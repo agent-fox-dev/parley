@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -566,5 +567,177 @@ func TestSync_FailureTextIsScrubbed(t *testing.T) {
 				t.Errorf("%s: the failure text %q (%d bytes) is not the scrubbed fetch failure", c.name, text, len(text))
 			}
 		}
+	}
+}
+
+func TestSync_ReevaluatesBranchThatMoved(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	observer := s.observe(t, nil)
+	origin, base := s.origin.Dir(), s.origin.Head("main")
+	// Each branch is behind origin's head (theirs, a child of base) or absent
+	// in the hub, and another writer moves it once, between the sync's
+	// evaluation and its swap; the sync must keep the writer's head and
+	// report the result against it.
+	cases := []struct {
+		branch string
+		inHub  bool
+		move   func(theirs string) string
+		want   workspace.BranchOutcome
+	}{
+		{"to-ahead", true, func(theirs string) string { return grow(t, s.copy, "to-ahead", theirs, "writer") },
+			workspace.BranchAhead},
+		{"to-diverged", true, func(string) string { return grow(t, s.copy, "to-diverged", base, "writer") },
+			workspace.BranchDiverged},
+		{"to-origin", true, func(theirs string) string {
+			gitrepotest.Git(t, s.copy, "update-ref", "refs/heads/to-origin", theirs)
+			return theirs
+		}, workspace.BranchUpToDate},
+		{"absent", false, func(string) string {
+			gitrepotest.Git(t, s.copy, "update-ref", "refs/heads/absent", base)
+			return base
+		}, workspace.BranchFastForward},
+	}
+	theirs, moved := map[string]string{}, map[string]string{}
+	for _, c := range cases {
+		theirs[c.branch] = grow(t, origin, c.branch, base, "origin")
+		if c.inHub {
+			gitrepotest.Git(t, s.copy, "branch", c.branch, base)
+		}
+		s.swaps.set(c.branch, func(call int) {
+			if call == 1 {
+				moved[c.branch] = c.move(theirs[c.branch])
+			}
+		})
+	}
+	r := s.sync(t, workspace.SyncOptions{})
+	for _, c := range cases {
+		head := moved[c.branch]
+		if c.want == workspace.BranchFastForward {
+			head = theirs[c.branch]
+		}
+		i := slices.IndexFunc(r.Branches, func(b workspace.BranchResult) bool { return b.Name == c.branch })
+		if i < 0 || r.Branches[i].Result != c.want || r.Branches[i].LocalSHA != head {
+			t.Errorf("%s: branches = %+v, want %s at %s", c.branch, r.Branches, c.want, head)
+		}
+		if got := ref(t, s.copy, "refs/heads/"+c.branch); got != head {
+			t.Errorf("%s: the hub's head = %s, want %s", c.branch, got, head)
+		}
+	}
+	// Only the move that succeeded is told and listed, from the head the
+	// writer left.
+	want := workspace.BranchMove{Workspace: syncSlug, Branch: "absent", Before: base, After: theirs["absent"], Cause: "sync"}
+	if got, _ := observer.recorded(); !slices.Equal(got, []workspace.BranchMove{want}) {
+		t.Errorf("the observer was told %+v, want only %+v", got, want)
+	}
+	events := s.eventsOf(t, syncEvent)
+	var meta struct{ Updated []map[string]any }
+	if len(events) != 1 || json.Unmarshal(events[0].Metadata, &meta) != nil {
+		t.Fatalf("sync events %+v, want one", events)
+	}
+	wantUpdated := []map[string]any{{"ref": "refs/heads/absent", "before": base, "after": theirs["absent"]}}
+	if !reflect.DeepEqual(meta.Updated, wantUpdated) {
+		t.Errorf("the event's updated = %v, want %v", meta.Updated, wantUpdated)
+	}
+}
+
+func TestSync_GivesUpAfterFiveEvaluations(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	origin, base := s.origin.Dir(), s.origin.Head("main")
+	for _, name := range []string{"aa", "zz"} {
+		grow(t, origin, name, base, "origin")
+		gitrepotest.Git(t, s.copy, "branch", name, base)
+	}
+	// The writer moves zz to a commit of its own on base before every swap,
+	// so that each evaluation finds zz diverged again and moves on a stale
+	// head. The hook runs in the hub's request, away from the test's
+	// goroutine.
+	s.swaps.set("zz", func(call int) {
+		id := gitFrom(t, s.copy, "", "commit-tree", base+"^{tree}", "-p", base, "-m", fmt.Sprintf("writer %d", call))
+		gitFrom(t, s.copy, "", "update-ref", "refs/heads/zz", id)
+	})
+	before, _ := s.workspace(t, syncSlug)
+	events := s.eventCount(t)
+	a := s.postSync(t, s.uKey, syncSlug, "reset_to_origin=true")
+	if errorType, message := a.refusal(t); a.status != http.StatusInternalServerError || errorType != "internal" ||
+		!strings.Contains(message, "zz") {
+		t.Errorf("answer = %d %s, want 500 internal naming zz", a.status, a.body)
+	}
+	if n := s.swaps.count("zz"); n != 5 {
+		t.Errorf("zz was evaluated for a swap %d times, want 5", n)
+	}
+	if rec, _ := s.workspace(t, syncSlug); !reflect.DeepEqual(rec, before) {
+		t.Errorf("the record is %+v, want %+v unchanged", rec, before)
+	}
+	if n := s.eventCount(t); n != events {
+		t.Errorf("the log grew by %d events, want none", n-events)
+	}
+	if got, want := ref(t, s.copy, "refs/heads/aa"), s.origin.Head("aa"); got != want {
+		t.Errorf("the hub's aa = %s, want origin's %s, moved before zz", got, want)
+	}
+}
+
+func TestSync_TwoConcurrentSyncs(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	origin, base := s.origin.Dir(), s.origin.Head("main")
+	branches := []string{"b0", "b1", "b2", "b3", "b4"}
+	for _, name := range branches {
+		gitrepotest.Git(t, origin, "branch", name, base)
+	}
+	s.sync(t, workspace.SyncOptions{})
+	heads := refsUnder(t, origin, "refs/heads/")
+	for round := range 20 {
+		if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady {
+			t.Fatalf("round %d: status %s before the syncs, want ready", round, rec.Status)
+		}
+		// A new commit on each branch, all in one fast-import.
+		var stream strings.Builder
+		for _, name := range branches {
+			msg := fmt.Sprintf("round %d on %s", round, name)
+			fmt.Fprintf(&stream, "commit refs/heads/%s\ncommitter Origin <origin@example.invalid> now\ndata %d\n%s\nfrom %s\n\n",
+				name, len(msg), msg, heads[name])
+		}
+		gitFrom(t, origin, stream.String(), "fast-import", "--quiet", "--date-format=now")
+		heads = refsUnder(t, origin, "refs/heads/")
+
+		var answers [2]answer
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range answers {
+			wg.Go(func() {
+				<-start
+				answers[i] = s.postSync(t, s.uKey, syncSlug, "")
+			})
+		}
+		close(start)
+		wg.Wait()
+		results := map[string][]workspace.BranchOutcome{}
+		for i, a := range answers {
+			if a.status != http.StatusOK {
+				t.Fatalf("round %d: sync %d answered %d %s, want 200", round, i, a.status, a.body)
+			}
+			_, list := syncBranches(t, a)
+			for _, b := range list {
+				results[b.Name] = append(results[b.Name], b.Result)
+			}
+		}
+		for name, got := range results {
+			slices.Sort(got)
+			want := []workspace.BranchOutcome{workspace.BranchUpToDate, workspace.BranchUpToDate}
+			if slices.Contains(branches, name) {
+				want = []workspace.BranchOutcome{workspace.BranchFastForward, workspace.BranchUpToDate}
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("round %d: %s was reported %v, want %v", round, name, got, want)
+			}
+		}
+		if got := refsUnder(t, s.copy, "refs/heads/"); !maps.Equal(got, heads) {
+			t.Fatalf("round %d: the hub's branches = %v, want origin's %v", round, got, heads)
+		}
+	}
+	if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady {
+		t.Errorf("status %s after the syncs, want ready", rec.Status)
 	}
 }

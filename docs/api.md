@@ -1396,6 +1396,18 @@ the hub has is neither looked at nor reported. Sync does not read
 `protected_branches` or `protect.owner_push`: a protected branch moves like
 any other.
 
+Sync takes no lock on the workspace and never changes its `status`. A
+branch that another writer (a push, a landing, another sync) moves between
+the comparison and the swap keeps that writer's head: the sync compares it
+again from the new head, against the same origin head, and reports the
+result of the last comparison, with `local_sha` the hub's head after it.
+A branch whose swap is lost on five comparisons stops the sync with `500`
+`internal`, whose message names the branch; nothing is recorded and no
+event is written, and branches moved before it stay moved. Two syncs of
+one workspace at the same time both complete: the second waits for the
+first one's fetch, never answers `409` `workspace_busy` for it, and reports
+`up_to_date` for a branch the first one has already moved.
+
 | Result | When | The hub's branch |
 |---|---|---|
 | `created` | the hub has no such branch | created at origin's head |
@@ -1483,7 +1495,7 @@ has no branch. `local_sha` is the hub's head of the branch after the sync,
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
 | `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`); nothing in the hub's repository changed and `sync_error` holds the same text |
-| `500` `internal` | the sync could not complete: a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
+| `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

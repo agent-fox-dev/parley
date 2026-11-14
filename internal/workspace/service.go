@@ -77,6 +77,11 @@ type Deps struct {
 	// transaction; nil means Insert. A test makes it fail to see the whole
 	// create roll back.
 	InsertWorkspace func(ctx context.Context, tx *sql.Tx, w Workspace) error
+	// BeforeRefSwap, when set, is called by a sync after it classified a
+	// branch of the workspace slug and before the compare-and-swap that
+	// moves it. It is for tests, which move the branch there as another
+	// writer would; it is nil in production.
+	BeforeRefSwap func(ctx context.Context, slug, branch string)
 	// Notify tells the clone workers that the workspace slug has clone work;
 	// it is called after the transaction that recorded the work commits. Nil
 	// tells no one.
@@ -116,6 +121,9 @@ type Service struct {
 
 	moveMu        sync.RWMutex
 	moveObservers []BranchMoveObserver
+
+	// fetchLocks serialises the syncs' fetches into one copy.
+	fetchLocks keyedLocks
 }
 
 // Bind binds the service to d. It is called once, before the hub serves.

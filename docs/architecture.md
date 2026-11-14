@@ -1726,7 +1726,9 @@ production `Lister` runs its `ListRemote`, and it is `Git`, the
 `workspace.Fetcher` (`FetchOrigin`) of a sync (nil is `gitrepo.Git{}` for
 both; a nil `Scrubber` is a scrubber that knows no value). `Deps` also holds
 `InsertWorkspace`, which writes the record in the create transaction (nil
-is `workspace.Insert`; a test makes it fail), and `Notify`, called with the
+is `workspace.Insert`; a test makes it fail), `BeforeRefSwap`, which a
+sync calls between a branch's classification and its swap (nil in
+production; a test moves the branch there), and `Notify`, called with the
 slug after a create commits so that clone work is picked up; the hub sets
 it to the workers' `Enqueue`. `(*Service).Enqueue(slug)` calls `Notify`
 (nothing without one): a feature that puts a workspace back to `pending`
@@ -2015,7 +2017,16 @@ goroutines, and nil at once for workers never launched.
 `(*Service).Sync(ctx, slug, SyncOptions)` reads the record, resolves the
 origin credential with `ResolveOriginCredential` at that moment, so that a
 changed secret counts at the next sync, and fetches origin into the copy at
-`RepoPath` through `Deps.Fetcher` with a deadline of 2 minutes. It then
+`RepoPath` through `Deps.Fetcher` with a deadline of 2 minutes. Two fetches
+into one copy collide on git's ref locks (the origin heads and
+`packed-refs` that `git fetch --atomic --prune` writes), so the fetch runs
+under the copy's entry of `Service.fetchLocks`, an in-process mutex per
+slug (`keyedLocks`, an entry removed when no one holds or waits for it): a
+second sync of the workspace waits for the first one's fetch and then runs
+its own. Nothing else of a sync takes a lock, and a sync never writes the
+workspace's status: tag creation is create-only (a tag another sync
+created first is skipped, not an error) and branch moves are single-ref
+compare-and-swaps, so syncs, pushes and landings meet only there. It then
 creates in the copy, in name order, every tag origin has and the copy
 lacks, at origin's value (an annotated tag as its tag object), each with
 `CompareAndSwapRef` expecting the tag absent, so that a tag another writer
@@ -2029,7 +2040,18 @@ otherwise `diverged`, or `reset` when `SyncOptions.ResetToOrigin` is set.
 `created`, `fast_forward` and `reset` move the branch to origin's head with
 `CompareAndSwapRef` expecting the head that was classified (absent for
 `created`); the others move nothing, and a diverged branch does not stop
-the walk. A branch only the hub has, never on origin or deleted there, is
+the walk. A swap that answers `gitrepo.ErrRefMoved` means another writer
+moved the branch after it was classified: `(*Service).syncBranch` keeps
+that writer's head, reads the branch again, classifies it against the same
+origin head and acts on the new result, up to `maxBranchEvaluations` (5)
+evaluations; the reported result, `local_sha` and the `Before` of the move
+are those of the last evaluation, and only a swap that succeeded is told to
+the observers and listed in the event's `updated`. When the fifth swap is
+lost too, `Sync` returns `server.Internal` naming the branch, before
+`completeSync`: no sync field and no event is written, and the moves made
+before stay, their observers already told. `Deps.BeforeRefSwap`, nil in
+production, is called between a branch's classification and its swap; it
+is for tests, which move the branch there as another writer would. A branch only the hub has, never on origin or deleted there, is
 neither looked at nor reported. Protected branches are treated as any
 other: sync reads neither the push rules nor `protected_branches` and
 `protect.owner_push`. It returns a `SyncResult` holding the record it read,

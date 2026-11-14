@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -148,6 +149,12 @@ type SyncResult struct {
 // looked at nor reported. Last it records the completion (see
 // completeSync). The caller has checked that the workspace may be synced;
 // opts.Actor must be the admin token or a user's credential.
+//
+// Sync takes no lock on the workspace and never writes its status: syncs of
+// one workspace wait only for one another's fetch (see fetchOrigin), and
+// beside those, pushes and landings they meet only at the compare-and-swap
+// of single refs. A branch that keeps moving under the sync stops it with an
+// internal error before anything is recorded; the moves made by then stay.
 func (s *Service) Sync(ctx context.Context, slug string, opts SyncOptions) (SyncResult, error) {
 	actorType, actorID, ok := eventActor(opts.Actor)
 	if !ok {
@@ -175,7 +182,7 @@ func (s *Service) Sync(ctx context.Context, slug string, opts SyncOptions) (Sync
 	branches := make([]BranchResult, 0, len(fetched.Branches))
 	var updated []refUpdate
 	for _, name := range slices.Sorted(maps.Keys(fetched.Branches)) {
-		b, before, err := syncBranch(ctx, repo, name, fetched.Branches[name], opts.ResetToOrigin)
+		b, before, err := s.syncBranch(ctx, repo, slug, name, fetched.Branches[name], opts.ResetToOrigin)
 		if err != nil {
 			return SyncResult{}, err
 		}
@@ -287,32 +294,52 @@ func moves(o BranchOutcome) bool {
 	return o == BranchCreated || o == BranchFastForward || o == BranchReset
 }
 
-// syncBranch evaluates the branch name of repo once against originHead,
-// origin's head of it: it classifies the hub's head and, for created,
-// fast_forward and reset, moves the branch to originHead only while it is
-// still at the head it classified, so that a move by another writer
-// meanwhile is never lost; that case is an error matching
-// gitrepo.ErrRefMoved. A diverged branch moves only when reset is true.
-// Whether the branch is protected does not matter: sync is one of the ways a
-// protected branch may move. before is the hub's head as classified, "" when
-// the hub had no such branch.
-func syncBranch(ctx context.Context, repo *gitrepo.Repo, name, originHead string, reset bool) (_ BranchResult, before string, _ error) {
-	local, found, err := repo.ResolveBranch(ctx, name)
-	if err != nil {
-		return BranchResult{}, "", err
-	}
-	before = local
-	outcome, err := classifyBranch(ctx, repo, local, found, originHead, reset)
-	if err != nil {
-		return BranchResult{}, "", fmt.Errorf("sync branch %s: %w", name, err)
-	}
-	if moves(outcome) {
-		if err := repo.CompareAndSwapRef(ctx, "refs/heads/"+name, originHead, local); err != nil {
+// maxBranchEvaluations is how often a sync evaluates one branch before it
+// gives up on a branch that another writer keeps moving, so that a sync
+// under constant writes ends; the caller syncs again.
+const maxBranchEvaluations = 5
+
+// syncBranch brings the branch name of repo, the copy of the workspace slug,
+// up to date with originHead, origin's head of it. An evaluation classifies
+// the hub's head and, for created, fast_forward and reset, moves the branch
+// to originHead only while it is still at the head it classified. When
+// another writer moved the branch meanwhile, its head stays and the branch is
+// evaluated again from that head, against the same originHead, up to
+// maxBranchEvaluations times; after that the error is an internal one naming
+// the branch. A diverged branch moves only when reset is true. Whether the
+// branch is protected does not matter: sync is one of the ways a protected
+// branch may move. The result and before, the head the move replaced ("" when
+// it created the branch), are those of the last evaluation.
+func (s *Service) syncBranch(ctx context.Context, repo *gitrepo.Repo, slug, name, originHead string, reset bool) (_ BranchResult, before string, _ error) {
+	for range maxBranchEvaluations {
+		local, found, err := repo.ResolveBranch(ctx, name)
+		if err != nil {
+			return BranchResult{}, "", err
+		}
+		outcome, err := classifyBranch(ctx, repo, local, found, originHead, reset)
+		if err != nil {
 			return BranchResult{}, "", fmt.Errorf("sync branch %s: %w", name, err)
 		}
-		local = originHead
+		result := BranchResult{Name: name, Result: outcome, LocalSHA: local, OriginSHA: originHead}
+		if !moves(outcome) {
+			return result, local, nil
+		}
+		if s.deps.BeforeRefSwap != nil {
+			s.deps.BeforeRefSwap(ctx, slug, name)
+		}
+		err = repo.CompareAndSwapRef(ctx, "refs/heads/"+name, originHead, local)
+		if errors.Is(err, gitrepo.ErrRefMoved) {
+			continue
+		}
+		if err != nil {
+			return BranchResult{}, "", fmt.Errorf("sync branch %s: %w", name, err)
+		}
+		result.LocalSHA = originHead
+		return result, local, nil
 	}
-	return BranchResult{Name: name, Result: outcome, LocalSHA: local, OriginSHA: originHead}, before, nil
+	return BranchResult{}, "", server.Internal(fmt.Sprintf(
+		"the sync of workspace %q stopped: branch %q moved in the hub during each of its %d evaluations; sync again",
+		slug, name, maxBranchEvaluations))
 }
 
 // classifyBranch is the outcome for a branch whose head in the hub is local
@@ -341,13 +368,19 @@ func classifyBranch(ctx context.Context, repo *gitrepo.Repo, local string, found
 // it. A credential that cannot be resolved, a fetch that fails and one cut
 // off at its deadline are one failure, which failFetch records and turns
 // into the answer; without a credential nothing is fetched, since an
-// anonymous fetch would not be the one the owner configured.
+// anonymous fetch would not be the one the owner configured. Two fetches
+// into one copy collide on git's locks of the origin heads they both write,
+// so the syncs of one workspace fetch one after the other: a sync waits for
+// the other's fetch, never answers busy, and runs the rest of its work
+// beside it.
 func (s *Service) fetchOrigin(ctx context.Context, w Workspace) (gitrepo.Fetched, error) {
 	cred, err := ResolveOriginCredential(ctx, s.deps.Secrets, w.Slug)
 	if err != nil {
 		return gitrepo.Fetched{}, s.failFetch(ctx, w.Slug, cred, err)
 	}
+	unlock := s.fetchLocks.lock(w.Slug)
 	fetched, err := s.deps.Fetcher.FetchOrigin(ctx, s.RepoPath(w.Slug), deref(w.GitURL), cred, syncFetchDeadline)
+	unlock()
 	if err != nil {
 		return gitrepo.Fetched{}, s.failFetch(ctx, w.Slug, cred, err)
 	}
@@ -399,4 +432,43 @@ func createTags(ctx context.Context, repo *gitrepo.Repo, tags map[string]string)
 		created[name] = tags[name]
 	}
 	return created, nil
+}
+
+// keyedLocks is a mutex per key, here a workspace's slug, that exists only
+// while someone holds or waits for it. Its zero value is ready for use.
+type keyedLocks struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+// keyedLock is the mutex of one key and the number of its holders and
+// waiters.
+type keyedLock struct {
+	sync.Mutex
+	users int
+}
+
+// lock waits until key's mutex is free, takes it and returns the function
+// that frees it.
+func (k *keyedLocks) lock(key string) (unlock func()) {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[string]*keyedLock{}
+	}
+	l := k.locks[key]
+	if l == nil {
+		l = &keyedLock{}
+		k.locks[key] = l
+	}
+	l.users++
+	k.mu.Unlock()
+	l.Lock()
+	return func() {
+		l.Unlock()
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		if l.users--; l.users == 0 {
+			delete(k.locks, key)
+		}
+	}
 }

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -831,13 +833,15 @@ const syncSlug = "demo"
 // user u, whose origin is a bare repository on disk holding the origin's
 // usual history (see gitrepotest.Origin.History), and the hub's copy of it at
 // its place, made by the clone work, which records the origin heads. The
-// hub's fetcher records every fetch.
+// hub's fetcher records every fetch, and swaps is the hub's hook between a
+// branch's classification and its swap.
 type syncWorld struct {
 	*world
 	origin *gitrepotest.Origin
 	// copy is the git directory of the hub's copy.
 	copy    string
 	fetches *recordingFetcher
+	swaps   *swapHook
 }
 
 // newSyncWorld starts a world with opts and builds the sync world in it.
@@ -845,16 +849,16 @@ func newSyncWorld(t *testing.T, opts ...option) *syncWorld {
 	t.Helper()
 	o := gitrepotest.NewOrigin(t)
 	o.History()
-	f := &recordingFetcher{}
+	f, h := &recordingFetcher{}, &swapHook{calls: map[string]int{}, on: map[string]func(int){}}
 	w := newWorld(t, append(opts, withCompose(func(c *hub.Composition) {
-		c.AdjustWorkspace(func(d *workspace.Deps) { f.Fetcher, d.Fetcher = d.Fetcher, f })
+		c.AdjustWorkspace(func(d *workspace.Deps) { f.Fetcher, d.Fetcher, d.BeforeRefSwap = d.Fetcher, f, h.before })
 	}))...)
 	url := o.Dir()
 	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
 	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
 		t.Fatalf("the clone of the sync workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
 	}
-	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f}
+	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f, swaps: h}
 }
 
 // sync runs a sync of the workspace with opts, the admin token as the actor
@@ -944,6 +948,57 @@ func (f *recordingFetcher) recorded() []fetchCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]fetchCall(nil), f.calls...)
+}
+
+// swapHook is the hub's hook between a branch's classification and its swap
+// in a sync: it counts the calls per branch and runs what is set for the
+// branch with the call's number, from 1.
+type swapHook struct {
+	mu    sync.Mutex
+	calls map[string]int
+	on    map[string]func(call int)
+}
+
+func (h *swapHook) before(_ context.Context, _, branch string) {
+	h.mu.Lock()
+	h.calls[branch]++
+	call, fn := h.calls[branch], h.on[branch]
+	h.mu.Unlock()
+	if fn != nil {
+		fn(call)
+	}
+}
+
+// set makes every later call for branch run fn.
+func (h *swapHook) set(branch string, fn func(call int)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.on[branch] = fn
+}
+
+// count is the number of calls for branch so far.
+func (h *swapHook) count(branch string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls[branch]
+}
+
+// gitFrom runs git with stdin on the repository at dir, as another writer
+// does, from any goroutine: a failure fails the test without stopping the
+// goroutine, and the output is "" then.
+func gitFrom(t *testing.T, dir, stdin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_AUTHOR_NAME=Writer", "GIT_AUTHOR_EMAIL=writer@example.invalid",
+		"GIT_COMMITTER_NAME=Writer", "GIT_COMMITTER_EMAIL=writer@example.invalid")
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Errorf("git %v in %s: %v: %s", args, dir, err, out)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // ref is the object id of the ref name of the repository at dir, "" when

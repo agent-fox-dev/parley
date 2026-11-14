@@ -99,3 +99,31 @@ moving it at that moment.
   `origin fetch failed: `.
 - A `sync_error` that cannot be written makes the sync answer `500`
   `internal` instead of `502` `upstream_error`.
+
+## Sync beside other writers
+
+- Two syncs of one copy at the same time cannot both run `git fetch
+  --atomic --prune`: each locks the origin heads (`refs/remotes/origin/*`)
+  and `packed-refs`, and the loser fails (`cannot lock ref
+  'refs/remotes/origin/<name>': is at … but expected …`), which would
+  answer `502`. The fetch is therefore serialised per copy by an
+  in-process mutex keyed by the slug on the `Service`: a sync waits for the
+  other's fetch and never answers `409 workspace_busy`. The package's "take
+  no lock on the workspace" holds for everything else: tag creation and the
+  per-branch pass take no lock, and the workspace's status is never written.
+  Tag creation stays outside the mutex because it is create-only: a tag
+  another sync created first is skipped without an error and is not
+  reported as created by the second sync. The mutex is per hub process,
+  which is the only writer of its copies.
+- The hook between a branch's evaluation and its swap is the optional
+  field `Deps.BeforeRefSwap func(ctx, slug, branch string)`, called after a
+  branch was classified as `created`, `fast_forward` or `reset` and before
+  its compare-and-swap, nil in production and set by tests through
+  `(*hub.Composition).AdjustWorkspace`, like `Deps.InsertWorkspace`. It is
+  not called for a branch that does not move.
+- The re-evaluation test covers its four cases in one sync, on four
+  branches of one workspace, rather than one sync per case on `main`.
+- The test giving up after five evaluations syncs with
+  `reset_to_origin=true`: its hook moves `zz` to a new child of the common
+  ancestor, which makes `zz` diverged, and only a reset tries to swap a
+  diverged branch again.
