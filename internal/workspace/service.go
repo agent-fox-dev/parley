@@ -104,6 +104,10 @@ type Service struct {
 	viewMu   sync.RWMutex
 	forkView ForkView
 
+	forkMu     sync.RWMutex
+	forkFields map[string]ForkFieldHandler
+	forkGuard  ForkUpdateGuard
+
 	stepMu    sync.RWMutex
 	postClone map[string]PostCloneStep
 }

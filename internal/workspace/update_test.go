@@ -2,13 +2,20 @@ package workspace_test
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -89,5 +96,253 @@ func TestUpdate_RefusesAnInvalidSettingsValueChangingNothing(t *testing.T) {
 		if after := w.get(t, w.uKey, "demo"); !bytes.Equal(after.body, before.body) {
 			t.Errorf("%v: the workspace = %s, want it unchanged %s", c.body, after.body, before.body)
 		}
+	}
+}
+
+// refused sends body to PATCH /workspaces/<slug> as cred, an hour of the
+// hub's time after the workspace was last read, and checks that the answer
+// is status with errorType and that the workspace, updated_at included, is
+// as it was.
+func (w *world) refused(t *testing.T, cred, slug string, body any, status int, errorType string) {
+	t.Helper()
+	before := w.get(t, w.Token, slug)
+	w.advance(time.Hour)
+	if r := w.patch(t, cred, slug, body); r.status != status || r.errorType(t) != errorType {
+		t.Errorf("PATCH %s %v = %d %s, want %d %s", slug, body, r.status, r.body, status, errorType)
+	}
+	if after := w.get(t, w.Token, slug); !bytes.Equal(after.body, before.body) {
+		t.Errorf("PATCH %s %v: the workspace = %s, want it unchanged %s", slug, body, after.body, before.body)
+	}
+}
+
+func TestUpdate_ChangesOnlyTheGivenFieldsAndUpdatedAt(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady, DefaultBranch: new("main"),
+		DisplayName: "demo", Description: "old"})
+	for _, cred := range []string{w.uKey, w.Token} {
+		for _, c := range []struct {
+			body  map[string]any
+			given []string
+		}{
+			{map[string]any{"display_name": "Demo"}, []string{"display_name"}},
+			{map[string]any{"description": "payments"}, []string{"description"}},
+			{map[string]any{"display_name": "D", "description": "p", "unknown_member": 1}, []string{"display_name", "description"}},
+		} {
+			before := w.get(t, cred, "demo").decode(t, http.StatusOK)
+			w.advance(time.Minute)
+			r := w.patch(t, cred, "demo", c.body)
+			got := r.decode(t, http.StatusOK)
+			if want := w.clock().Truncate(time.Second).Format(time.RFC3339); got["updated_at"] != want {
+				t.Errorf("%v: updated_at = %v, want the hub's time %s", c.body, got["updated_at"], want)
+			}
+			for _, f := range c.given {
+				if got[f] != c.body[f] {
+					t.Errorf("%v: %s = %v, want %v", c.body, f, got[f], c.body[f])
+				}
+			}
+			for _, m := range append(c.given, "updated_at") {
+				delete(got, m)
+				delete(before, m)
+			}
+			if !reflect.DeepEqual(got, before) {
+				t.Errorf("%v: the other members = %v, want them as before %v", c.body, got, before)
+			}
+			if after := w.get(t, cred, "demo"); !bytes.Equal(after.body, r.body) {
+				t.Errorf("%v: GET after the update = %s, want the update's answer %s", c.body, after.body, r.body)
+			}
+		}
+	}
+	for _, status := range []workspace.Status{workspace.StatusPending, workspace.StatusCloning, workspace.StatusReady, workspace.StatusFailed} {
+		w.put(t, workspace.Workspace{Slug: "in-" + string(status), Status: status})
+		if r := w.patch(t, w.uKey, "in-"+string(status), map[string]any{"description": "s"}); r.status != http.StatusOK {
+			t.Errorf("an update in status %s = %d %s, want 200", status, r.status, r.body)
+		}
+	}
+}
+
+func TestUpdate_ResetsANullOrEmptyDisplayNameToTheSlugAndANullDescriptionToEmpty(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, c := range []struct {
+		slug, field string
+		value       any
+		want        string
+	}{
+		{"name-null", "display_name", nil, "name-null"},
+		{"name-empty", "display_name", "", "name-empty"},
+		{"text-null", "description", nil, ""},
+		{"text-empty", "description", "", ""},
+	} {
+		w.put(t, workspace.Workspace{Slug: c.slug, DisplayName: "Demo", Description: "payments"})
+		if got := w.patch(t, w.uKey, c.slug, map[string]any{c.field: c.value}).decode(t, http.StatusOK)[c.field]; got != c.want {
+			t.Errorf("%s %v: %s = %q, want %q", c.field, c.value, c.field, got, c.want)
+		}
+	}
+}
+
+func TestUpdate_RefusesABodyThatIsNoObjectOrCarriesNoMutableField(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	for _, body := range []string{`[]`, `"x"`, `5`, `null`, `{}`, `{"foo": 1}`, `{"access": "owner"}`, `{not json`} {
+		w.refused(t, w.uKey, "demo", body, http.StatusBadRequest, "invalid_request")
+	}
+}
+
+func TestUpdate_RefusesAnImmutableOrForkOnlyFieldOnARepositoryWhateverItsValue(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady, DefaultBranch: new("main"), GitURL: new("https://git.example/demo.git")})
+	current := w.get(t, w.uKey, "demo").decode(t, http.StatusOK)
+	for _, field := range []string{"slug", "kind", "git_url", "default_branch", "owner_id", "workspace_mode", "upstream_url",
+		"integration_branch", "parent_slug", "fork_point", "ttl", "purpose", "auto_change"} {
+		for _, value := range []any{current[field], "other"} {
+			w.refused(t, w.uKey, "demo", map[string]any{field: value, "description": "x"}, http.StatusBadRequest, "invalid_request")
+		}
+	}
+}
+
+func TestUpdate_RefusesADisplayNameOrDescriptionOfTheWrongTypeOrLength(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	for _, c := range []struct {
+		field string
+		value any
+		ok    bool
+	}{
+		{"display_name", strings.Repeat("a", 128), true},
+		{"display_name", strings.Repeat("a", 129), false},
+		{"display_name", strings.Repeat("é", 128), true},
+		{"display_name", 5, false},
+		{"display_name", []any{}, false},
+		{"description", strings.Repeat("a", 1024), true},
+		{"description", strings.Repeat("a", 1025), false},
+		{"description", false, false},
+	} {
+		body := map[string]any{c.field: c.value}
+		if !c.ok {
+			w.refused(t, w.uKey, "demo", body, http.StatusBadRequest, "invalid_request")
+		} else if got := w.patch(t, w.uKey, "demo", body).decode(t, http.StatusOK)[c.field]; got != c.value {
+			t.Errorf("%s of %d characters = %v, want it stored", c.field, len([]rune(c.value.(string))), got)
+		}
+	}
+}
+
+func TestUpdate_RefusesAValidUpdateOfAnArchivedWorkspaceAfterTheBodyChecks(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "old", Status: workspace.StatusArchived})
+	for _, c := range []struct {
+		body      map[string]any
+		status    int
+		errorType string
+	}{
+		{map[string]any{"description": "x"}, http.StatusConflict, "workspace_archived"},
+		{map[string]any{"settings": map[string]any{"sync_enabled": false}}, http.StatusConflict, "workspace_archived"},
+		{map[string]any{"description": 5}, http.StatusBadRequest, "invalid_request"},
+		{map[string]any{"slug": "other"}, http.StatusBadRequest, "invalid_request"},
+	} {
+		w.refused(t, w.uKey, "old", c.body, c.status, c.errorType)
+	}
+}
+
+func TestUpdate_RefusesAMemberAPATWithoutWriteScopeAndACallerWhoCannotRead(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	acme := w.acme(t)
+	w.put(t, workspace.Workspace{Slug: "demo", OrgID: acme, Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "old", OrgID: acme, Status: workspace.StatusArchived})
+	readOnly, stranger := w.pat(t, w.u, "workspaces:read"), w.IssueKey(t, w.CreateUser(t, "wanda"))
+	body := map[string]any{"description": "x"}
+	for _, c := range []struct {
+		cred, slug string
+		status     int
+		errorType  string
+	}{
+		{w.vKey, "demo", http.StatusForbidden, "forbidden"},
+		{w.vKey, "old", http.StatusForbidden, "forbidden"},
+		{readOnly, "demo", http.StatusForbidden, "insufficient_scope"},
+		{readOnly, "no-such-slug", http.StatusForbidden, "insufficient_scope"},
+		{stranger, "demo", http.StatusNotFound, "not_found"},
+	} {
+		w.refused(t, c.cred, c.slug, body, c.status, c.errorType)
+	}
+	if hidden, unknown := w.patch(t, stranger, "demo", body), w.patch(t, stranger, "no-such-slug", body); !bytes.Equal(hidden.body, unknown.body) {
+		t.Errorf("the 404 of an unreadable workspace = %s, want the one of an unknown slug %s", hidden.body, unknown.body)
+	}
+	if got := w.get(t, w.uKey, "demo").decode(t, http.StatusOK)["description"]; got != "" {
+		t.Errorf("description of demo = %q, want it unchanged", got)
+	}
+}
+
+func TestUpdate_ChangesTheNameAndDescriptionOfAForkAndRefusesItsOrgAndSettings(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
+	got := w.patch(t, w.uKey, "demo--t1", map[string]any{"display_name": "task 1", "description": "fix"}).decode(t, http.StatusOK)
+	if got["display_name"] != "task 1" || got["description"] != "fix" {
+		t.Errorf("the fork after the update = %v / %v, want task 1 / fix", got["display_name"], got["description"])
+	}
+	if got := w.patch(t, w.uKey, "demo--t1", map[string]any{"display_name": nil}).decode(t, http.StatusOK)["display_name"]; got != "demo--t1" {
+		t.Errorf("display_name after null = %v, want the slug", got)
+	}
+	for _, c := range []struct {
+		body      map[string]any
+		errorType string
+	}{
+		{map[string]any{"org_id": "acme"}, "not_supported_on_fork"},
+		{map[string]any{"org_id": nil}, "not_supported_on_fork"},
+		{map[string]any{"settings": map[string]any{"sync_enabled": false}}, "not_supported_on_fork"},
+		{map[string]any{"settings": nil}, "not_supported_on_fork"},
+		{map[string]any{"description": "y", "settings": map[string]any{}}, "not_supported_on_fork"},
+		// A fork-only field nobody registered a handler for.
+		{map[string]any{"description": "y", "ttl": 3600}, "invalid_request"},
+	} {
+		w.refused(t, w.uKey, "demo--t1", c.body, http.StatusBadRequest, c.errorType)
+	}
+}
+
+func TestUpdate_AppliesTheRegisteredForkFieldsAndGuard(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, withCompose(func(c *hub.Composition) {
+		c.Workspaces().RegisterForkField("purpose", func(_ workspace.Workspace, raw json.RawMessage) (workspace.ForkFieldWrite, error) {
+			var purpose string
+			if err := json.Unmarshal(raw, &purpose); err != nil {
+				return nil, errors.New("must be a string")
+			}
+			return func(ctx context.Context, tx *sql.Tx, fork workspace.Workspace) error {
+				_, err := tx.ExecContext(ctx, `UPDATE workspaces SET purpose = ? WHERE slug = ?`, purpose, fork.Slug)
+				return err
+			}, nil
+		})
+		c.Workspaces().RegisterForkUpdateGuard(func(_ context.Context, _ *sql.Tx, fork workspace.Workspace) error {
+			if fork.Slug == "blocked--t1" {
+				return server.NewError("parent_archived", http.StatusConflict, "the parent is archived")
+			}
+			return nil
+		})
+	}))
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	for _, fork := range []string{"demo--t1", "blocked--t1"} {
+		w.put(t, workspace.Workspace{Slug: fork, Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
+	}
+	if got := w.patch(t, w.uKey, "demo--t1", map[string]any{"purpose": "review"}).decode(t, http.StatusOK)["purpose"]; got != "review" {
+		t.Errorf("purpose after the update = %v, want review", got)
+	}
+	for _, c := range []struct {
+		slug      string
+		body      map[string]any
+		status    int
+		errorType string
+	}{
+		{"demo--t1", map[string]any{"purpose": 5}, http.StatusBadRequest, "invalid_request"},
+		{"demo", map[string]any{"purpose": "review"}, http.StatusBadRequest, "invalid_request"},
+		{"blocked--t1", map[string]any{"description": "x"}, http.StatusConflict, "parent_archived"},
+		{"blocked--t1", map[string]any{"description": 5}, http.StatusBadRequest, "invalid_request"},
+	} {
+		w.refused(t, w.uKey, c.slug, c.body, c.status, c.errorType)
 	}
 }

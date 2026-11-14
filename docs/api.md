@@ -1281,21 +1281,33 @@ for an active member of its org, whatever scopes the caller's PAT holds.
 
 ## `PATCH /api/v1/workspaces/{slug}`
 
-Changes the settings of the workspace `{slug}`. It takes the admin token,
-an API key or a PAT, declares the scope `workspaces:write` for a PAT and
-needs write access to the workspace (see
-[Workspace access](#workspace-access)): its owner or the admin token.
+Changes the display name, the description and the settings of the
+workspace `{slug}`. It takes the admin token, an API key or a PAT, declares
+the scope `workspaces:write` for a PAT and needs write access to the
+workspace (see [Workspace access](#workspace-access)): its owner or the
+admin token. It works in every status but `archived`.
 
-The body is a JSON object; members the route does not read are ignored.
-The member read is `settings`: an object or `null`, applied to the stored
-settings key by key. A key given with a value its rule accepts is stored
-with that value (see [Workspace settings](#workspace-settings)), a key given
-with `null` returns to its default, and every key not given keeps its
-value; `"settings": null` returns every key to its default. The settings
-are applied all or nothing: when one key is refused, nothing is stored.
+The body is a JSON object that changes exactly the fields it carries;
+members the route does not know are ignored, and a field not given keeps
+its value.
+
+| Field | Repository workspace | Task fork |
+|---|---|---|
+| `display_name` | `null` or a string of at most 128 characters (Unicode code points); `null` or `""` sets it to the slug | the same |
+| `description` | `null` or a string of at most 1024 characters; `null` sets it to `""` | the same |
+| `org_id` | an org id or slug, or `null`; accepted, but the workspace keeps its org for now | `400` `not_supported_on_fork` |
+| `settings` | an object or `null`, applied to the stored settings key by key (below) | `400` `not_supported_on_fork` |
+| `ttl`, `purpose`, `auto_change` | `400` `invalid_request` | `400` `invalid_request` until the fork features accept them |
+| `slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`, `upstream_url`, `integration_branch`, `parent_slug`, `fork_point` | `400` `invalid_request`, whatever the value, the current one included | the same |
+
+In `settings`, a key given with a value its rule accepts is stored with that
+value (see [Workspace settings](#workspace-settings)), a key given with
+`null` returns to its default, and every key not given keeps its value;
+`"settings": null` returns every key to its default. The settings are
+applied all or nothing: when one key is refused, nothing is stored.
 
 ```json
-{"settings":{"land.strategy":"squash","protected_branches":["main","release/**"]}}
+{"display_name":"Payments","settings":{"land.strategy":"squash","protected_branches":["main","release/**"]}}
 ```
 
 The checks run in this order, the first that fails answering: a bound PAT
@@ -1303,14 +1315,19 @@ on a workspace outside its binding (`404`, see
 [Workspace-bound tokens](#workspace-bound-tokens)); a PAT without
 `workspaces:write` (`403`), before the workspace is looked up; the access
 check (`404` for a caller who cannot read the workspace, the same bytes as
-for a slug no workspace has, `403` for a member of its org); then the body.
+for a slug no workspace has, `403` for a member of its org, also on an
+archived workspace); then the body: not a JSON object; an immutable field;
+a field that does not apply to the workspace's kind; no field to change;
+the values in the order `display_name`, `description`, `org_id`,
+`settings`; and last the state: an archived workspace is `409`.
 Of several refused setting keys the message names one: an unknown key
 before any refused value, the first unknown key in byte order of the keys,
 otherwise the refused key that comes first in the table of
 [Workspace settings](#workspace-settings), whatever the order of the
-members in the body. The settings are read, applied and written with
+members in the body. The workspace is read, changed and written with
 `updated_at`, the current time cut to the second, in one store transaction;
-a refused request changes nothing, `updated_at` included.
+an update that changes no value still sets `updated_at`, and a refused
+request changes nothing, `updated_at` included.
 
 The answer is the workspace object after the update, the object
 [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
@@ -1318,11 +1335,13 @@ The answer is the workspace object after the update, the object
 
 | Status | When |
 |---|---|
-| `200 OK` | the settings are changed; the body is the workspace object |
-| `400` `invalid_request` | the body is not a JSON object, carries no `settings` (`the body carries no field to change`), or its `settings` are refused: `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`); the reason never repeats a URL |
+| `200 OK` | the fields are changed; the body is the workspace object |
+| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`); the reason never repeats a URL |
+| `400` `not_supported_on_fork` | `org_id` or `settings` in an update of a task fork, whatever the value (`<field>: a task fork takes its org and its settings from its parent`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
-| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), in every status |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
 | `500` `internal` | the write failed; nothing is changed |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`

@@ -1813,18 +1813,44 @@ last item's stored `created_at` (UnixNano) and slug.
 
 `internal/workspace/update.go` holds `PATCH /workspaces/:slug`, declared
 with `Scope` `workspaces:write` and `Marks` `access.need: write`, so the
-scope check and then the access check answer before the handler. The
-handler decodes the body as an object of raw members, then in one store
-transaction reads the record with `BySlug` (gone: the same `404`), applies
-the members the body carries by an ordered table of mutable fields
-(`updateFields`, each applying its value to a copy of the record or
-answering `400 invalid_request` with `<field>: <reason>`; so far only
-`settings`, applied with `SettingsRegistry.ApplySettings` from the stored
-document), and writes the changed fields with `updated_at` (the hub's
-time cut to the second); a body that carries none of them is `400`, and a
-refusal writes nothing. After the commit it reads the record back and
-answers it through `RenderWorkspace` with the level `access.DecisionOf`
-gives, so the answer is the one a following `GET` gives.
+scope check and then the access check answer before the handler (a member
+of the org is `403` in every status, archived included). The handler
+decodes the body as an object of raw members, so that a member given as
+`null` is told from one not given, then in one store transaction reads the
+record with `BySlug` (gone: the same `404`) and judges the body against it
+in `applyUpdate`. One table, `updateFields`, says what an update may do with
+each field by the workspace's kind: `display_name` and `description` are
+mutable on both kinds, `org_id` and `settings` on a repository workspace
+only (on a fork `400 not_supported_on_fork`), `ttl`, `purpose` and
+`auto_change` on a fork only, through a handler registered for them, and
+`slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`,
+`upstream_url`, `integration_branch`, `parent_slug` and `fork_point` on
+neither. The checks run in this order, the first failing one answering: an
+immutable field, whatever its value; a field that does not apply to the
+kind (a fork-only field on a repository workspace, or on a fork with no
+handler registered, is `400 invalid_request`); no mutable field; the values
+in table order (`display_name`, `description`, `org_id`, `settings`, then
+the fork-only fields), each applied to a copy of the record or answering
+`400 invalid_request` with `<field>: <reason>`; an archived workspace
+(`409 workspace_archived`), since validation comes before state; and for a
+fork the registered guard. Then it writes `display_name`, `description`,
+`settings` and `updated_at` (the hub's time cut to the second) and runs the
+fork-only fields' writes, all in the same transaction, so a refusal writes
+nothing. A `null` or empty `display_name` stores the slug, a `null`
+`description` the empty string. `org_id` is judged as a string or `null`
+but does not move the workspace yet. After the commit it reads the record
+back and answers it through `RenderWorkspace` with the level
+`access.DecisionOf` gives, so the answer is the one a following `GET`
+gives.
+
+The fork features add to an update without changing its rules through two
+registrations on the service, each under a mutex: `RegisterForkField(name,
+ForkFieldHandler)`, for `ttl`, `purpose` or `auto_change` only (another
+name panics), whose handler judges the field's raw value and returns the
+`ForkFieldWrite` that stores it inside the update's transaction, and
+`RegisterForkUpdateGuard(ForkUpdateGuard)`, asked about every update of a
+fork after the body is valid and the fork not archived, before anything is
+written, its `*server.Error` answered unchanged. `nil` removes either.
 
 `internal/workspace/settings.go` holds `SettingsRegistry`, the setting keys
 in registration order, empty in its zero value; the service holds one,
