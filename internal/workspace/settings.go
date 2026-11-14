@@ -28,6 +28,9 @@ type SettingKey struct {
 	// Validate judges a value of the key that is not null; its error is the
 	// reason the value is refused.
 	Validate func(value json.RawMessage) error
+	// Normalize returns the form of a value Validate accepted that is
+	// stored; nil stores the value as given.
+	Normalize func(value json.RawMessage) json.RawMessage
 }
 
 // SettingsRegistry holds the setting keys in the order they were registered,
@@ -65,8 +68,9 @@ func (r *SettingsRegistry) registered() []SettingKey {
 // settings value of a request, to stored, which it does not change. A raw
 // value of null returns every key to its default; any other value must be an
 // object, each of whose keys is registered: a key with the value null
-// returns to its default, every other value must pass its key's rule. The
-// keys raw does not name keep their stored value. A refusal is a 400
+// returns to its default, every other value must pass its key's rule and is
+// stored in its key's normal form. The keys raw does not name keep their
+// stored value. A refusal is a 400
 // invalid_request naming the first unknown key, else the first refused key
 // in registration order; nothing is applied then.
 func (r *SettingsRegistry) ApplySettings(stored map[string]json.RawMessage, raw json.RawMessage) (map[string]json.RawMessage, error) {
@@ -97,6 +101,9 @@ func (r *SettingsRegistry) ApplySettings(stored map[string]json.RawMessage, raw 
 		default:
 			if err := k.Validate(v); err != nil {
 				return nil, server.InvalidRequest(fmt.Sprintf("settings.%s: %v", k.Name, err))
+			}
+			if k.Normalize != nil {
+				v = k.Normalize(v)
 			}
 			out[k.Name] = v
 		}
@@ -194,7 +201,11 @@ var settingsTable = []settingSpec{
 // registry; an error means r already held one of the keys.
 func RegisterSettingKeys(r *SettingsRegistry) error {
 	for _, spec := range settingsTable {
-		if err := r.RegisterSetting(SettingKey{Name: spec.name, Default: spec.defaultFunc(), Validate: spec.validate}); err != nil {
+		k := SettingKey{Name: spec.name, Default: spec.defaultFunc(), Validate: spec.validate}
+		if spec.kind == kindURL {
+			k.Normalize = trimString
+		}
+		if err := r.RegisterSetting(k); err != nil {
 			return err
 		}
 	}
@@ -248,6 +259,14 @@ func jsonString(raw json.RawMessage) (s string, ok bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// trimString is the JSON string raw without its surrounding white space, so
+// that a URL key stores the URL its rule judged; raw is a JSON string.
+func trimString(raw json.RawMessage) json.RawMessage {
+	s, _ := jsonString(bytes.TrimSpace(raw))
+	b, _ := json.Marshal(strings.TrimSpace(s)) // a string always marshals
+	return b
 }
 
 // validateForgeURL accepts "" and an absolute https URL with a host and

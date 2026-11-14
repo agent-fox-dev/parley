@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and `GET /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces/:slug` and `PATCH /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1791,15 +1791,34 @@ for a slug no workspace has. The handler takes the caller's level from
 since the check is the same `404`) and answers it through
 `RenderWorkspace`, in every status and for both kinds.
 
+`internal/workspace/update.go` holds `PATCH /workspaces/:slug`, declared
+with `Scope` `workspaces:write` and `Marks` `access.need: write`, so the
+scope check and then the access check answer before the handler. The
+handler decodes the body as an object of raw members, then in one store
+transaction reads the record with `BySlug` (gone: the same `404`), applies
+the members the body carries by an ordered table of mutable fields
+(`updateFields`, each applying its value to a copy of the record or
+answering `400 invalid_request` with `<field>: <reason>`; so far only
+`settings`, applied with `SettingsRegistry.ApplySettings` from the stored
+document), and writes the changed fields with `updated_at` (the hub's
+time cut to the second); a body that carries none of them is `400`, and a
+refusal writes nothing. After the commit it reads the record back and
+answers it through `RenderWorkspace` with the level `access.DecisionOf`
+gives, so the answer is the one a following `GET` gives.
+
 `internal/workspace/settings.go` holds `SettingsRegistry`, the setting keys
 in registration order, empty in its zero value; the service holds one,
 returned by `(*Service).Settings()`. `RegisterSetting(SettingKey)` adds a
-key with its `Name`, its `Default` (a function of the default branch) and
-its `Validate` rule, refusing a duplicate or incomplete key;
+key with its `Name`, its `Default` (a function of the default branch), its
+`Validate` rule and an optional `Normalize`, the form of an accepted value
+that is stored (nil stores the value as given), refusing a duplicate or
+incomplete key;
 `ApplySettings(stored, raw)` applies a request's settings value (`null`
 resets every key; otherwise an object whose unknown keys are refused with
 `unknown setting "<key>"`, a `null` value resets that key, every other
-value passes its key's rule); `EffectiveSettings(stored, defaultBranch)`
+value passes its key's rule and is stored normalized; all or nothing, the
+first unknown key in byte order named before any refused value, else the
+first refused key in registration order); `EffectiveSettings(stored, defaultBranch)`
 returns every registered key with its stored value, decoded into the Go
 type of the key's default (`bool`, `string`, `[]string`), or its default.
 The same file holds the settings table, the one definition of the 21 keys
@@ -1808,7 +1827,8 @@ globs, and default) in the order they are judged in, and
 `RegisterSettingKeys(registry)`, which registers each with its default and
 a rule built from its kind: a bool key takes a JSON boolean, an enum key one
 of its strings, a URL key a string that is empty or an absolute `https` URL
-with a host and no user information, query or fragment once trimmed, and
+with a host and no user information, query or fragment once trimmed, stored
+trimmed through `Normalize`, and
 `protected_branches` an array of at most 50 distinct strings that pass
 `ValidateBranchGlob`. Its default is a list holding the default branch, the
 empty list (never `null`) while the default branch is `null`.

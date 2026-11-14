@@ -231,6 +231,14 @@ func (w *world) get(t *testing.T, cred, slug string) answer {
 	return answer{status, b}
 }
 
+// patch sends body to PATCH /workspaces/<slug> with cred as the bearer
+// credential.
+func (w *world) patch(t *testing.T, cred, slug string, body any) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPatch, "/api/v1/workspaces/"+slug, cred, body)
+	return answer{status, b}
+}
+
 // objectMembers are the members of every workspace object.
 var objectMembers = []string{"slug", "kind", "workspace_mode", "git_url", "default_branch", "owner_id", "org_id",
 	"status", "display_name", "description", "head_sha", "origin_head_sha", "clone_error", "last_sync_at",

@@ -89,9 +89,8 @@ func TestRead_ShowsAForkTheEffectiveSettingsOfItsParent(t *testing.T) {
 		t.Errorf("the fork's settings = %v, want its parent's %v", fork, parent)
 	}
 	// The parent's settings change after the fork was made.
-	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = 'demo'`,
-		`{"land.strategy":"squash"}`); err != nil {
-		t.Fatal(err)
+	if a := w.patch(t, w.uKey, "demo", map[string]any{"settings": map[string]any{"land.strategy": "squash"}}); a.status != http.StatusOK {
+		t.Fatalf("PATCH the parent's settings = %d %s, want 200", a.status, a.body)
 	}
 	fork := settings("demo--t1")
 	if fork["land.strategy"] != "squash" || !reflect.DeepEqual(fork["protected_branches"], []any{"main"}) {
