@@ -3,10 +3,7 @@ package secret_test
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
-	"encoding/json"
 	"io/fs"
 	"net/http"
 	"os"
@@ -22,30 +19,6 @@ import (
 )
 
 const noKeyWarning = "secrets cannot be stored: no encryption key configured"
-
-// newKey returns a random key in the raw form and in the base64 form an
-// operator configures it in.
-func newKey(t *testing.T) (raw []byte, encoded string) {
-	t.Helper()
-	raw = make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		t.Fatal(err)
-	}
-	return raw, base64.StdEncoding.EncodeToString(raw)
-}
-
-// logLines decodes every line of a hub's log whose msg is msg.
-func logLines(t *testing.T, log, msg string) []map[string]any {
-	t.Helper()
-	var out []map[string]any
-	for line := range strings.SplitSeq(log, "\n") {
-		var rec map[string]any
-		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == msg {
-			out = append(out, rec)
-		}
-	}
-	return out
-}
 
 func TestStart_StopsBeforeListeningOnAKeyThatCannotBeLoaded(t *testing.T) {
 	cases := []struct {

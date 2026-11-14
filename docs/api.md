@@ -1886,6 +1886,76 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |
 
+## Secrets
+
+A secret belongs to one of three secret scopes, each with its own routes:
+
+| Scope | Routes | Owner |
+|---|---|---|
+| user | `/api/v1/user/secrets` | the caller's user |
+| org | `/api/v1/orgs/{slug}/secrets` | the org `{slug}` names, by its slug or its id (see [Org selectors](#org-selectors)) |
+| workspace | `/api/v1/workspaces/{slug}/secrets` | the workspace `{slug}`, and no other: a task fork's secrets are not its parent's, nor the other way round |
+
+No route answers a secret's value. A route's access to its scope is decided
+in the access position of the [order of checks](#order-of-checks), after the
+scope of a PAT and the [workspace access](#workspace-access) check, so a PAT
+without the route's scope is refused `403` `insufficient_scope` whether or
+not the org or the workspace exists. Every secret route of a scope gives the
+same answers:
+
+- **User.** An API key or a PAT acts on its user's secrets. The admin token
+  has no user and is refused:
+
+  ```json
+  {"error":{"code":403,"message":"user-scoped endpoints require a user credential","error_type":"forbidden"}}
+  ```
+
+- **Org.** The admin token reaches every org, a blocked one included; a user
+  reaches an org with the status `active` of which they are a member. An org
+  that does not exist, an org the user is not a member of and a blocked org
+  are answered with the same bytes:
+
+  ```json
+  {"error":{"code":404,"message":"org not found","error_type":"not_found"}}
+  ```
+
+- **Workspace.** The routes need `owner` (see [Workspace access](#workspace-access)):
+  the workspace's owner (on a task fork also its parent's owner) and the
+  admin token reach them; a member of the workspace's org is answered `403`
+  `forbidden` with the message `org members have read-only access to this
+  workspace`, the creator of a task fork on the fork's parent included; anyone
+  else gets the `404` `workspace not found` of a slug with no workspace. The
+  workspace's status plays no part.
+
+A workspace-bound PAT is confined by the binding guard first (see
+[Workspace-bound tokens](#workspace-bound-tokens)).
+
+## `GET /api/v1/user/secrets`, `GET /api/v1/orgs/{slug}/secrets`, `GET /api/v1/workspaces/{slug}/secrets`
+
+Lists the secrets of the scope, a [list](#lists) in the standard pages, and
+declares the scope `secrets:read` for a PAT, which `secrets:write`
+satisfies. Who may call each route is in [Secrets](#secrets).
+
+The list holds the scope's own secrets, ordered by `key` ascending, compared
+byte by byte with `A` to `Z` lowered, so `_x`, `A`, `a1`, `b`, `B2`, `c` are
+in that order. Each item has exactly `key`, as it was first stored,
+`created_at` and `updated_at`, RFC 3339 in UTC with whole seconds; never the
+value or the owner. An empty scope gets `items` `[]`. The list reads no
+value, so it holds every secret also when the hub has no encryption key or
+a value cannot be decrypted with the configured keys.
+
+```json
+{"items":[{"key":"GIT_PAT","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}],"next_cursor":null}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are secrets as above |
+| `400` `invalid_request` | a bad `limit` (`limit must be an integer from 1 to 200`) or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT without `secrets:read` or `secrets:write` (`this route needs the scope secrets:read`) |
+| `403` `forbidden` | the admin token on `/user/secrets` (`user-scoped endpoints require a user credential`); a member of the workspace's org on `/workspaces/{slug}/secrets` (`org members have read-only access to this workspace`) |
+| `404` `not_found` | an org the caller may not reach or that does not exist (`org not found`); a workspace the caller has no level on or that does not exist (`workspace not found`) |
+
 ## `GET /api/v1/events`
 
 Streams the hub events the caller may see as Server-Sent Events: first the

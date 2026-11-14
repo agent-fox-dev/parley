@@ -28,7 +28,10 @@ const (
 // clock and scrubber and the event component, and reads the start report,
 // which the hub writes once it has bound the listener: the `secret
 // encryption` line, and the warning that secrets cannot be stored when no
-// current key is configured. The component exists from the
+// current key is configured. The secret routes are registered with the
+// component's scope check as an access check: it is added after identity's
+// and the workspace access checks, so a workspace secret route has its
+// access decided before the scope is resolved. The component exists from the
 // composition on, so a later part keeps it through Composition.Secrets; the
 // hooks that run after this one may use it.
 func composeSecrets(c *Composition) {
@@ -47,6 +50,10 @@ func composeSecrets(c *Composition) {
 		return err
 	})
 	c.addStartReport(func(logger *slog.Logger) { report.Log(logger) })
+	c.AddAccessCheck(c.secrets.ScopeCheck)
+	for _, r := range c.secrets.Routes() {
+		c.AddRoute(r)
+	}
 }
 
 // keyFilePath is the path [secrets].key_file names, a relative one taken
