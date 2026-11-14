@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -114,6 +115,22 @@ func TestUploadPack_StreamsUntilTheContextEndsAndThenKillsGitWithItsChildren(t *
 		if time.Now().After(deadline) {
 			t.Fatalf("git's child %d is still running 2s after the return", pid)
 		}
+	}
+}
+
+func TestUploadPack_GivesUpOnAVersion2RequestThatStopsComingWhenTheContextEnds(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	head := o.Commit("main", "first")
+	stalled, sender := io.Pipe()
+	defer sender.Close()
+	go func() { _, _ = io.WriteString(sender, pkt("command=fetch\n")+"0001"+pkt("want "+head+"\n")) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := (gitrepo.Git{}).UploadPack(ctx, gitrepo.ServeRequest{Dir: o.Dir(), Protocol2: true, Stdin: stalled, Stdout: io.Discard})
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 2*time.Second {
+		t.Errorf("UploadPack = %v after %v, want an error wrapping context.DeadlineExceeded within 2s", err, time.Since(start))
 	}
 }
 

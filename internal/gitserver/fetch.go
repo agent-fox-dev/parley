@@ -75,6 +75,24 @@ const (
 	errGitFailed = "upload-pack failed"
 )
 
+// uploadPackConfig is the configuration of every run of upload-pack, given
+// on its command line, so that every repository is served alike whatever
+// its own configuration says: partial clone with the filters blob:none,
+// blob:limit and tree alone, so that git refuses every other filter in
+// band; and a want of a commit that is no ref's tip but that a ref
+// reaches, which a client that fetches by object id needs under protocol
+// version 0, where it asks only when the advertisement allows it. No ref is
+// hidden: the hub's repositories hide none, and the configuration of the
+// host takes no part.
+var uploadPackConfig = []string{
+	"uploadpack.allowFilter=true",
+	"uploadpackfilter.allow=false",
+	"uploadpackfilter.blob:none.allow=true",
+	"uploadpackfilter.blob:limit.allow=true",
+	"uploadpackfilter.tree.allow=true",
+	"uploadpack.allowReachableSHA1InWant=true",
+}
+
 var (
 	errNoRunner      = errors.New("no git runner is installed")
 	errNoPushService = errors.New("no push service is installed")
@@ -105,7 +123,7 @@ func (c *Component) advertise(w http.ResponseWriter, r *http.Request, x Exchange
 	if !v2 {
 		_, _ = out.Write(append(pktLine("# service="+ServiceUploadPack+"\n"), flushPkt...))
 	}
-	c.run(r, x, out, gitrepo.ServeRequest{Dir: x.Repo, AdvertiseRefs: true, Protocol2: v2})
+	c.run(r, x, out, gitrepo.ServeRequest{Dir: x.Repo, AdvertiseRefs: true, Protocol2: v2, Config: uploadPackConfig})
 }
 
 // fetch runs the fetch exchange: git reads the request body, decompressed
@@ -123,7 +141,7 @@ func (c *Component) fetch(w http.ResponseWriter, r *http.Request, x Exchange) {
 		out.writeErr(refusal)
 		return
 	}
-	c.run(r, x, out, gitrepo.ServeRequest{Dir: x.Repo, Protocol2: protocol2(r.Header), Stdin: body})
+	c.run(r, x, out, gitrepo.ServeRequest{Dir: x.Repo, Protocol2: protocol2(r.Header), Config: uploadPackConfig, Stdin: body})
 }
 
 // run runs upload-pack for req, its answer written to out, bounded by the

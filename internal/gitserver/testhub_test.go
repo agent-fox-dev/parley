@@ -1,7 +1,9 @@
 package gitserver_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"fmt"
@@ -372,12 +374,82 @@ func fetchRequest(want string, haves ...string) string {
 // "acme/demo.git", on the hub, with password in its user information, as a
 // git client is given it.
 func (w *world) remote(password, repo string) string {
-	u, err := url.Parse(w.URL("/git/" + repo))
+	return remoteAt(w.URL("/"), password, repo)
+}
+
+// remoteAt is remote on the server at base, such as a proxy in front of
+// the hub.
+func remoteAt(base, password, repo string) string {
+	u, err := url.Parse(base)
 	if err != nil {
 		panic(err)
 	}
-	u.User = url.UserPassword("x", password)
+	u.Path, u.User = "/git/"+repo, url.UserPassword("x", password)
 	return u.String()
+}
+
+// history is what extendHistory built in demo's repository.
+type history struct {
+	// main are main's four commits, oldest first, and dates their commit
+	// dates, a day apart.
+	main  [4]string
+	dates [4]time.Time
+	// small and big are the blob ids of a.txt (10 bytes) and big.bin
+	// (200 kB), and bigSum the SHA-256 of big.bin's content.
+	small, big string
+	bigSum     [sha256.Size]byte
+	// change is the commit refs/parley/changes/1/1 points at, which is on
+	// no branch, and dangling a commit no ref reaches.
+	change, dangling string
+}
+
+// extendHistory replaces demo's history with one that holds every kind of
+// ref a hub serves: main with four commits a day apart, the first adding
+// a.txt and big.bin and the others changing README; the tag v0 on the
+// first; dev on the second with a commit of its own; the tag v1 on the
+// second, so that main~1 is no ref's tip; a note on the fourth in refs/notes/commits; the hub-owned
+// refs/parley/changes/1/1 on a commit off the third that no branch holds
+// and refs/parley/sandboxes/sb1/main at main; and a commit no ref reaches.
+// It moves w.head to main's new head. The refs are written in one run of
+// git fast-import.
+func (w *world) extendHistory(t *testing.T) history {
+	t.Helper()
+	var h history
+	big := bytes.Repeat([]byte("parley big.bin\n"), 200_000/15+1)[:200_000]
+	h.bigSum = sha256.Sum256(big)
+	var s strings.Builder
+	commit := func(ref string, mark int, at time.Time, from, files string) {
+		fmt.Fprintf(&s, "commit %s\nmark :%d\ncommitter P <p@example.invalid> %d +0000\ndata 2\n%02d\n", ref, mark, at.Unix(), mark)
+		if from != "" {
+			fmt.Fprintf(&s, "from %s\n", from)
+		}
+		s.WriteString(files + "\n")
+	}
+	file := func(path, content string) string {
+		return fmt.Sprintf("M 100644 inline %s\ndata %d\n%s\n", path, len(content), content)
+	}
+	day := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := range h.dates {
+		h.dates[i] = day.AddDate(0, 0, i)
+	}
+	s.WriteString("reset refs/heads/main\n")
+	commit("refs/heads/main", 1, h.dates[0], "", file("a.txt", "0123456789")+file("big.bin", string(big)))
+	for i := 2; i <= 4; i++ {
+		commit("refs/heads/main", i, h.dates[i-1], fmt.Sprintf(":%d", i-1), file("README", fmt.Sprintf("%d\n", i)))
+	}
+	commit("refs/heads/dev", 5, h.dates[1], ":2", file("README", "dev\n"))
+	commit("refs/parley/changes/1/1", 6, h.dates[2], ":3", file("README", "change\n"))
+	commit("refs/notes/commits", 7, h.dates[3], "", "N inline :4\ndata 5\nnote\n")
+	s.WriteString("reset refs/tags/v0\nfrom :1\n\nreset refs/tags/v1\nfrom :2\n\nreset refs/parley/sandboxes/sb1/main\nfrom :4\n\n")
+	if _, err := gitrepotest.Run(w.repo, s.String(), "fast-import", "--quiet", "--force", "--date-format=raw"); err != nil {
+		t.Fatal(err)
+	}
+	ids := strings.Fields(gitrepotest.Git(t, w.repo, "rev-parse", "main~3", "main~2", "main~1", "main", "main:a.txt", "main:big.bin", "refs/parley/changes/1/1"))
+	copy(h.main[:], ids)
+	h.small, h.big, h.change = ids[4], ids[5], ids[6]
+	h.dangling = gitrepotest.Git(t, w.repo, "commit-tree", "-m", "dangling", h.main[3]+"^{tree}")
+	w.head = h.main[3]
+	return h
 }
 
 // clientGit runs stock git with args in dir as a client of the hub, with

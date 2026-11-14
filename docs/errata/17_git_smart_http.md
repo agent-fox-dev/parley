@@ -100,3 +100,37 @@ or `error: ` prefix and with the repository's directory on disk replaced by
 `repository` (`upload-pack failed` when git wrote nothing), so that the
 client gets git's reason and never a path of the hub. The `ERR` pkt-lines
 the hub writes carry no trailing newline, as git's own do.
+
+## A version 2 want of a commit no ref reaches is refused by the hub, not by git
+
+The package passes `uploadpack.allowReachableSHA1InWant=true` to every run
+of upload-pack and expects git to refuse, in band, a want of an object no
+advertised ref reaches. Tried with git 2.56.0: under protocol version 0, in
+stateless mode, git refuses a want of a commit no ref reaches with
+`ERR upload-pack: not our ref <id>` whatever the configuration, and the
+setting only makes it advertise `allow-reachable-sha1-in-want`, without
+which a version 0 client does not ask for a commit by id at all
+(`Server does not allow request for unadvertised object`). Under protocol
+version 2 git serves any object it holds by its id: a commit written with
+`git commit-tree` that no ref points at is fetched with success, also with
+`uploadpack.allowReachableSHA1InWant`, `uploadpack.allowTipSHA1InWant` and
+`uploadpack.allowAnySHA1InWant` all set to `false`. No setting of git
+refuses it.
+
+So the hub refuses it itself (`internal/gitrepo/serve.go`, `checkWants`):
+a version 2 `command=fetch` request is kept in a file of git's private
+directory, its `want` ids are given to `git rev-list --stdin --not --all`,
+and when that lists one of them, the request is answered with the `ERR`
+pkt-line `upload-pack: not our ref <id>`, git's own text of version 0,
+before upload-pack runs. A commit no ref reaches (one whose branch was
+deleted, or a commit of the parent that a task fork can read only through
+its alternates) is thereby served under neither version.
+
+A tree or a blob is not checked, under either version: rev-list does not
+list one, and git's version 0 check, which runs the same rev-list, lets it
+through as well. A partial clone fetches the objects its filter left out
+by their ids, and whether a ref reaches a given tree or blob is a walk of
+every tree of every ref, which git itself does not make. Object ids are not
+guessable, and git does not treat reachability as a boundary between
+readers of one repository (see the SECURITY section of
+`gitnamespaces(7)`).

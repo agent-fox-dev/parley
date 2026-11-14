@@ -18,6 +18,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -86,9 +87,12 @@ func TestFetch_ClonesWithStockGitWhateverThePathsOfAPAT(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
-			out, err := clientGit(t, dir, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version="+c.protocol, "clone", w.remote(c.password, "acme/demo.git"), "d")
+			out, err := clientGit(t, dir, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version="+c.protocol, "clone", "--progress", w.remote(c.password, "acme/demo.git"), "d")
 			if err != nil {
 				t.Fatalf("git clone: %v\n%s", err, out)
+			}
+			if !strings.Contains(out, "remote: Enumerating objects") {
+				t.Errorf("git clone --progress showed no progress of the hub's git:\n%s", out)
 			}
 			if got, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "HEAD"); strings.TrimSpace(got) != w.head {
 				t.Errorf("HEAD of the clone = %s, want %s", got, w.head)
@@ -100,6 +104,81 @@ func TestFetch_ClonesWithStockGitWhateverThePathsOfAPAT(t *testing.T) {
 				t.Errorf("served under version 2 = %v, want %v; trace:\n%s", v2, c.protocol == "2", out)
 			}
 		})
+	}
+}
+
+func TestFetch_SendsTheHistoryAShallowFetchAsksFor(t *testing.T) {
+	t.Parallel()
+	w := newGitWorld(t, hubtest.Config{})
+	h := w.extendHistory(t)
+	remote := w.remote(w.ownerKey, "acme/demo.git")
+	// Each step runs git with args, the first in the directory the clone d
+	// is made in, the others in d, after which d's HEAD has commits commits.
+	type step struct {
+		args    []string
+		commits int
+	}
+	for _, c := range []struct {
+		name  string
+		steps []step
+	}{
+		{"depth, deepen, unshallow", []step{{[]string{"clone", "--depth", "1", remote, "d"}, 1}, {[]string{"fetch", "--deepen", "1"}, 2}, {[]string{"fetch", "--unshallow"}, 4}}},
+		{"shallow-since", []step{{[]string{"clone", "--shallow-since=" + h.dates[1].Format(time.RFC3339), remote, "d"}, 3}}},
+		{"shallow-exclude", []step{{[]string{"clone", "--shallow-exclude=v0", remote, "d"}, 3}}},
+	} {
+		for _, version := range []string{"0", "2"} {
+			t.Run(c.name+"/protocol "+version, func(t *testing.T) {
+				t.Parallel()
+				dir := t.TempDir()
+				d := filepath.Join(dir, "d")
+				for i, s := range c.steps {
+					in := d
+					if i == 0 {
+						in = dir
+					}
+					if out, err := clientGit(t, in, nil, append([]string{"-c", "protocol.version=" + version}, s.args...)...); err != nil {
+						t.Fatalf("git %s: %v\n%s", s.args[0], err, out)
+					}
+					if got, _ := clientGit(t, d, nil, "rev-list", "--count", "HEAD"); strings.TrimSpace(got) != strconv.Itoa(s.commits) {
+						t.Fatalf("after git %s %s the clone holds %s commits, want %d", s.args[0], s.args[1], strings.TrimSpace(got), s.commits)
+					}
+				}
+				_, err := os.Stat(filepath.Join(d, ".git", "shallow"))
+				if shallow, want := err == nil, c.steps[len(c.steps)-1].commits < len(h.main); shallow != want {
+					t.Errorf("the clone is shallow = %v, want %v", shallow, want)
+				}
+			})
+		}
+	}
+}
+
+func TestFetch_SendsOnlyTheObjectsAClientLacks(t *testing.T) {
+	t.Parallel()
+	w := newGitWorld(t, hubtest.Config{})
+	dir := t.TempDir()
+	versions := []string{"0", "2"}
+	for _, v := range versions {
+		if out, err := clientGit(t, dir, nil, "-c", "protocol.version="+v, "clone", w.remote(w.ownerKey, "acme/demo.git"), "d"+v); err != nil {
+			t.Fatalf("git clone: %v\n%s", err, out)
+		}
+	}
+	stream := "commit refs/heads/main\ncommitter P <p@example.invalid> now\ndata 6\nthird\nfrom refs/heads/main^0\nM 100644 inline README\ndata 2\n3\n"
+	if _, err := gitrepotest.Run(w.repo, stream, "fast-import", "--quiet", "--date-format=now"); err != nil {
+		t.Fatal(err)
+	}
+	head := gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
+	for _, v := range versions {
+		d := filepath.Join(dir, "d"+v)
+		out, err := clientGit(t, d, nil, "-c", "protocol.version="+v, "fetch", "--progress", "origin")
+		if err != nil {
+			t.Fatalf("protocol %s: git fetch: %v\n%s", v, err, out)
+		}
+		if got, _ := clientGit(t, d, nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != head {
+			t.Errorf("protocol %s: origin/main = %s, want %s", v, got, head)
+		}
+		if !strings.Contains(out, "remote: Total 3 ") {
+			t.Errorf("protocol %s: the fetch did not receive 3 objects (commit, tree, blob):\n%s", v, out)
+		}
 	}
 }
 

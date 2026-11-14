@@ -671,6 +671,30 @@ and any `Content-Type` is taken. The `paths` of a PAT are not read.
   writes it. A body sent with `Content-Encoding: gzip` is decompressed
   first.
 
+What a fetch can ask for is what stock git offers, the same under both
+protocol versions:
+
+- Every ref of the repository is advertised: branches, tags, notes and the
+  hub-owned refs under `refs/parley/`, with `HEAD` as a symbolic ref to the
+  default branch (`symref=HEAD:refs/heads/<branch>` under version 0, the
+  `symref-target` attribute of `ls-refs` under version 2). A version 2
+  `ls-refs` with `ref-prefix` arguments lists only the refs that match one
+  of them. A default `git clone` takes branches and tags only; a ref under
+  `refs/parley/` is fetched by its name.
+- Shallow history: `--depth`, `--deepen`, `--shallow-since`,
+  `--shallow-exclude` and `--unshallow`.
+- Incremental fetch: haves and wants are negotiated and only the objects
+  the client lacks are sent. git's progress lines reach the client while
+  the fetch runs (`remote: Enumerating objects …`).
+- Partial clone with the filters `blob:none`, `blob:limit=<n>` and
+  `tree:<depth>`, and the fetch by id of an object the filter left out
+  (git does that on its own, at checkout). Every other filter kind
+  (`object:type`, `sparse:oid`, `combine`, …) is refused.
+- A commit by its object id, when a ref reaches it. A commit no ref reaches
+  is refused under both versions; a tree or a blob is sent by its id, as git
+  does under version 0 (see
+  [errata/17_git_smart_http.md](errata/17_git_smart_http.md)).
+
 Once the answer has begun, an error is reported in band, as one pkt-line
 starting with `ERR `, and no pack follows it:
 
@@ -679,6 +703,8 @@ starting with `ERR `, and no pack follows it:
 | the request body is empty | `ERR empty request` |
 | `Content-Encoding` is `gzip` but the body is not valid gzip | `ERR invalid gzip body` |
 | git refuses the request | `ERR ` and git's own text, the last line of its error output without `fatal: ` |
+| a filter other than `blob:none`, `blob:limit` and `tree` | git's `ERR filter '<kind>' not supported` |
+| a want of a commit no ref reaches | `ERR upload-pack: not our ref <id>` |
 | the run of git takes longer than `[git].timeout` (see [configuration.md](configuration.md)) | `ERR request timed out` |
 
 On a timeout git is killed and the answer ends; the `ERR` pkt-line is
