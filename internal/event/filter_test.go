@@ -227,9 +227,9 @@ func TestFilters_RejectMalformed(t *testing.T) {
 			}
 		}
 	}
-	if got := w.events.Counters().OpenStreams; got != 0 {
-		t.Errorf("open_streams = %d, want 0", got)
-	}
+	// The accepted cases opened streams, which give their places back once
+	// the client has left, not before ask returns.
+	w.waitOpenStreams(t, 0)
 }
 
 func TestFilters_WorkspaceNotReadable(t *testing.T) {
