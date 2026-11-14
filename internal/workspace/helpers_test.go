@@ -1088,3 +1088,37 @@ func (s *syncWorld) observe(t *testing.T, err error) *recordingObserver {
 	s.svc.RegisterBranchMoveObserver(o)
 	return o
 }
+
+// setMode gives the sync workspace the workspace_mode mode and the
+// integration_branch integration.
+func (s *syncWorld) setMode(t *testing.T, mode, integration string) {
+	t.Helper()
+	if _, err := s.Store.Main().Exec(`UPDATE workspaces SET workspace_mode = ?, integration_branch = ? WHERE slug = ?`,
+		mode, integration, syncSlug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// excluding is an excluded-branch provider that names names, or fails with
+// err, and records the slugs it is asked for.
+type excluding struct {
+	names []string
+	err   error
+
+	mu    sync.Mutex
+	slugs []string
+}
+
+func (p *excluding) ExcludedBranches(_ context.Context, slug string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.slugs = append(p.slugs, slug)
+	return p.names, p.err
+}
+
+// asked are the slugs the provider was asked for so far.
+func (p *excluding) asked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.slugs)
+}

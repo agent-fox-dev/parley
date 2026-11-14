@@ -741,3 +741,97 @@ func TestSync_TwoConcurrentSyncs(t *testing.T) {
 		t.Errorf("status %s after the syncs, want ready", rec.Status)
 	}
 }
+
+func TestSync_SkipsCarryPatchBranches(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	origin, base := s.origin.Dir(), s.origin.Head("main")
+	gitrepotest.Git(t, origin, "update-ref", "-d", "refs/heads/dev")
+	for _, name := range []string{"integration", "patch/a", "feat"} {
+		gitrepotest.Git(t, s.copy, "branch", name, base)
+	}
+	for _, name := range []string{"main", "integration", "patch/a", "patch/b", "feat"} {
+		grow(t, origin, name, base, "origin")
+	}
+	hubIntegration := grow(t, s.copy, "integration", base, "hub")
+	theirs := refsUnder(t, origin, "refs/heads/")
+	provider := &excluding{names: []string{"patch/a", "patch/b"}}
+	s.svc.RegisterExcludedBranchProvider(provider)
+	observer := s.observe(t, nil)
+	s.setMode(t, workspace.ModeCarryPatch, "integration")
+
+	r := s.sync(t, workspace.SyncOptions{ResetToOrigin: true})
+	var names []string
+	for _, b := range r.Branches {
+		names = append(names, b.Name)
+	}
+	if want := []string{"feat", "main"}; !slices.Equal(names, want) {
+		t.Errorf("branches are %q, want %q", names, want)
+	}
+	for name, want := range map[string]string{"integration": hubIntegration, "patch/a": base, "patch/b": ""} {
+		if got := ref(t, s.copy, "refs/heads/"+name); got != want {
+			t.Errorf("the hub's %s = %q, want %q unchanged", name, got, want)
+		}
+		if got := ref(t, s.copy, "refs/remotes/origin/"+name); got != theirs[name] {
+			t.Errorf("the hub's origin head of %s = %q, want origin's %s", name, got, theirs[name])
+		}
+	}
+	if got := provider.asked(); !slices.Equal(got, []string{syncSlug}) {
+		t.Errorf("the provider was asked for %q, want once for %s", got, syncSlug)
+	}
+	moves, _ := observer.recorded()
+	var told []string
+	for _, m := range moves {
+		told = append(told, m.Branch)
+	}
+	if !slices.Equal(told, names) {
+		t.Errorf("the observer was told of %q, want %q", told, names)
+	}
+	events := s.eventsOf(t, syncEvent)
+	if len(events) != 1 {
+		t.Fatalf("%d sync events, want one", len(events))
+	}
+	for _, name := range []string{"integration", "patch/"} {
+		if strings.Contains(string(events[0].Metadata), name) {
+			t.Errorf("the event's metadata %s names %s", events[0].Metadata, name)
+		}
+	}
+
+	// The same refs in a standard workspace: nothing is left out and the
+	// provider is not asked.
+	s.setMode(t, workspace.ModeStandard, "integration")
+	r = s.sync(t, workspace.SyncOptions{ResetToOrigin: true})
+	want := map[string]workspace.BranchOutcome{"feat": workspace.BranchUpToDate, "main": workspace.BranchUpToDate,
+		"integration": workspace.BranchReset, "patch/a": workspace.BranchFastForward, "patch/b": workspace.BranchCreated}
+	if got := outcomes(r); !maps.Equal(got, want) {
+		t.Errorf("standard: results = %v, want %v", got, want)
+	}
+	if got := provider.asked(); len(got) != 1 {
+		t.Errorf("standard: the provider was asked %d times in all, want only by the carry-patch sync", len(got))
+	}
+}
+
+func TestSync_ExcludedBranchProviderFailure(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	s.setMode(t, workspace.ModeCarryPatch, "integration")
+	s.origin.Commit("main", "after the clone")
+	s.svc.RegisterExcludedBranchProvider(&excluding{err: errors.New("cannot read https://x:s3cr3t@example.test/patches.git")})
+	before, _ := s.workspace(t, syncSlug)
+	heads := refsUnder(t, s.copy, "refs/heads/")
+	events := s.eventCount(t)
+	a := s.postSync(t, s.uKey, syncSlug, "")
+	if errorType, message := a.refusal(t); a.status != http.StatusInternalServerError || errorType != "internal" ||
+		!strings.Contains(message, "excluded-branch provider") || strings.Contains(message, "s3cr3t") {
+		t.Errorf("answer = %d %s, want 500 internal naming the scrubbed provider failure", a.status, a.body)
+	}
+	if got := refsUnder(t, s.copy, "refs/heads/"); !maps.Equal(got, heads) {
+		t.Errorf("the hub's branches = %v, want %v unchanged", got, heads)
+	}
+	if rec, _ := s.workspace(t, syncSlug); !reflect.DeepEqual(rec, before) {
+		t.Errorf("the record is %+v, want %+v unchanged", rec, before)
+	}
+	if n := s.eventCount(t); n != events {
+		t.Errorf("the log grew by %d events, want none", n-events)
+	}
+}

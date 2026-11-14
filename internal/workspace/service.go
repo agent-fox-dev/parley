@@ -122,6 +122,9 @@ type Service struct {
 	moveMu        sync.RWMutex
 	moveObservers []BranchMoveObserver
 
+	excludeMu       sync.RWMutex
+	excludeProvider ExcludedBranchProvider
+
 	// fetchLocks serialises the syncs' fetches into one copy.
 	fetchLocks keyedLocks
 }

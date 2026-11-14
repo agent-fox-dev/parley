@@ -1396,6 +1396,16 @@ the hub has is neither looked at nor reported. Sync does not read
 `protected_branches` or `protect.owner_push`: a protected branch moves like
 any other.
 
+A workspace whose `workspace_mode` is `carry_patch` leaves some branches
+out of the comparison: its `integration_branch`, and the branches a
+provider the patch feature registers in the hub names for the workspace.
+Such a branch is not compared, not moved, not listed in `branches` and not
+in the event, although the fetch still sets its origin head. The provider
+is asked once per sync, after the fetch and the tags; if it fails, the sync
+stops with `500` `internal` before any branch is compared: no branch moves,
+no field is written and no event is emitted. A `standard` workspace leaves
+nothing out, whatever its `integration_branch`.
+
 Sync takes no lock on the workspace and never changes its `status`. A
 branch that another writer (a push, a landing, another sync) moves between
 the comparison and the swap keeps that writer's head: the sync compares it
@@ -1474,8 +1484,8 @@ recorded, so that it carries the new `last_sync_at`, `sync_error`,
 `head_sha` and `origin_head_sha`, the object
 [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
 `access` the caller's level, and the member `branches`: one entry per
-branch of origin, in byte order of the names, an empty list when origin
-has no branch. `local_sha` is the hub's head of the branch after the sync,
+branch of origin that the sync did not leave out, in byte order of the
+names, an empty list when there is none. `local_sha` is the hub's head of the branch after the sync,
 `origin_sha` origin's head as the fetch found it.
 
 ```json
@@ -1495,7 +1505,7 @@ has no branch. `local_sha` is the hub's head of the branch after the sync,
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
 | `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`); nothing in the hub's repository changed and `sync_error` holds the same text |
-| `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
+| `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

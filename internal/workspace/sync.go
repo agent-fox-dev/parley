@@ -93,6 +93,61 @@ func (s *Service) NotifyBranchMove(ctx context.Context, m BranchMove) {
 	}
 }
 
+// ExcludedBranchProvider names the branches of a carry-patch workspace that
+// sync leaves to the feature that maintains them, such as the workspace's
+// patch branches, which the rebuild and the patch rules move and the plain
+// per-branch pass must not overrule. ExcludedBranches is asked once per sync
+// of a carry-patch workspace, with its slug, and returns the branch names,
+// without refs/heads/; an error stops that sync before any branch is
+// compared.
+type ExcludedBranchProvider interface {
+	ExcludedBranches(ctx context.Context, slug string) ([]string, error)
+}
+
+// RegisterExcludedBranchProvider makes p the provider of the branches a sync
+// of a carry-patch workspace leaves out, replacing the one registered
+// before; nil removes it. The feature that owns the patch branches registers
+// it when the hub is composed; without one only a carry-patch workspace's
+// integration branch is left out.
+func (s *Service) RegisterExcludedBranchProvider(p ExcludedBranchProvider) {
+	s.excludeMu.Lock()
+	defer s.excludeMu.Unlock()
+	s.excludeProvider = p
+}
+
+// excludedBranches is the set of the branches of w that the per-branch pass
+// leaves out: for a carry-patch workspace its integration branch and the
+// branches the registered provider names for it; none, without asking the
+// provider, for any other workspace. A provider that fails stops the sync
+// with an internal error before any branch is compared, since moving a patch
+// branch by mistake would be worse than a sync the caller repeats; its text
+// is scrubbed, as it may hold what the provider read.
+func (s *Service) excludedBranches(ctx context.Context, w Workspace) (map[string]bool, error) {
+	excluded := map[string]bool{}
+	if w.Mode != ModeCarryPatch {
+		return excluded, nil
+	}
+	if b := deref(w.IntegrationBranch); b != "" {
+		excluded[b] = true
+	}
+	s.excludeMu.RLock()
+	p := s.excludeProvider
+	s.excludeMu.RUnlock()
+	if p == nil {
+		return excluded, nil
+	}
+	names, err := p.ExcludedBranches(ctx, w.Slug)
+	if err != nil {
+		return nil, server.Internal(s.deps.Scrubber.Scrub(fmt.Sprintf(
+			"the sync of workspace %q stopped before any branch was compared: the excluded-branch provider failed: %v",
+			w.Slug, err)))
+	}
+	for _, name := range names {
+		excluded[name] = true
+	}
+	return excluded, nil
+}
+
 // BranchOutcome is what a sync did with one branch of origin.
 type BranchOutcome string
 
@@ -130,9 +185,9 @@ type SyncResult struct {
 	// CreatedTags maps every tag the sync created in the copy to the object
 	// id it created it at, origin's value.
 	CreatedTags map[string]string
-	// Branches has one entry per branch of origin, sorted by name in byte
-	// order; it is empty, never nil, when origin has no branch, so that it
-	// marshals as [].
+	// Branches has one entry per branch of origin that the sync did not
+	// leave out, sorted by name in byte order; it is empty, never nil, when
+	// there is none, so that it marshals as [].
 	Branches []BranchResult
 }
 
@@ -146,7 +201,8 @@ type SyncResult struct {
 // every branch of origin in name order (see syncBranch), reports each in
 // Branches and tells the branch-move observers of each move right after it.
 // A branch only the hub has, never on origin or deleted there, is neither
-// looked at nor reported. Last it records the completion (see
+// looked at nor reported, and neither is a branch of a carry-patch workspace
+// that excludedBranches leaves out, although its origin head is fetched. Last it records the completion (see
 // completeSync). The caller has checked that the workspace may be synced;
 // opts.Actor must be the admin token or a user's credential.
 //
@@ -179,9 +235,16 @@ func (s *Service) Sync(ctx context.Context, slug string, opts SyncOptions) (Sync
 	if err != nil {
 		return SyncResult{}, err
 	}
+	excluded, err := s.excludedBranches(ctx, w)
+	if err != nil {
+		return SyncResult{}, err
+	}
 	branches := make([]BranchResult, 0, len(fetched.Branches))
 	var updated []refUpdate
 	for _, name := range slices.Sorted(maps.Keys(fetched.Branches)) {
+		if excluded[name] {
+			continue
+		}
 		b, before, err := s.syncBranch(ctx, repo, slug, name, fetched.Branches[name], opts.ResetToOrigin)
 		if err != nil {
 			return SyncResult{}, err

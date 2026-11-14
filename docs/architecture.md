@@ -2058,7 +2058,24 @@ other: sync reads neither the push rules nor `protected_branches` and
 `CreatedTags`, the tags it created, and `Branches`, one `BranchResult`
 (`name`, `result`, `local_sha`, `origin_sha` as JSON, the hub's head after
 the branch was handled and origin's head, full commit ids) per origin
-branch, sorted by name, empty and never nil when origin has no branch.
+branch it did not skip, sorted by name, empty and never nil when there is
+none.
+
+Before the walk, after the fetch and the tags, `excludedBranches` builds
+the set of branches the walk skips. For a record whose `Mode` is
+`ModeCarryPatch` it holds the record's `IntegrationBranch` (when set) and
+the names the registered `ExcludedBranchProvider` returns
+(`ExcludedBranches(ctx, slug) ([]string, error)`, asked once per sync);
+for any other mode it is empty and the provider is not asked. The provider
+is registered with `(*Service).RegisterExcludedBranchProvider`, one at a
+time, guarded by its own mutex, nil removing it; this package registers
+none, the patch feature does when the hub is composed. A skipped branch is
+not classified, moved, listed in `Branches` or the event, or told to the
+observers; its origin head is still set by the fetch, and `head_sha` and
+`origin_head_sha` are read as usual, also when the default branch is the
+integration branch. A provider error stops the sync before the walk with
+`server.Internal`, its text scrubbed by `Deps.Scrubber`: no branch moved,
+no sync field written, no event (tags created by then stay).
 
 A credential that cannot be resolved (nothing is then fetched), a fetch
 error and a fetch cut off at its deadline (`gitrepo.ErrDeadline`) are one

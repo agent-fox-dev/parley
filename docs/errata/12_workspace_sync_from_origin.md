@@ -127,3 +127,28 @@ moving it at that moment.
   `reset_to_origin=true`: its hook moves `zz` to a new child of the common
   ancestor, which makes `zz` diverged, and only a reset tries to swap a
   diverged branch again.
+
+## Branches a carry-patch workspace keeps out of sync
+
+- `RegisterExcludedBranchProvider` is a method of `*workspace.Service`,
+  like `RegisterPostCloneStep`. The provider implements
+  `ExcludedBranches(ctx, slug) ([]string, error)`, taking a context as well
+  as the slug. One provider is registered at a time; a later registration
+  replaces it and nil removes it.
+- The provider is asked after the fetch and the tag step, right before the
+  per-branch pass. A provider failure therefore leaves the tags that sync
+  created in the copy, as the fetch's origin heads stay. Only the branches,
+  the sync fields and the event are untouched, which is what the package
+  asks for.
+- The `500` message names the failure and includes the provider's error,
+  scrubbed by the hub's scrubber: `the sync of workspace "<slug>" stopped
+  before any branch was compared: the excluded-branch provider failed:
+  <error>`.
+- A name the provider returns that origin has no branch for changes
+  nothing.
+- The checks of the integration branch and of the provider are one test.
+  That test makes the fixture's record `carry_patch` with an `UPDATE` of
+  `workspace_mode` and `integration_branch`, not through a create. It also
+  removes the fixture's `dev` from origin so that `branches` is exactly the
+  list the check names. It syncs with `reset_to_origin=true` for both parts,
+  and then syncs the same refs as a `standard` workspace.
