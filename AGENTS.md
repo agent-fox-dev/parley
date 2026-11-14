@@ -8,8 +8,21 @@ Read `.specs/steering.md`, the project's steering directives:
 
 @.specs/steering.md
 
-1. **Read ADRs and errata** in `docs/` for architectural context.
-2. **Check git state:** `git log --oneline -20`, `git status --short --branch`.
+1. **Read the ADRs** in `docs/adr/`: the decisions the code follows, which
+   the code alone does not show.
+2. **Read the errata of what you build on**, not all of them:
+   `docs/errata/NN_*.md` for the specs your change depends on or whose code
+   it changes (NN is the spec number), and the project-wide ones, which have
+   no number.
+3. **Check git state:** `git log --oneline -20`, `git status --short --branch`.
+
+Do not read the rest of `docs/` to orient yourself. A spec package holds what
+a change needs from the PRDs in `docs/prd/`. The reference docs describe the
+code, and the code is authoritative: open one only to update it, at the
+section the change makes wrong, found by searching it.
+
+A subagent that is handed a brief by a session which did these steps works
+from the brief, and does not repeat steps 1 and 2.
 
 Only read files tracked by git (`git ls-files`): what `.gitignore` excludes
 is private notes and local secrets, not project material.
@@ -34,28 +47,18 @@ libraries — API signatures in specs may be unverified assumptions.
 
 ## Quality Commands
 
-| Command | What it does |
-|---------|-------------|
-| `make help` | List all targets |
-| `make build` | Build the project |
-| `make test` | Run all tests |
-| `make coverage` | Run all tests with a coverage report |
-| `make fmt` | Format all source files in place |
-| `make vet` | Static analysis |
-| `make lint` | Run the linter |
-| `make check` | `fmt`, `vet`, `lint` and `test` — use before committing |
-| `make doc` | Regenerate the API docs in `docs/generated/` (committed) |
-| `make clean` | Remove build output |
+The gate between tasks is what the spec packages define: every spec's
+`tasks.json` lists its `test_commands`, and `speca <package> --gate task`
+runs its `linter`, then its `all_tests` (`--gate full` at the baseline, after
+the integration task and on the merged tree). They must pass. Do not
+substitute a more thorough target for them between tasks.
 
-There is no `Makefile` yet, so none of these targets runs. Until one lands,
-use what the spec packages' `test_commands` use: `go test ./... -count=1` and
-`golangci-lint run ./...`.
-
-Run the full quality suite before committing:
-
-```
-make check
-```
+If the repository has a `Makefile` (or another task runner), look at its
+targets (`make help`, or read it). Where a target such as `check` is more
+thorough than the `test_commands` — for example `make check` running
+formatting, static analysis and linting on top of the tests — run it once,
+before committing a merge, on the merged tree. Where there is none, the gate
+on the merged tree is the last check.
 
 ## Git Workflow
 
@@ -101,7 +104,7 @@ When implementing a spec or any other feature:
 
 A session is not complete until:
 
-1. `make check` passes (no regressions).
+1. The quality suite (see Quality Commands) passes (no regressions).
 2. Changes are committed with a clear conventional commit message.
 3. The feature branch is pushed to origin and merged into `main`, and `main`
    is pushed.
