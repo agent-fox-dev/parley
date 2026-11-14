@@ -3450,6 +3450,17 @@ array, through `addSettings`, which parses the values with
 `ParseSettingFlags`, the one parser of `--setting`. `create --wait` polls
 `GET /workspaces/<slug>` through the shared wait.
 
+`parley fork` (`fork.go`) is `create` and `list`. `create` builds its body
+from its flags with `forkCreateBody`, which its wrapped argument check calls
+too, so that `--token-paths` without `--token-permissions` and words after
+`--` without `--sandbox-profile` are usage errors before any setting is
+resolved; the check counts only the arguments before `--` (cobra's
+`ArgsLenAtDash`), and the words after it become `sandbox.command`. It does
+not declare `ShowsOnce`, whose warning is unconditional: after printing the
+answer it warns on stderr only when the answer holds `token.token`. `list`
+sends a query parameter for each flag given (`listForks`), `--mine` as
+`owner=me`, and prints one page.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with

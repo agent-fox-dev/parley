@@ -765,12 +765,13 @@ func snapshot(t *testing.T, dir string) map[string]string {
 }
 
 // runAgainst runs parley with args against hub, presenting the credential K
-// through the global flags, with an empty configuration directory. A test
-// that calls it must not run in parallel.
+// through the global flags, with an empty configuration directory. The
+// global flags come first, so that words after a -- in args stay the
+// command's own. A test that calls it must not run in parallel.
 func runAgainst(t *testing.T, hub *stubHub, args ...string) (int, string, string) {
 	t.Helper()
 	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
-	return runCLI(t, slices.Concat(args, []string{"--endpoint-url", hub.URL, "--api-key", "K"})...)
+	return runCLI(t, slices.Concat([]string{"--endpoint-url", hub.URL, "--api-key", "K"}, args)...)
 }
 
 // sentRequest is the one request a command line must send: its method, its
