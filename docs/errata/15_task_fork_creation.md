@@ -70,3 +70,30 @@ with the production values the start hook `forks` sets (the hub git's
 `crypto/rand` generator). A test changes them with
 `(*hub.Composition).AdjustForks`, as `AdjustWorkspace` does for the
 workspace service.
+
+## The create checks `tokens:manage` itself
+
+The package leaves `tokens:manage` to the minting component. That
+component (`access.MintBound`, through `identity.MintPAT`) checks the input
+and the subset rule but not `tokens:manage`, which `POST
+/workspaces/:slug/tokens` gets from its route scope; the fork route's scope
+is `workspaces:write`. The create therefore checks it: a PAT caller whose
+body has `token` and whose permissions do not satisfy `tokens:manage` is
+answered `403 insufficient_scope` (`token: minting a token needs the scope
+tokens:manage`). The check runs inside the creation transaction just before
+the mint, so it keeps the token's place in the order of refusals, and the
+transaction is rolled back and the repository directory removed like any
+other refusal of the token.
+
+## A token's `expires` is a duration, passed to the minting component as an instant
+
+The minting component takes a lifetime in days (0, 30, 60 or 90) or an
+expiry instant, and gives a token without either a lifetime of 90 days. The
+fork body's `token.expires` has the form of `ttl` (a whole number above
+zero followed by `m`, `h` or `d`); the create reads it with
+`workspace.ParseDuration` when it reads the body, refusing any other value
+(`soon`, `0h`) with `400 invalid_request` (`token: expires: …`) before
+anything else is checked, and passes the minting component the instant of
+the fork's creation (whole seconds) plus that duration. Without `expires` it
+passes the lifetime 0, so the token never expires (`expires_at` `null`), as
+the package says, rather than the component's default of 90 days.

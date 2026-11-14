@@ -23,6 +23,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -346,4 +347,19 @@ func (w *world) unchanged(t *testing.T, before footprint) {
 func (w *world) patch(t *testing.T, cred, path string, body any) answer {
 	t.Helper()
 	return w.call(t, http.MethodPatch, path, cred, body)
+}
+
+// pat stores a PAT of dev with perms, paths (nil for none) and bound to
+// workspace ("" for none), and returns its secret and its id.
+func (w *world) pat(t *testing.T, workspace string, paths []string, perms ...string) (secret, id string) {
+	t.Helper()
+	w.insert(t, func(tx *sql.Tx) error {
+		var rec identity.PAT
+		var err error
+		secret, rec, err = identity.StorePAT(context.Background(), tx, identity.PATSpec{
+			UserID: w.dev, Name: "test", Permissions: perms, Paths: paths, Workspace: workspace, CreatedAt: w.clock()})
+		id = rec.TokenID
+		return err
+	})
+	return secret, id
 }

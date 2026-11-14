@@ -25,9 +25,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The PAT scope the create needs, and the event it writes.
+// The PAT scopes the create needs, the second only to mint a token, and
+// the event it writes.
 const (
-	scopeWrite = "workspaces:write"
+	scopeWrite  = "workspaces:write"
+	scopeTokens = "tokens:manage"
 	// EventFork is the type of the event a fork's creation writes.
 	EventFork = "parley.workspace.fork"
 )
@@ -76,11 +78,15 @@ type createRequest struct {
 }
 
 // tokenRequest is the token member of a create body: the token to mint,
-// bound to the fork, whose values the minting component judges.
+// bound to the fork. The create judges only expires, which the minting
+// component takes as an instant; the minting component judges the rest.
 type tokenRequest struct {
 	Name        *string  `json:"name"`
 	Permissions []string `json:"permissions"`
 	Paths       []string `json:"paths"`
+	Expires     *string  `json:"expires"`
+	// lifetime is expires as a duration, 0 for a token that never expires.
+	lifetime time.Duration
 }
 
 // createMember reads one member of a create body into the request; raw is
@@ -127,7 +133,14 @@ var createMembers = []createMember{
 		}
 		var t tokenRequest
 		if raw[0] != '{' || json.Unmarshal(raw, &t) != nil {
-			return errors.New("must be an object whose name is a string and whose permissions and paths are lists of strings")
+			return errors.New("must be an object whose name and expires are strings and whose permissions and paths are lists of strings")
+		}
+		if t.Expires != nil {
+			d, err := workspace.ParseDuration(*t.Expires)
+			if err != nil {
+				return fmt.Errorf("expires: %w", err)
+			}
+			t.lifetime = d
 		}
 		req.Token = &t
 		return nil
@@ -431,13 +444,7 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 		}
 		var tokenID *string
 		if req.Token != nil {
-			name := "fork:" + f.Slug
-			if req.Token.Name != nil {
-				name = *req.Token.Name
-			}
-			never := 0
-			pat, value, err := c.deps.Access.MintBound(ctx, tx, access.MintInput{Creator: p, Workspace: f.Slug,
-				Name: name, Permissions: req.Token.Permissions, Paths: req.Token.Paths, Expires: &never})
+			pat, value, err := c.mint(ctx, tx, p, f, *req.Token)
 			if err != nil {
 				return err
 			}
@@ -458,6 +465,30 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 		return createAnswer{}, err
 	}
 	return ans, nil
+}
+
+// mint mints in tx the token t that the caller p asks for with the fork f,
+// bound to f and owned by p's user, through the minting component, whose
+// refusals are the answer. A PAT caller must hold tokens:manage, as it must
+// to mint a bound token by its own route; the minting component holds it to
+// the subset rule. The token expires its lifetime after the fork's
+// creation, or never.
+func (c *Component) mint(ctx context.Context, tx *sql.Tx, p identity.Principal, f Fork, t tokenRequest) (identity.PAT, string, error) {
+	if p.Type == identity.TypePAT && !identity.Satisfies(p.Permissions, scopeTokens) {
+		return identity.PAT{}, "", server.InsufficientScope("token: minting a token needs the scope " + scopeTokens)
+	}
+	in := access.MintInput{Creator: p, Workspace: f.Slug, Name: "fork:" + f.Slug, Permissions: t.Permissions, Paths: t.Paths}
+	if t.Name != nil {
+		in.Name = *t.Name
+	}
+	if t.lifetime > 0 {
+		in.ExpiresAt = new(f.CreatedAt.Add(t.lifetime))
+	} else {
+		// Without expires the token lives as long as the fork; nil would
+		// be the minting component's default of 90 days.
+		in.Expires = new(0)
+	}
+	return c.deps.Access.MintBound(ctx, tx, in)
 }
 
 // mintedToken is the token member of a create's answer: the Token object
