@@ -14,7 +14,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-func TestAccess_ConfinesABoundTokenOnEveryRouteOfTheServedHub(t *testing.T) {
+func TestAccess_ConfinesABoundTokenAndReportsItsRefusalsOnTheServedHub(t *testing.T) {
 	t.Parallel()
 	var events *event.Component
 	h := hubtest.Start(t, func(c *hub.Composition) { events = c.Events() })
@@ -29,27 +29,34 @@ func TestAccess_ConfinesABoundTokenOnEveryRouteOfTheServedHub(t *testing.T) {
 	}
 	bound := h.IssuePAT(t, identity.PATSpec{UserID: alice, Permissions: []string{"users:read", "audit:read"}, Workspace: "w1"})
 
-	status, body := h.Call(t, http.MethodGet, "/api/v1/user", bound, nil)
-	var refused struct {
-		Error struct {
-			ErrorType string `json:"error_type"`
-		} `json:"error"`
-	}
-	if status != http.StatusForbidden || json.Unmarshal(body, &refused) != nil || refused.Error.ErrorType != "token_bound" {
-		t.Errorf("GET /user with a bound PAT = %d %s, want 403 token_bound", status, body)
+	// The second refusal comes within the minute of the first one's event.
+	for range 2 {
+		status, body := h.Call(t, http.MethodGet, "/api/v1/user", bound, nil)
+		var refused struct {
+			Error struct {
+				ErrorType string `json:"error_type"`
+			} `json:"error"`
+		}
+		if status != http.StatusForbidden || json.Unmarshal(body, &refused) != nil || refused.Error.ErrorType != "token_bound" {
+			t.Errorf("GET /user with a bound PAT = %d %s, want 403 token_bound", status, body)
+		}
 	}
 
+	const refusedType = "parley.token.bound_refused"
 	for _, tc := range []struct {
 		name, credential string
 		want             []string
 	}{
-		{"a bound PAT", bound, []string{"w1"}},
-		{"its user's API key", h.IssueKey(t, alice), []string{"w1", "w5"}},
+		{"a bound PAT", bound, []string{"w1 parley.change.open", "w1 " + refusedType}},
+		{"its user's API key", h.IssueKey(t, alice), []string{"w1 parley.change.open", "w5 parley.change.open", "w1 " + refusedType}},
 	} {
 		status, body := h.Call(t, http.MethodGet, "/api/v1/events/log", tc.credential, nil)
 		var page struct {
 			Items []struct {
-				Workspace string `json:"workspace"`
+				Workspace string         `json:"workspace"`
+				Type      string         `json:"type"`
+				ActorType string         `json:"actor_type"`
+				Metadata  map[string]any `json:"metadata"`
 			} `json:"items"`
 		}
 		if status != http.StatusOK || json.Unmarshal(body, &page) != nil {
@@ -58,10 +65,13 @@ func TestAccess_ConfinesABoundTokenOnEveryRouteOfTheServedHub(t *testing.T) {
 		}
 		var got []string
 		for _, it := range page.Items {
-			got = append(got, it.Workspace)
+			got = append(got, it.Workspace+" "+it.Type)
+			if it.Type == refusedType && (it.ActorType != "pat" || it.Metadata["route"] != "/api/v1/user" || it.Metadata["suppressed"] != 0.0) {
+				t.Errorf("GET /events/log with %s: refusal event %+v, want the PAT's GET /api/v1/user with suppressed 0", tc.name, it)
+			}
 		}
 		if !slices.Equal(got, tc.want) {
-			t.Errorf("GET /events/log with %s: events of %v, want %v", tc.name, got, tc.want)
+			t.Errorf("GET /events/log with %s: events %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

@@ -278,10 +278,14 @@ func (r loggedRecords) Record(ctx context.Context, slug string) (access.Record, 
 }
 
 // recordingEmitter is an event emitter that remembers, in order, each event
-// and the transaction it was emitted in, nil for one emitted now.
+// and the transaction it was emitted in, nil for one emitted now. When err
+// is set it returns err after remembering the event, and when panics is set
+// it panics instead, as a broken event log would.
 type recordingEmitter struct {
 	mu      sync.Mutex
 	emitted []emitted
+	err     error
+	panics  bool
 }
 
 type emitted struct {
@@ -295,7 +299,10 @@ func (e *recordingEmitter) Emit(_ context.Context, tx *sql.Tx, ev access.Event) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.emitted = append(e.emitted, emitted{ev, tx})
-	return nil
+	if e.panics {
+		panic("the event log is broken")
+	}
+	return e.err
 }
 
 func (e *recordingEmitter) EmitNow(_ context.Context, ev access.Event) error {
@@ -342,15 +349,50 @@ func newGuardHub(t *testing.T) *guardHub {
 	h := &guardHub{t: t, st: st, ids: &identity.Service{}, svc: &access.Service{},
 		orgs: map[string][]string{}, refusals: &refusalLog{}, calls: &atomic.Int64{}}
 	h.ids.Bind(identity.Deps{Store: st})
+	h.bind(h.refusals)
+	h.srv = h.pipeline(true)
+	return h
+}
+
+// bind binds the hub's service to its store and orgs, with the guard's
+// refusals going to refusals.
+func (h *guardHub) bind(refusals access.RefusalReporter) {
 	h.svc.Bind(access.Deps{
-		Records: access.StoreRecords(st.Main()),
+		Records: access.StoreRecords(h.st.Main()),
 		Memberships: access.MembershipsFunc(func(_ context.Context, userID string) ([]string, error) {
 			return h.orgs[userID], nil
 		}),
-		Refusals: h.refusals,
+		Refusals: refusals,
 	})
-	h.srv = h.pipeline(true)
-	return h
+}
+
+// limit puts a refusal limiter built anew, as at the hub's start, between
+// the guard and events, with clock as its clock and logger as its log.
+func (h *guardHub) limit(events access.EventEmitter, clock *testClock, logger *slog.Logger) {
+	h.bind(access.NewRefusalLimiter(events, clock.now, logger))
+}
+
+// testClock is a clock that stands still until the test advances it.
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newTestClock() *testClock {
+	return &testClock{t: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *testClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+// advance moves the clock on by d.
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
 }
 
 // pipeline is a server with the hub's checks installed, the binding guard

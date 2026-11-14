@@ -50,7 +50,7 @@ type Refusal struct {
 
 // RefusalReporter is told of every request the binding guard refuses, after
 // the refusal is decided and before it is answered. It cannot change the
-// answer.
+// answer. In the hub it is a RefusalLimiter.
 type RefusalReporter interface {
 	Refused(ctx context.Context, f Refusal)
 }

@@ -56,12 +56,14 @@ func CallerFrom(c server.Caller) Caller {
 }
 
 // Deps are what the service reads: the workspace records and the
-// memberships of users in active organizations, and where the binding guard
-// reports its refusals (nil discards them).
+// memberships of users in active organizations, where the binding guard
+// reports its refusals (nil discards them), and the event emitter through
+// which the service emits its own events.
 type Deps struct {
 	Records     RecordReader
 	Memberships Memberships
 	Refusals    RefusalReporter
+	Events      EventEmitter
 }
 
 // Service is the access rule. The hub registers its zero value when it

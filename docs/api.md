@@ -234,6 +234,30 @@ method and its pattern as registered, with the parameter names given here
 (`:slug`, `:number`, `:sha`, `:version`, `:id`). A route added later
 reaches a bound token only when it is registered under exactly these names.
 
+**Refusal events.** Each `403` and `404` the guard answers, on the REST API
+and on git, is reported as a hub event of type `parley.token.bound_refused`,
+at most one per token per minute. The minute starts when the token's event
+is emitted; the token's refusals inside it emit nothing and are counted, and
+the token's next event carries the count as `suppressed` (`0` when there
+was none). Every token is limited on its own, and the count is kept in
+memory only, so a restart of the hub starts every token afresh. The answer
+to the refused request is the same whether it is reported or counted, and
+whether or not the event could be written. A request the guard lets
+through, or that another check answers (`401`, `insufficient_scope`, the
+access rule's `404`), is neither reported nor counted. The event, as
+[`GET /api/v1/events/log`](#get-apiv1eventslog) shows it to the admin token
+and to a user with level `owner` or `admin` on the bound workspace:
+
+```json
+{"seq":12,"id":"…","type":"parley.token.bound_refused","time":"2026-11-14T12:01:00Z","workspace":"w1","actor_type":"pat","actor_id":"u_1","resource_type":"token","resource_id":"t_1","action":"bound_refused","session_id":null,"metadata":{"bound_workspace":"w1","method":"GET","requested_workspace":"w5","route":"/api/v1/workspaces/:slug/probe","status":404,"suppressed":3,"surface":"api","token_id":"t_1"}}
+```
+
+`workspace` is the bound slug; `metadata.route` is the matched route's
+pattern without the method (on git, the git route's pattern), `status` the
+answered status, `surface` `api` or `git`, and `requested_workspace`, the
+slug exactly as the request typed it, is present only when the request
+named a workspace.
+
 ## Request ids and response headers
 
 Every response the hub sends, on the REST API, on the built-in routes, for an

@@ -29,7 +29,9 @@ import (
 // the pipeline, so that it runs for every REST route, and the start hook
 // gives the event component the covered set of a workspace-bound token, from
 // which the event routes confine such a token's events to what its binding
-// covers.
+// covers. The guard's refusals go to a refusal limiter, which reports them
+// as rate-limited events through the event component; the limiter is built
+// in the start hook, so each start of the hub begins with none counted.
 func composeAccess(c *Composition) {
 	svc := &access.Service{}
 	c.access = svc
@@ -40,7 +42,11 @@ func composeAccess(c *Composition) {
 	c.addRouteRule(refusePublicNeed)
 	c.AddStartHook("access", func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
-		svc.Bind(access.Deps{Records: access.StoreRecords(db), Memberships: activeOrgs(db)})
+		events := accessEvents{c}
+		svc.Bind(access.Deps{
+			Records: access.StoreRecords(db), Memberships: activeOrgs(db),
+			Refusals: access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events,
+		})
 		c.Events().SetCoverage(coverage(svc))
 		return nil
 	})
@@ -56,6 +62,36 @@ func coverage(svc *access.Service) event.Coverage {
 		})
 		return slices.Contains(covered, slug), err
 	})
+}
+
+// accessEvents is the hub's event component as the access service emits
+// through it (access.EventEmitter). The access package cannot import the
+// event component, which imports it, so this converts its events. It reads
+// the component from the composition at each emit, since the events part is
+// composed after the access part.
+type accessEvents struct{ c *Composition }
+
+func (e accessEvents) Emit(ctx context.Context, tx *sql.Tx, ev access.Event) error {
+	_, err := e.c.Events().Emit(ctx, tx, eventInput(ev))
+	return err
+}
+
+func (e accessEvents) EmitNow(ctx context.Context, ev access.Event) error {
+	_, err := e.c.Events().EmitNow(ctx, eventInput(ev))
+	return err
+}
+
+// eventInput is ev as the event component takes it: an empty workspace or
+// actor is none.
+func eventInput(ev access.Event) event.Input {
+	in := event.Input{Type: ev.Type, ActorType: ev.ActorType, ResourceType: ev.ResourceType, ResourceID: ev.ResourceID, Metadata: ev.Metadata}
+	if ev.Workspace != "" {
+		in.Workspace = &ev.Workspace
+	}
+	if ev.ActorID != "" {
+		in.ActorID = &ev.ActorID
+	}
+	return in
 }
 
 // activeOrgs is the membership question of the hub: the active orgs of a

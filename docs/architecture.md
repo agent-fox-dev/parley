@@ -1171,8 +1171,16 @@ keeps data for a user or an org registers its remover from its part in
 its `Guard` as the pipeline's binding guard (`SetBindingGuard`), adds its
 `Check` to the access checks, after identity's admin check, and binds it in
 the start hook `access` to `access.Deps{Records:
-access.StoreRecords(rt.Store.Main()), Memberships: ...}`, the membership
-source being `identity.ActiveOrgIDs` over the same store. The same hook
+access.StoreRecords(rt.Store.Main()), Memberships: ..., Refusals:
+access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events}`, the
+membership source being `identity.ActiveOrgIDs` over the same store and
+`events` the adapter `accessEvents`, which implements
+`access.EventEmitter` over the event component: it converts an
+`access.Event` to an `event.Input` (an empty `Workspace` or `ActorID`
+becomes nil, `Metadata` is passed as is) and calls `c.Events().Emit` or
+`EmitNow`, reading the component from the composition at each emit, since
+`composeEvents` comes after `composeAccess`. The limiter is built in the
+hook, so every start of the hub begins with no refusal counted. The same hook
 installs the covered set of workspace-bound tokens in the event component,
 `c.Events().SetCoverage(...)`: an `event.CoverageFunc` that answers whether
 `(*access.Service).CoveredSet` of the caller contains the slug, with the
@@ -1469,9 +1477,32 @@ only when it is registered with these parameter names.
 access.Event)` in the caller's transaction, `EmitNow(ctx, access.Event)` in
 one of its own) over the value `access.Event{Type, Workspace, ActorType,
 ActorID, ResourceType, ResourceID, Metadata}`. The event component imports
-`internal/access`, so this package cannot name `event.Input`, and the event
-component is to be passed behind the interface. There is no discarding
-default; nothing emits through it yet.
+`internal/access`, so this package cannot name `event.Input`, and the hub
+passes the event component behind the interface (`accessEvents` in
+`internal/hub/access.go`). There is no discarding default.
+
+`internal/access/refusal.go` holds the hub's `RefusalReporter`,
+`access.RefusalLimiter`, built with `access.NewRefusalLimiter(events, now,
+logger)` (nil `now` is `time.Now`, nil `logger` discards). It keeps, in
+memory and under a mutex, for each token id the time of the token's last
+event and the count of refusals suppressed since. A refusal of a token
+with no event in the preceding 60 seconds is emitted with `EmitNow` as
+`access.RefusedEventType` (`parley.token.bound_refused`): workspace the
+bound slug, actor type `pat` and actor the token's user, resource `token`
+and the token id, and metadata `token_id`, `bound_workspace`, `method`,
+`route`, `status`, `surface`, `suppressed` (the count, then reset to 0) and,
+only when the request named a workspace, `requested_workspace`, the slug as
+typed; the token's minute starts then. A refusal inside the minute emits
+nothing and adds 1 to the count. Each refusal first drops every entry
+whose minute has passed with a count of 0, so the map holds only the
+tokens refused in the last minute or with refusals still to report. The
+emit runs after the guard has decided the answer, with the request's
+context detached from its cancellation, and cannot change it: an error, or
+a panic, which it recovers, is logged once at warn level (`the refusal of
+a workspace-bound token was not recorded`, with `token_id`,
+`bound_workspace` and `error`, never a token value) and not retried, and
+the token's minute counts as started. A limiter without an emitter logs
+the same warning.
 
 ### Hub events
 
