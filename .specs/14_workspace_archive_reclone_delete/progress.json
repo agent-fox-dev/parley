@@ -3,7 +3,7 @@
   "spec_id": "14",
   "spec_name": "workspace_archive_reclone_delete",
   "schema_version": 3,
-  "updated_at": "2026-11-14T13:58:11Z",
+  "updated_at": "2026-11-14T14:03:02Z",
   "tasks": [
     {
       "id": 1,
@@ -19,7 +19,7 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,

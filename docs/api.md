@@ -1741,6 +1741,52 @@ object [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers.
 | `409` `workspace_archived` | the workspace is `archived` already (`workspace "<slug>" is archived`) |
 | `500` `internal` | the status change or its event could not be written; the workspace is as it was |
 
+## `POST /api/v1/workspaces/{slug}/reactivate`
+
+Brings the archived repository workspace `{slug}` back into service. It
+takes the admin token, an API key or a PAT, declares the scope
+`workspaces:write` for a PAT and needs write access to the workspace (see
+[Workspace access](#workspace-access)): its owner or the admin token. The
+route reads no body; one that passes the content-type and size rules is
+ignored.
+
+A workspace in status `archived` is reactivated; the checks run in the
+order of the table below, and a refused reactivate changes nothing. In one
+store transaction `status` becomes `pending`, `clone_error` is cleared and
+one `parley.workspace.reactivate` event is written; when that transaction
+fails nothing has changed and the answer is `500 internal`. Once it has
+committed, the clone work of the workspace is started. When the copy the
+archive kept is still valid, the clone work brings the workspace to
+`ready` from it, with its branches and its `head_sha`, without contacting
+origin; when the copy is missing or does not open as a repository, the
+clone work makes a fresh copy from origin, which holds origin's branches
+and nothing that existed only in the hub.
+
+The event has `workspace` the slug, `resource_type` `workspace`,
+`resource_id` the slug, as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug), and an
+empty `metadata`.
+
+```json
+{"seq":17,"id":"…","type":"parley.workspace.reactivate","time":"2026-11-14T10:45:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"reactivate","session_id":null,"metadata":{}}
+```
+
+The answer is the workspace object, read after the reactivate, with
+`status` `pending`, `clone_error` `null` and `access` the caller's level,
+the object [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug)
+answers; read it again to see the clone work reach `ready` or `failed`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the workspace is back in `pending` and its clone work is started; the body is the workspace object |
+| `400` `not_supported_on_fork` | the workspace is a task fork (`workspace "<slug>" is a task fork, which cannot be reactivated on its own`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a delete is running; try again later`) |
+| `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
+| `500` `internal` | the status change or its event could not be written; the workspace is still `archived` |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

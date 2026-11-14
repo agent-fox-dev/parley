@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push` and `POST /api/v1/workspaces/:slug/archive` (see Archive) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive holds with `ClearMarkers`, which releases every marker at start, and the teardown set `Teardown` with `RemoveOwned`, through which an archive and a delete reach the data other packages keep for a workspace (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push`, `POST /api/v1/workspaces/:slug/archive` (see Archive) and `POST /api/v1/workspaces/:slug/reactivate` (see Reactivate) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive holds with `ClearMarkers`, which releases every marker at start, and the teardown set `Teardown` with `RemoveOwned`, through which an archive and a delete reach the data other packages keep for a workspace (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -2353,6 +2353,32 @@ it is still `m`, when `fn` returns or panics; a failure to release is
 logged. Neither write changes `updated_at`. `ClearMarkers(ctx, ex)`
 releases every marker; the start hook `workspaces` calls it, so that a
 hub that stopped during an operation starts with no marker.
+
+#### Reactivate
+
+`internal/workspace/reactivate.go` holds `POST /workspaces/:slug/reactivate`
+(scope `workspaces:write`, `access.MarkNeed` `write`, as for the archive;
+the body is not read). The handler reads the record and refuses
+(`reactivateRefusal`), in this order, a fork (`400 not_supported_on_fork`),
+a set marker (`409 workspace_busy`, `RequireReady`'s message), and every
+status other than `archived`, `pending` and `cloning` included (`409
+workspace_not_archived`). It holds no marker: it only writes the record.
+Detached from the request's cancellation, in one store transaction it sets
+`status` `pending`, clears `clone_error` and sets `updated_at` with the
+conditional write `UPDATE workspaces SET ... WHERE slug = ? AND status =
+'archived' AND maintenance = ''`, so that it cannot slip in beside an
+operation that holds the marker, and emits `parley.workspace.reactivate`
+(actor as for the other workspace events, `resource_type` `workspace`,
+`metadata` `{}`). A write that changes no row is answered from the record
+read again (`lostReactivate`: the refusal it now gets, `404` when it is
+gone, else `409 workspace_busy`); any other failure of the transaction is
+a `500 internal` with nothing changed. After the commit it calls
+`(*Service).Enqueue(slug)` and answers the record read again, rendered by
+`RenderWorkspace`. The clone work then keeps the copy the archive left when
+it is valid for the record (`keepCopy`: it opens, its instance id and
+origin url are the record's and the default branch resolves), so that the
+workspace is `ready` again without a request to origin, and makes a fresh
+clone otherwise.
 
 ### Hub events
 
