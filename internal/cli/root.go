@@ -6,6 +6,7 @@ package cli
 import (
 	"context"
 	"io"
+	"net/http"
 	"os"
 	"time"
 
@@ -37,6 +38,10 @@ type options struct {
 	// returns ctx's error as soon as ctx ends; tests replace it with a fake
 	// clock, so no reconnect takes real seconds.
 	reconnectWait func(ctx context.Context, d time.Duration) error
+	// transport, when set, wraps the transport of the client a command
+	// sends its requests through; tests read there the deadline each
+	// request runs under, which no test can wait out.
+	transport func(http.RoundTripper) http.RoundTripper
 }
 
 func defaultOptions() options {

@@ -3,7 +3,7 @@
   "spec_id": "52",
   "spec_name": "durable_event_log_and_stream",
   "schema_version": 3,
-  "updated_at": "2026-11-14T02:26:28Z",
+  "updated_at": "2026-11-14T02:30:06Z",
   "tasks": [
     {
       "id": 1,
@@ -43,7 +43,7 @@
     },
     {
       "id": 10,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 11,

@@ -27,6 +27,10 @@ const (
 	maxReconnectWait   = 30 * time.Second
 )
 
+// maxListWait bounds the --wait of parley events list, in seconds, that is
+// added to its request timeout.
+const maxListWait = 24 * 60 * 60
+
 // maxFrameLine bounds one line of the event stream, in bytes. The hub sends
 // an event record on one line, far shorter; a URL that points elsewhere
 // could send one line without end.
@@ -42,9 +46,10 @@ var stopStatuses = []int{
 	http.StatusGone,
 }
 
-// newEventsCommand builds parley events: the hub's event stream.
+// newEventsCommand builds parley events: the hub's event stream and its
+// event log.
 func newEventsCommand() *cobra.Command {
-	return group("events", "Follow the hub's events",
+	return group("events", "Follow the hub's events, or read them a page at a time",
 		declare(command{
 			Name:        "tail",
 			Description: "Follow the hub's events as they happen, one JSON line each, reconnecting by itself until interrupted",
@@ -54,7 +59,52 @@ func newEventsCommand() *cobra.Command {
 			Flags:       addEventFilterFlags,
 			Run:         tailEvents,
 		}),
+		declare(command{
+			Name:        "list",
+			Description: "Read one page of the hub's event log, waiting up to --wait seconds for an event when there is none",
+			Method:      http.MethodGet,
+			Path:        "/events/log",
+			Auth:        authUser,
+			Flags: func(fs *pflag.FlagSet) {
+				addEventFilterFlags(fs)
+				fs.Int("limit", 0, "the most events the page holds; the hub's default, 50, when not given")
+				fs.Int("wait", 0, "how many seconds the hub may hold the request while there is no event to return")
+			},
+			Run: listEvents,
+		}),
 	)
+}
+
+// listEvents is the run step of parley events list. It sends one request
+// with the query parameters of the flags given and prints the hub's page.
+// The hub may hold the request for --wait seconds before it answers, so the
+// request's timeout is the usual one plus that wait.
+func listEvents(c *call) error {
+	query := eventFilters(c)
+	if n, ok := c.after(); ok {
+		query.Set("after", strconv.FormatInt(n, 10))
+	}
+	// An integer the hub would refuse (a limit of 0, a wait of 61) is sent
+	// as given, so that the hub's own error says what is wrong with it.
+	for _, name := range []string{"limit", "wait"} {
+		if f := c.cmd.Flags().Lookup(name); f.Changed {
+			query.Set(name, f.Value.String())
+		}
+	}
+	wait, _ := c.cmd.Flags().GetInt("wait")
+	// The hub answers a wait above its limit at once; the bound only keeps
+	// the sum from overflowing.
+	wait = min(max(wait, 0), maxListWait)
+	resp, err := c.client.send(c.ctx, apiRequest{
+		method:  c.decl.Method,
+		path:    c.decl.Path,
+		query:   query,
+		timeout: c.client.timeout + time.Duration(wait)*time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	return c.printAnswer(resp)
 }
 
 // addEventFilterFlags registers the flags that choose which events a
