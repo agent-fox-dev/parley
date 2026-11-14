@@ -1406,6 +1406,21 @@ stops with `500` `internal` before any branch is compared: no branch moves,
 no field is written and no event is emitted. A `standard` workspace leaves
 nothing out, whatever its `integration_branch`.
 
+The patch feature may also register a sync extension in the hub, which
+runs inside the sync of a `carry_patch` workspace, never of a `standard`
+one, at two points: right after the fetch of origin, before any tag or
+branch is created or moved, and after the comparison of every branch,
+before the completion is recorded. Both run to their end when the caller
+disconnects. If the first fails, the sync ends as a failed fetch: nothing
+moves, `sync_error` is set and the answer is `502` `upstream_error`, whose
+message is the extension's error, scrubbed as below and without the prefix
+`origin fetch failed: `. If the second fails, the answer is `500`
+`internal` with its error, scrubbed, as message; the completion is not
+recorded (no field is written and no event emitted) and the branches moved
+before stay moved. When the second succeeds it may set `upstream_head_sha`,
+written in the completion's transaction, and add members to the answer.
+Without an extension a `carry_patch` workspace syncs as described here.
+
 Sync takes no lock on the workspace and never changes its `status`. A
 branch that another writer (a push, a landing, another sync) moves between
 the comparison and the swap keeps that writer's head: the sync compares it
@@ -1486,7 +1501,9 @@ recorded, so that it carries the new `last_sync_at`, `sync_error`,
 `access` the caller's level, and the member `branches`: one entry per
 branch of origin that the sync did not leave out, in byte order of the
 names, an empty list when there is none. `local_sha` is the hub's head of the branch after the sync,
-`origin_sha` origin's head as the fetch found it.
+`origin_sha` origin's head as the fetch found it. The members a sync
+extension adds come after `branches`, in byte order of their names; one
+whose name the workspace object or `branches` has already is left out.
 
 ```json
 {"slug":"demo","kind":"repository","status":"ready","access":"owner","…":"…","branches":[{"name":"dev","result":"diverged","local_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_sha":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"name":"main","result":"fast_forward","local_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"}]}
@@ -1494,7 +1511,7 @@ names, an empty list when there is none. `local_sha` is the hub's head of the br
 
 | Status | When |
 |---|---|
-| `200 OK` | the sync completed, diverged branches included; the body is the workspace object plus `branches` |
+| `200 OK` | the sync completed, diverged branches included; the body is the workspace object plus `branches`, and the members a sync extension adds |
 | `400` `invalid_request` | `reset_to_origin` is neither `true` nor `false`, or given more than once (`reset_to_origin must be given once, as true or false`) |
 | `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to sync from`) |
 | `400` `sync_disabled` | the workspace's setting `sync_enabled` is `false` (`workspace "<slug>" has sync disabled; set sync_enabled to true to sync it`) |
@@ -1504,8 +1521,8 @@ names, an empty list when there is none. `local_sha` is the hub's head of the br
 | `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
-| `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`); nothing in the hub's repository changed and `sync_error` holds the same text |
-| `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
+| `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`), or the first stage of a sync extension failed (`<its error, scrubbed>`); nothing in the hub's repository changed and `sync_error` holds the same text |
+| `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), the second stage of a sync extension failed (`<its error, scrubbed>`) or added a member that is not JSON, a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

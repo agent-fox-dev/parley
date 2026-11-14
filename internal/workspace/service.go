@@ -125,6 +125,9 @@ type Service struct {
 	excludeMu       sync.RWMutex
 	excludeProvider ExcludedBranchProvider
 
+	extMu   sync.RWMutex
+	syncExt SyncExtension
+
 	// fetchLocks serialises the syncs' fetches into one copy.
 	fetchLocks keyedLocks
 }

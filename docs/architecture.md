@@ -2081,11 +2081,35 @@ A credential that cannot be resolved (nothing is then fetched), a fetch
 error and a fetch cut off at its deadline (`gitrepo.ErrDeadline`) are one
 failure, handled by `failFetch`: the text `origin fetch failed: ` plus the
 error, scrubbed by `Deps.Scrubber` with the credential's password, is
-logged (`workspace sync could not fetch origin`), written as the record's
+logged (`workspace sync could not fetch`), written as the record's
 `sync_error` alone by `recordSyncError` (no other field, no event), and
 returned as `server.UpstreamError` with the same text. Nothing in the copy
 has changed at that point: the fetch is atomic and tags are created after
 it.
+
+`internal/workspace/sync_extension.go` declares the extension point of the
+carry-patch part of sync: `SyncExtension` with `AfterFetch(ctx, SyncRun)
+error` and `BeforeCompletion(ctx, SyncRun, []BranchResult) (SyncAddition,
+error)`, registered with `(*Service).RegisterSyncExtension`, one at a time,
+guarded by its own mutex, nil removing it; this package imports no
+carry-patch package and registers none. `SyncRun` holds the record as read
+before the fetch, the caller (`Actor`), `ResetToOrigin` and `OriginHeads`,
+a copy of origin's branch heads as fetched. `Sync` takes the extension once,
+after the fetch, and only for a record whose `Mode` is `ModeCarryPatch`;
+with none, or for a standard workspace, nothing changes. The order is: the
+fetch, `AfterFetch`, the tags, `excludedBranches`, the walk,
+`BeforeCompletion` (given a copy of `Branches`), `completeSync`. Both
+stages run on the sync's context, which the route has detached from the
+request. An `AfterFetch` error goes to `failFetch` without the `origin fetch
+failed: ` prefix, so a caller tells the two apart: `sync_error` and `502
+upstream_error` with the scrubbed text, nothing moved, no event. A
+`BeforeCompletion` error is `server.Internal` with its text scrubbed with
+the credential's password, as is a member whose value is not valid JSON;
+`completeSync` does not run (no field, no event) and the moves made stay.
+On success `SyncAddition.UpstreamHeadSHA`, when not nil, is written as
+`upstream_head_sha` by `recordSync` in the completion transaction
+(`COALESCE`, so nil leaves it), and `SyncAddition.Members` reach the route as
+`SyncResult.Members`.
 
 Each `created`, `fast_forward` or `reset` move is reported right after the
 ref changed through the exported `(*Service).NotifyBranchMove(ctx,
@@ -2131,7 +2155,9 @@ so a caller who disconnects does not stop it, with the caller from
 `identity.PrincipalOf` as `SyncOptions.Actor`, and answers `200` with the
 `RenderWorkspace` object of `SyncResult.Workspace`, the record after the
 completion, for the caller's level (`access.DecisionOf`) and the member
-`branches`. An error of `Sync` that is a `*server.Error`,
+`branches`; `syncAnswerJSON` appends each of `SyncResult.Members` after
+them, in byte order of the names, leaving out a name the object or
+`branches` has already. An error of `Sync` that is a `*server.Error`,
 wrapped or not, is the answer; any other is `500 internal`.
 
 ### Hub events

@@ -173,3 +173,29 @@ moving it at that moment.
   whole seconds or more (`50ms` is a usage error). The argument-count and
   `--timeout 0s` refusals and the `502` refusal are rows of the workspace
   commands' shared tests of a bad command line and of the hub's refusal.
+
+## The sync extension point
+
+- `RegisterSyncExtension` is a method of `*workspace.Service`, like
+  `RegisterExcludedBranchProvider`. One extension is registered at a time;
+  a later registration replaces it and nil removes it.
+- The run value is `SyncRun{Workspace, Actor, ResetToOrigin, OriginHeads}`:
+  the record as the sync read it before the fetch, the caller as an
+  `identity.Principal`, the flag, and a copy of origin's branch heads as
+  fetched. The second stage gets a copy of the per-branch results.
+- `SyncAddition.Members` is a `map[string]json.RawMessage`. A member whose
+  value is not valid JSON stops the sync with `500 internal` before the
+  completion is recorded, as an error of the second stage does, since the
+  answer could not carry it.
+- The extra members follow the workspace object's members and `branches`
+  in the answer, in byte order of their names. A member whose name the
+  object or `branches` has already is left out without an error.
+- The text of a failed first stage is the extension's error, scrubbed, with
+  no prefix; only a failed origin fetch begins with `origin fetch failed: `.
+  The log line of both is `workspace sync could not fetch`. The `500`
+  message of a failed second stage is the scrubbed error text alone.
+- The check that a disconnect stops neither stage is a second sync in the
+  stage-order test, not a part of the first one: a request the caller
+  cancels has no status to assert. The tests' workspace is `demo`, not
+  `my-project`, and the members test also returns a member named
+  `branches`, to show that it is not replaced either.

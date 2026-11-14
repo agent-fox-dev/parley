@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -189,6 +190,9 @@ type SyncResult struct {
 	// leave out, sorted by name in byte order; it is empty, never nil, when
 	// there is none, so that it marshals as [].
 	Branches []BranchResult
+	// Members are the members the sync extension added for the answer (see
+	// SyncAddition); nil without one.
+	Members map[string]json.RawMessage
 }
 
 // Sync brings the copy of the workspace slug up to date with its origin: it
@@ -205,6 +209,14 @@ type SyncResult struct {
 // that excludedBranches leaves out, although its origin head is fetched. Last it records the completion (see
 // completeSync). The caller has checked that the workspace may be synced;
 // opts.Actor must be the admin token or a user's credential.
+//
+// For a carry-patch workspace the registered SyncExtension runs at two
+// points: AfterFetch right after the fetch, before any tag or branch moves,
+// and BeforeCompletion after the per-branch pass, before the completion is
+// recorded, whose upstream_head_sha and extra answer members it gives. An
+// error of AfterFetch fails the sync as a fetch does (see failFetch); one
+// of BeforeCompletion is an internal error, and the completion is not
+// recorded.
 //
 // Sync takes no lock on the workspace and never writes its status: syncs of
 // one workspace wait only for one another's fetch (see fetchOrigin), and
@@ -223,9 +235,16 @@ func (s *Service) Sync(ctx context.Context, slug string, opts SyncOptions) (Sync
 	if !found {
 		return SyncResult{}, fmt.Errorf("sync workspace %q: %w", slug, ErrNotFound)
 	}
-	fetched, err := s.fetchOrigin(ctx, w)
+	fetched, cred, err := s.fetchOrigin(ctx, w)
 	if err != nil {
 		return SyncResult{}, err
+	}
+	ext := s.syncExtension(w)
+	run := SyncRun{Workspace: w, Actor: opts.Actor, ResetToOrigin: opts.ResetToOrigin, OriginHeads: maps.Clone(fetched.Branches)}
+	if ext != nil {
+		if err := ext.AfterFetch(ctx, run); err != nil {
+			return SyncResult{}, s.failFetch(ctx, slug, cred, err.Error())
+		}
 	}
 	repo, err := s.deps.Git.Open(ctx, s.RepoPath(slug))
 	if err != nil {
@@ -258,23 +277,48 @@ func (s *Service) Sync(ctx context.Context, slug string, opts SyncOptions) (Sync
 	for name, id := range created {
 		updated = append(updated, newRefUpdate("refs/tags/"+name, "", id))
 	}
+	var add SyncAddition
+	if ext != nil {
+		if add, err = s.beforeCompletion(ctx, ext, run, branches, cred); err != nil {
+			return SyncResult{}, err
+		}
+	}
 	in := syncEventInput(slug, branches, updated)
 	in.ActorType, in.ActorID = actorType, actorID
-	rec, err := s.completeSync(ctx, repo, w, fetched.Branches, in)
+	rec, err := s.completeSync(ctx, repo, w, fetched.Branches, add.UpstreamHeadSHA, in)
 	if err != nil {
 		return SyncResult{}, err
 	}
-	return SyncResult{Workspace: rec, CreatedTags: created, Branches: branches}, nil
+	return SyncResult{Workspace: rec, CreatedTags: created, Branches: branches, Members: add.Members}, nil
+}
+
+// beforeCompletion runs the second stage of ext for the sync run whose
+// per-branch pass gave branches. Its error, and a member whose value is not
+// JSON, which the answer could not carry, are an internal error with the
+// text scrubbed of the hub's secret values and of cred's secret.
+func (s *Service) beforeCompletion(ctx context.Context, ext SyncExtension, run SyncRun, branches []BranchResult, cred Credential) (SyncAddition, error) {
+	add, err := ext.BeforeCompletion(ctx, run, slices.Clone(branches))
+	if err != nil {
+		return SyncAddition{}, server.Internal(s.deps.Scrubber.Scrub(err.Error(), cred.Password))
+	}
+	for _, name := range slices.Sorted(maps.Keys(add.Members)) {
+		if !json.Valid(add.Members[name]) {
+			return SyncAddition{}, server.Internal(fmt.Sprintf(
+				"the sync of workspace %q stopped: the sync extension's member %q is not JSON", run.Workspace.Slug, name))
+		}
+	}
+	return add, nil
 }
 
 // completeSync records that the sync of w completed, in one store
 // transaction with its event in: last_sync_at the hub's time cut to the
 // second, sync_error cleared, head_sha the copy's head of w's default branch
 // and origin_head_sha origin's head of it in originHeads, each null when
-// there is none. updated_at is not written. It returns the record read
-// again after the transaction.
-func (s *Service) completeSync(ctx context.Context, repo *gitrepo.Repo, w Workspace, originHeads map[string]string, in event.Input) (Workspace, error) {
-	f := syncFields{LastSyncAt: s.deps.Now().UTC().Truncate(time.Second)}
+// there is none, and upstream_head_sha upstream when it is not nil.
+// updated_at is not written. It returns the record read again after the
+// transaction.
+func (s *Service) completeSync(ctx context.Context, repo *gitrepo.Repo, w Workspace, originHeads map[string]string, upstream *string, in event.Input) (Workspace, error) {
+	f := syncFields{LastSyncAt: s.deps.Now().UTC().Truncate(time.Second), UpstreamHeadSHA: upstream}
 	if w.DefaultBranch != nil {
 		branch := *w.DefaultBranch
 		head, found, err := repo.ResolveBranch(ctx, branch)
@@ -428,26 +472,27 @@ func classifyBranch(ctx context.Context, repo *gitrepo.Repo, local string, found
 
 // fetchOrigin resolves the origin credential of w now, so that a changed
 // secret counts at the next sync, and fetches w's origin into its copy with
-// it. A credential that cannot be resolved, a fetch that fails and one cut
-// off at its deadline are one failure, which failFetch records and turns
-// into the answer; without a credential nothing is fetched, since an
+// it, and returns the credential as well. A credential that cannot be
+// resolved, a fetch that fails and one cut off at its deadline are one
+// failure, which failFetch records behind fetchFailurePrefix and turns into
+// the answer; without a credential nothing is fetched, since an
 // anonymous fetch would not be the one the owner configured. Two fetches
 // into one copy collide on git's locks of the origin heads they both write,
 // so the syncs of one workspace fetch one after the other: a sync waits for
 // the other's fetch, never answers busy, and runs the rest of its work
 // beside it.
-func (s *Service) fetchOrigin(ctx context.Context, w Workspace) (gitrepo.Fetched, error) {
+func (s *Service) fetchOrigin(ctx context.Context, w Workspace) (gitrepo.Fetched, Credential, error) {
 	cred, err := ResolveOriginCredential(ctx, s.deps.Secrets, w.Slug)
 	if err != nil {
-		return gitrepo.Fetched{}, s.failFetch(ctx, w.Slug, cred, err)
+		return gitrepo.Fetched{}, cred, s.failFetch(ctx, w.Slug, cred, fetchFailurePrefix+err.Error())
 	}
 	unlock := s.fetchLocks.lock(w.Slug)
 	fetched, err := s.deps.Fetcher.FetchOrigin(ctx, s.RepoPath(w.Slug), deref(w.GitURL), cred, syncFetchDeadline)
 	unlock()
 	if err != nil {
-		return gitrepo.Fetched{}, s.failFetch(ctx, w.Slug, cred, err)
+		return gitrepo.Fetched{}, cred, s.failFetch(ctx, w.Slug, cred, fetchFailurePrefix+err.Error())
 	}
-	return fetched, nil
+	return fetched, cred, nil
 }
 
 // fetchFailurePrefix begins the text of a sync that could not fetch origin,
@@ -456,15 +501,16 @@ func (s *Service) fetchOrigin(ctx context.Context, w Workspace) (gitrepo.Fetched
 const fetchFailurePrefix = "origin fetch failed: "
 
 // failFetch records that the sync of the workspace slug could not fetch
-// origin because of cause and returns the upstream error the route answers.
-// The text is cause's behind fetchFailurePrefix, scrubbed of the secret
-// values the hub knows and of cred's secret, with URL userinfo removed and
-// cut to the scrubber's length; it is both sync_error and the answer's
-// message. Only sync_error is written and no event: the fetch is atomic and
-// tags are created only after it, so the copy is as it was.
-func (s *Service) failFetch(ctx context.Context, slug string, cred Credential, cause error) error {
-	text := s.deps.Scrubber.Scrub(fetchFailurePrefix+cause.Error(), cred.Password)
-	s.deps.Logger.Warn("workspace sync could not fetch origin", "slug", slug, "error", text)
+// what it needs, origin or what the sync extension's first stage fetches,
+// as cause says, and returns the upstream error the route answers. The text
+// is cause scrubbed of the secret values the hub knows and of cred's
+// secret, with URL userinfo removed and cut to the scrubber's length; it is
+// both sync_error and the answer's message. Only sync_error is written and
+// no event: the fetch is atomic and tags are created only after it and
+// after the first stage, so the copy is as it was.
+func (s *Service) failFetch(ctx context.Context, slug string, cred Credential, cause string) error {
+	text := s.deps.Scrubber.Scrub(cause, cred.Password)
+	s.deps.Logger.Warn("workspace sync could not fetch", "slug", slug, "error", text)
 	if err := recordSyncError(ctx, s.deps.Store.Main(), slug, text); err != nil {
 		return err
 	}

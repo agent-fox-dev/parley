@@ -262,6 +262,37 @@ func (w *world) postSync(t *testing.T, cred, slug, query string) answer {
 	return answer{status, b}
 }
 
+// postSyncAndLeave sends POST /workspaces/<slug>/sync with cred as the
+// bearer credential and, once started is closed, cancels the request as a
+// caller who disconnects; it returns when the request has ended so.
+func (w *world) postSyncAndLeave(t *testing.T, cred, slug string, started <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/"+slug+"/sync"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+	sent := make(chan error, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		sent <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sync did not reach the point to disconnect at within 10 s")
+	}
+	cancel()
+	if err := <-sent; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the request ended with %v, want it cancelled by the caller", err)
+	}
+}
+
 // list asks GET /workspaces?<query> with cred as the bearer credential.
 func (w *world) list(t *testing.T, cred, query string) answer {
 	t.Helper()

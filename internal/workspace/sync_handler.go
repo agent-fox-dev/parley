@@ -1,9 +1,13 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -28,9 +32,43 @@ type syncAnswer struct {
 	Branches []BranchResult `json:"branches"`
 }
 
+// syncAnswerJSON is the answer of a completed sync, obj and branches, with
+// every member of extra after them, in byte order of the names, except a
+// member whose name obj or branches has already: those are never replaced.
+func syncAnswerJSON(obj Object, branches []BranchResult, extra map[string]json.RawMessage) (json.RawMessage, error) {
+	body, err := json.Marshal(syncAnswer{Object: obj, Branches: branches})
+	if err != nil || len(extra) == 0 {
+		return body, err
+	}
+	var taken map[string]json.RawMessage
+	if err := json.Unmarshal(body, &taken); err != nil {
+		return nil, err
+	}
+	var b bytes.Buffer
+	b.Write(body[:len(body)-1])
+	for _, name := range slices.Sorted(maps.Keys(extra)) {
+		if _, ok := taken[name]; ok {
+			continue
+		}
+		key, err := json.Marshal(name)
+		if err != nil {
+			return nil, err
+		}
+		b.WriteByte(',')
+		b.Write(key)
+		b.WriteByte(':')
+		if err := json.Compact(&b, extra[name]); err != nil {
+			return nil, fmt.Errorf("the sync extension's member %q: %w", name, err)
+		}
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
+}
+
 // serveSync syncs the route's workspace when the query is valid and the
 // workspace may be synced, and answers the workspace object as the sync's
-// completion left it, with the caller's level, and the branches. Nothing is fetched before every check has
+// completion left it, with the caller's level, the branches and the members
+// a sync extension added. Nothing is fetched before every check has
 // passed. The sync runs on a context the request's end does not cancel, so
 // that a caller who disconnects does not stop it halfway; the principal
 // stays in that context's values.
@@ -70,7 +108,11 @@ func (s *Service) serveSync(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	server.WriteJSON(w, http.StatusOK, syncAnswer{Object: obj, Branches: result.Branches})
+	body, err := syncAnswerJSON(obj, result.Branches, result.Members)
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, body)
 	return nil
 }
 

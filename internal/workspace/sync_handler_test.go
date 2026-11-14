@@ -1,9 +1,7 @@
 package workspace_test
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"maps"
 	"net/http"
 	"reflect"
@@ -203,30 +201,7 @@ func TestSyncRoute_CompletesAfterDisconnect(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	s.fetches.holdWith(func() { close(started); <-release })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL("/api/v1/workspaces/"+syncSlug+"/sync"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+s.uKey)
-	sent := make(chan error, 1)
-	go func() {
-		res, err := http.DefaultClient.Do(req)
-		if err == nil {
-			res.Body.Close()
-		}
-		sent <- err
-	}()
-	select {
-	case <-started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the sync did not start its fetch within 10 s")
-	}
-	cancel()
-	if err := <-sent; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the request ended with %v, want it cancelled by the caller", err)
-	}
+	s.postSyncAndLeave(t, s.uKey, syncSlug, started)
 	close(release)
 
 	eventually(t, "the sync records its completion", func() bool {

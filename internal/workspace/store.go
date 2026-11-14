@@ -153,17 +153,20 @@ WHERE slug = ?`,
 type syncFields struct {
 	LastSyncAt             time.Time
 	HeadSHA, OriginHeadSHA *string
+	// UpstreamHeadSHA is written when it is not nil.
+	UpstreamHeadSHA *string
 }
 
 // recordSync writes f on the workspace slug through ex and clears its
-// sync_error; a nil head is written as null. updated_at is left as it is,
-// the time of the record's own last change. A slug no workspace has is
-// ErrNotFound.
+// sync_error; a nil head is written as null, a nil UpstreamHeadSHA leaves
+// upstream_head_sha as it is. updated_at is left as it is, the time of the
+// record's own last change. A slug no workspace has is ErrNotFound.
 func recordSync(ctx context.Context, ex Execer, slug string, f syncFields) error {
 	res, err := ex.ExecContext(ctx, `
-UPDATE workspaces SET last_sync_at = ?, sync_error = NULL, head_sha = ?, origin_head_sha = ?
+UPDATE workspaces SET last_sync_at = ?, sync_error = NULL, head_sha = ?, origin_head_sha = ?,
+	upstream_head_sha = COALESCE(?, upstream_head_sha)
 WHERE slug = ?`,
-		f.LastSyncAt.UnixNano(), f.HeadSHA, f.OriginHeadSHA, slug)
+		f.LastSyncAt.UnixNano(), f.HeadSHA, f.OriginHeadSHA, f.UpstreamHeadSHA, slug)
 	if err != nil {
 		return fmt.Errorf("record sync of workspace %q: %w", slug, err)
 	}
