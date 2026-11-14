@@ -177,6 +177,25 @@ WHERE slug = ?`,
 	return nil
 }
 
+// recordSyncError writes text as the sync_error of the workspace slug
+// through ex and nothing else: a sync that could not fetch leaves
+// last_sync_at, the heads and updated_at as they were. A slug no workspace
+// has is ErrNotFound.
+func recordSyncError(ctx context.Context, ex Execer, slug, text string) error {
+	res, err := ex.ExecContext(ctx, `UPDATE workspaces SET sync_error = ? WHERE slug = ?`, text, slug)
+	if err != nil {
+		return fmt.Errorf("record the sync error of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record the sync error of workspace %q: %w", slug, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("record the sync error of workspace %q: %w", slug, ErrNotFound)
+	}
+	return nil
+}
+
 // StartClone moves the workspace slug from pending to cloning and clears
 // its clone_error, in one write through ex, so that no one reads a clone in
 // progress with the error of an earlier one. A workspace already in cloning

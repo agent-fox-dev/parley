@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -441,5 +444,127 @@ func TestSync_ObserverFailureDoesNotFailSync(t *testing.T) {
 	}
 	if len(lines) != 1 || !strings.Contains(lines[0], "branch=ff") {
 		t.Errorf("the log has %q about the failure, want one line naming the branch ff", lines)
+	}
+}
+
+func TestSync_FetchFailureChangesNothing(t *testing.T) {
+	t.Parallel()
+	refusing := gitrepotest.NewOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", "right"))
+	refusing.History()
+	s := newSyncWorld(t, withGitOrigin(refusing))
+	s.sync(t, workspace.SyncOptions{})
+	s.putSecret(t, syncSlug, workspace.SecretGitPAT, "wrong")
+	// Origins that moved on since: a fetch that got through would change
+	// the copy's refs.
+	for _, o := range []*gitrepotest.Origin{s.origin, refusing} {
+		o.Commit("main", "after the last sync")
+		o.Tag("v2", "dev")
+	}
+	closing, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closing.Close() })
+	go func() {
+		for {
+			conn, err := closing.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	// The cases run in order on the one workspace; cause is a part of git's
+	// error each failure text must carry.
+	cases := []struct{ name, url, cause string }{
+		{"the origin path does not exist", filepath.Join(t.TempDir(), "gone.git"), "does not appear to be a git repository"},
+		{"origin answers 401 to the credential", refusing.URL(), "Authentication failed"},
+		{"origin closes the connection", "https://" + closing.Addr().String() + "/r.git", closing.Addr().String()},
+	}
+	for _, c := range cases {
+		if _, err := s.Store.Main().Exec(`UPDATE workspaces SET git_url = ?, sync_error = NULL WHERE slug = ?`, c.url, syncSlug); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := s.workspace(t, syncSlug)
+		refs := refsUnder(t, s.copy, "")
+		events := s.eventCount(t)
+		a := s.postSync(t, s.uKey, syncSlug, "")
+		if a.status != http.StatusBadGateway || a.errorType(t) != "upstream_error" {
+			t.Errorf("%s: answer = %d %s, want 502 upstream_error", c.name, a.status, a.body)
+		}
+		if got := refsUnder(t, s.copy, ""); !maps.Equal(got, refs) {
+			t.Errorf("%s: the hub's refs = %v, want %v unchanged", c.name, got, refs)
+		}
+		rec, _ := s.workspace(t, syncSlug)
+		if rec.SyncError == nil || !strings.HasPrefix(*rec.SyncError, "origin fetch failed: ") || !strings.Contains(*rec.SyncError, c.cause) {
+			t.Errorf("%s: sync_error = %q, want the fetch failure naming %q", c.name, deref(rec.SyncError), c.cause)
+		}
+		// Nothing but sync_error is written.
+		rec.SyncError = before.SyncError
+		if !reflect.DeepEqual(rec, before) {
+			t.Errorf("%s: the record is %+v, want %+v but for sync_error", c.name, rec, before)
+		}
+		if n := s.eventCount(t); n != events {
+			t.Errorf("%s: the log grew by %d events, want none", c.name, n-events)
+		}
+	}
+}
+
+func TestSync_SecretReadFailureNeverFetchesAnonymously(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	s.fail(faultSecretRead)
+	a := s.postSync(t, s.uKey, syncSlug, "")
+	if a.status != http.StatusBadGateway || a.errorType(t) != "upstream_error" {
+		t.Errorf("answer = %d %s, want 502 upstream_error", a.status, a.body)
+	}
+	if calls := s.fetches.recorded(); len(calls) != 0 {
+		t.Errorf("fetched %+v, want no fetch at all", calls)
+	}
+	if rec, _ := s.workspace(t, syncSlug); deref(rec.SyncError) == "" {
+		t.Errorf("sync_error is empty, want the failure to read the secrets")
+	}
+}
+
+func TestSync_FetchDeadlineIsTwoMinutes(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	s.sync(t, workspace.SyncOptions{})
+	if calls := s.fetches.recorded(); len(calls) != 1 || calls[0].deadline != 2*time.Minute {
+		t.Errorf("fetches %+v, want one with the deadline 2m", calls)
+	}
+	s.fetches.failWith(fmt.Errorf("git fetch: %w (2m0s)", gitrepo.ErrDeadline))
+	a := s.postSync(t, s.uKey, syncSlug, "")
+	if a.status != http.StatusBadGateway || a.errorType(t) != "upstream_error" {
+		t.Errorf("answer = %d %s, want 502 upstream_error", a.status, a.body)
+	}
+	if rec, _ := s.workspace(t, syncSlug); !strings.Contains(deref(rec.SyncError), gitrepo.ErrDeadline.Error()) {
+		t.Errorf("sync_error = %q, want the deadline named", deref(rec.SyncError))
+	}
+}
+
+func TestSync_FailureTextIsScrubbed(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	s.putSecret(t, syncSlug, workspace.SecretGitPAT, "s3cr3t")
+	for _, c := range []struct{ name, text string }{
+		{"the credential in a URL", "fatal: unable to access 'https://x-token-auth:s3cr3t@example.test/r.git/': The requested URL returned error: 403"},
+		{"the token alone", "remote: the token s3cr3t is not valid"},
+		{"a 5000-byte text", strings.Repeat("e", 4993) + " s3cr3t"},
+	} {
+		s.fetches.failWith(errors.New(c.text))
+		a := s.postSync(t, s.uKey, syncSlug, "")
+		errorType, message := a.refusal(t)
+		rec, _ := s.workspace(t, syncSlug)
+		if a.status != http.StatusBadGateway || errorType != "upstream_error" || message != deref(rec.SyncError) {
+			t.Errorf("%s: answer %d %s with %q, sync_error %q; want 502 upstream_error with the same text", c.name,
+				a.status, errorType, message, deref(rec.SyncError))
+		}
+		for _, text := range []string{message, deref(rec.SyncError)} {
+			if !strings.HasPrefix(text, "origin fetch failed: ") || strings.Contains(text, "s3cr3t") ||
+				strings.Contains(text, "@example.test") || len(text) > 1024 {
+				t.Errorf("%s: the failure text %q (%d bytes) is not the scrubbed fetch failure", c.name, text, len(text))
+			}
+		}
 	}
 }

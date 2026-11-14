@@ -2038,6 +2038,16 @@ other: sync reads neither the push rules nor `protected_branches` and
 the branch was handled and origin's head, full commit ids) per origin
 branch, sorted by name, empty and never nil when origin has no branch.
 
+A credential that cannot be resolved (nothing is then fetched), a fetch
+error and a fetch cut off at its deadline (`gitrepo.ErrDeadline`) are one
+failure, handled by `failFetch`: the text `origin fetch failed: ` plus the
+error, scrubbed by `Deps.Scrubber` with the credential's password, is
+logged (`workspace sync could not fetch origin`), written as the record's
+`sync_error` alone by `recordSyncError` (no other field, no event), and
+returned as `server.UpstreamError` with the same text. Nothing in the copy
+has changed at that point: the fetch is atomic and tags are created after
+it.
+
 Each `created`, `fast_forward` or `reset` move is reported right after the
 ref changed through the exported `(*Service).NotifyBranchMove(ctx,
 BranchMove{Workspace, Branch, Before, After, Cause})`, `Before` `""` for a

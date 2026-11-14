@@ -892,13 +892,14 @@ func deref(p *string) string {
 }
 
 // recordingFetcher is the hub's fetcher for syncs: it records every fetch
-// and runs it.
+// and runs it, or fails it with err while err is set.
 type recordingFetcher struct {
 	workspace.Fetcher
 
 	mu    sync.Mutex
 	calls []fetchCall
 	hold  func()
+	err   error
 }
 
 // fetchCall is one fetch: the copy, origin's URL, the credential and the
@@ -912,12 +913,23 @@ type fetchCall struct {
 func (f *recordingFetcher) FetchOrigin(ctx context.Context, dir, url string, cred workspace.Credential, deadline time.Duration) (gitrepo.Fetched, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, fetchCall{dir, url, cred, deadline})
-	hold := f.hold
+	hold, err := f.hold, f.err
 	f.mu.Unlock()
 	if hold != nil {
 		hold()
 	}
+	if err != nil {
+		return gitrepo.Fetched{}, err
+	}
 	return f.Fetcher.FetchOrigin(ctx, dir, url, cred, deadline)
+}
+
+// failWith makes every later fetch call fail with err, without fetching;
+// nil makes them fetch again.
+func (f *recordingFetcher) failWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 // holdWith makes every later fetch call hold before it runs.

@@ -1419,6 +1419,24 @@ Origin is not fetched before every check has passed. The sync runs to its
 end when the caller disconnects, with the same branch moves, fields and
 event as when the caller waits.
 
+A sync that cannot fetch origin changes nothing in the hub's repository: no
+branch, tag or origin head moves, since the fetch writes all of them or
+none and tags are created only after it. This covers secrets that cannot be
+read (nothing is then fetched, never anonymously), origin refusing the
+credential or the request, a failing network, and a fetch that has not
+ended after two minutes, whose git processes are stopped. The sync writes
+only `sync_error`, leaves `last_sync_at`, `head_sha`, `origin_head_sha` and
+`updated_at` as they were, writes no event and answers `502`
+`upstream_error`. `sync_error` and the answer's `message` are the same
+text: `origin fetch failed: ` followed by git's error, with every secret
+value the hub knows and the origin credential's secret replaced by
+`[redacted]`, the user information of every URL removed, and cut to 1024
+bytes. The next sync that completes clears `sync_error`.
+
+```json
+{"error":{"code":502,"message":"origin fetch failed: git fetch: exit status 128: fatal: Authentication failed for 'https://example.com/a.git/'","error_type":"upstream_error"}}
+```
+
 A completed sync, also one with branches `ahead` or `diverged`, sets in one
 store transaction `last_sync_at` to the hub's time cut to the second,
 `sync_error` to `null`, `head_sha` to the hub's head of the default branch
@@ -1464,7 +1482,8 @@ has no branch. `local_sha` is the hub's head of the branch after the sync,
 | `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
-| `500` `internal` | the sync could not complete: the workspace's secrets could not be read, origin could not be fetched, a ref of the hub could not be read or written, or the completion or its event could not be written; branches moved before stay moved |
+| `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`); nothing in the hub's repository changed and `sync_error` holds the same text |
+| `500` `internal` | the sync could not complete: a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

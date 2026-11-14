@@ -82,3 +82,20 @@ moving it at that moment.
 - `Sync` returns the record read again after the completion transaction in
   `SyncResult.Workspace`, and the route renders that record rather than
   reading it a second time.
+
+## A sync that cannot fetch
+
+- The resolver's failure is a fetch failure through the real resolver: a
+  test makes every read of the workspace's secrets fail rather than
+  stubbing the resolver. The recording fetcher of the checks wraps the hub's
+  fetcher and can be told to fail with a given error.
+- A failed fetch writes `sync_error` alone; `updated_at` stays as it was,
+  like `last_sync_at`, `head_sha` and `origin_head_sha`.
+- The text is scrubbed with the hub's scrubber given the credential's
+  password (or token) only, as the clone does; the user name is not a
+  secret value, and a short one would redact unrelated parts of the text.
+  When the scrubber cannot remove a secret cleanly its whole result is
+  `[redacted]`, and the text then does not begin with
+  `origin fetch failed: `.
+- A `sync_error` that cannot be written makes the sync answer `500`
+  `internal` instead of `502` `upstream_error`.

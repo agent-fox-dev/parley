@@ -2,6 +2,7 @@ package gitrepo_test
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"path/filepath"
 	"strings"
@@ -48,6 +49,33 @@ func TestFetchOrigin_RecordsOriginHeads(t *testing.T) {
 	}
 	heads = map[string]string{"main": newer, "dev": devHead, "release/1.x": release}
 	assertRefs(t, "the copy's refs after origin deleted feat/a", allRefs(t, dir), withOriginHeads(local, heads))
+}
+
+func TestFetchOrigin_StopsAtDeadline(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	g := gitrepo.Git{Env: o.Env()}
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	if err := g.Clone(context.Background(), o.URL(), gitrepo.Credential{}, dir); err != nil {
+		t.Fatal(err)
+	}
+	before := allRefs(t, dir)
+	ln := newSilentListener(t)
+	start := time.Now()
+	_, err := g.FetchOrigin(context.Background(), dir, ln.url, gitrepo.Credential{}, 200*time.Millisecond)
+	if !errors.Is(err, gitrepo.ErrDeadline) {
+		t.Errorf("err = %v, want ErrDeadline", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("returned after %v, want within 2s", d)
+	}
+	// The connection is held by git's transport helper: it closes only when
+	// no process of the fetch is left.
+	if !ln.quiet(500*time.Millisecond, 2*time.Second) {
+		t.Errorf("a connection to origin is still open 2s after the return: a git process is left")
+	}
+	assertRefs(t, "the copy's refs after the deadline", allRefs(t, dir), before)
 }
 
 // allRefs maps every ref of the repository at dir to the object id it

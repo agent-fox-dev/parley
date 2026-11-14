@@ -13,6 +13,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // syncFetchDeadline is how long the fetch of a sync may take, the deadline
@@ -337,13 +338,41 @@ func classifyBranch(ctx context.Context, repo *gitrepo.Repo, local string, found
 
 // fetchOrigin resolves the origin credential of w now, so that a changed
 // secret counts at the next sync, and fetches w's origin into its copy with
-// it.
+// it. A credential that cannot be resolved, a fetch that fails and one cut
+// off at its deadline are one failure, which failFetch records and turns
+// into the answer; without a credential nothing is fetched, since an
+// anonymous fetch would not be the one the owner configured.
 func (s *Service) fetchOrigin(ctx context.Context, w Workspace) (gitrepo.Fetched, error) {
 	cred, err := ResolveOriginCredential(ctx, s.deps.Secrets, w.Slug)
 	if err != nil {
-		return gitrepo.Fetched{}, err
+		return gitrepo.Fetched{}, s.failFetch(ctx, w.Slug, cred, err)
 	}
-	return s.deps.Fetcher.FetchOrigin(ctx, s.RepoPath(w.Slug), deref(w.GitURL), cred, syncFetchDeadline)
+	fetched, err := s.deps.Fetcher.FetchOrigin(ctx, s.RepoPath(w.Slug), deref(w.GitURL), cred, syncFetchDeadline)
+	if err != nil {
+		return gitrepo.Fetched{}, s.failFetch(ctx, w.Slug, cred, err)
+	}
+	return fetched, nil
+}
+
+// fetchFailurePrefix begins the text of a sync that could not fetch origin,
+// so that a caller can tell it from a failure of another source a sync
+// extension fetches.
+const fetchFailurePrefix = "origin fetch failed: "
+
+// failFetch records that the sync of the workspace slug could not fetch
+// origin because of cause and returns the upstream error the route answers.
+// The text is cause's behind fetchFailurePrefix, scrubbed of the secret
+// values the hub knows and of cred's secret, with URL userinfo removed and
+// cut to the scrubber's length; it is both sync_error and the answer's
+// message. Only sync_error is written and no event: the fetch is atomic and
+// tags are created only after it, so the copy is as it was.
+func (s *Service) failFetch(ctx context.Context, slug string, cred Credential, cause error) error {
+	text := s.deps.Scrubber.Scrub(fetchFailurePrefix+cause.Error(), cred.Password)
+	s.deps.Logger.Warn("workspace sync could not fetch origin", "slug", slug, "error", text)
+	if err := recordSyncError(ctx, s.deps.Store.Main(), slug, text); err != nil {
+		return err
+	}
+	return server.UpstreamError(text)
 }
 
 // createTags creates in repo, in name order, every tag of tags that it
