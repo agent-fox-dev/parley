@@ -149,6 +149,34 @@ WHERE slug = ?`,
 	return nil
 }
 
+// syncFields are what a completed sync writes on its workspace.
+type syncFields struct {
+	LastSyncAt             time.Time
+	HeadSHA, OriginHeadSHA *string
+}
+
+// recordSync writes f on the workspace slug through ex and clears its
+// sync_error; a nil head is written as null. updated_at is left as it is,
+// the time of the record's own last change. A slug no workspace has is
+// ErrNotFound.
+func recordSync(ctx context.Context, ex Execer, slug string, f syncFields) error {
+	res, err := ex.ExecContext(ctx, `
+UPDATE workspaces SET last_sync_at = ?, sync_error = NULL, head_sha = ?, origin_head_sha = ?
+WHERE slug = ?`,
+		f.LastSyncAt.UnixNano(), f.HeadSHA, f.OriginHeadSHA, slug)
+	if err != nil {
+		return fmt.Errorf("record sync of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record sync of workspace %q: %w", slug, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("record sync of workspace %q: %w", slug, ErrNotFound)
+	}
+	return nil
+}
+
 // StartClone moves the workspace slug from pending to cloning and clears
 // its clone_error, in one write through ex, so that no one reads a clone in
 // progress with the error of an earlier one. A workspace already in cloning

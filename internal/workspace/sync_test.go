@@ -2,15 +2,20 @@ package workspace_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -104,22 +109,8 @@ func TestSync_CreatesNewTagsAndKeepsExisting(t *testing.T) {
 func TestSync_PerBranchResults(t *testing.T) {
 	t.Parallel()
 	s := newSyncWorld(t)
-	origin := s.origin.Dir()
-	base := s.origin.Head("main")
-	// From base, same is equal on both sides, new-b (absent from the hub)
-	// and ff have a commit on origin only, ahead-b one in the hub only and
-	// div one of its own on each side; main and dev are as the clone left
-	// them.
-	gitrepotest.Git(t, origin, "branch", "same", base)
-	gitrepotest.Git(t, origin, "branch", "ahead-b", base)
-	for _, b := range []string{"new-b", "ff", "div"} {
-		grow(t, origin, b, base, "origin")
-	}
-	gitrepotest.Git(t, s.copy, "branch", "same", base)
-	gitrepotest.Git(t, s.copy, "branch", "ff", base)
-	hubAhead := grow(t, s.copy, "ahead-b", base, "hub")
-	hubDiv := grow(t, s.copy, "div", base, "hub")
-	theirs := refsUnder(t, origin, "refs/heads/")
+	set := s.branchSet(t)
+	base, theirs, hubAhead, hubDiv := set.base, set.theirs, set.hubAhead, set.hubDiv
 	up := workspace.BranchUpToDate
 	steps := []struct {
 		reset bool
@@ -266,5 +257,189 @@ func TestSync_ProtectedBranchAheadIsNormal(t *testing.T) {
 		if got := ref(t, s.copy, "refs/heads/main"); got != mine {
 			t.Errorf("reset %t: the hub's main = %s, want %s unchanged", reset, got, mine)
 		}
+	}
+}
+
+func TestSync_RecordsCompletion(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	origin := s.origin.Dir()
+	// The cases run in order on the one workspace; main is the result the
+	// default branch has, "" when origin no longer has it.
+	cases := []struct {
+		name, main string
+		change     func()
+	}{
+		{"all branches up_to_date", "up_to_date", func() {}},
+		{"main ahead", "ahead", func() { grow(t, s.copy, "main", s.origin.Head("main"), "hub") }},
+		{"a branch diverged", "ahead", func() {
+			base := s.origin.Head("dev")
+			grow(t, origin, "dev", base, "origin")
+			grow(t, s.copy, "dev", base, "hub")
+		}},
+		{"main fast_forward", "fast_forward", func() {
+			gitrepotest.Git(t, s.copy, "update-ref", "refs/heads/main", s.origin.Head("main"))
+			grow(t, origin, "main", s.origin.Head("main"), "origin")
+		}},
+		{"origin has deleted the default branch", "", func() {
+			gitrepotest.Git(t, origin, "update-ref", "-d", "refs/heads/main")
+		}},
+	}
+	for i, c := range cases {
+		c.change()
+		if _, err := s.Store.Main().Exec(`UPDATE workspaces SET sync_error = 'old' WHERE slug = ?`, syncSlug); err != nil {
+			t.Fatal(err)
+		}
+		s.advance(time.Minute)
+		before, _ := s.workspace(t, syncSlug)
+		obj, _ := syncBranches(t, s.postSync(t, s.uKey, syncSlug, ""))
+		rec, _ := s.workspace(t, syncSlug)
+		at := s.clock().UTC().Truncate(time.Second)
+		head := ref(t, s.copy, "refs/heads/main")
+		var originHead *string
+		if id := s.origin.Head("main"); id != "" {
+			originHead = &id
+		}
+		if rec.LastSyncAt == nil || !rec.LastSyncAt.Equal(at) || rec.SyncError != nil || deref(rec.HeadSHA) != head ||
+			!reflect.DeepEqual(rec.OriginHeadSHA, originHead) || !rec.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Errorf("%s: the record has last_sync_at %v, sync_error %v, head_sha %v, origin_head_sha %v, updated_at %v; "+
+				"want %v, nil, %s, %v, %v unchanged", c.name, rec.LastSyncAt, deref(rec.SyncError), deref(rec.HeadSHA),
+				deref(rec.OriginHeadSHA), rec.UpdatedAt, at, head, deref(originHead), before.UpdatedAt)
+		}
+		var wantOrigin any
+		if originHead != nil {
+			wantOrigin = *originHead
+		}
+		got := map[string]any{"last_sync_at": obj["last_sync_at"], "sync_error": obj["sync_error"],
+			"head_sha": obj["head_sha"], "origin_head_sha": obj["origin_head_sha"]}
+		want := map[string]any{"last_sync_at": at.Format(time.RFC3339), "sync_error": nil, "head_sha": head, "origin_head_sha": wantOrigin}
+		if !maps.Equal(got, want) {
+			t.Errorf("%s: the answer carries %v, want %v", c.name, got, want)
+		}
+		events := s.eventsOf(t, syncEvent)
+		if len(events) != i+1 {
+			t.Fatalf("%s: %d sync events after %d syncs", c.name, len(events), i+1)
+		}
+		var meta map[string]any
+		if err := json.Unmarshal(events[i].Metadata, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if list, ok := meta[c.main].([]any); c.main != "" && c.main != "up_to_date" && !slices.Contains(list, any("main")) {
+			t.Errorf("%s: the event's metadata %v does not list main under %s (%v)", c.name, meta, c.main, ok)
+		}
+	}
+}
+
+func TestSync_EmitsOneEvent(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	set := s.branchSet(t)
+	tag := s.origin.Tag("v2", "dev")
+	steps := []struct {
+		lists   map[string][]any
+		updated []any
+	}{
+		{map[string][]any{"created": {"new-b"}, "fast_forward": {"ff"}, "ahead": {"ahead-b"}, "diverged": {"div"}, "reset": {}},
+			[]any{
+				map[string]any{"ref": "refs/heads/ff", "before": set.base, "after": set.theirs["ff"]},
+				map[string]any{"ref": "refs/heads/new-b", "before": nil, "after": set.theirs["new-b"]},
+				map[string]any{"ref": "refs/tags/v2", "before": nil, "after": tag},
+			}},
+		// Nothing left to move: only the branches that stay apart are listed.
+		{map[string][]any{"created": {}, "fast_forward": {}, "ahead": {"ahead-b"}, "diverged": {"div"}, "reset": {}}, []any{}},
+	}
+	for i, step := range steps {
+		total := s.eventCount(t)
+		s.postSync(t, s.uKey, syncSlug, "reset_to_origin=false").decode(t, http.StatusOK)
+		events := s.eventsOf(t, syncEvent)
+		if n := s.eventCount(t); n != total+1 || len(events) != i+1 {
+			t.Fatalf("sync %d: the log grew by %d events, %d of them sync events; want one", i+1, n-total, len(events))
+		}
+		ev := events[i]
+		if deref(ev.Workspace) != syncSlug || ev.ResourceType != "workspace" || ev.ResourceID != syncSlug ||
+			ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != s.u {
+			t.Errorf("sync %d: event of %v, resource %s %s, actor %s %v; want %s, workspace %s, api_key %s",
+				i+1, deref(ev.Workspace), ev.ResourceType, ev.ResourceID, ev.ActorType, deref(ev.ActorID), syncSlug, syncSlug, s.u)
+		}
+		var meta map[string]any
+		if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{"updated": step.updated}
+		for name, list := range step.lists {
+			want[name] = list
+		}
+		if !reflect.DeepEqual(meta, want) {
+			t.Errorf("sync %d: metadata = %v, want %v", i+1, meta, want)
+		}
+	}
+}
+
+func TestSync_NotifiesBranchMoveObservers(t *testing.T) {
+	t.Parallel()
+	want := map[string]workspace.BranchOutcome{"main": workspace.BranchUpToDate, "dev": workspace.BranchUpToDate,
+		"same": workspace.BranchUpToDate, "new-b": workspace.BranchCreated, "ff": workspace.BranchFastForward,
+		"ahead-b": workspace.BranchAhead, "div": workspace.BranchReset}
+	for _, observers := range []int{2, 0} {
+		t.Run(fmt.Sprintf("%d observers", observers), func(t *testing.T) {
+			t.Parallel()
+			s := newSyncWorld(t)
+			set := s.branchSet(t)
+			var registered []*recordingObserver
+			for range observers {
+				registered = append(registered, s.observe(t, nil))
+			}
+			r := s.sync(t, workspace.SyncOptions{ResetToOrigin: true})
+			if got := outcomes(r); !maps.Equal(got, want) {
+				t.Errorf("results = %v, want %v", got, want)
+			}
+			// In the order of the branches, each told after the ref moved.
+			moves := []workspace.BranchMove{
+				{Workspace: syncSlug, Branch: "div", Before: set.hubDiv, After: set.theirs["div"], Cause: "sync"},
+				{Workspace: syncSlug, Branch: "ff", Before: set.base, After: set.theirs["ff"], Cause: "sync"},
+				{Workspace: syncSlug, Branch: "new-b", Before: "", After: set.theirs["new-b"], Cause: "sync"},
+			}
+			for i, o := range registered {
+				got, heads := o.recorded()
+				if !slices.Equal(got, moves) {
+					t.Errorf("observer %d was told %+v, want %+v", i, got, moves)
+				}
+				for j, m := range got {
+					if heads[j] != m.After {
+						t.Errorf("observer %d: the hub's %s was %s when told of the move to %s", i, m.Branch, heads[j], m.After)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSync_ObserverFailureDoesNotFailSync(t *testing.T) {
+	t.Parallel()
+	var log hubtest.LogBuffer
+	s := newSyncWorld(t, withLog(&log))
+	base := s.origin.Head("main")
+	gitrepotest.Git(t, s.copy, "branch", "ff", base)
+	theirs := grow(t, s.origin.Dir(), "ff", base, "origin")
+	s.observe(t, errors.New("observer out of order"))
+	recorder := s.observe(t, nil)
+	_, branches := syncBranches(t, s.postSync(t, s.uKey, syncSlug, ""))
+	if got := outcomes(workspace.SyncResult{Branches: branches})["ff"]; got != workspace.BranchFastForward {
+		t.Errorf("ff is %q, want fast_forward", got)
+	}
+	if got := ref(t, s.copy, "refs/heads/ff"); got != theirs {
+		t.Errorf("the hub's ff = %s, want origin's %s", got, theirs)
+	}
+	if moves, _ := recorder.recorded(); len(moves) != 1 || moves[0].Branch != "ff" {
+		t.Errorf("the observer after the failing one was told %+v, want the move of ff", moves)
+	}
+	var lines []string
+	for line := range strings.Lines(log.String()) {
+		if strings.Contains(line, "observer out of order") {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], "branch=ff") {
+		t.Errorf("the log has %q about the failure, want one line naming the branch ff", lines)
 	}
 }

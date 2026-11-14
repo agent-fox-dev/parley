@@ -375,6 +375,21 @@ func (s *Service) applyUpdate(ctx context.Context, tx *sql.Tx, cur Workspace, bo
 	return next, writes, nil
 }
 
+// eventActor is the actor a workspace event names for the caller p: the
+// admin token with no actor id, or the type of a user's credential with
+// that user. ok is false for a principal that is neither, such as the zero
+// one of a request without a caller.
+func eventActor(p identity.Principal) (actorType string, actorID *string, ok bool) {
+	switch {
+	case p.Type == identity.TypeAdmin:
+		return event.ActorAdminToken, nil, true
+	case p.User != nil:
+		id := p.User.ID
+		return p.Type, &id, true
+	}
+	return "", nil, false
+}
+
 // updateEventInput is the parley.workspace.update event of an update of
 // cur, whose body has passed every check, by the request's caller: the
 // admin token, with no actor id, or the credential's type with its user's
@@ -384,14 +399,9 @@ func (s *Service) applyUpdate(ctx context.Context, tx *sql.Tx, cur Workspace, bo
 func updateEventInput(ctx context.Context, cur Workspace, body map[string]json.RawMessage) (event.Input, error) {
 	slug := cur.Slug
 	in := event.Input{Type: eventUpdate, Workspace: &slug, ResourceType: "workspace", ResourceID: slug}
-	p, ok := identity.PrincipalOf(ctx)
-	switch {
-	case ok && p.Type == identity.TypeAdmin:
-		in.ActorType = event.ActorAdminToken
-	case ok && p.User != nil:
-		id := p.User.ID
-		in.ActorType, in.ActorID = p.Type, &id
-	default:
+	p, _ := identity.PrincipalOf(ctx)
+	var ok bool
+	if in.ActorType, in.ActorID, ok = eventActor(p); !ok {
 		return event.Input{}, errors.New("the workspace update found no caller")
 	}
 	fields := []string{}

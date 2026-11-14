@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"maps"
 	"net/http"
 	"slices"
@@ -24,10 +25,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The event types a create and an update write.
+// The event types a create, an update and a sync write.
 const (
 	createEvent = "parley.workspace.create"
 	updateEvent = "parley.workspace.update"
+	syncEvent   = "parley.workspace.sync"
 )
 
 // world is a hub the workspace route tests ask: the users u and v, each with
@@ -106,6 +108,13 @@ func withGitOrigin(o *gitrepotest.Origin) option {
 // every workspace created.
 func withCloneWorkers() option {
 	return func(_ *hubtest.Config, w *world) { w.cloneWorkers = true }
+}
+
+// withLog makes the workspace service log to buf, as text.
+func withLog(buf *hubtest.LogBuffer) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { d.Logger = slog.New(slog.NewTextHandler(buf, nil)) })
+	})
 }
 
 // withCompose runs fn on the hub's composition, after the world's own.
@@ -848,10 +857,13 @@ func newSyncWorld(t *testing.T, opts ...option) *syncWorld {
 	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f}
 }
 
-// sync runs a sync of the workspace with opts and fails the test when it
-// does not complete.
+// sync runs a sync of the workspace with opts, the admin token as the actor
+// when opts names none, and fails the test when it does not complete.
 func (s *syncWorld) sync(t *testing.T, opts workspace.SyncOptions) workspace.SyncResult {
 	t.Helper()
+	if opts.Actor.Type == "" {
+		opts.Actor = identity.Principal{Type: identity.TypeAdmin}
+	}
 	r, err := s.svc.Sync(context.Background(), syncSlug, opts)
 	if err != nil {
 		t.Fatalf("sync: %v", err)
@@ -886,6 +898,7 @@ type recordingFetcher struct {
 
 	mu    sync.Mutex
 	calls []fetchCall
+	hold  func()
 }
 
 // fetchCall is one fetch: the copy, origin's URL, the credential and the
@@ -899,8 +912,19 @@ type fetchCall struct {
 func (f *recordingFetcher) FetchOrigin(ctx context.Context, dir, url string, cred workspace.Credential, deadline time.Duration) (gitrepo.Fetched, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, fetchCall{dir, url, cred, deadline})
+	hold := f.hold
 	f.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
 	return f.Fetcher.FetchOrigin(ctx, dir, url, cred, deadline)
+}
+
+// holdWith makes every later fetch call hold before it runs.
+func (f *recordingFetcher) holdWith(hold func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hold = hold
 }
 
 // recorded are the fetches so far.
@@ -934,4 +958,66 @@ func outcomes(r workspace.SyncResult) map[string]workspace.BranchOutcome {
 		m[b.Name] = b.Result
 	}
 	return m
+}
+
+// branchSet is the branches of a sync world after build: from base, origin's
+// main, same is equal on both sides, new-b (absent from the hub) and ff have
+// a commit on origin only, ahead-b one in the hub only (hubAhead) and div one
+// of its own on each side (hubDiv); main and dev are as the clone left them.
+// theirs are origin's branch heads.
+type branchSet struct {
+	base, hubAhead, hubDiv string
+	theirs                 map[string]string
+}
+
+// branchSet builds the branch set in s.
+func (s *syncWorld) branchSet(t *testing.T) branchSet {
+	t.Helper()
+	origin := s.origin.Dir()
+	b := branchSet{base: s.origin.Head("main")}
+	gitrepotest.Git(t, origin, "branch", "same", b.base)
+	gitrepotest.Git(t, origin, "branch", "ahead-b", b.base)
+	for _, name := range []string{"new-b", "ff", "div"} {
+		grow(t, origin, name, b.base, "origin")
+	}
+	gitrepotest.Git(t, s.copy, "branch", "same", b.base)
+	gitrepotest.Git(t, s.copy, "branch", "ff", b.base)
+	b.hubAhead = grow(t, s.copy, "ahead-b", b.base, "hub")
+	b.hubDiv = grow(t, s.copy, "div", b.base, "hub")
+	b.theirs = refsUnder(t, origin, "refs/heads/")
+	return b
+}
+
+// recordingObserver records every branch move it is told of, with the hub's
+// head of the branch at that moment, and answers err.
+type recordingObserver struct {
+	t   *testing.T
+	dir string
+	err error
+
+	mu    sync.Mutex
+	moves []workspace.BranchMove
+	heads []string
+}
+
+func (o *recordingObserver) BranchMoved(_ context.Context, m workspace.BranchMove) error {
+	head := ref(o.t, o.dir, "refs/heads/"+m.Branch)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.moves, o.heads = append(o.moves, m), append(o.heads, head)
+	return o.err
+}
+
+// recorded are the moves told so far and the heads seen at each.
+func (o *recordingObserver) recorded() ([]workspace.BranchMove, []string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.moves), slices.Clone(o.heads)
+}
+
+// observe registers on the world's service an observer answering err.
+func (s *syncWorld) observe(t *testing.T, err error) *recordingObserver {
+	o := &recordingObserver{t: t, dir: s.copy, err: err}
+	s.svc.RegisterBranchMoveObserver(o)
+	return o
 }

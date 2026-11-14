@@ -1416,9 +1416,32 @@ archive or delete running on it, then its status; and last its effective
 setting `sync_enabled` (see [Workspace settings](#workspace-settings)), so
 that an archived workspace with sync disabled is refused as archived.
 Origin is not fetched before every check has passed. The sync runs to its
-end when the caller disconnects.
+end when the caller disconnects, with the same branch moves, fields and
+event as when the caller waits.
 
-The answer is the workspace object, read after the sync, the object
+A completed sync, also one with branches `ahead` or `diverged`, sets in one
+store transaction `last_sync_at` to the hub's time cut to the second,
+`sync_error` to `null`, `head_sha` to the hub's head of the default branch
+and `origin_head_sha` to origin's head of the default branch, `null` when
+origin has no such branch; `updated_at` is not changed. In the same
+transaction it writes one `parley.workspace.sync` event with `workspace`
+and `resource_id` the slug, `resource_type` `workspace`, and as actor the
+caller as for [`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug):
+`admin_token` with `actor_id` `null`, or `api_key` or `pat` with the
+caller's user. Its `metadata` holds `created`, `fast_forward`, `ahead`,
+`diverged` and `reset`, the names of the branches with that result in byte
+order (`[]` when none; an `up_to_date` branch is in no list), and
+`updated`, one entry per branch the sync created or moved and per tag it
+created, with the full ref name, the head before (`null` for a created ref)
+and after, sorted by `ref`:
+
+```json
+{"seq":14,"id":"…","type":"parley.workspace.sync","time":"2026-11-14T10:32:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"sync","session_id":null,"metadata":{"ahead":[],"created":["new-b"],"diverged":["dev"],"fast_forward":["main"],"reset":[],"updated":[{"ref":"refs/heads/main","before":"9fceb02d0ae598e95dc970b74767f19372d61af8","after":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"},{"ref":"refs/heads/new-b","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"ref":"refs/tags/v2","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"}]}}
+```
+
+The answer is the workspace object, read after the completion was
+recorded, so that it carries the new `last_sync_at`, `sync_error`,
+`head_sha` and `origin_head_sha`, the object
 [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
 `access` the caller's level, and the member `branches`: one entry per
 branch of origin, in byte order of the names, an empty list when origin
@@ -1441,7 +1464,7 @@ has no branch. `local_sha` is the hub's head of the branch after the sync,
 | `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
-| `500` `internal` | the sync could not complete: the workspace's secrets could not be read, origin could not be fetched, or a ref of the hub could not be read or written |
+| `500` `internal` | the sync could not complete: the workspace's secrets could not be read, origin could not be fetched, a ref of the hub could not be read or written, or the completion or its event could not be written; branches moved before stay moved |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

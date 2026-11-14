@@ -1,14 +1,18 @@
 package workspace_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -187,5 +191,55 @@ func TestSyncRoute_RefusesBeforeFetching(t *testing.T) {
 	if !reflect.DeepEqual(recsAfter, recsBefore) || eventsAfter != eventsBefore || !maps.Equal(refsAfter, refsBefore) {
 		t.Errorf("refused syncs changed the hub: records %v -> %v, events %d -> %d, refs %v -> %v",
 			recsBefore, recsAfter, eventsBefore, eventsAfter, refsBefore, refsAfter)
+	}
+}
+
+func TestSyncRoute_CompletesAfterDisconnect(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	base := s.origin.Head("main")
+	gitrepotest.Git(t, s.copy, "branch", "ff", base)
+	theirs := grow(t, s.origin.Dir(), "ff", base, "origin")
+	started, release := make(chan struct{}), make(chan struct{})
+	s.fetches.holdWith(func() { close(started); <-release })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL("/api/v1/workspaces/"+syncSlug+"/sync"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+s.uKey)
+	sent := make(chan error, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		sent <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sync did not start its fetch within 10 s")
+	}
+	cancel()
+	if err := <-sent; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the request ended with %v, want it cancelled by the caller", err)
+	}
+	close(release)
+
+	eventually(t, "the sync records its completion", func() bool {
+		rec, _ := s.workspace(t, syncSlug)
+		return rec.LastSyncAt != nil
+	})
+	if got := ref(t, s.copy, "refs/heads/ff"); got != theirs {
+		t.Errorf("the hub's ff = %s, want origin's %s", got, theirs)
+	}
+	if n := len(s.eventsOf(t, syncEvent)); n != 1 {
+		t.Errorf("%d sync events, want 1", n)
+	}
+	if calls := s.fetches.recorded(); len(calls) != 1 || calls[0].deadline != 2*time.Minute {
+		t.Errorf("fetches %+v, want one with the deadline of 2 minutes", calls)
 	}
 }

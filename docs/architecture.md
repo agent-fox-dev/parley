@@ -1843,8 +1843,9 @@ fork the registered guard. Then it writes `display_name`, `description`,
 when the org changed sets `org_id` on every record whose `parent_slug` is
 the workspace, runs the fork-only fields' writes and writes the
 `parley.workspace.update` event through `Deps.Events` (`updateEventInput`:
-the actor from `identity.PrincipalOf`, the admin principal mapped to
-`event.ActorAdminToken` with no actor id; `metadata.fields`, the mutable
+the actor from `identity.PrincipalOf`, mapped by `eventActor`, which the
+sync event shares: the admin principal to `event.ActorAdminToken` with no
+actor id, a user's credential to its type with the user as actor id; `metadata.fields`, the mutable
 fields the body carried in `updateFields` order, and for a fork
 `metadata.parent_slug`, never a value), all in the same transaction, so a
 refusal writes nothing, neither record nor event, and a failed write, the
@@ -2037,6 +2038,35 @@ other: sync reads neither the push rules nor `protected_branches` and
 the branch was handled and origin's head, full commit ids) per origin
 branch, sorted by name, empty and never nil when origin has no branch.
 
+Each `created`, `fast_forward` or `reset` move is reported right after the
+ref changed through the exported `(*Service).NotifyBranchMove(ctx,
+BranchMove{Workspace, Branch, Before, After, Cause})`, `Before` `""` for a
+created branch and `Cause` `MoveCauseSync` (`"sync"`), which a sync
+extension calls for its own moves too. It calls every `BranchMoveObserver`
+(`BranchMoved(ctx, BranchMove) error`) registered with
+`(*Service).RegisterBranchMoveObserver`, once each in the order of
+registration (the list is guarded by its own mutex; nil registers nothing);
+an observer's error is logged through `Deps.Logger` (`workspace
+branch-move observer failed`, with `slug`, `branch`, `cause` and `error`),
+and the remaining observers are still called and the sync goes on, since
+the branch has moved already. With no observer a sync behaves the same.
+
+When every branch is handled, `completeSync` writes in one `Store.Tx`
+`recordSync` (`last_sync_at` = `Deps.Now` in UTC cut to the second,
+`sync_error` `NULL`, `head_sha` the copy's head of the record's default
+branch and `origin_head_sha` origin's head of it from the fetch, each
+`NULL` when there is none; `updated_at` is not written) and the one
+`parley.workspace.sync` event (`syncEventInput`), whose actor is
+`SyncOptions.Actor` mapped by `eventActor`; a `SyncOptions.Actor` that is
+neither the admin token nor a user's credential is an error before
+anything is fetched. Its metadata holds the lists `created`,
+`fast_forward`, `ahead`, `diverged` and `reset` of branch names (sorted, `[]`
+when empty, `up_to_date` branches in none) and `updated`, one `{ref,
+before, after}` per moved or created branch and per created tag with full
+ref names, `before` `null` for a created ref, sorted by `ref`. `Sync`
+returns the record read again after that transaction as
+`SyncResult.Workspace`.
+
 `internal/workspace/sync_handler.go` holds `POST /workspaces/:slug/sync`,
 declared with `Scope` `workspaces:write` and `Marks` `access.need: write`,
 so the scope check and then the access check answer before the handler (a
@@ -2048,10 +2078,11 @@ reads `reset_to_origin` with `boolParam` (absent or `false`, `true`, else
 `sync_enabled` from the settings registry, `false` being
 `400 sync_disabled`, so that nothing is fetched before every check has
 passed. It runs `Sync` on `context.WithoutCancel` of the request's context,
-so a caller who disconnects does not stop it and the principal stays in the
-context's values, reads the record again and answers `200` with the
-`RenderWorkspace` object for the caller's level (`access.DecisionOf`) and
-the member `branches`. An error of `Sync` that is a `*server.Error`,
+so a caller who disconnects does not stop it, with the caller from
+`identity.PrincipalOf` as `SyncOptions.Actor`, and answers `200` with the
+`RenderWorkspace` object of `SyncResult.Workspace`, the record after the
+completion, for the caller's level (`access.DecisionOf`) and the member
+`branches`. An error of `Sync` that is a `*server.Error`,
 wrapped or not, is the answer; any other is `500 internal`.
 
 ### Hub events

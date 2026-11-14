@@ -113,6 +113,9 @@ type Service struct {
 
 	stepMu    sync.RWMutex
 	postClone map[string]PostCloneStep
+
+	moveMu        sync.RWMutex
+	moveObservers []BranchMoveObserver
 }
 
 // Bind binds the service to d. It is called once, before the hub serves.

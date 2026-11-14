@@ -58,3 +58,27 @@ moving it at that moment.
   route's tests send the three accepted queries against a workspace with a
   diverged branch and read the reset from the branch's result (`diverged`,
   `diverged`, `reset`).
+
+## Completion, event and branch-move observers
+
+- The caller reaches the sync as `SyncOptions.Actor`, an
+  `identity.Principal`: the route passes `identity.PrincipalOf` of the
+  request, a test calling `Sync` directly passes one. The event's actor is
+  mapped from it by the same function as the `parley.workspace.update`
+  event's (`eventActor`): the admin token is `admin_token` with no actor id.
+  A `Sync` call whose actor is neither the admin token nor a user's
+  credential is an error before anything is fetched.
+- A completed sync does not write `updated_at`: it writes `last_sync_at`,
+  `sync_error` (cleared), `head_sha` and `origin_head_sha` only, so that
+  `updated_at` stays the time of the record's own last change by a create
+  or an update.
+- `RegisterBranchMoveObserver` and `NotifyBranchMove` are methods of
+  `*workspace.Service`, like `RegisterPostCloneStep`, not package-level
+  functions. An observer implements `BranchMoved(ctx, BranchMove) error`;
+  `BranchMove.Before` is `""`, not absent, for a created branch, and its
+  cause is the constant `workspace.MoveCauseSync` (`"sync"`). Observers are
+  added in the order of registration and cannot be removed; a nil observer
+  adds none.
+- `Sync` returns the record read again after the completion transaction in
+  `SyncResult.Workspace`, and the route renders that record rather than
+  reading it a second time.

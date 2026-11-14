@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -28,8 +29,8 @@ type syncAnswer struct {
 }
 
 // serveSync syncs the route's workspace when the query is valid and the
-// workspace may be synced, and answers the workspace object with the
-// caller's level and the branches. Nothing is fetched before every check has
+// workspace may be synced, and answers the workspace object as the sync's
+// completion left it, with the caller's level, and the branches. Nothing is fetched before every check has
 // passed. The sync runs on a context the request's end does not cancel, so
 // that a caller who disconnects does not stop it halfway; the principal
 // stays in that context's values.
@@ -56,18 +57,16 @@ func (s *Service) serveSync(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	ctx := context.WithoutCancel(r.Context())
+	// The caller is the sync event's actor; the access check has let only
+	// the admin token or a user's credential through.
+	p, _ := identity.PrincipalOf(ctx)
 	// An error that is a *server.Error, wrapped or not, is the answer; any
 	// other is answered as a failure inside the hub.
-	result, err := s.Sync(ctx, slug, SyncOptions{ResetToOrigin: reset})
+	result, err := s.Sync(ctx, slug, SyncOptions{ResetToOrigin: reset, Actor: p})
 	if err != nil {
 		return err
 	}
-	if rec, found, err = BySlug(ctx, s.deps.Store.Main(), slug); err != nil {
-		return err
-	} else if !found {
-		return server.NotFound(ErrNotFound.Error())
-	}
-	obj, err := s.RenderWorkspace(ctx, rec, d.Level)
+	obj, err := s.RenderWorkspace(ctx, result.Workspace, d.Level)
 	if err != nil {
 		return err
 	}
