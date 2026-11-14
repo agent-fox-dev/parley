@@ -169,6 +169,25 @@ WHERE slug = ? AND status IN (?, ?)`,
 	return n == 1, nil
 }
 
+// failUnfinished sets the workspace slug to failed with msg as clone_error,
+// its heads cleared, in one write through ex, but only while it is in
+// pending or cloning: a workspace whose outcome was written after all, or
+// that is gone, is left as it is. failed reports whether it was set.
+func failUnfinished(ctx context.Context, ex Execer, slug, msg string, now time.Time) (failed bool, err error) {
+	res, err := ex.ExecContext(ctx, `
+UPDATE workspaces SET status = ?, head_sha = NULL, origin_head_sha = NULL, clone_error = ?, updated_at = ?
+WHERE slug = ? AND status IN (?, ?)`,
+		string(StatusFailed), msg, now.UnixNano(), slug, string(StatusPending), string(StatusCloning))
+	if err != nil {
+		return false, fmt.Errorf("fail the clone of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("fail the clone of workspace %q: %w", slug, err)
+	}
+	return n == 1, nil
+}
+
 // CloneWork lists through q the slugs of the workspaces with clone work
 // outstanding, those in pending or cloning, in the order the work was
 // recorded: by created_at, then by slug, so that two workspaces created in

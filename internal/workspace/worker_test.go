@@ -164,6 +164,47 @@ func TestWorkers_StopInterruptsACloneAndLeavesItForTheNextStart(t *testing.T) {
 	})
 }
 
+func TestWorkers_FailAWorkspaceWhoseOutcomeCouldNotBeRecordedOnceTheStoreAnswers(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	w := newWorld(t, withGitOrigin(o))
+	w.createFrom(t, "demo", o.URL(), nil)
+	// The store refuses every write of an outcome, ready or failed, until the
+	// trigger is dropped.
+	if _, err := w.Store.Main().Exec(`CREATE TRIGGER refuse_outcome BEFORE UPDATE OF status ON workspaces
+WHEN NEW.status IN ('ready', 'failed') BEGIN SELECT RAISE(ABORT, 'the store refuses the write'); END`); err != nil {
+		t.Fatal(err)
+	}
+	runs := &runLog{}
+	wk := w.startWorkers(t, 1, runs.around(w.svc.Clone))
+	wk.Enqueue("demo")
+	eventually(t, "the clone work returns", func() bool { _, finished, _ := runs.snapshot(); return len(finished) == 1 })
+	if rec, _ := w.workspace(t, "demo"); rec.Status != workspace.StatusCloning {
+		t.Fatalf("status %s while the store refuses the outcome, want cloning", rec.Status)
+	}
+	asked := o.Requests()
+	if _, err := w.Store.Main().Exec(`DROP TRIGGER refuse_outcome`); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the workspace is failed once the store answers", func() bool {
+		rec, _ := w.workspace(t, "demo")
+		return rec.Status == workspace.StatusFailed
+	})
+	rec, _ := w.workspace(t, "demo")
+	if rec.CloneError == nil || rec.HeadSHA != nil {
+		t.Errorf("clone_error %v, head_sha %v; want the write error and no head", rec.CloneError, rec.HeadSHA)
+	} else if !strings.Contains(*rec.CloneError, "the store refuses the write") {
+		t.Errorf("clone_error %q, want the write error the store answered", *rec.CloneError)
+	}
+	if left := w.leftovers(t, "demo"); len(left) != 0 {
+		t.Errorf("the repository root holds %v for the failed workspace, want nothing", left)
+	}
+	if _, finished, _ := runs.snapshot(); len(finished) != 1 || o.Requests() != asked {
+		t.Errorf("%d runs and %d more requests to origin, want the one run and no further attempt", len(finished), o.Requests()-asked)
+	}
+}
+
 func TestNewWorkers_RefusesFewerThanOneWorker(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {

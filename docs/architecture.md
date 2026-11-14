@@ -1876,8 +1876,16 @@ derived from `ctx`, so they end with it as with `Stop`. Each runs once; a
 second call is an error. The queue holds no state of its own: a workspace
 in `pending` or `cloning` is its own record of the work, and the next
 `Start` reads it again. An error of the work that is not the
-end of its context is logged as `workspace clone work failed`, and the
-workspace keeps its status. `Stop(ctx)` stops taking work, cancels the
+end of its context means its outcome could not be recorded: it is logged
+as `workspace clone work failed`, and the worker, still holding the slug,
+sets the workspace to `failed` with `clone_error` "the outcome of the clone
+could not be recorded: <the error>" (scrubbed) and null heads, in one write
+that only changes a workspace still in `pending` or `cloning`. When the
+store refuses that write too, the worker logs `workspace clone failure not
+recorded` and tries again, after 100 ms and then twice as long each time,
+up to 30 s, until the store takes it or the workers stop, which leaves the
+work to the next `Start`. Once the workspace is failed, its copy at
+`RepoPath` is removed. `Stop(ctx)` stops taking work, cancels the
 context of the running clones, so that their git processes are killed and
 `Clone` leaves their status as it is, waits for the goroutines, then
 removes every `.clone-*` entry again and returns the error of that removal
