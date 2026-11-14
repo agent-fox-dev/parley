@@ -56,3 +56,34 @@ that failed mid-run are not known, and the maintenance loop logs the error
 as `maintenance task failed` with `task` `secret_reencryption`. Every run
 that the store does not stop writes the line, one that a converter's error
 fails included.
+
+## A create body is held to the server's body limit first
+
+The package checks a create's values against the limit of 262,144 bytes
+each and leaves the size of a request body to the server. The secret routes
+keep the server's body limit, `[server].max_body_size`, 1 MiB (1,048,576
+bytes) by default, and the server reads the body before the create checks
+it. So a create whose body exceeds that limit is answered `413`
+`payload_too_large` (`request body exceeds 1048576 bytes`) before any entry
+is checked, although each of its values is within 262,144 bytes: four values
+of 262,144 bytes in one request are refused that way. One value of 262,144
+bytes fits, and is stored.
+
+## A create's exit status is its last failure's
+
+The package has `parley secrets create` with several scope flags exit with
+status `1` when a scope failed. The command sends to every scope, prints the
+results of those that succeeded, writes the error of each failed scope to
+stderr once and ends with the last failure, so the exit status is that
+failure's: `1` when the hub answered an error, as the package says, but `2`
+when the last failure is on the client's side, such as a hub that cannot be
+reached or an answer without items.
+
+## An empty KEY is refused as a usage error for delete and --from-stdin
+
+The package lists the malformed command lines that exit `2` with a
+`usage_error`. The CLI also refuses, in the same way and before any request,
+an empty KEY for `parley secrets delete` (`delete ''`), which would leave the
+route's last segment empty and so name the list route, and an empty KEY with
+`--from-stdin` (`create '' --from-stdin`, `update '' --from-stdin`), which
+names no secret.

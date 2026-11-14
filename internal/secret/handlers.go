@@ -66,15 +66,26 @@ func (c *Component) Routes() []server.Route {
 }
 
 // item is a secret as a list answers it: its key and its times, never its
-// value nor its owner.
+// value nor its owner. position, which is not answered, is the stored
+// item's Position, from which a list's cursor continues.
 type item struct {
 	Key       string       `json:"key"`
 	CreatedAt timefmt.Time `json:"created_at"`
 	UpdatedAt timefmt.Time `json:"updated_at"`
+	position  string
 }
 
 func itemOf(it Item) item {
-	return item{Key: it.Key, CreatedAt: timefmt.Time(it.CreatedAt), UpdatedAt: timefmt.Time(it.UpdatedAt)}
+	return item{Key: it.Key, CreatedAt: timefmt.Time(it.CreatedAt), UpdatedAt: timefmt.Time(it.UpdatedAt), position: it.Position()}
+}
+
+// itemsOf are the stored items as an answer gives them, in their order.
+func itemsOf(stored []Item) []item {
+	items := make([]item, len(stored))
+	for i, it := range stored {
+		items[i] = itemOf(it)
+	}
+	return items
 }
 
 // list answers GET on a secrets collection with a page of the scope's
@@ -97,11 +108,7 @@ func (c *Component) list(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	items := make([]item, len(stored))
-	for i, it := range stored {
-		items[i] = itemOf(it)
-	}
-	return server.WritePage(w, page, items, func(it item) any { return asciiLower(it.Key) })
+	return server.WritePage(w, page, itemsOf(stored), func(it item) any { return it.position })
 }
 
 // create answers POST on a secrets collection: it stores every entry of the
@@ -142,13 +149,9 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return routeError(err)
 	}
-	items := make([]item, len(stored))
-	for i, it := range stored {
-		items[i] = itemOf(it)
-	}
 	server.WriteJSON(w, http.StatusCreated, struct {
 		Items []item `json:"items"`
-	}{items})
+	}{itemsOf(stored)})
 	return nil
 }
 

@@ -287,7 +287,8 @@ it is ignored, the URL-safe alphabet is not accepted.
 `parleyd` loads the keys with the configuration, before it opens the stores,
 also for `--admin-email`, `--reset-admin-token` and `backup`. A key that is
 not 32 bytes of standard padded base64, or a key file that cannot be read,
-stops it with one `cannot start` line and exit status `1`; the line names the
+stops it with one error line and exit status `1`: `cannot start` for a start
+and the bootstrap, `backup failed` for `backup`. The line's `error` names the
 variable or the file, never the value:
 
 ```

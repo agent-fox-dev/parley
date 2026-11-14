@@ -247,8 +247,10 @@ func createSecrets(c *call) error {
 		}
 		results = append(results, result{s.name, items})
 	}
-	// Items are JSON the client has checked, so this cannot fail.
-	doc, _ := json.Marshal(map[string]any{"results": results})
+	doc, err := json.Marshal(map[string]any{"results": results})
+	if err != nil {
+		return clientError("cannot encode the results: %v", err)
+	}
 	if err := c.printResult(doc); err != nil {
 		return err
 	}
@@ -312,8 +314,10 @@ func printWholeList(c *call, path string) error {
 		}
 		query.Set("cursor", *page.NextCursor)
 	}
-	// The items are JSON the client has decoded, so this cannot fail.
-	doc, _ := json.Marshal(map[string]any{"items": items})
+	doc, err := json.Marshal(map[string]any{"items": items})
+	if err != nil {
+		return clientError("cannot encode the items: %v", err)
+	}
 	return c.printResult(doc)
 }
 

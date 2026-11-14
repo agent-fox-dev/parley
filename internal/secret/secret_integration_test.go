@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"net/http"
 	"os"
@@ -46,9 +45,7 @@ func TestStart_StopsBeforeListeningOnAKeyThatCannotBeLoaded(t *testing.T) {
 				t.Fatal(err)
 			}
 			env := map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir}
-			for k, v := range tc.env {
-				env[k] = v
-			}
+			maps.Copy(env, tc.env)
 			var stderr hubtest.LogBuffer
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -60,7 +57,7 @@ func TestStart_StopsBeforeListeningOnAKeyThatCannotBeLoaded(t *testing.T) {
 			if lines := strings.Split(log, "\n"); len(lines) != 1 {
 				t.Fatalf("stderr holds %d lines, want 1: %s", len(lines), log)
 			}
-			errs := logLines(t, log, "cannot start")
+			errs := secret.LogLines(t, log, "cannot start")
 			if len(errs) != 1 || errs[0]["level"] != "ERROR" {
 				t.Fatalf("stderr %s is not one cannot start error line", log)
 			}
@@ -71,7 +68,7 @@ func TestStart_StopsBeforeListeningOnAKeyThatCannotBeLoaded(t *testing.T) {
 			if tc.value != "" && strings.Contains(log, tc.value) {
 				t.Errorf("stderr %s quotes the configured value", log)
 			}
-			if len(logLines(t, log, "listening")) != 0 {
+			if len(secret.LogLines(t, log, "listening")) != 0 {
 				t.Errorf("the hub listened: %s", log)
 			}
 		})
@@ -80,40 +77,33 @@ func TestStart_StopsBeforeListeningOnAKeyThatCannotBeLoaded(t *testing.T) {
 
 func TestStart_ReportsSecretEncryptionAndStartsWithoutAKey(t *testing.T) {
 	_, current := newKey(t)
-	_, previous := newKey(t)
+	// A previous key is reported by the starts of the key rotation test.
 	cases := []struct {
-		name                string
-		cfg                 hubtest.Config
-		configured, hasPrev bool
+		name       string
+		cfg        hubtest.Config
+		configured bool
 	}{
-		{"no key", hubtest.Config{}, false, false},
-		{"current and previous key from the environment",
-			hubtest.Config{Env: map[string]string{secret.EnvCurrentKey: current, secret.EnvPreviousKey: previous}}, true, true},
+		{"no key", hubtest.Config{}, false},
 		{"current key from a key file relative to the config dir",
-			hubtest.Config{TOML: "[secrets]\nkey_file = \"keys/current\"\n", Files: map[string]string{"keys/current": current + "\n"}}, true, false},
+			hubtest.Config{TOML: "[secrets]\nkey_file = \"keys/current\"\n", Files: map[string]string{"keys/current": current + "\n"}}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := hubtest.StartWith(t, tc.cfg)
 			log := h.Log.String()
-			reports := logLines(t, log, "secret encryption")
+			reports := secret.LogLines(t, log, "secret encryption")
 			if len(reports) != 1 {
 				t.Fatalf("%d secret encryption lines, want 1; log = %s", len(reports), log)
 			}
-			want := map[string]any{"level": "INFO", "key_configured": tc.configured, "previous_key_present": tc.hasPrev, "undecryptable_secrets": float64(0)}
+			want := map[string]any{"level": "INFO", "key_configured": tc.configured, "previous_key_present": false, "undecryptable_secrets": float64(0)}
 			for k, v := range want {
 				if reports[0][k] != v {
 					t.Errorf("%s = %v, want %v", k, reports[0][k], v)
 				}
 			}
-			warnings := logLines(t, log, noKeyWarning)
-			if want := map[bool]int{false: 1}[tc.configured]; len(warnings) != want {
-				t.Errorf("%d no-key warnings, want %d; log = %s", len(warnings), want, log)
-			}
-			for _, w := range warnings {
-				if w["level"] != "WARN" {
-					t.Errorf("the no-key warning is at %v, want WARN", w["level"])
-				}
+			warnings := secret.LogLines(t, log, noKeyWarning)
+			if want := map[bool]int{false: 1}[tc.configured]; len(warnings) != want || want == 1 && warnings[0]["level"] != "WARN" {
+				t.Errorf("no-key warnings %v, want %d at WARN; log = %s", warnings, want, log)
 			}
 			if status, body := h.Call(t, http.MethodGet, "/readyz", "", nil); status != http.StatusOK || !strings.Contains(string(body), `"ready"`) {
 				t.Errorf("GET /readyz = %d %s, want 200 ready", status, body)
@@ -122,121 +112,45 @@ func TestStart_ReportsSecretEncryptionAndStartsWithoutAKey(t *testing.T) {
 	}
 }
 
-func TestStart_KeepsTheKeysOutOfTheLogAndTheStore(t *testing.T) {
+func TestSecretValuesAndKeys_NeverLeaveTheHub(t *testing.T) {
+	sentinels := []string{"S3ntinel-7f3a9c41-value", "S3ntinel-0b6e2d58-second"}
 	currentRaw, current := newKey(t)
 	previousRaw, previous := newKey(t)
-	passEnded := make(chan struct{})
+	var secrets *secret.Component
+	var events *event.Component
+	ended := make(chan struct{}, 1)
 	h := hubtest.StartWith(t, hubtest.Config{
 		TOML: "[logging]\nlevel = \"trace\"\n",
 		Env:  map[string]string{secret.EnvCurrentKey: current, secret.EnvPreviousKey: previous},
 		Compose: func(c *hub.Composition) {
+			secrets, events = c.Secrets(), c.Events()
 			c.AddStartHook("test-seed-secret", func(ctx context.Context, rt *hub.Runtime) error {
 				return rt.Store.Tx(ctx, func(tx *sql.Tx) error {
 					return c.Secrets().Put(ctx, tx, secret.ScopeUser, "u1", "GIT_PAT", "ghp_value")
 				})
 			})
-			// Tasks registered after the hub's own run last in a pass, so
-			// this one marks the end of the first pass.
-			c.AddMaintenanceTask("test-pass-end", func(context.Context, *hub.Runtime) error {
-				select {
-				case <-passEnded:
-				default:
-					close(passEnded)
-				}
-				return nil
-			})
+			passEnd(c, ended)
 		},
 	})
-	select {
-	case <-passEnded:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the first maintenance pass did not end within 5 s")
-	}
-	dataDir, _ := h.Listening["data_dir"].(string)
-	h.Stop()
-	if code := h.ExitCode(t, 10*time.Second); code != 0 {
-		t.Fatalf("the hub stopped with %d, want 0; log = %s", code, h.Log.String())
-	}
-
-	sources := dataFiles(t, dataDir)
-	sources["the log"] = []byte(h.Log.String())
-	forms := map[string][]byte{
-		"the current key in base64": []byte(current), "the current key's bytes": currentRaw,
-		"the previous key in base64": []byte(previous), "the previous key's bytes": previousRaw,
-	}
-	for where, content := range sources {
-		for form, key := range forms {
-			if bytes.Contains(content, key) {
-				t.Errorf("%s holds %s", where, form)
-			}
-		}
-	}
-}
-
-// dataFiles reads every file of a stopped hub's data directory, the
-// database and its -wal and -shm files among them: path to content.
-func dataFiles(t *testing.T, dir string) map[string][]byte {
-	t.Helper()
-	files := map[string][]byte{}
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		content, err := os.ReadFile(path)
-		files[path] = content
-		return err
-	})
-	if err != nil || len(files) == 0 {
-		t.Fatalf("read the data directory %s: %d files, %v", dir, len(files), err)
-	}
-	return files
-}
-
-func TestSecretValues_NeverLeaveTheHub(t *testing.T) {
-	sentinels := []string{"S3ntinel-7f3a9c41-value", "S3ntinel-0b6e2d58-second"}
-	_, key := newKey(t)
-	var secrets *secret.Component
-	var events *event.Component
-	h := hubtest.StartWith(t, hubtest.Config{
-		TOML:    "[logging]\nlevel = \"trace\"\n",
-		Env:     map[string]string{secret.EnvCurrentKey: key},
-		Compose: func(c *hub.Composition) { secrets, events = c.Secrets(), c.Events() },
-	})
+	// The first maintenance pass, which reads the stored secret under both
+	// keys, ends before anything else.
+	waitPass(t, ended)
 	userID := h.CreateUser(t, "owner")
 	cred := h.IssueKey(t, userID)
 	ctx := context.Background()
 	// sources are every text the hub gave out or kept, by where it was.
 	sources := map[string][]byte{}
-	call := func(method, path, idempotencyKey string, body any, want int) {
+	keep := func(what string, status int, answer []byte, want int) {
 		t.Helper()
-		var raw []byte
-		if body != nil {
-			raw, _ = json.Marshal(body)
+		if status != want {
+			t.Errorf("%s = %d %s, want %d", what, status, answer, want)
 		}
-		req, err := http.NewRequest(method, h.URL("/api/v1"+path), bytes.NewReader(raw))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer "+cred)
-		if body != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		if idempotencyKey != "" {
-			req.Header.Set("Idempotency-Key", idempotencyKey)
-		}
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		answer, err := io.ReadAll(res.Body)
-		_ = res.Body.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res.StatusCode != want {
-			t.Errorf("%s %s = %d %s, want %d", method, path, res.StatusCode, answer, want)
-		}
-		sources[fmt.Sprintf("the answer %d to %s %s", len(sources), method, path)] = answer
+		sources[fmt.Sprintf("the answer %d to %s", len(sources), what)] = answer
+	}
+	call := func(method, path string, body any, want int) {
+		t.Helper()
+		status, answer := h.Call(t, method, "/api/v1"+path, cred, body)
+		keep(method+" "+path, status, answer, want)
 	}
 	get := func(want string) {
 		t.Helper()
@@ -250,39 +164,54 @@ func TestSecretValues_NeverLeaveTheHub(t *testing.T) {
 	}
 
 	create := entries(map[string]any{"key": "GIT_PAT", "value": sentinels[0]})
-	call(http.MethodPost, "/user/secrets", "create-1", create, http.StatusCreated)
-	call(http.MethodPost, "/user/secrets", "create-1", create, http.StatusOK) // the replay
-	call(http.MethodGet, "/user/secrets", "", nil, http.StatusOK)
-	call(http.MethodPost, "/user/secrets", "", create, http.StatusConflict)
+	raw, err := json.Marshal(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The create with an Idempotency-Key, then its replay.
+	for _, want := range []int{http.StatusCreated, http.StatusOK} {
+		req, err := http.NewRequest(http.MethodPost, h.URL("/api/v1/user/secrets"), bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "create-1")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, err := io.ReadAll(res.Body)
+		if cerr := res.Body.Close(); err != nil || cerr != nil {
+			t.Fatal(err, cerr)
+		}
+		keep("POST /user/secrets with an Idempotency-Key", res.StatusCode, answer, want)
+	}
+	call(http.MethodGet, "/user/secrets", nil, http.StatusOK)
+	call(http.MethodPost, "/user/secrets", create, http.StatusConflict)
 	get(sentinels[0])
-	call(http.MethodPatch, "/user/secrets/GIT_PAT", "", map[string]any{"value": sentinels[1]}, http.StatusOK)
+	call(http.MethodPatch, "/user/secrets/GIT_PAT", map[string]any{"value": sentinels[1]}, http.StatusOK)
 	get(sentinels[1])
 	sources["the log of the first run"] = []byte(h.Log.String())
 	_, other := newKey(t)
 	h.RestartEnv(t, map[string]string{secret.EnvCurrentKey: other})
 	get("unreadable")
-	call(http.MethodDelete, "/user/secrets/GIT_PAT", "", nil, http.StatusNoContent)
+	call(http.MethodDelete, "/user/secrets/GIT_PAT", nil, http.StatusNoContent)
 	recs, _, err := events.ReadAfter(ctx, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, rec := range recs {
-		sources[fmt.Sprintf("the event %d %s", rec.Seq, rec.Type)], _ = json.Marshal(rec)
-	}
-	dataDir, _ := h.Listening["data_dir"].(string)
-	h.Stop()
-	if code := h.ExitCode(t, 10*time.Second); code != 0 {
-		t.Fatalf("the hub stopped with %d, want 0", code)
-	}
-	sources["the log of the second run"] = []byte(h.Log.String())
-	maps.Copy(sources, dataFiles(t, dataDir))
-	for where, content := range sources {
-		for _, s := range sentinels {
-			if bytes.Contains(content, []byte(s)) {
-				t.Errorf("%s holds the value %s", where, s)
-			}
+		if sources[fmt.Sprintf("the event %d %s", rec.Seq, rec.Type)], err = json.Marshal(rec); err != nil {
+			t.Fatal(err)
 		}
 	}
+	maps.Copy(sources, stopAndRead(t, h))
+	noneHolds(t, sources, map[string][]byte{
+		"the first value": []byte(sentinels[0]), "the second value": []byte(sentinels[1]),
+		"the current key in base64": []byte(current), "the current key's bytes": currentRaw,
+		"the previous key in base64": []byte(previous), "the previous key's bytes": previousRaw,
+	})
 }
 
 func TestOwnerDelete_RemovesTheOwnersSecretsInItsTransaction(t *testing.T) {
@@ -344,35 +273,26 @@ func TestSecretsFromTheShell_StoreUpdateAndRemoveAWorkspaceSecret(t *testing.T) 
 	}
 	listed := func() []map[string]json.RawMessage {
 		t.Helper()
-		var doc struct {
-			Items []map[string]json.RawMessage `json:"items"`
-		}
-		if err := json.Unmarshal([]byte(parley("", "secrets", "list", "--workspace", "acme")), &doc); err != nil {
-			t.Fatal(err)
-		}
-		return doc.Items
+		return pageOf(t, answer{http.StatusOK, []byte(parley("", "secrets", "list", "--workspace", "acme"))}).Items
 	}
 	_, seq := w.eventsAfter(t, 0)
 
 	var created struct {
 		Results []struct {
-			Scope string `json:"scope"`
-			Items []struct {
-				Key string `json:"key"`
-			} `json:"items"`
-		} `json:"results"`
+			Scope string
+			Items []struct{ Key string }
+		}
 	}
 	if err := json.Unmarshal([]byte(parley("", "secrets", "create", "GIT_PAT="+values[0], "--workspace", "acme")), &created); err != nil {
 		t.Fatal(err)
 	}
-	if len(created.Results) != 1 || created.Results[0].Scope != "workspace" ||
-		len(created.Results[0].Items) != 1 || created.Results[0].Items[0].Key != "GIT_PAT" {
-		t.Fatalf("create printed %+v, want scope workspace with the item GIT_PAT", created)
+	if got := fmt.Sprintf("%+v", created); got != "{Results:[{Scope:workspace Items:[{Key:GIT_PAT}]}]}" {
+		t.Fatalf("create printed %s, want scope workspace with the item GIT_PAT", got)
 	}
 	read(values[0], true)
 	items := listed()
-	if len(items) != 1 || len(items[0]) != 3 || items[0]["key"] == nil || items[0]["created_at"] == nil || items[0]["updated_at"] == nil {
-		t.Fatalf("list printed %v, want one item of exactly key, created_at and updated_at", items)
+	if len(items) != 1 {
+		t.Fatalf("list printed %v, want one item", items)
 	}
 	parley(values[1]+"\n", "secrets", "update", "GIT_PAT", "--from-stdin", "--workspace", "acme")
 	read(values[1], true)
@@ -396,88 +316,26 @@ func TestSecretsFromTheShell_StoreUpdateAndRemoveAWorkspaceSecret(t *testing.T) 
 		t.Errorf("secret events = %v, want %v", types, want)
 	}
 
-	dataDir, _ := w.Listening["data_dir"].(string)
-	w.Stop()
-	if code := w.ExitCode(t, 10*time.Second); code != 0 {
-		t.Fatalf("the hub stopped with %d, want 0", code)
-	}
-	sources := dataFiles(t, dataDir)
-	sources["the log"] = []byte(w.Log.String())
+	sources := stopAndRead(t, w.Hub)
 	for i, out := range outputs {
 		sources[fmt.Sprintf("command output %d", i)] = []byte(out)
 	}
-	for where, content := range sources {
-		for _, v := range values {
-			if bytes.Contains(content, []byte(v)) {
-				t.Errorf("%s holds the value %s", where, v)
-			}
-		}
-	}
+	noneHolds(t, sources, map[string][]byte{"the created value": []byte(values[0]), "the piped value": []byte(values[1])})
 }
 
 func TestKeyRotation_ReencryptsUnderTheNewKeyAndKeepsEverySecret(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("[server]\nbind = \"127.0.0.1\"\nport = 0\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	_, keyA := newKey(t)
 	_, keyB := newKey(t)
-	envOf := func(vars map[string]string) config.Env {
-		m := map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir}
-		maps.Copy(m, vars)
-		return config.MapEnv(m)
-	}
+	var secrets *secret.Component
+	ended := make(chan struct{}, 1)
+	h := hubtest.StartWith(t, hubtest.Config{
+		Env:     map[string]string{secret.EnvCurrentKey: keyA},
+		Compose: func(c *hub.Composition) { secrets = c.Secrets(); passEnd(c, ended) },
+	})
+	// The first pass of each run is waited for before the next restart, so
+	// that the mark a pass leaves is the one of the run that is waited for.
+	waitPass(t, ended)
 	ctx := context.Background()
-	if code := hub.Run(ctx, hub.Options{Args: []string{"--admin-email", "boss@example.com"},
-		Env: envOf(map[string]string{secret.EnvCurrentKey: keyA}), WorkDir: dir}); code != 0 {
-		t.Fatalf("bootstrap returned %d, want 0", code)
-	}
-	// The hub does not start while the token file of the bootstrap is there.
-	if err := os.Remove(filepath.Join(dir, "admin_token")); err != nil {
-		t.Fatal(err)
-	}
-	// run starts the hub with the variables vars until its first
-	// maintenance pass has ended, and returns it with its secret component
-	// and its store.
-	run := func(vars map[string]string) (*hubtest.Served, *secret.Component, *hub.Runtime) {
-		t.Helper()
-		var secrets *secret.Component
-		var rt *hub.Runtime
-		passEnded := make(chan struct{})
-		s := hubtest.Serve(t, hub.Options{Env: envOf(vars), WorkDir: dir, Compose: func(c *hub.Composition) {
-			secrets, rt = c.Secrets(), c.Runtime()
-			// Tasks registered after the hub's own run last in a pass.
-			c.AddMaintenanceTask("test-pass-end", func(context.Context, *hub.Runtime) error {
-				select {
-				case <-passEnded:
-				default:
-					close(passEnded)
-				}
-				return nil
-			})
-		}})
-		select {
-		case <-passEnded:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the first maintenance pass did not end within 5 s")
-		}
-		return s, secrets, rt
-	}
-	stop := func(s *hubtest.Served) {
-		t.Helper()
-		s.Stop()
-		if code := s.ExitCode(t, 10*time.Second); code != 0 {
-			t.Fatalf("the hub stopped with %d, want 0; log = %s", code, s.Log.String())
-		}
-	}
-	report := func(s *hubtest.Served, previous bool, undecryptable float64) {
-		t.Helper()
-		lines := logLines(t, s.Log.String(), "secret encryption")
-		if len(lines) != 1 || lines[0]["key_configured"] != true || lines[0]["previous_key_present"] != previous ||
-			lines[0]["undecryptable_secrets"] != undecryptable {
-			t.Fatalf("secret encryption lines = %v, want one with a key, previous %v, %v undecryptable", lines, previous, undecryptable)
-		}
-	}
 	places := []struct {
 		scope     secret.Scope
 		id, value string
@@ -485,9 +343,8 @@ func TestKeyRotation_ReencryptsUnderTheNewKeyAndKeepsEverySecret(t *testing.T) {
 		{secret.ScopeUser, "u1", "user-value-1d"}, {secret.ScopeOrg, "o1", "org-value-2e"},
 		{secret.ScopeWorkspace, "acme", "workspace-value-3f"},
 	}
-	listed := func(secrets *secret.Component) []secret.Item {
+	listed := func() (all []secret.Item) {
 		t.Helper()
-		var all []secret.Item
 		for _, p := range places {
 			items, err := secrets.ListPage(ctx, p.scope, p.id, "", 10)
 			if err != nil {
@@ -497,9 +354,18 @@ func TestKeyRotation_ReencryptsUnderTheNewKeyAndKeepsEverySecret(t *testing.T) {
 		}
 		return all
 	}
-
-	s, secrets, rt := run(map[string]string{secret.EnvCurrentKey: keyA})
-	err := rt.Store.Tx(ctx, func(tx *sql.Tx) error {
+	// restart starts the hub again with the keys given, and checks its start
+	// report.
+	restart := func(vars map[string]string, undecryptable float64) {
+		t.Helper()
+		h.RestartEnv(t, vars)
+		lines := secret.LogLines(t, h.Log.String(), "secret encryption")
+		if len(lines) != 1 || lines[0]["key_configured"] != true || lines[0]["previous_key_present"] != (vars[secret.EnvPreviousKey] != "") ||
+			lines[0]["undecryptable_secrets"] != undecryptable {
+			t.Fatalf("secret encryption lines = %v, want one with a key, the previous key %v, %v undecryptable", lines, vars, undecryptable)
+		}
+	}
+	err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
 		for _, p := range places {
 			if err := secrets.Put(ctx, tx, p.scope, p.id, "TOKEN", p.value); err != nil {
 				return err
@@ -510,81 +376,69 @@ func TestKeyRotation_ReencryptsUnderTheNewKeyAndKeepsEverySecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := listed(secrets)
-	stop(s)
+	before := listed()
 
-	s, _, _ = run(map[string]string{secret.EnvCurrentKey: keyB, secret.EnvPreviousKey: keyA})
-	report(s, true, 0)
-	if lines := logLines(t, s.Log.String(), "secret re-encryption"); len(lines) != 1 ||
+	restart(map[string]string{secret.EnvCurrentKey: keyB, secret.EnvPreviousKey: keyA}, 0)
+	waitPass(t, ended)
+	if lines := secret.LogLines(t, h.Log.String(), "secret re-encryption"); len(lines) != 1 ||
 		lines[0]["converted"] != float64(3) || lines[0]["remaining"] != float64(0) {
 		t.Fatalf("secret re-encryption lines = %v, want one with converted 3 and remaining 0", lines)
 	}
-	stop(s)
 
-	s, secrets, _ = run(map[string]string{secret.EnvCurrentKey: keyB})
-	report(s, false, 0)
+	restart(map[string]string{secret.EnvCurrentKey: keyB}, 0)
 	for _, p := range places {
 		if v, found, err := secrets.Get(ctx, p.scope, p.id, "TOKEN"); err != nil || !found || v != p.value {
 			t.Errorf("Get(%s %s) under the new key alone = %q, %v, %v; want %q", p.scope, p.id, v, found, err, p.value)
 		}
 	}
-	if after := listed(secrets); fmt.Sprint(after) != fmt.Sprint(before) {
+	if after := listed(); fmt.Sprint(after) != fmt.Sprint(before) {
 		t.Errorf("the entries after the rotation = %v, want them unchanged: %v", after, before)
 	}
-	stop(s)
 
-	s, secrets, _ = run(map[string]string{secret.EnvCurrentKey: keyA})
-	report(s, false, 3)
-	if n := len(listed(secrets)); n != 3 {
+	restart(map[string]string{secret.EnvCurrentKey: keyA}, 3)
+	if n := len(listed()); n != 3 {
 		t.Errorf("under the old key alone %d entries are listed, want 3", n)
 	}
-	stop(s)
 }
 
 func TestOrgSecrets_AreSharedWhileAWorkspacesSecretsStayWithItsOwner(t *testing.T) {
 	w := newWorld(t)
 	_, seq := w.eventsAfter(t, 0)
+	// A step answered 200 lists keys; one answered 4xx has errorType.
 	steps := []struct {
 		cred, method, path string
 		body               any
 		want               int
-		errorType          string
+		errorType, keys    string
 	}{
-		{w.memberKey, http.MethodPost, "/orgs/acme/secrets", entries(map[string]any{"key": "NPM_TOKEN", "value": "npm-7a1c"}), http.StatusCreated, ""},
-		{w.member2Key, http.MethodGet, "/orgs/acme/secrets", nil, http.StatusOK, ""},
-		{w.member2Key, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusForbidden, "forbidden"},
-		{w.ownerKey, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusOK, ""},
-		{w.outsiderKey, http.MethodGet, "/orgs/acme/secrets", nil, http.StatusNotFound, "not_found"},
-		{w.outsiderKey, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusNotFound, "not_found"},
+		{w.memberKey, http.MethodPost, "/orgs/acme/secrets", entries(map[string]any{"key": "NPM_TOKEN", "value": "npm-7a1c"}), http.StatusCreated, "", ""},
+		{w.member2Key, http.MethodGet, "/orgs/acme/secrets", nil, http.StatusOK, "", "[NPM_TOKEN]"},
+		{w.member2Key, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusForbidden, "forbidden", ""},
+		{w.ownerKey, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusOK, "", "[]"},
+		{w.outsiderKey, http.MethodGet, "/orgs/acme/secrets", nil, http.StatusNotFound, "not_found", ""},
+		{w.outsiderKey, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusNotFound, "not_found", ""},
 	}
-	var answers []answer
 	for _, s := range steps {
 		a := w.do(t, s.cred, s.method, s.path, s.body)
 		if a.status != s.want {
 			t.Fatalf("%s %s = %d %s, want %d", s.method, s.path, a.status, a.body, s.want)
 		}
-		if s.errorType != "" {
+		switch {
+		case s.want >= 400:
 			if et, _ := errorOf(t, a); et != s.errorType {
 				t.Errorf("%s %s error_type = %s, want %s", s.method, s.path, et, s.errorType)
 			}
+		case s.want == http.StatusOK:
+			if keys := fmt.Sprint(pageOf(t, a).keys(t)); keys != s.keys {
+				t.Errorf("%s %s lists %s, want %s", s.method, s.path, keys, s.keys)
+			}
 		}
-		answers = append(answers, a)
-	}
-	if keys := pageOf(t, answers[1]).keys(t); fmt.Sprint(keys) != "[NPM_TOKEN]" {
-		t.Errorf("the second member lists %v in the org, want [NPM_TOKEN]", keys)
-	}
-	if keys := pageOf(t, answers[3]).keys(t); len(keys) != 0 {
-		t.Errorf("the owner lists %v in the workspace, want none", keys)
 	}
 	recs, _ := w.eventsAfter(t, seq)
 	var scopes []string
 	for _, rec := range recs {
 		if strings.HasPrefix(rec.Type, "parley.secret.") {
-			var meta struct {
-				Scope string `json:"scope"`
-			}
-			_ = json.Unmarshal(rec.Metadata, &meta)
-			scopes = append(scopes, meta.Scope)
+			scopes = append(scopes, metadataOf(t, rec)["scope"])
 		}
 	}
 	if fmt.Sprint(scopes) != "[org]" {

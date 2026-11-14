@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,10 +123,23 @@ func TestLoadKeys_RefusesAMalformedKeyWithoutQuotingIt(t *testing.T) {
 func TestKey_PrintsNoKeyMaterial(t *testing.T) {
 	k := newKey(t)
 	keys := Keys{Current: k, Previous: k}
-	for _, s := range []string{fmt.Sprintf("%v %+v %s %x %q", keys, keys, k, k, k), fmt.Sprint(keys)} {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logged, nil))
+	logger.Info("x", "keys", keys, "key", k, "partial", Keys{Current: k})
+	marshalled, err := json.Marshal(struct {
+		Keys Keys
+		Key  Key
+	}{keys, k})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	for _, s := range []string{fmt.Sprintf("%v %+v %s %x %q", keys, keys, k, k, k), fmt.Sprint(keys), logged.String(), string(marshalled)} {
 		if strings.Contains(s, b64(k)) || strings.Contains(s, hex.EncodeToString(k)) || strings.Contains(s, string(k)) {
 			t.Errorf("printed keys %q carry the key", s)
 		}
+	}
+	if want := `"partial":{"Current":"[key]","Previous":null}`; !strings.Contains(logged.String(), want) {
+		t.Errorf("logged %s, want it to hold %s", logged.String(), want)
 	}
 }
 

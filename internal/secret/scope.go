@@ -100,7 +100,9 @@ func resolveUser(r *http.Request) (target, error) {
 // or its id, to the admin token for any org, a blocked one included, and to
 // a user who is a member of it while it is active. Every other caller, and
 // every caller for an org that does not exist, gets one 404 not_found, so
-// that nobody learns of an org they cannot use.
+// that nobody learns of an org they cannot use. A user's resolution does the
+// same two reads whatever its outcome, so that an org that does not exist
+// is not told from one the user cannot use by the time its answer takes.
 func (c *Component) resolveOrg(r *http.Request) (target, error) {
 	sc, ok := server.CallerOf(r.Context())
 	if !ok || !sc.Admin && sc.UserID == "" {
@@ -111,22 +113,21 @@ func (c *Component) resolveOrg(r *http.Request) (target, error) {
 	}
 	ctx, db := r.Context(), c.deps.Store.Main()
 	o, err := identity.OrgBySelector(ctx, db, server.Param(r, "slug"))
-	if errors.Is(err, identity.ErrNotFound) {
-		return target{}, server.NotFound(msgOrgNotFound)
-	}
-	if err != nil {
+	found := err == nil
+	if err != nil && !errors.Is(err, identity.ErrNotFound) {
 		return target{}, fmt.Errorf("resolve the org of a secret route: %w", err)
 	}
 	if !sc.Admin {
-		// The active orgs of the user: a blocked org's membership grants
-		// nothing.
+		// The active orgs of the user, read also for an org that does not
+		// exist: a blocked org's membership grants nothing.
 		orgs, err := identity.ActiveOrgIDs(ctx, db, sc.UserID)
 		if err != nil {
 			return target{}, fmt.Errorf("resolve the org of a secret route: %w", err)
 		}
-		if !slices.Contains(orgs, o.ID) {
-			return target{}, server.NotFound(msgOrgNotFound)
-		}
+		found = found && slices.Contains(orgs, o.ID)
+	}
+	if !found {
+		return target{}, server.NotFound(msgOrgNotFound)
 	}
 	return target{scope: ScopeOrg, id: o.ID}, nil
 }

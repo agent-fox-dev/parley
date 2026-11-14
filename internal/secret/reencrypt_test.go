@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"reflect"
@@ -74,12 +73,7 @@ func (s *storeTest) reencrypt(keys Keys, wrap func(rowStore) rowStore, converter
 	var buf bytes.Buffer
 	p := pass{err: c.reencrypt(s.ctx, slog.New(slog.NewJSONHandler(&buf, nil)), rows)}
 	p.log = buf.String()
-	for line := range strings.SplitSeq(strings.TrimSpace(p.log), "\n") {
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err == nil && rec["msg"] == "secret re-encryption" {
-			p.reports = append(p.reports, rec)
-		}
-	}
+	p.reports = LogLines(s.t, p.log, "secret re-encryption")
 	return p
 }
 
@@ -125,42 +119,6 @@ func (h *hookedRows) reseal(ctx context.Context, r sealedRow, s Sealed) (bool, e
 	return h.rowStore.reseal(ctx, r, s)
 }
 
-func TestReencrypt_ResealsThePreviousKeysValuesUnderTheCurrentKey(t *testing.T) {
-	a, b := newKey(t), newKey(t)
-	s := newStoreTest(t, Keys{Current: a})
-	values := map[[3]string]string{
-		{"user", "u1", "GIT_PAT"}: "p1", {"user", "u1", "Token"}: "p2",
-		{"org", "o1", "GIT_PAT"}: "p3", {"org", "o1", "DEPLOY"}: "p4",
-		{"workspace", "acme", "GIT_PAT"}: "p5",
-	}
-	for k, v := range values {
-		s.under(a, Scope(k[0]), k[1], k[2], v)
-	}
-	for k, v := range map[[3]string]string{{"workspace", "acme", "NEW1"}: "n1", {"workspace", "acme", "NEW2"}: "n2"} {
-		s.under(b, Scope(k[0]), k[1], k[2], v)
-		values[k] = v
-	}
-	s.now = s.now.Add(2 * time.Hour)
-
-	p := s.reencrypt(Keys{Current: b, Previous: a}, nil)
-	if p.err != nil {
-		t.Fatalf("reencrypt: %v", p.err)
-	}
-	p.wantReport(t, 5, 0)
-	for _, r := range s.rows() {
-		if r.KeyID != KeyID(b) {
-			t.Errorf("%s %s %s is under key %s, want the current key's", r.Scope, r.ScopeID, r.Key, r.KeyID)
-		}
-	}
-	onlyCurrent := s.component(Keys{Current: b})
-	for k, v := range values {
-		if got, _ := s.get(onlyCurrent, Scope(k[0]), k[1], k[2]); got != v {
-			t.Errorf("Get %v with only the current key = %q, want %q", k, got, v)
-		}
-	}
-	s.noSecretEvents()
-}
-
 func TestReencrypt_ResealsWhatThePreviousKeyOpensAndCountsTheRest(t *testing.T) {
 	a, b, c := newKey(t), newKey(t), newKey(t)
 	rotation := func(s *storeTest) {
@@ -181,6 +139,13 @@ func TestReencrypt_ResealsWhatThePreviousKeyOpensAndCountsTheRest(t *testing.T) 
 		wantErr              error
 	}{
 		{"values under the previous key", Keys{Current: b, Previous: a}, rotation, nil, 2, 2, 0, nil},
+		{"values across the three scopes", Keys{Current: b, Previous: a}, func(s *storeTest) {
+			for i, k := range []string{"user/u1/GIT_PAT", "user/u1/Token", "org/o1/GIT_PAT", "org/o1/DEPLOY", "workspace/acme/GIT_PAT", "workspace/acme/NEW1", "workspace/acme/NEW2"} {
+				scope, rest, _ := strings.Cut(k, "/")
+				id, name, _ := strings.Cut(rest, "/")
+				s.under([]Key{a, b}[i/5], Scope(scope), id, name, "sv-"+k)
+			}
+		}, nil, 5, 5, 0, nil},
 		{"more values than one batch", Keys{Current: b, Previous: a}, func(s *storeTest) {
 			s.c = s.component(Keys{Current: a})
 			s.fill(ScopeUser, "u1", 100)
@@ -213,6 +178,13 @@ func TestReencrypt_ResealsWhatThePreviousKeyOpensAndCountsTheRest(t *testing.T) 
 			s := newStoreTest(t, Keys{Current: b})
 			tc.seed(s)
 			before := s.rows()
+			// The values before the run, of the rows that open.
+			values := map[int64]string{}
+			for _, r := range before {
+				if v, _, err := s.component(Keys{Current: b, Previous: a}).Get(s.ctx, Scope(r.Scope), r.ScopeID, r.Key); err == nil {
+					values[r.ID] = v
+				}
+			}
 			s.now = s.now.Add(2 * time.Hour)
 			p := s.reencrypt(tc.keys, nil, tc.converters...)
 			if !errors.Is(p.err, tc.wantErr) || (tc.wantErr == nil) != (p.err == nil) {
@@ -230,6 +202,12 @@ func TestReencrypt_ResealsWhatThePreviousKeyOpensAndCountsTheRest(t *testing.T) 
 				default:
 					t.Errorf("row changed other than by a reseal under the current key: %+v, was %+v", r, was)
 				}
+				if r.KeyID != KeyID(b) {
+					continue
+				}
+				if v, _ := s.get(s.component(Keys{Current: b}), Scope(r.Scope), r.ScopeID, r.Key); v != values[r.ID] {
+					t.Errorf("%s with the current key alone = %q, want %q", r.Key, v, values[r.ID])
+				}
 			}
 			if resealed != tc.resealed {
 				t.Errorf("%d rows resealed, want %d", resealed, tc.resealed)
@@ -237,6 +215,7 @@ func TestReencrypt_ResealsWhatThePreviousKeyOpensAndCountsTheRest(t *testing.T) 
 			if strings.Contains(p.log, "sv-") {
 				t.Errorf("the log holds a value: %s", p.log)
 			}
+			s.noSecretEvents()
 		})
 	}
 }

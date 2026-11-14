@@ -1,14 +1,19 @@
 package secret_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/fs"
+	"maps"
 	"net/http"
-	"strings"
+	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -29,19 +34,6 @@ func newKey(t *testing.T) (raw []byte, encoded string) {
 		t.Fatal(err)
 	}
 	return raw, base64.StdEncoding.EncodeToString(raw)
-}
-
-// logLines decodes every line of a hub's log whose msg is msg.
-func logLines(t *testing.T, log, msg string) []map[string]any {
-	t.Helper()
-	var out []map[string]any
-	for line := range strings.SplitSeq(log, "\n") {
-		var rec map[string]any
-		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == msg {
-			out = append(out, rec)
-		}
-	}
-	return out
 }
 
 // route is one secret route as the route tests call it: its scope, its
@@ -85,15 +77,13 @@ var changed = map[string]any{"value": "changed"}
 // entries is a create body of the entries given.
 func entries(e ...any) map[string]any { return map[string]any{"entries": e} }
 
-// routesOf are the routes of scope.
-func routesOf(scope secret.Scope) []route {
-	var out []route
-	for _, r := range routes {
-		if r.scope == scope {
-			out = append(out, r)
-		}
+// keyed is a create body of entries with the keys given and no value.
+func keyed(keys ...string) map[string]any {
+	e := make([]any, len(keys))
+	for i, k := range keys {
+		e[i] = map[string]any{"key": k}
 	}
-	return out
+	return entries(e...)
 }
 
 // at is the route's path for the org or workspace name.
@@ -271,18 +261,22 @@ type page struct {
 	NextCursor *string                      `json:"next_cursor"`
 }
 
-// pageOf decodes the list answer a, which must be 200.
-func pageOf(t *testing.T, a answer) page { t.Helper(); return itemsOf(t, a, http.StatusOK) }
-
-// itemsOf decodes the answer a, which must have the status want, as a page.
-func itemsOf(t *testing.T, a answer, want int) page {
+// pageOf decodes the answer a, which must be 200 or have the status
+// given, as a page, and checks that each of its items has exactly the
+// members key, created_at and updated_at: never a value.
+func pageOf(t *testing.T, a answer, status ...int) page {
 	t.Helper()
 	var p page
-	if a.status != want {
+	if want := append(status, http.StatusOK)[0]; a.status != want {
 		t.Fatalf("answer = %d %s, want %d", a.status, a.body, want)
 	}
 	if err := json.Unmarshal(a.body, &p); err != nil {
 		t.Fatalf("decode the page %s: %v", a.body, err)
+	}
+	for _, it := range p.Items {
+		if members := slices.Sorted(maps.Keys(it)); !slices.Equal(members, []string{"created_at", "key", "updated_at"}) {
+			t.Errorf("item members = %v, want exactly key, created_at, updated_at", members)
+		}
 	}
 	return p
 }
@@ -299,6 +293,85 @@ func (p page) keys(t *testing.T) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// numbered are the n keys prefix0, prefix1 and so on.
+func numbered(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("%s%d", prefix, i)
+	}
+	return out
+}
+
+// metadataOf decodes the metadata of the event ev.
+func metadataOf(t *testing.T, ev event.Record) map[string]string {
+	t.Helper()
+	var meta map[string]string
+	if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+		t.Fatalf("decode the metadata %s of event %d: %v", ev.Metadata, ev.Seq, err)
+	}
+	return meta
+}
+
+// passEnd adds to c a maintenance task that marks the end of each pass on
+// ended, a channel with room for one mark. Tasks added after the hub's own
+// run last in a pass.
+func passEnd(c *hub.Composition, ended chan struct{}) {
+	c.AddMaintenanceTask("test-pass-end", func(context.Context, *hub.Runtime) error {
+		select {
+		case ended <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+}
+
+// waitPass waits up to 5 s for the mark of a pass's end.
+func waitPass(t *testing.T, ended chan struct{}) {
+	t.Helper()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the maintenance pass did not end within 5 s")
+	}
+}
+
+// stopAndRead stops the hub and returns what it kept and wrote: every file
+// of its data directory, the database and its -wal and -shm files among
+// them, and its log, by where it was.
+func stopAndRead(t *testing.T, h *hubtest.Hub) map[string][]byte {
+	t.Helper()
+	dir, _ := h.Listening["data_dir"].(string)
+	h.Stop()
+	if code := h.ExitCode(t, 10*time.Second); code != 0 {
+		t.Fatalf("the hub stopped with %d, want 0; log = %s", code, h.Log.String())
+	}
+	sources := map[string][]byte{"the log": []byte(h.Log.String())}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		sources[path], err = os.ReadFile(path)
+		return err
+	})
+	if err != nil || len(sources) == 1 {
+		t.Fatalf("read the data directory %s: %d files, %v", dir, len(sources)-1, err)
+	}
+	return sources
+}
+
+// noneHolds fails the test for each source that holds one of the needles,
+// each named by what it is.
+func noneHolds(t *testing.T, sources, needles map[string][]byte) {
+	t.Helper()
+	for where, content := range sources {
+		for what, needle := range needles {
+			if bytes.Contains(content, needle) {
+				t.Errorf("%s holds %s", where, what)
+			}
+		}
+	}
 }
 
 func ptr(s string) *string { return &s }

@@ -2,9 +2,7 @@ package secret
 
 import (
 	"bytes"
-	"encoding/json"
 	"log/slog"
-	"strings"
 	"testing"
 )
 
@@ -38,34 +36,20 @@ func TestStartReport_CountsTheValuesNoConfiguredKeyOpens(t *testing.T) {
 			}
 			var log bytes.Buffer
 			report.Log(slog.New(slog.NewJSONHandler(&log, nil)))
-			var reports, warnings int
-			for line := range strings.SplitSeq(strings.TrimSpace(log.String()), "\n") {
-				var rec map[string]any
-				if err := json.Unmarshal([]byte(line), &rec); err != nil {
-					t.Fatalf("log line %q: %v", line, err)
-				}
-				switch rec["msg"] {
-				case "secret encryption":
-					reports++
-					want := map[string]any{"level": "INFO", "key_configured": tc.keys.Current != nil,
-						"previous_key_present": tc.keys.Previous != nil, "undecryptable_secrets": tc.wantUndecryptable}
-					for k, v := range want {
-						if rec[k] != v {
-							t.Errorf("%s = %v, want %v in %s", k, rec[k], v, line)
-						}
-					}
-				case "secrets cannot be stored: no encryption key configured":
-					warnings++
-					if rec["level"] != "WARN" {
-						t.Errorf("warning at level %v, want WARN", rec["level"])
-					}
+			reports := LogLines(t, log.String(), "secret encryption")
+			if len(reports) != 1 {
+				t.Fatalf("%d report lines, want 1; log = %s", len(reports), log.String())
+			}
+			want := map[string]any{"level": "INFO", "key_configured": tc.keys.Current != nil,
+				"previous_key_present": tc.keys.Previous != nil, "undecryptable_secrets": tc.wantUndecryptable}
+			for k, v := range want {
+				if reports[0][k] != v {
+					t.Errorf("%s = %v, want %v; log = %s", k, reports[0][k], v, log.String())
 				}
 			}
-			if reports != 1 {
-				t.Errorf("%d report lines, want 1; log = %s", reports, log.String())
-			}
-			if want := map[bool]int{true: 1}[tc.wantWarning]; warnings != want {
-				t.Errorf("%d warning lines, want %d; log = %s", warnings, want, log.String())
+			warnings := LogLines(t, log.String(), "secrets cannot be stored: no encryption key configured")
+			if want := map[bool]int{true: 1}[tc.wantWarning]; len(warnings) != want || want == 1 && warnings[0]["level"] != "WARN" {
+				t.Errorf("warning lines %v, want %d at WARN; log = %s", warnings, want, log.String())
 			}
 		})
 	}

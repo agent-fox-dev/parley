@@ -38,8 +38,9 @@ const keySize = 32
 // encoding of one; it never quotes what was configured.
 var errMalformed = errors.New("must be standard padded base64 of exactly 32 bytes")
 
-// Key is an AES-256 key. It prints and logs as "[key]" whatever the verb, so
-// a key that reaches a log line or an error by mistake discloses nothing.
+// Key is an AES-256 key. It prints, logs and encodes as JSON as "[key]"
+// whatever the verb or the handler, so a key that reaches a log line, an
+// error or a JSON document by mistake discloses nothing.
 type Key []byte
 
 // Format prints "[key]" for every verb.
@@ -47,6 +48,17 @@ func (Key) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte("[key]")) }
 
 // LogValue logs "[key]" in place of the key.
 func (Key) LogValue() slog.Value { return slog.StringValue("[key]") }
+
+// MarshalJSON encodes the key as the string "[key]" and an absent key as
+// null, so that slog's JSON handler, which encodes a struct holding a key
+// such as Keys with encoding/json, discloses whether a key is configured and
+// nothing of it.
+func (k Key) MarshalJSON() ([]byte, error) {
+	if k == nil {
+		return []byte("null"), nil
+	}
+	return []byte(`"[key]"`), nil
+}
 
 // Keys are the operator's keys. A nil key is absent: without a current key
 // the hub runs and refuses only to store, and a previous key without a

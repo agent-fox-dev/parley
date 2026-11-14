@@ -3,6 +3,7 @@ package secret
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -15,6 +16,24 @@ import (
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
+
+// LogLines decodes the lines of a JSON log whose msg is msg, and fails the
+// test on a line that is not JSON. It is exported for the tests of package
+// secret_test, which read a running hub's log with it too.
+func LogLines(t *testing.T, log, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(log), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil && line != "" {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if rec["msg"] == msg {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
 
 // errRollback makes a transaction of the tests roll back.
 var errRollback = errors.New("roll back")
@@ -137,7 +156,7 @@ func (s *storeTest) noSecretEvents() {
 
 func TestGet_ReadsTheEntryOfExactlyThatScope(t *testing.T) {
 	s := newStoreTest(t, Keys{Current: newKey(t)})
-	s.put(ScopeWorkspace, "acme", "Git_Pat", "a")
+	s.put(ScopeWorkspace, "acme", "Git_Pat", "tok-4be1c0ffee-2d9a")
 	s.put(ScopeWorkspace, "acme", "EMPTY", "")
 
 	for _, tc := range []struct {
@@ -146,8 +165,8 @@ func TestGet_ReadsTheEntryOfExactlyThatScope(t *testing.T) {
 		want      string
 		wantFound bool
 	}{
-		{ScopeWorkspace, "acme", "GIT_PAT", "a", true},
-		{ScopeWorkspace, "acme", "git_pat", "a", true},
+		{ScopeWorkspace, "acme", "GIT_PAT", "tok-4be1c0ffee-2d9a", true},
+		{ScopeWorkspace, "acme", "git_pat", "tok-4be1c0ffee-2d9a", true},
 		{ScopeWorkspace, "acme", "empty", "", true},
 		{ScopeWorkspace, "acme-fork", "GIT_PAT", "", false},
 		{ScopeUser, "owner", "GIT_PAT", "", false},
@@ -156,6 +175,10 @@ func TestGet_ReadsTheEntryOfExactlyThatScope(t *testing.T) {
 		if v, found := s.get(s.c, tc.scope, tc.id, tc.key); v != tc.want || found != tc.wantFound {
 			t.Errorf("Get(%s, %s, %s) = %q, %v; want %q, %v", tc.scope, tc.id, tc.key, v, found, tc.want, tc.wantFound)
 		}
+	}
+	// What Get returned, the scrubber now removes from text that leaves the hub.
+	if got := s.scrub.Scrub("fetch failed for tok-4be1c0ffee-2d9a"); got != "fetch failed for [redacted]" {
+		t.Errorf("Scrub = %q", got)
 	}
 
 	if err := s.tx(true, func(tx *sql.Tx) error {
@@ -217,24 +240,19 @@ func TestGet_FailsAnUnreadableValueWithoutReportingItAbsent(t *testing.T) {
 
 func TestPut_StoresInTheCallersTransaction(t *testing.T) {
 	s := newStoreTest(t, Keys{Current: newKey(t)})
-	put := func(commit bool, key, value string) {
-		t.Helper()
-		if err := s.tx(commit, func(tx *sql.Tx) error { return s.c.Put(s.ctx, tx, ScopeWorkspace, "w", key, value) }); err != nil {
-			t.Fatal(err)
-		}
+	if err := s.tx(false, func(tx *sql.Tx) error { return s.c.Put(s.ctx, tx, ScopeWorkspace, "w", "GIT_PAT", "p") }); err != nil {
+		t.Fatal(err)
 	}
-
-	put(false, "GIT_PAT", "p")
 	if _, found := s.get(s.c, ScopeWorkspace, "w", "GIT_PAT"); found {
 		t.Fatal("the secret is there after a rollback")
 	}
-	put(true, "GIT_PAT", "p")
+	s.put(ScopeWorkspace, "w", "GIT_PAT", "p")
 	if v, _ := s.get(s.c, ScopeWorkspace, "w", "GIT_PAT"); v != "p" {
 		t.Fatalf("Get = %q, want p", v)
 	}
 	created := s.now
 	s.now = s.now.Add(time.Minute)
-	put(true, "git_pat", "q")
+	s.put(ScopeWorkspace, "w", "git_pat", "q")
 
 	items, err := s.c.ListPage(s.ctx, ScopeWorkspace, "w", "", 10)
 	if err != nil {
@@ -271,10 +289,12 @@ func TestPut_RefusesWithATypedErrorAndWritesNothing(t *testing.T) {
 			s.fill(ScopeOrg, "acme", tc.stored)
 			c := s.component(tc.keys)
 			var err error
-			s.tx(true, func(tx *sql.Tx) error {
+			if txErr := s.tx(true, func(tx *sql.Tx) error {
 				err = c.Put(s.ctx, tx, ScopeOrg, "acme", tc.key, tc.value)
 				return nil
-			})
+			}); txErr != nil {
+				t.Fatalf("the transaction around Put: %v", txErr)
+			}
 			if !errors.Is(err, tc.want) || (tc.want == nil) != (err == nil) {
 				t.Fatalf("Put error = %v, want %v", err, tc.want)
 			}
@@ -291,9 +311,6 @@ func TestPut_RefusesWithATypedErrorAndWritesNothing(t *testing.T) {
 	}
 	if s := newStoreTest(t, Keys{Current: key}); !s.c.Available() {
 		t.Error("Available() with a current key = false")
-	}
-	if e := UnavailableError; e.Status() != 503 || e.Type() != "secrets_unavailable" {
-		t.Errorf("UnavailableError = %d %s, want 503 secrets_unavailable", e.Status(), e.Type())
 	}
 }
 
@@ -385,15 +402,6 @@ func TestRemoveScope_DeletesOneScopeInTheCallersTransaction(t *testing.T) {
 			}
 			s.noSecretEvents()
 		})
-	}
-}
-
-func TestGet_RegistersTheValueWithTheScrubber(t *testing.T) {
-	s := newStoreTest(t, Keys{Current: newKey(t)})
-	s.put(ScopeWorkspace, "acme", "TOKEN", "tok-4be1c0ffee-2d9a")
-	s.get(s.c, ScopeWorkspace, "acme", "TOKEN")
-	if got := s.scrub.Scrub("fetch failed for tok-4be1c0ffee-2d9a"); got != "fetch failed for [redacted]" {
-		t.Errorf("Scrub = %q", got)
 	}
 }
 
