@@ -330,7 +330,7 @@ func (s *Service) organization(ctx context.Context, u *identity.User, selector *
 	var org identity.Org
 	var err error
 	if selector == nil {
-		org, err = identity.PersonalOrg(ctx, db, u.ID, u.Username)
+		org, err = identity.PersonalOrg(ctx, db, u.ID)
 	} else {
 		org, err = identity.OrgBySelector(ctx, db, *selector)
 	}

@@ -23,6 +23,7 @@ func composeIdentity(c *Composition) {
 	svc := &identity.Service{}
 	c.identity = svc
 	c.AddSchemaStep(identity.SchemaStep)
+	c.AddSchemaStep(identity.PersonalOrgStep)
 	c.AddStartHook("identity", func(_ context.Context, rt *Runtime) error {
 		svc.Bind(identity.Deps{
 			Store:       rt.Store,

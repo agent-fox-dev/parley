@@ -489,6 +489,33 @@ func TestCreate_RecordsTheWorkspaceInTheOrgItNames(t *testing.T) {
 	}
 }
 
+func TestCreate_UsesThePersonalOrgAfterTheUsernameOrTheOrgNameChanges(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	// A later login gives U another username; the personal org keeps its name.
+	if _, err := w.Store.Main().ExecContext(context.Background(),
+		`UPDATE users SET username = 'ursula-renamed' WHERE id = ?`, w.u); err != nil {
+		t.Fatal(err)
+	}
+	// An admin renames V's personal org.
+	if status, b := w.Call(t, http.MethodPatch, "/api/v1/orgs/"+w.vOrg.ID, w.Token,
+		map[string]any{"name": "victors-team"}); status != http.StatusOK {
+		t.Fatalf("rename the org = %d %s, want 200", status, b)
+	}
+	for _, c := range []struct {
+		name, key, slug string
+		org             identity.Org
+	}{
+		{"after the username changes", w.uKey, "after-username", w.uOrg},
+		{"after the org is renamed", w.vKey, "after-org-name", w.vOrg},
+	} {
+		obj := w.create(t, c.key, valid(c.slug)).object(t)
+		if obj["org_id"] != c.org.ID || obj["org_slug"] != c.org.Slug {
+			t.Errorf("%s: org %v (%v), want %s (%s)", c.name, obj["org_id"], obj["org_slug"], c.org.ID, c.org.Slug)
+		}
+	}
+}
+
 func TestCreate_RollsBackEveryWriteWhenOneFails(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)

@@ -703,8 +703,11 @@ without running a start hook or binding the listener.
 ### Identity
 
 `internal/hub/identity.go` adds the part `composeIdentity`, after
-`composeBootstrap` in `parts`. It adds the schema step
-`identity.SchemaStep` (`identity_records`), installs the `Authenticate`
+`composeBootstrap` in `parts`. It adds the schema steps
+`identity.SchemaStep` (`identity_records`) and, after it,
+`identity.PersonalOrgStep` (`identity_personal_orgs`), which adds the flag
+`personal` to `orgs` and, in a store that has records already, marks the org
+each user owns under their username, installs the `Authenticate`
 method of an `identity.Service` as the pipeline's authenticator, installs
 `identity.ScopeCheck` with `SetScopeCheck`, adds the service's
 `AdminCheck` method with `AddAccessCheck`, registers every route of `(*identity.Service).Routes()` with `AddRoute`, and adds the
@@ -858,7 +861,8 @@ rolls the whole transaction back.
 `identity.CreateUserAndPersonalOrg(ctx, tx, identity.NewUser{Username,
 Email, FullName, Provider, ProviderID, CreatedAt}, role)` is the one way a
 user is created: it writes the active user, the user's personal org (an
-`identity.Org`, active, named after the username, owned by the user) and
+`identity.Org`, active, named after the username, owned by the user and
+marked `personal`) and
 the membership in the transaction it is given, and returns the user and
 the org. The org's slug comes from the pure function `slug(username,
 userID)` in `internal/identity/slug.go`, or the first of `<slug>-1` to
@@ -1117,9 +1121,10 @@ the REST API's Org object (`id`, `name`, `slug`, `url`, `owner_id`, `null`
 when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
 `identity.OrgByID(ctx, q, id)` and `identity.OrgBySlug(ctx, q, slug)`
 return an org or `identity.ErrNotFound`, comparing the slug exactly;
-`identity.PersonalOrg(ctx, q, userID, username)` returns the user's
-personal org, the one owned by the user and named after the username as
-`CreateUserAndPersonalOrg` makes it, or `identity.ErrNotFound`; and
+`identity.PersonalOrg(ctx, q, userID)` returns the user's personal org, the
+one owned by the user and marked `personal` by `CreateUserAndPersonalOrg`,
+whatever the username and the org's name are now, or `identity.ErrNotFound`;
+and
 `identity.Memberships(ctx, q, orgID)` returns an org's
 `identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
 by user id; `identity.ActiveOrgIDs(ctx, q, userID)` returns, by id, the
