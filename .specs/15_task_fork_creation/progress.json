@@ -3,7 +3,7 @@
   "spec_id": "15",
   "spec_name": "task_fork_creation",
   "schema_version": 3,
-  "updated_at": "2026-11-14T16:56:42Z",
+  "updated_at": "2026-11-14T17:02:41Z",
   "tasks": [
     {
       "id": 1,
@@ -39,7 +39,7 @@
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,

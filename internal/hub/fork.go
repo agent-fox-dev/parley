@@ -17,7 +17,9 @@ const forksHook = "forks"
 // that refuses every update of a fork whose parent is not ready (ttl is the
 // fork lifetime's to register). Its start hook
 // binds the component to the stores, the workspace service, which knows
-// where the parents' and the forks' repositories are, and the hub's git.
+// where the parents' and the forks' repositories are, the hub's git, and the
+// access rule, which mints a fork's token and confines the fork list to what
+// the caller can read.
 // The component exists from the composition on, so a later part keeps it
 // through Composition.Forks, and registers there, while it is composed, the
 // collaborators the create asks: the session feature its session-linking
@@ -40,7 +42,7 @@ func composeForks(c *Composition) {
 	c.AddStartHook(forksHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := fork.Deps{Store: rt.Store, Workspaces: c.workspaces, Git: git, Events: c.Events(), Access: c.access,
-			Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx}
+			Readable: c.access, Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx}
 		for _, adjust := range c.forkAdjusters {
 			adjust(&d)
 		}

@@ -37,7 +37,7 @@ func TestStore_InsertReadCountAndList(t *testing.T) {
 	if n, err := fork.CountOf(ctx, w.Store.Main(), parentSlug); n != 3 || err != nil {
 		t.Errorf("CountOf = %d, %v; want 3", n, err)
 	}
-	list, err := fork.ListOf(ctx, w.Store.Main(), parentSlug)
+	list, err := fork.ListOf(ctx, w.Store.Main(), parentSlug, fork.ListFilter{})
 	var slugs []string
 	for _, f := range list {
 		slugs = append(slugs, f.Slug)

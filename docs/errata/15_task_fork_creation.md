@@ -142,3 +142,12 @@ has is `404 not_found` (`workspace not found`), and an archived parent on
 which a maintenance operation runs (its delete) is `409 workspace_busy` for
 both uses, since the marker is read first, as `workspace.RequireReady`
 does.
+
+## The fork list's filters
+
+Where the package is silent: `owner` and `session_id` given more than once
+are refused with `400 invalid_request` (`owner must be given once, as me`),
+as `GET /workspaces` refuses a repeated `include_forks`, rather than one of
+the values chosen; a `session_id` is matched in any case, since a session id
+is stored in lower case; and the admin token's items carry `access`
+`admin`, its level on every workspace.

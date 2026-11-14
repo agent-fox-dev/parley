@@ -27,6 +27,13 @@ type Minter interface {
 	MintBound(ctx context.Context, tx *sql.Tx, in access.MintInput) (identity.PAT, string, error)
 }
 
+// ReadableSets builds the set of workspaces a caller can read, with the
+// caller's level on each, cut to the binding's covered set for a bound
+// token. *access.Service satisfies it.
+type ReadableSets interface {
+	Readable(ctx context.Context, c access.Caller) (access.ReadableSet, error)
+}
+
 // Deps are what the fork component works with. The hub builds them in its
 // start hook; a test changes them through the hub's composition before they
 // are bound.
@@ -43,6 +50,9 @@ type Deps struct {
 	Events Events
 	// Access mints the token a create asks for, bound to the fork.
 	Access Minter
+	// Readable confines the fork list to the forks the caller can read and
+	// gives the caller's level on each.
+	Readable ReadableSets
 	// Limits are [forks]: the lifetime of a new fork and how many forks a
 	// workspace may have.
 	Limits config.Forks

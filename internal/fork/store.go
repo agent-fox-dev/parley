@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -101,11 +102,60 @@ func CountOf(ctx context.Context, q access.Querier, parent string) (int, error) 
 	return n, nil
 }
 
-// ListOf reads the forks of the workspace parent through q, newest first,
-// those created at the same instant by slug.
-func ListOf(ctx context.Context, q access.Querier, parent string) ([]Fork, error) {
-	rows, err := q.QueryContext(ctx, `SELECT slug FROM workspaces WHERE kind = ? AND parent_slug = ? ORDER BY created_at DESC, slug`,
-		access.KindFork, parent)
+// Position is a fork's place in the order of a parent's forks, newest
+// first, those created at the same instant by slug: its created_at in
+// UnixNano, then its slug. A page of the fork list carries the last one it
+// holds in its cursor.
+type Position struct {
+	CreatedAt int64  `json:"created_at"`
+	Slug      string `json:"slug"`
+}
+
+// ListFilter selects among the forks of a parent. Its zero value selects
+// them all.
+type ListFilter struct {
+	// Slugs, when not nil, keeps only the forks whose slug it holds.
+	Slugs []string
+	// OwnerID, when not nil, keeps only the forks of that user.
+	OwnerID *string
+	// SessionID, when not nil, keeps only the forks created in that
+	// session, compared in lower case.
+	SessionID *string
+	// After, when not nil, keeps only the forks after that position.
+	After *Position
+	// Limit is the most forks read; 0 reads them all.
+	Limit int
+}
+
+// ListOf reads the forks of the workspace parent that f selects through q,
+// newest first, those created at the same instant by slug. The selection,
+// the order and the position are all in the query, so that a page reads
+// only its own rows.
+func ListOf(ctx context.Context, q access.Querier, parent string, f ListFilter) ([]Fork, error) {
+	query := `SELECT slug FROM workspaces WHERE kind = ? AND parent_slug = ?`
+	args := []any{access.KindFork, parent}
+	if f.Slugs != nil {
+		b, err := json.Marshal(f.Slugs)
+		if err != nil {
+			return nil, fmt.Errorf("list the forks of %q: %w", parent, err)
+		}
+		query, args = query+` AND slug IN (SELECT value FROM json_each(?))`, append(args, string(b))
+	}
+	if f.OwnerID != nil {
+		query, args = query+` AND owner_id = ?`, append(args, *f.OwnerID)
+	}
+	if f.SessionID != nil {
+		query, args = query+` AND lower(session_id) = ?`, append(args, strings.ToLower(*f.SessionID))
+	}
+	if f.After != nil {
+		query += ` AND (created_at < ? OR (created_at = ? AND slug > ?))`
+		args = append(args, f.After.CreatedAt, f.After.CreatedAt, f.After.Slug)
+	}
+	query += ` ORDER BY created_at DESC, slug`
+	if f.Limit > 0 {
+		query, args = query+` LIMIT ?`, append(args, f.Limit)
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list the forks of %q: %w", parent, err)
 	}

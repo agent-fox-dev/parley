@@ -48,7 +48,7 @@ const purposeMax = 1024
 
 // Routes returns the fork routes of the REST API.
 func (c *Component) Routes() []server.Route {
-	return []server.Route{c.createRoute()}
+	return []server.Route{c.createRoute(), c.listRoute()}
 }
 
 // createRoute is POST /workspaces/:slug/forks. Reading the parent is enough

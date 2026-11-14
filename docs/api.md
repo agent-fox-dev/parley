@@ -2051,6 +2051,43 @@ minted, its `token_id`, never its value. The parent's readers see it (see
 {"seq":31,"id":"…","type":"parley.workspace.fork","time":"2026-11-14T10:30:15Z","workspace":"demo--task1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo--task1","action":"fork","session_id":null,"metadata":{"auto_change":true,"expires_at":"2026-11-15T10:30:15Z","fork_point":{"ref":"release","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8"},"parent_slug":"demo","purpose":"fix loader"}}
 ```
 
+## `GET /api/v1/workspaces/{slug}/forks`
+
+Lists the task forks of the workspace `{slug}` to a caller who can read it,
+in every status of the workspace. It takes the admin token, an API key or a
+PAT, and declares the scope `workspaces:read` for a PAT, which a PAT holding
+`workspaces:write` also satisfies. It needs read access to the workspace
+(see [Workspace access](#workspace-access)).
+
+The list holds the forks of `{slug}` the caller can read, each as its
+workspace object with the caller's `access` on it: `owner` for the fork's
+owner and the parent's owner, `member` for the other members of the org,
+`admin` for the admin token. For a PAT bound to a workspace it holds only
+the forks its binding covers (see
+[Workspace-bound tokens](#workspace-bound-tokens)): a PAT bound to the
+parent lists the forks it created, a PAT bound to a fork lists nothing. A
+task fork, and a workspace without forks, list nothing
+(`{"items":[],"next_cursor":null}`).
+
+It is a list (see [Lists](#lists)), with `limit` and `cursor` and these
+query parameters; with both, a fork is listed when it satisfies both:
+
+| Parameter | Meaning |
+|---|---|
+| `owner` | `me` keeps the forks whose owner is the caller's user; the admin token, which acts for no user, lists nothing |
+| `session_id` | a UUID, in any case: keeps the forks created in that session |
+
+The order is `created_at` descending, then `slug` ascending among the forks
+created in the same instant; the cursor carries both, so a walk over the
+pages returns each listed fork once.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page, `items` an array of workspace objects (`[]` when nothing matches) |
+| `400` `invalid_request` | `owner` other than exactly `me`, `session_id` that is not a UUID, an empty value included, or either given more than once (`owner must be given once, as me`, `session_id must be given once, as a UUID`); a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to
