@@ -16,8 +16,8 @@ command-line client. Both are written in Go, in the module
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
-| `internal/gitrepo` | the hub's one way to run git, the `git` command as a subprocess with no git library; it imports nothing of the project. `Git` (its zero value runs git from `PATH`; `Env` adds variables such as `GIT_SSL_CAINFO` to every git process, `Trace` sees the arguments of every invocation) runs each git process with a fixed minimal environment (`PATH`, `HOME` set to an empty private directory made, mode 0700, for that one process and removed when it returns, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so that the `ssh` of a `git@` origin fails rather than prompts, unless `Env` sets its own, `LC_ALL=C`), outside any repository, keeps git's standard error in the error it returns and, when the context ends, kills git with every process it started (its own process group) and waits for them. `ListRemote(ctx, url, cred)` returns origin's branches, tags and default branch as a `Remote`; `Clone(ctx, url, cred, dir)` makes a bare copy with every branch and tag and full history; both run with `-c credential.helper=`. A `Credential` (user name and password; the zero value is none) reaches git only through the environment of that one process: `GIT_ASKPASS` names a script, written into that private directory, that prints `PARLEY_GIT_USERNAME` or `PARLEY_GIT_PASSWORD`, so the credential is in no URL, no argument and no configuration file of the copy. `Open(ctx, dir)` opens a copy as a `Repo` (an error for a file, an empty directory or nothing), whose methods never contact origin: `DefaultBranch` and `SetDefaultBranch`, `ResolveBranch`, `Branches`, `OriginURL`, `Config` and `SetConfig` (the copy's own configuration), and the origin heads, kept as the refs `refs/remotes/origin/<name>`: `OriginHeads`, `OriginHead`, `SetOriginHead` and `DeleteOriginHead`; `Remove(dir)` removes a copy |
-| `internal/gitrepo/gitrepotest` | test support, imported by test code only, and the repository's one test origin: `NewOrigin(t, opts...)` makes an empty bare repository whose default branch is `main` and serves it over TLS with `net/http/httptest` and git's file-based HTTP transport (`git update-server-info` after every change), or with git's smart transport through `git http-backend` under `WithSmartHTTP()` (git cannot read a repository without refs over the file-based one, so an empty origin needs it); `WithBasicAuth(user, password)` makes it answer `401` without them; `Commit(branch, msg)`, `Branch(name, ref)`, `Tag(name, ref)` and `SetDefaultBranch(branch)` change it, `History()` builds the tests' usual history on it (`main` with three commits, `dev` branching off its second with one more, the tag `v1` on its first), `Head(branch)` reads it; `URL()` is its https URL and `Env()` (`GIT_SSL_CAINFO=<CAFile()>`) makes git trust it; `Requests()` counts the requests it received, `Block()` holds every later request until `Release()`, `Refuse(status)` answers every request with a status, and `Close()` shuts it down; `Git(t, dir, args...)` runs git on a repository directory, such as a copy the code under test made, away from the user's git configuration, and returns its trimmed output |
+| `internal/gitrepo` | the hub's one way to run git, the `git` command as a subprocess with no git library; it imports nothing of the project. `Git` (its zero value runs git from `PATH`; `Env` adds variables such as `GIT_SSL_CAINFO` to every git process, `Trace` sees the arguments of every invocation) runs each git process with a fixed minimal environment (`PATH`, `HOME` set to an empty private directory made, mode 0700, for that one process and removed when it returns, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so that the `ssh` of a `git@` origin fails rather than prompts, unless `Env` sets its own, `LC_ALL=C`), outside any repository, keeps git's standard error in the error it returns and, when the context ends, kills git with every process it started (its own process group) and waits for them. `ListRemote(ctx, url, cred)` returns origin's branches, tags and default branch as a `Remote`; `Clone(ctx, url, cred, dir)` makes a bare copy with every branch and tag and full history; both, like `FetchOrigin` below, run with `-c credential.helper=`. A `Credential` (user name and password; the zero value is none) reaches git only through the environment of that one process: `GIT_ASKPASS` names a script, written into that private directory, that prints `PARLEY_GIT_USERNAME` or `PARLEY_GIT_PASSWORD`, so the credential is in no URL, no argument and no configuration file of the copy. `FetchOrigin(ctx, dir, url, cred, deadline)` fetches every branch and tag of origin into the copy at `dir` in one `git fetch --atomic --force --no-tags` into a namespace of that one fetch, `refs/parley/fetch/<random>/`, which is read and removed right after the fetch, also after a failure, so that the tags' objects are in the copy and no extra ref outlives the fetch; only once the fetch has succeeded and the namespace is gone are the origin heads `refs/remotes/origin/<name>` set to origin's branches exactly (created, moved, removed for a branch origin no longer has) in one `update-ref --stdin` transaction, or, when git refuses it because a new name is a directory of a removed one (`dev` replaced by `dev/next`), with the removals first; a fetch that fails, or whose namespace cannot be removed, changes no origin head; no branch or tag of the copy is written; it returns origin's branch heads and tags as `Fetched`, and after `deadline` kills git with every process it started and returns an error matching `ErrDeadline`. `Open(ctx, dir)` opens a copy as a `Repo` (an error for a file, an empty directory or nothing), whose methods never contact origin: `DefaultBranch` and `SetDefaultBranch`, `ResolveBranch`, `Branches`, `Tags`, `OriginURL`, `Config` and `SetConfig` (the copy's own configuration), the origin heads, kept as the refs `refs/remotes/origin/<name>`: `OriginHeads`, `OriginHead`, `SetOriginHead` and `DeleteOriginHead`, `CompareAndSwapRef(ctx, ref, new, expectedOld)`, which moves a ref only from `expectedOld` (`""`: creates it only while it does not exist) and otherwise, or when another writer holds the ref's lock, changes nothing and returns an error matching `ErrRefMoved`, and `IsAncestor`; `Remove(dir)` removes a copy |
+| `internal/gitrepo/gitrepotest` | test support, imported by test code only, and the repository's one test origin: `NewOrigin(t, opts...)` makes an empty bare repository whose default branch is `main` and serves it over TLS with `net/http/httptest` and git's file-based HTTP transport (`git update-server-info` after every change), or with git's smart transport through `git http-backend` under `WithSmartHTTP()` (git cannot read a repository without refs over the file-based one, so an empty origin needs it); `WithBasicAuth(user, password)` makes it answer `401` without them; `Commit(branch, msg)`, `Branch(name, ref)`, `Tag(name, ref)` and `SetDefaultBranch(branch)` change it, `History()` builds the tests' usual history on it (`main` with three commits, `dev` branching off its second with one more, the tag `v1` on its first), `Head(branch)` reads it; `URL()` is its https URL and `Env()` (`GIT_SSL_CAINFO=<CAFile()>`) makes git trust it; `Requests()` counts the requests it received, `Block()` holds every later request until `Release()`, `Refuse(status)` answers every request with a status, and `Close()` shuts it down; `Git(t, dir, args...)` runs git on a repository directory, such as a copy the code under test made, away from the user's git configuration, and returns its trimmed output, and `Refs(t, dir, prefix)` maps the refs below `prefix` of such a directory, by their names without it (`""`: every ref, by its full name), to their object ids |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug` and `PATCH /api/v1/workspaces/:slug` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug` and `POST /api/v1/workspaces/:slug/sync` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1722,10 +1722,13 @@ gives it. The part's one `gitrepo.Git` passes on to git the variables
 `NO_PROXY` of the hub's environment, read when the hub is composed, and no
 other but `PATH` (see [configuration.md](configuration.md#environment-variables)); the
 production `Lister` runs its `ListRemote`, and it is `Git`, the
-`workspace.Git` (`Clone`, `Open`) of the clone work (nil is `gitrepo.Git{}`;
-a nil `Scrubber` is a scrubber that knows no value). `Deps` also holds
+`workspace.Git` (`Clone`, `Open`) of the clone work, and `Fetcher`, the
+`workspace.Fetcher` (`FetchOrigin`) of a sync (nil is `gitrepo.Git{}` for
+both; a nil `Scrubber` is a scrubber that knows no value). `Deps` also holds
 `InsertWorkspace`, which writes the record in the create transaction (nil
-is `workspace.Insert`; a test makes it fail), and `Notify`, called with the
+is `workspace.Insert`; a test makes it fail), `BeforeRefSwap`, which a
+sync calls between a branch's classification and its swap (nil in
+production; a test moves the branch there), and `Notify`, called with the
 slug after a create commits so that clone work is picked up; the hub sets
 it to the workers' `Enqueue`. `(*Service).Enqueue(slug)` calls `Notify`
 (nothing without one): a feature that puts a workspace back to `pending`
@@ -1842,8 +1845,9 @@ fork the registered guard. Then it writes `display_name`, `description`,
 when the org changed sets `org_id` on every record whose `parent_slug` is
 the workspace, runs the fork-only fields' writes and writes the
 `parley.workspace.update` event through `Deps.Events` (`updateEventInput`:
-the actor from `identity.PrincipalOf`, the admin principal mapped to
-`event.ActorAdminToken` with no actor id; `metadata.fields`, the mutable
+the actor from `identity.PrincipalOf`, mapped by `eventActor`, which the
+sync event shares: the admin principal to `event.ActorAdminToken` with no
+actor id, a user's credential to its type with the user as actor id; `metadata.fields`, the mutable
 fields the body carried in `updateFields` order, and for a fork
 `metadata.parent_slug`, never a value), all in the same transaction, so a
 refusal writes nothing, neither record nor event, and a failed write, the
@@ -2006,6 +2010,158 @@ context of the running clones, so that their git processes are killed and
 removes every `.clone-*` entry again and returns the error of that removal
 (nil when it succeeds); it returns `ctx`'s error when `ctx` ends before the
 goroutines, and nil at once for workers never launched.
+
+#### Sync
+
+`internal/workspace/sync.go` holds the sync of a workspace with its origin.
+`(*Service).Sync(ctx, slug, SyncOptions)` reads the record, resolves the
+origin credential with `ResolveOriginCredential` at that moment, so that a
+changed secret counts at the next sync, and fetches origin into the copy at
+`RepoPath` through `Deps.Fetcher` with a deadline of 2 minutes. Two fetches
+into one copy both set the origin heads (and `packed-refs`), and must not
+interleave there or meet on git's ref locks, so the fetch runs under the
+copy's entry of `Service.fetchLocks`, an in-process mutex per
+slug (`keyedLocks`, an entry removed when no one holds or waits for it): a
+second sync of the workspace waits for the first one's fetch and then runs
+its own. Nothing else of a sync takes a lock, and a sync never writes the
+workspace's status: tag creation is create-only (a tag another sync
+created first is skipped, not an error) and branch moves are single-ref
+compare-and-swaps, so syncs, pushes and landings meet only there. It then
+creates in the copy, in name order, every tag origin has and the copy
+lacks, at origin's value (an annotated tag as its tag object), each with
+`CompareAndSwapRef` expecting the tag absent, so that a tag another writer
+creates meanwhile keeps that writer's value; a tag the copy has keeps its
+value, whether origin has it at another value, has deleted it or never had
+it. It then evaluates every branch origin has, in name order, against the
+hub's head of it: `created` when the hub has no such branch, `up_to_date`
+when the heads are equal, `fast_forward` when the hub's head is an ancestor
+of origin's, `ahead` when origin's head is an ancestor of the hub's, and
+otherwise `diverged`, or `reset` when `SyncOptions.ResetToOrigin` is set.
+`created`, `fast_forward` and `reset` move the branch to origin's head with
+`CompareAndSwapRef` expecting the head that was classified (absent for
+`created`); the others move nothing, and a diverged branch does not stop
+the walk. A swap that answers `gitrepo.ErrRefMoved` means another writer
+moved the branch after it was classified: `(*Service).syncBranch` keeps
+that writer's head, reads the branch again, classifies it against the same
+origin head and acts on the new result, up to `maxBranchEvaluations` (5)
+evaluations; the reported result, `local_sha` and the `Before` of the move
+are those of the last evaluation, and only a swap that succeeded is told to
+the observers and listed in the event's `updated`. When the fifth swap is
+lost too, `Sync` returns `server.Internal` naming the branch, before
+`completeSync`: no sync field and no event is written, and the moves made
+before stay, their observers already told. `Deps.BeforeRefSwap`, nil in
+production, is called between a branch's classification and its swap; it
+is for tests, which move the branch there as another writer would. A branch only the hub has, never on origin or deleted there, is
+neither looked at nor reported. Protected branches are treated as any
+other: sync reads neither the push rules nor `protected_branches` and
+`protect.owner_push`. It returns a `SyncResult` holding the record read
+again after the completion (see below), `CreatedTags`, the tags it created, and `Branches`, one `BranchResult`
+(`name`, `result`, `local_sha`, `origin_sha` as JSON, the hub's head after
+the branch was handled and origin's head, full commit ids) per origin
+branch it did not skip, sorted by name, empty and never nil when there is
+none.
+
+Before the walk, after the fetch and the tags, `excludedBranches` builds
+the set of branches the walk skips. For a record whose `Mode` is
+`ModeCarryPatch` it holds the record's `IntegrationBranch` (when set) and
+the names the registered `ExcludedBranchProvider` returns
+(`ExcludedBranches(ctx, slug) ([]string, error)`, asked once per sync);
+for any other mode it is empty and the provider is not asked. The provider
+is registered with `(*Service).RegisterExcludedBranchProvider`, one at a
+time, guarded by its own mutex, nil removing it; this package registers
+none, the patch feature does when the hub is composed. A skipped branch is
+not classified, moved, listed in `Branches` or the event, or told to the
+observers; its origin head is still set by the fetch, and `head_sha` and
+`origin_head_sha` are read as usual, also when the default branch is the
+integration branch. A provider error stops the sync before the walk with
+`server.Internal`, its text scrubbed by `Deps.Scrubber`: no branch moved,
+no sync field written, no event (tags created by then stay).
+
+A credential that cannot be resolved (nothing is then fetched), a fetch
+error and a fetch cut off at its deadline (`gitrepo.ErrDeadline`) are one
+failure, handled by `failFetch`: the text `origin fetch failed: ` plus the
+error, scrubbed by `Deps.Scrubber` with the credential's password, is
+logged (`workspace sync could not fetch`), written as the record's
+`sync_error` alone by `recordSyncError` (no other field, no event), and
+returned as `server.UpstreamError` with the same text. Nothing in the copy
+has changed at that point: a fetch that fails sets no origin head and tags
+are created after it.
+
+`internal/workspace/sync_extension.go` declares the extension point of the
+carry-patch part of sync: `SyncExtension` with `AfterFetch(ctx, SyncRun)
+error` and `BeforeCompletion(ctx, SyncRun, []BranchResult) (SyncAddition,
+error)`, registered with `(*Service).RegisterSyncExtension`, one at a time,
+guarded by its own mutex, nil removing it; this package imports no
+carry-patch package and registers none. `SyncRun` holds the record as read
+before the fetch, the caller (`Actor`), `ResetToOrigin` and `OriginHeads`,
+a copy of origin's branch heads as fetched. `Sync` takes the extension once,
+after the fetch, and only for a record whose `Mode` is `ModeCarryPatch`;
+with none, or for a standard workspace, nothing changes. The order is: the
+fetch, `AfterFetch`, the tags, `excludedBranches`, the walk,
+`BeforeCompletion` (given a copy of `Branches`), `completeSync`. Both
+stages run on the sync's context, which the route has detached from the
+request. An `AfterFetch` error goes to `failFetch` without the `origin fetch
+failed: ` prefix, so a caller tells the two apart: `sync_error` and `502
+upstream_error` with the scrubbed text, no branch or tag moved, no event;
+the origin heads stay as the fetch, which had succeeded, set them. A
+`BeforeCompletion` error is `server.Internal` with its text scrubbed with
+the credential's password, as is a member whose value is not valid JSON;
+`completeSync` does not run (no field, no event) and the moves made stay.
+On success `SyncAddition.UpstreamHeadSHA`, when not nil, is written as
+`upstream_head_sha` by `recordSync` in the completion transaction
+(`COALESCE`, so nil leaves it), and `SyncAddition.Members` reach the route as
+`SyncResult.Members`.
+
+Each `created`, `fast_forward` or `reset` move is reported right after the
+ref changed through the exported `(*Service).NotifyBranchMove(ctx,
+BranchMove{Workspace, Branch, Before, After, Cause})`, `Before` `""` for a
+created branch and `Cause` `MoveCauseSync` (`"sync"`), which a sync
+extension calls for its own moves too. It calls every `BranchMoveObserver`
+(`BranchMoved(ctx, BranchMove) error`) registered with
+`(*Service).RegisterBranchMoveObserver`, once each in the order of
+registration (the list is guarded by its own mutex; nil registers nothing);
+an observer's error is logged through `Deps.Logger` (`workspace
+branch-move observer failed`, with `slug`, `branch`, `cause` and `error`),
+and the remaining observers are still called and the sync goes on, since
+the branch has moved already. With no observer a sync behaves the same.
+
+When every branch is handled, `completeSync` writes in one `Store.Tx`
+`recordSync` (`last_sync_at` = `Deps.Now` in UTC cut to the second,
+`sync_error` `NULL`, `head_sha` the copy's head of the record's default
+branch and `origin_head_sha` the copy's origin head of it, each `NULL`
+when there is none, both read from the copy at that moment rather than
+taken from this sync's fetch, so that a sync that completes after an
+overlapping later one does not record an older origin than the copy holds; `updated_at` is not written) and the one
+`parley.workspace.sync` event (`syncEventInput`), whose actor is
+`SyncOptions.Actor` mapped by `eventActor`; a `SyncOptions.Actor` that is
+neither the admin token nor a user's credential is an error before
+anything is fetched. Its metadata holds the lists `created`,
+`fast_forward`, `ahead`, `diverged` and `reset` of branch names (sorted, `[]`
+when empty, `up_to_date` branches in none) and `updated`, one `{ref,
+before, after}` per moved or created branch and per created tag with full
+ref names, `before` `null` for a created ref, sorted by `ref`. `Sync`
+returns the record read again after that transaction as
+`SyncResult.Workspace`.
+
+`internal/workspace/sync_handler.go` holds `POST /workspaces/:slug/sync`,
+declared with `Scope` `workspaces:write` and `Marks` `access.need: write`,
+so the scope check and then the access check answer before the handler (a
+member of the org is `403` in every status). The handler reads no body. It
+reads `reset_to_origin` with `boolParam` (absent or `false`, `true`, else
+`400 invalid_request`), reads the record with `BySlug` (gone: the same
+`404`), and judges it in `requireSyncable`: a task fork is
+`400 fork_has_no_origin`, then `RequireReady`, then the effective setting
+`sync_enabled` from the settings registry, `false` being
+`400 sync_disabled`, so that nothing is fetched before every check has
+passed. It runs `Sync` on `context.WithoutCancel` of the request's context,
+so a caller who disconnects does not stop it, with the caller from
+`identity.PrincipalOf` as `SyncOptions.Actor`, and answers `200` with the
+`RenderWorkspace` object of `SyncResult.Workspace`, the record after the
+completion, for the caller's level (`access.DecisionOf`) and the member
+`branches`; `syncAnswerJSON` appends each of `SyncResult.Members` after
+them, in byte order of the names, leaving out a name the object or
+`branches` has already. An error of `Sync` that is a `*server.Error`,
+wrapped or not, is the answer; any other is `500 internal`.
 
 ### Hub events
 

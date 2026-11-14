@@ -54,6 +54,10 @@ func TestCredential_ReachesGitOnlyThroughTheEnvironment(t *testing.T) {
 	log := &argvLog{}
 	g := gitrepo.Git{Env: o.Env(), Trace: log.trace}
 	ctx := context.Background()
+	fetchDir := filepath.Join(t.TempDir(), "fetch.git")
+	if err := g.Clone(ctx, o.URL(), gitrepo.Credential{Username: "x-token-auth", Password: token}, fetchDir); err != nil {
+		t.Fatal(err)
+	}
 
 	cases := []struct {
 		name string
@@ -72,6 +76,9 @@ func TestCredential_ReachesGitOnlyThroughTheEnvironment(t *testing.T) {
 			}
 			if c.ok && remote.Branches["main"] != mainHead {
 				t.Errorf("ListRemote main = %q, want %s", remote.Branches["main"], mainHead)
+			}
+			if _, err := g.FetchOrigin(ctx, fetchDir, o.URL(), c.cred, time.Minute); (err == nil) != c.ok {
+				t.Errorf("FetchOrigin = %v, want success %v", err, c.ok)
 			}
 			dir := filepath.Join(t.TempDir(), "copy.git")
 			err = g.Clone(ctx, o.URL(), c.cred, dir)

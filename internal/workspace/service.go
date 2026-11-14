@@ -70,10 +70,18 @@ type Deps struct {
 	// Git clones a workspace's origin into its copy and opens the copy;
 	// nil means gitrepo.Git{}.
 	Git Git
+	// Fetcher fetches a workspace's origin into its copy for a sync; nil
+	// means gitrepo.Git{}.
+	Fetcher Fetcher
 	// InsertWorkspace writes a new workspace record in the create
 	// transaction; nil means Insert. A test makes it fail to see the whole
 	// create roll back.
 	InsertWorkspace func(ctx context.Context, tx *sql.Tx, w Workspace) error
+	// BeforeRefSwap, when set, is called by a sync after it classified a
+	// branch of the workspace slug and before the compare-and-swap that
+	// moves it. It is for tests, which move the branch there as another
+	// writer would; it is nil in production.
+	BeforeRefSwap func(ctx context.Context, slug, branch string)
 	// Notify tells the clone workers that the workspace slug has clone work;
 	// it is called after the transaction that recorded the work commits. Nil
 	// tells no one.
@@ -110,6 +118,18 @@ type Service struct {
 
 	stepMu    sync.RWMutex
 	postClone map[string]PostCloneStep
+
+	moveMu        sync.RWMutex
+	moveObservers []BranchMoveObserver
+
+	excludeMu       sync.RWMutex
+	excludeProvider ExcludedBranchProvider
+
+	extMu   sync.RWMutex
+	syncExt SyncExtension
+
+	// fetchLocks serialises the syncs' fetches into one copy.
+	fetchLocks keyedLocks
 }
 
 // Bind binds the service to d. It is called once, before the hub serves.
@@ -126,6 +146,9 @@ func (s *Service) Bind(d Deps) {
 	if d.Git == nil {
 		d.Git = gitrepo.Git{}
 	}
+	if d.Fetcher == nil {
+		d.Fetcher = gitrepo.Git{}
+	}
 	if d.Scrubber == nil {
 		d.Scrubber = scrub.New()
 	}
@@ -139,5 +162,5 @@ func (s *Service) Settings() *SettingsRegistry { return &s.settings }
 
 // Routes returns the workspace routes of the REST API.
 func (s *Service) Routes() []server.Route {
-	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute()}
+	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute(), s.syncRoute()}
 }

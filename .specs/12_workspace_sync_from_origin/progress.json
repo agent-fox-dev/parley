@@ -3,47 +3,47 @@
   "spec_id": "12",
   "spec_name": "workspace_sync_from_origin",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-14T11:15:00Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

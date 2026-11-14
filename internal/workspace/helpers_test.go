@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"maps"
 	"net/http"
+	"os"
+	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,10 +27,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The event types a create and an update write.
+// The event types a create, an update and a sync write.
 const (
 	createEvent = "parley.workspace.create"
 	updateEvent = "parley.workspace.update"
+	syncEvent   = "parley.workspace.sync"
 )
 
 // world is a hub the workspace route tests ask: the users u and v, each with
@@ -105,6 +110,13 @@ func withGitOrigin(o *gitrepotest.Origin) option {
 // every workspace created.
 func withCloneWorkers() option {
 	return func(_ *hubtest.Config, w *world) { w.cloneWorkers = true }
+}
+
+// withLog makes the workspace service log to buf, as text.
+func withLog(buf *hubtest.LogBuffer) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { d.Logger = slog.New(slog.NewTextHandler(buf, nil)) })
+	})
 }
 
 // withCompose runs fn on the hub's composition, after the world's own.
@@ -240,6 +252,45 @@ func (w *world) patch(t *testing.T, cred, slug string, body any) answer {
 	t.Helper()
 	status, b := w.Call(t, http.MethodPatch, "/api/v1/workspaces/"+slug, cred, body)
 	return answer{status, b}
+}
+
+// postSync sends POST /workspaces/<slug>/sync?<query>, with no body, with
+// cred as the bearer credential.
+func (w *world) postSync(t *testing.T, cred, slug, query string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/sync?"+query, cred, nil)
+	return answer{status, b}
+}
+
+// postSyncAndLeave sends POST /workspaces/<slug>/sync with cred as the
+// bearer credential and, once started is closed, cancels the request as a
+// caller who disconnects; it returns when the request has ended so.
+func (w *world) postSyncAndLeave(t *testing.T, cred, slug string, started <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/"+slug+"/sync"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+	sent := make(chan error, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		sent <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sync did not reach the point to disconnect at within 10 s")
+	}
+	cancel()
+	if err := <-sent; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the request ended with %v, want it cancelled by the caller", err)
+	}
 }
 
 // list asks GET /workspaces?<query> with cred as the bearer credential.
@@ -791,4 +842,320 @@ func (w *world) setPending(t *testing.T, slug string, forget bool) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// deleteSecret removes the workspace secret name of slug through the secret
+// component.
+func (w *world) deleteSecret(t *testing.T, slug, name string) {
+	t.Helper()
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		_, err := w.secrets.Delete(context.Background(), tx, secret.ScopeWorkspace, slug, name)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// syncSlug is the workspace of a sync world.
+const syncSlug = "demo"
+
+// syncWorld is a world with the ready repository workspace syncSlug of the
+// user u, whose origin is a bare repository on disk holding the origin's
+// usual history (see gitrepotest.Origin.History), and the hub's copy of it at
+// its place, made by the clone work, which records the origin heads. The
+// hub's fetcher records every fetch, and swaps is the hub's hook between a
+// branch's classification and its swap.
+type syncWorld struct {
+	*world
+	origin *gitrepotest.Origin
+	// copy is the git directory of the hub's copy.
+	copy    string
+	fetches *recordingFetcher
+	swaps   *swapHook
+}
+
+// newSyncWorld starts a world with opts and builds the sync world in it.
+func newSyncWorld(t *testing.T, opts ...option) *syncWorld {
+	t.Helper()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	f, h := &recordingFetcher{}, &swapHook{calls: map[string]int{}, on: map[string]func(int){}}
+	w := newWorld(t, append(opts, withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { f.Fetcher, d.Fetcher, d.BeforeRefSwap = d.Fetcher, f, h.before })
+	}))...)
+	url := o.Dir()
+	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
+	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
+		t.Fatalf("the clone of the sync workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
+	}
+	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f, swaps: h}
+}
+
+// sync runs a sync of the workspace with opts, the admin token as the actor
+// when opts names none, and fails the test when it does not complete.
+func (s *syncWorld) sync(t *testing.T, opts workspace.SyncOptions) workspace.SyncResult {
+	t.Helper()
+	if opts.Actor.Type == "" {
+		opts.Actor = identity.Principal{Type: identity.TypeAdmin}
+	}
+	r, err := s.svc.Sync(context.Background(), syncSlug, opts)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	return r
+}
+
+// syncBranches decodes the branches of a, which must be 200, and checks that
+// the rest of a is the workspace object.
+func syncBranches(t *testing.T, a answer) (map[string]any, []workspace.BranchResult) {
+	t.Helper()
+	obj := a.decode(t, http.StatusOK)
+	var body struct {
+		Branches []workspace.BranchResult `json:"branches"`
+	}
+	if err := json.Unmarshal(a.body, &body); err != nil || body.Branches == nil {
+		t.Fatalf("the sync answer %s has no branches list (%v)", a.body, err)
+	}
+	delete(obj, "branches")
+	if len(obj) != len(objectMembers) {
+		t.Errorf("the sync answer has %d members beside branches, want the %d of a workspace object", len(obj), len(objectMembers))
+	}
+	return obj, body.Branches
+}
+
+// deref is the value p points at, "" for nil.
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// recordingFetcher is the hub's fetcher for syncs: it records every fetch
+// and runs it, or fails it with err while err is set.
+type recordingFetcher struct {
+	workspace.Fetcher
+
+	mu    sync.Mutex
+	calls []fetchCall
+	hold  func()
+	err   error
+}
+
+// fetchCall is one fetch: the copy, origin's URL, the credential and the
+// deadline it was given.
+type fetchCall struct {
+	dir, url string
+	cred     workspace.Credential
+	deadline time.Duration
+}
+
+func (f *recordingFetcher) FetchOrigin(ctx context.Context, dir, url string, cred workspace.Credential, deadline time.Duration) (gitrepo.Fetched, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, fetchCall{dir, url, cred, deadline})
+	hold, err := f.hold, f.err
+	f.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
+	if err != nil {
+		return gitrepo.Fetched{}, err
+	}
+	return f.Fetcher.FetchOrigin(ctx, dir, url, cred, deadline)
+}
+
+// failWith makes every later fetch call fail with err, without fetching;
+// nil makes them fetch again.
+func (f *recordingFetcher) failWith(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+// holdWith makes every later fetch call hold before it runs.
+func (f *recordingFetcher) holdWith(hold func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hold = hold
+}
+
+// recorded are the fetches so far.
+func (f *recordingFetcher) recorded() []fetchCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fetchCall(nil), f.calls...)
+}
+
+// swapHook is the hub's hook between a branch's classification and its swap
+// in a sync: it counts the calls per branch and runs what is set for the
+// branch with the call's number, from 1.
+type swapHook struct {
+	mu    sync.Mutex
+	calls map[string]int
+	on    map[string]func(call int)
+}
+
+func (h *swapHook) before(_ context.Context, _, branch string) {
+	h.mu.Lock()
+	h.calls[branch]++
+	call, fn := h.calls[branch], h.on[branch]
+	h.mu.Unlock()
+	if fn != nil {
+		fn(call)
+	}
+}
+
+// set makes every later call for branch run fn.
+func (h *swapHook) set(branch string, fn func(call int)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.on[branch] = fn
+}
+
+// count is the number of calls for branch so far.
+func (h *swapHook) count(branch string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls[branch]
+}
+
+// gitFrom runs git with stdin on the repository at dir, as another writer
+// does, from any goroutine: a failure fails the test without stopping the
+// goroutine, and the output is "" then.
+func gitFrom(t *testing.T, dir, stdin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_AUTHOR_NAME=Writer", "GIT_AUTHOR_EMAIL=writer@example.invalid",
+		"GIT_COMMITTER_NAME=Writer", "GIT_COMMITTER_EMAIL=writer@example.invalid")
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Errorf("git %v in %s: %v: %s", args, dir, err, out)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// ref is the object id of the ref name of the repository at dir, "" when
+// there is no such ref.
+func ref(t *testing.T, dir, name string) string {
+	t.Helper()
+	return gitrepotest.Git(t, dir, "for-each-ref", "--format=%(objectname)", name)
+}
+
+// grow points branch of the repository at dir at a new commit on top of
+// from, with from's tree and a message naming where, and returns its id, so
+// that two sides grown from one commit differ.
+func grow(t *testing.T, dir, branch, from, where string) string {
+	t.Helper()
+	id := gitrepotest.Git(t, dir, "commit-tree", from+"^{tree}", "-p", from, "-m", where+" on "+branch)
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+branch, id)
+	return id
+}
+
+// outcomes maps every branch of r to its result.
+func outcomes(r workspace.SyncResult) map[string]workspace.BranchOutcome {
+	m := map[string]workspace.BranchOutcome{}
+	for _, b := range r.Branches {
+		m[b.Name] = b.Result
+	}
+	return m
+}
+
+// branchSet is the branches of a sync world after build: from base, origin's
+// main, same is equal on both sides, new-b (absent from the hub) and ff have
+// a commit on origin only, ahead-b one in the hub only (hubAhead) and div one
+// of its own on each side (hubDiv); main and dev are as the clone left them.
+// theirs are origin's branch heads.
+type branchSet struct {
+	base, hubAhead, hubDiv string
+	theirs                 map[string]string
+}
+
+// branchSet builds the branch set in s.
+func (s *syncWorld) branchSet(t *testing.T) branchSet {
+	t.Helper()
+	origin := s.origin.Dir()
+	b := branchSet{base: s.origin.Head("main")}
+	gitrepotest.Git(t, origin, "branch", "same", b.base)
+	gitrepotest.Git(t, origin, "branch", "ahead-b", b.base)
+	for _, name := range []string{"new-b", "ff", "div"} {
+		grow(t, origin, name, b.base, "origin")
+	}
+	gitrepotest.Git(t, s.copy, "branch", "same", b.base)
+	gitrepotest.Git(t, s.copy, "branch", "ff", b.base)
+	b.hubAhead = grow(t, s.copy, "ahead-b", b.base, "hub")
+	b.hubDiv = grow(t, s.copy, "div", b.base, "hub")
+	b.theirs = gitrepotest.Refs(t, origin, "refs/heads/")
+	return b
+}
+
+// recordingObserver records every branch move it is told of, with the hub's
+// head of the branch at that moment, and answers err.
+type recordingObserver struct {
+	t   *testing.T
+	dir string
+	err error
+
+	mu    sync.Mutex
+	moves []workspace.BranchMove
+	heads []string
+}
+
+func (o *recordingObserver) BranchMoved(_ context.Context, m workspace.BranchMove) error {
+	head := ref(o.t, o.dir, "refs/heads/"+m.Branch)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.moves, o.heads = append(o.moves, m), append(o.heads, head)
+	return o.err
+}
+
+// recorded are the moves told so far and the heads seen at each.
+func (o *recordingObserver) recorded() ([]workspace.BranchMove, []string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.moves), slices.Clone(o.heads)
+}
+
+// observe registers on the world's service an observer answering err.
+func (s *syncWorld) observe(t *testing.T, err error) *recordingObserver {
+	o := &recordingObserver{t: t, dir: s.copy, err: err}
+	s.svc.RegisterBranchMoveObserver(o)
+	return o
+}
+
+// setMode gives the sync workspace the workspace_mode mode and the
+// integration_branch integration.
+func (s *syncWorld) setMode(t *testing.T, mode, integration string) {
+	t.Helper()
+	if _, err := s.Store.Main().Exec(`UPDATE workspaces SET workspace_mode = ?, integration_branch = ? WHERE slug = ?`,
+		mode, integration, syncSlug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// excluding is an excluded-branch provider that names names, or fails with
+// err, and records the slugs it is asked for.
+type excluding struct {
+	names []string
+	err   error
+
+	mu    sync.Mutex
+	slugs []string
+}
+
+func (p *excluding) ExcludedBranches(_ context.Context, slug string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.slugs = append(p.slugs, slug)
+	return p.names, p.err
+}
+
+// asked are the slugs the provider was asked for so far.
+func (p *excluding) asked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.slugs)
 }

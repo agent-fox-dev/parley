@@ -327,6 +327,23 @@ func Git(t testing.TB, dir string, args ...string) string {
 	return out
 }
 
+// Refs maps every ref below prefix of the repository whose git directory is
+// dir, by its name without prefix ("" for every ref, by its full name), to
+// the object id it points at.
+func Refs(t testing.TB, dir, prefix string) map[string]string {
+	t.Helper()
+	args := []string{"for-each-ref", "--format=%(refname) %(objectname)"}
+	if prefix != "" {
+		args = append(args, prefix) // an empty pattern would match no ref
+	}
+	refs := map[string]string{}
+	for line := range strings.Lines(Git(t, dir, args...)) {
+		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
+		refs[strings.TrimPrefix(name, prefix)] = id
+	}
+	return refs
+}
+
 // gitIn runs git on the repository whose git directory is dir with stdin as
 // its input, away from the user's and the system's git configuration, with
 // a fixed author, and returns its trimmed standard output.

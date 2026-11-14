@@ -1372,6 +1372,161 @@ The answer is the workspace object after the update, the object
 | `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
 | `500` `internal` | a write failed, that of a fork moved with the workspace or of the update's event included; nothing is changed |
 
+## `POST /api/v1/workspaces/{slug}/sync`
+
+Brings the repository workspace `{slug}` up to date with its origin. It
+takes the admin token, an API key or a PAT, declares the scope
+`workspaces:write` for a PAT and needs write access to the workspace (see
+[Workspace access](#workspace-access)): its owner or the admin token. The
+route reads no body. One query parameter:
+
+| Parameter | Values |
+|---|---|
+| `reset_to_origin` | absent or `false`: a diverged branch is left as it is; `true`: every diverged branch, and only those, is moved to origin's head. Any other value, an empty one, another spelling (`TRUE`, `1`) or the parameter given twice, is `400` `invalid_request` |
+
+The sync resolves the workspace's origin credential from its secrets at
+that moment and fetches every branch and tag of origin with it, with a
+deadline of two minutes; the fetch sets the hub's origin heads
+(`refs/remotes/origin/*`) to origin's branches, all or none. It then
+creates every tag origin has and the hub lacks, at origin's value, and
+never moves or deletes a tag the hub has. Last, it compares every branch
+of origin, in byte order of the names, with the hub's head of it, and moves
+the branch by a compare-and-swap where the result says so. A branch only
+the hub has is neither looked at nor reported. Sync does not read
+`protected_branches` or `protect.owner_push`: a protected branch moves like
+any other.
+
+A workspace whose `workspace_mode` is `carry_patch` leaves some branches
+out of the comparison: its `integration_branch`, and the branches a
+provider the patch feature registers in the hub names for the workspace.
+Such a branch is not compared, not moved, not listed in `branches` and not
+in the event, although the fetch still sets its origin head. The provider
+is asked once per sync, after the fetch and the tags; if it fails, the sync
+stops with `500` `internal` before any branch is compared: no branch moves,
+no field is written and no event is emitted. A `standard` workspace leaves
+nothing out, whatever its `integration_branch`.
+
+The patch feature may also register a sync extension in the hub, which
+runs inside the sync of a `carry_patch` workspace, never of a `standard`
+one, at two points: right after the fetch of origin, before any tag or
+branch is created or moved, and after the comparison of every branch,
+before the completion is recorded. Both run to their end when the caller
+disconnects. If the first fails, the sync ends as a failed fetch: no
+branch or tag moves, `sync_error` is set and the answer is `502`
+`upstream_error`, whose message is the extension's error, scrubbed as below
+and without the prefix `origin fetch failed: `; the origin heads stay as
+the fetch, which had succeeded, set them. If the second fails, the answer is `500`
+`internal` with its error, scrubbed, as message; the completion is not
+recorded (no field is written and no event emitted) and the branches moved
+before stay moved. When the second succeeds it may set `upstream_head_sha`,
+written in the completion's transaction, and add members to the answer.
+Without an extension a `carry_patch` workspace syncs as described here.
+
+Sync takes no lock on the workspace and never changes its `status`. A
+branch that another writer (a push, a landing, another sync) moves between
+the comparison and the swap keeps that writer's head: the sync compares it
+again from the new head, against the same origin head, and reports the
+result of the last comparison, with `local_sha` the hub's head after it.
+A branch whose swap is lost on five comparisons stops the sync with `500`
+`internal`, whose message names the branch; nothing is recorded and no
+event is written, and branches moved before it stay moved. Two syncs of
+one workspace at the same time both complete: the second waits for the
+first one's fetch, never answers `409` `workspace_busy` for it, and reports
+`up_to_date` for a branch the first one has already moved.
+
+| Result | When | The hub's branch |
+|---|---|---|
+| `created` | the hub has no such branch | created at origin's head |
+| `up_to_date` | both heads are equal | unchanged |
+| `fast_forward` | the hub's head is an ancestor of origin's | moved to origin's head |
+| `ahead` | origin's head is an ancestor of the hub's | unchanged |
+| `diverged` | each side has commits the other lacks, without `reset_to_origin=true` | unchanged |
+| `reset` | the same, with `reset_to_origin=true` | moved to origin's head |
+
+The checks run in this order, the first that fails answering: a bound PAT
+on a workspace outside its binding (`404`, see
+[Workspace-bound tokens](#workspace-bound-tokens)); a PAT without
+`workspaces:write` (`403`), before the workspace is looked up; the access
+check (`404` for a caller who cannot read the workspace, the same bytes as
+for a slug no workspace has, `403` for a member of its org, in every
+status); `reset_to_origin`; a task fork; the workspace's state: a reclone,
+archive or delete running on it, then its status; and last its effective
+setting `sync_enabled` (see [Workspace settings](#workspace-settings)), so
+that an archived workspace with sync disabled is refused as archived.
+Origin is not fetched before every check has passed. The sync runs to its
+end when the caller disconnects, with the same branch moves, fields and
+event as when the caller waits.
+
+A sync that cannot fetch origin changes nothing in the hub's repository: no
+branch, tag or origin head moves, since the origin heads are set only once
+the fetch has succeeded and tags are created only after it. This covers secrets that cannot be
+read (nothing is then fetched, never anonymously), origin refusing the
+credential or the request, a failing network, and a fetch that has not
+ended after two minutes, whose git processes are stopped. The sync writes
+only `sync_error`, leaves `last_sync_at`, `head_sha`, `origin_head_sha` and
+`updated_at` as they were, writes no event and answers `502`
+`upstream_error`. `sync_error` and the answer's `message` are the same
+text: `origin fetch failed: ` followed by git's error, with every secret
+value the hub knows and the origin credential's secret replaced by
+`[redacted]`, the user information of every URL removed, and cut to 1024
+bytes. The next sync that completes clears `sync_error`.
+
+```json
+{"error":{"code":502,"message":"origin fetch failed: git fetch: exit status 128: fatal: Authentication failed for 'https://example.com/a.git/'","error_type":"upstream_error"}}
+```
+
+A completed sync, also one with branches `ahead` or `diverged`, sets in one
+store transaction `last_sync_at` to the hub's time cut to the second,
+`sync_error` to `null`, `head_sha` to the hub's head of the default branch
+and `origin_head_sha` to its origin head, both read from the hub's
+repository when the completion is recorded, so that of two overlapping
+syncs the one that completes last never records an older origin than the
+other already fetched, `null` when there is no such branch; `updated_at` is not changed. In the same
+transaction it writes one `parley.workspace.sync` event with `workspace`
+and `resource_id` the slug, `resource_type` `workspace`, and as actor the
+caller as for [`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug):
+`admin_token` with `actor_id` `null`, or `api_key` or `pat` with the
+caller's user. Its `metadata` holds `created`, `fast_forward`, `ahead`,
+`diverged` and `reset`, the names of the branches with that result in byte
+order (`[]` when none; an `up_to_date` branch is in no list), and
+`updated`, one entry per branch the sync created or moved and per tag it
+created, with the full ref name, the head before (`null` for a created ref)
+and after, sorted by `ref`:
+
+```json
+{"seq":14,"id":"…","type":"parley.workspace.sync","time":"2026-11-14T10:32:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"sync","session_id":null,"metadata":{"ahead":[],"created":["new-b"],"diverged":["dev"],"fast_forward":["main"],"reset":[],"updated":[{"ref":"refs/heads/main","before":"9fceb02d0ae598e95dc970b74767f19372d61af8","after":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"},{"ref":"refs/heads/new-b","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"ref":"refs/tags/v2","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"}]}}
+```
+
+The answer is the workspace object, read after the completion was
+recorded, so that it carries the new `last_sync_at`, `sync_error`,
+`head_sha` and `origin_head_sha`, the object
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
+`access` the caller's level, and the member `branches`: one entry per
+branch of origin that the sync did not leave out, in byte order of the
+names, an empty list when there is none. `local_sha` is the hub's head of the branch after the sync,
+`origin_sha` origin's head as the fetch found it. The members a sync
+extension adds come after `branches`, in byte order of their names; one
+whose name the workspace object or `branches` has already is left out.
+
+```json
+{"slug":"demo","kind":"repository","status":"ready","access":"owner","…":"…","branches":[{"name":"dev","result":"diverged","local_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_sha":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"name":"main","result":"fast_forward","local_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"}]}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the sync completed, diverged branches included; the body is the workspace object plus `branches`, and the members a sync extension adds |
+| `400` `invalid_request` | `reset_to_origin` is neither `true` nor `false`, or given more than once (`reset_to_origin must be given once, as true or false`) |
+| `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to sync from`) |
+| `400` `sync_disabled` | the workspace's setting `sync_enabled` is `false` (`workspace "<slug>" has sync disabled; set sync_enabled to true to sync it`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
+| `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
+| `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`), or the first stage of a sync extension failed (`<its error, scrubbed>`); no branch or tag of the hub's repository changed, nor, for a failed fetch, any origin head (after a failed first stage they are those the fetch set), and `sync_error` holds the same text |
+| `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), the second stage of a sync extension failed (`<its error, scrubbed>`) or added a member that is not JSON, a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

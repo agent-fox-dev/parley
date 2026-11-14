@@ -149,6 +149,56 @@ WHERE slug = ?`,
 	return nil
 }
 
+// syncFields are what a completed sync writes on its workspace.
+type syncFields struct {
+	LastSyncAt             time.Time
+	HeadSHA, OriginHeadSHA *string
+	// UpstreamHeadSHA is written when it is not nil.
+	UpstreamHeadSHA *string
+}
+
+// recordSync writes f on the workspace slug through ex and clears its
+// sync_error; a nil head is written as null, a nil UpstreamHeadSHA leaves
+// upstream_head_sha as it is. updated_at is left as it is, the time of the
+// record's own last change. A slug no workspace has is ErrNotFound.
+func recordSync(ctx context.Context, ex Execer, slug string, f syncFields) error {
+	res, err := ex.ExecContext(ctx, `
+UPDATE workspaces SET last_sync_at = ?, sync_error = NULL, head_sha = ?, origin_head_sha = ?,
+	upstream_head_sha = COALESCE(?, upstream_head_sha)
+WHERE slug = ?`,
+		f.LastSyncAt.UnixNano(), f.HeadSHA, f.OriginHeadSHA, f.UpstreamHeadSHA, slug)
+	if err != nil {
+		return fmt.Errorf("record sync of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record sync of workspace %q: %w", slug, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("record sync of workspace %q: %w", slug, ErrNotFound)
+	}
+	return nil
+}
+
+// recordSyncError writes text as the sync_error of the workspace slug
+// through ex and nothing else: a sync that could not fetch leaves
+// last_sync_at, the heads and updated_at as they were. A slug no workspace
+// has is ErrNotFound.
+func recordSyncError(ctx context.Context, ex Execer, slug, text string) error {
+	res, err := ex.ExecContext(ctx, `UPDATE workspaces SET sync_error = ? WHERE slug = ?`, text, slug)
+	if err != nil {
+		return fmt.Errorf("record the sync error of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record the sync error of workspace %q: %w", slug, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("record the sync error of workspace %q: %w", slug, ErrNotFound)
+	}
+	return nil
+}
+
 // StartClone moves the workspace slug from pending to cloning and clears
 // its clone_error, in one write through ex, so that no one reads a clone in
 // progress with the error of an earlier one. A workspace already in cloning
