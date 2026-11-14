@@ -188,13 +188,10 @@ func (w *world) workerRounds(t *testing.T, rounds int, slugs []string) {
 
 func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testing.T) {
 	t.Parallel()
+	// No clone reaches the content of an origin, so none is given a
+	// history, and the rows whose git never runs share the trusted one.
 	trusted := gitrepotest.NewOrigin(t)
 	w := newWorld(t, withGitOrigin(trusted))
-	served := func(opts ...gitrepotest.Option) *gitrepotest.Origin {
-		o := gitrepotest.NewOrigin(t, opts...)
-		o.History()
-		return o
-	}
 	type outcome struct {
 		slug, msg string
 		origin    *gitrepotest.Origin
@@ -214,16 +211,20 @@ func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testi
 		// want is the whole clone_error, "" for any.
 		want string
 	}{
-		{name: "a closed port", origin: func() *gitrepotest.Origin { o := served(); o.Close(); return o }},
+		{name: "a closed port", origin: func() *gitrepotest.Origin { o := gitrepotest.NewOrigin(t); o.Close(); return o }},
 		{name: "an origin refusing the stored token with 401", origin: func() *gitrepotest.Origin {
-			return served(gitrepotest.WithBasicAuth("x-token-auth", "tok-other"))
+			return gitrepotest.NewOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", "tok-other"))
 		}},
-		{name: "an origin answering 403", origin: func() *gitrepotest.Origin { o := served(); o.Refuse(http.StatusForbidden); return o }},
+		{name: "an origin answering 403", origin: func() *gitrepotest.Origin {
+			o := gitrepotest.NewOrigin(t)
+			o.Refuse(http.StatusForbidden)
+			return o
+		}},
 		{name: "an empty repository", origin: func() *gitrepotest.Origin {
 			return gitrepotest.NewOrigin(t, gitrepotest.WithSmartHTTP())
 		}, want: "origin has no branches"},
-		{name: "a git error of 5000 bytes holding the token and userinfo", origin: func() *gitrepotest.Origin { return served() }, gitErr: errors.New(long)},
-		{name: "a credential that cannot be read", origin: func() *gitrepotest.Origin { return served() }, unreadable: true},
+		{name: "a git error of 5000 bytes holding the token and userinfo", origin: func() *gitrepotest.Origin { return trusted }, gitErr: errors.New(long)},
+		{name: "a credential that cannot be read", origin: func() *gitrepotest.Origin { return trusted }, unreadable: true},
 	} {
 		slug := fmt.Sprintf("broken-%d", i)
 		o := c.origin()
@@ -330,10 +331,15 @@ func TestClone_DiscardsWhatIsNotAValidCopyOfTheWorkspaceAndClonesFresh(t *testin
 	o := gitrepotest.NewOrigin(t)
 	mainHead, devHead, v1 := o.History()
 	w := newWorld(t, withGitOrigin(o))
-	// cloned makes a valid copy of slug with the marker branch stale.
+	// cloned gives slug a valid copy with the marker branch stale. The rows
+	// that start from one share the slug copied: each row's fresh clone
+	// leaves the valid copy the next one starts from, so only the first
+	// clones for it.
 	cloned := func(slug string) string {
-		w.createFrom(t, slug, o.URL(), nil)
-		w.clone(t, slug)
+		if _, found := w.workspace(t, slug); !found {
+			w.createFrom(t, slug, o.URL(), nil)
+			w.clone(t, slug)
+		}
 		dir := w.svc.RepoPath(slug)
 		gitrepotest.Git(t, dir, "update-ref", "refs/heads/stale", mainHead)
 		w.setPending(t, slug, false)
@@ -341,40 +347,45 @@ func TestClone_DiscardsWhatIsNotAValidCopyOfTheWorkspaceAndClonesFresh(t *testin
 	}
 	for i, c := range []struct {
 		name string
+		// copied runs the row on the slug copied, which holds a valid copy.
+		copied bool
 		// place puts what lies at the copy's place of slug before the work.
 		place func(slug string)
 	}{
-		{"a plain file", func(slug string) {
+		{"a plain file", false, func(slug string) {
 			w.createFrom(t, slug, o.URL(), nil)
 			if err := os.WriteFile(w.svc.RepoPath(slug), []byte("not a repository"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"an empty directory", func(slug string) {
+		{"an empty directory", false, func(slug string) {
 			w.createFrom(t, slug, o.URL(), nil)
 			if err := os.Mkdir(w.svc.RepoPath(slug), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"a bare repository without commits", func(slug string) {
+		{"a bare repository without commits", false, func(slug string) {
 			w.createFrom(t, slug, o.URL(), nil)
 			if out, err := exec.Command("git", "init", "--quiet", "--bare", w.svc.RepoPath(slug)).CombinedOutput(); err != nil {
 				t.Fatalf("git init: %v: %s", err, out)
 			}
 		}},
-		{"a copy whose origin URL was changed", func(slug string) {
+		{"a copy whose origin URL was changed", true, func(slug string) {
 			gitrepotest.Git(t, cloned(slug), "config", "--local", "remote.origin.url", "https://example.com/other.git")
 		}},
-		{"the copy of an earlier workspace of the same slug", func(slug string) {
+		{"the copy of an earlier workspace of the same slug", true, func(slug string) {
 			cloned(slug)
 			w.deleteRecord(t, slug)
 			w.createFrom(t, slug, o.URL(), nil)
 		}},
-		{"a copy without an instance id", func(slug string) {
+		{"a copy without an instance id", true, func(slug string) {
 			gitrepotest.Git(t, cloned(slug), "config", "--local", "--unset", "parley.workspace")
 		}},
 	} {
 		slug := "found-" + strconv.Itoa(i)
+		if c.copied {
+			slug = "copied"
+		}
 		c.place(slug)
 		asked := o.Requests()
 		rec := w.clone(t, slug)

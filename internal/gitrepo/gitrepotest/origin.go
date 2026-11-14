@@ -281,17 +281,38 @@ func (o *Origin) run(stdin string, args ...string) (string, error) {
 	return gitIn(o.dir, stdin, args...)
 }
 
-// History builds on the origin main (the default branch) with three
+// History builds on the empty origin main (the default branch) with three
 // commits, dev with one more on top of the second, and the tag v1 on main's
 // first commit. It returns the heads of main and dev and the tag's commit.
+// It writes them all in one run of git fast-import, which costs a fraction
+// of the dozens of git processes Commit, Branch and Tag would start.
 func (o *Origin) History() (mainHead, devHead, v1 string) {
 	o.t.Helper()
-	v1 = o.Commit("main", "first")
-	o.Branch("dev", o.Commit("main", "second"))
-	devHead = o.Commit("dev", "on dev")
-	mainHead = o.Commit("main", "third")
-	o.Tag("v1", v1)
-	return mainHead, devHead, v1
+	var stream strings.Builder
+	commit := func(mark int, branch, msg, from string) {
+		o.mu.Lock()
+		o.seq++
+		content := fmt.Sprintf("%s\n%d\n", msg, o.seq)
+		o.mu.Unlock()
+		fmt.Fprintf(&stream, "commit refs/heads/%s\nmark :%d\ncommitter Origin <origin@example.invalid> now\ndata %d\n%s\n",
+			branch, mark, len(msg), msg)
+		if from != "" {
+			fmt.Fprintf(&stream, "from %s\n", from)
+		}
+		fmt.Fprintf(&stream, "M 100644 inline README\ndata %d\n%s\n", len(content), content)
+	}
+	commit(1, "main", "first", "")
+	commit(2, "main", "second", ":1")
+	commit(3, "dev", "on dev", ":2")
+	commit(4, "main", "third", ":2")
+	stream.WriteString("reset refs/tags/v1\nfrom :1\n\n")
+	o.git(stream.String(), "fast-import", "--quiet", "--date-format=now")
+	heads := strings.Fields(o.git("", "rev-parse", "refs/heads/main", "refs/heads/dev", "refs/tags/v1"))
+	if len(heads) != 3 {
+		o.t.Fatalf("origin: the history's heads are %v, want three", heads)
+	}
+	o.publish()
+	return heads[0], heads[1], heads[2]
 }
 
 // Git runs git on the repository whose git directory is dir, such as a
