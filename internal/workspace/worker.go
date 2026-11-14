@@ -56,8 +56,9 @@ func NewWorkers(size int, svc *Service, work func(ctx context.Context, slug stri
 	return wk, nil
 }
 
-// Start removes what clones interrupted by an earlier stop left in the
-// repository root and queues the clone work of every workspace in pending
+// Start removes what clones interrupted by an earlier stop, and fork
+// creations the process did not survive, left in the repository root and
+// queues the clone work of every workspace in pending
 // or cloning in the order it was recorded (CloneWork). It runs no clone:
 // the hub calls it before it listens, so that the work of before the start
 // is ahead of any new one, and launches the workers only once it serves, so
@@ -71,7 +72,7 @@ func (wk *Workers) Start(ctx context.Context) error {
 	if started {
 		return errors.New("the clone workers are started already")
 	}
-	if err := wk.svc.removeCloneDirs(); err != nil {
+	if err := wk.svc.removeTempDirs(true); err != nil {
 		return err
 	}
 	slugs, err := CloneWork(ctx, wk.svc.deps.Store.Main())
@@ -147,7 +148,7 @@ func (wk *Workers) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return wk.svc.removeCloneDirs()
+	return wk.svc.removeTempDirs(false)
 }
 
 // halt makes the workers take no more work and wakes the idle ones, so that
@@ -197,10 +198,15 @@ func (wk *Workers) next() (slug string, ok bool) {
 	return slug, true
 }
 
-// removeCloneDirs removes every clone in progress from the repository root.
-// It runs only while no clone does: at the start of the workers and after
-// they have stopped.
-func (s *Service) removeCloneDirs() error {
+// removeTempDirs removes every clone in progress from the repository root,
+// and with forks every fork repository in the making (gitrepo.IsForkTemp)
+// too. It runs only while no clone does: at the start of the workers and
+// after they have stopped. Forks are created by requests, which the hub
+// serves only after the start and may still be serving at the stop, so the
+// fork directories are removed only at the start, which is before the hub
+// listens; what a creation the process did not survive left is gone by the
+// next start.
+func (s *Service) removeTempDirs(forks bool) error {
 	entries, err := os.ReadDir(s.deps.Root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -209,7 +215,7 @@ func (s *Service) removeCloneDirs() error {
 		return fmt.Errorf("read the repository root: %w", err)
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), cloneDirPrefix) {
+		if strings.HasPrefix(e.Name(), cloneDirPrefix) || forks && gitrepo.IsForkTemp(e.Name()) {
 			if err := gitrepo.Remove(filepath.Join(s.deps.Root, e.Name())); err != nil {
 				return err
 			}

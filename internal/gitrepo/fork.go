@@ -6,7 +6,21 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// forkTempMarker follows the base name of a fork's place in the name of the
+// directory CreateFork builds the fork's repository in: ".<base>.tmp-<random>".
+const forkTempMarker = ".tmp-"
+
+// IsForkTemp reports whether name, a directory entry's name, is that of the
+// directory a CreateFork in progress builds a fork's repository in. A
+// creation the process did not survive leaves the directory behind; the
+// owner of the directory the forks live in removes such entries while no
+// creation runs.
+func IsForkTemp(name string) bool {
+	return strings.HasPrefix(name, ".") && strings.Contains(name, forkTempMarker)
+}
 
 // CreateFork makes the repository of a fork of the repository at parentDir
 // at forkDir: an empty bare repository whose alternates file names the
@@ -18,7 +32,8 @@ import (
 // The repository is built in a new directory beside forkDir and renamed into
 // place once complete, so that a creation that fails or is interrupted
 // leaves nothing at forkDir that opens as a repository; on an error the
-// directory is removed. Something at forkDir already is refused with an
+// directory is removed, and one a creation the process did not survive left
+// is told by its name (IsForkTemp). Something at forkDir already is refused with an
 // error matching fs.ErrExist and left as it is, as is a parentDir that is
 // not a repository. Remove removes a fork's repository.
 func (g Git) CreateFork(ctx context.Context, parentDir, forkDir string) (err error) {
@@ -46,7 +61,7 @@ func (g Git) CreateFork(ctx context.Context, parentDir, forkDir string) (err err
 	} else if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", objects)
 	}
-	tmp, err := os.MkdirTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".tmp-")
+	tmp, err := os.MkdirTemp(filepath.Dir(dst), "."+filepath.Base(dst)+forkTempMarker)
 	if err != nil {
 		return err
 	}

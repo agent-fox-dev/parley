@@ -61,6 +61,32 @@ func TestWorkers_TakeUpPendingAndCloningWorkInCreationOrderAtStart(t *testing.T)
 	}
 }
 
+func TestWorkers_StartRemovesWhatAnInterruptedForkCreationLeft(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	root := filepath.Dir(w.svc.RepoPath("ws-a"))
+	leftover := filepath.Join(root, ".ws-a-fork.git.tmp-12345")
+	copied := w.svc.RepoPath("ws-a")
+	for _, dir := range []string{leftover, copied} {
+		if err := os.MkdirAll(filepath.Join(dir, "objects", "info"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wk, err := workspace.NewWorkers(1, w.svc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wk.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Errorf("the interrupted fork creation %s is still there (%v)", leftover, err)
+	}
+	if _, err := os.Stat(copied); err != nil {
+		t.Errorf("the copy %s was removed with it: %v", copied, err)
+	}
+}
+
 func TestWorkers_RunAtMostTheirNumberOfClonesFirstRecordedFirst(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
