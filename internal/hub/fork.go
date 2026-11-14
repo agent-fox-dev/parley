@@ -28,10 +28,21 @@ const forksHook = "forks"
 // the teardown collaborators registered on the workspace service. None is
 // registered here: without them every session_id is refused 400
 // unknown_session and every sandbox 404 sandboxes_disabled.
+//
+// The component is also the one place forks are removed: it is the fork
+// remover of the workspace service's teardown set, so that DELETE
+// /workspaces/:slug of a fork and the delete of a parent reach it, and it
+// removes what a fork owns through that set's RemoveOwned. The sandbox
+// feature registers its sandbox lifecycle on it (RegisterSandboxes) from
+// its own file; none is registered here, so a fork has no sandboxes to
+// delete. The pending discards of removed forks' repositories are a table
+// of their own, after the fork fields.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp
 	c.AddSchemaStep(fork.SchemaStep)
+	c.AddSchemaStep(fork.DiscardStep)
+	c.workspaces.Teardown().RegisterForkRemover(comp)
 	c.workspaces.RegisterForkView(comp.WorkspaceView)
 	c.workspaces.RegisterForkField("purpose", fork.PurposeField)
 	c.workspaces.RegisterForkField("auto_change", fork.AutoChangeField)
@@ -42,7 +53,8 @@ func composeForks(c *Composition) {
 	c.AddStartHook(forksHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := fork.Deps{Store: rt.Store, Workspaces: c.workspaces, Git: git, Events: c.Events(), Access: c.access,
-			Readable: c.access, Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx}
+			Readable: c.access, Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx,
+			Logger: rt.Logger}
 		for _, adjust := range c.forkAdjusters {
 			adjust(&d)
 		}

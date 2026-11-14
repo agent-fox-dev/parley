@@ -27,6 +27,8 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/secret"
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -52,6 +54,7 @@ type world struct {
 	forks      *fork.Component
 	workspaces *workspace.Service
 	events     *event.Component
+	secrets    *secret.Component
 
 	// dev and mia are the users' ids, devKey and miaKey their API keys,
 	// acme the org's id.
@@ -81,7 +84,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(time.Second / 2)}
 	compose := cfg.Compose
 	cfg.Now, cfg.Compose = w.clock, func(c *hub.Composition) {
-		w.forks, w.workspaces, w.events = c.Forks(), c.Workspaces(), c.Events()
+		w.forks, w.workspaces, w.events, w.secrets = c.Forks(), c.Workspaces(), c.Events(), c.Secrets()
 		if compose != nil {
 			compose(c)
 		}
@@ -610,4 +613,158 @@ func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (eve
 		return event.Record{}, errors.New("injected fault")
 	}
 	return e.Events.Emit(ctx, tx, in)
+}
+
+// secretKey is the current secret key of a removal world, so that a fork
+// can hold a secret.
+const secretKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
+// remover keeps what a fork's removal asked of the collaborators it calls:
+// registered in the teardown set as a remover of owned data and as the
+// session closer, and on the fork component as its sandbox collaborator. A
+// step fails while its fail flag is set; the event writer fails while fault
+// holds "event", and the discard of a fork's repository while failDiscard
+// is set.
+type remover struct {
+	store                                func() *sql.DB
+	mu                                   sync.Mutex
+	failRemove, failSandbox, failDiscard bool
+	removed                              []string
+	closed                               [][2]string
+	sandboxes                            []sandboxDelete
+	fault                                atomic.Value
+}
+
+// sandboxDelete is one call of the sandbox collaborator's delete, and
+// whether the fork's record existed when it was made.
+type sandboxDelete struct {
+	slug, reason       string
+	checkpoint, record bool
+}
+
+// set changes the remover under its lock.
+func (r *remover) set(fn func(*remover)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fn(r)
+}
+
+// take returns what the remover was asked since the last take and forgets
+// it: the slugs the remover of owned data was given, the (slug, reason)
+// pairs the session closer was, and the sandbox deletes.
+func (r *remover) take() (removed []string, closed [][2]string, sandboxes []sandboxDelete) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed, closed, sandboxes = r.removed, r.closed, r.sandboxes
+	r.removed, r.closed, r.sandboxes = nil, nil, nil
+	return removed, closed, sandboxes
+}
+
+func (r *remover) remove(_ context.Context, _ *sql.Tx, slug string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.removed = append(r.removed, slug)
+	if r.failRemove {
+		return errors.New("injected remover fault")
+	}
+	return nil
+}
+
+func (r *remover) CloseSessions(_ context.Context, _ *sql.Tx, slugs []string, reason string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range slugs {
+		r.closed = append(r.closed, [2]string{s, reason})
+	}
+	return nil
+}
+
+func (r *remover) DeleteSandboxes(ctx context.Context, slug, reason string, checkpoint bool) error {
+	_, found, err := fork.BySlug(ctx, r.store(), slug)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sandboxes = append(r.sandboxes, sandboxDelete{slug, reason, checkpoint, found})
+	if r.failSandbox {
+		return errors.New("injected sandbox fault")
+	}
+	return nil
+}
+
+func (r *remover) HasLiveSandbox(context.Context, string) (bool, error) { return false, nil }
+
+// newRemovalWorld is a world with a current secret key whose fork removals
+// call r as their collaborators.
+func newRemovalWorld(t *testing.T) (*world, *remover) {
+	t.Helper()
+	r := &remover{}
+	w := newWorldWith(t, hubtest.Config{Env: map[string]string{secret.EnvCurrentKey: secretKey}, Compose: func(c *hub.Composition) {
+		c.Workspaces().Teardown().RegisterRemover(r.remove)
+		c.Workspaces().Teardown().RegisterSessionCloser(r)
+		c.Forks().RegisterSandboxes(r)
+		c.AdjustForks(func(d *fork.Deps) {
+			d.Events = faultyEvents{d.Events, &r.fault}
+			d.RemoveRepo = func(dir string) error {
+				r.mu.Lock()
+				fail := r.failDiscard
+				r.mu.Unlock()
+				if fail {
+					return errors.New("injected discard fault")
+				}
+				return gitrepo.Remove(dir)
+			}
+		})
+	}})
+	r.store = w.Store.Main
+	return w, r
+}
+
+// held is what a fork of a removal world holds: its own branch task at
+// task, the PAT of dev bound to it (pat, with the id patID) with
+// workspaces:read, and the secret K.
+type held struct {
+	slug, task, pat, patID string
+	expires                time.Time
+}
+
+// seedHeld seeds the fork slug as seedFork does, with edit, and gives it
+// what held names.
+func (w *world) seedHeld(t *testing.T, slug string, edit ...func(*fork.Fork)) held {
+	t.Helper()
+	f := w.seedFork(t, slug, edit...)
+	h := held{slug: slug, task: w.commit(t, slug, "task", f.ForkPoint.SHA), expires: *f.ExpiresAt}
+	h.pat, h.patID = w.pat(t, slug, nil, "workspaces:read")
+	w.insert(t, func(tx *sql.Tx) error {
+		return w.secrets.Put(context.Background(), tx, secret.ScopeWorkspace, slug, "K", "value")
+	})
+	return h
+}
+
+// whole fails the test unless the fork of h is as seedHeld left it: its
+// record answered, its token authenticating, its secret stored and its own
+// branch at its commit.
+func (w *world) whole(t *testing.T, h held) {
+	t.Helper()
+	if got := w.get(t, w.devKey, "/workspaces/"+h.slug).object(t, http.StatusOK)["expires_at"]; got != timefmt.Format(h.expires) {
+		t.Errorf("expires_at of %s = %v, want %s", h.slug, got, timefmt.Format(h.expires))
+	}
+	if r := w.get(t, h.pat, "/workspaces/"+h.slug); r.status != http.StatusOK {
+		t.Errorf("GET %s with the bound token = %d %s, want 200", h.slug, r.status, r.body)
+	}
+	if n, err := w.secrets.Count(context.Background(), secret.ScopeWorkspace, h.slug); err != nil || n != 1 {
+		t.Errorf("secrets of %s = %d, %v, want 1", h.slug, n, err)
+	}
+	if got := w.head(t, w.workspaces.RepoPath(h.slug), "task"); got != h.task {
+		t.Errorf("branch task = %q, want %s", got, h.task)
+	}
+}
+
+// deleteEvents are the parley.workspace.delete events of the workspace slug.
+func (w *world) deleteEvents(t *testing.T, slug string) []event.Record {
+	t.Helper()
+	return slices.DeleteFunc(w.eventsOf(t, "parley.workspace.delete"), func(r event.Record) bool {
+		return r.Workspace == nil || *r.Workspace != slug
+	})
 }

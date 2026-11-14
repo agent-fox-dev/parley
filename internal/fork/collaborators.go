@@ -59,3 +59,20 @@ func (c *Component) RegisterSessionLinker(l SessionLinker) { c.linker = l }
 // RegisterSandbox makes s the sandbox component of the create; nil removes
 // it. It is called while the hub is composed, before it serves.
 func (c *Component) RegisterSandbox(s SandboxCreator) { c.sandbox = s }
+
+// SandboxLifecycle is the sandbox component as a fork's removal and its
+// early expiry ask it. The sandbox feature registers it on the component;
+// without one a fork has no sandboxes.
+type SandboxLifecycle interface {
+	// DeleteSandboxes deletes every sandbox of the workspace slug, giving
+	// reason, and saves a checkpoint of each first when checkpoint is set.
+	// An error leaves the fork in place.
+	DeleteSandboxes(ctx context.Context, slug, reason string, checkpoint bool) error
+	// HasLiveSandbox reports whether the workspace slug has a sandbox in
+	// state provisioning or ready.
+	HasLiveSandbox(ctx context.Context, slug string) (bool, error)
+}
+
+// RegisterSandboxes makes s the sandbox lifecycle of a fork's removal; nil
+// removes it. It is called while the hub is composed, before it serves.
+func (c *Component) RegisterSandboxes(s SandboxLifecycle) { c.sandboxes = s }

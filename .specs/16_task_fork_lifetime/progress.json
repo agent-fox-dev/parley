@@ -3,7 +3,7 @@
   "spec_id": "16",
   "spec_name": "task_fork_lifetime",
   "schema_version": 3,
-  "updated_at": "2026-11-14T17:44:47Z",
+  "updated_at": "2026-11-14T18:02:09Z",
   "tasks": [
     {
       "id": 1,
@@ -11,7 +11,7 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
