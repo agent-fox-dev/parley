@@ -15,6 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -460,6 +461,11 @@ loaded configuration before any store is opened, for rules that span more
 than one key or section, and `addVersionMember(func() map[string]any)` adds
 members to the document of `GET /version` (the server's
 `Options.VersionMembers`), after the build's.
+
+`(*Composition).Events()` returns the `*event.Component` that `composeEvents`
+(`internal/hub/events.go`) creates: a part keeps it when it is composed and
+emits through it from its start hook on, if it is listed after
+`composeEvents`, or from `Options.Compose` (see [Hub events](#hub-events)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -1347,8 +1353,258 @@ takes the orgs it has read and looks a parent up among the records it has
 collected, which hold every repository the user has a level on, so a parent
 that is not among them is one the user has no level on. A workspace is
 therefore in a user's set exactly when `Level` resolves a level other than
-`LevelNone` for it, with that level. No production code calls `Readable`
-yet; the workspace list, the event stream and the audit query will.
+`LevelNone` for it, with that level. The visibility decision of the hub
+events calls `Readable` (see [Hub events](#hub-events)); the workspace list
+and the audit query will.
+
+### Hub events
+
+`internal/hub/events.go` adds the part `composeEvents`, after `composeAccess`
+in `parts`. It creates a zero `event.Component`, adds the schema step
+`event.SchemaStep` (`hub_events`) and binds the component in the start hook
+`events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
+Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...,
+Shutdown: c.ShuttingDown(), Authenticate: c.identity.Authenticate,
+MaxStreams: ..., Retention: ...}`, the fork-parent lookup being
+`access.RecordBySlug` read in the emitting transaction, `c.access` the
+`*access.Service` that `composeAccess` creates and keeps on the composition,
+the memberships the same `identity.ActiveOrgIDs` source that service is bound
+to, `Shutdown` the hub's shutdown notification, which releases the
+requests the component holds, `Authenticate` the identity service's
+authenticator, with which a stream checks its credential again at every
+heartbeat, and `MaxStreams` and `Retention` the `[events]` settings
+`event.SettingsFrom(rt.Config)` reads. The part registers the keys of
+`[events]` with `event.Register` (`internal/event/config.go`) when it is
+composed: `retention`, a string read with `timefmt.ParseDuration`, at least
+`1h`, default `30d`, and `max_sse_connections`, an integer of at least 1,
+default 500; a value that breaks its rule fails the load with an error that
+names the key, so the hub exits with status 1 before it listens.
+`(*Component).Retention()` returns the loaded retention for the retention
+run. The part registers the routes of
+`(*Component).Routes()` with `AddRoute` when it is composed. `Bind` reads
+`last_seq`, and its error fails the start. The start hooks that run after it,
+those of the parts listed after `composeEvents` and of `Options.Compose`, may
+emit before the hub listens; a call made before the component is bound
+returns an error. The part also registers the background work `events`
+(grace one second), which runs `(*Component).Run` until the stop, so the
+stop waits for it before the stores close
+([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)).
+
+The step creates three tables in the transactional store:
+
+- `hub_events`, one row per committed event, keyed by `seq`, with the
+  record's fields, `metadata` as JSON text and `parent_slug`, the parent of a
+  task fork, which no consumer sees; indexes on `(workspace, seq)` and on
+  `time`, which is stored as the text `timefmt.Format` writes;
+- `hub_event_seq`, one row with `last_seq`, the last `seq` assigned, starting
+  at 0;
+- `hub_event_log_bound`, one row with `oldest_seq`, the lowest `seq` the log
+  addresses, starting at 1.
+
+`(*Component).Emit(ctx, tx, in)` stores one event inside `tx`, the caller's
+transaction of `(*store.Store).Tx`, so the event commits or rolls back with
+the state change it reports. It validates `in` first and writes nothing on a
+refusal, then increments `hub_event_seq` inside `tx` (the store runs one
+write transaction at a time, so commit order is `seq` order; a rolled-back
+transaction gives its number back, and deleting event rows never lowers the
+counter, across restarts too), takes a version 4 UUID as `id` (`uuid.NewV4`),
+the clock's time in UTC at whole seconds as `time` and the last segment of the
+type as `action`, and returns the stored `event.Record`. When `in.Parent` is
+empty and the workspace is a task fork, the parent's slug is read from the
+workspace record and stored with the event; a caller that deletes the fork's
+record before it emits passes `Parent` itself. `(*Component).EmitNow(ctx,
+in)` runs `Emit` in a transaction of its own, for what is not a store change.
+
+An `event.Input` is refused with an error wrapping `event.ErrInvalidEvent`
+whose text names the field (`invalid event: <field>: <reason>`) when: `type`
+does not begin with `parley.`, has fewer than three dot-separated segments or
+an empty one; `workspace` is an empty string; `resource_type` or
+`resource_id` is empty; `actor_type` is not one of `admin_token`, `api_key`,
+`pat`, `forge` and `system`; `actor_id` is missing or empty for `api_key` and
+`pat`, or present for the other three; `session_id` is not a UUID in the
+8-4-4-4-12 form (it is stored in lower case); or `metadata` is not a JSON
+object (`Metadata` is anything `encoding/json` encodes, nil and JSON null
+being `{}`). Every failure to write returns an error that is not
+`ErrInvalidEvent`; a route that returns it answers `500 internal`.
+
+A `Record` marshals to one line with exactly the members `seq`, `id`, `type`,
+`time`, `workspace`, `actor_type`, `actor_id`, `resource_type`,
+`resource_id`, `action`, `session_id` and `metadata`, in that order: `null`
+for an absent `workspace`, `actor_id` or `session_id`, an object for
+`metadata` and `time` as `timefmt.Format` writes it.
+
+Metadata leaves the hub with every event, so `Emit` passes every string value
+of it, at any depth (object values and array elements, not member names),
+through `Deps.Scrubber`, the hub's scrubber, before the row is written: URL
+user information and registered secret values are removed and the string is
+cut to 1024 bytes. Member names, numbers (kept as written), booleans and
+`null` are written back unchanged, in their order. The record `Emit` returns
+holds the scrubbed metadata, the same the log serves.
+
+The component cannot tell which metadata member is a list of paths, so an
+emitting package builds one with `event.PathList(meta, key, paths)`: it stores
+the first 100 paths, in their order, under `key`, and sets `truncated` to
+`true` only when it cut the list. Other lists in metadata are stored whole.
+
+The event log is read by position
+([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)).
+`(*Component).Bounds(ctx)` returns `event.Bounds{OldestSeq, LastSeq}`, both 0
+while no event was ever written; `LastSeq` is the counter, not the highest
+stored row, and `OldestSeq` is `hub_event_log_bound`, 1 until something has
+expired. `(*Component).ReadAfter(ctx, after, limit)` returns the events
+with a higher `seq` than `after`, ascending, at most `limit` (all when
+`limit` <= 0), and the position examined: the last record's `seq` when the
+limit was reached, else `last_seq`. When `after` is below `oldest_seq` minus
+1, at least one event after it has left the log, and it returns no record
+but an `*event.PositionExpiredError` carrying `OldestSeq`, which matches
+`event.ErrPositionExpired`, so a caller never misses events without knowing.
+The routes read the log through the same function, which also returns the
+bounds of its snapshot. The bounds and the
+records are read in one read-only transaction, which begins without the write
+lock and sees one snapshot. Since commit order is `seq` order, every read is a
+gap-free run of the log, also while other transactions emit.
+
+`(*Component).Expire(ctx, cutoff)` makes the events older than `cutoff`
+leave the log: in a write transaction it sets `oldest_seq` to the lowest
+`seq` whose `time` is not older than `cutoff`, or to `last_seq` when every
+event is older, so the newest event stays. It never lowers the bound, deletes
+no row, does nothing on an empty log (returning 0), and returns the new
+`oldest_seq`. Its schedule is the retention run's.
+
+`(*Component).Run(ctx)` follows the commits. The store has no after-commit
+hook, so while anything waits it reads `last_seq` every 100 ms of real time,
+and at once when `Emit` or `EmitNow` kicks it. While nothing waits, it reads
+nothing. When `last_seq` has risen it counts the new events by type, calls the
+callbacks registered with `(*Component).OnCommit(fn)` with each new record,
+in `seq` order, from its one goroutine, and wakes the waiters. A waiter (the
+stream and the long-poll) takes a channel from the unexported
+`waitAfter(position)`. The channel is closed once a commit of a higher `seq`
+has been observed, and in any case within a second. The waiter then reads the
+log by position again, so a missed wake-up delays an event and never loses it.
+When its context ends, `Run` wakes every waiter and returns.
+
+`(*Component).Counters()` returns `event.Counters{LastSeq, OpenStreams,
+WrittenByType}`. It first catches up with the commits itself, so the answer
+is exact. `WrittenByType` counts the events committed since the bind, by
+type; a rolled-back emit is never counted. `OpenStreams` counts the stream
+places taken with the unexported `takePlace(limit)`, which refuses once
+`limit` are taken, and not yet given back with `givePlace()`; the limit of
+the stream is `Deps.MaxStreams`, none when it is 0.
+
+`internal/event/visibility.go` decides who may see an event, at the time it
+is delivered. `(*Component).Visible(ctx, caller, rec)` returns `(bool,
+error)` for an `event.Caller{Admin, UserID, CredentialID, Workspace}`, where
+`Workspace` is the binding of a workspace-bound PAT and `""` otherwise;
+`event.CallerOf(r)` builds it from `server.CallerOf` and
+`identity.PrincipalOf` (the zero `Caller`, who sees nothing, on a public
+route). The rules:
+
+- the admin token sees every event, also one of a workspace that no longer
+  exists; a caller with no user sees none;
+- an event of a workspace is seen by a user whose level, from the readable
+  set of `Deps.Access` (`access.Service.Readable`), is `admin`, `owner` or
+  `member` on the workspace or on the fork parent stored with the event, so a
+  fork's events stay visible to the parent's readers after the fork's record
+  is deleted. A slug with no record gives no level. The types beginning with
+  `parley.secret.`, `parley.token.` or `parley.webhook.` need `owner` or
+  `admin` there (`parley.forge.webhook.set` is not one of them);
+- an event of no workspace is seen by the user whose id is
+  `metadata.scope_id` when `metadata.scope` is `user`, by the members of the
+  active org `metadata.scope_id` names when it is `org` (asked through
+  `Deps.Memberships`, the access rule's own membership question, so a blocked
+  org grants nothing), and by nobody else when there is no other scope;
+- a workspace-bound PAT never sees an event of no workspace. It sees an event
+  of a workspace its binding covers, asked through the `event.Coverage`
+  installed with `(*Component).SetCoverage`, under its user's level. A token
+  bound to a task fork also sees, under its user's level, the events of the
+  fork's parent whose `resource_type` is `change` and whose change, numbered
+  `resource_id`, has the fork as its source, asked through the
+  `event.ChangeSources` installed with `(*Component).SetChangeSources`.
+  Without a covered set a bound token sees nothing; without a change lookup
+  it sees none of the parent's events. Nothing installs either yet, so a
+  bound token sees no event.
+
+A read that fails returns `false` with the error, never a grant. The
+covered set and the change lookup are kept apart from `Deps`, so the bind in
+the start hook does not reset what a part installed when it was composed. A
+batch of events (a page of the log, a stream delivery) is decided by one
+unexported viewer, which reads the readable set and the active orgs at most
+once each, when an event first needs them, asks the coverage once per
+distinct slug and the change sources once per distinct change of the batch,
+and is dropped with the batch, so a change of access takes effect at
+the next delivery. `(*Component).VisibleToOwnerOf(ctx, workspace, rec)`, the
+form event webhooks use, is true exactly for the events whose workspace, or
+stored fork parent, is `workspace`, of every type, and reads nothing.
+
+The component's `event.Clock` has `Now()` and `NewTimer(d)`, so that tests
+control the time events are stamped with and the timers of the waits;
+`event.SystemClock(now)` is the hub's.
+
+`internal/event/poll.go` serves `GET /api/v1/events/log` (see
+[the API reference](api.md#get-apiv1eventslog)), declared with the scope
+`audit:read` and no access mark. It parses `limit` itself rather than through
+`server.ReadPage`, which would read `cursor` as the generic list's opaque
+cursor, where here it is another name for `after`. The request parsing the
+two event routes share is in `internal/event/filter.go`: the query string,
+the filters `workspace`, `types` and `session_id` with their matcher (all
+filters together, any one `types` entry), and a resume position. A page is
+collected by reading the log after the position in batches of 200, each in
+one snapshot with the bounds, so `next_after` and `last_seq` agree, keeping
+the events that match and that one viewer decides visible, until `limit`
+items or the end of the log. An empty page with `wait` above 0 waits on
+`waitAfter`, a timer of the component's clock, the request's context and
+`Deps.Shutdown`, and reads the log again after every wake-up; when the timer
+fires it reads once more, so `next_after` is the position the log holds then.
+The page is written without HTML escaping, so its items are the bytes of
+`Record`'s JSON form.
+
+`internal/event/stream.go` serves `GET /api/v1/events` (see
+[the API reference](api.md#get-apiv1events)), declared with the scope
+`audit:read`, no access mark and the route's own `Cache-Control: no-cache`.
+It reads the filters with the same parsing as the log, and the resume
+position from the `Last-Event-ID` header, which wins, or from `after`;
+without either it starts at `last_seq` at open. It takes a stream place
+(`takePlace(Deps.MaxStreams)`) before it answers, and when none is free
+answers `503 unavailable` with `Retry-After: 5`; it gives the place back
+when the stream ends, for any reason. It answers `200` with
+`Content-Type: text/event-stream` and starts a writer goroutine. Between the
+handler and the writer is the stream's outbox: the handler queues frames,
+the writer writes them in order and flushes whenever the outbox is empty, so
+a client that reads slowly holds up neither the heartbeats nor the checks.
+The handler queues a heartbeat at once and then runs one loop: it reads the
+log after the stream's position in batches of 200 through the same snapshot
+read as the log, queues each event that matches the filters and that one
+viewer per batch decides visible as a `hub_event` frame, and moves the
+position to the position examined, also past the events it did not send.
+Replay and live delivery are this same loop, so there is no gap and no
+repeat between them. When the log has nothing further it waits on
+`waitAfter`, one timer on the component's clock, the request's context,
+`Deps.Shutdown` and the writer's failure. The timer is due at the next
+heartbeat, 30 seconds after the previous one, or earlier when the write
+under way reaches 60 seconds before that. At a heartbeat the handler first
+authenticates the original request again with `Deps.Authenticate`; a
+credential that no longer authenticates ends the stream before any further
+frame is queued. It then reads the log once more and queues the heartbeat,
+whose `seq` is the position examined.
+
+The stream ends when the client goes away, the hub begins to stop, the
+credential no longer authenticates, an event is due while 256 events wait in
+the outbox (the event is not queued, so nothing is dropped from the open
+stream), or the write under way, which the writer stamps with the
+component's clock, has not completed for 60 seconds. On every end the handler
+stops the writer and waits for it, so nothing writes to the response after
+the handler returns; a write that is blocked on a client that does not read
+is ended first with a write deadline in the past through
+`http.ResponseController`, so a stop never waits for a client. The one
+exception is a response that cannot take a write deadline while a write is
+under way: the handler then returns without waiting, rather than wait on the
+client, and the writer ends after that write without writing another frame.
+A read that fails after the answer began ends the stream too, and the server
+logs the error. So does a read that finds the stream's position below
+`oldest_seq` minus 1, because events after it left the log since the
+previous read: the stream ends without another frame and without a log
+line, rather than skip them, and the client that resumes with the last `id`
+it received is refused `410` `cursor_expired`.
 
 ### The logger
 

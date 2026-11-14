@@ -339,6 +339,7 @@ Usage:
 
 Available Commands:
   admin       Administer the hub's users, organizations, API keys and access tokens
+  events      Follow the hub's events, or read them a page at a time
   help        Print the help of parley or of a command
   keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
@@ -531,7 +532,9 @@ sent as `%2E` or `%2E%2E`.
 
 Each request has 30 seconds to complete, from connecting to reading the
 whole answer, unless the command states another timeout (`parley version`:
-5 seconds; the callback of `parley login`: 60 seconds). A request that has
+5 seconds; the callback of `parley login`: 60 seconds; `parley events
+list`: 30 seconds plus its `--wait`; `parley events tail`: none, see
+[`parley events`](#parley-events)). A request that has
 not completed by then is abandoned with a `client_error`:
 
 ```json
@@ -548,7 +551,9 @@ Every request is sent exactly once. `parley` does not send it again after
 a `429`, a `5xx`, a timeout or a broken connection, does not act on
 `Retry-After`, and does not follow a redirect; the error goes to stderr and
 the command ends with its exit status, so a script decides whether to try
-again.
+again. The one exception is `parley events tail`, which follows a stream
+until it is interrupted and connects again by itself (see
+[`parley events`](#parley-events)).
 
 A hub that cannot be reached (the connection is refused, the host name does
 not resolve, the TLS handshake fails) is a `client_error` whose message
@@ -1151,10 +1156,150 @@ stderr as received, with exit status `1`; on a hub without sandboxes:
 `parley sandbox` run without a command prints its help and exits `0`; it
 reads no credential and sends no request.
 
+### `parley events`
+
+`parley events tail` follows the hub's event stream,
+`GET /api/v1/events` (see [api.md](api.md#get-apiv1events)), with the
+credential as `Authorization: Bearer` and `Accept: text/event-stream`, and
+runs until it is interrupted. `parley events list` reads one page of the
+event log, `GET /api/v1/events/log` (see
+[api.md](api.md#get-apiv1eventslog)). `parley events` run without a command
+prints its help and exits `0`; it reads no credential and sends no request.
+
+Both commands take these flags:
+
+| Flag | Query parameter |
+|---|---|
+| `--workspace <slug>` | `workspace`: only the events of this workspace |
+| `--types <types>` | `types`: only the events of these comma-separated types; an entry ending in `*` matches every type that begins with the text before it |
+| `--session <id>` | `session_id`: only the events of this agent session |
+| `--after <seq>` | `after`: only the events with a higher `seq`, the position to resume from |
+
+A flag that is given is sent as given, an empty value included, and the
+hub judges it; a flag that is not given is not sent, so without `--after`
+the request has no `after`: the stream starts with the events committed
+after it opens, and the page with the oldest event in the log. `--after`
+takes a non-negative integer; any other value (`-1`, `x`, `1.5`) is a
+`usage_error` with exit status `2`, and nothing is sent:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "invalid argument \"-1\" for \"--after\" flag: want a non-negative integer, such as 4",
+    "error_type": "usage_error"
+  }
+}
+```
+
+#### `parley events tail`
+
+The request has no timeout. For each `hub_event` frame the command writes
+the frame's `data`, the event record exactly as the hub sent it, followed
+by a newline, to stdout, so stdout holds one line of compact JSON per
+event in the order received, and nothing else; a heartbeat prints nothing:
+
+```
+{"seq":5,"id":"…","type":"parley.change.open","time":"2026-11-14T09:30:20Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"42","action":"open","session_id":null,"metadata":{}}
+{"seq":6,"id":"…","type":"parley.change.open","time":"2026-11-14T09:30:41Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"43","action":"open","session_id":null,"metadata":{}}
+```
+
+The command remembers the `id` of the last frame it received, heartbeats
+included, as its resume position. When the stream ends in any other way
+than an interrupt (the connection closes or fails, the hub cannot be
+reached, or the hub answers a status other than `200`, `400`, `401`, `403`,
+`404` and `410`: a `503` when every stream place is taken, a `429`, any
+other `5xx`), the command writes one progress line to stderr, waits and
+connects again with `after` set to that position (or to `--after`, or
+without `after`, when no frame was received yet):
+
+```
+reconnecting in 1s: the stream ended
+reconnecting in 2s: cannot reach the hub at http://127.0.0.1:8080: dial tcp 127.0.0.1:8080: connect: connection refused
+reconnecting in 4s: the hub answered 503
+```
+
+The wait is 1 second before the first attempt and twice as long before
+each further one, up to 30 seconds (1, 2, 4, 8, 16, 30, 30, … seconds);
+`Retry-After` does not change it. After a connection that delivered at
+least one frame it is 1 second again. An event is printed only when its
+`seq` (the frame's `id`) is higher than that of the last event printed, so
+an event the hub sends again after a reconnect is not printed twice.
+
+An interrupt (`SIGINT`, Ctrl-C) ends the stream; the command exits `0`
+and writes nothing more. The hub's answers `400`, `401`, `403`, `404` and
+`410` end the command without another request: the error envelope is
+written to stderr as received, `oldest_seq` of a `410` `cursor_expired`
+included, after any progress lines, and the exit status is `1`. Such an
+answer without an error envelope is a `client_error` (`the hub answered 404
+without an error envelope`) with exit status `2`, and so is a line of the
+stream longer than 8 MiB (8388608 bytes), which would come again on every
+reconnect.
+
+#### `parley events list`
+
+`parley events list` also takes two flags of its own, each sent only when
+given:
+
+| Flag | Query parameter |
+|---|---|
+| `--limit <n>` | `limit`: the most events the page holds; the hub's default, 50, when not given |
+| `--wait <seconds>` | `wait`: how long the hub may hold the request while there is no event to return |
+
+Both take an integer; a value that is not one (`--limit x`) is a
+`usage_error` with exit status `2`, and nothing is sent. An integer is sent
+as given, also one the hub refuses (`--limit 0`, `--wait 61`), so the hub's
+`400` names what is wrong with it.
+
+The command sends exactly one request. Its timeout is 30 seconds plus the
+`--wait` seconds (75 seconds with `--wait 45`), so a page the hub holds back
+for the whole wait is still received. The hub's page is printed on stdout as
+one JSON document indented by two spaces, like every result (see
+[Output](#output)), and the exit status is `0`:
+
+```json
+{
+  "items": [
+    {
+      "seq": 5,
+      "id": "…",
+      "type": "parley.change.open",
+      "time": "2026-11-14T09:30:20Z",
+      "workspace": "api",
+      "actor_type": "pat",
+      "actor_id": "u_1",
+      "resource_type": "change",
+      "resource_id": "42",
+      "action": "open",
+      "session_id": null,
+      "metadata": {}
+    }
+  ],
+  "next_cursor": null,
+  "next_after": 5,
+  "oldest_seq": 1,
+  "last_seq": 5
+}
+```
+
+To read the next page, run the command again with `--after` set to
+`next_after`. An error the hub answers (`400` for a parameter it refuses,
+`404` for a `workspace` the caller may not read, `410` `cursor_expired` for
+a position older than the log) is written to stderr as received,
+`oldest_seq` of a `410` included, nothing is written to stdout, and the
+exit status is `1` (see [Errors and exit statuses](#errors-and-exit-statuses)).
+
+| Command | Request |
+|---|---|
+| `parley events tail [--workspace <slug>] [--types <types>] [--session <id>] [--after <seq>]` | `GET /api/v1/events` with the query parameters of the flags given |
+| `parley events list [--workspace <slug>] [--types <types>] [--session <id>] [--after <seq>] [--limit <n>] [--wait <seconds>]` | `GET /api/v1/events/log` with the query parameters of the flags given |
+
 ### Output
 
 stdout carries exactly one JSON document, indented by two spaces and
-followed by one newline, or nothing. A command that calls one route prints
+followed by one newline, or nothing, except for `parley events tail`,
+which prints one line per event (see [`parley events`](#parley-events)).
+A command that calls one route prints
 the hub's answer to a `2xx` status as that document. The body is indented
 again without being decoded, so the order of its members and the text of
 its numbers stay as the hub sent them: the hub's
@@ -1298,10 +1443,15 @@ operation, which goes on on the hub.
 
 stdout carries the result, and nothing on a failure, except the result a
 `--fail-on-…` condition held in and the final record of a wait that ended
-in a state that is not a success (`wait_failed`, see [Waiting](#waiting)).
+in a state that is not a success (`wait_failed`, see [Waiting](#waiting)),
+and the events `parley events tail` printed before an error ended it (see
+[`parley events`](#parley-events)).
 Every error goes to stderr as one error
 envelope, a JSON document indented by two spaces and followed by a newline,
-and nothing else: no usage text follows it. An error envelope the hub
+and nothing else: no usage text follows it. The only other lines on stderr
+are the progress lines of a wait (see [Waiting](#waiting)) and the
+`reconnecting in …` lines of [`parley events tail`](#parley-events-tail),
+which come before any error envelope. An error envelope the hub
 answered (a status of `400` or above whose body is a JSON object with an
 `error` member holding `error_type`) is written as the hub sent it, indented
 again by two spaces without being decoded: its `code` is the HTTP status,

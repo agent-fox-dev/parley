@@ -103,7 +103,11 @@ func (c *call) newClient(hubURL, credential string) *client {
 	if c.decl.Timeout > 0 {
 		timeout = c.decl.Timeout
 	}
-	return newClient(hubURL, credential, timeout)
+	cl := newClient(hubURL, credential, timeout)
+	if c.opts.transport != nil {
+		cl.http.Transport = c.opts.transport(cl.http.Transport)
+	}
+	return cl
 }
 
 // The annotations a declared command or a group carries.

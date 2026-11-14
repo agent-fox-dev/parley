@@ -78,6 +78,8 @@ It never quotes a variable's value.
 | `[logging].level` | string | `"info"` | `trace`, `debug`, `info`, `warn` or `error`, in any letter case; lines below it are not written |
 | `[logging].log_health_probes` | boolean | `false` | write an access-log line, at debug level, for requests to `/healthz` and `/readyz` |
 | `[limits].requests_per_minute` | integer | `600` | how many REST requests one credential, or one client address without a valid credential, may send in a window of 60 seconds; `0` turns the rate limit off (see [api.md](api.md#rate-limit)) |
+| `[events].retention` | string | `"30d"` | how long an event stays in the event log, which `GET /api/v1/events` and `GET /api/v1/events/log` read from: a whole number followed by `s`, `m`, `h` or `d`, at least `1h` (see [api.md](api.md#get-apiv1events)). The hub's retention run applies it; that run is not built yet, and until it runs no event leaves the log |
+| `[events].max_sse_connections` | integer | `500` | how many event streams (`GET /api/v1/events`) may be open at once; at least `1`. A stream beyond it is answered `503` with `Retry-After: 5`; held long-polls of `GET /api/v1/events/log` do not count (see [api.md](api.md#get-apiv1events)) |
 
 `[database].path` and `[workspace].path`, set or not, are resolved to
 absolute paths:

@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -19,20 +20,26 @@ import (
 // No remover is registered on the identity service: a workspace outlives
 // its owner's and its org's deletion, and a deleted org grants nothing
 // because its memberships go with it.
+// The service is kept on the composition, so that the event component
+// decides with the same rule and the same memberships.
 func composeAccess(c *Composition) {
 	svc := &access.Service{}
+	c.access = svc
 	c.AddSchemaStep(access.SchemaStep)
 	c.AddAccessCheck(svc.Check)
 	c.addRouteRule(refusePublicNeed)
 	c.AddStartHook("access", func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
-		svc.Bind(access.Deps{
-			Records: access.StoreRecords(db),
-			Memberships: access.MembershipsFunc(func(ctx context.Context, userID string) ([]string, error) {
-				return identity.ActiveOrgIDs(ctx, db, userID)
-			}),
-		})
+		svc.Bind(access.Deps{Records: access.StoreRecords(db), Memberships: activeOrgs(db)})
 		return nil
+	})
+}
+
+// activeOrgs is the membership question of the hub: the active orgs of a
+// user, which the identity service keeps in db.
+func activeOrgs(db *sql.DB) access.Memberships {
+	return access.MembershipsFunc(func(ctx context.Context, userID string) ([]string, error) {
+		return identity.ActiveOrgIDs(ctx, db, userID)
 	})
 }
 

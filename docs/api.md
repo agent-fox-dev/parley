@@ -1674,3 +1674,165 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
 | `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |
+
+## `GET /api/v1/events`
+
+Streams the hub events the caller may see as Server-Sent Events: first the
+events after a resume position, then, on the same connection, every event
+committed afterwards, in ascending `seq`, with no gap and no repeat between
+the two. The route declares the scope `audit:read` for a PAT, which
+`audit:write` satisfies; the admin token and API keys are not held to it. It
+has no workspace in its path.
+
+| Parameter | Meaning |
+|---|---|
+| `Last-Event-ID` (header) | the resume position: the stream sends the events with a higher `seq`. A non-negative integer, at most `last_seq`; it wins over `after`, which is then not looked at |
+| `after` | the resume position when there is no `Last-Event-ID` header, by the same rules. Without either, the stream starts at `last_seq` when it opens and sends only events committed after that |
+| `workspace`, `types`, `session_id` | the filters, as on [`GET /api/v1/events/log`](#get-apiv1eventslog) |
+
+Other query parameters are ignored. The parameters are checked as on
+[`GET /api/v1/events/log`](#get-apiv1eventslog), in the same order, and
+every refusal is answered before the stream begins, as the JSON error
+envelope; no stream is started. The answer is `200` with
+`Content-Type: text/event-stream` and `Cache-Control: no-cache`, and its first
+frame, sent at once, is a heartbeat. Each frame is three lines and an empty
+line:
+
+```text
+id: 3
+event: heartbeat
+data: {"time":"2026-11-14T09:30:15Z","seq":3}
+
+id: 4
+event: hub_event
+data: {"seq":4,"id":"…","type":"parley.change.open","time":"2026-11-14T09:30:20Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"42","action":"open","session_id":null,"metadata":{}}
+
+```
+
+| Frame | `id` | `data` |
+|---|---|---|
+| `hub_event` | the event's `seq` | the hub event record as stored, on one line, the same bytes as an item of the log |
+| `heartbeat` | the position up to which the log has been examined for this client | `time`, the hub's time at whole seconds in UTC, and `seq`, the same position |
+
+A heartbeat is sent when the stream opens and then every 30 seconds. Every
+visible, matching event at or below a heartbeat's `seq` was sent before it,
+and its `seq` rises with `last_seq` also when no event matched the filters or
+was visible, so a client that reconnects with the `id` of the last frame it
+received, as `Last-Event-ID`, resumes exactly where it stopped. An event
+committed while the stream is open is sent within a second of its commit.
+Events are decided with the caller's access at the time they are delivered,
+by the rules of the log.
+
+The stream ends, and the hub closes the connection, when:
+
+- the client closes the connection;
+- the hub begins to stop: every stream ends at once, also one whose client
+  is not reading;
+- at a heartbeat, the credential no longer authenticates, as a new request
+  with it would not (revoked, expired, or its user blocked): no further
+  frame is sent, so the stream ends at most 30 seconds after the change;
+- 256 events are waiting for a client that reads more slowly than they come
+  and another one is due;
+- a write to the client has not completed for 60 seconds;
+- the stream's position fell below `oldest_seq` minus 1 since its previous
+  read of the log, because events after it left the log while it was open:
+  no further frame is sent, rather than skip those events, and a reconnect
+  with the `id` of the last frame received is answered `410`
+  `cursor_expired` with `oldest_seq`.
+
+The hub never drops an event from an open stream: the `hub_event` frames a
+client received before the end are a gap-free prefix of the visible,
+matching events, and a reconnect with the `id` of the last frame received
+sends every later one.
+
+At most `[events].max_sse_connections` streams are open at once (see
+[configuration.md](configuration.md#keys)); a held long-poll of
+[`GET /api/v1/events/log`](#get-apiv1eventslog) does not count toward the
+limit. A stream gives its place back when it ends, for any reason.
+
+| Status | When |
+|---|---|
+| `200 OK` | the stream; an error after it began ends the connection. When the caller's access cannot be read while an event is decided, the stream ends without a frame for that event |
+| `400` `invalid_request` | a malformed filter, as on the log; an `after` or `Last-Event-ID` that is not a non-negative integer (`after must be a non-negative integer`, `Last-Event-ID must be a non-negative integer`) or is above `last_seq` (`after must not be greater than last_seq (10)`, `Last-Event-ID must not be greater than last_seq (10)`); or a query string that does not parse (`the query string is malformed`). No stream is started |
+| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`), before any parameter is looked at |
+| `404` `not_found` | a `workspace` the caller may not read, as on the log (`workspace not found`). No stream is started |
+| `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1, as on the log (`event cursor expired`, with `oldest_seq`). No stream is started |
+| `500` `internal` | the log's bounds or the caller's access could not be read before the stream began (`internal error`) |
+| `503` `unavailable` | `[events].max_sse_connections` streams are open (`too many event streams are open`), with the header `Retry-After: 5`. No stream is started |
+
+## `GET /api/v1/events/log`
+
+Answers one page of the event log: the hub events the caller may see, in
+ascending `seq`, after a resume position. The route declares the scope
+`audit:read` for a PAT, which `audit:write` satisfies; the admin token and API
+keys are not held to it. It has no workspace in its path.
+
+| Parameter | Meaning |
+|---|---|
+| `after` | the resume position: the page holds events with a higher `seq`. A non-negative integer from `oldest_seq` minus 1 to `last_seq` (0 on a hub that has written no event). Without it (and without `cursor`) the page starts at `oldest_seq`, the oldest event in the log |
+| `cursor` | another name for `after`; both may be given only with the same value |
+| `limit` | the most items the page holds: an integer from 1 to 200, 50 when absent |
+| `wait` | how long to hold the request when there is nothing to return: a whole number of seconds from 0 to 60, 0 when absent |
+| `workspace` | only events whose `workspace` is this slug. The caller must be able to read the workspace: the admin token may name any slug, also one whose workspace was deleted, and reads the events stored under it; a workspace-bound PAT only a workspace its binding covers (none yet: no covered set is installed, so every `workspace` a bound PAT sends is `404`); every other caller only a workspace on which it has a level |
+| `types` | only events whose `type` matches one of these comma-separated entries: an exact type, or a prefix ending in `*` that matches every type beginning with the text before it (`*` alone matches every type). At most 20 entries, none empty, with `*` only as an entry's last character |
+| `session_id` | only events whose `session_id` is this UUID, in any letter case |
+
+The filters apply together; a `types` entry no event has gives an empty
+page, not an error. Other query parameters are ignored. The request is
+checked in this order, and the first refusal is the answer: the scope of a
+PAT, the parameters, the resume position against the bounds of the log,
+then the `workspace` filter against the caller's access. A position below
+`oldest_seq` minus 1 means at least one event after it has left the log,
+and is refused with `410` whether or not the caller could have seen the
+events that left:
+
+```json
+{"error":{"code":410,"message":"event cursor expired","error_type":"cursor_expired","oldest_seq":6}}
+```
+
+```json
+{"items":[{"seq":11,"id":"…","type":"parley.change.open","time":"2026-11-14T10:30:15Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"42","action":"open","session_id":null,"metadata":{}}],"next_cursor":null,"next_after":120,"oldest_seq":11,"last_seq":120}
+```
+
+| Member | Value |
+|---|---|
+| `items` | the visible, matching events after the position, at most `limit`, each the hub event record as stored; `[]` when there is none, never `null` |
+| `next_after` | the position to send as `after` for the next page: the `seq` of the last item when the page holds `limit` items, else the position up to which the log was examined, which is then `last_seq` |
+| `next_cursor` | `next_after` as a string when the page holds `limit` items, else `null` |
+| `oldest_seq`, `last_seq` | the bounds of the event log when the page was read: the lowest `seq` the log holds and the last `seq` written, both 0 while no event was ever written |
+
+Following `next_after` from page to page returns every visible, matching
+event exactly once, also when the events in between are ones the caller may
+not see or the filters exclude. Items are decided with the caller's access at
+the time the page is read: the admin token sees every event; a user sees the
+events of a workspace on which, or on whose fork parent, it has a level
+(`owner` or `admin` for the types beginning with `parley.secret.`,
+`parley.token.` and `parley.webhook.`), and an event of no workspace when its `metadata.scope`
+is `user` with the user's id, or `org` with an active org the user is a
+member of. A workspace-bound PAT sees no event yet.
+
+**Long-poll.** With `wait` above 0 and nothing to return, the hub holds the
+request until a visible, matching event is committed, and then answers with
+it, within a second of the commit. An event the caller may not see or the
+filters exclude does not end the wait. When `wait` seconds have passed, the
+answer is `200` with `items` `[]` and `next_after` moved to the position
+examined, `last_seq` at that time. When the hub begins to stop, every held
+request is answered at once, `200` with `items` `[]`. A held request whose
+client goes away stops waiting.
+
+A position that was valid when the request was checked can fall below
+`oldest_seq` minus 1 before the page is read, when events after it leave the
+log while the request is held or its page is being collected. The answer is
+then `410` `cursor_expired` with `oldest_seq`, as for a position refused at
+once, and never a page that skips the events that left. A request without a
+position starts at the oldest event the log holds when its page is first
+read.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page of the log |
+| `400` `invalid_request` | a `types` with more than 20 entries (`types has more than 20 entries`), an empty value or an empty entry (`types has an empty entry`), or an entry with `*` anywhere but last (`types entry "parley.*.land" has a * that is not its last character`); a `session_id` that is not a UUID (`session_id must be a UUID`); a `limit` that is not an integer from 1 to 200 (`limit must be an integer from 1 to 200`), a `wait` that is not a whole number of seconds from 0 to 60 (`wait must be a whole number of seconds from 0 to 60`), an `after` or `cursor` that is not a non-negative integer (`after must be a non-negative integer`) or is above `last_seq` (`after must not be greater than last_seq (10)`), `after` and `cursor` with different values (`after and cursor name different positions`), or a query string that does not parse (`the query string is malformed`). Answered at once; nothing is held |
+| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`), before any parameter is looked at |
+| `404` `not_found` | a `workspace` the caller may not read (`workspace not found`): the same answer for an existing workspace and for a slug with no workspace |
+| `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1 (`event cursor expired`), with the member `oldest_seq`, a number; also when it falls below while the request is held or its page is read |
+| `500` `internal` | the log or the caller's access could not be read (`internal error`); no item is sent |
