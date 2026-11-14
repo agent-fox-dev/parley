@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -314,5 +315,279 @@ func TestOwnerDelete_RemovesTheOwnersSecretsInItsTransaction(t *testing.T) {
 				t.Errorf("after DELETE %s the %s scope %s holds %d secrets, want %d", s.path, p.scope, p.id, n, s.left[i])
 			}
 		}
+	}
+}
+
+func TestSecretsFromTheShell_StoreUpdateAndRemoveAWorkspaceSecret(t *testing.T) {
+	// The CLI reads its config file only for what the flags do not give.
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
+	w := newWorld(t)
+	values := []string{"ghp-first-5c2e91a7", "ghp-piped-8d40b3f6"}
+	ctx := context.Background()
+	var outputs []string
+	parley := func(stdin string, args ...string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		args = append(args, "--endpoint-url", w.URL(""), "--api-key", w.ownerKey)
+		if code := cli.RunWith(ctx, args, &stdout, &stderr, cli.Hooks{Stdin: strings.NewReader(stdin)}); code != 0 {
+			t.Fatalf("parley %v = %d, stderr %s", args, code, stderr.String())
+		}
+		outputs = append(outputs, stdout.String(), stderr.String())
+		return stdout.String()
+	}
+	read := func(want string, wantFound bool) {
+		t.Helper()
+		v, found, err := w.secrets.Get(ctx, secret.ScopeWorkspace, "acme", "GIT_PAT")
+		if err != nil || found != wantFound || v != want {
+			t.Fatalf("Get = %q, %v, %v; want %q, %v", v, found, err, want, wantFound)
+		}
+	}
+	listed := func() []map[string]json.RawMessage {
+		t.Helper()
+		var doc struct {
+			Items []map[string]json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(parley("", "secrets", "list", "--workspace", "acme")), &doc); err != nil {
+			t.Fatal(err)
+		}
+		return doc.Items
+	}
+	_, seq := w.eventsAfter(t, 0)
+
+	var created struct {
+		Results []struct {
+			Scope string `json:"scope"`
+			Items []struct {
+				Key string `json:"key"`
+			} `json:"items"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(parley("", "secrets", "create", "GIT_PAT="+values[0], "--workspace", "acme")), &created); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Results) != 1 || created.Results[0].Scope != "workspace" ||
+		len(created.Results[0].Items) != 1 || created.Results[0].Items[0].Key != "GIT_PAT" {
+		t.Fatalf("create printed %+v, want scope workspace with the item GIT_PAT", created)
+	}
+	read(values[0], true)
+	items := listed()
+	if len(items) != 1 || len(items[0]) != 3 || items[0]["key"] == nil || items[0]["created_at"] == nil || items[0]["updated_at"] == nil {
+		t.Fatalf("list printed %v, want one item of exactly key, created_at and updated_at", items)
+	}
+	parley(values[1]+"\n", "secrets", "update", "GIT_PAT", "--from-stdin", "--workspace", "acme")
+	read(values[1], true)
+	parley("", "secrets", "delete", "GIT_PAT", "--workspace", "acme")
+	if items := listed(); len(items) != 0 {
+		t.Fatalf("list after delete printed %v, want none", items)
+	}
+	read("", false)
+
+	recs, _ := w.eventsAfter(t, seq)
+	var types []string
+	for _, rec := range recs {
+		if strings.HasPrefix(rec.Type, "parley.secret.") {
+			if rec.ResourceID != "GIT_PAT" || !equalPtr(rec.Workspace, ptr("acme")) {
+				t.Errorf("event %s is about %s in %v, want GIT_PAT in acme", rec.Type, rec.ResourceID, rec.Workspace)
+			}
+			types = append(types, rec.Type)
+		}
+	}
+	if want := []string{"parley.secret.create", "parley.secret.update", "parley.secret.delete"}; fmt.Sprint(types) != fmt.Sprint(want) {
+		t.Errorf("secret events = %v, want %v", types, want)
+	}
+
+	dataDir, _ := w.Listening["data_dir"].(string)
+	w.Stop()
+	if code := w.ExitCode(t, 10*time.Second); code != 0 {
+		t.Fatalf("the hub stopped with %d, want 0", code)
+	}
+	sources := dataFiles(t, dataDir)
+	sources["the log"] = []byte(w.Log.String())
+	for i, out := range outputs {
+		sources[fmt.Sprintf("command output %d", i)] = []byte(out)
+	}
+	for where, content := range sources {
+		for _, v := range values {
+			if bytes.Contains(content, []byte(v)) {
+				t.Errorf("%s holds the value %s", where, v)
+			}
+		}
+	}
+}
+
+func TestKeyRotation_ReencryptsUnderTheNewKeyAndKeepsEverySecret(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("[server]\nbind = \"127.0.0.1\"\nport = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, keyA := newKey(t)
+	_, keyB := newKey(t)
+	envOf := func(vars map[string]string) config.Env {
+		m := map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir}
+		maps.Copy(m, vars)
+		return config.MapEnv(m)
+	}
+	ctx := context.Background()
+	if code := hub.Run(ctx, hub.Options{Args: []string{"--admin-email", "boss@example.com"},
+		Env: envOf(map[string]string{secret.EnvCurrentKey: keyA}), WorkDir: dir}); code != 0 {
+		t.Fatalf("bootstrap returned %d, want 0", code)
+	}
+	// The hub does not start while the token file of the bootstrap is there.
+	if err := os.Remove(filepath.Join(dir, "admin_token")); err != nil {
+		t.Fatal(err)
+	}
+	// run starts the hub with the variables vars until its first
+	// maintenance pass has ended, and returns it with its secret component
+	// and its store.
+	run := func(vars map[string]string) (*hubtest.Served, *secret.Component, *hub.Runtime) {
+		t.Helper()
+		var secrets *secret.Component
+		var rt *hub.Runtime
+		passEnded := make(chan struct{})
+		s := hubtest.Serve(t, hub.Options{Env: envOf(vars), WorkDir: dir, Compose: func(c *hub.Composition) {
+			secrets, rt = c.Secrets(), c.Runtime()
+			// Tasks registered after the hub's own run last in a pass.
+			c.AddMaintenanceTask("test-pass-end", func(context.Context, *hub.Runtime) error {
+				select {
+				case <-passEnded:
+				default:
+					close(passEnded)
+				}
+				return nil
+			})
+		}})
+		select {
+		case <-passEnded:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the first maintenance pass did not end within 5 s")
+		}
+		return s, secrets, rt
+	}
+	stop := func(s *hubtest.Served) {
+		t.Helper()
+		s.Stop()
+		if code := s.ExitCode(t, 10*time.Second); code != 0 {
+			t.Fatalf("the hub stopped with %d, want 0; log = %s", code, s.Log.String())
+		}
+	}
+	report := func(s *hubtest.Served, previous bool, undecryptable float64) {
+		t.Helper()
+		lines := logLines(t, s.Log.String(), "secret encryption")
+		if len(lines) != 1 || lines[0]["key_configured"] != true || lines[0]["previous_key_present"] != previous ||
+			lines[0]["undecryptable_secrets"] != undecryptable {
+			t.Fatalf("secret encryption lines = %v, want one with a key, previous %v, %v undecryptable", lines, previous, undecryptable)
+		}
+	}
+	places := []struct {
+		scope     secret.Scope
+		id, value string
+	}{
+		{secret.ScopeUser, "u1", "user-value-1d"}, {secret.ScopeOrg, "o1", "org-value-2e"},
+		{secret.ScopeWorkspace, "acme", "workspace-value-3f"},
+	}
+	listed := func(secrets *secret.Component) []secret.Item {
+		t.Helper()
+		var all []secret.Item
+		for _, p := range places {
+			items, err := secrets.ListPage(ctx, p.scope, p.id, "", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			all = append(all, items...)
+		}
+		return all
+	}
+
+	s, secrets, rt := run(map[string]string{secret.EnvCurrentKey: keyA})
+	err := rt.Store.Tx(ctx, func(tx *sql.Tx) error {
+		for _, p := range places {
+			if err := secrets.Put(ctx, tx, p.scope, p.id, "TOKEN", p.value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := listed(secrets)
+	stop(s)
+
+	s, _, _ = run(map[string]string{secret.EnvCurrentKey: keyB, secret.EnvPreviousKey: keyA})
+	report(s, true, 0)
+	if lines := logLines(t, s.Log.String(), "secret re-encryption"); len(lines) != 1 ||
+		lines[0]["converted"] != float64(3) || lines[0]["remaining"] != float64(0) {
+		t.Fatalf("secret re-encryption lines = %v, want one with converted 3 and remaining 0", lines)
+	}
+	stop(s)
+
+	s, secrets, _ = run(map[string]string{secret.EnvCurrentKey: keyB})
+	report(s, false, 0)
+	for _, p := range places {
+		if v, found, err := secrets.Get(ctx, p.scope, p.id, "TOKEN"); err != nil || !found || v != p.value {
+			t.Errorf("Get(%s %s) under the new key alone = %q, %v, %v; want %q", p.scope, p.id, v, found, err, p.value)
+		}
+	}
+	if after := listed(secrets); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Errorf("the entries after the rotation = %v, want them unchanged: %v", after, before)
+	}
+	stop(s)
+
+	s, secrets, _ = run(map[string]string{secret.EnvCurrentKey: keyA})
+	report(s, false, 3)
+	if n := len(listed(secrets)); n != 3 {
+		t.Errorf("under the old key alone %d entries are listed, want 3", n)
+	}
+	stop(s)
+}
+
+func TestOrgSecrets_AreSharedWhileAWorkspacesSecretsStayWithItsOwner(t *testing.T) {
+	w := newWorld(t)
+	_, seq := w.eventsAfter(t, 0)
+	steps := []struct {
+		cred, method, path string
+		body               any
+		want               int
+		errorType          string
+	}{
+		{w.memberKey, http.MethodPost, "/orgs/acme/secrets", entries(map[string]any{"key": "NPM_TOKEN", "value": "npm-7a1c"}), http.StatusCreated, ""},
+		{w.member2Key, http.MethodGet, "/orgs/acme/secrets", nil, http.StatusOK, ""},
+		{w.member2Key, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusForbidden, "forbidden"},
+		{w.ownerKey, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusOK, ""},
+		{w.outsiderKey, http.MethodGet, "/orgs/acme/secrets", nil, http.StatusNotFound, "not_found"},
+		{w.outsiderKey, http.MethodGet, "/workspaces/acme/secrets", nil, http.StatusNotFound, "not_found"},
+	}
+	var answers []answer
+	for _, s := range steps {
+		a := w.do(t, s.cred, s.method, s.path, s.body)
+		if a.status != s.want {
+			t.Fatalf("%s %s = %d %s, want %d", s.method, s.path, a.status, a.body, s.want)
+		}
+		if s.errorType != "" {
+			if et, _ := errorOf(t, a); et != s.errorType {
+				t.Errorf("%s %s error_type = %s, want %s", s.method, s.path, et, s.errorType)
+			}
+		}
+		answers = append(answers, a)
+	}
+	if keys := pageOf(t, answers[1]).keys(t); fmt.Sprint(keys) != "[NPM_TOKEN]" {
+		t.Errorf("the second member lists %v in the org, want [NPM_TOKEN]", keys)
+	}
+	if keys := pageOf(t, answers[3]).keys(t); len(keys) != 0 {
+		t.Errorf("the owner lists %v in the workspace, want none", keys)
+	}
+	recs, _ := w.eventsAfter(t, seq)
+	var scopes []string
+	for _, rec := range recs {
+		if strings.HasPrefix(rec.Type, "parley.secret.") {
+			var meta struct {
+				Scope string `json:"scope"`
+			}
+			_ = json.Unmarshal(rec.Metadata, &meta)
+			scopes = append(scopes, meta.Scope)
+		}
+	}
+	if fmt.Sprint(scopes) != "[org]" {
+		t.Errorf("the scopes of the secret events = %v, want exactly one, org", scopes)
 	}
 }
