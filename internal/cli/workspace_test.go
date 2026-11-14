@@ -3,7 +3,9 @@ package cli
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -124,6 +126,8 @@ func TestWorkspace_PrintsTheHubsRefusalAndFails(t *testing.T) {
 		{"create --wait", http.MethodPost, workspacesPath, createDemo("--wait"), http.StatusConflict, conflict},
 		{"get", http.MethodGet, demoPath, []string{"workspace", "get", "demo"}, http.StatusNotFound, notFound},
 		{"update", http.MethodPatch, demoPath, updateDemo("--description", "x"), http.StatusNotFound, notFound},
+		{"sync", http.MethodPost, syncPath, syncCommand(), http.StatusBadGateway, upstreamError},
+		{"sync --wait", http.MethodPost, syncPath, syncCommand("--wait"), http.StatusBadGateway, upstreamError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -177,6 +181,9 @@ func TestWorkspace_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"an update with a bad setting among good flags", updateDemo("--description", "x", "--setting", "novalue"), "--setting"},
 		{"a get without a slug", []string{"workspace", "get"}, "<slug>"},
 		{"an update without a slug", []string{"workspace", "update", "--description", "x"}, "<slug>"},
+		{"a sync without a slug", []string{"workspace", "sync"}, "<slug>"},
+		{"a sync of two slugs", syncCommand("other"), `"other"`},
+		{"a sync wait without time", syncCommand("--wait", "--timeout", "0s"), "--timeout"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -376,6 +383,288 @@ func TestWorkspaceListGetUpdate_SendExactlyWhatTheArgumentsAndFlagsName(t *testi
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			wantSends(t, tt.args, tt.want)
+		})
+	}
+}
+
+// The route parley workspace sync my-project posts to, and the one its
+// --wait reads the rebuild job j1 at, as sent.
+const (
+	syncPath = "/api/v1/workspaces/my-project/sync"
+	jobPath  = "/api/v1/workspaces/my-project/rebuilds/j1"
+)
+
+// The branches entries of a sync answer: one with the branch exp
+// diverged, and one with nothing diverged.
+const (
+	divergedBranches = `[{"name":"exp","result":"diverged","local_sha":"a1","origin_sha":"b1"},{"name":"main","result":"fast_forward","local_sha":"c1","origin_sha":"c1"}]`
+	calmBranches     = `[{"name":"main","result":"up_to_date","local_sha":"c1","origin_sha":"c1"}]`
+)
+
+// upstreamError is the hub's refusal of a sync that could not fetch origin.
+const upstreamError = `{"error":{"code":502,"message":"origin fetch failed: exit status 128","error_type":"upstream_error"}}`
+
+// syncCommand is the command line that syncs my-project, followed by more.
+func syncCommand(more ...string) []string {
+	return append([]string{"workspace", "sync", "my-project"}, more...)
+}
+
+// syncAnswer is the hub's answer to a sync of my-project: the workspace
+// with branches, a JSON array, followed by the members more holds.
+func syncAnswer(branches, more string) string {
+	return `{"slug":"my-project","kind":"repository","status":"ready","last_sync_at":"2026-11-14T10:00:00Z","sync_error":null,"branches":` + branches + more + `}`
+}
+
+// rebuildJob is the rebuild job j1 in status as the hub serves it the n-th
+// time, so that two records of one status differ.
+func rebuildJob(status string, n int) string {
+	return `{"id":"j1","workspace_slug":"my-project","status":"` + status + `","poll":` + strconv.Itoa(n) + `}`
+}
+
+// withRebuild is answer, a JSON object, with the member rebuild holding job
+// added after its own members.
+func withRebuild(answer, job string) string {
+	return strings.TrimSuffix(answer, "}") + `,"rebuild":` + job + `}`
+}
+
+// syncHub is a stub hub that answers the sync of my-project with answer and
+// the n-th read of the rebuild job j1 with jobs[n-1], the last of jobs
+// answering every later one too.
+func syncHub(t *testing.T, answer string, jobs ...http.HandlerFunc) *stubHub {
+	t.Helper()
+	hub := newStubHub(t).answer(http.MethodPost, syncPath, http.StatusOK, answer)
+	if len(jobs) > 0 {
+		hub.handle(http.MethodGet, jobPath, inTurn(jobs...))
+	}
+	return hub
+}
+
+// jobsInStatus are the answers of a syncHub's job reads: the n-th is j1
+// in statuses[n-1].
+func jobsInStatus(statuses ...string) []http.HandlerFunc {
+	jobs := make([]http.HandlerFunc, 0, len(statuses))
+	for i, status := range statuses {
+		jobs = append(jobs, answerWith(http.StatusOK, rebuildJob(status, i+1)))
+	}
+	return jobs
+}
+
+// runSync is runWorkspace that also returns, for each request the command
+// sent, how long it had before its deadline.
+func runSync(t *testing.T, hub *stubHub, args ...string) (int, string, string, []time.Duration) {
+	t.Helper()
+	opts := defaultOptions()
+	opts.pollInterval = 10 * time.Millisecond
+	var mu sync.Mutex
+	var left []time.Duration
+	opts.transport = func(next http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var d time.Duration
+			if at, ok := r.Context().Deadline(); ok {
+				d = time.Until(at)
+			}
+			mu.Lock()
+			left = append(left, d)
+			mu.Unlock()
+			return next.RoundTrip(r)
+		})
+	}
+	code, stdout, stderr := runCLIWith(t, opts, onHub(hub.URL, args...)...)
+	return code, stdout, stderr, left
+}
+
+// wantErrorType fails the test unless the last document on stderr is an
+// error envelope of errorType, and returns its message.
+func wantErrorType(t *testing.T, stderr, errorType string) string {
+	t.Helper()
+	_, message, got := clientEnvelope(t, lastDocument(stderr))
+	if got != errorType {
+		t.Errorf("stderr = %q, want an envelope with error_type %s", stderr, errorType)
+	}
+	return message
+}
+
+func TestWorkspaceSync_PostsAndPrints(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		args           []string
+		rawPath, query string
+	}{
+		{"a slug", syncCommand(), syncPath, ""},
+		{"--reset-to-origin", syncCommand("--reset-to-origin"), syncPath, "reset_to_origin=true"},
+		{"a slug with a slash", []string{"workspace", "sync", "a/b"}, "/api/v1/workspaces/a%2Fb/sync", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			answer := syncAnswer(calmBranches, "")
+			path, _ := url.PathUnescape(tt.rawPath)
+			hub := newStubHub(t).answer(http.MethodPost, path, http.StatusOK, answer)
+
+			code, stdout, stderr, left := runSync(t, hub, tt.args...)
+
+			if code != 0 || stderr != "" {
+				t.Errorf("exit status = %d, stderr %q; want 0 and nothing", code, stderr)
+			}
+			if want := indented(t, answer); stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			sent := hub.recorded()
+			if len(sent) != 1 {
+				t.Fatalf("the hub got %v, want one request", sent)
+			}
+			if got := sent[0]; got.method != http.MethodPost || got.rawPath != tt.rawPath || got.query != tt.query || got.body != "" {
+				t.Errorf("sent %s %s ?%q body %q, want POST %s ?%q and no body", got.method, got.rawPath, got.query, got.body, tt.rawPath, tt.query)
+			}
+			if len(left) != 1 || left[0] <= 3*time.Minute-10*time.Second || left[0] > 3*time.Minute {
+				t.Errorf("the request had %v before its deadline, want 3 minutes", left)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSync_FailOnDiverged(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		flag   bool
+		answer string
+		// names are what stderr must name; none means exit 0 and nothing
+		// on stderr.
+		names []string
+	}{
+		{"a diverged branch", true, syncAnswer(divergedBranches, ""), []string{"exp"}},
+		{"a diverged patch", true, syncAnswer(calmBranches, `,"patches_diverged":["patch/a"]`), []string{"patch/a"}},
+		{"a diverged branch and patch", true, syncAnswer(divergedBranches, `,"patches_diverged":["patch/a"]`), []string{"exp", "patch/a"}},
+		{"nothing diverged and no patch", true, syncAnswer(calmBranches, `,"patches_diverged":[]`), nil},
+		{"nothing diverged", true, syncAnswer(calmBranches, ""), nil},
+		{"a diverged branch without the flag", false, syncAnswer(divergedBranches, ""), nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := syncHub(t, tt.answer)
+			args := syncCommand()
+			if tt.flag {
+				args = append(args, "--fail-on-diverged")
+			}
+
+			code, stdout, stderr, _ := runSync(t, hub, args...)
+
+			if want := indented(t, tt.answer); stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			if len(tt.names) == 0 {
+				if code != 0 || stderr != "" {
+					t.Errorf("exit status = %d, stderr %q; want 0 and nothing", code, stderr)
+				}
+				return
+			}
+			if code != 3 {
+				t.Errorf("exit status = %d, want 3", code)
+			}
+			message := wantErrorType(t, stderr, "condition_not_met")
+			for _, name := range tt.names {
+				if !strings.Contains(message, name) {
+					t.Errorf("message = %q, want it to name %s", message, name)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceSync_WaitsForRebuild(t *testing.T) {
+	t.Parallel()
+	statuses := []string{"queued", "running", "failed", "running", "completed"}
+	tests := []struct {
+		name, answer, want string
+		gets               int
+	}{
+		{
+			"a rebuild job", syncAnswer(divergedBranches, `,"rebuild_job_id":"j1"`),
+			withRebuild(syncAnswer(divergedBranches, `,"rebuild_job_id":"j1"`), rebuildJob("completed", 5)), 5,
+		},
+		{"a null rebuild job", syncAnswer(calmBranches, `,"rebuild_job_id":null`), syncAnswer(calmBranches, `,"rebuild_job_id":null`), 0},
+		{"no rebuild job", syncAnswer(calmBranches, ""), syncAnswer(calmBranches, ""), 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := syncHub(t, tt.answer, jobsInStatus(statuses...)...)
+
+			code, stdout, stderr, _ := runSync(t, hub, syncCommand("--wait")...)
+
+			if code != 0 {
+				t.Errorf("exit status = %d, want 0 (stderr %q)", code, stderr)
+			}
+			if want := indented(t, tt.want); stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			if lastDocument(stderr) != "" {
+				t.Errorf("stderr holds a JSON document: %q", stderr)
+			}
+			if tt.gets == 0 && stderr != "" {
+				t.Errorf("stderr = %q, want nothing without a rebuild job", stderr)
+			}
+			if got := hub.count(http.MethodGet); got != tt.gets {
+				t.Errorf("the hub got %d job reads, want %d", got, tt.gets)
+			}
+			sent := hub.recorded()
+			if len(sent) == 0 || sent[0].method != http.MethodPost || sent[0].rawPath != syncPath {
+				t.Fatalf("the hub got %v, want the sync first", sent)
+			}
+			for _, r := range sent[1:] {
+				if r.method != http.MethodGet || r.rawPath != jobPath {
+					t.Errorf("after the sync the hub got %s %s, want only GET %s", r.method, r.rawPath, jobPath)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceSync_FailedWait(t *testing.T) {
+	t.Parallel()
+	answer := syncAnswer(divergedBranches, `,"rebuild_job_id":"j1"`)
+	jobError := `{"error":{"code":500,"message":"internal error","error_type":"internal"}}`
+	tests := []struct {
+		name    string
+		jobs    []http.HandlerFunc
+		timeout string
+		// stdout is the document printed, "" for none; errorType the one
+		// of the envelope on stderr.
+		stdout, errorType string
+	}{
+		{"dead_letter", jobsInStatus("running", "dead_letter"), "", withRebuild(answer, rebuildJob("dead_letter", 2)), "wait_failed"},
+		{"cancelled", jobsInStatus("queued", "cancelled"), "", withRebuild(answer, rebuildJob("cancelled", 2)), "wait_failed"},
+		{"running until the timeout", jobsInStatus("running"), "1s", "", "wait_timeout"},
+		{"a job read answered 500", []http.HandlerFunc{answerWith(http.StatusInternalServerError, jobError)}, "", "", "internal"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := syncHub(t, answer, tt.jobs...)
+			args := syncCommand("--wait", "--fail-on-diverged")
+			if tt.timeout != "" {
+				args = append(args, "--timeout", tt.timeout)
+			}
+
+			code, stdout, stderr, _ := runSync(t, hub, args...)
+
+			if code != 1 {
+				t.Errorf("exit status = %d, want 1 (stderr %q)", code, stderr)
+			}
+			want := ""
+			if tt.stdout != "" {
+				want = indented(t, tt.stdout)
+			}
+			if stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			wantErrorType(t, stderr, tt.errorType)
+			if tt.errorType == "internal" && lastDocument(stderr) != indented(t, jobError) {
+				t.Errorf("stderr = %q, want the hub's envelope as received", stderr)
+			}
 		})
 	}
 }

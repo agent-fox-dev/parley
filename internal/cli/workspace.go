@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -116,7 +119,127 @@ func newWorkspaceCommand() *cobra.Command {
 		Args:        []argSpec{slugArg},
 		Auth:        authUser,
 	})
-	return group("workspace", "Register, list, read and change the workspaces of the hub", create, list, get, newWorkspaceUpdateCommand())
+	return group("workspace", "Register, list, read, change and sync the workspaces of the hub",
+		create, list, get, newWorkspaceUpdateCommand(), newWorkspaceSyncCommand())
+}
+
+// syncRequestTimeout bounds each request of parley workspace sync: the hub
+// fetches origin within its own 2-minute deadline before it answers, which
+// the default of 30 seconds would not wait for.
+const syncRequestTimeout = 3 * time.Minute
+
+// newWorkspaceSyncCommand builds parley workspace sync.
+func newWorkspaceSyncCommand() *cobra.Command {
+	return declare(command{
+		Name:        "sync",
+		Description: "Bring a workspace up to date with its origin; with --wait, wait for the rebuild the answer names",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/sync",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Timeout:     syncRequestTimeout,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.Bool("reset-to-origin", false, "move the branches that diverged from origin to origin's head")
+		},
+		FailOn: []failOn{{
+			Name:        "diverged",
+			Description: "exit 3 when a branch or a patch diverged from origin, naming them on stderr",
+			Check:       divergedIn,
+		}},
+		// The wait is the shared one, built per run by syncWorkspace once
+		// the answer names the rebuild job; this gives the command its
+		// flags and the job's terminal states.
+		Wait: &waitFor{Classify: byState("status", []string{"completed"}, []string{"dead_letter", "cancelled"})},
+		Run:  syncWorkspace,
+	})
+}
+
+// syncWorkspace is the run step of parley workspace sync. It sends the sync
+// once and prints the answer, unless --wait is given and the answer names a
+// rebuild job: then the shared wait reads that job at once and polls it
+// until it is completed, dead_letter or cancelled (failed is a job waiting
+// to retry), and prints the answer with the final job as its member
+// rebuild. The job is read through its REST route alone, so the command
+// needs no code of the rebuild jobs.
+func syncWorkspace(c *call) error {
+	var query url.Values
+	if reset, _ := c.cmd.Flags().GetBool("reset-to-origin"); reset {
+		query = url.Values{"reset_to_origin": {"true"}}
+	}
+	path := routePath(c.decl.Path, c.args)
+	answer, err := c.client.send(c.ctx, apiRequest{method: c.decl.Method, path: path, query: query})
+	if err != nil {
+		return err
+	}
+	var named struct {
+		RebuildJobID *string `json:"rebuild_job_id"`
+	}
+	// The client let only JSON through; an answer that is not an object
+	// names no job.
+	_ = json.Unmarshal(answer.body, &named)
+	waiting, _ := c.cmd.Flags().GetBool(waitFlag)
+	if !waiting || named.RebuildJobID == nil || *named.RebuildJobID == "" {
+		return c.printAnswer(answer)
+	}
+	job := apiRequest{
+		method: http.MethodGet,
+		path:   "/workspaces/" + pathSegment(c.args[slugArg.Name]) + "/rebuilds/" + pathSegment(*named.RebuildJobID),
+	}
+	w := *c.decl.Wait
+	w.Start = func(*call) (apiRequest, error) { return job, nil }
+	w.Poll = func(*call, []byte) (apiRequest, error) { return job, nil }
+	w.Document = func(_ *call, _, final []byte) ([]byte, error) {
+		return withMember(answer.body, "rebuild", final)
+	}
+	c.decl.Wait = &w
+	return c.wait()
+}
+
+// withMember is doc, a JSON object, with the member name holding value
+// added after its own members, which keep their order and text.
+func withMember(doc []byte, name string, value []byte) ([]byte, error) {
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, doc); err != nil {
+		return nil, clientError("cannot read the hub's answer: %v", err)
+	}
+	object := compact.Bytes()
+	if len(object) < 2 || object[0] != '{' {
+		return nil, clientError("the hub's answer is not a JSON object")
+	}
+	key, _ := json.Marshal(name)
+	out := append([]byte{}, object[:len(object)-1]...)
+	if len(object) > 2 {
+		out = append(out, ',')
+	}
+	out = append(append(append(out, key...), ':'), value...)
+	return append(out, '}'), nil
+}
+
+// divergedIn is the condition of --fail-on-diverged: result names a branch
+// whose result is diverged, or a non-empty patches_diverged. The message
+// names each of them.
+func divergedIn(result []byte) (bool, string) {
+	var doc struct {
+		Branches []struct {
+			Name   string `json:"name"`
+			Result string `json:"result"`
+		} `json:"branches"`
+		PatchesDiverged []string `json:"patches_diverged"`
+	}
+	// The document is the hub's answer, printed already; one this cannot
+	// read names nothing that diverged.
+	_ = json.Unmarshal(result, &doc)
+	var names []string
+	for _, b := range doc.Branches {
+		if b.Result == "diverged" {
+			names = append(names, b.Name)
+		}
+	}
+	names = append(names, doc.PatchesDiverged...)
+	if len(names) == 0 {
+		return false, ""
+	}
+	return true, "diverged from origin: " + strings.Join(names, ", ")
 }
 
 // newWorkspaceUpdateCommand builds parley workspace update.

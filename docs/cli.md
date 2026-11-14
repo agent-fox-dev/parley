@@ -391,7 +391,7 @@ Available Commands:
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
-  workspace   Register, list, read and change the workspaces of the hub
+  workspace   Register, list, read, change and sync the workspaces of the hub
 
 Flags:
       --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
@@ -1670,6 +1670,62 @@ invalid value among them, is the hub's to refuse.
 | `parley workspace list [flags]` | `GET /api/v1/workspaces` with a query parameter for each flag given |
 | `parley workspace get <slug>` | `GET /api/v1/workspaces/<slug>` |
 | `parley workspace update <slug> [flags]` | `PATCH /api/v1/workspaces/<slug>` with a member for each flag given |
+
+#### `parley workspace sync`
+
+```
+parley workspace sync <slug> [--reset-to-origin] [--fail-on-diverged] [--wait] [--timeout <duration>] [--poll-interval <duration>]
+```
+
+Brings a workspace up to date with its origin: it sends one
+[`POST /api/v1/workspaces/<slug>/sync`](api.md#post-apiv1workspacesslugsync)
+with the credential as `Authorization: Bearer`, no body, and `<slug>` as one
+percent-encoded path segment (`parley workspace sync a/b` sends
+`POST /api/v1/workspaces/a%2Fb/sync`), and prints the hub's answer, the
+workspace with its `branches`, as the one document on stdout with exit
+status `0`. The hub fetches origin before it answers, so each request of
+this command has a timeout of 3 minutes instead of 30 seconds.
+
+| Flag | Effect |
+|---|---|
+| `--reset-to-origin` | sends `reset_to_origin=true`, which moves the branches that diverged from origin to origin's head |
+| `--fail-on-diverged` | after printing, exits `3` when a branch or a patch diverged (see below) |
+| `--wait`, `--timeout`, `--poll-interval` | wait for the rebuild the answer names (see below and [Waiting](#waiting)) |
+
+A refusal of the hub's (`409` `workspace_busy`, `400` `sync_disabled`,
+`502` `upstream_error` when origin cannot be fetched, among others) is
+written to stderr as received, with nothing on stdout and exit status `1`.
+A missing `<slug>`, a second argument and a `--timeout` or
+`--poll-interval` the CLI cannot read are refused with a `usage_error` and
+exit status `2` before any request.
+
+**`--fail-on-diverged`.** After the answer is printed, the command collects
+the `name` of every `branches` entry whose `result` is `diverged` and every
+name in `patches_diverged`, which a carry-patch workspace's answer holds.
+When there is any, it writes a `condition_not_met` error naming them
+(`diverged from origin: exp, patch/a`) to stderr and exits `3`; otherwise
+it exits `0`. Without the flag a divergence changes nothing.
+
+**`--wait`.** When the answer has a `rebuild_job_id` that is not `null`,
+the command reads the job at once with
+`GET /api/v1/workspaces/<slug>/rebuilds/<rebuild_job_id>` and then polls it
+under the rules of [Waiting](#waiting), `--timeout` counted from the first
+answer about the job, reading its `status`: `completed` is the successful
+end, `dead_letter` and `cancelled` the unsuccessful ones, and `queued`,
+`running` and `failed` (a job waiting to retry) keep the wait going. When
+the wait ends in a terminal state, stdout receives one document: the sync
+answer with one more member, `rebuild`, holding the final job record, after
+the answer's own members. `completed` exits `0`; `dead_letter` and
+`cancelled` write `wait_failed` to stderr and exit `1`, also when
+`--fail-on-diverged` is given and a branch diverged. Running out of time is
+`wait_timeout` with nothing on stdout and exit status `1`, and a job read
+the hub answers with an error is written to stderr as received with exit
+status `1`. When the answer has no `rebuild_job_id`, or a `null` one,
+`--wait` changes nothing: the answer is printed and no job is read.
+
+| Command | Request |
+|---|---|
+| `parley workspace sync <slug> [flags]` | `POST /api/v1/workspaces/<slug>/sync`, with `reset_to_origin=true` for `--reset-to-origin`; with `--wait` and a `rebuild_job_id`, then `GET /api/v1/workspaces/<slug>/rebuilds/<id>` until `completed`, `dead_letter` or `cancelled` |
 
 ### Output
 

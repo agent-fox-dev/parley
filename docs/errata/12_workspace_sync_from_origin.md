@@ -152,3 +152,24 @@ moving it at that moment.
   removes the fixture's `dev` from origin so that `branches` is exactly the
   list the check names. It syncs with `reset_to_origin=true` for both parts,
   and then syncs the same refs as a `standard` workspace.
+
+## The parley workspace sync command
+
+- The 3-minute timeout is the command's request timeout
+  (`command.Timeout`), so it bounds the reads of the rebuild job too, not
+  the sync's `POST` alone; every read after the first is also bounded by
+  the wait's `--timeout`.
+- `--wait` is the CLI's shared wait, started only once the sync's answer
+  names a job: it reads the job at once and then polls it one interval after
+  each answer. `--timeout` therefore counts from the first answer about the
+  job rather than from the sync's answer, and the job's first read comes
+  right after the sync instead of one poll interval later. Without a
+  `rebuild_job_id` nothing of the wait runs, so stderr stays empty, with no
+  progress line.
+- The message of `--fail-on-diverged` is a `condition_not_met` error naming
+  the branches and then the patches: `diverged from origin: exp, patch/a`.
+- The checks run the wait with `--timeout 1s` and a 10 ms poll interval set
+  through the test options, because `--timeout` and `--poll-interval` take
+  whole seconds or more (`50ms` is a usage error). The argument-count and
+  `--timeout 0s` refusals and the `502` refusal are rows of the workspace
+  commands' shared tests of a bad command line and of the hub's refusal.
