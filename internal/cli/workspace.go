@@ -119,8 +119,39 @@ func newWorkspaceCommand() *cobra.Command {
 		Args:        []argSpec{slugArg},
 		Auth:        authUser,
 	})
-	return group("workspace", "Register, list, read, change and sync the workspaces of the hub",
-		create, list, get, newWorkspaceUpdateCommand(), newWorkspaceSyncCommand())
+	return group("workspace", "Register, list, read, change, sync and push the workspaces of the hub",
+		create, list, get, newWorkspaceUpdateCommand(), newWorkspaceSyncCommand(), newWorkspacePushCommand())
+}
+
+// pushRequestTimeout bounds the request of parley workspace push: the hub
+// pushes to origin within its own 2-minute deadline before it answers,
+// which the default of 30 seconds would not wait for.
+const pushRequestTimeout = 3 * time.Minute
+
+// newWorkspacePushCommand builds parley workspace push. It always sends the
+// body, {"force": false} without --force, so the request says what it asks
+// for; a forced push warns first, before anything reaches the hub, because
+// it may replace commits on origin.
+func newWorkspacePushCommand() *cobra.Command {
+	return declare(command{
+		Name:        "push",
+		Description: "Push one branch of a workspace to its origin, fast-forward only unless --force",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/branches/:branch/push",
+		Args:        []argSpec{slugArg, {Name: "branch", Required: true}},
+		Auth:        authUser,
+		Timeout:     pushRequestTimeout,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.Bool("force", false, "replace origin's branch, but only while it is where the hub last saw it")
+		},
+		Run: func(c *call) error {
+			force, _ := c.cmd.Flags().GetBool("force")
+			if force {
+				warn(c.stderr, "origin's branch %q may be replaced by the hub's", c.args["branch"])
+			}
+			return sendWith(c, nil, map[string]bool{"force": force})
+		},
+	})
 }
 
 // syncRequestTimeout bounds each request of parley workspace sync: the hub
