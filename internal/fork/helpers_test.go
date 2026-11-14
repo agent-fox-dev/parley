@@ -619,23 +619,29 @@ func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (eve
 // can hold a secret.
 const secretKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
-// remover keeps what a fork's removal asked of the collaborators it calls:
-// registered in the teardown set as a remover of owned data and as the
-// session closer, and on the fork component as its sandbox collaborator. A
-// step fails while its fail flag is set, for the fork only alone when only
-// is set; the event writer fails while fault holds "event", and the discard
-// of a fork's repository while failDiscard is set. during, when set, is
-// called with the fork's slug as its sandboxes are deleted, before the
-// delete fails or succeeds.
+// remover keeps what a fork's removal and its early expiry asked of the
+// collaborators they call: registered in the teardown set as a remover of
+// owned data and as the session closer, and on the fork component as its
+// sandbox collaborator and its change reader, which reports changes and,
+// as live, the forks with a sandbox provisioning or ready. A step fails
+// while its fail flag is set, for the fork only alone when only is set; the
+// event writer fails while fault holds "event", and the discard of a fork's
+// repository while failDiscard is set. during, when set, is called with the
+// fork's slug as its sandboxes are deleted, before the delete fails or
+// succeeds.
 type remover struct {
 	store                                func() *sql.DB
 	mu                                   sync.Mutex
 	failRemove, failSandbox, failDiscard bool
+	failChanges, failLive                bool
 	only                                 string
 	during                               func(slug string)
 	removed                              []string
 	closed                               [][2]string
 	sandboxes                            []sandboxDelete
+	changes                              map[string][]fork.SourceChange
+	live                                 map[string]bool
+	asked                                []string
 	fault                                atomic.Value
 }
 
@@ -709,18 +715,36 @@ func (r *remover) DeleteSandboxes(ctx context.Context, slug, reason string, chec
 	return nil
 }
 
-func (r *remover) HasLiveSandbox(context.Context, string) (bool, error) { return false, nil }
+func (r *remover) HasLiveSandbox(_ context.Context, slug string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fails(r.failLive, slug) {
+		return false, errors.New("injected sandbox state fault")
+	}
+	return r.live[slug], nil
+}
+
+func (r *remover) ChangesFrom(_ context.Context, slug string) ([]fork.SourceChange, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.asked = append(r.asked, slug)
+	if r.fails(r.failChanges, slug) {
+		return nil, errors.New("injected change reader fault")
+	}
+	return r.changes[slug], nil
+}
 
 // newRemovalWorld is a world with a current secret key whose fork removals
 // call r as their collaborators, with more run on the hub's composition
 // after that.
 func newRemovalWorld(t *testing.T, more ...func(*hub.Composition)) (*world, *remover) {
 	t.Helper()
-	r := &remover{}
+	r := &remover{changes: map[string][]fork.SourceChange{}, live: map[string]bool{}}
 	w := newWorldWith(t, hubtest.Config{Env: map[string]string{secret.EnvCurrentKey: secretKey}, Compose: func(c *hub.Composition) {
 		c.Workspaces().Teardown().RegisterRemover(r.remove)
 		c.Workspaces().Teardown().RegisterSessionCloser(r)
 		c.Forks().RegisterSandboxes(r)
+		c.Forks().RegisterChangeReader(r)
 		c.AdjustForks(func(d *fork.Deps) {
 			d.Events = faultyEvents{d.Events, &r.fault}
 			d.RemoveRepo = func(dir string) error {

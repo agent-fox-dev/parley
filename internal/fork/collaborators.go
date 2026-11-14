@@ -76,3 +76,24 @@ type SandboxLifecycle interface {
 // RegisterSandboxes makes s the sandbox lifecycle of a fork's removal; nil
 // removes it. It is called while the hub is composed, before it serves.
 func (c *Component) RegisterSandboxes(s SandboxLifecycle) { c.sandboxes = s }
+
+// SourceChange is a change as the early expiry of a fork reads it: the
+// fork's branch it proposes, and its state, such as open, landed or
+// abandoned.
+type SourceChange struct {
+	Branch string
+	State  string
+}
+
+// ChangeReader is the change component as the early expiry of a fork asks
+// it. The change feature registers it on the component; without one a fork
+// has no changes, and no fork is removed before its expires_at.
+type ChangeReader interface {
+	// ChangesFrom returns every change whose source is the fork forkSlug,
+	// in any state.
+	ChangesFrom(ctx context.Context, forkSlug string) ([]SourceChange, error)
+}
+
+// RegisterChangeReader makes r the change reader of the early expiry; nil
+// removes it. It is called while the hub is composed, before it serves.
+func (c *Component) RegisterChangeReader(r ChangeReader) { c.changes = r }

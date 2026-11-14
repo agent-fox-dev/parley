@@ -77,17 +77,25 @@ func (c removalCause) sessionReason() string {
 // removal is one removal of a fork: its cause, the caller who asked for it
 // (for a delete, alone or with the parent), for an expiry the reason its
 // event gives, ttl or landed, and the rule that says whether the fork, as
-// read, is still due, nil for always.
+// read through q, is still due, nil for always.
 type removal struct {
 	cause  removalCause
 	actor  identity.Principal
 	expiry string
-	due    func(Fork) bool
+	due    func(ctx context.Context, q access.Querier, f Fork) (bool, error)
 }
 
-// notDue is errNotDue when rm has a rule by which the fork f is not due.
-func (rm removal) notDue(f Fork) error {
-	if rm.due != nil && !rm.due(f) {
+// notDue is errNotDue when rm has a rule by which the fork f, read through
+// q, is not due, and the rule's error when it cannot tell.
+func (rm removal) notDue(ctx context.Context, q access.Querier, f Fork) error {
+	if rm.due == nil {
+		return nil
+	}
+	due, err := rm.due(ctx, q, f)
+	switch {
+	case err != nil:
+		return err
+	case !due:
 		return errNotDue
 	}
 	return nil
@@ -206,7 +214,7 @@ func (c *Component) remove(ctx context.Context, slug string, rm removal) error {
 	case !found:
 		return errGone
 	}
-	if err := rm.notDue(f); err != nil {
+	if err := rm.notDue(ctx, c.deps.Store.Main(), f); err != nil {
 		return err
 	}
 	if err := removalRefusal(ctx, c.deps.Store.Main(), f); err != nil {
@@ -247,7 +255,7 @@ func (c *Component) removeIn(ctx context.Context, tx *sql.Tx, slug string, rm re
 	case !found:
 		return Fork{}, errGone
 	}
-	if err := rm.notDue(f); err != nil {
+	if err := rm.notDue(ctx, tx, f); err != nil {
 		return Fork{}, err
 	}
 	if rm.cause != causeParentDeleted {

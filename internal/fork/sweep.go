@@ -41,8 +41,12 @@ type PassResult struct {
 // except one whose parent is pending, cloning or under a maintenance
 // operation, which is left for a later pass. A removal that fails is logged
 // and leaves the fork whole, and the pass goes on with the next fork, so
-// that the next pass finds the fork again. Then it repeats every pending
-// discard of a removed fork's repository.
+// that the next pass finds the fork again. Then, while [forks].expire_on_land
+// is set, it removes with the reason landed every other fork whose work has
+// landed a day ago (see expireLanded), the same way; a fork that is past its
+// expires_at has gone with the reason ttl already, so it is never removed
+// twice. Then it repeats every pending discard of a removed fork's
+// repository.
 //
 // The context is checked before each fork: once it is cancelled, as at the
 // hub's stop, the pass removes no further fork and ends. A removal already
@@ -61,27 +65,18 @@ func (c *Component) RunPass(ctx context.Context) PassResult {
 		c.deps.Logger.Error("fork sweep: expired forks not read", "error", err)
 		return res
 	}
-	due := func(f Fork) bool { return f.ExpiresAt != nil && !f.ExpiresAt.After(now) }
+	due := func(_ context.Context, _ access.Querier, f Fork) (bool, error) {
+		return f.ExpiresAt != nil && !f.ExpiresAt.After(now), nil
+	}
 	for _, slug := range slugs {
 		if ctx.Err() != nil {
 			res.Stopped = true
 			return res
 		}
-		err := c.remove(context.WithoutCancel(ctx), slug, removal{cause: causeExpired, expiry: expiryTTL, due: due})
-		var refusal *server.Error
-		switch {
-		case err == nil:
-			res.Removed = append(res.Removed, slug)
-			c.deps.Logger.Info("fork expired", "slug", slug, "reason", expiryTTL)
-		case errors.Is(err, errGone), errors.Is(err, errNotDue):
-			// Removed by another removal, or given a new lifetime, since
-			// the pass read it.
-		case errors.As(err, &refusal) && refusal.Status() == http.StatusConflict:
-			// Its parent is busy; a later pass removes it.
-		default:
-			res.Failed = append(res.Failed, slug)
-			c.deps.Logger.Error("fork sweep: fork not removed; tried again at the next pass", "slug", slug, "error", err)
-		}
+		c.expire(ctx, slug, removal{cause: causeExpired, expiry: expiryTTL, due: due}, &res)
+	}
+	if c.deps.Limits.ExpireOnLand {
+		c.expireLanded(ctx, now, &res)
 	}
 	if ctx.Err() != nil {
 		res.Stopped = true
@@ -89,6 +84,29 @@ func (c *Component) RunPass(ctx context.Context) PassResult {
 	}
 	c.retryDiscards(ctx)
 	return res
+}
+
+// expire removes the fork slug for rm, an expiry, on a context ctx's
+// cancellation does not reach, and adds the outcome to res. A fork removed
+// by another removal or no longer due since the pass read it, and one whose
+// parent is busy, is left quietly for a later pass; any other failure is
+// logged, and the fork is whole.
+func (c *Component) expire(ctx context.Context, slug string, rm removal, res *PassResult) {
+	err := c.remove(context.WithoutCancel(ctx), slug, rm)
+	var refusal *server.Error
+	switch {
+	case err == nil:
+		res.Removed = append(res.Removed, slug)
+		c.deps.Logger.Info("fork expired", "slug", slug, "reason", rm.expiry)
+	case errors.Is(err, errGone), errors.Is(err, errNotDue):
+		// Removed by another removal, or given a new lifetime or a new
+		// activity, since the pass read it.
+	case errors.As(err, &refusal) && refusal.Status() == http.StatusConflict:
+		// Its parent is busy; a later pass removes it.
+	default:
+		res.Failed = append(res.Failed, slug)
+		c.deps.Logger.Error("fork sweep: fork not removed; tried again at the next pass", "slug", slug, "error", err)
+	}
 }
 
 // expiredForks are the slugs of the forks whose expires_at is at or before

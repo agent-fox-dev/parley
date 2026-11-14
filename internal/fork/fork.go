@@ -101,6 +101,9 @@ type Component struct {
 	// sandboxes is the sandbox lifecycle a removal asks, nil while none is
 	// registered: a fork then has no sandboxes.
 	sandboxes SandboxLifecycle
+	// changes is the change reader of the early expiry, nil while none is
+	// registered: a fork then has no changes.
+	changes ChangeReader
 	// passMu is held by the sweep pass that runs, so that two never run at
 	// once.
 	passMu sync.Mutex

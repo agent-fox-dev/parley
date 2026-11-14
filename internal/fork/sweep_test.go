@@ -64,11 +64,24 @@ func TestRunPass_RemovesEveryExpiredFork(t *testing.T) {
 
 func TestRunPass_WritesOneExpireEvent(t *testing.T) {
 	t.Parallel()
-	w, _ := newRemovalWorld(t)
+	w, r := newRemovalWorld(t)
 	session := uuid.New().String()
-	for name, sessionID := range map[string]*string{"no session": nil, "in a session": &session} {
-		t.Run(name, func(t *testing.T) {
-			h := w.seedHeld(t, "demo--"+name[:2], expiring(w, -time.Minute), func(f *fork.Fork) { f.SessionID = sessionID })
+	for _, row := range []struct {
+		name, slug, reason string
+		sessionID          *string
+	}{
+		{"past expires_at", "demo--ttl", "ttl", nil},
+		{"past expires_at in a session", "demo--session", "ttl", &session},
+		{"a day after it landed", "demo--landed", "landed", nil},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			slug, sessionID := row.slug, row.sessionID
+			edit := expiring(w, -time.Minute)
+			if row.reason == "landed" {
+				edit = func(f *fork.Fork) { f.CreatedAt = w.clock().Add(-day) }
+				r.set(func(r *remover) { r.changes[slug] = []fork.SourceChange{{Branch: "task", State: "landed"}} })
+			}
+			h := w.seedHeld(t, slug, edit, func(f *fork.Fork) { f.SessionID = sessionID })
 			_, b1 := w.pat(t, h.slug, nil, "workspaces:read")
 			_, b2 := w.pat(t, h.slug, nil, "workspaces:read")
 			w.pass(t, context.Background())
@@ -94,7 +107,7 @@ func TestRunPass_WritesOneExpireEvent(t *testing.T) {
 			for _, id := range slices.Sorted(slices.Values([]string{h.patID, b1, b2})) {
 				tokens = append(tokens, id)
 			}
-			wantMembers(t, meta, map[string]any{"parent_slug": parentSlug, "reason": "ttl",
+			wantMembers(t, meta, map[string]any{"parent_slug": parentSlug, "reason": row.reason,
 				"expires_at": timefmt.Format(h.expires), "revoked_tokens": tokens})
 		})
 	}

@@ -56,11 +56,26 @@ const (
 // every minute, and stops at the stop before the stores close; each pass of
 // the maintenance loop runs one more as the task fork_expiry. The
 // component never runs two passes at once.
+//
+// While [forks].expire_on_land is set, a pass also removes a fork a day
+// after its work has landed. It asks the change feature for the fork's
+// changes through the change reader that feature registers on the
+// component (RegisterChangeReader) from its own file; the hub has no change
+// feature yet, so none is registered here, and no fork is removed before
+// its expires_at. The day counts from the fork's last activity, a column of
+// its own after the pending discards. The features that see an activity (a
+// push to the fork, an API write to it, a change of it opened, versioned,
+// landed, abandoned or restored: the push rules, the change feature and
+// the landing) register the component's RecordActivity with their own
+// activity hook, through one adapter each, in this function; none of them
+// is in the hub yet, so none is registered, and a fork's last activity is
+// its creation.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp
 	c.AddSchemaStep(fork.SchemaStep)
 	c.AddSchemaStep(fork.DiscardStep)
+	c.AddSchemaStep(fork.ActivityStep)
 	c.workspaces.Teardown().RegisterForkRemover(comp)
 	c.workspaces.RegisterForkView(comp.WorkspaceView)
 	c.workspaces.RegisterForkField("ttl", comp.TTLField)

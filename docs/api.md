@@ -1994,11 +1994,25 @@ repository that could not be removed after a delete or an expiry is
 removed by a later pass, unless a fork has been created under the same
 slug again.
 
+While [`[forks].expire_on_land`](configuration.md) is `true` (the
+default), the same pass then removes early, the same way, every other fork
+that is the source of at least one change, whose changes are all `landed`
+or `abandoned`, whose every own branch is the source branch of one of
+them, whose last activity is at least 24 hours old and which has no
+sandbox `provisioning` or `ready`. A fork's last activity is its creation
+until a push to it or a change of it being opened, versioned, landed,
+abandoned or restored is recorded. A fork past its `expires_at` is
+removed once, with the reason `ttl`. A fork whose changes or sandboxes
+cannot be read is kept, the failure logged with its slug, until a later
+pass. The hub has no change feature yet: until one is added, no fork has
+changes and none is removed before its `expires_at`.
+
 Each removal writes one `parley.fork.expire` event and no
 `parley.workspace.delete` event: actor `system`, `workspace` and
 `resource_id` the fork's slug, `resource_type` `workspace`, `session_id`
 the session the fork was created in (`null` for none), and `metadata`
-with `parent_slug`, `reason` `ttl`, `expires_at` the fork's `expires_at`
+with `parent_slug`, `reason` (`ttl` when its `expires_at` had passed,
+`landed` for an early removal), `expires_at` the fork's `expires_at`
 when it was removed, and `revoked_tokens`, the ids of the tokens bound to
 the fork that were revoked, in ascending order. The event is visible to
 the readers of the parent's events.

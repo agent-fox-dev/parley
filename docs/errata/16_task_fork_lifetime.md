@@ -107,3 +107,59 @@ removal of a fork it has begun, the sandbox deletion included, runs on a
 context the stop does not cancel, so that it reaches its commit or
 rollback and its discard. The hub waits for the sweep up to 10 seconds
 (`fork_sweep`'s grace) before it closes the stores.
+
+## A fork's last activity is a schema step of `internal/fork`
+
+The package places the migration of a fork's last activity in
+`internal/store`. As the pending discards are, it is a schema step of the
+feature's own package: `fork.ActivityStep` (`fork_activity`), which adds
+the column `last_activity_at` (UnixNano, nullable) to the workspace table,
+registered in `internal/hub/fork.go` after `fork.DiscardStep`.
+`internal/store` is unchanged. The package has the create set the last
+activity to the creation time; instead a NULL `last_activity_at` stands
+for the fork's `created_at`, so the create of package 15 writes nothing
+new and a fork created before the step counts as last active at its
+creation, which is the same instant.
+
+## No fork-activity hook is registered yet
+
+The package has `internal/hub/fork.go` register `fork.RecordActivity` with
+`pushrule.ForkActivity` (package 18), `change.ForkActivity` (package 22)
+and the after-landing hook list of `internal/land` (package 25), each
+through one adapter, for those of them in the repository. None of the
+three packages exists, so no adapter is registered: `RecordActivity(ctx,
+slug)` is exported on the fork component with no production caller, and a
+fork's last activity is its creation. The hub's comment in
+`internal/hub/fork.go` says where each adapter goes. This is a hand-off to
+packages 18, 22 and 25: each, when it is built, registers its adapter in
+`composeForks`; the adapter of package 25 calls `RecordActivity` for the
+source workspace of every landed change. `RecordActivity` opens a store
+transaction of its own, so an adapter calls it outside the transaction of
+the push or the change.
+
+## No change reader is registered yet, so no fork is removed early
+
+The package has the hub pass the real change reader to the fork component
+as package 22 arrives. The change reader (`fork.ChangeReader`,
+`ChangesFrom(ctx, forkSlug) ([]fork.SourceChange, error)`, each change its
+source `Branch` and its `State`) is registered on the component with
+`(*fork.Component).RegisterChangeReader` from the change feature's own part
+of the hub, as the sandbox lifecycle is. Package 22 is not built, so none
+is registered: every fork has no changes, and `[forks].expire_on_land`
+removes none before its `expires_at` until package 22 registers its
+reader.
+
+## A fork judged to have landed is judged again by its stored conditions
+
+The package has a pass judge a fork's early-expiry conditions and remove
+the fork when they hold. Between the judgement and the removal a push, a
+change transition or a `ttl` update can land. The removal reads the fork
+again, before its sandboxes are deleted and inside the removal's
+transaction, and leaves it alone once its `expires_at` has passed (it goes
+with the reason `ttl` at the next pass) or its last activity is less than
+24 hours old. The change reader and the sandbox collaborator are asked once,
+at the judgement and not inside the transaction, since they are outside the
+store: every event that changes a fork's changes is an activity, which the
+second read sees. A sandbox started on the fork in the moment between the
+judgement and the removal's sandbox deletion is deleted with the fork, as
+on every removal.
