@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,7 +61,9 @@ type route struct {
 var created = entries(map[string]any{"key": "ROUTE_KEY", "value": "v"})
 
 // routes are every secret route. The access tests iterate them, so a route
-// added here is held to the access rules of its scope.
+// added here is held to the access rules of its scope. A scope's POST
+// creates ROUTE_KEY, its PATCH changes it and its DELETE removes it, so a
+// test that calls every route in this order sees each one succeed.
 var routes = []route{
 	{secret.ScopeUser, http.MethodGet, "/user/secrets", nil, "secrets:read", http.StatusOK},
 	{secret.ScopeOrg, http.MethodGet, "/orgs/%s/secrets", nil, "secrets:read", http.StatusOK},
@@ -68,7 +71,16 @@ var routes = []route{
 	{secret.ScopeUser, http.MethodPost, "/user/secrets", created, "secrets:write", http.StatusCreated},
 	{secret.ScopeOrg, http.MethodPost, "/orgs/%s/secrets", created, "secrets:write", http.StatusCreated},
 	{secret.ScopeWorkspace, http.MethodPost, "/workspaces/%s/secrets", created, "secrets:write", http.StatusCreated},
+	{secret.ScopeUser, http.MethodPatch, "/user/secrets/ROUTE_KEY", changed, "secrets:write", http.StatusOK},
+	{secret.ScopeOrg, http.MethodPatch, "/orgs/%s/secrets/ROUTE_KEY", changed, "secrets:write", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodPatch, "/workspaces/%s/secrets/ROUTE_KEY", changed, "secrets:write", http.StatusOK},
+	{secret.ScopeUser, http.MethodDelete, "/user/secrets/route_key", nil, "secrets:write", http.StatusNoContent},
+	{secret.ScopeOrg, http.MethodDelete, "/orgs/%s/secrets/route_key", nil, "secrets:write", http.StatusNoContent},
+	{secret.ScopeWorkspace, http.MethodDelete, "/workspaces/%s/secrets/route_key", nil, "secrets:write", http.StatusNoContent},
 }
+
+// changed is an update body.
+var changed = map[string]any{"value": "changed"}
 
 // entries is a create body of the entries given.
 func entries(e ...any) map[string]any { return map[string]any{"entries": e} }
@@ -94,9 +106,8 @@ func (r route) at(name string) string {
 
 func (r route) String() string { return r.method + " " + r.path }
 
-// world is a hub with a current secret key, a clock that stands still at
-// now, and the callers the route tests
-// ask with. The org acme has the members owner, member and member2;
+// world is a hub with a current secret key, a clock that stands still
+// until a test advances it, and the callers the route tests ask with. The org acme has the members owner, member and member2;
 // outsider belongs to no org but their own. The workspace acme is owner's,
 // in the org acme, and acme-fork is a task fork of it that member created.
 // The org frozen, of which member is a member, is blocked.
@@ -106,7 +117,9 @@ type world struct {
 	// again at each restart.
 	secrets *secret.Component
 	events  *event.Component
-	// now is the hub's time.
+	// mu guards now, the hub's time, which the hub reads while a test
+	// advances it.
+	mu  sync.Mutex
 	now time.Time
 	// ownerID, memberID, member2ID and outsiderID are the users' ids, and
 	// the matching keys their API keys.
@@ -126,7 +139,7 @@ func newWorld(t *testing.T) *world {
 	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(-time.Second / 2)}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
 		Env:     map[string]string{secret.EnvCurrentKey: key},
-		Now:     func() time.Time { return w.now },
+		Now:     w.clock,
 		Compose: func(c *hub.Composition) { w.secrets, w.events = c.Secrets(), c.Events() },
 	})
 	w.ownerID, w.memberID = w.CreateUser(t, "owner"), w.CreateUser(t, "member")
@@ -147,6 +160,38 @@ func newWorld(t *testing.T) *world {
 	w.AddWorkspace(t, access.Record{Slug: "acme-fork", OwnerID: w.memberID, OrgID: w.orgID,
 		Kind: access.KindFork, ParentSlug: "acme", Status: access.StatusReady})
 	return w
+}
+
+// clock is the hub's time.
+func (w *world) clock() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.now
+}
+
+// advance moves the hub's time on by d and returns the new time.
+func (w *world) advance(d time.Duration) time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.now = w.now.Add(d)
+	return w.now
+}
+
+// place is a set of secrets that owner reaches: its scope, its owner's id
+// and its collection path.
+type place struct {
+	scope    secret.Scope
+	id, path string
+}
+
+// places are owner's user secrets, those of the org acme and those of the
+// workspace acme.
+func (w *world) places() []place {
+	return []place{
+		{secret.ScopeUser, w.ownerID, "/user/secrets"},
+		{secret.ScopeOrg, w.orgID, "/orgs/acme/secrets"},
+		{secret.ScopeWorkspace, "acme", "/workspaces/acme/secrets"},
+	}
 }
 
 // answer is the status and the body of a hub's answer.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -247,7 +248,7 @@ func TestListSecrets_ListsEveryEntryWithoutAKeyThatOpensThem(t *testing.T) {
 func TestCreateSecrets_StoresEveryEntryInRequestOrder(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	at := `"` + w.now.Truncate(time.Second).Format(time.RFC3339) + `"`
+	at := `"` + w.clock().Truncate(time.Second).Format(time.RFC3339) + `"`
 	long := strings.Repeat("k", 255)
 	cases := []struct {
 		name    string
@@ -476,6 +477,181 @@ func TestCreateSecrets_WritesAnEventPerEntry(t *testing.T) {
 				ev.ActorType != tc.actorType || !equalPtr(ev.ActorID, tc.actorID) {
 				t.Errorf("%v: event %d = %+v, metadata %s; want the create of %s by %s", tc.r, i, ev, ev.Metadata, key, tc.actorType)
 			}
+		}
+	}
+}
+
+func TestUpdateSecret_ReplacesTheValueInPlace(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	values := []string{"new", "", strings.Repeat("x", secret.MaxValueSize)}
+	for i, pl := range w.places() {
+		created := w.clock().Truncate(time.Second)
+		w.seed(t, pl.scope, pl.id, "Git_Pat")
+		now := w.advance(90 * time.Second).Truncate(time.Second)
+		a := w.do(t, w.ownerKey, http.MethodPatch, pl.path+"/git_pat", map[string]any{"value": values[i]})
+		var got map[string]any
+		_ = json.Unmarshal(a.body, &got)
+		want := map[string]any{"key": "Git_Pat", "created_at": created.Format(time.RFC3339), "updated_at": now.Format(time.RFC3339)}
+		if a.status != http.StatusOK || !maps.Equal(got, want) {
+			t.Errorf("%s: %d %s, want 200 %v", pl.path, a.status, a.body, want)
+		}
+		if v, found, err := w.secrets.Get(context.Background(), pl.scope, pl.id, "Git_Pat"); !found || err != nil || v != values[i] {
+			t.Errorf("%s: Get = %.20q, %v, %v; want %.20q", pl.path, v, found, err, values[i])
+		}
+	}
+}
+
+func TestUpdateSecret_RejectsABodyWithoutAStringValue(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "K")
+	before := w.do(t, w.ownerKey, http.MethodGet, "/workspaces/acme/secrets", nil)
+	w.advance(90 * time.Second)
+	bodies := map[string]any{
+		"no value":  map[string]any{},
+		"null":      map[string]any{"value": nil},
+		"a number":  map[string]any{"value": 7},
+		"too large": map[string]any{"value": strings.Repeat("x", secret.MaxValueSize+1)},
+	}
+	for name, body := range bodies {
+		a := w.do(t, w.ownerKey, http.MethodPatch, "/workspaces/acme/secrets/K", body)
+		if typ, _ := errorOf(t, a); a.status != http.StatusBadRequest || typ != "invalid_request" {
+			t.Errorf("%s: %d %s, want 400 invalid_request", name, a.status, a.body)
+		}
+	}
+	after := w.do(t, w.ownerKey, http.MethodGet, "/workspaces/acme/secrets", nil)
+	if v, _, _ := w.secrets.Get(context.Background(), secret.ScopeWorkspace, "acme", "K"); v != valueOf("K") || !bytes.Equal(after.body, before.body) {
+		t.Errorf("after the refusals: K = %q and list %s; want %q and %s", v, after.body, valueOf("K"), before.body)
+	}
+}
+
+func TestUpdateSecret_RefusesWithoutACurrentKey(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "A")
+	sealed := func() (b []byte) {
+		if err := w.Store.Main().QueryRowContext(context.Background(), `SELECT sealed FROM secrets WHERE key = 'A'`).Scan(&b); err != nil {
+			t.Fatalf("read the sealed value of A: %v", err)
+		}
+		return b
+	}
+	stored := sealed()
+	w.RestartEnv(t, nil)
+	for _, key := range []string{"A", "UNKNOWN"} {
+		a := w.do(t, w.ownerKey, http.MethodPatch, "/workspaces/acme/secrets/"+key, map[string]any{"value": "x"})
+		if typ, _ := errorOf(t, a); a.status != http.StatusServiceUnavailable || typ != "secrets_unavailable" {
+			t.Errorf("%s: %d %s, want 503 secrets_unavailable", key, a.status, a.body)
+		}
+	}
+	if !bytes.Equal(sealed(), stored) {
+		t.Error("the refused update changed the sealed value of A")
+	}
+}
+
+func TestUpdateSecret_OverwritesAValueNoKeyOpens(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "K")
+	_, other := newKey(t)
+	w.RestartEnv(t, map[string]string{secret.EnvCurrentKey: other})
+	ctx := context.Background()
+	if _, _, err := w.secrets.Get(ctx, secret.ScopeWorkspace, "acme", "K"); !errors.Is(err, secret.ErrUnreadable) {
+		t.Fatalf("Get under another key = %v, want ErrUnreadable", err)
+	}
+	if a := w.do(t, w.ownerKey, http.MethodPatch, "/workspaces/acme/secrets/K", map[string]any{"value": "again"}); a.status != http.StatusOK {
+		t.Errorf("update = %d %s, want 200", a.status, a.body)
+	}
+	if v, _, err := w.secrets.Get(ctx, secret.ScopeWorkspace, "acme", "K"); v != "again" || err != nil {
+		t.Errorf("Get after the update = %q, %v; want again", v, err)
+	}
+}
+
+func TestChangeSecret_AnswersNotFoundForAKeyTheScopeDoesNotHold(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeUser, w.memberID, "MINE")
+	w.seed(t, secret.ScopeWorkspace, "acme", "PARENTS")
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		var body any
+		if method == http.MethodPatch {
+			body = changed
+		}
+		for _, k := range []string{"MISSING", "not-a-key", "MINE", "PARENTS"} {
+			a := w.do(t, w.memberKey, method, "/workspaces/acme-fork/secrets/"+k, body)
+			typ, msg := errorOf(t, a)
+			if want := `key "` + k + `" not found`; a.status != http.StatusNotFound || typ != "not_found" || msg != want {
+				t.Errorf("%s %s on the fork = %d %s, want 404 not_found %q", method, k, a.status, a.body, want)
+			}
+		}
+	}
+	if w.count(t, secret.ScopeUser, w.memberID) != 1 || w.count(t, secret.ScopeWorkspace, "acme") != 1 {
+		t.Error("a refused change removed a secret of another scope")
+	}
+}
+
+func TestDeleteSecret_RemovesItWithOrWithoutAKeyThatOpensIt(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "Kept", "No_Key", "Other_Key")
+	_, other := newKey(t)
+	cases := []struct {
+		name, key string
+		restart   bool
+		env       map[string]string
+	}{
+		{"key configured", "kept", false, nil},
+		{"no key configured", "NO_KEY", true, nil},
+		{"sealed under a key no longer configured", "other_key", true, map[string]string{secret.EnvCurrentKey: other}},
+	}
+	for i, tc := range cases {
+		if tc.restart {
+			w.RestartEnv(t, tc.env)
+		}
+		a := w.do(t, w.ownerKey, http.MethodDelete, "/workspaces/acme/secrets/"+tc.key, nil)
+		if a.status != http.StatusNoContent || len(a.body) != 0 {
+			t.Errorf("%s: %d %q, want 204 and no body", tc.name, a.status, a.body)
+		}
+		if got := pageOf(t, w.do(t, w.ownerKey, http.MethodGet, "/workspaces/acme/secrets", nil)).keys(t); len(got) != 2-i {
+			t.Errorf("%s: list = %v after the delete", tc.name, got)
+		}
+		if i == 0 {
+			if a := w.do(t, w.ownerKey, http.MethodPost, "/workspaces/acme/secrets", entries(map[string]any{"key": "Kept"})); a.status != http.StatusCreated {
+				t.Errorf("%s: create again = %d %s, want 201", tc.name, a.status, a.body)
+			}
+			w.do(t, w.ownerKey, http.MethodDelete, "/workspaces/acme/secrets/Kept", nil)
+		}
+	}
+}
+
+func TestChangeSecret_WritesAnEventNamingTheStoredKey(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "Git_Pat")
+	steps := []struct {
+		method, key, action string
+		body                any
+	}{
+		{http.MethodPatch, "GIT_PAT", "update", changed},
+		{http.MethodDelete, "git_pat", "delete", nil},
+	}
+	want := map[string]string{"scope": "workspace", "scope_id": "acme", "key": "Git_Pat"}
+	for _, s := range steps {
+		_, seq := w.eventsAfter(t, 0)
+		if a := w.do(t, w.ownerKey, s.method, "/workspaces/acme/secrets/"+s.key, s.body); a.status >= 300 {
+			t.Fatalf("%s %s = %d %s", s.method, s.key, a.status, a.body)
+		}
+		recs, _ := w.eventsAfter(t, seq)
+		if len(recs) != 1 {
+			t.Fatalf("%s: %d new events, want 1", s.method, len(recs))
+		}
+		ev := recs[0]
+		var meta map[string]string
+		_ = json.Unmarshal(ev.Metadata, &meta)
+		if ev.Type != "parley.secret."+s.action || ev.Action != s.action || ev.ResourceType != "secret" || ev.ResourceID != "Git_Pat" ||
+			!maps.Equal(meta, want) || !equalPtr(ev.Workspace, ptr("acme")) ||
+			ev.ActorType != event.ActorAPIKey || !equalPtr(ev.ActorID, &w.ownerID) {
+			t.Errorf("%s: event = %+v, metadata %s; want the %s of Git_Pat in acme by owner", s.method, ev, ev.Metadata, s.action)
 		}
 	}
 }

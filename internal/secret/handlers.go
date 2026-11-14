@@ -3,6 +3,7 @@ package secret
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,7 +24,11 @@ const (
 
 // The event types of the secret routes. An event names the secret by its
 // stored key and never carries its value.
-const eventCreate = "parley.secret.create"
+const (
+	eventCreate = "parley.secret.create"
+	eventUpdate = "parley.secret.update"
+	eventDelete = "parley.secret.delete"
+)
 
 // errLimit is how the routes answer ErrLimitReached.
 var errLimit = server.NewError("secret_limit_reached", http.StatusTooManyRequests, ErrLimitReached.Error())
@@ -41,16 +46,20 @@ var collections = []struct {
 	{"/workspaces/:slug/secrets", map[string]string{MarkScope: string(ScopeWorkspace), access.MarkNeed: string(access.NeedOwner)}},
 }
 
-// Routes returns the secret routes of the REST API. Each carries its scope
-// mark, so that ScopeCheck resolves its scope before the handler runs, and
-// the PAT scope it needs. A create is a create route, so that a retried
-// request with its Idempotency-Key creates nothing twice.
+// Routes returns the secret routes of the REST API: a list and a create on
+// each collection, an update and a delete on each of its secrets. Each
+// carries its scope mark, so that ScopeCheck resolves its scope before the
+// handler runs, and the PAT scope it needs. A create is a create route, so
+// that a retried request with its Idempotency-Key creates nothing twice.
 func (c *Component) Routes() []server.Route {
 	var routes []server.Route
 	for _, col := range collections {
+		one := col.pattern + "/:key"
 		routes = append(routes,
 			server.Route{Method: http.MethodGet, Pattern: col.pattern, Scope: scopeRead, Marks: col.marks, Handler: c.list},
 			server.Route{Method: http.MethodPost, Pattern: col.pattern, Scope: scopeWrite, Marks: col.marks, Handler: c.create, Create: true},
+			server.Route{Method: http.MethodPatch, Pattern: one, Scope: scopeWrite, Marks: col.marks, Handler: c.update},
+			server.Route{Method: http.MethodDelete, Pattern: one, Scope: scopeWrite, Marks: col.marks, Handler: c.remove},
 		)
 	}
 	return routes
@@ -143,6 +152,91 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// update answers PATCH on a secret: it seals the body's value under the
+// current key in place of the old one, which it never opens, so a value no
+// configured key opens can still be replaced. The key keeps the casing it
+// was first stored with and its creation time. The body is checked before
+// the key, and the key before the secret is looked up, so a hub that cannot
+// store answers 503 for a key the scope does not hold too. The path's key is
+// not checked against the key rules: one no secret can have is not found.
+func (c *Component) update(w http.ResponseWriter, r *http.Request) error {
+	t, err := targetOf(r)
+	if err != nil {
+		return err
+	}
+	name := server.Param(r, "key")
+	value, err := decodeValue(r, name)
+	if err != nil {
+		return err
+	}
+	if !c.Available() {
+		return UnavailableError
+	}
+	ctx := r.Context()
+	in, err := eventInput(ctx, t)
+	if err != nil {
+		return err
+	}
+	var it Item
+	err = c.change(ctx, func(tx *sql.Tx) error {
+		var err error
+		if it, err = c.UpdateEntry(ctx, tx, t.scope, t.id, name, value); err != nil {
+			return err
+		}
+		return c.emit(ctx, tx, t, in, eventUpdate, it.Key)
+	})
+	if err != nil {
+		return routeError(err)
+	}
+	server.WriteJSON(w, http.StatusOK, itemOf(it))
+	return nil
+}
+
+// remove answers DELETE on a secret with 204 and no body. It never opens
+// the value, so it works on a hub without a key and on a value no
+// configured key opens.
+func (c *Component) remove(w http.ResponseWriter, r *http.Request) error {
+	t, err := targetOf(r)
+	if err != nil {
+		return err
+	}
+	ctx := r.Context()
+	in, err := eventInput(ctx, t)
+	if err != nil {
+		return err
+	}
+	err = c.change(ctx, func(tx *sql.Tx) error {
+		it, err := c.DeleteEntry(ctx, tx, t.scope, t.id, server.Param(r, "key"))
+		if err != nil {
+			return err
+		}
+		return c.emit(ctx, tx, t, in, eventDelete, it.Key)
+	})
+	if err != nil {
+		return routeError(err)
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// decodeValue reads the body of an update request, {"value": string}, and
+// answers 400 invalid_request, naming key, when value is absent, null, not
+// a string or over the size limit. Other members are ignored.
+func decodeValue(r *http.Request, key string) (string, error) {
+	var body map[string]json.RawMessage
+	if err := server.DecodeJSON(r, &body); err != nil {
+		return "", err
+	}
+	var value string
+	if !isString(body["value"]) || json.Unmarshal(body["value"], &value) != nil {
+		return "", server.InvalidRequest(fmt.Sprintf("the value of key %q must be a string", key))
+	}
+	if err := CheckValue(key, value); err != nil {
+		return "", server.InvalidRequest(err.Error())
+	}
+	return value, nil
+}
+
 // change runs fn in a write transaction of the store, which commits the
 // secrets and their events together or neither.
 func (c *Component) change(ctx context.Context, fn func(*sql.Tx) error) error {
@@ -194,6 +288,8 @@ func routeError(err error) error {
 		return server.InvalidRequest(ke.msg)
 	case errors.As(err, &ke) && errors.Is(err, ErrConflict):
 		return server.Conflict(ke.msg)
+	case errors.As(err, &ke) && errors.Is(err, ErrNotFound):
+		return server.NotFound(ke.msg)
 	case errors.Is(err, ErrUnavailable):
 		return UnavailableError
 	case errors.Is(err, ErrLimitReached):

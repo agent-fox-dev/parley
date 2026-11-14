@@ -2011,6 +2011,63 @@ every item, RFC 3339 in UTC with whole seconds; never a value.
 | `429` `secret_limit_reached` | the scope would hold more than 100 secrets (`maximum of 100 entries per scope exceeded`); nothing is stored |
 | `503` `secrets_unavailable` | the hub has no current encryption key (`secrets cannot be stored: no encryption key configured`); nothing is stored |
 
+## `PATCH /api/v1/user/secrets/{key}`, `PATCH /api/v1/orgs/{slug}/secrets/{key}`, `PATCH /api/v1/workspaces/{slug}/secrets/{key}`
+
+Replaces the value of the scope's secret whose key equals `{key}` ignoring
+the case of `A` to `Z`, and declares the scope `secrets:write` for a PAT.
+Who may call each route is in [Secrets](#secrets). `{key}` is not checked
+against the key rules: a key no secret can have is not found.
+
+The body is a JSON object with `value`, a string of at most 262144 bytes;
+other members are ignored:
+
+```json
+{"value":"ghp_…"}
+```
+
+The body is checked first, then a hub without a current encryption key
+answers `503`, for a key the scope does not hold too; then the secret is
+looked up. The new value is sealed under the current key without opening
+the old one, so a value the configured keys cannot decrypt is replaced too.
+The key keeps the casing it was first stored with and its `created_at`;
+`updated_at` is the time of the update. One event `parley.secret.update` is
+written in the same transaction, as for a create, with `resource_id` and
+`metadata.key` the key as it is stored, whatever casing the path used. If
+the event cannot be written, nothing changes and the answer is `500`.
+
+The answer is the secret as an item of the list: exactly `key`, as stored,
+`created_at` and `updated_at`; never a value.
+
+```json
+{"key":"GIT_PAT","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:31:45Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the value was replaced; the body is the item as above |
+| `400` `invalid_request` | `value` is absent, `null`, not a string (`the value of key "K" must be a string`) or longer than 262144 bytes (`the value of key "K" is longer than 262144 bytes`), `K` the key as the path gives it; or the body is not a JSON object (see [Request bodies](#request-bodies)). Nothing changes |
+| `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
+| `403` `forbidden` | as for the list (see above) |
+| `404` `not_found` | as for the list (see above); or the scope holds no such key (`key "K" not found`, `K` as the path gives it). A key held only by another scope, a task fork's parent included, is not found |
+| `503` `secrets_unavailable` | the hub has no current encryption key (`secrets cannot be stored: no encryption key configured`); nothing changes |
+
+## `DELETE /api/v1/user/secrets/{key}`, `DELETE /api/v1/orgs/{slug}/secrets/{key}`, `DELETE /api/v1/workspaces/{slug}/secrets/{key}`
+
+Removes the scope's secret whose key equals `{key}` ignoring the case of `A`
+to `Z`, and declares the scope `secrets:write` for a PAT. Who may call each
+route is in [Secrets](#secrets). The value is never read, so the route works
+on a hub without an encryption key and on a value the configured keys
+cannot decrypt. One event `parley.secret.delete` is written in the same
+transaction, named as for an update. If the event cannot be written, the
+secret stays and the answer is `500`. A removed key can be created again.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the secret was removed; the body is empty |
+| `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
+| `403` `forbidden` | as for the list (see above) |
+| `404` `not_found` | as for the update (see above) |
+
 ## `GET /api/v1/events`
 
 Streams the hub events the caller may see as Server-Sent Events: first the

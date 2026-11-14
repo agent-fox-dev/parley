@@ -1930,7 +1930,13 @@ checks the body (`internal/secret/validate.go`), answers
 `store.Tx`, calls `(*secret.Component).CreateEntries` and writes one
 `parley.secret.create` event per entry through the component's
 `secret.Emitter` (`*event.Component`), so the entries and their events
-commit together or not at all.
+commit together or not at all. The update handler checks the body's `value`,
+answers `secret.UnavailableError` without a current key, and then, in one
+`store.Tx`, calls `(*secret.Component).UpdateEntry`, which seals the new
+value without opening the old one, and writes `parley.secret.update`; the
+delete handler needs no key and calls `(*secret.Component).DeleteEntry`,
+which never opens the value, and writes `parley.secret.delete`. Both events
+name the key as it is stored, whatever casing the path used.
 
 ### The logger
 
