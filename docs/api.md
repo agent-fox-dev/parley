@@ -1564,9 +1564,16 @@ takes no lock. Without `force` origin's branch moves only by a
 fast-forward: a branch origin lacks is created, one origin has is moved
 only when origin's head is an ancestor of the hub's, and a branch origin
 already has at the hub's head is left as it is. A protected branch is
-pushed like any other without `force`. A forced push is handed to git with
-the explicit lease that origin must not have the branch, never with a plain
-force.
+pushed like any other without `force`. A forced push replaces origin's
+branch only while it is where the hub last saw it: it is handed to git with
+an explicit lease for that one ref, the origin head the hub recorded for
+the branch, or, when none is recorded, that origin must not have the
+branch, never with a plain force. A forced push that is a fast-forward or
+creates the branch is `pushed`; a branch origin already has at the hub's
+head is `up_to_date`, whatever the lease. A forced push refused because
+origin's branch moved changes neither origin's branch nor the recorded
+origin head; a sync brings in what origin has, after which the push may be
+tried again.
 
 Before origin is contacted the hub refuses, after the body and the branch
 name and in this order: a workspace that is not `ready` or on which a
@@ -1583,8 +1590,9 @@ no branch and no recorded origin head and writes no event.
 The answer of a push origin took names the branch, the commit pushed, the
 remote and its URL, the workspace's `git_url` without user information
 (a `git@host:path` URL as it is stored), and the result: `pushed` when
-origin's branch was created or moved forward, `up_to_date` when it was at
-the commit already.
+origin's branch was created or moved forward, `forced` when a forced push
+replaced it with a commit that does not descend from it, `up_to_date` when
+it was at the commit already.
 
 ```json
 {"branch":"feature","sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","remote":"origin","remote_url":"https://example.com/a.git","result":"pushed"}
@@ -1592,7 +1600,7 @@ the commit already.
 
 | Status | When |
 |---|---|
-| `200 OK` | origin took the push; `result` is `pushed` or `up_to_date` |
+| `200 OK` | origin took the push; `result` is `pushed`, `forced` or `up_to_date` |
 | `400` `invalid_request` | the body is not a JSON object (`request body must be a JSON object`, `request body is not valid JSON`), its `force` is not a JSON boolean (`request body member "force" must be true or false`), or the decoded name is not a valid branch name (`branch name "<name>": <the rule it breaks>`) |
 | `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to push to`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`), before the body is looked at |
@@ -1606,6 +1614,7 @@ the commit already.
 | `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
 | `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
 | `409` `non_fast_forward` | without `force`, origin's branch is not an ancestor of the hub's head: the two diverged or origin's is ahead (`origin's branch "<name>" is not an ancestor of the hub's head <sha> (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's commits, or push with force to replace origin's branch`); origin's branch and the hub's recorded origin head are unchanged |
+| `409` `origin_moved` | `force` is `true` and origin's branch is neither at the hub's head nor where the lease says: it moved since the hub last saw it, it exists although the hub recorded no origin head for it, or it is gone although the hub recorded one (`origin's branch "<name>" changed since the hub last saw it (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's branch, then push again`, or with `the hub has no record of origin's head of it, so origin must not have it` in the parentheses); origin's branch and the hub's recorded origin head are unchanged |
 | `503` `unavailable` | the patch list of a `carry_patch` workspace could not be read (`the patch list of workspace "<slug>" cannot be read; try again later`); nothing is pushed |
 | `500` `internal` | the workspace's secrets could not be read, or the push failed otherwise |
 

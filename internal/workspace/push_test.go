@@ -442,3 +442,61 @@ func TestPush_AnswersTheFirstFailingCheck(t *testing.T) {
 		t.Errorf("refused pushes reached the push operation: %+v", calls)
 	}
 }
+
+func TestPush_ForcesOnlyUnderTheRecordedOriginHead(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	base := ref(t, p.copy, "refs/heads/main")
+	rewrite := func(branch string) { grow(t, p.copy, branch, base, "hub") }
+	for _, c := range []struct {
+		name, branch string
+		// arrange sets origin's branch, its recorded origin head and the
+		// hub's branch.
+		arrange func(branch string)
+		result  string // "": the push is refused as 409 origin_moved
+	}{
+		{"origin at the recorded head, which the hub's head does not descend from", "replaced", func(b string) {
+			p.seen(t, b, base)
+			rewrite(b)
+		}, "forced"},
+		{"a fast-forward from the recorded head", "ahead", func(b string) { grow(t, p.copy, b, p.seen(t, b, base), "hub") }, "pushed"},
+		{"a branch origin lacks and no head is recorded for", "created", rewrite, "pushed"},
+		{"origin's branch got a commit after the recorded head", "moved", func(b string) {
+			grow(t, p.origin.Dir(), b, p.seen(t, b, base), "origin")
+			rewrite(b)
+		}, ""},
+		{"origin has the branch and no head is recorded", "unrecorded", func(b string) {
+			p.seen(t, b, base)
+			p.setOriginHead(t, b, "")
+			rewrite(b)
+		}, ""},
+		{"a head is recorded and origin deleted the branch", "deleted", func(b string) {
+			p.seen(t, b, base)
+			gitrepotest.Git(t, p.origin.Dir(), "update-ref", "-d", "refs/heads/"+b)
+			rewrite(b)
+		}, ""},
+	} {
+		c.arrange(c.branch)
+		hub, theirs, recorded := ref(t, p.copy, "refs/heads/"+c.branch), p.origin.Head(c.branch), ref(t, p.copy, "refs/remotes/origin/"+c.branch)
+		a := p.push(t, p.uKey, syncSlug, c.branch, `{"force":true}`)
+		if c.result == "" {
+			if a.status != http.StatusConflict || a.errorType(t) != "origin_moved" {
+				t.Errorf("%s: answer %d %s, want 409 origin_moved", c.name, a.status, a.body)
+			}
+			if got := p.origin.Head(c.branch); got != theirs {
+				t.Errorf("%s: origin's branch moved from %q to %q", c.name, theirs, got)
+			}
+			if got := ref(t, p.copy, "refs/remotes/origin/"+c.branch); got != recorded {
+				t.Errorf("%s: the recorded origin head moved from %q to %q", c.name, recorded, got)
+			}
+			continue
+		}
+		obj := a.decode(t, http.StatusOK)
+		if obj["result"] != c.result || obj["sha"] != hub {
+			t.Errorf("%s: answer %v, want %s at %s", c.name, obj, c.result, hub)
+		}
+		if got := p.origin.Head(c.branch); got != hub {
+			t.Errorf("%s: origin's branch is at %q, want %s", c.name, got, hub)
+		}
+	}
+}

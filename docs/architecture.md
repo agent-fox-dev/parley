@@ -2186,7 +2186,13 @@ without one no branch is a patch branch. The handler then reads the
 branch's head once with `ResolveBranch` (no branch is `404
 branch_not_found`), resolves the credential with
 `ResolveOriginCredential` and hands one `gitrepo.PushRequest` to
-`Deps.Pusher`; it takes no lock. It answers `200` with `branch`, `sha`,
+`Deps.Pusher`; it takes no lock. For a forced push the request's `Lease`
+is the branch's recorded origin head (`OriginHead`), or `""`, origin must
+not have the branch, when none is recorded; `gitrepo.Git.Push` passes it as
+`--force-with-lease=refs/heads/<name>:<lease>` and never a plain force, and
+reads git's `+` status as `forced` and its stale-info refusal as an error
+matching `gitrepo.ErrOriginMoved`, which the handler answers `409
+origin_moved` without touching the recorded origin head. It answers `200` with `branch`, `sha`,
 `remote` `origin`, `remote_url` (`withoutUserinfo` of `git_url`: an https
 URL without user information, any other form as stored) and `result`; an
 error matching `gitrepo.ErrNonFastForward` is `409 non_fast_forward`,

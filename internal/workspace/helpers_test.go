@@ -1198,6 +1198,33 @@ func newPushWorld(t *testing.T, secrets map[string]string, originOpts ...gitrepo
 	return &pushWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), pushes: p}
 }
 
+// seen points branch of the hub's copy and of origin at one new commit on
+// top of from and records it as the branch's origin head, as a sync that
+// brought it in leaves them, and returns the commit.
+func (p *pushWorld) seen(t *testing.T, branch, from string) string {
+	t.Helper()
+	id := grow(t, p.copy, branch, from, "seen")
+	gitrepotest.Git(t, p.copy, "push", "--quiet", p.origin.Dir(), id+":refs/heads/"+branch)
+	p.setOriginHead(t, branch, id)
+	return id
+}
+
+// setOriginHead records id as the origin head of branch in the hub's copy,
+// or removes the record when id is "".
+func (p *pushWorld) setOriginHead(t *testing.T, branch, id string) {
+	t.Helper()
+	ctx := context.Background()
+	repo, err := gitrepo.Git{}.Open(ctx, p.copy)
+	if err == nil && id == "" {
+		err = repo.DeleteOriginHead(ctx, branch)
+	} else if err == nil {
+		err = repo.SetOriginHead(ctx, branch, id)
+	}
+	if err != nil {
+		t.Fatalf("setting the origin head of %s to %q: %v", branch, id, err)
+	}
+}
+
 // push sends POST /workspaces/<slug>/branches/<segment>/push, segment being
 // the branch name as the path carries it, with body (nil for none) and cred
 // as the bearer credential.

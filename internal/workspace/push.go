@@ -106,12 +106,25 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	var lease string
+	var recorded bool
+	if force {
+		// The lease is the origin head the hub last saw, so that a forced
+		// push replaces only commits the hub has seen; with none recorded
+		// origin must not have the branch.
+		if lease, recorded, err = repo.OriginHead(ctx, name); err != nil {
+			return err
+		}
+	}
 	originURL := deref(rec.GitURL)
 	result, err := s.deps.Pusher.Push(ctx, gitrepo.PushRequest{
-		Dir: repo.Dir(), URL: originURL, Credential: cred, Commit: head, Branch: name, Force: force,
+		Dir: repo.Dir(), URL: originURL, Credential: cred, Commit: head, Branch: name, Force: force, Lease: lease,
 	})
 	if errors.Is(err, gitrepo.ErrNonFastForward) {
 		return nonFastForward(ctx, repo, name, head)
+	}
+	if errors.Is(err, gitrepo.ErrOriginMoved) {
+		return originMoved(name, lease, recorded)
 	}
 	if err != nil {
 		return err
@@ -227,6 +240,22 @@ func nonFastForward(ctx context.Context, repo *gitrepo.Repo, branch, head string
 	return server.NewError("non_fast_forward", http.StatusConflict, fmt.Sprintf(
 		"origin's branch %q is not an ancestor of the hub's head %s (%s); sync the workspace to bring in origin's commits, or push with force to replace origin's branch",
 		branch, head, last))
+}
+
+// originMoved is the refusal of a forced push of branch under lease that
+// origin did not take because its branch is no longer in the state the
+// lease names; recorded tells whether the lease is a recorded origin head
+// or the statement that origin lacks the branch. Origin's branch and the
+// recorded origin head are left as they are: a sync brings in what origin
+// has, after which the push may be tried again.
+func originMoved(branch, lease string, recorded bool) error {
+	last := "the hub has no record of origin's head of it, so origin must not have it"
+	if recorded {
+		last = "the origin head the hub last saw is " + lease
+	}
+	return server.NewError("origin_moved", http.StatusConflict, fmt.Sprintf(
+		"origin's branch %q changed since the hub last saw it (%s); sync the workspace to bring in origin's branch, then push again",
+		branch, last))
 }
 
 // withoutUserinfo is the origin URL raw with any user information removed.

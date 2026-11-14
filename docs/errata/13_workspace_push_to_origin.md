@@ -12,9 +12,12 @@ says, or decides what it leaves open.
   origin URL, the credential, the commit id, the branch name and whether
   the push is forced are members of `PushRequest` rather than separate
   arguments, so that a later choice of the push is one more member and no
-  caller changes. It returns a `gitrepo.PushResult` (`pushed`,
-  `up_to_date`) or an error; a non-fast-forward refusal matches
-  `gitrepo.ErrNonFastForward`.
+  caller changes. The lease of a forced push is the member `Lease`, the
+  commit id origin's branch must still have or `""` for a branch origin
+  must not have, read only with `Force`. It returns a `gitrepo.PushResult`
+  (`pushed`, `forced`, `up_to_date`) or an error; a non-fast-forward
+  refusal matches `gitrepo.ErrNonFastForward`, a stale lease
+  `gitrepo.ErrOriginMoved`.
 - The handler is not built from its collaborators as parameters. As for
   the sync, they are fields of `workspace.Deps`, which the hub sets in
   `internal/hub/workspace.go` and tests change through
