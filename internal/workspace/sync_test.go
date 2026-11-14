@@ -506,20 +506,17 @@ func TestSync_ObserverFailureDoesNotFailSync(t *testing.T) {
 
 func TestSync_FetchFailureChangesNothingButTheScrubbedSyncError(t *testing.T) {
 	t.Parallel()
-	refusing := gitrepotest.NewOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", "right"))
-	refusing.History()
-	s := newSyncWorld(t, withGitOrigin(refusing))
+	s := newSyncWorld(t)
 	s.sync(t, workspace.SyncOptions{})
 	if calls := s.fetches.recorded(); len(calls) != 1 || calls[0].deadline != 2*time.Minute {
 		t.Errorf("fetches %+v, want one with the deadline 2m", calls)
 	}
 	s.putSecret(t, syncSlug, workspace.SecretGitPAT, "s3cr3t")
-	// Origins that moved on since: a fetch that got through would change
-	// the copy's refs.
-	for _, o := range []*gitrepotest.Origin{s.origin, refusing} {
-		o.Commit("main", "after the last sync")
-		o.Tag("v2", "dev")
-	}
+	// An origin that moved on since, and takes only another credential: a
+	// fetch that got through would change the copy's refs.
+	s.origin.Commit("main", "after the last sync")
+	s.origin.Tag("v2", "dev")
+	s.origin.Accept("x-token-auth", "right")
 	closing, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -544,7 +541,7 @@ func TestSync_FetchFailureChangesNothingButTheScrubbedSyncError(t *testing.T) {
 	}{
 		{name: "the origin path does not exist", url: filepath.Join(t.TempDir(), "gone.git"),
 			cause: "does not appear to be a git repository"},
-		{name: "origin answers 401 to the credential", url: refusing.URL(), cause: "Authentication failed"},
+		{name: "origin answers 401 to the credential", url: s.origin.URL(), cause: "Authentication failed"},
 		{name: "origin closes the connection", url: "https://" + closing.Addr().String() + "/r.git",
 			cause: closing.Addr().String()},
 		{name: "the fetch reaches its deadline", fetchErr: fmt.Errorf("git fetch: %w (2m0s)", gitrepo.ErrDeadline),

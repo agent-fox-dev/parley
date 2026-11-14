@@ -869,11 +869,13 @@ func (w *world) deleteSecret(t *testing.T, slug, name string) {
 const syncSlug = "demo"
 
 // syncWorld is a world with the ready repository workspace syncSlug of the
-// user u, whose origin is a bare repository on disk holding the origin's
-// usual history (see gitrepotest.Origin.History), and the hub's copy of it at
-// its place, made by the clone work, which records the origin heads. The
-// hub's fetcher records every fetch, and swaps is the hub's hook between a
-// branch's classification and its swap.
+// user u, whose origin takes fetches and pushes over https
+// (gitrepotest.SmartOrigin) and holds the origin's usual history (see
+// gitrepotest.Origin.History), and the hub's copy of it at its place, made by
+// the clone work, which records the origin heads. The hub's fetcher records
+// every fetch and its push operation every push, and swaps is the hub's hook
+// between a branch's classification and its swap. The sync and the push
+// tests share it.
 type syncWorld struct {
 	*world
 	origin *gitrepotest.Origin
@@ -881,23 +883,28 @@ type syncWorld struct {
 	copy    string
 	fetches *recordingFetcher
 	swaps   *swapHook
+	pushes  *recordingPusher
 }
 
 // newSyncWorld starts a world with opts and builds the sync world in it.
 func newSyncWorld(t *testing.T, opts ...option) *syncWorld {
 	t.Helper()
-	o := gitrepotest.NewOrigin(t)
+	o := gitrepotest.SmartOrigin(t)
 	o.History()
-	f, h := &recordingFetcher{}, &swapHook{calls: map[string]int{}, on: map[string]func(int){}}
-	w := newWorld(t, append(opts, withCompose(func(c *hub.Composition) {
-		c.AdjustWorkspace(func(d *workspace.Deps) { f.Fetcher, d.Fetcher, d.BeforeRefSwap = d.Fetcher, f, h.before })
+	f, h, p := &recordingFetcher{}, &swapHook{calls: map[string]int{}, on: map[string]func(int){}}, &recordingPusher{}
+	w := newWorld(t, append(opts, withGitOrigin(o), withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) {
+			f.Fetcher, d.Fetcher, d.BeforeRefSwap = d.Fetcher, f, h.before
+			p.git, _ = d.Pusher.(gitrepo.Git)
+			p.git.Trace, d.Pusher = p.trace, p
+		})
 	}))...)
-	url := o.Dir()
+	url := o.URL()
 	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
 	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
 		t.Fatalf("the clone of the sync workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
 	}
-	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f, swaps: h}
+	return &syncWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), fetches: f, swaps: h, pushes: p}
 }
 
 // sync runs a sync of the workspace with opts, the admin token as the actor
@@ -1168,54 +1175,10 @@ func (p *excluding) asked() []string {
 	return slices.Clone(p.slugs)
 }
 
-// pushWorld is a world with the ready repository workspace syncSlug of the
-// user u, whose origin takes pushes over https (gitrepotest.SmartOrigin) and
-// holds the origin's usual history (see gitrepotest.Origin.History), and the
-// hub's copy of it at its place, made by the clone work, which records the
-// origin heads. The hub's push operation records every push.
-type pushWorld struct {
-	*world
-	origin *gitrepotest.Origin
-	// copy is the git directory of the hub's copy.
-	copy   string
-	pushes *recordingPusher
-}
-
-// newPushWorld builds the push world with an origin built with originOpts,
-// storing the workspace secrets secrets before the clone.
-func newPushWorld(t *testing.T, secrets map[string]string, originOpts ...gitrepotest.Option) *pushWorld {
-	t.Helper()
-	return newPushWorldWith(t, secrets, nil, originOpts...)
-}
-
-// newPushWorldWith is newPushWorld with the hub started with opts too.
-func newPushWorldWith(t *testing.T, secrets map[string]string, opts []option, originOpts ...gitrepotest.Option) *pushWorld {
-	t.Helper()
-	o := gitrepotest.SmartOrigin(t, originOpts...)
-	o.History()
-	p := &recordingPusher{}
-	w := newWorld(t, append([]option{withGitOrigin(o), withCompose(func(c *hub.Composition) {
-		c.AdjustWorkspace(func(d *workspace.Deps) {
-			g, _ := d.Pusher.(gitrepo.Git)
-			g.Trace = p.trace
-			p.git, d.Pusher = g, p
-		})
-	})}, opts...)...)
-	url := o.URL()
-	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
-	for name, value := range secrets {
-		w.putSecret(t, syncSlug, name, value)
-	}
-	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
-		t.Fatalf("the clone of the push workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
-	}
-	return &pushWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), pushes: p}
-}
-
 // seen points branch of the hub's copy and of origin at one new commit on
 // top of from and records it as the branch's origin head, as a sync that
 // brought it in leaves them, and returns the commit.
-func (p *pushWorld) seen(t *testing.T, branch, from string) string {
+func (p *syncWorld) seen(t *testing.T, branch, from string) string {
 	t.Helper()
 	id := grow(t, p.copy, branch, from, "seen")
 	gitrepotest.Git(t, p.copy, "push", "--quiet", p.origin.Dir(), id+":refs/heads/"+branch)
@@ -1225,22 +1188,17 @@ func (p *pushWorld) seen(t *testing.T, branch, from string) string {
 
 // setOriginHead records id as the origin head of branch in the hub's copy,
 // or removes the record when id is "".
-func (p *pushWorld) setOriginHead(t *testing.T, branch, id string) {
+func (p *syncWorld) setOriginHead(t *testing.T, branch, id string) {
 	t.Helper()
-	ctx := context.Background()
-	repo, err := gitrepo.Git{}.Open(ctx, p.copy)
-	if err == nil && id == "" {
-		err = repo.DeleteOriginHead(ctx, branch)
-	} else if err == nil {
-		err = repo.SetOriginHead(ctx, branch, id)
+	args := []string{"update-ref", "refs/remotes/origin/" + branch, id}
+	if id == "" {
+		args = []string{"update-ref", "-d", "refs/remotes/origin/" + branch}
 	}
-	if err != nil {
-		t.Fatalf("setting the origin head of %s to %q: %v", branch, id, err)
-	}
+	gitrepotest.Git(t, p.copy, args...)
 }
 
 // asked is closed once origin has been sent a request more than now.
-func (p *pushWorld) asked() <-chan struct{} {
+func (p *syncWorld) asked() <-chan struct{} {
 	n, ch := p.origin.Requests(), make(chan struct{})
 	go func() {
 		for deadline := time.Now().Add(10 * time.Second); p.origin.Requests() == n && time.Now().Before(deadline); {
@@ -1258,7 +1216,7 @@ func (p *pushWorld) asked() <-chan struct{} {
 // and otherwise ok false and error_type outcome; for a result also the
 // branch's origin head in the hub's copy, and for the default branch main
 // the workspace's origin_head_sha, at sha.
-func (p *pushWorld) checkRecords(t *testing.T, what string, n int, branch, sha string, force bool, outcome string) {
+func (p *syncWorld) checkRecords(t *testing.T, what string, n int, branch, sha string, force bool, outcome string) {
 	t.Helper()
 	evs := p.eventsOf(t, pushEvent)
 	if len(evs) != n+1 {
@@ -1288,17 +1246,6 @@ func (p *pushWorld) checkRecords(t *testing.T, what string, n int, branch, sha s
 			deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), ev.ResourceType, ev.ResourceID, meta,
 			syncSlug, event.ActorAPIKey, p.u, branch, want)
 	}
-}
-
-// outcome is the result of a push's answer a when it is 200, its error type
-// otherwise.
-func (a answer) outcome(t *testing.T) string {
-	t.Helper()
-	if a.status == http.StatusOK {
-		r, _ := a.decode(t, http.StatusOK)["result"].(string)
-		return r
-	}
-	return a.errorType(t)
 }
 
 // push sends POST /workspaces/<slug>/branches/<segment>/push, segment being
