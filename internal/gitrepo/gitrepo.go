@@ -295,6 +295,28 @@ func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...stri
 		return nil, "", err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
+	cmd := g.command(ctx, dir, a, args)
+	var out bytes.Buffer
+	errOut := &limitedBuffer{limit: stderrLimit}
+	cmd.Stdout, cmd.Stderr = &out, errOut
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	if err := cmd.Run(); err != nil {
+		stderr = strings.TrimSpace(errOut.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return out.Bytes(), stderr, fmt.Errorf("git %s: %w", subcommand(args), ctxErr)
+		}
+		return out.Bytes(), stderr, fmt.Errorf("git %s: %w: %s", subcommand(args), err, stderr)
+	}
+	return out.Bytes(), "", nil
+}
+
+// command is the git process that runs args under ctx in the home
+// directory of the private directory dir, with the minimal environment, Env
+// and a's credential, and that is killed with every process it started when
+// ctx ends.
+func (g Git) command(ctx context.Context, dir string, a access, args []string) *exec.Cmd {
 	if g.Trace != nil {
 		g.Trace(append([]string(nil), args...))
 	}
@@ -313,22 +335,9 @@ func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...stri
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
 		"LC_ALL=C",
 	}, g.Env...), credentialEnv(dir, a.cred, a.url)...)
-	var out bytes.Buffer
-	errOut := &limitedBuffer{limit: stderrLimit}
-	cmd.Stdout, cmd.Stderr = &out, errOut
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
 	cmd.WaitDelay = waitDelay
 	killGroupOnCancel(cmd)
-	if err := cmd.Run(); err != nil {
-		stderr = strings.TrimSpace(errOut.String())
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return out.Bytes(), stderr, fmt.Errorf("git %s: %w", subcommand(args), ctxErr)
-		}
-		return out.Bytes(), stderr, fmt.Errorf("git %s: %w: %s", subcommand(args), err, stderr)
-	}
-	return out.Bytes(), "", nil
+	return cmd
 }
 
 // subcommand is the git command args run, for an error's text.

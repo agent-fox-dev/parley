@@ -651,8 +651,40 @@ An error the hub did not expect, such as a failed read of the store or a
 workspace whose repository is missing from disk, is answered `500` with the
 body `internal error`, nothing of the cause in it, and written to the hub's
 log with the request id, the route's pattern and the repository segment.
-The hub has no git service yet: a request that passes every check is answered
-`500 internal error`.
+
+A fetch that passed every check is served by `git upload-pack` on the
+workspace's repository, as stock git expects it; a request body of any size
+and any `Content-Type` is taken. The `paths` of a PAT are not read.
+
+- `GET …/info/refs?service=git-upload-pack` answers `200` with
+  `Content-Type: application/x-git-upload-pack-advertisement` and
+  `Cache-Control: no-cache`. When the `Git-Protocol` header has the entry
+  `version=2` (entries are separated by `:`), the body is git's protocol
+  version 2 capability advertisement (first pkt-line `version 2`, then
+  capabilities such as `ls-refs` and `fetch`, no refs). Otherwise, with no
+  header or any other value, it is protocol version 0: the pkt-line
+  `# service=git-upload-pack`, a flush packet `0000`, then one pkt-line per
+  ref, the first carrying git's capability list.
+- `POST …/git-upload-pack` answers `200` with
+  `Content-Type: application/x-git-upload-pack-result` and
+  `Cache-Control: no-cache`, and its body is git's answer, sent as git
+  writes it. A body sent with `Content-Encoding: gzip` is decompressed
+  first.
+
+Once the answer has begun, an error is reported in band, as one pkt-line
+starting with `ERR `, and no pack follows it:
+
+| When | Pkt-line |
+|---|---|
+| the request body is empty | `ERR empty request` |
+| `Content-Encoding` is `gzip` but the body is not valid gzip | `ERR invalid gzip body` |
+| git refuses the request | `ERR ` and git's own text, the last line of its error output without `fatal: ` |
+| the run of git takes longer than `[git].timeout` (see [configuration.md](configuration.md)) | `ERR request timed out` |
+
+On a timeout git is killed and the answer ends; the `ERR` pkt-line is
+written only when no pack data had been sent yet, and the client's git
+fails. A push that passed every check is answered `500 internal error`: the
+hub has no push service yet.
 
 ## `GET /healthz`
 

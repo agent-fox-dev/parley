@@ -2,9 +2,12 @@ package gitserver_test
 
 import (
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -85,5 +88,23 @@ func TestState_JudgesAForkByItsOwnStatusThenByItsParent(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestState_ServesFetchesFromAForkOfAnArchivedParent(t *testing.T) {
+	t.Parallel()
+	w := newGitWorld(t, hubtest.Config{})
+	w.addFork(t)
+	gitrepotest.Git(t, w.workspaces.RepoPath("demo--t1"), "update-ref", "refs/heads/main", w.head)
+	w.setStatus(t, "demo", access.StatusArchived)
+	if a := w.call(t, http.MethodGet, "/git/acme/demo--t1.git/info/refs?service=git-upload-pack", basic("x", w.memberKey)); a.status != http.StatusOK {
+		t.Errorf("ref discovery = %d %q, want 200", a.status, a.body)
+	}
+	dir := t.TempDir()
+	if out, err := clientGit(t, dir, nil, "clone", w.remote(w.memberKey, "acme/demo--t1.git"), "d"); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	if got, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != w.head {
+		t.Errorf("origin/main of the clone = %s, want %s", got, w.head)
 	}
 }

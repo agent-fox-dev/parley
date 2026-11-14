@@ -13,9 +13,9 @@ package gitserver
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -138,9 +138,15 @@ type Deps struct {
 	// Repositories opens the repository of a workspace; with none, a
 	// request that passed every other check is answered 500 internal error.
 	Repositories Repositories
-	// Service serves a request that passed the checks; with none, such a
-	// request is answered 500 internal error.
+	// Service, when set, serves a request that passed the checks in place
+	// of the component's own exchange with git; tests put a recorder there.
 	Service Service
+	// Runner runs git upload-pack for the exchange of a fetch; with none, a
+	// fetch that passed the checks is answered 500 internal error. A push
+	// has no service yet and is answered 500 internal error.
+	Runner Runner
+	// Timeout bounds one run of upload-pack; zero is DefaultTimeout.
+	Timeout time.Duration
 	// Logger receives the causes of 500 answers; nil discards them.
 	Logger *slog.Logger
 }
@@ -195,7 +201,8 @@ var checks = []check{
 }
 
 // handler serves route: it runs the checks in order, stops at the first
-// that refuses, and hands a request that passed them all to the Service.
+// that refuses, and serves a request that passed them all with git, or
+// hands it to the Service when one is set.
 func (c *Component) handler(route Route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		x := Exchange{Route: route, Service: serviceOf(route, r)}
@@ -205,11 +212,11 @@ func (c *Component) handler(route Route) http.Handler {
 				return
 			}
 		}
-		if c.deps.Service == nil {
-			c.fail(w, r, errors.New("no git service is installed"))
+		if c.deps.Service != nil {
+			c.deps.Service.Serve(w, r, x)
 			return
 		}
-		c.deps.Service.Serve(w, r, x)
+		c.exchange(w, r, x)
 	})
 }
 

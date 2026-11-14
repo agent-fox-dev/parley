@@ -22,12 +22,14 @@ const gitServerHook = "gitserver"
 // fork component, whose parent check judges a fork's parent as it does for
 // every route that works on a fork, and to the workspace service's place
 // of each repository on disk, which is opened with the hub's git before any
-// exchange. The server, and with it the limiter, is built after the start
-// hooks, so the limiter reaches the component through a server hook: the
-// component holds a serverLimiter, which the hook points at the limiter of
-// the server that serves.
+// exchange, to the hub's git, which runs upload-pack for a fetch, and to
+// [git].timeout, which it registers and which bounds each run. The server,
+// and with it the limiter, is built after the start hooks, so the limiter
+// reaches the component through a server hook: the component holds a
+// serverLimiter, which the hook points at the limiter of the server that
+// serves.
 //
-// No git service is installed: a request that passes the checks is answered
+// No push service is installed: a push that passes the checks is answered
 // 500 internal error.
 //
 // The component exists from the composition on (GitServer); tests change
@@ -36,13 +38,17 @@ func composeGitServer(c *Composition) {
 	comp := &gitserver.Component{}
 	c.gitServer = comp
 	comp.Mount(c.Handle)
+	if err := gitserver.Register(c.registry); err != nil {
+		c.errs = append(c.errs, err)
+	}
 	limiter := &serverLimiter{}
 	c.addServerHook(func(srv *server.Server) { limiter.l = srv.RateLimiter() })
 	c.AddStartHook(gitServerHook, func(_ context.Context, rt *Runtime) error {
 		d := gitserver.Deps{
 			Credentials: c.identity, Limiter: limiter, Guard: c.access, Access: c.access,
 			Records: gitserver.StoreRecords(rt.Store.Main()), Parents: c.forks,
-			Repositories: gitserver.DiskRepositories(gitFor(c.env), c.workspaces.RepoPath), Logger: rt.Logger,
+			Repositories: gitserver.DiskRepositories(gitFor(c.env), c.workspaces.RepoPath),
+			Runner:       gitFor(c.env), Timeout: gitserver.TimeoutFrom(rt.Config), Logger: rt.Logger,
 		}
 		for _, adjust := range c.gitServerAdjusters {
 			adjust(&d)

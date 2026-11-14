@@ -4,11 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,18 +45,21 @@ const (
 // stranger owns other in the org beta. demo's
 // repository is at its place on disk, a bare repository whose default branch
 // main has two commits. The git server's service is a recorder, so that a
-// test sees what reached it.
+// test sees what reached it, unless the world serves git itself
+// (newGitWorld).
 type world struct {
 	*hubtest.Hub
 	workspaces *workspace.Service
 	service    *recorder
+	runs       countingRunner
 
 	owner, member, stranger          string
 	ownerKey, memberKey, strangerKey string
 	ownerPAT                         string
 	acme                             string
-	// repo is the git directory of demo's repository.
-	repo string
+	// repo is the git directory of demo's repository, and head the commit
+	// its main is at.
+	repo, head string
 
 	// mu guards now, the hub's time.
 	mu  sync.Mutex
@@ -63,11 +72,31 @@ type world struct {
 // hub with a low request limit can still be built.
 func newWorld(t *testing.T, cfg hubtest.Config) *world {
 	t.Helper()
-	w := &world{now: time.Now().UTC().Truncate(time.Second), service: &recorder{}}
+	return startWorld(t, cfg, &recorder{})
+}
+
+// newGitWorld is newWorld with the hub's own git exchange in place of the
+// recorder, so that stock git can be served; w.runs counts its runs of
+// git.
+func newGitWorld(t *testing.T, cfg hubtest.Config) *world {
+	t.Helper()
+	return startWorld(t, cfg, nil)
+}
+
+// startWorld is newWorld with service, when not nil, in place of the
+// hub's git exchange.
+func startWorld(t *testing.T, cfg hubtest.Config, service *recorder) *world {
+	t.Helper()
+	w := &world{now: time.Now().UTC().Truncate(time.Second), service: service}
 	compose := cfg.Compose
 	cfg.Now, cfg.Compose = w.clock, func(c *hub.Composition) {
 		w.workspaces = c.Workspaces()
-		c.AdjustGitServer(func(d *gitserver.Deps) { d.Service = w.service })
+		c.AdjustGitServer(func(d *gitserver.Deps) {
+			if service != nil {
+				d.Service = service
+			}
+			w.runs.Runner, d.Runner = d.Runner, &w.runs
+		})
 		if compose != nil {
 			compose(c)
 		}
@@ -94,6 +123,7 @@ func newWorld(t *testing.T, cfg hubtest.Config) *world {
 		t.Fatal(err)
 	}
 	head := gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
+	w.head = head
 	rec := workspace.Workspace{
 		Slug: "demo", Kind: access.KindRepository, Mode: workspace.ModeStandard,
 		GitURL: new("https://origin.test/demo.git"), DefaultBranch: new("main"), OwnerID: w.owner, OrgID: w.acme,
@@ -224,9 +254,18 @@ func (a answer) dump() string {
 // can be compared byte for byte, and no body.
 func (w *world) call(t *testing.T, method, path, auth string) answer {
 	t.Helper()
-	req, err := http.NewRequest(method, w.URL(path), nil)
+	return w.send(t, method, path, auth, nil, "")
+}
+
+// send is call with the headers header and the body body.
+func (w *world) send(t *testing.T, method, path, auth string, header http.Header, body string) answer {
+	t.Helper()
+	req, err := http.NewRequest(method, w.URL(path), strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
+	}
+	for k, v := range header {
+		req.Header[k] = v
 	}
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
@@ -237,11 +276,11 @@ func (w *world) call(t *testing.T, method, path, auth string) answer {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
+	got, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Fatalf("%s %s: read the body: %v", method, path, err)
 	}
-	return answer{res.StatusCode, res.Header, string(body)}
+	return answer{res.StatusCode, res.Header, string(got)}
 }
 
 // basic is the Authorization header of HTTP Basic with user and password.
@@ -279,4 +318,77 @@ func (r *recorder) last(t *testing.T) gitserver.Exchange {
 		t.Fatal("no request reached the service")
 	}
 	return r.exchanges[len(r.exchanges)-1]
+}
+
+// countingRunner counts the runs of git of the runner it wraps.
+type countingRunner struct {
+	gitserver.Runner
+	n atomic.Int64
+}
+
+func (c *countingRunner) UploadPack(ctx context.Context, req gitrepo.ServeRequest) error {
+	c.n.Add(1)
+	return c.Runner.UploadPack(ctx, req)
+}
+
+// flushPkt stands for a flush packet among the pkt-lines of a body.
+const flushPkt = "<flush>"
+
+// pktlines are the pkt-lines body starts with, each payload as it is and a
+// flush packet as flushPkt, up to the first bytes that are not a pkt-line,
+// such as a pack sent without the side band.
+func pktlines(body string) []string {
+	var pkts []string
+	for len(body) >= 4 {
+		n, err := strconv.ParseUint(body[:4], 16, 16)
+		switch {
+		case err != nil || n == 1 || n == 2 || n == 3 || int(n) > len(body):
+			return pkts
+		case n == 0:
+			pkts = append(pkts, flushPkt)
+			body = body[4:]
+		default:
+			pkts = append(pkts, body[4:n])
+			body = body[n:]
+		}
+	}
+	return pkts
+}
+
+// pkt is s as one pkt-line.
+func pkt(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
+
+// fetchRequest is a version 0 upload-pack request that wants want, after
+// the flush packet sends the lines haves, and says done.
+func fetchRequest(want string, haves ...string) string {
+	r := pkt("want "+want+"\n") + "0000"
+	for _, h := range haves {
+		r += pkt("have " + h + "\n")
+	}
+	return r + pkt("done\n")
+}
+
+// remote is the URL of the repository segment pair repo, such as
+// "acme/demo.git", on the hub, with password in its user information, as a
+// git client is given it.
+func (w *world) remote(password, repo string) string {
+	u, err := url.Parse(w.URL("/git/" + repo))
+	if err != nil {
+		panic(err)
+	}
+	u.User = url.UserPassword("x", password)
+	return u.String()
+}
+
+// clientGit runs stock git with args in dir as a client of the hub, with
+// none of the host's configuration (an empty home, no system
+// configuration) and no terminal prompt, env added to its environment, and
+// returns what it wrote to its standard output and error.
+func clientGit(t *testing.T, dir string, env []string, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}, env...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }

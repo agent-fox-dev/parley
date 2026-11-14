@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,7 +21,7 @@ import (
 
 func TestRoutes_RefusesRefDiscoveryWithoutAValidService(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, hubtest.Config{})
+	w := newGitWorld(t, hubtest.Config{})
 	for _, q := range []string{"", "service=", "service=git-archive", "service=upload-pack", "svc=git-upload-pack"} {
 		t.Run(q, func(t *testing.T) {
 			a := w.call(t, http.MethodGet, "/git/acme/demo.git/info/refs?"+q, basic("x", w.ownerKey))
@@ -29,15 +30,30 @@ func TestRoutes_RefusesRefDiscoveryWithoutAValidService(t *testing.T) {
 			}
 		})
 	}
-	if n := w.service.served(); n != 0 {
-		t.Errorf("%d refused requests reached the service, want none", n)
+	if n := w.runs.n.Load(); n != 0 {
+		t.Errorf("git ran %d times for refused requests, want never", n)
 	}
 	a := w.call(t, http.MethodGet, "/git/acme/demo.git/info/refs?service=git-upload-pack&service=git-receive-pack", basic("x", w.ownerKey))
-	if a.status != http.StatusOK {
-		t.Fatalf("two service values = %d %q, want 200", a.status, a.body)
+	if a.status != http.StatusOK || a.header.Get("Content-Type") != advertisement {
+		t.Errorf("two service values = %d Content-Type %q, want 200 %s", a.status, a.header.Get("Content-Type"), advertisement)
 	}
-	if x := w.service.last(t); x.Service != "git-upload-pack" || x.Need != "read" {
-		t.Errorf("exchange = service %q need %q, want git-upload-pack read", x.Service, x.Need)
+}
+
+// The REST body limit is 1KB on this hub.
+func TestRoutes_TakesAGitBodyBeyondTheRESTLimits(t *testing.T) {
+	t.Parallel()
+	w := newGitWorld(t, hubtest.Config{Server: `max_body_size = "1KB"`})
+	haves := slices.Repeat([]string{strings.Repeat("ab", 20)}, 82)
+	body := fetchRequest(w.head, haves...)
+	a := w.send(t, http.MethodPost, "/git/acme/demo.git/git-upload-pack", basic("x", w.ownerKey),
+		http.Header{"Content-Type": {"application/x-git-upload-pack-request"}}, body)
+	if len(body) < 4096 || a.status != http.StatusOK || !strings.Contains(a.body, "PACK") {
+		t.Errorf("a %d-byte fetch = %d %q, want 200 with a pack", len(body), a.status, a.body)
+	}
+	rest := w.send(t, http.MethodPost, "/api/v1/orgs", "Bearer "+w.Token,
+		http.Header{"Content-Type": {"application/json"}}, `{"slug":"`+strings.Repeat("a", 4096)+`"}`)
+	if rest.status != http.StatusRequestEntityTooLarge {
+		t.Errorf("the control: a 4KB REST request = %d %q, want 413", rest.status, rest.body)
 	}
 }
 

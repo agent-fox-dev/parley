@@ -87,3 +87,16 @@ server answers that refusal, as every `409` of the check other than
 `parent_archived`, with the busy message, so that the refusals of the git
 routes stay the fixed list of the package and a fork is never served while
 its parent cannot serve.
+
+## git's own text of a refused fetch is its error output, framed by the hub
+
+The package answers a fetch body that git cannot parse in band with "git's
+own text". In stateless mode `git upload-pack` writes no `ERR` packet for a
+request it cannot read (a truncated or malformed pkt-line): it writes its
+reason to its standard error and exits. When git fails before any pack data
+went out and wrote no error packet of its own, the hub writes one `ERR`
+pkt-line with the last line of git's standard error, without its `fatal: `
+or `error: ` prefix and with the repository's directory on disk replaced by
+`repository` (`upload-pack failed` when git wrote nothing), so that the
+client gets git's reason and never a path of the hub. The `ERR` pkt-lines
+the hub writes carry no trailing newline, as git's own do.
