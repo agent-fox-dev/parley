@@ -1269,6 +1269,12 @@ The answer is the workspace object, the same object `POST
 the workspace: `admin` for the admin token, `owner` for its owner, `member`
 for an active member of its org, whatever scopes the caller's PAT holds.
 
+For a task fork, `head_sha` is computed at every read: the parent's current
+head of the fork's base branch (its `default_branch`), read from the
+parent's repository, or `null` while the parent has no branch of that name;
+the answer is still `200`. `fork_point.sha` stays the head of that branch
+when the fork was created.
+
 | Status | When |
 |---|---|
 | `200 OK` | the body is the workspace object |
@@ -1282,10 +1288,13 @@ for an active member of its org, whatever scopes the caller's PAT holds.
 ## `PATCH /api/v1/workspaces/{slug}`
 
 Changes the display name, the description, the organization and the
-settings of the workspace `{slug}`. It takes the admin token, an API key or a PAT, declares
+settings of the workspace `{slug}`, and the purpose and `auto_change` of a
+task fork. It takes the admin token, an API key or a PAT, declares
 the scope `workspaces:write` for a PAT and needs write access to the
 workspace (see [Workspace access](#workspace-access)): its owner or the
-admin token. It works in every status but `archived`.
+admin token, and for a task fork also the owner of its parent. It works in
+every status but `archived`, and on a task fork only while its parent is
+`ready` with no maintenance running.
 
 The body is a JSON object that changes exactly the fields it carries;
 members the route does not know are ignored, and a field not given keeps
@@ -1297,7 +1306,9 @@ its value.
 | `description` | `null` or a string of at most 1024 characters; `null` sets it to `""` | the same |
 | `org_id` | an org id or slug, or `null` for the personal org of the workspace's owner; the workspace and every fork of it move to that org | `400` `not_supported_on_fork` |
 | `settings` | an object or `null`, applied to the stored settings key by key (below) | `400` `not_supported_on_fork` |
-| `ttl`, `purpose`, `auto_change` | `400` `invalid_request` | `400` `invalid_request` until the fork features accept them |
+| `ttl` | `400` `invalid_request` | `400` `invalid_request` until the fork lifetime accepts it |
+| `purpose` | `400` `invalid_request` | `null` or a string of at most 1024 characters (Unicode code points); `null` clears it |
+| `auto_change` | `400` `invalid_request` | `true` or `false`; `null` is refused |
 | `slug`, `kind`, `git_url`, `default_branch`, `owner_id`, `workspace_mode`, `upstream_url`, `integration_branch`, `parent_slug`, `fork_point` | `400` `invalid_request`, whatever the value, the current one included | the same |
 
 In `settings`, a key given with a value its rule accepts is stored with that
@@ -1328,9 +1339,16 @@ for a slug no workspace has, `403` for a member of its org, also on an
 archived workspace); then the body: not a JSON object; an immutable field;
 a field that does not apply to the workspace's kind; no field to change;
 the values in the order `display_name`, `description`, `org_id`,
-`settings`; an `org_id` naming an org of which the workspace's owner is
-not an active member (`403`); and last the state: an archived workspace is
-`409`.
+`settings`, `purpose`, `auto_change`; an `org_id` naming an org of which
+the workspace's owner is not an active member (`403`); and last the state:
+an archived workspace is `409`, and for a task fork, whatever the fields,
+its parent's state, read in the update's transaction: a parent that is
+`pending` or `cloning` or on which a maintenance operation (archive,
+reclone, delete) runs is `409` `workspace_busy`, a `failed` parent `409`
+`workspace_not_ready`, an `archived` parent `409` `parent_archived`. An
+invalid body is therefore `400` also while the parent is archived. A fork
+whose parent is archived stays readable:
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers it.
 Of several refused setting keys the message names one: an unknown key
 before any refused value, the first unknown key in byte order of the keys,
 otherwise the refused key that comes first in the table of
@@ -1350,8 +1368,10 @@ update is not made and is answered `500` `internal`. The event has
 caller's user, and in `metadata` `fields`, the names of the mutable fields
 the body carried in the order `display_name`, `description`, `org_id`,
 `settings`, `ttl`, `purpose`, `auto_change`, and for a task fork
-`parent_slug`, its parent's slug. The metadata holds no value of any
-field, so no setting appears in the log:
+`parent_slug`, its parent's slug; its `session_id` is the workspace's
+`session_id`, that of a fork created in a session and otherwise `null`.
+The metadata holds no value of any field, so no setting appears in the
+log:
 
 ```json
 {"seq":13,"id":"…","type":"parley.workspace.update","time":"2026-11-14T10:31:02Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"update","session_id":null,"metadata":{"fields":["display_name","settings"]}}
@@ -1364,12 +1384,15 @@ The answer is the workspace object after the update, the object
 | Status | When |
 |---|---|
 | `200 OK` | the fields are changed; the body is the workspace object |
-| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`); the reason never repeats a URL |
+| `400` `invalid_request` | the body is not a JSON object; it carries an immutable field (`<field>: cannot be changed`), a fork-only field on a repository workspace (`<field>: applies only to a task fork`) or on a fork that does not accept it (`<field>: cannot be changed`); it carries no field to change (`the body carries no field to change`); or a value is refused: `display_name: must be a string or null`, `display_name: must be at most 128 characters`, the same for `description` with 1024, `org_id: must be a string or null`, `org_id: no organization has the id or slug "<value>"` (also for `""` and an id no org has), `org_id: the workspace's owner has no personal organization`, `settings: must be an object or null`, `unknown setting "<key>"`, or `settings.<key>: <reason>` for a value its rule refuses (`settings.land.strategy: must be one of ["rebase" "squash"]`), `purpose: must be a string`, `purpose: must be at most 1024 characters long`, `auto_change: must be true or false`; the reason never repeats a URL |
 | `400` `not_supported_on_fork` | `org_id` or `settings` in an update of a task fork, whatever the value (`<field>: a task fork takes its org and its settings from its parent`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
 | `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), in every status; or an `org_id` naming an org of which the workspace's owner is not an active member, whoever the caller is (`the workspace's owner is not an active member of the organization`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
 | `409` `workspace_archived` | a valid update of a workspace in status `archived` (`workspace <slug> is archived`) |
+| `409` `parent_archived` | a valid update of a task fork whose parent is `archived` (`workspace "<fork slug>" is read-only: its parent workspace "<parent slug>" is archived`) |
+| `409` `workspace_busy` | a valid update of a task fork whose parent is `pending` or `cloning` (`workspace "<parent slug>" is busy: its clone has not finished; try again later`) or runs a maintenance operation (`workspace "<parent slug>" is busy: a <archive, reclone or delete> is running; try again later`) |
+| `409` `workspace_not_ready` | a valid update of a task fork whose parent is `failed` (`workspace "<parent slug>" is not ready: its clone failed; reclone it`) |
 | `500` `internal` | a write failed, that of a fork moved with the workspace or of the update's event included; nothing is changed |
 
 ## `POST /api/v1/workspaces/{slug}/sync`
@@ -1917,6 +1940,153 @@ readers of its parent's events, as the fork's other events are.
 | `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`), or a fork of the workspace was made while the delete ran (`workspace "<slug>" got the fork "<fork>" while it was being deleted; try again`): nothing has changed |
 | `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
 | `500` `internal` | the workspace is a task fork and no part of the hub deletes task forks (`workspace "<slug>" is a task fork, and no fork remover deletes it`): the fork is unchanged; or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
+
+## `POST /api/v1/workspaces/{slug}/forks`
+
+Creates a task fork of the repository workspace `{slug}`, its parent: a
+workspace that is `ready` at once, shares the parent's history without
+copying it, and is owned by the caller's user. It takes an API key or a PAT
+and declares the scope `workspaces:write` for a PAT and the level `read` on
+the parent (see [Workspace access](#workspace-access)), so an org member who
+can only read the parent can fork it, and a PAT bound to the parent can too.
+It is a create route (see [Idempotency](#idempotency)); a replay leaves out
+`token.token`.
+
+The body is a JSON object, or no body at all, which is `{}`; members the
+route does not read are ignored, and a member that is `null` counts as
+absent, so a client may send back what it read:
+
+| Member | Value |
+|---|---|
+| `name` | a string of 1 to 32 characters of `a` to `z`, digits and hyphens, starting and ending with a letter or digit, without two hyphens in a row; the fork's slug is `<parent slug>--<name>`. Absent, a name of 8 characters from `a` to `z` and digits, drawn from a cryptographic random source |
+| `ref` | a non-empty string, the short name of a branch of the parent, which becomes the fork's base branch and `default_branch`; absent, the parent's `default_branch` |
+| `ttl` | a string, a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`; `expires_at` is the creation time plus `ttl`. Absent, plus `[forks].default_ttl` (see [the configuration](configuration.md)) |
+| `auto_change` | `true` or `false`; absent, `true` |
+| `token` | an object `{name, permissions, paths, expires}` of the token to mint with the fork, bound to it and owned by the caller: `name` a string, absent `fork:<fork slug>`; `permissions` and `paths` lists of strings, judged by the minting component as for [`POST /api/v1/workspaces/{slug}/tokens`](#post-apiv1workspacesslugtokens); `expires` a string, a whole number above zero followed by `m`, `h` or `d`, and the token's `expires_at` is the fork's creation time plus `expires`. Absent `expires`, the token never expires (`expires_at` `null`). A PAT caller must hold `tokens:manage` and is held to the subset rule |
+| `purpose` | a string of at most 1024 characters (Unicode code points); absent, `null` |
+| `session_id` | a UUID in its hyphenated form, the session the fork is created in, judged by the session-linking rule for the caller and the parent; the fork stores it, and its event carries it, as the rule gives it back, in lower case, and the link of the fork to the session is recorded in the fork's transaction. No session component is part of the hub yet, so no session exists and every `session_id` is refused with `400` `unknown_session` |
+| `sandbox` | an object, the sandbox to create with the fork, handed as received, unread, to the sandbox component with the fork's `session_id` and `purpose` as defaults; the component judges it and answers the sandbox object or its refusal, on which no fork is created. No sandbox component is part of the hub yet, so every `sandbox` is refused with `404` `sandboxes_disabled` and no fork is created |
+
+```json
+{"name":"task1","ref":"release","ttl":"24h","purpose":"fix loader"}
+```
+
+The checks run in this order, the first that fails answering: a PAT without
+`workspaces:write` (`403`); the access rule for need `read` (`404` for a
+workspace the caller cannot read and for an unknown slug, with the same
+bytes); the admin token (`403`), before the body is read; the body, member
+by member in the order of the table (`400`); the session (`400`); a parent
+that is itself a task fork (`400`); the parent's state (`409`); the base
+branch (`400`); the fork limit (`429`); a name a workspace already has
+(`409`); the token (`400`, `403`); the sandbox (`404`, or the sandbox
+component's refusal). A refused request
+records nothing and leaves no repository directory behind.
+
+The fork's repository is an empty bare repository whose alternates file
+names the parent's object directory: no object is copied, and every commit
+of the parent, also one it receives later, is readable through it. Its
+place is the one every workspace copy has, `<[workspace].path>/<slug>.git`;
+a directory found there while no workspace has the slug is the leftover of
+a create that stopped, and is removed first. The fork is recorded with
+`kind` `fork`, `workspace_mode` `standard`, `status` `ready`, the caller as
+`owner_id`, the parent's `org_id`, `parent_slug` the parent, `display_name`
+the slug, `description` empty, `git_url`, `upstream_url` and
+`integration_branch` `null`, `fork_point` the base branch and the parent's
+head of it, the names of the parent's branches and tags as they are now as
+its tracking names (see [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug)),
+`expires_at`, `auto_change` and `purpose`, and, when a PAT authenticated
+the request, that PAT as its creating token, which lets a PAT bound to the
+parent reach the forks it created (see
+[Workspace-bound tokens](#workspace-bound-tokens)). The parent's state is
+judged again in the transaction, the fork, the link of the fork to its
+session, its token and a `parley.workspace.fork` event are written in that
+one transaction, the sandbox component is asked last in it, and
+creates of forks of one parent run one at a time from the name check to the
+commit, so two requests for one name answer `201` and `409`. When the
+repository cannot be made, or the transaction or its commit fails, the
+repository directory is removed, nothing is recorded, and the answer is
+`500` `internal` without its cause.
+
+The answer has `workspace`, the fork's workspace object with `access`
+`owner` and `head_sha` the parent's head of the base branch; `remote`, the
+fork's `hub_url`, `null` when no external URL is configured; and, only when
+the body asked for one, `token`, the Token object with `workspace` the
+fork's slug and the secret in `token.token`, which no other answer carries;
+and, only when the body had a `sandbox`, `sandbox`, the sandbox component's
+object as it gave it:
+
+```json
+{"workspace":{"slug":"demo--task1","kind":"fork","workspace_mode":"standard","git_url":null,"default_branch":"release","owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"acme","status":"ready","display_name":"demo--task1","description":"","head_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":"demo","fork_point":{"ref":"release","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8"},"expires_at":"2026-11-15T10:30:15Z","auto_change":true,"purpose":"fix loader","session_id":null,"settings":{"sync_enabled":true,"…":"…"},"hub_url":"https://hub.example/git/acme/demo--task1.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"},"remote":"https://hub.example/git/acme/demo--task1.git"}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | the fork was created; the body is `{workspace, remote}`, and `token` and `sandbox` when asked for |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token.token`; nothing is created |
+| `400` `invalid_request` | the body is not an object (the messages of [Request bodies](#request-bodies)), or a member is refused, the message naming it: `name: must be a string`, `name: must be 1 to 32 characters long`, `name: may hold only the letters a to z, digits and hyphens`, `name: must start with a letter or digit`, `name: must end with a letter or digit`, `name: must not contain two hyphens in a row`; `ref: must be a string`, `ref: must not be empty`; `ttl: must be a string`, `ttl: must end in one unit: m, h or d` and the other duration rules, `ttl: must be at least 5m`, `ttl: must be at most 30d, the hub's [forks].max_ttl`; `auto_change: must be true or false`; `token: must be an object whose name and expires are strings and whose permissions and paths are lists of strings`, `token: expires: must end in one unit: m, h or d` and the other duration rules (`token: expires: must be above zero` for `0h`); `purpose: must be a string`, `purpose: must be at most 1024 characters long`; `session_id: must be a string`, `session_id: must be a UUID`; `sandbox: must be an object`; or the minting component refuses the token, with the messages of `POST /api/v1/user/tokens` |
+| `400` `unknown_session` | the body has a `session_id` the session-linking rule refuses, or the hub has no session component (`session_id: no session "<id>"`) |
+| `400` `not_supported_on_fork` | the workspace is itself a task fork (`workspace "demo--task1" is a task fork, which cannot be forked; fork its parent instead`) |
+| `400` `fork_ref_not_found` | the base branch is not a branch of the parent: a tag, a commit id or a full ref name is not one (`ref: "nope" is not a branch of "demo"`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write`; a PAT without `tokens:manage` whose body has `token` (`token: minting a token needs the scope tokens:manage`); or a token beyond what the calling PAT holds, with the subset rule's messages |
+| `403` `forbidden` | the admin token, whatever the body (`a fork needs a user as owner; the admin token cannot create one`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
+| `404` `sandboxes_disabled` | the body has a `sandbox`: no sandbox component is part of the hub (`sandboxes are not enabled on this hub`); no fork is created |
+| the sandbox component's | the body has a `sandbox` the sandbox component refuses: its status, `error_type`, message and extra members unchanged (such as `429` `sandbox_capacity` with `limit`, `maximum` and `current`); no fork is created, also when a token was asked for |
+| `409` `workspace_busy` | the parent's clone has not finished, or a reclone, archive or delete runs on it |
+| `409` `workspace_archived` | the parent is archived |
+| `409` `workspace_not_ready` | the parent's clone failed |
+| `409` `conflict` | a workspace has the slug the given `name` makes (`name: "demo" has a fork "demo--task1"`) |
+| `429` `fork_limit_reached` | the parent has `[forks].max_per_workspace` forks (see [the configuration](configuration.md)), counting only forks that exist; it is counted before the repository is made and again in the transaction, so concurrent creates never pass the limit (`workspace "demo" has 200 forks, the hub's [forks].max_per_workspace`) |
+| `500` `internal` | 8 generated names in a row were in use, the session-linking rule could not judge the `session_id`, or making the repository, writing the fork, its session link, its token or its event, or the commit failed; nothing is recorded |
+
+The event has `workspace` and `resource_id` the fork's slug,
+`resource_type` `workspace`, `actor_type` `api_key` or `pat` after the
+calling credential, `actor_id` the caller's user, `session_id` the fork's,
+and in `metadata` the fork's `parent_slug`, `fork_point`, `expires_at`,
+`auto_change` and `purpose` (`null` when it has none) and, when a token was
+minted, its `token_id`, never its value. The parent's readers see it (see
+[`GET /api/v1/events`](#get-apiv1events)).
+
+```json
+{"seq":31,"id":"…","type":"parley.workspace.fork","time":"2026-11-14T10:30:15Z","workspace":"demo--task1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo--task1","action":"fork","session_id":null,"metadata":{"auto_change":true,"expires_at":"2026-11-15T10:30:15Z","fork_point":{"ref":"release","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8"},"parent_slug":"demo","purpose":"fix loader"}}
+```
+
+## `GET /api/v1/workspaces/{slug}/forks`
+
+Lists the task forks of the workspace `{slug}` to a caller who can read it,
+in every status of the workspace. It takes the admin token, an API key or a
+PAT, and declares the scope `workspaces:read` for a PAT, which a PAT holding
+`workspaces:write` also satisfies. It needs read access to the workspace
+(see [Workspace access](#workspace-access)).
+
+The list holds the forks of `{slug}` the caller can read, each as its
+workspace object with the caller's `access` on it: `owner` for the fork's
+owner and the parent's owner, `member` for the other members of the org,
+`admin` for the admin token. For a PAT bound to a workspace it holds only
+the forks its binding covers (see
+[Workspace-bound tokens](#workspace-bound-tokens)): a PAT bound to the
+parent lists the forks it created, a PAT bound to a fork lists nothing. A
+task fork, and a workspace without forks, list nothing
+(`{"items":[],"next_cursor":null}`).
+
+It is a list (see [Lists](#lists)), with `limit` and `cursor` and these
+query parameters; with both, a fork is listed when it satisfies both:
+
+| Parameter | Meaning |
+|---|---|
+| `owner` | `me` keeps the forks whose owner is the caller's user; the admin token, which acts for no user, lists nothing |
+| `session_id` | a UUID, in any case: keeps the forks created in that session |
+
+The order is `created_at` descending, then `slug` ascending among the forks
+created in the same instant; the cursor carries both, so a walk over the
+pages returns each listed fork once.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page, `items` an array of workspace objects (`[]` when nothing matches) |
+| `400` `invalid_request` | `owner` other than exactly `me`, `session_id` that is not a UUID, an empty value included, or either given more than once (`owner must be given once, as me`, `session_id must be given once, as a UUID`); a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 

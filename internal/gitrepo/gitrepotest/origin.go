@@ -357,9 +357,9 @@ func (o *Origin) git(stdin string, args ...string) string {
 	return out
 }
 
-// run runs git on the origin's repository (see gitIn).
+// run runs git on the origin's repository (see Run).
 func (o *Origin) run(stdin string, args ...string) (string, error) {
-	return gitIn(o.dir, stdin, args...)
+	return Run(o.dir, stdin, args...)
 }
 
 // History builds on the empty origin main (the default branch) with three
@@ -434,7 +434,7 @@ func shellQuote(s string) string {
 // the test on an error.
 func Git(t testing.TB, dir string, args ...string) string {
 	t.Helper()
-	out, err := gitIn(dir, "", args...)
+	out, err := Run(dir, "", args...)
 	if err != nil {
 		t.Fatalf("in %s: %v", dir, err)
 	}
@@ -458,10 +458,48 @@ func Refs(t testing.TB, dir, prefix string) map[string]string {
 	return refs
 }
 
-// gitIn runs git on the repository whose git directory is dir with stdin as
+// ObjectCounts is what git count-objects -v reports for the repository
+// whose git directory is dir, by field: count is its loose objects, in-pack
+// its packed ones.
+func ObjectCounts(t testing.TB, dir string) map[string]string {
+	t.Helper()
+	counts := map[string]string{}
+	for line := range strings.Lines(Git(t, dir, "count-objects", "-v")) {
+		k, v, _ := strings.Cut(strings.TrimSpace(line), ": ")
+		counts[k] = v
+	}
+	return counts
+}
+
+// PushCommit is the work of a client holding the main of the repository
+// src: in a bare repository of its own, it commits README with content on
+// top of main's head, then pushes that commit to branch of the repository
+// dest, which receives the commit, its tree and its blob. It returns the
+// commit's id.
+func PushCommit(t testing.TB, src, dest, branch, content string) string {
+	t.Helper()
+	client := filepath.Join(t.TempDir(), "client.git")
+	Git(t, client, "init", "--quiet", "--bare", client)
+	Git(t, client, "fetch", "--quiet", src, "main:main")
+	blob, err := Run(client, content, "hash-object", "-w", "--stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := Run(client, "100644 blob "+blob+"\tREADME\n", "mktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Git(t, client, "commit-tree", tree, "-p", "main", "-m", branch)
+	Git(t, client, "push", "--quiet", dest, id+":refs/heads/"+branch)
+	return id
+}
+
+// Run runs git on the repository whose git directory is dir with stdin as
 // its input, away from the user's and the system's git configuration, with
-// a fixed author, and returns its trimmed standard output.
-func gitIn(dir, stdin string, args ...string) (string, error) {
+// a fixed author, and returns its trimmed standard output, or an error that
+// holds git's standard error: for a test that feeds git an input, or
+// expects it to fail, where Git would fail the test.
+func Run(dir, stdin string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Env = append(os.Environ(),
 		"GIT_DIR="+dir,

@@ -382,6 +382,7 @@ Usage:
 Available Commands:
   admin       Administer the hub's users, organizations, API keys and access tokens
   events      Follow the hub's events, or read them a page at a time
+  fork        Create a task fork of a workspace and list a workspace's forks
   help        Print the help of parley or of a command
   keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
@@ -1847,6 +1848,96 @@ and exit status `2` before any request.
 | `parley workspace reactivate <slug> [--wait]` | `POST /api/v1/workspaces/<slug>/reactivate`; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
 | `parley workspace reclone <slug> --confirm [--wait]` | `POST /api/v1/workspaces/<slug>/reclone`; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
 | `parley workspace delete <slug> --confirm` | `DELETE /api/v1/workspaces/<slug>` |
+
+### `parley fork`
+
+`parley fork` run without a command prints its help and exits `0`; it reads
+no credential and sends no request. Its two commands create a task fork of a
+workspace and list a workspace's forks. Each sends one request with the
+credential as `Authorization: Bearer`, `<parent>` as one percent-encoded path
+segment (`parley fork list a/b` sends `GET /api/v1/workspaces/a%2Fb/forks`),
+and prints the hub's answer on stdout with exit status `0`; a refusal of the
+hub's is written to stderr as received, with nothing on stdout and exit
+status `1`.
+
+| Command | Request |
+|---|---|
+| `parley fork create <parent> [flags] [-- command...]` | `POST /api/v1/workspaces/<parent>/forks` with a member for each flag given |
+| `parley fork list <parent> [flags]` | `GET /api/v1/workspaces/<parent>/forks` with a query parameter for each flag given |
+
+#### `parley fork create`
+
+```
+parley fork create <parent> [--name <name>] [--ref <branch>] [--ttl <duration>] [--no-auto-change]
+                            [--purpose <text>] [--session <id>]
+                            [--token-permissions <scopes> [--token-paths <globs>]]
+                            [--sandbox-profile <profile> [-- command...]]
+```
+
+Sends [`POST /api/v1/workspaces/<parent>/forks`](api.md#post-apiv1workspacesslugforks)
+with a JSON body that holds exactly the members its flags name, and prints
+the hub's answer, `{"workspace": ..., "remote": ...}` with `token` and
+`sandbox` when they were asked for. Without a flag the body is `{}`, and the
+hub's defaults apply: a generated name, the parent's default branch, the
+hub's `[forks].default_ttl`, `auto_change` true.
+
+| Flag | Body member | Value |
+|---|---|---|
+| `--name <name>` | `name` | the string as given; the fork's slug is `<parent>--<name>` |
+| `--ref <branch>` | `ref` | the string as given |
+| `--ttl <duration>` | `ttl` | the string as given, such as `2h` or `7d` |
+| `--no-auto-change` | `auto_change` | `false` |
+| `--purpose <text>` | `purpose` | the string as given |
+| `--session <id>` | `session_id` | the string as given |
+| `--token-permissions <scopes>` | `token.permissions` | the list of its parts split at every comma |
+| `--token-paths <globs>` | `token.paths` | the list of its parts split at every comma; only with `--token-permissions` |
+| `--sandbox-profile <profile>` | `sandbox.profile` | the string as given |
+| `-- command...` | `sandbox.command` | the list of the words after `--`; only with `--sandbox-profile` |
+
+A flag given with an empty value is sent empty, for the hub to judge.
+`parley fork create demo --name t1 --token-permissions git:read,git:write
+--token-paths 'src/**,docs/**' --sandbox-profile default -- make test`
+sends
+
+```json
+{"name":"t1","sandbox":{"command":["make","test"],"profile":"default"},"token":{"paths":["src/**","docs/**"],"permissions":["git:read","git:write"]}}
+```
+
+When the answer holds the value of the token minted with the fork
+(`token.token`), the value is printed on stdout with the rest of the answer,
+and stderr gets one line that does not hold it:
+
+```
+warning: the token's value is shown once and will not be shown again
+```
+
+Without a token in the answer stderr stays empty.
+
+**Client checks.** A missing `<parent>`, a second argument before `--`,
+`--token-paths` without `--token-permissions` (`parley fork create needs
+--token-permissions with --token-paths`) and words after `--` without
+`--sandbox-profile` (`parley fork create needs --sandbox-profile with a
+command after --`) are refused with a `usage_error` and exit status `2`
+before any setting is read or any request sent. Everything else, a name,
+ref, ttl, scope or profile the hub does not accept among them, is the hub's
+to refuse.
+
+#### `parley fork list`
+
+```
+parley fork list <parent> [--mine] [--session <id>] [--limit <n>] [--cursor <cursor>]
+```
+
+Sends [`GET /api/v1/workspaces/<parent>/forks`](api.md#get-apiv1workspacesslugforks)
+with one query parameter for each flag given and none for a flag not given,
+and prints the page the hub answers, `{"items": [...], "next_cursor": ...}`,
+one page per run. `--mine` sends `owner=me`; `--session`, `--limit` and
+`--cursor` send `session_id`, `limit` and `cursor` with their values as
+given, which the hub judges. `parley fork list demo --session <id> --limit
+10 --cursor abc` sends
+`GET /api/v1/workspaces/demo/forks?cursor=abc&limit=10&session_id=<id>`. A
+missing `<parent>` and a second argument are refused with a `usage_error`
+and exit status `2` before any request.
 
 ### Output
 

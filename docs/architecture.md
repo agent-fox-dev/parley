@@ -14,10 +14,11 @@ command-line client. Both are written in Go, in the module
 | `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`, and the maintenance task `token_binding_sweep`, `SweepBindings`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
-| `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
+| `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, a registry of keys and whole sections that decides what the file may hold, and the keys it owns itself, among them the fork limits of `[forks]` (`Config.Forks`), whose `max_ttl` it refuses when shorter than `default_ttl` |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
-| `internal/gitrepo` | the hub's one way to run git, the `git` command as a subprocess with no git library; it imports nothing of the project. `Git` (its zero value runs git from `PATH`; `Env` adds variables such as `GIT_SSL_CAINFO` to every git process, `Trace` sees the arguments of every invocation) runs each git process with a fixed minimal environment (`PATH`, `HOME` set to an empty private directory made, mode 0700, for that one process and removed when it returns, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so that the `ssh` of a `git@` origin fails rather than prompts, unless `Env` sets its own, `LC_ALL=C`), outside any repository, keeps git's standard error in the error it returns and, when the context ends, kills git with every process it started (its own process group) and waits for them. `ListRemote(ctx, url, cred)` returns origin's branches, tags and default branch as a `Remote`; `Clone(ctx, url, cred, dir)` makes a bare copy with every branch and tag and full history; both, like `FetchOrigin` below, run with `-c credential.helper=`. A `Credential` (user name and password; the zero value is none) reaches git only through the environment of that one process: `GIT_ASKPASS` names a script, written into that private directory, that prints `PARLEY_GIT_USERNAME` or `PARLEY_GIT_PASSWORD`, so the credential is in no URL, no argument and no configuration file of the copy. `FetchOrigin(ctx, dir, url, cred, deadline)` fetches every branch and tag of origin into the copy at `dir` in one `git fetch --atomic --force --no-tags` into a namespace of that one fetch, `refs/parley/fetch/<random>/`, which is read and removed right after the fetch, also after a failure, so that the tags' objects are in the copy and no extra ref outlives the fetch; only once the fetch has succeeded and the namespace is gone are the origin heads `refs/remotes/origin/<name>` set to origin's branches exactly (created, moved, removed for a branch origin no longer has) in one `update-ref --stdin` transaction, or, when git refuses it because a new name is a directory of a removed one (`dev` replaced by `dev/next`), with the removals first; a fetch that fails, or whose namespace cannot be removed, changes no origin head; no branch or tag of the copy is written; it returns origin's branch heads and tags as `Fetched`, and after `deadline` kills git with every process it started and returns an error matching `ErrDeadline`. `Push(ctx, PushRequest)` pushes one commit of the copy at `PushRequest.Dir` to one branch of origin in one `git push --porcelain --no-follow-tags` of the single refspec `<commit>:refs/heads/<branch>`, with `-c credential.helper=` and the credential as above, so that no tag and no other branch is sent; `PushRequest.Force` adds the explicit lease `--force-with-lease=refs/heads/<branch>:<PushRequest.Lease>`, `Lease` being the commit origin's branch must still be at, or `""` for a branch origin must not have, never a plain force; the result is read from the status git reports for the ref, also when git exits with an error: `PushPushed` for a new branch or a fast-forward, `PushForced` for a forced push that replaced origin's branch, `PushUpToDate` when origin's branch is at the commit already (git reports it before it judges the lease), an error matching `ErrNonFastForward` for git's non-fast-forward and fetch-first refusals, one matching `ErrOriginMoved` for a forced push git refused because the lease is stale, and for every other failure a `*PushError` (`Branch`, `Class`, `Reason`, `Err`) whose class `errors.Is` matches: `ErrOriginRejected` for a `[remote rejected]` status of the ref, its `Reason` origin's reason followed by the `remote:` lines its hooks wrote; otherwise, when git reports no status for the ref, the class read from git's standard error, for the HTTPS transport and for the SSH transport's and forges' messages: `ErrUnauthenticated` (`Authentication failed`, `could not read Username`, HTTP 401, `Permission denied (publickey`), `ErrForbidden` (HTTP 403, `Permission to … denied`, `not allowed to push`), `ErrUnreachable` (name resolution, connection, proxy, TLS and certificate failures, `Host key verification failed`), judged before `ErrRepositoryNotFound` (HTTP 404, `not found`, `could not be found`) since such a text may hold a `not found` of its own, and `ErrPushFailed` for anything else, its `Reason` git's standard error without its boilerplate; a push whose context ended returns the error wrapping the context's error, git killed with every process it started. `PushBranches(ctx, PushBranchesRequest)` offers several branches of the copy at `Dir` in one `git push --porcelain --no-follow-tags`, with `-c credential.helper=` and the credential as above, of one refspec `<commit>:refs/heads/<branch>` for each entry of `Heads` (branch to commit), so that no tag is sent, nothing is forced and nothing is deleted; origin takes or refuses each branch on its own, and it returns one `BranchPush` (`Branch`, `Commit`, `Result`, `Err`) for each branch git reported a status for, ordered by name: `Result` `PushPushed` or `PushUpToDate` for a branch origin took, `Err` an error matching `ErrNonFastForward`, or a `*PushError` of class `ErrOriginRejected` or `ErrPushFailed`, for one it refused; its error is nil once every branch has a status, a `*PushError` of the transport's class when git failed before any, and an error wrapping the context's error, with the statuses reported before, when the context ended and git was killed with every process it started. `Open(ctx, dir)` opens a copy as a `Repo` (an error for a file, an empty directory or nothing), whose methods never contact origin: `DefaultBranch` and `SetDefaultBranch`, `ResolveBranch`, `Branches`, `Tags`, `OriginURL`, `Config` and `SetConfig` (the copy's own configuration), the origin heads, kept as the refs `refs/remotes/origin/<name>`: `OriginHeads`, `OriginHead`, `SetOriginHead` and `DeleteOriginHead`, `CompareAndSwapRef(ctx, ref, new, expectedOld)`, which moves a ref only from `expectedOld` (`""`: creates it only while it does not exist) and otherwise, or when another writer holds the ref's lock, changes nothing and returns an error matching `ErrRefMoved`, and `IsAncestor`; `Remove(dir)` removes a copy |
-| `internal/gitrepo/gitrepotest` | test support, imported by test code only, and the repository's one test origin: `NewOrigin(t, opts...)` makes an empty bare repository whose default branch is `main` and serves it over TLS with `net/http/httptest` and git's file-based HTTP transport (`git update-server-info` after every change), or with git's smart transport through `git http-backend` under `WithSmartHTTP()` (git cannot read a repository without refs over the file-based one, so an empty origin needs it); `SmartOrigin(t, opts...)` is `NewOrigin` with the smart transport and `http.receivepack` enabled, so that it takes pushes; `WithBasicAuth(user, password)` makes it answer `401` without them, and `Accept(user, password)` changes the credential it takes while it serves; `Commit(branch, msg)`, `Branch(name, ref)`, `Tag(name, ref)` and `SetDefaultBranch(branch)` change it, `History()` builds the tests' usual history on it (`main` with three commits, `dev` branching off its second with one more, the tag `v1` on its first), `Head(branch)` reads it; `URL()` is its https URL and `Env()` (`GIT_SSL_CAINFO=<CAFile()>`) makes git trust it; `Requests()` counts the requests it received, `Block()` holds every later request until `Release()`, `Refuse(status)` answers every request with a status, `Reject(message)` installs a `pre-receive` hook that refuses every update writing `message` (`""` removes it), `ServeUntrusted(true)` makes it serve, on every later connection, a self-signed certificate that `CAFile()` does not vouch for, and `Close()` shuts it down; `Git(t, dir, args...)` runs git on a repository directory, such as a copy the code under test made, away from the user's git configuration, and returns its trimmed output, and `Refs(t, dir, prefix)` maps the refs below `prefix` of such a directory, by their names without it (`""`: every ref, by its full name), to their object ids |
+| `internal/fork` | task forks: the lifetime rule `ResolveTTL(ttl, now, limits)`, the one judge of a requested `ttl` (a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`), which returns `expires_at` in whole seconds UTC or a `400 invalid_request` naming `ttl`, and `DefaultExpiry(now, limits)` for a fork created without one; the fork record (`Fork`: the workspace record plus the names of the parent's branches and tags at creation) and its store functions; and the `Component` with a fork's ref view (`Refs`), its computed head (`HeadSHA`, also shown as the `head_sha` of its workspace object) and the check of a write to one of its branches (`CheckBranchWrite`), and the parent-state check of a read or a write of a fork (`CheckParentState`); the handlers of `purpose` and `auto_change` in an update of a fork (`PurposeField`, `AutoChangeField`) and the guard of every update of a fork (`GuardUpdate`); and the routes `POST /workspaces/:slug/forks`, which creates a fork, and `GET /workspaces/:slug/forks`, which lists a workspace's forks in pages cut to the caller's readable set (`Routes`; see [Task forks](#task-forks)), with the two collaborators a later feature registers on the component: the session-linking rule (`SessionLinker`) and the sandbox component (`SandboxCreator`) |
+| `internal/gitrepo` | the hub's one way to run git, the `git` command as a subprocess with no git library; it imports nothing of the project. `Git` (its zero value runs git from `PATH`; `Env` adds variables such as `GIT_SSL_CAINFO` to every git process, `Trace` sees the arguments of every invocation) runs each git process with a fixed minimal environment (`PATH`, `HOME` set to an empty private directory made, mode 0700, for that one process and removed when it returns, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND=ssh -o BatchMode=yes`, so that the `ssh` of a `git@` origin fails rather than prompts, unless `Env` sets its own, `LC_ALL=C`), outside any repository, keeps git's standard error in the error it returns and, when the context ends, kills git with every process it started (its own process group) and waits for them. `ListRemote(ctx, url, cred)` returns origin's branches, tags and default branch as a `Remote`; `Clone(ctx, url, cred, dir)` makes a bare copy with every branch and tag and full history; both, like `FetchOrigin` below, run with `-c credential.helper=`. A `Credential` (user name and password; the zero value is none) reaches git only through the environment of that one process: `GIT_ASKPASS` names a script, written into that private directory, that prints `PARLEY_GIT_USERNAME` or `PARLEY_GIT_PASSWORD`, so the credential is in no URL, no argument and no configuration file of the copy. `FetchOrigin(ctx, dir, url, cred, deadline)` fetches every branch and tag of origin into the copy at `dir` in one `git fetch --atomic --force --no-tags` into a namespace of that one fetch, `refs/parley/fetch/<random>/`, which is read and removed right after the fetch, also after a failure, so that the tags' objects are in the copy and no extra ref outlives the fetch; only once the fetch has succeeded and the namespace is gone are the origin heads `refs/remotes/origin/<name>` set to origin's branches exactly (created, moved, removed for a branch origin no longer has) in one `update-ref --stdin` transaction, or, when git refuses it because a new name is a directory of a removed one (`dev` replaced by `dev/next`), with the removals first; a fetch that fails, or whose namespace cannot be removed, changes no origin head; no branch or tag of the copy is written; it returns origin's branch heads and tags as `Fetched`, and after `deadline` kills git with every process it started and returns an error matching `ErrDeadline`. `Push(ctx, PushRequest)` pushes one commit of the copy at `PushRequest.Dir` to one branch of origin in one `git push --porcelain --no-follow-tags` of the single refspec `<commit>:refs/heads/<branch>`, with `-c credential.helper=` and the credential as above, so that no tag and no other branch is sent; `PushRequest.Force` adds the explicit lease `--force-with-lease=refs/heads/<branch>:<PushRequest.Lease>`, `Lease` being the commit origin's branch must still be at, or `""` for a branch origin must not have, never a plain force; the result is read from the status git reports for the ref, also when git exits with an error: `PushPushed` for a new branch or a fast-forward, `PushForced` for a forced push that replaced origin's branch, `PushUpToDate` when origin's branch is at the commit already (git reports it before it judges the lease), an error matching `ErrNonFastForward` for git's non-fast-forward and fetch-first refusals, one matching `ErrOriginMoved` for a forced push git refused because the lease is stale, and for every other failure a `*PushError` (`Branch`, `Class`, `Reason`, `Err`) whose class `errors.Is` matches: `ErrOriginRejected` for a `[remote rejected]` status of the ref, its `Reason` origin's reason followed by the `remote:` lines its hooks wrote; otherwise, when git reports no status for the ref, the class read from git's standard error, for the HTTPS transport and for the SSH transport's and forges' messages: `ErrUnauthenticated` (`Authentication failed`, `could not read Username`, HTTP 401, `Permission denied (publickey`), `ErrForbidden` (HTTP 403, `Permission to … denied`, `not allowed to push`), `ErrUnreachable` (name resolution, connection, proxy, TLS and certificate failures, `Host key verification failed`), judged before `ErrRepositoryNotFound` (HTTP 404, `not found`, `could not be found`) since such a text may hold a `not found` of its own, and `ErrPushFailed` for anything else, its `Reason` git's standard error without its boilerplate; a push whose context ended returns the error wrapping the context's error, git killed with every process it started. `PushBranches(ctx, PushBranchesRequest)` offers several branches of the copy at `Dir` in one `git push --porcelain --no-follow-tags`, with `-c credential.helper=` and the credential as above, of one refspec `<commit>:refs/heads/<branch>` for each entry of `Heads` (branch to commit), so that no tag is sent, nothing is forced and nothing is deleted; origin takes or refuses each branch on its own, and it returns one `BranchPush` (`Branch`, `Commit`, `Result`, `Err`) for each branch git reported a status for, ordered by name: `Result` `PushPushed` or `PushUpToDate` for a branch origin took, `Err` an error matching `ErrNonFastForward`, or a `*PushError` of class `ErrOriginRejected` or `ErrPushFailed`, for one it refused; its error is nil once every branch has a status, a `*PushError` of the transport's class when git failed before any, and an error wrapping the context's error, with the statuses reported before, when the context ended and git was killed with every process it started. `Open(ctx, dir)` opens a copy as a `Repo` (an error for a file, an empty directory or nothing), whose methods never contact origin: `DefaultBranch` and `SetDefaultBranch`, `ResolveBranch`, `Branches`, `Tags`, `OriginURL`, `Config` and `SetConfig` (the copy's own configuration), the origin heads, kept as the refs `refs/remotes/origin/<name>`: `OriginHeads`, `OriginHead`, `SetOriginHead` and `DeleteOriginHead`, `CompareAndSwapRef(ctx, ref, new, expectedOld)`, which moves a ref only from `expectedOld` (`""`: creates it only while it does not exist) and otherwise, or when another writer holds the ref's lock, changes nothing and returns an error matching `ErrRefMoved`, and `IsAncestor`; `CreateFork(ctx, parentDir, forkDir)` makes a fork's repository without copying history: an empty bare repository (`git init --bare`) whose `objects/info/alternates` names the parent's object directory by its absolute path, so that no object or pack is written into it, the parent is not changed, every object of the parent, also one it receives later, is readable through it, and what is pushed to it is stored in it alone; it is built in a temporary directory `.<name>.tmp-<random>` beside `forkDir` and renamed into place once complete, the temporary directory removed on an error, and refuses, with an error matching `fs.ErrExist`, a `forkDir` where something exists already, which it leaves as it is, and a `parentDir` that is not a repository; `Remove(dir)` removes a copy or a fork's repository |
+| `internal/gitrepo/gitrepotest` | test support, imported by test code only, and the repository's one test origin: `NewOrigin(t, opts...)` makes an empty bare repository whose default branch is `main` and serves it over TLS with `net/http/httptest` and git's file-based HTTP transport (`git update-server-info` after every change), or with git's smart transport through `git http-backend` under `WithSmartHTTP()` (git cannot read a repository without refs over the file-based one, so an empty origin needs it); `SmartOrigin(t, opts...)` is `NewOrigin` with the smart transport and `http.receivepack` enabled, so that it takes pushes; `WithBasicAuth(user, password)` makes it answer `401` without them, and `Accept(user, password)` changes the credential it takes while it serves; `Commit(branch, msg)`, `Branch(name, ref)`, `Tag(name, ref)` and `SetDefaultBranch(branch)` change it, `History()` builds the tests' usual history on it (`main` with three commits, `dev` branching off its second with one more, the tag `v1` on its first), `Head(branch)` reads it; `URL()` is its https URL and `Env()` (`GIT_SSL_CAINFO=<CAFile()>`) makes git trust it; `Requests()` counts the requests it received, `Block()` holds every later request until `Release()`, `Refuse(status)` answers every request with a status, `Reject(message)` installs a `pre-receive` hook that refuses every update writing `message` (`""` removes it), `ServeUntrusted(true)` makes it serve, on every later connection, a self-signed certificate that `CAFile()` does not vouch for, and `Close()` shuts it down; `Git(t, dir, args...)` runs git on a repository directory, such as a copy the code under test made, away from the user's git configuration, and returns its trimmed output, `Run(dir, stdin, args...)` does the same with `stdin` as git's input and returns git's failure as an error instead of failing the test, and `Refs(t, dir, prefix)` maps the refs below `prefix` of such a directory, by their names without it (`""`: every ref, by its full name), to their object ids |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -474,6 +475,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 | `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: none) |
 | `AdjustWorkspace(func(*workspace.Deps))` | a change to the workspace service's dependencies, applied after the start hook `workspaces` builds them and before it binds them, in the order added; tests replace a collaborator with it |
+| `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
 `composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
@@ -511,6 +513,18 @@ invalid route does): a part keeps it when it is composed (see
 workspace, or acts when one is archived or deleted, registers its
 collaborator on `Workspaces().Teardown()`
 ([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)).
+
+`(*Composition).Forks()` returns the `*fork.Component` that `composeForks`
+(`internal/hub/fork.go`) creates: a part keeps it when it is composed and
+asks it for a fork's refs, head and branch writes from its start hook on, if
+it is listed after `composeForks`, or from `Options.Compose` (see
+[Task forks](#task-forks)). The session part registers its session-linking
+rule there with `RegisterSessionLinker` and the sandbox part its sandbox
+component with `RegisterSandbox`, each while it is composed, from its own
+file of `internal/hub`, as the teardown collaborators are registered on the
+workspace service
+([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md));
+no part registers either yet.
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -2498,6 +2512,189 @@ remover's discard function runs. The answer is `204` with no body. No
 event of the log is removed, so the earlier events of the deleted
 workspaces stay readable, and the slug can be created again.
 
+#### Task forks
+
+`internal/fork/store.go` holds `fork.SchemaStep` (`fork_fields`), which adds
+to the table `workspaces`, after `workspace.SchemaStep`, the columns
+`tracking_branches` and `tracking_tags`: the names of the branches and of
+the tags the parent had when the fork was created, each a JSON array of
+names, sorted and without repeats, NULL for a repository. They are columns
+of the workspace record, not a table of their own, so they go with the
+fork's record when it is removed. A fork's base branch is its
+`default_branch`; its fork point, `expires_at`, `auto_change`, `purpose`,
+`session_id`, parent and creating token are columns of the workspace
+record already. The record type is `fork.Fork` (an embedded
+`workspace.Workspace` plus `TrackingBranches` and `TrackingTags`), and the
+store functions are:
+
+- `Insert(ctx, tx, f)` stores the fork through `workspace.Insert` in the
+  caller's transaction and then its tracking names, so a slug in use is
+  `access.ErrDuplicateSlug` and a record the access rule refuses
+  `access.ErrInvalidRecord`; a record not of kind `fork` is refused with
+  `access.ErrInvalidRecord` before anything is written.
+- `BySlug(ctx, q, slug)` reads a fork through an `access.Querier`; a slug
+  no workspace has and a repository workspace are found = false with a nil
+  error.
+- `CountOf(ctx, q, parent)` counts the forks of a parent, and
+  `ListOf(ctx, q, parent, f)` lists those the `fork.ListFilter` `f` selects,
+  newest first, those created at the same instant by slug: only the slugs
+  of `Slugs` when it is not nil, the forks of `OwnerID`, those created in
+  `SessionID` (compared in lower case), those after the `fork.Position`
+  `After` (`created_at` in UnixNano, then slug), at most `Limit` of them;
+  the zero filter lists them all. The selection, the order and the position
+  are one query, so a page reads only its own rows.
+
+`internal/fork/refs.go` holds what the `fork.Component` answers about a
+fork's refs, each read now, from the parent's repository and the fork's,
+at `(*workspace.Service).RepoPath`; nothing is copied into the fork for it:
+
+- `Refs(ctx, slug)` is the ref view (`RefView`, with `Branches` and
+  `Tags`, each ordered by name and never nil, and the lookups `Branch(name)`
+  and `Tag(name)`), the one answer to which refs a fork has. Each recorded
+  branch name is a tracking branch (`Branch{Name, SHA, Tracking: true}`) at
+  the parent's current head of that name, absent while the parent has no
+  branch of the name; each recorded tag is listed (`Tag{Name, SHA}`) at the
+  object the parent's tag of the name points at now (the tag object of an
+  annotated tag), absent while the parent has none; a branch or tag the
+  parent gained after the fork never shows. The branches of the fork's own
+  repository are its own branches (`Tracking: false`), except those under
+  a recorded tracking name: git serving a fork copies the parent's tracking
+  refs into its repository, and such a copy is never an own branch, so a
+  recorded name is listed once, as the tracking branch at the parent's
+  head. Refs outside `refs/heads/`, such as `refs/parley/changes/*`, are
+  never branches. A slug that names no fork is an error matching
+  `fork.ErrNotFork`.
+- `HeadSHA(ctx, slug)` is the parent's current head of the fork's base
+  branch, nil when the parent has no such branch; the recorded fork point
+  is never read for it.
+- `CheckBranchWrite(ctx, slug, branch)` refuses the creation, move or
+  deletion of a branch (named without `refs/heads/`) of a fork whose name is
+  one of its recorded tracking names with `fork.TrackingBranchError`, `403
+  tracking_branch`, also while the parent has no branch of that name, since
+  the name stays reserved; it returns nil for every other name and for every
+  branch of a workspace that is not a fork.
+
+`internal/hub/fork.go` adds the part `composeForks`, after
+`composeWorkspaces`. It creates the `*fork.Component`, registers
+`fork.SchemaStep` and registers the component's `WorkspaceView` as the
+workspace service's fork view (`RegisterForkView`), so that every workspace
+object of a fork, as `GET /workspaces/:slug` answers it, has the `head_sha`
+`HeadSHA` gives, registers the update handlers of `purpose` and
+`auto_change` and the update guard (`RegisterForkField`,
+`RegisterForkUpdateGuard`), and adds the component's routes (`Routes`); its start
+hook `forks` builds the component's `fork.Deps` (the stores, the workspace
+service, the hub's git with the variables of the hub's environment that
+every git process gets, the event component as `Events`, the access rule as
+`Access`, whose `MintBound` mints a fork's token, and as `Readable`, whose
+readable set confines the fork list, `rt.Config.Forks` as
+`Limits`, the hub's clock, `CreateRepo` = the git's `CreateFork` and
+`Transact` = `rt.Store.Tx`), applies every function `AdjustForks` added,
+and binds the component; `Bind` sets `NewName`, when nil, to the
+generator of 8 characters from `a` to `z` and digits drawn from
+`crypto/rand`.
+
+`internal/fork/create.go` holds the create, `POST /workspaces/:slug/forks`
+(see [the API](api.md#post-apiv1workspacesslugforks)). The route declares
+the scope `workspaces:write`, the access need `read` and `ShowOnce`
+`token.token`, so that a replay of its `Idempotency-Key` answers without the
+token's secret. The handler refuses the admin token before it reads the
+body, reads the body member by member (no body is `{}`, a `null` member is
+absent), computes `expires_at` with `ResolveTTL` or `DefaultExpiry` at the
+hub's time, reads the parent's record and judges it with
+`workspace.RequireReady`, reads the parent's branches and tags from its
+repository and takes the fork point from them (`400 fork_ref_not_found`
+for a base branch the parent does not have). From the name check to the
+commit it holds a lock per parent slug (`Component.createLocks`), so that
+the creates of one parent's forks run one at a time there: it picks the
+slug (`<parent>--<name>`, `409 conflict` when a workspace has it, or a
+generated name drawn again while it is in use, at most 8 draws, then `500
+internal`), removes whatever is at the fork's `RepoPath` (no record has the
+slug, so it is a leftover of a create that stopped), makes the repository
+with `CreateRepo`, renders the workspace object with access `owner`, and
+in one `Transact` reads the parent again and judges it again with
+`RequireReady`, so that a maintenance operation that began meanwhile
+refuses the create, inserts the fork with `fork.Insert` (status `ready`,
+the caller's user as owner, the parent's org, the creating PAT's id when a
+PAT authenticated the request), records the link of the fork to its
+session, mints the token through `Access.MintBound` when the body has one,
+writes `parley.workspace.fork` (`fork.EventFork`) through `Events`, and
+last asks the sandbox component when the body has a `sandbox`. When the
+repository creation or the
+transaction fails, the repository directory is removed with
+`gitrepo.Remove` and the answer is the error, `500 internal` for anything
+but an API error; a duplicate slug at the insert is `409 conflict`.
+
+`internal/fork/list.go` holds the fork list, `GET /workspaces/:slug/forks`
+(see [the API](api.md#get-apiv1workspacesslugforks)). The route declares
+the scope `workspaces:read` and the access need `read`, and no state
+precondition. The handler reads the page with `server.ReadPage`, refuses an
+`owner` other than `me` and a `session_id` that is not a UUID (each given
+once) with `400 invalid_request`, and builds the caller's readable set with
+`Readable(ctx, access.CallerFrom(caller))`, which for a PAT bound to a
+workspace is already its binding's covered set: `ListOf` reads the forks
+of the slug among that set's slugs (every fork for the admin token's set),
+filtered and after the cursor's `fork.Position`, one more than the page
+holds, and each is rendered with `(*workspace.Service).RenderWorkspace` at
+the set's level on it, so its `head_sha` comes through the fork view;
+`server.WritePage` writes the page with the last item's position as
+`next_cursor`. `owner=me` with the admin token, which acts for no user,
+answers an empty page without a read.
+
+`internal/fork/collaborators.go` declares the two collaborators of the
+create, which other features supply and register on the component while
+the hub is composed (`RegisterSessionLinker`, `RegisterSandbox`; nil
+removes one), so that `internal/fork` depends on neither:
+
+- `SessionLinker` has `Check(ctx, caller, sessionID, parent)`, which
+  returns the id in lower case when it accepts it, an error matching
+  `fork.ErrUnknownSession` when it refuses it and any other error when it
+  cannot tell, and `Record(ctx, tx, sessionID, parent, forkSlug)`, which
+  links the fork to the session in the fork's creating transaction. The
+  create asks `Check` after the body, before the parent is read (`400
+  unknown_session` for a refusal, `500 internal` for a failure), stores the
+  id it returns on the fork, so that the fork's event carries it, and calls
+  `Record` right after the insert, its error rolling the transaction back
+  (`500 internal`). Neither is called without a `session_id`; without a
+  linker every `session_id` is `400 unknown_session`.
+- `SandboxCreator` has `CreateSandbox(ctx, tx, fork.SandboxRequest)`, the
+  request holding the caller, the fork, the body's `sandbox` member as
+  received and the fork's `session_id` and `purpose` as defaults; it
+  returns the sandbox object, a JSON object, or the API error the create
+  answers unchanged (status, `error_type`, extra members). The create calls
+  it once, the last step of its transaction, after the fork, its session
+  link, its token and its event are written and its repository exists, and
+  never reads the member itself; an error rolls the transaction back and
+  removes the repository directory, a result that is not a JSON object is
+  `500 internal`, and the object is the answer's `sandbox`. Without a
+  component a `sandbox` is `404 sandboxes_disabled` at that place.
+
+`internal/fork/guard.go` holds `CheckParentState(ctx, slug, use)` of the
+component, `use` being `fork.UseRead` or `fork.UseWrite`, the check every
+route that reads or writes a fork makes of the fork's parent, its errors
+built with the constructors of `internal/server` so that a caller answers
+them unchanged: nil for a repository workspace and for a fork whose parent
+is `ready` with no maintenance marker; otherwise `workspace.RequireReady`
+of the parent (`409 workspace_busy` for a marker, `pending` or `cloning`,
+`409 workspace_not_ready` for `failed`), except that an `archived` parent
+with no marker allows a read and refuses a write with `409
+parent_archived`; a slug no workspace has is `404 not_found`. `GuardUpdate`
+is the same check for a write, the parent read through the update's
+transaction.
+
+`internal/fork/update.go` holds the handlers of the fork-only fields
+`purpose` and `auto_change` in `PATCH /workspaces/:slug`, both
+`workspace.ForkFieldHandler`: `PurposeField` takes `null` (clears the
+purpose) or a string of at most 1024 code points, `AutoChangeField` `true`
+or `false` and never `null`, any other value being `400 invalid_request`
+(`<field>: <reason>`); each returns the write that stores its column in the
+update's transaction. `composeForks` registers them with
+`(*workspace.Service).RegisterForkField` and `GuardUpdate` with
+`RegisterForkUpdateGuard`, so the workspace update judges them after the
+other values and asks the guard, for every update of a fork, after the
+body is judged and before anything is written; `ttl` is left to the fork
+lifetime. The update's `parley.workspace.update` event carries the
+workspace's `session_id`.
+
 ### Hub events
 
 `internal/hub/events.go` adds the part `composeEvents`, after `composeAccess`
@@ -3252,6 +3449,17 @@ resolved. Both read `--setting`, registered by `addSettingFlag` as a string
 array, through `addSettings`, which parses the values with
 `ParseSettingFlags`, the one parser of `--setting`. `create --wait` polls
 `GET /workspaces/<slug>` through the shared wait.
+
+`parley fork` (`fork.go`) is `create` and `list`. `create` builds its body
+from its flags with `forkCreateBody`, which its wrapped argument check calls
+too, so that `--token-paths` without `--token-permissions` and words after
+`--` without `--sandbox-profile` are usage errors before any setting is
+resolved; the check counts only the arguments before `--` (cobra's
+`ArgsLenAtDash`), and the words after it become `sandbox.command`. It does
+not declare `ShowsOnce`, whose warning is unconditional: after printing the
+answer it warns on stderr only when the answer holds `token.token`. `list`
+sends a query parameter for each flag given (`listForks`), `--mine` as
+`owner=me`, and prints one page.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a

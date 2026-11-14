@@ -115,9 +115,9 @@ func TestRegistry_RefusesAConflictingSectionRegistration(t *testing.T) {
 			_ = reg.RegisterSection("sandbox", v)
 			_ = reg.RegisterSection("sandbox", v)
 		}},
-		{"section of a registered key", "forks", "[forks]\ndefault_ttl = \"1d\"\n", func(reg *config.Registry, v func(map[string]any) error) {
-			_ = reg.Register(config.Key{Section: "forks", Name: "default_ttl", Type: config.String, Default: "7d"})
-			_ = reg.RegisterSection("forks", v)
+		{"section of a registered key", "quotas", "[quotas]\nwindow = \"1d\"\n", func(reg *config.Registry, v func(map[string]any) error) {
+			_ = reg.Register(config.Key{Section: "quotas", Name: "window", Type: config.String, Default: "7d"})
+			_ = reg.RegisterSection("quotas", v)
 		}},
 		{"key in a registered section", "sandbox", "[sandbox]\nx = 1\n", func(reg *config.Registry, v func(map[string]any) error) {
 			_ = reg.RegisterSection("sandbox", v)
