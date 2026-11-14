@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -25,9 +26,13 @@ var forkStringFlags = []struct {
 	{"session", "session_id", "the id of the agent session to link the fork to"},
 }
 
+// forkSlugSeparator joins a fork's parent slug and its name; only a fork's
+// slug holds it.
+const forkSlugSeparator = "--"
+
 // newForkCommand builds parley fork: the task forks of a workspace.
 func newForkCommand() *cobra.Command {
-	return group("fork", "Create a task fork of a workspace and list a workspace's forks",
+	return group("fork", "Create, list, extend and delete the task forks of a workspace",
 		newForkCreateCommand(),
 		declare(command{
 			Name:        "list",
@@ -44,7 +49,81 @@ func newForkCommand() *cobra.Command {
 			},
 			Run: listForks,
 		}),
+		newForkExtendCommand(),
+		newForkDeleteCommand(),
 	)
+}
+
+// newForkExtendCommand builds parley fork extend: a new lifetime for a fork,
+// counted from the hub's time of the request. The form of --ttl is the
+// hub's to judge, so its refusal names what is wrong; only an empty value,
+// which can be no lifetime, is refused here.
+func newForkExtendCommand() *cobra.Command {
+	extend := forkOnly(declare(command{
+		Name:        "extend",
+		Description: "Give a task fork a new lifetime, longer or shorter, counted from now",
+		Method:      http.MethodPatch,
+		Path:        "/workspaces/:slug",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("ttl", "", "the fork's new lifetime from now, such as 2h or 7d, within the hub's [forks].max_ttl")
+		},
+		Run: func(c *call) error {
+			ttl, _ := c.cmd.Flags().GetString("ttl")
+			return sendWith(c, nil, map[string]any{"ttl": ttl})
+		},
+	}))
+	_ = extend.MarkFlagRequired("ttl")
+	checkLine := extend.Args
+	extend.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		if ttl, _ := cmd.Flags().GetString("ttl"); ttl == "" {
+			return usageError("%s needs a value for --ttl", cmd.CommandPath())
+		}
+		return nil
+	}
+	return extend
+}
+
+// newForkDeleteCommand builds parley fork delete. A fork is disposable, so
+// unlike parley workspace delete it takes no --confirm. The hub answers a
+// delete with no body, so the command prints a document that names the fork
+// deleted.
+func newForkDeleteCommand() *cobra.Command {
+	return forkOnly(declare(command{
+		Name:        "delete",
+		Description: "Delete a task fork at once, with its own branches and the tokens bound to it",
+		Method:      http.MethodDelete,
+		Path:        "/workspaces/:slug",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Confirm: func(c *call) any {
+			return struct {
+				Status string `json:"status"`
+				Slug   string `json:"slug"`
+			}{"deleted", c.args[slugArg.Name]}
+		},
+	}))
+}
+
+// forkOnly makes cmd refuse, as a usage error before any setting is
+// resolved or any request sent, a <slug> that is no fork's slug, so that a
+// command meant for a fork can never reach a repository workspace.
+func forkOnly(cmd *cobra.Command) *cobra.Command {
+	checkLine := cmd.Args
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		if !strings.Contains(args[0], forkSlugSeparator) {
+			return usageError("%s takes the slug of a task fork, <parent>--<name>, got %q", cmd.CommandPath(), args[0])
+		}
+		return nil
+	}
+	return cmd
 }
 
 // newForkCreateCommand builds parley fork create. The words after -- are

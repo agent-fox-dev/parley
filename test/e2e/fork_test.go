@@ -10,8 +10,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
+	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -23,21 +25,35 @@ import (
 
 // forkHub is a workspace hub holding demo, cloned by its workers from an
 // origin whose main has three commits, in the organization acme of the
-// developer and of a second member, who has an API key.
+// developer and of a second member, who has an API key. Its fork sweep runs
+// one pass at the start and then one at each tick the test sends on ticks.
 type forkHub struct {
 	*workspaceHub
 	comp      *hub.Composition
 	member    string
 	memberKey string
+	ticks     chan time.Time
 }
 
 // startForkHub starts the hub and creates demo, and each of more, as the
 // developer in acme, waiting until the hub has cloned them.
 func startForkHub(t *testing.T, more ...string) *forkHub {
 	t.Helper()
+	return startForkHubAt(t, nil, more...)
+}
+
+// startForkHubAt is startForkHub with now as the hub's clock, nil for
+// time.Now.
+func startForkHubAt(t *testing.T, now func() time.Time, more ...string) *forkHub {
+	t.Helper()
 	origin := newOrigin(t)
-	h := &forkHub{}
-	h.workspaceHub = startWorkspaceHub(t, origin, "demo", func(c *hub.Composition) { h.comp = c })
+	h := &forkHub{ticks: make(chan time.Time)}
+	h.workspaceHub = startWorkspaceHubAt(t, origin, "demo", now, func(c *hub.Composition) {
+		h.comp = c
+		c.AdjustForks(func(d *fork.Deps) {
+			d.SweepTicks = func() (<-chan time.Time, func()) { return h.ticks, func() {} }
+		})
+	})
 	acme := h.CreateOrg(t, "acme")
 	h.member = h.CreateUser(t, "member")
 	h.memberKey = h.IssueKey(t, h.member)
