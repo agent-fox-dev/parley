@@ -15,6 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds and the read by position |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -460,6 +461,11 @@ loaded configuration before any store is opened, for rules that span more
 than one key or section, and `addVersionMember(func() map[string]any)` adds
 members to the document of `GET /version` (the server's
 `Options.VersionMembers`), after the build's.
+
+`(*Composition).Events()` returns the `*event.Component` that `composeEvents`
+(`internal/hub/events.go`) creates: a part keeps it when it is composed and
+emits through it from its start hook on, if it is listed after
+`composeEvents`, or from `Options.Compose` (see [Hub events](#hub-events)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -1349,6 +1355,73 @@ that is not among them is one the user has no level on. A workspace is
 therefore in a user's set exactly when `Level` resolves a level other than
 `LevelNone` for it, with that level. No production code calls `Readable`
 yet; the workspace list, the event stream and the audit query will.
+
+### Hub events
+
+`internal/hub/events.go` adds the part `composeEvents`, after `composeAccess`
+in `parts`. It creates a zero `event.Component`, adds the schema step
+`event.SchemaStep` (`hub_events`) and binds the component in the start hook
+`events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
+Scrubber: rt.Scrubber, Parents: ...}`, the fork-parent lookup being
+`access.RecordBySlug` read in the emitting transaction. The start hooks that
+run after it, those of the parts listed after `composeEvents` and of
+`Options.Compose`, may emit before the hub listens; a call made before the
+component is bound returns an error.
+
+The step creates three tables in the transactional store:
+
+- `hub_events`, one row per committed event, keyed by `seq`, with the
+  record's fields, `metadata` as JSON text and `parent_slug`, the parent of a
+  task fork, which no consumer sees; indexes on `(workspace, seq)` and on
+  `time`, which is stored as the text `timefmt.Format` writes;
+- `hub_event_seq`, one row with `last_seq`, the last `seq` assigned, starting
+  at 0;
+- `hub_event_log_bound`, one row with `oldest_seq`, the lowest `seq` the log
+  addresses, starting at 1.
+
+`(*Component).Emit(ctx, tx, in)` stores one event inside `tx`, the caller's
+transaction of `(*store.Store).Tx`, so the event commits or rolls back with
+the state change it reports. It validates `in` first and writes nothing on a
+refusal, then increments `hub_event_seq` inside `tx` (the store runs one
+write transaction at a time, so commit order is `seq` order; a rolled-back
+transaction gives its number back, and deleting event rows never lowers the
+counter, across restarts too), takes a version 4 UUID as `id` (`uuid.NewV4`),
+the clock's time in UTC at whole seconds as `time` and the last segment of the
+type as `action`, and returns the stored `event.Record`. When `in.Parent` is
+empty and the workspace is a task fork, the parent's slug is read from the
+workspace record and stored with the event; a caller that deletes the fork's
+record before it emits passes `Parent` itself. `(*Component).EmitNow(ctx,
+in)` runs `Emit` in a transaction of its own, for what is not a store change.
+
+An `event.Input` is refused with an error wrapping `event.ErrInvalidEvent`
+whose text names the field (`invalid event: <field>: <reason>`) when: `type`
+does not begin with `parley.`, has fewer than three dot-separated segments or
+an empty one; `workspace` is an empty string; `resource_type` or
+`resource_id` is empty; `actor_type` is not one of `admin_token`, `api_key`,
+`pat`, `forge` and `system`; `actor_id` is missing or empty for `api_key` and
+`pat`, or present for the other three; `session_id` is not a UUID in the
+8-4-4-4-12 form (it is stored in lower case); or `metadata` is not a JSON
+object (`Metadata` is anything `encoding/json` encodes, nil and JSON null
+being `{}`). Every failure to write returns an error that is not
+`ErrInvalidEvent`; a route that returns it answers `500 internal`.
+
+A `Record` marshals to one line with exactly the members `seq`, `id`, `type`,
+`time`, `workspace`, `actor_type`, `actor_id`, `resource_type`,
+`resource_id`, `action`, `session_id` and `metadata`, in that order: `null`
+for an absent `workspace`, `actor_id` or `session_id`, an object for
+`metadata` and `time` as `timefmt.Format` writes it.
+
+`(*Component).Bounds(ctx)` returns `event.Bounds{OldestSeq, LastSeq}`, both 0
+while no event was ever written; `LastSeq` is the counter, not the highest
+stored row. `(*Component).ReadAfter(ctx, after, limit)` returns the events
+with a higher `seq` than `after`, ascending, at most `limit` (all when
+`limit` <= 0), and the position examined: the last record's `seq` when the
+limit was reached, else `last_seq`, both read in one read-only transaction,
+which begins without the write lock and sees one snapshot.
+
+The component's `event.Clock` has `Now()` and `NewTimer(d)`, so that tests
+control the time events are stamped with and the timers of the waits;
+`event.SystemClock(now)` is the hub's.
 
 ### The logger
 

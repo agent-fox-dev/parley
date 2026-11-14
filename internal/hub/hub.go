@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
@@ -56,6 +57,7 @@ var parts = []func(*Composition){
 	composeBootstrap,
 	composeIdentity,
 	composeAccess,
+	composeEvents,
 	composeSandbox,
 }
 
@@ -155,6 +157,10 @@ type Composition struct {
 	// that the delete of the user or the org removes that data in its own
 	// transaction (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
 	identity *identity.Service
+
+	// events is the event component composeEvents creates and binds in its
+	// start hook; the parts emit through it (Events).
+	events *event.Component
 }
 
 func newComposition() *Composition {
