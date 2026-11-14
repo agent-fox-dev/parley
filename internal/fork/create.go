@@ -13,6 +13,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+	"unicode/utf8"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -39,6 +41,9 @@ const (
 	nameDraws    = 8
 )
 
+// purposeMax is the most code points a fork's purpose may hold.
+const purposeMax = 1024
+
 // Routes returns the fork routes of the REST API.
 func (c *Component) Routes() []server.Route {
 	return []server.Route{c.createRoute()}
@@ -63,6 +68,11 @@ type createRequest struct {
 	AutoChange bool
 	Purpose    *string
 	Token      *tokenRequest
+	// SessionID is the session the fork is created in, a UUID.
+	SessionID *string
+	// Sandbox is the sandbox member as received, a JSON object, nil when
+	// the body has none.
+	Sandbox json.RawMessage
 }
 
 // tokenRequest is the token member of a create body: the token to mint,
@@ -89,7 +99,12 @@ var createMembers = []createMember{
 		return readString(raw, &req.Name, workspace.ValidateForkName)
 	}},
 	{"ref", func(_ *Component, req *createRequest, raw json.RawMessage, _ time.Time) error {
-		return readString(raw, &req.Ref, nil)
+		return readString(raw, &req.Ref, func(s string) error {
+			if s == "" {
+				return errors.New("must not be empty")
+			}
+			return nil
+		})
 	}},
 	{"ttl", func(c *Component, req *createRequest, raw json.RawMessage, now time.Time) error {
 		var ttl *string
@@ -118,7 +133,27 @@ var createMembers = []createMember{
 		return nil
 	}},
 	{"purpose", func(_ *Component, req *createRequest, raw json.RawMessage, _ time.Time) error {
-		return readString(raw, &req.Purpose, nil)
+		return readString(raw, &req.Purpose, func(s string) error {
+			if utf8.RuneCountInString(s) > purposeMax {
+				return fmt.Errorf("must be at most %d characters long", purposeMax)
+			}
+			return nil
+		})
+	}},
+	{"session_id", func(_ *Component, req *createRequest, raw json.RawMessage, _ time.Time) error {
+		return readString(raw, &req.SessionID, func(s string) error {
+			if _, err := uuid.Parse(s); len(s) != 36 || err != nil {
+				return errors.New("must be a UUID")
+			}
+			return nil
+		})
+	}},
+	{"sandbox", func(_ *Component, req *createRequest, raw json.RawMessage, _ time.Time) error {
+		if raw != nil && raw[0] != '{' {
+			return errors.New("must be an object")
+		}
+		req.Sandbox = raw
+		return nil
 	}},
 }
 
@@ -177,8 +212,9 @@ var errAdminCreate = server.Forbidden("a fork needs a user as owner; the admin t
 // in one transaction stores the fork, ready at once, mints the token the
 // body asks for and writes the fork's event, and answers 201 with the fork's
 // workspace object and its git remote. The checks run in the order of the
-// refusals: the caller, the body, the parent's state, the base branch, the
-// name in use. What the create made is removed when it fails, and a
+// refusals: the caller, the body, the session, a fork as parent, the
+// parent's state, the base branch, the fork limit, the name in use, the
+// token, the sandbox. What the create made is removed when it fails, and a
 // directory found at the fork's place without a record is a leftover of a
 // create that stopped, which it replaces.
 func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
@@ -195,6 +231,9 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := checkSession(req.SessionID); err != nil {
+		return err
+	}
 	parent, found, err := workspace.BySlug(ctx, c.deps.Store.Main(), server.Param(r, "slug"))
 	switch {
 	case err != nil:
@@ -202,6 +241,9 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
 	case !found:
 		// Deleted since the access check read it.
 		return server.NotFound("workspace not found")
+	case parent.Kind == access.KindFork:
+		return server.NewError("not_supported_on_fork", http.StatusBadRequest,
+			fmt.Sprintf("workspace %q is a task fork, which cannot be forked; fork its parent instead", parent.Slug))
 	}
 	if err := workspace.RequireReady(parent); err != nil {
 		return err
@@ -216,6 +258,11 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
 	// another create of the same name is making.
 	unlock := c.lockParent(parent.Slug)
 	defer unlock()
+	// Counted before the repository is made, so that a parent at its limit
+	// costs no directory, and again in the transaction.
+	if err := c.checkLimit(ctx, c.deps.Store.Main(), parent.Slug); err != nil {
+		return err
+	}
 	if f.Slug, err = c.freeSlug(ctx, parent.Slug, req.Name); err != nil {
 		return err
 	}
@@ -314,6 +361,30 @@ func (c *Component) freeSlug(ctx context.Context, parent string, name *string) (
 	return "", fmt.Errorf("no free fork name for %q in %d draws", parent, nameDraws)
 }
 
+// checkSession judges the session_id of a create, nil for none. No session
+// component is wired, so no session exists and every id is unknown.
+func checkSession(id *string) error {
+	if id == nil {
+		return nil
+	}
+	return server.NewError("unknown_session", http.StatusBadRequest, fmt.Sprintf("session_id: no session %q", *id))
+}
+
+// checkLimit is 429 fork_limit_reached when the workspace parent has
+// [forks].max_per_workspace forks or more, counting the fork records q
+// reads.
+func (c *Component) checkLimit(ctx context.Context, q access.Querier, parent string) error {
+	n, err := CountOf(ctx, q, parent)
+	switch {
+	case err != nil:
+		return err
+	case n >= c.deps.Limits.MaxPerWorkspace:
+		return server.NewError("fork_limit_reached", http.StatusTooManyRequests,
+			fmt.Sprintf("workspace %q has %d forks, the hub's [forks].max_per_workspace", parent, n))
+	}
+	return nil
+}
+
 // nameTaken answers a create whose given name a fork of parent has.
 func nameTaken(parent, slug string) error {
 	return server.Conflict(fmt.Sprintf("name: %q has a fork %q", parent, slug))
@@ -352,6 +423,9 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 		if err := workspace.RequireReady(parent); err != nil {
 			return err
 		}
+		if err := c.checkLimit(ctx, tx, parent.Slug); err != nil {
+			return err
+		}
 		if err := Insert(ctx, tx, f); err != nil {
 			return err
 		}
@@ -369,8 +443,16 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 			}
 			ans.Token, tokenID = &mintedToken{pat, value}, &pat.TokenID
 		}
-		_, err = c.deps.Events.Emit(ctx, tx, forkEventInput(p, f, tokenID))
-		return err
+		if _, err := c.deps.Events.Emit(ctx, tx, forkEventInput(p, f, tokenID)); err != nil {
+			return err
+		}
+		// The sandbox is asked last, once the fork, its token and its
+		// repository exist. No sandbox component is wired, so every sandbox
+		// is refused as the sandbox routes of such a hub answer.
+		if req.Sandbox != nil {
+			return server.NewError("sandboxes_disabled", http.StatusNotFound, "sandboxes are not enabled on this hub")
+		}
+		return nil
 	})
 	if err != nil {
 		return createAnswer{}, err

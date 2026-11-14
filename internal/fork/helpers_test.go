@@ -144,6 +144,15 @@ func (w *world) insert(t *testing.T, fn func(*sql.Tx) error) {
 	}
 }
 
+// exec runs the statement query with args on the hub's store and fails the
+// test on its error.
+func (w *world) exec(t *testing.T, query string, args ...any) {
+	t.Helper()
+	if _, err := w.Store.Main().ExecContext(context.Background(), query, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // seedFork stores a ready fork of demo named slug, as a create would, with
 // the fork's repository at its place: owned by dev in acme, taken from main
 // at main's head, tracking every branch and tag demo has now, created at the

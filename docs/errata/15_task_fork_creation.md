@@ -46,6 +46,11 @@ when generated, drawn again; only then is whatever lies at the fork's place
 removed as a leftover and the repository made. A duplicate slug at the
 insert is still answered `409 conflict`.
 
+The fork limit, which the package counts in the transaction before the
+insert, is counted under the same lock before the name check as well, so
+that a parent at its limit is refused (`429 fork_limit_reached`) before a
+repository directory is made; the count in the transaction stays.
+
 ## The parent's state is judged twice
 
 The package judges the parent's state once, at its place in the order of
