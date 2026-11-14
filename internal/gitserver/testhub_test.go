@@ -62,6 +62,8 @@ type world struct {
 	// repo is the git directory of demo's repository, and head the commit
 	// its main is at.
 	repo, head string
+	// work is the head of the fork's own branch work (newForkWorld).
+	work string
 
 	// mu guards now, the hub's time.
 	mu  sync.Mutex
@@ -163,6 +165,13 @@ func (w *world) pat(t *testing.T, user, bound string, perms ...string) (token, i
 // in acme, tracking main, with its own repository made from demo's.
 func (w *world) addFork(t *testing.T) {
 	t.Helper()
+	w.addForkTracking(t, []string{"main"}, nil)
+}
+
+// addForkTracking is addFork with the tracking branches branches and the
+// tracking tags tags recorded on the fork.
+func (w *world) addForkTracking(t *testing.T, branches, tags []string) {
+	t.Helper()
 	ctx, now, head := context.Background(), w.clock(), gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
 	f := fork.Fork{
 		Workspace: workspace.Workspace{
@@ -172,7 +181,7 @@ func (w *world) addFork(t *testing.T) {
 			ExpiresAt: new(now.Add(7 * 24 * time.Hour)), AutoChange: new(false),
 			CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
 		},
-		TrackingBranches: []string{"main"},
+		TrackingBranches: branches, TrackingTags: tags,
 	}
 	if err := (gitrepo.Git{}).CreateFork(ctx, w.repo, w.workspaces.RepoPath(f.Slug)); err != nil {
 		t.Fatal(err)
@@ -463,4 +472,88 @@ func clientGit(t *testing.T, dir string, env []string, args ...string) (string, 
 	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}, env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// newForkWorld is newGitWorld with the task fork demo--t1 of demo, which
+// tracks main, dev and v1, and view, when not nil, in place of the hub's
+// fork view, naming the same tracking refs and change 7 as the fork's. demo
+// holds, besides main, the branch dev and the tag v1 on main's first commit
+// and the version refs refs/parley/changes/7/1 and 7/2, on main's two
+// commits, and 8/1, on dev. The fork's repository holds its own branch work,
+// on a commit of the fork's own, at w.work.
+func newForkWorld(t *testing.T, view *fakeForkView) *world {
+	t.Helper()
+	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		if view != nil {
+			view.set(gitserver.ForkRefs{Tracking: []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"}, Changes: []int64{7}}, nil)
+			c.AdjustGitServer(func(d *gitserver.Deps) { d.ForkView = view })
+		}
+	}})
+	first := gitrepotest.Git(t, w.repo, "rev-parse", "main~1")
+	for ref, id := range map[string]string{
+		"refs/heads/dev": first, "refs/tags/v1": first,
+		"refs/parley/changes/7/1": first, "refs/parley/changes/7/2": w.head, "refs/parley/changes/8/1": first,
+	} {
+		gitrepotest.Git(t, w.repo, "update-ref", ref, id)
+	}
+	w.addForkTracking(t, []string{"main", "dev"}, []string{"v1"})
+	fork := w.workspaces.RepoPath("demo--t1")
+	w.work = gitrepotest.Git(t, fork, "commit-tree", "-p", w.head, "-m", "work", w.head+"^{tree}")
+	gitrepotest.Git(t, fork, "update-ref", "refs/heads/work", w.work)
+	return w
+}
+
+// commitOn adds a commit to the branch of demo's repository and returns its
+// id.
+func (w *world) commitOn(t *testing.T, branch string) string {
+	t.Helper()
+	id := gitrepotest.Git(t, w.repo, "commit-tree", "-p", "refs/heads/"+branch, "-m", "next", "refs/heads/"+branch+"^{tree}")
+	gitrepotest.Git(t, w.repo, "update-ref", "refs/heads/"+branch, id)
+	return id
+}
+
+// fakeForkView is the git server's fork view in the tests: it answers what
+// set gave it and counts the questions.
+type fakeForkView struct {
+	mu    sync.Mutex
+	refs  gitserver.ForkRefs
+	err   error
+	asked int
+}
+
+func (f *fakeForkView) ForkRefs(context.Context, string) (gitserver.ForkRefs, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked++
+	return f.refs, f.err
+}
+
+// set makes the view answer refs and err.
+func (f *fakeForkView) set(refs gitserver.ForkRefs, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refs, f.err = refs, err
+}
+
+// questions is how often the view was asked.
+func (f *fakeForkView) questions() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.asked
+}
+
+// lsRemote maps every ref stock git lists for remote to its id.
+func lsRemote(t *testing.T, remote string) map[string]string {
+	t.Helper()
+	out, err := clientGit(t, t.TempDir(), nil, "ls-remote", remote)
+	if err != nil {
+		t.Fatalf("git ls-remote: %v\n%s", err, out)
+	}
+	refs := map[string]string{}
+	for line := range strings.Lines(out) {
+		if id, name, ok := strings.Cut(strings.TrimSpace(line), "\t"); ok {
+			refs[name] = id
+		}
+	}
+	return refs
 }

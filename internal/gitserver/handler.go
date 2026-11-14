@@ -138,6 +138,14 @@ type Deps struct {
 	// Repositories opens the repository of a workspace; with none, a
 	// request that passed every other check is answered 500 internal error.
 	Repositories Repositories
+	// ForkView names the refs a task fork shows of its parent's, which are
+	// copied into the fork's repository before git serves it; with none, a
+	// fork is served with the refs its repository holds.
+	ForkView ForkView
+	// Copier copies those refs from the parent's repository into the
+	// fork's; with none, a request for a fork is answered 500 internal error
+	// while a ForkView is installed.
+	Copier Copier
 	// Service, when set, serves a request that passed the checks in place
 	// of the component's own exchange with git; tests put a recorder there.
 	Service Service
@@ -154,7 +162,8 @@ type Deps struct {
 // Component is the git server. The zero Component is ready to be mounted;
 // Bind gives it its dependencies before it serves the first request.
 type Component struct {
-	deps Deps
+	deps  Deps
+	locks forkLocks
 }
 
 // Bind sets the component's dependencies. The hub calls it once, from a
@@ -186,9 +195,11 @@ type check func(c *Component, w http.ResponseWriter, r *http.Request, x *Exchang
 // about the repository it asked for; the binding guard; the scope of a PAT;
 // the resolution of the repository with the access rule; the validation of
 // the request, which a caller who cannot see the repository never reaches;
-// the state of the workspace and of a fork's parent; and last the opening
-// of the repository, so that nothing has run git before every refusal had
-// its chance.
+// the state of the workspace and of a fork's parent; the opening of the
+// repository; and last, for a task fork, the copy of the refs it shows of
+// its parent's, so that nothing has run git before every refusal had its
+// chance, and whatever serves the request, a fetch or a push, finds the
+// fork's refs up to date.
 var checks = []check{
 	(*Component).authenticate,
 	(*Component).rateLimit,
@@ -198,6 +209,7 @@ var checks = []check{
 	(*Component).validate,
 	(*Component).state,
 	(*Component).open,
+	(*Component).forkRefs,
 }
 
 // handler serves route: it runs the checks in order, stops at the first

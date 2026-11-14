@@ -712,6 +712,26 @@ written only when no pack data had been sent yet, and the client's git
 fails. A push that passed every check is answered `500 internal error`: the
 hub has no push service yet.
 
+A task fork is served with its own refs and what it shows of its parent's,
+on every git route, as of the moment of the request:
+
+- Each tracking branch and tracking tag of the fork (the branches and tags
+  the parent had when the fork was created, see
+  [`POST /api/v1/workspaces/{slug}/forks`](#post-apiv1workspacesslugforks))
+  is advertised under its own name at the value the parent's ref of that
+  name has now, and not at all once the parent no longer has it. A branch
+  or tag the parent gained after the fork is never advertised.
+- The version refs `refs/parley/changes/<number>/<version>` of the changes
+  whose source is the fork are advertised under the parent's names, and
+  no version ref of another change. The hub records no change's source
+  yet, so a fork advertises no version ref.
+- The fork's own branches are advertised as they are.
+
+When those refs cannot be brought up to date, such as when the parent's
+repository is missing from disk, the request is answered `500` with the
+body `internal error` before git runs, so a fork is never served with refs
+that may be out of date.
+
 ## `GET /healthz`
 
 Liveness: the process is up and serving HTTP.

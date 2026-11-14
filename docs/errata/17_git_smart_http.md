@@ -134,3 +134,32 @@ every tree of every ref, which git itself does not make. Object ids are not
 guessable, and git does not treat reachability as a boundary between
 readers of one repository (see the SECURITY section of
 `gitnamespaces(7)`).
+
+## The hub's fork view names no change yet
+
+The package builds the fork view of `parleyd` "from packages 15 and 22":
+the tracking names package 15 records on a fork, and the changes whose
+source is the fork, which package 22 records. Package 22 (the change
+feature, `internal/change`) is not part of the hub yet, so the fork view
+installed in `internal/hub/gitserver.go` names the fork's tracking refs
+from its record (`fork.BySlug`: `refs/heads/<b>` for each tracking branch,
+`refs/tags/<t>` for each tracking tag) and no change. A fork therefore
+advertises no version ref, and the copy deletes every
+`refs/parley/changes/` ref from the fork's repository. The copy of the
+version refs of named changes is in place and tested through the test seam
+(`AdjustGitServer`) with a fork view that names changes; once package 22
+records a change's source, the hub's view names those changes and nothing
+else changes.
+
+## The copy takes namespaces as well as names
+
+The package's copy function "copies named refs" and deletes "each named ref
+the source no longer has". The version refs of a change are not known by
+name before the parent's refs are read, and the fork's version refs of
+changes it does not name must go, though the parent has them. So
+`gitrepo.CopyRefs` takes, besides `Names`, `Prefixes` (every ref of the
+source below `refs/parley/changes/<number>/` of a named change is set) and
+`Prune` (every ref of the fork below `refs/parley/changes/` that the copy
+does not set is deleted). Names, prefixes and the prune namespace come from
+the git server alone, so no other ref of the parent is copied and no other
+ref of the fork is touched.
