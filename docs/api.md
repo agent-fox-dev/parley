@@ -1070,15 +1070,26 @@ workspace, so a PAT bound to a workspace is refused before the scope check
 (see [Workspace-bound tokens](#workspace-bound-tokens)).
 
 The body is a JSON object; members the route does not read are ignored, and
-a member whose value is `null` counts as absent:
+a member that the table allows to be `null` counts as absent when it is:
 
 | Member | Required | Value |
 |---|---|---|
 | `slug` | yes | a string of 3 to 64 characters of `a` to `z`, digits and hyphens, starting with a letter, ending with a letter or digit, without two hyphens in a row; unique among all workspaces |
 | `git_url` | yes | a string `https://<host>/<path>` without user information, or `git@<host>:<path>` |
-| `default_branch` | no | a string, stored as given; absent, `null` until the clone takes it from origin |
-| `display_name` | no | a string; absent or empty, the slug |
-| `description` | no | a string; absent, the empty string |
+| `default_branch` | no | a string or `null`; a valid git branch name, stored as given; absent, `null` until the clone takes it from origin |
+| `org_id` | no | a string or `null`; an organization id or slug, which the workspace is recorded in; absent, the caller's personal organization |
+| `display_name` | no | a string or `null` of at most 128 characters (Unicode code points); absent or empty, the slug |
+| `description` | no | a string or `null` of at most 1024 characters (Unicode code points); absent, the empty string |
+| `workspace_mode` | no | a string or `null`: `standard` or `carry_patch`; absent, `null` or empty, `standard` |
+| `upstream_url` | with `carry_patch` | a string or `null`; required with `carry_patch` and checked by the `git_url` rule; with `standard` only `null` is accepted |
+| `integration_branch` | no | a string or `null`; with `carry_patch` a valid branch name, stored as given (`null` when absent); with `standard` only `null` is accepted |
+| `settings` | no | an object or `null`: each key a registered setting whose value its rule accepts, a key with the value `null` keeping its default; only the keys set are stored. Absent or `null`, every key keeps its default |
+| `git_pat` | no | a string, not empty; not with `git_username` or `git_password` |
+| `git_username`, `git_password` | no | strings, not empty, given together or not at all |
+
+No credential member may be given with a `git_url` of the form
+`git@<host>:<path>`. The credential members are checked for their form;
+they are not yet checked against origin or stored.
 
 ```json
 {"slug":"demo","git_url":"https://example.com/a.git"}
@@ -1088,14 +1099,16 @@ The checks run in this order, the first that fails answering, and a refused
 request records nothing: a bound PAT (`403` `token_bound`); a PAT without
 `workspaces:write` (`403`); the admin token (`403`), before the body is
 read, so it gets the same answer for a valid and an invalid body; the body,
-member by member in the order of the table (`400`); the caller's personal
-org, which the workspace is recorded in and of which the caller must be an
-active member; a slug that a workspace already has, in any status (`409`).
+member by member in the order of the table, the first member refused named
+in the message (`400`); the organization, the one `org_id` names or the
+caller's personal org, which must exist (`400`) and of which the caller must
+be an active member (`403`); a slug that a workspace already has, in any
+status (`409`). Nothing contacts origin before all of these pass.
 
-The workspace is recorded with `kind` `repository`, `workspace_mode`
-`standard`, `status` `pending`, the caller as `owner_id`, the caller's
-personal org as `org_id`, `created_at` equal to `updated_at`, and the
-settings document empty. A workspace in `pending` is its own clone work.
+The workspace is recorded with `kind` `repository`, the `workspace_mode`,
+`upstream_url` and `integration_branch` given, `status` `pending`, the
+caller as `owner_id`, the chosen org as `org_id`, `created_at` equal to
+`updated_at`, and a settings document holding the keys `settings` set. A workspace in `pending` is its own clone work.
 The workspace and a `parley.workspace.create` event are written in one
 store transaction: a failure of either, or of the commit, leaves neither
 and is answered `500` `internal` without its cause. When two requests race
@@ -1118,10 +1131,10 @@ registered).
 |---|---|
 | `201 Created` | the workspace was recorded; the body is the workspace object |
 | `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is recorded |
-| `400` `invalid_request` | the body is refused, the message naming the member: `slug: is required`, `slug: must be a string`, `slug: must start with a letter` and the other slug rules, `git_url: is required`, `git_url: must be a string`, a `git_url:` rule, `default_branch: must be a string or null` (the same for `display_name` and `description`); or the caller has no personal org (`org_id: the caller has no personal organization`) |
+| `400` `invalid_request` | the body is refused, the message naming the member: `slug: is required`, `slug: must be a string` (also for `null`), `slug: must start with a letter` and the other slug rules, the same for `git_url` with its rules; `default_branch: must be a string or null` (the same for `org_id`, `display_name`, `description`, `workspace_mode`, `upstream_url` and `integration_branch`), `default_branch: must not be empty` and the other branch-name rules (the same for `integration_branch`), `display_name: must be at most 128 characters`, `description: must be at most 1024 characters`; `workspace_mode: must be "standard" or "carry_patch"`, `upstream_url: is required with workspace_mode carry_patch`, `upstream_url: is accepted only with workspace_mode carry_patch` (the same for `integration_branch`), an `upstream_url:` rule of `git_url`; `settings: must be an object or null`, `unknown setting "<key>"`, `settings.<key>: <reason>` for a value its rule refuses; `git_pat: must be a string` (also for `null`, the same for `git_username` and `git_password`), `git_pat: must not be empty`, `git_pat: must not be given with a git_url of the form git@<host>:<path>`, `git_username: must not be given with git_pat`, `git_password: must not be given with git_pat`, `git_password: is required with git_username`, `git_password: is accepted only with git_username`; or an organization that does not exist (`org_id: no organization has the id or slug "acme"`, or `org_id: the caller has no personal organization`) |
 | `403` `token_bound` | a PAT bound to a workspace |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
-| `403` `forbidden` | the admin token (`a workspace needs a user as owner; the admin token cannot create one`), or a caller who is not an active member of their personal org (`the caller is not an active member of the organization`) |
+| `403` `forbidden` | the admin token (`a workspace needs a user as owner; the admin token cannot create one`), or a caller who is not an active member of the org `org_id` names, or of their personal org (`the caller is not an active member of the organization`) |
 | `409` `conflict` | a workspace has the slug, whatever its status (`slug: a workspace with the slug "demo" exists`) |
 | `413` `payload_too_large` | the body is over the hub's body limit (see [Request bodies](#request-bodies)) |
 | `500` `internal` | writing the workspace or its event failed; nothing is recorded |

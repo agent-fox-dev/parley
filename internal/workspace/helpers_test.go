@@ -167,15 +167,23 @@ func (a answer) object(t *testing.T) map[string]any {
 // errorType is the error_type of a's error envelope.
 func (a answer) errorType(t *testing.T) string {
 	t.Helper()
+	errorType, _ := a.refusal(t)
+	return errorType
+}
+
+// refusal is the error_type and the message of a's error envelope.
+func (a answer) refusal(t *testing.T) (errorType, message string) {
+	t.Helper()
 	var env struct {
 		Error struct {
 			ErrorType string `json:"error_type"`
+			Message   string `json:"message"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(a.body, &env); err != nil {
 		t.Fatalf("decode the error envelope %s: %v", a.body, err)
 	}
-	return env.Error.ErrorType
+	return env.Error.ErrorType, env.Error.Message
 }
 
 // workspaces is the number of workspace records the store holds.
@@ -186,6 +194,21 @@ func (w *world) workspaces(t *testing.T) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// footprint is what a refused create leaves as it found it: the workspace
+// records, the secrets of every scope, the create events and the calls to
+// origin.
+type footprint struct{ workspaces, secrets, events, originCalls int }
+
+// footprint counts what the hub holds and what origin was asked.
+func (w *world) footprint(t *testing.T) footprint {
+	t.Helper()
+	var secrets int
+	if err := w.Store.Main().QueryRow(`SELECT count(*) FROM secrets`).Scan(&secrets); err != nil {
+		t.Fatal(err)
+	}
+	return footprint{w.workspaces(t), secrets, len(w.createEvents(t)), w.origin.called()}
 }
 
 // workspace reads the record slug from the store; found is false when there

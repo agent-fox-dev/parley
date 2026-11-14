@@ -1700,9 +1700,13 @@ that clone work is picked up; the hub leaves both unset so far.
 `workspaces:write`, a create route, no workspace need; see
 [api.md](api.md#post-apiv1workspaces)). The handler refuses the admin token
 first, reads the body by an ordered list of members (`createMembers`, each
-answering `400 invalid_request` with `<member>: <reason>`), takes the
-caller's personal org (`identity.PersonalOrg`) and checks the caller is an
-active member of it, answers a slug in use `409 conflict` after a read with
+answering `400 invalid_request` with `<member>: <reason>`, a member able to
+depend on those before it; `settings` is applied with
+`SettingsRegistry.ApplySettings` from an empty document, and its own
+answers pass through unchanged), takes the org `org_id` names
+(`identity.OrgBySelector`; unknown is `400`) or else the caller's personal
+org (`identity.PersonalOrg`) and checks the caller is an active member of
+it (`403` otherwise), answers a slug in use `409 conflict` after a read with
 `access.RecordBySlug`, and then, in one store transaction, inserts the
 record with `workspace.Insert` (status `pending`, a fresh instance id,
 `created_at` = `updated_at` cut to the second) and writes

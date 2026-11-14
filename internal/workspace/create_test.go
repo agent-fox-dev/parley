@@ -2,16 +2,19 @@ package workspace_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -296,5 +299,209 @@ func TestCreate_CreatesExactlyOneOfConcurrentRequestsForOneSlug(t *testing.T) {
 	}
 	if n := len(w.createEvents(t)); n != 1 {
 		t.Errorf("%d create events, want 1", n)
+	}
+}
+
+// withBoolSetting registers the setting k: true by default, and only a JSON
+// boolean is a value of it.
+var withBoolSetting = withCompose(func(c *hub.Composition) {
+	err := c.Workspaces().Settings().RegisterSetting(workspace.SettingKey{
+		Name:    "k",
+		Default: func(*string) any { return true },
+		Validate: func(v json.RawMessage) error {
+			var b bool
+			return json.Unmarshal(v, &b)
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+})
+
+func TestCreate_RefusesAnInvalidBodyNamingTheFirstMemberRefused(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, withBoolSetting)
+	// Every body names a slug in use, so a refusal shows that the member
+	// checks come before the slug-in-use check.
+	w.create(t, w.uKey, valid("taken")).object(t)
+	const sshURL = "git@example.com:a/b.git"
+	carry := func(extra map[string]any) map[string]any {
+		extra["workspace_mode"], extra["upstream_url"] = "carry_patch", "https://example.com/up.git"
+		return extra
+	}
+	for _, c := range []struct {
+		name   string
+		extra  map[string]any
+		drop   string
+		prefix string
+	}{
+		{"no slug", nil, "slug", "slug:"},
+		{"slug ab", map[string]any{"slug": "ab"}, "", "slug:"},
+		{"slug A-b", map[string]any{"slug": "A-b"}, "", "slug:"},
+		{"slug 7", map[string]any{"slug": 7}, "", "slug:"},
+		{"no git_url", nil, "git_url", "git_url:"},
+		{"git_url over http", map[string]any{"git_url": "http://example.com/a"}, "", "git_url:"},
+		{"git_url with user information", map[string]any{"git_url": "https://u:p@example.com/a"}, "", "git_url:"},
+		{"git_url null", map[string]any{"git_url": nil}, "", "git_url:"},
+		{"slug and git_url both bad", map[string]any{"slug": "ab", "git_url": "file:///x"}, "", "slug:"},
+
+		{"default_branch a..b", map[string]any{"default_branch": "a..b"}, "", "default_branch:"},
+		{"default_branch empty", map[string]any{"default_branch": ""}, "", "default_branch:"},
+		{"default_branch 5", map[string]any{"default_branch": 5}, "", "default_branch:"},
+		{"display_name of 129 characters", map[string]any{"display_name": strings.Repeat("a", 129)}, "", "display_name:"},
+		{"display_name []", map[string]any{"display_name": []any{}}, "", "display_name:"},
+		{"description of 1025 characters", map[string]any{"description": strings.Repeat("a", 1025)}, "", "description:"},
+		{"description 1", map[string]any{"description": 1}, "", "description:"},
+
+		{"pat and username", map[string]any{"git_pat": "t", "git_username": "u"}, "", "git_username:"},
+		{"pat and password", map[string]any{"git_pat": "t", "git_password": "p"}, "", "git_password:"},
+		{"pat, username and password", map[string]any{"git_pat": "t", "git_username": "u", "git_password": "p"}, "", "git_username:"},
+		{"username only", map[string]any{"git_username": "u"}, "", "git_password:"},
+		{"password only", map[string]any{"git_password": "p"}, "", "git_password:"},
+		{"pat empty", map[string]any{"git_pat": ""}, "", "git_pat:"},
+		{"username empty", map[string]any{"git_username": "", "git_password": "p"}, "", "git_username:"},
+		{"password empty", map[string]any{"git_username": "u", "git_password": ""}, "", "git_password:"},
+		{"pat 5", map[string]any{"git_pat": 5}, "", "git_pat:"},
+		{"pat null", map[string]any{"git_pat": nil}, "", "git_pat:"},
+		{"pat with a git@ URL", map[string]any{"git_url": sshURL, "git_pat": "t"}, "", "git_pat:"},
+		{"username and password with a git@ URL", map[string]any{"git_url": sshURL, "git_username": "u", "git_password": "p"}, "", "git_username:"},
+
+		{"mode mirror", map[string]any{"workspace_mode": "mirror"}, "", "workspace_mode:"},
+		{"mode 3", map[string]any{"workspace_mode": 3}, "", "workspace_mode:"},
+		{"standard with upstream_url", map[string]any{"workspace_mode": "standard", "upstream_url": "https://example.com/up.git"}, "", "upstream_url:"},
+		{"no mode with integration_branch", map[string]any{"integration_branch": "deploy"}, "", "integration_branch:"},
+		{"carry_patch without upstream_url", map[string]any{"workspace_mode": "carry_patch"}, "", "upstream_url:"},
+		{"carry_patch with upstream_url over http", map[string]any{"workspace_mode": "carry_patch", "upstream_url": "http://x/y"}, "", "upstream_url:"},
+		{"carry_patch with integration_branch a..b", carry(map[string]any{"integration_branch": "a..b"}), "", "integration_branch:"},
+
+		{"settings []", map[string]any{"settings": []any{}}, "", "settings:"},
+		{"settings x", map[string]any{"settings": "x"}, "", "settings:"},
+		{"settings 1", map[string]any{"settings": 1}, "", "settings:"},
+		{"an unknown setting", map[string]any{"settings": map[string]any{"nope": true}}, "", `unknown setting "nope"`},
+		{"a setting value its rule refuses", map[string]any{"settings": map[string]any{"k": "x"}}, "", "settings.k:"},
+		{"bad settings before a bad credential", map[string]any{"settings": 1, "git_pat": 5}, "", "settings:"},
+	} {
+		body := valid("taken")
+		maps.Copy(body, c.extra)
+		delete(body, c.drop)
+		before := w.footprint(t)
+		a := w.create(t, w.uKey, body)
+		if errorType, message := a.refusal(t); a.status != http.StatusBadRequest || errorType != "invalid_request" || !strings.HasPrefix(message, c.prefix) {
+			t.Errorf("%s = %d %s, want 400 invalid_request with a message starting %q", c.name, a.status, a.body, c.prefix)
+		}
+		if after := w.footprint(t); after != before {
+			t.Errorf("%s: the hub went from %+v to %+v, want nothing recorded and origin never called", c.name, before, after)
+		}
+	}
+}
+
+func TestCreate_StoresAndAnswersTheOptionalMembers(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, withBoolSetting)
+	twoByte := strings.Repeat("é", 128)
+	long := strings.Repeat("d", 1024)
+	upstream := "https://example.com/up.git"
+	carry := map[string]any{"workspace_mode": "carry_patch", "upstream_url": upstream}
+	for i, c := range []struct {
+		name  string
+		extra map[string]any
+		want  map[string]any // members of the answer; a display_name of "" stands for the slug
+	}{
+		{"display_name of 128 two-byte characters", map[string]any{"display_name": twoByte}, map[string]any{"display_name": twoByte}},
+		{"description of 1024 characters", map[string]any{"description": long}, map[string]any{"description": long}},
+		{"default_branch, display_name and description null", map[string]any{"default_branch": nil, "display_name": nil, "description": nil},
+			map[string]any{"default_branch": nil, "display_name": "", "description": ""}},
+
+		{"mode empty", map[string]any{"workspace_mode": ""}, map[string]any{"workspace_mode": "standard"}},
+		{"mode null", map[string]any{"workspace_mode": nil}, map[string]any{"workspace_mode": "standard"}},
+		{"standard with upstream_url null", map[string]any{"workspace_mode": "standard", "upstream_url": nil},
+			map[string]any{"workspace_mode": "standard", "upstream_url": nil}},
+		{"carry_patch with upstream_url", carry,
+			map[string]any{"workspace_mode": "carry_patch", "upstream_url": upstream, "integration_branch": nil}},
+		{"carry_patch with integration_branch", map[string]any{"workspace_mode": "carry_patch", "upstream_url": upstream, "integration_branch": "deploy"},
+			map[string]any{"workspace_mode": "carry_patch", "upstream_url": upstream, "integration_branch": "deploy"}},
+
+		{"settings null", map[string]any{"settings": nil}, map[string]any{"settings": map[string]any{"k": true}}},
+		{"settings {}", map[string]any{"settings": map[string]any{}}, map[string]any{"settings": map[string]any{"k": true}}},
+		{"settings k false", map[string]any{"settings": map[string]any{"k": false}}, map[string]any{"settings": map[string]any{"k": false}}},
+		{"settings k null", map[string]any{"settings": map[string]any{"k": nil}}, map[string]any{"settings": map[string]any{"k": true}}},
+
+		{"members the route does not define", map[string]any{"status": "ready", "owner_id": "someone", "kind": "fork", "zzz": []any{1}},
+			map[string]any{"status": "pending", "owner_id": w.u, "kind": "repository"}},
+	} {
+		slug := fmt.Sprintf("demo-%d", i)
+		body := valid(slug)
+		maps.Copy(body, c.extra)
+		obj := w.create(t, w.uKey, body).object(t)
+		for member, want := range c.want {
+			if member == "display_name" && want == "" {
+				want = slug
+			}
+			if !reflect.DeepEqual(obj[member], want) {
+				t.Errorf("%s: %s = %#v, want %#v", c.name, member, obj[member], want)
+			}
+		}
+		// What is stored answers the same object as the create did.
+		rec, _ := w.workspace(t, slug)
+		stored, err := w.svc.RenderWorkspace(context.Background(), rec, access.LevelOwner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var storedObj map[string]any
+		if b, err := json.Marshal(stored); err != nil || json.Unmarshal(b, &storedObj) != nil {
+			t.Fatalf("encode the stored object: %v", err)
+		}
+		if !reflect.DeepEqual(storedObj, obj) {
+			t.Errorf("%s: the stored workspace renders %v, the create answered %v", c.name, storedObj, obj)
+		}
+	}
+}
+
+func TestCreate_RecordsTheWorkspaceInTheOrgItNames(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	beta := w.CreateOrg(t, "beta")
+	w.create(t, w.uKey, valid("taken")).object(t)
+	post := func(orgID any, slug string) answer {
+		t.Helper()
+		body := valid(slug)
+		body["org_id"] = orgID
+		return w.create(t, w.uKey, body)
+	}
+	for _, c := range []struct {
+		name      string
+		orgID     any
+		status    int
+		errorType string
+	}{
+		{"an unknown org", "no-such-org", http.StatusBadRequest, "invalid_request"},
+		{"an unknown org id", "00000000-0000-4000-8000-000000000000", http.StatusBadRequest, "invalid_request"},
+		{"a number", 7, http.StatusBadRequest, "invalid_request"},
+		{"the id of an org U is not in", beta, http.StatusForbidden, "forbidden"},
+		{"the slug of an org U is not in", "beta", http.StatusForbidden, "forbidden"},
+	} {
+		before := w.footprint(t)
+		if a := post(c.orgID, "taken"); a.status != c.status || a.errorType(t) != c.errorType {
+			t.Errorf("%s = %d %s, want %d %s", c.name, a.status, a.body, c.status, c.errorType)
+		}
+		if after := w.footprint(t); after != before {
+			t.Errorf("%s: the hub went from %+v to %+v, want nothing recorded", c.name, before, after)
+		}
+	}
+
+	w.AddMember(t, beta, w.u)
+	for _, c := range []struct {
+		orgID         any
+		slug          string
+		wantID, wantS string
+	}{
+		{"beta", "in-beta", beta, "beta"},
+		{beta, "in-beta-by-id", beta, "beta"},
+		{nil, "personal", w.uOrg.ID, w.uOrg.Slug},
+	} {
+		obj := post(c.orgID, c.slug).object(t)
+		if obj["org_id"] != c.wantID || obj["org_slug"] != c.wantS {
+			t.Errorf("org_id %v: org %v (%v), want %s (%s)", c.orgID, obj["org_id"], obj["org_slug"], c.wantID, c.wantS)
+		}
 	}
 }

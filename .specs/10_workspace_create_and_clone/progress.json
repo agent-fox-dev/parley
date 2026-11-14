@@ -3,7 +3,7 @@
   "spec_id": "10",
   "spec_name": "workspace_create_and_clone",
   "schema_version": 3,
-  "updated_at": "2026-11-14T07:00:10Z",
+  "updated_at": "2026-11-14T07:06:30Z",
   "tasks": [
     {
       "id": 1,
@@ -19,7 +19,7 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
