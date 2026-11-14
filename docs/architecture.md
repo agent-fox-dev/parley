@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push`, `POST /api/v1/workspaces/:slug/archive` (see Archive), `POST /api/v1/workspaces/:slug/reactivate` (see Reactivate) and `POST /api/v1/workspaces/:slug/reclone` (see Reclone) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive and a reclone hold with `ClearMarkers`, which releases every marker at start, and the teardown set `Teardown` with `RemoveOwned`, through which an archive and a delete reach the data other packages keep for a workspace (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push`, `POST /api/v1/workspaces/:slug/archive` (see Archive), `POST /api/v1/workspaces/:slug/reactivate` (see Reactivate) and `POST /api/v1/workspaces/:slug/reclone` (see Reclone) and `DELETE /api/v1/workspaces/:slug` (see Delete) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive, a reclone and a delete hold with `ClearMarkers`, which releases every marker at start, and the teardown set `Teardown` with `RemoveOwned`, through which an archive and a delete reach the data other packages keep for a workspace (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1736,8 +1736,9 @@ production `Lister` runs its `ListRemote`, and it is `Git`, the
 is `workspace.Insert`; a test makes it fail), `BeforeRefSwap`, which a
 sync calls between a branch's classification and its swap (nil in
 production; a test moves the branch there), `RemoveCopy`, which removes a
-workspace's copy once a reclone has committed (nil is `gitrepo.Remove`; a
-test replaces it with a no-op, as a hub that stopped before the removal),
+workspace's copy once a reclone or a delete has committed (nil is
+`gitrepo.Remove`; a test replaces it with a no-op, as a hub that stopped
+before the removal, or with one that fails),
 and `Notify`, called with the
 slug after a create commits so that clone work is picked up; the hub sets
 it to the workers' `Enqueue`. `(*Service).Enqueue(slug)` calls `Notify`
@@ -2411,6 +2412,42 @@ the commit and the removal: a copy that survives is not valid for the
 record (`keepCopy`), so the clone work at the next start replaces it with
 a fresh clone. No remover of the teardown set is called: change records
 and every other package's data stay.
+
+#### Delete
+
+`internal/workspace/delete.go` holds `DELETE /workspaces/:slug` (scope
+`workspaces:write`, `access.MarkNeed` `write`, as for the archive; the body
+is not read). The handler reads the record. A task fork is answered `500
+internal` without anything removed: only the fork remover of the teardown
+set deletes a fork. A repository workspace is refused (`deleteRefusal`), in
+this order, with a set marker (`409 workspace_busy`, `RequireReady`'s
+message) and with every status other than `archived` (`409
+workspace_not_archived`). Then it moves off the request's cancellation and,
+holding the `delete` marker (`withMarker`), reads the record again, checks
+it again and takes the teardown set once. When a sandbox remover is
+registered it lists the forks (`forksOf`, ascending) and calls
+`RemoveSandboxes(ctx, [slug, forks...])` before any write; its error is a
+`500 internal` with nothing changed. Then, in one store transaction: with a
+fork remover, `RemoveForksOf(ctx, tx, slug, caller)` removes the forks and
+writes their events, and its slugs, sorted, are the `deleted_forks`;
+without one, each fork in ascending slug order is removed by
+`removeWorkspace`, the same per-workspace removal as the workspace's. That
+calls `RemoveOwned(ctx, tx, slug, "workspace deleted")`, deletes the record
+(`DELETE FROM workspaces WHERE slug = ?`, its settings with it) and emits
+`parley.workspace.delete` (actor as for the other workspace events,
+`resource_type` `workspace`, `metadata` `{kind, parent_slug,
+revoked_tokens}`, `revoked_tokens` being what `RemoveOwned` returned). A
+fork's event passes `event.Input.Parent`, because the fork's record is
+already gone when it is written. Last, the workspace itself goes the same
+way, its event with `deleted_forks` as well. Any error rolls the whole
+transaction back and is a `500 internal`, and no repository data is
+discarded. After the commit `Deps.RemoveCopy(RepoPath(ws))` removes the
+copy of each fork the transaction removed itself and then the workspace's
+(a failure is logged as `workspace copy not removed after a delete` with
+the slug and the path, and the answer stays `204`), and then the fork
+remover's discard function runs. The answer is `204` with no body. No
+event of the log is removed, so the earlier events of the deleted
+workspaces stay readable, and the slug can be created again.
 
 ### Hub events
 

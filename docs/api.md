@@ -1846,6 +1846,65 @@ it again to see the clone work reach `ready` or `failed`.
 | `409` `has_forks` | the workspace has at least one fork, which depends on its copy (`workspace "<slug>" has <n> forks, which depend on its copy; delete them first`) |
 | `500` `internal` | the status change or its event could not be written; the workspace and its copy are as they were |
 
+## `DELETE /api/v1/workspaces/{slug}`
+
+Deletes the archived repository workspace `{slug}`, its task forks and
+everything they own, in one step or not at all. It takes the admin token,
+an API key or a PAT, declares the scope `workspaces:write` for a PAT and
+needs write access to the workspace (see
+[Workspace access](#workspace-access)): its owner or the admin token. The
+route reads no body; one that passes the content-type and size rules is
+ignored.
+
+A repository workspace in status `archived` is deleted; the checks run in
+the order of the table below, and a refused delete changes nothing. Once
+they have passed, the delete runs to its end even when the caller
+disconnects, and while it runs every other request that needs the
+workspace's repository answers `409` `workspace_busy`. First the
+sandboxes of the workspace and of its forks are deleted; when that fails
+the answer is `500 internal` and no record, token or other data has
+changed, so the delete can be repeated. Then, in one store transaction,
+the forks are removed in ascending slug order and then the workspace: for
+each, the tokens bound to it are revoked, the data other features keep
+for it (its secrets among them) is removed, its remaining agent sessions
+are ended with the reason `workspace deleted`, its record is removed with
+its settings, and one `parley.workspace.delete` event is written, the
+workspace's last. When anything in that transaction fails, nothing has
+changed, the repository data included, and the answer is `500 internal`.
+Once it has committed, the hub's copies of the removed workspaces are
+removed from disk; a copy that cannot be removed is logged with the slug
+and the path, and the answer stays `204`. Every event written about the
+workspace and its forks before the delete stays in the event log. The slug
+is free again afterwards:
+[`POST /api/v1/workspaces`](#post-apiv1workspaces) takes it as a slug that
+was never used.
+
+Each event has `workspace` the removed slug, `resource_type` `workspace`,
+`resource_id` the slug, and as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug). Its
+`metadata` holds `kind` (`fork` or `repository`), `parent_slug` (the
+fork's parent, `null` for the repository workspace) and `revoked_tokens`,
+the ids of the tokens bound to that slug that were revoked, in ascending
+order, `[]` when there were none. The repository workspace's event also
+holds `deleted_forks`, the slugs of the forks removed with it, in
+ascending order, `[]` when it had none. A fork's event is visible to the
+readers of its parent's events, as the fork's other events are.
+
+```json
+{"seq":19,"id":"…","type":"parley.workspace.delete","time":"2026-11-14T11:00:00Z","workspace":"demo--t1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo--t1","action":"delete","session_id":null,"metadata":{"kind":"fork","parent_slug":"demo","revoked_tokens":["tok1"]}}
+{"seq":20,"id":"…","type":"parley.workspace.delete","time":"2026-11-14T11:00:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"delete","session_id":null,"metadata":{"kind":"repository","parent_slug":null,"revoked_tokens":[],"deleted_forks":["demo--t1"]}}
+```
+
+| Status | When |
+|---|---|
+| `204 No Content` | the workspace, its forks and what they own are gone; the body is empty |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
+| `500` `internal` | the workspace is a task fork, which only the task-fork feature deletes and which no part of the hub deletes yet (`workspace "<slug>" is a task fork, and no fork remover deletes it`); or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

@@ -172,10 +172,10 @@ func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *
 	return rec, nil
 }
 
-// forksOf returns the slugs of the forks of the workspace parent, in
-// ascending order, empty and not nil when it has none.
-func forksOf(ctx context.Context, tx *sql.Tx, parent string) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT slug FROM workspaces WHERE parent_slug = ? ORDER BY slug`, parent)
+// forksOf returns the slugs of the forks of the workspace parent, read
+// through q, in ascending order, empty and not nil when it has none.
+func forksOf(ctx context.Context, q access.Querier, parent string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT slug FROM workspaces WHERE parent_slug = ? ORDER BY slug`, parent)
 	if err != nil {
 		return nil, fmt.Errorf("list the forks: %w", err)
 	}
