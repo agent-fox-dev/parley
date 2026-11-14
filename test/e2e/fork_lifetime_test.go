@@ -100,8 +100,10 @@ func TestForkLifetime_AnAgentExtendsItsForkAndDeletesItFromTheShell(t *testing.T
 	if status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/"+slug, h.key, nil); status != http.StatusNotFound {
 		t.Errorf("GET %s as its owner = %d %s, want 404", slug, status, body)
 	}
-	if status, body := h.Call(t, http.MethodGet, "/api/v1/user", token, nil); status != http.StatusUnauthorized {
-		t.Errorf("GET /api/v1/user with the fork's bound token = %d %s, want 401", status, body)
+	for _, path := range []string{"/api/v1/workspaces/" + slug, "/api/v1/user"} {
+		if status, body := h.Call(t, http.MethodGet, path, token, nil); status != http.StatusUnauthorized {
+			t.Errorf("GET %s with the fork's bound token = %d %s, want 401", path, status, body)
+		}
 	}
 
 	events := h.eventsOf(t, slug)
