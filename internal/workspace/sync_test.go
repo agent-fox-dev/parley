@@ -558,9 +558,7 @@ func TestSync_FetchFailureChangesNothingButTheScrubbedSyncError(t *testing.T) {
 	}
 	for _, c := range cases {
 		if c.url != "" {
-			if _, err := s.Store.Main().Exec(`UPDATE workspaces SET git_url = ? WHERE slug = ?`, c.url, syncSlug); err != nil {
-				t.Fatal(err)
-			}
+			s.setGitURL(t, syncSlug, c.url)
 		}
 		if _, err := s.Store.Main().Exec(`UPDATE workspaces SET sync_error = NULL WHERE slug = ?`, syncSlug); err != nil {
 			t.Fatal(err)

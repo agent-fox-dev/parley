@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ const (
 	createEvent = "parley.workspace.create"
 	updateEvent = "parley.workspace.update"
 	syncEvent   = "parley.workspace.sync"
+	pushEvent   = "parley.workspace.push"
 )
 
 // world is a hub the workspace route tests ask: the users u and v, each with
@@ -267,9 +269,15 @@ func (w *world) postSync(t *testing.T, cred, slug, query string) answer {
 // caller who disconnects; it returns when the request has ended so.
 func (w *world) postSyncAndLeave(t *testing.T, cred, slug string, started <-chan struct{}) {
 	t.Helper()
+	w.postAndLeave(t, cred, "/api/v1/workspaces/"+slug+"/sync", started)
+}
+
+// postAndLeave sends POST path, with no body, as postSyncAndLeave does.
+func (w *world) postAndLeave(t *testing.T, cred, path string, started <-chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/"+slug+"/sync"), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL(path), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1126,11 +1134,11 @@ func (s *syncWorld) observe(t *testing.T, err error) *recordingObserver {
 	return o
 }
 
-// setMode gives the sync workspace the workspace_mode mode and the
+// setMode gives the workspace syncSlug the workspace_mode mode and the
 // integration_branch integration.
-func (s *syncWorld) setMode(t *testing.T, mode, integration string) {
+func (w *world) setMode(t *testing.T, mode, integration string) {
 	t.Helper()
-	if _, err := s.Store.Main().Exec(`UPDATE workspaces SET workspace_mode = ?, integration_branch = ? WHERE slug = ?`,
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET workspace_mode = ?, integration_branch = ? WHERE slug = ?`,
 		mode, integration, syncSlug); err != nil {
 		t.Fatal(err)
 	}
@@ -1158,4 +1166,304 @@ func (p *excluding) asked() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.slugs)
+}
+
+// pushWorld is a world with the ready repository workspace syncSlug of the
+// user u, whose origin takes pushes over https (gitrepotest.SmartOrigin) and
+// holds the origin's usual history (see gitrepotest.Origin.History), and the
+// hub's copy of it at its place, made by the clone work, which records the
+// origin heads. The hub's push operation records every push.
+type pushWorld struct {
+	*world
+	origin *gitrepotest.Origin
+	// copy is the git directory of the hub's copy.
+	copy   string
+	pushes *recordingPusher
+}
+
+// newPushWorld builds the push world with an origin built with originOpts,
+// storing the workspace secrets secrets before the clone.
+func newPushWorld(t *testing.T, secrets map[string]string, originOpts ...gitrepotest.Option) *pushWorld {
+	t.Helper()
+	return newPushWorldWith(t, secrets, nil, originOpts...)
+}
+
+// newPushWorldWith is newPushWorld with the hub started with opts too.
+func newPushWorldWith(t *testing.T, secrets map[string]string, opts []option, originOpts ...gitrepotest.Option) *pushWorld {
+	t.Helper()
+	o := gitrepotest.SmartOrigin(t, originOpts...)
+	o.History()
+	p := &recordingPusher{}
+	w := newWorld(t, append([]option{withGitOrigin(o), withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) {
+			g, _ := d.Pusher.(gitrepo.Git)
+			g.Trace = p.trace
+			p.git, d.Pusher = g, p
+		})
+	})}, opts...)...)
+	url := o.URL()
+	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
+	for name, value := range secrets {
+		w.putSecret(t, syncSlug, name, value)
+	}
+	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
+		t.Fatalf("the clone of the push workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
+	}
+	return &pushWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), pushes: p}
+}
+
+// seen points branch of the hub's copy and of origin at one new commit on
+// top of from and records it as the branch's origin head, as a sync that
+// brought it in leaves them, and returns the commit.
+func (p *pushWorld) seen(t *testing.T, branch, from string) string {
+	t.Helper()
+	id := grow(t, p.copy, branch, from, "seen")
+	gitrepotest.Git(t, p.copy, "push", "--quiet", p.origin.Dir(), id+":refs/heads/"+branch)
+	p.setOriginHead(t, branch, id)
+	return id
+}
+
+// setOriginHead records id as the origin head of branch in the hub's copy,
+// or removes the record when id is "".
+func (p *pushWorld) setOriginHead(t *testing.T, branch, id string) {
+	t.Helper()
+	ctx := context.Background()
+	repo, err := gitrepo.Git{}.Open(ctx, p.copy)
+	if err == nil && id == "" {
+		err = repo.DeleteOriginHead(ctx, branch)
+	} else if err == nil {
+		err = repo.SetOriginHead(ctx, branch, id)
+	}
+	if err != nil {
+		t.Fatalf("setting the origin head of %s to %q: %v", branch, id, err)
+	}
+}
+
+// asked is closed once origin has been sent a request more than now.
+func (p *pushWorld) asked() <-chan struct{} {
+	n, ch := p.origin.Requests(), make(chan struct{})
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); p.origin.Requests() == n && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+// checkRecords checks what a push of the hub's head sha of branch of the
+// workspace syncSlug by u, forced when force is set, recorded after the log
+// held n push events: exactly one push event more, for that branch, whose
+// metadata has ok true and result outcome when outcome is a push result,
+// and otherwise ok false and error_type outcome; for a result also the
+// branch's origin head in the hub's copy, and for the default branch main
+// the workspace's origin_head_sha, at sha.
+func (p *pushWorld) checkRecords(t *testing.T, what string, n int, branch, sha string, force bool, outcome string) {
+	t.Helper()
+	evs := p.eventsOf(t, pushEvent)
+	if len(evs) != n+1 {
+		t.Errorf("%s: %d push events written, want 1", what, len(evs)-n)
+		return
+	}
+	rec, _ := p.workspace(t, syncSlug)
+	want := map[string]any{"branch": branch, "sha": sha, "force": force, "remote_url": deref(rec.GitURL), "ok": false, "error_type": outcome}
+	if slices.Contains([]gitrepo.PushResult{gitrepo.PushPushed, gitrepo.PushForced, gitrepo.PushUpToDate}, gitrepo.PushResult(outcome)) {
+		delete(want, "error_type")
+		want["ok"], want["result"] = true, outcome
+		if got := ref(t, p.copy, "refs/remotes/origin/"+branch); got != sha {
+			t.Errorf("%s: the recorded origin head of %s is %q, want %s", what, branch, got, sha)
+		}
+		if got := deref(rec.OriginHeadSHA); branch == "main" && got != sha {
+			t.Errorf("%s: origin_head_sha is %q, want %s", what, got, sha)
+		}
+	}
+	ev := evs[n]
+	var meta map[string]any
+	if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if deref(ev.Workspace) != syncSlug || ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != p.u ||
+		ev.ResourceType != "branch" || ev.ResourceID != branch || !reflect.DeepEqual(meta, want) {
+		t.Errorf("%s: push event of workspace %q by %s %q on %s %q with %v, want workspace %q by %s %q on branch %q with %v", what,
+			deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), ev.ResourceType, ev.ResourceID, meta,
+			syncSlug, event.ActorAPIKey, p.u, branch, want)
+	}
+}
+
+// outcome is the result of a push's answer a when it is 200, its error type
+// otherwise.
+func (a answer) outcome(t *testing.T) string {
+	t.Helper()
+	if a.status == http.StatusOK {
+		r, _ := a.decode(t, http.StatusOK)["result"].(string)
+		return r
+	}
+	return a.errorType(t)
+}
+
+// push sends POST /workspaces/<slug>/branches/<segment>/push, segment being
+// the branch name as the path carries it, with body (nil for none) and cred
+// as the bearer credential.
+func (w *world) push(t *testing.T, cred, slug, segment string, body any) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/branches/"+segment+"/push", cred, body)
+	return answer{status, b}
+}
+
+// recordingPusher is the hub's push operation: it records every push and the
+// arguments of every git process the hub's git runs for one, and runs the
+// push, or answers with stub without running git while stub is set.
+type recordingPusher struct {
+	git gitrepo.Git
+
+	mu    sync.Mutex
+	calls []gitrepo.PushRequest
+	args  [][]string
+	stub  func(context.Context) (gitrepo.PushResult, error)
+}
+
+func (p *recordingPusher) Push(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
+	p.mu.Lock()
+	p.calls = append(p.calls, req)
+	stub := p.stub
+	p.mu.Unlock()
+	if stub != nil {
+		return stub(ctx)
+	}
+	return p.git.Push(ctx, req)
+}
+
+func (p *recordingPusher) trace(args []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.args = append(p.args, args)
+}
+
+// stubWith makes every later push answer r without running git.
+func (p *recordingPusher) stubWith(r gitrepo.PushResult) {
+	p.answerWith(func(context.Context) (gitrepo.PushResult, error) { return r, nil })
+}
+
+// answerWith makes every later push answer what fn, given the push's
+// context, returns, without running git.
+func (p *recordingPusher) answerWith(fn func(context.Context) (gitrepo.PushResult, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stub = fn
+}
+
+// recorded are the pushes so far.
+func (p *recordingPusher) recorded() []gitrepo.PushRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.calls)
+}
+
+// gitArgs are the arguments of every git process the pushes ran so far.
+func (p *recordingPusher) gitArgs() [][]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.args)
+}
+
+// setProtected stores globs as the protected_branches setting of the
+// workspace syncSlug; nil leaves the setting unset.
+func (w *world) setProtected(t *testing.T, globs []string) {
+	t.Helper()
+	doc := []byte("{}")
+	if globs != nil {
+		var err error
+		if doc, err = json.Marshal(map[string][]string{"protected_branches": globs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = ?`, string(doc), syncSlug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// storeSecrets stores secrets as the secrets of the workspace syncSlug,
+// deleting each one whose value is "".
+func (w *world) storeSecrets(t *testing.T, secrets map[string]string) {
+	t.Helper()
+	for name, value := range secrets {
+		if value == "" {
+			w.deleteSecret(t, syncSlug, name)
+		} else {
+			w.putSecret(t, syncSlug, name, value)
+		}
+	}
+}
+
+// setGitURL points the record of the workspace slug at the origin url.
+func (w *world) setGitURL(t *testing.T, slug, url string) {
+	t.Helper()
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET git_url = ? WHERE slug = ?`, url, slug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// withPushDeadline gives the hub's pushes the deadline d.
+func withPushDeadline(d time.Duration) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(deps *workspace.Deps) { deps.PushDeadline = d })
+	})
+}
+
+// processesNaming are the command lines of the running processes whose
+// command line holds s, such as a git push to an origin's URL and the
+// transport helper it started.
+func processesNaming(t *testing.T, s string) []string {
+	t.Helper()
+	out, err := exec.Command("ps", "-A", "-o", "args=").Output()
+	if err != nil {
+		t.Fatalf("list the processes: %v", err)
+	}
+	var naming []string
+	for line := range strings.Lines(string(out)) {
+		if strings.Contains(line, s) {
+			naming = append(naming, strings.TrimSpace(line))
+		}
+	}
+	return naming
+}
+
+// patchLookup is a patch-branch lookup that reports the branches registered
+// as patch branches of every workspace, and fails for the workspace failing.
+type patchLookup struct {
+	registered []string
+	failing    string
+}
+
+func (l patchLookup) IsPatchBranch(_ context.Context, slug, branch string) (bool, error) {
+	if slug == l.failing {
+		return false, errors.New("the patch list cannot be read")
+	}
+	return slices.Contains(l.registered, branch), nil
+}
+
+// beforeEmit is the hub's event component, which runs a function before
+// every event it writes.
+type beforeEmit struct {
+	workspace.Events
+
+	mu sync.Mutex
+	fn func()
+}
+
+func (e *beforeEmit) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	e.mu.Lock()
+	fn := e.fn
+	e.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	return e.Events.Emit(ctx, tx, in)
+}
+
+// set makes fn the function run before every event.
+func (e *beforeEmit) set(fn func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fn = fn
 }

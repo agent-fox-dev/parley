@@ -1532,6 +1532,150 @@ whose name the workspace object or `branches` has already is left out.
 | `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`), or the first stage of a sync extension failed (`<its error, scrubbed>`); no branch or tag of the hub's repository changed, nor, for a failed fetch, any origin head (after a failed first stage they are those the fetch set), and `sync_error` holds the same text |
 | `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), the second stage of a sync extension failed (`<its error, scrubbed>`) or added a member that is not JSON, a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
+## `POST /api/v1/workspaces/{slug}/branches/{name}/push`
+
+Pushes the branch `{name}` of the repository workspace `{slug}` to the same
+branch of the workspace's origin. It takes the admin token, an API key or a
+PAT, declares the scope `workspaces:write` for a PAT and needs write access
+to the workspace (see [Workspace access](#workspace-access)): its owner or
+the admin token. `{name}` is percent-decoded once, so `fix%2F42` is the
+branch `fix/42` and `a%2525b` the branch `a%25b`; the decoded name must
+follow git's branch-name rule, as `default_branch` of
+[`POST /api/v1/workspaces`](#post-apiv1workspaces) does.
+
+The body is optional. No body, an empty body and an object without `force`
+mean `force` `false`; `{"force": true}` asks for a forced push. Members
+other than `force` are ignored. A body that is not a JSON object, or whose
+`force` is not `true` or `false` (`null` included), is `400`
+`invalid_request`; a body sent without `Content-Type: application/json` is
+`415` as for every route (see [Request bodies](#request-bodies)).
+
+```json
+{"force": false}
+```
+
+The hub reads the head of `refs/heads/{name}` once and pushes that commit,
+and only that one ref, to `refs/heads/{name}` on origin in one `git push`,
+with the workspace's origin credential resolved from its secrets for this
+push; no tag and no other branch is sent, and the credential is in no URL,
+argument or configuration file. A branch that moves in the hub while the
+push runs changes neither what is pushed nor what is answered; the push
+takes no lock. Without `force` origin's branch moves only by a
+fast-forward: a branch origin lacks is created, one origin has is moved
+only when origin's head is an ancestor of the hub's, and a branch origin
+already has at the hub's head is left as it is. A protected branch is
+pushed like any other without `force`. A forced push replaces origin's
+branch only while it is where the hub last saw it: it is handed to git with
+an explicit lease for that one ref, the origin head the hub recorded for
+the branch, or, when none is recorded, that origin must not have the
+branch, never with a plain force. A forced push that is a fast-forward or
+creates the branch is `pushed`; a branch origin already has at the hub's
+head is `up_to_date`, whatever the lease. A forced push refused because
+origin's branch moved changes neither origin's branch nor the recorded
+origin head; a sync brings in what origin has, after which the push may be
+tried again.
+
+A push that fails changes neither origin's branch nor the hub's recorded
+origin head. The answer says what stopped it: origin refusing the update
+(`422`), the credential, the repository, the network or anything else on
+origin's side (`502`), or the push's deadline of 2 minutes (`504`), after
+which `git` is killed with every process it started. Each is read from the
+status git reports for the ref when it reports one, and otherwise from
+what the HTTPS transport, or for a `git@` origin the SSH transport, says.
+Origin's own text may repeat the credential or the URL it was called with,
+so the `message` of every error of this route has every secret value the
+hub knows and the value of the origin credential resolved for the push
+(the token of `GIT_PAT` or the password of `GIT_PASSWORD`) replaced by
+`[redacted]`, the user information of every URL removed, and is cut to
+1024 bytes, never inside a character. The branch name of the push event
+and `remote_url`, in the answer and in the event, are cleaned the same
+way.
+
+```json
+{"error":{"code":422,"message":"origin refused the update of branch \"feature\": pre-receive hook declined: denied for [redacted] at https://git.example/r.git","error_type":"origin_rejected"}}
+```
+
+Before origin is contacted the hub refuses, after the body and the branch
+name and in this order: a workspace that is not `ready` or on which a
+reclone, archive or delete runs; a task fork, whatever the state of its
+parent; for a `carry_patch` workspace, its `integration_branch` and the
+branch of a registered patch that is not deleted, with and without `force`;
+a forced push of a branch one of the globs of the effective setting
+`protected_branches` matches (by default the default branch); and last a
+branch the hub's copy does not have. A request that fails several checks
+gets the answer of the first. The integration, patch and protected
+refusals do not depend on the branch existing. A refused request changes
+no branch and no recorded origin head and writes no event.
+
+The answer of a push origin took names the branch, the commit pushed, the
+remote and its URL, the workspace's `git_url` without user information
+(a `git@host:path` URL as it is stored) and with any secret value in it
+replaced by `[redacted]`, and the result: `pushed` when
+origin's branch was created or moved forward, `forced` when a forced push
+replaced it with a commit that does not descend from it, `up_to_date` when
+it was at the commit already.
+
+```json
+{"branch":"feature","sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","remote":"origin","remote_url":"https://example.com/a.git","result":"pushed"}
+```
+
+Every push handed to origin, one that passed the checks above and whose
+credential was read, writes exactly one `parley.workspace.push` event, also
+when it fails and also when the caller disconnected: once the push begins
+it runs to its end or to its deadline, and its records are written, whether
+or not the caller is still there to read the answer. The one exception is a
+hub that cannot write its records: the answer is then `500 internal` and no
+event is written. A push origin took
+first records the pushed commit as the branch's origin head in the hub's
+repository and then, in one store transaction, writes the event and, for
+the default branch, the workspace's `origin_head_sha` (`updated_at` and
+`status` are not changed). When that transaction fails the origin head is
+put back to what it was before the call (removed when there was none),
+unless a sync has moved it since, no event is written and the answer is
+`500 internal`; origin keeps the
+commit, and the next sync or push records it. A push that failed writes
+the event alone and leaves the origin head as it was. The event has
+`workspace` the slug, `resource_type` `branch`, `resource_id` the branch
+name, and as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug):
+`admin_token` with `actor_id` `null`, or `api_key` or `pat` with the
+caller's user. Its `metadata` holds `branch`, `sha` (the hub's head that was
+offered), `force` (what the request asked), `ok`, `remote_url` (as in the
+answer) and, for a push origin took (`ok` `true`), `result`, as in the
+answer, or, for one that failed (`ok` `false`), `error_type`, the answer's,
+never both:
+
+```json
+{"seq":15,"id":"…","type":"parley.workspace.push","time":"2026-11-14T10:35:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"branch","resource_id":"feature","action":"push","session_id":null,"metadata":{"branch":"feature","sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","force":false,"ok":false,"remote_url":"https://example.com/a.git","error_type":"non_fast_forward"}}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | origin took the push; `result` is `pushed`, `forced` or `up_to_date` |
+| `400` `invalid_request` | the body is not a JSON object (`request body must be a JSON object`, `request body is not valid JSON`), its `force` is not a JSON boolean (`request body member "force" must be true or false`), or the decoded name is not a valid branch name (`branch name "<name>": <the rule it breaks>`) |
+| `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to push to`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`), before the body is looked at |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), before the body is looked at |
+| `403` `integration_branch` | the branch is the `integration_branch` of a `carry_patch` workspace (`branch "<name>" is the integration branch of workspace "<slug>", which only its rebuild pushes to origin`) |
+| `403` `patch_branch` | the branch is the branch of a registered patch of a `carry_patch` workspace that is not deleted (`branch "<name>" is a patch branch of workspace "<slug>", which only its patch list pushes to origin`) |
+| `403` `protected_branch` | `force` is `true` and a glob of `protected_branches` matches the branch (`branch "<name>" of workspace "<slug>" is protected and cannot be replaced by a forced push`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`), before the body is looked at; also a bound PAT on a workspace outside its binding |
+| `404` `branch_not_found` | the hub's copy has no branch `{name}` (`workspace "<slug>" has no branch "<name>"`) |
+| `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
+| `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
+| `409` `non_fast_forward` | without `force`, origin's branch is not an ancestor of the hub's head: the two diverged or origin's is ahead (`origin's branch "<name>" is not an ancestor of the hub's head <sha> (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's commits, or push with force to replace origin's branch`); origin's branch and the hub's recorded origin head are unchanged |
+| `409` `origin_moved` | `force` is `true` and origin's branch is neither at the hub's head nor where the lease says: it moved since the hub last saw it, it exists although the hub recorded no origin head for it, or it is gone although the hub recorded one (`origin's branch "<name>" changed since the hub last saw it (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's branch, then push again`, or with `the hub has no record of origin's head of it, so origin must not have it` in the parentheses); origin's branch and the hub's recorded origin head are unchanged |
+| `422` `origin_rejected` | origin itself refused the update of the branch, by a branch rule or a server-side hook (`origin refused the update of branch "<name>": <origin's reason>`, the reason followed by what origin's hook wrote, such as `pre-receive hook declined: branch is locked`) |
+| `502` `origin_unauthenticated` | origin asked for a credential and the workspace has none (`origin at <remote_url> asked for a credential and workspace "<slug>" has no credential; store GIT_PAT, or GIT_USERNAME and GIT_PASSWORD, as its secrets`), or origin did not take the stored one (`origin at <remote_url> rejected the stored credential of workspace "<slug>"`) |
+| `502` `origin_forbidden` | origin answered that the credential may not push to the repository, HTTP `403` (`origin at <remote_url> does not let the credential of workspace "<slug>" push to the repository: <what git said>`) |
+| `502` `origin_not_found` | origin has no repository at `git_url`, or the credential cannot see it, HTTP `404` (`origin has no repository at <remote_url>, or the credential of workspace "<slug>" cannot see it: <what git said>`) |
+| `502` `origin_unreachable` | origin's name did not resolve, the connection failed, or TLS did, an untrusted certificate included; for a `git@` origin also a host key that is not trusted (`origin at <remote_url> cannot be reached: <what git said>`) |
+| `502` `upstream_error` | the push failed in any other way, such as HTTP `500` from origin (`the push of branch "<name>" to origin at <remote_url> failed: <what git said>`) |
+| `503` `unavailable` | the patch list of a `carry_patch` workspace could not be read (`the patch list of workspace "<slug>" cannot be read; try again later`); nothing is pushed |
+| `504` `origin_timeout` | the push had not finished 2 minutes after it began; `git` is killed with every process it started before the answer (`the push of branch "<name>" to origin did not finish within 2m0s`) |
+| `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential and no event is written; the records of a push handed to origin could not be written, in which case no event is written and, when origin took the push, the origin head is put back unless a sync has moved it since; or the hub failed otherwise |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

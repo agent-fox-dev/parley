@@ -391,7 +391,7 @@ Available Commands:
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
-  workspace   Register, list, read, change and sync the workspaces of the hub
+  workspace   Register, list, read, change, sync and push the workspaces of the hub
 
 Flags:
       --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
@@ -1726,6 +1726,47 @@ status `1`. When the answer has no `rebuild_job_id`, or a `null` one,
 | Command | Request |
 |---|---|
 | `parley workspace sync <slug> [flags]` | `POST /api/v1/workspaces/<slug>/sync`, with `reset_to_origin=true` for `--reset-to-origin`; with `--wait` and a `rebuild_job_id`, then `GET /api/v1/workspaces/<slug>/rebuilds/<id>` until `completed`, `dead_letter` or `cancelled` |
+
+#### `parley workspace push`
+
+```
+parley workspace push <slug> <branch> [--force]
+```
+
+Pushes one branch of a workspace to the same branch of its origin: it sends
+one
+[`POST /api/v1/workspaces/<slug>/branches/<branch>/push`](api.md#post-apiv1workspacesslugbranchesnamepush)
+with the credential as `Authorization: Bearer`, `<slug>` and `<branch>`
+each as one percent-encoded path segment (`parley workspace push demo
+fix/42` sends `POST /api/v1/workspaces/demo/branches/fix%2F42/push`), and
+always a body, `{"force":false}`, or `{"force":true}` with `--force`. It
+prints the hub's answer, with `branch`, `sha`, `remote`, `remote_url` and
+`result` (`pushed`, `forced` or `up_to_date`), as the one document on
+stdout with exit status `0`. The hub pushes to origin within its own
+deadline of 2 minutes before it answers, so the request has a timeout of 3
+minutes instead of 30 seconds.
+
+| Flag | Effect |
+|---|---|
+| `--force` | sends `{"force":true}`: origin's branch is replaced, but only while it is where the hub last saw it |
+
+With `--force` the command first writes one line to stderr, before the
+request is sent:
+
+```
+warning: origin's branch "main" may be replaced by the hub's
+```
+
+A refusal of the hub's (`409` `non_fast_forward`, `409` `origin_moved`,
+`403` `protected_branch`, `504` `origin_timeout`, among others) is written
+to stderr as received, after the warning of `--force`, with nothing on
+stdout and exit status `1`. A missing `<slug>` or `<branch>` and a third
+argument are refused with a `usage_error` and exit status `2` before any
+request.
+
+| Command | Request |
+|---|---|
+| `parley workspace push <slug> <branch> [--force]` | `POST /api/v1/workspaces/<slug>/branches/<branch>/push` with `{"force":false}`, or `{"force":true}` for `--force` |
 
 ### Output
 

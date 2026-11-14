@@ -54,8 +54,8 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // the clone workers, [workspace].workers of them, and binds the workspace
 // service to the stores, the secret and event components and the access
 // rule of the parts composed before it, the hub's git, which lists origins,
-// makes the workspaces' copies and fetches their origins for a sync, the
-// hub's scrubber, logger and clock, [server].external_url,
+// makes the workspaces' copies, fetches their origins for a sync and pushes
+// their branches to them, the hub's scrubber, logger and clock, [server].external_url,
 // [workspace].path, where the copies live, and the workers, which are told
 // about every workspace created, after every
 // adjuster AdjustWorkspace added has changed those dependencies. It then
@@ -97,6 +97,7 @@ func composeWorkspaces(c *Composition) {
 			Lister:      originLister{git},
 			Git:         git,
 			Fetcher:     git,
+			Pusher:      git,
 			Notify:      workers.Enqueue,
 			Scrubber:    rt.Scrubber,
 			Logger:      rt.Logger,

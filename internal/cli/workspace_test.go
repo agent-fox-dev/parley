@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -128,6 +130,10 @@ func TestWorkspace_PrintsTheHubsRefusalAndFails(t *testing.T) {
 		{"update", http.MethodPatch, demoPath, updateDemo("--description", "x"), http.StatusNotFound, notFound},
 		{"sync", http.MethodPost, syncPath, syncCommand(), http.StatusBadGateway, upstreamError},
 		{"sync --wait", http.MethodPost, syncPath, syncCommand("--wait"), http.StatusBadGateway, upstreamError},
+		{"push, not a fast-forward", http.MethodPost, pushPath, pushMain(), http.StatusConflict, pushRefusal(409, "non_fast_forward")},
+		{"push --force, origin moved", http.MethodPost, pushPath, pushMain("--force"), http.StatusConflict, pushRefusal(409, "origin_moved")},
+		{"push --force of a protected branch", http.MethodPost, pushPath, pushMain("--force"), http.StatusForbidden, pushRefusal(403, "protected_branch")},
+		{"push past origin's deadline", http.MethodPost, pushPath, pushMain(), http.StatusGatewayTimeout, pushRefusal(504, "origin_timeout")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -142,8 +148,16 @@ func TestWorkspace_PrintsTheHubsRefusalAndFails(t *testing.T) {
 			if stdout != "" {
 				t.Errorf("stdout = %q, want it empty", stdout)
 			}
-			if want := indented(t, tt.refusal); stderr != want {
+			// A forced push warns before it sends; nothing else may come
+			// before the envelope.
+			envelope := lastDocument(stderr)
+			if want := indented(t, tt.refusal); envelope != want {
 				t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
+			}
+			for _, line := range nonEmptyLines(strings.TrimSuffix(stderr, envelope)) {
+				if !strings.HasPrefix(line, "warning: ") {
+					t.Errorf("stderr holds %q before the envelope, want only warnings", line)
+				}
 			}
 			if sent := hub.recorded(); len(sent) != 1 || sent[0].method != tt.method || sent[0].rawPath != tt.path {
 				t.Errorf("the hub got %v, want one %s %s", sent, tt.method, tt.path)
@@ -184,6 +198,9 @@ func TestWorkspace_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"a sync without a slug", []string{"workspace", "sync"}, "<slug>"},
 		{"a sync of two slugs", syncCommand("other"), `"other"`},
 		{"a sync wait without time", syncCommand("--wait", "--timeout", "0s"), "--timeout"},
+		{"a push without a slug", []string{"workspace", "push"}, "<slug>"},
+		{"a push without a branch", []string{"workspace", "push", "demo"}, "<branch>"},
+		{"a push of two branches", pushMain("extra"), `"extra"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -664,6 +681,87 @@ func TestWorkspaceSync_FailedWait(t *testing.T) {
 			wantErrorType(t, stderr, tt.errorType)
 			if tt.errorType == "internal" && lastDocument(stderr) != indented(t, jobError) {
 				t.Errorf("stderr = %q, want the hub's envelope as received", stderr)
+			}
+		})
+	}
+}
+
+// pushPath is the route parley workspace push demo main posts to, as sent.
+const pushPath = "/api/v1/workspaces/demo/branches/main/push"
+
+// pushMain is the command line that pushes the branch main of demo,
+// followed by more.
+func pushMain(more ...string) []string {
+	return append([]string{"workspace", "push", "demo", "main"}, more...)
+}
+
+// pushRefusal is the hub's refusal of a push with code and errorType.
+func pushRefusal(code int, errorType string) string {
+	return `{"error":{"code":` + strconv.Itoa(code) + `,"message":"push refused","error_type":"` + errorType + `"}}`
+}
+
+func TestWorkspacePush_PostsTheForceAndPrintsTheAnswer(t *testing.T) {
+	t.Parallel()
+	answer := `{"branch":"fix/42","sha":"a1b2","remote":"origin","remote_url":"https://example.com/a.git","result":"pushed"}`
+	tests := []struct {
+		name          string
+		args          []string
+		rawPath, body string
+		// warned is whether stderr holds the warning, written before the
+		// request was sent.
+		warned bool
+	}{
+		{"a branch with a slash", []string{"workspace", "push", "demo", "fix/42"}, "/api/v1/workspaces/demo/branches/fix%2F42/push", `{"force":false}`, false},
+		{"--force", pushMain("--force"), pushPath, `{"force":true}`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var stdout bytes.Buffer
+			var stderr syncBuffer
+			// atRequest is what stderr held when the request arrived.
+			atRequest := make(chan string, 1)
+			path, _ := url.PathUnescape(tt.rawPath)
+			hub := newStubHub(t).handle(http.MethodPost, path, func(w http.ResponseWriter, _ *http.Request) {
+				atRequest <- stderr.String()
+				answerWith(http.StatusOK, answer)(w, nil)
+			})
+			var deadline time.Time
+			opts := defaultOptions()
+			opts.transport = func(next http.RoundTripper) http.RoundTripper {
+				return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					deadline, _ = r.Context().Deadline()
+					return next.RoundTrip(r)
+				})
+			}
+			start := time.Now()
+
+			code := run(context.Background(), onHub(hub.URL, tt.args...), &stdout, &stderr, opts)
+
+			if code != 0 {
+				t.Errorf("exit status = %d, want 0 (stderr %q)", code, stderr.String())
+			}
+			if want := indented(t, answer); stdout.String() != want {
+				t.Errorf("stdout = %q, want %q", stdout.String(), want)
+			}
+			select {
+			case held := <-atRequest:
+				if strings.Contains(held, "may be replaced") != tt.warned {
+					t.Errorf("stderr when the request arrived = %q, want the warning: %v", held, tt.warned)
+				}
+			default:
+				t.Error("the hub got no request")
+			}
+			if !tt.warned && stderr.String() != "" {
+				t.Errorf("stderr = %q, want it empty", stderr.String())
+			}
+			sent := hub.recorded()
+			if len(sent) != 1 || sent[0].method != http.MethodPost || sent[0].rawPath != tt.rawPath {
+				t.Fatalf("the hub got %v, want one POST %s", sent, tt.rawPath)
+			}
+			wantJSONBody(t, sent[0].body, tt.body)
+			if left := deadline.Sub(start); left < 179*time.Second || left > 181*time.Second {
+				t.Errorf("the request's deadline was %v after the start, want 3 minutes", left)
 			}
 		})
 	}

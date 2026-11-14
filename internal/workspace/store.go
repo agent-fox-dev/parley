@@ -349,3 +349,22 @@ func deref(s *string) string {
 	}
 	return *s
 }
+
+// recordOriginHead writes id as the origin_head_sha of the workspace slug
+// through ex and nothing else: a push of its default branch changes neither
+// its status nor updated_at, the time of the record's own last change. A
+// slug no workspace has is ErrNotFound.
+func recordOriginHead(ctx context.Context, ex Execer, slug, id string) error {
+	res, err := ex.ExecContext(ctx, `UPDATE workspaces SET origin_head_sha = ? WHERE slug = ?`, id, slug)
+	if err != nil {
+		return fmt.Errorf("record the origin head of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record the origin head of workspace %q: %w", slug, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("record the origin head of workspace %q: %w", slug, ErrNotFound)
+	}
+	return nil
+}
