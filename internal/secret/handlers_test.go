@@ -3,6 +3,7 @@ package secret_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -652,6 +653,83 @@ func TestChangeSecret_WritesAnEventNamingTheStoredKey(t *testing.T) {
 			!maps.Equal(meta, want) || !equalPtr(ev.Workspace, ptr("acme")) ||
 			ev.ActorType != event.ActorAPIKey || !equalPtr(ev.ActorID, &w.ownerID) {
 			t.Errorf("%s: event = %+v, metadata %s; want the %s of Git_Pat in acme by owner", s.method, ev, ev.Metadata, s.action)
+		}
+	}
+}
+
+func TestSecretRefusals_WriteNoEvent(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "TAKEN")
+	full := make([]string, secret.MaxEntries)
+	for i := range full {
+		full[i] = fmt.Sprintf("S%d", i)
+	}
+	w.seed(t, secret.ScopeUser, w.member2ID, full...)
+	reader := w.IssuePAT(t, identity.PATSpec{UserID: w.ownerID, Permissions: []string{"secrets:read"}})
+	one := entries(map[string]any{"key": "NEW", "value": "v"})
+	cases := []struct {
+		name, cred, method, path string
+		body                     any
+		noKey                    bool // asked after a restart without a key
+		want                     int
+	}{
+		{"create with an invalid body", w.ownerKey, http.MethodPost, "/user/secrets", entries(), false, http.StatusBadRequest},
+		{"create with one new key and one the scope holds", w.ownerKey, http.MethodPost, "/workspaces/acme/secrets",
+			entries(map[string]any{"key": "NEW"}, map[string]any{"key": "TAKEN"}), false, http.StatusConflict},
+		{"create into a full scope", w.member2Key, http.MethodPost, "/user/secrets", one, false, http.StatusTooManyRequests},
+		{"update with an invalid body", w.ownerKey, http.MethodPatch, "/workspaces/acme/secrets/TAKEN", map[string]any{"value": 5}, false, http.StatusBadRequest},
+		{"update of a key the scope does not hold", w.ownerKey, http.MethodPatch, "/workspaces/acme/secrets/MISSING", changed, false, http.StatusNotFound},
+		{"delete of a key the scope does not hold", w.ownerKey, http.MethodDelete, "/workspaces/acme/secrets/MISSING", nil, false, http.StatusNotFound},
+		{"create by an org member on the workspace", w.memberKey, http.MethodPost, "/workspaces/acme/secrets", one, false, http.StatusForbidden},
+		{"create by an outsider on the org", w.outsiderKey, http.MethodPost, "/orgs/acme/secrets", one, false, http.StatusNotFound},
+		{"create with a PAT without secrets:write", reader, http.MethodPost, "/user/secrets", one, false, http.StatusForbidden},
+		{"create without a key", w.ownerKey, http.MethodPost, "/user/secrets", one, true, http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		if tc.noKey && w.secrets.Available() {
+			w.RestartEnv(t, nil)
+		}
+		_, seq := w.eventsAfter(t, 0)
+		a := w.do(t, tc.cred, tc.method, tc.path, tc.body)
+		if recs, _ := w.eventsAfter(t, seq); a.status != tc.want || len(recs) != 0 {
+			t.Errorf("%s: %d %s and %d new events, want %d and none", tc.name, a.status, a.body, len(recs), tc.want)
+		}
+	}
+}
+
+func TestChangeSecret_RollsBackWhenItsEventCannotBeWritten(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.seed(t, secret.ScopeWorkspace, "acme", "KEPT")
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `CREATE TRIGGER refuse_events BEFORE INSERT ON hub_events BEGIN SELECT RAISE(ABORT, 'event refused'); END`)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := func() (s string) {
+		if err := w.Store.Main().QueryRowContext(ctx, `SELECT coalesce(group_concat(r, ','), '') FROM
+(SELECT key || ':' || hex(sealed) || ':' || updated_at AS r FROM secrets ORDER BY id)`).Scan(&s); err != nil {
+			t.Fatalf("read the secret rows: %v", err)
+		}
+		return s
+	}
+	before := rows()
+	for _, r := range []route{
+		{method: http.MethodPost, path: "/workspaces/acme/secrets", body: entries(map[string]any{"key": "NEW", "value": "v"})},
+		{method: http.MethodPatch, path: "/workspaces/acme/secrets/KEPT", body: changed},
+		{method: http.MethodDelete, path: "/workspaces/acme/secrets/KEPT"},
+	} {
+		w.advance(time.Second)
+		a := w.do(t, w.ownerKey, r.method, r.path, r.body)
+		if typ, _ := errorOf(t, a); a.status != http.StatusInternalServerError || typ != "internal" || bytes.Contains(a.body, []byte("refused")) {
+			t.Errorf("%v = %d %s, want 500 internal without the cause", r, a.status, a.body)
+		}
+		if got := rows(); got != before {
+			t.Errorf("%v changed the rows to %s, want %s", r, got, before)
 		}
 	}
 }

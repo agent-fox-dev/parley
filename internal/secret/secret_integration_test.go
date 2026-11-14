@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +18,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/secret"
@@ -151,21 +157,8 @@ func TestStart_KeepsTheKeysOutOfTheLogAndTheStore(t *testing.T) {
 		t.Fatalf("the hub stopped with %d, want 0; log = %s", code, h.Log.String())
 	}
 
-	sources := map[string][]byte{"the log": []byte(h.Log.String())}
-	err := filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		content, err := os.ReadFile(path)
-		sources[path] = content
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sources) < 2 {
-		t.Fatalf("no file in the data directory %s", dataDir)
-	}
+	sources := dataFiles(t, dataDir)
+	sources["the log"] = []byte(h.Log.String())
 	forms := map[string][]byte{
 		"the current key in base64": []byte(current), "the current key's bytes": currentRaw,
 		"the previous key in base64": []byte(previous), "the previous key's bytes": previousRaw,
@@ -174,6 +167,118 @@ func TestStart_KeepsTheKeysOutOfTheLogAndTheStore(t *testing.T) {
 		for form, key := range forms {
 			if bytes.Contains(content, key) {
 				t.Errorf("%s holds %s", where, form)
+			}
+		}
+	}
+}
+
+// dataFiles reads every file of a stopped hub's data directory, the
+// database and its -wal and -shm files among them: path to content.
+func dataFiles(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	files := map[string][]byte{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		files[path] = content
+		return err
+	})
+	if err != nil || len(files) == 0 {
+		t.Fatalf("read the data directory %s: %d files, %v", dir, len(files), err)
+	}
+	return files
+}
+
+func TestSecretValues_NeverLeaveTheHub(t *testing.T) {
+	sentinels := []string{"S3ntinel-7f3a9c41-value", "S3ntinel-0b6e2d58-second"}
+	_, key := newKey(t)
+	var secrets *secret.Component
+	var events *event.Component
+	h := hubtest.StartWith(t, hubtest.Config{
+		TOML:    "[logging]\nlevel = \"trace\"\n",
+		Env:     map[string]string{secret.EnvCurrentKey: key},
+		Compose: func(c *hub.Composition) { secrets, events = c.Secrets(), c.Events() },
+	})
+	userID := h.CreateUser(t, "owner")
+	cred := h.IssueKey(t, userID)
+	ctx := context.Background()
+	// sources are every text the hub gave out or kept, by where it was.
+	sources := map[string][]byte{}
+	call := func(method, path, idempotencyKey string, body any, want int) {
+		t.Helper()
+		var raw []byte
+		if body != nil {
+			raw, _ = json.Marshal(body)
+		}
+		req, err := http.NewRequest(method, h.URL("/api/v1"+path), bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if idempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", idempotencyKey)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, err := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.StatusCode != want {
+			t.Errorf("%s %s = %d %s, want %d", method, path, res.StatusCode, answer, want)
+		}
+		sources[fmt.Sprintf("the answer %d to %s %s", len(sources), method, path)] = answer
+	}
+	get := func(want string) {
+		t.Helper()
+		v, _, err := secrets.Get(ctx, secret.ScopeUser, userID, "git_pat")
+		if err != nil {
+			sources["the error of Get under "+want] = []byte(err.Error())
+		}
+		if v != want && (want != "unreadable" || !errors.Is(err, secret.ErrUnreadable)) {
+			t.Fatalf("Get = %q, %v; want %s", v, err, want)
+		}
+	}
+
+	create := entries(map[string]any{"key": "GIT_PAT", "value": sentinels[0]})
+	call(http.MethodPost, "/user/secrets", "create-1", create, http.StatusCreated)
+	call(http.MethodPost, "/user/secrets", "create-1", create, http.StatusOK) // the replay
+	call(http.MethodGet, "/user/secrets", "", nil, http.StatusOK)
+	call(http.MethodPost, "/user/secrets", "", create, http.StatusConflict)
+	get(sentinels[0])
+	call(http.MethodPatch, "/user/secrets/GIT_PAT", "", map[string]any{"value": sentinels[1]}, http.StatusOK)
+	get(sentinels[1])
+	sources["the log of the first run"] = []byte(h.Log.String())
+	_, other := newKey(t)
+	h.RestartEnv(t, map[string]string{secret.EnvCurrentKey: other})
+	get("unreadable")
+	call(http.MethodDelete, "/user/secrets/GIT_PAT", "", nil, http.StatusNoContent)
+	recs, _, err := events.ReadAfter(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range recs {
+		sources[fmt.Sprintf("the event %d %s", rec.Seq, rec.Type)], _ = json.Marshal(rec)
+	}
+	dataDir, _ := h.Listening["data_dir"].(string)
+	h.Stop()
+	if code := h.ExitCode(t, 10*time.Second); code != 0 {
+		t.Fatalf("the hub stopped with %d, want 0", code)
+	}
+	sources["the log of the second run"] = []byte(h.Log.String())
+	maps.Copy(sources, dataFiles(t, dataDir))
+	for where, content := range sources {
+		for _, s := range sentinels {
+			if bytes.Contains(content, []byte(s)) {
+				t.Errorf("%s holds the value %s", where, s)
 			}
 		}
 	}
