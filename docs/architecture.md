@@ -1831,14 +1831,23 @@ kind (a fork-only field on a repository workspace, or on a fork with no
 handler registered, is `400 invalid_request`); no mutable field; the values
 in table order (`display_name`, `description`, `org_id`, `settings`, then
 the fork-only fields), each applied to a copy of the record or answering
-`400 invalid_request` with `<field>: <reason>`; an archived workspace
+`400 invalid_request` with `<field>: <reason>` (a value's reader reads
+through the update's transaction, and a store error it meets is a `500`,
+never a refusal); for an `org_id`, the workspace's owner, not the caller,
+an active member of the target org (`identity.ActiveOrgIDs`), else `403
+forbidden`; an archived workspace
 (`409 workspace_archived`), since validation comes before state; and for a
 fork the registered guard. Then it writes `display_name`, `description`,
-`settings` and `updated_at` (the hub's time cut to the second) and runs the
-fork-only fields' writes, all in the same transaction, so a refusal writes
-nothing. A `null` or empty `display_name` stores the slug, a `null`
-`description` the empty string. `org_id` is judged as a string or `null`
-but does not move the workspace yet. After the commit it reads the record
+`org_id`, `settings` and `updated_at` (the hub's time cut to the second),
+when the org changed sets `org_id` on every record whose `parent_slug` is
+the workspace, and runs the fork-only fields' writes, all in the same
+transaction, so a refusal writes nothing and a failed write keeps nothing. A `null` or empty `display_name` stores the slug, a `null`
+`description` the empty string. `org_id` (`moveTarget`) is `null`, the
+owner's personal org (`identity.PersonalOrg`), or a string looked up with
+`identity.OrgBySelector` (an id in UUID form, else a slug); anything else,
+or a string no org has, is `400`. The access rule reads the org from the
+same row, so a move changes who may read the workspace and its forks with
+no other write. After the commit it reads the record
 back and answers it through `RenderWorkspace` with the level
 `access.DecisionOf` gives, so the answer is the one a following `GET`
 gives.

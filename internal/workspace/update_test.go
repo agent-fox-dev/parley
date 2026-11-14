@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"reflect"
@@ -344,5 +345,112 @@ func TestUpdate_AppliesTheRegisteredForkFieldsAndGuard(t *testing.T) {
 		{"blocked--t1", map[string]any{"description": 5}, http.StatusBadRequest, "invalid_request"},
 	} {
 		w.refused(t, w.uKey, c.slug, c.body, c.status, c.errorType)
+	}
+}
+
+func TestUpdate_MovesARepositoryWorkspaceToAnOrgOfItsOwner(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, withExternalURL("https://hub.example"))
+	acme, gamma := w.acme(t), w.CreateOrg(t, "gamma")
+	w.AddMember(t, gamma, w.u)
+	for i, cred := range []string{w.uKey, w.Token} {
+		for j, c := range []struct {
+			from, wantID, wantSlug string
+			value                  any
+		}{
+			{w.uOrg.ID, acme, "acme", acme},
+			{w.uOrg.ID, acme, "acme", "acme"},
+			{acme, w.uOrg.ID, w.uOrg.Slug, nil},
+		} {
+			slug := fmt.Sprintf("demo-%d-%d", i, j)
+			w.put(t, workspace.Workspace{Slug: slug, OrgID: c.from, Status: workspace.StatusReady})
+			got := w.patch(t, cred, slug, map[string]any{"org_id": c.value}).decode(t, http.StatusOK)
+			hubURL := "https://hub.example/git/" + c.wantSlug + "/" + slug + ".git"
+			if got["org_id"] != c.wantID || got["org_slug"] != c.wantSlug || got["hub_url"] != hubURL {
+				t.Errorf("%s moved by %v: org_id, org_slug, hub_url = %v, %v, %v; want %s, %s, %s",
+					slug, c.value, got["org_id"], got["org_slug"], got["hub_url"], c.wantID, c.wantSlug, hubURL)
+			}
+			// v is a member of acme only: the workspace's org decides
+			// whether v may read it.
+			r := w.get(t, w.vKey, slug)
+			if c.wantID == acme && (r.status != http.StatusOK || r.decode(t, http.StatusOK)["access"] != "member") {
+				t.Errorf("%s in acme read by v = %d %s, want 200 with access member", slug, r.status, r.body)
+			} else if c.wantID != acme && r.status != http.StatusNotFound {
+				t.Errorf("%s out of acme read by v = %d %s, want 404", slug, r.status, r.body)
+			}
+			w.patch(t, cred, slug, map[string]any{"org_id": "gamma"}).decode(t, http.StatusOK)
+			if r := w.get(t, w.vKey, slug); r.status != http.StatusNotFound {
+				t.Errorf("%s in gamma read by v = %d %s, want 404", slug, r.status, r.body)
+			}
+		}
+	}
+}
+
+func TestUpdate_MovesTheForksWithTheWorkspaceInOneTransaction(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	acme := w.acme(t)
+	forks := []string{"demo--t1", "demo--t2"}
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	for _, fork := range forks {
+		w.put(t, workspace.Workspace{Slug: fork, Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
+	}
+	w.patch(t, w.uKey, "demo", map[string]any{"org_id": "acme"}).decode(t, http.StatusOK)
+	for _, fork := range forks {
+		if got := w.get(t, w.uKey, fork).decode(t, http.StatusOK); got["org_id"] != acme || got["org_slug"] != "acme" {
+			t.Errorf("%s after the move: org_id, org_slug = %v, %v; want %s, acme", fork, got["org_id"], got["org_slug"], acme)
+		}
+		if r := w.get(t, w.vKey, fork); r.status != http.StatusOK {
+			t.Errorf("%s read by v, a member of acme = %d %s, want 200", fork, r.status, r.body)
+		}
+	}
+	// The write of the second fork fails: nothing of the move is kept.
+	if _, err := w.Store.Main().Exec(`CREATE TRIGGER fail_fork BEFORE UPDATE OF org_id ON workspaces
+		WHEN NEW.slug = 'demo--t2' BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if r := w.patch(t, w.uKey, "demo", map[string]any{"org_id": nil}); r.status != http.StatusInternalServerError {
+		t.Errorf("a move whose fork write fails = %d %s, want 500", r.status, r.body)
+	}
+	for _, slug := range append([]string{"demo"}, forks...) {
+		if rec, _ := w.workspace(t, slug); rec.OrgID != acme {
+			t.Errorf("%s after the failed move: org_id = %s, want acme's %s", slug, rec.OrgID, acme)
+		}
+	}
+}
+
+func TestUpdate_RefusesAnOrgThatIsNoneOrNotOneOfTheOwnersChangingNothing(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	acme, beta := w.acme(t), w.CreateOrg(t, "beta")
+	w.AddMember(t, beta, w.v)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "old", Status: workspace.StatusArchived})
+	type row struct {
+		slug      string
+		body      map[string]any
+		status    int
+		errorType string
+	}
+	cases := []row{
+		// The owner, not the caller, must be a member: v is one of beta.
+		{"demo", map[string]any{"org_id": beta, "description": "x"}, http.StatusForbidden, "forbidden"},
+		{"demo", map[string]any{"org_id": "beta", "description": "x"}, http.StatusForbidden, "forbidden"},
+		// The values are judged first, the archived status last.
+		{"demo", map[string]any{"org_id": "beta", "description": 5}, http.StatusBadRequest, "invalid_request"},
+		{"old", map[string]any{"org_id": "beta"}, http.StatusForbidden, "forbidden"},
+		{"old", map[string]any{"org_id": acme}, http.StatusConflict, "workspace_archived"},
+	}
+	for _, value := range []any{"no-such-org", "00000000-0000-0000-0000-000000000000", "", 5, true, map[string]any{}} {
+		cases = append(cases, row{"demo", map[string]any{"org_id": value}, http.StatusBadRequest, "invalid_request"})
+	}
+	for _, cred := range []string{w.uKey, w.Token} {
+		for _, c := range cases {
+			w.refused(t, cred, c.slug, c.body, c.status, c.errorType)
+		}
+	}
+	if rec, _ := w.workspace(t, "demo--t1"); rec.OrgID != w.uOrg.ID {
+		t.Errorf("the fork after the refusals: org_id = %s, want u's personal org %s", rec.OrgID, w.uOrg.ID)
 	}
 }

@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -47,13 +49,18 @@ const (
 // updateField is one field an update body may name. apply, nil for a field
 // that is not judged here, judges the field's value raw, which may be null
 // but is never absent, and applies it to next, the workspace as the update
-// leaves it. Its error is the reason the value is refused, without the
-// field's name, or a *server.Error that is the answer itself.
+// leaves it, reading what it needs through tx, the update's transaction.
+// Its error is the reason the value is refused, without the field's name, a
+// *server.Error that is the answer itself, or a failure of the hub.
 type updateField struct {
 	name  string
 	class fieldClass
-	apply func(s *Service, next *Workspace, raw json.RawMessage) error
+	apply func(ctx context.Context, tx *sql.Tx, s *Service, next *Workspace, raw json.RawMessage) error
 }
+
+// failure is an error of the hub met while a value is judged, answered as
+// a 500 and never as a refusal of the value.
+type failure struct{ error }
 
 // updateFields are the fields of an update body, the one place that says
 // which fields an update changes on which kind. The mutable ones come in
@@ -61,7 +68,7 @@ type updateField struct {
 // request, so this order decides which field a refusal names. Members not
 // listed are ignored.
 var updateFields = []updateField{
-	{"display_name", fieldShared, func(_ *Service, next *Workspace, raw json.RawMessage) error {
+	{"display_name", fieldShared, func(_ context.Context, _ *sql.Tx, _ *Service, next *Workspace, raw json.RawMessage) error {
 		name, err := nullableText(raw, 128)
 		if name == "" {
 			// A workspace always has a name to show: its slug unless it
@@ -71,19 +78,17 @@ var updateFields = []updateField{
 		next.DisplayName = name
 		return err
 	}},
-	{"description", fieldShared, func(_ *Service, next *Workspace, raw json.RawMessage) error {
+	{"description", fieldShared, func(_ context.Context, _ *sql.Tx, _ *Service, next *Workspace, raw json.RawMessage) error {
 		text, err := nullableText(raw, 1024)
 		next.Description = text
 		return err
 	}},
-	{"org_id", fieldRepository, func(_ *Service, _ *Workspace, raw json.RawMessage) error {
-		// An org id or slug, or null for the owner's personal org, as in a
-		// create. The move itself is not applied yet: the record keeps its
-		// org.
-		var selector *string
-		return readOptional(raw, &selector, nil)
+	{"org_id", fieldRepository, func(ctx context.Context, tx *sql.Tx, _ *Service, next *Workspace, raw json.RawMessage) error {
+		org, err := moveTarget(ctx, tx, next.OwnerID, raw)
+		next.OrgID = org.ID
+		return err
 	}},
-	{"settings", fieldRepository, func(s *Service, next *Workspace, raw json.RawMessage) error {
+	{"settings", fieldRepository, func(_ context.Context, _ *sql.Tx, s *Service, next *Workspace, raw json.RawMessage) error {
 		settings, err := s.settings.ApplySettings(next.Settings, raw)
 		if err != nil {
 			return err
@@ -114,6 +119,35 @@ func nullableText(raw json.RawMessage, n int) (string, error) {
 		return "", err
 	}
 	return deref(text), nil
+}
+
+// moveTarget is the org raw, the org_id of an update of a workspace of the
+// user owner, names: null is the owner's personal org, a string an org's id
+// or slug, as in a create. Whether the owner may have the workspace there
+// is not judged here.
+func moveTarget(ctx context.Context, tx *sql.Tx, owner string, raw json.RawMessage) (identity.Org, error) {
+	var selector *string
+	if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if err := readOptional(raw, &selector, nil); err != nil {
+			return identity.Org{}, err
+		}
+	}
+	var org identity.Org
+	var err error
+	if selector == nil {
+		org, err = identity.PersonalOrg(ctx, tx, owner)
+	} else {
+		org, err = identity.OrgBySelector(ctx, tx, *selector)
+	}
+	switch {
+	case errors.Is(err, identity.ErrNotFound) && selector == nil:
+		return identity.Org{}, errors.New("the workspace's owner has no personal organization")
+	case errors.Is(err, identity.ErrNotFound):
+		return identity.Org{}, fmt.Errorf("no organization has the id or slug %q", *selector)
+	case err != nil:
+		return identity.Org{}, failure{err}
+	}
+	return org, nil
 }
 
 // ForkFieldWrite stores the value of a fork-only field in fork, the record
@@ -202,6 +236,13 @@ func (s *Service) update(w http.ResponseWriter, r *http.Request) error {
 		if err := writeUpdate(ctx, tx, next); err != nil {
 			return err
 		}
+		if next.OrgID != cur.OrgID {
+			// A fork lives in its parent's org, so a move takes the forks
+			// along, in this transaction: all of them move or none.
+			if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET org_id = ? WHERE parent_slug = ?`, next.OrgID, slug); err != nil {
+				return fmt.Errorf("move the forks of workspace %q: %w", slug, err)
+			}
+		}
 		for _, write := range writes {
 			if err := write(ctx, tx, next); err != nil {
 				return fmt.Errorf("update workspace %q: %w", slug, err)
@@ -236,9 +277,11 @@ func (s *Service) update(w http.ResponseWriter, r *http.Request) error {
 // invalid_request for a fork-only field on a repository workspace or with
 // no handler registered); no mutable field (400 invalid_request); the
 // values, in the order of updateFields (400 invalid_request
-// "<field>: <reason>", or the answer the field gave); an archived workspace
-// (409 workspace_archived), because validation comes before state; and for
-// a fork the registered guard.
+// "<field>: <reason>", or the answer the field gave); an org_id naming an
+// org of which the workspace's owner, whoever the caller is, is not an
+// active member (403 forbidden); an archived workspace (409
+// workspace_archived), because validation comes before state; and for a
+// fork the registered guard.
 func (s *Service) applyUpdate(ctx context.Context, tx *sql.Tx, cur Workspace, body map[string]json.RawMessage) (Workspace, []ForkFieldWrite, error) {
 	forkFields, guard := s.forkUpdate()
 	fork := cur.Kind == access.KindFork
@@ -274,7 +317,7 @@ func (s *Service) applyUpdate(ctx context.Context, tx *sql.Tx, cur Workspace, bo
 		var err error
 		switch {
 		case f.apply != nil:
-			err = f.apply(s, &next, body[f.name])
+			err = f.apply(ctx, tx, s, &next, body[f.name])
 		case f.class == fieldFork:
 			var write ForkFieldWrite
 			if write, err = forkFields[f.name](cur, body[f.name]); write != nil {
@@ -285,7 +328,21 @@ func (s *Service) applyUpdate(ctx context.Context, tx *sql.Tx, cur Workspace, bo
 			if answer, ok := errors.AsType[*server.Error](err); ok {
 				return Workspace{}, nil, answer
 			}
+			if hubErr, ok := errors.AsType[failure](err); ok {
+				return Workspace{}, nil, hubErr.error
+			}
 			return Workspace{}, nil, server.InvalidRequest(f.name + ": " + err.Error())
+		}
+	}
+	if _, ok := body["org_id"]; ok {
+		// The workspace stays its owner's: an org it moves to must be one
+		// of the owner's, even when the admin token moves it.
+		active, err := identity.ActiveOrgIDs(ctx, tx, cur.OwnerID)
+		if err != nil {
+			return Workspace{}, nil, err
+		}
+		if !slices.Contains(active, next.OrgID) {
+			return Workspace{}, nil, server.Forbidden("the workspace's owner is not an active member of the organization")
 		}
 	}
 	if cur.Status == StatusArchived {
@@ -306,8 +363,8 @@ func writeUpdate(ctx context.Context, tx *sql.Tx, w Workspace) error {
 	if err != nil {
 		return fmt.Errorf("update workspace %q: %w", w.Slug, err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET display_name = ?, description = ?, settings = ?,
-		updated_at = ? WHERE slug = ?`, w.DisplayName, w.Description, settings, w.UpdatedAt.UnixNano(), w.Slug); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET display_name = ?, description = ?, org_id = ?, settings = ?,
+		updated_at = ? WHERE slug = ?`, w.DisplayName, w.Description, w.OrgID, settings, w.UpdatedAt.UnixNano(), w.Slug); err != nil {
 		return fmt.Errorf("update workspace %q: %w", w.Slug, err)
 	}
 	return nil
