@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting and listing of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`) |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1533,6 +1533,24 @@ is emitted, so the refusal rolls back the token and emits nothing. Any other
 failure of the insert, the event or the commit rolls back and is answered
 `500 internal`. The answer is `201` with the Token object followed by
 `token`, the value.
+
+`internal/access/revoke.go` holds the revoking component of bound tokens,
+`(*Service).RevokeBoundTo(ctx, tx, slugs)`, for the components that remove
+workspaces (workspace delete, fork expiry), which call it in the
+transaction that removes them, so the removal and the revocation commit or
+roll back together. In that transaction, which it does not commit, one
+`UPDATE pats ... RETURNING token_id` sets `revoked_at` to the instant of
+`Deps.Now` on every PAT whose `workspace` is one of `slugs`, whose
+`revoked_at` is NULL and whose `expires_at` is NULL or after that instant,
+and it returns their token ids sorted ascending, a non-nil list that is
+empty for no slug or no live token. A token already revoked keeps its
+`revoked_at` and an expired one is left as it is (unlike
+`identity.RevokeTokenByID`, which revokes an expired token too), and
+neither is returned. On a failed write it returns the error and a nil
+list, and the caller rolls back. It emits no event: the removal's own event
+carries the ids. A revoked token is answered `401 credential revoked` by
+authentication from the next request on, before the binding guard, so it
+is never reported as a refusal. No production caller uses it yet.
 
 `internal/access/refusal.go` holds the hub's `RefusalReporter`,
 `access.RefusalLimiter`, built with `access.NewRefusalLimiter(events, now,
