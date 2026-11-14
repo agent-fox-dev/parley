@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -24,14 +25,16 @@ const createEvent = "parley.workspace.create"
 
 // world is a hub the workspace route tests ask: the users u and v, each with
 // an API key and a personal org, the hub's secret and event components, a
-// fake origin that records every call, and the clone notifications, which
-// are recorded and dropped so that no clone runs.
+// fake origin that records every call, the hub's git for clone work behind a
+// recorder, and the clone notifications, which are recorded and dropped so
+// that no clone runs unless the test runs it.
 type world struct {
 	*hubtest.Hub
 	svc     *workspace.Service
 	secrets *secret.Component
 	events  *event.Component
 	origin  *fakeOrigin
+	git     *recordingGit
 
 	// u and v are the users' ids, uKey and vKey their API keys, uOrg and
 	// vOrg their personal orgs.
@@ -59,6 +62,8 @@ const (
 	faultInsert = "workspace insert"
 	faultSecret = "secret write"
 	faultEvent  = "event write"
+	// faultSecretRead fails every read of a secret, not only in a create.
+	faultSecretRead = "secret read"
 )
 
 // option changes how newWorld starts the hub.
@@ -96,7 +101,7 @@ func withCompose(fn func(*hub.Composition)) option {
 // through a second, and builds the world in it.
 func newWorld(t *testing.T, opts ...option) *world {
 	t.Helper()
-	w := &world{origin: &fakeOrigin{}, now: time.Now().UTC().Truncate(time.Second).Add(time.Second / 2)}
+	w := &world{origin: &fakeOrigin{}, git: &recordingGit{}, now: time.Now().UTC().Truncate(time.Second).Add(time.Second / 2)}
 	cfg := hubtest.Config{
 		Env: map[string]string{secret.EnvCurrentKey: testKey},
 		Now: w.clock,
@@ -115,6 +120,8 @@ func newWorld(t *testing.T, opts ...option) *world {
 				}
 				d.Secrets = faultySecrets{d.Secrets, w}
 				d.Events = faultyEvents{d.Events, w}
+				w.git.Git = d.Git
+				d.Git = w.git
 			})
 		},
 	}
@@ -297,6 +304,13 @@ func (s faultySecrets) Put(ctx context.Context, tx *sql.Tx, scope secret.Scope, 
 	return s.Secrets.Put(ctx, tx, scope, scopeID, name, value)
 }
 
+func (s faultySecrets) Get(ctx context.Context, scope secret.Scope, scopeID, name string) (string, bool, error) {
+	if err := s.w.faulted(faultSecretRead); err != nil {
+		return "", false, err
+	}
+	return s.Secrets.Get(ctx, scope, scopeID, name)
+}
+
 // faultyEvents is the hub's event component, failing its writes while the
 // world says so.
 type faultyEvents struct {
@@ -354,6 +368,16 @@ func (w *world) workspaceSecrets(t *testing.T, slug string) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// eventCount is the number of events of the log.
+func (w *world) eventCount(t *testing.T) int {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(recs)
 }
 
 // createEvents are the parley.workspace.create events of the log.
@@ -454,4 +478,47 @@ func (r failingReader) Get(_ context.Context, _ secret.Scope, _, name string) (s
 	}
 	v, ok := r.values[name]
 	return v, ok, nil
+}
+
+// recordingGit is the hub's git for clone work: it counts every invocation
+// and, while cloneErr is set, answers every clone with it without running
+// git.
+type recordingGit struct {
+	workspace.Git
+
+	mu       sync.Mutex
+	calls    int
+	cloneErr error
+}
+
+func (g *recordingGit) Clone(ctx context.Context, url string, cred workspace.Credential, dir string) error {
+	g.mu.Lock()
+	g.calls++
+	err := g.cloneErr
+	g.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return g.Git.Clone(ctx, url, cred, dir)
+}
+
+func (g *recordingGit) Open(ctx context.Context, dir string) (*gitrepo.Repo, error) {
+	g.mu.Lock()
+	g.calls++
+	g.mu.Unlock()
+	return g.Git.Open(ctx, dir)
+}
+
+// failClone makes every later clone answer err; nil runs git again.
+func (g *recordingGit) failClone(err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cloneErr = err
+}
+
+// invocations is the number of clones and opens the clone work asked for.
+func (g *recordingGit) invocations() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
 }

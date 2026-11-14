@@ -55,6 +55,9 @@ type Deps struct {
 	Events Events
 	// Lister lists an origin's refs with a credential.
 	Lister OriginLister
+	// Git clones a workspace's origin into its copy and opens the copy;
+	// nil means gitrepo.Git{}.
+	Git Git
 	// InsertWorkspace writes a new workspace record in the create
 	// transaction; nil means Insert. A test makes it fail to see the whole
 	// create roll back.
@@ -63,7 +66,8 @@ type Deps struct {
 	// it is called after the transaction that recorded the work commits. Nil
 	// tells no one.
 	Notify func(slug string)
-	// Scrubber cleans text that leaves the hub of secret values.
+	// Scrubber cleans text that leaves the hub of secret values; nil means
+	// a scrubber that knows no value.
 	Scrubber *scrub.Scrubber
 	// Logger is the hub's logger; nil discards.
 	Logger *slog.Logger
@@ -73,7 +77,7 @@ type Deps struct {
 	// at; empty when it is not configured.
 	ExternalURL string
 	// Root is [workspace].path, the directory that holds the workspaces'
-	// copies.
+	// copies and the clones in progress.
 	Root string
 }
 
@@ -87,6 +91,9 @@ type Service struct {
 
 	viewMu   sync.RWMutex
 	forkView ForkView
+
+	stepMu    sync.RWMutex
+	postClone map[string]PostCloneStep
 }
 
 // Bind binds the service to d. It is called once, before the hub serves.
@@ -99,6 +106,12 @@ func (s *Service) Bind(d Deps) {
 	}
 	if d.InsertWorkspace == nil {
 		d.InsertWorkspace = Insert
+	}
+	if d.Git == nil {
+		d.Git = gitrepo.Git{}
+	}
+	if d.Scrubber == nil {
+		d.Scrubber = scrub.New()
 	}
 	s.deps = d
 }

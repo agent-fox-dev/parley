@@ -42,9 +42,9 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // composeWorkspaces adds the workspace fields to the workspace records of
 // the access part and registers the workspace routes. Its start hook binds
 // the workspace service to the stores, the secret and event components of
-// the parts composed before it, the hub's git, which lists origins, the
-// hub's scrubber, logger and clock, [server].external_url and
-// [workspace].path, after every adjuster AdjustWorkspace added has changed
+// the parts composed before it, the hub's git, which lists origins and
+// makes the workspaces' copies, the hub's scrubber, logger and clock,
+// [server].external_url and [workspace].path, where the copies live, after every adjuster AdjustWorkspace added has changed
 // those dependencies. The service exists from the composition on, so a
 // later part keeps it through Composition.Workspaces and registers its
 // setting keys on Workspaces().Settings() when it is composed.
@@ -64,6 +64,7 @@ func composeWorkspaces(c *Composition) {
 			Secrets:     c.Secrets(),
 			Events:      c.Events(),
 			Lister:      originLister{git},
+			Git:         git,
 			Scrubber:    rt.Scrubber,
 			Logger:      rt.Logger,
 			Now:         rt.Now,

@@ -149,6 +149,26 @@ WHERE slug = ?`,
 	return nil
 }
 
+// StartClone moves the workspace slug from pending to cloning and clears
+// its clone_error, in one write through ex, so that no one reads a clone in
+// progress with the error of an earlier one. A workspace already in cloning
+// gets the same write, since its clone is taken up again. started is false,
+// with no error, for a workspace in any other status or no workspace.
+func StartClone(ctx context.Context, ex Execer, slug string, now time.Time) (started bool, err error) {
+	res, err := ex.ExecContext(ctx, `
+UPDATE workspaces SET status = ?, clone_error = NULL, updated_at = ?
+WHERE slug = ? AND status IN (?, ?)`,
+		string(StatusCloning), now.UnixNano(), slug, string(StatusPending), string(StatusCloning))
+	if err != nil {
+		return false, fmt.Errorf("start the clone of workspace %q: %w", slug, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("start the clone of workspace %q: %w", slug, err)
+	}
+	return n == 1, nil
+}
+
 // workspaceColumns are the columns scanWorkspace reads, in its order.
 const workspaceColumns = `slug, kind, workspace_mode, git_url, default_branch, owner_id, org_id, status,
 	display_name, description, head_sha, origin_head_sha, clone_error, last_sync_at, sync_error,

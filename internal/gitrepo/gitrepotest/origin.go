@@ -1,7 +1,8 @@
 // Package gitrepotest is the test origin of the repository: a bare git
 // repository the test builds commits, branches and tags in, served over TLS
-// by net/http/httptest with git's file-based ("dumb") HTTP transport. It is
-// imported by test code only.
+// by net/http/httptest with git's file-based ("dumb") HTTP transport, or
+// with its smart transport through git http-backend. It is imported by test
+// code only.
 package gitrepotest
 
 import (
@@ -9,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"net/http/cgi"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -34,6 +36,8 @@ type Origin struct {
 	// user and password, when user is not empty, are the Basic
 	// authentication every request must carry.
 	user, password string
+	// smart serves git's smart HTTP transport instead of the files.
+	smart bool
 
 	// mu guards what the handler reads while the test changes it.
 	mu       sync.Mutex
@@ -54,6 +58,14 @@ func WithBasicAuth(user, password string) Option {
 	return func(o *Origin) { o.user, o.password = user, password }
 }
 
+// WithSmartHTTP makes the origin serve git's smart HTTP transport through
+// git http-backend instead of the repository's files. Git cannot read a
+// repository without refs over the file-based transport, so an empty origin
+// needs this one to be cloned as a real server serves it.
+func WithSmartHTTP() Option {
+	return func(o *Origin) { o.smart = true }
+}
+
 // NewOrigin builds an empty bare repository whose default branch is main in
 // a temporary directory of t, serves it over TLS and closes it when the test
 // ends. A git that should trust it runs with the variables of Env.
@@ -66,6 +78,9 @@ func NewOrigin(t testing.TB, opts ...Option) *Origin {
 	o.git("", "init", "--quiet", "--bare", "--initial-branch=main")
 	o.publish()
 	o.files = http.StripPrefix("/"+repoName, http.FileServer(http.Dir(o.dir)))
+	if o.smart {
+		o.files = o.backend()
+	}
 	o.srv = httptest.NewTLSServer(http.HandlerFunc(o.serve))
 	o.caFile = filepath.Join(t.TempDir(), "origin-ca.pem")
 	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: o.srv.Certificate().Raw})
@@ -220,6 +235,27 @@ func (o *Origin) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	o.files.ServeHTTP(w, r)
+}
+
+// backend is git http-backend serving the origin's repository, which it
+// finds below GIT_PROJECT_ROOT by the request's path.
+func (o *Origin) backend() http.Handler {
+	o.t.Helper()
+	git, err := exec.LookPath("git")
+	if err != nil {
+		o.t.Fatalf("origin: %v", err)
+	}
+	return &cgi.Handler{
+		Path: git,
+		Args: []string{"http-backend"},
+		Dir:  filepath.Dir(o.dir),
+		Env: []string{
+			"GIT_PROJECT_ROOT=" + filepath.Dir(o.dir),
+			"GIT_HTTP_EXPORT_ALL=1",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL=" + os.DevNull,
+		},
+	}
 }
 
 // publish writes the files git's file-based HTTP transport reads the refs
