@@ -15,7 +15,8 @@ import (
 const MinForkTTL = 5 * time.Minute
 
 // Forks holds the keys of [forks] the loader owns: the lifetime of a fork at
-// its creation and how many forks one workspace may have.
+// its creation, how many forks one workspace may have, and whether a fork
+// goes early once its work has landed.
 type Forks struct {
 	// DefaultTTL is the lifetime of a fork created without a ttl.
 	DefaultTTL time.Duration
@@ -24,11 +25,13 @@ type Forks struct {
 	MaxTTL time.Duration
 	// MaxPerWorkspace is how many forks one workspace may have; at least 1.
 	MaxPerWorkspace int
+	// ExpireOnLand is whether the sweep removes a fork a day after all its
+	// changes have landed or been abandoned, before its lifetime ends.
+	ExpireOnLand bool
 }
 
 // forkKeys are the keys of [forks] the loader owns. The section stays open
-// to keys other packages register, such as the fate of a fork whose changes
-// have landed.
+// to keys other packages register.
 var forkKeys = []Key{
 	{Section: "forks", Name: "default_ttl", Type: String, Default: "7d", Validate: func(v any) error {
 		d, err := forkDuration(v)
@@ -42,6 +45,7 @@ var forkKeys = []Key{
 		return err
 	}},
 	{Section: "forks", Name: "max_per_workspace", Type: Int, Default: 200, Validate: intBetween(1, math.MaxInt)},
+	{Section: "forks", Name: "expire_on_land", Type: Bool, Default: true},
 }
 
 // forkDuration reads a [forks] duration in the loader's duration form.
@@ -63,5 +67,10 @@ func forksFrom(values map[string]map[string]any) (Forks, error) {
 	if maxTTL < def {
 		return Forks{}, errors.New("forks.max_ttl: must not be shorter than forks.default_ttl")
 	}
-	return Forks{DefaultTTL: def, MaxTTL: maxTTL, MaxPerWorkspace: keys["max_per_workspace"].(int)}, nil
+	return Forks{
+		DefaultTTL:      def,
+		MaxTTL:          maxTTL,
+		MaxPerWorkspace: keys["max_per_workspace"].(int),
+		ExpireOnLand:    keys["expire_on_land"].(bool),
+	}, nil
 }

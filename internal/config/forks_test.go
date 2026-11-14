@@ -15,9 +15,11 @@ func TestLoad_ReadsTheForkLimitsOrTheirDefaults(t *testing.T) {
 		text string
 		want config.Forks
 	}{
-		{"empty file", "", config.Forks{DefaultTTL: 168 * time.Hour, MaxTTL: 720 * time.Hour, MaxPerWorkspace: 200}},
-		{"only default_ttl", "[forks]\ndefault_ttl = \"2d\"\n", config.Forks{DefaultTTL: 48 * time.Hour, MaxTTL: 720 * time.Hour, MaxPerWorkspace: 200}},
-		{"all three keys", "[forks]\ndefault_ttl = \"2d\"\nmax_ttl = \"10d\"\nmax_per_workspace = 3\n", config.Forks{DefaultTTL: 48 * time.Hour, MaxTTL: 240 * time.Hour, MaxPerWorkspace: 3}},
+		{"empty file", "", config.Forks{DefaultTTL: 168 * time.Hour, MaxTTL: 720 * time.Hour, MaxPerWorkspace: 200, ExpireOnLand: true}},
+		{"only default_ttl", "[forks]\ndefault_ttl = \"2d\"\n", config.Forks{DefaultTTL: 48 * time.Hour, MaxTTL: 720 * time.Hour, MaxPerWorkspace: 200, ExpireOnLand: true}},
+		{"all three lifetime keys", "[forks]\ndefault_ttl = \"2d\"\nmax_ttl = \"10d\"\nmax_per_workspace = 3\n", config.Forks{DefaultTTL: 48 * time.Hour, MaxTTL: 240 * time.Hour, MaxPerWorkspace: 3, ExpireOnLand: true}},
+		{"expire_on_land false", "[forks]\nexpire_on_land = false\n", config.Forks{DefaultTTL: 168 * time.Hour, MaxTTL: 720 * time.Hour, MaxPerWorkspace: 200, ExpireOnLand: false}},
+		{"expire_on_land true", "[forks]\nexpire_on_land = true\n", config.Forks{DefaultTTL: 168 * time.Hour, MaxTTL: 720 * time.Hour, MaxPerWorkspace: 200, ExpireOnLand: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,6 +48,7 @@ func TestLoad_RefusesForkLimitsThatContradictEachOther(t *testing.T) {
 		{"max_ttl shorter than default_ttl", "default_ttl = \"8d\"\nmax_ttl = \"7d\"", "forks.max_ttl"},
 		{"max_ttl shorter than the default default_ttl", "max_ttl = \"2d\"", "forks.max_ttl"},
 		{"no fork allowed", "max_per_workspace = 0", "forks.max_per_workspace"},
+		{"expire_on_land not a boolean", "expire_on_land = \"yes\"", "forks.expire_on_land"},
 		{"equal default_ttl and max_ttl", "default_ttl = \"7d\"\nmax_ttl = \"7d\"", ""},
 	}
 	for _, tc := range cases {
