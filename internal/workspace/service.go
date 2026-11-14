@@ -76,8 +76,11 @@ type Deps struct {
 	// Pusher pushes a branch of a workspace's copy to its origin; nil means
 	// gitrepo.Git{}.
 	Pusher Pusher
-	// PushDeadline is how long a push may take; 0 means the fixed 2
-	// minutes.
+	// SafetyPusher offers every branch of a workspace's copy to its origin
+	// before an archive or a reclone; nil means gitrepo.Git{}.
+	SafetyPusher BranchesPusher
+	// PushDeadline is how long a push may take, and a safety copy of every
+	// branch with it; 0 means the fixed 2 minutes.
 	PushDeadline time.Duration
 	// InsertWorkspace writes a new workspace record in the create
 	// transaction; nil means Insert. A test makes it fail to see the whole
@@ -160,6 +163,9 @@ func (s *Service) Bind(d Deps) {
 	}
 	if d.Pusher == nil {
 		d.Pusher = gitrepo.Git{}
+	}
+	if d.SafetyPusher == nil {
+		d.SafetyPusher = gitrepo.Git{}
 	}
 	if d.PushDeadline == 0 {
 		d.PushDeadline = pushDeadline

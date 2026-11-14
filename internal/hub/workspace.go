@@ -90,20 +90,21 @@ func composeWorkspaces(c *Composition) {
 			return err
 		}
 		d := workspace.Deps{
-			Store:       rt.Store,
-			Secrets:     c.Secrets(),
-			Events:      c.Events(),
-			Access:      c.access,
-			Lister:      originLister{git},
-			Git:         git,
-			Fetcher:     git,
-			Pusher:      git,
-			Notify:      workers.Enqueue,
-			Scrubber:    rt.Scrubber,
-			Logger:      rt.Logger,
-			Now:         rt.Now,
-			ExternalURL: rt.Config.Server.ExternalURL,
-			Root:        rt.Config.Workspace.Path,
+			Store:        rt.Store,
+			Secrets:      c.Secrets(),
+			Events:       c.Events(),
+			Access:       c.access,
+			Lister:       originLister{git},
+			Git:          git,
+			Fetcher:      git,
+			Pusher:       git,
+			SafetyPusher: git,
+			Notify:       workers.Enqueue,
+			Scrubber:     rt.Scrubber,
+			Logger:       rt.Logger,
+			Now:          rt.Now,
+			ExternalURL:  rt.Config.Server.ExternalURL,
+			Root:         rt.Config.Workspace.Path,
 		}
 		for _, adjust := range c.workspaceAdjusters {
 			adjust(&d)
