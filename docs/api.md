@@ -51,7 +51,9 @@ that fails answers the request, and no later check or the handler runs.
 4. The body size, then the content type: `413` or `415`, as in
    [Request bodies](#request-bodies).
 5. The route's own feature check, where it declares one, then the binding
-   guard.
+   guard. Every sandbox route has the sandbox feature check: `404`
+   `sandboxes_disabled` on a hub without sandboxes (see
+   [Sandbox routes](#sandbox-routes)).
 6. The scope check: `403 insufficient_scope` for a PAT whose permissions
    do not satisfy the scope the route declares (see [Scopes](#scopes)).
 7. The access checks: first the admin check of the admin routes, `403
@@ -470,7 +472,7 @@ The build of the running hub.
 
 | Status | Body |
 |---|---|
-| `200 OK` | an object with exactly the string members below |
+| `200 OK` | an object with exactly the members below |
 
 The answer carries `Cache-Control: public, max-age=300`.
 
@@ -480,11 +482,18 @@ The answer carries `Cache-Control: public, max-age=300`.
 | `commit` | the commit the binary was built from, or `unknown` when none was set |
 | `build_time` | the build time as given at build time, or `unknown` when none was set |
 | `go_version` | the version of the Go toolchain that built the binary, for example `go1.27.3` |
+| `sandbox_runtime` | only on a hub with sandboxes on (a `[sandbox]` section, see [configuration.md](configuration.md#sandboxes)): an object of two strings, `supported`, the OpenShell releases the hub works with as `>=<lowest> <<first unsupported>`, and `connected`, the release the gateway reported when the hub started. It is read once, at start, and stays the same while the gateway cannot be reached |
 
 Example:
 
 ```json
 {"version":"1.4.0","commit":"3f2a1bc","build_time":"2026-01-02T03:04:05Z","go_version":"go1.27.3"}
+```
+
+With sandboxes on:
+
+```json
+{"version":"1.4.0","commit":"3f2a1bc","build_time":"2026-01-02T03:04:05Z","go_version":"go1.27.3","sandbox_runtime":{"supported":">=0.1.0 <0.2.0","connected":"0.1.8"}}
 ```
 
 How the build values are set is in [architecture.md](architecture.md#build-information).
@@ -1028,6 +1037,163 @@ The check runs in the access position of the [order of checks](#order-of-checks)
 after the admin check and before the `Idempotency-Key` of a create route, so
 a replayed create is decided again. No route declares a need yet; the
 workspace routes will.
+
+## Sandbox routes
+
+Sandboxes are optional: a hub offers them only with a `[sandbox]` section
+(see [configuration.md](configuration.md#sandboxes)). Every sandbox route
+runs the sandbox feature check in step 5 of the [order of checks](#order-of-checks),
+after authentication, the rate limit and the body checks and before the
+binding guard, the scope check, workspace access and the handler. On a hub
+without sandboxes it answers every authenticated caller, the admin token
+included, whatever the scopes of a PAT and whether or not the workspace
+exists:
+
+```json
+{"error":{"code":404,"message":"sandboxes are not enabled on this hub","error_type":"sandboxes_disabled"}}
+```
+
+A request without a credential still gets `401 unauthenticated`, a path no
+route has `404 not_found`, a method the route does not have `405
+method_not_allowed` and a body over the limit `413`, since those steps come
+first. On a hub with sandboxes the check passes and the later checks and the
+handler decide.
+
+A sandbox route of a workspace, under `/api/v1/workspaces/{slug}/sandboxes`,
+is of one of two kinds:
+
+| Kind | Scope of a PAT | Workspace access | Routes |
+|---|---|---|---|
+| read | `sandboxes:read` | `read` | getting a sandbox, listing a workspace's sandboxes, its logs, downloading a file, listing policy proposals |
+| write | `sandboxes:write` | `write` | every other, creating, exec, attach, uploading, stop, start, delete, checkpoints, approving and rejecting a proposal included |
+
+The scope is checked before workspace access, so a PAT without the scope is
+answered `403 insufficient_scope` also on a slug that names no workspace,
+and an org member's PAT without `sandboxes:write` gets `403
+insufficient_scope` on a write route, not `403 forbidden`. The admin token
+passes as an owner of every workspace, except on a route that acts for a
+user, such as creating a sandbox: there it is answered, after workspace
+access and before the route reads its body,
+
+```json
+{"error":{"code":403,"message":"the admin token cannot create a sandbox","error_type":"forbidden"}}
+```
+
+and on a slug that names no workspace `404 not_found`, since workspace
+access is decided first.
+
+When the sandbox runtime cannot be reached, or has no operation for what a
+sandbox route asks of it, the route answers `502` with `error_type`
+`sandbox_runtime_error`. Its message is the runtime's error with the
+gateway's credentials and any user information of a URL removed; do not
+branch on it. The hub keeps serving: routes that read only the hub's own
+state keep answering.
+
+```json
+{"error":{"code":502,"message":"sandbox runtime: get_sandbox: unavailable: connection refused","error_type":"sandbox_runtime_error"}}
+```
+
+A route that runs a command in a sandbox, attaches to it or writes a file
+into it also needs a credential that covers the sandbox's hub credential
+(its `hub_access`), so that a weak token cannot act through a sandbox a
+stronger credential created. It is decided once the sandbox is found and
+before the body is validated: every caller covers a sandbox whose
+`hub_access` is null, the admin token and an API key cover every one, and a
+PAT covers it when it holds every scope of `hub_access.scopes` (a `:write`
+scope also counting for its `:read`, as in the scope check) and, if the PAT
+has `paths`, `hub_access.paths` is not null and each of its globs is covered
+by one of the PAT's globs. Any other caller gets `403
+insufficient_scope`, and nothing is run, attached or written:
+
+```json
+{"error":{"code":403,"message":"this token does not hold \"git:write\", which the sandbox's hub credential holds","error_type":"insufficient_scope"}}
+```
+
+The message names the first scope the token lacks, or the first of the
+hub credential's globs no glob of the token covers, or says that the token
+is limited to paths and the hub credential is not; do not branch on it.
+
+## `GET /api/v1/sandbox-profiles`
+
+Lists the sandbox profiles of the hub's configuration (see
+[configuration.md](configuration.md#sandboxes)), so that an agent knows
+which profile to ask for. Any authenticated caller may call it: an API key,
+the admin token, or a PAT with the scope `sandboxes:read`. It needs access
+to no workspace, so a user who owns none gets the same list.
+
+The answer is `200` with every profile, in name order, on one page:
+`next_cursor` is always `null`, and the route ignores every query
+parameter, `limit` and `cursor` included. It is read from the configuration
+alone and asks the sandbox runtime nothing, so it answers the same while the
+runtime is unreachable.
+
+```json
+{"items":[{"name":"agent","default":true,"description":"an agent","image":"agent:1","cpu":"2","memory":"4Gi","gpu":1,"ttl":"4h","ttl_seconds":14400,"idle_timeout":"30m","policy_summary":["a.test","b.test"],"credentials":["model"],"optional_credentials":["search"],"exposed_secrets":[{"name":"A_TOKEN","optional":true},{"name":"Z_TOKEN","optional":false}],"hub_access":"none","env_keys":["A","B"],"checkpoint":false,"allow_proposals":false}],"next_cursor":null}
+```
+
+Each item has exactly these members:
+
+| Member | Value |
+|---|---|
+| `name` | the profile's name |
+| `default` | `true` for the profile a sandbox gets when its creator names none |
+| `description` | the profile's description, `""` when it has none |
+| `image`, `cpu`, `memory` | as configured, `""` when the profile leaves them to the runtime |
+| `gpu` | the number of GPUs, `0` when none |
+| `ttl` | the profile's time to live, as a [duration](#timestamps-and-durations) in the largest unit that divides it: `4h`, `30m`, `1d` (a `ttl` of `24h` is written `1d`) |
+| `ttl_seconds` | the same time to live in seconds, an integer |
+| `idle_timeout` | the profile's idle timeout, the section's when the profile sets none, written like `ttl`; `0s` when the idle stop is off |
+| `policy_summary` | the hosts the profile's base policy allows, as the runtime reported them at start, sorted; `[]` for the built-in policy |
+| `credentials`, `optional_credentials` | the names of the configured credentials the profile attaches, required and optional; `[]` when none |
+| `exposed_secrets` | the names of the secrets the profile exposes, each `{"name": …, "optional": …}`, sorted by name; `[]` when none |
+| `hub_access` | `fork` or `none` |
+| `env_keys` | the names of the profile's `env` variables, sorted; `[]` when none |
+| `checkpoint`, `allow_proposals` | as configured |
+
+The path of a policy file, the values of `env`, and the lists
+`expose_secrets` and `optional_expose_secrets` are never shown, and no
+member holds a secret's value.
+
+A PAT without `sandboxes:read` gets `403 insufficient_scope`, a request
+without a credential `401 unauthenticated`, and on a hub without sandboxes
+every authenticated caller gets `404 sandboxes_disabled` (see
+[Sandbox routes](#sandbox-routes)).
+
+## `GET /api/v1/sandboxes`
+
+Lists the sandboxes of every workspace on the hub, for the operator. Only
+the admin token may call it: every other credential, the API key of a user
+with role `admin` and a PAT with `sandboxes:read` and `sandboxes:write`
+included, is answered before anything is read with
+
+```json
+{"error":{"code":403,"message":"only the admin token may list every sandbox of the hub","error_type":"forbidden"}}
+```
+
+A request without a credential gets `401 unauthenticated`, and on a hub
+without sandboxes the admin token gets `404 sandboxes_disabled` (see
+[Sandbox routes](#sandbox-routes)).
+
+The answer is `200` with a [list](#lists): the sandbox objects as the hub
+stores them, newest first by `created_at` and then by `id`, both
+descending. It is read from the hub's own records and asks the sandbox
+runtime nothing, so it answers the same while the runtime is unreachable.
+Until the hub stores sandboxes the list is empty:
+
+```json
+{"items":[],"next_cursor":null}
+```
+
+| Query parameter | Value |
+|---|---|
+| `state` | only the sandboxes in this state, one of `provisioning`, `ready`, `stopped`, `completed`, `failed` and `deleted`, written exactly so |
+| `user` | only the sandboxes created by the user with this id |
+| `limit`, `cursor` | as for every [list](#lists): `limit` from 1 to 200, default 50 |
+
+`state` and `user` together select the sandboxes that match both. Any other
+`state`, `limit` or `cursor`, and a cursor of a page with other filters, is
+answered `400 invalid_request`. A failure to read the records is `500
+internal` with the message `internal error`, and no items.
 
 ## User selectors
 

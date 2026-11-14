@@ -267,6 +267,24 @@ start work that failed:
 {"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
 ```
 
+With sandboxes on (a `[sandbox]` section, see
+[configuration.md](configuration.md#sandboxes)), the start checks the
+OpenShell gateway once, after the stores are open and before it listens, in
+the start hook `sandbox_runtime_check`. The check stops at its first
+failure, and the line names the key to look at: `sandbox.gateway_url` for a
+gateway that cannot be reached, refuses the hub's credential, is not
+healthy, runs a release outside the supported range or does not answer
+within 30 seconds; `sandbox.credentials[<name>].provider_profile` for a
+provider profile the gateway does not know; `sandbox.profiles[<name>].expose_secrets`
+or `optional_expose_secrets` for an exposed secret whose name is a variable
+of a credential the profile attaches; `sandbox.profiles[<name>].policy` for
+a policy file the gateway rejects or cannot validate. The gateway token and
+the OIDC client secret never appear in it:
+
+```json
+{"time":"2026-11-13T13:11:39.120534+01:00","level":"ERROR","msg":"cannot start","error":"start hook \"sandbox_runtime_check\": sandbox.gateway_url: the gateway runs OpenShell release \"0.3.1\", outside the supported range >=0.1.0 <0.2.0"}
+```
+
 When it cannot bind the address the line is `cannot listen`:
 
 ```json
@@ -325,6 +343,7 @@ Available Commands:
   keys        List, refresh and revoke your API keys
   login       Sign in to the hub and save the hub URL and the credential
   orgs        List and read the organizations you belong to
+  sandbox     Work with the hub's sandboxes and their profiles
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
@@ -1105,6 +1124,32 @@ with exit status `2`, and sends no request:
   }
 }
 ```
+
+### `parley sandbox`
+
+`parley sandbox profiles` calls `GET /api/v1/sandbox-profiles` once (see
+[api.md](api.md#get-apiv1sandbox-profiles)) with the credential as
+`Authorization: Bearer`, prints the hub's answer on stdout as described
+under [Output](#output), and exits `0`. The list is one page, in name order,
+and the command has no paging flags. An error the hub answers is written to
+stderr as received, with exit status `1`; on a hub without sandboxes:
+
+```json
+{
+  "error": {
+    "code": 404,
+    "message": "sandboxes are not enabled on this hub",
+    "error_type": "sandboxes_disabled"
+  }
+}
+```
+
+| Command | Request |
+|---|---|
+| `parley sandbox profiles` | `GET /api/v1/sandbox-profiles` |
+
+`parley sandbox` run without a command prints its help and exits `0`; it
+reads no credential and sends no request.
 
 ### Output
 

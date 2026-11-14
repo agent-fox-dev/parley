@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/agent-fox-dev/parley/internal/buildinfo"
 )
 
 // Probe reports whether one part of the hub can do its work: it returns an
@@ -57,6 +55,10 @@ type Options struct {
 	// IdempotencyStore keeps the records of creates sent with an
 	// Idempotency-Key; nil means an in-memory store, emptied at restart.
 	IdempotencyStore IdempotencyStore
+	// VersionMembers, when set, is called on every GET /version and its
+	// members are added to the document after the build's; a member named
+	// like one of the build's is left out.
+	VersionMembers func() map[string]any
 }
 
 // Server is the hub's HTTP server.
@@ -235,13 +237,6 @@ type statusDocument struct {
 	Status string `json:"status"`
 }
 
-type versionDocument struct {
-	Version   string `json:"version"`
-	Commit    string `json:"commit"`
-	BuildTime string `json:"build_time"`
-	GoVersion string `json:"go_version"`
-}
-
 // The probes must always see the hub's current state, so no cache may keep
 // their answer; the build of a running hub changes only on a restart.
 const (
@@ -270,15 +265,4 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, statusDocument{Status: "ready"})
-}
-
-func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Cache-Control", versionCacheControl)
-	info := buildinfo.Get()
-	WriteJSON(w, http.StatusOK, versionDocument{
-		Version:   info.Version,
-		Commit:    info.Commit,
-		BuildTime: info.BuildTime,
-		GoVersion: info.GoVersion,
-	})
 }

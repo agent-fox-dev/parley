@@ -10,6 +10,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -111,12 +114,29 @@ func (s *Served) ExitCode(t testing.TB, within time.Duration) int {
 }
 
 // Hub is a running hub bootstrapped with an admin token, and its store, for
-// what no route does: seeding users and issuing an API key the way a login
-// does.
+// what no route does: seeding users, issuing an API key the way a login
+// does, storing a PAT and a workspace record. Orgs and their members are
+// made through the admin routes, with Call.
 type Hub struct {
 	*Served
 	Token string
 	Store *store.Store
+}
+
+// Config is what StartWith starts a hub with besides its defaults.
+type Config struct {
+	// Server is TOML added inside the [server] table, after bind and port,
+	// such as an external_url line.
+	Server string
+	// TOML is added to config.toml after the [server] table, such as a
+	// [sandbox] section.
+	TOML string
+	// Files are written into the config dir, where config.toml is, before
+	// the hub is bootstrapped: name to content. A relative path in the
+	// configuration is taken from that directory.
+	Files map[string]string
+	// Compose is run on the hub's composition; nil for nothing.
+	Compose func(*hub.Composition)
 }
 
 // Start bootstraps a hub with an admin token in a fresh data directory,
@@ -125,9 +145,26 @@ type Hub struct {
 // environment, so tests that start one may run in parallel.
 func Start(t testing.TB, compose func(*hub.Composition)) *Hub {
 	t.Helper()
+	return StartWith(t, Config{Compose: compose})
+}
+
+// StartWith is Start with what cfg adds to config.toml and to the config
+// dir.
+func StartWith(t testing.TB, cfg Config) *Hub {
+	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("[server]\nbind = \"127.0.0.1\"\nport = 0\n"), 0o644); err != nil {
-		t.Fatal(err)
+	files := map[string]string{"config.toml": "[server]\nbind = \"127.0.0.1\"\nport = 0\n" + cfg.Server + "\n" + cfg.TOML}
+	for name, content := range cfg.Files {
+		files[name] = content
+	}
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
 	var out, errb LogBuffer
@@ -150,8 +187,8 @@ func Start(t testing.TB, compose func(*hub.Composition)) *Hub {
 			h.Store = rt.Store
 			return nil
 		})
-		if compose != nil {
-			compose(c)
+		if cfg.Compose != nil {
+			cfg.Compose(c)
 		}
 	}})
 	return h
@@ -189,4 +226,102 @@ func (h *Hub) IssueKey(t testing.TB, userID string) string {
 		t.Fatalf("issue a key for %s: %v", userID, err)
 	}
 	return key
+}
+
+// IssuePAT stores the PAT spec describes, as minting one does, and returns
+// the token. An empty name is "test" and a zero creation time is now.
+func (h *Hub) IssuePAT(t testing.TB, spec identity.PATSpec) string {
+	t.Helper()
+	if spec.Name == "" {
+		spec.Name = "test"
+	}
+	if spec.CreatedAt.IsZero() {
+		spec.CreatedAt = time.Now()
+	}
+	ctx := context.Background()
+	var token string
+	err := h.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		token, _, err = identity.StorePAT(ctx, tx, spec)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("store a PAT for %s: %v", spec.UserID, err)
+	}
+	return token
+}
+
+// CreateOrg creates the active org slug, named slug, through the admin
+// route and returns its id.
+func (h *Hub) CreateOrg(t testing.TB, slug string) string {
+	t.Helper()
+	status, body := h.Call(t, http.MethodPost, "/api/v1/orgs", h.Token, map[string]string{"name": slug, "slug": slug})
+	var org struct {
+		ID string `json:"id"`
+	}
+	if status != http.StatusCreated || json.Unmarshal(body, &org) != nil || org.ID == "" {
+		t.Fatalf("create org %s = %d %s, want 201 with an id", slug, status, body)
+	}
+	return org.ID
+}
+
+// AddMember makes the user userID a member of the org orgID through the
+// admin route.
+func (h *Hub) AddMember(t testing.TB, orgID, userID string) {
+	t.Helper()
+	if status, body := h.Call(t, http.MethodPut, "/api/v1/orgs/"+orgID+"/members/"+userID, h.Token, nil); status != http.StatusNoContent {
+		t.Fatalf("add member %s to %s = %d %s, want 204", userID, orgID, status, body)
+	}
+}
+
+// AddWorkspace stores the workspace record rec, the record the access rule
+// decides from, as registering or forking a workspace does.
+func (h *Hub) AddWorkspace(t testing.TB, rec access.Record) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return access.InsertRecord(ctx, tx, rec) }); err != nil {
+		t.Fatalf("store the workspace record %+v: %v", rec, err)
+	}
+}
+
+// Call sends method path to the hub with credential as the bearer
+// credential ("" for none) and body: nil for none, a []byte or a string as
+// it is, anything else as JSON; a body is sent as application/json. It
+// returns the status and the body of the answer, and fails the test when the
+// request cannot be sent or the answer read.
+func (s *Served) Call(t testing.TB, method, path, credential string, body any) (int, []byte) {
+	t.Helper()
+	var data io.Reader
+	switch b := body.(type) {
+	case nil:
+	case []byte:
+		data = bytes.NewReader(b)
+	case string:
+		data = strings.NewReader(b)
+	default:
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, s.URL(path), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("%s %s: read the body: %v", method, path, err)
+	}
+	return res.StatusCode, b
 }

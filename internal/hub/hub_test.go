@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -176,6 +178,9 @@ func TestRun_StopsTheStartAtTheFirstFailingStage(t *testing.T) {
 			if !strings.Contains(lines[0], a.want) {
 				t.Errorf("error line %q does not name %q", lines[0], a.want)
 			}
+			if a.secret != "" && strings.Contains(stderr.String(), a.secret) {
+				t.Errorf("stderr %q holds the secret %q", stderr.String(), a.secret)
+			}
 			if strings.Contains(stderr.String(), "listening") {
 				t.Errorf("stderr %q has a listening line", stderr.String())
 			}
@@ -199,6 +204,8 @@ type failedStart struct {
 	dir     string
 	compose func(*hub.Composition)
 	want    string
+	// secret, when set, must not appear on stderr.
+	secret string
 }
 
 // failingStart is a row of TestRun_StopsTheStartAtTheFirstFailingStage.
@@ -217,6 +224,29 @@ func failingStarts(hooks func(row string) func(*hub.Composition)) []failingStart
 	return []failingStart{
 		{"invalid configuration", "data", func(t *testing.T, row string) failedStart {
 			return failedStart{dir: workDir(t, "[server]\nprot = 1\n"), compose: hooks(row), want: "server.prot"}
+		}},
+		{"invalid sandbox section", "data", func(t *testing.T, row string) failedStart {
+			dir := workDir(t, localConfig+externalURL+"[sandbox]\nruntime = \"docker\"\ngateway_url = \"https://gw.test\"\ntoken_file = \"gateway-token\"\n"+
+				"[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n")
+			writeFile(t, filepath.Join(dir, "gateway-token"), gatewayToken)
+			var calls atomic.Int32
+			return failedStart{dir: dir, want: "sandbox.runtime", compose: func(c *hub.Composition) {
+				c.SetSandboxRuntime(runtimeOf(newRuntime(t), &calls, nil))
+				hooks(row)(c)
+			}}
+		}},
+		{"sandbox gateway refusing the hub", "", func(t *testing.T, row string) failedStart {
+			dir := workDir(t, localConfig+externalURL+sandboxSection)
+			for name, content := range sandboxFiles {
+				writeFile(t, filepath.Join(dir, name), content)
+			}
+			rt := newRuntime(t)
+			rt.FailOperation(runtime.OpRelease, runtime.ErrUnavailable, "unauthenticated: token "+gatewayToken+" refused")
+			var calls atomic.Int32
+			return failedStart{dir: dir, want: "sandbox.gateway_url", secret: gatewayToken, compose: func(c *hub.Composition) {
+				c.SetSandboxRuntime(runtimeOf(rt, &calls, nil))
+				hooks(row)(c)
+			}}
 		}},
 		{"data directory under a regular file", "", func(t *testing.T, row string) failedStart {
 			dir := t.TempDir()

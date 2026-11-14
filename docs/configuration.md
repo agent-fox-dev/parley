@@ -121,6 +121,152 @@ The default endpoints are, for `github`,
 `https://openidconnect.googleapis.com/v1/userinfo`. The `[oauth]` section
 holds nothing else.
 
+### Sandboxes
+
+The `[sandbox]` section turns sandboxes on: a file that holds it, even
+empty, enables them, and a file without it leaves them off. An empty
+section is invalid, since `gateway_url` is required. With the section,
+`[server].external_url` must be set.
+
+```toml
+[server]
+external_url = "https://parley.example"
+
+[sandbox]
+gateway_url = "https://openshell.example:8443"
+token_file = "openshell.token"
+
+[[sandbox.profiles]]
+name = "agent"
+ttl = "4h"
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `runtime` | string | `"openshell"` | the sandbox runtime; `openshell` only |
+| `gateway_url` | string | required | the OpenShell gateway: an `https` URL, or an `http` URL to `localhost`, an address in `127.0.0.0/8` or `::1`; without user information, a query, a fragment, or a path other than `/` |
+| `tls_cert`, `tls_key` | string | `""` | the client certificate and its key for mutual TLS, both or neither; each a readable file |
+| `tls_ca` | string | `""` | a readable file of CA certificates the gateway's certificate is checked against |
+| `token_file` | string | `""` | a readable file holding the bearer token; its content without surrounding white space must not be empty. It is read once, when `parleyd` starts |
+| `oidc_issuer`, `oidc_client_id`, `oidc_client_secret_file` | string | `""` | OIDC client credentials, all three or none: the issuer by the rule of `gateway_url` except that it may have a path, and a readable, non-empty file holding the client secret |
+| `openshell_workspace` | string | `"parley"` | the OpenShell workspace the hub owns: 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit |
+| `max_ttl` | duration | `"24h"` | more than `0` |
+| `idle_timeout` | duration | `"30m"` | `0` or more; `0` disables the idle stop |
+| `max_sandboxes` | integer | `200` | at least `1` |
+| `max_per_org` | integer | `100`, or `max_sandboxes` when that is smaller | at least `1` and at most `max_sandboxes` |
+| `max_per_workspace` | integer | `50` | at least `1` |
+| `max_per_user` | integer | `20` | at least `1` |
+| `allow_workspace_rules` | boolean | `true` | |
+| `max_exec_timeout` | duration | `"30m"` | more than `0` |
+| `max_concurrent_execs` | integer | `8` | at least `1` |
+| `max_transfer_size` | string | `"1GB"` | in the size format of `[server].max_body_size` |
+| `log_retention` | duration | `"7d"` | more than `0` |
+| `reconcile_interval` | duration | `"1m"` | from `10s` to `10m`, both included |
+| `[[sandbox.profiles]]` | tables | required | the sandbox profiles, at least one |
+| `[[sandbox.credentials]]` | tables | none | the credentials profiles may attach |
+
+A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
+hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
+`tls_ca`, `token_file`, `oidc_client_secret_file` and a profile's `policy`
+are taken from the config dir.
+
+Exactly one way to authenticate to the gateway is configured: mutual TLS
+(`tls_cert` with `tls_key`), `token_file`, or the three OIDC keys. `tls_ca`
+may accompany any of them. With none, or with more than one, the failure
+names `sandbox.gateway_url` and the ways found, such as
+`sandbox.gateway_url: configure exactly one way to authenticate, found:
+mutual TLS, token_file`. A pair or a triple that is incomplete names the keys
+it misses instead.
+
+The hub connects to the gateway's host and port (when `gateway_url` gives
+none, 443, or 80 for an `http` gateway), over TLS for an `https` URL and without it for an `http` one.
+With mutual TLS it presents the client certificate; with `token_file` it
+sends the file's content as a bearer token, also over `http` to a loopback
+gateway; with OIDC it obtains a token from `oidc_issuer` with the client
+credentials grant on its first call to the gateway and renews it before it
+expires. The hub supports the OpenShell releases from `0.1.0`, included, to
+`0.2.0`, excluded, compared as semantic versions after an optional leading
+`v`; a release that is not a semantic version is outside the range.
+
+Once the file is accepted and the stores are open, and before it listens,
+`parleyd` checks the gateway once, within 30 seconds in all, in this order,
+and does not start on the first failure (see [cli.md](cli.md) for the
+error line): it reads the gateway's health and release and refuses an
+unhealthy gateway or a release outside the range; it makes sure the
+`openshell_workspace` exists, creating it when it does not; it installs the
+provider profile `parley-hub` of the hub credential a sandbox reaches the hub
+with, its placeholder in `PARLEY_API_KEY`, for the scheme, host and port of
+`[server].external_url` (443 for `https` and 80 for `http` when the URL gives
+none) and any program; it reads, once each, the provider profiles the
+`[[sandbox.credentials]]` name, and refuses one the gateway does not know;
+it refuses a name in a profile's `expose_secrets` or
+`optional_expose_secrets` that is a variable declared by the provider
+profile of a credential the same profile attaches through `credentials` or
+`optional_credentials`; and it sends each profile's `policy` file to the
+gateway for validation and keeps the hosts the gateway reports it allows.
+The built-in policy is not sent. A gateway that cannot validate a policy
+file fails the start for a profile that names one: the OpenShell SDK the hub
+is built with has no call for it, so against an OpenShell gateway every
+profile stays on the built-in policy. A second start finds the workspace and
+replaces `parley-hub`, so nothing is created twice.
+
+A profile is the template of a sandbox. Its table may hold these keys and
+no other:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit; unique among the profiles |
+| `default` | boolean | `false` | the profile a sandbox gets when its creator names none; at most one profile sets it |
+| `description` | string | `""` | |
+| `image` | string | `""` | the sandbox image; `""` leaves it to the runtime |
+| `cpu`, `memory` | string | `""` | the sandbox's resources; `""` leaves them to the runtime |
+| `gpu` | integer | `0` | `0` or more |
+| `ttl` | duration | required | more than `0` and at most `max_ttl` |
+| `idle_timeout` | duration | the section's `idle_timeout` | `0` or more; `0` disables the idle stop |
+| `policy` | string | `""` | a readable file holding the base network policy; `""` is the built-in policy |
+| `credentials` | list of strings | `[]` | names of `[[sandbox.credentials]]` tables the sandbox gets |
+| `optional_credentials` | list of strings | `[]` | as `credentials`; a name may not be in both lists |
+| `expose_secrets` | list of strings | `[]` | names of secrets whose values the sandbox's environment gets, by the rules below |
+| `optional_expose_secrets` | list of strings | `[]` | as `expose_secrets`; a name may not be in both lists |
+| `hub_access` | string | `"fork"` | `fork` or `none` |
+| `env` | table of strings | `{}` | the sandbox's environment: each key matches `^[A-Za-z_][A-Za-z0-9_]*$` and does not start with `PARLEY_` or `OPENSHELL_` |
+| `checkpoint` | boolean | `true` | |
+| `allow_proposals` | boolean | `true` | |
+
+A name in `expose_secrets` or `optional_expose_secrets` matches
+`^[A-Za-z_][A-Za-z0-9_]*$`, does not start with `PARLEY_` or `OPENSHELL_`, is
+none of the reserved secret names `GIT_PAT`, `GIT_USERNAME`, `GIT_PASSWORD`,
+`UPSTREAM_GIT_PAT`, `UPSTREAM_GIT_USERNAME`, `UPSTREAM_GIT_PASSWORD` and
+`FORGE_WEBHOOK_SECRET` in any letter case, and is not a key of the profile's
+`env`. Whether the secret exists is not checked when `parleyd` starts.
+
+A configured credential is a secret a profile may attach to its sandboxes.
+Its table holds exactly:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | the pattern of a profile's name; unique among the credentials |
+| `provider_profile` | string | required | the id of the OpenShell provider profile that says how the runtime may use it; not empty |
+| `secret` | string | required | the name of the secret holding its value; not empty |
+
+The section is checked as a whole, after the rest of the file is accepted
+and before any store is opened. Every failure is reported in one error, the
+failures separated by `; `, each naming its key: `sandbox.<key>`,
+`sandbox.profiles[<name>].<key>`, `sandbox.credentials[<name>].<key>` (the
+zero-based index in place of a name that is missing or not a valid name), or
+`server.external_url`. An unknown key in the section, a profile or a
+credential is a failure like the others. A failure about an `env` key, a
+listed credential or an exposed secret quotes that key or name, such as
+`sandbox.profiles[agent].credentials: "nope" is not the name of a
+[[sandbox.credentials]] table`. Beyond those configured names, no failure
+quotes a value, so the error holds no secret and neither the content of `token_file` or `oidc_client_secret_file`, nor
+the user information of a URL, nor the value of an `env` entry. For
+example:
+
+```
+configuration file /srv/parley/config.toml: sandbox.runtime: must be openshell; sandbox.max_ttl: must be more than 0; sandbox.reconcile_interval: must be from 10s to 10m; sandbox.gatway_url: unknown key; server.external_url: must be set when the [sandbox] section is present
+```
+
 ### Environment variables
 
 | Variable | Effect |

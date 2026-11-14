@@ -193,6 +193,24 @@ func TestVersion_AnswersTheBuildValuesAndGoVersion(t *testing.T) {
 	}
 }
 
+// The build values are package globals that another test sets, so this
+// test must not run in parallel with it.
+func TestVersion_AddsTheMembersItIsGivenWithoutReplacingTheBuilds(t *testing.T) {
+	t.Parallel()
+	h := New(Options{VersionMembers: func() map[string]any {
+		return map[string]any{"sandbox_runtime": map[string]any{"connected": "0.1.8"}, "version": "forged"}
+	}}).Handler()
+
+	got := decodeObject(t, get(t, h, "/version", nil).body)
+
+	if want := map[string]any{"connected": "0.1.8"}; !reflect.DeepEqual(got["sandbox_runtime"], want) {
+		t.Errorf("sandbox_runtime = %v, want %v", got["sandbox_runtime"], want)
+	}
+	if got["version"] != buildinfo.Get().Version {
+		t.Errorf("version = %v, want the build's %q", got["version"], buildinfo.Get().Version)
+	}
+}
+
 // serving is a server started by startServing on 127.0.0.1:0.
 type serving struct {
 	addr   string
