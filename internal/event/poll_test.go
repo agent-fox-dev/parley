@@ -320,3 +320,24 @@ func TestLog_ShutdownReleasesLongPolls(t *testing.T) {
 		}
 	}
 }
+
+func TestLog_UsesCurrentAccess(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	out := w.key("out")
+
+	e1 := w.emit(on("parley.change.open", "api"))
+	if got := w.getLog(t, out, "after=0").seqs(t); len(got) != 0 {
+		t.Fatalf("out without access: seqs = %v, want none", got)
+	}
+	w.addMember(w.acme, "out")
+	e2 := w.emit(on("parley.change.open", "api"))
+	if got, want := w.getLog(t, out, "after=0").seqs(t), []int64{e1.Seq, e2.Seq}; !slices.Equal(got, want) {
+		t.Errorf("out after joining acme: seqs = %v, want the earlier and the later event, %v", got, want)
+	}
+	w.removeMember(w.acme, "out")
+	w.emit(on("parley.change.open", "api"))
+	if got := w.getLog(t, out, "after=0").seqs(t); len(got) != 0 {
+		t.Errorf("out after leaving acme: seqs = %v, want none", got)
+	}
+}

@@ -35,11 +35,12 @@ func (c *Component) Routes() []server.Route {
 // logQuery is a request to the log.
 type logQuery struct {
 	filter filter
-	// after is the position the page starts after, when hasAfter.
-	after    int64
-	hasAfter bool
-	limit    int
-	wait     time.Duration
+	// after is the position the page starts after, read from the
+	// parameter posName; posName is "" when the request gives none.
+	after   int64
+	posName string
+	limit   int
+	wait    time.Duration
 }
 
 // parseLogQuery reads a request to the log, refusing every bad parameter at
@@ -51,7 +52,11 @@ func parseLogQuery(rawQuery string) (logQuery, error) {
 	if err != nil {
 		return logQuery{}, err
 	}
-	lq := logQuery{filter: parseFilter(q), limit: defaultLogLimit}
+	f, err := parseFilter(q)
+	if err != nil {
+		return logQuery{}, err
+	}
+	lq := logQuery{filter: f, limit: defaultLogLimit}
 	if q.Has("limit") {
 		n, err := strconv.Atoi(q.Get("limit"))
 		if err != nil || n < 1 || n > maxLogLimit {
@@ -74,10 +79,12 @@ func parseLogQuery(rawQuery string) (logQuery, error) {
 		if err != nil {
 			return logQuery{}, err
 		}
-		if lq.hasAfter && pos != lq.after {
+		if lq.posName != "" && pos != lq.after {
 			return logQuery{}, server.InvalidRequest("after and cursor name different positions")
 		}
-		lq.after, lq.hasAfter = pos, true
+		if lq.posName == "" {
+			lq.after, lq.posName = pos, name
+		}
 	}
 	return lq, nil
 }
@@ -93,7 +100,9 @@ type logPage struct {
 }
 
 // serveLog answers GET /events/log: the visible, matching events after the
-// position, at most limit of them. When there is none and wait is above 0,
+// position, at most limit of them. The parameters, the position against the
+// log's bounds and the workspace filter against the caller's access are
+// checked first, in that order, by the rules the stream applies too. When there is none and wait is above 0,
 // it holds the request until one is committed, the wait ends on the
 // component's clock, the hub begins to stop or the client goes away.
 func (c *Component) serveLog(w http.ResponseWriter, r *http.Request) error {
@@ -102,13 +111,19 @@ func (c *Component) serveLog(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	ctx, caller := r.Context(), CallerOf(r)
-	pos := q.after
-	if !q.hasAfter {
-		b, err := c.Bounds(ctx)
-		if err != nil {
+	b, err := c.Bounds(ctx)
+	if err != nil {
+		return err
+	}
+	pos := max(b.OldestSeq-1, 0)
+	if q.posName != "" {
+		if err := checkPosition(q.posName, q.after, b); err != nil {
 			return err
 		}
-		pos = max(b.OldestSeq-1, 0)
+		pos = q.after
+	}
+	if err := c.checkWorkspace(ctx, caller, q.filter.Workspace); err != nil {
+		return err
 	}
 	page, err := c.collect(ctx, caller, q.filter, pos, q.limit)
 	if err != nil || len(page.Items) > 0 || q.wait == 0 {

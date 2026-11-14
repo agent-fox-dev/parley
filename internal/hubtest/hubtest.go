@@ -11,9 +11,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -121,6 +123,9 @@ type Hub struct {
 	*Served
 	Token string
 	Store *store.Store
+	// opts are the options the hub is served with, which Restart serves it
+	// with again.
+	opts hub.Options
 }
 
 // Config is what StartWith starts a hub with besides its defaults.
@@ -137,6 +142,8 @@ type Config struct {
 	Files map[string]string
 	// Compose is run on the hub's composition; nil for nothing.
 	Compose func(*hub.Composition)
+	// Now is the hub's clock once it is served; nil for time.Now.
+	Now func() time.Time
 }
 
 // Start bootstraps a hub with an admin token in a fresh data directory,
@@ -182,7 +189,7 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 		t.Fatal(err)
 	}
 	h := &Hub{Token: strings.TrimSpace(string(token))}
-	h.Served = Serve(t, hub.Options{Env: env, WorkDir: dir, Compose: func(c *hub.Composition) {
+	h.opts = hub.Options{Env: env, WorkDir: dir, Now: cfg.Now, Compose: func(c *hub.Composition) {
 		c.AddStartHook("test-store", func(_ context.Context, rt *hub.Runtime) error {
 			h.Store = rt.Store
 			return nil
@@ -190,8 +197,33 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 		if cfg.Compose != nil {
 			cfg.Compose(c)
 		}
-	}})
+	}}
+	h.Served = Serve(t, h.opts)
 	return h
+}
+
+// Restart stops the hub, waits up to 10 s for it to return with status 0,
+// and serves it again with the same data directory, configuration and
+// composition on the same port, as a restart of parleyd does. Served, URL
+// and Store are those of the new run afterwards.
+func (h *Hub) Restart(t testing.TB) {
+	t.Helper()
+	addr, _ := h.Listening["addr"].(string)
+	_, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("the listening address %q: %v", addr, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("the listening port %q: %v", portText, err)
+	}
+	h.Stop()
+	if code := h.ExitCode(t, 10*time.Second); code != 0 {
+		t.Fatalf("the hub stopped with %d, want 0; stderr = %q", code, h.Log.String())
+	}
+	opts := h.opts
+	opts.Port = &port
+	h.Served = Serve(t, opts)
 }
 
 // CreateUser stores the user username with role user and a personal org,

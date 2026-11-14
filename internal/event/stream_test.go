@@ -740,3 +740,31 @@ func TestStream_ShutdownClosesStreams(t *testing.T) {
 	}
 	w.waitOpenStreams(t, 0)
 }
+
+func TestStream_AccessChangeWhileOpen(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	mem, out := w.openStream(t, w.key("mem"), "", nil), w.openStream(t, w.key("out"), "", nil)
+	mem.heartbeat(2 * time.Second)
+	out.heartbeat(2 * time.Second)
+	w.clock.WaitTimers(t, 2)
+
+	e1 := w.emit(on("parley.change.open", "api"))
+	if f := mem.next(2 * time.Second); f.event != "hub_event" || f.seq(t) != e1.Seq {
+		t.Fatalf("mem: frame %q, want the hub_event %d", f.lines, e1.Seq)
+	}
+	out.quiet(200 * time.Millisecond)
+
+	w.removeMember(w.acme, "mem")
+	w.addMember(w.acme, "out")
+	e2 := w.emit(on("parley.change.open", "api"))
+	if f := out.next(2 * time.Second); f.event != "hub_event" || f.seq(t) != e2.Seq {
+		t.Fatalf("out after joining acme: frame %q, want the hub_event %d", f.lines, e2.Seq)
+	}
+	mem.quiet(200 * time.Millisecond)
+	w.clock.Advance(heartbeatInterval)
+	hb := mem.heartbeat(2 * time.Second)
+	if hb.seq(t) < e2.Seq {
+		t.Errorf("mem after leaving acme: heartbeat id %s, want at least %d", hb.id, e2.Seq)
+	}
+}

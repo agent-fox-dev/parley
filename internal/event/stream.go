@@ -41,8 +41,12 @@ func (c *Component) streamLimit() int {
 // serveStream answers GET /events: a Server-Sent Events stream of the
 // visible, matching events after the resume position, or after last_seq at
 // open without one, followed live on the same connection, with a heartbeat
-// at once and then every 30 seconds. A request that finds every stream place
-// taken is refused with 503 and Retry-After: 5.
+// at once and then every 30 seconds. Every refusal is answered before the
+// stream's headers are written, so that it is the JSON error envelope and
+// no stream starts: the filters, the position against the log's bounds and
+// the workspace filter against the caller's access, checked in that order
+// by the rules the log applies too; then a request that finds every stream
+// place taken is refused with 503 and Retry-After: 5.
 //
 // The stream ends when the client goes away, when the hub begins to stop,
 // when the credential no longer authenticates at a heartbeat, when 256
@@ -55,18 +59,26 @@ func (c *Component) serveStream(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	f := parseFilter(q)
-	pos, ok, err := streamPosition(r, q)
+	f, err := parseFilter(q)
 	if err != nil {
 		return err
 	}
-	ctx := r.Context()
-	if !ok {
-		b, err := c.Bounds(ctx)
-		if err != nil {
-			return err
-		}
+	pos, posName, err := streamPosition(r, q)
+	if err != nil {
+		return err
+	}
+	ctx, caller := r.Context(), CallerOf(r)
+	b, err := c.Bounds(ctx)
+	if err != nil {
+		return err
+	}
+	if posName == "" {
 		pos = b.LastSeq
+	} else if err := checkPosition(posName, pos, b); err != nil {
+		return err
+	}
+	if err := c.checkWorkspace(ctx, caller, f.Workspace); err != nil {
+		return err
 	}
 	if !c.takePlace(c.streamLimit()) {
 		w.Header().Set("Retry-After", streamRetryAfter)
@@ -76,7 +88,7 @@ func (c *Component) serveStream(w http.ResponseWriter, r *http.Request) error {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
-	s := &stream{c: c, caller: CallerOf(r), filter: f, pos: pos, out: newOutbox(c.deps.Clock, w)}
+	s := &stream{c: c, caller: caller, filter: f, pos: pos, out: newOutbox(c.deps.Clock, w)}
 	go s.out.run()
 	defer s.out.stop()
 

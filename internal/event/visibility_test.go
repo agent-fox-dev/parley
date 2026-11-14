@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -259,6 +260,10 @@ func TestVisible_FailureIsNeverAGrant(t *testing.T) {
 	orgEvent.Workspace = nil
 	orgEvent.Metadata = map[string]any{"scope": "org", "scope_id": w.acme}
 	recs := []Record{w.stored(on("parley.change.open", "api")), w.stored(orgEvent)}
+	mem := w.key("mem")
+	s := w.openStream(t, mem, "", nil)
+	s.heartbeat(2 * time.Second)
+
 	w.failMemberships.Store(true)
 	for _, rec := range recs {
 		ok, err := w.events.Visible(context.Background(), w.user("mem"), rec)
@@ -266,6 +271,13 @@ func TestVisible_FailureIsNeverAGrant(t *testing.T) {
 			t.Errorf("Visible(mem, %s) with the memberships unreadable = %v, %v, want false and the read error", rec.Type, ok, err)
 		}
 	}
+
+	a := w.ask(t, "/events/log", mem, "after=0", nil)
+	if env := a.envelope(t); a.status != http.StatusInternalServerError || env.Error.ErrorType != "internal" {
+		t.Errorf("GET /events/log with the memberships unreadable = %d %s, want 500 internal", a.status, a.body)
+	}
+	w.emit(on("parley.change.open", "api"))
+	s.ends(2 * time.Second)
 }
 
 func TestCallerOf_ReadsTheAuthenticatedCredential(t *testing.T) {

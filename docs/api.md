@@ -1686,11 +1686,14 @@ has no workspace in its path.
 
 | Parameter | Meaning |
 |---|---|
-| `Last-Event-ID` (header) | the resume position: the stream sends the events with a higher `seq`. A non-negative integer; it wins over `after` |
-| `after` | the resume position when there is no `Last-Event-ID` header. Without either, the stream starts at `last_seq` when it opens and sends only events committed after that |
+| `Last-Event-ID` (header) | the resume position: the stream sends the events with a higher `seq`. A non-negative integer, at most `last_seq`; it wins over `after`, which is then not looked at |
+| `after` | the resume position when there is no `Last-Event-ID` header, by the same rules. Without either, the stream starts at `last_seq` when it opens and sends only events committed after that |
 | `workspace`, `types`, `session_id` | the filters, as on [`GET /api/v1/events/log`](#get-apiv1eventslog) |
 
-Other query parameters are ignored. The answer is `200` with
+Other query parameters are ignored. The parameters are checked as on
+[`GET /api/v1/events/log`](#get-apiv1eventslog), in the same order, and
+every refusal is answered before the stream begins, as the JSON error
+envelope; no stream is started. The answer is `200` with
 `Content-Type: text/event-stream` and `Cache-Control: no-cache`, and its first
 frame, sent at once, is a heartbeat. Each frame is three lines and an empty
 line:
@@ -1744,10 +1747,12 @@ limit. A stream gives its place back when it ends, for any reason.
 
 | Status | When |
 |---|---|
-| `200 OK` | the stream; an error after it began ends the connection |
-| `400` `invalid_request` | an `after` or `Last-Event-ID` that is not a non-negative integer (`after must be a non-negative integer`, `Last-Event-ID must be a non-negative integer`), or a query string that does not parse (`the query string is malformed`). No stream is started |
-| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`) |
-| `500` `internal` | the log's bounds could not be read before the stream began (`internal error`) |
+| `200 OK` | the stream; an error after it began ends the connection. When the caller's access cannot be read while an event is decided, the stream ends without a frame for that event |
+| `400` `invalid_request` | a malformed filter, as on the log; an `after` or `Last-Event-ID` that is not a non-negative integer (`after must be a non-negative integer`, `Last-Event-ID must be a non-negative integer`) or is above `last_seq` (`after must not be greater than last_seq (10)`, `Last-Event-ID must not be greater than last_seq (10)`); or a query string that does not parse (`the query string is malformed`). No stream is started |
+| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`), before any parameter is looked at |
+| `404` `not_found` | a `workspace` the caller may not read, as on the log (`workspace not found`). No stream is started |
+| `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1, as on the log (`event cursor expired`, with `oldest_seq`). No stream is started |
+| `500` `internal` | the log's bounds or the caller's access could not be read before the stream began (`internal error`) |
 | `503` `unavailable` | `[events].max_sse_connections` streams are open (`too many event streams are open`), with the header `Retry-After: 5`. No stream is started |
 
 ## `GET /api/v1/events/log`
@@ -1759,15 +1764,26 @@ keys are not held to it. It has no workspace in its path.
 
 | Parameter | Meaning |
 |---|---|
-| `after` | the resume position: the page holds events with a higher `seq`. A non-negative integer. Without it (and without `cursor`) the page starts at `oldest_seq`, the oldest event in the log |
+| `after` | the resume position: the page holds events with a higher `seq`. A non-negative integer from `oldest_seq` minus 1 to `last_seq` (0 on a hub that has written no event). Without it (and without `cursor`) the page starts at `oldest_seq`, the oldest event in the log |
 | `cursor` | another name for `after`; both may be given only with the same value |
 | `limit` | the most items the page holds: an integer from 1 to 200, 50 when absent |
 | `wait` | how long to hold the request when there is nothing to return: a whole number of seconds from 0 to 60, 0 when absent |
-| `workspace` | only events whose `workspace` is this slug |
-| `types` | only events whose `type` matches one of these comma-separated entries: an exact type, or a prefix ending in `*` that matches every type beginning with the text before it (`*` alone matches every type) |
+| `workspace` | only events whose `workspace` is this slug. The caller must be able to read the workspace: the admin token may name any slug, also one whose workspace was deleted, and reads the events stored under it; a workspace-bound PAT only a workspace its binding covers (none yet: no covered set is installed, so every `workspace` a bound PAT sends is `404`); every other caller only a workspace on which it has a level |
+| `types` | only events whose `type` matches one of these comma-separated entries: an exact type, or a prefix ending in `*` that matches every type beginning with the text before it (`*` alone matches every type). At most 20 entries, none empty, with `*` only as an entry's last character |
 | `session_id` | only events whose `session_id` is this UUID, in any letter case |
 
-The filters apply together. Other query parameters are ignored.
+The filters apply together; a `types` entry no event has gives an empty
+page, not an error. Other query parameters are ignored. The request is
+checked in this order, and the first refusal is the answer: the scope of a
+PAT, the parameters, the resume position against the bounds of the log,
+then the `workspace` filter against the caller's access. A position below
+`oldest_seq` minus 1 means at least one event after it has left the log,
+and is refused with `410` whether or not the caller could have seen the
+events that left:
+
+```json
+{"error":{"code":410,"message":"event cursor expired","error_type":"cursor_expired","oldest_seq":6}}
+```
 
 ```json
 {"items":[{"seq":11,"id":"…","type":"parley.change.open","time":"2026-11-14T10:30:15Z","workspace":"api","actor_type":"pat","actor_id":"u_1","resource_type":"change","resource_id":"42","action":"open","session_id":null,"metadata":{}}],"next_cursor":null,"next_after":120,"oldest_seq":11,"last_seq":120}
@@ -1802,6 +1818,8 @@ client goes away stops waiting.
 | Status | When |
 |---|---|
 | `200 OK` | the body is a page of the log |
-| `400` `invalid_request` | a `limit` that is not an integer from 1 to 200 (`limit must be an integer from 1 to 200`), a `wait` that is not a whole number of seconds from 0 to 60 (`wait must be a whole number of seconds from 0 to 60`), an `after` or `cursor` that is not a non-negative integer (`after must be a non-negative integer`), `after` and `cursor` with different values (`after and cursor name different positions`), or a query string that does not parse (`the query string is malformed`). Answered at once; nothing is held |
-| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`) |
-| `500` `internal` | the log or the caller's access could not be read (`internal error`) |
+| `400` `invalid_request` | a `types` with more than 20 entries (`types has more than 20 entries`), an empty value or an empty entry (`types has an empty entry`), or an entry with `*` anywhere but last (`types entry "parley.*.land" has a * that is not its last character`); a `session_id` that is not a UUID (`session_id must be a UUID`); a `limit` that is not an integer from 1 to 200 (`limit must be an integer from 1 to 200`), a `wait` that is not a whole number of seconds from 0 to 60 (`wait must be a whole number of seconds from 0 to 60`), an `after` or `cursor` that is not a non-negative integer (`after must be a non-negative integer`) or is above `last_seq` (`after must not be greater than last_seq (10)`), `after` and `cursor` with different values (`after and cursor name different positions`), or a query string that does not parse (`the query string is malformed`). Answered at once; nothing is held |
+| `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`), before any parameter is looked at |
+| `404` `not_found` | a `workspace` the caller may not read (`workspace not found`): the same answer for an existing workspace and for a slug with no workspace |
+| `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1 (`event cursor expired`), with the member `oldest_seq`, a number |
+| `500` `internal` | the log or the caller's access could not be read (`internal error`); no item is sent |
