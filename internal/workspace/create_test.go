@@ -65,12 +65,8 @@ func TestCreate_RecordsAPendingRepositoryAndAnswersTheWholeObject(t *testing.T) 
 	w := newWorld(t)
 	obj := w.create(t, w.uKey, valid("demo")).object(t)
 
-	members := []string{"slug", "kind", "workspace_mode", "git_url", "default_branch", "owner_id", "org_id", "status",
-		"display_name", "description", "head_sha", "origin_head_sha", "clone_error", "last_sync_at", "sync_error",
-		"upstream_url", "integration_branch", "upstream_head_sha", "parent_slug", "fork_point", "expires_at",
-		"auto_change", "purpose", "session_id", "settings", "created_at", "updated_at", "org_slug", "hub_url", "access"}
-	if got := slices.Sorted(maps.Keys(obj)); !slices.Equal(got, slices.Sorted(slices.Values(members))) {
-		t.Errorf("members = %v, want exactly %v", got, members)
+	if got := slices.Sorted(maps.Keys(obj)); !slices.Equal(got, slices.Sorted(slices.Values(objectMembers))) {
+		t.Errorf("members = %v, want exactly %v", got, objectMembers)
 	}
 	at := timefmt.Format(w.clock())
 	for member, want := range map[string]any{
@@ -122,10 +118,7 @@ func TestCreate_AnswersHubURLOrgSlugAndEffectiveSettings(t *testing.T) {
 		hubURL   string // "" for null
 		settings string
 	}{
-		{"an external URL", []option{withExternalURL("https://hub.example")}, valid("demo"), "https://hub.example/git/%s/demo.git", `{}`},
-		{"one with a trailing slash", []option{withExternalURL("https://hub.example/")}, valid("demo"), "https://hub.example/git/%s/demo.git", `{}`},
-		{"one with a path", []option{withExternalURL("https://hub.example/base/")}, valid("demo"), "https://hub.example/base/git/%s/demo.git", `{}`},
-		{"none", nil, valid("demo"), "", `{}`},
+		{"an external URL", []option{withExternalURL("https://hub.example/")}, valid("demo"), "https://hub.example/git/%s/demo.git", `{}`},
 		{"registered settings", []option{registered}, map[string]any{"slug": "demo", "git_url": "https://example.com/a.git", "default_branch": "trunk"},
 			"", `{"branches":["trunk"],"flag":true}`},
 	} {

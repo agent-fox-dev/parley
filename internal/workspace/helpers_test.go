@@ -224,11 +224,31 @@ func (w *world) create(t *testing.T, cred string, body any) answer {
 	return answer{status, b}
 }
 
+// get asks GET /workspaces/<slug> with cred as the bearer credential.
+func (w *world) get(t *testing.T, cred, slug string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodGet, "/api/v1/workspaces/"+slug, cred, nil)
+	return answer{status, b}
+}
+
+// objectMembers are the members of every workspace object.
+var objectMembers = []string{"slug", "kind", "workspace_mode", "git_url", "default_branch", "owner_id", "org_id",
+	"status", "display_name", "description", "head_sha", "origin_head_sha", "clone_error", "last_sync_at",
+	"sync_error", "upstream_url", "integration_branch", "upstream_head_sha", "parent_slug", "fork_point",
+	"expires_at", "auto_change", "purpose", "session_id", "settings", "created_at", "updated_at", "org_slug",
+	"hub_url", "access"}
+
 // object decodes a, which must be 201, as a workspace object.
 func (a answer) object(t *testing.T) map[string]any {
 	t.Helper()
-	if a.status != http.StatusCreated {
-		t.Fatalf("answer = %d %s, want 201", a.status, a.body)
+	return a.decode(t, http.StatusCreated)
+}
+
+// decode decodes a, which must have the status want, as a JSON object.
+func (a answer) decode(t *testing.T, want int) map[string]any {
+	t.Helper()
+	if a.status != want {
+		t.Fatalf("answer = %d %s, want %d", a.status, a.body, want)
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(a.body, &obj); err != nil {
@@ -665,17 +685,50 @@ func eventually(t *testing.T, what string, cond func() bool) {
 // create.
 func (w *world) insertRecord(t *testing.T, slug string, status workspace.Status, created time.Time, url string) {
 	t.Helper()
+	w.put(t, workspace.Workspace{Slug: slug, Status: status, GitURL: &url, CreatedAt: created})
+}
+
+// put stores the workspace record rec, with what it leaves zero filled in
+// as a create would: a standard repository of the user u in u's personal
+// org, pending, created and updated at the hub's time, with an instance id.
+func (w *world) put(t *testing.T, rec workspace.Workspace) {
+	t.Helper()
+	if rec.Kind == "" {
+		rec.Kind = access.KindRepository
+	}
+	if rec.Mode == "" {
+		rec.Mode = workspace.ModeStandard
+	}
+	if rec.OwnerID == "" {
+		rec.OwnerID = w.u
+	}
+	if rec.OrgID == "" {
+		rec.OrgID = w.uOrg.ID
+	}
+	if rec.Status == "" {
+		rec.Status = workspace.StatusPending
+	}
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = w.clock()
+	}
+	if rec.UpdatedAt.IsZero() {
+		rec.UpdatedAt = rec.CreatedAt
+	}
+	rec.InstanceID = workspace.NewInstanceID()
 	ctx := context.Background()
-	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		return workspace.Insert(ctx, tx, workspace.Workspace{
-			Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard, GitURL: &url,
-			OwnerID: w.u, OrgID: w.uOrg.ID, Status: status, CreatedAt: created, UpdatedAt: created,
-			InstanceID: workspace.NewInstanceID(),
-		})
-	})
-	if err != nil {
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, rec) }); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// acme creates the org acme with the users u and v as members and returns
+// its id.
+func (w *world) acme(t *testing.T) string {
+	t.Helper()
+	id := w.CreateOrg(t, "acme")
+	w.AddMember(t, id, w.u)
+	w.AddMember(t, id, w.v)
+	return id
 }
 
 // setPending puts the workspace slug back to pending with its other clone

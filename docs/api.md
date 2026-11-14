@@ -1163,6 +1163,38 @@ given):
 {"seq":12,"id":"…","type":"parley.workspace.create","time":"2026-11-14T10:30:15Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"create","session_id":null,"metadata":{"default_branch":null,"git_url":"https://example.com/a.git","kind":"repository","workspace_mode":"standard"}}
 ```
 
+## `GET /api/v1/workspaces/{slug}`
+
+Answers the workspace `{slug}` to a caller who can read it, in every status
+(`pending`, `cloning`, `ready`, `failed`, `archived`) and for a repository
+workspace and a task fork alike. It takes the admin token, an API key or a
+PAT, and declares the scope `workspaces:read` for a PAT, which a PAT holding
+`workspaces:write` also satisfies. It needs read access to the workspace
+(see [Workspace access](#workspace-access)).
+
+The checks run in this order: a bound PAT on a workspace outside its
+binding (`404`, see [Workspace-bound tokens](#workspace-bound-tokens)); a
+PAT with neither `workspaces:read` nor `workspaces:write` (`403`), before
+the workspace is looked up, so the answer is the same for a slug a
+workspace has and for one no workspace has; then the access check, which
+answers a caller who cannot read the workspace with the same status and
+the same bytes as a slug no workspace has, archived or not.
+
+The answer is the workspace object, the same object `POST
+/api/v1/workspaces` answers (see there), with `access` the caller's level on
+the workspace: `admin` for the admin token, `owner` for its owner, `member`
+for an active member of its org, whatever scopes the caller's PAT holds.
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is the workspace object |
+| `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+
+```json
+{"error":{"code":404,"message":"workspace not found","error_type":"not_found"}}
+```
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to
