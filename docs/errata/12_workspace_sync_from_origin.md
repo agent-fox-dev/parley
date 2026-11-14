@@ -52,6 +52,31 @@ ref that must not exist, and also answers `gitrepo.ErrRefMoved`, changing
 nothing, when another writer holds the ref's lock, since that writer is
 moving it at that moment.
 
+## Refs whose name a ref only the hub has is in the way of
+
+The package's six branch results do not cover a branch of origin that the
+hub cannot create because a ref only the hub has holds a conflicting name:
+git keeps ref names as a tree of files and cannot hold both
+`refs/heads/feat` and `refs/heads/feat/x`, or both `refs/heads/topic` and
+`refs/heads/topic/a`. Such a hub-only branch must stay untouched, so the
+sync neither removes nor renames it.
+
+- `(*gitrepo.Repo).CompareAndSwapRef` answers `gitrepo.ErrRefNameConflict`,
+  changing nothing, when the ref it is to create has a ref in the way of its
+  name, read from the repository's refs after git refused, not from git's
+  message.
+- Such a branch is reported with a seventh result, `name_conflict`
+  (`workspace.BranchNameConflict`), with `local_sha` `""` and `origin_sha`
+  origin's head; it is not created, no branch-move observer is told, and it
+  is not in the event's `updated`. The event's `metadata` gains the list
+  `name_conflict`, `[]` when empty, like the other results. The other
+  branches are synced and the completion is recorded as usual; with
+  `reset_to_origin=true` the result is the same. `--fail-on-diverged` does
+  not count it: nothing has diverged.
+- A tag of origin with such a conflict (`v1/rc` beside the hub's `v1`) is
+  skipped, as a tag the hub has already is: it is not created and not in
+  `updated`, and the sync goes on.
+
 ## The sync route
 
 - There is no `internal/workspace/routes.go`: the workspace routes are the
