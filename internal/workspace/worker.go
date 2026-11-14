@@ -31,8 +31,10 @@ type Workers struct {
 	queue   []string
 	held    map[string]bool
 	stopped bool
+	// started is set by Start.
+	started bool
 	// cancel ends the context of the running clones; done is closed once
-	// every worker has returned. Both are set by Start.
+	// every worker has returned. Both are set by Launch.
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -41,7 +43,7 @@ type Workers struct {
 // given, the clone work of svc (Service.Clone) when work is nil. Fewer than
 // one worker could never clone anything, so a size below 1 is refused with
 // an error that names the configuration key it comes from. No worker runs
-// before Start.
+// before Launch.
 func NewWorkers(size int, svc *Service, work func(ctx context.Context, slug string) error) (*Workers, error) {
 	if size < 1 {
 		return nil, fmt.Errorf("[workspace].workers must be at least 1, got %d", size)
@@ -55,15 +57,16 @@ func NewWorkers(size int, svc *Service, work func(ctx context.Context, slug stri
 }
 
 // Start removes what clones interrupted by an earlier stop left in the
-// repository root, queues the clone work of every workspace in pending or
-// cloning in the order it was recorded (CloneWork), and starts the workers.
-// It returns once all of it is queued, so that the hub listens only after
-// the work of before the start is ahead of any new one. The clones run
-// until Stop, or until ctx ends, which stops the workers as Stop does
-// without waiting for them. Start runs once; a second call is an error.
+// repository root and queues the clone work of every workspace in pending
+// or cloning in the order it was recorded (CloneWork). It runs no clone:
+// the hub calls it before it listens, so that the work of before the start
+// is ahead of any new one, and launches the workers only once it serves, so
+// that a start that fails after it leaves nothing running. Start runs once;
+// a second call is an error.
 func (wk *Workers) Start(ctx context.Context) error {
 	wk.mu.Lock()
-	started := wk.done != nil
+	started := wk.started
+	wk.started = true
 	wk.mu.Unlock()
 	if started {
 		return errors.New("the clone workers are started already")
@@ -78,13 +81,24 @@ func (wk *Workers) Start(ctx context.Context) error {
 	for _, slug := range slugs {
 		wk.Enqueue(slug)
 	}
+	return nil
+}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	context.AfterFunc(runCtx, wk.halt)
-	done := make(chan struct{})
+// Launch starts the workers on the work queued so far and on what Enqueue
+// adds later. The clones run until Stop, or until ctx ends, which stops the
+// workers as Stop does without waiting for them. Launch runs once; a second
+// call is an error.
+func (wk *Workers) Launch(ctx context.Context) error {
 	wk.mu.Lock()
+	if wk.done != nil {
+		wk.mu.Unlock()
+		return errors.New("the clone workers are launched already")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	wk.cancel, wk.done = cancel, done
 	wk.mu.Unlock()
+	context.AfterFunc(runCtx, wk.halt)
 	var wg sync.WaitGroup
 	for range wk.size {
 		wg.Go(func() { wk.run(runCtx) })
@@ -99,7 +113,7 @@ func (wk *Workers) Start(ctx context.Context) error {
 // Enqueue records that the workspace slug has clone work: it waits behind
 // the work recorded before it until a worker is free. The hub calls it once
 // the transaction that recorded the work has committed, as does a feature
-// that puts a workspace back to pending. A slug already waiting or running
+// that puts a workspace back to pending, through Service.Enqueue. A slug already waiting or running
 // is not queued again, and nothing is queued after Stop.
 func (wk *Workers) Enqueue(slug string) {
 	wk.mu.Lock()
@@ -115,8 +129,10 @@ func (wk *Workers) Enqueue(slug string) {
 // Stop stops the workers: they take no more work, the running clones are
 // cancelled, which kills their git processes, and the clones in progress
 // are removed. The status of an interrupted workspace is left as it is, so
-// that the next Start takes its work up again. Stop returns nil once every
-// worker has returned, or ctx's error when ctx ends first.
+// that the next Start takes its work up again. Once every worker has
+// returned, Stop removes the clones in progress and returns the error of
+// that removal, nil when it succeeds; it returns ctx's error when ctx ends
+// before the workers return. Workers never launched have nothing to stop.
 func (wk *Workers) Stop(ctx context.Context) error {
 	wk.halt()
 	wk.mu.Lock()
@@ -198,4 +214,15 @@ func (s *Service) removeCloneDirs() error {
 		}
 	}
 	return nil
+}
+
+// Enqueue hands the workspace slug to the clone workers (Deps.Notify). It is
+// for the features that put a workspace back to pending, which call it once
+// the transaction that did so has committed; the workers are the hub's, out
+// of their reach. Without a Notify it tells no one, and the work waits for
+// the next start.
+func (s *Service) Enqueue(slug string) {
+	if s.deps.Notify != nil {
+		s.deps.Notify(slug)
+	}
 }

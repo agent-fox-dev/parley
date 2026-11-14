@@ -280,6 +280,11 @@ func (g Git) run(ctx context.Context, cred Credential, args ...string) ([]byte, 
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=" + os.DevNull,
 		"GIT_TERMINAL_PROMPT=0",
+		// ssh reads a password or a host key answer from the terminal, which
+		// GIT_TERMINAL_PROMPT does not stop: batch mode makes it fail
+		// instead of hanging a git@ origin's call. Env comes later, so a
+		// caller's GIT_SSH_COMMAND replaces it.
+		"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
 		"LC_ALL=C",
 	}, g.Env...), credentialEnv(dir, cred)...)
 	var stdout bytes.Buffer

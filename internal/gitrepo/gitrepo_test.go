@@ -19,18 +19,6 @@ import (
 // token is the origin's password in the credential tests.
 const token = "tok-123"
 
-// history builds main (the default branch) with three commits, dev with one
-// more on top of the second, and the tag v1 on main's first commit. It
-// returns the heads of main and dev and the tag's commit.
-func history(o *gitrepotest.Origin) (mainHead, devHead, v1 string) {
-	v1 = o.Commit("main", "first")
-	o.Branch("dev", o.Commit("main", "second"))
-	devHead = o.Commit("dev", "on dev")
-	mainHead = o.Commit("main", "third")
-	o.Tag("v1", v1)
-	return mainHead, devHead, v1
-}
-
 // argvLog records the arguments of every git invocation.
 type argvLog struct {
 	mu   sync.Mutex
@@ -60,7 +48,7 @@ func (l *argvLog) containing(s string) string {
 func TestCredential_ReachesGitOnlyThroughTheEnvironment(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", token))
-	mainHead, _, _ := history(o)
+	mainHead, _, _ := o.History()
 	log := &argvLog{}
 	g := gitrepo.Git{Env: o.Env(), Trace: log.trace}
 	ctx := context.Background()
@@ -147,7 +135,7 @@ func TestListRemote_ReportsBranchesTagsAndTheDefaultBranch(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			o := gitrepotest.NewOrigin(t)
-			mainHead, devHead, v1 := history(o)
+			mainHead, devHead, v1 := o.History()
 			o.SetDefaultBranch(c.defaultBranch)
 			got, err := gitrepo.Git{Env: o.Env()}.ListRemote(context.Background(), o.URL(), gitrepo.Credential{})
 			if err != nil {
@@ -177,7 +165,7 @@ func TestListRemote_AnswersAnEmptyOriginWithNoBranches(t *testing.T) {
 func TestClone_MakesABareCopyWithEveryBranchTagAndFullHistory(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	mainHead, devHead, v1 := history(o)
+	mainHead, devHead, v1 := o.History()
 	g := gitrepo.Git{Env: o.Env()}
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "copy.git")
@@ -208,7 +196,7 @@ func TestClone_MakesABareCopyWithEveryBranchTagAndFullHistory(t *testing.T) {
 		{"rev-list --count main", "3"},
 		{"rev-parse refs/tags/v1", v1},
 	} {
-		if got := gitOut(t, dir, strings.Fields(c.args)...); got != c.want {
+		if got := gitrepotest.Git(t, dir, strings.Fields(c.args)...); got != c.want {
 			t.Errorf("git %s = %q, want %q", c.args, got, c.want)
 		}
 	}
@@ -223,7 +211,7 @@ func TestClone_MakesABareCopyWithEveryBranchTagAndFullHistory(t *testing.T) {
 func TestRepo_WritesOriginHeadsConfigAndTheDefaultBranch(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	mainHead, devHead, _ := history(o)
+	mainHead, devHead, _ := o.History()
 	g := gitrepo.Git{Env: o.Env()}
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "copy.git")
@@ -248,7 +236,7 @@ func TestRepo_WritesOriginHeadsConfigAndTheDefaultBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertRefs(t, "OriginHeads", heads, map[string]string{"main": mainHead, "dev": devHead})
-	if got := gitOut(t, dir, "rev-parse", "refs/remotes/origin/dev"); got != devHead {
+	if got := gitrepotest.Git(t, dir, "rev-parse", "refs/remotes/origin/dev"); got != devHead {
 		t.Errorf("refs/remotes/origin/dev = %q, want %s", got, devHead)
 	}
 	if err := repo.DeleteOriginHead(ctx, "dev"); err != nil {
@@ -339,6 +327,38 @@ func TestGit_EndsWithTheContextAndLeavesNoGitProcess(t *testing.T) {
 	}
 }
 
+// Not parallel: it puts a fake ssh first on the PATH of the test process,
+// which git finds through the PATH it is given.
+func TestGit_RunsSSHInBatchModeUnlessTheCallerGivesItsOwnCommand(t *testing.T) {
+	bin := t.TempDir()
+	argsFile := filepath.Join(bin, "args")
+	script := "#!/bin/sh\necho \"$*\" > '" + argsFile + "'\nexit 255\n"
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, c := range []struct {
+		name            string
+		env             []string
+		want, wantNever string
+	}{
+		{"the minimal environment", nil, "-o BatchMode=yes", ""},
+		{"a caller's GIT_SSH_COMMAND", []string{"GIT_SSH_COMMAND=ssh -o ConnectTimeout=1"}, "-o ConnectTimeout=1", "BatchMode"},
+	} {
+		_ = os.Remove(argsFile)
+		if _, err := (gitrepo.Git{Env: c.env}).ListRemote(context.Background(), "git@example.invalid:a/b.git", gitrepo.Credential{}); err == nil {
+			t.Errorf("%s: ListRemote over the failing ssh = nil, want an error", c.name)
+		}
+		got, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("%s: git never ran ssh: %v", c.name, err)
+		}
+		if !strings.Contains(string(got), c.want) || (c.wantNever != "" && strings.Contains(string(got), c.wantNever)) {
+			t.Errorf("%s: ssh ran with %q, want %q and no %q", c.name, got, c.want, c.wantNever)
+		}
+	}
+}
+
 // silentListener accepts connections and never answers them.
 type silentListener struct {
 	url  string
@@ -407,15 +427,4 @@ func assertRefs(t *testing.T, what string, got, want map[string]string) {
 			t.Errorf("%s[%s] = %q, want %s", what, name, got[name], id)
 		}
 	}
-}
-
-// gitOut runs git on the bare repository dir and returns its trimmed
-// output.
-func gitOut(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	out, err := exec.Command("git", append([]string{"--git-dir", dir}, args...)...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v: %s", args, err, out)
-	}
-	return strings.TrimSpace(string(out))
 }

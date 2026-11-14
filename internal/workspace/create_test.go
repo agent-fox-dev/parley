@@ -95,25 +95,6 @@ func TestCreate_RecordsAPendingRepositoryAndAnswersTheWholeObject(t *testing.T) 
 	if got := w.notifications(); !slices.Equal(got, []string{"demo"}) {
 		t.Errorf("clone notifications = %v, want [demo]", got)
 	}
-
-	for _, c := range []struct {
-		name   string
-		extra  map[string]any
-		member string
-		want   string
-	}{
-		{"an empty display_name", map[string]any{"display_name": ""}, "display_name", "demo-2"},
-		{"a given display_name", map[string]any{"display_name": "Demo"}, "display_name", "Demo"},
-		{"a given description", map[string]any{"description": "the demo"}, "description", "the demo"},
-		{"a given default_branch", map[string]any{"default_branch": "trunk"}, "default_branch", "trunk"},
-	} {
-		body := valid("demo-2")
-		maps.Copy(body, c.extra)
-		if got := w.create(t, w.uKey, body).object(t)[c.member]; got != c.want {
-			t.Errorf("with %s: %s = %#v, want %q", c.name, c.member, got, c.want)
-		}
-		w.deleteRecord(t, "demo-2")
-	}
 }
 
 func TestCreate_AnswersHubURLOrgSlugAndEffectiveSettings(t *testing.T) {
@@ -407,7 +388,9 @@ func TestCreate_StoresAndAnswersTheOptionalMembers(t *testing.T) {
 		extra map[string]any
 		want  map[string]any // members of the answer; a display_name of "" stands for the slug
 	}{
+		{"display_name empty", map[string]any{"display_name": ""}, map[string]any{"display_name": ""}},
 		{"display_name of 128 two-byte characters", map[string]any{"display_name": twoByte}, map[string]any{"display_name": twoByte}},
+		{"default_branch given", map[string]any{"default_branch": "trunk"}, map[string]any{"default_branch": "trunk"}},
 		{"description of 1024 characters", map[string]any{"description": long}, map[string]any{"description": long}},
 		{"default_branch, display_name and description null", map[string]any{"default_branch": nil, "display_name": nil, "description": nil},
 			map[string]any{"default_branch": nil, "display_name": "", "description": ""}},

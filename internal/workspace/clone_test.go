@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,18 +17,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// history builds main (the default branch) with three commits, dev with one
-// more on top of the second, and the tag v1 on main's first commit. It
-// returns the heads of main and dev and the tag's commit.
-func history(o *gitrepotest.Origin) (mainHead, devHead, v1 string) {
-	v1 = o.Commit("main", "first")
-	o.Branch("dev", o.Commit("main", "second"))
-	devHead = o.Commit("dev", "on dev")
-	mainHead = o.Commit("main", "third")
-	o.Tag("v1", v1)
-	return mainHead, devHead, v1
-}
 
 // createFrom creates the workspace slug of the user u whose origin is url,
 // with members added to the body, and returns its record.
@@ -70,22 +59,10 @@ func (w *world) leftovers(t *testing.T, slug string) []string {
 	return out
 }
 
-// gitIn runs git on the repository dir and returns its trimmed output.
-func gitIn(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	cmd := exec.Command("git", append([]string{"--git-dir=" + dir}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("git %v in %s: %v", args, dir, err)
-	}
-	return strings.TrimSpace(string(out))
-}
-
 func TestClone_MarksTheWorkspaceCloningWithoutTheOldErrorBeforeAskingOrigin(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o))
 	w.createFrom(t, "demo", o.URL(), nil)
 	old := "old"
@@ -121,7 +98,7 @@ func TestClone_MarksTheWorkspaceCloningWithoutTheOldErrorBeforeAskingOrigin(t *t
 func TestClone_HoldsEveryBranchAndTagWithFullHistoryAndTheOriginHeads(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	mainHead, devHead, v1 := history(o)
+	mainHead, devHead, v1 := o.History()
 	w := newWorld(t, withGitOrigin(o))
 	for _, c := range []struct {
 		slug, branch, head string
@@ -156,7 +133,7 @@ func TestClone_HoldsEveryBranchAndTagWithFullHistoryAndTheOriginHeads(t *testing
 				"refs/remotes/origin/dev=" + devHead, "refs/remotes/origin/main=" + mainHead,
 				"refs/tags/v1=" + v1}, "\n")},
 		} {
-			if got := gitIn(t, dir, strings.Fields(q.args)...); got != q.want {
+			if got := gitrepotest.Git(t, dir, strings.Fields(q.args)...); got != q.want {
 				t.Errorf("%s: git %s = %q, want %q", c.slug, q.args, got, q.want)
 			}
 		}
@@ -177,7 +154,7 @@ func TestClone_HoldsEveryBranchAndTagWithFullHistoryAndTheOriginHeads(t *testing
 func TestClone_FailsNamingAGivenDefaultBranchOriginDoesNotHave(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o))
 	w.createFrom(t, "demo", o.URL(), map[string]any{"default_branch": "nope"})
 	rec := w.clone(t, "demo")
@@ -192,13 +169,30 @@ func TestClone_FailsNamingAGivenDefaultBranchOriginDoesNotHave(t *testing.T) {
 	}
 }
 
+// workerRounds hands slugs to one clone worker rounds times over, each
+// round once the work of the one before has ended, and waits for the last.
+func (w *world) workerRounds(t *testing.T, rounds int, slugs []string) {
+	t.Helper()
+	runs := &runLog{}
+	wk := w.startWorkers(t, 1, runs.around(w.svc.Clone))
+	for round := 1; round <= rounds; round++ {
+		for _, slug := range slugs {
+			wk.Enqueue(slug)
+		}
+		eventually(t, fmt.Sprintf("worker round %d", round), func() bool {
+			_, finished, _ := runs.snapshot()
+			return len(finished) == round*len(slugs)
+		})
+	}
+}
+
 func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testing.T) {
 	t.Parallel()
 	trusted := gitrepotest.NewOrigin(t)
 	w := newWorld(t, withGitOrigin(trusted))
 	served := func(opts ...gitrepotest.Option) *gitrepotest.Origin {
 		o := gitrepotest.NewOrigin(t, opts...)
-		history(o)
+		o.History()
 		return o
 	}
 	type outcome struct {
@@ -275,17 +269,11 @@ func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testi
 		failed = append(failed, outcome{slug, msg, o, o.Requests()})
 	}
 	// Three rounds of the workers over the failed workspaces start no clone.
-	runs := &runLog{}
-	wk := w.startWorkers(t, 1, runs.around(w.svc.Clone))
-	for round := 1; round <= 3; round++ {
-		for _, f := range failed {
-			wk.Enqueue(f.slug)
-		}
-		eventually(t, fmt.Sprintf("worker round %d", round), func() bool {
-			_, finished, _ := runs.snapshot()
-			return len(finished) == round*len(failed)
-		})
+	slugs := make([]string, len(failed))
+	for i, f := range failed {
+		slugs[i] = f.slug
 	}
+	w.workerRounds(t, 3, slugs)
 	for _, f := range failed {
 		if rec, _ := w.workspace(t, f.slug); rec.Status != workspace.StatusFailed || rec.CloneError == nil ||
 			*rec.CloneError != f.msg || f.origin.Requests() != f.asked {
@@ -295,10 +283,119 @@ func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testi
 	}
 }
 
+// commitOnMain adds a commit to main directly in the copy dir and returns
+// it.
+func commitOnMain(t *testing.T, dir string) string {
+	t.Helper()
+	id := gitrepotest.Git(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.com",
+		"commit-tree", "main^{tree}", "-p", "main", "-m", "made in the copy")
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/main", id)
+	return id
+}
+
+func TestClone_KeepsAValidCopyOfTheWorkspaceWithoutAskingOrigin(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	w := newWorld(t, withGitOrigin(o))
+	cases := []struct {
+		slug string
+		// forget removes default_branch from the record before the work.
+		forget bool
+		head   string
+	}{{slug: "kept"}, {slug: "kept-without-branch", forget: true}}
+	for i, c := range cases {
+		w.createFrom(t, c.slug, o.URL(), nil)
+		w.clone(t, c.slug)
+		cases[i].head = commitOnMain(t, w.svc.RepoPath(c.slug))
+		w.setPending(t, c.slug, c.forget)
+	}
+	asked := o.Requests()
+	o.Close()
+	for _, c := range cases {
+		rec := w.clone(t, c.slug)
+		if rec.Status != workspace.StatusReady || rec.HeadSHA == nil || *rec.HeadSHA != c.head ||
+			rec.DefaultBranch == nil || *rec.DefaultBranch != "main" {
+			t.Errorf("%s: status %s, head_sha %v, default_branch %v; want ready, the copy's head %s, main",
+				c.slug, rec.Status, rec.HeadSHA, rec.DefaultBranch, c.head)
+		}
+	}
+	if o.Requests() != asked {
+		t.Errorf("origin got %d requests, want none", o.Requests()-asked)
+	}
+}
+
+func TestClone_DiscardsWhatIsNotAValidCopyOfTheWorkspaceAndClonesFresh(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	mainHead, devHead, v1 := o.History()
+	w := newWorld(t, withGitOrigin(o))
+	// cloned makes a valid copy of slug with the marker branch stale.
+	cloned := func(slug string) string {
+		w.createFrom(t, slug, o.URL(), nil)
+		w.clone(t, slug)
+		dir := w.svc.RepoPath(slug)
+		gitrepotest.Git(t, dir, "update-ref", "refs/heads/stale", mainHead)
+		w.setPending(t, slug, false)
+		return dir
+	}
+	for i, c := range []struct {
+		name string
+		// place puts what lies at the copy's place of slug before the work.
+		place func(slug string)
+	}{
+		{"a plain file", func(slug string) {
+			w.createFrom(t, slug, o.URL(), nil)
+			if err := os.WriteFile(w.svc.RepoPath(slug), []byte("not a repository"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"an empty directory", func(slug string) {
+			w.createFrom(t, slug, o.URL(), nil)
+			if err := os.Mkdir(w.svc.RepoPath(slug), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a bare repository without commits", func(slug string) {
+			w.createFrom(t, slug, o.URL(), nil)
+			if out, err := exec.Command("git", "init", "--quiet", "--bare", w.svc.RepoPath(slug)).CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v: %s", err, out)
+			}
+		}},
+		{"a copy whose origin URL was changed", func(slug string) {
+			gitrepotest.Git(t, cloned(slug), "config", "--local", "remote.origin.url", "https://example.com/other.git")
+		}},
+		{"the copy of an earlier workspace of the same slug", func(slug string) {
+			cloned(slug)
+			w.deleteRecord(t, slug)
+			w.createFrom(t, slug, o.URL(), nil)
+		}},
+		{"a copy without an instance id", func(slug string) {
+			gitrepotest.Git(t, cloned(slug), "config", "--local", "--unset", "parley.workspace")
+		}},
+	} {
+		slug := "found-" + strconv.Itoa(i)
+		c.place(slug)
+		asked := o.Requests()
+		rec := w.clone(t, slug)
+		if rec.Status != workspace.StatusReady || rec.HeadSHA == nil || *rec.HeadSHA != mainHead {
+			t.Errorf("%s: status %s, head_sha %v; want ready at origin's main %s", c.name, rec.Status, rec.HeadSHA, mainHead)
+			continue
+		}
+		want := fmt.Sprintf("refs/heads/dev=%s\nrefs/heads/main=%s\nrefs/tags/v1=%s", devHead, mainHead, v1)
+		if got := gitrepotest.Git(t, w.svc.RepoPath(slug), "for-each-ref", "--format=%(refname)=%(objectname)", "refs/heads", "refs/tags"); got != want {
+			t.Errorf("%s: the copy holds\n%s\nwant origin's refs only\n%s", c.name, got, want)
+		}
+		if o.Requests() == asked {
+			t.Errorf("%s: origin got no request, want a fresh clone", c.name)
+		}
+	}
+}
+
 func TestClone_RunsTheModesStepOnceOnTheFreshCopyAndIsReadyWhenItFails(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o))
 	type seen struct {
 		status workspace.Status
@@ -344,5 +441,38 @@ func TestClone_RunsTheModesStepOnceOnTheFreshCopyAndIsReadyWhenItFails(t *testin
 	}
 	if log := w.Log.String(); !strings.Contains(log, "the post-clone step broke") {
 		t.Errorf("the hub's log holds no error of the step:\n%s", log)
+	}
+}
+
+func TestClone_StoppedAfterTheMoveIntoPlaceLeavesNothingAndRunsTheStepAtTheNextRun(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	w := newWorld(t, withGitOrigin(o))
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	runs := 0
+	// The first run of the step stands for a hub that stops while the step
+	// runs, with the copy at its place.
+	w.svc.RegisterPostCloneStep(workspace.ModeCarryPatch, func(stepCtx context.Context, _ workspace.Workspace, _ *gitrepo.Repo) error {
+		runs++
+		if runs == 1 {
+			stop()
+			return stepCtx.Err()
+		}
+		return nil
+	})
+	w.createFrom(t, "stopped", o.URL(), map[string]any{"workspace_mode": "carry_patch", "upstream_url": "https://example.com/up.git"})
+	if err := w.svc.Clone(ctx, "stopped"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("clone work stopped in the step = %v, want the context's end", err)
+	}
+	if rec, _ := w.workspace(t, "stopped"); rec.Status != workspace.StatusCloning {
+		t.Errorf("status %s after the stop, want cloning", rec.Status)
+	}
+	if left := w.leftovers(t, "stopped"); len(left) != 0 {
+		t.Errorf("the repository root holds %v after the stop, want nothing of the clone", left)
+	}
+	if rec := w.clone(t, "stopped"); rec.Status != workspace.StatusReady || runs != 2 {
+		t.Errorf("the next run left status %s with the step run %d times, want ready and 2", rec.Status, runs)
 	}
 }

@@ -81,16 +81,16 @@ func (s *Service) postCloneStep(mode string) PostCloneStep {
 // hub; a workspace in any other status, or none, is left alone, so that a
 // failed clone is never tried again on its own.
 //
-// A copy of this workspace already at its place, such as the one a stop
-// between the clone's move into place and ready leaves, is kept rather than
-// cloned again (see keepCopy); anything else there is replaced by a fresh
-// clone.
+// A copy of this workspace already at its place, such as the one a hub that
+// ended without its stop (killed) between the clone's move into place and
+// ready leaves, is kept rather than cloned again (see keepCopy); anything
+// else there is replaced by a fresh clone.
 //
 // A failure is recorded, never retried, and Clone returns nil for it. When
-// ctx ends first (the hub stops), the clone in progress is removed and the
-// status is left as it is, so that the next start takes the work up again;
-// Clone then returns ctx's error. Any other error means the outcome could
-// not be recorded.
+// ctx ends first (the hub stops), the clone in progress is removed, the
+// copy too once it is at its place, and the status is left as it is, so
+// that the next start takes the work up again; Clone then returns ctx's
+// error. Any other error means the outcome could not be recorded.
 func (s *Service) Clone(ctx context.Context, slug string) error {
 	started, err := StartClone(ctx, s.deps.Store.Main(), slug, s.deps.Now())
 	if err != nil || !started {
@@ -136,7 +136,11 @@ func (s *Service) cloneFresh(ctx context.Context, w Workspace, cred Credential) 
 	if err != nil {
 		return fmt.Errorf("make a clone directory: %w", err)
 	}
-	defer func() { _ = gitrepo.Remove(tmp) }()
+	defer func() {
+		if err := gitrepo.Remove(tmp); err != nil {
+			s.deps.Logger.Warn("workspace clone directory removal failed", "slug", w.Slug, "error", err)
+		}
+	}()
 	if err := s.deps.Git.Clone(ctx, deref(w.GitURL), cred, tmp); err != nil {
 		return err
 	}
@@ -169,13 +173,28 @@ func (s *Service) cloneFresh(ctx context.Context, w Workspace, cred Credential) 
 	if err := os.Rename(tmp, dst); err != nil {
 		return fmt.Errorf("move the clone into place: %w", err)
 	}
-	head := branches[branch]
+	err = s.finishClone(ctx, w, branch, branches[branch])
+	if err != nil && ctx.Err() != nil {
+		// A stop leaves nothing at the copy's place, so that the next start
+		// clones afresh and runs the mode's post-clone step, which keepCopy
+		// would skip on the copy left here.
+		if rmErr := gitrepo.Remove(dst); rmErr != nil {
+			s.deps.Logger.Warn("workspace clone cleanup failed", "slug", w.Slug, "error", rmErr)
+		}
+	}
+	return err
+}
+
+// finishClone records the default branch branch and its head head of the
+// copy of w now at its place, runs the mode's post-clone step and sets the
+// status to ready.
+func (s *Service) finishClone(ctx context.Context, w Workspace, branch, head string) error {
 	w.DefaultBranch, w.HeadSHA, w.OriginHeadSHA, w.CloneError = &branch, &head, &head, nil
 	if err := s.recordClone(ctx, w, StatusCloning); err != nil {
 		return err
 	}
 	if step := s.postCloneStep(w.Mode); step != nil {
-		copied, err := s.deps.Git.Open(ctx, dst)
+		copied, err := s.deps.Git.Open(ctx, s.RepoPath(w.Slug))
 		if err == nil {
 			err = step(ctx, w, copied)
 		}

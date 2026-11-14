@@ -18,6 +18,7 @@ import (
 )
 
 func TestResolveOriginCredential_ReadsTheWorkspaceSecretsOnEveryCall(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	tokenAuth := func(tok string) workspace.Credential {
 		return workspace.Credential{Username: "x-token-auth", Password: tok}
@@ -62,6 +63,7 @@ func TestResolveOriginCredential_ReadsTheWorkspaceSecretsOnEveryCall(t *testing.
 }
 
 func TestResolveOriginCredential_ReturnsAReadErrorNeverNoCredential(t *testing.T) {
+	t.Parallel()
 	broken := errors.New("the secret store cannot be read")
 	cases := []struct {
 		name     string

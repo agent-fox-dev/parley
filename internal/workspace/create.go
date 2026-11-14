@@ -294,6 +294,12 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) error {
 	if req.Description != nil {
 		ws.Description = *req.Description
 	}
+	// Built before the commit, so that a workspace once committed and queued
+	// is always answered 201.
+	obj, err := s.render(ctx, ws, access.LevelOwner, org)
+	if err != nil {
+		return err
+	}
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		if err := s.deps.InsertWorkspace(ctx, tx, ws); err != nil {
 			return err
@@ -310,13 +316,7 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return fmt.Errorf("create workspace %q: %w", req.Slug, err)
 	}
-	if s.deps.Notify != nil {
-		s.deps.Notify(ws.Slug)
-	}
-	obj, err := s.RenderWorkspace(ctx, ws, access.LevelOwner)
-	if err != nil {
-		return err
-	}
+	s.Enqueue(ws.Slug)
 	server.WriteJSON(w, http.StatusCreated, obj)
 	return nil
 }

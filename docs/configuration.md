@@ -323,11 +323,15 @@ as it is and keeps `remaining` above `0`.
 | `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | passed on to every `git` process the hub runs against an origin, for origins behind a private certificate authority or a proxy (see below) |
 
 `parleyd` runs `git` with a fixed minimal environment, away from the
-configuration and credential stores of the account that runs it: no other
+configuration and credential stores of the account that runs it: apart from
+`PATH`, through which `git` and the programs it starts are found, no other
 variable of `parleyd`'s environment reaches `git`, so an origin whose
 certificate a private authority signed needs `GIT_SSL_CAINFO` (or
 `SSL_CERT_FILE`) set for `parleyd`, and an origin reached through a proxy
-needs the proxy variables. They are read once, when `parleyd` starts.
+needs the proxy variables. They are read once, when `parleyd` starts. The
+`ssh` of a `git@` origin runs in batch mode (`GIT_SSH_COMMAND=ssh -o
+BatchMode=yes`), so a call that would need a password or a host key answer
+fails rather than waits.
 
 ### Fixed values
 

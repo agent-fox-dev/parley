@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -44,10 +46,13 @@ type world struct {
 	uOrg, vOrg identity.Org
 
 	// mu guards now, the hub's time, which a test may advance while the hub
-	// reads it, notified, fault and availableCalls.
+	// reads it, notified, slugs, fault and availableCalls.
 	mu       sync.Mutex
 	now      time.Time
 	notified []string
+	// slugs are the workspace slugs a create named or a secret was stored
+	// for: the scopes a test can find secrets in.
+	slugs map[string]bool
 	// fault names the write of a create that fails, "" for none: one of
 	// faultInsert, faultSecret and faultEvent.
 	fault string
@@ -210,6 +215,11 @@ type answer struct {
 // create posts body to POST /workspaces with cred as the bearer credential.
 func (w *world) create(t *testing.T, cred string, body any) answer {
 	t.Helper()
+	if m, ok := body.(map[string]any); ok {
+		if slug, ok := m["slug"].(string); ok {
+			w.useSlug(slug)
+		}
+	}
 	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces", cred, body)
 	return answer{status, b}
 }
@@ -259,14 +269,46 @@ func (w *world) workspaces(t *testing.T) int {
 	return n
 }
 
-// stored is the number of workspace records and of secrets the store holds,
-// -1 for a count that cannot be read; it may run outside the test's
-// goroutine.
+// stored is the number of workspace records and of secrets the store holds
+// (see secretCount), -1 for a count that cannot be read; it may run outside
+// the test's goroutine.
 func (w *world) stored() (workspaces, secrets int) {
-	workspaces, secrets = -1, -1
+	workspaces = -1
 	_ = w.Store.Main().QueryRow(`SELECT count(*) FROM workspaces`).Scan(&workspaces)
-	_ = w.Store.Main().QueryRow(`SELECT count(*) FROM secrets`).Scan(&secrets)
+	secrets, err := w.secretCount()
+	if err != nil {
+		secrets = -1
+	}
 	return workspaces, secrets
+}
+
+// useSlug adds slug to the scopes secretCount counts.
+func (w *world) useSlug(slug string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.slugs == nil {
+		w.slugs = map[string]bool{}
+	}
+	w.slugs[slug] = true
+}
+
+// secretCount is the number of secrets the secret component holds in the
+// scopes the tests use: the workspace scope of every slug a create named or
+// a secret was stored for. The component counts one scope at a time, and a
+// create stores secrets in no other.
+func (w *world) secretCount() (int, error) {
+	w.mu.Lock()
+	slugs := slices.Collect(maps.Keys(w.slugs))
+	w.mu.Unlock()
+	total := 0
+	for _, slug := range slugs {
+		n, err := w.secrets.Count(context.Background(), secret.ScopeWorkspace, slug)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // fail makes the write named fault of every create fail until it is called
@@ -338,15 +380,15 @@ func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (eve
 }
 
 // footprint is what a refused create leaves as it found it: the workspace
-// records, the secrets of every scope, the create events and the calls to
-// origin.
+// records, the secrets (see secretCount), the create events and the calls
+// to origin.
 type footprint struct{ workspaces, secrets, events, originCalls int }
 
 // footprint counts what the hub holds and what origin was asked.
 func (w *world) footprint(t *testing.T) footprint {
 	t.Helper()
-	var secrets int
-	if err := w.Store.Main().QueryRow(`SELECT count(*) FROM secrets`).Scan(&secrets); err != nil {
+	secrets, err := w.secretCount()
+	if err != nil {
 		t.Fatal(err)
 	}
 	return footprint{w.workspaces(t), secrets, len(w.createEvents(t)), w.origin.called()}
@@ -468,6 +510,7 @@ func (o *fakeOrigin) called() int {
 // component.
 func (w *world) putSecret(t *testing.T, slug, name, value string) {
 	t.Helper()
+	w.useSlug(slug)
 	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
 		return w.secrets.Put(context.Background(), tx, secret.ScopeWorkspace, slug, name, value)
 	})
@@ -535,9 +578,9 @@ func (g *recordingGit) invocations() int {
 	return g.calls
 }
 
-// startWorkers starts clone workers of size on the world's service that run
-// work, nil for the service's clone work, and stops them when the test
-// ends.
+// startWorkers starts and launches clone workers of size on the world's
+// service that run work, nil for the service's clone work, and stops them
+// when the test ends.
 func (w *world) startWorkers(t *testing.T, size int, work func(context.Context, string) error) *workspace.Workers {
 	t.Helper()
 	wk, err := workspace.NewWorkers(size, w.svc, work)
@@ -545,6 +588,9 @@ func (w *world) startWorkers(t *testing.T, size int, work func(context.Context, 
 		t.Fatal(err)
 	}
 	if err := wk.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := wk.Launch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

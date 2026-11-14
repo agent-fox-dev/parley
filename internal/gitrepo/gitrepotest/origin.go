@@ -276,12 +276,43 @@ func (o *Origin) git(stdin string, args ...string) string {
 	return out
 }
 
-// run runs git on the origin's repository, away from the user's and the
-// system's git configuration, with a fixed author.
+// run runs git on the origin's repository (see gitIn).
 func (o *Origin) run(stdin string, args ...string) (string, error) {
+	return gitIn(o.dir, stdin, args...)
+}
+
+// History builds on the origin main (the default branch) with three
+// commits, dev with one more on top of the second, and the tag v1 on main's
+// first commit. It returns the heads of main and dev and the tag's commit.
+func (o *Origin) History() (mainHead, devHead, v1 string) {
+	o.t.Helper()
+	v1 = o.Commit("main", "first")
+	o.Branch("dev", o.Commit("main", "second"))
+	devHead = o.Commit("dev", "on dev")
+	mainHead = o.Commit("main", "third")
+	o.Tag("v1", v1)
+	return mainHead, devHead, v1
+}
+
+// Git runs git on the repository whose git directory is dir, such as a
+// copy the code under test made, and returns its trimmed output, failing
+// the test on an error.
+func Git(t testing.TB, dir string, args ...string) string {
+	t.Helper()
+	out, err := gitIn(dir, "", args...)
+	if err != nil {
+		t.Fatalf("in %s: %v", dir, err)
+	}
+	return out
+}
+
+// gitIn runs git on the repository whose git directory is dir with stdin as
+// its input, away from the user's and the system's git configuration, with
+// a fixed author, and returns its trimmed standard output.
+func gitIn(dir, stdin string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Env = append(os.Environ(),
-		"GIT_DIR="+o.dir,
+		"GIT_DIR="+dir,
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_AUTHOR_NAME=Origin", "GIT_AUTHOR_EMAIL=origin@example.invalid",

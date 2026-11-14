@@ -79,6 +79,13 @@ func (s *Service) RenderWorkspace(ctx context.Context, w Workspace, level access
 	if err != nil {
 		return Object{}, fmt.Errorf("render workspace %q: the org: %w", w.Slug, err)
 	}
+	return s.render(ctx, w, level, org)
+}
+
+// render is RenderWorkspace with the workspace's org org already read, for
+// a caller that has it, such as the create, which builds its answer before
+// it commits.
+func (s *Service) render(ctx context.Context, w Workspace, level access.Level, org identity.Org) (Object, error) {
 	o := Object{
 		Slug: w.Slug, Kind: w.Kind, WorkspaceMode: w.Mode, GitURL: w.GitURL, DefaultBranch: w.DefaultBranch,
 		OwnerID: w.OwnerID, OrgID: w.OrgID, OrgSlug: org.Slug, Status: string(w.Status),

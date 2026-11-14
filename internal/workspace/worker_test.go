@@ -2,7 +2,7 @@ package workspace_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,15 +12,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 func TestWorkers_TakeUpPendingAndCloningWorkInCreationOrderAtStart(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o))
 	at := func(s int) time.Time { return time.Date(2026, 1, 2, 10, 0, s, 0, time.UTC) }
 	w.insertRecord(t, "ws-c", workspace.StatusCloning, at(2), o.URL())
@@ -57,119 +61,10 @@ func TestWorkers_TakeUpPendingAndCloningWorkInCreationOrderAtStart(t *testing.T)
 	}
 }
 
-// commitOnMain adds a commit to main directly in the copy dir and returns
-// it.
-func commitOnMain(t *testing.T, dir string) string {
-	t.Helper()
-	id := gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.com",
-		"commit-tree", "main^{tree}", "-p", "main", "-m", "made in the copy")
-	gitIn(t, dir, "update-ref", "refs/heads/main", id)
-	return id
-}
-
-func TestClone_KeepsAValidCopyOfTheWorkspaceWithoutAskingOrigin(t *testing.T) {
-	t.Parallel()
-	o := gitrepotest.NewOrigin(t)
-	history(o)
-	w := newWorld(t, withGitOrigin(o))
-	cases := []struct {
-		slug string
-		// forget removes default_branch from the record before the work.
-		forget bool
-		head   string
-	}{{slug: "kept"}, {slug: "kept-without-branch", forget: true}}
-	for i, c := range cases {
-		w.createFrom(t, c.slug, o.URL(), nil)
-		w.clone(t, c.slug)
-		cases[i].head = commitOnMain(t, w.svc.RepoPath(c.slug))
-		w.setPending(t, c.slug, c.forget)
-	}
-	asked := o.Requests()
-	o.Close()
-	for _, c := range cases {
-		rec := w.clone(t, c.slug)
-		if rec.Status != workspace.StatusReady || rec.HeadSHA == nil || *rec.HeadSHA != c.head ||
-			rec.DefaultBranch == nil || *rec.DefaultBranch != "main" {
-			t.Errorf("%s: status %s, head_sha %v, default_branch %v; want ready, the copy's head %s, main",
-				c.slug, rec.Status, rec.HeadSHA, rec.DefaultBranch, c.head)
-		}
-	}
-	if o.Requests() != asked {
-		t.Errorf("origin got %d requests, want none", o.Requests()-asked)
-	}
-}
-
-func TestClone_DiscardsWhatIsNotAValidCopyOfTheWorkspaceAndClonesFresh(t *testing.T) {
-	t.Parallel()
-	o := gitrepotest.NewOrigin(t)
-	mainHead, devHead, v1 := history(o)
-	w := newWorld(t, withGitOrigin(o))
-	// cloned makes a valid copy of slug with the marker branch stale.
-	cloned := func(slug string) string {
-		w.createFrom(t, slug, o.URL(), nil)
-		w.clone(t, slug)
-		dir := w.svc.RepoPath(slug)
-		gitIn(t, dir, "update-ref", "refs/heads/stale", mainHead)
-		w.setPending(t, slug, false)
-		return dir
-	}
-	for i, c := range []struct {
-		name string
-		// place puts what lies at the copy's place of slug before the work.
-		place func(slug string)
-	}{
-		{"a plain file", func(slug string) {
-			w.createFrom(t, slug, o.URL(), nil)
-			if err := os.WriteFile(w.svc.RepoPath(slug), []byte("not a repository"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"an empty directory", func(slug string) {
-			w.createFrom(t, slug, o.URL(), nil)
-			if err := os.Mkdir(w.svc.RepoPath(slug), 0o700); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"a bare repository without commits", func(slug string) {
-			w.createFrom(t, slug, o.URL(), nil)
-			if out, err := exec.Command("git", "init", "--quiet", "--bare", w.svc.RepoPath(slug)).CombinedOutput(); err != nil {
-				t.Fatalf("git init: %v: %s", err, out)
-			}
-		}},
-		{"a copy whose origin URL was changed", func(slug string) {
-			gitIn(t, cloned(slug), "config", "--local", "remote.origin.url", "https://example.com/other.git")
-		}},
-		{"the copy of an earlier workspace of the same slug", func(slug string) {
-			cloned(slug)
-			w.deleteRecord(t, slug)
-			w.createFrom(t, slug, o.URL(), nil)
-		}},
-		{"a copy without an instance id", func(slug string) {
-			gitIn(t, cloned(slug), "config", "--local", "--unset", "parley.workspace")
-		}},
-	} {
-		slug := "found-" + strconv.Itoa(i)
-		c.place(slug)
-		asked := o.Requests()
-		rec := w.clone(t, slug)
-		if rec.Status != workspace.StatusReady || rec.HeadSHA == nil || *rec.HeadSHA != mainHead {
-			t.Errorf("%s: status %s, head_sha %v; want ready at origin's main %s", c.name, rec.Status, rec.HeadSHA, mainHead)
-			continue
-		}
-		want := fmt.Sprintf("refs/heads/dev=%s\nrefs/heads/main=%s\nrefs/tags/v1=%s", devHead, mainHead, v1)
-		if got := gitIn(t, w.svc.RepoPath(slug), "for-each-ref", "--format=%(refname)=%(objectname)", "refs/heads", "refs/tags"); got != want {
-			t.Errorf("%s: the copy holds\n%s\nwant origin's refs only\n%s", c.name, got, want)
-		}
-		if o.Requests() == asked {
-			t.Errorf("%s: origin got no request, want a fresh clone", c.name)
-		}
-	}
-}
-
 func TestWorkers_RunAtMostTheirNumberOfClonesFirstRecordedFirst(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o))
 	runs := &runLog{hold: make(chan struct{})}
 	wk := w.startWorkers(t, 2, runs.around(w.svc.Clone))
@@ -230,7 +125,7 @@ func gitChildren(t *testing.T) []string {
 // Not parallel: it counts the git processes of the whole test process.
 func TestWorkers_StopInterruptsACloneAndLeavesItForTheNextStart(t *testing.T) {
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o))
 	w.createFrom(t, "demo", o.URL(), nil)
 	o.Block()
@@ -239,6 +134,9 @@ func TestWorkers_StopInterruptsACloneAndLeavesItForTheNextStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := wk.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := wk.Launch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	wk.Enqueue("demo")
@@ -285,7 +183,7 @@ func TestNewWorkers_RefusesFewerThanOneWorker(t *testing.T) {
 func TestWorkers_CloneWhatTheHubCreatesAndWhatWasPendingAtItsStart(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
-	history(o)
+	o.History()
 	w := newWorld(t, withGitOrigin(o), withCloneWorkers())
 	ready := func(slug string) func() bool {
 		return func() bool { rec, _ := w.workspace(t, slug); return rec.Status == workspace.StatusReady }
@@ -298,4 +196,65 @@ func TestWorkers_CloneWhatTheHubCreatesAndWhatWasPendingAtItsStart(t *testing.T)
 	if _, err := (gitrepo.Git{}).Open(context.Background(), w.svc.RepoPath("waiting")); err != nil {
 		t.Errorf("no copy of the workspace pending at the start: %v", err)
 	}
+}
+
+func TestWorkers_CloneNothingWhenALaterPartStopsTheHubsStart(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	var configPath string
+	w := newWorld(t, withGitOrigin(o), withCompose(func(c *hub.Composition) {
+		c.AddStartHook("config-path", func(_ context.Context, rt *hub.Runtime) error {
+			configPath = rt.Config.Path
+			return nil
+		})
+	}))
+	w.insertRecord(t, "waiting", workspace.StatusPending, w.clock(), o.URL())
+	w.Stop()
+	if code := w.ExitCode(t, 10*time.Second); code != 0 {
+		t.Fatalf("the hub stopped with %d, want 0", code)
+	}
+	dir := filepath.Dir(configPath)
+	asked := o.Requests()
+	var log hubtest.LogBuffer
+	code := hub.Run(context.Background(), hub.Options{
+		Env: config.MapEnv(map[string]string{
+			"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir, secret.EnvCurrentKey: testKey, "GIT_SSL_CAINFO": o.CAFile(),
+		}),
+		WorkDir: dir, Stderr: &log,
+		Compose: func(c *hub.Composition) {
+			c.AddStartHook("refuses", func(context.Context, *hub.Runtime) error {
+				// Long enough for a clone already running to reach origin.
+				for deadline := time.Now().Add(500 * time.Millisecond); o.Requests() == asked && time.Now().Before(deadline); {
+					time.Sleep(5 * time.Millisecond)
+				}
+				return errors.New("a later part refuses to start")
+			})
+		},
+	})
+	if code == 0 || !strings.Contains(log.String(), "a later part refuses to start") {
+		t.Fatalf("the start returned %d, want it stopped by the refusing part; log:\n%s", code, log.String())
+	}
+	time.Sleep(100 * time.Millisecond)
+	if o.Requests() != asked {
+		t.Errorf("origin got %d requests from a hub whose start failed, want none", o.Requests()-asked)
+	}
+	w.Restart(t)
+	eventually(t, "the next start clones the waiting workspace", func() bool {
+		rec, _ := w.workspace(t, "waiting")
+		return rec.Status == workspace.StatusReady
+	})
+}
+
+func TestService_EnqueueHandsAPendingWorkspaceToTheCloneWorkers(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	w := newWorld(t, withGitOrigin(o), withCloneWorkers())
+	w.insertRecord(t, "back", workspace.StatusPending, w.clock(), o.URL())
+	w.svc.Enqueue("back")
+	eventually(t, "the workspace put back to pending is ready", func() bool {
+		rec, _ := w.workspace(t, "back")
+		return rec.Status == workspace.StatusReady
+	})
 }

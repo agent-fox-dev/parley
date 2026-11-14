@@ -10,13 +10,13 @@ import (
 )
 
 // workspacesHook is the name of the start hook that binds the workspace
-// service and starts its clone workers.
+// service and queues the clone work left from before the start.
 const workspacesHook = "workspaces"
 
-// cloneWork is the name of the background work that stops the clone
-// workers when the hub stops; cloneStopGrace is how long the stop waits for
-// them. A running clone ends as soon as its git process is killed, so the
-// grace only covers the cleanup after it.
+// cloneWork is the name of the background work that runs the clone workers
+// while the hub serves and stops them when the hub stops; cloneStopGrace is
+// how long the stop waits for them. A running clone ends as soon as its git
+// process is killed, so the grace only covers the cleanup after it.
 const (
 	cloneWork      = "workspace_clones"
 	cloneStopGrace = 10 * time.Second
@@ -25,7 +25,7 @@ const (
 // gitPassthrough are the variables of the hub's environment that every git
 // process gets: an operator whose origins sit behind a private certificate
 // authority or a proxy sets them for parleyd as for git itself. Nothing else
-// of the hub's environment reaches git.
+// of the hub's environment reaches git but PATH, which finds it.
 var gitPassthrough = []string{"GIT_SSL_CAINFO", "SSL_CERT_FILE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}
 
 // gitFor is the git the hub runs with the environment env: the variables of
@@ -58,9 +58,12 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // [server].external_url, [workspace].path, where the copies live, and the
 // workers, which are told about every workspace created, after every
 // adjuster AdjustWorkspace added has changed those dependencies. It then
-// starts the workers, which queue the clone work left from before the start,
-// so that it is queued before the hub listens; a refused number of workers
-// stops the start. The workers are stopped when the hub stops. The service
+// has the workers queue the clone work left from before the start, so that
+// it is queued before the hub listens; a refused number of workers stops the
+// start. The workers run in the background work, which begins only once the
+// hub listens, so that a start that fails after the hook leaves no clone
+// running over stores that are closed; they are stopped when the hub stops.
+// The service
 // exists from the composition on, so a later part keeps it through
 // Composition.Workspaces and registers its setting keys on
 // Workspaces().Settings() when it is composed.
@@ -101,6 +104,10 @@ func composeWorkspaces(c *Composition) {
 		return workers.Start(ctx)
 	})
 	c.AddBackgroundWork(cloneWork, cloneStopGrace, func(ctx context.Context, rt *Runtime) {
+		if err := workers.Launch(ctx); err != nil {
+			rt.Logger.Error("workspace clone workers did not start", "error", err)
+			return
+		}
 		<-ctx.Done()
 		stop, cancel := context.WithTimeout(context.Background(), cloneStopGrace)
 		defer cancel()
