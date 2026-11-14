@@ -22,8 +22,17 @@ func composeForks(c *Composition) {
 	c.forks = comp
 	c.AddSchemaStep(fork.SchemaStep)
 	c.workspaces.RegisterForkView(comp.WorkspaceView)
+	for _, r := range comp.Routes() {
+		c.AddRoute(r)
+	}
 	c.AddStartHook(forksHook, func(_ context.Context, rt *Runtime) error {
-		comp.Bind(fork.Deps{Store: rt.Store, Workspaces: c.workspaces, Git: gitFor(c.env)})
+		git := gitFor(c.env)
+		d := fork.Deps{Store: rt.Store, Workspaces: c.workspaces, Git: git, Events: c.Events(), Access: c.access,
+			Limits: rt.Config.Forks, Now: rt.Now, CreateRepo: git.CreateFork, Transact: rt.Store.Tx}
+		for _, adjust := range c.forkAdjusters {
+			adjust(&d)
+		}
+		comp.Bind(d)
 		return nil
 	})
 }
@@ -32,3 +41,11 @@ func composeForks(c *Composition) {
 // and the check of a write to one of its branches. A part keeps it when it
 // is composed; the component serves once its start hook has run.
 func (c *Composition) Forks() *fork.Component { return c.forks }
+
+// AdjustForks adds fn to the functions that change the fork component's
+// dependencies after the start hook has built them and before it binds
+// them, in the order they were added. Tests replace a collaborator with it,
+// such as the name generator or the repository creator.
+func (c *Composition) AdjustForks(fn func(*fork.Deps)) {
+	c.forkAdjusters = append(c.forkAdjusters, fn)
+}

@@ -1924,6 +1924,103 @@ readers of its parent's events, as the fork's other events are.
 | `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
 | `500` `internal` | the workspace is a task fork and no part of the hub deletes task forks (`workspace "<slug>" is a task fork, and no fork remover deletes it`): the fork is unchanged; or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
 
+## `POST /api/v1/workspaces/{slug}/forks`
+
+Creates a task fork of the repository workspace `{slug}`, its parent: a
+workspace that is `ready` at once, shares the parent's history without
+copying it, and is owned by the caller's user. It takes an API key or a PAT
+and declares the scope `workspaces:write` for a PAT and the level `read` on
+the parent (see [Workspace access](#workspace-access)), so an org member who
+can only read the parent can fork it, and a PAT bound to the parent can too.
+It is a create route (see [Idempotency](#idempotency)); a replay leaves out
+`token.token`.
+
+The body is a JSON object, or no body at all, which is `{}`; members the
+route does not read are ignored, and a member that is `null` counts as
+absent, so a client may send back what it read:
+
+| Member | Value |
+|---|---|
+| `name` | a string of 1 to 32 characters of `a` to `z`, digits and hyphens, starting and ending with a letter or digit, without two hyphens in a row; the fork's slug is `<parent slug>--<name>`. Absent, a name of 8 characters from `a` to `z` and digits, drawn from a cryptographic random source |
+| `ref` | a string, the short name of a branch of the parent, which becomes the fork's base branch and `default_branch`; absent, the parent's `default_branch` |
+| `ttl` | a string, a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`; `expires_at` is the creation time plus `ttl`. Absent, plus `[forks].default_ttl` (see [the configuration](configuration.md)) |
+| `auto_change` | `true` or `false`; absent, `true` |
+| `token` | an object `{name, permissions, paths}` of the token to mint with the fork, bound to it: `name` a string, absent `fork:<fork slug>`; `permissions` and `paths` lists of strings, judged by the minting component as for [`POST /api/v1/workspaces/{slug}/tokens`](#post-apiv1workspacesslugtokens). The token never expires |
+| `purpose` | a string; absent, `null` |
+
+```json
+{"name":"task1","ref":"release","ttl":"24h","purpose":"fix loader"}
+```
+
+The checks run in this order, the first that fails answering: a PAT without
+`workspaces:write` (`403`); the access rule for need `read` (`404` for a
+workspace the caller cannot read and for an unknown slug, with the same
+bytes); the admin token (`403`), before the body is read; the body, member
+by member in the order of the table (`400`); the parent's state (`409`);
+the base branch (`400`); a name a workspace already has (`409`); the token
+(`400`, `403`). A refused request records nothing.
+
+The fork's repository is an empty bare repository whose alternates file
+names the parent's object directory: no object is copied, and every commit
+of the parent, also one it receives later, is readable through it. Its
+place is the one every workspace copy has, `<[workspace].path>/<slug>.git`;
+a directory found there while no workspace has the slug is the leftover of
+a create that stopped, and is removed first. The fork is recorded with
+`kind` `fork`, `workspace_mode` `standard`, `status` `ready`, the caller as
+`owner_id`, the parent's `org_id`, `parent_slug` the parent, `display_name`
+the slug, `description` empty, `git_url`, `upstream_url` and
+`integration_branch` `null`, `fork_point` the base branch and the parent's
+head of it, the names of the parent's branches and tags as they are now as
+its tracking names (see [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug)),
+`expires_at`, `auto_change` and `purpose`, and, when a PAT authenticated
+the request, that PAT as its creating token, which lets a PAT bound to the
+parent reach the forks it created (see
+[Workspace-bound tokens](#workspace-bound-tokens)). The parent's state is
+judged again in the transaction, the fork, its token and a
+`parley.workspace.fork` event are written in that one transaction, and
+creates of forks of one parent run one at a time from the name check to the
+commit, so two requests for one name answer `201` and `409`. When the
+repository cannot be made, or the transaction or its commit fails, the
+repository directory is removed, nothing is recorded, and the answer is
+`500` `internal` without its cause.
+
+The answer has `workspace`, the fork's workspace object with `access`
+`owner` and `head_sha` the parent's head of the base branch; `remote`, the
+fork's `hub_url`, `null` when no external URL is configured; and, only when
+the body asked for one, `token`, the Token object with `workspace` the
+fork's slug and the secret in `token.token`, which no other answer carries:
+
+```json
+{"workspace":{"slug":"demo--task1","kind":"fork","workspace_mode":"standard","git_url":null,"default_branch":"release","owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"acme","status":"ready","display_name":"demo--task1","description":"","head_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":"demo","fork_point":{"ref":"release","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8"},"expires_at":"2026-11-15T10:30:15Z","auto_change":true,"purpose":"fix loader","session_id":null,"settings":{"sync_enabled":true,"…":"…"},"hub_url":"https://hub.example/git/acme/demo--task1.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"},"remote":"https://hub.example/git/acme/demo--task1.git"}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | the fork was created; the body is `{workspace, remote}`, and `token` when asked for |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token.token`; nothing is created |
+| `400` `invalid_request` | the body is not an object (the messages of [Request bodies](#request-bodies)), or a member is refused, the message naming it: `name: must be a string`, `name: must be 1 to 32 characters long`, `name: may hold only the letters a to z, digits and hyphens`, `name: must start with a letter or digit`, `name: must end with a letter or digit`, `name: must not contain two hyphens in a row`; `ref: must be a string`; `ttl: must be a string`, `ttl: must end in one unit: m, h or d` and the other duration rules, `ttl: must be at least 5m`, `ttl: must be at most 30d, the hub's [forks].max_ttl`; `auto_change: must be true or false`; `token: must be an object whose name is a string and whose permissions and paths are lists of strings`; `purpose: must be a string`; or the minting component refuses the token, with the messages of `POST /api/v1/user/tokens` |
+| `400` `fork_ref_not_found` | the base branch is not a branch of the parent: a tag, a commit id or a full ref name is not one (`ref: "nope" is not a branch of "demo"`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write`, or a token beyond what the calling PAT holds, with the subset rule's messages |
+| `403` `forbidden` | the admin token, whatever the body (`a fork needs a user as owner; the admin token cannot create one`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
+| `409` `workspace_busy` | the parent's clone has not finished, or a reclone, archive or delete runs on it |
+| `409` `workspace_archived` | the parent is archived |
+| `409` `workspace_not_ready` | the parent's clone failed |
+| `409` `conflict` | a workspace has the slug the given `name` makes (`name: "demo" has a fork "demo--task1"`) |
+| `500` `internal` | 8 generated names in a row were in use, or making the repository, writing the fork, its token or its event, or the commit failed; nothing is recorded |
+
+The event has `workspace` and `resource_id` the fork's slug,
+`resource_type` `workspace`, `actor_type` `api_key` or `pat` after the
+calling credential, `actor_id` the caller's user, `session_id` the fork's,
+and in `metadata` the fork's `parent_slug`, `fork_point`, `expires_at`,
+`auto_change` and `purpose` (`null` when it has none) and, when a token was
+minted, its `token_id`, never its value. The parent's readers see it (see
+[`GET /api/v1/events`](#get-apiv1events)).
+
+```json
+{"seq":31,"id":"…","type":"parley.workspace.fork","time":"2026-11-14T10:30:15Z","workspace":"demo--task1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo--task1","action":"fork","session_id":null,"metadata":{"auto_change":true,"expires_at":"2026-11-15T10:30:15Z","fork_point":{"ref":"release","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8"},"parent_slug":"demo","purpose":"fix loader"}}
+```
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

@@ -187,8 +187,10 @@ type Composition struct {
 	workspaceAdjusters []func(*workspace.Deps)
 
 	// forks is the fork component composeForks creates and binds in its
-	// start hook (Forks).
-	forks *fork.Component
+	// start hook (Forks), after forkAdjusters have changed its
+	// dependencies (AdjustForks).
+	forks         *fork.Component
+	forkAdjusters []func(*fork.Deps)
 
 	// env is the hub's environment, Options.Env, which a part's
 	// configuration check reads what the configuration file does not hold

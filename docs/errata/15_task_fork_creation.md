@@ -31,3 +31,37 @@ in two columns, `tracking_branches` and `tracking_tags`, added to the table
 rather than in a table of their own, so that they are removed with the
 fork's record by whatever removes it. The base branch is the record's
 `default_branch`.
+
+## Creates of one parent's forks run one at a time
+
+The package makes a fork's repository before the transaction and has a
+create discard a directory found at the new fork's place without a record;
+it leaves to the store's single writer that concurrent creates neither share
+a name nor pass the limit. The single writer serialises the transactions
+only, not the directory work before them, so one create could discard the
+repository another create of the same name had just made. The create
+therefore holds an in-process lock per parent slug from the name check to
+the commit: under it, a name a workspace has is refused (`409 conflict`) or,
+when generated, drawn again; only then is whatever lies at the fork's place
+removed as a leftover and the repository made. A duplicate slug at the
+insert is still answered `409 conflict`.
+
+## The parent's state is judged twice
+
+The package judges the parent's state once, at its place in the order of
+refusals. The create judges it there, before the repository is made, and
+again on the parent's record read inside the creation transaction, with the
+same `workspace.RequireReady`, so that a reclone, archive or delete whose
+maintenance marker was set between the two refuses the create (`409
+workspace_busy`, or the answer of the state it left) instead of racing it.
+
+## Test seams of the create are fields of `fork.Deps`
+
+The fault injection the package asks for (the repository creator, the
+store's commit, the event writer) and the injectable name generator are
+fields of `fork.Deps`: `CreateRepo`, `Transact`, `Events` and `NewName`,
+with the production values the start hook `forks` sets (the hub git's
+`CreateFork`, `Store.Tx`, the event component) or `Bind` fills in (the
+`crypto/rand` generator). A test changes them with
+`(*hub.Composition).AdjustForks`, as `AdjustWorkspace` does for the
+workspace service.

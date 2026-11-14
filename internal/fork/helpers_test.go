@@ -1,18 +1,23 @@
 package fork_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -36,6 +41,7 @@ type world struct {
 	*hubtest.Hub
 	forks      *fork.Component
 	workspaces *workspace.Service
+	events     *event.Component
 
 	// dev and mia are the users' ids, devKey and miaKey their API keys,
 	// acme the org's id.
@@ -55,13 +61,22 @@ type world struct {
 // the world in it.
 func newWorld(t *testing.T, compose func(*hub.Composition)) *world {
 	t.Helper()
+	return newWorldWith(t, hubtest.Config{Compose: compose})
+}
+
+// newWorldWith is newWorld with what cfg adds to the hub's configuration;
+// the world sets cfg.Now.
+func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
+	t.Helper()
 	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(time.Second / 2)}
-	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock, Compose: func(c *hub.Composition) {
-		w.forks, w.workspaces = c.Forks(), c.Workspaces()
+	compose := cfg.Compose
+	cfg.Now, cfg.Compose = w.clock, func(c *hub.Composition) {
+		w.forks, w.workspaces, w.events = c.Forks(), c.Workspaces(), c.Events()
 		if compose != nil {
 			compose(c)
 		}
-	}})
+	}
+	w.Hub = hubtest.StartWith(t, cfg)
 	w.dev, w.mia = w.CreateUser(t, "dev"), w.CreateUser(t, "mia")
 	w.devKey, w.miaKey = w.IssueKey(t, w.dev), w.IssueKey(t, w.mia)
 	w.acme = w.CreateOrg(t, "acme")
@@ -76,16 +91,34 @@ func newWorld(t *testing.T, compose func(*hub.Composition)) *world {
 	if _, err := gitrepotest.Run(w.parent, stream, "fast-import", "--quiet", "--date-format=now"); err != nil {
 		t.Fatal(err)
 	}
-	head := w.head(t, w.parent, "main")
-	w.insert(t, func(tx *sql.Tx) error {
-		return workspace.Insert(context.Background(), tx, workspace.Workspace{
-			Slug: parentSlug, Kind: access.KindRepository, Mode: workspace.ModeStandard,
-			GitURL: new("https://origin.test/demo.git"), DefaultBranch: new("main"), OwnerID: w.dev, OrgID: w.acme,
-			Status: workspace.StatusReady, DisplayName: parentSlug, HeadSHA: &head,
-			CreatedAt: w.clock(), UpdatedAt: w.clock(), InstanceID: workspace.NewInstanceID(),
-		})
-	})
+	w.storeParent(t, parentSlug)
 	return w
+}
+
+// addParent adds the ready repository workspace slug of dev in acme, whose
+// repository is a copy of demo's; edit, when given, changes the record
+// before it is stored.
+func (w *world) addParent(t *testing.T, slug string, edit ...func(*workspace.Workspace)) {
+	t.Helper()
+	gitrepotest.Git(t, w.parent, "clone", "--quiet", "--bare", w.parent, w.workspaces.RepoPath(slug))
+	w.storeParent(t, slug, edit...)
+}
+
+// storeParent stores the record of the ready repository workspace slug of
+// dev in acme, whose repository is at its place already.
+func (w *world) storeParent(t *testing.T, slug string, edit ...func(*workspace.Workspace)) {
+	t.Helper()
+	head := w.head(t, w.workspaces.RepoPath(slug), "main")
+	rec := workspace.Workspace{
+		Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard,
+		GitURL: new("https://origin.test/" + slug + ".git"), DefaultBranch: new("main"), OwnerID: w.dev, OrgID: w.acme,
+		Status: workspace.StatusReady, DisplayName: slug, HeadSHA: &head,
+		CreatedAt: w.clock(), UpdatedAt: w.clock(), InstanceID: workspace.NewInstanceID(),
+	}
+	for _, fn := range edit {
+		fn(&rec)
+	}
+	w.insert(t, func(tx *sql.Tx) error { return workspace.Insert(context.Background(), tx, rec) })
 }
 
 // clock is the hub's time.
@@ -213,6 +246,91 @@ func (w *world) get(t *testing.T, cred, path string) answer {
 func (w *world) post(t *testing.T, cred, path string, body any) answer {
 	t.Helper()
 	return w.call(t, http.MethodPost, path, cred, body)
+}
+
+// postKey sends POST path with cred, body and the Idempotency-Key key.
+func (w *world) postKey(t *testing.T, cred, path, key string, body any) answer {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, w.URL("/api/v1"+path), bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return answer{res.StatusCode, b}
+}
+
+// forkEvents are the parley.workspace.fork events of the log, in its order.
+func (w *world) forkEvents(t *testing.T) []event.Record {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []event.Record
+	for _, r := range recs {
+		if r.Type == "parley.workspace.fork" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// footprint is what a refused or failed create must leave as it found it:
+// demo's forks, the entries of the directory that holds the workspaces'
+// repositories, the tokens and the events.
+type footprint struct {
+	forks, tokens, events int
+	entries               string
+}
+
+// footprint is the world's footprint now.
+func (w *world) footprint(t *testing.T) footprint {
+	t.Helper()
+	ctx := context.Background()
+	var f footprint
+	var err error
+	if f.forks, err = fork.CountOf(ctx, w.Store.Main(), parentSlug); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		query string
+		n     *int
+	}{{"SELECT count(*) FROM pats", &f.tokens}, {"SELECT count(*) FROM hub_events", &f.events}} {
+		if err := w.Store.Main().QueryRowContext(ctx, c.query).Scan(c.n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Dir(w.parent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		f.entries += e.Name() + " "
+	}
+	return f
+}
+
+// unchanged fails the test when the world's footprint is no longer before.
+func (w *world) unchanged(t *testing.T, before footprint) {
+	t.Helper()
+	if got := w.footprint(t); got != before {
+		t.Errorf("footprint = %+v, want it unchanged from %+v", got, before)
+	}
 }
 
 // patch sends PATCH path with cred and body.
