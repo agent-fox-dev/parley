@@ -2628,22 +2628,29 @@ writes nothing), and emits the event through `Events` with `Parent` set:
 `kind` `fork`, `parent_slug` and `revoked_tokens` in ascending order, for
 `deleted` and `parent_deleted`, and `parley.fork.expire`
 (`fork.EventExpire`) by the system for `expired`; both carry the fork's
-`session_id`. A removal of one fork (`remove`) refuses a parent that is
+`session_id`. A removal of one fork (`remove`) takes the parent's create
+lock first and holds it to its end, then refuses a parent that is
 `pending` or `cloning` or carries a maintenance marker with `409
 workspace_busy` (any other parent status lets the fork go), then, when a
 `SandboxLifecycle` is registered, calls `DeleteSandboxes(ctx, slug,
 "workspace_deleted", false)` before any write and stops on its error;
-then, holding the parent's create lock, runs `removeIn` in one
-`Transact`, which checks the parent again through the transaction, and
-once it has committed discards the fork's repository at its `RepoPath`
-with `RemoveRepo`, which removes its own branches with it. A discard that
+then runs `removeIn` in one `Transact`, which checks the parent again
+through the transaction, and once it has committed discards the fork's
+repository at its `RepoPath` with `RemoveRepo`, which removes its own
+branches with it. A `ttl` update or a parent's archive takes no create
+lock, so a fork whose transaction backs out (no longer due, or its parent
+busy) after its sandboxes were deleted is kept without them, and that is
+logged at warn level (`fork kept after its sandboxes were deleted: it
+changed while they were`, with `slug` and `error`). A discard that
 fails is logged and recorded in the table `fork_discards` (`slug` primary
 key, `parent_slug`, `recorded_at` in UnixNano), created by
 `fork.DiscardStep`; the removal's result does not change. `DeleteFork(ctx,
 slug, caller)` is that removal for a `DELETE`: nil on success, `404
-not_found` (`workspace not found`) for the not-found result, the `409`
-unchanged, and `500 internal` (`internal error`, the cause logged) for
-anything else. `RemoveForksOf(ctx, tx, parent, actor)` runs `removeIn`
+not_found` (`workspace not found`) for the not-found result, the `409` of
+its own refusal of a busy parent unchanged (that refusal carries the
+sentinel `errParentBusy`), and `500 internal` (`internal error`, the cause
+logged) for anything else, a `409` of a remover of owned data or of the
+session closer included. `RemoveForksOf(ctx, tx, parent, actor)` runs `removeIn`
 with the cause `parent_deleted` for every fork of the parent in ascending
 slug order inside the parent's transaction, without the sandbox call or a
 transaction of its own, and returns the slugs (`[]` for none) and the
@@ -2657,11 +2664,13 @@ removes each through `remove` with the cause `expired` and the reason
 `ttl`; the fork is read again before its sandboxes are deleted and inside
 the transaction, and one whose `expires_at` is no longer due (given a new
 lifetime since the pass read it) is left alone. A not-found result and the
-`409` of a busy parent leave the fork for a later pass without a log; any
-other failure is logged at error level (`fork sweep: fork not removed; tried
-again at the next pass`, with `slug` and `error`), the fork is whole, and
-the pass goes on. `ctx` is checked before each fork, and once it is
-cancelled the pass ends; the removal itself runs on
+removal's refusal of a busy parent leave the fork for a later pass without
+an error log; any other failure, a collaborator's `409` included, is logged
+at error level (`fork sweep: fork not removed; tried again at the next
+pass`, with `slug` and `error`), the fork is whole, and the pass goes on.
+`ctx` is checked before each fork and before each part of the pass, and
+once it is cancelled the pass ends, with `Stopped` set and no error log for
+a read the cancellation broke; the removal itself runs on
 `context.WithoutCancel(ctx)`, so that a removal under way commits or rolls
 back and discards. At the end of a pass that was not stopped, each row of
 `fork_discards` is retried under the create lock of its parent: while no

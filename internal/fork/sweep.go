@@ -5,11 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
-	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // SweepInterval is the time between two sweep passes after the first.
@@ -48,8 +46,9 @@ type PassResult struct {
 // twice. Then it repeats every pending discard of a removed fork's
 // repository.
 //
-// The context is checked before each fork: once it is cancelled, as at the
-// hub's stop, the pass removes no further fork and ends. A removal already
+// The context is checked before each fork and before each part: once it is
+// cancelled, as at the hub's stop, the pass removes no further fork and
+// ends, and a read the cancellation broke is not logged. A removal already
 // begun runs on a context the cancellation does not reach, so that its
 // transaction commits or rolls back and its discard runs. A pass requested
 // while another runs returns at once with Skipped set.
@@ -60,8 +59,12 @@ func (c *Component) RunPass(ctx context.Context) PassResult {
 	defer c.passMu.Unlock()
 	var res PassResult
 	now := c.deps.Now()
-	slugs, err := c.expiredForks(ctx, now)
-	if err != nil {
+	slugs, err := forkSlugs(ctx, c.deps.Store.Main(), `expires_at IS NOT NULL AND expires_at <= ?`, now.UnixNano())
+	switch {
+	case err != nil && ctx.Err() != nil:
+		res.Stopped = true
+		return res
+	case err != nil:
 		c.deps.Logger.Error("fork sweep: expired forks not read", "error", err)
 		return res
 	}
@@ -74,6 +77,10 @@ func (c *Component) RunPass(ctx context.Context) PassResult {
 			return res
 		}
 		c.expire(ctx, slug, removal{cause: causeExpired, expiry: expiryTTL, due: due}, &res)
+	}
+	if ctx.Err() != nil {
+		res.Stopped = true
+		return res
 	}
 	if c.deps.Limits.ExpireOnLand {
 		c.expireLanded(ctx, now, &res)
@@ -89,11 +96,12 @@ func (c *Component) RunPass(ctx context.Context) PassResult {
 // expire removes the fork slug for rm, an expiry, on a context ctx's
 // cancellation does not reach, and adds the outcome to res. A fork removed
 // by another removal or no longer due since the pass read it, and one whose
-// parent is busy, is left quietly for a later pass; any other failure is
-// logged, and the fork is whole.
+// parent refuses its removal, is left for a later pass without an error
+// (the removal warns of one that lost its sandboxes that way); any other
+// failure, a collaborator's 409 among them, is logged, and the fork is
+// whole.
 func (c *Component) expire(ctx context.Context, slug string, rm removal, res *PassResult) {
 	err := c.remove(context.WithoutCancel(ctx), slug, rm)
-	var refusal *server.Error
 	switch {
 	case err == nil:
 		res.Removed = append(res.Removed, slug)
@@ -101,33 +109,12 @@ func (c *Component) expire(ctx context.Context, slug string, rm removal, res *Pa
 	case errors.Is(err, errGone), errors.Is(err, errNotDue):
 		// Removed by another removal, or given a new lifetime or a new
 		// activity, since the pass read it.
-	case errors.As(err, &refusal) && refusal.Status() == http.StatusConflict:
+	case errors.Is(err, errParentBusy):
 		// Its parent is busy; a later pass removes it.
 	default:
 		res.Failed = append(res.Failed, slug)
 		c.deps.Logger.Error("fork sweep: fork not removed; tried again at the next pass", "slug", slug, "error", err)
 	}
-}
-
-// expiredForks are the slugs of the forks whose expires_at is at or before
-// now, in ascending order.
-func (c *Component) expiredForks(ctx context.Context, now time.Time) ([]string, error) {
-	rows, err := c.deps.Store.Main().QueryContext(ctx,
-		`SELECT slug FROM workspaces WHERE kind = ? AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY slug`,
-		access.KindFork, now.UnixNano())
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var slugs []string
-	for rows.Next() {
-		var slug string
-		if err := rows.Scan(&slug); err != nil {
-			return nil, err
-		}
-		slugs = append(slugs, slug)
-	}
-	return slugs, rows.Err()
 }
 
 // pendingDiscard is a recorded discard of a removed fork's repository that
@@ -145,7 +132,9 @@ type pendingDiscard struct {
 func (c *Component) retryDiscards(ctx context.Context) {
 	pending, err := c.pendingDiscards(ctx)
 	if err != nil {
-		c.deps.Logger.Error("fork sweep: pending discards not read", "error", err)
+		if ctx.Err() == nil {
+			c.deps.Logger.Error("fork sweep: pending discards not read", "error", err)
+		}
 		return
 	}
 	for _, p := range pending {

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -53,6 +52,11 @@ var errGone = errors.New("fork not found")
 // errNotDue is the result of an expiry of a fork that is no longer due,
 // such as one given a new lifetime since the sweep read it.
 var errNotDue = errors.New("fork not due for expiry")
+
+// errParentBusy marks the refusal of a removal by a busy parent, joined to
+// its 409, so that a caller tells it from a 409 of a collaborator, such as
+// a remover of owned data, which is a failure of the removal.
+var errParentBusy = errors.New("parent busy")
 
 // removalCause is why a fork is removed. It decides the event the removal
 // writes and the reason the session closer is given.
@@ -135,7 +139,7 @@ func (c *Component) DeleteFork(ctx context.Context, slug string, caller identity
 		return nil
 	case errors.Is(err, errGone):
 		return server.NotFound(workspace.ErrNotFound.Error())
-	case errors.As(err, &refusal) && refusal.Status() == http.StatusConflict:
+	case errors.Is(err, errParentBusy) && errors.As(err, &refusal):
 		return refusal
 	}
 	c.deps.Logger.Error("fork not removed", "slug", slug, "error", err)
@@ -150,24 +154,7 @@ func (c *Component) DeleteFork(ctx context.Context, slug string, caller identity
 // lifecycle, since the parent's delete has deleted the sandboxes of the
 // parent and its forks first, and opens no transaction of its own.
 func (c *Component) RemoveForksOf(ctx context.Context, tx *sql.Tx, parent string, actor identity.Principal) ([]string, func(), error) {
-	rows, err := tx.QueryContext(ctx, `SELECT slug FROM workspaces WHERE kind = ? AND parent_slug = ? ORDER BY slug`,
-		access.KindFork, parent)
-	if err != nil {
-		return nil, nil, fmt.Errorf("list the forks of %q: %w", parent, err)
-	}
-	slugs := []string{}
-	for rows.Next() {
-		var slug string
-		if err := rows.Scan(&slug); err != nil {
-			rows.Close()
-			return nil, nil, fmt.Errorf("list the forks of %q: %w", parent, err)
-		}
-		slugs = append(slugs, slug)
-	}
-	// Read in full before the forks are removed, since tx holds one
-	// connection.
-	err = rows.Err()
-	rows.Close()
+	slugs, err := forkSlugs(ctx, tx, `parent_slug = ?`, parent)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list the forks of %q: %w", parent, err)
 	}
@@ -197,16 +184,55 @@ func (c *Component) CountTaskForks(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// remove removes the fork slug alone, for rm: it deletes the fork's
-// sandboxes first, which live outside the store's transaction, so that no
-// sandbox outlives its fork, and stops on their error; then it removes the
-// fork in one transaction; and once that has committed, never before, it
-// discards the fork's repository, so that a removal rolled back has lost
-// nothing. A parent that refuses the removal is checked before the
-// sandboxes and again in the transaction. The parent's create lock is held
-// from the transaction to the discard, so that a create of a fork of the
-// same name never has its new repository discarded.
+// forkSlugs are the slugs of the forks, read through q, that meet the
+// condition where on the workspace table with args, in ascending order,
+// empty and not nil when there are none. They are read in full before it
+// returns, since a transaction holds one connection and its caller goes on
+// to use it.
+func forkSlugs(ctx context.Context, q access.Querier, where string, args ...any) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT slug FROM workspaces WHERE kind = ? AND (`+where+`) ORDER BY slug`,
+		append([]any{access.KindFork}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	slugs := []string{}
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
+			return nil, err
+		}
+		slugs = append(slugs, slug)
+	}
+	return slugs, rows.Err()
+}
+
+// remove removes the fork slug alone, for rm, under the create lock of its
+// parent, taken first, so that no create of a fork of that parent and no
+// other removal of one alone runs between its checks and its end, and a
+// create of a fork of the same name never has its new repository
+// discarded. It checks that
+// the fork is due and that its parent lets it go; then it deletes the fork's
+// sandboxes, which live outside the store's transaction, so that no sandbox
+// outlives its fork, and stops on their error; then it removes the fork in
+// one transaction, which checks both again; and once that has committed,
+// never before, it discards the fork's repository, so that a removal rolled
+// back has lost nothing.
+//
+// A ttl update or a parent's archive takes no create lock, so the fork can
+// cease to be due, or its parent become busy, while its sandboxes are
+// deleted. The transaction then keeps the fork, which has lost its
+// sandboxes; that is logged as a warning, since nothing can bring them back.
 func (c *Component) remove(ctx context.Context, slug string, rm removal) error {
+	parent, err := access.ForkParent(ctx, c.deps.Store.Main(), slug)
+	switch {
+	case err != nil:
+		return err
+	case parent == "":
+		return errGone
+	}
+	unlock := c.lockParent(parent)
+	defer unlock()
 	f, found, err := BySlug(ctx, c.deps.Store.Main(), slug)
 	switch {
 	case err != nil:
@@ -225,14 +251,16 @@ func (c *Component) remove(ctx context.Context, slug string, rm removal) error {
 			return fmt.Errorf("remove fork %q: delete its sandboxes: %w", slug, err)
 		}
 	}
-	unlock := c.lockParent(*f.ParentSlug)
-	defer unlock()
 	err = c.deps.Transact(ctx, func(tx *sql.Tx) error {
 		var err error
 		f, err = c.removeIn(ctx, tx, slug, rm)
 		return err
 	})
 	if err != nil {
+		if c.sandboxes != nil && (errors.Is(err, errNotDue) || errors.Is(err, errParentBusy)) {
+			c.deps.Logger.Warn("fork kept after its sandboxes were deleted: it changed while they were",
+				"slug", slug, "error", err)
+		}
 		return err
 	}
 	c.discard(ctx, f)
@@ -319,10 +347,10 @@ func (rm removal) event(f Fork, revoked []string) (event.Input, error) {
 }
 
 // removalRefusal is nil when a removal may take the fork f, and otherwise
-// the 409 workspace_busy of the parent, read through q: a parent that is
-// pending or cloning, or that a maintenance operation runs on, will be able
-// to let the fork go once that work ends. Every other parent, ready,
-// archived or failed, lets it go.
+// errParentBusy joined to the 409 workspace_busy of the parent, read
+// through q: a parent that is pending or cloning, or that a maintenance
+// operation runs on, will be able to let the fork go once that work ends.
+// Every other parent, ready, archived or failed, lets it go.
 func removalRefusal(ctx context.Context, q access.Querier, f Fork) error {
 	parent, found, err := workspace.BySlug(ctx, q, *f.ParentSlug)
 	switch {
@@ -334,7 +362,7 @@ func removalRefusal(ctx context.Context, q access.Querier, f Fork) error {
 		parent.Status != workspace.StatusCloning:
 		return nil
 	}
-	return workspace.RequireReady(parent)
+	return fmt.Errorf("%w: %w", errParentBusy, workspace.RequireReady(parent))
 }
 
 // discard removes the repository of the removed fork f, which holds its

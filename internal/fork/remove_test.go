@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 	"uuid"
@@ -111,14 +110,15 @@ func TestDeleteFork_LeavesTheForkWholeWhenAStepFails(t *testing.T) {
 	}{
 		{"sandbox deletion fails", func(r *remover) { r.failSandbox = true }, false},
 		{"remover of owned data fails", func(r *remover) { r.failRemove = true }, true},
+		{"remover of owned data refuses with a conflict", func(r *remover) { r.refuseRemove = true }, true},
 		{"event write fails", func(r *remover) { r.fault.Store("event") }, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			h := w.seedHeld(t, "demo--"+c.name[:2])
+			h := w.seedHeld(t, "demo--"+c.name[:2]+c.name[len(c.name)-2:])
 			r.take()
 			r.set(c.fail)
 			t.Cleanup(func() {
-				r.set(func(r *remover) { r.failSandbox, r.failRemove = false, false; r.fault.Store("") })
+				r.set(func(r *remover) { r.failSandbox, r.failRemove, r.refuseRemove = false, false, false; r.fault.Store("") })
 			})
 			wantError(t, w.call(t, http.MethodDelete, "/workspaces/"+h.slug, w.devKey, nil), http.StatusInternalServerError, "internal")
 			r.set(func(r *remover) { r.fault.Store("") })
@@ -241,20 +241,8 @@ func TestDeleteFork_RemovesAForkAtMostOnce(t *testing.T) {
 	t.Parallel()
 	w, r := newRemovalWorld(t)
 	h := w.seedHeld(t, "demo--t1")
-	var mu sync.Mutex
-	var statuses []int
-	var wg sync.WaitGroup
-	for range 2 {
-		wg.Go(func() {
-			a := w.call(t, http.MethodDelete, "/workspaces/"+h.slug, w.devKey, nil)
-			mu.Lock()
-			defer mu.Unlock()
-			statuses = append(statuses, a.status)
-		})
-	}
-	wg.Wait()
-	if slices.Sort(statuses); !reflect.DeepEqual(statuses, []int{http.StatusNoContent, http.StatusNotFound}) {
-		t.Errorf("statuses = %v, want one 204 and one 404", statuses)
+	if counts := w.callAll(t, 2, http.MethodDelete, "/workspaces/"+h.slug, nil); !reflect.DeepEqual(counts, map[int]int{http.StatusNoContent: 1, http.StatusNotFound: 1}) {
+		t.Errorf("answers by status = %v, want one 204 and one 404", counts)
 	}
 	if evs := w.eventsFor(t, fork.EventDelete, h.slug); len(evs) != 1 {
 		t.Errorf("delete events = %d, want 1", len(evs))

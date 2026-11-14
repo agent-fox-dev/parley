@@ -119,6 +119,7 @@ func TestRunPass_GoesOnPastAForkItCannotRemove(t *testing.T) {
 	for name, fail := range map[string]func(*remover){
 		"sandbox collaborator":  func(r *remover) { r.failSandbox = true },
 		"remover of owned data": func(r *remover) { r.failRemove = true },
+		"conflict of a remover": func(r *remover) { r.refuseRemove = true },
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := "demo--" + name[:2]
@@ -127,7 +128,9 @@ func TestRunPass_GoesOnPastAForkItCannotRemove(t *testing.T) {
 				w.seedFork(t, slug, expiring(w, -time.Second))
 			}
 			r.set(func(r *remover) { r.only = b; fail(r) })
-			t.Cleanup(func() { r.set(func(r *remover) { r.only, r.failSandbox, r.failRemove = "", false, false }) })
+			t.Cleanup(func() {
+				r.set(func(r *remover) { r.only, r.failSandbox, r.failRemove, r.refuseRemove = "", false, false, false })
+			})
 			if res := w.pass(t, context.Background()); !reflect.DeepEqual(res.Failed, []string{b}) {
 				t.Errorf("failed = %v, want [%s]", res.Failed, b)
 			}
@@ -142,7 +145,7 @@ func TestRunPass_GoesOnPastAForkItCannotRemove(t *testing.T) {
 			if !strings.Contains(w.Log.String(), `"slug":"`+b+`"`) {
 				t.Errorf("no log record names %s; log = %s", b, w.Log.String())
 			}
-			r.set(func(r *remover) { r.only, r.failSandbox, r.failRemove = "", false, false })
+			r.set(func(r *remover) { r.only, r.failSandbox, r.failRemove, r.refuseRemove = "", false, false, false })
 			w.pass(t, context.Background())
 			wantError(t, w.get(t, w.devKey, "/workspaces/"+b), http.StatusNotFound, "not_found")
 			if n := len(w.eventsFor(t, fork.EventExpire, b)); n != 1 {
@@ -187,35 +190,56 @@ func TestRunPass_LeavesTheForksOfABusyParentForALaterPass(t *testing.T) {
 
 func TestRunPass_EndsAfterTheRemovalInProgressWhenCancelled(t *testing.T) {
 	t.Parallel()
-	w, r := newRemovalWorld(t)
 	slugs := []string{"demo--a", "demo--b", "demo--c"}
-	for _, slug := range slugs {
-		w.seedFork(t, slug, expiring(w, -time.Second))
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	r.set(func(r *remover) {
-		r.during = func(slug string) {
-			if slug == slugs[1] {
-				cancel()
+	for _, c := range []struct {
+		name string
+		// at is the index of the fork during whose removal the context is
+		// cancelled, -1 for before the pass.
+		at int
+	}{
+		{"before the pass", -1},
+		{"in a removal with forks left", 1},
+		{"in the last removal", 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w, r := newRemovalWorld(t)
+			for _, slug := range slugs {
+				w.seedFork(t, slug, expiring(w, -time.Second))
 			}
-		}
-	})
-	if res := w.pass(t, ctx); !res.Stopped {
-		t.Errorf("pass = %+v, want it stopped", res)
-	}
-	for i, slug := range slugs {
-		_, found, err := fork.BySlug(context.Background(), w.Store.Main(), slug)
-		if err != nil {
-			t.Fatal(err)
-		}
-		events := len(w.eventsFor(t, fork.EventExpire, slug))
-		switch {
-		case found == (events != 0):
-			t.Errorf("%s: record %v with %d expire events, want removed with one event or whole without", slug, found, events)
-		case i == 0 && found, i == 2 && !found:
-			t.Errorf("%s: record %v, want the first removed and the last whole", slug, found)
-		}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if c.at < 0 {
+				cancel()
+			} else {
+				r.set(func(r *remover) {
+					r.during = func(slug string) {
+						if slug == slugs[c.at] {
+							cancel()
+						}
+					}
+				})
+			}
+			if res := w.pass(t, ctx); !res.Stopped {
+				t.Errorf("pass = %+v, want it stopped", res)
+			}
+			for i, slug := range slugs {
+				_, found, err := fork.BySlug(context.Background(), w.Store.Main(), slug)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events := len(w.eventsFor(t, fork.EventExpire, slug))
+				switch {
+				case found == (events != 0):
+					t.Errorf("%s: record %v with %d expire events, want removed with one event or whole without", slug, found, events)
+				case i < c.at && found, i > c.at && !found:
+					t.Errorf("%s: record %v, want the forks before the cancellation removed and those after it whole", slug, found)
+				}
+			}
+			if w.logged("ERROR", "") {
+				t.Errorf("the stopped pass logged an error; log = %s", w.Log.String())
+			}
+		})
 	}
 }
 
@@ -231,16 +255,7 @@ func TestRunPass_ReturnsAtOnceWhileAnotherPassRuns(t *testing.T) {
 		}
 	})
 	done := make(chan fork.PassResult)
-	go func() {
-		// A pass the hub runs itself at that moment is waited for first.
-		for {
-			if res := w.forks.RunPass(context.Background()); !res.Skipped {
-				done <- res
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}()
+	go func() { done <- w.forks.RunPass(context.Background()) }()
 	within(t, "the first pass reaches the sandboxes", func() { <-entered })
 	if res := w.forks.RunPass(context.Background()); !res.Skipped || len(res.Removed) != 0 {
 		t.Errorf("second pass = %+v, want it skipped", res)
@@ -284,8 +299,18 @@ func TestSweepLoop_PassesAtStartAndAtEachTickUntilCancelled(t *testing.T) {
 func TestSweep_RunsAtEachTickAndAsTheMaintenanceTask(t *testing.T) {
 	t.Parallel()
 	tk := &ticker{c: make(chan time.Time)}
+	tk.hold.Lock()
 	w, _ := newRemovalWorld(t, tk.compose)
-	w.seedFork(t, "demo--a", expiring(w, -time.Second))
+	// demo--s is due at the pass at start, demo--a only once the clock has
+	// moved on after it, so that only the tick's pass can remove demo--a.
+	w.seedFork(t, "demo--s", expiring(w, -time.Second))
+	w.seedFork(t, "demo--a", expiring(w, time.Minute))
+	tk.hold.Unlock()
+	eventually(t, "the pass at start removes demo--s", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--s")) == 1 })
+	w.advance(2 * time.Minute)
+	if n := len(w.eventsFor(t, fork.EventExpire, "demo--a")); n != 0 {
+		t.Fatalf("expire events of demo--a before the tick = %d, want none", n)
+	}
 	within(t, "the sweep takes a tick", func() { tk.c <- time.Now() })
 	eventually(t, "the tick's pass removes demo--a", func() bool { return len(w.eventsFor(t, fork.EventExpire, "demo--a")) == 1 })
 
@@ -300,22 +325,53 @@ func TestSweep_RunsAtEachTickAndAsTheMaintenanceTask(t *testing.T) {
 
 func TestRunPass_KeepsAnExpiredForkWhoseLifetimeWasSetAgain(t *testing.T) {
 	t.Parallel()
-	w, _ := newRemovalWorld(t)
-	created(t, w.post(t, w.devKey, forksPath, map[string]any{"name": "t1", "ttl": "5m"}))
-	w.advance(6 * time.Minute)
-	if a := w.get(t, w.devKey, "/workspaces/demo--t1"); a.status != http.StatusOK {
-		t.Fatalf("GET after expires_at = %d %s, want 200", a.status, a.body)
-	}
-	got := w.patch(t, w.devKey, "/workspaces/demo--t1", map[string]any{"ttl": "1h"}).object(t, http.StatusOK)["expires_at"]
-	if want := timefmt.Format(w.clock().Add(time.Hour)); got != want {
-		t.Errorf("expires_at = %v, want %s", got, want)
-	}
-	w.pass(t, context.Background())
-	if a := w.get(t, w.devKey, "/workspaces/demo--t1"); a.status != http.StatusOK {
-		t.Errorf("GET after the pass = %d %s, want 200", a.status, a.body)
-	}
-	if n := len(w.eventsOf(t, fork.EventExpire)); n != 0 {
-		t.Errorf("expire events = %d, want none", n)
+	w, r := newRemovalWorld(t)
+	for _, c := range []struct {
+		name string
+		// during sets the lifetime while the removal deletes the
+		// sandboxes, after the removal's first look at the fork.
+		during bool
+	}{
+		{"before the pass", false},
+		{"while its sandboxes are deleted", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			name := "t" + c.name[:2]
+			slug := parentSlug + "--" + name
+			created(t, w.post(t, w.devKey, forksPath, map[string]any{"name": name, "ttl": "5m"}))
+			w.advance(6 * time.Minute)
+			if a := w.get(t, w.devKey, "/workspaces/"+slug); a.status != http.StatusOK {
+				t.Fatalf("GET after expires_at = %d %s, want 200", a.status, a.body)
+			}
+			extend := func() {
+				got := w.patch(t, w.devKey, "/workspaces/"+slug, map[string]any{"ttl": "1h"}).object(t, http.StatusOK)["expires_at"]
+				if want := timefmt.Format(w.clock().Add(time.Hour)); got != want {
+					t.Errorf("expires_at = %v, want %s", got, want)
+				}
+			}
+			if c.during {
+				r.set(func(r *remover) {
+					r.during = func(s string) {
+						if s == slug {
+							extend()
+						}
+					}
+				})
+				t.Cleanup(func() { r.set(func(r *remover) { r.during = nil }) })
+			} else {
+				extend()
+			}
+			w.pass(t, context.Background())
+			if a := w.get(t, w.devKey, "/workspaces/"+slug); a.status != http.StatusOK {
+				t.Errorf("GET after the pass = %d %s, want 200", a.status, a.body)
+			}
+			if n := len(w.eventsFor(t, fork.EventExpire, slug)); n != 0 {
+				t.Errorf("expire events = %d, want none", n)
+			}
+			if c.during && !w.logged("WARN", slug) {
+				t.Errorf("no warning names %s, whose sandboxes went with the fork kept; log = %s", slug, w.Log.String())
+			}
+		})
 	}
 }
 
@@ -371,19 +427,15 @@ func expiring(w *world, in time.Duration) func(*fork.Fork) {
 	return func(f *fork.Fork) { f.ExpiresAt = new(w.clock().Add(in)) }
 }
 
-// pass runs one sweep pass with ctx and returns what it did; a pass the hub
-// runs itself at that moment is waited for first.
+// pass runs one sweep pass with ctx and returns what it did; no other pass
+// runs in a removal world (see newRemovalWorld).
 func (w *world) pass(t *testing.T, ctx context.Context) fork.PassResult {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		res := w.forks.RunPass(ctx)
-		if !res.Skipped {
-			return res
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("every sweep pass was skipped for 5 s")
-		}
+	res := w.forks.RunPass(ctx)
+	if res.Skipped {
+		t.Fatal("the sweep pass was skipped, as if another ran")
 	}
+	return res
 }
 
 // pending reports whether a discard of the fork slug's repository is

@@ -19,9 +19,11 @@ A fork's own branches live only in the fork's own repository, at its
 parent. Discarding them after the removal's commit is removing that
 directory (`fork.Deps.RemoveRepo`, `gitrepo.Remove` by default); the
 parent's repository is never written. The removal holds the parent's create
-lock from its transaction to the discard, so that a create of a fork of the
-same name, which replaces whatever it finds at the fork's place, never has
-its new repository discarded.
+lock from before its first checks to the discard, so that a create of a
+fork of the same name, which replaces whatever it finds at the fork's
+place, never has its new repository discarded, and no create of a fork of
+that parent and no other removal of one alone runs between its checks and
+its end.
 
 ## A fork stays removable whatever its parent's clone state
 
@@ -54,7 +56,10 @@ runs that set.
 busy parent with `500 internal` and the message `internal error`, as the
 hub answers any internal failure, and logs the cause (`fork not removed`,
 with `slug` and `error`), so that no detail of a remover's failure reaches
-the caller.
+the caller. A `409` that a remover of owned data or the session closer
+returns is such a failure: only the removal's own refusal of a busy parent
+is answered `409 workspace_busy`, and the sweep logs the other as a failed
+removal.
 
 ## The handler of `ttl` is a method of the fork component
 
@@ -87,7 +92,17 @@ before its time when it read them. A `ttl` update can land between that
 read and the fork's removal. The removal therefore reads the fork again,
 before its sandboxes are deleted and inside the removal's transaction, and
 leaves it alone when its `expires_at` is no longer at or before the pass's
-time; the pass writes no event for it and logs nothing.
+time; the pass writes no event for it.
+
+A window remains between the two reads. The sandboxes live outside the
+store's transaction, so they are deleted before it and cannot be rolled
+back with it, and neither a `ttl` update nor a parent's archive takes the
+parent's create lock, which the removal holds from before its first read
+to its end. A fork given a new lifetime, or whose parent becomes busy,
+while its sandboxes are deleted is kept by the transaction without them.
+That is logged at warn level (`fork kept after its sandboxes were deleted:
+it changed while they were`, with `slug` and `error`), so that it is not
+silent; a fork left alone at the first read logs nothing.
 
 ## A pending discard yields to a fork created again under the slug
 

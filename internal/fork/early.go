@@ -65,8 +65,12 @@ func (c *Component) RecordActivity(ctx context.Context, slug string) error {
 // logged and kept, and the pass goes on with the next fork. The context is
 // checked before each fork, as for the expired forks.
 func (c *Component) expireLanded(ctx context.Context, now time.Time, res *PassResult) {
-	slugs, err := c.liveForks(ctx, now)
-	if err != nil {
+	slugs, err := forkSlugs(ctx, c.deps.Store.Main(), `expires_at IS NULL OR expires_at > ?`, now.UnixNano())
+	switch {
+	case err != nil && ctx.Err() != nil:
+		res.Stopped = true
+		return
+	case err != nil:
 		c.deps.Logger.Error("fork sweep: forks not read for their early expiry", "error", err)
 		return
 	}
@@ -86,27 +90,6 @@ func (c *Component) expireLanded(ctx context.Context, now time.Time, res *PassRe
 		}
 		c.expire(ctx, slug, removal{cause: causeExpired, expiry: expiryLanded, due: due}, res)
 	}
-}
-
-// liveForks are the slugs of the forks whose expires_at is after now, in
-// ascending order.
-func (c *Component) liveForks(ctx context.Context, now time.Time) ([]string, error) {
-	rows, err := c.deps.Store.Main().QueryContext(ctx,
-		`SELECT slug FROM workspaces WHERE kind = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY slug`,
-		access.KindFork, now.UnixNano())
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var slugs []string
-	for rows.Next() {
-		var slug string
-		if err := rows.Scan(&slug); err != nil {
-			return nil, err
-		}
-		slugs = append(slugs, slug)
-	}
-	return slugs, rows.Err()
 }
 
 // workLanded reports whether the fork slug meets at now every condition of

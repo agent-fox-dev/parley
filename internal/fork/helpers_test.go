@@ -1,11 +1,13 @@
 package fork_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -28,6 +30,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -524,18 +527,59 @@ func wantError(t *testing.T, a answer, status int, typ string) {
 // status.
 func (w *world) postAll(t *testing.T, n int, body any) map[int]int {
 	t.Helper()
+	return w.callAll(t, n, http.MethodPost, forksPath, body)
+}
+
+// callAll sends n requests method path, under /api/v1, with dev's key and
+// body (nil for none) at once, and counts the answers by status. A request
+// that cannot be sent fails the test once all have returned, from the
+// test's goroutine.
+func (w *world) callAll(t *testing.T, n int, method, path string, body any) map[int]int {
+	t.Helper()
+	var raw []byte
+	if body != nil {
+		var err error
+		if raw, err = json.Marshal(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send := func() (int, error) {
+		req, err := http.NewRequest(method, w.URL("/api/v1"+path), bytes.NewReader(raw))
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+w.devKey)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer res.Body.Close()
+		_, err = io.Copy(io.Discard, res.Body)
+		return res.StatusCode, err
+	}
 	var mu sync.Mutex
 	counts := map[int]int{}
+	var errs []error
 	var wg sync.WaitGroup
 	for range n {
 		wg.Go(func() {
-			status, _ := w.Call(t, http.MethodPost, "/api/v1"+forksPath, w.devKey, body)
+			status, err := send()
 			mu.Lock()
 			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s %s: %w", method, path, err))
+				return
+			}
 			counts[status]++
 		})
 	}
 	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
+	}
 	return counts
 }
 
@@ -624,16 +668,17 @@ const secretKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 // owned data and as the session closer, and on the fork component as its
 // sandbox collaborator and its change reader, which reports changes and,
 // as live, the forks with a sandbox provisioning or ready. A step fails
-// while its fail flag is set, for the fork only alone when only is set; the
-// event writer fails while fault holds "event", and the discard of a fork's
-// repository while failDiscard is set. during, when set, is called with the
+// while its fail flag is set, for the fork only alone when only is set, and
+// the remover of owned data refuses with a 409 of its own while
+// refuseRemove is; the event writer fails while fault holds "event", and the
+// discard of a fork's repository while failDiscard is set. during, when set, is called with the
 // fork's slug as its sandboxes are deleted, before the delete fails or
 // succeeds.
 type remover struct {
 	store                                func() *sql.DB
 	mu                                   sync.Mutex
 	failRemove, failSandbox, failDiscard bool
-	failChanges, failLive                bool
+	failChanges, failLive, refuseRemove  bool
 	only                                 string
 	during                               func(slug string)
 	removed                              []string
@@ -682,6 +727,9 @@ func (r *remover) remove(_ context.Context, _ *sql.Tx, slug string) error {
 	r.removed = append(r.removed, slug)
 	if r.fails(r.failRemove, slug) {
 		return errors.New("injected remover fault")
+	}
+	if r.fails(r.refuseRemove, slug) {
+		return server.NewError("conflict", http.StatusConflict, "injected remover refusal")
 	}
 	return nil
 }
@@ -736,16 +784,35 @@ func (r *remover) ChangesFrom(_ context.Context, slug string) ([]fork.SourceChan
 
 // newRemovalWorld is a world with a current secret key whose fork removals
 // call r as their collaborators, with more run on the hub's composition
-// after that.
+// after that. No sweep pass runs in it unless the test runs one: the
+// sweep's loop waits for its ticker until the hub stops, and then ends
+// without a pass, unless more gives it a ticker; and the world is returned
+// once the maintenance loop's first pass, which runs the sweep as the task
+// fork_expiry, has ended.
 func newRemovalWorld(t *testing.T, more ...func(*hub.Composition)) (*world, *remover) {
 	t.Helper()
 	r := &remover{changes: map[string][]fork.SourceChange{}, live: map[string]bool{}}
+	// settled is closed by a task that maintenance runs after the ones it
+	// knows by name, fork_expiry among them; a restart's pass runs it again.
+	settled := make(chan struct{})
+	var once sync.Once
 	w := newWorldWith(t, hubtest.Config{Env: map[string]string{secret.EnvCurrentKey: secretKey}, Compose: func(c *hub.Composition) {
 		c.Workspaces().Teardown().RegisterRemover(r.remove)
 		c.Workspaces().Teardown().RegisterSessionCloser(r)
 		c.Forks().RegisterSandboxes(r)
 		c.Forks().RegisterChangeReader(r)
+		c.AddMaintenanceTask("removal_world_settled", func(context.Context, *hub.Runtime) error {
+			once.Do(func() { close(settled) })
+			return nil
+		})
+		stopping := c.ShuttingDown()
 		c.AdjustForks(func(d *fork.Deps) {
+			// The stop cancels the loop's context before it closes stopping,
+			// so the loop returns without a pass.
+			d.SweepTicks = func() (<-chan time.Time, func()) {
+				<-stopping
+				return nil, func() {}
+			}
 			d.Events = faultyEvents{d.Events, &r.fault}
 			d.RemoveRepo = func(dir string) error {
 				r.mu.Lock()
@@ -763,6 +830,7 @@ func newRemovalWorld(t *testing.T, more ...func(*hub.Composition)) (*world, *rem
 	}})
 	// Read at each call, since a restart opens the store again.
 	r.store = func() *sql.DB { return w.Store.Main() }
+	within(t, "the maintenance loop's first pass", func() { <-settled })
 	return w, r
 }
 
@@ -804,6 +872,19 @@ func (w *world) whole(t *testing.T, h held) {
 	if got := w.head(t, w.workspaces.RepoPath(h.slug), "task"); got != h.task {
 		t.Errorf("branch task = %q, want %s", got, h.task)
 	}
+}
+
+// logged reports whether the hub's log holds a record at level, such as
+// WARN or ERROR, that names the fork slug, or any record at level when slug
+// is "".
+func (w *world) logged(level, slug string) bool {
+	for line := range strings.SplitSeq(w.Log.String(), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["level"] == level && (slug == "" || rec["slug"] == slug) {
+			return true
+		}
+	}
+	return false
 }
 
 // eventsFor are the events of type typ of the workspace slug.
