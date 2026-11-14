@@ -14,9 +14,11 @@ const gitServerHook = "gitserver"
 // under /git on the server's router, outside the REST API, so that they
 // pass none of its checks, and binds the component in a start hook, before
 // the hub serves its first request, to the identity service, which checks
-// the Basic password as it checks a bearer credential, and to the server's
+// the Basic password as it checks a bearer credential, to the server's
 // own rate limiter, so that a credential has one window across git and the
-// REST API. The server, and with it the limiter, is built after the start
+// REST API, to the access service, whose binding guard and access rule
+// decide a git request as they decide a REST request, and to the store the
+// repository's organization and workspace record are read from. The server, and with it the limiter, is built after the start
 // hooks, so the limiter reaches the component through a server hook: the
 // component holds a serverLimiter, which the hook points at the limiter of
 // the server that serves.
@@ -33,7 +35,10 @@ func composeGitServer(c *Composition) {
 	limiter := &serverLimiter{}
 	c.addServerHook(func(srv *server.Server) { limiter.l = srv.RateLimiter() })
 	c.AddStartHook(gitServerHook, func(_ context.Context, rt *Runtime) error {
-		d := gitserver.Deps{Credentials: c.identity, Limiter: limiter, Logger: rt.Logger}
+		d := gitserver.Deps{
+			Credentials: c.identity, Limiter: limiter, Guard: c.access, Access: c.access,
+			Records: gitserver.StoreRecords(rt.Store.Main()), Logger: rt.Logger,
+		}
 		for _, adjust := range c.gitServerAdjusters {
 			adjust(&d)
 		}

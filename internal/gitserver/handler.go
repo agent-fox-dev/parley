@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -89,6 +90,15 @@ type Exchange struct {
 	Caller server.Caller
 	// Principal is the credential the caller presented.
 	Principal identity.Principal
+	// Need is what the request needs of the caller on the workspace, decided
+	// by the route alone before anything is looked up.
+	Need access.Need
+	// Level is the caller's level on the workspace, as the access rule
+	// decided it.
+	Level access.Level
+	// Binding is what the binding guard found a bound PAT reaches; nil for
+	// every other credential.
+	Binding *access.Binding
 	// Workspace is the record of the workspace the request addresses, as the
 	// resolution of the repository read it; it is the zero Workspace on a
 	// request no check has resolved.
@@ -110,6 +120,15 @@ type Deps struct {
 	// Limiter is the rate limit, shared with the REST API; with none, every
 	// request is admitted.
 	Limiter Limiter
+	// Guard is the binding guard on git; with none, every bound PAT is
+	// answered as for a repository that does not exist.
+	Guard Guard
+	// Access is the workspace access rule; with none, a request that reaches
+	// the resolution of its repository is answered 500 internal error.
+	Access Access
+	// Records reads the organization and the workspace record a request
+	// names; with none, as with no Access.
+	Records Records
 	// Service serves a request that passed the checks; with none, such a
 	// request is answered 500 internal error.
 	Service Service
@@ -146,12 +165,20 @@ func (c *Component) Mount(handle func(pattern string, h http.Handler)) {
 type check func(c *Component, w http.ResponseWriter, r *http.Request, x *Exchange) bool
 
 // checks are the checks of every git request, in the order the hub answers
-// them: authentication, then the rate limit, which counts the request
-// against the credential authentication found, so that a caller over its
-// limit learns nothing about the repository it asked for.
+// them, so that the first that fails decides the answer: authentication;
+// the rate limit, which counts the request against the credential
+// authentication found, so that a caller over its limit learns nothing
+// about the repository it asked for; the binding guard; the scope of a PAT;
+// the resolution of the repository with the access rule; and the
+// validation of the request, which a caller who cannot see the repository
+// never reaches.
 var checks = []check{
 	(*Component).authenticate,
 	(*Component).rateLimit,
+	(*Component).guard,
+	(*Component).scope,
+	(*Component).resolve,
+	(*Component).validate,
 }
 
 // handler serves route: it runs the checks in order, stops at the first
@@ -159,6 +186,7 @@ var checks = []check{
 func (c *Component) handler(route Route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		x := Exchange{Route: route, Service: serviceOf(route, r)}
+		x.Need = needOf(route, x.Service)
 		for _, chk := range checks {
 			if !chk(c, w, r, &x) {
 				return

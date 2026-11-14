@@ -32,7 +32,9 @@ const (
 // world is a hub the git server tests ask, on a clock that stands still
 // unless a test moves it: the org acme; its member owner, who owns the
 // ready workspace demo, and its member member; stranger, who belongs to no
-// org; each with an API key, and owner with a PAT that holds git:read. demo's
+// org; each with an API key, and owner with a PAT that holds git:read. The
+// owner also owns solo, whose organization no longer exists, and the
+// stranger owns other in the org beta. demo's
 // repository is at its place on disk, a bare repository whose default branch
 // main has two commits. The git server's service is a recorder, so that a
 // test sees what reached it.
@@ -78,6 +80,10 @@ func newWorld(t *testing.T, cfg hubtest.Config) *world {
 		w.AddMember(t, w.acme, user)
 		w.advance(time.Minute)
 	}
+	beta := w.CreateOrg(t, "beta")
+	w.advance(time.Minute)
+	w.AddWorkspace(t, access.Record{Slug: "solo", OwnerID: w.owner, OrgID: "org-deleted", Kind: access.KindRepository, Status: access.StatusReady})
+	w.AddWorkspace(t, access.Record{Slug: "other", OwnerID: w.stranger, OrgID: beta, Kind: access.KindRepository, Status: access.StatusReady})
 	w.repo = w.workspaces.RepoPath("demo")
 	gitrepotest.Git(t, w.repo, "init", "--quiet", "--bare", "--initial-branch=main", w.repo)
 	stream := "commit refs/heads/main\nmark :1\ncommitter P <p@example.invalid> now\ndata 5\nfirst\nM 100644 inline README\ndata 2\n1\n" +
@@ -111,6 +117,45 @@ func (w *world) advance(d time.Duration) {
 	defer w.mu.Unlock()
 	w.now = w.now.Add(d)
 }
+
+// pat stores a PAT of user holding perms, bound to the workspace bound
+// unless it is "", and returns the token and its id.
+func (w *world) pat(t *testing.T, user, bound string, perms ...string) (token, id string) {
+	t.Helper()
+	return w.IssuePATID(t, identity.PATSpec{UserID: user, Permissions: perms, Workspace: bound, CreatedAt: w.clock()})
+}
+
+// setStatus sets the status of the workspace slug in the store.
+func (w *world) setStatus(t *testing.T, slug, status string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ? WHERE slug = ?`, status, slug)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gitRequest is one of the four requests git sends: ref discovery for a
+// fetch, the fetch exchange, ref discovery for a push and the push
+// exchange.
+type gitRequest struct {
+	name, method, suffix string
+	push                 bool
+}
+
+// gitRequests are the four requests, the three routes among them.
+var gitRequests = []gitRequest{
+	{"fetch refs", http.MethodGet, "/info/refs?service=git-upload-pack", false},
+	{"fetch", http.MethodPost, "/git-upload-pack", false},
+	{"push refs", http.MethodGet, "/info/refs?service=git-receive-pack", true},
+	{"push", http.MethodPost, "/git-receive-pack", true},
+}
+
+// to is the path of the request for the repository segment pair repo, such
+// as "acme/demo.git".
+func (g gitRequest) to(repo string) string { return "/git/" + repo + g.suffix }
 
 // answer is a response of the hub, its body read.
 type answer struct {

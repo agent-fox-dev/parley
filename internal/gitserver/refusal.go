@@ -11,6 +11,11 @@ const (
 	msgUserBlocked  = "user is blocked"
 	msgRateLimited  = "rate limit exceeded"
 	msgInternal     = "internal error"
+	msgNotFound     = "repository not found"
+	// msgLacksScope is followed by the scope the request needs.
+	msgLacksScope     = "token lacks scope "
+	msgReadOnly       = "org members have read-only access to this workspace; create a task fork to contribute"
+	msgInvalidService = "invalid or missing service parameter"
 )
 
 // basicChallenge asks git for a credential: git prompts for one, or asks

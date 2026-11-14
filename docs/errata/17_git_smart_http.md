@@ -37,3 +37,25 @@ the real server in-process on a loopback port over a real store, and
 replace the service that runs after the checks with a recorder through
 `AdjustGitServer`; the git routes are thereby also reached through the
 server's dispatcher, as in production.
+
+## A workspace "without an organization" is one whose organization is gone
+
+The package answers `404 repository not found` for "a workspace without an
+organization". Every workspace record carries an `org_id` (the column is
+`NOT NULL` and `access.InsertRecord` refuses an empty one), but it carries
+no foreign key, so a workspace keeps the id of an organization that has
+since been deleted. That is the workspace without an organization: the git
+server answers it, and a record whose `org_id` is empty, with the same
+`404` as an unknown slug, and its test stores a workspace whose `org_id`
+names no organization.
+
+## The two `service` values are checked at the exchange, not at its content type
+
+The check of the package asserts that ref discovery with
+`service=git-upload-pack&service=git-receive-pack` answers with the
+`Content-Type` of an upload-pack advertisement. Which service serves a
+request is decided by the checks, and the advertisement is written by the
+service that runs after them; the test of the checks asserts that the
+request reaches that service as an upload-pack request with need read. The
+content type is the one the upload-pack advertisement always carries, written
+by the service of ref discovery, not by the checks.

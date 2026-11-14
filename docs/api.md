@@ -595,6 +595,44 @@ answers it with an HTTP status and a body of one line of text, sent with
    answer is the same for a repository that exists and one that does not. A
    request that authentication refused is counted against its client
    address and still answered by authentication (`401` or `403`).
+3. The binding guard, for a PAT bound to a workspace (see
+   [Workspace-bound tokens](#workspace-bound-tokens)): on a repository its
+   binding does not cover, whether or not it exists, it gets `404` with the
+   body `repository not found`, whatever scopes it holds, and the refusal
+   is recorded as a `parley.token.bound_refused` event with `surface` `git`.
+4. The scope of a PAT. A push (`POST …/git-receive-pack`, and ref discovery
+   whose first `service` value is `git-receive-pack`) needs `git:write`;
+   every other request needs `git:read`, which `git:write` also satisfies.
+   A PAT without it gets `403` with the body `token lacks scope git:read` or
+   `token lacks scope git:write`, before the repository is looked at, so the
+   answer is the same for a repository that exists and one that does not. An
+   API key and the admin token carry no scopes and skip this check; the
+   `paths` of a PAT are never read on git.
+5. The repository and the caller's access to it, by the
+   [workspace access rule](#workspace-access): a push needs write access,
+   every other request read access. The repository segment must end in
+   `.git`, the slug before it must name a workspace the caller can read,
+   the workspace's organization must exist, and the org segment must be
+   that organization's slug, letter case included. Every request that fails
+   one of these gets the same answer, byte for byte but for `Date` and the
+   request id, in every status of the workspace:
+
+   ```
+   HTTP/1.1 404 Not Found
+   Content-Type: text/plain; charset=utf-8
+
+   repository not found
+   ```
+
+   An org member who is not the owner gets, on a push to a repository at
+   its right URL, in every status of the workspace, `403` with the body
+   `org members have read-only access to this workspace; create a task fork to contribute`.
+   Memberships and bindings are read on every request, so a removed member
+   is refused from the next request on.
+6. The request. On ref discovery the first value of the query parameter
+   `service` must be `git-upload-pack` or `git-receive-pack`; later values
+   are ignored. Otherwise the answer is `400` with the body
+   `invalid or missing service parameter`.
 
 An error the hub did not expect is answered `500` with the body
 `internal error` and written to the hub's log with the request id. The hub
