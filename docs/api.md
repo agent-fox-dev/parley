@@ -1600,7 +1600,8 @@ user's own API key, is `409` `conflict` and deletes nothing. The check and
 the delete run in one write transaction, like a demotion's (see
 [Role and status of a user](#role-and-status-of-a-user)).
 
-Data that other parts of the hub keep for the user is removed in the same
+Data that other parts of the hub keep for the user, the user's
+[secrets](#secrets) among them, is removed in the same
 transaction, before the user (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
 When that removal fails, the delete is undone as a whole, and the answer is
 `500` `internal`.
@@ -1874,7 +1875,8 @@ who were its members or its owner are kept. Afterwards the org is `404`
 former members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs), and a new
 org may take its name and its slug.
 
-Data that other parts of the hub keep for the org is removed in the same
+Data that other parts of the hub keep for the org, the org's
+[secrets](#secrets) among them, is removed in the same
 transaction (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
 When that removal fails, the delete is undone as a whole, and the answer is
 `500` `internal`.
@@ -1885,6 +1887,194 @@ When that removal fails, the delete is undone as a whole, and the answer is
 | `403` `forbidden` | the caller is not an admin (see [Admin routes](#admin-routes)) |
 | `404` `not_found` | no org has that id or slug (`org not found`). Nothing changes. |
 | `500` `internal` | removing data another part of the hub keeps for the org failed (`internal error`). Nothing changes. |
+
+## Secrets
+
+A secret belongs to one of three secret scopes, each with its own routes:
+
+| Scope | Routes | Owner |
+|---|---|---|
+| user | `/api/v1/user/secrets` | the caller's user |
+| org | `/api/v1/orgs/{slug}/secrets` | the org `{slug}` names, by its slug or its id (see [Org selectors](#org-selectors)) |
+| workspace | `/api/v1/workspaces/{slug}/secrets` | the workspace `{slug}`, and no other: a task fork's secrets are not its parent's, nor the other way round |
+
+No route answers a secret's value. A route's access to its scope is decided
+in the access position of the [order of checks](#order-of-checks), after the
+scope of a PAT and the [workspace access](#workspace-access) check, so a PAT
+without the route's scope is refused `403` `insufficient_scope` whether or
+not the org or the workspace exists. Every secret route of a scope gives the
+same answers:
+
+- **User.** An API key or a PAT acts on its user's secrets. The admin token
+  has no user and is refused:
+
+  ```json
+  {"error":{"code":403,"message":"user-scoped endpoints require a user credential","error_type":"forbidden"}}
+  ```
+
+- **Org.** The admin token reaches every org, a blocked one included; a user
+  reaches an org with the status `active` of which they are a member. An org
+  that does not exist, an org the user is not a member of and a blocked org
+  are answered with the same bytes:
+
+  ```json
+  {"error":{"code":404,"message":"org not found","error_type":"not_found"}}
+  ```
+
+- **Workspace.** The routes need `owner` (see [Workspace access](#workspace-access)):
+  the workspace's owner (on a task fork also its parent's owner) and the
+  admin token reach them; a member of the workspace's org is answered `403`
+  `forbidden` with the message `org members have read-only access to this
+  workspace`, the creator of a task fork on the fork's parent included; anyone
+  else gets the `404` `workspace not found` of a slug with no workspace. The
+  workspace's status plays no part.
+
+A workspace-bound PAT is confined by the binding guard first (see
+[Workspace-bound tokens](#workspace-bound-tokens)).
+
+The secrets of a user go with the user's deletion
+([`DELETE /api/v1/users/{id}`](#delete-apiv1usersid)) and those of an org with
+the org's ([`DELETE /api/v1/orgs/{id}`](#delete-apiv1orgsid)), in the
+transaction of the delete and without a `parley.secret.delete` event; a
+delete that is refused, such as that of the only active admin, keeps them.
+
+## `GET /api/v1/user/secrets`, `GET /api/v1/orgs/{slug}/secrets`, `GET /api/v1/workspaces/{slug}/secrets`
+
+Lists the secrets of the scope, a [list](#lists) in the standard pages, and
+declares the scope `secrets:read` for a PAT, which `secrets:write`
+satisfies. Who may call each route is in [Secrets](#secrets).
+
+The list holds the scope's own secrets, ordered by `key` ascending, compared
+byte by byte with `A` to `Z` lowered, so `_x`, `A`, `a1`, `b`, `B2`, `c` are
+in that order. Each item has exactly `key`, as it was first stored,
+`created_at` and `updated_at`, RFC 3339 in UTC with whole seconds; never the
+value or the owner. An empty scope gets `items` `[]`. The list reads no
+value, so it holds every secret also when the hub has no encryption key or
+a value cannot be decrypted with the configured keys.
+
+```json
+{"items":[{"key":"GIT_PAT","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}],"next_cursor":null}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are secrets as above |
+| `400` `invalid_request` | a bad `limit` (`limit must be an integer from 1 to 200`) or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT without `secrets:read` or `secrets:write` (`this route needs the scope secrets:read`) |
+| `403` `forbidden` | the admin token on `/user/secrets` (`user-scoped endpoints require a user credential`); a member of the workspace's org on `/workspaces/{slug}/secrets` (`org members have read-only access to this workspace`) |
+| `404` `not_found` | an org the caller may not reach or that does not exist (`org not found`); a workspace the caller has no level on or that does not exist (`workspace not found`) |
+
+## `POST /api/v1/user/secrets`, `POST /api/v1/orgs/{slug}/secrets`, `POST /api/v1/workspaces/{slug}/secrets`
+
+Creates secrets in the scope, all of them or none, and declares the scope
+`secrets:write` for a PAT. Who may call each route is in
+[Secrets](#secrets). It is a create route (see [Idempotency](#idempotency)).
+
+The body is a JSON object with `entries`, an array of at least one object
+with `key` and `value`; other members are ignored:
+
+| Member | Required | Value |
+|---|---|---|
+| `key` | yes | a string of 1 to 255 characters, each an ASCII letter, a digit or `_`, not beginning with a digit; stored as given |
+| `value` | no | a string of at most 262144 bytes; absent, the empty string. `null` or another type is refused |
+
+```json
+{"entries":[{"key":"GIT_PAT","value":"ghp_…"},{"key":"GIT_USERNAME","value":"octocat"}]}
+```
+
+The body is checked in this order, and the first fault is answered:
+`entries` is a non-empty array; entry by entry, its key and then its value;
+then no two keys are equal ignoring the case of `A` to `Z`. With a valid
+body, a hub without a current encryption key answers `503`. Then, in one
+transaction: when the scope's secrets and the entries together would be more
+than 100, `429`, also when a key already exists; otherwise, when the scope
+already holds a key equal to one of the entries ignoring case, `409` naming
+the first such key in request order, as the request spells it. Otherwise
+every entry is stored, with one creation time, and one event
+`parley.secret.create` is written per entry in the same transaction:
+`resource_type` `secret`, `resource_id` the key, `metadata` exactly
+`{"scope","scope_id","key"}` (`scope_id` the user id, the org id or the
+workspace slug), `workspace` the slug on the workspace route and `null`
+otherwise, and the caller as the actor. If the events cannot be written,
+nothing is stored and the answer is `500`.
+
+The answer holds the entries in request order, as the items of a list:
+exactly `key`, `created_at` and `updated_at`, which are equal, the same for
+every item, RFC 3339 in UTC with whole seconds; never a value.
+
+```json
+{"items":[{"key":"GIT_PAT","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"},{"key":"GIT_USERNAME","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}]}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | every entry was stored; the body is `items` as above |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is stored |
+| `400` `invalid_request` | the body is refused; nothing is stored. The messages: `entries must be a non-empty array of {key, value} objects`, `entries[0] must be an object`, `entries[0] must have a key that is a string`, `key "" must have 1 to 255 characters`, `key "1A" must not begin with a digit`, `key "A-B" may hold only ASCII letters, digits and _`, `the value of key "K" must be a string`, `the value of key "K" is longer than 262144 bytes`, `key "TOKEN" is given more than once, ignoring case` |
+| `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
+| `403` `forbidden` | as for the list (see above) |
+| `404` `not_found` | as for the list (see above) |
+| `409` `conflict` | the scope holds one of the keys, ignoring case (`key "TOKEN" already exists`); nothing is stored |
+| `413` `payload_too_large` | the body is over the hub's body limit (see [Request bodies](#request-bodies)) |
+| `429` `secret_limit_reached` | the scope would hold more than 100 secrets (`maximum of 100 entries per scope exceeded`); nothing is stored |
+| `503` `secrets_unavailable` | the hub has no current encryption key (`secrets cannot be stored: no encryption key configured`); nothing is stored |
+
+## `PATCH /api/v1/user/secrets/{key}`, `PATCH /api/v1/orgs/{slug}/secrets/{key}`, `PATCH /api/v1/workspaces/{slug}/secrets/{key}`
+
+Replaces the value of the scope's secret whose key equals `{key}` ignoring
+the case of `A` to `Z`, and declares the scope `secrets:write` for a PAT.
+Who may call each route is in [Secrets](#secrets). `{key}` is not checked
+against the key rules: a key no secret can have is not found.
+
+The body is a JSON object with `value`, a string of at most 262144 bytes;
+other members are ignored:
+
+```json
+{"value":"ghp_…"}
+```
+
+The body is checked first, then a hub without a current encryption key
+answers `503`, for a key the scope does not hold too; then the secret is
+looked up. The new value is sealed under the current key without opening
+the old one, so a value the configured keys cannot decrypt is replaced too.
+The key keeps the casing it was first stored with and its `created_at`;
+`updated_at` is the time of the update. One event `parley.secret.update` is
+written in the same transaction, as for a create, with `resource_id` and
+`metadata.key` the key as it is stored, whatever casing the path used. If
+the event cannot be written, nothing changes and the answer is `500`.
+
+The answer is the secret as an item of the list: exactly `key`, as stored,
+`created_at` and `updated_at`; never a value.
+
+```json
+{"key":"GIT_PAT","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:31:45Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the value was replaced; the body is the item as above |
+| `400` `invalid_request` | `value` is absent, `null`, not a string (`the value of key "K" must be a string`) or longer than 262144 bytes (`the value of key "K" is longer than 262144 bytes`), `K` the key as the path gives it; or the body is not a JSON object (see [Request bodies](#request-bodies)). Nothing changes |
+| `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
+| `403` `forbidden` | as for the list (see above) |
+| `404` `not_found` | as for the list (see above); or the scope holds no such key (`key "K" not found`, `K` as the path gives it). A key held only by another scope, a task fork's parent included, is not found |
+| `503` `secrets_unavailable` | the hub has no current encryption key (`secrets cannot be stored: no encryption key configured`); nothing changes |
+
+## `DELETE /api/v1/user/secrets/{key}`, `DELETE /api/v1/orgs/{slug}/secrets/{key}`, `DELETE /api/v1/workspaces/{slug}/secrets/{key}`
+
+Removes the scope's secret whose key equals `{key}` ignoring the case of `A`
+to `Z`, and declares the scope `secrets:write` for a PAT. Who may call each
+route is in [Secrets](#secrets). The value is never read, so the route works
+on a hub without an encryption key and on a value the configured keys
+cannot decrypt. One event `parley.secret.delete` is written in the same
+transaction, named as for an update. If the event cannot be written, the
+secret stays and the answer is `500`. A removed key can be created again.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the secret was removed; the body is empty |
+| `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
+| `403` `forbidden` | as for the list (see above) |
+| `404` `not_found` | as for the update (see above) |
 
 ## `GET /api/v1/events`
 

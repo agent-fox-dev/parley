@@ -33,6 +33,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/scrub"
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -59,6 +60,7 @@ var parts = []func(*Composition){
 	composeIdentity,
 	composeAccess,
 	composeEvents,
+	composeSecrets,
 	composeSandbox,
 }
 
@@ -145,6 +147,9 @@ type Composition struct {
 	// versionMembers add members to the document of GET /version
 	// (addVersionMember).
 	versionMembers []func() map[string]any
+	// startReports write the parts' start lines once the listener is bound
+	// (addStartReport).
+	startReports []func(*slog.Logger)
 
 	// sandbox is the sandbox feature composeSandbox creates, with the
 	// factory of its runtime client and the recorder of its metrics.
@@ -166,6 +171,16 @@ type Composition struct {
 	// events is the event component composeEvents creates and binds in its
 	// start hook; the parts emit through it (Events).
 	events *event.Component
+
+	// secrets is the secret component composeSecrets creates and binds in
+	// its start hook; the parts read and store secrets through it (Secrets).
+	secrets *secret.Component
+
+	// env is the hub's environment, Options.Env, which a part's
+	// configuration check reads what the configuration file does not hold
+	// from: the operator's secret keys
+	// (docs/adr/06-load-the-secret-keys-before-the-stores-open.md).
+	env config.Env
 }
 
 func newComposition() *Composition {
@@ -300,6 +315,16 @@ func (c *Composition) install(srv *server.Server) (err error) {
 // start like a configuration error.
 func (c *Composition) addConfigCheck(check func(*config.Config) error) {
 	c.configChecks = append(c.configChecks, check)
+}
+
+// addStartReport adds lines a part writes about how it started, such as the
+// secret encryption report. The reports are written in the order they were
+// added, once the listener is bound and right before the listening line, so
+// that a start that fails still writes its one error line and nothing else
+// (docs/adr/06-load-the-secret-keys-before-the-stores-open.md). A part
+// computes what it reports in its start hook.
+func (c *Composition) addStartReport(report func(*slog.Logger)) {
+	c.startReports = append(c.startReports, report)
 }
 
 // addVersionMember adds members to the document of GET /version: members is
@@ -505,6 +530,10 @@ func (r *run) fail(err error) int {
 // configured secrets.
 func (r *run) configure() (*Composition, *config.Config, error) {
 	c := newComposition()
+	c.env = r.opts.Env
+	if c.env == nil {
+		c.env = config.MapEnv(nil)
+	}
 	for _, part := range parts {
 		part(c)
 	}
@@ -604,6 +633,9 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 	opts.Logger = r.logger
 	opts.VersionMembers = c.versionDocument
 	opts.OnListen = func(bound net.Addr) {
+		for _, report := range c.startReports {
+			report(r.logger)
+		}
 		r.logger.Info("listening", "addr", bound.String(), "config", cfg.Path, "data_dir", cfg.DataDir())
 	}
 	srv := server.New(opts)

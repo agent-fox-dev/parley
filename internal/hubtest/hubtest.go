@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -126,6 +127,9 @@ type Hub struct {
 	// opts are the options the hub is served with, which Restart serves it
 	// with again.
 	opts hub.Options
+	// baseEnv is the environment every run of the hub has, before what
+	// Config.Env or RestartEnv adds.
+	baseEnv map[string]string
 }
 
 // Config is what StartWith starts a hub with besides its defaults.
@@ -144,6 +148,9 @@ type Config struct {
 	Compose func(*hub.Composition)
 	// Now is the hub's clock once it is served; nil for time.Now.
 	Now func() time.Time
+	// Env is added to the hub's environment, for the bootstrap and every
+	// run, such as the operator's secret keys; nil for nothing.
+	Env map[string]string
 }
 
 // Start bootstraps a hub with an admin token in a fresh data directory,
@@ -173,7 +180,8 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 			t.Fatal(err)
 		}
 	}
-	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
+	baseEnv := map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir}
+	env := withEnv(baseEnv, cfg.Env)
 	var out, errb LogBuffer
 	if code := hub.Run(context.Background(), hub.Options{
 		Args: []string{"--admin-email", "boss@example.com"}, Env: env, WorkDir: dir, Stdout: &out, Stderr: &errb,
@@ -188,7 +196,7 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 	if err := os.Remove(tokenFile); err != nil {
 		t.Fatal(err)
 	}
-	h := &Hub{Token: strings.TrimSpace(string(token))}
+	h := &Hub{Token: strings.TrimSpace(string(token)), baseEnv: baseEnv}
 	h.opts = hub.Options{Env: env, WorkDir: dir, Now: cfg.Now, Compose: func(c *hub.Composition) {
 		c.AddStartHook("test-store", func(_ context.Context, rt *hub.Runtime) error {
 			h.Store = rt.Store
@@ -202,11 +210,32 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 	return h
 }
 
+// withEnv is base with extra added, as an environment.
+func withEnv(base, extra map[string]string) config.Env {
+	env := maps.Clone(base)
+	maps.Copy(env, extra)
+	return config.MapEnv(env)
+}
+
 // Restart stops the hub, waits up to 10 s for it to return with status 0,
-// and serves it again with the same data directory, configuration and
-// composition on the same port, as a restart of parleyd does. Served, URL
-// and Store are those of the new run afterwards.
+// and serves it again with the same data directory, configuration,
+// environment and composition on the same port, as a restart of parleyd
+// does. Served, URL and Store are those of the new run afterwards.
 func (h *Hub) Restart(t testing.TB) {
+	t.Helper()
+	h.restart(t, h.opts.Env)
+}
+
+// RestartEnv is Restart with env added to the hub's environment in place of
+// what Config.Env or an earlier RestartEnv added, as an operator restarts
+// parleyd with other variables, such as another secret key; later restarts
+// keep it.
+func (h *Hub) RestartEnv(t testing.TB, env map[string]string) {
+	t.Helper()
+	h.restart(t, withEnv(h.baseEnv, env))
+}
+
+func (h *Hub) restart(t testing.TB, env config.Env) {
 	t.Helper()
 	addr, _ := h.Listening["addr"].(string)
 	_, portText, err := net.SplitHostPort(addr)
@@ -221,6 +250,7 @@ func (h *Hub) Restart(t testing.TB) {
 	if code := h.ExitCode(t, 10*time.Second); code != 0 {
 		t.Fatalf("the hub stopped with %d, want 0; stderr = %q", code, h.Log.String())
 	}
+	h.opts.Env = env
 	opts := h.opts
 	opts.Port = &port
 	h.Served = Serve(t, opts)

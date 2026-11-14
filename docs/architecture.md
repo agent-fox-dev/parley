@@ -18,7 +18,7 @@ command-line client. Both are written in Go, in the module
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
-| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
+| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
@@ -26,6 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
 | `internal/sandbox/runtime/runtimetest` | test support, imported by test code only: `Fake`, the in-memory runtime and the only test double of the runtime, with its test controls, and `RunContract`, the contract tests every implementation of the runtime client passes |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
+| `internal/secret` | the hub's secrets, whose values leave the hub through no response, log line or error: `LoadKeys` reads the operator's current key (`PARLEY_SECRETS_KEY`, or the file `[secrets].key_file` names) and previous key (`PARLEY_SECRETS_KEY_PREVIOUS`), each standard padded base64 of 32 bytes, into `Keys`, whose keys print, log and encode as JSON as `[key]` (an absent key encodes as `null`); `Seal` and `Open` seal a value with AES-256-GCM under the current key, a fresh 12-byte nonce and a binding of its owner as additional data, and open it with the current or the previous key by the `KeyID` (the first 8 bytes of the key's SHA-256 in hex) it carries; `SealValue`, `OpenValue` and `NeedsReseal` do the same for values that are not named secrets, with the key id in front of the sealed bytes; `Component` (the hub uses its zero value, bound once at start by `Bind(Deps)` to the store, the keys, the clock, the scrubber and the event log; `New(Deps)` builds a bound one; table `secrets`, created by `SchemaStep`, unique on scope, scope id and the key with A to Z lowered) is the one place secrets are read, stored and removed, in the scopes `ScopeUser`, `ScopeOrg` and `ScopeWorkspace`: `Get` reads one secret of exactly one scope on every call, matching the key ignoring ASCII case, registers the value with the scrubber and fails a value no key opens with `ErrUnreadable`, never as absent; `Put`, `Delete`, `RemoveScope` and the package function `RemoveWorkspace` change secrets inside the caller's transaction and write no event; `CreateEntries` (all or nothing, the limit of 100 checked before a conflict), `ListPage`, `UpdateEntry`, `DeleteEntry` and `Count` serve the secret routes; `Routes` are the secret routes and `ScopeCheck` the access check that resolves a route's scope from its `MarkScope` mark; `Available` reports whether a current key is configured; `StartReport` counts the stored values whose key id is neither configured key's and `(StartReport).Log` writes the start lines; `Reencrypt` is the maintenance task that re-seals the values under the previous key with the current one and runs the `Converter`s other parts add with `RegisterConverter`; `ErrUnavailable` (no current key), `ErrUnreadable` (no configured key opens the value), `ErrInvalid`, `ErrLimitReached`, `ErrConflict` and `ErrNotFound` are the errors to match, and `UnavailableError` is the `503 secrets_unavailable` the REST API answers for `ErrUnavailable` |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
@@ -476,9 +477,21 @@ or `Options.Compose`, keeps it and reads its settings and runtime client
 once the hub serves. Two unexported registrations serve the parts of the hub
 itself: `addConfigCheck(func(*config.Config) error)` adds a check run on the
 loaded configuration before any store is opened, for rules that span more
-than one key or section, and `addVersionMember(func() map[string]any)` adds
+than one key or section, `addVersionMember(func() map[string]any)` adds
 members to the document of `GET /version` (the server's
-`Options.VersionMembers`), after the build's.
+`Options.VersionMembers`), after the build's, and
+`addStartReport(func(*slog.Logger))` adds lines a part writes about its
+start, which the hub writes once the listener is bound, right before the
+`listening` line, so that a failed start still writes only its one error
+line. The composition keeps the hub's environment (`Options.Env`, an empty
+one when nil) in its unexported field `env`, which a configuration check
+reads ([ADR 06](adr/06-load-the-secret-keys-before-the-stores-open.md)).
+
+`(*Composition).Secrets()` returns the `*secret.Component` that
+`composeSecrets` (`internal/hub/secrets.go`) creates: a part keeps it when
+it is composed and reads, stores and removes secrets through it from its
+start hook on, if it is listed after `composeSecrets`, or from
+`Options.Compose` (see [Secrets](#secrets)).
 
 `(*Composition).Events()` returns the `*event.Component` that `composeEvents`
 (`internal/hub/events.go`) creates: a part keeps it when it is composed and
@@ -523,7 +536,8 @@ failure:
 2. load the configuration with the composition's registry (`config.toml`,
    see [configuration.md](configuration.md)), set the logger's level from
    `[logging].level`, run the configuration checks of `addConfigCheck`
-   (the `[sandbox]` section's, see [The start-up check](#the-start-up-check)),
+   (the `[sandbox]` section's, see [The start-up check](#the-start-up-check),
+   and the loading of the secret keys, see [Secrets](#secrets)),
    and register every OAuth provider's `client_secret` with the scrubber;
 3. open the stores with the composition's schema steps (`store.Open`);
 4. the bootstrap (`internal/hub/bootstrap.go`), which may end the run with
@@ -542,8 +556,10 @@ failure:
    first pass (see [The maintenance loop](#the-maintenance-loop)), and each
    piece of background work in a goroutine of its own, with one context
    shared with the server and the loop;
-10. `Serve`, whose `OnListen` writes the `listening` line with `addr`,
-    `config` (`cfg.Path`) and `data_dir` (`cfg.DataDir()`).
+10. `Serve`, whose `OnListen` writes the parts' start reports
+    (`addStartReport`), in the order they were added, and then the
+    `listening` line with `addr`, `config` (`cfg.Path`) and `data_dir`
+    (`cfg.DataDir()`).
 
 The listener is bound before the maintenance loop starts, so that a bind
 failure is the only line of a failed start. A failure before listening is
@@ -1866,6 +1882,102 @@ previous read: the stream ends without another frame and without a log
 line, rather than skip them, and the client that resumes with the last `id`
 it received is refused `410` `cursor_expired`.
 
+### Secrets
+
+`internal/hub/secrets.go` adds the part `composeSecrets`, after
+`composeEvents` in `parts`. It creates a zero `secret.Component`, registers
+`[secrets].key_file` (a string, default `""`), and adds the schema step
+`secret.SchemaStep` (`secrets`). Its configuration check calls
+`secret.LoadKeys(c.env, path)` on the hub's environment and the path of
+`[secrets].key_file`, a relative path taken from `cfg.Dir` as the
+`[sandbox]` section's path keys are; an error stops the start as the one
+`cannot start` line, before any store is opened, also for the bootstrap, and
+stops `backup`, which loads the configuration the same way, as its one
+`backup failed` line
+([ADR 06](adr/06-load-the-secret-keys-before-the-stores-open.md)). The start
+hook `secrets` binds the component to `secret.Deps{Store: rt.Store, Keys:
+<the loaded keys>, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events}`
+and reads `(*secret.Component).StartReport`: whether a current and a
+previous key are configured, and the number of rows of `secrets` whose
+`key_id` is neither key's `secret.KeyID`, counted in SQL without decrypting
+anything. A failing count fails the hook. The part's start report
+(`addStartReport`) writes it with `(secret.StartReport).Log` once the
+listener is bound: the info line `secret encryption` with `key_configured`,
+`previous_key_present` and `undecryptable_secrets`, and without a current key
+the warn line `secrets cannot be stored: no encryption key configured`. Key
+material is never logged: `secret.Key` logs, prints and encodes as JSON as
+`[key]`, also inside a struct such as `secret.Keys` that slog's JSON handler
+encodes, and the report and the loading errors carry booleans, counts and the names of the
+variable or the file only.
+
+The part registers the routes of `(*secret.Component).Routes` and adds
+`(*secret.Component).ScopeCheck` to the access checks, after identity's admin
+check and access's subset and workspace checks. Every secret route carries
+the mark `secret.MarkScope` (`secret.scope`: `user`, `org` or `workspace`),
+and the workspace routes also `access.MarkNeed` `owner`, so the workspace
+access check answers the member's `403` and the stranger's `404` before the
+scope is resolved. The scope check resolves the scope with one function per
+scope (`internal/secret/scope.go`): the caller's user id for `user` (the
+admin token is refused `403 forbidden`); for `org` the org of
+`identity.OrgBySelector`, which the admin token reaches in any status and a
+user only when it is among `identity.ActiveOrgIDs`, every other case one
+constant `404 org not found`; for `workspace` the path's slug once the
+workspace access check has attached its decision. It attaches the scope
+with `server.Attach` ([ADR 04](adr/04-let-a-check-attach-a-value-for-the-handler.md)),
+and the handlers read it. The list handler pages
+`(*secret.Component).ListPage` with `server.ReadPage` and `server.WritePage`,
+the lowered key as the position, and reads no value. The create handler
+checks the body (`internal/secret/validate.go`), answers
+`secret.UnavailableError` without a current key, and then, in one
+`store.Tx`, calls `(*secret.Component).CreateEntries` and writes one
+`parley.secret.create` event per entry through the component's
+`secret.Emitter` (`*event.Component`), so the entries and their events
+commit together or not at all. The update handler checks the body's `value`,
+answers `secret.UnavailableError` without a current key, and then, in one
+`store.Tx`, calls `(*secret.Component).UpdateEntry`, which seals the new
+value without opening the old one, and writes `parley.secret.update`; the
+delete handler needs no key and calls `(*secret.Component).DeleteEntry`,
+which never opens the value, and writes `parley.secret.delete`. Both events
+name the key as it is stored, whatever casing the path used.
+
+The part also registers the removal of the secrets of a user and of an org
+on the identity service, with `c.identity.RegisterUserRemover` and
+`c.identity.RegisterOrgRemover`
+([ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)):
+each remover calls `(*secret.Component).RemoveScope` with `secret.ScopeUser`
+or `secret.ScopeOrg` and the id the delete gives it. `DELETE /users/:id` and
+`DELETE /orgs/:id` call them in their own transaction, before the record is
+deleted, so the secrets go with the user or the org; the user delete's
+`guardLastAdmin` refuses the only active admin with `409 conflict` before
+any remover runs, and a delete that is refused or rolls back keeps them. The
+removal reads no value and writes no `parley.secret.*` event.
+
+The part registers the maintenance task `secret_reencryption`, which calls
+`(*secret.Component).Reencrypt(ctx, rt.Logger)` (`internal/secret/reencrypt.go`)
+in every pass. With a current and a previous key configured, and the two
+different, it reads the rows of `secrets` whose `key_id` is the previous
+key's `secret.KeyID`, 100 at a time in the order of their `id`, opens each
+under the previous key with the binding of its entry and seals it under the
+current key with the same binding. It writes each row in a `store.Tx` of its
+own with `UPDATE … WHERE id = ? AND key_id = ? AND sealed = ?`, the key id
+and sealed bytes it read, so that a row a request updated or deleted in the
+meantime keeps the request's result; it never changes `key`, `created_at` or
+`updated_at` and writes no event. A value that fails to open stays as it is
+and counts as remaining. Without a current or a previous key it converts
+nothing. Then it runs the converters other parts registered with
+`(*secret.Component).RegisterConverter(fn secret.Converter)`, in
+registration order: a `Converter` (`func(ctx, keys secret.Keys) (converted,
+remaining int, err error)`) re-seals the values a part keeps outside the
+secret table, such as those it stored with `SealValue`, and nothing
+registers one yet. The task ends with the info line `secret re-encryption`
+with `converted` (the rows it re-sealed plus the converters' counts) and
+`remaining` (the rows whose `key_id` is not the current key's, every row
+without a current key, plus the converters' counts). A store failure stops
+it before the converters and the line and returns the error, which the
+maintenance loop logs as `maintenance task failed`; the rows written until
+then stay converted, and every value still opens with the two keys. A
+converter's error is returned after the line.
+
 ### The logger
 
 `hub.NewLogger(w, level, scrubber)` returns a `*slog.Logger` with
@@ -2246,6 +2358,21 @@ comma-separated flags, and `create` sends `paths` only when `--paths` is
 given and declares `ShowsOnce`. `changePermissions` builds the three
 permission commands; after the answer is printed, `replace` and `remove`
 note on stderr a Token whose `revoked_at` is not null.
+
+`parley secrets` (`secrets.go`) is `create`, `list`, `update` and `delete`,
+each with a run step of its own. `withSecretArgs` wraps a command's argument
+check so that the scope flags and the entries are refused as usage errors
+before any setting is resolved: an empty `--org` or `--workspace`, more
+than one scope flag on all but `create`, and arguments that `parseEntries`
+or the `--from-stdin` check refuses. `secretScopes` turns the flags into the
+scopes' routes in the order user, org, workspace, the user's alone without
+a flag. `create` sends one request per scope, keeps going after a failure,
+prints the items of the scopes that succeeded, writes every failure but the
+last with `printError` and returns the last, which `run` prints, so each is
+written once and the exit status is the last failure's. `list` reads the
+whole list with `printWholeList`, which asks for pages of 200, follows
+`next_cursor` and prints `{"items":[…]}`; `delete` prints its `Confirm`
+document `{"deleted":"<KEY>"}`.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
