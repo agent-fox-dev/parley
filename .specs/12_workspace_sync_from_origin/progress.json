@@ -3,7 +3,7 @@
   "spec_id": "12",
   "spec_name": "workspace_sync_from_origin",
   "schema_version": 3,
-  "updated_at": "2026-11-14T10:22:08Z",
+  "updated_at": "2026-11-14T10:26:35Z",
   "tasks": [
     {
       "id": 1,
@@ -11,7 +11,7 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,

@@ -2020,8 +2020,22 @@ lacks, at origin's value (an annotated tag as its tag object), each with
 `CompareAndSwapRef` expecting the tag absent, so that a tag another writer
 creates meanwhile keeps that writer's value; a tag the copy has keeps its
 value, whether origin has it at another value, has deleted it or never had
-it. It returns a `SyncResult` holding the record it read and
-`CreatedTags`, the tags it created.
+it. It then evaluates every branch origin has, in name order, against the
+hub's head of it: `created` when the hub has no such branch, `up_to_date`
+when the heads are equal, `fast_forward` when the hub's head is an ancestor
+of origin's, `ahead` when origin's head is an ancestor of the hub's, and
+otherwise `diverged`, or `reset` when `SyncOptions.ResetToOrigin` is set.
+`created`, `fast_forward` and `reset` move the branch to origin's head with
+`CompareAndSwapRef` expecting the head that was classified (absent for
+`created`); the others move nothing, and a diverged branch does not stop
+the walk. A branch only the hub has, never on origin or deleted there, is
+neither looked at nor reported. Protected branches are treated as any
+other: sync reads neither the push rules nor `protected_branches` and
+`protect.owner_push`. It returns a `SyncResult` holding the record it read,
+`CreatedTags`, the tags it created, and `Branches`, one `BranchResult`
+(`name`, `result`, `local_sha`, `origin_sha` as JSON, the hub's head after
+the branch was handled and origin's head, full commit ids) per origin
+branch, sorted by name, empty and never nil when origin has no branch.
 
 ### Hub events
 

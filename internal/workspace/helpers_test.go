@@ -901,3 +901,29 @@ func (f *recordingFetcher) recorded() []fetchCall {
 	defer f.mu.Unlock()
 	return append([]fetchCall(nil), f.calls...)
 }
+
+// ref is the object id of the ref name of the repository at dir, "" when
+// there is no such ref.
+func ref(t *testing.T, dir, name string) string {
+	t.Helper()
+	return gitrepotest.Git(t, dir, "for-each-ref", "--format=%(objectname)", name)
+}
+
+// grow points branch of the repository at dir at a new commit on top of
+// from, with from's tree and a message naming where, and returns its id, so
+// that two sides grown from one commit differ.
+func grow(t *testing.T, dir, branch, from, where string) string {
+	t.Helper()
+	id := gitrepotest.Git(t, dir, "commit-tree", from+"^{tree}", "-p", from, "-m", where+" on "+branch)
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+branch, id)
+	return id
+}
+
+// outcomes maps every branch of r to its result.
+func outcomes(r workspace.SyncResult) map[string]workspace.BranchOutcome {
+	m := map[string]workspace.BranchOutcome{}
+	for _, b := range r.Branches {
+		m[b.Name] = b.Result
+	}
+	return m
+}
