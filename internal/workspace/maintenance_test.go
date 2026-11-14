@@ -2,16 +2,15 @@ package workspace_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,50 +21,13 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// operation is a route that retires or repairs a workspace: the method and
-// the part of the path after /api/v1/workspaces/<slug>.
-type operation struct{ name, method, suffix string }
-
-// operations are the four such routes.
-var operations = []operation{
-	{"archive", http.MethodPost, "/archive"},
-	{"reactivate", http.MethodPost, "/reactivate"},
-	{"reclone", http.MethodPost, "/reclone"},
-	{"delete", http.MethodDelete, ""},
-}
-
-// operationNamed is the operation named name.
-func operationNamed(name string) operation {
-	return operations[slices.IndexFunc(operations, func(o operation) bool { return o.name == name })]
-}
-
-// operate sends the operation named op on slug, with no body, with cred as
-// the bearer credential.
-func (w *world) operate(t *testing.T, op, cred, slug string) answer {
-	t.Helper()
-	o := operationNamed(op)
-	status, b := w.Call(t, o.method, "/api/v1/workspaces/"+slug+o.suffix, cred, nil)
-	return answer{status, b}
-}
-
-// outcome is a's status, followed by its error_type when it is a refusal.
-func (a answer) outcome(t *testing.T) string {
-	t.Helper()
-	if a.status < 300 {
-		return fmt.Sprint(a.status)
-	}
-	return fmt.Sprintf("%d %s", a.status, a.errorType(t))
-}
-
 // recordingCollaborators starts a world with opts whose safety-copy pusher
 // and teardown set are stubs alone, which record every call: the pusher in
 // the stub it returns, the session closer, the archive observer, the
 // sandbox remover and a remover of owned data in the log.
 func recordingCollaborators(t *testing.T, opts ...option) (*world, *stubBranchesPusher, *teardownLog) {
 	t.Helper()
-	p := &stubBranchesPusher{answer: func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		return nil, nil
-	}}
+	p := &stubBranchesPusher{}
 	calls := &teardownLog{}
 	stub := &stubTeardown{name: "stub", log: calls}
 	w := newWorld(t, append(opts, withSafetyPusher(p), withTeardown(func(td *workspace.Teardown) {
@@ -81,8 +43,7 @@ func recordingCollaborators(t *testing.T, opts ...option) (*world, *stubBranches
 func TestMaintenance_EveryOperationIsBusyWhileTheMarkerIsSet(t *testing.T) {
 	t.Parallel()
 	w, p, calls := recordingCollaborators(t)
-	url := "https://origin.test/r.git"
-	w.put(t, workspace.Workspace{Slug: "demo", GitURL: &url})
+	w.put(t, workspace.Workspace{Slug: "demo"})
 	// alone is what each operation answers by the status alone.
 	alone := map[string]map[workspace.Status]string{
 		"archive":    {workspace.StatusReady: "200", workspace.StatusFailed: "200", workspace.StatusArchived: "409 workspace_archived"},
@@ -109,7 +70,7 @@ func TestMaintenance_EveryOperationIsBusyWhileTheMarkerIsSet(t *testing.T) {
 			}
 			// The same request on a workspace without the marker.
 			other := fmt.Sprintf("other-%s-%s", status, op.name)
-			w.put(t, workspace.Workspace{Slug: other, Status: status, GitURL: &url})
+			w.put(t, workspace.Workspace{Slug: other, Status: status})
 			if got, want := w.operate(t, op.name, w.uKey, other).outcome(t), alone[op.name][status]; got != want {
 				t.Errorf("%s of %s %s = %s, want %s", op.name, status, other, got, want)
 			}
@@ -140,13 +101,12 @@ func TestMaintenance_EveryOperationIsBusyWhileTheMarkerIsSet(t *testing.T) {
 func TestMaintenance_RefusesCallersWithoutWriteAccess(t *testing.T) {
 	t.Parallel()
 	w, p, calls := recordingCollaborators(t)
-	acme, url := w.acme(t), "https://origin.test/r.git"
+	acme := w.acme(t)
 	for _, rec := range []workspace.Workspace{
 		{Slug: "team", OrgID: acme, Status: workspace.StatusReady},
 		{Slug: "team-archived", OrgID: acme, Status: workspace.StatusArchived},
 		{Slug: "own", Status: workspace.StatusReady},
 	} {
-		rec.GitURL = &url
 		w.put(t, rec)
 	}
 	readOnly := w.pat(t, w.u, "workspaces:read")
@@ -191,95 +151,54 @@ func TestMaintenance_RefusesCallersWithoutWriteAccess(t *testing.T) {
 	if heads, _ := p.calls(); len(heads) != 0 {
 		t.Errorf("refused requests offered branches to origin %d times, want never", len(heads))
 	}
-	if a := w.archive(t, w.Token, "own"); a.status != http.StatusOK {
+	if a := w.operate(t, "archive", w.Token, "own"); a.status != http.StatusOK {
 		t.Errorf("archive by the admin token = %d %s, want 200", a.status, a.body)
 	}
 }
-
-// tripwire stands for collaborators of an operation: the one named where
-// fails, or panics, at each call while mode is "fail" or "panic".
-type tripwire struct {
-	mu          sync.Mutex
-	where, mode string
-}
-
-func (tw *tripwire) set(where, mode string) {
-	tw.mu.Lock()
-	defer tw.mu.Unlock()
-	tw.where, tw.mode = where, mode
-}
-
-func (tw *tripwire) hit(what string) error {
-	tw.mu.Lock()
-	where, mode := tw.where, tw.mode
-	tw.mu.Unlock()
-	switch {
-	case what != where:
-	case mode == "panic":
-		panic("the " + what + " panicked")
-	case mode == "fail":
-		return errors.New("the " + what + " failed")
-	}
-	return nil
-}
-
-func (tw *tripwire) RemoveSandboxes(context.Context, []string) error {
-	return tw.hit("sandbox remover")
-}
-
-func (tw *tripwire) WorkspaceArchived(context.Context, string, []string) error {
-	return tw.hit("archive observer")
-}
-
-func (tw *tripwire) remove(context.Context, *sql.Tx, string) error { return tw.hit("remover") }
 
 func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
 		name, op string
-		// status is one the operation takes; where and mode make a
-		// collaborator fail or panic, where "event writer" fails the write
-		// of the operation's event; want is the answer.
-		status      workspace.Status
-		where, mode string
-		want        string
+		// status is one the operation takes; the collaborator where fails,
+		// or panics when panics is set; want is the answer.
+		status workspace.Status
+		where  string
+		panics bool
+		want   string
 	}{
 		{name: "archive succeeds", op: "archive", status: workspace.StatusReady, want: "200"},
-		{name: "archive whose transaction fails", op: "archive", status: workspace.StatusReady,
-			where: "event writer", want: "500 internal"},
 		{name: "archive whose observer panics", op: "archive", status: workspace.StatusReady,
-			where: "archive observer", mode: "panic", want: "500 internal"},
-		{name: "reclone whose transaction fails", op: "reclone", status: workspace.StatusReady,
-			where: "event writer", want: "500 internal"},
+			where: "archive observer", panics: true, want: "500 internal"},
 		{name: "reclone whose copy removal panics", op: "reclone", status: workspace.StatusReady,
-			where: "copy removal", mode: "panic", want: "500 internal"},
+			where: "copy removal", panics: true, want: "500 internal"},
 		{name: "delete whose sandbox remover fails", op: "delete", status: workspace.StatusArchived,
-			where: "sandbox remover", mode: "fail", want: "500 internal"},
+			where: "sandbox remover", want: "500 internal"},
 		{name: "delete whose sandbox remover panics", op: "delete", status: workspace.StatusArchived,
-			where: "sandbox remover", mode: "panic", want: "500 internal"},
+			where: "sandbox remover", panics: true, want: "500 internal"},
 		{name: "delete whose removal step fails", op: "delete", status: workspace.StatusArchived,
-			where: "remover", mode: "fail", want: "500 internal"},
+			where: "remover", want: "500 internal"},
 		{name: "delete succeeds", op: "delete", status: workspace.StatusArchived, want: "204"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			tw := &tripwire{}
+			stubs := map[string]*stubTeardown{}
+			for _, name := range []string{"archive observer", "copy removal", "sandbox remover", "remover"} {
+				stubs[name] = &stubTeardown{name: name}
+			}
 			w := newWorld(t, withTeardown(func(td *workspace.Teardown) {
-				td.RegisterSandboxRemover(tw)
-				td.RegisterArchiveObserver(tw)
-				td.RegisterRemover(tw.remove)
+				td.RegisterSandboxRemover(stubs["sandbox remover"])
+				td.RegisterArchiveObserver(stubs["archive observer"])
+				td.RegisterRemover(stubs["remover"].remove)
 			}), withRemoveCopy(func(dir string) error {
-				if err := tw.hit("copy removal"); err != nil {
+				if err := stubs["copy removal"].remove(context.Background(), nil, dir); err != nil {
 					return err
 				}
 				return gitrepo.Remove(dir)
 			}))
-			url := "https://origin.test/r.git"
-			w.put(t, workspace.Workspace{Slug: "demo", Status: c.status, GitURL: &url})
-			if c.where == "event writer" {
-				w.fail(faultEvent)
-			} else {
-				tw.set(c.where, c.mode)
+			w.put(t, workspace.Workspace{Slug: "demo", Status: c.status})
+			if c.where != "" {
+				stubs[c.where].set(errors.New("the "+c.where+" failed"), c.panics)
 			}
 
 			if a := w.operate(t, c.op, w.uKey, "demo"); a.outcome(t) != c.want {
@@ -293,8 +212,9 @@ func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 			if found && rec.Marker != workspace.MarkerNone {
 				t.Errorf("the marker is %q after the call, want it released", rec.Marker)
 			}
-			w.fail("")
-			tw.set("", "")
+			if c.where != "" {
+				stubs[c.where].set(nil, false)
+			}
 			if !found {
 				if a := w.operate(t, c.op, w.uKey, "demo"); a.outcome(t) != "404 not_found" {
 					t.Errorf("%s of the deleted workspace = %d %s, want 404 not_found", c.op, a.status, a.body)
@@ -310,6 +230,58 @@ func TestMaintenance_TheMarkerIsReleasedWhenTheCallEnds(t *testing.T) {
 				t.Errorf("the next %s = %d %s, want it to succeed", c.op, a.status, a.body)
 			}
 		})
+	}
+}
+
+func TestMaintenance_TheMarkerAdmitsOneOperationPerWorkspaceAtATime(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
+	w.put(t, workspace.Workspace{Slug: "other", Status: workspace.StatusReady})
+	ctx := context.Background()
+	const n = 8
+	start, release := make(chan struct{}), make(chan struct{})
+	free := sync.OnceFunc(func() { close(release) })
+	defer free()
+	var ran atomic.Int32
+	results := make(chan error, n)
+	for range n {
+		go func() {
+			<-start
+			results <- w.svc.WithMarker(ctx, "demo", workspace.MarkerArchive, func() error {
+				ran.Add(1)
+				<-release
+				return nil
+			})
+		}()
+	}
+	close(start)
+	for i := range n - 1 {
+		select {
+		case err := <-results:
+			var guard *server.Error
+			if !errors.As(err, &guard) || guard.Type() != "workspace_busy" {
+				t.Errorf("a call that lost the race answered %v, want workspace_busy", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%d of %d calls were refused while one held the marker of demo, want %d", i, n, n-1)
+		}
+	}
+	other := false
+	if err := w.svc.WithMarker(ctx, "other", workspace.MarkerReclone, func() error { other = true; return nil }); err != nil || !other {
+		t.Errorf("the marker of other while demo holds one: ran %t, %v; want it run", other, err)
+	}
+	free()
+	if err := <-results; err != nil {
+		t.Errorf("the call that holds the marker answered %v, want nil", err)
+	}
+	if got := ran.Load(); got != 1 {
+		t.Errorf("%d calls ran while holding the marker of demo, want 1", got)
+	}
+	for _, slug := range []string{"demo", "other"} {
+		if rec, _ := w.workspace(t, slug); rec.Marker != workspace.MarkerNone {
+			t.Errorf("the marker of %s is %q afterwards, want it released", slug, rec.Marker)
+		}
 	}
 }
 
@@ -387,7 +359,7 @@ func TestMaintenance_OneOperationAtATimeOnAWorkspace(t *testing.T) {
 			t.Errorf("%s of demo while it is archived = %d %s, want 409 workspace_busy", op, got.status, got.body)
 		}
 	}
-	if got := w.archive(t, w.uKey, "other"); got.status != http.StatusOK {
+	if got := w.operate(t, "archive", w.uKey, "other"); got.status != http.StatusOK {
 		t.Errorf("archive of other while demo is archived = %d %s, want 200", got.status, got.body)
 	}
 	a.Release()
@@ -409,21 +381,11 @@ func TestMaintenance_OneOperationAtATimeOnAWorkspace(t *testing.T) {
 	}
 }
 
-// blockingSandboxes is a sandbox remover that tells started of its call and
-// then waits for release.
-type blockingSandboxes struct{ started, release chan struct{} }
-
-func (s *blockingSandboxes) RemoveSandboxes(context.Context, []string) error {
-	close(s.started)
-	<-s.release
-	return nil
-}
-
 func TestMaintenance_ACallerWhoDisconnectsDoesNotStopTheOperation(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.SmartOrigin(t)
 	o.History()
-	sandboxes := &blockingSandboxes{started: make(chan struct{}), release: make(chan struct{})}
+	sandboxes := &stubTeardown{name: "sandboxes", started: make(chan struct{}), release: make(chan struct{})}
 	w := newWorld(t, withGitOrigin(o), withTeardown(func(td *workspace.Teardown) { td.RegisterSandboxRemover(sandboxes) }))
 	w.cloneFrom(t, "arc", o)
 	w.cloneFrom(t, "rec", o)

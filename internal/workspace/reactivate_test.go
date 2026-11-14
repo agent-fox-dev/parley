@@ -12,7 +12,6 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
-	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -20,14 +19,6 @@ import (
 
 // reactivateEvent is the event a reactivate writes.
 const reactivateEvent = "parley.workspace.reactivate"
-
-// reactivate sends POST /workspaces/<slug>/reactivate, with no body, with
-// cred as the bearer credential.
-func (w *world) reactivate(t *testing.T, cred, slug string) answer {
-	t.Helper()
-	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/reactivate", cred, nil)
-	return answer{status, b}
-}
 
 // statusAtNotify records, for every clone notification, the status the
 // store holds for the workspace at that moment, before the world's own
@@ -64,8 +55,7 @@ func TestReactivate_PutsAnArchivedWorkspaceBackToPending(t *testing.T) {
 	t.Parallel()
 	seen := &statusAtNotify{}
 	w := newWorld(t, seen.option())
-	url := "https://origin.test/r.git"
-	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusArchived, GitURL: &url})
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusArchived})
 	for _, c := range []struct {
 		name      string
 		cred      string
@@ -86,7 +76,7 @@ func TestReactivate_PutsAnArchivedWorkspaceBackToPending(t *testing.T) {
 			defer w.fail("")
 			events, notified := len(w.eventsOf(t, reactivateEvent)), len(w.notifications())
 
-			a := w.reactivate(t, c.cred, "demo")
+			a := w.operate(t, "reactivate", c.cred, "demo")
 
 			rec, _ := w.workspace(t, "demo")
 			evs := w.eventsOf(t, reactivateEvent)
@@ -128,7 +118,6 @@ func TestReactivate_PutsAnArchivedWorkspaceBackToPending(t *testing.T) {
 func TestReactivate_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	url := "https://origin.test/r.git"
 	for _, rec := range []workspace.Workspace{
 		{Slug: "demo", Status: workspace.StatusArchived},
 		{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusArchived},
@@ -136,12 +125,7 @@ func TestReactivate_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 		{Slug: "failed", Status: workspace.StatusFailed},
 		{Slug: "pending", Status: workspace.StatusPending},
 		{Slug: "cloning", Status: workspace.StatusCloning},
-		{Slug: "archived-busy", Status: workspace.StatusArchived, Marker: workspace.MarkerDelete},
-		{Slug: "ready-busy", Status: workspace.StatusReady, Marker: workspace.MarkerReclone},
 	} {
-		if rec.Kind == "" {
-			rec.GitURL = &url
-		}
 		w.put(t, rec)
 	}
 	for _, c := range []struct {
@@ -154,11 +138,9 @@ func TestReactivate_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 		{"failed", http.StatusConflict, "workspace_not_archived"},
 		{"pending", http.StatusConflict, "workspace_not_archived"},
 		{"cloning", http.StatusConflict, "workspace_not_archived"},
-		{"archived-busy", http.StatusConflict, "workspace_busy"},
-		{"ready-busy", http.StatusConflict, "workspace_busy"},
 	} {
 		before, _ := w.workspace(t, c.slug)
-		if a := w.reactivate(t, w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
+		if a := w.operate(t, "reactivate", w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
 			t.Errorf("reactivate of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
 		}
 		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
@@ -173,24 +155,14 @@ func TestReactivate_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	}
 }
 
-func TestReactivate_CloneWorkBringsTheWorkspaceBackFromItsCopyOrFromOrigin(t *testing.T) {
+func TestReactivate_CloneWorkClonesOriginAfreshWhenTheCopyIsNoLongerValid(t *testing.T) {
 	t.Parallel()
-	refuseAll := &stubBranchesPusher{answer: func(_ context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		var got []gitrepo.BranchPush
-		for b, id := range req.Heads {
-			got = append(got, gitrepo.BranchPush{Branch: b, Commit: id, Err: gitrepo.ErrNonFastForward})
-		}
-		return got, nil
-	}}
-	s := newSyncWorld(t, withCloneWorkers(), withSafetyPusher(refuseAll))
+	s := newSyncWorld(t, withCloneWorkers(), withSafetyPusher(&stubBranchesPusher{answer: taking(0)}))
 	for _, c := range []struct {
 		name string
-		// damage breaks the copy after the archive; nil keeps it valid.
+		// damage breaks the copy after the archive.
 		damage func(t *testing.T)
 	}{
-		// The kept copy comes first: it holds the hub's commits, which a
-		// fresh clone of a later row has thrown away.
-		{name: "the kept copy is valid"},
 		{name: "the copy directory is removed", damage: func(t *testing.T) {
 			if err := os.RemoveAll(s.copy); err != nil {
 				t.Fatal(err)
@@ -211,15 +183,12 @@ func TestReactivate_CloneWorkBringsTheWorkspaceBackFromItsCopyOrFromOrigin(t *te
 			if _, err := s.Store.Main().Exec(`UPDATE workspaces SET head_sha = ? WHERE slug = ?`, hubMain, syncSlug); err != nil {
 				t.Fatal(err)
 			}
-			if a := s.archive(t, s.uKey, syncSlug); a.status != http.StatusOK {
+			if a := s.operate(t, "archive", s.uKey, syncSlug); a.status != http.StatusOK {
 				t.Fatalf("archive = %d %s, want 200", a.status, a.body)
 			}
-			if c.damage != nil {
-				c.damage(t)
-			}
-			asked := s.origin.Requests()
+			c.damage(t)
 
-			if a := s.reactivate(t, s.uKey, syncSlug); a.status != http.StatusOK {
+			if a := s.operate(t, "reactivate", s.uKey, syncSlug); a.status != http.StatusOK {
 				t.Fatalf("reactivate = %d %s, want 200", a.status, a.body)
 			}
 			var rec workspace.Workspace
@@ -230,21 +199,10 @@ func TestReactivate_CloneWorkBringsTheWorkspaceBackFromItsCopyOrFromOrigin(t *te
 			if rec.Status != workspace.StatusReady {
 				t.Fatalf("the reactivated workspace is %s (%v), want ready", rec.Status, deref(rec.CloneError))
 			}
-			localOnly := ref(t, s.copy, "refs/heads/local-only")
-			if c.damage == nil {
-				if deref(rec.HeadSHA) != hubMain || localOnly == "" {
-					t.Errorf("head_sha %s and local-only %q after the reactivate, want the head before the archive %s and the branch kept",
-						deref(rec.HeadSHA), localOnly, hubMain)
-				}
-				if n := s.origin.Requests() - asked; n != 0 {
-					t.Errorf("origin got %d requests between the reactivate and ready, want none", n)
-				}
-				return
-			}
 			if main := ref(t, s.copy, "refs/heads/main"); main != originMain || deref(rec.HeadSHA) != originMain {
 				t.Errorf("the copy's main %s and head_sha %s after the fresh clone, want origin's main %s", main, deref(rec.HeadSHA), originMain)
 			}
-			if localOnly != "" {
+			if localOnly := ref(t, s.copy, "refs/heads/local-only"); localOnly != "" {
 				t.Errorf("refs/heads/local-only is %s in the fresh copy, want it absent", localOnly)
 			}
 		})

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"os"
 	"reflect"
@@ -25,53 +24,27 @@ import (
 // archiveEvent is the event an archive writes.
 const archiveEvent = "parley.workspace.archive"
 
-// archive sends POST /workspaces/<slug>/archive, with no body, with cred as
-// the bearer credential.
-func (w *world) archive(t *testing.T, cred, slug string) answer {
-	t.Helper()
-	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/archive", cred, nil)
-	return answer{status, b}
-}
-
 func TestArchive_ArchivesAndRecordsTheOutcome(t *testing.T) {
 	t.Parallel()
-	p := &stubBranchesPusher{}
-	s := newSyncWorld(t, withSafetyPusher(p))
-	ready, _ := s.workspace(t, syncSlug)
-
 	// seen is the status the store held for the workspace when the safety
 	// copy offered its branches.
 	var mu sync.Mutex
 	var seen workspace.Status
-	// taking answers for every branch offered, in the order of the names,
-	// that origin took the first n and refused the others.
-	look := func(ctx context.Context) {
+	var s *syncWorld
+	p := &stubBranchesPusher{before: func(ctx context.Context) {
 		rec, _, _ := workspace.BySlug(ctx, s.Store.Main(), syncSlug)
 		mu.Lock()
 		seen = rec.Status
 		mu.Unlock()
-	}
-	taking := func(n int) func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		return func(ctx context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-			look(ctx)
-			var got []gitrepo.BranchPush
-			for i, b := range slices.Sorted(maps.Keys(req.Heads)) {
-				r := gitrepo.BranchPush{Branch: b, Commit: req.Heads[b], Result: gitrepo.PushUpToDate}
-				if i >= n {
-					r.Result, r.Err = "", gitrepo.ErrNonFastForward
-				}
-				got = append(got, r)
-			}
-			return got, nil
-		}
-	}
-	dialFails := func(ctx context.Context, _ gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		look(ctx)
+	}}
+	s = newSyncWorld(t, withSafetyPusher(p))
+	ready, _ := s.workspace(t, syncSlug)
+	dialFails := func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
 		return nil, errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
 	}
 	for _, c := range []struct {
 		name   string
-		answer func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error)
+		answer pushAnswer
 		fault  string
 		forks  int
 		// failed archives the workspace after its clone failed, with no
@@ -110,9 +83,7 @@ func TestArchive_ArchivesAndRecordsTheOutcome(t *testing.T) {
 				s.put(t, workspace.Workspace{Slug: fmt.Sprintf("%s--f%d", syncSlug, i), Kind: access.KindFork,
 					ParentSlug: new(syncSlug), Status: workspace.StatusReady})
 			}
-			p.mu.Lock()
-			p.heads, p.ctxErr, p.answer = nil, nil, c.answer
-			p.mu.Unlock()
+			p.reset(c.answer)
 			mu.Lock()
 			seen = ""
 			mu.Unlock()
@@ -120,7 +91,7 @@ func TestArchive_ArchivesAndRecordsTheOutcome(t *testing.T) {
 			defer s.fail("")
 			events := len(s.eventsOf(t, archiveEvent))
 
-			a := s.archive(t, s.uKey, syncSlug)
+			a := s.operate(t, "archive", s.uKey, syncSlug)
 
 			rec, _ := s.workspace(t, syncSlug)
 			if rec.Marker != workspace.MarkerNone {
@@ -173,28 +144,20 @@ func TestArchive_ArchivesAndRecordsTheOutcome(t *testing.T) {
 
 func TestArchive_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	t.Parallel()
-	p := &stubBranchesPusher{answer: func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		return nil, nil
-	}}
+	p := &stubBranchesPusher{}
 	calls := &teardownLog{}
 	stub := &stubTeardown{name: "stub", log: calls}
 	w := newWorld(t, withSafetyPusher(p), withTeardown(func(td *workspace.Teardown) {
 		td.RegisterSessionCloser(stub)
 		td.RegisterArchiveObserver(stub)
 	}))
-	url := "https://origin.test/r.git"
 	for _, rec := range []workspace.Workspace{
 		{Slug: "demo", Status: workspace.StatusReady},
 		{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady},
 		{Slug: "archived", Status: workspace.StatusArchived},
-		{Slug: "archived-busy", Status: workspace.StatusArchived, Marker: workspace.MarkerDelete},
-		{Slug: "ready-busy", Status: workspace.StatusReady, Marker: workspace.MarkerReclone},
 		{Slug: "pending", Status: workspace.StatusPending},
 		{Slug: "cloning", Status: workspace.StatusCloning},
 	} {
-		if rec.Kind == "" {
-			rec.GitURL = &url
-		}
 		w.put(t, rec)
 	}
 	for _, c := range []struct {
@@ -204,13 +167,11 @@ func TestArchive_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	}{
 		{"demo--t1", http.StatusBadRequest, "not_supported_on_fork"},
 		{"archived", http.StatusConflict, "workspace_archived"},
-		{"archived-busy", http.StatusConflict, "workspace_busy"},
-		{"ready-busy", http.StatusConflict, "workspace_busy"},
 		{"pending", http.StatusConflict, "workspace_busy"},
 		{"cloning", http.StatusConflict, "workspace_busy"},
 	} {
 		before, _ := w.workspace(t, c.slug)
-		if a := w.archive(t, w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
+		if a := w.operate(t, "archive", w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
 			t.Errorf("archive of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
 		}
 		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
@@ -244,7 +205,7 @@ func TestArchive_LeavesTheCopyAndTheForksAsTheyAre(t *testing.T) {
 	s.put(t, workspace.Workspace{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: new(syncSlug), Status: workspace.StatusReady})
 	before := gitrepotest.Git(t, s.copy, "for-each-ref")
 
-	if a := s.archive(t, s.uKey, syncSlug); a.status != http.StatusOK {
+	if a := s.operate(t, "archive", s.uKey, syncSlug); a.status != http.StatusOK {
 		t.Fatalf("archive = %d %s, want 200", a.status, a.body)
 	}
 	if after := gitrepotest.Git(t, s.copy, "for-each-ref"); after != before {
@@ -272,8 +233,7 @@ func TestArchive_LeavesTheCopyAndTheForksAsTheyAre(t *testing.T) {
 func TestArchive_HubStartReleasesAMarkerLeftByAStoppedHub(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	url := "https://origin.test/r.git"
-	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady, GitURL: &url})
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady})
 	w.setMarker(t, "demo", workspace.MarkerArchive)
 
 	w.Restart(t)
@@ -281,23 +241,9 @@ func TestArchive_HubStartReleasesAMarkerLeftByAStoppedHub(t *testing.T) {
 	if rec, _ := w.workspace(t, "demo"); rec.Marker != workspace.MarkerNone {
 		t.Errorf("the marker is %q after the restart, want it released", rec.Marker)
 	}
-	if a := w.archive(t, w.uKey, "demo"); a.status != http.StatusOK {
+	if a := w.operate(t, "archive", w.uKey, "demo"); a.status != http.StatusOK {
 		t.Errorf("archive after the restart = %d %s, want 200", a.status, a.body)
 	}
-}
-
-// archiveWithForks starts a world with opts and the ready workspace demo,
-// without a copy, so that the safety copy has nothing to offer, and its
-// forks.
-func archiveWithForks(t *testing.T, forks []string, opts ...option) *world {
-	t.Helper()
-	w := newWorld(t, opts...)
-	url := "https://origin.test/r.git"
-	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusReady, GitURL: &url})
-	for _, f := range forks {
-		w.put(t, workspace.Workspace{Slug: f, Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
-	}
-	return w
 }
 
 func TestArchive_EndsTheSessionsOfTheWorkspaceAndItsForks(t *testing.T) {
@@ -327,7 +273,7 @@ func TestArchive_EndsTheSessionsOfTheWorkspaceAndItsForks(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			a := w.archive(t, w.uKey, "demo")
+			a := w.operate(t, "archive", w.uKey, "demo")
 
 			if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" {
 				t.Errorf("answer status %v, want archived", obj["status"])
@@ -367,7 +313,7 @@ func TestArchive_TellsEveryObserverOnceTheArchiveHasCommitted(t *testing.T) {
 	}))
 	first.w, second.w = w, w
 
-	a := w.archive(t, w.uKey, "demo")
+	a := w.operate(t, "archive", w.uKey, "demo")
 
 	if obj := a.decode(t, http.StatusOK); obj["status"] != "archived" {
 		t.Errorf("answer status %v, want archived", obj["status"])

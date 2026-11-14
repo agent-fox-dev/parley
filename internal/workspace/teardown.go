@@ -158,7 +158,13 @@ func (s *Service) Teardown() *Teardown { return &s.teardown }
 // none. The first error stops it and is returned; the caller rolls tx back.
 // It is the one way a workspace's or a fork's owned data is removed.
 func (s *Service) RemoveOwned(ctx context.Context, tx *sql.Tx, slug, reason string) ([]string, error) {
-	set := s.teardown.snapshot()
+	return removeOwned(ctx, tx, s.teardown.snapshot(), slug, reason)
+}
+
+// removeOwned is RemoveOwned with the collaborators of set, so that a
+// delete, which removes several workspaces, calls the ones it took at its
+// start for each of them.
+func removeOwned(ctx context.Context, tx *sql.Tx, set teardownSet, slug, reason string) ([]string, error) {
 	ids := []string{}
 	if set.revoker != nil {
 		revoked, err := set.revoker.RevokeBoundTo(ctx, tx, []string{slug})

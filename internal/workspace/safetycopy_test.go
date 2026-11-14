@@ -6,13 +6,11 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
-	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -83,59 +81,28 @@ func TestSafetyCopy_LeavesTheIntegrationBranchOut(t *testing.T) {
 	}
 }
 
-// stubBranchesPusher is the hub's safety-copy pusher: it records the heads
-// of every push and the error of its context once the push returns, and
-// answers what answer, given the push, returns, without running git.
-type stubBranchesPusher struct {
-	mu     sync.Mutex
-	heads  []map[string]string
-	ctxErr []error
-	answer func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error)
-}
-
-func (p *stubBranchesPusher) PushBranches(ctx context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-	p.mu.Lock()
-	answer := p.answer
-	p.mu.Unlock()
-	got, err := answer(ctx, req)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.heads, p.ctxErr = append(p.heads, req.Heads), append(p.ctxErr, ctx.Err())
-	return got, err
-}
-
-// calls are the pushes so far: their heads and the error of their context.
-func (p *stubBranchesPusher) calls() ([]map[string]string, []error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.heads, p.ctxErr
-}
-
 func TestSafetyCopy_ReducesTheBranchResultsToOneOutcome(t *testing.T) {
 	t.Parallel()
 	p := &stubBranchesPusher{}
-	s := newSyncWorld(t, withPushDeadline(200*time.Millisecond), withCompose(func(c *hub.Composition) {
-		c.AdjustWorkspace(func(d *workspace.Deps) { d.SafetyPusher = p })
-	}))
-	url := s.origin.URL()
-	s.put(t, workspace.Workspace{Slug: "broken", Status: workspace.StatusFailed, GitURL: &url})
-	s.put(t, workspace.Workspace{Slug: "empty", Status: workspace.StatusReady, GitURL: &url})
+	s := newSyncWorld(t, withPushDeadline(200*time.Millisecond), withSafetyPusher(p))
+	s.put(t, workspace.Workspace{Slug: "broken", Status: workspace.StatusFailed})
+	s.put(t, workspace.Workspace{Slug: "empty", Status: workspace.StatusReady})
 	gitrepotest.Git(t, s.svc.RepoPath("empty"), "init", "--quiet", "--bare", s.svc.RepoPath("empty"))
 
 	pushed := gitrepo.BranchPush{Result: gitrepo.PushPushed}
 	upToDate := gitrepo.BranchPush{Result: gitrepo.PushUpToDate}
 	rejected := gitrepo.BranchPush{Err: gitrepo.ErrNonFastForward}
 	// answer gives main the first result and dev the second.
-	answer := func(main, dev gitrepo.BranchPush) func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+	answer := func(main, dev gitrepo.BranchPush) pushAnswer {
 		return func(_ context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
 			main.Branch, main.Commit, dev.Branch, dev.Commit = "main", req.Heads["main"], "dev", req.Heads["dev"]
 			return []gitrepo.BranchPush{main, dev}, nil
 		}
 	}
-	failing := func(err error) func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+	failing := func(err error) pushAnswer {
 		return func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) { return nil, err }
 	}
-	stalled := func(accepted []string) func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+	stalled := func(accepted []string) pushAnswer {
 		return func(ctx context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
 			<-ctx.Done()
 			var got []gitrepo.BranchPush
@@ -149,7 +116,7 @@ func TestSafetyCopy_ReducesTheBranchResultsToOneOutcome(t *testing.T) {
 		name   string
 		slug   string
 		fault  string
-		answer func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error)
+		answer pushAnswer
 		want   string
 		// pushed tells whether the pusher is called; cancelled whether its
 		// context has ended when it returns.
@@ -174,9 +141,7 @@ func TestSafetyCopy_ReducesTheBranchResultsToOneOutcome(t *testing.T) {
 		{name: "deadline passes after a branch was taken", answer: stalled([]string{"main"}), want: "partial", pushed: true, cancelled: true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			p.mu.Lock()
-			p.heads, p.ctxErr, p.answer = nil, nil, c.answer
-			p.mu.Unlock()
+			p.reset(c.answer)
 			s.fail(c.fault)
 			defer s.fail("")
 			slug := c.slug
@@ -208,7 +173,7 @@ func TestSafetyCopy_KeepsTheCredentialAndOriginsWordsOutOfTheArchive(t *testing.
 	s := newSyncWorld(t, withLog(&log), withSafetyPusher(p))
 	s.storeSecrets(t, map[string]string{workspace.SecretGitPAT: "s3cr3t-token"})
 
-	a := s.archive(t, s.uKey, syncSlug)
+	a := s.operate(t, "archive", s.uKey, syncSlug)
 
 	if a.status != http.StatusOK {
 		t.Fatalf("archive = %d %s, want 200", a.status, a.body)

@@ -23,20 +23,6 @@ import (
 // recloneEvent is the event a reclone writes.
 const recloneEvent = "parley.workspace.reclone"
 
-// reclone sends POST /workspaces/<slug>/reclone, with no body, with cred as
-// the bearer credential.
-func (w *world) reclone(t *testing.T, cred, slug string) answer {
-	t.Helper()
-	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/reclone", cred, nil)
-	return answer{status, b}
-}
-
-// exists tells whether something is at path.
-func exists(path string) bool {
-	_, err := os.Lstat(path)
-	return err == nil
-}
-
 // recordSteps records in steps the removals of a copy and the clone
 // notifications, in the order the hub makes them, each with whether the
 // copy's directory exists at that moment; the removal still removes.
@@ -58,13 +44,6 @@ func recordSteps(steps *teardownLog) option {
 	}
 }
 
-// withRemoveCopy makes remove the hub's removal of a workspace's copy.
-func withRemoveCopy(remove func(dir string) error) option {
-	return withCompose(func(c *hub.Composition) {
-		c.AdjustWorkspace(func(d *workspace.Deps) { d.RemoveCopy = remove })
-	})
-}
-
 // sameRefs fails the test unless the branches and tags of the repository
 // at dir are those of origin, with the same ids.
 func sameRefs(t *testing.T, dir string, origin *gitrepotest.Origin) {
@@ -79,24 +58,8 @@ func sameRefs(t *testing.T, dir string, origin *gitrepotest.Origin) {
 func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 	t.Parallel()
 	steps := &teardownLog{}
-	p := &stubBranchesPusher{}
+	p := &stubBranchesPusher{before: func(context.Context) { steps.add("push") }}
 	s := newSyncWorld(t, withSafetyPusher(p), recordSteps(steps))
-	// taking answers for every branch offered, in the order of the names,
-	// that origin took the first n and refused the others.
-	taking := func(n int) func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		return func(_ context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-			steps.add("push")
-			var got []gitrepo.BranchPush
-			for i, b := range slices.Sorted(maps.Keys(req.Heads)) {
-				r := gitrepo.BranchPush{Branch: b, Commit: req.Heads[b], Result: gitrepo.PushUpToDate}
-				if i >= n {
-					r.Result, r.Err = "", gitrepo.ErrNonFastForward
-				}
-				got = append(got, r)
-			}
-			return got, nil
-		}
-	}
 	done := []string{"push", "remove copy=true", "notify demo copy=false"}
 	for _, c := range []struct {
 		name  string
@@ -145,14 +108,12 @@ func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 					t.Fatalf("the copy holds the origin heads %v, want three", heads)
 				}
 			}
-			p.mu.Lock()
-			p.answer = taking(c.taken)
-			p.mu.Unlock()
+			p.reset(taking(c.taken))
 			s.fail(c.fault)
 			defer s.fail("")
 			events, made := len(s.eventsOf(t, recloneEvent)), len(steps.recorded())
 
-			a := s.reclone(t, s.uKey, syncSlug)
+			a := s.operate(t, "reclone", s.uKey, syncSlug)
 
 			rec, _ := s.workspace(t, syncSlug)
 			if rec.Marker != workspace.MarkerNone {
@@ -212,22 +173,16 @@ func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
 
 func TestReclone_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	t.Parallel()
-	p := &stubBranchesPusher{answer: func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
-		return nil, nil
-	}}
+	p := &stubBranchesPusher{}
 	w := newWorld(t, withSafetyPusher(p))
-	url := "https://origin.test/r.git"
 	for _, rec := range []workspace.Workspace{
 		{Slug: "ready-forked", Status: workspace.StatusReady},
 		{Slug: "failed-forked", Status: workspace.StatusFailed},
 		{Slug: "archived", Status: workspace.StatusArchived},
 		{Slug: "archived-forked", Status: workspace.StatusArchived},
-		{Slug: "archived-busy", Status: workspace.StatusArchived, Marker: workspace.MarkerDelete},
 		{Slug: "pending", Status: workspace.StatusPending},
 		{Slug: "cloning-forked", Status: workspace.StatusCloning},
-		{Slug: "ready-busy", Status: workspace.StatusReady, Marker: workspace.MarkerArchive},
 	} {
-		rec.GitURL = &url
 		w.put(t, rec)
 	}
 	for _, parent := range []string{"ready-forked", "failed-forked", "archived-forked", "cloning-forked"} {
@@ -241,10 +196,8 @@ func TestReclone_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 		{"ready-forked--t1", http.StatusBadRequest, "fork_has_no_origin"},
 		{"archived", http.StatusConflict, "workspace_archived"},
 		{"archived-forked", http.StatusConflict, "workspace_archived"},
-		{"archived-busy", http.StatusConflict, "workspace_busy"},
 		{"pending", http.StatusConflict, "workspace_busy"},
 		{"cloning-forked", http.StatusConflict, "workspace_busy"},
-		{"ready-busy", http.StatusConflict, "workspace_busy"},
 		{"ready-forked", http.StatusConflict, "has_forks"},
 		{"failed-forked", http.StatusConflict, "has_forks"},
 	} {
@@ -253,7 +206,7 @@ func TestReclone_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 			t.Fatal(err)
 		}
 		before, _ := w.workspace(t, c.slug)
-		if a := w.reclone(t, w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
+		if a := w.operate(t, "reclone", w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
 			t.Errorf("reclone of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
 		}
 		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
@@ -292,7 +245,7 @@ func TestReclone_TheNewCopyHoldsExactlyWhatOriginHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if a := s.reclone(t, s.uKey, syncSlug); a.status != http.StatusOK {
+	if a := s.operate(t, "reclone", s.uKey, syncSlug); a.status != http.StatusOK {
 		t.Fatalf("reclone = %d %s, want 200", a.status, a.body)
 	}
 	var rec workspace.Workspace
@@ -331,7 +284,7 @@ func TestReclone_ACopyLeftByAStoppedHubIsClonedFresh(t *testing.T) {
 	grow(t, s.copy, "local-only", s.origin.Head("main"), "hub")
 	s.origin.Reject("refused by policy")
 
-	if a := s.reclone(t, s.uKey, syncSlug); a.status != http.StatusOK {
+	if a := s.operate(t, "reclone", s.uKey, syncSlug); a.status != http.StatusOK {
 		t.Fatalf("reclone = %d %s, want 200", a.status, a.body)
 	}
 	if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusPending || ref(t, s.copy, "refs/heads/local-only") == "" {

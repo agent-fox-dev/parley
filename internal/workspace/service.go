@@ -148,7 +148,8 @@ type Service struct {
 	// teardown holds the collaborators an archive and a delete call.
 	teardown Teardown
 
-	// fetchLocks serialises the syncs' fetches into one copy.
+	// fetchLocks serialises the writes of origin heads into one copy: the
+	// syncs' fetches, the safety copy's and the reclone's removal of it.
 	fetchLocks keyedLocks
 }
 

@@ -82,8 +82,11 @@ func (s *Service) serveReactivate(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return fmt.Errorf("reactivate workspace %q: %w", slug, err)
 	}
-	s.Enqueue(slug)
+	// Read before the clone workers are woken, so that the answer is the
+	// record as the reactivate left it, pending, not as a clone has
+	// already moved it.
 	rec, found, err = BySlug(ctx, s.deps.Store.Main(), slug)
+	s.Enqueue(slug)
 	if err != nil {
 		return err
 	}

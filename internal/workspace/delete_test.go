@@ -28,14 +28,6 @@ import (
 // deleteEvent is the event a delete writes for each workspace it removes.
 const deleteEvent = "parley.workspace.delete"
 
-// deleteWorkspace sends DELETE /workspaces/<slug> with cred as the bearer
-// credential.
-func (w *world) deleteWorkspace(t *testing.T, cred, slug string) answer {
-	t.Helper()
-	status, b := w.Call(t, http.MethodDelete, "/api/v1/workspaces/"+slug, cred, nil)
-	return answer{status, b}
-}
-
 // owners are the collaborators of a delete whose data the stubs keep, as
 // one row of the table owned for each owner and workspace.
 var owners = []string{"changes", "secrets", "sessions", "tokens"}
@@ -216,8 +208,7 @@ func deleteWorld(t *testing.T, stub *deleteStub, forks []string, register func(*
 	if stub != nil {
 		stub.w = w
 	}
-	url := "https://origin.test/r.git"
-	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusArchived, GitURL: &url,
+	w.put(t, workspace.Workspace{Slug: "demo", Status: workspace.StatusArchived,
 		Settings: map[string]json.RawMessage{"note": json.RawMessage(`"kept"`)}})
 	for _, f := range forks {
 		w.put(t, workspace.Workspace{Slug: f, Kind: access.KindFork, ParentSlug: new("demo"), Status: workspace.StatusReady})
@@ -295,11 +286,13 @@ func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 		admin bool
 		forks bool
 		// want is the log of the calls, with the caller's name for
-		// "%s"; left are the rows of owned the delete leaves.
-		want []string
-		left []string
+		// "%s"; left are the rows of owned the delete leaves; recreate
+		// creates the slug again afterwards.
+		want     []string
+		left     []string
+		recreate bool
 	}{
-		{name: "the owner, with the forks removed one by one", want: oneByOne},
+		{name: "the owner, with the forks removed one by one", want: oneByOne, recreate: true},
 		{name: "the admin token", admin: true, want: oneByOne},
 		{name: "the owner, with a fork remover", forks: true,
 			want: slices.Concat([]string{sandboxes, "forks of demo by %s"}, removal("demo"),
@@ -315,7 +308,7 @@ func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 				cred = w.Token
 			}
 
-			a := w.deleteWorkspace(t, cred, "demo")
+			a := w.operate(t, "delete", cred, "demo")
 
 			if a.status != http.StatusNoContent || len(a.body) != 0 {
 				t.Fatalf("delete = %d %q, want 204 with no body", a.status, a.body)
@@ -336,6 +329,9 @@ func TestDelete_RemovesTheWorkspaceItsForksAndWhatTheyOwn(t *testing.T) {
 			if got := w.ownedRows(t); !slices.Equal(got, c.left) {
 				t.Errorf("owned rows after the delete %v, want %v", got, c.left)
 			}
+			if !c.recreate {
+				return
+			}
 			if obj := w.create(t, w.uKey, valid("demo")).decode(t, http.StatusCreated); obj["status"] != "pending" {
 				t.Errorf("a create with the deleted slug answers status %v, want pending", obj["status"])
 			}
@@ -347,34 +343,19 @@ func TestDelete_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
 	t.Parallel()
 	stub := &deleteStub{}
 	w := deleteWorld(t, stub, nil, registerAll(stub, true))
-	url := "https://origin.test/r.git"
-	for _, rec := range []workspace.Workspace{
-		{Slug: "ready", Status: workspace.StatusReady},
-		{Slug: "failed", Status: workspace.StatusFailed},
-		{Slug: "pending", Status: workspace.StatusPending},
-		{Slug: "cloning", Status: workspace.StatusCloning},
-		{Slug: "archived-busy", Status: workspace.StatusArchived, Marker: workspace.MarkerArchive},
-	} {
-		rec.GitURL = &url
-		w.put(t, rec)
-		makeCopy(t, w.svc.RepoPath(rec.Slug))
-	}
-	for _, c := range []struct{ slug, errorType string }{
-		{"ready", "workspace_not_archived"},
-		{"failed", "workspace_not_archived"},
-		{"pending", "workspace_not_archived"},
-		{"cloning", "workspace_not_archived"},
-		{"archived-busy", "workspace_busy"},
-	} {
-		before, _ := w.workspace(t, c.slug)
-		if a := w.deleteWorkspace(t, w.uKey, c.slug); a.status != http.StatusConflict || a.errorType(t) != c.errorType {
-			t.Errorf("delete of %s = %d %s, want 409 %s", c.slug, a.status, a.body, c.errorType)
+	for _, status := range []workspace.Status{workspace.StatusReady, workspace.StatusFailed, workspace.StatusPending, workspace.StatusCloning} {
+		slug := string(status)
+		w.put(t, workspace.Workspace{Slug: slug, Status: status})
+		makeCopy(t, w.svc.RepoPath(slug))
+		before, _ := w.workspace(t, slug)
+		if a := w.operate(t, "delete", w.uKey, slug); a.outcome(t) != "409 workspace_not_archived" {
+			t.Errorf("delete of %s = %d %s, want 409 workspace_not_archived", slug, a.status, a.body)
 		}
-		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
-			t.Errorf("delete of %s changed the record from %+v to %+v", c.slug, before, after)
+		if after, _ := w.workspace(t, slug); !reflect.DeepEqual(after, before) {
+			t.Errorf("delete of %s changed the record from %+v to %+v", slug, before, after)
 		}
-		if !exists(w.svc.RepoPath(c.slug)) {
-			t.Errorf("delete of %s removed its copy", c.slug)
+		if !exists(w.svc.RepoPath(slug)) {
+			t.Errorf("delete of %s removed its copy", slug)
 		}
 	}
 	if got := stub.log.recorded(); len(got) != 0 {
@@ -408,7 +389,7 @@ func TestDelete_HandsAForkToTheForkRemover(t *testing.T) {
 			w := deleteWorld(t, stub, []string{"demo--a"}, registerAll(stub, c.remover))
 			parent, _ := w.workspace(t, "demo")
 
-			a := w.deleteWorkspace(t, w.uKey, "demo--a")
+			a := w.operate(t, "delete", w.uKey, "demo--a")
 
 			if got := a.outcome(t); got != c.want || (a.status == http.StatusNoContent && len(a.body) != 0) {
 				t.Errorf("delete of the fork = %d %q, want %s", a.status, a.body, c.want)
@@ -469,7 +450,7 @@ func TestDelete_AFailingStepChangesNothing(t *testing.T) {
 				}
 			}
 
-			a := w.deleteWorkspace(t, w.uKey, "demo")
+			a := w.operate(t, "delete", w.uKey, "demo")
 
 			if a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
 				t.Errorf("delete = %d %s, want 500 internal", a.status, a.body)
@@ -501,7 +482,7 @@ func TestDelete_AFailingStepChangesNothing(t *testing.T) {
 			if _, err := w.Store.Main().Exec(`DROP TRIGGER IF EXISTS fault`); err != nil {
 				t.Fatal(err)
 			}
-			if a := w.deleteWorkspace(t, w.uKey, "demo"); a.status != http.StatusNoContent {
+			if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
 				t.Errorf("the repeated delete = %d %s, want 204", a.status, a.body)
 			}
 		})
@@ -539,7 +520,7 @@ func TestDelete_WritesOneEventPerRemovedWorkspace(t *testing.T) {
 			stub := &deleteStub{tokens: c.tokens, forks: []string{"demo--b", "demo--a"}, dropForks: true}
 			w := deleteWorld(t, stub, c.forks, registerAll(stub, c.remover))
 
-			if a := w.deleteWorkspace(t, w.uKey, "demo"); a.status != http.StatusNoContent {
+			if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
 				t.Fatalf("delete = %d %s, want 204", a.status, a.body)
 			}
 			evs := w.eventsOf(t, deleteEvent)
@@ -590,7 +571,7 @@ func TestDelete_KeepsTheEarlierEventsOfTheDeletedWorkspaces(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if a := w.deleteWorkspace(t, w.uKey, "demo"); a.status != http.StatusNoContent {
+	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
 		t.Fatalf("delete = %d %s, want 204", a.status, a.body)
 	}
 
@@ -614,7 +595,7 @@ func TestDelete_AnswersDoneWhenTheCopyCannotBeRemoved(t *testing.T) {
 	w := deleteWorld(t, nil, nil, nil, withLog(&log),
 		withRemoveCopy(func(string) error { return errors.New("device busy") }))
 
-	if a := w.deleteWorkspace(t, w.uKey, "demo"); a.status != http.StatusNoContent || len(a.body) != 0 {
+	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent || len(a.body) != 0 {
 		t.Fatalf("delete = %d %q, want 204 with no body", a.status, a.body)
 	}
 	if _, found := w.workspace(t, "demo"); found {
@@ -638,10 +619,10 @@ func TestDelete_WithNoCollaboratorsChangesOnlyTheWorkspaceRecords(t *testing.T) 
 	t.Parallel()
 	w := archiveWithForks(t, []string{"demo--a"}, withTeardown(func(td *workspace.Teardown) { td.Clear() }))
 
-	if a := w.archive(t, w.uKey, "demo"); a.status != http.StatusOK {
+	if a := w.operate(t, "archive", w.uKey, "demo"); a.status != http.StatusOK {
 		t.Fatalf("archive = %d %s, want 200", a.status, a.body)
 	}
-	if a := w.deleteWorkspace(t, w.uKey, "demo"); a.status != http.StatusNoContent {
+	if a := w.operate(t, "delete", w.uKey, "demo"); a.status != http.StatusNoContent {
 		t.Fatalf("delete = %d %s, want 204", a.status, a.body)
 	}
 	if n := w.workspaces(t); n != 0 {

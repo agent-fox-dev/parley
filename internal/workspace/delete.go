@@ -172,7 +172,7 @@ func (s *Service) deleteWorkspace(ctx context.Context, slug string, p identity.P
 				return err
 			}
 			for _, f := range forks {
-				if err := s.removeWorkspace(ctx, tx, f, &slug, actorType, actorID, nil); err != nil {
+				if err := s.removeWorkspace(ctx, tx, set, f, &slug, actorType, actorID, nil); err != nil {
 					return err
 				}
 			}
@@ -181,7 +181,7 @@ func (s *Service) deleteWorkspace(ctx context.Context, slug string, p identity.P
 		if deleted == nil {
 			deleted = []string{}
 		}
-		return s.removeWorkspace(ctx, tx, slug, nil, actorType, actorID, &deleted)
+		return s.removeWorkspace(ctx, tx, set, slug, nil, actorType, actorID, &deleted)
 	})
 	if err != nil {
 		return fmt.Errorf("delete workspace %q: %w", slug, err)
@@ -199,13 +199,14 @@ func (s *Service) deleteWorkspace(ctx context.Context, slug string, p identity.P
 }
 
 // removeWorkspace removes, in the transaction tx of a delete, the
-// workspace slug: what it owns through RemoveOwned, then its record, with
-// its settings, then it writes its delete event by the actor given. parent
-// is a fork's parent, nil for a repository workspace, whose event alone
-// carries deletedForks.
-func (s *Service) removeWorkspace(ctx context.Context, tx *sql.Tx, slug string, parent *string,
+// workspace slug: what it owns, as RemoveOwned removes it with the
+// collaborators of the delete's set, then its record, with its settings,
+// then it writes its delete event by the actor given. parent is a fork's
+// parent, nil for a repository workspace, whose event alone carries
+// deletedForks.
+func (s *Service) removeWorkspace(ctx context.Context, tx *sql.Tx, set teardownSet, slug string, parent *string,
 	actorType string, actorID *string, deletedForks *[]string) error {
-	revoked, err := s.RemoveOwned(ctx, tx, slug, deleteReason)
+	revoked, err := removeOwned(ctx, tx, set, slug, deleteReason)
 	if err != nil {
 		return err
 	}

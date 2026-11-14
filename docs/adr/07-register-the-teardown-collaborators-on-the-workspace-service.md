@@ -54,7 +54,10 @@ and nil removes it. Removers and archive observers are lists:
 `RegisterRemover` and `RegisterArchiveObserver` add after those before,
 and are called in registration order. Registration is safe from several
 goroutines and happens while the hub is composed, before any request. An
-operation takes the set once, at its start. The zero value is valid: with
+operation takes the set once, at its start, and calls those collaborators
+for every workspace it touches: a delete passes its set to the removal of
+each fork and of the workspace, while `RemoveOwned`, called on its own,
+takes a set of its own. The zero value is valid: with
 nothing registered an archive and a delete touch the workspace records
 alone.
 

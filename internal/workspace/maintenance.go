@@ -10,7 +10,8 @@ import (
 // withMarker runs fn while the workspace slug holds the maintenance marker
 // m, which RequireReady reads, so that no other request that needs the
 // workspace's repository runs beside the operation. The marker is the
-// record's maintenance column (see errata 14): setting it is one
+// record's maintenance column rather than a lock in memory, so that the
+// state guard sees it in the record it is given: setting it is one
 // conditional write, so that of two operations that ask at once exactly one
 // holds it; the other is answered 409 workspace_busy, or 404 when the
 // workspace is gone, without fn running. The marker is released when fn

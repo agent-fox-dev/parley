@@ -69,16 +69,6 @@ func refuseBranch(t *testing.T, origin *gitrepotest.Origin, branch string) {
 	}
 }
 
-// branchOff makes a new branch in the bare repository dir with one commit
-// on top of the branch from, which stays where it is, and returns its id.
-func branchOff(t *testing.T, dir, branch, from, msg string) string {
-	t.Helper()
-	head := gitrepotest.Git(t, dir, "rev-parse", "refs/heads/"+from)
-	id := gitrepotest.Git(t, dir, "commit-tree", head+"^{tree}", "-p", head, "-m", msg)
-	gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+branch, id)
-	return id
-}
-
 // recordingRevoker is the token revoker of the removal step: it answers the
 // token tok1 for the fork demo--t1 and records the slugs it was asked for.
 type recordingRevoker struct {
@@ -155,7 +145,8 @@ func TestWorkspaceRetire_ADeveloperDeletesAnArchivedWorkspaceWithAForkAndRegiste
 	copyDir := filepath.Join(h.root, "demo.git")
 	// A branch only the hub holds, which origin refuses, so that it is lost
 	// with the copy.
-	branchOff(t, copyDir, "local-only", "main", "only in the hub")
+	gitrepotest.Git(t, copyDir, "branch", "local-only", "main")
+	advance(t, copyDir, "local-only", "only in the hub")
 	refuseBranch(t, origin, "local-only")
 	h.must(t, "workspace", "archive", "demo")
 
@@ -209,7 +200,8 @@ func TestWorkspaceRetire_ADeveloperReclonesAWorkspaceFromTheShell(t *testing.T) 
 	h := startWorkspaceHub(t, origin, "demo")
 	h.createReady(t, "demo", origin.URL())
 	copyDir := filepath.Join(h.root, "demo.git")
-	feat := branchOff(t, copyDir, "feat", "main", "feat in the hub")
+	gitrepotest.Git(t, copyDir, "branch", "feat", "main")
+	feat := advance(t, copyDir, "feat", "feat in the hub")
 	// The hub's stale is rewritten from main's parent, so it does not
 	// descend from origin's stale and origin refuses it.
 	base := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/main~1")

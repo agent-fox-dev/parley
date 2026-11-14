@@ -163,8 +163,10 @@ func (s *Service) reclone(ctx context.Context, slug, actorType string, actorID *
 	}
 	// The record no longer owns the copy: a copy that cannot be removed now
 	// is replaced by the clone work, so the failure is only logged.
+	// Not while a sync that passed the state guard before the marker was
+	// set fetches into the copy.
 	dir := s.RepoPath(slug)
-	if err := s.deps.RemoveCopy(dir); err != nil {
+	if err := func() error { defer s.fetchLocks.lock(slug)(); return s.deps.RemoveCopy(dir) }(); err != nil {
 		s.deps.Logger.Error("workspace copy not removed after a reclone", "slug", slug, "path", dir, "error", err)
 	}
 	s.Enqueue(slug)

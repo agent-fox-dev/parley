@@ -76,6 +76,10 @@ func (s *Service) safetyCopy(ctx context.Context, w Workspace) string {
 		fail("resolve the origin credential", err)
 		return originPushFailed
 	}
+	// The origin heads it sets are the ones a sync's fetch writes: a sync
+	// that passed the state guard before the marker was set must not meet
+	// it there.
+	defer s.fetchLocks.lock(w.Slug)()
 	pushCtx, cancel := context.WithTimeout(ctx, s.deps.PushDeadline)
 	defer cancel()
 	results, err := s.deps.SafetyPusher.PushBranches(pushCtx, gitrepo.PushBranchesRequest{

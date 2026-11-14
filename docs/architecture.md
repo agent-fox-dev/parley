@@ -2034,7 +2034,11 @@ interleave there or meet on git's ref locks, so the fetch runs under the
 copy's entry of `Service.fetchLocks`, an in-process mutex per
 slug (`keyedLocks`, an entry removed when no one holds or waits for it): a
 second sync of the workspace waits for the first one's fetch and then runs
-its own. Nothing else of a sync takes a lock, and a sync never writes the
+its own. The safety copy takes the same entry around its push and the
+origin heads it sets, and a reclone around its removal of the copy, so
+that a sync that passed the state guard before their marker was set does
+not fetch into the copy beside them. Nothing else of a sync takes a lock,
+and a sync never writes the
 workspace's status: tag creation is create-only (a tag another sync
 created first is skipped, not an error) and branch moves are single-ref
 compare-and-swaps, so syncs, pushes and landings meet only there. It then
@@ -2265,7 +2269,8 @@ branch with its head from `Branches`, drops the `integration_branch` of a
 credential with `ResolveOriginCredential` (an error is `failed` before
 any git call, never an anonymous push) and hands every branch to
 `Deps.SafetyPusher` in one `gitrepo.PushBranchesRequest` under a context
-with `Deps.PushDeadline`, the push route's deadline. Each branch origin
+with `Deps.PushDeadline`, the push route's deadline, holding the copy's
+entry of `Service.fetchLocks` (see Sync) until it returns. Each branch origin
 took (`pushed` or `up_to_date`) has its origin head set to the commit
 offered with `SetOriginHead`; a refused one keeps its own, and no
 `parley.workspace.push` event and no `origin_head_sha` is written. The
@@ -2304,9 +2309,10 @@ is read only by the safety copy, and no fork record or other data is
 touched: no remover of owned data and no sandbox remover is called.
 
 The archive takes its collaborators from the teardown set once, before the
-safety copy. In its transaction, after the event, it lists the forks
-(`SELECT slug FROM workspaces WHERE parent_slug = ? ORDER BY slug`, the
-count the event gives) and, when a session closer is registered, calls
+safety copy. In its transaction, after the status write and before the
+event, it lists the forks (`SELECT slug FROM workspaces WHERE parent_slug =
+? ORDER BY slug`), whose number is the event's `forks`; after the event,
+when a session closer is registered, it calls
 `CloseSessions(ctx, tx, [slug, forks...], "workspace archived")` under the
 savepoint `archive_sessions`: a closer's error is logged as `workspace
 sessions not closed on archive` with the slug, `ROLLBACK TO
@@ -2376,9 +2382,10 @@ operation that holds the marker, and emits `parley.workspace.reactivate`
 `metadata` `{}`). A write that changes no row is answered from the record
 read again (`lostReactivate`: the refusal it now gets, `404` when it is
 gone, else `409 workspace_busy`); any other failure of the transaction is
-a `500 internal` with nothing changed. After the commit it calls
-`(*Service).Enqueue(slug)` and answers the record read again, rendered by
-`RenderWorkspace`. The clone work then keeps the copy the archive left when
+a `500 internal` with nothing changed. After the commit it reads the
+record again, then calls `(*Service).Enqueue(slug)`, so that the answer,
+rendered by `RenderWorkspace`, is the record as the reactivate left it,
+`pending`, whatever the clone work has done since. The clone work then keeps the copy the archive left when
 it is valid for the record (`keepCopy`: it opens, its instance id and
 origin url are the record's and the default branch resolves), so that the
 workspace is `ready` again without a request to origin, and makes a fresh
@@ -2403,8 +2410,8 @@ new `instance_id` (`NewInstanceID`), sets `updated_at` and emits
 `default_branch`, `last_sync_at` and `clone_error` stay until the clone
 work changes them. A failed transaction answers `500 internal` and changes
 neither the record nor the copy. After the commit it reads the record for
-the answer, removes the copy through `Deps.RemoveCopy(RepoPath(slug))`,
-which removes the origin heads (`refs/remotes/origin/*`) with it (a
+the answer, removes the copy through `Deps.RemoveCopy(RepoPath(slug))`
+under the copy's entry of `Service.fetchLocks`, which removes the origin heads (`refs/remotes/origin/*`) with it (a
 failure is logged with the slug and the path), and calls
 `(*Service).Enqueue(slug)`; the answer is rendered by `RenderWorkspace`.
 The new instance id is what makes a reclone safe against a stop between
@@ -2429,7 +2436,8 @@ this order, with a set marker (`409 workspace_busy`, `RequireReady`'s
 message) and with every status other than `archived` (`409
 workspace_not_archived`). Then it moves off the request's cancellation and,
 holding the `delete` marker (`withMarker`), reads the record again, checks
-it again and takes the teardown set once. When a sandbox remover is
+it again and takes the teardown set once, whose collaborators every
+removal of the operation then calls. When a sandbox remover is
 registered it lists the forks (`forksOf`, ascending) and calls
 `RemoveSandboxes(ctx, [slug, forks...])` before any write; its error is a
 `500 internal` with nothing changed. Then, in one store transaction: with a
@@ -2437,7 +2445,9 @@ fork remover, `RemoveForksOf(ctx, tx, slug, caller)` removes the forks and
 writes their events, and its slugs, sorted, are the `deleted_forks`;
 without one, each fork in ascending slug order is removed by
 `removeWorkspace`, the same per-workspace removal as the workspace's. That
-calls `RemoveOwned(ctx, tx, slug, "workspace deleted")`, deletes the record
+removes what the workspace owns as `RemoveOwned(ctx, tx, slug, "workspace
+deleted")` does, with the delete's set rather than a snapshot of its own
+(`removeOwned`, which `RemoveOwned` wraps), deletes the record
 (`DELETE FROM workspaces WHERE slug = ?`, its settings with it) and emits
 `parley.workspace.delete` (actor as for the other workspace events,
 `resource_type` `workspace`, `metadata` `{kind, parent_slug,
