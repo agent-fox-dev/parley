@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the clone workers `Workers` (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1699,7 +1699,13 @@ the hub's scrubber, logger and clock, `[server].external_url` as
 `OriginLister` that lists an origin's refs with a `Credential`, the type
 `gitrepo.Credential`, so that a resolved credential goes to git unchanged),
 applies every function `AdjustWorkspace` added, and binds the service with
-`Bind`. The part's one `gitrepo.Git` passes on to git the variables
+`Bind`. Before it builds them, the hook builds the clone workers with
+`workspace.NewWorkers(cfg.Workspace.Workers, svc, nil)`, whose refusal stops
+the start; after `Bind` it starts them with `Start`, so that the clone work
+left from before the start is queued before the hub listens (see Clone
+work). The background work `workspace_clones` waits for the stop and then
+calls the workers' `Stop` with a 10-second deadline, the grace the stop
+gives it. The part's one `gitrepo.Git` passes on to git the variables
 `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY` and
 `NO_PROXY` of the hub's environment, read when the hub is composed, and no
 other (see [configuration.md](configuration.md#environment-variables)); the
@@ -1708,8 +1714,8 @@ production `Lister` runs its `ListRemote`, and it is `Git`, the
 a nil `Scrubber` is a scrubber that knows no value). `Deps` also holds
 `InsertWorkspace`, which writes the record in the create transaction (nil
 is `workspace.Insert`; a test makes it fail), and `Notify`, called with the
-slug after a create commits so that clone work is picked up; the hub
-leaves `Notify` unset so far.
+slug after a create commits so that clone work is picked up; the hub sets
+it to the workers' `Enqueue`.
 
 `internal/workspace/credential.go` holds `ResolveOriginCredential(ctx,
 secrets, slug)`, which every operation that contacts a workspace's origin
@@ -1793,29 +1799,40 @@ work of one workspace:
    `clone_error` before origin is contacted; a workspace already in
    `cloning` is taken up again; any other status, or no workspace, is left
    alone, so a failed clone is never tried again on its own.
-2. `ResolveOriginCredential` reads the credential; a read error fails the
+2. A copy of this workspace at `RepoPath` is kept: one that opens as a
+   repository, whose `parley.workspace` is the workspace's instance id,
+   whose `remote.origin.url` is its `git_url`, and whose default branch (the
+   copy's own `HEAD` branch while the record has no `default_branch`)
+   resolves to a commit. Its head of that branch becomes `head_sha`, the
+   branch `default_branch`, the origin head it keeps for it, if any,
+   `origin_head_sha`, and the status `ready`, in one write; origin is not
+   asked and no post-clone step runs. This is how a stop between the copy's
+   rename and `ready` is resumed. Anything else at `RepoPath` (a file, an
+   empty directory, a repository failing one of the tests, the copy of an
+   earlier workspace of the same slug) goes on to a fresh clone.
+3. `ResolveOriginCredential` reads the credential; a read error fails the
    clone before git runs.
-3. Whatever lies at `RepoPath` is removed, and origin is cloned with
+4. Whatever lies at `RepoPath` is removed, and origin is cloned with
    `Git.Clone` into a directory `.clone-<random>` in the repository root
    (no slug starts with a dot, so no copy carries the prefix).
-4. A copy without a branch fails with `origin has no branches`; a
+5. A copy without a branch fails with `origin has no branches`; a
    `default_branch` given at creation that the copy does not have fails with
    `origin has no branch "<name>", the default_branch given at creation`.
    Without one, the default branch is the branch the copy's `HEAD` names
    (origin's default branch), or, when that branch does not exist, the first
    branch by name.
-5. `SetOriginHead` writes `refs/remotes/origin/<name>` at the head of every
+6. `SetOriginHead` writes `refs/remotes/origin/<name>` at the head of every
    branch, the workspace's instance id is written to the copy's
    configuration as `parley.workspace`, the copy's `HEAD` is set to the
    default branch, and the directory is renamed to `RepoPath`.
-6. One `UpdateClone` records `default_branch`, `head_sha` and
+7. One `UpdateClone` records `default_branch`, `head_sha` and
    `origin_head_sha` (the default branch's head) with the status still
    `cloning`.
-7. The post-clone step registered for the workspace's `workspace_mode` with
+8. The post-clone step registered for the workspace's `workspace_mode` with
    `(*Service).RegisterPostCloneStep(mode, step)` runs, given the record and
    the copy opened at `RepoPath`; an error it returns is logged as
    `workspace post-clone step failed` and does not change the outcome.
-8. The status is set to `ready`.
+9. The status is set to `ready`.
 
 Any failure removes the clone directory and whatever lies at `RepoPath`,
 logs `workspace clone failed` and sets the status to `failed` with
@@ -1829,7 +1846,27 @@ the clone directory is removed, the status is left as it is so that the
 work is taken up again, and `Clone` returns the context's error. A
 workspace that is ready is recorded with one write after the step, so a
 stop between the copy's rename and `ready` leaves the workspace in
-`cloning`.
+`cloning`, with a copy step 2 keeps at the next start.
+
+`internal/workspace/worker.go` runs the clone work in the background.
+`NewWorkers(size, svc, work)` refuses a size below 1 with an error naming
+`[workspace].workers`; `work` is the work run for each slug, `svc.Clone`
+when nil. `Enqueue(slug)` appends a slug to a first-in-first-out queue in
+memory; a slug already waiting or running is not queued again, and nothing
+is queued after `Stop`. `Start(ctx)` removes every `.clone-*` entry of the
+repository root (clones a stop interrupted), queues every workspace in
+`pending` or `cloning` in the order of `CloneWork` (by `created_at`, then
+slug), starts `size` goroutines that take slugs from the queue one at a
+time, and returns only then; the clones run under a context derived from
+`ctx`, so they end with it as with `Stop`. The queue holds no state of its
+own: a workspace in `pending` or `cloning` is its own record of the work,
+and the next `Start` reads it again. An error of the work that is not the
+end of its context is logged as `workspace clone work failed`, and the
+workspace keeps its status. `Stop(ctx)` stops taking work, cancels the
+context of the running clones, so that their git processes are killed and
+`Clone` leaves their status as it is, waits for the goroutines, then
+removes every `.clone-*` entry again, and returns nil; it returns `ctx`'s
+error when `ctx` ends before the goroutines.
 
 ### Hub events
 

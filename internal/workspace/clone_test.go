@@ -201,6 +201,12 @@ func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testi
 		history(o)
 		return o
 	}
+	type outcome struct {
+		slug, msg string
+		origin    *gitrepotest.Origin
+		asked     int
+	}
+	var failed []outcome
 	prefix := "fatal: tok-123 was refused by https://u:pw@host/x "
 	long := prefix + strings.Repeat("x", 5000-len(prefix))
 	for i, c := range []struct {
@@ -266,6 +272,26 @@ func TestClone_FailsWithACleanBoundedErrorLeavingNothingAndTryingNoMore(t *testi
 			t.Errorf("%s: clone work again left status %s and asked origin %d more times, want failed as it was and no request",
 				c.name, again.Status, o.Requests()-asked)
 		}
+		failed = append(failed, outcome{slug, msg, o, o.Requests()})
+	}
+	// Three rounds of the workers over the failed workspaces start no clone.
+	runs := &runLog{}
+	wk := w.startWorkers(t, 1, runs.around(w.svc.Clone))
+	for round := 1; round <= 3; round++ {
+		for _, f := range failed {
+			wk.Enqueue(f.slug)
+		}
+		eventually(t, fmt.Sprintf("worker round %d", round), func() bool {
+			_, finished, _ := runs.snapshot()
+			return len(finished) == round*len(failed)
+		})
+	}
+	for _, f := range failed {
+		if rec, _ := w.workspace(t, f.slug); rec.Status != workspace.StatusFailed || rec.CloneError == nil ||
+			*rec.CloneError != f.msg || f.origin.Requests() != f.asked {
+			t.Errorf("%s after three worker rounds: status %s, origin asked %d more times; want failed as it was and no request",
+				f.slug, rec.Status, f.origin.Requests()-f.asked)
+		}
 	}
 }
 
@@ -285,16 +311,24 @@ func TestClone_RunsTheModesStepOnceOnTheFreshCopyAndIsReadyWhenItFails(t *testin
 		runs = append(runs, seen{rec.Status, err == nil && repo.Dir() == w.svc.RepoPath(ws.Slug)})
 		return errors.New("the post-clone step broke")
 	})
+	carryPatch := map[string]any{"workspace_mode": "carry_patch", "upstream_url": "https://example.com/up.git"}
 	for _, c := range []struct {
 		slug    string
 		members map[string]any
-		runs    int
+		// kept runs the clone work on a valid copy of the workspace.
+		kept bool
+		runs int
 	}{
-		{"patched", map[string]any{"workspace_mode": "carry_patch", "upstream_url": "https://example.com/up.git"}, 1},
-		{"plain", nil, 0},
+		{"patched", carryPatch, false, 1},
+		{"plain", nil, false, 0},
+		{"kept", carryPatch, true, 0},
 	} {
-		runs = nil
 		w.createFrom(t, c.slug, o.URL(), c.members)
+		if c.kept {
+			w.clone(t, c.slug)
+			w.setPending(t, c.slug, false)
+		}
+		runs = nil
 		rec := w.clone(t, c.slug)
 		if len(runs) != c.runs {
 			t.Errorf("%s: the step ran %d times, want %d", c.slug, len(runs), c.runs)

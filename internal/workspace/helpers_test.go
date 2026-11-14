@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -55,6 +56,9 @@ type world struct {
 	// gitOrigin keeps the hub's own origin lister, which runs git, in place
 	// of the fake origin.
 	gitOrigin bool
+	// cloneWorkers keeps the hub's clone notification, so that the hub's
+	// own workers run the clone work of what is created.
+	cloneWorkers bool
 }
 
 // The writes of a create a test can make fail.
@@ -89,6 +93,12 @@ func withGitOrigin(o *gitrepotest.Origin) option {
 	}
 }
 
+// withCloneWorkers lets the hub's own clone workers run the clone work of
+// every workspace created.
+func withCloneWorkers() option {
+	return func(_ *hubtest.Config, w *world) { w.cloneWorkers = true }
+}
+
 // withCompose runs fn on the hub's composition, after the world's own.
 func withCompose(fn func(*hub.Composition)) option {
 	return func(c *hubtest.Config, _ *world) {
@@ -111,7 +121,9 @@ func newWorld(t *testing.T, opts ...option) *world {
 				if !w.gitOrigin {
 					d.Lister = w.origin
 				}
-				d.Notify = w.notify
+				if !w.cloneWorkers {
+					d.Notify = w.notify
+				}
 				d.InsertWorkspace = func(ctx context.Context, tx *sql.Tx, ws workspace.Workspace) error {
 					if err := w.faulted(faultInsert); err != nil {
 						return err
@@ -521,4 +533,118 @@ func (g *recordingGit) invocations() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.calls
+}
+
+// startWorkers starts clone workers of size on the world's service that run
+// work, nil for the service's clone work, and stops them when the test
+// ends.
+func (w *world) startWorkers(t *testing.T, size int, work func(context.Context, string) error) *workspace.Workers {
+	t.Helper()
+	wk, err := workspace.NewWorkers(size, w.svc, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wk.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := wk.Stop(ctx); err != nil {
+			t.Errorf("stop the clone workers: %v", err)
+		}
+	})
+	return wk
+}
+
+// runLog records the clone work workers run through it: the slugs in the
+// order their work started and ended, and how many ran at once at most.
+// While hold is set, each run waits for a value from it (or its context's
+// end) before it does the work.
+type runLog struct {
+	mu                sync.Mutex
+	started, finished []string
+	running, most     int
+	hold              chan struct{}
+}
+
+// around returns work that records each run in l, waits at l.hold, then
+// runs clone.
+func (l *runLog) around(clone func(context.Context, string) error) func(context.Context, string) error {
+	return func(ctx context.Context, slug string) error {
+		l.mu.Lock()
+		l.started = append(l.started, slug)
+		l.running++
+		l.most = max(l.most, l.running)
+		hold := l.hold
+		l.mu.Unlock()
+		defer func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.running--
+			l.finished = append(l.finished, slug)
+		}()
+		if hold != nil {
+			select {
+			case <-hold:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return clone(ctx, slug)
+	}
+}
+
+// snapshot is the slugs started and finished so far and the most runs seen
+// at once.
+func (l *runLog) snapshot() (started, finished []string, most int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.started...), append([]string(nil), l.finished...), l.most
+}
+
+// eventually waits up to 10 s for cond to hold and fails the test, naming
+// what, when it does not.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within 10 s", what)
+		}
+	}
+}
+
+// insertRecord stores a repository workspace of the user u with status,
+// origin url and creation time created, as the store holds it after a
+// create.
+func (w *world) insertRecord(t *testing.T, slug string, status workspace.Status, created time.Time, url string) {
+	t.Helper()
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		return workspace.Insert(ctx, tx, workspace.Workspace{
+			Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard, GitURL: &url,
+			OwnerID: w.u, OrgID: w.uOrg.ID, Status: status, CreatedAt: created, UpdatedAt: created,
+			InstanceID: workspace.NewInstanceID(),
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setPending puts the workspace slug back to pending with its other clone
+// fields kept, its default_branch removed when forget is true, as a
+// workspace that has clone work again.
+func (w *world) setPending(t *testing.T, slug string, forget bool) {
+	t.Helper()
+	rec, _ := w.workspace(t, slug)
+	if forget {
+		rec.DefaultBranch = nil
+	}
+	if err := workspace.UpdateClone(context.Background(), w.Store.Main(), slug, workspace.CloneFields{
+		Status: workspace.StatusPending, DefaultBranch: rec.DefaultBranch, HeadSHA: rec.HeadSHA,
+		OriginHeadSHA: rec.OriginHeadSHA, CloneError: rec.CloneError, UpdatedAt: w.clock(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

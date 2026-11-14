@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -9,8 +10,17 @@ import (
 )
 
 // workspacesHook is the name of the start hook that binds the workspace
-// service.
+// service and starts its clone workers.
 const workspacesHook = "workspaces"
+
+// cloneWork is the name of the background work that stops the clone
+// workers when the hub stops; cloneStopGrace is how long the stop waits for
+// them. A running clone ends as soon as its git process is killed, so the
+// grace only covers the cleanup after it.
+const (
+	cloneWork      = "workspace_clones"
+	cloneStopGrace = 10 * time.Second
+)
 
 // gitPassthrough are the variables of the hub's environment that every git
 // process gets: an operator whose origins sit behind a private certificate
@@ -40,14 +50,20 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 }
 
 // composeWorkspaces adds the workspace fields to the workspace records of
-// the access part and registers the workspace routes. Its start hook binds
-// the workspace service to the stores, the secret and event components of
-// the parts composed before it, the hub's git, which lists origins and
-// makes the workspaces' copies, the hub's scrubber, logger and clock,
-// [server].external_url and [workspace].path, where the copies live, after every adjuster AdjustWorkspace added has changed
-// those dependencies. The service exists from the composition on, so a
-// later part keeps it through Composition.Workspaces and registers its
-// setting keys on Workspaces().Settings() when it is composed.
+// the access part and registers the workspace routes. Its start hook builds
+// the clone workers, [workspace].workers of them, and binds the workspace
+// service to the stores, the secret and event components of the parts
+// composed before it, the hub's git, which lists origins and makes the
+// workspaces' copies, the hub's scrubber, logger and clock,
+// [server].external_url, [workspace].path, where the copies live, and the
+// workers, which are told about every workspace created, after every
+// adjuster AdjustWorkspace added has changed those dependencies. It then
+// starts the workers, which queue the clone work left from before the start,
+// so that it is queued before the hub listens; a refused number of workers
+// stops the start. The workers are stopped when the hub stops. The service
+// exists from the composition on, so a later part keeps it through
+// Composition.Workspaces and registers its setting keys on
+// Workspaces().Settings() when it is composed.
 func composeWorkspaces(c *Composition) {
 	svc := &workspace.Service{}
 	c.workspaces = svc
@@ -58,13 +74,20 @@ func composeWorkspaces(c *Composition) {
 	for _, r := range svc.Routes() {
 		c.AddRoute(r)
 	}
-	c.AddStartHook(workspacesHook, func(_ context.Context, rt *Runtime) error {
+	// Built by the start hook, which runs before the background work.
+	var workers *workspace.Workers
+	c.AddStartHook(workspacesHook, func(ctx context.Context, rt *Runtime) error {
+		var err error
+		if workers, err = workspace.NewWorkers(rt.Config.Workspace.Workers, svc, nil); err != nil {
+			return err
+		}
 		d := workspace.Deps{
 			Store:       rt.Store,
 			Secrets:     c.Secrets(),
 			Events:      c.Events(),
 			Lister:      originLister{git},
 			Git:         git,
+			Notify:      workers.Enqueue,
 			Scrubber:    rt.Scrubber,
 			Logger:      rt.Logger,
 			Now:         rt.Now,
@@ -75,7 +98,15 @@ func composeWorkspaces(c *Composition) {
 			adjust(&d)
 		}
 		svc.Bind(d)
-		return nil
+		return workers.Start(ctx)
+	})
+	c.AddBackgroundWork(cloneWork, cloneStopGrace, func(ctx context.Context, rt *Runtime) {
+		<-ctx.Done()
+		stop, cancel := context.WithTimeout(context.Background(), cloneStopGrace)
+		defer cancel()
+		if err := workers.Stop(stop); err != nil {
+			rt.Logger.Warn("workspace clone workers did not stop", "error", err)
+		}
 	})
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -80,6 +81,11 @@ func (s *Service) postCloneStep(mode string) PostCloneStep {
 // hub; a workspace in any other status, or none, is left alone, so that a
 // failed clone is never tried again on its own.
 //
+// A copy of this workspace already at its place, such as the one a stop
+// between the clone's move into place and ready leaves, is kept rather than
+// cloned again (see keepCopy); anything else there is replaced by a fresh
+// clone.
+//
 // A failure is recorded, never retried, and Clone returns nil for it. When
 // ctx ends first (the hub stops), the clone in progress is removed and the
 // status is left as it is, so that the next start takes the work up again;
@@ -94,11 +100,16 @@ func (s *Service) Clone(ctx context.Context, slug string) error {
 	if err != nil || !found {
 		return err
 	}
-	// The credential is resolved before git runs: a secret that cannot be
-	// read fails the clone rather than turning into an anonymous request.
-	cred, err := ResolveOriginCredential(ctx, s.deps.Secrets, slug)
-	if err == nil {
-		err = s.cloneFresh(ctx, w, cred)
+	var cred Credential
+	kept, err := s.keepCopy(ctx, w)
+	if err == nil && !kept {
+		// The credential is resolved before git runs: a secret that cannot
+		// be read fails the clone rather than turning into an anonymous
+		// request.
+		cred, err = ResolveOriginCredential(ctx, s.deps.Secrets, slug)
+		if err == nil {
+			err = s.cloneFresh(ctx, w, cred)
+		}
 	}
 	if err == nil {
 		return nil
@@ -116,7 +127,7 @@ func (s *Service) Clone(ctx context.Context, slug string) error {
 // mode's post-clone step and sets the status to ready.
 func (s *Service) cloneFresh(ctx context.Context, w Workspace, cred Credential) error {
 	dst := s.RepoPath(w.Slug)
-	// What lies at the copy's place was not made by this clone; a fresh
+	// What lies at the copy's place is not a copy keepCopy kept; a fresh
 	// clone replaces it.
 	if err := gitrepo.Remove(dst); err != nil {
 		return err
@@ -176,6 +187,65 @@ func (s *Service) cloneFresh(ctx context.Context, w Workspace, cred Credential) 
 		}
 	}
 	return s.recordClone(ctx, w, StatusReady)
+}
+
+// keepCopy keeps what lies at the place of w's copy when it is a complete
+// copy of this workspace: it opens as a repository, the workspace's default
+// branch (the copy's own while the record names none) resolves to a commit,
+// its remote.origin.url is w's git_url and its parley.workspace is w's
+// instance id, which only a finished clone for this very record writes. It
+// then records the copy's head of that branch and the branch itself, sets
+// the status to ready and reports kept, without asking origin and without
+// the mode's post-clone step, which ran when the copy was made. Anything
+// else at the place is left for a fresh clone; an error is the end of ctx
+// or a write that failed.
+func (s *Service) keepCopy(ctx context.Context, w Workspace) (kept bool, err error) {
+	dst := s.RepoPath(w.Slug)
+	if _, err := os.Lstat(dst); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	branch, head, origin, ok := s.validCopy(ctx, dst, w)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if !ok {
+		return false, nil
+	}
+	w.DefaultBranch, w.HeadSHA, w.CloneError = &branch, &head, nil
+	if origin != "" {
+		w.OriginHeadSHA = &origin
+	}
+	return true, s.recordClone(ctx, w, StatusReady)
+}
+
+// validCopy reports whether dir holds a complete copy of w, as keepCopy
+// describes it, and returns its default branch, that branch's head and the
+// origin head it keeps for it ("" for none). A git error is no copy.
+func (s *Service) validCopy(ctx context.Context, dir string, w Workspace) (branch, head, origin string, ok bool) {
+	repo, err := s.deps.Git.Open(ctx, dir)
+	if err != nil {
+		return "", "", "", false
+	}
+	if id, found, err := repo.Config(ctx, instanceKey); err != nil || !found || id != w.InstanceID {
+		return "", "", "", false
+	}
+	if url, err := repo.OriginURL(ctx); err != nil || url != deref(w.GitURL) {
+		return "", "", "", false
+	}
+	branch = deref(w.DefaultBranch)
+	if w.DefaultBranch == nil {
+		if branch, err = repo.DefaultBranch(ctx); err != nil {
+			return "", "", "", false
+		}
+	}
+	head, found, err := repo.ResolveBranch(ctx, branch)
+	if err != nil || !found {
+		return "", "", "", false
+	}
+	if id, found, err := repo.OriginHead(ctx, branch); err == nil && found {
+		origin = id
+	}
+	return branch, head, origin, true
 }
 
 // cloneBranch is the workspace's default branch on a fresh copy whose

@@ -169,6 +169,31 @@ WHERE slug = ? AND status IN (?, ?)`,
 	return n == 1, nil
 }
 
+// CloneWork lists through q the slugs of the workspaces with clone work
+// outstanding, those in pending or cloning, in the order the work was
+// recorded: by created_at, then by slug, so that two workspaces created in
+// the same second come in a fixed order.
+func CloneWork(ctx context.Context, q access.Querier) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT slug FROM workspaces WHERE status IN (?, ?) ORDER BY created_at, slug`,
+		string(StatusPending), string(StatusCloning))
+	if err != nil {
+		return nil, fmt.Errorf("list the clone work: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var slugs []string
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
+			return nil, fmt.Errorf("list the clone work: %w", err)
+		}
+		slugs = append(slugs, slug)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list the clone work: %w", err)
+	}
+	return slugs, nil
+}
+
 // workspaceColumns are the columns scanWorkspace reads, in its order.
 const workspaceColumns = `slug, kind, workspace_mode, git_url, default_branch, owner_id, org_id, status,
 	display_name, description, head_sha, origin_head_sha, clone_error, last_sync_at, sync_error,
