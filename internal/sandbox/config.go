@@ -95,8 +95,10 @@ type Settings struct {
 	profiles    []Profile
 	credentials []Credential
 
-	// token and oidcClientSecret are the contents of the two secret files,
-	// unexported so that printing the settings does not print them.
+	// token and oidcClientSecret are the contents of the two secret files.
+	// They are unexported so that they are read through Token and
+	// OIDCClientSecret only and encoding/json leaves them out; fmt still
+	// prints unexported fields, so Settings must not be formatted with %v.
 	token            string
 	oidcClientSecret string
 }
@@ -128,8 +130,10 @@ const namePatternReason = "must be 1 to 63 lower-case letters, digits, _ or -, s
 // in the order of the configuration reference, the ways to authenticate, the
 // profiles, the credentials, the profiles' references to credentials, the
 // section's unknown keys, then server.external_url, so that the first ones
-// survive when the error line is cut. No failure quotes a value, so no message holds the content of a
-// secret file or the user information of a URL.
+// survive when the error line is cut. A failure quotes no value but a
+// configured name (an env key, a name a list holds, a credential's name),
+// so that no message holds a secret, the content of a file, an env value
+// or the user information of a URL.
 func FromConfig(cfg *config.Config) (*Settings, error) {
 	table, present := cfg.Section(SectionName)
 	if !present {

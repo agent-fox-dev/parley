@@ -103,6 +103,7 @@ func (is *issuer) Grants() int {
 }
 
 func TestBuildConfig_ConnectsWithTheOneConfiguredWayToAuthenticate(t *testing.T) {
+	t.Parallel()
 	cert, key := selfSigned(t)
 	is := newIssuer(t)
 	files := map[string]string{"cert.pem": cert, "key.pem": key, "ca.pem": cert, "token": " tok\n", "secret": "oidc-SECRET\n"}
@@ -159,6 +160,7 @@ func TestBuildConfig_ConnectsWithTheOneConfiguredWayToAuthenticate(t *testing.T)
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
 			settings := loadSettings(t, row.keys, files)
 			cfg, err := openshell.BuildConfig(settings)
 			if err != nil {
@@ -200,6 +202,7 @@ func TestBuildConfig_ConnectsWithTheOneConfiguredWayToAuthenticate(t *testing.T)
 }
 
 func TestBuildConfig_RenewsTheOIDCTokenFromTheIssuer(t *testing.T) {
+	t.Parallel()
 	is := newIssuer(t)
 	settings := loadSettings(t,
 		"gateway_url = \"https://gw.test:8443\"\noidc_issuer = \""+is.URL+"\"\noidc_client_id = \"parley\"\noidc_client_secret_file = \"secret\"",
@@ -222,8 +225,10 @@ func TestBuildConfig_RenewsTheOIDCTokenFromTheIssuer(t *testing.T) {
 }
 
 func TestBuildConfig_RefusesSettingsWithoutSandboxes(t *testing.T) {
+	t.Parallel()
 	for name, settings := range map[string]*sandbox.Settings{"nil": nil, "disabled": {}} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			if _, err := openshell.BuildConfig(settings); err == nil || !strings.Contains(err.Error(), "not enabled") {
 				t.Fatalf("BuildConfig = %v, want an error saying sandboxes are not enabled", err)
 			}

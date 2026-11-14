@@ -2,6 +2,7 @@ package openshell_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"strconv"
@@ -26,29 +27,57 @@ func failingSandboxes(s *gateway, err error) {
 	}
 }
 
+// errorKindRow is an operation's result of one kind: the gateway set up to
+// give it, the operation, the kind and a part of the runtime's reason the
+// error keeps ("" for none).
+type errorKindRow struct {
+	name  string
+	setup func(s *gateway)
+	op    func(ctx context.Context, c runtime.Client) error
+	want  error
+	text  string
+}
+
 func TestClient_ReturnsAnErrorOfExactlyOneKind(t *testing.T) {
-	getSandbox := func(c runtime.Client) error { _, err := c.GetSandbox(t.Context(), "none"); return err }
-	createSandbox := func(c runtime.Client) error {
-		_, err := c.CreateSandbox(t.Context(), runtime.SandboxSpec{Name: "sb-1", Image: "registry.test/no such image"})
+	t.Parallel()
+	for _, row := range errorKindRows() {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			s := newGateway()
+			if row.setup != nil {
+				row.setup(s)
+			}
+			c := openshell.NewWithClient(s, "parley", openshell.Deps{})
+			err := row.op(t.Context(), c)
+			wantOneKind(t, err, row.want)
+			if row.text != "" && !strings.Contains(err.Error(), row.text) {
+				t.Errorf("error %q does not keep the runtime's reason %q", err, row.text)
+			}
+		})
+	}
+}
+
+// errorKindRows are the results of every kind the client gives, with the
+// gateway's answers that map to each.
+func errorKindRows() []errorKindRow {
+	getSandbox := func(ctx context.Context, c runtime.Client) error { _, err := c.GetSandbox(ctx, "none"); return err }
+	createSandbox := func(ctx context.Context, c runtime.Client) error {
+		_, err := c.CreateSandbox(ctx, runtime.SandboxSpec{Name: "sb-1", Image: "registry.test/no such image"})
 		return err
 	}
-	rows := []struct {
-		name  string
-		setup func(s *gateway)
-		op    func(c runtime.Client) error
-		want  error
-		// text is a part of the runtime's reason the error keeps.
-		text string
-	}{
+	return []errorKindRow{
 		{name: "get of an unknown sandbox", op: getSandbox, want: runtime.ErrNotFound},
 		{
 			name: "delete of an unknown provider",
-			op:   func(c runtime.Client) error { return c.DeleteProvider(t.Context(), "none") },
+			op:   func(ctx context.Context, c runtime.Client) error { return c.DeleteProvider(ctx, "none") },
 			want: runtime.ErrNotFound,
 		},
 		{
 			name: "get of an unknown provider profile",
-			op:   func(c runtime.Client) error { _, err := c.GetProviderProfile(t.Context(), "none"); return err },
+			op: func(ctx context.Context, c runtime.Client) error {
+				_, err := c.GetProviderProfile(ctx, "none")
+				return err
+			},
 			want: runtime.ErrNotFound,
 		},
 		{
@@ -114,35 +143,25 @@ func TestClient_ReturnsAnErrorOfExactlyOneKind(t *testing.T) {
 		},
 		{
 			name: "an operation the backend lacks",
-			op: func(c runtime.Client) error {
-				_, err := c.Exec(t.Context(), "sb-1", runtime.ExecRequest{Command: []string{"true"}})
+			op: func(ctx context.Context, c runtime.Client) error {
+				_, err := c.Exec(ctx, "sb-1", runtime.ExecRequest{Command: []string{"true"}})
 				return err
 			},
 			want: runtime.ErrUnsupported,
 		},
 		{
 			name: "an operation the SDK lacks",
-			op:   func(c runtime.Client) error { _, err := c.Stat(t.Context(), "sb-1", "/w/none"); return err },
+			op: func(ctx context.Context, c runtime.Client) error {
+				_, err := c.Stat(ctx, "sb-1", "/w/none")
+				return err
+			},
 			want: runtime.ErrUnsupported,
 		},
-	}
-	for _, row := range rows {
-		t.Run(row.name, func(t *testing.T) {
-			s := newGateway()
-			if row.setup != nil {
-				row.setup(s)
-			}
-			c := openshell.NewWithClient(s, "parley", openshell.Deps{})
-			err := row.op(c)
-			wantOneKind(t, err, row.want)
-			if row.text != "" && !strings.Contains(err.Error(), row.text) {
-				t.Errorf("error %q does not keep the runtime's reason %q", err, row.text)
-			}
-		})
 	}
 }
 
 func TestClient_TakesARefusedConnectionForAnUnavailableRuntime(t *testing.T) {
+	// Serial: the loopback port it frees must stay closed until the client dials it.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -162,6 +181,7 @@ func TestClient_TakesARefusedConnectionForAnUnavailableRuntime(t *testing.T) {
 }
 
 func TestClient_AnswersWhatTheSDKCannotDoAsUnsupportedWithoutCallingIt(t *testing.T) {
+	t.Parallel()
 	s := newGateway()
 	// Every call that reaches the SDK fails as unavailable, so an
 	// operation that answers unsupported has not called it.
@@ -184,11 +204,27 @@ func TestClient_AnswersWhatTheSDKCannotDoAsUnsupportedWithoutCallingIt(t *testin
 			_, err := c.Exec(ctx, "sb-1", runtime.ExecRequest{Command: []string{"cat"}, Stdin: []byte("in")})
 			return err
 		},
+		runtime.OpCreateSandbox + " with a base document": func() error {
+			_, err := c.CreateSandbox(ctx, runtime.SandboxSpec{Name: "sb-1", Policy: runtime.Policy{Base: []byte("version: 1\n")}})
+			return err
+		},
+		runtime.OpCreateSandbox + " in a working directory": func() error {
+			_, err := c.CreateSandbox(ctx, runtime.SandboxSpec{Name: "sb-1", WorkDir: "/w"})
+			return err
+		},
+		runtime.OpStartSandbox + " with a policy value": func() error {
+			return c.StartSandbox(ctx, "sb-1", runtime.StartSpec{Policy: runtime.Policy{Added: []runtime.Rule{{Name: "r", Body: json.RawMessage(`{}`)}}}})
+		},
+		runtime.OpStartSandbox + " with an environment": func() error {
+			return c.StartSandbox(ctx, "sb-1", runtime.StartSpec{Env: map[string]string{"A": "1"}})
+		},
 		runtime.OpExecStream + " with stdin": func() error {
 			_, err := c.ExecStream(ctx, "sb-1", runtime.ExecRequest{Command: []string{"cat"}, Stdin: []byte("in")})
 			return err
 		},
 	}
+	// The subtests stay serial: they share the client, whose flag is read
+	// once they have all run.
 	for op, call := range ops {
 		t.Run(op, func(t *testing.T) {
 			err := call()

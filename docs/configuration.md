@@ -178,8 +178,8 @@ names `sandbox.gateway_url` and the ways found, such as
 mutual TLS, token_file`. A pair or a triple that is incomplete names the keys
 it misses instead.
 
-The hub connects to the gateway's host and port (443 when `gateway_url`
-gives none), over TLS for an `https` URL and without it for an `http` one.
+The hub connects to the gateway's host and port (when `gateway_url` gives
+none, 443, or 80 for an `http` gateway), over TLS for an `https` URL and without it for an `http` one.
 With mutual TLS it presents the client certificate; with `token_file` it
 sends the file's content as a bearer token, also over `http` to a loopback
 gateway; with OIDC it obtains a token from `oidc_issuer` with the client
@@ -258,8 +258,8 @@ zero-based index in place of a name that is missing or not a valid name), or
 credential is a failure like the others. A failure about an `env` key, a
 listed credential or an exposed secret quotes that key or name, such as
 `sandbox.profiles[agent].credentials: "nope" is not the name of a
-[[sandbox.credentials]] table`. No failure quotes a value, so the error
-holds neither the content of `token_file` or `oidc_client_secret_file`, nor
+[[sandbox.credentials]] table`. Beyond those configured names, no failure
+quotes a value, so the error holds no secret and neither the content of `token_file` or `oidc_client_secret_file`, nor
 the user information of a URL, nor the value of an `env` entry. For
 example:
 

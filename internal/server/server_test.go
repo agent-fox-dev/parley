@@ -196,6 +196,7 @@ func TestVersion_AnswersTheBuildValuesAndGoVersion(t *testing.T) {
 // The build values are package globals that another test sets, so this
 // test must not run in parallel with it.
 func TestVersion_AddsTheMembersItIsGivenWithoutReplacingTheBuilds(t *testing.T) {
+	t.Parallel()
 	h := New(Options{VersionMembers: func() map[string]any {
 		return map[string]any{"sandbox_runtime": map[string]any{"connected": "0.1.8"}, "version": "forged"}
 	}}).Handler()

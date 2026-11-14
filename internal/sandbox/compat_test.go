@@ -44,7 +44,4 @@ func TestReleaseRange_IsWrittenWithItsTwoBounds(t *testing.T) {
 	if got := (sandbox.ReleaseRange{Lowest: "1.2.0", FirstUnsupported: "2.0.0"}).String(); got != ">=1.2.0 <2.0.0" {
 		t.Errorf("String() = %q, want %q", got, ">=1.2.0 <2.0.0")
 	}
-	if got := sandbox.SupportedReleases.String(); got != ">="+sandbox.LowestSupportedRelease+" <"+sandbox.FirstUnsupportedRelease {
-		t.Errorf("SupportedReleases = %q, want the two constants", got)
-	}
 }

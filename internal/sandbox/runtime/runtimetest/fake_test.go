@@ -19,6 +19,7 @@ import (
 )
 
 func TestFake_PassesTheContract(t *testing.T) {
+	t.Parallel()
 	modes := []struct {
 		name  string
 		opts  []runtimetest.Option
@@ -35,6 +36,7 @@ func TestFake_PassesTheContract(t *testing.T) {
 	}
 	for _, mode := range modes {
 		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
 			runtimetest.RunContract(t, func(t *testing.T) runtimetest.Backend {
 				f := runtimetest.New(t, mode.opts...)
 				if mode.setup != nil {
@@ -47,6 +49,7 @@ func TestFake_PassesTheContract(t *testing.T) {
 }
 
 func TestRunContract_SkipsTheOperationsABackendLacks(t *testing.T) {
+	t.Parallel()
 	lacking := []string{
 		runtime.OpGetProviderProfile, runtime.OpInstallProviderProfile, runtime.OpListProviders,
 		runtime.OpAttachProvider, runtime.OpValidatePolicy, runtime.OpGetPolicy, runtime.OpAddPolicyRule,
@@ -66,8 +69,10 @@ func TestRunContract_SkipsTheOperationsABackendLacks(t *testing.T) {
 }
 
 func TestFake_FailsANamedOperationWithTheChosenKindUntilCleared(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []error{runtime.ErrNotFound, runtime.ErrInvalid, runtime.ErrUnsupported, runtime.ErrUnavailable} {
 		t.Run(kind.Error(), func(t *testing.T) {
+			t.Parallel()
 			f := runtimetest.New(t)
 			c := f.Client("parley", nil)
 			ctx := t.Context()
@@ -91,6 +96,7 @@ func TestFake_FailsANamedOperationWithTheChosenKindUntilCleared(t *testing.T) {
 }
 
 func TestFake_ReportsTheReleaseAndProviderProfilesItWasGiven(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c := f.Client("parley", nil)
 	ctx := t.Context()
@@ -113,6 +119,7 @@ func TestFake_ReportsTheReleaseAndProviderProfilesItWasGiven(t *testing.T) {
 }
 
 func TestFake_RejectsThePolicyValuesAPredicateMatches(t *testing.T) {
+	t.Parallel()
 	bad := runtime.Policy{Base: []byte("bad\n")}
 	rows := []struct {
 		name string
@@ -132,6 +139,7 @@ func TestFake_RejectsThePolicyValuesAPredicateMatches(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
 			f := runtimetest.New(t)
 			c := f.Client("parley", nil)
 			ctx := t.Context()
@@ -150,6 +158,7 @@ func TestFake_RejectsThePolicyValuesAPredicateMatches(t *testing.T) {
 }
 
 func TestFake_ReportsWhatABaseDocumentAllowsAndRefersTo(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c := f.Client("parley", nil)
 	want := runtime.PolicyValidation{Hosts: []string{"api.anthropic.test"}, Providers: []string{"anthropic"}}
@@ -165,6 +174,7 @@ func TestFake_ReportsWhatABaseDocumentAllowsAndRefersTo(t *testing.T) {
 }
 
 func TestFake_ChangesASandboxAsTheTestTellsIt(t *testing.T) {
+	t.Parallel()
 	rows := []struct {
 		name   string
 		change func(f *runtimetest.Fake)
@@ -179,6 +189,7 @@ func TestFake_ChangesASandboxAsTheTestTellsIt(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
 			f := runtimetest.New(t)
 			c := f.Client("parley", nil)
 			ctx := t.Context()
@@ -209,6 +220,7 @@ func TestFake_ChangesASandboxAsTheTestTellsIt(t *testing.T) {
 }
 
 func TestFake_DroppedWorkingDirectoryLosesItsFiles(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c := f.Client("parley", nil)
 	ctx := t.Context()
@@ -225,6 +237,7 @@ func TestFake_DroppedWorkingDirectoryLosesItsFiles(t *testing.T) {
 }
 
 func TestFake_LogsTheEntriesItWasToldToEmit(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
 	f := runtimetest.New(t, runtimetest.WithClock(func() time.Time { return now }))
 	c := f.Client("parley", nil)
@@ -252,6 +265,7 @@ func TestFake_LogsTheEntriesItWasToldToEmit(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
 			ls, err := c.Logs(ctx, "sb-1", row.query)
 			if err != nil {
 				t.Fatal(err)
@@ -283,6 +297,7 @@ func TestFake_LogsTheEntriesItWasToldToEmit(t *testing.T) {
 }
 
 func TestFake_BreaksAnOpenStream(t *testing.T) {
+	t.Parallel()
 	rows := []struct {
 		op   string
 		open func(ctx context.Context, c runtime.Client) (next func() error, err error)
@@ -306,6 +321,7 @@ func TestFake_BreaksAnOpenStream(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.op, func(t *testing.T) {
+			t.Parallel()
 			f := runtimetest.New(t)
 			f.SetExec(func(ctx context.Context, _ string, _ runtime.ExecRequest, _, _ io.Writer) int {
 				<-ctx.Done()
@@ -339,6 +355,7 @@ func TestFake_BreaksAnOpenStream(t *testing.T) {
 }
 
 func TestFake_ForgetsAStreamOnceItEnds(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c := f.Client("parley", nil)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -372,6 +389,7 @@ func TestFake_ForgetsAStreamOnceItEnds(t *testing.T) {
 }
 
 func TestFake_RecordsTheCallsItReceivedInOrder(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c, other := f.Client("parley", nil), f.Client("other", nil)
 	ctx := t.Context()
@@ -397,6 +415,7 @@ func TestFake_RecordsTheCallsItReceivedInOrder(t *testing.T) {
 }
 
 func TestFake_ScriptsExecResults(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c := f.Client("parley", nil)
 	ctx := t.Context()
@@ -442,6 +461,7 @@ func TestFake_ScriptsExecResults(t *testing.T) {
 }
 
 func TestFake_BacksASandboxWithAHostDirectory(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t, runtimetest.WithHostDirs())
 	c := f.Client("parley", nil)
 	ctx := t.Context()
@@ -465,6 +485,7 @@ func TestFake_BacksASandboxWithAHostDirectory(t *testing.T) {
 }
 
 func TestFake_KeepsWhatItWasGiven(t *testing.T) {
+	t.Parallel()
 	f := runtimetest.New(t)
 	c := f.Client("parley", nil)
 	ctx := t.Context()

@@ -20,6 +20,7 @@ func TestSandboxRoutes_AnswerEveryCallerDisabledWhileSandboxesAreOff(t *testing.
 		{"a PAT with sandboxes:read", h.pat(t, h.owner, "sandboxes:read")},
 		{"a PAT without a sandbox scope", h.pat(t, h.owner, "git:read")},
 	}
+	// Serial subtests: each counts the handler's calls around its request.
 	for _, path := range []string{"/sandbox-profiles", "/sandboxes", "/workspaces/ws/sandboxes/probe-read", "/workspaces/nope/sandboxes/probe-read"} {
 		for _, c := range creds {
 			t.Run(path+" with "+c.name, func(t *testing.T) {
@@ -43,6 +44,7 @@ func TestSandboxRoutes_LeaveTheChecksBeforeTheFeatureCheckToDecideWhileSandboxes
 	if len(overLimit) != probeBodyLimit+1 {
 		t.Fatalf("the body is %d bytes, want %d", len(overLimit), probeBodyLimit+1)
 	}
+	// Serial subtests: the handler's calls are counted once they have all run.
 	for _, c := range []struct {
 		name, method, path, cred string
 		body                     any
@@ -78,6 +80,7 @@ type accessRow struct {
 // checks the answer and that the handler ran only for the 200 rows.
 func checkAccess(t *testing.T, h *probeHub, method, route string, rows []accessRow) {
 	t.Helper()
+	// Serial subtests: each counts the handler's calls around its request.
 	for _, c := range rows {
 		t.Run(c.name, func(t *testing.T) {
 			var body any
@@ -160,6 +163,7 @@ func TestSandboxRoute_AnswersARuntimeErrorTheHandlerReturnsWithTheRuntimeErrorAn
 	t.Parallel()
 	h := startProbeHub(t, true)
 	const userinfoPass = "pw-SECRET"
+	// Serial subtests: each sets the failure of the runtime they share.
 	for _, c := range []struct {
 		name string
 		fail func()
@@ -205,35 +209,34 @@ func patWith(paths []string, permissions ...string) identity.Principal {
 func TestCovers_HoldsAPATToEveryHubScopeAndToPathsNoWiderThanItsOwn(t *testing.T) {
 	t.Parallel()
 	hubScopes := []string{"git:read", "git:write", "changes:write"}
+	// hub is a hub credential of hubScopes limited to paths (none for no
+	// limit).
+	hub := func(paths ...string) *sandbox.HubAccess { return &sandbox.HubAccess{Scopes: hubScopes, Paths: paths} }
 	for _, c := range []struct {
-		name     string
-		pat      identity.Principal
-		hubPaths []string
-		want     bool
+		name string
+		pat  identity.Principal
+		ha   *sandbox.HubAccess
+		want bool
 	}{
-		{"every hub scope, neither limited to paths", patWith(nil, hubScopes...), nil, true},
-		{"git:write missing", patWith(nil, "git:read", "changes:write"), nil, false},
-		{"every hub scope and others", patWith(nil, "git:read", "git:write", "changes:write", "sandboxes:write", "secrets:read"), nil, true},
-		{"git:read implied by git:write", patWith(nil, "git:write", "changes:write"), nil, true},
-		{"a PAT glob covering the hub glob", patWith([]string{"src/**"}, hubScopes...), []string{"src/api/*.go"}, true},
-		{"a PAT glob equal to the hub glob", patWith([]string{"src/**"}, hubScopes...), []string{"src/**"}, true},
-		{"a PAT glob narrower than the hub glob", patWith([]string{"src/*"}, hubScopes...), []string{"src/**"}, false},
-		{"one hub glob no PAT glob covers", patWith([]string{"src/**"}, hubScopes...), []string{"src/a", "docs/b"}, false},
-		{"a PAT limited to paths and a hub credential without a limit", patWith([]string{"src/**"}, hubScopes...), nil, false},
-		{"a PAT without a limit and a hub credential limited to paths", patWith(nil, hubScopes...), []string{"docs/**"}, true},
+		{"every hub scope, neither limited to paths", patWith(nil, hubScopes...), hub(), true},
+		{"git:write missing", patWith(nil, "git:read", "changes:write"), hub(), false},
+		{"every hub scope and others", patWith(nil, "git:read", "git:write", "changes:write", "sandboxes:write", "secrets:read"), hub(), true},
+		{"git:read implied by git:write", patWith(nil, "git:write", "changes:write"), hub(), true},
+		{"a PAT glob covering the hub glob", patWith([]string{"src/**"}, hubScopes...), hub("src/api/*.go"), true},
+		{"a PAT glob equal to the hub glob", patWith([]string{"src/**"}, hubScopes...), hub("src/**"), true},
+		{"a PAT glob narrower than the hub glob", patWith([]string{"src/*"}, hubScopes...), hub("src/**"), false},
+		{"one hub glob no PAT glob covers", patWith([]string{"src/**"}, hubScopes...), hub("src/a", "docs/b"), false},
+		{"a PAT limited to paths and a hub credential without a limit", patWith([]string{"src/**"}, hubScopes...), hub(), false},
+		{"a PAT without a limit and a hub credential limited to paths", patWith(nil, hubScopes...), hub("docs/**"), true},
+		{"no hub scopes and no paths, a PAT without scopes", patWith(nil), &sandbox.HubAccess{Scopes: []string{}}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			ha := &sandbox.HubAccess{Scopes: hubScopes, Paths: c.hubPaths}
-			if got := sandbox.Covers(c.pat, ha); got != c.want {
-				t.Errorf("Covers(%+v, %+v) = %v, want %v", c.pat, ha, got, c.want)
+			t.Parallel()
+			if got := sandbox.Covers(c.pat, c.ha); got != c.want {
+				t.Errorf("Covers(%+v, %+v) = %v, want %v", c.pat, c.ha, got, c.want)
 			}
 		})
 	}
-	t.Run("no hub scopes and no paths, a PAT without scopes", func(t *testing.T) {
-		if !sandbox.Covers(patWith(nil), &sandbox.HubAccess{Scopes: []string{}}) {
-			t.Error("Covers = false, want true")
-		}
-	})
 }
 
 func TestCovers_LetsTheAdminTokenAndAPIKeysAndEveryCallerOfASandboxWithoutAHubCredentialThrough(t *testing.T) {
@@ -259,6 +262,7 @@ func TestCovers_LetsTheAdminTokenAndAPIKeysAndEveryCallerOfASandboxWithoutAHubCr
 		{"a PAT without scopes limited to paths, no hub credential", patWith([]string{"a/*"}), nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			if !sandbox.Covers(c.caller, c.ha) {
 				t.Errorf("Covers(%+v, %+v) = false, want true", c.caller, c.ha)
 			}

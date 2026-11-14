@@ -1,13 +1,16 @@
 // Package openshell is the runtime client over the OpenShell Go SDK
 // (github.com/ai-openshell/sdk-go, package openshell/v1). It is the only
-// package of the hub that imports the SDK.
+// production package of the hub that imports the SDK.
 //
 // Every operation acts in the client's OpenShell workspace, which it passes
 // to every SDK call. An operation the SDK has no call for answers with an
 // error of kind runtime.ErrUnsupported and is not imitated with other calls:
 // ValidatePolicy, GetPolicy, WatchSandboxes, RunMain, MakeDir, Stat, Walk and
-// Logs, and Exec and ExecStream with input on stdin. What the SDK cannot
-// carry of a request it otherwise has a call for is listed on the operation.
+// Logs, and Exec and ExecStream with input on stdin. A request with a part
+// the SDK cannot carry is unsupported too, so that no part is silently
+// dropped (CreateSandbox with a base document or a working directory,
+// StartSandbox with a policy value or an environment); the exception is the
+// paths of a provider profile's endpoints, see InstallProviderProfile.
 package openshell
 
 import (
@@ -76,8 +79,9 @@ func New(settings *sandbox.Settings, deps Deps) (runtime.Client, error) {
 }
 
 // NewWithClient returns the runtime client over an SDK client, acting in
-// workspace. Closing the SDK client makes every later operation fail as
-// unavailable.
+// workspace. Closing the SDK client makes every later operation that calls
+// it fail as unavailable; an operation the SDK lacks still answers
+// unsupported without calling it.
 func NewWithClient(ci v1.ClientInterface, workspace string, deps Deps) runtime.Client {
 	if deps.Scrubber == nil {
 		deps.Scrubber = scrub.New()
@@ -436,9 +440,9 @@ func (c *client) RejectProposal(ctx context.Context, sandbox, id, reason string)
 
 // sdkPolicy is the SDK policy of a policy value: its protected and added
 // rules as named network rules, nil when it has none. The SDK takes a typed
-// policy, not a document, so the base document is not sent; a rule the
-// SDK's network rule cannot hold is unsupported, and an added rule named
-// like an earlier rule, which would replace it, is invalid.
+// policy, not a document, so the caller refuses a base document before; a
+// rule the SDK's network rule cannot hold is unsupported, and an added rule
+// named like an earlier rule, which would replace it, is invalid.
 func sdkPolicy(op string, p runtime.Policy) (*v1.SandboxPolicy, error) {
 	rules := slices.Concat(p.Protected, p.Added)
 	if len(rules) == 0 {
@@ -479,10 +483,16 @@ func networkRule(op string, rule runtime.Rule) (v1.NetworkPolicyRule, error) {
 
 // CreateSandbox creates the sandbox with its image, resources, environment,
 // providers, labels and the rules of its policy value. The SDK has no
-// working directory at creation and takes no policy document, so neither
-// spec.WorkDir nor spec.Policy.Base is carried: the gateway's defaults
-// apply.
+// working directory at creation and takes no policy document, so a request
+// with either is unsupported and does not reach the SDK: a sandbox must not
+// run without the policy or outside the directory it was asked for.
 func (c *client) CreateSandbox(ctx context.Context, spec runtime.SandboxSpec) (runtime.SandboxStatus, error) {
+	if len(spec.Policy.Base) > 0 {
+		return runtime.SandboxStatus{}, c.reach.Observe(unsupported(runtime.OpCreateSandbox, "the SDK takes no base policy document at creation"))
+	}
+	if spec.WorkDir != "" {
+		return runtime.SandboxStatus{}, c.reach.Observe(unsupported(runtime.OpCreateSandbox, "the SDK has no working directory at creation"))
+	}
 	return call(c, ctx, runtime.OpCreateSandbox, func(ctx context.Context) (runtime.SandboxStatus, error) {
 		policy, err := sdkPolicy(runtime.OpCreateSandbox, spec.Policy)
 		if err != nil {
@@ -558,9 +568,16 @@ func (c *client) StopSandbox(ctx context.Context, name string) error {
 }
 
 // StartSandbox starts a stopped sandbox. The SDK's start takes neither a
-// policy nor an environment, so the sandbox keeps the policy and the
-// environment the gateway holds for it, and spec is not carried.
-func (c *client) StartSandbox(ctx context.Context, name string, _ runtime.StartSpec) error {
+// policy nor an environment, so a request with a policy value or an
+// environment is unsupported and does not reach the SDK: a sandbox must not
+// run again without the policy it was asked for.
+func (c *client) StartSandbox(ctx context.Context, name string, spec runtime.StartSpec) error {
+	if p := spec.Policy; len(p.Base) > 0 || len(p.Protected) > 0 || len(p.Added) > 0 {
+		return c.reach.Observe(unsupported(runtime.OpStartSandbox, "the SDK's start takes no policy"))
+	}
+	if len(spec.Env) > 0 {
+		return c.reach.Observe(unsupported(runtime.OpStartSandbox, "the SDK's start takes no environment"))
+	}
 	return c.do(ctx, runtime.OpStartSandbox, func(ctx context.Context) error {
 		_, err := c.sdk.Sandboxes().Start(ctx, c.ws, name)
 		return err

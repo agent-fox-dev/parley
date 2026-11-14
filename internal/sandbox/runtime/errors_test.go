@@ -12,6 +12,7 @@ import (
 var kinds = []error{runtime.ErrNotFound, runtime.ErrInvalid, runtime.ErrUnsupported, runtime.ErrUnavailable}
 
 func TestError_IsOfExactlyOneKindAndKeepsTheReason(t *testing.T) {
+	t.Parallel()
 	rows := []struct {
 		name string
 		kind error
@@ -26,6 +27,7 @@ func TestError_IsOfExactlyOneKindAndKeepsTheReason(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
 			err := error(runtime.NewError(row.kind, runtime.OpValidatePolicy, "bad rule"))
 			for _, e := range []error{err, fmt.Errorf("checking the policy: %w", err)} {
 				var held []error
@@ -49,6 +51,7 @@ func TestError_IsOfExactlyOneKindAndKeepsTheReason(t *testing.T) {
 }
 
 func TestKindOf_TakesAnErrorWithoutAKindForUnavailable(t *testing.T) {
+	t.Parallel()
 	if k := runtime.KindOf(nil); k != nil {
 		t.Fatalf("KindOf(nil) = %v, want nil", k)
 	}

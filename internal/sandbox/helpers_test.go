@@ -1,10 +1,8 @@
 package sandbox_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -329,41 +327,12 @@ type answer struct {
 }
 
 // call sends method path, under /api/v1, with cred as the bearer credential
-// ("" for none) and body: nil for none, []byte as it is, anything else as
-// JSON; a body is sent as application/json.
+// ("" for none) and body, as hubtest's Call does, and reads the error
+// envelope of the answer, if it has one.
 func (h *probeHub) call(t *testing.T, method, path, cred string, body any) answer {
 	t.Helper()
-	var data io.Reader
-	switch b := body.(type) {
-	case nil:
-	case []byte:
-		data = bytes.NewReader(b)
-	default:
-		raw, err := json.Marshal(b)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequest(method, h.URL("/api/v1"+path), data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cred != "" {
-		req.Header.Set("Authorization", "Bearer "+cred)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
-	}
-	defer res.Body.Close()
-	a := answer{status: res.StatusCode}
-	if a.body, err = io.ReadAll(res.Body); err != nil {
-		t.Fatalf("%s %s: read the body: %v", method, path, err)
-	}
+	var a answer
+	a.status, a.body = h.Call(t, method, "/api/v1"+path, cred, body)
 	var env struct {
 		Error *json.RawMessage `json:"error"`
 	}

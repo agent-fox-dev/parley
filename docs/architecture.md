@@ -17,11 +17,11 @@ command-line client. Both are written in Go, in the module
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
-| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it) and files in the config dir, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, and `LogBuffer` holds a running hub's log for the test to read |
+| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
-| `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only package that imports the SDK: `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
+| `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
 | `internal/sandbox/runtime/runtimetest` | test support, imported by test code only: `Fake`, the in-memory runtime and the only test double of the runtime, with its test controls, and `RunContract`, the contract tests every implementation of the runtime client passes |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
@@ -1579,10 +1579,11 @@ secret with the scrubber, builds the SDK configuration with
 `openshell_workspace`. `openshell.NewWithClient(sdkClient, workspace, deps)`
 builds the client over an SDK client the caller has, such as the SDK's
 in-memory `fake.NewClient()`; closing that SDK client makes every later
-operation fail as `ErrUnavailable`.
+operation that calls it fail as `ErrUnavailable`, while the operations the
+SDK lacks keep answering `ErrUnsupported` without calling it.
 
-`BuildConfig` takes the address from `gateway_url`: its host and port, 443
-by default, with the `http://` scheme kept for a loopback gateway, which is
+`BuildConfig` takes the address from `gateway_url`: its host and port (when
+it gives none, 443, or 80 for an `http` gateway), with the `http://` scheme kept for a loopback gateway, which is
 how the SDK is told to connect without TLS. Mutual TLS gives the SDK the
 certificate and key files and no token source; `token_file` gives a static
 bearer token; the OIDC keys give the SDK's client-credentials token source,
@@ -1609,11 +1610,15 @@ The SDK in `go.mod` (v0.1.8) has no call for `ValidatePolicy`, `GetPolicy`,
 `Stat`, `Walk` and `Logs` (its logs are the gateway's and the supervisor's
 log lines), nor for `Exec` and `ExecStream` with input on stdin; they answer
 `ErrUnsupported` without calling it. Where it has a call but cannot carry a
-part of the request, the part is not sent: `CreateSandbox` sends no working
-directory and no base document (the SDK takes typed policy rules: the
+part of the request, a request with that part is `ErrUnsupported` too and
+does not reach the SDK, so that no sandbox runs without the policy or
+outside the directory it was asked for: `CreateSandbox` with a working
+directory or a base document (the SDK takes typed policy rules: the
 protected and added rules go as named network rules, and a rule its network
-rule cannot hold is `ErrUnsupported`), and `StartSandbox` sends neither the
-policy nor the environment, so the sandbox keeps those the gateway holds.
+rule cannot hold is `ErrUnsupported`), and `StartSandbox` with a policy
+value or an environment. With SDK v0.1.8 no sandbox can therefore be created
+with a base policy or in a working directory; the caller answers
+`ErrUnsupported` as its own package says.
 `InstallProviderProfile` installs a profile with one credential named after
 the profile; the SDK's profile endpoint is a host, a port and a protocol,
 which takes the endpoint's scheme, and has no path, so an endpoint's paths
@@ -1633,7 +1638,10 @@ exists.
 The contract tests run against this implementation over the SDK's in-memory
 client, which keeps no provider profiles and answers its profile, exec, file
 and policy draft calls as not implemented, so the assertions about those
-operations are skipped there.
+operations are skipped there, as are those that need a sandbox created in a
+working directory with a base document. The contract creates the sandboxes
+of the tests whose subject is not what a sandbox is created with without
+either, so those tests hold for this implementation.
 
 `openshelltest.New(opts...)` (`internal/sandbox/runtime/openshell/openshelltest`,
 test support) returns a `Gateway`: a `v1.ClientInterface` that stands in for

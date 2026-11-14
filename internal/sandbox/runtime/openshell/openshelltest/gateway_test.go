@@ -10,6 +10,7 @@ import (
 )
 
 func TestGateway_KeepsProviderProfilesPerWorkspace(t *testing.T) {
+	t.Parallel()
 	g := openshelltest.New()
 	ctx := t.Context()
 	g.AddProfile("parley", v1.ProviderProfile{ID: "anthropic", Credentials: []v1.ProfileCredential{{Name: "api_key", EnvVars: []string{"ANTHROPIC_API_KEY"}}}})
@@ -40,6 +41,7 @@ func TestGateway_KeepsProviderProfilesPerWorkspace(t *testing.T) {
 }
 
 func TestGateway_IsUnreachableUntilToldOtherwise(t *testing.T) {
+	t.Parallel()
 	g := openshelltest.New()
 	ctx := context.Background()
 	calls := map[string]func() error{

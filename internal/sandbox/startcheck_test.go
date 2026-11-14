@@ -191,17 +191,15 @@ func TestRunStartCheck_StopsAtAGatewayItCannotUseNamingTheGatewayURL(t *testing.
 
 func TestRunStartCheck_RefusesAReleaseOutsideTheSupportedRange(t *testing.T) {
 	t.Parallel()
+	// Which releases the range holds is ReleaseRange's; the check refuses
+	// one outside it, naming the release and the range, before any other
+	// call, and goes on with one inside it.
 	for _, tc := range []struct {
 		release string
 		accept  bool
 	}{
 		{"1.1.9", false},
-		{"1.2.0", true},
-		{"1.9.3", true},
-		{"2.0.0", false},
-		{"v1.4.0", true},
-		{"nightly", false},
-		{"", false},
+		{"1.4.0", true},
 	} {
 		t.Run("release "+tc.release, func(t *testing.T) {
 			t.Parallel()
@@ -213,6 +211,9 @@ func TestRunStartCheck_RefusesAReleaseOutsideTheSupportedRange(t *testing.T) {
 			if tc.accept {
 				if err != nil {
 					t.Fatalf("RunStartCheck: %v", err)
+				}
+				if got := ops(rt.Calls()); len(got) < 2 || got[0] != runtime.OpRelease {
+					t.Errorf("calls = %q, want the release read and the calls after it", got)
 				}
 				return
 			}

@@ -244,27 +244,26 @@ func TestFromConfig_RefusesAnInvalidCredentialOrReferenceToOne(t *testing.T) {
 func TestFromConfig_RefusesAnEnvKeyThatIsNotAVariableNameNamingTheKeyAlone(t *testing.T) {
 	t.Parallel()
 	const value = "val-SECRETISH"
+	quoted := `"` + value + `"`
 	cases := []struct {
-		key     string
-		refused bool
+		name, key string
+		value     string // the entry's value as TOML
+		refused   bool
 	}{
-		{"PARLEY_X", true},
-		{"OPENSHELL_Y", true},
-		{"1ABC", true},
-		{"A-B", true},
-		{"", true},
-		{"PARLEYX", false},
-		{"parley_lower", false},
-		{"_X", false},
+		{"PARLEY_X", "PARLEY_X", quoted, true},
+		{"OPENSHELL_Y", "OPENSHELL_Y", quoted, true},
+		{"1ABC", "1ABC", quoted, true},
+		{"A-B", "A-B", quoted, true},
+		{"the empty key", "", quoted, true},
+		{"a value that is not a string", "A", "7", true},
+		{"PARLEYX", "PARLEYX", quoted, false},
+		{"parley_lower", "parley_lower", quoted, false},
+		{"_X", "_X", quoted, false},
 	}
 	for _, tc := range cases {
-		name := tc.key
-		if name == "" {
-			name = "the empty key"
-		}
-		t.Run(name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := loadSandbox(t, sandboxFile{profile: "env = { \"" + tc.key + "\" = \"" + value + "\" }\n"}, nil)
+			s, err := loadSandbox(t, sandboxFile{profile: "env = { \"" + tc.key + "\" = " + tc.value + " }\n"}, nil)
 			if !tc.refused {
 				if err != nil {
 					t.Fatalf("load: %v; want the key accepted", err)
@@ -277,11 +276,6 @@ func TestFromConfig_RefusesAnEnvKeyThatIsNotAVariableNameNamingTheKeyAlone(t *te
 			}
 		})
 	}
-	t.Run("a value that is not a string", func(t *testing.T) {
-		t.Parallel()
-		s, err := loadSandbox(t, sandboxFile{profile: "env = { A = 7 }\n"}, nil)
-		wantErrorNaming(t, s, err, "sandbox.profiles[agent].env", `"A"`)
-	})
 }
 
 func TestFromConfig_RefusesAnExposedSecretNameBreakingTheNameRules(t *testing.T) {

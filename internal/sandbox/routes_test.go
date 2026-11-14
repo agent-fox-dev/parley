@@ -72,6 +72,7 @@ func TestProfileList_GivesEveryCallerWithTheReadScopeEveryProfileInNameOrderOnOn
 		{"the admin token", h.Token},
 		{"a PAT with sandboxes:read", h.pat(t, loner, "sandboxes:read")},
 	}
+	// Serial subtests: each counts the runtime's calls around its requests.
 	for _, c := range creds {
 		t.Run(c.name, func(t *testing.T) {
 			before := len(h.rt.Calls())
@@ -157,6 +158,7 @@ func TestProfileList_ShowsWhatAProfileOffersWithoutItsPolicyPathEnvValuesOrSecre
 	}
 	for name, w := range want {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			got := item(t, list.Items, name)
 			// Comparing the whole object also proves that it has exactly the
 			// eighteen members and none of policy, env, expose_secrets and
@@ -185,6 +187,7 @@ func TestProfileList_RefusesAPATWithoutTheReadScopeAndARequestWithoutACredential
 		{"no credential", "", http.StatusUnauthorized, "unauthenticated"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			a := h.call(t, http.MethodGet, "/sandbox-profiles", c.cred, nil)
 			if a.status != c.status || a.err.ErrorType != c.errorType {
 				t.Errorf("GET /sandbox-profiles = %d %s, want %d %s", a.status, a.body, c.status, c.errorType)
@@ -326,6 +329,7 @@ func TestSandboxList_GivesOnlyTheSandboxesInTheStateAndOfTheUserAsked(t *testing
 		{"user=nobody", []any{}},
 	} {
 		t.Run(c.query, func(t *testing.T) {
+			t.Parallel()
 			list := listSandboxes(t, h, "/sandboxes?"+c.query, h.Token)
 			if !reflect.DeepEqual(ids(list.Items), c.want) {
 				t.Errorf("ids = %v, want %v", ids(list.Items), c.want)
@@ -337,6 +341,7 @@ func TestSandboxList_GivesOnlyTheSandboxesInTheStateAndOfTheUserAsked(t *testing
 	}
 
 	t.Run("a cursor of another filter", func(t *testing.T) {
+		t.Parallel()
 		first := listSandboxes(t, h, "/sandboxes?state=ready&limit=1", h.Token)
 		if first.NextCursor == nil {
 			t.Fatal("the first page of state=ready&limit=1 has no next_cursor")
@@ -357,6 +362,7 @@ func TestSandboxList_RefusesEveryCredentialButTheAdminTokenWithoutReadingAnySand
 		t.Fatalf("promote root = %d %s, want 200", a.status, a.body)
 	}
 	dev := h.CreateUser(t, "dev")
+	// Serial subtests: the source's calls are counted once they have all run.
 	for _, c := range []struct {
 		name, cred string
 		status     int
@@ -383,6 +389,7 @@ func TestSandboxList_RefusesAnUnknownStateABadLimitOrAMalformedCursorWithoutRead
 	t.Parallel()
 	src := &memorySource{sandboxes: fiveSandboxes()}
 	h := startListHub(t, src)
+	// Serial subtests: each counts the source's calls around its request.
 	for _, c := range []struct {
 		query  string
 		status int

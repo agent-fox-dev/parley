@@ -116,7 +116,7 @@ func (s *Served) ExitCode(t testing.TB, within time.Duration) int {
 // Hub is a running hub bootstrapped with an admin token, and its store, for
 // what no route does: seeding users, issuing an API key the way a login
 // does, storing a PAT and a workspace record. Orgs and their members are
-// made through the admin routes.
+// made through the admin routes, with Call.
 type Hub struct {
 	*Served
 	Token string
@@ -254,7 +254,7 @@ func (h *Hub) IssuePAT(t testing.TB, spec identity.PATSpec) string {
 // route and returns its id.
 func (h *Hub) CreateOrg(t testing.TB, slug string) string {
 	t.Helper()
-	status, body := h.admin(t, http.MethodPost, "/api/v1/orgs", `{"name":"`+slug+`","slug":"`+slug+`"}`)
+	status, body := h.Call(t, http.MethodPost, "/api/v1/orgs", h.Token, map[string]string{"name": slug, "slug": slug})
 	var org struct {
 		ID string `json:"id"`
 	}
@@ -268,7 +268,7 @@ func (h *Hub) CreateOrg(t testing.TB, slug string) string {
 // admin route.
 func (h *Hub) AddMember(t testing.TB, orgID, userID string) {
 	t.Helper()
-	if status, body := h.admin(t, http.MethodPut, "/api/v1/orgs/"+orgID+"/members/"+userID, ""); status != http.StatusNoContent {
+	if status, body := h.Call(t, http.MethodPut, "/api/v1/orgs/"+orgID+"/members/"+userID, h.Token, nil); status != http.StatusNoContent {
 		t.Fatalf("add member %s to %s = %d %s, want 204", userID, orgID, status, body)
 	}
 }
@@ -283,16 +283,35 @@ func (h *Hub) AddWorkspace(t testing.TB, rec access.Record) {
 	}
 }
 
-// admin sends method path with the admin token and body as JSON ("" for
-// none), and returns the status and the body of the answer.
-func (h *Hub) admin(t testing.TB, method, path, body string) (int, []byte) {
+// Call sends method path to the hub with credential as the bearer
+// credential ("" for none) and body: nil for none, a []byte or a string as
+// it is, anything else as JSON; a body is sent as application/json. It
+// returns the status and the body of the answer, and fails the test when the
+// request cannot be sent or the answer read.
+func (s *Served) Call(t testing.TB, method, path, credential string, body any) (int, []byte) {
 	t.Helper()
-	req, err := http.NewRequest(method, h.URL(path), strings.NewReader(body))
+	var data io.Reader
+	switch b := body.(type) {
+	case nil:
+	case []byte:
+		data = bytes.NewReader(b)
+	case string:
+		data = strings.NewReader(b)
+	default:
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, s.URL(path), data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+h.Token)
-	if body != "" {
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	}
+	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	res, err := http.DefaultClient.Do(req)

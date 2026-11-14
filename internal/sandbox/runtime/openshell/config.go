@@ -15,7 +15,8 @@ import (
 // BuildConfig returns the SDK configuration of a checked [sandbox] section:
 // the gateway's address and the one way to authenticate it configures.
 //
-// The address is gateway_url's host and port (443 when the URL gives none).
+// The address is gateway_url's host and port (when the URL gives none, 443,
+// or 80 for an http gateway_url).
 // An http gateway_url, which the section allows only for a loopback host,
 // keeps its scheme, which is how the SDK is told to connect without TLS.
 //

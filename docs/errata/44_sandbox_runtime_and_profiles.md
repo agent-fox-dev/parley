@@ -27,9 +27,11 @@ configuration reference (`runtime`, `gateway_url`, the TLS, token and OIDC
 keys), then the count of the ways to authenticate, the remaining keys,
 `[[sandbox.profiles]]`, `[[sandbox.credentials]]`, the profiles' references
 to credentials that do not exist, the section's unknown keys in name order,
-and last `server.external_url`. No failure quotes a value,
-durations and sizes included, so that no value a `${NAME}` reference brought
-in reaches the error line.
+and last `server.external_url`. A failure quotes no value but the configured
+names it is about (an env key, a name a profile's lists hold, a credential's
+name), and never a secret, the content of a file, an env value or the user
+information of a URL, durations and sizes included, so that no secret a
+`${NAME}` reference brought in reaches the error line.
 
 ## Relative paths are taken from the config dir
 
@@ -69,8 +71,10 @@ signatures. Where it leaves a choice, the interface in
   not the error it was made from, so that what was scrubbed from the text
   cannot be reached through `errors.Unwrap`. An error of none of the four
   kinds counts as unavailable (`runtime.KindOf`).
-- The reachability flag starts set, and the recorder hears of it at its
-  first change. The hub serves only after its start-up check succeeded
+- The reachability flag starts set, and the client's recorder hears of it
+  at its first change. `RunStartCheck` also sets `parley_sandbox_runtime_up`
+  to `1` on the recorder when it succeeds, so the gauge reads `1` from the
+  moment the hub serves; the hub serves only after that check succeeded
   through the client, so a set flag is true at that point.
 
 ## The contract's error-kind rows that need a gateway
@@ -115,30 +119,45 @@ implementation in `internal/sandbox/runtime/openshell` follows the SDK:
   lines, which carry neither the main process's output by stream nor the
   policy log's decisions, and cannot be followed), and none for `Exec` and
   `ExecStream` with input on stdin. They answer `unsupported` without
-  calling the SDK.
+  calling the SDK. Closing the SDK client makes the operations that call it
+  fail as `unavailable`; these keep answering `unsupported`.
 - The SDK's in-memory client (`fake.NewClient`) answers provider profiles,
   exec, file transfer, logs, sandbox configuration and policy drafts as not
   implemented, so over it those operations of the client are `unsupported`
   too. Its default gateway release is `fake`, which is not a semantic
   version; `fake.WithGatewayInfo` sets another.
 
-## What the SDK cannot carry of a request is not sent
+## What the SDK cannot carry of a request
 
 Where the SDK has a call for an operation but no field for a part of its
-request, the part is not sent and the gateway's default applies:
+request, the operation answers `unsupported` without calling the SDK when
+the request holds that part, as for an operation the SDK lacks (design
+decision 19), so that no part is silently dropped and a sandbox never runs
+without the policy, or outside the working directory, it was asked for:
 
-- `CreateSandbox` sends no working directory (the SDK has none at creation)
-  and no base document (the SDK takes typed policy rules, not a document).
-  The protected and added rules are sent as named network rules, decoded
-  from their JSON bodies; a body with a member the SDK's network rule has no
-  field for is `unsupported`, and an added rule named like an earlier rule,
-  which would replace it, is `invalid`. A profile that names a `policy` file
-  cannot start against this implementation (`ValidatePolicy` is
-  unsupported), so the base a sandbox is created with is the built-in
-  policy.
-- `StartSandbox` sends neither the policy value nor the environment: the
-  SDK's start takes neither, and the sandbox keeps those the gateway holds
-  for it.
+- `CreateSandbox` with a base document (`Policy.Base`, the SDK takes typed
+  policy rules, not a document) or a working directory (the SDK has none at
+  creation) is `unsupported`. Without them the sandbox is created with its
+  image, resources, GPU, environment, providers, labels and its protected
+  and added rules, sent as named network rules decoded from their JSON
+  bodies; a body with a member the SDK's network rule has no field for is
+  `unsupported`, and an added rule named like an earlier rule, which would
+  replace it, is `invalid`.
+- `StartSandbox` with a policy value (a base document, a protected or an
+  added rule) or an environment is `unsupported`: the SDK's start takes
+  neither. Without them the sandbox is started and keeps what the gateway
+  holds for it.
+
+The consequence with SDK v0.1.8: no sandbox can be created with a base
+policy or in a working directory, and none started again with its policy
+and environment. A caller (package 45 for creation, 47 for start) gets
+`unsupported` and gives its own answer, `502 sandbox_runtime_error` or a
+failed sandbox, as design decision 19 says. A profile that names a `policy`
+file cannot start against this implementation anyway (`ValidatePolicy` is
+unsupported).
+
+One part is still not sent, and the operation is carried out without it:
+
 - `InstallProviderProfile` installs one credential named after the profile,
   whose placeholder goes into each of the profile's variables, and
   `EnsureProvider` stores a provider's value under the one credential of its
@@ -151,15 +170,26 @@ request, the part is not sent and the gateway's default applies:
   paths outside those two are the same hub's, so the credential still
   reaches no other party, and narrowing it per workspace belongs to the
   sandbox's policy (design decision 15).
-- The SDK reports nothing of a sandbox's working directory, which counts as
-  present while the sandbox exists.
+
+The SDK reports nothing of a sandbox's working directory, which counts as
+present while the sandbox exists.
 
 ## The OpenShell implementation's checks
 
 The contract (`runtimetest.RunContract`) runs against the implementation
 over the SDK's in-memory client; the assertions about what that client does
 not implement (provider profiles, exec, file transfer, policy drafts) are
-skipped. The contract's check that an installed provider profile is returned
+skipped. The contract creates the sandboxes of the tests whose subject is
+not what a sandbox is created with without a working directory or a base
+document (`plainSpec`), so that those tests (create, list and delete, wait
+and stop, the workspace boundary, the error kinds, every operation of an
+unreachable backend) hold here; the tests of the policy value a sandbox was
+created with, and those that use its files, create it in `/w` with a base
+document (`contractSpec`), which this implementation refuses as
+`unsupported`, so they are skipped, as is the start of the stop and start
+test, which carries a policy value. Creation and start with only what the
+SDK can carry, and their refusal otherwise without an SDK call, are tested
+with the implementation. The contract's check that an installed provider profile is returned
 by get, paths included, cannot hold for this implementation against a
 gateway that keeps profiles, because the paths are not sent; the provider
 operations are instead tested against `openshelltest.Gateway`, which keeps

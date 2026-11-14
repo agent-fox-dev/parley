@@ -103,7 +103,13 @@ grepping for declarations.
 - Shared test helpers live in `internal/hubtest`, imported by test code
   only: `hubtest.Start` bootstraps a hub with an admin token and serves it
   in-process on a free loopback port (its `Hub` has `Token`, `Store`,
-  `URL(path)`, `CreateUser` and `IssueKey`), `hubtest.Serve` runs a hub
-  with the options a test gives until the test ends, and `hubtest.LogBuffer`
-  is the buffer a running hub may write its log to while the test reads it.
-  A test that needs a running hub starts it with these.
+  `URL(path)`, `Call`, `CreateUser`, `IssueKey`, `IssuePAT`, `CreateOrg`,
+  `AddMember` and `AddWorkspace`), `hubtest.StartWith` does the same with a
+  `hubtest.Config` (`Server` inside `[server]`, `TOML` after it, `Files` in
+  the config dir, `Compose` on the composition), `hubtest.Serve` runs a hub
+  with the options a test gives until the test ends (its `Served` has
+  `URL(path)` and `Call(t, method, path, credential, body)`, which sends a
+  request with a bearer credential and returns the answer's status and
+  body), and `hubtest.LogBuffer` is the buffer a running hub may write its
+  log to while the test reads it. A test that needs a running hub starts it
+  with these.
