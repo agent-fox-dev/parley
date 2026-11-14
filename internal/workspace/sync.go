@@ -156,14 +156,19 @@ type BranchOutcome string
 // up_to_date when both heads are equal, fast_forward when the hub's head was
 // an ancestor of origin's, ahead when origin's head is an ancestor of the
 // hub's, and, when each side has commits the other lacks, diverged (left as
-// it is) or, with ResetToOrigin, reset (moved to origin's head).
+// it is) or, with ResetToOrigin, reset (moved to origin's head). A branch the
+// hub lacks and cannot create, because a branch only the hub has is in the
+// way of its name (feat beside origin's feat/x, or topic/a beside origin's
+// topic), is name_conflict: not created, and the branch in the way is left
+// as it is.
 const (
-	BranchCreated     BranchOutcome = "created"
-	BranchUpToDate    BranchOutcome = "up_to_date"
-	BranchFastForward BranchOutcome = "fast_forward"
-	BranchAhead       BranchOutcome = "ahead"
-	BranchDiverged    BranchOutcome = "diverged"
-	BranchReset       BranchOutcome = "reset"
+	BranchCreated      BranchOutcome = "created"
+	BranchUpToDate     BranchOutcome = "up_to_date"
+	BranchFastForward  BranchOutcome = "fast_forward"
+	BranchAhead        BranchOutcome = "ahead"
+	BranchDiverged     BranchOutcome = "diverged"
+	BranchReset        BranchOutcome = "reset"
+	BranchNameConflict BranchOutcome = "name_conflict"
 )
 
 // BranchResult is one entry of a sync's branch list, as the sync answer
@@ -172,7 +177,8 @@ type BranchResult struct {
 	// Name is the branch's name, without refs/heads/.
 	Name   string        `json:"name"`
 	Result BranchOutcome `json:"result"`
-	// LocalSHA is the hub's head of the branch after the sync handled it.
+	// LocalSHA is the hub's head of the branch after the sync handled it, ""
+	// for a name_conflict branch, which the hub does not have.
 	LocalSHA string `json:"local_sha"`
 	// OriginSHA is origin's head of the branch as the fetch found it.
 	OriginSHA string `json:"origin_sha"`
@@ -201,7 +207,8 @@ type SyncResult struct {
 // syncFetchDeadline, which sets the copy's origin heads to origin's
 // branches, and creates in the copy every tag origin has and the copy lacks,
 // at origin's value. A tag the copy has keeps its value, whether origin has
-// it at another value, has deleted it or never had it. It then evaluates
+// it at another value, has deleted it or never had it, and a tag of origin
+// whose name a tag of the copy is in the way of is not created. It then evaluates
 // every branch of origin in name order (see syncBranch), reports each in
 // Branches and tells the branch-move observers of each move right after it.
 // A branch only the hub has, never on origin or deleted there, is neither
@@ -386,7 +393,7 @@ func newRefUpdate(ref, before, after string) refUpdate {
 // the sync created or moved, sorted by its full name.
 func syncEventInput(slug string, branches []BranchResult, updated []refUpdate) event.Input {
 	lists := map[BranchOutcome][]string{}
-	for _, o := range []BranchOutcome{BranchCreated, BranchFastForward, BranchAhead, BranchDiverged, BranchReset} {
+	for _, o := range []BranchOutcome{BranchCreated, BranchFastForward, BranchAhead, BranchDiverged, BranchReset, BranchNameConflict} {
 		lists[o] = []string{}
 	}
 	// branches is sorted by name, so each list is too.
@@ -422,8 +429,10 @@ const maxBranchEvaluations = 5
 // maxBranchEvaluations times; after that the error is an internal one naming
 // the branch. A diverged branch moves only when reset is true. Whether the
 // branch is protected does not matter: sync is one of the ways a protected
-// branch may move. The result and before, the head the move replaced ("" when
-// it created the branch), are those of the last evaluation.
+// branch may move. A branch that cannot be created because another branch's
+// name is in the way is name_conflict, with no local head. The result and
+// before, the head the move replaced ("" when it created the branch), are
+// those of the last evaluation.
 func (s *Service) syncBranch(ctx context.Context, repo *gitrepo.Repo, slug, name, originHead string, reset bool) (_ BranchResult, before string, _ error) {
 	for range maxBranchEvaluations {
 		local, found, err := repo.ResolveBranch(ctx, name)
@@ -444,6 +453,9 @@ func (s *Service) syncBranch(ctx context.Context, repo *gitrepo.Repo, slug, name
 		err = repo.CompareAndSwapRef(ctx, "refs/heads/"+name, originHead, local)
 		if errors.Is(err, gitrepo.ErrRefMoved) {
 			continue
+		}
+		if errors.Is(err, gitrepo.ErrRefNameConflict) {
+			return BranchResult{Name: name, Result: BranchNameConflict, OriginSHA: originHead}, "", nil
 		}
 		if err != nil {
 			return BranchResult{}, "", fmt.Errorf("sync branch %s: %w", name, err)
@@ -529,7 +541,9 @@ func (s *Service) failFetch(ctx context.Context, slug string, cred Credential, c
 // createTags creates in repo, in name order, every tag of tags that it
 // lacks, at the value tags gives, and returns those it created. Each is
 // created only while it does not exist, so that a tag another writer creates
-// meanwhile keeps that writer's value.
+// meanwhile keeps that writer's value. A tag whose name a tag of repo is in
+// the way of (v1/rc beside v1) is not created, as a tag repo has keeps its
+// value.
 func createTags(ctx context.Context, repo *gitrepo.Repo, tags map[string]string) (map[string]string, error) {
 	have, err := repo.Tags(ctx)
 	if err != nil {
@@ -541,7 +555,7 @@ func createTags(ctx context.Context, repo *gitrepo.Repo, tags map[string]string)
 			continue
 		}
 		err := repo.CompareAndSwapRef(ctx, "refs/tags/"+name, tags[name], "")
-		if errors.Is(err, gitrepo.ErrRefMoved) {
+		if errors.Is(err, gitrepo.ErrRefMoved) || errors.Is(err, gitrepo.ErrRefNameConflict) {
 			continue
 		}
 		if err != nil {

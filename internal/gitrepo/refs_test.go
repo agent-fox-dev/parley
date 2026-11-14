@@ -67,6 +67,33 @@ func TestCompareAndSwapRef(t *testing.T) {
 	}
 }
 
+func TestCompareAndSwapRef_NameInTheWayOfAnotherRef(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, c := range []struct {
+		name          string
+		existing, ref string
+	}{
+		{"the new name is below an existing ref", "refs/heads/feat", "refs/heads/feat/x"},
+		{"an existing ref is below the new name", "refs/heads/topic/a", "refs/heads/topic"},
+		{"a tag below an existing tag", "refs/tags/v1", "refs/tags/v1/rc"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			repo, c1, c2, _ := threeCommits(t)
+			gitrepotest.Git(t, repo.Dir(), "update-ref", c.existing, c1)
+			err := repo.CompareAndSwapRef(ctx, c.ref, c2, "")
+			if !errors.Is(err, gitrepo.ErrRefNameConflict) || errors.Is(err, gitrepo.ErrRefMoved) {
+				t.Errorf("CompareAndSwapRef = %v, want an error matching only ErrRefNameConflict", err)
+			}
+			got := gitrepotest.Refs(t, repo.Dir(), "")
+			if _, created := got[c.ref]; got[c.existing] != c1 || created {
+				t.Errorf("refs = %v, want %s at %s and no %s", got, c.existing, c1, c.ref)
+			}
+		})
+	}
+}
+
 func TestIsAncestor(t *testing.T) {
 	t.Parallel()
 	repo, c1, c2, c3 := threeCommits(t)

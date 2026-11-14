@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -13,12 +14,21 @@ import (
 // caller reads it again and decides anew.
 var ErrRefMoved = errors.New("the ref is not at the expected value")
 
+// ErrRefNameConflict is the error of a compare-and-swap that would create a
+// ref whose name another ref's name is a directory of, or that is itself a
+// directory of another ref's name, such as refs/heads/feat/x beside
+// refs/heads/feat: git keeps both names in one tree of ref files and cannot
+// hold the two. Nothing changes.
+var ErrRefNameConflict = errors.New("another ref is in the way of the name")
+
 // CompareAndSwapRef points ref, a full ref name such as refs/heads/main, at
 // newID only if it points at expectedOld now, as one atomic step of git's
 // ref transaction; expectedOld "" means that ref must not exist, so that the
 // call creates it. When ref is elsewhere, exists though expected absent, or
 // is locked by another writer, nothing changes and the error matches
-// ErrRefMoved; any other error is git's.
+// ErrRefMoved; when ref is to be created and another ref's name is in the
+// way of its name, nothing changes and the error matches
+// ErrRefNameConflict; any other error is git's.
 func (r *Repo) CompareAndSwapRef(ctx context.Context, ref, newID, expectedOld string) error {
 	// An empty old value is git's own "must not exist yet".
 	_, err := r.git(ctx, "update-ref", ref, newID, expectedOld)
@@ -30,7 +40,38 @@ func (r *Repo) CompareAndSwapRef(ctx context.Context, ref, newID, expectedOld st
 	if moved || strings.Contains(err.Error(), ".lock': File exists") {
 		return fmt.Errorf("move %s: %w", ref, ErrRefMoved)
 	}
+	if expectedOld == "" {
+		// The refs are read rather than git's message matched, whose wording
+		// changes between versions.
+		if blocked, blockErr := r.nameBlocked(ctx, ref); blockErr == nil && blocked {
+			return fmt.Errorf("create %s: %w", ref, ErrRefNameConflict)
+		}
+	}
 	return err
+}
+
+// nameBlocked reports whether a ref exists whose name is a directory of
+// ref's, such as refs/heads/feat for refs/heads/feat/x, or that lies below
+// ref's name, such as refs/heads/topic/a for refs/heads/topic.
+func (r *Repo) nameBlocked(ctx context.Context, ref string) (bool, error) {
+	parts := strings.Split(ref, "/")
+	var dirs []string
+	// refs/heads and the like are namespaces, never refs.
+	for i := 3; i < len(parts); i++ {
+		dirs = append(dirs, strings.Join(parts[:i], "/"))
+	}
+	// A pattern matches its own name and every ref below it.
+	out, err := r.git(ctx, append([]string{"for-each-ref", "--format=%(refname)", ref}, dirs...)...)
+	if err != nil {
+		return false, err
+	}
+	for name := range strings.Lines(string(out)) {
+		name = strings.TrimRight(name, "\n")
+		if strings.HasPrefix(name, ref+"/") || slices.Contains(dirs, name) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // IsAncestor reports whether the commit ancestor is reachable from the

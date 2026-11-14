@@ -1442,6 +1442,11 @@ first one's fetch, never answers `409` `workspace_busy` for it, and reports
 | `ahead` | origin's head is an ancestor of the hub's | unchanged |
 | `diverged` | each side has commits the other lacks, without `reset_to_origin=true` | unchanged |
 | `reset` | the same, with `reset_to_origin=true` | moved to origin's head |
+| `name_conflict` | the hub has no such branch and cannot create it, because a branch only the hub has is in the way of its name: `feat` for origin's `feat/x`, or `topic/a` for origin's `topic` | not created; the branch in the way is unchanged; `local_sha` is `""` |
+
+A tag of origin that a tag only the hub has is in the way of in the same
+way (`v1/rc` beside the hub's `v1`) is not created and not listed in the
+event, as a tag the hub has keeps its value; the sync goes on.
 
 The checks run in this order, the first that fails answering: a bound PAT
 on a workspace outside its binding (`404`, see
@@ -1487,14 +1492,14 @@ and `resource_id` the slug, `resource_type` `workspace`, and as actor the
 caller as for [`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug):
 `admin_token` with `actor_id` `null`, or `api_key` or `pat` with the
 caller's user. Its `metadata` holds `created`, `fast_forward`, `ahead`,
-`diverged` and `reset`, the names of the branches with that result in byte
+`diverged`, `reset` and `name_conflict`, the names of the branches with that result in byte
 order (`[]` when none; an `up_to_date` branch is in no list), and
 `updated`, one entry per branch the sync created or moved and per tag it
 created, with the full ref name, the head before (`null` for a created ref)
 and after, sorted by `ref`:
 
 ```json
-{"seq":14,"id":"…","type":"parley.workspace.sync","time":"2026-11-14T10:32:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"sync","session_id":null,"metadata":{"ahead":[],"created":["new-b"],"diverged":["dev"],"fast_forward":["main"],"reset":[],"updated":[{"ref":"refs/heads/main","before":"9fceb02d0ae598e95dc970b74767f19372d61af8","after":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"},{"ref":"refs/heads/new-b","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"ref":"refs/tags/v2","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"}]}}
+{"seq":14,"id":"…","type":"parley.workspace.sync","time":"2026-11-14T10:32:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"sync","session_id":null,"metadata":{"ahead":[],"created":["new-b"],"diverged":["dev"],"fast_forward":["main"],"name_conflict":[],"reset":[],"updated":[{"ref":"refs/heads/main","before":"9fceb02d0ae598e95dc970b74767f19372d61af8","after":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"},{"ref":"refs/heads/new-b","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"ref":"refs/tags/v2","before":null,"after":"e83c5163316f89bfbde7d9ab23ca2e25604af290"}]}}
 ```
 
 The answer is the workspace object, read after the completion was
@@ -1503,7 +1508,7 @@ recorded, so that it carries the new `last_sync_at`, `sync_error`,
 [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers, with
 `access` the caller's level, and the member `branches`: one entry per
 branch of origin that the sync did not leave out, in byte order of the
-names, an empty list when there is none. `local_sha` is the hub's head of the branch after the sync,
+names, an empty list when there is none. `local_sha` is the hub's head of the branch after the sync (`""` for `name_conflict`),
 `origin_sha` origin's head as the fetch found it. The members a sync
 extension adds come after `branches`, in byte order of their names; one
 whose name the workspace object or `branches` has already is left out.

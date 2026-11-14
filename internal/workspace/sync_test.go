@@ -167,6 +167,68 @@ func TestSync_LeavesHubOnlyBranchesAlone(t *testing.T) {
 	}
 }
 
+func TestSync_ReportsOriginRefsAHubOnlyRefIsInTheWayOf(t *testing.T) {
+	t.Parallel()
+	s := newSyncWorld(t)
+	main := s.origin.Head("main")
+	// The hub alone has feat, topic/a and the tag v9; origin has feat/x,
+	// topic and v9/rc, which git cannot create beside them, and a new
+	// branch and tag that it can.
+	hubFeat, hubTopic := grow(t, s.copy, "feat", main, "hub"), grow(t, s.copy, "topic/a", main, "hub")
+	gitrepotest.Git(t, s.copy, "update-ref", "refs/tags/v9", main)
+	originFeat, originTopic := s.origin.Branch("feat/x", "dev"), s.origin.Branch("topic", "dev")
+	s.origin.Tag("v9/rc", "dev")
+	newB, v10 := s.origin.Branch("new-b", "dev"), s.origin.Tag("v10", "dev")
+	steps := []struct {
+		reset   bool
+		newB    workspace.BranchOutcome
+		created map[string]string
+	}{
+		{false, workspace.BranchCreated, map[string]string{"v10": v10}},
+		{true, workspace.BranchUpToDate, map[string]string{}},
+	}
+	for i, step := range steps {
+		r := s.sync(t, workspace.SyncOptions{ResetToOrigin: step.reset})
+		want := map[string]workspace.BranchResult{
+			"feat/x": {Name: "feat/x", Result: workspace.BranchNameConflict, OriginSHA: originFeat},
+			"topic":  {Name: "topic", Result: workspace.BranchNameConflict, OriginSHA: originTopic},
+			"new-b":  {Name: "new-b", Result: step.newB, LocalSHA: newB, OriginSHA: newB},
+		}
+		for _, b := range r.Branches {
+			if w, ok := want[b.Name]; ok && b != w {
+				t.Errorf("sync %d: branch %s = %+v, want %+v", i+1, b.Name, b, w)
+			}
+		}
+		if got := outcomes(r); len(got) != len(want)+2 {
+			t.Errorf("sync %d: results = %v, want feat/x, topic, new-b, main and dev", i+1, got)
+		}
+		heads := gitrepotest.Refs(t, s.copy, "refs/heads/")
+		_, hasFeatX := heads["feat/x"]
+		_, hasTopic := heads["topic"]
+		if heads["feat"] != hubFeat || heads["topic/a"] != hubTopic || hasFeatX || hasTopic || heads["new-b"] != newB {
+			t.Errorf("sync %d: the hub's branches = %v, want feat and topic/a unchanged, no feat/x or topic, new-b at %s", i+1, heads, newB)
+		}
+		tags := gitrepotest.Refs(t, s.copy, "refs/tags/")
+		if _, hasRC := tags["v9/rc"]; tags["v9"] != main || hasRC || tags["v10"] != v10 {
+			t.Errorf("sync %d: the hub's tags = %v, want v9 unchanged, no v9/rc, v10 at %s", i+1, tags, v10)
+		}
+		if !maps.Equal(r.CreatedTags, step.created) {
+			t.Errorf("sync %d: CreatedTags = %v, want %v", i+1, r.CreatedTags, step.created)
+		}
+		if r.Workspace.LastSyncAt == nil || r.Workspace.SyncError != nil {
+			t.Errorf("sync %d: the record's last_sync_at %v, sync_error %v; want a completion", i+1, r.Workspace.LastSyncAt, deref(r.Workspace.SyncError))
+		}
+		events := s.eventsOf(t, syncEvent)
+		var meta map[string]any
+		if len(events) != i+1 || json.Unmarshal(events[i].Metadata, &meta) != nil {
+			t.Fatalf("sync %d: %d sync events, want %d", i+1, len(events), i+1)
+		}
+		if got, want := meta["name_conflict"], []any{"feat/x", "topic"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("sync %d: the event's name_conflict = %v, want %v", i+1, got, want)
+		}
+	}
+}
+
 func TestSync_BranchesListShape(t *testing.T) {
 	t.Parallel()
 	s := newSyncWorld(t)
@@ -337,14 +399,14 @@ func TestSync_EmitsOneEvent(t *testing.T) {
 		lists   map[string][]any
 		updated []any
 	}{
-		{map[string][]any{"created": {"new-b"}, "fast_forward": {"ff"}, "ahead": {"ahead-b"}, "diverged": {"div"}, "reset": {}},
+		{map[string][]any{"created": {"new-b"}, "fast_forward": {"ff"}, "ahead": {"ahead-b"}, "diverged": {"div"}, "reset": {}, "name_conflict": {}},
 			[]any{
 				map[string]any{"ref": "refs/heads/ff", "before": set.base, "after": set.theirs["ff"]},
 				map[string]any{"ref": "refs/heads/new-b", "before": nil, "after": set.theirs["new-b"]},
 				map[string]any{"ref": "refs/tags/v2", "before": nil, "after": tag},
 			}},
 		// Nothing left to move: only the branches that stay apart are listed.
-		{map[string][]any{"created": {}, "fast_forward": {}, "ahead": {"ahead-b"}, "diverged": {"div"}, "reset": {}}, []any{}},
+		{map[string][]any{"created": {}, "fast_forward": {}, "ahead": {"ahead-b"}, "diverged": {"div"}, "reset": {}, "name_conflict": {}}, []any{}},
 	}
 	for i, step := range steps {
 		total := s.eventCount(t)
