@@ -3,8 +3,6 @@ package access_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"io"
 	"maps"
 	"net/http"
 	"sync/atomic"
@@ -53,59 +51,12 @@ func (h *accessHub) probe(method, pattern string, need access.Need) server.Route
 	}
 }
 
-// createOrg creates the active org slug through the admin route and returns
-// its id.
-func (h *accessHub) createOrg(t *testing.T, slug string) string {
-	t.Helper()
-	a := h.call(t, http.MethodPost, "/orgs", h.Token, map[string]string{"name": slug, "slug": slug})
-	var org struct {
-		ID string `json:"id"`
-	}
-	if a.status != http.StatusCreated || json.Unmarshal(a.body, &org) != nil || org.ID == "" {
-		t.Fatalf("create org %s = %d %s, want 201 with an id", slug, a.status, a.body)
-	}
-	return org.ID
-}
-
-// member adds (PUT) or removes (DELETE) the user userID as a member of the
-// org orgID through the admin route.
-func (h *accessHub) member(t *testing.T, method, orgID, userID string) {
-	t.Helper()
-	if a := h.call(t, method, "/orgs/"+orgID+"/members/"+userID, h.Token, nil); a.status != http.StatusNoContent {
-		t.Fatalf("%s member %s of %s = %d %s, want 204", method, userID, orgID, a.status, a.body)
-	}
-}
-
 // call sends method path, under /api/v1, with key as the bearer credential
 // and body as JSON when it is not nil.
 func (h *accessHub) call(t *testing.T, method, path, key string, body any) answer {
 	t.Helper()
-	var data io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data = bytes.NewReader(b)
-	}
-	req, err := http.NewRequest(method, h.URL("/api/v1"+path), data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
-	}
-	defer res.Body.Close()
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatalf("%s %s: read the body: %v", method, path, err)
-	}
-	return answer{res.StatusCode, res.Header.Get("Content-Type"), b, res.Header.Get("Allow")}
+	status, b := h.Call(t, method, "/api/v1"+path, key, body)
+	return answer{status: status, body: b}
 }
 
 // readable builds the readable set of the user userID with a service bound
@@ -127,8 +78,8 @@ func TestHub_AnswersTheOwnerTheMemberAndAnOutsiderOnAWriteRoute(t *testing.T) {
 	t.Parallel()
 	h := startAccessHub(t)
 	owner, member, outsider := h.CreateUser(t, "owner"), h.CreateUser(t, "member"), h.CreateUser(t, "outsider")
-	org := h.createOrg(t, "team")
-	h.member(t, http.MethodPut, org, member)
+	org := h.CreateOrg(t, "team")
+	h.AddMember(t, org, member)
 	seed(t, h.Store, repo("acme", owner, org, access.StatusReady))
 
 	if a := h.call(t, http.MethodPost, "/workspaces/acme/probe", h.IssueKey(t, owner), map[string]any{}); a.status != http.StatusOK || decode(t, a).Level != access.LevelOwner {
@@ -153,15 +104,17 @@ func TestHub_ClosesTheForkOfAMemberWhoLeavesTheOrgAndKeepsItOpenToTheParentsOwne
 	t.Parallel()
 	h := startAccessHub(t)
 	owner, member := h.CreateUser(t, "owner"), h.CreateUser(t, "member")
-	org := h.createOrg(t, "team")
-	h.member(t, http.MethodPut, org, member)
+	org := h.CreateOrg(t, "team")
+	h.AddMember(t, org, member)
 	seed(t, h.Store, repo("acme", owner, org, access.StatusReady), fork("acme--m", member, org, "acme"))
 	ownerKey, memberKey := h.IssueKey(t, owner), h.IssueKey(t, member)
 
 	if a := h.call(t, http.MethodGet, "/workspaces/acme--m/probe-owner", memberKey, nil); a.status != http.StatusOK || decode(t, a).Level != access.LevelOwner {
 		t.Fatalf("the member's owner route on the fork before leaving = %d %s, want 200 at level owner", a.status, a.body)
 	}
-	h.member(t, http.MethodDelete, org, member)
+	if a := h.call(t, http.MethodDelete, "/orgs/"+org+"/members/"+member, h.Token, nil); a.status != http.StatusNoContent {
+		t.Fatalf("remove the member = %d %s, want 204", a.status, a.body)
+	}
 	for _, path := range []string{"/workspaces/acme--m/probe-owner", "/workspaces/acme/probe-read"} {
 		if a := h.call(t, http.MethodGet, path, memberKey, nil); a.status != http.StatusNotFound || decode(t, a).Error.ErrorType != "not_found" {
 			t.Errorf("the former member's GET %s = %d %s, want 404 not_found", path, a.status, a.body)

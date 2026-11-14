@@ -16,296 +16,62 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// probePattern is the probe route every guard test registers: it needs read
-// and the scope git:read.
+// probePattern is the probe route that needs read and the scope git:read.
 const probePattern = "/workspaces/:slug/probe"
 
-func TestGuard_PassesWhatTheBindingCoversWithTheBindingForTheHandler(t *testing.T) {
-	h := newGuardHub(t)
-	h.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
-	alice, org := h.user("alice")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w2", alice, org, access.StatusArchived))
-	tokW1, idW1 := h.pat(alice, "w1", "git:read")
-	tokW2, _ := h.pat(alice, "w2", "git:read")
-	seed(t, h.st, createdBy(fork("f1", alice, org, "w1"), idW1))
-	tokF1, _ := h.pat(alice, "f1", "git:read")
-	unbound, _ := h.pat(alice, "", "git:read")
+// route is a route's method, its pattern and a path that matches it.
+type route struct{ method, pattern, path string }
 
-	for _, tc := range []struct {
-		name, token, slug string
-		want              binding
-	}{
-		{"the bound workspace", tokW1, "w1", binding{"w1", access.RelationBound}},
-		{"the bound workspace archived", tokW2, "w2", binding{"w2", access.RelationBound}},
-		{"a fork the token created", tokW1, "f1", binding{"w1", access.RelationCreatedFork}},
-		{"the bound fork", tokF1, "f1", binding{"f1", access.RelationBound}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			b := h.do(http.MethodGet, "/workspaces/"+tc.slug+"/probe", tc.token)
-			u := h.do(http.MethodGet, "/workspaces/"+tc.slug+"/probe", unbound)
-			if b.status != http.StatusOK || u.status != http.StatusOK {
-				t.Fatalf("bound %d %s, unbound %d %s, want 200 for both", b.status, b.body, u.status, u.body)
-			}
-			if got := decode(t, b).Binding; got == nil || *got != tc.want {
-				t.Errorf("bound PAT: the handler found %+v, want %+v", got, tc.want)
-			}
-			if got := decode(t, u).Binding; got != nil {
-				t.Errorf("unbound PAT: the handler found %+v, want none", got)
-			}
-		})
-	}
-	if got := h.refusals.all(); len(got) != 0 {
-		t.Errorf("refusals = %+v, want none", got)
-	}
-
-	// A fork the token creates after an earlier answer is covered at once.
-	if a := h.do(http.MethodGet, "/workspaces/f3/probe", tokW1); a.status != http.StatusNotFound {
-		t.Fatalf("f3 before it exists = %d %s, want 404", a.status, a.body)
-	}
-	seed(t, h.st, createdBy(fork("f3", alice, org, "w1"), idW1))
-	a := h.do(http.MethodGet, "/workspaces/f3/probe", tokW1)
-	if got := decode(t, a).Binding; a.status != http.StatusOK || got == nil || *got != (binding{"w1", access.RelationCreatedFork}) {
-		t.Errorf("f3 after the token created it = %d %s, want 200 with the binding of a created fork", a.status, a.body)
-	}
+// contributorRoutes are the routes of a workspace, relative to
+// /workspaces/:slug, that a token bound to a fork of it reaches.
+var contributorRoutes = []route{
+	{http.MethodPost, "/changes", "/changes"},
+	{http.MethodGet, "/changes", "/changes"},
+	{http.MethodGet, "/changes/:number", "/changes/7"},
+	{http.MethodGet, "/changes/by-commit/:sha", "/changes/by-commit/a1b2c3"},
+	{http.MethodPatch, "/changes/:number", "/changes/7"},
+	{http.MethodPost, "/changes/:number/abandon", "/changes/7/abandon"},
+	{http.MethodPost, "/changes/:number/restore", "/changes/7/restore"},
+	{http.MethodPost, "/changes/:number/restack", "/changes/7/restack"},
+	{http.MethodGet, "/changes/:number/versions", "/changes/7/versions"},
+	{http.MethodGet, "/changes/:number/versions/:version", "/changes/7/versions/2"},
+	{http.MethodGet, "/changes/:number/diff", "/changes/7/diff"},
+	{http.MethodGet, "/changes/:number/stack", "/changes/7/stack"},
+	{http.MethodPost, "/changes/:number/land", "/changes/7/land"},
+	{http.MethodGet, "/changes/:number/lands", "/changes/7/lands"},
+	{http.MethodGet, "/lands/:id", "/lands/l1"},
+	{http.MethodGet, "/changes/:number/conflict", "/changes/7/conflict"},
+	{http.MethodGet, "/changes/:number/conflict/file", "/changes/7/conflict/file"},
+	{http.MethodGet, "/changes/:number/approvals", "/changes/7/approvals"},
+	{http.MethodGet, "/changes/:number/checks", "/changes/7/checks"},
+	{http.MethodGet, "/policy", "/policy"},
+	{http.MethodPost, "/policy/evaluate", "/policy/evaluate"},
+	{http.MethodGet, "/activity", "/activity"},
+	{http.MethodGet, "/changes/:number/overlaps", "/changes/7/overlaps"},
+	{http.MethodGet, "/claims", "/claims"},
+	{http.MethodGet, "/claims/:id", "/claims/c1"},
 }
 
-func TestGuard_AnswersEveryWorkspaceOutsideTheBindingNotFoundBeforeScopeAndAccess(t *testing.T) {
-	h := newGuardHub(t)
-	h.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
-	alice, org := h.user("alice")
-	bob, bobOrg := h.user("bob")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w5", alice, org, access.StatusReady),
-		repo("w6", bob, bobOrg, access.StatusReady))
-	tokA, idA := h.pat(alice, "w1", "git:read")
-	tokNoScope, _ := h.pat(alice, "w1", "changes:read")
-	_, idB := h.pat(alice, "w1", "git:read")
-	_, idBob := h.pat(bob, "", "git:read")
-	seed(t, h.st,
-		createdBy(fork("f1", alice, org, "w1"), idA),
-		createdBy(fork("f2", alice, org, "w1"), idB),
-		fork("f3", alice, org, "w1"),
-		createdBy(fork("f4", bob, org, "w1"), idBob),
-		fork("f9", alice, org, "w1"),
-		createdBy(fork("g1", alice, org, "w5"), idA))
-	tokF, idF := h.pat(alice, "f1", "git:read")
-
-	type row struct{ token, tokenID, bound, slug string }
-	rows := []row{
-		{tokA, idA, "w1", "f2"}, // created by another token of the same user
-		{tokA, idA, "w1", "f3"}, // created with no token
-		{tokA, idA, "w1", "f4"}, // created by another user's token
-		{tokF, idF, "f1", "f9"}, // a sibling of the bound fork
-		{tokA, idA, "w1", "g1"}, // created by the token, but a fork of another workspace
-	}
-	for _, slug := range []string{"w5", "w6", "nosuch", "f9"} {
-		rows = append(rows, row{tokA, idA, "w1", slug}, row{tokNoScope, "", "w1", slug})
-	}
-	var bodies [][]byte
-	for _, r := range rows {
-		a := h.do(http.MethodGet, "/workspaces/"+r.slug+"/probe", r.token)
-		e := decode(t, a)
-		if a.status != http.StatusNotFound || e.Error.ErrorType != "not_found" || e.Error.Message != "workspace not found" {
-			t.Errorf("token bound to %s on %s = %d %s, want 404 not_found workspace not found", r.bound, r.slug, a.status, a.body)
-		}
-		bodies = append(bodies, a.body)
-	}
-	for i, b := range bodies {
-		if !bytes.Equal(b, bodies[0]) {
-			t.Errorf("body of row %d = %s, want the same as row 0, %s", i, b, bodies[0])
-		}
-	}
-	if n := h.calls.Load(); n != 0 {
-		t.Errorf("the probe ran %d times, want 0", n)
-	}
-	got := h.refusals.all()
-	if len(got) != len(rows) {
-		t.Fatalf("%d refusals reported, want one per request, %d", len(got), len(rows))
-	}
-	for i, f := range got {
-		r := rows[i]
-		if f.RequestedWorkspace == nil || *f.RequestedWorkspace != r.slug || f.BoundWorkspace != r.bound ||
-			f.Status != http.StatusNotFound || f.Method != http.MethodGet || f.Route != "/api/v1"+probePattern ||
-			f.Surface != "api" || f.UserID != alice || r.tokenID != "" && f.TokenID != r.tokenID {
-			t.Errorf("refusal %d = %+v, want the request of the token bound to %s on %s", i, f, r.bound, r.slug)
-		}
-	}
-}
-
-func TestGuard_LeavesScopeAndAccessToDecideAsForAnUnboundToken(t *testing.T) {
-	h := newGuardHub(t)
-	h.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
-	h.probe(http.MethodGet, "/workspaces/:slug/probe-write", access.NeedWrite, "git:read")
-	alice, org := h.user("alice")
-	carol, _ := h.user("carol")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady),
-		repo("w7", alice, "org7", access.StatusReady))
-
-	for _, tc := range []struct {
-		name, user, slug, route string
-		perms                   []string
-		member                  bool
-		status                  int
-	}{
-		{"a user no longer in the workspace's org", carol, "w7", "probe", []string{"git:read"}, false, http.StatusNotFound},
-		{"a token without the route's scope", alice, "w1", "probe", []string{"changes:read"}, false, http.StatusForbidden},
-		{"a member on a route that needs write", carol, "w7", "probe-write", []string{"git:read"}, true, http.StatusForbidden},
-		{"a bound slug with no workspace", alice, "gone", "probe", []string{"git:read"}, false, http.StatusNotFound},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h.orgs[carol] = nil
-			if tc.member {
-				h.orgs[carol] = []string{"org7"}
-			}
-			bound, _ := h.pat(tc.user, tc.slug, tc.perms...)
-			unbound, _ := h.pat(tc.user, "", tc.perms...)
-			path := "/workspaces/" + tc.slug + "/" + tc.route
-			b, u := h.do(http.MethodGet, path, bound), h.do(http.MethodGet, path, unbound)
-			if b.status != tc.status || u.status != b.status || !bytes.Equal(b.body, u.body) {
-				t.Errorf("bound %d %s, unbound %d %s, want %d and the same body", b.status, b.body, u.status, u.body, tc.status)
-			}
-		})
-	}
-	if got := h.refusals.all(); len(got) != 0 {
-		t.Errorf("refusals = %+v, want none", got)
-	}
-}
-
-// parentWithFork is a guard hub where alice owns p1 and its fork f1, with
-// tokF, alice's PAT [git:read] bound to f1.
-func parentWithFork(t *testing.T) (h *guardHub, alice, org, tokF string) {
-	h = newGuardHub(t)
-	alice, org = h.user("alice")
-	seed(t, h.st, repo("p1", alice, org, access.StatusReady), fork("f1", alice, org, "p1"))
-	tokF, _ = h.pat(alice, "f1", "git:read")
-	return h, alice, org, tokF
-}
-
-func TestGuard_LetsAForkTokenOntoTheContributorRoutesOfTheParent(t *testing.T) {
-	h, _, _, tokF := parentWithFork(t)
-	rows := []struct{ method, pattern, path string }{
-		{http.MethodPost, "/changes", "/changes"},
-		{http.MethodGet, "/changes", "/changes"},
-		{http.MethodGet, "/changes/:number", "/changes/7"},
-		{http.MethodGet, "/changes/by-commit/:sha", "/changes/by-commit/a1b2c3"},
-		{http.MethodPatch, "/changes/:number", "/changes/7"},
-		{http.MethodPost, "/changes/:number/abandon", "/changes/7/abandon"},
-		{http.MethodPost, "/changes/:number/restore", "/changes/7/restore"},
-		{http.MethodPost, "/changes/:number/restack", "/changes/7/restack"},
-		{http.MethodGet, "/changes/:number/versions", "/changes/7/versions"},
-		{http.MethodGet, "/changes/:number/versions/:version", "/changes/7/versions/2"},
-		{http.MethodGet, "/changes/:number/diff", "/changes/7/diff"},
-		{http.MethodGet, "/changes/:number/stack", "/changes/7/stack"},
-		{http.MethodPost, "/changes/:number/land", "/changes/7/land"},
-		{http.MethodGet, "/changes/:number/lands", "/changes/7/lands"},
-		{http.MethodGet, "/lands/:id", "/lands/l1"},
-		{http.MethodGet, "/changes/:number/conflict", "/changes/7/conflict"},
-		{http.MethodGet, "/changes/:number/conflict/file", "/changes/7/conflict/file"},
-		{http.MethodGet, "/changes/:number/approvals", "/changes/7/approvals"},
-		{http.MethodGet, "/changes/:number/checks", "/changes/7/checks"},
-		{http.MethodGet, "/policy", "/policy"},
-		{http.MethodPost, "/policy/evaluate", "/policy/evaluate"},
-		{http.MethodGet, "/activity", "/activity"},
-		{http.MethodGet, "/changes/:number/overlaps", "/changes/7/overlaps"},
-		{http.MethodGet, "/claims", "/claims"},
-		{http.MethodGet, "/claims/:id", "/claims/c1"},
-	}
-	if len(rows) != 25 {
-		t.Fatalf("%d rows, want the 25 contributor routes", len(rows))
-	}
-	want := binding{"f1", access.RelationParentOfBoundFork}
-	for _, r := range rows {
-		h.probe(r.method, "/workspaces/:slug"+r.pattern, access.NeedRead, "git:read")
-	}
-	for _, r := range rows {
-		a := h.do(r.method, "/workspaces/p1"+r.path, tokF)
-		if a.status != http.StatusOK {
-			t.Errorf("%s p1%s = %d %s, want 200", r.method, r.path, a.status, a.body)
-			continue
-		}
-		if got := decode(t, a).Binding; got == nil || *got != want {
-			t.Errorf("%s p1%s: the handler found %+v, want %+v", r.method, r.path, got, want)
-		}
-	}
-	if got := h.refusals.all(); len(got) != 0 {
-		t.Errorf("refusals = %+v, want none", got)
-	}
-}
-
-func TestGuard_RefusesAForkTokenEveryOtherRouteOfTheParent(t *testing.T) {
-	h, alice, _, tokF := parentWithFork(t)
-	routes := []struct{ method, pattern, path string }{
-		{http.MethodGet, "/probe", "/probe"},
-		{http.MethodGet, "/lands", "/lands"},
-		{http.MethodPut, "/policy", "/policy"},
-		{http.MethodPost, "/changes/:number/approvals", "/changes/7/approvals"},
-		{http.MethodDelete, "/changes/:number/approvals/:id", "/changes/7/approvals/a1"},
-		{http.MethodPut, "/changes/:number/checks/:name", "/changes/7/checks/ci"},
-		{http.MethodPost, "/changes/:number/revert", "/changes/7/revert"},
-		{http.MethodPost, "/claims", "/claims"},
-		{http.MethodPatch, "/claims/:id", "/claims/c1"},
-		{http.MethodDelete, "/claims/:id", "/claims/c1"},
-		{http.MethodPost, "/tokens", "/tokens"},
-		{http.MethodGet, "/tokens", "/tokens"},
-		{http.MethodPost, "/forks", "/forks"},
-	}
-	for _, r := range routes {
-		h.probe(r.method, "/workspaces/:slug"+r.pattern, access.NeedRead, "git:read")
-	}
-	for _, r := range routes {
-		a := h.do(r.method, "/workspaces/p1"+r.path, tokF)
-		if e := decode(t, a); a.status != http.StatusForbidden || e.Error.ErrorType != "token_bound" {
-			t.Errorf("%s p1%s = %d %s, want 403 token_bound", r.method, r.path, a.status, a.body)
-		}
-	}
-	if n := h.calls.Load(); n != 0 {
-		t.Errorf("the probes ran %d times, want 0", n)
-	}
-	got := h.refusals.all()
-	if len(got) != len(routes) {
-		t.Fatalf("%d refusals reported, want one per request, %d", len(got), len(routes))
-	}
-	for i, f := range got {
-		r := routes[i]
-		if f.Status != http.StatusForbidden || f.Method != r.method || f.Route != "/api/v1/workspaces/:slug"+r.pattern ||
-			f.RequestedWorkspace == nil || *f.RequestedWorkspace != "p1" || f.BoundWorkspace != "f1" || f.UserID != alice {
-			t.Errorf("refusal %d = %+v, want the 403 of %s p1%s", i, f, r.method, r.path)
-		}
-	}
-}
-
-func TestGuard_OpensTheContributorRoutesOnlyOnTheBoundForksOwnParent(t *testing.T) {
-	h, alice, org, tokF := parentWithFork(t)
-	h.probe(http.MethodGet, "/workspaces/:slug/changes", access.NeedRead, "git:read")
-	seed(t, h.st, repo("p2", alice, org, access.StatusReady), fork("f9", alice, org, "p1"))
-	tokP, _ := h.pat(alice, "p1", "git:read")
-
-	for _, tc := range []struct {
-		name, token, slug string
-		status            int
-	}{
-		{"a fork token on another workspace", tokF, "p2", http.StatusNotFound},
-		{"a repository token on another workspace", tokP, "p2", http.StatusNotFound},
-		{"a fork token on a sibling fork", tokF, "f9", http.StatusNotFound},
-		{"a repository token on its own workspace", tokP, "p1", http.StatusOK},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := h.do(http.MethodGet, "/workspaces/"+tc.slug+"/changes", tc.token)
-			e := decode(t, a)
-			switch {
-			case a.status != tc.status:
-				t.Errorf("GET %s/changes = %d %s, want %d", tc.slug, a.status, a.body, tc.status)
-			case tc.status == http.StatusNotFound && e.Error.Message != "workspace not found":
-				t.Errorf("message = %q, want workspace not found", e.Error.Message)
-			case tc.status == http.StatusOK && (e.Binding == nil || *e.Binding != binding{"p1", access.RelationBound}):
-				t.Errorf("the handler found %+v, want p1 bound", e.Binding)
-			}
-		})
-	}
+// parentOnlyRoutes are routes of a workspace, relative to /workspaces/:slug,
+// that a token bound to a fork of it does not reach.
+var parentOnlyRoutes = []route{
+	{http.MethodGet, "/lands", "/lands"},
+	{http.MethodPut, "/policy", "/policy"},
+	{http.MethodPost, "/changes/:number/approvals", "/changes/7/approvals"},
+	{http.MethodDelete, "/changes/:number/approvals/:id", "/changes/7/approvals/a1"},
+	{http.MethodPut, "/changes/:number/checks/:name", "/changes/7/checks/ci"},
+	{http.MethodPost, "/changes/:number/revert", "/changes/7/revert"},
+	{http.MethodPost, "/claims", "/claims"},
+	{http.MethodPatch, "/claims/:id", "/claims/c1"},
+	{http.MethodDelete, "/claims/:id", "/claims/c1"},
+	{http.MethodPost, "/tokens", "/tokens"},
+	{http.MethodGet, "/tokens", "/tokens"},
+	{http.MethodPost, "/forks", "/forks"},
 }
 
 // allowlist is every route that names no workspace and that a bound PAT
-// reaches, with a path that matches it.
-var allowlist = []struct{ method, pattern, path string }{
+// reaches.
+var allowlist = []route{
 	{http.MethodGet, "/workspaces", "/workspaces"},
 	{http.MethodGet, "/events", "/events"},
 	{http.MethodGet, "/events/log", "/events/log"},
@@ -319,44 +85,246 @@ var allowlist = []struct{ method, pattern, path string }{
 	{http.MethodGet, "/sessions/:id/usage", "/sessions/s1/usage"},
 }
 
-func TestGuard_PassesTheAllowlistWithTheBindingTheRouteConfinesItsResultTo(t *testing.T) {
-	h := newGuardHub(t)
-	alice, org := h.user("alice")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w5", alice, org, access.StatusReady))
-	tokA, idA := h.pat(alice, "w1", "git:read")
-	seed(t, h.st, createdBy(fork("f1", alice, org, "w1"), idA), fork("f2", alice, org, "w1"))
-	for _, r := range allowlist {
-		h.probe(r.method, r.pattern, "", "")
-	}
+// cred is a stored PAT: its value, its token_id, the workspace it is bound
+// to ("" for none) and its user.
+type cred struct{ value, id, bound, user string }
 
+// guardWorld is a guard hub with identity's routes and probe routes for
+// every route of the tables above, the probe route and a write probe route
+// /workspaces/:slug/probe-write, POST /workspaces and GET /sandboxes. Alice
+// owns w1, the archived w2 and w5 in her personal org, and w7 in org7, of
+// which dave is a member; bob owns w6. The forks of w1 are f1, created by
+// alice's token "w1", f2, created by "w1 other", f3 and f9, created by no
+// token, and f4, created by bob's token; g1 is a fork of w5 created by "w1".
+// Its PATs are in tok, by name.
+type guardWorld struct {
+	*guardHub
+	alice, org string
+	tok        map[string]cred
+}
+
+func newGuardWorld(t *testing.T) *guardWorld {
+	t.Helper()
+	w := &guardWorld{guardHub: newGuardHub(t), tok: map[string]cred{}}
+	w.routes()
+	alice, org := w.user("alice")
+	bob, bobOrg := w.user("bob")
+	carol, _ := w.user("carol")
+	dave, _ := w.user("dave")
+	w.alice, w.org, w.orgs[dave] = alice, org, []string{"org7"}
+	seed(t, w.st, repo("w1", alice, org, access.StatusReady), repo("w2", alice, org, access.StatusArchived),
+		repo("w5", alice, org, access.StatusReady), repo("w6", bob, bobOrg, access.StatusReady),
+		repo("w7", alice, "org7", access.StatusReady))
+	read, past := []string{"git:read"}, time.Now().Add(-time.Hour)
+	add := func(name, user, bound string, perms []string, expires *time.Time) {
+		v, id := w.storePAT(identity.PATSpec{UserID: user, Permissions: perms, Workspace: bound, ExpiresAt: expires})
+		w.tok[name] = cred{v, id, bound, user}
+	}
+	add("w1", alice, "w1", read, nil)
+	add("w1 other", alice, "w1", read, nil)
+	add("w1 no scope", alice, "w1", []string{"changes:read"}, nil)
+	add("w1 every scope", alice, "w1", identity.RegisteredScopes(), nil)
+	add("w2", alice, "w2", read, nil)
+	add("gone", alice, "gone", read, nil)
+	add("unbound", alice, "", read, nil)
+	add("unbound no scope", alice, "", []string{"changes:read"}, nil)
+	add("bob", bob, "", read, nil)
+	add("carol w7", carol, "w7", read, nil)
+	add("carol", carol, "", read, nil)
+	add("dave w7", dave, "w7", read, nil)
+	add("dave", dave, "", read, nil)
+	add("revoked", alice, "w1", read, nil)
+	add("expired", alice, "w1", []string{"users:read"}, &past)
+	if err := w.st.Tx(context.Background(), func(tx *sql.Tx) error {
+		return identity.RevokeTokenByID(context.Background(), tx, w.tok["revoked"].id, time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	v := w.tok["w1"].value
+	w.tok["wrong secret"] = cred{value: v[:len(v)-1] + map[bool]string{true: "b", false: "a"}[strings.HasSuffix(v, "a")]}
+	seed(t, w.st,
+		createdBy(fork("f1", alice, org, "w1"), w.tok["w1"].id),
+		createdBy(fork("f2", alice, org, "w1"), w.tok["w1 other"].id),
+		fork("f3", alice, org, "w1"),
+		createdBy(fork("f4", bob, org, "w1"), w.tok["bob"].id),
+		fork("f9", alice, org, "w1"),
+		createdBy(fork("g1", alice, org, "w5"), w.tok["w1"].id))
+	add("f1", alice, "f1", read, nil)
+	return w
+}
+
+// routes registers the world's routes on its server.
+func (w *guardWorld) routes() {
+	w.identityRoutes()
+	w.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
+	w.probe(http.MethodGet, "/workspaces/:slug/probe-write", access.NeedWrite, "git:read")
+	for _, r := range slices.Concat(contributorRoutes, parentOnlyRoutes) {
+		w.probe(r.method, "/workspaces/:slug"+r.pattern, access.NeedRead, "git:read")
+	}
 	for _, r := range allowlist {
-		a := h.do(r.method, r.path, tokA)
+		w.probe(r.method, r.pattern, "", "")
+	}
+	w.probe(http.MethodPost, "/workspaces", "", "workspaces:write")
+	w.probe(http.MethodGet, "/sandboxes", "", "sandboxes:read")
+}
+
+// guardCase is one request of the matrix and what it is answered.
+type guardCase struct {
+	token, method, path string
+	status              int
+	errorType           string   // of a refusal
+	found               *binding // what the handler finds on a 200; nil for none
+	covered             []string // the covered set the handler reads, checked when not nil
+	refusal             string   // the pattern of the route a refusal of the guard reports; "" for none
+	same                string   // the token answered the same, byte for byte, when not ""
+}
+
+// on is the binding of the workspace ws with the relation rel.
+func on(ws string, rel access.Relation) *binding { return &binding{ws, rel} }
+
+// outside is the request of token on the probe route of slug, which the
+// guard answers 404 as a workspace outside the binding.
+func outside(token, slug string) guardCase {
+	return guardCase{token: token, method: http.MethodGet, path: "/workspaces/" + slug + "/probe",
+		status: http.StatusNotFound, errorType: "not_found", refusal: probePattern}
+}
+
+// check sends each request of cases and checks its answer, that the handler
+// ran on a 200 only, and the refusal the guard reported. Every 404 of the
+// guard is the same bytes.
+func (w *guardWorld) check(t *testing.T, cases []guardCase) {
+	t.Helper()
+	var notFound [][]byte
+	for _, c := range cases {
+		tok := w.tok[c.token]
+		what := c.token + ": " + c.method + " " + c.path
+		reported, calls := len(w.refusals.all()), w.calls.Load()
+		a := w.do(c.method, c.path, tok.value)
 		e := decode(t, a)
-		switch {
-		case a.status != http.StatusOK:
-			t.Errorf("%s %s = %d %s, want 200", r.method, r.path, a.status, a.body)
-		case e.Binding == nil || *e.Binding != binding{BoundWorkspace: "w1"}:
-			t.Errorf("%s %s: the handler found %+v, want the binding to w1", r.method, r.path, e.Binding)
-		case !slices.Equal(e.Covered, []string{"f1", "w1"}):
-			t.Errorf("%s %s: covered set %v, want [f1 w1]", r.method, r.path, e.Covered)
+		if a.status != c.status || e.Error.ErrorType != c.errorType {
+			t.Errorf("%s = %d %s, want %d %s", what, a.status, a.body, c.status, c.errorType)
+			continue
+		}
+		if ran := w.calls.Load() - calls; ran != map[bool]int64{true: 1}[c.status == http.StatusOK] {
+			t.Errorf("%s ran the handler %d times", what, ran)
+		}
+		if c.status == http.StatusOK && !reflect.DeepEqual(e.Binding, c.found) {
+			t.Errorf("%s: the handler found %+v, want %+v", what, e.Binding, c.found)
+		}
+		if c.covered != nil && !slices.Equal(e.Covered, c.covered) {
+			t.Errorf("%s: covered set %v, want %v", what, e.Covered, c.covered)
+		}
+		if c.status == http.StatusMethodNotAllowed && a.allow == "" {
+			t.Errorf("%s: 405 without an Allow header", what)
+		}
+		if c.same != "" {
+			if b := w.do(c.method, c.path, w.tok[c.same].value); b.status != a.status || !bytes.Equal(b.body, a.body) {
+				t.Errorf("%s = %d %s, but for %s %d %s", what, a.status, a.body, c.same, b.status, b.body)
+			}
+		}
+		got := w.refusals.all()[reported:]
+		if c.refusal == "" {
+			if len(got) != 0 {
+				t.Errorf("%s: refusals %+v, want none", what, got)
+			}
+			continue
+		}
+		var requested *string
+		if rest, ok := strings.CutPrefix(c.path, "/workspaces/"); ok {
+			requested = new(strings.Split(rest, "/")[0])
+		}
+		want := access.Refusal{TokenID: tok.id, UserID: tok.user, BoundWorkspace: tok.bound, RequestedWorkspace: requested,
+			Method: c.method, Route: "/api/v1" + c.refusal, Status: c.status, Surface: access.SurfaceAPI}
+		if len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+			t.Errorf("%s: refusals %+v, want one %+v", what, got, want)
+		}
+		if c.status == http.StatusNotFound {
+			notFound = append(notFound, a.body)
 		}
 	}
-	if got := h.refusals.all(); len(got) != 0 {
-		t.Errorf("refusals = %+v, want none", got)
+	for _, b := range notFound {
+		if !bytes.Equal(b, notFound[0]) {
+			t.Errorf("a 404 of the guard is %s, another %s, want the same bytes", b, notFound[0])
+		}
 	}
 }
 
-func TestGuard_RefusesEveryOtherRouteThatNamesNoWorkspaceBeforeTheScopeCheck(t *testing.T) {
-	h := newGuardHub(t)
-	h.identityRoutes()
-	h.probe(http.MethodPost, "/workspaces", "", "workspaces:write")
-	h.probe(http.MethodGet, "/sandboxes", "", "sandboxes:read")
-	alice, org := h.user("alice")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady))
+func TestGuard_PassesWhatTheBindingCoversWithTheBindingForTheHandler(t *testing.T) {
+	w := newGuardWorld(t)
+	pass := func(token, slug string, found *binding) guardCase {
+		return guardCase{token: token, method: http.MethodGet, path: "/workspaces/" + slug + "/probe", status: http.StatusOK, found: found}
+	}
+	w.check(t, []guardCase{
+		pass("w1", "w1", on("w1", access.RelationBound)),
+		pass("w2", "w2", on("w2", access.RelationBound)),
+		pass("w1", "f1", on("w1", access.RelationCreatedFork)),
+		pass("f1", "f1", on("f1", access.RelationBound)),
+		pass("unbound", "w1", nil),
+		pass("unbound", "w2", nil),
+		pass("unbound", "f1", nil),
+		{token: "w1", method: http.MethodGet, path: "/workspaces/w1/changes", status: http.StatusOK, found: on("w1", access.RelationBound)},
+		outside("w1", "f5"),
+	})
+	// A fork the token creates after an earlier answer is covered at once.
+	seed(t, w.st, createdBy(fork("f5", w.alice, w.org, "w1"), w.tok["w1"].id))
+	w.check(t, []guardCase{pass("w1", "f5", on("w1", access.RelationCreatedFork))})
+}
 
-	for _, perms := range [][]string{identity.RegisteredScopes(), {"git:read"}} {
-		tok, id := h.pat(alice, "w1", perms...)
-		routes := []struct{ method, pattern, path string }{
+func TestGuard_AnswersEveryWorkspaceOutsideTheBindingNotFoundBeforeScopeAndAccess(t *testing.T) {
+	w := newGuardWorld(t)
+	cases := []guardCase{
+		outside("w1", "f2"), // created by another token of the same user
+		outside("w1", "f3"), // created with no token
+		outside("w1", "f4"), // created by another user's token
+		outside("f1", "f9"), // a sibling of the bound fork
+		outside("w1", "g1"), // created by the token, but a fork of another workspace
+		outside("f1", "w5"), // a fork token on another workspace
+	}
+	for _, slug := range []string{"w5", "w6", "nosuch", "f9"} {
+		cases = append(cases, outside("w1", slug), outside("w1 no scope", slug))
+	}
+	w.check(t, cases)
+}
+
+func TestGuard_LeavesScopeAndAccessToDecideAsForAnUnboundToken(t *testing.T) {
+	w := newGuardWorld(t)
+	w.check(t, []guardCase{
+		// A user no longer in the workspace's org.
+		{token: "carol w7", method: http.MethodGet, path: "/workspaces/w7/probe", status: http.StatusNotFound, errorType: "not_found", same: "carol"},
+		// A token without the route's scope.
+		{token: "w1 no scope", method: http.MethodGet, path: "/workspaces/w1/probe", status: http.StatusForbidden, errorType: "insufficient_scope", same: "unbound no scope"},
+		// A member on a route that needs write.
+		{token: "dave w7", method: http.MethodGet, path: "/workspaces/w7/probe-write", status: http.StatusForbidden, errorType: "forbidden", same: "dave"},
+		// A bound slug with no workspace.
+		{token: "gone", method: http.MethodGet, path: "/workspaces/gone/probe", status: http.StatusNotFound, errorType: "not_found", same: "unbound"},
+	})
+}
+
+func TestGuard_LetsAForkTokenOntoTheContributorRoutesOfTheParentOnly(t *testing.T) {
+	w := newGuardWorld(t)
+	cases := []guardCase{{token: "f1", method: http.MethodGet, path: "/workspaces/w1/probe", status: http.StatusForbidden,
+		errorType: "token_bound", refusal: probePattern}}
+	for _, r := range contributorRoutes {
+		cases = append(cases, guardCase{token: "f1", method: r.method, path: "/workspaces/w1" + r.path,
+			status: http.StatusOK, found: on("f1", access.RelationParentOfBoundFork)})
+	}
+	for _, r := range parentOnlyRoutes {
+		cases = append(cases, guardCase{token: "f1", method: r.method, path: "/workspaces/w1" + r.path,
+			status: http.StatusForbidden, errorType: "token_bound", refusal: "/workspaces/:slug" + r.pattern})
+	}
+	w.check(t, cases)
+}
+
+func TestGuard_PassesTheAllowlistAndRefusesEveryOtherRouteThatNamesNoWorkspaceBeforeTheScopeCheck(t *testing.T) {
+	w := newGuardWorld(t)
+	var cases []guardCase
+	for _, r := range allowlist {
+		cases = append(cases, guardCase{token: "w1", method: r.method, path: r.path, status: http.StatusOK,
+			found: on("w1", ""), covered: []string{"f1", "w1"}})
+	}
+	for _, token := range []string{"w1 every scope", "w1"} {
+		id := w.tok[token].id
+		for _, r := range []route{
 			{http.MethodGet, "/user", "/user"},
 			{http.MethodPatch, "/user", "/user"},
 			{http.MethodGet, "/user/orgs", "/user/orgs"},
@@ -370,161 +338,94 @@ func TestGuard_RefusesEveryOtherRouteThatNamesNoWorkspaceBeforeTheScopeCheck(t *
 			{http.MethodGet, "/users", "/users"},
 			{http.MethodPost, "/workspaces", "/workspaces"},
 			{http.MethodGet, "/sandboxes", "/sandboxes"},
-		}
-		before := len(h.refusals.all())
-		for _, r := range routes {
-			a := h.do(r.method, r.path, tok)
-			if e := decode(t, a); a.status != http.StatusForbidden || e.Error.ErrorType != "token_bound" {
-				t.Errorf("%d-scope token: %s %s = %d %s, want 403 token_bound", len(perms), r.method, r.path, a.status, a.body)
-			}
-		}
-		got := h.refusals.all()[before:]
-		if len(got) != len(routes) {
-			t.Fatalf("%d-scope token: %d refusals reported, want one per request, %d", len(perms), len(got), len(routes))
-		}
-		for i, f := range got {
-			r := routes[i]
-			if f.Status != http.StatusForbidden || f.Method != r.method || f.Route != "/api/v1"+r.pattern ||
-				f.RequestedWorkspace != nil || f.BoundWorkspace != "w1" || f.TokenID != id || f.Surface != "api" {
-				t.Errorf("%d-scope token: refusal %d = %+v, want the 403 of %s %s", len(perms), i, f, r.method, r.pattern)
-			}
-		}
-		pat, err := identity.PATByID(context.Background(), h.st.Main(), id)
-		if err != nil || pat.RevokedAt != nil {
-			t.Errorf("%d-scope token: the token after the requests = %+v, %v, want it live", len(perms), pat, err)
+		} {
+			cases = append(cases, guardCase{token: token, method: r.method, path: r.path, status: http.StatusForbidden,
+				errorType: "token_bound", refusal: r.pattern})
 		}
 	}
-	if n := h.calls.Load(); n != 0 {
-		t.Errorf("the probes ran %d times, want 0", n)
-	}
-}
-
-func TestGuard_LeavesEveryOtherCredentialAsWithoutTheGuard(t *testing.T) {
-	h := newGuardHub(t)
-	h.identityRoutes()
-	h.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
-	without := h.unguarded()
-	without.identityRoutes()
-	without.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
-	alice, org := h.user("alice")
-	bob, bobOrg := h.user("bob")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w5", bob, bobOrg, access.StatusReady))
-	unbound, _ := h.pat(alice, "", "git:read")
-
-	paths := []string{"/workspaces/w1/probe", "/workspaces/w5/probe", "/workspaces/nosuch/probe", "/user"}
-	for _, tc := range []struct {
-		name, credential string
-		paths            []string
-	}{
-		{"an API key", h.key(alice), paths},
-		{"the admin token", h.admin(), paths[:3]},
-		{"an unbound PAT", unbound, paths},
-	} {
-		for _, path := range tc.paths {
-			with, wo := h.do(http.MethodGet, path, tc.credential), without.do(http.MethodGet, path, tc.credential)
-			if with.status != wo.status || !bytes.Equal(with.body, wo.body) {
-				t.Errorf("%s on %s = %d %s with the guard, %d %s without", tc.name, path, with.status, with.body, wo.status, wo.body)
-			}
-			if with.status == http.StatusOK && decode(t, with).Binding != nil {
-				t.Errorf("%s on %s: the handler found a binding, %s", tc.name, path, with.body)
-			}
+	w.check(t, cases)
+	for _, token := range []string{"w1 every scope", "w1"} {
+		if pat, err := identity.PATByID(context.Background(), w.st.Main(), w.tok[token].id); err != nil || pat.RevokedAt != nil {
+			t.Errorf("%s after the requests = %+v, %v, want it live", token, pat, err)
 		}
-	}
-	if got := h.refusals.all(); len(got) != 0 {
-		t.Errorf("refusals = %+v, want none", got)
 	}
 }
 
 func TestGuard_DoesNotRunOnARequestAnEarlierCheckAnswers(t *testing.T) {
-	h := newGuardHub(t)
-	h.identityRoutes()
-	h.probe(http.MethodGet, probePattern, access.NeedRead, "git:read")
-	alice, org := h.user("alice")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w5", alice, org, access.StatusReady))
-	valid, _ := h.pat(alice, "w1", "git:read")
-	revoked, revokedID := h.pat(alice, "w1", "git:read")
-	if err := h.st.Tx(context.Background(), func(tx *sql.Tx) error {
-		return identity.RevokeTokenByID(context.Background(), tx, revokedID, time.Now())
-	}); err != nil {
-		t.Fatal(err)
-	}
-	past := time.Now().Add(-time.Hour)
-	expired, _ := h.storePAT(identity.PATSpec{UserID: alice, Permissions: []string{"users:read"}, Workspace: "w1", ExpiresAt: &past})
-	wrong := valid[:len(valid)-1] + map[bool]string{true: "b", false: "a"}[strings.HasSuffix(valid, "a")]
+	w := newGuardWorld(t)
+	w.check(t, []guardCase{
+		{token: "w1", method: http.MethodGet, path: "/nosuch", status: http.StatusNotFound, errorType: "not_found"},
+		{token: "w1", method: http.MethodDelete, path: "/workspaces/w5/probe", status: http.StatusMethodNotAllowed, errorType: "method_not_allowed"},
+		{token: "wrong secret", method: http.MethodGet, path: "/workspaces/w5/probe", status: http.StatusUnauthorized, errorType: "unauthenticated"},
+		{token: "revoked", method: http.MethodGet, path: "/workspaces/w5/probe", status: http.StatusUnauthorized, errorType: "unauthenticated"},
+		{token: "expired", method: http.MethodGet, path: "/user", status: http.StatusUnauthorized, errorType: "unauthenticated"},
+	})
+}
 
-	for _, tc := range []struct {
-		name, method, path, credential, errorType string
-		status                                    int
+func TestGuard_LeavesEveryOtherCredentialAsWithoutTheGuard(t *testing.T) {
+	w := newGuardWorld(t)
+	without := &guardWorld{guardHub: w.unguarded()}
+	without.routes()
+	paths := []string{"/workspaces/w1/probe", "/workspaces/w6/probe", "/workspaces/nosuch/probe", "/user"}
+	for _, c := range []struct {
+		name, credential string
+		paths            []string
 	}{
-		{"an unknown path", http.MethodGet, "/nosuch", valid, "not_found", http.StatusNotFound},
-		{"a method the path does not allow", http.MethodDelete, "/workspaces/w5/probe", valid, "method_not_allowed", http.StatusMethodNotAllowed},
-		{"a wrong secret", http.MethodGet, "/workspaces/w5/probe", wrong, "unauthenticated", http.StatusUnauthorized},
-		{"a revoked token", http.MethodGet, "/workspaces/w5/probe", revoked, "unauthenticated", http.StatusUnauthorized},
-		{"an expired token", http.MethodGet, "/user", expired, "unauthenticated", http.StatusUnauthorized},
+		{"an API key", w.key(w.alice), paths},
+		{"the admin token", w.admin(), paths[:3]},
+		{"an unbound PAT", w.tok["unbound"].value, paths},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := h.do(tc.method, tc.path, tc.credential)
-			if e := decode(t, a); a.status != tc.status || e.Error.ErrorType != tc.errorType {
-				t.Errorf("%s %s = %d %s, want %d %s", tc.method, tc.path, a.status, a.body, tc.status, tc.errorType)
+		for _, path := range c.paths {
+			with, wo := w.do(http.MethodGet, path, c.credential), without.do(http.MethodGet, path, c.credential)
+			if with.status != wo.status || !bytes.Equal(with.body, wo.body) {
+				t.Errorf("%s on %s = %d %s with the guard, %d %s without", c.name, path, with.status, with.body, wo.status, wo.body)
 			}
-			if tc.status == http.StatusMethodNotAllowed && a.allow == "" {
-				t.Errorf("405 without an Allow header")
+			if with.status == http.StatusOK && decode(t, with).Binding != nil {
+				t.Errorf("%s on %s: the handler found a binding, %s", c.name, path, with.body)
 			}
-		})
+		}
 	}
-	if got := h.refusals.all(); len(got) != 0 {
+	if got := w.refusals.all(); len(got) != 0 {
 		t.Errorf("refusals = %+v, want none", got)
 	}
 }
 
 func TestGuardGit_PassesWhatTheBindingCoversAndAnswersEverythingElseNotFound(t *testing.T) {
-	h := newGuardHub(t)
-	alice, org := h.user("alice")
-	seed(t, h.st, repo("w1", alice, org, access.StatusReady), repo("w5", alice, org, access.StatusReady))
-	_, idA := h.pat(alice, "w1", "git:read")
-	seed(t, h.st, createdBy(fork("f1", alice, org, "w1"), idA))
-	_, idF := h.pat(alice, "f1", "git:read")
+	w := newGuardWorld(t)
+	alice, idA, idF := w.alice, w.tok["w1"].id, w.tok["f1"].id
 	unbound := server.Caller{CredentialID: "t_unbound", UserID: alice, Detail: &identity.Principal{
 		Type: identity.TypePAT, CredentialID: "t_unbound", User: &identity.User{ID: alice}}}
 	const pattern = "/git/:org/:slug.git/git-upload-pack"
 
-	for _, tc := range []struct {
+	for _, c := range []struct {
 		name   string
 		caller server.Caller
 		slug   string
-		want   *access.Binding // nil with pass for an unbound credential
 		pass   bool
+		want   *access.Binding
 	}{
-		{"the bound workspace", boundPAT(alice, idA, "w1"), "w1", &access.Binding{TokenID: idA, Workspace: "w1", Relation: access.RelationBound}, true},
-		{"a fork the token created", boundPAT(alice, idA, "w1"), "f1", &access.Binding{TokenID: idA, Workspace: "w1", Relation: access.RelationCreatedFork}, true},
-		{"another workspace", boundPAT(alice, idA, "w1"), "w5", nil, false},
-		{"a slug with no workspace", boundPAT(alice, idA, "w1"), "nosuch", nil, false},
-		{"the parent of the bound fork", boundPAT(alice, idF, "f1"), "w1", nil, false},
-		{"an API key", server.Caller{CredentialID: "k1", UserID: alice}, "w5", nil, true},
-		{"the admin token", server.Caller{CredentialID: "admin", Admin: true}, "w5", nil, true},
-		{"an unbound PAT", unbound, "w5", nil, true},
+		{"the bound workspace", boundPAT(alice, idA, "w1"), "w1", true, &access.Binding{TokenID: idA, Workspace: "w1", Relation: access.RelationBound}},
+		{"a fork the token created", boundPAT(alice, idA, "w1"), "f1", true, &access.Binding{TokenID: idA, Workspace: "w1", Relation: access.RelationCreatedFork}},
+		{"another workspace", boundPAT(alice, idA, "w1"), "w5", false, nil},
+		{"a slug with no workspace", boundPAT(alice, idA, "w1"), "nosuch", false, nil},
+		{"the parent of the bound fork", boundPAT(alice, idF, "f1"), "w1", false, nil},
+		{"an API key", server.Caller{CredentialID: "k1", UserID: alice}, "w5", true, nil},
+		{"the admin token", server.Caller{CredentialID: "admin", Admin: true}, "w5", true, nil},
+		{"an unbound PAT", unbound, "w5", true, nil},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			before := len(h.refusals.all())
-			d, err := h.svc.GuardGit(context.Background(), tc.caller, tc.slug, http.MethodPost, pattern)
-			if err != nil {
-				t.Fatalf("GuardGit: %v", err)
-			}
-			got := h.refusals.all()[before:]
-			if tc.pass {
-				if !d.Pass || !reflect.DeepEqual(d.Binding, tc.want) || len(got) != 0 {
-					t.Errorf("GuardGit = %+v (binding %+v), refusals %+v; want pass with %+v and no refusal", d, d.Binding, got, tc.want)
-				}
-				return
-			}
-			if d.Pass || d.Status != http.StatusNotFound || d.Binding != nil {
-				t.Errorf("GuardGit = %+v, want a refusal with 404", d)
-			}
-			if len(got) != 1 || got[0].Surface != "git" || got[0].Status != http.StatusNotFound ||
-				got[0].RequestedWorkspace == nil || *got[0].RequestedWorkspace != tc.slug ||
-				got[0].Method != http.MethodPost || got[0].Route != pattern || got[0].UserID != alice {
-				t.Errorf("refusals = %+v, want one git 404 of POST %s on %s", got, pattern, tc.slug)
-			}
-		})
+		reported := len(w.refusals.all())
+		d, err := w.svc.GuardGit(context.Background(), c.caller, c.slug, http.MethodPost, pattern)
+		got := w.refusals.all()[reported:]
+		want := access.GitDecision{Pass: c.pass, Binding: c.want}
+		var refusals []access.Refusal
+		if !c.pass {
+			want.Status = http.StatusNotFound
+			ac := access.CallerFrom(c.caller)
+			refusals = []access.Refusal{{TokenID: ac.TokenID, UserID: alice, BoundWorkspace: ac.Workspace, RequestedWorkspace: &c.slug,
+				Method: http.MethodPost, Route: pattern, Status: http.StatusNotFound, Surface: access.SurfaceGit}}
+		}
+		if err != nil || !reflect.DeepEqual(d, want) || len(got) != len(refusals) || len(got) > 0 && !reflect.DeepEqual(got, refusals) {
+			t.Errorf("%s: GuardGit = %+v, %v, refusals %+v; want %+v, refusals %+v", c.name, d, err, got, want, refusals)
+		}
 	}
 }
