@@ -1924,7 +1924,13 @@ workspace access check has attached its decision. It attaches the scope
 with `server.Attach` ([ADR 04](adr/04-let-a-check-attach-a-value-for-the-handler.md)),
 and the handlers read it. The list handler pages
 `(*secret.Component).ListPage` with `server.ReadPage` and `server.WritePage`,
-the lowered key as the position, and reads no value.
+the lowered key as the position, and reads no value. The create handler
+checks the body (`internal/secret/validate.go`), answers
+`secret.UnavailableError` without a current key, and then, in one
+`store.Tx`, calls `(*secret.Component).CreateEntries` and writes one
+`parley.secret.create` event per entry through the component's
+`secret.Emitter` (`*event.Component`), so the entries and their events
+commit together or not at all.
 
 ### The logger
 

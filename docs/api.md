@@ -1956,6 +1956,61 @@ a value cannot be decrypted with the configured keys.
 | `403` `forbidden` | the admin token on `/user/secrets` (`user-scoped endpoints require a user credential`); a member of the workspace's org on `/workspaces/{slug}/secrets` (`org members have read-only access to this workspace`) |
 | `404` `not_found` | an org the caller may not reach or that does not exist (`org not found`); a workspace the caller has no level on or that does not exist (`workspace not found`) |
 
+## `POST /api/v1/user/secrets`, `POST /api/v1/orgs/{slug}/secrets`, `POST /api/v1/workspaces/{slug}/secrets`
+
+Creates secrets in the scope, all of them or none, and declares the scope
+`secrets:write` for a PAT. Who may call each route is in
+[Secrets](#secrets). It is a create route (see [Idempotency](#idempotency)).
+
+The body is a JSON object with `entries`, an array of at least one object
+with `key` and `value`; other members are ignored:
+
+| Member | Required | Value |
+|---|---|---|
+| `key` | yes | a string of 1 to 255 characters, each an ASCII letter, a digit or `_`, not beginning with a digit; stored as given |
+| `value` | no | a string of at most 262144 bytes; absent, the empty string. `null` or another type is refused |
+
+```json
+{"entries":[{"key":"GIT_PAT","value":"ghp_…"},{"key":"GIT_USERNAME","value":"octocat"}]}
+```
+
+The body is checked in this order, and the first fault is answered:
+`entries` is a non-empty array; entry by entry, its key and then its value;
+then no two keys are equal ignoring the case of `A` to `Z`. With a valid
+body, a hub without a current encryption key answers `503`. Then, in one
+transaction: when the scope's secrets and the entries together would be more
+than 100, `429`, also when a key already exists; otherwise, when the scope
+already holds a key equal to one of the entries ignoring case, `409` naming
+the first such key in request order, as the request spells it. Otherwise
+every entry is stored, with one creation time, and one event
+`parley.secret.create` is written per entry in the same transaction:
+`resource_type` `secret`, `resource_id` the key, `metadata` exactly
+`{"scope","scope_id","key"}` (`scope_id` the user id, the org id or the
+workspace slug), `workspace` the slug on the workspace route and `null`
+otherwise, and the caller as the actor. If the events cannot be written,
+nothing is stored and the answer is `500`.
+
+The answer holds the entries in request order, as the items of a list:
+exactly `key`, `created_at` and `updated_at`, which are equal, the same for
+every item, RFC 3339 in UTC with whole seconds; never a value.
+
+```json
+{"items":[{"key":"GIT_PAT","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"},{"key":"GIT_USERNAME","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}]}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | every entry was stored; the body is `items` as above |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is stored |
+| `400` `invalid_request` | the body is refused; nothing is stored. The messages: `entries must be a non-empty array of {key, value} objects`, `entries[0] must be an object`, `entries[0] must have a key that is a string`, `key "" must have 1 to 255 characters`, `key "1A" must not begin with a digit`, `key "A-B" may hold only ASCII letters, digits and _`, `the value of key "K" must be a string`, `the value of key "K" is longer than 262144 bytes`, `key "TOKEN" is given more than once, ignoring case` |
+| `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
+| `403` `forbidden` | as for the list (see above) |
+| `404` `not_found` | as for the list (see above) |
+| `409` `conflict` | the scope holds one of the keys, ignoring case (`key "TOKEN" already exists`); nothing is stored |
+| `413` `payload_too_large` | the body is over the hub's body limit (see [Request bodies](#request-bodies)) |
+| `429` `secret_limit_reached` | the scope would hold more than 100 secrets (`maximum of 100 entries per scope exceeded`); nothing is stored |
+| `503` `secrets_unavailable` | the hub has no current encryption key (`secrets cannot be stored: no encryption key configured`); nothing is stored |
+
 ## `GET /api/v1/events`
 
 Streams the hub events the caller may see as Server-Sent Events: first the

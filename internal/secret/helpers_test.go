@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/secret"
@@ -43,21 +45,33 @@ func logLines(t *testing.T, log, msg string) []map[string]any {
 
 // route is one secret route as the route tests call it: its scope, its
 // method, its path below /api/v1 with %s where the org or workspace goes
-// (a user path has none), and a body the route accepts.
+// (a user path has none), a body the route accepts, the PAT scope it needs
+// and the status it answers a caller it serves.
 type route struct {
 	scope  secret.Scope
 	method string
 	path   string
 	body   any
+	need   string
+	ok     int
 }
+
+// created is a create body the create routes accept once per scope.
+var created = entries(map[string]any{"key": "ROUTE_KEY", "value": "v"})
 
 // routes are every secret route. The access tests iterate them, so a route
 // added here is held to the access rules of its scope.
 var routes = []route{
-	{secret.ScopeUser, http.MethodGet, "/user/secrets", nil},
-	{secret.ScopeOrg, http.MethodGet, "/orgs/%s/secrets", nil},
-	{secret.ScopeWorkspace, http.MethodGet, "/workspaces/%s/secrets", nil},
+	{secret.ScopeUser, http.MethodGet, "/user/secrets", nil, "secrets:read", http.StatusOK},
+	{secret.ScopeOrg, http.MethodGet, "/orgs/%s/secrets", nil, "secrets:read", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodGet, "/workspaces/%s/secrets", nil, "secrets:read", http.StatusOK},
+	{secret.ScopeUser, http.MethodPost, "/user/secrets", created, "secrets:write", http.StatusCreated},
+	{secret.ScopeOrg, http.MethodPost, "/orgs/%s/secrets", created, "secrets:write", http.StatusCreated},
+	{secret.ScopeWorkspace, http.MethodPost, "/workspaces/%s/secrets", created, "secrets:write", http.StatusCreated},
 }
+
+// entries is a create body of the entries given.
+func entries(e ...any) map[string]any { return map[string]any{"entries": e} }
 
 // routesOf are the routes of scope.
 func routesOf(scope secret.Scope) []route {
@@ -80,15 +94,20 @@ func (r route) at(name string) string {
 
 func (r route) String() string { return r.method + " " + r.path }
 
-// world is a hub with a current secret key and the callers the route tests
+// world is a hub with a current secret key, a clock that stands still at
+// now, and the callers the route tests
 // ask with. The org acme has the members owner, member and member2;
 // outsider belongs to no org but their own. The workspace acme is owner's,
 // in the org acme, and acme-fork is a task fork of it that member created.
 // The org frozen, of which member is a member, is blocked.
 type world struct {
 	*hubtest.Hub
-	// secrets is the hub's secret component, taken again at each restart.
+	// secrets and events are the hub's secret and event components, taken
+	// again at each restart.
 	secrets *secret.Component
+	events  *event.Component
+	// now is the hub's time.
+	now time.Time
 	// ownerID, memberID, member2ID and outsiderID are the users' ids, and
 	// the matching keys their API keys.
 	ownerID, memberID, member2ID, outsiderID     string
@@ -102,10 +121,13 @@ type world struct {
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	_, key := newKey(t)
-	w := &world{}
+	// Halfway through a second, so that a stored time is seen cut to whole
+	// seconds.
+	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(-time.Second / 2)}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
 		Env:     map[string]string{secret.EnvCurrentKey: key},
-		Compose: func(c *hub.Composition) { w.secrets = c.Secrets() },
+		Now:     func() time.Time { return w.now },
+		Compose: func(c *hub.Composition) { w.secrets, w.events = c.Secrets(), c.Events() },
 	})
 	w.ownerID, w.memberID = w.CreateUser(t, "owner"), w.CreateUser(t, "member")
 	w.member2ID, w.outsiderID = w.CreateUser(t, "member2"), w.CreateUser(t, "outsider")
@@ -169,6 +191,17 @@ func (w *world) count(t *testing.T, scope secret.Scope, id string) int {
 	return n
 }
 
+// eventsAfter returns the events of the log after seq and the log's last
+// seq, from which a later call reads what a request wrote.
+func (w *world) eventsAfter(t *testing.T, seq int64) ([]event.Record, int64) {
+	t.Helper()
+	recs, last, err := w.events.ReadAfter(context.Background(), seq, 0)
+	if err != nil {
+		t.Fatalf("read the events after %d: %v", seq, err)
+	}
+	return recs, last
+}
+
 // valueOf is the value seed stores under key: text no answer may hold.
 func valueOf(key string) string { return "sv-" + key + "-6f1d0c9a" }
 
@@ -194,11 +227,14 @@ type page struct {
 }
 
 // pageOf decodes the list answer a, which must be 200.
-func pageOf(t *testing.T, a answer) page {
+func pageOf(t *testing.T, a answer) page { t.Helper(); return itemsOf(t, a, http.StatusOK) }
+
+// itemsOf decodes the answer a, which must have the status want, as a page.
+func itemsOf(t *testing.T, a answer, want int) page {
 	t.Helper()
 	var p page
-	if a.status != http.StatusOK {
-		t.Fatalf("list = %d %s, want 200", a.status, a.body)
+	if a.status != want {
+		t.Fatalf("answer = %d %s, want %d", a.status, a.body, want)
 	}
 	if err := json.Unmarshal(a.body, &p); err != nil {
 		t.Fatalf("decode the page %s: %v", a.body, err)
@@ -219,3 +255,8 @@ func (p page) keys(t *testing.T) []string {
 	}
 	return out
 }
+
+func ptr(s string) *string { return &s }
+
+// equalPtr reports whether a and b are both nil or point to equal strings.
+func equalPtr(a, b *string) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
