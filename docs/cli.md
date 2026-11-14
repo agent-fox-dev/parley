@@ -391,6 +391,7 @@ Available Commands:
   tokens      Create, read, change and revoke your personal access tokens
   user        Read and update your own profile
   version     Print the client's build and, given a hub URL, the hub's build
+  workspace   Register repositories as workspaces of the hub
 
 Flags:
       --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
@@ -1488,6 +1489,115 @@ or `delete` (`parley secrets list takes at most one of --user, --org and
 --workspace`); and `--org` or `--workspace` with an empty value
 (`parley secrets list needs a slug as the value of --org`). A message names
 an entry by its position, never by its text, which may hold a value.
+
+### `parley workspace`
+
+`parley workspace` run without a command prints its help and exits `0`; it
+reads no credential and sends no request.
+
+#### `parley workspace create`
+
+```
+parley workspace create --slug <slug> --git-url <url> [flags]
+```
+
+Registers a git repository as a workspace: it sends one
+[`POST /api/v1/workspaces`](api.md#post-apiv1workspaces) with the
+credential as `Authorization: Bearer` and prints the hub's answer, the
+workspace in `status` `pending`, on stdout. The hub clones the repository
+in the background; `--wait` waits for that clone to end (see below).
+
+| Flag | Body member | Value |
+|---|---|---|
+| `--slug <slug>` | `slug` | required: the workspace's slug |
+| `--git-url <url>` | `git_url` | required: `https://<host>/<path>` or `git@<host>:<path>` |
+| `--default-branch <name>` | `default_branch` | the branch the workspace treats as its default (default: origin's) |
+| `--org <id or slug>` | `org_id` | the organization the workspace is recorded in (default: your personal organization) |
+| `--display-name <text>` | `display_name` | the workspace's display name (default: the slug) |
+| `--description <text>` | `description` | the workspace's description |
+| `--workspace-mode <mode>` | `workspace_mode` | `standard` or `carry_patch` (default: `standard`) |
+| `--upstream-url <url>` | `upstream_url` | with `carry_patch`, the upstream project the workspace tracks |
+| `--integration-branch <name>` | `integration_branch` | with `carry_patch`, the branch the hub rebuilds as upstream plus the patches |
+| `--git-pat <token>` | `git_pat` | a token origin accepts, stored as the workspace secret `GIT_PAT` |
+| `--git-username <name>` | `git_username` | with `--git-password`, the user name origin accepts, stored as `GIT_USERNAME` |
+| `--git-password <password>` | `git_password` | with `--git-username`, the password origin accepts, stored as `GIT_PASSWORD` |
+| `--setting <key=value>` | `settings` | repeatable: one workspace setting each (see below) |
+| `--wait`, `--timeout`, `--poll-interval` | | see [Waiting](#waiting) |
+
+The body holds a member for each flag given and none for a flag not given,
+so the hub applies its own default to what is left out. A flag given with
+an empty value is sent with the empty string, which the hub judges
+(`--description ""` sends `"description":""`):
+
+```
+parley workspace create --slug demo --git-url https://example.com/a.git
+```
+
+sends
+
+```json
+{"slug":"demo","git_url":"https://example.com/a.git"}
+```
+
+**Settings.** Each `--setting` is split at its first `=` into a key and a
+value, and sets `settings[key]` to: `null` when the value is empty, which
+keeps the setting's default; for the key `protected_branches`, the list of
+the value's comma-separated parts; otherwise `true` or `false` as a boolean
+when the value is one of them; otherwise the value as a string. When a key
+is given more than once, the last one wins. Which keys exist, and which
+values each takes, is the hub's to judge. `--setting a=true --setting
+protected_branches=main,release/* --setting u=https://x/y?a=b --setting
+b=1 --setting c=` sends
+
+```json
+{"settings":{"a":true,"protected_branches":["main","release/*"],"u":"https://x/y?a=b","b":"1","c":null}}
+```
+
+`protected_branches=true` sends `["true"]`, and `protected_branches=` sends
+`null`. Without `--setting` the body has no `settings` member.
+
+**Client checks.** These command lines are refused with a `usage_error`
+and exit status `2` before any setting is read or any request sent:
+
+- `--slug` or `--git-url` not given (`parley workspace create needs the
+  flag --slug`);
+- `--git-pat`, `--git-username` or `--git-password` given with an empty
+  value (`parley workspace create needs a value for --git-pat`);
+- `--git-pat` with `--git-username` or `--git-password`
+  (`parley workspace create takes --git-pat or --git-username with
+  --git-password, not both`);
+- `--git-username` without `--git-password` (`parley workspace create
+  needs --git-password with --git-username`), or the other way round
+  (`parley workspace create needs --git-username with --git-password`);
+- a `--setting` without `=` (`--setting "abc" has no =: give key=value`,
+  also for an empty `--setting ""`) or with nothing before it
+  (`--setting "=v" has no key before =`);
+- a `--timeout` or `--poll-interval` the CLI cannot read (see
+  [Waiting](#waiting)).
+
+Every other rule, a slug's form among them, is the hub's: its refusal is
+written to stderr as received (`400` `invalid_request`, `400`
+`credential_check_failed`, `409` `conflict` for a slug in use), nothing is
+written to stdout and the exit status is `1`.
+
+**`--wait`.** After the hub answers the create with `201`, the command
+polls `GET /api/v1/workspaces/<slug>`, the slug sent as one percent-encoded
+path segment, under the rules of [Waiting](#waiting), reading the
+workspace's `status`: `ready` is the successful end, `failed` the
+unsuccessful one, and `pending` and `cloning` keep the wait going. The
+progress lines read `waiting: pending`, `waiting: cloning`, `waiting:
+ready`. On `ready` the final workspace is the only document on stdout and
+the exit status is `0`; on `failed` the final workspace, with its
+`clone_error`, is printed on stdout, `wait_failed` (`the operation ended in
+the state "failed", which is not a success`) is written to stderr and the
+exit status is `1`. Running out of time is `wait_timeout` with exit status
+`1` and nothing on stdout, and a poll the hub answers with an error (a
+`404` for a workspace the caller cannot read) is written to stderr as
+received with exit status `1`.
+
+| Command | Request |
+|---|---|
+| `parley workspace create --slug <slug> --git-url <url> [flags]` | `POST /api/v1/workspaces` with a member for each flag given; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
 
 ### Output
 
