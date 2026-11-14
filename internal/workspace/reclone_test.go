@@ -1,0 +1,356 @@
+package workspace_test
+
+import (
+	"context"
+	"encoding/json"
+	"maps"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"testing"
+
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/workspace"
+)
+
+// recloneEvent is the event a reclone writes.
+const recloneEvent = "parley.workspace.reclone"
+
+// reclone sends POST /workspaces/<slug>/reclone, with no body, with cred as
+// the bearer credential.
+func (w *world) reclone(t *testing.T, cred, slug string) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/reclone", cred, nil)
+	return answer{status, b}
+}
+
+// exists tells whether something is at path.
+func exists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// recordSteps records in steps the removals of a copy and the clone
+// notifications, in the order the hub makes them, each with whether the
+// copy's directory exists at that moment; the removal still removes.
+func recordSteps(steps *teardownLog) option {
+	return func(c *hubtest.Config, w *world) {
+		withCompose(func(comp *hub.Composition) {
+			comp.AdjustWorkspace(func(d *workspace.Deps) {
+				next := d.Notify
+				d.Notify = func(slug string) {
+					steps.add("notify %s copy=%t", slug, exists(w.svc.RepoPath(slug)))
+					next(slug)
+				}
+				d.RemoveCopy = func(dir string) error {
+					steps.add("remove copy=%t", exists(dir))
+					return gitrepo.Remove(dir)
+				}
+			})
+		})(c, w)
+	}
+}
+
+// withRemoveCopy makes remove the hub's removal of a workspace's copy.
+func withRemoveCopy(remove func(dir string) error) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { d.RemoveCopy = remove })
+	})
+}
+
+// sameRefs fails the test unless the branches and tags of the repository
+// at dir are those of origin, with the same ids.
+func sameRefs(t *testing.T, dir string, origin *gitrepotest.Origin) {
+	t.Helper()
+	for _, prefix := range []string{"refs/heads/", "refs/tags/"} {
+		if got, want := gitrepotest.Refs(t, dir, prefix), gitrepotest.Refs(t, origin.Dir(), prefix); !maps.Equal(got, want) {
+			t.Errorf("the copy's %s are %v, want origin's %v", prefix, got, want)
+		}
+	}
+}
+
+func TestReclone_DiscardsTheCopyAndPutsTheWorkspaceBackToPending(t *testing.T) {
+	t.Parallel()
+	steps := &teardownLog{}
+	p := &stubBranchesPusher{}
+	s := newSyncWorld(t, withSafetyPusher(p), recordSteps(steps))
+	// taking answers for every branch offered, in the order of the names,
+	// that origin took the first n and refused the others.
+	taking := func(n int) func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+		return func(_ context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+			steps.add("push")
+			var got []gitrepo.BranchPush
+			for i, b := range slices.Sorted(maps.Keys(req.Heads)) {
+				r := gitrepo.BranchPush{Branch: b, Commit: req.Heads[b], Result: gitrepo.PushUpToDate}
+				if i >= n {
+					r.Result, r.Err = "", gitrepo.ErrNonFastForward
+				}
+				got = append(got, r)
+			}
+			return got, nil
+		}
+	}
+	done := []string{"push", "remove copy=true", "notify demo copy=false"}
+	for _, c := range []struct {
+		name  string
+		taken int
+		fault string
+		// failed reclones the workspace after its clone failed, with no
+		// copy.
+		failed bool
+		// want is the origin_push of the event; "" for a reclone that
+		// fails inside the hub.
+		want  string
+		steps []string
+	}{
+		{name: "origin takes every branch", taken: 2, want: "ok", steps: done},
+		{name: "origin takes some branches", taken: 1, want: "partial", steps: done},
+		{name: "origin takes no branch", want: "failed", steps: done},
+		{name: "the event cannot be written", taken: 2, fault: faultEvent, steps: []string{"push"}},
+		{name: "failed workspace without a copy", taken: 2, failed: true, want: "ok",
+			steps: []string{"remove copy=false", "notify demo copy=false"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusReady {
+				// The row before reclones it: its clone work brings back a
+				// ready workspace with a copy.
+				if rec = s.clone(t, syncSlug); rec.Status != workspace.StatusReady {
+					t.Fatalf("the clone left the workspace %s (%v)", rec.Status, deref(rec.CloneError))
+				}
+			}
+			status, cloneError := workspace.StatusReady, (*string)(nil)
+			if c.failed {
+				status, cloneError = workspace.StatusFailed, new("boom")
+				if err := os.RemoveAll(s.copy); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				gitrepotest.Git(t, s.copy, "update-ref", "refs/remotes/origin/extra", s.origin.Head("main"))
+			}
+			if _, err := s.Store.Main().Exec(`UPDATE workspaces SET status = ?, clone_error = ?, sync_error = 'x', origin_head_sha = head_sha
+				WHERE slug = ?`, string(status), cloneError, syncSlug); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := s.workspace(t, syncSlug)
+			var heads map[string]string
+			if !c.failed {
+				if heads = gitrepotest.Refs(t, s.copy, "refs/remotes/origin/"); len(heads) != 3 {
+					t.Fatalf("the copy holds the origin heads %v, want three", heads)
+				}
+			}
+			p.mu.Lock()
+			p.answer = taking(c.taken)
+			p.mu.Unlock()
+			s.fail(c.fault)
+			defer s.fail("")
+			events, made := len(s.eventsOf(t, recloneEvent)), len(steps.recorded())
+
+			a := s.reclone(t, s.uKey, syncSlug)
+
+			rec, _ := s.workspace(t, syncSlug)
+			if rec.Marker != workspace.MarkerNone {
+				t.Errorf("the marker is %q after the reclone, want it released", rec.Marker)
+			}
+			if got := steps.recorded()[made:]; !slices.Equal(got, c.steps) {
+				t.Errorf("the reclone's steps are %v, want %v", got, c.steps)
+			}
+			evs := s.eventsOf(t, recloneEvent)
+			if c.want == "" {
+				if a.status != http.StatusInternalServerError || a.errorType(t) != "internal" {
+					t.Errorf("answer = %d %s, want 500 internal", a.status, a.body)
+				}
+				if !reflect.DeepEqual(rec, before) || len(evs) != events {
+					t.Errorf("record %+v and %d reclone events after a failed reclone, want %+v and none", rec, len(evs)-events, before)
+				}
+				if got := gitrepotest.Refs(t, s.copy, "refs/remotes/origin/"); !maps.Equal(got, heads) {
+					t.Errorf("the copy's origin heads are %v after a failed reclone, want %v", got, heads)
+				}
+				return
+			}
+			obj := a.decode(t, http.StatusOK)
+			if obj["status"] != "pending" || obj["sync_error"] != nil || obj["origin_head_sha"] != nil {
+				t.Errorf("answer status %v sync_error %v origin_head_sha %v, want pending, null and null",
+					obj["status"], obj["sync_error"], obj["origin_head_sha"])
+			}
+			if rec.Status != workspace.StatusPending || rec.SyncError != nil || rec.OriginHeadSHA != nil {
+				t.Errorf("stored status %s sync_error %v origin_head_sha %v, want pending and null",
+					rec.Status, deref(rec.SyncError), deref(rec.OriginHeadSHA))
+			}
+			if rec.InstanceID == before.InstanceID {
+				t.Error("the record keeps its instance id after the reclone")
+			}
+			if deref(rec.HeadSHA) != deref(before.HeadSHA) || deref(rec.DefaultBranch) != deref(before.DefaultBranch) {
+				t.Errorf("head_sha %q default_branch %q after the reclone, want %q %q as before",
+					deref(rec.HeadSHA), deref(rec.DefaultBranch), deref(before.HeadSHA), deref(before.DefaultBranch))
+			}
+			if exists(s.copy) {
+				t.Error("the copy is still on disk after the reclone")
+			}
+			if len(evs) != events+1 {
+				t.Fatalf("%d reclone events written, want 1", len(evs)-events)
+			}
+			ev := evs[events]
+			var meta map[string]any
+			if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]any{"origin_push": c.want}
+			if deref(ev.Workspace) != syncSlug || ev.ActorType != event.ActorAPIKey || deref(ev.ActorID) != s.u || !reflect.DeepEqual(meta, want) {
+				t.Errorf("reclone event of workspace %q by %s %q with %v, want workspace %q by %s %q with %v",
+					deref(ev.Workspace), ev.ActorType, deref(ev.ActorID), meta, syncSlug, event.ActorAPIKey, s.u, want)
+			}
+		})
+	}
+}
+
+func TestReclone_RefusesWithoutTouchingTheWorkspace(t *testing.T) {
+	t.Parallel()
+	p := &stubBranchesPusher{answer: func(context.Context, gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+		return nil, nil
+	}}
+	w := newWorld(t, withSafetyPusher(p))
+	url := "https://origin.test/r.git"
+	for _, rec := range []workspace.Workspace{
+		{Slug: "ready-forked", Status: workspace.StatusReady},
+		{Slug: "failed-forked", Status: workspace.StatusFailed},
+		{Slug: "archived", Status: workspace.StatusArchived},
+		{Slug: "archived-forked", Status: workspace.StatusArchived},
+		{Slug: "archived-busy", Status: workspace.StatusArchived, Marker: workspace.MarkerDelete},
+		{Slug: "pending", Status: workspace.StatusPending},
+		{Slug: "cloning-forked", Status: workspace.StatusCloning},
+		{Slug: "ready-busy", Status: workspace.StatusReady, Marker: workspace.MarkerArchive},
+	} {
+		rec.GitURL = &url
+		w.put(t, rec)
+	}
+	for _, parent := range []string{"ready-forked", "failed-forked", "archived-forked", "cloning-forked"} {
+		w.put(t, workspace.Workspace{Slug: parent + "--t1", Kind: access.KindFork, ParentSlug: new(parent), Status: workspace.StatusReady})
+	}
+	for _, c := range []struct {
+		slug      string
+		status    int
+		errorType string
+	}{
+		{"ready-forked--t1", http.StatusBadRequest, "fork_has_no_origin"},
+		{"archived", http.StatusConflict, "workspace_archived"},
+		{"archived-forked", http.StatusConflict, "workspace_archived"},
+		{"archived-busy", http.StatusConflict, "workspace_busy"},
+		{"pending", http.StatusConflict, "workspace_busy"},
+		{"cloning-forked", http.StatusConflict, "workspace_busy"},
+		{"ready-busy", http.StatusConflict, "workspace_busy"},
+		{"ready-forked", http.StatusConflict, "has_forks"},
+		{"failed-forked", http.StatusConflict, "has_forks"},
+	} {
+		dir := w.svc.RepoPath(c.slug)
+		if err := os.MkdirAll(filepath.Join(dir, "objects"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := w.workspace(t, c.slug)
+		if a := w.reclone(t, w.uKey, c.slug); a.status != c.status || a.errorType(t) != c.errorType {
+			t.Errorf("reclone of %s = %d %s, want %d %s", c.slug, a.status, a.body, c.status, c.errorType)
+		}
+		if after, _ := w.workspace(t, c.slug); !reflect.DeepEqual(after, before) {
+			t.Errorf("reclone of %s changed the record from %+v to %+v", c.slug, before, after)
+		}
+		if !exists(filepath.Join(dir, "objects")) {
+			t.Errorf("reclone of %s removed its copy", c.slug)
+		}
+	}
+	if heads, _ := p.calls(); len(heads) != 0 {
+		t.Errorf("refused reclones offered branches to origin %d times, want never", len(heads))
+	}
+	if evs := w.eventsOf(t, recloneEvent); len(evs) != 0 {
+		t.Errorf("refused reclones wrote %d reclone events, want none", len(evs))
+	}
+	if got := w.notifications(); len(got) != 0 {
+		t.Errorf("refused reclones told the clone workers about %v, want nothing", got)
+	}
+}
+
+func TestReclone_TheNewCopyHoldsExactlyWhatOriginHolds(t *testing.T) {
+	t.Parallel()
+	calls := &teardownLog{}
+	removers := &stubTeardown{name: "remover", log: calls}
+	s := newSyncWorld(t, withCloneWorkers(), withTeardown(func(td *workspace.Teardown) {
+		td.RegisterRemover(removers.remove)
+		td.RegisterRemover(removers.remove)
+	}))
+	main := s.origin.Head("main")
+	accepted := grow(t, s.copy, "accepted", main, "hub")
+	grow(t, s.copy, "rejected", main, "hub")
+	gitrepotest.Git(t, s.copy, "update-ref", "refs/parley/changes/1/v1", main)
+	// Origin's update hook refuses the branch rejected and takes the others.
+	hook := filepath.Join(s.origin.Dir(), "hooks", "update")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n[ \"$1\" != refs/heads/rejected ]\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if a := s.reclone(t, s.uKey, syncSlug); a.status != http.StatusOK {
+		t.Fatalf("reclone = %d %s, want 200", a.status, a.body)
+	}
+	var rec workspace.Workspace
+	eventually(t, "the clone work of the recloned workspace ends", func() bool {
+		rec, _ = s.workspace(t, syncSlug)
+		return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
+	})
+	if rec.Status != workspace.StatusReady {
+		t.Fatalf("the recloned workspace is %s (%v), want ready", rec.Status, deref(rec.CloneError))
+	}
+	sameRefs(t, s.copy, s.origin)
+	for _, name := range []string{"refs/heads/rejected", "refs/parley/changes/1/v1"} {
+		if id := ref(t, s.copy, name); id != "" {
+			t.Errorf("%s is %s in the new copy, want it absent", name, id)
+		}
+	}
+	if got := ref(t, s.copy, "refs/heads/accepted"); got != accepted {
+		t.Errorf("refs/heads/accepted is %q in the new copy, want the hub's former commit %s, which origin took", got, accepted)
+	}
+	if deref(rec.HeadSHA) != s.origin.Head("main") || deref(rec.OriginHeadSHA) != deref(rec.HeadSHA) {
+		t.Errorf("head_sha %s origin_head_sha %s, want origin's main %s for both", deref(rec.HeadSHA), deref(rec.OriginHeadSHA), s.origin.Head("main"))
+	}
+	if evs := s.eventsOf(t, recloneEvent); len(evs) != 1 || string(evs[0].Metadata) != `{"origin_push":"partial"}` {
+		t.Errorf("reclone events %v, want one with origin_push partial", evs)
+	}
+	if got := calls.recorded(); len(got) != 0 {
+		t.Errorf("the reclone called removers of owned data: %v, want no call", got)
+	}
+}
+
+func TestReclone_ACopyLeftByAStoppedHubIsClonedFresh(t *testing.T) {
+	t.Parallel()
+	// The removal is a no-op, as for a hub that stopped once the reclone had
+	// committed and before it removed the copy.
+	s := newSyncWorld(t, withRemoveCopy(func(string) error { return nil }))
+	grow(t, s.copy, "local-only", s.origin.Head("main"), "hub")
+	s.origin.Reject("refused by policy")
+
+	if a := s.reclone(t, s.uKey, syncSlug); a.status != http.StatusOK {
+		t.Fatalf("reclone = %d %s, want 200", a.status, a.body)
+	}
+	if rec, _ := s.workspace(t, syncSlug); rec.Status != workspace.StatusPending || ref(t, s.copy, "refs/heads/local-only") == "" {
+		t.Fatalf("status %s and local-only %q after the reclone, want pending and the old copy on disk",
+			rec.Status, ref(t, s.copy, "refs/heads/local-only"))
+	}
+
+	s.startWorkers(t, 1, nil)
+
+	var rec workspace.Workspace
+	eventually(t, "the clone work started at the next start ends", func() bool {
+		rec, _ = s.workspace(t, syncSlug)
+		return rec.Status == workspace.StatusReady || rec.Status == workspace.StatusFailed
+	})
+	if rec.Status != workspace.StatusReady {
+		t.Fatalf("the workspace is %s (%v), want ready", rec.Status, deref(rec.CloneError))
+	}
+	if id := ref(t, s.copy, "refs/heads/local-only"); id != "" {
+		t.Errorf("refs/heads/local-only is %s in the copy, want it absent", id)
+	}
+	sameRefs(t, s.copy, s.origin)
+}

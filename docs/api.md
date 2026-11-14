@@ -1787,6 +1787,65 @@ answers; read it again to see the clone work reach `ready` or `failed`.
 | `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
 | `500` `internal` | the status change or its event could not be written; the workspace is still `archived` |
 
+## `POST /api/v1/workspaces/{slug}/reclone`
+
+Throws away the hub's copy of the repository workspace `{slug}` and clones
+its origin again. It takes the admin token, an API key or a PAT, declares
+the scope `workspaces:write` for a PAT and needs write access to the
+workspace (see [Workspace access](#workspace-access)): its owner or the
+admin token. The route reads no body; one that passes the content-type and
+size rules is ignored.
+
+A workspace in status `ready` or `failed` without forks is recloned; the
+checks run in the order of the table below, and a refused reclone neither
+contacts origin nor touches the copy. While the reclone runs, every other
+request that needs the workspace's repository is answered `409
+workspace_busy`. First the hub makes the same safety copy as
+[`POST /api/v1/workspaces/{slug}/archive`](#post-apiv1workspacesslugarchive):
+it offers every branch of its copy to origin as a fast-forward, except a
+carry-patch workspace's integration branch, and goes on whatever origin
+answers. Then, in one store transaction, `status` becomes `pending`,
+`sync_error` and `origin_head_sha` are cleared and one
+`parley.workspace.reclone` event is written; when that transaction fails
+nothing has changed, the copy included, and the answer is `500 internal`.
+Once it has committed, the copy is removed from disk, and with it the
+origin head of every branch, and the clone work of the workspace is
+started. The new copy holds what origin holds and nothing else: a branch
+origin did not take, and every ref under `refs/parley/`, are lost; change
+records and the other data the workspace owns stay. `head_sha`,
+`default_branch`, `last_sync_at` and `clone_error` keep their values until
+the clone work changes them. A copy that a hub stopped in the middle of a
+reclone left on disk is not taken for the workspace's copy: the clone
+work at the next start replaces it with a fresh clone.
+
+The event has `workspace` the slug, `resource_type` `workspace`,
+`resource_id` the slug, as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug), and in
+`metadata` `origin_push`, the outcome of the safety copy, with the values
+the archive event gives it (`ok`, `partial` or `failed`).
+
+```json
+{"seq":18,"id":"…","type":"parley.workspace.reclone","time":"2026-11-14T10:50:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"reclone","session_id":null,"metadata":{"origin_push":"ok"}}
+```
+
+The answer is the workspace object, read after the reclone, with `status`
+`pending`, `sync_error` `null`, `origin_head_sha` `null` and `access` the
+caller's level, the object
+[`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers; read
+it again to see the clone work reach `ready` or `failed`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the workspace is back in `pending`, its copy is gone and its clone work is started, whatever `origin_push` says; the body is the workspace object |
+| `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to reclone from`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`), or it is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`) |
+| `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
+| `409` `has_forks` | the workspace has at least one fork, which depends on its copy (`workspace "<slug>" has <n> forks, which depend on its copy; delete them first`) |
+| `500` `internal` | the status change or its event could not be written; the workspace and its copy are as they were |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

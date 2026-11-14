@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -1413,4 +1414,89 @@ func (e *beforeEmit) set(fn func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.fn = fn
+}
+
+// setMarker stores m as the maintenance marker of the workspace slug, as an
+// operation running on it holds it.
+func (w *world) setMarker(t *testing.T, slug string, m workspace.Marker) {
+	t.Helper()
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET maintenance = ? WHERE slug = ?`, string(m), slug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// withSafetyPusher makes p the hub's safety-copy pusher.
+func withSafetyPusher(p workspace.BranchesPusher) option {
+	return withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) { d.SafetyPusher = p })
+	})
+}
+
+// withTeardown has fn register collaborators on the hub's teardown set.
+func withTeardown(fn func(*workspace.Teardown)) option {
+	return withCompose(func(c *hub.Composition) { fn(c.Workspaces().Teardown()) })
+}
+
+// teardownLog records the calls of stub teardown collaborators, one line
+// each, in the order they were made.
+type teardownLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *teardownLog) add(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *teardownLog) recorded() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.lines)
+}
+
+// stubTeardown is every collaborator of the teardown set at once. It
+// records each call in log under its name and then fails with fail, when
+// set. As a session closer it first writes the slugs it was given as a row
+// of the table session_marks through the transaction, when mark is set; as
+// an archive observer it records the status w's store holds for the
+// workspace.
+type stubTeardown struct {
+	name string
+	log  *teardownLog
+	fail error
+	mark bool
+	w    *world
+}
+
+func (s *stubTeardown) CloseSessions(ctx context.Context, tx *sql.Tx, slugs []string, reason string) error {
+	slugs = slices.Sorted(slices.Values(slugs))
+	if s.mark {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO session_marks (slugs) VALUES (?)`, strings.Join(slugs, " ")); err != nil {
+			return err
+		}
+	}
+	s.log.add("%s close %v %s", s.name, slugs, reason)
+	return s.fail
+}
+
+func (s *stubTeardown) WorkspaceArchived(ctx context.Context, slug string, forks []string) error {
+	var status workspace.Status
+	if s.w != nil {
+		rec, _, _ := workspace.BySlug(ctx, s.w.Store.Main(), slug)
+		status = rec.Status
+	}
+	s.log.add("%s observe %s %v %s", s.name, slug, forks, status)
+	return s.fail
+}
+
+func (s *stubTeardown) RemoveSandboxes(_ context.Context, slugs []string) error {
+	s.log.add("%s sandboxes %v", s.name, slugs)
+	return s.fail
+}
+
+func (s *stubTeardown) remove(_ context.Context, _ *sql.Tx, slug string) error {
+	s.log.add("%s remove %s", s.name, slug)
+	return s.fail
 }

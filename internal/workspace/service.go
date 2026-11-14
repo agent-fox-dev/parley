@@ -79,6 +79,11 @@ type Deps struct {
 	// SafetyPusher offers every branch of a workspace's copy to its origin
 	// before an archive or a reclone; nil means gitrepo.Git{}.
 	SafetyPusher BranchesPusher
+	// RemoveCopy removes a workspace's copy, the directory dir, after a
+	// reclone or a delete has committed; nil means gitrepo.Remove. A test
+	// replaces it to reproduce a hub that stopped before the removal, or a
+	// removal that fails.
+	RemoveCopy func(dir string) error
 	// PushDeadline is how long a push may take, and a safety copy of every
 	// branch with it; 0 means the fixed 2 minutes.
 	PushDeadline time.Duration
@@ -170,6 +175,9 @@ func (s *Service) Bind(d Deps) {
 	if d.SafetyPusher == nil {
 		d.SafetyPusher = gitrepo.Git{}
 	}
+	if d.RemoveCopy == nil {
+		d.RemoveCopy = gitrepo.Remove
+	}
 	if d.PushDeadline == 0 {
 		d.PushDeadline = pushDeadline
 	}
@@ -187,5 +195,5 @@ func (s *Service) Settings() *SettingsRegistry { return &s.settings }
 // Routes returns the workspace routes of the REST API.
 func (s *Service) Routes() []server.Route {
 	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute(), s.syncRoute(), s.pushRoute(),
-		s.archiveRoute(), s.reactivateRoute()}
+		s.archiveRoute(), s.reactivateRoute(), s.recloneRoute()}
 }
