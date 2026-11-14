@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -102,13 +103,18 @@ func archiveRefusal(w Workspace, held bool) error {
 	return RequireReady(w)
 }
 
+// archiveReason is the reason an archive gives the session closer.
+const archiveReason = "workspace archived"
+
 // archive archives the workspace slug, whose maintenance marker the caller
 // holds, by the actor given, and returns its record as the archive left it.
 // It offers every branch to origin first, whatever origin answers, then in
-// one store transaction sets the status to archived, clears clone_error and
-// writes the archive event; when the transaction fails nothing has changed.
-// The hub's copy, the forks and what they own are left as they are: an
-// archived workspace can be reactivated from them.
+// one store transaction sets the status to archived, clears clone_error,
+// writes the archive event and has the session closer end the sessions of
+// the workspace and its forks; when the transaction fails nothing has
+// changed. Once it has committed, every archive observer is told. The hub's
+// copy, the forks and what they own are left as they are: an archived
+// workspace can be reactivated from them.
 func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *string) (Workspace, error) {
 	// Read again under the marker: an operation that ended between the
 	// handler's checks and the marker may have changed the status.
@@ -122,7 +128,9 @@ func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *
 	if err := archiveRefusal(rec, true); err != nil {
 		return Workspace{}, err
 	}
+	set := s.teardown.snapshot()
 	outcome := s.safetyCopy(ctx, rec)
+	var forks []string
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, clone_error = NULL, updated_at = ? WHERE slug = ?`,
 			string(StatusArchived), s.deps.Now().UnixNano(), slug)
@@ -136,17 +144,23 @@ func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *
 		if n == 0 {
 			return ErrNotFound
 		}
-		var forks int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM workspaces WHERE parent_slug = ?`, slug).Scan(&forks); err != nil {
-			return fmt.Errorf("count the forks: %w", err)
+		if forks, err = forksOf(ctx, tx, slug); err != nil {
+			return err
 		}
-		_, err = s.deps.Events.Emit(ctx, tx, event.Input{Type: eventArchive, Workspace: &slug,
+		if _, err := s.deps.Events.Emit(ctx, tx, event.Input{Type: eventArchive, Workspace: &slug,
 			ActorType: actorType, ActorID: actorID, ResourceType: "workspace", ResourceID: slug,
-			Metadata: archiveEventMeta{HeadSHA: rec.HeadSHA, OriginPush: outcome, Forks: forks}})
-		return err
+			Metadata: archiveEventMeta{HeadSHA: rec.HeadSHA, OriginPush: outcome, Forks: len(forks)}}); err != nil {
+			return err
+		}
+		return s.closeSessions(ctx, tx, set.closer, slug, forks)
 	})
 	if err != nil {
 		return Workspace{}, fmt.Errorf("archive workspace %q: %w", slug, err)
+	}
+	for _, o := range set.observers {
+		if err := o.WorkspaceArchived(ctx, slug, slices.Clone(forks)); err != nil {
+			s.deps.Logger.Error("workspace archive observer failed", "slug", slug, "error", err)
+		}
 	}
 	rec, found, err = BySlug(ctx, s.deps.Store.Main(), slug)
 	if err != nil {
@@ -156,4 +170,51 @@ func (s *Service) archive(ctx context.Context, slug, actorType string, actorID *
 		return Workspace{}, fmt.Errorf("archive workspace %q: the record is gone after the archive", slug)
 	}
 	return rec, nil
+}
+
+// forksOf returns the slugs of the forks of the workspace parent, in
+// ascending order, empty and not nil when it has none.
+func forksOf(ctx context.Context, tx *sql.Tx, parent string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT slug FROM workspaces WHERE parent_slug = ? ORDER BY slug`, parent)
+	if err != nil {
+		return nil, fmt.Errorf("list the forks: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	forks := []string{}
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
+			return nil, fmt.Errorf("list the forks: %w", err)
+		}
+		forks = append(forks, slug)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list the forks: %w", err)
+	}
+	return forks, nil
+}
+
+// closeSessions has closer, when there is one, end in the archive's
+// transaction tx the sessions of the workspace slug and of its forks. It
+// runs under a savepoint: a closer that fails has its own writes undone and
+// its error logged, and the archive goes on, since the workspace is
+// archived whether or not a session could be ended. Only a failure of the
+// savepoint itself is returned.
+func (s *Service) closeSessions(ctx context.Context, tx *sql.Tx, closer SessionCloser, slug string, forks []string) error {
+	if closer == nil {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT archive_sessions`); err != nil {
+		return fmt.Errorf("open the sessions' savepoint: %w", err)
+	}
+	if err := closer.CloseSessions(ctx, tx, append([]string{slug}, forks...), archiveReason); err != nil {
+		s.deps.Logger.Error("workspace sessions not closed on archive", "slug", slug, "error", err)
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO archive_sessions`); err != nil {
+			return fmt.Errorf("undo the session closer's writes: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE archive_sessions`); err != nil {
+		return fmt.Errorf("release the sessions' savepoint: %w", err)
+	}
+	return nil
 }

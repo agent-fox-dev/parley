@@ -140,6 +140,9 @@ type Service struct {
 	extMu   sync.RWMutex
 	syncExt SyncExtension
 
+	// teardown holds the collaborators an archive and a delete call.
+	teardown Teardown
+
 	// fetchLocks serialises the syncs' fetches into one copy.
 	fetchLocks keyedLocks
 }

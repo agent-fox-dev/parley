@@ -6,6 +6,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -65,8 +66,10 @@ func (l originLister) ListOrigin(ctx context.Context, url string, cred workspace
 // hub listens, so that a start that fails after the hook leaves no clone
 // running over stores that are closed; they are stopped when the hub stops.
 // The service exists from the composition on, with the keys of the settings
-// table registered on its settings registry, so a later part keeps it
-// through Composition.Workspaces.
+// table registered on its settings registry and, on its teardown set, the
+// access rule as the token revoker and the secrets' removal as a remover of
+// owned data, so a later part keeps it through Composition.Workspaces and
+// registers its own collaborators on Workspaces().Teardown().
 func composeWorkspaces(c *Composition) {
 	svc := &workspace.Service{}
 	c.workspaces = svc
@@ -78,6 +81,13 @@ func composeWorkspaces(c *Composition) {
 	// One git for the part, so that every call it makes to an origin runs
 	// with the same environment.
 	git := gitFor(c.env)
+	// The collaborators of the packages composed before this part: tokens
+	// have no remover of their own and are revoked through the access rule,
+	// and the secret package cannot register itself, since it cannot import
+	// this one. Every other owner of workspace data registers its own from
+	// its part (ADR 07).
+	svc.Teardown().RegisterTokenRevoker(c.access)
+	svc.Teardown().RegisterRemover(secret.RemoveWorkspace)
 	c.AddSchemaStep(workspace.SchemaStep)
 	for _, r := range svc.Routes() {
 		c.AddRoute(r)

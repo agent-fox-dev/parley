@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push` and `POST /api/v1/workspaces/:slug/archive` (see Archive) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive holds with `ClearMarkers`, which releases every marker at start (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push` and `POST /api/v1/workspaces/:slug/archive` (see Archive) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive holds with `ClearMarkers`, which releases every marker at start, and the teardown set `Teardown` with `RemoveOwned`, through which an archive and a delete reach the data other packages keep for a workspace (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -507,7 +507,10 @@ emits through it from its start hook on, if it is listed after
 the settings table registered on `Workspaces().Settings()` by
 `workspace.RegisterSettingKeys` (a failure panics the composition, as an
 invalid route does): a part keeps it when it is composed (see
-[Workspace records](#workspace-records)).
+[Workspace records](#workspace-records)). A part that keeps data for a
+workspace, or acts when one is archived or deleted, registers its
+collaborator on `Workspaces().Teardown()`
+([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -2294,7 +2297,48 @@ forks}`, `head_sha` the record's, `null` when it has none). A failure of
 the transaction is a `500 internal` with nothing changed. The answer is
 the record read after the commit, rendered by `RenderWorkspace`. The copy
 is read only by the safety copy, and no fork record or other data is
-touched.
+touched: no remover of owned data and no sandbox remover is called.
+
+The archive takes its collaborators from the teardown set once, before the
+safety copy. In its transaction, after the event, it lists the forks
+(`SELECT slug FROM workspaces WHERE parent_slug = ? ORDER BY slug`, the
+count the event gives) and, when a session closer is registered, calls
+`CloseSessions(ctx, tx, [slug, forks...], "workspace archived")` under the
+savepoint `archive_sessions`: a closer's error is logged as `workspace
+sessions not closed on archive` with the slug, `ROLLBACK TO
+archive_sessions` undoes the closer's writes, and the archive commits; only
+a failure of the savepoint statements fails it. After the commit every
+archive observer is called in registration order with the slug and the
+forks; an observer's error is logged as `workspace archive observer
+failed` with the slug and the next observer is called. A refused archive
+calls neither.
+
+`internal/workspace/teardown.go` holds the teardown set
+([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)),
+`workspace.Teardown`, which `(*Service).Teardown()` returns: the
+collaborators through which an archive and a delete reach the data other
+packages keep for a workspace. Its zero value is valid, and with nothing
+registered the operations touch the workspace records alone. It holds one
+`TokenRevoker` (`RevokeBoundTo(ctx, tx, slugs)` returning the revoked
+token ids; `RegisterTokenRevoker`), the `Remover`s of owned data
+(`func(ctx, tx, slug) error`, in registration order; `RegisterRemover`),
+one `SessionCloser` (`CloseSessions(ctx, tx, slugs, reason)`;
+`RegisterSessionCloser`), one `SandboxRemover` (`RemoveSandboxes(ctx,
+slugs)`; `RegisterSandboxRemover`), the `ArchiveObserver`s
+(`WorkspaceArchived(ctx, slug, forks)`, in registration order;
+`RegisterArchiveObserver`) and one `ForkRemover` (`DeleteFork(ctx, slug,
+caller)` and `RemoveForksOf(ctx, tx, parent, actor)` returning the removed
+slugs and a function that discards their repository data after the
+commit; `RegisterForkRemover`). A single collaborator's `Register` replaces
+the one before, and nil removes it; a list's adds, and nil adds none.
+Registration is safe from several goroutines and happens while the hub is
+composed. `(*Service).RemoveOwned(ctx, tx, slug, reason)` removes in `tx`
+what the workspace owns outside its record: it calls the token revoker
+with `[slug]`, every remover of owned data in order and the session closer
+with `[slug]` and the reason, stops at the first error, and returns the
+revoked token ids in ascending order, `[]` when there are none. The
+workspaces part registers on the set `c.access` (the `*access.Service`) as
+the token revoker and `secret.RemoveWorkspace` as a remover of owned data.
 
 `internal/workspace/maintenance.go` holds the maintenance marker, the
 record's `maintenance` column, which `RequireReady` reads (see errata 14:

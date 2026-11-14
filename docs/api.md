@@ -1697,10 +1697,17 @@ workspace's origin credential and a deadline of two minutes, sending no
 tag, forcing nothing and deleting nothing. Whatever origin answers, the
 archive goes on: a branch origin refused stays in the hub's copy. A
 `failed` workspace, or one with no copy, offers nothing. Then, in one
-store transaction, `status` becomes `archived`, `clone_error` is cleared
-and one `parley.workspace.archive` event is written; when that transaction
-fails nothing has changed and the answer is `500 internal`. The hub's
-copy, every ref of it, and the workspace's forks are left as they are.
+store transaction, `status` becomes `archived`, `clone_error` is cleared,
+one `parley.workspace.archive` event is written and every active agent
+session of the workspace and of its forks is ended with the reason
+`workspace archived`; when that transaction fails nothing has changed and
+the answer is `500 internal`. A session that cannot be ended does not fail
+the archive: what ending the sessions wrote is undone, the failure is
+logged, and the workspace is archived all the same. Once the archive is
+stored, the features that act on an archived workspace, such as one that
+stops its sandboxes, are told; a failure there is logged and changes
+nothing in the answer. The hub's copy, every ref of it, the workspace's
+forks and the data they own are left as they are.
 
 The event has `workspace` the slug, `resource_type` `workspace`,
 `resource_id` the slug, and as actor the caller as for
