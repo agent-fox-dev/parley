@@ -2172,8 +2172,19 @@ the body. `pushForce` reads the body: none or empty is `force` `false`,
 otherwise `server.DecodeJSON` into a map, and `force`, when given, must be
 `true` or `false` (`400 invalid_request` otherwise, `null` included). The
 handler validates the name the router decoded once with
-`ValidateBranchName`, reads the record with `BySlug`, reads the branch's
-head once with `ResolveBranch`, resolves the credential with
+`ValidateBranchName`, reads the record with `BySlug`, and asks
+`pushRefusal` in this order: `RequireReady`, a fork (`400
+fork_has_no_origin`), for a `carry_patch` workspace its
+`integration_branch` (`403 integration_branch`) and then the registered
+`PatchBranchLookup` (`403 patch_branch`; an error is `503 unavailable`,
+logged scrubbed), and for a forced push `MatchAnyBranchGlob` over the
+effective `protected_branches` of the settings registry (`403
+protected_branch`); none of them needs the branch or contacts origin. The
+lookup is registered with `(*Service).RegisterPatchBranchLookup`, one at a
+time, by the feature that keeps a carry-patch workspace's patch list;
+without one no branch is a patch branch. The handler then reads the
+branch's head once with `ResolveBranch` (no branch is `404
+branch_not_found`), resolves the credential with
 `ResolveOriginCredential` and hands one `gitrepo.PushRequest` to
 `Deps.Pusher`; it takes no lock. It answers `200` with `branch`, `sha`,
 `remote` `origin`, `remote_url` (`withoutUserinfo` of `git_url`: an https

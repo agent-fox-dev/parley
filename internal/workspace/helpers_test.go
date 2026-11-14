@@ -1126,11 +1126,11 @@ func (s *syncWorld) observe(t *testing.T, err error) *recordingObserver {
 	return o
 }
 
-// setMode gives the sync workspace the workspace_mode mode and the
+// setMode gives the workspace syncSlug the workspace_mode mode and the
 // integration_branch integration.
-func (s *syncWorld) setMode(t *testing.T, mode, integration string) {
+func (w *world) setMode(t *testing.T, mode, integration string) {
 	t.Helper()
-	if _, err := s.Store.Main().Exec(`UPDATE workspaces SET workspace_mode = ?, integration_branch = ? WHERE slug = ?`,
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET workspace_mode = ?, integration_branch = ? WHERE slug = ?`,
 		mode, integration, syncSlug); err != nil {
 		t.Fatal(err)
 	}
@@ -1255,4 +1255,34 @@ func (p *recordingPusher) gitArgs() [][]string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.args)
+}
+
+// setProtected stores globs as the protected_branches setting of the
+// workspace syncSlug; nil leaves the setting unset.
+func (w *world) setProtected(t *testing.T, globs []string) {
+	t.Helper()
+	doc := []byte("{}")
+	if globs != nil {
+		var err error
+		if doc, err = json.Marshal(map[string][]string{"protected_branches": globs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = ?`, string(doc), syncSlug); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// patchLookup is a patch-branch lookup that reports the branches registered
+// as patch branches of every workspace, and fails for the workspace failing.
+type patchLookup struct {
+	registered []string
+	failing    string
+}
+
+func (l patchLookup) IsPatchBranch(_ context.Context, slug, branch string) (bool, error) {
+	if slug == l.failing {
+		return false, errors.New("the patch list cannot be read")
+	}
+	return slices.Contains(l.registered, branch), nil
 }

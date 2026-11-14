@@ -128,6 +128,9 @@ type Service struct {
 	excludeMu       sync.RWMutex
 	excludeProvider ExcludedBranchProvider
 
+	patchMu     sync.RWMutex
+	patchLookup PatchBranchLookup
+
 	extMu   sync.RWMutex
 	syncExt SyncExtension
 

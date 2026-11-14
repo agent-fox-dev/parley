@@ -1,6 +1,7 @@
 package workspace_test
 
 import (
+	"encoding/json"
 	"maps"
 	"net/http"
 	"net/url"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -31,7 +33,8 @@ func TestPushRoute_TakesForceOnlyFromATrueMember(t *testing.T) {
 		{"another member alone", `{"extra":1}`, false},
 	} {
 		before := len(p.pushes.recorded())
-		if a := p.push(t, p.uKey, syncSlug, "main", c.body); a.status != http.StatusOK {
+		// dev, since a forced push of the protected main is refused.
+		if a := p.push(t, p.uKey, syncSlug, "dev", c.body); a.status != http.StatusOK {
 			t.Errorf("%s: answer %d %s, want 200", c.name, a.status, a.body)
 			continue
 		}
@@ -264,5 +267,178 @@ func TestPush_AuthenticatesWithTheSecretsOfTheMoment(t *testing.T) {
 				t.Errorf("git ran with the arguments %v, which hold %s", a, secret)
 			}
 		}
+	}
+}
+
+func TestPush_RefusesBeforeContactingOrigin(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	p.svc.RegisterPatchBranchLookup(patchLookup{registered: []string{"patch/a"}, failing: "cp-broken"})
+	parent, deploy := syncSlug, "deploy"
+	ready := workspace.StatusReady
+	for _, rec := range []workspace.Workspace{
+		{Slug: "pending", Status: workspace.StatusPending},
+		{Slug: "cloning", Status: workspace.StatusCloning},
+		{Slug: "recloning", Status: ready, Marker: workspace.MarkerReclone},
+		{Slug: "archiving", Status: ready, Marker: workspace.MarkerArchive},
+		{Slug: "deleting", Status: ready, Marker: workspace.MarkerDelete},
+		{Slug: "failed", Status: workspace.StatusFailed},
+		{Slug: "archived", Status: workspace.StatusArchived},
+		{Slug: "a-fork", Kind: access.KindFork, ParentSlug: &parent, Status: ready},
+		{Slug: "cp", Mode: workspace.ModeCarryPatch, IntegrationBranch: &deploy, Status: ready},
+		{Slug: "cp-broken", Mode: workspace.ModeCarryPatch, IntegrationBranch: &deploy, Status: ready},
+	} {
+		p.put(t, rec)
+	}
+	requests, copyRefs, originRefs, events := p.origin.Requests(), gitrepotest.Refs(t, p.copy, ""), gitrepotest.Refs(t, p.origin.Dir(), ""), p.eventCount(t)
+	for _, c := range []struct {
+		name, slug, branch string
+		body               any
+		status             int
+		errorType          string
+	}{
+		{"a pending workspace", "pending", "main", nil, http.StatusConflict, "workspace_busy"},
+		{"a cloning workspace", "cloning", "main", nil, http.StatusConflict, "workspace_busy"},
+		{"a running reclone", "recloning", "main", nil, http.StatusConflict, "workspace_busy"},
+		{"a running archive", "archiving", "main", nil, http.StatusConflict, "workspace_busy"},
+		{"a running delete", "deleting", "main", nil, http.StatusConflict, "workspace_busy"},
+		{"a failed workspace", "failed", "main", nil, http.StatusConflict, "workspace_not_ready"},
+		{"an archived workspace", "archived", "main", nil, http.StatusConflict, "workspace_archived"},
+		{"a fork whose parent is ready", "a-fork", "work", nil, http.StatusBadRequest, "fork_has_no_origin"},
+		{"the integration branch", "cp", "deploy", `{"force":false}`, http.StatusForbidden, "integration_branch"},
+		{"the integration branch with force", "cp", "deploy", `{"force":true}`, http.StatusForbidden, "integration_branch"},
+		{"a registered patch branch", "cp", url.PathEscape("patch/a"), `{"force":false}`, http.StatusForbidden, "patch_branch"},
+		{"a registered patch branch with force", "cp", url.PathEscape("patch/a"), `{"force":true}`, http.StatusForbidden, "patch_branch"},
+		{"a patch list that cannot be read", "cp-broken", "feature", nil, http.StatusServiceUnavailable, "unavailable"},
+		{"a branch the hub's copy lacks", syncSlug, "nope", `{"force":false}`, http.StatusNotFound, "branch_not_found"},
+	} {
+		if a := p.push(t, p.uKey, c.slug, c.branch, c.body); a.status != c.status || a.errorType(t) != c.errorType {
+			t.Errorf("%s: answer %d %s, want %d %s", c.name, a.status, a.body, c.status, c.errorType)
+		}
+	}
+	if calls := p.pushes.recorded(); len(calls) != 0 {
+		t.Errorf("refused pushes reached the push operation: %+v", calls)
+	}
+	if n := p.origin.Requests(); n != requests {
+		t.Errorf("refused pushes sent origin %d requests", n-requests)
+	}
+	if got := gitrepotest.Refs(t, p.copy, ""); !maps.Equal(got, copyRefs) {
+		t.Errorf("the copy's refs changed from %v to %v", copyRefs, got)
+	}
+	if got := gitrepotest.Refs(t, p.origin.Dir(), ""); !maps.Equal(got, originRefs) {
+		t.Errorf("origin's refs changed from %v to %v", originRefs, got)
+	}
+	if n := p.eventCount(t); n != events {
+		t.Errorf("refused pushes wrote %d events", n-events)
+	}
+}
+
+func TestPush_LeavesBranchesNoRefusalNames(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	p.pushes.stubWith(gitrepo.PushPushed)
+	main := ref(t, p.copy, "refs/heads/main")
+	for _, b := range []string{"deploy", "patch/a", "patch/gone"} {
+		gitrepotest.Git(t, p.copy, "branch", b, main)
+	}
+	for _, c := range []struct {
+		name, branch string
+		before       func()
+	}{
+		{"the branch deploy of a standard workspace", "deploy", func() {}},
+		{"a carry-patch workspace's branch with no lookup registered", "patch/a", func() {
+			p.setMode(t, workspace.ModeCarryPatch, "deploy")
+		}},
+		{"a branch the lookup does not report", "patch/gone", func() {
+			p.svc.RegisterPatchBranchLookup(patchLookup{registered: []string{"patch/a"}})
+		}},
+	} {
+		c.before()
+		for _, body := range []string{`{"force":false}`, `{"force":true}`} {
+			before := len(p.pushes.recorded())
+			if a := p.push(t, p.uKey, syncSlug, url.PathEscape(c.branch), body); a.status != http.StatusOK {
+				t.Errorf("%s, %s: answer %d %s, want 200", c.name, body, a.status, a.body)
+			}
+			if calls := p.pushes.recorded(); len(calls) != before+1 || calls[before].Branch != c.branch {
+				t.Errorf("%s, %s: pushes %+v, want one of %s", c.name, body, calls[before:], c.branch)
+			}
+		}
+	}
+}
+
+func TestPush_RefusesForcedPushOfAProtectedBranch(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	p.pushes.stubWith(gitrepo.PushPushed)
+	main := ref(t, p.copy, "refs/heads/main")
+	for _, b := range []string{"main2", "x/main", "release/1/x", "a/b"} {
+		gitrepotest.Git(t, p.copy, "branch", b, main)
+	}
+	for _, c := range []struct {
+		globs     []string // nil: the setting is not stored
+		branch    string
+		protected bool
+	}{
+		{[]string{"main"}, "main", true},
+		{[]string{"main"}, "main2", false},
+		{[]string{"main"}, "x/main", false},
+		{[]string{"release/*"}, "release/1.x", true},
+		{[]string{"release/*"}, "release/1/x", false},
+		{[]string{"release/**"}, "release/1/x", true},
+		{[]string{"**"}, "a/b/c", true},
+		{[]string{"*"}, "a/b", false},
+		{[]string{}, "main", false},
+		{nil, "main", true},
+	} {
+		p.setProtected(t, c.globs)
+		before := len(p.pushes.recorded())
+		a := p.push(t, p.uKey, syncSlug, url.PathEscape(c.branch), `{"force":true}`)
+		pushed := len(p.pushes.recorded()) > before
+		switch {
+		case c.protected && (a.status != http.StatusForbidden || a.errorType(t) != "protected_branch" || pushed):
+			t.Errorf("globs %q, branch %s: answer %d %s (pushed %v), want 403 protected_branch without a push", c.globs, c.branch, a.status, a.body, pushed)
+		case !c.protected && (a.status != http.StatusOK || !pushed):
+			t.Errorf("globs %q, branch %s: answer %d %s (pushed %v), want 200 after a push", c.globs, c.branch, a.status, a.body, pushed)
+		}
+	}
+}
+
+func TestPush_AnswersTheFirstFailingCheck(t *testing.T) {
+	t.Parallel()
+	p := newPushWorld(t, nil)
+	p.pushes.stubWith(gitrepo.PushPushed)
+	parent, deploy := syncSlug, "deploy"
+	for _, rec := range []workspace.Workspace{
+		{Slug: "archived", Status: workspace.StatusArchived},
+		{Slug: "archived-cp", Status: workspace.StatusArchived, Mode: workspace.ModeCarryPatch, IntegrationBranch: &deploy},
+		{Slug: "failed-fork", Status: workspace.StatusFailed, Kind: access.KindFork, ParentSlug: &parent},
+		{Slug: "cp-protected", Status: workspace.StatusReady, Mode: workspace.ModeCarryPatch, IntegrationBranch: &deploy,
+			Settings: map[string]json.RawMessage{"protected_branches": json.RawMessage(`["deploy"]`)}},
+	} {
+		p.put(t, rec)
+	}
+	p.setProtected(t, []string{"release/*"})
+	for _, c := range []struct {
+		name, slug, branch string
+		body               any
+		status             int
+		errorType, message string // message: a word the message holds, "" for any
+	}{
+		{"an invalid body and branch name", syncSlug, "a..b", `[]`, http.StatusBadRequest, "invalid_request", "request body"},
+		{"an invalid branch name on an archived workspace", "archived", "a..b", nil, http.StatusBadRequest, "invalid_request", "branch name"},
+		{"the integration branch of an archived workspace", "archived-cp", "deploy", nil, http.StatusConflict, "workspace_archived", ""},
+		{"a failed fork", "failed-fork", "work", nil, http.StatusConflict, "workspace_not_ready", ""},
+		{"a forced push of a protected integration branch", "cp-protected", "deploy", `{"force":true}`, http.StatusForbidden, "integration_branch", ""},
+		{"a forced push of a missing protected branch", syncSlug, url.PathEscape("release/9"), `{"force":true}`, http.StatusForbidden, "protected_branch", ""},
+		{"a push of a missing protected branch", syncSlug, url.PathEscape("release/9"), `{"force":false}`, http.StatusNotFound, "branch_not_found", ""},
+	} {
+		a := p.push(t, p.uKey, c.slug, c.branch, c.body)
+		errorType, msg := a.refusal(t)
+		if a.status != c.status || errorType != c.errorType || !strings.Contains(msg, c.message) {
+			t.Errorf("%s: answer %d %s, want %d %s naming %q", c.name, a.status, a.body, c.status, c.errorType, c.message)
+		}
+	}
+	if calls := p.pushes.recorded(); len(calls) != 0 {
+		t.Errorf("refused pushes reached the push operation: %+v", calls)
 	}
 }

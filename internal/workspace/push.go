@@ -20,6 +20,26 @@ type Pusher interface {
 	Push(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)
 }
 
+// PatchBranchLookup tells which branches of a carry-patch workspace are
+// patch branches, which reach origin only through the feature that keeps
+// the patch list, never through the push route. IsPatchBranch reports
+// whether branch, without refs/heads/, is the branch of a registered patch
+// of the workspace slug that is not deleted; an error means the patch list
+// could not be read.
+type PatchBranchLookup interface {
+	IsPatchBranch(ctx context.Context, slug, branch string) (bool, error)
+}
+
+// RegisterPatchBranchLookup makes l the patch-branch lookup of the push
+// route, replacing the one registered before; nil removes it. The feature
+// that keeps the patch list registers it when the hub is composed; without
+// one no branch is a patch branch.
+func (s *Service) RegisterPatchBranchLookup(l PatchBranchLookup) {
+	s.patchMu.Lock()
+	defer s.patchMu.Unlock()
+	s.patchLookup = l
+}
+
 // remoteOrigin is the name a push answer gives the remote it pushed to.
 const remoteOrigin = "origin"
 
@@ -67,6 +87,9 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 		// one the check gives for a slug no workspace has.
 		return server.NotFound(ErrNotFound.Error())
 	}
+	if err := s.pushRefusal(ctx, rec, name, force); err != nil {
+		return err
+	}
 	repo, err := s.deps.Git.Open(ctx, s.RepoPath(slug))
 	if err != nil {
 		return err
@@ -76,7 +99,8 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if !found {
-		return fmt.Errorf("push workspace %q: no branch %q", slug, name)
+		return server.NewError("branch_not_found", http.StatusNotFound,
+			fmt.Sprintf("workspace %q has no branch %q", slug, name))
 	}
 	cred, err := ResolveOriginCredential(ctx, s.deps.Secrets, slug)
 	if err != nil {
@@ -96,6 +120,67 @@ func (s *Service) servePush(w http.ResponseWriter, r *http.Request) error {
 		Branch: name, SHA: head, Remote: remoteOrigin, RemoteURL: withoutUserinfo(originURL), Result: result,
 	})
 	return nil
+}
+
+// pushRefusal is nil when the hub may hand a push of branch of w, forced
+// when force is set, to origin, and otherwise the refusal, the first
+// failing check in this order: the workspace's state as RequireReady judges
+// it, a task fork, which has no origin, the integration branch or a patch
+// branch of a carry-patch workspace, which only the feature that rebuilds or
+// keeps them pushes, then a forced push of a protected branch. None of them
+// depends on the branch existing, and none contacts origin.
+func (s *Service) pushRefusal(ctx context.Context, w Workspace, branch string, force bool) error {
+	if err := RequireReady(w); err != nil {
+		return err
+	}
+	if w.Kind == access.KindFork {
+		return server.NewError("fork_has_no_origin", http.StatusBadRequest,
+			fmt.Sprintf("workspace %q is a task fork, which has no origin to push to", w.Slug))
+	}
+	if w.Mode == ModeCarryPatch {
+		if b := deref(w.IntegrationBranch); b != "" && b == branch {
+			return server.NewError("integration_branch", http.StatusForbidden, fmt.Sprintf(
+				"branch %q is the integration branch of workspace %q, which only its rebuild pushes to origin", branch, w.Slug))
+		}
+		patch, err := s.isPatchBranch(ctx, w.Slug, branch)
+		if err != nil {
+			return err
+		}
+		if patch {
+			return server.NewError("patch_branch", http.StatusForbidden, fmt.Sprintf(
+				"branch %q is a patch branch of workspace %q, which only its patch list pushes to origin", branch, w.Slug))
+		}
+	}
+	if force {
+		globs, _ := s.settings.EffectiveSettings(w.Settings, w.DefaultBranch)["protected_branches"].([]string)
+		if MatchAnyBranchGlob(globs, branch) {
+			return server.NewError("protected_branch", http.StatusForbidden, fmt.Sprintf(
+				"branch %q of workspace %q is protected and cannot be replaced by a forced push", branch, w.Slug))
+		}
+	}
+	return nil
+}
+
+// isPatchBranch reports whether branch is a patch branch of the carry-patch
+// workspace slug, as the registered patch-branch lookup says; with none
+// registered no branch is. A lookup that fails is 503 unavailable, so that
+// a patch branch never passes unchecked and the caller may try again; what
+// it said is logged scrubbed, not answered, as it may hold what it read.
+func (s *Service) isPatchBranch(ctx context.Context, slug, branch string) (bool, error) {
+	s.patchMu.RLock()
+	l := s.patchLookup
+	s.patchMu.RUnlock()
+	if l == nil {
+		return false, nil
+	}
+	patch, err := l.IsPatchBranch(ctx, slug, branch)
+	if err != nil {
+		s.deps.Logger.Error("workspace patch-branch lookup failed", "slug", slug, "branch", branch,
+			"error", s.deps.Scrubber.Scrub(err.Error()))
+		return false, server.Unavailable(fmt.Sprintf(
+			"the patch list of workspace %q cannot be read; try again later", slug))
+	}
+	return patch, nil
 }
 
 // pushForce is the force the body of r asks for: true only for a JSON

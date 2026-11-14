@@ -1564,8 +1564,21 @@ takes no lock. Without `force` origin's branch moves only by a
 fast-forward: a branch origin lacks is created, one origin has is moved
 only when origin's head is an ancestor of the hub's, and a branch origin
 already has at the hub's head is left as it is. A protected branch is
-pushed like any other. A forced push is handed to git with the explicit
-lease that origin must not have the branch, never with a plain force.
+pushed like any other without `force`. A forced push is handed to git with
+the explicit lease that origin must not have the branch, never with a plain
+force.
+
+Before origin is contacted the hub refuses, after the body and the branch
+name and in this order: a workspace that is not `ready` or on which a
+reclone, archive or delete runs; a task fork, whatever the state of its
+parent; for a `carry_patch` workspace, its `integration_branch` and the
+branch of a registered patch that is not deleted, with and without `force`;
+a forced push of a branch one of the globs of the effective setting
+`protected_branches` matches (by default the default branch); and last a
+branch the hub's copy does not have. A request that fails several checks
+gets the answer of the first. The integration, patch and protected
+refusals do not depend on the branch existing. A refused request changes
+no branch and no recorded origin head and writes no event.
 
 The answer of a push origin took names the branch, the commit pushed, the
 remote and its URL, the workspace's `git_url` without user information
@@ -1581,11 +1594,20 @@ the commit already.
 |---|---|
 | `200 OK` | origin took the push; `result` is `pushed` or `up_to_date` |
 | `400` `invalid_request` | the body is not a JSON object (`request body must be a JSON object`, `request body is not valid JSON`), its `force` is not a JSON boolean (`request body member "force" must be true or false`), or the decoded name is not a valid branch name (`branch name "<name>": <the rule it breaks>`) |
+| `400` `fork_has_no_origin` | the workspace is a task fork (`workspace "<slug>" is a task fork, which has no origin to push to`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`), before the body is looked at |
 | `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), before the body is looked at |
+| `403` `integration_branch` | the branch is the `integration_branch` of a `carry_patch` workspace (`branch "<name>" is the integration branch of workspace "<slug>", which only its rebuild pushes to origin`) |
+| `403` `patch_branch` | the branch is the branch of a registered patch of a `carry_patch` workspace that is not deleted (`branch "<name>" is a patch branch of workspace "<slug>", which only its patch list pushes to origin`) |
+| `403` `protected_branch` | `force` is `true` and a glob of `protected_branches` matches the branch (`branch "<name>" of workspace "<slug>" is protected and cannot be replaced by a forced push`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`), before the body is looked at; also a bound PAT on a workspace outside its binding |
+| `404` `branch_not_found` | the hub's copy has no branch `{name}` (`workspace "<slug>" has no branch "<name>"`) |
+| `409` `workspace_busy` | the workspace is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`), or a reclone, archive or delete runs on it, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_not_ready` | the workspace is `failed` (`workspace "<slug>" is not ready: its clone failed; reclone it`) |
+| `409` `workspace_archived` | the workspace is `archived` (`workspace "<slug>" is archived`) |
 | `409` `non_fast_forward` | without `force`, origin's branch is not an ancestor of the hub's head: the two diverged or origin's is ahead (`origin's branch "<name>" is not an ancestor of the hub's head <sha> (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's commits, or push with force to replace origin's branch`); origin's branch and the hub's recorded origin head are unchanged |
-| `500` `internal` | the hub has no branch `{name}`, the workspace's secrets could not be read, or the push failed otherwise |
+| `503` `unavailable` | the patch list of a `carry_patch` workspace could not be read (`the patch list of workspace "<slug>" cannot be read; try again later`); nothing is pushed |
+| `500` `internal` | the workspace's secrets could not be read, or the push failed otherwise |
 
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
