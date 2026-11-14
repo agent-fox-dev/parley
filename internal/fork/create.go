@@ -244,10 +244,11 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := checkSession(req.SessionID); err != nil {
+	slug := server.Param(r, "slug")
+	if req.SessionID, err = c.checkSession(ctx, p, req.SessionID, slug); err != nil {
 		return err
 	}
-	parent, found, err := workspace.BySlug(ctx, c.deps.Store.Main(), server.Param(r, "slug"))
+	parent, found, err := workspace.BySlug(ctx, c.deps.Store.Main(), slug)
 	switch {
 	case err != nil:
 		return err
@@ -336,7 +337,7 @@ func (c *Component) newFork(ctx context.Context, p identity.Principal, parent wo
 			Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: &base,
 			OwnerID: p.User.ID, OrgID: parent.OrgID, Status: workspace.StatusReady,
 			ParentSlug: &parent.Slug, ForkPoint: &workspace.ForkPoint{Ref: base, SHA: sha},
-			ExpiresAt: &req.ExpiresAt, AutoChange: &req.AutoChange, Purpose: req.Purpose,
+			ExpiresAt: &req.ExpiresAt, AutoChange: &req.AutoChange, Purpose: req.Purpose, SessionID: req.SessionID,
 			CreatedAt: created, UpdatedAt: created, InstanceID: workspace.NewInstanceID(),
 		},
 		TrackingBranches: slices.Sorted(maps.Keys(branches)),
@@ -374,13 +375,26 @@ func (c *Component) freeSlug(ctx context.Context, parent string, name *string) (
 	return "", fmt.Errorf("no free fork name for %q in %d draws", parent, nameDraws)
 }
 
-// checkSession judges the session_id of a create, nil for none. No session
-// component is wired, so no session exists and every id is unknown.
-func checkSession(id *string) error {
+// checkSession judges the session_id the caller p names for a fork of the
+// workspace parent, nil for none, by the session-linking rule, and returns
+// the id as the rule gives it back, in lower case. Without a rule no session
+// exists, so every id is unknown.
+func (c *Component) checkSession(ctx context.Context, p identity.Principal, id *string, parent string) (*string, error) {
 	if id == nil {
-		return nil
+		return nil, nil
 	}
-	return server.NewError("unknown_session", http.StatusBadRequest, fmt.Sprintf("session_id: no session %q", *id))
+	unknown := server.NewError("unknown_session", http.StatusBadRequest, fmt.Sprintf("session_id: no session %q", *id))
+	if c.linker == nil {
+		return nil, unknown
+	}
+	got, err := c.linker.Check(ctx, p, *id, parent)
+	switch {
+	case errors.Is(err, ErrUnknownSession):
+		return nil, unknown
+	case err != nil:
+		return nil, fmt.Errorf("check session %q: %w", *id, err)
+	}
+	return &got, nil
 }
 
 // checkLimit is 429 fork_limit_reached when the workspace parent has
@@ -410,6 +424,8 @@ type createAnswer struct {
 	Workspace workspace.Object `json:"workspace"`
 	Remote    *string          `json:"remote"`
 	Token     *mintedToken     `json:"token,omitempty"`
+	// Sandbox is the sandbox component's object, as it gave it.
+	Sandbox json.RawMessage `json:"sandbox,omitempty"`
 }
 
 // commit stores the fork f that the caller p creates by req in one
@@ -442,6 +458,11 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 		if err := Insert(ctx, tx, f); err != nil {
 			return err
 		}
+		if f.SessionID != nil && c.linker != nil {
+			if err := c.linker.Record(ctx, tx, *f.SessionID, parent.Slug, f.Slug); err != nil {
+				return fmt.Errorf("link fork %q to session %q: %w", f.Slug, *f.SessionID, err)
+			}
+		}
 		var tokenID *string
 		if req.Token != nil {
 			pat, value, err := c.mint(ctx, tx, p, f, *req.Token)
@@ -454,17 +475,38 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 			return err
 		}
 		// The sandbox is asked last, once the fork, its token and its
-		// repository exist. No sandbox component is wired, so every sandbox
-		// is refused as the sandbox routes of such a hub answer.
-		if req.Sandbox != nil {
-			return server.NewError("sandboxes_disabled", http.StatusNotFound, "sandboxes are not enabled on this hub")
+		// repository exist, and its refusal, answered as it is, takes the
+		// fork with it.
+		if req.Sandbox == nil {
+			return nil
 		}
-		return nil
+		ans.Sandbox, err = c.createSandbox(ctx, tx, p, f, req.Sandbox)
+		return err
 	})
 	if err != nil {
 		return createAnswer{}, err
 	}
 	return ans, nil
+}
+
+// createSandbox asks the sandbox component in tx for the sandbox raw, the
+// body's member as received, on the fork f that the caller p creates, with
+// the fork's session and purpose as defaults. Without a component sandboxes
+// are disabled, which the sandbox routes of such a hub answer as well.
+func (c *Component) createSandbox(ctx context.Context, tx *sql.Tx, p identity.Principal, f Fork, raw json.RawMessage) (json.RawMessage, error) {
+	if c.sandbox == nil {
+		return nil, server.NewError("sandboxes_disabled", http.StatusNotFound, "sandboxes are not enabled on this hub")
+	}
+	obj, err := c.sandbox.CreateSandbox(ctx, tx, SandboxRequest{Caller: p, Fork: f, Sandbox: raw, SessionID: f.SessionID, Purpose: f.Purpose})
+	switch {
+	case err != nil:
+		return nil, err
+	case !json.Valid(obj) || bytes.TrimSpace(obj)[0] != '{':
+		// Judged before the commit, so that a fork once committed is always
+		// answered 201.
+		return nil, fmt.Errorf("the sandbox of fork %q is not a JSON object: %q", f.Slug, obj)
+	}
+	return obj, nil
 }
 
 // mint mints in tx the token t that the caller p asks for with the fork f,

@@ -11,6 +11,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -199,36 +200,47 @@ func TestCreate_RefusalOrder(t *testing.T) {
 	w.seedFork(t, "full--x", parentOf("full", workspace.StatusReady))
 	w.seedFork(t, "full--y", parentOf("full", workspace.StatusReady))
 
-	// No session component is wired, so no session exists; nor is a
-	// sandbox component, so every sandbox is refused.
+	// w has no session linker, so no session exists, and no sandbox
+	// component, so every sandbox is refused; stubbed has a linker refusing
+	// every session and a sandbox component refusing every sandbox.
+	stubbed := newWorld(t, collaborate(&linker{refuse: true},
+		&sandboxer{err: server.NewError("credential_missing", http.StatusUnprocessableEntity, "no credential")}))
+	stubbed.seedFork(t, "demo--f1")
 	const session = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 	badToken := map[string]any{"permissions": []string{"no:such"}}
 	for _, c := range []struct {
-		name, slug string
-		admin      bool
-		body       map[string]any
-		status     int
-		want       string
+		name, slug  string
+		admin, stub bool
+		body        map[string]any
+		status      int
+		want        string
 	}{
-		{"admin token, then the body", "demo", true, map[string]any{"name": "BAD"}, http.StatusForbidden, "forbidden"},
-		{"body, then the session", "demo", false, map[string]any{"name": "BAD", "session_id": session}, http.StatusBadRequest, "invalid_request"},
-		{"session, then a fork as parent", "demo--f1", false, map[string]any{"session_id": session}, http.StatusBadRequest, "unknown_session"},
-		{"a fork as parent, then its state", "arch--f", false, map[string]any{}, http.StatusBadRequest, "not_supported_on_fork"},
-		{"parent state, then ref", "arch", false, map[string]any{"ref": "nope"}, http.StatusConflict, "workspace_archived"},
-		{"ref, then the limit", "full", false, map[string]any{"ref": "nope"}, http.StatusBadRequest, "fork_ref_not_found"},
-		{"limit, then the name in use", "full", false, map[string]any{"name": "x"}, http.StatusTooManyRequests, "fork_limit_reached"},
-		{"name in use, then the token", "demo", false, map[string]any{"name": "f1", "token": badToken}, http.StatusConflict, "conflict"},
-		{"token, then the sandbox", "demo", false, map[string]any{"name": "t1", "token": badToken, "sandbox": map[string]any{}}, http.StatusBadRequest, "invalid_request"},
-		{"sandbox", "demo", false, map[string]any{"name": "t2", "sandbox": map[string]any{}}, http.StatusNotFound, "sandboxes_disabled"},
+		{"admin token, then the body", "demo", true, false, map[string]any{"name": "BAD"}, http.StatusForbidden, "forbidden"},
+		{"body, then the session", "demo", false, false, map[string]any{"name": "BAD", "session_id": session}, http.StatusBadRequest, "invalid_request"},
+		{"session, then a fork as parent", "demo--f1", false, false, map[string]any{"session_id": session}, http.StatusBadRequest, "unknown_session"},
+		{"a fork as parent, then its state", "arch--f", false, false, map[string]any{}, http.StatusBadRequest, "not_supported_on_fork"},
+		{"parent state, then ref", "arch", false, false, map[string]any{"ref": "nope"}, http.StatusConflict, "workspace_archived"},
+		{"ref, then the limit", "full", false, false, map[string]any{"ref": "nope"}, http.StatusBadRequest, "fork_ref_not_found"},
+		{"limit, then the name in use", "full", false, false, map[string]any{"name": "x"}, http.StatusTooManyRequests, "fork_limit_reached"},
+		{"name in use, then the token", "demo", false, false, map[string]any{"name": "f1", "token": badToken}, http.StatusConflict, "conflict"},
+		{"token, then the sandbox", "demo", false, false, map[string]any{"name": "t1", "token": badToken, "sandbox": map[string]any{}}, http.StatusBadRequest, "invalid_request"},
+		{"body, then the session, with a linker", "demo", false, true, map[string]any{"name": "BAD", "session_id": session}, http.StatusBadRequest, "invalid_request"},
+		{"session, then a fork as parent, with a linker", "demo--f1", false, true, map[string]any{"session_id": session}, http.StatusBadRequest, "unknown_session"},
+		{"token, then the sandbox, with a component", "demo", false, true, map[string]any{"name": "t1", "token": badToken, "sandbox": map[string]any{}}, http.StatusBadRequest, "invalid_request"},
+		{"sandbox", "demo", false, false, map[string]any{"name": "t2", "sandbox": map[string]any{}}, http.StatusNotFound, "sandboxes_disabled"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			cred := w.devKey
-			if c.admin {
-				cred = w.Token
+			on := w
+			if c.stub {
+				on = stubbed
 			}
-			before := w.footprint(t)
-			wantError(t, w.post(t, cred, "/workspaces/"+c.slug+"/forks", c.body), c.status, c.want)
-			w.unchanged(t, before)
+			cred := on.devKey
+			if c.admin {
+				cred = on.Token
+			}
+			before := on.footprint(t)
+			wantError(t, on.post(t, cred, "/workspaces/"+c.slug+"/forks", c.body), c.status, c.want)
+			on.unchanged(t, before)
 		})
 	}
 }

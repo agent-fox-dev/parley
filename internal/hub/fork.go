@@ -16,7 +16,13 @@ const forksHook = "forks"
 // binds the component to the stores, the workspace service, which knows
 // where the parents' and the forks' repositories are, and the hub's git.
 // The component exists from the composition on, so a later part keeps it
-// through Composition.Forks.
+// through Composition.Forks, and registers there, while it is composed, the
+// collaborators the create asks: the session feature its session-linking
+// rule (RegisterSessionLinker) and the sandbox feature its sandbox component
+// (RegisterSandbox), each from its own file of this package, as ADR 07 has
+// the teardown collaborators registered on the workspace service. None is
+// registered here: without them every session_id is refused 400
+// unknown_session and every sandbox 404 sandboxes_disabled.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp
@@ -37,9 +43,11 @@ func composeForks(c *Composition) {
 	})
 }
 
-// Forks returns the hub's fork component: the ref view of a fork, its head
-// and the check of a write to one of its branches. A part keeps it when it
-// is composed; the component serves once its start hook has run.
+// Forks returns the hub's fork component: the ref view of a fork, its head,
+// the check of a write to one of its branches, and the registration points
+// of the create's session linker and sandbox component. A part keeps it
+// when it is composed and registers its collaborators then; the component
+// serves once its start hook has run.
 func (c *Composition) Forks() *fork.Component { return c.forks }
 
 // AdjustForks adds fn to the functions that change the fork component's

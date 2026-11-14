@@ -1947,8 +1947,8 @@ absent, so a client may send back what it read:
 | `auto_change` | `true` or `false`; absent, `true` |
 | `token` | an object `{name, permissions, paths, expires}` of the token to mint with the fork, bound to it and owned by the caller: `name` a string, absent `fork:<fork slug>`; `permissions` and `paths` lists of strings, judged by the minting component as for [`POST /api/v1/workspaces/{slug}/tokens`](#post-apiv1workspacesslugtokens); `expires` a string, a whole number above zero followed by `m`, `h` or `d`, and the token's `expires_at` is the fork's creation time plus `expires`. Absent `expires`, the token never expires (`expires_at` `null`). A PAT caller must hold `tokens:manage` and is held to the subset rule |
 | `purpose` | a string of at most 1024 characters (Unicode code points); absent, `null` |
-| `session_id` | a UUID in its hyphenated form, the session the fork is created in. No session component is part of the hub yet, so no session exists and every `session_id` is refused with `400` `unknown_session` |
-| `sandbox` | an object, the sandbox to create with the fork. No sandbox component is part of the hub yet, so every `sandbox` is refused with `404` `sandboxes_disabled` and no fork is created |
+| `session_id` | a UUID in its hyphenated form, the session the fork is created in, judged by the session-linking rule for the caller and the parent; the fork stores it, and its event carries it, as the rule gives it back, in lower case, and the link of the fork to the session is recorded in the fork's transaction. No session component is part of the hub yet, so no session exists and every `session_id` is refused with `400` `unknown_session` |
+| `sandbox` | an object, the sandbox to create with the fork, handed as received, unread, to the sandbox component with the fork's `session_id` and `purpose` as defaults; the component judges it and answers the sandbox object or its refusal, on which no fork is created. No sandbox component is part of the hub yet, so every `sandbox` is refused with `404` `sandboxes_disabled` and no fork is created |
 
 ```json
 {"name":"task1","ref":"release","ttl":"24h","purpose":"fix loader"}
@@ -1961,7 +1961,8 @@ bytes); the admin token (`403`), before the body is read; the body, member
 by member in the order of the table (`400`); the session (`400`); a parent
 that is itself a task fork (`400`); the parent's state (`409`); the base
 branch (`400`); the fork limit (`429`); a name a workspace already has
-(`409`); the token (`400`, `403`); the sandbox (`404`). A refused request
+(`409`); the token (`400`, `403`); the sandbox (`404`, or the sandbox
+component's refusal). A refused request
 records nothing and leaves no repository directory behind.
 
 The fork's repository is an empty bare repository whose alternates file
@@ -1980,8 +1981,9 @@ its tracking names (see [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacessl
 the request, that PAT as its creating token, which lets a PAT bound to the
 parent reach the forks it created (see
 [Workspace-bound tokens](#workspace-bound-tokens)). The parent's state is
-judged again in the transaction, the fork, its token and a
-`parley.workspace.fork` event are written in that one transaction, and
+judged again in the transaction, the fork, the link of the fork to its
+session, its token and a `parley.workspace.fork` event are written in that
+one transaction, the sandbox component is asked last in it, and
 creates of forks of one parent run one at a time from the name check to the
 commit, so two requests for one name answer `201` and `409`. When the
 repository cannot be made, or the transaction or its commit fails, the
@@ -1992,7 +1994,9 @@ The answer has `workspace`, the fork's workspace object with `access`
 `owner` and `head_sha` the parent's head of the base branch; `remote`, the
 fork's `hub_url`, `null` when no external URL is configured; and, only when
 the body asked for one, `token`, the Token object with `workspace` the
-fork's slug and the secret in `token.token`, which no other answer carries:
+fork's slug and the secret in `token.token`, which no other answer carries;
+and, only when the body had a `sandbox`, `sandbox`, the sandbox component's
+object as it gave it:
 
 ```json
 {"workspace":{"slug":"demo--task1","kind":"fork","workspace_mode":"standard","git_url":null,"default_branch":"release","owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"acme","status":"ready","display_name":"demo--task1","description":"","head_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":"demo","fork_point":{"ref":"release","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8"},"expires_at":"2026-11-15T10:30:15Z","auto_change":true,"purpose":"fix loader","session_id":null,"settings":{"sync_enabled":true,"…":"…"},"hub_url":"https://hub.example/git/acme/demo--task1.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"},"remote":"https://hub.example/git/acme/demo--task1.git"}
@@ -2000,22 +2004,23 @@ fork's slug and the secret in `token.token`, which no other answer carries:
 
 | Status | When |
 |---|---|
-| `201 Created` | the fork was created; the body is `{workspace, remote}`, and `token` when asked for |
+| `201 Created` | the fork was created; the body is `{workspace, remote}`, and `token` and `sandbox` when asked for |
 | `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token.token`; nothing is created |
 | `400` `invalid_request` | the body is not an object (the messages of [Request bodies](#request-bodies)), or a member is refused, the message naming it: `name: must be a string`, `name: must be 1 to 32 characters long`, `name: may hold only the letters a to z, digits and hyphens`, `name: must start with a letter or digit`, `name: must end with a letter or digit`, `name: must not contain two hyphens in a row`; `ref: must be a string`, `ref: must not be empty`; `ttl: must be a string`, `ttl: must end in one unit: m, h or d` and the other duration rules, `ttl: must be at least 5m`, `ttl: must be at most 30d, the hub's [forks].max_ttl`; `auto_change: must be true or false`; `token: must be an object whose name and expires are strings and whose permissions and paths are lists of strings`, `token: expires: must end in one unit: m, h or d` and the other duration rules (`token: expires: must be above zero` for `0h`); `purpose: must be a string`, `purpose: must be at most 1024 characters long`; `session_id: must be a string`, `session_id: must be a UUID`; `sandbox: must be an object`; or the minting component refuses the token, with the messages of `POST /api/v1/user/tokens` |
-| `400` `unknown_session` | the body has a `session_id`: no session exists (`session_id: no session "<id>"`) |
+| `400` `unknown_session` | the body has a `session_id` the session-linking rule refuses, or the hub has no session component (`session_id: no session "<id>"`) |
 | `400` `not_supported_on_fork` | the workspace is itself a task fork (`workspace "demo--task1" is a task fork, which cannot be forked; fork its parent instead`) |
 | `400` `fork_ref_not_found` | the base branch is not a branch of the parent: a tag, a commit id or a full ref name is not one (`ref: "nope" is not a branch of "demo"`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write`; a PAT without `tokens:manage` whose body has `token` (`token: minting a token needs the scope tokens:manage`); or a token beyond what the calling PAT holds, with the subset rule's messages |
 | `403` `forbidden` | the admin token, whatever the body (`a fork needs a user as owner; the admin token cannot create one`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
 | `404` `sandboxes_disabled` | the body has a `sandbox`: no sandbox component is part of the hub (`sandboxes are not enabled on this hub`); no fork is created |
+| the sandbox component's | the body has a `sandbox` the sandbox component refuses: its status, `error_type`, message and extra members unchanged (such as `429` `sandbox_capacity` with `limit`, `maximum` and `current`); no fork is created, also when a token was asked for |
 | `409` `workspace_busy` | the parent's clone has not finished, or a reclone, archive or delete runs on it |
 | `409` `workspace_archived` | the parent is archived |
 | `409` `workspace_not_ready` | the parent's clone failed |
 | `409` `conflict` | a workspace has the slug the given `name` makes (`name: "demo" has a fork "demo--task1"`) |
 | `429` `fork_limit_reached` | the parent has `[forks].max_per_workspace` forks (see [the configuration](configuration.md)), counting only forks that exist; it is counted before the repository is made and again in the transaction, so concurrent creates never pass the limit (`workspace "demo" has 200 forks, the hub's [forks].max_per_workspace`) |
-| `500` `internal` | 8 generated names in a row were in use, or making the repository, writing the fork, its token or its event, or the commit failed; nothing is recorded |
+| `500` `internal` | 8 generated names in a row were in use, the session-linking rule could not judge the `session_id`, or making the repository, writing the fork, its session link, its token or its event, or the commit failed; nothing is recorded |
 
 The event has `workspace` and `resource_id` the fork's slug,
 `resource_type` `workspace`, `actor_type` `api_key` or `pat` after the

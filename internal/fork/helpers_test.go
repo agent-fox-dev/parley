@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -362,4 +363,113 @@ func (w *world) pat(t *testing.T, workspace string, paths []string, perms ...str
 		return err
 	})
 	return secret, id
+}
+
+// linker is a session linker that accepts every id, in lower case, unless
+// refuse or fail is set; its record writes a row of the table session_marks
+// through the transaction it is given, unless recordErr is set. It keeps
+// what it was asked.
+type linker struct {
+	mu              sync.Mutex
+	refuse          bool
+	fail, recordErr error
+	checks, records [][3]string
+}
+
+// set changes the linker under its lock.
+func (l *linker) set(fn func(*linker)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fn(l)
+}
+
+// asked is what the linker's check and record were asked, in order: the
+// checks as (id, caller's user, parent), the records as (id, parent, fork).
+func (l *linker) asked() (checks, records [][3]string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.checks), slices.Clone(l.records)
+}
+
+func (l *linker) Check(_ context.Context, caller identity.Principal, id, parent string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.checks = append(l.checks, [3]string{id, caller.User.ID, parent})
+	switch {
+	case l.fail != nil:
+		return "", l.fail
+	case l.refuse:
+		return "", fmt.Errorf("no session %s: %w", id, fork.ErrUnknownSession)
+	}
+	return strings.ToLower(id), nil
+}
+
+func (l *linker) Record(ctx context.Context, tx *sql.Tx, id, parent, forkSlug string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.records = append(l.records, [3]string{id, parent, forkSlug})
+	if l.recordErr != nil {
+		return l.recordErr
+	}
+	_, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS session_marks (fork TEXT);
+		INSERT INTO session_marks (fork) VALUES (?)`, forkSlug)
+	return err
+}
+
+// sandboxer is a sandbox component that answers obj, or err when it is set,
+// and keeps every call with what it saw in the transaction it was given.
+type sandboxer struct {
+	workspaces *workspace.Service
+	mu         sync.Mutex
+	obj        json.RawMessage
+	err        error
+	calls      []sandboxCall
+}
+
+// sandboxCall is one call of a sandboxer: the request, whether the fork's
+// record could be read through the transaction, and whether its repository
+// existed.
+type sandboxCall struct {
+	req           fork.SandboxRequest
+	visible, repo bool
+}
+
+// set changes the sandboxer under its lock.
+func (s *sandboxer) set(fn func(*sandboxer)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s)
+}
+
+// called is the sandboxer's calls so far.
+func (s *sandboxer) called() []sandboxCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.calls)
+}
+
+func (s *sandboxer) CreateSandbox(ctx context.Context, tx *sql.Tx, req fork.SandboxRequest) (json.RawMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, visible, err := fork.BySlug(ctx, tx, req.Fork.Slug)
+	if err != nil {
+		return nil, err
+	}
+	_, statErr := os.Stat(s.workspaces.RepoPath(req.Fork.Slug))
+	s.calls = append(s.calls, sandboxCall{req, visible, statErr == nil})
+	return s.obj, s.err
+}
+
+// collaborate registers l and s, each when not nil, on the fork component
+// of the hub being composed.
+func collaborate(l *linker, s *sandboxer) func(*hub.Composition) {
+	return func(c *hub.Composition) {
+		if l != nil {
+			c.Forks().RegisterSessionLinker(l)
+		}
+		if s != nil {
+			s.workspaces = c.Workspaces()
+			c.Forks().RegisterSandbox(s)
+		}
+	}
 }

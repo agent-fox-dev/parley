@@ -69,6 +69,10 @@ type Component struct {
 	// createLocks holds a *sync.Mutex per parent slug, held by a create of
 	// a fork of that parent from its name check to its commit.
 	createLocks sync.Map
+	// linker and sandbox are the collaborators other features register,
+	// nil while none is: no session exists, and sandboxes are disabled.
+	linker  SessionLinker
+	sandbox SandboxCreator
 }
 
 // Bind binds the component to d. It is called once, before the hub serves.

@@ -97,3 +97,23 @@ anything else is checked, and passes the minting component the instant of
 the fork's creation (whole seconds) plus that duration. Without `expires` it
 passes the lifetime 0, so the token never expires (`expires_at` `null`), as
 the package says, rather than the component's default of 90 days.
+
+## The shapes of the session linker and the sandbox component
+
+The package says the session-linking check answers "accepted (with the
+lower-case id), refused or failed", and that the sandbox component takes
+the caller, the fork, the raw `sandbox` member and the fork's `session_id`
+and `purpose`. In `internal/fork/collaborators.go`, `SessionLinker.Check`
+returns the lower-case id, an error matching `fork.ErrUnknownSession` for a
+refusal (`400 unknown_session`), or any other error for a failure (`500
+internal`); `SessionLinker.Record` takes the transaction, the session id,
+the parent's slug and the fork's slug. `SandboxCreator.CreateSandbox` takes
+the context, the transaction and one `fork.SandboxRequest` holding the
+other five. Both are registered on the component with
+`RegisterSessionLinker` and `RegisterSandbox` (nil removes one), reached
+through `Composition.Forks()`.
+
+Where the package is silent: a sandbox component that answers something
+other than a JSON object, without an error, fails the create with `500
+internal` inside the transaction, so that a fork once committed is always
+answered `201` with a valid body.
