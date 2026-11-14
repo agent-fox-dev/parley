@@ -1061,6 +1061,81 @@ authenticates, cannot be changed. A refused request changes nothing.
 | `404` `not_found` | the caller's user has no token with this id (`token not found`) |
 | `409` `conflict` | the token is revoked (`token is revoked`) or expired (`token is expired`) |
 
+## `POST /api/v1/workspaces`
+
+Registers a git repository as a workspace owned by the caller's user. It
+takes an API key or a PAT and declares the scope `workspaces:write` for a
+PAT. It is a create route (see [Idempotency](#idempotency)). It names no
+workspace, so a PAT bound to a workspace is refused before the scope check
+(see [Workspace-bound tokens](#workspace-bound-tokens)).
+
+The body is a JSON object; members the route does not read are ignored, and
+a member whose value is `null` counts as absent:
+
+| Member | Required | Value |
+|---|---|---|
+| `slug` | yes | a string of 3 to 64 characters of `a` to `z`, digits and hyphens, starting with a letter, ending with a letter or digit, without two hyphens in a row; unique among all workspaces |
+| `git_url` | yes | a string `https://<host>/<path>` without user information, or `git@<host>:<path>` |
+| `default_branch` | no | a string, stored as given; absent, `null` until the clone takes it from origin |
+| `display_name` | no | a string; absent or empty, the slug |
+| `description` | no | a string; absent, the empty string |
+
+```json
+{"slug":"demo","git_url":"https://example.com/a.git"}
+```
+
+The checks run in this order, the first that fails answering, and a refused
+request records nothing: a bound PAT (`403` `token_bound`); a PAT without
+`workspaces:write` (`403`); the admin token (`403`), before the body is
+read, so it gets the same answer for a valid and an invalid body; the body,
+member by member in the order of the table (`400`); the caller's personal
+org, which the workspace is recorded in and of which the caller must be an
+active member; a slug that a workspace already has, in any status (`409`).
+
+The workspace is recorded with `kind` `repository`, `workspace_mode`
+`standard`, `status` `pending`, the caller as `owner_id`, the caller's
+personal org as `org_id`, `created_at` equal to `updated_at`, and the
+settings document empty. A workspace in `pending` is its own clone work.
+The workspace and a `parley.workspace.create` event are written in one
+store transaction: a failure of either, or of the commit, leaves neither
+and is answered `500` `internal` without its cause. When two requests race
+for one slug, one is answered `201` and the other `409`.
+
+The answer is the workspace object: every field of the workspace, a field
+without a value written as `null` and never left out, and `org_slug`, the
+slug of its org; `hub_url`, the workspace's git remote on the hub,
+`<[server].external_url>/git/<org_slug>/<slug>.git` with one trailing `/`
+of the external URL removed, or `null` when no external URL is configured;
+`access`, the caller's level (`owner` for the creator); and `settings`,
+every registered setting key with its effective value (`{}` while no key is
+registered).
+
+```json
+{"slug":"demo","kind":"repository","workspace_mode":"standard","git_url":"https://example.com/a.git","default_branch":null,"owner_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","org_id":"5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b","org_slug":"octocat","status":"pending","display_name":"demo","description":"","head_sha":null,"origin_head_sha":null,"clone_error":null,"last_sync_at":null,"sync_error":null,"upstream_url":null,"integration_branch":null,"upstream_head_sha":null,"parent_slug":null,"fork_point":null,"expires_at":null,"auto_change":null,"purpose":null,"session_id":null,"settings":{},"hub_url":"https://hub.example/git/octocat/demo.git","access":"owner","created_at":"2026-11-14T10:30:15Z","updated_at":"2026-11-14T10:30:15Z"}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | the workspace was recorded; the body is the workspace object |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is recorded |
+| `400` `invalid_request` | the body is refused, the message naming the member: `slug: is required`, `slug: must be a string`, `slug: must start with a letter` and the other slug rules, `git_url: is required`, `git_url: must be a string`, a `git_url:` rule, `default_branch: must be a string or null` (the same for `display_name` and `description`); or the caller has no personal org (`org_id: the caller has no personal organization`) |
+| `403` `token_bound` | a PAT bound to a workspace |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | the admin token (`a workspace needs a user as owner; the admin token cannot create one`), or a caller who is not an active member of their personal org (`the caller is not an active member of the organization`) |
+| `409` `conflict` | a workspace has the slug, whatever its status (`slug: a workspace with the slug "demo" exists`) |
+| `413` `payload_too_large` | the body is over the hub's body limit (see [Request bodies](#request-bodies)) |
+| `500` `internal` | writing the workspace or its event failed; nothing is recorded |
+
+The event has `workspace` and `resource_id` the slug, `resource_type`
+`workspace`, `actor_type` `api_key` or `pat` after the calling credential,
+`actor_id` the caller's user, and in `metadata` the workspace's `kind`,
+`git_url`, `workspace_mode` and `default_branch` (`null` when none was
+given):
+
+```json
+{"seq":12,"id":"…","type":"parley.workspace.create","time":"2026-11-14T10:30:15Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"create","session_id":null,"metadata":{"default_branch":null,"git_url":"https://example.com/a.git","kind":"repository","workspace_mode":"standard"}}
+```
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

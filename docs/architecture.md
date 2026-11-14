@@ -30,7 +30,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions and the state guard `RequireReady` (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the workspace service with `POST /api/v1/workspaces`, the one encoder of the workspace object `RenderWorkspace` and the settings registry (see Workspace records), and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -471,6 +471,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
 | `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: none) |
+| `AdjustWorkspace(func(*workspace.Deps))` | a change to the workspace service's dependencies, applied after the start hook `workspaces` builds them and before it binds them, in the order added; tests replace a collaborator with it |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
 `composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
@@ -498,6 +499,11 @@ start hook on, if it is listed after `composeSecrets`, or from
 (`internal/hub/events.go`) creates: a part keeps it when it is composed and
 emits through it from its start hook on, if it is listed after
 `composeEvents`, or from `Options.Compose` (see [Hub events](#hub-events)).
+
+`(*Composition).Workspaces()` returns the `*workspace.Service` that
+`composeWorkspaces` (`internal/hub/workspace.go`) creates: a part keeps it
+when it is composed and registers its setting keys on
+`Workspaces().Settings()` then (see [Workspace records](#workspace-records)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -1108,7 +1114,10 @@ of the request. `PATCH /user` reads the body with `fullNameOf(r)`, the rule
 the REST API's Org object (`id`, `name`, `slug`, `url`, `owner_id`, `null`
 when `OwnerID` is empty, `status`, `created_at`, `updated_at`);
 `identity.OrgByID(ctx, q, id)` and `identity.OrgBySlug(ctx, q, slug)`
-return an org or `identity.ErrNotFound`, comparing the slug exactly; and
+return an org or `identity.ErrNotFound`, comparing the slug exactly;
+`identity.PersonalOrg(ctx, q, userID, username)` returns the user's
+personal org, the one owned by the user and named after the username as
+`CreateUserAndPersonalOrg` makes it, or `identity.ErrNotFound`; and
 `identity.Memberships(ctx, q, orgID)` returns an org's
 `identity.Membership`s (`OrgID`, `UserID`, `CreatedAt`), oldest first, then
 by user id; `identity.ActiveOrgIDs(ctx, q, userID)` returns, by id, the
@@ -1651,7 +1660,7 @@ settings document as one JSON object, default `'{}'`), `created_at` and
 (`''`, `reclone`, `archive` or `delete`, a `CHECK` constraint). Times are
 UnixNano integers. The slug stays the primary key, unique across
 repositories and forks. Origin heads have no column: they are refs of the
-workspace's copy. No part of the hub registers the step yet.
+workspace's copy. `composeWorkspaces` registers the step.
 
 `internal/workspace/record.go` holds `workspace.Workspace`, every field of
 a workspace (a nil pointer for a null field) plus `InstanceID`, `Marker` and
@@ -1674,6 +1683,54 @@ functions take the caller's transaction:
   `DefaultBranch`, `HeadSHA`, `OriginHeadSHA`, `CloneError`, `UpdatedAt`),
   every one of them, a nil one as NULL, through an `Execer` (a `*sql.Tx` or
   the `*sql.DB`); an unknown slug is `workspace.ErrNotFound`.
+
+`internal/hub/workspace.go` adds the part `composeWorkspaces`, after
+`composeSecrets`. It creates the `*workspace.Service`, registers
+`workspace.SchemaStep` and the workspace routes, and adds the start hook
+`workspaces`, which builds the service's `workspace.Deps` (the stores, the
+secret and event components through the `Secrets` and `Events` interfaces,
+the hub's scrubber, logger and clock, `[server].external_url` as
+`ExternalURL` and `[workspace].path` as `Root`), applies every function
+`AdjustWorkspace` added, and binds the service with `Bind`. `Deps` also
+holds `Lister`, an `OriginLister` that lists an origin's refs with a
+`Credential`, and `Notify`, called with the slug after a create commits so
+that clone work is picked up; the hub leaves both unset so far.
+
+`internal/workspace/create.go` serves `POST /api/v1/workspaces` (scope
+`workspaces:write`, a create route, no workspace need; see
+[api.md](api.md#post-apiv1workspaces)). The handler refuses the admin token
+first, reads the body by an ordered list of members (`createMembers`, each
+answering `400 invalid_request` with `<member>: <reason>`), takes the
+caller's personal org (`identity.PersonalOrg`) and checks the caller is an
+active member of it, answers a slug in use `409 conflict` after a read with
+`access.RecordBySlug`, and then, in one store transaction, inserts the
+record with `workspace.Insert` (status `pending`, a fresh instance id,
+`created_at` = `updated_at` cut to the second) and writes
+`parley.workspace.create` through the event component. A slug taken by a
+racing request is `access.ErrDuplicateSlug` from the insert and the same
+`409`. The pending record is the clone work; there is no separate queue.
+
+`internal/workspace/response.go` holds `(*Service).RenderWorkspace(ctx, w,
+level)`, the one place a workspace object (`workspace.Object`) is built:
+every field of the record, a nil one encoded as `null`, plus `org_slug`
+(read from the workspace's org), `hub_url` (`ExternalURL` without one
+trailing slash, then `/git/<org_slug>/<slug>.git`, or `null` without an
+external URL), `access` (the caller's level) and `settings`. A record of
+kind `fork` goes last through the `ForkView` registered with
+`(*Service).RegisterForkView`, so the fork feature completes its object
+without this package importing it.
+
+`internal/workspace/settings.go` holds `SettingsRegistry`, the setting keys
+in registration order, empty in its zero value; the service holds one,
+returned by `(*Service).Settings()`. `RegisterSetting(SettingKey)` adds a
+key with its `Name`, its `Default` (a function of the default branch) and
+its `Validate` rule, refusing a duplicate or incomplete key;
+`ApplySettings(stored, raw)` applies a request's settings value (`null`
+resets every key; otherwise an object whose unknown keys are refused with
+`unknown setting "<key>"`, a `null` value resets that key, every other
+value passes its key's rule); `EffectiveSettings(stored, defaultBranch)`
+returns every registered key with its stored value or its default. No key
+is registered yet, so every workspace object shows `settings` as `{}`.
 
 `internal/workspace/guard.go` holds `RequireReady(w)`, the state check of
 every route that needs a workspace's repository. It reads the marker first:

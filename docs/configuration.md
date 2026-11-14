@@ -70,7 +70,7 @@ It never quotes a variable's value.
 |---|---|---|---|
 | `[server].bind` | string | `"0.0.0.0"` | the address the hub listens on; not empty |
 | `[server].port` | integer | `8080` | the TCP port the hub listens on, `0` to `65535`; `0` lets the system choose |
-| `[server].external_url` | string | `""` | the URL clients reach the hub at; empty, or an absolute `http` or `https` URL |
+| `[server].external_url` | string | `""` | the URL clients reach the hub at; empty, or an absolute `http` or `https` URL. A workspace object's `hub_url` is built from it, and is `null` while it is empty (see [api.md](api.md#post-apiv1workspaces)) |
 | `[server].max_body_size` | string | `"1MB"` | the largest REST request body: a positive whole number followed by `KB`, `MB` or `GB`, in any letter case, in powers of 1024; a larger body is answered `413` (see [api.md](api.md#request-bodies)) |
 | `[database].path` | string | see below | the transactional store's file; its directory is the data directory |
 | `[workspace].path` | string | see below | the workspace root, where the repositories live |
