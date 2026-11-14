@@ -622,17 +622,27 @@ const secretKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 // remover keeps what a fork's removal asked of the collaborators it calls:
 // registered in the teardown set as a remover of owned data and as the
 // session closer, and on the fork component as its sandbox collaborator. A
-// step fails while its fail flag is set; the event writer fails while fault
-// holds "event", and the discard of a fork's repository while failDiscard
-// is set.
+// step fails while its fail flag is set, for the fork only alone when only
+// is set; the event writer fails while fault holds "event", and the discard
+// of a fork's repository while failDiscard is set. during, when set, is
+// called with the fork's slug as its sandboxes are deleted, before the
+// delete fails or succeeds.
 type remover struct {
 	store                                func() *sql.DB
 	mu                                   sync.Mutex
 	failRemove, failSandbox, failDiscard bool
+	only                                 string
+	during                               func(slug string)
 	removed                              []string
 	closed                               [][2]string
 	sandboxes                            []sandboxDelete
 	fault                                atomic.Value
+}
+
+// fails reports whether a step whose fail flag is flag fails for the fork
+// slug; the caller holds the lock.
+func (r *remover) fails(flag bool, slug string) bool {
+	return flag && (r.only == "" || r.only == slug)
 }
 
 // sandboxDelete is one call of the sandbox collaborator's delete, and
@@ -664,7 +674,7 @@ func (r *remover) remove(_ context.Context, _ *sql.Tx, slug string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.removed = append(r.removed, slug)
-	if r.failRemove {
+	if r.fails(r.failRemove, slug) {
 		return errors.New("injected remover fault")
 	}
 	return nil
@@ -685,9 +695,15 @@ func (r *remover) DeleteSandboxes(ctx context.Context, slug, reason string, chec
 		return err
 	}
 	r.mu.Lock()
+	during := r.during
+	r.mu.Unlock()
+	if during != nil {
+		during(slug)
+	}
+	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sandboxes = append(r.sandboxes, sandboxDelete{slug, reason, checkpoint, found})
-	if r.failSandbox {
+	if r.fails(r.failSandbox, slug) {
 		return errors.New("injected sandbox fault")
 	}
 	return nil
@@ -696,8 +712,9 @@ func (r *remover) DeleteSandboxes(ctx context.Context, slug, reason string, chec
 func (r *remover) HasLiveSandbox(context.Context, string) (bool, error) { return false, nil }
 
 // newRemovalWorld is a world with a current secret key whose fork removals
-// call r as their collaborators.
-func newRemovalWorld(t *testing.T) (*world, *remover) {
+// call r as their collaborators, with more run on the hub's composition
+// after that.
+func newRemovalWorld(t *testing.T, more ...func(*hub.Composition)) (*world, *remover) {
 	t.Helper()
 	r := &remover{}
 	w := newWorldWith(t, hubtest.Config{Env: map[string]string{secret.EnvCurrentKey: secretKey}, Compose: func(c *hub.Composition) {
@@ -716,8 +733,12 @@ func newRemovalWorld(t *testing.T) (*world, *remover) {
 				return gitrepo.Remove(dir)
 			}
 		})
+		for _, fn := range more {
+			fn(c)
+		}
 	}})
-	r.store = w.Store.Main
+	// Read at each call, since a restart opens the store again.
+	r.store = func() *sql.DB { return w.Store.Main() }
 	return w, r
 }
 

@@ -2,12 +2,24 @@ package hub
 
 import (
 	"context"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/fork"
 )
 
-// forksHook is the name of the start hook that binds the fork component.
-const forksHook = "forks"
+const (
+	// forksHook is the name of the start hook that binds the fork
+	// component.
+	forksHook = "forks"
+	// forkSweepWork is the name of the background work that runs the fork
+	// sweep, and forkExpiryTask that of its maintenance task, under which
+	// package maintenance orders it.
+	forkSweepWork  = "fork_sweep"
+	forkExpiryTask = "fork_expiry"
+	// forkSweepGrace is how long the stop waits for the sweep: a removal
+	// that has begun runs to its commit or rollback, and its discard.
+	forkSweepGrace = 10 * time.Second
+)
 
 // composeForks adds the task forks: the fork fields of the workspace
 // records, after the workspace part's; the fork view of the workspace
@@ -38,6 +50,12 @@ const forksHook = "forks"
 // its own file; none is registered here, so a fork has no sandboxes to
 // delete. The pending discards of removed forks' repositories are a table
 // of their own, after the fork fields.
+//
+// The sweep that removes the forks whose lifetime has ended runs as
+// background work once the component is bound, one pass at once and one
+// every minute, and stops at the stop before the stores close; each pass of
+// the maintenance loop runs one more as the task fork_expiry. The
+// component never runs two passes at once.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp
@@ -61,6 +79,11 @@ func composeForks(c *Composition) {
 			adjust(&d)
 		}
 		comp.Bind(d)
+		return nil
+	})
+	c.AddBackgroundWork(forkSweepWork, forkSweepGrace, func(ctx context.Context, _ *Runtime) { comp.RunSweep(ctx) })
+	c.AddMaintenanceTask(forkExpiryTask, func(ctx context.Context, _ *Runtime) error {
+		comp.RunPass(ctx)
 		return nil
 	})
 }

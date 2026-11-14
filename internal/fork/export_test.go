@@ -3,6 +3,7 @@ package fork
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
@@ -15,4 +16,10 @@ func (c *Component) RemoveWithCause(ctx context.Context, slug, cause string, act
 		_, err := c.removeIn(ctx, tx, slug, removal{cause: removalCause(cause), actor: actor, expiry: "ttl"})
 		return err
 	})
+}
+
+// SweepLoop runs pass at once, then once per tick of ticks, until ctx is
+// cancelled, as the sweep does with its passes.
+func SweepLoop(ctx context.Context, ticks <-chan time.Time, pass func(context.Context)) {
+	sweepLoop(ctx, ticks, pass)
 }

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -140,6 +141,12 @@ func TestDeleteFork_DeletesTheSandboxesFirst(t *testing.T) {
 		"DELETE": func(t *testing.T, slug string) {
 			if a := w.call(t, http.MethodDelete, "/workspaces/"+slug, w.devKey, nil); a.status != http.StatusNoContent {
 				t.Fatalf("DELETE = %d %s, want 204", a.status, a.body)
+			}
+		},
+		"sweep pass": func(t *testing.T, slug string) {
+			w.exec(t, `UPDATE workspaces SET expires_at = ? WHERE slug = ?`, w.clock().Add(-time.Second).UnixNano(), slug)
+			if res := w.pass(t, context.Background()); !slices.Contains(res.Removed, slug) {
+				t.Fatalf("pass = %+v, want %s removed", res, slug)
 			}
 		},
 	} {

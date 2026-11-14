@@ -1975,6 +1975,38 @@ caller as actor, `metadata.parent_slug` the parent's slug, no
 | `409` `workspace_busy` | the parent is `pending` or `cloning` (`workspace "<parent>" is busy: its clone has not finished; try again later`) or a reclone, archive or delete runs on it (`workspace "<parent>" is busy: a <operation> is running; try again later`): the fork is unchanged |
 | `500` `internal` | the sandboxes could not be deleted, or a step of the removal failed (`internal error`): the fork is unchanged |
 
+### Expiry of a task fork
+
+A fork whose `expires_at` has passed stays as it was, served by `GET` and
+open to a new lifetime with `ttl` in
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug), until a
+pass of the hub's sweep removes it. The sweep runs one pass right after the
+hub starts, one every 60 seconds and one in each hourly maintenance pass
+(the task `fork_expiry`), never two at once. A pass removes every fork
+whose `expires_at` is at or before its time, the forks of an `archived`
+parent included, as a delete does: its sandboxes first, then in one store
+transaction its bound tokens, the data other features keep for it, its
+sessions (ended with the reason `fork expired`) and its record, then its
+repository. A fork whose parent is `pending` or `cloning` or under a
+reclone, archive or delete is left for a later pass, and so is a fork whose
+removal fails, whole; the failure is logged with the fork's slug. A
+repository that could not be removed after a delete or an expiry is
+removed by a later pass, unless a fork has been created under the same
+slug again.
+
+Each removal writes one `parley.fork.expire` event and no
+`parley.workspace.delete` event: actor `system`, `workspace` and
+`resource_id` the fork's slug, `resource_type` `workspace`, `session_id`
+the session the fork was created in (`null` for none), and `metadata`
+with `parent_slug`, `reason` `ttl`, `expires_at` the fork's `expires_at`
+when it was removed, and `revoked_tokens`, the ids of the tokens bound to
+the fork that were revoked, in ascending order. The event is visible to
+the readers of the parent's events.
+
+```json
+{"seq":21,"id":"…","type":"parley.fork.expire","time":"2026-11-21T11:00:30Z","workspace":"demo--t1","actor_type":"system","actor_id":null,"resource_type":"workspace","resource_id":"demo--t1","action":"expire","session_id":null,"metadata":{"parent_slug":"demo","reason":"ttl","expires_at":"2026-11-21T11:00:00Z","revoked_tokens":["tok1"]}}
+```
+
 ## `POST /api/v1/workspaces/{slug}/forks`
 
 Creates a task fork of the repository workspace `{slug}`, its parent: a

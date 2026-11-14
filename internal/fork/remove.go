@@ -50,6 +50,10 @@ var DiscardStep = store.Step{
 // never existed, or another removal took it first.
 var errGone = errors.New("fork not found")
 
+// errNotDue is the result of an expiry of a fork that is no longer due,
+// such as one given a new lifetime since the sweep read it.
+var errNotDue = errors.New("fork not due for expiry")
+
 // removalCause is why a fork is removed. It decides the event the removal
 // writes and the reason the session closer is given.
 type removalCause string
@@ -71,12 +75,22 @@ func (c removalCause) sessionReason() string {
 }
 
 // removal is one removal of a fork: its cause, the caller who asked for it
-// (for a delete, alone or with the parent), and for an expiry the reason
-// its event gives, ttl or landed.
+// (for a delete, alone or with the parent), for an expiry the reason its
+// event gives, ttl or landed, and the rule that says whether the fork, as
+// read, is still due, nil for always.
 type removal struct {
 	cause  removalCause
 	actor  identity.Principal
 	expiry string
+	due    func(Fork) bool
+}
+
+// notDue is errNotDue when rm has a rule by which the fork f is not due.
+func (rm removal) notDue(f Fork) error {
+	if rm.due != nil && !rm.due(f) {
+		return errNotDue
+	}
+	return nil
 }
 
 // deleteEventMeta is the metadata of a fork's parley.workspace.delete
@@ -192,6 +206,9 @@ func (c *Component) remove(ctx context.Context, slug string, rm removal) error {
 	case !found:
 		return errGone
 	}
+	if err := rm.notDue(f); err != nil {
+		return err
+	}
 	if err := removalRefusal(ctx, c.deps.Store.Main(), f); err != nil {
 		return err
 	}
@@ -219,7 +236,8 @@ func (c *Component) remove(ctx context.Context, slug string, rm removal) error {
 // revokes the tokens bound to it, runs every remover of owned data and ends
 // its sessions; then its record; then its event. A fork with no record is
 // errGone. The record's deletion decides between two removals of one fork:
-// the one that deletes no row is errGone and writes nothing. A removal with
+// the one that deletes no row is errGone and writes nothing. An expiry of a
+// fork that, read through tx, is no longer due is errNotDue. A removal with
 // its parent does not judge the parent, whose delete is running.
 func (c *Component) removeIn(ctx context.Context, tx *sql.Tx, slug string, rm removal) (Fork, error) {
 	f, found, err := BySlug(ctx, tx, slug)
@@ -228,6 +246,9 @@ func (c *Component) removeIn(ctx context.Context, tx *sql.Tx, slug string, rm re
 		return Fork{}, err
 	case !found:
 		return Fork{}, errGone
+	}
+	if err := rm.notDue(f); err != nil {
+		return Fork{}, err
 	}
 	if rm.cause != causeParentDeleted {
 		if err := removalRefusal(ctx, tx, f); err != nil {

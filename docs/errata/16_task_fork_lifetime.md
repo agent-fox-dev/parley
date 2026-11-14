@@ -68,3 +68,42 @@ the hub is composed and reading `Deps.Now` and `Deps.Limits` of the bound
 component each time it is called. Its refusal of a value that is not a
 string (`null`, a number, a boolean) is `ttl: must be a string`; a string
 `ResolveTTL` refuses is answered with `ResolveTTL`'s own `400`.
+
+## The sweep's maintenance task is `fork_expiry`
+
+The package names the maintenance task of the sweep `fork expiry`. Package
+`internal/maintenance` already orders its known tasks by name, and the name
+it holds for this one is `fork_expiry`; the task is registered under that
+name, with `Composition.AddMaintenanceTask` in `internal/hub/fork.go`, so
+that it runs in its place in a pass. `internal/maintenance` is unchanged:
+the sweep's loop is background work of the hub
+(`Composition.AddBackgroundWork`, `fork_sweep`), not a part of that
+package.
+
+## A fork given a new lifetime during a pass is not expired
+
+The package has a pass remove every fork whose `expires_at` was at or
+before its time when it read them. A `ttl` update can land between that
+read and the fork's removal. The removal therefore reads the fork again,
+before its sandboxes are deleted and inside the removal's transaction, and
+leaves it alone when its `expires_at` is no longer at or before the pass's
+time; the pass writes no event for it and logs nothing.
+
+## A pending discard yields to a fork created again under the slug
+
+The package has every later pass repeat a failed discard until it succeeds.
+A fork may be created again under the removed fork's slug before then; its
+create replaces whatever it finds at the fork's place with its own
+repository. A pending discard is therefore repeated only while no workspace
+record has the slug, under the create lock of the parent, and its record is
+dropped without a removal once one does, so that the new fork keeps its
+repository.
+
+## The removal a shutdown interrupts runs on to its end
+
+The package has the sweep complete or roll back the removal in progress
+when the hub stops. The pass checks its context before each fork, and the
+removal of a fork it has begun, the sandbox deletion included, runs on a
+context the stop does not cancel, so that it reaches its commit or
+rollback and its discard. The hub waits for the sweep up to 10 seconds
+(`fork_sweep`'s grace) before it closes the stores.
