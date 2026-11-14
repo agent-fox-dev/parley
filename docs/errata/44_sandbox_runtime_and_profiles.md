@@ -177,26 +177,23 @@ present while the sandbox exists.
 ## The OpenShell implementation's checks
 
 The contract (`runtimetest.RunContract`) runs against the implementation
-over the SDK's in-memory client; the assertions about what that client does
-not implement (provider profiles, exec, file transfer, policy drafts) are
-skipped. The contract creates the sandboxes of the tests whose subject is
-not what a sandbox is created with without a working directory or a base
-document (`plainSpec`), so that those tests (create, list and delete, wait
-and stop, the workspace boundary, the error kinds, every operation of an
-unreachable backend) hold here; the tests of the policy value a sandbox was
-created with, and those that use its files, create it in `/w` with a base
-document (`contractSpec`), which this implementation refuses as
-`unsupported`, so they are skipped, as is the start of the stop and start
-test, which carries a policy value. Creation and start with only what the
-SDK can carry, and their refusal otherwise without an SDK call, are tested
-with the implementation. The contract's check that an installed provider profile is returned
-by get, paths included, cannot hold for this implementation against a
-gateway that keeps profiles, because the paths are not sent; the provider
-operations are instead tested against `openshelltest.Gateway`, which keeps
-profiles, with the contract's other assertions about them (create or
-replace, list with labels and without values, attach, detach, an unknown
-provider not found, a deleted provider not found) and the profile reported
-without its paths.
+over the test gateway, with what the SDK's in-memory client does not
+implement (exec, file transfer, policy drafts) added in the package's tests:
+commands run as processes of the host, and files and draft chunks are kept
+in memory. The gateway holds the provider profile `anthropic`, with one
+credential, which the contract's providers name, as a gateway that ships it
+does. Only the policy value test creates its sandbox in `/w` with a base
+document (`contractSpec`); this implementation refuses that as
+`unsupported`, so the test is skipped, as is the start of the stop and start
+test, which carries a policy value, and every assertion about an operation
+the SDK lacks. Every other test creates its sandbox without either
+(`plainSpec`) and runs here: exec, the exec stream, the terminal, upload and
+download, providers, provider profiles and proposals included. The backend
+sets `EndpointsWithoutPaths`, so the contract expects an installed provider
+profile back from get without its endpoints' paths, which are not sent (see
+the previous entry), and with the rest of it unchanged. Creation and start
+with only what the SDK can carry, and their refusal otherwise without an SDK
+call, are tested with the implementation.
 The error-kind rows that need a gateway (an image the gateway
 refuses, an unauthenticated answer, a server error, a refused connection)
 are checked with SDK errors given to the client and, for the refused

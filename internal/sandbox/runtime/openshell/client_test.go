@@ -26,16 +26,14 @@ import (
 func TestClient_PassesTheContract(t *testing.T) {
 	t.Parallel()
 	runtimetest.RunContract(t, func(t *testing.T) runtimetest.Backend {
-		// Over the SDK's in-memory client alone: it keeps no provider
-		// profiles, so the operations that need one are skipped here and
-		// tested over the test gateway's profiles below.
-		g := newGateway()
-		g.noProfiles = true
+		g, drafts := newContractGateway(t)
 		return runtimetest.Backend{
 			Client: func(workspace string, rec runtime.Recorder) runtime.Client {
 				return openshell.NewWithClient(g, workspace, openshell.Deps{Scrubber: scrub.New(), Recorder: rec})
 			},
-			SetUnreachable: g.SetUnreachable,
+			SetUnreachable:        g.SetUnreachable,
+			AddProposal:           drafts.add,
+			EndpointsWithoutPaths: true,
 		}
 	})
 }

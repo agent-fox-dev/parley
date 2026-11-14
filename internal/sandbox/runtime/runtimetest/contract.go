@@ -33,6 +33,12 @@ type Backend struct {
 	// AddProposal, when not nil, adds a pending proposal to a sandbox of
 	// workspace and returns its id.
 	AddProposal func(workspace string, p runtime.Proposal) string
+	// EndpointsWithoutPaths says that the backend keeps a provider profile's
+	// endpoints without their paths, as the OpenShell implementation does
+	// because its SDK's endpoint has no path (a declared deviation). Get is
+	// then expected to return the installed profile with every endpoint's
+	// paths left out, and the rest of it unchanged.
+	EndpointsWithoutPaths bool
 }
 
 // The workspaces the contract's clients act in.
@@ -434,8 +440,15 @@ func contractProviderProfile(t *testing.T, b Backend) {
 	got, err := c.GetProviderProfile(ctx, p.ID)
 	skipIfUnsupported(t, err, "GetProviderProfile")
 	require(t, err, "GetProviderProfile")
-	if !reflect.DeepEqual(got, p) {
-		t.Fatalf("GetProviderProfile = %+v, want %+v", got, p)
+	want := p
+	if b.EndpointsWithoutPaths {
+		want.Endpoints = slices.Clone(p.Endpoints)
+		for i := range want.Endpoints {
+			want.Endpoints[i].Paths = nil
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetProviderProfile = %+v, want %+v", got, want)
 	}
 }
 
@@ -710,7 +723,7 @@ func closeIfOpen[S interface{ Close() error }](s S, err error) error {
 
 // contractSpec is the sandbox as the hub creates one: plainSpec in the
 // working directory /w, with a base document in its policy value. The tests
-// of what a sandbox is created with, and of its files, use it.
+// of what a sandbox is created with use it.
 func contractSpec(name string) runtime.SandboxSpec {
 	spec := plainSpec(name)
 	spec.WorkDir = "/w"
@@ -753,15 +766,12 @@ func createSandbox(t *testing.T, ctx context.Context, c runtime.Client, name str
 	return name
 }
 
-// readySandbox creates the sandbox contractSpec(name), in the working
-// directory the file tests use, waits until it is ready and returns its
-// name.
+// readySandbox creates the sandbox plainSpec(name), waits until it is ready
+// and returns its name.
 func readySandbox(t *testing.T, ctx context.Context, c runtime.Client, name string) string {
 	t.Helper()
-	_, err := c.CreateSandbox(ctx, contractSpec(name))
-	skipIfUnsupported(t, err, "CreateSandbox with a working directory and a base document")
-	require(t, err, "CreateSandbox")
-	_, err = c.WaitReady(ctx, name)
+	name = createSandbox(t, ctx, c, name)
+	_, err := c.WaitReady(ctx, name)
 	if !skipped(t, err, "WaitReady") {
 		require(t, err, "WaitReady")
 	}
