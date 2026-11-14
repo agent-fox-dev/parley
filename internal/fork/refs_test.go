@@ -100,11 +100,6 @@ func TestRefs_OwnBranches(t *testing.T) {
 	}
 }
 
-// named are the branches of bs whose name is name.
-func named(bs []fork.Branch, name string) []fork.Branch {
-	return slices.DeleteFunc(slices.Clone(bs), func(b fork.Branch) bool { return b.Name != name })
-}
-
 func TestCheckBranchWrite(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, nil)

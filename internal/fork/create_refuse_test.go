@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/fork"
@@ -14,33 +13,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// wantError fails the test unless a has status and the error type typ.
-func wantError(t *testing.T, a answer, status int, typ string) {
-	t.Helper()
-	if e, _ := a.object(t, status)["error"].(map[string]any); e["error_type"] != typ {
-		t.Errorf("error = %v, want %d %s", e, status, typ)
-	}
-}
-
-// postAll sends n creates with body at once and counts the answers by
-// status.
-func (w *world) postAll(t *testing.T, n int, body any) map[int]int {
-	t.Helper()
-	var mu sync.Mutex
-	counts := map[int]int{}
-	var wg sync.WaitGroup
-	for range n {
-		wg.Go(func() {
-			status, _ := w.Call(t, http.MethodPost, "/api/v1"+forksPath, w.devKey, body)
-			mu.Lock()
-			defer mu.Unlock()
-			counts[status]++
-		})
-	}
-	wg.Wait()
-	return counts
-}
 
 func TestCreate_RefusesAdminToken(t *testing.T) {
 	t.Parallel()
@@ -227,7 +199,6 @@ func TestCreate_RefusalOrder(t *testing.T) {
 		{"body, then the session, with a linker", "demo", false, true, map[string]any{"name": "BAD", "session_id": session}, http.StatusBadRequest, "invalid_request"},
 		{"session, then a fork as parent, with a linker", "demo--f1", false, true, map[string]any{"session_id": session}, http.StatusBadRequest, "unknown_session"},
 		{"token, then the sandbox, with a component", "demo", false, true, map[string]any{"name": "t1", "token": badToken, "sandbox": map[string]any{}}, http.StatusBadRequest, "invalid_request"},
-		{"sandbox", "demo", false, false, map[string]any{"name": "t2", "sandbox": map[string]any{}}, http.StatusNotFound, "sandboxes_disabled"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			on := w

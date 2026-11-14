@@ -58,18 +58,6 @@ func newFork(t *testing.T, parent string) string {
 	return fork
 }
 
-// objectCounts is what git count-objects -v reports for the repository at
-// dir, by field.
-func objectCounts(t *testing.T, dir string) map[string]string {
-	t.Helper()
-	counts := map[string]string{}
-	for line := range strings.Lines(gitrepotest.Git(t, dir, "count-objects", "-v")) {
-		k, v, _ := strings.Cut(strings.TrimSpace(line), ": ")
-		counts[k] = v
-	}
-	return counts
-}
-
 // readable reports whether git cat-file -e finds object id in the
 // repository at dir.
 func readable(dir, id string) bool {
@@ -90,15 +78,15 @@ func TestCreateFork_CopiesNothing(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			parent, _, _, _ := forkParent(t, c.commits)
-			before, refs := objectCounts(t, parent), gitrepotest.Refs(t, parent, "")
+			before, refs := gitrepotest.ObjectCounts(t, parent), gitrepotest.Refs(t, parent, "")
 			if packed := before["in-pack"] != "0"; packed != c.packed {
 				t.Fatalf("the parent's objects are %v, want packed %v", before, c.packed)
 			}
 			fork := newFork(t, parent)
-			if got := objectCounts(t, fork); got["count"] != "0" || got["in-pack"] != "0" {
+			if got := gitrepotest.ObjectCounts(t, fork); got["count"] != "0" || got["in-pack"] != "0" {
 				t.Errorf("the fork's objects = %v, want count 0 and in-pack 0", got)
 			}
-			if got := objectCounts(t, parent); !maps.Equal(got, before) {
+			if got := gitrepotest.ObjectCounts(t, parent); !maps.Equal(got, before) {
 				t.Errorf("the parent's objects after the fork = %v, want %v", got, before)
 			}
 			assertRefs(t, "the parent's refs after the fork", gitrepotest.Refs(t, parent, ""), refs)
@@ -130,24 +118,12 @@ func TestCreateFork_SharesHistory(t *testing.T) {
 
 func TestCreateFork_OwnWorkStaysInFork(t *testing.T) {
 	t.Parallel()
-	parent, mainHead, _, _ := forkParent(t, 3)
+	parent, _, _, _ := forkParent(t, 3)
 	fork := newFork(t, parent)
 	refs := gitrepotest.Refs(t, parent, "")
 	// A client holding the parent's main commits one changed file on top of
 	// it and pushes the commit to the new branch task of the fork.
-	client := filepath.Join(t.TempDir(), "client.git")
-	gitrepotest.Git(t, client, "init", "--quiet", "--bare", client)
-	gitrepotest.Git(t, client, "fetch", "--quiet", parent, "main:main")
-	blob, err := gitrepotest.Run(client, "changed\n", "hash-object", "-w", "--stdin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tree, err := gitrepotest.Run(client, "100644 blob "+blob+"\tREADME\n", "mktree")
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := gitrepotest.Git(t, client, "commit-tree", tree, "-p", mainHead, "-m", "task")
-	gitrepotest.Git(t, client, "push", "--quiet", fork, id+":refs/heads/task")
+	id := gitrepotest.PushCommit(t, parent, fork, "task", "changed\n")
 
 	if got := gitrepotest.Git(t, fork, "rev-parse", "refs/heads/task"); got != id {
 		t.Errorf("the fork's task = %s, want %s", got, id)
@@ -156,7 +132,7 @@ func TestCreateFork_OwnWorkStaysInFork(t *testing.T) {
 	if readable(parent, id) {
 		t.Errorf("the commit %s pushed to the fork is readable in the parent", id)
 	}
-	if got := objectCounts(t, fork)["count"]; got != "3" {
+	if got := gitrepotest.ObjectCounts(t, fork)["count"]; got != "3" {
 		t.Errorf("the fork holds %s objects, want the 3 pushed (commit, tree, blob)", got)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"maps"
 	"net/http"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -63,17 +62,13 @@ func (h *forkHub) runAs(t *testing.T, credential string, args ...string) ran {
 }
 
 // repo is the directory of the hub's repository of the workspace slug.
-func (h *forkHub) repo(slug string) string { return filepath.Join(h.root, slug+".git") }
+func (h *forkHub) repo(slug string) string { return h.comp.Workspaces().RepoPath(slug) }
 
 // objectCounts are the loose objects and the packed ones of the repository
-// dir, as git count-objects counts them.
+// dir.
 func objectCounts(t *testing.T, dir string) (loose, packed string) {
 	t.Helper()
-	counts := map[string]string{}
-	for line := range strings.Lines(gitrepotest.Git(t, dir, "count-objects", "-v")) {
-		key, value, _ := strings.Cut(strings.TrimSpace(line), ": ")
-		counts[key] = value
-	}
+	counts := gitrepotest.ObjectCounts(t, dir)
 	return counts["count"], counts["in-pack"]
 }
 
@@ -124,19 +119,7 @@ func TestForkWithTokenEndToEnd(t *testing.T) {
 	}
 	// A client holding the parent's main commits one changed file on top of
 	// it and pushes the commit to the new branch work of the fork.
-	client := filepath.Join(t.TempDir(), "client.git")
-	gitrepotest.Git(t, client, "init", "--quiet", "--bare", client)
-	gitrepotest.Git(t, client, "fetch", "--quiet", parentDir, "main:main")
-	blob, err := gitrepotest.Run(client, "work\n", "hash-object", "-w", "--stdin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tree, err := gitrepotest.Run(client, "100644 blob "+blob+"\tREADME\n", "mktree")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pushed := gitrepotest.Git(t, client, "commit-tree", tree, "-p", head, "-m", "work")
-	gitrepotest.Git(t, client, "push", "--quiet", dir, pushed+":refs/heads/work")
+	gitrepotest.PushCommit(t, parentDir, dir, "work", "work\n")
 	if loose, packed := objectCounts(t, dir); loose != "3" || packed != "0" {
 		t.Errorf("after the push the fork holds %s loose and %s packed objects, want the pushed commit's 3 (commit, tree, blob)", loose, packed)
 	}
@@ -197,7 +180,8 @@ func TestMemberForkFollowsParent(t *testing.T) {
 		t.Errorf("a write check of the fork's main = %v, want tracking_branch", err)
 	}
 
-	if status, body := h.Call(t, http.MethodPatch, "/api/v1/workspaces/demo", h.memberKey, map[string]any{"description": "x"}); status != http.StatusForbidden {
-		t.Errorf("the member's update of demo = %d %s, want 403", status, body)
+	status, body = h.Call(t, http.MethodPatch, "/api/v1/workspaces/demo", h.memberKey, map[string]any{"description": "x"})
+	if status != http.StatusForbidden || str(decoded(t, body), "error", "error_type") != "forbidden" {
+		t.Errorf("the member's update of demo = %d %s, want 403 forbidden", status, body)
 	}
 }

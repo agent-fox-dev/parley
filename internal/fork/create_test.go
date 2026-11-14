@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -24,37 +24,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-const forksPath = "/workspaces/demo/forks"
-
-// created is the answer a, which must be 201, with its workspace member.
-func created(t *testing.T, a answer) (body, ws map[string]any) {
-	t.Helper()
-	body = a.object(t, http.StatusCreated)
-	ws, _ = body["workspace"].(map[string]any)
-	return body, ws
-}
-
-// wantMembers fails the test for each member of want that obj does not hold
-// with the same value.
-func wantMembers(t *testing.T, obj, want map[string]any) {
-	t.Helper()
-	for k, v := range want {
-		if !reflect.DeepEqual(obj[k], v) {
-			t.Errorf("%s = %#v, want %#v", k, obj[k], v)
-		}
-	}
-}
-
-// wantAbsent fails the test for each of names obj holds.
-func wantAbsent(t *testing.T, obj map[string]any, names ...string) {
-	t.Helper()
-	for _, n := range names {
-		if v, ok := obj[n]; ok {
-			t.Errorf("%s = %#v, want it absent", n, v)
-		}
-	}
-}
 
 func TestCreate_AnswersReadyFork(t *testing.T) {
 	t.Parallel()
@@ -97,7 +66,7 @@ func TestCreate_Defaults(t *testing.T) {
 	slug := regexp.MustCompile(`^demo--[a-z0-9]{8}$`)
 	expires := timefmt.Format(w.clock().Add(7 * 24 * time.Hour))
 	for name, body := range map[string]any{
-		"absent": nil, "empty": "{}", "unknown member": `{"colour":"red"}`,
+		"absent": nil, "empty without a length": io.MultiReader(), "empty": "{}", "unknown member": `{"colour":"red"}`,
 		"null members": `{"name":null,"ref":null,"ttl":null,"auto_change":null,"token":null,"purpose":null,"session_id":null,"sandbox":null}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -121,9 +90,7 @@ func TestCreate_MemberOwnsFork(t *testing.T) {
 			wantMembers(t, ws, map[string]any{"owner_id": c.user, "org_id": w.acme, "access": "owner"})
 		})
 	}
-	if r := w.patch(t, w.miaKey, "/workspaces/demo", map[string]any{"description": "x"}); r.status != http.StatusForbidden {
-		t.Errorf("the member's PATCH of the parent = %d %s, want 403", r.status, r.body)
-	}
+	wantError(t, w.patch(t, w.miaKey, "/workspaces/demo", map[string]any{"description": "x"}), http.StatusForbidden, "forbidden")
 }
 
 func TestCreate_ForkPoint(t *testing.T) {
@@ -251,13 +218,12 @@ func TestCreate_GeneratedNameCollision(t *testing.T) {
 		t.Errorf("slug = %v after %d names, want demo--bbbbbbbb after 3", ws["slug"], called())
 	}
 	set([]string{"aaaaaaaa"})
-	r := w.post(t, w.devKey, forksPath, map[string]any{})
-	if e := r.object(t, http.StatusInternalServerError)["error"].(map[string]any); e["error_type"] != "internal" || called() != 8 {
-		t.Errorf("error = %v after %d names, want internal after 8", e, called())
+	before := w.footprint(t)
+	wantError(t, w.post(t, w.devKey, forksPath, map[string]any{}), http.StatusInternalServerError, "internal")
+	if called() != 8 {
+		t.Errorf("names drawn = %d, want 8", called())
 	}
-	if n := w.footprint(t).forks; n != 2 {
-		t.Errorf("forks = %d, want 2", n)
-	}
+	w.unchanged(t, before)
 }
 
 func TestCreate_CleansUpOnFailure(t *testing.T) {
@@ -317,18 +283,4 @@ func TestCreate_CleansUpOnFailure(t *testing.T) {
 			t.Errorf("count-objects = %q, want no object", out)
 		}
 	})
-}
-
-// faultyEvents is the hub's event component, failing its writes while
-// fault holds "event".
-type faultyEvents struct {
-	fork.Events
-	fault *atomic.Value
-}
-
-func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
-	if e.fault.Load() == "event" {
-		return event.Record{}, errors.New("injected fault")
-	}
-	return e.Events.Emit(ctx, tx, in)
 }

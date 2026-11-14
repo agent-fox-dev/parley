@@ -6,20 +6,18 @@ import (
 	"errors"
 	"slices"
 	"testing"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/fork"
 )
 
-func TestStore_InsertReadCountAndList(t *testing.T) {
+func TestStore_InsertReadAndCount(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := newWorld(t, nil)
 	older := w.seedFork(t, "demo--a", func(f *fork.Fork) { f.TrackingBranches = []string{"release", "main", "main"} })
-	w.advance(time.Second)
-	w.seedFork(t, "demo--c")
 	w.seedFork(t, "demo--b")
+	w.seedFork(t, "demo--c")
 
 	got, found, err := fork.BySlug(ctx, w.Store.Main(), "demo--a")
 	if err != nil || !found {
@@ -36,14 +34,6 @@ func TestStore_InsertReadCountAndList(t *testing.T) {
 	}
 	if n, err := fork.CountOf(ctx, w.Store.Main(), parentSlug); n != 3 || err != nil {
 		t.Errorf("CountOf = %d, %v; want 3", n, err)
-	}
-	list, err := fork.ListOf(ctx, w.Store.Main(), parentSlug, fork.ListFilter{})
-	var slugs []string
-	for _, f := range list {
-		slugs = append(slugs, f.Slug)
-	}
-	if err != nil || !slices.Equal(slugs, []string{"demo--b", "demo--c", "demo--a"}) {
-		t.Errorf("ListOf = %v, %v; want newest first, then by slug", slugs, err)
 	}
 
 	dup := older

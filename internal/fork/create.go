@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"slices"
@@ -155,7 +156,7 @@ var createMembers = []createMember{
 	}},
 	{"session_id", func(_ *Component, req *createRequest, raw json.RawMessage, _ time.Time) error {
 		return readString(raw, &req.SessionID, func(s string) error {
-			if _, err := uuid.Parse(s); len(s) != 36 || err != nil {
+			if !isUUID(s) {
 				return errors.New("must be a UUID")
 			}
 			return nil
@@ -168,6 +169,14 @@ var createMembers = []createMember{
 		req.Sandbox = raw
 		return nil
 	}},
+}
+
+// isUUID reports whether s is a UUID in its 36-character form, groups of
+// 8, 4, 4, 4 and 12 hexadecimal digits joined by hyphens, the one form a
+// session id is written in.
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return len(s) == 36 && err == nil
 }
 
 // readString reads the member raw, a string, into dst, and judges it by
@@ -190,13 +199,20 @@ func readString(raw json.RawMessage, dst **string, rule func(string) error) erro
 }
 
 // parseCreate reads the body of r by createMembers, at the hub's time now.
-// No body is the empty object, and a null member is an absent one, so that
-// a client may send back what it read. It answers the first member refused
-// with 400 invalid_request "<member>: <reason>", or with the answer the
-// member's reader gave.
+// No body, or an empty one however it was sent, is the empty object, and a
+// null member is an absent one, so that a client may send back what it
+// read. It answers the first member refused with 400 invalid_request
+// "<member>: <reason>", or with the answer the member's reader gave.
 func (c *Component) parseCreate(r *http.Request, now time.Time) (createRequest, error) {
 	body := map[string]json.RawMessage{}
-	if r.ContentLength != 0 {
+	// Judged on the bytes, not on the declared length, which a body sent in
+	// chunks does not have.
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return createRequest{}, server.InvalidRequest("request body could not be read")
+	}
+	if len(data) > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(data))
 		if err := server.DecodeJSON(r, &body); err != nil {
 			return createRequest{}, err
 		}
@@ -491,11 +507,12 @@ func (c *Component) commit(ctx context.Context, p identity.Principal, f Fork, re
 
 // createSandbox asks the sandbox component in tx for the sandbox raw, the
 // body's member as received, on the fork f that the caller p creates, with
-// the fork's session and purpose as defaults. Without a component sandboxes
-// are disabled, which the sandbox routes of such a hub answer as well.
+// the fork's session and purpose as defaults. Without a component no
+// sandbox can be created, which is answered as a hub without sandboxes
+// answers.
 func (c *Component) createSandbox(ctx context.Context, tx *sql.Tx, p identity.Principal, f Fork, raw json.RawMessage) (json.RawMessage, error) {
 	if c.sandbox == nil {
-		return nil, server.NewError("sandboxes_disabled", http.StatusNotFound, "sandboxes are not enabled on this hub")
+		return nil, server.NewError("sandboxes_disabled", http.StatusNotFound, "sandbox: no sandbox component is available on this hub to create one")
 	}
 	obj, err := c.sandbox.CreateSandbox(ctx, tx, SandboxRequest{Caller: p, Fork: f, Sandbox: raw, SessionID: f.SessionID, Purpose: f.Purpose})
 	switch {
@@ -577,13 +594,38 @@ func forkEventInput(p identity.Principal, f Fork, tokenID *string) event.Input {
 	}
 }
 
+// parentLock is the create lock of one parent.
+type parentLock struct {
+	sync.Mutex
+	// users counts the creates holding or waiting for the lock, guarded by
+	// the component's locksMu.
+	users int
+}
+
 // lockParent takes the create lock of the workspace parent and returns its
-// release.
+// release. The last create to release a lock removes it, so that the map
+// holds only the parents a create is working on.
 func (c *Component) lockParent(parent string) (unlock func()) {
-	l, _ := c.createLocks.LoadOrStore(parent, &sync.Mutex{})
-	mu := l.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	c.locksMu.Lock()
+	l := c.createLocks[parent]
+	if l == nil {
+		if c.createLocks == nil {
+			c.createLocks = map[string]*parentLock{}
+		}
+		l = &parentLock{}
+		c.createLocks[parent] = l
+	}
+	l.users++
+	c.locksMu.Unlock()
+	l.Lock()
+	return func() {
+		l.Unlock()
+		c.locksMu.Lock()
+		defer c.locksMu.Unlock()
+		if l.users--; l.users == 0 {
+			delete(c.createLocks, parent)
+		}
+	}
 }
 
 // randomName draws a fork name of nameLength characters of nameAlphabet

@@ -1,21 +1,23 @@
 package fork_test
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -26,6 +28,12 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
+)
+
+// forksPath is the fork routes of demo, forkPath the workspace demo--f.
+const (
+	forksPath = "/workspaces/demo/forks"
+	forkPath  = "/workspaces/demo--f"
 )
 
 // parentSlug is the repository workspace every world holds, the parent the
@@ -262,27 +270,8 @@ func (w *world) post(t *testing.T, cred, path string, body any) answer {
 // postKey sends POST path with cred, body and the Idempotency-Key key.
 func (w *world) postKey(t *testing.T, cred, path, key string, body any) answer {
 	t.Helper()
-	raw, err := json.Marshal(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, w.URL("/api/v1"+path), bytes.NewReader(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+cred)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", key)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return answer{res.StatusCode, b}
+	status, b := w.CallWith(t, http.MethodPost, "/api/v1"+path, cred, body, http.Header{"Idempotency-Key": {key}})
+	return answer{status, b}
 }
 
 // forkEvents are the parley.workspace.fork events of the log, in its order.
@@ -379,15 +368,7 @@ func (w *world) patch(t *testing.T, cred, path string, body any) answer {
 // workspace ("" for none), and returns its secret and its id.
 func (w *world) pat(t *testing.T, workspace string, paths []string, perms ...string) (secret, id string) {
 	t.Helper()
-	w.insert(t, func(tx *sql.Tx) error {
-		var rec identity.PAT
-		var err error
-		secret, rec, err = identity.StorePAT(context.Background(), tx, identity.PATSpec{
-			UserID: w.dev, Name: "test", Permissions: perms, Paths: paths, Workspace: workspace, CreatedAt: w.clock()})
-		id = rec.TokenID
-		return err
-	})
-	return secret, id
+	return w.IssuePATID(t, identity.PATSpec{UserID: w.dev, Permissions: perms, Paths: paths, Workspace: workspace, CreatedAt: w.clock()})
 }
 
 // linker is a session linker that accepts every id, in lower case, unless
@@ -497,4 +478,136 @@ func collaborate(l *linker, s *sandboxer) func(*hub.Composition) {
 			c.Forks().RegisterSandbox(s)
 		}
 	}
+}
+
+// created is the answer a, which must be 201, with its workspace member.
+func created(t *testing.T, a answer) (body, ws map[string]any) {
+	t.Helper()
+	body = a.object(t, http.StatusCreated)
+	ws, _ = body["workspace"].(map[string]any)
+	return body, ws
+}
+
+// wantMembers fails the test for each member of want that obj does not hold
+// with the same value.
+func wantMembers(t *testing.T, obj, want map[string]any) {
+	t.Helper()
+	for k, v := range want {
+		if !reflect.DeepEqual(obj[k], v) {
+			t.Errorf("%s = %#v, want %#v", k, obj[k], v)
+		}
+	}
+}
+
+// wantAbsent fails the test for each of names obj holds.
+func wantAbsent(t *testing.T, obj map[string]any, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		if v, ok := obj[n]; ok {
+			t.Errorf("%s = %#v, want it absent", n, v)
+		}
+	}
+}
+
+// wantError fails the test unless a has status and the error type typ.
+func wantError(t *testing.T, a answer, status int, typ string) {
+	t.Helper()
+	if e, _ := a.object(t, status)["error"].(map[string]any); e["error_type"] != typ {
+		t.Errorf("error = %v, want %d %s", e, status, typ)
+	}
+}
+
+// postAll sends n creates with body at once and counts the answers by
+// status.
+func (w *world) postAll(t *testing.T, n int, body any) map[int]int {
+	t.Helper()
+	var mu sync.Mutex
+	counts := map[int]int{}
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			status, _ := w.Call(t, http.MethodPost, "/api/v1"+forksPath, w.devKey, body)
+			mu.Lock()
+			defer mu.Unlock()
+			counts[status]++
+		})
+	}
+	wg.Wait()
+	return counts
+}
+
+// listed are the forks of the world of newListWorld, as the list orders
+// them: newest first, then by slug.
+var listed = []string{"demo--c", "demo--d", "demo--b", "demo--a"}
+
+// newListWorld is a world whose demo has four forks: demo--a of dev, the
+// oldest, demo--b of mia, created in the session it returns, and demo--c
+// and demo--d of dev, created at the same instant, the newest.
+func newListWorld(t *testing.T) (w *world, session string) {
+	t.Helper()
+	w, session = newWorld(t, nil), uuid.New().String()
+	w.seedFork(t, "demo--a")
+	w.advance(time.Second)
+	w.seedFork(t, "demo--b", func(f *fork.Fork) { f.OwnerID, f.SessionID = w.mia, &session })
+	w.advance(time.Second)
+	w.seedFork(t, "demo--d")
+	w.seedFork(t, "demo--c")
+	return w, session
+}
+
+// page decodes a, which must be 200 with items an array, as a page of the
+// fork list: the items' slugs, the items by slug and next_cursor.
+func page(t *testing.T, a answer) (slugs []string, items map[string]map[string]any, next *string) {
+	t.Helper()
+	var p struct {
+		Items      *[]map[string]any `json:"items"`
+		NextCursor *string           `json:"next_cursor"`
+	}
+	if a.status != http.StatusOK || json.Unmarshal(a.body, &p) != nil || p.Items == nil {
+		t.Fatalf("answer = %d %s, want 200 with an array of items", a.status, a.body)
+	}
+	slugs, items = []string{}, map[string]map[string]any{}
+	for _, it := range *p.Items {
+		slug, _ := it["slug"].(string)
+		slugs, items[slug] = append(slugs, slug), it
+	}
+	return slugs, items, p.NextCursor
+}
+
+// lastUpdate is the last parley.workspace.update event of the log, with
+// its metadata decoded.
+func (w *world) lastUpdate(t *testing.T) (sessionID *string, fields []string, parent string) {
+	t.Helper()
+	evs := w.eventsOf(t, "parley.workspace.update")
+	if len(evs) == 0 {
+		t.Fatal("no parley.workspace.update event")
+	}
+	ev := evs[len(evs)-1]
+	var meta struct {
+		Fields []string `json:"fields"`
+		Parent string   `json:"parent_slug"`
+	}
+	if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
+		t.Fatal(err)
+	}
+	return ev.SessionID, meta.Fields, meta.Parent
+}
+
+// named are the branches of bs whose name is name.
+func named(bs []fork.Branch, name string) []fork.Branch {
+	return slices.DeleteFunc(slices.Clone(bs), func(b fork.Branch) bool { return b.Name != name })
+}
+
+// faultyEvents is the hub's event component, failing its writes while
+// fault holds "event".
+type faultyEvents struct {
+	fork.Events
+	fault *atomic.Value
+}
+
+func (e faultyEvents) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	if e.fault.Load() == "event" {
+		return event.Record{}, errors.New("injected fault")
+	}
+	return e.Events.Emit(ctx, tx, in)
 }

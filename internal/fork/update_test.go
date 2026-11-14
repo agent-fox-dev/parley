@@ -1,7 +1,6 @@
 package fork_test
 
 import (
-	"encoding/json"
 	"net/http"
 	"reflect"
 	"slices"
@@ -12,27 +11,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-const forkPath = "/workspaces/demo--f"
-
-// lastUpdate is the last parley.workspace.update event of the log, with
-// its metadata decoded.
-func (w *world) lastUpdate(t *testing.T) (sessionID *string, fields []string, parent string) {
-	t.Helper()
-	evs := w.eventsOf(t, "parley.workspace.update")
-	if len(evs) == 0 {
-		t.Fatal("no parley.workspace.update event")
-	}
-	ev := evs[len(evs)-1]
-	var meta struct {
-		Fields []string `json:"fields"`
-		Parent string   `json:"parent_slug"`
-	}
-	if err := json.Unmarshal(ev.Metadata, &meta); err != nil {
-		t.Fatal(err)
-	}
-	return ev.SessionID, meta.Fields, meta.Parent
-}
 
 func TestUpdate_ForkFields(t *testing.T) {
 	t.Parallel()

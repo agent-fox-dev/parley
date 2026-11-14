@@ -294,6 +294,14 @@ func (h *Hub) IssueKey(t testing.TB, userID string) string {
 // the token. An empty name is "test" and a zero creation time is now.
 func (h *Hub) IssuePAT(t testing.TB, spec identity.PATSpec) string {
 	t.Helper()
+	token, _ := h.IssuePATID(t, spec)
+	return token
+}
+
+// IssuePATID is IssuePAT that returns the stored token's id as well, for a
+// test that looks for the token by its id.
+func (h *Hub) IssuePATID(t testing.TB, spec identity.PATSpec) (token, id string) {
+	t.Helper()
 	if spec.Name == "" {
 		spec.Name = "test"
 	}
@@ -301,15 +309,17 @@ func (h *Hub) IssuePAT(t testing.TB, spec identity.PATSpec) string {
 		spec.CreatedAt = time.Now()
 	}
 	ctx := context.Background()
-	var token string
-	err := h.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
-		token, _, err = identity.StorePAT(ctx, tx, spec)
+	err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var rec identity.PAT
+		var err error
+		token, rec, err = identity.StorePAT(ctx, tx, spec)
+		id = rec.TokenID
 		return err
 	})
 	if err != nil {
 		t.Fatalf("store a PAT for %s: %v", spec.UserID, err)
 	}
-	return token
+	return token, id
 }
 
 // CreateOrg creates the active org slug, named slug, through the admin
@@ -347,10 +357,19 @@ func (h *Hub) AddWorkspace(t testing.TB, rec access.Record) {
 
 // Call sends method path to the hub with credential as the bearer
 // credential ("" for none) and body: nil for none, a []byte or a string as
-// it is, anything else as JSON; a body is sent as application/json. It
-// returns the status and the body of the answer, and fails the test when the
-// request cannot be sent or the answer read.
+// it is, an io.Reader as it reads, without a declared length unless it is
+// one of the readers net/http knows the length of, anything else as JSON; a
+// body is sent as application/json. It returns the status and the body of
+// the answer, and fails the test when the request cannot be sent or the
+// answer read.
 func (s *Served) Call(t testing.TB, method, path, credential string, body any) (int, []byte) {
+	t.Helper()
+	return s.CallWith(t, method, path, credential, body, nil)
+}
+
+// CallWith is Call with the headers of header added to the request, such
+// as an Idempotency-Key.
+func (s *Served) CallWith(t testing.TB, method, path, credential string, body any, header http.Header) (int, []byte) {
 	t.Helper()
 	var data io.Reader
 	switch b := body.(type) {
@@ -359,6 +378,8 @@ func (s *Served) Call(t testing.TB, method, path, credential string, body any) (
 		data = bytes.NewReader(b)
 	case string:
 		data = strings.NewReader(b)
+	case io.Reader:
+		data = b
 	default:
 		raw, err := json.Marshal(b)
 		if err != nil {
@@ -375,6 +396,11 @@ func (s *Served) Call(t testing.TB, method, path, credential string, body any) (
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {

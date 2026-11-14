@@ -76,9 +76,11 @@ type Deps struct {
 // binds it once at start with Bind, before it serves a request.
 type Component struct {
 	deps Deps
-	// createLocks holds a *sync.Mutex per parent slug, held by a create of
-	// a fork of that parent from its name check to its commit.
-	createLocks sync.Map
+	// createLocks holds the create lock of each parent slug a create holds
+	// or waits for, held by a create of a fork of that parent from its name
+	// check to its commit; locksMu guards the map and the counts in it.
+	locksMu     sync.Mutex
+	createLocks map[string]*parentLock
 	// linker and sandbox are the collaborators other features register,
 	// nil while none is: no session exists, and sandboxes are disabled.
 	linker  SessionLinker

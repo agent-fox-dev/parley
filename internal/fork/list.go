@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -45,7 +44,7 @@ func (c *Component) list(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if f.SessionID, err = oneParam(query, "session_id", func(v string) bool { _, err := uuid.Parse(v); return err == nil }, "a UUID"); err != nil {
+	if f.SessionID, err = oneParam(query, "session_id", isUUID, "a UUID"); err != nil {
 		return err
 	}
 	var pos Position

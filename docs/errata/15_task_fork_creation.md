@@ -46,6 +46,11 @@ when generated, drawn again; only then is whatever lies at the fork's place
 removed as a leftover and the repository made. A duplicate slug at the
 insert is still answered `409 conflict`.
 
+The lock is held across the sandbox component's call too, which runs in the
+creation transaction; that costs no concurrency the transaction does not
+cost already, since the store's single writer holds it across that call
+anyway. A parent's lock exists only while a create holds or waits for it.
+
 The fork limit, which the package counts in the transaction before the
 insert, is counted under the same lock before the name check as well, so
 that a parent at its limit is refused (`429 fork_limit_reached`) before a
@@ -92,8 +97,10 @@ expiry instant, and gives a token without either a lifetime of 90 days. The
 fork body's `token.expires` has the form of `ttl` (a whole number above
 zero followed by `m`, `h` or `d`); the create reads it with
 `workspace.ParseDuration` when it reads the body, refusing any other value
-(`soon`, `0h`) with `400 invalid_request` (`token: expires: …`) before
-anything else is checked, and passes the minting component the instant of
+(`soon`, `0h`) with `400 invalid_request` (`token: expires: …`) at the body
+step: after the admin token is refused and after the members judged before
+`token` (`name`, `ref`, `ttl`, `auto_change`), before the session and every
+later check. It passes the minting component the instant of
 the fork's creation (whole seconds) plus that duration. Without `expires` it
 passes the lifetime 0, so the token never expires (`expires_at` `null`), as
 the package says, rather than the component's default of 90 days.
@@ -148,6 +155,7 @@ does.
 Where the package is silent: `owner` and `session_id` given more than once
 are refused with `400 invalid_request` (`owner must be given once, as me`),
 as `GET /workspaces` refuses a repeated `include_forks`, rather than one of
-the values chosen; a `session_id` is matched in any case, since a session id
-is stored in lower case; and the admin token's items carry `access`
+the values chosen; a `session_id` must be a UUID in its 36-character form,
+as the create's `session_id` must, and is matched in any case, since a
+session id is stored in lower case; and the admin token's items carry `access`
 `admin`, its level on every workspace.
