@@ -162,21 +162,23 @@ func (wk *Workers) halt() {
 
 // run is one worker: it runs the work of the slugs it takes from the queue,
 // one at a time, until the workers are stopped. An error that is not the
-// end of ctx means the outcome could not be recorded; the workspace keeps
-// its status, so its work is taken up again at the next start.
+// end of ctx means the outcome could not be recorded: the worker sets the
+// workspace to failed with that error once the store takes the write
+// (Service.failUnrecorded), and holds the slug until then, so that no other
+// worker clones it meanwhile.
 func (wk *Workers) run(ctx context.Context) {
 	for {
 		slug, ok := wk.next()
 		if !ok {
 			return
 		}
-		err := wk.work(ctx, slug)
+		if err := wk.work(ctx, slug); err != nil && ctx.Err() == nil {
+			wk.svc.deps.Logger.Error("workspace clone work failed", "slug", slug, "error", err)
+			wk.svc.failUnrecorded(ctx, slug, err)
+		}
 		wk.mu.Lock()
 		delete(wk.held, slug)
 		wk.mu.Unlock()
-		if err != nil && ctx.Err() == nil {
-			wk.svc.deps.Logger.Error("workspace clone work failed", "slug", slug, "error", err)
-		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
@@ -295,6 +296,47 @@ func (s *Service) recordClone(ctx context.Context, w Workspace, status Status) e
 		Status: status, DefaultBranch: w.DefaultBranch, HeadSHA: w.HeadSHA,
 		OriginHeadSHA: w.OriginHeadSHA, CloneError: w.CloneError, UpdatedAt: s.deps.Now(),
 	})
+}
+
+// The waits between the tries of failUnrecorded: the first, doubled after
+// each try up to the longest.
+const (
+	unrecordedRetryFirst = 100 * time.Millisecond
+	unrecordedRetryMost  = 30 * time.Second
+)
+
+// failUnrecorded settles the clone work of the workspace slug whose outcome
+// could not be recorded because of the store error cause, so that the
+// workspace does not stay in pending or cloning, which the state guard
+// answers as busy, until the next start. It sets the status to failed with
+// cause's text as clone_error once the store takes the write, trying again
+// with a growing wait until it does or ctx ends; the hub's stop leaves the
+// work to the next start, as for an interrupted clone. Once failed, the copy
+// is removed, as for any failed clone. A workspace no longer in pending or
+// cloning, such as one whose outcome was written though the write reported
+// an error, or one deleted, is left as it is.
+func (s *Service) failUnrecorded(ctx context.Context, slug string, cause error) {
+	msg := s.deps.Scrubber.Scrub("the outcome of the clone could not be recorded: " + cause.Error())
+	for wait := unrecordedRetryFirst; ; wait = min(2*wait, unrecordedRetryMost) {
+		failed, err := failUnfinished(ctx, s.deps.Store.Main(), slug, msg, s.deps.Now())
+		if err == nil {
+			if failed {
+				if err := gitrepo.Remove(s.RepoPath(slug)); err != nil {
+					s.deps.Logger.Error("workspace clone cleanup failed", "slug", slug, "error", err)
+				}
+			}
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		s.deps.Logger.Warn("workspace clone failure not recorded", "slug", slug, "error", err, "retry_in", wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
 }
 
 // failClone ends the clone of w that failed with cause: it removes
