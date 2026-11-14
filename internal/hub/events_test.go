@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,5 +162,62 @@ func TestEvents_StopReleasesHeldLogRequests(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the held request was not answered within 5 s of the stop")
+	}
+}
+
+func TestHub_AppliesStreamLimit(t *testing.T) {
+	t.Parallel()
+	var events *event.Component
+	h := hubtest.StartWith(t, hubtest.Config{TOML: "[events]\nmax_sse_connections = 1\nretention = \"2d\"\n",
+		Compose: func(c *hub.Composition) { events = c.Events() }})
+	if got := events.Retention(); got != 48*time.Hour {
+		t.Errorf("Retention() = %v, want the configured 48h", got)
+	}
+
+	open := func() *http.Response {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.URL("/api/v1/events"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+h.Token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /api/v1/events: %v", err)
+		}
+		t.Cleanup(func() { res.Body.Close() })
+		return res
+	}
+	if res := open(); res.StatusCode != http.StatusOK {
+		t.Fatalf("first stream: status %d, want 200", res.StatusCode)
+	}
+	res := open()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second stream: status %d, want 503", res.StatusCode)
+	}
+	if got := res.Header.Get("Retry-After"); got != "5" {
+		t.Errorf("second stream: Retry-After = %q, want 5", got)
+	}
+}
+
+func TestHub_RefusesInvalidEventConfig(t *testing.T) {
+	t.Parallel()
+	dir := workDir(t, localConfig+"[events]\nretention = \"10m\"\n")
+	var stderr syncBuffer
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	code := hub.Run(ctx, hub.Options{WorkDir: dir, Stderr: &stderr})
+
+	if code != 1 {
+		t.Errorf("Run returned %d, want 1", code)
+	}
+	lines := nonEmptyLines(stderr.String())
+	if len(lines) != 1 || !strings.Contains(lines[0], "events.retention") {
+		t.Errorf("stderr = %q, want one line naming events.retention", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "listening") {
+		t.Errorf("stderr %q has a listening line", stderr.String())
 	}
 }

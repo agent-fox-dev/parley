@@ -15,7 +15,7 @@ command-line client. Both are written in Go, in the module
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
-| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`) and a function run on the composition (`Config.Compose`), `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
@@ -1364,12 +1364,23 @@ in `parts`. It creates a zero `event.Component`, adds the schema step
 `event.SchemaStep` (`hub_events`) and binds the component in the start hook
 `events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
 Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...,
-Shutdown: c.ShuttingDown()}`, the fork-parent lookup being
+Shutdown: c.ShuttingDown(), Authenticate: c.identity.Authenticate,
+MaxStreams: ..., Retention: ...}`, the fork-parent lookup being
 `access.RecordBySlug` read in the emitting transaction, `c.access` the
 `*access.Service` that `composeAccess` creates and keeps on the composition,
 the memberships the same `identity.ActiveOrgIDs` source that service is bound
-to, and `Shutdown` the hub's shutdown notification, which releases the
-requests the component holds. The part registers the routes of
+to, `Shutdown` the hub's shutdown notification, which releases the
+requests the component holds, `Authenticate` the identity service's
+authenticator, with which a stream checks its credential again at every
+heartbeat, and `MaxStreams` and `Retention` the `[events]` settings
+`event.SettingsFrom(rt.Config)` reads. The part registers the keys of
+`[events]` with `event.Register` (`internal/event/config.go`) when it is
+composed: `retention`, a string read with `timefmt.ParseDuration`, at least
+`1h`, default `30d`, and `max_sse_connections`, an integer of at least 1,
+default 500; a value that breaks its rule fails the load with an error that
+names the key, so the hub exits with status 1 before it listens.
+`(*Component).Retention()` returns the loaded retention for the retention
+run. The part registers the routes of
 `(*Component).Routes()` with `AddRoute` when it is composed. `Bind` reads
 `last_seq`, and its error fails the start. The start hooks that run after it,
 those of the parts listed after `composeEvents` and of `Options.Compose`, may
@@ -1472,7 +1483,8 @@ WrittenByType}`. It first catches up with the commits itself, so the answer
 is exact. `WrittenByType` counts the events committed since the bind, by
 type; a rolled-back emit is never counted. `OpenStreams` counts the stream
 places taken with the unexported `takePlace(limit)`, which refuses once
-`limit` are taken, and not yet given back with `givePlace()`.
+`limit` are taken, and not yet given back with `givePlace()`; the limit of
+the stream is `Deps.MaxStreams`, none when it is 0.
 
 `internal/event/visibility.go` decides who may see an event, at the time it
 is delivered. `(*Component).Visible(ctx, caller, rec)` returns `(bool,
@@ -1546,21 +1558,40 @@ The page is written without HTML escaping, so its items are the bytes of
 It reads the filters with the same parsing as the log, and the resume
 position from the `Last-Event-ID` header, which wins, or from `after`;
 without either it starts at `last_seq` at open. It takes a stream place
-(`takePlace`, which `Counters().OpenStreams` counts, with no limit
-configured yet) before it answers and gives it back when the stream ends.
-It answers `200` with `Content-Type: text/event-stream`, sends a heartbeat at
-once and then runs one loop: it reads the log after the stream's position in
-batches of 200 through the same snapshot read as the log, sends each event
-that matches the filters and that one viewer per batch decides visible as a
-`hub_event` frame, flushes, and moves the position to the position examined,
-also past the events it did not send. Replay and live delivery are this same
-loop, so there is no gap and no repeat between them. When the log has nothing
-further it waits on `waitAfter`, a heartbeat timer of 30 seconds on the
-component's clock, the request's context and `Deps.Shutdown`. When the timer
-fires it reads the log once more and then sends the heartbeat, whose `seq` is
-the position examined. The stream ends when the client goes away or the hub
-begins to stop; a read that fails after the answer began ends it too, and the
-server logs the error.
+(`takePlace(Deps.MaxStreams)`) before it answers, and when none is free
+answers `503 unavailable` with `Retry-After: 5`; it gives the place back
+when the stream ends, for any reason. It answers `200` with
+`Content-Type: text/event-stream` and starts a writer goroutine. Between the
+handler and the writer is the stream's outbox: the handler queues frames,
+the writer writes them in order and flushes whenever the outbox is empty, so
+a client that reads slowly holds up neither the heartbeats nor the checks.
+The handler queues a heartbeat at once and then runs one loop: it reads the
+log after the stream's position in batches of 200 through the same snapshot
+read as the log, queues each event that matches the filters and that one
+viewer per batch decides visible as a `hub_event` frame, and moves the
+position to the position examined, also past the events it did not send.
+Replay and live delivery are this same loop, so there is no gap and no
+repeat between them. When the log has nothing further it waits on
+`waitAfter`, one timer on the component's clock, the request's context,
+`Deps.Shutdown` and the writer's failure. The timer is due at the next
+heartbeat, 30 seconds after the previous one, or earlier when the write
+under way reaches 60 seconds before that. At a heartbeat the handler first
+authenticates the original request again with `Deps.Authenticate`; a
+credential that no longer authenticates ends the stream before any further
+frame is queued. It then reads the log once more and queues the heartbeat,
+whose `seq` is the position examined.
+
+The stream ends when the client goes away, the hub begins to stop, the
+credential no longer authenticates, an event is due while 256 events wait in
+the outbox (the event is not queued, so nothing is dropped from the open
+stream), or the write under way, which the writer stamps with the
+component's clock, has not completed for 60 seconds. On every end the handler
+stops the writer and waits for it, so nothing writes to the response after
+the handler returns; a write that is blocked on a client that does not read
+is ended first with a write deadline in the past through
+`http.ResponseController`, so a stop never waits for a client. A read that
+fails after the answer began ends the stream too, and the server logs the
+error.
 
 ### The logger
 

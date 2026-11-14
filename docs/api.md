@@ -1718,8 +1718,29 @@ was visible, so a client that reconnects with the `id` of the last frame it
 received, as `Last-Event-ID`, resumes exactly where it stopped. An event
 committed while the stream is open is sent within a second of its commit.
 Events are decided with the caller's access at the time they are delivered,
-by the rules of the log. The stream ends when the client closes the
-connection or the hub begins to stop.
+by the rules of the log.
+
+The stream ends, and the hub closes the connection, when:
+
+- the client closes the connection;
+- the hub begins to stop: every stream ends at once, also one whose client
+  is not reading;
+- at a heartbeat, the credential no longer authenticates, as a new request
+  with it would not (revoked, expired, or its user blocked): no further
+  frame is sent, so the stream ends at most 30 seconds after the change;
+- 256 events are waiting for a client that reads more slowly than they come
+  and another one is due;
+- a write to the client has not completed for 60 seconds.
+
+The hub never drops an event from an open stream: the `hub_event` frames a
+client received before the end are a gap-free prefix of the visible,
+matching events, and a reconnect with the `id` of the last frame received
+sends every later one.
+
+At most `[events].max_sse_connections` streams are open at once (see
+[configuration.md](configuration.md#keys)); a held long-poll of
+[`GET /api/v1/events/log`](#get-apiv1eventslog) does not count toward the
+limit. A stream gives its place back when it ends, for any reason.
 
 | Status | When |
 |---|---|
@@ -1727,6 +1748,7 @@ connection or the hub begins to stop.
 | `400` `invalid_request` | an `after` or `Last-Event-ID` that is not a non-negative integer (`after must be a non-negative integer`, `Last-Event-ID must be a non-negative integer`), or a query string that does not parse (`the query string is malformed`). No stream is started |
 | `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`) |
 | `500` `internal` | the log's bounds could not be read before the stream began (`internal error`) |
+| `503` `unavailable` | `[events].max_sse_connections` streams are open (`too many event streams are open`), with the header `Retry-After: 5`. No stream is started |
 
 ## `GET /api/v1/events/log`
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/scrub"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -109,6 +110,16 @@ type Deps struct {
 	// begins to stop; every held request returns when it closes. nil never
 	// closes.
 	Shutdown <-chan struct{}
+	// Authenticate checks a request's credential again, as the hub's
+	// pipeline does; a stream asks it at every heartbeat and ends when the
+	// credential no longer authenticates. nil checks nothing.
+	Authenticate server.Authenticator
+	// MaxStreams is the number of event streams that may be open at once,
+	// [events].max_sse_connections; 0 is no limit.
+	MaxStreams int
+	// Retention is how long an event stays in the event log,
+	// [events].retention; 0 is DefaultRetention.
+	Retention time.Duration
 }
 
 // Component is the hub's event component, one per hub. The hub creates it

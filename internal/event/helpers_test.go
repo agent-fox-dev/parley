@@ -151,8 +151,11 @@ type fixture struct {
 	store    *store.Store
 	clock    *fakeClock
 	scrubber *scrub.Scrubber
+	identity *identity.Service
 	access   *access.Service
 	events   *Component
+	// opts change the component's dependencies at every bind.
+	opts []func(*Deps)
 	// failMemberships makes every read of the memberships fail, for the
 	// access rule and the component alike.
 	failMemberships atomic.Bool
@@ -167,17 +170,18 @@ type fixture struct {
 
 // newFixture opens a store in a fresh directory with the event schema, the
 // identity and workspace records and a test table, and binds a component to
-// it. The
-// store is closed when the test ends.
-func newFixture(t testing.TB) *fixture {
+// it, with its dependencies changed by opts. The store is closed when the
+// test ends.
+func newFixture(t testing.TB, opts ...func(*Deps)) *fixture {
 	t.Helper()
-	f := &fixture{t: t, dir: t.TempDir(), clock: newFakeClock(clockStart), scrubber: scrub.New()}
+	f := &fixture{t: t, dir: t.TempDir(), clock: newFakeClock(clockStart), scrubber: scrub.New(), opts: opts}
 	f.open()
 	return f
 }
 
 // open opens the fixture's store, binds a new component to it and runs it,
-// as a hub does at every start.
+// as a hub does at every start. The component authenticates its streams
+// again through the real identity service on the fake clock.
 func (f *fixture) open() {
 	f.t.Helper()
 	st, err := store.Open(context.Background(), store.Options{
@@ -189,12 +193,18 @@ func (f *fixture) open() {
 	}
 	f.t.Cleanup(func() { st.Close() })
 	f.store = st
+	f.identity = &identity.Service{}
+	f.identity.Bind(identity.Deps{Store: st, Now: f.clock.Now})
 	f.access = &access.Service{}
 	f.access.Bind(access.Deps{Records: access.StoreRecords(st.Main()), Memberships: f.memberships()})
 	shutdown := make(chan struct{})
 	f.shutdown, f.shutDown = shutdown, sync.OnceFunc(func() { close(shutdown) })
-	f.events, err = New(Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{},
-		Access: f.access, Memberships: f.memberships(), Shutdown: shutdown})
+	deps := Deps{Store: st, Clock: f.clock, Scrubber: f.scrubber, Parents: storeParents{},
+		Access: f.access, Memberships: f.memberships(), Shutdown: shutdown, Authenticate: f.identity.Authenticate}
+	for _, opt := range f.opts {
+		opt(&deps)
+	}
+	f.events, err = New(deps)
 	if err != nil {
 		f.t.Fatalf("bind the component: %v", err)
 	}
@@ -350,16 +360,16 @@ type world struct {
 	acme  string
 }
 
-// newWorld builds a world on a new fixture.
-func newWorld(t testing.TB) *world {
+// newWorld builds a world on a new fixture whose component's dependencies
+// opts change.
+func newWorld(t testing.TB, opts ...func(*Deps)) *world {
 	t.Helper()
 	ctx := context.Background()
-	w := &world{fixture: newFixture(t), users: map[string]string{}, keys: map[string]string{}}
+	w := &world{fixture: newFixture(t, opts...), users: map[string]string{}, keys: map[string]string{}}
 	if err := identity.IssueAdminToken(ctx, w.store, "", func(tok string) error { w.admin = tok; return nil }); err != nil {
 		t.Fatalf("issue the admin token: %v", err)
 	}
-	ids := &identity.Service{}
-	ids.Bind(identity.Deps{Store: w.store, Now: w.clock.Now})
+	ids := w.identity
 	w.srv = server.New(server.Options{Logger: slog.New(slog.DiscardHandler), RateLimitDisabled: true, Now: w.clock.Now})
 	w.srv.SetAuthenticator(ids.Authenticate)
 	w.srv.SetScopeCheck(identity.ScopeCheck)

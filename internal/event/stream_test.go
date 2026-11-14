@@ -2,15 +2,22 @@ package event
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
 // frame is one frame of an event stream: its lines, without the empty line
@@ -37,6 +44,8 @@ type eventStream struct {
 	t      testing.TB
 	status int
 	header http.Header
+	// body is the whole answer when it is not a stream (status not 200).
+	body   []byte
 	frames <-chan frame
 	// close ends the connection from the client's side.
 	close func()
@@ -77,6 +86,13 @@ func (w *world) openStream(t testing.TB, credential, query string, header map[st
 		t.Fatalf("GET /events?%s: %v", query, err)
 	}
 	frames := make(chan frame, 1024)
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		cancel()
+		close(frames)
+		return &eventStream{t: t, status: res.StatusCode, header: res.Header, body: body, frames: frames, close: func() {}}
+	}
 	go func() {
 		defer close(frames)
 		sc := bufio.NewScanner(res.Body)
@@ -360,4 +376,367 @@ func TestStream_HeartbeatAdvancesPosition(t *testing.T) {
 	if hb := again.heartbeat(2 * time.Second); hb.id != "15" {
 		t.Errorf("reconnect: first heartbeat id = %s, want 15", hb.id)
 	}
+}
+
+// ends fails the test unless the stream ends within d of real time without
+// another frame.
+func (s *eventStream) ends(d time.Duration) {
+	s.t.Helper()
+	select {
+	case f, ok := <-s.frames:
+		if ok {
+			s.t.Fatalf("frame %q, want the stream to end without one", f.lines)
+		}
+	case <-time.After(d):
+		s.t.Fatalf("the stream is still open %v later, want it ended", d)
+	}
+}
+
+// stuckWriter is the response writer of a client that stops reading: it
+// accepts its first accept writes, then blocks every later one until the
+// server gives up on the connection with a write deadline, as a real
+// connection does, or the test ends.
+type stuckWriter struct {
+	header http.Header
+	accept int
+
+	mu      sync.Mutex
+	writes  int
+	written bytes.Buffer
+	// blocked is closed when the first write blocks; release ends every
+	// blocked write.
+	blocked     chan struct{}
+	release     chan struct{}
+	blockOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func newStuckWriter(t testing.TB, accept int) *stuckWriter {
+	sw := &stuckWriter{header: http.Header{}, accept: accept, blocked: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(sw.unblock)
+	return sw
+}
+
+func (sw *stuckWriter) Header() http.Header { return sw.header }
+
+func (sw *stuckWriter) WriteHeader(int) {}
+
+func (sw *stuckWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	if sw.writes < sw.accept {
+		sw.writes++
+		defer sw.mu.Unlock()
+		return sw.written.Write(p)
+	}
+	sw.mu.Unlock()
+	sw.blockOnce.Do(func() { close(sw.blocked) })
+	<-sw.release
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (sw *stuckWriter) Flush() {}
+
+// SetWriteDeadline ends the blocked writes, as a deadline in the past does
+// on a real connection.
+func (sw *stuckWriter) SetWriteDeadline(time.Time) error {
+	sw.unblock()
+	return nil
+}
+
+func (sw *stuckWriter) unblock() { sw.releaseOnce.Do(func() { close(sw.release) }) }
+
+// hubEventIDs are the ids of the hub_event frames the writer accepted, in
+// their order.
+func (sw *stuckWriter) hubEventIDs(t testing.TB) []int64 {
+	t.Helper()
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	var ids []int64
+	for block := range strings.SplitSeq(sw.written.String(), "\n\n") {
+		lines := strings.Split(block, "\n")
+		if len(lines) < 2 || lines[1] != "event: hub_event" {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimPrefix(lines[0], "id: "), 10, 64)
+		if err != nil {
+			t.Fatalf("frame %q: %v", block, err)
+		}
+		ids = append(ids, n)
+	}
+	return ids
+}
+
+// stuckStream serves GET /api/v1/events as the admin token to a client that
+// stops reading after accept writes, through the world's router, and returns
+// the writer and a channel closed when the handler has returned.
+func (w *world) stuckStream(t testing.TB, accept int) (*stuckWriter, <-chan struct{}) {
+	t.Helper()
+	sw := newStuckWriter(t, accept)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer "+w.admin)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.srv.Handler().ServeHTTP(sw, req)
+	}()
+	// Cleanups run last first: the stop releases the handler before the
+	// store closes.
+	t.Cleanup(func() {
+		cancel()
+		w.shutDown()
+		sw.unblock()
+		<-done
+	})
+	return sw, done
+}
+
+// returns fails the test unless done is closed within d of real time.
+func returns(t testing.TB, done <-chan struct{}, d time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s has not returned within %v", what, d)
+	}
+}
+
+// running fails the test when done is closed now or within d of real time.
+func running(t testing.TB, done <-chan struct{}, d time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatalf("%s returned, want it still open", what)
+	case <-time.After(d):
+	}
+}
+
+// emitMany emits n events in one committed transaction.
+func (f *fixture) emitMany(n int) {
+	f.t.Helper()
+	ctx := context.Background()
+	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
+		for range n {
+			if _, err := f.events.Emit(ctx, tx, on("parley.change.open", "api")); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		f.t.Fatalf("emit %d events: %v", n, err)
+	}
+}
+
+func TestStream_SlowConsumerIsClosedNotSkipped(t *testing.T) {
+	t.Parallel()
+	t.Run("256 events waiting", func(t *testing.T) {
+		t.Parallel()
+		w := newWorld(t)
+		// The client takes the opening heartbeat and five events, then
+		// stops reading while the sixth is written.
+		sw, done := w.stuckStream(t, 6)
+		w.clock.WaitTimers(t, 1)
+		w.emitMany(6)
+		select {
+		case <-sw.blocked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no write blocked within 5 s")
+		}
+
+		w.emitMany(256)
+		running(t, done, 500*time.Millisecond, "the stream with 256 events waiting")
+		if got := w.events.Counters().OpenStreams; got != 1 {
+			t.Fatalf("open_streams = %d with 256 events waiting, want 1", got)
+		}
+		w.emitMany(1)
+		returns(t, done, 2*time.Second, "the stream with a 257th event due")
+		w.emitMany(300 - 263)
+
+		if got, want := sw.hubEventIDs(t), seqRange(1, 5); !slices.Equal(got, want) {
+			t.Errorf("hub_event ids written = %v, want %v", got, want)
+		}
+		if got := w.events.Counters().OpenStreams; got != 0 {
+			t.Errorf("open_streams = %d after the stream ended, want 0", got)
+		}
+		var resumed []int64
+		for after := int64(5); ; {
+			var page struct {
+				Items     []Record `json:"items"`
+				NextAfter int64    `json:"next_after"`
+			}
+			body := w.adminCall(http.MethodGet, "/events/log?limit=200&after="+strconv.FormatInt(after, 10), nil, http.StatusOK)
+			if err := json.Unmarshal(body, &page); err != nil {
+				t.Fatalf("page after %d: %v", after, err)
+			}
+			if len(page.Items) == 0 {
+				break
+			}
+			resumed = append(resumed, seqs(page.Items)...)
+			after = page.NextAfter
+		}
+		if want := seqRange(6, 300); !slices.Equal(resumed, want) {
+			t.Errorf("the log after the last id written = %v, want 6..300", resumed)
+		}
+	})
+	t.Run("no data accepted for 60 s", func(t *testing.T) {
+		t.Parallel()
+		w := newWorld(t)
+		sw, done := w.stuckStream(t, 1)
+		w.clock.WaitTimers(t, 1)
+		w.emitMany(1)
+		select {
+		case <-sw.blocked:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no write blocked within 5 s")
+		}
+
+		w.clock.Advance(59 * time.Second)
+		running(t, done, 300*time.Millisecond, "the stream after 59 s")
+		w.clock.WaitTimers(t, 1)
+		w.clock.Advance(time.Second)
+		returns(t, done, 2*time.Second, "the stream after 60 s without a write")
+		if got := w.events.Counters().OpenStreams; got != 0 {
+			t.Errorf("open_streams = %d, want 0", got)
+		}
+	})
+}
+
+func TestStream_ConnectionLimit(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *Deps) { d.MaxStreams = 2 })
+	w.emit(on("parley.change.open", "api"))
+	srv := w.serve()
+
+	// Held long-polls take no place.
+	for range 3 {
+		go func() {
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/events/log?wait=60&after=1", nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+w.admin)
+			if res, err := srv.Client().Do(req); err == nil {
+				res.Body.Close()
+			}
+		}()
+	}
+	w.clock.WaitTimers(t, 3)
+
+	first := w.openStream(t, w.admin, "", nil)
+	second := w.openStream(t, w.admin, "", nil)
+	if first.status != http.StatusOK || second.status != http.StatusOK {
+		t.Fatalf("two streams: status %d and %d, want 200 and 200", first.status, second.status)
+	}
+	third := w.openStream(t, w.admin, "", nil)
+	if third.status != http.StatusServiceUnavailable {
+		t.Fatalf("third stream: status %d, want 503", third.status)
+	}
+	var env struct {
+		Error struct {
+			ErrorType string `json:"error_type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(third.body, &env); err != nil || env.Error.ErrorType != "unavailable" {
+		t.Errorf("third stream: body %s, want the envelope with error_type unavailable", third.body)
+	}
+	if got := third.header.Get("Retry-After"); got != "5" {
+		t.Errorf("third stream: Retry-After = %q, want 5", got)
+	}
+
+	first.close()
+	w.waitOpenStreams(t, 1)
+	if again := w.openStream(t, w.admin, "", nil); again.status != http.StatusOK {
+		t.Errorf("after a stream ended: status %d, want 200", again.status)
+	}
+}
+
+func TestStream_ClosesWhenCredentialEnds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		apply func(w *world, tokenID string)
+	}{
+		{"the PAT is revoked", func(w *world, tokenID string) {
+			ctx := context.Background()
+			if err := w.store.Tx(ctx, func(tx *sql.Tx) error {
+				return identity.RevokeTokenByID(ctx, tx, tokenID, w.clock.Now())
+			}); err != nil {
+				w.t.Fatalf("revoke: %v", err)
+			}
+		}},
+		{"the PAT expires", func(w *world, tokenID string) {
+			ctx := context.Background()
+			if err := w.store.Tx(ctx, func(tx *sql.Tx) error {
+				return identity.SetTokenExpiryByID(ctx, tx, tokenID, w.clock.Now().Add(10*time.Second))
+			}); err != nil {
+				w.t.Fatalf("set the expiry: %v", err)
+			}
+		}},
+		{"the PAT's user is blocked", func(w *world, _ string) {
+			w.adminCall(http.MethodPost, "/users/"+w.users["dev"]+"/block", nil, http.StatusOK)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			ctx := context.Background()
+			var token string
+			var pat identity.PAT
+			if err := w.store.Tx(ctx, func(tx *sql.Tx) error {
+				var err error
+				token, pat, err = identity.StorePAT(ctx, tx, identity.PATSpec{UserID: w.users["dev"], Name: "follow",
+					Permissions: []string{"audit:read"}, CreatedAt: w.clock.Now()})
+				return err
+			}); err != nil {
+				t.Fatalf("store a PAT: %v", err)
+			}
+			s := w.openStream(t, token, "", nil)
+			if s.status != http.StatusOK {
+				t.Fatalf("status = %d, want 200", s.status)
+			}
+			s.heartbeat(2 * time.Second)
+			w.clock.WaitTimers(t, 1)
+
+			tc.apply(w, pat.TokenID)
+			w.emit(on("parley.change.open", "api"))
+			if f := s.next(2 * time.Second); f.event != "hub_event" {
+				t.Fatalf("frame %q, want the event emitted before the check", f.lines)
+			}
+			w.clock.WaitTimers(t, 1)
+			w.clock.Advance(30 * time.Second)
+			s.ends(2 * time.Second)
+			w.waitOpenStreams(t, 0)
+		})
+	}
+}
+
+func TestStream_ShutdownClosesStreams(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	readers := []*eventStream{w.openStream(t, w.admin, "", nil), w.openStream(t, w.admin, "", nil)}
+	for _, s := range readers {
+		s.heartbeat(2 * time.Second)
+	}
+	// The third client never reads: its handler is blocked in a write.
+	sw, done := w.stuckStream(t, 1)
+	w.clock.WaitTimers(t, 3)
+	w.emit(on("parley.change.open", "api"))
+	select {
+	case <-sw.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no write blocked within 5 s")
+	}
+	for _, s := range readers {
+		if f := s.next(2 * time.Second); f.event != "hub_event" {
+			t.Fatalf("frame %q, want the hub_event", f.lines)
+		}
+	}
+
+	w.shutDown()
+	returns(t, done, time.Second, "the stream blocked in a write")
+	for _, s := range readers {
+		s.ends(time.Second)
+	}
+	w.waitOpenStreams(t, 0)
 }
