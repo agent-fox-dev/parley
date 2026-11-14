@@ -17,7 +17,10 @@ import (
 // workspace is gone, without fn running. The marker is released when fn
 // returns or panics, on a context the request's end does not cancel, and
 // only while it is still m. Neither write changes updated_at, since the
-// marker is the hub's own and no response shows it.
+// marker is the hub's own and no response shows it. Once the marker is set,
+// fn waits for the syncs and pushes of the workspace that passed the state
+// guard before it to end (see admitWork); the ones that come after it are
+// refused by the marker.
 func (s *Service) withMarker(ctx context.Context, slug string, m Marker, fn func() error) error {
 	db := s.deps.Store.Main()
 	res, err := db.ExecContext(ctx, `UPDATE workspaces SET maintenance = ? WHERE slug = ? AND maintenance = ''`, string(m), slug)
@@ -48,7 +51,43 @@ func (s *Service) withMarker(ctx context.Context, slug string, m Marker, fn func
 			s.deps.Logger.Error("workspace maintenance marker not released", "slug", slug, "marker", string(m), "error", err)
 		}
 	}()
+	defer s.work.lock(slug)()
 	return fn()
+}
+
+// admitWork admits a sync or a push of the workspace slug, whose route
+// judges the record with check, the route's own refusals with the state
+// guard among them: it reads the record and judges it, then holds the
+// workspace's work lock shared, reads and judges the record again under
+// it, and returns that record and the function that releases the lock,
+// which the caller calls when its work has ended. A slug no record has is
+// answered 404. The first read answers a request that comes while a
+// maintenance operation runs at once, without waiting for the operation; the
+// second refuses one whose first read came just before the operation set
+// its marker and which waited for it to end, since it changed the record.
+func (s *Service) admitWork(ctx context.Context, slug string, check func(Workspace) error) (Workspace, func(), error) {
+	read := func() (Workspace, error) {
+		rec, found, err := BySlug(ctx, s.deps.Store.Main(), slug)
+		switch {
+		case err != nil:
+			return Workspace{}, err
+		case !found:
+			// Deleted between the access check and this read: the answer is
+			// the one the check gives for a slug no workspace has.
+			return Workspace{}, server.NotFound(ErrNotFound.Error())
+		}
+		return rec, check(rec)
+	}
+	if _, err := read(); err != nil {
+		return Workspace{}, nil, err
+	}
+	release := s.work.rlock(slug)
+	rec, err := read()
+	if err != nil {
+		release()
+		return Workspace{}, nil, err
+	}
+	return rec, release, nil
 }
 
 // ClearMarkers releases through ex the maintenance marker of every

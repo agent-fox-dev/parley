@@ -566,8 +566,9 @@ func createTags(ctx context.Context, repo *gitrepo.Repo, tags map[string]string)
 	return created, nil
 }
 
-// keyedLocks is a mutex per key, here a workspace's slug, that exists only
-// while someone holds or waits for it. Its zero value is ready for use.
+// keyedLocks is a readers-writer mutex per key, here a workspace's slug,
+// that exists only while someone holds or waits for it. Its zero value is
+// ready for use.
 type keyedLocks struct {
 	mu    sync.Mutex
 	locks map[string]*keyedLock
@@ -576,13 +577,25 @@ type keyedLocks struct {
 // keyedLock is the mutex of one key and the number of its holders and
 // waiters.
 type keyedLock struct {
-	sync.Mutex
+	sync.RWMutex
 	users int
 }
 
-// lock waits until key's mutex is free, takes it and returns the function
-// that frees it.
+// lock waits until key's mutex is free, takes it alone and returns the
+// function that frees it.
 func (k *keyedLocks) lock(key string) (unlock func()) {
+	return k.take(key, false)
+}
+
+// rlock waits until no one holds key's mutex alone or waits to, takes it
+// shared and returns the function that frees it.
+func (k *keyedLocks) rlock(key string) (unlock func()) {
+	return k.take(key, true)
+}
+
+// take takes key's mutex, shared when shared is set, and returns the
+// function that frees it.
+func (k *keyedLocks) take(key string, shared bool) (unlock func()) {
 	k.mu.Lock()
 	if k.locks == nil {
 		k.locks = map[string]*keyedLock{}
@@ -594,9 +607,17 @@ func (k *keyedLocks) lock(key string) (unlock func()) {
 	}
 	l.users++
 	k.mu.Unlock()
-	l.Lock()
+	if shared {
+		l.RLock()
+	} else {
+		l.Lock()
+	}
 	return func() {
-		l.Unlock()
+		if shared {
+			l.RUnlock()
+		} else {
+			l.Unlock()
+		}
 		k.mu.Lock()
 		defer k.mu.Unlock()
 		if l.users--; l.users == 0 {

@@ -1689,7 +1689,9 @@ A workspace in status `ready` or `failed` is archived; the checks run in
 the order of the table below, and a refused archive contacts no origin and
 changes nothing. Once they have passed, the archive runs to its end even
 when the caller disconnects, and while it runs every other request that
-needs the workspace's repository answers `409` `workspace_busy`. It first
+needs the workspace's repository answers `409` `workspace_busy`. A sync or
+push of the workspace already running when the archive starts is waited
+for first. It first
 makes the safety copy: every branch of the hub's copy (for a `carry_patch`
 workspace every branch but its `integration_branch`) is offered to the
 branch of the same name on origin as a fast-forward, in one push with the
@@ -1800,7 +1802,9 @@ A workspace in status `ready` or `failed` without forks is recloned; the
 checks run in the order of the table below, and a refused reclone neither
 contacts origin nor touches the copy. While the reclone runs, every other
 request that needs the workspace's repository is answered `409
-workspace_busy`. First the hub makes the same safety copy as
+workspace_busy`, and a sync or push of the workspace already running when
+the reclone starts is waited for before the reclone changes anything.
+First the hub makes the same safety copy as
 [`POST /api/v1/workspaces/{slug}/archive`](#post-apiv1workspacesslugarchive):
 it offers every branch of its copy to origin as a fast-forward, except a
 carry-patch workspace's integration branch, and goes on whatever origin
@@ -1870,7 +1874,9 @@ disconnects, and while it runs every other request that needs the
 workspace's repository answers `409` `workspace_busy`. First the
 sandboxes of the workspace and of its forks are deleted; when that fails
 the answer is `500 internal` and no record, token or other data has
-changed, so the delete can be repeated. Then, in one store transaction,
+changed, so the delete can be repeated. A fork made after the sandboxes
+were deleted makes the delete answer `409` `workspace_busy` with nothing
+changed, so it can be repeated. Then, in one store transaction,
 the forks are removed in ascending slug order and then the workspace: for
 each, the tokens bound to it are revoked, the data other features keep
 for it (its secrets among them) is removed, its remaining agent sessions
@@ -1908,7 +1914,7 @@ readers of its parent's events, as the fork's other events are.
 | `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
 | `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
-| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`) |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace (`workspace "<slug>" is busy: a reclone is running; try again later`), or a fork of the workspace was made while the delete ran (`workspace "<slug>" got the fork "<fork>" while it was being deleted; try again`): nothing has changed |
 | `409` `workspace_not_archived` | the workspace is in any status other than `archived`, `pending` and `cloning` included (`workspace "<slug>" is ready, not archived`) |
 | `500` `internal` | the workspace is a task fork and no part of the hub deletes task forks (`workspace "<slug>" is a task fork, and no fork remover deletes it`): the fork is unchanged; or the sandboxes could not be deleted, or a step of the removal failed: the workspace is still `archived` and nothing has changed |
 

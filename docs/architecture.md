@@ -1934,7 +1934,9 @@ requests at once.
 `internal/workspace/clone.go` holds the clone work. `(*Service).RepoPath(slug)`
 is the place of a workspace's copy, `<[workspace].path>/<slug>.git`, and the
 one place the path is built. `(*Service).Clone(ctx, slug)` does the clone
-work of one workspace:
+work of one workspace, holding the slug's entry of `Service.copies` while
+it runs, so that it waits for a delete of an earlier workspace with the
+slug to remove that one's copy (see Delete):
 
 1. `StartClone` moves a `pending` workspace to `cloning` and clears its
    `clone_error` before origin is contacted; a workspace already in
@@ -2037,7 +2039,10 @@ second sync of the workspace waits for the first one's fetch and then runs
 its own. The safety copy takes the same entry around its push and the
 origin heads it sets, and a reclone around its removal of the copy, so
 that a sync that passed the state guard before their marker was set does
-not fetch into the copy beside them. Nothing else of a sync takes a lock,
+not fetch into the copy beside them. The sync route also holds the
+workspace's work lock shared for the whole sync (see the maintenance
+marker under Archive), which an archive, a reclone and a delete wait for.
+Nothing else of a sync takes a lock,
 and a sync never writes the
 workspace's status: tag creation is create-only (a tag another sync
 created first is skipped, not an error) and branch moves are single-ref
@@ -2360,7 +2365,18 @@ by `RequireReady` on the record read again (`409 workspace_busy`), or
 `404` when the workspace is gone, without `fn` running. It releases the
 marker in a deferred write on a context that is not cancelled, only while
 it is still `m`, when `fn` returns or panics; a failure to release is
-logged. Neither write changes `updated_at`. `ClearMarkers(ctx, ex)`
+logged. Neither write changes `updated_at`. Once the marker is set, `fn`
+runs holding the workspace's entry of `Service.work` (`keyedLocks`, a
+readers-writer mutex per slug) alone, so it first waits for the syncs and
+pushes of the workspace still running. Those hold the same entry shared
+for their whole run: `(*Service).admitWork(ctx, slug, check)`, which the
+sync and push handlers call in place of their own read, reads the record
+and judges it with the route's refusals (state guard included), takes the
+entry shared, then reads and judges the record again under it. The first
+read answers a request that comes while an operation runs at once
+(`409 workspace_busy`). The second read refuses one that read the record
+just before the marker was set and then waited for the operation to end,
+since the operation has changed the record. `ClearMarkers(ctx, ex)`
 releases every marker; the start hook `workspaces` calls it, so that a
 hub that stopped during an operation starts with no marker.
 
@@ -2437,10 +2453,16 @@ message) and with every status other than `archived` (`409
 workspace_not_archived`). Then it moves off the request's cancellation and,
 holding the `delete` marker (`withMarker`), reads the record again, checks
 it again and takes the teardown set once, whose collaborators every
-removal of the operation then calls. When a sandbox remover is
-registered it lists the forks (`forksOf`, ascending) and calls
+removal of the operation then calls. It lists the forks (`forksOf`,
+ascending) and, when a sandbox remover is registered, calls
 `RemoveSandboxes(ctx, [slug, forks...])` before any write; its error is a
-`500 internal` with nothing changed. Then, in one store transaction: with a
+`500 internal` with nothing changed. It then takes the entries of
+`Service.copies` (`keyedLocks`) of the workspace and those forks, in slug
+order, and holds them until the copies are removed and the discard
+function has run. Clone work holds its slug's entry for its whole run, so
+a workspace created again with the slug once the transaction has
+committed has its clone wait for the removal of the old copy, and the
+removal never meets the new copy. Then, in one store transaction: with a
 fork remover, `RemoveForksOf(ctx, tx, slug, caller)` removes the forks and
 writes their events, and its slugs, sorted, are the `deleted_forks`;
 without one, each fork in ascending slug order is removed by
@@ -2454,8 +2476,11 @@ deleted")` does, with the delete's set rather than a snapshot of its own
 revoked_tokens}`, `revoked_tokens` being what `RemoveOwned` returned). A
 fork's event passes `event.Input.Parent`, because the fork's record is
 already gone when it is written. Last, the workspace itself goes the same
-way, its event with `deleted_forks` as well. Any error rolls the whole
-transaction back and is a `500 internal`, and no repository data is
+way, its event with `deleted_forks` as well. A removed fork that was not in
+the list read before the sandboxes went, a fork made while the delete ran
+whose sandbox may still run, rolls the transaction back with `409
+workspace_busy`, and the delete can be repeated. Any other error rolls the
+whole transaction back and is a `500 internal`, and no repository data is
 discarded. After the commit `Deps.RemoveCopy(RepoPath(ws))` removes the
 copy of each fork the transaction removed itself and then the workspace's
 (a failure is logged as `workspace copy not removed after a delete` with
