@@ -3,11 +3,11 @@
   "spec_id": "39",
   "spec_name": "secrets",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-14T04:58:56Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
