@@ -380,19 +380,20 @@ Usage:
   parley [command]
 
 Available Commands:
-  admin       Administer the hub's users, organizations, API keys and access tokens
-  events      Follow the hub's events, or read them a page at a time
-  fork        Create, list, extend and delete the task forks of a workspace
-  help        Print the help of parley or of a command
-  keys        List, refresh and revoke your API keys
-  login       Sign in to the hub and save the hub URL and the credential
-  orgs        List and read the organizations you belong to
-  sandbox     Work with the hub's sandboxes and their profiles
-  secrets     Create, list, update and delete secrets, whose values the hub never shows
-  tokens      Create, read, change and revoke your personal access tokens
-  user        Read and update your own profile
-  version     Print the client's build and, given a hub URL, the hub's build
-  workspace   Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub
+  admin             Administer the hub's users, organizations, API keys and access tokens
+  credential-helper Give git the hub credential for the hub's own URL (git's credential helper protocol)
+  events            Follow the hub's events, or read them a page at a time
+  fork              Create, list, extend and delete the task forks of a workspace
+  help              Print the help of parley or of a command
+  keys              List, refresh and revoke your API keys
+  login             Sign in to the hub and save the hub URL and the credential
+  orgs              List and read the organizations you belong to
+  sandbox           Work with the hub's sandboxes and their profiles
+  secrets           Create, list, update and delete secrets, whose values the hub never shows
+  tokens            Create, read, change and revoke your personal access tokens
+  user              Read and update your own profile
+  version           Print the client's build and, given a hub URL, the hub's build
+  workspace         Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub
 
 Flags:
       --api-key string        credential presented to the hub (default: $PARLEY_API_KEY, then api_key in the config file); parley login takes it from this flag alone and stores it (- reads it from stdin)
@@ -1987,6 +1988,68 @@ needs the flag --ttl`) or an empty one (`parley fork extend needs a value for
 --ttl`) are refused with a `usage_error` and exit status `2` before any
 setting is read or any request sent. `--confirm` is an unknown flag of
 `parley fork delete`, refused the same way.
+
+### `parley credential-helper`
+
+```
+Usage:
+  parley credential-helper <verb> [flags]
+```
+
+A [git credential helper](https://git-scm.com/docs/gitcredentials) that
+hands the hub credential to git for the hub's own URL, so that the plain
+URLs of the [git routes](api.md#git-over-http), such as
+`<hub URL>/git/acme/demo.git`, work without typing a credential. Set it up
+once for the hub's URL:
+
+```sh
+git config --global credential.<hub-url>.helper '!parley credential-helper'
+```
+
+The credential may be an API key or a PAT. The command makes no request to
+the hub, takes no flags of its own and reads no setting when the verb is not
+`get`.
+
+**`get`.** It reads git's request from stdin: `key=value` lines up to the
+first empty line or the end of input. It keeps the value (the text after the
+first `=`) of `protocol` and of `host`, the last one when a key comes twice,
+and ignores every other key, every line without `=` and everything after the
+empty line. It then takes the hub URL and the credential as every command
+does (see [Settings](#settings-the-hub-url-and-the-credential)): the
+global flags, then `PARLEY_ENDPOINT_URL` and `PARLEY_API_KEY`, each when set
+and not empty, then `endpoint_url` and `api_key` of the configuration file,
+read only when one of the two is still empty. It answers only when the
+request's `protocol` equals the hub URL's scheme, its host name equals the
+hub URL's without regard to case, and the ports are equal, a missing port
+being `443` for `https` and `80` for `http`; neither path is looked at. The
+answer is four lines on stdout, `protocol` and `host` as the request gave
+them:
+
+```
+protocol=https
+host=hub.example:8443
+username=x-token-auth
+password=<credential>
+```
+
+For hub `https://hub.example`, `host=HUB.example:443` and `host=hub.example`
+are answered; `protocol=http`, `host=hub.example:444` and
+`host=hub.example.evil` are not.
+
+**No answer.** When the request has no `protocol` or no `host`, names
+another scheme, host or port, or the settings lack the hub URL or the
+credential, the configuration file cannot be read or parsed, or the hub URL
+is not an absolute `http` or `https` URL with a host and without a query or
+fragment, the command prints nothing, on stdout or stderr, and exits `0`, so
+that git goes on to its next helper.
+
+**Other verbs.** `store`, `erase` and any other verb (`GET` included: the
+verb is matched exactly) print nothing, read neither stdin nor the
+configuration file, and exit `0`: the credential lives in parley's settings,
+not in git.
+
+**Client checks.** No verb, or a second argument, is a `usage_error` with
+exit status `2`, the error envelope on stderr and nothing on stdout.
 
 ### Output
 

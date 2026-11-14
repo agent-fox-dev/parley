@@ -215,3 +215,17 @@ built. The git server reads the setting through its `Settings` dependency,
 and the case is tested with an empty `workspace.SettingsRegistry` set
 through `AdjustGitServer` while the stored settings document holds
 `audit_fetches: true`: no event is written.
+
+## The credential helper refuses every hub URL the other commands refuse
+
+The package lists the settings for which `parley credential-helper get`
+answers nothing: a missing hub URL or credential, a hub URL without a host
+or of a scheme other than `http` and `https`, and a configuration file that
+cannot be read. Its design decision says the helper resolves its settings
+as every command does. It does so literally: it calls `resolveSettings` in
+`internal/cli/config.go`, the function every command of auth `user` or
+`admin` resolves its settings with, and takes any error it returns as no
+answer. That function also refuses a hub URL with a query or a fragment
+(`checkHubURL`), with which no other command works either, so the helper
+answers nothing for such a URL too, where the package's list would answer
+when the scheme, host and port match.
