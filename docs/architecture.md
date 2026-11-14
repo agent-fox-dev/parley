@@ -32,7 +32,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
-| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync` and `POST /api/v1/workspaces/:slug/branches/:name/push` and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
+| `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push` and `POST /api/v1/workspaces/:slug/archive` (see Archive) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive holds with `ClearMarkers`, which releases every marker at start (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
 ## The HTTP server
@@ -1708,7 +1708,9 @@ the workspace list the caller's readable set, the hub's scrubber, logger and clo
 `OriginLister` that lists an origin's refs with a `Credential`, the type
 `gitrepo.Credential`, so that a resolved credential goes to git unchanged),
 applies every function `AdjustWorkspace` added, and binds the service with
-`Bind`. Before it builds them, the hook builds the clone workers with
+`Bind`. First of all the hook releases every maintenance marker with
+`workspace.ClearMarkers` (see Archive), whose failure stops the start.
+Before it builds the dependencies, the hook builds the clone workers with
 `workspace.NewWorkers(cfg.Workspace.Workers, svc, nil)`, whose refusal stops
 the start; after `Bind` it calls their `Start`, so that the clone work left
 from before the start is queued before the hub listens (see Clone work),
@@ -2265,7 +2267,48 @@ took some, and `failed` when it took none, including a transport failure
 or a deadline with no branch taken. A failure (the copy that cannot be
 read, the credential, the refused branches and the push's error) is
 logged as `workspace safety copy failed` with the slug and the step, its
-text passed through the scrubber with the credential.
+text passed through the scrubber with the credential. A refused branch and
+the push's error are logged only by their class (`pushReason`): the
+`Class` of a `*gitrepo.PushError`, `ErrNonFastForward`'s text, `the push
+did not finish within its deadline`, or `ErrPushFailed`'s text for any
+other error, never what git or origin wrote, which may hold anything
+origin chose to send.
+
+#### Archive
+
+`internal/workspace/archive.go` holds `POST /workspaces/:slug/archive`
+(scope `workspaces:write`, `access.MarkNeed` `write`, so that only the
+owner and the admin token reach the handler; the body is not read). The
+handler reads the record and refuses, in this order, a fork (`400
+not_supported_on_fork`), then, through `RequireReady`, a set marker or a
+status `pending` or `cloning` (`409 workspace_busy`) and `archived` (`409
+workspace_archived`); `ready` and `failed` pass. It then detaches from the
+request's cancellation (`context.WithoutCancel`) and runs the archive with
+the marker `archive` held. Under the marker it reads the record again and
+checks the status again, makes the safety copy, and in one store
+transaction sets `status` `archived`, clears `clone_error`, sets
+`updated_at`, counts the rows whose `parent_slug` is the workspace, and
+emits `parley.workspace.archive` (actor as for the other workspace
+events, `resource_type` `workspace`, `metadata` `{head_sha, origin_push,
+forks}`, `head_sha` the record's, `null` when it has none). A failure of
+the transaction is a `500 internal` with nothing changed. The answer is
+the record read after the commit, rendered by `RenderWorkspace`. The copy
+is read only by the safety copy, and no fork record or other data is
+touched.
+
+`internal/workspace/maintenance.go` holds the maintenance marker, the
+record's `maintenance` column, which `RequireReady` reads (see errata 14:
+the marker is stored, not kept in memory). `(*Service).withMarker(ctx,
+slug, m, fn)` sets it with one conditional write (`UPDATE workspaces SET
+maintenance = ? WHERE slug = ? AND maintenance = ''`), so that of two
+operations that ask at once exactly one holds it; the other is answered
+by `RequireReady` on the record read again (`409 workspace_busy`), or
+`404` when the workspace is gone, without `fn` running. It releases the
+marker in a deferred write on a context that is not cancelled, only while
+it is still `m`, when `fn` returns or panics; a failure to release is
+logged. Neither write changes `updated_at`. `ClearMarkers(ctx, ex)`
+releases every marker; the start hook `workspaces` calls it, so that a
+hub that stopped during an operation starts with no marker.
 
 ### Hub events
 

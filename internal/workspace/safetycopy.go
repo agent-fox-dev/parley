@@ -41,8 +41,8 @@ const (
 // commit offered; a refused branch keeps its own. The outcome is one of
 // ok, partial and failed, and nothing origin answers stops the caller:
 // there is no error, a failure is logged with the slug, its text scrubbed
-// of the credential. A workspace without a copy, whose clone failed, has
-// nothing to offer.
+// of the credential, and a refused push only by its class (pushReason). A
+// workspace without a copy, whose clone failed, has nothing to offer.
 func (s *Service) safetyCopy(ctx context.Context, w Workspace) string {
 	dir := s.RepoPath(w.Slug)
 	if w.Status == StatusFailed || w.GitURL == nil {
@@ -85,7 +85,7 @@ func (s *Service) safetyCopy(ctx context.Context, w Workspace) string {
 	var refused []string
 	for _, r := range results {
 		if r.Err != nil {
-			refused = append(refused, r.Err.Error())
+			refused = append(refused, r.Branch+": "+pushReason(r.Err))
 			continue
 		}
 		accepted++
@@ -94,7 +94,7 @@ func (s *Service) safetyCopy(ctx context.Context, w Workspace) string {
 		}
 	}
 	if err != nil {
-		refused = append(refused, err.Error())
+		refused = append(refused, pushReason(err))
 	}
 	if len(refused) > 0 {
 		fail("push", errors.New(strings.Join(refused, "; ")))
@@ -106,4 +106,20 @@ func (s *Service) safetyCopy(ctx context.Context, w Workspace) string {
 		return originPushPartial
 	}
 	return originPushFailed
+}
+
+// pushReason is what the log of a safety copy says of a branch origin
+// refused or of a push that failed: the class of the failure, never the
+// text git or origin wrote, which may hold anything origin chose to send.
+func pushReason(err error) string {
+	var failed *gitrepo.PushError
+	switch {
+	case errors.As(err, &failed) && failed.Class != nil:
+		return failed.Class.Error()
+	case errors.Is(err, gitrepo.ErrNonFastForward):
+		return gitrepo.ErrNonFastForward.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the push did not finish within its deadline"
+	}
+	return gitrepo.ErrPushFailed.Error()
 }

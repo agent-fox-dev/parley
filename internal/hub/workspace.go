@@ -85,6 +85,11 @@ func composeWorkspaces(c *Composition) {
 	// Built by the start hook, which runs before the background work.
 	var workers *workspace.Workers
 	c.AddStartHook(workspacesHook, func(ctx context.Context, rt *Runtime) error {
+		// A maintenance marker guards an operation of a running hub only;
+		// one left by a hub that stopped during it is released first.
+		if err := workspace.ClearMarkers(ctx, rt.Store.Main()); err != nil {
+			return err
+		}
 		var err error
 		if workers, err = workspace.NewWorkers(rt.Config.Workspace.Workers, svc, nil); err != nil {
 			return err

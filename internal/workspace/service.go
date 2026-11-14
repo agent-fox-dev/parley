@@ -183,5 +183,6 @@ func (s *Service) Settings() *SettingsRegistry { return &s.settings }
 
 // Routes returns the workspace routes of the REST API.
 func (s *Service) Routes() []server.Route {
-	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute(), s.syncRoute(), s.pushRoute()}
+	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute(), s.syncRoute(), s.pushRoute(),
+		s.archiveRoute()}
 }

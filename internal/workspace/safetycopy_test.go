@@ -2,7 +2,10 @@ package workspace_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -190,5 +194,44 @@ func TestSafetyCopy_ReducesTheBranchResultsToOneOutcome(t *testing.T) {
 				t.Errorf("the push's context ended with %v, want ended = %v", ctxErrs[0], c.cancelled)
 			}
 		})
+	}
+}
+
+func TestSafetyCopy_KeepsTheCredentialAndOriginsWordsOutOfTheArchive(t *testing.T) {
+	t.Parallel()
+	const said = "remote: denied for https://x-token-auth:s3cr3t-token@origin.test/r.git"
+	var log hubtest.LogBuffer
+	p := &stubBranchesPusher{answer: func(_ context.Context, req gitrepo.PushBranchesRequest) ([]gitrepo.BranchPush, error) {
+		refused := &gitrepo.PushError{Branch: "main", Class: gitrepo.ErrOriginRejected, Reason: said}
+		return []gitrepo.BranchPush{{Branch: "main", Commit: req.Heads["main"], Err: refused}}, errors.New(said)
+	}}
+	s := newSyncWorld(t, withLog(&log), withSafetyPusher(p))
+	s.storeSecrets(t, map[string]string{workspace.SecretGitPAT: "s3cr3t-token"})
+
+	a := s.archive(t, s.uKey, syncSlug)
+
+	if a.status != http.StatusOK {
+		t.Fatalf("archive = %d %s, want 200", a.status, a.body)
+	}
+	evs := s.eventsOf(t, archiveEvent)
+	if len(evs) != 1 {
+		t.Fatalf("%d archive events, want 1", len(evs))
+	}
+	ev, err := json.Marshal(evs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(evs[0].Metadata), `"origin_push":"failed"`) {
+		t.Errorf("the archive event's metadata is %s, want origin_push failed", evs[0].Metadata)
+	}
+	if !strings.Contains(log.String(), "workspace safety copy failed") {
+		t.Errorf("the log does not report the failed safety copy:\n%s", log.String())
+	}
+	for what, text := range map[string]string{"the answer": string(a.body), "the event": string(ev), "the log": log.String()} {
+		for _, secret := range []string{"s3cr3t-token", "remote: denied"} {
+			if strings.Contains(text, secret) {
+				t.Errorf("%s holds %q:\n%s", what, secret, text)
+			}
+		}
 	}
 }

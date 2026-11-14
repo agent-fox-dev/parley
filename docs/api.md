@@ -1676,6 +1676,64 @@ never both:
 | `504` `origin_timeout` | the push had not finished 2 minutes after it began; `git` is killed with every process it started before the answer (`the push of branch "<name>" to origin did not finish within 2m0s`) |
 | `500` `internal` | the workspace's secrets could not be read, in which case origin is not contacted and nothing is pushed without a credential and no event is written; the records of a push handed to origin could not be written, in which case no event is written and, when origin took the push, the origin head is put back unless a sync has moved it since; or the hub failed otherwise |
 
+## `POST /api/v1/workspaces/{slug}/archive`
+
+Takes the repository workspace `{slug}` out of service without losing
+anything the hub holds. It takes the admin token, an API key or a PAT,
+declares the scope `workspaces:write` for a PAT and needs write access to
+the workspace (see [Workspace access](#workspace-access)): its owner or the
+admin token. The route reads no body; one that passes the content-type and
+size rules is ignored.
+
+A workspace in status `ready` or `failed` is archived; the checks run in
+the order of the table below, and a refused archive contacts no origin and
+changes nothing. Once they have passed, the archive runs to its end even
+when the caller disconnects, and while it runs every other request that
+needs the workspace's repository answers `409` `workspace_busy`. It first
+makes the safety copy: every branch of the hub's copy (for a `carry_patch`
+workspace every branch but its `integration_branch`) is offered to the
+branch of the same name on origin as a fast-forward, in one push with the
+workspace's origin credential and a deadline of two minutes, sending no
+tag, forcing nothing and deleting nothing. Whatever origin answers, the
+archive goes on: a branch origin refused stays in the hub's copy. A
+`failed` workspace, or one with no copy, offers nothing. Then, in one
+store transaction, `status` becomes `archived`, `clone_error` is cleared
+and one `parley.workspace.archive` event is written; when that transaction
+fails nothing has changed and the answer is `500 internal`. The hub's
+copy, every ref of it, and the workspace's forks are left as they are.
+
+The event has `workspace` the slug, `resource_type` `workspace`,
+`resource_id` the slug, and as actor the caller as for
+[`PATCH /api/v1/workspaces/{slug}`](#patch-apiv1workspacesslug). Its
+`metadata` holds `head_sha` (the workspace's `head_sha` when it was
+archived, `null` when it has none), `origin_push`, the outcome of the
+safety copy, and `forks`, the number of forks of the workspace.
+`origin_push` is `ok` when origin took every branch offered or there was
+none to offer, `partial` when it took at least one and refused at least
+one, and `failed` when it took none, also when the credential could not be
+read (no anonymous push is tried), origin refused the credential, could
+not be reached or did not answer within the deadline. Neither the answer
+nor the event nor the hub's log holds the credential or what origin said.
+
+```json
+{"seq":16,"id":"…","type":"parley.workspace.archive","time":"2026-11-14T10:40:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"workspace","resource_id":"demo","action":"archive","session_id":null,"metadata":{"head_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_push":"partial","forks":2}}
+```
+
+The answer is the workspace object, read after the archive, with `status`
+`archived`, `clone_error` `null` and `access` the caller's level, the
+object [`GET /api/v1/workspaces/{slug}`](#get-apiv1workspacesslug) answers.
+
+| Status | When |
+|---|---|
+| `200 OK` | the workspace is archived, whatever `origin_push` says; the body is the workspace object |
+| `400` `not_supported_on_fork` | the workspace is a task fork (`workspace "<slug>" is a task fork, which cannot be archived; delete it instead`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`) |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`) |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`); also a bound PAT on a workspace outside its binding |
+| `409` `workspace_busy` | a reclone, archive or delete runs on the workspace, in any status (`workspace "<slug>" is busy: a reclone is running; try again later`), or it is `pending` or `cloning` (`workspace "<slug>" is busy: its clone has not finished; try again later`) |
+| `409` `workspace_archived` | the workspace is `archived` already (`workspace "<slug>" is archived`) |
+| `500` `internal` | the status change or its event could not be written; the workspace is as it was |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to
