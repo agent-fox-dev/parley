@@ -2,6 +2,7 @@ package workspace_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -283,4 +284,32 @@ func (o *fakeOrigin) called() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return len(o.calls)
+}
+
+// putSecret stores the workspace secret name of slug through the secret
+// component.
+func (w *world) putSecret(t *testing.T, slug, name, value string) {
+	t.Helper()
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		return w.secrets.Put(context.Background(), tx, secret.ScopeWorkspace, slug, name, value)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// failingReader is a secret reader whose read of the secret fail answers
+// err; it answers the others from values.
+type failingReader struct {
+	fail   string
+	err    error
+	values map[string]string
+}
+
+func (r failingReader) Get(_ context.Context, _ secret.Scope, _, name string) (string, bool, error) {
+	if name == r.fail {
+		return "", false, r.err
+	}
+	v, ok := r.values[name]
+	return v, ok, nil
 }

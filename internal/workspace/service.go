@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -20,7 +21,7 @@ import (
 type Secrets interface {
 	Available() bool
 	Put(ctx context.Context, tx *sql.Tx, scope secret.Scope, scopeID, name, value string) error
-	Get(ctx context.Context, scope secret.Scope, scopeID, name string) (value string, found bool, err error)
+	SecretReader
 }
 
 // Events is the event component as the service uses it: it writes an event
@@ -30,11 +31,9 @@ type Events interface {
 }
 
 // Credential is what git presents to origin: a user name and a password or
-// token. The zero value is no credential.
-type Credential struct {
-	Username string
-	Password string
-}
+// token. The zero value is no credential. It is gitrepo's type, so that a
+// resolved credential goes to git unchanged.
+type Credential = gitrepo.Credential
 
 // OriginLister lists the refs of an origin with a credential. An error means
 // that origin refused the credential or could not be reached.
