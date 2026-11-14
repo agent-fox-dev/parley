@@ -1,18 +1,28 @@
 package sandbox_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // The content of the files every configuration dir of loadSandbox holds. The
@@ -185,4 +195,163 @@ func ops(calls []runtimetest.Call) []string {
 		out[i] = c.Op
 	}
 	return out
+}
+
+// gatewayToken is the content of the token file of a hub with sandboxes on.
+const gatewayToken = "gw-tok-SECRET"
+
+// sandboxesOn is what startProbeHub adds to a hub's configuration to turn
+// sandboxes on: [server].external_url and a [sandbox] section with the
+// token file gateway-token and the profile agent.
+var sandboxesOn = hubtest.Config{
+	Server: "external_url = \"https://hub.test\"\n",
+	TOML: "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
+		"[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n",
+	Files: map[string]string{"gateway-token": gatewayToken + "\n"},
+}
+
+// probeBodyLimit is the body limit of the probe write route.
+const probeBodyLimit = 1024
+
+// probeHub is a real hub with the sandbox probe routes, each declared with
+// the sandbox service's declarations, and the workspace ws owned by owner in
+// the org team, of which member is a member and outsider is not. A probe
+// answers 200 and counts its calls.
+type probeHub struct {
+	*hubtest.Hub
+	// rt is the runtime of a hub with sandboxes on; nil with sandboxes off.
+	rt    *runtimetest.Fake
+	calls atomic.Int64
+	// owner, member and outsider are user ids.
+	owner, member, outsider string
+}
+
+// startProbeHub starts a probe hub, with sandboxes on over a fake runtime
+// when on is true. Its probe routes are:
+//
+//   - GET /sandbox-profiles (scope sandboxes:read) and GET /sandboxes,
+//     declared for the whole hub;
+//   - GET /workspaces/:slug/sandboxes/probe-read, of kind read;
+//   - POST /workspaces/:slug/sandboxes/probe-write, of kind write, with the
+//     body limit probeBodyLimit;
+//   - POST /workspaces/:slug/sandboxes/probe-create, of kind write and
+//     needing a user, which answers 400 to a body without a name;
+//   - GET /workspaces/:slug/sandboxes/probe-runtime, of kind read, which
+//     returns the error of GetSandbox.
+func startProbeHub(t *testing.T, on bool) *probeHub {
+	t.Helper()
+	h := &probeHub{}
+	var cfg hubtest.Config
+	if on {
+		cfg = sandboxesOn
+		h.rt = runtimetest.New(t)
+	}
+	cfg.Compose = func(c *hub.Composition) {
+		svc := c.Sandbox()
+		if on {
+			c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+				return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+			})
+		}
+		// The routes of the whole hub stand in for the feature's own until
+		// the hub serves them.
+		c.AddRoute(svc.Route(server.Route{Method: http.MethodGet, Pattern: "/sandbox-profiles", Scope: "sandboxes:read", Handler: h.probe}))
+		c.AddRoute(svc.Route(server.Route{Method: http.MethodGet, Pattern: "/sandboxes", Handler: h.probe}))
+		c.AddRoute(svc.WorkspaceRoute(sandbox.KindRead, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/sandboxes/probe-read", Handler: h.probe}))
+		c.AddRoute(svc.WorkspaceRoute(sandbox.KindWrite, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/sandboxes/probe-write", MaxBodySize: probeBodyLimit, Handler: h.probe}))
+		c.AddRoute(svc.WorkspaceRoute(sandbox.KindWrite, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/sandboxes/probe-create", Handler: func(w http.ResponseWriter, r *http.Request) error {
+			h.calls.Add(1)
+			var body struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+				return server.InvalidRequest("name is required")
+			}
+			server.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return nil
+		}}, sandbox.NeedsUser()))
+		c.AddRoute(svc.WorkspaceRoute(sandbox.KindRead, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/sandboxes/probe-runtime", Handler: func(w http.ResponseWriter, r *http.Request) error {
+			h.calls.Add(1)
+			if _, err := svc.Client().GetSandbox(r.Context(), "probe"); err != nil {
+				return err
+			}
+			server.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return nil
+		}}))
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	h.owner, h.member, h.outsider = h.CreateUser(t, "owner"), h.CreateUser(t, "member"), h.CreateUser(t, "outsider")
+	org := h.CreateOrg(t, "team")
+	h.AddMember(t, org, h.member)
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: org, Kind: access.KindRepository, Status: access.StatusReady})
+	return h
+}
+
+func (h *probeHub) probe(w http.ResponseWriter, _ *http.Request) error {
+	h.calls.Add(1)
+	server.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	return nil
+}
+
+// pat stores a PAT of the user userID with permissions and returns it.
+func (h *probeHub) pat(t *testing.T, userID string, permissions ...string) string {
+	t.Helper()
+	return h.IssuePAT(t, identity.PATSpec{UserID: userID, Permissions: permissions})
+}
+
+// answer is the answer to a request: its status, its body and the members
+// of its error envelope, if it has one.
+type answer struct {
+	status int
+	body   []byte
+	err    struct {
+		Code      int    `json:"code"`
+		Message   string `json:"message"`
+		ErrorType string `json:"error_type"`
+	}
+}
+
+// call sends method path, under /api/v1, with cred as the bearer credential
+// ("" for none) and body: nil for none, []byte as it is, anything else as
+// JSON; a body is sent as application/json.
+func (h *probeHub) call(t *testing.T, method, path, cred string, body any) answer {
+	t.Helper()
+	var data io.Reader
+	switch b := body.(type) {
+	case nil:
+	case []byte:
+		data = bytes.NewReader(b)
+	default:
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, h.URL("/api/v1"+path), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred != "" {
+		req.Header.Set("Authorization", "Bearer "+cred)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer res.Body.Close()
+	a := answer{status: res.StatusCode}
+	if a.body, err = io.ReadAll(res.Body); err != nil {
+		t.Fatalf("%s %s: read the body: %v", method, path, err)
+	}
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
 }

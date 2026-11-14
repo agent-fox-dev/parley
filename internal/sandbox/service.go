@@ -41,6 +41,7 @@ type Service struct {
 	client      runtime.Client
 	release     runtime.Release
 	releases    ReleaseRange
+	scrubber    *scrub.Scrubber
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

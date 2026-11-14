@@ -51,7 +51,9 @@ that fails answers the request, and no later check or the handler runs.
 4. The body size, then the content type: `413` or `415`, as in
    [Request bodies](#request-bodies).
 5. The route's own feature check, where it declares one, then the binding
-   guard.
+   guard. Every sandbox route has the sandbox feature check: `404`
+   `sandboxes_disabled` on a hub without sandboxes (see
+   [Sandbox routes](#sandbox-routes)).
 6. The scope check: `403 insufficient_scope` for a PAT whose permissions
    do not satisfy the scope the route declares (see [Scopes](#scopes)).
 7. The access checks: first the admin check of the admin routes, `403
@@ -1035,6 +1037,63 @@ The check runs in the access position of the [order of checks](#order-of-checks)
 after the admin check and before the `Idempotency-Key` of a create route, so
 a replayed create is decided again. No route declares a need yet; the
 workspace routes will.
+
+## Sandbox routes
+
+Sandboxes are optional: a hub offers them only with a `[sandbox]` section
+(see [configuration.md](configuration.md#sandboxes)). Every sandbox route
+runs the sandbox feature check in step 5 of the [order of checks](#order-of-checks),
+after authentication, the rate limit and the body checks and before the
+binding guard, the scope check, workspace access and the handler. On a hub
+without sandboxes it answers every authenticated caller, the admin token
+included, whatever the scopes of a PAT and whether or not the workspace
+exists:
+
+```json
+{"error":{"code":404,"message":"sandboxes are not enabled on this hub","error_type":"sandboxes_disabled"}}
+```
+
+A request without a credential still gets `401 unauthenticated`, a path no
+route has `404 not_found`, a method the route does not have `405
+method_not_allowed` and a body over the limit `413`, since those steps come
+first. On a hub with sandboxes the check passes and the later checks and the
+handler decide.
+
+A sandbox route of a workspace, under `/api/v1/workspaces/{slug}/sandboxes`,
+is of one of two kinds:
+
+| Kind | Scope of a PAT | Workspace access | Routes |
+|---|---|---|---|
+| read | `sandboxes:read` | `read` | getting a sandbox, listing a workspace's sandboxes, its logs, downloading a file, listing policy proposals |
+| write | `sandboxes:write` | `write` | every other, creating, exec, attach, uploading, stop, start, delete, checkpoints, approving and rejecting a proposal included |
+
+The scope is checked before workspace access, so a PAT without the scope is
+answered `403 insufficient_scope` also on a slug that names no workspace,
+and an org member's PAT without `sandboxes:write` gets `403
+insufficient_scope` on a write route, not `403 forbidden`. The admin token
+passes as an owner of every workspace, except on a route that acts for a
+user, such as creating a sandbox: there it is answered, after workspace
+access and before the route reads its body,
+
+```json
+{"error":{"code":403,"message":"the admin token cannot create a sandbox","error_type":"forbidden"}}
+```
+
+and on a slug that names no workspace `404 not_found`, since workspace
+access is decided first.
+
+When the sandbox runtime cannot be reached, or has no operation for what a
+sandbox route asks of it, the route answers `502` with `error_type`
+`sandbox_runtime_error`. Its message is the runtime's error with the
+gateway's credentials and any user information of a URL removed; do not
+branch on it. The hub keeps serving: routes that read only the hub's own
+state keep answering.
+
+```json
+{"error":{"code":502,"message":"sandbox runtime: get_sandbox: unavailable: connection refused","error_type":"sandbox_runtime_error"}}
+```
+
+No sandbox route is served yet; the sandbox routes will be.
 
 ## User selectors
 

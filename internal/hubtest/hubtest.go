@@ -10,6 +10,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -111,8 +114,9 @@ func (s *Served) ExitCode(t testing.TB, within time.Duration) int {
 }
 
 // Hub is a running hub bootstrapped with an admin token, and its store, for
-// what no route does: seeding users and issuing an API key the way a login
-// does.
+// what no route does: seeding users, issuing an API key the way a login
+// does, storing a PAT and a workspace record. Orgs and their members are
+// made through the admin routes.
 type Hub struct {
 	*Served
 	Token string
@@ -222,4 +226,83 @@ func (h *Hub) IssueKey(t testing.TB, userID string) string {
 		t.Fatalf("issue a key for %s: %v", userID, err)
 	}
 	return key
+}
+
+// IssuePAT stores the PAT spec describes, as minting one does, and returns
+// the token. An empty name is "test" and a zero creation time is now.
+func (h *Hub) IssuePAT(t testing.TB, spec identity.PATSpec) string {
+	t.Helper()
+	if spec.Name == "" {
+		spec.Name = "test"
+	}
+	if spec.CreatedAt.IsZero() {
+		spec.CreatedAt = time.Now()
+	}
+	ctx := context.Background()
+	var token string
+	err := h.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		token, _, err = identity.StorePAT(ctx, tx, spec)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("store a PAT for %s: %v", spec.UserID, err)
+	}
+	return token
+}
+
+// CreateOrg creates the active org slug, named slug, through the admin
+// route and returns its id.
+func (h *Hub) CreateOrg(t testing.TB, slug string) string {
+	t.Helper()
+	status, body := h.admin(t, http.MethodPost, "/api/v1/orgs", `{"name":"`+slug+`","slug":"`+slug+`"}`)
+	var org struct {
+		ID string `json:"id"`
+	}
+	if status != http.StatusCreated || json.Unmarshal(body, &org) != nil || org.ID == "" {
+		t.Fatalf("create org %s = %d %s, want 201 with an id", slug, status, body)
+	}
+	return org.ID
+}
+
+// AddMember makes the user userID a member of the org orgID through the
+// admin route.
+func (h *Hub) AddMember(t testing.TB, orgID, userID string) {
+	t.Helper()
+	if status, body := h.admin(t, http.MethodPut, "/api/v1/orgs/"+orgID+"/members/"+userID, ""); status != http.StatusNoContent {
+		t.Fatalf("add member %s to %s = %d %s, want 204", userID, orgID, status, body)
+	}
+}
+
+// AddWorkspace stores the workspace record rec, the record the access rule
+// decides from, as registering or forking a workspace does.
+func (h *Hub) AddWorkspace(t testing.TB, rec access.Record) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return access.InsertRecord(ctx, tx, rec) }); err != nil {
+		t.Fatalf("store the workspace record %+v: %v", rec, err)
+	}
+}
+
+// admin sends method path with the admin token and body as JSON ("" for
+// none), and returns the status and the body of the answer.
+func (h *Hub) admin(t testing.TB, method, path, body string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, h.URL(path), strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.Token)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("%s %s: read the body: %v", method, path, err)
+	}
+	return res.StatusCode, b
 }

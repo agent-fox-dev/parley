@@ -225,3 +225,30 @@ the members its parts add with the unexported `addVersionMember`.
   `compat.go` and a release inside it, not an injected range: the hub takes
   no range of its own. The range is injected (`CheckOptions.Releases`) in
   the tests of the check.
+
+## How the sandbox routes are declared
+
+The package places the feature check at the router's feature-check
+position, and the needs-a-user rule and the runtime-error answer after
+workspace access and before the handler validates the body; it does not say
+how. The feature check is `server.Route.Feature`, which the pipeline runs
+after the body checks and before the binding guard. The other two wrap the
+route's handler, which runs after every access check, so no new pipeline
+position was added. The declarations are methods of `*sandbox.Service`:
+`Route` for the routes of the whole hub (the feature check and the
+runtime-error answer), `WorkspaceRoute(kind, route, opts...)` for workspace
+routes (also the scope `sandboxes:read` or `sandboxes:write` and the
+workspace need `read` or `write`, replacing what the route gives) and the
+option `NeedsUser`. Since routes are declared before the configuration is
+loaded, the feature check reads whether sandboxes are on per request.
+
+- The disabled answer's message is `sandboxes are not enabled on this hub`.
+- The runtime-error wrapper answers only an error of kind `ErrUnavailable`
+  or `ErrUnsupported`, tested with `errors.Is`, that is not already a
+  `*server.Error`: an error of no runtime kind stays `500 internal`, though
+  `runtime.KindOf` would take it for unavailable, so that a fault of the hub
+  is not reported as the runtime's. Its message is the runtime error's text
+  passed through the hub's scrubber, which the start hook gives the service
+  with `SetScrubber` whether or not sandboxes are on.
+- There is no binding guard yet; the declarations need none of their own,
+  since it is a pipeline position.

@@ -17,9 +17,9 @@ command-line client. Both are written in Go, in the module
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
-| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it) and files in the config dir, `Serve` runs a hub with given options until the test ends, and `LogBuffer` holds a running hub's log for the test to read |
+| `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it) and files in the config dir, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release), and `Recorder` is the metrics recorder of the sandbox packages |
+| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `RuntimeError` is the `502 sandbox_runtime_error` answer, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only package that imports the SDK: `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
@@ -1430,6 +1430,40 @@ release. `(*sandbox.Service).Version()` then gives `GET /version` its
 `sandbox_runtime` member, `supported` (`ReleaseRange.String()`,
 `>=0.1.0 <0.2.0`) and `connected`; it makes no call, so it does not change
 while the runtime is unreachable.
+
+## Sandbox route declarations
+
+The sandbox packages add their routes through the `*sandbox.Service` of
+`(*Composition).Sandbox()`, which declares them on top of the pipeline's
+positions rather than adding positions of its own:
+
+- `Route(server.Route)` declares a route of the whole hub, such as the
+  profile list: it sets `Route.Feature` to the service's feature check and
+  wraps the handler with the runtime-error answer, and keeps the route's
+  scope and marks.
+- `WorkspaceRoute(kind, server.Route, opts...)` declares a route under
+  `/workspaces/:slug/sandboxes`: on top of what `Route` adds it sets
+  `Route.Scope` to `sandboxes:read` or `sandboxes:write` and the mark
+  `access.MarkNeed` to `read` or `write`, for `sandbox.KindRead` and
+  `sandbox.KindWrite`. The doc comment of `Kind` names the kind of each
+  route of the sandbox packages. With `sandbox.NeedsUser()` the handler is
+  wrapped once more, so that the admin token is answered `403 forbidden`
+  with the message `the admin token cannot create a sandbox`.
+
+Routes are declared while the hub composes, before the configuration is
+loaded, so the feature check reads whether sandboxes are on when a request
+comes and answers `404 sandboxes_disabled` while they are off. It runs in
+the pipeline's feature position: after the body checks, before the binding
+guard. The needs-a-user rule and the runtime-error answer wrap the handler,
+which runs after every access check, so they come after workspace access and
+before the handler reads its body. The runtime-error wrapper turns an error
+of kind `ErrUnavailable` or `ErrUnsupported` that the handler returns, and
+did not turn into another answer, into `sandbox.RuntimeError` with the
+error's text passed through the hub's scrubber, which the start hook
+`sandbox_runtime_check` gives the service (`SetScrubber`) and which knows
+the gateway token and the OIDC client secret; a `*server.Error` and every
+other error are left to the pipeline. A handler that answers a runtime error
+itself calls `sandbox.RuntimeError` with a message it scrubbed.
 
 ## The sandbox runtime client
 
