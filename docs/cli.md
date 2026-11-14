@@ -250,6 +250,14 @@ again in the next hourly pass:
 {"time":"2026-11-13T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
 ```
 
+The maintenance task `token_binding_sweep` writes one info line with the
+number of tokens it revoked, in a pass that revoked any: tokens bound to a
+workspace that no longer exists:
+
+```json
+{"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"revoked the tokens bound to workspaces that no longer exist","count":2}
+```
+
 When a stop stops waiting for something whose grace or the 30-second limit
 has passed, it writes one line naming it in `work`: `requests`,
 `maintenance loop` or the name of a piece of background work:

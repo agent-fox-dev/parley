@@ -463,6 +463,30 @@ func (h *guardHub) pats(where string, args ...any) int {
 	return n
 }
 
+// revokedAt returns the revoked_at of every PAT in the store, by token_id,
+// as stored.
+func (h *guardHub) revokedAt() map[string]sql.NullInt64 {
+	h.t.Helper()
+	rows, err := h.st.Main().Query("SELECT token_id, revoked_at FROM pats")
+	if err != nil {
+		h.t.Fatalf("read the PATs: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]sql.NullInt64{}
+	for rows.Next() {
+		var id string
+		var at sql.NullInt64
+		if err := rows.Scan(&id, &at); err != nil {
+			h.t.Fatalf("read a PAT: %v", err)
+		}
+		got[id] = at
+	}
+	if err := rows.Err(); err != nil {
+		h.t.Fatalf("read the PATs: %v", err)
+	}
+	return got
+}
+
 // admin issues the hub's admin token and returns it.
 func (h *guardHub) admin() string {
 	h.t.Helper()

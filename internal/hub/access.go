@@ -38,6 +38,10 @@ import (
 // more than it holds is refused before the workspace is looked up; the
 // service mints in the hub's store and records each binding through the
 // event component in the minting transaction.
+//
+// Each maintenance pass runs the service's token binding sweep, which
+// revokes the live tokens bound to a workspace that no longer exists and
+// logs their number to the hub's log.
 func composeAccess(c *Composition) {
 	svc := &access.Service{}
 	c.access = svc
@@ -50,13 +54,17 @@ func composeAccess(c *Composition) {
 		c.AddRoute(r)
 	}
 	c.addRouteRule(refusePublicNeed)
+	c.AddMaintenanceTask("token_binding_sweep", func(ctx context.Context, _ *Runtime) error {
+		_, err := svc.SweepBindings(ctx)
+		return err
+	})
 	c.AddStartHook("access", func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
 		events := accessEvents{c}
 		svc.Bind(access.Deps{
 			Records: access.StoreRecords(db), Memberships: activeOrgs(db),
 			Refusals: access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events,
-			Store: rt.Store, Now: rt.Now,
+			Store: rt.Store, Now: rt.Now, Logger: rt.Logger,
 		})
 		c.Events().SetCoverage(coverage(svc))
 		return nil

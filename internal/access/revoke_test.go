@@ -57,30 +57,6 @@ func newRevokeFixture(t *testing.T) *revokeFixture {
 	return f
 }
 
-// revokedAt returns the revoked_at of every PAT in the store, by token_id,
-// as stored.
-func (f *revokeFixture) revokedAt() map[string]sql.NullInt64 {
-	f.h.t.Helper()
-	rows, err := f.h.st.Main().Query("SELECT token_id, revoked_at FROM pats")
-	if err != nil {
-		f.h.t.Fatalf("read the PATs: %v", err)
-	}
-	defer rows.Close()
-	got := map[string]sql.NullInt64{}
-	for rows.Next() {
-		var id string
-		var at sql.NullInt64
-		if err := rows.Scan(&id, &at); err != nil {
-			f.h.t.Fatalf("read a PAT: %v", err)
-		}
-		got[id] = at
-	}
-	if err := rows.Err(); err != nil {
-		f.h.t.Fatalf("read the PATs: %v", err)
-	}
-	return got
-}
-
 // begin begins a transaction of the fixture's store.
 func (f *revokeFixture) begin() *sql.Tx {
 	f.h.t.Helper()
@@ -105,7 +81,7 @@ func TestRevokeBoundTo_RevokesTheLiveTokensOfTheSlugsAndReturnsTheirIDs(t *testi
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRevokeFixture(t)
-			before := f.revokedAt()
+			before := f.h.revokedAt()
 			tx := f.begin()
 			ids, err := f.svc.RevokeBoundTo(context.Background(), tx, tc.slugs)
 			if cerr := tx.Commit(); cerr != nil {
@@ -132,7 +108,7 @@ func TestRevokeBoundTo_RevokesTheLiveTokensOfTheSlugsAndReturnsTheirIDs(t *testi
 					t.Errorf("PAT %s (%s) revoked_at = %v, want %v", id, p.Workspace, p.RevokedAt, now)
 				}
 			}
-			after := f.revokedAt()
+			after := f.h.revokedAt()
 			for name, id := range f.ids {
 				if !slices.Contains(tc.revoked, name) && after[id] != before[id] {
 					t.Errorf("%s: revoked_at = %v, want it unchanged, %v", name, after[id], before[id])
@@ -164,7 +140,7 @@ BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`); err != nil {
 					t.Fatalf("create the failing trigger: %v", err)
 				}
 			}
-			before := f.revokedAt()
+			before := f.h.revokedAt()
 			tx := f.begin()
 			ids, err := f.svc.RevokeBoundTo(context.Background(), tx, []string{"w1"})
 			if tc.writeFails && (err == nil || ids != nil) {
@@ -176,7 +152,7 @@ BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`); err != nil {
 			if err := tx.Rollback(); err != nil {
 				t.Fatalf("roll back: %v", err)
 			}
-			if after := f.revokedAt(); !maps.Equal(after, before) {
+			if after := f.h.revokedAt(); !maps.Equal(after, before) {
 				t.Errorf("revoked_at after the rollback = %v, want %v", after, before)
 			}
 		})

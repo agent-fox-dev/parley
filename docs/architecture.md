@@ -11,7 +11,7 @@ command-line client. Both are written in Go, in the module
 |---|---|
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
-| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`) |
+| `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`, and the maintenance task `token_binding_sweep`, `SweepBindings`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, and a registry of keys and whole sections that decides what the file may hold |
@@ -1170,11 +1170,12 @@ keeps data for a user or an org registers its remover from its part in
 (`workspace_creating_token`), registers a zero `access.Service`, installs
 its `Guard` as the pipeline's binding guard (`SetBindingGuard`), adds its
 `SubsetCheck` and then its `Check` to the access checks, after identity's
-admin check, registers its `TokenRoutes()`, and binds it in
+admin check, registers its `TokenRoutes()`, registers its
+`SweepBindings` as the maintenance task `token_binding_sweep`, and binds it in
 the start hook `access` to `access.Deps{Records:
 access.StoreRecords(rt.Store.Main()), Memberships: ..., Refusals:
 access.NewRefusalLimiter(events, rt.Now, rt.Logger), Events: events, Store:
-rt.Store, Now: rt.Now}`, the
+rt.Store, Now: rt.Now, Logger: rt.Logger}`, the
 membership source being `identity.ActiveOrgIDs` over the same store and
 `events` the adapter `accessEvents`, which implements
 `access.EventEmitter` over the event component: it converts an
@@ -1551,6 +1552,25 @@ list, and the caller rolls back. It emits no event: the removal's own event
 carries the ids. A revoked token is answered `401 credential revoked` by
 authentication from the next request on, before the binding guard, so it
 is never reported as a refusal. No production caller uses it yet.
+
+`internal/access/sweep.go` holds the token binding sweep,
+`(*Service).SweepBindings(ctx)`, which the hub runs as the maintenance task
+`token_binding_sweep`, so that a bound token a removal left behind stops
+working within one maintenance interval. In one transaction of `Deps.Store`
+it reads the distinct `workspace` of the PATs that are bound and not revoked
+and have no row in `workspaces`, and revokes their live tokens with
+`RevokeBoundTo`, so a token that is unbound, bound to a workspace with a
+record in any status (archived included), revoked or expired is left as it
+is. It returns how many it revoked and, when that is more than 0, logs one
+info line `revoked the tokens bound to workspaces that no longer exist` with
+`count` to `Deps.Logger` (nil discards); it emits no event. On a store
+failure the transaction is rolled back and it returns 0 and the error, which
+the maintenance loop logs as `maintenance task failed`. A context cancelled
+before it begins returns the context's error and writes nothing; once
+begun, the transaction runs to its end with a context that a stop does not
+cancel, because `database/sql` rolls a cancelled transaction back in a
+goroutine of its own, which could close the store's last connection after
+the hub has closed the store and returned from `Run`.
 
 `internal/access/refusal.go` holds the hub's `RefusalReporter`,
 `access.RefusalLimiter`, built with `access.NewRefusalLimiter(events, now,
