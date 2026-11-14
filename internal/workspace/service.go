@@ -73,6 +73,9 @@ type Deps struct {
 	// Fetcher fetches a workspace's origin into its copy for a sync; nil
 	// means gitrepo.Git{}.
 	Fetcher Fetcher
+	// Pusher pushes a branch of a workspace's copy to its origin; nil means
+	// gitrepo.Git{}.
+	Pusher Pusher
 	// InsertWorkspace writes a new workspace record in the create
 	// transaction; nil means Insert. A test makes it fail to see the whole
 	// create roll back.
@@ -149,6 +152,9 @@ func (s *Service) Bind(d Deps) {
 	if d.Fetcher == nil {
 		d.Fetcher = gitrepo.Git{}
 	}
+	if d.Pusher == nil {
+		d.Pusher = gitrepo.Git{}
+	}
 	if d.Scrubber == nil {
 		d.Scrubber = scrub.New()
 	}
@@ -162,5 +168,5 @@ func (s *Service) Settings() *SettingsRegistry { return &s.settings }
 
 // Routes returns the workspace routes of the REST API.
 func (s *Service) Routes() []server.Route {
-	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute(), s.syncRoute()}
+	return []server.Route{s.createRoute(), s.listRoute(), s.readRoute(), s.updateRoute(), s.syncRoute(), s.pushRoute()}
 }

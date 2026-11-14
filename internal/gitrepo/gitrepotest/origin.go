@@ -1,8 +1,8 @@
 // Package gitrepotest is the test origin of the repository: a bare git
 // repository the test builds commits, branches and tags in, served over TLS
 // by net/http/httptest with git's file-based ("dumb") HTTP transport, or
-// with its smart transport through git http-backend. It is imported by test
-// code only.
+// with its smart transport through git http-backend, which takes pushes too
+// for an origin SmartOrigin builds. It is imported by test code only.
 package gitrepotest
 
 import (
@@ -33,18 +33,18 @@ type Origin struct {
 	caFile string
 	files  http.Handler
 
-	// user and password, when user is not empty, are the Basic
-	// authentication every request must carry.
-	user, password string
 	// smart serves git's smart HTTP transport instead of the files.
 	smart bool
 
 	// mu guards what the handler reads while the test changes it.
-	mu       sync.Mutex
-	requests int
-	gate     chan struct{}
-	refuse   int
-	seq      int
+	mu sync.Mutex
+	// user and password, when user is not empty, are the Basic
+	// authentication every request must carry.
+	user, password string
+	requests       int
+	gate           chan struct{}
+	refuse         int
+	seq            int
 
 	closeOnce sync.Once
 }
@@ -64,6 +64,17 @@ func WithBasicAuth(user, password string) Option {
 // needs this one to be cloned as a real server serves it.
 func WithSmartHTTP() Option {
 	return func(o *Origin) { o.smart = true }
+}
+
+// SmartOrigin builds an origin as NewOrigin does, with opts, that serves
+// git's smart HTTP transport and takes pushes: git http-backend refuses a
+// push from a client it knows no user of unless the repository enables
+// receive-pack, which this one does.
+func SmartOrigin(t testing.TB, opts ...Option) *Origin {
+	t.Helper()
+	o := NewOrigin(t, append(opts, WithSmartHTTP())...)
+	o.git("", "config", "http.receivepack", "true")
+	return o
 }
 
 // NewOrigin builds an empty bare repository whose default branch is main in
@@ -163,6 +174,14 @@ func (o *Origin) Head(branch string) string {
 	return out
 }
 
+// Accept makes the origin take, from now on, only the Basic authentication
+// with user and password; an empty user makes it take every request.
+func (o *Origin) Accept(user, password string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.user, o.password = user, password
+}
+
 // Requests is the number of HTTP requests the origin has received, those it
 // refused or still holds at the gate included.
 func (o *Origin) Requests() int {
@@ -214,6 +233,7 @@ func (o *Origin) serve(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	o.requests++
 	gate, refuse := o.gate, o.refuse
+	user, password := o.user, o.password
 	o.mu.Unlock()
 	if gate != nil {
 		select {
@@ -226,9 +246,9 @@ func (o *Origin) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(refuse)
 		return
 	}
-	if o.user != "" {
-		user, password, ok := r.BasicAuth()
-		if !ok || user != o.user || password != o.password {
+	if user != "" {
+		gotUser, gotPassword, ok := r.BasicAuth()
+		if !ok || gotUser != user || gotPassword != password {
 			w.Header().Set("WWW-Authenticate", `Basic realm="origin"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return

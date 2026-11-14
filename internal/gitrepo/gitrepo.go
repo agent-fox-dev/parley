@@ -278,6 +278,17 @@ func (g Git) run(ctx context.Context, a access, args ...string) ([]byte, error) 
 
 // runInput is run with stdin as git's standard input, none when nil.
 func (g Git) runInput(ctx context.Context, a access, stdin []byte, args ...string) ([]byte, error) {
+	out, err := g.runOutput(ctx, a, stdin, args...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// runOutput is runInput that returns git's standard output after a failure
+// too, for a command such as git push --porcelain that reports what it did
+// there also when it exits with an error.
+func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...string) ([]byte, error) {
 	dir, err := privateDir(!a.cred.IsZero())
 	if err != nil {
 		return nil, err
@@ -311,9 +322,9 @@ func (g Git) runInput(ctx context.Context, a access, stdin []byte, args ...strin
 	killGroupOnCancel(cmd)
 	if err := cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("git %s: %w", subcommand(args), ctxErr)
+			return stdout.Bytes(), fmt.Errorf("git %s: %w", subcommand(args), ctxErr)
 		}
-		return nil, fmt.Errorf("git %s: %w: %s", subcommand(args), err, strings.TrimSpace(stderr.String()))
+		return stdout.Bytes(), fmt.Errorf("git %s: %w: %s", subcommand(args), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
 }

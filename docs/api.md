@@ -1532,6 +1532,61 @@ whose name the workspace object or `branches` has already is left out.
 | `502` `upstream_error` | origin could not be fetched, or the workspace's secrets could not be read to fetch it (`origin fetch failed: <git's error, scrubbed>`), or the first stage of a sync extension failed (`<its error, scrubbed>`); no branch or tag of the hub's repository changed, nor, for a failed fetch, any origin head (after a failed first stage they are those the fetch set), and `sync_error` holds the same text |
 | `500` `internal` | the sync could not complete: a branch moved in the hub under each of five comparisons (`the sync of workspace "<slug>" stopped: branch "<name>" moved in the hub during each of its 5 evaluations; sync again`), the excluded-branch provider of a `carry_patch` workspace failed (`the sync of workspace "<slug>" stopped before any branch was compared: the excluded-branch provider failed: <its error, scrubbed>`), the second stage of a sync extension failed (`<its error, scrubbed>`) or added a member that is not JSON, a ref of the hub could not be read or written, or `sync_error`, the completion or its event could not be written; branches moved before stay moved |
 
+## `POST /api/v1/workspaces/{slug}/branches/{name}/push`
+
+Pushes the branch `{name}` of the repository workspace `{slug}` to the same
+branch of the workspace's origin. It takes the admin token, an API key or a
+PAT, declares the scope `workspaces:write` for a PAT and needs write access
+to the workspace (see [Workspace access](#workspace-access)): its owner or
+the admin token. `{name}` is percent-decoded once, so `fix%2F42` is the
+branch `fix/42` and `a%2525b` the branch `a%25b`; the decoded name must
+follow git's branch-name rule, as `default_branch` of
+[`POST /api/v1/workspaces`](#post-apiv1workspaces) does.
+
+The body is optional. No body, an empty body and an object without `force`
+mean `force` `false`; `{"force": true}` asks for a forced push. Members
+other than `force` are ignored. A body that is not a JSON object, or whose
+`force` is not `true` or `false` (`null` included), is `400`
+`invalid_request`; a body sent without `Content-Type: application/json` is
+`415` as for every route (see [Request bodies](#request-bodies)).
+
+```json
+{"force": false}
+```
+
+The hub reads the head of `refs/heads/{name}` once and pushes that commit,
+and only that one ref, to `refs/heads/{name}` on origin in one `git push`,
+with the workspace's origin credential resolved from its secrets for this
+push; no tag and no other branch is sent, and the credential is in no URL,
+argument or configuration file. A branch that moves in the hub while the
+push runs changes neither what is pushed nor what is answered; the push
+takes no lock. Without `force` origin's branch moves only by a
+fast-forward: a branch origin lacks is created, one origin has is moved
+only when origin's head is an ancestor of the hub's, and a branch origin
+already has at the hub's head is left as it is. A protected branch is
+pushed like any other. A forced push is handed to git with the explicit
+lease that origin must not have the branch, never with a plain force.
+
+The answer of a push origin took names the branch, the commit pushed, the
+remote and its URL, the workspace's `git_url` without user information
+(a `git@host:path` URL as it is stored), and the result: `pushed` when
+origin's branch was created or moved forward, `up_to_date` when it was at
+the commit already.
+
+```json
+{"branch":"feature","sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","remote":"origin","remote_url":"https://example.com/a.git","result":"pushed"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | origin took the push; `result` is `pushed` or `up_to_date` |
+| `400` `invalid_request` | the body is not a JSON object (`request body must be a JSON object`, `request body is not valid JSON`), its `force` is not a JSON boolean (`request body member "force" must be true or false`), or the decoded name is not a valid branch name (`branch name "<name>": <the rule it breaks>`) |
+| `403` `insufficient_scope` | a PAT without `workspaces:write` (`this route needs the scope workspaces:write`), before the body is looked at |
+| `403` `forbidden` | a member of the workspace's org who does not own it (`org members have read-only access to this workspace`), before the body is looked at |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`), before the body is looked at; also a bound PAT on a workspace outside its binding |
+| `409` `non_fast_forward` | without `force`, origin's branch is not an ancestor of the hub's head: the two diverged or origin's is ahead (`origin's branch "<name>" is not an ancestor of the hub's head <sha> (the origin head the hub last saw is <sha>); sync the workspace to bring in origin's commits, or push with force to replace origin's branch`); origin's branch and the hub's recorded origin head are unchanged |
+| `500` `internal` | the hub has no branch `{name}`, the workspace's secrets could not be read, or the push failed otherwise |
+
 ## `POST /api/v1/workspaces/{slug}/tokens`
 
 Mints a personal access token (PAT) owned by the caller's user and bound to

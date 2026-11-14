@@ -1159,3 +1159,100 @@ func (p *excluding) asked() []string {
 	defer p.mu.Unlock()
 	return slices.Clone(p.slugs)
 }
+
+// pushWorld is a world with the ready repository workspace syncSlug of the
+// user u, whose origin takes pushes over https (gitrepotest.SmartOrigin) and
+// holds the origin's usual history (see gitrepotest.Origin.History), and the
+// hub's copy of it at its place, made by the clone work, which records the
+// origin heads. The hub's push operation records every push.
+type pushWorld struct {
+	*world
+	origin *gitrepotest.Origin
+	// copy is the git directory of the hub's copy.
+	copy   string
+	pushes *recordingPusher
+}
+
+// newPushWorld builds the push world with an origin built with originOpts,
+// storing the workspace secrets secrets before the clone.
+func newPushWorld(t *testing.T, secrets map[string]string, originOpts ...gitrepotest.Option) *pushWorld {
+	t.Helper()
+	o := gitrepotest.SmartOrigin(t, originOpts...)
+	o.History()
+	p := &recordingPusher{}
+	w := newWorld(t, withGitOrigin(o), withCompose(func(c *hub.Composition) {
+		c.AdjustWorkspace(func(d *workspace.Deps) {
+			g, _ := d.Pusher.(gitrepo.Git)
+			g.Trace = p.trace
+			p.git, d.Pusher = g, p
+		})
+	}))
+	url := o.URL()
+	w.put(t, workspace.Workspace{Slug: syncSlug, GitURL: &url})
+	for name, value := range secrets {
+		w.putSecret(t, syncSlug, name, value)
+	}
+	if rec := w.clone(t, syncSlug); rec.Status != workspace.StatusReady {
+		t.Fatalf("the clone of the push workspace left it %s (%v)", rec.Status, deref(rec.CloneError))
+	}
+	return &pushWorld{world: w, origin: o, copy: w.svc.RepoPath(syncSlug), pushes: p}
+}
+
+// push sends POST /workspaces/<slug>/branches/<segment>/push, segment being
+// the branch name as the path carries it, with body (nil for none) and cred
+// as the bearer credential.
+func (w *world) push(t *testing.T, cred, slug, segment string, body any) answer {
+	t.Helper()
+	status, b := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/branches/"+segment+"/push", cred, body)
+	return answer{status, b}
+}
+
+// recordingPusher is the hub's push operation: it records every push and the
+// arguments of every git process the hub's git runs for one, and runs the
+// push, or answers stub without running git while stub is set.
+type recordingPusher struct {
+	git gitrepo.Git
+
+	mu    sync.Mutex
+	calls []gitrepo.PushRequest
+	args  [][]string
+	stub  gitrepo.PushResult
+}
+
+func (p *recordingPusher) Push(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
+	p.mu.Lock()
+	p.calls = append(p.calls, req)
+	stub := p.stub
+	p.mu.Unlock()
+	if stub != "" {
+		return stub, nil
+	}
+	return p.git.Push(ctx, req)
+}
+
+func (p *recordingPusher) trace(args []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.args = append(p.args, args)
+}
+
+// stubWith makes every later push answer r without running git.
+func (p *recordingPusher) stubWith(r gitrepo.PushResult) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stub = r
+}
+
+// recorded are the pushes so far.
+func (p *recordingPusher) recorded() []gitrepo.PushRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.calls)
+}
+
+// gitArgs are the arguments of every git process the pushes ran so far.
+func (p *recordingPusher) gitArgs() [][]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.args)
+}

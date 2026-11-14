@@ -3,11 +3,11 @@
   "spec_id": "13",
   "spec_name": "workspace_push_to_origin",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-14T12:08:55Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
