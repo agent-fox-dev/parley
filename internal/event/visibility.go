@@ -131,7 +131,7 @@ func isOwnerOnly(typ string) bool {
 //   - an event of a workspace is seen by a user with a level on the
 //     workspace or on the parent of the task fork it concerns, which is
 //     stored with the event and so outlives the fork; a type of ownerOnly
-//     needs level owner there;
+//     needs level owner or admin there;
 //   - an event of no workspace is seen by the user metadata.scope_id names
 //     when metadata.scope is "user", by the members of the active org it
 //     names when metadata.scope is "org", and by nobody else;

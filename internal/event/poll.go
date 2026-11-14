@@ -2,7 +2,7 @@ package event
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -115,7 +115,9 @@ func (c *Component) serveLog(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	pos := max(b.OldestSeq-1, 0)
+	// Without a position the page starts at the oldest event of its first
+	// read, not of this check, so a concurrent expiry cannot refuse it.
+	pos := int64(-1)
 	if q.posName != "" {
 		if err := checkPosition(q.posName, q.after, b); err != nil {
 			return err
@@ -170,7 +172,14 @@ func (c *Component) collect(ctx context.Context, caller Caller, f filter, pos in
 	v := c.newViewer(caller)
 	page := logPage{Items: []Record{}}
 	for {
-		recs, examined, b, err := c.readBatch(ctx, pos, logBatch)
+		recs, examined, b, err := c.readLog(ctx, pos, logBatch)
+		var expired *PositionExpiredError
+		if errors.As(err, &expired) {
+			// Events after pos left the log after the request's position
+			// was checked: the page would skip them, so it is refused as an
+			// expired position is.
+			return logPage{}, errCursorExpired(expired.OldestSeq)
+		}
 		if err != nil {
 			return logPage{}, err
 		}
@@ -199,32 +208,6 @@ func (c *Component) collect(ctx context.Context, caller Caller, f filter, pos in
 		}
 		pos = examined
 	}
-}
-
-// readBatch is ReadAfter with the bounds of the same snapshot, so that a
-// page's position and its bounds agree.
-func (c *Component) readBatch(ctx context.Context, after int64, limit int) ([]Record, int64, Bounds, error) {
-	if c.deps.Store == nil {
-		return nil, 0, Bounds{}, errNotBound
-	}
-	var recs []Record
-	var b Bounds
-	err := c.snapshot(ctx, func(tx *sql.Tx) error {
-		var err error
-		if b, err = readBounds(ctx, tx); err != nil {
-			return err
-		}
-		recs, err = queryRecords(ctx, tx, max(after, b.OldestSeq-1), b.LastSeq, limit)
-		return err
-	})
-	if err != nil {
-		return nil, 0, Bounds{}, fmt.Errorf("read events: %w", err)
-	}
-	examined := b.LastSeq
-	if len(recs) == limit {
-		examined = recs[len(recs)-1].Seq
-	}
-	return recs, examined, b, nil
 }
 
 // writeLogPage answers 200 with page, or returns err when there is one. The

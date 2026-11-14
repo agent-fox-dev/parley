@@ -100,7 +100,7 @@ func TestLog_ReturnsAPage(t *testing.T) {
 		t.Fatalf("Expire = %d, %v, want 11", oldest, err)
 	}
 	stored := map[int64][]byte{}
-	for _, rec := range w.readAll(0) {
+	for _, rec := range w.readAll(10) {
 		raw, err := json.Marshal(rec)
 		if err != nil {
 			t.Fatal(err)

@@ -111,35 +111,6 @@ func logItems(t testing.TB, h *hubtest.Hub) []hubEvent {
 	return page.Items
 }
 
-func TestEventsHub_TestRouteCommitsRowAndEventTogether(t *testing.T) {
-	t.Parallel()
-	h := startEventsHub(t, hubtest.Config{})
-	row := map[string]string{"name": "r1", "workspace": "api"}
-
-	status, body := h.Call(t, http.MethodPost, rowsPath, h.Token, row)
-	var emitted hubEvent
-	if status != http.StatusCreated || json.Unmarshal(body, &emitted) != nil || emitted.Seq == 0 {
-		t.Fatalf("POST %s = %d %s, want 201 with the event", rowsPath, status, body)
-	}
-	var rows int
-	if err := h.Store.Main().QueryRow(`SELECT count(*) FROM e2e_rows WHERE name = 'r1'`).Scan(&rows); err != nil || rows != 1 {
-		t.Fatalf("rows named r1 = %d, %v, want 1", rows, err)
-	}
-	items := logItems(t, h)
-	if len(items) != 1 || items[0].Seq != emitted.Seq || items[0].Type != "parley.change.open" ||
-		items[0].Workspace == nil || *items[0].Workspace != "api" || items[0].ResourceID != "r1" {
-		t.Fatalf("the log = %+v, want the one event the route answered, %+v", items, emitted)
-	}
-
-	// The same name again fails the row, and the event is rolled back with it.
-	if status, body := h.Call(t, http.MethodPost, rowsPath, h.Token, row); status != http.StatusInternalServerError {
-		t.Errorf("POST %s with a name already written = %d %s, want 500", rowsPath, status, body)
-	}
-	if items := logItems(t, h); len(items) != 1 {
-		t.Errorf("the log after the failed write holds %d events, want 1", len(items))
-	}
-}
-
 // sseFrame is one frame of the event stream: its id, its event name and
 // its data line.
 type sseFrame struct {

@@ -144,6 +144,8 @@ func (c *Component) OnCommit(fn func(Record)) {
 // the store cannot be read, the counts are those last observed.
 func (c *Component) Counters() Counters {
 	if c.deps.Store != nil {
+		// A failed read leaves the counts as last observed, as documented,
+		// and loses nothing: the next call or poll reads from the same seq.
 		_ = c.catchUp(context.Background())
 	}
 	n := &c.notify
@@ -227,6 +229,9 @@ func (c *Component) Run(ctx context.Context) {
 		if !n.busy() {
 			continue
 		}
+		// A failed read is not logged here: it is retried at the next poll
+		// from the same seq, so no event is lost, and the waiters it wakes
+		// read the log themselves and report the failure to their clients.
 		var failed bool
 		if c.deps.Store != nil {
 			failed = c.catchUp(ctx) != nil
@@ -256,10 +261,43 @@ func (c *Component) catchUp(ctx context.Context) error {
 	n := &c.notify
 	n.catching.Lock()
 	defer n.catching.Unlock()
-	n.mu.Lock()
-	from, wantRecords := n.seen, len(n.callbacks) > 0
-	n.mu.Unlock()
+	for {
+		n.mu.Lock()
+		from, wantRecords := n.seen, len(n.callbacks) > 0
+		n.mu.Unlock()
+		last, recs, counts, err := c.readCommitted(ctx, from, wantRecords)
+		if err != nil || last <= from {
+			return err
+		}
 
+		n.mu.Lock()
+		if !wantRecords && len(n.callbacks) > 0 {
+			// A callback registered during the read is owed these events,
+			// which the read did not keep: read them again with their
+			// records. Callbacks are never removed, so this happens once.
+			n.mu.Unlock()
+			continue
+		}
+		n.seen = last
+		if n.byType == nil {
+			n.byType = map[string]int64{}
+		}
+		for typ, k := range counts {
+			n.byType[typ] += k
+		}
+		if len(recs) > 0 {
+			n.pending = append(n.pending, recs...)
+			n.pokeLocked()
+		}
+		n.wakeLocked()
+		n.mu.Unlock()
+		return nil
+	}
+}
+
+// readCommitted reads, in one snapshot, last_seq and the events committed
+// after from, counted by type: their records too when wantRecords is set.
+func (c *Component) readCommitted(ctx context.Context, from int64, wantRecords bool) (int64, []Record, map[string]int64, error) {
 	var last int64
 	var recs []Record
 	counts := map[string]int64{}
@@ -270,37 +308,19 @@ func (c *Component) catchUp(ctx context.Context) error {
 		if last <= from {
 			return nil
 		}
-		if wantRecords {
-			var err error
-			if recs, err = queryRecords(ctx, tx, from, last, 0); err != nil {
-				return err
-			}
-			for _, rec := range recs {
-				counts[rec.Type]++
-			}
-			return nil
+		if !wantRecords {
+			return countByType(ctx, tx, from, last, counts)
 		}
-		return countByType(ctx, tx, from, last, counts)
+		var err error
+		if recs, err = queryRecords(ctx, tx, from, last, 0); err != nil {
+			return err
+		}
+		for _, rec := range recs {
+			counts[rec.Type]++
+		}
+		return nil
 	})
-	if err != nil || last <= from {
-		return err
-	}
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.seen = last
-	if n.byType == nil {
-		n.byType = map[string]int64{}
-	}
-	for typ, k := range counts {
-		n.byType[typ] += k
-	}
-	if len(recs) > 0 {
-		n.pending = append(n.pending, recs...)
-		n.pokeLocked()
-	}
-	n.wakeLocked()
-	return nil
+	return last, recs, counts, err
 }
 
 // countByType adds the number of stored events with after < seq <= upTo to

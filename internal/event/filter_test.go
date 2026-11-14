@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +185,26 @@ func TestFilters_SameOnStreamAndLog(t *testing.T) {
 			}
 		}
 	}
+
+	// Both routes send an event as the same bytes, and neither escapes HTML.
+	marked := on("parley.change.open", "api")
+	marked.Metadata = map[string]any{"title": "<a> & <b>"}
+	seq := w.emit(marked).Seq
+	after := "after=" + strconv.FormatInt(seq-1, 10)
+	page := w.getLog(t, w.admin, after)
+	if len(page.page.Items) != 1 {
+		t.Fatalf("/events/log?%s: %d items, want 1", after, len(page.page.Items))
+	}
+	item := []byte(page.page.Items[0])
+	if !bytes.Contains(item, []byte(`"title":"<a> & <b>"`)) {
+		t.Errorf("log item = %s, want the metadata unescaped", item)
+	}
+	s := w.openStream(t, w.admin, after, nil)
+	s.heartbeat(2 * time.Second)
+	if f := s.next(2 * time.Second); f.event != "hub_event" || !bytes.Equal([]byte(f.data), item) {
+		t.Errorf("stream frame %q, want a hub_event whose data is the log item %s", f.lines, item)
+	}
+	s.close()
 }
 
 func TestFilters_RejectMalformed(t *testing.T) {
@@ -312,6 +333,54 @@ func TestPosition_Expired(t *testing.T) {
 	}
 	if got := w.events.Counters().OpenStreams; got != 0 {
 		t.Errorf("open_streams = %d, want 0", got)
+	}
+}
+
+func TestPosition_ExpiresWhileOpen(t *testing.T) {
+	t.Parallel()
+	for _, route := range eventRoutes {
+		t.Run(route, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			for range 3 {
+				w.emit(on("parley.change.open", "api"))
+			}
+			// Without the notifier a waiting reader wakes only at its own
+			// timer, so the expiry lands between two of its reads.
+			w.stop()
+			var stream *eventStream
+			var held <-chan logReply
+			if route == "/events" {
+				stream = w.openStream(t, w.admin, "after=3", nil)
+				if stream.status != http.StatusOK {
+					t.Fatalf("GET /events?after=3 = %d %s, want 200", stream.status, stream.body)
+				}
+				stream.heartbeat(2 * time.Second)
+			} else {
+				held = w.holdLog(w.admin, "wait=60&after=3")
+			}
+			w.clock.WaitTimers(t, 1)
+			w.emit(on("parley.change.open", "api"))
+			w.emit(on("parley.change.open", "api"))
+			// A cutoff after every event keeps only the newest, 5, so the
+			// reader's position 3 is below oldest_seq minus 1.
+			if oldest, err := w.events.Expire(context.Background(), w.clock.Now().Add(time.Hour)); err != nil || oldest != 5 {
+				t.Fatalf("Expire = %d, %v, want 5", oldest, err)
+			}
+
+			if route == "/events" {
+				w.clock.Advance(heartbeatInterval)
+				stream.ends(2 * time.Second)
+				return
+			}
+			w.clock.Advance(maxLogWait * time.Second)
+			r := answerWithin(t, 2*time.Second, held)
+			var env errorBody
+			if err := json.Unmarshal(r.raw, &env); err != nil || r.status != http.StatusGone ||
+				env.Error.ErrorType != "cursor_expired" || string(env.Error.OldestSeq) != "5" {
+				t.Errorf("answer = %d %s, want 410 cursor_expired with oldest_seq 5", r.status, r.raw)
+			}
+		})
 	}
 }
 

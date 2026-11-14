@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -44,39 +45,70 @@ SELECT s.last_seq, l.oldest_seq FROM hub_event_seq s, hub_event_log_bound l`).Sc
 	return b, nil
 }
 
+// ErrPositionExpired is the error, a *PositionExpiredError, of a read after
+// a position from which at least one event has since left the log.
+var ErrPositionExpired = errors.New("event log position expired")
+
+// PositionExpiredError reports a read after a position below oldest_seq
+// minus 1: the events between the position and OldestSeq have left the log,
+// so the reader would miss them. It matches ErrPositionExpired.
+type PositionExpiredError struct {
+	After     int64
+	OldestSeq int64
+}
+
+func (e *PositionExpiredError) Error() string {
+	return fmt.Sprintf("%s: position %d is below oldest_seq %d minus 1", ErrPositionExpired, e.After, e.OldestSeq)
+}
+
+// Is makes the error match ErrPositionExpired.
+func (e *PositionExpiredError) Is(target error) bool { return target == ErrPositionExpired }
+
 // ReadAfter reads the events of the log with a seq higher than after,
 // ascending, at most limit of them (every one when limit <= 0), and the
 // position the read examined: the seq of the last record when the limit was
-// reached, otherwise last_seq. Events below oldest_seq have left the log and
-// are never returned. Everything comes from one snapshot of the store, so
-// the position never claims an event the read could not see; and since the
-// store commits events in seq order, the records are a gap-free run of the
-// log (ADR 05).
+// reached, otherwise last_seq. A position below oldest_seq minus 1 is never
+// read from, since events after it have left the log: the read fails with a
+// *PositionExpiredError, matching ErrPositionExpired, that carries
+// oldest_seq, so the caller knows it missed events and where the log now
+// begins. Everything comes from one snapshot of the store, so the position
+// never claims an event the read could not see; and since the store commits
+// events in seq order, the records are a gap-free run of the log (ADR 05).
 func (c *Component) ReadAfter(ctx context.Context, after int64, limit int) ([]Record, int64, error) {
+	recs, examined, _, err := c.readLog(ctx, max(after, 0), limit)
+	return recs, examined, err
+}
+
+// readLog is ReadAfter that also returns the bounds of the snapshot it read,
+// so that a page's position and its bounds agree. An after below 0 reads
+// from the oldest event the log holds, whatever oldest_seq is at the read.
+func (c *Component) readLog(ctx context.Context, after int64, limit int) ([]Record, int64, Bounds, error) {
 	if c.deps.Store == nil {
-		return nil, 0, errNotBound
+		return nil, 0, Bounds{}, errNotBound
 	}
 	var recs []Record
-	var examined int64
+	var b Bounds
 	err := c.snapshot(ctx, func(tx *sql.Tx) error {
-		b, err := readBounds(ctx, tx)
-		if err != nil {
+		var err error
+		if b, err = readBounds(ctx, tx); err != nil {
 			return err
 		}
-		recs, err = queryRecords(ctx, tx, max(after, b.OldestSeq-1), b.LastSeq, limit)
-		if err != nil {
-			return err
+		if after < 0 {
+			after = max(b.OldestSeq-1, 0)
+		} else if after < b.OldestSeq-1 {
+			return &PositionExpiredError{After: after, OldestSeq: b.OldestSeq}
 		}
-		examined = b.LastSeq
-		if limit > 0 && len(recs) == limit {
-			examined = recs[len(recs)-1].Seq
-		}
-		return nil
+		recs, err = queryRecords(ctx, tx, after, b.LastSeq, limit)
+		return err
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("read events: %w", err)
+		return nil, 0, Bounds{}, fmt.Errorf("read events: %w", err)
 	}
-	return recs, examined, nil
+	examined := b.LastSeq
+	if limit > 0 && len(recs) == limit {
+		examined = recs[len(recs)-1].Seq
+	}
+	return recs, examined, b, nil
 }
 
 // Expire makes the events older than cutoff leave the event log and returns

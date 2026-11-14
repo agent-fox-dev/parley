@@ -1452,9 +1452,14 @@ The event log is read by position
 while no event was ever written; `LastSeq` is the counter, not the highest
 stored row, and `OldestSeq` is `hub_event_log_bound`, 1 until something has
 expired. `(*Component).ReadAfter(ctx, after, limit)` returns the events
-with a higher `seq` than `after` and not below `oldest_seq`, ascending, at
-most `limit` (all when `limit` <= 0), and the position examined: the last
-record's `seq` when the limit was reached, else `last_seq`. The bounds and the
+with a higher `seq` than `after`, ascending, at most `limit` (all when
+`limit` <= 0), and the position examined: the last record's `seq` when the
+limit was reached, else `last_seq`. When `after` is below `oldest_seq` minus
+1, at least one event after it has left the log, and it returns no record
+but an `*event.PositionExpiredError` carrying `OldestSeq`, which matches
+`event.ErrPositionExpired`, so a caller never misses events without knowing.
+The routes read the log through the same function, which also returns the
+bounds of its snapshot. The bounds and the
 records are read in one read-only transaction, which begins without the write
 lock and sees one snapshot. Since commit order is `seq` order, every read is a
 gap-free run of the log, also while other transactions emit.
@@ -1501,8 +1506,8 @@ route). The rules:
   `member` on the workspace or on the fork parent stored with the event, so a
   fork's events stay visible to the parent's readers after the fork's record
   is deleted. A slug with no record gives no level. The types beginning with
-  `parley.secret.`, `parley.token.` or `parley.webhook.` need `owner` there
-  (`parley.forge.webhook.set` is not one of them);
+  `parley.secret.`, `parley.token.` or `parley.webhook.` need `owner` or
+  `admin` there (`parley.forge.webhook.set` is not one of them);
 - an event of no workspace is seen by the user whose id is
   `metadata.scope_id` when `metadata.scope` is `user`, by the members of the
   active org `metadata.scope_id` names when it is `org` (asked through
@@ -1523,9 +1528,10 @@ A read that fails returns `false` with the error, never a grant. The
 covered set and the change lookup are kept apart from `Deps`, so the bind in
 the start hook does not reset what a part installed when it was composed. A
 batch of events (a page of the log, a stream delivery) is decided by one
-unexported viewer, which reads the readable set, the active orgs, the
-coverage and the change sources each at most once, when an event first needs
-them, and is dropped with the batch, so a change of access takes effect at
+unexported viewer, which reads the readable set and the active orgs at most
+once each, when an event first needs them, asks the coverage once per
+distinct slug and the change sources once per distinct change of the batch,
+and is dropped with the batch, so a change of access takes effect at
 the next delivery. `(*Component).VisibleToOwnerOf(ctx, workspace, rec)`, the
 form event webhooks use, is true exactly for the events whose workspace, or
 stored fork parent, is `workspace`, of every type, and reads nothing.
@@ -1589,9 +1595,16 @@ component's clock, has not completed for 60 seconds. On every end the handler
 stops the writer and waits for it, so nothing writes to the response after
 the handler returns; a write that is blocked on a client that does not read
 is ended first with a write deadline in the past through
-`http.ResponseController`, so a stop never waits for a client. A read that
-fails after the answer began ends the stream too, and the server logs the
-error.
+`http.ResponseController`, so a stop never waits for a client. The one
+exception is a response that cannot take a write deadline while a write is
+under way: the handler then returns without waiting, rather than wait on the
+client, and the writer ends after that write without writing another frame.
+A read that fails after the answer began ends the stream too, and the server
+logs the error. So does a read that finds the stream's position below
+`oldest_seq` minus 1, because events after it left the log since the
+previous read: the stream ends without another frame and without a log
+line, rather than skip them, and the client that resumes with the last `id`
+it received is refused `410` `cursor_expired`.
 
 ### The logger
 

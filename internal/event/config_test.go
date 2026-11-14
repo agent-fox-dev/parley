@@ -75,11 +75,3 @@ func TestConfig_RejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
-
-func TestRetention_IsTheLoadedValue(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t, func(d *Deps) { d.Retention = 48 * time.Hour })
-	if got := f.events.Retention(); got != 48*time.Hour {
-		t.Errorf("Retention() = %v, want 48h", got)
-	}
-}

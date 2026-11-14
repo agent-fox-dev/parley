@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -58,9 +59,14 @@ func TestExpire_MovesOldestSeq(t *testing.T) {
 		if b := f.bounds(); b.OldestSeq != step.want || b.LastSeq != 7 {
 			t.Errorf("%s: Bounds = %+v, want {%d, 7}", step.name, b, step.want)
 		}
-		for _, after := range []int64{0, step.want - 1} {
-			if recs := f.readAll(after); len(recs) == 0 || recs[0].Seq != step.want {
-				t.Errorf("%s: ReadAfter(%d) starts at %v, want seq %d", step.name, after, seqs(recs), step.want)
+		if recs := f.readAll(step.want - 1); len(recs) == 0 || recs[0].Seq != step.want {
+			t.Errorf("%s: ReadAfter(%d) starts at %v, want seq %d", step.name, step.want-1, seqs(recs), step.want)
+		}
+		if below := step.want - 2; below >= 0 {
+			_, _, err := f.events.ReadAfter(context.Background(), below, 0)
+			var expired *PositionExpiredError
+			if !errors.Is(err, ErrPositionExpired) || !errors.As(err, &expired) || expired.OldestSeq != step.want {
+				t.Errorf("%s: ReadAfter(%d) error = %v, want ErrPositionExpired with oldest_seq %d", step.name, below, err, step.want)
 			}
 		}
 		var rows int

@@ -1733,7 +1733,12 @@ The stream ends, and the hub closes the connection, when:
   frame is sent, so the stream ends at most 30 seconds after the change;
 - 256 events are waiting for a client that reads more slowly than they come
   and another one is due;
-- a write to the client has not completed for 60 seconds.
+- a write to the client has not completed for 60 seconds;
+- the stream's position fell below `oldest_seq` minus 1 since its previous
+  read of the log, because events after it left the log while it was open:
+  no further frame is sent, rather than skip those events, and a reconnect
+  with the `id` of the last frame received is answered `410`
+  `cursor_expired` with `oldest_seq`.
 
 The hub never drops an event from an open stream: the `hub_event` frames a
 client received before the end are a gap-free prefix of the visible,
@@ -1801,8 +1806,8 @@ event exactly once, also when the events in between are ones the caller may
 not see or the filters exclude. Items are decided with the caller's access at
 the time the page is read: the admin token sees every event; a user sees the
 events of a workspace on which, or on whose fork parent, it has a level
-(`owner` for the types beginning with `parley.secret.`, `parley.token.` and
-`parley.webhook.`), and an event of no workspace when its `metadata.scope`
+(`owner` or `admin` for the types beginning with `parley.secret.`,
+`parley.token.` and `parley.webhook.`), and an event of no workspace when its `metadata.scope`
 is `user` with the user's id, or `org` with an active org the user is a
 member of. A workspace-bound PAT sees no event yet.
 
@@ -1815,11 +1820,19 @@ examined, `last_seq` at that time. When the hub begins to stop, every held
 request is answered at once, `200` with `items` `[]`. A held request whose
 client goes away stops waiting.
 
+A position that was valid when the request was checked can fall below
+`oldest_seq` minus 1 before the page is read, when events after it leave the
+log while the request is held or its page is being collected. The answer is
+then `410` `cursor_expired` with `oldest_seq`, as for a position refused at
+once, and never a page that skips the events that left. A request without a
+position starts at the oldest event the log holds when its page is first
+read.
+
 | Status | When |
 |---|---|
 | `200 OK` | the body is a page of the log |
 | `400` `invalid_request` | a `types` with more than 20 entries (`types has more than 20 entries`), an empty value or an empty entry (`types has an empty entry`), or an entry with `*` anywhere but last (`types entry "parley.*.land" has a * that is not its last character`); a `session_id` that is not a UUID (`session_id must be a UUID`); a `limit` that is not an integer from 1 to 200 (`limit must be an integer from 1 to 200`), a `wait` that is not a whole number of seconds from 0 to 60 (`wait must be a whole number of seconds from 0 to 60`), an `after` or `cursor` that is not a non-negative integer (`after must be a non-negative integer`) or is above `last_seq` (`after must not be greater than last_seq (10)`), `after` and `cursor` with different values (`after and cursor name different positions`), or a query string that does not parse (`the query string is malformed`). Answered at once; nothing is held |
 | `403` `insufficient_scope` | a PAT without `audit:read` or `audit:write` (`this route needs the scope audit:read`), before any parameter is looked at |
 | `404` `not_found` | a `workspace` the caller may not read (`workspace not found`): the same answer for an existing workspace and for a slug with no workspace |
-| `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1 (`event cursor expired`), with the member `oldest_seq`, a number |
+| `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1 (`event cursor expired`), with the member `oldest_seq`, a number; also when it falls below while the request is held or its page is read |
 | `500` `internal` | the log or the caller's access could not be read (`internal error`); no item is sent |

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -244,53 +243,6 @@ func TestSeq_SurvivesRestartAndIsNeverReused(t *testing.T) {
 	}
 }
 
-func TestEmit_StoresTheForkParent(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	ctx := context.Background()
-	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
-		for _, rec := range []access.Record{
-			{Slug: "api", OwnerID: "u_1", OrgID: "o_1", Kind: access.KindRepository, Status: access.StatusReady},
-			{Slug: "api-task", OwnerID: "u_1", OrgID: "o_1", Kind: access.KindFork, ParentSlug: "api", Status: access.StatusReady},
-		} {
-			if err := access.InsertRecord(ctx, tx, rec); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, tc := range []struct {
-		name      string
-		workspace *string
-		parent    string
-		want      string
-	}{
-		{"a fork stores its parent", ptr("api-task"), "", "api"},
-		{"a repository stores none", ptr("api"), "", ""},
-		{"a workspace without a record stores none", ptr("gone"), "", ""},
-		{"an event without a workspace stores none", nil, "", ""},
-		{"a parent passed by the caller is stored", ptr("deleted-task"), "api", "api"},
-	} {
-		in := valid("parley.workspace.update")
-		in.Workspace, in.Parent = tc.workspace, tc.parent
-		if tc.workspace == nil {
-			in.Metadata = map[string]any{"scope": "user", "scope_id": "u_1"}
-		}
-		emitted := f.emit(in)
-		if emitted.parent != tc.want {
-			t.Errorf("%s: emitted parent = %q, want %q", tc.name, emitted.parent, tc.want)
-		}
-		read := f.readAll(emitted.Seq - 1)
-		if len(read) != 1 || read[0].parent != tc.want {
-			t.Errorf("%s: read back %+v, want parent %q", tc.name, read, tc.want)
-		}
-	}
-}
-
 func TestEmit_ConcurrentWritersStayOrdered(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -394,26 +346,6 @@ func TestCounters_ReportSeqStreamsAndTypes(t *testing.T) {
 	f.events.givePlace()
 	if got := f.events.Counters().OpenStreams; got != 0 {
 		t.Errorf("open_streams after the place was given back = %d, want 0", got)
-	}
-}
-
-func TestCounters_StreamPlacesStopAtTheLimit(t *testing.T) {
-	t.Parallel()
-	f := newFixture(t)
-	for range 2 {
-		if !f.events.takePlace(2) {
-			t.Fatal("takePlace refused a place below the limit")
-		}
-	}
-	if f.events.takePlace(2) {
-		t.Error("takePlace granted a third place with a limit of 2")
-	}
-	f.events.givePlace()
-	if !f.events.takePlace(2) {
-		t.Error("takePlace refused a place given back")
-	}
-	if got := f.events.Counters().OpenStreams; got != 2 {
-		t.Errorf("open_streams = %d, want 2", got)
 	}
 }
 

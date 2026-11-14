@@ -1448,7 +1448,10 @@ and the events `parley events tail` printed before an error ended it (see
 [`parley events`](#parley-events)).
 Every error goes to stderr as one error
 envelope, a JSON document indented by two spaces and followed by a newline,
-and nothing else: no usage text follows it. An error envelope the hub
+and nothing else: no usage text follows it. The only other lines on stderr
+are the progress lines of a wait (see [Waiting](#waiting)) and the
+`reconnecting in …` lines of [`parley events tail`](#parley-events-tail),
+which come before any error envelope. An error envelope the hub
 answered (a status of `400` or above whose body is a JSON object with an
 `error` member holding `error_type`) is written as the hub sent it, indented
 again by two spaces without being decoded: its `code` is the HTTP status,

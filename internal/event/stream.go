@@ -50,10 +50,11 @@ func (c *Component) streamLimit() int {
 //
 // The stream ends when the client goes away, when the hub begins to stop,
 // when the credential no longer authenticates at a heartbeat, when 256
-// events wait for the client and another is due, or when a write to the
-// client has not completed for 60 seconds. It never skips an event while it
+// events wait for the client and another is due, when a write to the
+// client has not completed for 60 seconds, or when events after its
+// position left the log while it was open. It never skips an event while it
 // is open: what the client did not receive, it reads again by resuming from
-// the last id it got.
+// the last id it got, or learns it missed with cursor_expired.
 func (c *Component) serveStream(w http.ResponseWriter, r *http.Request) error {
 	q, err := parseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -155,10 +156,13 @@ type stream struct {
 // where the log was examined, also past the events it did not send. Each
 // batch is decided by one viewer, so the caller's access is read once per
 // batch and a change of it shows at the next one. An error ends the stream;
-// so does an event that finds 256 events waiting, which is never dropped.
+// so does an event that finds 256 events waiting, which is never dropped,
+// and a position from which events have left the log since the last read,
+// which would skip them: the stream ends without another frame, and the
+// client that resumes from its last id is refused with cursor_expired.
 func (s *stream) deliver(ctx context.Context) error {
 	for {
-		recs, examined, _, err := s.c.readBatch(ctx, s.pos, logBatch)
+		recs, examined, _, err := s.c.readLog(ctx, s.pos, logBatch)
 		if err != nil {
 			return err
 		}
@@ -230,11 +234,12 @@ var (
 
 // ended is what serveStream returns when err ended the stream: nothing when
 // the stream ended for a reason of the client's, which is how a stream
-// normally ends, else err, which the server logs, since the answer has
+// normally ends, or because its position expired, which the client learns
+// when it resumes, else err, which the server logs, since the answer has
 // begun and no status can be sent.
 func (s *stream) ended(ctx context.Context, err error) error {
 	if errors.Is(err, errClientGone) || errors.Is(err, errTooSlow) || errors.Is(err, errCredentialEnded) ||
-		ctx.Err() != nil {
+		errors.Is(err, ErrPositionExpired) || ctx.Err() != nil {
 		return nil
 	}
 	return err

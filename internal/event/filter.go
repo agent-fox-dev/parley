@@ -137,9 +137,15 @@ func checkPosition(name string, pos int64, b Bounds) error {
 		return server.InvalidRequest(fmt.Sprintf("%s must not be greater than last_seq (%d)", name, b.LastSeq))
 	}
 	if pos < b.OldestSeq-1 {
-		return server.NewError("cursor_expired", http.StatusGone, "event cursor expired").With("oldest_seq", b.OldestSeq)
+		return errCursorExpired(b.OldestSeq)
 	}
 	return nil
+}
+
+// errCursorExpired is the answer to a position from which at least one
+// event has left the log, which now begins at oldestSeq.
+func errCursorExpired(oldestSeq int64) error {
+	return server.NewError("cursor_expired", http.StatusGone, "event cursor expired").With("oldest_seq", oldestSeq)
 }
 
 // coverage is the covered set installed with SetCoverage, nil while none
