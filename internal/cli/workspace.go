@@ -119,8 +119,109 @@ func newWorkspaceCommand() *cobra.Command {
 		Args:        []argSpec{slugArg},
 		Auth:        authUser,
 	})
-	return group("workspace", "Register, list, read, change, sync and push the workspaces of the hub",
-		create, list, get, newWorkspaceUpdateCommand(), newWorkspaceSyncCommand(), newWorkspacePushCommand())
+	return group("workspace", "Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub",
+		create, list, get, newWorkspaceUpdateCommand(), newWorkspaceSyncCommand(), newWorkspacePushCommand(),
+		newWorkspaceArchiveCommand(), newWorkspaceReactivateCommand(), newWorkspaceRecloneCommand(), newWorkspaceDeleteCommand())
+}
+
+// safetyCopyRequestTimeout bounds the requests of parley workspace archive
+// and reclone: the hub offers every branch to origin within its own
+// 2-minute deadline before it answers, which the default of 30 seconds
+// would not wait for.
+const safetyCopyRequestTimeout = 3 * time.Minute
+
+// confirmFlag is the flag without which a command that destroys data sends
+// nothing.
+const confirmFlag = "confirm"
+
+// untilCloned is the wait of a command that puts a workspace back to
+// pending: it polls the workspace until the hub's clone work has made it
+// ready or failed, as parley workspace create --wait does.
+func untilCloned() *waitFor {
+	return &waitFor{
+		Poll: func(c *call, _ []byte) (apiRequest, error) {
+			return apiRequest{method: http.MethodGet, path: "/workspaces/" + pathSegment(c.args[slugArg.Name])}, nil
+		},
+		Classify: byState("status", []string{"ready"}, []string{"failed"}),
+	}
+}
+
+// needsConfirm gives cmd the --confirm flag, whose usage is what, and
+// refuses a command line without it, or with --confirm=false, as a usage
+// error before any setting is resolved or any request sent.
+func needsConfirm(cmd *cobra.Command, what string) *cobra.Command {
+	cmd.Flags().Bool(confirmFlag, false, what)
+	checkLine := cmd.Args
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		if confirmed, _ := cmd.Flags().GetBool(confirmFlag); !confirmed {
+			return usageError("%s needs --%s, because it cannot be undone", cmd.CommandPath(), confirmFlag)
+		}
+		return nil
+	}
+	return cmd
+}
+
+// newWorkspaceArchiveCommand builds parley workspace archive.
+func newWorkspaceArchiveCommand() *cobra.Command {
+	return declare(command{
+		Name:        "archive",
+		Description: "Take a workspace out of service, keeping its copy, after offering its branches to origin",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/archive",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Timeout:     safetyCopyRequestTimeout,
+	})
+}
+
+// newWorkspaceReactivateCommand builds parley workspace reactivate.
+func newWorkspaceReactivateCommand() *cobra.Command {
+	return declare(command{
+		Name:        "reactivate",
+		Description: "Bring an archived workspace back into service; with --wait, wait until it is ready",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/reactivate",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Wait:        untilCloned(),
+	})
+}
+
+// newWorkspaceRecloneCommand builds parley workspace reclone.
+func newWorkspaceRecloneCommand() *cobra.Command {
+	return needsConfirm(declare(command{
+		Name:        "reclone",
+		Description: "Discard the hub's copy of a workspace and clone origin again, after offering its branches to origin; with --wait, wait until it is ready",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/reclone",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Timeout:     safetyCopyRequestTimeout,
+		Wait:        untilCloned(),
+	}), "discard the hub's copy: commits origin refuses are lost")
+}
+
+// newWorkspaceDeleteCommand builds parley workspace delete. The hub answers
+// a delete with no body, so the command prints a document that names the
+// workspace deleted.
+func newWorkspaceDeleteCommand() *cobra.Command {
+	return needsConfirm(declare(command{
+		Name:        "delete",
+		Description: "Delete an archived workspace with its forks and everything they own",
+		Method:      http.MethodDelete,
+		Path:        "/workspaces/:slug",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Confirm: func(c *call) any {
+			return struct {
+				Status string `json:"status"`
+				Slug   string `json:"slug"`
+			}{"deleted", c.args[slugArg.Name]}
+		},
+	}), "delete the workspace, its forks and everything they own")
 }
 
 // pushRequestTimeout bounds the request of parley workspace push: the hub

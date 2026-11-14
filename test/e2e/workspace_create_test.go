@@ -49,8 +49,9 @@ type startState struct {
 }
 
 // startWorkspaceHub starts the hub for origin, recording the state of the
-// workspace slug at every start.
-func startWorkspaceHub(t *testing.T, origin *gitrepotest.Origin, slug string) *workspaceHub {
+// workspace slug at every start; each of compose runs on the composition
+// after the parts are composed.
+func startWorkspaceHub(t *testing.T, origin *gitrepotest.Origin, slug string, compose ...func(*hub.Composition)) *workspaceHub {
 	t.Helper()
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -74,6 +75,9 @@ func startWorkspaceHub(t *testing.T, origin *gitrepotest.Origin, slug string) *w
 				defer h.mu.Unlock()
 				h.starts = append(h.starts, startState{string(w.Status), rootEntries(t, d.Root)})
 			})
+			for _, fn := range compose {
+				fn(c)
+			}
 		},
 	})
 	h.user = h.CreateUser(t, "dev")
