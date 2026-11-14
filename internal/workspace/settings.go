@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -270,15 +272,22 @@ func trimString(raw json.RawMessage) json.RawMessage {
 }
 
 // validateForgeURL accepts "" and an absolute https URL with a host and
-// without user information, query or fragment.
+// without user information, query or fragment. The value is stored as
+// given, so the scheme must be written in lower case, and white space,
+// which url.Parse lets through in a path, is refused rather than stored.
 func validateForgeURL(s string) error {
 	if s == "" {
 		return nil
 	}
+	if strings.ContainsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return errors.New("must not hold white space or control characters")
+	}
 	u, err := url.Parse(s)
 	switch {
-	case err != nil || !u.IsAbs() || u.Scheme != "https" || u.Hostname() == "":
+	case err != nil || !strings.HasPrefix(s, "https://") || u.Hostname() == "":
 		return errors.New(`must be "" or an absolute https:// URL with a host`)
+	case !validPort(u):
+		return errors.New("must have a port from 1 to 65535 if it names one")
 	case u.User != nil:
 		return errors.New("must not hold user information")
 	case u.RawQuery != "" || u.ForceQuery:
@@ -287,6 +296,24 @@ func validateForgeURL(s string) error {
 		return errors.New("must not hold a fragment")
 	}
 	return nil
+}
+
+// validPort reports whether u names no port, or one from 1 to 65535 in
+// decimal digits; url.Parse lets an empty port and one out of range through.
+func validPort(u *url.URL) bool {
+	host := u.Host
+	if i := strings.LastIndexByte(host, ']'); i >= 0 {
+		host = host[i+1:] // the colons of an IPv6 address are not a port
+	}
+	_, p, found := strings.Cut(host, ":")
+	if !found {
+		return true
+	}
+	if p == "" || strings.Trim(p, "0123456789") != "" {
+		return false
+	}
+	n, err := strconv.Atoi(p)
+	return err == nil && n >= 1 && n <= 65535
 }
 
 // validateGlobs accepts a JSON array of at most maxProtectedBranches

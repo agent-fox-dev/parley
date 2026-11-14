@@ -116,6 +116,11 @@ func newWorkspaceCommand() *cobra.Command {
 		Args:        []argSpec{slugArg},
 		Auth:        authUser,
 	})
+	return group("workspace", "Register, list, read and change the workspaces of the hub", create, list, get, newWorkspaceUpdateCommand())
+}
+
+// newWorkspaceUpdateCommand builds parley workspace update.
+func newWorkspaceUpdateCommand() *cobra.Command {
 	update := declare(command{
 		Name:        "update",
 		Description: "Change a workspace's display name, description, organization or settings",
@@ -151,7 +156,7 @@ func newWorkspaceCommand() *cobra.Command {
 		_, err := workspaceUpdateBody(cmd)
 		return err
 	}
-	return group("workspace", "Register, list, read and change the workspaces of the hub", create, list, get, update)
+	return update
 }
 
 // listWorkspaces is the run step of parley workspace list: it sends a query

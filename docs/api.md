@@ -1079,7 +1079,7 @@ it was set, otherwise its default. Only the keys set are stored.
 | `changes.require_intent` | bool | | `true` |
 | `changes.auto_restack` | bool | | `true` |
 | `audit_fetches` | bool | | `false` |
-| `forge_api_url` | URL string | `""` or an absolute `https://` URL with a host and without user information, query or fragment | `""` |
+| `forge_api_url` | URL string | `""` or an absolute URL starting with exactly `https://` (lower case), with a host, a port only if from 1 to 65535, and without user information, query, fragment, white space or control characters | `""` |
 | `upstream_forge_api_url` | URL string | the same | `""` |
 | `patch_branch_source` | enum | `hub`, `origin` | `hub` |
 | `patch_divergence_policy` | enum | `replace`, `report` | `replace` |
@@ -1244,7 +1244,7 @@ over the pages returns each listed workspace once.
 | Status | When |
 |---|---|
 | `200 OK` | the body is a page, `items` an array of workspace objects (`[]` when nothing matches) |
-| `400` `invalid_request` | `include_archived` or `include_forks` with a value other than exactly `true` or `false`, an empty one included (`include_forks must be true or false`); a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `400` `invalid_request` | `include_archived` or `include_forks` with a value other than exactly `true` or `false`, an empty one included, or given more than once (`include_forks must be given once, as true or false`); a bad `limit` or `cursor` (see [Lists](#lists)) |
 | `403` `insufficient_scope` | a PAT with neither `workspaces:read` nor `workspaces:write` (`this route needs the scope workspaces:read`) |
 
 ## `GET /api/v1/workspaces/{slug}`

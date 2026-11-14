@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -185,14 +184,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t
 	origin := newOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
 
-	var stdout, stderr bytes.Buffer
-	code := cli.Run(context.Background(), []string{"--endpoint-url", h.URL(""), "--api-key", h.key,
-		"workspace", "create", "--slug", "demo", "--git-url", origin.URL()}, &stdout, &stderr)
-	r := ran{code, stdout.String(), stderr.String()}
-	if r.code != 0 {
-		t.Fatalf("workspace create exited %d; stderr = %q", r.code, r.stderr)
-	}
-	printed := r.json(t)
+	printed := h.must(t, "workspace", "create", "--slug", "demo", "--git-url", origin.URL()).json(t)
 	if printed["status"] != "pending" || printed["access"] != "owner" || printed["hub_url"] != "https://hub.example/git/dev/demo.git" {
 		t.Errorf("printed status %v, access %v, hub_url %v; want pending, owner, https://hub.example/git/dev/demo.git",
 			printed["status"], printed["access"], printed["hub_url"])

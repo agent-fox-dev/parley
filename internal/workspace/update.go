@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"time"
@@ -181,14 +182,18 @@ func (s *Service) RegisterForkField(name string, h ForkFieldHandler) {
 	}
 	s.forkMu.Lock()
 	defer s.forkMu.Unlock()
+	// A new map replaces the old one rather than changing it, because an
+	// update in flight keeps reading the map forkUpdate handed it.
+	fields := maps.Clone(s.forkFields)
+	if fields == nil {
+		fields = map[string]ForkFieldHandler{}
+	}
 	if h == nil {
-		delete(s.forkFields, name)
-		return
+		delete(fields, name)
+	} else {
+		fields[name] = h
 	}
-	if s.forkFields == nil {
-		s.forkFields = map[string]ForkFieldHandler{}
-	}
-	s.forkFields[name] = h
+	s.forkFields = fields
 }
 
 // RegisterForkUpdateGuard makes g the guard asked about every update of a
@@ -200,6 +205,8 @@ func (s *Service) RegisterForkUpdateGuard(g ForkUpdateGuard) {
 }
 
 // forkUpdate is the fork-only field handlers and the guard registered now.
+// The map is never written after it is returned (RegisterForkField swaps in
+// a new one), so the caller reads it without the lock.
 func (s *Service) forkUpdate() (map[string]ForkFieldHandler, ForkUpdateGuard) {
 	s.forkMu.RLock()
 	defer s.forkMu.RUnlock()

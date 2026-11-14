@@ -218,7 +218,8 @@ func TestRead_ListOrdersNewestFirstThenBySlugAcrossPages(t *testing.T) {
 func TestRead_ListRefusesABooleanOtherThanTrueOrFalse(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	for _, query := range []string{"include_archived=yes", "include_archived=1", "include_forks=TRUE", "include_forks="} {
+	for _, query := range []string{"include_archived=yes", "include_archived=1", "include_forks=TRUE", "include_forks=",
+		"include_archived=true&include_archived=yes", "include_forks=true&include_forks=true"} {
 		if a := w.list(t, w.uKey, query); a.status != http.StatusBadRequest || a.errorType(t) != "invalid_request" {
 			t.Errorf("?%s = %d %s, want 400 invalid_request", query, a.status, a.body)
 		}

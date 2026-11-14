@@ -89,14 +89,8 @@ func TestUpdate_RefusesAnInvalidSettingsValueChangingNothing(t *testing.T) {
 		{map[string]any{"settings": []any{}}, "settings"},
 		{map[string]any{"settings": map[string]any{"nope": 1}}, `unknown setting "nope"`},
 	} {
-		before := w.get(t, w.uKey, "demo")
-		w.advance(time.Minute)
-		r := w.patch(t, w.uKey, "demo", c.body)
-		if errorType, msg := r.refusal(t); r.status != http.StatusBadRequest || errorType != "invalid_request" || !strings.Contains(msg, c.want) {
-			t.Errorf("%v = %d %s, want 400 invalid_request naming %s", c.body, r.status, r.body, c.want)
-		}
-		if after := w.get(t, w.uKey, "demo"); !bytes.Equal(after.body, before.body) {
-			t.Errorf("%v: the workspace = %s, want it unchanged %s", c.body, after.body, before.body)
+		if msg := w.refused(t, w.uKey, "demo", c.body, http.StatusBadRequest, "invalid_request"); !strings.Contains(msg, c.want) {
+			t.Errorf("%v: message %q, want it to name %s", c.body, msg, c.want)
 		}
 	}
 }
@@ -104,12 +98,15 @@ func TestUpdate_RefusesAnInvalidSettingsValueChangingNothing(t *testing.T) {
 // refused sends body to PATCH /workspaces/<slug> as cred, an hour of the
 // hub's time after the workspace was last read, and checks that the answer
 // is status with errorType, that the workspace, updated_at included, is as
-// it was and that the event log holds no new event.
-func (w *world) refused(t *testing.T, cred, slug string, body any, status int, errorType string) {
+// it was and that the event log holds no new event. It returns the
+// refusal's message.
+func (w *world) refused(t *testing.T, cred, slug string, body any, status int, errorType string) string {
 	t.Helper()
 	before, events := w.get(t, w.Token, slug), w.eventCount(t)
 	w.advance(time.Hour)
-	if r := w.patch(t, cred, slug, body); r.status != status || r.errorType(t) != errorType {
+	r := w.patch(t, cred, slug, body)
+	gotType, msg := r.refusal(t)
+	if r.status != status || gotType != errorType {
 		t.Errorf("PATCH %s %v = %d %s, want %d %s", slug, body, r.status, r.body, status, errorType)
 	}
 	if after := w.get(t, w.Token, slug); !bytes.Equal(after.body, before.body) {
@@ -118,6 +115,7 @@ func (w *world) refused(t *testing.T, cred, slug string, body any, status int, e
 	if n := w.eventCount(t); n != events {
 		t.Errorf("PATCH %s %v: %d events, want the %d before it", slug, body, n, events)
 	}
+	return msg
 }
 
 func TestUpdate_ChangesOnlyTheGivenFieldsAndUpdatedAt(t *testing.T) {
@@ -456,6 +454,16 @@ func TestUpdate_RefusesAnOrgThatIsNoneOrNotOneOfTheOwnersChangingNothing(t *test
 	}
 	if rec, _ := w.workspace(t, "demo--t1"); rec.OrgID != w.uOrg.ID {
 		t.Errorf("the fork after the refusals: org_id = %s, want u's personal org %s", rec.OrgID, w.uOrg.ID)
+	}
+	// null names the owner's personal org, which this owner no longer has.
+	nora := w.CreateUser(t, "nora")
+	if _, err := w.Store.Main().Exec(`UPDATE orgs SET personal = 0 WHERE owner_id = ?`, nora); err != nil {
+		t.Fatal(err)
+	}
+	w.put(t, workspace.Workspace{Slug: "noras", OwnerID: nora, OrgID: acme, Status: workspace.StatusReady})
+	want := "org_id: the workspace's owner has no personal organization"
+	if msg := w.refused(t, w.Token, "noras", map[string]any{"org_id": nil}, http.StatusBadRequest, "invalid_request"); msg != want {
+		t.Errorf("org_id null for an owner without a personal org: message %q, want %q", msg, want)
 	}
 }
 

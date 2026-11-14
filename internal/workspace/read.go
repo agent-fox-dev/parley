@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -103,7 +104,10 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) error {
 	} else if ok {
 		after = &pos
 	}
-	caller, _ := server.CallerOf(r.Context())
+	caller, ok := server.CallerOf(r.Context())
+	if !ok {
+		return server.Internal("the workspace list found no caller")
+	}
 	set, err := s.deps.Access.Readable(r.Context(), access.CallerFrom(caller))
 	if err != nil {
 		return fmt.Errorf("list workspaces: %w", err)
@@ -118,8 +122,17 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) error {
 	}
 	items := make([]Object, 0, len(recs))
 	created := make(map[string]int64, len(recs))
+	// A page's workspaces mostly share a few orgs: each is read once.
+	orgs := map[string]identity.Org{}
 	for _, rec := range recs {
-		obj, err := s.RenderWorkspace(r.Context(), rec, set.Level(rec.Slug))
+		org, ok := orgs[rec.OrgID]
+		if !ok {
+			if org, err = identity.OrgByID(r.Context(), s.deps.Store.Main(), rec.OrgID); err != nil {
+				return fmt.Errorf("list workspaces: the org of %q: %w", rec.Slug, err)
+			}
+			orgs[rec.OrgID] = org
+		}
+		obj, err := s.render(r.Context(), rec, set.Level(rec.Slug), org)
 		if err != nil {
 			return err
 		}
@@ -131,18 +144,22 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) error {
 
 // boolParam reads the query parameter name: absent or false is false, true
 // is true, and any other value is refused rather than ignored, so that a
-// misspelt true does not silently list less.
+// misspelt true does not silently list less. A parameter given more than
+// once is refused too, rather than one of its values chosen.
 func boolParam(query url.Values, name string) (bool, error) {
-	if !query.Has(name) {
+	values, ok := query[name]
+	if !ok {
 		return false, nil
 	}
-	switch query.Get(name) {
-	case "true":
-		return true, nil
-	case "false":
-		return false, nil
+	if len(values) == 1 {
+		switch values[0] {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		}
 	}
-	return false, server.InvalidRequest(name + " must be true or false")
+	return false, server.InvalidRequest(name + " must be given once, as true or false")
 }
 
 // readList reads up to limit workspaces of the readable set set that f

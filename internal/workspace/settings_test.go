@@ -159,7 +159,9 @@ func TestSettings_StoresAValueItsKeyAcceptsAndRefusesAnyOther(t *testing.T) {
 		}
 		for _, bad := range []string{`"http://api.example"`, `"api.example/v3"`, `"/api/v3"`, `"https://"`, `"https:///path"`,
 			`"https://user@api.example"`, `"https://user:pw@api.example"`, `"https://api.example/v3?x=1"`,
-			`"https://api.example/v3#frag"`, `"ssh://api.example"`, `5`, `true`, `[]`} {
+			`"https://api.example/v3#frag"`, `"ssh://api.example"`, `"HTTPS://api.example"`, `"https://api.example:"`,
+			`"https://api.example:0"`, `"https://api.example:99999"`, `"https://api.example/a b"`, `"https://api.example/a\tb"`,
+			`5`, `true`, `[]`} {
 			rows = append(rows, row{key, bad, ""})
 		}
 	}
