@@ -2737,8 +2737,15 @@ update's transaction. `composeForks` registers them with
 `(*workspace.Service).RegisterForkField` and `GuardUpdate` with
 `RegisterForkUpdateGuard`, so the workspace update judges them after the
 other values and asks the guard, for every update of a fork, after the
-body is judged and before anything is written; `ttl` is left to the fork
-lifetime. The update's `parley.workspace.update` event carries the
+body is judged and before anything is written. The handler of `ttl` is
+`(*fork.Component).TTLField` in `internal/fork/extend.go`, a method because
+it needs the hub's clock and the `[forks]` limits, read from the bound
+component when it is called: `null`, a number or a boolean is `400
+invalid_request` (`ttl: must be a string`), a string is judged by
+`ResolveTTL` at the component's `Now` (its `400` answered unchanged), and
+the write stores the resulting `expires_at` in the update's transaction, so
+that the new lifetime counts from the request, later or earlier than the
+one before. The update's `parley.workspace.update` event carries the
 workspace's `session_id`.
 
 ### Hub events

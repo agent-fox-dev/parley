@@ -761,10 +761,10 @@ func (w *world) whole(t *testing.T, h held) {
 	}
 }
 
-// deleteEvents are the parley.workspace.delete events of the workspace slug.
-func (w *world) deleteEvents(t *testing.T, slug string) []event.Record {
+// eventsFor are the events of type typ of the workspace slug.
+func (w *world) eventsFor(t *testing.T, typ, slug string) []event.Record {
 	t.Helper()
-	return slices.DeleteFunc(w.eventsOf(t, "parley.workspace.delete"), func(r event.Record) bool {
+	return slices.DeleteFunc(w.eventsOf(t, typ), func(r event.Record) bool {
 		return r.Workspace == nil || *r.Workspace != slug
 	})
 }

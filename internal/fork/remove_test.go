@@ -123,7 +123,7 @@ func TestDeleteFork_LeavesTheForkWholeWhenAStepFails(t *testing.T) {
 			if (len(removed) > 0) != c.wantRemoved || len(sandboxes) != 1 {
 				t.Errorf("remover of owned data asked %v (want a call: %v), sandboxes %v (want one call)", removed, c.wantRemoved, sandboxes)
 			}
-			if evs := w.deleteEvents(t, h.slug); len(evs) != 0 {
+			if evs := w.eventsFor(t, fork.EventDelete, h.slug); len(evs) != 0 {
 				t.Errorf("delete events = %d, want none", len(evs))
 			}
 		})
@@ -163,7 +163,7 @@ func TestDeleteFork_WritesOneDeleteEvent(t *testing.T) {
 			if a := w.call(t, http.MethodDelete, "/workspaces/"+h.slug, w.devKey, nil); a.status != http.StatusNoContent {
 				t.Fatalf("DELETE = %d %s, want 204", a.status, a.body)
 			}
-			evs := w.deleteEvents(t, h.slug)
+			evs := w.eventsFor(t, fork.EventDelete, h.slug)
 			if len(evs) != 1 {
 				t.Fatalf("delete events = %d, want 1", len(evs))
 			}
@@ -222,7 +222,7 @@ func TestDeleteFork_RefusesAndLeavesTheForkWhole(t *testing.T) {
 		})
 	}
 	w.whole(t, h)
-	if evs := w.deleteEvents(t, h.slug); len(evs) != 0 {
+	if evs := w.eventsFor(t, fork.EventDelete, h.slug); len(evs) != 0 {
 		t.Errorf("delete events = %d, want none", len(evs))
 	}
 }
@@ -246,7 +246,7 @@ func TestDeleteFork_RemovesAForkAtMostOnce(t *testing.T) {
 	if slices.Sort(statuses); !reflect.DeepEqual(statuses, []int{http.StatusNoContent, http.StatusNotFound}) {
 		t.Errorf("statuses = %v, want one 204 and one 404", statuses)
 	}
-	if evs := w.deleteEvents(t, h.slug); len(evs) != 1 {
+	if evs := w.eventsFor(t, fork.EventDelete, h.slug); len(evs) != 1 {
 		t.Errorf("delete events = %d, want 1", len(evs))
 	}
 	if removed, _, _ := r.take(); len(removed) != 1 {

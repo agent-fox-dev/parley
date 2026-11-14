@@ -55,3 +55,16 @@ busy parent with `500 internal` and the message `internal error`, as the
 hub answers any internal failure, and logs the cause (`fork not removed`,
 with `slug` and `error`), so that no detail of a remover's failure reaches
 the caller.
+
+## The handler of `ttl` is a method of the fork component
+
+The package registers a handler for `ttl` with package 11's
+`RegisterForkField` and has it call `ResolveTTL` at the request time. A
+`workspace.ForkFieldHandler` receives the fork and the raw value only, and
+`ResolveTTL` needs the hub's clock and the `[forks]` limits, which exist
+only once the hub has started. The handler is therefore
+`(*fork.Component).TTLField`, registered in `internal/hub/fork.go` while
+the hub is composed and reading `Deps.Now` and `Deps.Limits` of the bound
+component each time it is called. Its refusal of a value that is not a
+string (`null`, a number, a boolean) is `ttl: must be a string`; a string
+`ResolveTTL` refuses is answered with `ResolveTTL`'s own `400`.
