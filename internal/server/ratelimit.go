@@ -110,11 +110,11 @@ func (s *Server) RateLimiter() *Limiter { return s.limiter }
 // callers without a credential id never share one window. Over the limit it
 // sets Retry-After and answers 429.
 func (s *Server) rateLimit(w http.ResponseWriter, r *http.Request) error {
-	key := addressKey(r)
-	if c, ok := CallerOf(r.Context()); ok && c.CredentialID != "" {
-		key = "credential:" + c.CredentialID
+	var credentialID string
+	if c, ok := CallerOf(r.Context()); ok {
+		credentialID = c.CredentialID
 	}
-	ok, retryAfter := s.limiter.Allow(key)
+	ok, retryAfter := s.limiter.Allow(LimitKey(r, credentialID))
 	if ok {
 		return nil
 	}
@@ -127,6 +127,18 @@ func (s *Server) rateLimit(w http.ResponseWriter, r *http.Request) error {
 // refusal comes first in the order of checks.
 func (s *Server) countRefused(r *http.Request) {
 	s.limiter.Allow(addressKey(r))
+}
+
+// LimitKey is the limiter key the REST API counts r against: its
+// credential when credentialID is not empty, otherwise the connection's
+// client address. A surface mounted with Handle counts its requests with it
+// on RateLimiter, so that a caller has one window across that surface and
+// the REST API.
+func LimitKey(r *http.Request, credentialID string) string {
+	if credentialID != "" {
+		return "credential:" + credentialID
+	}
+	return addressKey(r)
 }
 
 // addressKey is the limiter key of the connection's remote IP address. Headers

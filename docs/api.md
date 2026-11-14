@@ -333,6 +333,8 @@ it has ended, the next request starts a new one.
 - A request that authentication refused is still answered with
   authentication's own error (`401`), even when its address is over the
   limit; the address's count decides the answer only on public routes.
+- A git request is counted too, against the same keys, as in
+  [Git over HTTP](#git-over-http).
 - `/healthz`, `/readyz` and `/version`, and any request answered `404` or
   `405` at route matching (`/metrics` included, which the hub does not
   serve yet), are never counted or refused.
@@ -546,6 +548,58 @@ The catalogue of error types and the status each is answered with:
 A feature can answer a type of its own outside this table (for example
 `workspace_busy` with `409`); its section of this page names the type and its
 status. The envelope's shape is the same for every type.
+
+## Git over HTTP
+
+Outside `/api/v1`, the hub speaks git smart HTTP on three routes:
+
+| Route | What |
+|---|---|
+| `GET /git/{org}/{slug}.git/info/refs` | ref discovery, with the query parameter `service` |
+| `POST /git/{org}/{slug}.git/git-upload-pack` | the fetch exchange |
+| `POST /git/{org}/{slug}.git/git-receive-pack` | the push exchange |
+
+Any other path or method under `/git` gets the general `404 not_found` or
+`405 method_not_allowed` envelope of [Routes and matching](#routes-and-matching),
+before any credential is read. The git routes pass none of the REST API's
+checks: no JSON body, no body limit, no content-type rule, no error envelope.
+A git request passes these checks in this order, and the first that refuses
+answers it with an HTTP status and a body of one line of text, sent with
+`Content-Type: text/plain; charset=utf-8`:
+
+1. Authentication. git sends the credential as HTTP Basic,
+   `Authorization: Basic <base64 of user:password>`, with the scheme in any
+   letter case. The password is the credential (an API key, a PAT or the
+   admin token, checked as in [Authentication](#authentication)); the user
+   name is never read, so any name, an empty one included, works. A missing
+   header, another scheme (such as `Bearer`), data that is not base64 or has
+   no colon, an empty password, and a credential that is unknown, wrong,
+   revoked or expired all get the same answer, whatever the request
+   addresses:
+
+   ```
+   HTTP/1.1 401 Unauthorized
+   WWW-Authenticate: Basic realm="parley"
+   Content-Type: text/plain; charset=utf-8
+
+   authentication required
+   ```
+
+   The credential of a blocked user gets `403` with the body
+   `user is blocked` and no `WWW-Authenticate` header, so git does not ask
+   for another credential.
+2. The rate limit, as in [Rate limit](#rate-limit): the request is counted
+   against its credential, in the same window as the credential's REST
+   requests. Over the limit it gets `429` with a `Retry-After` header and the
+   body `rate limit exceeded`, before the repository is looked at, so the
+   answer is the same for a repository that exists and one that does not. A
+   request that authentication refused is counted against its client
+   address and still answered by authentication (`401` or `403`).
+
+An error the hub did not expect is answered `500` with the body
+`internal error` and written to the hub's log with the request id. The hub
+has no git service yet: a request that passes every check is answered
+`500 internal error`.
 
 ## `GET /healthz`
 

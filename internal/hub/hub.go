@@ -30,6 +30,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
+	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
@@ -65,6 +66,7 @@ var parts = []func(*Composition){
 	composeSecrets,
 	composeWorkspaces,
 	composeForks,
+	composeGitServer,
 	composeSandbox,
 }
 
@@ -191,6 +193,16 @@ type Composition struct {
 	// dependencies (AdjustForks).
 	forks         *fork.Component
 	forkAdjusters []func(*fork.Deps)
+
+	// gitServer is the git server composeGitServer creates and binds in its
+	// start hook (GitServer), after gitServerAdjusters have changed its
+	// dependencies (AdjustGitServer).
+	gitServer          *gitserver.Component
+	gitServerAdjusters []func(*gitserver.Deps)
+
+	// serverHooks receive the HTTP server once install has registered the
+	// routes, mounts and checks on it (addServerHook).
+	serverHooks []func(*server.Server)
 
 	// env is the hub's environment, Options.Env, which a part's
 	// configuration check reads what the configuration file does not hold
@@ -321,7 +333,20 @@ func (c *Composition) install(srv *server.Server) (err error) {
 	for _, check := range c.accessChecks {
 		srv.AddAccessCheck(check)
 	}
+	for _, hook := range c.serverHooks {
+		hook(srv)
+	}
 	return nil
+}
+
+// addServerHook adds a function that receives the HTTP server install
+// installs on, for a part that needs what only the built server has, such as
+// its rate limiter. install runs once on a server of its own while the
+// composition is checked, before anything is opened, and once on the server
+// that serves, after the start hooks and before the first request; what a
+// hook keeps from the second call is what the requests see.
+func (c *Composition) addServerHook(hook func(*server.Server)) {
+	c.serverHooks = append(c.serverHooks, hook)
 }
 
 // addConfigCheck adds a check of the loaded configuration, for a part whose
