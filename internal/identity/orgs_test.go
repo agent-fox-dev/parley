@@ -3,6 +3,7 @@ package identity_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 func TestMemberships_ListsTheMembersOfOneOrg(t *testing.T) {
@@ -88,5 +90,37 @@ func TestActiveOrgIDs_ListsOnlyTheActiveOrgsOfWhichTheUserIsAMember(t *testing.T
 		if got, err := identity.ActiveOrgIDs(context.Background(), h.st.Main(), c.userID); err != nil || !slices.Equal(got, c.want) {
 			t.Errorf("%s: ActiveOrgIDs = %v, %v, want %v", c.name, got, err, c.want)
 		}
+	}
+}
+
+func TestPersonalOrgStep_MarksTheOrgEachUserOwnsUnderTheirUsernameInAnExistingStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	opts := store.Options{DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces")}
+	st, err := store.Open(ctx, opts, []store.Step{identity.SchemaStep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Main().ExecContext(ctx, `
+INSERT INTO users (id, username, email, role, status, provider, provider_id, created_at, updated_at)
+VALUES ('u1', 'alice', 'a@x', 'user', 'active', 'github', '1', 0, 0);
+INSERT INTO orgs (id, name, slug, owner_id, status, created_at, updated_at) VALUES
+	('o1', 'Acme Inc', 'acme', 'u1', 'active', 0, 0),
+	('o2', 'alice', 'alice', 'u1', 'active', 0, 0);`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	st, err = store.Open(ctx, opts, []store.Step{identity.SchemaStep, identity.PersonalOrgStep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.Main().ExecContext(ctx, `UPDATE orgs SET name = 'Alice Ltd' WHERE id = 'o2'`); err != nil {
+		t.Fatal(err)
+	}
+	if o, err := identity.PersonalOrg(ctx, st.Main(), "u1"); err != nil || o.ID != "o2" {
+		t.Errorf("PersonalOrg = %q, %v; want o2", o.ID, err)
 	}
 }

@@ -49,7 +49,7 @@ func TestCreateUserAndPersonalOrg_TriesTheSlugSuffixesInOrder(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
 			st, err := store.Open(ctx, store.Options{DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "ws")},
-				[]store.Step{SchemaStep})
+				[]store.Step{SchemaStep, PersonalOrgStep})
 			if err != nil {
 				t.Fatalf("open store: %v", err)
 			}

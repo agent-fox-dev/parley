@@ -351,7 +351,7 @@ func newGuardHub(t *testing.T) *guardHub {
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(dir, "workspaces"),
-	}, []store.Step{identity.SchemaStep, identity.AdminSettingsStep, access.SchemaStep, access.CreatingTokenStep})
+	}, []store.Step{identity.SchemaStep, identity.PersonalOrgStep, identity.AdminSettingsStep, access.SchemaStep, access.CreatingTokenStep})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

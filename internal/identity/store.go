@@ -402,7 +402,8 @@ const slugSuffixes = 10
 
 // CreateUserAndPersonalOrg creates, in tx, the active user nu with the role
 // role, the user's personal org and the user's membership of it. The org is
-// active, named after the username and owned by the user; its slug is
+// active, named after the username, owned by the user and marked personal
+// (see PersonalOrg); its slug is
 // derived from the username (see slug), or the first free of <slug>-1 to
 // <slug>-10 when that one is taken. It returns an error that is
 // ErrConflict, and writes nothing, when the username, the e-mail or the
@@ -447,7 +448,8 @@ func CreateUserAndPersonalOrg(ctx context.Context, tx *sql.Tx, nu NewUser, role 
 	}{
 		{"user", `INSERT INTO users (id, username, email, full_name, role, status, provider, provider_id, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, []any{u.ID, u.Username, u.Email, u.FullName, u.Role, u.Status, u.Provider, u.ProviderID, at, at}},
-		{"org", `INSERT INTO orgs (id, name, slug, url, owner_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		{"org", `INSERT INTO orgs (id, name, slug, url, owner_id, status, personal, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 			[]any{o.ID, o.Name, o.Slug, o.URL, o.OwnerID, o.Status, at, at}},
 		{"membership", `INSERT INTO memberships (org_id, user_id, created_at) VALUES (?, ?, ?)`, []any{o.ID, u.ID, at}},
 	} {

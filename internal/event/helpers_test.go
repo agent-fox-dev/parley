@@ -188,7 +188,7 @@ func (f *fixture) open() {
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(f.dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(f.dir, "workspaces"),
-	}, []store.Step{identity.AdminSettingsStep, identity.SchemaStep, access.SchemaStep, access.CreatingTokenStep, SchemaStep, testRowsStep})
+	}, []store.Step{identity.AdminSettingsStep, identity.SchemaStep, identity.PersonalOrgStep, access.SchemaStep, access.CreatingTokenStep, SchemaStep, testRowsStep})
 	if err != nil {
 		f.t.Fatalf("open store: %v", err)
 	}

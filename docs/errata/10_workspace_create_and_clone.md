@@ -3,13 +3,17 @@
 Where the implementation of package 10 (`.specs/10_workspace_create_and_clone`)
 differs from what the package says, or decides what it leaves open.
 
-## The personal organization is found by owner and name
+## The personal organization is marked on the org
 
 The package says a create without `org_id` uses "the caller's personal
-organization", but no record marks an org as personal. The org
-`identity.CreateUserAndPersonalOrg` makes is owned by the user and named after
-the username, so `identity.PersonalOrg(ctx, q, userID, username)` selects the
-org with that owner and that name. When there is none, the create answers
+organization", and the identity records did not say which org that is. The
+schema step `identity_personal_orgs` adds the flag `personal` to `orgs`;
+`identity.CreateUserAndPersonalOrg` sets it on the org it makes, and in a store
+with records already the step sets it on the org each user owns under their
+username. `identity.PersonalOrg(ctx, q, userID)` selects the org with that
+owner and the flag, so a later login that changes the username, or an admin
+renaming the org, leaves it the personal org. When there is none (the user
+is not its owner any more, or it was deleted), the create answers
 `400 invalid_request` with `org_id: the caller has no personal organization`;
 the caller can name an org with `org_id`. The caller must be an active member
 of the chosen org (`identity.ActiveOrgIDs`), personal or named, or the answer is

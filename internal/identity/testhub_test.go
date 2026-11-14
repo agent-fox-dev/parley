@@ -109,7 +109,7 @@ func newTestHub(t *testing.T, opts ...hubOption) *testHub {
 	st, err := store.Open(ctx, store.Options{
 		DatabasePath:  filepath.Join(h.dataDir, "parley.db"),
 		WorkspaceRoot: filepath.Join(dir, "workspaces"),
-	}, []store.Step{identity.AdminSettingsStep, identity.SchemaStep})
+	}, []store.Step{identity.AdminSettingsStep, identity.SchemaStep, identity.PersonalOrgStep})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

@@ -75,3 +75,22 @@ CREATE INDEX pats_user ON pats (user_id);`)
 		return err
 	},
 }
+
+// PersonalOrgStep marks the personal org of each user: the org flagged
+// personal and owned by the user. It is a step of its own, after
+// SchemaStep, so that a store whose records exist already gains the flag;
+// there it marks the org each user owns that is named after the user's
+// username, which is how CreateUserAndPersonalOrg made it. Neither a later
+// username nor a rename of the org moves the mark.
+var PersonalOrgStep = store.Step{
+	Name:   "identity_personal_orgs",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+ALTER TABLE orgs ADD COLUMN personal INTEGER NOT NULL DEFAULT 0 CHECK (personal IN (0, 1));
+UPDATE orgs SET personal = 1
+WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = orgs.owner_id AND u.username = orgs.name);
+CREATE UNIQUE INDEX orgs_personal_owner ON orgs (owner_id) WHERE personal = 1;`)
+		return err
+	},
+}
