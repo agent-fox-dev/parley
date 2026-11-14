@@ -61,11 +61,7 @@ func composeEvents(c *Composition) {
 
 // forkParent is the parent's slug when slug names a task fork, read in q.
 func forkParent(ctx context.Context, q event.Querier, slug string) (string, error) {
-	rec, found, err := access.RecordBySlug(ctx, q, slug)
-	if err != nil || !found || rec.Kind != access.KindFork {
-		return "", err
-	}
-	return rec.ParentSlug, nil
+	return access.ForkParent(ctx, q, slug)
 }
 
 // Events returns the hub's event component, through which every part that

@@ -188,6 +188,16 @@ func RecordBySlug(ctx context.Context, q Querier, slug string) (Record, bool, er
 	return rec, true, nil
 }
 
+// ForkParent returns the slug of the parent when slug names a task fork, and
+// "" when it names a repository or no workspace.
+func ForkParent(ctx context.Context, q Querier, slug string) (string, error) {
+	rec, found, err := RecordBySlug(ctx, q, slug)
+	if err != nil || !found || rec.Kind != KindFork {
+		return "", err
+	}
+	return rec.ParentSlug, nil
+}
+
 // RecordsOwnedOrIn lists, by slug, the records owned by ownerID or in one of
 // orgIDs.
 func RecordsOwnedOrIn(ctx context.Context, q Querier, ownerID string, orgIDs []string) ([]Record, error) {

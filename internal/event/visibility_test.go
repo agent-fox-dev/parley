@@ -26,13 +26,6 @@ func (w *world) caller(name string) Caller {
 	return w.user(name)
 }
 
-// on is a valid input of type typ on the workspace slug.
-func on(typ, slug string) Input {
-	in := valid(typ)
-	in.Workspace = ptr(slug)
-	return in
-}
-
 // stored emits in and returns its record as the log serves it, with the
 // fork parent the store kept.
 func (w *world) stored(in Input) Record {
@@ -64,16 +57,23 @@ func TestVisible_WorkspaceEvents(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	for _, tc := range []struct {
-		workspace string
-		want      []bool
+		typ, workspace string
+		names          []string
+		want           []bool
 	}{
-		{"api", []bool{true, true, true, false}},
+		{"parley.change.open", "api", callerNames, []bool{true, true, true, false}},
 		// gone names no workspace: a deleted repository.
-		{"gone", []bool{true, false, false, false}},
+		{"parley.change.open", "gone", callerNames, []bool{true, false, false, false}},
+		{"parley.secret.create", "api", callerNames, []bool{true, true, false, false}},
+		{"parley.token.bind", "api", callerNames, []bool{true, true, false, false}},
+		{"parley.webhook.create", "api", callerNames, []bool{true, true, false, false}},
+		{"parley.forge.webhook.set", "api", callerNames, []bool{true, true, true, false}},
+		// mem owns the fork, dev its parent; mem2 is only a member of both.
+		{"parley.token.bind", "api-f1", []string{"admin", "mem", "dev", "mem2", "out"}, []bool{true, true, true, false, false}},
 	} {
-		rec := w.stored(on("parley.change.open", tc.workspace))
-		if got := w.visibleTo(rec, callerNames...); !slices.Equal(got, tc.want) {
-			t.Errorf("parley.change.open on %s: visible to %v = %v, want %v", tc.workspace, callerNames, got, tc.want)
+		rec := w.stored(on(tc.typ, tc.workspace))
+		if got := w.visibleTo(rec, tc.names...); !slices.Equal(got, tc.want) {
+			t.Errorf("%s on %s: visible to %v = %v, want %v", tc.typ, tc.workspace, tc.names, got, tc.want)
 		}
 	}
 }
@@ -101,39 +101,11 @@ func TestVisible_ForkEventsFollowTheParent(t *testing.T) {
 	check("event of a fork deleted before the emit, parent passed", w.stored(in))
 }
 
-func TestVisible_OwnerOnlyTypes(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t)
-	for _, tc := range []struct {
-		typ, workspace string
-		names          []string
-		want           []bool
-	}{
-		{"parley.secret.create", "api", callerNames, []bool{true, true, false, false}},
-		{"parley.token.bind", "api", callerNames, []bool{true, true, false, false}},
-		{"parley.webhook.create", "api", callerNames, []bool{true, true, false, false}},
-		{"parley.forge.webhook.set", "api", callerNames, []bool{true, true, true, false}},
-		// mem owns the fork, dev its parent; mem2 is only a member of both.
-		{"parley.token.bind", "api-f1", []string{"admin", "mem", "dev", "mem2", "out"}, []bool{true, true, true, false, false}},
-	} {
-		rec := w.stored(on(tc.typ, tc.workspace))
-		if got := w.visibleTo(rec, tc.names...); !slices.Equal(got, tc.want) {
-			t.Errorf("%s on %s: visible to %v = %v, want %v", tc.typ, tc.workspace, tc.names, got, tc.want)
-		}
-	}
-}
-
 func TestVisible_EventsWithoutWorkspace(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	scoped := func(typ string, meta map[string]any) Input {
-		in := valid(typ)
-		in.Workspace = nil
-		in.Metadata = meta
-		return in
-	}
-	userEvent := scoped("parley.secret.create", map[string]any{"scope": "user", "scope_id": w.users["dev"]})
-	orgEvent := scoped("parley.variable.update", map[string]any{"scope": "org", "scope_id": w.acme})
+	userEvent := scoped("parley.secret.create", "user", w.users["dev"])
+	orgEvent := scoped("parley.variable.update", "org", w.acme)
 	for _, tc := range []struct {
 		name  string
 		in    Input
@@ -144,9 +116,8 @@ func TestVisible_EventsWithoutWorkspace(t *testing.T) {
 		{"user scope", userEvent, nil, []string{"dev", "mem", "admin"}, []bool{true, false, true}},
 		{"org scope", orgEvent, nil, []string{"dev", "mem", "out", "admin"}, []bool{true, true, false, true}},
 		{"org scope after the org is blocked", orgEvent, func() { w.blockOrg(w.acme) }, []string{"mem", "admin"}, []bool{false, true}},
-		{"no scope", scoped("parley.user.create", nil), nil, callerNames, []bool{true, false, false, false}},
-		{"unknown scope", scoped("parley.user.create", map[string]any{"scope": "hub", "scope_id": w.users["dev"]}), nil,
-			callerNames, []bool{true, false, false, false}},
+		{"no scope", scoped("parley.user.create", "", ""), nil, callerNames, []bool{true, false, false, false}},
+		{"unknown scope", scoped("parley.user.create", "hub", w.users["dev"]), nil, callerNames, []bool{true, false, false, false}},
 	} {
 		if tc.setup != nil {
 			tc.setup()
@@ -181,9 +152,7 @@ func TestVisible_BoundTokens(t *testing.T) {
 		in.ResourceID = number
 		return in
 	}
-	secret := valid("parley.secret.create")
-	secret.Workspace = nil
-	secret.Metadata = map[string]any{"scope": "user", "scope_id": w.users["dev"]}
+	secret := scoped("parley.secret.create", "user", w.users["dev"])
 	push := on("parley.git.push", "api")
 	push.ResourceType, push.ResourceID = "workspace", "api"
 
@@ -230,9 +199,7 @@ func TestVisible_BoundTokens(t *testing.T) {
 func TestVisibleToOwnerOf(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	secret := valid("parley.secret.create")
-	secret.Workspace = nil
-	secret.Metadata = map[string]any{"scope": "user", "scope_id": w.users["dev"]}
+	secret := scoped("parley.secret.create", "user", w.users["dev"])
 	expire := w.stored(on("parley.fork.expire", "api-f1"))
 	w.deleteWorkspace("api-f1")
 	for _, tc := range []struct {
@@ -256,12 +223,9 @@ func TestVisibleToOwnerOf(t *testing.T) {
 func TestVisible_FailureIsNeverAGrant(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	orgEvent := valid("parley.variable.update")
-	orgEvent.Workspace = nil
-	orgEvent.Metadata = map[string]any{"scope": "org", "scope_id": w.acme}
-	recs := []Record{w.stored(on("parley.change.open", "api")), w.stored(orgEvent)}
+	recs := []Record{w.stored(on("parley.change.open", "api")), w.stored(scoped("parley.variable.update", "org", w.acme))}
 	mem := w.key("mem")
-	s := w.openStream(t, mem, "", nil)
+	s := w.openStream(t, mem, "", "")
 	s.heartbeat(2 * time.Second)
 
 	w.failMemberships.Store(true)
@@ -272,11 +236,8 @@ func TestVisible_FailureIsNeverAGrant(t *testing.T) {
 		}
 	}
 
-	a := w.ask(t, "/events/log", mem, "after=0", nil)
-	if env := a.envelope(t); a.status != http.StatusInternalServerError || env.Error.ErrorType != "internal" {
-		t.Errorf("GET /events/log with the memberships unreadable = %d %s, want 500 internal", a.status, a.body)
-	}
-	w.emit(on("parley.change.open", "api"))
+	w.ask(t, "/events/log", mem, "after=0", "").refused(t, "GET /events/log with the memberships unreadable", http.StatusInternalServerError, "internal")
+	w.emitMany(1)
 	s.ends(2 * time.Second)
 }
 
@@ -289,22 +250,16 @@ func TestCallerOf_ReadsTheAuthenticatedCredential(t *testing.T) {
 		return nil
 	}})
 	ctx := context.Background()
-	var key, keyID, pat, patID string
+	var key, keyID string
 	err := w.store.Tx(ctx, func(tx *sql.Tx) error {
-		var err error
 		k, rec, err := identity.IssueAPIKey(ctx, tx, w.users["dev"], 0, clockStart)
-		if err != nil {
-			return err
-		}
 		key, keyID = k, rec.KeyID
-		p, tok, err := identity.StorePAT(ctx, tx, identity.PATSpec{UserID: w.users["mem"], Name: "bound",
-			Permissions: []string{"audit:read"}, Workspace: "api-f1", CreatedAt: clockStart})
-		pat, patID = p, tok.TokenID
 		return err
 	})
 	if err != nil {
-		t.Fatalf("issue credentials: %v", err)
+		t.Fatalf("issue an API key: %v", err)
 	}
+	pat, patID := w.pat("mem", "api-f1", "audit:read")
 	for _, tc := range []struct {
 		name, credential string
 		want             Caller
@@ -314,8 +269,8 @@ func TestCallerOf_ReadsTheAuthenticatedCredential(t *testing.T) {
 		{"bound PAT", pat, Caller{UserID: w.users["mem"], CredentialID: patID, Workspace: "api-f1"}},
 	} {
 		got = Caller{}
-		if status, body := w.call(http.MethodGet, "/test/caller", tc.credential, nil); status != http.StatusNoContent && status != http.StatusOK {
-			t.Fatalf("%s: GET /test/caller = %d %s", tc.name, status, body)
+		if a := w.call(http.MethodGet, "/test/caller", tc.credential, nil); a.status != http.StatusNoContent && a.status != http.StatusOK {
+			t.Fatalf("%s: GET /test/caller = %d %s", tc.name, a.status, a.body)
 		}
 		if got != tc.want {
 			t.Errorf("%s: CallerOf = %+v, want %+v", tc.name, got, tc.want)

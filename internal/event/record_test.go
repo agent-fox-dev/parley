@@ -155,7 +155,7 @@ func TestEmit_RejectsInvalidInput(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.field) {
 				t.Errorf("error %q does not name the field %s", err, tc.field)
 			}
-			if got := f.lastSeq(); got != 0 {
+			if got := f.bounds().LastSeq; got != 0 {
 				t.Errorf("last_seq = %d, want 0", got)
 			}
 		})

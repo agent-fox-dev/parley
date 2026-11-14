@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"regexp"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func TestEmit_RollbackLeavesNoEvent(t *testing.T) {
 			if recs := f.readAll(0); !reflect.DeepEqual(recs, []Record{first}) {
 				t.Errorf("ReadAfter(0) = %+v, want only the committed event", recs)
 			}
-			if got := f.lastSeq(); got != 1 {
+			if got := f.bounds().LastSeq; got != 1 {
 				t.Errorf("last_seq = %d, want 1", got)
 			}
 			if f.hasRow("rolled back") {
@@ -146,17 +147,7 @@ func TestEmit_StoreFailureFailsTheRequest(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/test-emit", nil))
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want 500 (body %s)", rec.Code, rec.Body.Bytes())
-	}
-	var body struct {
-		Error struct {
-			ErrorType string `json:"error_type"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.ErrorType != "internal" {
-		t.Errorf("body = %s, want error_type internal", rec.Body.Bytes())
-	}
+	answer{status: rec.Code, header: rec.Header(), body: rec.Body.Bytes()}.refused(t, "the request", http.StatusInternalServerError, "internal")
 	if emitErr == nil || errors.Is(emitErr, ErrInvalidEvent) {
 		t.Errorf("Emit error = %v, want a store error that is not ErrInvalidEvent", emitErr)
 	}
@@ -188,34 +179,23 @@ func TestEmitNow_WritesInOwnTransaction(t *testing.T) {
 func TestEmit_SeveralInOneTransactionAreConsecutive(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	ctx := context.Background()
 	f.emit(valid("parley.change.open"))
 
-	var seqs []int64
-	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
-		for _, ref := range []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"} {
-			in := valid("parley.git.push")
-			in.ResourceType, in.ResourceID = "ref", ref
-			rec, err := f.events.Emit(ctx, tx, in)
-			if err != nil {
-				return err
-			}
-			seqs = append(seqs, rec.Seq)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("transaction: %v", err)
+	refs := []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"}
+	ins := make([]Input, len(refs))
+	for i, ref := range refs {
+		ins[i] = valid("parley.git.push")
+		ins[i].ResourceType, ins[i].ResourceID = "ref", ref
 	}
-	if want := []int64{2, 3, 4}; !reflect.DeepEqual(seqs, want) {
-		t.Errorf("seqs = %v, want %v", seqs, want)
+	if got := seqs(f.emitTx(ins...)); !reflect.DeepEqual(got, []int64{2, 3, 4}) {
+		t.Errorf("seqs = %v, want [2 3 4]", got)
 	}
 	var read []string
 	for _, rec := range f.readAll(1) {
 		read = append(read, rec.ResourceID)
 	}
-	if want := []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"}; !reflect.DeepEqual(read, want) {
-		t.Errorf("ReadAfter(1) refs = %v, want %v", read, want)
+	if !reflect.DeepEqual(read, refs) {
+		t.Errorf("ReadAfter(1) refs = %v, want %v", read, refs)
 	}
 }
 
@@ -238,7 +218,7 @@ func TestSeq_SurvivesRestartAndIsNeverReused(t *testing.T) {
 	if got := f.emit(valid("parley.change.open")).Seq; got != 5 {
 		t.Errorf("seq after every event was deleted and a restart = %d, want 5", got)
 	}
-	if got := f.lastSeq(); got != 5 {
+	if got := f.bounds().LastSeq; got != 5 {
 		t.Errorf("last_seq = %d, want 5", got)
 	}
 }
@@ -282,10 +262,8 @@ func TestEmit_ConcurrentWritersStayOrdered(t *testing.T) {
 		default:
 		}
 		got := seqs(f.readAll(0))
-		for i, seq := range got {
-			if seq != int64(i+1) {
-				t.Fatalf("a read returned seqs %v, not a prefix of 1..n without a hole", got)
-			}
+		if !slices.Equal(got, seqRange(1, int64(len(got)))) {
+			t.Fatalf("a read returned seqs %v, not a prefix of 1..n without a hole", got)
 		}
 		if len(got) < longest {
 			t.Fatalf("a read returned %d events after one returned %d", len(got), longest)
@@ -301,14 +279,11 @@ func TestEmit_ConcurrentWritersStayOrdered(t *testing.T) {
 	}
 	recs := f.readAll(0)
 	ids := map[string]bool{}
-	for i, rec := range recs {
-		if rec.Seq != int64(i+1) {
-			t.Fatalf("the log holds seqs %v, want 1..%d", seqs(recs), writers*perWriter)
-		}
+	for _, rec := range recs {
 		ids[rec.ID] = true
 	}
-	if len(recs) != writers*perWriter || len(ids) != writers*perWriter {
-		t.Errorf("the log holds %d events with %d distinct ids, want %d of each", len(recs), len(ids), writers*perWriter)
+	if !slices.Equal(seqs(recs), seqRange(1, writers*perWriter)) || len(ids) != writers*perWriter {
+		t.Errorf("the log holds seqs %v with %d distinct ids, want 1..%d with as many", seqs(recs), len(ids), writers*perWriter)
 	}
 	if got := f.events.Counters(); got.LastSeq != writers*perWriter || got.WrittenByType["parley.change.open"] != writers*perWriter {
 		t.Errorf("Counters = %+v, want last_seq and parley.change.open both %d", got, writers*perWriter)
@@ -318,19 +293,8 @@ func TestEmit_ConcurrentWritersStayOrdered(t *testing.T) {
 func TestCounters_ReportSeqStreamsAndTypes(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	ctx := context.Background()
-	f.emit(valid("parley.change.open"))
-	f.emit(valid("parley.change.open"))
-	f.emit(valid("parley.claim.create"))
-	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := f.events.Emit(ctx, tx, valid("parley.change.land")); err != nil {
-			return err
-		}
-		return errors.New("refused")
-	})
-	if err == nil {
-		t.Fatal("the rolled-back transaction committed")
-	}
+	f.emitTx(valid("parley.change.open"), valid("parley.change.open"), valid("parley.claim.create"))
+	f.emitRolledBack(valid("parley.change.land"))
 	if !f.events.takePlace(500) {
 		t.Fatal("takePlace refused the first stream place")
 	}
@@ -352,31 +316,12 @@ func TestCounters_ReportSeqStreamsAndTypes(t *testing.T) {
 func TestOnCommit_NotifiesCommittedEventsInSeqOrder(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
-	ctx := context.Background()
 	got := make(chan Record, 10)
 	f.events.OnCommit(func(rec Record) { got <- rec })
 
-	err := f.store.Tx(ctx, func(tx *sql.Tx) error {
-		for _, typ := range []string{"parley.change.open", "parley.change.update"} {
-			if _, err := f.events.Emit(ctx, tx, valid(typ)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = f.store.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := f.events.Emit(ctx, tx, valid("parley.change.abandon")); err != nil {
-			return err
-		}
-		return errors.New("refused")
-	})
-	if err == nil {
-		t.Fatal("the rolled-back transaction committed")
-	}
-	if _, err := f.events.EmitNow(ctx, valid("parley.change.land")); err != nil {
+	f.emitTx(valid("parley.change.open"), valid("parley.change.update"))
+	f.emitRolledBack(valid("parley.change.abandon"))
+	if _, err := f.events.EmitNow(context.Background(), valid("parley.change.land")); err != nil {
 		t.Fatal(err)
 	}
 
