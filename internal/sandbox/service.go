@@ -42,6 +42,8 @@ type Service struct {
 	release     runtime.Release
 	releases    ReleaseRange
 	scrubber    *scrub.Scrubber
+	// source is what the hub-wide list reads; nil until one is registered.
+	source Source
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

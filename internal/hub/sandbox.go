@@ -20,7 +20,9 @@ const sandboxCheckHook = "sandbox_runtime_check"
 // client in a start hook and runs the start-up check through it before the
 // hub listens. With sandboxes off the hook builds nothing and contacts no
 // runtime. GET /version reports the runtime the check connected to, and GET
-// /sandbox-profiles lists the configured profiles. The sandbox routes,
+// /sandbox-profiles lists the configured profiles, and GET /sandboxes lists,
+// to the admin token, the sandboxes of the source a later part registers
+// (Service.RegisterSource). The sandbox routes,
 // declared through the service, scrub the runtime errors they answer with
 // the hub's scrubber.
 //
@@ -37,6 +39,7 @@ func composeSandbox(c *Composition) {
 	}
 	c.addConfigCheck(svc.Configure)
 	c.AddRoute(svc.ProfilesRoute())
+	c.AddRoute(svc.SandboxesRoute())
 	c.addVersionMember(func() map[string]any {
 		if v, ok := svc.Version(); ok {
 			return map[string]any{"sandbox_runtime": v}

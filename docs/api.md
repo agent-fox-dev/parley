@@ -1159,6 +1159,42 @@ without a credential `401 unauthenticated`, and on a hub without sandboxes
 every authenticated caller gets `404 sandboxes_disabled` (see
 [Sandbox routes](#sandbox-routes)).
 
+## `GET /api/v1/sandboxes`
+
+Lists the sandboxes of every workspace on the hub, for the operator. Only
+the admin token may call it: every other credential, the API key of a user
+with role `admin` and a PAT with `sandboxes:read` and `sandboxes:write`
+included, is answered before anything is read with
+
+```json
+{"error":{"code":403,"message":"only the admin token may list every sandbox of the hub","error_type":"forbidden"}}
+```
+
+A request without a credential gets `401 unauthenticated`, and on a hub
+without sandboxes the admin token gets `404 sandboxes_disabled` (see
+[Sandbox routes](#sandbox-routes)).
+
+The answer is `200` with a [list](#lists): the sandbox objects as the hub
+stores them, newest first by `created_at` and then by `id`, both
+descending. It is read from the hub's own records and asks the sandbox
+runtime nothing, so it answers the same while the runtime is unreachable.
+Until the hub stores sandboxes the list is empty:
+
+```json
+{"items":[],"next_cursor":null}
+```
+
+| Query parameter | Value |
+|---|---|
+| `state` | only the sandboxes in this state, one of `provisioning`, `ready`, `stopped`, `completed`, `failed` and `deleted`, written exactly so |
+| `user` | only the sandboxes created by the user with this id |
+| `limit`, `cursor` | as for every [list](#lists): `limit` from 1 to 200, default 50 |
+
+`state` and `user` together select the sandboxes that match both. Any other
+`state`, `limit` or `cursor`, and a cursor of a page with other filters, is
+answered `400 invalid_request`. A failure to read the records is `500
+internal` with the message `internal error`, and no items.
+
 ## User selectors
 
 A route with a user in its path, `/api/v1/users/{id}` or

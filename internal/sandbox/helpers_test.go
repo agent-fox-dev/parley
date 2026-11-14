@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
@@ -227,10 +228,9 @@ type probeHub struct {
 }
 
 // startProbeHub starts a probe hub, with sandboxes on over a fake runtime
-// when on is true. Its probe routes are:
+// when on is true. Its probe routes, beside the hub's own GET
+// /sandbox-profiles and GET /sandboxes, are:
 //
-//   - GET /sandboxes, declared for the whole hub (GET /sandbox-profiles is
-//     the hub's own);
 //   - GET /workspaces/:slug/sandboxes/probe-read, of kind read;
 //   - POST /workspaces/:slug/sandboxes/probe-write, of kind write, with the
 //     body limit probeBodyLimit;
@@ -257,9 +257,6 @@ func startProbeHub(t *testing.T, on bool) *probeHub {
 				return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 			})
 		}
-		// The hub-wide list stands in for the feature's own until the hub
-		// serves it.
-		c.AddRoute(svc.Route(server.Route{Method: http.MethodGet, Pattern: "/sandboxes", Handler: h.probe}))
 		c.AddRoute(svc.WorkspaceRoute(sandbox.KindRead, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/sandboxes/probe-read", Handler: h.probe}))
 		c.AddRoute(svc.WorkspaceRoute(sandbox.KindWrite, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/sandboxes/probe-write", MaxBodySize: probeBodyLimit, Handler: h.probe}))
 		c.AddRoute(svc.WorkspaceRoute(sandbox.KindWrite, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/sandboxes/probe-create", Handler: func(w http.ResponseWriter, r *http.Request) error {
@@ -414,4 +411,72 @@ func startProfilesHub(t *testing.T) (*probeHub, string) {
 		t.Fatalf("the hub has no profile agent with a policy file: %+v", agent)
 	}
 	return h, agent.PolicyPath
+}
+
+// storedSandbox is a sandbox a memorySource holds.
+type storedSandbox struct {
+	id, workspace, state, user string
+	createdAt                  time.Time
+}
+
+// object is the sandbox object the source gives for s.
+func (s storedSandbox) object() map[string]any {
+	return map[string]any{
+		"id": s.id, "workspace": s.workspace, "state": s.state, "created_by": s.user,
+		"created_at": s.createdAt.Format(time.RFC3339), "profile": map[string]any{"name": "agent"},
+	}
+}
+
+// memorySource is a sandbox source over a fixed list of sandboxes that
+// counts its calls and fails each with err when err is set.
+type memorySource struct {
+	sandboxes []storedSandbox
+	err       error
+	calls     atomic.Int64
+}
+
+func (m *memorySource) List(_ context.Context, f sandbox.Filter, after *sandbox.Position, limit int) ([]sandbox.Item, error) {
+	m.calls.Add(1)
+	if m.err != nil {
+		return nil, m.err
+	}
+	all := slices.Clone(m.sandboxes)
+	slices.SortFunc(all, func(a, b storedSandbox) int {
+		if c := b.createdAt.Compare(a.createdAt); c != 0 {
+			return c
+		}
+		return strings.Compare(b.id, a.id)
+	})
+	var out []sandbox.Item
+	for _, s := range all {
+		if (f.State != "" && s.state != f.State) || (f.User != "" && s.user != f.User) {
+			continue
+		}
+		if after != nil && !(s.createdAt.Before(after.CreatedAt) || (s.createdAt.Equal(after.CreatedAt) && s.id < after.ID)) {
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		out = append(out, sandbox.Item{CreatedAt: s.createdAt, ID: s.id, Object: s.object()})
+	}
+	return out, nil
+}
+
+// startListHub starts a probe hub with sandboxes on over a fake runtime,
+// with src registered as the sandbox source when it is not nil.
+func startListHub(t *testing.T, src sandbox.Source) *probeHub {
+	t.Helper()
+	h := &probeHub{rt: runtimetest.New(t)}
+	cfg := sandboxesOn
+	cfg.Compose = func(c *hub.Composition) {
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+		if src != nil {
+			c.Sandbox().RegisterSource(src)
+		}
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	return h
 }

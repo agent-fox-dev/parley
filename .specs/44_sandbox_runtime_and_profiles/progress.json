@@ -3,7 +3,7 @@
   "spec_id": "44",
   "spec_name": "sandbox_runtime_and_profiles",
   "schema_version": 3,
-  "updated_at": "2026-11-14T00:21:41Z",
+  "updated_at": "2026-11-14T00:29:06Z",
   "tasks": [
     {
       "id": 1,
@@ -39,7 +39,7 @@
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,

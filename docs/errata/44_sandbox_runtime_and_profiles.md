@@ -293,3 +293,33 @@ with the examples `4h`, `30m` and `0s`. The code follows these rules:
   a profile on the built-in policy, and a validated policy that allows no
   host, both list `[]`. Every other list member is `[]` when empty, never
   `null`.
+
+## The hub-wide sandbox list's details
+
+The package asks for `GET /sandboxes` for the admin token alone, over a
+sandbox source that package 45 registers, and leaves its shape open. The
+code follows these rules:
+
+- The caller is checked with `server.Caller.Admin`, the admin token, inside
+  the handler, after the feature check and before the query or the source
+  is read. `identity.MarkAdmin` is not used, since it also admits the API
+  keys of users with role `admin`. The route has no scope, so a PAT, whatever
+  its scopes, reaches the handler and gets `403 forbidden` with the message
+  `only the admin token may list every sandbox of the hub`.
+- The source is `sandbox.Source` in `internal/sandbox/source.go`, with the
+  one operation `List(ctx, Filter{State, User}, after *Position, limit)`;
+  `Position` is `{created_at, id}` and is what the cursor carries. An `Item`
+  carries `CreatedAt`, `ID` and the `Object` the list writes as it is. It is
+  registered with `(*sandbox.Service).RegisterSource`, while the hub
+  composes or in a start hook; a second registration replaces the first.
+- The checks run in this order: the admin token, then `limit` and `cursor`
+  (`server.ReadPage`, which binds the cursor to the query, so a cursor of
+  other filters is `400`), then `state`. A `state` that is present and empty
+  is refused like any other unknown state; an empty `user` selects every
+  user.
+- An error of the source is passed on without its chain (`%v`), so that it
+  is `500 internal` even when it carries a runtime error's kind: the list
+  never comes from the runtime, and the runtime-error answer of
+  `Service.Route` must not take it for one.
+- The route is added in `composeSandbox` (`internal/hub/sandbox.go`), not in
+  `internal/hub/hub.go`, beside the profile list.
