@@ -144,11 +144,11 @@ func deref(s *string) string {
 	return *s
 }
 
-// createEvents are the metadata of the parley.workspace.create events of
-// the workspace slug in the hub's event log.
-func (h *workspaceHub) createEvents(t *testing.T, slug string) []string {
+// events are the metadata of the events of type typ of the workspace slug
+// in the hub's event log, oldest first.
+func (h *workspaceHub) events(t *testing.T, typ, slug string) []string {
 	t.Helper()
-	rows, err := h.Store.Main().Query(`SELECT metadata FROM hub_events WHERE type = 'parley.workspace.create' AND workspace = ?`, slug)
+	rows, err := h.Store.Main().Query(`SELECT metadata FROM hub_events WHERE type = ? AND workspace = ? ORDER BY seq`, typ, slug)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t
 			t.Errorf("the copy's %s = %q, want %q", ref, got[ref], id)
 		}
 	}
-	if events := h.createEvents(t, "demo"); len(events) != 1 {
+	if events := h.events(t, "parley.workspace.create", "demo"); len(events) != 1 {
 		t.Errorf("create events of demo = %d, want 1", len(events))
 	}
 }
@@ -252,7 +252,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPrivateRepositoryWithAToken(t *test
 		t.Errorf("priv2 exists after the refused create (found %v, %v)", found, err)
 	}
 
-	for _, meta := range h.createEvents(t, "priv") {
+	for _, meta := range h.events(t, "parley.workspace.create", "priv") {
 		if strings.Contains(meta, token) {
 			t.Errorf("the create event holds the token: %s", meta)
 		}

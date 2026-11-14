@@ -786,8 +786,8 @@ const hubAnswer = `{"id": "x", "n": 1.50, "items": [], "next_cursor": null}`
 
 // wantSends runs args against a stub hub that answers want with 200 and
 // hubAnswer, and checks that the command sent exactly want, once, with the
-// credential K, printed the answer as parley prints a result and wrote
-// nothing to stderr.
+// credential K, a body as application/json, printed the answer as parley
+// prints a result and wrote nothing to stderr.
 func wantSends(t *testing.T, args []string, want sentRequest) {
 	t.Helper()
 	path, err := url.PathUnescape(want.rawPath)
@@ -823,6 +823,9 @@ func wantSends(t *testing.T, args []string, want sentRequest) {
 			t.Errorf("body = %q, want none", got.body)
 		}
 		return
+	}
+	if ct := got.header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 	wantJSONBody(t, got.body, want.body)
 }

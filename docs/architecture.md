@@ -2750,6 +2750,18 @@ whole list with `printWholeList`, which asks for pages of 200, follows
 `next_cursor` and prints `{"items":[…]}`; `delete` prints its `Confirm`
 document `{"deleted":"<KEY>"}`.
 
+`parley workspace` (`workspace.go`) is `create`, `list`, `get` and
+`update`. `get` is a declaration alone. `list` sends a query parameter for
+each flag given (`listWorkspaces`) and prints one page. `create` and
+`update` build their bodies from their flags (`workspaceCreateBody`,
+`workspaceUpdateBody`) and wrap their argument check so that the body is
+built there too: a command line it refuses (an update with nothing to
+change, a `--setting` without `=`) is a usage error before any setting is
+resolved. Both read `--setting`, registered by `addSettingFlag` as a string
+array, through `addSettings`, which parses the values with
+`ParseSettingFlags`, the one parser of `--setting`. `create --wait` polls
+`GET /workspaces/<slug>` through the shared wait.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with
