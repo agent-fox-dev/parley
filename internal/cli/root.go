@@ -33,6 +33,10 @@ type options struct {
 	// pollInterval, when not zero, replaces the --poll-interval of a wait,
 	// so that tests poll faster than the flag's smallest value, 1s.
 	pollInterval time.Duration
+	// reconnectWait waits d before parley events tail connects again, or
+	// returns ctx's error as soon as ctx ends; tests replace it with a fake
+	// clock, so no reconnect takes real seconds.
+	reconnectWait func(ctx context.Context, d time.Duration) error
 }
 
 func defaultOptions() options {
@@ -42,6 +46,7 @@ func defaultOptions() options {
 		openBrowser:    openSystemBrowser,
 		loginWait:      120 * time.Second,
 		requestTimeout: defaultRequestTimeout,
+		reconnectWait:  sleepUnlessDone,
 	}
 }
 
@@ -120,7 +125,7 @@ func newRootCommand(opts options) *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 
 	installHelp(root)
-	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newKeysCommand(), newTokensCommand(), newSandboxCommand(), newAdminCommand())
+	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newKeysCommand(), newTokensCommand(), newSandboxCommand(), newEventsCommand(), newAdminCommand())
 	for _, build := range opts.extra {
 		root.AddCommand(build())
 	}
