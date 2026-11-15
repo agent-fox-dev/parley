@@ -3172,6 +3172,132 @@ between pages; a cursor used with other query parameters is refused (see
 {"items":[{"path":"api/greeting.go","line":3,"text":"func Greeting() string {"},{"path":"docs/a.md","line":1,"text":"# Greeting"}],"next_cursor":null,"resolved_sha":"2ecc9343e95b57b9f37e0e94ee6bae610a47b8bd"}
 ```
 
+## Source control writes
+
+The routes below change a workspace's repository without a clone: so far
+they are the three refs write routes. Every one of them behaves alike in
+what follows.
+
+It takes the admin token, an API key or a PAT, and declares the scope
+`git:write` for a PAT. It needs write access to the workspace (see
+[Workspace access](#workspace-access)), which the owner and the admin
+token have. These checks run before the route and touch no repository: no
+credential is `401` `unauthenticated`, a PAT without `git:write` `403`
+`insufficient_scope`, for an unknown slug as well, a caller who cannot
+read the workspace `404` `not_found` (`workspace not found`), and an org
+member, who can only read it, `403` `forbidden`. The route then refuses a
+workspace that cannot take a write, before it reads the body:
+
+| State | Answer |
+|---|---|
+| `archived` | `409` `workspace_archived` |
+| a reclone, archive or delete running, on any status; `pending` or `cloning` | `409` `workspace_busy` |
+| `failed` | `409` `workspace_not_ready` |
+| a task fork whose parent is `archived` | `409` `parent_archived` |
+| a task fork whose parent is busy or failed | the parent's answer, `409` `workspace_busy` or `workspace_not_ready` |
+
+Every ref a write moves is decided by the push rules and written by the
+hub's ref writer, the same ones a `git push` goes through (see
+[Git over HTTP](#git-over-http)), so a write is refused exactly where a push of
+the same ref update would be: `403` with the rule's message and its
+`error_type` (`hub_owned_ref`, `protected_branch`, `default_branch`,
+`tracking_branch`, `integration_branch`, `patch_branch`,
+`path_not_allowed`), such as `main is the default branch and cannot be
+deleted`, or `500` `internal` (`the push rules could not be evaluated; try
+again`) when a rule could not be evaluated. The ref is moved by
+compare-and-swap against the value the route read: a ref that moved in
+between is `409` `ref_moved`, with the commit it is at now in
+`error.details.current_sha` (`null` when it no longer exists), and nothing
+changes. An accepted write emits one `parley.git.push` event per ref, with
+`via` `"api"`, as a push does with `via` `"git"`.
+
+```json
+{"error":{"code":409,"message":"refs/heads/work is not at the expected commit; read it again and retry","error_type":"ref_moved","details":{"current_sha":"d81e7ee540a0ae85fa486bfd9c53f46cfbdf4f89"}}}
+```
+
+Writes have no time limit. Each request a write route handles is reported
+once to the hub's request recorder with the route's op (`ref_create`,
+`ref_move`, `ref_delete`) and `ok` for a status below 400, `ref_moved` for
+a `409` `ref_moved`, `refused` for a `403` of a push rule, `error`
+otherwise; a request the checks before the route refuse is not reported.
+
+A ref name in these routes is a full ref name, or a branch name, which is
+any name that does not begin with `refs/` and is read as
+`refs/heads/{name}`. It must be a name git takes for a ref
+(`git check-ref-format`) below `refs/heads/` or `refs/tags/`; a name below
+`refs/parley/` reaches the push rules, which refuse it as the hub's
+(`403` `hub_owned_ref`); `HEAD` and every other namespace are `400`
+`invalid_request`. A commit id in a body or a query is a full
+40-character id.
+
+## `POST /api/v1/workspaces/{slug}/scm/refs`
+
+Creates a branch or a tag at a commit and answers its ref object. The body:
+
+| Member | Meaning |
+|---|---|
+| `name` | required: the ref name; a bare name creates a branch |
+| `sha` | the full id of the commit to create the ref at |
+| `ref` | a revision naming that commit, in any of the four forms a read takes (branch name, tag name, full ref name, full or abbreviated commit id) |
+
+Exactly one of `sha` and `ref` is given. A tag created so is lightweight.
+
+```json
+{"name":"refs/tags/v1","ref":"main"}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | the ref object of the new ref |
+| `400` `invalid_request` | no `name` (`name is required`); a name that is no valid ref name (`"a..b" is not a valid ref name`) or lies outside the namespaces (`"refs/notes/n" is outside refs/heads/, refs/tags/ and refs/parley/`); both or neither of `sha` and `ref` (`give exactly one of sha and ref`); a `sha` that is not a full id (`sha must be a full 40-character commit id`) |
+| `403` | a push rule refuses the creation, such as `hub_owned_ref` for a name below `refs/parley/` |
+| `404` `ref_not_found` | the target names no commit (`revision "nope" names no commit`, `revision "…" names an object that is not a commit`) |
+| `409` `ref_exists` | the ref exists (`ref refs/heads/main already exists`) |
+| `409` `ref_moved` | another write created the ref in between |
+
+```json
+{"name":"refs/tags/v1","kind":"tag","sha":"d81e7ee540a0ae85fa486bfd9c53f46cfbdf4f89","protected":false,"tracking":false,"change":null}
+```
+
+## `PATCH /api/v1/workspaces/{slug}/scm/refs/{name}`
+
+Moves a branch or a tag to another commit, when it is at `expected_sha`,
+and answers its ref object. `{name}` takes the rest of the path, as in
+`GET …/scm/refs/{name}`. The body:
+
+| Member | Meaning |
+|---|---|
+| `sha` | required: the full id of the commit to move the ref to |
+| `expected_sha` | required: the full id of the commit the caller saw the ref at |
+
+The `parley.git.push` event has `forced` `true` when the old commit is not
+an ancestor of the new one. A move to the commit the ref is at answers
+`200` and emits no event. The move names the version kind `ref`, so a
+branch that is the source of a draft or open change gets a version.
+
+| Status | When |
+|---|---|
+| `200 OK` | the ref object at `sha` |
+| `400` `invalid_request` | a bad name; no `sha` or `expected_sha`, or one that is not a full id (`sha and expected_sha must both be full 40-character commit ids`) |
+| `403` | a push rule refuses the move, such as `protected_branch` |
+| `404` `ref_not_found` | no ref has the name (`ref "refs/heads/nope" does not exist`); `sha` names no commit |
+| `409` `ref_moved` | the ref is not at `expected_sha`, or moved in between; `details.current_sha` is where it is |
+
+## `DELETE /api/v1/workspaces/{slug}/scm/refs/{name}`
+
+Deletes a branch or a tag. The optional query parameter `expected_sha` is
+the full id of the commit the caller saw the ref at; without it the ref is
+deleted at the commit it is at. The ref's commits stay in the repository.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the ref is deleted |
+| `400` `invalid_request` | a bad name; an `expected_sha` that is not a full id (`expected_sha must be a full 40-character commit id`) |
+| `403` | a push rule refuses the delete: `default_branch` (`main is the default branch and cannot be deleted`), `protected_branch` (`main is protected and cannot be force-pushed or deleted`), `hub_owned_ref` |
+| `404` `ref_not_found` | no ref has the name |
+| `409` `ref_moved` | the ref is not at `expected_sha`, or moved in between |
+| `409` `ref_in_use` | the branch is the source of a draft or open change (`branch work is the source of change 3 and cannot be deleted`) |
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

@@ -1,6 +1,7 @@
 package scm_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -563,9 +565,27 @@ func (w *world) get(t *testing.T, path, credential string, header ...string) rep
 // send is get with the method method.
 func (w *world) send(t *testing.T, method, path, credential string, header ...string) reply {
 	t.Helper()
-	req, err := http.NewRequest(method, w.URL("/api/v1"+path), nil)
+	return w.sendJSON(t, method, path, credential, nil, header...)
+}
+
+// sendJSON is send with body, when it is not nil, encoded as JSON as the
+// request's body.
+func (w *world) sendJSON(t *testing.T, method, path, credential string, body any, header ...string) reply {
+	t.Helper()
+	var content io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, w.URL("/api/v1"+path), content)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if credential != "" {
 		req.Header.Set("Authorization", "Bearer "+credential)
@@ -628,3 +648,130 @@ func (o *observations) reset() []string {
 	o.seen = nil
 	return seen
 }
+
+// writeWorld is a world whose writes the tests watch: the change linker
+// registered on its scm routes is linker, and stage is a ref-updated stage
+// registered with its ref writer.
+type writeWorld struct {
+	*world
+	linker *fakeLinker
+	stage  *recordingStage
+}
+
+// newWriteWorld starts a writeWorld, with toml added to the hub's
+// config.toml and adjust changing the scm routes' dependencies.
+func newWriteWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *writeWorld {
+	t.Helper()
+	ww := &writeWorld{linker: &fakeLinker{changes: map[string]*scm.LinkedChange{}}, stage: &recordingStage{}}
+	ww.world = newComposedWorld(t, toml, func(c *hub.Composition) {
+		c.SCM().RegisterChangeLinker(ww.linker)
+		c.RefWriter().RegisterRefUpdatedStage(ww.stage.run)
+	}, adjust...)
+	return ww
+}
+
+// fakeLinker is a change linker that answers changes, by branch, to every
+// lookup and records the branches it was asked about.
+type fakeLinker struct {
+	mu      sync.Mutex
+	changes map[string]*scm.LinkedChange
+	asked   []string
+}
+
+// answer makes the linker name change as the source change of branch, none
+// when change is nil.
+func (f *fakeLinker) answer(branch string, change *scm.LinkedChange) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changes[branch] = change
+}
+
+func (f *fakeLinker) FindOpen(_ context.Context, slug, branch string) (*scm.LinkedChange, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, slug+" "+branch)
+	return f.changes[branch], nil
+}
+
+func (f *fakeLinker) CheckOpening(context.Context, scm.ChangeOpening) error { return nil }
+
+func (f *fakeLinker) Open(context.Context, scm.ChangeOpening) (*scm.LinkedChange, error) {
+	return nil, nil
+}
+
+// recordingStage is a ref-updated stage that records what it is given and
+// reports versions, by ref, for the updates of a request.
+type recordingStage struct {
+	mu       sync.Mutex
+	versions map[string]*pushrule.Version
+	seen     []pushrule.StageInput
+}
+
+func (s *recordingStage) run(_ context.Context, _ *sql.Tx, in pushrule.StageInput) ([]*pushrule.Version, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen = append(s.seen, in)
+	versions := make([]*pushrule.Version, len(in.Updates))
+	for i, u := range in.Updates {
+		versions[i] = s.versions[u.Ref]
+	}
+	return versions, nil
+}
+
+// reset forgets what the stage was given and returns it.
+func (s *recordingStage) reset() []pushrule.StageInput {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := s.seen
+	s.seen = nil
+	return seen
+}
+
+// pushEvent is the metadata of a parley.git.push event.
+type pushEvent struct {
+	Ref                              string
+	Before, After                    *string
+	Created, Deleted, Forced, Direct bool
+	Via                              string
+}
+
+// lastSeq is the sequence number of the last event of the hub's log.
+func (w *world) lastSeq(t *testing.T) int64 {
+	t.Helper()
+	_, seq, err := w.events.ReadAfter(context.Background(), 0, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// eventsAfter are the types of the events after the sequence number seq,
+// and the metadata of those that are parley.git.push events.
+func (w *world) eventsAfter(t *testing.T, seq int64) (types []string, pushes []pushEvent) {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), seq, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range recs {
+		types = append(types, rec.Type)
+		if rec.Type != pushrule.EventPush {
+			continue
+		}
+		var p pushEvent
+		if err := json.Unmarshal(rec.Metadata, &p); err != nil {
+			t.Fatal(err)
+		}
+		pushes = append(pushes, p)
+	}
+	return types, pushes
+}
+
+// refsStream is the history of a workspace the writes of refs work on:
+// main is m1, adding README.md, api/old.go and docs/guide.md, then m2,
+// changing README.md.
+const refsStream = "commit refs/heads/main\nmark :1\n" + testCommitter + "data 2\nm1\n" +
+	"M 100644 inline README.md\ndata 7\nreadme\n\nM 100644 inline api/old.go\ndata 12\npackage api\n\n" +
+	"M 100644 inline docs/guide.md\ndata 6\nguide\n\n" +
+	"commit refs/heads/main\nmark :2\n" + testCommitter + "data 2\nm2\nfrom :1\n" +
+	"M 100644 inline README.md\ndata 8\nreadme2\n\n"

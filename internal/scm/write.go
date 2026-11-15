@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -59,9 +60,9 @@ func (c *Component) writeRoute(method, pattern, op string, h writeHandler) serve
 }
 
 // gate is h behind the state part of the write gate, reporting each
-// request h answers to the recorder once, under op, with the status it
-// wrote or, when it returned an error before writing, the status the error
-// is answered with. A request the gate refuses reaches no handler and is
+// request h answers to the recorder once, under op, with the result of the
+// status it wrote or, when it returned an error before writing, of the
+// error (writeResult). A request the gate refuses reaches no handler and is
 // not reported, as one the shared checks refuse is not.
 func (c *Component) gate(op string, h writeHandler) server.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
@@ -75,13 +76,27 @@ func (c *Component) gate(op string, h writeHandler) server.HandlerFunc {
 		if status == 0 {
 			status = errorStatus(err)
 		}
-		result := ResultOK
-		if status >= http.StatusBadRequest {
-			result = ResultError
-		}
-		c.deps.Recorder.Observe(op, result)
+		c.deps.Recorder.Observe(op, writeResult(status, err))
 		return err
 	}
+}
+
+// writeResult is the result a write reports for an answer of status, which
+// the error err, when not nil, is answered with: ResultRefused for a push
+// rule's refusal, ResultRefMoved for 409 ref_moved, else ResultOK below 400
+// and ResultError from 400 on.
+func writeResult(status int, err error) string {
+	var refused *ruleRefusal
+	var apiErr *server.Error
+	switch {
+	case errors.As(err, &refused):
+		return ResultRefused
+	case errors.As(err, &apiErr) && apiErr.Status() == http.StatusConflict && apiErr.Type() == pushrule.ErrorTypeRefMoved:
+		return ResultRefMoved
+	case status >= http.StatusBadRequest:
+		return ResultError
+	}
+	return ResultOK
 }
 
 // admit is the write of the request r, once the shared checks have granted

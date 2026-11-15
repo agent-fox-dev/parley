@@ -6,9 +6,12 @@
 // Every write route is built by one wrapper (writeRoute), which needs, for a
 // personal access token, git:write and write access to the workspace, and
 // refuses a workspace, or a fork's parent, that cannot take a write before
-// the route's handler runs.
+// the route's handler runs. Every ref a write moves goes through one step
+// (updateRef): the push rule engine decides it and the ref writer writes
+// it by compare-and-swap and emits its events, as for a git push, so this
+// package writes no ref of its own.
 //
-// The routes are GET routes under /workspaces/:slug/scm. Each needs read
+// The read routes are GET routes under /workspaces/:slug/scm. Each needs read
 // access to the workspace and, for a personal access token, git:read, which
 // the server's shared checks decide before a handler runs; each reads only
 // a workspace whose repository is intact, and reports every request it
@@ -37,17 +40,24 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The results a read reports to the request recorder.
+// The results a request reports to the request recorder: ResultOK for an
+// answer whose status is below 400 and ResultError for any other, except
+// that a write reports ResultRefMoved for a 409 ref_moved and ResultRefused
+// for a 403 of a push rule.
 const (
-	ResultOK    = "ok"
-	ResultError = "error"
+	ResultOK       = "ok"
+	ResultError    = "error"
+	ResultRefMoved = "ref_moved"
+	ResultRefused  = "refused"
 )
 
 // The ops the read routes report, one per kind of read.
@@ -111,9 +121,15 @@ type Deps struct {
 	// Sessions names the session that introduced a commit; nil names
 	// none.
 	Sessions SessionLookup
-	// Recorder is told of every request a read route handles; nil tells
-	// no one.
+	// Recorder is told of every request a read or write route handles;
+	// nil tells no one.
 	Recorder Recorder
+	// Rules decide every ref update a write asks for; nil is a push rule
+	// engine with no lookups.
+	Rules Rules
+	// RefWriter writes every ref update the rules allow, and its events;
+	// nil is a ref writer with no store, no stages and no event log.
+	RefWriter RefWriter
 	// MaxFileSize is the size in bytes of the largest file the file route
 	// serves; zero or less is DefaultMaxFileSize.
 	MaxFileSize int64
@@ -122,10 +138,16 @@ type Deps struct {
 	ReadTimeout time.Duration
 }
 
-// Component serves the read routes. Its zero value is ready to be
-// registered; it serves once Bind has given it its dependencies, before
+// Component serves the read and write routes. Its zero value is ready to
+// be registered; it serves once Bind has given it its dependencies, before
 // the first request.
-type Component struct{ deps Deps }
+type Component struct {
+	deps Deps
+
+	mu sync.RWMutex
+	// linker is the registered change linker, nil for none.
+	linker ChangeLinker
+}
 
 // Bind gives the component its dependencies, the defaults in place of the
 // members d leaves nil.
@@ -145,6 +167,12 @@ func (c *Component) Bind(d Deps) {
 	if d.Recorder == nil {
 		d.Recorder = noRecorder{}
 	}
+	if d.Rules == nil {
+		d.Rules = &pushrule.Engine{}
+	}
+	if d.RefWriter == nil {
+		d.RefWriter = &pushrule.Writer{}
+	}
 	if d.MaxFileSize <= 0 {
 		d.MaxFileSize = DefaultMaxFileSize
 	}
@@ -154,9 +182,12 @@ func (c *Component) Bind(d Deps) {
 	c.deps = d
 }
 
-// Routes are the read routes, for the server's router.
+// Routes are the read and write routes, for the server's router.
 func (c *Component) Routes() []server.Route {
 	return []server.Route{
+		c.writeRoute(http.MethodPost, "/refs", opRefCreate, c.createRef),
+		c.writeRoute(http.MethodPatch, "/refs/*name", opRefMove, c.moveRef),
+		c.writeRoute(http.MethodDelete, "/refs/*name", opRefDelete, c.deleteRef),
 		c.route("/refs", opRefs, c.listRefs),
 		c.route("/refs/*name", opRefs, c.getRef),
 		c.route("/commits", opCommits, c.listCommits),

@@ -122,6 +122,32 @@ func TestResolveRef_PeelsAFullRefNameToItsCommit(t *testing.T) {
 	}
 }
 
+func TestLookupRef_FindsTheRefOfAFullName(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		name  string
+		want  gitrepo.Ref
+		found bool
+		noGit bool
+	}{
+		{"refs/tags/v2", gitrepo.Ref{Name: "refs/tags/v2", ID: f.v2, Commit: f.c2}, true, false},
+		{"refs/tags/tree", gitrepo.Ref{Name: "refs/tags/tree", ID: f.tr}, true, false},
+		{"refs/heads/feature", gitrepo.Ref{}, false, false},
+		{"main", gitrepo.Ref{}, false, true},
+		{"refs/heads/a..b", gitrepo.Ref{}, false, true},
+	} {
+		f.calls.Store(0)
+		got, found, err := f.repo.LookupRef(context.Background(), c.name)
+		if err != nil || found != c.found || got != c.want {
+			t.Errorf("LookupRef(%q) = %v, %v, %v; want %v, %v", c.name, got, found, err, c.want, c.found)
+		}
+		if n := f.calls.Load(); c.noGit && n != 0 {
+			t.Errorf("LookupRef(%q): %d git processes ran for a name refused before git", c.name, n)
+		}
+	}
+}
+
 func TestResolveCommit_FindsTheOneCommitAnIdNames(t *testing.T) {
 	t.Parallel()
 	f := newReadFixture(t)

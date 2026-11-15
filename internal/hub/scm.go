@@ -14,8 +14,8 @@ import (
 // API's read routes.
 const scmHook = "scm"
 
-// composeSCM adds the read half of the source control API: it registers
-// the read routes under /workspaces/:slug/scm, whose scope and access need
+// composeSCM adds the source control API: it registers the read and write
+// routes under /workspaces/:slug/scm, whose scope and access need
 // the shared checks decide, and binds the component in a start hook to the
 // workspace records in the store; to the fork component's parent-state
 // check for a read and for a write, so that a fork whose parent is busy or
@@ -27,8 +27,11 @@ const scmHook = "scm"
 // names the git server advertises) and for a repository workspace what its
 // repository holds; and to the push rules' protected-branch test over the
 // workspace's effective protected_branches, a fork's from its parent's, so
-// that the reads call protected what a push meets as protected. Each read
-// is bounded by [scm].read_timeout and a file by [scm].max_file_size.
+// that the reads call protected what a push meets as protected; and to the
+// push rule engine and the ref writer of the git server's part, so that a
+// write is decided and written exactly as a push of the same ref update.
+// Each read is bounded by [scm].read_timeout and a file by
+// [scm].max_file_size.
 //
 // The change, commit-change and session lookups keep their defaults, which
 // name none: the hub has no change or session records to ask. The hub
@@ -69,6 +72,8 @@ func composeSCM(c *Composition) {
 				return scm.RepoRefs(repo)
 			},
 			Protected:   protectedBranches{pushSettings{db, c.workspaces.Settings()}},
+			Rules:       c.pushRules,
+			RefWriter:   c.refWriter,
 			ReadTimeout: rt.Config.SCM.ReadTimeout,
 			MaxFileSize: rt.Config.SCM.MaxFileSize,
 		}
