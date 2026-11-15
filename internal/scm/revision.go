@@ -33,6 +33,12 @@ type Repository interface {
 	// DiffChanges are the file changes between two full ids, from "" being
 	// the empty tree.
 	DiffChanges(ctx context.Context, from, to string) ([]gitrepo.FileChange, error)
+	// DiffPatches reads the patch of each file change DiffChanges lists for
+	// the same ids, in its order, until each returns false.
+	DiffPatches(ctx context.Context, from, to string, opt gitrepo.PatchOptions, each func(i int, patch []byte) bool) error
+	// MergeBase is the newest common ancestor of the commits of two full
+	// ids, "" when they have none.
+	MergeBase(ctx context.Context, a, b string) (string, error)
 	// ReadTree reads the directory path, "" for the root, of the commit of
 	// a full id, with recursive every entry below it.
 	ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error)

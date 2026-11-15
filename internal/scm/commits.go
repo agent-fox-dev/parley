@@ -16,13 +16,6 @@ type signature struct {
 	Time  string `json:"time"`
 }
 
-// commitStats are a commit's numbers against its first parent.
-type commitStats struct {
-	FilesChanged int `json:"files_changed"`
-	Insertions   int `json:"insertions"`
-	Deletions    int `json:"deletions"`
-}
-
 // commitObject is a commit as every read route answers it.
 type commitObject struct {
 	SHA       string        `json:"sha"`
@@ -34,19 +27,7 @@ type commitObject struct {
 	Change    *CommitChange `json:"change"`
 	SessionID *string       `json:"session_id"`
 	// Stats is present only where the caller asks for it.
-	Stats *commitStats `json:"stats,omitempty"`
-}
-
-// fileChange is how one file of a commit differs from its first parent.
-type fileChange struct {
-	Path       string  `json:"path"`
-	OldPath    *string `json:"old_path"`
-	Status     string  `json:"status"`
-	Insertions int     `json:"insertions"`
-	Deletions  int     `json:"deletions"`
-	Binary     bool    `json:"binary"`
-	OldSHA     *string `json:"old_sha"`
-	NewSHA     *string `json:"new_sha"`
+	Stats *diffStats `json:"stats,omitempty"`
 }
 
 // commitsPosition is where a commit listing continues: the commit its first
@@ -194,8 +175,7 @@ func (c *Component) commitObjects(ctx context.Context, rd *read, commits []gitre
 			return nil, err
 		}
 		if stats != nil {
-			s := stats[i]
-			o.Stats = &commitStats{FilesChanged: s.FilesChanged, Insertions: s.Insertions, Deletions: s.Deletions}
+			o.Stats = new(newDiffStats(stats[i]))
 		}
 		objs = append(objs, o)
 	}
@@ -204,23 +184,4 @@ func (c *Component) commitObjects(ctx context.Context, rd *read, commits []gitre
 
 func newSignature(s gitrepo.Signature) signature {
 	return signature{Name: s.Name, Email: s.Email, Time: s.Time.UTC().Format(time.RFC3339)}
-}
-
-// fileChanges are changes as the read routes answer them: a path, id or
-// old path a change has no value for is null.
-func fileChanges(changes []gitrepo.FileChange) []fileChange {
-	orNull := func(s string) *string {
-		if s == "" {
-			return nil
-		}
-		return &s
-	}
-	files := make([]fileChange, 0, len(changes))
-	for _, ch := range changes {
-		files = append(files, fileChange{
-			Path: ch.Path, OldPath: orNull(ch.OldPath), Status: ch.Status, Insertions: ch.Insertions,
-			Deletions: ch.Deletions, Binary: ch.Binary, OldSHA: orNull(ch.OldID), NewSHA: orNull(ch.NewID),
-		})
-	}
-	return files
 }

@@ -308,6 +308,40 @@ func (w *world) addTree(t *testing.T, files ...string) string {
 		big.String()+"\n")
 }
 
+// addDiff adds the ready workspace diff of the owner and returns the ids of
+// its commits mb, main, feature and orphan. Its main is mb <- main, which
+// adds only-main.txt. mb holds a.txt (ten lines), edit.txt, gone.txt, the
+// binary img.bin and the regular file kind. feature, one commit on top of
+// mb, adds new.txt (three lines), deletes gone.txt, replaces the line three
+// of edit.txt with two lines, moves a.txt to moved/b.txt changing its last
+// line, changes img.bin, turns kind into a symlink and adds docs/guide.md,
+// docs/api/x.txt, notes.md and src/readme.md. orphan is a root commit of
+// its own adding o1.txt and o2.txt.
+func (w *world) addDiff(t *testing.T) map[string]string {
+	t.Helper()
+	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+	file := func(path, content string) string { return "M 100644 inline " + path + "\n" + data(content) }
+	var alpha strings.Builder
+	for i := 1; i <= 9; i++ {
+		fmt.Fprintf(&alpha, "alpha line %d\n", i)
+	}
+	dir := w.addWorkspace(t, "diff", w.org, "commit refs/heads/main\nmark :1\n"+testCommitter+data("mb")+
+		file("a.txt", alpha.String()+"alpha line 10\n")+file("edit.txt", "one\ntwo\nthree\nfour\nfive\n")+
+		file("gone.txt", "gone\n")+file("img.bin", "\x00\x01\x02")+file("kind", "kind\n")+
+		"\ncommit refs/heads/main\n"+testCommitter+data("main")+"from :1\n"+file("only-main.txt", "main\n")+
+		"\ncommit refs/heads/feature\n"+testCommitter+data("feature")+"from :1\n"+
+		file("new.txt", "n1\nn2\nn3\n")+"D gone.txt\n"+file("edit.txt", "one\ntwo\n3a\n3b\nfour\nfive\n")+
+		"D a.txt\n"+file("moved/b.txt", alpha.String()+"alpha line ten\n")+file("img.bin", "\x00\x03")+
+		"M 120000 inline kind\n"+data("edit.txt")+file("docs/guide.md", "guide\n")+file("docs/api/x.txt", "x\n")+
+		file("notes.md", "notes\n")+file("src/readme.md", "readme\n")+
+		"\ncommit refs/heads/orphan\n"+testCommitter+data("orphan")+file("o1.txt", "o1\n")+file("o2.txt", "o2\n")+"\n")
+	ids := map[string]string{}
+	for i, id := range strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main~1", "main", "feature", "orphan")) {
+		ids[[]string{"mb", "main", "feature", "orphan"}[i]] = id
+	}
+	return ids
+}
+
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
@@ -413,6 +447,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"commits", "/commits/main", "/commits/nope"},
 	{"tree", "/tree", "/tree?path=nope"},
 	{"file", "/file?path=f.txt", "/file?path=nope.txt"},
+	{"diff", "/diff?base=main&head=feature/x", "/diff?base=main"},
 }
 
 // observations is a request recorder that keeps what it was told, each

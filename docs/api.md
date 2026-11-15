@@ -2608,7 +2608,7 @@ who reads it); the `limit` and `cursor` (`400`).
 
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
-refs routes, the two commits routes, the tree route and the file route below. Every one of them behaves
+refs routes, the two commits routes, the tree route, the file route and the diff route below. Every one of them behaves
 alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
@@ -2641,7 +2641,7 @@ moves. A fork shows no `refs/parley/` ref.
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
-`tree` for the tree route, `file` for the file route) and `ok` for a status
+`tree` for the tree route, `file` for the file route, `diff` for the diff route) and `ok` for a status
 below 400 (a `206` included),
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
@@ -2662,7 +2662,8 @@ Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
 
 A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree` and
-`…/scm/file`, `{sha}` of `…/scm/commits/{sha}`) is a branch name, a tag name, a full ref name or a
+`…/scm/file`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
+`…/scm/diff`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
 the tag of that name, where both existing is ambiguous; otherwise a commit
@@ -2695,7 +2696,25 @@ A commit object, as every route that answers commits writes it:
 | `message` | the whole message, as written, its last newline included when it has one |
 | `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it; always `null` until the hub records changes |
 | `session_id` | the agent session that introduced the commit; always `null` until the hub records sessions |
-| `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed files are found, and a binary file counts as changed with no lines |
+| `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
+
+A file change, as every route that answers file changes writes it (the
+commit route with `files=true`, the diff route):
+
+| Member | Value |
+|---|---|
+| `path` | the file's path, on the new side; for a deleted file, the path it had |
+| `old_path` | the path on the old side of a renamed or copied file, else `null` |
+| `status` | `added`, `modified`, `deleted`, `renamed`, `copied` or `type_changed` (a path whose kind changed, such as a regular file that became a symbolic link) |
+| `insertions`, `deletions` | lines added and removed; `0` and `0` for a binary file |
+| `binary` | `true` for a file git treats as binary |
+| `old_sha`, `new_sha` | the file's blob id on each side, `null` on the side it is missing from |
+| `patch` | only on the diff route with patches on: the file's part of the unified diff, from its `diff --git` line; never for a binary file |
+
+Renamed and copied files are found as git finds them (`-M -C`): a file
+moved with small edits is one change `renamed` with both paths, not a
+deletion and an addition, and a copy is found when the file it was copied
+from changed in the same comparison.
 
 ## `GET /api/v1/workspaces/{slug}/scm/refs`
 
@@ -2774,17 +2793,9 @@ Answers the commit object of the commit `{sha}` names, which is any
 revision (a branch name with a `/` is written with `%2F`, as
 `…/commits/feature%2Fx`), always with `stats`. With `files=true` it also
 has `files`, the commit's file changes against its first parent, or
-against the empty tree for a root commit, in byte order of path; without
-it, or with `files=false`, the member is absent. A file change:
-
-| Member | Value |
-|---|---|
-| `path` | the file's path, on the new side; for a deleted file, the path it had |
-| `old_path` | the path on the old side of a renamed or copied file, else `null` |
-| `status` | `added`, `modified`, `deleted`, `renamed`, `copied` or `type_changed` |
-| `insertions`, `deletions` | lines added and removed; `0` and `0` for a binary file |
-| `binary` | `true` for a file git treats as binary |
-| `old_sha`, `new_sha` | the file's blob id on each side, `null` on the side it is missing from |
+against the empty tree for a root commit, in byte order of path, each a
+file change (see [Source control reads](#source-control-reads)) without
+`patch`; without it, or with `files=false`, the member is absent.
 
 | Status | When |
 |---|---|
@@ -2903,6 +2914,51 @@ forms.
 
 ```json
 {"error":{"code":413,"message":"file \"big.dat\" is 33554433 bytes, over the limit of 33554432","error_type":"payload_too_large","size":33554433}}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/diff`
+
+Answers the file changes between two revisions. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `base`, `head` | the two revisions compared, both required |
+| `mode` | `merge_base` (the default): the merge base of `base` and `head` against `head`, so a file changed only on `base` since they parted is not in the answer; `direct`: `base` itself against `head` |
+| `path` | a glob, repeatable: only the files whose path one of them matches are answered and counted; `*` matches within a segment, `**` across segments, the whole path, case-sensitively; no `path` keeps every file |
+| `patches` | `true` (the default) or `false`; with `false` no file has `patch` |
+| `context` | the lines of context around each change in the patches, an integer from 0 to 20; default 3 |
+| `format` | `json` (the default) or `patch` |
+
+The JSON answer:
+
+| Member | Value |
+|---|---|
+| `base_sha`, `head_sha` | the full ids `base` and `head` resolved to |
+| `merge_base_sha` | the full id of their merge base, in both modes; `null` when they share no ancestor, and then the left side in `merge_base` mode is the empty tree, so every file of `head` is `added` |
+| `files` | the file changes (see [Source control reads](#source-control-reads)), in byte order of path |
+| `stats` | `{"files_changed": …, "insertions": …, "deletions": …}` over every file the `path` globs keep, also those a cut leaves out |
+| `truncated` | `true` when the answer was cut |
+
+The answer lists at most 5,000 files, the first in path order. Patches are
+added file by file until the next file's patch would take their total past
+8 MiB (8,388,608 bytes); that file and every later one is answered without
+`patch`. A cut of either kind sets `truncated`.
+
+With `format=patch` the answer is the unified diff of the same files as
+text, `Content-Type: text/x-diff`, each binary file as a binary patch, so
+that `git apply` applies it to the left side's tree. It is cut at a file
+boundary by the same limits, and a cut answer carries the header
+`X-Parley-Truncated: true`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the diff, as JSON or as text |
+| `400` `invalid_request` | no `base` or no `head` (`base and head are required`); `mode` other than `merge_base` or `direct` (`mode must be merge_base or direct`); `format` other than `json` or `patch` (`format must be json or patch`); `context` that is not an integer from 0 to 20 (`context must be an integer from 0 to 20`); `patches` other than `true` or `false` (`patches must be true or false`) |
+| `404` `ref_not_found` | `base` or `head` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"base_sha":"6c638ebb967a4ce0b52b308260b292f0dbdbd489","head_sha":"c7a58b21816fb50c8054f4b8d574c7d205f9a4bb","merge_base_sha":"4a5a3035a79aa72418c2fa14d64c763813e558a6","files":[{"path":"edit.txt","old_path":null,"status":"modified","insertions":2,"deletions":1,"binary":false,"old_sha":"b2f931a67315c95c5daab3aac6de62e534808476","new_sha":"c04cd7487d84c5531d5a28b8763a5982ba7b8501","patch":"diff --git a/edit.txt b/edit.txt\nindex b2f931a..c04cd74 100644\n--- a/edit.txt\n+++ b/edit.txt\n@@ -1,5 +1,6 @@\n one\n two\n-three\n+3a\n+3b\n four\n five\n"},{"path":"img.bin","old_path":null,"status":"modified","insertions":0,"deletions":0,"binary":true,"old_sha":"8352675d67aed6625ece79af41c27fdb4ee2e867","new_sha":"a903574af00b573ad9bdb2bccf8d93ed00c675de"},{"path":"new.txt","old_path":null,"status":"added","insertions":3,"deletions":0,"binary":false,"old_sha":null,"new_sha":"5804e5526e21ff0d1a3d282f07834c45f28612ca","patch":"diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..5804e55\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,3 @@\n+n1\n+n2\n+n3\n"}],"stats":{"files_changed":3,"insertions":5,"deletions":1},"truncated":false}
 ```
 
 ## Admin routes

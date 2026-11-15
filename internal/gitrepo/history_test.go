@@ -3,7 +3,6 @@ package gitrepo_test
 import (
 	"context"
 	"errors"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -142,36 +141,6 @@ func TestReadCommits_ReadsEachCommitAsWritten(t *testing.T) {
 
 func sameSignature(a, b gitrepo.Signature) bool {
 	return a.Name == b.Name && a.Email == b.Email && a.Time.Equal(b.Time)
-}
-
-func TestDiffChanges_ListsTheFilesThatDifferWithTheirNumbers(t *testing.T) {
-	t.Parallel()
-	f := newHistoryFixture(t)
-	ctx := context.Background()
-	for _, c := range []struct {
-		from, to string
-		want     []gitrepo.FileChange
-	}{
-		{"", "c1", []gitrepo.FileChange{
-			{Path: "a.txt", Status: gitrepo.ChangeAdded, Insertions: 1, NewID: f.id["c1:a.txt"]},
-			{Path: "bin.dat", Status: gitrepo.ChangeAdded, Binary: true, NewID: f.id["c1:bin.dat"]},
-			{Path: "old.md", Status: gitrepo.ChangeAdded, Insertions: 1, NewID: f.id["c1:old.md"]},
-		}},
-		{"c1", "c2", []gitrepo.FileChange{
-			{Path: "a.txt", Status: gitrepo.ChangeModified, Insertions: 2, Deletions: 1, OldID: f.id["c1:a.txt"], NewID: f.id["c2:a.txt"]},
-			{Path: "new.md", OldPath: "old.md", Status: gitrepo.ChangeRenamed, OldID: f.id["c1:old.md"], NewID: f.id["c1:old.md"]},
-		}},
-		{"c2", "c1", []gitrepo.FileChange{
-			{Path: "a.txt", Status: gitrepo.ChangeModified, Insertions: 1, Deletions: 2, OldID: f.id["c2:a.txt"], NewID: f.id["c1:a.txt"]},
-			{Path: "old.md", OldPath: "new.md", Status: gitrepo.ChangeRenamed, OldID: f.id["c1:old.md"], NewID: f.id["c1:old.md"]},
-		}},
-		{"c2", "c3", nil},
-	} {
-		got, err := f.repo.DiffChanges(ctx, f.id[c.from], f.id[c.to])
-		if err != nil || len(got) != len(c.want) || (len(got) > 0 && !reflect.DeepEqual(got, c.want)) {
-			t.Errorf("DiffChanges(%s, %s) = %+v, %v; want %+v", c.from, c.to, got, err, c.want)
-		}
-	}
 }
 
 func TestCommitStats_CountsEachCommitAgainstItsFirstParent(t *testing.T) {

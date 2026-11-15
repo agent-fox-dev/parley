@@ -55,37 +55,6 @@ type DiffStats struct {
 	FilesChanged, Insertions, Deletions int
 }
 
-// The statuses of a FileChange.
-const (
-	ChangeAdded       = "added"
-	ChangeModified    = "modified"
-	ChangeDeleted     = "deleted"
-	ChangeRenamed     = "renamed"
-	ChangeCopied      = "copied"
-	ChangeTypeChanged = "type_changed"
-)
-
-// FileChange is how one file differs between two trees.
-type FileChange struct {
-	// Path is the file's path on the new side, and on the old side for a
-	// deleted file; OldPath is the path on the old side of a renamed or
-	// copied file, "" otherwise.
-	Path, OldPath string
-	// Status is one of ChangeAdded, ChangeModified, ChangeDeleted,
-	// ChangeRenamed, ChangeCopied and ChangeTypeChanged.
-	Status string
-	// Insertions and Deletions count lines, both 0 for a binary file.
-	Insertions, Deletions int
-	Binary                bool
-	// OldID and NewID are the file's blob ids on each side, "" on the side
-	// it is missing from.
-	OldID, NewID string
-}
-
-// nullID is the id git writes for the side of a change a file is missing
-// from.
-var nullID = strings.Repeat("0", idLen)
-
 // History is the commits reachable from the commit of the full id from,
 // newest first, that q keeps. A path that no commit changed keeps none.
 func (r *Repo) History(ctx context.Context, from string, q HistoryQuery) ([]Commit, error) {
@@ -252,7 +221,8 @@ func parseSignature(s string) (Signature, error) {
 
 // CommitStats are the numbers of each of commits against its first parent,
 // or against the empty tree for a commit without one, in their order.
-// Renamed files are found; a binary file counts as changed with no lines.
+// Renamed and copied files are found; a binary file counts as changed
+// with no lines.
 func (r *Repo) CommitStats(ctx context.Context, commits []Commit) ([]DiffStats, error) {
 	if len(commits) == 0 {
 		return nil, nil
@@ -268,8 +238,8 @@ func (r *Repo) CommitStats(ctx context.Context, commits []Commit) ([]DiffStats, 
 		}
 		in.WriteString("\n")
 	}
-	out, err := r.g.runInput(ctx, access{}, []byte(in.String()),
-		"--git-dir="+r.dir, "diff-tree", "--stdin", "--always", "--root", "-r", "-z", "-M", "--numstat")
+	args := append(append([]string{"--git-dir=" + r.dir, "diff-tree", "--stdin", "--always", "--root", "-r", "-z"}, findRenames...), "--numstat")
+	out, err := r.g.runInput(ctx, access{}, []byte(in.String()), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -296,88 +266,6 @@ func (r *Repo) CommitStats(ctx context.Context, commits []Commit) ([]DiffStats, 
 		fields = rest
 	}
 	return stats, nil
-}
-
-// DiffChanges are the file changes from the tree of from to that of to,
-// each a full id of a commit or a tree, from "" being the empty tree, in
-// byte order of path. Renamed files are found.
-func (r *Repo) DiffChanges(ctx context.Context, from, to string) ([]FileChange, error) {
-	if from == "" {
-		empty, err := r.emptyTree(ctx)
-		if err != nil {
-			return nil, err
-		}
-		from = empty
-	}
-	for _, id := range []string{from, to} {
-		if !isHexID(id, idLen) {
-			return nil, fmt.Errorf("diff of %q: %w", id, ErrNotFound)
-		}
-	}
-	out, err := r.git(ctx, "diff-tree", "-r", "-z", "-M", "--raw", "--numstat", strings.ToLower(from), strings.ToLower(to))
-	if err != nil {
-		return nil, err
-	}
-	// The raw entries come first, each ":<modes> <ids> <status>" and its
-	// paths, then a numstat entry for each, in the same order.
-	fields := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
-	var changes []FileChange
-	for len(fields) > 0 && strings.HasPrefix(fields[0], ":") {
-		f := strings.Fields(fields[0])
-		if len(f) != 5 || len(fields) < 2 {
-			return nil, fmt.Errorf("diff: diff-tree answered %q", fields[0])
-		}
-		c := FileChange{Path: fields[1], OldID: blobID(f[2]), NewID: blobID(f[3])}
-		fields = fields[2:]
-		switch f[4][0] {
-		case 'A':
-			c.Status = ChangeAdded
-		case 'D':
-			c.Status = ChangeDeleted
-		case 'M':
-			c.Status = ChangeModified
-		case 'T':
-			c.Status = ChangeTypeChanged
-		case 'R', 'C':
-			if len(fields) == 0 {
-				return nil, fmt.Errorf("diff: diff-tree answered %q without its new path", f[4])
-			}
-			c.Status = map[byte]string{'R': ChangeRenamed, 'C': ChangeCopied}[f[4][0]]
-			c.OldPath, c.Path = c.Path, fields[0]
-			fields = fields[1:]
-		default:
-			return nil, fmt.Errorf("diff: diff-tree answered the status %q", f[4])
-		}
-		changes = append(changes, c)
-	}
-	for i := range changes {
-		n, rest, err := parseNumstat(fields)
-		if err != nil {
-			return nil, err
-		}
-		changes[i].Insertions, changes[i].Deletions, changes[i].Binary = n.Insertions, n.Deletions, n.binary
-		fields = rest
-	}
-	return changes, nil
-}
-
-// blobID is the id git writes for one side of a change, "" for the side a
-// file is missing from.
-func blobID(id string) string {
-	if id == nullID {
-		return ""
-	}
-	return id
-}
-
-// emptyTree is the id of the tree that holds nothing, in the repository's
-// object format; git knows it whether or not the repository stores it.
-func (r *Repo) emptyTree(ctx context.Context) (string, error) {
-	out, err := r.g.runInput(ctx, access{}, []byte{}, "--git-dir="+r.dir, "hash-object", "-t", "tree", "--stdin")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 // numstat is one file's line counts.
@@ -421,13 +309,4 @@ func (s *DiffStats) add(n numstat) {
 	s.FilesChanged++
 	s.Insertions += n.Insertions
 	s.Deletions += n.Deletions
-}
-
-// Stats are the numbers of changes taken together.
-func Stats(changes []FileChange) DiffStats {
-	var s DiffStats
-	for _, c := range changes {
-		s.add(numstat{Insertions: c.Insertions, Deletions: c.Deletions})
-	}
-	return s
 }
