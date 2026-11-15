@@ -52,6 +52,16 @@ type commitRequest struct {
 	Author          *commitAuthor   `json:"author"`
 	Operations      []fileOperation `json:"operations"`
 	AllowEmpty      bool            `json:"allow_empty"`
+	Change          *commitChange   `json:"change"`
+}
+
+// commitChange is the change a commit request asks to open, its branch the
+// source.
+type commitChange struct {
+	TargetBranch *string `json:"target_branch"`
+	Title        *string `json:"title"`
+	Intent       *string `json:"intent"`
+	Draft        bool    `json:"draft"`
 }
 
 // commitAuthor is the author a commit request names.
@@ -88,7 +98,9 @@ type commitAnswer struct {
 //
 // The checks run in the order in which each has what it needs: the shape of
 // the body and of every operation (400 invalid_request), before anything is
-// read from the repository; the parent (409 ref_moved for an existing branch
+// read from the repository; a change object on a protected branch (400
+// invalid_request), before the parent is resolved or any object written;
+// the parent (409 ref_moved for an existing branch
 // whose expected_head_sha is absent or another commit, so that one answer
 // tells the caller what to retry from; 400 invalid_request for a new branch
 // without base_ref; 404 ref_not_found when base_ref names no commit); the
@@ -106,10 +118,12 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	if err != nil {
 		return err
 	}
-	// The change object, refused on a protected branch, and the session are
-	// checked here, before the parent is resolved.
-
 	ctx := r.Context()
+	if err := c.checkChangeSource(ctx, wr, branch, body.Change); err != nil {
+		return err
+	}
+	// The session is checked here, before the parent is resolved.
+
 	t, err := c.target(ctx, wr)
 	if err != nil {
 		return err
@@ -146,6 +160,27 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 		return err
 	}
 	return c.writeCommit(w, r, t, branch, sha)
+}
+
+// checkChangeSource refuses, with 400 invalid_request, a change object on a
+// commit to branch, a full branch name, when the workspace of the write wr
+// protects the branch, as the push rules' protected-branch test over its
+// effective protected_branches says: a protected branch moves by landing a
+// change or by a direct push, never as the source of a change, so the
+// request is refused before anything is resolved or written. A request
+// without a change object passes.
+func (c *Component) checkChangeSource(ctx context.Context, wr *write, branch string, change *commitChange) error {
+	if change == nil {
+		return nil
+	}
+	protected, err := c.deps.Protected.ProtectedBranches(ctx, wr.ws)
+	if err != nil {
+		return err
+	}
+	if name := strings.TrimPrefix(branch, "refs/heads/"); protected(name) {
+		return server.InvalidRequest(fmt.Sprintf("%s is protected and cannot be the source of a change; commit to another branch to open one", name))
+	}
+	return nil
 }
 
 // check is the full name of the branch the request names and its

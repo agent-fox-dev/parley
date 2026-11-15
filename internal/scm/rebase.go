@@ -31,7 +31,7 @@ type rebaseRequest struct {
 // rebaseAnswer is the answer to a rebase request: the branch at its new
 // head, the heads before and after, the commit it was rebased onto, and
 // the change whose source the branch is, with the version the rebase made
-// of it, null when there is none.
+// of it, null when there is none and when the rebase was a direct push.
 type rebaseAnswer struct {
 	Status     string        `json:"status"`
 	Branch     refObject     `json:"branch"`
@@ -120,10 +120,7 @@ func (c *Component) rebase(w http.ResponseWriter, r *http.Request, wr *write) er
 	if err != nil {
 		return err
 	}
-	answer.NewHeadSHA = newHead
-	if v := up.version; v != nil {
-		answer.Change = &LinkedChange{WorkspaceSlug: v.WorkspaceSlug, Number: v.Number, Version: v.Version}
-	}
+	answer.NewHeadSHA, answer.Change = newHead, up.change()
 	return c.writeRebase(w, r, t, branch, answer)
 }
 

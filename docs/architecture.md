@@ -3341,6 +3341,11 @@ failed `409` `ref_moved` with `details.current_sha` read after the
 failure, and a ref-updated stage's error is answered as it is when it is
 an API error, else `500` `internal`. The step returns the engine's decision
 (its `Direct`, `Created`, `Forced` flags) and the version a stage recorded.
+The owner exemption is the engine's: a fast-forward of a protected branch
+by the owner or the admin token with an exempt credential comes back with
+`Direct` set, and the route then asks the `ChangeLinker` nothing and names
+no change (`refUpdated.change()` is `nil` for a direct push whatever a stage
+reported), since a direct push is the version of no change.
 A write opens the workspace's repository through `Deps.Open`, which must
 hand over a `*gitrepo.Repo`, since the ref writer writes to one.
 
@@ -3358,7 +3363,10 @@ without one (`noLinker`), no branch is, and every opening is refused with
 
 The commit route (`createCommit` in `commit.go`) checks the body and every
 operation's shape first (`gitrepo.ValidPath` for each path), before it
-opens the repository; then resolves the parent: for an existing branch
+opens the repository; then refuses a `change` object on a branch the
+workspace protects (`400` `invalid_request`), asking `Deps.Protected`, the
+push rules' protected-branch test over the effective `protected_branches`
+the engine reads, before any object is written; then resolves the parent: for an existing branch
 its head from `LookupRef`, which `expected_head_sha` must name (`409`
 `ref_moved` otherwise, also when it is absent), for a new one the commit
 `base_ref` names through the revision resolver, before `pushrule.ZeroID`;

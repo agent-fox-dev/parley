@@ -86,7 +86,8 @@ func (c *Component) createRef(w http.ResponseWriter, r *http.Request, wr *write)
 // the branch when the name does not begin with refs/, moved to the commit
 // sha when it is at expected_sha, through the shared ref update step with
 // the version kind ref, so that the source branch of a change gets a
-// version. A move to the commit the ref is at changes nothing and emits
+// version; a fast-forward of a protected branch by its owner or the admin
+// token is a direct push, which is the version of no change. A move to the commit the ref is at changes nothing and emits
 // nothing, as a push with no change does.
 func (c *Component) moveRef(w http.ResponseWriter, r *http.Request, wr *write) error {
 	name, err := writeRefName(server.Param(r, "name"))

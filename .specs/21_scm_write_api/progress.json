@@ -3,7 +3,7 @@
   "spec_id": "21",
   "spec_name": "scm_write_api",
   "schema_version": 3,
-  "updated_at": "2026-11-15T11:35:24Z",
+  "updated_at": "2026-11-15T11:41:49Z",
   "tasks": [
     {
       "id": 1,
@@ -31,7 +31,7 @@
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,

@@ -3233,6 +3233,22 @@ between is `409` `ref_moved`, with the commit it is at now in
 changes. An accepted write emits one `parley.git.push` event per ref, with
 `via` `"api"`, as a push does with `via` `"git"`.
 
+A protected branch (one the workspace's effective `protected_branches`
+match, a task fork's its parent's) is held as for a push. Nobody, the admin
+token included, creates one (`release/1 is protected; push another branch
+and open a change (git push -o parley.change)`), moves one to a commit that
+does not descend from its head, by a ref move or a rebase, or deletes one
+(`main is protected and cannot be force-pushed or deleted`). While
+`protect.owner_push` is `true`, the workspace's owner or the admin token
+moves one forward, by a commit, a ref move or a rebase whose new head
+descends from the old one, with an API key, the admin token, or a PAT
+neither bound to a workspace nor limited to paths: a direct push, whose
+`parley.git.push` event has `direct` `true`. A direct push is the version
+of no change: the route opens none and answers `change` `null`. Every other
+caller, and every caller while `protect.owner_push` is `false`, gets `403`
+`protected_branch` (`main is protected; push another branch and open a
+change (git push -o parley.change)`).
+
 ```json
 {"error":{"code":409,"message":"refs/heads/work is not at the expected commit; read it again and retry","error_type":"ref_moved","details":{"current_sha":"d81e7ee540a0ae85fa486bfd9c53f46cfbdf4f89"}}}
 ```
@@ -3266,6 +3282,7 @@ and moves one branch to it, or creates the branch there. The body:
 | `author` | `{"name": …, "email": …}`, both required, neither holding `<`, `>` or a line break; without it the author is the caller (the user's full name, else the username, and e-mail), and for the admin token the hub (`parley` `<parley@localhost>`) |
 | `operations` | the file operations, at most 1,000, applied in order, each to the tree the one before it left; may be empty or absent |
 | `allow_empty` | `true` to make a commit whose tree is its parent's; default `false` |
+| `change` | `{"target_branch": …, "title": …, "intent": …, "draft": …}`, a change to open with `branch` as its source; refused on a protected branch (see [Source control writes](#source-control-writes)) |
 
 An operation is one of:
 
@@ -3290,7 +3307,8 @@ git's garbage collection.
 
 The checks run in this order: the body and the shape of every operation,
 before the repository is read, so a malformed request answers `400`
-whatever the branch's state; the parent; the operations against the tree;
+whatever the branch's state; a `change` object on a protected branch,
+before the parent is resolved or any object is written; the parent; the operations against the tree;
 emptiness; then the push rules and the compare-and-swap.
 
 The body limit of this route is `[scm].max_commit_size`, 33554432 bytes
@@ -3310,7 +3328,7 @@ its `message` ends in a newline, as every message git writes does.
 | Status | When |
 |---|---|
 | `201 Created` | the commit, the branch and the change, as above |
-| `400` `invalid_request` | no `branch`, or not a branch name; no `message`, or an empty one; an `author` without `name` or `email`; an `expected_head_sha` that is not a full id; more than 1,000 operations (`a commit takes at most 1000 operations, not 1001`); a malformed operation (`operation 0: op "copy" is none of put, delete, move and chmod`): an unknown or missing `op`, a bad path, a `put` with both or neither of `content` and `content_base64` or invalid base64, a mode the operation does not take, a missing member; a `branch` that does not exist and no `base_ref` |
+| `400` `invalid_request` | no `branch`, or not a branch name; no `message`, or an empty one; an `author` without `name` or `email`; an `expected_head_sha` that is not a full id; more than 1,000 operations (`a commit takes at most 1000 operations, not 1001`); a malformed operation (`operation 0: op "copy" is none of put, delete, move and chmod`): an unknown or missing `op`, a bad path, a `put` with both or neither of `content` and `content_base64` or invalid base64, a mode the operation does not take, a missing member; a `change` object on a protected branch (`main is protected and cannot be the source of a change; commit to another branch to open one`), for every caller, the owner and the admin token included; a `branch` that does not exist and no `base_ref` |
 | `400` `invalid_operation` | an operation that does not apply to the tree the ones before it left: a `delete`, `move` or `chmod` of a missing path or a directory, a `move` onto a file or a directory, a `put` below a file or onto a directory, any operation on or below a submodule entry; `details.index` is the zero-based index of the first such operation |
 | `400` `empty_commit` | the operations leave the parent's tree as it is and `allow_empty` is not `true` (`the operations leave the tree as it is; set allow_empty to commit it anyway`) |
 | `403` | a push rule refuses the update, such as `protected_branch` |
@@ -3427,9 +3445,9 @@ when the old head is not an ancestor of the new one.
 `old_head_sha`). `branch` is the ref object at `new_head_sha`, and
 `onto_sha` the commit `onto` names. `change` is
 `{"workspace_slug": …, "number": …, "version": …}`: for `rebased`, the
-change and the version the rebase recorded; for `up_to_date`, the draft or
-open change whose source the branch is, with its current version; `null`
-when there is none.
+change and the version the rebase recorded, `null` for a direct push of a
+protected branch; for `up_to_date`, the draft or open change whose source
+the branch is, with its current version; `null` when there is none.
 
 A commit that does not apply ends the rebase: the branch stays where it
 was, no event is emitted, and the answer is `409` `rebase_conflict` with
