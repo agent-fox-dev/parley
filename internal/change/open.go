@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -57,10 +58,19 @@ type OpenInput struct {
 	Kind string
 	// Reverts is the number of the change a revert reverts, nil for none.
 	Reverts *int64
+	// CheckPaths asks that every file of version 1 match the globs of a
+	// path-scoped caller; the REST route sets it, while a push or a commit
+	// had its paths checked when it moved the branch.
+	CheckPaths bool
 }
 
 // Open opens a change in tx, the caller's transaction, which it neither
-// begins nor commits: it gives the target workspace's next number, records
+// begins nor commits. It first runs every check of an open, in order (the
+// binding of a bound token, the input, an explicit session, the caller's
+// access, as Authorize judges binding and access, the workspaces' state,
+// the branches and commits, a change that already has the source, the
+// title and intent, and with CheckPaths the paths of a path-scoped
+// caller), and answers the first that fails without writing anything. It then gives the target workspace's next number, records
 // version 1 with its ref refs/parley/changes/<number>/1 in the target's
 // repository, links its session, stores the change draft or open with
 // mergeable unknown, asks the auto_land guard before it stores auto_land,
@@ -75,7 +85,7 @@ type OpenInput struct {
 // collaborator returns is returned unchanged.
 func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (Change, error) {
 	co := c.collaborators()
-	o, err := c.resolve(ctx, tx, co, in)
+	o, err := c.check(ctx, tx, co, in)
 	if err != nil {
 		return Change{}, err
 	}
@@ -213,76 +223,183 @@ type opening struct {
 	targetBranch           string
 	head, base, patchID    string
 	stats                  Stats
-	paths                  []string
-	truncated              bool
-	title, intent          string
-	session                *string
-	labels                 []string
+	// files are every file the version touches, in byte order; paths the
+	// first MaxPaths of them, truncated set when there were more.
+	files, paths  []string
+	truncated     bool
+	title, intent string
+	session       *string
+	labels        []string
 }
 
-// resolve reads what the open in names and fills in its defaults.
-func (c *Component) resolve(ctx context.Context, tx *sql.Tx, co collaborators, in OpenInput) (*opening, error) {
-	o := &opening{}
-	target, found, err := c.deps.Workspaces.Workspace(ctx, tx, in.Workspace)
-	if err != nil {
+// labelPattern is what a label is.
+var labelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.:/-]{0,62}$`)
+
+// MaxLabels is the number of labels a change may have.
+const MaxLabels = 20
+
+// check runs every check of the open in, in order, and resolves it, reading
+// through q and writing nothing: the binding of a bound token, the input,
+// an explicit session, the caller's access, the state of the target and the
+// source workspace, the branches and commits of source and target, the
+// change that may already have the source, the title and the intent, and
+// the paths of a path-scoped token. The first that fails is its answer.
+func (c *Component) check(ctx context.Context, q Querier, co collaborators, in OpenInput) (*opening, error) {
+	if err := c.authorizeBinding(ctx, in.Caller, in.Workspace, in.SourceWorkspace); err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, server.NotFound(fmt.Sprintf("no workspace %q", in.Workspace))
+	if err := validate(in); err != nil {
+		return nil, err
 	}
-	o.target, o.source = target, target
-	if in.SourceWorkspace != "" && in.SourceWorkspace != in.Workspace {
-		source, found, err := c.deps.Workspaces.Workspace(ctx, tx, in.SourceWorkspace)
-		if err != nil {
+	o := &opening{}
+	if in.SessionID != nil {
+		var err error
+		if o.session, err = c.session(ctx, co, in, Workspace{}); err != nil {
 			return nil, err
 		}
-		if !found {
-			return nil, sourceNotRelated(in.SourceWorkspace, in.Workspace)
-		}
-		o.source = source
 	}
-	if o.session, err = c.session(ctx, co, in, o.source); err != nil {
+	if err := c.authorizeAccess(ctx, in.Caller, in.Workspace, in.SourceWorkspace); err != nil {
 		return nil, err
 	}
+	if err := c.resolve(ctx, q, co, in, o); err != nil {
+		return nil, err
+	}
+	if in.CheckPaths && in.Caller.Paths != nil {
+		for _, path := range o.files {
+			if !identity.MatchAny(in.Caller.Paths, path) {
+				return nil, server.PathNotAllowed(fmt.Sprintf("%s: the token may not change this file", path)).With("path", path)
+			}
+		}
+	}
+	return o, nil
+}
+
+// validate checks what the open in names by itself.
+func validate(in OpenInput) error {
+	switch {
+	case in.SourceBranch == "":
+		return server.InvalidRequest("source.branch: required")
+	case in.DependsOn != nil && *in.DependsOn < 1:
+		return server.InvalidRequest("depends_on: must be a positive integer")
+	case len(in.Labels) > MaxLabels:
+		return server.InvalidRequest(fmt.Sprintf("labels: at most %d", MaxLabels))
+	}
+	for _, l := range in.Labels {
+		if !labelPattern.MatchString(l) {
+			return server.InvalidRequest(fmt.Sprintf("labels: %q must match %s", l, labelPattern))
+		}
+	}
+	return nil
+}
+
+// resolve reads what the open in names, checks the workspaces, branches and
+// commits in order, fills in the defaults and checks the title and the
+// intent, into o.
+func (c *Component) resolve(ctx context.Context, q Querier, co collaborators, in OpenInput, o *opening) error {
+	target, found, err := c.deps.Workspaces.Workspace(ctx, q, in.Workspace)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return server.NotFound(fmt.Sprintf("no workspace %q", in.Workspace))
+	}
+	o.target, o.source = target, target
+	related := true
+	if in.SourceWorkspace != "" && in.SourceWorkspace != in.Workspace {
+		source, found, err := c.deps.Workspaces.Workspace(ctx, q, in.SourceWorkspace)
+		if err != nil {
+			return err
+		}
+		o.source = source
+		related = found && source.Fork && source.Parent == target.Slug
+		if !found {
+			o.source = Workspace{Slug: in.SourceWorkspace}
+		}
+	}
+	if target.Unusable != nil {
+		return target.Unusable
+	}
+	if o.source.Unusable != nil {
+		return o.source.Unusable
+	}
 	o.targetBranch = target.DefaultBranch
-	if o.source.Fork {
+	if o.source.Fork && related {
 		o.targetBranch = o.source.DefaultBranch
 	}
 	if in.TargetBranch != nil {
 		o.targetBranch = *in.TargetBranch
 	}
 	if o.targetRepo, err = c.deps.Repos(ctx, target.Slug); err != nil {
-		return nil, err
+		return err
+	}
+	targetHead, found, err := o.targetRepo.ResolveBranch(ctx, o.targetBranch)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", o.targetBranch, target.Slug))
+	}
+	if target.CarryPatch && o.targetBranch == target.IntegrationBranch {
+		return server.NewError("integration_branch", http.StatusForbidden,
+			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", o.targetBranch, target.Slug))
+	}
+	if !related {
+		return sourceNotRelated(in.SourceWorkspace, target.Slug)
+	}
+	if in.SessionID == nil {
+		if o.session, err = c.session(ctx, co, in, o.source); err != nil {
+			return err
+		}
 	}
 	o.sourceRepo = o.targetRepo
 	if o.source.Slug != target.Slug {
 		if o.sourceRepo, err = c.deps.Repos(ctx, o.source.Slug); err != nil {
-			return nil, err
+			return err
 		}
-	}
-	targetHead, found, err := o.targetRepo.ResolveBranch(ctx, o.targetBranch)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", o.targetBranch, target.Slug))
 	}
 	if o.head = in.Head; o.head == "" {
 		if o.head, found, err = o.sourceRepo.ResolveBranch(ctx, in.SourceBranch); err != nil {
-			return nil, err
+			return err
 		}
 		if !found {
-			return nil, server.NewError("source_not_found", http.StatusBadRequest, fmt.Sprintf("source.branch: no branch %q in %s", in.SourceBranch, o.source.Slug))
+			return server.NewError("source_not_found", http.StatusBadRequest, fmt.Sprintf("source.branch: no branch %q in %s", in.SourceBranch, o.source.Slug))
 		}
 	}
-	// A fork's repository reads its parent's objects, so the version is
-	// measured where its head is, before the head is brought into the
-	// target's repository.
-	if err := o.measure(ctx, targetHead); err != nil {
-		return nil, err
+	if o.source.Slug == target.Slug && in.SourceBranch == o.targetBranch {
+		return server.InvalidRequest(fmt.Sprintf("source.branch: %s is the target branch itself", in.SourceBranch))
+	}
+	// A fork's repository reads its parent's objects, so the commits are
+	// read and the version measured where its head is, before the head is
+	// brought into the target's repository.
+	ahead, err := o.sourceRepo.CommitsBetween(ctx, targetHead, o.head, 0)
+	if err != nil {
+		return err
+	}
+	if len(ahead) == 0 {
+		return server.NewError("nothing_to_land", http.StatusBadRequest,
+			fmt.Sprintf("source.branch: %s has no commit that %s lacks", in.SourceBranch, o.targetBranch))
+	}
+	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)
+	if err != nil {
+		return err
+	}
+	for _, cm := range commits {
+		if len(cm.Parents) > 1 {
+			return server.NewError("merge_commits_unsupported", http.StatusBadRequest,
+				fmt.Sprintf("source.branch: the merge commit %s is among the commits to land; rebase instead", cm.ID))
+		}
+	}
+	if _, _, found, err := activeOfSource(ctx, q, o.source.Slug, in.SourceBranch); err != nil || found {
+		if err != nil {
+			return err
+		}
+		return c.changeExists(ctx, q, o.source.Slug, in.SourceBranch)
+	}
+	if err := o.measure(ctx, targetHead, len(ahead)); err != nil {
+		return err
 	}
 	if err := o.describe(ctx, in); err != nil {
-		return nil, err
+		return err
 	}
 	o.labels = []string{}
 	for _, l := range in.Labels {
@@ -290,12 +407,13 @@ func (c *Component) resolve(ctx context.Context, tx *sql.Tx, co collaborators, i
 			o.labels = append(o.labels, l)
 		}
 	}
-	return o, nil
+	return nil
 }
 
 // measure computes the version's base, stats, touched paths and patch id
-// against the target's head.
-func (o *opening) measure(ctx context.Context, targetHead string) error {
+// against the target's head; ahead is the number of its commits the target
+// lacks.
+func (o *opening) measure(ctx context.Context, targetHead string, ahead int) error {
 	repo := o.sourceRepo
 	var err error
 	if o.base, err = repo.MergeBase(ctx, o.head, targetHead); err != nil {
@@ -305,21 +423,21 @@ func (o *opening) measure(ctx context.Context, targetHead string) error {
 	if err != nil {
 		return err
 	}
-	ahead, _, err := repo.AheadBehind(ctx, targetHead, o.head)
-	if err != nil {
-		return err
-	}
 	s := gitrepo.Stats(changes)
 	o.stats = Stats{Commits: ahead, FilesChanged: s.FilesChanged, Insertions: s.Insertions, Deletions: s.Deletions}
-	o.paths, o.truncated = touchedPaths(changes)
+	o.files = touchedPaths(changes)
+	o.paths, o.truncated = o.files, len(o.files) > MaxPaths
+	if o.truncated {
+		o.paths = o.files[:MaxPaths]
+	}
 	o.patchID, err = repo.PatchID(ctx, o.base, o.head)
 	return err
 }
 
 // touchedPaths are the files changes touch, both sides of a rename, in
-// byte order and each once, at most MaxPaths of them; truncated is set
-// when there were more.
-func touchedPaths(changes []gitrepo.FileChange) (paths []string, truncated bool) {
+// byte order and each once.
+func touchedPaths(changes []gitrepo.FileChange) []string {
+	var paths []string
 	for _, ch := range changes {
 		paths = append(paths, ch.Path)
 		if ch.OldPath != "" {
@@ -327,16 +445,15 @@ func touchedPaths(changes []gitrepo.FileChange) (paths []string, truncated bool)
 		}
 	}
 	slices.Sort(paths)
-	paths = slices.Compact(paths)
-	if len(paths) > MaxPaths {
-		return paths[:MaxPaths], true
-	}
-	return nonNil(paths), false
+	return nonNil(slices.Compact(paths))
 }
 
 // describe fills in the title and the intent: the caller's, or the
 // subject and the body of the head commit, the intent then the source
-// fork's purpose, each default cut to its limit.
+// fork's purpose, each default cut to its limit. A title must then be one
+// line of at most MaxTitle characters, a given intent at most MaxIntent,
+// and the intent must say something, unless the change is a draft or the
+// target workspace does not require an intent.
 func (o *opening) describe(ctx context.Context, in OpenInput) error {
 	commits, err := o.sourceRepo.ReadCommits(ctx, []string{o.head})
 	if err != nil {
@@ -359,6 +476,19 @@ func (o *opening) describe(ctx context.Context, in OpenInput) error {
 		o.intent = cut(body, MaxIntent)
 	case o.source.Fork && o.source.Purpose != nil:
 		o.intent = cut(strings.TrimSpace(*o.source.Purpose), MaxIntent)
+	}
+	switch {
+	case strings.TrimSpace(o.title) == "":
+		return server.InvalidRequest("title: must not be empty")
+	case utf8.RuneCountInString(o.title) > MaxTitle:
+		return server.InvalidRequest(fmt.Sprintf("title: at most %d characters", MaxTitle))
+	case strings.ContainsAny(o.title, "\r\n"):
+		return server.InvalidRequest("title: must be one line")
+	case utf8.RuneCountInString(o.intent) > MaxIntent:
+		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
+	case strings.TrimSpace(o.intent) == "" && !in.Draft && o.target.RequireIntent:
+		return server.NewError("intent_required", http.StatusBadRequest,
+			fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", o.target.Slug))
 	}
 	return nil
 }
@@ -478,54 +608,6 @@ func (c *Component) emit(ctx context.Context, tx *sql.Tx, caller Caller, ch Chan
 		ResourceID: strconv.FormatInt(ch.Number, 10), SessionID: ch.SessionID, Metadata: meta,
 	})
 	return err
-}
-
-// openBody is the body of POST /workspaces/:slug/changes.
-type openBody struct {
-	Source struct {
-		WorkspaceSlug *string `json:"workspace_slug"`
-		Branch        string  `json:"branch"`
-	} `json:"source"`
-	TargetBranch *string  `json:"target_branch"`
-	Title        *string  `json:"title"`
-	Intent       *string  `json:"intent"`
-	Draft        *bool    `json:"draft"`
-	DependsOn    *int64   `json:"depends_on"`
-	AutoLand     *bool    `json:"auto_land"`
-	Labels       []string `json:"labels"`
-	SessionID    *string  `json:"session_id"`
-}
-
-// openRoute opens a change in the workspace :slug from the request's body,
-// in a transaction of its own, with version 1 of kind ref: the head is on
-// the source branch already. It answers 201 with the change object.
-func (c *Component) openRoute(w http.ResponseWriter, r *http.Request) error {
-	var body openBody
-	if err := server.DecodeJSON(r, &body); err != nil {
-		return err
-	}
-	ctx := r.Context()
-	p, _ := identity.PrincipalOf(ctx)
-	in := OpenInput{
-		Workspace: server.Param(r, "slug"), SourceBranch: body.Source.Branch,
-		TargetBranch: body.TargetBranch, Title: body.Title, Intent: body.Intent, Draft: body.Draft != nil && *body.Draft,
-		DependsOn: body.DependsOn, AutoLand: body.AutoLand, Labels: body.Labels, SessionID: body.SessionID,
-		Caller: CallerOf(p), Kind: KindRef,
-	}
-	if body.Source.WorkspaceSlug != nil {
-		in.SourceWorkspace = *body.Source.WorkspaceSlug
-	}
-	var ch Change
-	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		var err error
-		ch, err = c.Open(ctx, tx, in)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	server.WriteJSON(w, http.StatusCreated, ch)
-	return nil
 }
 
 // now is the component's clock, in UTC.

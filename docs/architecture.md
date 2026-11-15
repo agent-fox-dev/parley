@@ -3451,7 +3451,7 @@ in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 `change.SchemaStep` (the step `changes`), registers its `Routes()` with
 `AddRoute`, and binds it in the start hook `changes` to the store
 (`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
-(`Repos`), `changeWorkspaces` (`Workspaces`), an adapter over
+(`Repos`), the access service (`Access`), `changeWorkspaces` (`Workspaces`), an adapter over
 `workspace.BySlug`, read through the querier it is given, so in the
 caller's transaction, with `workspace.RequireReady` as `Unusable` and the
 effective `changes.require_intent`, the event component (`Events`), the
@@ -3470,7 +3470,26 @@ cascade from `changes`; a unique partial index keeps one draft or open
 change per source branch, and a violation answers `409 change_exists`.
 
 `(*change.Component).Open(ctx, tx, change.OpenInput)` runs in the caller's
-transaction and neither begins nor commits one. It reads the target and
+transaction and neither begins nor commits one. It first runs every check
+of an open, in order and writing nothing (the unexported `check`, which
+reads through a `Querier`): the binding of a bound token, the input
+(`source.branch`, at most `MaxLabels` labels matching the label pattern,
+a positive `depends_on`), an explicit session, the caller's access, the
+target's and source's `Unusable`, then the target branch, the integration
+branch of a carry-patch target, the source being the target or a fork of
+it, the source branch, not the same branch, a commit ahead, no merge
+commit ahead, no draft or open change of the source, the title and the
+intent, and, with `CheckPaths` (which the route sets), every touched file
+against a path-scoped caller's globs (`identity.MatchAny`). Binding and
+access are `(*change.Component).Authorize(ctx, caller, target, source)`
+(`authorize.go`), exported for the other surfaces that open changes: it
+asks the access rule (`change.AccessRule`, the hub's `*access.Service`)
+for the bound token's `RelationOf` the target and source, the caller's
+`Level` on the target and `CanWrite` on the source, telling a source the
+caller reads (`403 forbidden`) from one they cannot see (`400
+source_not_related`); the admin token and the hub pass. A bound token's
+workspace reaches it as `change.Caller.Bound`, from the principal. It
+then reads the target and
 source workspaces, chooses the session (an explicit one the session linker
 must accept; else the trigger's, then the source fork's, dropped when
 refused), resolves the target and source branches, and measures the
@@ -3499,9 +3518,15 @@ the component instance, with `RegisterSessionLinker`,
 The hub registers none yet. `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
-The route `POST /workspaces/:slug/changes` (scope `changes:write`, read
-access to `:slug`, an idempotent create) opens its own transaction and
-calls `Open` with version kind `ref`.
+The route `POST /workspaces/:slug/changes` (`routes.go`; scope
+`changes:write`, read access to `:slug`, an idempotent create, and on the
+parent of a token's bound fork a contributor route) decodes the body, a
+member of the wrong type being `400 invalid_request`, opens its own
+transaction and calls `Open` with version kind `ref` and `CheckPaths`.
+Two opens of one source cannot interleave, since the store serialises
+write transactions: the second finds the first change and answers `409
+change_exists`, and the unique index answers the same should one slip
+through.
 
 ### Hub events
 

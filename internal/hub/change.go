@@ -17,7 +17,8 @@ const changeHook = "changes"
 // need the shared checks decide, and the component, bound in a start hook to
 // the store, to the place of each repository on disk, opened with the hub's
 // git, to the workspace records with their effective settings, read in the
-// caller's transaction, and to the hub's event log.
+// caller's transaction, to the access rule, which Authorize asks, and to
+// the hub's event log.
 //
 // No collaborator is registered on the component yet: without a session
 // linker an explicit session_id is refused and a defaulted one dropped;
@@ -42,6 +43,7 @@ func composeChanges(c *Composition) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
 			},
 			Workspaces: changeWorkspaces{c.workspaces.Settings()},
+			Access:     c.access,
 			Events:     c.events,
 			Now:        rt.Now,
 			Logger:     rt.Logger,

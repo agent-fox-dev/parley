@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -129,12 +128,14 @@ type Credential struct {
 }
 
 // Caller is who asks for a change or a version: the user (none for the
-// admin token and the hub), the credential, and the path globs a
-// path-scoped token is limited to (nil for none).
+// admin token and the hub), the credential, the path globs a path-scoped
+// token is limited to (nil for none), and the workspace a bound PAT is
+// bound to ("" for every other credential).
 type Caller struct {
 	UserID, Username string
 	Credential       Credential
 	Paths            []string
+	Bound            string
 }
 
 // CallerOf is the caller an authenticated principal is.
@@ -145,6 +146,9 @@ func CallerOf(p identity.Principal) Caller {
 	}
 	if p.User != nil {
 		c.UserID, c.Username = p.User.ID, p.User.Username
+	}
+	if p.Workspace != nil {
+		c.Bound = *p.Workspace
 	}
 	return c
 }
@@ -339,8 +343,8 @@ func (v Version) MarshalJSON() ([]byte, error) {
 	}{plain(v), timefmt.Time(v.CreatedAt)})
 }
 
-// Deps are what the component needs. Store, Repos and Workspaces are
-// required; every other member has a default.
+// Deps are what the component needs. Store, Repos, Workspaces and Access
+// are required; every other member has a default.
 type Deps struct {
 	// Store is the hub's store: the route opens its transaction there and
 	// a read without the caller's transaction reads it.
@@ -349,6 +353,8 @@ type Deps struct {
 	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
 	// Workspaces reads the workspace records.
 	Workspaces WorkspaceReader
+	// Access is the access rule, which Authorize asks.
+	Access AccessRule
 	// Events takes the change events, in the caller's transaction; nil
 	// discards them.
 	Events EventWriter
@@ -387,12 +393,4 @@ func (c *Component) Bind(d Deps) {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
 	c.deps = d
-}
-
-// Routes are the change routes, for the server's router.
-func (c *Component) Routes() []server.Route {
-	return []server.Route{{
-		Method: http.MethodPost, Pattern: "/workspaces/:slug/changes", Scope: "changes:write", Create: true,
-		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.openRoute,
-	}}
 }

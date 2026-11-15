@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -275,6 +276,63 @@ func (s *sessions) Record(_ context.Context, _ *sql.Tx, id, workspace string, nu
 
 // errRollback is what a test returns from a transaction to undo it.
 var errRollback = errors.New("roll back")
+
+// set sets the column of the workspace record slug to value.
+func (w *world) set(t *testing.T, slug, column string, value any) {
+	t.Helper()
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET `+column+` = ? WHERE slug = ?`, value, slug)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// member adds the user name as a member of the org acme, which reads demo,
+// and returns their id and an API key of theirs.
+func (w *world) member(t *testing.T, name string) (id, key string) {
+	t.Helper()
+	id = w.CreateUser(t, name)
+	w.AddMember(t, w.org, id)
+	return id, w.IssueKey(t, id)
+}
+
+// snapshot is what an open writes: the rows of the change tables, the
+// version refs of demo's repository and the change events in the log.
+type snapshot struct {
+	rows   map[string]int
+	refs   map[string]string
+	events int
+}
+
+func (w *world) snapshot(t *testing.T) snapshot {
+	t.Helper()
+	events := 0
+	for _, e := range w.eventsAfter(t, 0) {
+		if e.ResourceType == "change" {
+			events++
+		}
+	}
+	return snapshot{w.rows(t), gitrepotest.Refs(t, w.demo, "refs/parley/changes/"), events}
+}
+
+// refused posts body to the workspace slug with the credential and fails
+// the test unless the answer is status with errorType and the open wrote
+// nothing; it returns the answer's error object.
+func (w *world) refused(t *testing.T, slug, credential string, body any, status int, errorType string) map[string]any {
+	t.Helper()
+	before := w.snapshot(t)
+	got, out := w.post(t, slug, credential, body)
+	errObj, _ := out["error"].(map[string]any)
+	if got != status || errObj["error_type"] != errorType {
+		t.Errorf("POST %v = %d %v, want %d %s", body, got, out, status, errorType)
+	}
+	if after := w.snapshot(t); !reflect.DeepEqual(after, before) {
+		t.Errorf("a refused open wrote %+v, had %+v", after, before)
+	}
+	return errObj
+}
 
 // patFor issues a PAT of the owner with the permissions and path globs
 // (nil for none), and returns it with its token id.

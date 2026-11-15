@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -32,7 +33,7 @@ func TestOpen_FillsTheDefaults(t *testing.T) {
 	commit(t, m1, "subject", w.base, "Subject only\n", map[string]string{"s.txt": "s\n"})
 	commit(t, m1, "body", w.base, "With body\n\nThe body.\n", map[string]string{"b.txt": "b\n"})
 	commit(t, m1, "trigger", w.base, "Triggered\n", map[string]string{"t.txt": "t\n"})
-	commit(t, m2, "refused", w.base, "Refused session\n", map[string]string{"r.txt": "r\n"})
+	commit(t, m2, "refused", w.base, "Refused session\n\nWhy.\n", map[string]string{"r.txt": "r\n"})
 	commit(t, w.demo, "long", w.base, "Long\n\n"+long+"\n", map[string]string{"l.txt": "l\n"})
 	commit(t, w.demo, "explicit", w.base, "Ignored\n\nIgnored too\n", map[string]string{"e.txt": "e\n"})
 
@@ -129,7 +130,7 @@ func TestOpen_RecordsVersionOneWithItsRef(t *testing.T) {
 			files[fmt.Sprintf("many/f%04d.txt", i)] = "x\n"
 		}
 		commit(t, w.demo, "many", w.base, "Many\n", files)
-		got := w.mustPost(t, map[string]any{"source": map[string]any{"branch": "many"}})
+		got := w.mustPost(t, map[string]any{"source": map[string]any{"branch": "many"}, "intent": "many files"})
 		if paths, _ := got["paths"].([]any); len(paths) != change.MaxPaths || got["paths_truncated"] != true {
 			t.Errorf("paths has %d entries and paths_truncated is %v, want %d and true", len(paths), got["paths_truncated"], change.MaxPaths)
 		}
@@ -141,10 +142,10 @@ func TestOpen_NumbersEachWorkspacesChangesNeverGivingANumberTwice(t *testing.T) 
 	w := newWorld(t)
 	other := w.addWorkspace(t, "other")
 	for _, name := range []string{"b1", "b2"} {
-		w.branch(t, name, name+"\n")
+		w.branch(t, name, name+"\n\nWhy.\n")
 	}
-	commit(t, other, "o1", "refs/heads/main", "o1\n", map[string]string{"o1.txt": "o\n"})
-	commit(t, other, "o2", "refs/heads/main", "o2\n", map[string]string{"o2.txt": "o\n"})
+	commit(t, other, "o1", "refs/heads/main", "o1\n\nWhy.\n", map[string]string{"o1.txt": "o\n"})
+	commit(t, other, "o2", "refs/heads/main", "o2\n\nWhy.\n", map[string]string{"o2.txt": "o\n"})
 	var demo, others []any
 	refs := map[string]bool{}
 	open := func(slug, branch string) {
@@ -546,4 +547,377 @@ func TestOpen_RecordsARevertWithItsKindAndTheRevertedChange(t *testing.T) {
 	if v := w.versions(t, "demo", int64(got["number"].(float64))); len(v) != 1 || v[0]["kind"] != "ref" {
 		t.Errorf("versions = %v, want one of kind ref", v)
 	}
+}
+
+// src is a body naming the branch of the source workspace ws ("" for the
+// target).
+func src(ws, branch string) map[string]any {
+	s := map[string]any{"branch": branch}
+	if ws != "" {
+		s["workspace_slug"] = ws
+	}
+	return map[string]any{"source": s}
+}
+
+// The member m reads demo and owns the fork demo--m1; the fork
+// demo--other is the owner's, which m reads as a member.
+func TestOpen_LetsOnlyACallerWhoWritesTheSourceOpen(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	m, mKey := w.member(t, "m")
+	stranger := w.CreateUser(t, "stranger")
+	strangerKey := w.IssueKey(t, stranger)
+	m1 := w.addFork(t, "demo--m1", "main", nil, nil)
+	w.set(t, "demo--m1", "owner_id", m)
+	other := w.addFork(t, "demo--other", "main", nil, nil)
+	w.branch(t, "feat", "Feat\n\nWhy.\n")
+	commit(t, other, "feat", w.base, "Other\n\nWhy.\n", map[string]string{"o.txt": "o\n"})
+	commit(t, m1, "task", w.base, "Task\n\nWhy.\n", map[string]string{"t.txt": "t\n"})
+	commit(t, m1, "task2", w.base, "Task 2\n\nWhy.\n", map[string]string{"t2.txt": "t\n"})
+	readPAT, _ := w.patFor(t, []string{"changes:read"}, nil)
+	now := time.Now().UTC()
+	forkBound := w.IssuePAT(t, identity.PATSpec{UserID: m, Permissions: []string{"changes:write"}, Workspace: "demo--m1", CreatedAt: now})
+	demoBound := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"changes:write"}, Workspace: "demo", CreatedAt: now})
+
+	for _, c := range []struct {
+		name, credential string
+		body             map[string]any
+		status           int
+		errorType        string
+	}{
+		{"a token without changes:write", readPAT, src("", "feat"), http.StatusForbidden, "insufficient_scope"},
+		{"a user without access to the target", strangerKey, src("", "feat"), http.StatusNotFound, "not_found"},
+		{"a member naming a fork they only read", mKey, src("demo--other", "feat"), http.StatusForbidden, "forbidden"},
+		{"a member naming the target they only read", mKey, src("demo", "feat"), http.StatusForbidden, "forbidden"},
+		{"a fork-bound token naming no source workspace", forkBound, src("", "task"), http.StatusForbidden, "token_bound"},
+		{"a fork-bound token naming another fork", forkBound, src("demo--other", "feat"), http.StatusForbidden, "token_bound"},
+		{"a repository-bound token naming a fork it did not create", demoBound, src("demo--other", "feat"), http.StatusBadRequest, "source_not_related"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w.refused(t, "demo", c.credential, c.body, c.status, c.errorType)
+		})
+	}
+	t.Run("the owner of the workspace", func(t *testing.T) {
+		got := w.mustPost(t, src("", "feat"))
+		want := map[string]any{"workspace_slug": "demo", "number": 1.0, "ref": "demo#1", "state": "open", "version": 1.0,
+			"source": map[string]any{"workspace_slug": "demo", "branch": "feat"},
+			"author": map[string]any{"actor_type": "api_key", "actor_id": w.owner, "username": "owner"}}
+		for member, v := range want {
+			if !reflect.DeepEqual(got[member], v) {
+				t.Errorf("%s = %#v, want %#v", member, got[member], v)
+			}
+		}
+	})
+	for _, c := range []struct{ name, credential, branch string }{
+		{"a member from their own fork", mKey, "task"},
+		{"a fork-bound token from its fork", forkBound, "task2"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			status, got := w.post(t, "demo", c.credential, src("demo--m1", c.branch))
+			source, _ := got["source"].(map[string]any)
+			if status != http.StatusCreated || got["workspace_slug"] != "demo" || source["workspace_slug"] != "demo--m1" || got["target_branch"] != "main" {
+				t.Errorf("POST = %d %v, want 201 in demo from demo--m1 onto main", status, got)
+			}
+		})
+	}
+}
+
+func TestOpen_RefusesAWorkspaceThatIsNotReady(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	m1 := w.addFork(t, "demo--m1", "main", nil, nil)
+	commit(t, m1, "task", w.base, "Task\n\nWhy.\n", map[string]string{"t.txt": "t\n"})
+	for _, slug := range []string{"demo", "demo--m1"} {
+		for _, c := range []struct {
+			column, value, errorType string
+		}{
+			{"status", "pending", "workspace_busy"},
+			{"status", "cloning", "workspace_busy"},
+			{"maintenance", "reclone", "workspace_busy"},
+			{"status", "failed", "workspace_not_ready"},
+			{"status", "archived", "workspace_archived"},
+		} {
+			t.Run(slug+" "+c.value, func(t *testing.T) {
+				w.set(t, slug, c.column, c.value)
+				defer w.set(t, slug, "status", "ready")
+				defer w.set(t, slug, "maintenance", "")
+				w.refused(t, "demo", w.ownerKey, src("demo--m1", "task"), http.StatusConflict, c.errorType)
+			})
+		}
+	}
+	w.mustPost(t, src("demo--m1", "task"))
+}
+
+func TestOpen_RefusesAnInvalidBody(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, name := range []string{"feat", "twenty", "long", "twice", "session"} {
+		w.branch(t, name, name+"\n\nWhy.\n")
+	}
+	labels := func(n int) []any {
+		out := []any{}
+		for i := range n {
+			out = append(out, fmt.Sprintf("l%d", i))
+		}
+		return out
+	}
+	with := func(member string, value any) map[string]any {
+		body := src("", "feat")
+		body[member] = value
+		return body
+	}
+	for _, c := range []struct {
+		name      string
+		body      any
+		errorType string
+	}{
+		{"an empty body", map[string]any{}, "invalid_request"},
+		{"a source without a branch", map[string]any{"source": map[string]any{}}, "invalid_request"},
+		{"an empty branch", src("", ""), "invalid_request"},
+		{"a member of the wrong type", with("draft", "yes"), "invalid_request"},
+		{"more than twenty labels", with("labels", labels(21)), "invalid_request"},
+		{"an upper-case label", with("labels", []any{"Upper"}), "invalid_request"},
+		{"a label starting with a dash", with("labels", []any{"-x"}), "invalid_request"},
+		{"a label of 64 characters", with("labels", []any{strings.Repeat("a", 64)}), "invalid_request"},
+		{"depends_on zero", with("depends_on", 0), "invalid_request"},
+		{"depends_on negative", with("depends_on", -1), "invalid_request"},
+		{"depends_on a string", with("depends_on", "1"), "invalid_request"},
+		{"a session the linker refuses", with("session_id", sessionOther), "unknown_session"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w.refused(t, "demo", w.ownerKey, c.body, http.StatusBadRequest, c.errorType)
+		})
+	}
+	for _, c := range []struct {
+		name, branch, member string
+		value                any
+		want                 map[string]any
+	}{
+		{"twenty labels", "twenty", "labels", labels(20), map[string]any{"labels": labels(20)}},
+		{"a label of 63 characters", "long", "labels", []any{strings.Repeat("a", 63)}, map[string]any{"labels": []any{strings.Repeat("a", 63)}}},
+		{"a repeated label", "twice", "labels", []any{"a", "a"}, map[string]any{"labels": []any{"a"}}},
+		{"a session the linker accepts", "session", "session_id", sessionOne, map[string]any{"session_id": sessionOne, "sessions": []any{sessionOne}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			body := src("", c.branch)
+			body[c.member] = c.value
+			got := w.mustPost(t, body)
+			for member, v := range c.want {
+				if !reflect.DeepEqual(got[member], v) {
+					t.Errorf("%s = %#v, want %#v", member, got[member], v)
+				}
+			}
+		})
+	}
+}
+
+// demo has merged, whose history ahead of main holds a merge commit, and
+// behind, at main's commit; elsewhere is the owner's unrelated workspace,
+// hidden one the owner cannot see, and cp a carry-patch workspace whose
+// integration branch is integration.
+func TestOpen_AnswersTheFirstFailingCheckOfTheSourceAndTarget(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, "elsewhere")
+	w.addWorkspace(t, "hidden")
+	stranger := w.CreateUser(t, "stranger")
+	w.set(t, "hidden", "owner_id", stranger)
+	w.set(t, "hidden", "org_id", w.CreateOrg(t, "strangers"))
+	cp := w.addWorkspace(t, "cp")
+	w.set(t, "cp", "workspace_mode", "carry_patch")
+	w.set(t, "cp", "integration_branch", "integration")
+	commit(t, cp, "integration", "refs/heads/main", "Upstream plus patches\n", map[string]string{"i.txt": "i\n"})
+	commit(t, cp, "patch", "refs/heads/main", "Patch\n\nWhy.\n", map[string]string{"p.txt": "p\n"})
+	side := commit(t, w.demo, "side", w.base, "Side\n", map[string]string{"s.txt": "s\n"})
+	first := commit(t, w.demo, "merged", w.base, "First\n", map[string]string{"f.txt": "f\n"})
+	if _, err := gitrepotest.Run(w.demo, "commit refs/heads/merged\n"+committer+data("Merge side\n\nWhy.\n")+
+		"from "+first+"\nmerge "+side+"\n\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/behind", w.base)
+	w.branch(t, "feat", "Feat\n\nWhy.\n")
+
+	body := func(ws, branch, target string) map[string]any {
+		b := src(ws, branch)
+		if target != "" {
+			b["target_branch"] = target
+		}
+		return b
+	}
+	for _, c := range []struct {
+		name, slug string
+		body       map[string]any
+		status     int
+		errorType  string
+	}{
+		{"the target branch is missing", "demo", body("", "feat", "nope"), http.StatusBadRequest, "target_not_found"},
+		{"the target is the integration branch", "cp", body("", "patch", "integration"), http.StatusForbidden, "integration_branch"},
+		{"the source workspace is unknown", "demo", body("ghost", "feat", ""), http.StatusBadRequest, "source_not_related"},
+		{"the source workspace is invisible", "demo", body("hidden", "main", ""), http.StatusBadRequest, "source_not_related"},
+		{"the source workspace is unrelated", "demo", body("elsewhere", "main", ""), http.StatusBadRequest, "source_not_related"},
+		{"the source branch is missing", "demo", body("", "nope", ""), http.StatusBadRequest, "source_not_found"},
+		{"source and target are one branch", "demo", body("", "main", "main"), http.StatusBadRequest, "invalid_request"},
+		{"nothing to land", "demo", body("", "behind", ""), http.StatusBadRequest, "nothing_to_land"},
+		{"a merge commit ahead", "demo", body("", "merged", ""), http.StatusBadRequest, "merge_commits_unsupported"},
+		{"no target branch and no source branch", "demo", body("", "nope", "nope"), http.StatusBadRequest, "target_not_found"},
+		{"an unrelated source without the branch", "demo", body("elsewhere", "nope", ""), http.StatusBadRequest, "source_not_related"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w.refused(t, c.slug, w.ownerKey, c.body, c.status, c.errorType)
+		})
+	}
+	t.Run("a patch branch of a carry-patch workspace", func(t *testing.T) {
+		if status, got := w.post(t, "cp", w.ownerKey, body("", "patch", "release")); status != http.StatusCreated {
+			t.Errorf("POST = %d %v, want 201", status, got)
+		}
+	})
+}
+
+func TestOpen_ChecksTheTitleAndTheIntent(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	lax := w.addWorkspace(t, "lax")
+	w.set(t, "lax", "settings", `{"changes.require_intent":false}`)
+	commit(t, lax, "bare", "refs/heads/main", "Bare\n", map[string]string{"b.txt": "b\n"})
+	w.branch(t, "feat", "Feat\n\nWhy.\n")
+	w.branch(t, "bare", "Bare\n")
+	w.branch(t, "draft", "Draft\n")
+	w.branch(t, "full", "Full\n")
+	commit(t, w.demo, "nosubject", w.base, "\nOnly a body.\n", map[string]string{"n.txt": "n\n"})
+	subject := strings.Repeat("s", 250)
+	commit(t, w.demo, "longsubject", w.base, subject+"\n\nWhy.\n", map[string]string{"l.txt": "l\n"})
+
+	with := func(branch string, members ...any) map[string]any {
+		body := src("", branch)
+		for i := 0; i < len(members); i += 2 {
+			body[members[i].(string)] = members[i+1]
+		}
+		return body
+	}
+	for _, c := range []struct {
+		name      string
+		body      map[string]any
+		errorType string
+	}{
+		{"an empty title", with("feat", "title", ""), "invalid_request"},
+		{"a title of 201 characters", with("feat", "title", strings.Repeat("t", 201)), "invalid_request"},
+		{"a title with a line break", with("feat", "title", "a\nb"), "invalid_request"},
+		{"a head commit without a subject", with("nosubject"), "invalid_request"},
+		{"an intent of 16,001 characters", with("feat", "intent", strings.Repeat("i", 16001)), "invalid_request"},
+		{"no intent and a commit without a body", with("bare"), "intent_required"},
+		{"an intent of white space", with("feat", "intent", "  \n"), "intent_required"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w.refused(t, "demo", w.ownerKey, c.body, http.StatusBadRequest, c.errorType)
+		})
+	}
+	for _, c := range []struct {
+		name, slug string
+		body       map[string]any
+		want       map[string]any
+	}{
+		{"the longest title and intent", "demo", with("full", "title", strings.Repeat("t", 200), "intent", strings.Repeat("i", 16000)),
+			map[string]any{"title": strings.Repeat("t", 200)}},
+		{"a draft without an intent", "demo", with("draft", "draft", true), map[string]any{"intent": "", "state": "draft"}},
+		{"no intent where none is required", "lax", with("bare"), map[string]any{"intent": ""}},
+		{"a long subject", "demo", with("longsubject"), map[string]any{"title": subject[:change.MaxTitle]}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			status, got := w.post(t, c.slug, w.ownerKey, c.body)
+			if status != http.StatusCreated {
+				t.Fatalf("POST = %d %v, want 201", status, got)
+			}
+			for member, v := range c.want {
+				if got[member] != v {
+					t.Errorf("%s = %.40q, want %.40q", member, got[member], v)
+				}
+			}
+		})
+	}
+}
+
+func TestOpen_RefusesASecondChangeOfTheSameSource(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, name := range []string{"feat", "drafted", "race"} {
+		w.branch(t, name, name+"\n\nWhy.\n")
+	}
+	w.mustPost(t, src("", "feat"))
+	w.mustPost(t, map[string]any{"source": map[string]any{"branch": "drafted"}, "draft": true})
+	for _, c := range []struct {
+		branch string
+		number float64
+	}{{"feat", 1}, {"drafted", 2}} {
+		t.Run(c.branch, func(t *testing.T) {
+			errObj := w.refused(t, "demo", w.ownerKey, src("", c.branch), http.StatusConflict, "change_exists")
+			want := map[string]any{"workspace_slug": "demo", "number": c.number, "ref": fmt.Sprintf("demo#%v", c.number)}
+			if !reflect.DeepEqual(errObj["details"], want) {
+				t.Errorf("details = %v, want %v", errObj["details"], want)
+			}
+		})
+	}
+	t.Run("after the change is abandoned", func(t *testing.T) {
+		if err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+			return change.AbandonChange(context.Background(), tx, "demo", 1, "abandoned", time.Now())
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := w.mustPost(t, src("", "feat")); got["number"] != 3.0 {
+			t.Errorf("number = %v, want 3", got["number"])
+		}
+	})
+	t.Run("concurrent opens", func(t *testing.T) {
+		var wg sync.WaitGroup
+		statuses := make([]int, 8)
+		types := make([]any, 8)
+		for i := range statuses {
+			wg.Go(func() {
+				status, raw := w.Call(t, http.MethodPost, "/api/v1/workspaces/demo/changes", w.ownerKey, src("", "race"))
+				var out struct{ Error map[string]any }
+				_ = json.Unmarshal(raw, &out)
+				statuses[i], types[i] = status, out.Error["error_type"]
+			})
+		}
+		wg.Wait()
+		created := 0
+		for i, status := range statuses {
+			switch {
+			case status == http.StatusCreated:
+				created++
+			case status != http.StatusConflict || types[i] != "change_exists":
+				t.Errorf("an open answered %d %v, want 201 or 409 change_exists", status, types[i])
+			}
+		}
+		var changes, versions int
+		if err := w.Store.Main().QueryRow(`SELECT COUNT(*), (SELECT COUNT(*) FROM change_versions v WHERE v.workspace_slug = c.workspace_slug AND v.number = c.number)
+			FROM changes c WHERE source_branch = 'race'`).Scan(&changes, &versions); err != nil {
+			t.Fatal(err)
+		}
+		if created != 1 || changes != 1 || versions != 1 {
+			t.Errorf("%d opens created, %d changes and %d versions stored, want one of each", created, changes, versions)
+		}
+	})
+}
+
+// The token may write docs/**; earlier was committed by someone else.
+func TestOpen_RefusesAFileOutsideAPathScopedToken(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	commit(t, w.demo, "docs", w.base, "Docs\n\nWhy.\n", map[string]string{"docs/a.md": "a\n"})
+	commit(t, w.demo, "mixed", w.base, "Mixed\n\nWhy.\n", map[string]string{"docs/a.md": "a\n", "src/x.go": "x\n", "src/y.go": "y\n"})
+	commit(t, w.demo, "earlier", w.base, "Earlier\n\nWhy.\n", map[string]string{"src/x.go": "x\n"})
+	pat, _ := w.patFor(t, []string{"changes:write"}, []string{"docs/**"})
+	for _, branch := range []string{"mixed", "earlier"} {
+		t.Run(branch, func(t *testing.T) {
+			errObj := w.refused(t, "demo", pat, src("", branch), http.StatusForbidden, "path_not_allowed")
+			if errObj["path"] != "src/x.go" {
+				t.Errorf("error.path = %v, want src/x.go", errObj["path"])
+			}
+		})
+	}
+	t.Run("docs only", func(t *testing.T) {
+		if status, got := w.post(t, "demo", pat, src("", "docs")); status != http.StatusCreated {
+			t.Errorf("POST = %d %v, want 201", status, got)
+		}
+	})
 }

@@ -3598,19 +3598,23 @@ kind `ref`.
 ## `POST /api/v1/workspaces/{slug}/changes`
 
 Opens a change in the workspace `{slug}`, the target workspace. It needs,
-for a personal access token, `changes:write`, and read access to `{slug}`.
-The body:
+for a personal access token, `changes:write`, read access to `{slug}` and
+write access to the source workspace: an org member who only reads
+`{slug}` opens a change from a branch of their own task fork of it. A
+token bound to a task fork reaches the fork's parent on this route only to
+open a change whose `source.workspace_slug` is that fork; any other bound
+token opens only from a workspace its binding covers. The body:
 
 | Member | Meaning |
 |---|---|
 | `source` | required: `{"workspace_slug"?, "branch"}`; `workspace_slug` defaults to `{slug}` |
 | `target_branch` | defaults to the fork's base branch for a fork source, else to the workspace's default branch |
-| `title` | defaults to the subject of the head commit, cut to 200 characters |
-| `intent` | defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters |
+| `title` | one line of at most 200 characters; defaults to the subject of the head commit, cut to 200 characters |
+| `intent` | at most 16,000 characters; defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters; required (not empty or white space) unless `draft` is `true` or the target's setting `changes.require_intent` is `false` |
 | `draft` | `true` opens the change as a draft |
-| `depends_on` | the number of the change this one depends on |
+| `depends_on` | the number of the change this one depends on, a positive integer |
 | `auto_land` | defaults to `false` |
-| `labels` | defaults to `[]`; a repeated label is kept once |
+| `labels` | defaults to `[]`; at most 20, each matching `^[a-z0-9][a-z0-9_.:/-]{0,62}$`; a repeated label is kept once |
 | `session_id` | defaults to the session recorded on the source fork; a defaulted session the session rule refuses is dropped |
 
 ```json
@@ -3633,17 +3637,42 @@ The open writes `parley.change.version` for version 1, with `ref`,
 `target_branch`, `source_workspace`, `source_branch`, `depends_on` and
 `was_draft` (`false`). Both have `resource_type` `change`, `resource_id`
 the number, the target workspace and the change's session. A refused open
-writes no change, version or event.
+writes no change, version, ref under `refs/parley/changes` or event.
+
+The checks run in this order, and a request that fails several gets the
+answer of the first: the token's binding; the scope and read access to
+`{slug}`; the body; `session_id`; write access to the source workspace;
+the state of the target and the source workspace; the target branch
+exists; it is not the integration branch of a carry-patch workspace; the
+source workspace is `{slug}` or a fork of it; the source branch exists;
+it is not the target branch of the same workspace; it has a commit the
+target branch lacks; none of those is a merge commit; no draft or open
+change has this source; the title and the intent; for a path-scoped
+token, every file the version changes against its base matches one of
+the token's globs. Of two opens of one source at the same time, one
+answers `201` and the other `409` `change_exists`.
 
 | Status | When |
 |---|---|
 | `201 Created` | the change, as above; a replay of a recorded `Idempotency-Key` with the same body answers the first answer |
-| `400` `invalid_request` | a body member of the wrong type; no `title` while the head commit has no subject |
-| `400` `source_not_related` | no source workspace `source.workspace_slug` |
+| `400` `invalid_request` | a body member of the wrong type; no `source.branch`; more than 20 labels or a label that does not match; a `depends_on` below 1; the source branch is the target branch of the same workspace; a title that is empty, longer than 200 characters or more than one line, also no `title` while the head commit has no subject; an intent longer than 16,000 characters |
+| `400` `intent_required` | the intent is empty or white space, the change is not a draft and the target requires an intent |
+| `400` `merge_commits_unsupported` | a merge commit is among the commits the target branch lacks |
+| `400` `nothing_to_land` | the source branch has no commit the target branch lacks |
+| `400` `source_not_related` | the source workspace does not exist, the caller cannot see it, or it is neither `{slug}` nor a fork of it |
 | `400` `source_not_found` | no branch `source.branch` in the source workspace |
 | `400` `target_not_found` | no branch `target_branch` in the target workspace |
 | `400` `unknown_session` | the `session_id` is not accepted |
+| `403` `forbidden` | the caller reads the source workspace but cannot write it |
+| `403` `insufficient_scope` | a personal access token without `changes:write` |
+| `403` `integration_branch` | `target_branch` is the integration branch of a carry-patch workspace, which the hub rebuilds |
+| `403` `path_not_allowed` | a path-scoped token, and a file of the version matches none of its globs; `error.path` names the first such file in byte order |
+| `403` `token_bound` | a token bound to a task fork, on the fork's parent, with another `source.workspace_slug` or none |
+| `404` `not_found` | the caller cannot read `{slug}` |
 | `409` `change_exists` | another draft or open change has this source; `details` is `{"workspace_slug", "number", "ref"}` of that change |
+| `409` `workspace_busy` | the target or the source workspace is pending, cloning, or under a reclone, archive or delete |
+| `409` `workspace_not_ready` | the target or the source workspace failed its clone |
+| `409` `workspace_archived` | the target or the source workspace is archived |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
 
 ## Admin routes
