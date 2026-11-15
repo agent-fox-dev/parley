@@ -107,7 +107,9 @@ const (
 // workspace and target branch whose head its head is built on, and measures
 // the version from that change's head, so that a change of a stack counts
 // only its own commits; with none below, the link is cleared and the
-// version keeps the merge base with its target branch. Its column of the
+// version keeps the merge base with its target branch. The depends_on an
+// open or a PATCH names is checked and taken in place of that rule, for
+// version 1 of an open. Its column of the
 // change record, the commit a change must sit on once the change below it
 // landed, is added by StackStep.
 //

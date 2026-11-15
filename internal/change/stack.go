@@ -3,8 +3,11 @@ package change
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -30,37 +33,162 @@ func (c *Component) StackLinker() StackLinker { return stacks{c} }
 // stores through the component's setters.
 type stacks struct{ c *Component }
 
-// LinkVersion links the change ch, whose new version is v, to the nearest
-// change below its head, or to none, and measures the version from that
-// change's head or, with none, leaves the merge base with the target
-// branch that recording the version measured.
-func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Version, _ *int64) error {
+// LinkVersion links the change ch, whose new version is v, and measures
+// the version from the head of the change it now depends on. The change
+// dependsOn names, which only an open passes, for the first version, is
+// the link when it can be one (else the invalid_dependency error); without
+// it, the link is the nearest change below the head, or none, which
+// leaves the merge base with the target branch that recording the version
+// measured.
+func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Version, dependsOn *int64) error {
+	if dependsOn != nil {
+		return s.linkTo(ctx, tx, ch, *dependsOn)
+	}
 	lower, err := s.below(ctx, tx, ch, v.HeadSHA)
 	if err != nil {
 		return err
 	}
-	var link *int64
-	if lower != nil {
-		link = &lower.number
+	if lower == nil {
+		return s.store(ctx, tx, ch, nil, nil)
 	}
+	return s.store(ctx, tx, ch, &lower.number, &lower.head)
+}
+
+// SetDependsOn links the change ch to the change a request names, as
+// LinkVersion does an explicit link, or, for nil, unlinks it and measures
+// it from its merge base with the target branch; the change already
+// linked so is left as it is. The commit the change's mergeability is
+// computed against moves with the link, so its check is scheduled again.
+func (s stacks) SetDependsOn(ctx context.Context, tx *sql.Tx, ch Change, dependsOn *int64) error {
+	if sameLink(ch.DependsOn, dependsOn) {
+		return nil
+	}
+	// The other members of the request, a new target branch among them,
+	// were stored before.
+	ch, err := readChange(ctx, tx, ch.WorkspaceSlug, ch.Number)
+	if err != nil {
+		return err
+	}
+	if dependsOn != nil {
+		err = s.linkTo(ctx, tx, ch, *dependsOn)
+	} else {
+		err = s.unlink(ctx, tx, ch)
+	}
+	if err != nil {
+		return err
+	}
+	return s.c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number)
+}
+
+// linkTo links the change ch to the change number of its workspace, which
+// a caller named, and, when ch is built on that change's head, measures ch
+// from it. A change that is not built on it keeps its base until it is
+// restacked onto it.
+func (s stacks) linkTo(ctx context.Context, tx *sql.Tx, ch Change, number int64) error {
+	lower, err := checkDependency(ctx, tx, ch, number)
+	if err != nil {
+		return err
+	}
+	repo, err := s.c.deps.Repos(ctx, ch.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	built, err := repo.IsAncestor(ctx, lower.HeadSHA, ch.HeadSHA)
+	if err != nil {
+		return err
+	}
+	var base *string
+	if built {
+		base = &lower.HeadSHA
+	}
+	return s.store(ctx, tx, ch, &number, base)
+}
+
+// unlink unlinks the change ch and measures it from the merge base of its
+// head with its target branch; with the target branch missing it keeps its
+// base, as a version recorded then does.
+func (s stacks) unlink(ctx context.Context, tx *sql.Tx, ch Change) error {
+	repo, err := s.c.deps.Repos(ctx, ch.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	target, found, err := repo.ResolveBranch(ctx, ch.TargetBranch)
+	if err != nil {
+		return err
+	}
+	var base *string
+	if found {
+		mergeBase, err := repo.MergeBase(ctx, ch.HeadSHA, target)
+		if err != nil {
+			return err
+		}
+		base = &mergeBase
+	}
+	return s.store(ctx, tx, ch, nil, base)
+}
+
+// store stores link as the depends_on of the change ch and base, unless
+// nil, as the base of its current version, each only when it differs from
+// what ch has.
+func (s stacks) store(ctx context.Context, tx *sql.Tx, ch Change, link *int64, base *string) error {
 	if !sameLink(ch.DependsOn, link) {
 		if err := s.c.SetDependsOn(ctx, tx, ch.WorkspaceSlug, ch.Number, link); err != nil {
 			return err
 		}
 	}
-	if lower == nil || baseColumn(ch.BaseSHA) == lower.head {
+	if base == nil || baseColumn(ch.BaseSHA) == *base {
 		return nil
 	}
-	return s.c.SetBase(ctx, tx, ch.WorkspaceSlug, ch.Number, lower.head)
+	return s.c.SetBase(ctx, tx, ch.WorkspaceSlug, ch.Number, *base)
 }
 
-// SetDependsOn stores the link a request names, and writes nothing when the
-// change already has it.
-func (s stacks) SetDependsOn(ctx context.Context, tx *sql.Tx, ch Change, dependsOn *int64) error {
-	if sameLink(ch.DependsOn, dependsOn) {
-		return nil
+// checkDependency reads the change number of the workspace of the change
+// ch, which a caller names as the one ch depends on, and answers 400
+// invalid_dependency when it cannot be: no such change, ch itself, a
+// change into another target branch, one that is neither draft nor open,
+// or one that already sits on ch, which would close a cycle.
+func checkDependency(ctx context.Context, q Querier, ch Change, number int64) (Change, error) {
+	refuse := func(format string, args ...any) (Change, error) {
+		return Change{}, server.NewError("invalid_dependency", http.StatusBadRequest, "depends_on: "+fmt.Sprintf(format, args...))
 	}
-	return s.c.SetDependsOn(ctx, tx, ch.WorkspaceSlug, ch.Number, dependsOn)
+	if number == ch.Number {
+		return refuse("%s cannot depend on itself", ch.Ref)
+	}
+	lower, err := readChange(ctx, q, ch.WorkspaceSlug, number)
+	switch {
+	case errors.Is(err, ErrChangeNotFound):
+		return refuse("no change %s", Ref(ch.WorkspaceSlug, number))
+	case err != nil:
+		return Change{}, err
+	case lower.TargetBranch != ch.TargetBranch:
+		return refuse("%s targets %s, not %s", lower.Ref, lower.TargetBranch, ch.TargetBranch)
+	case lower.State != StateDraft && lower.State != StateOpen:
+		return refuse("%s is %s", lower.Ref, lower.State)
+	}
+	seen := map[int64]bool{number: true}
+	for down := lower.DependsOn; down != nil && !seen[*down]; {
+		if *down == ch.Number {
+			return refuse("%s already depends on %s", lower.Ref, ch.Ref)
+		}
+		seen[*down] = true
+		next, err := linkOf(ctx, q, ch.WorkspaceSlug, *down)
+		if err != nil {
+			return Change{}, err
+		}
+		down = next
+	}
+	return lower, nil
+}
+
+// linkOf is the depends_on of the change number of the workspace, nil for
+// none or for no such change.
+func linkOf(ctx context.Context, q Querier, workspace string, number int64) (*int64, error) {
+	var link *int64
+	err := q.QueryRowContext(ctx, `SELECT depends_on FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&link)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return link, err
 }
 
 // candidate is a change a new head may be built on: its number and head.

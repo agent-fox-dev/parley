@@ -3593,7 +3593,7 @@ The change object:
 |---|---|
 | `state` | `draft`, `open`, `landed` or `abandoned` |
 | `version`, `head_sha`, `base_sha` | the current version, its head and its base: the head of the change it depends on; with none, the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; `null` when the head shares no history with the target branch |
-| `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first. At open and on every new version the hub sets `depends_on` from the commit graph: to the nearest draft or open change of the same workspace and target branch whose head is a proper ancestor of the new head (the fewest commits between the two heads, the lowest number on a tie), or to `null` when there is none |
+| `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first. At open and on every new version the hub sets `depends_on` from the commit graph: to the nearest draft or open change of the same workspace and target branch whose head is a proper ancestor of the new head (the fewest commits between the two heads, the lowest number on a tie), or to `null` when there is none. A `depends_on` the caller names at open is the link of version 1 instead; every later version is linked from the commit graph again. A `PATCH` sets or clears it (see [Modifying a change](#modifying-a-change)) |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
 | `mergeable`, `conflict` | whether the commits of the current version that the onto-commit lacks rebase onto the onto-commit, the commit the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
@@ -3662,7 +3662,7 @@ token opens only from a workspace its binding covers. The body:
 | `title` | one line of at most 200 characters; defaults to the subject of the head commit, cut to 200 characters |
 | `intent` | at most 16,000 characters; defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters; required (not empty or white space) unless `draft` is `true` or the target's setting `changes.require_intent` is `false` |
 | `draft` | `true` opens the change as a draft |
-| `depends_on` | the number of the change this one depends on, a positive integer |
+| `depends_on` | the number of the change this one depends on, a positive integer: a draft or open change of `{slug}` with the same target branch. It is the change's link for version 1 in place of the one the commit graph gives, and `base_sha` is that change's head when the source branch is built on it |
 | `auto_land` | defaults to `false` |
 | `labels` | defaults to `[]`; at most 20, each matching `^[a-z0-9][a-z0-9_.:/-]{0,62}$`; a repeated label is kept once |
 | `session_id` | defaults to the session recorded on the source fork; a defaulted session the session rule refuses is dropped |
@@ -3700,7 +3700,7 @@ target branch lacks; it shares history with the target branch; none of
 the commits the target lacks is a merge commit; no draft or open
 change has this source; the title and the intent; for a path-scoped
 token, every file the version changes against its base matches one of
-the token's globs. Of two opens of one source at the same time, one
+the token's globs; the change `depends_on` names. Of two opens of one source at the same time, one
 answers `201` and the other `409` `change_exists`.
 
 | Status | When |
@@ -3708,6 +3708,7 @@ answers `201` and the other `409` `change_exists`.
 | `201 Created` | the change, as above; a replay of a recorded `Idempotency-Key` with the same body answers the first answer |
 | `400` `invalid_request` | a body member of the wrong type; no `source.branch`; more than 20 labels or a label that does not match; a `depends_on` below 1; the source branch is the target branch of the same workspace; a title that is empty, longer than 200 characters or more than one line, also no `title` while the head commit has no subject; an intent longer than 16,000 characters |
 | `400` `intent_required` | the intent is empty or white space, the change is not a draft and the target requires an intent |
+| `400` `invalid_dependency` | `depends_on` names no change of `{slug}`, a change into another target branch, or a change that is neither draft nor open |
 | `400` `merge_commits_unsupported` | a merge commit is among the commits the target branch lacks |
 | `400` `nothing_to_land` | the source branch has no commit the target branch lacks |
 | `400` `source_not_related` | the source workspace does not exist, the caller cannot see it, or it is neither `{slug}` nor a fork of it |
@@ -3989,6 +3990,24 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   when a stored value changes; editing `title`, `intent`, `labels` or
   `auto_land` writes no event, and the events of a retarget and of a move
   from draft to open come after them, so they carry the edited `title`.
+  The member `depends_on`, a change number or `null` (another type is
+  `400` `invalid_request`), links a draft or open change to another or
+  unlinks it, after the other members are stored; on a landed or
+  abandoned change it is ignored, and the link the change already has is
+  no edit. A number must name a draft or open change of `{slug}` with
+  the same target branch, neither the change itself nor one that already
+  depends on it, directly or through others: else `400`
+  `invalid_dependency`, and nothing of the body is applied. The change
+  then depends on it, and when its head has that change's head as an
+  ancestor `base_sha` becomes that head, with `stats`, `paths` and
+  `paths_truncated` measured against it; otherwise the base stays.
+  `null` clears the link, and `base_sha` becomes the merge base of
+  `head_sha` and the target branch's head (the base stays while the
+  target branch does not exist), with `stats`, `paths` and
+  `paths_truncated` measured against it. A new base is also the current
+  version's: its `base_sha`, `stats` and `patch_equivalent_to` are
+  measured again. Either way `mergeable` becomes `unknown` and is checked
+  again, and the `PATCH` writes no event.
 - `POST …/abandon` takes no body or a JSON object (no body is the same as
   `{}`) with two optional members: `reason`, a string, and `dependants`,
   `"reparent"` or `"abandon"`; another type, `null`, or another value of

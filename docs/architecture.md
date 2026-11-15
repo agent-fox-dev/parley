@@ -3664,9 +3664,20 @@ it differs and, for a link, moves the version's base to that change's head
 through `SetBase`, so that the stats, paths and patch id count only the
 change's own commits; with none below, it clears the link and the version
 keeps the merge base with the target branch that measuring it found. The
-`depends_on` an open names is not taken: the link from the commit graph
-stands. Its `SetDependsOn` (for `PATCH`) stores the value given and writes
-nothing for the value the change already has. `ReadChange(ctx, q, workspace, number)` reads
+`depends_on` an open names is the link of version 1 instead (later
+versions are linked from the commit graph); `SetDependsOn` (for `PATCH`)
+links to the number given the same way, or, for `null`, clears the link
+and moves the base to the merge base of the head and the target branch's
+head (kept while the target branch is missing), then schedules the
+change's mergeability check; the link the change already has writes
+nothing. An explicit link is checked first by `checkDependency`, one
+function for both: a number that names no change of the workspace, the
+change itself, a change into another target branch, one neither draft nor
+open, or one whose chain of `depends_on` links, walked down, reaches the
+change is `400 invalid_dependency`, which rolls back the open's or the
+`PATCH`'s transaction. An accepted link moves the base to the lower
+change's head only when the head is built on it (`IsAncestor`); otherwise
+the base stays. `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
 The change's `dependants` are not stored: every read derives them as the

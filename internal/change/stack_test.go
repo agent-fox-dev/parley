@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"reflect"
 	"slices"
 	"testing"
@@ -213,5 +214,138 @@ func TestLinkVersion_MeasuresADependantByItsOwnCommits(t *testing.T) {
 	b := w.read(t, w.openBranch(t, "b", nil).Number)
 	if b.Stats.Commits != 1 || b.Stats.FilesChanged != 1 || !reflect.DeepEqual(b.Paths, []string{"b.txt"}) {
 		t.Errorf("stats, paths = %+v, %v; want 1 commit, 1 file, [b.txt]", b.Stats, b.Paths)
+	}
+}
+
+func TestDependsOn_LinksTheChangeToTheOneTheCallerNames(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	cases := []struct {
+		name string
+		// send opens the changes, each branch named with the prefix p,
+		// sends the request that names the lower change and returns its
+		// answer and the lower change.
+		send func(t *testing.T, p string) (int, map[string]any, change.Change)
+		// want is the status of the answer; built says whether the change
+		// is built on the lower change's head.
+		want  int
+		built bool
+	}{
+		{"at open, the later of two changes with the same head", func(t *testing.T, p string) (int, map[string]any, change.Change) {
+			a := w.stacked(t, p+"a")[0]
+			gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/"+p+"a2", a.HeadSHA)
+			lower := w.openBranch(t, p+"a2", nil)
+			commit(t, w.demo, p+"b", a.HeadSHA, "B\n\nWhy.\n", map[string]string{p + "b.txt": "b\n"})
+			status, got := w.post(t, "demo", w.ownerKey, map[string]any{"source": map[string]any{"branch": p + "b"}, "depends_on": lower.Number})
+			return status, got, lower
+		}, http.StatusCreated, true},
+		{"by PATCH, built on the lower change, after its link was cleared", func(t *testing.T, p string) (int, map[string]any, change.Change) {
+			s := w.stacked(t, p+"a", p+"b")
+			if status, got := w.patch(t, s[1].Number, w.ownerKey, `{"depends_on":null}`); status != http.StatusOK {
+				t.Fatalf("PATCH depends_on null = %d %v", status, got)
+			}
+			status, got := w.patch(t, s[1].Number, w.ownerKey, map[string]any{"depends_on": s[0].Number})
+			return status, got, s[0]
+		}, http.StatusOK, true},
+		{"by PATCH, built on main only", func(t *testing.T, p string) (int, map[string]any, change.Change) {
+			lower := w.stacked(t, p+"a")[0]
+			w.branch(t, p+"b", "B\n\nWhy.\n")
+			status, got := w.patch(t, w.openBranch(t, p+"b", nil).Number, w.ownerKey, map[string]any{"depends_on": lower.Number})
+			return status, got, lower
+		}, http.StatusOK, false},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, got, lower := c.send(t, fmt.Sprintf("e%d", i))
+			if status != c.want || got["depends_on"] != float64(lower.Number) {
+				t.Fatalf("answer = %d %v, want %d with depends_on %d", status, got, c.want, lower.Number)
+			}
+			if c.built && got["base_sha"] != lower.HeadSHA {
+				t.Errorf("base_sha = %v, want the lower change's head %s", got["base_sha"], lower.HeadSHA)
+			}
+			if number, _ := got["number"].(float64); !slices.Contains(w.read(t, lower.Number).Dependants, int64(number)) {
+				t.Errorf("the dependants of %d = %v, want %v among them", lower.Number, w.read(t, lower.Number).Dependants, number)
+			}
+		})
+	}
+}
+
+func TestDependsOn_RefusesALinkToAChangeTheChangeCannotSitOn(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	s := w.stacked(t, "a", "b", "c")
+	_, abandoned, landed := closedChanges(t, w)
+	w.branch(t, "r", "R\n\nWhy.\n")
+	release := w.openBranch(t, "r", func(in *change.OpenInput) { in.TargetBranch = new("release") }).Number
+	w.branch(t, "new", "New\n\nWhy.\n")
+	a := s[0].Number
+	cases := []struct {
+		name      string
+		dependsOn int64
+		// title also renames the change; atOpen also sends the value at
+		// open.
+		title, atOpen bool
+	}{
+		{"an unknown change", 999, false, true},
+		{"the change itself, with a title", a, true, false},
+		{"a change directly above it", s[1].Number, false, false},
+		{"a change above it through another", s[2].Number, false, false},
+		{"a change into another target branch", release, false, true},
+		{"a landed change", landed, false, true},
+		{"an abandoned change", abandoned, false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := map[string]any{"depends_on": c.dependsOn}
+			if c.title {
+				body["title"] = "renamed"
+			}
+			before, _ := w.change(t, a)
+			at := w.updatedAt(t, a)
+			if status, got := w.patch(t, a, w.ownerKey, body); status != http.StatusBadRequest || errorType(got) != "invalid_dependency" {
+				t.Errorf("PATCH %v = %d %v, want 400 invalid_dependency", body, status, got)
+			}
+			if after, _ := w.change(t, a); !reflect.DeepEqual(after, before) || w.updatedAt(t, a) != at {
+				t.Errorf("a refused PATCH left %v, had %v", after, before)
+			}
+			if c.atOpen {
+				w.refused(t, "demo", w.ownerKey, map[string]any{"source": map[string]any{"branch": "new"}, "depends_on": c.dependsOn}, http.StatusBadRequest, "invalid_dependency")
+			}
+		})
+	}
+}
+
+func TestSetDependsOn_ClearingTheLinkMeasuresTheChangeFromItsTarget(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	s := w.stacked(t, "a", "b")
+	status, got := w.patch(t, s[1].Number, w.ownerKey, `{"depends_on":null}`)
+	mergeBase := gitrepotest.Git(t, w.demo, "merge-base", s[1].HeadSHA, "main")
+	stats, _ := got["stats"].(map[string]any)
+	if status != http.StatusOK || got["depends_on"] != nil || got["base_sha"] != mergeBase {
+		t.Errorf("PATCH depends_on null = %d with depends_on %v, base_sha %v; want 200, none, %s", status, got["depends_on"], got["base_sha"], mergeBase)
+	}
+	if stats["commits"] != 2.0 || !reflect.DeepEqual(got["paths"], []any{"a.txt", "b.txt"}) {
+		t.Errorf("stats, paths = %v, %v; want the 2 commits of a and b, [a.txt b.txt]", stats, got["paths"])
+	}
+	if deps := w.read(t, s[0].Number).Dependants; len(deps) != 0 {
+		t.Errorf("the dependants of %d = %v, want none", s[0].Number, deps)
+	}
+}
+
+func TestLinkVersion_KeepsAnExplicitLinkForTheFirstVersionOnly(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.set(t, "demo", "settings", `{"changes.auto_restack":false}`)
+	a, x := w.stacked(t, "a")[0], w.stacked(t, "x")[0]
+	head := commit(t, w.demo, "b", x.HeadSHA, "B\n", map[string]string{"b.txt": "b\n"})
+	b := w.openBranch(t, "b", func(in *change.OpenInput) { in.DependsOn = new(a.Number) }).Number
+	if got := w.read(t, b).DependsOn; got == nil || *got != a.Number {
+		t.Fatalf("depends_on after the open = %v, want %d", got, a.Number)
+	}
+	head = commit(t, w.demo, "b", head, "B2\n", map[string]string{"b.txt": "b2\n"})
+	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b", Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
+	if got := w.read(t, b).DependsOn; got == nil || *got != x.Number {
+		t.Errorf("depends_on after the next version = %v, want %d", got, x.Number)
 	}
 }
