@@ -3651,8 +3651,9 @@ the component instance, with `RegisterSessionLinker`,
 abandon in `lifecycle.go`, `RegisterRestacker`
 ([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
 The hub registers the fork activity recorder (below) and the component's
-own stack linker (`StackLinker()`, below), and no session linker, landing
-evaluator, auto_land guard or restacker.
+own stack linker (`StackLinker()`) and restacker (`Restacker()`), both the
+type `stacks` (below), and no session linker, landing evaluator or
+auto_land guard.
 
 The stack linker (`stack.go`, the type `stacks`) links each new version,
 at open and after, from the commit graph: of the other draft and open
@@ -3716,7 +3717,10 @@ removed) and the commit it must sit on (`sitOn`: the head of the
 `onto` or the change's `restack_onto`, else the head of the target branch
 in the target's repository). Outside any transaction it resolves the
 source branch in the source workspace's repository; when the head has the
-commit already (`IsAncestor`) the restack is up to date: in a transaction,
+commit and the commit has the change's `base_sha` (`sitsOn`, two
+`IsAncestor`; with no base the first alone), the restack is up to date —
+a dependant whose base is the head of an abandoned change below has that
+head too, and is not: in a transaction,
 the record is removed, a `needs_restack` with reason `conflict` or
 `auto_restack_off` is cleared, `restack_onto` is cleared, and the
 mergeability check is scheduled when a record was removed or a flag
@@ -3743,7 +3747,22 @@ the move) and removes the record by its `seq`, so that a newer record
 written meanwhile stays. When that transaction fails after the swap, the
 branch is set back with a compare-and-swap. The version runs the stack
 linker like any other, which records the restacks of the changes above
-it, so a stack is restacked bottom first. The tests set the replay and a
+it, so a stack is restacked bottom first.
+
+`(*Component).OnLanded(ctx, workspace, number, landed)`
+(`restack_queue.go`) is the entry point for a change that landed as the
+commit `landed`: in a `Store.Tx` of its own, since the landing has ended,
+each direct dependant gets `depends_on` nil (`SetDependsOn`, its base
+kept, so that only its own commits are replayed), `restack_onto` the
+landed commit, its depth recomputed, then `pendRestack` with
+`TriggerLand` (`land`) and `onto` the landed commit; the changes further
+up keep their links. No landing calls it yet: the hub registers it nowhere,
+and its tests call it directly. `stacks.RequestRestack(ctx, tx, ch,
+trigger)`, the `Restacker` an abandon with `DependantsReparent` calls
+after it has set the dependant's `depends_on`, recomputes the depth of
+`ch` and the changes above it and calls `pendRestack(ctx, tx, ch,
+trigger, "")` in the abandon's transaction; `sitOn` then resolves to the
+head of the change `ch` now depends on, or the target head. The tests set the replay and a
 hook before the swap through `export_test.go` (`SetRestackSeams`), hold
 the worker (`HoldRestacks`) and run passes in the test's goroutine
 (`RestackPass`). `ReadChange(ctx, q, workspace, number)` reads
@@ -3896,8 +3915,9 @@ with `SetDependsOn`, then hands each to the `Restacker`
 (`RequestRestack(ctx, tx, ch, trigger)`, declared in `lifecycle.go` and
 registered with `(*change.Component).RegisterRestacker`, which the stack
 feature implements) with the trigger `abandon` (`TriggerAbandon`) inside
-the transaction, whose error rolls the abandon back; with no restacker
-registered it calls `ScheduleMergeable` on each instead.
+the transaction, whose error rolls the abandon back (the hub registers
+`stacks`, above); with no restacker registered it calls
+`ScheduleMergeable` on each instead.
 
 The restore route's operation (`restore` in `lifecycle.go`) checks, in
 this order and before it writes anything: the change is abandoned (`409

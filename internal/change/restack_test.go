@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"reflect"
 	"slices"
 	"strconv"
@@ -208,5 +209,83 @@ func TestRestack_ReplaysExactlyTheChangesOwnCommits(t *testing.T) {
 	}
 	if _, err := gitrepotest.Run(w.demo, "", "merge-base", "--is-ancestor", a.HeadSHA, head); err == nil {
 		t.Errorf("the restacked head %s still has the old head of a %s", head, a.HeadSHA)
+	}
+}
+
+func TestRestack_RebasesTheDependantsOfALandedChangeOntoTheLandedCommit(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	s := w.stacked(t, "la", "lb", "lc")
+	landed := w.land(t, s[0].Number, map[string]string{"la.txt": "la\n"})
+	seq := w.seq(t)
+	if err := w.changes.OnLanded(context.Background(), "demo", s[0].Number, landed); err != nil {
+		t.Fatalf("OnLanded = %v", err)
+	}
+	w.runPending(t)
+
+	b, c := w.read(t, s[1].Number), w.read(t, s[2].Number)
+	vs := w.versions(t, "demo", b.Number)
+	v := vs[len(vs)-1]
+	if got := w.subjects(t, landed, b.HeadSHA); b.DependsOn != nil || v["kind"] != change.KindRestack || v["base_sha"] != landed || !slices.Equal(got, []string{"lb"}) {
+		t.Errorf("demo#%d depends on %v, its last version is %v on %v with %q; want none, a restack on %s with [lb]", b.Number, b.DependsOn, v["kind"], v["base_sha"], got, landed)
+	}
+	numbers, meta := w.restackEvents(t, seq)
+	if want := []string{strconv.FormatInt(b.Number, 10), strconv.FormatInt(c.Number, 10)}; !slices.Equal(numbers, want) ||
+		meta[0]["onto_sha"] != landed || meta[0]["trigger"] != change.TriggerLand {
+		t.Fatalf("restack events of %v, the first %v; want %v, the first onto %s for land", numbers, meta, want, landed)
+	}
+	vs = w.versions(t, "demo", c.Number)
+	v = vs[len(vs)-1]
+	head, _ := v["head_sha"].(string)
+	_, err := gitrepotest.Run(w.demo, "", "merge-base", "--is-ancestor", landed, head)
+	if c.DependsOn == nil || *c.DependsOn != b.Number || v["kind"] != change.KindRestack || v["base_sha"] != b.HeadSHA || err != nil {
+		t.Errorf("demo#%d depends on %v, its last version is %v on %v at %s (on the landed commit: %v); want on %d, a restack on %s",
+			c.Number, c.DependsOn, v["kind"], v["base_sha"], head, err, b.Number, b.HeadSHA)
+	}
+}
+
+func TestRestack_RebasesTheReparentedDependantsOfAnAbandonedChangeWithoutItsCommits(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	for i, c := range []struct {
+		name string
+		// abandoned is the index of the abandoned change, whose dependant
+		// is the one after it, the top of the stack.
+		abandoned int
+	}{
+		{"the middle of three", 1},
+		{"the bottom of two", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fmt.Sprintf("r%d", i)
+			names := []string{p + "a", p + "b", p + "c"}[:c.abandoned+2]
+			s := w.stacked(t, names...)
+			gone, dep := s[c.abandoned], s[c.abandoned+1]
+			seq := w.seq(t)
+			if status, out := w.abandon(t, gone.Number, w.ownerKey, map[string]any{"dependants": "reparent"}); status != http.StatusOK {
+				t.Fatalf("abandon = %d %v, want 200", status, out)
+			}
+			w.runPending(t)
+
+			var link *int64
+			onto := w.head(t, "main")
+			if c.abandoned > 0 {
+				link, onto = &s[c.abandoned-1].Number, s[c.abandoned-1].HeadSHA
+			}
+			ch := w.read(t, dep.Number)
+			vs := w.versions(t, "demo", dep.Number)
+			v := vs[len(vs)-1]
+			want := slices.Delete(slices.Clone(names), c.abandoned, c.abandoned+1)
+			if got := w.subjects(t, w.base, ch.HeadSHA); !reflect.DeepEqual(ch.DependsOn, link) || v["kind"] != change.KindRestack || v["base_sha"] != onto || !slices.Equal(got, want) {
+				t.Errorf("demo#%d depends on %v, its last version is %v on %v with %q; want on %v, a restack on %s with %q",
+					dep.Number, ch.DependsOn, v["kind"], v["base_sha"], got, link, onto, want)
+			}
+			numbers, meta := w.restackEvents(t, seq)
+			if i := slices.Index(numbers, strconv.FormatInt(dep.Number, 10)); i < 0 || meta[i]["trigger"] != change.TriggerAbandon {
+				t.Errorf("restack events of %v with %v, want one of demo#%d for abandon", numbers, meta, dep.Number)
+			}
+		})
 	}
 }

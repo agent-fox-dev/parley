@@ -4027,11 +4027,13 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   transaction, with the same `reason` and one `parley.change.abandon`
   each. With `"reparent"`, each direct dependant stays as it is but now
   depends on what the abandoned change depended on (`null` when nothing),
-  and its restack is asked for, by the stack feature when the hub has
-  one: when that request fails, the answer is `500` and nothing is
-  abandoned; without it, the dependant's `mergeable` becomes `unknown`
-  and is checked again. `dependants` on a change that has none changes
-  nothing.
+  and gets a pending restack, with the trigger `abandon`, in the same
+  transaction (see [Stacks and restack](#stacks-and-restack)): it is
+  rebased onto the head of the change it now depends on, or onto the head
+  of its target branch when it depends on none, without the abandoned
+  change's commits. When that record cannot be written, the answer is
+  `500` and nothing is abandoned. `dependants` on a change that has none
+  changes nothing.
 - `POST …/restore` takes no body (one that is sent is ignored) and brings
   an abandoned change back to `open` under its number. Its refusals come
   in this order, the first that applies answering, and none changes
@@ -4129,15 +4131,29 @@ the version cannot record them, the version is not recorded either. A
 change has at most one pending restack: a newer one replaces it, so that
 the change is restacked once, onto the newest head below.
 
+When a change lands as a commit on its target branch, each `draft` or
+`open` change directly above it, in one store transaction of its own,
+gets `depends_on` `null`, keeps the landed commit as the commit it must
+sit on, and gets a pending restack onto that commit, with the trigger
+`land`; a change without dependants records nothing. The changes further
+up keep their `depends_on` and are restacked in turn onto the new head of
+the change directly below them. An abandon with `"dependants":
+"reparent"` records the restack of each reparented dependant, with the
+trigger `abandon` (see [Modifying a change](#modifying-a-change)).
+
 The hub runs the pending restacks in the background, one at a time, in
 the order they were recorded; those pending when `parleyd` stopped run
 after it starts again. A restack replays the commits of the change after
 its `base_sha` up to the head of its source branch, in order, onto the
-head of the change below, in the repository's object store (no work tree
-and no ref), each with its author and message and the hub as committer,
-so that a change below that was force-pushed to an unrelated head does
-not bring its old commits along. When the source branch already has the
-head below, nothing is recorded and no event is written. Otherwise the
+commit it must sit on: the head of the change it depends on while that
+one is `draft` or `open`; else the landed commit of the change below it;
+else the head of its target branch. The replay runs in the repository's
+object store (no work tree and no ref), each commit with its author and
+message and the hub as committer, so that a change below that was
+force-pushed to an unrelated head, landed or abandoned does not bring its
+old commits along. When the source branch already sits on that commit
+(it has the commit, and the commit has the change's `base_sha`), nothing
+is recorded and no event is written. Otherwise the
 source branch is moved to the result with a compare-and-swap on the head
 the restack read; when it moved in between, the restack starts again from
 the new head, at most 5 times in one run, after which nothing is changed
@@ -4145,15 +4161,16 @@ and the restack stays pending.
 
 The move is recorded as the change's next version, of kind `restack`,
 created by the hub (`created_by.actor_type` `system`), with the session of
-the version it replaces, `base_sha` the head below and
+the version it replaces, `base_sha` the commit it was restacked onto and
 `patch_equivalent_to` the earlier version with the same diff, as any
 version has it. `needs_restack` is cleared unless its reason is
 `stack_too_deep`, and the version restacks the changes above it in turn,
 bottom first. The hub writes, by `system`, `parley.change.version` with
 `kind` `restack` and then `parley.change.restack` with `number`, `ref`,
 `version`, `head_sha` (the dependant's new version and head), `onto_sha`
-(the head it was restacked onto) and `trigger` (`version`). A restack
-whose source branch already sat on the head below clears a
+(the commit it was restacked onto) and `trigger` (`version`, `land` or
+`abandon`). A restack whose source branch already sat on that commit
+clears a
 `needs_restack` set for `conflict` or `auto_restack_off`. A restack
 whose replay conflicts moves nothing and ends; the change's mergeability
 check then reports the conflict. A restack that fails for another reason

@@ -751,6 +751,19 @@ func (w *world) amend(t *testing.T, branch string, files map[string]string) stri
 	return head
 }
 
+// land moves main of demo past a commit of its own to one that sets files,
+// as the landing of the change number with those files would, marks the
+// change landed as that commit through the store, and returns the commit.
+func (w *world) land(t *testing.T, number int64, files map[string]string) string {
+	t.Helper()
+	moved := commit(t, w.demo, "main", w.head(t, "main"), "main moved\n", map[string]string{"main.txt": strconv.FormatInt(number, 10) + "\n"})
+	landed := commit(t, w.demo, "main", moved, "landed\n", files)
+	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetLanded(ctx, tx, "demo", number, change.Landed{SHA: landed, At: time.Now(), By: change.Actor{ActorType: change.ActorSystem}, LandID: "l" + strconv.FormatInt(number, 10)})
+	})
+	return landed
+}
+
 // subjects are the subjects of the commits of demo after base up to head,
 // oldest first.
 func (w *world) subjects(t *testing.T, base, head string) []string {

@@ -29,9 +29,27 @@ var StackStep = store.Step{
 // version to the change it is built on, read from the commit graph.
 func (c *Component) StackLinker() StackLinker { return stacks{c} }
 
+// Restacker is the component's own restacker, which records the restack an
+// abandon asks for a reparented dependant.
+func (c *Component) Restacker() Restacker { return stacks{c} }
+
 // stacks keeps the stacks of changes: the links between them, which it
-// stores through the component's setters.
+// stores through the component's setters, and the restacks they owe.
 type stacks struct{ c *Component }
+
+// RequestRestack records in tx a pending restack of the change ch for the
+// trigger, onto the commit it must sit on when the restack runs: the head
+// of the change it depends on, which the caller has set, or, with none,
+// the head of its target branch. The restack replays only the commits
+// after ch's base, so the commits of a change below it that is gone are
+// left out. The depth of ch, and of every change above it, follows its
+// link first.
+func (s stacks) RequestRestack(ctx context.Context, tx *sql.Tx, ch Change, trigger string) error {
+	if err := s.recomputeDepth(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
+		return err
+	}
+	return s.c.pendRestack(ctx, tx, ch, trigger, "")
+}
 
 // LinkVersion links the change ch, whose new version is v, and measures
 // the version from the head of the change it now depends on. The change

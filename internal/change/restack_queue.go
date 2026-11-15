@@ -43,6 +43,10 @@ const EventRestack = "parley.change.restack"
 // below asks for.
 const TriggerVersion = "version"
 
+// TriggerLand is the trigger of the restack the landing of the change below
+// asks for.
+const TriggerLand = "land"
+
 // restackJob is a restack to run: the change number of the workspace, for
 // the trigger, onto the commit onto when it names one, and seq, the
 // pending record it runs, 0 for none.
@@ -67,6 +71,45 @@ func (c *Component) pendRestack(ctx context.Context, tx *sql.Tx, ch Change, trig
 	}
 	c.restacks.wake()
 	return nil
+}
+
+// OnLanded is told that the change number of the workspace landed as the
+// commit landed on its target branch. In a transaction of its own, since
+// the landing has ended and nothing it does may undo it, each draft or
+// open change directly above it no longer depends on it, keeps the landed
+// commit as the commit it must sit on and gets a pending restack onto it;
+// the changes further up keep their links and are restacked by the
+// versions those restacks record. A change without dependants records
+// nothing.
+func (c *Component) OnLanded(ctx context.Context, workspace string, number int64, landed string) error {
+	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		deps, err := dependants(ctx, tx, workspace, number)
+		if err != nil {
+			return err
+		}
+		s := stacks{c}
+		for _, n := range deps {
+			if err := c.SetDependsOn(ctx, tx, workspace, n, nil); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE changes SET restack_onto = ? WHERE workspace_slug = ? AND number = ?`, landed, workspace, n); err != nil {
+				return fmt.Errorf("store what %s sits on: %w", Ref(workspace, n), err)
+			}
+			// The depth first, so that the restack is recorded for the
+			// change as it now sits in its stack.
+			if err := s.recomputeDepth(ctx, tx, workspace, n); err != nil {
+				return err
+			}
+			d, err := readChange(ctx, tx, workspace, n)
+			if err != nil {
+				return err
+			}
+			if err := c.pendRestack(ctx, tx, d, TriggerLand, landed); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // dropRestack removes in tx the pending restack of the job, unless a newer

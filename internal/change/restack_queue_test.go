@@ -1,6 +1,7 @@
 package change_test
 
 import (
+	"context"
 	"slices"
 	"testing"
 
@@ -69,5 +70,44 @@ func TestPendRestack_KeepsOneRestackPerChangeOntoTheNewestHeadBelow(t *testing.T
 	vs := w.versions(t, "demo", s[1].Number)
 	if v := vs[len(vs)-1]; len(vs) != 2 || v["base_sha"] != head {
 		t.Errorf("demo#%d has %d versions, the last on %v; want 2, on %s", s[1].Number, len(vs), v["base_sha"], head)
+	}
+}
+
+func TestOnLanded_PendsARestackOfEachDirectDependantOntoTheLandedCommit(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	for _, c := range []struct {
+		name  string
+		names []string
+	}{
+		{"a change with dependants", []string{"da", "db", "dc"}},
+		{"a change without dependants", []string{"na"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := w.stacked(t, c.names...)
+			before := w.pending(t)
+			landed := w.land(t, s[0].Number, map[string]string{c.names[0] + ".txt": c.names[0] + "\n"})
+			if err := w.changes.OnLanded(context.Background(), "demo", s[0].Number, landed); err != nil {
+				t.Fatalf("OnLanded = %v", err)
+			}
+			if len(s) == 1 {
+				if got := w.pending(t); !slices.Equal(got, before) {
+					t.Errorf("pending restacks of %v, want %v", got, before)
+				}
+				return
+			}
+			b, above := w.read(t, s[1].Number), w.read(t, s[2].Number)
+			if b.DependsOn != nil || above.DependsOn == nil || *above.DependsOn != b.Number {
+				t.Errorf("demo#%d depends on %v and demo#%d on %v; want none and %d", b.Number, b.DependsOn, above.Number, above.DependsOn, b.Number)
+			}
+			var trigger, onto string
+			if err := w.Store.Main().QueryRow(`SELECT trigger, onto FROM change_restacks WHERE workspace_slug = 'demo' AND number = ?`, b.Number).Scan(&trigger, &onto); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := w.pending(t), append(before, b.Number); !slices.Equal(got, want) || trigger != change.TriggerLand || onto != landed {
+				t.Errorf("pending restacks of %v, demo#%d's for %q onto %s; want %v, for land onto %s", got, b.Number, trigger, onto, want, landed)
+			}
+		})
 	}
 }

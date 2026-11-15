@@ -107,7 +107,7 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 		return res, false, fmt.Errorf("restack %s: its source branch %s:%s does not exist", ch.Ref, ch.Source.WorkspaceSlug, branch)
 	}
 	res.head = head
-	built, err := repo.IsAncestor(ctx, onto, head)
+	built, err := sitsOn(ctx, repo, baseColumn(ch.BaseSHA), head, onto)
 	if err != nil {
 		return res, false, err
 	}
@@ -302,6 +302,21 @@ func (c *Component) sitOn(ctx context.Context, q Querier, ch Change, onto string
 	}
 	head, _, err := repo.ResolveBranch(ctx, ch.TargetBranch)
 	return head, err
+}
+
+// sitsOn reports whether the change whose commits are base..head in repo
+// already sits on onto: head has onto, and onto has base, so that every
+// commit of head that onto lacks is the change's own. A base onto does not
+// have, such as the head of an abandoned change below, means that head
+// still carries commits that are not the change's own, which a restack
+// leaves out. A change with no base counts every commit of its head as
+// its own.
+func sitsOn(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (bool, error) {
+	built, err := repo.IsAncestor(ctx, onto, head)
+	if err != nil || !built || base == "" {
+		return built, err
+	}
+	return repo.IsAncestor(ctx, base, onto)
 }
 
 // clearRestackOnto forgets in tx the landed commit the change number of
