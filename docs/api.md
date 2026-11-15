@@ -696,11 +696,11 @@ protocol versions:
   `tree:<depth>`, and the fetch by id of an object the filter left out
   (git does that on its own, at checkout). Every other filter kind
   (`object:type`, `sparse:oid`, `combine`, …) is refused.
-- A commit by its object id, when a ref reaches it. A commit no ref reaches,
-  or an annotated tag of one, is refused under both versions, however the
-  want writes its id (git reads the leading 40 or 64 hexadecimal digits, in
-  either case, and ignores what follows); a tree or a blob is sent by its
-  id, as git does under version 0 (see
+- An object by its id, a commit, a tree, a blob or an annotated tag, when a
+  ref reaches it. An object no ref reaches is refused under both versions,
+  however the want writes its id (git reads the leading 40 or 64
+  hexadecimal digits, in either case, and ignores what follows); for a task
+  fork, that is a ref of the fork (see
   [errata/17_git_smart_http.md](errata/17_git_smart_http.md)).
 
 Once the answer has begun, an error is reported in band, as one pkt-line
@@ -712,9 +712,9 @@ starting with `ERR `, and no pack follows it:
 | `Content-Encoding` is `gzip` but the body is not valid gzip | `ERR invalid gzip body` |
 | git refuses the request | `ERR ` and git's own text, the last line of its error output without `fatal: `; `ERR upload-pack failed` when git wrote none or that line names a place on the hub's disk |
 | a filter other than `blob:none`, `blob:limit` and `tree` | git's `ERR filter '<kind>' not supported` |
-| a want of a commit no ref reaches | `ERR upload-pack: not our ref <id>` |
+| a want of an object no ref reaches | `ERR upload-pack: not our ref <id>` |
 | a version 2 want whose id git cannot read (fewer than 40 hexadecimal digits) | `ERR upload-pack: protocol error, expected to get oid` |
-| a version 2 request body larger than 16 MiB (after gzip decompression) | `ERR request too large` |
+| a version 2 request body, or the wants of a version 0 one, larger than 16 MiB (after gzip decompression) | `ERR request too large` |
 | the request, a task fork's ref copy and the run of git together, takes longer than `[git].timeout` (see [configuration.md](configuration.md)) | `ERR request timed out` |
 
 On a timeout git is killed and the answer ends; the `ERR` pkt-line is

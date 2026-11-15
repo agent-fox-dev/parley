@@ -288,8 +288,11 @@ func TestFetch_EndsARequestThatOutlivesTheTimeoutAndItsGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The timeout leaves room for the want check's git commands, which run
+	// before upload-pack, also on a loaded machine.
+	const timeout = time.Second
 	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
-		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = 200 * time.Millisecond })
+		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = timeout })
 	}})
 	bin := t.TempDir()
 	pidFile := filepath.Join(bin, "pid")
@@ -300,8 +303,8 @@ func TestFetch_EndsARequestThatOutlivesTheTimeoutAndItsGit(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	start := time.Now()
 	a := w.send(t, http.MethodPost, uploadPack, basic("x", w.ownerKey), nil, fetchRequest(w.head))
-	if d := time.Since(start); d > 2200*time.Millisecond {
-		t.Errorf("the request ended after %v, want within 2.2s", d)
+	if d := time.Since(start); d > timeout+2*time.Second {
+		t.Errorf("the request ended after %v, want within %v", d, timeout+2*time.Second)
 	}
 	if pkts := pktlines(a.body); a.status != http.StatusOK || len(pkts) == 0 || pkts[len(pkts)-1] != "ERR request timed out" {
 		t.Errorf("answer = %d %q, want 200 ending with the pkt-line ERR request timed out", a.status, a.body)
