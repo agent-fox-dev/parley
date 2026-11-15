@@ -116,6 +116,52 @@ func TestRouting_PrefersALiteralSegmentOverAParameter(t *testing.T) {
 	}
 }
 
+func TestRouting_ACatchAllParameterTakesTheRestOfThePath(t *testing.T) {
+	t.Parallel()
+	var log callLog
+	s := New(Options{})
+	s.SetAuthenticator(log.authenticator(testCaller, nil))
+	for _, pattern := range []string{"/w/:slug/refs", "/w/:slug/refs/*name", "/w/:slug/refs/heads/:branch"} {
+		s.Register(Route{Method: http.MethodGet, Pattern: pattern, Handler: func(w http.ResponseWriter, r *http.Request) error {
+			m, _ := MatchedRoute(r)
+			WriteJSON(w, http.StatusOK, map[string]any{"route": m.Pattern, "params": m.Params})
+			return nil
+		}})
+	}
+	h := s.Handler()
+
+	tests := []struct {
+		path, wantRoute string
+		wantParams      map[string]any
+	}{
+		{"/api/v1/w/p1/refs", "/w/:slug/refs", map[string]any{"slug": "p1"}},
+		{"/api/v1/w/p1/refs/main", "/w/:slug/refs/*name", map[string]any{"slug": "p1", "name": "main"}},
+		{"/api/v1/w/p1/refs/feature/x", "/w/:slug/refs/*name", map[string]any{"slug": "p1", "name": "feature/x"}},
+		{"/api/v1/w/p1/refs/refs/heads/feature/x", "/w/:slug/refs/*name", map[string]any{"slug": "p1", "name": "refs/heads/feature/x"}},
+		{"/api/v1/w/p1/refs/a%2Fb/c%20d", "/w/:slug/refs/*name", map[string]any{"slug": "p1", "name": "a/b/c d"}},
+		{"/api/v1/w/p1/refs/heads/main", "/w/:slug/refs/heads/:branch", map[string]any{"slug": "p1", "branch": "main"}},
+		{"/api/v1/w/p1/refs/heads/main/x", "/w/:slug/refs/*name", map[string]any{"slug": "p1", "name": "heads/main/x"}},
+		{"/api/v1/w/p1/refs/", "", nil},
+		{"/api/v1/w/p1/refs/a/", "", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			rec := do(h, newRequest(http.MethodGet, tt.path, nil, ""))
+			if tt.wantRoute == "" {
+				assertError(t, rec, http.StatusNotFound, "not_found")
+				return
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body.Bytes())
+			}
+			want := map[string]any{"route": tt.wantRoute, "params": tt.wantParams}
+			if got := decodeObject(t, rec.Body.Bytes()); !reflect.DeepEqual(got, want) {
+				t.Errorf("body = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestRouting_AnswersNotFoundForAPathNoRouteMatches(t *testing.T) {
 	t.Parallel()
 	var log callLog
@@ -208,6 +254,10 @@ func TestRegister_PanicsOnAnInvalidOrDuplicateRoute(t *testing.T) {
 		{"pattern with a router wildcard", Route{Method: "GET", Pattern: "/things/{id}", Handler: ok}},
 		{"parameter without a name", Route{Method: "GET", Pattern: "/things/:", Handler: ok}},
 		{"parameter named twice", Route{Method: "GET", Pattern: "/things/:id/parts/:id", Handler: ok}},
+		{"catch-all parameter before the last segment", Route{Method: "GET", Pattern: "/things/*rest/x", Handler: ok}},
+		{"catch-all parameter without a name", Route{Method: "GET", Pattern: "/things/*", Handler: ok}},
+		{"catch-all parameter named like another", Route{Method: "GET", Pattern: "/things/:id/*id", Handler: ok}},
+		{"catch-all route already registered", Route{Method: "GET", Pattern: "/taken/*other", Handler: ok}},
 		{"lower-case method", Route{Method: "get", Pattern: "/things", Handler: ok}},
 		{"no method", Route{Pattern: "/things", Handler: ok}},
 		{"no handler", Route{Method: "GET", Pattern: "/things"}},
@@ -218,6 +268,7 @@ func TestRegister_PanicsOnAnInvalidOrDuplicateRoute(t *testing.T) {
 			t.Parallel()
 			s := New(Options{})
 			s.Register(Route{Method: "GET", Pattern: "/taken", Handler: ok})
+			s.Register(Route{Method: "GET", Pattern: "/taken/*rest", Handler: ok})
 			defer func() {
 				if recover() == nil {
 					t.Errorf("Register(%s %q) did not panic", tt.route.Method, tt.route.Pattern)

@@ -28,7 +28,9 @@ type Route struct {
 	// answers HEAD, without a body.
 	Method string
 	// Pattern is the path relative to /api/v1, starting with a slash, with
-	// :name segments for path parameters, such as /workspaces/:slug.
+	// :name segments for path parameters, such as /workspaces/:slug, and
+	// optionally a last segment *name, a catch-all parameter that takes one
+	// or more remaining segments, such as /refs/*name for refs/heads/main.
 	Pattern string
 	// Handler serves the request once every check has passed.
 	Handler HandlerFunc
@@ -128,48 +130,61 @@ type apiRoute struct {
 
 // matches reports whether the route's pattern matches the unescaped path
 // segments: every literal segment equal, every parameter a segment that is
-// not empty.
+// not empty, and a catch-all parameter one or more segments that are not
+// empty.
 func (a *apiRoute) matches(path []string) bool {
-	if len(path) != len(a.segments) {
+	n := len(a.segments)
+	if catchAll := n > 0 && isCatchAll(a.segments[n-1]); catchAll && len(path) < n || !catchAll && len(path) != n {
 		return false
 	}
-	for i, seg := range a.segments {
-		if isParam(seg) {
-			if path[i] == "" {
+	for i, p := range path {
+		seg := a.segments[min(i, n-1)]
+		if isParam(seg) || isCatchAll(seg) {
+			if p == "" {
 				return false
 			}
-		} else if seg != path[i] {
+		} else if seg != p {
 			return false
 		}
 	}
 	return true
 }
 
-// specificity compares two patterns of the same path: it is positive when a
-// is more specific than b, negative when b is, and 0 when they have the same
-// segments up to their parameter names. The first segment where one has a
-// literal and the other a parameter decides, the literal winning, so that
-// /changes/by-commit/:sha and /changes/:number/stack can both be registered
-// and /changes/by-commit/stack goes to the first.
+// specificity compares two patterns: it is positive when a is more
+// specific than b, negative when b is, and 0 when they have the same
+// segments up to their parameter names. The first segment where they differ
+// in kind decides, a literal winning over a parameter and a parameter over
+// a catch-all, so that /changes/by-commit/:sha and /changes/:number/stack
+// can both be registered and /changes/by-commit/stack goes to the first, and
+// /refs/heads/:branch takes /refs/heads/main from /refs/*name. When one
+// pattern is the beginning of the other, the longer is the more specific.
 func specificity(a, b []string) int {
-	if len(a) != len(b) {
-		return len(a) - len(b)
-	}
-	for i := range a {
-		pa, pb := isParam(a[i]), isParam(b[i])
-		switch {
-		case pa && !pb:
-			return -1
-		case !pa && pb:
-			return 1
-		case !pa && a[i] != b[i]:
+	for i := range min(len(a), len(b)) {
+		if c := segmentRank(a[i]) - segmentRank(b[i]); c != 0 {
+			return c
+		}
+		if !isParam(a[i]) && !isCatchAll(a[i]) && a[i] != b[i] {
 			return strings.Compare(a[i], b[i])
 		}
 	}
-	return 0
+	return len(a) - len(b)
+}
+
+// segmentRank orders the kinds of pattern segment from the least specific:
+// a catch-all, a parameter, a literal.
+func segmentRank(seg string) int {
+	switch {
+	case isCatchAll(seg):
+		return 0
+	case isParam(seg):
+		return 1
+	}
+	return 2
 }
 
 func isParam(seg string) bool { return strings.HasPrefix(seg, ":") }
+
+func isCatchAll(seg string) bool { return strings.HasPrefix(seg, "*") }
 
 // match returns the REST API route that serves method on the path below
 // /api/v1, given as its unescaped segments: of the routes whose pattern
@@ -214,13 +229,15 @@ func parsePattern(p string) (segments []string, err error) {
 	}
 	segments = strings.Split(p[1:], "/")
 	var names []string
-	for _, seg := range segments {
+	for i, seg := range segments {
 		switch {
 		case seg == "" || seg == "." || seg == "..":
 			return nil, fmt.Errorf("empty or relative segment %q", seg)
 		case strings.ContainsAny(seg, "{}"):
 			return nil, fmt.Errorf("segment %q holds a brace; use :name for a parameter", seg)
-		case isParam(seg):
+		case isCatchAll(seg) && i != len(segments)-1:
+			return nil, fmt.Errorf("catch-all parameter %q is not the last segment", seg)
+		case isParam(seg) || isCatchAll(seg):
 			name := seg[1:]
 			if !validParamName(name) {
 				return nil, fmt.Errorf("parameter %q is not a valid name", seg)
@@ -262,13 +279,17 @@ func validMethod(m string) bool {
 }
 
 // serveRoute records the route a matched, its parameter values taken from
-// the unescaped path segments, and an empty holder for the checks'
-// attachments in the request's context and runs the pipeline.
+// the unescaped path segments (a catch-all's the remaining segments joined
+// by slashes), and an empty holder for the checks' attachments in the
+// request's context and runs the pipeline.
 func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request, a *apiRoute, path []string) {
 	params := make(map[string]string)
 	for i, seg := range a.segments {
-		if isParam(seg) {
+		switch {
+		case isParam(seg):
 			params[seg[1:]] = path[i]
+		case isCatchAll(seg):
+			params[seg[1:]] = strings.Join(path[i:], "/")
 		}
 	}
 	m := Matched{Method: a.route.Method, Pattern: a.route.Pattern, Route: a.route, Params: params}

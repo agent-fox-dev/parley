@@ -25,8 +25,13 @@ Paths are matched exactly, segment by segment, and a path that does not
 match is never redirected. When two routes match a path, the one with a
 fixed segment where the other has a parameter, reading from the left, serves
 it: `GET /api/v1/workspaces/{slug}/changes/by-commit/stack` goes to
-`changes/by-commit/{sha}`, not to `changes/{number}/stack`. A request that
-no route serves is answered as follows:
+`changes/by-commit/{sha}`, not to `changes/{number}/stack`. A route's last
+parameter may take the rest of the path: `{name}` in
+`GET /api/v1/workspaces/{slug}/scm/refs/{name}` matches one or more
+segments, none of them empty, and its value is their unescaped texts joined
+by `/`, so `…/scm/refs/feature/x` has `name` `feature/x`; a route with a
+fixed segment or a single-segment parameter in its place serves a path both
+match. A request that no route serves is answered as follows:
 
 | Request | Answer |
 |---|---|
@@ -376,8 +381,8 @@ know are ignored.
 
 ## Lists
 
-Every route that answers a list answers one page of it, `200` with exactly
-these two members:
+Every route that answers a list answers one page of it, `200` with these
+two members first:
 
 ```json
 {"items":[{"id":2},{"id":4}],"next_cursor":"eyJwIjo0LCJmIjoi..."}
@@ -387,6 +392,10 @@ these two members:
 |---|---|
 | `items` | an array of the page's items, in the list's order; `[]` when the page is empty, never `null` |
 | `next_cursor` | a string when more items follow, `null` on the last page |
+
+A list that names more than its items, such as the commit it was read
+from, adds members after `next_cursor`, and its section of this page names
+them; every other list has these two alone.
 
 A list request takes two query parameters:
 
@@ -2593,6 +2602,574 @@ who reads it); the `limit` and `cursor` (`400`).
 
 ```json
 {"items":[{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":"2026-01-02T00:00:00Z","created_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
+```
+
+## Source control reads
+
+The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
+repository without a clone. They are `GET` routes; so far they are the two
+refs routes, the two commits routes, the tree route, the file route, the
+diff route, the compare route, the blame route and the search route below. Every one of them behaves
+alike in what follows.
+
+It takes the admin token, an API key or a PAT, and declares the scope
+`git:read` for a PAT, which a PAT holding `git:write` also satisfies. It
+needs read access to the workspace (see [Workspace access](#workspace-access)),
+so an org member reads as the owner does. These checks run before the route
+and touch no repository: no credential is `401` `unauthenticated`, a PAT
+with neither scope `403` `insufficient_scope` (`this route needs the scope
+git:read`), for an unknown slug as well, and a caller who cannot read the
+workspace `404` `not_found` (`workspace not found`), with the same bytes as
+for an unknown slug.
+
+The route then checks its query parameters (`400` `invalid_request`), then
+the state of the workspace, and only then opens the repository:
+
+| State | Answer |
+|---|---|
+| `ready`; `archived` with no operation running, which reads as it did before the archive | served |
+| a reclone, archive or delete running, on any status | `409` `workspace_busy` |
+| `pending` or `cloning` | `409` `workspace_busy` |
+| `failed` | `409` `workspace_not_ready` |
+| a task fork whose parent is in one of the three states above | the parent's answer, `409` `workspace_busy` or `workspace_not_ready`; a fork whose parent is `archived` is served |
+
+Every read is bounded by the hub's read timeout, `[scm].read_timeout`
+(30 seconds by default, see [configuration.md](configuration.md)), counted
+from the moment the route begins handling the request: when it runs out,
+every `git` process of the read is killed with every process it started. A
+read that has not begun its answer by then, also one whose git work is
+done and whose answer is still being prepared, is answered `503`
+`scm_timeout` (`the read did not finish within the read timeout of 30s`),
+with none of the read's own headers; a read whose answer has begun is cut
+off, the connection dropped before the body ends.
+
+A task fork is read through its ref view, the one the git server
+advertises: its own branches, with `tracking` `false`, and the branches and
+tags it tracks at its parent's current heads, the branches with `tracking`
+`true`, so a read of a fork follows its parent's branch as soon as it
+moves. A fork shows no `refs/parley/` ref.
+
+No read emits an event. Each request a route handles, refused by the route
+itself or answered, is reported once to the hub's request recorder with the
+route's op (`refs` for both refs routes, `commits` for both commits routes,
+`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route, `search` for the search route) and `ok` for a status
+below 400 (a `206` or a `304` included),
+`error` otherwise, an answer cut off at the read timeout included; a request the checks before the route refuse is not
+reported. The hub has no metric export yet, so the recorder discards what
+it is told.
+
+A ref object has exactly these members:
+
+| Member | Value |
+|---|---|
+| `name` | the full ref name, such as `refs/heads/main` |
+| `kind` | `branch` under `refs/heads/`, `tag` under `refs/tags/`, `hub` under `refs/parley/` |
+| `sha` | the full id of the commit the ref points at; for an annotated tag, the commit the tag peels to |
+| `protected` | `true` for a branch the workspace's effective `protected_branches` protect (a fork's are its parent's) and for every `refs/parley/` ref, else `false` |
+| `tracking` | `true` for a task fork's tracking branch, else `false` |
+| `change` | `{"workspace_slug": …, "number": …}` for the open or draft change whose source is the branch; always `null` until the hub records changes |
+
+Refs in any other namespace, such as `refs/notes/`, have no kind and are
+never listed, nor is a ref that reaches no commit.
+
+A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree`,
+`…/scm/file`, `…/scm/blame` and `…/scm/search`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
+`…/scm/diff` and `…/scm/compare`) is a branch name, a tag name, a full ref name or a
+full or abbreviated commit id (4 to 40 hexadecimal characters). A string
+that begins with `refs/` is that full ref name only; otherwise the branch or
+the tag of that name, where both existing is ambiguous; otherwise a commit
+id, which names a commit whether or not a ref reaches it. An annotated tag
+names the commit it peels to. A revision that names no one commit, an
+expression such as `main~2`, `HEAD` or `@{1}` included, is `404`
+`ref_not_found` (such as `revision "main~2" names no commit`, `revision
+"dup" is both a branch and a tag`, `revision "4ad6" names more than one
+commit`). A `ref` that is absent is the head of the workspace's default
+branch. Each revision of a request is resolved once, against one reading of
+the workspace's refs, and the whole answer is computed from the commit ids
+it resolved to, so a read that runs while a ref moves answers for the old
+commit or the new one, never a mix.
+
+Every successful answer (`200` or `206`) carries an `ETag`, a quoted digest
+of the request's path (the route, the workspace and any path parameter),
+its query string (a list's `cursor` included, so each page has its own
+tag), the full ids of the commits its revisions resolved to, and its
+representation (raw or JSON on the file route, JSON or patch on the diff
+route). The two refs routes resolve no revision; their tag is a digest of
+the path, the query and the ref objects of the answer (names, ids and the
+other members), so it changes when a listed ref moves, appears or goes.
+Two identical requests get the same tag while no ref they name moves.
+`Cache-Control` is then:
+
+| Read | `Cache-Control` |
+|---|---|
+| a route with revision parameters, every one of them written as a full 40-character commit id (an absent `ref` is not); a later page of a list whose `ref` is one | `private, max-age=31536000, immutable` |
+| any other: a revision written as a name or an abbreviated id, an absent `ref`, and both refs routes always | `private, no-cache` |
+
+A request whose `If-None-Match` holds the tag the answer would carry, alone
+or in a comma-separated list (a `W/` prefix is ignored), is answered `304
+Not Modified` with no body and the same `ETag` and `Cache-Control` (and on
+the file route `Vary`); `*` is not taken as a match. This is decided once the
+revisions are resolved and before the rest of the read, so a current copy
+costs no history walk, tree listing, file read, diff, trial rebase, blame
+or search; a tag that does not match gets the full answer. An error answer
+has no `ETag` and keeps `Cache-Control: no-store`.
+
+A `path` parameter of a read that names a path of the repository is
+relative, has no empty, `.` or `..` segment, has no segment `.git` and
+holds no NUL byte; any other is `400` `invalid_request` (such as `path must
+be a relative path of the repository, such as docs/api.md`, `path
+"docs//api" has an empty, . or .. segment`, `path ".git/config" lies under
+.git`), checked before the workspace's state and the repository.
+
+A commit object, as every route that answers commits writes it:
+
+| Member | Value |
+|---|---|
+| `sha` | the commit's full id |
+| `parents` | the full ids of its parents, the first parent first; `[]` for a root commit |
+| `tree_sha` | the full id of its tree |
+| `author`, `committer` | `{"name": …, "email": …, "time": …}`, `time` an RFC 3339 timestamp in UTC, such as `2026-01-02T03:04:05Z` |
+| `message` | the whole message, as written, its last newline included when it has one |
+| `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it; always `null` until the hub records changes |
+| `session_id` | the agent session that introduced the commit; always `null` until the hub records sessions |
+| `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
+
+A file change, as every route that answers file changes writes it (the
+commit route with `files=true`, the diff route, the compare route):
+
+| Member | Value |
+|---|---|
+| `path` | the file's path, on the new side; for a deleted file, the path it had |
+| `old_path` | the path on the old side of a renamed or copied file, else `null` |
+| `status` | `added`, `modified`, `deleted`, `renamed`, `copied` or `type_changed` (a path whose kind changed, such as a regular file that became a symbolic link) |
+| `insertions`, `deletions` | lines added and removed; `0` and `0` for a binary file |
+| `binary` | `true` for a file git treats as binary |
+| `old_sha`, `new_sha` | the file's blob id on each side, `null` on the side it is missing from |
+| `patch` | only on the diff route with patches on: the file's part of the unified diff, from its `diff --git` line; never for a binary file |
+
+Renamed and copied files are found as git finds them (`-M -C`): a file
+moved with small edits is one change `renamed` with both paths, not a
+deletion and an addition, and a copy is found when the file it was copied
+from changed in the same comparison.
+
+## `GET /api/v1/workspaces/{slug}/scm/refs`
+
+Lists the refs of the workspace whose full names begin with `prefix`, as
+ref objects in byte order of name. It is a list (see [Lists](#lists)), with
+the standard `limit` and `cursor`, and the query parameter:
+
+| Parameter | Meaning |
+|---|---|
+| `prefix` | the start of the full names listed, matched as text; default `refs/heads/`; `refs/` lists all three namespaces |
+
+The cursor carries the last name of the page, so a walk over the pages
+returns each ref once. A prefix no ref has answers
+`{"items":[],"next_cursor":null}`.
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of ref objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"name":"refs/heads/feature/x","kind":"branch","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","protected":false,"tracking":false,"change":null},{"name":"refs/heads/main","kind":"branch","sha":"4ad62a88646935da6b42d1a9b1462904e8d62e91","protected":true,"tracking":false,"change":null}],"next_cursor":null}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/refs/{name}`
+
+Answers the ref object of one ref. `{name}` takes the rest of the path (see
+[Routes and matching](#routes-and-matching)): a full ref name, such as
+`refs/tags/v1`, or a branch name, which is any name that does not begin with
+`refs/` and is read as `refs/heads/{name}`, so `…/refs/feature/x` and
+`…/refs/refs/heads/feature/x` answer the same object.
+
+| Status | When |
+|---|---|
+| `200 OK` | the ref object |
+| `404` `ref_not_found` | no listed ref has the name, or it is outside `refs/heads/`, `refs/tags/` and `refs/parley/` (`ref "refs/heads/nope" does not exist`); a tag name without `refs/tags/` is read as a branch name |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+## `GET /api/v1/workspaces/{slug}/scm/commits`
+
+Lists the commits reachable from `ref`, newest first, as commit objects. It
+is a list (see [Lists](#lists)), with the standard `limit` and `cursor`,
+and names the commit it was read from in `resolved_sha` after
+`next_cursor`. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose history is listed; default the workspace's default branch |
+| `first_parent` | `true` (default) follows only the first parent of each merge, so the commits a merge brought in are not listed; `false` lists them too |
+| `path` | only the commits that changed this path, a file or anything below a directory, taken literally; a path no commit changed answers `items: []` |
+| `follow` | `true` follows `path`, which must then name one file, across renames; default `false` |
+| `since`, `until` | RFC 3339 timestamps: only the commits whose committer time is at or after `since` and at or before `until` |
+| `author` | only the commits whose author's name or e-mail contains this text, without regard to case |
+| `stats` | `true` adds `stats` to each commit; default `false`, which leaves the member out |
+
+The filters are read together. The cursor carries the commit the first page
+resolved and how many commits the pages before held, so every page of one
+listing is read from that commit, also when `ref` moves between pages; a
+cursor used with other query parameters is refused (see [Lists](#lists)).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of commit objects, with `resolved_sha` |
+| `400` `invalid_request` | a bad `limit` or `cursor`; an illegal `path`; `first_parent`, `follow` or `stats` other than `true` or `false` (`stats must be true or false`); `since` or `until` not an RFC 3339 timestamp (`since must be an RFC 3339 timestamp, such as 2026-01-02T03:04:05Z`); `follow=true` without `path` (`follow=true needs a path, the one file whose renames it follows`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"sha":"4ad62a88646935da6b42d1a9b1462904e8d62e91","parents":["9fceb02d0ae598e95dc970b74767f19372d61af8"],"tree_sha":"e7849aa020dd1d5745b252959a661f3c67634838","author":{"name":"Alice","email":"alice@example.com","time":"2026-01-02T03:04:05Z"},"committer":{"name":"Alice","email":"alice@example.com","time":"2026-01-02T03:04:05Z"},"message":"Second\n\nBody one.\nBody two.\n","change":null,"session_id":null}],"next_cursor":"eyJwIjp7InNoYSI6...","resolved_sha":"4ad62a88646935da6b42d1a9b1462904e8d62e91"}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/commits/{sha}`
+
+Answers the commit object of the commit `{sha}` names, which is any
+revision (a branch name with a `/` is written with `%2F`, as
+`…/commits/feature%2Fx`), always with `stats`. With `files=true` it also
+has `files`, the commit's file changes against its first parent, or
+against the empty tree for a root commit, in byte order of path, each a
+file change (see [Source control reads](#source-control-reads)) without
+`patch`; without it, or with `files=false`, the member is absent.
+
+| Status | When |
+|---|---|
+| `200 OK` | the commit object, with `stats` and, with `files=true`, `files` |
+| `400` `invalid_request` | `files` other than `true` or `false` (`files must be true or false`) |
+| `404` `ref_not_found` | `{sha}` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","parents":[],"tree_sha":"755f3edd3ea43bc4b9134fc17299060a0eae2c91","author":{"name":"Alice","email":"alice@example.com","time":"2026-01-01T00:00:00Z"},"committer":{"name":"Alice","email":"alice@example.com","time":"2026-01-01T00:00:00Z"},"message":"c1","change":null,"session_id":null,"stats":{"files_changed":1,"insertions":1,"deletions":0},"files":[{"path":"old.md","old_path":null,"status":"added","insertions":1,"deletions":0,"binary":false,"old_sha":null,"new_sha":"5626abf0f72e58d7a153368ba57db4c673c0e171"}]}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/tree`
+
+Lists the entries of the directory `path` of the commit `ref` names, in
+byte order of path. It is a list (see [Lists](#lists)) whose `limit`
+defaults to 1000 and may be 1 to 10000, with `cursor`, and names after
+`next_cursor` the commit it was read from in `resolved_sha` and the listed
+directory's tree id in `tree_sha`. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose tree is listed; default the workspace's default branch |
+| `path` | the directory listed (see [Source control reads](#source-control-reads) for the paths taken); default, or empty, the root |
+| `recursive` | `true` lists every entry below `path`, directories as well as their contents; default `false`, the directory's own entries |
+
+A tree entry:
+
+| Member | Value |
+|---|---|
+| `path` | the entry's path from the root, such as `docs/a.md` |
+| `name` | the last segment of `path`, such as `a.md` |
+| `type` | `blob` for a file, `tree` for a directory, `symlink` for a symbolic link (mode `120000`), `commit` for a submodule entry (mode `160000`) |
+| `mode` | git's six-digit octal mode: `100644`, `100755`, `040000`, `120000` or `160000` |
+| `sha` | the entry's object id; for a submodule, the commit it records |
+| `size` | the file's size in bytes, on entries of type `blob` alone |
+
+The cursor carries the commit the first page resolved and the last path of
+the page, so every page of one listing is read from that commit, also when
+`ref` moves between pages; a cursor used with other query parameters is
+refused (see [Lists](#lists)).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of tree entries, with `resolved_sha` and `tree_sha` |
+| `400` `invalid_request` | a bad `limit` or `cursor`; `recursive` other than `true` or `false` (`recursive must be true or false`); an illegal `path`; a `path` that names a file, a symlink or a submodule entry (`path "README.md" is not a directory at <sha>`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"path":"README.md","name":"README.md","type":"blob","mode":"100644","sha":"13bcb9b3fd97cada4cd021e2e72c979c8238efa1","size":19},{"path":"docs","name":"docs","type":"tree","mode":"040000","sha":"6da2702274f2abf0f9c6f803b21a74ba377d235f"},{"path":"link","name":"link","type":"symlink","mode":"120000","sha":"42061c01a1c70097d1e4579f29a5adf40abdec95"},{"path":"run.sh","name":"run.sh","type":"blob","mode":"100755","sha":"85ba14df52f8c72688537de6e7555fb402217b1e","size":19},{"path":"vendor","name":"vendor","type":"tree","mode":"040000","sha":"a379d76fcb2ec666646b67b3d22eb53bf9fe5489"}],"next_cursor":null,"resolved_sha":"b6916afb245765e766995f2bf355f74e2aee2453","tree_sha":"1cce13dc891e3208bb9939d7b515da0889e99ccf"}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/file`
+
+Answers the file or symbolic link `path` of the commit `ref` names. Its
+query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose file is read; default the workspace's default branch |
+| `path` | the file read, required (see [Source control reads](#source-control-reads) for the paths taken) |
+
+Without `Accept: application/json` the answer is the file's bytes, a
+symbolic link's being its target, with `Content-Type:
+application/octet-stream`, `Content-Length` and the headers:
+
+| Header | Value |
+|---|---|
+| `X-Parley-Blob-Sha` | the file's blob id |
+| `X-Parley-Resolved-Sha` | the full id of the commit `ref` resolved to |
+| `X-Parley-File-Mode` | git's mode of the file: `100644`, `100755` or `120000` for a symbolic link |
+
+A `Range` header of exactly one byte range, `bytes=a-b`, `bytes=a-` or
+`bytes=-n` (the last `n` bytes), is answered `206 Partial Content` with
+those bytes, the same headers and `Content-Range: bytes <first>-<last>/<size>`;
+an end past the file is cut to its last byte. A range that starts at or
+after the end of the file (on an empty file, every range) is `416`
+`range_not_satisfiable` with `Content-Range: bytes */<size>`. A header with
+several ranges, or one that is not a byte range, is ignored and the whole
+file answered `200`.
+
+Both forms of a successful answer carry `Vary: Accept`, and each form has
+its own `ETag` (see [Source control reads](#source-control-reads)); a
+range answer carries the tag of the whole file's raw form.
+
+When `Accept` names `application/json`, the answer is a JSON object and a
+`Range` header is ignored:
+
+| Member | Value |
+|---|---|
+| `path` | the file's path, as asked |
+| `sha` | the file's blob id |
+| `mode` | git's mode of the file |
+| `size` | the file's size in bytes |
+| `encoding` | `utf8` when the bytes are valid UTF-8, else `base64` |
+| `content` | the bytes as text for `utf8`, their standard base64 encoding for `base64` |
+| `resolved_sha` | the full id of the commit `ref` resolved to |
+
+A file larger than the hub's file size limit, `[scm].max_file_size` (32 MiB,
+33,554,432 bytes, by default; see [configuration.md](configuration.md)), is
+refused before any of it is read, whole or in part, in both forms; a file of
+exactly the limit is served. An error is the JSON error envelope in both
+forms.
+
+| Status | When |
+|---|---|
+| `200 OK` | the file, raw or as JSON |
+| `206 Partial Content` | one range of the raw file |
+| `400` `invalid_request` | no `path` (`path is required`); an illegal `path`; a `path` that names a directory or a submodule entry (`path "docs" is a directory or a submodule at <sha>, not a file`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope.txt" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `413` `payload_too_large` | the file is over the limit (`file "big.dat" is 33554433 bytes, over the limit of 33554432`), with the member `size`, the file's size in bytes, inside `error` |
+| `416` `range_not_satisfiable` | the one range starts at or after the end of the file |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"path":"README.md","sha":"13bcb9b3fd97cada4cd021e2e72c979c8238efa1","mode":"100644","size":19,"encoding":"utf8","content":"# Tree\n\nA fixture.\n","resolved_sha":"b6916afb245765e766995f2bf355f74e2aee2453"}
+```
+
+```json
+{"error":{"code":413,"message":"file \"big.dat\" is 33554433 bytes, over the limit of 33554432","error_type":"payload_too_large","size":33554433}}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/diff`
+
+Answers the file changes between two revisions. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `base`, `head` | the two revisions compared, both required |
+| `mode` | `merge_base` (the default): the merge base of `base` and `head` against `head`, so a file changed only on `base` since they parted is not in the answer; `direct`: `base` itself against `head` |
+| `path` | a glob, repeatable: only the files whose path one of them matches are answered and counted; `*` matches within a segment, `**` across segments, the whole path, case-sensitively; no `path` keeps every file |
+| `patches` | `true` (the default) or `false`; with `false` no file has `patch` |
+| `context` | the lines of context around each change in the patches, an integer from 0 to 20; default 3 |
+| `format` | `json` (the default) or `patch` |
+
+The JSON answer:
+
+| Member | Value |
+|---|---|
+| `base_sha`, `head_sha` | the full ids `base` and `head` resolved to |
+| `merge_base_sha` | the full id of their merge base, in both modes; `null` when they share no ancestor, and then the left side in `merge_base` mode is the empty tree, so every file of `head` is `added` |
+| `files` | the file changes (see [Source control reads](#source-control-reads)), in byte order of path |
+| `stats` | `{"files_changed": …, "insertions": …, "deletions": …}` over every file the `path` globs keep, also those a cut leaves out |
+| `truncated` | `true` when the answer was cut |
+
+The answer lists at most 5,000 files, the first in path order. Patches are
+added file by file until the next file's patch would take their total past
+8 MiB (8,388,608 bytes); that file and every later one is answered without
+`patch`. A cut of either kind sets `truncated`.
+
+With `format=patch` the answer is the unified diff of the same files as
+text, `Content-Type: text/x-diff`, each binary file as a binary patch, so
+that `git apply` applies it to the left side's tree. It is cut at a file
+boundary by the same limits, and a cut answer carries the header
+`X-Parley-Truncated: true`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the diff, as JSON or as text |
+| `400` `invalid_request` | no `base` or no `head` (`base and head are required`); `mode` other than `merge_base` or `direct` (`mode must be merge_base or direct`); `format` other than `json` or `patch` (`format must be json or patch`); `context` that is not an integer from 0 to 20 (`context must be an integer from 0 to 20`); `patches` other than `true` or `false` (`patches must be true or false`) |
+| `404` `ref_not_found` | `base` or `head` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"base_sha":"6c638ebb967a4ce0b52b308260b292f0dbdbd489","head_sha":"c7a58b21816fb50c8054f4b8d574c7d205f9a4bb","merge_base_sha":"4a5a3035a79aa72418c2fa14d64c763813e558a6","files":[{"path":"edit.txt","old_path":null,"status":"modified","insertions":2,"deletions":1,"binary":false,"old_sha":"b2f931a67315c95c5daab3aac6de62e534808476","new_sha":"c04cd7487d84c5531d5a28b8763a5982ba7b8501","patch":"diff --git a/edit.txt b/edit.txt\nindex b2f931a..c04cd74 100644\n--- a/edit.txt\n+++ b/edit.txt\n@@ -1,5 +1,6 @@\n one\n two\n-three\n+3a\n+3b\n four\n five\n"},{"path":"img.bin","old_path":null,"status":"modified","insertions":0,"deletions":0,"binary":true,"old_sha":"8352675d67aed6625ece79af41c27fdb4ee2e867","new_sha":"a903574af00b573ad9bdb2bccf8d93ed00c675de"},{"path":"new.txt","old_path":null,"status":"added","insertions":3,"deletions":0,"binary":false,"old_sha":null,"new_sha":"5804e5526e21ff0d1a3d282f07834c45f28612ca","patch":"diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..5804e55\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,3 @@\n+n1\n+n2\n+n3\n"}],"stats":{"files_changed":3,"insertions":5,"deletions":1},"truncated":false}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/compare`
+
+Answers how two revisions relate and whether `head` can be rebased onto
+`base`, from a trial rebase that moves no ref. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `base` | the revision `head` would be rebased onto, required |
+| `head` | the revision whose commits would be replayed, required |
+
+The trial replays the commits that `head` reaches and `base` does not,
+oldest first, on top of `base`, in the repository's object store alone: no
+work tree, no index and no ref is used or changed (it may leave objects no
+ref reaches, which git's garbage collection removes). It stops at the first
+commit that does not apply. It needs git 2.40 or later on the hub's `PATH`.
+
+The answer:
+
+| Member | Value |
+|---|---|
+| `base_sha`, `head_sha` | the full ids `base` and `head` resolved to |
+| `merge_base_sha` | the full id of their merge base; `null` when they share no ancestor |
+| `ahead` | the number of commits `head` reaches and `base` does not |
+| `behind` | the number of commits `base` reaches and `head` does not |
+| `commits` | the first 200 of the commits `head` reaches and `base` does not, oldest first, each a commit object (see [Source control reads](#source-control-reads)) without `stats` |
+| `files` | the first 5,000 file changes, in byte order of path, from the merge base (the empty tree when there is none) to `head`, without `patch` |
+| `mergeable` | `clean` when every commit applies, `conflict` when one does not |
+| `conflict` | `null` when `clean`; otherwise the conflict report |
+
+A `head` that `base` contains answers `ahead` `0`, `commits` `[]`, `files`
+`[]` and `clean`.
+
+The conflict report has every member, whichever is empty:
+
+| Member | Value |
+|---|---|
+| `target_sha` | the commit the head was rebased onto: `base_sha` |
+| `head_sha` | `head_sha` |
+| `base_sha` | the merge base: `merge_base_sha` |
+| `commit_sha` | the first commit of `head` that did not apply |
+| `files` | the conflicted files, in byte order of path: `{"path": …, "kind": …, "base": …, "ours": …, "theirs": …, "landed_by": []}` |
+| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` until the hub records which change landed which commit |
+| `change` | the change whose head was rebased; always `null` for the same reason |
+
+In a conflicted file, `base`, `ours` and `theirs` are the file on each side
+of the three-way merge that failed, `{"sha": …, "mode": …, "path": …}` (the
+blob id, git's six-digit octal mode and the path on that side, which a rename
+makes differ), or `null` on a side the file does not exist on: `base` the
+failed commit's parent, `ours` the target with the commits of `head` before
+the failed one replayed on it, `theirs` the failed commit. `kind` is
+`content` when both sides changed the same lines, `add_add` when both added
+the path, `modify_delete` when the target changed a file the head deleted,
+`delete_modify` for the reverse, and `rename`, `mode` (a file on one side, a
+symlink or another type on the other), `binary` or `submodule` where git
+names the conflict so. `landed_by` lists the landed changes that changed the
+file; always `[]` for now.
+
+| Status | When |
+|---|---|
+| `200 OK` | the comparison, `clean` or `conflict` |
+| `400` `invalid_request` | no `base` or no `head` (`base and head are required`) |
+| `400` `merge_commits_unsupported` | a merge commit is among the commits of `head` not in `base` (`the commits of head that are not in base include a merge commit, which a rebase cannot replay`), refused before anything is replayed |
+| `404` `ref_not_found` | `base` or `head` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"base_sha":"25f1fc8af806873de70bc5fcbc519d5252016e97","head_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","merge_base_sha":"a0ad1d035cc9cc15942e85b7855fab58d6d91173","ahead":2,"behind":1,"commits":[{"sha":"6df6be0f167d2a962d6b959a9adb8d07e5f8db0f","parents":["a0ad1d035cc9cc15942e85b7855fab58d6d91173"],"tree_sha":"fb9593de39c7271ab6cb836f1c86b5ce9d019732","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"e1","change":null,"session_id":null},{"sha":"6f061333631277a4de8c1b1608151c23149a7d0d","parents":["6df6be0f167d2a962d6b959a9adb8d07e5f8db0f"],"tree_sha":"401eeb772a93302aaa5152c4fdae59a78fd09088","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"e2","change":null,"session_id":null}],"files":[{"path":"e.txt","old_path":null,"status":"added","insertions":1,"deletions":0,"binary":false,"old_sha":null,"new_sha":"d905d9da82c97264ab6f4920e20242e088850ce9"},{"path":"f.txt","old_path":null,"status":"modified","insertions":1,"deletions":1,"binary":false,"old_sha":"df967b96a579e45a18b8251732d16804b2e56a55","new_sha":"564b12f45becba5fb2f70e270af067c1f13b3aab"}],"mergeable":"conflict","conflict":{"target_sha":"25f1fc8af806873de70bc5fcbc519d5252016e97","head_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","base_sha":"a0ad1d035cc9cc15942e85b7855fab58d6d91173","commit_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","files":[{"path":"f.txt","kind":"content","base":{"sha":"df967b96a579e45a18b8251732d16804b2e56a55","mode":"100644","path":"f.txt"},"ours":{"sha":"ba2906d0666cf726c7eaadd2cd3db615dedfdf3a","mode":"100644","path":"f.txt"},"theirs":{"sha":"564b12f45becba5fb2f70e270af067c1f13b3aab","mode":"100644","path":"f.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/blame`
+
+Answers, for the text file `path` of the commit `ref` names, which commit
+last changed each line. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose file is blamed; default the workspace's default branch |
+| `path` | the file blamed, required (see [Source control reads](#source-control-reads) for the paths taken) |
+| `start_line` | the first line answered, an integer, 1-based; default 1 |
+| `end_line` | the last line answered, an integer, inclusive; default the file's last line, and one past it is cut to it |
+
+The answer:
+
+| Member | Value |
+|---|---|
+| `resolved_sha` | the full id of the commit `ref` resolved to |
+| `path` | the file's path, as asked |
+| `ranges` | the lines `start_line` to `end_line` in ranges, in line order, without overlap and without gaps; `[]` for an empty file |
+
+A range is a run of adjacent lines that one commit last changed at adjacent
+lines of the file as that commit wrote it; a range is cut at `start_line`
+and `end_line`:
+
+| Member | Value |
+|---|---|
+| `start_line`, `end_line` | the range's first and last line, 1-based and inclusive |
+| `commit` | the commit object (see [Source control reads](#source-control-reads)) of the commit that last changed the lines, without `stats` |
+| `original_path` | the file's path in that commit; renames are followed, so lines older than a rename carry the path the file had then |
+| `original_start_line` | the line the range's first line was in that commit |
+
+Only a text file of at most 2 MiB (2,097,152 bytes) is blamed; its size is
+checked before any of it is read. A file is binary, as git decides, when a
+NUL byte is among its first 8,000 bytes.
+
+| Status | When |
+|---|---|
+| `200 OK` | the ranges |
+| `400` `invalid_request` | no `path` (`path is required`); an illegal `path`; a `path` that names a directory or a submodule entry (`path "docs" is a directory or a submodule at <sha>, not a file`); a binary file (`file "bin.dat" is binary at <sha>, and a binary file has no lines to blame`); `start_line` or `end_line` that is not an integer (`start_line must be an integer`); `start_line` below 1 (`start_line must be 1 or more`), past `end_line` (`start_line must not be past end_line`) or past the file's last line (`start_line 7 is past the end of "f.txt", which has 6 lines`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `413` `payload_too_large` | the file is over 2 MiB (`file "big.txt" is 2097153 bytes, over the blame limit of 2097152`), with the member `size`, the file's size in bytes, inside `error` |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"resolved_sha":"e94a3ed170581b5a82b33fbae52aa59e5440a85c","path":"f.txt","ranges":[{"start_line":2,"end_line":2,"commit":{"sha":"c879c916954e2527c2c290a3aefd9dbd29c583d5","parents":[],"tree_sha":"25112f361a479cb362affd349fdf98b7d9549372","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c1","change":null,"session_id":null},"original_path":"f.txt","original_start_line":2},{"start_line":3,"end_line":3,"commit":{"sha":"5ea6473f65744357e45e476ef873539eaabdf894","parents":["dccb1e2ac5045a0393b8c9ca78770ce76457e489"],"tree_sha":"156a012498a0d513b1aeead4e128793235401724","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c3","change":null,"session_id":null},"original_path":"f.txt","original_start_line":3},{"start_line":4,"end_line":4,"commit":{"sha":"dccb1e2ac5045a0393b8c9ca78770ce76457e489","parents":["c879c916954e2527c2c290a3aefd9dbd29c583d5"],"tree_sha":"c2db841be5755f9c5c38e623743dae67506a3265","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c2","change":null,"session_id":null},"original_path":"f.txt","original_start_line":4}]}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/search`
+
+Searches the contents of every text file of the commit `ref` names for the
+lines that match `q`, and answers one item per matching line, ordered by
+path (byte order) and then by line. It is a list (see [Lists](#lists))
+whose `limit` defaults to 50 and may be 1 to 200, with `cursor`, and names
+after `next_cursor` the commit it searched in `resolved_sha`. Its query
+parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `q` | what to look for, required, 1 to 500 characters; by default a literal string, in which characters special in regular expressions match themselves |
+| `ref` | the revision whose files are searched; default the workspace's default branch |
+| `regex` | `true` takes `q` as an extended regular expression; default `false`. The escapes `\w`, `\W`, `\s` and `\S` outside a bracket expression mean `[[:alnum:]_]`, `[^[:alnum:]_]`, `[[:space:]]` and `[^[:space:]]` with every C library git is built on |
+| `case_sensitive` | `false` matches without regard to case; default `true` |
+| `path` | a glob, repeatable: only files whose path one of the globs matches are searched (`*` within a segment, `**` across segments, the whole path, case-sensitive); default every file |
+
+A file git treats as binary (a NUL byte among its first 8,000 bytes) is
+never searched, and neither is a submodule entry. A match:
+
+| Member | Value |
+|---|---|
+| `path` | the file's path from the root |
+| `line` | the line's number, 1-based |
+| `text` | the line without its line ending (`\n` or `\r\n`), cut to its first 500 characters (characters, not bytes, so no character is split) |
+
+A `q` that holds a newline matches no line. The cursor carries the commit
+the first page resolved and the path and line of the last match of the
+page, so every page of one search reads that commit, also when `ref` moves
+between pages; a cursor used with other query parameters is refused (see
+[Lists](#lists)).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of matches, with `resolved_sha`; `items` `[]` when nothing matches |
+| `400` `invalid_request` | a bad `limit` or `cursor`; no `q`, an empty `q` or one over 500 characters (`q must have 1 to 500 characters`); a `q` holding a NUL character (`q must not contain a NUL character`); `regex` or `case_sensitive` other than `true` or `false` (`regex must be true or false`); with `regex=true`, a `q` git refuses as an extended regular expression (`q "(x" is not a valid extended regular expression`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"path":"api/greeting.go","line":3,"text":"func Greeting() string {"},{"path":"docs/a.md","line":1,"text":"# Greeting"}],"next_cursor":null,"resolved_sha":"2ecc9343e95b57b9f37e0e94ee6bae610a47b8bd"}
 ```
 
 ## Admin routes

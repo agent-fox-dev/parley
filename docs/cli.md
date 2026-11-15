@@ -389,6 +389,7 @@ Available Commands:
   login             Sign in to the hub and save the hub URL and the credential
   orgs              List and read the organizations you belong to
   sandbox           Work with the hub's sandboxes and their profiles
+  scm               Read the refs, commits, files, diffs and blame of a workspace without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   tokens            Create, read, change and revoke your personal access tokens
   user              Read and update your own profile
@@ -1988,6 +1989,72 @@ needs the flag --ttl`) or an empty one (`parley fork extend needs a value for
 --ttl`) are refused with a `usage_error` and exit status `2` before any
 setting is read or any request sent. `--confirm` is an unknown flag of
 `parley fork delete`, refused the same way.
+
+### `parley scm`
+
+`parley scm` run without a command prints its help and exits `0`; it reads
+no credential and sends no request. Its nine commands read a workspace's
+repository without a clone, through the
+[source control reads](api.md#source-control-reads) of the hub. Each sends
+one `GET` with the credential as `Authorization: Bearer`, `<slug>` (and the
+`<rev>` of `show`) as one percent-encoded path segment
+(`parley scm show demo feature/x` sends
+`GET /api/v1/workspaces/demo/scm/commits/feature%2Fx`), its other arguments
+and each flag given as query parameters, and no parameter for a flag not
+given, so that the hub's default applies. Text flags are sent as given, for
+the hub to judge; a boolean flag sends its value below when given.
+
+| Command | Request | Arguments and flags sent as |
+|---|---|---|
+| `parley scm refs <slug> [--prefix <p>] [--limit <n>] [--cursor <c>]` | `GET …/scm/refs` | `prefix`, `limit`, `cursor` |
+| `parley scm log <slug> [--ref <rev>] [--path <path>] [--follow] [--since <time>] [--until <time>] [--author <text>] [--stats] [--limit <n>] [--cursor <c>]` | `GET …/scm/commits` | `ref`, `path`, `follow=true`, `since`, `until`, `author`, `stats=true`, `limit`, `cursor` |
+| `parley scm show <slug> <rev> [--files]` | `GET …/scm/commits/<rev>` | `files=true` |
+| `parley scm ls <slug> [path] [--ref <rev>] [--recursive]` | `GET …/scm/tree` | `path`, `ref`, `recursive=true` |
+| `parley scm cat <slug> <path> [--ref <rev>] [--output <file>]` | `GET …/scm/file` | `path`, `ref` |
+| `parley scm diff <slug> <base> <head> [--mode merge_base\|direct] [--path <glob>]... [--patch \| --name-only]` | `GET …/scm/diff` | `base`, `head`, `mode`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
+| `parley scm compare <slug> <base> <head> [--fail-on-conflict]` | `GET …/scm/compare` | `base`, `head` |
+| `parley scm blame <slug> <path> [--ref <rev>] [--lines <start>:<end>]` | `GET …/scm/blame` | `path`, `ref`, `--lines` `start_line` and `end_line` |
+| `parley scm search <slug> <query> [--ref <rev>] [--path <glob>]... [--regex] [--ignore-case]` | `GET …/scm/search` | `q`, `ref`, one `path` per `--path`, `regex=true`, `--ignore-case` `case_sensitive=false` |
+
+`parley scm search demo 'to do' --ref v1 --path 'src/**' --path '*.go'
+--regex --ignore-case` sends
+`GET /api/v1/workspaces/demo/scm/search?case_sensitive=false&path=src%2F%2A%2A&path=%2A.go&q=to+do&ref=v1&regex=true`.
+
+Every command but `cat` and `diff --patch` prints the hub's JSON answer on
+stdout, as every result is printed (see [Output](#output)), with exit status
+`0`. `ls`, `search`, `refs` and `log` print the one page the hub answered
+and do not follow `next_cursor`; `refs` and `log` take `--cursor` to read
+the next one.
+
+- `parley scm cat` asks for the raw form of the file (`Accept: */*`) and
+  writes the file's bytes, unchanged and without JSON framing, to stdout,
+  or with `--output <file>` to that file, created or replaced, with stdout
+  empty. The file is written only once the hub has answered `200`: after a
+  refusal nothing is written, no file is created and an existing one is left
+  as it was. A file that cannot be written is a `client_error` (`cannot
+  write the file: …`) with exit status `2`.
+- `parley scm diff --patch` prints the unified diff text the hub answers
+  (`Content-Type: text/x-diff`) as received; `--name-only` prints the JSON
+  answer, whose files carry no `patch`.
+- `parley scm compare --fail-on-conflict` prints the answer and, when its
+  `mergeable` is `conflict`, ends with a `condition_not_met` envelope on
+  stderr (`head does not rebase onto base without a conflict: mergeable is
+  conflict`) and exit status `3`. With `mergeable` `clean`, or without the
+  flag, the exit status is `0`.
+
+A refusal of the hub's (`404` `ref_not_found` or `path_not_found`, `409`
+`workspace_busy`, `413` `payload_too_large`, `503` `scm_timeout`, among
+others) is written to stderr as received, with nothing on stdout and exit
+status `1`.
+
+**Client checks.** A wrong number of arguments, a `--mode` other than
+`merge_base` or `direct` (`parley scm diff takes --mode merge_base or
+direct, got "sideways"`), `--patch` with `--name-only` (`parley scm diff
+takes --patch or --name-only, not both`), a `--lines` that is not two
+positive integers `<start>:<end>` (`parley scm blame takes --lines
+<start>:<end>, two positive integers, got "3"`) and a `--limit` that is not
+an integer are refused with a `usage_error` and exit status `2` before any
+setting is read or any request sent.
 
 ### `parley credential-helper`
 

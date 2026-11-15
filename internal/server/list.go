@@ -118,6 +118,19 @@ func (p Page) After(pos any) (bool, error) {
 // when items are added or removed earlier in the order; it must encode as
 // JSON, and After decodes it on the next page.
 func WritePage[T any](w http.ResponseWriter, p Page, items []T, position func(T) any) error {
+	return WritePageWith(w, p, items, position)
+}
+
+// Member is a named member a list answer carries after next_cursor.
+type Member struct {
+	Name  string
+	Value any
+}
+
+// WritePageWith is WritePage for a list that names more than its items,
+// such as the commit the page was read from: members follow next_cursor,
+// in their order.
+func WritePageWith[T any](w http.ResponseWriter, p Page, items []T, position func(T) any, members ...Member) error {
 	var next *string
 	if len(items) > p.Limit {
 		items = items[:p.Limit]
@@ -130,10 +143,22 @@ func WritePage[T any](w http.ResponseWriter, p Page, items []T, position func(T)
 	if items == nil {
 		items = []T{}
 	}
-	WriteJSON(w, http.StatusOK, struct {
-		Items      []T     `json:"items"`
-		NextCursor *string `json:"next_cursor"`
-	}{items, next})
+	b := bytes.NewBufferString("{")
+	for i, m := range append([]Member{{"items", items}, {"next_cursor", next}}, members...) {
+		value, err := json.Marshal(m.Value)
+		if err != nil {
+			return fmt.Errorf("encode list member %s: %w", m.Name, err)
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		name, _ := json.Marshal(m.Name)
+		b.Write(name)
+		b.WriteByte(':')
+		b.Write(value)
+	}
+	b.WriteByte('}')
+	WriteJSON(w, http.StatusOK, json.RawMessage(b.Bytes()))
 	return nil
 }
 

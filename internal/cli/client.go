@@ -92,6 +92,10 @@ type apiRequest struct {
 	// one is a client_error naming the status, reported as soon as the
 	// bound is passed.
 	maxAnswer int64
+	// accept, when not empty, is sent as the Accept header in place of
+	// application/json, for a route that answers another form unless JSON
+	// is asked for.
+	accept string
 }
 
 // response is the hub's answer to one request: its status and its whole
@@ -172,7 +176,11 @@ func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
 	if r.body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Accept", "application/json")
+	accept := "application/json"
+	if r.accept != "" {
+		accept = r.accept
+	}
+	req.Header.Set("Accept", accept)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

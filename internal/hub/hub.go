@@ -35,6 +35,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
+	"github.com/agent-fox-dev/parley/internal/scm"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -68,6 +69,7 @@ var parts = []func(*Composition){
 	composeWorkspaces,
 	composeForks,
 	composeGitServer,
+	composeSCM,
 	composeSandbox,
 }
 
@@ -200,6 +202,12 @@ type Composition struct {
 	// dependencies (AdjustGitServer).
 	gitServer          *gitserver.Component
 	gitServerAdjusters []func(*gitserver.Deps)
+
+	// scm is the read half of the source control API, which composeSCM
+	// creates and binds in its start hook (SCM), after scmAdjusters have
+	// changed its dependencies (AdjustSCM).
+	scm          *scm.Component
+	scmAdjusters []func(*scm.Deps)
 
 	// refWriter is the ref writer every surface that writes refs writes
 	// through (RefWriter). It exists from the composition on, so that a
