@@ -17,6 +17,7 @@ import (
 func TestLookups_AnswerFromTheChangeRecord(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
+	w.hold(t)
 	f := w.changesOfDemo(t)
 	ctx := context.Background()
 

@@ -60,6 +60,9 @@ func TestSourceDeleted_AbandonsTheChangeOfTheBranchAndKeepsItsVersions(t *testin
 			if got := abandonReason(t, w, c.number); got != "source_deleted" {
 				t.Errorf("abandon reason = %q, want source_deleted", got)
 			}
+			if got := w.announced(t, c.number); got != "" {
+				t.Errorf("the change is still announced landable at %s", got)
+			}
 			if got := w.versions(t, "demo", c.number); len(got) != len(c.heads) {
 				t.Errorf("versions = %v, want %d", got, len(c.heads))
 			}
@@ -73,7 +76,7 @@ func TestSourceDeleted_AbandonsTheChangeOfTheBranchAndKeepsItsVersions(t *testin
 				t.Fatalf("events = %+v, want one parley.change.abandon", events)
 			}
 			e := events[0]
-			want := map[string]any{"reason": "source_deleted", "ref": change.Ref("demo", c.number),
+			want := map[string]any{"number": float64(c.number), "reason": "source_deleted", "ref": change.Ref("demo", c.number),
 				"version": float64(len(c.heads)), "head_sha": c.heads[len(c.heads)-1]}
 			if e.Type != change.EventAbandon || e.ResourceType != "change" || e.ResourceID != strconv.FormatInt(c.number, 10) ||
 				*e.Workspace != "demo" || e.ActorType != change.CredentialAPIKey || e.ActorID == nil || *e.ActorID != w.owner ||

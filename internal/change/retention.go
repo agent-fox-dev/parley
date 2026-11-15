@@ -29,19 +29,16 @@ const (
 // SourceDeleted moves the draft or open change whose source is the branch,
 // named without refs/heads/, of the workspace (the source workspace, a
 // task fork or the change's own workspace) to abandoned for
-// ReasonSourceDeleted, as actor did, and writes parley.change.abandon. The
-// move goes through SetAbandoned, so a fork source's activity recorder is
-// told: the fork lives on, and the move may end its work. A branch that is
-// the source of no draft or open change changes nothing.
+// ReasonSourceDeleted, as actor did, through Abandon: it writes
+// parley.change.abandon, and a fork source's activity recorder is told, for
+// the fork lives on and the move may end its work. A branch that is the
+// source of no draft or open change changes nothing.
 func (c *Component) SourceDeleted(ctx context.Context, tx *sql.Tx, workspace, branch string, actor Caller) error {
 	target, number, found, err := activeOfSource(ctx, tx, workspace, branch)
 	if err != nil || !found {
 		return err
 	}
-	if err := c.SetAbandoned(ctx, tx, target, number, ReasonSourceDeleted); err != nil {
-		return err
-	}
-	return c.emitAbandon(ctx, tx, actor, target, number, ReasonSourceDeleted)
+	return c.Abandon(ctx, tx, target, number, ReasonSourceDeleted, actor)
 }
 
 // ForkDeleted moves every draft or open change whose source workspace is

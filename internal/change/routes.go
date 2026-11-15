@@ -11,11 +11,17 @@ import (
 
 // Routes are the change routes, for the server's router: the open, the
 // list and the reads of one change, its versions, the change of a commit
-// and the diff of a version.
+// and the diff of a version, and the edit, the abandon and the restore of
+// one change.
 func (c *Component) Routes() []server.Route {
 	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	read := func(pattern string, h server.HandlerFunc) server.Route {
 		return server.Route{Method: http.MethodGet, Pattern: pattern, Scope: "changes:read", Marks: need, Handler: h}
+	}
+	// A write route on one change needs only read access to its workspace:
+	// AuthorizeModify lets its author through, who may only read it.
+	write := func(method, pattern string, h server.HandlerFunc) server.Route {
+		return server.Route{Method: method, Pattern: pattern, Scope: "changes:write", Marks: need, Handler: h}
 	}
 	// The patterns are those of the contributor table of internal/access,
 	// parameter names included, so that a token bound to a fork reaches
@@ -32,6 +38,9 @@ func (c *Component) Routes() []server.Route {
 		read("/workspaces/:slug/changes/:number/versions", c.listVersions),
 		read("/workspaces/:slug/changes/:number/versions/:version", c.getVersion),
 		read("/workspaces/:slug/changes/:number/diff", c.getDiff),
+		write(http.MethodPatch, "/workspaces/:slug/changes/:number", c.editRoute),
+		write(http.MethodPost, "/workspaces/:slug/changes/:number/abandon", c.abandonRoute),
+		write(http.MethodPost, "/workspaces/:slug/changes/:number/restore", c.restoreRoute),
 	}
 }
 

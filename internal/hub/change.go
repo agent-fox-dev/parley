@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -18,8 +19,21 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// changeHook is the name of the start hook that binds the change component.
-const changeHook = "changes"
+// changeHook is the name of the start hook that binds the change component;
+// reconcileHook the name of the one after it that reconciles the changes
+// with their source branches.
+const (
+	changeHook    = "changes"
+	reconcileHook = "changes-reconcile"
+)
+
+// mergeabilityWork is the name of the background work that runs the
+// mergeability checks; mergeabilityGrace is how long the stop waits for
+// it, which ends the git process of a running check at once.
+const (
+	mergeabilityWork  = "change_mergeability"
+	mergeabilityGrace = 5 * time.Second
+)
 
 // composeChanges adds the changes: the schema of the change record, the
 // change routes under /workspaces/:slug/changes, whose scope and access
@@ -62,6 +76,28 @@ const changeHook = "changes"
 //     the refs moved and before the push is answered; it is bound to the
 //     hub's logger in the start hook.
 //
+// It runs the mergeability checks as background work (RunMergeability),
+// spaced per change by [changes].mergeable_debounce, each result stored
+// with its parley.change.conflict and parley.change.ready events
+// (StoreMergeability, AnnounceLandable), and schedules them from the
+// transaction that moved what a change sits on:
+//
+//   - a version observer (MergeableObserver) schedules the check of a
+//     change with a new version, whatever recorded it, and of the changes
+//     that depend on it;
+//   - a second ref-updated stage of the ref writer (TargetsUpdated), after
+//     the first, schedules the checks of the changes whose target branch a
+//     push, the source control API or a landing moved, created or deleted;
+//   - a second branch-move observer of sync (syncTargets) does so for a
+//     branch a sync moved, in a store transaction of its own.
+//
+// A start hook after the one that binds the component, and so before the
+// listener is bound, reconciles every draft and open change with its source
+// branch (Reconcile): the head of a branch moved while its bookkeeping was
+// lost is recorded as a version by the hub, a change whose source branch is
+// gone is abandoned for source_deleted, and every change whose mergeable is
+// unknown is scheduled for a check, which the worker runs once it starts.
+//
 // No session linker, stack linker, landing evaluator or auto_land guard is
 // registered: without a session linker an explicit session_id is refused
 // and a defaulted one dropped; without a stack linker no change depends on
@@ -74,13 +110,19 @@ func composeChanges(c *Composition) {
 	comp := &change.Component{}
 	c.changes = comp
 	c.AddSchemaStep(change.SchemaStep)
+	c.AddSchemaStep(change.AutoLandSetterStep)
+	c.AddSchemaStep(change.MergeableStep)
+	c.AddSchemaStep(change.AnnouncedStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
 	c.refWriter.RegisterRefUpdatedStage(comp.RefUpdated)
+	c.refWriter.RegisterRefUpdatedStage(comp.TargetsUpdated)
+	comp.AddVersionObserver(comp.MergeableObserver())
 	c.scm.RegisterChangeLinker(changeLinker{comp, c.runtime})
 	c.AdjustSCM(func(d *scm.Deps) { d.Changes = changeLookup{comp} })
 	c.workspaces.RegisterBranchMoveObserver(syncVersions{comp, c.runtime})
+	c.workspaces.RegisterBranchMoveObserver(syncTargets{comp, c.runtime})
 	c.workspaces.Teardown().RegisterRemover(func(ctx context.Context, tx *sql.Tx, slug string) error {
 		if err := comp.ForkDeleted(ctx, tx, slug, change.Caller{}); err != nil {
 			return err
@@ -110,6 +152,8 @@ func composeChanges(c *Composition) {
 			Events:     c.events,
 			Now:        rt.Now,
 			Logger:     rt.Logger,
+
+			MergeableDebounce: rt.Config.Changes.MergeableDebounce,
 		}
 		for _, adjust := range c.changeAdjusters {
 			adjust(&d)
@@ -118,6 +162,8 @@ func composeChanges(c *Composition) {
 		mapper.Bind(rt.Logger)
 		return nil
 	})
+	c.AddStartHook(reconcileHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
+	c.AddBackgroundWork(mergeabilityWork, mergeabilityGrace, func(ctx context.Context, _ *Runtime) { comp.RunMergeability(ctx) })
 }
 
 // changeWorkspaces reads the workspace records for the change component,
@@ -331,6 +377,20 @@ func (o syncVersions) BranchMoved(ctx context.Context, m workspace.BranchMove) e
 		_, err := o.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: m.Workspace, Branch: m.Branch, Head: m.After,
 			Kind: change.KindSync})
 		return err
+	})
+}
+
+// syncTargets is the branch-move observer of sync that schedules the
+// mergeability checks of the changes whose target branch a sync moved, in
+// a store transaction of its own.
+type syncTargets struct {
+	changes *change.Component
+	rt      *Runtime
+}
+
+func (o syncTargets) BranchMoved(ctx context.Context, m workspace.BranchMove) error {
+	return o.rt.Store.Tx(ctx, func(tx *sql.Tx) error {
+		return o.changes.ScheduleTargetMergeable(ctx, tx, m.Workspace, m.Branch)
 	})
 }
 

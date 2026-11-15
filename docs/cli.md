@@ -1994,9 +1994,10 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its six commands open and read
-the changes of a workspace through the [change routes](api.md#changes) of
-the hub. Each sends one request with the credential as
+reads no credential and sends no request. Its twelve commands open, read,
+edit, abandon, restore and wait for the changes of a workspace through the
+[change routes](api.md#changes) of the hub. Each sends one request (`edit`
+with a label flag two, `wait` one per poll, see below) with the credential as
 `Authorization: Bearer` and `<slug>` (and the `<sha>` of `find`) as one
 percent-encoded path segment (`parley change open a/b --source feat` sends
 `POST /api/v1/workspaces/a%2Fb/changes`).
@@ -2009,6 +2010,12 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change find <slug> <sha>` | `GET …/changes/by-commit/<sha>` | |
 | `parley change versions <slug> <number>` | `GET …/changes/<number>/versions` | |
 | `parley change diff <slug> <number> [--version <n>\|latest] [--against <n>] [--path <glob>]... [--patch \| --name-only]` | `GET …/changes/<number>/diff` | `version`, `against`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
+| `parley change edit <slug> <number> [--title <t>] [--intent <i>\|@<file>\|-] [--label <l>]... [--remove-label <l>]... [--auto-land \| --no-auto-land] [--target <branch>]` | `PATCH …/changes/<number>` | the body below |
+| `parley change ready <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"open"}` |
+| `parley change draft <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"draft"}` |
+| `parley change abandon <slug> <number> [--reason <text>] [--dependants reparent\|abandon]` | `POST …/changes/<number>/abandon` | `reason` and `dependants`, as given; `{}` without a flag |
+| `parley change restore <slug> <number>` | `POST …/changes/<number>/restore` | no body |
+| `parley change wait <slug> <number> [--for landed\|ready\|mergeable] [--timeout <duration>] [--poll-interval <duration>]` | `GET …/changes/<number>`, once per poll | |
 
 A flag not given sends no parameter, so that the hub's default applies;
 text values are sent as given, for the hub to judge.
@@ -2026,6 +2033,19 @@ stdin that cannot be read is a `client_error` (`cannot read the intent:
 open /nonexist: no such file or directory`) with exit status `2`, and no
 request is sent.
 
+The body of `parley change edit` holds one member for each flag given and
+none for a flag not given, so that a member not named is left as it is:
+`--title` `title` (an empty `--title ""` is sent as `""`, for the hub to
+judge), `--intent` `intent` (read as for `open`, before any request),
+`--auto-land` `auto_land` `true`, `--no-auto-land` `auto_land` `false`,
+and `--target` `target_branch`. With `--label` or `--remove-label`, each
+repeatable, `edit` first reads the change with `GET …/changes/<number>`,
+takes its `labels`, removes every `--remove-label` value, appends every
+`--label` value it does not hold yet, in order, and sends the result as
+`labels` in the one `PATCH` (`--remove-label a --label a` on `["a","b"]`
+sends `["b","a"]`; removing every label sends `[]`). When that read fails,
+its error is printed as for any refusal and no `PATCH` is sent.
+
 Every command but `diff --patch` prints the hub's JSON answer on stdout, as
 every result is printed (see [Output](#output)), with exit status `0`;
 `open` prints the `201` change. `parley change diff --patch` prints the
@@ -2034,9 +2054,39 @@ received; `--name-only` prints the JSON answer, whose files carry no
 `patch`. `list` prints the one page the hub answered and does not follow
 `next_cursor`.
 
+`parley change wait` reads the change at once, then again one
+`--poll-interval` (default `5s`) after each answer, until the change meets
+the condition of `--for` or can no longer meet it, under one deadline:
+`--timeout` (default `5m`) counted from the start of the command. Durations
+are written as for [Waiting](#waiting). The command changes nothing on the
+hub. Each read decides the wait from the change's `state`,
+`landing.status` and `mergeable`:
+
+| `--for` | Ends with exit status `0` | Fails with `wait_failed` |
+|---|---|---|
+| `landed` (the default) | `state` `landed` | `state` `abandoned` |
+| `ready` | `state` `landed`, or `landing.status` `ready` with `mergeable` `clean` | `state` `abandoned`, `landing.status` `blocked` (a draft's always is) or `mergeable` `conflict` |
+| `mergeable` | `state` `landed`, or `mergeable` `clean` | `state` `abandoned` or `mergeable` `conflict` |
+
+Any other change keeps the wait going. Each read writes one progress line
+to stderr, `waiting: <state>, landing <status>, mergeable <mergeable>`
+(`waiting: open, landing pending, mergeable unknown`; a member the change
+does not carry is left out, as in `waiting: landed`). On a success the
+change of the last read is the only document on stdout and the exit status
+is `0`. On a failure the change of the last read is printed on stdout and
+`wait_failed` is written to stderr (`the change is open, landing blocked,
+mergeable clean, which ends the wait for ready`), with exit status `1`.
+When the deadline passes first, nothing is printed on stdout and
+`wait_timeout` is written to stderr (`the operation did not end within 5m;
+its last state was "open, landing pending, mergeable unknown"`), with exit
+status `1`; a read in flight at the deadline is abandoned. A read the hub
+answers with an error ends the wait at once: its envelope is written to
+stderr as received, nothing to stdout, exit status `1`.
+
 A refusal of the hub's (`404` `change_not_found`, `400`
-`source_not_related`, `409` `change_exists`, `400` `invalid_request`, among
-others) is written to stderr as received, with nothing on stdout and exit
+`source_not_related`, `409` `change_exists`, `400` `invalid_request`, `409`
+`change_closed`, `400` `intent_required`, `409` `has_dependants`, `409`
+`source_workspace_gone`, among others) is written to stderr as received, with nothing on stdout and exit
 status `1`. `open` is sent once and never retried.
 
 **Client checks.** A missing `--source`, a wrong number of arguments, a
@@ -2045,9 +2095,19 @@ positive integer in decimal digits (`parley change show takes a <number>
 that is a positive integer, got "x"`), a `--version` that is neither that
 nor `latest` (`parley change diff takes --version <n>, a positive integer
 or latest, got "x"`), `--patch` with `--name-only` (`parley change diff
-takes --patch or --name-only, not both`) and a `--limit` that is not an
-integer are refused with a `usage_error` and exit status `2` before any
-setting is read or any request sent.
+takes --patch or --name-only, not both`), a `--limit` that is not an
+integer, `edit` without any of its edit flags (`parley change edit needs
+at least one of --title, --intent, --label, --remove-label, --auto-land,
+--no-auto-land, --target`), `edit` with both `--auto-land` and
+`--no-auto-land` (`parley change edit takes --auto-land or --no-auto-land,
+not both`), an `abandon --dependants` other than `reparent` and
+`abandon` (`parley change abandon takes --dependants reparent or abandon,
+got "delete"`), a `wait --for` other than `landed`, `ready` and
+`mergeable` (`parley change wait takes --for landed, ready or mergeable,
+got "done"`) and a `wait --timeout` or `--poll-interval` that is not a
+duration above zero (see [Waiting](#waiting)) are refused with a
+`usage_error` and exit status `2` before any setting is read or any request
+sent.
 
 ### `parley scm`
 
@@ -2403,8 +2463,8 @@ their values and in their order. An error `parley` raises itself has `code`
 |---|---|
 | `usage_error` | the command line cannot be accepted: an unknown command, at the top level or under a group, an unknown flag, a flag without its value or with a value that does not parse as the flag's type, fewer or more arguments than the command takes, a flag the command requires that is not given, `parley help` with words that name no command, or a value the command refuses (`parley login --expires 45`). It is raised before any setting is read and before any request |
 | `client_error` | a failure on the client's side that is not the command line's: for example no hub URL, a configuration file that cannot be read, a hub that cannot be reached, an answer that is not the hub's. A failure inside the CLI of no other kind is reported as a `client_error` too, with its text as the message |
-| `wait_failed` | a wait for a long operation ended in a state that is not a success (see [Waiting](#waiting)) |
-| `wait_timeout` | a wait for a long operation ran out of time (see [Waiting](#waiting)) |
+| `wait_failed` | a wait for a long operation ended in a state that is not a success (see [Waiting](#waiting)), or `parley change wait` read a change that ends its wait without meeting it (see [`parley change`](#parley-change)) |
+| `wait_timeout` | a wait for a long operation, or `parley change wait`, ran out of time (see [Waiting](#waiting)) |
 | `condition_not_met` | a `--fail-on-…` condition held in the result |
 
 The exit status follows from the error alone, on every command:

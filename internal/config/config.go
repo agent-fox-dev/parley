@@ -50,6 +50,7 @@ type Config struct {
 	OAuth     OAuth
 	Forks     Forks
 	SCM       SCM
+	Changes   Changes
 
 	values map[string]map[string]any
 	// sections holds the content of each section registered as a whole that
@@ -203,6 +204,7 @@ func (r *Registry) Load(env Env, workDir string) (*Config, error) {
 	c := build(values, providers, path, work, lookup(env, "XDG_DATA_HOME"))
 	c.Forks = forks
 	c.SCM = scmFrom(values)
+	c.Changes = changesFrom(values)
 	c.sections = sections
 	return c, nil
 }

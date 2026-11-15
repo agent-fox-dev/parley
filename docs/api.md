@@ -3592,7 +3592,7 @@ The change object:
 | `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
-| `mergeable`, `conflict` | `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` |
+| `mergeable`, `conflict` | whether the commits of the current version that the onto-commit lacks rebase onto the onto-commit, the commit the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
 | `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
@@ -3626,6 +3626,17 @@ and the deletion of the target workspace deletes its changes. Each
 abandonment writes `parley.change.abandon`, its `reason` `source_deleted`
 or `source_workspace_deleted`. The versions and their refs stay.
 
+When `parleyd` starts, before it accepts a request, it compares the source
+branch of every draft and open change with the head of the change's
+current version, so that a move whose bookkeeping a stop lost is not lost:
+a branch at another commit records that commit as the next version, of
+kind `ref` by the hub (`created_by.actor_type` `system`), with its
+`parley.change.version` event; a missing branch, while the source
+workspace still exists, abandons the change with `reason`
+`source_deleted` by the hub. A change that is in line with its branch is
+left as it is, `updated_at` included. Every draft and open change whose
+`mergeable` is `unknown` then gets a mergeability check without a request.
+
 ## `POST /api/v1/workspaces/{slug}/changes`
 
 Opens a change in the workspace `{slug}`, the target workspace. It needs,
@@ -3654,17 +3665,17 @@ token opens only from a workspace its binding covers. The body:
 
 The answer is `201` with the change object, at version 1: the head of the
 source branch, of kind `ref`, written at `refs/parley/changes/<number>/1`.
-`mergeable` is `unknown`. A draft has `landing`
+`mergeable` is `unknown` until its first check. A draft has `landing`
 `{"status":"blocked","reason":"draft","requirements":[]}`; any other
 change the landing evaluation's answer, which until the hub has a landing
 policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
 hub has a session feature, every `session_id` is refused and a defaulted
 one dropped.
 
-The open writes `parley.change.version` for version 1, with `ref`,
-`version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to` and
-`draft` in its metadata, then, unless the change is a draft,
-`parley.change.open`, with `ref`, `version`, `head_sha`, `title`,
+The open writes `parley.change.version` for version 1, with `number`,
+`ref`, `version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to`
+and `draft` in its metadata, then, unless the change is a draft,
+`parley.change.open`, with `number`, `ref`, `version`, `head_sha`, `title`,
 `target_branch`, `source_workspace`, `source_branch`, `depends_on` and
 `was_draft` (`false`). Both have `resource_type` `change`, `resource_id`
 the number, the target workspace and the change's session. A refused open
@@ -3702,7 +3713,7 @@ answers `201` and the other `409` `change_exists`.
 | `403` `path_not_allowed` | a path-scoped token, and a file of the version matches none of its globs; `error.path` names the first such file in byte order |
 | `403` `token_bound` | a token bound to a task fork, on the fork's parent, with another `source.workspace_slug` or none |
 | `404` `not_found` | the caller cannot read `{slug}` |
-| `409` `change_exists` | another draft or open change has this source; `details` is `{"workspace_slug", "number", "ref"}` of that change |
+| `409` `change_exists` | another draft or open change has this source; the message names its ref, and `details` is `{"workspace_slug", "number", "ref"}` of that change |
 | `409` `workspace_busy` | the target or the source workspace is pending, cloning, or under a reclone, archive or delete |
 | `409` `workspace_not_ready` | the target or the source workspace failed its clone |
 | `409` `workspace_archived` | the target or the source workspace is archived |
@@ -3881,6 +3892,201 @@ On a task fork's slug the list holds the changes of the fork's parent
 whose `source.workspace_slug` is the fork, with the same filters and
 order; a fork holds no changes of its own. A token bound to a task fork
 lists, on the fork's parent, only the changes whose source is that fork.
+
+## Modifying a change
+
+`PATCH /api/v1/workspaces/{slug}/changes/{number}`,
+`POST /api/v1/workspaces/{slug}/changes/{number}/abandon` and
+`POST /api/v1/workspaces/{slug}/changes/{number}/restore` modify a change
+of the workspace `{slug}`. Each needs, for a personal access token,
+`changes:write`, and read access to `{slug}`: a token without the scope is
+answered `403` `insufficient_scope` also when `{slug}` names no workspace,
+and a caller who cannot read `{slug}` `404` `not_found`, as for a slug
+that names none. The change is then found as on the [reads of a
+change](#reading-a-change): a number that names no change the request may
+reach, the changes outside its fork for a token bound to a task fork
+included, answers `404` `change_not_found`.
+
+A change may be modified by the user who opened it (its
+`author.actor_id`), with any credential of theirs, also when they only
+read `{slug}`; by a caller who writes `{slug}` (its owner); and with the
+admin token. Anyone else who reads `{slug}` is answered `403`
+`forbidden`, and the change is left as it was.
+
+Then the body is checked (`400` `invalid_request`), and then the state of
+`{slug}`: while it is `pending` or `cloning`, or a reclone, archive or
+delete of it runs, the answer is `409` `workspace_busy`; when its clone
+failed, `409` `workspace_not_ready`; when it is archived, `409`
+`workspace_archived`. Each route answers `200` with the change object as
+`GET …/changes/{number}` returns it.
+
+- `PATCH` takes a JSON object whose members `title`, `intent`, `labels`,
+  `auto_land`, `state` and `target_branch` edit the change; a member the
+  body does not name keeps its value, and members it does not know are
+  ignored. Every member it names is checked before anything is stored,
+  and one that fails refuses the whole body with `400` `invalid_request`:
+  `title` a string of 1 to 200 characters (Unicode code points; white
+  space only is empty) without a line feed or carriage return, `intent` a
+  string of at most 16,000 characters, `labels` an array of strings,
+  which replaces the whole list after its duplicates are removed (the
+  first kept), of at most 20 labels each matching
+  `^[a-z0-9][a-z0-9_.:/-]{0,62}$`, `auto_land` `true` or `false`, `state`
+  `"draft"` or `"open"`, and `target_branch` a string; `null` is the
+  wrong type for each. A body that names none of them changes nothing,
+  `updated_at` included, whatever the change's state. An abandoned change
+  takes no edit and a landed one only an edit of `labels` alone: else
+  `409` `change_closed`. An edit that would leave the change `open` with
+  an empty intent while `{slug}`'s `changes.require_intent` is on is
+  answered `400` `intent_required`. A body with `auto_land` asks the
+  `auto_land` guard, when one is registered, before anything is stored;
+  its refusal is the answer and nothing of the body is applied. A
+  `state` of `"open"` on a draft marks it ready: the change becomes
+  `open`, its `landing` is evaluated again without the `draft` block, and
+  `parley.change.open` is written by the caller with `number`, `ref`,
+  `version`, `head_sha`, `title`, `target_branch`, `source_workspace`,
+  `source_branch`, `depends_on` and `was_draft` (`true`), followed by
+  `parley.change.ready` when the change is then landable (see
+  [Mergeability](#mergeability)). A `state` of `"draft"` on an open change
+  makes it a draft: `landing` becomes
+  `{"status":"blocked","reason":"draft"}`, its versions, labels,
+  `auto_land` and `mergeable` stay, its landable announcement is
+  forgotten, and no event is written. A `state` the change already has is
+  no edit, before the intent rule as after it: `{"state":"open"}` on an
+  open change whose intent is empty, opened before `{slug}` required one,
+  is answered `200` with nothing changed, while an edit of another member
+  of that change is answered `400` `intent_required`. A `target_branch` other than the change's own retargets a
+  draft or open change. The branch is checked as an open checks its
+  target, with the same answers: `400` `target_not_found` for a branch
+  `{slug}` does not have, `403` `integration_branch` for the integration
+  branch of a carry-patch workspace, `400` `invalid_request` for the
+  change's own source branch in `{slug}`. A change that depends on
+  another, or that a draft or open change depends on, is answered `409`
+  `conflict`. The retarget records no version: `target_branch` is set,
+  `base_sha` becomes the merge base of `head_sha` and the new target's
+  head, `stats`, `paths` and `paths_truncated` are measured against it,
+  and the change's versions keep what they were measured against.
+  `landing` is evaluated again, so a branch that already has every
+  commit of the change, or one from which a merge commit lies before the
+  head, is accepted and reported as `{"status":"blocked","reason":
+  "nothing_to_land"}` or `"merge_commits"`; a change whose target branch
+  was deleted may be retargeted onto one that exists. `mergeable` becomes
+  `unknown` and is checked again, the landable announcement is
+  forgotten, and `parley.change.version` is written by the caller with
+  `number`, `ref`, `version` and `head_sha` (the current ones), `kind`
+  `retarget`, the new `base_sha`, `patch_equivalent_to` `null` and
+  `draft`. A `target_branch` a draft or open change already has is no
+  edit; on a landed or abandoned change it is refused like any other member. The
+  members are stored together, the retarget after the other members and
+  before a move between draft and open, and `updated_at` advances only
+  when a stored value changes; editing `title`, `intent`, `labels` or
+  `auto_land` writes no event, and the events of a retarget and of a move
+  from draft to open come after them, so they carry the edited `title`.
+- `POST …/abandon` takes no body or a JSON object (no body is the same as
+  `{}`) with two optional members: `reason`, a string, and `dependants`,
+  `"reparent"` or `"abandon"`; another type, `null`, or another value of
+  `dependants` is `400` `invalid_request`. An abandoned or landed change
+  is answered `409` `change_closed`. A change on which a draft or open
+  change depends (its `dependants`) is answered `409` `has_dependants`
+  when the body has no `dependants`, with the numbers of the dependants
+  in the error's `dependants` member, and nothing changes. The change
+  moves to `abandoned` and its landable announcement is forgotten, its
+  waiting mergeability check is dropped once the abandon has committed,
+  and `parley.change.abandon` is
+  written by the caller with `reason` as given (the empty string when
+  absent), `number`, `ref`, `version` and `head_sha`. The source branch
+  and the version refs stay. With `"abandon"`, every draft or open change
+  above it in its stack, direct or not, is abandoned too in the same
+  transaction, with the same `reason` and one `parley.change.abandon`
+  each. With `"reparent"`, each direct dependant stays as it is but now
+  depends on what the abandoned change depended on (`null` when nothing),
+  and its restack is asked for, by the stack feature when the hub has
+  one: when that request fails, the answer is `500` and nothing is
+  abandoned; without it, the dependant's `mergeable` becomes `unknown`
+  and is checked again. `dependants` on a change that has none changes
+  nothing.
+- `POST …/restore` takes no body (one that is sent is ignored) and brings
+  an abandoned change back to `open` under its number. Its refusals come
+  in this order, the first that applies answering, and none changes
+  anything or creates a branch: a change that is `draft`, `open` or
+  `landed` is `409` `change_not_abandoned`; a change whose source
+  workspace, a task fork, no longer exists is `409`
+  `source_workspace_gone` (its version refs stay); another draft or open
+  change with the same source workspace and branch is `409`
+  `change_exists`, as an open answers it, the message naming that
+  change's ref; a source branch that no longer exists while the head
+  commit of the change's last version is gone from the source
+  workspace's repository too is `409` `conflict`; and an empty intent
+  while `{slug}`'s `changes.require_intent` is on is `400`
+  `intent_required`. A source branch that no longer exists while that
+  commit does is created at it, with a create-only ref update; a branch
+  that appeared in the meantime is taken at its head. A branch the
+  restore created is a new target too: every draft or open change of the
+  source workspace into it has its `mergeable` set to `unknown` and checked
+  again, as a push creating it would. The change moves
+  to `open` (a change that was a draft when abandoned too), its `landing`
+  is evaluated again, `mergeable` becomes `unknown` and is checked again,
+  and `parley.change.restore` is written by the caller with `number`,
+  `ref`, `version` and `head_sha` of the last version; no
+  `parley.change.open` is written. When the source branch is at another
+  commit than the last version's head, that commit is then recorded as a
+  new version of kind `ref`, created by the caller with their
+  credential, with its `parley.change.version`; the answer carries it as
+  `version` and `head_sha`. Of two restores of two changes with one
+  source, one is answered `200` and the other `409` `change_exists`.
+
+## Mergeability
+
+The hub computes `mergeable` in the background for every `draft` and
+`open` change, without being asked: it trial-rebases the commits of the
+current version that the onto-commit lacks onto the onto-commit, the head
+of the change named by `depends_on` while that change is `draft` or
+`open`, otherwise the head of the target branch. The result is `clean`,
+or `conflict` with the conflict report in `conflict`: `target_sha` (the
+onto-commit), `head_sha`, `base_sha`, `commit_sha` (the first commit that
+does not apply), `files` (each `path`, `kind`, `base`, `ours`, `theirs`,
+`landed_by`), `landed_changes` and `change`. The trial writes no ref and
+no work tree in either repository.
+
+`mergeable` becomes `unknown`, with `conflict` `null`, in the transaction
+of what triggers a new check: a new version of the change, a new version
+of the change it depends on, a move, creation or deletion of its target
+branch by a push, the source control API, a landing or a sync, or by a
+restore that creates it as its source branch, a retarget and a restore. It stays `unknown` until the check stores its result; a result
+for a head or an onto-commit that is no longer the change's is
+discarded and computed again. Two checks of one change start at least
+`[changes].mergeable_debounce` apart (default `5s`, see
+[configuration.md](configuration.md#keys)). While the target branch does
+not exist, `mergeable` stays `unknown` and `landing` reports
+`{"status":"blocked","reason":"target_not_found"}`. A trial rebase that
+fails or runs past 30 seconds is stopped and leaves `mergeable`
+`unknown` until the change's next trigger.
+
+Every change event, these two included, has `resource_type` `change`,
+`resource_id` the number, the target workspace, the change's session,
+and `number` and `ref` in its metadata. A result writes, by the hub
+(`actor_type` `system`), in the transaction that stores it:
+
+- `parley.change.conflict` when the check finds a conflict and the value
+  the last check computed was `clean`, or there was none: metadata
+  `number`, `ref`, `version`, `head_sha`, `files` (the conflicted paths)
+  and `needs_restack`. A further conflict, for the same or a later
+  version or target head, replaces the conflict report and writes no
+  event; an `unknown` in between does not count. A `clean` result clears
+  the report, so the next conflict is announced again.
+- `parley.change.ready` when the change is `open`, its `landing.status` is
+  `ready` and `mergeable` is `clean` (landable) at a `head_sha` it has not
+  been announced at since it last was not landable: metadata `number`,
+  `ref`, `version` and `head_sha`, nothing else. A target move that leaves
+  it clean announces nothing again; a result or a step that finds it not
+  landable (a draft, a landing `pending` or `blocked`, a conflict), an
+  abandon or a retarget forgets the announcement, so it is announced
+  again the next time it is landable, at the same head too. While
+  `mergeable` is `unknown` nothing is announced or forgotten.
+
+When the event cannot be written, or the transaction fails, neither the
+result nor the event is stored: `mergeable` stays `unknown`, the failure
+is logged as `the mergeability check failed`, and the change's next
+trigger computes it again.
 
 ## Admin routes
 

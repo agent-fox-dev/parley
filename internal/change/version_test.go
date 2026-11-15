@@ -20,6 +20,7 @@ import (
 func TestRecordVersion_RecordsTheNewHeadAsTheNextVersion(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
+	w.hold(t)
 	h1 := commit(t, w.demo, "feat", w.base, "One\n", map[string]string{"x.txt": "x\n"})
 	w.openBranch(t, "feat", nil)
 	v1 := w.versions(t, "demo", 1)[0]
@@ -324,7 +325,7 @@ func TestRecordVersion_RunsTheCollaboratorsInOrderAndWritesTheVersionEvent(t *te
 	if len(events) != 1 || events[0].Type != change.EventVersion || events[0].ResourceID != "1" {
 		t.Fatalf("events = %+v, want one parley.change.version of change 1", events)
 	}
-	want := map[string]any{"ref": "demo#1", "version": 2.0, "head_sha": h2, "kind": "commit", "base_sha": w.base,
+	want := map[string]any{"number": 1.0, "ref": "demo#1", "version": 2.0, "head_sha": h2, "kind": "commit", "base_sha": w.base,
 		"patch_equivalent_to": nil, "draft": false}
 	if got := metadata(t, events[0]); !reflect.DeepEqual(got, want) {
 		t.Errorf("metadata = %v, want %v", got, want)

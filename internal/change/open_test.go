@@ -197,21 +197,23 @@ func TestOpen_WritesTheVersionEventAndTheOpenEventUnlessDraft(t *testing.T) {
 	t.Run("open", func(t *testing.T) {
 		seq := w.seq(t)
 		got := w.mustPost(t, map[string]any{"source": map[string]any{"workspace_slug": "demo--m1", "branch": "task"}, "session_id": sessionOne})
+		// The mergeability check, which mustPost waits for, announces the
+		// clean change after the open.
 		events := w.eventsAfter(t, seq)
 		var types []string
 		for _, e := range events {
 			types = append(types, e.Type)
 		}
-		if want := []string{"parley.change.version", "parley.change.open"}; !reflect.DeepEqual(types, want) {
+		if want := []string{"parley.change.version", "parley.change.open", change.EventReady}; !reflect.DeepEqual(types, want) {
 			t.Fatalf("event types = %v, want %v", types, want)
 		}
-		for _, e := range events {
+		for _, e := range events[:2] {
 			if e.ResourceType != "change" || e.ResourceID != "1" || e.Workspace == nil || *e.Workspace != "demo" ||
 				e.SessionID == nil || *e.SessionID != sessionOne || e.ActorType != "api_key" || e.ActorID == nil || *e.ActorID != w.owner {
 				t.Errorf("%s: %+v, want resource change 1 of demo in sessionOne by the owner's key", e.Type, e)
 			}
 		}
-		common := map[string]any{"ref": "demo#1", "version": 1.0, "head_sha": head}
+		common := map[string]any{"number": 1.0, "ref": "demo#1", "version": 1.0, "head_sha": head}
 		version := map[string]any{"kind": "ref", "base_sha": w.base, "patch_equivalent_to": nil, "draft": false}
 		opened := map[string]any{"title": "Task", "target_branch": "main", "source_workspace": "demo--m1",
 			"source_branch": "task", "depends_on": nil, "was_draft": false}
@@ -862,6 +864,9 @@ func TestOpen_RefusesASecondChangeOfTheSameSource(t *testing.T) {
 			want := map[string]any{"workspace_slug": "demo", "number": c.number, "ref": fmt.Sprintf("demo#%v", c.number)}
 			if !reflect.DeepEqual(errObj["details"], want) {
 				t.Errorf("details = %v, want %v", errObj["details"], want)
+			}
+			if msg, _ := errObj["message"].(string); !strings.HasSuffix(msg, " of "+want["ref"].(string)) {
+				t.Errorf("message = %q, want it to name %v", msg, want["ref"])
 			}
 		})
 	}

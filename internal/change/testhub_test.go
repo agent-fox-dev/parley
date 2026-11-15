@@ -45,7 +45,8 @@ const (
 // member of the org acme, with the API key ownerKey; the owner's ready
 // workspace demo, whose main and release are at one commit (base) holding
 // a.txt ("l1\nl2\nl3\n"); a session linker that accepts sessionOne and
-// sessionTwo, registered on the change component.
+// sessionTwo, registered on the change component. Its mergeability checks
+// are not spaced, unless the configuration has a [changes] table.
 type world struct {
 	*hubtest.Hub
 	workspaces *workspace.Service
@@ -58,6 +59,8 @@ type world struct {
 	// demo is the git directory of demo's repository, and base the commit
 	// its main and release are at.
 	demo, base string
+	// held is set once hold keeps the mergeability checks from starting.
+	held bool
 }
 
 func newWorld(t *testing.T) *world {
@@ -70,6 +73,9 @@ func newWorld(t *testing.T) *world {
 func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 	t.Helper()
 	w := &world{sessions: &sessions{accept: map[string]bool{sessionOne: true, sessionTwo: true}}}
+	if !strings.Contains(cfg.TOML, "[changes]") {
+		cfg.TOML = zeroDebounce + cfg.TOML
+	}
 	compose := cfg.Compose
 	cfg.Compose = func(c *hub.Composition) {
 		w.workspaces, w.events, w.changes, w.forks = c.Workspaces(), c.Events(), c.Changes(), c.Forks()
@@ -269,11 +275,13 @@ func (w *world) mustPost(t *testing.T, body any) map[string]any {
 	if status != http.StatusCreated {
 		t.Fatalf("POST changes = %d %v, want 201", status, out)
 	}
+	w.quiet(t)
 	return out
 }
 
 // open calls Open with in in a transaction of its own, which it commits
-// when Open succeeds.
+// when Open succeeds, and waits until the change's mergeability check has
+// ended.
 func (w *world) open(t *testing.T, in change.OpenInput) (change.Change, error) {
 	t.Helper()
 	var ch change.Change
@@ -282,6 +290,7 @@ func (w *world) open(t *testing.T, in change.OpenInput) (change.Change, error) {
 		ch, err = w.changes.Open(context.Background(), tx, in)
 		return err
 	})
+	w.quiet(t)
 	return ch, err
 }
 
@@ -470,7 +479,8 @@ func (w *world) openBranch(t *testing.T, branch string, edit func(*change.OpenIn
 }
 
 // record calls RecordVersion with in in a transaction of its own, which it
-// commits when RecordVersion succeeds.
+// commits when RecordVersion succeeds, and waits until the mergeability
+// checks it scheduled have ended.
 func (w *world) record(t *testing.T, in change.VersionInput) (*change.Version, error) {
 	t.Helper()
 	var v *change.Version
@@ -479,6 +489,7 @@ func (w *world) record(t *testing.T, in change.VersionInput) (*change.Version, e
 		v, err = w.changes.RecordVersion(context.Background(), tx, in)
 		return err
 	})
+	w.quiet(t)
 	return v, err
 }
 
@@ -591,4 +602,69 @@ func (w *world) landedCommits(t *testing.T) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// zeroDebounce is the configuration of a hub that does not space two
+// mergeability checks of one change.
+const zeroDebounce = "[changes]\nmergeable_debounce = \"0s\"\n"
+
+// idle waits until no mergeability check of the change number of demo is
+// waiting or running.
+func (w *world) idle(t *testing.T, number int64) {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); !change.MergeableIdle(w.changes, "demo", number); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the mergeability check of demo#%d did not end", number)
+		}
+	}
+}
+
+// settled waits until the background check has computed the mergeable of
+// the change number of demo, so that it writes nothing more, and returns
+// the change then.
+func (w *world) settled(t *testing.T, number int64) change.Change {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		w.idle(t, number)
+		if ch := w.read(t, number); ch.Mergeable != change.MergeableUnknown && change.MergeableIdle(w.changes, "demo", number) {
+			return ch
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the mergeable of demo#%d stayed unknown", number)
+		}
+	}
+}
+
+// quiet waits until no mergeability check is waiting or running, so that
+// the worker writes nothing until the next trigger; it returns at once
+// while hold keeps the checks from starting.
+func (w *world) quiet(t *testing.T) {
+	t.Helper()
+	if w.held {
+		return
+	}
+	for deadline := time.Now().Add(20 * time.Second); !change.MergeableQuiet(w.changes); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the mergeability checks did not end")
+		}
+	}
+}
+
+// hold keeps every mergeability check from starting until the test ends,
+// so that mergeable stays unknown after a trigger and nothing else is
+// written.
+func (w *world) hold(t *testing.T) {
+	t.Helper()
+	g := newGate()
+	t.Cleanup(g.release)
+	change.SetMergeableSeams(w.changes, change.MergeableSeams{Gate: g.pass})
+	w.held = true
+}
+
+// trigger schedules a mergeability check of the change number of demo.
+func (w *world) trigger(t *testing.T, number int64) {
+	t.Helper()
+	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.ScheduleMergeable(ctx, tx, "demo", number)
+	})
 }

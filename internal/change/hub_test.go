@@ -33,7 +33,7 @@ func (w *world) abandonReasons(t *testing.T, seq int64) []any {
 func TestHubPart_ConnectsTheChangeComponentToTheOtherFeatures(t *testing.T) {
 	t.Parallel()
 	var skew atomic.Int64
-	w := newWorldWith(t, hubtest.Config{Now: func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }})
+	w := newWorldWith(t, hubtest.Config{TOML: zeroDebounce, Now: func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }})
 	ctx := context.Background()
 
 	t.Run("a branch a sync moved gets a version of the hub", func(t *testing.T) {
@@ -71,7 +71,7 @@ func TestHubPart_ConnectsTheChangeComponentToTheOtherFeatures(t *testing.T) {
 				seen = append(seen, e["type"].(string)+" "+e["workspace"].(string)+"#"+e["resource_id"].(string))
 			}
 		}
-		if want := []string{change.EventVersion + " demo#2", change.EventOpen + " demo#2"}; status != http.StatusOK || !reflect.DeepEqual(seen, want) {
+		if want := []string{change.EventVersion + " demo#2", change.EventOpen + " demo#2", change.EventReady + " demo#2"}; status != http.StatusOK || !reflect.DeepEqual(seen, want) {
 			t.Errorf("the fork-bound token reads %d %v, want the events of the fork's change only, %v", status, seen, want)
 		}
 	})
@@ -115,6 +115,26 @@ func TestHubPart_ConnectsTheChangeComponentToTheOtherFeatures(t *testing.T) {
 		skew.Store(int64(25 * time.Hour))
 		if res := w.forks.RunPass(ctx); !slices.Contains(res.Removed, "demo--m1") {
 			t.Errorf("the pass a day later = %+v, want demo--m1 removed", res)
+		}
+	})
+
+	t.Run("a target branch a sync moved has its changes checked again", func(t *testing.T) {
+		before := commit(t, w.demo, "upstream", w.base, "Upstream\n", map[string]string{"u.txt": "u\n"})
+		w.branch(t, "onto-upstream", "Onto upstream\n\nWhy.\n")
+		n := w.openBranch(t, "onto-upstream", func(in *change.OpenInput) { in.TargetBranch = new("upstream") }).Number
+		w.settled(t, n)
+		g := newGate()
+		change.SetMergeableSeams(w.changes, change.MergeableSeams{Gate: g.pass})
+		t.Cleanup(g.release)
+		after := commit(t, w.demo, "upstream", before, "Fetched\n", map[string]string{"f.txt": "f\n"})
+		w.workspaces.NotifyBranchMove(ctx, workspace.BranchMove{Workspace: "demo", Branch: "upstream", Before: before, After: after,
+			Cause: workspace.MoveCauseSync})
+		if ch := w.read(t, n); ch.Mergeable != change.MergeableUnknown {
+			t.Fatalf("after the sync the change is %s, want unknown until its check", ch.Mergeable)
+		}
+		g.release()
+		if ch := w.settled(t, n); ch.Mergeable != change.MergeableClean {
+			t.Errorf("after its check the change is %s, want clean", ch.Mergeable)
 		}
 	})
 }

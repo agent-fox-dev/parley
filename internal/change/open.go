@@ -3,6 +3,7 @@ package change
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // The event types of a change this package writes.
@@ -243,11 +245,91 @@ func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborato
 	return nil
 }
 
+// AutoLandSetterStep gives the change record who turned auto_land on: the
+// user (NULL for the admin token and the hub), the credential type and the
+// path globs of a path-scoped token (NULL for none), so that whoever starts
+// an automatic land knows what the setter could do. It applies after
+// SchemaStep.
+var AutoLandSetterStep = store.Step{
+	Name:   "change_auto_land_setter",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		for _, column := range []string{"auto_land_user_id TEXT", "auto_land_credential_type TEXT", "auto_land_paths TEXT"} {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE changes ADD COLUMN `+column); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
 // SetAutoLand stores value as the auto_land of the change number of the
 // workspace in tx, set by caller; the auto_land guard has been asked
-// before. A change that does not exist is the change-not-found error.
-func (c *Component) SetAutoLand(ctx context.Context, tx *sql.Tx, workspace string, number int64, value bool, _ Caller) error {
-	return update(ctx, tx, workspace, number, c.now(), `auto_land = ?`, value)
+// before. Turning it on stores the caller as its setter, turning it off
+// forgets the setter, and the value it already has changes nothing, so
+// that the setter is who turned it on. A change that does not exist is the
+// change-not-found error.
+func (c *Component) SetAutoLand(ctx context.Context, tx *sql.Tx, workspace string, number int64, value bool, caller Caller) error {
+	var current bool
+	err := tx.QueryRowContext(ctx, `SELECT auto_land FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&current)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return errChangeNotFound(workspace, number)
+	case err != nil:
+		return err
+	case current == value:
+		return nil
+	case !value:
+		return update(ctx, tx, workspace, number, c.now(),
+			`auto_land = 0, auto_land_user_id = NULL, auto_land_credential_type = NULL, auto_land_paths = NULL`)
+	}
+	var user, paths *string
+	if caller.UserID != "" {
+		user = &caller.UserID
+	}
+	if len(caller.Paths) > 0 {
+		b, err := json.Marshal(caller.Paths)
+		if err != nil {
+			return err
+		}
+		paths = new(string(b))
+	}
+	return update(ctx, tx, workspace, number, c.now(),
+		`auto_land = 1, auto_land_user_id = ?, auto_land_credential_type = ?, auto_land_paths = ?`, user, caller.actor().ActorType, paths)
+}
+
+// AutoLandSet is who turned a change's auto_land on: the user (nil for the
+// admin token and the hub), the type of the credential they used and the
+// path globs that credential is limited to (nil for none).
+type AutoLandSet struct {
+	UserID         *string
+	CredentialType string
+	Paths          []string
+}
+
+// AutoLandSetter reads, through q (the caller's transaction, or nil for the
+// store), who turned on the auto_land of the change number of the
+// workspace; found is false while auto_land is off. A change that does not
+// exist is the change-not-found error.
+func (c *Component) AutoLandSetter(ctx context.Context, q Querier, workspace string, number int64) (s AutoLandSet, found bool, err error) {
+	var credential, paths sql.NullString
+	err = c.querier(q).QueryRowContext(ctx, `SELECT auto_land_user_id, auto_land_credential_type, auto_land_paths
+	FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&s.UserID, &credential, &paths)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return AutoLandSet{}, false, errChangeNotFound(workspace, number)
+	case err != nil:
+		return AutoLandSet{}, false, err
+	case !credential.Valid:
+		return AutoLandSet{}, false, nil
+	}
+	s.CredentialType = credential.String
+	if paths.Valid {
+		if err := json.Unmarshal([]byte(paths.String), &s.Paths); err != nil {
+			return AutoLandSet{}, false, fmt.Errorf("the auto_land setter of %s: %w", Ref(workspace, number), err)
+		}
+	}
+	return s, true, nil
 }
 
 // ReadChange reads the change number of the workspace, without a scope or
@@ -328,10 +410,39 @@ func validate(in OpenInput) error {
 		return server.InvalidRequest("source.branch: required")
 	case in.DependsOn != nil && *in.DependsOn < 1:
 		return server.InvalidRequest("depends_on: must be a positive integer")
-	case len(in.Labels) > MaxLabels:
+	}
+	return checkLabels(in.Labels)
+}
+
+// checkTitle refuses a title, the caller's or a default, that is empty or
+// white space only, longer than MaxTitle characters or more than one line.
+func checkTitle(title string) error {
+	switch {
+	case strings.TrimSpace(title) == "":
+		return server.InvalidRequest("title: must not be empty")
+	case utf8.RuneCountInString(title) > MaxTitle:
+		return server.InvalidRequest(fmt.Sprintf("title: at most %d characters", MaxTitle))
+	case strings.ContainsAny(title, "\r\n"):
+		return server.InvalidRequest("title: must be one line")
+	}
+	return nil
+}
+
+// checkIntent refuses an intent longer than MaxIntent characters.
+func checkIntent(intent string) error {
+	if utf8.RuneCountInString(intent) > MaxIntent {
+		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
+	}
+	return nil
+}
+
+// checkLabels refuses more than MaxLabels labels, or one that labelPattern
+// does not match.
+func checkLabels(labels []string) error {
+	if len(labels) > MaxLabels {
 		return server.InvalidRequest(fmt.Sprintf("labels: at most %d", MaxLabels))
 	}
-	for _, l := range in.Labels {
+	for _, l := range labels {
 		if !labelPattern.MatchString(l) {
 			return server.InvalidRequest(fmt.Sprintf("labels: %q must match %s", l, labelPattern))
 		}
@@ -423,12 +534,10 @@ func (c *Component) readWorkspaces(ctx context.Context, q Querier, in OpenInput,
 
 // targetBranch fills in the target branch of the open in, the one named or
 // the default, the base branch of a fork source related to the target or
-// the target workspace's default branch, opens the target's repository and returns the
-// branch's head; a branch the repository does not have, or the integration
-// branch of a carry-patch workspace, is refused.
+// the target workspace's default branch, opens the target's repository and
+// returns the branch's head, once checkTarget accepts it.
 func (c *Component) targetBranch(ctx context.Context, in OpenInput, o *opening, related bool) (string, error) {
-	target := o.target
-	o.targetBranch = target.DefaultBranch
+	o.targetBranch = o.target.DefaultBranch
 	if o.source.Fork && related {
 		o.targetBranch = o.source.DefaultBranch
 	}
@@ -436,26 +545,40 @@ func (c *Component) targetBranch(ctx context.Context, in OpenInput, o *opening, 
 		o.targetBranch = *in.TargetBranch
 	}
 	var err error
-	if o.targetRepo, err = c.deps.Repos(ctx, target.Slug); err != nil {
+	if o.targetRepo, err = c.deps.Repos(ctx, o.target.Slug); err != nil {
 		return "", err
 	}
-	head, found, err := o.targetRepo.ResolveBranch(ctx, o.targetBranch)
-	if err != nil {
+	return checkTarget(ctx, o.targetRepo, o.target, branchOf{o.source.Slug, in.SourceBranch}, o.targetBranch)
+}
+
+// branchOf is a branch of a workspace.
+type branchOf struct{ workspace, branch string }
+
+// checkTarget checks branch as the target branch of a change from source
+// into the workspace target, whose repository is repo, by the rules an
+// open and a retarget share, so that both answer a target alike, and
+// returns the branch's head: the repository must have the branch, which
+// must not be the integration branch of a carry-patch workspace, nor the
+// source branch itself.
+func checkTarget(ctx context.Context, repo *gitrepo.Repo, target Workspace, source branchOf, branch string) (string, error) {
+	head, found, err := repo.ResolveBranch(ctx, branch)
+	switch {
+	case err != nil:
 		return "", err
-	}
-	if !found {
-		return "", server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", o.targetBranch, target.Slug))
-	}
-	if target.CarryPatch && o.targetBranch == target.IntegrationBranch {
+	case !found:
+		return "", server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", branch, target.Slug))
+	case target.CarryPatch && branch == target.IntegrationBranch:
 		return "", server.NewError("integration_branch", http.StatusForbidden,
-			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", o.targetBranch, target.Slug))
+			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", branch, target.Slug))
+	case source.workspace == target.Slug && source.branch == branch:
+		return "", server.InvalidRequest(fmt.Sprintf("target_branch: %s is the source branch itself", branch))
 	}
 	return head, nil
 }
 
 // sourceHead opens the source's repository and fills in the head of the
 // open in: the one the trigger named, or the source branch's, which must
-// exist and must not be the target branch itself.
+// exist.
 func (c *Component) sourceHead(ctx context.Context, in OpenInput, o *opening) error {
 	o.sourceRepo = o.targetRepo
 	var err error
@@ -472,9 +595,6 @@ func (c *Component) sourceHead(ctx context.Context, in OpenInput, o *opening) er
 		if !found {
 			return server.NewError("source_not_found", http.StatusBadRequest, fmt.Sprintf("source.branch: no branch %q in %s", in.SourceBranch, o.source.Slug))
 		}
-	}
-	if o.source.Slug == o.target.Slug && in.SourceBranch == o.targetBranch {
-		return server.InvalidRequest(fmt.Sprintf("source.branch: %s is the target branch itself", in.SourceBranch))
 	}
 	return nil
 }
@@ -593,18 +713,14 @@ func (o *opening) describe(ctx context.Context, in OpenInput) error {
 	case o.source.Fork && o.source.Purpose != nil:
 		o.intent = cut(strings.TrimSpace(*o.source.Purpose), MaxIntent)
 	}
-	switch {
-	case strings.TrimSpace(o.title) == "":
-		return server.InvalidRequest("title: must not be empty")
-	case utf8.RuneCountInString(o.title) > MaxTitle:
-		return server.InvalidRequest(fmt.Sprintf("title: at most %d characters", MaxTitle))
-	case strings.ContainsAny(o.title, "\r\n"):
-		return server.InvalidRequest("title: must be one line")
-	case utf8.RuneCountInString(o.intent) > MaxIntent:
-		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
-	case strings.TrimSpace(o.intent) == "" && !in.Draft && o.target.RequireIntent:
-		return server.NewError("intent_required", http.StatusBadRequest,
-			fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", o.target.Slug))
+	if err := checkTitle(o.title); err != nil {
+		return err
+	}
+	if err := checkIntent(o.intent); err != nil {
+		return err
+	}
+	if strings.TrimSpace(o.intent) == "" && !in.Draft && o.target.RequireIntent {
+		return intentRequired(o.target.Slug)
 	}
 	return nil
 }
@@ -692,18 +808,45 @@ func (c *Component) actorOf(ctx context.Context, tx *sql.Tx, caller Caller) (Act
 	return caller.actor(), nil
 }
 
-// changeExists is the refusal of an open whose source another draft or
-// open change has, naming that change.
+// intentRequired is the refusal of an open change with an empty intent in
+// the workspace, whose changes.require_intent is set.
+func intentRequired(workspace string) error {
+	return server.NewError("intent_required", http.StatusBadRequest,
+		fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", workspace))
+}
+
+// intentRule is the intent rule of an open change of the workspace, read
+// through q, as an edit or a restore would leave it with the intent: an
+// intent of white space only, or none, is intentRequired where the
+// workspace requires one, whose record is read only then.
+func (c *Component) intentRule(ctx context.Context, q Querier, workspace, intent string) error {
+	if strings.TrimSpace(intent) != "" {
+		return nil
+	}
+	target, _, err := c.deps.Workspaces.Workspace(ctx, q, workspace)
+	if err != nil {
+		return err
+	}
+	if target.RequireIntent {
+		return intentRequired(workspace)
+	}
+	return nil
+}
+
+// changeExists is the refusal of an open or a restore whose source another
+// draft or open change has, naming that change in its message and its
+// details.
 func (c *Component) changeExists(ctx context.Context, q Querier, source, branch string) error {
 	workspace, number, found, err := activeOfSource(ctx, q, source, branch)
 	if err != nil {
 		return err
 	}
-	e := server.NewError("change_exists", http.StatusConflict, fmt.Sprintf("%s:%s is already the source of a change", source, branch))
-	if found {
-		e = e.WithDetails(map[string]any{"workspace_slug": workspace, "number": number, "ref": Ref(workspace, number)})
+	if !found {
+		return server.NewError("change_exists", http.StatusConflict, fmt.Sprintf("%s:%s is already the source of a change", source, branch))
 	}
-	return e
+	ref := Ref(workspace, number)
+	return server.NewError("change_exists", http.StatusConflict, fmt.Sprintf("%s:%s is already the source of %s", source, branch, ref)).
+		WithDetails(map[string]any{"workspace_slug": workspace, "number": number, "ref": ref})
 }
 
 // sourceNotRelated is the refusal of a source workspace that is neither the
@@ -719,10 +862,16 @@ func (c *Component) emitOpen(ctx context.Context, tx *sql.Tx, caller Caller, ch 
 	if err := c.emitVersion(ctx, tx, caller, ch, v); err != nil || ch.State == StateDraft {
 		return err
 	}
+	return c.emitOpened(ctx, tx, caller, ch, false)
+}
+
+// emitOpened writes parley.change.open for the change ch by caller, as it
+// is opened or, wasDraft, as the draft it was is marked ready.
+func (c *Component) emitOpened(ctx context.Context, tx *sql.Tx, caller Caller, ch Change, wasDraft bool) error {
 	return c.emit(ctx, tx, caller, ch, EventOpen, map[string]any{
 		"version": ch.Version, "head_sha": ch.HeadSHA, "title": ch.Title, "target_branch": ch.TargetBranch,
 		"source_workspace": ch.Source.WorkspaceSlug, "source_branch": ch.Source.Branch, "depends_on": ch.DependsOn,
-		"was_draft": false,
+		"was_draft": wasDraft,
 	})
 }
 
@@ -736,9 +885,9 @@ func (c *Component) emitVersion(ctx context.Context, tx *sql.Tx, caller Caller, 
 }
 
 // emit writes the event typ of the change ch by caller in tx, its metadata
-// the change's ref and meta.
+// the change's number and ref, which every change event carries, and meta.
 func (c *Component) emit(ctx context.Context, tx *sql.Tx, caller Caller, ch Change, typ string, meta map[string]any) error {
-	meta["ref"] = ch.Ref
+	meta["number"], meta["ref"] = ch.Number, ch.Ref
 	a := caller.actor()
 	slug := ch.WorkspaceSlug
 	_, err := c.deps.Events.Emit(ctx, tx, event.Input{

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -104,7 +105,9 @@ func TestChange_ADeveloperOpensAChangeAndReadsItBackByNumberCommitAndRef(t *test
 		t.Errorf("FETCH_HEAD = %s, want the pushed head %s", fetched, head)
 	}
 
-	if types := h.changeEventTypes(t, "demo"); strings.Join(types, " ") != "parley.change.version parley.change.open" {
+	// The mergeability check announces the clean change in the background.
+	types := slices.DeleteFunc(h.changeEventTypes(t, "demo"), func(typ string) bool { return typ == "parley.change.ready" })
+	if strings.Join(types, " ") != "parley.change.version parley.change.open" {
 		t.Errorf("the change events of demo = %v, want parley.change.version and then parley.change.open", types)
 	}
 }
