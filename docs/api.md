@@ -3270,8 +3270,10 @@ does not descend from its head, by a ref move or a rebase, or deletes one
 moves one forward, by a commit, a ref move or a rebase whose new head
 descends from the old one, with an API key, the admin token, or a PAT
 neither bound to a workspace nor limited to paths: a direct push, whose
-`parley.git.push` event has `direct` `true`. A direct push is the version
-of no change: the route opens none and answers `change` `null`. Every other
+`parley.git.push` event has `direct` `true`. A direct push opens no
+change: the route answers `change` `null`, unless the branch is the source
+of a draft or open change, when it names the version the move recorded
+(see [Changes](#changes)). Every other
 caller, and every caller while `protect.owner_push` is `false`, gets `403`
 `protected_branch` (`main is protected; push another branch and open a
 change (git push -o parley.change)`).
@@ -3525,8 +3527,8 @@ when the old head is not an ancestor of the new one.
 `old_head_sha`). `branch` is the ref object at `new_head_sha`, and
 `onto_sha` the commit `onto` names. `change` is
 `{"workspace_slug": …, "number": …, "version": …}`: for `rebased`, the
-change and the version the rebase recorded, `null` for a direct push of a
-protected branch; for `up_to_date`, the draft or open change whose source
+change and the version the rebase recorded, `null` when the branch is the
+source of no draft or open change; for `up_to_date`, the draft or open change whose source
 the branch is, with its current version; `null` when there is none.
 
 A commit that does not apply ends the rebase: the branch stays where it
@@ -3615,7 +3617,9 @@ the write is answered: a git push (kind `push`), a commit (`commit`), a ref
 move (`ref`) and a rebase (`rebase`) through the [source control
 writes](#source-control-writes), each by its caller and in its session;
 and a sync from origin (`sync`), by the hub (`created_by.actor_type`
-`system`). A direct push to a protected branch and a landing record none.
+`system`). A direct push to a protected branch records the version too
+when that branch is the source of a draft or open change; a landing
+records none.
 A git push that deletes the source branch abandons the change; the
 deletion of its task fork abandons every draft and open change from it,
 and the deletion of the target workspace deletes its changes. Each

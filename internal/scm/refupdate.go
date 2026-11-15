@@ -122,18 +122,18 @@ type refUpdate struct {
 // refUpdated is a ref update the ref writer made: the engine's decision,
 // which says whether it created, deleted or forced its ref and whether it
 // was a direct push, and the version a ref-updated stage recorded for it,
-// nil for none. A direct push moves a protected branch outside any change:
-// a route asks the change linker nothing after one and names no change.
+// nil for none. A direct push opens no change: a route asks the change
+// linker nothing after one, and names only the version a stage recorded
+// when the branch was already a change's source.
 type refUpdated struct {
 	decision pushrule.Decision
 	version  *pushrule.Version
 }
 
 // change is the change the update made a version of, as a write's answer
-// names it: nil when no stage recorded a version, and for a direct push,
-// which is no version of a change.
+// names it: nil when no stage recorded a version.
 func (u refUpdated) change() *LinkedChange {
-	if u.decision.Direct || u.version == nil {
+	if u.version == nil {
 		return nil
 	}
 	v := u.version

@@ -336,30 +336,34 @@ func TestChangeLinker_RecordsAWriteToTheSourceBetweenTheCommitAndTheOpen(t *test
 	})
 }
 
-// Each update moves feat, the source of change 1, to h2; only the last
-// row is one the stage records a version for.
+// Each update moves feat, the source of change 1, forward; only the rows
+// with a version are ones the stage records a version for, a direct push
+// among them, since it moved the source of a change all the same.
 func TestRefUpdated_RecordsAVersionOnlyForAnAllowedMoveOfABranchThatNamesAKind(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	h1 := w.branch(t, "feat", "Feat\n\nWhy.\n")
 	w.openBranch(t, "feat", nil)
 	h2 := commit(t, w.demo, "feat", h1, "Two\n", map[string]string{"two.txt": "2\n"})
+	h3 := commit(t, w.demo, "feat", h2, "Three\n", map[string]string{"three.txt": "3\n"})
 	caller := pushrule.Caller{Level: access.LevelOwner, CredentialType: change.CredentialAPIKey, CredentialID: "k1", UserID: w.owner}
-	move := func(ref string, direct, allowed bool) []pushrule.Decision {
-		return []pushrule.Decision{{Update: pushrule.Update{Ref: ref, Before: h1, After: h2}, Allowed: allowed, Direct: direct}}
+	move := func(ref, before, after string, direct, allowed bool) []pushrule.Decision {
+		return []pushrule.Decision{{Update: pushrule.Update{Ref: ref, Before: before, After: after}, Allowed: allowed, Direct: direct}}
 	}
+	version := int64(1)
 	for _, c := range []struct {
 		name, via, kind string
 		updates         []pushrule.Decision
 		want            *pushrule.Version
 	}{
-		{"a direct push", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", true, true), nil},
-		{"a refused update", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", false, false), nil},
-		{"a land", pushrule.ViaLand, pushrule.VersionKindNone, move("refs/heads/feat", false, true), nil},
-		{"a write that names no kind", pushrule.ViaAPI, pushrule.VersionKindNone, move("refs/heads/feat", false, true), nil},
-		{"a tag", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/tags/feat", false, true), nil},
-		{"a push of the source", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", false, true),
+		{"a refused update", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", h1, h2, false, false), nil},
+		{"a land", pushrule.ViaLand, pushrule.VersionKindNone, move("refs/heads/feat", h1, h2, false, true), nil},
+		{"a write that names no kind", pushrule.ViaAPI, pushrule.VersionKindNone, move("refs/heads/feat", h1, h2, false, true), nil},
+		{"a tag", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/tags/feat", h1, h2, false, true), nil},
+		{"a push of the source", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", h1, h2, false, true),
 			&pushrule.Version{WorkspaceSlug: "demo", Number: 1, Version: 2}},
+		{"a direct push of the source", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", h2, h3, true, true),
+			&pushrule.Version{WorkspaceSlug: "demo", Number: 1, Version: 3}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var out []*pushrule.Version
@@ -377,12 +381,11 @@ func TestRefUpdated_RecordsAVersionOnlyForAnAllowedMoveOfABranchThatNamesAKind(t
 			if !reflect.DeepEqual(out, want) {
 				t.Errorf("RefUpdated = %v, want %v", out, want)
 			}
-			wantVersion := int64(1)
 			if c.want != nil {
-				wantVersion = 2
+				version = int64(c.want.Version)
 			}
-			if ch := w.read(t, 1); ch.Version != wantVersion {
-				t.Errorf("change 1 is at version %d, want %d", ch.Version, wantVersion)
+			if ch := w.read(t, 1); ch.Version != version {
+				t.Errorf("change 1 is at version %d, want %d", ch.Version, version)
 			}
 		})
 	}

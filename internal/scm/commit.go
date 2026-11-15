@@ -238,8 +238,8 @@ func (c *Component) commitEvent(ctx context.Context, wr *write, git *gitrepo.Rep
 
 // commitChange is the change the answer to a commit of the write wr names,
 // once branch, a full name, has moved to sha in the update up, and why none
-// was opened when opening one failed. A direct push is the version of no
-// change and opens none. The change object the request carried, explicit,
+// was opened when opening one failed. A direct push opens no change: it
+// names the change the ref writer recorded a version of, if any. The change object the request carried, explicit,
 // whose opening the linker checked before the branch moved, is opened now.
 // Without one, the change the ref writer recorded a version of is named;
 // and in a fork whose auto_change is on, a branch that is the source of no
@@ -250,7 +250,7 @@ func (c *Component) commitEvent(ctx context.Context, wr *write, git *gitrepo.Rep
 func (c *Component) commitChange(ctx context.Context, wr *write, linker ChangeLinker, up refUpdated, explicit *ChangeOpening,
 	branch, sha string, session *string) (*LinkedChange, *changeError) {
 	if up.decision.Direct {
-		return nil, nil
+		return up.change(), nil
 	}
 	o := explicit
 	if o == nil {

@@ -205,3 +205,17 @@ runs its transactions one at a time and the ref writer moves the refs
 inside its own, so a write that moves the branch after the open's
 transaction finds the change in its stage and records its version as
 usual.
+
+## A direct push to the source of a change records its version
+
+The package has the ref-updated stage record nothing for an update flagged
+direct. Package 19 has a push to the source of a draft or open change
+record a version whatever the push carries, and GIT-FR-040 checks that
+rule before it skips a direct push (which only keeps a change from being
+opened). A protected branch can be a change's source: nothing refuses the
+open, and a branch may become protected after its change was opened. The
+stage (`internal/change/refstage.go`) therefore treats a direct push like
+any other allowed move: it records the version of the branch's draft or
+open change, and records nothing for a protected branch that is the source
+of no change. A git push is then told `change <workspace>#<number> version
+<n>`, and a landing still records nothing.

@@ -106,3 +106,14 @@ a name that cannot be created (`refMovedNow` in
 `internal/scm/refupdate.go`). This holds for `POST …/scm/refs` and for a
 commit that creates its branch. A git push of the same create keeps the
 ref writer's answer.
+
+## A direct push names the version it recorded
+
+The package answers `change` `null` for every direct push of a protected
+branch, whatever a ref-updated stage reported. A protected branch that is
+the source of a draft or open change gets a version when it is moved
+directly (see erratum 22, *A direct push to the source of a change records
+its version*), so a commit and a rebase that are direct pushes name that
+version, as every other write does (`refUpdated.change()` in
+`internal/scm/refupdate.go`). A direct push still asks the change linker
+nothing and opens no change.
