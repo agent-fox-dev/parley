@@ -381,6 +381,7 @@ Usage:
 
 Available Commands:
   admin             Administer the hub's users, organizations, API keys and access tokens
+  change            Open, list and read the changes of a workspace, their versions and their diffs
   credential-helper Give git the hub credential for the hub's own URL (git's credential helper protocol)
   events            Follow the hub's events, or read them a page at a time
   fork              Create, list, extend and delete the task forks of a workspace
@@ -1989,6 +1990,64 @@ needs the flag --ttl`) or an empty one (`parley fork extend needs a value for
 --ttl`) are refused with a `usage_error` and exit status `2` before any
 setting is read or any request sent. `--confirm` is an unknown flag of
 `parley fork delete`, refused the same way.
+
+### `parley change`
+
+`parley change` run without a command prints its help and exits `0`; it
+reads no credential and sends no request. Its six commands open and read
+the changes of a workspace through the [change routes](api.md#changes) of
+the hub. Each sends one request with the credential as
+`Authorization: Bearer` and `<slug>` (and the `<sha>` of `find`) as one
+percent-encoded path segment (`parley change open a/b --source feat` sends
+`POST /api/v1/workspaces/a%2Fb/changes`).
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley change open <slug> --source <branch> [--source-workspace <slug>] [--target <branch>] [--title <t>] [--intent <i>\|@<file>\|-] [--draft] [--depends-on <n>] [--auto-land] [--label <l>]... [--session <id>]` | `POST …/changes` | the body below |
+| `parley change list <slug> [--state <s>]... [--target <branch>] [--author <id>\|me] [--session <id>] [--label <l>] [--path <glob>] [--mergeable <m>] [--landing-status <s>] [--stack-of <n>] [--limit <n>] [--cursor <c>]` | `GET …/changes` | one `state` per `--state`, `--target` `target_branch`, `author`, `--session` `session_id`, `label`, `path`, `mergeable`, `--landing-status` `landing_status`, `--stack-of` `stack_of`, `limit`, `cursor` |
+| `parley change show <slug> <number> [--include <list>]` | `GET …/changes/<number>` | `include`, as given |
+| `parley change find <slug> <sha>` | `GET …/changes/by-commit/<sha>` | |
+| `parley change versions <slug> <number>` | `GET …/changes/<number>/versions` | |
+| `parley change diff <slug> <number> [--version <n>\|latest] [--against <n>] [--path <glob>]... [--patch \| --name-only]` | `GET …/changes/<number>/diff` | `version`, `against`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
+
+A flag not given sends no parameter, so that the hub's default applies;
+text values are sent as given, for the hub to judge.
+
+The body of `parley change open` holds `source.branch` from `--source`, and
+one member for each other flag given, none for a flag not given:
+`--source-workspace` `source.workspace_slug`, `--target` `target_branch`,
+`--title` `title`, `--intent` `intent`, `--draft` `draft` (`true`),
+`--depends-on` `depends_on` (a number), `--auto-land` `auto_land` (`true`),
+the `--label` values `labels` and `--session` `session_id`.
+`--intent @<file>` sends the content of the file as the intent, and
+`--intent -` all of standard input; any other value is sent as it is, so an
+intent that starts with `@` is given through a file or stdin. A file or
+stdin that cannot be read is a `client_error` (`cannot read the intent:
+open /nonexist: no such file or directory`) with exit status `2`, and no
+request is sent.
+
+Every command but `diff --patch` prints the hub's JSON answer on stdout, as
+every result is printed (see [Output](#output)), with exit status `0`;
+`open` prints the `201` change. `parley change diff --patch` prints the
+unified diff text the hub answers (`Content-Type: text/x-diff`) as
+received; `--name-only` prints the JSON answer, whose files carry no
+`patch`. `list` prints the one page the hub answered and does not follow
+`next_cursor`.
+
+A refusal of the hub's (`404` `change_not_found`, `400`
+`source_not_related`, `409` `change_exists`, `400` `invalid_request`, among
+others) is written to stderr as received, with nothing on stdout and exit
+status `1`. `open` is sent once and never retried.
+
+**Client checks.** A missing `--source`, a wrong number of arguments, a
+`<number>`, `--against`, `--depends-on` or `--stack-of` that is not a
+positive integer in decimal digits (`parley change show takes a <number>
+that is a positive integer, got "x"`), a `--version` that is neither that
+nor `latest` (`parley change diff takes --version <n>, a positive integer
+or latest, got "x"`), `--patch` with `--name-only` (`parley change diff
+takes --patch or --name-only, not both`) and a `--limit` that is not an
+integer are refused with a `usage_error` and exit status `2` before any
+setting is read or any request sent.
 
 ### `parley scm`
 

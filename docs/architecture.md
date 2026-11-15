@@ -4509,6 +4509,19 @@ answer it warns on stderr only when the answer holds `token.token`. `list`
 sends a query parameter for each flag given (`listForks`), `--mine` as
 `owner=me`, and prints one page.
 
+`parley change` (`change.go`) is `open`, `list`, `show`, `find`, `versions`
+and `diff`. The five reads are built like the reads of `parley scm`
+(`scm.go`), as an `scmRead` each, whose query flags become query
+parameters; `diff` shares with `parley scm diff` the check `onePatchForm`
+and the run step `diffRevisions`, which prints the patch text of `--patch`
+as received. `open` builds its body in `openChange`, a member only for a
+flag given, and reads `--intent @<file>` or `-` through `intentText`
+before sending, a file that cannot be read being a `client_error`.
+`withNumbers` wraps the argument check of `open`, `list`, `show`,
+`versions` and `diff`, so that a `<number>`, `--depends-on`, `--stack-of`,
+`--version` (or `latest`) or `--against` that is not a positive integer is
+a usage error before any setting is resolved.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with
