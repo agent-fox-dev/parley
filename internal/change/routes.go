@@ -9,8 +9,9 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// Routes are the change routes, for the server's router: the open and
-// the reads of one change, its versions and the change of a commit.
+// Routes are the change routes, for the server's router: the open, the
+// list and the reads of one change, its versions and the change of a
+// commit.
 func (c *Component) Routes() []server.Route {
 	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	read := func(pattern string, h server.HandlerFunc) server.Route {
@@ -25,6 +26,7 @@ func (c *Component) Routes() []server.Route {
 			Method: http.MethodPost, Pattern: "/workspaces/:slug/changes", Scope: "changes:write", Create: true,
 			Marks: need, Handler: c.openRoute,
 		},
+		read("/workspaces/:slug/changes", c.listChanges),
 		read("/workspaces/:slug/changes/:number", c.getChange),
 		read("/workspaces/:slug/changes/by-commit/:sha", c.byCommit),
 		read("/workspaces/:slug/changes/:number/versions", c.listVersions),

@@ -3633,6 +3633,26 @@ version (by number or `latest`) carries its `ref`. By-commit asks
 answers only a change of `:slug`, so a fork's slug finds nothing though
 `ChangeOfCommit` answers it from the parent.
 
+The list (`list.go`), `GET /workspaces/:slug/changes` with the same scope,
+need and contributor-table pattern, reads the store outside any
+transaction. It lists the changes of `:slug`, or, when the access decision's
+record is a fork, those of its parent whose source workspace is the fork,
+and, for a token bound to a fork calling on its parent (`confinedTo`), only
+those whose source is the bound fork. The filters are SQL conditions
+combined with `AND` (`label` through `json_each` over the stored labels,
+`landing_status` through `json_extract`, `session_id` through
+`change_sessions`), except `path`, whose glob is matched with
+`identity.MatchPath` over the stored paths while the rows are read in
+order, before the page's limit is counted. Paging is by keyset in a total
+order: `updated_at` in whole seconds descending, then `number` descending
+(position `{s, n}`), or `number` ascending (`{n}`), so the order is that of
+the times the caller sees. `stack_of` reads every change's `depends_on`
+link of the workspace, walks down to the bottom and up through the
+dependants, keeps the stack members that meet the filters other than
+`state`, and pages by index in the stack (`{i}`). Items are `listItem`s,
+the change object without `conflict`, and without `paths` and
+`paths_truncated` unless `include=paths`.
+
 `include` on the change (`expand.go`) takes `versions`, which the
 component serves from `readVersions`, and `approvals`, `checks`, `stack`
 and `overlaps`, each served by the `change.Expander` (`func(ctx, Change)

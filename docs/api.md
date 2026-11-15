@@ -3732,6 +3732,55 @@ commit that is neither, also an inner commit of a version, and any commit
 on a task fork's slug, answers `404` `change_not_found`; a `{sha}` that is
 not 40 hexadecimal characters `400` `invalid_request`.
 
+## `GET /api/v1/workspaces/{slug}/changes`
+
+Lists the changes of the workspace `{slug}`. It needs, for a personal
+access token, `changes:read`, and read access to `{slug}`, answered as for
+the reads of a change above. The answer is `200` with the list envelope
+`{"items":[…],"next_cursor":…}`, paged by `limit` (1 to 200, default 50)
+and `cursor` as every list: following `next_cursor` until it is `null`
+gives every matching change once, whatever the limit. Each item is the
+change object without `conflict`, and without `paths` and
+`paths_truncated` unless `include=paths`; any other `include` value, the
+empty one included, answers `400` `invalid_request`.
+
+Without filters the list holds the changes in state `draft` or `open`,
+the most recently updated first: by `updated_at` descending, as the change
+object shows it (in whole seconds), then by `number` descending.
+`sort=number` orders by `number` ascending instead. The filters combine,
+each narrowing the list:
+
+| Parameter | Keeps the changes |
+|---|---|
+| `state` | in this state: `draft`, `open`, `landed` or `abandoned`; given more than once, in any of them. Without it, `draft` and `open` |
+| `target_branch` | with this target branch |
+| `source_workspace` | whose source branch is in this workspace |
+| `author` | opened by this user id; `me` names the caller's user |
+| `session_id` | to which this session contributed a version, current or earlier |
+| `label` | that carry this label |
+| `path` | that touch, among their stored `paths`, a file this glob matches, in the glob syntax of a token's `paths` (`*` within a path segment, `**` across them) |
+| `mergeable` | `clean`, `conflict` or `unknown` |
+| `landing_status` | whose `landing.status` is `ready`, `pending` or `blocked` |
+| `stack_of` | of the stack of this change, see below |
+
+`stack_of=<number>` lists the stack of that change: the change it reaches
+by following `depends_on` down to the one that depends on nothing, then
+every change that depends on one already listed, level by level, lower
+numbers first within a level. The stack is listed in every state and in
+that order, whatever `state` and `sort` say; the other filters still
+apply. A `stack_of` that names no change the request may see answers `404`
+`change_not_found`.
+
+A `state`, `mergeable` or `landing_status` outside its values, a `sort`
+other than `number`, `author=me` from the admin token, which has no user,
+and a `stack_of` that is not a positive integer answer `400`
+`invalid_request`.
+
+On a task fork's slug the list holds the changes of the fork's parent
+whose `source.workspace_slug` is the fork, with the same filters and
+order; a fork holds no changes of its own. A token bound to a task fork
+lists, on the fork's parent, only the changes whose source is that fork.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

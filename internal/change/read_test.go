@@ -211,7 +211,7 @@ func TestRead_ServesAChangeItsVersionsAndItsCommits(t *testing.T) {
 	t.Run("a caller without the scope or access", func(t *testing.T) {
 		gitPAT, _ := w.patFor(t, []string{"git:read"}, nil)
 		strangerKey := w.IssueKey(t, w.CreateUser(t, "u9"))
-		for _, route := range []string{"/changes/1", "/changes/by-commit/" + f.task1, "/changes/1/versions", "/changes/1/versions/1"} {
+		for _, route := range []string{"/changes", "/changes/1", "/changes/by-commit/" + f.task1, "/changes/1/versions", "/changes/1/versions/1"} {
 			for _, slug := range []string{"demo", "no-such-workspace"} {
 				if status, got, _ := w.get(t, "/workspaces/"+slug+route, gitPAT); status != http.StatusForbidden || errorType(got) != "insufficient_scope" {
 					t.Errorf("GET %s on %s with git:read = %d %v, want 403 insufficient_scope", route, slug, status, got)
@@ -235,6 +235,10 @@ func TestRead_ServesAChangeItsVersionsAndItsCommits(t *testing.T) {
 			if status, got, _ := w.get(t, "/workspaces/demo"+path, bound); status != http.StatusNotFound || errorType(got) != "change_not_found" {
 				t.Errorf("GET %s of another change = %d %v, want 404 change_not_found", path, status, got)
 			}
+		}
+		if status, got, _ := w.get(t, "/workspaces/demo/changes?state=draft&state=open&state=landed", bound); status != http.StatusOK ||
+			!reflect.DeepEqual(versionNumbers(got["items"]), []float64{1}) {
+			t.Errorf("GET /changes = %d %v, want 200 with only the fork's change 1", status, got)
 		}
 	})
 }
