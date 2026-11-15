@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
-	"github.com/agent-fox-dev/parley/internal/scm"
 )
 
 // The files the file tests add to the tree workspace's main, beside what
@@ -31,10 +30,10 @@ var (
 // fileWorld is a world whose tree workspace also holds bin.dat (the bytes
 // 0x00 to 0xff), empty.txt, utf8.txt (multi-byte text), digits.txt (100
 // bytes), edge.dat (1,024 bytes) and big.dat (1,025 bytes), and the git
-// directory of that workspace.
-func fileWorld(t *testing.T, adjust ...func(*scm.Deps)) (*world, string) {
+// directory of that workspace; toml is added to the hub's config.toml.
+func fileWorld(t *testing.T, toml ...string) (*world, string) {
 	t.Helper()
-	w := newWorld(t, adjust...)
+	w := newConfiguredWorld(t, strings.Join(toml, "\n"))
 	return w, w.addTree(t, "bin.dat", binDat, "empty.txt", "", "utf8.txt", utf8Txt, "digits.txt", digitsTxt,
 		"edge.dat", strings.Repeat("e", 1024), "big.dat", strings.Repeat("b", 1025))
 }
@@ -171,7 +170,7 @@ func TestFile_RefusesAPathOrRangeItCannotServe(t *testing.T) {
 }
 
 func TestFile_RefusesAFileOverTheSizeLimit(t *testing.T) {
-	w, _ := fileWorld(t, func(d *scm.Deps) { d.MaxFileSize = 1024 })
+	w, _ := fileWorld(t, "[scm]\nmax_file_size = \"1KB\"\n")
 	for _, accept := range []string{"", "application/json"} {
 		for _, rng := range []string{"", "bytes=0-9"} {
 			r := w.get(t, fileURL("big.dat"), w.ownerKey, "Accept", accept, "Range", rng)

@@ -48,3 +48,17 @@ where glibc's does. `gitrepo.(*Repo).Grep` writes `\w`, `\W`, `\s` and
 `[[:space:]]` and `[^[:space:]]` before git sees the expression, so they
 mean what they mean with glibc on Linux and on macOS alike. Other GNU
 escapes, such as `\b`, `\<` and `\>`, are left to the C library.
+
+## A refused `[scm]` value is named as `scm.read_timeout`
+
+The package says that a `read_timeout` or `max_file_size` of zero or below
+is refused with an error naming the key as `[scm].read_timeout` or
+`[scm].max_file_size`. The configuration loader names every key it refuses
+in one form, `section.key` (`forks.max_per_workspace`,
+`server.max_body_size`), and the `[scm]` keys follow it: the error names
+`scm.read_timeout` or `scm.max_file_size`, such as `configuration file
+…/config.toml: scm.read_timeout: must be above zero`
+(`internal/config/scm.go`; `TestLoad_RefusesAReadLimitOfZeroOrBelow` in
+`internal/config/scm_test.go` asserts that form). `parleyd` stops with exit
+status 1 and that one error line before it listens, as for every refused
+configuration.

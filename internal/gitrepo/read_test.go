@@ -6,9 +6,12 @@ import (
 	"io"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -285,5 +288,62 @@ func TestWriteBlob_WritesTheBytesOfABlob(t *testing.T) {
 	f.calls.Store(0)
 	if err := f.repo.WriteBlob(context.Background(), f.blob[:7], io.Discard); !errors.Is(err, gitrepo.ErrNotFound) || f.calls.Load() != 0 {
 		t.Errorf("WriteBlob(abbreviated id) = %v after %d git processes, want ErrNotFound and none", err, f.calls.Load())
+	}
+}
+
+// stallingWriter takes the first write, signals it on first, and then
+// takes nothing more until ctx ends, so that git fills its pipe and waits.
+type stallingWriter struct {
+	ctx   context.Context
+	first chan struct{}
+	once  sync.Once
+}
+
+func (w *stallingWriter) Write(p []byte) (int, error) {
+	took := false
+	w.once.Do(func() { took = true; close(w.first) })
+	if took {
+		return len(p), nil
+	}
+	<-w.ctx.Done()
+	return 0, w.ctx.Err()
+}
+
+func TestWriteBlob_EndsGitWhenItsContextEndsMidRead(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	big := strings.Repeat("0123456789abcdef", 1<<16) // 1 MiB, far more than a pipe holds
+	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 3\nbig\n" +
+		"M 100644 inline big.dat\ndata " + strconv.Itoa(len(big)) + "\n" + big + "\n\n"
+	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	blob := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main:big.dat"))
+	repo, err := gitrepo.Git{}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &stallingWriter{ctx: ctx, first: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { done <- repo.WriteBlob(ctx, blob, w) }()
+	select {
+	case <-w.first:
+	case err := <-done:
+		t.Fatalf("WriteBlob returned %v before git wrote anything", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("git wrote nothing within 5s")
+	}
+	cancel()
+	// WriteBlob returns once git has exited and been waited for.
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("WriteBlob = %v, want an error wrapping context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WriteBlob did not return within 1s of the end of its context")
 	}
 }

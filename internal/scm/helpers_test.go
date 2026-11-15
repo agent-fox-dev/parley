@@ -149,8 +149,14 @@ const testCommitter = "committer T <t@example.invalid> 1700000000 +0000\n"
 // dependencies after the world's own changes.
 func newWorld(t *testing.T, adjust ...func(*scm.Deps)) *world {
 	t.Helper()
+	return newConfiguredWorld(t, "", adjust...)
+}
+
+// newConfiguredWorld is newWorld with toml added to the hub's config.toml.
+func newConfiguredWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *world {
+	t.Helper()
 	w := &world{observed: &observations{}, id: map[string]string{}}
-	w.Hub = hubtest.StartWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
+	w.Hub = hubtest.StartWith(t, hubtest.Config{TOML: toml, Compose: func(c *hub.Composition) {
 		w.workspaces, w.events = c.Workspaces(), c.Events()
 		c.AdjustSCM(func(d *scm.Deps) {
 			open := d.Open

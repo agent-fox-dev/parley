@@ -20,12 +20,19 @@
 // it resolved, its query and its representation, and answers 304 to an
 // If-None-Match that holds it, before the costly part of the read; one
 // whose revisions were all written as full commit ids is marked immutable.
+//
+// Every read is bounded: it has the read timeout from the moment its route
+// begins handling it, and every git command it runs ends with it. A read
+// that has not begun its answer by then is answered 503 scm_timeout; one
+// whose answer has begun is cut off.
 package scm
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -49,6 +56,14 @@ const (
 	opBlame   = "blame"
 	opSearch  = "search"
 )
+
+// DefaultReadTimeout is how long a read may run when Deps sets no read
+// timeout.
+const DefaultReadTimeout = 30 * time.Second
+
+// errReadTimeout is the cause of the end of a read's context at its
+// deadline, which tells it from a client that went away.
+var errReadTimeout = errors.New("the read timed out")
 
 // scopeRead is the scope a personal access token needs for every read;
 // git:write implies it.
@@ -93,6 +108,9 @@ type Deps struct {
 	// MaxFileSize is the size in bytes of the largest file the file route
 	// serves; zero or less is DefaultMaxFileSize.
 	MaxFileSize int64
+	// ReadTimeout is how long a read may run, from the moment its route
+	// begins handling it; zero or less is DefaultReadTimeout.
+	ReadTimeout time.Duration
 }
 
 // Component serves the read routes. Its zero value is ready to be
@@ -121,6 +139,9 @@ func (c *Component) Bind(d Deps) {
 	if d.MaxFileSize <= 0 {
 		d.MaxFileSize = DefaultMaxFileSize
 	}
+	if d.ReadTimeout <= 0 {
+		d.ReadTimeout = DefaultReadTimeout
+	}
 	c.deps = d
 }
 
@@ -148,30 +169,65 @@ func (c *Component) route(pattern, op string, h server.HandlerFunc) server.Route
 		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.observe(op, h)}
 }
 
-// observe is h reporting each request it answers to the recorder once,
-// with the status it wrote or, when it returned an error before writing,
-// the status the error is answered with. An answer h did not write itself,
-// an error's, carries none of the caching headers h set before it failed.
+// observe is h bounded by the read timeout and reporting each request it
+// answers to the recorder once, with the status it wrote or, when it
+// returned an error before writing, the status the error is answered
+// with. An answer h did not write itself, an error's, carries none of the
+// caching headers h set before it failed.
+//
+// h's request carries a context that ends at the read timeout, which ends
+// every git command h runs with it. Once that deadline has passed, nothing
+// h writes reaches the client: a read that had not begun its answer is
+// answered 503 scm_timeout, with none of the headers h set, and one whose
+// answer had begun and did not finish it is cut off, so that the client
+// cannot take a part of a body for all of it.
 func (c *Component) observe(op string, h server.HandlerFunc) server.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
-		sw := &statusWriter{ResponseWriter: w}
+		ctx, cancel := context.WithTimeoutCause(r.Context(), c.deps.ReadTimeout, errReadTimeout)
+		defer cancel()
+		sw := &statusWriter{ResponseWriter: w, ctx: ctx}
+		before := w.Header().Clone()
 		restore := uncached(w.Header())
 		defer func() {
 			if sw.status == 0 {
 				restore()
 			}
 		}()
-		err := h(sw, r)
+		err := h(sw, r.WithContext(ctx))
+		timedOut := context.Cause(ctx) == errReadTimeout
+		if timedOut && sw.status == 0 {
+			if sw.refused {
+				replaceHeader(w.Header(), before)
+			}
+			err = server.NewError("scm_timeout", http.StatusServiceUnavailable,
+				fmt.Sprintf("the read did not finish within the read timeout of %s", c.deps.ReadTimeout))
+		}
+		cut := timedOut && sw.status != 0 && (err != nil || sw.refused)
 		status := sw.status
 		if status == 0 {
 			status = errorStatus(err)
 		}
 		result := ResultOK
-		if status >= http.StatusBadRequest {
+		if status >= http.StatusBadRequest || cut {
 			result = ResultError
 		}
 		c.deps.Recorder.Observe(op, result)
+		if cut {
+			// net/http drops the connection, so that the answer does not end
+			// as if it were whole.
+			panic(http.ErrAbortHandler)
+		}
 		return err
+	}
+}
+
+// replaceHeader makes h hold what was holds, and nothing else.
+func replaceHeader(h, was http.Header) {
+	for name := range h {
+		delete(h, name)
+	}
+	for name, values := range was {
+		h[name] = values
 	}
 }
 
@@ -188,13 +244,30 @@ func errorStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
-// statusWriter remembers the status of the answer written through it.
+// statusWriter remembers the status of the answer written through it,
+// and passes nothing on once the read's context has reached its deadline.
 type statusWriter struct {
 	http.ResponseWriter
+	ctx    context.Context
 	status int
+	// refused is set once a write came after the deadline.
+	refused bool
+}
+
+// late reports whether the read's deadline has passed, and remembers that
+// a write was refused for it.
+func (s *statusWriter) late() bool {
+	if context.Cause(s.ctx) != errReadTimeout {
+		return false
+	}
+	s.refused = true
+	return true
 }
 
 func (s *statusWriter) WriteHeader(status int) {
+	if s.late() {
+		return
+	}
 	if s.status == 0 {
 		s.status = status
 	}
@@ -202,6 +275,9 @@ func (s *statusWriter) WriteHeader(status int) {
 }
 
 func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.late() {
+		return 0, context.Cause(s.ctx)
+	}
 	if s.status == 0 {
 		s.status = http.StatusOK
 	}
