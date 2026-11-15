@@ -209,9 +209,9 @@ func (r costlyRepo) TrialRebase(ctx context.Context, onto, head string) (*gitrep
 	return r.Repository.TrialRebase(ctx, onto, head)
 }
 
-func (r costlyRepo) ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error) {
+func (r costlyRepo) ReadTree(ctx context.Context, commit, path string, read gitrepo.TreeRead) (gitrepo.Tree, error) {
 	r.calls.add("ReadTree")
-	return r.Repository.ReadTree(ctx, commit, path, recursive)
+	return r.Repository.ReadTree(ctx, commit, path, read)
 }
 
 func (r costlyRepo) LookupFile(ctx context.Context, commit, path string) (gitrepo.TreeEntry, error) {

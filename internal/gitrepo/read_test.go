@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -213,9 +215,147 @@ func TestReadTree_ListsADirectoryOfACommitInPathOrder(t *testing.T) {
 		{"", true, gitrepo.Tree{ID: id(f.x + "^{tree}"), Entries: []gitrepo.TreeEntry{d, md, x, ft}}},
 		{"dir", false, gitrepo.Tree{ID: id(f.x + ":dir"), Entries: []gitrepo.TreeEntry{x}}},
 	} {
-		got, err := f.repo.ReadTree(context.Background(), f.x, c.path, c.recursive)
+		got, err := f.repo.ReadTree(context.Background(), f.x, c.path, gitrepo.TreeRead{Recursive: c.recursive})
 		if err != nil || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("ReadTree(x, %q, %v) = %+v, %v, want %+v", c.path, c.recursive, got, err, c.want)
+		}
+	}
+}
+
+// pagedTree is a repository whose main holds nested directories and paths
+// whose byte order differs from git's tree order, and the id of main.
+func pagedTree(t *testing.T) (*gitrepo.Repo, string) {
+	t.Helper()
+	dir := t.TempDir()
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nx\n"
+	for _, p := range []string{"a/x", "a/y/z", "a.b", "a-b/c", "a0", "b/1", "b/2/3", "b/2/4", ":c/q", "z*[/w", "é/ö", "\xff"} {
+		stream += "M 100644 inline " + p + "\ndata 2\nx\n\n"
+	}
+	if _, err := gitrepotest.Run(dir, stream+"\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := (gitrepo.Git{}).Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo, strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
+}
+
+// removeObject deletes the loose object of the revision rev from the
+// repository whose git directory is dir, so that git can no longer read it.
+func removeObject(t *testing.T, dir, rev string) {
+	t.Helper()
+	id := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", rev))
+	if err := os.Remove(filepath.Join(dir, "objects", id[:2], id[2:])); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadTree_ListsAPageOfTheEntriesAfterAPath(t *testing.T) {
+	t.Parallel()
+	repo, main := pagedTree(t)
+	ctx := context.Background()
+	for _, c := range []struct {
+		path      string
+		recursive bool
+	}{{"", true}, {"", false}, {"b", true}, {"a", true}, {"b", false}} {
+		whole, err := repo.ReadTree(ctx, main, c.path, gitrepo.TreeRead{Recursive: c.recursive})
+		if err != nil {
+			t.Fatal(err)
+		}
+		afters := []string{"", "0", "a", "a/", "a/y", "a/y/", "a/y/zz", "aa", "b/", "b/2/", "z", "\xff\xff", "a//y", "../a", "b/2/3/x"}
+		for _, e := range whole.Entries {
+			afters = append(afters, e.Path)
+		}
+		for _, after := range afters {
+			var rest []gitrepo.TreeEntry
+			for _, e := range whole.Entries {
+				if e.Path > after {
+					rest = append(rest, e)
+				}
+			}
+			for _, limit := range []int{0, 1, 3} {
+				want := gitrepo.Tree{ID: whole.ID, Entries: rest}
+				if limit > 0 && len(rest) > limit {
+					want.Entries = rest[:limit]
+				}
+				if want.Entries == nil {
+					want.Entries = []gitrepo.TreeEntry{}
+				}
+				got, err := repo.ReadTree(ctx, main, c.path, gitrepo.TreeRead{Recursive: c.recursive, After: after, Limit: limit})
+				if err != nil || !reflect.DeepEqual(got, want) {
+					t.Errorf("ReadTree(%q, recursive %v, after %q, limit %d) = %v, %v, want %v", c.path, c.recursive, after, limit, got, err, want)
+				}
+			}
+		}
+	}
+}
+
+func TestReadTree_ListsMoreDirectoriesThanOneRunOfGitTakes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	// 300 directories of 250-byte names take more than 64 KiB of command line.
+	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nx\n"
+	for i := range 300 {
+		name := strconv.Itoa(1000+i) + strings.Repeat("d", 246)
+		stream += "M 100644 inline " + name + "/f\ndata 2\nx\nM 100644 inline " + name + ".txt\ndata 2\nx\n"
+	}
+	if _, err := gitrepotest.Run(dir, stream+"\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := (gitrepo.Git{}).Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := strings.Split(strings.TrimSuffix(gitrepotest.Git(t, dir, "ls-tree", "-r", "-t", "-z", "--name-only", "main"), "\x00"), "\x00")
+	slices.Sort(all)
+	for _, after := range []string{"", all[1], all[450]} {
+		got, err := repo.ReadTree(context.Background(), strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main")), "", gitrepo.TreeRead{Recursive: true, After: after})
+		var paths []string
+		for _, e := range got.Entries {
+			paths = append(paths, e.Path)
+		}
+		want := slices.DeleteFunc(slices.Clone(all), func(p string) bool { return p <= after })
+		if err != nil || !slices.Equal(paths, want) {
+			t.Errorf("ReadTree(after %.10q) = %d entries, %v; want the %d after it", after, len(paths), err, len(want))
+		}
+	}
+}
+
+func TestReadTree_ReadsNoDirectoryBeforeThePageOrPastIt(t *testing.T) {
+	t.Parallel()
+	repo, main := pagedTree(t)
+	ctx := context.Background()
+	whole, err := repo.ReadTree(ctx, main, "", gitrepo.TreeRead{Recursive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeObject(t, repo.Dir(), main+":a/y")
+	removeObject(t, repo.Dir(), main+":é")
+	if _, err := repo.ReadTree(ctx, main, "", gitrepo.TreeRead{Recursive: true}); err == nil {
+		t.Fatal("a whole listing read the directories git cannot read")
+	}
+	paths := func(es []gitrepo.TreeEntry) (p []string) {
+		for _, e := range es {
+			p = append(p, e.Path)
+		}
+		return p
+	}
+	for _, c := range []struct {
+		after string
+		limit int
+		want  []string
+	}{
+		{"", 3, []string{":c", ":c/q", "a"}},
+		{"a/x", 1, []string{"a/y"}},
+		{"a0", 4, []string{"b", "b/1", "b/2", "b/2/3"}},
+		{"b/1", 3, []string{"b/2", "b/2/3", "b/2/4"}},
+	} {
+		got, err := repo.ReadTree(ctx, main, "", gitrepo.TreeRead{Recursive: true, After: c.after, Limit: c.limit})
+		if err != nil || !slices.Equal(paths(got.Entries), c.want) || got.ID != whole.ID {
+			t.Errorf("ReadTree(after %q, limit %d) = %v, %v, want %v", c.after, c.limit, paths(got.Entries), err, c.want)
 		}
 	}
 }
@@ -236,7 +376,7 @@ func TestReadTree_TellsAMissingPathFromOneThatIsNoDirectory(t *testing.T) {
 		{strings.Repeat("f", 40), "", gitrepo.ErrNotFound},
 		{f.x[:7], "", gitrepo.ErrNotFound},
 	} {
-		if got, err := f.repo.ReadTree(context.Background(), c.commit, c.path, false); !errors.Is(err, c.want) {
+		if got, err := f.repo.ReadTree(context.Background(), c.commit, c.path, gitrepo.TreeRead{}); !errors.Is(err, c.want) {
 			t.Errorf("ReadTree(%s, %q) = %+v, %v, want %v", c.commit, c.path, got, err, c.want)
 		}
 	}

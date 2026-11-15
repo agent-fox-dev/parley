@@ -1,10 +1,12 @@
 package gitrepo
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -63,6 +65,19 @@ type Tree struct {
 	Entries []TreeEntry
 }
 
+// TreeRead says which entries of a directory a tree read lists.
+type TreeRead struct {
+	// Recursive lists every entry below the directory, directories as well
+	// as their contents; otherwise the directory's own entries.
+	Recursive bool
+	// After leaves out every entry whose path is not after After in byte
+	// order, "" none; with Recursive, no directory before it is read.
+	After string
+	// Limit is the most entries listed, the first in path order; 0 lists
+	// every one.
+	Limit int
+}
+
 // TreeEntry is an entry of a directory.
 type TreeEntry struct {
 	// Path is the entry's path from the root of the commit's tree.
@@ -82,12 +97,12 @@ type TreeEntry struct {
 }
 
 // ReadTree reads the directory path of the commit of the full id commit:
-// its tree id and its entries or, with recursive, every entry below it,
-// directories as well as their contents. path is "" for the root, or a
-// path of the commit's tree, which git takes literally. A path that names
-// no entry, or a commit id that names no commit, is ErrNotFound; a path
-// that names a file, a symlink or a submodule is ErrNotDirectory.
-func (r *Repo) ReadTree(ctx context.Context, commit, path string, recursive bool) (Tree, error) {
+// its tree id and the entries read says, in path order. path is "" for the
+// root, or a path of the commit's tree, which git takes literally. A path
+// that names no entry, or a commit id that names no commit, is
+// ErrNotFound; a path that names a file, a symlink or a submodule is
+// ErrNotDirectory.
+func (r *Repo) ReadTree(ctx context.Context, commit, path string, read TreeRead) (Tree, error) {
 	if len(commit) != idLen || !isHexID(commit, idLen) || strings.ContainsAny(path, "\n\x00") {
 		return Tree{}, fmt.Errorf("tree %q: %w", commit+":"+path, ErrNotFound)
 	}
@@ -127,13 +142,249 @@ func (r *Repo) ReadTree(ctx context.Context, commit, path string, recursive bool
 	if path != "" {
 		prefix = path + "/"
 	}
-	entries, err := r.lsTree(ctx, dir, prefix, recursive)
+	need := read.Limit
+	if need <= 0 {
+		need = math.MaxInt
+	}
+	var entries []TreeEntry
+	if read.Recursive {
+		entries, err = r.treeAfter(ctx, commit, dir, prefix, read.After, need)
+	} else {
+		entries, err = r.lsTree(ctx, dir, prefix, false)
+		sortByPath(entries)
+		entries = slices.DeleteFunc(entries, func(e TreeEntry) bool { return read.After != "" && e.Path <= read.After })
+	}
 	if err != nil {
 		return Tree{}, err
 	}
-	// git orders a tree's entries as if a directory's name ended in "/".
+	return Tree{ID: dir, Entries: entries[:min(len(entries), need)]}, nil
+}
+
+// sortByPath orders entries by path, byte by byte: git orders a tree's
+// entries as if a directory's name ended in "/".
+func sortByPath(entries []TreeEntry) {
 	slices.SortFunc(entries, func(a, b TreeEntry) int { return strings.Compare(a.Path, b.Path) })
-	return Tree{ID: dir, Entries: entries}, nil
+}
+
+// maxTreePathspecs is the most bytes of names one listing of the contents
+// of directories takes on git's command line.
+const maxTreePathspecs = 64 << 10
+
+// treeAfter lists, in path order, the first need entries below the
+// directory tree of the commit of the full id commit, whose path is prefix
+// ("" or ending in "/"), that come after the path after, every one when
+// after is "". It reads the directories on the way down to after, then,
+// from the deepest, the entries after it in each, and stops as soon as it
+// holds need: no directory before after is read, nor one past the page.
+func (r *Repo) treeAfter(ctx context.Context, commit, tree, prefix, after string, need int) ([]TreeEntry, error) {
+	// level is a directory on the way, its path and what follows it in after.
+	type level struct{ tree, prefix, tail string }
+	levels := []level{{tree, prefix, ""}}
+	if after != "" {
+		rel, below := strings.CutPrefix(after, prefix)
+		switch {
+		case below:
+			levels[0].tail = rel
+			parts := strings.Split(rel, "/")
+			var names []string
+			for j := 1; j < len(parts) && !slices.Contains([]string{"", ".", ".."}, parts[j-1]); j++ {
+				names = append(names, treeName(commit, prefix+strings.Join(parts[:j], "/")))
+			}
+			lines := []string{}
+			if len(names) > 0 {
+				var err error
+				if lines, err = r.batchCheck(ctx, "%(objectname) %(objecttype)", names); err != nil {
+					return nil, err
+				}
+			}
+			for j, line := range lines {
+				id, ok := strings.CutSuffix(line, " "+ObjectTree)
+				if !ok {
+					// Nothing is below a path that names no directory.
+					break
+				}
+				levels = append(levels, level{id, prefix + strings.Join(parts[:j+1], "/") + "/", strings.Join(parts[j+1:], "/")})
+			}
+		case after > prefix:
+			// Every entry begins with prefix, which after does not.
+			return []TreeEntry{}, nil
+		}
+	}
+	out := []TreeEntry{}
+	for j := len(levels) - 1; j >= 0 && len(out) < need; j-- {
+		// An entry of a deeper directory comes before every one after it
+		// in a directory above.
+		l := levels[j]
+		if err := r.entriesAfter(ctx, l.tree, l.prefix, l.tail, need, &out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// entriesAfter appends to out, in path order, the entries below the
+// directory tree, whose path is prefix, that come after prefix+tail, until
+// out holds need. An entry x of the directory comes after when x > tail,
+// and every entry below x when x+"/" > tail: that is how each compares
+// with tail byte by byte, x holding no "/". The contents of a directory
+// are listed only when they come next.
+func (r *Repo) entriesAfter(ctx context.Context, tree, prefix, tail string, need int, out *[]TreeEntry) error {
+	own, err := r.lsTree(ctx, tree, prefix, false)
+	if err != nil {
+		return err
+	}
+	// key is where an entry, or the contents of a directory, come.
+	type key struct {
+		at    string
+		e     TreeEntry
+		below bool
+	}
+	var keys []key
+	for _, e := range own {
+		if e.Name > tail {
+			keys = append(keys, key{e.Name, e, false})
+		}
+		if e.Type == ObjectTree && e.Name+"/" > tail {
+			keys = append(keys, key{e.Name + "/", e, true})
+		}
+	}
+	slices.SortFunc(keys, func(a, b key) int { return strings.Compare(a.at, b.at) })
+
+	full := func() bool { return len(*out) >= need }
+	for len(keys) > 0 && !full() {
+		if !keys[0].below {
+			*out = append(*out, keys[0].e)
+			keys = keys[1:]
+			continue
+		}
+		// One run of git lists the contents of the next directories, each
+		// whole after the one before, which is also the order of their keys.
+		listed := map[string]bool{}
+		var names []string
+		size := 0
+		for _, k := range keys {
+			if !k.below {
+				continue
+			}
+			if len(names) > 0 && size+len(k.e.Name) > maxTreePathspecs {
+				// The rest wait for a run of their own, in their order.
+				break
+			}
+			listed[k.e.Name], names, size = true, append(names, k.e.Name), size+len(k.e.Name)+len(":(literal)")
+		}
+		var block []TreeEntry
+		blockOf := ""
+		// take appends the keys up to the contents of blockOf, then those.
+		take := func() {
+			for len(keys) > 0 && !full() {
+				k := keys[0]
+				keys = keys[1:]
+				switch {
+				case !k.below:
+					*out = append(*out, k.e)
+				case k.e.Name == blockOf:
+					sortByPath(block)
+					*out = append(*out, block...)
+					return
+				}
+				// A directory listed with nothing below it has no block.
+			}
+		}
+		stopped, err := r.lsTreeBelow(ctx, tree, prefix, names, func(e TreeEntry, rel string) bool {
+			name, _, below := strings.Cut(rel, "/")
+			if !below {
+				// The directory itself, which its own key places.
+				return true
+			}
+			if name != blockOf {
+				if blockOf != "" {
+					// The block before is whole, since git has gone on.
+					if take(); full() {
+						return false
+					}
+				}
+				blockOf, block = name, block[:0]
+			}
+			block = append(block, e)
+			return true
+		})
+		if stopped {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if blockOf != "" {
+			take()
+		}
+		for len(keys) > 0 && !full() && (!keys[0].below || listed[keys[0].e.Name]) {
+			if !keys[0].below {
+				*out = append(*out, keys[0].e)
+			}
+			keys = keys[1:]
+		}
+	}
+	return nil
+}
+
+// lsTreeBelow lists every entry below the entries names of the tree of
+// the full id tree, directories included, in git's order, and calls each
+// with it, its path prefixed with prefix, and its path in tree, until each
+// returns false; stopped says that it did, and git is stopped then.
+func (r *Repo) lsTreeBelow(ctx context.Context, tree, prefix string, names []string, each func(e TreeEntry, rel string) bool) (stopped bool, err error) {
+	args := []string{"--git-dir=" + r.dir, "ls-tree", "-z", "-l", "-r", "-t", tree, "--"}
+	for _, n := range names {
+		args = append(args, ":(literal)"+n)
+	}
+	dir, err := privateDir(false)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	gitCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	cmd := r.g.command(gitCtx, dir, access{}, args)
+	errOut := &limitedBuffer{limit: stderrLimit}
+	cmd.Stderr = errOut
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return false, err
+	}
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("git ls-tree: %w", err)
+	}
+	br := bufio.NewReaderSize(stdout, 64<<10)
+	var readErr error
+	for !stopped && readErr == nil {
+		rec, err := br.ReadString(0)
+		switch {
+		case errors.Is(err, io.EOF) && rec == "":
+		case err != nil:
+			readErr = err
+		default:
+			var e TreeEntry
+			if e, readErr = parseTreeRecord(strings.TrimSuffix(rec, "\x00"), prefix); readErr == nil {
+				stopped = !each(e, strings.TrimPrefix(e.Path, prefix))
+			}
+			continue
+		}
+		break
+	}
+	if stopped || readErr != nil {
+		stop()
+	}
+	waitErr := cmd.Wait()
+	switch {
+	case stopped:
+		return true, nil
+	case ctx.Err() != nil:
+		return false, fmt.Errorf("git ls-tree: %w", ctx.Err())
+	case readErr != nil:
+		return false, fmt.Errorf("git ls-tree: read the entries: %w", readErr)
+	case waitErr != nil:
+		return false, fmt.Errorf("git ls-tree: %w: %s", waitErr, strings.TrimSpace(errOut.String()))
+	}
+	return false, nil
 }
 
 // LookupFile is the entry of the file path of the commit of the full id
@@ -236,22 +487,33 @@ func (r *Repo) lsTree(ctx context.Context, tree, prefix string, recursive bool) 
 		if rec == "" {
 			continue
 		}
-		// <mode> <type> <id> <size, padded>\t<path>, the size "-" for any
-		// object but a blob.
-		meta, rel, ok := strings.Cut(rec, "\t")
-		f := strings.Fields(meta)
-		if !ok || len(f) != 4 {
-			return nil, fmt.Errorf("ls-tree answered %q", rec)
-		}
-		e := TreeEntry{Path: prefix + rel, Name: rel[strings.LastIndexByte(rel, '/')+1:], Mode: f[0], Type: f[1], ID: f[2]}
-		if e.Type == ObjectBlob {
-			if e.Size, err = strconv.ParseInt(f[3], 10, 64); err != nil {
-				return nil, fmt.Errorf("ls-tree answered %q", rec)
-			}
+		e, err := parseTreeRecord(rec, prefix)
+		if err != nil {
+			return nil, err
 		}
 		entries = append(entries, e)
 	}
 	return entries, nil
+}
+
+// parseTreeRecord is the entry a record of git ls-tree -z -l writes,
+// "<mode> <type> <id> <size, padded>\t<path>", the size "-" for any object
+// but a blob, its path prefixed with prefix.
+func parseTreeRecord(rec, prefix string) (TreeEntry, error) {
+	meta, rel, ok := strings.Cut(rec, "\t")
+	f := strings.Fields(meta)
+	if !ok || len(f) != 4 {
+		return TreeEntry{}, fmt.Errorf("ls-tree answered %q", rec)
+	}
+	e := TreeEntry{Path: prefix + rel, Name: rel[strings.LastIndexByte(rel, '/')+1:], Mode: f[0], Type: f[1], ID: f[2]}
+	if e.Type == ObjectBlob {
+		size, err := strconv.ParseInt(f[3], 10, 64)
+		if err != nil {
+			return TreeEntry{}, fmt.Errorf("ls-tree answered %q", rec)
+		}
+		e.Size = size
+	}
+	return e, nil
 }
 
 // idLen is the length of a full object id written in hexadecimal.

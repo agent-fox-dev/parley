@@ -35,8 +35,8 @@ func (s stalledRepo) ListRefs(ctx context.Context, _ ...string) ([]gitrepo.Ref, 
 // waits for its context to end.
 type lateRepo struct{ scm.Repository }
 
-func (l lateRepo) ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error) {
-	tree, err := l.Repository.ReadTree(ctx, commit, path, recursive)
+func (l lateRepo) ReadTree(ctx context.Context, commit, path string, read gitrepo.TreeRead) (gitrepo.Tree, error) {
+	tree, err := l.Repository.ReadTree(ctx, commit, path, read)
 	<-ctx.Done()
 	return tree, err
 }

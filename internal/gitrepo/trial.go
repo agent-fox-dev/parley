@@ -27,28 +27,20 @@ func (r *Repo) TrialRebase(ctx context.Context, onto, head string) (*ConflictRep
 	if err != nil {
 		return nil, err
 	}
-	ids, err := r.CommitsBetween(ctx, onto, head, 0)
-	if err != nil || len(ids) == 0 {
+	commits, err := r.replayed(ctx, onto, head)
+	if err != nil || len(commits) == 0 {
 		return nil, err
-	}
-	commits, err := r.ReadCommits(ctx, append(ids, onto))
-	if err != nil {
-		return nil, err
-	}
-	target, commits := commits[len(commits)-1], commits[:len(commits)-1]
-	if slices.ContainsFunc(commits, func(c Commit) bool { return len(c.Parents) > 1 }) {
-		return nil, ErrMergeCommit
 	}
 
 	// Without merges, the commits form one line: each one's parent is the
 	// one before it, and the first one's is outside the range, or none.
-	parent, parentTree, err := r.firstParent(ctx, commits[0])
+	ontoTree, parent, parentTree, err := r.trialStart(ctx, onto, commits[0])
 	if err != nil {
 		return nil, err
 	}
 	// ours is the commit the next one is replayed onto, "" while it is
 	// only the tree oursTree, made into a commit when a merge needs one.
-	ours, oursTree := target.ID, target.Tree
+	ours, oursTree := onto, ontoTree
 	for _, c := range commits {
 		switch {
 		case parentTree == oursTree:
@@ -79,22 +71,52 @@ func (r *Repo) TrialRebase(ctx context.Context, onto, head string) (*ConflictRep
 	return nil, nil
 }
 
-// firstParent is the parent of the commit c and its tree; for a root
-// commit, a commit of the empty tree, the side a three-way merge starts
-// from for everything c adds.
-func (r *Repo) firstParent(ctx context.Context, c Commit) (id, tree string, err error) {
-	if len(c.Parents) == 0 {
-		if tree, err = r.emptyTree(ctx); err != nil {
-			return "", "", err
-		}
-		id, err = r.trialCommit(ctx, tree)
-		return id, tree, err
-	}
-	parents, err := r.ReadCommits(ctx, c.Parents[:1])
+// replayed lists the commits of the range onto..head, oldest first, each
+// with its tree and parents alone: their messages are not read. A merge
+// commit among them is ErrMergeCommit.
+func (r *Repo) replayed(ctx context.Context, onto, head string) ([]Commit, error) {
+	out, err := r.git(ctx, "rev-list", "--reverse", "--no-commit-header", "--format=%H %T %P", onto+".."+head)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	return parents[0].ID, parents[0].Tree, nil
+	var commits []Commit
+	for line := range strings.Lines(string(out)) {
+		f := strings.Fields(line)
+		switch {
+		case len(f) < 2:
+			return nil, fmt.Errorf("rev-list answered %q", line)
+		case len(f) > 3:
+			return nil, ErrMergeCommit
+		}
+		commits = append(commits, Commit{ID: f[0], Tree: f[1], Parents: f[2:]})
+	}
+	return commits, nil
+}
+
+// trialStart is the tree of the commit onto, and the parent of the commit
+// first with its tree: for a root commit, a commit of the empty tree, the
+// side a three-way merge starts from for everything first adds.
+func (r *Repo) trialStart(ctx context.Context, onto string, first Commit) (ontoTree, parent, parentTree string, err error) {
+	names := []string{onto + "^{tree}"}
+	if len(first.Parents) > 0 {
+		parent = first.Parents[0]
+		names = append(names, parent+"^{tree}")
+	}
+	trees, err := r.batchCheck(ctx, "%(objectname)", names)
+	if err != nil {
+		return "", "", "", err
+	}
+	if len(trees) != len(names) || slices.ContainsFunc(trees, func(l string) bool { return strings.HasSuffix(l, " missing") }) {
+		return "", "", "", fmt.Errorf("trial rebase of %s: cat-file answered %q", first.ID, trees)
+	}
+	if parent != "" {
+		return trees[0], parent, trees[1], nil
+	}
+	if parentTree, err = r.emptyTree(ctx); err != nil {
+		return "", "", "", err
+	}
+	parent, err = r.trialCommit(ctx, parentTree)
+	return trees[0], parent, parentTree, err
 }
 
 // trialCommit writes a commit of tree with no parent and returns its id,

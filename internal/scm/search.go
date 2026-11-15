@@ -38,12 +38,6 @@ type searchPosition struct {
 	Line int    `json:"line"`
 }
 
-// after reports whether m comes after p in the order of a search's
-// matches: by path, compared byte by byte, then by line.
-func (p searchPosition) after(m gitrepo.GrepMatch) bool {
-	return m.Path > p.Path || (m.Path == p.Path && m.Line > p.Line)
-}
-
 // search answers GET …/scm/search: a page of the lines of the text files
 // at ref that q matches, as a fixed string with regard to case unless
 // regex or case_sensitive say otherwise, in the files whose path one of the
@@ -94,11 +88,16 @@ func (c *Component) search(w http.ResponseWriter, r *http.Request) error {
 	}
 	sha := res.SHA
 	items := make([]searchMatch, 0, page.Limit+1)
-	err = rd.repo.Grep(r.Context(), sha, gitrepo.GrepQuery{Pattern: pattern, Regexp: regex, IgnoreCase: !caseSensitive}, func(m gitrepo.GrepMatch) bool {
-		if (continuing && !pos.after(m)) || !identity.MatchAny(globs, m.Path) {
+	query := gitrepo.GrepQuery{Pattern: pattern, Regexp: regex, IgnoreCase: !caseSensitive, MaxText: maxMatchText}
+	if continuing {
+		// git starts after the last match the pages before held.
+		query.AfterPath, query.AfterLine = pos.Path, pos.Line
+	}
+	err = rd.repo.Grep(r.Context(), sha, query, func(m gitrepo.GrepMatch) bool {
+		if !identity.MatchAny(globs, m.Path) {
 			return true
 		}
-		items = append(items, searchMatch{Path: m.Path, Line: m.Line, Text: firstRunes(m.Text, maxMatchText)})
+		items = append(items, searchMatch{Path: m.Path, Line: m.Line, Text: m.Text})
 		// One match past the page tells that there is a next page.
 		return len(items) <= page.Limit
 	})
@@ -110,16 +109,4 @@ func (c *Component) search(w http.ResponseWriter, r *http.Request) error {
 	}
 	return server.WritePageWith(w, page, items, func(m searchMatch) any { return searchPosition{SHA: sha, Path: m.Path, Line: m.Line} },
 		server.Member{Name: "resolved_sha", Value: sha})
-}
-
-// firstRunes is s cut to its first n characters, so that no character is
-// split.
-func firstRunes(s string, n int) string {
-	for i := range s {
-		if n == 0 {
-			return s[:i]
-		}
-		n--
-	}
-	return s
 }
