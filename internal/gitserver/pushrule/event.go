@@ -56,8 +56,9 @@ type written struct {
 // Finish is the event step of an accepted request, which the caller of
 // Apply runs with Apply's result once it is done with the moved refs; a
 // push maps itself to changes in between. In one store transaction it
-// writes one parley.git.push event per update, in command order, and
-// removes the request's journal entry. When that transaction fails, the
+// writes one parley.git.push event per update, in command order, then the
+// request's own events (ApplyRequest.Events), and removes the request's
+// journal entry. When that transaction fails, the
 // failure is logged and the entry kept, so the next start writes the
 // events, and the request stays accepted. Then it tells every post-push
 // listener, each on a goroutine of its own. A result that is not accepted,
@@ -102,8 +103,8 @@ func tell(ctx context.Context, logger *slog.Logger, l PostPushListener, p PostPu
 	}
 }
 
-// settle writes, in tx, the events of the journal entry e and removes the
-// entry. An entry already removed, by an earlier call, has its events
+// settle writes, in tx, the events of the journal entry e, its push events
+// and then those it owes beside them, and removes the entry. An entry already removed, by an earlier call, has its events
 // written already and is left alone.
 func settle(ctx context.Context, tx *sql.Tx, events EventWriter, e JournalEntry) error {
 	if e.ID != 0 {
@@ -112,7 +113,7 @@ func settle(ctx context.Context, tx *sql.Tx, events EventWriter, e JournalEntry)
 			return err
 		}
 	}
-	for _, in := range pushEvents(e) {
+	for _, in := range append(pushEvents(e), e.Events...) {
 		if _, err := events.Emit(ctx, tx, in); err != nil {
 			return err
 		}
@@ -167,7 +168,7 @@ func journalEntryOf(req ApplyRequest) JournalEntry {
 	e := JournalEntry{
 		Workspace: req.Workspace.Slug, ActorType: req.Caller.CredentialType, ActorID: req.Caller.UserID,
 		CredentialID: req.Caller.CredentialID, SessionID: req.SessionID, Via: req.Via,
-		Updates: make([]JournalUpdate, len(req.Verdict.Decisions)),
+		Updates: make([]JournalUpdate, len(req.Verdict.Decisions)), Events: req.Events,
 	}
 	if req.Workspace.Kind == access.KindFork {
 		e.Parent = req.Workspace.Parent

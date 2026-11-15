@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -104,5 +105,57 @@ func TestReconcile_WritesTheEventsTheJournalOwesAndDropsTheRest(t *testing.T) {
 	}
 	if err := w.Reconcile(ctx); err != nil || len(logged(t, log)) != len(want) {
 		t.Errorf("a second Reconcile = %v with %d events, want nothing more written", err, len(logged(t, log)))
+	}
+}
+
+func TestFinish_WritesTheRequestsOwnEventsWithItsPushEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// stops is set for a hub whose event step fails, or that stops
+		// before it, so that the events are owed at the next start.
+		stops bool
+	}{
+		{"written by the event step", false},
+		{"written at the next start when the event step did not write them", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newRepo(t)
+			st := newStore(t)
+			log := eventLog(t, st)
+			repos := func(context.Context, string) (*gitrepo.Repo, error) { return r.view, nil }
+			var w pushrule.Writer
+			var finishing pushrule.EventWriter = log
+			if tc.stops {
+				finishing = &emitted{err: errInjected}
+			}
+			w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: finishing, Repos: repos})
+			slug, user := "demo", "u-owner"
+			own := event.Input{Type: "parley.scm.commit", Workspace: &slug, ActorType: "api_key", ActorID: &user,
+				ResourceType: "commit", ResourceID: r.head, Metadata: map[string]any{"branch": "a", "sha": r.head}}
+			res, err := w.Apply(ctx, pushrule.ApplyRequest{Verdict: allowed(create("refs/heads/a", r.head)), Repo: r.view,
+				Workspace: demo, Caller: ownerKey, Via: pushrule.ViaAPI, VersionKind: pushrule.VersionKindCommit, Events: []event.Input{own}})
+			if err != nil || res.Refused() {
+				t.Fatalf("Apply = %+v, %v, want accepted", res, err)
+			}
+			w.Finish(ctx, res)
+			if tc.stops {
+				var next pushrule.Writer
+				next.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: log, Repos: repos})
+				if err := next.Reconcile(ctx); err != nil {
+					t.Fatalf("Reconcile = %v", err)
+				}
+			}
+			want := []string{
+				eventLine("parley.git.push", &slug, "api_key", &user, "ref", "refs/heads/a", nil, metadata("refs/heads/a", pushrule.ZeroID, r.head, "api", "created")),
+				eventLine("parley.scm.commit", &slug, "api_key", &user, "commit", r.head, nil, `{"branch":"a","sha":"`+r.head+`"}`),
+			}
+			if got := logged(t, log); !slices.Equal(got, want) {
+				t.Errorf("events\n%q\nwant\n%q", got, want)
+			}
+			if j := journal(t, st); len(j) != 0 {
+				t.Errorf("journal = %+v, want it empty", j)
+			}
+		})
 	}
 }

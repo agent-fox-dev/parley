@@ -108,6 +108,7 @@ func composeGitServer(c *Composition) {
 		return nil
 	})
 	c.AddSchemaStep(pushrule.JournalStep)
+	c.AddSchemaStep(pushrule.JournalEventsStep)
 	c.AddStartHook(pushJournalHook, func(ctx context.Context, _ *Runtime) error { return c.refWriter.Reconcile(ctx) })
 }
 

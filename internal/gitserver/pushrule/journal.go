@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -43,13 +44,30 @@ CREATE TABLE push_journal (
 	},
 }
 
+// JournalEventsStep adds to the push journal the events a request owes
+// beside its parley.git.push events, such as the parley.scm.commit event of
+// a commit made through the API, so that they are written with the push
+// events or at the next start. It is a step of its own, after JournalStep,
+// so that a store whose journal exists already gains the column; an entry
+// it holds then owes no other event.
+var JournalEventsStep = store.Step{
+	Name:   "push_journal_events",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `ALTER TABLE push_journal ADD COLUMN events TEXT NOT NULL DEFAULT '[]'`)
+		return err
+	},
+}
+
 // JournalEntry is one request of the push journal: its ID, the slug of the
 // workspace written to, its parent's slug for a task fork, the caller as
 // the request's events name it (ActorType one of the Credential constants,
 // ActorID the user, empty for the admin token), the credential's id, the
 // session it belongs to (nil for none), the surface it came through, its
-// ref updates in command order, and whether its refs are known to have
-// moved: Committed is set with the commit of the refs.
+// ref updates in command order, the events it owes after their
+// parley.git.push events, and whether its refs are known to have moved:
+// Committed is set with the commit of the refs. An event read back from the
+// journal has its metadata as a json.RawMessage, nil for none.
 type JournalEntry struct {
 	ID                               int64
 	Workspace, Parent                string
@@ -57,6 +75,7 @@ type JournalEntry struct {
 	SessionID                        *string
 	Via                              string
 	Updates                          []JournalUpdate
+	Events                           []event.Input
 	Committed                        bool
 }
 
@@ -79,6 +98,19 @@ type journalUpdateJSON struct {
 	Direct  bool   `json:"direct"`
 }
 
+// journalEventJSON is how an event of a journal entry is stored.
+type journalEventJSON struct {
+	Type         string          `json:"type"`
+	Workspace    *string         `json:"workspace"`
+	ActorType    string          `json:"actor_type"`
+	ActorID      *string         `json:"actor_id"`
+	ResourceType string          `json:"resource_type"`
+	ResourceID   string          `json:"resource_id"`
+	SessionID    *string         `json:"session_id"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	Parent       string          `json:"parent"`
+}
+
 // Querier is what a read of the journal goes through: the store's *sql.DB
 // or an open *sql.Tx.
 type Querier interface {
@@ -96,12 +128,26 @@ func InsertJournalEntry(ctx context.Context, tx *sql.Tx, e JournalEntry) (int64,
 	if err != nil {
 		return 0, fmt.Errorf("push journal: %w", err)
 	}
+	events := make([]journalEventJSON, len(e.Events))
+	for i, in := range e.Events {
+		events[i] = journalEventJSON{Type: in.Type, Workspace: in.Workspace, ActorType: in.ActorType, ActorID: in.ActorID,
+			ResourceType: in.ResourceType, ResourceID: in.ResourceID, SessionID: in.SessionID, Parent: in.Parent}
+		if in.Metadata != nil {
+			if events[i].Metadata, err = json.Marshal(in.Metadata); err != nil {
+				return 0, fmt.Errorf("push journal: the metadata of %s: %w", in.Type, err)
+			}
+		}
+	}
+	eventsJSON, err := json.Marshal(events)
+	if err != nil {
+		return 0, fmt.Errorf("push journal: %w", err)
+	}
 	var id int64
 	err = tx.QueryRowContext(ctx, `
-INSERT INTO push_journal (workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates, committed)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+INSERT INTO push_journal (workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates, events, committed)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 		e.Workspace, nullString(e.Parent), e.ActorType, nullString(e.ActorID), nullString(e.CredentialID),
-		e.SessionID, e.Via, string(updates), e.Committed).Scan(&id)
+		e.SessionID, e.Via, string(updates), string(eventsJSON), e.Committed).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("push journal: add the entry of %s: %w", e.Workspace, err)
 	}
@@ -111,7 +157,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 // JournalEntries reads every entry of the journal, oldest first.
 func JournalEntries(ctx context.Context, q Querier) ([]JournalEntry, error) {
 	rows, err := q.QueryContext(ctx, `
-SELECT id, workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates, committed
+SELECT id, workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates, events, committed
 FROM push_journal ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("push journal: read: %w", err)
@@ -121,8 +167,8 @@ FROM push_journal ORDER BY id`)
 	for rows.Next() {
 		var e JournalEntry
 		var parent, actorID, credentialID, session sql.NullString
-		var updates string
-		if err := rows.Scan(&e.ID, &e.Workspace, &parent, &e.ActorType, &actorID, &credentialID, &session, &e.Via, &updates, &e.Committed); err != nil {
+		var updates, events string
+		if err := rows.Scan(&e.ID, &e.Workspace, &parent, &e.ActorType, &actorID, &credentialID, &session, &e.Via, &updates, &events, &e.Committed); err != nil {
 			return nil, fmt.Errorf("push journal: read: %w", err)
 		}
 		e.Parent, e.ActorID, e.CredentialID = parent.String, actorID.String, credentialID.String
@@ -135,6 +181,18 @@ FROM push_journal ORDER BY id`)
 		}
 		for _, u := range stored {
 			e.Updates = append(e.Updates, JournalUpdate(u))
+		}
+		var owed []journalEventJSON
+		if err := json.Unmarshal([]byte(events), &owed); err != nil {
+			return nil, fmt.Errorf("push journal: entry %d: %w", e.ID, err)
+		}
+		for _, o := range owed {
+			in := event.Input{Type: o.Type, Workspace: o.Workspace, ActorType: o.ActorType, ActorID: o.ActorID,
+				ResourceType: o.ResourceType, ResourceID: o.ResourceID, SessionID: o.SessionID, Parent: o.Parent}
+			if o.Metadata != nil {
+				in.Metadata = o.Metadata
+			}
+			e.Events = append(e.Events, in)
 		}
 		entries = append(entries, e)
 	}
@@ -165,8 +223,9 @@ func deleteJournalEntry(ctx context.Context, tx *sql.Tx, id int64) (bool, error)
 }
 
 // Reconcile settles what the journal holds; the hub runs it as it starts,
-// before it serves. An entry marked committed had its refs moved and its
-// events never written, which happens when Finish failed: its events are
+// before it serves. An entry's events are its parley.git.push events and
+// then the events it owes beside them. An entry marked committed had its
+// refs moved and its events never written, which happens when Finish failed: its events are
 // written and the entry removed in one transaction, whatever its refs hold
 // now, since a later write may have moved them since. For any other entry
 // it reads the entry's refs: when every one holds its after value (is
