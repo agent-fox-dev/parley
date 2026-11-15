@@ -3063,7 +3063,13 @@ writes the whole answer; otherwise the component serves it (`fetch.go`):
   `parley.target`; such a push, or any push to a task fork whose
   `auto_change` is true, opens a change with the push's session, and an
   open refused with a `*ChangeExistsError` records a version of that
-  change instead; a failing call is the reason `internal error`, logged.
+  change instead; the `OpenRequest` names the pushed workspace, or a
+  pushed fork's parent, as the change's workspace, the pushed workspace
+  and branch as its source and the pusher as its caller, and carries
+  `parley.target`, `parley.title`, `parley.intent` and `parley.draft`
+  when the push gives them, the same for every open of the push, nil
+  (or false) leaving the change's defaults; a `VersionRequest` carries
+  none of them; a failing call is the reason `internal error`, logged.
   `Outcome.Line`, `pushreport.go`, words the lines
   `change <workspace>#<number> version <n>`,
   `change <workspace>#<number> version 1 (opened)` or

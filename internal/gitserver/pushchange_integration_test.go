@@ -93,14 +93,23 @@ func (w *world) openChange(t *testing.T, branch string) {
 // version of demo at path under …/changes/, such as "1" or "1/versions/2";
 // Number is a version's own number.
 type demoChange struct {
-	Number    int     `json:"number"`
-	Version   int     `json:"version"`
-	Kind      string  `json:"kind"`
-	HeadSHA   string  `json:"head_sha"`
-	SessionID *string `json:"session_id"`
-	Source    struct {
-		Branch string `json:"branch"`
+	WorkspaceSlug string  `json:"workspace_slug"`
+	Number        int     `json:"number"`
+	Version       int     `json:"version"`
+	Kind          string  `json:"kind"`
+	HeadSHA       string  `json:"head_sha"`
+	SessionID     *string `json:"session_id"`
+	Title         string  `json:"title"`
+	Intent        string  `json:"intent"`
+	State         string  `json:"state"`
+	TargetBranch  string  `json:"target_branch"`
+	Source        struct {
+		WorkspaceSlug string `json:"workspace_slug"`
+		Branch        string `json:"branch"`
 	} `json:"source"`
+	Author struct {
+		Username *string `json:"username"`
+	} `json:"author"`
 }
 
 func (w *world) demoChange(t *testing.T, path string) demoChange {
@@ -349,5 +358,111 @@ func TestPushChange_GivesThePushSessionToVersionsAndOpenedChanges(t *testing.T) 
 				t.Errorf("change %d = %+v, want one from %s with session %s", 2+i, opened, other, session(c.session))
 			}
 		})
+	}
+}
+
+// A change a push opens takes its target, title, intent and draft state
+// from the push's options, and the defaults of a change for an option left
+// out: the default branch, the head commit's subject and body, open. Its
+// source is the pushed branch and its author the pusher.
+func TestPushChange_OpensAChangeWithTheOptionsOfThePush(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	dir := w.cloneDemo(t, w.ownerKey)
+	runGit(t, dir, "push", "--quiet", "origin", "main:release")
+	const subject, body = "Fix retry loop", "Retries never stopped."
+	for i, c := range []struct {
+		name                         string
+		body                         string
+		options                      []string
+		title, intent, state, target string
+	}{
+		{"no option but the change", body, []string{"parley.change"}, subject, body, "open", "main"},
+		{"a target", body, []string{"parley.target=release"}, subject, body, "open", "release"},
+		{"a title and an intent", body, []string{"parley.change", "parley.title=T", "parley.intent=I"}, "T", "I", "open", "main"},
+		{"a draft", body, []string{"parley.change", "parley.draft"}, subject, body, "draft", "main"},
+		// demo requires an intent, the default of changes.require_intent,
+		// which a draft may still lack.
+		{"a draft without an intent", "", []string{"parley.change", "parley.draft"}, subject, "", "draft", "main"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := fmt.Sprintf("fix%d", i)
+			runGit(t, dir, "checkout", "--quiet", "-b", branch, "main")
+			commit := []string{"commit", "--quiet", "--allow-empty", "-m", subject}
+			if c.body != "" {
+				commit = append(commit, "-m", c.body)
+			}
+			runGit(t, dir, commit...)
+			push := []string{"push"}
+			for _, o := range c.options {
+				push = append(push, "-o", o)
+			}
+			out := runGit(t, dir, append(push, "origin", branch)...)
+			opened := "opened"
+			if c.state == "draft" {
+				opened += ", draft"
+			}
+			if want := fmt.Sprintf("remote: change demo#%d version 1 (%s)", i+1, opened); !slices.Contains(linesWith(out, "remote: change "), want) {
+				t.Errorf("git's output lacks %q:\n%s", want, out)
+			}
+			got := w.demoChange(t, strconv.Itoa(i+1))
+			if got.Title != c.title || got.Intent != c.intent || got.State != c.state || got.TargetBranch != c.target ||
+				got.Source.WorkspaceSlug != "demo" || got.Source.Branch != branch || got.Author.Username == nil || *got.Author.Username != "owner" {
+				t.Errorf("change %d = %+v, want title %q, intent %q, state %s, target %s, source demo:%s and author owner",
+					i+1, got, c.title, c.intent, c.state, c.target, branch)
+			}
+		})
+	}
+}
+
+// A push to a branch whose change is open adds a version and leaves the
+// change's title, intent, target and state as they were, whatever options
+// the push carries.
+func TestPushChange_LeavesTheChangeOfAPushedBranchAsItWas(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	dir := w.cloneDemo(t, w.ownerKey)
+	runGit(t, dir, "push", "--quiet", "origin", "main:release")
+	branchWithCommit(t, dir, "fix")
+	runGit(t, dir, "push", "--quiet", "-o", "parley.change", "-o", "parley.title=Old", "-o", "parley.intent=Why", "origin", "fix")
+	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", "again")
+	out := runGit(t, dir, "push", "-o", "parley.title=New", "-o", "parley.intent=Other", "-o", "parley.target=release", "-o", "parley.draft", "origin", "fix")
+	if got := linesWith(out, "remote: change "); !slices.Equal(got, []string{"remote: change demo#1 version 2"}) {
+		t.Errorf("change lines = %q, want the second version of demo#1", got)
+	}
+	if c := w.demoChange(t, "1"); c.Version != 2 || c.Title != "Old" || c.Intent != "Why" || c.TargetBranch != "main" || c.State != "open" || w.changeCount(t) != 1 {
+		t.Errorf("change 1 = %+v among %d changes, want the only one, at version 2, with title Old, intent Why, target main, open", c, w.changeCount(t))
+	}
+}
+
+// The change of a branch pushed to a task fork is opened in the fork's
+// parent, from the fork's branch, onto the fork's base branch; the fork
+// holds no change of its own.
+func TestPushChange_OpensTheChangeOfAForkBranchInTheParent(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	gitrepotest.Git(t, w.repo, "update-ref", "refs/heads/release", w.head)
+	w.addForkFrom(t, "release", []string{"release"}, nil)
+	gitrepotest.Git(t, w.workspaces.RepoPath("demo--t1"), "update-ref", "refs/heads/release", w.head)
+	token, _ := w.pat(t, w.member, "demo--t1", "git:write", "changes:write")
+	dir := filepath.Join(t.TempDir(), "fork")
+	runGit(t, t.TempDir(), "clone", "--quiet", w.remote(token, "acme/demo--t1.git"), dir)
+	runGit(t, dir, "checkout", "--quiet", "-b", "work", "origin/release")
+	runGit(t, dir, "-c", "user.name=P", "-c", "user.email=p@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "work", "-m", "Because work must be.")
+	out := runGit(t, dir, "push", "-o", "parley.change", "origin", "work")
+	if got := linesWith(out, "remote: change "); !slices.Equal(got, []string{"remote: change demo#1 version 1 (opened)"}) {
+		t.Errorf("change lines = %q, want demo#1 opened:\n%s", got, out)
+	}
+	if c := w.demoChange(t, "1"); c.WorkspaceSlug != "demo" || c.Source.WorkspaceSlug != "demo--t1" || c.Source.Branch != "work" || c.TargetBranch != "release" {
+		t.Errorf("change 1 = %+v, want one of demo from demo--t1:work onto release", c)
+	}
+	status, body := w.Call(t, http.MethodGet, "/api/v1/workspaces/demo--t1/changes", w.memberKey, nil)
+	var list struct {
+		Items []demoChange `json:"items"`
+	}
+	if status != http.StatusOK || json.Unmarshal(body, &list) != nil {
+		t.Fatalf("GET demo--t1's changes = %d %s, want 200", status, body)
+	}
+	for _, c := range list.Items {
+		if c.WorkspaceSlug != "demo" {
+			t.Errorf("the fork's change list holds %+v, a change of %s, want only changes of demo", c, c.WorkspaceSlug)
+		}
 	}
 }

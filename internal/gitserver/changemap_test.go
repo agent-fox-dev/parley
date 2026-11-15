@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -13,16 +14,17 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// changeFake is a change service that notes each call, in order, and
-// answers with what the test scripted: the draft or open change of each
-// branch, the refusal of an open, the change an open makes and the version
-// a record makes.
+// changeFake is a change service that notes each call, in order, and each
+// open request, and answers with what the test scripted: the draft or open
+// change of each branch, the refusal of an open, the change an open makes
+// and the version a record makes.
 type changeFake struct {
 	found    map[string]*gitserver.BranchChange
 	openErr  error
 	opened   gitserver.OpenedChange
 	recorded *pushrule.Version
 	calls    []string
+	opens    []gitserver.OpenRequest
 }
 
 func (f *changeFake) OpenChangeOfBranch(_ context.Context, source, branch string) (*gitserver.BranchChange, error) {
@@ -37,6 +39,7 @@ func (f *changeFake) RecordPushVersion(_ context.Context, req gitserver.VersionR
 
 func (f *changeFake) OpenChange(_ context.Context, req gitserver.OpenRequest) (gitserver.OpenedChange, error) {
 	f.calls = append(f.calls, fmt.Sprintf("open %s:%s@%s %s", req.Source, req.Branch, req.Head, session(req.SessionID)))
+	f.opens = append(f.opens, req)
 	return f.opened, f.openErr
 }
 
@@ -250,6 +253,64 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 			}
 			if !reflect.DeepEqual(lines, want) {
 				t.Errorf("lines %q, want %q", lines, want)
+			}
+		})
+	}
+}
+
+// A change a push opens belongs to the pushed repository, or to the parent
+// of the pushed fork with the fork as its source, is authored by the
+// pusher, and carries the target, title, intent and draft flag the push
+// names, the same for every change the push opens; an option left out is
+// left to the change's defaults. A branch that already has a change gets
+// its version from the ref writer and opens nothing.
+func TestChangeMapper_OpensTheChangeWithTheOptionsOfThePush(t *testing.T) {
+	t.Parallel()
+	open := func(ws, source, branch string, opts ...string) gitserver.OpenRequest {
+		req := gitserver.OpenRequest{Workspace: ws, Source: source, Branch: branch, Head: "c1", Caller: gitPAT}
+		for _, o := range opts {
+			name, value, _ := strings.Cut(o, "=")
+			switch name {
+			case "parley.target":
+				req.Target = ptr(value)
+			case "parley.title":
+				req.Title = ptr(value)
+			case "parley.intent":
+				req.Intent = ptr(value)
+			case "parley.draft":
+				req.Draft = true
+			}
+		}
+		return req
+	}
+	all := []string{"parley.target=release", "parley.title=T", "parley.intent=I", "parley.draft"}
+	for _, c := range []struct {
+		name    string
+		ws      workspace.Workspace
+		options []string
+		updates []pushrule.UpdateResult
+		want    []gitserver.OpenRequest
+	}{
+		{"a repository's branch, no target", repoWS, []string{"parley.change"}, []pushrule.UpdateResult{created("refs/heads/fix")},
+			[]gitserver.OpenRequest{open("demo", "demo", "fix")}},
+		{"a repository's branch, a target", repoWS, []string{"parley.target=release"}, []pushrule.UpdateResult{created("refs/heads/fix")},
+			[]gitserver.OpenRequest{open("demo", "demo", "fix", "parley.target=release")}},
+		{"a fork's branch", forkWS(false), []string{"parley.change"}, []pushrule.UpdateResult{created("refs/heads/fix")},
+			[]gitserver.OpenRequest{open("demo", "demo--k3x9w2ab", "fix")}},
+		{"a fork's branch with every option", forkWS(true), all, []pushrule.UpdateResult{created("refs/heads/fix")},
+			[]gitserver.OpenRequest{open("demo", "demo--k3x9w2ab", "fix", all...)}},
+		{"several branches, one with a change", repoWS, all,
+			[]pushrule.UpdateResult{created("refs/heads/a"), versioned("refs/heads/b", pushrule.Version{WorkspaceSlug: "demo", Number: 7, Version: 2}), created("refs/heads/c")},
+			[]gitserver.OpenRequest{open("demo", "demo", "a", all...), open("demo", "demo", "c", all...)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			fake := &changeFake{opened: gitserver.OpenedChange{Workspace: "demo", Number: 1}}
+			gitserver.NewChangeMapper(fake, nil).Map(context.Background(), gitserver.MappingInput{
+				Workspace: c.ws, Caller: gitPAT, Options: c.options, Updates: c.updates,
+			}, func(string) {})
+			if !reflect.DeepEqual(fake.opens, c.want) {
+				t.Errorf("open requests %+v, want %+v", fake.opens, c.want)
 			}
 		})
 	}

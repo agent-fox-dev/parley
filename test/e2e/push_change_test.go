@@ -8,18 +8,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// An agent opens a change by pushing a branch with stock git and a push
-// option, adds a version with a plain push, and reads the change the git
-// output named as soon as the push returns.
-func TestPushChange_AnAgentOpensAChangeByPushingAndAddsAVersionWithTheNextPush(t *testing.T) {
-	h := startForkHub(t)
-	agent := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"git:read", "git:write", "changes:read", "changes:write"}, CreatedAt: time.Now()})
-	g := newGitClient(t, h.URL(""), agent)
-	dir := filepath.Join(t.TempDir(), "demo")
-	run := func(args ...string) string {
+// cloneAs clones the workspace slug of the hub h with stock git and
+// credential, and returns what runs git in the clone, failing the test when
+// git fails, and gives its output.
+func cloneAs(t *testing.T, h *forkHub, credential, slug string) func(args ...string) string {
+	t.Helper()
+	g := newGitClient(t, h.URL(""), credential)
+	dir := filepath.Join(t.TempDir(), slug)
+	if out, err := g.git("", "clone", "--quiet", h.URL("/git/acme/"+slug+".git"), dir); err != nil {
+		t.Fatalf("git clone %s = %v: %s", slug, err, out)
+	}
+	return func(args ...string) string {
 		t.Helper()
 		out, err := g.git(dir, args...)
 		if err != nil {
@@ -27,9 +30,15 @@ func TestPushChange_AnAgentOpensAChangeByPushingAndAddsAVersionWithTheNextPush(t
 		}
 		return out
 	}
-	if out, err := g.git("", "clone", "--quiet", h.URL("/git/acme/demo.git"), dir); err != nil {
-		t.Fatalf("git clone = %v: %s", err, out)
-	}
+}
+
+// An agent opens a change by pushing a branch with stock git and a push
+// option, adds a version with a plain push, and reads the change the git
+// output named as soon as the push returns.
+func TestPushChange_AnAgentOpensAChangeByPushingAndAddsAVersionWithTheNextPush(t *testing.T) {
+	h := startForkHub(t)
+	agent := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"git:read", "git:write", "changes:read", "changes:write"}, CreatedAt: time.Now()})
+	run := cloneAs(t, h, agent, "demo")
 	commit := func(message string) {
 		t.Helper()
 		run("-c", "user.name=Agent", "-c", "user.email=agent@example.invalid", "commit", "--quiet", "--allow-empty", "-m", message, "-m", "Retries looped forever.")
@@ -55,4 +64,37 @@ func TestPushChange_AnAgentOpensAChangeByPushingAndAddsAVersionWithTheNextPush(t
 		t.Errorf("GET changes/1 = %d %s, want open, version 2 at %s", status, body, head)
 	}
 	run("fetch", "--quiet", "origin", "refs/parley/changes/1/1", "refs/parley/changes/1/2")
+}
+
+// An agent's plain push to its task fork, which opens changes on its own,
+// opens a change in the fork's parent from the fork's branch, onto the
+// fork's base branch and with the fork's purpose as its intent, while the
+// branch stays in the fork.
+func TestPushChange_APushToATaskForkOpensAChangeInTheParent(t *testing.T) {
+	h := startForkHub(t)
+	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/forks", h.key, map[string]any{
+		"name": "t1", "auto_change": true, "purpose": "speed up retries",
+		"token": map[string]any{"permissions": []string{"git:write", "changes:read", "changes:write"}},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create demo--t1 = %d %s, want 201", status, body)
+	}
+	created := decoded(t, body)
+	slug, token := str(created, "workspace", "slug"), str(created, "token", "token")
+	run := cloneAs(t, h, token, slug)
+	run("checkout", "--quiet", "-b", "work")
+	run("-c", "user.name=Agent", "-c", "user.email=agent@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "Speed up retries")
+	if out := run("push", "origin", "work"); !strings.Contains(out, "remote: change demo#1 version 1 (opened)") {
+		t.Errorf("the push printed:\n%s\nwant remote: change demo#1 version 1 (opened)", out)
+	}
+
+	status, body = h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/1", token, nil)
+	ch := decoded(t, body)
+	if status != http.StatusOK || str(ch, "source", "workspace_slug") != slug || str(ch, "source", "branch") != "work" ||
+		str(ch, "target_branch") != "main" || str(ch, "state") != "open" || str(ch, "intent") != "speed up retries" {
+		t.Errorf("GET changes/1 with the fork's token = %d %s, want an open change from %s:work onto main with the fork's purpose", status, body, slug)
+	}
+	if fork, parent := gitrepotest.Refs(t, h.repo(slug), "refs/heads/"), gitrepotest.Refs(t, h.repo("demo"), "refs/heads/"); fork["work"] == "" || parent["work"] != "" {
+		t.Errorf("work is at %q in the fork and %q in demo, want it in the fork alone", fork["work"], parent["work"])
+	}
 }

@@ -196,14 +196,7 @@ func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts Push
 	case !opts.Change && !autoChange:
 		return Outcome{Branch: branch}
 	}
-	opened, err := m.changes.OpenChange(ctx, OpenRequest{
-		Workspace: source,
-		Source:    source,
-		Branch:    branch,
-		Head:      u.After,
-		SessionID: in.SessionID,
-		Caller:    in.Caller,
-	})
+	opened, err := m.changes.OpenChange(ctx, openRequest(in, opts, branch, u.After))
 	var exists *ChangeExistsError
 	switch {
 	case errors.As(err, &exists):
@@ -229,6 +222,31 @@ func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts Push
 		return m.failed(ctx, in, branch, err)
 	}
 	return Outcome{Branch: branch, Kind: OutcomeOpened, Workspace: opened.Workspace, Number: opened.Number, Version: 1, Draft: opened.Draft}
+}
+
+// openRequest is the open of the change of branch at head: in the pushed
+// workspace, or in the parent of a pushed fork, where the change lands,
+// from the pushed branch, by the pusher. Every open of one push carries the
+// same options, and an option the push left out is left to the change's
+// defaults.
+func openRequest(in MappingInput, opts PushOptions, branch, head string) OpenRequest {
+	ws := in.Workspace
+	target := ws.Slug
+	if ws.Kind == access.KindFork && ws.ParentSlug != nil {
+		target = *ws.ParentSlug
+	}
+	return OpenRequest{
+		Workspace: target,
+		Source:    ws.Slug,
+		Branch:    branch,
+		Head:      head,
+		Target:    opts.Target,
+		Title:     opts.Title,
+		Intent:    opts.Intent,
+		Draft:     opts.Draft,
+		SessionID: in.SessionID,
+		Caller:    in.Caller,
+	}
 }
 
 func versionOutcome(branch string, v *pushrule.Version) Outcome {
