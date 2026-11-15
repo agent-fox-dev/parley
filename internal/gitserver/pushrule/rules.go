@@ -48,7 +48,7 @@ var order = [...]rule{
 	protectedBranch,
 	defaultBranchDeletion,
 	trackingBranch,
-	nil, // carry-patch push control
+	carryPatch,
 	nil, // path-scoped tokens
 }
 

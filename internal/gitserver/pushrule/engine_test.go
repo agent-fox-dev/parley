@@ -38,13 +38,16 @@ func TestEvaluate_DecidesEveryUpdateInOrderAndWritesNothing(t *testing.T) {
 	r := newRepo(t)
 	lookup := &tracking{}
 	e := engine(pushrule.EngineDeps{Settings: protecting("main"), Tracking: lookup})
+	cp := &controller{}
+	cp.answers = map[string]pushrule.Answer{"refs/heads/patch/a": pushrule.AllowAfterForward(cp.forward)}
+	e.RegisterController(cp)
 	refsBefore := gitrepotest.Git(t, r.dir, "for-each-ref")
 	updates := []pushrule.Update{
 		create("refs/heads/topic", r.side),
 		create("refs/parley/x", r.head),
-		move("refs/heads/feat", r.head, r.side),
+		move("refs/heads/patch/a", r.head, r.side),
 	}
-	v := e.Evaluate(context.Background(), pushrule.Request{Workspace: demo, Caller: ownerKey, Updates: updates, Repo: r.view})
+	v := e.Evaluate(context.Background(), pushrule.Request{Workspace: demoCP, Caller: ownerKey, Updates: updates, Repo: r.view})
 	if len(v.Decisions) != len(updates) {
 		t.Fatalf("got %d decisions for %d updates", len(v.Decisions), len(updates))
 	}
@@ -58,8 +61,14 @@ func TestEvaluate_DecidesEveryUpdateInOrderAndWritesNothing(t *testing.T) {
 			t.Errorf("decision %d = %+v, want %+v about %+v", i, d, wants[i], updates[i])
 		}
 	}
+	if v.Decisions[2].Forward == nil {
+		t.Error("the patch branch update carries no pending forward")
+	}
 	if !v.Refused() {
 		t.Error("Refused() = false for a request with a refused update")
+	}
+	if _, forwarded := cp.counts(); forwarded != 0 {
+		t.Errorf("evaluating ran %d forwards, want none", forwarded)
 	}
 	if got := gitrepotest.Git(t, r.dir, "for-each-ref"); got != refsBefore {
 		t.Errorf("refs after evaluating:\n%s\nwant:\n%s", got, refsBefore)

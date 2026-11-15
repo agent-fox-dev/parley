@@ -124,12 +124,15 @@ type EngineDeps struct {
 // Decision is the engine's answer for one update. An allowed update says
 // whether it creates its ref, deletes it, moves it to a commit its old
 // value is not an ancestor of (Forced), or is a direct push to a protected
-// branch. A refused one carries the refusing rule's Message and ErrorType,
-// and Path when the rule refused a file.
+// branch, and carries in Forward the forward to origin the carry-patch
+// controller made it wait on, nil when there is none. A refused one carries
+// the refusing rule's Message and ErrorType, and Path when the rule refused
+// a file.
 type Decision struct {
 	Update
 	Allowed, Created, Deleted, Forced, Direct bool
 	Message, ErrorType, Path                  string
+	Forward                                   Forward
 }
 
 // Verdict is the engine's answer for a request: one decision per update,
@@ -150,10 +153,12 @@ func (v Verdict) Refused() bool {
 }
 
 // Engine is the push rule engine. Its zero value is ready to evaluate with
-// no lookups; Bind hands it the hub's.
+// no lookups; Bind hands it the hub's, and RegisterController the
+// carry-patch controller of the feature that owns it.
 type Engine struct {
-	mu   sync.RWMutex
-	deps EngineDeps
+	mu         sync.RWMutex
+	deps       EngineDeps
+	controller Controller
 }
 
 // Bind sets the lookups the engine asks from then on.
@@ -164,12 +169,13 @@ func (e *Engine) Bind(d EngineDeps) {
 }
 
 // Evaluate decides every update of req before anything is written, and
-// writes nothing itself: no ref, no event, no forward to origin. A rule that
-// cannot be evaluated refuses its update with ErrorTypeInternal, so
+// writes nothing itself: no ref, no event, no forward to origin; a forward
+// the carry-patch controller asks for rides on the allowed decision. A rule
+// that cannot be evaluated refuses its update with ErrorTypeInternal, so
 // Evaluate has no error of its own.
 func (e *Engine) Evaluate(ctx context.Context, req Request) Verdict {
 	e.mu.RLock()
-	ev := &evaluation{deps: e.deps, req: req}
+	ev := &evaluation{deps: e.deps, controller: e.controller, req: req}
 	e.mu.RUnlock()
 	v := Verdict{Decisions: make([]Decision, 0, len(req.Updates))}
 	for _, u := range req.Updates {
@@ -182,8 +188,9 @@ func (e *Engine) Evaluate(ctx context.Context, req Request) Verdict {
 // The workspace's settings are read once, by the first rule that needs
 // them; cur is what the rules learnt about the update being decided.
 type evaluation struct {
-	deps EngineDeps
-	req  Request
+	deps       EngineDeps
+	controller Controller
+	req        Request
 
 	settingsRead bool
 	settings     Settings
@@ -194,7 +201,8 @@ type evaluation struct {
 
 // current is what the rules learnt about one update while deciding it.
 type current struct {
-	direct              bool // the owner exemption let it pass the protected-branch rule
+	direct              bool    // the owner exemption let it pass the protected-branch rule
+	forward             Forward // the carry-patch controller made it wait on a forward to origin
 	forcedKnown, forced bool
 }
 
@@ -227,7 +235,7 @@ func (ev *evaluation) decide(ctx context.Context, u Update) Decision {
 			return no.decision(u)
 		}
 	}
-	d := Decision{Update: u, Allowed: true, Created: u.Before == ZeroID, Deleted: u.After == ZeroID, Direct: ev.cur.direct}
+	d := Decision{Update: u, Allowed: true, Created: u.Before == ZeroID, Deleted: u.After == ZeroID, Direct: ev.cur.direct, Forward: ev.cur.forward}
 	if !d.Created && !d.Deleted {
 		forced, err := ev.forced(ctx, u)
 		if err != nil {

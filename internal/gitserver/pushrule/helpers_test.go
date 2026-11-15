@@ -57,6 +57,7 @@ var (
 var (
 	demo   = pushrule.Workspace{Slug: "demo", Kind: access.KindRepository, DefaultBranch: "main", Mode: workspace.ModeStandard}
 	demoFk = pushrule.Workspace{Slug: "demo--k3x9w2ab", Kind: access.KindFork, Parent: "demo", DefaultBranch: "main", Mode: workspace.ModeStandard}
+	demoCP = pushrule.Workspace{Slug: "demo", Kind: access.KindRepository, DefaultBranch: "main", Mode: workspace.ModeCarryPatch}
 )
 
 // settings answers every workspace with its push settings, or with err.
@@ -90,6 +91,40 @@ func (s *tracking) IsTracking(_ context.Context, slug, branch string) (bool, err
 	defer s.mu.Unlock()
 	s.asked = append(s.asked, slug+":"+branch)
 	return slices.Contains(s.branches, branch), s.err
+}
+
+// controller is a carry-patch controller that answers each ref with its
+// scripted answer, Allow for a ref it has none for, and records each question
+// and each run of its forward.
+type controller struct {
+	answers map[string]pushrule.Answer
+
+	mu        sync.Mutex
+	asked     []string
+	forwarded int
+}
+
+func (c *controller) Decide(_ context.Context, ws pushrule.Workspace, caller pushrule.Caller, u pushrule.Update) (pushrule.Answer, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked = append(c.asked, ws.Slug+":"+caller.CredentialID+":"+u.Ref)
+	if a, ok := c.answers[u.Ref]; ok {
+		return a, nil
+	}
+	return pushrule.Allow(), nil
+}
+
+func (c *controller) forward(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forwarded++
+	return nil
+}
+
+func (c *controller) counts() (asked, forwarded int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.asked), c.forwarded
 }
 
 func engine(deps pushrule.EngineDeps) *pushrule.Engine {
