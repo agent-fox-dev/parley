@@ -70,7 +70,7 @@ func (c *Component) createRef(w http.ResponseWriter, r *http.Request, wr *write)
 		}
 		sha = res.SHA
 	}
-	if _, exists, err := t.git.LookupRef(ctx, name); err != nil {
+	if _, exists, err := t.lookup(ctx, name); err != nil {
 		return err
 	} else if exists {
 		return server.NewError("ref_exists", http.StatusConflict, fmt.Sprintf("ref %s already exists", name))
@@ -195,7 +195,7 @@ func writeRefName(name string) (string, error) {
 // current is the ref of the full name name as the repository holds it, or
 // 404 ref_not_found when there is none.
 func (t *target) current(r *http.Request, name string) (gitrepo.Ref, error) {
-	ref, found, err := t.git.LookupRef(r.Context(), name)
+	ref, found, err := t.lookup(r.Context(), name)
 	if err != nil {
 		return gitrepo.Ref{}, err
 	}

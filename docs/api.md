@@ -3204,7 +3204,29 @@ the same ref update would be: `403` with the rule's message and its
 `tracking_branch`, `integration_branch`, `patch_branch`,
 `path_not_allowed`), such as `main is the default branch and cannot be
 deleted`, or `500` `internal` (`the push rules could not be evaluated; try
-again`) when a rule could not be evaluated. The ref is moved by
+again`, never the failure itself) when a rule could not be evaluated. The
+rules are asked once per request, once the commit the ref is to point at
+is in the repository and before the ref moves. A `path_not_allowed`
+refusal names the first path the token may not change as `error.path`; a
+`tracking_branch` refusal names the branch the task fork was taken from,
+its `fork_point.ref`, as `error.details.base_ref`, the branch to commit to
+instead:
+
+```json
+{"error":{"code":403,"message":"path src/b.go is outside this token's allowed paths","error_type":"path_not_allowed","path":"src/b.go"}}
+```
+
+```json
+{"error":{"code":403,"message":"main tracks the parent workspace and is read-only in this fork; push a new branch","error_type":"tracking_branch","details":{"base_ref":"main"}}}
+```
+
+A refused write moves no ref, emits no event, opens no change and is not
+recorded for an `Idempotency-Key` replay, so a retry is decided again. In
+a task fork the tracking branches are the parent's branches the fork shows
+(`tracking: true` in the ref object): a write names them by their current
+commit, as a push does, and the push rules refuse it, the protected-branch
+rule first where it protects the branch (`main is protected and cannot be
+force-pushed or deleted` for a delete of the default branch). The ref is moved by
 compare-and-swap against the value the route read: a ref that moved in
 between is `409` `ref_moved`, with the commit it is at now in
 `error.details.current_sha` (`null` when it no longer exists), and nothing

@@ -253,7 +253,7 @@ func (o fileOperation) operation() (gitrepo.Operation, error) {
 // expected_head_sha must name, base_ref being ignored; for a new branch the
 // commit base_ref names, and pushrule.ZeroID.
 func (t *target) parent(ctx context.Context, branch string, b commitRequest) (parent, before string, err error) {
-	ref, found, err := t.git.LookupRef(ctx, branch)
+	ref, found, err := t.lookup(ctx, branch)
 	if err != nil {
 		return "", "", err
 	}

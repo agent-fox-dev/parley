@@ -11,6 +11,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // Rules decide whether the ref updates of a write are allowed: the push
@@ -71,6 +72,35 @@ func (c *Component) gitRepo(ctx context.Context, slug string) (*gitrepo.Repo, er
 	return g, nil
 }
 
+// lookup is the ref of the full name name as the write's workspace shows
+// it: the ref of its repository, else, in a fork, the tracking branch of
+// that name, which shows the parent's branch and is in no ref of the
+// fork's repository. A write to a tracking branch so meets the push rules
+// with the value a push of it would name, and is refused by them as the
+// push is. found is false when the workspace shows no such ref.
+func (t *target) lookup(ctx context.Context, name string) (ref gitrepo.Ref, found bool, err error) {
+	ref, found, err = t.git.LookupRef(ctx, name)
+	if err != nil || found || t.ws.Kind != access.KindFork {
+		return ref, found, err
+	}
+	refs, err := t.view.Refs(ctx)
+	if err != nil {
+		return gitrepo.Ref{}, false, err
+	}
+	for _, r := range refs {
+		if r.Name != name || !r.Tracking {
+			continue
+		}
+		commit := r.Commit
+		if commit == "" {
+			// A branch names a commit.
+			commit = r.SHA
+		}
+		return gitrepo.Ref{Name: r.Name, ID: r.SHA, Commit: commit}, true, nil
+	}
+	return gitrepo.Ref{}, false, nil
+}
+
 // refUpdate is the one ref update a write asks for: ref, a full ref name,
 // from before (pushrule.ZeroID for a create) to after (pushrule.ZeroID for
 // a delete), the kind of version it makes of a change whose source it moves
@@ -118,7 +148,7 @@ func (c *Component) updateRef(ctx context.Context, wr *write, repo *gitrepo.Repo
 	}
 	verdict := c.deps.Rules.Evaluate(ctx, req)
 	if verdict.Refused() {
-		return refUpdated{}, refusal(verdict.Decisions)
+		return refUpdated{}, refusal(wr.ws, verdict.Decisions)
 	}
 	res, err := c.deps.RefWriter.Apply(ctx, pushrule.ApplyRequest{
 		Verdict: verdict, Repo: repo, Workspace: pw, Caller: pc, SessionID: u.sessionID,
@@ -129,7 +159,7 @@ func (c *Component) updateRef(ctx context.Context, wr *write, repo *gitrepo.Repo
 	case pushrule.OutcomeRefMoved:
 		return refUpdated{}, refMovedNow(context.WithoutCancel(ctx), repo, u.ref)
 	case pushrule.OutcomeRefused:
-		return refUpdated{}, refusal(decisionsOf(res))
+		return refUpdated{}, refusal(wr.ws, decisionsOf(res))
 	default:
 		var apiErr *server.Error
 		if errors.As(err, &apiErr) {
@@ -189,17 +219,29 @@ func (r *ruleRefusal) Error() string { return r.err.Error() }
 
 func (r *ruleRefusal) Unwrap() error { return r.err }
 
-// refusal is the answer to a write whose update the decisions ds refuse:
-// the first refusing rule's message and error type with 403, or 500
-// internal when no rule could be evaluated.
-func refusal(ds []pushrule.Decision) error {
+// refusal is the answer to a write to the workspace ws whose update the
+// decisions ds refuse: the first refusing rule's message, unchanged, and
+// error type with 403, or 500 internal with a message of its own when no
+// rule could be evaluated, since what failed is the hub's to know. A path
+// refusal names the path the token may not change as the member path of
+// the error; a tracking-branch refusal names the branch the fork was taken
+// from as details.base_ref, the branch to write to instead.
+func refusal(ws workspace.Workspace, ds []pushrule.Decision) error {
 	for _, d := range ds {
 		switch {
 		case d.ErrorType == pushrule.ErrorTypeInternal:
 			return server.Internal(msgRulesInternal)
-		case d.ErrorType != "":
-			return &ruleRefusal{server.NewError(d.ErrorType, http.StatusForbidden, d.Message)}
+		case d.ErrorType == "":
+			continue
 		}
+		e := server.NewError(d.ErrorType, http.StatusForbidden, d.Message)
+		switch {
+		case d.ErrorType == pushrule.ErrorTypePathNotAllowed && d.Path != "":
+			e = e.With("path", d.Path)
+		case d.ErrorType == pushrule.ErrorTypeTrackingBranch && ws.ForkPoint != nil:
+			e = e.WithDetails(map[string]any{"base_ref": ws.ForkPoint.Ref})
+		}
+		return &ruleRefusal{e}
 	}
 	return server.Internal(msgRulesInternal)
 }

@@ -673,11 +673,13 @@ func newWriteWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *writeW
 }
 
 // fakeLinker is a change linker that answers changes, by branch, to every
-// lookup and records the branches it was asked about.
+// lookup and records the branches it was asked about, and the source
+// branches of the openings it was asked to check or open.
 type fakeLinker struct {
 	mu      sync.Mutex
 	changes map[string]*scm.LinkedChange
 	asked   []string
+	opened  []string
 }
 
 // answer makes the linker name change as the source change of branch, none
@@ -695,10 +697,28 @@ func (f *fakeLinker) FindOpen(_ context.Context, slug, branch string) (*scm.Link
 	return f.changes[branch], nil
 }
 
-func (f *fakeLinker) CheckOpening(context.Context, scm.ChangeOpening) error { return nil }
+func (f *fakeLinker) CheckOpening(_ context.Context, o scm.ChangeOpening) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, "check "+o.SourceWorkspace+" "+o.SourceBranch)
+	return nil
+}
 
-func (f *fakeLinker) Open(context.Context, scm.ChangeOpening) (*scm.LinkedChange, error) {
+func (f *fakeLinker) Open(_ context.Context, o scm.ChangeOpening) (*scm.LinkedChange, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, "open "+o.SourceWorkspace+" "+o.SourceBranch)
 	return nil, nil
+}
+
+// calls forgets the lookups and openings the linker was asked for and
+// returns them.
+func (f *fakeLinker) calls() (asked, opened []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	asked, opened = f.asked, f.opened
+	f.asked, f.opened = nil, nil
+	return asked, opened
 }
 
 // recordingStage is a ref-updated stage that records what it is given and

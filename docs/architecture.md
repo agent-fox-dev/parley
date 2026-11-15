@@ -3328,7 +3328,15 @@ from the record; for a task fork the parent's git directory as
 `RefWriter.Finish` with a context that is not cancelled, which writes the
 `parley.git.push` events and tells the post-push listeners. A refused
 update is `403` with the rule's message and error type (`500` `internal`
-for a rule that could not be evaluated), an `Apply` whose compare-and-swap
+with a fixed message for a rule that could not be evaluated), with the
+refused path as the error's member `path` for `path_not_allowed` and the
+fork record's `ForkPoint.Ref` as `details.base_ref` for `tracking_branch`;
+a refusal returns before `Apply`, so no ref moves, no event is written and
+no change is opened. A write reads the ref it moves through the target's
+`lookup`: the ref of the workspace's repository, else, in a task fork, the
+tracking branch of the fork's ref view, so that a write to a tracking branch
+reaches the push rules with the parent's commit as its before value and is
+refused there, as a push of it is. An `Apply` whose compare-and-swap
 failed `409` `ref_moved` with `details.current_sha` read after the
 failure, and a ref-updated stage's error is answered as it is when it is
 an API error, else `500` `internal`. The step returns the engine's decision
