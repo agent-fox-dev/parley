@@ -57,6 +57,15 @@ func (c *Component) getFile(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// The two forms are two representations of one URL.
+	w.Header().Add("Vary", "Accept")
+	repr := reprRaw
+	if acceptsJSON(r) {
+		repr = reprJSON
+	}
+	if notModified(w, r, res.Full, res.SHA, repr) {
+		return nil
+	}
 	file, err := rd.repo.LookupFile(ctx, res.SHA, path)
 	switch {
 	case errors.Is(err, gitrepo.ErrNotFound):
@@ -71,7 +80,7 @@ func (c *Component) getFile(w http.ResponseWriter, r *http.Request) error {
 			With("size", file.Size)
 	}
 
-	if acceptsJSON(r) {
+	if repr == reprJSON {
 		var content bytes.Buffer
 		if err := rd.repo.WriteBlob(ctx, file.ID, &content); err != nil {
 			return err

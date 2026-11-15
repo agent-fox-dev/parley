@@ -84,21 +84,16 @@ func (c *Component) search(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	ctx := r.Context()
-	sha := pos.SHA
-	if continuing {
-		if _, err := rd.repo.PeelCommit(ctx, sha); err != nil {
-			return notFound(sha, err)
-		}
-	} else {
-		res, err := rd.resolver.ResolveOptional(ctx, q.Get("ref"))
-		if err != nil {
-			return err
-		}
-		sha = res.SHA
+	res, err := listedCommit(r, rd, continuing, pos.SHA)
+	if err != nil {
+		return err
 	}
+	if notModified(w, r, res.Full, res.SHA) {
+		return nil
+	}
+	sha := res.SHA
 	items := make([]searchMatch, 0, page.Limit+1)
-	err = rd.repo.Grep(ctx, sha, gitrepo.GrepQuery{Pattern: pattern, Regexp: regex, IgnoreCase: !caseSensitive}, func(m gitrepo.GrepMatch) bool {
+	err = rd.repo.Grep(r.Context(), sha, gitrepo.GrepQuery{Pattern: pattern, Regexp: regex, IgnoreCase: !caseSensitive}, func(m gitrepo.GrepMatch) bool {
 		if (continuing && !pos.after(m)) || !matchesAny(globs, m.Path) {
 			return true
 		}

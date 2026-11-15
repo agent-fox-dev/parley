@@ -448,7 +448,13 @@ func (r reply) members(key string) []string {
 // turn, a header whose value is "" left out.
 func (w *world) get(t *testing.T, path, credential string, header ...string) reply {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, w.URL("/api/v1"+path), nil)
+	return w.send(t, http.MethodGet, path, credential, header...)
+}
+
+// send is get with the method method.
+func (w *world) send(t *testing.T, method, path, credential string, header ...string) reply {
+	t.Helper()
+	req, err := http.NewRequest(method, w.URL("/api/v1"+path), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,12 +468,12 @@ func (w *world) get(t *testing.T, path, credential string, header ...string) rep
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("GET %s: %v", path, err)
+		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	defer res.Body.Close()
 	r := reply{status: res.StatusCode, header: res.Header}
 	if r.body, err = io.ReadAll(res.Body); err != nil {
-		t.Fatalf("GET %s: read the body: %v", path, err)
+		t.Fatalf("%s %s: read the body: %v", method, path, err)
 	}
 	_ = json.Unmarshal(r.body, &r.json)
 	return r

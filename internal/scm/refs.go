@@ -1,6 +1,7 @@
 package scm
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -73,6 +74,9 @@ func (c *Component) listRefs(w http.ResponseWriter, r *http.Request) error {
 			objs = append(objs, obj)
 		}
 	}
+	if notModified(w, r, false, refsTag(objs...)) {
+		return nil
+	}
 	return server.WritePage(w, page, objs, func(o refObject) any { return o.Name })
 }
 
@@ -106,8 +110,23 @@ func (c *Component) getRef(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return missing
 	}
+	if notModified(w, r, false, refsTag(obj)) {
+		return nil
+	}
 	server.WriteJSON(w, http.StatusOK, obj)
 	return nil
+}
+
+// refsTag is what the entity tag of a refs answer is computed from: the
+// objects of its refs, their names and commit ids and what the lookups
+// said of them, since the refs routes resolve no revision.
+func refsTag(objs ...refObject) string {
+	b, err := json.Marshal(objs)
+	if err != nil {
+		// A ref object always encodes.
+		panic(err)
+	}
+	return string(b)
 }
 
 // refObject is the object of the listed ref ref of the read rd; ok is

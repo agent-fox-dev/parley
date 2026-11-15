@@ -15,6 +15,11 @@
 // to git as a revision expression or an option. Refs are read from the
 // workspace's ref view (RefView), so that a fork answers with its own view
 // of its parent's branches.
+//
+// Every successful read carries an entity tag, derived from the commit ids
+// it resolved, its query and its representation, and answers 304 to an
+// If-None-Match that holds it, before the costly part of the read; one
+// whose revisions were all written as full commit ids is marked immutable.
 package scm
 
 import (
@@ -145,10 +150,17 @@ func (c *Component) route(pattern, op string, h server.HandlerFunc) server.Route
 
 // observe is h reporting each request it answers to the recorder once,
 // with the status it wrote or, when it returned an error before writing,
-// the status the error is answered with.
+// the status the error is answered with. An answer h did not write itself,
+// an error's, carries none of the caching headers h set before it failed.
 func (c *Component) observe(op string, h server.HandlerFunc) server.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		sw := &statusWriter{ResponseWriter: w}
+		restore := uncached(w.Header())
+		defer func() {
+			if sw.status == 0 {
+				restore()
+			}
+		}()
 		err := h(sw, r)
 		status := sw.status
 		if status == 0 {

@@ -80,19 +80,14 @@ func (c *Component) listCommits(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	ctx := r.Context()
-	sha := pos.SHA
-	if continuing {
-		if _, err := rd.repo.PeelCommit(ctx, sha); err != nil {
-			return notFound(sha, err)
-		}
-	} else {
-		res, err := rd.resolver.ResolveOptional(ctx, q.Get("ref"))
-		if err != nil {
-			return err
-		}
-		sha = res.SHA
+	res, err := listedCommit(r, rd, continuing, pos.SHA)
+	if err != nil {
+		return err
 	}
-	commits, err := rd.repo.History(ctx, sha, hq)
+	if notModified(w, r, res.Full, res.SHA) {
+		return nil
+	}
+	commits, err := rd.repo.History(ctx, res.SHA, hq)
 	if err != nil {
 		return err
 	}
@@ -106,9 +101,24 @@ func (c *Component) listCommits(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	next := commitsPosition{SHA: sha, Offset: pos.Offset + page.Limit}
+	next := commitsPosition{SHA: res.SHA, Offset: pos.Offset + page.Limit}
 	return server.WritePageWith(w, page, objs, func(commitObject) any { return next },
-		server.Member{Name: "resolved_sha", Value: sha})
+		server.Member{Name: "resolved_sha", Value: res.SHA})
+}
+
+// listedCommit is the commit a page of a list reads: on a later page the
+// commit its cursor pinned, else the commit the query's ref names. A later
+// page is immutable when the ref is a full commit id, as its first page
+// is.
+func listedCommit(r *http.Request, rd *read, continuing bool, pinned string) (Resolved, error) {
+	ref := r.URL.Query().Get("ref")
+	if !continuing {
+		return rd.resolver.ResolveOptional(r.Context(), ref)
+	}
+	if _, err := rd.repo.PeelCommit(r.Context(), pinned); err != nil {
+		return Resolved{}, notFound(pinned, err)
+	}
+	return Resolved{SHA: pinned, Full: fullID(ref)}, nil
 }
 
 // getCommit answers GET …/scm/commits/:sha: the commit any revision names,
@@ -127,6 +137,9 @@ func (c *Component) getCommit(w http.ResponseWriter, r *http.Request) error {
 	res, err := rd.resolver.Resolve(ctx, server.Param(r, "sha"))
 	if err != nil {
 		return err
+	}
+	if notModified(w, r, res.Full, res.SHA) {
+		return nil
 	}
 	commits, err := rd.repo.ReadCommits(ctx, []string{res.SHA})
 	if err != nil {

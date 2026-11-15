@@ -56,6 +56,9 @@ func (c *Component) getCompare(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if notModified(w, r, base.Full && head.Full, base.SHA, head.SHA) {
+		return nil
+	}
 	conflict, err := rd.repo.TrialRebase(ctx, base.SHA, head.SHA)
 	if errors.Is(err, gitrepo.ErrMergeCommit) {
 		return server.NewError("merge_commits_unsupported", http.StatusBadRequest,

@@ -148,6 +148,13 @@ func (c *Component) getDiff(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	repr := reprJSON
+	if dq.asPatch {
+		repr = reprPatch
+	}
+	if notModified(w, r, base.Full && head.Full, base.SHA, head.SHA, repr) {
+		return nil
+	}
 	mergeBase, err := rd.repo.MergeBase(ctx, base.SHA, head.SHA)
 	if err != nil {
 		return err

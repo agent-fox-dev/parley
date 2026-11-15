@@ -2,6 +2,7 @@ package scm_test
 
 import (
 	"context"
+	"net/http"
 	"slices"
 	"testing"
 )
@@ -26,6 +27,15 @@ func TestRead_ReportsEachRequestOnceToTheRecorder(t *testing.T) {
 			check(t, scmPath("demo", rt.bad), w.ownerKey, rt.op+" error")
 		})
 	}
+	t.Run("answered not modified", func(t *testing.T) {
+		path := scmPath("demo", "/file?path=f.txt")
+		tag := w.get(t, path, w.ownerKey).header.Get("ETag")
+		w.observed.reset()
+		r := w.get(t, path, w.ownerKey, "If-None-Match", tag)
+		if got, want := w.observed.reset(), []string{"file ok"}; r.status != http.StatusNotModified || !slices.Equal(got, want) {
+			t.Errorf("If-None-Match %s: %d, the recorder saw %q; want 304 and %q", tag, r.status, got, want)
+		}
+	})
 	t.Run("refused by the state check", func(t *testing.T) {
 		w.set(t, "demo", "maintenance", "reclone")
 		defer w.set(t, "demo", "maintenance", "")

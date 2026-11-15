@@ -2643,7 +2643,7 @@ No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
 `tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route, `search` for the search route) and `ok` for a status
-below 400 (a `206` included),
+below 400 (a `206` or a `304` included),
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
 it is told.
@@ -2678,6 +2678,31 @@ branch. Each revision of a request is resolved once, against one reading of
 the workspace's refs, and the whole answer is computed from the commit ids
 it resolved to, so a read that runs while a ref moves answers for the old
 commit or the new one, never a mix.
+
+Every successful answer (`200` or `206`) carries an `ETag`, a quoted digest
+of the request's path (the route, the workspace and any path parameter),
+its query string (a list's `cursor` included, so each page has its own
+tag), the full ids of the commits its revisions resolved to, and its
+representation (raw or JSON on the file route, JSON or patch on the diff
+route). The two refs routes resolve no revision; their tag is a digest of
+the path, the query and the ref objects of the answer (names, ids and the
+other members), so it changes when a listed ref moves, appears or goes.
+Two identical requests get the same tag while no ref they name moves.
+`Cache-Control` is then:
+
+| Read | `Cache-Control` |
+|---|---|
+| a route with revision parameters, every one of them written as a full 40-character commit id (an absent `ref` is not); a later page of a list whose `ref` is one | `private, max-age=31536000, immutable` |
+| any other: a revision written as a name or an abbreviated id, an absent `ref`, and both refs routes always | `private, no-cache` |
+
+A request whose `If-None-Match` holds the tag the answer would carry, alone
+or in a comma-separated list (a `W/` prefix is ignored), is answered `304
+Not Modified` with no body and the same `ETag` and `Cache-Control` (and on
+the file route `Vary`); `*` is not taken as a match. This is decided once the
+revisions are resolved and before the rest of the read, so a current copy
+costs no history walk, tree listing, file read, diff, trial rebase, blame
+or search; a tag that does not match gets the full answer. An error answer
+has no `ETag` and keeps `Cache-Control: no-store`.
 
 A `path` parameter of a read that names a path of the repository is
 relative, has no empty, `.` or `..` segment, has no segment `.git` and
@@ -2879,6 +2904,10 @@ after the end of the file (on an empty file, every range) is `416`
 `range_not_satisfiable` with `Content-Range: bytes */<size>`. A header with
 several ranges, or one that is not a byte range, is ignored and the whole
 file answered `200`.
+
+Both forms of a successful answer carry `Vary: Accept`, and each form has
+its own `ETag` (see [Source control reads](#source-control-reads)); a
+range answer carries the tag of the whole file's raw form.
 
 When `Accept` names `application/json`, the answer is a JSON object and a
 `Range` header is ignored:

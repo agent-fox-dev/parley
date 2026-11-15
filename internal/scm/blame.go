@@ -72,6 +72,9 @@ func (c *Component) getBlame(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if notModified(w, r, res.Full, res.SHA) {
+		return nil
+	}
 	file, err := rd.repo.LookupFile(ctx, res.SHA, path)
 	switch {
 	case errors.Is(err, gitrepo.ErrNotFound):

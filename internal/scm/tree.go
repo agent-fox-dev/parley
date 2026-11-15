@@ -76,20 +76,15 @@ func (c *Component) listTree(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	ctx := r.Context()
-	sha := pos.SHA
-	if continuing {
-		if _, err := rd.repo.PeelCommit(ctx, sha); err != nil {
-			return notFound(sha, err)
-		}
-	} else {
-		res, err := rd.resolver.ResolveOptional(ctx, q.Get("ref"))
-		if err != nil {
-			return err
-		}
-		sha = res.SHA
+	res, err := listedCommit(r, rd, continuing, pos.SHA)
+	if err != nil {
+		return err
 	}
-	tree, err := rd.repo.ReadTree(ctx, sha, path, recursive)
+	if notModified(w, r, res.Full, res.SHA) {
+		return nil
+	}
+	sha := res.SHA
+	tree, err := rd.repo.ReadTree(r.Context(), sha, path, recursive)
 	switch {
 	case errors.Is(err, gitrepo.ErrNotFound):
 		return server.NewError("path_not_found", http.StatusNotFound, fmt.Sprintf("path %q does not exist at %s", path, sha))
