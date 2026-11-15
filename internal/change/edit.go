@@ -14,6 +14,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
+// KindRetarget is the kind parley.change.version gives a retarget, which
+// measures the current version against another target branch and records
+// no version, so that no stored version has it.
+const KindRetarget = "retarget"
+
 // editRoute edits the change :number of the workspace :slug with the
 // members the PATCH body names, through modify; members the body does not
 // name, and members it does not know, are left as they are.
@@ -161,9 +166,10 @@ func changeClosed(ch Change, takes string) error {
 
 // applyEdit applies e to the change ch, as caller, in tx: the state rules
 // of a closed change, the intent rule on the change as the edit would leave
-// it, the auto_land guard, then the writes, so that a refusal leaves every
-// member as it was. updated_at advances only when a stored value changes;
-// of the members, only a move from draft to open writes an event.
+// it, the rules of a retarget, the auto_land guard, then the writes, so
+// that a refusal leaves every member as it was. updated_at advances only
+// when a stored value changes; of the members, only a retarget and a move
+// from draft to open write an event.
 func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators, ch Change, caller Caller, e edit) error {
 	switch {
 	case !e.edits() && !e.hasDependsOn:
@@ -172,6 +178,13 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 		return changeClosed(ch, "no edit")
 	case ch.State == StateLanded && e.edits() && !e.labelsOnly():
 		return changeClosed(ch, "no edit but of its labels")
+	}
+	// The target a draft or open change already has is no edit; a closed
+	// change was refused it above like any other member.
+	if e.targetBranch != nil && *e.targetBranch == ch.TargetBranch {
+		if e.targetBranch = nil; !e.edits() && !e.hasDependsOn {
+			return nil
+		}
 	}
 	closed := ch.State != StateDraft && ch.State != StateOpen
 	state, intent := ch.State, ch.Intent
@@ -191,8 +204,10 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 				fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", ch.WorkspaceSlug))
 		}
 	}
-	if e.targetBranch != nil && *e.targetBranch != ch.TargetBranch {
-		return server.NewError("not_implemented", http.StatusNotImplemented, "target_branch: a change cannot be retargeted yet")
+	if e.targetBranch != nil {
+		if err := c.checkRetarget(ctx, tx, ch, *e.targetBranch); err != nil {
+			return err
+		}
 	}
 	if e.autoLand != nil && co.guard != nil {
 		if err := co.guard.CheckAutoLand(ctx, tx, caller, ch, *e.autoLand); err != nil {
@@ -224,6 +239,11 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 	}
 	if e.autoLand != nil {
 		if err := c.SetAutoLand(ctx, tx, ch.WorkspaceSlug, ch.Number, *e.autoLand, caller); err != nil {
+			return err
+		}
+	}
+	if e.targetBranch != nil {
+		if err := c.retarget(ctx, tx, ch.WorkspaceSlug, ch.Number, *e.targetBranch, caller); err != nil {
 			return err
 		}
 	}
@@ -259,4 +279,73 @@ func (c *Component) moveState(ctx context.Context, tx *sql.Tx, workspace string,
 		return err
 	}
 	return c.AnnounceLandable(ctx, tx, workspace, number)
+}
+
+// checkRetarget refuses, reading through tx, to retarget the change ch onto
+// branch: a branch an open would refuse as its target is answered as the
+// open answers it, and a change of a stack, below or above another, is
+// refused, since its place in the stack, not its target, says what it
+// sits on.
+func (c *Component) checkRetarget(ctx context.Context, tx *sql.Tx, ch Change, branch string) error {
+	target, found, err := c.deps.Workspaces.Workspace(ctx, tx, ch.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errChangeNotFound(ch.WorkspaceSlug, ch.Number)
+	}
+	repo, err := c.deps.Repos(ctx, ch.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	if _, err := checkTarget(ctx, repo, target, branchOf{ch.Source.WorkspaceSlug, ch.Source.Branch}, branch); err != nil {
+		return err
+	}
+	if ch.DependsOn != nil || len(ch.Dependants) > 0 {
+		return server.Conflict(fmt.Sprintf("target_branch: %s is part of a stack, whose changes sit on each other; take it out of the stack first", ch.Ref))
+	}
+	return nil
+}
+
+// retarget points the change number of the workspace at branch, in tx, by
+// caller: its base becomes the merge base of its head and the branch, and
+// its stats, paths and patch id are measured against it, on the change
+// only, since its versions record what they were measured against when
+// they were recorded (so SetBase, which rewrites the current version, is
+// not used). Its landing is evaluated again, a structural cause blocking
+// it rather than refusing the retarget, its landable announcement is
+// forgotten, its mergeability is checked again, and parley.change.version
+// of kind retarget is written for its current version.
+func (c *Component) retarget(ctx context.Context, tx *sql.Tx, workspace string, number int64, branch string, caller Caller) error {
+	ch, err := readChange(ctx, tx, workspace, number)
+	if err != nil {
+		return err
+	}
+	ch.TargetBranch = branch
+	o, _, err := c.measureMove(ctx, tx, ch, ch.HeadSHA)
+	if err != nil {
+		return err
+	}
+	paths, err := json.Marshal(nonNil(o.paths))
+	if err != nil {
+		return err
+	}
+	if err := update(ctx, tx, workspace, number, c.now(), `target_branch = ?, base_sha = ?, patch_id = ?, commits = ?,
+	files_changed = ?, insertions = ?, deletions = ?, paths = ?, paths_truncated = ?`, branch, o.base, o.patchID,
+		o.stats.Commits, o.stats.FilesChanged, o.stats.Insertions, o.stats.Deletions, string(paths), o.truncated); err != nil {
+		return err
+	}
+	if err := c.reevaluateLanding(ctx, tx, workspace, number); err != nil {
+		return err
+	}
+	if err := c.ForgetLandable(ctx, tx, workspace, number); err != nil {
+		return err
+	}
+	if err := c.ScheduleMergeable(ctx, tx, workspace, number); err != nil {
+		return err
+	}
+	if ch, err = readChange(ctx, tx, workspace, number); err != nil {
+		return err
+	}
+	return c.emitVersion(ctx, tx, caller, ch, Version{Number: ch.Version, HeadSHA: ch.HeadSHA, Kind: KindRetarget, BaseSHA: baseOf(o.base)})
 }

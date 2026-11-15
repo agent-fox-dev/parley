@@ -3731,8 +3731,20 @@ for a draft marked ready, `parley.change.open` by the caller with
 `was_draft` `true` (`emitOpened`, which `Open` shares) and
 `AnnounceLandable`, or, for a change made a draft, `ForgetLandable` and no
 event; neither schedules a mergeability check, since the head and the
-target stay. A differing `target_branch`
-is answered `501 not_implemented` for now. The abandon goes through
+target stay. A differing `target_branch` is checked before any write by
+`checkRetarget`: the target rules go through `checkTarget` (`open.go`),
+which `Open`'s `targetBranch` calls too, so a missing branch, the
+integration branch of a carry-patch workspace and the change's own source
+branch get the answers of an open, and a change with a `depends_on` or a
+draft or open dependant is `409 conflict`. `retarget` then writes, after
+the other members and before `moveState`, the target branch and the base,
+patch id, stats and paths `measureMove` finds against it on the change
+row only (`SetBase` would rewrite the current version too), runs
+`reevaluateLanding`, `ForgetLandable` and `ScheduleMergeable`, and writes
+`parley.change.version` by the caller with kind `retarget`
+(`KindRetarget`, an event kind no stored version has) for the current
+version. A `target_branch` equal to the change's own is no edit on a draft or
+open change; the closed-change rules count it like any other member. The abandon goes through
 `(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
 which is `SetAbandoned`, `ForgetLandable` and `parley.change.abandon` with
 the given reason;

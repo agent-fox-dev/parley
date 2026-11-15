@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http"
 	"reflect"
 	"strconv"
 	"sync"
@@ -252,15 +253,9 @@ func TestAnnounceLandable_AnnouncesAgainOnlyAfterTheChangeWasNotLandable(t *test
 			w.branch(t, "b", "B")
 			w.openBranch(t, "b", nil)
 			w.settled(t, 1)
-			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
-				if _, err := tx.ExecContext(ctx, `UPDATE changes SET target_branch = 'release' WHERE workspace_slug = 'demo' AND number = 1`); err != nil {
-					return err
-				}
-				if err := w.changes.ForgetLandable(ctx, tx, "demo", 1); err != nil {
-					return err
-				}
-				return w.changes.ScheduleMergeable(ctx, tx, "demo", 1)
-			})
+			if status, out := w.patch(t, 1, w.ownerKey, map[string]any{"target_branch": "release"}); status != http.StatusOK {
+				t.Fatalf("retarget = %d %v", status, out)
+			}
 			w.settled(t, 1)
 		}, 2},
 		{"a draft found clean", func(t *testing.T, w *world, _ int64) {

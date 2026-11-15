@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -256,6 +257,9 @@ func TestEdit_RefusesEveryEditOfAClosedChangeButTheLabelsOfALandedOne(t *testing
 		{"auto_land on a landed change", landed, map[string]any{"auto_land": true}},
 		{"a landed change made a draft", landed, map[string]any{"state": "draft"}},
 		{"a landed change retargeted", landed, map[string]any{"target_branch": "dev"}},
+		{"an abandoned change named its own target", abandoned, map[string]any{"target_branch": "main"}},
+		{"a landed change named its own target", landed, map[string]any{"target_branch": "main"}},
+		{"the labels and the own target of a landed change", landed, map[string]any{"labels": []string{"x"}, "target_branch": "main"}},
 		{"the labels and the title of a landed change", landed, map[string]any{"labels": []string{"x"}, "title": "t"}},
 	} {
 		_, before := w.change(t, c.number)
@@ -436,26 +440,190 @@ func TestEdit_MovesAnOpenChangeBackToDraftKeepingWhatItHas(t *testing.T) {
 	}
 }
 
-func TestEdit_ChangesNothingForTheStateTheChangeHas(t *testing.T) {
+func TestEdit_ChangesNothingForAValueTheChangeHas(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	for _, c := range []struct {
-		state string
+	for i, c := range []struct {
 		draft bool
+		body  map[string]any
 	}{
-		{change.StateOpen, false},
-		{change.StateDraft, true},
+		{false, map[string]any{"state": change.StateOpen}},
+		{true, map[string]any{"state": change.StateDraft}},
+		{false, map[string]any{"target_branch": "main"}},
 	} {
-		w.branch(t, c.state, c.state+"\n")
-		n := w.openBranch(t, c.state, func(in *change.OpenInput) { in.Draft = c.draft }).Number
+		branch := "s" + strconv.Itoa(i)
+		w.branch(t, branch, branch+"\n")
+		n := w.openBranch(t, branch, func(in *change.OpenInput) { in.Draft = c.draft }).Number
 		w.settled(t, n)
 		before, _ := w.change(t, n)
 		seq, at := w.seq(t), w.updatedAt(t, n)
-		if status, got := w.patch(t, n, w.ownerKey, map[string]any{"state": c.state}); status != http.StatusOK || !reflect.DeepEqual(got, before) || w.updatedAt(t, n) != at {
-			t.Errorf("PATCH state %s on a change in it = %d %v, want 200 with the change as it was, updated_at included:\n%v", c.state, status, got, before)
+		if status, got := w.patch(t, n, w.ownerKey, c.body); status != http.StatusOK || !reflect.DeepEqual(got, before) || w.updatedAt(t, n) != at {
+			t.Errorf("PATCH %v on a change that has it = %d %v, want 200 with the change as it was, updated_at included:\n%v", c.body, status, got, before)
 		}
 		if events := w.eventsAfter(t, seq); len(events) != 0 {
-			t.Errorf("PATCH state %s on a change in it wrote %d events, e.g. %s", c.state, len(events), events[0].Type)
+			t.Errorf("PATCH %v on a change that has it wrote %d events, e.g. %s", c.body, len(events), events[0].Type)
 		}
+	}
+}
+
+// diverged commits m.txt on demo's main and r.txt on its release, then a
+// change of a.txt on top of main in mia's fork, which it opens by mia into
+// main; it returns the change's number and head.
+func diverged(t *testing.T, m *miaWorld) (int64, string) {
+	t.Helper()
+	main := commit(t, m.demo, "main", "main", "M\n", map[string]string{"m.txt": "m\n"})
+	commit(t, m.demo, "release", "release", "R\n", map[string]string{"r.txt": "r\n"})
+	head := commit(t, m.t1, "task", main, "Task\n\nWhy.\n", map[string]string{"a.txt": "l1\nl2\nl3\nl4\n"})
+	ch := m.openBranch(t, "task", func(in *change.OpenInput) {
+		in.SourceWorkspace = "demo--t1"
+		in.Caller = change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+	})
+	return ch.Number, head
+}
+
+func TestEdit_RetargetsTheChangeAtItsVersion(t *testing.T) {
+	t.Parallel()
+	m := newMiaWorld(t)
+	n, head := diverged(t, m)
+	m.settled(t, n)
+	versions := m.versions(t, "demo", n)
+	seq := m.seq(t)
+
+	status, got := m.patch(t, n, m.miaKey, map[string]any{"target_branch": "release"})
+	base := gitrepotest.Git(t, m.demo, "merge-base", head, "release")
+	stats, _ := got["stats"].(map[string]any)
+	if status != http.StatusOK || got["target_branch"] != "release" || got["base_sha"] != base || got["version"] != 1.0 ||
+		got["head_sha"] != head || got["mergeable"] != change.MergeableUnknown {
+		t.Fatalf("PATCH target_branch release = %d %v, want 200 into release from %s at version 1, %s, unknown", status, got, base, head)
+	}
+	if commits, _ := strconv.ParseFloat(gitrepotest.Git(t, m.demo, "rev-list", "--count", "release.."+head), 64); stats["commits"] != commits {
+		t.Errorf("stats = %v, want %v commits", stats, commits)
+	}
+	if want := []any{"a.txt", "m.txt"}; !reflect.DeepEqual(got["paths"], want) {
+		t.Errorf("paths = %v, want %v", got["paths"], want)
+	}
+	if after := m.versions(t, "demo", n); !reflect.DeepEqual(after, versions) {
+		t.Errorf("versions = %v, were %v", after, versions)
+	}
+	events := m.changeEvents(t, seq, change.EventVersion, n)
+	if len(events) != 1 {
+		t.Fatalf("%d version events, want 1", len(events))
+	}
+	if e := events[0]; e.ActorID == nil || *e.ActorID != m.mia {
+		t.Errorf("the version event is by %s %v, want mia", e.ActorType, e.ActorID)
+	}
+	want := map[string]any{"number": float64(n), "ref": "demo#" + strconv.FormatInt(n, 10), "version": 1.0, "head_sha": head,
+		"kind": "retarget", "base_sha": base, "patch_equivalent_to": nil, "draft": false}
+	if meta := metadata(t, events[0]); !reflect.DeepEqual(meta, want) {
+		t.Errorf("metadata of the version event = %v, want %v", meta, want)
+	}
+	if ch := m.settled(t, n); ch.TargetBranch != "release" || ch.Mergeable != change.MergeableClean {
+		t.Errorf("after its check the change is into %s and %s, want release and clean", ch.TargetBranch, ch.Mergeable)
+	}
+}
+
+func TestEdit_RefusesATargetAnOpenWouldRefuse(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	cp := w.addWorkspace(t, "cp")
+	w.set(t, "cp", "workspace_mode", "carry_patch")
+	w.set(t, "cp", "integration_branch", "integration")
+	commit(t, cp, "integration", "refs/heads/main", "Upstream plus patches\n", map[string]string{"i.txt": "i\n"})
+	commit(t, cp, "patch", "refs/heads/main", "Patch\n\nWhy.\n", map[string]string{"p.txt": "p\n"})
+	if _, err := w.open(t, change.OpenInput{Workspace: "cp", SourceBranch: "patch", Intent: new("why"), Caller: w.ownerCaller(), Kind: change.KindRef}); err != nil {
+		t.Fatal(err)
+	}
+	w.branch(t, "feat", "Feat\n\nWhy.\n")
+	w.openBranch(t, "feat", nil)
+	for _, c := range []struct {
+		name, path, target string
+		status             int
+		errorType          string
+	}{
+		{"a branch that does not exist", "/workspaces/demo/changes/1", "nope", http.StatusBadRequest, "target_not_found"},
+		{"the change's own source branch", "/workspaces/demo/changes/1", "feat", http.StatusBadRequest, "invalid_request"},
+		{"the integration branch", "/workspaces/cp/changes/1", "integration", http.StatusForbidden, "integration_branch"},
+	} {
+		_, _, before := w.get(t, c.path, w.ownerKey)
+		seq := w.seq(t)
+		if status, got := w.send(t, http.MethodPatch, c.path, w.ownerKey, map[string]any{"target_branch": c.target}); status != c.status || errorType(got) != c.errorType {
+			t.Errorf("%s: PATCH = %d %v, want %d %s", c.name, status, got, c.status, c.errorType)
+		}
+		if _, _, after := w.get(t, c.path, w.ownerKey); !bytes.Equal(after, before) {
+			t.Errorf("%s: the refused retarget changed the change:\n%s\nwas\n%s", c.name, after, before)
+		}
+		if events := w.eventsAfter(t, seq); len(events) != 0 {
+			t.Errorf("%s: the refused retarget wrote %d events, e.g. %s", c.name, len(events), events[0].Type)
+		}
+	}
+}
+
+func TestEdit_RefusesToRetargetAChangeOfAStack(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	b1 := commit(t, w.demo, "b1", w.base, "B1", map[string]string{"one.txt": "1\n"})
+	w.openBranch(t, "b1", nil)
+	commit(t, w.demo, "b2", b1, "B2", map[string]string{"two.txt": "2\n"})
+	w.openBranch(t, "b2", nil)
+	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetDependsOn(ctx, tx, "demo", 2, new(int64(1)))
+	})
+	for _, c := range []struct {
+		name   string
+		number int64
+	}{
+		{"the lower change", 1},
+		{"the upper change", 2},
+	} {
+		_, before := w.change(t, c.number)
+		if status, got := w.patch(t, c.number, w.ownerKey, map[string]any{"target_branch": "release"}); status != http.StatusConflict || errorType(got) != "conflict" {
+			t.Errorf("%s: PATCH = %d %v, want 409 conflict", c.name, status, got)
+		}
+		if _, after := w.change(t, c.number); !bytes.Equal(after, before) {
+			t.Errorf("%s: the refused retarget changed the change:\n%s\nwas\n%s", c.name, after, before)
+		}
+	}
+}
+
+func TestEdit_RetargetsOntoABranchItCannotLandOnAndSaysWhy(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	side := commit(t, w.demo, "side", w.base, "Side\n", map[string]string{"s.txt": "s\n"})
+	first := commit(t, w.demo, "main", "main", "First\n", map[string]string{"f.txt": "f\n"})
+	if _, err := gitrepotest.Run(w.demo, "commit refs/heads/main\n"+committer+data("Merge side\n")+
+		"from "+first+"\nmerge "+side+"\n\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	head := commit(t, w.demo, "feat", "main", "Feat\n\nWhy.\n", map[string]string{"feat.txt": "feat\n"})
+	n := w.openBranch(t, "feat", nil).Number
+	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/ahead", head)
+	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/old", w.base)
+	for _, c := range []struct{ target, reason string }{
+		{"ahead", "nothing_to_land"},
+		{"old", "merge_commits"},
+	} {
+		status, got := w.patch(t, n, w.ownerKey, map[string]any{"target_branch": c.target})
+		landing, _ := got["landing"].(map[string]any)
+		if status != http.StatusOK || got["target_branch"] != c.target || landing["status"] != change.LandingBlocked || landing["reason"] != c.reason {
+			t.Errorf("PATCH target_branch %s = %d %v, want 200 into %s, blocked by %s", c.target, status, got, c.target, c.reason)
+		}
+	}
+}
+
+func TestEdit_RetargetsAChangeWhoseTargetBranchIsGone(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.branch(t, "b", "B\n\nWhy.\n")
+	n := w.openBranch(t, "b", func(in *change.OpenInput) { in.TargetBranch = new("release") }).Number
+	w.settled(t, n)
+	w.push(t, "release", "", nil)
+	w.idle(t, n)
+	if ch := w.read(t, n); ch.Landing.Reason == nil || *ch.Landing.Reason != "target_not_found" {
+		t.Fatalf("with release gone the landing is %+v, want blocked by target_not_found", ch.Landing)
+	}
+	status, got := w.patch(t, n, w.ownerKey, map[string]any{"target_branch": "main"})
+	landing, _ := got["landing"].(map[string]any)
+	if status != http.StatusOK || got["target_branch"] != "main" || landing["reason"] == "target_not_found" {
+		t.Errorf("PATCH target_branch main = %d %v, want 200 into main, not blocked by target_not_found", status, got)
 	}
 }

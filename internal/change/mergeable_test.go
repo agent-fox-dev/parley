@@ -212,7 +212,9 @@ func TestMergeability_MarksEveryAffectedChangeUnknownUntilItsCheck(t *testing.T)
 			w.push(t, "b1", "b1", map[string]string{"one2.txt": "1\n"})
 		}, affected: []int64{1, 2}},
 		{name: "a retarget", trigger: func(t *testing.T, w *world) {
-			w.trigger(t, 4)
+			if status, out := w.patch(t, 4, w.ownerKey, map[string]any{"target_branch": "main"}); status != http.StatusOK {
+				t.Fatalf("retarget = %d %v", status, out)
+			}
 		}, affected: []int64{4}},
 		{name: "a restore", before: func(t *testing.T, w *world) {
 			if status, out := w.send(t, http.MethodPost, "/workspaces/demo/changes/3/abandon", w.ownerKey, nil); status != http.StatusOK {

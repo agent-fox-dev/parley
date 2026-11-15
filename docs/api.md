@@ -3940,13 +3940,33 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   `{"status":"blocked","reason":"draft"}`, its versions, labels,
   `auto_land` and `mergeable` stay, its landable announcement is
   forgotten, and no event is written. A `state` the change already has is
-  no edit. A `target_branch`
-  other than the change's own is answered `501` `not_implemented` (a
-  change cannot be retargeted yet). The members are stored together, and
-  `updated_at` advances only when a stored value changes; editing
-  `title`, `intent`, `labels` or `auto_land` writes no event, and the
-  events of a move from draft to open come after them, so they carry the
-  edited `title`.
+  no edit. A `target_branch` other than the change's own retargets a
+  draft or open change. The branch is checked as an open checks its
+  target, with the same answers: `400` `target_not_found` for a branch
+  `{slug}` does not have, `403` `integration_branch` for the integration
+  branch of a carry-patch workspace, `400` `invalid_request` for the
+  change's own source branch in `{slug}`. A change that depends on
+  another, or that a draft or open change depends on, is answered `409`
+  `conflict`. The retarget records no version: `target_branch` is set,
+  `base_sha` becomes the merge base of `head_sha` and the new target's
+  head, `stats`, `paths` and `paths_truncated` are measured against it,
+  and the change's versions keep what they were measured against.
+  `landing` is evaluated again, so a branch that already has every
+  commit of the change, or one from which a merge commit lies before the
+  head, is accepted and reported as `{"status":"blocked","reason":
+  "nothing_to_land"}` or `"merge_commits"`; a change whose target branch
+  was deleted may be retargeted onto one that exists. `mergeable` becomes
+  `unknown` and is checked again, the landable announcement is
+  forgotten, and `parley.change.version` is written by the caller with
+  `number`, `ref`, `version` and `head_sha` (the current ones), `kind`
+  `retarget`, the new `base_sha`, `patch_equivalent_to` `null` and
+  `draft`. A `target_branch` a draft or open change already has is no
+  edit; on a landed or abandoned change it is refused like any other member. The
+  members are stored together, the retarget after the other members and
+  before a move between draft and open, and `updated_at` advances only
+  when a stored value changes; editing `title`, `intent`, `labels` or
+  `auto_land` writes no event, and the events of a retarget and of a move
+  from draft to open come after them, so they carry the edited `title`.
 - `POST …/abandon` takes no body or a JSON object with `reason`, a string,
   and moves the change to `abandoned`, writing `parley.change.abandon` by
   the caller with `reason` as given (the empty string when absent),
@@ -3973,8 +3993,8 @@ no work tree in either repository.
 `mergeable` becomes `unknown`, with `conflict` `null`, in the transaction
 of what triggers a new check: a new version of the change, a new version
 of the change it depends on, a move, creation or deletion of its target
-branch by a push, the source control API, a landing or a sync, and a
-restore. It stays `unknown` until the check stores its result; a result
+branch by a push, the source control API, a landing or a sync, a
+retarget and a restore. It stays `unknown` until the check stores its result; a result
 for a head or an onto-commit that is no longer the change's is
 discarded and computed again. Two checks of one change start at least
 `[changes].mergeable_debounce` apart (default `5s`, see

@@ -505,12 +505,10 @@ func (c *Component) readWorkspaces(ctx context.Context, q Querier, in OpenInput,
 
 // targetBranch fills in the target branch of the open in, the one named or
 // the default, the base branch of a fork source related to the target or
-// the target workspace's default branch, opens the target's repository and returns the
-// branch's head; a branch the repository does not have, or the integration
-// branch of a carry-patch workspace, is refused.
+// the target workspace's default branch, opens the target's repository and
+// returns the branch's head, once checkTarget accepts it.
 func (c *Component) targetBranch(ctx context.Context, in OpenInput, o *opening, related bool) (string, error) {
-	target := o.target
-	o.targetBranch = target.DefaultBranch
+	o.targetBranch = o.target.DefaultBranch
 	if o.source.Fork && related {
 		o.targetBranch = o.source.DefaultBranch
 	}
@@ -518,26 +516,40 @@ func (c *Component) targetBranch(ctx context.Context, in OpenInput, o *opening, 
 		o.targetBranch = *in.TargetBranch
 	}
 	var err error
-	if o.targetRepo, err = c.deps.Repos(ctx, target.Slug); err != nil {
+	if o.targetRepo, err = c.deps.Repos(ctx, o.target.Slug); err != nil {
 		return "", err
 	}
-	head, found, err := o.targetRepo.ResolveBranch(ctx, o.targetBranch)
-	if err != nil {
+	return checkTarget(ctx, o.targetRepo, o.target, branchOf{o.source.Slug, in.SourceBranch}, o.targetBranch)
+}
+
+// branchOf is a branch of a workspace.
+type branchOf struct{ workspace, branch string }
+
+// checkTarget checks branch as the target branch of a change from source
+// into the workspace target, whose repository is repo, by the rules an
+// open and a retarget share, so that both answer a target alike, and
+// returns the branch's head: the repository must have the branch, which
+// must not be the integration branch of a carry-patch workspace, nor the
+// source branch itself.
+func checkTarget(ctx context.Context, repo *gitrepo.Repo, target Workspace, source branchOf, branch string) (string, error) {
+	head, found, err := repo.ResolveBranch(ctx, branch)
+	switch {
+	case err != nil:
 		return "", err
-	}
-	if !found {
-		return "", server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", o.targetBranch, target.Slug))
-	}
-	if target.CarryPatch && o.targetBranch == target.IntegrationBranch {
+	case !found:
+		return "", server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", branch, target.Slug))
+	case target.CarryPatch && branch == target.IntegrationBranch:
 		return "", server.NewError("integration_branch", http.StatusForbidden,
-			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", o.targetBranch, target.Slug))
+			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", branch, target.Slug))
+	case source.workspace == target.Slug && source.branch == branch:
+		return "", server.InvalidRequest(fmt.Sprintf("target_branch: %s is the source branch itself", branch))
 	}
 	return head, nil
 }
 
 // sourceHead opens the source's repository and fills in the head of the
 // open in: the one the trigger named, or the source branch's, which must
-// exist and must not be the target branch itself.
+// exist.
 func (c *Component) sourceHead(ctx context.Context, in OpenInput, o *opening) error {
 	o.sourceRepo = o.targetRepo
 	var err error
@@ -554,9 +566,6 @@ func (c *Component) sourceHead(ctx context.Context, in OpenInput, o *opening) er
 		if !found {
 			return server.NewError("source_not_found", http.StatusBadRequest, fmt.Sprintf("source.branch: no branch %q in %s", in.SourceBranch, o.source.Slug))
 		}
-	}
-	if o.source.Slug == o.target.Slug && in.SourceBranch == o.targetBranch {
-		return server.InvalidRequest(fmt.Sprintf("source.branch: %s is the target branch itself", in.SourceBranch))
 	}
 	return nil
 }
