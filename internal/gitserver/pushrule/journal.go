@@ -19,7 +19,9 @@ import (
 //
 // updates is the JSON list of the request's ref updates in command order,
 // each with its flags; actor_id is null for the admin token, session_id
-// for a write that belongs to no session.
+// for a write that belongs to no session. committed is set in the store
+// transaction the refs moved in, so an entry that has it owes its events
+// whatever its refs hold later.
 var JournalStep = store.Step{
 	Name:   "push_journal",
 	Target: store.Main,
@@ -34,7 +36,8 @@ CREATE TABLE push_journal (
 	credential_id TEXT,
 	session_id    TEXT,
 	via           TEXT NOT NULL,
-	updates       TEXT NOT NULL
+	updates       TEXT NOT NULL,
+	committed     INTEGER NOT NULL DEFAULT 0
 )`)
 		return err
 	},
@@ -44,8 +47,9 @@ CREATE TABLE push_journal (
 // workspace written to, its parent's slug for a task fork, the caller as
 // the request's events name it (ActorType one of the Credential constants,
 // ActorID the user, empty for the admin token), the credential's id, the
-// session it belongs to (nil for none), the surface it came through and its
-// ref updates in command order.
+// session it belongs to (nil for none), the surface it came through, its
+// ref updates in command order, and whether its refs are known to have
+// moved: Committed is set with the commit of the refs.
 type JournalEntry struct {
 	ID                               int64
 	Workspace, Parent                string
@@ -53,6 +57,7 @@ type JournalEntry struct {
 	SessionID                        *string
 	Via                              string
 	Updates                          []JournalUpdate
+	Committed                        bool
 }
 
 // JournalUpdate is one ref update of a journal entry with the flags the
@@ -93,10 +98,10 @@ func InsertJournalEntry(ctx context.Context, tx *sql.Tx, e JournalEntry) (int64,
 	}
 	var id int64
 	err = tx.QueryRowContext(ctx, `
-INSERT INTO push_journal (workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+INSERT INTO push_journal (workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates, committed)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 		e.Workspace, nullString(e.Parent), e.ActorType, nullString(e.ActorID), nullString(e.CredentialID),
-		e.SessionID, e.Via, string(updates)).Scan(&id)
+		e.SessionID, e.Via, string(updates), e.Committed).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("push journal: add the entry of %s: %w", e.Workspace, err)
 	}
@@ -106,7 +111,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 // JournalEntries reads every entry of the journal, oldest first.
 func JournalEntries(ctx context.Context, q Querier) ([]JournalEntry, error) {
 	rows, err := q.QueryContext(ctx, `
-SELECT id, workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates
+SELECT id, workspace, parent_slug, actor_type, actor_id, credential_id, session_id, via, updates, committed
 FROM push_journal ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("push journal: read: %w", err)
@@ -117,7 +122,7 @@ FROM push_journal ORDER BY id`)
 		var e JournalEntry
 		var parent, actorID, credentialID, session sql.NullString
 		var updates string
-		if err := rows.Scan(&e.ID, &e.Workspace, &parent, &e.ActorType, &actorID, &credentialID, &session, &e.Via, &updates); err != nil {
+		if err := rows.Scan(&e.ID, &e.Workspace, &parent, &e.ActorType, &actorID, &credentialID, &session, &e.Via, &updates, &e.Committed); err != nil {
 			return nil, fmt.Errorf("push journal: read: %w", err)
 		}
 		e.Parent, e.ActorID, e.CredentialID = parent.String, actorID.String, credentialID.String
@@ -139,6 +144,15 @@ FROM push_journal ORDER BY id`)
 	return entries, nil
 }
 
+// markJournalEntryCommitted marks the entry id committed in tx, the store
+// transaction the request's refs move in.
+func markJournalEntryCommitted(ctx context.Context, tx *sql.Tx, id int64) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE push_journal SET committed = 1 WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("push journal: mark entry %d committed: %w", id, err)
+	}
+	return nil
+}
+
 // deleteJournalEntry removes the entry id in tx and reports whether it was
 // there.
 func deleteJournalEntry(ctx context.Context, tx *sql.Tx, id int64) (bool, error) {
@@ -151,16 +165,20 @@ func deleteJournalEntry(ctx context.Context, tx *sql.Tx, id int64) (bool, error)
 }
 
 // Reconcile settles what the journal holds; the hub runs it as it starts,
-// before it serves. For each entry it reads the entry's refs: when every
-// one holds its after value (is absent, for a delete), the request's refs
-// moved and its events were never written, so they are written and the
-// entry removed in one transaction; otherwise the refs never moved and the
-// entry is removed without events. A ref that holds neither its before nor
-// its after value was moved by another writer since the request was
-// refused; that entry is removed without events too, and logged. An entry
-// whose repository or transaction fails is logged and kept for the next
-// start. An error is a failure to read the journal. Without an event log or
-// a way to open the repositories it does nothing.
+// before it serves. An entry marked committed had its refs moved and its
+// events never written, which happens when Finish failed: its events are
+// written and the entry removed in one transaction, whatever its refs hold
+// now, since a later write may have moved them since. For any other entry
+// it reads the entry's refs: when every one holds its after value (is
+// absent, for a delete), the hub stopped between the commit of the refs
+// and that of the store, and the events are written the same way;
+// otherwise the refs never moved and the entry is removed without events.
+// A ref of such an entry that holds neither its before nor its after value
+// was moved by another writer since the request was refused; that entry is
+// removed without events too, and logged. An entry whose repository or
+// transaction fails is logged and kept for the next start. An error is a
+// failure to read the journal. Without an event log or a way to open the
+// repositories it does nothing.
 func (w *Writer) Reconcile(ctx context.Context) error {
 	w.mu.RLock()
 	deps := w.deps
@@ -180,16 +198,20 @@ func (w *Writer) Reconcile(ctx context.Context) error {
 		return err
 	}
 	for _, e := range entries {
-		moved, neither, err := refsMoved(ctx, deps.Repos, e)
-		if err != nil {
-			logger.Error("push journal: entry kept, its refs cannot be read", "workspace", e.Workspace, "journal_entry", e.ID, "error", err)
-			continue
+		moved := e.Committed
+		if !moved {
+			var neither bool
+			var err error
+			if moved, neither, err = refsMoved(ctx, deps.Repos, e); err != nil {
+				logger.Error("push journal: entry kept, its refs cannot be read", "workspace", e.Workspace, "journal_entry", e.ID, "error", err)
+				continue
+			}
+			if neither {
+				logger.Warn("push journal: entry dropped, its refs hold neither their before nor their after values",
+					"workspace", e.Workspace, "journal_entry", e.ID)
+			}
 		}
-		if neither {
-			logger.Warn("push journal: entry dropped, its refs hold neither their before nor their after values",
-				"workspace", e.Workspace, "journal_entry", e.ID)
-		}
-		err = deps.Transact(ctx, func(tx *sql.Tx) error {
+		err := deps.Transact(ctx, func(tx *sql.Tx) error {
 			if moved {
 				return settle(ctx, tx, deps.Events, e)
 			}

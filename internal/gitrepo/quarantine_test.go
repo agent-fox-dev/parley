@@ -15,14 +15,15 @@ func TestQuarantine_HoldsTheObjectsOfAPackUntilTheyAreMovedOrDiscarded(t *testin
 	repo, _, _, c3 := threeCommits(t)
 	client := newFork(t, repo.Dir())
 	for _, c := range []struct {
-		name             string
-		mangle           func(pack string) string
-		migrate, invalid bool
+		name                        string
+		mangle                      func(pack string) string
+		migrate, unmigrate, invalid bool
 	}{
-		{"moved into the repository", nil, true, false},
-		{"discarded", nil, false, false},
-		{"not a pack", func(string) string { return "twenty bytes, no pack" }, false, true},
-		{"a truncated pack", func(p string) string { return p[:len(p)/2] }, false, true},
+		{"moved into the repository", nil, true, false, false},
+		{"moved in and taken out again", nil, true, true, false},
+		{"discarded", nil, false, false, false},
+		{"not a pack", func(string) string { return "twenty bytes, no pack" }, false, false, true},
+		{"a truncated pack", func(p string) string { return p[:len(p)/2] }, false, false, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			c4 := gitrepotest.Git(t, client, "commit-tree", "-p", c3, "-m", c.name, c3+"^{tree}")
@@ -50,11 +51,16 @@ func TestQuarantine_HoldsTheObjectsOfAPackUntilTheyAreMovedOrDiscarded(t *testin
 					t.Fatal(err)
 				}
 			}
+			if c.unmigrate {
+				if err := q.Unmigrate(); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := q.Discard(); err != nil {
 				t.Fatal(err)
 			}
-			if got := readable(repo.Dir(), c4); got != c.migrate {
-				t.Errorf("the pack's commit readable in the repository = %t, want %t", got, c.migrate)
+			if got, want := readable(repo.Dir(), c4), c.migrate && !c.unmigrate; got != want {
+				t.Errorf("the pack's commit readable in the repository = %t, want %t", got, want)
 			}
 			if strays := gitrepotest.Quarantines(repo.Dir()); len(strays) != 0 {
 				t.Errorf("objects/ holds %v, want no quarantine left", strays)

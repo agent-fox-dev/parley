@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -26,16 +27,18 @@ const resultType = "application/x-git-receive-pack-result"
 
 // stages are the options stage, the mapping stage and a ref-updated stage
 // a test registers on its hub. They note in seen what they find when they
-// are called, answer what the test set, and the mapping stage of holdRef
-// tells held and waits for release.
+// are called, answer what the test set (the ref-updated stage fails with
+// fail when it is set), and the mapping stage of holdRef tells held and
+// waits for release.
 type stages struct {
+	t *testing.T
 	w *world
 
 	mu      sync.Mutex
 	refusal string
 	session *string
 	lines   []string
-	options [][]string
+	fail    error
 	mapped  int
 	seen    []string
 
@@ -46,7 +49,6 @@ type stages struct {
 func (s *stages) CheckOptions(_ context.Context, in gitserver.OptionsInput) (gitserver.OptionsAnswer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.options = append(s.options, in.Options)
 	stored := len(gitrepotest.Quarantines(s.w.repo)) > 0 || readable(s.w.repo, in.Updates[0].After)
 	s.seen = append(s.seen, fmt.Sprintf("options %q, pack stored %t", in.Options, stored))
 	return gitserver.OptionsAnswer{Refusal: s.refusal, SessionID: s.session}, nil
@@ -57,7 +59,7 @@ func (s *stages) MapPush(_ context.Context, in gitserver.MappingInput) []string 
 	s.mapped++
 	u := in.Updates[0]
 	at, _ := gitrepotest.Run(s.w.repo, "", "rev-parse", "--verify", "--quiet", u.Ref)
-	s.seen = append(s.seen, fmt.Sprintf("mapping %s at %s, direct %t, version %+v, events at %d", u.Ref, at, u.Direct, u.Version, s.w.lastSeq()))
+	s.seen = append(s.seen, fmt.Sprintf("mapping %s at %s, direct %t, version %+v, events at %d", u.Ref, at, u.Direct, u.Version, s.w.lastSeq(s.t)))
 	lines, hold := s.lines, u.Ref == s.holdRef
 	s.mu.Unlock()
 	if hold {
@@ -74,8 +76,8 @@ func (s *stages) refUpdated(_ context.Context, _ *sql.Tx, in pushrule.StageInput
 	if in.SessionID != nil {
 		session = *in.SessionID
 	}
-	s.seen = append(s.seen, "ref-updated, session "+session)
-	return []*pushrule.Version{{WorkspaceSlug: "demo", Number: 1, Version: 1}}, nil
+	s.seen = append(s.seen, fmt.Sprintf("ref-updated, session %s, pushed commit readable %t", session, readable(s.w.repo, in.Updates[0].After)))
+	return []*pushrule.Version{{WorkspaceSlug: "demo", Number: 1, Version: 1}}, s.fail
 }
 
 // take returns what the stages saw since the last take and forgets it.
@@ -90,7 +92,7 @@ func (s *stages) take() []string {
 // newStagedWorld is newGitWorld with the stages registered on its hub.
 func newStagedWorld(t *testing.T) (*world, *stages) {
 	t.Helper()
-	s := &stages{held: make(chan struct{}), release: make(chan struct{})}
+	s := &stages{t: t, held: make(chan struct{}), release: make(chan struct{})}
 	s.w = newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
 		c.Receiver().RegisterOptionsStage(s)
 		c.Receiver().RegisterMappingStage(s)
@@ -194,7 +196,7 @@ func TestReceive_RefusesTheWholePushAndKeepsNoObjectWhenOneRefIsRefused(t *testi
 			w.set(t, "demo", "settings", c.settings)
 			ok := command{zero, w.commit(t, w.head, fmt.Sprint("ok ", i)), "refs/heads/ok"}
 			cmds := []command{c.offending, ok}
-			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq()
+			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
 			a := w.receive(t, "acme/demo.git", c.credential, receiveRequest(fullCaps, cmds, nil, w.packFor(t, cmds)))
 			got := parseReport(a.body)
 			want := []string{"unpack ok", "ng " + c.offending.ref + " " + c.message, "ng refs/heads/ok not updated: another ref in this push was refused"}
@@ -212,10 +214,31 @@ func TestReceive_RefusesTheWholePushAndKeepsNoObjectWhenOneRefIsRefused(t *testi
 					t.Errorf("the pushed commit %s is readable in the repository", cmd.new)
 				}
 			}
-			if q, seen := gitrepotest.Quarantines(w.repo), s.take(); len(q) != 0 || w.lastSeq() != seq || len(seen) != 1 {
-				t.Errorf("quarantines %v, events %d -> %d, stages saw %q: want none left, no event, only the options stage", q, seq, w.lastSeq(), seen)
+			if q, seen := gitrepotest.Quarantines(w.repo), s.take(); len(q) != 0 || w.lastSeq(t) != seq || len(seen) != 1 {
+				t.Errorf("quarantines %v, events %d -> %d, stages saw %q: want none left, no event, only the options stage", q, seq, w.lastSeq(t), seen)
 			}
 		})
+	}
+}
+
+// A push stopped after its objects moved into the repository, where the
+// ref-updated stages read them, takes them out again.
+func TestReceive_KeepsNoObjectOfAPushStoppedAfterItsObjectsMovedIn(t *testing.T) {
+	t.Parallel()
+	w, s := newStagedWorld(t)
+	s.fail = errors.New("stage failed")
+	pushed := w.commit(t, w.head, "stopped")
+	cmds := []command{{zero, pushed, "refs/heads/stopped"}}
+	refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
+	got := parseReport(w.receive(t, "acme/demo.git", w.ownerKey, receiveRequest(fullCaps, cmds, nil, w.packFor(t, cmds))).body)
+	if want := []string{"unpack ok", "ng refs/heads/stopped internal error; try again"}; !slices.Equal(got.lines, want) {
+		t.Errorf("report = %q, want %q", got.lines, want)
+	}
+	if seen, want := s.take(), "ref-updated, session none, pushed commit readable true"; len(seen) != 2 || seen[1] != want {
+		t.Errorf("the stages saw %q, want the options stage, then %q", seen, want)
+	}
+	if readable(w.repo, pushed) || len(gitrepotest.Quarantines(w.repo)) != 0 || gitrepotest.Git(t, w.repo, "for-each-ref") != refs || w.lastSeq(t) != seq {
+		t.Error("a push stopped by its ref-updated stage left its commit readable or a quarantine, moved a ref or wrote an event")
 	}
 }
 
@@ -227,7 +250,7 @@ func TestReceive_RunsTheOptionsStageBeforeThePackAndTheMappingStageAfterTheRefs(
 	caps := append(slices.Clone(fullCaps), "push-options")
 	feat := w.commit(t, w.head, "feat")
 	cmds := []command{{zero, feat, "refs/heads/feat"}}
-	seq := w.lastSeq()
+	seq := w.lastSeq(t)
 	a := w.receive(t, "acme/demo.git", w.ownerKey, receiveRequest(caps, cmds, []string{"parley.change", "x=y"}, w.packFor(t, cmds)))
 	got := parseReport(a.body)
 	if want := []string{"unpack ok", "ok refs/heads/feat"}; !slices.Equal(got.lines, want) || !strings.Contains(got.text, line+"\n") {
@@ -235,7 +258,7 @@ func TestReceive_RunsTheOptionsStageBeforeThePackAndTheMappingStageAfterTheRefs(
 	}
 	want := []string{
 		`options ["parley.change" "x=y"], pack stored false`,
-		"ref-updated, session " + session,
+		"ref-updated, session " + session + ", pushed commit readable true",
 		fmt.Sprintf("mapping refs/heads/feat at %s, direct false, version &{WorkspaceSlug:demo Number:1 Version:1}, events at %d", feat, seq),
 	}
 	if seen := s.take(); !slices.Equal(seen, want) {
@@ -246,12 +269,12 @@ func TestReceive_RunsTheOptionsStageBeforeThePackAndTheMappingStageAfterTheRefs(
 	s.refusal = refusal
 	refused := w.commit(t, w.head, "refused")
 	cmds = []command{{zero, refused, "refs/heads/refused"}}
-	refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq()
+	refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
 	got = parseReport(w.receive(t, "acme/demo.git", w.ownerKey, receiveRequest(caps, cmds, []string{"parley.nope"}, w.packFor(t, cmds))).body)
 	if want := []string{"unpack ok", "ng refs/heads/refused " + refusal}; !slices.Equal(got.lines, want) || got.text != "error: "+refusal+"\n" {
 		t.Errorf("report = %q side band %q, want %q and the one line error: %s", got.lines, got.text, want, refusal)
 	}
-	if readable(w.repo, refused) || len(gitrepotest.Quarantines(w.repo)) != 0 || gitrepotest.Git(t, w.repo, "for-each-ref") != refs || w.lastSeq() != seq {
+	if readable(w.repo, refused) || len(gitrepotest.Quarantines(w.repo)) != 0 || gitrepotest.Git(t, w.repo, "for-each-ref") != refs || w.lastSeq(t) != seq {
 		t.Error("a push the options stage refused stored an object, left a quarantine, moved a ref or wrote an event")
 	}
 	if seen := s.take(); len(seen) != 1 {
@@ -274,13 +297,13 @@ func TestReceive_FailsAPushWhosePackCannotBeRead(t *testing.T) {
 		{"no pack at all", ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq()
+			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
 			a := w.receive(t, "acme/demo.git", w.ownerKey, receiveRequest(fullCaps, cmds, nil, c.pack))
 			if got, want := parseReport(a.body).lines, []string{"unpack invalid pack", "ng refs/heads/feat unpacker error"}; a.status != http.StatusOK || !slices.Equal(got, want) {
 				t.Errorf("answer = %d %q, want 200 %q", a.status, got, want)
 			}
 			if gitrepotest.Git(t, w.repo, "for-each-ref") != refs || readable(w.repo, feat) || readable(w.repo, other) ||
-				len(gitrepotest.Quarantines(w.repo)) != 0 || w.lastSeq() != seq {
+				len(gitrepotest.Quarantines(w.repo)) != 0 || w.lastSeq(t) != seq {
 				t.Error("a push whose pack failed moved a ref, stored an object, left a quarantine or wrote an event")
 			}
 		})
@@ -290,12 +313,12 @@ func TestReceive_FailsAPushWhosePackCannotBeRead(t *testing.T) {
 func TestReceive_AnswersAPushWithoutCommandsWithAnEmptyBody(t *testing.T) {
 	t.Parallel()
 	w, s := newStagedWorld(t)
-	refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq()
+	refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
 	a := w.receive(t, "acme/demo.git", w.ownerKey, "0000")
 	if a.status != http.StatusOK || a.header.Get("Content-Type") != resultType || a.body != "" {
 		t.Errorf("answer = %d %q %q, want 200 %s and no body", a.status, a.header.Get("Content-Type"), a.body, resultType)
 	}
-	if gitrepotest.Git(t, w.repo, "for-each-ref") != refs || w.lastSeq() != seq || len(s.take()) != 0 {
+	if gitrepotest.Git(t, w.repo, "for-each-ref") != refs || w.lastSeq(t) != seq || len(s.take()) != 0 {
 		t.Error("a push without commands moved a ref, wrote an event or ran a stage")
 	}
 }

@@ -51,9 +51,11 @@ a package-level registry:
   `Receiver.Bind(ReceiverDeps)` in a start hook.
 
 Registration is safe from several goroutines and happens while the hub is
-composed, before any request. A call takes the registered collaborators
-once, at its start, and calls them for the whole request. The zero values
-are valid: with nothing registered, the engine refuses a `carry_patch`
+composed, before any request. Each call of the engine, the writer or the
+processor (`Evaluate`, `Apply`, `Finish`, a push) takes the collaborators
+registered then once, at its own start, and calls them for the rest of
+that call: `Finish` takes the post-push listeners when it starts, not
+when `Apply` did. The zero values are valid: with nothing registered, the engine refuses a `carry_patch`
 workspace's updates as internal rather than allowing them, and the writer
 runs no stage, records no activity and tells no listener, and the
 processor accepts every

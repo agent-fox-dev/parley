@@ -176,8 +176,8 @@ func (c *controller) counts() (asked, forwarded int) {
 var errInjected = errors.New("injected failure")
 
 // view is a repository view that fails the question named by fails
-// ("IsAncestor", "NewCommits" or "ChangedPaths") and counts the questions
-// about commits it is asked.
+// ("IsAncestor", "NewCommits", "ChangedPaths" or "ObjectPaths") and counts
+// the questions about commits and objects it is asked.
 type view struct {
 	pushrule.View
 	fails string
@@ -205,6 +205,13 @@ func (v *view) ChangedPaths(ctx context.Context, commit string) ([]string, error
 		return nil, errInjected
 	}
 	return v.View.ChangedPaths(ctx, commit)
+}
+
+func (v *view) ObjectPaths(ctx context.Context, id string) (string, []string, error) {
+	if v.count("ObjectPaths") {
+		return "", nil, errInjected
+	}
+	return v.View.ObjectPaths(ctx, id)
 }
 
 // count counts a question about commits and reports whether it fails.

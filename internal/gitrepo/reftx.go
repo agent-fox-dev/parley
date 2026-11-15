@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -70,7 +71,12 @@ func (r *Repo) PrepareRefs(ctx context.Context, updates []RefUpdate) (*RefTx, er
 	if err != nil {
 		return nil, err
 	}
-	cmd := r.g.command(context.WithoutCancel(ctx), home, access{}, []string{"--git-dir=" + r.dir, "update-ref", "--stdin"})
+	// A transaction that deletes a packed ref holds the packed refs' lock
+	// until it ends, and git waits one second for that lock by default:
+	// waiting longer has a transaction deleting another packed ref wait for
+	// the first one's commit rather than fail.
+	cmd := r.g.command(context.WithoutCancel(ctx), home, access{},
+		[]string{"-c", "core.packedRefsTimeout=" + packedRefsTimeout, "--git-dir=" + r.dir, "update-ref", "--stdin"})
 	t := &RefTx{cmd: cmd, stderr: &limitedBuffer{limit: stderrLimit}, home: home}
 	cmd.Stderr = t.stderr
 	if t.stdin, err = cmd.StdinPipe(); err == nil {
@@ -140,6 +146,10 @@ func refScript(updates []RefUpdate) (string, error) {
 	return b.String(), nil
 }
 
+// packedRefsTimeout is how long, in milliseconds, a ref transaction waits
+// for the lock of the packed refs that another transaction holds.
+const packedRefsTimeout = "10000"
+
 // lockedRef finds the ref a failed prepare names in git's message.
 var lockedRef = regexp.MustCompile(`cannot lock ref '([^']+)'`)
 
@@ -147,8 +157,10 @@ var lockedRef = regexp.MustCompile(`cannot lock ref '([^']+)'`)
 // read again rather than git's message matched, whose wording changes
 // between versions: the first update whose ref is not as it expects moved.
 // A ref no expectation fails was held by another writer when git's message
-// says its lock exists, and in the way of another ref's name when the
-// update creates it and such a ref exists.
+// says that ref's lock exists, and in the way of another ref's name when
+// the update creates it and such a ref exists. A lock held on no ref of
+// the transaction, such as that of the packed refs past the wait, moved no
+// ref: it is git's error.
 func (r *Repo) refTxFailure(ctx context.Context, updates []RefUpdate, err error) error {
 	refs := make([]string, len(updates))
 	for i, u := range updates {
@@ -164,11 +176,10 @@ func (r *Repo) refTxFailure(ctx context.Context, updates []RefUpdate, err error)
 		}
 	}
 	if strings.Contains(err.Error(), ".lock': File exists") {
-		ref := updates[0].Ref
-		if m := lockedRef.FindStringSubmatch(err.Error()); m != nil {
-			ref = m[1]
+		if m := lockedRef.FindStringSubmatch(err.Error()); m != nil && slices.Contains(refs, m[1]) {
+			return &RefError{Ref: m[1], Err: ErrRefMoved}
 		}
-		return &RefError{Ref: ref, Err: ErrRefMoved}
+		return err
 	}
 	for _, u := range updates {
 		if u.Old != "" {

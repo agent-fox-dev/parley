@@ -2,8 +2,10 @@ package gitrepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,11 +17,13 @@ import (
 // that moving its files into the repository is a rename on one file
 // system. git reads the repository's objects from it, and the repository
 // never reads its objects until Migrate moves them in, so a push that is
-// refused leaves nothing readable behind once Discard removed it.
+// refused leaves nothing readable behind once Discard removed it, nor one
+// stopped after Migrate once Unmigrate took them out again.
 type Quarantine struct {
-	repo *Repo
-	dir  string
-	view *Repo
+	repo     *Repo
+	dir      string
+	view     *Repo
+	migrated []string // the files Migrate added to the repository
 }
 
 // NewQuarantine makes an empty quarantine in the repository.
@@ -69,7 +73,10 @@ func (q *Quarantine) Receive(ctx context.Context, pack io.Reader) error {
 
 // Migrate moves every object of the quarantine into the repository: the
 // files of each pack, its index last, since the index is what makes git
-// read a pack, and any loose object.
+// read a pack, and any loose object. A file the repository already has,
+// which has the same content since objects and packs are named for it, is
+// left as it is. Migrate notes the files it adds, which Unmigrate removes
+// again.
 func (q *Quarantine) Migrate() error {
 	entries, err := os.ReadDir(q.dir)
 	if err != nil {
@@ -91,10 +98,55 @@ func (q *Quarantine) Migrate() error {
 			return fmt.Errorf("migrate the quarantine: %w", err)
 		}
 		for _, f := range files {
-			if err := os.Rename(filepath.Join(q.dir, e.Name(), f.Name()), filepath.Join(dst, f.Name())); err != nil {
+			added, err := moveIn(filepath.Join(q.dir, e.Name(), f.Name()), filepath.Join(dst, f.Name()))
+			if added {
+				q.migrated = append(q.migrated, filepath.Join(dst, f.Name()))
+			}
+			if err != nil {
 				return fmt.Errorf("migrate the quarantine: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+// moveIn moves the file src to dst unless dst exists, and reports whether
+// it added dst. A hard link cannot replace a file another push added
+// meanwhile, as a rename would; a file system without hard links has the
+// file renamed.
+func moveIn(src, dst string) (added bool, err error) {
+	err = os.Link(src, dst)
+	switch {
+	case err == nil:
+		return true, os.Remove(src)
+	case errors.Is(err, fs.ErrExist):
+		return false, nil
+	}
+	if _, statErr := os.Lstat(dst); statErr == nil {
+		return false, nil
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Unmigrate removes from the repository every file Migrate added, each
+// pack's index first, so that a push stopped once its objects were moved
+// in leaves none of them readable. It does nothing when Migrate added
+// nothing.
+func (q *Quarantine) Unmigrate() error {
+	files := slices.Clone(q.migrated)
+	slices.SortStableFunc(files, func(a, b string) int { return indexLast(b) - indexLast(a) })
+	var errs []error
+	for _, f := range files {
+		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	q.migrated = nil
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("take the quarantine's objects out again: %w", err)
 	}
 	return nil
 }

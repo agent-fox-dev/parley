@@ -88,6 +88,10 @@ type View interface {
 	// first parent, every path of its tree for a root commit, and both
 	// paths of a rename.
 	ChangedPaths(ctx context.Context, commit string) ([]string, error)
+	// ObjectPaths peels id through any tags and reports what it reaches,
+	// "commit", "tree" or "blob", and for a tree every path in it, in byte
+	// order.
+	ObjectPaths(ctx context.Context, id string) (kind string, paths []string, err error)
 }
 
 // Request is one write to evaluate: the updates, in the order the caller

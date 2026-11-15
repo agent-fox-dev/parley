@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -39,6 +40,15 @@ func TestEvaluate_HoldsAPathScopedTokenToItsPathsInEveryNewCommit(t *testing.T) 
 	keep := func(ref, id string) string { gitrepotest.Git(t, r.dir, "update-ref", ref, id); return id }
 	push := func(us ...pushrule.Update) pushrule.Request { return pushrule.Request{Updates: us} }
 	feat := func(after string) pushrule.Request { return push(move("refs/heads/feat", r.head, after)) }
+	tree := func(commit string) string { return gitrepotest.Git(t, r.dir, "rev-parse", commit+"^{tree}") }
+	blob := gitrepotest.Git(t, r.dir, "rev-parse", c(nil, "M docs/blob.md")+":docs/blob.md")
+	tag := func(kind, id string) string {
+		out, err := gitrepotest.Run(r.dir, "object "+id+"\ntype "+kind+"\ntag x\ntagger P <p@example.invalid> 0 +0000\n\nx\n", "mktag")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out)
+	}
 	for _, tc := range []struct {
 		name string
 		req  func() pushrule.Request
@@ -80,6 +90,15 @@ func TestEvaluate_HoldsAPathScopedTokenToItsPathsInEveryNewCommit(t *testing.T) 
 			tag := unreferenced(t, r.dir, "refs/tags/tmp", "tag tmp\nfrom "+c(h, "M src/t.go")+"\ntagger P <p@example.invalid> now\ndata 0\n")
 			return push(create("refs/tags/v1", tag))
 		}, []string{"src/t.go"}},
+		{"a tree outside the paths", func() pushrule.Request {
+			return push(create("refs/tags/t", tree(c(nil, "M docs/a.md", "M src/x.go"))))
+		}, []string{"src/x.go"}},
+		{"a tree inside the paths", func() pushrule.Request { return push(create("refs/heads/t", tree(c(nil, "M docs/a.md")))) }, []string{""}},
+		{"an annotated tag of a tree", func() pushrule.Request {
+			return push(create("refs/custom/t", tag("tree", tree(c(nil, "M lib/y.go")))))
+		}, []string{"lib/y.go"}},
+		{"a blob", func() pushrule.Request { return push(create("refs/custom/b", blob)) }, []string{"refs/custom/b"}},
+		{"an annotated tag of a blob", func() pushrule.Request { return push(create("refs/tags/b", tag("blob", blob))) }, []string{"refs/tags/b"}},
 		{"a notes commit", func() pushrule.Request { return push(create("refs/notes/commits", c(nil, "M "+r.head))) }, []string{r.head}},
 		{"a delete", func() pushrule.Request { return push(remove("refs/heads/feat", r.head)) }, []string{""}},
 		{"a fast-forward to a commit another branch reaches", func() pushrule.Request {

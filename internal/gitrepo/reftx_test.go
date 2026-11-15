@@ -6,6 +6,7 @@ import (
 	"maps"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -125,5 +126,37 @@ func TestPrepareRefs_ReadsTheNewObjectsOfAQuarantine(t *testing.T) {
 	}
 	if got := gitrepotest.Git(t, repo.Dir(), "rev-parse", "main"); got != c3 {
 		t.Errorf("main = %s, want %s", got, c3)
+	}
+}
+
+// Deleting a packed ref locks the packed refs until the transaction ends,
+// so a transaction deleting another packed ref waits for it rather than
+// failing as though its ref had moved.
+func TestPrepareRefs_WaitsForAnotherTransactionThatDeletesAPackedRef(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo, c1, c2, _ := threeCommits(t)
+	gitrepotest.Git(t, repo.Dir(), "update-ref", "refs/heads/a", c1)
+	gitrepotest.Git(t, repo.Dir(), "update-ref", "refs/heads/b", c2)
+	gitrepotest.Git(t, repo.Dir(), "pack-refs", "--all")
+	held, err := repo.PrepareRefs(ctx, []gitrepo.RefUpdate{{Ref: "refs/heads/a", Old: c1}})
+	if err != nil {
+		t.Fatalf("the held transaction: %v", err)
+	}
+	// Longer than git's default wait of one second for the lock.
+	committed := make(chan error, 1)
+	time.AfterFunc(1500*time.Millisecond, func() { committed <- held.Commit() })
+	tx, err := repo.PrepareRefs(ctx, []gitrepo.RefUpdate{{Ref: "refs/heads/b", Old: c2}})
+	if err != nil {
+		t.Fatalf("PrepareRefs while another transaction deletes a packed ref = %v, want it prepared once that one ends", err)
+	}
+	if err := <-committed; err != nil {
+		t.Fatalf("the held transaction's Commit = %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit = %v", err)
+	}
+	if got := gitrepotest.Refs(t, repo.Dir(), "refs/heads/"); got["a"] != "" || got["b"] != "" {
+		t.Errorf("refs = %v, want a and b deleted", got)
 	}
 }

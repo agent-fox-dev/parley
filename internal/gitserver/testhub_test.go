@@ -722,10 +722,14 @@ func readable(dir, id string) bool {
 	return err == nil
 }
 
-// lastSeq is the seq of the newest event of the hub's event log.
-func (w *world) lastSeq() int64 {
+// lastSeq is the seq of the newest event of the hub's event log; a log
+// that cannot be read fails the test. It may be called from a goroutine of
+// the hub's.
+func (w *world) lastSeq(t testing.TB) int64 {
+	t.Helper()
 	_, seq, err := w.events.ReadAfter(context.Background(), 0, 10000)
 	if err != nil {
+		t.Errorf("read the event log: %v", err)
 		return -1
 	}
 	return seq

@@ -144,16 +144,28 @@ lost; forwards to origin that already ran are left as they are, as for a
 later failed forward. A writer bound without an event log keeps no
 journal and writes no event.
 
-## Reconcile drops an entry whose refs hold neither value
+## Reconcile writes the events of a committed entry whatever its refs hold
 
 The package has the start-up reconciliation write the events of an entry
 whose refs hold their after values and drop one whose refs were never
-written. An entry with a ref that holds neither its before nor its after
-value, which only another writer can cause after the request was
-refused, is dropped without events as well, and logged as a warning. An
-entry whose repository cannot be opened or read, or whose transaction
-fails, is logged and kept for the next start rather than failing the
-start; the start fails only when the journal itself cannot be read.
+written. Reading the refs alone cannot tell an entry whose request moved
+its refs, whose `Finish` then failed while the hub served on, and whose
+refs a later accepted push moved again, from one that never moved them;
+that request's events would be lost. The journal entry is therefore
+marked `committed` inside the store transaction the ref-updated stages
+run in, which commits right after the refs move, and Reconcile writes the
+events of a committed entry and removes it whatever its refs hold now.
+An entry not marked keeps the rule of the package: its refs all at their
+after values mean the hub stopped between the commit of the refs and that
+of the store (the gap the package accepts), and its events are written;
+otherwise it is removed without events. A ref of an unmarked entry that
+holds neither its before nor its after value can then only have been
+moved by another writer after the request was refused (or, in that gap,
+by a writer outside the hub before it started again); the entry is
+removed without events as well, and logged as a warning. An entry whose
+repository cannot be opened or read, or whose transaction fails, is
+logged and kept for the next start rather than failing the start; the
+start fails only when the journal itself cannot be read.
 
 ## A push's `[git].timeout` runs from its arrival to the preparation of its ref transaction
 
@@ -185,3 +197,52 @@ discard it, after the options stage has refused the push or for a push of
 deletes only, which is then answered as before. The key is a string, like
 `[server].max_body_size`: `"0"`, a whole number of bytes, or a whole number
 followed by `KB`, `MB` or `GB`.
+
+## A path-scoped token is held to the trees and blobs a ref is pointed at
+
+The package holds a path-scoped token to the commits a request adds and
+to the files of a version an update without new commits makes. A ref
+other than a branch may also be pointed at a tree, a blob, or an
+annotated tag of one, which adds no commit and makes no version; such an
+update would bring files outside the token's paths into the repository
+unchecked. An update that adds no commit is therefore held by what its
+after value reaches through any tags (`View.ObjectPaths`): a commit as
+before, by the files of its version; a tree by every path in it, as the
+tree of a root commit is; and a blob, which has no path the token's
+globs could allow, is refused for every path-scoped token with
+`path_not_allowed`, the ref's name as the path:
+`path <ref> is outside this token's allowed paths`. Refusing it as
+`internal` would tell the client to try again, which can never succeed.
+
+## A push stopped after its objects moved in has them taken out again
+
+The package moves a push's quarantined objects into the repository once
+the refs are locked, before the stages run, so that the stages read them,
+and says a refused push leaves none of its objects behind. A request that
+stops after that move (the store transaction cannot begin, a stage
+fails, the refs cannot be committed) moves no ref, and its objects would
+stay in `objects/pack`. `Quarantine.Migrate` therefore notes the files it
+adds, and `Quarantine.Unmigrate` removes them again, each pack's index
+first; `Writer.Apply` runs it through the `ApplyRequest.AfterAbort` hook
+whenever the request stops with no ref moved after `BeforeCommit` ran.
+`Migrate` hard-links each file into place and leaves a file the
+repository already has as it is, so it never notes, nor `Unmigrate`
+removes, a pack that was there before. Two concurrent pushes whose packs
+are byte for byte the same share one file, and if the push that added it
+is stopped, the file goes; git names a pack for its content, so this
+needs two clients to build the same pack at once, and the hub accepts
+that.
+
+## A ref transaction waits for the packed refs, and a lock on no ref of it is git's error
+
+A transaction of `git update-ref` that deletes a packed ref holds the
+lock of `packed-refs` from its prepare to its end, and git waits one
+second for that lock by default, so a second transaction deleting another
+packed ref while the first runs its stages failed, and was answered as a
+moved ref on its first update, which never moved. `PrepareRefs` runs git
+with `core.packedRefsTimeout` at 10 seconds, so the second waits for the
+first to end. When the prepare still fails on a lock held on none of the
+transaction's refs, such as that of `packed-refs`, no ref moved, and the
+failure is git's error, which the ref writer answers as internal; only
+the lock of one of the transaction's own refs counts as a moved ref,
+naming that ref.

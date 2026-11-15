@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
@@ -23,8 +24,9 @@ type VersionFiles interface {
 
 // pathScoped holds a path-scoped token to its paths over the whole request,
 // once every update of it passed the other rules: no commit the request
-// adds to the repository, and no file of a version an update without new
-// commits makes, may touch a path that matches none of the token's globs.
+// adds to the repository, no file of a version an update without new
+// commits makes, and no file of a tree an update points a ref at, may touch
+// a path that matches none of the token's globs.
 // It refuses the first update in command order that reaches the first such
 // path, commits taken oldest first and paths in byte order, so that the
 // same push is always refused with the same path. Any other caller is held
@@ -97,12 +99,31 @@ func (ev *evaluation) pathScoped(ctx context.Context, ds []Decision) {
 	}
 	for _, i := range pending {
 		if adds[i] == 0 {
-			if no := ev.versionFiles(ctx, ds[i].Update, globs); no != nil {
+			if no := ev.withoutNewCommits(ctx, ds[i].Update, globs); no != nil {
 				ds[i] = no.decision(ds[i].Update)
 				return
 			}
 		}
 	}
+}
+
+// withoutNewCommits holds u, an update that adds no commit, to globs by
+// what its after value reaches through any tags: a commit by the files of
+// the version the update makes, a tree by every path in it, as the tree of
+// a root commit is held. A blob has no path that globs could allow, so it
+// is refused, naming the ref it would be written to; so is anything else,
+// since what cannot be read cannot be held to the paths.
+func (ev *evaluation) withoutNewCommits(ctx context.Context, u Update, globs []string) *refusal {
+	kind, paths, err := ev.req.Repo.ObjectPaths(ctx, u.After)
+	switch {
+	case err != nil:
+		return internal
+	case kind == gitrepo.ObjectCommit:
+		return ev.versionFiles(ctx, u, globs)
+	case kind == gitrepo.ObjectTree:
+		return outside(globs, paths)
+	}
+	return &refusal{message: fmt.Sprintf(msgPathNotAllowed, u.Ref), errorType: ErrorTypePathNotAllowed, path: u.Ref}
 }
 
 // versionFiles holds u, an update that adds no commit, to globs through the

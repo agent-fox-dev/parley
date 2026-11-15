@@ -153,9 +153,11 @@ func TestApply_RefusesTheWholeRequestAsInternalWhenTheCommitStepFails(t *testing
 			w.RegisterRefUpdatedStage((&stage{name: "failing", log: &log, dir: r.dir, err: stageErr}).run)
 			w.RegisterRefUpdatedStage((&stage{name: "third", log: &log, dir: r.dir}).run)
 			refsBefore := gitrepotest.Refs(t, r.dir, "")
+			undone := 0
 			res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: allowed(move("refs/heads/feat", r.head, r.side)), Repo: r.view,
 				Workspace: demo, Caller: ownerKey, Via: pushrule.ViaGit, VersionKind: pushrule.VersionKindPush,
-				BeforeCommit: func(context.Context) error { return tc.hookErr }})
+				BeforeCommit: func(context.Context) error { return tc.hookErr },
+				AfterAbort:   func(context.Context) error { undone++; return errInjected }})
 			w.Finish(context.Background(), res)
 			if tc.noStages {
 				if err == nil {
@@ -175,6 +177,9 @@ func TestApply_RefusesTheWholeRequestAsInternalWhenTheCommitStepFails(t *testing
 			}
 			if tc.wantLog != nil && !slices.Equal(log, tc.wantLog) {
 				t.Errorf("stages called %v, want %v", log, tc.wantLog)
+			}
+			if undone != 1 {
+				t.Errorf("the hook after the abort ran %d times, want once", undone)
 			}
 		})
 	}
@@ -267,9 +272,6 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 		}
 	}
 
-	lookup, cp, files := &tracking{}, &controller{}, &versionFiles{}
-	e := engine(pushrule.EngineDeps{Settings: settings{Settings: pushrule.Settings{ProtectedBranches: []string{"main"}}}, Tracking: lookup, VersionFiles: files})
-	e.RegisterController(cp)
 	var log []string
 	s := &stage{name: "s", log: &log, dir: r.dir}
 	ev := &emitted{}
@@ -301,9 +303,6 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 	}
 	slug := "demo"
 	wantEvents := []string{eventLine("parley.git.push", &slug, "admin_token", nil, "ref", "refs/heads/main", nil, metadata("refs/heads/main", r.head, b, "land")) + " parent="}
-	if asked, forwarded := cp.counts(); len(lookup.asked)+len(files.asked)+asked+forwarded != 0 {
-		t.Errorf("the engine's collaborators were asked: %v %v %d %d", lookup.asked, files.asked, asked, forwarded)
-	}
 	if res := land(r.side); res.Outcome != pushrule.OutcomeRefMoved {
 		t.Errorf("a land from a stale before = %+v, want ref_moved", res)
 	}

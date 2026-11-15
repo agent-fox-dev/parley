@@ -99,8 +99,6 @@ func TestEvaluate_AnswersWithTheFirstRuleThatRefuses(t *testing.T) {
 			refused(patchMsg, "patch_branch"), 1},
 		{demoCP, []string{"main", "patch/*"}, memberKey, move("refs/heads/patch/a", r.base, r.head),
 			refused("patch/a is protected; push another branch and open a change (git push -o parley.change)", "protected_branch"), 0},
-		{demo, []string{"main"}, docsPAT, move("refs/heads/feat", r.head, src),
-			outcome{Message: "path src/a.go is outside this token's allowed paths", ErrorType: "path_not_allowed", Path: "src/a.go"}, 0},
 		{demoFk, []string{"main"}, docsPAT, move("refs/heads/dev", r.head, src),
 			refused("dev tracks the parent workspace and is read-only in this fork; push a new branch", "tracking_branch"), 0},
 	} {
@@ -137,6 +135,7 @@ func TestEvaluate_RefusesAsInternalWhatARuleCannotEvaluate(t *testing.T) {
 		{"version-files lookup fails", demo, pushrule.EngineDeps{Settings: none, VersionFiles: &versionFiles{err: errInjected}}, nil, "", docsPAT, ff},
 		{"new-commits question fails", demo, pushrule.EngineDeps{Settings: none}, nil, "NewCommits", docsPAT, added},
 		{"changed-paths question fails", demo, pushrule.EngineDeps{Settings: none}, nil, "ChangedPaths", docsPAT, added},
+		{"object question fails", demo, pushrule.EngineDeps{Settings: none}, nil, "ObjectPaths", docsPAT, ff},
 	} {
 		e := engine(tc.deps)
 		e.RegisterController(tc.controller)

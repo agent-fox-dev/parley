@@ -84,7 +84,7 @@ func TestPushEndToEnd_AgentPushesANewBranchThenForcePushesIt(t *testing.T) {
 	w := newGitWorld(t, hubtest.Config{})
 	pat, _ := w.pat(t, w.owner, "", "git:read", "git:write")
 	dir := w.cloneDemo(t, pat)
-	seq := w.lastSeq()
+	seq := w.lastSeq(t)
 
 	runGit(t, dir, "checkout", "--quiet", "-b", "fix-retry")
 	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", "retry")
@@ -120,7 +120,7 @@ func TestPushEndToEnd_AgentPushesANewBranchThenForcePushesIt(t *testing.T) {
 func TestPushEndToEnd_OwnerPushesTheProtectedBranchDirectlyAndIsRefusedWithABoundToken(t *testing.T) {
 	w := newGitWorld(t, hubtest.Config{})
 	dir := w.cloneDemo(t, w.ownerKey)
-	seq := w.lastSeq()
+	seq := w.lastSeq(t)
 
 	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", "direct")
 	direct := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
@@ -141,7 +141,7 @@ func TestPushEndToEnd_OwnerPushesTheProtectedBranchDirectlyAndIsRefusedWithABoun
 	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", "second")
 	second := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
 	runGit(t, dir, "branch", "feature-x")
-	refsBefore, seqBefore := gitrepotest.Refs(t, w.repo, "refs/"), w.lastSeq()
+	refsBefore, seqBefore := gitrepotest.Refs(t, w.repo, "refs/"), w.lastSeq(t)
 	out, err := clientGit(t, dir, nil, "push", "origin", "main", "feature-x")
 	if err == nil {
 		t.Fatalf("git push with the bound PAT succeeded, want it refused:\n%s", out)
@@ -161,7 +161,7 @@ func TestPushEndToEnd_OwnerPushesTheProtectedBranchDirectlyAndIsRefusedWithABoun
 	if out, err := clientGit(t, t.TempDir(), nil, "fetch", "--quiet", w.remote(w.ownerKey, "acme/demo.git"), second); err == nil {
 		t.Errorf("git fetch of the refused commit %s succeeded:\n%s", second, out)
 	}
-	if got := w.lastSeq(); got != seqBefore {
+	if got := w.lastSeq(t); got != seqBefore {
 		t.Errorf("the event log moved from %d to %d on a refused push", seqBefore, got)
 	}
 }
@@ -175,7 +175,7 @@ func TestPushEndToEnd_PathScopedTokenIsHeldToItsPaths(t *testing.T) {
 	}
 	token := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"git:read", "git:write"}, Paths: []string{"docs/**"}, CreatedAt: w.clock()})
 	dir := w.cloneDemo(t, token)
-	seq := w.lastSeq()
+	seq := w.lastSeq(t)
 
 	runGit(t, dir, "checkout", "--quiet", "-b", "docs-fix")
 	writeFiles(t, dir, map[string]string{"docs/guide.md": "# Guide, fixed\n", "src/main.go": "package main // fixed\n"})

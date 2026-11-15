@@ -108,7 +108,7 @@ func TestPushEvent_RecordsEveryAcceptedRefUpdate(t *testing.T) {
 			s.mu.Lock()
 			s.session = tc.session
 			s.mu.Unlock()
-			seq := w.lastSeq()
+			seq := w.lastSeq(t)
 			report := parseReport(w.receive(t, tc.repo, tc.credential, receiveRequest(fullCaps, tc.cmds, nil, w.packFor(t, tc.cmds))).body).lines
 			if report[0] != "unpack ok" || slices.ContainsFunc(report[1:], func(l string) bool { return !strings.HasPrefix(l, "ok ") }) {
 				t.Fatalf("report = %q, want every ref accepted", report)
@@ -135,7 +135,7 @@ func TestPushEvent_WritesTheEventsOfOneRequestInAdjacentPositions(t *testing.T) 
 		}
 		bodies[i] = receiveRequest(fullCaps, cmds, nil, w.packFor(t, cmds))
 	}
-	seq := w.lastSeq()
+	seq := w.lastSeq(t)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range n {

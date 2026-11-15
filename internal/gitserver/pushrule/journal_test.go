@@ -39,11 +39,12 @@ func TestApply_KeepsTheJournalEntryWhenTheEventsCannotBeWritten(t *testing.T) {
 	if len(got) == 1 {
 		want[0].ID = got[0].ID
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("journal = %+v, want %+v", got, want)
-	}
 	if !reflect.DeepEqual(duringCommit, want) {
-		t.Errorf("journal before the refs moved = %+v, want the entry", duringCommit)
+		t.Errorf("journal before the refs moved = %+v, want the entry, not committed", duringCommit)
+	}
+	want[0].Committed = true
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("journal = %+v, want %+v, committed with the refs", got, want)
 	}
 }
 
@@ -65,8 +66,12 @@ func TestReconcile_WritesTheEventsTheJournalOwesAndDropsTheRest(t *testing.T) {
 		Updates: []pushrule.JournalUpdate{{Ref: "refs/heads/gone", Before: r.head, After: pushrule.ZeroID, Deleted: true}}}
 	movedSince := pushrule.JournalEntry{Workspace: "demo", ActorType: "api_key", ActorID: "u-owner", Via: "land",
 		Updates: []pushrule.JournalUpdate{{Ref: "refs/heads/patch/a", Before: r.base, After: next}}}
+	// Written, its events not (Finish failed), and its ref moved by a later
+	// push while the hub served on.
+	committedMovedLater := pushrule.JournalEntry{Workspace: "demo", ActorType: "api_key", ActorID: "u-owner", Via: "git", Committed: true,
+		Updates: []pushrule.JournalUpdate{{Ref: "refs/heads/dev", Before: r.head, After: next}}}
 	if err := st.Tx(ctx, func(tx *sql.Tx) error {
-		for _, e := range []pushrule.JournalEntry{owed, neverWritten, deleted, movedSince} {
+		for _, e := range []pushrule.JournalEntry{owed, neverWritten, deleted, movedSince, committedMovedLater} {
 			if _, err := pushrule.InsertJournalEntry(ctx, tx, e); err != nil {
 				return err
 			}
@@ -77,6 +82,7 @@ func TestReconcile_WritesTheEventsTheJournalOwesAndDropsTheRest(t *testing.T) {
 	}
 	gitrepotest.Git(t, r.dir, "update-ref", "refs/heads/feat", next)
 	gitrepotest.Git(t, r.dir, "update-ref", "refs/heads/e1", next)
+	gitrepotest.Git(t, r.dir, "update-ref", "refs/heads/dev", r.side)
 
 	var w pushrule.Writer
 	w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: log, Repos: func(context.Context, string) (*gitrepo.Repo, error) { return r.view, nil }})
@@ -88,6 +94,7 @@ func TestReconcile_WritesTheEventsTheJournalOwesAndDropsTheRest(t *testing.T) {
 		eventLine("parley.git.push", &slug, "pat", &user, "ref", "refs/heads/feat", &session, metadata("refs/heads/feat", r.head, next, "git")),
 		eventLine("parley.git.push", &slug, "pat", &user, "ref", "refs/heads/e1", &session, metadata("refs/heads/e1", pushrule.ZeroID, next, "git", "created")),
 		eventLine("parley.git.push", &slug, "admin_token", nil, "ref", "refs/heads/gone", nil, metadata("refs/heads/gone", r.head, pushrule.ZeroID, "api", "deleted")),
+		eventLine("parley.git.push", &slug, "api_key", &user, "ref", "refs/heads/dev", nil, metadata("refs/heads/dev", r.head, next, "git")),
 	}
 	if got := logged(t, log); !slices.Equal(got, want) {
 		t.Errorf("events\n%q\nwant\n%q", got, want)

@@ -760,18 +760,21 @@ A push that passed every check gets its ref advertisement from
     refs (`refs/parley/ is maintained by the hub and cannot be pushed to`),
     protected branches (`<branch> is protected and cannot be force-pushed
     or deleted`, `<branch> is protected; push another branch and open a
-    change (git push -o parley.change)`; the workspace's owner or the admin
-    token may fast-forward one while `protect.owner_push` is true), the
-    default branch (`<branch> is the default branch and cannot be
-    deleted`), a fork's tracking branches (`<branch> tracks the parent
-    workspace and is read-only in this fork; push a new branch`), the
-    carry-patch controls and the paths of a path-scoped PAT (`path <path>
-    is outside this token's allowed paths`); one that cannot be decided is
-    refused with `internal error; try again`. The refs then move together
-    by compare-and-swap against the old values sent: a ref that moved
-    meanwhile is refused with `ref changed since it was read; fetch and try
-    again`, so of two pushes of one ref from one value exactly one goes
-    through.
+    change (git push -o parley.change)`; while `protect.owner_push` is
+    true, the workspace's owner or an admin may fast-forward one with an
+    API key, the admin token, or a PAT neither bound to a workspace nor
+    limited to paths), the default branch (`<branch> is the default branch
+    and cannot be deleted`), a fork's tracking branches (`<branch> tracks
+    the parent workspace and is read-only in this fork; push a new
+    branch`), the carry-patch controls and the paths of a path-scoped PAT
+    (`path <path> is outside this token's allowed paths`: every path a new
+    commit changes, every path of a tree a ref is pointed at, and, for a
+    blob a ref is pointed at, which has no path, the ref's name); one that
+    cannot be decided is refused with `internal error; try again`. The
+    refs then move together by compare-and-swap against the old values
+    sent: a ref that moved meanwhile is refused with `ref changed since it
+    was read; fetch and try again`, so of two pushes of one ref from one
+    value exactly one goes through.
   - The answer is `200` with
     `Content-Type: application/x-git-receive-pack-result` and
     `Cache-Control: no-cache`. With `report-status` (or
@@ -784,7 +787,8 @@ A push that passed every check gets its ref advertisement from
     which git shows as `remote: error: …`. Without `report-status` the
     answer has no report, and without `side-band-64k` no `error:` line.
   - A refused push leaves every ref as it was and none of its objects in
-    the repository.
+    the repository, also one refused after its objects were moved in
+    (a failing stage or store), which has them taken out again.
   - An accepted push writes one `parley.git.push` event per ref update, in
     command order, all in one transaction, so the events of one push are
     adjacent in the event log, before the answer is sent. A refused push,

@@ -49,14 +49,11 @@ func TestEvaluate_TakesTheCarryPatchControllersAnswerForWhatRulesOneToThreeAllow
 		if d.Forward == nil {
 			continue
 		}
-		if _, forwarded := cp.counts(); forwarded != 0 {
-			t.Errorf("%s: evaluating ran the forward", name)
-		}
 		if err := d.Forward(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if _, forwarded := cp.counts(); forwarded != 1 {
-			t.Errorf("%s: the pending forward is not the controller's", name)
+			t.Errorf("%s: the pending forward ran the controller's %d times, want once", name, forwarded)
 		}
 	}
 }

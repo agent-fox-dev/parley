@@ -75,16 +75,16 @@ func TestReceive_FailsAPushWhosePackIsLargerThanTheMaximumPushSize(t *testing.T)
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			w := newGitWorld(t, c.cfg)
-			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq()
+			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
 			a := w.receive(t, "acme/demo.git", w.ownerKey, receiveRequest(fullCaps, cmds, nil, pack))
 			if got := parseReport(a.body).lines; a.status != http.StatusOK || !slices.Equal(got, c.want) {
 				t.Errorf("answer = %d %q, want 200 %q", a.status, got, c.want)
 			}
 			applied := c.want[0] == "unpack ok"
 			moved := gitrepotest.Git(t, w.repo, "for-each-ref") != refs
-			if q := gitrepotest.Quarantines(w.repo); moved != applied || readable(w.repo, id) != applied || (w.lastSeq() != seq) != applied || len(q) != 0 {
+			if q := gitrepotest.Quarantines(w.repo); moved != applied || readable(w.repo, id) != applied || (w.lastSeq(t) != seq) != applied || len(q) != 0 {
 				t.Errorf("refs moved %t, commit readable %t, events %d -> %d, quarantines %v: want the push applied %t and no quarantine left",
-					moved, readable(w.repo, id), seq, w.lastSeq(), q, applied)
+					moved, readable(w.repo, id), seq, w.lastSeq(t), q, applied)
 			}
 		})
 	}
@@ -112,7 +112,7 @@ func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testi
 			cmds := []command{{zero, feat, "refs/heads/feat"}}
 			pack := w.packFor(t, cmds)
 			body := receiveRequest(caps, cmds, c.options, pack)
-			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq()
+			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
 			start := time.Now()
 			var got string
 			if c.stall {
@@ -126,7 +126,7 @@ func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testi
 			if lines, want := parseReport(got).lines, []string{"unpack push timed out", "ng refs/heads/feat unpacker error"}; !slices.Equal(lines, want) {
 				t.Errorf("report = %q, want %q", lines, want)
 			}
-			if gitrepotest.Git(t, w.repo, "for-each-ref") != refs || readable(w.repo, feat) || len(gitrepotest.Quarantines(w.repo)) != 0 || w.lastSeq() != seq {
+			if gitrepotest.Git(t, w.repo, "for-each-ref") != refs || readable(w.repo, feat) || len(gitrepotest.Quarantines(w.repo)) != 0 || w.lastSeq(t) != seq {
 				t.Error("a push that timed out moved a ref, stored an object, left a quarantine or wrote an event")
 			}
 		})

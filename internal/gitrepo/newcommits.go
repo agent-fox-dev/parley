@@ -2,6 +2,7 @@ package gitrepo
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 )
@@ -51,4 +52,41 @@ func (r *Repo) ChangedPaths(ctx context.Context, commit string) ([]string, error
 	}
 	slices.Sort(paths)
 	return slices.Compact(paths), nil
+}
+
+// The kinds of object ObjectPaths reports an id peels to.
+const (
+	ObjectCommit = "commit"
+	ObjectTree   = "tree"
+	ObjectBlob   = "blob"
+)
+
+// ObjectPaths peels id through any annotated tags to the object it reaches
+// and reports its kind, ObjectCommit, ObjectTree or ObjectBlob, and for a tree
+// every path of a file in it, at any depth, in byte order. An id that names
+// no object is an error.
+func (r *Repo) ObjectPaths(ctx context.Context, id string) (kind string, paths []string, err error) {
+	// A revision ^{} peels every tag; cat-file says what it reaches, or
+	// "missing".
+	out, err := r.g.runInput(ctx, access{}, []byte(id+"^{}\n"), "--git-dir="+r.dir, "cat-file", "--batch-check=%(objecttype)")
+	if err != nil {
+		return "", nil, err
+	}
+	switch kind = strings.TrimSpace(string(out)); kind {
+	case ObjectCommit, ObjectBlob:
+		return kind, nil, nil
+	case ObjectTree:
+	default:
+		return "", nil, fmt.Errorf("object %s: %s", id, kind)
+	}
+	out, err = r.git(ctx, "ls-tree", "-r", "-z", "--name-only", "--full-tree", id+"^{}")
+	if err != nil {
+		return "", nil, err
+	}
+	paths = strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	if len(out) == 0 {
+		paths = nil
+	}
+	slices.Sort(paths)
+	return kind, paths, nil
 }

@@ -214,7 +214,8 @@ func (run *push) process(ctx context.Context, body *packReader) (report, Result)
 	if err != nil {
 		return run.failed(ctx, "open the repository", err)
 	}
-	view, beforeCommit := repo, func(context.Context) error { return nil }
+	view := repo
+	var beforeCommit, afterAbort func(context.Context) error
 	if afters := run.afters(); len(afters) > 0 {
 		q, err := repo.NewQuarantine()
 		if err != nil {
@@ -232,7 +233,11 @@ func (run *push) process(ctx context.Context, body *packReader) (report, Result)
 			}
 			return failAll(run.updates, unpackInvalid, msgUnpackerErr), ResultError
 		}
-		view, beforeCommit = q.View(), func(context.Context) error { return q.Migrate() }
+		// A push stopped once its objects moved in takes them out again,
+		// so a refused push leaves none in the repository.
+		view = q.View()
+		beforeCommit = func(context.Context) error { return q.Migrate() }
+		afterAbort = func(context.Context) error { return q.Unmigrate() }
 	} else {
 		_, _ = io.Copy(io.Discard, body)
 	}
@@ -248,7 +253,7 @@ func (run *push) process(ctx context.Context, body *packReader) (report, Result)
 	// The ref writer stops at ctx's end only up to its ref transaction.
 	res, err := run.writer().Apply(ctx, pushrule.ApplyRequest{
 		Verdict: verdict, Repo: view, Workspace: pw, Caller: pc, SessionID: answer.SessionID,
-		Via: pushrule.ViaGit, VersionKind: pushrule.VersionKindPush, BeforeCommit: beforeCommit,
+		Via: pushrule.ViaGit, VersionKind: pushrule.VersionKindPush, BeforeCommit: beforeCommit, AfterAbort: afterAbort,
 	})
 	if res.Outcome == pushrule.OutcomeInternal && expired(ctx) {
 		return run.timedOut()

@@ -168,7 +168,10 @@ func (w *Writer) RegisterForkActivity(f ForkActivity) {
 // at their before values and before the stages run; a push moves its
 // quarantined objects into the repository there, once the refs are certain
 // to be at the values it was evaluated against. An error from it stops the
-// request as a stage's does.
+// request as a stage's does. AfterAbort, when set, runs when the request
+// stops with no ref moved after BeforeCommit ran, whether BeforeCommit
+// failed or a later step did; a push takes the objects it moved in out of
+// the repository again there. Its error is logged.
 type ApplyRequest struct {
 	Verdict          Verdict
 	Repo             *gitrepo.Repo
@@ -177,6 +180,7 @@ type ApplyRequest struct {
 	SessionID        *string
 	Via, VersionKind string
 	BeforeCommit     func(ctx context.Context) error
+	AfterAbort       func(ctx context.Context) error
 }
 
 // UpdateResult is what became of one update: its decision as the verdict
@@ -212,17 +216,18 @@ func (r Result) Refused() bool { return r.Outcome != OutcomeAccepted }
 // transaction, and the refs then move just before that transaction
 // commits. A ref not at its before value refuses the request with
 // OutcomeRefMoved; a failure of BeforeCommit or a stage aborts the
-// transaction and refuses every update as internal, and Apply returns that
-// error unchanged. A store commit that fails after the refs moved is
-// logged, and the request stays accepted. After an accepted request, the
-// head_sha of a repository whose default branch moved is set, and the
-// activity of a fork written through git or the API recorded.
+// transaction, runs AfterAbort and refuses every update as internal, and
+// Apply returns that error unchanged. A store commit that fails after the
+// refs moved is logged, and the request stays accepted. After an accepted
+// request, the head_sha of a repository whose default branch moved is set,
+// and the activity of a fork written through git or the API recorded.
 //
 // With an event log bound, the request is entered in the push journal, in
 // a store transaction of its own, after the forwards and before the refs
-// move, and the entry is removed when they do not; the caller then runs
-// Finish with the result of an accepted request, which writes its events
-// and removes the entry. Via must be ViaGit, ViaAPI or ViaLand: another
+// move; the entry is marked committed in the stages' store transaction,
+// which the refs move in, and removed when they do not; the caller then
+// runs Finish with the result of an accepted request, which writes its
+// events and removes the entry. Via must be ViaGit, ViaAPI or ViaLand: another
 // value is an error before anything is done.
 //
 // ctx bounds the request up to its ref transaction: the forwards, the
@@ -278,14 +283,30 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 			return res.internal(), err
 		}
 	}
-	// A request whose refs did not move owes no event.
+	res, err := writeRefs(ctx, deps, stages, logger, req, res, wr.entry.ID)
+	if res.Refused() {
+		return res, err
+	}
+	res.written = wr
+	w.afterWrite(context.WithoutCancel(ctx), logger, deps.Heads, forkActivity, req)
+	return res, nil
+}
+
+// writeRefs is the commit step of Apply for a request that passed its
+// forwards and was entered in the journal as journalID (0 for none): it
+// prepares the ref transaction, runs BeforeCommit, and has commit run the
+// stages and move the refs. A request whose refs do not move has its
+// journal entry removed, since it owes no event, and, once BeforeCommit
+// ran, AfterAbort run.
+func writeRefs(ctx context.Context, deps WriterDeps, stages []RefUpdatedStage, logger *slog.Logger,
+	req ApplyRequest, res Result, journalID int64) (Result, error) {
 	unjournal := func() {
-		if wr.entry.ID == 0 {
+		if journalID == 0 {
 			return
 		}
 		bg := context.WithoutCancel(ctx)
 		err := deps.Transact(bg, func(tx *sql.Tx) error {
-			_, err := deleteJournalEntry(bg, tx, wr.entry.ID)
+			_, err := deleteJournalEntry(bg, tx, journalID)
 			return err
 		})
 		if err != nil {
@@ -310,27 +331,31 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 	// a failure of its own, whatever ctx says, so that the end of the
 	// caller's time cannot leave it between the ref and the store commit.
 	ctx = context.WithoutCancel(ctx)
+	stop := func(err error) (Result, error) {
+		_ = tx.Abort()
+		if req.AfterAbort != nil {
+			if undoErr := req.AfterAbort(ctx); undoErr != nil {
+				logger.Error("push: what the hook before the commit did not undone", "workspace", req.Workspace.Slug, "error", undoErr)
+			}
+		}
+		unjournal()
+		return res.internal(), err
+	}
 	if req.BeforeCommit != nil {
 		if err := req.BeforeCommit(ctx); err != nil {
-			_ = tx.Abort()
-			unjournal()
-			return res.internal(), err
+			return stop(err)
 		}
 	}
 	in := StageInput{Workspace: req.Workspace, Caller: req.Caller, SessionID: req.SessionID, Via: req.Via, VersionKind: req.VersionKind, Updates: req.Verdict.Decisions}
-	moved, err := commit(ctx, deps.Transact, stages, tx, in, res.Updates)
+	moved, err := commit(ctx, deps.Transact, stages, tx, in, res.Updates, journalID)
 	if !moved {
-		_ = tx.Abort()
-		unjournal()
-		return res.internal(), err
+		return stop(err)
 	}
 	if err != nil {
 		logger.Error("push: refs written, store transaction of the ref-updated stages not committed",
 			"workspace", req.Workspace.Slug, "error", err)
 	}
 	res.Outcome = OutcomeAccepted
-	res.written = wr
-	w.afterWrite(ctx, logger, deps.Heads, forkActivity, req)
 	return res, nil
 }
 
@@ -379,12 +404,13 @@ func (r Result) forward(ctx context.Context, limit time.Duration, ds []Decision)
 
 // commit is the commit step of an accepted request whose ref transaction tx
 // is prepared: the stages run in one store transaction, in order, each
-// version they report going to the update result at its index, and the
-// refs move as the last step of that transaction. moved reports whether
-// the refs moved; when they did not, err is why, a stage's error
-// unchanged. When they did, err is the store's failure to commit.
+// version they report going to the update result at its index, the journal
+// entry journalID (0 for none) is marked committed, and the refs move as
+// the last step of that transaction. moved reports whether the refs moved;
+// when they did not, err is why, a stage's error unchanged. When they did,
+// err is the store's failure to commit.
 func commit(ctx context.Context, transact func(context.Context, func(*sql.Tx) error) error, stages []RefUpdatedStage,
-	tx *gitrepo.RefTx, in StageInput, results []UpdateResult) (moved bool, err error) {
+	tx *gitrepo.RefTx, in StageInput, results []UpdateResult, journalID int64) (moved bool, err error) {
 	if transact == nil {
 		if len(stages) > 0 {
 			return false, errors.New("apply: ref-updated stages but no store to run them in")
@@ -406,6 +432,13 @@ func commit(ctx context.Context, transact func(context.Context, func(*sql.Tx) er
 				if v != nil && i < len(results) && results[i].Version == nil {
 					results[i].Version = v
 				}
+			}
+		}
+		// Committed with the refs, the mark tells Reconcile the events are
+		// owed whatever the refs hold by then.
+		if journalID != 0 {
+			if err := markJournalEntryCommitted(ctx, sqlTx, journalID); err != nil {
+				return err
 			}
 		}
 		if err := tx.Commit(); err != nil {
