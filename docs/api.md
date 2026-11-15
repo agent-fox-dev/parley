@@ -3702,7 +3702,7 @@ answers `201` and the other `409` `change_exists`.
 | `403` `path_not_allowed` | a path-scoped token, and a file of the version matches none of its globs; `error.path` names the first such file in byte order |
 | `403` `token_bound` | a token bound to a task fork, on the fork's parent, with another `source.workspace_slug` or none |
 | `404` `not_found` | the caller cannot read `{slug}` |
-| `409` `change_exists` | another draft or open change has this source; `details` is `{"workspace_slug", "number", "ref"}` of that change |
+| `409` `change_exists` | another draft or open change has this source; the message names its ref, and `details` is `{"workspace_slug", "number", "ref"}` of that change |
 | `409` `workspace_busy` | the target or the source workspace is pending, cloning, or under a reclone, archive or delete |
 | `409` `workspace_not_ready` | the target or the source workspace failed its clone |
 | `409` `workspace_archived` | the target or the source workspace is archived |
@@ -3989,10 +3989,32 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   abandoned; without it, the dependant's `mergeable` becomes `unknown`
   and is checked again. `dependants` on a change that has none changes
   nothing.
-- `POST …/restore` takes no body and moves the change to `open` at its
-  last version with `mergeable` `unknown`, writing
-  `parley.change.restore` by the caller with `number`, `ref`, `version`
-  and `head_sha`, and schedules its mergeability check.
+- `POST …/restore` takes no body (one that is sent is ignored) and brings
+  an abandoned change back to `open` under its number. Its refusals come
+  in this order, the first that applies answering, and none changes
+  anything or creates a branch: a change that is `draft`, `open` or
+  `landed` is `409` `change_not_abandoned`; a change whose source
+  workspace, a task fork, no longer exists is `409`
+  `source_workspace_gone` (its version refs stay); another draft or open
+  change with the same source workspace and branch is `409`
+  `change_exists`, as an open answers it, the message naming that
+  change's ref; a source branch that no longer exists while the head
+  commit of the change's last version is gone from the source
+  workspace's repository too is `409` `conflict`; and an empty intent
+  while `{slug}`'s `changes.require_intent` is on is `400`
+  `intent_required`. A source branch that no longer exists while that
+  commit does is created at it, with a create-only ref update; a branch
+  that appeared in the meantime is taken at its head. The change moves
+  to `open` (a change that was a draft when abandoned too), its `landing`
+  is evaluated again, `mergeable` becomes `unknown` and is checked again,
+  and `parley.change.restore` is written by the caller with `number`,
+  `ref`, `version` and `head_sha` of the last version; no
+  `parley.change.open` is written. When the source branch is at another
+  commit than the last version's head, that commit is then recorded as a
+  new version of kind `ref`, created by the caller with their
+  credential, with its `parley.change.version`; the answer carries it as
+  `version` and `head_sha`. Of two restores of two changes with one
+  source, one is answered `200` and the other `409` `change_exists`.
 
 ## Mergeability
 

@@ -5,10 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -291,5 +293,252 @@ func TestAbandon_RefusesAnInvalidBody(t *testing.T) {
 		if ch := w.read(t, n); ch.State != change.StateOpen {
 			t.Errorf("after %v the change is %s, want open", body, ch.State)
 		}
+	}
+}
+
+// restore sends POST …/restore to the change number of demo with the
+// credential, and returns the status and the decoded answer.
+func (w *world) restore(t *testing.T, number int64, credential string) (int, map[string]any) {
+	t.Helper()
+	return w.send(t, http.MethodPost, "/workspaces/demo/changes/"+strconv.FormatInt(number, 10)+"/restore", credential, nil)
+}
+
+// abandonedTask opens in demo, by mia, a change from the new branch of
+// demo--t1, a draft when asked, records its version 2, abandons it, and
+// returns its number and the head of version 2.
+func (m *miaWorld) abandonedTask(t *testing.T, branch string, draft bool) (int64, string) {
+	t.Helper()
+	mia := change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+	one := commit(t, m.t1, branch, m.base, branch+"\n\nWhy.\n", map[string]string{branch + ".txt": "1\n"})
+	n := m.openBranch(t, branch, func(in *change.OpenInput) {
+		in.SourceWorkspace, in.Caller, in.Draft = "demo--t1", mia, draft
+	}).Number
+	head := commit(t, m.t1, branch, one, "Two\n", map[string]string{branch + ".txt": "2\n"})
+	m.mustRecord(t, change.VersionInput{Workspace: "demo--t1", Branch: branch, Head: head, Kind: change.KindPush, Caller: mia})
+	if status, out := m.abandon(t, n, m.miaKey, nil); status != http.StatusOK {
+		t.Fatalf("abandon demo#%d = %d %v", n, status, out)
+	}
+	return n, head
+}
+
+func TestRestore_ReopensTheChangeAtTheHeadOfItsSourceBranch(t *testing.T) {
+	t.Parallel()
+	m := newMiaWorld(t)
+	restored := []string{change.EventRestore}
+	for i, c := range []struct {
+		name  string
+		draft bool
+		// move changes the source branch, at last after the abandon, and
+		// returns the head it is to have after the restore.
+		move    func(t *testing.T, branch, last string) string
+		version int64
+		events  []string
+	}{
+		{"its branch at the last version", false, nil, 2, restored},
+		{"a draft when it was abandoned", true, nil, 2, restored},
+		{"its branch deleted", false, func(t *testing.T, branch, last string) string {
+			gitrepotest.Git(t, m.t1, "update-ref", "-d", "refs/heads/"+branch)
+			return last
+		}, 2, restored},
+		{"its branch moved on", false, func(t *testing.T, branch, last string) string {
+			return commit(t, m.t1, branch, last, "Three\n", map[string]string{branch + ".txt": "3\n"})
+		}, 3, []string{change.EventRestore, change.EventVersion}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := "r" + strconv.Itoa(i)
+			n, last := m.abandonedTask(t, branch, c.draft)
+			head := last
+			if c.move != nil {
+				head = c.move(t, branch, last)
+			}
+			// A fork activity recorder that fails changes nothing.
+			rec := &activity{fail: true}
+			m.changes.RegisterForkActivity(rec)
+			g := newGate()
+			t.Cleanup(g.release)
+			change.SetMergeableSeams(m.changes, change.MergeableSeams{Gate: g.pass})
+			seq := m.seq(t)
+			status, out := m.restore(t, n, m.miaKey)
+			landing, _ := out["landing"].(map[string]any)
+			if status != http.StatusOK || out["state"] != change.StateOpen || out["version"] != float64(c.version) ||
+				out["head_sha"] != head || out["mergeable"] != change.MergeableUnknown || landing["status"] != change.LandingReady {
+				t.Fatalf("restore = %d %v, want 200 open at version %d, %s, mergeable unknown and landing ready", status, out, c.version, head)
+			}
+			if got := gitrepotest.Refs(t, m.t1, "refs/heads/")[branch]; got != head {
+				t.Errorf("the source branch is at %q, want %s", got, head)
+			}
+			var types []string
+			for _, e := range m.eventsAfter(t, seq) {
+				types = append(types, e.Type)
+			}
+			if !slices.Equal(types, c.events) {
+				t.Errorf("events after the restore = %v, want %v", types, c.events)
+			}
+			events := m.changeEvents(t, seq, change.EventRestore, n)
+			want := map[string]any{"number": float64(n), "ref": change.Ref("demo", n), "version": float64(2), "head_sha": last}
+			if len(events) != 1 || events[0].ActorID == nil || *events[0].ActorID != m.mia || !reflect.DeepEqual(metadata(t, events[0]), want) {
+				t.Errorf("restore events = %+v, want one by mia with %v", events, want)
+			}
+			versions := m.versions(t, "demo", n)
+			if len(versions) != int(c.version) {
+				t.Fatalf("%d versions, want %d", len(versions), c.version)
+			}
+			if c.version == 3 {
+				var credential string
+				if err := m.Store.Main().QueryRow(`SELECT credential_type FROM change_versions WHERE workspace_slug = 'demo' AND number = ? AND version = 3`, n).
+					Scan(&credential); err != nil {
+					t.Fatal(err)
+				}
+				v := versions[2]
+				if by, _ := v["created_by"].(map[string]any); v["kind"] != change.KindRef || v["head_sha"] != head || by["actor_id"] != m.mia || credential != change.CredentialAPIKey {
+					t.Errorf("version 3 = %v with credential %q, want of kind ref at %s by mia with her API key", v, credential, head)
+				}
+			}
+			if got := rec.told(); !slices.Equal(got, []string{"demo--t1"}) {
+				t.Errorf("the fork activity recorder was told %v, want [demo--t1]", got)
+			}
+			g.release()
+			if ch := m.settled(t, n); ch.Mergeable != change.MergeableClean {
+				t.Errorf("mergeable = %s after the check, want clean", ch.Mergeable)
+			}
+		})
+	}
+}
+
+func TestRestore_RefusesAChangeThatIsNotAbandonedFirst(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	open, _, landed := closedChanges(t, w)
+	w.branch(t, "draft", "Draft\n\nWhy.\n")
+	draft := w.openBranch(t, "draft", func(in *change.OpenInput) { in.Draft = true }).Number
+	for _, n := range []int64{draft, open, landed} {
+		_, before := w.change(t, n)
+		seq := w.seq(t)
+		// An open or draft change has its own source, which the later
+		// check of another change with the source would refuse.
+		if status, out := w.restore(t, n, w.ownerKey); status != http.StatusConflict || errorType(out) != "change_not_abandoned" {
+			t.Errorf("restore of demo#%d = %d %v, want 409 change_not_abandoned", n, status, out)
+		}
+		if _, after := w.change(t, n); !bytes.Equal(after, before) {
+			t.Errorf("the refused restore changed demo#%d:\n%s\nwas\n%s", n, after, before)
+		}
+		if events := w.eventsAfter(t, seq); len(events) != 0 {
+			t.Errorf("the refused restore wrote %+v", events)
+		}
+	}
+}
+
+func TestRestore_RefusesAChangeWhoseForkIsGoneAndKeepsItsVersions(t *testing.T) {
+	t.Parallel()
+	m := newMiaWorld(t)
+	n, _ := m.abandonedTask(t, "task", false)
+	if status, out := m.send(t, http.MethodDelete, "/workspaces/demo--t1", m.Token, nil); status != http.StatusNoContent {
+		t.Fatalf("DELETE demo--t1 = %d %v, want 204", status, out)
+	}
+	if status, out := m.restore(t, n, m.ownerKey); status != http.StatusConflict || errorType(out) != "source_workspace_gone" {
+		t.Errorf("restore = %d %v, want 409 source_workspace_gone", status, out)
+	}
+	if ch := m.read(t, n); ch.State != change.StateAbandoned {
+		t.Errorf("the change is %s, want abandoned", ch.State)
+	}
+	refs := gitrepotest.Refs(t, m.demo, "refs/parley/changes/")
+	for _, v := range m.versions(t, "demo", n) {
+		if ref := strconv.FormatInt(n, 10) + "/" + strconv.FormatFloat(v["number"].(float64), 'f', 0, 64); refs[ref] != v["head_sha"] {
+			t.Errorf("refs/parley/changes/%s is at %q, want %v", ref, refs[ref], v["head_sha"])
+		}
+	}
+}
+
+func TestRestore_RefusesWhileAnotherChangeHasItsSource(t *testing.T) {
+	t.Parallel()
+	m := newMiaWorld(t)
+	first, _ := m.abandonedTask(t, "feat", false)
+	second := m.openBranch(t, "feat", func(in *change.OpenInput) {
+		in.SourceWorkspace, in.Caller = "demo--t1", change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+	}).Number
+	status, out := m.restore(t, first, m.miaKey)
+	if msg, _ := out["error"].(map[string]any)["message"].(string); status != http.StatusConflict || errorType(out) != "change_exists" ||
+		!strings.Contains(msg, change.Ref("demo", second)) {
+		t.Errorf("restore = %d %v, want 409 change_exists naming demo#%d", status, out, second)
+	}
+	if one, two := m.read(t, first), m.read(t, second); one.State != change.StateAbandoned || two.State != change.StateOpen {
+		t.Errorf("demo#%d is %s and demo#%d %s, want abandoned and open", first, one.State, second, two.State)
+	}
+	t.Run("two restores at once", func(t *testing.T) {
+		if status, out := m.abandon(t, second, m.ownerKey, nil); status != http.StatusOK {
+			t.Fatalf("abandon = %d %v", status, out)
+		}
+		var wg sync.WaitGroup
+		answers := make([]string, 2)
+		for i, n := range []int64{first, second} {
+			wg.Go(func() {
+				status, out := m.restore(t, n, m.ownerKey)
+				answers[i] = strconv.Itoa(status) + " " + fmt.Sprint(errorType(out))
+			})
+		}
+		wg.Wait()
+		if slices.Sort(answers); !slices.Equal(answers, []string{"200 <nil>", "409 change_exists"}) {
+			t.Errorf("the restores answered %v, want one 200 and one 409 change_exists", answers)
+		}
+	})
+}
+
+func TestRestore_RefusesWhenTheBranchAndTheLastVersionAreGone(t *testing.T) {
+	t.Parallel()
+	m := newMiaWorld(t)
+	n, head := m.abandonedTask(t, "task", false)
+	gitrepotest.Git(t, m.t1, "update-ref", "-d", "refs/heads/task")
+	// The fork reads the parent's objects, so both lose the commit, as
+	// after a reclone.
+	for _, dir := range []string{m.t1, m.demo} {
+		for ref := range gitrepotest.Refs(t, dir, "refs/parley/") {
+			gitrepotest.Git(t, dir, "update-ref", "-d", "refs/parley/"+ref)
+		}
+		gitrepotest.Git(t, dir, "reflog", "expire", "--expire=now", "--all")
+		gitrepotest.Git(t, dir, "gc", "--quiet", "--prune=now")
+	}
+	if _, err := gitrepotest.Run(m.t1, "", "cat-file", "-e", head); err == nil {
+		t.Fatalf("the fork's repository still has %s", head)
+	}
+	if status, out := m.restore(t, n, m.miaKey); status != http.StatusConflict || errorType(out) != "conflict" {
+		t.Errorf("restore = %d %v, want 409 conflict", status, out)
+	}
+	if ch := m.read(t, n); ch.State != change.StateAbandoned {
+		t.Errorf("the change is %s, want abandoned", ch.State)
+	}
+	if got, found := gitrepotest.Refs(t, m.t1, "refs/heads/")["task"]; found {
+		t.Errorf("the source branch was created at %s", got)
+	}
+}
+
+func TestRestore_RefusesAChangeWithoutAnIntentLastOfAllChecks(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	head := w.branch(t, "quiet", "Quiet\n")
+	n := w.openBranch(t, "quiet", func(in *change.OpenInput) { in.Draft, in.Intent = true, new("") }).Number
+	if status, out := w.abandon(t, n, w.ownerKey, nil); status != http.StatusOK {
+		t.Fatalf("abandon = %d %v", status, out)
+	}
+	gitrepotest.Git(t, w.demo, "update-ref", "-d", "refs/heads/quiet")
+	if status, out := w.restore(t, n, w.ownerKey); status != http.StatusBadRequest || errorType(out) != "intent_required" {
+		t.Errorf("restore = %d %v, want 400 intent_required", status, out)
+	}
+	if got, found := gitrepotest.Refs(t, w.demo, "refs/heads/")["quiet"]; found {
+		t.Errorf("the refused restore created the source branch at %s", got)
+	}
+	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/quiet", head)
+	other := w.openBranch(t, "quiet", nil).Number
+	if status, out := w.restore(t, n, w.ownerKey); status != http.StatusConflict || errorType(out) != "change_exists" {
+		t.Errorf("restore while demo#%d has the source = %d %v, want 409 change_exists", other, status, out)
+	}
+	if ch := w.read(t, n); ch.State != change.StateAbandoned {
+		t.Errorf("the change is %s, want abandoned", ch.State)
+	}
+	if status, out := w.abandon(t, other, w.ownerKey, nil); status != http.StatusOK {
+		t.Fatalf("abandon demo#%d = %d %v", other, status, out)
+	}
+	w.set(t, "demo", "settings", `{"changes.require_intent":false}`)
+	if status, out := w.restore(t, n, w.ownerKey); status != http.StatusOK || out["state"] != change.StateOpen {
+		t.Errorf("restore without the setting = %d %v, want 200 open", status, out)
 	}
 }

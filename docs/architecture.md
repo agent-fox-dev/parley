@@ -3767,9 +3767,33 @@ feature implements) with the trigger `abandon` (`TriggerAbandon`) inside
 the transaction, whose error rolls the abandon back; with no restacker
 registered it calls `ScheduleMergeable` on each instead. When the route's
 transaction does not commit, the checks the abandon dropped are
-scheduled again. The restore sets the change `open`, calls `ScheduleMergeable` and writes
-`parley.change.restore` (`EventRestore`, metadata `number`, `ref`,
-`version`, `head_sha`).
+scheduled again.
+
+The restore route's operation (`restore` in `lifecycle.go`) checks, in
+this order and before it writes anything: the change is abandoned (`409
+change_not_abandoned`); its source workspace has a record, read through
+the `WorkspaceReader` (`409 source_workspace_gone`); no draft or open
+change has its source (`activeOfSource`, answered by `changeExists`,
+`409 change_exists` naming that change's ref, the refusal an open gives);
+in the source workspace's repository either the source branch exists or
+the last version's head is still an object (`ResolveBranch`, then
+`Missing`, which sees a fork's parent's objects through its alternates;
+else `409 conflict`); the intent is not empty while the target
+workspace's `RequireIntent` is set (`intentRequired`, shared with the
+open, `400 intent_required`). A missing branch is then created at the
+last version's head with `CompareAndSwapRef(ctx, ref, head, "")`;
+`ErrRefMoved` means it appeared in the meantime, and its head is read
+and taken as for a branch that exists. A branch the restore created is
+deleted again (a compare-and-swap to the zero id) when the operation
+fails after it. In the route's transaction it then sets the change `open`
+with no `abandon_reason`, a violation of the unique index on the active
+source being answered as `409 change_exists`, runs `reevaluateLanding`,
+calls `ScheduleMergeable`, writes `parley.change.restore` (`EventRestore`,
+metadata `number`, `ref`, `version`, `head_sha` of the last version),
+tells the `ForkActivity` of a fork source (its error logged), records a
+branch head other than the last version's through `RecordVersion` with
+kind `ref` and the caller, now that the change is open, and calls
+`AnnounceLandable`.
 
 The mergeability worker (`mergeable.go`) keeps, on the component, the set
 of changes whose check is due or waits (one entry per change, whatever the
@@ -3911,8 +3935,8 @@ member of the wrong type being `400 invalid_request`, opens its own
 transaction and calls `Open` with version kind `ref` and `CheckPaths`.
 Two opens of one source cannot interleave, since the store serialises
 write transactions: the second finds the first change and answers `409
-change_exists`, and the unique index answers the same should one slip
-through.
+change_exists`, naming its ref in the message and the details, and the
+unique index answers the same should one slip through.
 
 The reads (`read.go`) are four `GET` routes with scope `changes:read` and
 read access to `:slug`, registered with the patterns of the contributor

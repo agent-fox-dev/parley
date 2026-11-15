@@ -694,8 +694,7 @@ func (o *opening) describe(ctx context.Context, in OpenInput) error {
 	case utf8.RuneCountInString(o.intent) > MaxIntent:
 		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
 	case strings.TrimSpace(o.intent) == "" && !in.Draft && o.target.RequireIntent:
-		return server.NewError("intent_required", http.StatusBadRequest,
-			fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", o.target.Slug))
+		return intentRequired(o.target.Slug)
 	}
 	return nil
 }
@@ -783,18 +782,27 @@ func (c *Component) actorOf(ctx context.Context, tx *sql.Tx, caller Caller) (Act
 	return caller.actor(), nil
 }
 
-// changeExists is the refusal of an open whose source another draft or
-// open change has, naming that change.
+// intentRequired is the refusal of an open change with an empty intent in
+// the workspace, whose changes.require_intent is set.
+func intentRequired(workspace string) error {
+	return server.NewError("intent_required", http.StatusBadRequest,
+		fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", workspace))
+}
+
+// changeExists is the refusal of an open or a restore whose source another
+// draft or open change has, naming that change in its message and its
+// details.
 func (c *Component) changeExists(ctx context.Context, q Querier, source, branch string) error {
 	workspace, number, found, err := activeOfSource(ctx, q, source, branch)
 	if err != nil {
 		return err
 	}
-	e := server.NewError("change_exists", http.StatusConflict, fmt.Sprintf("%s:%s is already the source of a change", source, branch))
-	if found {
-		e = e.WithDetails(map[string]any{"workspace_slug": workspace, "number": number, "ref": Ref(workspace, number)})
+	if !found {
+		return server.NewError("change_exists", http.StatusConflict, fmt.Sprintf("%s:%s is already the source of a change", source, branch))
 	}
-	return e
+	ref := Ref(workspace, number)
+	return server.NewError("change_exists", http.StatusConflict, fmt.Sprintf("%s:%s is already the source of %s", source, branch, ref)).
+		WithDetails(map[string]any{"workspace_slug": workspace, "number": number, "ref": ref})
 }
 
 // sourceNotRelated is the refusal of a source workspace that is neither the

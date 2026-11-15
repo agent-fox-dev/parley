@@ -5,11 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -223,17 +226,141 @@ func (c *Component) restoreRoute(w http.ResponseWriter, r *http.Request) error {
 	return c.modify(w, r, func(*http.Request) (operation, error) { return c.restore, nil })
 }
 
-// restore moves the change ch back to open at its last version, with
-// mergeable unknown and its check scheduled, and writes
-// parley.change.restore by caller.
-func (c *Component) restore(ctx context.Context, tx *sql.Tx, ch Change, caller Caller) error {
+// restore moves the abandoned change ch back to open at the head of its
+// source branch, as caller, in tx. Its refusals come in a fixed order, the
+// first that applies answering: a change that is not abandoned (409
+// change_not_abandoned), a source workspace that no longer exists (409
+// source_workspace_gone), another draft or open change with the same
+// source (409 change_exists), a source branch gone together with the last
+// version's commit, so that there is nothing to restore it at (409
+// conflict), and an empty intent where the workspace requires one (400
+// intent_required). Nothing is written before the last refusal.
+//
+// A source branch that is gone is created at the last version's head, only
+// if it is still absent; one created meanwhile is taken as it is. The
+// change then becomes open, its landing is evaluated again, its
+// mergeability is checked again, parley.change.restore is written for the
+// last version and a fork source's activity recorder is told. A branch
+// whose head is not the last version's has that head recorded as a new
+// version of kind ref by caller, after the change is open, since only a
+// draft or open change takes a version.
+func (c *Component) restore(ctx context.Context, tx *sql.Tx, ch Change, caller Caller) (err error) {
+	if ch.State != StateAbandoned {
+		return server.NewError("change_not_abandoned", http.StatusConflict, fmt.Sprintf("%s is %s; only an abandoned change is restored", ch.Ref, ch.State))
+	}
+	source := ch.Source
+	if _, found, err := c.deps.Workspaces.Workspace(ctx, tx, source.WorkspaceSlug); err != nil || !found {
+		if err != nil {
+			return err
+		}
+		return server.NewError("source_workspace_gone", http.StatusConflict,
+			fmt.Sprintf("%s cannot be restored: its source workspace %s no longer exists", ch.Ref, source.WorkspaceSlug))
+	}
+	if _, _, found, err := activeOfSource(ctx, tx, source.WorkspaceSlug, source.Branch); err != nil || found {
+		if err != nil {
+			return err
+		}
+		return c.changeExists(ctx, tx, source.WorkspaceSlug, source.Branch)
+	}
+	repo, err := c.deps.Repos(ctx, source.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	head, found, err := repo.ResolveBranch(ctx, source.Branch)
+	if err != nil {
+		return err
+	}
+	if !found {
+		missing, err := repo.Missing(ctx, []string{ch.HeadSHA})
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			return server.Conflict(fmt.Sprintf("%s cannot be restored: its source branch %s:%s and the head %s of its version %d are gone",
+				ch.Ref, source.WorkspaceSlug, source.Branch, ch.HeadSHA, ch.Version))
+		}
+	}
+	if strings.TrimSpace(ch.Intent) == "" {
+		target, _, err := c.deps.Workspaces.Workspace(ctx, tx, ch.WorkspaceSlug)
+		if err != nil {
+			return err
+		}
+		if target.RequireIntent {
+			return intentRequired(ch.WorkspaceSlug)
+		}
+	}
+	if !found {
+		var created bool
+		if head, created, err = recreateBranch(ctx, repo, source.Branch, ch.HeadSHA); err != nil {
+			return err
+		}
+		if created {
+			// A branch this restore created goes again with a restore
+			// that does not complete.
+			defer func() {
+				if err != nil {
+					if derr := repo.CompareAndSwapRef(context.WithoutCancel(ctx), "refs/heads/"+source.Branch, zeroID, head); derr != nil {
+						c.deps.Logger.Warn("the recreated source branch was not removed", "workspace", source.WorkspaceSlug, "branch", source.Branch, "error", derr)
+					}
+				}
+			}()
+		}
+	}
 	if err := update(ctx, tx, ch.WorkspaceSlug, ch.Number, c.now(), `state = 'open', abandon_reason = NULL`); err != nil {
+		if isUniqueViolation(err) {
+			return c.changeExists(ctx, tx, source.WorkspaceSlug, source.Branch)
+		}
+		return err
+	}
+	if err := c.reevaluateLanding(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
 	}
 	if err := c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
 	}
-	return c.emit(ctx, tx, caller, ch, EventRestore, map[string]any{"version": ch.Version, "head_sha": ch.HeadSHA})
+	if err := c.emit(ctx, tx, caller, ch, EventRestore, map[string]any{"version": ch.Version, "head_sha": ch.HeadSHA}); err != nil {
+		return err
+	}
+	// A change's source is its own workspace or a fork of it.
+	if activity := c.collaborators().activity; activity != nil && source.WorkspaceSlug != ch.WorkspaceSlug {
+		if err := activity.RecordActivity(ctx, tx, source.WorkspaceSlug); err != nil {
+			c.deps.Logger.Warn("the fork's activity was not recorded", "fork", source.WorkspaceSlug, "change", ch.Ref, "error", err)
+		}
+	}
+	if head != ch.HeadSHA {
+		if _, err := c.RecordVersion(ctx, tx, VersionInput{Workspace: source.WorkspaceSlug, Branch: source.Branch, Head: head, Kind: KindRef, Caller: caller}); err != nil {
+			return err
+		}
+	}
+	return c.AnnounceLandable(ctx, tx, ch.WorkspaceSlug, ch.Number)
+}
+
+// zeroID is git's id of no object, which as a ref's new value deletes it.
+const zeroID = "0000000000000000000000000000000000000000"
+
+// recreateBranch creates the branch of repo at head, only while it does not
+// exist, and returns the head the branch then has and whether this call
+// created it: head, or the head of a branch created in the meantime, which
+// is taken as it is.
+func recreateBranch(ctx context.Context, repo *gitrepo.Repo, branch, head string) (string, bool, error) {
+	err := repo.CompareAndSwapRef(ctx, "refs/heads/"+branch, head, "")
+	switch {
+	case err == nil:
+		return head, true, nil
+	case errors.Is(err, gitrepo.ErrRefNameConflict):
+		return "", false, server.Conflict(fmt.Sprintf("source branch %s cannot be created: another branch is in the way of its name", branch))
+	case !errors.Is(err, gitrepo.ErrRefMoved):
+		return "", false, err
+	}
+	now, found, err := repo.ResolveBranch(ctx, branch)
+	if err != nil {
+		return "", false, err
+	}
+	if !found {
+		// Locked by another writer, and not there yet.
+		return "", false, server.Conflict(fmt.Sprintf("source branch %s is being written; try again", branch))
+	}
+	return now, false, nil
 }
 
 // decodeOptional is server.DecodeJSON for a body that may be absent: no

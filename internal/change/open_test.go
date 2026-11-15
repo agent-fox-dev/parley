@@ -866,6 +866,9 @@ func TestOpen_RefusesASecondChangeOfTheSameSource(t *testing.T) {
 			if !reflect.DeepEqual(errObj["details"], want) {
 				t.Errorf("details = %v, want %v", errObj["details"], want)
 			}
+			if msg, _ := errObj["message"].(string); !strings.HasSuffix(msg, " of "+want["ref"].(string)) {
+				t.Errorf("message = %q, want it to name %v", msg, want["ref"])
+			}
 		})
 	}
 	t.Run("after the change is abandoned", func(t *testing.T) {
