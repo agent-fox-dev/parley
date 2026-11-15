@@ -20,3 +20,12 @@ func WriteProbeRoute(c *Component, ran *atomic.Int64) server.Route {
 		return nil
 	})
 }
+
+// SetRebaseHook makes hook run in every rebase once its commits are
+// replayed and before its branch moves, as another writer would run
+// meanwhile; nil removes it.
+func SetRebaseHook(c *Component, hook func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.replayed = hook
+}

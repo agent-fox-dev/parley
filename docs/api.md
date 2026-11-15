@@ -3174,9 +3174,9 @@ between pages; a cursor used with other query parameters is refused (see
 
 ## Source control writes
 
-The routes below change a workspace's repository without a clone: so far
-they are the commit route and the three refs write routes. Every one of
-them behaves alike in what follows.
+The routes below change a workspace's repository without a clone: the
+commit route, the three refs write routes and the rebase route. Every one
+of them behaves alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
 `git:write` for a PAT. It needs write access to the workspace (see
@@ -3217,7 +3217,7 @@ changes. An accepted write emits one `parley.git.push` event per ref, with
 
 Writes have no time limit. Each request a write route handles is reported
 once to the hub's request recorder with the route's op (`commit`,
-`ref_create`, `ref_move`, `ref_delete`) and `ok` for a status below 400, `ref_moved` for
+`ref_create`, `ref_move`, `ref_delete`, `rebase`) and `ok` for a status below 400, `ref_moved` for
 a `409` `ref_moved`, `refused` for a `403` of a push rule, `error`
 otherwise; a request the checks before the route refuse is not reported.
 
@@ -3363,6 +3363,83 @@ deleted at the commit it is at. The ref's commits stay in the repository.
 | `404` `ref_not_found` | no ref has the name |
 | `409` `ref_moved` | the ref is not at `expected_sha`, or moved in between |
 | `409` `ref_in_use` | the branch is the source of a draft or open change (`branch work is the source of change 3 and cannot be deleted`) |
+
+## `POST /api/v1/workspaces/{slug}/scm/rebase`
+
+Replays the commits of a branch that `onto` does not hold, oldest first,
+on top of the commit `onto` names, and moves the branch to the result, with
+no working copy. The body:
+
+| Member | Meaning |
+|---|---|
+| `branch` | required: the branch to rebase, a branch name or a full name below `refs/heads/` |
+| `onto` | required: a revision (a branch name, a tag name, a full ref name, a full or abbreviated commit id) naming the commit to rebase onto |
+| `expected_head_sha` | the full id of the commit the caller saw `branch` at; without it the head the request reads first guards the move |
+
+```json
+{"branch":"topic","onto":"main","expected_head_sha":"9cdbe993678a61933dbfc1b29496123ac2997ea0"}
+```
+
+Each new commit keeps the author, with the author's time and zone, and the
+message of the commit it replays; its committer is the hub, `parley`
+`<parley@localhost>`, at the time of the request. A commit that changes
+nothing on top of what it is replayed onto is left out; when nothing is
+left, the branch moves to the `onto` commit. A merge commit among the
+commits to replay is refused, since the rebase keeps no merge. The replay
+uses no work tree, index or lock, so a rebase that stops leaves nothing
+behind but unreferenced objects for git's garbage collection.
+
+When `onto` is the branch's head or one of its ancestors, the answer is
+`up_to_date`: the branch does not move, the push rules are not asked and
+no event is emitted. Otherwise the branch is moved by compare-and-swap
+against the head the request read first, through the push rules, with the
+version kind `rebase`, so a branch that is the source of a draft or open
+change gets a version; the `parley.git.push` event has `forced` `true`
+when the old head is not an ancestor of the new one.
+
+```json
+{"status":"rebased","branch":{"name":"refs/heads/topic","kind":"branch","sha":"6038b95a48a0ef29a63329c161332c1accd8e5e8","protected":false,"tracking":false,"change":null},"old_head_sha":"9cdbe993678a61933dbfc1b29496123ac2997ea0","new_head_sha":"6038b95a48a0ef29a63329c161332c1accd8e5e8","onto_sha":"b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","change":null}
+```
+
+`status` is `rebased` or `up_to_date` (`new_head_sha` equal to
+`old_head_sha`). `branch` is the ref object at `new_head_sha`, and
+`onto_sha` the commit `onto` names. `change` is
+`{"workspace_slug": …, "number": …, "version": …}`: for `rebased`, the
+change and the version the rebase recorded; for `up_to_date`, the draft or
+open change whose source the branch is, with its current version; `null`
+when there is none.
+
+A commit that does not apply ends the rebase: the branch stays where it
+was, no event is emitted, and the answer is `409` `rebase_conflict` with
+the conflict report in `error.details`. `target_sha` is the `onto` commit,
+`head_sha` the branch's head, `base_sha` their merge base (`null` when they
+share none), `commit_sha` the first commit that did not apply, and `files`
+the conflicted files in byte order of path, each with its `kind`
+(`content`, `add_add`, `modify_delete`, `delete_modify`, `rename`, `mode`,
+`binary`, `submodule`) and the file on each side, `base` (the commit's
+parent), `ours` (`onto` with the commits replayed before it) and `theirs`
+(the commit), `null` on a side that lacks it. `landed_changes`, each
+`landed_by` and `change` are empty or `null`: the hub does not say yet
+which landed change touched the files.
+
+```json
+{"error":{"code":409,"message":"commit 3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8 of refs/heads/clash does not apply on top of b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","error_type":"rebase_conflict","details":{"target_sha":"b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","head_sha":"2d165dbfc00967ebdead889de8ba17e45a81f98d","base_sha":"a5bc5c5cd7650975def32e01a71d7011f00bfeb6","commit_sha":"3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8","files":[{"path":"a.txt","kind":"content","base":{"sha":"814f4a422927b82f5f8a43f8fab6d3839e3983f2","mode":"100644","path":"a.txt"},"ours":{"sha":"4c1ee586b89c236961f884e55c2745659e6e45f6","mode":"100644","path":"a.txt"},"theirs":{"sha":"08a39ce7008d263b922cbee785e726af46facfac","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}}
+```
+
+The checks run in this order: the body, before the repository is read;
+the branch and `expected_head_sha`; `onto`; whether the branch holds
+`onto`; the merge commits; the replay; then the push rules and the
+compare-and-swap.
+
+| Status | When |
+|---|---|
+| `200 OK` | `rebased` or `up_to_date`, as above |
+| `400` `invalid_request` | no `branch` (`branch is required`), or not a branch name (`branch "refs/tags/v1" is not a valid branch name`); no `onto` (`onto is required`); an `expected_head_sha` that is not a full id (`expected_head_sha must be a full 40-character commit id`) |
+| `400` `merge_commits_unsupported` | a commit to replay is a merge commit (`refs/heads/merged has a merge commit that main does not hold; a rebase replays no merge commit`) |
+| `403` | a push rule refuses the move, such as `protected_branch` |
+| `404` `ref_not_found` | the branch does not exist (`ref "refs/heads/nope" does not exist`); `onto` names no commit |
+| `409` `ref_moved` | the branch is not at `expected_head_sha`, or moved while the commits were replayed; `details.current_sha` is where it is |
+| `409` `rebase_conflict` | a commit does not apply; `details` is the conflict report |
 
 ## Admin routes
 

@@ -32,43 +32,16 @@ func (r *Repo) TrialRebase(ctx context.Context, onto, head string) (*ConflictRep
 		return nil, err
 	}
 
-	// Without merges, the commits form one line: each one's parent is the
-	// one before it, and the first one's is outside the range, or none.
-	ontoTree, parent, parentTree, err := r.trialStart(ctx, onto, commits[0])
-	if err != nil {
-		return nil, err
-	}
-	// ours is the commit the next one is replayed onto, "" while it is
-	// only the tree oursTree, made into a commit when a merge needs one.
-	ours, oursTree := onto, ontoTree
-	for _, c := range commits {
-		switch {
-		case parentTree == oursTree:
-			// The commit's own parent holds what it is replayed onto, so
-			// it applies as it is.
-			ours, oursTree = c.ID, c.Tree
-		default:
-			if ours == "" {
-				if ours, err = r.trialCommit(ctx, oursTree); err != nil {
-					return nil, err
-				}
-			}
-			tree, files, err := r.mergeTree(ctx, parent, ours, c.ID)
-			if err != nil {
-				return nil, err
-			}
-			if files != nil {
-				base, err := r.MergeBase(ctx, onto, head)
-				if err != nil {
-					return nil, err
-				}
-				return &ConflictReport{TargetSHA: onto, HeadSHA: head, BaseSHA: base, CommitSHA: c.ID, Files: files}, nil
-			}
-			ours, oursTree = "", tree
+	// The commit itself holds the tree its replay makes when that is its
+	// own tree; otherwise only the tree is known, and the next merge that
+	// needs it as a commit writes one (trialCommit).
+	_, report, err := r.replay(ctx, onto, head, commits, func(c Commit, _, _, tree string) (string, error) {
+		if tree == c.Tree {
+			return c.ID, nil
 		}
-		parent, parentTree = c.ID, c.Tree
-	}
-	return nil, nil
+		return "", nil
+	})
+	return report, err
 }
 
 // replayed lists the commits of the range onto..head, oldest first, each

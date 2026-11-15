@@ -150,6 +150,10 @@ type Component struct {
 	mu sync.RWMutex
 	// linker is the registered change linker, nil for none.
 	linker ChangeLinker
+	// replayed, when not nil, runs once a rebase has replayed its
+	// commits and before it moves the branch: a test's way to move the
+	// branch meanwhile.
+	replayed func()
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
@@ -199,6 +203,7 @@ func (c *Component) Routes() []server.Route {
 		c.writeRoute(http.MethodPost, "/refs", opRefCreate, c.createRef),
 		c.writeRoute(http.MethodPatch, "/refs/*name", opRefMove, c.moveRef),
 		c.writeRoute(http.MethodDelete, "/refs/*name", opRefDelete, c.deleteRef),
+		c.writeRoute(http.MethodPost, "/rebase", opRebase, c.rebase),
 		c.route("/refs", opRefs, c.listRefs),
 		c.route("/refs/*name", opRefs, c.getRef),
 		c.route("/commits", opCommits, c.listCommits),

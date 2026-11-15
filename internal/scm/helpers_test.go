@@ -650,10 +650,11 @@ func (o *observations) reset() []string {
 }
 
 // writeWorld is a world whose writes the tests watch: the change linker
-// registered on its scm routes is linker, and stage is a ref-updated stage
-// registered with its ref writer.
+// registered on its scm routes, scm, is linker, and stage is a ref-updated
+// stage registered with its ref writer.
 type writeWorld struct {
 	*world
+	scm    *scm.Component
 	linker *fakeLinker
 	stage  *recordingStage
 }
@@ -664,7 +665,8 @@ func newWriteWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *writeW
 	t.Helper()
 	ww := &writeWorld{linker: &fakeLinker{changes: map[string]*scm.LinkedChange{}}, stage: &recordingStage{}}
 	ww.world = newComposedWorld(t, toml, func(c *hub.Composition) {
-		c.SCM().RegisterChangeLinker(ww.linker)
+		ww.scm = c.SCM()
+		ww.scm.RegisterChangeLinker(ww.linker)
 		c.RefWriter().RegisterRefUpdatedStage(ww.stage.run)
 	}, adjust...)
 	return ww
