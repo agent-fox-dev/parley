@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -37,9 +39,10 @@ const changePath = "/workspaces/:slug/changes/:number"
 var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land", "no-auto-land", "target"}
 
 // newChangeCommand builds parley change: the changes of a workspace, their
-// versions and their diffs, and their edits, abandon and restore.
+// versions and their diffs, their edits, abandon and restore, and waiting
+// for one.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list, read, edit, abandon and restore the changes of a workspace, and read their versions and diffs",
+	return group("change", "Open, list, read, edit, abandon, restore and wait for the changes of a workspace, and read their versions and diffs",
 		newChangeOpenCommand(),
 		newChangeEditCommand(),
 		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
@@ -53,6 +56,7 @@ func newChangeCommand() *cobra.Command {
 			Args:        []argSpec{slugArg, numberArg},
 			Auth:        authUser,
 		}), true),
+		newChangeWaitCommand(),
 		withNumbers(scmRead{
 			command: command{Name: "list", Description: "List the changes of a workspace, the draft and open ones unless --state says otherwise", Path: "/workspaces/:slug/changes", Args: []argSpec{slugArg}},
 			query: []queryFlag{
@@ -313,6 +317,128 @@ func newChangeAbandonCommand() *cobra.Command {
 		}
 		return nil
 	})
+}
+
+// changeWaits are the conditions parley change wait --for takes.
+var changeWaits = []string{"landed", "ready", "mergeable"}
+
+// newChangeWaitCommand builds parley change wait: polls of a change until
+// it meets the condition of --for or can no longer meet it.
+func newChangeWaitCommand() *cobra.Command {
+	wait := declare(command{
+		Name:        "wait",
+		Description: "Wait until a change is landed, ready to land or mergeable, reading it every poll interval",
+		Method:      http.MethodGet,
+		Path:        changePath,
+		Args:        []argSpec{slugArg, numberArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("for", "landed", "what to wait for: landed, ready (ready to land and mergeable) or mergeable")
+			fs.Var(newDurationValue(defaultWaitTimeout), timeoutFlag,
+				"how long to wait: a whole number followed by s, m, h or d")
+			fs.Var(newDurationValue(defaultWaitPollInterval), pollIntervalFlag,
+				"how long to wait between two reads of the change: a whole number followed by s, m, h or d")
+		},
+		Run: waitForChange,
+	})
+	return checkFlags(withNumbers(wait, true), func(cmd *cobra.Command) error {
+		if value, _ := cmd.Flags().GetString("for"); !slices.Contains(changeWaits, value) {
+			return usageError("%s takes --for landed, ready or mergeable, got %q", cmd.CommandPath(), value)
+		}
+		return nil
+	})
+}
+
+// waitForChange is the run step of parley change wait. It reads the change
+// at once, then one poll interval after each answer, under one deadline
+// that counts --timeout from the start, and writes one progress line per
+// read to stderr. It prints the change of the read that decides the wait,
+// with wait_failed when the change can no longer meet the condition; at
+// the deadline it prints nothing and returns wait_timeout. It changes
+// nothing on the hub. The shared wait does not fit: it starts an
+// operation and reads one state member.
+func waitForChange(c *call) error {
+	condition, _ := c.cmd.Flags().GetString("for")
+	timeout := c.durationFlag(timeoutFlag)
+	interval := c.durationFlag(pollIntervalFlag).d
+	if c.opts.pollInterval > 0 {
+		interval = c.opts.pollInterval
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, timeout.d)
+	defer cancel()
+	path := routePath(c.decl.Path, c.args)
+	state := ""
+	for {
+		resp, err := c.client.request(ctx, http.MethodGet, path, nil, nil)
+		if err != nil {
+			return c.waitEnded(ctx, timeout, state, err)
+		}
+		var change struct {
+			State   string `json:"state"`
+			Landing struct {
+				Status string `json:"status"`
+			} `json:"landing"`
+			Mergeable string `json:"mergeable"`
+		}
+		if err := json.Unmarshal(resp.body, &change); err != nil || change.State == "" {
+			return clientError("cannot read the state of the change from the hub's answer")
+		}
+		state = change.State
+		if change.Landing.Status != "" {
+			state += ", landing " + change.Landing.Status
+		}
+		if change.Mergeable != "" {
+			state += ", mergeable " + change.Mergeable
+		}
+		progress(c.stderr, "waiting: %s", state)
+		switch changeWaitOutcome(condition, change.State, change.Landing.Status, change.Mergeable) {
+		case successful:
+			return c.printResult(resp.body)
+		case unsuccessful:
+			if err := c.printResult(resp.body); err != nil {
+				return err
+			}
+			return waitFailed("the change is %s, which ends the wait for %s", state, condition)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return c.waitEnded(ctx, timeout, state, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// changeWaitOutcome decides parley change wait --for condition on a change
+// in state with its landing status and mergeable. A landed change ends
+// every wait well and an abandoned one fails every wait. Ready fails on a
+// blocked landing or a conflict, and mergeable on a conflict alone, since
+// a draft's landing is always blocked.
+func changeWaitOutcome(condition, state, landing, mergeable string) outcome {
+	switch state {
+	case "landed":
+		return successful
+	case "abandoned":
+		return unsuccessful
+	}
+	switch condition {
+	case "ready":
+		if landing == "ready" && mergeable == "clean" {
+			return successful
+		}
+		if landing == "blocked" || mergeable == "conflict" {
+			return unsuccessful
+		}
+	case "mergeable":
+		if mergeable == "clean" {
+			return successful
+		}
+		if mergeable == "conflict" {
+			return unsuccessful
+		}
+	}
+	return notTerminal
 }
 
 // checkFlags makes cmd refuse, as a usage error before any setting is

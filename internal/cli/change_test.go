@@ -5,8 +5,11 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // changesPath is the path of the change routes of the workspace demo, as
@@ -411,6 +414,10 @@ func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"ready", "demo"},
 		{"draft", "demo", "12", "13"},
 		{"restore"},
+		{"wait", "demo"},
+		{"wait", "demo", "12", "--for", "done"},
+		{"wait", "demo", "12", "--timeout", "0s"},
+		{"wait", "demo", "12", "--poll-interval", "-1s"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -421,5 +428,156 @@ func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 				t.Errorf("the hub got %v, want no request", sent)
 			}
 		})
+	}
+}
+
+// polledChange is change 12 as the hub answers it in state, landing status
+// and mergeable, given as "state/landing/mergeable"; a state alone, such
+// as "landed", gives the state alone.
+func polledChange(t *testing.T, given string) string {
+	t.Helper()
+	parts := strings.Split(given, "/")
+	switch len(parts) {
+	case 1:
+		return `{"number":12,"state":` + jsonString(parts[0]) + `}`
+	case 3:
+		return `{"number":12,"state":` + jsonString(parts[0]) + `,"landing":{"status":` + jsonString(parts[1]) +
+			`},"mergeable":` + jsonString(parts[2]) + `}`
+	}
+	t.Fatalf("a polled change is state or state/landing/mergeable, got %q", given)
+	return ""
+}
+
+// runChangeWait runs parley change wait demo 12 with flags, polling every
+// interval, against a stub hub that answers its polls with answers in
+// order, the last one again once they run out, and returns what it printed
+// and the requests it sent.
+func runChangeWait(t *testing.T, interval time.Duration, answers []stubAnswer, flags ...string) (code int, stdout, stderr string, sent []stubRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	polls := 0
+	hub := newStubHub(t).handle(http.MethodGet, changesPath+"/12", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		a := answers[min(polls, len(answers)-1)]
+		polls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(a.status)
+		w.Write([]byte(a.body))
+	})
+	opts := defaultOptions()
+	opts.pollInterval = interval
+	code, stdout, stderr = runCLIWith(t, opts, onHub(hub.URL, append([]string{"change", "wait", "demo", "12"}, flags...)...)...)
+	return code, stdout, stderr, hub.recorded()
+}
+
+func TestChangeWait_StopsAtThePollThatMeetsOrFailsTheCondition(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		flags []string
+		// polls are the answers to the polls, in order: a change as
+		// polledChange takes it, or the status of a hub error.
+		polls []string
+		// want is the error type the wait ends with, "" for a success.
+		want string
+	}{
+		{"landed by default", nil, []string{"open/pending/unknown", "open/ready/clean", "landed"}, ""},
+		{"landed", []string{"--for", "landed"}, []string{"landed"}, ""},
+		{"ready", []string{"--for", "ready"}, []string{"open/pending/unknown", "open/ready/unknown", "open/ready/clean"}, ""},
+		{"ready by landing", []string{"--for", "ready"}, []string{"landed"}, ""},
+		{"mergeable while a blocked draft", []string{"--for", "mergeable"}, []string{"draft/blocked/unknown", "draft/blocked/clean"}, ""},
+		{"mergeable by landing", []string{"--for", "mergeable"}, []string{"landed"}, ""},
+		{"landed but abandoned", []string{"--for", "landed"}, []string{"open/pending/unknown", "abandoned"}, "wait_failed"},
+		{"ready but abandoned", []string{"--for", "ready"}, []string{"abandoned"}, "wait_failed"},
+		{"mergeable but abandoned", []string{"--for", "mergeable"}, []string{"abandoned"}, "wait_failed"},
+		{"ready but blocked", []string{"--for", "ready"}, []string{"open/pending/unknown", "open/blocked/clean"}, "wait_failed"},
+		{"ready but a draft", []string{"--for", "ready"}, []string{"draft/blocked/unknown"}, "wait_failed"},
+		{"ready but conflicting", []string{"--for", "ready"}, []string{"open/ready/conflict"}, "wait_failed"},
+		{"mergeable but conflicting", []string{"--for", "mergeable"}, []string{"open/ready/unknown", "open/ready/conflict"}, "wait_failed"},
+		{"landed but gone", nil, []string{"open/pending/unknown", "404"}, "change_not_found"},
+		{"landed but unauthenticated", nil, []string{"401"}, "unauthenticated"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var answers []stubAnswer
+			for _, p := range tt.polls {
+				if status, err := strconv.Atoi(p); err == nil {
+					answers = append(answers, stubAnswer{status, envelope(status, tt.want)})
+				} else {
+					answers = append(answers, stubAnswer{http.StatusOK, polledChange(t, p)})
+				}
+			}
+			last := answers[len(answers)-1]
+
+			code, stdout, stderr, sent := runChangeWait(t, 10*time.Millisecond, answers, tt.flags...)
+
+			if len(sent) != len(answers) {
+				t.Errorf("the hub got %d requests, want %d polls", len(sent), len(answers))
+			}
+			for _, r := range sent {
+				if r.method != http.MethodGet || r.rawPath != changesPath+"/12" {
+					t.Errorf("the hub got %s %s, want only GET %s/12", r.method, r.rawPath, changesPath)
+				}
+			}
+			progress := nonEmptyLines(strings.TrimSuffix(stderr, lastDocument(stderr)))
+			if tt.want == "" {
+				if code != 0 || len(progress) != len(answers) {
+					t.Errorf("exit status %d, stderr %q; want 0 and one progress line per poll", code, stderr)
+				}
+				if want := indented(t, last.body); stdout != want {
+					t.Errorf("stdout = %q, want the last change %q", stdout, want)
+				}
+				return
+			}
+			if code != 1 {
+				t.Errorf("exit status = %d, want 1", code)
+			}
+			gotCode, _, gotType := clientEnvelope(t, lastDocument(stderr))
+			if gotType != tt.want {
+				t.Errorf("stderr = %q, want an envelope of %s", stderr, tt.want)
+			}
+			if last.status != http.StatusOK {
+				if stdout != "" || gotCode != float64(last.status) {
+					t.Errorf("stdout %q, envelope code %v; want nothing and the hub's envelope", stdout, gotCode)
+				}
+				return
+			}
+			if want := indented(t, last.body); stdout != want || gotCode != 0 {
+				t.Errorf("stdout %q, envelope code %v; want the last change %q and code 0", stdout, gotCode, want)
+			}
+			if len(progress) != len(answers) {
+				t.Errorf("progress = %q, want one line per poll", progress)
+			}
+		})
+	}
+}
+
+func TestChangeWait_GivesUpAtTheTimeoutWithoutChangingAnything(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+
+	code, stdout, stderr, sent := runChangeWait(t, 20*time.Millisecond, []stubAnswer{{http.StatusOK, polledChange(t, "open/pending/unknown")}},
+		"--timeout", "1s")
+
+	// The flag's smallest timeout is 1s; the wait may outlast it by one
+	// poll's request time.
+	if elapsed := time.Since(start); elapsed < time.Second || elapsed >= 2*time.Second {
+		t.Errorf("the wait took %v, want 1s and less than 2s", elapsed)
+	}
+	if code != 1 || stdout != "" {
+		t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
+	}
+	if gotCode, _, gotType := clientEnvelope(t, lastDocument(stderr)); gotCode != 0 || gotType != "wait_timeout" {
+		t.Errorf("stderr = %q, want a wait_timeout envelope with code 0", stderr)
+	}
+	if len(sent) < 2 {
+		t.Errorf("the hub got %d polls, want at least 2", len(sent))
+	}
+	for _, r := range sent {
+		if r.method != http.MethodGet {
+			t.Errorf("the hub got %s %s, want only GETs", r.method, r.rawPath)
+		}
 	}
 }

@@ -4805,7 +4805,7 @@ sends a query parameter for each flag given (`listForks`), `--mine` as
 `owner=me`, and prints one page.
 
 `parley change` (`change.go`) is `open`, `list`, `show`, `find`, `versions`,
-`diff`, `edit`, `ready`, `draft`, `abandon` and `restore`. The five reads are built like the reads of `parley scm`
+`diff`, `edit`, `ready`, `draft`, `abandon`, `restore` and `wait`. The five reads are built like the reads of `parley scm`
 (`scm.go`), as an `scmRead` each, whose query flags become query
 parameters; `diff` shares with `parley scm diff` the check `onePatchForm`
 and the run step `diffRevisions`, which prints the patch text of `--patch`
@@ -4824,7 +4824,15 @@ send only a `state`, `abandon` only the `reason` and `dependants` given,
 and `restore` no body. `checkFlags` wraps the argument check of `edit` and
 `abandon` with their flag rules (an edit flag needed, `--auto-land` with
 `--no-auto-land`, a `--dependants` value), refused as usage errors before
-any setting is resolved.
+any setting is resolved; it wraps `wait`'s for its `--for` value.
+`wait` (`waitForChange`) does not use the shared wait of `wait.go`, which
+starts an operation and reads one state member: it polls the change with
+`GET` at once and then one poll interval after each answer, under one
+deadline counted from its start, and decides each answer with
+`changeWaitOutcome` from `--for`, `state`, `landing.status` and
+`mergeable`. It takes from `wait.go` the duration flags
+(`newDurationValue`), the tests' `pollInterval` and `waitEnded`, which
+turns a passed deadline into `wait_timeout`.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
