@@ -62,6 +62,12 @@ type OpenInput struct {
 	// path-scoped caller; the REST route sets it, while a push or a commit
 	// had its paths checked when it moved the branch.
 	CheckPaths bool
+	// AfterMove says that the trigger moved the source branch to Head
+	// before tx began, as the source control API's commit route does, so
+	// that a write that moved or deleted the branch since found no change
+	// in its ref-updated stage. Open then reads the branch in tx, once
+	// version 1 is recorded.
+	AfterMove bool
 }
 
 // Open opens a change in tx, the caller's transaction, which it neither
@@ -78,6 +84,14 @@ type OpenInput struct {
 // the version observers in that order, tells the fork activity recorder of
 // a fork source, and writes parley.change.version and, unless the change is
 // a draft, parley.change.open. It returns the change as stored then.
+//
+// With AfterMove, a source branch that tx finds at another head than Head
+// records that head as version 2, of kind ref by the hub, and one that tx
+// finds gone abandons the change for ReasonSourceDeleted, as the
+// ref-updated stage of that write would have done had the change existed.
+// A write that moves the branch later runs its stage after tx commits, as
+// the store runs its transactions one at a time and the ref writer moves
+// the refs inside its own, so no move is lost.
 //
 // The version ref is written before the collaborators run, which may read
 // the head from the target's repository, and before Open returns, since a
@@ -157,7 +171,32 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (_ Chang
 	if err := c.emitOpen(ctx, tx, in.Caller, ch, v); err != nil {
 		return Change{}, err
 	}
+	if in.AfterMove {
+		return c.followSource(ctx, tx, o, ch)
+	}
 	return ch, nil
+}
+
+// followSource records, for the change ch just opened from o, what became
+// of its source branch since the trigger moved it to o.head: another head
+// is the next version, of kind ref by the hub; a branch that is gone
+// abandons the change. It returns the change as stored then.
+func (c *Component) followSource(ctx context.Context, tx *sql.Tx, o *opening, ch Change) (Change, error) {
+	head, found, err := o.sourceRepo.ResolveBranch(ctx, ch.Source.Branch)
+	switch {
+	case err != nil:
+		return Change{}, err
+	case !found:
+		err = c.SourceDeleted(ctx, tx, ch.Source.WorkspaceSlug, ch.Source.Branch, Caller{})
+	case head != o.head:
+		_, err = c.RecordVersion(ctx, tx, VersionInput{Workspace: ch.Source.WorkspaceSlug, Branch: ch.Source.Branch, Head: head, Kind: KindRef})
+	default:
+		return ch, nil
+	}
+	if err != nil {
+		return Change{}, err
+	}
+	return readChange(ctx, tx, ch.WorkspaceSlug, ch.Number)
 }
 
 // afterVersion runs, for the new version v of the change number of the

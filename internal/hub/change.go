@@ -136,7 +136,9 @@ func (r changeWorkspaces) Workspace(ctx context.Context, q change.Querier, slug 
 // component's lookup of a branch's change, its check of an open, which
 // writes nothing, and its open, in a store transaction of its own, since
 // the writes check before the branch moves and open after it moved, outside
-// any transaction. A change a commit opens has version 1 of kind commit.
+// any transaction. A change a commit opens has version 1 of kind commit;
+// the open reads the branch again in its transaction, so that a write
+// that moved it in between is its next version (change.OpenInput.AfterMove).
 type changeLinker struct {
 	changes *change.Component
 	rt      *Runtime
@@ -168,10 +170,14 @@ func (l changeLinker) Open(ctx context.Context, o scm.ChangeOpening) (*scm.Linke
 
 // openingInput is the open of the change a write asks for: what it named,
 // "" being the defaults, at the head it moves the source branch to, with
-// its session as the trigger's, by its caller.
+// its session as the trigger's, by its caller. The open comes after the
+// branch moved, outside the write's transaction, so it follows a later
+// move of the branch (AfterMove); a check before the move has none to
+// follow.
 func openingInput(o scm.ChangeOpening) change.OpenInput {
 	in := change.OpenInput{Workspace: o.Workspace, SourceWorkspace: o.SourceWorkspace, SourceBranch: o.SourceBranch,
-		Head: o.Head, TriggerSession: o.SessionID, Draft: o.Draft, Caller: change.CallerOf(o.Caller), Kind: change.KindCommit}
+		Head: o.Head, TriggerSession: o.SessionID, Draft: o.Draft, Caller: change.CallerOf(o.Caller), Kind: change.KindCommit,
+		AfterMove: true}
 	for dst, src := range map[**string]string{&in.TargetBranch: o.TargetBranch, &in.Title: o.Title, &in.Intent: o.Intent} {
 		if src != "" {
 			*dst = &src

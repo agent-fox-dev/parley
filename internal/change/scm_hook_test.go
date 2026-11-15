@@ -1,12 +1,18 @@
 package change_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"os/exec"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -202,6 +208,130 @@ func TestChangeLinker_ChecksAndOpensTheChangeACommitAsksFor(t *testing.T) {
 		status, out := w.send(t, http.MethodDelete, "/workspaces/demo/scm/refs/topic", w.ownerKey, nil)
 		if status != http.StatusConflict || errorType(out) != "ref_in_use" {
 			t.Errorf("DELETE refs/topic = %d %v, want 409 ref_in_use", status, out)
+		}
+	})
+}
+
+// activityFunc is a fork activity recorder of the ref writer as a function.
+type activityFunc func(ctx context.Context, slug string) error
+
+func (f activityFunc) RecordActivity(ctx context.Context, slug string) error { return f(ctx, slug) }
+
+// sendFromHub sends a request as send does, from a goroutine of the hub's,
+// which may not fail the test: it returns the status and the answer, or
+// the error as the answer.
+func (w *world) sendFromHub(method, path string, body any) (int, string) {
+	var data io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 0, err.Error()
+		}
+		data = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, w.URL("/api/v1"+path), data)
+	if err != nil {
+		return 0, err.Error()
+	}
+	req.Header.Set("Authorization", "Bearer "+w.ownerKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer res.Body.Close()
+	answer, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(answer)
+}
+
+// A write that moves or deletes the branch a commit moved, after the
+// commit's refs moved and before the change the commit asks for is opened,
+// finds no change in its ref-updated stage: the open reads the branch in
+// its own transaction, and records the move as the next version of kind
+// ref by the hub, or abandons the change whose source is gone.
+func TestChangeLinker_RecordsAWriteToTheSourceBetweenTheCommitAndTheOpen(t *testing.T) {
+	t.Parallel()
+	var between atomic.Pointer[func()]
+	w := newWorldWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		c.SCM().RegisterSessionLinker(anySession{})
+		forks := c.Forks()
+		// The ref writer tells the fork activity recorder of a write to a
+		// fork once its refs moved and before the write goes on, which is
+		// the gap between a commit and the open of its change.
+		c.RefWriter().RegisterForkActivity(activityFunc(func(ctx context.Context, slug string) error {
+			if f := between.Swap(nil); f != nil {
+				(*f)()
+			}
+			return forks.RecordActivity(ctx, slug)
+		}))
+	}})
+	m1 := w.addFork(t, "demo--m1", "main", nil, nil)
+	// inGap has write run once in the gap of the next write to the fork,
+	// given the head of branch; the channel gives what it answered.
+	inGap := func(branch string, write func(head string) (int, string)) <-chan string {
+		done := make(chan string, 1)
+		f := func() {
+			out, err := exec.Command("git", "--git-dir", m1, "rev-parse", "refs/heads/"+branch).Output()
+			if err != nil {
+				done <- err.Error()
+				return
+			}
+			status, answer := write(strings.TrimSpace(string(out)))
+			done <- fmt.Sprintf("%d %s", status, answer)
+		}
+		between.Store(&f)
+		return done
+	}
+	// commitTo commits to the new branch, asking for a change, which is
+	// change number of demo, and returns the commit.
+	commitTo := func(t *testing.T, branch string, number int64) string {
+		t.Helper()
+		status, out := w.send(t, http.MethodPost, "/workspaces/demo--m1/scm/commits", w.ownerKey, map[string]any{
+			"branch": branch, "base_ref": w.base, "message": "Topic\n", "change": map[string]any{"title": "The topic", "intent": "Because."},
+			"operations": []any{map[string]any{"op": "put", "path": branch + ".txt", "content": branch + "\n"}}})
+		if status != http.StatusCreated {
+			t.Fatalf("POST commits = %d %v, want 201", status, out)
+		}
+		if ch, _ := named(out).(map[string]any); ch["number"] != float64(number) {
+			t.Fatalf("the commit's change = %v, want change %d", named(out), number)
+		}
+		return out["commit"].(map[string]any)["sha"].(string)
+	}
+
+	t.Run("a commit moves the branch", func(t *testing.T) {
+		gap := inGap("topic", func(head string) (int, string) {
+			return w.sendFromHub(http.MethodPost, "/workspaces/demo--m1/scm/commits", map[string]any{
+				"branch": "topic", "expected_head_sha": head, "message": "Later\n",
+				"operations": []any{map[string]any{"op": "put", "path": "later.txt", "content": "later\n"}}})
+		})
+		first := commitTo(t, "topic", 1)
+		if answer := <-gap; !strings.HasPrefix(answer, "201 ") {
+			t.Fatalf("the commit in the gap = %s, want 201", answer)
+		}
+		later := gitrepotest.Refs(t, m1, "refs/heads/")["topic"]
+		if later == first {
+			t.Fatal("the commit in the gap left topic at the first commit")
+		}
+		w.latest(t, 1, 2, later, change.KindRef)
+		if v1 := w.versions(t, "demo", 1)[0]; v1["head_sha"] != first || v1["kind"] != change.KindCommit {
+			t.Errorf("version 1 = %v, want kind commit at %s", v1, first)
+		}
+	})
+	t.Run("a write deletes the branch", func(t *testing.T) {
+		gap := inGap("gone", func(head string) (int, string) {
+			return w.sendFromHub(http.MethodDelete, "/workspaces/demo--m1/scm/refs/gone?expected_sha="+head, nil)
+		})
+		commitTo(t, "gone", 2)
+		if answer := <-gap; !strings.HasPrefix(answer, "204 ") {
+			t.Fatalf("the delete in the gap = %s, want 204", answer)
+		}
+		if _, found := gitrepotest.Refs(t, m1, "refs/heads/")["gone"]; found {
+			t.Fatal("the delete in the gap left the branch")
+		}
+		if ch := w.read(t, 2); ch.State != change.StateAbandoned || ch.Version != 1 {
+			t.Errorf("change 2 = %s at version %d, want abandoned at version 1", ch.State, ch.Version)
 		}
 	})
 }
