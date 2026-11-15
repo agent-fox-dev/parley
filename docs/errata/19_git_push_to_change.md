@@ -30,3 +30,19 @@ that the push opens changes for the other branches only, each with the
 same options. A record-version request (`VersionRequest`) has no field for
 a target, a title, an intent or a draft flag, so no version request can
 carry them.
+
+The check that a PAT without `changes:write` still adds a version to a
+branch's open change expects a record-version call too. For the same
+reason, that version is one the ref writer reported: the unit test gives
+the PAT's branch a reported version and checks that it is the outcome,
+with no call and no warning. The scope check runs only before an open,
+and never after a lost race, because the open was already allowed then.
+
+## A refusal with a server status is an internal error
+
+The open's refusals are `*server.Error` values, and every one that is
+not worded on its own is reported as its message followed by its error
+type. The mapping takes only those below status 500 as refusals: a
+`*server.Error` of status 500 or above is an internal error, like an
+untyped one. It is logged, its text is never sent, and the reason is
+`internal error`.

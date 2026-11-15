@@ -1,8 +1,12 @@
 package gitserver_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,36 +15,67 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // changeFake is a change service that notes each call, in order, and each
 // open request, and answers with what the test scripted: the draft or open
 // change of each branch, the refusal of an open, the change an open makes
-// and the version a record makes.
+// and the version a record makes. fail scripts, by "find <branch>", "open
+// <branch>" or "record <branch>", the error that call returns or, for any
+// other value, the panic it raises.
 type changeFake struct {
 	found    map[string]*gitserver.BranchChange
 	openErr  error
 	opened   gitserver.OpenedChange
 	recorded *pushrule.Version
+	fail     map[string]any
 	calls    []string
 	opens    []gitserver.OpenRequest
 }
 
+func (f *changeFake) failure(call string) error {
+	v, ok := f.fail[call]
+	if !ok {
+		return nil
+	}
+	if err, isErr := v.(error); isErr {
+		return err
+	}
+	panic(v)
+}
+
 func (f *changeFake) OpenChangeOfBranch(_ context.Context, source, branch string) (*gitserver.BranchChange, error) {
 	f.calls = append(f.calls, "find "+source+":"+branch)
+	if err := f.failure("find " + branch); err != nil {
+		return nil, err
+	}
 	return f.found[branch], nil
 }
 
 func (f *changeFake) RecordPushVersion(_ context.Context, req gitserver.VersionRequest) (*pushrule.Version, error) {
 	f.calls = append(f.calls, fmt.Sprintf("record %s#%d from %s:%s@%s %s", req.Workspace, req.Number, req.Source, req.Branch, req.Head, session(req.SessionID)))
+	if err := f.failure("record " + req.Branch); err != nil {
+		return nil, err
+	}
 	return f.recorded, nil
 }
 
 func (f *changeFake) OpenChange(_ context.Context, req gitserver.OpenRequest) (gitserver.OpenedChange, error) {
 	f.calls = append(f.calls, fmt.Sprintf("open %s:%s@%s %s", req.Source, req.Branch, req.Head, session(req.SessionID)))
 	f.opens = append(f.opens, req)
+	if err := f.failure("open " + req.Branch); err != nil {
+		return gitserver.OpenedChange{}, err
+	}
 	return f.opened, f.openErr
+}
+
+func permissions(c gitserver.PushCaller) []string {
+	if c.PAT == nil {
+		return nil
+	}
+	return c.PAT.Permissions
 }
 
 func session(id *string) string {
@@ -76,15 +111,22 @@ func versioned(ref string, v pushrule.Version) pushrule.UpdateResult {
 }
 
 var (
-	repoWS = workspace.Workspace{Slug: "demo", Kind: access.KindRepository}
-	apiKey = gitserver.PushCaller{CredentialType: gitserver.CredentialAPIKey, CredentialID: "k1", UserID: "u1", Level: access.LevelOwner}
-	gitPAT = gitserver.PushCaller{CredentialType: gitserver.CredentialPAT, CredentialID: "t1", UserID: "u1", Level: access.LevelOwner,
-		PAT: &identity.Principal{Type: identity.TypePAT, CredentialID: "t1", Permissions: []string{"git:write"}}}
+	repoWS     = workspace.Workspace{Slug: "demo", Kind: access.KindRepository, DefaultBranch: ptr("main")}
+	apiKey     = gitserver.PushCaller{CredentialType: gitserver.CredentialAPIKey, CredentialID: "k1", UserID: "u1", Level: access.LevelOwner}
+	adminToken = gitserver.PushCaller{CredentialType: gitserver.CredentialAdminToken, Level: access.LevelOwner}
+	gitPAT     = patCaller("git:write")
+	changesPAT = patCaller("git:write", "changes:write")
 )
 
+func patCaller(perms ...string) gitserver.PushCaller {
+	return gitserver.PushCaller{CredentialType: gitserver.CredentialPAT, CredentialID: "t1", UserID: "u1", Level: access.LevelOwner,
+		PAT: &identity.Principal{Type: identity.TypePAT, CredentialID: "t1", Permissions: perms}}
+}
+
+// forkWS is a task fork of demo whose base branch is main.
 func forkWS(autoChange bool) workspace.Workspace {
 	parent := "demo"
-	return workspace.Workspace{Slug: "demo--k3x9w2ab", Kind: access.KindFork, ParentSlug: &parent, AutoChange: &autoChange}
+	return workspace.Workspace{Slug: "demo--k3x9w2ab", Kind: access.KindFork, ParentSlug: &parent, AutoChange: &autoChange, DefaultBranch: ptr("main")}
 }
 
 func TestChangeMapper_MapsOnlyCreatedOrUpdatedBranchesInCommandOrder(t *testing.T) {
@@ -137,12 +179,19 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 		found    map[string]*gitserver.BranchChange
 		openErr  error
 		recorded *pushrule.Version
+		fail     map[string]any
 		calls    []string
 		outcomes []gitserver.Outcome
 	}
-	opened := gitserver.Outcome{Branch: "b", Kind: gitserver.OutcomeOpened, Workspace: "demo", Number: 1, Version: 1}
+	openedFor := func(branch string) gitserver.Outcome {
+		return gitserver.Outcome{Branch: branch, Kind: gitserver.OutcomeOpened, Workspace: "demo", Number: 1, Version: 1}
+	}
+	opened := openedFor("b")
 	none := func(branch string) gitserver.Outcome { return gitserver.Outcome{Branch: branch} }
-	directWarning := gitserver.Outcome{Branch: "main", Kind: gitserver.OutcomeWarning, Reason: "branch is protected and was pushed directly"}
+	warning := func(branch, reason string) gitserver.Outcome {
+		return gitserver.Outcome{Branch: branch, Kind: gitserver.OutcomeWarning, Reason: reason}
+	}
+	directWarning := warning("main", "branch is protected and was pushed directly")
 	var cases []mapCase
 	// A version the ref writer reported is the outcome whatever the push
 	// asks, and nothing is looked up, opened or recorded for it.
@@ -231,14 +280,99 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 			calls:    []string{"find demo:b", "open demo:b@c1 " + s, "record demo#9 from demo:b@c1 " + s},
 			outcomes: []gitserver.Outcome{{Branch: "b", Kind: gitserver.OutcomeVersion, Workspace: "demo", Number: 9, Version: 2}}},
 	)
+	// An open the change feature refuses is a warning with the refusal's
+	// reason, which names the target given or the default one.
+	for _, r := range []struct {
+		option string
+		err    error
+		reason string
+	}{
+		{"parley.target=nope", server.NewError("target_not_found", http.StatusBadRequest, `target_branch: no branch "nope" in demo`),
+			"target branch nope does not exist (target_not_found)"},
+		{"parley.change", server.NewError("target_not_found", http.StatusBadRequest, `target_branch: no branch "main" in demo`),
+			"target branch main does not exist (target_not_found)"},
+		{"parley.change", server.NewError("nothing_to_land", http.StatusBadRequest, "source: no commit to land"), "no commits ahead of main (nothing_to_land)"},
+		{"parley.change", server.NewError("merge_commits_unsupported", http.StatusBadRequest, "source: commit c1 is a merge"),
+			"merge commits are not supported (merge_commits_unsupported)"},
+		{"parley.change", server.NewError("intent_required", http.StatusBadRequest, "intent: required"),
+			"intent is required; push with -o parley.intent=<text> or -o parley.draft (intent_required)"},
+		{"parley.change", server.NewError("integration_branch", http.StatusForbidden, "target is the integration branch"),
+			"target is the integration branch (integration_branch)"},
+		{"parley.change", server.InvalidRequest("title must be 1 to 200 characters"), "title must be 1 to 200 characters (invalid_request)"},
+	} {
+		cases = append(cases, mapCase{
+			name: fmt.Sprintf("an open refused for %s with %s", r.err, r.option), ws: repoWS, caller: apiKey, options: []string{r.option},
+			updates: []pushrule.UpdateResult{created("refs/heads/fix")}, openErr: r.err,
+			calls: []string{"find demo:fix", "open demo:fix@c1 -"}, outcomes: []gitserver.Outcome{warning("fix", r.reason)},
+		})
+	}
+	// A branch that is its own target opens nothing; a fork's branch never
+	// is, since its change lands in the parent.
+	cases = append(cases,
+		mapCase{name: "a branch named as its own target", ws: repoWS, caller: apiKey, options: []string{"parley.target=rel"},
+			updates: []pushrule.UpdateResult{updated("refs/heads/rel")},
+			calls:   []string{"find demo:rel"}, outcomes: []gitserver.Outcome{warning("rel", "branch is its own target")}},
+		mapCase{name: "the default branch pushed without a direct push", ws: repoWS, caller: apiKey, options: []string{"parley.change"},
+			updates: []pushrule.UpdateResult{updated("refs/heads/main")},
+			calls:   []string{"find demo:main"}, outcomes: []gitserver.Outcome{warning("main", "branch is its own target")}},
+		mapCase{name: "a fork's base branch", ws: forkWS(false), caller: apiKey, options: []string{"parley.change"},
+			updates: []pushrule.UpdateResult{updated("refs/heads/main")},
+			calls:   []string{"find demo--k3x9w2ab:main", "open demo--k3x9w2ab:main@c1 -"}, outcomes: []gitserver.Outcome{openedFor("main")}},
+	)
+	// Only a PAT is held to changes:write before an open; a version the ref
+	// writer reported (above) is no open and is not held to it.
+	noScope := warning("fix", "token lacks scope changes:write")
+	for _, c := range []struct {
+		caller gitserver.PushCaller
+		ws     workspace.Workspace
+		opts   []string
+		opens  bool
+	}{
+		{gitPAT, repoWS, []string{"parley.change"}, false},
+		{changesPAT, repoWS, []string{"parley.change"}, true},
+		{apiKey, repoWS, []string{"parley.change"}, true},
+		{adminToken, repoWS, []string{"parley.change"}, true},
+		{gitPAT, forkWS(true), nil, false},
+	} {
+		mc := mapCase{name: fmt.Sprintf("%s holding %v in %s with %q", c.caller.CredentialType, permissions(c.caller), c.ws.Slug, c.opts),
+			ws: c.ws, caller: c.caller, options: c.opts, updates: []pushrule.UpdateResult{created("refs/heads/fix")},
+			calls: []string{"find " + c.ws.Slug + ":fix"}, outcomes: []gitserver.Outcome{noScope}}
+		if c.opens {
+			mc.calls = append(mc.calls, "open "+c.ws.Slug+":fix@c1 -")
+			mc.outcomes = []gitserver.Outcome{openedFor("fix")}
+		}
+		cases = append(cases, mc)
+	}
+	// A lookup, open or record that fails or panics warns of its branch with
+	// no word of the failure, which is logged, and the next branch is mapped.
+	failedA := func(name string, fail map[string]any, calls ...string) mapCase {
+		return mapCase{name: name, ws: repoWS, caller: apiKey, options: []string{"parley.change"},
+			updates: []pushrule.UpdateResult{created("refs/heads/a"), created("refs/heads/b")}, fail: fail,
+			calls:    append(calls, "find demo:b", "open demo:b@c1 -"),
+			outcomes: []gitserver.Outcome{warning("a", "internal error"), opened}}
+	}
+	cases = append(cases,
+		failedA("an open that fails", map[string]any{"open a": errors.New("disk full under /srv/parley")}, "find demo:a", "open demo:a@c1 -"),
+		failedA("an open that fails with a server error", map[string]any{"open a": server.Internal("store unreachable at /srv/parley")}, "find demo:a", "open demo:a@c1 -"),
+		failedA("an open that panics", map[string]any{"open a": "nil map under /srv/parley"}, "find demo:a", "open demo:a@c1 -"),
+		failedA("a lookup that fails", map[string]any{"find a": errors.New("database is locked")}, "find demo:a"),
+		failedA("a record after a lost race that fails", map[string]any{"open a": &gitserver.ChangeExistsError{Workspace: "demo", Number: 9},
+			"record a": errors.New("no such table: change_versions")}, "find demo:a", "open demo:a@c1 -", "record demo#9 from demo:a@c1 -"),
+	)
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			fake := &changeFake{found: c.found, openErr: c.openErr, recorded: c.recorded, opened: gitserver.OpenedChange{Workspace: "demo", Number: 1}}
+			fake := &changeFake{found: c.found, openErr: c.openErr, recorded: c.recorded, fail: c.fail, opened: gitserver.OpenedChange{Workspace: "demo", Number: 1}}
 			var lines []string
-			got := gitserver.NewChangeMapper(fake, nil).Map(context.Background(), gitserver.MappingInput{
+			var log bytes.Buffer
+			got := gitserver.NewChangeMapper(fake, slog.New(slog.NewTextHandler(&log, nil))).Map(context.Background(), gitserver.MappingInput{
 				Workspace: c.ws, Caller: c.caller, Options: c.options, SessionID: c.session, Updates: c.updates,
 			}, func(l string) { lines = append(lines, l) })
+			for _, f := range c.fail {
+				if _, race := f.(*gitserver.ChangeExistsError); !race && !strings.Contains(log.String(), fmt.Sprint(f)) {
+					t.Errorf("the log lacks the failure %q:\n%s", f, log.String())
+				}
+			}
 			if !reflect.DeepEqual(fake.calls, c.calls) {
 				t.Errorf("calls %q, want %q", fake.calls, c.calls)
 			}
@@ -267,7 +401,7 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 func TestChangeMapper_OpensTheChangeWithTheOptionsOfThePush(t *testing.T) {
 	t.Parallel()
 	open := func(ws, source, branch string, opts ...string) gitserver.OpenRequest {
-		req := gitserver.OpenRequest{Workspace: ws, Source: source, Branch: branch, Head: "c1", Caller: gitPAT}
+		req := gitserver.OpenRequest{Workspace: ws, Source: source, Branch: branch, Head: "c1", Caller: changesPAT}
 		for _, o := range opts {
 			name, value, _ := strings.Cut(o, "=")
 			switch name {
@@ -307,7 +441,7 @@ func TestChangeMapper_OpensTheChangeWithTheOptionsOfThePush(t *testing.T) {
 			t.Parallel()
 			fake := &changeFake{opened: gitserver.OpenedChange{Workspace: "demo", Number: 1}}
 			gitserver.NewChangeMapper(fake, nil).Map(context.Background(), gitserver.MappingInput{
-				Workspace: c.ws, Caller: gitPAT, Options: c.options, Updates: c.updates,
+				Workspace: c.ws, Caller: changesPAT, Options: c.options, Updates: c.updates,
 			}, func(string) {})
 			if !reflect.DeepEqual(fake.opens, c.want) {
 				t.Errorf("open requests %+v, want %+v", fake.opens, c.want)

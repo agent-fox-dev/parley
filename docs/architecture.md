@@ -3069,7 +3069,21 @@ writes the whole answer; otherwise the component serves it (`fetch.go`):
   `parley.target`, `parley.title`, `parley.intent` and `parley.draft`
   when the push gives them, the same for every open of the push, nil
   (or false) leaving the change's defaults; a `VersionRequest` carries
-  none of them; a failing call is the reason `internal error`, logged.
+  none of them; before the open, a branch that is its own target (the
+  change's workspace is the pushed one and `parley.target`, or else the
+  pushed workspace's default branch, a fork's base branch, is the pushed
+  branch) is the reason `branch is its own target`, and a PAT without
+  `changes:write` (API keys and the admin token are not checked) the
+  reason `token lacks scope changes:write`; an open refused with a
+  `*server.Error` below 500 is worded by `refusalReason`
+  (`pushreport.go`): `target branch <t> does not exist (target_not_found)`,
+  `no commits ahead of <t> (nothing_to_land)`,
+  `merge commits are not supported (merge_commits_unsupported)`,
+  `intent is required; push with -o parley.intent=<text> or -o parley.draft (intent_required)`,
+  and any other as `<message> (<error_type>)`; any other failing call, or
+  a panic, of the lookup, the open or the record is the reason
+  `internal error`, logged and never sent, and the next branch is mapped
+  all the same; the push is never failed by its mapping.
   `Outcome.Line`, `pushreport.go`, words the lines
   `change <workspace>#<number> version <n>`,
   `change <workspace>#<number> version 1 (opened)` or

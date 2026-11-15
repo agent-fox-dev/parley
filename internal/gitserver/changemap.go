@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -170,8 +172,15 @@ func (m *ChangeMapper) Map(ctx context.Context, in MappingInput, send func(line 
 }
 
 // mapBranch decides the outcome of the created or updated branch of the
-// update u by the first rule that fits.
-func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts PushOptions, autoChange bool, branch string, u pushrule.UpdateResult) Outcome {
+// update u by the first rule that fits. A failure of the change feature,
+// a panic included, is the warning of this branch alone: the push stands
+// and the next branch is mapped.
+func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts PushOptions, autoChange bool, branch string, u pushrule.UpdateResult) (o Outcome) {
+	defer func() {
+		if r := recover(); r != nil {
+			o = m.failed(ctx, in, branch, fmt.Errorf("panic: %v", r))
+		}
+	}()
 	// The change feature recorded the version of a push to a change's
 	// source inside the ref update, whatever the push asked.
 	if v := u.Version; v != nil {
@@ -196,8 +205,17 @@ func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts Push
 	case !opts.Change && !autoChange:
 		return Outcome{Branch: branch}
 	}
-	opened, err := m.changes.OpenChange(ctx, openRequest(in, opts, branch, u.After))
+	req := openRequest(in, opts, branch, u.After)
+	target := targetBranch(in, opts)
+	switch {
+	case req.Workspace == source && target == branch:
+		return Outcome{Branch: branch, Kind: OutcomeWarning, Reason: reasonOwnTarget}
+	case !mayOpen(in.Caller):
+		return Outcome{Branch: branch, Kind: OutcomeWarning, Reason: reasonNoScope}
+	}
+	opened, err := m.changes.OpenChange(ctx, req)
 	var exists *ChangeExistsError
+	var refusal *server.Error
 	switch {
 	case errors.As(err, &exists):
 		// Another push opened the change first: this push is a version of
@@ -218,6 +236,8 @@ func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts Push
 			return Outcome{Branch: branch}
 		}
 		return versionOutcome(branch, v)
+	case errors.As(err, &refusal) && refusal.Status() < http.StatusInternalServerError:
+		return Outcome{Branch: branch, Kind: OutcomeWarning, Reason: refusalReason(refusal, target)}
 	case err != nil:
 		return m.failed(ctx, in, branch, err)
 	}
@@ -247,6 +267,27 @@ func openRequest(in MappingInput, opts PushOptions, branch, head string) OpenReq
 		SessionID: in.SessionID,
 		Caller:    in.Caller,
 	}
+}
+
+// targetBranch is the branch the change of a pushed branch would land on:
+// the one the push names, or the default the change feature takes, the
+// pushed workspace's default branch, which is a fork's base branch. It is
+// "" when neither is known.
+func targetBranch(in MappingInput, opts PushOptions) string {
+	switch {
+	case opts.Target != nil:
+		return *opts.Target
+	case in.Workspace.DefaultBranch != nil:
+		return *in.Workspace.DefaultBranch
+	}
+	return ""
+}
+
+// mayOpen reports whether the pusher's credential may open a change. Only a
+// PAT carries scopes, and it needs changes:write, as on the changes route;
+// the mapping checks it because the open itself does not.
+func mayOpen(c PushCaller) bool {
+	return c.CredentialType != CredentialPAT || (c.PAT != nil && identity.Satisfies(c.PAT.Permissions, "changes:write"))
 }
 
 func versionOutcome(branch string, v *pushrule.Version) Outcome {

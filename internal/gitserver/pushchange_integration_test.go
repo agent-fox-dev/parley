@@ -466,3 +466,54 @@ func TestPushChange_OpensTheChangeOfAForkBranchInTheParent(t *testing.T) {
 		}
 	}
 }
+
+// A change the hub cannot open for a pushed branch costs the push nothing:
+// git exits 0, the branch is at the pushed head on the hub, its push event
+// is in the log, and the reason is on a warning line.
+func TestPushChange_WarnsOfAChangeItCannotOpenAndKeepsThePush(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	dir := w.cloneDemo(t, w.ownerKey)
+	gitOnly, _ := w.pat(t, w.owner, "", "git:write")
+	for _, c := range []struct {
+		name, branch string
+		prepare      func()
+		option       string
+		password     string
+		reason       string
+	}{
+		{"a target that does not exist", "fix", func() { branchWithCommit(t, dir, "fix") }, "parley.target=nope", w.ownerKey,
+			"target branch nope does not exist (target_not_found)"},
+		{"a branch at the target's head", "same", func() { runGit(t, dir, "checkout", "--quiet", "-b", "same", "main") }, "parley.change", w.ownerKey,
+			"no commits ahead of main (nothing_to_land)"},
+		{"a branch holding a merge commit", "merged", func() {
+			branchWithCommit(t, dir, "side")
+			branchWithCommit(t, dir, "merged")
+			runGit(t, dir, "merge", "--quiet", "--no-ff", "-m", "merge side", "side")
+		}, "parley.change", w.ownerKey, "merge commits are not supported (merge_commits_unsupported)"},
+		{"a PAT without changes:write", "scoped", func() { branchWithCommit(t, dir, "scoped") }, "parley.change", gitOnly,
+			"token lacks scope changes:write"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			c.prepare()
+			head := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+			seq := w.lastSeq(t)
+			out, err := clientGit(t, dir, nil, "push", "-o", c.option, w.remote(c.password, "acme/demo.git"), c.branch)
+			if err != nil || strings.Contains(out, "[remote rejected]") {
+				t.Fatalf("git push: %v, want it accepted:\n%s", err, out)
+			}
+			want := []string{"remote: warning: no change for " + c.branch + ": " + c.reason}
+			if got := linesWith(out, "remote: warning: no change for "); !slices.Equal(got, want) {
+				t.Errorf("warning lines = %q, want %q:\n%s", got, want, out)
+			}
+			if got := gitrepotest.Refs(t, w.repo, "refs/heads/")[c.branch]; got != head {
+				t.Errorf("the hub's %s is at %q, want the pushed head %s", c.branch, got, head)
+			}
+			if evs := w.pushEvents(t, seq); len(evs) != 1 || evs[0].Ref != "refs/heads/"+c.branch {
+				t.Errorf("push events = %+v, want one for refs/heads/%s", evs, c.branch)
+			}
+			if n := w.changeCount(t); n != 0 {
+				t.Errorf("the hub holds %d changes, want none", n)
+			}
+		})
+	}
+}
