@@ -1,6 +1,7 @@
 package gitserver
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -64,7 +65,9 @@ type PushCaller struct {
 // a gzip body is passed on as the client sent it, because the processor
 // decides how much of a push it reads and how. Full duplex is enabled on
 // the response before the call, so that the processor may answer while it
-// reads. It returns the result of the request, which the git server counts
+// reads. The request's context ends at the request's deadline, [git].timeout
+// after it came in, which bounds the processor's work as it bounds a
+// fetch. It returns the result of the request, which the git server counts
 // once; the processor never counts it itself.
 type PushProcessor interface {
 	ProcessPush(w http.ResponseWriter, r *http.Request, caller PushCaller, ws workspace.Workspace) Result
@@ -73,16 +76,19 @@ type PushProcessor interface {
 var errNoPushProcessor = errors.New("no push processor is installed")
 
 // push hands a push that passed every check to the push processor, which
-// writes the whole answer, and returns the processor's result. Without a
-// processor the push is answered 500 internal error with its body unread
-// and git not run, so that nothing in the repository changes.
+// writes the whole answer, and returns the processor's result; the
+// request's context ends at its deadline. Without a processor the push is
+// answered 500 internal error with its body unread and git not run, so
+// that nothing in the repository changes.
 func (c *Component) push(w http.ResponseWriter, r *http.Request, x Exchange) Result {
 	if c.deps.Push == nil {
 		c.fail(w, r, errNoPushProcessor)
 		return ResultError
 	}
 	_ = http.NewResponseController(w).EnableFullDuplex()
-	return c.deps.Push.ProcessPush(w, r, pushCaller(x), x.Workspace)
+	ctx, cancel := context.WithDeadline(r.Context(), x.deadline)
+	defer cancel()
+	return c.deps.Push.ProcessPush(w, r.WithContext(ctx), pushCaller(x), x.Workspace)
 }
 
 // pushCaller is the caller the checks established for x.

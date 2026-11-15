@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,13 +27,19 @@ const (
 	DefaultTimeout = 30 * time.Minute
 )
 
-// Register registers [git].timeout with r: how long one git request may
-// take, a task fork's ref copy and the run of upload-pack together, a
-// duration with a unit of s, m, h or d above zero (default 30m). A value
-// that breaks the rule fails the load with an error naming the key, which
-// stops the start.
+// Register registers the keys of [git] with r: timeout, how long one git
+// request may take, a task fork's ref copy and the run of upload-pack, or
+// the push processor's work up to its ref transaction, together, a
+// duration with a unit of s, m, h or d above zero (default 30m); and
+// max_push_size, the largest pack a push may send, 0 for no limit (the
+// default), a whole number of bytes or a whole number followed by KB, MB or
+// GB. A value that breaks a rule fails the load with an error naming the
+// key, which stops the start.
 func Register(r *config.Registry) error {
-	return r.Register(config.Key{Section: SectionName, Name: "timeout", Type: config.String, Default: "30m", Validate: validTimeout})
+	return errors.Join(
+		r.Register(config.Key{Section: SectionName, Name: "timeout", Type: config.String, Default: "30m", Validate: validTimeout}),
+		r.Register(config.Key{Section: SectionName, Name: "max_push_size", Type: config.String, Default: "0", Validate: validPushSize}),
+	)
 }
 
 func validTimeout(v any) error {
@@ -53,6 +60,35 @@ func TimeoutFrom(cfg *config.Config) time.Duration {
 		return d
 	}
 	return DefaultTimeout
+}
+
+func validPushSize(v any) error {
+	_, err := parsePushSize(v.(string))
+	return err
+}
+
+// parsePushSize reads a value of [git].max_push_size: a whole number of
+// bytes, 0 among them, or a size as [server].max_body_size takes one.
+func parsePushSize(s string) (int64, error) {
+	if s != "" && strings.Trim(s, "0123456789") == "" {
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return n, nil
+		}
+		return 0, errors.New("is too large")
+	}
+	n, err := config.ParseSize(s)
+	if err != nil {
+		return 0, errors.New("must be 0, a whole number of bytes, or a whole number followed by KB, MB or GB, such as 100MB")
+	}
+	return n, nil
+}
+
+// MaxPushSizeFrom reads [git].max_push_size from cfg, loaded with the key
+// Register registers, in bytes; 0, also for a key that was not loaded, is
+// no limit.
+func MaxPushSizeFrom(cfg *config.Config) int64 {
+	n, _ := parsePushSize(cfg.String(SectionName, "max_push_size"))
+	return n
 }
 
 // Runner runs git for a client: upload-pack for ref discovery and the

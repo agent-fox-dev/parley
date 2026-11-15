@@ -458,6 +458,40 @@ func Refs(t testing.TB, dir, prefix string) map[string]string {
 	return refs
 }
 
+// Pack is the pack git pack-objects --revs writes in the repository whose
+// git directory is dir for revs, such as a commit and ^ a commit the
+// receiver has: the bytes a client sends to push them.
+func Pack(t testing.TB, dir string, revs ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", "pack-objects", "--stdout", "--revs", "--quiet")
+	cmd.Env = append(os.Environ(), "GIT_DIR="+dir, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+	cmd.Stdin = strings.NewReader(strings.Join(revs, "\n") + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("pack %v in %s: %v", revs, dir, err)
+	}
+	return string(out)
+}
+
+// Quarantines lists the entries of the object directory of the repository
+// whose git directory is dir that git does not keep there itself (pack,
+// info and the two-character directories of loose objects): what a push
+// left behind of its quarantine. A directory it cannot read is reported as
+// its error, so that a test sees it.
+func Quarantines(dir string) []string {
+	entries, err := os.ReadDir(filepath.Join(dir, "objects"))
+	if err != nil {
+		return []string{err.Error()}
+	}
+	var strays []string
+	for _, e := range entries {
+		if n := e.Name(); n != "pack" && n != "info" && len(n) != 2 {
+			strays = append(strays, n)
+		}
+	}
+	return strays
+}
+
 // ObjectCounts is what git count-objects -v reports for the repository
 // whose git directory is dir, by field: count is its loose objects, in-pack
 // its packed ones.

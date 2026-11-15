@@ -438,7 +438,7 @@ func build(values map[string]map[string]any, providers []Provider, path, work, d
 	values["database"]["path"] = dataPath(values["database"]["path"].(string), "parley.db", work, dataHome)
 	values["workspace"]["path"] = dataPath(values["workspace"]["path"].(string), "workspaces", work, dataHome)
 	values["logging"]["level"] = strings.ToLower(values["logging"]["level"].(string))
-	maxBody, _ := parseSize(values["server"]["max_body_size"].(string)) // checked by its key's rule
+	maxBody, _ := ParseSize(values["server"]["max_body_size"].(string)) // checked by its key's rule
 
 	c := &Config{Path: path, Dir: filepath.Dir(path), values: values}
 	c.Server = Server{

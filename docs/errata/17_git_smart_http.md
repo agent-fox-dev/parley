@@ -203,19 +203,18 @@ does not set is deleted). Names, prefixes and the prune namespace come from
 the git server alone, so no other ref of the parent is copied and no other
 ref of the fork is touched.
 
-## The hub installs no push processor yet
+## The push processor is installed by package 18, in `internal/hub`
 
 The package passes "the push processor of package 18" to the git server.
-Package 18 (the push rules) is not part of the hub yet, so
-`internal/hub/gitserver.go` installs none, and `cmd/parleyd` is unchanged,
-as for every other collaborator of the git server. Ref discovery for a push
-is served, and a push that passed every check is answered
-`500 internal error` with its body unread and git not run, so no ref of the
-repository changes and stock `git push` fails. The hand-over to an
-installed processor is tested through the test seam (`AdjustGitServer`)
-with a processor that records what it was handed. Once package 18 sets
-`gitserver.Deps.Push` in the git server's start hook, pushes reach it and
-nothing else changes.
+Package 18 installs it where every other collaborator of the git server is
+installed: the git server's start hook in `internal/hub/gitserver.go` sets
+`gitserver.Deps.Push` to the hub's `gitserver.Receiver`, and `cmd/parleyd`
+is unchanged. A push that passed every check is processed by it (see
+erratum 18 and `docs/architecture.md`). The git server still answers a push
+`500 internal error`, its body unread and git not run, when no processor is
+set; the test of that case removes the processor through the test seam
+(`AdjustGitServer`), and the hand-over is tested there with a processor
+that records what it was handed.
 
 ## The PAT a push processor gets is the principal of the credential check
 

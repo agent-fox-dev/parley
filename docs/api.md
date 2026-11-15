@@ -733,11 +733,84 @@ A push that passed every check gets its ref advertisement from
   capability list, which holds `report-status`, `delete-refs`,
   `side-band-64k`, `ofs-delta`, `atomic` and `push-options`.
 - `POST …/git-receive-pack` is handed, with its body unread and whatever
-  its size, to the hub's push processor, which writes the whole answer.
-  The hub has no push processor yet, so the push is answered `500` with the
-  body `internal error`, its body is not read, git does not run, and no ref
-  of the repository changes; stock `git push` fails with
-  `error: RPC failed; HTTP 500`.
+  its size, to the hub's push processor, which writes the whole answer;
+  `git receive-pack` does not run. A push moves all of its refs or none:
+  - The body (gzip-decoded when `Content-Encoding` says so) holds the
+    commands `<old> <new> <ref>`, the client's capabilities after a NUL on
+    the first, a flush packet, then the push options and a flush packet
+    when the client asked for `push-options`, then the pack, which a push
+    of deletes only leaves out. A body whose command list cannot be read is
+    answered `400` with `invalid receive-pack request`; a body holding only
+    a flush packet is answered `200` with an empty body and changes
+    nothing.
+  - The pack is held apart from the repository until the push is accepted.
+    A pack git cannot index, or a new value that names no object, is
+    reported `unpack invalid pack` with `ng <ref> unpacker error` for every
+    ref. A pack larger than `[git].max_push_size` (no limit by default; see
+    [configuration.md](configuration.md)) is read no further and reported
+    `unpack pack exceeds the maximum push size` with
+    `ng <ref> unpacker error` for every ref; a pack of exactly the limit is
+    accepted.
+  - A push is bounded by `[git].timeout` from its arrival up to its ref
+    transaction: when it runs out before, the push's `git` processes are
+    killed, nothing changes, and every ref is reported
+    `unpack push timed out` with `ng <ref> unpacker error`; once the ref
+    transaction has started, the push is finished.
+  - Every ref update is decided by the push rules, in the order hub-owned
+    refs (`refs/parley/ is maintained by the hub and cannot be pushed to`),
+    protected branches (`<branch> is protected and cannot be force-pushed
+    or deleted`, `<branch> is protected; push another branch and open a
+    change (git push -o parley.change)`; while `protect.owner_push` is
+    true, the workspace's owner or an admin may fast-forward one with an
+    API key, the admin token, or a PAT neither bound to a workspace nor
+    limited to paths), the default branch (`<branch> is the default branch
+    and cannot be deleted`), a fork's tracking branches (`<branch> tracks
+    the parent workspace and is read-only in this fork; push a new
+    branch`), the carry-patch controls and the paths of a path-scoped PAT
+    (`path <path> is outside this token's allowed paths`: every path a new
+    commit changes, every path of a tree a ref is pointed at, and, for a
+    blob a ref is pointed at, which has no path, the ref's name); one that
+    cannot be decided is refused with `internal error; try again`. The
+    refs then move together by compare-and-swap against the old values
+    sent: a ref that moved meanwhile is refused with `ref changed since it
+    was read; fetch and try again`, so of two pushes of one ref from one
+    value exactly one goes through.
+  - The answer is `200` with
+    `Content-Type: application/x-git-receive-pack-result` and
+    `Cache-Control: no-cache`. With `report-status` (or
+    `report-status-v2`) it holds the status report: `unpack ok`, then per
+    command, in order, `ok <ref>` for an accepted push, or for a refused
+    one `ng <ref> <message>` for each refused ref and
+    `ng <ref> not updated: another ref in this push was refused` for the
+    others. With `side-band-64k` the report comes inside band 1, and band 2
+    carries before it an `error: <ref>: <message>` line per refused ref,
+    which git shows as `remote: error: …`. Without `report-status` the
+    answer has no report, and without `side-band-64k` no `error:` line.
+  - A refused push leaves every ref as it was and none of its objects in
+    the repository, also one refused after its objects were moved in
+    (a failing stage or store), which has them taken out again.
+  - An accepted push writes one `parley.git.push` event per ref update, in
+    command order, all in one transaction, so the events of one push are
+    adjacent in the event log, before the answer is sent. A refused push,
+    one whose pack fails and one without commands write none. The event
+    names the addressed workspace (a task fork's own slug for a fork) as
+    `workspace`, `resource_type` `ref` and the full ref name as
+    `resource_id`, the caller as for the fetch event below (`actor_type`
+    `pat`, `api_key` or `admin_token`, the user as `actor_id`, `null` for
+    the admin token), and the session the push belongs to as `session_id`,
+    `null` for none. Its metadata holds `ref`, `before` (`null` for a
+    create), `after` (`null` for a delete), `created`, `deleted`, `forced`
+    (neither a create nor a delete, and `before` not an ancestor of
+    `after`), `direct` (a fast-forward of a protected branch by its owner
+    or the admin token) and `via`, `git` for a push:
+
+    ```json
+    {"seq":15,"id":"…","type":"parley.git.push","time":"2026-11-14T10:33:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"ref","resource_id":"refs/heads/main","action":"push","session_id":null,"metadata":{"ref":"refs/heads/main","before":"3ba7119670b709c3ed9a0fafc7c8d0d3124b74e1","after":"e59b116d14077f2bdc935c1adee921a5b9f2ec67","created":false,"deleted":false,"forced":false,"direct":true,"via":"git"}}
+    ```
+
+    A push stays accepted when its events cannot be written: they are
+    written when the hub next starts, before it serves, as are those of a
+    push whose refs moved just before the hub stopped.
 
 A task fork is served with its own refs and what it shows of its parent's,
 on every git route, as of the moment of the request:
@@ -767,7 +840,12 @@ discovery, whichever service it asks for, `upload-pack` or `receive-pack`.
 every other refusal (`400`, `409`, `429`, `500`) and for an exchange that
 ended with one of the hub's `ERR` pkt-lines, a failed git or a timeout;
 `ok` for a served exchange; and, for a push handed to the push processor,
-the result the processor reports. The hub does not export the counter at
+the result the processor reports: `ok` for an accepted push and for one
+without commands, `refused` for a push refused by a rule, by the options
+stage or because a ref moved meanwhile, `error` for a pack that cannot be
+read or is over `[git].max_push_size`, a push that timed out, one refused
+with `internal error; try again` and a command list that cannot be read
+(`400`). The hub does not export the counter at
 `/metrics` yet.
 
 When the workspace's setting `audit_fetches` is `true` (for a task fork,

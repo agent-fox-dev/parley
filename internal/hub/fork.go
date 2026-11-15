@@ -67,9 +67,11 @@ const (
 // push to the fork, an API write to it, a change of it opened, versioned,
 // landed, abandoned or restored: the push rules, the change feature and
 // the landing) register the component's RecordActivity with their own
-// activity hook, through one adapter each, in this function; none of them
-// is in the hub yet, so none is registered, and a fork's last activity is
-// its creation.
+// activity hook in this function. The ref writer's is registered here: the
+// writer tells the component of every accepted write to a fork through git
+// or the source control API, after the refs moved and outside any store
+// transaction, since RecordActivity opens its own. The change feature and
+// the landing are not in the hub yet, so theirs are not.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp
@@ -82,6 +84,7 @@ func composeForks(c *Composition) {
 	c.workspaces.RegisterForkField("purpose", fork.PurposeField)
 	c.workspaces.RegisterForkField("auto_change", fork.AutoChangeField)
 	c.workspaces.RegisterForkUpdateGuard(fork.GuardUpdate)
+	c.refWriter.RegisterForkActivity(comp)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
