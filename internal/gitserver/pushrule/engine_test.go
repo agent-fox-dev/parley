@@ -74,3 +74,75 @@ func TestEvaluate_DecidesEveryUpdateInOrderAndWritesNothing(t *testing.T) {
 		t.Errorf("refs after evaluating:\n%s\nwant:\n%s", got, refsBefore)
 	}
 }
+
+func TestEvaluate_AnswersWithTheFirstRuleThatRefuses(t *testing.T) {
+	r := newRepo(t)
+	src := commit(t, r.dir, []string{r.head}, "M src/a.go")
+	const patchMsg = "patch/a is rebuilt by the hub; push a new patch branch"
+	for _, tc := range []struct {
+		ws        pushrule.Workspace
+		protected []string
+		caller    pushrule.Caller
+		u         pushrule.Update
+		want      outcome
+		asked     int
+	}{
+		{demo, []string{"main"}, ownerKey, remove("refs/heads/main", r.head),
+			refused("main is protected and cannot be force-pushed or deleted", "protected_branch"), 0},
+		{demoFk, []string{"main"}, ownerKey, create("refs/heads/main", r.head),
+			refused("main is protected; push another branch and open a change (git push -o parley.change)", "protected_branch"), 0},
+		{demoFk, []string{"main"}, ownerKey, move("refs/heads/main", r.base, r.head),
+			refused("main tracks the parent workspace and is read-only in this fork; push a new branch", "tracking_branch"), 0},
+		{demoFk, nil, ownerKey, remove("refs/heads/main", r.head),
+			refused("main is the default branch and cannot be deleted", "default_branch"), 0},
+		{demoCP, []string{"main", "patch/*"}, ownerKey, move("refs/heads/patch/a", r.base, r.head),
+			refused(patchMsg, "patch_branch"), 1},
+		{demoCP, []string{"main", "patch/*"}, memberKey, move("refs/heads/patch/a", r.base, r.head),
+			refused("patch/a is protected; push another branch and open a change (git push -o parley.change)", "protected_branch"), 0},
+		{demo, []string{"main"}, docsPAT, move("refs/heads/feat", r.head, src),
+			outcome{Message: "path src/a.go is outside this token's allowed paths", ErrorType: "path_not_allowed", Path: "src/a.go"}, 0},
+		{demoFk, []string{"main"}, docsPAT, move("refs/heads/dev", r.head, src),
+			refused("dev tracks the parent workspace and is read-only in this fork; push a new branch", "tracking_branch"), 0},
+	} {
+		cp := &controller{answers: map[string]pushrule.Answer{"refs/heads/patch/a": pushrule.Refuse(patchMsg, "patch_branch")}}
+		e := engine(pushrule.EngineDeps{Settings: protecting(tc.protected...), Tracking: &tracking{branches: []string{"main", "dev"}}})
+		e.RegisterController(cp)
+		got := decide(t, e, r, tc.ws, tc.caller, tc.u)
+		if asked, _ := cp.counts(); got != tc.want || asked != tc.asked {
+			t.Errorf("%s on %s by %s: %+v after %d controller questions, want %+v after %d",
+				describe(tc.u), tc.ws.Slug, tc.caller.CredentialID, got, asked, tc.want, tc.asked)
+		}
+	}
+}
+
+func TestEvaluate_RefusesAsInternalWhatARuleCannotEvaluate(t *testing.T) {
+	r := newRepo(t)
+	ff := move("refs/heads/feat", r.base, r.head)
+	added := move("refs/heads/feat", r.head, commit(t, r.dir, []string{r.head}, "M docs/added.md"))
+	none := protecting()
+	for _, tc := range []struct {
+		fault      string
+		ws         pushrule.Workspace
+		deps       pushrule.EngineDeps
+		controller pushrule.Controller
+		fails      string
+		caller     pushrule.Caller
+		u          pushrule.Update
+	}{
+		{"settings reader fails", demo, pushrule.EngineDeps{Settings: settings{err: errInjected}}, nil, "", ownerKey, ff},
+		{"is-ancestor fails on a protected branch", demo, pushrule.EngineDeps{Settings: protecting("main")}, nil, "IsAncestor", ownerKey, move("refs/heads/main", r.base, r.head)},
+		{"tracking lookup fails on a fork", demoFk, pushrule.EngineDeps{Settings: none, Tracking: &tracking{err: errInjected}}, nil, "", ownerKey, ff},
+		{"controller fails", demoCP, pushrule.EngineDeps{Settings: none}, &controller{err: errInjected}, "", ownerKey, ff},
+		{"no controller on a carry_patch workspace", demoCP, pushrule.EngineDeps{Settings: none}, nil, "", ownerKey, ff},
+		{"version-files lookup fails", demo, pushrule.EngineDeps{Settings: none, VersionFiles: &versionFiles{err: errInjected}}, nil, "", docsPAT, ff},
+		{"new-commits question fails", demo, pushrule.EngineDeps{Settings: none}, nil, "NewCommits", docsPAT, added},
+		{"changed-paths question fails", demo, pushrule.EngineDeps{Settings: none}, nil, "ChangedPaths", docsPAT, added},
+	} {
+		e := engine(tc.deps)
+		e.RegisterController(tc.controller)
+		v := e.Evaluate(context.Background(), pushrule.Request{Workspace: tc.ws, Caller: tc.caller, Updates: []pushrule.Update{tc.u}, Repo: &view{View: r.view, fails: tc.fails}})
+		if len(v.Decisions) != 1 || outcomeOf(v.Decisions[0]) != refused("internal error; try again", "internal") {
+			t.Errorf("%s: %+v, want one refused as internal", tc.fault, v.Decisions)
+		}
+	}
+}

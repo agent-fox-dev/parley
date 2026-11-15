@@ -79,15 +79,27 @@ type View interface {
 	// IsAncestor reports whether the commit ancestor is reachable from the
 	// commit descendant.
 	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
+	// NewCommits lists the commits reachable from tips, commits or tags
+	// that lead to one, and from no ref of the repository nor, when
+	// parentDir is not "", of the repository at that git directory, oldest
+	// first with every commit after its parents.
+	NewCommits(ctx context.Context, tips []string, parentDir string) ([]string, error)
+	// ChangedPaths lists in byte order the paths commit changes against its
+	// first parent, every path of its tree for a root commit, and both
+	// paths of a rename.
+	ChangedPaths(ctx context.Context, commit string) ([]string, error)
 }
 
 // Request is one write to evaluate: the updates, in the order the caller
 // sent them, of the workspace by the caller, asked of the repository Repo.
+// ParentRepo is the git directory of a fork's parent, whose commits are not
+// new to the fork, and empty for a workspace that is no fork.
 type Request struct {
-	Workspace Workspace
-	Caller    Caller
-	Updates   []Update
-	Repo      View
+	Workspace  Workspace
+	Caller     Caller
+	Updates    []Update
+	Repo       View
+	ParentRepo string
 }
 
 // Settings are the workspace's effective settings that decide how its
@@ -115,10 +127,12 @@ type Tracking interface {
 // is the settings reader; nil means every workspace has the settings'
 // defaults, which protect its default branch and allow direct pushes.
 // Tracking is the tracking-branch lookup; nil means no fork has tracking
-// branches.
+// branches. VersionFiles is the version-files lookup; nil means no update
+// without new commits makes a version.
 type EngineDeps struct {
-	Settings SettingsReader
-	Tracking Tracking
+	Settings     SettingsReader
+	Tracking     Tracking
+	VersionFiles VersionFiles
 }
 
 // Decision is the engine's answer for one update. An allowed update says
@@ -172,7 +186,9 @@ func (e *Engine) Bind(d EngineDeps) {
 // writes nothing itself: no ref, no event, no forward to origin; a forward
 // the carry-patch controller asks for rides on the allowed decision. A rule
 // that cannot be evaluated refuses its update with ErrorTypeInternal, so
-// Evaluate has no error of its own.
+// Evaluate has no error of its own. The rule for path-scoped tokens, last
+// in the order, looks at the commits of the request as a whole, and runs
+// only once every update passed the rules before it.
 func (e *Engine) Evaluate(ctx context.Context, req Request) Verdict {
 	e.mu.RLock()
 	ev := &evaluation{deps: e.deps, controller: e.controller, req: req}
@@ -180,6 +196,9 @@ func (e *Engine) Evaluate(ctx context.Context, req Request) Verdict {
 	v := Verdict{Decisions: make([]Decision, 0, len(req.Updates))}
 	for _, u := range req.Updates {
 		v.Decisions = append(v.Decisions, ev.decide(ctx, u))
+	}
+	if !v.Refused() {
+		ev.pathScoped(ctx, v.Decisions)
 	}
 	return v
 }
@@ -223,14 +242,11 @@ func (ev *evaluation) pushSettings(ctx context.Context) (Settings, error) {
 // without a repository to ask.
 var errNoView = errors.New("no repository view to ask")
 
-// decide runs the rules over u in order, the first refusal deciding, and
-// allows u when none refuses.
+// decide runs the per-update rules over u in order, the first refusal
+// deciding, and allows u when none refuses.
 func (ev *evaluation) decide(ctx context.Context, u Update) Decision {
 	ev.cur = current{}
 	for _, r := range order {
-		if r == nil {
-			continue
-		}
 		if no := r(ctx, ev, u); no != nil {
 			return no.decision(u)
 		}

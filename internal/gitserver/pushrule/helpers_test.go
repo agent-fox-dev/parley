@@ -2,8 +2,11 @@ package pushrule_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -42,6 +45,38 @@ func newRepo(t *testing.T) *repo {
 	return &repo{dir: dir, view: view, base: base, head: heads["main"], side: heads["side"]}
 }
 
+// commit writes, in the repository at dir, a commit of parents (none for a
+// root commit) whose tree is the first parent's changed by ops, fast-import
+// file commands in which "M <path>" writes a file holding its path, and
+// returns its id, which no ref reaches.
+func commit(t *testing.T, dir string, parents []string, ops ...string) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("commit refs/new\ncommitter P <p@example.invalid> now\ndata 0\n")
+	for i, p := range parents {
+		b.WriteString([]string{"from ", "merge "}[min(i, 1)] + p + "\n")
+	}
+	for _, op := range ops {
+		if path, ok := strings.CutPrefix(op, "M "); ok {
+			op = fmt.Sprintf("M 100644 inline %s\ndata %d\n%s", path, len(path), path)
+		}
+		b.WriteString(op + "\n")
+	}
+	return unreferenced(t, dir, "refs/new", b.String())
+}
+
+// unreferenced runs the fast-import stream, which writes ref, in the
+// repository at dir, and returns what ref pointed at once it removed ref.
+func unreferenced(t *testing.T, dir, ref, stream string) string {
+	t.Helper()
+	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet", "--date-format=now"); err != nil {
+		t.Fatal(err)
+	}
+	id := gitrepotest.Git(t, dir, "rev-parse", ref)
+	gitrepotest.Git(t, dir, "update-ref", "-d", ref)
+	return id
+}
+
 // The callers of the tests, by the credential they push with.
 var (
 	adminToken = pushrule.Caller{Level: access.LevelAdmin, CredentialType: pushrule.CredentialAdminToken}
@@ -49,6 +84,7 @@ var (
 	ownerPAT   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-owner", UserID: "u-owner"}
 	boundPAT   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-bound", UserID: "u-owner", Bound: true}
 	pathsPAT   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-paths", UserID: "u-owner", Paths: []string{"**"}}
+	docsPAT    = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-docs", UserID: "u-owner", Paths: []string{"docs/**"}}
 	memberKey  = pushrule.Caller{Level: access.LevelMember, CredentialType: pushrule.CredentialAPIKey, CredentialID: "key-member", UserID: "u-member"}
 	memberPAT  = pushrule.Caller{Level: access.LevelMember, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-member", UserID: "u-member"}
 )
@@ -94,10 +130,11 @@ func (s *tracking) IsTracking(_ context.Context, slug, branch string) (bool, err
 }
 
 // controller is a carry-patch controller that answers each ref with its
-// scripted answer, Allow for a ref it has none for, and records each question
-// and each run of its forward.
+// scripted answer, Allow for a ref it has none for, or fails with err, and
+// records each question and each run of its forward.
 type controller struct {
 	answers map[string]pushrule.Answer
+	err     error
 
 	mu        sync.Mutex
 	asked     []string
@@ -108,6 +145,9 @@ func (c *controller) Decide(_ context.Context, ws pushrule.Workspace, caller pus
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.asked = append(c.asked, ws.Slug+":"+caller.CredentialID+":"+u.Ref)
+	if c.err != nil {
+		return pushrule.Answer{}, c.err
+	}
 	if a, ok := c.answers[u.Ref]; ok {
 		return a, nil
 	}
@@ -125,6 +165,63 @@ func (c *controller) counts() (asked, forwarded int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.asked), c.forwarded
+}
+
+// errInjected is the failure a stub is told to answer with.
+var errInjected = errors.New("injected failure")
+
+// view is a repository view that fails the question named by fails
+// ("IsAncestor", "NewCommits" or "ChangedPaths") and counts the questions
+// about commits it is asked.
+type view struct {
+	pushrule.View
+	fails string
+
+	mu    sync.Mutex
+	asked int
+}
+
+func (v *view) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	if v.fails == "IsAncestor" {
+		return false, errInjected
+	}
+	return v.View.IsAncestor(ctx, ancestor, descendant)
+}
+
+func (v *view) NewCommits(ctx context.Context, tips []string, parentDir string) ([]string, error) {
+	if v.count("NewCommits") {
+		return nil, errInjected
+	}
+	return v.View.NewCommits(ctx, tips, parentDir)
+}
+
+func (v *view) ChangedPaths(ctx context.Context, commit string) ([]string, error) {
+	if v.count("ChangedPaths") {
+		return nil, errInjected
+	}
+	return v.View.ChangedPaths(ctx, commit)
+}
+
+// count counts a question about commits and reports whether it fails.
+func (v *view) count(question string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.asked++
+	return v.fails == question
+}
+
+// versionFiles answers every question with files and found, or fails with
+// err, and records each question.
+type versionFiles struct {
+	files []string
+	found bool
+	err   error
+	asked []string
+}
+
+func (s *versionFiles) Files(_ context.Context, slug, branch, head string, opensChange bool) ([]string, bool, error) {
+	s.asked = append(s.asked, fmt.Sprintf("%s %s %s %t", slug, branch, head, opensChange))
+	return s.files, s.found, s.err
 }
 
 func engine(deps pushrule.EngineDeps) *pushrule.Engine {

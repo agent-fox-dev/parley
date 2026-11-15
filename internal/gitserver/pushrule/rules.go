@@ -39,17 +39,17 @@ func (r *refusal) decision(u Update) Decision {
 // rule refuses u, or returns nil to leave it to the rules after it.
 type rule func(ctx context.Context, ev *evaluation, u Update) *refusal
 
-// order is the rules in the order they are evaluated: hub-owned refs,
-// protected branches, default branch deletion, tracking branches,
-// carry-patch push control, path-scoped tokens. A nil slot is a rule the
-// engine does not hold yet, and is skipped.
+// order is the rules each update is evaluated by, in order: hub-owned
+// refs, protected branches, default branch deletion, tracking branches,
+// carry-patch push control. The last rule, path-scoped tokens, follows them
+// for the request as a whole (pathScoped), since a commit may come with any
+// of its updates.
 var order = [...]rule{
 	hubOwnedRef,
 	protectedBranch,
 	defaultBranchDeletion,
 	trackingBranch,
 	carryPatch,
-	nil, // path-scoped tokens
 }
 
 // hubOwnedRef refuses every write under refs/parley/, whoever the caller:
