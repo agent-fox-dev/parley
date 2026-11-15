@@ -84,8 +84,10 @@ type OpenInput struct {
 // mergeable unknown, asks the auto_land guard before it stores auto_land,
 // then runs the stack linker, the landing evaluator (not for a draft) and
 // the version observers in that order, tells the fork activity recorder of
-// a fork source, and writes parley.change.version and, unless the change is
-// a draft, parley.change.open. It returns the change as stored then.
+// a fork source, and writes parley.change.version, with the version as
+// stored then (the stack linker may have measured it from the change
+// below), and, unless the change is a draft, parley.change.open. It
+// returns the change as stored then.
 //
 // With AfterMove, a source branch that tx finds at another head than Head
 // records that head as version 2, of kind ref by the hub, and one that tx
@@ -168,6 +170,9 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (_ Chang
 		}
 	}
 	if ch, err = readChange(ctx, tx, ch.WorkspaceSlug, number); err != nil {
+		return Change{}, err
+	}
+	if v, err = storedVersion(ctx, tx, ch.WorkspaceSlug, number, v); err != nil {
 		return Change{}, err
 	}
 	if err := c.emitOpen(ctx, tx, in.Caller, ch, v); err != nil {

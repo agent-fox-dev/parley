@@ -594,6 +594,37 @@ func (w *world) changesOfDemo(t *testing.T) changesOfDemo {
 	return f
 }
 
+// stacked opens in demo a change from each of the new branches, in order,
+// each branch one commit adding <name>.txt on top of the branch before it
+// (the first on base), and returns them as opened.
+func (w *world) stacked(t *testing.T, names ...string) []change.Change {
+	t.Helper()
+	from := w.base
+	var out []change.Change
+	for _, n := range names {
+		from = commit(t, w.demo, n, from, n+"\n", map[string]string{n + ".txt": n + "\n"})
+		out = append(out, w.openBranch(t, n, nil))
+	}
+	return out
+}
+
+// versionEvent is the metadata of the last parley.change.version event of
+// the change number of demo after seq; it fails the test when there is
+// none.
+func (w *world) versionEvent(t *testing.T, seq, number int64) map[string]any {
+	t.Helper()
+	var out map[string]any
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.Type == change.EventVersion && e.ResourceID == strconv.FormatInt(number, 10) {
+			out = metadata(t, e)
+		}
+	}
+	if out == nil {
+		t.Fatalf("no parley.change.version of demo#%d after %d", number, seq)
+	}
+	return out
+}
+
 // landedCommits counts the landed-commit records.
 func (w *world) landedCommits(t *testing.T) int {
 	t.Helper()

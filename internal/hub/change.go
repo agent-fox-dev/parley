@@ -102,11 +102,19 @@ const (
 // gone is abandoned for source_deleted, and every change whose mergeable is
 // unknown is scheduled for a check, which the worker runs once it starts.
 //
-// No session linker, stack linker, landing evaluator or auto_land guard is
-// registered: without a session linker an explicit session_id is refused
-// and a defaulted one dropped; without a stack linker no change depends on
-// another; without a landing evaluator every open change is ready to land;
-// and auto_land is stored as given.
+// The component's own stack linker (StackLinker) links every new version,
+// at open and after, to the nearest draft or open change of the same
+// workspace and target branch whose head its head is built on, and measures
+// the version from that change's head, so that a change of a stack counts
+// only its own commits; with none below, the link is cleared and the
+// version keeps the merge base with its target branch. Its column of the
+// change record, the commit a change must sit on once the change below it
+// landed, is added by StackStep.
+//
+// No session linker, landing evaluator or auto_land guard is registered:
+// without a session linker an explicit session_id is refused and a
+// defaulted one dropped; without a landing evaluator every open change is
+// ready to land; and auto_land is stored as given.
 //
 // The component exists from the composition on (Changes); tests change its
 // dependencies with AdjustChange.
@@ -117,11 +125,13 @@ func composeChanges(c *Composition) {
 	c.AddSchemaStep(change.AutoLandSetterStep)
 	c.AddSchemaStep(change.MergeableStep)
 	c.AddSchemaStep(change.AnnouncedStep)
+	c.AddSchemaStep(change.StackStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
 	c.refWriter.RegisterRefUpdatedStage(comp.RefUpdated)
 	c.refWriter.RegisterRefUpdatedStage(comp.TargetsUpdated)
+	comp.RegisterStackLinker(comp.StackLinker())
 	comp.AddVersionObserver(comp.MergeableObserver())
 	c.scm.RegisterChangeLinker(changeLinker{comp, c.runtime})
 	c.AdjustSCM(func(d *scm.Deps) { d.Changes = changeLookup{comp} })

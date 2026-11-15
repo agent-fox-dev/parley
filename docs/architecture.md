@@ -3532,8 +3532,10 @@ push calls no linker. The three `POST` routes are registered with
 in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 `change.SchemaStep` (the step `changes`) and right after it
 `change.AutoLandSetterStep` (`change_auto_land_setter`),
-`change.MergeableStep` (`change_mergeable`) and `change.AnnouncedStep`
-(`change_ready_announced`), registers its `Routes()` with
+`change.MergeableStep` (`change_mergeable`), `change.AnnouncedStep`
+(`change_ready_announced`) and `change.StackStep` (`change_stack`, the
+column `restack_onto`: the commit a change must sit on once the change
+below it landed, `NULL` for none), registers its `Routes()` with
 `AddRoute`, and binds it in the start hook `changes` to the store
 (`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
 (`Repos`), the access service (`Access`), `changeWorkspaces` (`Workspaces`), an adapter over
@@ -3627,7 +3629,10 @@ again when a later step fails), records the
 session link, makes it the change's current version (head, base, patch id,
 stats, paths, `session_id`, `mergeable` `unknown`, `updated_at`), then runs
 the stack linker, the landing derivation and the observers as at open, and
-emits `parley.change.version`. The landing of a draft stays
+emits `parley.change.version` with the version re-read from the
+transaction (`storedVersion`), since the stack linker may have moved its
+base, and so its stats and `patch_equivalent_to`; `Open` does the same.
+The landing of a draft stays
 `blocked`/`draft`; a missing target branch, a head with no commit the
 target lacks, a head with no history in common with the target and a
 merge commit among the version's commits store `blocked` with
@@ -3643,8 +3648,25 @@ the component instance, with `RegisterSessionLinker`,
 `RegisterAutoLandGuard`, `RegisterForkActivity` and, declared beside the
 abandon in `lifecycle.go`, `RegisterRestacker`
 ([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
-The hub registers the fork activity recorder (below) and none of the
-others yet. `ReadChange(ctx, q, workspace, number)` reads
+The hub registers the fork activity recorder (below) and the component's
+own stack linker (`StackLinker()`, below), and no session linker, landing
+evaluator, auto_land guard or restacker.
+
+The stack linker (`stack.go`, the type `stacks`) links each new version,
+at open and after, from the commit graph: of the other draft and open
+changes of the same workspace and target branch, whose head is not the
+new head, it keeps those whose head is a proper ancestor of the new head
+(`IsAncestor`, asked of the target's repository, which holds every
+version head of its changes under their version refs, a fork's too), and
+takes the one with the fewest commits to the new head (`CommitsBetween`),
+the lowest number on a tie. It stores the link through `SetDependsOn` when
+it differs and, for a link, moves the version's base to that change's head
+through `SetBase`, so that the stats, paths and patch id count only the
+change's own commits; with none below, it clears the link and the version
+keeps the merge base with the target branch that measuring it found. The
+`depends_on` an open names is not taken: the link from the commit graph
+stands. Its `SetDependsOn` (for `PATCH`) stores the value given and writes
+nothing for the value the change already has. `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
 The change's `dependants` are not stored: every read derives them as the
@@ -3674,8 +3696,10 @@ The setters (`setters.go`) store, in the caller's transaction, what other
 features compute, set `updated_at`, and answer the change-not-found error
 for an unknown change: `SetDependsOn`, `SetBase` (the base of the current
 version, with stats, touched paths and patch id measured again against it
-in the change's own repository, on the change and on the version; a base
-of `""` is none, measured from the empty tree),
+in the change's own repository, on the change and on the version, and the
+version's `patch_equivalent_to` set again to the latest earlier version
+with the new patch id, `null` for none; a base of `""` is none, measured
+from the empty tree),
 `SetMergeable` (the conflict report is kept only with `conflict`),
 `SetNeedsRestack` (the reason is dropped with `false`), `SetLanding`,
 `SetLanded` (state `landed`, the `landed` object and the landed-commit

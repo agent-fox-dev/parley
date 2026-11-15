@@ -42,7 +42,9 @@ type VersionInput struct {
 // bringing a fork's commit there first, links its session, makes it the
 // change's current version with mergeable unknown, then runs the stack
 // linker, the landing derivation and the version observers in that order
-// and writes parley.change.version. The landing of a draft stays
+// and writes parley.change.version with the version as stored then, whose
+// base and patch equivalence the stack linker may have measured again
+// from the change below. The landing of a draft stays
 // blocked/draft; a missing target branch, a head with no commit the target
 // lacks, a head with no history in common with the target and a merge
 // commit among the version's commits block it as target_not_found,
@@ -75,7 +77,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	if err != nil {
 		return nil, err
 	}
-	equivalent, err := latestEquivalent(ctx, tx, workspace, number, o.patchID)
+	equivalent, err := latestEquivalent(ctx, tx, workspace, number, ch.Version+1, o.patchID)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +109,9 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 		return nil, err
 	}
 	if ch, err = readChange(ctx, tx, workspace, number); err != nil {
+		return nil, err
+	}
+	if v, err = storedVersion(ctx, tx, workspace, number, v); err != nil {
 		return nil, err
 	}
 	if err := c.emitVersion(ctx, tx, in.Caller, ch, v); err != nil {

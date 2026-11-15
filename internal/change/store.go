@@ -265,9 +265,16 @@ func storeVersion(ctx context.Context, tx *sql.Tx, workspace string, number int6
 
 // storeBase stores the base o measured the current version, version, of
 // the change number of the workspace against, with the stats, touched
-// paths and patch id it measured, on the change and on the version.
+// paths and patch id it measured, on the change and on the version, and
+// the earlier version the version is now patch-equivalent to, if any: the
+// same commits measured from a new base, as a change's own commits once
+// it sits on another, may make the same diff as an earlier version.
 func storeBase(ctx context.Context, tx *sql.Tx, workspace string, number, version int64, o *opening, now time.Time) error {
 	paths, err := json.Marshal(nonNil(o.paths))
+	if err != nil {
+		return err
+	}
+	equivalent, err := latestEquivalent(ctx, tx, workspace, number, version, o.patchID)
 	if err != nil {
 		return err
 	}
@@ -276,9 +283,9 @@ func storeBase(ctx context.Context, tx *sql.Tx, workspace string, number, versio
 		o.stats.FilesChanged, o.stats.Insertions, o.stats.Deletions, string(paths), o.truncated); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE change_versions SET base_sha = ?, patch_id = ?, commits = ?, files_changed = ?,
-	insertions = ?, deletions = ? WHERE workspace_slug = ? AND number = ? AND version = ?`, o.base, o.patchID,
-		o.stats.Commits, o.stats.FilesChanged, o.stats.Insertions, o.stats.Deletions, workspace, number, version)
+	_, err = tx.ExecContext(ctx, `UPDATE change_versions SET base_sha = ?, patch_id = ?, patch_equivalent_to = ?, commits = ?,
+	files_changed = ?, insertions = ?, deletions = ? WHERE workspace_slug = ? AND number = ? AND version = ?`, o.base, o.patchID,
+		equivalent, o.stats.Commits, o.stats.FilesChanged, o.stats.Insertions, o.stats.Deletions, workspace, number, version)
 	if err != nil {
 		return fmt.Errorf("store the base of version %d of %s: %w", version, Ref(workspace, number), err)
 	}
@@ -298,11 +305,12 @@ func versionBase(ctx context.Context, q Querier, workspace string, number, versi
 }
 
 // latestEquivalent is the number of the latest version of the change
-// number of the workspace whose patch id is patchID, nil for none.
-func latestEquivalent(ctx context.Context, q Querier, workspace string, number int64, patchID string) (*int64, error) {
+// number of the workspace, of those numbered below before, whose patch id
+// is patchID, nil for none.
+func latestEquivalent(ctx context.Context, q Querier, workspace string, number, before int64, patchID string) (*int64, error) {
 	var version int64
-	err := q.QueryRowContext(ctx, `SELECT version FROM change_versions WHERE workspace_slug = ? AND number = ? AND patch_id = ?
-ORDER BY version DESC LIMIT 1`, workspace, number, patchID).Scan(&version)
+	err := q.QueryRowContext(ctx, `SELECT version FROM change_versions WHERE workspace_slug = ? AND number = ? AND version < ?
+AND patch_id = ? ORDER BY version DESC LIMIT 1`, workspace, number, before, patchID).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -500,6 +508,20 @@ WHERE workspace_slug = ? AND number = ? AND version > ? ORDER BY version LIMIT ?
 		out = append(out, ver)
 	}
 	return out, rows.Err()
+}
+
+// storedVersion is the version v of the change number of the workspace as
+// tx holds it once the collaborators ran: the stack linker may have
+// measured it from another base.
+func storedVersion(ctx context.Context, tx *sql.Tx, workspace string, number int64, v Version) (Version, error) {
+	vs, err := readVersionsAfter(ctx, tx, workspace, number, v.Number-1, 1)
+	if err != nil {
+		return Version{}, err
+	}
+	if len(vs) == 0 {
+		return Version{}, fmt.Errorf("read version %d of %s: %w", v.Number, Ref(workspace, number), sql.ErrNoRows)
+	}
+	return vs[0], nil
 }
 
 // queryList reads the one column of every row query selects.

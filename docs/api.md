@@ -3592,8 +3592,8 @@ The change object:
 | Member | Meaning |
 |---|---|
 | `state` | `draft`, `open`, `landed` or `abandoned` |
-| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; `null` when the head shares no history with the target branch |
-| `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
+| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the head of the change it depends on; with none, the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; `null` when the head shares no history with the target branch |
+| `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first. At open and on every new version the hub sets `depends_on` from the commit graph: to the nearest draft or open change of the same workspace and target branch whose head is a proper ancestor of the new head (the fewest commits between the two heads, the lowest number on a tie), or to `null` when there is none |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
 | `mergeable`, `conflict` | whether the commits of the current version that the onto-commit lacks rebase onto the onto-commit, the commit the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
