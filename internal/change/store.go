@@ -240,6 +240,28 @@ func storeVersion(ctx context.Context, tx *sql.Tx, workspace string, number int6
 		v.Stats.Insertions, v.Stats.Deletions, string(b), truncated, v.SessionID)
 }
 
+// storeBase stores the base o measured the current version, version, of
+// the change number of the workspace against, with the stats, touched
+// paths and patch id it measured, on the change and on the version.
+func storeBase(ctx context.Context, tx *sql.Tx, workspace string, number, version int64, o *opening, now time.Time) error {
+	paths, err := json.Marshal(nonNil(o.paths))
+	if err != nil {
+		return err
+	}
+	if err := update(ctx, tx, workspace, number, now, `base_sha = ?, patch_id = ?, commits = ?, files_changed = ?,
+	insertions = ?, deletions = ?, paths = ?, paths_truncated = ?`, o.base, o.patchID, o.stats.Commits,
+		o.stats.FilesChanged, o.stats.Insertions, o.stats.Deletions, string(paths), o.truncated); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE change_versions SET base_sha = ?, patch_id = ?, commits = ?, files_changed = ?,
+	insertions = ?, deletions = ? WHERE workspace_slug = ? AND number = ? AND version = ?`, o.base, o.patchID,
+		o.stats.Commits, o.stats.FilesChanged, o.stats.Insertions, o.stats.Deletions, workspace, number, version)
+	if err != nil {
+		return fmt.Errorf("store the base of version %d of %s: %w", version, Ref(workspace, number), err)
+	}
+	return nil
+}
+
 // versionBase is the base of the version of the change number of the
 // workspace.
 func versionBase(ctx context.Context, q Querier, workspace string, number, version int64) (string, error) {

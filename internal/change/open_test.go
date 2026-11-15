@@ -168,7 +168,7 @@ func TestOpen_NumbersEachWorkspacesChangesNeverGivingANumberTwice(t *testing.T) 
 		t.Fatalf("an open of a missing branch = 201 %v", got)
 	}
 	if err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
-		return change.AbandonChange(context.Background(), tx, "demo", 2, "abandoned", time.Now())
+		return w.changes.SetAbandoned(context.Background(), tx, "demo", 2, "abandoned")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +517,7 @@ func TestOpen_RecordsARevertWithItsKindAndTheRevertedChange(t *testing.T) {
 	w.mustPost(t, map[string]any{"source": map[string]any{"branch": "feat"}})
 	ctx := context.Background()
 	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		return change.LandChange(ctx, tx, "demo", 1, change.Landed{SHA: w.base, At: time.Now(), By: change.Actor{ActorType: change.ActorSystem}, LandID: "l1"}, time.Now())
+		return w.changes.SetLanded(ctx, tx, "demo", 1, change.Landed{SHA: w.base, At: time.Now(), By: change.Actor{ActorType: change.ActorSystem}, LandID: "l1"})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -858,7 +858,7 @@ func TestOpen_RefusesASecondChangeOfTheSameSource(t *testing.T) {
 	}
 	t.Run("after the change is abandoned", func(t *testing.T) {
 		if err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
-			return change.AbandonChange(context.Background(), tx, "demo", 1, "abandoned", time.Now())
+			return w.changes.SetAbandoned(context.Background(), tx, "demo", 1, "abandoned")
 		}); err != nil {
 			t.Fatal(err)
 		}

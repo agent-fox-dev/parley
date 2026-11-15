@@ -95,10 +95,10 @@ func TestRecordVersion_RecordsNothingForTheSameHeadOrABranchWithoutAnActiveChang
 	w.openBranch(t, "abandoned", nil)
 	ctx := context.Background()
 	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		if err := change.LandChange(ctx, tx, "demo", 2, change.Landed{SHA: w.base, At: time.Now(), By: change.Actor{ActorType: "system"}}, time.Now()); err != nil {
+		if err := w.changes.SetLanded(ctx, tx, "demo", 2, change.Landed{SHA: w.base, At: time.Now(), By: change.Actor{ActorType: "system"}}); err != nil {
 			return err
 		}
-		return change.AbandonChange(ctx, tx, "demo", 3, "abandoned", time.Now())
+		return w.changes.SetAbandoned(ctx, tx, "demo", 3, "abandoned")
 	}); err != nil {
 		t.Fatal(err)
 	}

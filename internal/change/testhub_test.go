@@ -395,3 +395,94 @@ func (w *world) read(t *testing.T, number int64) change.Change {
 	}
 	return ch
 }
+
+// write runs fn in a transaction of its own and fails the test unless it
+// commits.
+func (w *world) write(t *testing.T, fn func(ctx context.Context, tx *sql.Tx) error) {
+	t.Helper()
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return fn(ctx, tx) }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// activity is a fork activity recorder that records the slugs it is told
+// of, and returns an error for each while fail is set.
+type activity struct {
+	mu    sync.Mutex
+	calls []string
+	fail  bool
+}
+
+func (a *activity) RecordActivity(_ context.Context, _ *sql.Tx, slug string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls = append(a.calls, slug)
+	if a.fail {
+		return errors.New("the recorder failed")
+	}
+	return nil
+}
+
+func (a *activity) told() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.calls)
+}
+
+// changesOfDemo are the commits of the changes changesOfDemo opens in
+// demo, by which they are looked up.
+type changesOfDemo struct {
+	// task1 and task2 are the commits of demo--m1's task: change 1 has
+	// versions at task1, task2, then task1 again.
+	task1, task2 string
+	// b2 is the head of change 2's version 1, which change 4's version 1
+	// has too; change 2's version 2 is at landed.
+	b2 string
+	// b3 is the head of change 3, which landed it as landed, a commit on
+	// demo's main.
+	b3, landed string
+}
+
+// changesOfDemo opens in demo: change 1, open, from demo--m1's task with
+// three versions in session sessionOne; change 2, a draft from b2; change
+// 3 from b3, landed with one landed-commit record; change 4, open, from
+// b4, at the head of change 2's first version; then records version 2 of
+// change 2 at the commit change 3 landed as.
+func (w *world) changesOfDemo(t *testing.T) changesOfDemo {
+	t.Helper()
+	var f changesOfDemo
+	m1 := w.addFork(t, "demo--m1", "main", nil, nil)
+	f.task1 = commit(t, m1, "task", w.base, "Task\n\nWhy.\n", map[string]string{"t.txt": "t1\n"})
+	w.openBranch(t, "task", func(in *change.OpenInput) { in.SourceWorkspace, in.SessionID = "demo--m1", new(sessionOne) })
+	f.task2 = commit(t, m1, "task", f.task1, "More\n", map[string]string{"t.txt": "t2\n"})
+	w.mustRecord(t, change.VersionInput{Workspace: "demo--m1", Branch: "task", Head: f.task2, Kind: change.KindPush,
+		Caller: w.ownerCaller(), SessionID: new(sessionOne)})
+	gitrepotest.Git(t, m1, "update-ref", "refs/heads/task", f.task1)
+	w.mustRecord(t, change.VersionInput{Workspace: "demo--m1", Branch: "task", Head: f.task1, Kind: change.KindPush,
+		Caller: w.ownerCaller(), SessionID: new(sessionOne)})
+	f.b2 = w.branch(t, "b2", "B2\n\nWhy.\n")
+	w.openBranch(t, "b2", func(in *change.OpenInput) { in.Draft = true })
+	f.b3 = w.branch(t, "b3", "B3\n\nWhy.\n")
+	w.openBranch(t, "b3", nil)
+	f.landed = commit(t, w.demo, "main", w.base, "B3 (landed)\n\nWhy.\n", map[string]string{"b3.txt": "b3\n"})
+	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetLanded(ctx, tx, "demo", 3, change.Landed{SHA: f.landed, At: time.Now(), LandID: "l1",
+			By: change.Actor{ActorType: change.CredentialAPIKey, ActorID: &w.owner}, Commits: []change.LandedCommit{{VersionSHA: f.b3, LandedSHA: f.landed}}})
+	})
+	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/b4", f.b2)
+	w.openBranch(t, "b4", nil)
+	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/b2", f.landed)
+	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b2", Head: f.landed, Kind: change.KindPush, Caller: w.ownerCaller()})
+	return f
+}
+
+// landedCommits counts the landed-commit records.
+func (w *world) landedCommits(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := w.Store.Main().QueryRow(`SELECT COUNT(*) FROM change_landed_commits`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}

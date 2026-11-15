@@ -3543,6 +3543,42 @@ the component instance, with `RegisterSessionLinker`,
 The hub registers none yet. `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
+The change's `dependants` are not stored: every read derives them as the
+ascending numbers of the draft and open changes whose `depends_on` names
+it.
+
+The lookups (`lookup.go`) read through a `Querier` the same way, `nil`
+being the store, and answer "none" with a nil error:
+`OpenChangeOfBranch(ctx, q, workspace, branch)` is the draft or open
+change of a source branch (`change.BranchChange{WorkspaceSlug, Number,
+Version, State}`, named under its target, the parent for a fork's
+branch); `ChangeOfCommit(ctx, q, workspace, sha)` is the change that
+landed the commit (a `change_landed_commits` record) or else has it as a
+version head, the lowest number first (`change.CommitChange{WorkspaceSlug,
+Number, Version, Landed}`, `Version` the highest version with that head
+or, for a landed commit, with the record's `version_sha` as head, nil for
+none), a fork's slug asking for the parent's changes whose source is the
+fork; `ChangesOfSession(ctx, q, session)` lists the `change.Key`s
+(`workspace_slug`, `number`) of every change with a version of the
+session, across workspaces, ordered by slug and number;
+`ChangeNumbersOfSource(ctx, q, workspace)` lists every change, in any
+state, whose source workspace it is (`change.SourceChange{WorkspaceSlug,
+Number, Branch, State}`), ordered by number; `OpenCounts(ctx)` counts the
+draft and open changes per workspace slug.
+
+The setters (`setters.go`) store, in the caller's transaction, what other
+features compute, set `updated_at`, and answer the change-not-found error
+for an unknown change: `SetDependsOn`, `SetBase` (the base of the current
+version, with stats, touched paths and patch id measured again against it
+in the change's own repository, on the change and on the version),
+`SetMergeable` (the conflict report is kept only with `conflict`),
+`SetNeedsRestack` (the reason is dropped with `false`), `SetLanding`,
+`SetLanded` (state `landed`, the `landed` object and the landed-commit
+records), `SetReverts`, `SetRevertedBy`, `SetAbandoned` (state `abandoned`
+with a reason; for a fork source it tells the `ForkActivity` recorder,
+whose error is logged) and, from `Open`, `SetAutoLand`. The move to
+`landed` tells no recorder.
+
 The route `POST /workspaces/:slug/changes` (`routes.go`; scope
 `changes:write`, read access to `:slug`, an idempotent create, and on the
 parent of a token's bound fork a contributor route) decodes the body, a
