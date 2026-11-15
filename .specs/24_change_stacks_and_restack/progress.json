@@ -3,7 +3,7 @@
   "spec_id": "24",
   "spec_name": "change_stacks_and_restack",
   "schema_version": 3,
-  "updated_at": "2026-11-15T22:32:34Z",
+  "updated_at": "2026-11-15T22:35:12Z",
   "tasks": [
     {
       "id": 1,
@@ -47,7 +47,7 @@
     },
     {
       "id": 11,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
