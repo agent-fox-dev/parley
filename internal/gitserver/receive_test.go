@@ -133,7 +133,7 @@ func TestReceive_UpdatesEveryRefOfAnAcceptedPushTogether(t *testing.T) {
 		{"two creates and a delete", []command{
 			{zero, w.commit(t, w.head, "a"), "refs/heads/a"}, {zero, w.commit(t, w.head, "b"), "refs/heads/b"}, {w.head, zero, "refs/heads/old"},
 		}, nil, false},
-		{"a push option with no stage registered", []command{{zero, w.commit(t, w.head, "opt"), "refs/heads/opt"}}, []string{"parley.anything"}, false},
+		{"a push option that is not a parley option", []command{{zero, w.commit(t, w.head, "opt"), "refs/heads/opt"}}, []string{"ci.skip"}, false},
 		{"gzip-encoded request", []command{{zero, w.commit(t, w.head, "gz"), "refs/heads/gz"}}, nil, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {

@@ -68,13 +68,18 @@ const (
 // place of each repository on disk and [git].max_push_size, which the part
 // registers beside [git].timeout, and is the git server's Push, so that
 // a push that passed the checks is decided by the rules and written by the
-// ref writer.
+// ref writer. Its options stage (PushOptions), which exists from the
+// composition on, is registered on it when the part is composed and bound
+// to the hub's logger in the same start hook: it refuses
+// a push with invalid options before its pack is read and hands on the
+// session of parley.session.
 //
 // The component exists from the composition on (GitServer); tests change
 // its dependencies with AdjustGitServer.
 func composeGitServer(c *Composition) {
 	comp := &gitserver.Component{}
 	c.gitServer = comp
+	c.receiver.RegisterOptionsStage(c.pushOptions)
 	comp.Mount(c.Handle)
 	if err := gitserver.Register(c.registry); err != nil {
 		c.errs = append(c.errs, err)
@@ -91,6 +96,7 @@ func composeGitServer(c *Composition) {
 		c.pushRules.Bind(pushrule.EngineDeps{
 			Settings: pushSettings{rt.Store.Main(), c.workspaces.Settings()}, Tracking: trackingBranches{c.forks},
 		})
+		c.pushOptions.Bind(rt.Logger)
 		c.receiver.Bind(gitserver.ReceiverDeps{
 			Engine: c.pushRules, Writer: c.refWriter, Git: gitFor(c.env), RepoPath: c.workspaces.RepoPath,
 			MaxPushSize: gitserver.MaxPushSizeFrom(rt.Config), Logger: rt.Logger,
@@ -230,6 +236,13 @@ func (c *Composition) PushRules() *pushrule.Engine { return c.pushRules }
 // git server's Push once its start hook has run. A part keeps it when it is
 // composed and registers its options stage and its mapping stage then.
 func (c *Composition) Receiver() *gitserver.Receiver { return c.receiver }
+
+// PushOptions returns the hub's options stage, the push processor's from
+// the composition on, which judges a push's options before its pack is
+// read. The part that owns the session-linking rule registers its session
+// linker on it when it is composed; until one does, every parley.session
+// is refused.
+func (c *Composition) PushOptions() *gitserver.PushOptionsStage { return c.pushOptions }
 
 // GitServer returns the hub's git server, which serves the three git routes
 // once its start hook has run.

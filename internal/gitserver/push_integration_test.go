@@ -23,6 +23,7 @@ import (
 type gitPushEvent struct {
 	ActorType string
 	Ref       string
+	SessionID *string
 	Meta      struct {
 		Before  *string `json:"before"`
 		Created bool    `json:"created"`
@@ -44,7 +45,7 @@ func (w *world) pushEvents(t *testing.T, seq int64) []gitPushEvent {
 		if r.Type != "parley.git.push" {
 			continue
 		}
-		ev := gitPushEvent{ActorType: r.ActorType, Ref: r.ResourceID}
+		ev := gitPushEvent{ActorType: r.ActorType, Ref: r.ResourceID, SessionID: r.SessionID}
 		if err := json.Unmarshal(r.Metadata, &ev.Meta); err != nil {
 			t.Fatal(err)
 		}

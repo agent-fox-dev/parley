@@ -188,12 +188,19 @@ func (w *world) addFork(t *testing.T) {
 // tracking tags tags recorded on the fork.
 func (w *world) addForkTracking(t *testing.T, branches, tags []string) {
 	t.Helper()
-	ctx, now, head := context.Background(), w.clock(), gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
+	w.addForkFrom(t, "main", branches, tags)
+}
+
+// addForkFrom is addForkTracking with the fork made from demo's branch
+// base, its base branch.
+func (w *world) addForkFrom(t *testing.T, base string, branches, tags []string) {
+	t.Helper()
+	ctx, now, head := context.Background(), w.clock(), gitrepotest.Refs(t, w.repo, "refs/heads/")[base]
 	f := fork.Fork{
 		Workspace: workspace.Workspace{
-			Slug: "demo--t1", Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
+			Slug: "demo--t1", Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: new(base),
 			OwnerID: w.member, OrgID: w.acme, Status: workspace.StatusReady, DisplayName: "demo--t1",
-			ParentSlug: new("demo"), ForkPoint: &workspace.ForkPoint{Ref: "main", SHA: head},
+			ParentSlug: new("demo"), ForkPoint: &workspace.ForkPoint{Ref: base, SHA: head},
 			ExpiresAt: new(now.Add(7 * 24 * time.Hour)), AutoChange: new(false),
 			CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
 		},
