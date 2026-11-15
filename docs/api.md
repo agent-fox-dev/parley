@@ -4135,8 +4135,9 @@ trigger computes it again.
 
 A new version of a change records, in the same store transaction, a
 pending restack of each `draft` or `open` change directly above it (its
-`dependants`) whose head does not have the new head, and the push or
-commit that made the version is answered without waiting for them. When
+`dependants`), and the push or commit that made the version is answered
+without waiting for them; one already built on the new head ends without
+a version (see below). When
 the version cannot record them, the version is not recorded either. A
 change has at most one pending restack: a newer one replaces it, so that
 the change is restacked once, onto the newest head below.
@@ -4173,7 +4174,12 @@ branch. A change below it that lands still leaves it with `depends_on`
 
 The hub runs the pending restacks in the background, one at a time, in
 the order they were recorded; those pending when `parleyd` stopped run
-after it starts again. A restack replays the commits of the change after
+after it starts again. A restack for a new version below (`version`) or
+for a caller's link (`manual`) of a change that, when its turn comes, no
+longer depends on a `draft` or `open` change and has no landed commit to
+sit on (its `depends_on` was cleared, or a version of its own left it
+unlinked) is removed without running: no version, no event and no branch
+move, and the change's mergeability is checked. A restack replays the commits of the change after
 its `base_sha` up to the head of its source branch, in order, onto the
 commit it must sit on: the head of the change it depends on while that
 one is `draft` or `open`; else the landed commit of the change below it;
@@ -4185,9 +4191,12 @@ old commits along. When the source branch already sits on that commit
 (it has the commit, and the commit has the change's `base_sha`), nothing
 is recorded and no event is written. Otherwise the
 source branch is moved to the result with a compare-and-swap on the head
-the restack read; when it moved in between, the restack starts again from
-the new head, at most 5 times in one run, after which nothing is changed
-and the restack stays pending.
+the restack read; when it moved in between, or the change got a version
+or another `base_sha`, the restack starts again from the new head, at most
+5 times in one run, after which nothing is changed and the restack stays
+pending. A replay that leaves the head as it is, as it does once the
+change was pushed onto that commit, records nothing, as for a change that
+already sits on it.
 
 The move is recorded as the change's next version, of kind `restack`,
 created by the hub (`created_by.actor_type` `system`), with the session of
@@ -4201,7 +4210,10 @@ bottom first. The hub writes, by `system`, `parley.change.version` with
 (the commit it was restacked onto) and `trigger` (`version`, `land`,
 `abandon` or `manual`). A restack whose source branch already sat on that commit
 clears a
-`needs_restack` set for `conflict` or `auto_restack_off`.
+`needs_restack` set for `conflict` or `auto_restack_off`. A change that
+leaves a `conflict` this way, by a restack or by a version (below), is no
+longer in conflict: the next conflict of a restack writes
+`parley.change.conflict` again.
 
 A restack whose replay conflicts moves no branch, records no version and
 records no restack of the changes above it, which keep their versions and
@@ -4224,18 +4236,20 @@ moves while the replay runs, the restack starts again instead.
 A version recorded for a change whose `needs_restack` is set for
 `conflict` or `auto_restack_off` clears `needs_restack` and
 `restack_reason` when its head has the commit the change must sit on: the
-head of the change it depends on, or the landed commit of the change that
-was below it. A version that leaves a linked change with no `depends_on`
-clears them too, together with the link. Any other version leaves them
-as they are.
+head of the change it depends on; with none, the landed commit of the
+change that was below it, or else the head of its target branch. A
+version that leaves a linked change with no `depends_on` clears them too,
+together with the link. Any other version leaves them as they are.
 
 A restack that fails for another reason
 than a conflict (the `git` command cannot be started or exits with an
 error, or the repository cannot be read) changes nothing; it is logged
 once, at level `ERROR`, as `the restack failed` with `workspace`,
 `number` and `error` (its text scrubbed of credentials), stays pending
-until a newer restack of the change replaces it or `parleyd` starts
-again, and the hub goes on with the next pending restack. A pending
+until a newer restack of the change replaces it, a version of the change
+itself records it again (so that it runs again, and its mergeability is
+checked once it ends), or `parleyd` starts again, and the hub goes on with
+the next pending restack. A pending
 restack whose change is no longer `draft` or `open` when its turn comes
 is removed, and nothing else happens: no version, no event and no branch
 move.

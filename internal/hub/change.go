@@ -126,8 +126,9 @@ const (
 // it (Stack), registered as the expander of stack.
 //
 // A new version of a change records, in its transaction, a pending restack
-// of each change directly above it that is not built on the new head; the
-// table of pending restacks is added by RestackStep. The restacks run as
+// of each change directly above it (one already built on the new head
+// ends as up to date); the table of pending restacks is added by
+// RestackStep. The restacks run as
 // background work (RunRestacks), one at a time in the order they were
 // recorded, those pending at the start first: each replays the change's
 // own commits onto the head below in the object store, moves the source

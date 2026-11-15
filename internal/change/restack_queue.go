@@ -202,7 +202,8 @@ func dropRestack(ctx context.Context, tx *sql.Tx, j restackJob) (bool, error) {
 // the hub owed when it stopped, then each one recorded once the
 // transaction that records it has committed. A restack that fails, or
 // whose source branch keeps moving under it, is logged and stays pending
-// until a newer one replaces it or the hub starts again.
+// until a newer one replaces it (a version of the change itself records it
+// again, renewRestack) or the hub starts again.
 func (c *Component) RunRestacks(ctx context.Context) {
 	w := &c.restacks
 	w.wake()

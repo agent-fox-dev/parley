@@ -58,10 +58,11 @@ func (s stacks) RequestRestack(ctx context.Context, tx *sql.Tx, ch Change, trigg
 // it, the link is the nearest change below the head, or none, which
 // leaves the merge base with the target branch that recording the version
 // measured. The depth of ch, and of every change above it, follows the
-// link, and a restack ch was flagged as needing may be answered by the
-// version (settle). Each change directly above ch that is not built on the
-// new head gets a pending restack onto it, recorded in tx, so that a
-// version is never stored without the restacks it owes.
+// link, a restack ch was flagged as needing may be answered by the version
+// (settle), and a restack ch has pending runs again (renewRestack). Each
+// change directly above ch gets a pending restack onto the new head,
+// recorded in tx, so that a version is never stored without the restacks
+// it owes.
 func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Version, dependsOn *int64) error {
 	if err := s.link(ctx, tx, ch, v, dependsOn); err != nil {
 		return err
@@ -72,38 +73,58 @@ func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Versio
 	if err := s.settle(ctx, tx, ch, v); err != nil {
 		return err
 	}
-	return s.pendDependants(ctx, tx, ch, v)
+	if err := s.renewRestack(ctx, tx, ch, v); err != nil {
+		return err
+	}
+	return s.pendDependants(ctx, tx, ch)
+}
+
+// renewRestack records again in tx, as a newer record, the pending restack
+// the change ch has, unless its new version v is a restack's own, whose
+// restack removes the record. The worker keeps a record whose restack
+// failed, or lost every swap, until a newer one (restackWorker.keep), and
+// the change's mergeability is not computed while the record is pending
+// (mergePair); the change's own version may put it on the commit it must
+// sit on, or move the branch the swaps lost to, so its restack runs again
+// and ends the record either way.
+func (s stacks) renewRestack(ctx context.Context, tx *sql.Tx, ch Change, v Version) error {
+	if v.Kind == KindRestack {
+		return nil
+	}
+	res, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO change_restacks (workspace_slug, number, trigger, onto)
+SELECT workspace_slug, number, trigger, onto FROM change_restacks WHERE workspace_slug = ? AND number = ?`, ch.WorkspaceSlug, ch.Number)
+	if err != nil {
+		return fmt.Errorf("record the restack of %s again: %w", ch.Ref, err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return err
+	}
+	s.c.restacks.wake()
+	return nil
 }
 
 // settle clears in tx the needs_restack of the change ch, set because a
 // restack conflicted or automatic restacks are off, once its new version v
-// sits on the commit it must: the head of the change it now depends on, or
-// the commit the change below it landed as, which it then no longer keeps.
-// A change the version unlinked has no change below it to sit on, so its
-// flag goes with the link. Any other flag, and a version that does not sit
-// on that commit, leave the change as it is.
+// sits on the commit it must (sitOn): the head of the change it now
+// depends on; with none, the commit the change below it landed as, which
+// it then no longer keeps, or else the head of its target branch. A change
+// the version unlinked has no change below it to sit on, so its flag goes
+// with the link. Any other flag, a version that does not sit on that
+// commit, and a change with no commit to sit on leave the change as it is.
 func (s stacks) settle(ctx context.Context, tx *sql.Tx, ch Change, v Version) error {
 	now, err := readChange(ctx, tx, ch.WorkspaceSlug, ch.Number)
 	if err != nil {
 		return err
 	}
-	if reason := reasonOf(now); !now.NeedsRestack || (reason != RestackConflict && reason != RestackAutoOff) {
+	reason := reasonOf(now)
+	if !now.NeedsRestack || (reason != RestackConflict && reason != RestackAutoOff) {
 		return nil
 	}
-	var must string
-	switch {
-	case now.DependsOn != nil:
-		lower, err := readChange(ctx, tx, ch.WorkspaceSlug, *now.DependsOn)
-		if err != nil {
+	if now.DependsOn != nil || ch.DependsOn == nil {
+		must, err := s.c.sitOn(ctx, tx, now, "")
+		if err != nil || must == "" {
 			return err
 		}
-		must = lower.HeadSHA
-	case ch.DependsOn == nil:
-		if must, err = landedBelow(ctx, tx, now); err != nil || must == "" {
-			return err
-		}
-	}
-	if must != "" {
 		repo, err := s.c.deps.Repos(ctx, ch.WorkspaceSlug)
 		if err != nil {
 			return err
@@ -113,22 +134,20 @@ func (s stacks) settle(ctx context.Context, tx *sql.Tx, ch Change, v Version) er
 			return err
 		}
 	}
-	if err := s.c.SetNeedsRestack(ctx, tx, ch.WorkspaceSlug, ch.Number, false, nil); err != nil {
+	if err := s.c.clearNeedsRestack(ctx, tx, ch.WorkspaceSlug, ch.Number, reason); err != nil {
 		return err
 	}
 	return clearRestackOnto(ctx, tx, ch.WorkspaceSlug, ch.Number)
 }
 
 // pendDependants records a pending restack, for a new version, of each
-// direct dependant of the change ch whose head does not have the head of
-// ch's new version v. Ancestry is asked of the target's repository, which
-// holds every version head of its changes.
-func (s stacks) pendDependants(ctx context.Context, tx *sql.Tx, ch Change, v Version) error {
+// direct dependant of the change ch, one already built on the new head
+// too: its restack finds it so (up to date) and clears a flag that a
+// conflict, or automatic restacks off, left on it below an older head.
+// With automatic restacks off, pendRestack only flags the dependants that
+// do not sit on the new head.
+func (s stacks) pendDependants(ctx context.Context, tx *sql.Tx, ch Change) error {
 	deps, err := dependants(ctx, tx, ch.WorkspaceSlug, ch.Number)
-	if err != nil || len(deps) == 0 {
-		return err
-	}
-	repo, err := s.c.deps.Repos(ctx, ch.WorkspaceSlug)
 	if err != nil {
 		return err
 	}
@@ -137,14 +156,8 @@ func (s stacks) pendDependants(ctx context.Context, tx *sql.Tx, ch Change, v Ver
 		if err != nil {
 			return err
 		}
-		built, err := repo.IsAncestor(ctx, v.HeadSHA, d.HeadSHA)
-		if err != nil {
+		if err := s.c.pendRestack(ctx, tx, d, TriggerVersion, ""); err != nil {
 			return err
-		}
-		if !built {
-			if err := s.c.pendRestack(ctx, tx, d, TriggerVersion, ""); err != nil {
-				return err
-			}
 		}
 	}
 	return nil

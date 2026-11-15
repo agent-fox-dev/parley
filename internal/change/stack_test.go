@@ -439,6 +439,17 @@ func TestLinkVersion_ClearsANeedsRestackOnceTheChangeSitsOnWhatItMust(t *testing
 		w.runPending(t)
 		return landed
 	}
+	// conflictOnTarget moves the target to clash with b and abandons a, the
+	// bottom, which reparents b onto the target, whose restack conflicts; it
+	// returns the target's head.
+	conflictOnTarget := func(t *testing.T, p string, a change.Change) string {
+		commit(t, w.demo, "main", w.head(t, "main"), "main clashes\n", map[string]string{p + "f.txt": "m\n"})
+		if status, out := w.abandon(t, a.Number, w.ownerKey, map[string]any{"dependants": "reparent"}); status != http.StatusOK {
+			t.Fatalf("abandon = %d %v, want 200", status, out)
+		}
+		w.runPending(t)
+		return w.head(t, "main")
+	}
 	for i, c := range []struct {
 		name string
 		// flag sets the needs_restack of the change b, which sits on the
@@ -461,6 +472,8 @@ func TestLinkVersion_ClearsANeedsRestackOnceTheChangeSitsOnWhatItMust(t *testing
 		{"in conflict on the landed commit, rebased onto it", conflictOnLanded, func(below, _ string) string { return below }, change.RestackConflict, true, false},
 		{"in conflict on the landed commit, amended on its old base", conflictOnLanded, func(_, base string) string { return base }, change.RestackConflict, false, false},
 		{"in conflict, rebased onto its target", conflictOnA, func(string, string) string { return w.base }, change.RestackConflict, true, false},
+		{"in conflict on its target, rebased onto it", conflictOnTarget, func(below, _ string) string { return below }, change.RestackConflict, true, false},
+		{"in conflict on its target, amended on its old base", conflictOnTarget, func(_, base string) string { return base }, change.RestackConflict, false, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			p := fmt.Sprintf("x%d", i)

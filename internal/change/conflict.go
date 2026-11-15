@@ -3,6 +3,7 @@ package change
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
@@ -73,4 +74,22 @@ func restackReport(r *gitrepo.ConflictReport, onto, head, base string) *gitrepo.
 // would replace the report of ch's own commits that the restack stored.
 func holdsRestackConflict(ch Change) bool {
 	return ch.Mergeable == MergeableConflict && ch.NeedsRestack && reasonOf(ch) == RestackConflict
+}
+
+// clearNeedsRestack clears in tx the needs_restack of the change number of
+// the workspace, which was set for reason. A change that leaves a restack
+// conflict this way also forgets that its mergeability was last computed
+// as a conflict: StoreMergeability announces a conflict only after another
+// value, and the change, no longer in conflict, would otherwise have the
+// next conflict of a restack, found before a check computed its
+// mergeability again, stored without parley.change.conflict.
+func (c *Component) clearNeedsRestack(ctx context.Context, tx *sql.Tx, workspace string, number int64, reason string) error {
+	if err := c.SetNeedsRestack(ctx, tx, workspace, number, false, nil); err != nil || reason != RestackConflict {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE changes SET mergeable_last = NULL WHERE workspace_slug = ? AND number = ? AND mergeable_last = ?`,
+		workspace, number, MergeableConflict); err != nil {
+		return fmt.Errorf("store the mergeable of %s: %w", Ref(workspace, number), err)
+	}
+	return nil
 }

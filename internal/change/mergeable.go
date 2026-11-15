@@ -253,9 +253,7 @@ func (c *Component) mergePair(ctx context.Context, q Querier, workspace string, 
 	if err != nil || (ch.State != StateDraft && ch.State != StateOpen) {
 		return ch, "", false, err
 	}
-	var pending bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM change_restacks WHERE workspace_slug = ? AND number = ?)`,
-		workspace, number).Scan(&pending); err != nil || pending {
+	if pending, err := hasPendingRestack(ctx, q, workspace, number); err != nil || pending {
 		return ch, "", false, err
 	}
 	if ch.DependsOn != nil {

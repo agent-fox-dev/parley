@@ -32,17 +32,17 @@ const (
 	// restackLost: the source branch moved before each swap, and nothing
 	// moved.
 	restackLost
-	// restackSkipped: the worker's change sits too deep in its stack to be
-	// restacked by the hub, and nothing moved.
+	// restackSkipped: the worker leaves the change as it is, since it sits
+	// too deep in its stack to be restacked by the hub, or no longer sits
+	// on what the restack was for; nothing moved.
 	restackSkipped
 )
 
-// restackResult is the end of a restack: its outcome, the version it
-// recorded when restacked, the head the source branch was read at in the
-// last attempt, and the conflict report of a conflict.
+// restackResult is the end of a restack: its outcome, the head the source
+// branch was read at in the last attempt, and the conflict report of a
+// conflict.
 type restackResult struct {
 	outcome restackOutcome
-	version *Version
 	head    string
 	report  *gitrepo.ConflictReport
 }
@@ -54,9 +54,10 @@ type restackResult struct {
 // was read, in a store transaction that records the move as the change's
 // next version, of kind restack, by caller (the zero Caller for the hub)
 // in session, nil for the session of the version it replaces. When the
-// branch, or the commit to sit on, moved in between, the restack starts
-// again, at most restackAttempts times. Each end removes the job's pending
-// record, except a lost race and an error, which change nothing.
+// branch, the change's version or the commit to sit on moved in between,
+// the restack starts again, at most restackAttempts times. Each end
+// removes the job's pending record, except a lost race and an error, which
+// change nothing.
 //
 // It runs no transaction of its caller's: it reads and writes in
 // transactions of its own, and replays outside any, since a replay may
@@ -74,94 +75,162 @@ func (c *Component) restack(ctx context.Context, j restackJob, by Caller, sessio
 	return res, nil
 }
 
-// restackOnce is one attempt of restack; again is set when the source
-// branch or the commit to sit on moved before the swap.
-func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, session *string, attempt int) (res restackResult, again bool, err error) {
-	var ch Change
-	var onto string
-	var deep bool
-	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
-		if ch, err = readChange(ctx, tx, j.workspace, j.number); err != nil || !active(ch) {
-			return err
-		}
-		// A change that sank too deep in its stack after its restack was
-		// recorded is not restacked by the hub. Its depth is counted, not
-		// read from its restack_reason, which a conflict may have
-		// replaced.
-		if j.background {
-			if deep, err = c.tooDeep(ctx, tx, j.workspace, j.number); err != nil || deep {
-				return err
-			}
-		}
-		onto, err = c.sitOn(ctx, tx, ch, j.onto)
-		return err
-	})
-	switch {
-	case errors.Is(err, ErrChangeNotFound):
-		return restackResult{outcome: restackClosed}, false, nil
-	case err != nil:
-		return res, false, err
-	case !active(ch):
-		return c.restackEnded(ctx, j, ch, restackResult{outcome: restackClosed})
-	case deep:
-		return c.restackEnded(ctx, j, ch, restackResult{outcome: restackSkipped})
-	case onto == "":
-		return res, false, fmt.Errorf("restack %s: its target branch %s does not exist", ch.Ref, ch.TargetBranch)
-	}
+// restackRead is what an attempt of a restack starts from: the change as
+// recorded, the commit it must sit on, its source repository and the head
+// its source branch was read at. ends is set, with outcome, when the
+// restack ends there without a replay.
+type restackRead struct {
+	ch      Change
+	onto    string
+	repo    *gitrepo.Repo
+	head    string
+	ends    bool
+	outcome restackOutcome
+}
 
-	repo, err := c.deps.Repos(ctx, ch.Source.WorkspaceSlug)
-	if err != nil {
-		return res, false, err
-	}
-	branch := ch.Source.Branch
-	head, found, err := repo.ResolveBranch(ctx, branch)
+// restackOnce is one attempt of restack; again is set when the source
+// branch, the change's version or the commit to sit on moved before the
+// swap.
+func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, session *string, attempt int) (restackResult, bool, error) {
+	rd, err := c.readRestack(ctx, j)
 	switch {
 	case err != nil:
-		return res, false, err
-	case !found:
-		return res, false, fmt.Errorf("restack %s: its source branch %s:%s does not exist", ch.Ref, ch.Source.WorkspaceSlug, branch)
-	}
-	res.head = head
-	built, err := sitsOn(ctx, repo, baseColumn(ch.BaseSHA), head, onto)
-	if err != nil {
-		return res, false, err
-	}
-	if built {
-		res.outcome = restackUpToDate
-		return c.restackEnded(ctx, j, ch, res)
+		return restackResult{head: rd.head}, false, err
+	case rd.ends:
+		return c.restackEnded(ctx, j, restackResult{outcome: rd.outcome, head: rd.head})
 	}
 	rebase, beforeSwap := c.restacks.seams()
-	newHead, report, err := rebase(ctx, repo, baseColumn(ch.BaseSHA), head, onto, c.now())
+	newHead, report, err := rebase(ctx, rd.repo, baseColumn(rd.ch.BaseSHA), rd.head, rd.onto, c.now())
 	switch {
 	case err != nil:
-		return res, false, err
+		return restackResult{head: rd.head}, false, err
 	case report != nil:
-		res.outcome, res.report = restackConflict, report
-		return c.restackConflicted(ctx, j, ch, res, onto)
+		return c.restackConflicted(ctx, j, rd.ch, restackResult{outcome: restackConflict, head: rd.head, report: report}, rd.onto)
 	}
 	// The hub's own restacks are not judged: their actor is the hub, and
-	// the version guard judges a caller's version.
-	if g := c.collaborators().versions; g != nil && !j.background {
-		if err := g.CheckVersion(ctx, by, ch, onto, newHead); err != nil {
-			return res, false, err
+	// the version guard judges a caller's version, which a replay that
+	// leaves the head as it is does not make.
+	if g := c.collaborators().versions; g != nil && !j.background && newHead != rd.head {
+		if err := g.CheckVersion(ctx, by, rd.ch, rd.onto, newHead); err != nil {
+			return restackResult{head: rd.head}, false, err
 		}
 	}
 	if beforeSwap != nil {
 		beforeSwap(ctx, j.workspace, j.number, attempt)
 	}
+	return c.swapRestack(ctx, j, rd, newHead, by, session)
+}
 
-	swapped := false
-	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+// readRestack reads what an attempt of the restack of the job starts from:
+// the change and the commit it must sit on, in a transaction of its own,
+// which waits for the one that recorded the job; then, outside any, the
+// head of its source branch. The restack ends there when the change is
+// gone or no longer draft or open (closed), when the worker leaves it as
+// it is (skipsRestack), or when it already sits on the commit (up to
+// date).
+func (c *Component) readRestack(ctx context.Context, j restackJob) (rd restackRead, err error) {
+	var skip bool
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		if rd.ch, err = readChange(ctx, tx, j.workspace, j.number); err != nil || !active(rd.ch) {
+			return err
+		}
+		if j.background {
+			if skip, err = c.skipsRestack(ctx, tx, j, rd.ch); err != nil || skip {
+				return err
+			}
+		}
+		rd.onto, err = c.sitOn(ctx, tx, rd.ch, j.onto)
+		return err
+	})
+	switch {
+	case errors.Is(err, ErrChangeNotFound), err == nil && !active(rd.ch):
+		rd.ends, rd.outcome = true, restackClosed
+		return rd, nil
+	case err != nil:
+		return rd, err
+	case skip:
+		rd.ends, rd.outcome = true, restackSkipped
+		return rd, nil
+	case rd.onto == "":
+		return rd, fmt.Errorf("restack %s: its target branch %s does not exist", rd.ch.Ref, rd.ch.TargetBranch)
+	}
+	if rd.repo, err = c.deps.Repos(ctx, rd.ch.Source.WorkspaceSlug); err != nil {
+		return rd, err
+	}
+	branch := rd.ch.Source.Branch
+	head, found, err := rd.repo.ResolveBranch(ctx, branch)
+	switch {
+	case err != nil:
+		return rd, err
+	case !found:
+		return rd, fmt.Errorf("restack %s: its source branch %s:%s does not exist", rd.ch.Ref, rd.ch.Source.WorkspaceSlug, branch)
+	}
+	rd.head = head
+	built, err := sitsOn(ctx, rd.repo, baseColumn(rd.ch.BaseSHA), head, rd.onto)
+	rd.ends, rd.outcome = built, restackUpToDate
+	return rd, err
+}
+
+// skipsRestack reports whether the worker leaves the change ch of the job
+// as it is, read in tx. A change that sank too deep in its stack after its
+// restack was recorded is not restacked by the hub; its depth is counted,
+// not read from its restack_reason, which a conflict may have replaced. A
+// restack for a new version below, or for a caller's link, of a change
+// that no longer depends on a draft or open change and has no landed
+// commit to sit on, ends too: the change below it is no longer there, and
+// nothing asked for a restack onto its target branch.
+func (c *Component) skipsRestack(ctx context.Context, tx *sql.Tx, j restackJob, ch Change) (bool, error) {
+	if deep, err := c.tooDeep(ctx, tx, j.workspace, j.number); err != nil || deep {
+		return deep, err
+	}
+	if (j.trigger != TriggerVersion && j.trigger != TriggerManual) || j.onto != "" {
+		return false, nil
+	}
+	if ch.DependsOn != nil {
+		lower, err := readChange(ctx, tx, ch.WorkspaceSlug, *ch.DependsOn)
+		switch {
+		case err == nil && active(lower):
+			return false, nil
+		case err != nil && !errors.Is(err, ErrChangeNotFound):
+			return false, err
+		}
+	}
+	landed, err := landedBelow(ctx, tx, ch)
+	return landed == "", err
+}
+
+// swapRestack moves, in a store transaction, the source branch that the
+// attempt rd read to newHead, the change's commits replayed onto rd.onto,
+// and records the move (recordRestack). When the change got a version or
+// another base, or the commit to sit on moved, since rd was read, or the
+// branch moved, nothing is written and again is set: the replay was of
+// commits the change no longer has. A replay that leaves the head as it
+// is, as it does once the change was pushed onto that commit, moves
+// nothing and ends the restack as up to date; the push records its own
+// version. A failure after the branch moved sets it back.
+func (c *Component) swapRestack(ctx context.Context, j restackJob, rd restackRead, newHead string, by Caller, session *string) (restackResult, bool, error) {
+	res := restackResult{outcome: restacked, head: rd.head}
+	ref := "refs/heads/" + rd.ch.Source.Branch
+	again, swapped := false, false
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		now, err := readChange(ctx, tx, j.workspace, j.number)
 		if err != nil || !active(now) {
 			res.outcome = restackClosed
 			return c.ignoreGone(ctx, tx, j, err)
 		}
-		if ontoNow, err := c.sitOn(ctx, tx, now, j.onto); err != nil || ontoNow != onto {
+		if now.HeadSHA != rd.ch.HeadSHA || baseColumn(now.BaseSHA) != baseColumn(rd.ch.BaseSHA) {
+			again = true
+			return nil
+		}
+		if onto, err := c.sitOn(ctx, tx, now, j.onto); err != nil || onto != rd.onto {
 			again = err == nil
 			return err
 		}
-		switch err := repo.CompareAndSwapRef(ctx, "refs/heads/"+branch, newHead, head); {
+		if newHead == rd.head {
+			res.outcome = restackUpToDate
+			return c.storeRestackEnd(ctx, tx, j, restackUpToDate)
+		}
+		switch err := rd.repo.CompareAndSwapRef(ctx, ref, newHead, rd.head); {
 		case errors.Is(err, gitrepo.ErrRefMoved):
 			again = true
 			return nil
@@ -173,19 +242,17 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 		if in == nil {
 			in = now.SessionID
 		}
-		res.outcome = restacked
-		res.version, err = c.recordRestack(ctx, tx, j, now, by, in, newHead, onto)
-		return err
+		return c.recordRestack(ctx, tx, j, now, by, in, newHead, rd.onto)
 	})
 	if err != nil && swapped {
 		// The version was not recorded, so the branch goes back to the head
 		// it had; a push since then keeps its own move.
-		if rerr := repo.CompareAndSwapRef(context.WithoutCancel(ctx), "refs/heads/"+branch, head, newHead); rerr != nil {
-			c.deps.Logger.Error("the source branch of a failed restack was not set back", "change", ch.Ref, "branch", branch, "error", rerr)
+		if rerr := rd.repo.CompareAndSwapRef(context.WithoutCancel(ctx), ref, rd.head, newHead); rerr != nil {
+			c.deps.Logger.Error("the source branch of a failed restack was not set back", "change", rd.ch.Ref, "branch", rd.ch.Source.Branch, "error", rerr)
 		}
 	}
 	if err != nil || again {
-		return restackResult{head: head}, again, err
+		return restackResult{head: rd.head}, again, err
 	}
 	return res, false, nil
 }
@@ -199,82 +266,87 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 // sits too deep in its stack; parley.change.restack follows the version's
 // event, and the changes whose target is the moved branch are checked
 // again, since no ref-updated stage saw the move.
-func (c *Component) recordRestack(ctx context.Context, tx *sql.Tx, j restackJob, ch Change, by Caller, session *string, head, onto string) (*Version, error) {
+func (c *Component) recordRestack(ctx context.Context, tx *sql.Tx, j restackJob, ch Change, by Caller, session *string, head, onto string) error {
 	v, err := c.RecordVersion(ctx, tx, VersionInput{Workspace: ch.Source.WorkspaceSlug, Branch: ch.Source.Branch, Head: head,
 		Kind: KindRestack, Caller: by, SessionID: session, SessionChecked: true})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if v == nil {
-		return nil, fmt.Errorf("restack %s: no version was recorded for %s", ch.Ref, head)
+		return fmt.Errorf("restack %s: no version was recorded for %s", ch.Ref, head)
 	}
 	if ch, err = readChange(ctx, tx, j.workspace, j.number); err != nil {
-		return nil, err
+		return err
 	}
-	if ch.NeedsRestack && reasonOf(ch) != RestackTooDeep {
-		if err := c.SetNeedsRestack(ctx, tx, j.workspace, j.number, false, nil); err != nil {
-			return nil, err
+	if reason := reasonOf(ch); ch.NeedsRestack && reason != RestackTooDeep {
+		if err := c.clearNeedsRestack(ctx, tx, j.workspace, j.number, reason); err != nil {
+			return err
 		}
 	}
 	if err := clearRestackOnto(ctx, tx, j.workspace, j.number); err != nil {
-		return nil, err
+		return err
 	}
 	if err := c.emit(ctx, tx, by, ch, EventRestack, map[string]any{
 		"version": v.Number, "head_sha": v.HeadSHA, "onto_sha": onto, "trigger": j.trigger,
 	}); err != nil {
-		return nil, err
+		return err
 	}
 	if err := c.ScheduleTargetMergeable(ctx, tx, ch.Source.WorkspaceSlug, ch.Source.Branch); err != nil {
-		return nil, err
+		return err
 	}
 	_, err = dropRestack(ctx, tx, j)
-	return v, err
+	return err
 }
 
 // restackEnded stores, in a transaction of its own, the end of a restack
-// of the change ch that moved nothing and found no conflict
-// (restackConflicted stores that), and removes the job's pending record:
+// that moved nothing and found no conflict (storeRestackEnd), and returns
+// res as the attempt's result.
+func (c *Component) restackEnded(ctx context.Context, j restackJob, res restackResult) (restackResult, bool, error) {
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.storeRestackEnd(ctx, tx, j, res.outcome) })
+	return res, false, err
+}
+
+// storeRestackEnd stores in tx the end of the restack of the job that
+// moved nothing and found no conflict (restackConflicted stores that), and
+// removes the job's pending record:
 //
 //   - up to date: a needs_restack set for a conflict or with automatic
 //     restacks off is cleared, since the change now sits on what it must,
 //     and so is the landed commit it had to sit on;
-//   - skipped as too deep in its stack: its mergeability is checked again;
+//   - skipped: its mergeability is checked again;
 //   - closed: nothing else.
 //
 // The mergeability check of a change with a pending record stores nothing
 // (mergePair), so it is scheduled again once the record is gone.
-func (c *Component) restackEnded(ctx context.Context, j restackJob, ch Change, res restackResult) (restackResult, bool, error) {
-	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		dropped, err := dropRestack(ctx, tx, j)
-		switch {
-		case err != nil || res.outcome == restackClosed:
-			return err
-		case res.outcome == restackSkipped:
-			if !dropped {
-				return nil
-			}
-			return c.ScheduleMergeable(ctx, tx, j.workspace, j.number)
-		}
-		now, err := readChange(ctx, tx, j.workspace, j.number)
-		if err != nil || !active(now) {
-			return c.ignoreGone(ctx, tx, j, err)
-		}
-		cleared := false
-		if reason := reasonOf(now); now.NeedsRestack && (reason == RestackConflict || reason == RestackAutoOff) {
-			if err := c.SetNeedsRestack(ctx, tx, j.workspace, j.number, false, nil); err != nil {
-				return err
-			}
-			cleared = true
-		}
-		if err := clearRestackOnto(ctx, tx, j.workspace, j.number); err != nil {
-			return err
-		}
-		if !dropped && !cleared {
+func (c *Component) storeRestackEnd(ctx context.Context, tx *sql.Tx, j restackJob, outcome restackOutcome) error {
+	dropped, err := dropRestack(ctx, tx, j)
+	switch {
+	case err != nil || outcome == restackClosed:
+		return err
+	case outcome == restackSkipped:
+		if !dropped {
 			return nil
 		}
 		return c.ScheduleMergeable(ctx, tx, j.workspace, j.number)
-	})
-	return res, false, err
+	}
+	now, err := readChange(ctx, tx, j.workspace, j.number)
+	if err != nil || !active(now) {
+		return c.ignoreGone(ctx, tx, j, err)
+	}
+	cleared := false
+	if reason := reasonOf(now); now.NeedsRestack && (reason == RestackConflict || reason == RestackAutoOff) {
+		if err := c.clearNeedsRestack(ctx, tx, j.workspace, j.number, reason); err != nil {
+			return err
+		}
+		cleared = true
+	}
+	if err := clearRestackOnto(ctx, tx, j.workspace, j.number); err != nil {
+		return err
+	}
+	if !dropped && !cleared {
+		return nil
+	}
+	return c.ScheduleMergeable(ctx, tx, j.workspace, j.number)
 }
 
 // ignoreGone is nil for err, the error of reading the change of the job in

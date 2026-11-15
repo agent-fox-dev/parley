@@ -101,23 +101,33 @@ func TestRestack_LeavesADependantAlreadyOnTheNewHeadBelowAsItIs(t *testing.T) {
 	for i, reason := range []string{"", "conflict", "auto_restack_off"} {
 		t.Run(fmt.Sprintf("flagged %q", reason), func(t *testing.T) {
 			p := fmt.Sprintf("u%d", i)
-			b := w.stacked(t, p+"a", p+"b")[1]
+			s := w.stacked(t, p+"a", p+"b")
+			a, b := s[0], s[1]
+			// b is pushed onto the next head of a, and flagged, before a
+			// gets that head as a version.
+			next := commit(t, w.demo, p+"a", a.HeadSHA, "A2\n", map[string]string{p + "a2.txt": "a2\n"})
+			pushed := commit(t, w.demo, p+"b", next, "B\n", map[string]string{p + "b.txt": "b\n"})
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "b", Head: pushed, Kind: change.KindPush, Caller: w.ownerCaller()})
 			if reason != "" {
 				w.write(t, func(ctx context.Context, tx *sql.Tx) error {
 					return w.changes.SetNeedsRestack(ctx, tx, "demo", b.Number, true, &reason)
 				})
 			}
-			head := w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
-			pushed := commit(t, w.demo, p+"b", head, "B\n", map[string]string{p + "b.txt": "b\n"})
-			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "b", Head: pushed, Kind: change.KindPush, Caller: w.ownerCaller()})
 			seq := w.seq(t)
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "a", Head: next, Kind: change.KindPush, Caller: w.ownerCaller()})
 			w.runPending(t)
 			ch := w.read(t, b.Number)
 			if vs := w.versions(t, "demo", b.Number); ch.Version != 2 || vs[1]["kind"] != change.KindPush || w.head(t, p+"b") != pushed {
 				t.Errorf("demo#%d is at version %d of kind %v, its branch at %s; want 2 of kind push at %s", b.Number, ch.Version, vs[len(vs)-1]["kind"], w.head(t, p+"b"), pushed)
 			}
-			if got, _ := w.restackEvents(t, seq); len(got) != 0 || slices.Contains(w.pending(t), b.Number) || ch.NeedsRestack {
-				t.Errorf("restack events %v, pending %v, needs_restack %v; want none, none, false", got, w.pending(t), ch.NeedsRestack)
+			var touched []string
+			for _, e := range w.changeEventsOf(t, seq, b.Number) {
+				if e.Type == change.EventVersion || e.Type == change.EventRestack || e.Type == change.EventConflict {
+					touched = append(touched, e.Type)
+				}
+			}
+			if len(touched) != 0 || slices.Contains(w.pending(t), b.Number) || ch.NeedsRestack {
+				t.Errorf("events %v, pending %v, needs_restack %v for %q; want none, none, false", touched, w.pending(t), ch.NeedsRestack, deref(ch.RestackReason))
 			}
 		})
 	}
@@ -155,7 +165,7 @@ func TestRestack_StartsAgainWhenTheSourceBranchMovesBeforeTheSwap(t *testing.T) 
 			})
 			defer change.SetRestackSeams(w.changes, change.RestackSeams{})
 			seq := w.seq(t)
-			w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			below := w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
 			w.runPending(t)
 			vs := w.versions(t, "demo", b.Number)
 			v := vs[len(vs)-1]
@@ -167,11 +177,108 @@ func TestRestack_StartsAgainWhenTheSourceBranchMovesBeforeTheSwap(t *testing.T) 
 				if len(vs) != 1 || len(events) != 0 || !slices.Contains(w.pending(t), b.Number) || w.read(t, b.Number).NeedsRestack {
 					t.Errorf("%d versions, restack events %v, pending %v; want 1, none, still pending", len(vs), events, w.pending(t))
 				}
+				// The author's own push onto the head below lets the kept
+				// restack run again, which finds the change on it, and its
+				// mergeability is computed.
+				pushed := commit(t, w.demo, p+"b", below, "B again\n", map[string]string{p + "b.txt": "b\n"})
+				w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "b", Head: pushed, Kind: change.KindPush, Caller: w.ownerCaller()})
+				w.runPending(t)
+				if ch := w.read(t, b.Number); ch.Version != 2 || ch.Mergeable != change.MergeableClean || len(w.pending(t)) != 0 {
+					t.Errorf("after the push demo#%d is at version %d, mergeable %s, pending %v; want 2, clean, none", b.Number, ch.Version, ch.Mergeable, w.pending(t))
+				}
 				return
 			}
 			base, head := v["base_sha"].(string), v["head_sha"].(string)
 			if got := w.subjects(t, base, head); v["kind"] != change.KindRestack || !slices.Equal(got, []string{p + "b", "between1"}) || w.head(t, p+"b") != head {
 				t.Errorf("the last version is %v with the commits %q, its branch at %s; want a restack of %q at %s", v["kind"], got, w.head(t, p+"b"), []string{p + "b", "between1"}, head)
+			}
+		})
+	}
+}
+
+func TestRestack_LeavesAChangeAPushPutOnTheNewHeadBelowWhereItIs(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	for i, c := range []struct {
+		name string
+		// recorded is whether the push's version is recorded before the
+		// swap, rather than after the restack.
+		recorded bool
+	}{
+		{"its version is recorded before the swap", true},
+		{"its version is not recorded yet", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fmt.Sprintf("q%d", i)
+			b := w.stacked(t, p+"a", p+"b")[1]
+			below := w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			// The author pushes b rebased onto the head below while the
+			// restack runs.
+			pushed := commit(t, w.demo, p+"b", below, "B\n", map[string]string{p + "b.txt": "b\n"})
+			change.SetRestackSeams(w.changes, change.RestackSeams{
+				BeforeSwap: func(_ context.Context, _ string, number int64, attempt int) {
+					if c.recorded && number == b.Number && attempt == 1 {
+						w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "b", Head: pushed, Kind: change.KindPush, Caller: w.ownerCaller()})
+					}
+				},
+			})
+			defer change.SetRestackSeams(w.changes, change.RestackSeams{})
+			seq := w.seq(t)
+			w.runPending(t)
+			kinds := []any{}
+			for _, v := range w.versions(t, "demo", b.Number) {
+				kinds = append(kinds, v["kind"])
+			}
+			want := []any{change.KindRef}
+			if c.recorded {
+				want = append(want, change.KindPush)
+			}
+			events, _ := w.restackEvents(t, seq)
+			if !reflect.DeepEqual(kinds, want) || w.head(t, p+"b") != pushed || len(events) != 0 || len(w.pending(t)) != 0 {
+				t.Errorf("demo#%d has versions of kinds %v, its branch at %s, restack events %v, pending %v; want %v, %s, none, none",
+					b.Number, kinds, w.head(t, p+"b"), events, w.pending(t), want, pushed)
+			}
+		})
+	}
+}
+
+func TestRestack_LeavesAChangeNoLongerOnAnotherWhereItIs(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	for i, c := range []struct {
+		name string
+		// unlink takes the change b, with a restack pending onto the change
+		// below, off it.
+		unlink func(t *testing.T, p string, b change.Change)
+	}{
+		{"by PATCH", func(t *testing.T, _ string, b change.Change) {
+			if status, got := w.patch(t, b.Number, w.ownerKey, map[string]any{"depends_on": nil}); status != http.StatusOK {
+				t.Fatalf("PATCH depends_on null = %d %v, want 200", status, got)
+			}
+		}},
+		{"by a push onto its target", func(t *testing.T, p string, _ change.Change) {
+			head := commit(t, w.demo, p+"b", w.head(t, "main"), "B on main\n", map[string]string{p + "b.txt": "b\n"})
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "b", Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fmt.Sprintf("n%d", i)
+			b := w.stacked(t, p+"a", p+"b")[1]
+			w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			c.unlink(t, p, b)
+			before := w.read(t, b.Number)
+			// The target moves on, so that a restack onto it would move b.
+			commit(t, w.demo, "main", w.head(t, "main"), "main moved\n", map[string]string{p + "m.txt": "m\n"})
+			seq := w.seq(t)
+			w.runPending(t)
+			ch := w.read(t, b.Number)
+			events, _ := w.restackEvents(t, seq)
+			if ch.DependsOn != nil || ch.Version != before.Version || w.head(t, p+"b") != before.HeadSHA || len(events) != 0 ||
+				len(w.pending(t)) != 0 || ch.Mergeable == change.MergeableUnknown {
+				t.Errorf("demo#%d depends on %v, at version %d, its branch at %s, restack events %v, pending %v, mergeable %s; want none, %d, %s, none, none, computed",
+					b.Number, ch.DependsOn, ch.Version, w.head(t, p+"b"), events, w.pending(t), ch.Mergeable, before.Version, before.HeadSHA)
 			}
 		})
 	}
@@ -380,6 +487,18 @@ func TestRestack_ReportsAConflictOnTheChangeAndMovesNothing(t *testing.T) {
 	if n := len(w.changeEvents(t, seq, change.EventConflict, b.Number)); n != 1 || report["target_sha"] != again {
 		t.Errorf("%d parley.change.conflict events, the report onto %v; want 1, onto %s", n, report["target_sha"], again)
 	}
+
+	// A push onto the head below clears the conflict, so the next one, found
+	// before a check computed the change's mergeability again, is announced.
+	w.hold(t)
+	fixed := commit(t, w.demo, "b", again, "B again\n", map[string]string{"f.txt": "b\n"})
+	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b", Head: fixed, Kind: change.KindPush, Caller: w.ownerCaller()})
+	w.amend(t, "a", map[string]string{"f.txt": "a4\n"})
+	w.runPending(t)
+	events = w.changeEvents(t, seq, change.EventConflict, b.Number)
+	if len(events) != 2 || metadata(t, events[1])["needs_restack"] != true || metadata(t, events[1])["version"] != 2.0 {
+		t.Errorf("%d parley.change.conflict events, want 2, the second of version 2 with needs_restack true", len(events))
+	}
 }
 
 func TestRestack_ReportsTheConflictOfTheChangesOwnCommits(t *testing.T) {
@@ -393,12 +512,14 @@ func TestRestack_ReportsTheConflictOfTheChangesOwnCommits(t *testing.T) {
 		// change's second commit sets on top of it, amended the file the
 		// change below is amended to add instead.
 		lower, own, amended string
-		// missing are the sides of the conflicted file that lack it.
+		// kind is the kind of the conflicted file, missing the sides of it
+		// that lack it.
+		kind    string
 		missing []string
 	}{
-		{"both sides edit the same line", "f.txt", "f.txt", "f.txt", nil},
-		{"both sides add the same path", "f.txt", "n.txt", "n.txt", []string{"base"}},
-		{"the change below deletes a file the change edits", "f.txt", "f.txt", "z.txt", []string{"ours"}},
+		{"both sides edit the same line", "f.txt", "f.txt", "f.txt", gitrepo.ConflictContent, nil},
+		{"both sides add the same path", "f.txt", "n.txt", "n.txt", gitrepo.ConflictAddAdd, []string{"base"}},
+		{"the change below deletes a file the change edits", "f.txt", "f.txt", "z.txt", gitrepo.ConflictDeleteModify, []string{"ours"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			p := fmt.Sprintf("k%d", i)
@@ -424,8 +545,8 @@ func TestRestack_ReportsTheConflictOfTheChangesOwnCommits(t *testing.T) {
 				t.Fatalf("the report names no file: %v", rep)
 			}
 			f, _ := files[0].(map[string]any)
-			if f["path"] != p+c.own || !reflect.DeepEqual(f["landed_by"], []any{}) {
-				t.Errorf("the first file is %v, want %s landed by none", f, p+c.own)
+			if f["path"] != p+c.own || f["kind"] != c.kind || !reflect.DeepEqual(f["landed_by"], []any{}) {
+				t.Errorf("the first file is %v, want %s of kind %s landed by none", f, p+c.own, c.kind)
 			}
 			shas := []any{rep["target_sha"], rep["head_sha"], rep["base_sha"], rep["commit_sha"]}
 			for _, side := range []string{"base", "ours", "theirs"} {

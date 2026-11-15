@@ -73,6 +73,60 @@ the target or a retarget, is not held back. It stores its own trial report:
 `mergeable` stays `conflict` and no second event is written, but the
 report's `base_sha` and `commit_sha` then describe the check's trial.
 
+A restack's pending record is kept, after a restack that failed or lost
+every swap, until a newer record or the next start, and the change is not
+checked meanwhile. A version of the change itself records its pending
+restack again, so that the restack runs again: it ends as up to date when
+the version put the change on its commit, and its end schedules the check.
+
+## A restack of a change with nothing below it ends without one
+
+Nothing asks for a restack of a change that was unlinked, by
+`PATCH {"depends_on": null}` or by a version of its own that the automatic
+rule left with no `depends_on`. A background restack recorded for a new
+version below (`version`) or for a caller's link (`manual`), whose change,
+when its turn comes, no longer depends on a draft or open change and has no
+landed commit to sit on, is removed without a restack, and the change's
+check is scheduled. A reparent after an abandon (`abandon`) still restacks
+a change with no `depends_on` onto the target branch, a landing (`land`)
+onto the landed commit, and the manual route onto the target branch.
+
+## Every direct dependant gets a pending restack
+
+A new version records one pending restack per direct dependant, also for
+one already built on the new head: its restack ends as up to date and
+clears a `conflict` or `auto_restack_off` flag that an older head below
+left. With `changes.auto_restack` false, only the dependants not on the new
+head are flagged.
+
+## A restack starts again when the change moved under it
+
+The swap's transaction checks that the change's `head_sha` and `base_sha`
+are still those the attempt read, besides the commit to sit on, and starts
+the attempt again otherwise: a push recorded meanwhile makes the replay one
+of commits the change no longer has. A replay that returns the head it was
+given, as for a change already pushed onto the commit, moves nothing and
+ends as up to date, so that the push records its own version.
+
+## An unlinked change sits on its target branch
+
+A version clears a `conflict` or `auto_restack_off` flag of a change that
+has no `depends_on` before or after it, and no landed commit below, when its
+head has the head of the target branch, the commit a restack would sit it
+on. A change reparented onto its target branch by an abandon is cleared by
+the author's push rebased onto it, and not by one that lacks it.
+
+## Leaving a restack conflict forgets the conflict
+
+`StoreMergeability` writes `parley.change.conflict` only after a computed
+value other than `conflict`, and a check stores nothing while a restack is
+pending. When a change leaves a restack conflict (a version that sits on
+its commit, a restack's version, or a restack that finds it up to date),
+its `mergeable_last` goes from `conflict` to none, so that the next
+conflict of a restack, found before a check computed a value, is announced
+again. A second conflict while the change still has the flag writes no
+event.
+
 ## Too deep is counted, not read from the reason
 
 A restack conflict replaces `stack_too_deep` with `conflict` on a too-deep

@@ -3697,15 +3697,29 @@ not sit on its `sitOn` commit. Depth never refuses a version or a link.
 
 Then `settle` clears `needs_restack` and `restack_reason`, and
 `restack_onto`, of a change flagged for `conflict` or `auto_restack_off`
-whose new head has the commit it must sit on (`IsAncestor` in the target's
-repository): the head of the change it now depends on, or, unlinked, its
-`restack_onto`; a change the version unlinked is cleared without one,
-since it has no change below it to sit on. Other flags are left.
+whose new head has the commit it must sit on (`sitOn`, then `IsAncestor`
+in the target's repository): the head of the change it now depends on,
+or, unlinked, its `restack_onto`, else the head of its target branch (a
+missing target leaves the flag); a change the version unlinked is cleared
+without one, since it has no change below it to sit on. Other flags are
+left. Every clearing of a `conflict` flag (`clearNeedsRestack`, in
+`conflict.go`: `settle`, a restack's version, an up-to-date restack) also
+sets `mergeable_last` from `conflict` to NULL, so that the next conflict
+of a restack, stored before a check computed the change's mergeability
+again, is a transition and writes `parley.change.conflict`.
+
+`renewRestack` then records the change's own pending restack again, when
+it has one and the version is not of kind `restack` (whose restack
+removes the record): `INSERT OR REPLACE … SELECT` gives it a higher
+`seq`, so a record the worker marked failed runs again on the change's
+own version, and ends either way (a change pushed onto its commit is up
+to date), after which its mergeability check is scheduled.
 
 Last, `LinkVersion` records a pending restack (`pendRestack`, trigger
-`version`) of each direct dependant of the change whose head does not
-have the new head (`IsAncestor` in the target's repository), in the
-version's transaction, so that an error writing it undoes the version.
+`version`) of each direct dependant of the change, one already on the new
+head too (its restack is up to date and clears a stale `conflict` or
+`auto_restack_off` flag), in the version's transaction, so that an error
+writing it undoes the version.
 `pendRestack(ctx, tx, ch, trigger, onto)` is the one writer of a pending
 restack: `INSERT OR REPLACE` into `change_restacks` (`seq` `INTEGER
 PRIMARY KEY AUTOINCREMENT`, `workspace_slug`, `number`, `trigger`, `onto`
@@ -3730,16 +3744,18 @@ repeats until none is left. A restack that returns an error, or loses the
 swap 5 times, is logged as `the restack failed` (`workspace`, `number`,
 `error`; the hub's logger scrubs the error's text) and marked failed with
 its `seq`, so it stays pending and runs again when a newer record
-replaces it or at the next start (the map lives in the component, which
+replaces it (a version of the change itself renews it) or at the next start (the map lives in the component, which
 a start builds anew); the pass goes on with the next record. Every
 failure of a restack is an error value; nothing in the worker ends the
 process.
 
 The restack (`restack.go`, `restack(ctx, job, caller, session)`) reads the
 change in a `Store.Tx` (gone, or neither draft nor open: the record is
-removed; for a job of the worker, `restackJob.background`, a change that
-is `tooDeep` now is skipped: the record is removed and its mergeability
-check scheduled) and the commit it must sit on (`sitOn`: the head of the
+removed; for a job of the worker, `restackJob.background`, `skipsRestack`
+skips a change that is `tooDeep` now, and one whose job has the trigger
+`version` or `manual` and no `onto` that no longer has a draft or open
+`depends_on` change nor a `restack_onto`: the record is removed and its
+mergeability check scheduled) and the commit it must sit on (`sitOn`: the head of the
 `depends_on` change while that one is draft or open, else the record's
 `onto` or the change's `restack_onto`, else the head of the target branch
 in the target's repository). Outside any transaction it resolves the
@@ -3767,9 +3783,11 @@ function writes on a transition carries `needs_restack` `true`. The report
 (`restackReport`) is the replay's, with `target_sha` that commit,
 `head_sha` the head, `base_sha` the change's base, and no landed changes,
 `landed_by` or change. No branch moves and nothing is recorded for the
-changes above. Otherwise, in one `Store.Tx`,
-it reads the change and the commit to sit on again (moved: the attempt
-starts again), moves the source branch with `CompareAndSwapRef` on the
+changes above. Otherwise (`swapRestack`), in one `Store.Tx`,
+it reads the change and the commit to sit on again (a new `head_sha` or
+`base_sha`, or a moved commit: the attempt starts again; a replay that
+returned the head it read is up to date, as above, with nothing moved),
+moves the source branch with `CompareAndSwapRef` on the
 head it read (`ErrRefMoved`, also for a ref a push has locked: the
 attempt starts again, at most 5 in all), records the version with
 `RecordVersion` (kind `restack`, by the zero `Caller` for the hub, the

@@ -1,34 +1,21 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
-	"os"
-	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/cli"
 )
 
 // restackDeadline is how long a test waits for the hub to restack or flag
 // a change in the background.
 const restackDeadline = 10 * time.Second
-
-// amendFile rewrites file with content in the clone that run works in,
-// amends the commit at its head with it, and returns the new head.
-func amendFile(t *testing.T, run func(...string) string, file, content, message string) string {
-	t.Helper()
-	dir := strings.TrimSpace(run("rev-parse", "--show-toplevel"))
-	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	run("add", file)
-	run("-c", "user.name=Agent", "-c", "user.email=agent@example.invalid", "commit", "--quiet", "--amend", "-m", message)
-	return strings.TrimSpace(run("rev-parse", "HEAD"))
-}
 
 // summaries are the numbers and the needs_restack of the changes of a
 // stack as the stack route answers it.
@@ -72,7 +59,7 @@ func TestStackRestack_AnAmendedBottomRestacksTheChangesAboveIt(t *testing.T) {
 	}
 
 	owner("checkout", "--quiet", "low")
-	amended := amendFile(t, owner, "low.txt", "low, amended\n", "Add low, amended")
+	amended := commitFile(t, owner, "low.txt", "low, amended\n", "Add low, amended", "--amend")
 	owner("push", "--quiet", "--force", "origin", "low")
 	h.within(t, restackDeadline, "3", "restacked", func(c map[string]any) bool { return c["version"] == float64(2) })
 
@@ -137,7 +124,15 @@ func TestStackRestack_AConflictingRestackIsReportedAndAPushResolvesIt(t *testing
 		t.Fatalf("after the push below demo#2 is %v, want version 1 in conflict on f.txt", c)
 	}
 
-	r := h.runAs(t, h.key, "change", "restack", "demo", "2")
+	// The agent's shell holds the hub's address and its API key.
+	t.Setenv("PARLEY_ENDPOINT_URL", h.URL(""))
+	t.Setenv("PARLEY_API_KEY", h.key)
+	parley := func(args ...string) ran {
+		var stdout, stderr bytes.Buffer
+		code := cli.Run(context.Background(), args, &stdout, &stderr)
+		return ran{code, stdout.String(), stderr.String()}
+	}
+	r := parley("change", "restack", "demo", "2")
 	if r.code != 1 || r.stdout != "" || r.errorType(t) != "rebase_conflict" {
 		t.Errorf("change restack exited %d with stdout %q and stderr %s, want 1, nothing and rebase_conflict", r.code, r.stdout, r.stderr)
 	}
@@ -151,7 +146,7 @@ func TestStackRestack_AConflictingRestackIsReportedAndAPushResolvesIt(t *testing
 		t.Errorf("after the fixing push demo#2 is %v, want version 2 of kind push, needs_restack false and no reason", c)
 	}
 
-	r = h.runAs(t, h.key, "change", "stack", "demo", "2")
+	r = parley("change", "stack", "demo", "2")
 	if r.code != 0 {
 		t.Fatalf("change stack exited %d: %s", r.code, r.stderr)
 	}
