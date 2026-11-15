@@ -788,6 +788,19 @@ func (w *world) restackEvents(t *testing.T, seq int64) (numbers []string, meta [
 	return numbers, meta
 }
 
+// failFor is a replay that fails, as a git command that exits with an
+// error other than a conflict, for the head while fails reports true (nil:
+// always), with the words in its error's text, and replays any other head
+// as the hub does.
+func failFor(head string, fails func() bool, words ...string) func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time) (string, *gitrepo.ConflictReport, error) {
+	return func(ctx context.Context, repo *gitrepo.Repo, base, h, onto string, at time.Time) (string, *gitrepo.ConflictReport, error) {
+		if h == head && (fails == nil || fails()) {
+			return "", nil, fmt.Errorf("git merge-tree: exit status 128: fatal: %s", strings.Join(append([]string{"bad object"}, words...), " "))
+		}
+		return repo.RebaseFrom(ctx, base, h, onto, at)
+	}
+}
+
 // restack sends the manual restack of the change number of demo with the
 // credential and the body (nil for none), and returns the status and the
 // decoded answer.

@@ -4226,9 +4226,15 @@ clears them too, together with the link. Any other version leaves them
 as they are.
 
 A restack that fails for another reason
-than a conflict changes nothing; it is logged as `the restack failed`
-with `workspace`, `number` and `error`, and stays pending until a newer
-restack of the change replaces it or `parleyd` starts again.
+than a conflict (the `git` command cannot be started or exits with an
+error, or the repository cannot be read) changes nothing; it is logged
+once, at level `ERROR`, as `the restack failed` with `workspace`,
+`number` and `error` (its text scrubbed of credentials), stays pending
+until a newer restack of the change replaces it or `parleyd` starts
+again, and the hub goes on with the next pending restack. A pending
+restack whose change is no longer `draft` or `open` when its turn comes
+is removed, and nothing else happens: no version, no event and no branch
+move.
 
 ### Manual restack
 

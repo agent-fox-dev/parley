@@ -3728,8 +3728,12 @@ woken; a pass reads, in a `Store.Tx` (so it waits for the transaction that
 recorded it), the lowest `seq` not marked failed in memory, runs it, and
 repeats until none is left. A restack that returns an error, or loses the
 swap 5 times, is logged as `the restack failed` (`workspace`, `number`,
-`error`) and marked failed with its `seq`, so it stays pending and runs
-again when a newer record replaces it or at the next start.
+`error`; the hub's logger scrubs the error's text) and marked failed with
+its `seq`, so it stays pending and runs again when a newer record
+replaces it or at the next start (the map lives in the component, which
+a start builds anew); the pass goes on with the next record. Every
+failure of a restack is an error value; nothing in the worker ends the
+process.
 
 The restack (`restack.go`, `restack(ctx, job, caller, session)`) reads the
 change in a `Store.Tx` (gone, or neither draft nor open: the record is

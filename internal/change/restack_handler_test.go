@@ -247,6 +247,13 @@ func TestRestackRoute_RefusesAChangeItCannotRestack(t *testing.T) {
 			commit(t, w.demo, "main", w.head(t, "main"), "main moved\n", map[string]string{p + "main.txt": "m\n"})
 			return w.read(t, ch.Number)
 		}, http.StatusBadRequest, "merge_commits_unsupported"},
+		{"whose replay fails for another reason than a conflict", func(t *testing.T, p string) change.Change {
+			b := w.stacked(t, p+"a", p+"b")[1]
+			change.SetRestackSeams(w.changes, change.RestackSeams{Rebase: failFor(b.HeadSHA, nil)})
+			t.Cleanup(func() { change.SetRestackSeams(w.changes, change.RestackSeams{}) })
+			w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			return w.read(t, b.Number)
+		}, http.StatusInternalServerError, "internal"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ch := c.build(t, fmt.Sprintf("c%d", i))
