@@ -3691,6 +3691,27 @@ workspace of the same slug numbers from 1; the changes of other
 workspaces stay, also those whose source it was. The ref-updated stage
 calls `SourceDeleted` and the teardown remover the other two (below).
 
+The three write routes on one change (`PATCH …/changes/:number`, `POST
+…/abandon`, `POST …/restore`; handlers in `edit.go` and `lifecycle.go`)
+share the unexported `modify` (`authz.go`), which runs in one store
+transaction, in order: `changeOf` (`404 change_not_found`, with the
+confinement of a fork-bound token on the parent), the caller rule
+`change.AuthorizeModify(r, ch)`, exported for the other routes that modify
+a change (nil for the admin token, a caller whose access decision is
+`owner` or `admin`, and the user who is the change's `author.actor_id`,
+whatever their credential; else `403 forbidden`), the route's body
+parser, which returns the route's operation (`400`), `workspaceUsable`,
+the target workspace's `Unusable` (`409 workspace_busy`,
+`workspace_not_ready`, `workspace_archived`), then the operation, and
+answers the change re-read in the transaction. The routes declare
+`changes:write` and the need `read`, so a member who opened a change
+reaches it. The edit stores `labels`; the abandon goes through
+`(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
+which is `SetAbandoned` and `parley.change.abandon` with the given reason;
+the restore sets the change `open` with `mergeable` `unknown` and writes
+`parley.change.restore` (`EventRestore`, metadata `number`, `ref`,
+`version`, `head_sha`).
+
 The hub part connects the component to the features that move a change's
 source or ask about changes, all at composition, on the instances that
 call them:

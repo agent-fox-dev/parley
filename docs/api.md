@@ -3882,6 +3882,45 @@ whose `source.workspace_slug` is the fork, with the same filters and
 order; a fork holds no changes of its own. A token bound to a task fork
 lists, on the fork's parent, only the changes whose source is that fork.
 
+## Modifying a change
+
+`PATCH /api/v1/workspaces/{slug}/changes/{number}`,
+`POST /api/v1/workspaces/{slug}/changes/{number}/abandon` and
+`POST /api/v1/workspaces/{slug}/changes/{number}/restore` modify a change
+of the workspace `{slug}`. Each needs, for a personal access token,
+`changes:write`, and read access to `{slug}`: a token without the scope is
+answered `403` `insufficient_scope` also when `{slug}` names no workspace,
+and a caller who cannot read `{slug}` `404` `not_found`, as for a slug
+that names none. The change is then found as on the [reads of a
+change](#reading-a-change): a number that names no change the request may
+reach, the changes outside its fork for a token bound to a task fork
+included, answers `404` `change_not_found`.
+
+A change may be modified by the user who opened it (its
+`author.actor_id`), with any credential of theirs, also when they only
+read `{slug}`; by a caller who writes `{slug}` (its owner); and with the
+admin token. Anyone else who reads `{slug}` is answered `403`
+`forbidden`, and the change is left as it was.
+
+Then the body is checked (`400` `invalid_request`), and then the state of
+`{slug}`: while it is `pending` or `cloning`, or a reclone, archive or
+delete of it runs, the answer is `409` `workspace_busy`; when its clone
+failed, `409` `workspace_not_ready`; when it is archived, `409`
+`workspace_archived`. Each route answers `200` with the change object as
+`GET …/changes/{number}` returns it.
+
+- `PATCH` takes a JSON object; `labels`, an array of strings, replaces
+  the change's labels. Members it does not know are ignored.
+- `POST …/abandon` takes no body or a JSON object with `reason`, a string,
+  and moves the change to `abandoned`, writing `parley.change.abandon` by
+  the caller with `reason` as given (the empty string when absent),
+  `ref`, `version` and `head_sha`. The source branch and the version refs
+  stay.
+- `POST …/restore` takes no body and moves the change to `open` at its
+  last version with `mergeable` `unknown`, writing
+  `parley.change.restore` by the caller with `number`, `ref`, `version`
+  and `head_sha`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
