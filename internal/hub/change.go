@@ -146,10 +146,11 @@ const (
 // changes.auto_restack false, which changeWorkspaces reads, none is
 // recorded and a change behind is flagged auto_restack_off instead.
 //
-// No session linker, landing evaluator or auto_land guard is registered:
-// without a session linker an explicit session_id is refused and a
-// defaulted one dropped; without a landing evaluator every open change is
-// ready to land; and auto_land is stored as given.
+// No session linker, landing evaluator, auto_land guard or version guard is
+// registered: without a session linker an explicit session_id is refused
+// and a defaulted one dropped; without a landing evaluator every open
+// change is ready to land; auto_land is stored as given; and the version
+// a manual restack records is not judged.
 //
 // The component exists from the composition on (Changes); tests change its
 // dependencies with AdjustChange.

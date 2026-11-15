@@ -54,7 +54,9 @@ const TriggerManual = "manual"
 // restackJob is a restack to run: the change number of the workspace, for
 // the trigger, onto the commit onto when it names one, and seq, the
 // pending record it runs, 0 for none. background is set for a job the
-// worker runs, which a change too deep in its stack skips.
+// worker runs, which a change too deep in its stack skips; a caller's job,
+// without it, restacks such a change too, and has its version judged by
+// the version guard.
 type restackJob struct {
 	workspace  string
 	number     int64

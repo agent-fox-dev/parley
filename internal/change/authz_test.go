@@ -29,6 +29,7 @@ var modifyRoutes = []modifyRoute{
 	{"edit", http.MethodPatch, "", map[string]any{"labels": []string{"x"}}},
 	{"abandon", http.MethodPost, "/abandon", nil},
 	{"restore", http.MethodPost, "/restore", nil},
+	{"restack", http.MethodPost, "/restack", nil},
 }
 
 // call sends the route on the change number (as the path names it) of the

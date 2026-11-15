@@ -3782,6 +3782,35 @@ branch is set back with a compare-and-swap. The version runs the stack
 linker like any other, which records the restacks of the changes above
 it, so a stack is restacked bottom first.
 
+The manual restack, `POST …/changes/:number/restack` (`restackRoute`,
+`restack_handler.go`, registered as a write route with `changes:write`
+and the need `read`, on the contributor table's pattern), follows the
+order of `modify` without using it, since its git work runs outside the
+transaction and a conflict is answered after its transaction committed:
+in one `Store.Tx`, `changeOf`, `AuthorizeModify`, the optional body
+(`decodeOptional`; `session_id` judged with the session linker's rule,
+`400 unknown_session`; `resolutions` not read), `workspaceUsable`, `409
+change_closed` for a closed change, and the commit to sit on (`sitOn`,
+with the `onto` of the change's pending record; `""` is `400
+target_not_found`). It then runs `restack` with a job of trigger
+`TriggerManual` (`manual`) that carries the `seq` of the change's pending
+record, so that the record is removed when the restack ends, and without
+`background`, so that a change too deep in its stack is restacked too
+(its flag stays) and the version guard is asked; the caller is the
+version's creator and the events' actor, and the body's session (else the
+replaced version's) is recorded with `SessionChecked`. Outcomes: restacked
+and up to date answer `200` `{status, change}` with the change re-read;
+a conflict `409 rebase_conflict` with `restackConflicted`'s report as
+`details`; a lost race `409 ref_moved` with the branch's head read again
+as `details.current_sha`; `gitrepo.ErrMergeCommit` `400
+merge_commits_unsupported`; any other error `500 internal`. The interface
+`VersionGuard` (`CheckVersion(ctx, caller, ch, base, head)`), registered
+with `(*Component).RegisterVersionGuard` (a collaborator of the instance,
+nil removes it), is asked in `restackOnce` once per attempt of a job that
+is not `background`, after the replay and before the hook before the
+swap; its error ends the restack unchanged, with nothing written. The hub
+registers no version guard.
+
 `(*Component).OnLanded(ctx, workspace, number, landed)`
 (`restack_queue.go`) is the entry point for a change that landed as the
 commit `landed`: in a `Store.Tx` of its own, since the landing has ended,

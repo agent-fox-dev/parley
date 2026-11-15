@@ -4230,6 +4230,67 @@ than a conflict changes nothing; it is logged as `the restack failed`
 with `workspace`, `number` and `error`, and stays pending until a newer
 restack of the change replaces it or `parleyd` starts again.
 
+### Manual restack
+
+`POST /api/v1/workspaces/{slug}/changes/{number}/restack` restacks the
+change `{number}` of `{slug}` on demand, as the hub restacks it in the
+background, and answers with the outcome in the same call. It is checked
+as the routes of [Modifying a change](#modifying-a-change) are, in the
+same order: `changes:write` and read access to `{slug}` (`403`
+`insufficient_scope`, `404` `not_found`), the change (`404`
+`change_not_found`, a change outside the fork of a token bound to a task
+fork included), the caller (its author with any credential of theirs, a
+caller who writes `{slug}`, or the admin token; anyone else who reads
+`{slug}` gets `403` `forbidden`), then the body, then the state of
+`{slug}` (`409` `workspace_busy`, `workspace_not_ready`,
+`workspace_archived`). The body is absent or a JSON object; its member
+`session_id`, a string, must pass the session-linking rule (`400`
+`unknown_session`, before any replay), and its other members, such as
+`resolutions`, are ignored. A change that is `landed` or `abandoned` is
+answered `409` `change_closed`, and a change with `depends_on` `null`
+whose target branch does not exist `400` `target_not_found`; neither
+changes anything.
+
+The restack replays the change's commits onto the commit it must sit on,
+as above. The change's pending restack, if it has one, is taken over and
+removed when the restack ends. A change too deep in its stack is restacked
+too and keeps `needs_restack` with `restack_reason` `stack_too_deep`. It
+answers:
+
+- `200` `{"status": "restacked", "change": <change object>}` when the
+  source branch moved: the version is of kind `restack`, created by the
+  caller (`created_by`, and the caller's credential as its creating
+  credential), in the body's `session_id` or else the session of the
+  version it replaces; `needs_restack` is cleared unless its reason is
+  `stack_too_deep`; and the hub writes `parley.change.version` and then
+  `parley.change.restack` with the trigger `manual`, both with the caller
+  as actor.
+- `200` `{"status": "up_to_date", "change": <change object>}` when the
+  change already sits on that commit: no version and no event; a
+  `needs_restack` set for `conflict` or `auto_restack_off` is cleared and
+  the change's mergeability is computed again.
+- `409` `rebase_conflict` with the conflict report as the envelope's
+  `details` when a commit does not apply: the change is left as a
+  conflicting background restack leaves it (`needs_restack` for
+  `conflict`, `mergeable` `conflict` with the report,
+  `parley.change.conflict` unless it was in conflict already), and nothing
+  moves.
+- `409` `ref_moved` with `details.current_sha`, the source branch's head
+  (`null` when it is gone), when the branch moved before each of 5
+  compare-and-swaps; nothing is recorded.
+- `400` `merge_commits_unsupported` when a merge commit is among the
+  change's own commits; nothing moves.
+
+A version guard, when the hub has one, judges the version a manual
+restack would record, once per attempt, after the replay and before the
+source branch moves, with the caller's credential and paths and the
+version's base (the commit sat on) and head; its refusal, such as `403`
+`path_not_allowed` with the `path`, is the answer, and nothing changes.
+It is not asked for an `up_to_date` answer, a conflict or a restack of
+the hub. No guard is registered yet, so every version passes.
+
+A restack that fails for another reason answers `500` `internal`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

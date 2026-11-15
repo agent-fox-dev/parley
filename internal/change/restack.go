@@ -139,6 +139,13 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 		res.outcome, res.report = restackConflict, report
 		return c.restackConflicted(ctx, j, ch, res, onto)
 	}
+	// The hub's own restacks are not judged: their actor is the hub, and
+	// the version guard judges a caller's version.
+	if g := c.collaborators().versions; g != nil && !j.background {
+		if err := g.CheckVersion(ctx, by, ch, onto, newHead); err != nil {
+			return res, false, err
+		}
+	}
 	if beforeSwap != nil {
 		beforeSwap(ctx, j.workspace, j.number, attempt)
 	}

@@ -403,7 +403,9 @@ type Component struct {
 	guard     AutoLandGuard
 	activity  ForkActivity
 	restacker Restacker
-	expanders map[string]Expander
+	// versionGuard judges the version of a manual restack.
+	versionGuard VersionGuard
+	expanders    map[string]Expander
 
 	// merge holds the scheduled mergeability checks.
 	merge    mergeWorker

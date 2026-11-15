@@ -787,3 +787,64 @@ func (w *world) restackEvents(t *testing.T, seq int64) (numbers []string, meta [
 	}
 	return numbers, meta
 }
+
+// restack sends the manual restack of the change number of demo with the
+// credential and the body (nil for none), and returns the status and the
+// decoded answer.
+func (w *world) restack(t *testing.T, number int64, credential string, body any) (int, map[string]any) {
+	t.Helper()
+	return w.send(t, http.MethodPost, "/workspaces/demo/changes/"+strconv.FormatInt(number, 10)+"/restack", credential, body)
+}
+
+// versionGuard is a version guard that records every call, with the head
+// the change's source branch in dir was at then, and answers refuse.
+type versionGuard struct {
+	dir    string
+	refuse error
+
+	mu    sync.Mutex
+	calls []versionCall
+}
+
+// versionCall is one call of a versionGuard.
+type versionCall struct {
+	caller               change.Caller
+	base, head, branchAt string
+}
+
+func (g *versionGuard) CheckVersion(_ context.Context, caller change.Caller, ch change.Change, base, head string) error {
+	at, _ := gitrepotest.Run(g.dir, "", "rev-parse", "refs/heads/"+ch.Source.Branch)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls = append(g.calls, versionCall{caller, base, head, strings.TrimSpace(at)})
+	return g.refuse
+}
+
+func (g *versionGuard) called() []versionCall {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.calls)
+}
+
+// guard registers a version guard of demo that answers refuse until the
+// test ends.
+func (w *world) guard(t *testing.T, refuse error) *versionGuard {
+	t.Helper()
+	g := &versionGuard{dir: w.demo, refuse: refuse}
+	w.changes.RegisterVersionGuard(g)
+	t.Cleanup(func() { w.changes.RegisterVersionGuard(nil) })
+	return g
+}
+
+// changeEventsOf are the events of the change number of demo written after
+// seq, of every type.
+func (w *world) changeEventsOf(t *testing.T, seq, number int64) []event.Record {
+	t.Helper()
+	var out []event.Record
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.ResourceType == "change" && e.ResourceID == strconv.FormatInt(number, 10) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
