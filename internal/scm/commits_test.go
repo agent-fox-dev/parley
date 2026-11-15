@@ -14,6 +14,7 @@ import (
 )
 
 func TestCommits_ListsTheFirstParentHistoryOfARefInPagesFromOneCommit(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	id := w.addHistory(t)
 	path := scmPath("hist", "/commits?ref=main")
@@ -40,8 +41,9 @@ func TestCommits_ListsTheFirstParentHistoryOfARefInPagesFromOneCommit(t *testing
 }
 
 func TestCommits_KeepsTheCommitsTheFiltersAskFor(t *testing.T) {
-	w := newWorld(t)
-	id := w.addHistory(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.hist
 	for _, c := range []struct {
 		query string
 		want  []string
@@ -92,8 +94,9 @@ func (l commitLookups) SessionOf(_ context.Context, _, sha string) (*string, err
 }
 
 func TestCommits_DescribesEachCommitTheSameWay(t *testing.T) {
-	w := newWorld(t)
-	id := w.addHistory(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.hist
 	alice := map[string]any{"name": "Alice", "email": "alice@example.com", "time": histT2}
 	want := map[string]any{
 		"sha": id["c2"], "parents": []any{id["c1"]}, "author": alice, "committer": alice, "message": histMessage,
@@ -126,8 +129,9 @@ func TestCommits_DescribesEachCommitTheSameWay(t *testing.T) {
 }
 
 func TestCommits_ReadsOneCommitByAnyRevisionWithItsStats(t *testing.T) {
-	w := newWorld(t)
-	id := w.addHistory(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.hist
 	r := w.get(t, scmPath("hist", "/commits/"+id["c2"]), w.ownerKey)
 	stats, _ := r.json["stats"].(map[string]any)
 	if _, hasFiles := r.json["files"]; r.status != http.StatusOK || r.json["sha"] != id["c2"] || stats["files_changed"] != 2.0 || hasFiles {
@@ -153,8 +157,9 @@ func TestCommits_ReadsOneCommitByAnyRevisionWithItsStats(t *testing.T) {
 }
 
 func TestCommits_ResolveTheirRevisionThroughTheResolver(t *testing.T) {
-	w := newWorld(t)
-	hist := w.addHistory(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	hist := w.hist
 	for _, c := range []struct{ slug, path, member, want string }{
 		{"demo", "/commits/feature%2Fx", "sha", w.id["c3"]},
 		{"demo", "/commits?ref=v2", "resolved_sha", w.id["c2"]},
@@ -167,7 +172,8 @@ func TestCommits_ResolveTheirRevisionThroughTheResolver(t *testing.T) {
 }
 
 func TestCommits_RefusesAMalformedParameter(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, path := range []string{
 		"/commits?stats=yes", "/commits?first_parent=1", "/commits?since=yesterday",
 		"/commits?until=2026-13-01T00:00:00Z", "/commits?follow=true", "/commits/main?files=maybe",

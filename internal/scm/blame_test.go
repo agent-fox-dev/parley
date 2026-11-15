@@ -51,8 +51,9 @@ func (r reply) rangeOf(t *testing.T, sha string) map[string]any {
 }
 
 func TestBlame_GroupsTheWholeFileIntoRangesOfOneCommit(t *testing.T) {
-	w := newWorld(t)
-	id := w.addBlame(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.blame
 	for _, q := range []string{"ref=main&path=f.txt", "path=f.txt"} {
 		r := w.get(t, scmPath("blame", "/blame?"+q), w.ownerKey)
 		want := []blameRange{{1, 2, id["c1"], 1}, {3, 3, id["c3"], 3}, {4, 6, id["c2"], 4}}
@@ -69,8 +70,9 @@ func TestBlame_GroupsTheWholeFileIntoRangesOfOneCommit(t *testing.T) {
 }
 
 func TestBlame_ReturnsOnlyTheRangesInsideALineSpan(t *testing.T) {
-	w := newWorld(t)
-	id := w.addBlame(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.blame
 	c1, c2, c3 := id["c1"], id["c2"], id["c3"]
 	for _, c := range []struct {
 		span string
@@ -89,6 +91,7 @@ func TestBlame_ReturnsOnlyTheRangesInsideALineSpan(t *testing.T) {
 }
 
 func TestBlame_DescribesTheCommitOfEachRangeFollowingRenames(t *testing.T) {
+	t.Parallel()
 	var sha string
 	w := newWorld(t, func(d *scm.Deps) { d.Changes = commitLookups{&sha} })
 	id := w.addBlame(t)
@@ -118,8 +121,8 @@ func TestBlame_DescribesTheCommitOfEachRangeFollowingRenames(t *testing.T) {
 }
 
 func TestBlame_RefusesAPathOrSpanItCannotBlame(t *testing.T) {
-	w := newWorld(t)
-	w.addBlame(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, c := range []struct {
 		query     string
 		status    int

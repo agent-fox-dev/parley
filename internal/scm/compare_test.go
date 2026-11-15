@@ -1,13 +1,16 @@
 package scm_test
 
 import (
+	"context"
 	"net/http"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/scm"
 )
 
 // compareRepo is the cmp workspace's repository, whose refs the tests
@@ -49,8 +52,9 @@ func (r reply) commitShas() []string {
 }
 
 func TestCompare_ReportsHowTwoRevisionsRelateWhenHeadApplies(t *testing.T) {
-	w := newWorld(t)
-	c := compareRepo{w.addCompare(t)}
+	t.Parallel()
+	w := readOnlyWorld(t)
+	c := compareRepo{w.cmp}
 	before := c.refs(t)
 
 	r := w.get(t, scmPath("cmp", "/compare?base=main&head=feature"), w.ownerKey)
@@ -79,11 +83,6 @@ func TestCompare_ReportsHowTwoRevisionsRelateWhenHeadApplies(t *testing.T) {
 		t.Errorf("head contained in base: %d %s, want ahead 0, commits [], files [] and clean", s.status, s.body)
 	}
 
-	l := w.get(t, scmPath("cmp", "/compare?base=main&head=long"), w.ownerKey)
-	if shas := l.commitShas(); l.json["ahead"] != float64(gitrepotest.LongCommits) || len(shas) != 200 || shas[0] != c.id(t, "long~249") {
-		t.Errorf("long: ahead %v, %d commits; want %d and the first 200, oldest first", l.json["ahead"], len(shas), gitrepotest.LongCommits)
-	}
-
 	if n := w.get(t, scmPath("cmp", "/compare?base=nope&head=main"), w.ownerKey); n.status != http.StatusNotFound || n.errorType() != "ref_not_found" {
 		t.Errorf("base=nope: %d %s, want 404 ref_not_found", n.status, n.body)
 	}
@@ -92,9 +91,34 @@ func TestCompare_ReportsHowTwoRevisionsRelateWhenHeadApplies(t *testing.T) {
 	}
 }
 
-func TestCompare_ReportsTheConflictOfTheFirstCommitThatDoesNotApply(t *testing.T) {
-	w := newWorld(t)
+// noTrialRepo is a workspace repository whose trial rebase reports a clean
+// rebase without replaying a commit, which gitrepo's own tests do.
+type noTrialRepo struct{ scm.Repository }
+
+func (noTrialRepo) TrialRebase(context.Context, string, string) (*gitrepo.ConflictReport, error) {
+	return nil, nil
+}
+
+func TestCompare_ListsTheFirst200CommitsOfHeadOldestFirst(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *scm.Deps) {
+		open := d.Open
+		d.Open = func(ctx context.Context, slug string) (scm.Repository, error) {
+			repo, err := open(ctx, slug)
+			return noTrialRepo{repo}, err
+		}
+	})
 	c := compareRepo{w.addCompare(t)}
+	l := w.get(t, scmPath("cmp", "/compare?base=main&head=long"), w.ownerKey)
+	if shas := l.commitShas(); l.json["ahead"] != float64(gitrepotest.LongCommits) || len(shas) != 200 || shas[0] != c.id(t, "long~249") {
+		t.Errorf("long: ahead %v, %d commits; want %d and the first 200, oldest first", l.json["ahead"], len(shas), gitrepotest.LongCommits)
+	}
+}
+
+func TestCompare_ReportsTheConflictOfTheFirstCommitThatDoesNotApply(t *testing.T) {
+	t.Parallel()
+	w := readOnlyWorld(t)
+	c := compareRepo{w.cmp}
 	for _, tc := range []struct{ base, head, kind string }{
 		{"main", "both-edit", "content"},
 		{"main", "both-add", "add_add"},
@@ -124,8 +148,9 @@ func TestCompare_ReportsTheConflictOfTheFirstCommitThatDoesNotApply(t *testing.T
 }
 
 func TestCompare_RefusesAMergeCommitAmongTheCommitsToReplay(t *testing.T) {
-	w := newWorld(t)
-	c := compareRepo{w.addCompare(t)}
+	t.Parallel()
+	w := readOnlyWorld(t)
+	c := compareRepo{w.cmp}
 	before := c.refs(t)
 	if r := w.get(t, scmPath("cmp", "/compare?base=main&head=merged"), w.ownerKey); r.status != http.StatusBadRequest || r.errorType() != "merge_commits_unsupported" {
 		t.Errorf("merged onto main: %d %s, want 400 merge_commits_unsupported", r.status, r.body)

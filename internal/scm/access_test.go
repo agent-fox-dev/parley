@@ -9,6 +9,7 @@ import (
 )
 
 func TestRead_ServesEveryReaderOnEveryReadableWorkspace(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	creds := []struct{ name, cred string }{
 		{"owner key", w.ownerKey}, {"member key", w.memberKey},
@@ -49,6 +50,7 @@ func TestRead_ServesEveryReaderOnEveryReadableWorkspace(t *testing.T) {
 }
 
 func TestRead_RefusesACallerWhoMayNotReadWithoutOpeningTheRepository(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	const requestID = "5f0c6a52-3a8e-4d43-9c55-0d8b1f0e2a41"
 	for _, rt := range scmRoutes {
@@ -75,6 +77,7 @@ func TestRead_RefusesACallerWhoMayNotReadWithoutOpeningTheRepository(t *testing.
 }
 
 func TestRead_RefusesAWorkspaceThatIsNotReadableWithoutOpeningTheRepository(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	tests := []struct {
 		name, slug        string

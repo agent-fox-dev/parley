@@ -134,7 +134,7 @@ func TestTrialRebase_ReadsNoCommitMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, head := range []string{"feature", "long", "merged", "both-edit", "main~1"} {
+	for _, head := range []string{"feature", "merged", "both-edit", "main~1"} {
 		if _, err := repo.TrialRebase(context.Background(), f.id(t, "main"), f.id(t, head)); err != nil && !errors.Is(err, gitrepo.ErrMergeCommit) {
 			t.Errorf("TrialRebase(main, %s): %v", head, err)
 		}

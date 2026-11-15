@@ -72,6 +72,8 @@ func (w *world) fetch(path string) (reply, error) {
 	return r, err
 }
 
+// The timeout tests measure how long an answer takes, so they do not run in
+// parallel with the other tests of the package.
 func TestRead_EndsAReadThatOutlastsTheReadTimeout(t *testing.T) {
 	var ended atomic.Int32
 	w := newWorld(t, func(d *scm.Deps) {

@@ -22,7 +22,8 @@ const (
 var quotedTag = regexp.MustCompile(`^"[^"]+"$`)
 
 func TestRead_MarksAnAnswerAddressedByFullIdsImmutable(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	c, c1 := w.id["c2"], w.id["c1"]
 	for _, path := range []string{
 		"/commits?ref=" + c, "/commits/" + c, "/tree?ref=" + c, "/file?ref=" + c + "&path=f.txt",
@@ -40,6 +41,7 @@ func TestRead_MarksAnAnswerAddressedByFullIdsImmutable(t *testing.T) {
 }
 
 func TestRead_AnswersAnyOtherReadWithATagToRevalidate(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	c := w.id["c2"]
 	paths := []string{"/diff?base=main&head=" + c, "/file?ref=" + c[:7] + "&path=f.txt", "/commits/" + c[:12]}
@@ -85,6 +87,7 @@ func TestRead_AnswersAnyOtherReadWithATagToRevalidate(t *testing.T) {
 }
 
 func TestRead_AnswersNotModifiedToAnIfNoneMatchHoldingItsTag(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	for _, tc := range []struct{ name, path string }{
 		{"file by name", "/file?ref=main&path=f.txt"},
@@ -118,6 +121,7 @@ func TestRead_AnswersNotModifiedToAnIfNoneMatchHoldingItsTag(t *testing.T) {
 }
 
 func TestRead_AnswersNotModifiedWithoutTheReadsCostlyPart(t *testing.T) {
+	t.Parallel()
 	calls := &costlyCalls{}
 	w := newWorld(t, func(d *scm.Deps) {
 		open := d.Open
@@ -142,7 +146,8 @@ func TestRead_AnswersNotModifiedWithoutTheReadsCostlyPart(t *testing.T) {
 }
 
 func TestRead_LeavesAnErrorWithoutATagAndUncached(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, rt := range scmRoutes {
 		t.Run(rt.bad, func(t *testing.T) {
 			r := w.get(t, scmPath("demo", rt.bad), w.ownerKey)

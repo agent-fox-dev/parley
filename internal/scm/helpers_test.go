@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -153,7 +155,7 @@ func newWorld(t *testing.T, adjust ...func(*scm.Deps)) *world {
 }
 
 // newConfiguredWorld is newWorld with toml added to the hub's config.toml.
-func newConfiguredWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *world {
+func newConfiguredWorld(t testing.TB, toml string, adjust ...func(*scm.Deps)) *world {
 	t.Helper()
 	w := &world{observed: &observations{}, id: map[string]string{}}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{TOML: toml, Compose: func(c *hub.Composition) {
@@ -194,9 +196,99 @@ func newConfiguredWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *w
 	return w
 }
 
+// readWorld is the world the tests that only read share, built once for the
+// package: a world as newWorld makes it, its rate limit off since every
+// test that reads sends with the same keys, with the owner's workspaces hist,
+// tree, files, diff, cmp, blame and search added. hist, diff and blame are
+// the ids addHistory, addDiff and addBlame return; tree, files, cmp and
+// search the git directories of those workspaces, files a tree workspace
+// holding fileExtras too; and searchMain the id of search's main. Its tests
+// change nothing in it and read neither its observations nor its opens.
+type readWorld struct {
+	*world
+	hist, diff, blame        map[string]string
+	tree, files, cmp, search string
+	searchMain               string
+}
+
+// readOnly is the package's readWorld, and the testing.TB it lives on.
+var readOnly struct {
+	once    sync.Once
+	tb      packageTB
+	w       *readWorld
+	failure any
+}
+
+// readOnlyWorld is the package's readWorld, built by the first test that
+// asks for it; a failure to build it fails every test that asks.
+func readOnlyWorld(t *testing.T) *readWorld {
+	t.Helper()
+	readOnly.once.Do(func() {
+		defer func() { readOnly.failure = recover() }()
+		tb := &readOnly.tb
+		w := &readWorld{world: newConfiguredWorld(tb, "[limits]\nrequests_per_minute = 0\n")}
+		w.hist, w.diff, w.blame = w.addHistory(tb), w.addDiff(tb), w.addBlame(tb)
+		w.tree, w.files, w.cmp = w.addTree(tb, "tree"), w.addTree(tb, "files", fileExtras...), w.addCompare(tb)
+		w.search, w.searchMain = w.addSearch(tb)
+		readOnly.w = w
+	})
+	if readOnly.failure != nil {
+		t.Fatalf("the shared world: %v", readOnly.failure)
+	}
+	return readOnly.w
+}
+
+// TestMain runs the package's tests, then stops the shared world.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	readOnly.tb.cleanup()
+	os.Exit(code)
+}
+
+// packageTB is the testing.TB of what lasts as long as the package's tests:
+// its cleanups run when TestMain calls cleanup, and a failure panics, which
+// readOnlyWorld turns into the failure of the test that asked. hubtest and
+// the world's helpers call only the methods it defines.
+type packageTB struct {
+	testing.TB
+	mu       sync.Mutex
+	cleanups []func()
+}
+
+func (*packageTB) Helper() {}
+
+func (p *packageTB) Cleanup(f func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cleanups = append(p.cleanups, f)
+}
+
+func (p *packageTB) TempDir() string {
+	dir, err := os.MkdirTemp("", "scm-test-")
+	if err != nil {
+		p.Fatal(err)
+	}
+	p.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func (*packageTB) Fatal(args ...any) { panic(fmt.Sprint(args...)) }
+
+func (*packageTB) Fatalf(format string, args ...any) { panic(fmt.Sprintf(format, args...)) }
+
+// cleanup runs the cleanups, the last registered first, as a test does.
+func (p *packageTB) cleanup() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, f := range slices.Backward(p.cleanups) {
+		f()
+	}
+	p.cleanups = nil
+}
+
 // addWorkspace adds the ready workspace slug of the owner in org, its
 // repository made by stream, and returns the repository's git directory.
-func (w *world) addWorkspace(t *testing.T, slug, org, stream string) string {
+func (w *world) addWorkspace(t testing.TB, slug, org, stream string) string {
 	t.Helper()
 	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
 	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
@@ -219,7 +311,7 @@ func (w *world) addWorkspace(t *testing.T, slug, org, stream string) string {
 // addFork adds the ready task fork parent--t1 of parent, which the member
 // owns, tracking branches and tags, its repository borrowing the parent's
 // objects.
-func (w *world) addFork(t *testing.T, parent, org string, branches, tags []string) {
+func (w *world) addFork(t testing.TB, parent, org string, branches, tags []string) {
 	t.Helper()
 	ctx, now, slug := context.Background(), time.Now().UTC(), parent+"--t1"
 	head := gitrepotest.Refs(t, w.workspaces.RepoPath(parent), "refs/heads/")["main"]
@@ -260,7 +352,7 @@ const histMessage = "Second\n\nBody one.\nBody two.\n"
 // Bob at histT4, merges side, whose commit s1, by Bob at histT3 on top of
 // c2, adds side.txt. The branch docs has r, by Bob <bob@example.org> at
 // histT3 on top of c2, which renames old.md to new.md.
-func (w *world) addHistory(t *testing.T) map[string]string {
+func (w *world) addHistory(t testing.TB) map[string]string {
 	t.Helper()
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	who := func(name, email, at string) string {
@@ -289,13 +381,13 @@ func (w *world) addHistory(t *testing.T) map[string]string {
 // treeReadme is the content of README.md on the tree workspace's main.
 const treeReadme = "# Tree\n\nA fixture.\n"
 
-// addTree adds the ready workspace tree of the owner and returns its git
+// addTree adds the ready workspace slug of the owner and returns its git
 // directory. Its main holds README.md (treeReadme), the executable run.sh,
 // the symlink link to README.md, docs/a.md, docs/api/b.md, the submodule
 // entry vendor/sub and the files of files, given as path and content in
 // turn; its branch big holds 1,500 files at its root, f0000.txt to
 // f1499.txt.
-func (w *world) addTree(t *testing.T, files ...string) string {
+func (w *world) addTree(t testing.TB, slug string, files ...string) string {
 	t.Helper()
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	var more strings.Builder
@@ -307,7 +399,7 @@ func (w *world) addTree(t *testing.T, files ...string) string {
 	for i := range 1500 {
 		fmt.Fprintf(&big, "M 100644 :9 f%04d.txt\n", i)
 	}
-	return w.addWorkspace(t, "tree", w.org, "commit refs/heads/main\n"+testCommitter+data("tree")+
+	return w.addWorkspace(t, slug, w.org, "commit refs/heads/main\n"+testCommitter+data("tree")+
 		"M 100644 inline README.md\n"+data(treeReadme)+"M 100755 inline run.sh\n"+data("#!/bin/sh\necho run\n")+
 		"M 120000 inline link\n"+data("README.md")+"M 100644 inline docs/a.md\n"+data("a\n")+
 		"M 100644 inline docs/api/b.md\n"+data("b\n")+"M 160000 "+strings.Repeat("5", 40)+" vendor/sub\n"+more.String()+"\n"+
@@ -323,7 +415,7 @@ func (w *world) addTree(t *testing.T, files ...string) string {
 // line, changes img.bin, turns kind into a symlink and adds docs/guide.md,
 // docs/api/x.txt, notes.md and src/readme.md. orphan is a root commit of
 // its own adding o1.txt and o2.txt.
-func (w *world) addDiff(t *testing.T) map[string]string {
+func (w *world) addDiff(t testing.TB) map[string]string {
 	t.Helper()
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	file := func(path, content string) string { return "M 100644 inline " + path + "\n" + data(content) }
@@ -350,7 +442,7 @@ func (w *world) addDiff(t *testing.T) map[string]string {
 
 // addCompare adds the ready workspace cmp of the owner, its repository made
 // from gitrepotest.CompareStream, and returns its git directory.
-func (w *world) addCompare(t *testing.T) string {
+func (w *world) addCompare(t testing.TB) string {
 	t.Helper()
 	return w.addWorkspace(t, "cmp", w.org, gitrepotest.CompareStream())
 }
@@ -364,7 +456,7 @@ var blameEdge = strings.Repeat(strings.Repeat("e", 63)+"\n", 32768)
 // binary file bin.dat, edge.txt (blameEdge), big.txt (blameEdge and one more
 // byte), docs/a.md and the submodule entry sub, and returns the ids of c1 to
 // c4 and of main.
-func (w *world) addBlame(t *testing.T) map[string]string {
+func (w *world) addBlame(t testing.TB) map[string]string {
 	t.Helper()
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	file := func(path, content string) string { return "M 100644 inline " + path + "\n" + data(content) }
@@ -381,7 +473,7 @@ func (w *world) addBlame(t *testing.T) map[string]string {
 // addSearch adds the ready workspace search of the owner, its repository
 // made from gitrepotest.SearchStream, and returns its git directory and the
 // id of its main.
-func (w *world) addSearch(t *testing.T) (dir, main string) {
+func (w *world) addSearch(t testing.TB) (dir, main string) {
 	t.Helper()
 	dir = w.addWorkspace(t, "search", w.org, gitrepotest.SearchStream())
 	return dir, strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
@@ -389,7 +481,7 @@ func (w *world) addSearch(t *testing.T) (dir, main string) {
 
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
-func (w *world) set(t *testing.T, slug, column, value string) {
+func (w *world) set(t testing.TB, slug, column, value string) {
 	t.Helper()
 	ctx := context.Background()
 	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {

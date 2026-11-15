@@ -9,6 +9,7 @@ import (
 )
 
 func TestRead_AForkShowsItsOwnBranchesAndItsParentsCurrentHeads(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	forkRepo := w.workspaces.RepoPath("demo--t1")
 	gitrepotest.Git(t, forkRepo, "update-ref", "refs/heads/work", w.id["c1"])
