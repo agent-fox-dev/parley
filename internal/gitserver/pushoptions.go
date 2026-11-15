@@ -81,7 +81,7 @@ func ParsePushOptions(raw []string) (PushOptions, string) {
 	for _, o := range raw {
 		name, value, hasValue := strings.Cut(o, "=")
 		if len(o) > maxPushOptionBytes {
-			return PushOptions{}, invalidOption(name, fmt.Sprintf("longer than %d bytes", maxPushOptionBytes))
+			return PushOptions{}, invalidOption(cutName(name), fmt.Sprintf("longer than %d bytes", maxPushOptionBytes))
 		}
 		if !strings.HasPrefix(name, "parley.") {
 			continue
@@ -171,6 +171,23 @@ func ValidatePushOptions(ctx context.Context, raw []string, caller PushCaller, w
 
 func invalidOption(name, reason string) string {
 	return "invalid push option " + name + ": " + reason
+}
+
+// cutName is the name of an over-long option as its refusal shows it: the
+// name, or when it is longer than one option may be, its first
+// maxPushOptionBytes bytes at most, cut at a character boundary and marked
+// with "...". A name as long as git can send would otherwise make the
+// refusal's status and side-band lines longer than one pkt-line, and the
+// client would report a protocol error instead of the refusal.
+func cutName(name string) string {
+	if len(name) <= maxPushOptionBytes {
+		return name
+	}
+	n := maxPushOptionBytes
+	for n > 0 && !utf8.RuneStart(name[n]) {
+		n--
+	}
+	return name[:n] + "..."
 }
 
 // PushOptionsStage is the push processor's options stage: it judges the

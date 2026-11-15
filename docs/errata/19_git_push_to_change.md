@@ -80,3 +80,16 @@ type. The mapping takes only those below status 500 as refusals: a
 `*server.Error` of status 500 or above is an internal error, like an
 untyped one. It is logged, its text is never sent, and the reason is
 `internal error`.
+
+## The refusal of an over-long option cuts the name it repeats
+
+The package refuses an option longer than 1,024 bytes with
+`invalid push option <name>: longer than 1024 bytes`. Git may send an
+option name of up to about 65,500 bytes, and repeating all of it would make
+the `ng <ref> <message>` status line and the `error: <message>` side-band
+line longer than one pkt-line, so that the client reports a protocol error
+instead of the refusal. A name longer than 1,024 bytes is therefore shown
+cut to its first 1,024 bytes at most, at a character boundary, followed by
+`...` (`cutName` in `internal/gitserver/pushoptions.go`), for example
+`invalid push option aaaa…a...: longer than 1024 bytes`. A name of 1,024
+bytes or less is shown whole, as the package says.

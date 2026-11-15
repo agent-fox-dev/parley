@@ -110,6 +110,8 @@ func TestValidatePushOptions_RefusesTheFirstInvalidOption(t *testing.T) {
 		{[]string{"parley.draft=1", "parley.bogus"}, "parley.draft: takes no value"},
 		{[]string{"parley.intent=" + strings.Repeat("i", 1025-len("parley.intent="))}, "parley.intent: longer than 1024 bytes"},
 		{[]string{"note=" + strings.Repeat("n", 1021)}, "note: longer than 1024 bytes"},
+		{[]string{strings.Repeat("n", 65500)}, strings.Repeat("n", 1024) + "...: longer than 1024 bytes"},
+		{[]string{strings.Repeat("n", 1023) + "é" + strings.Repeat("n", 10)}, strings.Repeat("n", 1023) + "...: longer than 1024 bytes"},
 		{numbered("x", 17), tooMany},
 		{append([]string{"parley.bogus"}, numbered("x", 16)...), tooMany},
 	} {
