@@ -150,19 +150,13 @@ var lockedRef = regexp.MustCompile(`cannot lock ref '([^']+)'`)
 // says its lock exists, and in the way of another ref's name when the
 // update creates it and such a ref exists.
 func (r *Repo) refTxFailure(ctx context.Context, updates []RefUpdate, err error) error {
-	patterns := []string{"for-each-ref", "--format=%(objectname) %(refname)"}
-	for _, u := range updates {
-		patterns = append(patterns, u.Ref)
+	refs := make([]string, len(updates))
+	for i, u := range updates {
+		refs[i] = u.Ref
 	}
-	out, readErr := r.git(ctx, patterns...)
+	current, readErr := r.RefValues(ctx, refs)
 	if readErr != nil {
 		return errors.Join(err, readErr)
-	}
-	current := map[string]string{}
-	for line := range strings.Lines(string(out)) {
-		if id, ref, ok := strings.Cut(strings.TrimRight(line, "\n"), " "); ok {
-			current[ref] = id
-		}
 	}
 	for _, u := range updates {
 		if id, found := current[u.Ref]; found != (u.Old != "") || id != u.Old {

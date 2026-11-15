@@ -86,8 +86,9 @@ type ReceiverDeps struct {
 // commands and push options of a push that passed the git server's checks,
 // asks the options stage, receives the pack into a quarantine, has the push
 // rules decide every ref update, has the ref writer write all of them or
-// none, asks the mapping stage of an accepted push and answers with git's
-// status report, carrying the rules' message for each ref. git
+// none, asks the mapping stage of an accepted push, has the ref writer
+// write its events and tell its post-push listeners, and answers with
+// git's status report, carrying the rules' message for each ref. git
 // receive-pack is not run: its report cannot carry those messages.
 //
 // The stages are registered on the instance while the hub is composed
@@ -233,8 +234,9 @@ func (run *push) process(ctx context.Context, body *bufio.Reader) (report, Resul
 	if run.mapping != nil {
 		rep.band = append(rep.band, run.mapping.MapPush(ctx, MappingInput{run.ws, run.caller, run.pushOpts, answer.SessionID, res.Updates})...)
 	}
-	// The ref writer's event step for the accepted updates runs here, after
-	// the mapping stage and before the answer.
+	// The events come after the mapping stage, which may open changes, and
+	// before the answer, so a client that has read it finds them.
+	run.writer().Finish(ctx, res)
 	return rep, ResultOK
 }
 

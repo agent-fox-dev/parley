@@ -122,3 +122,35 @@ non-create, non-delete update, so the update is refused with
 an object the repository lacks, so only a client that invents its `before`
 meets this; stock git sends the value it read from the advertisement or its
 own remote-tracking ref, which the repository holds unless it was pruned.
+
+## The event step is `Writer.Finish`, run with the result of `Apply`
+
+The package gives the ref writer a second step that the caller runs after
+the ref transaction, without naming it. It is
+`(*pushrule.Writer).Finish(ctx, result)`, given the `Result` `Apply`
+returned, which carries what the step writes; a result that is not
+accepted writes and tells nothing. Its transaction runs to its end even
+when the caller's context has ended, since the refs have moved. A caller
+of `Apply` that never runs `Finish` leaves the request's journal entry in
+place, so its events are written at the next start rather than lost.
+
+## A journal entry that cannot be written refuses the request as internal
+
+The package has the journal entry written in a transaction of its own
+before the ref transaction and does not say what a failure of that
+transaction does. It refuses every update with `internal error; try
+again` and moves no ref, so no request moves refs whose events could be
+lost; forwards to origin that already ran are left as they are, as for a
+later failed forward. A writer bound without an event log keeps no
+journal and writes no event.
+
+## Reconcile drops an entry whose refs hold neither value
+
+The package has the start-up reconciliation write the events of an entry
+whose refs hold their after values and drop one whose refs were never
+written. An entry with a ref that holds neither its before nor its after
+value, which only another writer can cause after the request was
+refused, is dropped without events as well, and logged as a warning. An
+entry whose repository cannot be opened or read, or whose transaction
+fails, is logged and kept for the next start rather than failing the
+start; the start fails only when the journal itself cannot be read.

@@ -40,12 +40,14 @@ func TestApply_WritesNoRefOfARequestWithARefNotAtItsBefore(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var log []string
 			s := &stage{name: "s", log: &log, dir: r.dir}
+			st, ev := newStore(t), &emitted{}
 			var w pushrule.Writer
-			w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx})
+			w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: ev})
 			w.RegisterRefUpdatedStage(s.run)
 			refsBefore := gitrepotest.Refs(t, r.dir, "")
 			v := pushrule.Verdict{Decisions: []pushrule.Decision{tc.first, allowed(create("refs/heads/ok", r.head)).Decisions[0]}}
 			res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: v, Repo: r.view, Workspace: demo, Caller: ownerKey, Via: pushrule.ViaGit, VersionKind: pushrule.VersionKindPush})
+			w.Finish(context.Background(), res)
 			if err != nil || res.Outcome != tc.outcome || !res.Refused() || len(res.Updates) != 2 {
 				t.Fatalf("Apply = %+v, %v, want outcome %s for both updates", res, err, tc.outcome)
 			}
@@ -58,8 +60,8 @@ func TestApply_WritesNoRefOfARequestWithARefNotAtItsBefore(t *testing.T) {
 			if got := gitrepotest.Refs(t, r.dir, ""); !maps.Equal(got, refsBefore) {
 				t.Errorf("refs = %v, want them unchanged %v", got, refsBefore)
 			}
-			if len(log) != 0 {
-				t.Errorf("stages called %v, want none", log)
+			if len(log) != 0 || len(ev.got(t)) != 0 || len(journal(t, st)) != 0 {
+				t.Errorf("stages called %v, events %q, journal %+v: want none", log, ev.got(t), journal(t, st))
 			}
 		})
 	}
@@ -137,9 +139,10 @@ func TestApply_RefusesTheWholeRequestAsInternalWhenTheCommitStepFails(t *testing
 			r := newRepo(t)
 			st := newStore(t)
 			var log []string
+			ev := &emitted{}
 			var w pushrule.Writer
 			if !tc.noStages {
-				w.Bind(pushrule.WriterDeps{Transact: st.Tx})
+				w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: ev})
 			}
 			w.RegisterRefUpdatedStage((&stage{name: "first", log: &log, dir: r.dir, write: true}).run)
 			w.RegisterRefUpdatedStage((&stage{name: "failing", log: &log, dir: r.dir, err: stageErr}).run)
@@ -148,6 +151,7 @@ func TestApply_RefusesTheWholeRequestAsInternalWhenTheCommitStepFails(t *testing
 			res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: allowed(move("refs/heads/feat", r.head, r.side)), Repo: r.view,
 				Workspace: demo, Caller: ownerKey, Via: pushrule.ViaGit, VersionKind: pushrule.VersionKindPush,
 				BeforeCommit: func(context.Context) error { return tc.hookErr }})
+			w.Finish(context.Background(), res)
 			if tc.noStages {
 				if err == nil {
 					t.Error("Apply without a store returned no error")
@@ -161,8 +165,8 @@ func TestApply_RefusesTheWholeRequestAsInternalWhenTheCommitStepFails(t *testing
 			if got := gitrepotest.Refs(t, r.dir, ""); !maps.Equal(got, refsBefore) {
 				t.Errorf("refs = %v, want them unchanged", got)
 			}
-			if got := stageRows(t, st); len(got) != 0 {
-				t.Errorf("stage rows = %v, want none stored", got)
+			if got := stageRows(t, st); len(got) != 0 || len(ev.got(t)) != 0 || len(journal(t, st)) != 0 {
+				t.Errorf("stage rows = %v, events %q, journal %+v: want none", got, ev.got(t), journal(t, st))
 			}
 			if tc.wantLog != nil && !slices.Equal(log, tc.wantLog) {
 				t.Errorf("stages called %v, want %v", log, tc.wantLog)
@@ -263,8 +267,9 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 	e.RegisterController(cp)
 	var log []string
 	s := &stage{name: "s", log: &log, dir: r.dir}
+	ev := &emitted{}
 	var w pushrule.Writer
-	w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx})
+	w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx, Events: ev})
 	w.RegisterRefUpdatedStage(s.run)
 	land := func(after string) pushrule.Result {
 		t.Helper()
@@ -276,6 +281,7 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		w.Finish(ctx, res)
 		return res
 	}
 	b := commit(t, r.dir, []string{r.head}, "M src/b.go")
@@ -288,6 +294,8 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 	if len(s.inputs) != 1 || s.inputs[0].Via != "land" || s.inputs[0].Updates[0].Direct {
 		t.Errorf("stage inputs %+v, want one call with via land and direct false", s.inputs)
 	}
+	slug := "demo"
+	wantEvents := []string{eventLine("parley.git.push", &slug, "admin_token", nil, "ref", "refs/heads/main", nil, metadata("refs/heads/main", r.head, b, "land")) + " parent="}
 	if asked, forwarded := cp.counts(); len(lookup.asked)+len(files.asked)+asked+forwarded != 0 {
 		t.Errorf("the engine's collaborators were asked: %v %v %d %d", lookup.asked, files.asked, asked, forwarded)
 	}
@@ -297,12 +305,17 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 	if got := gitrepotest.Git(t, r.dir, "rev-parse", "main"); got != b {
 		t.Errorf("main = %.7s after the stale land, want %.7s", got, b)
 	}
+	if got := ev.got(t); !slices.Equal(got, wantEvents) {
+		t.Errorf("events %q, want the first land's alone %q", got, wantEvents)
+	}
 }
 
 func TestApply_RunsTheForwardsInCommandOrderBeforeAnyRefIsWritten(t *testing.T) {
 	r := newRepo(t)
 	f := &forwards{dir: r.dir}
+	ev := &emitted{}
 	var w pushrule.Writer
+	w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx, Events: ev})
 	v := allowed(move("refs/heads/patch/a", r.head, r.side), move("refs/heads/feat", r.head, r.side), create("refs/heads/patch/b", r.side))
 	v.Decisions[0].Forward = f.of("refs/heads/patch/a", nil, false)
 	v.Decisions[2].Forward = f.of("refs/heads/patch/b", nil, false)
@@ -310,6 +323,7 @@ func TestApply_RunsTheForwardsInCommandOrderBeforeAnyRefIsWritten(t *testing.T) 
 	if err != nil || res.Outcome != pushrule.OutcomeAccepted {
 		t.Fatalf("Apply = %+v, %v, want accepted", res, err)
 	}
+	w.Finish(context.Background(), res)
 	if want := []string{"refs/heads/patch/a=" + r.head, "refs/heads/patch/b="}; !slices.Equal(f.runs, want) {
 		t.Errorf("forwards ran %v, want %v: each once, in command order, with its ref at its before", f.runs, want)
 	}
@@ -323,9 +337,11 @@ func TestApply_RunsTheForwardsInCommandOrderBeforeAnyRefIsWritten(t *testing.T) 
 	v.Decisions = append(v.Decisions, pushrule.Decision{Update: create("refs/parley/x", r.side), Message: "refs/parley/ is maintained by the hub and cannot be pushed to", ErrorType: pushrule.ErrorTypeHubOwnedRef})
 	if res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: v, Repo: r.view, Workspace: demoCP, Caller: ownerKey, Via: pushrule.ViaGit}); err != nil || res.Outcome != pushrule.OutcomeRefused {
 		t.Errorf("Apply of a refused verdict = %+v, %v, want refused", res, err)
+	} else {
+		w.Finish(context.Background(), res)
 	}
-	if len(f.runs) != 2 {
-		t.Errorf("forwards ran %v after a refused verdict, want no further run", f.runs)
+	if len(f.runs) != 2 || len(ev.got(t)) != 3 {
+		t.Errorf("forwards ran %v and events %q after a refused verdict, want no further run and only the accepted request's three", f.runs, ev.got(t))
 	}
 	if got := gitrepotest.Refs(t, r.dir, ""); !maps.Equal(got, refsBefore) {
 		t.Errorf("refs = %v, want them unchanged", got)
@@ -349,8 +365,9 @@ func TestApply_RefusesTheWholeRequestWhenAForwardFailsOrOutlastsItsLimit(t *test
 			r := newRepo(t)
 			f := &forwards{dir: r.dir}
 			var log []string
+			st, ev := newStore(t), &emitted{}
 			var w pushrule.Writer
-			w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx, ForwardLimit: 50 * time.Millisecond})
+			w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: ev, ForwardLimit: 50 * time.Millisecond})
 			w.RegisterRefUpdatedStage((&stage{name: "s", log: &log, dir: r.dir}).run)
 			v := allowed(move("refs/heads/patch/a", r.head, r.side), create("refs/heads/patch/b", r.side), create("refs/heads/patch/c", r.side))
 			v.Decisions[0].Forward = f.of("refs/heads/patch/a", nil, false)
@@ -358,6 +375,7 @@ func TestApply_RefusesTheWholeRequestWhenAForwardFailsOrOutlastsItsLimit(t *test
 			v.Decisions[2].Forward = f.of("refs/heads/patch/c", nil, false)
 			refsBefore := gitrepotest.Refs(t, r.dir, "")
 			res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: v, Repo: r.view, Workspace: demoCP, Caller: ownerKey, Via: pushrule.ViaGit})
+			w.Finish(context.Background(), res)
 			if err != nil || res.Outcome != pushrule.OutcomeRefused || !res.Refused() || len(res.Updates) != 3 {
 				t.Fatalf("Apply = %+v, %v, want the request refused", res, err)
 			}
@@ -376,8 +394,8 @@ func TestApply_RefusesTheWholeRequestWhenAForwardFailsOrOutlastsItsLimit(t *test
 			if got := gitrepotest.Refs(t, r.dir, ""); !maps.Equal(got, refsBefore) {
 				t.Errorf("refs = %v, want them unchanged %v", got, refsBefore)
 			}
-			if len(log) != 0 {
-				t.Errorf("stages called %v, want none", log)
+			if len(log) != 0 || len(ev.got(t)) != 0 || len(journal(t, st)) != 0 {
+				t.Errorf("stages called %v, events %q, journal %+v: want none", log, ev.got(t), journal(t, st))
 			}
 		})
 	}

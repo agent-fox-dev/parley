@@ -115,6 +115,12 @@ type WriterDeps struct {
 	// ForwardLimit is how long each forward to origin may run; zero means
 	// DefaultForwardLimit. Tests shorten it.
 	ForwardLimit time.Duration
+	// Events is the event log the parley.git.push events are written to;
+	// nil writes no event and keeps no journal.
+	Events EventWriter
+	// Repos opens the repository of a workspace by its slug, which
+	// Reconcile reads the refs of a journal entry from.
+	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
 }
 
 // Writer is the ref writer: the one way the git server, the source control
@@ -127,6 +133,7 @@ type Writer struct {
 	deps         WriterDeps
 	stages       []RefUpdatedStage
 	forkActivity ForkActivity
+	listeners    []PostPushListener
 }
 
 // Bind sets what the writer writes with from then on.
@@ -181,10 +188,14 @@ type UpdateResult struct {
 }
 
 // Result is what became of a request: its outcome, one of the Outcome
-// constants, and one result per update, in the order of the verdict.
+// constants, and one result per update, in the order of the verdict. The
+// result of an accepted request also carries what its event step, Finish,
+// writes and reports.
 type Result struct {
 	Outcome string
 	Updates []UpdateResult
+
+	written *written
 }
 
 // Refused reports whether the request moved no ref.
@@ -207,6 +218,13 @@ func (r Result) Refused() bool { return r.Outcome != OutcomeAccepted }
 // head_sha of a repository whose default branch moved is set, and the
 // activity of a fork written through git or the API recorded.
 //
+// With an event log bound, the request is entered in the push journal, in
+// a store transaction of its own, after the forwards and before the refs
+// move, and the entry is removed when they do not; the caller then runs
+// Finish with the result of an accepted request, which writes its events
+// and removes the entry. Via must be ViaGit, ViaAPI or ViaLand: another
+// value is an error before anything is done.
+//
 // No lock spans the request: two requests on one repository are ordered by
 // the ref transaction alone, in which a ref the other holds counts as
 // moved.
@@ -221,6 +239,9 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 	res := Result{Updates: make([]UpdateResult, len(req.Verdict.Decisions))}
 	for i, d := range req.Verdict.Decisions {
 		res.Updates[i].Decision = d
+	}
+	if req.Via != ViaGit && req.Via != ViaAPI && req.Via != ViaLand {
+		return res.internal(), fmt.Errorf("apply: unknown surface %q", req.Via)
 	}
 	if req.Verdict.Refused() {
 		res.Outcome = OutcomeRefused
@@ -243,25 +264,56 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 	if refusedRes, ok, err := res.forward(ctx, deps.ForwardLimit, req.Verdict.Decisions); !ok {
 		return refusedRes, err
 	}
+	wr := &written{entry: journalEntryOf(req), updates: req.Verdict.Decisions}
+	if deps.Transact != nil && deps.Events != nil {
+		err := deps.Transact(ctx, func(tx *sql.Tx) (err error) {
+			wr.entry.ID, err = InsertJournalEntry(ctx, tx, wr.entry)
+			return err
+		})
+		if err != nil {
+			return res.internal(), err
+		}
+	}
+	// A request whose refs did not move owes no event.
+	unjournal := func() {
+		if wr.entry.ID == 0 {
+			return
+		}
+		bg := context.WithoutCancel(ctx)
+		err := deps.Transact(bg, func(tx *sql.Tx) error {
+			_, err := deleteJournalEntry(bg, tx, wr.entry.ID)
+			return err
+		})
+		if err != nil {
+			logger.Error("push: journal entry of a request whose refs did not move not removed",
+				"workspace", req.Workspace.Slug, "error", err)
+		}
+	}
 	tx, err := req.Repo.PrepareRefs(ctx, refUpdates(req.Verdict.Decisions))
 	var refErr *gitrepo.RefError
 	switch {
 	case errors.As(err, &refErr):
+		unjournal()
 		// A name in the way of another ref's is as stale a picture of the
 		// repository as a moved ref: the caller fetches and sees it.
 		return res.refMoved(refErr.Ref), nil
 	case err != nil:
+		unjournal()
 		return res.internal(), err
 	}
 	defer func() { _ = tx.Abort() }()
 	if req.BeforeCommit != nil {
 		if err := req.BeforeCommit(ctx); err != nil {
+			_ = tx.Abort()
+			unjournal()
 			return res.internal(), err
 		}
 	}
 	in := StageInput{Workspace: req.Workspace, Caller: req.Caller, SessionID: req.SessionID, Via: req.Via, VersionKind: req.VersionKind, Updates: req.Verdict.Decisions}
 	moved, err := commit(ctx, deps.Transact, stages, tx, in, res.Updates)
 	if !moved {
+		_ = tx.Abort()
+		unjournal()
 		return res.internal(), err
 	}
 	if err != nil {
@@ -269,6 +321,7 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 			"workspace", req.Workspace.Slug, "error", err)
 	}
 	res.Outcome = OutcomeAccepted
+	res.written = wr
 	w.afterWrite(ctx, logger, deps.Heads, forkActivity, req)
 	return res, nil
 }

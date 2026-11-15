@@ -33,8 +33,10 @@ a package-level registry:
   adds a stage after those before, the stages running in registration
   order in the store transaction of every accepted request;
   `RegisterForkActivity(ForkActivity)` sets the one fork activity
-  recorder, replacing the one before, nil removing it. Later packages add
-  the post-push listeners the same way.
+  recorder, replacing the one before, nil removing it;
+  `RegisterPostPushListener(PostPushListener)` adds a listener after those
+  before, each told of every accepted write, on a goroutine of its own, by
+  the writer's event step `Finish`.
 - On the `*pushrule.Engine`: `RegisterController(Controller)` sets the one
   carry-patch controller, replacing the one before.
 - On the `*gitserver.Receiver`, the push processor behind
@@ -42,7 +44,8 @@ a package-level registry:
   `RegisterMappingStage(MappingStage)` set the one options stage and the
   one mapping stage, each replacing the one before, nil removing it.
 - What the hub itself provides rather than a feature (the store's
-  transaction, the head_sha setter, the settings reader, the tracking
+  transaction, the event log, the opening of a workspace's repository,
+  the head_sha setter, the settings reader, the tracking
   lookup, the version-files lookup, the logger) is handed over with
   `Writer.Bind(WriterDeps)`, `Engine.Bind(EngineDeps)` and
   `Receiver.Bind(ReceiverDeps)` in a start hook.
@@ -52,7 +55,8 @@ composed, before any request. A call takes the registered collaborators
 once, at its start, and calls them for the whole request. The zero values
 are valid: with nothing registered, the engine refuses a `carry_patch`
 workspace's updates as internal rather than allowing them, and the writer
-runs no stage and records no activity, and the processor accepts every
+runs no stage, records no activity and tells no listener, and the
+processor accepts every
 push option and adds no line.
 
 The hub creates the ref writer in `newComposition`, so that it exists from

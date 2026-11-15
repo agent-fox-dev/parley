@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
@@ -471,5 +472,55 @@ func TestReceive_AppliesPushesOfDifferentRefsWithoutWaitingForEachOther(t *testi
 	}
 	if refs := gitrepotest.Refs(t, w.repo, "refs/heads/"); refs["a"] == "" || refs["b"] == "" {
 		t.Errorf("branches = %v, want a and b", refs)
+	}
+}
+
+// postPush is a post-push listener that sends what it is told to called and
+// then waits for release.
+type postPush struct {
+	called  chan pushrule.PostPush
+	release chan struct{}
+}
+
+func (l *postPush) listen(_ context.Context, p pushrule.PostPush) error {
+	l.called <- p
+	<-l.release
+	return nil
+}
+
+// next is the next call of l, failing the test when none comes within 5 s.
+func (l *postPush) next(t *testing.T) pushrule.PostPush {
+	t.Helper()
+	select {
+	case p := <-l.called:
+		return p
+	case <-time.After(5 * time.Second):
+		t.Fatal("the post-push listener was not called")
+		return pushrule.PostPush{}
+	}
+}
+
+// The answer to an accepted push does not wait for the post-push listeners,
+// and a push that moves no ref tells them nothing.
+func TestReceive_TellsThePostPushListenersOfAnAcceptedPushWithoutWaitingForThem(t *testing.T) {
+	t.Parallel()
+	l := &postPush{called: make(chan pushrule.PostPush, 8), release: make(chan struct{})}
+	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) { c.RefWriter().RegisterPostPushListener(l.listen) }})
+	t.Cleanup(func() { close(l.release) })
+	push := func(ref string) []string {
+		cmds := []command{{zero, w.commit(t, w.head, ref), ref}}
+		return parseReport(w.receive(t, "acme/demo.git", w.ownerKey, receiveRequest(fullCaps, cmds, nil, w.packFor(t, cmds))).body).lines
+	}
+	if got := push("refs/heads/feat"); !slices.Equal(got, []string{"unpack ok", "ok refs/heads/feat"}) {
+		t.Fatalf("report = %q while the listener holds, want ok refs/heads/feat", got)
+	}
+	if p := l.next(t); p.Workspace != "demo" || p.Via != "git" || p.SessionID != nil || len(p.Updates) != 1 || p.Updates[0].Ref != "refs/heads/feat" || !p.Updates[0].Created {
+		t.Errorf("the listener was told %+v, want demo, the create of refs/heads/feat, via git and no session", p)
+	}
+	w.receive(t, "acme/demo.git", w.ownerKey, "0000")
+	push("refs/parley/x")
+	push("refs/heads/after")
+	if p := l.next(t); p.Updates[0].Ref != "refs/heads/after" || len(l.called) != 0 {
+		t.Errorf("the listener was told of %s with %d calls pending, want only the accepted refs/heads/after", p.Updates[0].Ref, len(l.called))
 	}
 }

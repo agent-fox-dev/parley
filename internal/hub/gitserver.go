@@ -8,6 +8,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/fork"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -15,8 +16,12 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// gitServerHook is the name of the start hook that binds the git server.
-const gitServerHook = "gitserver"
+// gitServerHook is the name of the start hook that binds the git server,
+// and pushJournalHook that of the one that settles the push journal.
+const (
+	gitServerHook   = "gitserver"
+	pushJournalHook = "push-journal"
+)
 
 // composeGitServer adds the git server: it mounts the three git routes
 // under /git on the server's router, outside the REST API, so that they
@@ -44,9 +49,15 @@ const gitServerHook = "gitserver"
 // serves.
 //
 // The same start hook binds the push path. The ref writer (RefWriter) is
-// bound to the store, in whose transactions its ref-updated stages run, to
-// the head_sha setter, which records the new head of a repository's
-// default branch on its record, and to the hub's logger. The push rule
+// bound to the store, in whose transactions its ref-updated stages run and
+// its push journal is kept, to the event log, which receives the
+// parley.git.push events, to the head_sha setter, which records the new
+// head of a repository's default branch on its record, to the place of
+// each repository on disk, opened with the hub's git, and to the hub's
+// logger. The push journal's schema step is registered here, and a second
+// start hook, after the first and before the hub serves, has the ref writer
+// settle it: the events of a request whose refs moved before the hub
+// stopped are written then. The push rule
 // engine (PushRules) is bound to the settings reader, which reads a
 // workspace's effective protected_branches and protect.owner_push from its
 // record, a fork's from its parent's, and to the tracking-branch lookup,
@@ -68,7 +79,12 @@ func composeGitServer(c *Composition) {
 	limiter := &serverLimiter{}
 	c.addServerHook(func(srv *server.Server) { limiter.l = srv.RateLimiter() })
 	c.AddStartHook(gitServerHook, func(_ context.Context, rt *Runtime) error {
-		c.refWriter.Bind(pushrule.WriterDeps{Transact: rt.Store.Tx, Heads: headSetter{rt.Store}, Logger: rt.Logger})
+		c.refWriter.Bind(pushrule.WriterDeps{
+			Transact: rt.Store.Tx, Events: c.Events(), Heads: headSetter{rt.Store}, Logger: rt.Logger,
+			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
+				return gitFor(c.env).Open(ctx, c.workspaces.RepoPath(slug))
+			},
+		})
 		c.pushRules.Bind(pushrule.EngineDeps{
 			Settings: pushSettings{rt.Store.Main(), c.workspaces.Settings()}, Tracking: trackingBranches{c.forks},
 		})
@@ -89,6 +105,8 @@ func composeGitServer(c *Composition) {
 		comp.Bind(d)
 		return nil
 	})
+	c.AddSchemaStep(pushrule.JournalStep)
+	c.AddStartHook(pushJournalHook, func(ctx context.Context, _ *Runtime) error { return c.refWriter.Reconcile(ctx) })
 }
 
 // headSetter is the ref writer's head_sha setter: it writes the head on the
@@ -184,8 +202,8 @@ func (s *serverLimiter) Allow(key string) (bool, int) { return s.l.Allow(key) }
 // RefWriter returns the hub's ref writer, which writes the refs of every
 // surface that moves a workspace's refs once the git server's start hook
 // has bound it. A part keeps it when it is composed and registers its
-// collaborators then: its ref-updated stages and the fork activity
-// recorder.
+// collaborators then: its ref-updated stages, the fork activity recorder
+// and its post-push listeners.
 func (c *Composition) RefWriter() *pushrule.Writer { return c.refWriter }
 
 // PushRules returns the hub's push rule engine, which decides the ref

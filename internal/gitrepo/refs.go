@@ -84,6 +84,27 @@ func (r *Repo) IsAncestor(ctx context.Context, ancestor, descendant string) (boo
 	return err == nil, err
 }
 
+// RefValues maps each of refs, full ref names, that exists to the object id
+// it points at; a ref that does not exist is absent from the map.
+func (r *Repo) RefValues(ctx context.Context, refs []string) (map[string]string, error) {
+	values := map[string]string{}
+	if len(refs) == 0 {
+		return values, nil
+	}
+	// for-each-ref matches a pattern as a prefix of whole name components,
+	// so only the exact names are kept.
+	out, err := r.git(ctx, append([]string{"for-each-ref", "--format=%(objectname) %(refname)"}, refs...)...)
+	if err != nil {
+		return nil, err
+	}
+	for line := range strings.Lines(string(out)) {
+		if id, ref, ok := strings.Cut(strings.TrimRight(line, "\n"), " "); ok && slices.Contains(refs, ref) {
+			values[ref] = id
+		}
+	}
+	return values, nil
+}
+
 // Tags maps every tag of the repository to the object id it points at: the
 // tag object of an annotated tag, the commit of a lightweight one.
 func (r *Repo) Tags(ctx context.Context) (map[string]string, error) {

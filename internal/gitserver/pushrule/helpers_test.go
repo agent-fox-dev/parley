@@ -3,6 +3,7 @@ package pushrule_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -10,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -279,13 +282,14 @@ func allowed(us ...pushrule.Update) pushrule.Verdict {
 	return v
 }
 
-// newStore opens a store in a temporary directory of t whose one table,
-// stage_rows, is where the stages of the tests write.
+// newStore opens a store in a temporary directory of t with the hub
+// events, the push journal and stage_rows, the table the stages of the
+// tests write to.
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), store.Options{DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces")},
-		[]store.Step{{Name: "stage_rows", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+		[]store.Step{event.SchemaStep, pushrule.JournalStep, {Name: "stage_rows", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx, `CREATE TABLE stage_rows (ref TEXT NOT NULL)`)
 			return err
 		}}})
@@ -386,5 +390,135 @@ func (f *forwards) of(ref string, err error, blocks bool) pushrule.Forward {
 			return f.ctxErr
 		}
 		return err
+	}
+}
+
+// The session ids of the tests; the event log takes only UUIDs.
+const (
+	session1 = "6f1c2a4e-8d3b-4c5a-9e7f-0a1b2c3d4e5f"
+	session2 = "0b7e5d3c-2a1f-4e6d-8c9b-1a2b3c4d5e6f"
+)
+
+// emitted is an event writer that captures what it is given, or fails with
+// err.
+type emitted struct {
+	err error
+
+	mu     sync.Mutex
+	inputs []event.Input
+}
+
+func (e *emitted) Emit(_ context.Context, _ *sql.Tx, in event.Input) (event.Record, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.err != nil {
+		return event.Record{}, e.err
+	}
+	e.inputs = append(e.inputs, in)
+	return event.Record{}, nil
+}
+
+// got is what e captured, each event as eventLine writes it.
+func (e *emitted) got(t *testing.T) []string {
+	t.Helper()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	lines := []string{}
+	for _, in := range e.inputs {
+		meta, err := json.Marshal(in.Metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, eventLine(in.Type, in.Workspace, in.ActorType, in.ActorID, in.ResourceType, in.ResourceID, in.SessionID, string(meta))+" parent="+in.Parent)
+	}
+	return lines
+}
+
+// eventLine is an event on one line, an absent value as null.
+func eventLine(typ string, ws *string, actorType string, actorID *string, resType, resID string, session *string, meta string) string {
+	null := func(s *string) string {
+		if s == nil {
+			return "null"
+		}
+		return *s
+	}
+	return strings.Join([]string{typ, null(ws), actorType, null(actorID), resType, resID, null(session), meta}, " ")
+}
+
+// metadata is the metadata of the parley.git.push event of an update of
+// ref from before to after, ZeroID standing for null, with the flags in
+// flags ("created", "deleted", "forced", "direct") set, through via.
+func metadata(ref, before, after, via string, flags ...string) string {
+	id := func(s string) string {
+		if s == pushrule.ZeroID {
+			return "null"
+		}
+		return `"` + s + `"`
+	}
+	return fmt.Sprintf(`{"ref":"%s","before":%s,"after":%s,"created":%t,"deleted":%t,"forced":%t,"direct":%t,"via":"%s"}`,
+		ref, id(before), id(after), slices.Contains(flags, "created"), slices.Contains(flags, "deleted"),
+		slices.Contains(flags, "forced"), slices.Contains(flags, "direct"), via)
+}
+
+// eventLog is the hub's event log over st.
+func eventLog(t *testing.T, st *store.Store) *event.Component {
+	t.Helper()
+	c, err := event.New(event.Deps{Store: st, Clock: event.SystemClock(time.Now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// logged is every event of c's log, each as eventLine writes it.
+func logged(t *testing.T, c *event.Component) []string {
+	t.Helper()
+	recs, _, err := c.ReadAfter(context.Background(), 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{}
+	for _, r := range recs {
+		lines = append(lines, eventLine(r.Type, r.Workspace, r.ActorType, r.ActorID, r.ResourceType, r.ResourceID, r.SessionID, string(r.Metadata)))
+	}
+	return lines
+}
+
+// journal is every entry of the push journal in st.
+func journal(t *testing.T, st *store.Store) []pushrule.JournalEntry {
+	t.Helper()
+	entries, err := pushrule.JournalEntries(context.Background(), st.Main())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
+// listener is a post-push listener that sends what it is told to called
+// and then waits for release.
+type listener struct {
+	called  chan pushrule.PostPush
+	release chan struct{}
+}
+
+func newListener() *listener {
+	return &listener{called: make(chan pushrule.PostPush, 16), release: make(chan struct{})}
+}
+
+func (l *listener) listen(_ context.Context, p pushrule.PostPush) error {
+	l.called <- p
+	<-l.release
+	return errInjected
+}
+
+// next is the next call of l, failing the test when none comes within 5 s.
+func (l *listener) next(t *testing.T) pushrule.PostPush {
+	t.Helper()
+	select {
+	case p := <-l.called:
+		return p
+	case <-time.After(5 * time.Second):
+		t.Fatal("the listener was not called")
+		return pushrule.PostPush{}
 	}
 }

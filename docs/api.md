@@ -776,6 +776,28 @@ A push that passed every check gets its ref advertisement from
     answer has no report, and without `side-band-64k` no `error:` line.
   - A refused push leaves every ref as it was and none of its objects in
     the repository.
+  - An accepted push writes one `parley.git.push` event per ref update, in
+    command order, all in one transaction, so the events of one push are
+    adjacent in the event log, before the answer is sent. A refused push,
+    one whose pack fails and one without commands write none. The event
+    names the addressed workspace (a task fork's own slug for a fork) as
+    `workspace`, `resource_type` `ref` and the full ref name as
+    `resource_id`, the caller as for the fetch event below (`actor_type`
+    `pat`, `api_key` or `admin_token`, the user as `actor_id`, `null` for
+    the admin token), and the session the push belongs to as `session_id`,
+    `null` for none. Its metadata holds `ref`, `before` (`null` for a
+    create), `after` (`null` for a delete), `created`, `deleted`, `forced`
+    (neither a create nor a delete, and `before` not an ancestor of
+    `after`), `direct` (a fast-forward of a protected branch by its owner
+    or the admin token) and `via`, `git` for a push:
+
+    ```json
+    {"seq":15,"id":"…","type":"parley.git.push","time":"2026-11-14T10:33:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"ref","resource_id":"refs/heads/main","action":"push","session_id":null,"metadata":{"ref":"refs/heads/main","before":"3ba7119670b709c3ed9a0fafc7c8d0d3124b74e1","after":"e59b116d14077f2bdc935c1adee921a5b9f2ec67","created":false,"deleted":false,"forced":false,"direct":true,"via":"git"}}
+    ```
+
+    A push stays accepted when its events cannot be written: they are
+    written when the hub next starts, before it serves, as are those of a
+    push whose refs moved just before the hub stopped.
 
 A task fork is served with its own refs and what it shows of its parent's,
 on every git route, as of the moment of the request:
