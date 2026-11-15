@@ -47,15 +47,21 @@ const TriggerVersion = "version"
 // asks for.
 const TriggerLand = "land"
 
+// TriggerManual is the trigger of the restack a caller asks for: an
+// explicit depends_on naming a change the caller's commits do not sit on.
+const TriggerManual = "manual"
+
 // restackJob is a restack to run: the change number of the workspace, for
 // the trigger, onto the commit onto when it names one, and seq, the
-// pending record it runs, 0 for none.
+// pending record it runs, 0 for none. background is set for a job the
+// worker runs, which a change too deep in its stack skips.
 type restackJob struct {
-	workspace string
-	number    int64
-	seq       int64
-	trigger   string
-	onto      string
+	workspace  string
+	number     int64
+	seq        int64
+	trigger    string
+	onto       string
+	background bool
 }
 
 // pendRestack records in tx, the transaction of what caused it, that the
@@ -64,13 +70,79 @@ type restackJob struct {
 // newest commit below is the one it is restacked onto. A record that
 // cannot be written fails tx. The worker is woken; it runs the restack
 // once tx has committed.
+//
+// A change deeper in its stack than the limit gets none: the limit exists
+// to bound the restacks a move below costs, and the change it records
+// none for gets no version that would restack the changes above it. A
+// workspace with automatic restacks off gets none either; its change is
+// only flagged, with auto_restack_off, when it does not sit on the commit
+// it must (flagBehind).
 func (c *Component) pendRestack(ctx context.Context, tx *sql.Tx, ch Change, trigger, onto string) error {
+	deep, err := c.tooDeep(ctx, tx, ch.WorkspaceSlug, ch.Number)
+	if err != nil || deep {
+		return err
+	}
+	w, found, err := c.deps.Workspaces.Workspace(ctx, tx, ch.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	if found && !w.AutoRestack {
+		return c.flagBehind(ctx, tx, ch, onto)
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO change_restacks (workspace_slug, number, trigger, onto) VALUES (?, ?, ?, ?)`,
 		ch.WorkspaceSlug, ch.Number, trigger, onto); err != nil {
 		return fmt.Errorf("record the restack of %s: %w", ch.Ref, err)
 	}
 	c.restacks.wake()
 	return nil
+}
+
+// flagBehind sets in tx needs_restack, for auto_restack_off, on the change
+// ch when it does not sit on the commit it must, as its link now reads
+// (sitOn, with onto the commit a restack would have named), so that a
+// caller sees that the change is behind and restacks it. Nothing moves. A
+// change whose target branch is missing has no commit to sit on and is
+// left as it is.
+func (c *Component) flagBehind(ctx context.Context, tx *sql.Tx, ch Change, onto string) error {
+	now, err := readChange(ctx, tx, ch.WorkspaceSlug, ch.Number)
+	if err != nil {
+		return err
+	}
+	behind, err := c.behind(ctx, tx, now, onto)
+	if err != nil || !behind {
+		return err
+	}
+	return c.SetNeedsRestack(ctx, tx, ch.WorkspaceSlug, ch.Number, true, new(RestackAutoOff))
+}
+
+// behind reports whether the change ch, read through q, does not sit on
+// the commit it must (sitOn, with onto as a pending record names it), as
+// a restack judges it (sitsOn). Ancestry is asked of the target's
+// repository, which holds every version head of its changes and every
+// base they are measured from. A change with no commit to sit on is not
+// behind.
+func (c *Component) behind(ctx context.Context, q Querier, ch Change, onto string) (bool, error) {
+	at, err := c.sitOn(ctx, q, ch, onto)
+	if err != nil || at == "" {
+		return false, err
+	}
+	repo, err := c.deps.Repos(ctx, ch.WorkspaceSlug)
+	if err != nil {
+		return false, err
+	}
+	on, err := sitsOn(ctx, repo, baseColumn(ch.BaseSHA), ch.HeadSHA, at)
+	return !on, err
+}
+
+// hasPendingRestack reports whether the change number of the workspace has
+// a pending restack, read through q.
+func hasPendingRestack(ctx context.Context, q Querier, workspace string, number int64) (bool, error) {
+	var pending bool
+	err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM change_restacks WHERE workspace_slug = ? AND number = ?)`, workspace, number).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("read the restack of %s: %w", Ref(workspace, number), err)
+	}
+	return pending, nil
 }
 
 // OnLanded is told that the change number of the workspace landed as the
@@ -194,7 +266,7 @@ func (c *Component) nextRestack(ctx context.Context) (j restackJob, found bool, 
 				return err
 			}
 			if !c.restacks.kept(j) {
-				found = true
+				found, j.background = true, true
 				return nil
 			}
 		}

@@ -221,6 +221,9 @@ func TestLinkVersion_MeasuresADependantByItsOwnCommits(t *testing.T) {
 func TestDependsOn_LinksTheChangeToTheOneTheCallerNames(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
+	// A change not built on the one it is linked to gets a restack, which
+	// is not what this test looks at.
+	w.holdRestacks(t)
 	cases := []struct {
 		name string
 		// send opens the changes, each branch named with the prefix p,

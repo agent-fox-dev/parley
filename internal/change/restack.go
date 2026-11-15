@@ -32,6 +32,9 @@ const (
 	// restackLost: the source branch moved before each swap, and nothing
 	// moved.
 	restackLost
+	// restackSkipped: the worker's change sits too deep in its stack to be
+	// restacked by the hub, and nothing moved.
+	restackSkipped
 )
 
 // restackResult is the end of a restack: its outcome, the version it
@@ -76,9 +79,19 @@ func (c *Component) restack(ctx context.Context, j restackJob, by Caller, sessio
 func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, session *string, attempt int) (res restackResult, again bool, err error) {
 	var ch Change
 	var onto string
+	var deep bool
 	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
 		if ch, err = readChange(ctx, tx, j.workspace, j.number); err != nil || !active(ch) {
 			return err
+		}
+		// A change that sank too deep in its stack after its restack was
+		// recorded is not restacked by the hub. Its depth is counted, not
+		// read from its restack_reason, which a conflict may have
+		// replaced.
+		if j.background {
+			if deep, err = c.tooDeep(ctx, tx, j.workspace, j.number); err != nil || deep {
+				return err
+			}
 		}
 		onto, err = c.sitOn(ctx, tx, ch, j.onto)
 		return err
@@ -90,6 +103,8 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 		return res, false, err
 	case !active(ch):
 		return c.restackEnded(ctx, j, ch, restackResult{outcome: restackClosed})
+	case deep:
+		return c.restackEnded(ctx, j, ch, restackResult{outcome: restackSkipped})
 	case onto == "":
 		return res, false, fmt.Errorf("restack %s: its target branch %s does not exist", ch.Ref, ch.TargetBranch)
 	}
@@ -216,6 +231,7 @@ func (c *Component) recordRestack(ctx context.Context, tx *sql.Tx, j restackJob,
 //   - up to date: a needs_restack set for a conflict or with automatic
 //     restacks off is cleared, since the change now sits on what it must,
 //     and so is the landed commit it had to sit on;
+//   - skipped as too deep in its stack: its mergeability is checked again;
 //   - closed: nothing else.
 //
 // The mergeability check of a change with a pending record stores nothing
@@ -223,8 +239,14 @@ func (c *Component) recordRestack(ctx context.Context, tx *sql.Tx, j restackJob,
 func (c *Component) restackEnded(ctx context.Context, j restackJob, ch Change, res restackResult) (restackResult, bool, error) {
 	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		dropped, err := dropRestack(ctx, tx, j)
-		if err != nil || res.outcome == restackClosed {
+		switch {
+		case err != nil || res.outcome == restackClosed:
 			return err
+		case res.outcome == restackSkipped:
+			if !dropped {
+				return nil
+			}
+			return c.ScheduleMergeable(ctx, tx, j.workspace, j.number)
 		}
 		now, err := readChange(ctx, tx, j.workspace, j.number)
 		if err != nil || !active(now) {

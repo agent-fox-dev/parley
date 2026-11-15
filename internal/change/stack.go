@@ -196,8 +196,10 @@ func (s stacks) SetDependsOn(ctx context.Context, tx *sql.Tx, ch Change, depends
 
 // linkTo links the change ch to the change number of its workspace, which
 // a caller named, and, when ch is built on that change's head, measures ch
-// from it. A change that is not built on it keeps its base until it is
-// restacked onto it.
+// from it. A change that is not built on it keeps its base and gets a
+// pending restack onto it, recorded in tx, for the caller's request (or the
+// auto_restack_off flag, as pendRestack says), so that needs_restack keeps
+// meaning that a change is not built on the change below it.
 func (s stacks) linkTo(ctx context.Context, tx *sql.Tx, ch Change, number int64) error {
 	lower, err := checkDependency(ctx, tx, ch, number)
 	if err != nil {
@@ -211,11 +213,13 @@ func (s stacks) linkTo(ctx context.Context, tx *sql.Tx, ch Change, number int64)
 	if err != nil {
 		return err
 	}
-	var base *string
 	if built {
-		base = &lower.HeadSHA
+		return s.store(ctx, tx, ch, &number, &lower.HeadSHA)
 	}
-	return s.store(ctx, tx, ch, &number, base)
+	if err := s.store(ctx, tx, ch, &number, nil); err != nil {
+		return err
+	}
+	return s.c.pendRestack(ctx, tx, ch, TriggerManual, "")
 }
 
 // unlink unlinks the change ch and measures it from the merge base of its
@@ -299,7 +303,10 @@ func checkDependency(ctx context.Context, q Querier, ch Change, number int64) (C
 // stack than the limit, and unflags one flagged so that no longer does. A
 // change past the limit keeps its link and its versions: the flag only
 // keeps it out of the restacks, whose cost grows with every change above
-// the one that moved.
+// the one that moved. A change back within the limit missed the restacks
+// of the moves below it, so it gets a pending restack when it does not sit
+// on what it must (unless it has one pending already, whose commit to sit
+// on is read when it runs).
 func (s stacks) recomputeDepth(ctx context.Context, tx *sql.Tx, workspace string, number int64) error {
 	above, err := stackAbove(ctx, tx, workspace, number)
 	if err != nil {
@@ -333,16 +340,44 @@ func (s stacks) recomputeDepth(ctx context.Context, tx *sql.Tx, workspace string
 		case deep && !flagged:
 			err = s.c.SetNeedsRestack(ctx, tx, workspace, n, true, new(RestackTooDeep))
 		case !deep && flagged:
-			// Whether the change, back within the limit, must be restacked
-			// onto the change below it is decided here once the change
-			// is unflagged.
-			err = s.c.SetNeedsRestack(ctx, tx, workspace, n, false, nil)
+			err = s.unflagDeep(ctx, tx, workspace, n)
 		}
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// unflagDeep clears in tx the stack_too_deep of the change number of the
+// workspace, now within the limit, and records a pending restack of it when
+// it does not sit on the commit it must, as recomputeDepth says.
+func (s stacks) unflagDeep(ctx context.Context, tx *sql.Tx, workspace string, number int64) error {
+	if err := s.c.SetNeedsRestack(ctx, tx, workspace, number, false, nil); err != nil {
+		return err
+	}
+	pending, err := hasPendingRestack(ctx, tx, workspace, number)
+	if err != nil || pending {
+		return err
+	}
+	ch, err := readChange(ctx, tx, workspace, number)
+	if err != nil {
+		return err
+	}
+	behind, err := s.c.behind(ctx, tx, ch, "")
+	if err != nil || !behind {
+		return err
+	}
+	return s.c.pendRestack(ctx, tx, ch, TriggerVersion, "")
+}
+
+// tooDeep reports whether the change number of the workspace sits deeper
+// in its stack than the limit, read through q. The depth is counted from
+// the links, which restack_reason follows only once recomputeDepth ran,
+// and which a restack conflict replaces.
+func (c *Component) tooDeep(ctx context.Context, q Querier, workspace string, number int64) (bool, error) {
+	depth, err := depthOf(ctx, q, workspace, number)
+	return depth > c.deps.MaxStackDepth, err
 }
 
 // depthOf is the depth of the change number of the workspace in its stack:

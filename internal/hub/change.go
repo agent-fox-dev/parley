@@ -141,7 +141,10 @@ const (
 // (Restacker) records, in the abandon's transaction, the restack of each
 // dependant an abandon reparents. The entry point for a landed change
 // (OnLanded), which unlinks its dependants and restacks them onto the
-// landed commit, is not registered: no landing exists to call it.
+// landed commit, is not registered: no landing exists to call it. A change
+// too deep in its stack gets no restack; with the workspace setting
+// changes.auto_restack false, which changeWorkspaces reads, none is
+// recorded and a change behind is flagged auto_restack_off instead.
 //
 // No session linker, landing evaluator or auto_land guard is registered:
 // without a session linker an explicit session_id is refused and a
@@ -235,8 +238,12 @@ func (r changeWorkspaces) Workspace(ctx context.Context, q change.Querier, slug 
 			*dst = *src
 		}
 	}
-	if on, ok := r.settings.EffectiveSettings(w.Settings, w.DefaultBranch)["changes.require_intent"].(bool); ok {
+	settings := r.settings.EffectiveSettings(w.Settings, w.DefaultBranch)
+	if on, ok := settings["changes.require_intent"].(bool); ok {
 		out.RequireIntent = on
+	}
+	if on, ok := settings["changes.auto_restack"].(bool); ok {
+		out.AutoRestack = on
 	}
 	return out, true, nil
 }

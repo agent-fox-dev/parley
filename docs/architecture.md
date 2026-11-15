@@ -3680,7 +3680,8 @@ open, or one whose chain of `depends_on` links, walked down, reaches the
 change is `400 invalid_dependency`, which rolls back the open's or the
 `PATCH`'s transaction. An accepted link moves the base to the lower
 change's head only when the head is built on it (`IsAncestor`); otherwise
-the base stays. After every link it stores (`LinkVersion` and
+the base stays and `linkTo` calls `pendRestack` with `TriggerManual`
+(`manual`). After every link it stores (`LinkVersion` and
 `SetDependsOn` alike), `recomputeDepth` counts the depth of the change
 (`depthOf`: the changes in its chain of `depends_on` links down to one
 with none, itself included) and of every draft or open change above it
@@ -3688,8 +3689,11 @@ with none, itself included) and of every draft or open change above it
 `needs_restack` with `restack_reason` `stack_too_deep` through
 `SetNeedsRestack` on each one deeper than `Deps.MaxStackDepth` (from
 `[changes].max_stack_depth`, `DefaultMaxStackDepth` 20 when zero), and
-clears both on a change so flagged that is back within the limit. Depth
-never refuses a version or a link.
+clears both on a change so flagged that is back within the limit
+(`unflagDeep`), which then, unless the change has a pending restack
+already, calls `pendRestack` with `TriggerVersion` when the change is
+`behind`: `sitsOn` in the target's repository says its head and base do
+not sit on its `sitOn` commit. Depth never refuses a version or a link.
 
 Then `settle` clears `needs_restack` and `restack_reason`, and
 `restack_onto`, of a change flagged for `conflict` or `auto_restack_off`
@@ -3707,7 +3711,17 @@ restack: `INSERT OR REPLACE` into `change_restacks` (`seq` `INTEGER
 PRIMARY KEY AUTOINCREMENT`, `workspace_slug`, `number`, `trigger`, `onto`
 — the commit to sit on when the record names one, `''` otherwise — unique
 per change, deleted with it), so a newer record replaces the older with a
-higher `seq`, then wakes the worker. `RunRestacks(ctx)`
+higher `seq`, then wakes the worker. It records nothing for a change
+that is `tooDeep` (`depthOf` above the limit, counted rather than read
+from `restack_reason`, which a restack conflict replaces). When the
+workspace's `change.Workspace.AutoRestack` (the effective
+`changes.auto_restack`, filled by `changeWorkspaces` in
+`internal/hub/change.go`) is false, it records nothing either:
+`flagBehind` re-reads the change and sets `needs_restack` with
+`RestackAutoOff` (`auto_restack_off`) when it is `behind` the commit
+`onto` or its link names, so every caller (`LinkVersion`'s dependants,
+`linkTo`, `unflagDeep`, `OnLanded`, `RequestRestack`) gets the setting
+through it. `RunRestacks(ctx)`
 (`restack_queue.go`) is one goroutine: it runs a pass at the start, which
 runs what was pending when the hub stopped, and one each time it is
 woken; a pass reads, in a `Store.Tx` (so it waits for the transaction that
@@ -3719,7 +3733,9 @@ again when a newer record replaces it or at the next start.
 
 The restack (`restack.go`, `restack(ctx, job, caller, session)`) reads the
 change in a `Store.Tx` (gone, or neither draft nor open: the record is
-removed) and the commit it must sit on (`sitOn`: the head of the
+removed; for a job of the worker, `restackJob.background`, a change that
+is `tooDeep` now is skipped: the record is removed and its mergeability
+check scheduled) and the commit it must sit on (`sitOn`: the head of the
 `depends_on` change while that one is draft or open, else the record's
 `onto` or the change's `restack_onto`, else the head of the target branch
 in the target's repository). Outside any transaction it resolves the

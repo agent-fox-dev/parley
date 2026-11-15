@@ -3597,7 +3597,7 @@ The change object:
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
 | `mergeable`, `conflict` | whether the commits of the current version that the onto-commit lacks rebase onto the onto-commit, the commit the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
-| `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why. `stack_too_deep`: the change sits deeper in its stack than `[changes].max_stack_depth` (its depth is the number of changes in its chain of `depends_on` links down to a change with none, itself included); its version and its `depends_on` are recorded all the same, and the flag is cleared when a link below it changes so that it is back within the limit. A restack clears the flag for any other reason (see [Stacks and restack](#stacks-and-restack)) |
+| `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why. `stack_too_deep`: the change sits deeper in its stack than `[changes].max_stack_depth` (its depth is the number of changes in its chain of `depends_on` links down to a change with none, itself included); its version and its `depends_on` are recorded all the same, the hub restacks neither it nor the changes above it, and the flag is cleared when a link below it changes so that it is back within the limit. `auto_restack_off`: the workspace's `changes.auto_restack` is `false` and the change is not built on what it must sit on. `conflict`: its restack conflicted. A restack clears the flag for any reason but `stack_too_deep` (see [Stacks and restack](#stacks-and-restack)) |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
 | `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements` |
@@ -3663,7 +3663,7 @@ token opens only from a workspace its binding covers. The body:
 | `title` | one line of at most 200 characters; defaults to the subject of the head commit, cut to 200 characters |
 | `intent` | at most 16,000 characters; defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters; required (not empty or white space) unless `draft` is `true` or the target's setting `changes.require_intent` is `false` |
 | `draft` | `true` opens the change as a draft |
-| `depends_on` | the number of the change this one depends on, a positive integer: a draft or open change of `{slug}` with the same target branch. It is the change's link for version 1 in place of the one the commit graph gives, and `base_sha` is that change's head when the source branch is built on it |
+| `depends_on` | the number of the change this one depends on, a positive integer: a draft or open change of `{slug}` with the same target branch. It is the change's link for version 1 in place of the one the commit graph gives, and `base_sha` is that change's head when the source branch is built on it; when it is not, the change is restacked onto it (see [Stacks and restack](#stacks-and-restack)) |
 | `auto_land` | defaults to `false` |
 | `labels` | defaults to `[]`; at most 20, each matching `^[a-z0-9][a-z0-9_.:/-]{0,62}$`; a repeated label is kept once |
 | `session_id` | defaults to the session recorded on the source fork; a defaulted session the session rule refuses is dropped |
@@ -4001,7 +4001,9 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   `invalid_dependency`, and nothing of the body is applied. The change
   then depends on it, and when its head has that change's head as an
   ancestor `base_sha` becomes that head, with `stats`, `paths` and
-  `paths_truncated` measured against it; otherwise the base stays.
+  `paths_truncated` measured against it; otherwise the base stays and
+  the change is restacked onto it (see
+  [Stacks and restack](#stacks-and-restack)).
   `null` clears the link, and `base_sha` becomes the merge base of
   `head_sha` and the target branch's head (the base stays while the
   target branch does not exist), with `stats`, `paths` and
@@ -4028,7 +4030,9 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   each. With `"reparent"`, each direct dependant stays as it is but now
   depends on what the abandoned change depended on (`null` when nothing),
   and gets a pending restack, with the trigger `abandon`, in the same
-  transaction (see [Stacks and restack](#stacks-and-restack)): it is
+  transaction (see [Stacks and restack](#stacks-and-restack); with
+  `changes.auto_restack` `false` it gets `needs_restack` with
+  `restack_reason` `auto_restack_off` instead): it is
   rebased onto the head of the change it now depends on, or onto the head
   of its target branch when it depends on none, without the abandoned
   change's commits. When that record cannot be written, the answer is
@@ -4141,7 +4145,27 @@ sit on, and gets a pending restack onto that commit, with the trigger
 up keep their `depends_on` and are restacked in turn onto the new head of
 the change directly below them. An abandon with `"dependants":
 "reparent"` records the restack of each reparented dependant, with the
-trigger `abandon` (see [Modifying a change](#modifying-a-change)).
+trigger `abandon` (see [Modifying a change](#modifying-a-change)). A
+`depends_on` a caller sets at open or by `PATCH` on a change whose head
+does not have the head of the change it names records, in the same
+transaction, a pending restack of the change onto that head, with the
+trigger `manual`; the hub runs it as any other.
+
+A change deeper in its stack than `[changes].max_stack_depth` gets no
+pending restack, and a restack recorded before it sank that deep is
+removed without running when its turn comes; since it gets no version,
+the changes above it get none either. When a link below it changes so
+that it is back within the limit, its `stack_too_deep` is cleared and,
+when it does not sit on the head of the change below it (or the commit
+it must sit on), it gets a pending restack with the trigger `version`.
+
+While the workspace's setting `changes.auto_restack` is `false`, none of
+these records a pending restack and no branch moves: each change that
+would have one gets `needs_restack` `true` with `restack_reason`
+`auto_restack_off` when it does not sit on the commit it must (a change
+already on it is left as it is), and keeps its version and its source
+branch. A change below it that lands still leaves it with `depends_on`
+`null` and the landed commit as the commit it must sit on.
 
 The hub runs the pending restacks in the background, one at a time, in
 the order they were recorded; those pending when `parleyd` stopped run
@@ -4170,8 +4194,8 @@ version has it. `needs_restack` is cleared unless its reason is
 bottom first. The hub writes, by `system`, `parley.change.version` with
 `kind` `restack` and then `parley.change.restack` with `number`, `ref`,
 `version`, `head_sha` (the dependant's new version and head), `onto_sha`
-(the commit it was restacked onto) and `trigger` (`version`, `land` or
-`abandon`). A restack whose source branch already sat on that commit
+(the commit it was restacked onto) and `trigger` (`version`, `land`,
+`abandon` or `manual`). A restack whose source branch already sat on that commit
 clears a
 `needs_restack` set for `conflict` or `auto_restack_off`.
 

@@ -18,6 +18,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
 func TestRestack_RebasesADependantOntoTheNewHeadBelowAsAVersionOfTheHub(t *testing.T) {
@@ -257,11 +258,18 @@ func TestRestack_RebasesTheReparentedDependantsOfAnAbandonedChangeWithoutItsComm
 		// abandoned is the index of the abandoned change, whose dependant
 		// is the one after it, the top of the stack.
 		abandoned int
+		// off turns the workspace's automatic restacks off.
+		off bool
 	}{
-		{"the middle of three", 1},
-		{"the bottom of two", 0},
+		{"the middle of three", 1, false},
+		{"the bottom of two", 0, false},
+		{"the middle of three, with automatic restacks off", 1, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			if c.off {
+				w.set(t, "demo", "settings", `{"changes.auto_restack":false}`)
+				defer w.set(t, "demo", "settings", `{}`)
+			}
 			p := fmt.Sprintf("r%d", i)
 			names := []string{p + "a", p + "b", p + "c"}[:c.abandoned+2]
 			s := w.stacked(t, names...)
@@ -278,6 +286,15 @@ func TestRestack_RebasesTheReparentedDependantsOfAnAbandonedChangeWithoutItsComm
 				link, onto = &s[c.abandoned-1].Number, s[c.abandoned-1].HeadSHA
 			}
 			ch := w.read(t, dep.Number)
+			if c.off {
+				events, _ := w.restackEvents(t, seq)
+				if !reflect.DeepEqual(ch.DependsOn, link) || !ch.NeedsRestack || deref(ch.RestackReason) != change.RestackAutoOff ||
+					ch.Version != 1 || w.head(t, dep.Source.Branch) != dep.HeadSHA || len(w.pending(t)) != 0 || len(events) != 0 {
+					t.Errorf("demo#%d depends on %v, needs_restack %v for %q, version %d, branch at %s, pending %v, restack events %v; want on %v, true for auto_restack_off, 1, %s, none, none",
+						dep.Number, ch.DependsOn, ch.NeedsRestack, deref(ch.RestackReason), ch.Version, w.head(t, dep.Source.Branch), w.pending(t), events, link, dep.HeadSHA)
+				}
+				return
+			}
 			vs := w.versions(t, "demo", dep.Number)
 			v := vs[len(vs)-1]
 			want := slices.Delete(slices.Clone(names), c.abandoned, c.abandoned+1)
@@ -454,5 +471,206 @@ func TestRestack_StartsAgainWhenTheChangeGetsAVersionDuringAConflictingReplay(t 
 	if events := w.changeEvents(t, seq, change.EventConflict, b.Number); got.NeedsRestack || got.Mergeable == change.MergeableConflict || len(events) != 0 || len(w.pending(t)) != 0 {
 		t.Errorf("needs_restack %v, mergeable %s, %d conflict events, pending %v; want false, not conflict, none, none",
 			got.NeedsRestack, got.Mergeable, len(events), w.pending(t))
+	}
+}
+
+func TestRestack_RebasesAChangeOntoTheChangeItsCallerLinkedItTo(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	for i, c := range []struct {
+		name string
+		// link opens the change of the branch p+"b", built on main, and
+		// links it to the change a.
+		link func(t *testing.T, p string, a change.Change) change.Change
+	}{
+		{"by PATCH", func(t *testing.T, p string, a change.Change) change.Change {
+			w.branch(t, p+"b", "B\n\nWhy.\n")
+			b := w.openBranch(t, p+"b", nil)
+			if status, got := w.patch(t, b.Number, w.ownerKey, map[string]any{"depends_on": a.Number}); status != http.StatusOK {
+				t.Fatalf("PATCH depends_on %d = %d %v, want 200", a.Number, status, got)
+			}
+			return b
+		}},
+		{"at open", func(t *testing.T, p string, a change.Change) change.Change {
+			w.branch(t, p+"b", "B\n\nWhy.\n")
+			return w.openBranch(t, p+"b", func(in *change.OpenInput) { in.DependsOn = new(a.Number) })
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fmt.Sprintf("x%d", i)
+			a := w.stacked(t, p+"a")[0]
+			seq := w.seq(t)
+			b := c.link(t, p, a)
+			if !slices.Contains(w.pending(t), b.Number) {
+				t.Fatalf("pending restacks of %v, want one of demo#%d", w.pending(t), b.Number)
+			}
+			w.runPending(t)
+
+			vs := w.versions(t, "demo", b.Number)
+			v := vs[len(vs)-1]
+			created, _ := v["created_by"].(map[string]any)
+			head, _ := v["head_sha"].(string)
+			_, err := gitrepotest.Run(w.demo, "", "merge-base", "--is-ancestor", a.HeadSHA, head)
+			if v["kind"] != change.KindRestack || created["actor_type"] != change.ActorSystem || v["base_sha"] != a.HeadSHA || err != nil {
+				t.Errorf("the last version is %v by %v on %v at %s (on %s: %v); want a restack by the hub on %s", v["kind"], created["actor_type"], v["base_sha"], head, a.HeadSHA, err, a.HeadSHA)
+			}
+			numbers, meta := w.restackEvents(t, seq)
+			if !slices.Equal(numbers, []string{strconv.FormatInt(b.Number, 10)}) || meta[0]["trigger"] != change.TriggerManual {
+				t.Errorf("restack events of %v with %v, want one of demo#%d for manual", numbers, meta, b.Number)
+			}
+		})
+	}
+}
+
+func TestRestack_OnlyFlagsTheChangesBehindWhileAutomaticRestacksAreOff(t *testing.T) {
+	t.Parallel()
+	w := newWorldWith(t, hubtest.Config{TOML: zeroDebounce + "max_stack_depth = 2\n"})
+	w.set(t, "demo", "settings", `{"changes.auto_restack":false}`)
+	w.holdRestacks(t)
+	land := func(t *testing.T, a change.Change, files map[string]string) {
+		landed := w.land(t, a.Number, files)
+		if err := w.changes.OnLanded(context.Background(), "demo", a.Number, landed); err != nil {
+			t.Fatalf("OnLanded = %v", err)
+		}
+	}
+	for i, c := range []struct {
+		name string
+		// move builds the changes, each branch named with the prefix p,
+		// moves what is below them and returns the changes that must be
+		// flagged, as they were before, and those that must not.
+		move func(t *testing.T, p string) (behind, on []change.Change)
+	}{
+		{"the change below gets a new version", func(t *testing.T, p string) (behind, on []change.Change) {
+			s := w.stacked(t, p+"a", p+"b")
+			commit(t, w.demo, p+"c", s[0].HeadSHA, "C\n", map[string]string{p + "c.txt": "c\n"})
+			cc := w.openBranch(t, p+"c", nil)
+			head := commit(t, w.demo, p+"a", s[0].HeadSHA, "A2\n", map[string]string{p + "a2.txt": "a2\n"})
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "a", Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
+			pushed := commit(t, w.demo, p+"c", head, "C\n", map[string]string{p + "c.txt": "c\n"})
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "c", Head: pushed, Kind: change.KindPush, Caller: w.ownerCaller()})
+			return []change.Change{s[1]}, []change.Change{cc}
+		}},
+		{"the change below lands", func(t *testing.T, p string) (behind, on []change.Change) {
+			s := w.stacked(t, p+"a", p+"b")
+			land(t, s[0], map[string]string{p + "a.txt": p + "a\n"})
+			if b := w.read(t, s[1].Number); b.DependsOn != nil {
+				t.Errorf("demo#%d depends on %d, want none", b.Number, *b.DependsOn)
+			}
+			return []change.Change{s[1]}, nil
+		}},
+		{"the caller links the change to one it is not built on", func(t *testing.T, p string) (behind, on []change.Change) {
+			a := w.stacked(t, p+"a")[0]
+			w.branch(t, p+"b", "B\n\nWhy.\n")
+			b := w.openBranch(t, p+"b", nil)
+			status, got := w.patch(t, b.Number, w.ownerKey, map[string]any{"depends_on": a.Number})
+			if status != http.StatusOK || got["needs_restack"] != true || got["restack_reason"] != change.RestackAutoOff {
+				t.Errorf("PATCH depends_on %d = %d %v, want 200 with needs_restack for auto_restack_off", a.Number, status, got)
+			}
+			return []change.Change{b}, nil
+		}},
+		{"a change too deep in its stack comes back within the limit", func(t *testing.T, p string) (behind, on []change.Change) {
+			s := w.stacked(t, p+"a", p+"b", p+"c")
+			w.amend(t, p+"b", map[string]string{p + "b2.txt": "b2\n"})
+			b := w.read(t, s[1].Number)
+			land(t, s[0], map[string]string{p + "a.txt": p + "a\n"})
+			return []change.Change{b, s[2]}, nil
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			seq := w.seq(t)
+			behind, on := c.move(t, fmt.Sprintf("o%d", i))
+			for _, before := range behind {
+				ch := w.read(t, before.Number)
+				if !ch.NeedsRestack || deref(ch.RestackReason) != change.RestackAutoOff || ch.Version != before.Version || w.head(t, ch.Source.Branch) != before.HeadSHA {
+					t.Errorf("demo#%d: needs_restack %v for %q, version %d, branch at %s; want true for auto_restack_off, %d, %s",
+						ch.Number, ch.NeedsRestack, deref(ch.RestackReason), ch.Version, w.head(t, ch.Source.Branch), before.Version, before.HeadSHA)
+				}
+			}
+			for _, o := range on {
+				if ch := w.read(t, o.Number); ch.NeedsRestack {
+					t.Errorf("demo#%d on the new head below: needs_restack for %q, want false", ch.Number, deref(ch.RestackReason))
+				}
+			}
+			if events, _ := w.restackEvents(t, seq); len(w.pending(t)) != 0 || len(events) != 0 {
+				t.Errorf("pending restacks %v, restack events %v; want none", w.pending(t), events)
+			}
+		})
+	}
+}
+
+func TestRestack_LeavesAChangeTooDeepInItsStackWhereItIs(t *testing.T) {
+	t.Parallel()
+	w := newWorldWith(t, hubtest.Config{TOML: zeroDebounce + "max_stack_depth = 2\n"})
+	w.holdRestacks(t)
+	for i, c := range []struct {
+		name string
+		// move builds the stack, each branch named with the prefix p, moves
+		// a change below the change too deep and returns the change that
+		// must be restacked and the one too deep, as it was before.
+		move func(t *testing.T, p string) (moved, deep change.Change)
+	}{
+		{"the change below gets a new version", func(t *testing.T, p string) (moved, deep change.Change) {
+			s := w.stacked(t, p+"a", p+"b", p+"c")
+			w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			return s[1], s[2]
+		}},
+		{"the change was flagged for a conflict since", func(t *testing.T, p string) (moved, deep change.Change) {
+			s := w.stacked(t, p+"a", p+"b", p+"c")
+			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+				return w.changes.SetNeedsRestack(ctx, tx, "demo", s[2].Number, true, new(change.RestackConflict))
+			})
+			w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			return s[1], s[2]
+		}},
+		{"the change became too deep after its restack was recorded", func(t *testing.T, p string) (moved, deep change.Change) {
+			x := w.stacked(t, p+"x")[0]
+			s := w.stacked(t, p+"a", p+"b")
+			w.amend(t, p+"a", map[string]string{p + "a2.txt": "a2\n"})
+			if status, got := w.patch(t, s[0].Number, w.ownerKey, map[string]any{"depends_on": x.Number}); status != http.StatusOK {
+				t.Fatalf("PATCH depends_on %d = %d %v, want 200", x.Number, status, got)
+			}
+			return s[0], s[1]
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			moved, deep := c.move(t, fmt.Sprintf("t%d", i))
+			w.runPending(t)
+			vs := w.versions(t, "demo", moved.Number)
+			if v := vs[len(vs)-1]; v["kind"] != change.KindRestack {
+				t.Errorf("demo#%d's last version is %v, want a restack", moved.Number, v["kind"])
+			}
+			ch := w.read(t, deep.Number)
+			if ch.Version != deep.Version || w.head(t, ch.Source.Branch) != deep.HeadSHA || slices.Contains(w.pending(t), deep.Number) ||
+				!ch.NeedsRestack || deref(ch.RestackReason) != change.RestackTooDeep {
+				t.Errorf("demo#%d too deep: version %d, branch at %s, pending %v, needs_restack %v for %q; want %d, %s, not pending, true for stack_too_deep",
+					ch.Number, ch.Version, w.head(t, ch.Source.Branch), w.pending(t), ch.NeedsRestack, deref(ch.RestackReason), deep.Version, deep.HeadSHA)
+			}
+		})
+	}
+}
+
+func TestRestack_RebasesAChangeBackWithinTheStackDepthLimit(t *testing.T) {
+	t.Parallel()
+	w := newWorldWith(t, hubtest.Config{TOML: zeroDebounce + "max_stack_depth = 2\n"})
+	w.holdRestacks(t)
+	s := w.stacked(t, "a", "b", "c")
+	w.amend(t, "a", map[string]string{"a2.txt": "a2\n"})
+	w.runPending(t)
+	if c := w.read(t, s[2].Number); c.Version != 1 {
+		t.Fatalf("demo#%d too deep is at version %d, want 1", c.Number, c.Version)
+	}
+	landed := w.land(t, s[0].Number, map[string]string{"a2.txt": "a2\n"})
+	if err := w.changes.OnLanded(context.Background(), "demo", s[0].Number, landed); err != nil {
+		t.Fatalf("OnLanded = %v", err)
+	}
+	w.runPending(t)
+
+	b, c := w.read(t, s[1].Number), w.read(t, s[2].Number)
+	vs := w.versions(t, "demo", c.Number)
+	v := vs[len(vs)-1]
+	if b.DependsOn != nil || c.NeedsRestack || c.RestackReason != nil || v["kind"] != change.KindRestack || v["base_sha"] != b.HeadSHA {
+		t.Errorf("demo#%d depends on %v; demo#%d needs_restack %v for %q, its last version %v on %v; want none; false for none, a restack on %s",
+			b.Number, b.DependsOn, c.Number, c.NeedsRestack, deref(c.RestackReason), v["kind"], v["base_sha"], b.HeadSHA)
 	}
 }
