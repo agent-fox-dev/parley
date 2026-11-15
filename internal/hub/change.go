@@ -19,8 +19,13 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// changeHook is the name of the start hook that binds the change component.
-const changeHook = "changes"
+// changeHook is the name of the start hook that binds the change component;
+// reconcileHook the name of the one after it that reconciles the changes
+// with their source branches.
+const (
+	changeHook    = "changes"
+	reconcileHook = "changes-reconcile"
+)
 
 // mergeabilityWork is the name of the background work that runs the
 // mergeability checks; mergeabilityGrace is how long the stop waits for
@@ -86,6 +91,13 @@ const (
 //   - a second branch-move observer of sync (syncTargets) does so for a
 //     branch a sync moved, in a store transaction of its own.
 //
+// A start hook after the one that binds the component, and so before the
+// listener is bound, reconciles every draft and open change with its source
+// branch (Reconcile): the head of a branch moved while its bookkeeping was
+// lost is recorded as a version by the hub, a change whose source branch is
+// gone is abandoned for source_deleted, and every change whose mergeable is
+// unknown is scheduled for a check, which the worker runs once it starts.
+//
 // No session linker, stack linker, landing evaluator or auto_land guard is
 // registered: without a session linker an explicit session_id is refused
 // and a defaulted one dropped; without a stack linker no change depends on
@@ -150,6 +162,7 @@ func composeChanges(c *Composition) {
 		mapper.Bind(rt.Logger)
 		return nil
 	})
+	c.AddStartHook(reconcileHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
 	c.AddBackgroundWork(mergeabilityWork, mergeabilityGrace, func(ctx context.Context, _ *Runtime) { comp.RunMergeability(ctx) })
 }
 

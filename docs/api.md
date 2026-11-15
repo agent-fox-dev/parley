@@ -3626,6 +3626,17 @@ and the deletion of the target workspace deletes its changes. Each
 abandonment writes `parley.change.abandon`, its `reason` `source_deleted`
 or `source_workspace_deleted`. The versions and their refs stay.
 
+When `parleyd` starts, before it accepts a request, it compares the source
+branch of every draft and open change with the head of the change's
+current version, so that a move whose bookkeeping a stop lost is not lost:
+a branch at another commit records that commit as the next version, of
+kind `ref` by the hub (`created_by.actor_type` `system`), with its
+`parley.change.version` event; a missing branch, while the source
+workspace still exists, abandons the change with `reason`
+`source_deleted` by the hub. A change that is in line with its branch is
+left as it is, `updated_at` included. Every draft and open change whose
+`mergeable` is `unknown` then gets a mergeability check without a request.
+
 ## `POST /api/v1/workspaces/{slug}/changes`
 
 Opens a change in the workspace `{slug}`, the target workspace. It needs,

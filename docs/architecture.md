@@ -3533,7 +3533,9 @@ in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 caller's transaction, with `workspace.RequireReady` as `Unusable` and the
 effective `changes.require_intent`, the event component (`Events`), the
 hub's clock and logger, and `[changes].mergeable_debounce`
-(`MergeableDebounce`); `AdjustChange` adjusters run before the bind. It
+(`MergeableDebounce`); `AdjustChange` adjusters run before the bind. Right
+after it, the start hook `changes-reconcile` runs `Reconcile` (below), so
+it runs after the `push-journal` hook and before the listener is bound. It
 adds the background work `change_mergeability` (grace 5 s), which runs
 `RunMergeability` until the stop.
 
@@ -3849,6 +3851,27 @@ transaction and schedule the check at once:
 change (restore; the retarget and the restack call it too), and
 `ScheduleTargetMergeable(ctx, tx, workspace, branch)` for the draft and
 open changes of the workspace whose target is the branch.
+
+`(*change.Component).Reconcile(ctx)` (`reconcile.go`) is the start-up
+reconciliation, which repairs what a stop between a ref update and its
+store transaction lost. It lists the draft and open changes and reconciles
+each in a `Store.Tx` of its own: it reads the source branch in the source
+workspace's repository; at the head of the current version it writes
+nothing, `updated_at` included; at another commit it calls `RecordVersion`
+with kind `ref` and `change.Caller{}` (actor `system`, no credential), so
+the version, its ref, `parley.change.version` and the check come as for
+any new version; a missing branch of a source workspace that has its record
+calls `Abandon` with `source_deleted` by the system, which keeps the
+versions and their refs. A change that cannot be reconciled, because a
+repository cannot be read, the version cannot be recorded, or its source
+workspace has no record (a fork whose delete did not settle its changes),
+is left as it is and logged at error level as `the change was not
+reconciled with its source branch` with `workspace` and `number`; the
+others are reconciled all the same and the start goes on. Only a failure
+to list the changes fails the start. Then every draft and open change whose
+`mergeable` is `unknown` is added to the worker's waiting set without a
+write; the worker keeps those entries and runs them once it starts after
+the bind.
 
 The hub part connects the component to the features that move a change's
 source or ask about changes, all at composition, on the instances that
