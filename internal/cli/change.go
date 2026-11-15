@@ -39,10 +39,10 @@ const changePath = "/workspaces/:slug/changes/:number"
 var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land", "no-auto-land", "target"}
 
 // newChangeCommand builds parley change: the changes of a workspace, their
-// versions and their diffs, their edits, abandon and restore, and waiting
-// for one.
+// versions and their diffs, their stacks, their edits, abandon, restore and
+// restack, and waiting for one.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list, read, edit, abandon, restore and wait for the changes of a workspace, and read their versions and diffs",
+	return group("change", "Open, list, read, edit, abandon, restore, restack and wait for the changes of a workspace, and read their versions, diffs and stacks",
 		newChangeOpenCommand(),
 		newChangeEditCommand(),
 		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
@@ -55,6 +55,17 @@ func newChangeCommand() *cobra.Command {
 			Path:        changePath + "/restore",
 			Args:        []argSpec{slugArg, numberArg},
 			Auth:        authUser,
+		}), true),
+		withNumbers(declare(command{
+			Name:        "restack",
+			Description: "Rebase a change onto the change it is stacked on, or onto its target branch, now",
+			Method:      http.MethodPost,
+			Path:        changePath + "/restack",
+			Args:        []argSpec{slugArg, numberArg},
+			Auth:        authUser,
+			Run: func(c *call) error {
+				return sendWith(c, nil, map[string]any{})
+			},
 		}), true),
 		newChangeWaitCommand(),
 		withNumbers(scmRead{
@@ -83,6 +94,9 @@ func newChangeCommand() *cobra.Command {
 		}.build(),
 		withNumbers(scmRead{
 			command: command{Name: "versions", Description: "List the versions of a change, oldest first", Path: "/workspaces/:slug/changes/:number/versions", Args: []argSpec{slugArg, numberArg}},
+		}.build(), true),
+		withNumbers(scmRead{
+			command: command{Name: "stack", Description: "Show the stack of a change: the changes below it, the change and the draft and open changes above it, bottom first", Path: changePath + "/stack", Args: []argSpec{slugArg, numberArg}},
 		}.build(), true),
 		withNumbers(scmRead{
 			command: command{Name: "diff", Description: "Show the diff of a version of a change, or the interdiff of two versions", Path: "/workspaces/:slug/changes/:number/diff", Args: []argSpec{slugArg, numberArg}},

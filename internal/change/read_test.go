@@ -74,7 +74,7 @@ func TestRead_ServesAChangeItsVersionsAndItsCommits(t *testing.T) {
 			{"versions", http.StatusOK, nil, []string{"checks", "stack"}},
 			{"", http.StatusOK, nil, []string{"versions", "checks"}},
 			{"versions,checks", http.StatusOK, map[string]any{"checks": []any{map[string]any{"name": "ci"}}}, nil},
-			{"stack", http.StatusOK, nil, []string{"stack", "versions"}},
+			{"stack", http.StatusOK, nil, []string{"versions", "checks"}},
 			{"bogus", http.StatusBadRequest, nil, nil},
 			{"versions,,bogus", http.StatusBadRequest, nil, nil},
 			{"versions,,checks", http.StatusBadRequest, nil, nil},

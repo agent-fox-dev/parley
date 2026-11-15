@@ -45,15 +45,16 @@ func startLifecycleHub(t *testing.T) *lifecycleHub {
 }
 
 // commitFile writes content to file in the clone that run works in and
-// commits it.
-func commitFile(t *testing.T, run func(...string) string, file, content, message string) string {
+// commits it, with the commit's other flags (--amend replaces the commit
+// at the head), and returns the new head.
+func commitFile(t *testing.T, run func(...string) string, file, content, message string, flags ...string) string {
 	t.Helper()
 	dir := strings.TrimSpace(run("rev-parse", "--show-toplevel"))
 	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run("add", file)
-	run("-c", "user.name=Agent", "-c", "user.email=agent@example.invalid", "commit", "--quiet", "-m", message)
+	run(append([]string{"-c", "user.name=Agent", "-c", "user.email=agent@example.invalid", "commit", "--quiet", "-m", message}, flags...)...)
 	return strings.TrimSpace(run("rev-parse", "HEAD"))
 }
 
@@ -86,7 +87,13 @@ func (h *lifecycleHub) read(t *testing.T, credential, number string) map[string]
 // 20 s, and returns it.
 func (h *lifecycleHub) until(t *testing.T, number, what string, done func(map[string]any) bool) map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	return h.within(t, 20*time.Second, number, what, done)
+}
+
+// within is until for up to d.
+func (h *lifecycleHub) within(t *testing.T, d time.Duration, number, what string, done func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for {
 		c := h.read(t, h.key, number)
 		if done(c) {

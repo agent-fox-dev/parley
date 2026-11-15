@@ -10,9 +10,9 @@ import (
 )
 
 // Routes are the change routes, for the server's router: the open, the
-// list and the reads of one change, its versions, the change of a commit
-// and the diff of a version, and the edit, the abandon and the restore of
-// one change.
+// list and the reads of one change, its versions, its stack, the change of
+// a commit and the diff of a version, and the edit, the abandon, the
+// restore and the manual restack of one change.
 func (c *Component) Routes() []server.Route {
 	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	read := func(pattern string, h server.HandlerFunc) server.Route {
@@ -38,9 +38,11 @@ func (c *Component) Routes() []server.Route {
 		read("/workspaces/:slug/changes/:number/versions", c.listVersions),
 		read("/workspaces/:slug/changes/:number/versions/:version", c.getVersion),
 		read("/workspaces/:slug/changes/:number/diff", c.getDiff),
+		read("/workspaces/:slug/changes/:number/stack", c.stackRoute),
 		write(http.MethodPatch, "/workspaces/:slug/changes/:number", c.editRoute),
 		write(http.MethodPost, "/workspaces/:slug/changes/:number/abandon", c.abandonRoute),
 		write(http.MethodPost, "/workspaces/:slug/changes/:number/restore", c.restoreRoute),
+		write(http.MethodPost, "/workspaces/:slug/changes/:number/restack", c.restackRoute),
 	}
 }
 

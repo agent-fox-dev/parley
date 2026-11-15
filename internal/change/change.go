@@ -61,6 +61,22 @@ const (
 	MergeableUnknown  = "unknown"
 )
 
+// The reasons of a change's needs_restack.
+const (
+	// RestackTooDeep is the reason of a change that sits deeper in its
+	// stack than [changes].max_stack_depth.
+	RestackTooDeep = "stack_too_deep"
+	// RestackConflict is the reason of a change whose restack conflicted.
+	RestackConflict = "conflict"
+	// RestackAutoOff is the reason of a change that a workspace with
+	// changes.auto_restack off does not restack.
+	RestackAutoOff = "auto_restack_off"
+)
+
+// DefaultMaxStackDepth is the deepest a change may sit in its stack when
+// Deps names no limit.
+const DefaultMaxStackDepth = 20
+
 // The statuses of a change's landing.
 const (
 	LandingReady   = "ready"
@@ -367,6 +383,10 @@ type Deps struct {
 	// MergeableDebounce is the shortest time between the starts of two
 	// mergeability checks of one change; zero, or below, for none.
 	MergeableDebounce time.Duration
+	// MaxStackDepth is the deepest a change may sit in its stack, itself
+	// counted, before it is flagged stack_too_deep; zero, or below, is
+	// DefaultMaxStackDepth.
+	MaxStackDepth int
 }
 
 // Component keeps the changes. Its zero value is ready to be registered and
@@ -383,10 +403,13 @@ type Component struct {
 	guard     AutoLandGuard
 	activity  ForkActivity
 	restacker Restacker
-	expanders map[string]Expander
+	// versionGuard judges the version of a manual restack.
+	versionGuard VersionGuard
+	expanders    map[string]Expander
 
 	// merge holds the scheduled mergeability checks.
-	merge mergeWorker
+	merge    mergeWorker
+	restacks restackWorker
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
@@ -400,6 +423,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.MaxStackDepth <= 0 {
+		d.MaxStackDepth = DefaultMaxStackDepth
 	}
 	c.deps = d
 }

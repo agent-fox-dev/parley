@@ -35,6 +35,14 @@ const (
 	mergeabilityGrace = 5 * time.Second
 )
 
+// restackWork is the name of the background work that runs the pending
+// restacks; restackGrace is how long the stop waits for it, which ends the
+// git process of a running replay at once and leaves its restack pending.
+const (
+	restackWork  = "change_restack"
+	restackGrace = 5 * time.Second
+)
+
 // composeChanges adds the changes: the schema of the change record, the
 // change routes under /workspaces/:slug/changes, whose scope and access
 // need the shared checks decide, and the component, bound in a start hook to
@@ -102,11 +110,50 @@ const (
 // gone is abandoned for source_deleted, and every change whose mergeable is
 // unknown is scheduled for a check, which the worker runs once it starts.
 //
-// No session linker, stack linker, landing evaluator or auto_land guard is
+// The component's own stack linker (StackLinker) links every new version,
+// at open and after, to the nearest draft or open change of the same
+// workspace and target branch whose head its head is built on, and measures
+// the version from that change's head, so that a change of a stack counts
+// only its own commits; with none below, the link is cleared and the
+// version keeps the merge base with its target branch. The depends_on an
+// open or a PATCH names is checked and taken in place of that rule, for
+// version 1 of an open. After each link, a change deeper in its stack
+// than [changes].max_stack_depth, and each such change above it, is flagged
+// stack_too_deep, and one back within the limit unflagged. Its column of the
+// change record, the commit a change must sit on once the change below it
+// landed, is added by StackStep. The member include=stack adds to a read of
+// one change is the change's stack as GET …/changes/:number/stack answers
+// it (Stack), registered as the expander of stack.
+//
+// A new version of a change records, in its transaction, a pending restack
+// of each change directly above it (one already built on the new head
+// ends as up to date); the table of pending restacks is added by
+// RestackStep. The restacks run as
+// background work (RunRestacks), one at a time in the order they were
+// recorded, those pending at the start first: each replays the change's
+// own commits onto the head below in the object store, moves the source
+// branch with a compare-and-swap and records a version of kind restack by
+// the hub in one store transaction, with parley.change.restack after its
+// version event, which records the restacks of the changes above it in
+// turn. A restack whose replay conflicts moves nothing and stores the
+// conflict as the mergeability result, with needs_restack set for it, so
+// that StoreMergeability writes its parley.change.conflict; the changes
+// above are not restacked. The mergeability check of a change with a
+// pending restack stores nothing until the restack has ended. The
+// component's own restacker
+// (Restacker) records, in the abandon's transaction, the restack of each
+// dependant an abandon reparents. The entry point for a landed change
+// (OnLanded), which unlinks its dependants and restacks them onto the
+// landed commit, is not registered: no landing exists to call it. A change
+// too deep in its stack gets no restack; with the workspace setting
+// changes.auto_restack false, which changeWorkspaces reads, none is
+// recorded and a change behind is flagged auto_restack_off instead.
+//
+// No session linker, landing evaluator, auto_land guard or version guard is
 // registered: without a session linker an explicit session_id is refused
-// and a defaulted one dropped; without a stack linker no change depends on
-// another; without a landing evaluator every open change is ready to land;
-// and auto_land is stored as given.
+// and a defaulted one dropped; without a landing evaluator every open
+// change is ready to land; auto_land is stored as given; and the version
+// a manual restack records is not judged.
 //
 // The component exists from the composition on (Changes); tests change its
 // dependencies with AdjustChange.
@@ -117,11 +164,16 @@ func composeChanges(c *Composition) {
 	c.AddSchemaStep(change.AutoLandSetterStep)
 	c.AddSchemaStep(change.MergeableStep)
 	c.AddSchemaStep(change.AnnouncedStep)
+	c.AddSchemaStep(change.StackStep)
+	c.AddSchemaStep(change.RestackStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
 	c.refWriter.RegisterRefUpdatedStage(comp.RefUpdated)
 	c.refWriter.RegisterRefUpdatedStage(comp.TargetsUpdated)
+	comp.RegisterStackLinker(comp.StackLinker())
+	comp.RegisterRestacker(comp.Restacker())
+	comp.RegisterExpander("stack", func(ctx context.Context, ch change.Change) (any, error) { return comp.Stack(ctx, ch) })
 	comp.AddVersionObserver(comp.MergeableObserver())
 	c.scm.RegisterChangeLinker(changeLinker{comp, c.runtime})
 	c.AdjustSCM(func(d *scm.Deps) { d.Changes = changeLookup{comp} })
@@ -159,6 +211,7 @@ func composeChanges(c *Composition) {
 			Logger:     rt.Logger,
 
 			MergeableDebounce: rt.Config.Changes.MergeableDebounce,
+			MaxStackDepth:     rt.Config.Changes.MaxStackDepth,
 		}
 		for _, adjust := range c.changeAdjusters {
 			adjust(&d)
@@ -169,6 +222,7 @@ func composeChanges(c *Composition) {
 	})
 	c.AddStartHook(reconcileHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
 	c.AddBackgroundWork(mergeabilityWork, mergeabilityGrace, func(ctx context.Context, _ *Runtime) { comp.RunMergeability(ctx) })
+	c.AddBackgroundWork(restackWork, restackGrace, func(ctx context.Context, _ *Runtime) { comp.RunRestacks(ctx) })
 }
 
 // changeWorkspaces reads the workspace records for the change component,
@@ -189,8 +243,12 @@ func (r changeWorkspaces) Workspace(ctx context.Context, q change.Querier, slug 
 			*dst = *src
 		}
 	}
-	if on, ok := r.settings.EffectiveSettings(w.Settings, w.DefaultBranch)["changes.require_intent"].(bool); ok {
+	settings := r.settings.EffectiveSettings(w.Settings, w.DefaultBranch)
+	if on, ok := settings["changes.require_intent"].(bool); ok {
 		out.RequireIntent = on
+	}
+	if on, ok := settings["changes.auto_restack"].(bool); ok {
+		out.AutoRestack = on
 	}
 	return out, true, nil
 }

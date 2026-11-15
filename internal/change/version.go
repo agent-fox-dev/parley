@@ -21,6 +21,11 @@ type VersionInput struct {
 	Caller Caller
 	// SessionID is the session of the move, nil for none.
 	SessionID *string
+	// SessionChecked is set for a session judged before, such as the one
+	// of the version a restack replaces: it is recorded as it is, without
+	// asking the session linker again, unless no session linker is
+	// registered, which drops it.
+	SessionChecked bool
 }
 
 // RecordVersion records the move in of a branch as the next version of the
@@ -31,8 +36,9 @@ type VersionInput struct {
 //
 // A session must pass the session linker (without one, every session is
 // refused) or the answer is 400 unknown_session, before anything is
-// written. The version's base is the merge base of its head and the
-// target branch, none for a head that shares no history with it, or the
+// written, unless it was checked before (SessionChecked). The version's
+// base is the merge base of its head and the target branch, none for a
+// head that shares no history with it, or the
 // previous version's base while the target branch does not exist; a
 // version with no base is measured from the empty tree. It is
 // patch-equivalent to the latest earlier version
@@ -42,7 +48,9 @@ type VersionInput struct {
 // bringing a fork's commit there first, links its session, makes it the
 // change's current version with mergeable unknown, then runs the stack
 // linker, the landing derivation and the version observers in that order
-// and writes parley.change.version. The landing of a draft stays
+// and writes parley.change.version with the version as stored then, whose
+// base and patch equivalence the stack linker may have measured again
+// from the change below. The landing of a draft stays
 // blocked/draft; a missing target branch, a head with no commit the target
 // lacks, a head with no history in common with the target and a merge
 // commit among the version's commits block it as target_not_found,
@@ -66,7 +74,12 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	}
 	co := c.collaborators()
 	var session *string
-	if in.SessionID != nil {
+	switch {
+	case in.SessionID != nil && in.SessionChecked:
+		if co.sessions != nil {
+			session = in.SessionID
+		}
+	case in.SessionID != nil:
 		if session, err = c.session(ctx, co, OpenInput{Workspace: workspace, SessionID: in.SessionID, Caller: in.Caller}, Workspace{}); err != nil {
 			return nil, err
 		}
@@ -75,7 +88,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	if err != nil {
 		return nil, err
 	}
-	equivalent, err := latestEquivalent(ctx, tx, workspace, number, o.patchID)
+	equivalent, err := latestEquivalent(ctx, tx, workspace, number, ch.Version+1, o.patchID)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +120,9 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 		return nil, err
 	}
 	if ch, err = readChange(ctx, tx, workspace, number); err != nil {
+		return nil, err
+	}
+	if v, err = storedVersion(ctx, tx, workspace, number, v); err != nil {
 		return nil, err
 	}
 	if err := c.emitVersion(ctx, tx, in.Caller, ch, v); err != nil {

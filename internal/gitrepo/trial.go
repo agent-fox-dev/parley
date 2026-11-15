@@ -27,7 +27,7 @@ func (r *Repo) TrialRebase(ctx context.Context, onto, head string) (*ConflictRep
 	if err != nil {
 		return nil, err
 	}
-	commits, err := r.replayed(ctx, onto, head)
+	commits, err := r.replayed(ctx, onto+".."+head)
 	if err != nil || len(commits) == 0 {
 		return nil, err
 	}
@@ -44,11 +44,11 @@ func (r *Repo) TrialRebase(ctx context.Context, onto, head string) (*ConflictRep
 	return report, err
 }
 
-// replayed lists the commits of the range onto..head, oldest first, each
-// with its tree and parents alone: their messages are not read. A merge
-// commit among them is ErrMergeCommit.
-func (r *Repo) replayed(ctx context.Context, onto, head string) ([]Commit, error) {
-	out, err := r.git(ctx, "rev-list", "--reverse", "--no-commit-header", "--format=%H %T %P", onto+".."+head)
+// replayed lists the commits of the rev-list range commitRange, such as
+// onto..head, oldest first, each with its tree and parents alone: their
+// messages are not read. A merge commit among them is ErrMergeCommit.
+func (r *Repo) replayed(ctx context.Context, commitRange string) ([]Commit, error) {
+	out, err := r.git(ctx, "rev-list", "--reverse", "--no-commit-header", "--format=%H %T %P", commitRange)
 	if err != nil {
 		return nil, err
 	}

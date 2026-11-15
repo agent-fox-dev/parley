@@ -47,6 +47,8 @@ func changeHub(t *testing.T) *stubHub {
 		answer(http.MethodPatch, "/api/v1/workspaces/a/b/changes/12", http.StatusOK, hubAnswer).
 		answer(http.MethodPost, changesPath+"/12/abandon", http.StatusOK, hubAnswer).
 		answer(http.MethodPost, changesPath+"/12/restore", http.StatusOK, hubAnswer).
+		answer(http.MethodGet, changesPath+"/12/stack", http.StatusOK, hubAnswer).
+		answer(http.MethodGet, "/api/v1/workspaces/a/b/changes/12/stack", http.StatusOK, hubAnswer).
 		answer(http.MethodGet, changesPath+"/13", http.StatusOK, labelledChange).
 		answer(http.MethodPatch, changesPath+"/13", http.StatusOK, hubAnswer).
 		handle(http.MethodGet, changesPath+"/12/diff", func(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +213,8 @@ func TestChange_ReadsSendOneGetToTheirRoute(t *testing.T) {
 		{[]string{"show", "demo", "12", "--include", "versions,stack"}, changesPath + "/12", url.Values{"include": {"versions,stack"}}, ""},
 		{[]string{"find", "demo", changeSHA}, changesPath + "/by-commit/" + changeSHA, nil, ""},
 		{[]string{"versions", "demo", "12"}, changesPath + "/12/versions", nil, ""},
+		{[]string{"stack", "demo", "12"}, changesPath + "/12/stack", nil, ""},
+		{[]string{"stack", "a/b", "12"}, "/api/v1/workspaces/a%2Fb/changes/12/stack", nil, ""},
 		{[]string{"show", "demo", "99"}, changesPath + "/99", nil, changeNotFound},
 	}
 	for _, tt := range tests {
@@ -352,24 +356,53 @@ func TestChangeEdit_SendsTheChangesLabelsWithTheLabelFlagsApplied(t *testing.T) 
 	}
 }
 
+func TestChangeRestack_SendsAnEmptyObjectAndPrintsTheOutcome(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{"restacked", "up_to_date"} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			answer := `{"status":"` + status + `","change":{"number":12,"needs_restack":false}}`
+			hub := newStubHub(t).answer(http.MethodPost, changesPath+"/12/restack", http.StatusOK, answer)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", "restack", "demo", "12")
+
+			got := wantOnlyRequest(t, sent, http.MethodPost, changesPath+"/12/restack")
+			if ct := got.header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+			wantJSONBody(t, got.body, `{}`)
+			wantResult(t, code, stdout, stderr, answer)
+		})
+	}
+}
+
 func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 	t.Parallel()
+	conflict := `{"error":{"code":409,"message":"demo#12 conflicts with what it must sit on","error_type":"rebase_conflict",` +
+		`"details":{"target_sha":"` + changeSHA + `","files":[{"path":"f.txt","kind":"content"}]}}}`
 	tests := []struct {
 		args         []string
 		method, path string
 		status       int
 		errorType    string
+		// refusal is the envelope the hub answers, "" for the one envelope
+		// builds from the status and the error type.
+		refusal string
 	}{
-		{[]string{"edit", "demo", "12", "--title", "T"}, http.MethodPatch, changesPath + "/12", http.StatusConflict, "change_closed"},
-		{[]string{"edit", "demo", "12", "--label", "c"}, http.MethodGet, changesPath + "/12", http.StatusNotFound, "change_not_found"},
-		{[]string{"ready", "demo", "12"}, http.MethodPatch, changesPath + "/12", http.StatusBadRequest, "intent_required"},
-		{[]string{"abandon", "demo", "12"}, http.MethodPost, changesPath + "/12/abandon", http.StatusConflict, "has_dependants"},
-		{[]string{"restore", "demo", "12"}, http.MethodPost, changesPath + "/12/restore", http.StatusConflict, "source_workspace_gone"},
+		{[]string{"edit", "demo", "12", "--title", "T"}, http.MethodPatch, changesPath + "/12", http.StatusConflict, "change_closed", ""},
+		{[]string{"edit", "demo", "12", "--label", "c"}, http.MethodGet, changesPath + "/12", http.StatusNotFound, "change_not_found", ""},
+		{[]string{"ready", "demo", "12"}, http.MethodPatch, changesPath + "/12", http.StatusBadRequest, "intent_required", ""},
+		{[]string{"abandon", "demo", "12"}, http.MethodPost, changesPath + "/12/abandon", http.StatusConflict, "has_dependants", ""},
+		{[]string{"restore", "demo", "12"}, http.MethodPost, changesPath + "/12/restore", http.StatusConflict, "source_workspace_gone", ""},
+		{[]string{"restack", "demo", "12"}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			t.Parallel()
-			refusal := envelope(tt.status, tt.errorType)
+			refusal := tt.refusal
+			if refusal == "" {
+				refusal = envelope(tt.status, tt.errorType)
+			}
 			hub := newStubHub(t).answer(tt.method, tt.path, tt.status, refusal)
 
 			code, stdout, stderr, sent := runChange(t, hub, "", tt.args...)
@@ -414,6 +447,10 @@ func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"ready", "demo"},
 		{"draft", "demo", "12", "13"},
 		{"restore"},
+		{"restack", "demo"},
+		{"restack", "demo", "0"},
+		{"stack", "demo", "x"},
+		{"stack", "demo", "1", "2"},
 		{"wait", "demo"},
 		{"wait", "demo", "12", "--for", "done"},
 		{"wait", "demo", "12", "--timeout", "0s"},

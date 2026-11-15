@@ -166,7 +166,9 @@ func (c *Component) runChecks(ctx context.Context) {
 // checkMergeable computes the mergeable of the change k: it reads the
 // change's head and onto-commit, trial-rebases the head onto it in the
 // target's repository under the deadline, and stores the result when they
-// are still the change's; a pair that moved on is scheduled again. A
+// are still the change's, unless a restack stored its conflict since the
+// check was scheduled (holdsRestackConflict); a pair that moved on is
+// scheduled again. A
 // missing target branch leaves mergeable unknown and re-evaluates the
 // landing, which reports it. A trial rebase that fails or passes its
 // deadline leaves mergeable unknown and is logged; the change's next
@@ -212,6 +214,9 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		if moved = now.HeadSHA != ch.HeadSHA || ontoNow != onto; moved {
 			return nil
 		}
+		if holdsRestackConflict(now) {
+			return nil
+		}
 		return c.StoreMergeability(ctx, tx, k.workspace, k.number, ch.HeadSHA, onto, report)
 	})
 	if err != nil {
@@ -236,13 +241,19 @@ func (c *Component) checkFailed(ctx context.Context, k mergeKey, err error) {
 // commit its check rebases onto: the head of the change it depends on
 // while that one is draft or open, otherwise the head of its target
 // branch, "" when that branch does not exist. live is false for a change
-// that is neither draft nor open, or that does not exist.
+// that is neither draft nor open, or that does not exist, and for one with
+// a pending restack: its head still holds the old commits of the change
+// below, which a check would replay onto the new ones and report as a
+// conflict; the end of the restack schedules its check again.
 func (c *Component) mergePair(ctx context.Context, q Querier, workspace string, number int64) (ch Change, onto string, live bool, err error) {
 	ch, err = readChange(ctx, q, workspace, number)
 	if errors.Is(err, ErrChangeNotFound) {
 		return Change{}, "", false, nil
 	}
 	if err != nil || (ch.State != StateDraft && ch.State != StateOpen) {
+		return ch, "", false, err
+	}
+	if pending, err := hasPendingRestack(ctx, q, workspace, number); err != nil || pending {
 		return ch, "", false, err
 	}
 	if ch.DependsOn != nil {

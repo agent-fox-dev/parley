@@ -32,6 +32,10 @@ type Workspace struct {
 	Purpose, SessionID *string
 	// RequireIntent is the effective changes.require_intent setting.
 	RequireIntent bool
+	// AutoRestack is the effective changes.auto_restack setting: false
+	// leaves a restack of the workspace's changes to their callers, and
+	// only flags a change that needs one.
+	AutoRestack bool
 	// Unusable is nil for a workspace a change may be opened in or from,
 	// and otherwise its refusal, such as 409 workspace_busy.
 	Unusable error
@@ -174,10 +178,11 @@ type collaborators struct {
 	guard     AutoLandGuard
 	activity  ForkActivity
 	restacker Restacker
+	versions  VersionGuard
 }
 
 func (c *Component) collaborators() collaborators {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return collaborators{c.sessions, c.stack, c.evaluator, append([]VersionObserver(nil), c.observers...), c.guard, c.activity, c.restacker}
+	return collaborators{c.sessions, c.stack, c.evaluator, append([]VersionObserver(nil), c.observers...), c.guard, c.activity, c.restacker, c.versionGuard}
 }

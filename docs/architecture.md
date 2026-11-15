@@ -3532,8 +3532,11 @@ push calls no linker. The three `POST` routes are registered with
 in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 `change.SchemaStep` (the step `changes`) and right after it
 `change.AutoLandSetterStep` (`change_auto_land_setter`),
-`change.MergeableStep` (`change_mergeable`) and `change.AnnouncedStep`
-(`change_ready_announced`), registers its `Routes()` with
+`change.MergeableStep` (`change_mergeable`), `change.AnnouncedStep`
+(`change_ready_announced`), `change.StackStep` (`change_stack`, the
+column `restack_onto`: the commit a change must sit on once the change
+below it landed, `NULL` for none) and `change.RestackStep`
+(`change_restacks`, the table of pending restacks), registers its `Routes()` with
 `AddRoute`, and binds it in the start hook `changes` to the store
 (`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
 (`Repos`), the access service (`Access`), `changeWorkspaces` (`Workspaces`), an adapter over
@@ -3545,7 +3548,8 @@ hub's clock and logger, and `[changes].mergeable_debounce`
 after it, the start hook `changes-reconcile` runs `Reconcile` (below), so
 it runs after the `push-journal` hook and before the listener is bound. It
 adds the background work `change_mergeability` (grace 5 s), which runs
-`RunMergeability` until the stop.
+`RunMergeability` until the stop, and `change_restack` (grace 5 s), which
+runs `RunRestacks` (below).
 
 The schema keeps `changes` (one row per change, keyed by target workspace
 and number, with the current version's head, base, stats, touched paths
@@ -3627,7 +3631,10 @@ again when a later step fails), records the
 session link, makes it the change's current version (head, base, patch id,
 stats, paths, `session_id`, `mergeable` `unknown`, `updated_at`), then runs
 the stack linker, the landing derivation and the observers as at open, and
-emits `parley.change.version`. The landing of a draft stays
+emits `parley.change.version` with the version re-read from the
+transaction (`storedVersion`), since the stack linker may have moved its
+base, and so its stats and `patch_equivalent_to`; `Open` does the same.
+The landing of a draft stays
 `blocked`/`draft`; a missing target branch, a head with no commit the
 target lacks, a head with no history in common with the target and a
 merge commit among the version's commits store `blocked` with
@@ -3643,8 +3650,221 @@ the component instance, with `RegisterSessionLinker`,
 `RegisterAutoLandGuard`, `RegisterForkActivity` and, declared beside the
 abandon in `lifecycle.go`, `RegisterRestacker`
 ([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
-The hub registers the fork activity recorder (below) and none of the
-others yet. `ReadChange(ctx, q, workspace, number)` reads
+The hub registers the fork activity recorder (below) and the component's
+own stack linker (`StackLinker()`) and restacker (`Restacker()`), both the
+type `stacks` (below), and no session linker, landing evaluator or
+auto_land guard.
+
+The stack linker (`stack.go`, the type `stacks`) links each new version,
+at open and after, from the commit graph: of the other draft and open
+changes of the same workspace and target branch, whose head is not the
+new head, it keeps those whose head is a proper ancestor of the new head
+(`IsAncestor`, asked of the target's repository, which holds every
+version head of its changes under their version refs, a fork's too), and
+takes the one with the fewest commits to the new head (`CommitsBetween`),
+the lowest number on a tie. It stores the link through `SetDependsOn` when
+it differs and, for a link, moves the version's base to that change's head
+through `SetBase`, so that the stats, paths and patch id count only the
+change's own commits; with none below, it clears the link and the version
+keeps the merge base with the target branch that measuring it found. The
+`depends_on` an open names is the link of version 1 instead (later
+versions are linked from the commit graph); `SetDependsOn` (for `PATCH`)
+links to the number given the same way, or, for `null`, clears the link
+and moves the base to the merge base of the head and the target branch's
+head (kept while the target branch is missing), then schedules the
+change's mergeability check; the link the change already has writes
+nothing. An explicit link is checked first by `checkDependency`, one
+function for both: a number that names no change of the workspace, the
+change itself, a change into another target branch, one neither draft nor
+open, or one whose chain of `depends_on` links, walked down, reaches the
+change is `400 invalid_dependency`, which rolls back the open's or the
+`PATCH`'s transaction. An accepted link moves the base to the lower
+change's head only when the head is built on it (`IsAncestor`); otherwise
+the base stays and `linkTo` calls `pendRestack` with `TriggerManual`
+(`manual`). After every link it stores (`LinkVersion` and
+`SetDependsOn` alike), `recomputeDepth` counts the depth of the change
+(`depthOf`: the changes in its chain of `depends_on` links down to one
+with none, itself included) and of every draft or open change above it
+(`stackAbove`, each one more than the change it depends on), and sets
+`needs_restack` with `restack_reason` `stack_too_deep` through
+`SetNeedsRestack` on each one deeper than `Deps.MaxStackDepth` (from
+`[changes].max_stack_depth`, `DefaultMaxStackDepth` 20 when zero), and
+clears both on a change so flagged that is back within the limit
+(`unflagDeep`), which then, unless the change has a pending restack
+already, calls `pendRestack` with `TriggerVersion` when the change is
+`behind`: `sitsOn` in the target's repository says its head and base do
+not sit on its `sitOn` commit. Depth never refuses a version or a link.
+
+Then `settle` clears `needs_restack` and `restack_reason`, and
+`restack_onto`, of a change flagged for `conflict` or `auto_restack_off`
+whose new head has the commit it must sit on (`sitOn`, then `IsAncestor`
+in the target's repository): the head of the change it now depends on,
+or, unlinked, its `restack_onto`, else the head of its target branch (a
+missing target leaves the flag); a change the version unlinked is cleared
+without one, since it has no change below it to sit on. Other flags are
+left. Every clearing of a `conflict` flag (`clearNeedsRestack`, in
+`conflict.go`: `settle`, a restack's version, an up-to-date restack) also
+sets `mergeable_last` from `conflict` to NULL, so that the next conflict
+of a restack, stored before a check computed the change's mergeability
+again, is a transition and writes `parley.change.conflict`.
+
+`renewRestack` then records the change's own pending restack again, when
+it has one and the version is not of kind `restack` (whose restack
+removes the record): `INSERT OR REPLACE … SELECT` gives it a higher
+`seq`, so a record the worker marked failed runs again on the change's
+own version, and ends either way (a change pushed onto its commit is up
+to date), after which its mergeability check is scheduled.
+
+Last, `LinkVersion` records a pending restack (`pendRestack`, trigger
+`version`) of each direct dependant of the change, one already on the new
+head too (its restack is up to date and clears a stale `conflict` or
+`auto_restack_off` flag), in the version's transaction, so that an error
+writing it undoes the version.
+`pendRestack(ctx, tx, ch, trigger, onto)` is the one writer of a pending
+restack: `INSERT OR REPLACE` into `change_restacks` (`seq` `INTEGER
+PRIMARY KEY AUTOINCREMENT`, `workspace_slug`, `number`, `trigger`, `onto`
+— the commit to sit on when the record names one, `''` otherwise — unique
+per change, deleted with it), so a newer record replaces the older with a
+higher `seq`, then wakes the worker. It records nothing for a change
+that is `tooDeep` (`depthOf` above the limit, counted rather than read
+from `restack_reason`, which a restack conflict replaces). When the
+workspace's `change.Workspace.AutoRestack` (the effective
+`changes.auto_restack`, filled by `changeWorkspaces` in
+`internal/hub/change.go`) is false, it records nothing either:
+`flagBehind` re-reads the change and sets `needs_restack` with
+`RestackAutoOff` (`auto_restack_off`) when it is `behind` the commit
+`onto` or its link names, so every caller (`LinkVersion`'s dependants,
+`linkTo`, `unflagDeep`, `OnLanded`, `RequestRestack`) gets the setting
+through it. `RunRestacks(ctx)`
+(`restack_queue.go`) is one goroutine: it runs a pass at the start, which
+runs what was pending when the hub stopped, and one each time it is
+woken; a pass reads, in a `Store.Tx` (so it waits for the transaction that
+recorded it), the lowest `seq` not marked failed in memory, runs it, and
+repeats until none is left. A restack that returns an error, or loses the
+swap 5 times, is logged as `the restack failed` (`workspace`, `number`,
+`error`; the hub's logger scrubs the error's text) and marked failed with
+its `seq`, so it stays pending and runs again when a newer record
+replaces it (a version of the change itself renews it) or at the next start (the map lives in the component, which
+a start builds anew); the pass goes on with the next record. Every
+failure of a restack is an error value; nothing in the worker ends the
+process.
+
+The restack (`restack.go`, `restack(ctx, job, caller, session)`) reads the
+change in a `Store.Tx` (gone, or neither draft nor open: the record is
+removed; for a job of the worker, `restackJob.background`, `skipsRestack`
+skips a change that is `tooDeep` now, and one whose job has the trigger
+`version` or `manual` and no `onto` that no longer has a draft or open
+`depends_on` change nor a `restack_onto`: the record is removed and its
+mergeability check scheduled) and the commit it must sit on (`sitOn`: the head of the
+`depends_on` change while that one is draft or open, else the record's
+`onto` or the change's `restack_onto`, else the head of the target branch
+in the target's repository). Outside any transaction it resolves the
+source branch in the source workspace's repository; when the head has the
+commit and the commit has the change's `base_sha` (`sitsOn`, two
+`IsAncestor`; with no base the first alone), the restack is up to date —
+a dependant whose base is the head of an abandoned change below has that
+head too, and is not: in a transaction,
+the record is removed, a `needs_restack` with reason `conflict` or
+`auto_restack_off` is cleared, `restack_onto` is cleared, and the
+mergeability check is scheduled when a record was removed or a flag
+cleared. Otherwise it replays `base_sha..head` onto the commit with
+`(*gitrepo.Repo).RebaseFrom(ctx, base, head, onto, at)`, which differs from
+`Rebase` only in replaying the commits after `base` instead of those
+`onto` lacks, so that the old commits of a change below that was
+force-pushed or landed are not replayed; its conflict report's `base_sha`
+is `base`. A conflict ends the restack (`restackConflicted`, in
+`conflict.go`): in one `Store.Tx` it reads the change and the commit to
+sit on again (a new head or a moved commit: the attempt starts again),
+removes the record, sets `needs_restack` with reason `conflict`
+(`SetNeedsRestack`) and then stores `mergeable` `conflict` with the report
+through `StoreMergeability` for the pair of the head it read and the
+commit it replayed onto, so that the `parley.change.conflict` that
+function writes on a transition carries `needs_restack` `true`. The report
+(`restackReport`) is the replay's, with `target_sha` that commit,
+`head_sha` the head, `base_sha` the change's base, and no landed changes,
+`landed_by` or change. No branch moves and nothing is recorded for the
+changes above. Otherwise (`swapRestack`), in one `Store.Tx`,
+it reads the change and the commit to sit on again (a new `head_sha` or
+`base_sha`, or a moved commit: the attempt starts again; a replay that
+returned the head it read is up to date, as above, with nothing moved),
+moves the source branch with `CompareAndSwapRef` on the
+head it read (`ErrRefMoved`, also for a ref a push has locked: the
+attempt starts again, at most 5 in all), records the version with
+`RecordVersion` (kind `restack`, by the zero `Caller` for the hub, the
+session of the change's current version with `VersionInput.SessionChecked`
+set, so the session linker is not asked again; without a session linker
+the session is dropped), clears `needs_restack` unless its reason is
+`stack_too_deep` and `restack_onto`, writes `parley.change.restack`
+(`EventRestack`, metadata `version`, `head_sha`, `onto_sha`, `trigger`)
+after the version's event, schedules the changes whose target is the
+moved branch (`ScheduleTargetMergeable`, since no ref-updated stage saw
+the move) and removes the record by its `seq`, so that a newer record
+written meanwhile stays. When that transaction fails after the swap, the
+branch is set back with a compare-and-swap. The version runs the stack
+linker like any other, which records the restacks of the changes above
+it, so a stack is restacked bottom first.
+
+The manual restack, `POST …/changes/:number/restack` (`restackRoute`,
+`restack_handler.go`, registered as a write route with `changes:write`
+and the need `read`, on the contributor table's pattern), follows the
+order of `modify` without using it, since its git work runs outside the
+transaction and a conflict is answered after its transaction committed:
+in one `Store.Tx`, `changeOf`, `AuthorizeModify`, the optional body
+(`decodeOptional`; `session_id` judged with the session linker's rule,
+`400 unknown_session`; `resolutions` not read), `workspaceUsable`, `409
+change_closed` for a closed change, and the commit to sit on (`sitOn`,
+with the `onto` of the change's pending record; `""` is `400
+target_not_found`). It then runs `restack` with a job of trigger
+`TriggerManual` (`manual`) that carries the `seq` of the change's pending
+record, so that the record is removed when the restack ends, and without
+`background`, so that a change too deep in its stack is restacked too
+(its flag stays) and the version guard is asked; the caller is the
+version's creator and the events' actor, and the body's session (else the
+replaced version's) is recorded with `SessionChecked`. Outcomes: restacked
+and up to date answer `200` `{status, change}` with the change re-read;
+a conflict `409 rebase_conflict` with `restackConflicted`'s report as
+`details`; a lost race `409 ref_moved` with the branch's head read again
+as `details.current_sha`; `gitrepo.ErrMergeCommit` `400
+merge_commits_unsupported`; any other error `500 internal`. The interface
+`VersionGuard` (`CheckVersion(ctx, caller, ch, base, head)`), registered
+with `(*Component).RegisterVersionGuard` (a collaborator of the instance,
+nil removes it), is asked in `restackOnce` once per attempt of a job that
+is not `background`, after the replay and before the hook before the
+swap; its error ends the restack unchanged, with nothing written. The hub
+registers no version guard.
+
+The stack route, `GET …/changes/:number/stack` (`stackRoute`,
+`stack_handler.go`, a read route with `changes:read` and the need `read`,
+on the contributor table's pattern), resolves its change with `changeOf`
+and answers `(*Component).Stack(ctx, ch)`: a `Stack` (`target_branch` and
+`[]StackSummary`, each the nine members of a summary with a
+`StackLanding` holding only `status`). `Stack` walks `depends_on` down from
+the change with `linkOf` (stopping where a change would repeat), then up
+level by level through `dependants` (draft and open changes only), each
+level sorted by number, which orders the changes above by depth from the
+bottom and then by number; it reads each change with `readChange` from
+the store. The binding of a token bound to a fork is read from the
+context (`confinedTo` on a request carrying it), so that only the changes
+whose source is the fork are listed, for the route and for the expander
+alike. `composeChanges` registers `Stack` as the expander of `stack`.
+
+`(*Component).OnLanded(ctx, workspace, number, landed)`
+(`restack_queue.go`) is the entry point for a change that landed as the
+commit `landed`: in a `Store.Tx` of its own, since the landing has ended,
+each direct dependant gets `depends_on` nil (`SetDependsOn`, its base
+kept, so that only its own commits are replayed), `restack_onto` the
+landed commit, its depth recomputed, then `pendRestack` with
+`TriggerLand` (`land`) and `onto` the landed commit; the changes further
+up keep their links. No landing calls it yet: the hub registers it nowhere,
+and its tests call it directly. `stacks.RequestRestack(ctx, tx, ch,
+trigger)`, the `Restacker` an abandon with `DependantsReparent` calls
+after it has set the dependant's `depends_on`, recomputes the depth of
+`ch` and the changes above it and calls `pendRestack(ctx, tx, ch,
+trigger, "")` in the abandon's transaction; `sitOn` then resolves to the
+head of the change `ch` now depends on, or the target head. The tests set the replay and a
+hook before the swap through `export_test.go` (`SetRestackSeams`), hold
+the worker (`HoldRestacks`) and run passes in the test's goroutine
+(`RestackPass`). `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
 The change's `dependants` are not stored: every read derives them as the
@@ -3674,8 +3894,10 @@ The setters (`setters.go`) store, in the caller's transaction, what other
 features compute, set `updated_at`, and answer the change-not-found error
 for an unknown change: `SetDependsOn`, `SetBase` (the base of the current
 version, with stats, touched paths and patch id measured again against it
-in the change's own repository, on the change and on the version; a base
-of `""` is none, measured from the empty tree),
+in the change's own repository, on the change and on the version, and the
+version's `patch_equivalent_to` set again to the latest earlier version
+with the new patch id, `null` for none; a base of `""` is none, measured
+from the empty tree),
 `SetMergeable` (the conflict report is kept only with `conflict`),
 `SetNeedsRestack` (the reason is dropped with `false`), `SetLanding`,
 `SetLanded` (state `landed`, the `landed` object and the landed-commit
@@ -3792,8 +4014,9 @@ with `SetDependsOn`, then hands each to the `Restacker`
 (`RequestRestack(ctx, tx, ch, trigger)`, declared in `lifecycle.go` and
 registered with `(*change.Component).RegisterRestacker`, which the stack
 feature implements) with the trigger `abandon` (`TriggerAbandon`) inside
-the transaction, whose error rolls the abandon back; with no restacker
-registered it calls `ScheduleMergeable` on each instead.
+the transaction, whose error rolls the abandon back (the hub registers
+`stacks`, above); with no restacker registered it calls
+`ScheduleMergeable` on each instead.
 
 The restore route's operation (`restore` in `lifecycle.go`) checks, in
 this order and before it writes anything: the change is abandoned (`409
@@ -3835,8 +4058,10 @@ ended check or the next due time. A check reads the change and its
 onto-commit in a `Store.Tx` of its own, which waits for the transaction
 that scheduled it: the head of the `depends_on` change while that one is
 draft or open, else the head of the target branch in the target
-workspace's repository. A change that is neither draft nor open is
-dropped; a missing target branch leaves `mergeable` `unknown` and runs
+workspace's repository. A change that is neither draft nor open, or that
+has a pending restack (`change_restacks`), is dropped, since its head
+still holds the old commits of the change below: the end of the restack
+schedules it again, or stores its conflict; a missing target branch leaves `mergeable` `unknown` and runs
 `reevaluateLanding` (draft: `blocked/draft`; else the structural reason
 `measureMove` finds, `target_not_found` here; else the landing evaluator
 with the current version; else ready). Otherwise the check runs
@@ -3846,7 +4071,13 @@ which writes no ref, index or work tree; an error or the deadline leaves
 `workspace` and `number`, and nothing retries it before the change's next
 trigger. The result is stored in a second `Store.Tx` only while the change
 is draft or open and its head and onto-commit are still those computed,
-else it is discarded and the change scheduled again. A check scheduled in
+else it is discarded and the change scheduled again. A change that holds
+the conflict a restack stored after the check was scheduled
+(`holdsRestackConflict`: `mergeable` `conflict`, `needs_restack` with
+reason `conflict`) keeps it: the result is discarded, since the trial
+replays the old commits of the change below that the change still
+carries and its report would replace the one of the change's own
+commits. A check scheduled in
 a transaction that is rolled back computes the change as it is.
 
 `(*change.Component).StoreMergeability(ctx, tx, workspace, number, head,
@@ -4035,8 +4266,9 @@ and `overlaps`, each served by the `change.Expander` (`func(ctx, Change)
 (any, error)`) registered on the instance with
 `(*change.Component).RegisterExpander(name, fn)` (nil removes; a name
 outside those four panics); a name without an expander adds no member, and
-the members follow the change's own in that order. No feature registers an
-expander yet.
+the members follow the change's own in that order. The hub registers
+`(*Component).Stack` for `stack`; no feature registers the other three
+yet.
 
 The diff (`diff.go`), `GET /workspaces/:slug/changes/:number/diff` with
 the same scope, need and contributor-table pattern, resolves its change

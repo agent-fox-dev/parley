@@ -45,3 +45,36 @@ func TestLoad_RefusesAMergeableDebounceThatIsNotADurationOfZeroOrMore(t *testing
 		})
 	}
 }
+
+func TestLoad_ReadsAMaxStackDepthOfAtLeastOneOrItsDefault(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, text string
+		// want is the value read; refused says the load fails instead.
+		want    int
+		refused bool
+	}{
+		{"absent", "", 20, false},
+		{"one", "[changes]\nmax_stack_depth = 1\n", 1, false},
+		{"twenty", "[changes]\nmax_stack_depth = 20\n", 20, false},
+		{"five hundred", "[changes]\nmax_stack_depth = 500\n", 500, false},
+		{"zero", "[changes]\nmax_stack_depth = 0\n", 0, true},
+		{"minus one", "[changes]\nmax_stack_depth = -1\n", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := config.Load(noEnv(), dirWith(t, tc.text))
+			switch {
+			case tc.refused:
+				if err == nil || !strings.Contains(err.Error(), "changes.max_stack_depth") {
+					t.Errorf("Load error = %v, want one naming changes.max_stack_depth", err)
+				}
+			case err != nil:
+				t.Fatal(err)
+			case cfg.Changes.MaxStackDepth != tc.want:
+				t.Errorf("MaxStackDepth = %d, want %d", cfg.Changes.MaxStackDepth, tc.want)
+			}
+		})
+	}
+}

@@ -1994,8 +1994,9 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its twelve commands open, read,
-edit, abandon, restore and wait for the changes of a workspace through the
+reads no credential and sends no request. Its fourteen commands open,
+read, edit, abandon, restore, restack and wait for the changes of a
+workspace, and read their stacks, through the
 [change routes](api.md#changes) of the hub. Each sends one request (`edit`
 with a label flag two, `wait` one per poll, see below) with the credential as
 `Authorization: Bearer` and `<slug>` (and the `<sha>` of `find`) as one
@@ -2009,12 +2010,14 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change show <slug> <number> [--include <list>]` | `GET …/changes/<number>` | `include`, as given |
 | `parley change find <slug> <sha>` | `GET …/changes/by-commit/<sha>` | |
 | `parley change versions <slug> <number>` | `GET …/changes/<number>/versions` | |
+| `parley change stack <slug> <number>` | `GET …/changes/<number>/stack` | |
 | `parley change diff <slug> <number> [--version <n>\|latest] [--against <n>] [--path <glob>]... [--patch \| --name-only]` | `GET …/changes/<number>/diff` | `version`, `against`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
 | `parley change edit <slug> <number> [--title <t>] [--intent <i>\|@<file>\|-] [--label <l>]... [--remove-label <l>]... [--auto-land \| --no-auto-land] [--target <branch>]` | `PATCH …/changes/<number>` | the body below |
 | `parley change ready <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"open"}` |
 | `parley change draft <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"draft"}` |
 | `parley change abandon <slug> <number> [--reason <text>] [--dependants reparent\|abandon]` | `POST …/changes/<number>/abandon` | `reason` and `dependants`, as given; `{}` without a flag |
 | `parley change restore <slug> <number>` | `POST …/changes/<number>/restore` | no body |
+| `parley change restack <slug> <number>` | `POST …/changes/<number>/restack` | the body `{}` |
 | `parley change wait <slug> <number> [--for landed\|ready\|mergeable] [--timeout <duration>] [--poll-interval <duration>]` | `GET …/changes/<number>`, once per poll | |
 
 A flag not given sends no parameter, so that the hub's default applies;
@@ -2052,7 +2055,14 @@ every result is printed (see [Output](#output)), with exit status `0`;
 unified diff text the hub answers (`Content-Type: text/x-diff`) as
 received; `--name-only` prints the JSON answer, whose files carry no
 `patch`. `list` prints the one page the hub answered and does not follow
-`next_cursor`.
+`next_cursor`. `stack` prints the stack the hub answers (see
+[The stack of a change](api.md#the-stack-of-a-change)): `target_branch` and
+the summaries of its changes, bottom first. `restack` asks the hub to
+rebase the change onto what it must sit on now (see
+[Manual restack](api.md#manual-restack)) and prints its answer,
+`{"status": "restacked" | "up_to_date", "change": …}`; a restack that
+conflicts is the refusal `409` `rebase_conflict`, whose envelope holds the
+conflict report in `details`.
 
 `parley change wait` reads the change at once, then again one
 `--poll-interval` (default `5s`) after each answer, until the change meets
@@ -2086,7 +2096,8 @@ stderr as received, nothing to stdout, exit status `1`.
 A refusal of the hub's (`404` `change_not_found`, `400`
 `source_not_related`, `409` `change_exists`, `400` `invalid_request`, `409`
 `change_closed`, `400` `intent_required`, `409` `has_dependants`, `409`
-`source_workspace_gone`, among others) is written to stderr as received, with nothing on stdout and exit
+`source_workspace_gone`, `409` `rebase_conflict` with its conflict report,
+among others) is written to stderr as received, with nothing on stdout and exit
 status `1`. `open` is sent once and never retried.
 
 **Client checks.** A missing `--source`, a wrong number of arguments, a

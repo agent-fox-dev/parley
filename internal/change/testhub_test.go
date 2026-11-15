@@ -594,6 +594,37 @@ func (w *world) changesOfDemo(t *testing.T) changesOfDemo {
 	return f
 }
 
+// stacked opens in demo a change from each of the new branches, in order,
+// each branch one commit adding <name>.txt on top of the branch before it
+// (the first on base), and returns them as opened.
+func (w *world) stacked(t *testing.T, names ...string) []change.Change {
+	t.Helper()
+	from := w.base
+	var out []change.Change
+	for _, n := range names {
+		from = commit(t, w.demo, n, from, n+"\n", map[string]string{n + ".txt": n + "\n"})
+		out = append(out, w.openBranch(t, n, nil))
+	}
+	return out
+}
+
+// versionEvent is the metadata of the last parley.change.version event of
+// the change number of demo after seq; it fails the test when there is
+// none.
+func (w *world) versionEvent(t *testing.T, seq, number int64) map[string]any {
+	t.Helper()
+	var out map[string]any
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.Type == change.EventVersion && e.ResourceID == strconv.FormatInt(number, 10) {
+			out = metadata(t, e)
+		}
+	}
+	if out == nil {
+		t.Fatalf("no parley.change.version of demo#%d after %d", number, seq)
+	}
+	return out
+}
+
 // landedCommits counts the landed-commit records.
 func (w *world) landedCommits(t *testing.T) int {
 	t.Helper()
@@ -635,30 +666,30 @@ func (w *world) settled(t *testing.T, number int64) change.Change {
 	}
 }
 
-// quiet waits until no mergeability check is waiting or running, so that
-// the worker writes nothing until the next trigger; it returns at once
-// while hold keeps the checks from starting.
+// quiet waits until the restack worker has nothing to run and no
+// mergeability check is waiting or running, so that the workers write
+// nothing until the next trigger; it does not wait for the restacks while
+// holdRestacks holds them, or for the checks while hold keeps them from
+// starting. The restacks are asked first, since they schedule checks.
 func (w *world) quiet(t *testing.T) {
 	t.Helper()
-	if w.held {
-		return
-	}
-	for deadline := time.Now().Add(20 * time.Second); !change.MergeableQuiet(w.changes); time.Sleep(5 * time.Millisecond) {
+	for deadline := time.Now().Add(20 * time.Second); !change.RestacksQuiet(w.changes) || !(w.held || change.MergeableQuiet(w.changes)); time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatal("the mergeability checks did not end")
+			t.Fatal("the restacks and the mergeability checks did not end")
 		}
 	}
 }
 
 // hold keeps every mergeability check from starting until the test ends,
-// so that mergeable stays unknown after a trigger and nothing else is
-// written.
-func (w *world) hold(t *testing.T) {
+// or until the function it returns lets them start, so that mergeable
+// stays unknown after a trigger and nothing else is written.
+func (w *world) hold(t *testing.T) (release func()) {
 	t.Helper()
 	g := newGate()
 	t.Cleanup(g.release)
 	change.SetMergeableSeams(w.changes, change.MergeableSeams{Gate: g.pass})
 	w.held = true
+	return func() { g.release(); w.held = false }
 }
 
 // trigger schedules a mergeability check of the change number of demo.
@@ -667,4 +698,166 @@ func (w *world) trigger(t *testing.T, number int64) {
 	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
 		return w.changes.ScheduleMergeable(ctx, tx, "demo", number)
 	})
+}
+
+// holdRestacks keeps the restack worker from running any pending restack
+// until the test ends, so that the test runs them with runPending.
+func (w *world) holdRestacks(t *testing.T) {
+	t.Helper()
+	change.HoldRestacks(w.changes)
+}
+
+// runPending runs the pending restacks in the test's goroutine, those they
+// record too, until none is left that has not failed, then waits for the
+// mergeability checks they scheduled.
+func (w *world) runPending(t *testing.T) {
+	t.Helper()
+	change.RestackPass(context.Background(), w.changes)
+	w.quiet(t)
+}
+
+// pending are the numbers of the changes of demo with a pending restack,
+// in the order the restacks were recorded.
+func (w *world) pending(t *testing.T) []int64 {
+	t.Helper()
+	out, err := w.Store.Main().Query(`SELECT number FROM change_restacks WHERE workspace_slug = 'demo' ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	numbers := []int64{}
+	for out.Next() {
+		var n int64
+		if err := out.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		numbers = append(numbers, n)
+	}
+	return numbers
+}
+
+// head is the commit the branch of demo is at.
+func (w *world) head(t *testing.T, branch string) string {
+	t.Helper()
+	return gitrepotest.Refs(t, w.demo, "refs/heads/")[branch]
+}
+
+// amend replaces the tip commit of the branch of demo by one on the same
+// parent that sets files, records it as the next version of the branch's
+// change, pushed by the owner, and returns it.
+func (w *world) amend(t *testing.T, branch string, files map[string]string) string {
+	t.Helper()
+	head := commit(t, w.demo, branch, gitrepotest.Git(t, w.demo, "rev-parse", branch+"^"), branch+" amended\n", files)
+	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: branch, Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
+	return head
+}
+
+// land moves main of demo past a commit of its own to one that sets files,
+// as the landing of the change number with those files would, marks the
+// change landed as that commit through the store, and returns the commit.
+func (w *world) land(t *testing.T, number int64, files map[string]string) string {
+	t.Helper()
+	moved := commit(t, w.demo, "main", w.head(t, "main"), "main moved\n", map[string]string{"main.txt": strconv.FormatInt(number, 10) + "\n"})
+	landed := commit(t, w.demo, "main", moved, "landed\n", files)
+	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetLanded(ctx, tx, "demo", number, change.Landed{SHA: landed, At: time.Now(), By: change.Actor{ActorType: change.ActorSystem}, LandID: "l" + strconv.FormatInt(number, 10)})
+	})
+	return landed
+}
+
+// subjects are the subjects of the commits of demo after base up to head,
+// oldest first.
+func (w *world) subjects(t *testing.T, base, head string) []string {
+	t.Helper()
+	out := gitrepotest.Git(t, w.demo, "log", "--reverse", "--format=%s", base+".."+head)
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+// restackEvents are the parley.change.restack events after seq, by the
+// number of their change.
+func (w *world) restackEvents(t *testing.T, seq int64) (numbers []string, meta []map[string]any) {
+	t.Helper()
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.Type == change.EventRestack {
+			numbers, meta = append(numbers, e.ResourceID), append(meta, metadata(t, e))
+		}
+	}
+	return numbers, meta
+}
+
+// failFor is a replay that fails, as a git command that exits with an
+// error other than a conflict, for the head while fails reports true (nil:
+// always), with the words in its error's text, and replays any other head
+// as the hub does.
+func failFor(head string, fails func() bool, words ...string) func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time) (string, *gitrepo.ConflictReport, error) {
+	return func(ctx context.Context, repo *gitrepo.Repo, base, h, onto string, at time.Time) (string, *gitrepo.ConflictReport, error) {
+		if h == head && (fails == nil || fails()) {
+			return "", nil, fmt.Errorf("git merge-tree: exit status 128: fatal: %s", strings.Join(append([]string{"bad object"}, words...), " "))
+		}
+		return repo.RebaseFrom(ctx, base, h, onto, at)
+	}
+}
+
+// restack sends the manual restack of the change number of demo with the
+// credential and the body (nil for none), and returns the status and the
+// decoded answer.
+func (w *world) restack(t *testing.T, number int64, credential string, body any) (int, map[string]any) {
+	t.Helper()
+	return w.send(t, http.MethodPost, "/workspaces/demo/changes/"+strconv.FormatInt(number, 10)+"/restack", credential, body)
+}
+
+// versionGuard is a version guard that records every call, with the head
+// the change's source branch in dir was at then, and answers refuse.
+type versionGuard struct {
+	dir    string
+	refuse error
+
+	mu    sync.Mutex
+	calls []versionCall
+}
+
+// versionCall is one call of a versionGuard.
+type versionCall struct {
+	caller               change.Caller
+	base, head, branchAt string
+}
+
+func (g *versionGuard) CheckVersion(_ context.Context, caller change.Caller, ch change.Change, base, head string) error {
+	at, _ := gitrepotest.Run(g.dir, "", "rev-parse", "refs/heads/"+ch.Source.Branch)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls = append(g.calls, versionCall{caller, base, head, strings.TrimSpace(at)})
+	return g.refuse
+}
+
+func (g *versionGuard) called() []versionCall {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.calls)
+}
+
+// guard registers a version guard of demo that answers refuse until the
+// test ends.
+func (w *world) guard(t *testing.T, refuse error) *versionGuard {
+	t.Helper()
+	g := &versionGuard{dir: w.demo, refuse: refuse}
+	w.changes.RegisterVersionGuard(g)
+	t.Cleanup(func() { w.changes.RegisterVersionGuard(nil) })
+	return g
+}
+
+// changeEventsOf are the events of the change number of demo written after
+// seq, of every type.
+func (w *world) changeEventsOf(t *testing.T, seq, number int64) []event.Record {
+	t.Helper()
+	var out []event.Record
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.ResourceType == "change" && e.ResourceID == strconv.FormatInt(number, 10) {
+			out = append(out, e)
+		}
+	}
+	return out
 }

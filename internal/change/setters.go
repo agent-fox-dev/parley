@@ -20,7 +20,9 @@ func (c *Component) SetDependsOn(ctx context.Context, tx *sql.Tx, workspace stri
 
 // SetBase makes base the base of the change's current version and
 // measures the version against it again: its base_sha, stats, touched
-// paths and patch id, on the change and on the version. The measuring runs
+// paths and patch id, on the change and on the version, and the latest
+// earlier version whose patch id it now has, as its patch_equivalent_to
+// (none when there is none). The measuring runs
 // in the change's own repository, which holds the head under its version
 // ref, also for a fork's change, and the new base, such as the head of the
 // change it now depends on or of the branch it now targets. A base of ""

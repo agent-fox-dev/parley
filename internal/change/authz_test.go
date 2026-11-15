@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -29,6 +30,7 @@ var modifyRoutes = []modifyRoute{
 	{"edit", http.MethodPatch, "", map[string]any{"labels": []string{"x"}}},
 	{"abandon", http.MethodPost, "/abandon", nil},
 	{"restore", http.MethodPost, "/restore", nil},
+	{"restack", http.MethodPost, "/restack", nil},
 }
 
 // call sends the route on the change number (as the path names it) of the
@@ -65,6 +67,36 @@ func newMiaWorldWith(t *testing.T, cfg hubtest.Config) *miaWorld {
 	m.t1 = m.addFork(t, "demo--t1", "main", nil, nil)
 	m.set(t, "demo--t1", "owner_id", m.mia)
 	return m
+}
+
+// untouched moves main of demo on, so that a restack would move each
+// change opened on the base, and returns a check that the changes numbered
+// (as paths name them) still read as they do now, that no branch of demo or
+// of demo--t1 moved, and that no event of a change was written since.
+func (m *miaWorld) untouched(t *testing.T, numbers ...string) func(t *testing.T, what string) {
+	t.Helper()
+	commit(t, m.demo, "main", m.head(t, "main"), "main moved\n", map[string]string{"main.txt": "moved\n"})
+	state := func(t *testing.T) string {
+		t.Helper()
+		out := gitrepotest.Git(t, m.demo, "for-each-ref", "refs/heads/") + "\n" + gitrepotest.Git(t, m.t1, "for-each-ref", "refs/heads/")
+		for _, n := range numbers {
+			_, _, raw := m.get(t, "/workspaces/demo/changes/"+n, m.ownerKey)
+			out += "\n" + string(raw)
+		}
+		return out
+	}
+	before, seq := state(t), m.seq(t)
+	return func(t *testing.T, what string) {
+		t.Helper()
+		if after := state(t); after != before {
+			t.Errorf("the refused %s changed a change or a branch:\n%s\nwas\n%s", what, after, before)
+		}
+		for _, e := range m.eventsAfter(t, seq) {
+			if strings.HasPrefix(e.Type, "parley.change.") {
+				t.Errorf("the refused %s wrote %s", what, e.Type)
+			}
+		}
+	}
 }
 
 // caller is mia using an API key of hers.
@@ -111,20 +143,12 @@ func TestModify_RefusesAReaderWhoIsNeitherTheAuthorNorAWriter(t *testing.T) {
 	number := m.openAsMia(t, "task")
 	for _, r := range modifyRoutes {
 		t.Run(r.name, func(t *testing.T) {
-			_, _, before := m.get(t, "/workspaces/demo/changes/"+number, m.ownerKey)
-			seq := m.seq(t)
+			untouched := m.untouched(t, number)
 			status, out, _ := r.call(t, m.world, "demo", number, m.noaKey)
 			if status != http.StatusForbidden || errorType(out) != "forbidden" {
 				t.Errorf("%s by noa = %d %v, want 403 forbidden", r.name, status, out)
 			}
-			if _, _, after := m.get(t, "/workspaces/demo/changes/"+number, m.ownerKey); !bytes.Equal(after, before) {
-				t.Errorf("the refused %s changed the change:\n%s\nwas\n%s", r.name, after, before)
-			}
-			for _, e := range m.eventsAfter(t, seq) {
-				if strings.HasPrefix(e.Type, "parley.change.") {
-					t.Errorf("the refused %s wrote %s", r.name, e.Type)
-				}
-			}
+			untouched(t, r.name)
 		})
 	}
 }
@@ -134,6 +158,7 @@ func TestModify_RefusesATokenWithoutChangesWriteAlikeOnEverySlug(t *testing.T) {
 	m := newMiaWorld(t)
 	number := m.openAsMia(t, "task")
 	readPAT, _ := m.patFor(t, []string{"changes:read"}, nil)
+	untouched := m.untouched(t, number)
 	for _, r := range modifyRoutes {
 		status, out, onDemo := r.call(t, m.world, "demo", number, readPAT)
 		_, _, onNothing := r.call(t, m.world, "nope", number, readPAT)
@@ -144,6 +169,7 @@ func TestModify_RefusesATokenWithoutChangesWriteAlikeOnEverySlug(t *testing.T) {
 			t.Errorf("%s on demo answered %s, on a missing workspace %s", r.name, onDemo, onNothing)
 		}
 	}
+	untouched(t, "requests without changes:write")
 }
 
 // demo#1 is mia's from demo--t1, demo#2 the owner's from a branch of demo.
@@ -155,6 +181,7 @@ func TestModify_AnswersChangeNotFoundAlikeForEveryChangeOutOfReach(t *testing.T)
 	fromDemo := strconv.FormatInt(m.openBranch(t, "feat", nil).Number, 10)
 	bound := m.IssuePAT(t, identity.PATSpec{UserID: m.mia, Permissions: []string{"changes:read", "changes:write"},
 		Workspace: "demo--t1", CreatedAt: time.Now().UTC()})
+	untouched := m.untouched(t, fromFork, fromDemo)
 	for _, c := range []struct{ name, number, credential string }{
 		{"a number with no change", "999", m.ownerKey},
 		{"a number that is not decimal", "abc", m.ownerKey},
@@ -167,6 +194,7 @@ func TestModify_AnswersChangeNotFoundAlikeForEveryChangeOutOfReach(t *testing.T)
 			}
 		}
 	}
+	untouched(t, "requests for changes out of reach")
 	if status, out, _ := modifyRoutes[0].call(t, m.world, "demo", fromFork, bound); status != http.StatusOK {
 		t.Errorf("an edit by the fork-bound token of a change from its fork = %d %v, want 200", status, out)
 	}
@@ -177,6 +205,7 @@ func TestModify_HidesTheWorkspaceFromACallerWhoCannotReadIt(t *testing.T) {
 	m := newMiaWorld(t)
 	number := m.openAsMia(t, "task")
 	outsiderKey := m.IssueKey(t, m.CreateUser(t, "outsider"))
+	untouched := m.untouched(t, number)
 	hidden := func(credential string) {
 		t.Helper()
 		for _, r := range modifyRoutes {
@@ -186,6 +215,7 @@ func TestModify_HidesTheWorkspaceFromACallerWhoCannotReadIt(t *testing.T) {
 				t.Errorf("%s = %d %s, want 404 not_found as on a missing workspace: %s", r.name, status, onDemo, onNothing)
 			}
 		}
+		untouched(t, "requests of a caller who cannot read the workspace")
 	}
 	hidden(outsiderKey)
 	if status, out := m.send(t, http.MethodDelete, "/orgs/"+m.org+"/members/"+m.mia, m.Token, nil); status != http.StatusNoContent {
