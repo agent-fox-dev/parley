@@ -115,6 +115,74 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	return &v, nil
 }
 
+// RecordRacedVersion records in tx the move in of the source branch of the
+// draft or open change number of the workspace by a write whose
+// ref-updated stage found no change, the change being opened after it
+// moved the branch, and returns the number of the version the move is:
+//
+//   - the current version, when the change already has in.Head: the open
+//     that followed the branch (OpenInput.AfterMove) recorded it, of kind
+//     ref by the hub with no session, and it becomes the move's, of
+//     in.Kind by in.Caller in in.SessionID, its session linked; the event
+//     written for it then is left as it was;
+//   - the current version, with nothing recorded, when the branch is no
+//     longer at in.Head: a later write moved it, and its version stands;
+//   - otherwise the next version, as RecordVersion records it.
+//
+// A session the session linker refuses is 400 unknown_session, before
+// anything is written. in.Workspace and in.Branch name the change's source.
+func (c *Component) RecordRacedVersion(ctx context.Context, tx *sql.Tx, workspace string, number int64, in VersionInput) (int64, error) {
+	ch, err := readChange(ctx, tx, workspace, number)
+	if err != nil {
+		return 0, err
+	}
+	if ch.HeadSHA != in.Head {
+		repo, err := c.deps.Repos(ctx, ch.Source.WorkspaceSlug)
+		if err != nil {
+			return 0, err
+		}
+		head, found, err := repo.ResolveBranch(ctx, ch.Source.Branch)
+		if err != nil || !found || head != in.Head {
+			return ch.Version, err
+		}
+		v, err := c.RecordVersion(ctx, tx, in)
+		if err != nil || v == nil {
+			return ch.Version, err
+		}
+		return v.Number, nil
+	}
+	current, err := readVersionsAfter(ctx, tx, workspace, number, ch.Version-1, 1)
+	if err != nil || len(current) == 0 {
+		return ch.Version, err
+	}
+	v := current[0]
+	if v.Kind != KindRef || v.CreatedBy.ActorType != ActorSystem || v.SessionID != nil {
+		return v.Number, nil
+	}
+	co := c.collaborators()
+	if in.SessionID != nil {
+		if v.SessionID, err = c.session(ctx, co, OpenInput{Workspace: workspace, SessionID: in.SessionID, Caller: in.Caller}, Workspace{}); err != nil {
+			return 0, err
+		}
+	}
+	if v.CreatedBy, err = c.actorOf(ctx, tx, in.Caller); err != nil {
+		return 0, err
+	}
+	v.Kind, v.Credential = in.Kind, in.Caller.Credential
+	if err := attributeVersion(ctx, tx, workspace, number, v); err != nil {
+		return 0, err
+	}
+	if v.SessionID != nil {
+		if err := co.sessions.Record(ctx, tx, *v.SessionID, workspace, number, v.Number); err != nil {
+			return 0, err
+		}
+		if err := update(ctx, tx, workspace, number, c.now(), `session_id = ?`, v.SessionID); err != nil {
+			return 0, err
+		}
+	}
+	return v.Number, nil
+}
+
 // measureMove measures head, the new head of the change ch's source branch,
 // as Open measures version 1: its base, stats, touched paths and patch id,
 // read in the source's repository, which for a fork reads its parent's

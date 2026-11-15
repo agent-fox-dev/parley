@@ -17,16 +17,21 @@ import (
 
 // ChangeService is what the mapping of a push asks of the changes: the
 // lookup of a branch's change, the open of a change, and the version of a
-// change whose open another push won. The ordinary version of a push is not
-// among them: the change feature records it inside the ref update, and the
-// mapping reads it from the ref writer's result.
+// change opened after the push moved its branch, by another push that won
+// the race to open it. The ordinary version of a push is not among them:
+// the change feature records it inside the ref update, and the mapping
+// reads it from the ref writer's result.
 type ChangeService interface {
 	// OpenChangeOfBranch returns the draft or open change whose source is
 	// the branch of the workspace source, or nil when it has none.
 	OpenChangeOfBranch(ctx context.Context, source, branch string) (*BranchChange, error)
-	// RecordPushVersion records a version of kind push of the change the
-	// request names, at its head. It returns nil when the head already is
-	// the change's current version, which records nothing.
+	// RecordPushVersion returns the version of the change the request
+	// names that the push is, the change having been opened after the push
+	// moved its branch: the change's current version when it has the
+	// pushed head, then made the push's, of kind push by its caller, or
+	// when a later write moved the branch on; otherwise a new version of
+	// kind push at the head. It refuses with a *ChangeNotOpenError when the
+	// change is no longer draft or open.
 	RecordPushVersion(ctx context.Context, req VersionRequest) (*pushrule.Version, error)
 	// OpenChange opens a change from the request's source. It refuses
 	// with a *ChangeExistsError when the source already has a draft or
@@ -70,12 +75,14 @@ type OpenRequest struct {
 	Caller    PushCaller
 }
 
-// OpenedChange is the change an open made: its workspace, its number, and
-// whether it was opened as a draft.
+// OpenedChange is the change an open made: its workspace, its number,
+// whether it was opened as a draft, and whether it was abandoned at once,
+// its branch deleted after the push moved it.
 type OpenedChange struct {
 	Workspace string
 	Number    int
 	Draft     bool
+	Abandoned bool
 }
 
 // ChangeExistsError refuses the open of a change whose source already has
@@ -88,6 +95,19 @@ type ChangeExistsError struct {
 
 func (e *ChangeExistsError) Error() string {
 	return fmt.Sprintf("the source is already the source of change %s#%d", e.Workspace, e.Number)
+}
+
+// ChangeNotOpenError refuses the version of a push on the change Number of
+// Workspace, which left draft and open for State since the push lost the
+// race to open it.
+type ChangeNotOpenError struct {
+	Workspace string
+	Number    int
+	State     string
+}
+
+func (e *ChangeNotOpenError) Error() string {
+	return fmt.Sprintf("change %s#%d is %s", e.Workspace, e.Number, e.State)
 }
 
 // OutcomeKind is what the mapping made of a pushed branch.
@@ -191,10 +211,10 @@ func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts Push
 	if err != nil {
 		return m.failed(ctx, in, branch, err)
 	}
-	// A change with no version reported already has the pushed head as
-	// its current version, a move that records nothing.
+	// A change for which the ref writer reported no version was opened
+	// after this push moved the branch, by a push that won the race.
 	if found != nil {
-		return Outcome{Branch: branch}
+		return m.recordRaced(ctx, in, branch, u, found.Workspace, found.Number)
 	}
 	switch {
 	case u.Direct:
@@ -220,28 +240,43 @@ func (m *ChangeMapper) mapBranch(ctx context.Context, in MappingInput, opts Push
 	case errors.As(err, &exists):
 		// Another push opened the change first: this push is a version of
 		// it, as it would have been had that push finished first.
-		v, err := m.changes.RecordPushVersion(ctx, VersionRequest{
-			Workspace: exists.Workspace,
-			Number:    exists.Number,
-			Source:    source,
-			Branch:    branch,
-			Head:      u.After,
-			Caller:    in.Caller,
-			SessionID: in.SessionID,
-		})
-		if err != nil {
-			return m.failed(ctx, in, branch, err)
-		}
-		if v == nil {
-			return Outcome{Branch: branch}
-		}
-		return versionOutcome(branch, v)
+		return m.recordRaced(ctx, in, branch, u, exists.Workspace, exists.Number)
 	case errors.As(err, &refusal) && refusal.Status() < http.StatusInternalServerError:
 		return Outcome{Branch: branch, Kind: OutcomeWarning, Reason: refusalReason(refusal, target)}
 	case err != nil:
 		return m.failed(ctx, in, branch, err)
 	}
+	if opened.Abandoned {
+		return Outcome{Branch: branch, Kind: OutcomeWarning,
+			Reason: fmt.Sprintf("branch was deleted, change %s#%d abandoned", opened.Workspace, opened.Number)}
+	}
 	return Outcome{Branch: branch, Kind: OutcomeOpened, Workspace: opened.Workspace, Number: opened.Number, Version: 1, Draft: opened.Draft}
+}
+
+// recordRaced is the outcome of the update u of branch, whose change, the
+// change number of workspace, another push opened after u moved the
+// branch: the version the push is, or a warning when the change left draft
+// and open since.
+func (m *ChangeMapper) recordRaced(ctx context.Context, in MappingInput, branch string, u pushrule.UpdateResult, workspace string, number int) Outcome {
+	v, err := m.changes.RecordPushVersion(ctx, VersionRequest{
+		Workspace: workspace,
+		Number:    number,
+		Source:    in.Workspace.Slug,
+		Branch:    branch,
+		Head:      u.After,
+		Caller:    in.Caller,
+		SessionID: in.SessionID,
+	})
+	var notOpen *ChangeNotOpenError
+	switch {
+	case errors.As(err, &notOpen):
+		return Outcome{Branch: branch, Kind: OutcomeWarning, Reason: notOpen.Error()}
+	case err != nil:
+		return m.failed(ctx, in, branch, err)
+	case v == nil:
+		return Outcome{Branch: branch}
+	}
+	return versionOutcome(branch, v)
 }
 
 // openRequest is the open of the change of branch at head: in the pushed

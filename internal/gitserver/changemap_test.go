@@ -170,18 +170,19 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 	t.Parallel()
 	const s = "3f2c8a1e-5b7d-4c9e-8f10-2a3b4c5d6e7f"
 	type mapCase struct {
-		name     string
-		ws       workspace.Workspace
-		caller   gitserver.PushCaller
-		options  []string
-		session  *string
-		updates  []pushrule.UpdateResult
-		found    map[string]*gitserver.BranchChange
-		openErr  error
-		recorded *pushrule.Version
-		fail     map[string]any
-		calls    []string
-		outcomes []gitserver.Outcome
+		name      string
+		ws        workspace.Workspace
+		caller    gitserver.PushCaller
+		options   []string
+		session   *string
+		updates   []pushrule.UpdateResult
+		found     map[string]*gitserver.BranchChange
+		openErr   error
+		recorded  *pushrule.Version
+		abandoned bool
+		fail      map[string]any
+		calls     []string
+		outcomes  []gitserver.Outcome
 	}
 	openedFor := func(branch string) gitserver.Outcome {
 		return gitserver.Outcome{Branch: branch, Kind: gitserver.OutcomeOpened, Workspace: "demo", Number: 1, Version: 1}
@@ -256,10 +257,13 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 			updates: []pushrule.UpdateResult{direct("refs/heads/main"), created("refs/heads/b")},
 			calls:   []string{"find demo:main", "find demo:b", "open demo:b@c1 -"}, outcomes: []gitserver.Outcome{directWarning, opened}},
 		// A draft or open change for which the ref writer reported no
-		// version already has the pushed head.
-		mapCase{name: "a change whose head is already the pushed one", ws: repoWS, caller: apiKey, options: []string{"parley.change"},
+		// version was opened after the push moved the branch: the push is
+		// told the change's version, whatever it asked.
+		mapCase{name: "a change opened after the push moved its branch", ws: repoWS, caller: apiKey,
 			updates: []pushrule.UpdateResult{updated("refs/heads/b")}, found: map[string]*gitserver.BranchChange{"b": {Workspace: "demo", Number: 4}},
-			calls: []string{"find demo:b"}, outcomes: []gitserver.Outcome{none("b")}},
+			recorded: &pushrule.Version{WorkspaceSlug: "demo", Number: 4, Version: 2},
+			calls:    []string{"find demo:b", "record demo#4 from demo:b@c1 -"},
+			outcomes: []gitserver.Outcome{{Branch: "b", Kind: gitserver.OutcomeVersion, Workspace: "demo", Number: 4, Version: 2}}},
 		// An open another push won becomes a version of its change.
 		mapCase{name: "a lost race to open", ws: repoWS, caller: apiKey, options: []string{"parley.change"},
 			updates: []pushrule.UpdateResult{created("refs/heads/b")}, openErr: &gitserver.ChangeExistsError{Workspace: "demo", Number: 9},
@@ -268,8 +272,20 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 			outcomes: []gitserver.Outcome{{Branch: "b", Kind: gitserver.OutcomeVersion, Workspace: "demo", Number: 9, Version: 2}}},
 		mapCase{name: "a lost race to a change that already has the head", ws: repoWS, caller: apiKey, options: []string{"parley.change"},
 			updates: []pushrule.UpdateResult{created("refs/heads/b")}, openErr: &gitserver.ChangeExistsError{Workspace: "demo", Number: 9},
+			recorded: &pushrule.Version{WorkspaceSlug: "demo", Number: 9, Version: 1},
 			calls:    []string{"find demo:b", "open demo:b@c1 -", "record demo#9 from demo:b@c1 -"},
-			outcomes: []gitserver.Outcome{none("b")}},
+			outcomes: []gitserver.Outcome{{Branch: "b", Kind: gitserver.OutcomeVersion, Workspace: "demo", Number: 9, Version: 1}}},
+		// A change that left draft and open since the push lost the race to
+		// open it, and one an open abandoned at once, are warnings.
+		mapCase{name: "a lost race to a change that left open", ws: repoWS, caller: apiKey, options: []string{"parley.change"},
+			updates: []pushrule.UpdateResult{created("refs/heads/b")}, openErr: &gitserver.ChangeExistsError{Workspace: "demo", Number: 9},
+			fail:     map[string]any{"record b": &gitserver.ChangeNotOpenError{Workspace: "demo", Number: 9, State: "landed"}},
+			calls:    []string{"find demo:b", "open demo:b@c1 -", "record demo#9 from demo:b@c1 -"},
+			outcomes: []gitserver.Outcome{warning("b", "change demo#9 is landed")}},
+		mapCase{name: "an open whose branch was deleted since", ws: repoWS, caller: apiKey, options: []string{"parley.change"},
+			updates: []pushrule.UpdateResult{created("refs/heads/b")}, abandoned: true,
+			calls:    []string{"find demo:b", "open demo:b@c1 -"},
+			outcomes: []gitserver.Outcome{warning("b", "branch was deleted, change demo#1 abandoned")}},
 		// The session of the push goes with every open and record.
 		mapCase{name: "the session of an open", ws: repoWS, caller: apiKey, options: []string{"parley.change", "parley.session=" + s}, session: ptr(s),
 			updates: []pushrule.UpdateResult{created("refs/heads/b")},
@@ -362,14 +378,18 @@ func TestChangeMapper_DecidesTheOutcomeOfEachBranch(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			fake := &changeFake{found: c.found, openErr: c.openErr, recorded: c.recorded, fail: c.fail, opened: gitserver.OpenedChange{Workspace: "demo", Number: 1}}
+			fake := &changeFake{found: c.found, openErr: c.openErr, recorded: c.recorded, fail: c.fail, opened: gitserver.OpenedChange{Workspace: "demo", Number: 1, Abandoned: c.abandoned}}
 			var lines []string
 			var log bytes.Buffer
 			got := gitserver.NewChangeMapper(fake, slog.New(slog.NewTextHandler(&log, nil))).Map(context.Background(), gitserver.MappingInput{
 				Workspace: c.ws, Caller: c.caller, Options: c.options, SessionID: c.session, Updates: c.updates,
 			}, func(l string) { lines = append(lines, l) })
 			for _, f := range c.fail {
-				if _, race := f.(*gitserver.ChangeExistsError); !race && !strings.Contains(log.String(), fmt.Sprint(f)) {
+				switch f.(type) {
+				case *gitserver.ChangeExistsError, *gitserver.ChangeNotOpenError:
+					continue
+				}
+				if !strings.Contains(log.String(), fmt.Sprint(f)) {
 					t.Errorf("the log lacks the failure %q:\n%s", f, log.String())
 				}
 			}
