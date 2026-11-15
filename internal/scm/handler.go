@@ -136,6 +136,9 @@ type Deps struct {
 	// ReadTimeout is how long a read may run, from the moment its route
 	// begins handling it; zero or less is DefaultReadTimeout.
 	ReadTimeout time.Duration
+	// Now is the clock the commits a write makes take their times from;
+	// nil is time.Now.
+	Now func() time.Time
 }
 
 // Component serves the read and write routes. Its zero value is ready to
@@ -179,12 +182,20 @@ func (c *Component) Bind(d Deps) {
 	if d.ReadTimeout <= 0 {
 		d.ReadTimeout = DefaultReadTimeout
 	}
+	if d.Now == nil {
+		d.Now = time.Now
+	}
 	c.deps = d
 }
 
-// Routes are the read and write routes, for the server's router.
+// Routes are the read and write routes, for the server's router. The
+// commit route's body limit is DefaultMaxCommitSize until LimitCommitBody
+// sets another.
 func (c *Component) Routes() []server.Route {
+	commit := c.writeRoute(http.MethodPost, commitsPattern, opCommit, c.createCommit)
+	commit.MaxBodySize = DefaultMaxCommitSize
 	return []server.Route{
+		commit,
 		c.writeRoute(http.MethodPost, "/refs", opRefCreate, c.createRef),
 		c.writeRoute(http.MethodPatch, "/refs/*name", opRefMove, c.moveRef),
 		c.writeRoute(http.MethodDelete, "/refs/*name", opRefDelete, c.deleteRef),

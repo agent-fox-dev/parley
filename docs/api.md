@@ -3175,8 +3175,8 @@ between pages; a cursor used with other query parameters is refused (see
 ## Source control writes
 
 The routes below change a workspace's repository without a clone: so far
-they are the three refs write routes. Every one of them behaves alike in
-what follows.
+they are the commit route and the three refs write routes. Every one of
+them behaves alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
 `git:write` for a PAT. It needs write access to the workspace (see
@@ -3216,8 +3216,8 @@ changes. An accepted write emits one `parley.git.push` event per ref, with
 ```
 
 Writes have no time limit. Each request a write route handles is reported
-once to the hub's request recorder with the route's op (`ref_create`,
-`ref_move`, `ref_delete`) and `ok` for a status below 400, `ref_moved` for
+once to the hub's request recorder with the route's op (`commit`,
+`ref_create`, `ref_move`, `ref_delete`) and `ok` for a status below 400, `ref_moved` for
 a `409` `ref_moved`, `refused` for a `403` of a push rule, `error`
 otherwise; a request the checks before the route refuse is not reported.
 
@@ -3229,6 +3229,72 @@ any name that does not begin with `refs/` and is read as
 (`403` `hub_owned_ref`); `HEAD` and every other namespace are `400`
 `invalid_request`. A commit id in a body or a query is a full
 40-character id.
+
+## `POST /api/v1/workspaces/{slug}/scm/commits`
+
+Makes one commit from a list of file operations, with no working copy,
+and moves one branch to it, or creates the branch there. The body:
+
+| Member | Meaning |
+|---|---|
+| `branch` | required: the branch to commit to, a branch name or a full name below `refs/heads/`, which `git check-ref-format` takes |
+| `expected_head_sha` | the full id of the commit the caller saw `branch` at; required when `branch` exists |
+| `base_ref` | a revision (a branch name, a tag name, a full ref name, a full or abbreviated commit id) naming the commit a new `branch` is created on; required when `branch` does not exist, ignored when it does |
+| `message` | required: the commit message, not empty |
+| `author` | `{"name": …, "email": …}`, both required, neither holding `<`, `>` or a line break; without it the author is the caller (the user's full name, else the username, and e-mail), and for the admin token the hub (`parley` `<parley@localhost>`) |
+| `operations` | the file operations, at most 1,000, applied in order, each to the tree the one before it left; may be empty or absent |
+| `allow_empty` | `true` to make a commit whose tree is its parent's; default `false` |
+
+An operation is one of:
+
+| `op` | Members | Effect |
+|---|---|---|
+| `put` | `path`, exactly one of `content` (UTF-8 text) and `content_base64`, optional `mode` (`100644`, the default, `100755` or `120000`) | writes the file, or replaces it, creating its parent directories; with `120000` the content is a symlink's target |
+| `delete` | `path` | removes the file; a directory left empty goes with it |
+| `move` | `from`, `to` | renames the file, keeping its content and mode |
+| `chmod` | `path`, `mode` (`100644` or `100755`) | changes the file's mode alone |
+
+A path is relative to the root of the repository: not empty, not starting
+with `/`, without an empty, `.`, `..` or `.git` segment (at any depth).
+
+The committer is the hub, `parley` `<parley@localhost>`; author and
+committer take the time of the request. The commit's parent is the head of
+`branch`, or for a new branch the commit `base_ref` names. The branch is
+moved, or created, by compare-and-swap against that parent, through the
+push rules, so of several requests with the same `expected_head_sha` one
+answers `201` and the others `409` `ref_moved`. A request that is refused
+moves no ref and emits no event; objects it wrote stay unreferenced for
+git's garbage collection.
+
+The checks run in this order: the body and the shape of every operation,
+before the repository is read, so a malformed request answers `400`
+whatever the branch's state; the parent; the operations against the tree;
+emptiness; then the push rules and the compare-and-swap.
+
+The body limit of this route is `[scm].max_commit_size`, 33554432 bytes
+(32 MiB) by default (see [configuration.md](configuration.md)), in place
+of `[server].max_body_size`: a larger body is `413` `payload_too_large`,
+before it is parsed.
+
+```json
+{"commit":{"sha":"6d2ec0406c25abdbdf0518833eff0667aecbff02","parents":["8792bc3d8b0e88fe7152443b9175ee4b05c54691"],"tree_sha":"474930f4d466d1c07e08b0986e3b5ca1556d21ac","author":{"name":"owner","email":"owner@example.com","time":"2026-11-15T11:11:44Z"},"committer":{"name":"parley","email":"parley@localhost","time":"2026-11-15T11:11:44Z"},"message":"m\n","change":null,"session_id":null,"stats":{"files_changed":1,"insertions":1,"deletions":0}},"branch":{"name":"refs/heads/work","kind":"branch","sha":"6d2ec0406c25abdbdf0518833eff0667aecbff02","protected":false,"tracking":false,"change":null},"change":null,"change_error":null}
+```
+
+`commit` is the commit object of `GET …/scm/commits/{sha}`, with `stats`;
+its `message` ends in a newline, as every message git writes does.
+`branch` is the ref object at the new commit. `change` and
+`change_error` are `null`.
+
+| Status | When |
+|---|---|
+| `201 Created` | the commit, the branch and the change, as above |
+| `400` `invalid_request` | no `branch`, or not a branch name; no `message`, or an empty one; an `author` without `name` or `email`; an `expected_head_sha` that is not a full id; more than 1,000 operations (`a commit takes at most 1000 operations, not 1001`); a malformed operation (`operation 0: op "copy" is none of put, delete, move and chmod`): an unknown or missing `op`, a bad path, a `put` with both or neither of `content` and `content_base64` or invalid base64, a mode the operation does not take, a missing member; a `branch` that does not exist and no `base_ref` |
+| `400` `invalid_operation` | an operation that does not apply to the tree the ones before it left: a `delete`, `move` or `chmod` of a missing path or a directory, a `move` onto a file or a directory, a `put` below a file or onto a directory, any operation on or below a submodule entry; `details.index` is the zero-based index of the first such operation |
+| `400` `empty_commit` | the operations leave the parent's tree as it is and `allow_empty` is not `true` (`the operations leave the tree as it is; set allow_empty to commit it anyway`) |
+| `403` | a push rule refuses the update, such as `protected_branch` |
+| `404` `ref_not_found` | `base_ref` names no commit |
+| `409` `ref_moved` | `branch` exists and `expected_head_sha` is absent or another commit, or the branch moved in between; `details.current_sha` is where it is |
+| `413` `payload_too_large` | the body is larger than `[scm].max_commit_size` |
 
 ## `POST /api/v1/workspaces/{slug}/scm/refs`
 

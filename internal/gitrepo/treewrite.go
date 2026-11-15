@@ -285,7 +285,7 @@ func (s *treeState) apply(op Operation) (string, error) {
 		if mode == "" {
 			mode = ModeFile
 		}
-		if !validPath(op.Path) || (mode != ModeFile && mode != ModeExecutable && mode != ModeSymlink) {
+		if !ValidPath(op.Path) || (mode != ModeFile && mode != ModeExecutable && mode != ModeSymlink) {
 			return op.Path, ErrInvalidOperation
 		}
 		if err := s.placeable(op.Path); err != nil {
@@ -296,7 +296,7 @@ func (s *treeState) apply(op Operation) (string, error) {
 		}
 		s.add(op.Path, &stagedFile{mode: mode, content: op.Content})
 	case OpDelete:
-		if !validPath(op.Path) {
+		if !ValidPath(op.Path) {
 			return op.Path, ErrInvalidOperation
 		}
 		if _, err := s.file(op.Path); err != nil {
@@ -304,7 +304,7 @@ func (s *treeState) apply(op Operation) (string, error) {
 		}
 		s.remove(op.Path)
 	case OpChmod:
-		if !validPath(op.Path) || (op.Mode != ModeFile && op.Mode != ModeExecutable) {
+		if !ValidPath(op.Path) || (op.Mode != ModeFile && op.Mode != ModeExecutable) {
 			return op.Path, ErrInvalidOperation
 		}
 		f, err := s.file(op.Path)
@@ -313,7 +313,7 @@ func (s *treeState) apply(op Operation) (string, error) {
 		}
 		f.mode = op.Mode
 	case OpMove:
-		if !validPath(op.From) || !validPath(op.To) {
+		if !ValidPath(op.From) || !ValidPath(op.To) {
 			return op.From, ErrInvalidOperation
 		}
 		f, err := s.file(op.From)
@@ -417,10 +417,10 @@ func parents(path string) func(yield func(string) bool) {
 	}
 }
 
-// validPath is whether path can name a file of a tree: not empty, not
+// ValidPath reports whether path can name a file of a tree: not empty, not
 // absolute, no empty, ".", ".." or ".git" segment, the last in any case
 // since git refuses it so on a file system that ignores case, and no NUL.
-func validPath(path string) bool {
+func ValidPath(path string) bool {
 	if path == "" || strings.ContainsRune(path, 0) {
 		return false
 	}

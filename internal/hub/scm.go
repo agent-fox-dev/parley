@@ -31,7 +31,10 @@ const scmHook = "scm"
 // push rule engine and the ref writer of the git server's part, so that a
 // write is decided and written exactly as a push of the same ref update.
 // Each read is bounded by [scm].read_timeout and a file by
-// [scm].max_file_size.
+// [scm].max_file_size; the body of a commit request by
+// [scm].max_commit_size, which the start hook sets as the commit route's
+// own body limit, in place of [server].max_body_size; the commits a write
+// makes take their times from the hub's clock.
 //
 // The change, commit-change and session lookups keep their defaults, which
 // name none: the hub has no change or session records to ask. The hub
@@ -42,10 +45,15 @@ const scmHook = "scm"
 func composeSCM(c *Composition) {
 	comp := &scm.Component{}
 	c.scm = comp
-	for _, r := range comp.Routes() {
+	first := len(c.routes)
+	routes := comp.Routes()
+	for _, r := range routes {
 		c.AddRoute(r)
 	}
 	c.AddStartHook(scmHook, func(_ context.Context, rt *Runtime) error {
+		// The configuration loads after the composition, and the start
+		// hooks run before the server installs the routes.
+		scm.LimitCommitBody(c.routes[first:first+len(routes)], rt.Config.SCM.MaxCommitSize)
 		git := gitFor(c.env)
 		db := rt.Store.Main()
 		d := scm.Deps{
@@ -76,6 +84,7 @@ func composeSCM(c *Composition) {
 			RefWriter:   c.refWriter,
 			ReadTimeout: rt.Config.SCM.ReadTimeout,
 			MaxFileSize: rt.Config.SCM.MaxFileSize,
+			Now:         rt.Now,
 		}
 		for _, adjust := range c.scmAdjusters {
 			adjust(&d)
