@@ -4,13 +4,20 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -92,8 +99,12 @@ func TestReceive_FailsAPushWhosePackIsLargerThanTheMaximumPushSize(t *testing.T)
 
 // The push's [git].timeout is 100 ms: an options stage that holds the push,
 // and a client that sends half its pack and then nothing, outlast it.
+//
+// Not parallel: it puts a git first on the PATH of the test process, which
+// notes the pid of every git index-pack and then becomes the real git, so
+// that the test can see the index-pack of the stalled push is gone.
 func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testing.T) {
-	t.Parallel()
+	pids := indexPackPIDs(t)
 	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
 		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = 100 * time.Millisecond })
 		c.Receiver().RegisterOptionsStage(limitStage{})
@@ -108,6 +119,7 @@ func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testi
 		{"a body that stops halfway through the pack", nil, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			_ = os.Remove(pids)
 			feat := w.commit(t, w.head, c.name)
 			cmds := []command{{zero, feat, "refs/heads/feat"}}
 			pack := w.packFor(t, cmds)
@@ -123,6 +135,15 @@ func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testi
 			if d := time.Since(start); d > 2*time.Second {
 				t.Errorf("the push was answered after %v, want within 2s", d)
 			}
+			started := readPIDs(t, pids)
+			if c.stall && len(started) == 0 {
+				t.Error("no git index-pack ran for a push whose body stopped halfway through the pack")
+			}
+			for _, pid := range started {
+				if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+					t.Errorf("git index-pack %d of the push that timed out is still there once it was answered (kill: %v)", pid, err)
+				}
+			}
 			if lines, want := parseReport(got).lines, []string{"unpack push timed out", "ng refs/heads/feat unpacker error"}; !slices.Equal(lines, want) {
 				t.Errorf("report = %q, want %q", lines, want)
 			}
@@ -131,6 +152,46 @@ func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testi
 			}
 		})
 	}
+}
+
+// indexPackPIDs puts a git first on the PATH of the test process that adds
+// the pid of every git index-pack to a file, one per line, before it
+// becomes the real git with the same pid, and returns the file's path.
+func indexPackPIDs(t *testing.T) string {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	pids := filepath.Join(bin, "pids")
+	script := "#!/bin/sh\ncase \" $* \" in *\" index-pack \"*) echo $$ >> '" + pids + "' ;; esac\nexec '" + gitPath + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return pids
+}
+
+// readPIDs is the pids in file, none when it does not exist.
+func readPIDs(t *testing.T, file string) []int {
+	t.Helper()
+	b, err := os.ReadFile(file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, line := range strings.Fields(string(b)) {
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pids = append(pids, pid)
+	}
+	return pids
 }
 
 // stalled sends the push body to demo's receive-pack route with the
