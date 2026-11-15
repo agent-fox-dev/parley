@@ -56,14 +56,65 @@ func TestPushChange_AnAgentOpensAChangeByPushingAndAddsAVersionWithTheNextPush(t
 	head := strings.TrimSpace(run("rev-parse", "fix-retry"))
 	status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/1", agent, nil)
 	var ch struct {
+		Title   string `json:"title"`
 		State   string `json:"state"`
 		Version int    `json:"version"`
 		HeadSHA string `json:"head_sha"`
 	}
-	if status != http.StatusOK || json.Unmarshal(body, &ch) != nil || ch.State != "open" || ch.Version != 2 || ch.HeadSHA != head {
-		t.Errorf("GET changes/1 = %d %s, want open, version 2 at %s", status, body, head)
+	if status != http.StatusOK || json.Unmarshal(body, &ch) != nil || ch.Title != "Fix retry loop" || ch.State != "open" || ch.Version != 2 || ch.HeadSHA != head {
+		t.Errorf("GET changes/1 = %d %s, want \"Fix retry loop\", open, version 2 at %s", status, body, head)
 	}
 	run("fetch", "--quiet", "origin", "refs/parley/changes/1/1", "refs/parley/changes/1/2")
+	if n := gitPushEventsOf(t, h, "refs/heads/fix-retry"); n != 2 {
+		t.Errorf("the log holds %d parley.git.push events of refs/heads/fix-retry, want 2", n)
+	}
+}
+
+// gitPushEventsOf counts the parley.git.push events of ref in the hub's
+// log.
+func gitPushEventsOf(t *testing.T, h *forkHub, ref string) int {
+	t.Helper()
+	n := 0
+	for _, ev := range logItems(t, h.Hub) {
+		if ev.Type == "parley.git.push" && ev.ResourceID == ref {
+			n++
+		}
+	}
+	return n
+}
+
+// A developer who mistypes a push option has the whole push refused before
+// anything is written, and is told which option and why.
+func TestPushChange_APushWithAnInvalidOptionIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	h := startForkHub(t)
+	g := newGitClient(t, h.URL(""), h.key)
+	dir := filepath.Join(t.TempDir(), "demo")
+	if out, err := g.git("", "clone", "--quiet", h.URL("/git/acme/demo.git"), dir); err != nil {
+		t.Fatalf("git clone demo = %v: %s", err, out)
+	}
+	for _, args := range [][]string{{"checkout", "--quiet", "-b", "topic"}, {"-c", "user.name=Dev", "-c", "user.email=dev@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "Topic"}} {
+		if out, err := g.git(dir, args...); err != nil {
+			t.Fatalf("git %s = %v: %s", strings.Join(args, " "), err, out)
+		}
+	}
+
+	out, err := g.git(dir, "push", "-o", "parley.titel=x", "origin", "topic")
+	if err == nil || !strings.Contains(out, "remote: error: invalid push option parley.titel: unknown option") {
+		t.Errorf("git push -o parley.titel=x = %v:\n%s\nwant it refused with remote: error: invalid push option parley.titel: unknown option", err, out)
+	}
+	if out, err := g.git(dir, "ls-remote", "origin", "refs/heads/topic"); err != nil || strings.TrimSpace(out) != "" {
+		t.Errorf("git ls-remote origin refs/heads/topic = %v %q, want nothing", err, out)
+	}
+	if n := gitPushEventsOf(t, h, "refs/heads/topic"); n != 0 {
+		t.Errorf("the log holds %d parley.git.push events of refs/heads/topic, want none", n)
+	}
+	status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes", h.key, nil)
+	var page struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if status != http.StatusOK || json.Unmarshal(body, &page) != nil || len(page.Items) != 0 {
+		t.Errorf("GET /workspaces/demo/changes = %d %s, want an empty list", status, body)
+	}
 }
 
 // An agent's plain push to its task fork, which opens changes on its own,
