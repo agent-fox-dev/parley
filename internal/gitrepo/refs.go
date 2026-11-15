@@ -43,17 +43,19 @@ func (r *Repo) CompareAndSwapRef(ctx context.Context, ref, newID, expectedOld st
 	if expectedOld == "" {
 		// The refs are read rather than git's message matched, whose wording
 		// changes between versions.
-		if blocked, blockErr := r.nameBlocked(ctx, ref); blockErr == nil && blocked {
+		if _, blocked, blockErr := r.RefInTheWay(ctx, ref); blockErr == nil && blocked {
 			return fmt.Errorf("create %s: %w", ref, ErrRefNameConflict)
 		}
 	}
 	return err
 }
 
-// nameBlocked reports whether a ref exists whose name is a directory of
-// ref's, such as refs/heads/feat for refs/heads/feat/x, or that lies below
-// ref's name, such as refs/heads/topic/a for refs/heads/topic.
-func (r *Repo) nameBlocked(ctx context.Context, ref string) (bool, error) {
+// RefInTheWay is the ref whose name keeps ref from being created: one
+// whose name is a directory of ref's, such as refs/heads/feat for
+// refs/heads/feat/x, or one that lies below ref's name, such as
+// refs/heads/topic/a for refs/heads/topic; the first by name when there
+// are several. found is false when no ref is in the way.
+func (r *Repo) RefInTheWay(ctx context.Context, ref string) (name string, found bool, err error) {
 	parts := strings.Split(ref, "/")
 	var dirs []string
 	// refs/heads and the like are namespaces, never refs.
@@ -63,15 +65,15 @@ func (r *Repo) nameBlocked(ctx context.Context, ref string) (bool, error) {
 	// A pattern matches its own name and every ref below it.
 	out, err := r.git(ctx, append([]string{"for-each-ref", "--format=%(refname)", ref}, dirs...)...)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	for name := range strings.Lines(string(out)) {
 		name = strings.TrimRight(name, "\n")
 		if strings.HasPrefix(name, ref+"/") || slices.Contains(dirs, name) {
-			return true, nil
+			return name, true, nil
 		}
 	}
-	return false, nil
+	return "", false, nil
 }
 
 // IsAncestor reports whether the commit ancestor is reachable from the

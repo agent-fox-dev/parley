@@ -3392,6 +3392,7 @@ made a version of or opened, `null` when there is none; `change_error` is
 | `403` | a push rule refuses the update, such as `protected_branch` |
 | `404` `ref_not_found` | `base_ref` names no commit |
 | `409` `ref_moved` | `branch` exists and `expected_head_sha` is absent or another commit, or the branch moved in between; `details.current_sha` is where it is |
+| `409` `ref_exists` | `branch` does not exist and another branch's name is in the way of it, one being a directory of the other (`ref refs/heads/feat is in the way of refs/heads/feat/x; delete it to create refs/heads/feat/x`) |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
 | `413` `payload_too_large` | the body is larger than `[scm].max_commit_size` |
 
@@ -3418,8 +3419,8 @@ Exactly one of `sha` and `ref` is given. A tag created so is lightweight.
 | `400` `invalid_request` | no `name` (`name is required`); a name that is no valid ref name (`"a..b" is not a valid ref name`) or lies outside the namespaces (`"refs/notes/n" is outside refs/heads/, refs/tags/ and refs/parley/`); both or neither of `sha` and `ref` (`give exactly one of sha and ref`); a `sha` that is not a full id (`sha must be a full 40-character commit id`) |
 | `403` | a push rule refuses the creation, such as `hub_owned_ref` for a name below `refs/parley/` |
 | `404` `ref_not_found` | the target names no commit (`revision "nope" names no commit`, `revision "…" names an object that is not a commit`) |
-| `409` `ref_exists` | the ref exists (`ref refs/heads/main already exists`) |
-| `409` `ref_moved` | another write created the ref in between, or another ref is in the way of the name (`refs/heads/feat/x` beside a new `refs/heads/feat`), `details.current_sha` then `null` |
+| `409` `ref_exists` | the ref exists (`ref refs/heads/main already exists`), or another ref's name is in the way of the name, one being a directory of the other (`ref refs/heads/feat/x is in the way of refs/heads/feat; delete it to create refs/heads/feat`) |
+| `409` `ref_moved` | another write created the ref in between; `details.current_sha` is where it is then, `null` when it is gone again |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
 
 ```json

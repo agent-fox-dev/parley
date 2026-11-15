@@ -102,6 +102,10 @@ func TestRefCreate(t *testing.T) {
 	t.Run("refuses an invalid creation and creates nothing", func(t *testing.T) {
 		tree := strings.TrimSpace(gitrepotest.Git(t, w.dir, "rev-parse", "main^{tree}"))
 		sha := w.m2
+		// A name another ref's name is in the way of cannot be created:
+		// the answer names that ref.
+		gitrepotest.Git(t, w.dir, "update-ref", "refs/heads/nest/a", w.m1)
+		inTheWay := map[string]string{"name below an existing branch": "refs/heads/main", "name above an existing branch": "refs/heads/nest/a"}
 		for _, tc := range []struct {
 			name      string
 			body      map[string]any
@@ -126,11 +130,16 @@ func TestRefCreate(t *testing.T) {
 			{"existing branch by bare name", map[string]any{"name": "main", "sha": w.m1}, http.StatusConflict, "ref_exists"},
 			{"existing branch by full name", map[string]any{"name": "refs/heads/main", "sha": w.m1}, http.StatusConflict, "ref_exists"},
 			{"hub-owned ref", map[string]any{"name": "refs/parley/changes/1/1", "sha": sha}, http.StatusForbidden, "hub_owned_ref"},
+			{"name below an existing branch", map[string]any{"name": "main/x", "sha": sha}, http.StatusConflict, "ref_exists"},
+			{"name above an existing branch", map[string]any{"name": "nest", "sha": sha}, http.StatusConflict, "ref_exists"},
 		} {
 			refs, seq := gitrepotest.Git(t, w.dir, "for-each-ref"), w.lastSeq(t)
 			r := w.sendJSON(t, http.MethodPost, path, w.ownerKey, tc.body)
 			if r.status != tc.status || r.errorType() != tc.errorType {
 				t.Errorf("%s: %d %s, want %d %s", tc.name, r.status, r.body, tc.status, tc.errorType)
+			}
+			if ref := inTheWay[tc.name]; ref != "" && !strings.Contains(r.message(), ref+" is in the way") {
+				t.Errorf("%s: message %q, want it to name the ref in the way, %s", tc.name, r.message(), ref)
 			}
 			w.checkObserved(t, tc.name, "ref_create", r)
 			if after := gitrepotest.Git(t, w.dir, "for-each-ref"); after != refs {
