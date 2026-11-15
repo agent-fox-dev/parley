@@ -86,15 +86,16 @@ func (r *Repo) History(ctx context.Context, from string, q HistoryQuery) ([]Comm
 		}
 		args = append(args, "--until="+gitTime(q.Until.Unix()))
 	}
-	if q.Author != "" {
-		args = append(args, "--regexp-ignore-case", "--fixed-strings", "--author="+q.Author)
-	}
 	// git counts the commits it skips before --follow drops those that did
-	// not change the file, so a followed history is counted here.
+	// not change the file, so a followed history is counted here. git
+	// matches --author against the whole "Name <email>" line, where a value
+	// spanning the two, or a bare "<", would match too, so the author is
+	// matched here, the name and the e-mail apart, and counted after it.
 	skip, count := max(q.Skip, 0), q.Count
 	if q.Follow {
 		args = append(args, "--follow")
-	} else {
+	}
+	if !q.Follow && q.Author == "" {
 		args = append(args, "--skip="+strconv.Itoa(skip))
 		if count > 0 {
 			args = append(args, "--max-count="+strconv.Itoa(count))
@@ -110,11 +111,48 @@ func (r *Repo) History(ctx context.Context, from string, q HistoryQuery) ([]Comm
 		return nil, err
 	}
 	ids := strings.Fields(string(out))
+	if q.Author != "" {
+		return r.authoredBy(ctx, ids, q.Author, skip, count)
+	}
 	ids = ids[min(skip, len(ids)):]
 	if count > 0 {
 		ids = ids[:min(count, len(ids))]
 	}
 	return r.ReadCommits(ctx, ids)
+}
+
+// authorBatch is how many commits a history kept by author reads at once.
+const authorBatch = 256
+
+// authoredBy is the commits of the full ids ids, in their order, whose
+// author's name or e-mail contains author without regard to case, less the
+// first skip of them and, when count is above 0, at most count after those.
+func (r *Repo) authoredBy(ctx context.Context, ids []string, author string, skip, count int) ([]Commit, error) {
+	author = strings.ToLower(author)
+	var kept []Commit
+	for len(ids) > 0 {
+		batch := ids[:min(authorBatch, len(ids))]
+		ids = ids[len(batch):]
+		commits, err := r.ReadCommits(ctx, batch)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range commits {
+			if !strings.Contains(strings.ToLower(c.Author.Name), author) &&
+				!strings.Contains(strings.ToLower(c.Author.Email), author) {
+				continue
+			}
+			if skip > 0 {
+				skip--
+				continue
+			}
+			kept = append(kept, c)
+			if count > 0 && len(kept) == count {
+				return kept, nil
+			}
+		}
+	}
+	return kept, nil
 }
 
 // gitTime is the time of the Unix time t in the form git reads as that
