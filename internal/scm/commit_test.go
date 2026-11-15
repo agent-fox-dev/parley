@@ -266,6 +266,8 @@ func TestCommit(t *testing.T) {
 			{"new branch without base_ref", map[string]any{"branch": "nobase", "message": "m", "operations": []any{put("a", "b")}}, 400, "invalid_request"},
 			{"new branch whose base_ref names nothing", map[string]any{"branch": "nobase", "base_ref": "no-such-ref", "message": "m",
 				"operations": []any{put("a", "b")}}, 404, "ref_not_found"},
+			{"new branch below an existing branch", map[string]any{"branch": "shape/x", "base_ref": "main", "message": "m",
+				"operations": []any{put("a", "b")}}, 409, "ref_exists"},
 			// Malformed operations, each sent with a stale head, which is
 			// never reached.
 			{"op copy", on(op("op", "copy", "path", "a")), 400, "invalid_request"},

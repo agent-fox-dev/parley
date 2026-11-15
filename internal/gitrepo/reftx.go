@@ -185,7 +185,7 @@ func (r *Repo) refTxFailure(ctx context.Context, updates []RefUpdate, err error)
 		if u.Old != "" {
 			continue
 		}
-		if blocked, blockErr := r.nameBlocked(ctx, u.Ref); blockErr == nil && blocked {
+		if _, blocked, blockErr := r.RefInTheWay(ctx, u.Ref); blockErr == nil && blocked {
 			return &RefError{Ref: u.Ref, Err: ErrRefNameConflict}
 		}
 	}

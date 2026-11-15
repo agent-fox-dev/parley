@@ -152,7 +152,9 @@ func (u refUpdated) change() *LinkedChange {
 // A refused update is 403 with the refusing rule's message and error type;
 // one no rule could be evaluated for, 500 internal. A ref not at u.before
 // when the refs are written is 409 ref_moved with the commit it is at then
-// as details.current_sha. A failure of a ref-updated stage is answered as
+// as details.current_sha; a ref to be created whose name another ref is in
+// the way of is 409 ref_exists naming that ref, since no head to retry
+// from would make the create succeed. A failure of a ref-updated stage is answered as
 // it is when it is an API error, else 500 internal.
 func (c *Component) updateRef(ctx context.Context, wr *write, repo *gitrepo.Repo, u refUpdate) (refUpdated, error) {
 	pw, pc := ruleFacts(wr)
@@ -181,7 +183,7 @@ func (c *Component) updateRef(ctx context.Context, wr *write, repo *gitrepo.Repo
 	switch res.Outcome {
 	case pushrule.OutcomeAccepted:
 	case pushrule.OutcomeRefMoved:
-		return refUpdated{}, refMovedNow(context.WithoutCancel(ctx), repo, u.ref)
+		return refUpdated{}, refMovedNow(context.WithoutCancel(ctx), repo, u.ref, u.before == pushrule.ZeroID)
 	case pushrule.OutcomeRefused:
 		return refUpdated{}, refusal(wr.ws, decisionsOf(res))
 	default:
@@ -280,15 +282,34 @@ func refMoved(name string, current *string) error {
 }
 
 // refMovedNow is refMoved with the commit the ref name of repo is at now,
-// read after the ref writer found it moved.
-func refMovedNow(ctx context.Context, repo *gitrepo.Repo, name string) error {
+// read after the ref writer found it moved. For a create, create true, a
+// ref name that does not exist then was refused because another ref's name
+// is in the way of it, and the answer is refInTheWay when one is.
+func refMovedNow(ctx context.Context, repo *gitrepo.Repo, name string, create bool) error {
 	ref, found, err := repo.LookupRef(ctx, name)
 	if err != nil {
 		return err
 	}
-	if !found {
-		return refMoved(name, nil)
+	if found {
+		current := commitOf(ref)
+		return refMoved(name, &current)
 	}
-	current := commitOf(ref)
-	return refMoved(name, &current)
+	if create {
+		blocker, blocked, err := repo.RefInTheWay(ctx, name)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			return refInTheWay(name, blocker)
+		}
+	}
+	return refMoved(name, nil)
+}
+
+// refInTheWay is the answer to a create of the ref name that git cannot
+// hold beside the ref blocker, one name being a directory of the other:
+// 409 ref_exists naming blocker, which must go before name can be created.
+func refInTheWay(name, blocker string) error {
+	return server.NewError("ref_exists", http.StatusConflict,
+		fmt.Sprintf("ref %s is in the way of %s; delete it to create %s", blocker, name, name))
 }

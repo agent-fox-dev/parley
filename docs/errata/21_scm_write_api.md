@@ -90,3 +90,19 @@ The package's checks use the session id `s-1`. The event log stores only
 session ids of the UUID form (`event.Input.SessionID`), so a session the
 linker accepts is carried in the lower-case form it returns, and the tests
 use UUIDs.
+
+## A ref name in the way of a create is `409 ref_exists`
+
+The ref writer answers a create whose name another ref's name is in the
+way of (`refs/heads/feat` beside `refs/heads/feat/x`, either way round) as
+a moved ref (erratum 18). A `409 ref_moved` carries the head to retry from,
+and here there is none: no retry creates the ref while the other one
+stands. When the ref writer answers `ref_moved` for a create and the name
+still does not exist, the write asks `gitrepo.(*Repo).RefInTheWay` for the
+ref in the way and, when there is one, answers `409 ref_exists` naming it
+(`ref refs/heads/feat/x is in the way of refs/heads/feat; delete it to
+create refs/heads/feat`), the error type the ref creation already gives to
+a name that cannot be created (`refMovedNow` in
+`internal/scm/refupdate.go`). This holds for `POST …/scm/refs` and for a
+commit that creates its branch. A git push of the same create keeps the
+ref writer's answer.

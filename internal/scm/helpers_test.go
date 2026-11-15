@@ -536,6 +536,13 @@ func (r reply) errorType() string {
 	return s
 }
 
+// message is the message of an error envelope, "" for any other body.
+func (r reply) message() string {
+	e, _ := r.json["error"].(map[string]any)
+	s, _ := e["message"].(string)
+	return s
+}
+
 // names are the name members of the items of a list.
 func (r reply) names() []string { return r.members("name") }
 
