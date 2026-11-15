@@ -71,7 +71,7 @@ func TestHubPart_ConnectsTheChangeComponentToTheOtherFeatures(t *testing.T) {
 				seen = append(seen, e["type"].(string)+" "+e["workspace"].(string)+"#"+e["resource_id"].(string))
 			}
 		}
-		if want := []string{change.EventVersion + " demo#2", change.EventOpen + " demo#2"}; status != http.StatusOK || !reflect.DeepEqual(seen, want) {
+		if want := []string{change.EventVersion + " demo#2", change.EventOpen + " demo#2", change.EventReady + " demo#2"}; status != http.StatusOK || !reflect.DeepEqual(seen, want) {
 			t.Errorf("the fork-bound token reads %d %v, want the events of the fork's change only, %v", status, seen, want)
 		}
 	})

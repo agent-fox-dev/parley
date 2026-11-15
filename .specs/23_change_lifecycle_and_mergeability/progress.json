@@ -3,7 +3,7 @@
   "spec_id": "23",
   "spec_name": "change_lifecycle_and_mergeability",
   "schema_version": 3,
-  "updated_at": "2026-11-15T18:26:16Z",
+  "updated_at": "2026-11-15T18:39:13Z",
   "tasks": [
     {
       "id": 1,
@@ -19,7 +19,7 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,

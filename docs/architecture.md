@@ -3523,8 +3523,9 @@ push calls no linker. The three `POST` routes are registered with
 `internal/hub/change.go` adds the part `composeChanges`, after `composeSCM`
 in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 `change.SchemaStep` (the step `changes`) and right after it
-`change.AutoLandSetterStep` (`change_auto_land_setter`) and
-`change.MergeableStep` (`change_mergeable`), registers its `Routes()` with
+`change.AutoLandSetterStep` (`change_auto_land_setter`),
+`change.MergeableStep` (`change_mergeable`) and `change.AnnouncedStep`
+(`change_ready_announced`), registers its `Routes()` with
 `AddRoute`, and binds it in the start hook `changes` to the store
 (`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
 (`Repos`), the access service (`Access`), `changeWorkspaces` (`Workspaces`), an adapter over
@@ -3727,7 +3728,8 @@ to the `StackLinker`'s `SetDependsOn` for a draft or open change while
 one is registered, and is ignored otherwise. A differing `target_branch`
 is answered `501 not_implemented` for now. The abandon goes through
 `(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
-which is `SetAbandoned` and `parley.change.abandon` with the given reason;
+which is `SetAbandoned`, `ForgetLandable` and `parley.change.abandon` with
+the given reason;
 the restore sets the change `open`, calls `ScheduleMergeable` and writes
 `parley.change.restore` (`EventRestore`, metadata `number`, `ref`,
 `version`, `head_sha`).
@@ -3753,12 +3755,32 @@ which writes no ref, index or work tree; an error or the deadline leaves
 `workspace` and `number`, and nothing retries it before the change's next
 trigger. The result is stored in a second `Store.Tx` only while the change
 is draft or open and its head and onto-commit are still those computed,
-else it is discarded and the change scheduled again: `storeResult` calls
-`SetMergeable` (`clean`, or `conflict` with the JSON of the
-`gitrepo.ConflictReport`) and stores the pair and the value in
-`mergeable_head`, `mergeable_onto` and `mergeable_last`, and re-evaluates a
-landing still blocked for `target_not_found`. A check scheduled in a
-transaction that is rolled back computes the change as it is.
+else it is discarded and the change scheduled again. A check scheduled in
+a transaction that is rolled back computes the change as it is.
+
+`(*change.Component).StoreMergeability(ctx, tx, workspace, number, head,
+onto, report)` (`mergeable.go`) is the one function that stores a computed
+result, in the caller's transaction (the worker's, and the restack's of
+package 24): it reads `mergeable_last`, the value the last check computed,
+calls `SetMergeable` (`clean`, or `conflict` with the JSON of the
+`gitrepo.ConflictReport`), stores the pair and the value in
+`mergeable_head`, `mergeable_onto` and `mergeable_last`, writes
+`parley.change.conflict` (`EventConflict`, by the hub, metadata `version`,
+`head_sha`, `files`, `needs_restack`) only for a conflict whose last
+computed value was not `conflict`, re-evaluates a landing still blocked for
+`target_not_found`, and runs `AnnounceLandable` last.
+`(*change.Component).AnnounceLandable(ctx, tx, workspace, number)`
+(`landable.go`) is the one writer of `parley.change.ready` (`EventReady`,
+by the hub, metadata `version`, `head_sha`): it does nothing while
+`mergeable` is `unknown`; an `open` change with `landing.status` `ready`
+and `mergeable` `clean` whose `ready_announced_head` is not its head gets
+the event and the head stored; any other change has the column cleared
+through `ForgetLandable(ctx, tx, workspace, number)`, which the abandon
+(and the retarget) call too. The landing policy calls `AnnounceLandable`
+in each transaction that stores a landing. `emit` (`open.go`) adds
+`number` and `ref` to the metadata of every change event. An error of
+the event writer rolls the storing transaction back, which leaves
+`mergeable` `unknown` and is logged as a failed check.
 
 Triggers set `mergeable` `unknown` (`conflict` null) in the triggering
 transaction and schedule the check at once:

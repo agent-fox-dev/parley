@@ -42,10 +42,15 @@ func (c *Component) parseAbandon(r *http.Request) (operation, error) {
 
 // Abandon moves the change number of the workspace to abandoned for
 // reason, as actor did, in tx, and writes parley.change.abandon. The move
-// goes through SetAbandoned, so a fork source's activity recorder is told.
-// Its source branch and its version refs stay as they are.
+// goes through SetAbandoned, so a fork source's activity recorder is told,
+// and forgets the change's announcement as landable, so that a restore
+// announces it again. Its source branch and its version refs stay as they
+// are.
 func (c *Component) Abandon(ctx context.Context, tx *sql.Tx, workspace string, number int64, reason string, actor Caller) error {
 	if err := c.SetAbandoned(ctx, tx, workspace, number, reason); err != nil {
+		return err
+	}
+	if err := c.ForgetLandable(ctx, tx, workspace, number); err != nil {
 		return err
 	}
 	return c.emitAbandon(ctx, tx, actor, workspace, number, reason)
@@ -68,7 +73,7 @@ func (c *Component) restore(ctx context.Context, tx *sql.Tx, ch Change, caller C
 	if err := c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
 	}
-	return c.emit(ctx, tx, caller, ch, EventRestore, map[string]any{"number": ch.Number, "version": ch.Version, "head_sha": ch.HeadSHA})
+	return c.emit(ctx, tx, caller, ch, EventRestore, map[string]any{"version": ch.Version, "head_sha": ch.HeadSHA})
 }
 
 // decodeOptional is server.DecodeJSON for a body that may be absent: no

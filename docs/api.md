@@ -3661,10 +3661,10 @@ policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
 hub has a session feature, every `session_id` is refused and a defaulted
 one dropped.
 
-The open writes `parley.change.version` for version 1, with `ref`,
-`version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to` and
-`draft` in its metadata, then, unless the change is a draft,
-`parley.change.open`, with `ref`, `version`, `head_sha`, `title`,
+The open writes `parley.change.version` for version 1, with `number`,
+`ref`, `version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to`
+and `draft` in its metadata, then, unless the change is a draft,
+`parley.change.open`, with `number`, `ref`, `version`, `head_sha`, `title`,
 `target_branch`, `source_workspace`, `source_branch`, `depends_on` and
 `was_draft` (`false`). Both have `resource_type` `change`, `resource_id`
 the number, the target workspace and the change's session. A refused open
@@ -3937,7 +3937,7 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
 - `POST …/abandon` takes no body or a JSON object with `reason`, a string,
   and moves the change to `abandoned`, writing `parley.change.abandon` by
   the caller with `reason` as given (the empty string when absent),
-  `ref`, `version` and `head_sha`. The source branch and the version refs
+  `number`, `ref`, `version` and `head_sha`. The source branch and the version refs
   stay.
 - `POST …/restore` takes no body and moves the change to `open` at its
   last version with `mergeable` `unknown`, writing
@@ -3970,6 +3970,33 @@ not exist, `mergeable` stays `unknown` and `landing` reports
 `{"status":"blocked","reason":"target_not_found"}`. A trial rebase that
 fails or runs past 30 seconds is stopped and leaves `mergeable`
 `unknown` until the change's next trigger.
+
+Every change event, these two included, has `resource_type` `change`,
+`resource_id` the number, the target workspace, the change's session,
+and `number` and `ref` in its metadata. A result writes, by the hub
+(`actor_type` `system`), in the transaction that stores it:
+
+- `parley.change.conflict` when the check finds a conflict and the value
+  the last check computed was `clean`, or there was none: metadata
+  `number`, `ref`, `version`, `head_sha`, `files` (the conflicted paths)
+  and `needs_restack`. A further conflict, for the same or a later
+  version or target head, replaces the conflict report and writes no
+  event; an `unknown` in between does not count. A `clean` result clears
+  the report, so the next conflict is announced again.
+- `parley.change.ready` when the change is `open`, its `landing.status` is
+  `ready` and `mergeable` is `clean` (landable) at a `head_sha` it has not
+  been announced at since it last was not landable: metadata `number`,
+  `ref`, `version` and `head_sha`, nothing else. A target move that leaves
+  it clean announces nothing again; a result or a step that finds it not
+  landable (a draft, a landing `pending` or `blocked`, a conflict), an
+  abandon or a retarget forgets the announcement, so it is announced
+  again the next time it is landable, at the same head too. While
+  `mergeable` is `unknown` nothing is announced or forgotten.
+
+When the event cannot be written, or the transaction fails, neither the
+result nor the event is stored: `mergeable` stays `unknown`, the failure
+is logged as `the mergeability check failed`, and the change's next
+trigger computes it again.
 
 ## Admin routes
 

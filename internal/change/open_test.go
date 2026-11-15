@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -197,7 +199,8 @@ func TestOpen_WritesTheVersionEventAndTheOpenEventUnlessDraft(t *testing.T) {
 	t.Run("open", func(t *testing.T) {
 		seq := w.seq(t)
 		got := w.mustPost(t, map[string]any{"source": map[string]any{"workspace_slug": "demo--m1", "branch": "task"}, "session_id": sessionOne})
-		events := w.eventsAfter(t, seq)
+		// The mergeability check announces the clean change after the open.
+		events := slices.DeleteFunc(w.eventsAfter(t, seq), func(e event.Record) bool { return e.Type == change.EventReady })
 		var types []string
 		for _, e := range events {
 			types = append(types, e.Type)
@@ -211,7 +214,7 @@ func TestOpen_WritesTheVersionEventAndTheOpenEventUnlessDraft(t *testing.T) {
 				t.Errorf("%s: %+v, want resource change 1 of demo in sessionOne by the owner's key", e.Type, e)
 			}
 		}
-		common := map[string]any{"ref": "demo#1", "version": 1.0, "head_sha": head}
+		common := map[string]any{"number": 1.0, "ref": "demo#1", "version": 1.0, "head_sha": head}
 		version := map[string]any{"kind": "ref", "base_sha": w.base, "patch_equivalent_to": nil, "draft": false}
 		opened := map[string]any{"title": "Task", "target_branch": "main", "source_workspace": "demo--m1",
 			"source_branch": "task", "depends_on": nil, "was_draft": false}

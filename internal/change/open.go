@@ -818,9 +818,9 @@ func (c *Component) emitVersion(ctx context.Context, tx *sql.Tx, caller Caller, 
 }
 
 // emit writes the event typ of the change ch by caller in tx, its metadata
-// the change's ref and meta.
+// the change's number and ref, which every change event carries, and meta.
 func (c *Component) emit(ctx context.Context, tx *sql.Tx, caller Caller, ch Change, typ string, meta map[string]any) error {
-	meta["ref"] = ch.Ref
+	meta["number"], meta["ref"] = ch.Number, ch.Ref
 	a := caller.actor()
 	slug := ch.WorkspaceSlug
 	_, err := c.deps.Events.Emit(ctx, tx, event.Input{

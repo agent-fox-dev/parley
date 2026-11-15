@@ -32,6 +32,10 @@ var MergeableStep = store.Step{
 	},
 }
 
+// EventConflict is the event of a change whose mergeability check found a
+// conflict where the last one found none.
+const EventConflict = "parley.change.conflict"
+
 // mergeableDeadline is how long a trial rebase may run, the read deadline
 // of the hub's git reads; mergeablePool is how many checks run at once.
 const (
@@ -207,7 +211,7 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		if moved = now.HeadSHA != ch.HeadSHA || ontoNow != onto; moved {
 			return nil
 		}
-		return c.storeResult(ctx, tx, k.workspace, k.number, ch.HeadSHA, onto, report)
+		return c.StoreMergeability(ctx, tx, k.workspace, k.number, ch.HeadSHA, onto, report)
 	})
 	if err != nil {
 		c.checkFailed(ctx, k, err)
@@ -257,12 +261,30 @@ func (c *Component) mergePair(ctx context.Context, q Querier, workspace string, 
 	return ch, onto, err == nil, err
 }
 
-// storeResult stores in tx the result of the check of the change number of
-// the workspace for its head rebased onto onto: clean for no report,
-// otherwise conflict with the report, together with the pair and the value
-// computed. A landing blocked for a missing target is re-evaluated, since
-// the check found the target again.
-func (c *Component) storeResult(ctx context.Context, tx *sql.Tx, workspace string, number int64, head, onto string, report *gitrepo.ConflictReport) error {
+// StoreMergeability stores in tx, the caller's transaction, the result of
+// a mergeability check of the change number of the workspace: its head
+// rebased onto onto, clean for a nil report, otherwise conflict with the
+// report, together with the pair and the value computed. It is the one
+// writer of a computed mergeable and of parley.change.conflict, so that a
+// conflict found by a check and one found by a restack are announced once.
+//
+// A transition is judged against the value the last check computed, which
+// an unknown in between does not replace: a conflict after a clean result,
+// or after none, writes parley.change.conflict by the hub; a conflict after
+// a conflict replaces the report and writes nothing; a clean result clears
+// the report. A landing blocked for a missing target is re-evaluated,
+// since the check found the target again, and the announcement step
+// (AnnounceLandable) runs last. An error leaves tx to be rolled back, the
+// result and its events with it.
+func (c *Component) StoreMergeability(ctx context.Context, tx *sql.Tx, workspace string, number int64, head, onto string, report *gitrepo.ConflictReport) error {
+	var last sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT mergeable_last FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&last)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return errChangeNotFound(workspace, number)
+	case err != nil:
+		return fmt.Errorf("read the mergeable of %s: %w", Ref(workspace, number), err)
+	}
 	value, conflict := MergeableClean, json.RawMessage(nil)
 	if report != nil {
 		b, err := json.Marshal(report)
@@ -282,10 +304,29 @@ WHERE workspace_slug = ? AND number = ?`, head, onto, value, workspace, number);
 	if err != nil {
 		return err
 	}
-	if ch.Landing.Status == LandingBlocked && ch.Landing.Reason != nil && *ch.Landing.Reason == "target_not_found" {
-		return c.reevaluateLanding(ctx, tx, workspace, number)
+	if report != nil && last.String != MergeableConflict {
+		if err := c.emitConflict(ctx, tx, ch, report); err != nil {
+			return err
+		}
 	}
-	return nil
+	if ch.Landing.Status == LandingBlocked && ch.Landing.Reason != nil && *ch.Landing.Reason == "target_not_found" {
+		if err := c.reevaluateLanding(ctx, tx, workspace, number); err != nil {
+			return err
+		}
+	}
+	return c.AnnounceLandable(ctx, tx, workspace, number)
+}
+
+// emitConflict writes parley.change.conflict by the hub for the change ch,
+// which the report says conflicts, naming its conflicted paths.
+func (c *Component) emitConflict(ctx context.Context, tx *sql.Tx, ch Change, report *gitrepo.ConflictReport) error {
+	files := make([]string, 0, len(report.Files))
+	for _, f := range report.Files {
+		files = append(files, f.Path)
+	}
+	return c.emit(ctx, tx, Caller{}, ch, EventConflict, map[string]any{
+		"version": ch.Version, "head_sha": ch.HeadSHA, "files": files, "needs_restack": ch.NeedsRestack,
+	})
 }
 
 // reevaluateLanding derives again, in tx, the landing of the change number

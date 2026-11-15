@@ -72,8 +72,10 @@ const (
 //     hub's logger in the start hook.
 //
 // It runs the mergeability checks as background work (RunMergeability),
-// spaced per change by [changes].mergeable_debounce, and schedules them
-// from the transaction that moved what a change sits on:
+// spaced per change by [changes].mergeable_debounce, each result stored
+// with its parley.change.conflict and parley.change.ready events
+// (StoreMergeability, AnnounceLandable), and schedules them from the
+// transaction that moved what a change sits on:
 //
 //   - a version observer (MergeableObserver) schedules the check of a
 //     change with a new version, whatever recorded it, and of the changes
@@ -98,6 +100,7 @@ func composeChanges(c *Composition) {
 	c.AddSchemaStep(change.SchemaStep)
 	c.AddSchemaStep(change.AutoLandSetterStep)
 	c.AddSchemaStep(change.MergeableStep)
+	c.AddSchemaStep(change.AnnouncedStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
