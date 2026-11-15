@@ -43,23 +43,13 @@ func (s *recordingSink) EmitNow(ctx context.Context, in event.Input) (event.Reco
 	return rec, err
 }
 
-// fetches are the parley.git.fetch events stored since the last clear.
-func (s *recordingSink) fetches() []event.Record {
+// take returns the records stored since the last take and forgets them.
+func (s *recordingSink) take() []event.Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []event.Record
-	for _, r := range s.records {
-		if r.Type == "parley.git.fetch" {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-func (s *recordingSink) clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	out := s.records
 	s.records = nil
+	return out
 }
 
 // newAuditWorld is newGitWorld with sink in front of the hub's event log,
@@ -114,9 +104,9 @@ func TestEvent_RecordsAnAuditedFetchThatSendsAPack(t *testing.T) {
 	for _, protocol := range []string{"0", "2"} {
 		for _, row := range rows {
 			t.Run("protocol "+protocol+"/"+row.name, func(t *testing.T) {
-				sink.clear()
+				sink.take()
 				w.clone(t, t.TempDir(), protocol, row.password, row.args...)
-				events := sink.fetches()
+				events := sink.take()
 				if len(events) != 1 {
 					t.Fatalf("%d parley.git.fetch events, want 1: %+v", len(events), events)
 				}
@@ -125,10 +115,10 @@ func TestEvent_RecordsAnAuditedFetchThatSendsAPack(t *testing.T) {
 				if e.ActorID != nil {
 					actorID = *e.ActorID
 				}
-				if e.Workspace == nil || *e.Workspace != "demo" || e.ResourceType != "workspace" || e.ResourceID != "demo" ||
+				if e.Type != "parley.git.fetch" || e.Workspace == nil || *e.Workspace != "demo" || e.ResourceType != "workspace" || e.ResourceID != "demo" ||
 					e.Action != "fetch" || e.ActorType != row.actorType || actorID != row.actorID {
-					t.Errorf("event = workspace %v %s %s %s actor %s %v, want demo workspace demo fetch actor %s %v",
-						e.Workspace, e.ResourceType, e.ResourceID, e.Action, e.ActorType, actorID, row.actorType, row.actorID)
+					t.Errorf("event = %s workspace %v %s %s %s actor %s %v, want parley.git.fetch demo workspace demo fetch actor %s %v",
+						e.Type, e.Workspace, e.ResourceType, e.ResourceID, e.Action, e.ActorType, actorID, row.actorType, row.actorID)
 				}
 				var meta map[string]any
 				if err := json.Unmarshal(e.Metadata, &meta); err != nil {
@@ -177,9 +167,9 @@ func TestEvent_AuditsAForkByItsParentsSetting(t *testing.T) {
 			w.set(t, "demo--t1", "settings", string(doc))
 			records.orphan.Store(row.orphan)
 			defer records.orphan.Store(false)
-			sink.clear()
+			sink.take()
 			runGit(t, t.TempDir(), "clone", "--no-checkout", w.remote(w.memberKey, "acme/demo--t1.git"), "d")
-			events := sink.fetches()
+			events := sink.take()
 			if len(events) != row.want {
 				t.Fatalf("%d parley.git.fetch events, want %d: %+v", len(events), row.want, events)
 			}
@@ -194,8 +184,6 @@ func TestEvent_RecordsNoFetchThatSendsNoPackOrIsNotAudited(t *testing.T) {
 	t.Parallel()
 	sink := &recordingSink{}
 	w := newAuditWorld(t, sink, nil)
-	unregisteredSink := &recordingSink{}
-	unregistered := newAuditWorld(t, unregisteredSink, func(d *gitserver.Deps) { d.Settings = &workspace.SettingsRegistry{} })
 	send := func(auth, body string, status int) func(*testing.T, string) {
 		return func(t *testing.T, _ string) {
 			if a := w.send(t, http.MethodPost, uploadPack, auth, nil, body); a.status != status {
@@ -205,25 +193,21 @@ func TestEvent_RecordsNoFetchThatSendsNoPackOrIsNotAudited(t *testing.T) {
 	}
 	rows := []struct {
 		name    string
-		w       *world
-		sink    *recordingSink
 		arrange func(*testing.T, string)
 		run     func(*testing.T, string)
 	}{
-		{"ls-remote", w, sink, nil, func(t *testing.T, _ string) { lsRemote(t, w.remote(w.ownerKey, "acme/demo.git")) }},
-		{"fetch in an up-to-date clone", w, sink,
+		{"ls-remote", nil, func(t *testing.T, _ string) { lsRemote(t, w.remote(w.ownerKey, "acme/demo.git")) }},
+		{"fetch in an up-to-date clone",
 			func(t *testing.T, dir string) { w.clone(t, dir, "2", w.ownerKey) },
 			func(t *testing.T, dir string) { runGit(t, filepath.Join(dir, "d"), "fetch", "origin") }},
-		{"refused fetch", w, sink, nil, send(basic("x", w.strangerKey), fetchRequest(w.head), http.StatusNotFound)},
-		{"fetch answered with an ERR packet", w, sink, nil, send(basic("x", w.ownerKey), "", http.StatusOK)},
-		{"clone with audit_fetches false", w, sink,
+		{"refused fetch", nil, send(basic("x", w.strangerKey), fetchRequest(w.head), http.StatusNotFound)},
+		{"fetch answered with an ERR packet", nil, send(basic("x", w.ownerKey), "", http.StatusOK)},
+		{"clone with audit_fetches false",
 			func(t *testing.T, _ string) {
 				w.auditFetches(t, false)
 				t.Cleanup(func() { w.auditFetches(t, true) })
 			},
 			func(t *testing.T, dir string) { w.clone(t, dir, "2", w.ownerKey) }},
-		{"clone with no audit_fetches key registered", unregistered, unregisteredSink, nil,
-			func(t *testing.T, dir string) { unregistered.clone(t, dir, "2", unregistered.ownerKey) }},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
@@ -231,60 +215,49 @@ func TestEvent_RecordsNoFetchThatSendsNoPackOrIsNotAudited(t *testing.T) {
 			if row.arrange != nil {
 				row.arrange(t, dir)
 			}
-			row.sink.clear()
+			sink.take()
 			row.run(t, dir)
-			if events := row.sink.fetches(); len(events) != 0 {
+			if events := sink.take(); len(events) != 0 {
 				t.Errorf("%d parley.git.fetch events, want none: %+v", len(events), events)
 			}
 		})
 	}
 }
 
+// A fetch of a workspace whose audit_fetches key is not registered is not
+// audited: no event is attempted.
 func TestEvent_CompletesAnAuditedFetchWhateverBecomesOfItsEvent(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
 		name   string
-		noSink bool
+		fail   error
+		adjust func(*gitserver.Deps)
+		logged int
 	}{
-		{"the sink fails", false},
-		{"no sink", true},
+		{"the sink fails", errors.New("event log unavailable"), nil, 1},
+		{"no sink", nil, func(d *gitserver.Deps) { d.Events = nil }, 0},
+		{"no audit_fetches key registered", nil, func(d *gitserver.Deps) { d.Settings = &workspace.SettingsRegistry{} }, 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			sink := &recordingSink{fail: errors.New("event log unavailable")}
-			w := newAuditWorld(t, sink, func(d *gitserver.Deps) {
-				if c.noSink {
-					d.Events = nil
-				}
-			})
+			sink := &recordingSink{fail: c.fail}
+			w := newAuditWorld(t, sink, c.adjust)
 			served := gitserver.RequestLabels{Service: gitserver.LabelUploadPack, Result: gitserver.ResultOK}
 			before := w.git.Requests()
 			dir := t.TempDir()
 			w.clone(t, dir, "0", w.ownerKey)
-			if head, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "HEAD"); strings.TrimSpace(head) != w.head {
+			if head := runGit(t, filepath.Join(dir, "d"), "rev-parse", "HEAD"); strings.TrimSpace(head) != w.head {
 				t.Errorf("HEAD of the clone = %s, want %s", head, w.head)
 			}
 			if n := grown(before, w.git.Requests())[served]; n != 1 {
 				t.Errorf("the counter of %v grew by %d, want 1", served, n)
 			}
-			want := 1
-			if c.noSink {
-				want = 0
+			if n := strings.Count(w.Log.String(), "parley.git.fetch"); n != c.logged {
+				t.Errorf("%d log records name parley.git.fetch, want %d; log:\n%s", n, c.logged, w.Log.String())
 			}
-			if n := countLines(w.Log.String(), "parley.git.fetch"); n != want {
-				t.Errorf("%d log records name parley.git.fetch, want %d; log:\n%s", n, want, w.Log.String())
+			if events := sink.take(); len(events) != 0 {
+				t.Errorf("%d events stored, want none: %+v", len(events), events)
 			}
 		})
 	}
-}
-
-// countLines is the number of lines of log that hold s.
-func countLines(log, s string) int {
-	n := 0
-	for line := range strings.Lines(log) {
-		if strings.Contains(line, s) {
-			n++
-		}
-	}
-	return n
 }

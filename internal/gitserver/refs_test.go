@@ -1,45 +1,13 @@
 package gitserver_test
 
 import (
-	"maps"
 	"net/http"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
-
-func TestRefs_AdvertisesEveryRefWhileACloneTakesBranchesAndTags(t *testing.T) {
-	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{})
-	w.extendHistory(t)
-	want := gitrepotest.Refs(t, w.repo, "")
-	want["HEAD"], want["symref HEAD"] = want["refs/heads/main"], "refs/heads/main"
-	remote := w.remote(w.ownerKey, "acme/demo.git")
-	for _, version := range []string{"0", "2"} {
-		t.Run("protocol "+version, func(t *testing.T) {
-			t.Parallel()
-			dir := t.TempDir()
-			v := []string{"-c", "protocol.version=" + version}
-			if got := lsRemote(t, remote, v...); !maps.Equal(got, want) {
-				t.Errorf("git ls-remote --symref listed %v, want %v", got, want)
-			}
-			runGit(t, dir, append(v, "clone", "--no-checkout", remote, "d")...)
-			out := runGit(t, filepath.Join(dir, "d"), "for-each-ref", "--format=%(refname)")
-			for name := range strings.Lines(out) {
-				if !strings.HasPrefix(name, "refs/heads/") && !strings.HasPrefix(name, "refs/remotes/origin/") && !strings.HasPrefix(name, "refs/tags/") {
-					t.Errorf("the clone took %s, want branches and tags only", strings.TrimSpace(name))
-				}
-			}
-			if !strings.Contains(out, "refs/remotes/origin/dev\n") || !strings.Contains(out, "refs/tags/v1\n") {
-				t.Errorf("the clone's refs are\n%s\nwant origin/dev and v1 among them", out)
-			}
-		})
-	}
-}
 
 func TestRefs_ListsOnlyTheRefsOfTheAskedPrefixes(t *testing.T) {
 	t.Parallel()

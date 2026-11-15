@@ -3,11 +3,10 @@ package gitserver_test
 import (
 	"cmp"
 	"context"
-	"encoding/json"
+	"encoding/base64"
 	"errors"
-	"maps"
 	"net/http"
-	"slices"
+	"path"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,28 +16,9 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-func TestRoutes_RefusesRefDiscoveryWithoutAValidService(t *testing.T) {
-	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{})
-	for _, q := range []string{"", "service=", "service=git-archive", "service=upload-pack", "svc=git-upload-pack"} {
-		t.Run(q, func(t *testing.T) {
-			a := w.call(t, http.MethodGet, "/git/acme/demo.git/info/refs?"+q, basic("x", w.ownerKey))
-			if a.status != http.StatusBadRequest || a.body != "invalid or missing service parameter\n" {
-				t.Errorf("answer = %d %q, want 400 \"invalid or missing service parameter\\n\"", a.status, a.body)
-			}
-		})
-	}
-	if n := w.runs.n.Load(); n != 0 {
-		t.Errorf("git ran %d times for refused requests, want never", n)
-	}
-	a := w.call(t, http.MethodGet, "/git/acme/demo.git/info/refs?service=git-upload-pack&service=git-receive-pack", basic("x", w.ownerKey))
-	if a.status != http.StatusOK || a.header.Get("Content-Type") != advertisement {
-		t.Errorf("two service values = %d Content-Type %q, want 200 %s", a.status, a.header.Get("Content-Type"), advertisement)
-	}
-}
 
 // DELETE gets the server's own answer to a method no route of the path has,
 // which HEAD, a method the router serves with a GET route, is to match.
@@ -58,93 +38,213 @@ func TestRoutes_AnswersHEADAsAnyOtherMethodBeforeAnyCheck(t *testing.T) {
 	}
 }
 
-// The REST body limit is 1KB on this hub.
-func TestRoutes_TakesAGitBodyBeyondTheRESTLimits(t *testing.T) {
-	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{Server: `max_body_size = "1KB"`})
-	haves := slices.Repeat([]string{strings.Repeat("ab", 20)}, 82)
-	body := fetchRequest(w.head, haves...)
-	a := w.send(t, http.MethodPost, "/git/acme/demo.git/git-upload-pack", basic("x", w.ownerKey),
-		http.Header{"Content-Type": {"application/x-git-upload-pack-request"}}, body)
-	if len(body) < 4096 || a.status != http.StatusOK || !strings.Contains(a.body, "PACK") {
-		t.Errorf("a %d-byte fetch = %d %q, want 200 with a pack", len(body), a.status, a.body)
-	}
-	rest := w.send(t, http.MethodPost, "/api/v1/orgs", "Bearer "+w.Token,
-		http.Header{"Content-Type": {"application/json"}}, `{"slug":"`+strings.Repeat("a", 4096)+`"}`)
-	if rest.status != http.StatusRequestEntityTooLarge {
-		t.Errorf("the control: a 4KB REST request = %d %q, want 413", rest.status, rest.body)
-	}
+// refusal is a request and the answer the checks are to give it: g on repo
+// (acme/demo.git when "") with the Authorization header auth, sent twice
+// when twice, so that the second is judged, while demo has the status demo
+// and the marker marker and the fork demo--t1 the status fork (ready when
+// "") and the access rule or the records fail as fail says. A status of
+// 200 is a request the checks let through to the service; any other is
+// answered with msg as one line of text.
+type refusal struct {
+	name, auth, repo, fail string
+	g                      gitRequest
+	demo, fork             string
+	marker                 workspace.Marker
+	twice                  bool
+	status                 int
+	msg                    string
 }
 
 // The hub admits one request a minute per key, and each row starts a new
-// window, so that the row over the limit, which sends its request twice,
-// is the only one refused for it. The workspace empty is ready and has no
-// repository on disk. Each row's request is counted once, by its route and
-// its result.
-func TestRoutes_AnswersEveryEarlyRefusalWithOneLineOfText(t *testing.T) {
+// window, so that a row sent twice is the only one over the limit. The
+// workspace empty is ready and has no repository on disk. Each request is
+// counted once, by its route and its result: a refusal of authentication or
+// access (401, 403, 404) as refused, any other as an error. Every answer to
+// a request without a credential that passes (401), and every answer to one
+// for a repository the caller cannot see (404), is the same bytes. The cause
+// of every 500 is logged, with the route and the repository, and hidden
+// from the answer.
+func TestRoutes_AnswersEachRequestByTheFirstCheckItFails(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, hubtest.Config{TOML: "[limits]\nrequests_per_minute = 1"})
+	f := &faulty{}
+	f.fail.Store("")
+	w := newWorld(t, hubtest.Config{TOML: "[limits]\nrequests_per_minute = 1", Compose: func(c *hub.Composition) {
+		c.AdjustGitServer(func(d *gitserver.Deps) {
+			f.Access, f.Records = d.Access, d.Records
+			d.Access, d.Records = f, f
+		})
+	}})
 	w.addFork(t)
 	w.AddWorkspace(t, access.Record{Slug: "empty", OwnerID: w.owner, OrgID: w.acme, Kind: access.KindRepository, Status: access.StatusReady})
 	blocked := w.CreateUser(t, "blocked")
-	blockedKey := w.IssueKey(t, blocked)
-	if status, body := w.Call(t, http.MethodPost, "/api/v1/users/"+blocked+"/block", w.Token, nil); status != http.StatusOK {
-		t.Fatalf("block the user = %d %s, want 200", status, body)
+	blockedKey, revoked := w.IssueKey(t, blocked), w.IssueKey(t, w.owner)
+	for _, c := range []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/users/" + blocked + "/block"},
+		{http.MethodDelete, "/api/v1/users/" + w.owner + "/keys/" + strings.Split(revoked, "_")[1]},
+	} {
+		w.advance(time.Minute)
+		if status, body := w.Call(t, c.method, c.path, w.Token, nil); status != http.StatusOK {
+			t.Fatalf("%s %s = %d %s, want 200", c.method, c.path, status, body)
+		}
 	}
+	expired := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"git:read"}, ExpiresAt: new(w.clock().Add(-1)), CreatedAt: w.clock().Add(-2)})
 	noGit, _ := w.pat(t, w.owner, "", "changes:read")
-	const refused, failed = gitserver.ResultRefused, gitserver.ResultError
-	rows := []struct {
-		name, auth string
-		request    gitRequest
-		repo       string
-		parent     string
-		twice      bool
-		status     int
-		message    string
-		result     gitserver.Result
-	}{
-		{"no credential", "", gitRequests[0], "acme/demo.git", "", false, http.StatusUnauthorized, "authentication required", refused},
-		{"blocked user", basic("x", blockedKey), gitRequests[0], "acme/demo.git", "", false, http.StatusForbidden, "user is blocked", refused},
-		{"over the limit", basic("x", w.ownerKey), gitRequests[0], "acme/demo.git", "", true, http.StatusTooManyRequests, "rate limit exceeded", failed},
-		{"unknown repository", basic("x", w.ownerKey), gitRequests[1], "acme/nosuch.git", "", false, http.StatusNotFound, "repository not found", refused},
-		{"pat without git:read", basic("x", noGit), gitRequests[1], "acme/demo.git", "", false, http.StatusForbidden, "token lacks scope git:read", refused},
-		{"pat without git:write", basic("x", w.ownerPAT), gitRequests[3], "acme/demo.git", "", false, http.StatusForbidden, "token lacks scope git:write", refused},
-		{"member pushes", basic("x", w.memberKey), gitRequests[3], "acme/demo.git", "", false, http.StatusForbidden, msgReadOnly[:len(msgReadOnly)-1], refused},
-		{"invalid service", basic("x", w.ownerKey), gitRequest{"refs", http.MethodGet, "/info/refs?service=git-archive", false, gitserver.LabelInfoRefs}, "acme/demo.git", "", false,
-			http.StatusBadRequest, "invalid or missing service parameter", failed},
-		{"workspace not ready", basic("x", w.ownerKey), gitRequests[1], "acme/demo.git", access.StatusFailed, false, http.StatusConflict,
-			"repository not available: workspace is failed", failed},
-		{"parent busy", basic("x", w.memberKey), gitRequests[1], "acme/demo--t1.git", access.StatusCloning, false, http.StatusConflict,
-			"repository not available: parent workspace is busy", failed},
-		{"parent archived", basic("x", w.memberKey), gitRequests[3], "acme/demo--t1.git", access.StatusArchived, false, http.StatusConflict,
-			"repository is read-only: parent workspace is archived", failed},
-		{"no repository on disk", basic("x", w.ownerKey), gitRequests[0], "acme/empty.git", "", false, http.StatusInternalServerError, "internal error", failed},
+	boundReader, _ := w.pat(t, w.owner, "demo", "git:read")
+	boundNoGit, _ := w.pat(t, w.owner, "demo", "changes:read")
+	memberPAT, _ := w.pat(t, w.member, "", "git:write")
+	owner, member := basic("x", w.ownerKey), basic("x", w.memberKey)
+	const (
+		ready, archived, failed       = access.StatusReady, access.StatusArchived, access.StatusFailed
+		pending, cloning              = access.StatusPending, access.StatusCloning
+		notAvailable, busy, readOnly  = "repository not available: workspace is ", "repository not available: parent workspace is busy", "repository is read-only: parent workspace is archived"
+		notFound, scope, invalidQuery = "repository not found", "token lacks scope ", "invalid or missing service parameter"
+	)
+	refs := func(query string) gitRequest {
+		return gitRequest{"refs?" + query, http.MethodGet, "/info/refs?" + query, false, gitserver.LabelInfoRefs}
 	}
-	for _, row := range rows {
-		t.Run(row.name, func(t *testing.T) {
+	other := "beta/other.git"
+	rows := []refusal{
+		{name: "blocked user", auth: basic("x", blockedKey), g: reqFetchRefs, status: http.StatusForbidden, msg: "user is blocked"},
+		{name: "blocked user over the limit", auth: basic("x", blockedKey), g: reqFetchRefs, twice: true, status: http.StatusForbidden, msg: "user is blocked"},
+		{name: "over the limit", auth: owner, g: reqFetchRefs, twice: true, status: http.StatusTooManyRequests, msg: "rate limit exceeded"},
+		{name: "outside the binding over the limit", auth: basic("x", boundReader), g: reqFetchRefs, repo: other, twice: true, status: http.StatusTooManyRequests, msg: "rate limit exceeded"},
+		{name: "outside the binding without a git scope", auth: basic("x", boundNoGit), g: reqFetchRefs, repo: other, status: http.StatusNotFound, msg: notFound},
+		{name: "stranger with an invalid service", auth: basic("x", w.strangerKey), g: refs("service=git-archive"), status: http.StatusNotFound, msg: notFound},
+		{name: "invalid service on a workspace not ready", auth: owner, g: refs("service=git-archive"), demo: archived, status: http.StatusBadRequest, msg: invalidQuery},
+		{name: "no repository on disk", auth: owner, g: reqFetchRefs, repo: "acme/empty.git", status: http.StatusInternalServerError, msg: "internal error"},
+		{name: "the workspace lookup fails", auth: owner, g: reqFetchRefs, fail: "workspace", status: http.StatusInternalServerError, msg: "internal error"},
+		{name: "the access decision fails", auth: owner, g: reqFetch, fail: "decide", status: http.StatusInternalServerError, msg: "internal error"},
+	}
+	for _, q := range []string{"", "service=", "service=git-archive", "service=upload-pack", "svc=git-upload-pack"} {
+		rows = append(rows, refusal{name: "service query " + q, auth: owner, g: refs(q), status: http.StatusBadRequest, msg: invalidQuery})
+	}
+	for _, auth := range []string{"", "Bearer " + w.ownerKey, "Basic !!!", "Basic " + base64.StdEncoding.EncodeToString([]byte("nocolon")), basic("x", ""),
+		basic("x", "parley_abcdefgh_"+strings.Repeat("x", 32)), basic("x", revoked), basic("x", expired)} {
+		for _, at := range []struct {
+			g    gitRequest
+			repo string
+		}{{reqFetchRefs, ""}, {reqPush, "acme/nosuch.git"}} {
+			rows = append(rows, refusal{name: "credential " + auth + "/" + at.g.name, auth: auth, g: at.g, repo: at.repo, status: http.StatusUnauthorized, msg: "authentication required"})
+		}
+	}
+	for _, repo := range []string{"", "acme/nosuch.git", other} {
+		for _, g := range gitRequests {
+			auth, need := noGit, "git:read"
+			if g.push {
+				auth, need = w.ownerPAT, "git:write"
+			}
+			rows = append(rows, refusal{name: "no " + need + "/" + repo + "/" + g.name, auth: basic("x", auth), g: g, repo: repo, status: http.StatusForbidden, msg: scope + need})
+		}
+	}
+	for _, status := range []string{ready, archived} {
+		for _, auth := range []string{w.memberKey, memberPAT} {
+			for _, g := range []gitRequest{reqPushRefs, reqPush} {
+				rows = append(rows, refusal{name: "member pushes/" + status + "/" + g.name, auth: basic("x", auth), g: g, demo: status, status: http.StatusForbidden, msg: msgReadOnly[:len(msgReadOnly)-1]})
+			}
+		}
+	}
+	for _, g := range gitRequests {
+		for _, repo := range []string{"acme/demo", "acme/nosuch.git", "acme/solo.git", "beta/demo.git", "ACME/demo.git"} {
+			rows = append(rows, refusal{name: "unseen " + repo + "/" + g.name, auth: owner, g: g, repo: repo, status: http.StatusNotFound, msg: notFound})
+		}
+		for _, status := range []string{pending, cloning, ready, failed, archived} {
+			rows = append(rows, refusal{name: "stranger/" + status + "/" + g.name, auth: basic("x", w.strangerKey), g: g, demo: status, status: http.StatusNotFound, msg: notFound})
+		}
+		for _, s := range []struct {
+			status string
+			marker workspace.Marker
+			word   string
+		}{{pending, "", "pending"}, {cloning, "", "cloning"}, {failed, "", "failed"}, {archived, "", "archived"}, {ready, workspace.MarkerReclone, "busy"}} {
+			rows = append(rows, refusal{name: "workspace " + s.word + "/" + g.name, auth: owner, g: g, demo: s.status, marker: s.marker, status: http.StatusConflict, msg: notAvailable + s.word})
+		}
+		// A fork is judged by its own status, then by its parent's.
+		for _, c := range []struct {
+			name, fork, parent string
+			marker             workspace.Marker
+			fetch, push        string
+		}{
+			{"parent cloning", ready, cloning, "", busy, busy},
+			{"parent pending", ready, pending, "", busy, busy},
+			{"parent failed", ready, failed, "", busy, busy},
+			{"marker on a ready parent", ready, ready, workspace.MarkerReclone, busy, busy},
+			{"marker on an archived parent", ready, archived, workspace.MarkerDelete, busy, busy},
+			{"parent archived", ready, archived, "", "", readOnly},
+			{"fork failed with its parent cloning", failed, cloning, "", notAvailable + "failed", notAvailable + "failed"},
+			{"parent ready", ready, ready, "", "", ""},
+		} {
+			r := refusal{name: "fork/" + c.name + "/" + g.name, auth: member, g: g, repo: "acme/demo--t1.git", demo: c.parent, fork: c.fork, marker: c.marker,
+				status: http.StatusConflict, msg: c.fetch}
+			if g.push {
+				r.msg = c.push
+			}
+			if r.msg == "" {
+				r.status = http.StatusOK
+			}
+			rows = append(rows, r)
+		}
+	}
+	first := map[int]string{}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
 			w.advance(time.Minute)
-			w.setStatus(t, "demo", cmp.Or(row.parent, access.StatusReady))
-			if row.twice {
-				w.call(t, row.request.method, row.request.to(row.repo), row.auth)
+			w.set(t, "demo", "status", cmp.Or(r.demo, ready))
+			w.set(t, "demo", "maintenance", string(r.marker))
+			w.set(t, "demo--t1", "status", cmp.Or(r.fork, ready))
+			f.fail.Store(r.fail)
+			defer f.fail.Store("")
+			repo := cmp.Or(r.repo, "acme/demo.git")
+			to, logged := r.g.to(repo), strings.Count(w.Log.String(), `"msg":"git request failed"`)
+			if r.twice {
+				w.call(t, r.g.method, to, r.auth)
 			}
 			before, served := w.git.Requests(), w.service.served()
-			a := w.call(t, row.request.method, row.request.to(row.repo), row.auth)
-			if w.service.served() != served {
-				t.Error("the refused request reached the service")
+			a := w.call(t, r.g.method, to, r.auth)
+			result := gitserver.ResultError
+			switch r.status {
+			case http.StatusOK:
+				result = gitserver.ResultOK
+				if a.status != http.StatusOK || w.service.served() != served+1 {
+					t.Errorf("answer = %d %q, want the request served", a.status, a.body)
+				}
+			case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+				result = gitserver.ResultRefused
 			}
-			if a.status != row.status || a.body != row.message+"\n" || a.header.Get("Content-Type") != "text/plain; charset=utf-8" {
-				t.Errorf("answer = %d %q Content-Type %q, want %d %q text/plain; charset=utf-8",
-					a.status, a.body, a.header.Get("Content-Type"), row.status, row.message+"\n")
+			if r.status != http.StatusOK {
+				if w.service.served() != served {
+					t.Error("the refused request reached the service")
+				}
+				if a.status != r.status || a.body != r.msg+"\n" || a.header.Get("Content-Type") != "text/plain; charset=utf-8" {
+					t.Errorf("answer = %d %q Content-Type %q, want %d %q text/plain; charset=utf-8", a.status, a.body, a.header.Get("Content-Type"), r.status, r.msg+"\n")
+				}
+				challenge := ""
+				if r.status == http.StatusUnauthorized {
+					challenge = `Basic realm="parley"`
+				}
+				if got := a.header.Get("WWW-Authenticate"); got != challenge {
+					t.Errorf("WWW-Authenticate = %q, want %q", got, challenge)
+				}
 			}
-			if challenged := a.header.Get("WWW-Authenticate") != ""; challenged != (row.status == http.StatusUnauthorized) {
-				t.Errorf("WWW-Authenticate %q on a %d, want the challenge on a 401 alone", a.header.Get("WWW-Authenticate"), a.status)
+			if r.status == http.StatusUnauthorized || r.status == http.StatusNotFound {
+				if first[r.status] == "" {
+					first[r.status] = a.dump()
+				} else if got := a.dump(); got != first[r.status] {
+					t.Errorf("answer =\n%s\nwant the same as the first %d:\n%s", got, r.status, first[r.status])
+				}
 			}
-			if json.Valid([]byte(a.body)) {
-				t.Errorf("body %q is JSON, want one line of text", a.body)
-			}
-			want := map[gitserver.RequestLabels]uint64{{Service: row.request.label, Result: row.result}: 1}
-			if got := grown(before, w.git.Requests()); !maps.Equal(got, want) {
-				t.Errorf("the counter grew by %v, want %v", got, want)
+			w.counted(t, before, r.g.label, result)
+			log := w.Log.String()
+			n := strings.Count(log, `"msg":"git request failed"`) - logged
+			if want := r.status == http.StatusInternalServerError; n != 0 && !want || n != 1 && want {
+				t.Fatalf("%d error records logged for a %d, want one for a 500 alone; log:\n%s", n, r.status, log)
+			} else if want {
+				route, _, _ := strings.Cut(r.g.suffix, "?")
+				record := log[strings.LastIndex(log, `"msg":"git request failed"`):]
+				record = record[:strings.IndexByte(record, '\n')]
+				for _, want := range []string{`"route":"` + r.g.method + ` /git/{org}/{repo}` + route + `"`, `"repository":"` + path.Base(repo) + `"`, `"error":`} {
+					if !strings.Contains(record, want) {
+						t.Errorf("error record %s lacks %s", record, want)
+					}
+				}
 			}
 		})
 	}
@@ -172,47 +272,4 @@ func (f *faulty) Workspace(ctx context.Context, slug string) (workspace.Workspac
 		return workspace.Workspace{}, false, errFault
 	}
 	return f.Records.Workspace(ctx, slug)
-}
-
-func TestRoutes_HidesEveryFailureBeforeTheExchangeBehindInternalError(t *testing.T) {
-	t.Parallel()
-	f := &faulty{}
-	f.fail.Store("")
-	w := newWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
-		c.AdjustGitServer(func(d *gitserver.Deps) {
-			f.Access, f.Records = d.Access, d.Records
-			d.Access, d.Records = f, f
-		})
-	}})
-	w.AddWorkspace(t, access.Record{Slug: "empty", OwnerID: w.owner, OrgID: w.acme, Kind: access.KindRepository, Status: access.StatusReady})
-	failures := []struct{ name, fail, slug string }{
-		{"workspace lookup", "workspace", "demo"},
-		{"access decision", "decide", "demo"},
-		{"repository directory missing", "", "empty"},
-	}
-	for _, c := range failures {
-		t.Run(c.name, func(t *testing.T) {
-			f.fail.Store(c.fail)
-			defer f.fail.Store("")
-			before := strings.Count(w.Log.String(), `"msg":"git request failed"`)
-			a := w.call(t, http.MethodGet, "/git/acme/"+c.slug+".git/info/refs?service=git-upload-pack", basic("x", w.ownerKey))
-			if a.status != http.StatusInternalServerError || a.body != "internal error\n" {
-				t.Errorf("answer = %d %q, want 500 \"internal error\\n\"", a.status, a.body)
-			}
-			log := w.Log.String()
-			if n := strings.Count(log, `"msg":"git request failed"`) - before; n != 1 {
-				t.Fatalf("%d error records logged, want 1; log:\n%s", n, log)
-			}
-			record := log[strings.LastIndex(log, `"msg":"git request failed"`):]
-			record = record[:strings.IndexByte(record, '\n')]
-			for _, want := range []string{`"route":"GET /git/{org}/{repo}/info/refs"`, `"repository":"` + c.slug + `.git"`, `"error":`} {
-				if !strings.Contains(record, want) {
-					t.Errorf("error record %s lacks %s", record, want)
-				}
-			}
-		})
-	}
-	if n := w.service.served(); n != 0 {
-		t.Errorf("%d failed requests reached the service, want none", n)
-	}
 }

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"path"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 
@@ -21,6 +20,9 @@ const (
 	msgReadOnly = "org members have read-only access to this workspace; create a task fork to contribute\n"
 )
 
+// The credential is the Basic password alone: each credential is sent with
+// another user name on each request, and a request it is not granted is
+// refused 403, never challenged.
 func TestAuthorize_GrantsTheNeedOfTheRouteByCredential(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, hubtest.Config{})
@@ -35,14 +37,15 @@ func TestAuthorize_GrantsTheNeedOfTheRouteByCredential(t *testing.T) {
 		{"owner pat git:read", w.ownerPAT, w.owner, false, false},
 		{"owner pat git:write", writer, w.owner, false, true},
 	}
+	names := []string{"", "x-token-auth", "git", "member"}
 	for _, c := range credentials {
-		for _, g := range gitRequests {
+		for i, g := range gitRequests {
 			t.Run(c.name+"/"+g.name, func(t *testing.T) {
 				before := w.service.served()
-				a := w.call(t, g.method, g.to("acme/demo.git"), basic("x", c.password))
+				a := w.call(t, g.method, g.to("acme/demo.git"), basic(names[i], c.password))
 				granted := w.service.served() == before+1
-				if want := c.push || !g.push; granted != want {
-					t.Fatalf("granted = %v (answer %d %q), want %v", granted, a.status, a.body, want)
+				if want := c.push || !g.push; granted != want || (!granted && a.status != http.StatusForbidden) {
+					t.Fatalf("granted = %v (answer %d %q), want %v, or a 403", granted, a.status, a.body, want)
 				}
 				if !granted {
 					return
@@ -57,34 +60,6 @@ func TestAuthorize_GrantsTheNeedOfTheRouteByCredential(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-func TestAuthorize_RefusesAMissingScopeWhateverTheRepository(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t, hubtest.Config{})
-	noGit, _ := w.pat(t, w.owner, "", "changes:read")
-	rows := []struct {
-		password string
-		request  gitRequest
-		want     string
-	}{
-		{noGit, gitRequests[0], "token lacks scope git:read\n"},
-		{noGit, gitRequests[1], "token lacks scope git:read\n"},
-		{w.ownerPAT, gitRequests[2], "token lacks scope git:write\n"},
-		{w.ownerPAT, gitRequests[3], "token lacks scope git:write\n"},
-	}
-	for _, row := range rows {
-		for _, repo := range []string{"acme/demo.git", "acme/nosuch.git", "beta/other.git"} {
-			t.Run(row.request.name+"/"+repo, func(t *testing.T) {
-				if a := w.call(t, row.request.method, row.request.to(repo), basic("x", row.password)); a.status != http.StatusForbidden || a.body != row.want {
-					t.Errorf("answer = %d %q, want 403 %q", a.status, a.body, row.want)
-				}
-			})
-		}
-	}
-	if n := w.service.served(); n != 0 {
-		t.Errorf("%d refused requests reached the service, want none", n)
 	}
 }
 
@@ -158,68 +133,6 @@ func TestAuthorize_AsksTheBindingGuardBeforeTheScope(t *testing.T) {
 	}
 }
 
-func TestResolve_AnswersEveryRepositoryTheCallerCannotSeeAlike(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t, hubtest.Config{})
-	cases := []struct {
-		name, password, repo string
-	}{
-		{"no .git", w.ownerKey, "acme/demo"},
-		{"unknown slug", w.ownerKey, "acme/nosuch.git"},
-		{"no org", w.ownerKey, "acme/solo.git"},
-		{"wrong org", w.ownerKey, "beta/demo.git"},
-		{"org in other case", w.ownerKey, "ACME/demo.git"},
-	}
-	var first string
-	check := func(t *testing.T, password, repo string) {
-		t.Helper()
-		for _, g := range gitRequests {
-			a := w.call(t, g.method, g.to(repo), basic("x", password))
-			if a.status != http.StatusNotFound || a.body != msgNotFound {
-				t.Errorf("%s: answer = %d %q, want 404 %q", g.name, a.status, a.body, msgNotFound)
-			}
-			if first == "" {
-				first = a.dump()
-			} else if got := a.dump(); got != first {
-				t.Errorf("%s: answer =\n%s\nwant the same as the first:\n%s", g.name, got, first)
-			}
-		}
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) { check(t, c.password, c.repo) })
-	}
-	for _, status := range []string{access.StatusPending, access.StatusCloning, access.StatusReady, access.StatusFailed, access.StatusArchived} {
-		t.Run("stranger/"+status, func(t *testing.T) {
-			w.setStatus(t, "demo", status)
-			check(t, w.strangerKey, "acme/demo.git")
-		})
-	}
-	if n := w.service.served(); n != 0 {
-		t.Errorf("%d refused requests reached the service, want none", n)
-	}
-}
-
-func TestAuthorize_TellsAMemberWhoPushesToFork(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t, hubtest.Config{})
-	memberPAT, _ := w.pat(t, w.member, "", "git:write")
-	for _, status := range []string{access.StatusReady, access.StatusArchived} {
-		w.setStatus(t, "demo", status)
-		for _, password := range []string{w.memberKey, memberPAT} {
-			for _, g := range gitRequests[2:] {
-				t.Run(status+"/"+g.name, func(t *testing.T) {
-					if a := w.call(t, g.method, g.to("acme/demo.git"), basic("x", password)); a.status != http.StatusForbidden || a.body != msgReadOnly {
-						t.Errorf("answer = %d %q, want 403 %q", a.status, a.body, msgReadOnly)
-					}
-				})
-			}
-		}
-	}
-	if n := w.service.served(); n != 0 {
-		t.Errorf("%d refused requests reached the service, want none", n)
-	}
-}
-
 func TestAuthorize_ReadsTheMembershipOnEveryRequest(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, hubtest.Config{})
@@ -236,49 +149,4 @@ func TestAuthorize_ReadsTheMembershipOnEveryRequest(t *testing.T) {
 	want(http.StatusNotFound)
 	w.AddMember(t, w.acme, w.member)
 	want(http.StatusOK)
-}
-
-// Each row arranges two failures at once, on a hub that admits one request
-// a minute per key; a row with twice set sends its request a second time,
-// so that the key is over its limit, and is judged by the second answer.
-func TestAuthorize_AnswersTheFirstFailingCheck(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t, hubtest.Config{TOML: "[limits]\nrequests_per_minute = 1"})
-	blocked := w.CreateUser(t, "blocked")
-	blockedKey := w.IssueKey(t, blocked)
-	if status, body := w.Call(t, http.MethodPost, "/api/v1/users/"+blocked+"/block", w.Token, nil); status != http.StatusOK {
-		t.Fatalf("block the user = %d %s, want 200", status, body)
-	}
-	w.setStatus(t, "demo", access.StatusArchived)
-	boundReader, _ := w.pat(t, w.owner, "demo", "git:read")
-	boundNoGit, _ := w.pat(t, w.owner, "demo", "changes:read")
-	noGit, _ := w.pat(t, w.owner, "", "changes:read")
-	rows := []struct {
-		name, password, path string
-		twice                bool
-		status               int
-		want                 string
-	}{
-		{"blocked user over the limit", blockedKey, demoRefs, true, http.StatusForbidden, "user is blocked"},
-		{"outside the binding over the limit", boundReader, "/git/beta/other.git/info/refs?service=git-upload-pack", true, http.StatusTooManyRequests, "rate limit exceeded"},
-		{"outside the binding without a git scope", boundNoGit, "/git/beta/other.git/info/refs?service=git-upload-pack", false, http.StatusNotFound, "repository not found"},
-		{"no git scope on an unknown slug", noGit, "/git/acme/nosuch.git/info/refs?service=git-upload-pack", false, http.StatusForbidden, "token lacks scope git:read"},
-		{"stranger with an invalid service", w.strangerKey, "/git/acme/demo.git/info/refs?service=git-archive", false, http.StatusNotFound, "repository not found"},
-		{"member pushes to a workspace not ready", w.memberKey, "/git/acme/demo.git/git-receive-pack", false, http.StatusForbidden, msgReadOnly[:len(msgReadOnly)-1]},
-		{"owner with an invalid service on a workspace not ready", w.ownerKey, "/git/acme/demo.git/info/refs?service=git-archive", false, http.StatusBadRequest, "invalid or missing service parameter"},
-	}
-	for _, row := range rows {
-		t.Run(row.name, func(t *testing.T) {
-			method := http.MethodGet
-			if strings.HasSuffix(row.path, "/git-receive-pack") {
-				method = http.MethodPost
-			}
-			if row.twice {
-				w.call(t, method, row.path, basic("x", row.password))
-			}
-			if a := w.call(t, method, row.path, basic("x", row.password)); a.status != row.status || a.body != row.want+"\n" {
-				t.Errorf("answer = %d %q, want %d %q", a.status, a.body, row.status, row.want+"\n")
-			}
-		})
-	}
 }

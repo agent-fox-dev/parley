@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
@@ -22,16 +23,25 @@ import (
 // forkRemote is the fork's URL with the member's key, as git is given it.
 func forkRemote(w *world) string { return w.remote(w.memberKey, "acme/demo--t1.git") }
 
+// The fork lists the version refs of its own changes alone, as the view
+// names them at the request. It is served while its parent is archived.
 func TestForkView_AdvertisesEachTrackingRefAtTheParentsValueOfTheRequest(t *testing.T) {
 	t.Parallel()
-	w := newForkWorld(t, &fakeForkView{})
+	view := &fakeForkView{}
+	w := newForkWorld(t, view)
 	parent := gitrepotest.Refs(t, w.repo, "")
 	refs := lsRemote(t, forkRemote(w))
-	for _, name := range []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1"} {
+	for _, name := range []string{"refs/heads/main", "refs/heads/dev", "refs/tags/v1", "refs/parley/changes/7/1", "refs/parley/changes/7/2"} {
 		if refs[name] != parent[name] {
 			t.Errorf("the fork lists %s at %q, want the parent's %s", name, refs[name], parent[name])
 		}
 	}
+	if _, listed := refs["refs/parley/changes/8/1"]; listed {
+		t.Error("the fork lists refs/parley/changes/8/1, a version of another change")
+	}
+	d := t.TempDir()
+	runGit(t, d, "init", "--quiet")
+	runGit(t, d, "fetch", forkRemote(w), "refs/parley/changes/7/1")
 	if refs["refs/heads/work"] != w.work {
 		t.Errorf("the fork lists its own work at %q, want %s", refs["refs/heads/work"], w.work)
 	}
@@ -50,30 +60,11 @@ func TestForkView_AdvertisesEachTrackingRefAtTheParentsValueOfTheRequest(t *test
 	if refs["refs/heads/work"] != w.work {
 		t.Errorf("the fork's own work moved to %q, want %s", refs["refs/heads/work"], w.work)
 	}
-	dir := t.TempDir()
-	runGit(t, dir, "clone", "--quiet", forkRemote(w), "d")
-	if got, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != next {
+	w.set(t, "demo", "status", access.StatusArchived)
+	runGit(t, d, "clone", "--quiet", forkRemote(w), "d")
+	if got := runGit(t, filepath.Join(d, "d"), "rev-parse", "origin/main"); strings.TrimSpace(got) != next {
 		t.Errorf("origin/main of the clone = %s, want %s", got, next)
 	}
-}
-
-func TestForkView_AdvertisesTheVersionRefsOfTheForksOwnChangesAlone(t *testing.T) {
-	t.Parallel()
-	view := &fakeForkView{}
-	w := newForkWorld(t, view)
-	parent := gitrepotest.Refs(t, w.repo, "refs/parley/changes/")
-	refs := lsRemote(t, forkRemote(w))
-	for _, v := range []string{"7/1", "7/2"} {
-		if got := refs["refs/parley/changes/"+v]; got != parent[v] {
-			t.Errorf("the fork lists refs/parley/changes/%s at %q, want the parent's %s", v, got, parent[v])
-		}
-	}
-	if _, listed := refs["refs/parley/changes/8/1"]; listed {
-		t.Error("the fork lists refs/parley/changes/8/1, a version of another change")
-	}
-	d := t.TempDir()
-	runGit(t, d, "init", "--quiet")
-	runGit(t, d, "fetch", forkRemote(w), "refs/parley/changes/7/1")
 	view.set(gitserver.ForkRefs{Tracking: []string{"refs/heads/main"}}, nil)
 	for name := range lsRemote(t, forkRemote(w)) {
 		if strings.HasPrefix(name, "refs/parley/changes/") {

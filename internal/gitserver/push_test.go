@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"cmp"
-	"context"
 	"crypto/rand"
-	"database/sql"
 	"io"
 	"net"
 	"net/http"
@@ -25,12 +23,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
-)
-
-// The paths of demo's ref discovery for push and of its push exchange.
-const (
-	pushRefs    = "/git/acme/demo.git/info/refs?service=git-receive-pack"
-	receivePack = "/git/acme/demo.git/git-receive-pack"
 )
 
 // The push side is version 0 whatever the client asks for: git receive-pack
@@ -109,22 +101,15 @@ func (f *fakeProcessor) ProcessPush(w http.ResponseWriter, r *http.Request, c gi
 	return res
 }
 
-// The REST body limit is 1KB on this hub, and the push 64 kB.
+// The REST body limit is 1KB on this hub, and the push 64 kB. The processor
+// answers every push 200, and the result it reports is what the push is
+// counted as.
 func TestPush_HandsTheCheckedPushToTheProcessorWithTheCallerAndTheWholeBody(t *testing.T) {
 	t.Parallel()
 	processor := &fakeProcessor{}
 	w := newGitWorld(t, hubtest.Config{Server: `max_body_size = "1KB"`, Compose: func(c *hub.Composition) {
 		c.AdjustGitServer(func(d *gitserver.Deps) { d.Push = processor })
 	}})
-	ctx := context.Background()
-	var key string
-	var keyRec identity.APIKey
-	if err := w.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
-		key, keyRec, err = identity.IssueAPIKey(ctx, tx, w.owner, 0, w.clock())
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
 	pat, patID := w.pat(t, w.owner, "", "git:write")
 	bound, boundID := w.pat(t, w.owner, "demo", "git:write")
 	paths, pathsID := w.IssuePATID(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"git:write"}, Paths: []string{"docs/**"}, CreatedAt: w.clock()})
@@ -133,24 +118,28 @@ func TestPush_HandsTheCheckedPushToTheProcessorWithTheCallerAndTheWholeBody(t *t
 		credential string
 		want       gitserver.PushCaller
 		paths      []string
+		result     gitserver.Result
 	}{
-		{"owner API key", key, gitserver.PushCaller{CredentialType: "api_key", CredentialID: keyRec.KeyID, UserID: w.owner, Level: access.LevelOwner}, nil},
-		{"owner PAT", pat, gitserver.PushCaller{CredentialType: "pat", CredentialID: patID, UserID: w.owner, Level: access.LevelOwner}, nil},
-		{"owner PAT with paths", paths, gitserver.PushCaller{CredentialType: "pat", CredentialID: pathsID, UserID: w.owner, Level: access.LevelOwner}, []string{"docs/**"}},
+		{"owner API key", w.ownerKey, gitserver.PushCaller{CredentialType: "api_key", CredentialID: strings.Split(w.ownerKey, "_")[1], UserID: w.owner, Level: access.LevelOwner}, nil, gitserver.ResultOK},
+		{"owner PAT", pat, gitserver.PushCaller{CredentialType: "pat", CredentialID: patID, UserID: w.owner, Level: access.LevelOwner}, nil, gitserver.ResultRefused},
+		{"owner PAT with paths", paths, gitserver.PushCaller{CredentialType: "pat", CredentialID: pathsID, UserID: w.owner, Level: access.LevelOwner}, []string{"docs/**"}, gitserver.ResultOK},
 		{"bound PAT", bound, gitserver.PushCaller{CredentialType: "pat", CredentialID: boundID, UserID: w.owner, Level: access.LevelOwner,
-			Binding: &access.Binding{TokenID: boundID, Workspace: "demo", Relation: access.RelationBound}}, nil},
-		{"admin token", w.Token, gitserver.PushCaller{CredentialType: "admin_token", CredentialID: "admin", Level: access.LevelAdmin}, nil},
+			Binding: &access.Binding{TokenID: boundID, Workspace: "demo", Relation: access.RelationBound}}, nil, gitserver.ResultError},
+		{"admin token", w.Token, gitserver.PushCaller{CredentialType: "admin_token", CredentialID: "admin", Level: access.LevelAdmin}, nil, gitserver.ResultOK},
 	}
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			sent := make([]byte, 64<<10)
 			_, _ = rand.Read(sent)
+			processor.report(c.result)
+			before := w.git.Requests()
 			a := w.send(t, http.MethodPost, receivePack, basic("x", c.credential),
 				http.Header{"Content-Type": {"application/x-git-receive-pack-request"}}, string(sent))
 			if a.status != http.StatusOK || a.body != "fake" || a.header.Get("Content-Type") != "application/x-git-receive-pack-result" {
 				t.Errorf("answer = %d Content-Type %q %q, want the processor's 200 application/x-git-receive-pack-result \"fake\"",
 					a.status, a.header.Get("Content-Type"), a.body)
 			}
+			w.counted(t, before, gitserver.LabelReceivePack, c.result)
 			processor.mu.Lock()
 			defer processor.mu.Unlock()
 			if len(processor.calls) != i+1 {

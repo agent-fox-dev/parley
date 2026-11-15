@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,29 +29,31 @@ import (
 const (
 	advertisement = "application/x-git-upload-pack-advertisement"
 	result        = "application/x-git-upload-pack-result"
-	uploadPack    = "/git/acme/demo.git/git-upload-pack"
 )
 
+// A service given twice is the first; each answer is counted once.
 func TestFetch_AdvertisesRefsUnderTheProtocolTheHeaderAsks(t *testing.T) {
 	t.Parallel()
 	w := newGitWorld(t, hubtest.Config{})
 	for _, c := range []struct {
-		name, header string
-		v2           bool
+		name, header, query string
+		v2                  bool
 	}{
-		{"no header", "", false},
-		{"version=1", "version=1", false},
-		{"foo=bar", "foo=bar", false},
-		{"version=2", "version=2", true},
-		{"version=2 among other entries", "foo=bar:version=2", true},
+		{"no header", "", "", false},
+		{"version=1", "version=1", "", false},
+		{"foo=bar", "foo=bar", "", false},
+		{"version=2", "version=2", "", true},
+		{"version=2 among other entries", "foo=bar:version=2", "", true},
+		{"the service given twice", "", "&service=git-receive-pack", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
 			header := http.Header{}
 			if c.header != "" {
 				header.Set("Git-Protocol", c.header)
 			}
-			a := w.send(t, http.MethodGet, demoRefs, basic("x", w.ownerKey), header, "")
+			before := w.git.Requests()
+			a := w.send(t, http.MethodGet, demoRefs+c.query, basic("x", w.ownerKey), header, "")
+			w.counted(t, before, gitserver.LabelInfoRefs, gitserver.ResultOK)
 			if a.status != http.StatusOK || a.header.Get("Content-Type") != advertisement || a.header.Get("Cache-Control") != "no-cache" {
 				t.Fatalf("answer = %d Content-Type %q Cache-Control %q, want 200 %s no-cache", a.status,
 					a.header.Get("Content-Type"), a.header.Get("Cache-Control"), advertisement)
@@ -73,37 +76,62 @@ func TestFetch_AdvertisesRefsUnderTheProtocolTheHeaderAsks(t *testing.T) {
 	}
 }
 
-func TestFetch_ClonesWithStockGitWhateverThePathsOfAPAT(t *testing.T) {
+// Each clone lists every ref, takes the branches and tags alone and shows
+// the progress of the hub's git, whatever the paths of a PAT; each fetch
+// after a commit is added on the hub receives that commit alone.
+func TestFetch_ClonesAndFetchesWithStockGit(t *testing.T) {
 	t.Parallel()
 	w := newGitWorld(t, hubtest.Config{})
+	w.extendHistory(t)
+	want := gitrepotest.Refs(t, w.repo, "")
+	want["HEAD"], want["symref HEAD"] = want["refs/heads/main"], "refs/heads/main"
 	docsOnly := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"git:read"}, Paths: []string{"docs/**"}, CreatedAt: w.clock()})
-	for _, c := range []struct {
-		name, protocol, password string
-	}{
+	dir, clones := t.TempDir(), map[string]string{}
+	for i, c := range []struct{ name, protocol, password string }{
 		{"protocol 0", "0", w.ownerKey},
 		{"protocol 2", "2", w.ownerKey},
 		{"pat limited to docs/**", "2", docsOnly},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			dir := t.TempDir()
-			out, err := clientGit(t, dir, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version="+c.protocol, "clone", "--progress", w.remote(c.password, "acme/demo.git"), "d")
+			v, remote := []string{"-c", "protocol.version=" + c.protocol}, w.remote(c.password, "acme/demo.git")
+			if got := lsRemote(t, remote, v...); !maps.Equal(got, want) {
+				t.Errorf("git ls-remote --symref listed %v, want %v", got, want)
+			}
+			d := filepath.Join(dir, strconv.Itoa(i))
+			out, err := clientGit(t, dir, []string{"GIT_TRACE_PACKET=1"}, append(v, "clone", "--progress", remote, d)...)
 			if err != nil {
 				t.Fatalf("git clone: %v\n%s", err, out)
 			}
+			clones[c.protocol] = d
 			if !strings.Contains(out, "remote: Enumerating objects") {
 				t.Errorf("git clone --progress showed no progress of the hub's git:\n%s", out)
-			}
-			if got, _ := clientGit(t, filepath.Join(dir, "d"), nil, "rev-parse", "HEAD"); strings.TrimSpace(got) != w.head {
-				t.Errorf("HEAD of the clone = %s, want %s", got, w.head)
-			}
-			if _, err := os.Stat(filepath.Join(dir, "d", "README")); err != nil {
-				t.Errorf("the clone lacks README: %v", err)
 			}
 			if v2 := strings.Contains(out, "< version 2"); v2 != (c.protocol == "2") {
 				t.Errorf("served under version 2 = %v, want %v; trace:\n%s", v2, c.protocol == "2", out)
 			}
+			if got := runGit(t, d, "rev-parse", "HEAD"); strings.TrimSpace(got) != w.head {
+				t.Errorf("HEAD of the clone = %s, want %s", got, w.head)
+			}
+			refs := runGit(t, d, "for-each-ref", "--format=%(refname)")
+			for name := range strings.Lines(refs) {
+				if !strings.HasPrefix(name, "refs/heads/") && !strings.HasPrefix(name, "refs/remotes/origin/") && !strings.HasPrefix(name, "refs/tags/") {
+					t.Errorf("the clone took %s, want branches and tags only", strings.TrimSpace(name))
+				}
+			}
+			if !strings.Contains(refs, "refs/remotes/origin/dev\n") || !strings.Contains(refs, "refs/tags/v1\n") {
+				t.Errorf("the clone's refs are\n%s\nwant origin/dev and v1 among them", refs)
+			}
 		})
+	}
+	next := w.commitOn(t, "main")
+	for protocol, d := range clones {
+		out := runGit(t, d, "-c", "protocol.version="+protocol, "fetch", "--progress", "origin")
+		if got := runGit(t, d, "rev-parse", "origin/main"); strings.TrimSpace(got) != next {
+			t.Errorf("protocol %s: origin/main = %s, want %s", protocol, got, next)
+		}
+		if !strings.Contains(out, "remote: Total 1 ") {
+			t.Errorf("protocol %s: the fetch did not receive the one new commit alone:\n%s", protocol, out)
+		}
 	}
 }
 
@@ -150,57 +178,57 @@ func TestFetch_SendsTheHistoryAShallowFetchAsksFor(t *testing.T) {
 	}
 }
 
-func TestFetch_SendsOnlyTheObjectsAClientLacks(t *testing.T) {
+// The REST body limit is 1KB on this hub. Every request is answered 200 as
+// an upload-pack result and counted once: one that sends a pack as ok, one
+// answered with an ERR packet as an error.
+func TestFetch_AnswersAnUploadPackRequestInBand(t *testing.T) {
 	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{})
-	dir := t.TempDir()
-	versions := []string{"0", "2"}
-	for _, v := range versions {
-		runGit(t, dir, "-c", "protocol.version="+v, "clone", w.remote(w.ownerKey, "acme/demo.git"), "d"+v)
-	}
-	stream := "commit refs/heads/main\ncommitter P <p@example.invalid> now\ndata 6\nthird\nfrom refs/heads/main^0\nM 100644 inline README\ndata 2\n3\n"
-	if _, err := gitrepotest.Run(w.repo, stream, "fast-import", "--quiet", "--date-format=now"); err != nil {
-		t.Fatal(err)
-	}
-	head := gitrepotest.Refs(t, w.repo, "refs/heads/")["main"]
-	for _, v := range versions {
-		d := filepath.Join(dir, "d"+v)
-		out := runGit(t, d, "-c", "protocol.version="+v, "fetch", "--progress", "origin")
-		if got, _ := clientGit(t, d, nil, "rev-parse", "origin/main"); strings.TrimSpace(got) != head {
-			t.Errorf("protocol %s: origin/main = %s, want %s", v, got, head)
-		}
-		if !strings.Contains(out, "remote: Total 3 ") {
-			t.Errorf("protocol %s: the fetch did not receive 3 objects (commit, tree, blob):\n%s", v, out)
-		}
-	}
-}
-
-func TestFetch_SendsThePackOfAPlainOrGzipRequest(t *testing.T) {
-	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{})
+	w := newGitWorld(t, hubtest.Config{Server: `max_body_size = "1KB"`})
 	var zipped bytes.Buffer
 	zw := gzip.NewWriter(&zipped)
 	_, _ = io.WriteString(zw, fetchRequest(w.head))
 	_ = zw.Close()
-	for _, c := range []struct{ name, encoding, body string }{
-		{"plain", "", fetchRequest(w.head)},
-		{"gzip", "gzip", zipped.String()},
+	beyond := fetchRequest(w.head, slices.Repeat([]string{strings.Repeat("ab", 20)}, 82)...)
+	for _, c := range []struct {
+		name, encoding, body, err string
+		runsGit                   bool
+	}{
+		{"plain", "", fetchRequest(w.head), "", true},
+		{"gzip", "gzip", zipped.String(), "", true},
+		{"beyond the REST body limit", "", beyond, "", true},
+		{"empty body", "", "", "ERR empty request", false},
+		{"invalid gzip", "gzip", "not gzip", "ERR invalid gzip body", false},
+		{"not an upload-pack request", "", "0009junk", "ERR ", true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
 			header := http.Header{"Content-Type": {"application/x-git-upload-pack-request"}}
 			if c.encoding != "" {
 				header.Set("Content-Encoding", c.encoding)
 			}
+			runs, before := w.runs.n.Load(), w.git.Requests()
 			a := w.send(t, http.MethodPost, uploadPack, basic("x", w.ownerKey), header, c.body)
 			if a.status != http.StatusOK || a.header.Get("Content-Type") != result || a.header.Get("Cache-Control") != "no-cache" {
 				t.Fatalf("answer = %d Content-Type %q Cache-Control %q, want 200 %s no-cache", a.status,
 					a.header.Get("Content-Type"), a.header.Get("Cache-Control"), result)
 			}
-			if !strings.Contains(a.body, "PACK") {
-				t.Errorf("body = %q, want a pack", a.body)
+			pkts := pktlines(a.body)
+			i := slices.IndexFunc(pkts, func(p string) bool { return strings.HasPrefix(p, "ERR ") })
+			res, errSent := gitserver.ResultOK, i >= 0 && strings.HasPrefix(pkts[i], c.err)
+			if c.err != "" {
+				res = gitserver.ResultError
 			}
+			if strings.Contains(a.body, "PACK") != (c.err == "") || errSent != (c.err != "") {
+				t.Errorf("%d-byte request: body = %q, want a pack, or the ERR pkt-line %q and no pack", len(c.body), a.body, c.err)
+			}
+			if ran := w.runs.n.Load() > runs; ran != c.runsGit {
+				t.Errorf("git ran = %v, want %v", ran, c.runsGit)
+			}
+			w.counted(t, before, gitserver.LabelUploadPack, res)
 		})
+	}
+	rest := w.send(t, http.MethodPost, "/api/v1/orgs", "Bearer "+w.Token, http.Header{"Content-Type": {"application/json"}}, `{"slug":"`+strings.Repeat("a", 4096)+`"}`)
+	if len(beyond) < 4096 || rest.status != http.StatusRequestEntityTooLarge {
+		t.Errorf("the control: a 4KB REST request = %d %q, want 413 (git request of %d bytes)", rest.status, rest.body, len(beyond))
 	}
 }
 
@@ -244,39 +272,6 @@ func TestFetch_SendsGitsFirstBytesBeforeGitEnds(t *testing.T) {
 	got := make([]byte, len(pkt("NAK\n")))
 	if _, err := io.ReadFull(res.Body, got); err != nil || string(got) != pkt("NAK\n") {
 		t.Fatalf("read %q (%v) while git was running, want %q", got, err, pkt("NAK\n"))
-	}
-}
-
-func TestFetch_ReportsABadRequestInBand(t *testing.T) {
-	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{})
-	for _, c := range []struct {
-		name, body, encoding, want string
-		runsGit                    bool
-	}{
-		{"empty body", "", "", "ERR empty request", false},
-		{"invalid gzip", "not gzip", "gzip", "ERR invalid gzip body", false},
-		{"not an upload-pack request", "0009junk", "", "", true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			header := http.Header{}
-			if c.encoding != "" {
-				header.Set("Content-Encoding", c.encoding)
-			}
-			before := w.runs.n.Load()
-			a := w.send(t, http.MethodPost, uploadPack, basic("x", w.ownerKey), header, c.body)
-			if a.status != http.StatusOK || a.header.Get("Content-Type") != result {
-				t.Fatalf("answer = %d Content-Type %q, want 200 %s", a.status, a.header.Get("Content-Type"), result)
-			}
-			pkts := pktlines(a.body)
-			i := slices.IndexFunc(pkts, func(p string) bool { return strings.HasPrefix(p, "ERR ") })
-			if i < 0 || (c.want != "" && strings.TrimSuffix(pkts[i], "\n") != c.want) || strings.Contains(a.body, "PACK") {
-				t.Errorf("body = %q, want one ERR pkt-line %q and no pack", a.body, c.want)
-			}
-			if ran := w.runs.n.Load() > before; ran != c.runsGit {
-				t.Errorf("git ran = %v, want %v", ran, c.runsGit)
-			}
-		})
 	}
 }
 
