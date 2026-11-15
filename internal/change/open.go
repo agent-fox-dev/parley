@@ -102,13 +102,13 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (_ Chang
 		return Change{}, err
 	}
 	v := Version{
-		Number: 1, HeadSHA: o.head, BaseSHA: o.base, Kind: in.Kind, CreatedBy: actor, SessionID: o.session,
+		Number: 1, HeadSHA: o.head, BaseSHA: baseOf(o.base), Kind: in.Kind, CreatedBy: actor, SessionID: o.session,
 		Stats: o.stats, CreatedAt: now, Credential: in.Caller.Credential, PatchID: o.patchID,
 	}
 	ch := Change{
 		WorkspaceSlug: o.target.Slug, Number: number, Ref: Ref(o.target.Slug, number), Title: o.title, Intent: o.intent,
 		State: StateOpen, TargetBranch: o.targetBranch, Source: Source{o.source.Slug, in.SourceBranch},
-		Version: 1, HeadSHA: o.head, BaseSHA: o.base, Author: actor, SessionID: o.session,
+		Version: 1, HeadSHA: o.head, BaseSHA: baseOf(o.base), Author: actor, SessionID: o.session,
 		Mergeable: MergeableUnknown, Stats: o.stats, Paths: o.paths, PathsTruncated: o.truncated,
 		Landing: readyLanding(), Labels: o.labels, Reverts: in.Reverts, CreatedAt: now, UpdatedAt: now,
 	}
@@ -333,7 +333,7 @@ func (c *Component) resolve(ctx context.Context, q Querier, co collaborators, in
 		}
 		return c.changeExists(ctx, q, o.source.Slug, in.SourceBranch)
 	}
-	if err := o.measure(ctx, targetHead, ahead); err != nil {
+	if err := o.measureFromBase(ctx, ahead); err != nil {
 		return err
 	}
 	if err := o.describe(ctx, in); err != nil {
@@ -441,8 +441,9 @@ func (c *Component) sourceHead(ctx context.Context, in OpenInput, o *opening) er
 }
 
 // commitsAhead counts the commits of the head that the target branch, at
-// targetHead, lacks; there must be at least one and none may be a merge
-// commit.
+// targetHead, lacks, and finds the version's base, their merge base, into
+// o.base; there must be at least one such commit, a base, and no merge
+// commit among them.
 func (o *opening) commitsAhead(ctx context.Context, in OpenInput, targetHead string) (int, error) {
 	// A fork's repository reads its parent's objects, so the commits are
 	// read and the version measured where its head is, before the head is
@@ -454,6 +455,15 @@ func (o *opening) commitsAhead(ctx context.Context, in OpenInput, targetHead str
 	if len(ahead) == 0 {
 		return 0, server.NewError("nothing_to_land", http.StatusBadRequest,
 			fmt.Sprintf("source.branch: %s has no commit that %s lacks", in.SourceBranch, o.targetBranch))
+	}
+	if o.base, err = o.sourceRepo.MergeBase(ctx, o.head, targetHead); err != nil {
+		return 0, err
+	}
+	if o.base == "" {
+		// With no common ancestor there is nothing to land the change's
+		// commits onto: git refuses such a merge too.
+		return 0, server.NewError("unrelated_history", http.StatusBadRequest,
+			fmt.Sprintf("source.branch: %s shares no history with %s", in.SourceBranch, o.targetBranch))
 	}
 	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)
 	if err != nil {
@@ -470,7 +480,8 @@ func (o *opening) commitsAhead(ctx context.Context, in OpenInput, targetHead str
 
 // measure computes the version's base, stats, touched paths and patch id
 // against the target's head; ahead is the number of its commits the target
-// lacks.
+// lacks. A head that shares no history with the target has no base, and is
+// measured from the empty tree.
 func (o *opening) measure(ctx context.Context, targetHead string, ahead int) error {
 	var err error
 	if o.base, err = o.sourceRepo.MergeBase(ctx, o.head, targetHead); err != nil {
@@ -480,7 +491,8 @@ func (o *opening) measure(ctx context.Context, targetHead string, ahead int) err
 }
 
 // measureFromBase computes the version's stats, touched paths and patch id
-// against its base, o.base; ahead is the number of its commits.
+// against its base, o.base, the empty tree for none; ahead is the number
+// of its commits.
 func (o *opening) measureFromBase(ctx context.Context, ahead int) error {
 	repo := o.sourceRepo
 	changes, err := repo.DiffChanges(ctx, o.base, o.head)

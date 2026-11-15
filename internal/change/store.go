@@ -164,7 +164,7 @@ func insertChange(ctx context.Context, tx *sql.Tx, ch Change, v Version) error {
 	paths_truncated, landing, auto_land, labels, reverts, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ch.WorkspaceSlug, ch.Number, ch.Title, ch.Intent, ch.State, ch.TargetBranch,
-		ch.Source.WorkspaceSlug, ch.Source.Branch, ch.Version, ch.HeadSHA, ch.BaseSHA, v.PatchID, ch.DependsOn,
+		ch.Source.WorkspaceSlug, ch.Source.Branch, ch.Version, ch.HeadSHA, baseColumn(ch.BaseSHA), v.PatchID, ch.DependsOn,
 		ch.Author.ActorType, ch.Author.ActorID, ch.Author.Username, ch.SessionID, ch.Mergeable, ch.NeedsRestack,
 		ch.Stats.Commits, ch.Stats.FilesChanged, ch.Stats.Insertions, ch.Stats.Deletions, string(paths),
 		ch.PathsTruncated, string(landing), ch.AutoLand, string(labels), ch.Reverts,
@@ -189,7 +189,7 @@ func insertVersion(ctx context.Context, tx *sql.Tx, workspace string, number int
 	kind, patch_id, patch_equivalent_to, actor_type, actor_id, actor_username, credential_type, credential_id,
 	session_id, commits, files_changed, insertions, deletions, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		workspace, number, v.Number, v.HeadSHA, v.BaseSHA, v.Kind, v.PatchID, v.PatchEquivalentTo,
+		workspace, number, v.Number, v.HeadSHA, baseColumn(v.BaseSHA), v.Kind, v.PatchID, v.PatchEquivalentTo,
 		v.CreatedBy.ActorType, v.CreatedBy.ActorID, v.CreatedBy.Username, credType, credID, v.SessionID,
 		v.Stats.Commits, v.Stats.FilesChanged, v.Stats.Insertions, v.Stats.Deletions, v.CreatedAt.UnixNano())
 	if err != nil {
@@ -236,7 +236,7 @@ func storeVersion(ctx context.Context, tx *sql.Tx, workspace string, number int6
 	}
 	return update(ctx, tx, workspace, number, v.CreatedAt, `version = ?, head_sha = ?, base_sha = ?, patch_id = ?,
 	commits = ?, files_changed = ?, insertions = ?, deletions = ?, paths = ?, paths_truncated = ?, session_id = ?,
-	mergeable = 'unknown'`, v.Number, v.HeadSHA, v.BaseSHA, v.PatchID, v.Stats.Commits, v.Stats.FilesChanged,
+	mergeable = 'unknown'`, v.Number, v.HeadSHA, baseColumn(v.BaseSHA), v.PatchID, v.Stats.Commits, v.Stats.FilesChanged,
 		v.Stats.Insertions, v.Stats.Deletions, string(b), truncated, v.SessionID)
 }
 
@@ -353,13 +353,14 @@ const changeColumns = `workspace_slug, number, title, intent, state, abandon_rea
 func readChange(ctx context.Context, q Querier, workspace string, number int64) (Change, error) {
 	var (
 		ch                        Change
+		base                      string
 		abandon, conflict, landed sql.NullString
 		paths, landing, labels    string
 		created, updated          int64
 	)
 	err := q.QueryRowContext(ctx, `SELECT `+changeColumns+` FROM changes WHERE workspace_slug = ? AND number = ?`,
 		workspace, number).Scan(&ch.WorkspaceSlug, &ch.Number, &ch.Title, &ch.Intent, &ch.State, &abandon,
-		&ch.TargetBranch, &ch.Source.WorkspaceSlug, &ch.Source.Branch, &ch.Version, &ch.HeadSHA, &ch.BaseSHA,
+		&ch.TargetBranch, &ch.Source.WorkspaceSlug, &ch.Source.Branch, &ch.Version, &ch.HeadSHA, &base,
 		&ch.DependsOn, &ch.Author.ActorType, &ch.Author.ActorID, &ch.Author.Username, &ch.SessionID, &ch.Mergeable,
 		&conflict, &ch.NeedsRestack, &ch.RestackReason, &ch.Stats.Commits, &ch.Stats.FilesChanged,
 		&ch.Stats.Insertions, &ch.Stats.Deletions, &paths, &ch.PathsTruncated, &landing, &ch.AutoLand, &labels,
@@ -371,6 +372,7 @@ func readChange(ctx context.Context, q Querier, workspace string, number int64) 
 		return Change{}, fmt.Errorf("read %s: %w", Ref(workspace, number), err)
 	}
 	ch.Ref = Ref(ch.WorkspaceSlug, ch.Number)
+	ch.BaseSHA = baseOf(base)
 	ch.abandonReason = abandon.String
 	ch.CreatedAt, ch.UpdatedAt = time.Unix(0, created).UTC(), time.Unix(0, updated).UTC()
 	if conflict.Valid {
@@ -459,15 +461,17 @@ WHERE workspace_slug = ? AND number = ? AND version > ? ORDER BY version LIMIT ?
 	for rows.Next() {
 		var (
 			credType, credID sql.NullString
+			base             string
 			created          int64
 			ver              Version
 		)
-		if err := rows.Scan(&ver.Number, &ver.HeadSHA, &ver.BaseSHA, &ver.Kind, &ver.PatchID, &ver.PatchEquivalentTo,
+		if err := rows.Scan(&ver.Number, &ver.HeadSHA, &base, &ver.Kind, &ver.PatchID, &ver.PatchEquivalentTo,
 			&ver.CreatedBy.ActorType, &ver.CreatedBy.ActorID, &ver.CreatedBy.Username, &credType, &credID,
 			&ver.SessionID, &ver.Stats.Commits, &ver.Stats.FilesChanged, &ver.Stats.Insertions, &ver.Stats.Deletions,
 			&created); err != nil {
 			return nil, err
 		}
+		ver.BaseSHA = baseOf(base)
 		ver.Credential = Credential{Type: credType.String, ID: credID.String}
 		ver.CreatedAt = time.Unix(0, created).UTC()
 		out = append(out, ver)
@@ -491,6 +495,25 @@ func queryList[T any](ctx context.Context, q Querier, query string, args ...any)
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// baseOf is the base_sha of a change or a version whose base column, or
+// measured base, holds base: nil for "", a head that shares no history
+// with the target branch.
+func baseOf(base string) *string {
+	if base == "" {
+		return nil
+	}
+	return &base
+}
+
+// baseColumn is the base column's value for the base_sha base: "" for
+// none, which the repository's diffs read as the empty tree.
+func baseColumn(base *string) string {
+	if base == nil {
+		return ""
+	}
+	return *base
 }
 
 // nonNil is s, or an empty list for nil.

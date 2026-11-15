@@ -239,12 +239,23 @@ func TestSetters_StoreWhatOtherComponentsCompute(t *testing.T) {
 		}
 		ch := set(t, 2, func(ctx context.Context, tx *sql.Tx) error { return w.changes.SetBase(ctx, tx, "demo", 2, b1) })
 		stats := change.Stats{Commits: 1, FilesChanged: 1, Insertions: 1}
-		if ch.BaseSHA != b1 || ch.Stats != stats || !reflect.DeepEqual(ch.Paths, []string{"b2.txt"}) {
-			t.Errorf("base_sha, stats, paths = %s, %+v, %v; want %s, %+v, [b2.txt]", ch.BaseSHA, ch.Stats, ch.Paths, b1, stats)
+		if deref(ch.BaseSHA) != b1 || ch.Stats != stats || !reflect.DeepEqual(ch.Paths, []string{"b2.txt"}) {
+			t.Errorf("base_sha, stats, paths = %s, %+v, %v; want %s, %+v, [b2.txt]", deref(ch.BaseSHA), ch.Stats, ch.Paths, b1, stats)
 		}
 		vs, err := change.ReadVersions(ctx, w.Store.Main(), "demo", 2)
-		if err != nil || len(vs) != 1 || vs[0].BaseSHA != b1 || vs[0].Stats != stats || vs[0].PatchID != patchID {
+		if err != nil || len(vs) != 1 || deref(vs[0].BaseSHA) != b1 || vs[0].Stats != stats || vs[0].PatchID != patchID {
 			t.Errorf("versions = %+v, %v; want version 1 based on %s with %+v and the patch id %s", vs, err, b1, stats, patchID)
+		}
+	})
+	t.Run("no base", func(t *testing.T) {
+		ch := set(t, 2, func(ctx context.Context, tx *sql.Tx) error { return w.changes.SetBase(ctx, tx, "demo", 2, "") })
+		stats := change.Stats{Commits: 3, FilesChanged: 3, Insertions: 5}
+		if ch.BaseSHA != nil || ch.Stats != stats || !reflect.DeepEqual(ch.Paths, []string{"a.txt", "b1.txt", "b2.txt"}) {
+			t.Errorf("base_sha, stats, paths = %v, %+v, %v; want none, %+v and every file of %s", ch.BaseSHA, ch.Stats, ch.Paths, stats, b2)
+		}
+		vs, err := change.ReadVersions(ctx, w.Store.Main(), "demo", 2)
+		if err != nil || len(vs) != 1 || vs[0].BaseSHA != nil || vs[0].Stats != stats {
+			t.Errorf("versions = %+v, %v; want version 1 with no base and %+v", vs, err, stats)
 		}
 	})
 	t.Run("mergeable and its conflict report", func(t *testing.T) {

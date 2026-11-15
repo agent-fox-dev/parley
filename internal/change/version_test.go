@@ -28,7 +28,7 @@ func TestRecordVersion_RecordsTheNewHeadAsTheNextVersion(t *testing.T) {
 
 	v := w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "feat", Head: h2, Kind: change.KindPush,
 		Caller: w.ownerCaller(), SessionID: new(sessionTwo)})
-	if v.Number != 2 || v.Kind != "push" || v.HeadSHA != h2 || v.BaseSHA != w.base || v.CreatedBy.ActorID == nil ||
+	if v.Number != 2 || v.Kind != "push" || v.HeadSHA != h2 || deref(v.BaseSHA) != w.base || v.CreatedBy.ActorID == nil ||
 		*v.CreatedBy.ActorID != w.owner || v.SessionID == nil || *v.SessionID != sessionTwo {
 		t.Errorf("RecordVersion = %+v, want version 2 of kind push at %s by the owner in sessionTwo", v, h2)
 	}
@@ -49,7 +49,7 @@ func TestRecordVersion_RecordsTheNewHeadAsTheNextVersion(t *testing.T) {
 		t.Errorf("versions = %v, want version 1 unchanged (%v) and %v", versions, v1, asJSON(t, v))
 	}
 	ch := w.read(t, 1)
-	if ch.Version != 2 || ch.HeadSHA != h2 || ch.BaseSHA != w.base || ch.Stats.Commits != 2 || ch.Stats.FilesChanged != 2 ||
+	if ch.Version != 2 || ch.HeadSHA != h2 || deref(ch.BaseSHA) != w.base || ch.Stats.Commits != 2 || ch.Stats.FilesChanged != 2 ||
 		ch.SessionID == nil || *ch.SessionID != sessionTwo || ch.Mergeable != change.MergeableUnknown || ch.UpdatedAt.Before(before) ||
 		!reflect.DeepEqual(ch.Paths, []string{"x.txt", "y.txt"}) || !reflect.DeepEqual(ch.Sessions, []string{sessionTwo}) {
 		t.Errorf("the change reads %+v, want version 2 at %s with two commits, x.txt and y.txt, sessionTwo and mergeable unknown", ch, h2)
@@ -251,6 +251,9 @@ func TestRecordVersion_StoresTheStructuralLandingWithoutTheEvaluator(t *testing.
 		{"the head of main", 1, func(*testing.T) string { return main }, "nothing_to_land"},
 		{"an ancestor of main", 1, func(*testing.T) string { return w.base }, "nothing_to_land"},
 		{"a merge commit ahead of main", 1, merge, "merge_commits"},
+		{"a history with no common ancestor", 1, func(t *testing.T) string {
+			return commit(t, w.demo, "feat", "", "Root\n", map[string]string{"r.txt": "r\n"})
+		}, "unrelated_history"},
 		{"a commit ahead of main", 1, func(t *testing.T) string {
 			return commit(t, w.demo, "feat", main, "Ahead\n", map[string]string{"x.txt": "x\n"})
 		}, ""},
@@ -258,7 +261,7 @@ func TestRecordVersion_StoresTheStructuralLandingWithoutTheEvaluator(t *testing.
 			return commit(t, w.demo, "drafty", "drafty", "More\n", map[string]string{"d.txt": "d\n"})
 		}, "draft"},
 		{"a missing target branch", 1, func(t *testing.T) string {
-			previousBase = w.read(t, 1).BaseSHA
+			previousBase = deref(w.read(t, 1).BaseSHA)
 			gitrepotest.Git(t, w.demo, "update-ref", "-d", "refs/heads/main")
 			return commit(t, w.demo, "feat", "feat", "After\n", map[string]string{"y.txt": "y\n"})
 		}, "target_not_found"},
@@ -284,8 +287,12 @@ func TestRecordVersion_StoresTheStructuralLandingWithoutTheEvaluator(t *testing.
 			if len(calls.order) != wantCalls {
 				t.Errorf("the evaluator was called %d times, want %d", len(calls.order)-called, wantCalls-called)
 			}
-			if c.reason == "target_not_found" && v.BaseSHA != previousBase {
-				t.Errorf("base_sha = %s, want the previous version's %s", v.BaseSHA, previousBase)
+			if c.reason == "unrelated_history" && (v.BaseSHA != nil || ch.BaseSHA != nil ||
+				ch.Stats != (change.Stats{Commits: 1, FilesChanged: 1, Insertions: 1}) || !reflect.DeepEqual(ch.Paths, []string{"r.txt"})) {
+				t.Errorf("base_sha %v, the change reads %+v; want no base and r.txt measured from the empty tree", v.BaseSHA, ch)
+			}
+			if c.reason == "target_not_found" && deref(v.BaseSHA) != previousBase {
+				t.Errorf("base_sha = %s, want the previous version's %s", deref(v.BaseSHA), previousBase)
 			}
 		})
 	}

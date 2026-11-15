@@ -200,3 +200,13 @@ func TestCommitsBetween_ListsAndCountsTheCommitsOnlyOneSideHas(t *testing.T) {
 		}
 	}
 }
+
+func TestCommitsBetween_ListsEveryCommitOfTheHeadForNoBase(t *testing.T) {
+	t.Parallel()
+	f := newCompareFixture(t)
+	want := strings.Fields(gitrepotest.Git(t, f.dir, "rev-list", "--reverse", "--topo-order", "feature"))
+	got, err := f.repo.CommitsBetween(context.Background(), "", f.id(t, "feature"), 0)
+	if err != nil || len(got) < 2 || !slices.Equal(got, want) {
+		t.Errorf("CommitsBetween(\"\", feature, 0) = %v, %v; want %v", got, err, want)
+	}
+}

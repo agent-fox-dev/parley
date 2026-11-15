@@ -340,3 +340,36 @@ func applies(t *testing.T, dir, commit string, patch []byte) {
 		}
 	}
 }
+
+// feat is rewritten to a root commit holding r.txt alone, so version 2
+// shares no history with main.
+func TestDiff_ServesAVersionWithNoBaseFromTheEmptyTree(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	head1 := commit(t, w.demo, "feat", w.base, "Feat\n", map[string]string{"x.txt": "x\n"})
+	w.openBranch(t, "feat", nil)
+	seq := w.seq(t)
+	root := commit(t, w.demo, "feat", "", "Root\n", map[string]string{"r.txt": "r\n"})
+	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "feat", Head: root, Kind: change.KindPush, Caller: w.ownerCaller()})
+
+	_, ch, _ := w.get(t, "/workspaces/demo/changes/1", w.ownerKey)
+	if versions := w.versions(t, "demo", 1); ch["base_sha"] != nil || !hasMember(ch, "base_sha") || versions[1]["base_sha"] != nil {
+		t.Errorf("base_sha of the change = %v, of version 2 = %v; want null", ch["base_sha"], versions[1]["base_sha"])
+	}
+	if events := w.eventsAfter(t, seq); len(events) != 1 || metadata(t, events[0])["base_sha"] != nil || !hasMember(metadata(t, events[0]), "base_sha") {
+		t.Errorf("events = %v, want one parley.change.version with base_sha null", events)
+	}
+	status, got, _ := w.get(t, "/workspaces/demo/changes/1/diff", w.ownerKey)
+	if status != http.StatusOK || got["base_sha"] != nil || !hasMember(got, "base_sha") || got["merge_base_sha"] != nil || got["head_sha"] != root {
+		t.Fatalf("GET diff = %d %v, want 200 with base_sha and merge_base_sha null and head %s", status, got, root)
+	}
+	if f := filesByPath(got)["r.txt"]; len(files(got)) != 1 || f["status"] != "added" {
+		t.Errorf("files = %v, want r.txt added", files(got))
+	}
+	status, got, _ = w.get(t, "/workspaces/demo/changes/1/diff?version=2&against=1", w.ownerKey)
+	byPath := filesByPath(got)
+	if status != http.StatusOK || got["base_sha"] != head1 || byPath["r.txt"]["status"] != "added" || byPath["r.txt"]["changed"] != true ||
+		byPath["x.txt"]["status"] != "deleted" || byPath["x.txt"]["changed"] != true {
+		t.Errorf("GET diff?version=2&against=1 = %d %v, want r.txt added and x.txt deleted from %s", status, got, head1)
+	}
+}

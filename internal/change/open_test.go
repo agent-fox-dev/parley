@@ -742,6 +742,7 @@ func TestOpen_AnswersTheFirstFailingCheckOfTheSourceAndTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/behind", w.base)
+	commit(t, w.demo, "orphan", "", "Orphan\n\nWhy.\n", map[string]string{"o.txt": "o\n"})
 	w.branch(t, "feat", "Feat\n\nWhy.\n")
 
 	body := func(ws, branch, target string) map[string]any {
@@ -765,6 +766,7 @@ func TestOpen_AnswersTheFirstFailingCheckOfTheSourceAndTarget(t *testing.T) {
 		{"the source branch is missing", "demo", body("", "nope", ""), http.StatusBadRequest, "source_not_found"},
 		{"source and target are one branch", "demo", body("", "main", "main"), http.StatusBadRequest, "invalid_request"},
 		{"nothing to land", "demo", body("", "behind", ""), http.StatusBadRequest, "nothing_to_land"},
+		{"no history in common with the target", "demo", body("", "orphan", ""), http.StatusBadRequest, "unrelated_history"},
 		{"a merge commit ahead", "demo", body("", "merged", ""), http.StatusBadRequest, "merge_commits_unsupported"},
 		{"no target branch and no source branch", "demo", body("", "nope", "nope"), http.StatusBadRequest, "target_not_found"},
 		{"an unrelated source without the branch", "demo", body("elsewhere", "nope", ""), http.StatusBadRequest, "source_not_related"},
