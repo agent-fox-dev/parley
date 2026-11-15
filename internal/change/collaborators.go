@@ -173,10 +173,11 @@ type collaborators struct {
 	observers []VersionObserver
 	guard     AutoLandGuard
 	activity  ForkActivity
+	restacker Restacker
 }
 
 func (c *Component) collaborators() collaborators {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return collaborators{c.sessions, c.stack, c.evaluator, append([]VersionObserver(nil), c.observers...), c.guard, c.activity}
+	return collaborators{c.sessions, c.stack, c.evaluator, append([]VersionObserver(nil), c.observers...), c.guard, c.activity, c.restacker}
 }

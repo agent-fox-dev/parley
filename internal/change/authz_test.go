@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -52,7 +53,13 @@ type miaWorld struct {
 
 func newMiaWorld(t *testing.T) *miaWorld {
 	t.Helper()
-	m := &miaWorld{world: newWorld(t)}
+	return newMiaWorldWith(t, hubtest.Config{})
+}
+
+// newMiaWorldWith is newMiaWorld on a hub started with cfg.
+func newMiaWorldWith(t *testing.T, cfg hubtest.Config) *miaWorld {
+	t.Helper()
+	m := &miaWorld{world: newWorldWith(t, cfg)}
 	m.mia, m.miaKey = m.member(t, "mia")
 	_, m.noaKey = m.member(t, "noa")
 	m.t1 = m.addFork(t, "demo--t1", "main", nil, nil)

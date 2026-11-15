@@ -3630,7 +3630,8 @@ counted.
 The collaborators (`internal/change/collaborators.go`) are registered on
 the component instance, with `RegisterSessionLinker`,
 `RegisterStackLinker`, `RegisterLandingEvaluator`, `AddVersionObserver`,
-`RegisterAutoLandGuard` and `RegisterForkActivity`
+`RegisterAutoLandGuard`, `RegisterForkActivity` and, declared beside the
+abandon in `lifecycle.go`, `RegisterRestacker`
 ([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
 The hub registers the fork activity recorder (below) and none of the
 others yet. `ReadChange(ctx, q, workspace, number)` reads
@@ -3686,8 +3687,8 @@ record, so a delete may call them after the workspace's own record is
 gone. `SourceDeleted(ctx, tx, workspace, branch, actor)` moves the draft
 or open change of the source branch (`workspace` being the source
 workspace, as for `RecordVersion`) to `abandoned` for `source_deleted`
-through `SetAbandoned`, so a fork source's recorder is told, and a branch
-with no such change changes nothing. `ForkDeleted(ctx, tx, fork, actor)`
+through `Abandon` (below), so a fork source's recorder is told, and a
+branch with no such change changes nothing. `ForkDeleted(ctx, tx, fork, actor)`
 moves every draft or open change whose source is the fork, all of them
 the parent's, to `abandoned` for `source_workspace_deleted` without
 telling the recorder, and leaves landed and abandoned changes alone; a
@@ -3744,11 +3745,29 @@ row only (`SetBase` would rewrite the current version too), runs
 `parley.change.version` by the caller with kind `retarget`
 (`KindRetarget`, an event kind no stored version has) for the current
 version. A `target_branch` equal to the change's own is no edit on a draft or
-open change; the closed-change rules count it like any other member. The abandon goes through
+open change; the closed-change rules count it like any other member.
+Every abandon of a change, by the route, a deleted source branch and the
+other callers in the hub, goes through
 `(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
-which is `SetAbandoned`, `ForgetLandable` and `parley.change.abandon` with
-the given reason;
-the restore sets the change `open`, calls `ScheduleMergeable` and writes
+which is `SetAbandoned`, `ForgetLandable`, `parley.change.abandon` with the
+given reason, and the removal of the change from the mergeability
+worker's waiting checks; it touches no ref and leaves the change's
+dependants as they are. The abandon route's operation (`lifecycle.go`)
+decodes an optional body (`reason` a string, `dependants`
+`DependantsReparent` or `DependantsAbandon`), refuses a closed change
+(`409 change_closed`) and, without a `dependants` member, one with draft
+or open dependants (`409 has_dependants`). `DependantsAbandon` collects
+the whole stack above (the dependants, transitively) and abandons it
+after the change, in the one transaction. `DependantsReparent` abandons
+the change, sets each direct dependant's `depends_on` to the change's own
+with `SetDependsOn`, then hands each to the `Restacker`
+(`RequestRestack(ctx, tx, ch, trigger)`, declared in `lifecycle.go` and
+registered with `(*change.Component).RegisterRestacker`, which the stack
+feature implements) with the trigger `abandon` (`TriggerAbandon`) inside
+the transaction, whose error rolls the abandon back; with no restacker
+registered it calls `ScheduleMergeable` on each instead. When the route's
+transaction does not commit, the checks the abandon dropped are
+scheduled again. The restore sets the change `open`, calls `ScheduleMergeable` and writes
 `parley.change.restore` (`EventRestore`, metadata `number`, `ref`,
 `version`, `head_sha`).
 

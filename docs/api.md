@@ -3967,11 +3967,28 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   when a stored value changes; editing `title`, `intent`, `labels` or
   `auto_land` writes no event, and the events of a retarget and of a move
   from draft to open come after them, so they carry the edited `title`.
-- `POST …/abandon` takes no body or a JSON object with `reason`, a string,
-  and moves the change to `abandoned`, writing `parley.change.abandon` by
-  the caller with `reason` as given (the empty string when absent),
-  `number`, `ref`, `version` and `head_sha`. The source branch and the version refs
-  stay.
+- `POST …/abandon` takes no body or a JSON object (no body is the same as
+  `{}`) with two optional members: `reason`, a string, and `dependants`,
+  `"reparent"` or `"abandon"`; another type, `null`, or another value of
+  `dependants` is `400` `invalid_request`. An abandoned or landed change
+  is answered `409` `change_closed`. A change on which a draft or open
+  change depends (its `dependants`) is answered `409` `has_dependants`
+  when the body has no `dependants`, with the numbers of the dependants
+  in the error's `dependants` member, and nothing changes. The change
+  moves to `abandoned`, its waiting mergeability check is dropped and its
+  landable announcement forgotten, and `parley.change.abandon` is
+  written by the caller with `reason` as given (the empty string when
+  absent), `number`, `ref`, `version` and `head_sha`. The source branch
+  and the version refs stay. With `"abandon"`, every draft or open change
+  above it in its stack, direct or not, is abandoned too in the same
+  transaction, with the same `reason` and one `parley.change.abandon`
+  each. With `"reparent"`, each direct dependant stays as it is but now
+  depends on what the abandoned change depended on (`null` when nothing),
+  and its restack is asked for, by the stack feature when the hub has
+  one: when that request fails, the answer is `500` and nothing is
+  abandoned; without it, the dependant's `mergeable` becomes `unknown`
+  and is checked again. `dependants` on a change that has none changes
+  nothing.
 - `POST …/restore` takes no body and moves the change to `open` at its
   last version with `mergeable` `unknown`, writing
   `parley.change.restore` by the caller with `number`, `ref`, `version`

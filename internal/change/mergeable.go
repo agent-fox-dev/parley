@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -424,6 +425,20 @@ func (w *mergeWorker) pend(k mergeKey) {
 		w.pending = append(w.pending, k)
 	}
 	w.signal()
+}
+
+// drop removes k from the waiting checks, for a change that is no longer
+// draft or open, and reports whether a check of k was waiting. A check of
+// k that runs stores nothing for such a change.
+func (w *mergeWorker) drop(k mergeKey) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.queued[k] {
+		return false
+	}
+	delete(w.queued, k)
+	w.pending = slices.DeleteFunc(w.pending, func(p mergeKey) bool { return p == k })
+	return true
 }
 
 // next takes the first waiting change that has no running check and whose

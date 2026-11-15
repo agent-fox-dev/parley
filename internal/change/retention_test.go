@@ -60,6 +60,9 @@ func TestSourceDeleted_AbandonsTheChangeOfTheBranchAndKeepsItsVersions(t *testin
 			if got := abandonReason(t, w, c.number); got != "source_deleted" {
 				t.Errorf("abandon reason = %q, want source_deleted", got)
 			}
+			if got := w.announced(t, c.number); got != "" {
+				t.Errorf("the change is still announced landable at %s", got)
+			}
 			if got := w.versions(t, "demo", c.number); len(got) != len(c.heads) {
 				t.Errorf("versions = %v, want %d", got, len(c.heads))
 			}

@@ -382,6 +382,7 @@ type Component struct {
 	observers []VersionObserver
 	guard     AutoLandGuard
 	activity  ForkActivity
+	restacker Restacker
 	expanders map[string]Expander
 
 	// merge holds the scheduled mergeability checks.
