@@ -4347,6 +4347,82 @@ source is that fork. The `stack_of` filter of
 [the list](#get-apiv1workspacesslugchanges) walks the stack in every
 state instead.
 
+## Landing
+
+Landing adds a change's commits to its target branch. Every request to
+land a change, or a stack of changes, is recorded as a land attempt,
+which is kept for the life of its workspace: the teardown that deletes a
+workspace deletes its attempts. The land route that creates attempts is
+not served yet; the hub serves the attempts read-only.
+
+The land attempt object:
+
+```json
+{"id":"0f9a7f8e-5c1b-4d6e-9a3b-1c2d3e4f5a6b","workspace_slug":"demo","target_branch":"main","changes":[1,2],"status":"landed","trigger":"manual","strategy":"rebase","attempts":1,"onto_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","landed_sha":"5e3d0c1a2b4f6e8d0a1c3e5f7a9b1d3f5e7a9c1b","noop":false,"commits":[{"change":1,"version_sha":"0b86db2bc73da0f067ec404140cfc00060162383","landed_sha":"7c1e9a2b3d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b"},{"change":2,"version_sha":"1f2e3d4c5b6a7980a1b2c3d4e5f6a7b8c9d0e1f2","landed_sha":"5e3d0c1a2b4f6e8d0a1c3e5f7a9b1d3f5e7a9c1b"}],"conflict":null,"blocked":null,"error":null,"override":null,"policy_revision":0,"requested_by":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"created_at":"2026-11-16T09:00:00Z","finished_at":"2026-11-16T09:00:01Z"}
+```
+
+Every member is always present, `null` where the attempt has no value.
+
+| Member | Meaning |
+|---|---|
+| `id` | the attempt's UUID |
+| `workspace_slug`, `target_branch` | the workspace whose branch the attempt lands on, which holds the changes, and the branch |
+| `changes` | the numbers of the changes the attempt lands, bottom first. The attempt lands the version each change had when the attempt was created; a version that arrives later is not landed by it |
+| `status` | `running`, then one of the final `landed`, `conflict`, `blocked` and `failed`. A final attempt never changes, and reads the same on every later request |
+| `trigger` | `manual`, or `auto_land` for the automatic landing of a change |
+| `strategy` | `rebase` or `squash` |
+| `attempts` | the tries to move the target branch |
+| `onto_sha`, `landed_sha` | the target head the commits were landed on and the head the land made it |
+| `noop` | `true` for a land whose commits were all on the target already |
+| `commits` | each landed commit: the `change` it belongs to, the commit of its version (`version_sha`) and the commit it landed as (`landed_sha`); `[]` for none |
+| `conflict` | the conflict report of an attempt that ended `conflict`, in the form [the comparison](#get-apiv1workspacesslugscmcompare) gives it |
+| `blocked` | the change whose landing requirements were not met: `change`, `status` and `requirements` (never `null`) |
+| `error` | why an attempt ended `failed`: `contention`, `timeout`, `origin_rejected` or `internal` |
+| `override` | `{"reason": …}`, the override the attempt applied |
+| `policy_revision` | the revision of the policy that judged the attempt, `null` until it was judged |
+| `requested_by` | who asked for the land: `actor_type` (`admin_token`, `api_key` or `pat`), `actor_id` and `username`, both `null` for the admin token |
+| `session_id` | the session the land was asked for in |
+| `created_at`, `finished_at` | when the attempt was created and when it ended, `null` while it runs |
+
+The three reads need the scope `changes:read` and read access to
+`{slug}`. Both lists are [lists](#lists) ordered newest first: by
+`created_at` at the whole second it shows, then by `id`, both descending.
+A token bound to a task fork, calling on the fork's parent, reaches
+`GET …/changes/{number}/lands` and `GET …/lands/{id}`; `GET …/lands` is
+answered `403` `token_bound`.
+
+### `GET /api/v1/workspaces/{slug}/changes/{number}/lands`
+
+Lists the attempts that cover the change `{number}` of `{slug}`, those of
+a stack it is part of included; `items` is `[]` for a change with none.
+A `{number}` that is not a positive integer, or that `{slug}` has no change
+of, is `404` `change_not_found`.
+
+### `GET /api/v1/workspaces/{slug}/lands`
+
+Lists the attempts whose target is `{slug}`, narrowed by every filter the
+query gives:
+
+| Parameter | Keeps |
+|---|---|
+| `status` | the attempts in that status; repeatable, any of the values given |
+| `target_branch` | the attempts on that branch |
+| `since` | the attempts created at or after that RFC 3339 timestamp |
+
+A task fork holds no changes, so its attempts are never listed on its
+parent. `400` `invalid_request` answers a `status` that is not one of the
+five (`status must be one of running, landed, conflict, blocked, failed`),
+a `since` that does not parse (`since must be an RFC 3339 timestamp`), a
+`limit` outside 1 to 200 and a cursor that is malformed or that a query
+with other filters issued.
+
+### `GET /api/v1/workspaces/{slug}/lands/{id}`
+
+Answers `200` with the land attempt `{id}` of `{slug}`. An `{id}` that is
+not a UUID, that names no attempt, or that names an attempt of another
+workspace is `404` `land_not_found`, with the message `<slug> has no land
+attempt "<id>"`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

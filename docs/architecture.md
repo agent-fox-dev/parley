@@ -26,6 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
+| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -496,6 +497,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AdjustGitServer(func(*gitserver.Deps))` | a change to the git server's dependencies, applied after the start hook `gitserver` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the git runner, the timeout or a service in place of the exchange |
 | `AdjustSCM(func(*scm.Deps))` | a change to the source control reads' dependencies, applied after the start hook `scm` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the repository opener or the request recorder |
 | `AdjustChange(func(*change.Deps))` | a change to the change component's dependencies, applied after the start hook `changes` builds them and before it binds them, in the order added |
+| `AdjustLand(func(*land.Deps))` | a change to the land component's dependencies, applied after the start hook `land` builds them and before it binds them, in the order added |
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
@@ -4302,6 +4304,46 @@ the heads' diff does not name (the same content at both heads) is
 answered `modified` with an empty patch and counted in `stats`, unless
 that diff cut its list of files, and an unchanged one with the file change
 of its own diff and no patch.
+
+### Landing
+
+`internal/hub/land.go` adds the part `composeLand`, after `composeChanges`
+in `parts`. It creates a zero `land.Component` (`Land()`), adds
+`land.SchemaStep` (the step `land_attempts`), registers its `Routes()`
+with `AddRoute`, registers `WorkspaceDeleted` as a remover of the
+workspace teardown, which deletes a deleted workspace's attempts in the
+delete's transaction, and binds the component in the start hook `land`
+to the store (`Store`), the hub's git opening
+`(*workspace.Service).RepoPath(slug)` (`Repos`), the change component
+(`Changes`), `landWorkspaces` (`Workspaces`), an adapter over
+`workspace.BySlug`, read through the querier it is given, with
+`workspace.RequireReady` as `Ready` and the effective `land.strategy`,
+`land.by_author` and `land.delete_source`, the access service
+(`Access`), the event component (`Events`), the ref writer
+(`RefWriter`) and the hub's clock and logger; `AdjustLand` adjusters run
+before the bind.
+
+The schema keeps `land_attempts` (one row per attempt, keyed by its
+UUID, with the workspace, the target branch, the status, constrained to
+the five, the trigger, the strategy, the result members, `commits`,
+`conflict`, `blocked` and `override` as JSON, who requested it with the
+credential's id, and `created_at` and `finished_at` in nanoseconds), with
+indexes on the workspace with the status and with `created_at`, and
+`land_attempt_changes` (keyed by attempt and position, the changes an
+attempt covers bottom first, each with the version it had when the
+attempt was created, that version's head and base, and the change's
+source workspace and branch), deleted with its attempt, with an index on
+the number. An attempt is inserted running; finishing it writes its final
+status and its result members in one `UPDATE` that only a running
+attempt of that workspace takes, so a second final status is refused and
+a final attempt never changes.
+
+The routes read the store directly. `GET …/changes/:number/lands` reads
+the change through `(*change.Component).ReadChange` first, so a number
+the workspace does not have is `404 change_not_found`, and selects the
+attempts with a covered change of that number; `GET …/lands` adds a
+condition per filter. Both order by `created_at / 1000000000` (the shown
+second) and `id`, descending, and page by keyset on those two values.
 
 ### Hub events
 
