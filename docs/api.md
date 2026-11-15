@@ -3231,7 +3231,25 @@ compare-and-swap against the value the route read: a ref that moved in
 between is `409` `ref_moved`, with the commit it is at now in
 `error.details.current_sha` (`null` when it no longer exists), and nothing
 changes. An accepted write emits one `parley.git.push` event per ref, with
-`via` `"api"`, as a push does with `via` `"git"`.
+`via` `"api"`, as a push does with `via` `"git"`, and the hub's ref writer
+tells the post-push listeners of it as of a push, with `via` `"api"` and
+the request's session; a refused write tells them nothing.
+
+The commit and the rebase route take a `session_id`, the agent session the
+write belongs to. It is checked after the body and before the branch is
+read: a session the hub does not know for the caller and the workspace is
+`400` `unknown_session` (`session_id: no session "…"`), and nothing moves.
+No session feature is registered yet, so every `session_id` is refused
+that way. An accepted session goes, in lower case, onto the write's
+events, the version the write records and, for a commit, the commit
+object's `session_id`.
+
+The three `POST` routes (commit, ref creation, rebase) are create routes
+(see [Idempotency](#idempotency)): a repeated `Idempotency-Key` with the
+same body answers `200` with the first answer and moves nothing, the same
+key with another body is `409` `conflict`, and a refused request is not
+recorded, so its retry is decided again. `PATCH` and `DELETE` ignore the
+header; `expected_sha` makes their retry safe.
 
 A protected branch (one the workspace's effective `protected_branches`
 match, a task fork's its parent's) is held as for a push. Nobody, the admin
@@ -3283,6 +3301,7 @@ and moves one branch to it, or creates the branch there. The body:
 | `operations` | the file operations, at most 1,000, applied in order, each to the tree the one before it left; may be empty or absent |
 | `allow_empty` | `true` to make a commit whose tree is its parent's; default `false` |
 | `change` | `{"target_branch": …, "title": …, "intent": …, "draft": …}`, a change to open with `branch` as its source; refused on a protected branch (see [Source control writes](#source-control-writes)) |
+| `session_id` | the agent session the commit belongs to (see [Source control writes](#source-control-writes)) |
 
 An operation is one of:
 
@@ -3308,8 +3327,42 @@ git's garbage collection.
 The checks run in this order: the body and the shape of every operation,
 before the repository is read, so a malformed request answers `400`
 whatever the branch's state; a `change` object on a protected branch,
-before the parent is resolved or any object is written; the parent; the operations against the tree;
-emptiness; then the push rules and the compare-and-swap.
+before the parent is resolved or any object is written; the
+`session_id`; the parent; the operations against the tree; emptiness; the
+push rules; the change component's check of the `change` object; then the
+compare-and-swap.
+
+Once the branch has moved, the commit has the consequences of a push of
+it. After the `parley.git.push` event of the branch, one
+`parley.scm.commit` event names the commit (`resource_type` `commit`, its
+id as `resource_id`), with the caller as for the push event and the
+request's session; its metadata holds `branch` (the branch's name without
+`refs/heads/`), `sha`, `parent_sha` and `files`, the paths the commit
+changed against its parent (both paths of a move) in byte order, the first
+100 of them, with `truncated` `true` when there were more:
+
+```json
+{"seq":16,"id":"…","type":"parley.scm.commit","time":"2026-11-15T11:11:44Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"commit","resource_id":"6d2ec0406c25abdbdf0518833eff0667aecbff02","action":"commit","session_id":null,"metadata":{"branch":"work","files":["README.md","api/new.go","api/old.go"],"parent_sha":"8792bc3d8b0e88fe7152443b9175ee4b05c54691","sha":"6d2ec0406c25abdbdf0518833eff0667aecbff02"}}
+```
+
+The commit names the version kind `commit`, so a branch that is the
+source of a draft or open change gets a version, which `change` names. A
+`change` object is checked by the change component after the push rules
+and before the branch moves, and its refusal is the answer, unchanged
+(such as `403` `insufficient_scope`, `400` `target_not_found` or `409`
+`change_exists`), with nothing moved; once the branch has moved the change
+is opened, in a task fork in its parent, and `change` names it with
+version 1. No change component is registered yet, so a `change` object is
+`400` `invalid_request` (`this hub cannot open a change: no change
+component is registered`). In a task fork whose `auto_change` is `true`, a
+commit without a `change` object to a branch that is the source of no
+draft or open change asks the change component to open one in the parent,
+with the fork's branch as source and the fork's base branch
+(`fork_point.ref`) as target; the commit is kept whatever the outcome, and
+when the opening fails `change` is `null` and `change_error` is
+`{"error_type": …, "message": …}`, the change component's refusal, or
+`internal` (`the change could not be opened`). A direct push opens no
+change.
 
 The body limit of this route is `[scm].max_commit_size`, 33554432 bytes
 (32 MiB) by default (see [configuration.md](configuration.md)), in place
@@ -3322,18 +3375,24 @@ before it is parsed.
 
 `commit` is the commit object of `GET …/scm/commits/{sha}`, with `stats`;
 its `message` ends in a newline, as every message git writes does.
-`branch` is the ref object at the new commit. `change` and
-`change_error` are `null`.
+`branch` is the ref object at the new commit. `change` is
+`{"workspace_slug": …, "number": …, "version": …}`, the change the commit
+made a version of or opened, `null` when there is none; `change_error` is
+`null` unless an `auto_change` opening failed, as above.
 
 | Status | When |
 |---|---|
 | `201 Created` | the commit, the branch and the change, as above |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is created |
 | `400` `invalid_request` | no `branch`, or not a branch name; no `message`, or an empty one; an `author` without `name` or `email`; an `expected_head_sha` that is not a full id; more than 1,000 operations (`a commit takes at most 1000 operations, not 1001`); a malformed operation (`operation 0: op "copy" is none of put, delete, move and chmod`): an unknown or missing `op`, a bad path, a `put` with both or neither of `content` and `content_base64` or invalid base64, a mode the operation does not take, a missing member; a `change` object on a protected branch (`main is protected and cannot be the source of a change; commit to another branch to open one`), for every caller, the owner and the admin token included; a `branch` that does not exist and no `base_ref` |
 | `400` `invalid_operation` | an operation that does not apply to the tree the ones before it left: a `delete`, `move` or `chmod` of a missing path or a directory, a `move` onto a file or a directory, a `put` below a file or onto a directory, any operation on or below a submodule entry; `details.index` is the zero-based index of the first such operation |
 | `400` `empty_commit` | the operations leave the parent's tree as it is and `allow_empty` is not `true` (`the operations leave the tree as it is; set allow_empty to commit it anyway`) |
+| `400` `unknown_session` | the `session_id` is not accepted |
+| `400`, `403`, `409` of the change component | the change component refuses the `change` object |
 | `403` | a push rule refuses the update, such as `protected_branch` |
 | `404` `ref_not_found` | `base_ref` names no commit |
 | `409` `ref_moved` | `branch` exists and `expected_head_sha` is absent or another commit, or the branch moved in between; `details.current_sha` is where it is |
+| `409` `conflict` | the `Idempotency-Key` was used with another body |
 | `413` `payload_too_large` | the body is larger than `[scm].max_commit_size` |
 
 ## `POST /api/v1/workspaces/{slug}/scm/refs`
@@ -3355,11 +3414,13 @@ Exactly one of `sha` and `ref` is given. A tag created so is lightweight.
 | Status | When |
 |---|---|
 | `201 Created` | the ref object of the new ref |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is created |
 | `400` `invalid_request` | no `name` (`name is required`); a name that is no valid ref name (`"a..b" is not a valid ref name`) or lies outside the namespaces (`"refs/notes/n" is outside refs/heads/, refs/tags/ and refs/parley/`); both or neither of `sha` and `ref` (`give exactly one of sha and ref`); a `sha` that is not a full id (`sha must be a full 40-character commit id`) |
 | `403` | a push rule refuses the creation, such as `hub_owned_ref` for a name below `refs/parley/` |
 | `404` `ref_not_found` | the target names no commit (`revision "nope" names no commit`, `revision "…" names an object that is not a commit`) |
 | `409` `ref_exists` | the ref exists (`ref refs/heads/main already exists`) |
 | `409` `ref_moved` | another write created the ref in between |
+| `409` `conflict` | the `Idempotency-Key` was used with another body |
 
 ```json
 {"name":"refs/tags/v1","kind":"tag","sha":"d81e7ee540a0ae85fa486bfd9c53f46cfbdf4f89","protected":false,"tracking":false,"change":null}
@@ -3415,6 +3476,7 @@ no working copy. The body:
 | `branch` | required: the branch to rebase, a branch name or a full name below `refs/heads/` |
 | `onto` | required: a revision (a branch name, a tag name, a full ref name, a full or abbreviated commit id) naming the commit to rebase onto |
 | `expected_head_sha` | the full id of the commit the caller saw `branch` at; without it the head the request reads first guards the move |
+| `session_id` | the agent session the rebase belongs to (see [Source control writes](#source-control-writes)) |
 
 ```json
 {"branch":"topic","onto":"main","expected_head_sha":"9cdbe993678a61933dbfc1b29496123ac2997ea0"}
@@ -3467,19 +3529,21 @@ which landed change touched the files.
 ```
 
 The checks run in this order: the body, before the repository is read;
-the branch and `expected_head_sha`; `onto`; whether the branch holds
+the `session_id`; the branch and `expected_head_sha`; `onto`; whether the branch holds
 `onto`; the merge commits; the replay; then the push rules and the
 compare-and-swap.
 
 | Status | When |
 |---|---|
-| `200 OK` | `rebased` or `up_to_date`, as above |
+| `200 OK` | `rebased` or `up_to_date`, as above; or a replay of a recorded `Idempotency-Key` with the same body: the first answer, and nothing moves |
 | `400` `invalid_request` | no `branch` (`branch is required`), or not a branch name (`branch "refs/tags/v1" is not a valid branch name`); no `onto` (`onto is required`); an `expected_head_sha` that is not a full id (`expected_head_sha must be a full 40-character commit id`) |
 | `400` `merge_commits_unsupported` | a commit to replay is a merge commit (`refs/heads/merged has a merge commit that main does not hold; a rebase replays no merge commit`) |
+| `400` `unknown_session` | the `session_id` is not accepted |
 | `403` | a push rule refuses the move, such as `protected_branch` |
 | `404` `ref_not_found` | the branch does not exist (`ref "refs/heads/nope" does not exist`); `onto` names no commit |
 | `409` `ref_moved` | the branch is not at `expected_head_sha`, or moved while the commits were replayed; `details.current_sha` is where it is |
 | `409` `rebase_conflict` | a commit does not apply; `details` is the conflict report |
+| `409` `conflict` | the `Idempotency-Key` was used with another body |
 
 ## Admin routes
 

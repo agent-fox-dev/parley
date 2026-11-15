@@ -105,11 +105,14 @@ func (t *target) lookup(ctx context.Context, name string) (ref gitrepo.Ref, foun
 // from before (pushrule.ZeroID for a create) to after (pushrule.ZeroID for
 // a delete), the kind of version it makes of a change whose source it moves
 // (one of the pushrule.VersionKind constants), and the session the write
-// belongs to, nil for none.
+// belongs to, nil for none. beforeWrite, when set, runs once the push rules
+// have allowed the update, with their decision, and before the ref writer
+// is asked to write it; its error is the write's answer and nothing moves.
 type refUpdate struct {
 	ref, before, after string
 	versionKind        string
 	sessionID          *string
+	beforeWrite        func(ctx context.Context, d pushrule.Decision) error
 }
 
 // refUpdated is a ref update the ref writer made: the engine's decision,
@@ -161,6 +164,11 @@ func (c *Component) updateRef(ctx context.Context, wr *write, repo *gitrepo.Repo
 	verdict := c.deps.Rules.Evaluate(ctx, req)
 	if verdict.Refused() {
 		return refUpdated{}, refusal(wr.ws, verdict.Decisions)
+	}
+	if u.beforeWrite != nil && len(verdict.Decisions) > 0 {
+		if err := u.beforeWrite(ctx, verdict.Decisions[0]); err != nil {
+			return refUpdated{}, err
+		}
 	}
 	res, err := c.deps.RefWriter.Apply(ctx, pushrule.ApplyRequest{
 		Verdict: verdict, Repo: repo, Workspace: pw, Caller: pc, SessionID: u.sessionID,

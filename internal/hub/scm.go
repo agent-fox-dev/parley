@@ -29,7 +29,9 @@ const scmHook = "scm"
 // workspace's effective protected_branches, a fork's from its parent's, so
 // that the reads call protected what a push meets as protected; and to the
 // push rule engine and the ref writer of the git server's part, so that a
-// write is decided and written exactly as a push of the same ref update.
+// write is decided and written exactly as a push of the same ref update;
+// and to the hub's event log, which takes the parley.scm.commit event of
+// every commit a write makes, after the push event the ref writer emits.
 // Each read is bounded by [scm].read_timeout and a file by
 // [scm].max_file_size; the body of a commit request by
 // [scm].max_commit_size, which the start hook sets as the commit route's
@@ -37,8 +39,11 @@ const scmHook = "scm"
 // makes take their times from the hub's clock.
 //
 // The change, commit-change and session lookups keep their defaults, which
-// name none: the hub has no change or session records to ask. The hub
-// registers no request recorder; the default discards the observations.
+// name none: the hub has no change or session records to ask. Nothing
+// registers a change linker or a session linker on the component yet, so a
+// write that asks for a change is refused 400 invalid_request and every
+// session_id 400 unknown_session. The hub registers no request recorder;
+// the default discards the observations.
 //
 // The component exists from the composition on (SCM); tests change its
 // dependencies with AdjustSCM.
@@ -85,6 +90,8 @@ func composeSCM(c *Composition) {
 			ReadTimeout: rt.Config.SCM.ReadTimeout,
 			MaxFileSize: rt.Config.SCM.MaxFileSize,
 			Now:         rt.Now,
+			Events:      c.Events(),
+			Logger:      rt.Logger,
 		}
 		for _, adjust := range c.scmAdjusters {
 			adjust(&d)

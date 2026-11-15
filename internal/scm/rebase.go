@@ -26,6 +26,7 @@ type rebaseRequest struct {
 	Branch          *string `json:"branch"`
 	Onto            *string `json:"onto"`
 	ExpectedHeadSHA *string `json:"expected_head_sha"`
+	SessionID       *string `json:"session_id"`
 }
 
 // rebaseAnswer is the answer to a rebase request: the branch at its new
@@ -50,8 +51,10 @@ type rebaseAnswer struct {
 // The checks run in the order in which each has what it needs: the body
 // (400 invalid_request: branch or onto missing, a branch outside
 // refs/heads/, an expected_head_sha that is not a full id), before anything
-// is read; the branch (404 ref_not_found) and expected_head_sha (409
-// ref_moved); onto (404 ref_not_found). A branch that already holds onto
+// is read; a session_id the session linker does not accept (400
+// unknown_session); the branch (404 ref_not_found) and expected_head_sha
+// (409 ref_moved); onto (404 ref_not_found). The session goes with the
+// update to the ref writer, onto its events and the version it records. A branch that already holds onto
 // answers up_to_date and moves nothing. A merge commit among the commits to
 // replay is 400 merge_commits_unsupported and the first commit that does
 // not apply 409 rebase_conflict with the conflict report as details, both
@@ -67,9 +70,11 @@ func (c *Component) rebase(w http.ResponseWriter, r *http.Request, wr *write) er
 	if err != nil {
 		return err
 	}
-	// The session is checked here, before the branch is resolved.
-
 	ctx := r.Context()
+	session, err := c.checkSession(ctx, wr, body.SessionID)
+	if err != nil {
+		return err
+	}
 	t, err := c.target(ctx, wr)
 	if err != nil {
 		return err
@@ -116,7 +121,7 @@ func (c *Component) rebase(w http.ResponseWriter, r *http.Request, wr *write) er
 		hook()
 	}
 	up, err := c.updateRef(ctx, wr, t.git, refUpdate{ref: branch, before: ref.ID, after: newHead,
-		versionKind: pushrule.VersionKindRebase})
+		versionKind: pushrule.VersionKindRebase, sessionID: session})
 	if err != nil {
 		return err
 	}
