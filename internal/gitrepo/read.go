@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -21,6 +22,10 @@ var (
 	// ErrNotCommit is the error of a name whose object is not a commit and
 	// leads to none through annotated tags.
 	ErrNotCommit = errors.New("the object is not a commit")
+	// ErrNotDirectory is the error of a path that names an entry other
+	// than a directory where a directory is read: a file, a symlink or a
+	// submodule.
+	ErrNotDirectory = errors.New("the path is not a directory")
 )
 
 // Ref is a ref of the repository.
@@ -43,6 +48,131 @@ type Object struct {
 	Type string
 	// Size is the object's size in bytes, as git stores it uncompressed.
 	Size int64
+}
+
+// Tree is a directory of a commit and the entries a tree read lists.
+type Tree struct {
+	// ID is the directory's tree id.
+	ID string
+	// Entries are the entries listed, ordered by Path in byte order.
+	Entries []TreeEntry
+}
+
+// TreeEntry is an entry of a directory.
+type TreeEntry struct {
+	// Path is the entry's path from the root of the commit's tree.
+	Path string
+	// Name is the last segment of Path.
+	Name string
+	// Mode is git's six-digit octal mode, such as 100644 or 040000.
+	Mode string
+	// ID is the entry's object id: a submodule's commit id for a
+	// submodule.
+	ID string
+	// Type is git's object type: ObjectBlob (a symlink included),
+	// ObjectTree, or ObjectCommit for a submodule.
+	Type string
+	// Size is a blob's size in bytes, 0 for any other type.
+	Size int64
+}
+
+// ReadTree reads the directory path of the commit of the full id commit:
+// its tree id and its entries or, with recursive, every entry below it,
+// directories as well as their contents. path is "" for the root, or a
+// path of the commit's tree, which git takes literally. A path that names
+// no entry, or a commit id that names no commit, is ErrNotFound; a path
+// that names a file, a symlink or a submodule is ErrNotDirectory.
+func (r *Repo) ReadTree(ctx context.Context, commit, path string, recursive bool) (Tree, error) {
+	if len(commit) != idLen || !isHexID(commit, idLen) || strings.ContainsAny(path, "\n\x00") {
+		return Tree{}, fmt.Errorf("tree %q: %w", commit+":"+path, ErrNotFound)
+	}
+	commit = strings.ToLower(commit)
+	parent, name := "", path
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		parent, name = path[:i], path[i+1:]
+	}
+	treeOf := func(dir string) string {
+		if dir == "" {
+			return commit + "^{tree}"
+		}
+		return commit + ":" + dir
+	}
+	// One run looks up the path and its parent: a submodule's commit is not
+	// in the repository, so only the parent's entry tells a submodule from
+	// a path that does not exist.
+	names := []string{treeOf(path), treeOf(parent)}
+	lines, err := r.batchCheck(ctx, "%(objectname) %(objecttype)", names)
+	if err != nil {
+		return Tree{}, err
+	}
+	if len(lines) != len(names) {
+		return Tree{}, fmt.Errorf("tree %s: cat-file answered %q", names[0], lines)
+	}
+	dir, found := strings.CutSuffix(lines[0], " "+ObjectTree)
+	switch {
+	case found:
+	case lines[0] != names[0]+" missing":
+		return Tree{}, fmt.Errorf("tree %s: %w", names[0], ErrNotDirectory)
+	case path == "" || lines[1] == names[1]+" missing" || !strings.HasSuffix(lines[1], " "+ObjectTree):
+		return Tree{}, fmt.Errorf("tree %s: %w", names[0], ErrNotFound)
+	default:
+		siblings, err := r.lsTree(ctx, strings.TrimSuffix(lines[1], " "+ObjectTree), "", false)
+		if err != nil {
+			return Tree{}, err
+		}
+		for _, e := range siblings {
+			if e.Name == name && e.Type == ObjectCommit {
+				return Tree{}, fmt.Errorf("tree %s: a submodule: %w", names[0], ErrNotDirectory)
+			}
+		}
+		return Tree{}, fmt.Errorf("tree %s: %w", names[0], ErrNotFound)
+	}
+	prefix := ""
+	if path != "" {
+		prefix = path + "/"
+	}
+	entries, err := r.lsTree(ctx, dir, prefix, recursive)
+	if err != nil {
+		return Tree{}, err
+	}
+	// git orders a tree's entries as if a directory's name ended in "/".
+	slices.SortFunc(entries, func(a, b TreeEntry) int { return strings.Compare(a.Path, b.Path) })
+	return Tree{ID: dir, Entries: entries}, nil
+}
+
+// lsTree lists the entries of the tree of the full id tree, each path
+// prefixed with prefix, or with recursive every entry below it,
+// directories included, in git's order.
+func (r *Repo) lsTree(ctx context.Context, tree, prefix string, recursive bool) ([]TreeEntry, error) {
+	args := []string{"ls-tree", "-z", "-l"}
+	if recursive {
+		args = append(args, "-r", "-t")
+	}
+	out, err := r.git(ctx, append(args, tree)...)
+	if err != nil {
+		return nil, err
+	}
+	entries := []TreeEntry{}
+	for rec := range strings.SplitSeq(strings.TrimSuffix(string(out), "\x00"), "\x00") {
+		if rec == "" {
+			continue
+		}
+		// <mode> <type> <id> <size, padded>\t<path>, the size "-" for any
+		// object but a blob.
+		meta, rel, ok := strings.Cut(rec, "\t")
+		f := strings.Fields(meta)
+		if !ok || len(f) != 4 {
+			return nil, fmt.Errorf("ls-tree answered %q", rec)
+		}
+		e := TreeEntry{Path: prefix + rel, Name: rel[strings.LastIndexByte(rel, '/')+1:], Mode: f[0], Type: f[1], ID: f[2]}
+		if e.Type == ObjectBlob {
+			if e.Size, err = strconv.ParseInt(f[3], 10, 64); err != nil {
+				return nil, fmt.Errorf("ls-tree answered %q", rec)
+			}
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
 }
 
 // idLen is the length of a full object id written in hexadecimal.

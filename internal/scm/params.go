@@ -3,6 +3,7 @@ package scm
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -35,4 +36,31 @@ func timeParam(q url.Values, name string) (*time.Time, error) {
 		return nil, server.InvalidRequest(fmt.Sprintf("%s must be an RFC 3339 timestamp, such as 2026-01-02T03:04:05Z", name))
 	}
 	return &t, nil
+}
+
+// pathParam is the query parameter path of q, a path of the repository's
+// tree; "" when q has none or an empty one, which is 400 invalid_request
+// when required is set. A path is legal when it is relative, has no empty,
+// "." or ".." segment, does not lie under .git and holds no NUL; any other
+// is 400 invalid_request, so that no path a tree cannot hold reaches git.
+func pathParam(q url.Values, required bool) (string, error) {
+	path := q.Get("path")
+	if path == "" {
+		if required {
+			return "", server.InvalidRequest("path is required")
+		}
+		return "", nil
+	}
+	if strings.HasPrefix(path, "/") || strings.ContainsRune(path, 0) {
+		return "", server.InvalidRequest("path must be a relative path of the repository, such as docs/api.md")
+	}
+	for seg := range strings.SplitSeq(path, "/") {
+		switch seg {
+		case "", ".", "..":
+			return "", server.InvalidRequest(fmt.Sprintf("path %q has an empty, . or .. segment", path))
+		case ".git":
+			return "", server.InvalidRequest(fmt.Sprintf("path %q lies under .git", path))
+		}
+	}
+	return path, nil
 }

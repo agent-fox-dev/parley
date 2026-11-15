@@ -37,6 +37,7 @@ const (
 const (
 	opRefs    = "refs"
 	opCommits = "commits"
+	opTree    = "tree"
 )
 
 // scopeRead is the scope a personal access token needs for every read;
@@ -114,6 +115,7 @@ func (c *Component) Routes() []server.Route {
 		c.route("/refs/*name", opRefs, c.getRef),
 		c.route("/commits", opCommits, c.listCommits),
 		c.route("/commits/:sha", opCommits, c.getCommit),
+		c.route("/tree", opTree, c.listTree),
 	}
 }
 

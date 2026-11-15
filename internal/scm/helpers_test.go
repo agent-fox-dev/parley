@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -279,6 +280,29 @@ func (w *world) addHistory(t *testing.T) map[string]string {
 	return ids
 }
 
+// treeReadme is the content of README.md on the tree workspace's main.
+const treeReadme = "# Tree\n\nA fixture.\n"
+
+// addTree adds the ready workspace tree of the owner and returns its git
+// directory. Its main holds README.md (treeReadme), the executable run.sh,
+// the symlink link to README.md, docs/a.md, docs/api/b.md and the submodule
+// entry vendor/sub; its branch big holds 1,500 files at its root, f0000.txt
+// to f1499.txt.
+func (w *world) addTree(t *testing.T) string {
+	t.Helper()
+	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+	var big strings.Builder
+	big.WriteString("blob\nmark :9\n" + data("x") + "commit refs/heads/big\n" + testCommitter + data("big"))
+	for i := range 1500 {
+		fmt.Fprintf(&big, "M 100644 :9 f%04d.txt\n", i)
+	}
+	return w.addWorkspace(t, "tree", w.org, "commit refs/heads/main\n"+testCommitter+data("tree")+
+		"M 100644 inline README.md\n"+data(treeReadme)+"M 100755 inline run.sh\n"+data("#!/bin/sh\necho run\n")+
+		"M 120000 inline link\n"+data("README.md")+"M 100644 inline docs/a.md\n"+data("a\n")+
+		"M 100644 inline docs/api/b.md\n"+data("b\n")+"M 160000 "+strings.Repeat("5", 40)+" vendor/sub\n\n"+
+		big.String()+"\n")
+}
+
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
@@ -380,6 +404,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"refs", "/refs/main", "/refs/nope"},
 	{"commits", "/commits", "/commits?stats=yes"},
 	{"commits", "/commits/main", "/commits/nope"},
+	{"tree", "/tree", "/tree?path=nope"},
 }
 
 // observations is a request recorder that keeps what it was told, each

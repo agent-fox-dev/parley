@@ -3,6 +3,7 @@ package gitrepo_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -12,10 +13,11 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
 
-// readFixture is a repository to read from: main with c1 and c2, feature/x
-// with x on top of c1, the annotated tag v2 at c2, the tag tree at c1's
-// tree, the commit gone that no ref reaches, and commits of which two share
-// the abbreviated id prefix. calls counts the git processes run on repo.
+// readFixture is a repository to read from: main with c1 and c2, f.txt
+// different in each; feature/x with x on top of c1, adding dir/x.txt and the
+// empty dir.md; the annotated tag v2 at c2, the tag tree at c1's tree, the
+// commit gone that no ref reaches, and commits of which two share the
+// abbreviated id prefix. calls counts the git processes run on repo.
 type readFixture struct {
 	repo                          *gitrepo.Repo
 	calls                         *atomic.Int32
@@ -30,7 +32,7 @@ func newReadFixture(t *testing.T) readFixture {
 	const who = "committer T <t@example.invalid> 1700000000 +0000\n"
 	stream := "commit refs/heads/main\nmark :1\n" + who + "data 2\nc1\nM 100644 inline f.txt\ndata 4\none\n\n" +
 		"commit refs/heads/main\n" + who + "data 2\nc2\nM 100644 inline f.txt\ndata 4\ntwo\n\n" +
-		"commit refs/heads/feature/x\n" + who + "data 1\nx\nfrom :1\nM 100644 inline dir/x.txt\ndata 2\nx\n\n" +
+		"commit refs/heads/feature/x\n" + who + "data 1\nx\nfrom :1\nM 100644 inline dir/x.txt\ndata 2\nx\nM 100644 inline dir.md\ndata 0\n\n" +
 		"commit refs/heads/gone\n" + who + "data 4\ngone\nfrom :1\n\n" +
 		"tag v2\nfrom refs/heads/main\ntagger T <t@example.invalid> 1700000000 +0000\ndata 2\nv2\n"
 	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
@@ -180,6 +182,58 @@ func TestObjectInfo_ReportsTypeAndSize(t *testing.T) {
 		got, err := f.repo.ObjectInfo(context.Background(), c.name)
 		if !errors.Is(err, c.wantErr) || got != c.want {
 			t.Errorf("ObjectInfo(%q) = %+v, %v, want %+v, %v", c.name, got, err, c.want, c.wantErr)
+		}
+	}
+}
+
+func TestReadTree_ListsADirectoryOfACommitInPathOrder(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	dir := f.repo.Dir()
+	id := func(rev string) string { return strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", rev)) }
+	entry := func(path, mode, typ string, size int64) gitrepo.TreeEntry {
+		return gitrepo.TreeEntry{Path: path, Name: path[strings.LastIndex(path, "/")+1:], Mode: mode, ID: id(f.x + ":" + path), Type: typ, Size: size}
+	}
+	// git orders dir.md before dir, as if dir were dir/; a path's byte
+	// order puts dir first.
+	d := entry("dir", "040000", gitrepo.ObjectTree, 0)
+	md := entry("dir.md", "100644", gitrepo.ObjectBlob, 0)
+	x := entry("dir/x.txt", "100644", gitrepo.ObjectBlob, 2)
+	ft := entry("f.txt", "100644", gitrepo.ObjectBlob, 4)
+	for _, c := range []struct {
+		path      string
+		recursive bool
+		want      gitrepo.Tree
+	}{
+		{"", false, gitrepo.Tree{ID: id(f.x + "^{tree}"), Entries: []gitrepo.TreeEntry{d, md, ft}}},
+		{"", true, gitrepo.Tree{ID: id(f.x + "^{tree}"), Entries: []gitrepo.TreeEntry{d, md, x, ft}}},
+		{"dir", false, gitrepo.Tree{ID: id(f.x + ":dir"), Entries: []gitrepo.TreeEntry{x}}},
+	} {
+		got, err := f.repo.ReadTree(context.Background(), f.x, c.path, c.recursive)
+		if err != nil || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("ReadTree(x, %q, %v) = %+v, %v, want %+v", c.path, c.recursive, got, err, c.want)
+		}
+	}
+}
+
+func TestReadTree_TellsAMissingPathFromOneThatIsNoDirectory(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		commit, path string
+		want         error
+	}{
+		{f.x, "nope", gitrepo.ErrNotFound},
+		{f.x, "dir/nope", gitrepo.ErrNotFound},
+		{f.x, "nope/deeper", gitrepo.ErrNotFound},
+		{f.x, "f.txt/deeper", gitrepo.ErrNotFound},
+		{f.x, "f.txt", gitrepo.ErrNotDirectory},
+		{f.x, "dir/x.txt", gitrepo.ErrNotDirectory},
+		{strings.Repeat("f", 40), "", gitrepo.ErrNotFound},
+		{f.x[:7], "", gitrepo.ErrNotFound},
+	} {
+		if got, err := f.repo.ReadTree(context.Background(), c.commit, c.path, false); !errors.Is(err, c.want) {
+			t.Errorf("ReadTree(%s, %q) = %+v, %v, want %v", c.commit, c.path, got, err, c.want)
 		}
 	}
 }

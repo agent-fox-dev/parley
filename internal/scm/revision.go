@@ -32,6 +32,9 @@ type Repository interface {
 	// DiffChanges are the file changes between two full ids, from "" being
 	// the empty tree.
 	DiffChanges(ctx context.Context, from, to string) ([]gitrepo.FileChange, error)
+	// ReadTree reads the directory path, "" for the root, of the commit of
+	// a full id, with recursive every entry below it.
+	ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error)
 }
 
 // Ref is a ref of a workspace as its ref view shows it.

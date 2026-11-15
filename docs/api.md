@@ -2608,7 +2608,7 @@ who reads it); the `limit` and `cursor` (`400`).
 
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
-refs routes and the two commits routes below. Every one of them behaves
+refs routes, the two commits routes and the tree route below. Every one of them behaves
 alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
@@ -2640,8 +2640,8 @@ moves. A fork shows no `refs/parley/` ref.
 
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
-route's op (`refs` for both refs routes, `commits` for both commits routes)
-and `ok` for a status below 400,
+route's op (`refs` for both refs routes, `commits` for both commits routes,
+`tree` for the tree route) and `ok` for a status below 400,
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
 it is told.
@@ -2660,7 +2660,7 @@ A ref object has exactly these members:
 Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
 
-A revision parameter (`ref` of `…/scm/commits`, `{sha}` of
+A revision parameter (`ref` of `…/scm/commits` and `…/scm/tree`, `{sha}` of
 `…/scm/commits/{sha}`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
@@ -2672,6 +2672,13 @@ expression such as `main~2`, `HEAD` or `@{1}` included, is `404`
 "dup" is both a branch and a tag`, `revision "4ad6" names more than one
 commit`). A `ref` that is absent is the head of the workspace's default
 branch.
+
+A `path` parameter of a read that names a path of the repository is
+relative, has no empty, `.` or `..` segment, has no segment `.git` and
+holds no NUL byte; any other is `400` `invalid_request` (such as `path must
+be a relative path of the repository, such as docs/api.md`, `path
+"docs//api" has an empty, . or .. segment`, `path ".git/config" lies under
+.git`), checked before the workspace's state and the repository.
 
 A commit object, as every route that answers commits writes it:
 
@@ -2784,6 +2791,48 @@ it, or with `files=false`, the member is absent. A file change:
 
 ```json
 {"sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","parents":[],"tree_sha":"755f3edd3ea43bc4b9134fc17299060a0eae2c91","author":{"name":"Alice","email":"alice@example.com","time":"2026-01-01T00:00:00Z"},"committer":{"name":"Alice","email":"alice@example.com","time":"2026-01-01T00:00:00Z"},"message":"c1","change":null,"session_id":null,"stats":{"files_changed":1,"insertions":1,"deletions":0},"files":[{"path":"old.md","old_path":null,"status":"added","insertions":1,"deletions":0,"binary":false,"old_sha":null,"new_sha":"5626abf0f72e58d7a153368ba57db4c673c0e171"}]}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/tree`
+
+Lists the entries of the directory `path` of the commit `ref` names, in
+byte order of path. It is a list (see [Lists](#lists)) whose `limit`
+defaults to 1000 and may be 1 to 10000, with `cursor`, and names after
+`next_cursor` the commit it was read from in `resolved_sha` and the listed
+directory's tree id in `tree_sha`. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose tree is listed; default the workspace's default branch |
+| `path` | the directory listed (see [Source control reads](#source-control-reads) for the paths taken); default, or empty, the root |
+| `recursive` | `true` lists every entry below `path`, directories as well as their contents; default `false`, the directory's own entries |
+
+A tree entry:
+
+| Member | Value |
+|---|---|
+| `path` | the entry's path from the root, such as `docs/a.md` |
+| `name` | the last segment of `path`, such as `a.md` |
+| `type` | `blob` for a file, `tree` for a directory, `symlink` for a symbolic link (mode `120000`), `commit` for a submodule entry (mode `160000`) |
+| `mode` | git's six-digit octal mode: `100644`, `100755`, `040000`, `120000` or `160000` |
+| `sha` | the entry's object id; for a submodule, the commit it records |
+| `size` | the file's size in bytes, on entries of type `blob` alone |
+
+The cursor carries the commit the first page resolved and the last path of
+the page, so every page of one listing is read from that commit, also when
+`ref` moves between pages; a cursor used with other query parameters is
+refused (see [Lists](#lists)).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of tree entries, with `resolved_sha` and `tree_sha` |
+| `400` `invalid_request` | a bad `limit` or `cursor`; `recursive` other than `true` or `false` (`recursive must be true or false`); an illegal `path`; a `path` that names a file, a symlink or a submodule entry (`path "README.md" is not a directory at <sha>`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"path":"README.md","name":"README.md","type":"blob","mode":"100644","sha":"13bcb9b3fd97cada4cd021e2e72c979c8238efa1","size":19},{"path":"docs","name":"docs","type":"tree","mode":"040000","sha":"6da2702274f2abf0f9c6f803b21a74ba377d235f"},{"path":"link","name":"link","type":"symlink","mode":"120000","sha":"42061c01a1c70097d1e4579f29a5adf40abdec95"},{"path":"run.sh","name":"run.sh","type":"blob","mode":"100755","sha":"85ba14df52f8c72688537de6e7555fb402217b1e","size":19},{"path":"vendor","name":"vendor","type":"tree","mode":"040000","sha":"a379d76fcb2ec666646b67b3d22eb53bf9fe5489"}],"next_cursor":null,"resolved_sha":"b6916afb245765e766995f2bf355f74e2aee2453","tree_sha":"1cce13dc891e3208bb9939d7b515da0889e99ccf"}
 ```
 
 ## Admin routes
