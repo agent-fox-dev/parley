@@ -25,14 +25,14 @@ type compareAnswer struct {
 	Ahead        int                     `json:"ahead"`
 	Behind       int                     `json:"behind"`
 	Commits      []commitObject          `json:"commits"`
-	Files        []fileChange            `json:"files"`
+	Files        []FileChange            `json:"files"`
 	Mergeable    string                  `json:"mergeable"`
 	Conflict     *gitrepo.ConflictReport `json:"conflict"`
 }
 
 // getCompare answers GET …/scm/compare: how head relates to base (their
 // merge base, the commits only each one has, the first maxCompareCommits
-// commits of head not in base, oldest first, and the first maxDiffFiles
+// commits of head not in base, oldest first, and the first MaxDiffFiles
 // file changes from the merge base to head) and whether rebasing head onto
 // base would succeed, from a trial rebase that changes no ref. A merge
 // commit among the commits to replay is 400 merge_commits_unsupported,
@@ -97,7 +97,7 @@ func (c *Component) getCompare(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	answer.Files = fileChanges(changes[:min(len(changes), maxDiffFiles)])
+	answer.Files = FileChanges(changes[:min(len(changes), MaxDiffFiles)])
 	server.WriteJSON(w, http.StatusOK, answer)
 	return nil
 }

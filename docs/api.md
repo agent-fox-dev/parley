@@ -3679,7 +3679,9 @@ answers `201` and the other `409` `change_exists`.
 
 `GET /api/v1/workspaces/{slug}/changes/{number}`,
 `GET /api/v1/workspaces/{slug}/changes/{number}/versions`,
-`GET /api/v1/workspaces/{slug}/changes/{number}/versions/{version}` and
+`GET /api/v1/workspaces/{slug}/changes/{number}/versions/{version}`,
+`GET /api/v1/workspaces/{slug}/changes/{number}/diff` (see
+[below](#get-apiv1workspacesslugchangesnumberdiff)) and
 `GET /api/v1/workspaces/{slug}/changes/by-commit/{sha}` read a change of
 the workspace `{slug}`. Each needs, for a personal access token,
 `changes:read`, and read access to `{slug}`; a token without the scope is
@@ -3689,10 +3691,10 @@ that names none. `by-commit` is a path segment of its own: `{number}` is
 never `by-commit`.
 
 A change of `{slug}` that the request cannot name answers `404`
-`change_not_found` on the first three routes: a `{number}` that is not a
+`change_not_found` on the routes under `…/changes/{number}`: a `{number}` that is not a
 positive integer, a number `{slug}` does not have, and any number on a task
 fork's slug, since a fork holds no changes (its changes belong to its
-parent). A token bound to a task fork reaches these four routes on the
+parent). A token bound to a task fork reaches these five routes on the
 fork's parent, and there only the changes whose `source.workspace_slug` is
 that fork: every other change answers `404` `change_not_found` as if it did
 not exist, and `by-commit` finds only those changes.
@@ -3731,6 +3733,64 @@ there is none; `landed` is `true` only for a commit the change landed. A
 commit that is neither, also an inner commit of a version, and any commit
 on a task fork's slug, answers `404` `change_not_found`; a `{sha}` that is
 not 40 hexadecimal characters `400` `invalid_request`.
+
+## `GET /api/v1/workspaces/{slug}/changes/{number}/diff`
+
+Answers the diff of a version of the change, or, with `against`, the
+interdiff of two versions: what moved between them, with what a rebase
+brought in left out. It needs what the other reads of a change need (see
+[Reading a change](#reading-a-change)), and answers a change it cannot
+name as they do. All git work happens in the target workspace's
+repository, where every version's head is held under its version ref, a
+fork source's too. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `version` | a version number or `latest` (the default), the current version |
+| `against` | a version number; with it the answer is the interdiff of `version` and `against` |
+| `path` | a glob, repeatable, as on [`…/scm/diff`](#get-apiv1workspacesslugscmdiff): only the files whose path one of them matches are answered and counted |
+| `patches` | `true` (the default) or `false`; with `false` no file has `patch` |
+| `format` | `json` (the default) or `patch` |
+
+Without `against`, the answer is the diff of the version from its
+`base_sha` to its `head_sha`, computed as `…/scm/diff` computes it in
+`direct` mode, with rename detection, 3 lines of context and the same
+limits (5,000 files, 8 MiB of patch text, then `truncated: true`). It has
+the members of the `…/scm/diff` answer, `base_sha` and `merge_base_sha`
+both the version's `base_sha`, and two more: `version`, the version's
+number, and `against`, `null`.
+
+With `against`, a file is listed when either version touches it against
+its own base, and carries `changed`: `true` when its patch (base to head,
+compared without the `index` line and the hunks' positions) differs
+between the two versions or only one of them touches it, else `false`.
+A changed file is described, with its `patch`, by the diff of its content
+at the head of `against` to its content at the head of `version`; a
+changed file whose content is the same at both heads (the bases differ) is
+`modified` with no line changed and an empty `patch`. An unchanged file
+has no `patch` and is described by the version's own diff (`against`'s
+when only that touches it). `base_sha` is the head of `against`,
+`head_sha` the head of `version`, `merge_base_sha` `null`, `version` and
+`against` the two numbers, and `stats` count the changed files only.
+Two patch-equivalent versions, and a version compared with itself, have no
+changed file. The limits of the plain diff apply.
+
+With `format=patch` the answer is the patch text of the files that would
+carry a `patch`, `Content-Type: text/x-diff`, as on `…/scm/diff`: it
+applies to the tree of `base_sha` (without `against`) or of the head of
+`against`, and a cut answer carries `X-Parley-Truncated: true`.
+
+```json
+{"base_sha":"dd626b3e…","head_sha":"8adab83c…","merge_base_sha":null,"files":[{"path":"a.txt","old_path":null,"status":"modified","insertions":1,"deletions":1,"binary":false,"old_sha":"…","new_sha":"…","changed":false},{"path":"b.txt","old_path":null,"status":"modified","insertions":1,"deletions":0,"binary":false,"old_sha":"…","new_sha":"…","patch":"diff --git a/b.txt b/b.txt\nindex …\n--- a/b.txt\n+++ b/b.txt\n@@ -2,3 +2,4 @@ b1\n b2\n b3\n b4\n+b5\n","changed":true}],"stats":{"files_changed":1,"insertions":1,"deletions":0},"truncated":false,"version":3,"against":1}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the diff or the interdiff, as JSON or as text |
+| `400` `invalid_request` | `version` that is neither a positive integer nor `latest` (`version must be a positive integer or latest`); `against` that is not a positive integer (`against must be a positive integer`); `format` other than `json` or `patch` (`format must be json or patch`); `patches` other than `true` or `false` (`patches must be true or false`) |
+| `404` `change_not_found` | as for the other reads of a change |
+| `404` `not_found` | a `version` or `against` number the change does not have |
+| `404` `ref_not_found` | the base or head commit of a named version is no longer in the repository, such as after a reclone; the change and its versions stay readable |
 
 ## `GET /api/v1/workspaces/{slug}/changes`
 

@@ -197,7 +197,7 @@ func TestRead_ServesAChangeItsVersionsAndItsCommits(t *testing.T) {
 	t.Run("a change the workspace does not have", func(t *testing.T) {
 		for _, base := range []string{"/workspaces/demo/changes/99", "/workspaces/demo/changes/abc", "/workspaces/demo/changes/0",
 			"/workspaces/demo/changes/-1", "/workspaces/demo--m1/changes/1"} {
-			for _, route := range []string{"", "/versions", "/versions/1"} {
+			for _, route := range []string{"", "/versions", "/versions/1", "/diff"} {
 				if status, got, _ := w.get(t, base+route, w.ownerKey); status != http.StatusNotFound || errorType(got) != "change_not_found" {
 					t.Errorf("GET %s = %d %v, want 404 change_not_found", base+route, status, got)
 				}
@@ -211,7 +211,7 @@ func TestRead_ServesAChangeItsVersionsAndItsCommits(t *testing.T) {
 	t.Run("a caller without the scope or access", func(t *testing.T) {
 		gitPAT, _ := w.patFor(t, []string{"git:read"}, nil)
 		strangerKey := w.IssueKey(t, w.CreateUser(t, "u9"))
-		for _, route := range []string{"/changes", "/changes/1", "/changes/by-commit/" + f.task1, "/changes/1/versions", "/changes/1/versions/1"} {
+		for _, route := range []string{"/changes", "/changes/1", "/changes/by-commit/" + f.task1, "/changes/1/versions", "/changes/1/versions/1", "/changes/1/diff"} {
 			for _, slug := range []string{"demo", "no-such-workspace"} {
 				if status, got, _ := w.get(t, "/workspaces/"+slug+route, gitPAT); status != http.StatusForbidden || errorType(got) != "insufficient_scope" {
 					t.Errorf("GET %s on %s with git:read = %d %v, want 403 insufficient_scope", route, slug, status, got)
@@ -226,12 +226,12 @@ func TestRead_ServesAChangeItsVersionsAndItsCommits(t *testing.T) {
 	})
 
 	t.Run("a token bound to a fork", func(t *testing.T) {
-		for _, path := range []string{"/changes/1", "/changes/1/versions", "/changes/1/versions/latest", "/changes/by-commit/" + f.task2} {
+		for _, path := range []string{"/changes/1", "/changes/1/versions", "/changes/1/versions/latest", "/changes/1/diff", "/changes/by-commit/" + f.task2} {
 			if status, got, _ := w.get(t, "/workspaces/demo"+path, bound); status != http.StatusOK {
 				t.Errorf("GET %s of the fork's change = %d %v, want 200", path, status, got)
 			}
 		}
-		for _, path := range []string{"/changes/2", "/changes/2/versions", "/changes/2/versions/1", "/changes/by-commit/" + f.landed, "/changes/by-commit/" + f.b2} {
+		for _, path := range []string{"/changes/2", "/changes/2/versions", "/changes/2/versions/1", "/changes/2/diff", "/changes/by-commit/" + f.landed, "/changes/by-commit/" + f.b2} {
 			if status, got, _ := w.get(t, "/workspaces/demo"+path, bound); status != http.StatusNotFound || errorType(got) != "change_not_found" {
 				t.Errorf("GET %s of another change = %d %v, want 404 change_not_found", path, status, got)
 			}
