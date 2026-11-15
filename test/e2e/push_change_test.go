@@ -1,7 +1,9 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
@@ -147,5 +150,75 @@ func TestPushChange_APushToATaskForkOpensAChangeInTheParent(t *testing.T) {
 	}
 	if fork, parent := gitrepotest.Refs(t, h.repo(slug), "refs/heads/"), gitrepotest.Refs(t, h.repo("demo"), "refs/heads/"); fork["work"] == "" || parent["work"] != "" {
 		t.Errorf("work is at %q in the fork and %q in demo, want it in the fork alone", fork["work"], parent["work"])
+	}
+}
+
+// pushHold is a fork activity recorder that holds each accepted write to a
+// fork, after its refs moved and before its push is mapped to changes,
+// until the test releases it: each call hands the test the channel that
+// releases it.
+type pushHold chan chan struct{}
+
+func (h pushHold) RecordActivity(context.Context, string) error {
+	release := make(chan struct{})
+	h <- release
+	<-release
+	return nil
+}
+
+// Two pushes that race on a task fork's branch each get their line: the
+// first opens the change, which follows the branch to the second push's
+// head, and the second push is told that version, recorded as its own.
+func TestPushChange_TwoRacingPushesToATaskForkEachGetTheirVersion(t *testing.T) {
+	hold := make(pushHold)
+	h := startForkHubWith(t, nil, func(c *hub.Composition) { c.RefWriter().RegisterForkActivity(hold) })
+	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/forks", h.key, map[string]any{
+		"name": "t1", "auto_change": true, "purpose": "speed up retries",
+		"token": map[string]any{"permissions": []string{"git:write", "changes:read", "changes:write"}},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create demo--t1 = %d %s, want 201", status, body)
+	}
+	created := decoded(t, body)
+	slug, token := str(created, "workspace", "slug"), str(created, "token", "token")
+	push := func(run func(...string) string, message string) <-chan string {
+		run("-c", "user.name=Agent", "-c", "user.email=agent@example.invalid", "commit", "--quiet", "--allow-empty", "-m", message)
+		g, dir := newGitClient(t, h.URL(""), token), strings.TrimSpace(run("rev-parse", "--show-toplevel"))
+		done := make(chan string, 1)
+		go func() {
+			out, err := g.git(dir, "push", "origin", "work")
+			done <- fmt.Sprintf("%v\n%s", err, out)
+		}()
+		return done
+	}
+
+	first := cloneAs(t, h, token, slug)
+	first("checkout", "--quiet", "-b", "work")
+	firstDone := push(first, "Speed up retries")
+	releaseFirst := <-hold
+	second := cloneAs(t, h, token, slug)
+	second("checkout", "--quiet", "work")
+	secondDone := push(second, "Bound the retries")
+	releaseSecond := <-hold
+	close(releaseFirst)
+	if out := <-firstDone; !strings.Contains(out, "remote: change demo#1 version 1 (opened)") {
+		t.Errorf("the first push printed:\n%s\nwant remote: change demo#1 version 1 (opened)", out)
+	}
+	close(releaseSecond)
+	if out := <-secondDone; !strings.Contains(out, "remote: change demo#1 version 2") {
+		t.Errorf("the second push printed:\n%s\nwant remote: change demo#1 version 2", out)
+	}
+
+	status, body = h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/1/versions/2", token, nil)
+	var v struct {
+		HeadSHA   string `json:"head_sha"`
+		Kind      string `json:"kind"`
+		CreatedBy struct {
+			ActorType string `json:"actor_type"`
+		} `json:"created_by"`
+	}
+	head := strings.TrimSpace(second("rev-parse", "work"))
+	if status != http.StatusOK || json.Unmarshal(body, &v) != nil || v.HeadSHA != head || v.Kind != "push" || v.CreatedBy.ActorType == "system" {
+		t.Errorf("GET changes/1/versions/2 = %d %s, want the second push's head %s, of kind push, by its caller", status, body, head)
 	}
 }

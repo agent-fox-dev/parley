@@ -24,7 +24,8 @@ that already has an open change. The package's own decisions say
 otherwise: the ordinary version of a push is recorded by the change
 feature's ref-updated stage inside the ref update, and the mapping reads
 it from the ref writer's result (`pushrule.UpdateResult.Version`); the
-service's record operation is used only after a lost race to open. The
+service's record operation is used only after a race to open (see
+*A push whose change was opened after it moved the branch*). The
 unit test gives that branch a version the ref writer reported, and checks
 that the push opens changes for the other branches only, each with the
 same options. A record-version request (`VersionRequest`) has no field for
@@ -37,6 +38,39 @@ reason, that version is one the ref writer reported: the unit test gives
 the PAT's branch a reported version and checks that it is the outcome,
 with no call and no warning. The scope check runs only before an open,
 and never after a lost race, because the open was already allowed then.
+
+## A push whose change was opened after it moved the branch
+
+The package records a version of kind `push` on the existing change after
+an open refused with `change_exists`. When two pushes race to open the
+change of one branch, the winner's open follows the branch (erratum 22,
+*The open of a commit's change follows a later move of its branch*) and
+may already have recorded the loser's head, as kind `ref` by the hub,
+before the loser's mapping runs; the loser's mapping then finds the
+change, or its open is refused. Both are answered the same way, in one
+store transaction, on the change the lookup or the refusal named:
+
+- a change that left draft and open since is the warning
+  `change <workspace>#<number> is <state>`, nothing recorded;
+- a change that already has the pushed head answers its current version,
+  `change <workspace>#<number> version <n>`; a version the hub recorded
+  on following the branch (kind `ref`, the system actor, no session)
+  becomes the push's: kind `push`, created by its caller with their
+  credential, in its session, which is linked to the change. The
+  `parley.change.version` event written when the hub recorded it is
+  left as it was, kind `ref` by the hub;
+- a change whose branch a later write moved past the pushed head answers
+  its current version and records nothing, since the later write's
+  version stands and a version at the pushed head would no longer be the
+  branch's head;
+- any other head is recorded as the next version, of kind `push`.
+
+A push whose found change has no version reported gets its line whatever
+options it gave, as a push to a change's source does. An open whose branch
+was deleted between the push and the open abandons the change it opened
+(`source_deleted`), and the push is told
+`warning: no change for <branch>: branch was deleted, change <workspace>#<number> abandoned`
+instead of `(opened)`.
 
 ## A refusal with a server status is an internal error
 

@@ -3063,13 +3063,25 @@ writes the whole answer; otherwise the component serves it (`fetch.go`):
   each created or updated branch in command order, through a
   `ChangeService`, to one `Outcome`: a version the ref writer reported is
   a new version, with no call; otherwise the branch's draft or open change
-  is looked up, and one found records nothing; a direct push opens nothing
+  is looked up, and one found was opened after the push moved the branch,
+  by a push that won the race to open it, so the push is answered as
+  after a lost race (below), whatever it asked; a direct push opens nothing
   and is warned of only when the push has `parley.change` or
   `parley.target`; such a push, or any push to a task fork whose
-  `auto_change` is true, opens a change with the push's session, and an
-  open refused with a `*ChangeExistsError` records the push instead as
-  the next version of the source branch's draft or open change, whichever
-  is active when it is recorded; the `OpenRequest` names the pushed workspace, or a
+  `auto_change` is true, opens a change with the push's session; an open
+  whose branch was deleted in between returns the change abandoned
+  (`OpenedChange.Abandoned`), the reason
+  `branch was deleted, change <workspace>#<number> abandoned`; an open
+  refused with a `*ChangeExistsError` is a lost race, answered by the
+  service's `RecordPushVersion` on the change the refusal named, in one
+  store transaction (`change.Component.RecordRacedVersion`): a change
+  that left draft and open since is a `*ChangeNotOpenError`, the reason
+  `change <workspace>#<number> is <state>`; one that already has the
+  pushed head, which the winner's open recorded on following the branch
+  as kind `ref` by the hub, makes that version the push's (kind `push`,
+  its caller, credential and session) and answers it; one whose branch a
+  later write moved on answers its current version and records nothing;
+  any other head is recorded as the next version; the `OpenRequest` names the pushed workspace, or a
   pushed fork's parent, as the change's workspace, the pushed workspace
   and branch as its source and the pusher as its caller, and carries
   `parley.target`, `parley.title`, `parley.intent` and `parley.draft`

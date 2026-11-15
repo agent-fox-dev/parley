@@ -205,7 +205,8 @@ func openingInput(o scm.ChangeOpening) change.OpenInput {
 // runs once the push's refs moved, outside the ref writer's transaction. A
 // change a push opens has version 1 of kind push, and the open reads the
 // branch again in its transaction, so that a write that moved it in between
-// is its next version (change.OpenInput.AfterMove).
+// is its next version (change.OpenInput.AfterMove), or a branch deleted in
+// between abandons it.
 type pushChanges struct {
 	changes *change.Component
 	rt      *Runtime
@@ -219,21 +220,26 @@ func (p pushChanges) OpenChangeOfBranch(ctx context.Context, source, branch stri
 	return &gitserver.BranchChange{Workspace: b.WorkspaceSlug, Number: int(b.Number)}, nil
 }
 
-// RecordPushVersion records the version and names the change it was
-// recorded for in one transaction, as the ref-updated stage does.
+// RecordPushVersion answers, in one transaction, the push whose branch
+// the change the request names was opened for after the push moved it: a
+// change that left draft and open since is refused with the state it is
+// in, and an open one is told of the move (change.RecordRacedVersion).
 func (p pushChanges) RecordPushVersion(ctx context.Context, req gitserver.VersionRequest) (*pushrule.Version, error) {
 	var out *pushrule.Version
 	err := p.rt.Store.Tx(ctx, func(tx *sql.Tx) error {
-		v, err := p.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: req.Source, Branch: req.Branch, Head: req.Head,
-			Kind: change.KindPush, Caller: pushCaller(req.Caller), SessionID: req.SessionID})
-		if err != nil || v == nil {
-			return err
-		}
-		ch, _, err := p.changes.OpenChangeOfBranch(ctx, tx, req.Source, req.Branch)
+		ch, err := p.changes.ReadChange(ctx, tx, req.Workspace, int64(req.Number))
 		if err != nil {
 			return err
 		}
-		out = &pushrule.Version{WorkspaceSlug: ch.WorkspaceSlug, Number: int(ch.Number), Version: int(v.Number)}
+		if ch.State != change.StateDraft && ch.State != change.StateOpen {
+			return &gitserver.ChangeNotOpenError{Workspace: req.Workspace, Number: req.Number, State: ch.State}
+		}
+		v, err := p.changes.RecordRacedVersion(ctx, tx, req.Workspace, int64(req.Number), change.VersionInput{Workspace: req.Source,
+			Branch: req.Branch, Head: req.Head, Kind: change.KindPush, Caller: pushCaller(req.Caller), SessionID: req.SessionID})
+		if err != nil {
+			return err
+		}
+		out = &pushrule.Version{WorkspaceSlug: req.Workspace, Number: req.Number, Version: int(v)}
 		return nil
 	})
 	if err != nil {
@@ -273,7 +279,8 @@ func (p pushChanges) OpenChange(ctx context.Context, req gitserver.OpenRequest) 
 	if err != nil {
 		return gitserver.OpenedChange{}, err
 	}
-	return gitserver.OpenedChange{Workspace: ch.WorkspaceSlug, Number: int(ch.Number), Draft: ch.State == change.StateDraft}, nil
+	return gitserver.OpenedChange{Workspace: ch.WorkspaceSlug, Number: int(ch.Number), Draft: ch.State == change.StateDraft,
+		Abandoned: ch.State == change.StateAbandoned}, nil
 }
 
 // pushCaller is the change component's caller a push's caller is: a PAT

@@ -195,16 +195,39 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	if err != nil {
 		return fmt.Errorf("store version %d of %s: %w", v.Number, Ref(workspace, number), err)
 	}
-	if v.SessionID == nil {
+	return addSession(ctx, tx, workspace, number, v.SessionID)
+}
+
+// addSession adds session, when not nil, to the sessions of the change
+// number of the workspace, after those it has.
+func addSession(ctx context.Context, tx *sql.Tx, workspace string, number int64, session *string) error {
+	if session == nil {
 		return nil
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO change_sessions (workspace_slug, number, position, session_id)
+	_, err := tx.ExecContext(ctx, `INSERT INTO change_sessions (workspace_slug, number, position, session_id)
 SELECT ?, ?, COALESCE(MAX(position), 0) + 1, ? FROM change_sessions WHERE workspace_slug = ? AND number = ?
-ON CONFLICT DO NOTHING`, workspace, number, *v.SessionID, workspace, number)
+ON CONFLICT DO NOTHING`, workspace, number, *session, workspace, number)
 	if err != nil {
 		return fmt.Errorf("store the session of %s: %w", Ref(workspace, number), err)
 	}
 	return nil
+}
+
+// attributeVersion stores v's kind, creator, credential and session as
+// those of the stored version v.Number of the change number of the
+// workspace, and adds its session to the change's.
+func attributeVersion(ctx context.Context, tx *sql.Tx, workspace string, number int64, v Version) error {
+	var credType, credID *string
+	if v.Credential.Type != "" {
+		credType, credID = &v.Credential.Type, &v.Credential.ID
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE change_versions SET kind = ?, actor_type = ?, actor_id = ?, actor_username = ?,
+	credential_type = ?, credential_id = ?, session_id = ? WHERE workspace_slug = ? AND number = ? AND version = ?`,
+		v.Kind, v.CreatedBy.ActorType, v.CreatedBy.ActorID, v.CreatedBy.Username, credType, credID, v.SessionID,
+		workspace, number, v.Number); err != nil {
+		return fmt.Errorf("attribute version %d of %s: %w", v.Number, Ref(workspace, number), err)
+	}
+	return addSession(ctx, tx, workspace, number, v.SessionID)
 }
 
 // update sets columns of the change number of the workspace, given as
