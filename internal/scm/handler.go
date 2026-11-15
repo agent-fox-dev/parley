@@ -41,6 +41,7 @@ const (
 	opFile    = "file"
 	opDiff    = "diff"
 	opCompare = "compare"
+	opBlame   = "blame"
 )
 
 // scopeRead is the scope a personal access token needs for every read;
@@ -128,6 +129,7 @@ func (c *Component) Routes() []server.Route {
 		c.route("/file", opFile, c.getFile),
 		c.route("/diff", opDiff, c.getDiff),
 		c.route("/compare", opCompare, c.getCompare),
+		c.route("/blame", opBlame, c.getBlame),
 	}
 }
 

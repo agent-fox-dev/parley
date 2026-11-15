@@ -57,6 +57,10 @@ type Repository interface {
 	LookupFile(ctx context.Context, commit, path string) (gitrepo.TreeEntry, error)
 	// WriteBlob writes the bytes of the blob of a full id to w.
 	WriteBlob(ctx context.Context, id string, w io.Writer) error
+	// Blame groups the lines first to last, 0 being the first and the last
+	// line, of the file path of the commit of a full id by the commit that
+	// last changed them, following renames, in line order.
+	Blame(ctx context.Context, commit, path string, first, last int) ([]gitrepo.BlameRange, error)
 }
 
 // Ref is a ref of a workspace as its ref view shows it.

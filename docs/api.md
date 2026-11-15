@@ -2608,7 +2608,8 @@ who reads it); the `limit` and `cursor` (`400`).
 
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
-refs routes, the two commits routes, the tree route, the file route and the diff route below. Every one of them behaves
+refs routes, the two commits routes, the tree route, the file route, the
+diff route, the compare route and the blame route below. Every one of them behaves
 alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
@@ -2641,7 +2642,7 @@ moves. A fork shows no `refs/parley/` ref.
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
-`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route) and `ok` for a status
+`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route) and `ok` for a status
 below 400 (a `206` included),
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
@@ -2661,8 +2662,8 @@ A ref object has exactly these members:
 Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
 
-A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree` and
-`…/scm/file`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
+A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree`,
+`…/scm/file` and `…/scm/blame`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
 `…/scm/diff` and `…/scm/compare`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
@@ -3028,6 +3029,54 @@ file; always `[]` for now.
 
 ```json
 {"base_sha":"25f1fc8af806873de70bc5fcbc519d5252016e97","head_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","merge_base_sha":"a0ad1d035cc9cc15942e85b7855fab58d6d91173","ahead":2,"behind":1,"commits":[{"sha":"6df6be0f167d2a962d6b959a9adb8d07e5f8db0f","parents":["a0ad1d035cc9cc15942e85b7855fab58d6d91173"],"tree_sha":"fb9593de39c7271ab6cb836f1c86b5ce9d019732","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"e1","change":null,"session_id":null},{"sha":"6f061333631277a4de8c1b1608151c23149a7d0d","parents":["6df6be0f167d2a962d6b959a9adb8d07e5f8db0f"],"tree_sha":"401eeb772a93302aaa5152c4fdae59a78fd09088","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"e2","change":null,"session_id":null}],"files":[{"path":"e.txt","old_path":null,"status":"added","insertions":1,"deletions":0,"binary":false,"old_sha":null,"new_sha":"d905d9da82c97264ab6f4920e20242e088850ce9"},{"path":"f.txt","old_path":null,"status":"modified","insertions":1,"deletions":1,"binary":false,"old_sha":"df967b96a579e45a18b8251732d16804b2e56a55","new_sha":"564b12f45becba5fb2f70e270af067c1f13b3aab"}],"mergeable":"conflict","conflict":{"target_sha":"25f1fc8af806873de70bc5fcbc519d5252016e97","head_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","base_sha":"a0ad1d035cc9cc15942e85b7855fab58d6d91173","commit_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","files":[{"path":"f.txt","kind":"content","base":{"sha":"df967b96a579e45a18b8251732d16804b2e56a55","mode":"100644","path":"f.txt"},"ours":{"sha":"ba2906d0666cf726c7eaadd2cd3db615dedfdf3a","mode":"100644","path":"f.txt"},"theirs":{"sha":"564b12f45becba5fb2f70e270af067c1f13b3aab","mode":"100644","path":"f.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/blame`
+
+Answers, for the text file `path` of the commit `ref` names, which commit
+last changed each line. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose file is blamed; default the workspace's default branch |
+| `path` | the file blamed, required (see [Source control reads](#source-control-reads) for the paths taken) |
+| `start_line` | the first line answered, an integer, 1-based; default 1 |
+| `end_line` | the last line answered, an integer, inclusive; default the file's last line, and one past it is cut to it |
+
+The answer:
+
+| Member | Value |
+|---|---|
+| `resolved_sha` | the full id of the commit `ref` resolved to |
+| `path` | the file's path, as asked |
+| `ranges` | the lines `start_line` to `end_line` in ranges, in line order, without overlap and without gaps; `[]` for an empty file |
+
+A range is a run of adjacent lines that one commit last changed at adjacent
+lines of the file as that commit wrote it; a range is cut at `start_line`
+and `end_line`:
+
+| Member | Value |
+|---|---|
+| `start_line`, `end_line` | the range's first and last line, 1-based and inclusive |
+| `commit` | the commit object (see [Source control reads](#source-control-reads)) of the commit that last changed the lines, without `stats` |
+| `original_path` | the file's path in that commit; renames are followed, so lines older than a rename carry the path the file had then |
+| `original_start_line` | the line the range's first line was in that commit |
+
+Only a text file of at most 2 MiB (2,097,152 bytes) is blamed; its size is
+checked before any of it is read. A file is binary, as git decides, when a
+NUL byte is among its first 8,000 bytes.
+
+| Status | When |
+|---|---|
+| `200 OK` | the ranges |
+| `400` `invalid_request` | no `path` (`path is required`); an illegal `path`; a `path` that names a directory or a submodule entry (`path "docs" is a directory or a submodule at <sha>, not a file`); a binary file (`file "bin.dat" is binary at <sha>, and a binary file has no lines to blame`); `start_line` or `end_line` that is not an integer (`start_line must be an integer`); `start_line` below 1 (`start_line must be 1 or more`), past `end_line` (`start_line must not be past end_line`) or past the file's last line (`start_line 7 is past the end of "f.txt", which has 6 lines`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `413` `payload_too_large` | the file is over 2 MiB (`file "big.txt" is 2097153 bytes, over the blame limit of 2097152`), with the member `size`, the file's size in bytes, inside `error` |
+
+```json
+{"resolved_sha":"e94a3ed170581b5a82b33fbae52aa59e5440a85c","path":"f.txt","ranges":[{"start_line":2,"end_line":2,"commit":{"sha":"c879c916954e2527c2c290a3aefd9dbd29c583d5","parents":[],"tree_sha":"25112f361a479cb362affd349fdf98b7d9549372","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c1","change":null,"session_id":null},"original_path":"f.txt","original_start_line":2},{"start_line":3,"end_line":3,"commit":{"sha":"5ea6473f65744357e45e476ef873539eaabdf894","parents":["dccb1e2ac5045a0393b8c9ca78770ce76457e489"],"tree_sha":"156a012498a0d513b1aeead4e128793235401724","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c3","change":null,"session_id":null},"original_path":"f.txt","original_start_line":3},{"start_line":4,"end_line":4,"commit":{"sha":"dccb1e2ac5045a0393b8c9ca78770ce76457e489","parents":["c879c916954e2527c2c290a3aefd9dbd29c583d5"],"tree_sha":"c2db841be5755f9c5c38e623743dae67506a3265","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c2","change":null,"session_id":null},"original_path":"f.txt","original_start_line":4}]}
 ```
 
 ## Admin routes

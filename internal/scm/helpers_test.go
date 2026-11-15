@@ -349,6 +349,29 @@ func (w *world) addCompare(t *testing.T) string {
 	return w.addWorkspace(t, "cmp", w.org, gitrepotest.CompareStream())
 }
 
+// blameEdge is a text file of exactly the 2 MiB a blame takes, in lines of
+// 64 bytes.
+var blameEdge = strings.Repeat(strings.Repeat("e", 63)+"\n", 32768)
+
+// addBlame adds the ready workspace blame of the owner, its main the four
+// commits of gitrepotest.BlameStream and on top of them a fifth adding the
+// binary file bin.dat, edge.txt (blameEdge), big.txt (blameEdge and one more
+// byte), docs/a.md and the submodule entry sub, and returns the ids of c1 to
+// c4 and of main.
+func (w *world) addBlame(t *testing.T) map[string]string {
+	t.Helper()
+	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+	file := func(path, content string) string { return "M 100644 inline " + path + "\n" + data(content) }
+	dir := w.addWorkspace(t, "blame", w.org, gitrepotest.BlameStream()+"commit refs/heads/main\n"+testCommitter+data("more")+
+		file("bin.dat", "bin\x00ary\n")+file("edge.txt", blameEdge)+file("big.txt", blameEdge+"b")+file("docs/a.md", "a\n")+
+		"M 160000 "+strings.Repeat("5", 40)+" sub\n\n")
+	ids := map[string]string{}
+	for i, id := range strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main~4", "main~3", "main~2", "main~1", "main")) {
+		ids[[]string{"c1", "c2", "c3", "c4", "main"}[i]] = id
+	}
+	return ids
+}
+
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
@@ -456,6 +479,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"file", "/file?path=f.txt", "/file?path=nope.txt"},
 	{"diff", "/diff?base=main&head=feature/x", "/diff?base=main"},
 	{"compare", "/compare?base=main&head=feature/x", "/compare?base=main"},
+	{"blame", "/blame?path=f.txt", "/blame?path=nope.txt"},
 }
 
 // observations is a request recorder that keeps what it was told, each
