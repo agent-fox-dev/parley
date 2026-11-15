@@ -2894,8 +2894,14 @@ the `gitserver` hook and so before the hub serves, which runs
 read. The push rule engine (`*pushrule.Engine`) and the push
 processor (`*gitserver.Receiver`) also exist from the composition on,
 returned by `(*Composition).PushRules()` and `(*Composition).Receiver()`, so
-that a part registers its carry-patch controller, or its options and
-mapping stages, while it is composed. The start hook binds the engine to
+that a part registers its carry-patch controller, or its mapping stage,
+while it is composed. The part itself creates the processor's options
+stage (`*gitserver.PushOptionsStage`), registers it with
+`RegisterOptionsStage` and returns it from `(*Composition).PushOptions()`,
+on which the part that owns the session-linking rule registers its
+`gitserver.SessionLinker` (`RegisterSessionLinker`; none is registered yet,
+so every `parley.session` is refused); the start hook binds it to the hub's
+logger. The start hook binds the engine to
 the settings reader `pushSettings`, which reads the effective
 `protected_branches` and `protect.owner_push` of the workspace's record,
 a fork's from its parent's record, with `workspace.BySlug` and the
@@ -3031,7 +3037,13 @@ writes the whole answer; otherwise the component serves it (`fetch.go`):
   (`OptionsStage`, registered with `RegisterOptionsStage`; its answer may
   refuse the push with a message M, the rest of the body read and dropped,
   reported `ng <ref> M` for every ref with one side-band line `error: M`,
-  set the session id and mark the updates as opening a change); the pack
+  set the session id and mark the updates as opening a change; the hub's
+  is `PushOptionsStage`, which refuses with the message of
+  `ValidatePushOptions` (`pushoptions.go`), a session linker's failure
+  being the refusal `internal error; try again`, logged, and otherwise sets
+  the session the linker accepted and marks the updates when the push has
+  `parley.change` or `parley.target` or goes to a task fork whose
+  `auto_change` is true); the pack
   into a `gitrepo.Quarantine` (skipped when every command is a delete),
   which fails as `unpack invalid pack` with `ng <ref> unpacker error` for
   every ref when git index-pack refuses it or a new value names no object;

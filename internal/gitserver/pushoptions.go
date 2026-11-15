@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // The limits of the push options of one push. They count every option, not
@@ -151,4 +155,61 @@ func ValidatePushOptions(ctx context.Context, raw []string, caller PushCaller, w
 
 func invalidOption(name, reason string) string {
 	return "invalid push option " + name + ": " + reason
+}
+
+// PushOptionsStage is the push processor's options stage: it judges the
+// push options of a push with ValidatePushOptions, so that an invalid one
+// refuses the push before its pack is read, and hands on the session of
+// parley.session, which the push's version and events are written for.
+//
+// Its session linker is registered on the instance
+// (docs/adr/08-register-the-push-collaborators-on-the-ref-writer.md); with
+// none, every parley.session is refused as an unknown session. The zero
+// value is ready to use and logs nothing.
+type PushOptionsStage struct {
+	mu       sync.RWMutex
+	sessions SessionLinker
+	logger   *slog.Logger
+}
+
+// Bind sets the logger of the stage's failures that are not the client's
+// doing: a session linker that could not tell.
+func (s *PushOptionsStage) Bind(logger *slog.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logger = logger
+}
+
+// RegisterSessionLinker makes l the session linker, replacing the one
+// registered before; nil removes it.
+func (s *PushOptionsStage) RegisterSessionLinker(l SessionLinker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions = l
+}
+
+// CheckOptions answers the push in with the refusal of its options, or with
+// the session the push is written for and whether it opens a change: one
+// that asks for a change, or any push to a task fork that opens changes on
+// its own. A session linker that could not tell is answered as a refusal,
+// not as an error, since the client is told only to try again; the error
+// is logged.
+func (s *PushOptionsStage) CheckOptions(ctx context.Context, in OptionsInput) (OptionsAnswer, error) {
+	s.mu.RLock()
+	sessions, logger := s.sessions, s.logger
+	s.mu.RUnlock()
+	opts, refusal, err := ValidatePushOptions(ctx, in.Options, in.Caller, in.Workspace.Slug, sessions)
+	if err != nil && logger != nil {
+		logger.LogAttrs(ctx, slog.LevelError, "git push options failed",
+			slog.String("request_id", server.RequestID(ctx)),
+			slog.String("workspace", in.Workspace.Slug),
+			slog.String("error", err.Error()),
+		)
+	}
+	if refusal != "" {
+		return OptionsAnswer{Refusal: refusal}, nil
+	}
+	ws := in.Workspace
+	autoChange := ws.Kind == access.KindFork && ws.AutoChange != nil && *ws.AutoChange
+	return OptionsAnswer{SessionID: opts.SessionID, OpensChange: opts.Change || autoChange}, nil
 }

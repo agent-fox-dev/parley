@@ -228,9 +228,12 @@ type Composition struct {
 	// (PushRules), and receiver the push processor behind git-receive-pack
 	// (Receiver). Both exist from the composition on, so that a part
 	// registers its collaborator on them while the hub is composed;
-	// composeGitServer binds them in its start hook.
-	pushRules *pushrule.Engine
-	receiver  *gitserver.Receiver
+	// composeGitServer binds them in its start hook. pushOptions is the
+	// receiver's options stage (PushOptions), which composeGitServer
+	// creates and registers.
+	pushRules   *pushrule.Engine
+	receiver    *gitserver.Receiver
+	pushOptions *gitserver.PushOptionsStage
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).

@@ -1,14 +1,18 @@
 package gitserver_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // sessionStub is a session linker that notes each check and refuses with
@@ -157,6 +161,48 @@ func TestValidatePushOptions_RefusesASessionTheLinkerDoesNotAccept(t *testing.T)
 				if !reflect.DeepEqual(tc.linker.calls, want) {
 					t.Errorf("linker calls = %+v, want %+v", tc.linker.calls, want)
 				}
+			}
+		})
+	}
+}
+
+// The options stage answers a push with the refusal of its options, or with
+// the session it is written for and whether it opens a change; a session
+// linker that cannot tell refuses the push, logged, rather than failing it.
+func TestPushOptionsStage_AnswersWithTheRefusalOrTheSessionAndOpening(t *testing.T) {
+	repo := workspace.Workspace{Slug: "demo", Kind: access.KindRepository}
+	fork := func(auto bool) workspace.Workspace {
+		return workspace.Workspace{Slug: "demo--t1", Kind: access.KindFork, ParentSlug: ptr("demo"), AutoChange: &auto}
+	}
+	for _, c := range []struct {
+		name    string
+		ws      workspace.Workspace
+		options []string
+		linker  error
+		want    gitserver.OptionsAnswer
+	}{
+		{"no option", repo, nil, nil, gitserver.OptionsAnswer{}},
+		{"a change asked for", repo, []string{"parley.change"}, nil, gitserver.OptionsAnswer{OpensChange: true}},
+		{"a target", repo, []string{"parley.target=release"}, nil, gitserver.OptionsAnswer{OpensChange: true}},
+		{"a fork that opens changes", fork(true), nil, nil, gitserver.OptionsAnswer{OpensChange: true}},
+		{"a fork that does not", fork(false), nil, nil, gitserver.OptionsAnswer{}},
+		{"a session", repo, []string{"parley.session=ABC"}, nil, gitserver.OptionsAnswer{SessionID: ptr("abc")}},
+		{"an invalid option", fork(true), []string{"parley.bogus"}, nil,
+			gitserver.OptionsAnswer{Refusal: "invalid push option parley.bogus: unknown option"}},
+		{"a linker that cannot tell", repo, []string{"parley.session=abc", "parley.change"}, errors.New("store down"),
+			gitserver.OptionsAnswer{Refusal: "internal error; try again"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			s := &gitserver.PushOptionsStage{}
+			s.Bind(slog.New(slog.NewTextHandler(&logged, nil)))
+			s.RegisterSessionLinker(&sessionStub{err: c.linker})
+			got, err := s.CheckOptions(context.Background(), gitserver.OptionsInput{Workspace: c.ws, Options: c.options})
+			if err != nil || !reflect.DeepEqual(got, c.want) {
+				t.Errorf("answer = %+v, %v; want %+v, nil", got, err, c.want)
+			}
+			if failed := c.linker != nil; strings.Contains(logged.String(), "store down") != failed {
+				t.Errorf("log = %q, want the linker's failure logged: %t", logged.String(), failed)
 			}
 		})
 	}
