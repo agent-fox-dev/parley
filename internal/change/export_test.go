@@ -26,7 +26,7 @@ func PatchID(ctx context.Context, repo *gitrepo.Repo, base, head string) (string
 // rebase, its deadline, the worker's clock and a gate every check passes
 // as it starts; nil and zero keep the hub's.
 type MergeableSeams struct {
-	Trial    func(ctx context.Context, repo *gitrepo.Repo, onto, head string) (*gitrepo.ConflictReport, error)
+	Trial    func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error)
 	Deadline time.Duration
 	Clock    interface {
 		Now() time.Time

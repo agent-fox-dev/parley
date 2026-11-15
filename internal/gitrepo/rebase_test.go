@@ -157,6 +157,9 @@ func TestRebaseFrom_ReplaysOnlyTheCommitsAfterTheBase(t *testing.T) {
 			base = f.id(t, base)
 		}
 		head, onto := f.id(t, c.head), f.id(t, c.onto)
+		if trial, err := f.repo.TrialRebaseFrom(context.Background(), base, head, onto); trial != nil || err != nil {
+			t.Errorf("%s: TrialRebaseFrom = %+v, %v; want clean", c.name, trial, err)
+		}
 		got, report, err := f.repo.RebaseFrom(context.Background(), base, head, onto, rebaseAt)
 		switch {
 		case err != nil || report != nil:
@@ -176,6 +179,9 @@ func TestRebaseFrom_ReplaysOnlyTheCommitsAfterTheBase(t *testing.T) {
 	if report.BaseSHA != base || report.CommitSHA != head || report.TargetSHA != onto || report.HeadSHA != head {
 		t.Errorf("the report names base %s, commit %s, target %s, head %s; want %s, %s, %s, %s",
 			report.BaseSHA, report.CommitSHA, report.TargetSHA, report.HeadSHA, base, head, onto, head)
+	}
+	if trial, err := f.repo.TrialRebaseFrom(context.Background(), base, head, onto); err != nil || !reflect.DeepEqual(trial, report) {
+		t.Errorf("TrialRebaseFrom(both-edit~1, both-edit, main) = %+v, %v; want the rebase's report %+v", trial, err, report)
 	}
 }
 

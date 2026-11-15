@@ -69,9 +69,16 @@ so the restack's report (the change's own commits) is not replaced by the
 check's trial.
 
 A check triggered after that conflict for another reason, such as a push to
-the target or a retarget, is not held back. It stores its own trial report:
-`mergeable` stays `conflict` and no second event is written, but the
-report's `base_sha` and `commit_sha` then describe the check's trial.
+the target or a retarget, is not held back, and stores its own report:
+`mergeable` stays `conflict` and no second event is written. For a change in
+a stack (one with a `depends_on`, a `needs_restack` or a `restack_onto`) the
+check replays only the change's own commits, `base_sha..head`, through
+`(*gitrepo.Repo).TrialRebaseFrom`, as its restack replays them, so its
+report describes the same commits as the restack's: `base_sha` the change's
+base and `commit_sha` one of its own commits, never one of the change below.
+That holds also for a change whose restack never ran, such as one flagged
+while automatic restacks are off. A change outside a stack keeps the trial
+of `onto..head`, the commits the onto-commit lacks.
 
 A restack's pending record is kept, after a restack that failed or lost
 every swap, until a newer record or the next start, and the change is not

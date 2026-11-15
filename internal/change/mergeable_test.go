@@ -286,7 +286,7 @@ func TestMergeability_ComputesOnlyTheLatestPairOfABurst(t *testing.T) {
 	var trials atomic.Int32
 	held := newGate()
 	change.SetMergeableSeams(w.changes, change.MergeableSeams{
-		Trial: func(ctx context.Context, repo *gitrepo.Repo, onto, head string) (*gitrepo.ConflictReport, error) {
+		Trial: func(ctx context.Context, repo *gitrepo.Repo, _, head, onto string) (*gitrepo.ConflictReport, error) {
 			if trials.Add(1) == 1 {
 				held.pass(ctx, "demo", 1)
 			}
@@ -514,7 +514,7 @@ func TestMergeability_LeavesUnknownWhenTheTrialRebaseFails(t *testing.T) {
 			w.settled(t, 2)
 			var cancelled atomic.Bool
 			change.SetMergeableSeams(w.changes, change.MergeableSeams{Deadline: 50 * time.Millisecond,
-				Trial: func(ctx context.Context, _ *gitrepo.Repo, _, _ string) (*gitrepo.ConflictReport, error) {
+				Trial: func(ctx context.Context, _ *gitrepo.Repo, _, _, _ string) (*gitrepo.ConflictReport, error) {
 					return nil, tc.fail(ctx, &cancelled)
 				}})
 			seq := w.seq(t)
@@ -551,12 +551,12 @@ func TestMergeability_LeavesEveryRefAsItWas(t *testing.T) {
 	cases := []struct {
 		name  string
 		main  map[string]string
-		trial func(ctx context.Context, repo *gitrepo.Repo, onto, head string) (*gitrepo.ConflictReport, error)
+		trial func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error)
 		want  string
 	}{
 		{"clean", map[string]string{"b.txt": "m\n"}, nil, change.MergeableClean},
 		{"conflict", map[string]string{"a.txt": lineOneM}, nil, change.MergeableConflict},
-		{"past its deadline", map[string]string{"a.txt": lineOneM}, func(ctx context.Context, repo *gitrepo.Repo, onto, head string) (*gitrepo.ConflictReport, error) {
+		{"past its deadline", map[string]string{"a.txt": lineOneM}, func(ctx context.Context, repo *gitrepo.Repo, _, head, onto string) (*gitrepo.ConflictReport, error) {
 			// The deadline may end git midway; the check fails at it either way.
 			_, err := repo.TrialRebase(ctx, onto, head)
 			<-ctx.Done()
@@ -588,6 +588,53 @@ func TestMergeability_LeavesEveryRefAsItWas(t *testing.T) {
 			}
 			if after := state(); after != before {
 				t.Errorf("refs and worktrees after the check:\n%s\nbefore:\n%s", after, before)
+			}
+		})
+	}
+}
+
+func TestMergeability_ReportsOnlyTheOwnCommitsOfAChangeInAStack(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.holdRestacks(t)
+	for i, c := range []struct {
+		name        string
+		autoRestack bool
+		// move moves what the change b sits on, after a, which adds f.txt,
+		// and b, which changes it, were opened, so that a check that replayed
+		// a's old commit would report it.
+		move func(t *testing.T, p string, a change.Change)
+	}{
+		{"a check for another trigger after a restack's conflict", true, func(t *testing.T, p string, _ change.Change) {
+			w.amend(t, p+"a", map[string]string{p + "f.txt": "a2\n"})
+			w.runPending(t)
+		}},
+		{"the change below gets a new version while automatic restacks are off", false, func(t *testing.T, p string, _ change.Change) {
+			w.amend(t, p+"a", map[string]string{p + "f.txt": "a2\n"})
+		}},
+		{"the change below lands while automatic restacks are off", false, func(t *testing.T, p string, a change.Change) {
+			landed := w.land(t, a.Number, map[string]string{p + "f.txt": "squashed\n"})
+			if err := w.changes.OnLanded(context.Background(), "demo", a.Number, landed); err != nil {
+				t.Fatalf("OnLanded = %v", err)
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fmt.Sprintf("o%d", i)
+			w.set(t, "demo", "settings", fmt.Sprintf(`{"changes.auto_restack":%v}`, c.autoRestack))
+			a := commit(t, w.demo, p+"a", w.base, "A\n", map[string]string{p + "f.txt": "a\n"})
+			lower := w.openBranch(t, p+"a", nil)
+			commit(t, w.demo, p+"b", a, "B\n", map[string]string{p + "f.txt": "b\n"})
+			b := w.openBranch(t, p+"b", nil)
+			c.move(t, p, lower)
+			w.trigger(t, b.Number)
+			w.quiet(t)
+
+			got := w.read(t, b.Number)
+			rep := asJSON(t, got.Conflict)
+			if got.Mergeable != change.MergeableConflict || rep["commit_sha"] != b.HeadSHA || rep["base_sha"] != a || rep["head_sha"] != b.HeadSHA {
+				t.Errorf("demo#%d: mergeable %s with the report %v; want conflict at its own commit %s from its base %s",
+					b.Number, got.Mergeable, rep, b.HeadSHA, a)
 			}
 		})
 	}

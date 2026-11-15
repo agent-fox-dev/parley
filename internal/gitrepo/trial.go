@@ -23,11 +23,37 @@ var ErrMergeCommit = errors.New("a merge commit is among the commits to replay")
 // no ref is used or changed. It may leave objects no ref reaches, which
 // git's garbage collection removes.
 func (r *Repo) TrialRebase(ctx context.Context, onto, head string) (*ConflictReport, error) {
+	return r.trial(ctx, onto, head, onto)
+}
+
+// TrialRebaseFrom is TrialRebase of the commits that head reaches and base
+// does not, the commits of a branch made on base, on top of onto, as
+// RebaseFrom replays them: base's own commits are not replayed, also when
+// onto does not have them. A base of "" replays every commit of head. The
+// report of a commit that does not apply names base as its base.
+func (r *Repo) TrialRebaseFrom(ctx context.Context, base, head, onto string) (*ConflictReport, error) {
+	report, err := r.trial(ctx, base, head, onto)
+	if report != nil {
+		report.BaseSHA = base
+	}
+	return report, err
+}
+
+// trial replays the commits from..head, every commit of head for a from
+// of "", on top of onto, as TrialRebase says.
+func (r *Repo) trial(ctx context.Context, from, head, onto string) (*ConflictReport, error) {
 	onto, head, err := rangeEnds(onto, head)
 	if err != nil {
 		return nil, err
 	}
-	commits, err := r.replayed(ctx, onto+".."+head)
+	commitRange := head
+	if from != "" {
+		if from, _, err = rangeEnds(from, head); err != nil {
+			return nil, err
+		}
+		commitRange = from + ".." + head
+	}
+	commits, err := r.replayed(ctx, commitRange)
 	if err != nil || len(commits) == 0 {
 		return nil, err
 	}

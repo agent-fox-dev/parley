@@ -165,8 +165,9 @@ func (c *Component) runChecks(ctx context.Context) {
 
 // checkMergeable computes the mergeable of the change k: it reads the
 // change's head and onto-commit, trial-rebases the head onto it in the
-// target's repository under the deadline, and stores the result when they
-// are still the change's, unless a restack stored its conflict since the
+// target's repository under the deadline, only the change's own commits for
+// a change in a stack (ownBase), and stores the result when they and the
+// change's base are still the change's, unless a restack stored its conflict since the
 // check was scheduled (holdsRestackConflict); a pair that moved on is
 // scheduled again. A
 // missing target branch leaves mergeable unknown and re-evaluates the
@@ -179,12 +180,16 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		gate(ctx, k.workspace, k.number)
 	}
 	var (
-		ch   Change
-		onto string
-		live bool
+		ch         Change
+		onto, base string
+		live       bool
 	)
 	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
-		if ch, onto, live, err = c.mergePair(ctx, tx, k.workspace, k.number); err != nil || !live || onto != "" {
+		if ch, onto, live, err = c.mergePair(ctx, tx, k.workspace, k.number); err != nil || !live {
+			return err
+		}
+		if onto != "" {
+			base, err = ownBase(ctx, tx, ch)
 			return err
 		}
 		return c.reevaluateLanding(ctx, tx, k.workspace, k.number)
@@ -199,7 +204,7 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, deadline)
-	report, err := trial(tctx, repo, onto, ch.HeadSHA)
+	report, err := trial(tctx, repo, base, ch.HeadSHA, onto)
 	cancel()
 	if err != nil {
 		c.checkFailed(ctx, k, err)
@@ -211,7 +216,7 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		if err != nil || !live {
 			return err
 		}
-		if moved = now.HeadSHA != ch.HeadSHA || ontoNow != onto; moved {
+		if moved = now.HeadSHA != ch.HeadSHA || ontoNow != onto || baseColumn(now.BaseSHA) != baseColumn(ch.BaseSHA); moved {
 			return nil
 		}
 		if holdsRestackConflict(now) {
@@ -271,6 +276,25 @@ func (c *Component) mergePair(ctx context.Context, q Querier, workspace string, 
 	}
 	onto, _, err = repo.ResolveBranch(ctx, ch.TargetBranch)
 	return ch, onto, err == nil, err
+}
+
+// ownBase is, for the change ch read through q, the commit after which its
+// head holds only its own commits, when ch is in a stack: it depends on a
+// change, it needs a restack, or it must sit on the commit the change
+// below landed as. Its head may then still carry the commits of the change
+// below as they were when ch was built on them, which a trial of onto..head
+// would replay and could report as the conflict; its check replays only
+// its own commits, as its restack does, so that a check's report and a
+// restack's describe the same commits. It is "" for any other change, and
+// for one with no base, whose check replays onto..head.
+func ownBase(ctx context.Context, q Querier, ch Change) (string, error) {
+	if ch.DependsOn == nil && !ch.NeedsRestack {
+		landed, err := landedBelow(ctx, q, ch)
+		if err != nil || landed == "" {
+			return "", err
+		}
+	}
+	return baseColumn(ch.BaseSHA), nil
 }
 
 // StoreMergeability stores in tx, the caller's transaction, the result of
@@ -396,12 +420,16 @@ type wallClock struct{}
 func (wallClock) Now() time.Time                         { return time.Now() }
 func (wallClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
-// trialFunc trial-rebases head onto onto in repo: nil for clean, the
-// conflict report otherwise.
-type trialFunc func(ctx context.Context, repo *gitrepo.Repo, onto, head string) (*gitrepo.ConflictReport, error)
+// trialFunc trial-rebases head onto onto in repo, the commits after base
+// for a base, onto..head for none: nil for clean, the conflict report
+// otherwise.
+type trialFunc func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error)
 
-func trialRebase(ctx context.Context, repo *gitrepo.Repo, onto, head string) (*gitrepo.ConflictReport, error) {
-	return repo.TrialRebase(ctx, onto, head)
+func trialRebase(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
+	if base == "" {
+		return repo.TrialRebase(ctx, onto, head)
+	}
+	return repo.TrialRebaseFrom(ctx, base, head, onto)
 }
 
 // mergeWorker is the set of changes whose check is due or waits, each

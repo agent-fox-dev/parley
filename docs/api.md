@@ -4078,7 +4078,11 @@ The hub computes `mergeable` in the background for every `draft` and
 `open` change, without being asked: it trial-rebases the commits of the
 current version that the onto-commit lacks onto the onto-commit, the head
 of the change named by `depends_on` while that change is `draft` or
-`open`, otherwise the head of the target branch. The result is `clean`,
+`open`, otherwise the head of the target branch. For a change in a stack
+(one with a `depends_on`, a `needs_restack`, or a change below that
+landed) the trial replays only the change's own commits, those after its
+`base_sha`, as a restack does, so that the report never names a commit of
+the change below and its `base_sha` is the change's. The result is `clean`,
 or `conflict` with the conflict report in `conflict`: `target_sha` (the
 onto-commit), `head_sha`, `base_sha`, `commit_sha` (the first commit that
 does not apply), `files` (each `path`, `kind`, `base`, `ours`, `theirs`,
