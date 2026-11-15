@@ -51,8 +51,8 @@ type Repository interface {
 	// gitrepo.ErrMergeCommit.
 	TrialRebase(ctx context.Context, onto, head string) (*gitrepo.ConflictReport, error)
 	// ReadTree reads the directory path, "" for the root, of the commit of
-	// a full id, with recursive every entry below it.
-	ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error)
+	// a full id, and the entries read says.
+	ReadTree(ctx context.Context, commit, path string, read gitrepo.TreeRead) (gitrepo.Tree, error)
 	// LookupFile is the entry of the file path of the commit of a full id.
 	LookupFile(ctx context.Context, commit, path string) (gitrepo.TreeEntry, error)
 	// WriteBlob writes the bytes of the blob of a full id to w.

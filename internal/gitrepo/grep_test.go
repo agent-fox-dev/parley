@@ -77,6 +77,93 @@ func TestGrep_FindsTheLinesThatMatchAPatternInPathOrder(t *testing.T) {
 	}
 }
 
+func TestGrep_KeepsTheFirstCharactersOfALongLine(t *testing.T) {
+	repo, main := searchRepo(t)
+	for _, c := range []struct {
+		max  int
+		want string
+	}{
+		{500, gitrepotest.SearchLong[:len("needle")+494*len("é")]},
+		{1, "n"},
+		{2000, gitrepotest.SearchLong},
+		{5000, gitrepotest.SearchLong},
+	} {
+		var got []gitrepo.GrepMatch
+		err := repo.Grep(context.Background(), main, gitrepo.GrepQuery{Pattern: "needle", MaxText: c.max}, func(x gitrepo.GrepMatch) bool {
+			got = append(got, x)
+			return true
+		})
+		if err != nil || len(got) != 1 || got[0].Text != c.want {
+			t.Errorf("Grep(needle, MaxText %d) = %+v, %v, want the line's first %d characters", c.max, got, err, c.max)
+		}
+	}
+	// A line cut short keeps a CR it holds; a whole line loses the CR of its CR LF.
+	if got := grepWith(t, repo, main, gitrepo.GrepQuery{Pattern: "windows", MaxText: 12}); len(got) != 1 || got[0].Text != "windows line" {
+		t.Errorf("Grep(windows, MaxText 12) = %+v, want the line without its CR", got)
+	}
+}
+
+func TestGrep_ContinuesAfterAMatch(t *testing.T) {
+	repo, main := searchRepo(t)
+	type m = gitrepo.GrepMatch
+	for _, c := range []struct {
+		name string
+		q    gitrepo.GrepQuery
+		want []m
+	}{
+		{"after a line of a file", gitrepo.GrepQuery{Pattern: "hit 44", AfterPath: "hits.txt", AfterLine: 44},
+			[]m{{"hits.txt", 440, "hit 440"}, {"hits.txt", 441, "hit 441"}, {"hits.txt", 442, "hit 442"}, {"hits.txt", 443, "hit 443"},
+				{"hits.txt", 444, "hit 444"}, {"hits.txt", 445, "hit 445"}, {"hits.txt", 446, "hit 446"}, {"hits.txt", 447, "hit 447"},
+				{"hits.txt", 448, "hit 448"}, {"hits.txt", 449, "hit 449"}}},
+		{"into the files after it", gitrepo.GrepQuery{Pattern: "a", AfterPath: "docs/a.md", AfterLine: 1},
+			[]m{{"docs/a.md", 3, "Say hello."}, {"literal.txt", 1, "a.b(c)*"}, {"literal.txt", 2, "aXb"}}},
+		{"after a path no file has", gitrepo.GrepQuery{Pattern: "unicode", AfterPath: "dir with space/a", AfterLine: 9},
+			[]m{{"dir with space/ü.txt", 1, "unicode path"}}},
+		{"after a path beyond ASCII", gitrepo.GrepQuery{Pattern: "e", AfterPath: "dir with space/ü.txt", AfterLine: 1, MaxText: 6},
+			[]m{{"docs/a.md", 1, "# Gree"}, {"docs/a.md", 3, "Say he"}, {"long.txt", 1, "needle"}}},
+		{"after the last match", gitrepo.GrepQuery{Pattern: "hit", AfterPath: "long.txt", AfterLine: 1}, []m{}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := grepWith(t, repo, main, c.q); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("Grep(%+v) = %+v, want %+v", c.q, got, c.want)
+			}
+		})
+	}
+}
+
+func TestGrep_ContinuesAfterAnyPath(t *testing.T) {
+	dir := t.TempDir()
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	paths := []string{":x/1", "a b", "a*b", "a-b", "a.b/c", "a/b", "a/b/c", "a[b]", "a\\b", "a?", "ab", "é/ü", "\xff"}
+	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nx\n"
+	for _, p := range paths {
+		if p == "a/b" {
+			continue // a/b is a directory
+		}
+		stream += "M 100644 inline " + p + "\ndata 4\nhit\n\n"
+	}
+	if _, err := gitrepotest.Run(dir, stream+"\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := (gitrepo.Git{}).Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
+	all := grepWith(t, repo, main, gitrepo.GrepQuery{Pattern: "hit"})
+	for _, after := range append(paths, "", "0", "a", "a/", "a/a", "a/b/", "../x", "a/./b", "/a", "a//b", "\xff\xff", "a\x00b") {
+		want := []gitrepo.GrepMatch{}
+		for _, x := range all {
+			if after == "" || x.Path > after {
+				want = append(want, x)
+			}
+		}
+		if got := grepWith(t, repo, main, gitrepo.GrepQuery{Pattern: "hit", AfterPath: after, AfterLine: 1}); !reflect.DeepEqual(got, want) {
+			t.Errorf("Grep(hit) after %q = %v, want %v", after, got, want)
+		}
+	}
+}
+
 func TestGrep_RefusesAPatternOrCommitItCannotSearch(t *testing.T) {
 	repo, main := searchRepo(t)
 	for _, c := range []struct {
@@ -106,12 +193,18 @@ func TestGrep_RefusesAPatternOrCommitItCannotSearch(t *testing.T) {
 // grepAll is every match of the fixed string pattern at commit.
 func grepAll(t *testing.T, repo *gitrepo.Repo, commit, pattern string) []gitrepo.GrepMatch {
 	t.Helper()
-	var got []gitrepo.GrepMatch
-	if err := repo.Grep(context.Background(), commit, gitrepo.GrepQuery{Pattern: pattern}, func(x gitrepo.GrepMatch) bool {
+	return grepWith(t, repo, commit, gitrepo.GrepQuery{Pattern: pattern})
+}
+
+// grepWith is every match of q at commit.
+func grepWith(t *testing.T, repo *gitrepo.Repo, commit string, q gitrepo.GrepQuery) []gitrepo.GrepMatch {
+	t.Helper()
+	got := []gitrepo.GrepMatch{}
+	if err := repo.Grep(context.Background(), commit, q, func(x gitrepo.GrepMatch) bool {
 		got = append(got, x)
 		return true
 	}); err != nil {
-		t.Fatalf("Grep(%s): %v", pattern, err)
+		t.Fatalf("Grep(%+v): %v", q, err)
 	}
 	return got
 }

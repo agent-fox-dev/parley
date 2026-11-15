@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -114,5 +116,30 @@ func TestTrialRebase_ReplaysEveryCommitThatAppliesAndNoMerge(t *testing.T) {
 		if after := gitrepotest.ObjectCounts(t, f.dir); c.err != nil && after["count"] != objects["count"] {
 			t.Errorf("%s: the refused rebase wrote objects: %v, then %v", c.head, objects, after)
 		}
+	}
+}
+
+func TestTrialRebase_ReadsNoCommitMessage(t *testing.T) {
+	t.Parallel()
+	f := newCompareFixture(t)
+	var mu sync.Mutex
+	var read [][]string
+	repo, err := gitrepo.Git{Trace: func(args []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if slices.Contains(args, "cat-file") && !slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--batch-check") }) {
+			read = append(read, args)
+		}
+	}}.Open(context.Background(), f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, head := range []string{"feature", "long", "merged", "both-edit", "main~1"} {
+		if _, err := repo.TrialRebase(context.Background(), f.id(t, "main"), f.id(t, head)); err != nil && !errors.Is(err, gitrepo.ErrMergeCommit) {
+			t.Errorf("TrialRebase(main, %s): %v", head, err)
+		}
+	}
+	if len(read) != 0 {
+		t.Errorf("the trial rebases read whole objects: %v", read)
 	}
 }

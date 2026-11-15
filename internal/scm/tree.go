@@ -84,7 +84,12 @@ func (c *Component) listTree(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	sha := res.SHA
-	tree, err := rd.repo.ReadTree(r.Context(), sha, path, recursive)
+	// One entry past the page tells that there is a next page.
+	read := gitrepo.TreeRead{Recursive: recursive, Limit: page.Limit + 1}
+	if continuing {
+		read.After = pos.Path
+	}
+	tree, err := rd.repo.ReadTree(r.Context(), sha, path, read)
 	switch {
 	case errors.Is(err, gitrepo.ErrNotFound):
 		return server.NewError("path_not_found", http.StatusNotFound, fmt.Sprintf("path %q does not exist at %s", path, sha))
@@ -93,14 +98,8 @@ func (c *Component) listTree(w http.ResponseWriter, r *http.Request) error {
 	case err != nil:
 		return err
 	}
-	items := make([]treeEntry, 0, page.Limit+1)
+	items := make([]treeEntry, 0, len(tree.Entries))
 	for _, e := range tree.Entries {
-		if continuing && e.Path <= pos.Path {
-			continue
-		}
-		if len(items) > page.Limit {
-			break
-		}
 		items = append(items, newTreeEntry(e))
 	}
 	return server.WritePageWith(w, page, items, func(e treeEntry) any { return treePosition{SHA: sha, Path: e.Path} },
