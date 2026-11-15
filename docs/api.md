@@ -2177,7 +2177,11 @@ Once it has committed, the copy is removed from disk, and with it the
 origin head of every branch, and the clone work of the workspace is
 started. The new copy holds what origin holds and nothing else: a branch
 origin did not take, and every ref under `refs/parley/`, are lost; change
-records and the other data the workspace owns stay. `head_sha`,
+records and the other data the workspace owns stay. When the clone work
+leaves the workspace `ready`, in the same store transaction, every draft
+and open change whose source branch the new copy does not have is
+abandoned with `reason` `source_lost` by the hub (`actor_type` `system`),
+with its `parley.change.abandon` event. `head_sha`,
 `default_branch`, `last_sync_at` and `clone_error` keep their values until
 the clone work changes them. A copy that a hub stopped in the middle of a
 reclone left on disk is not taken for the workspace's copy: the clone
@@ -3622,9 +3626,13 @@ when that branch is the source of a draft or open change; a landing
 records none.
 A git push that deletes the source branch abandons the change; the
 deletion of its task fork abandons every draft and open change from it,
-and the deletion of the target workspace deletes its changes. Each
-abandonment writes `parley.change.abandon`, its `reason` `source_deleted`
-or `source_workspace_deleted`. The versions and their refs stay.
+and the deletion of the target workspace deletes its changes. A reclone
+of the source workspace abandons, once its clone work leaves the workspace
+`ready`, every draft and open change whose source branch did not come
+back from origin, by the hub. Each
+abandonment writes `parley.change.abandon`, its `reason` `source_deleted`,
+`source_workspace_deleted` or `source_lost`. The versions and their refs
+stay.
 
 When `parleyd` starts, before it accepts a request, it compares the source
 branch of every draft and open change with the head of the change's

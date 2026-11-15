@@ -58,6 +58,10 @@ const (
 //   - a branch a sync moved records a version of kind sync by the hub, in a
 //     store transaction of its own, since the sync tells its observers
 //     outside one;
+//   - a clone that leaves a workspace ready abandons for source_lost, in
+//     the transaction that sets it ready, the draft and open changes whose
+//     source branch the fresh copy does not have, as after a reclone that
+//     did not bring the branch back from origin;
 //   - the teardown of a workspace, and of each of its forks, abandons the
 //     changes whose source is a deleted fork and deletes the workspace's
 //     own changes, in the delete's transaction;
@@ -123,6 +127,7 @@ func composeChanges(c *Composition) {
 	c.AdjustSCM(func(d *scm.Deps) { d.Changes = changeLookup{comp} })
 	c.workspaces.RegisterBranchMoveObserver(syncVersions{comp, c.runtime})
 	c.workspaces.RegisterBranchMoveObserver(syncTargets{comp, c.runtime})
+	c.workspaces.RegisterCloneObserver(lostSources{comp})
 	c.workspaces.Teardown().RegisterRemover(func(ctx context.Context, tx *sql.Tx, slug string) error {
 		if err := comp.ForkDeleted(ctx, tx, slug, change.Caller{}); err != nil {
 			return err
@@ -392,6 +397,15 @@ func (o syncTargets) BranchMoved(ctx context.Context, m workspace.BranchMove) er
 	return o.rt.Store.Tx(ctx, func(tx *sql.Tx) error {
 		return o.changes.ScheduleTargetMergeable(ctx, tx, m.Workspace, m.Branch)
 	})
+}
+
+// lostSources is the clone observer of the workspaces: a fresh copy that
+// lacks the source branch of a draft or open change abandons that change
+// for source_lost, in the transaction that sets the workspace ready.
+type lostSources struct{ changes *change.Component }
+
+func (o lostSources) Cloned(ctx context.Context, tx *sql.Tx, slug string) error {
+	return o.changes.SourceLost(ctx, tx, slug)
 }
 
 // forkChanges is the fork component's change reader: every change, in any

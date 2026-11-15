@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -28,6 +29,17 @@ type Git interface {
 // at its place. An error it returns is logged and does not fail the clone:
 // the copy is complete without the step.
 type PostCloneStep func(ctx context.Context, w Workspace, repo *gitrepo.Repo) error
+
+// CloneObserver is told of every clone that leaves a workspace ready, in
+// the store transaction that sets it ready, once the fresh copy is at its
+// place, so that a feature can settle what that copy no longer holds, such
+// as a change whose source branch a reclone did not bring back from origin,
+// without this package knowing that feature. Its writes commit with the
+// ready status; an error it returns undoes them alone, and is logged: the
+// copy is complete whatever the observer does.
+type CloneObserver interface {
+	Cloned(ctx context.Context, tx *sql.Tx, slug string) error
+}
 
 // cloneDirPrefix starts the name of a clone in progress in the repository
 // root. No slug starts with a dot, so no copy's name can carry it, and what
@@ -65,6 +77,18 @@ func (s *Service) RegisterPostCloneStep(mode string, step PostCloneStep) {
 		return
 	}
 	s.postClone[mode] = step
+}
+
+// RegisterCloneObserver adds o to the observers every clone that leaves a
+// workspace ready tells, in the order of registration; nil adds none. The
+// features that observe clones register when the hub is composed.
+func (s *Service) RegisterCloneObserver(o CloneObserver) {
+	if o == nil {
+		return
+	}
+	s.clonedMu.Lock()
+	defer s.clonedMu.Unlock()
+	s.cloneObservers = append(s.cloneObservers, o)
 }
 
 // postCloneStep is the step registered for mode, nil without one.
@@ -210,7 +234,7 @@ func (s *Service) finishClone(ctx context.Context, w Workspace, branch, head str
 			s.deps.Logger.Error("workspace post-clone step failed", "slug", w.Slug, "workspace_mode", w.Mode, "error", err)
 		}
 	}
-	return s.recordClone(ctx, w, StatusReady)
+	return s.becomeReady(ctx, w)
 }
 
 // keepCopy keeps what lies at the place of w's copy when it is a complete
@@ -239,7 +263,7 @@ func (s *Service) keepCopy(ctx context.Context, w Workspace) (kept bool, err err
 	if origin != "" {
 		w.OriginHeadSHA = &origin
 	}
-	return true, s.recordClone(ctx, w, StatusReady)
+	return true, s.becomeReady(ctx, w)
 }
 
 // validCopy reports whether dir holds a complete copy of w, as keepCopy
@@ -292,6 +316,40 @@ func cloneBranch(ctx context.Context, repo *gitrepo.Repo, given *string, branche
 		return "", err
 	}
 	return slices.Sorted(maps.Keys(branches))[0], nil
+}
+
+// becomeReady writes the clone fields of w with status ready and tells the
+// clone observers, in registration order, in the same store transaction,
+// each under a savepoint: an observer that fails has its own writes undone
+// and its error logged, and the workspace becomes ready all the same. Only
+// a failure of the write or of a savepoint is returned.
+func (s *Service) becomeReady(ctx context.Context, w Workspace) error {
+	s.clonedMu.RLock()
+	observers := slices.Clone(s.cloneObservers)
+	s.clonedMu.RUnlock()
+	return s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if err := UpdateClone(ctx, tx, w.Slug, CloneFields{
+			Status: StatusReady, DefaultBranch: w.DefaultBranch, HeadSHA: w.HeadSHA,
+			OriginHeadSHA: w.OriginHeadSHA, CloneError: w.CloneError, UpdatedAt: s.deps.Now(),
+		}); err != nil {
+			return err
+		}
+		for _, o := range observers {
+			if _, err := tx.ExecContext(ctx, `SAVEPOINT clone_observer`); err != nil {
+				return fmt.Errorf("open the clone observer's savepoint: %w", err)
+			}
+			if err := o.Cloned(ctx, tx, w.Slug); err != nil {
+				s.deps.Logger.Error("workspace clone observer failed", "slug", w.Slug, "error", err)
+				if _, err := tx.ExecContext(ctx, `ROLLBACK TO clone_observer`); err != nil {
+					return fmt.Errorf("undo the clone observer's writes: %w", err)
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `RELEASE clone_observer`); err != nil {
+				return fmt.Errorf("release the clone observer's savepoint: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 // recordClone writes the clone fields of w with status in one write.

@@ -133,6 +133,9 @@ type Service struct {
 	stepMu    sync.RWMutex
 	postClone map[string]PostCloneStep
 
+	clonedMu       sync.RWMutex
+	cloneObservers []CloneObserver
+
 	moveMu        sync.RWMutex
 	moveObservers []BranchMoveObserver
 

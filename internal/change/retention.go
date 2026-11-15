@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
 
 // EventAbandon is the event of a change moved to abandoned.
@@ -17,6 +19,9 @@ const (
 	// ReasonSourceWorkspaceDeleted is the reason of a change whose source
 	// workspace, a task fork, was deleted.
 	ReasonSourceWorkspaceDeleted = "source_workspace_deleted"
+	// ReasonSourceLost is the reason of a change whose source branch the
+	// reclone of its workspace did not bring back from origin.
+	ReasonSourceLost = "source_lost"
 )
 
 // A change outlives its source as a record: abandoning it for a deleted
@@ -109,4 +114,38 @@ func (c *Component) emitAbandon(ctx context.Context, tx *sql.Tx, actor Caller, w
 		return err
 	}
 	return c.emit(ctx, tx, actor, ch, EventAbandon, map[string]any{"reason": reason, "version": ch.Version, "head_sha": ch.HeadSHA})
+}
+
+// SourceLost abandons, in tx, every draft and open change whose source is
+// a branch the copy of the workspace slug does not have, for
+// ReasonSourceLost, by the hub, through Abandon. The workspace's clone
+// calls it once a fresh copy is at its place: a reclone brings back only
+// the branches origin has, and a change whose branch did not come back has
+// nothing left to follow. A change whose branch is there stays as it is.
+func (c *Component) SourceLost(ctx context.Context, tx *sql.Tx, slug string) error {
+	sources, err := c.ChangeNumbersOfSource(ctx, tx, slug)
+	if err != nil {
+		return err
+	}
+	var repo *gitrepo.Repo
+	for _, s := range sources {
+		if s.State != StateDraft && s.State != StateOpen {
+			continue
+		}
+		if repo == nil {
+			if repo, err = c.deps.Repos(ctx, slug); err != nil {
+				return fmt.Errorf("open the copy of %s: %w", slug, err)
+			}
+		}
+		_, found, err := repo.ResolveBranch(ctx, s.Branch)
+		if err != nil {
+			return err
+		}
+		if !found {
+			if err := c.Abandon(ctx, tx, s.WorkspaceSlug, s.Number, ReasonSourceLost, Caller{}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
