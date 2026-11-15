@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,10 +23,12 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -57,6 +60,7 @@ type world struct {
 	*hubtest.Hub
 	workspaces *workspace.Service
 	git        *gitserver.Component
+	events     *event.Component
 	service    *recorder
 	runs       countingRunner
 
@@ -69,6 +73,9 @@ type world struct {
 	repo, head string
 	// work is the head of the fork's own branch work (newForkWorld).
 	work string
+	// client is a repository that borrows demo's objects, in which a test
+	// makes what it pushes (commit, packFor).
+	client string
 
 	// mu guards now, the hub's time.
 	mu  sync.Mutex
@@ -99,7 +106,7 @@ func startWorld(t *testing.T, cfg hubtest.Config, service *recorder) *world {
 	w := &world{now: time.Now().UTC().Truncate(time.Second), service: service}
 	compose := cfg.Compose
 	cfg.Now, cfg.Compose = w.clock, func(c *hub.Composition) {
-		w.workspaces, w.git = c.Workspaces(), c.GitServer()
+		w.workspaces, w.git, w.events = c.Workspaces(), c.GitServer(), c.Events()
 		c.AdjustGitServer(func(d *gitserver.Deps) {
 			if service != nil {
 				d.Service = service
@@ -140,6 +147,10 @@ func startWorld(t *testing.T, cfg hubtest.Config, service *recorder) *world {
 		CreatedAt: w.clock(), UpdatedAt: w.clock(), InstanceID: workspace.NewInstanceID(),
 	}
 	if err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error { return workspace.Insert(context.Background(), tx, rec) }); err != nil {
+		t.Fatal(err)
+	}
+	w.client = filepath.Join(t.TempDir(), "client.git")
+	if err := (gitrepo.Git{}).CreateFork(context.Background(), w.repo, w.client); err != nil {
 		t.Fatal(err)
 	}
 	return w
@@ -284,9 +295,18 @@ func (w *world) call(t *testing.T, method, path, auth string) answer {
 // send is call with the headers header and the body body.
 func (w *world) send(t *testing.T, method, path, auth string, header http.Header, body string) answer {
 	t.Helper()
+	a, err := w.sendErr(method, path, auth, header, body)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return a
+}
+
+// sendErr is send that returns its failure, for a goroutine of a test.
+func (w *world) sendErr(method, path, auth string, header http.Header, body string) (answer, error) {
 	req, err := http.NewRequest(method, w.URL(path), strings.NewReader(body))
 	if err != nil {
-		t.Fatal(err)
+		return answer{}, err
 	}
 	for k, v := range header {
 		req.Header[k] = v
@@ -297,14 +317,14 @@ func (w *world) send(t *testing.T, method, path, auth string, header http.Header
 	req.Header.Set("X-Request-ID", fixedRequest)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
+		return answer{}, err
 	}
 	defer res.Body.Close()
 	got, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("%s %s: read the body: %v", method, path, err)
+		return answer{}, fmt.Errorf("read the body: %w", err)
 	}
-	return answer{res.StatusCode, res.Header, string(got)}
+	return answer{res.StatusCode, res.Header, string(got)}, nil
 }
 
 // basic is the Authorization header of HTTP Basic with user and password.
@@ -583,4 +603,130 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 	return out
+}
+
+// command is one command of a push: ref moves from old to new, ZeroID being
+// a create's old and a delete's new.
+type command struct{ old, new, ref string }
+
+// zero is the all-zero object id.
+const zero = pushrule.ZeroID
+
+// fullCaps are the capabilities stock git asks for when it pushes.
+var fullCaps = []string{"report-status", "side-band-64k", "delete-refs", "atomic"}
+
+// receiveRequest is the body of a receive-pack request: the commands, the
+// first carrying caps, a flush packet, then, when caps holds push-options,
+// the options and a flush packet, then pack.
+func receiveRequest(caps []string, cmds []command, options []string, pack string) string {
+	var b strings.Builder
+	for i, c := range cmds {
+		line := c.old + " " + c.new + " " + c.ref
+		if i == 0 {
+			line += "\x00" + strings.Join(caps, " ")
+		}
+		b.WriteString(pkt(line + "\n"))
+	}
+	b.WriteString("0000")
+	if slices.Contains(caps, "push-options") {
+		for _, o := range options {
+			b.WriteString(pkt(o + "\n"))
+		}
+		b.WriteString("0000")
+	}
+	return b.String() + pack
+}
+
+// receive posts the receive-pack request body to the repository segment
+// pair repo, such as "acme/demo.git", with credential.
+func (w *world) receive(t *testing.T, repo, credential, body string) answer {
+	t.Helper()
+	a, err := w.receiveErr(repo, credential, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// receiveErr is receive that returns its failure, for a goroutine of a test.
+func (w *world) receiveErr(repo, credential, body string) (answer, error) {
+	return w.sendErr(http.MethodPost, "/git/"+repo+"/git-receive-pack", basic("x", credential),
+		http.Header{"Content-Type": {"application/x-git-receive-pack-request"}}, body)
+}
+
+// commit makes in the client repository a commit on parent with parent's
+// tree and message msg, and returns its id: a commit demo's repository does
+// not have until it is pushed.
+func (w *world) commit(t *testing.T, parent, msg string) string {
+	t.Helper()
+	return gitrepotest.Git(t, w.client, "commit-tree", "-p", parent, "-m", msg, parent+"^{tree}")
+}
+
+// packFor is the pack a client sends with cmds: every new value, without
+// what demo's main and the old values reach; "" for commands that are all
+// deletes.
+func (w *world) packFor(t *testing.T, cmds []command) string {
+	t.Helper()
+	revs := []string{"^" + w.head}
+	sends := false
+	for _, c := range cmds {
+		if c.new != zero {
+			revs, sends = append(revs, c.new), true
+		}
+		if c.old != zero {
+			revs = append(revs, "^"+c.old)
+		}
+	}
+	if !sends {
+		return ""
+	}
+	return gitrepotest.Pack(t, w.client, revs...)
+}
+
+// receiveReport is the answer of a receive-pack request taken apart: the
+// lines of its status report, without their line ends, whether they came
+// inside side band 1, and the text of side band 2.
+type receiveReport struct {
+	lines  []string
+	framed bool
+	text   string
+}
+
+// parseReport takes the receive-pack answer body apart.
+func parseReport(body string) receiveReport {
+	var r receiveReport
+	var band1 strings.Builder
+	for _, p := range pktlines(body) {
+		switch {
+		case p == flushPkt:
+		case strings.HasPrefix(p, "\x01"):
+			band1.WriteString(p[1:])
+			r.framed = true
+		case strings.HasPrefix(p, "\x02"):
+			r.text += p[1:]
+		default:
+			r.lines = append(r.lines, strings.TrimSuffix(p, "\n"))
+		}
+	}
+	for _, p := range pktlines(band1.String()) {
+		if p != flushPkt {
+			r.lines = append(r.lines, strings.TrimSuffix(p, "\n"))
+		}
+	}
+	return r
+}
+
+// readable reports whether the repository at dir holds the object id.
+func readable(dir, id string) bool {
+	_, err := gitrepotest.Run(dir, "", "cat-file", "-e", id)
+	return err == nil
+}
+
+// lastSeq is the seq of the newest event of the hub's event log.
+func (w *world) lastSeq() int64 {
+	_, seq, err := w.events.ReadAfter(context.Background(), 0, 10000)
+	if err != nil {
+		return -1
+	}
+	return seq
 }

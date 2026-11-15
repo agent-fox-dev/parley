@@ -72,3 +72,53 @@ not finish within the limit. When the request's own context ends during a
 forward (the push's `[git].timeout`, or the client gone), the request is
 refused as `internal` and `Apply` returns the context's error, as for any
 other step that the request's end stops.
+
+## A command list the hub cannot read is answered `400`
+
+The package answers every push `200` with a status report. A request whose
+command list is not what git sends (a pkt-line that is not one, a command
+that is not `<old> <new> <ref>` with forty-digit ids and a ref under
+`refs/`, a create and delete at once, a gzip body that does not decode) has
+no ref the report could name, so the processor answers it
+`400 invalid receive-pack request` in plain text, as the git server answers
+its other refusals, and the request counts as `error`. Stock git never
+sends one.
+
+## `report-status-v2` is answered as `report-status`
+
+The receive-pack advertisement, which is git's own (package 17), offers
+`report-status-v2`, and stock git asks for it instead of `report-status`.
+Version 2 differs only by the `option` lines a server adds after a ref it
+rewrote; the hub rewrites no ref, so the processor sends the same report for
+either capability.
+
+## A failure of the hub's before the pack is stored is reported per ref
+
+The package words `internal error; try again` for a rule that cannot be
+evaluated and for a failed ref-updated stage. The processor reports the same
+text for a failure before the rules run (the options stage returns an
+error, the repository cannot be opened, the quarantine cannot be made):
+`unpack ok`, `ng <ref> internal error; try again` and an
+`error: <ref>: internal error; try again` side-band line for every ref, and
+the request counts as `error`.
+
+## The options stage can mark a push as opening a change
+
+The package gives package 19 an options stage that receives the push
+options and may refuse the push or set its session. Rule 5 holds an update
+without new commits to the files of the version it makes, which depends on
+whether the update opens a change (`Update.OpensChange`), and only the
+options say so. `gitserver.OptionsAnswer` therefore also has
+`OpensChange`, which marks every update of the push; without an options
+stage no update opens a change.
+
+## A `before` that names no object is refused as internal
+
+The rules are evaluated on the `before` the client sent. A `before` that
+names no object of the repository fails the ancestry question of a
+non-create, non-delete update, so the update is refused with
+`internal error; try again` rather than with the compare-and-swap's
+`ref changed since it was read; fetch and try again`. A ref cannot point at
+an object the repository lacks, so only a client that invents its `before`
+meets this; stock git sends the value it read from the advertisement or its
+own remote-tracking ref, which the repository holds unless it was pruned.

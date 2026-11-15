@@ -166,7 +166,9 @@ func TestPush_HandsTheCheckedPushToTheProcessorWithTheCallerAndTheWholeBody(t *t
 
 func TestPush_RefusesAndChangesNothingWithoutAProcessor(t *testing.T) {
 	t.Parallel()
-	w := newGitWorld(t, hubtest.Config{})
+	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		c.AdjustGitServer(func(d *gitserver.Deps) { d.Push = nil })
+	}})
 	before := gitrepotest.Git(t, w.repo, "for-each-ref")
 	dir := t.TempDir()
 	remote := w.remote(w.ownerKey, "acme/demo.git")

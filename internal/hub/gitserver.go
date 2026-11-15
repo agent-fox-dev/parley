@@ -3,7 +3,10 @@ package hub
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -40,12 +43,18 @@ const gitServerHook = "gitserver"
 // serverLimiter, which the hook points at the limiter of the server that
 // serves.
 //
-// The same start hook binds the ref writer (RefWriter) to the store, in
-// whose transactions its ref-updated stages run, to the head_sha setter,
-// which records the new head of a repository's default branch on its
-// record, and to the hub's logger. No push processor is installed yet, so
-// nothing writes through it over git: a push that passes the checks is
-// answered 500 internal error, its body unread and git not run.
+// The same start hook binds the push path. The ref writer (RefWriter) is
+// bound to the store, in whose transactions its ref-updated stages run, to
+// the head_sha setter, which records the new head of a repository's
+// default branch on its record, and to the hub's logger. The push rule
+// engine (PushRules) is bound to the settings reader, which reads a
+// workspace's effective protected_branches and protect.owner_push from its
+// record, a fork's from its parent's, and to the tracking-branch lookup,
+// which asks the fork component. The push processor (Receiver) is bound to
+// the engine, the ref writer, the hub's git and the workspace service's
+// place of each repository on disk, and is the git server's Push, so that
+// a push that passed the checks is decided by the rules and written by the
+// ref writer.
 //
 // The component exists from the composition on (GitServer); tests change
 // its dependencies with AdjustGitServer.
@@ -59,19 +68,25 @@ func composeGitServer(c *Composition) {
 	limiter := &serverLimiter{}
 	c.addServerHook(func(srv *server.Server) { limiter.l = srv.RateLimiter() })
 	c.AddStartHook(gitServerHook, func(_ context.Context, rt *Runtime) error {
+		c.refWriter.Bind(pushrule.WriterDeps{Transact: rt.Store.Tx, Heads: headSetter{rt.Store}, Logger: rt.Logger})
+		c.pushRules.Bind(pushrule.EngineDeps{
+			Settings: pushSettings{rt.Store.Main(), c.workspaces.Settings()}, Tracking: trackingBranches{c.forks},
+		})
+		c.receiver.Bind(gitserver.ReceiverDeps{
+			Engine: c.pushRules, Writer: c.refWriter, Git: gitFor(c.env), RepoPath: c.workspaces.RepoPath, Logger: rt.Logger,
+		})
 		d := gitserver.Deps{
 			Credentials: c.identity, Limiter: limiter, Guard: c.access, Access: c.access,
 			Records: gitserver.StoreRecords(rt.Store.Main()), Parents: c.forks,
 			Repositories: gitserver.DiskRepositories(gitFor(c.env), c.workspaces.RepoPath),
 			Runner:       gitFor(c.env), Timeout: gitserver.TimeoutFrom(rt.Config), Logger: rt.Logger,
 			ForkView: forkView{rt.Store.Main()}, Copier: gitFor(c.env),
-			Events: c.Events(), Settings: c.workspaces.Settings(),
+			Events: c.Events(), Settings: c.workspaces.Settings(), Push: c.receiver,
 		}
 		for _, adjust := range c.gitServerAdjusters {
 			adjust(&d)
 		}
 		comp.Bind(d)
-		c.refWriter.Bind(pushrule.WriterDeps{Transact: rt.Store.Tx, Heads: headSetter{rt.Store}, Logger: rt.Logger})
 		return nil
 	})
 }
@@ -83,6 +98,54 @@ type headSetter struct{ st *store.Store }
 
 func (h headSetter) SetHead(ctx context.Context, slug, id string) error {
 	return h.st.Tx(ctx, func(tx *sql.Tx) error { return workspace.RecordHead(ctx, tx, slug, id) })
+}
+
+// pushSettings is the push rule engine's settings reader: the effective
+// protected_branches and protect.owner_push of a workspace, read from its
+// record at the moment of the push, a task fork's from its parent's, since
+// a fork has no settings of its own.
+type pushSettings struct {
+	db       *sql.DB
+	registry *workspace.SettingsRegistry
+}
+
+func (s pushSettings) PushSettings(ctx context.Context, ws pushrule.Workspace) (pushrule.Settings, error) {
+	slug := ws.Slug
+	if ws.Kind == access.KindFork {
+		slug = ws.Parent
+	}
+	rec, found, err := workspace.BySlug(ctx, s.db, slug)
+	if err != nil {
+		return pushrule.Settings{}, err
+	}
+	if !found {
+		return pushrule.Settings{}, fmt.Errorf("push settings: workspace %q not found", slug)
+	}
+	eff := s.registry.EffectiveSettings(rec.Settings, rec.DefaultBranch)
+	globs, globsOK := eff["protected_branches"].([]string)
+	ownerPush, ownerPushOK := eff["protect.owner_push"].(bool)
+	if !globsOK || !ownerPushOK {
+		return pushrule.Settings{}, fmt.Errorf("push settings of %q cannot be read", slug)
+	}
+	return pushrule.Settings{ProtectedBranches: globs, OwnerPush: ownerPush}, nil
+}
+
+// trackingBranches is the push rule engine's tracking-branch lookup: the
+// fork component's answer whether a branch of a fork may be written, whose
+// tracking_branch refusal names a tracking branch; any other error is a
+// failed lookup.
+type trackingBranches struct{ forks *fork.Component }
+
+func (t trackingBranches) IsTracking(ctx context.Context, forkSlug, branch string) (bool, error) {
+	err := t.forks.CheckBranchWrite(ctx, forkSlug, branch)
+	var refusal *server.Error
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.As(err, &refusal) && refusal.Type() == "tracking_branch":
+		return true, nil
+	}
+	return false, err
 }
 
 // forkView is the git server's fork view: a fork's tracking refs are the
@@ -124,6 +187,17 @@ func (s *serverLimiter) Allow(key string) (bool, int) { return s.l.Allow(key) }
 // collaborators then: its ref-updated stages and the fork activity
 // recorder.
 func (c *Composition) RefWriter() *pushrule.Writer { return c.refWriter }
+
+// PushRules returns the hub's push rule engine, which decides the ref
+// updates of every surface that writes refs once the git server's start
+// hook has bound it. A part keeps it when it is composed and registers its
+// collaborators then, such as the carry-patch controller.
+func (c *Composition) PushRules() *pushrule.Engine { return c.pushRules }
+
+// Receiver returns the hub's push processor behind git-receive-pack, the
+// git server's Push once its start hook has run. A part keeps it when it is
+// composed and registers its options stage and its mapping stage then.
+func (c *Composition) Receiver() *gitserver.Receiver { return c.receiver }
 
 // GitServer returns the hub's git server, which serves the three git routes
 // once its start hook has run.

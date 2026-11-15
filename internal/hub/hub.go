@@ -208,6 +208,14 @@ type Composition struct {
 	// (docs/adr/08-register-the-push-collaborators-on-the-ref-writer.md).
 	refWriter *pushrule.Writer
 
+	// pushRules is the push rule engine every surface that writes refs asks
+	// (PushRules), and receiver the push processor behind git-receive-pack
+	// (Receiver). Both exist from the composition on, so that a part
+	// registers its collaborator on them while the hub is composed;
+	// composeGitServer binds them in its start hook.
+	pushRules *pushrule.Engine
+	receiver  *gitserver.Receiver
+
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).
 	serverHooks []func(*server.Server)
@@ -221,7 +229,7 @@ type Composition struct {
 
 func newComposition() *Composition {
 	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}, shutdown: make(chan struct{}),
-		refWriter: &pushrule.Writer{}}
+		refWriter: &pushrule.Writer{}, pushRules: &pushrule.Engine{}, receiver: &gitserver.Receiver{}}
 }
 
 // Runtime returns the runtime the hub fills once the stores are open, before

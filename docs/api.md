@@ -733,11 +733,49 @@ A push that passed every check gets its ref advertisement from
   capability list, which holds `report-status`, `delete-refs`,
   `side-band-64k`, `ofs-delta`, `atomic` and `push-options`.
 - `POST …/git-receive-pack` is handed, with its body unread and whatever
-  its size, to the hub's push processor, which writes the whole answer.
-  The hub has no push processor yet, so the push is answered `500` with the
-  body `internal error`, its body is not read, git does not run, and no ref
-  of the repository changes; stock `git push` fails with
-  `error: RPC failed; HTTP 500`.
+  its size, to the hub's push processor, which writes the whole answer;
+  `git receive-pack` does not run. A push moves all of its refs or none:
+  - The body (gzip-decoded when `Content-Encoding` says so) holds the
+    commands `<old> <new> <ref>`, the client's capabilities after a NUL on
+    the first, a flush packet, then the push options and a flush packet
+    when the client asked for `push-options`, then the pack, which a push
+    of deletes only leaves out. A body whose command list cannot be read is
+    answered `400` with `invalid receive-pack request`; a body holding only
+    a flush packet is answered `200` with an empty body and changes
+    nothing.
+  - The pack is held apart from the repository until the push is accepted.
+    A pack git cannot index, or a new value that names no object, is
+    reported `unpack invalid pack` with `ng <ref> unpacker error` for every
+    ref.
+  - Every ref update is decided by the push rules, in the order hub-owned
+    refs (`refs/parley/ is maintained by the hub and cannot be pushed to`),
+    protected branches (`<branch> is protected and cannot be force-pushed
+    or deleted`, `<branch> is protected; push another branch and open a
+    change (git push -o parley.change)`; the workspace's owner or the admin
+    token may fast-forward one while `protect.owner_push` is true), the
+    default branch (`<branch> is the default branch and cannot be
+    deleted`), a fork's tracking branches (`<branch> tracks the parent
+    workspace and is read-only in this fork; push a new branch`), the
+    carry-patch controls and the paths of a path-scoped PAT (`path <path>
+    is outside this token's allowed paths`); one that cannot be decided is
+    refused with `internal error; try again`. The refs then move together
+    by compare-and-swap against the old values sent: a ref that moved
+    meanwhile is refused with `ref changed since it was read; fetch and try
+    again`, so of two pushes of one ref from one value exactly one goes
+    through.
+  - The answer is `200` with
+    `Content-Type: application/x-git-receive-pack-result` and
+    `Cache-Control: no-cache`. With `report-status` (or
+    `report-status-v2`) it holds the status report: `unpack ok`, then per
+    command, in order, `ok <ref>` for an accepted push, or for a refused
+    one `ng <ref> <message>` for each refused ref and
+    `ng <ref> not updated: another ref in this push was refused` for the
+    others. With `side-band-64k` the report comes inside band 1, and band 2
+    carries before it an `error: <ref>: <message>` line per refused ref,
+    which git shows as `remote: error: …`. Without `report-status` the
+    answer has no report, and without `side-band-64k` no `error:` line.
+  - A refused push leaves every ref as it was and none of its objects in
+    the repository.
 
 A task fork is served with its own refs and what it shows of its parent's,
 on every git route, as of the moment of the request:

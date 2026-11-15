@@ -37,17 +37,23 @@ a package-level registry:
   the post-push listeners the same way.
 - On the `*pushrule.Engine`: `RegisterController(Controller)` sets the one
   carry-patch controller, replacing the one before.
+- On the `*gitserver.Receiver`, the push processor behind
+  git-receive-pack: `RegisterOptionsStage(OptionsStage)` and
+  `RegisterMappingStage(MappingStage)` set the one options stage and the
+  one mapping stage, each replacing the one before, nil removing it.
 - What the hub itself provides rather than a feature (the store's
   transaction, the head_sha setter, the settings reader, the tracking
   lookup, the version-files lookup, the logger) is handed over with
-  `Writer.Bind(WriterDeps)` and `Engine.Bind(EngineDeps)` in a start hook.
+  `Writer.Bind(WriterDeps)`, `Engine.Bind(EngineDeps)` and
+  `Receiver.Bind(ReceiverDeps)` in a start hook.
 
 Registration is safe from several goroutines and happens while the hub is
 composed, before any request. A call takes the registered collaborators
 once, at its start, and calls them for the whole request. The zero values
 are valid: with nothing registered, the engine refuses a `carry_patch`
 workspace's updates as internal rather than allowing them, and the writer
-runs no stage and records no activity.
+runs no stage and records no activity, and the processor accepts every
+push option and adds no line.
 
 The hub creates the ref writer in `newComposition`, so that it exists from
 the composition on and a part composed before the git server, the forks
@@ -55,7 +61,9 @@ part in `internal/hub/fork.go`, can register the fork component as its
 fork activity recorder; `(*Composition).RefWriter()` returns it, and the
 git server's start hook in `internal/hub/gitserver.go` binds it. Every
 other package that takes part in a write registers its collaborator on
-`c.RefWriter()` (or the engine) from its own part in `internal/hub`.
+`c.RefWriter()`, the engine (`c.PushRules()`) or the processor
+(`c.Receiver()`), all three created in `newComposition`, from its own part
+in `internal/hub`.
 
 ## Consequences
 
