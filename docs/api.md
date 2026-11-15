@@ -3735,7 +3735,9 @@ answers `201` and the other `409` `change_exists`.
 `GET /api/v1/workspaces/{slug}/changes/{number}/versions`,
 `GET /api/v1/workspaces/{slug}/changes/{number}/versions/{version}`,
 `GET /api/v1/workspaces/{slug}/changes/{number}/diff` (see
-[below](#get-apiv1workspacesslugchangesnumberdiff)) and
+[below](#get-apiv1workspacesslugchangesnumberdiff)),
+`GET /api/v1/workspaces/{slug}/changes/{number}/stack` (see
+[The stack of a change](#the-stack-of-a-change)) and
 `GET /api/v1/workspaces/{slug}/changes/by-commit/{sha}` read a change of
 the workspace `{slug}`. Each needs, for a personal access token,
 `changes:read`, and read access to `{slug}`; a token without the scope is
@@ -3748,7 +3750,7 @@ A change of `{slug}` that the request cannot name answers `404`
 `change_not_found` on the routes under `…/changes/{number}`: a `{number}` that is not a
 positive integer, a number `{slug}` does not have, and any number on a task
 fork's slug, since a fork holds no changes (its changes belong to its
-parent). A token bound to a task fork reaches these five routes on the
+parent). A token bound to a task fork reaches these six routes on the
 fork's parent, and there only the changes whose `source.workspace_slug` is
 that fork: every other change answers `404` `change_not_found` as if it did
 not exist, and `by-commit` finds only those changes.
@@ -3756,9 +3758,11 @@ not exist, and `by-commit` finds only those changes.
 `GET …/changes/{number}` answers `200` with the change object. `include`, a
 comma list of `versions`, `approvals`, `checks`, `stack` and `overlaps`
 (also given more than once), adds a member of that name after the change's
-own: `versions` the list of versions, oldest first; each other name what
-the hub's feature for it computes, and no member while the hub has none
-(none has one yet). Any other name, the empty name included, answers `400`
+own: `versions` the list of versions, oldest first; `stack` the change's
+stack, as `GET …/changes/{number}/stack` answers it for the same caller;
+each other name what the hub's feature for it computes, and no member
+while the hub has none (`approvals`, `checks` and `overlaps` have none
+yet). Any other name, the empty name included, answers `400`
 `invalid_request`.
 
 `GET …/changes/{number}/versions` answers `200` with the versions, oldest
@@ -4296,6 +4300,34 @@ It is not asked for an `up_to_date` answer, a conflict or a restack of
 the hub. No guard is registered yet, so every version passes.
 
 A restack that fails for another reason answers `500` `internal`.
+
+### The stack of a change
+
+`GET /api/v1/workspaces/{slug}/changes/{number}/stack` answers `200` with
+the stack the change `{number}` of `{slug}` is part of, checked as every
+[read of a change](#reading-a-change) is (`changes:read` and read access
+to `{slug}`; `404` `change_not_found` for a change the request cannot
+name):
+
+```json
+{"target_branch":"main","changes":[{"number":1,"title":"Add low","state":"open","version":2,"head_sha":"…","mergeable":"clean","needs_restack":false,"restack_reason":null,"landing":{"status":"ready"}},{"number":2,"title":"Add mid","state":"open","version":2,"head_sha":"…","mergeable":"clean","needs_restack":false,"restack_reason":null,"landing":{"status":"ready"}}]}
+```
+
+`target_branch` is the change's target branch. `changes` lists, bottom
+first, the chain of `depends_on` links below the change down to the change
+that depends on nothing, the change itself, and every `draft` or `open`
+change reachable upward from it through `dependants`, ordered by depth
+from the bottom and then by number, so that where a change has several
+dependants all are listed; `abandoned` and `landed` changes above it are
+left out. Every change of a chain gives the same list; where a change has
+several dependants, asking for one of them lists the chain below it and
+the changes above it, not the other branches. Each summary has exactly `number`, `title`,
+`state`, `version`, `head_sha`, `mergeable`, `needs_restack`,
+`restack_reason` and `landing` with its `status` alone. A token bound to a
+task fork, calling on the fork's parent, sees only the changes whose
+source is that fork. The `stack_of` filter of
+[the list](#get-apiv1workspacesslugchanges) walks the stack in every
+state instead.
 
 ## Admin routes
 

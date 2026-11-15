@@ -3815,6 +3815,21 @@ is not `background`, after the replay and before the hook before the
 swap; its error ends the restack unchanged, with nothing written. The hub
 registers no version guard.
 
+The stack route, `GET …/changes/:number/stack` (`stackRoute`,
+`stack_handler.go`, a read route with `changes:read` and the need `read`,
+on the contributor table's pattern), resolves its change with `changeOf`
+and answers `(*Component).Stack(ctx, ch)`: a `Stack` (`target_branch` and
+`[]StackSummary`, each the nine members of a summary with a
+`StackLanding` holding only `status`). `Stack` walks `depends_on` down from
+the change with `linkOf` (stopping where a change would repeat), then up
+level by level through `dependants` (draft and open changes only), each
+level sorted by number, which orders the changes above by depth from the
+bottom and then by number; it reads each change with `readChange` from
+the store. The binding of a token bound to a fork is read from the
+context (`confinedTo` on a request carrying it), so that only the changes
+whose source is the fork are listed, for the route and for the expander
+alike. `composeChanges` registers `Stack` as the expander of `stack`.
+
 `(*Component).OnLanded(ctx, workspace, number, landed)`
 (`restack_queue.go`) is the entry point for a change that landed as the
 commit `landed`: in a `Store.Tx` of its own, since the landing has ended,
@@ -4233,8 +4248,9 @@ and `overlaps`, each served by the `change.Expander` (`func(ctx, Change)
 (any, error)`) registered on the instance with
 `(*change.Component).RegisterExpander(name, fn)` (nil removes; a name
 outside those four panics); a name without an expander adds no member, and
-the members follow the change's own in that order. No feature registers an
-expander yet.
+the members follow the change's own in that order. The hub registers
+`(*Component).Stack` for `stack`; no feature registers the other three
+yet.
 
 The diff (`diff.go`), `GET /workspaces/:slug/changes/:number/diff` with
 the same scope, need and contributor-table pattern, resolves its change

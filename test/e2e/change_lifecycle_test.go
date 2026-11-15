@@ -86,7 +86,13 @@ func (h *lifecycleHub) read(t *testing.T, credential, number string) map[string]
 // 20 s, and returns it.
 func (h *lifecycleHub) until(t *testing.T, number, what string, done func(map[string]any) bool) map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	return h.within(t, 20*time.Second, number, what, done)
+}
+
+// within is until for up to d.
+func (h *lifecycleHub) within(t *testing.T, d time.Duration, number, what string, done func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for {
 		c := h.read(t, h.key, number)
 		if done(c) {

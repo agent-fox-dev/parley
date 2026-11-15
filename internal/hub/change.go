@@ -121,7 +121,9 @@ const (
 // than [changes].max_stack_depth, and each such change above it, is flagged
 // stack_too_deep, and one back within the limit unflagged. Its column of the
 // change record, the commit a change must sit on once the change below it
-// landed, is added by StackStep.
+// landed, is added by StackStep. The member include=stack adds to a read of
+// one change is the change's stack as GET …/changes/:number/stack answers
+// it (Stack), registered as the expander of stack.
 //
 // A new version of a change records, in its transaction, a pending restack
 // of each change directly above it that is not built on the new head; the
@@ -170,6 +172,7 @@ func composeChanges(c *Composition) {
 	c.refWriter.RegisterRefUpdatedStage(comp.TargetsUpdated)
 	comp.RegisterStackLinker(comp.StackLinker())
 	comp.RegisterRestacker(comp.Restacker())
+	comp.RegisterExpander("stack", func(ctx context.Context, ch change.Change) (any, error) { return comp.Stack(ctx, ch) })
 	comp.AddVersionObserver(comp.MergeableObserver())
 	c.scm.RegisterChangeLinker(changeLinker{comp, c.runtime})
 	c.AdjustSCM(func(d *scm.Deps) { d.Changes = changeLookup{comp} })
