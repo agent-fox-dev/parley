@@ -84,6 +84,15 @@ func TestStore_KeepsEveryFieldAndUpdatesTheCloneFieldsInATransaction(t *testing.
 	repo.Status, repo.HeadSHA, repo.OriginHeadSHA, repo.CloneError, repo.UpdatedAt = workspace.StatusReady, new("def"), new("def"), nil, t0.Add(time.Minute)
 	read(repo)
 
+	if err := workspace.RecordHead(ctx, st.Main(), "acme", "fed"); err != nil {
+		t.Fatalf("RecordHead = %v", err)
+	}
+	repo.HeadSHA = new("fed")
+	read(repo)
+	if err := workspace.RecordHead(ctx, st.Main(), "nope", "fed"); !errors.Is(err, workspace.ErrNotFound) {
+		t.Errorf("RecordHead(nope) = %v, want ErrNotFound", err)
+	}
+
 	if err := tx(func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, fork) }); !errors.Is(err, access.ErrDuplicateSlug) {
 		t.Errorf("a second Insert(acme--f1) = %v, want ErrDuplicateSlug", err)
 	}

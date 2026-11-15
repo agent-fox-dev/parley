@@ -6,7 +6,10 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/store"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // gitServerHook is the name of the start hook that binds the git server.
@@ -37,9 +40,12 @@ const gitServerHook = "gitserver"
 // serverLimiter, which the hook points at the limiter of the server that
 // serves.
 //
-// No push processor is installed, because the push rules are not part of
-// the hub yet: a push that passes the checks is answered 500 internal
-// error, its body unread and git not run.
+// The same start hook binds the ref writer (RefWriter) to the store, in
+// whose transactions its ref-updated stages run, to the head_sha setter,
+// which records the new head of a repository's default branch on its
+// record, and to the hub's logger. No push processor is installed yet, so
+// nothing writes through it over git: a push that passes the checks is
+// answered 500 internal error, its body unread and git not run.
 //
 // The component exists from the composition on (GitServer); tests change
 // its dependencies with AdjustGitServer.
@@ -65,8 +71,18 @@ func composeGitServer(c *Composition) {
 			adjust(&d)
 		}
 		comp.Bind(d)
+		c.refWriter.Bind(pushrule.WriterDeps{Transact: rt.Store.Tx, Heads: headSetter{rt.Store}, Logger: rt.Logger})
 		return nil
 	})
+}
+
+// headSetter is the ref writer's head_sha setter: it writes the head on the
+// workspace's record in a transaction of its own, which the writer opens
+// after its own has committed.
+type headSetter struct{ st *store.Store }
+
+func (h headSetter) SetHead(ctx context.Context, slug, id string) error {
+	return h.st.Tx(ctx, func(tx *sql.Tx) error { return workspace.RecordHead(ctx, tx, slug, id) })
 }
 
 // forkView is the git server's fork view: a fork's tracking refs are the
@@ -101,6 +117,13 @@ func (v forkView) ForkRefs(ctx context.Context, slug string) (gitserver.ForkRefs
 type serverLimiter struct{ l *server.Limiter }
 
 func (s *serverLimiter) Allow(key string) (bool, int) { return s.l.Allow(key) }
+
+// RefWriter returns the hub's ref writer, which writes the refs of every
+// surface that moves a workspace's refs once the git server's start hook
+// has bound it. A part keeps it when it is composed and registers its
+// collaborators then: its ref-updated stages and the fork activity
+// recorder.
+func (c *Composition) RefWriter() *pushrule.Writer { return c.refWriter }
 
 // GitServer returns the hub's git server, which serves the three git routes
 // once its start hook has run.

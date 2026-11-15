@@ -136,17 +136,19 @@ for the fork's `created_at`, so the create of package 15 writes nothing
 new and a fork created before the step counts as last active at its
 creation, which is the same instant.
 
-## No fork-activity hook is registered yet
+## Only the push rules' fork-activity hook is registered yet
 
 The package has `internal/hub/fork.go` register `fork.RecordActivity` with
 `pushrule.ForkActivity` (package 18), `change.ForkActivity` (package 22)
 and the after-landing hook list of `internal/land` (package 25), each
-through one adapter, for those of them in the repository. None of the
-three packages exists, so no adapter is registered: `RecordActivity(ctx,
-slug)` is exported on the fork component with no production caller, and a
-fork's last activity is its creation. The hub's comment in
-`internal/hub/fork.go` says where each adapter goes. This is a hand-off to
-packages 18, 22 and 25: each, when it is built, registers its adapter in
+through one adapter, for those of them in the repository. Package 18 is:
+`composeForks` registers the fork component itself, whose `RecordActivity`
+is the one method of `pushrule.ForkActivity`, on the hub's ref writer
+(`c.RefWriter().RegisterForkActivity`), which calls it after every accepted
+write through git or the source control API to a fork. Packages 22 and 25
+do not exist, so theirs are not registered. The hub's comment in
+`internal/hub/fork.go` says where each goes. This is a hand-off to
+packages 22 and 25: each, when it is built, registers its adapter in
 `composeForks`; the adapter of package 25 calls `RecordActivity` for the
 source workspace of every landed change. `RecordActivity` opens a store
 transaction of its own, so an adapter calls it outside the transaction of

@@ -31,6 +31,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
@@ -200,6 +201,13 @@ type Composition struct {
 	gitServer          *gitserver.Component
 	gitServerAdjusters []func(*gitserver.Deps)
 
+	// refWriter is the ref writer every surface that writes refs writes
+	// through (RefWriter). It exists from the composition on, so that a
+	// part composed before the git server, such as the forks, registers
+	// its collaborator on it; composeGitServer binds it in its start hook
+	// (docs/adr/08-register-the-push-collaborators-on-the-ref-writer.md).
+	refWriter *pushrule.Writer
+
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).
 	serverHooks []func(*server.Server)
@@ -212,7 +220,8 @@ type Composition struct {
 }
 
 func newComposition() *Composition {
-	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}, shutdown: make(chan struct{})}
+	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}, shutdown: make(chan struct{}),
+		refWriter: &pushrule.Writer{}}
 }
 
 // Runtime returns the runtime the hub fills once the stores are open, before

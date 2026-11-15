@@ -2,6 +2,7 @@ package pushrule_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
+	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -265,4 +267,101 @@ func decide(t *testing.T, e *pushrule.Engine, r *repo, ws pushrule.Workspace, ca
 		t.Fatalf("decisions for %+v = %+v, want one about the update", u, v.Decisions)
 	}
 	return outcomeOf(v.Decisions[0])
+}
+
+// allowed is the verdict that allows every update of us, as the engine
+// would have, whatever the repository holds.
+func allowed(us ...pushrule.Update) pushrule.Verdict {
+	var v pushrule.Verdict
+	for _, u := range us {
+		v.Decisions = append(v.Decisions, pushrule.Decision{Update: u, Allowed: true, Created: u.Before == pushrule.ZeroID, Deleted: u.After == pushrule.ZeroID})
+	}
+	return v
+}
+
+// newStore opens a store in a temporary directory of t whose one table,
+// stage_rows, is where the stages of the tests write.
+func newStore(t *testing.T) *store.Store {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces")},
+		[]store.Step{{Name: "stage_rows", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `CREATE TABLE stage_rows (ref TEXT NOT NULL)`)
+			return err
+		}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+// stageRows are the refs the stages wrote rows for and the store holds.
+func stageRows(t *testing.T, st *store.Store) []string {
+	t.Helper()
+	rows, err := st.Main().Query(`SELECT ref FROM stage_rows ORDER BY rowid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var refs []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+// stage is a ref-updated stage that logs its name to log, writes a row of
+// stage_rows for each update when write is set, and answers versions or
+// err. It records what it was given, and what the repository at dir held
+// when it ran: each update's ref, the value it pointed at and whether its
+// after value could be read.
+type stage struct {
+	name     string
+	log      *[]string
+	dir      string
+	write    bool
+	versions []*pushrule.Version
+	err      error
+
+	inputs []pushrule.StageInput
+	seen   []string
+}
+
+func (s *stage) run(ctx context.Context, tx *sql.Tx, in pushrule.StageInput) ([]*pushrule.Version, error) {
+	*s.log = append(*s.log, s.name)
+	s.inputs = append(s.inputs, in)
+	for _, d := range in.Updates {
+		at, _ := gitrepotest.Run(s.dir, "", "rev-parse", "--verify", "--quiet", d.Ref)
+		_, unreadable := gitrepotest.Run(s.dir, "", "cat-file", "-e", d.After)
+		s.seen = append(s.seen, fmt.Sprintf("%s=%.7s readable=%t", d.Ref, strings.TrimSpace(at), unreadable == nil))
+		if s.write {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO stage_rows (ref) VALUES (?)`, d.Ref); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return s.versions, s.err
+}
+
+// reports records what the ref writer reports after a write: the fork
+// activity of a slug, or the new head of a workspace as "slug id". The
+// fork activity recorder fails with err.
+type reports struct {
+	err error
+	got []string
+}
+
+func (r *reports) RecordActivity(_ context.Context, slug string) error {
+	r.got = append(r.got, slug)
+	return r.err
+}
+
+func (r *reports) SetHead(_ context.Context, slug, id string) error {
+	r.got = append(r.got, slug+" "+id)
+	return nil
 }
