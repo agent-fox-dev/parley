@@ -181,6 +181,71 @@ func TestUploadPack_RefusesAVersion2WantOfACommitNoRefReachesHoweverItIsWritten(
 	}
 }
 
+// A tree, a blob or an annotated tag is served by its id when a ref of the
+// repository served reaches it, deep in history too, and refused when none
+// does; a task fork's refs, not its parent's, say what the fork reaches.
+func TestUploadPack_ServesATreeBlobOrTagByIdOnlyWhenARefReachesIt(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	git := func(args ...string) string { return gitrepotest.Git(t, o.Dir(), args...) }
+	git("tag", "-a", "-m", "release", "release", "main")
+	tipTag := git("rev-parse", "refs/tags/release")
+	git("tag", "-a", "-m", "gone", "gone", "main")
+	goneTag := git("rev-parse", "refs/tags/gone")
+	git("update-ref", "-d", "refs/tags/gone")
+	looseBlob, err := gitrepotest.Run(o.Dir(), "no ref reaches this\n", "hash-object", "-w", "--stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	looseBlob = strings.TrimSpace(looseBlob)
+	looseTree, err := gitrepotest.Run(o.Dir(), "100644 blob "+looseBlob+"\tloose\n", "mktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	looseTree = strings.TrimSpace(looseTree)
+	fork := filepath.Join(t.TempDir(), "fork.git")
+	if err := (gitrepo.Git{}).CreateFork(context.Background(), o.Dir(), fork); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, fork, "update-ref", "refs/heads/main", git("rev-parse", "main"))
+	for _, c := range []struct {
+		name, dir, id string
+		served        bool
+	}{
+		{"a blob of main's first commit", o.Dir(), git("rev-parse", "main~2:README"), true},
+		{"the tree of main's first commit", o.Dir(), git("rev-parse", "main~2^{tree}"), true},
+		{"an annotated tag a ref points at", o.Dir(), tipTag, true},
+		{"a blob no ref reaches", o.Dir(), looseBlob, false},
+		{"a tree no ref reaches", o.Dir(), looseTree, false},
+		{"an annotated tag no ref points at", o.Dir(), goneTag, false},
+		{"a fork's blob its own branch reaches", fork, git("rev-parse", "main:README"), true},
+		{"a parent's blob no ref of the fork reaches", fork, git("rev-parse", "dev:README"), false},
+	} {
+		for _, v2 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/protocol 2 %v", c.name, v2), func(t *testing.T) {
+				t.Parallel()
+				request := pkt("want "+c.id+"\n") + "0000" + pkt("done\n")
+				if v2 {
+					request = pkt("command=fetch\n") + "0001" + pkt("want "+c.id+"\n") + pkt("done\n") + "0000"
+				}
+				var out bytes.Buffer
+				err := (gitrepo.Git{}).UploadPack(context.Background(), gitrepo.ServeRequest{
+					Dir: c.dir, Protocol2: v2, Config: []string{"uploadpack.allowReachableSHA1InWant=true"},
+					Stdin: strings.NewReader(request), Stdout: &out,
+				})
+				var se *gitrepo.ServeError
+				switch {
+				case c.served && (err != nil || !strings.Contains(out.String(), "PACK")):
+					t.Errorf("UploadPack = %v, wrote %q; want a pack", err, out.String())
+				case !c.served && (!errors.As(err, &se) || se.Stderr != "upload-pack: not our ref "+c.id || out.Len() != 0):
+					t.Errorf("UploadPack = %v, wrote %q; want %q with git not run", err, out.String(), "upload-pack: not our ref "+c.id)
+				}
+			})
+		}
+	}
+}
+
 // signalWriter closes first at its first write.
 type signalWriter struct {
 	first  chan struct{}

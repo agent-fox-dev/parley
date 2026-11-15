@@ -93,7 +93,7 @@ of a fork's parent that git reads through the fork's alternates, is replaced
 as a whole by `upload-pack failed`. The `ERR` pkt-lines
 the hub writes carry no trailing newline, as git's own do.
 
-## A version 2 want of a commit no ref reaches is refused by the hub, not by git
+## A want of an object no ref reaches is refused by the hub, not by git
 
 The package passes `uploadpack.allowReachableSHA1InWant=true` to every run
 of upload-pack and expects git to refuse, in band, a want of an object no
@@ -109,8 +109,20 @@ version 2 git serves any object it holds by its id: a commit written with
 `uploadpack.allowAnySHA1InWant` all set to `false`. No setting of git
 refuses it.
 
-So the hub refuses it itself (`internal/gitrepo/serve.go`, `checkWants`):
-a version 2 request is kept in a file of git's private directory and read
+Nor does git check a tree, a blob or a tag under either version: a want of
+a blob no ref reaches, sent with `uploadpack.allowReachableSHA1InWant=true`,
+is answered with a pack that holds it under version 0 as under version 2.
+That would let any reader of a workspace download, by its id, an object of
+rewritten history, and a PAT bound to a task fork the objects of the parent
+that the fork's own refs do not reach, which the fork's repository reads
+through its alternates.
+
+So the hub refuses them itself (`internal/gitrepo/serve.go`, `checkWants`),
+under both versions: a version 0 request is kept in a file of git's private
+directory up to the flush packet that ends its wants, its `want` lines read
+by their leading hexadecimal digits as below, and git reads that file and
+then the rest of the request as it comes. A version 2 request is kept in
+such a file whole and read
 as git's version 2 server reads it, the command and the capabilities in any
 order up to the delimiter packet (a capability line such as `agent=` may
 come before `command=fetch`); for a `command=fetch`, every `want` id is
@@ -122,35 +134,45 @@ lengths are given, lowercased, to
 of the repository's object format and leaves out a name it cannot resolve.
 When that lists a commit, an annotated tag's commit included, the request is
 answered with the `ERR` pkt-line `upload-pack: not our ref <id>`, git's own
-text of version 0, before upload-pack runs. A `want` without 40 leading
+text of version 0, before upload-pack runs. Otherwise the wanted ids are
+given to `git cat-file --batch-check`, and every tree, blob and tag among
+them that no ref points at is looked for among the objects the refs reach,
+`git rev-list --objects --in-commit-order --use-bitmap-index --all`, read
+as it comes and stopped once every one has been met; one it never meets is
+refused with the same text. A version 2 `want` without 40 leading
 hexadecimal digits, which git cannot read, is refused the same way with
-git's text `upload-pack: protocol error, expected to get oid`. A commit no
-ref reaches (one whose branch was deleted, or a commit of the parent that a
-task fork can read only through its alternates) is thereby served under
-neither version.
+git's text `upload-pack: protocol error, expected to get oid`; under
+version 0 git refuses such a want itself. An object no ref reaches (a
+commit whose branch was deleted, a blob of rewritten history, an object of
+the parent that a task fork can read only through its alternates) is
+thereby served under neither version.
 
-## A version 2 request is kept up to 16 MiB, answered `ERR request too large` beyond
+A fetch of commits, also of annotated tags that refs point at, as every
+clone and fetch by ref sends, costs two short git commands and no walk. The
+walk is made for a tree, a blob or a tag no ref points at, which is what a
+partial clone wants when it fetches the objects its filter left out: every
+object a ref reaches is met, so that fetch is served, and it costs up to one
+walk of the repository's objects, the trees and blobs of each commit after
+it, newest first, so that the objects of a recent checkout are met early.
+Reachability bitmaps, where a repository has them, answer in place of the
+walk.
+
+## A request is kept up to 16 MiB, answered `ERR request too large` beyond
 
 The package takes a fetch body "of any size". The want check above keeps a
-version 2 request whole on disk before git runs, so the hub bounds what it
+version 2 request whole on disk before git runs, and a version 0 request up
+to the end of its wants, so the hub bounds what it
 keeps: up to `gitrepo.DefaultMaxRequest`, 16 MiB, counted after gzip
 decompression. A fetch request is a pkt-line of about 50 bytes per want and
 per have; stock git sends a few thousand haves at most in one round of
 negotiation, and a fetch of 100,000 refs is about 5 MB of wants, so a real
-request stays far below the bound. A larger version 2 request is answered
+request stays far below the bound. A larger version 2 request, or a
+version 0 request whose wants run past the bound, is answered
 in band, before git runs, with the `ERR` pkt-line `request too large`, a
 text of the hub's beside the package's `empty request`, `invalid gzip body`
-and `request timed out`, and counted with the result `error`. A version 0
-request is not kept but streamed to git, and has no such bound.
-
-A tree or a blob is not checked, under either version: rev-list does not
-list one, and git's version 0 check, which runs the same rev-list, lets it
-through as well. A partial clone fetches the objects its filter left out
-by their ids, and whether a ref reaches a given tree or blob is a walk of
-every tree of every ref, which git itself does not make. Object ids are not
-guessable, and git does not treat reachability as a boundary between
-readers of one repository (see the SECURITY section of
-`gitnamespaces(7)`).
+and `request timed out`, and counted with the result `error`. The haves of
+a version 0 request, after its wants, are not kept but streamed to git, and
+have no such bound.
 
 ## The hub's fork view names no change yet
 

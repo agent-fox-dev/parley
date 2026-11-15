@@ -77,10 +77,10 @@ const (
 	receivePack = "receive-pack"
 )
 
-// The failures of a version 2 fetch refused before git runs: a want of a
-// commit no ref reaches, and a want that names no object id git can read.
+// The failures of a fetch refused before git runs: a want of an object no
+// ref reaches, and a version 2 want that names no object id git can read.
 var (
-	errNotOurRef = errors.New("a want names a commit no ref reaches")
+	errNotOurRef = errors.New("a want names an object no ref reaches")
 	errBadWant   = errors.New("a want names no object id")
 )
 
@@ -97,25 +97,32 @@ var receivePackConfig = []string{"receive.advertisePushOptions=true", "receive.a
 // when ctx ended, git killed with every process it started, and otherwise a
 // *ServeError.
 //
-// Under version 0 git refuses a want of a commit that no ref reaches; under
-// version 2 git serves any object it holds by its id. A version 2 fetch
-// that wants such a commit, or an annotated tag of one, is refused here,
-// before git runs, with git's own text of version 0, so that a commit no
-// ref reaches (one whose ref was deleted, or one a task fork holds only
-// through its parent's objects) is served under neither version; a want
-// whose id git could not read is refused as well. A want of a tree or a
-// blob is left to git, as git does under version 0: a partial clone fetches
-// those by id, and whether a ref reaches one is a walk of every tree of
-// every ref. A version 2 request is kept whole for that check, up to
-// req.MaxRequest bytes; a larger one is refused with ErrRequestTooLarge.
+// A fetch is served only the objects the repository's refs reach. git
+// itself refuses, under version 0 alone, a want of a commit no ref reaches,
+// and under either version serves a tree, a blob or a tag by its id
+// whether a ref reaches it or not. So every want of a fetch is checked here,
+// before git runs, and a want of an object no ref reaches (a commit whose
+// ref was deleted, a blob of rewritten history, or an object a task fork
+// holds only through its parent's objects) is refused with git's own text
+// of version 0. A commit is judged by its ancestry; a tree, a blob or a tag
+// that no ref points at by a walk of every object the refs reach, which
+// stops once it has met every one wanted. A partial clone's fetch of what
+// its filter left out wants objects its refs reach, and is served. A
+// version 2 want whose id git could not read is refused as well. For the
+// check a version 2 request is kept whole, and a version 0 request up to
+// the end of its wants, up to req.MaxRequest bytes; a larger one is refused
+// with ErrRequestTooLarge.
 func (g Git) UploadPack(ctx context.Context, req ServeRequest) error {
-	var filter func(dir, repo string, in io.Reader) (*os.File, error)
-	if req.Protocol2 && !req.AdvertiseRefs && req.Stdin != nil {
+	var filter func(dir, repo string, in io.Reader) (io.ReadCloser, error)
+	if !req.AdvertiseRefs && req.Stdin != nil {
 		limit := req.MaxRequest
 		if limit <= 0 {
 			limit = DefaultMaxRequest
 		}
-		filter = func(dir, repo string, in io.Reader) (*os.File, error) { return g.checkWants(ctx, dir, repo, limit, in) }
+		v2 := req.Protocol2
+		filter = func(dir, repo string, in io.Reader) (io.ReadCloser, error) {
+			return g.checkWants(ctx, dir, repo, limit, v2, in)
+		}
 	}
 	return g.serve(ctx, uploadPack, req, filter)
 }
@@ -135,7 +142,7 @@ func (g Git) ReceivePack(ctx context.Context, req ServeRequest) error {
 // given git's private directory, the repository and the request, and
 // returns what git reads in the request's place, or a failure that stops
 // git before it runs.
-func (g Git) serve(ctx context.Context, command string, req ServeRequest, filter func(dir, repo string, in io.Reader) (*os.File, error)) error {
+func (g Git) serve(ctx context.Context, command string, req ServeRequest, filter func(dir, repo string, in io.Reader) (io.ReadCloser, error)) error {
 	repo, err := filepath.Abs(req.Dir)
 	if err != nil {
 		return fmt.Errorf("serve %s: %w", req.Dir, err)
@@ -177,20 +184,21 @@ func (g Git) serve(ctx context.Context, command string, req ServeRequest, filter
 	return nil
 }
 
-// checkWants reads the version 2 request in into a file of the private
-// directory dir and returns the file, read from its start, for git to
-// read; or a *ServeError when the request is a fetch that wants a commit
-// no ref of the repository repo reaches, or names a want git cannot read,
-// and an error wrapping ErrRequestTooLarge when the request holds more than
-// limit bytes. A request git cannot read otherwise is passed on for git to
-// refuse in its own words. A client that stops sending holds the request no
-// longer than ctx.
-func (g Git) checkWants(ctx context.Context, dir, repo string, limit int64, in io.Reader) (*os.File, error) {
+// checkWants reads the request in into a file of the private directory
+// dir, the whole of a version 2 request, the wants of a version 0 one, and
+// returns what git is to read: the file, read from its start, followed for
+// version 0 by the rest of in. It returns a *ServeError when the request is
+// a fetch that wants an object no ref of the repository repo reaches, or a
+// version 2 want git cannot read, and an error wrapping ErrRequestTooLarge
+// when what it keeps holds more than limit bytes. A request git cannot read
+// otherwise is passed on for git to refuse in its own words. A client that
+// stops sending holds the request no longer than ctx.
+func (g Git) checkWants(ctx context.Context, dir, repo string, limit int64, v2 bool, in io.Reader) (io.ReadCloser, error) {
 	f, err := os.Create(filepath.Join(dir, "request"))
 	if err != nil {
 		return nil, fmt.Errorf("keep the request: %w", err)
 	}
-	wants, err := keepWants(ctx, f, in, limit)
+	wants, err := keepWants(ctx, f, in, limit, v2)
 	if err == nil {
 		_, err = f.Seek(0, io.SeekStart)
 	}
@@ -201,18 +209,22 @@ func (g Git) checkWants(ctx context.Context, dir, repo string, limit int64, in i
 		_ = f.Close()
 		return nil, err
 	}
-	return f, nil
+	if v2 {
+		return f, nil
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(f, in), f}, nil
 }
 
 // reached returns a *ServeError naming a want of wants that is, or leads
-// to, a commit no ref of the repository repo reaches, nil when there is
+// to, an object no ref of the repository repo reaches, nil when there is
 // none.
 func (g Git) reached(ctx context.Context, repo string, wants []want) error {
-	var in strings.Builder
+	var ids []string
 	for _, w := range wants {
-		for _, id := range w.ids {
-			in.WriteString(id + "\n")
-		}
+		ids = append(ids, w.ids...)
 	}
 	// rev-list lists the wanted commits that no ref reaches, an annotated
 	// tag's commit among them: a ref's tip and its ancestors are left out,
@@ -220,7 +232,7 @@ func (g Git) reached(ctx context.Context, repo string, wants []want) error {
 	// object the repository does not hold or an id of the other object
 	// format, is left out too: git refuses a missing object itself, and
 	// reads an id of its own format alone.
-	out, err := g.runInput(ctx, access{}, []byte(in.String()), "--git-dir="+repo, "rev-list", "--ignore-missing", "--stdin", "--not", "--all")
+	out, err := g.runInput(ctx, access{}, []byte(strings.Join(ids, "\n")+"\n"), "--git-dir="+repo, "rev-list", "--ignore-missing", "--stdin", "--not", "--all")
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("git upload-pack: %w", ctxErr)
 	}
@@ -229,9 +241,14 @@ func (g Git) reached(ctx context.Context, repo string, wants []want) error {
 	}
 	unreached := strings.Fields(string(out))
 	if len(unreached) == 0 {
+		if unreached, err = g.unreachedObjects(ctx, repo, ids); err != nil {
+			return err
+		}
+	}
+	if len(unreached) == 0 {
 		return nil
 	}
-	// The want named is the first rev-list lists, or, when it lists an
+	// The want named is the first listed, or, when rev-list lists an
 	// annotated tag's commit, the first of all.
 	named := wants[0].ids[0]
 	for _, w := range wants {
@@ -243,12 +260,112 @@ func (g Git) reached(ctx context.Context, repo string, wants []want) error {
 	return &ServeError{Command: uploadPack, Stderr: "upload-pack: not our ref " + named, Err: errNotOurRef}
 }
 
-// keepWants copies the request in to w and returns the wants it names when
-// it is a version 2 fetch command, nil otherwise, or an error wrapping ctx's
-// when ctx ends first, ErrRequestTooLarge when in holds more than limit bytes,
-// and a *ServeError when a want names no id git can read. The copy runs on
-// while in blocks, until in gives up.
-func keepWants(ctx context.Context, w io.Writer, in io.Reader, limit int64) ([]want, error) {
+// unreachedObjects returns those of ids that name a tree, a blob or a tag
+// of the repository repo that no ref reaches. A commit is left out, and so
+// is an id the repository does not resolve. An object a ref points at is
+// reached; the others are looked for among every object the refs reach.
+func (g Git) unreachedObjects(ctx context.Context, repo string, ids []string) ([]string, error) {
+	out, err := g.runInput(ctx, access{}, []byte(strings.Join(ids, "\n")+"\n"), "--git-dir="+repo, "cat-file", "--batch-check=%(objectname) %(objecttype)")
+	if err != nil {
+		return nil, g.checkFailed(ctx, err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if len(lines) != len(ids) {
+		return nil, fmt.Errorf("check the wants: cat-file answered %d lines for %d ids", len(lines), len(ids))
+	}
+	// pending holds each object yet to be met, by its full name, with the
+	// ids that name it.
+	pending := map[string][]string{}
+	for i, line := range lines {
+		name, typ, _ := strings.Cut(line, " ")
+		if typ == "tree" || typ == "blob" || typ == "tag" {
+			pending[name] = append(pending[name], ids[i])
+		}
+	}
+	if len(pending) > 0 {
+		tips, err := g.run(ctx, access{}, "--git-dir="+repo, "for-each-ref", "--format=%(objectname)")
+		if err != nil {
+			return nil, g.checkFailed(ctx, err)
+		}
+		for _, tip := range strings.Fields(string(tips)) {
+			delete(pending, tip)
+		}
+	}
+	if len(pending) > 0 {
+		if err := g.walkReached(ctx, repo, func(name string) bool {
+			delete(pending, name)
+			return len(pending) > 0
+		}); err != nil {
+			return nil, err
+		}
+	}
+	var unreached []string
+	for _, named := range pending {
+		unreached = append(unreached, named...)
+	}
+	return unreached, nil
+}
+
+// walkReached gives more the name of every object the refs of the
+// repository repo reach, HEAD's included, the trees and blobs of each
+// commit after it, newest first, until more returns false, and then stops
+// the walk. Reachability bitmaps, where the repository has them, answer in
+// place of the walk.
+func (g Git) walkReached(ctx context.Context, repo string, more func(name string) bool) error {
+	dir, err := privateDir(false)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	walk, stop := context.WithCancel(ctx)
+	defer stop()
+	cmd := g.command(walk, dir, access{}, []string{"--git-dir=" + repo, "rev-list", "--objects", "--no-object-names", "--in-commit-order", "--use-bitmap-index", "--all"})
+	errOut := &limitedBuffer{limit: stderrLimit}
+	cmd.Stderr = errOut
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("check the wants: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("check the wants: %w", err)
+	}
+	met := false
+	for lines := bufio.NewScanner(stdout); lines.Scan(); {
+		if !more(lines.Text()) {
+			met = true
+			break
+		}
+	}
+	if met {
+		stop()
+	}
+	err = cmd.Wait()
+	switch {
+	case met:
+		return nil
+	case err != nil:
+		return g.checkFailed(ctx, fmt.Errorf("git rev-list: %w: %s", err, strings.TrimSpace(errOut.String())))
+	}
+	return ctx.Err()
+}
+
+// checkFailed is the error of a git command of the want check that failed
+// with err: one wrapping ctx's error when ctx ended.
+func (g Git) checkFailed(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("git upload-pack: %w", ctxErr)
+	}
+	return fmt.Errorf("check the wants: %w", err)
+}
+
+// keepWants copies the request in to w, the whole of a version 2 request,
+// a version 0 one up to the flush packet that ends its wants, and returns
+// the wants it names when it is a version 2 fetch command or a version 0
+// request, nil otherwise, or an error wrapping ctx's when ctx ends first,
+// ErrRequestTooLarge when what it keeps holds more than limit bytes, and a
+// *ServeError when a version 2 want names no id git can read. The copy runs
+// on while in blocks, until in gives up.
+func keepWants(ctx context.Context, w io.Writer, in io.Reader, limit int64, v2 bool) ([]want, error) {
 	type kept struct {
 		wants []want
 		err   error
@@ -256,8 +373,8 @@ func keepWants(ctx context.Context, w io.Writer, in io.Reader, limit int64) ([]w
 	done := make(chan kept, 1)
 	go func() {
 		limited := &io.LimitedReader{R: in, N: limit + 1}
-		wants, err := scanWants(w, limited)
-		if err == nil && limited.N == 0 {
+		wants, ended, err := scanWants(w, limited, v2)
+		if err == nil && limited.N == 0 && (v2 || !ended) {
 			err = fmt.Errorf("git upload-pack: %w", ErrRequestTooLarge)
 		}
 		done <- kept{wants, err}
@@ -277,14 +394,17 @@ func keepWants(ctx context.Context, w io.Writer, in io.Reader, limit int64) ([]w
 // want is one want line of a fetch: the ids rev-list is given for it.
 type want struct{ ids []string }
 
-// scanWants is keepWants without the context and the bound. It reads the
-// request as git's protocol version 2 server does: the command and the
-// capabilities, in any order, up to the delimiter packet, then, for a fetch,
-// its arguments. It stops looking at the end of the request, its flush
-// packet, or at bytes that are not pkt-lines, and copies them all the same.
-func scanWants(w io.Writer, in io.Reader) ([]want, error) {
+// scanWants is keepWants without the context and the bound. It reads a
+// version 2 request as git's protocol version 2 server does: the command
+// and the capabilities, in any order, up to the delimiter packet, then, for
+// a fetch, its arguments; it stops looking at the end of the request, its
+// flush packet, or at bytes that are not pkt-lines, and copies them all the
+// same. It reads a version 0 request's want lines up to the flush packet
+// that ends them, when it reports ended, or up to bytes that are not
+// pkt-lines, and copies no further than it read: a want whose id git cannot
+// read is left for git to refuse.
+func scanWants(w io.Writer, in io.Reader, v2 bool) (wants []want, ended bool, err error) {
 	r := bufio.NewReader(io.TeeReader(in, w))
-	var wants []want
 	var fetch, args bool
 	var refused error
 	for {
@@ -294,9 +414,13 @@ func scanWants(w io.Writer, in io.Reader) ([]want, error) {
 		}
 		n, err := strconv.ParseUint(string(head[:]), 16, 16)
 		if err != nil || n == 0 {
+			ended = err == nil
 			break
 		}
 		if n < 4 {
+			if !v2 {
+				break
+			}
 			if n == 1 && !args {
 				if !fetch {
 					break
@@ -310,7 +434,7 @@ func scanWants(w io.Writer, in io.Reader) ([]want, error) {
 			break
 		}
 		line := strings.TrimSuffix(string(payload), "\n")
-		if !args {
+		if v2 && !args {
 			if cmd, ok := strings.CutPrefix(line, "command="); ok {
 				fetch = cmd == "fetch"
 			}
@@ -322,17 +446,20 @@ func scanWants(w io.Writer, in io.Reader) ([]want, error) {
 		}
 		if ids := wantIDs(arg); ids != nil {
 			wants = append(wants, want{ids})
-		} else {
+		} else if v2 {
 			refused = &ServeError{Command: uploadPack, Stderr: "upload-pack: protocol error, expected to get oid", Err: errBadWant}
 		}
 	}
+	if !v2 {
+		return wants, ended, nil
+	}
 	if _, err := io.Copy(io.Discard, r); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if refused != nil {
-		return nil, refused
+		return nil, false, refused
 	}
-	return wants, nil
+	return wants, true, nil
 }
 
 // wantIDs are the ids git may read from the argument of a want line, nil
