@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -174,7 +175,7 @@ func (c *Component) getDiff(w http.ResponseWriter, r *http.Request) error {
 	var kept []int
 	var keptChanges []gitrepo.FileChange
 	for i, ch := range changes {
-		if matchesAny(dq.globs, ch.Path) {
+		if identity.MatchAny(dq.globs, ch.Path) {
 			kept, keptChanges = append(kept, i), append(keptChanges, ch)
 		}
 	}

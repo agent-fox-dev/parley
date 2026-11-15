@@ -2817,7 +2817,7 @@ cursor used with other query parameters is refused (see [Lists](#lists)).
 | Status | When |
 |---|---|
 | `200 OK` | a page of commit objects, with `resolved_sha` |
-| `400` `invalid_request` | a bad `limit` or `cursor`; `first_parent`, `follow` or `stats` other than `true` or `false` (`stats must be true or false`); `since` or `until` not an RFC 3339 timestamp (`since must be an RFC 3339 timestamp, such as 2026-01-02T03:04:05Z`); `follow=true` without `path` (`follow=true needs a path, the one file whose renames it follows`) |
+| `400` `invalid_request` | a bad `limit` or `cursor`; an illegal `path`; `first_parent`, `follow` or `stats` other than `true` or `false` (`stats must be true or false`); `since` or `until` not an RFC 3339 timestamp (`since must be an RFC 3339 timestamp, such as 2026-01-02T03:04:05Z`); `follow=true` without `path` (`follow=true needs a path, the one file whose renames it follows`) |
 | `404` `ref_not_found` | `ref` names no one commit |
 | `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
 | `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |

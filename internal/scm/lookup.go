@@ -53,7 +53,8 @@ func (defaultBranchOnly) ProtectedBranches(_ context.Context, w workspace.Worksp
 	return func(branch string) bool { return w.DefaultBranch != nil && branch == *w.DefaultBranch }, nil
 }
 
-// noChanges names no change: no package records changes yet.
+// noChanges names no change: the hub has no change records to ask, so the
+// default answers none.
 type noChanges struct{}
 
 func (noChanges) OpenChangeOfBranch(context.Context, string, string) (*Change, error) {

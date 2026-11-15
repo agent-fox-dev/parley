@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -326,7 +327,7 @@ func catFile(c *call, query url.Values) error {
 	}
 	if c.cmd.Flags().Changed("output") {
 		out, _ := c.cmd.Flags().GetString("output")
-		if err := os.WriteFile(out, body, 0o666); err != nil {
+		if err := writeOutput(out, body); err != nil {
 			return clientError("cannot write the file: %v", err)
 		}
 		return nil
@@ -335,6 +336,37 @@ func catFile(c *call, query url.Values) error {
 		return clientError("cannot write the file's bytes: %v", err)
 	}
 	return nil
+}
+
+// writeOutput makes path hold data. It writes a temporary file beside path
+// and renames it onto path, so that a write failing partway leaves a file
+// that already exists as it was, rather than emptied. A new file gets mode
+// 0644, a replaced one keeps its mode.
+func writeOutput(path string, data []byte) (err error) {
+	mode := os.FileMode(0o644)
+	if fi, statErr := os.Stat(path); statErr == nil {
+		mode = fi.Mode().Perm()
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // diffRevisions is the run step of parley scm diff: with --patch it prints

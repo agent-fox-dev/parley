@@ -30,9 +30,8 @@ const scmHook = "scm"
 // is bounded by [scm].read_timeout and a file by [scm].max_file_size.
 //
 // The change, commit-change and session lookups keep their defaults, which
-// name none: the features that record changes and sessions are not in the
-// hub yet. The request recorder keeps its default too, until the hub
-// exports metrics.
+// name none: the hub has no change or session records to ask. The hub
+// registers no request recorder; the default discards the observations.
 //
 // The component exists from the composition on (SCM); tests change its
 // dependencies with AdjustSCM.

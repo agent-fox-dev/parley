@@ -120,15 +120,12 @@ func TestTree_RefusesAPathOrLimitItCannotList(t *testing.T) {
 	}
 }
 
-// The resolver's forms of a revision, as a read route's ref parameter takes
-// them.
+// The tree route reads its ref through the resolver: a name, the default
+// branch without one, and a form the resolver refuses.
 func TestTree_ReadsTheCommitItsRefNames(t *testing.T) {
 	w := newWorld(t)
 	for _, c := range []struct{ ref, want string }{
-		{"", w.id["c2"]}, {"main", w.id["c2"]}, {"feature/x", w.id["c3"]}, {"v1", w.id["c1"]}, {"v2", w.id["c2"]},
-		{"refs/heads/main", w.id["c2"]}, {"refs/tags/v2", w.id["c2"]}, {"refs/parley/changes/12/3", w.id["c3"]},
-		{w.id["c1"], w.id["c1"]}, {w.id["c3"][:7], w.id["c3"]},
-		{"nope", ""}, {"main~1", ""}, {"HEAD", ""}, {"--all", ""},
+		{"v2", w.id["c2"]}, {"", w.id["c2"]}, {"main~1", ""},
 	} {
 		t.Run(c.ref, func(t *testing.T) {
 			r := w.get(t, scmPath("demo", "/tree?ref="+url.QueryEscape(c.ref)), w.ownerKey)

@@ -171,6 +171,8 @@ func TestCommits_RefusesAMalformedParameter(t *testing.T) {
 	for _, path := range []string{
 		"/commits?stats=yes", "/commits?first_parent=1", "/commits?since=yesterday",
 		"/commits?until=2026-13-01T00:00:00Z", "/commits?follow=true", "/commits/main?files=maybe",
+		"/commits?path=/x", "/commits?path=../x", "/commits?path=a//b", "/commits?path=./a",
+		"/commits?path=.git/config",
 	} {
 		if r := w.get(t, scmPath("demo", path), w.ownerKey); r.status != http.StatusBadRequest || r.errorType() != "invalid_request" {
 			t.Errorf("GET %s = %d %s, want 400 invalid_request", path, r.status, r.body)

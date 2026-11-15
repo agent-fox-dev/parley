@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -94,7 +95,7 @@ func (c *Component) search(w http.ResponseWriter, r *http.Request) error {
 	sha := res.SHA
 	items := make([]searchMatch, 0, page.Limit+1)
 	err = rd.repo.Grep(r.Context(), sha, gitrepo.GrepQuery{Pattern: pattern, Regexp: regex, IgnoreCase: !caseSensitive}, func(m gitrepo.GrepMatch) bool {
-		if (continuing && !pos.after(m)) || !matchesAny(globs, m.Path) {
+		if (continuing && !pos.after(m)) || !identity.MatchAny(globs, m.Path) {
 			return true
 		}
 		items = append(items, searchMatch{Path: m.Path, Line: m.Line, Text: firstRunes(m.Text, maxMatchText)})

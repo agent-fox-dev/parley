@@ -54,7 +54,10 @@ func (c *Component) listCommits(w http.ResponseWriter, r *http.Request) error {
 		return server.InvalidRequest("cursor is malformed or belongs to another query")
 	}
 	q := r.URL.Query()
-	hq := gitrepo.HistoryQuery{Path: q.Get("path"), Author: q.Get("author"), Skip: pos.Offset, Count: page.Limit + 1}
+	hq := gitrepo.HistoryQuery{Author: q.Get("author"), Skip: pos.Offset, Count: page.Limit + 1}
+	if hq.Path, err = pathParam(q, false); err != nil {
+		return err
+	}
 	if hq.FirstParent, err = boolParam(q, "first_parent", true); err != nil {
 		return err
 	}

@@ -19,9 +19,10 @@ import (
 // The tests of this file set environment variables, so they must not run in
 // parallel.
 
-// startSCMHub starts a hub whose workspace demo is cloned, the way package
-// 10 registers a workspace, from an origin that holds what stream imports,
-// and returns the hub and the place of demo's repository on disk.
+// startSCMHub starts a hub whose workspace demo is cloned, the way a
+// workspace is registered through the API (create, then clone), from an
+// origin that holds what stream imports, and returns the hub and the place
+// of demo's repository on disk.
 func startSCMHub(t *testing.T, stream string) (*workspaceHub, string) {
 	t.Helper()
 	origin := gitrepotest.NewOrigin(t, gitrepotest.WithSmartHTTP())
