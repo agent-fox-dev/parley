@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -75,9 +76,9 @@ func TestValidatePushOptions_AcceptsWellFormedOptions(t *testing.T) {
 		{"session the linker accepts", []string{"parley.session=" + sessionID}, gitserver.PushOptions{SessionID: ptr(strings.ToLower(sessionID))}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, refusal, _ := gitserver.ValidatePushOptions(context.Background(), tc.opts, gitserver.PushCaller{UserID: "U"}, "demo", &sessionStub{})
-			if refusal != "" {
-				t.Fatalf("refused: %q", refusal)
+			got, refusal, err := gitserver.ValidatePushOptions(context.Background(), tc.opts, gitserver.PushCaller{UserID: "U"}, "demo", &sessionStub{})
+			if err != nil || refusal != "" {
+				t.Fatalf("refused: %q, %v", refusal, err)
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("options = %+v, want %+v", got, tc.want)
@@ -117,9 +118,9 @@ func TestValidatePushOptions_RefusesTheFirstInvalidOption(t *testing.T) {
 			want = "invalid push option " + want
 		}
 		t.Run(want, func(t *testing.T) {
-			got, refusal, _ := gitserver.ValidatePushOptions(context.Background(), tc.opts, gitserver.PushCaller{UserID: "U"}, "demo", &sessionStub{})
-			if refusal != want {
-				t.Errorf("refusal = %q, want %q", refusal, want)
+			got, refusal, err := gitserver.ValidatePushOptions(context.Background(), tc.opts, gitserver.PushCaller{UserID: "U"}, "demo", &sessionStub{})
+			if err != nil || refusal != want {
+				t.Errorf("refusal = %q, %v; want %q, nil", refusal, err, want)
 			}
 			if !reflect.DeepEqual(got, gitserver.PushOptions{}) {
 				t.Errorf("a refused push has options %+v", got)
@@ -130,24 +131,34 @@ func TestValidatePushOptions_RefusesTheFirstInvalidOption(t *testing.T) {
 
 func TestValidatePushOptions_RefusesASessionTheLinkerDoesNotAccept(t *testing.T) {
 	caller := gitserver.PushCaller{CredentialType: gitserver.CredentialAPIKey, CredentialID: "k1", UserID: "U"}
+	const unknown, internal = "invalid push option parley.session: unknown session", "internal error; try again"
+	refuses := func() *sessionStub {
+		return &sessionStub{err: fmt.Errorf("no such session: %w", gitserver.ErrUnknownSession)}
+	}
+	fails := func() *sessionStub { return &sessionStub{err: errors.New("database is locked")} }
 	for _, tc := range []struct {
-		name   string
-		id     string
-		linker *sessionStub // nil for no linker registered
-		want   string
+		name          string
+		id            string
+		before, after []string     // the options sent before and after the session
+		linker        *sessionStub // nil for no linker registered
+		want          string
 	}{
-		{"refused", sessionID, &sessionStub{err: fmt.Errorf("no such session: %w", gitserver.ErrUnknownSession)}, "invalid push option parley.session: unknown session"},
-		{"not an id", "not-a-uuid", &sessionStub{err: gitserver.ErrUnknownSession}, "invalid push option parley.session: unknown session"},
-		{"no linker", sessionID, nil, "invalid push option parley.session: unknown session"},
-		{"linker fails", sessionID, &sessionStub{err: errors.New("database is locked")}, "internal error; try again"},
+		{"refused", sessionID, nil, nil, refuses(), unknown},
+		{"not an id", "not-a-uuid", nil, nil, &sessionStub{err: gitserver.ErrUnknownSession}, unknown},
+		{"no linker", sessionID, nil, nil, nil, unknown},
+		{"linker fails", sessionID, nil, nil, fails(), internal},
+		{"refused before an invalid option", sessionID, nil, []string{"parley.titel=x"}, refuses(), unknown},
+		{"linker fails before an invalid option", sessionID, nil, []string{"parley.titel=x"}, fails(), internal},
+		{"invalid option before the session", sessionID, []string{"parley.titel=x"}, nil, refuses(), "invalid push option parley.titel: unknown option"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var linker gitserver.SessionLinker
 			if tc.linker != nil {
 				linker = tc.linker
 			}
-			got, refusal, err := gitserver.ValidatePushOptions(context.Background(), []string{"parley.session=" + tc.id}, caller, "demo", linker)
-			if (err != nil) != (tc.name == "linker fails") {
+			opts := append(append(slices.Clone(tc.before), "parley.session="+tc.id), tc.after...)
+			got, refusal, err := gitserver.ValidatePushOptions(context.Background(), opts, caller, "demo", linker)
+			if (err != nil) != (tc.want == internal) {
 				t.Errorf("err = %v; only a failing linker returns its error", err)
 			}
 			if refusal != tc.want {
@@ -157,7 +168,10 @@ func TestValidatePushOptions_RefusesASessionTheLinkerDoesNotAccept(t *testing.T)
 				t.Errorf("a refused session is set: %q", *got.SessionID)
 			}
 			if tc.linker != nil {
-				want := []sessionCheck{{caller, tc.id, "demo"}}
+				var want []sessionCheck // an option at fault before the session spares the linker
+				if tc.before == nil {
+					want = []sessionCheck{{caller, tc.id, "demo"}}
+				}
 				if !reflect.DeepEqual(tc.linker.calls, want) {
 					t.Errorf("linker calls = %+v, want %+v", tc.linker.calls, want)
 				}
@@ -182,13 +196,11 @@ func TestPushOptionsStage_AnswersWithTheRefusalOrTheSessionAndOpening(t *testing
 		want    gitserver.OptionsAnswer
 	}{
 		{"no option", repo, nil, nil, gitserver.OptionsAnswer{}},
-		{"a change asked for", repo, []string{"parley.change"}, nil, gitserver.OptionsAnswer{OpensChange: true}},
+		{"a change asked for in a session", repo, []string{"parley.session=ABC", "parley.change"}, nil,
+			gitserver.OptionsAnswer{SessionID: ptr("abc"), OpensChange: true}},
 		{"a target", repo, []string{"parley.target=release"}, nil, gitserver.OptionsAnswer{OpensChange: true}},
 		{"a fork that opens changes", fork(true), nil, nil, gitserver.OptionsAnswer{OpensChange: true}},
 		{"a fork that does not", fork(false), nil, nil, gitserver.OptionsAnswer{}},
-		{"a session", repo, []string{"parley.session=ABC"}, nil, gitserver.OptionsAnswer{SessionID: ptr("abc")}},
-		{"an invalid option", fork(true), []string{"parley.bogus"}, nil,
-			gitserver.OptionsAnswer{Refusal: "invalid push option parley.bogus: unknown option"}},
 		{"a linker that cannot tell", repo, []string{"parley.session=abc", "parley.change"}, errors.New("store down"),
 			gitserver.OptionsAnswer{Refusal: "internal error; try again"}},
 	} {

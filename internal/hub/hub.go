@@ -226,11 +226,11 @@ type Composition struct {
 
 	// pushRules is the push rule engine every surface that writes refs asks
 	// (PushRules), and receiver the push processor behind git-receive-pack
-	// (Receiver). Both exist from the composition on, so that a part
-	// registers its collaborator on them while the hub is composed;
-	// composeGitServer binds them in its start hook. pushOptions is the
-	// receiver's options stage (PushOptions), which composeGitServer
-	// creates and registers.
+	// (Receiver), and pushOptions the receiver's options stage
+	// (PushOptions). All three exist from the composition on, so that a
+	// part registers its collaborator on them while the hub is composed,
+	// whichever part comes first; composeGitServer registers the options
+	// stage on the receiver and binds the three in its start hook.
 	pushRules   *pushrule.Engine
 	receiver    *gitserver.Receiver
 	pushOptions *gitserver.PushOptionsStage
@@ -248,7 +248,8 @@ type Composition struct {
 
 func newComposition() *Composition {
 	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}, shutdown: make(chan struct{}),
-		refWriter: &pushrule.Writer{}, pushRules: &pushrule.Engine{}, receiver: &gitserver.Receiver{}}
+		refWriter: &pushrule.Writer{}, pushRules: &pushrule.Engine{}, receiver: &gitserver.Receiver{},
+		pushOptions: &gitserver.PushOptionsStage{}}
 }
 
 // Runtime returns the runtime the hub fills once the stores are open, before

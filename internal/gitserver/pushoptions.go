@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -125,29 +126,44 @@ func ParsePushOptions(raw []string) (PushOptions, string) {
 }
 
 // ValidatePushOptions judges the push options raw of a push by the caller
-// to the workspace slug: ParsePushOptions, then, for well-formed options
-// with a parley.session, the session linker sessions, nil when none is
-// registered. It returns the options, with the session id as the linker
-// gives it back, and "", or the zero options and the message the client is
-// shown. A session the linker refuses, or that no linker can verify, is an
-// unknown session; when the linker cannot tell, the push is refused as an
-// internal error and the error is returned for the caller to log, since a
-// session nothing verified is never accepted.
+// to the workspace slug: ParsePushOptions, with a parley.session checked by
+// the session linker sessions, nil when none is registered, at its place in
+// the order sent, so that an option at fault before it refuses the push
+// without asking the linker and one after it is judged only once the linker
+// accepted the session. The number of options is judged before any of
+// them. It returns the options, with the session id as the linker gives it
+// back, and "", or the zero options and the message the client is shown. A
+// session the linker refuses, or that no linker can verify, is an unknown
+// session; when the linker cannot tell, the push is refused as an internal
+// error and the error is returned for the caller to log, since a session
+// nothing verified is never accepted.
 func ValidatePushOptions(ctx context.Context, raw []string, caller PushCaller, workspace string, sessions SessionLinker) (PushOptions, string, error) {
-	opts, refusal := ParsePushOptions(raw)
-	if refusal != "" || opts.SessionID == nil {
+	at := slices.IndexFunc(raw, func(o string) bool {
+		name, _, _ := strings.Cut(o, "=")
+		return name == "parley.session"
+	})
+	if len(raw) > maxPushOptions || at < 0 {
+		opts, refusal := ParsePushOptions(raw)
 		return opts, refusal, nil
+	}
+	head, refusal := ParsePushOptions(raw[:at+1])
+	if refusal != "" {
+		return PushOptions{}, refusal, nil
 	}
 	unknown := invalidOption("parley.session", "unknown session")
 	if sessions == nil {
 		return PushOptions{}, unknown, nil
 	}
-	id, err := sessions.Check(ctx, caller, *opts.SessionID, workspace)
+	id, err := sessions.Check(ctx, caller, *head.SessionID, workspace)
 	switch {
 	case errors.Is(err, ErrUnknownSession):
 		return PushOptions{}, unknown, nil
 	case err != nil:
-		return PushOptions{}, "internal error; try again", fmt.Errorf("check session %q: %w", *opts.SessionID, err)
+		return PushOptions{}, "internal error; try again", fmt.Errorf("check session %q: %w", *head.SessionID, err)
+	}
+	opts, refusal := ParsePushOptions(raw)
+	if refusal != "" {
+		return PushOptions{}, refusal, nil
 	}
 	opts.SessionID = &id
 	return opts, "", nil

@@ -68,8 +68,9 @@ const (
 // place of each repository on disk and [git].max_push_size, which the part
 // registers beside [git].timeout, and is the git server's Push, so that
 // a push that passed the checks is decided by the rules and written by the
-// ref writer. Its options stage (PushOptions) is registered when the part is
-// composed and bound to the hub's logger in the same start hook: it refuses
+// ref writer. Its options stage (PushOptions), which exists from the
+// composition on, is registered on it when the part is composed and bound
+// to the hub's logger in the same start hook: it refuses
 // a push with invalid options before its pack is read and hands on the
 // session of parley.session.
 //
@@ -78,7 +79,6 @@ const (
 func composeGitServer(c *Composition) {
 	comp := &gitserver.Component{}
 	c.gitServer = comp
-	c.pushOptions = &gitserver.PushOptionsStage{}
 	c.receiver.RegisterOptionsStage(c.pushOptions)
 	comp.Mount(c.Handle)
 	if err := gitserver.Register(c.registry); err != nil {

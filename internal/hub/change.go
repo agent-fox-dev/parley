@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -244,7 +245,9 @@ func (p pushChanges) RecordPushVersion(ctx context.Context, req gitserver.Versio
 // OpenChange opens the change with what the push named, nil being the
 // defaults, and its session as the trigger's. The component's change_exists
 // names the change that has the source only in its details, so the
-// refusal is answered with the change the lookup finds.
+// refusal is answered with the change the lookup finds; a lookup that
+// fails or finds none leaves the push unrecorded, an error of the hub's,
+// not a refusal of the push.
 func (p pushChanges) OpenChange(ctx context.Context, req gitserver.OpenRequest) (gitserver.OpenedChange, error) {
 	in := change.OpenInput{Workspace: req.Workspace, SourceWorkspace: req.Source, SourceBranch: req.Branch, Head: req.Head,
 		TargetBranch: req.Target, Title: req.Title, Intent: req.Intent, TriggerSession: req.SessionID, Draft: req.Draft,
@@ -256,9 +259,16 @@ func (p pushChanges) OpenChange(ctx context.Context, req gitserver.OpenRequest) 
 	})
 	var refusal *server.Error
 	if errors.As(err, &refusal) && refusal.Type() == "change_exists" {
-		if b, found, lerr := p.changes.OpenChangeOfBranch(ctx, nil, req.Source, req.Branch); lerr == nil && found {
-			return gitserver.OpenedChange{}, &gitserver.ChangeExistsError{Workspace: b.WorkspaceSlug, Number: int(b.Number)}
+		// The refusal is kept as text only: wrapped, the mapper would word
+		// it as the push's refusal, when the push failed to be recorded.
+		b, found, lerr := p.changes.OpenChangeOfBranch(ctx, nil, req.Source, req.Branch)
+		switch {
+		case lerr != nil:
+			return gitserver.OpenedChange{}, fmt.Errorf("open refused (%v), and the lookup of the source's change failed: %w", err, lerr)
+		case !found:
+			return gitserver.OpenedChange{}, fmt.Errorf("open refused (%v), and the lookup found no change of the source", err)
 		}
+		return gitserver.OpenedChange{}, &gitserver.ChangeExistsError{Workspace: b.WorkspaceSlug, Number: int(b.Number)}
 	}
 	if err != nil {
 		return gitserver.OpenedChange{}, err
