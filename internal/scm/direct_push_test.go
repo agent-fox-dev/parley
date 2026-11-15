@@ -21,7 +21,8 @@ const (
 
 // TestDirectPush checks how the writes meet a protected branch with the
 // hub's own push rule engine: the owner and the admin token move it forward
-// as a direct push, which opens and asks for no change, and nobody creates,
+// as a direct push, which opens and asks for no change but names the
+// version a stage recorded for it, and nobody creates,
 // rewinds, rewrites or deletes it. Each behaviour has a workspace of its
 // own, made by refsStream, whose main, m1 <- m2, is protected by default.
 func TestDirectPush(t *testing.T) {
@@ -72,7 +73,8 @@ func TestDirectPush(t *testing.T) {
 
 	t.Run("accepts a commit to the protected branch from an exempt caller as a direct push", func(t *testing.T) {
 		dir, _, _ := seed(t, "direct")
-		// A version a stage reported for main would still name no change.
+		// The version a stage reports for main, the source of a change, is
+		// named as for any other write.
 		w.stage.mu.Lock()
 		w.stage.versions = map[string]*pushrule.Version{"refs/heads/main": {WorkspaceSlug: "direct", Number: 7, Version: 3}}
 		w.stage.mu.Unlock()
@@ -97,8 +99,8 @@ func TestDirectPush(t *testing.T) {
 				pushes[0].Via != pushrule.ViaAPI || pushes[0].After == nil || *pushes[0].After != sha {
 				t.Errorf("%s: push events %+v, want one direct, not forced, to %s via api", caller.name, pushes, sha)
 			}
-			if c, ok := r.json["change"]; !ok || c != nil {
-				t.Errorf("%s: change %v, want null", caller.name, c)
+			if c, _ := r.json["change"].(map[string]any); c["workspace_slug"] != "direct" || c["number"] != 7.0 || c["version"] != 3.0 {
+				t.Errorf("%s: change %v, want direct#7 version 3", caller.name, r.json["change"])
 			}
 			if c, ok := r.json["change_error"]; !ok || c != nil {
 				t.Errorf("%s: change_error %v, want null", caller.name, c)
@@ -206,8 +208,8 @@ func TestDirectPush(t *testing.T) {
 		if r.status != http.StatusOK || r.json["status"] != "rebased" || r.json["old_head_sha"] != c || r.json["new_head_sha"] != d {
 			t.Fatalf("a rebase of main onto a descendant: %d %s, want 200 rebased from %s to %s", r.status, r.body, c, d)
 		}
-		if ch, ok := r.json["change"]; !ok || ch != nil {
-			t.Errorf("a rebase of main onto a descendant: change %v, want null", ch)
+		if ch, _ := r.json["change"].(map[string]any); ch["workspace_slug"] != "forward" || ch["number"] != 7.0 || ch["version"] != 3.0 {
+			t.Errorf("a rebase of main onto a descendant: change %v, want forward#7 version 3", r.json["change"])
 		}
 		checkDirect(t, "a rebase of main onto a descendant", seq, c, d)
 

@@ -24,11 +24,13 @@ var versionKinds = map[string]string{
 // (docs/adr/08-register-the-push-collaborators-on-the-ref-writer.md).
 //
 // For each allowed update of a branch of in.Workspace, the workspace
-// written to and so the source workspace, that is not a direct push to a
-// protected branch: a deleted branch abandons its draft or open change
-// (SourceDeleted); a moved or created one records the next version of its
-// draft or open change (RecordVersion) with the kind the write named, by
-// the caller with the credential they used, in the write's session. The
+// written to and so the source workspace: a deleted branch abandons its
+// draft or open change (SourceDeleted); a moved or created one records the
+// next version of its draft or open change (RecordVersion) with the kind
+// the write named, by the caller with the credential they used, in the
+// write's session. A direct push to a protected branch is such a move: it
+// opens no change, but a branch that is already a change's source moved
+// all the same. The
 // list it returns names, at the index of each update, the version recorded
 // for it, nil for none. A landing, a write that names no version kind and
 // any other ref record nothing. An error, such as 400 unknown_session for a
@@ -44,7 +46,7 @@ func (c *Component) RefUpdated(ctx context.Context, tx *sql.Tx, in pushrule.Stag
 	for i, d := range in.Updates {
 		branch, ok := strings.CutPrefix(d.Ref, "refs/heads/")
 		switch {
-		case !ok || !d.Allowed || d.Direct:
+		case !ok || !d.Allowed:
 			continue
 		case d.Deleted:
 			if err := c.SourceDeleted(ctx, tx, in.Workspace.Slug, branch, caller); err != nil {

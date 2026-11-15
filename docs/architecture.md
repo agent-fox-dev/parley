@@ -3407,9 +3407,10 @@ an API error, else `500` `internal`. The step returns the engine's decision
 (its `Direct`, `Created`, `Forced` flags) and the version a stage recorded.
 The owner exemption is the engine's: a fast-forward of a protected branch
 by the owner or the admin token with an exempt credential comes back with
-`Direct` set, and the route then asks the `ChangeLinker` nothing and names
-no change (`refUpdated.change()` is `nil` for a direct push whatever a stage
-reported), since a direct push is the version of no change.
+`Direct` set, and the route then asks the `ChangeLinker` nothing and opens
+no change; it names the version a stage recorded (`refUpdated.change()`),
+which it records only when the protected branch is already the source of a
+draft or open change.
 A write opens the workspace's repository through `Deps.Open`, which must
 hand over a `*gitrepo.Repo`, since the ref writer writes to one.
 
@@ -3686,7 +3687,7 @@ call them:
   (`refstage.go`). The ref writer runs the stage in the store transaction
   of every accepted write of refs, after the refs are locked and before
   they move. Unless `Via` is `land`, for each allowed update of
-  `refs/heads/<b>` that is not `Direct`: a `Deleted` one calls
+  `refs/heads/<b>`, a `Direct` one included: a `Deleted` one calls
   `SourceDeleted` with the caller; with `VersionKind` `push`, `commit`,
   `ref` or `rebase` the others call `RecordVersion` with that kind, the
   caller (`pushrule.Caller`'s `UserID`, `CredentialType` and

@@ -433,6 +433,41 @@ func TestPushChange_LeavesTheChangeOfAPushedBranchAsItWas(t *testing.T) {
 	}
 }
 
+// A protected branch that is the source of an open change gets a version
+// when its owner pushes it directly, whatever the push asks, and the
+// client is told of the version rather than warned.
+func TestPushChange_AddsAVersionForADirectPushOfAChangesSource(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	dir := w.cloneDemo(t, w.ownerKey)
+	runGit(t, dir, "push", "--quiet", "origin", "main:release")
+	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", "first")
+	runGit(t, dir, "push", "--quiet", "origin", "main")
+	status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/demo/changes", w.ownerKey, map[string]any{
+		"source": map[string]any{"branch": "main"}, "target_branch": "release", "title": "Release main", "intent": "Ship it."})
+	if status != http.StatusCreated {
+		t.Fatalf("open a change of main onto release = %d %s, want 201", status, body)
+	}
+	for i, options := range [][]string{nil, {"parley.change"}} {
+		runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", fmt.Sprintf("direct %d", i))
+		head := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+		push := []string{"push"}
+		for _, o := range options {
+			push = append(push, "-o", o)
+		}
+		out := runGit(t, dir, append(push, "origin", "main")...)
+		version := i + 2
+		if got, want := linesWith(out, "remote: "), []string{fmt.Sprintf("remote: change demo#1 version %d", version)}; !slices.Equal(got, want) {
+			t.Errorf("options %q: remote lines = %q, want %q", options, got, want)
+		}
+		if c := w.demoChange(t, "1"); c.Version != version || c.HeadSHA != head || c.State != "open" {
+			t.Errorf("options %q: change 1 = %+v, want open at version %d with head %s", options, c, version, head)
+		}
+		if v := w.demoChange(t, fmt.Sprintf("1/versions/%d", version)); v.Kind != "push" || v.HeadSHA != head {
+			t.Errorf("options %q: version %d = %+v, want kind push at %s", options, version, v, head)
+		}
+	}
+}
+
 // The change of a branch pushed to a task fork is opened in the fork's
 // parent, from the fork's branch, onto the fork's base branch; the fork
 // holds no change of its own.
