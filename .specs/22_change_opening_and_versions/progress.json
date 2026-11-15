@@ -3,51 +3,51 @@
   "spec_id": "22",
   "spec_name": "change_opening_and_versions",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-15T14:58:06Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 11,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

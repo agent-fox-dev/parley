@@ -132,15 +132,8 @@ func newSCMCommand() *cobra.Command {
 				{name: "patch", param: "format", kind: switchFlag, sends: "patch", usage: "print the unified diff text instead of JSON"},
 				{name: "name-only", param: "patches", kind: switchFlag, sends: "false", usage: "leave the patch text out of the files"},
 			},
-			check: func(cmd *cobra.Command) error {
-				patch, _ := cmd.Flags().GetBool("patch")
-				nameOnly, _ := cmd.Flags().GetBool("name-only")
-				if patch && nameOnly {
-					return usageError("%s takes --patch or --name-only, not both", cmd.CommandPath())
-				}
-				return nil
-			},
-			send: diffRevisions,
+			check: onePatchForm,
+			send:  diffRevisions,
 		}.build(),
 		scmRead{
 			command: command{
@@ -372,6 +365,17 @@ func writeOutput(path string, data []byte) (err error) {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// onePatchForm refuses --patch with --name-only: the one asks for the
+// patch text alone, the other for the files without it.
+func onePatchForm(cmd *cobra.Command) error {
+	patch, _ := cmd.Flags().GetBool("patch")
+	nameOnly, _ := cmd.Flags().GetBool("name-only")
+	if patch && nameOnly {
+		return usageError("%s takes --patch or --name-only, not both", cmd.CommandPath())
+	}
+	return nil
 }
 
 // diffRevisions is the run step of parley scm diff: with --patch it prints

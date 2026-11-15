@@ -38,15 +38,15 @@ const scmHook = "scm"
 // own body limit, in place of [server].max_body_size; the commits a write
 // makes take their times from the hub's clock.
 //
-// The change, commit-change and session lookups keep their defaults, which
-// name none: the hub has no change or session records to ask. Nothing
-// registers a change linker or a session linker on the component yet, so a
-// write that asks for a change is refused 400 invalid_request and every
-// session_id 400 unknown_session. The hub registers no request recorder;
-// the default discards the observations.
+// The change part (composeChanges) sets the change and commit-change
+// lookups through AdjustSCM and registers the change linker. The session
+// lookup keeps its default, which names none, and nothing registers a
+// session linker yet, so every session_id is refused 400 unknown_session.
+// The hub registers no request recorder; the default discards the
+// observations.
 //
-// The component exists from the composition on (SCM); tests change its
-// dependencies with AdjustSCM.
+// The component exists from the composition on (SCM); a later part and
+// tests change its dependencies with AdjustSCM.
 func composeSCM(c *Composition) {
 	comp := &scm.Component{}
 	c.scm = comp
@@ -102,8 +102,8 @@ func composeSCM(c *Composition) {
 
 // forkRefs is the ref view of the fork slug: the fork component's, its
 // branches with their tracking flag and its recorded tags, which the reads
-// peel to the commits they reach. It names no refs/parley/ ref, as the git
-// server's fork view names no change.
+// peel to the commits they reach. It names no refs/parley/ ref: a fork's
+// changes and their version refs are its parent's.
 type forkRefs struct {
 	forks *fork.Component
 	slug  string
@@ -146,7 +146,8 @@ func (c *Composition) SCM() *scm.Component { return c.scm }
 
 // AdjustSCM adds fn to the functions that change the read routes'
 // dependencies after the start hook has built them and before it binds
-// them, in the order they were added. Tests replace a collaborator with it,
+// them, in the order they were added. The change part sets the change
+// lookups with it, and tests replace a collaborator with it after that,
 // such as the request recorder or the repository opener.
 func (c *Composition) AdjustSCM(fn func(*scm.Deps)) {
 	c.scmAdjusters = append(c.scmAdjusters, fn)

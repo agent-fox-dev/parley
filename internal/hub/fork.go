@@ -60,18 +60,18 @@ const (
 // While [forks].expire_on_land is set, a pass also removes a fork a day
 // after its work has landed. It asks the change feature for the fork's
 // changes through the change reader that feature registers on the
-// component (RegisterChangeReader) from its own file; the hub has no change
-// feature yet, so none is registered here, and no fork is removed before
-// its expires_at. The day counts from the fork's last activity, a column of
-// its own after the pending discards. The features that see an activity (a
-// push to the fork, an API write to it, a change of it opened, versioned,
-// landed, abandoned or restored: the push rules, the change feature and
-// the landing) register the component's RecordActivity with their own
-// activity hook in this function. The ref writer's is registered here: the
-// writer tells the component of every accepted write to a fork through git
-// or the source control API, after the refs moved and outside any store
-// transaction, since RecordActivity opens its own. The change feature and
-// the landing are not in the hub yet, so theirs are not.
+// component (RegisterChangeReader) from its own file (composeChanges). The
+// day counts from the fork's last activity, a column of its own after the
+// pending discards. The features that see an activity (a push to the fork,
+// an API write to it, a change of it opened, versioned, landed, abandoned
+// or restored: the push rules, the change feature and the landing)
+// register the component's recorder with their own activity hook. The ref
+// writer's is registered here: the writer tells the component of every
+// accepted write to a fork through git or the source control API, after
+// the refs moved and outside any store transaction, since RecordActivity
+// opens its own. The change part registers RecordActivityIn, which runs in
+// the transaction that opens or abandons the change. The landing is not in
+// the hub yet, so its hook is not registered.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp

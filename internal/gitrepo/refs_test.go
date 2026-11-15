@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -110,5 +111,73 @@ func TestIsAncestor(t *testing.T) {
 		if err != nil || got != c.want {
 			t.Errorf("%s: IsAncestor = %v, %v; want %v", c.name, got, err, c.want)
 		}
+	}
+}
+
+func TestSetRef_PointsTheRefAtTheCommitWhateverItHeld(t *testing.T) {
+	t.Parallel()
+	repo, c1, c2, _ := threeCommits(t)
+	ctx := context.Background()
+	const ref = "refs/parley/changes/1/1"
+	for _, id := range []string{c1, c2} {
+		if err := repo.SetRef(ctx, ref, id); err != nil {
+			t.Fatalf("SetRef(%s): %v", id, err)
+		}
+		if got := gitrepotest.Refs(t, repo.Dir(), "")[ref]; got != id {
+			t.Errorf("after SetRef(%s), %s = %q", id, ref, got)
+		}
+	}
+}
+
+func TestDeleteRef_RemovesTheRefAndAcceptsOneThatIsGone(t *testing.T) {
+	t.Parallel()
+	repo, c1, _, _ := threeCommits(t)
+	ctx := context.Background()
+	const ref, other = "refs/parley/changes/1/1", "refs/parley/changes/1/2"
+	for _, r := range []string{ref, other} {
+		if err := repo.SetRef(ctx, r, c1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 2 {
+		if err := repo.DeleteRef(ctx, ref); err != nil {
+			t.Fatalf("DeleteRef(%s): %v", ref, err)
+		}
+	}
+	if got := gitrepotest.Refs(t, repo.Dir(), "refs/parley/changes/"); !reflect.DeepEqual(got, map[string]string{"1/2": c1}) {
+		t.Errorf("refs after DeleteRef = %v, want only %s", got, other)
+	}
+}
+
+// A commit made in a fork is not in its parent's repository: SetRefFrom
+// brings it there under the ref, and points the ref at a commit the parent
+// already holds without copying anything.
+func TestSetRefFrom_BringsACommitOfAnotherRepositoryUnderTheRef(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	parent, head, _, _ := forkParent(t, 2)
+	fork := newFork(t, parent)
+	own := gitrepotest.PushCommit(t, parent, fork, "work", "only in the fork\n")
+	if readable(parent, own) {
+		t.Fatal("the parent holds the fork's commit before the copy")
+	}
+	repo, err := gitrepo.Git{}.Open(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ ref, id string }{
+		{"refs/parley/changes/1/1", own},
+		{"refs/parley/changes/2/1", head},
+		{"refs/parley/changes/1/1", head},
+	} {
+		if err := repo.SetRefFrom(ctx, fork, c.ref, c.id); err != nil {
+			t.Fatalf("SetRefFrom(%s, %s): %v", c.ref, c.id, err)
+		}
+		if got := gitrepotest.Refs(t, parent, "")[c.ref]; got != c.id {
+			t.Errorf("after SetRefFrom, %s = %q, want %s", c.ref, got, c.id)
+		}
+	}
+	if !readable(parent, own) {
+		t.Error("the parent cannot read the fork's commit after the copy")
 	}
 }

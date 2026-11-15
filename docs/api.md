@@ -783,7 +783,12 @@ A push that passed every check gets its ref advertisement from
     refs then move together by compare-and-swap against the old values
     sent: a ref that moved meanwhile is refused with `ref changed since it
     was read; fetch and try again`, so of two pushes of one ref from one
-    value exactly one goes through.
+    value exactly one goes through. In the same store transaction, before
+    the refs move, a pushed branch that is the source of a draft or open
+    change records the change's next version, of kind `push` (see
+    [Changes](#changes)), and a deleted one abandons its change; when that
+    fails, such as for a session the hub refuses, every ref is refused with
+    `internal error; try again` and nothing moves.
   - The answer is `200` with
     `Content-Type: application/x-git-receive-pack-result` and
     `Cache-Control: no-cache`. With `report-status` (or
@@ -832,8 +837,7 @@ on every git route, as of the moment of the request:
   or tag the parent gained after the fork is never advertised.
 - The version refs `refs/parley/changes/<number>/<version>` of the changes
   whose source is the fork are advertised under the parent's names, and
-  no version ref of another change. The hub records no change's source
-  yet, so a fork advertises no version ref.
+  no version ref of another change, whatever state the change is in.
 - The fork's own branches are advertised as they are.
 
 When those refs cannot be brought up to date, such as when the parent's
@@ -2338,8 +2342,7 @@ until a push to it or a change of it being opened, versioned, landed,
 abandoned or restored is recorded. A fork past its `expires_at` is
 removed once, with the reason `ttl`. A fork whose changes or sandboxes
 cannot be read is kept, the failure logged with its slug, until a later
-pass. The hub has no change feature yet: until one is added, no fork has
-changes and none is removed before its `expires_at`.
+pass.
 
 Each removal writes one `parley.fork.expire` event and no
 `parley.workspace.delete` event: actor `system`, `workspace` and
@@ -2667,7 +2670,7 @@ A ref object has exactly these members:
 | `sha` | the full id of the commit the ref points at; for an annotated tag, the commit the tag peels to |
 | `protected` | `true` for a branch the workspace's effective `protected_branches` protect (a fork's are its parent's) and for every `refs/parley/` ref, else `false` |
 | `tracking` | `true` for a task fork's tracking branch, else `false` |
-| `change` | `{"workspace_slug": …, "number": …}` for the open or draft change whose source is the branch; always `null` until the hub records changes |
+| `change` | `{"workspace_slug": …, "number": …}` for the open or draft change whose source is the branch, named under the workspace it belongs to (a task fork's parent for a fork's branch); `null` when there is none |
 
 Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
@@ -2730,7 +2733,7 @@ A commit object, as every route that answers commits writes it:
 | `tree_sha` | the full id of its tree |
 | `author`, `committer` | `{"name": …, "email": …, "time": …}`, `time` an RFC 3339 timestamp in UTC, such as `2026-01-02T03:04:05Z` |
 | `message` | the whole message, as written, its last newline included when it has one |
-| `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it; always `null` until the hub records changes |
+| `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it (a change that landed it first, then the lowest number); `version` is the highest version with the commit as its head or, for a landed commit, the version whose head it was landed from, `null` when there is none; on a task fork's slug, only the parent's changes whose source is the fork; `null` for a commit of no change |
 | `session_id` | the agent session that introduced the commit; always `null` until the hub records sessions |
 | `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
 
@@ -3233,7 +3236,13 @@ between is `409` `ref_moved`, with the commit it is at now in
 changes. An accepted write emits one `parley.git.push` event per ref, with
 `via` `"api"`, as a push does with `via` `"git"`, and the hub's ref writer
 tells the post-push listeners of it as of a push, with `via` `"api"` and
-the request's session; a refused write tells them nothing.
+the request's session; a refused write tells them nothing. As for a push,
+a branch that is the source of a draft or open change records the change's
+next version when the write moves it, in the store transaction of the
+move: of kind `commit` for a commit, `ref` for a ref move and `rebase` for
+a rebase (see [Changes](#changes)). A failure to record it, such as `400`
+`unknown_session` for a session the change component refuses, is the
+write's answer, and the branch does not move.
 
 The commit and the rebase route take a `session_id`, the agent session the
 write belongs to. It is checked after the body and before the branch is
@@ -3356,9 +3365,10 @@ and before the branch moves, and its refusal is the answer, unchanged
 (such as `403` `insufficient_scope`, `400` `target_not_found` or `409`
 `change_exists`), with nothing moved; once the branch has moved the change
 is opened, in a task fork in its parent, and `change` names it with
-version 1. No change component is registered yet, so a `change` object is
-`400` `invalid_request` (`this hub cannot open a change: no change
-component is registered`). In a task fork whose `auto_change` is `true`, a
+version 1 of kind `commit`, with the request's `session_id` as its
+session. The change component checks it as `POST
+/api/v1/workspaces/{slug}/changes` does, without the check of a
+path-scoped token's paths, which the push rules made of the commit. In a task fork whose `auto_change` is `true`, a
 commit without a `change` object to a branch that is the source of no
 draft or open change asks the change component to open one in the parent,
 with the fork's branch as source and the fork's base branch
@@ -3549,6 +3559,317 @@ compare-and-swap.
 | `409` `ref_moved` | the branch is not at `expected_head_sha`, or moved while the commits were replayed; `details.current_sha` is where it is |
 | `409` `rebase_conflict` | a commit does not apply; `details` is the conflict report |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
+
+## Changes
+
+A change is a numbered proposal to add the commits of a source branch to a
+target branch. It belongs to the workspace that holds its target branch
+(the target workspace) and is numbered there from 1; a number is never
+given twice, also after its change was abandoned. Its reference is
+`<workspace_slug>#<number>`, such as `demo#1`. The source branch is a
+branch of the target workspace or of a task fork of it.
+
+Every head the source branch had is a version, numbered from 1. The head
+of each version stays fetchable at `refs/parley/changes/<number>/<version>`
+in the target workspace's repository; for a fork source the commit is
+copied there from the fork.
+
+The change object:
+
+```json
+{"workspace_slug":"demo","number":1,"ref":"demo#1","title":"Add x","intent":"Because y","state":"open","target_branch":"main","source":{"workspace_slug":"demo","branch":"feat"},"version":1,"head_sha":"0b86db2bc73da0f067ec404140cfc00060162383","base_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","depends_on":null,"dependants":[],"author":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"sessions":[],"mergeable":"unknown","conflict":null,"needs_restack":false,"restack_reason":null,"stats":{"commits":1,"files_changed":1,"insertions":1,"deletions":0},"paths":["feat.txt"],"paths_truncated":false,"landing":{"status":"ready","reason":null,"requirements":[]},"auto_land":false,"labels":["docs"],"landed":null,"reverts":null,"reverted_by":null,"created_at":"2026-11-15T13:12:13Z","updated_at":"2026-11-15T13:12:13Z"}
+```
+
+| Member | Meaning |
+|---|---|
+| `state` | `draft`, `open`, `landed` or `abandoned` |
+| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; the empty string when the head shares no history with the target branch |
+| `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
+| `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
+| `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
+| `mergeable`, `conflict` | `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` |
+| `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why |
+| `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha` |
+| `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
+| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked, else `null`, and the policy's `requirements` |
+| `landed` | how it landed, `null` until then: `sha`, `at`, `by` (an author object), `land_id` and `commits`, each `{version_sha, landed_sha}` |
+| `reverts`, `reverted_by` | the number of the change it reverts, and of the change that reverts it, `null` for none |
+
+Arrays are never `null`; times are RFC 3339 in UTC with whole seconds.
+
+A version has `number`, `head_sha`, `base_sha`, `kind` (`push`, `commit`,
+`ref`, `rebase`, `restack`, `revert`, `sync`), `patch_equivalent_to` (the
+latest earlier version whose diff against its own base is the same, file by
+file, as the interdiff below compares them, white space included, `null`
+for none), `created_by` (an author object), `session_id`, `stats` and
+`created_at`. A version recorded for a head that was already on the source
+branch, such as version 1 of a change opened through the route below, has
+kind `ref`.
+
+Every move of the source branch of a draft or open change to a new head
+records the next version in the same store transaction as the move, before
+the write is answered: a git push (kind `push`), a commit (`commit`), a ref
+move (`ref`) and a rebase (`rebase`) through the [source control
+writes](#source-control-writes), each by its caller and in its session;
+and a sync from origin (`sync`), by the hub (`created_by.actor_type`
+`system`). A direct push to a protected branch and a landing record none.
+A git push that deletes the source branch abandons the change; the
+deletion of its task fork abandons every draft and open change from it,
+and the deletion of the target workspace deletes its changes. Each
+abandonment writes `parley.change.abandon`, its `reason` `source_deleted`
+or `source_workspace_deleted`. The versions and their refs stay.
+
+## `POST /api/v1/workspaces/{slug}/changes`
+
+Opens a change in the workspace `{slug}`, the target workspace. It needs,
+for a personal access token, `changes:write`, read access to `{slug}` and
+write access to the source workspace: an org member who only reads
+`{slug}` opens a change from a branch of their own task fork of it. A
+token bound to a task fork reaches the fork's parent on this route only to
+open a change whose `source.workspace_slug` is that fork; any other bound
+token opens only from a workspace its binding covers. The body:
+
+| Member | Meaning |
+|---|---|
+| `source` | required: `{"workspace_slug"?, "branch"}`; `workspace_slug` defaults to `{slug}` |
+| `target_branch` | defaults to the fork's base branch for a fork source, else to the workspace's default branch |
+| `title` | one line of at most 200 characters; defaults to the subject of the head commit, cut to 200 characters |
+| `intent` | at most 16,000 characters; defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters; required (not empty or white space) unless `draft` is `true` or the target's setting `changes.require_intent` is `false` |
+| `draft` | `true` opens the change as a draft |
+| `depends_on` | the number of the change this one depends on, a positive integer |
+| `auto_land` | defaults to `false` |
+| `labels` | defaults to `[]`; at most 20, each matching `^[a-z0-9][a-z0-9_.:/-]{0,62}$`; a repeated label is kept once |
+| `session_id` | defaults to the session recorded on the source fork; a defaulted session the session rule refuses is dropped |
+
+```json
+{"source":{"branch":"feat"},"labels":["docs"]}
+```
+
+The answer is `201` with the change object, at version 1: the head of the
+source branch, of kind `ref`, written at `refs/parley/changes/<number>/1`.
+`mergeable` is `unknown`. A draft has `landing`
+`{"status":"blocked","reason":"draft","requirements":[]}`; any other
+change the landing evaluation's answer, which until the hub has a landing
+policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
+hub has a session feature, every `session_id` is refused and a defaulted
+one dropped.
+
+The open writes `parley.change.version` for version 1, with `ref`,
+`version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to` and
+`draft` in its metadata, then, unless the change is a draft,
+`parley.change.open`, with `ref`, `version`, `head_sha`, `title`,
+`target_branch`, `source_workspace`, `source_branch`, `depends_on` and
+`was_draft` (`false`). Both have `resource_type` `change`, `resource_id`
+the number, the target workspace and the change's session. A refused open
+writes no change, version, ref under `refs/parley/changes` or event.
+
+The checks run in this order, and a request that fails several gets the
+answer of the first: the token's binding; the scope and read access to
+`{slug}`; the body; `session_id`; write access to the source workspace;
+the state of the target and the source workspace; the target branch
+exists; it is not the integration branch of a carry-patch workspace; the
+source workspace is `{slug}` or a fork of it; the source branch exists;
+it is not the target branch of the same workspace; it has a commit the
+target branch lacks; none of those is a merge commit; no draft or open
+change has this source; the title and the intent; for a path-scoped
+token, every file the version changes against its base matches one of
+the token's globs. Of two opens of one source at the same time, one
+answers `201` and the other `409` `change_exists`.
+
+| Status | When |
+|---|---|
+| `201 Created` | the change, as above; a replay of a recorded `Idempotency-Key` with the same body answers the first answer |
+| `400` `invalid_request` | a body member of the wrong type; no `source.branch`; more than 20 labels or a label that does not match; a `depends_on` below 1; the source branch is the target branch of the same workspace; a title that is empty, longer than 200 characters or more than one line, also no `title` while the head commit has no subject; an intent longer than 16,000 characters |
+| `400` `intent_required` | the intent is empty or white space, the change is not a draft and the target requires an intent |
+| `400` `merge_commits_unsupported` | a merge commit is among the commits the target branch lacks |
+| `400` `nothing_to_land` | the source branch has no commit the target branch lacks |
+| `400` `source_not_related` | the source workspace does not exist, the caller cannot see it, or it is neither `{slug}` nor a fork of it |
+| `400` `source_not_found` | no branch `source.branch` in the source workspace |
+| `400` `target_not_found` | no branch `target_branch` in the target workspace |
+| `400` `unknown_session` | the `session_id` is not accepted |
+| `403` `forbidden` | the caller reads the source workspace but cannot write it |
+| `403` `insufficient_scope` | a personal access token without `changes:write` |
+| `403` `integration_branch` | `target_branch` is the integration branch of a carry-patch workspace, which the hub rebuilds |
+| `403` `path_not_allowed` | a path-scoped token, and a file of the version matches none of its globs; `error.path` names the first such file in byte order |
+| `403` `token_bound` | a token bound to a task fork, on the fork's parent, with another `source.workspace_slug` or none |
+| `404` `not_found` | the caller cannot read `{slug}` |
+| `409` `change_exists` | another draft or open change has this source; `details` is `{"workspace_slug", "number", "ref"}` of that change |
+| `409` `workspace_busy` | the target or the source workspace is pending, cloning, or under a reclone, archive or delete |
+| `409` `workspace_not_ready` | the target or the source workspace failed its clone |
+| `409` `workspace_archived` | the target or the source workspace is archived |
+| `409` `conflict` | the `Idempotency-Key` was used with another body |
+
+## Reading a change
+
+`GET /api/v1/workspaces/{slug}/changes/{number}`,
+`GET /api/v1/workspaces/{slug}/changes/{number}/versions`,
+`GET /api/v1/workspaces/{slug}/changes/{number}/versions/{version}`,
+`GET /api/v1/workspaces/{slug}/changes/{number}/diff` (see
+[below](#get-apiv1workspacesslugchangesnumberdiff)) and
+`GET /api/v1/workspaces/{slug}/changes/by-commit/{sha}` read a change of
+the workspace `{slug}`. Each needs, for a personal access token,
+`changes:read`, and read access to `{slug}`; a token without the scope is
+answered `403` `insufficient_scope` also when `{slug}` names no workspace,
+and a caller who cannot read `{slug}` `404` `not_found`, as for a slug
+that names none. `by-commit` is a path segment of its own: `{number}` is
+never `by-commit`.
+
+A change of `{slug}` that the request cannot name answers `404`
+`change_not_found` on the routes under `…/changes/{number}`: a `{number}` that is not a
+positive integer, a number `{slug}` does not have, and any number on a task
+fork's slug, since a fork holds no changes (its changes belong to its
+parent). A token bound to a task fork reaches these five routes on the
+fork's parent, and there only the changes whose `source.workspace_slug` is
+that fork: every other change answers `404` `change_not_found` as if it did
+not exist, and `by-commit` finds only those changes.
+
+`GET …/changes/{number}` answers `200` with the change object. `include`, a
+comma list of `versions`, `approvals`, `checks`, `stack` and `overlaps`
+(also given more than once), adds a member of that name after the change's
+own: `versions` the list of versions, oldest first; each other name what
+the hub's feature for it computes, and no member while the hub has none
+(none has one yet). Any other name, the empty name included, answers `400`
+`invalid_request`.
+
+`GET …/changes/{number}/versions` answers `200` with the versions, oldest
+first, in the list envelope `{"items":[…],"next_cursor":…}`, paged by
+`limit` and `cursor` as every list. Each item is a version object.
+
+`GET …/changes/{number}/versions/{version}` answers `200` with one version
+object, `{version}` a version number or `latest`, the current version,
+plus `ref`, the name of its version ref:
+
+```json
+{"number":2,"head_sha":"…","base_sha":"…","kind":"push","patch_equivalent_to":null,"created_by":{"actor_type":"api_key","actor_id":"…","username":"owner"},"session_id":null,"stats":{"commits":2,"files_changed":1,"insertions":1,"deletions":0},"created_at":"2026-11-15T13:12:13Z","ref":"refs/parley/changes/1/2"}
+```
+
+A `{version}` that is neither a positive integer nor `latest` answers `400`
+`invalid_request`; a number the change does not have, `404` `not_found`.
+
+`GET …/changes/by-commit/{sha}` finds the change of `{slug}` that landed
+the commit `{sha}`, a full commit id of 40 hexadecimal characters, or has
+it as the head of a version. A change that landed it comes first, then the
+lowest number. The answer is `200` with
+`{"change": <change object>, "version": <int or null>, "landed": <bool>}`:
+`version` is the highest version of the change with this head, or, for a
+commit the change landed, the version it was landed from, `null` when
+there is none; `landed` is `true` only for a commit the change landed. A
+commit that is neither, also an inner commit of a version, and any commit
+on a task fork's slug, answers `404` `change_not_found`; a `{sha}` that is
+not 40 hexadecimal characters `400` `invalid_request`.
+
+## `GET /api/v1/workspaces/{slug}/changes/{number}/diff`
+
+Answers the diff of a version of the change, or, with `against`, the
+interdiff of two versions: what moved between them, with what a rebase
+brought in left out. It needs what the other reads of a change need (see
+[Reading a change](#reading-a-change)), and answers a change it cannot
+name as they do. All git work happens in the target workspace's
+repository, where every version's head is held under its version ref, a
+fork source's too. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `version` | a version number or `latest` (the default), the current version |
+| `against` | a version number; with it the answer is the interdiff of `version` and `against` |
+| `path` | a glob, repeatable, as on [`…/scm/diff`](#get-apiv1workspacesslugscmdiff): only the files whose path one of them matches are answered and counted |
+| `patches` | `true` (the default) or `false`; with `false` no file has `patch` |
+| `format` | `json` (the default) or `patch` |
+
+Without `against`, the answer is the diff of the version from its
+`base_sha` to its `head_sha`, computed as `…/scm/diff` computes it in
+`direct` mode, with rename detection, 3 lines of context and the same
+limits (5,000 files, 8 MiB of patch text, then `truncated: true`). It has
+the members of the `…/scm/diff` answer, `base_sha` and `merge_base_sha`
+both the version's `base_sha`, and two more: `version`, the version's
+number, and `against`, `null`.
+
+With `against`, a file is listed when either version touches it against
+its own base, and carries `changed`: `true` when its patch (base to head,
+compared without the `index` line and the hunks' positions) differs
+between the two versions or only one of them touches it, else `false`.
+A changed file is described, with its `patch`, by the diff of the head of
+`against` to the head of `version`, with rename detection: `added` when
+it is only at the head of `version`, `deleted` when it is only at the
+head of `against`, else `modified`. When that diff finds a rename that
+involves a changed file, the rename's one entry (`renamed`, with
+`old_path`) describes both of its paths: it is listed at its new path when
+that is a changed file, else at its old one, and the old path has no entry
+of its own. A changed file whose content is the same at both heads (the
+bases differ) is `modified` with no line changed, `old_sha` and `new_sha`
+both its blob at the heads, and an empty `patch`. An unchanged file
+has no `patch` and is described by the version's own diff (`against`'s
+when only that touches it). `base_sha` is the head of `against`,
+`head_sha` the head of `version`, `merge_base_sha` `null`, `version` and
+`against` the two numbers, and `stats` count the changed files only.
+Two patch-equivalent versions, and a version compared with itself, have no
+changed file. The limits of the plain diff apply.
+
+With `format=patch` the answer is the patch text of the files that would
+carry a `patch`, `Content-Type: text/x-diff`, as on `…/scm/diff`: it
+applies to the tree of `base_sha` (without `against`) or of the head of
+`against`, and a cut answer carries `X-Parley-Truncated: true`.
+
+```json
+{"base_sha":"dd626b3e…","head_sha":"8adab83c…","merge_base_sha":null,"files":[{"path":"a.txt","old_path":null,"status":"modified","insertions":1,"deletions":1,"binary":false,"old_sha":"…","new_sha":"…","changed":false},{"path":"b.txt","old_path":null,"status":"modified","insertions":1,"deletions":0,"binary":false,"old_sha":"…","new_sha":"…","patch":"diff --git a/b.txt b/b.txt\nindex …\n--- a/b.txt\n+++ b/b.txt\n@@ -2,3 +2,4 @@ b1\n b2\n b3\n b4\n+b5\n","changed":true}],"stats":{"files_changed":1,"insertions":1,"deletions":0},"truncated":false,"version":3,"against":1}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the diff or the interdiff, as JSON or as text |
+| `400` `invalid_request` | `version` that is neither a positive integer nor `latest` (`version must be a positive integer or latest`); `against` that is not a positive integer (`against must be a positive integer`); `format` other than `json` or `patch` (`format must be json or patch`); `patches` other than `true` or `false` (`patches must be true or false`) |
+| `404` `change_not_found` | as for the other reads of a change |
+| `404` `not_found` | a `version` or `against` number the change does not have |
+| `404` `ref_not_found` | the base or head commit of a named version is no longer in the repository, such as after a reclone; the change and its versions stay readable |
+
+## `GET /api/v1/workspaces/{slug}/changes`
+
+Lists the changes of the workspace `{slug}`. It needs, for a personal
+access token, `changes:read`, and read access to `{slug}`, answered as for
+the reads of a change above. The answer is `200` with the list envelope
+`{"items":[…],"next_cursor":…}`, paged by `limit` (1 to 200, default 50)
+and `cursor` as every list: following `next_cursor` until it is `null`
+gives every matching change once, whatever the limit. Each item is the
+change object without `conflict`, and without `paths` and
+`paths_truncated` unless `include=paths`; any other `include` value, the
+empty one included, answers `400` `invalid_request`.
+
+Without filters the list holds the changes in state `draft` or `open`,
+the most recently updated first: by `updated_at` descending, as the change
+object shows it (in whole seconds), then by `number` descending.
+`sort=number` orders by `number` ascending instead. The filters combine,
+each narrowing the list:
+
+| Parameter | Keeps the changes |
+|---|---|
+| `state` | in this state: `draft`, `open`, `landed` or `abandoned`; given more than once, in any of them. Without it, `draft` and `open` |
+| `target_branch` | with this target branch |
+| `source_workspace` | whose source branch is in this workspace |
+| `author` | opened by this user id; `me` names the caller's user |
+| `session_id` | to which this session contributed a version, current or earlier |
+| `label` | that carry this label |
+| `path` | that touch, among their stored `paths`, a file this glob matches, in the glob syntax of a token's `paths` (`*` within a path segment, `**` across them) |
+| `mergeable` | `clean`, `conflict` or `unknown` |
+| `landing_status` | whose `landing.status` is `ready`, `pending` or `blocked` |
+| `stack_of` | of the stack of this change, see below |
+
+`stack_of=<number>` lists the stack of that change: the change it reaches
+by following `depends_on` down to the one that depends on nothing, then
+every change that depends on one already listed, level by level, lower
+numbers first within a level. The stack is listed in every state and in
+that order, whatever `state` and `sort` say; the other filters still
+apply. A `stack_of` that names no change the request may see answers `404`
+`change_not_found`.
+
+A `state`, `mergeable` or `landing_status` outside its values, a `sort`
+other than `number`, `author=me` from the admin token, which has no user,
+and a `stack_of` that is not a positive integer answer `400`
+`invalid_request`.
+
+On a task fork's slug the list holds the changes of the fork's parent
+whose `source.workspace_slug` is the fork, with the same filters and
+order; a fork holds no changes of its own. A token bound to a task fork
+lists, on the fork's parent, only the changes whose source is that fork.
 
 ## Admin routes
 
@@ -4598,7 +4919,9 @@ events of a workspace on which, or on whose fork parent, it has a level
 `parley.token.` and `parley.webhook.`), and an event of no workspace when its `metadata.scope`
 is `user` with the user's id, or `org` with an active org the user is a
 member of. A workspace-bound PAT sees, under its user's level, only the
-events of the workspaces its binding covers, and no event of no workspace.
+events of the workspaces its binding covers, and no event of no workspace;
+a token bound to a task fork also sees the change events (`resource_type`
+`change`) of the fork's parent whose change has the fork as its source.
 
 **Long-poll.** With `wait` above 0 and nothing to return, the hub holds the
 request until a visible, matching event is committed, and then answers with

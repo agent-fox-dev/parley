@@ -27,7 +27,7 @@ type commitObject struct {
 	Change    *CommitChange `json:"change"`
 	SessionID *string       `json:"session_id"`
 	// Stats is present only where the caller asks for it.
-	Stats *diffStats `json:"stats,omitempty"`
+	Stats *DiffStats `json:"stats,omitempty"`
 }
 
 // commitsPosition is where a commit listing continues: the commit its first
@@ -162,10 +162,10 @@ func (c *Component) getCommit(w http.ResponseWriter, r *http.Request) error {
 	}
 	answer := struct {
 		commitObject
-		Files *[]fileChange `json:"files,omitempty"`
+		Files *[]FileChange `json:"files,omitempty"`
 	}{commitObject: objs[0]}
 	if withFiles {
-		files := fileChanges(changes)
+		files := FileChanges(changes)
 		answer.Files = &files
 	}
 	server.WriteJSON(w, http.StatusOK, answer)
