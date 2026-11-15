@@ -3,7 +3,7 @@
   "spec_id": "22",
   "spec_name": "change_opening_and_versions",
   "schema_version": 3,
-  "updated_at": "2026-11-15T14:55:01Z",
+  "updated_at": "2026-11-15T14:58:06Z",
   "tasks": [
     {
       "id": 1,
@@ -47,7 +47,7 @@
     },
     {
       "id": 11,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
