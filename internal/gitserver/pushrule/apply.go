@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -48,9 +49,14 @@ const (
 // its before value when the refs were written.
 const ErrorTypeRefMoved = "ref_moved"
 
+// DefaultForwardLimit is how long a forward to origin may run when
+// WriterDeps.ForwardLimit is zero.
+const DefaultForwardLimit = 120 * time.Second
+
 const (
-	msgNotUpdated = "not updated: another ref in this push was refused"
-	msgRefMoved   = "ref changed since it was read; fetch and try again"
+	msgNotUpdated      = "not updated: another ref in this push was refused"
+	msgForwardTimedOut = "origin rejected push: timed out"
+	msgRefMoved        = "ref changed since it was read; fetch and try again"
 )
 
 // Version is the version of a change a ref-updated stage recorded for an
@@ -106,6 +112,9 @@ type WriterDeps struct {
 	Transact func(ctx context.Context, fn func(*sql.Tx) error) error
 	Heads    HeadSetter
 	Logger   *slog.Logger
+	// ForwardLimit is how long each forward to origin may run; zero means
+	// DefaultForwardLimit. Tests shorten it.
+	ForwardLimit time.Duration
 }
 
 // Writer is the ref writer: the one way the git server, the source control
@@ -182,8 +191,11 @@ type Result struct {
 func (r Result) Refused() bool { return r.Outcome != OutcomeAccepted }
 
 // Apply writes the request: every ref of it, or none. A verdict that
-// refuses an update writes nothing, and every update it allows is
-// answered that it was not updated. Otherwise the refs are moved in one
+// refuses an update writes nothing and runs no forward, and every update
+// it allows is answered that it was not updated. Otherwise the pending
+// forwards to origin run first, in command order, each under the forward
+// limit; one that fails or outlasts its limit refuses the request with
+// OutcomeRefused before any ref is written. Then the refs are moved in one
 // compare-and-swap transaction of git's against their before values: it is
 // prepared, BeforeCommit runs, the ref-updated stages run in one store
 // transaction, and the refs then move just before that transaction
@@ -228,6 +240,9 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 	if req.Repo == nil {
 		return res.internal(), errors.New("apply: no repository to write to")
 	}
+	if refusedRes, ok, err := res.forward(ctx, deps.ForwardLimit, req.Verdict.Decisions); !ok {
+		return refusedRes, err
+	}
 	tx, err := req.Repo.PrepareRefs(ctx, refUpdates(req.Verdict.Decisions))
 	var refErr *gitrepo.RefError
 	switch {
@@ -256,6 +271,49 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 	res.Outcome = OutcomeAccepted
 	w.afterWrite(ctx, logger, deps.Heads, forkActivity, req)
 	return res, nil
+}
+
+// forward runs the pending forwards of ds to origin, in command order, each
+// under limit (DefaultForwardLimit when zero), and reports whether all of
+// them went through. The first that fails, or has not finished when its
+// limit passes, stops the request: no later forward runs, the earlier ones
+// are left as origin has them, since a forward cannot be taken back, and
+// the result refuses that update with the forward's message, or the
+// timed-out one, as patch_branch, and the others as not updated. A forward
+// is expected to end when its context does. When ctx itself ends, every
+// update is refused as internal with ctx's error.
+func (r Result) forward(ctx context.Context, limit time.Duration, ds []Decision) (Result, bool, error) {
+	if limit <= 0 {
+		limit = DefaultForwardLimit
+	}
+	for i, d := range ds {
+		if d.Forward == nil {
+			continue
+		}
+		fctx, cancel := context.WithTimeout(ctx, limit)
+		err := d.Forward(fctx)
+		timedOut := errors.Is(fctx.Err(), context.DeadlineExceeded)
+		cancel()
+		var message string
+		switch {
+		case ctx.Err() != nil:
+			return r.internal(), false, ctx.Err()
+		case timedOut:
+			message = msgForwardTimedOut
+		case err != nil:
+			message = err.Error()
+		default:
+			continue
+		}
+		r.Outcome = OutcomeRefused
+		for j := range r.Updates {
+			u := r.Updates[j].Update
+			r.Updates[j] = UpdateResult{Decision: Decision{Update: u, Message: msgNotUpdated}}
+		}
+		r.Updates[i].Decision = Decision{Update: d.Update, Message: message, ErrorType: ErrorTypePatchBranch}
+		return r, false, nil
+	}
+	return r, true, nil
 }
 
 // commit is the commit step of an accepted request whose ref transaction tx

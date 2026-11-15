@@ -56,3 +56,19 @@ transaction to run the ref-updated stages in. With stages registered it
 aborts the ref transaction and refuses every update as internal, rather
 than moving refs whose stages did not run; with none it moves the refs.
 The hub always binds `rt.Store.Tx`.
+
+## A forward is waited for, and only its own limit is a time-out
+
+The package has the ref writer cancel a forward that has not finished
+within 120 seconds and refuse the request with `origin rejected push:
+timed out`, and leaves open what a forward that returns late, or a request
+that ends meanwhile, does. `Writer.Apply` runs each forward on the
+request's goroutine and waits for it to return; a forward must end when its
+context does, as one running git through `internal/gitrepo` does. When its
+limit (`WriterDeps.ForwardLimit`, default `pushrule.DefaultForwardLimit`,
+120 s) has passed by the time it returns, the update is refused as timed
+out with `patch_branch` even if the forward reports success, since it did
+not finish within the limit. When the request's own context ends during a
+forward (the push's `[git].timeout`, or the client gone), the request is
+refused as `internal` and `Apply` returns the context's error, as for any
+other step that the request's end stops.

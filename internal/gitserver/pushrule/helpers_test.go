@@ -365,3 +365,26 @@ func (r *reports) SetHead(_ context.Context, slug, id string) error {
 	r.got = append(r.got, slug+" "+id)
 	return nil
 }
+
+// forwards makes forwards to origin that record, in order, each run: the
+// ref forwarded and the value it held in the repository at dir then.
+type forwards struct {
+	dir    string
+	runs   []string
+	ctxErr error // what the context of a forward that blocked said once it ended
+}
+
+// of is a forward of ref that records its run and answers err; one that
+// blocks waits for its context to end and answers the context's error.
+func (f *forwards) of(ref string, err error, blocks bool) pushrule.Forward {
+	return func(ctx context.Context) error {
+		at, _ := gitrepotest.Run(f.dir, "", "rev-parse", "--verify", "--quiet", ref)
+		f.runs = append(f.runs, ref+"="+strings.TrimSpace(at))
+		if blocks {
+			<-ctx.Done()
+			f.ctxErr = ctx.Err()
+			return f.ctxErr
+		}
+		return err
+	}
+}

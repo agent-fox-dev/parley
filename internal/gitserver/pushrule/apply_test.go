@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -295,5 +296,89 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 	}
 	if got := gitrepotest.Git(t, r.dir, "rev-parse", "main"); got != b {
 		t.Errorf("main = %.7s after the stale land, want %.7s", got, b)
+	}
+}
+
+func TestApply_RunsTheForwardsInCommandOrderBeforeAnyRefIsWritten(t *testing.T) {
+	r := newRepo(t)
+	f := &forwards{dir: r.dir}
+	var w pushrule.Writer
+	v := allowed(move("refs/heads/patch/a", r.head, r.side), move("refs/heads/feat", r.head, r.side), create("refs/heads/patch/b", r.side))
+	v.Decisions[0].Forward = f.of("refs/heads/patch/a", nil, false)
+	v.Decisions[2].Forward = f.of("refs/heads/patch/b", nil, false)
+	res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: v, Repo: r.view, Workspace: demoCP, Caller: ownerKey, Via: pushrule.ViaGit})
+	if err != nil || res.Outcome != pushrule.OutcomeAccepted {
+		t.Fatalf("Apply = %+v, %v, want accepted", res, err)
+	}
+	if want := []string{"refs/heads/patch/a=" + r.head, "refs/heads/patch/b="}; !slices.Equal(f.runs, want) {
+		t.Errorf("forwards ran %v, want %v: each once, in command order, with its ref at its before", f.runs, want)
+	}
+	if heads := gitrepotest.Refs(t, r.dir, "refs/heads/"); heads["patch/a"] != r.side || heads["feat"] != r.side || heads["patch/b"] != r.side {
+		t.Errorf("refs = %v, want patch/a, feat and patch/b at %.7s", heads, r.side)
+	}
+
+	refsBefore := gitrepotest.Refs(t, r.dir, "")
+	v = allowed(move("refs/heads/patch/a", r.side, r.head))
+	v.Decisions[0].Forward = f.of("refs/heads/patch/a", nil, false)
+	v.Decisions = append(v.Decisions, pushrule.Decision{Update: create("refs/parley/x", r.side), Message: "refs/parley/ is maintained by the hub and cannot be pushed to", ErrorType: pushrule.ErrorTypeHubOwnedRef})
+	if res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: v, Repo: r.view, Workspace: demoCP, Caller: ownerKey, Via: pushrule.ViaGit}); err != nil || res.Outcome != pushrule.OutcomeRefused {
+		t.Errorf("Apply of a refused verdict = %+v, %v, want refused", res, err)
+	}
+	if len(f.runs) != 2 {
+		t.Errorf("forwards ran %v after a refused verdict, want no further run", f.runs)
+	}
+	if got := gitrepotest.Refs(t, r.dir, ""); !maps.Equal(got, refsBefore) {
+		t.Errorf("refs = %v, want them unchanged", got)
+	}
+}
+
+func TestApply_RefusesTheWholeRequestWhenAForwardFailsOrOutlastsItsLimit(t *testing.T) {
+	if pushrule.DefaultForwardLimit != 120*time.Second {
+		t.Errorf("the default forward limit is %v, want 2m0s", pushrule.DefaultForwardLimit)
+	}
+	for _, tc := range []struct {
+		name    string
+		err     error
+		blocks  bool
+		message string
+	}{
+		{name: "origin rejects the second forward", err: errors.New("origin rejected push: non-fast-forward"), message: "origin rejected push: non-fast-forward"},
+		{name: "the second forward outlasts its limit", blocks: true, message: "origin rejected push: timed out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRepo(t)
+			f := &forwards{dir: r.dir}
+			var log []string
+			var w pushrule.Writer
+			w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx, ForwardLimit: 50 * time.Millisecond})
+			w.RegisterRefUpdatedStage((&stage{name: "s", log: &log, dir: r.dir}).run)
+			v := allowed(move("refs/heads/patch/a", r.head, r.side), create("refs/heads/patch/b", r.side), create("refs/heads/patch/c", r.side))
+			v.Decisions[0].Forward = f.of("refs/heads/patch/a", nil, false)
+			v.Decisions[1].Forward = f.of("refs/heads/patch/b", tc.err, tc.blocks)
+			v.Decisions[2].Forward = f.of("refs/heads/patch/c", nil, false)
+			refsBefore := gitrepotest.Refs(t, r.dir, "")
+			res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: v, Repo: r.view, Workspace: demoCP, Caller: ownerKey, Via: pushrule.ViaGit})
+			if err != nil || res.Outcome != pushrule.OutcomeRefused || !res.Refused() || len(res.Updates) != 3 {
+				t.Fatalf("Apply = %+v, %v, want the request refused", res, err)
+			}
+			want := []outcome{{Message: msgNotUpdated}, refused(tc.message, pushrule.ErrorTypePatchBranch), {Message: msgNotUpdated}}
+			for i, u := range res.Updates {
+				if got := outcomeOf(u.Decision); got != want[i] {
+					t.Errorf("%s: %+v, want %+v", u.Ref, got, want[i])
+				}
+			}
+			if want := []string{"refs/heads/patch/a=" + r.head, "refs/heads/patch/b="}; !slices.Equal(f.runs, want) {
+				t.Errorf("forwards ran %v, want %v: the earlier one once and left as it is, no later one", f.runs, want)
+			}
+			if tc.blocks && f.ctxErr == nil {
+				t.Error("the forward that outlasted its limit did not see its context end")
+			}
+			if got := gitrepotest.Refs(t, r.dir, ""); !maps.Equal(got, refsBefore) {
+				t.Errorf("refs = %v, want them unchanged %v", got, refsBefore)
+			}
+			if len(log) != 0 {
+				t.Errorf("stages called %v, want none", log)
+			}
+		})
 	}
 }
