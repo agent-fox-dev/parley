@@ -3054,7 +3054,7 @@ writes the whole answer; otherwise the component serves it (`fetch.go`):
   push the mapping stage (`MappingStage`, registered with
   `RegisterMappingStage`), given the accepted updates with their direct
   flags and versions, whose lines go on the side band (`ChangeMapper`,
-  `changemap.go`, is one, which the hub does not register yet: it takes
+  `changemap.go`, is the one the hub's changes part registers: it takes
   each created or updated branch in command order, through a
   `ChangeService`, to one `Outcome`: a version the ref writer reported is
   a new version, with no call; otherwise the branch's draft or open change
@@ -3699,6 +3699,20 @@ call them:
   `ReadChange`, "" for a change that does not exist.
 - the git server's fork view (`forkView`) names the numbers of
   `ChangeNumbersOfSource` as `gitserver.ForkRefs.Changes`.
+- `c.Receiver().RegisterMappingStage`: a `gitserver.ChangeMapper` over
+  `pushChanges`, created with no logger and bound to the hub's logger
+  (`ChangeMapper.Bind`) in the start hook. `pushChanges` is the mapper's
+  `gitserver.ChangeService`: `OpenChangeOfBranch` is the component's;
+  `OpenChange` is `Open` in a `Store.Tx` of its own, since the mapping
+  runs after the push's ref transaction, with version kind `push`,
+  `AfterMove`, no `CheckPaths`, the push's session as `TriggerSession`,
+  and the request's target branch, title, intent and draft flag (nil
+  being the defaults), and answers a `409 change_exists` with
+  `*gitserver.ChangeExistsError` naming the change `OpenChangeOfBranch`
+  finds; `RecordPushVersion` is `RecordVersion` of kind `push` and then
+  `OpenChangeOfBranch`, in one `Store.Tx`, as the ref-updated stage
+  reports a version. The caller is `change.CallerOf` of a PAT's principal,
+  and otherwise the push caller's user, credential type and id.
 
 The route `POST /workspaces/:slug/changes` (`routes.go`; scope
 `changes:write`, read access to `:slug`, an idempotent create, and on the

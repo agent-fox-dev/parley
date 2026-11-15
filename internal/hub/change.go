@@ -10,7 +10,10 @@ import (
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitserver"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/scm"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -51,7 +54,12 @@ const changeHook = "changes"
 //   - the event log asks a change's source workspace, so that a token bound
 //     to a fork reads the change events of its parent that are the fork's;
 //   - the git server's fork view advertises the version refs of the
-//     changes from a fork (forkView).
+//     changes from a fork (forkView);
+//   - the push processor's mapping stage, a change mapper over the
+//     component (pushChanges), turns each branch of an accepted push into
+//     the version or the change it makes and tells the git client, after
+//     the refs moved and before the push is answered; it is bound to the
+//     hub's logger in the start hook.
 //
 // No session linker, stack linker, landing evaluator or auto_land guard is
 // registered: without a session linker an explicit session_id is refused
@@ -79,6 +87,8 @@ func composeChanges(c *Composition) {
 		return comp.WorkspaceDeleted(ctx, tx, slug)
 	})
 	c.forks.RegisterChangeReader(forkChanges{comp})
+	mapper := gitserver.NewChangeMapper(pushChanges{comp, c.runtime}, nil)
+	c.receiver.RegisterMappingStage(mapper)
 	comp.RegisterForkActivity(forkActivity{c.forks})
 	c.events.SetChangeSources(event.ChangeSourcesFunc(func(ctx context.Context, workspace string, number int64) (string, error) {
 		ch, err := comp.ReadChange(ctx, nil, workspace, number)
@@ -104,6 +114,7 @@ func composeChanges(c *Composition) {
 			adjust(&d)
 		}
 		comp.Bind(d)
+		mapper.Bind(rt.Logger)
 		return nil
 	})
 }
@@ -184,6 +195,85 @@ func openingInput(o scm.ChangeOpening) change.OpenInput {
 		}
 	}
 	return in
+}
+
+// pushChanges is the change service of the push processor's mapping stage:
+// the change component's lookup of a branch's change, its open of the
+// change a push asks for, and the version of a change another push opened
+// first, each write in a store transaction of its own, since the mapping
+// runs once the push's refs moved, outside the ref writer's transaction. A
+// change a push opens has version 1 of kind push, and the open reads the
+// branch again in its transaction, so that a write that moved it in between
+// is its next version (change.OpenInput.AfterMove).
+type pushChanges struct {
+	changes *change.Component
+	rt      *Runtime
+}
+
+func (p pushChanges) OpenChangeOfBranch(ctx context.Context, source, branch string) (*gitserver.BranchChange, error) {
+	b, found, err := p.changes.OpenChangeOfBranch(ctx, nil, source, branch)
+	if err != nil || !found {
+		return nil, err
+	}
+	return &gitserver.BranchChange{Workspace: b.WorkspaceSlug, Number: int(b.Number)}, nil
+}
+
+// RecordPushVersion records the version and names the change it was
+// recorded for in one transaction, as the ref-updated stage does.
+func (p pushChanges) RecordPushVersion(ctx context.Context, req gitserver.VersionRequest) (*pushrule.Version, error) {
+	var out *pushrule.Version
+	err := p.rt.Store.Tx(ctx, func(tx *sql.Tx) error {
+		v, err := p.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: req.Source, Branch: req.Branch, Head: req.Head,
+			Kind: change.KindPush, Caller: pushCaller(req.Caller), SessionID: req.SessionID})
+		if err != nil || v == nil {
+			return err
+		}
+		ch, _, err := p.changes.OpenChangeOfBranch(ctx, tx, req.Source, req.Branch)
+		if err != nil {
+			return err
+		}
+		out = &pushrule.Version{WorkspaceSlug: ch.WorkspaceSlug, Number: int(ch.Number), Version: int(v.Number)}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// OpenChange opens the change with what the push named, nil being the
+// defaults, and its session as the trigger's. The component's change_exists
+// names the change that has the source only in its details, so the
+// refusal is answered with the change the lookup finds.
+func (p pushChanges) OpenChange(ctx context.Context, req gitserver.OpenRequest) (gitserver.OpenedChange, error) {
+	in := change.OpenInput{Workspace: req.Workspace, SourceWorkspace: req.Source, SourceBranch: req.Branch, Head: req.Head,
+		TargetBranch: req.Target, Title: req.Title, Intent: req.Intent, TriggerSession: req.SessionID, Draft: req.Draft,
+		Caller: pushCaller(req.Caller), Kind: change.KindPush, AfterMove: true}
+	var ch change.Change
+	err := p.rt.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		ch, err = p.changes.Open(ctx, tx, in)
+		return err
+	})
+	var refusal *server.Error
+	if errors.As(err, &refusal) && refusal.Type() == "change_exists" {
+		if b, found, lerr := p.changes.OpenChangeOfBranch(ctx, nil, req.Source, req.Branch); lerr == nil && found {
+			return gitserver.OpenedChange{}, &gitserver.ChangeExistsError{Workspace: b.WorkspaceSlug, Number: int(b.Number)}
+		}
+	}
+	if err != nil {
+		return gitserver.OpenedChange{}, err
+	}
+	return gitserver.OpenedChange{Workspace: ch.WorkspaceSlug, Number: int(ch.Number), Draft: ch.State == change.StateDraft}, nil
+}
+
+// pushCaller is the change component's caller a push's caller is: a PAT
+// as the credential check read it, with its paths and its binding, and
+// any other credential by its user, type and id.
+func pushCaller(c gitserver.PushCaller) change.Caller {
+	if c.PAT != nil {
+		return change.CallerOf(*c.PAT)
+	}
+	return change.Caller{UserID: c.UserID, Credential: change.Credential{Type: c.CredentialType, ID: c.CredentialID}}
 }
 
 // changeLookup is the source control reads' lookup of the change of a

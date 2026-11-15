@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -116,13 +117,23 @@ type Outcome struct {
 // ChangeMapper is the mapping of an accepted push to changes.
 type ChangeMapper struct {
 	changes ChangeService
-	logger  *slog.Logger
+	// mu guards logger, which Bind may set once the mapper is registered.
+	mu     sync.RWMutex
+	logger *slog.Logger
 }
 
 // NewChangeMapper returns the mapping that works with changes and logs
 // the failures that are not the client's doing to logger, nil for none.
 func NewChangeMapper(changes ChangeService, logger *slog.Logger) *ChangeMapper {
 	return &ChangeMapper{changes: changes, logger: logger}
+}
+
+// Bind sets the logger of the failures that are not the client's doing,
+// for a mapper registered before the hub's logger exists.
+func (m *ChangeMapper) Bind(logger *slog.Logger) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logger = logger
 }
 
 // MapPush is the mapping stage: it maps the push in and returns the lines
@@ -229,8 +240,11 @@ func versionOutcome(branch string, v *pushrule.Version) Outcome {
 // error is logged and its text never sent, since it may name what the
 // client must not see.
 func (m *ChangeMapper) failed(ctx context.Context, in MappingInput, branch string, err error) Outcome {
-	if m.logger != nil {
-		m.logger.LogAttrs(ctx, slog.LevelError, "git push change mapping failed",
+	m.mu.RLock()
+	logger := m.logger
+	m.mu.RUnlock()
+	if logger != nil {
+		logger.LogAttrs(ctx, slog.LevelError, "git push change mapping failed",
 			slog.String("request_id", server.RequestID(ctx)),
 			slog.String("workspace", in.Workspace.Slug),
 			slog.String("branch", branch),

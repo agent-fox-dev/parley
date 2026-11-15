@@ -1,13 +1,22 @@
 package gitserver_test
 
 import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/hub"
@@ -28,11 +37,12 @@ func acceptingSessions(c *hub.Composition) {
 }
 
 // branchWithCommit makes the branch name off main in the working tree dir,
-// with one empty commit, and returns the commit's id.
+// with one empty commit, whose body is the intent of a change opened from
+// it, and returns the commit's id.
 func branchWithCommit(t *testing.T, dir, name string) string {
 	t.Helper()
 	runGit(t, dir, "checkout", "--quiet", "-b", name, "main")
-	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", name)
+	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", name, "-m", "Because "+name+" must be.")
 	return strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
 }
 
@@ -44,6 +54,63 @@ func (w *world) changeCount(t *testing.T) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// changeSessions is the change component's session linker in the tests: it
+// accepts every session id and records nothing.
+type changeSessions struct{}
+
+func (changeSessions) Check(_ context.Context, _ change.Caller, id, _ string) (string, error) {
+	return strings.ToLower(id), nil
+}
+
+func (changeSessions) Record(context.Context, *sql.Tx, string, string, int64, int64) error {
+	return nil
+}
+
+// linesWith are the lines of git's output out that start with prefix,
+// trimmed.
+func linesWith(out, prefix string) []string {
+	var lines []string
+	for line := range strings.Lines(out) {
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, prefix) {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// openChange opens a change of demo from its branch with the owner's key.
+func (w *world) openChange(t *testing.T, branch string) {
+	t.Helper()
+	status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/demo/changes", w.ownerKey, map[string]any{"source": map[string]any{"branch": branch}})
+	if status != http.StatusCreated {
+		t.Fatalf("open a change of %s = %d %s, want 201", branch, status, body)
+	}
+}
+
+// demoChange is what the changes API shows, to the owner, of the change or
+// version of demo at path under …/changes/, such as "1" or "1/versions/2";
+// Number is a version's own number.
+type demoChange struct {
+	Number    int     `json:"number"`
+	Version   int     `json:"version"`
+	Kind      string  `json:"kind"`
+	HeadSHA   string  `json:"head_sha"`
+	SessionID *string `json:"session_id"`
+	Source    struct {
+		Branch string `json:"branch"`
+	} `json:"source"`
+}
+
+func (w *world) demoChange(t *testing.T, path string) demoChange {
+	t.Helper()
+	status, body := w.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/"+path, w.ownerKey, nil)
+	var c demoChange
+	if status != http.StatusOK || json.Unmarshal(body, &c) != nil {
+		t.Fatalf("GET changes/%s = %d %s, want 200", path, status, body)
+	}
+	return c
 }
 
 // receivePackStatus is the status line of the hub's answer to the last
@@ -92,12 +159,7 @@ func TestPushChange_RefusesInvalidOptionsBeforeThePack(t *testing.T) {
 			if err == nil {
 				t.Fatalf("git push succeeded, want it refused:\n%s", out)
 			}
-			var errLines []string
-			for line := range strings.Lines(out) {
-				if line = strings.TrimSpace(line); strings.HasPrefix(line, "remote: error:") {
-					errLines = append(errLines, line)
-				}
-			}
+			errLines := linesWith(out, "remote: error:")
 			if want := []string{"remote: error: " + c.message}; !slices.Equal(errLines, want) {
 				t.Errorf("error lines = %q, want %q", errLines, want)
 			}
@@ -152,5 +214,140 @@ func TestPushChange_GivesThePushSessionToEveryEvent(t *testing.T) {
 	runGit(t, dir, "push", "--quiet", "origin", "plain")
 	if evs := w.pushEvents(t, seq); len(evs) != 1 || evs[0].SessionID != nil {
 		t.Errorf("push events = %+v, want one without a session", evs)
+	}
+}
+
+// The lines of a push name each branch's change in the order of the push's
+// commands: a version for the branch that has a change, an opened change for
+// the one that asks for it, and nothing for a tag. Stock git sends the
+// commands of refs the hub has before those of new refs, whatever the order
+// of its command line, so the order is read from git's packet trace.
+func TestPushChange_ReportsEachBranchInCommandOrder(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	dir := w.cloneDemo(t, w.ownerKey)
+	branchWithCommit(t, dir, "a")
+	runGit(t, dir, "push", "--quiet", "origin", "a")
+	w.openChange(t, "a")
+	runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", "a again")
+	branchWithCommit(t, dir, "b")
+	runGit(t, dir, "tag", "v1")
+	trace := filepath.Join(t.TempDir(), "trace")
+	out, err := clientGit(t, dir, []string{"GIT_TRACE_PACKET=" + trace}, "push", "-o", "parley.change", "origin", "b", "a", "refs/tags/v1")
+	raw, rerr := os.ReadFile(trace)
+	if err != nil || rerr != nil {
+		t.Fatalf("git push: %v, trace: %v:\n%s", err, rerr, out)
+	}
+	lineOf := map[string]string{"refs/heads/a": "remote: change demo#1 version 2", "refs/heads/b": "remote: change demo#2 version 1 (opened)"}
+	var want []string
+	for _, m := range regexp.MustCompile(`git> [0-9a-f]{40} [0-9a-f]{40} (refs/[^\s\\]+)`).FindAllStringSubmatch(string(raw), -1) {
+		if line, ok := lineOf[m[1]]; ok {
+			want = append(want, line)
+		}
+	}
+	if got := linesWith(out, "remote: change "); len(want) != 2 || !slices.Equal(got, want) {
+		t.Errorf("change lines = %q, want %q, one per branch in the order git sent them:\n%s", got, want, out)
+	}
+	for _, line := range linesWith(out, "remote:") {
+		if strings.Contains(line, "v1") {
+			t.Errorf("the line %q names the tag", line)
+		}
+	}
+}
+
+// A client that asked for no side band gets the plain status report, and
+// its push is mapped all the same.
+func TestPushChange_MapsAPushWithoutASideBandAndSendsNoLine(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{})
+	cmds := []command{{zero, w.commit(t, w.head, "quiet\n\nBecause quiet must be."), "refs/heads/quiet"}}
+	a := w.receive(t, "acme/demo.git", w.ownerKey,
+		receiveRequest([]string{"report-status", "push-options"}, cmds, []string{"parley.change"}, w.packFor(t, cmds)))
+	rep := parseReport(a.body)
+	if a.status != http.StatusOK || !slices.Equal(rep.lines, []string{"unpack ok", "ok refs/heads/quiet"}) ||
+		strings.ContainsAny(a.body, "\x01\x02") || strings.Contains(a.body, "change demo#") {
+		t.Errorf("answer = %d %q, want 200 and the plain status report", a.status, a.body)
+	}
+	if n, c := w.changeCount(t), w.demoChange(t, "1"); n != 1 || c.Source.Branch != "quiet" {
+		t.Errorf("the hub holds %d changes, the first from %q: want one from quiet", n, c.Source.Branch)
+	}
+}
+
+// A push that is refused, whose pack is too large or that updates nothing
+// opens no change and sends no change line, whatever it asks.
+func TestPushChange_MapsNothingForAPushThatMovesNoRef(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{TOML: "[git]\nmax_push_size = \"4096\"\n"})
+	dir := w.cloneDemo(t, w.ownerKey)
+	noise := make([]byte, 16<<10)
+	_, _ = rand.Read(noise)
+	for _, c := range []struct {
+		name    string
+		prepare func()
+		refs    []string
+		refused bool
+	}{
+		{"a ref refused by a push rule", func() { branchWithCommit(t, dir, "topic") }, []string{"topic", "topic:refs/parley/x"}, true},
+		{"a pack over the maximum push size", func() {
+			branchWithCommit(t, dir, "big")
+			writeFiles(t, dir, map[string]string{"big.txt": hex.EncodeToString(noise)})
+			runGit(t, dir, "commit", "--quiet", "-m", "big")
+		}, []string{"big"}, true},
+		{"nothing to update", func() { runGit(t, dir, "checkout", "--quiet", "main") }, nil, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			c.prepare()
+			out, err := clientGit(t, dir, nil, append([]string{"push", "-o", "parley.change", "origin"}, c.refs...)...)
+			if (err != nil) != c.refused {
+				t.Fatalf("git push: %v, want refused %t:\n%s", err, c.refused, out)
+			}
+			if lines := append(linesWith(out, "remote: change "), linesWith(out, "remote: warning: no change")...); len(lines) != 0 {
+				t.Errorf("change lines %q, want none", lines)
+			}
+			if n := w.changeCount(t); n != 0 {
+				t.Errorf("the hub holds %d changes, want none", n)
+			}
+		})
+	}
+}
+
+// The session of parley.session goes on the version a push records on its
+// branch's change and on the change it opens; with none, the version has no
+// session and the opened change the change component's default, none for a
+// repository's branch.
+func TestPushChange_GivesThePushSessionToVersionsAndOpenedChanges(t *testing.T) {
+	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		acceptingSessions(c)
+		c.Changes().RegisterSessionLinker(changeSessions{})
+	}})
+	dir := w.cloneDemo(t, w.ownerKey)
+	branchWithCommit(t, dir, "fix")
+	runGit(t, dir, "push", "--quiet", "origin", "fix")
+	w.openChange(t, "fix")
+	for i, c := range []struct {
+		name    string
+		session *string
+	}{
+		{"the push's session", ptr(pushSession)},
+		{"no session", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			push := []string{"push", "--quiet"}
+			if c.session != nil {
+				push = append(push, "-o", "parley.session="+*c.session)
+			}
+			runGit(t, dir, "checkout", "--quiet", "fix")
+			runGit(t, dir, "commit", "--quiet", "--allow-empty", "-m", c.name)
+			head := strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+			runGit(t, dir, append(push, "origin", "fix")...)
+			v := w.demoChange(t, fmt.Sprintf("1/versions/%d", w.demoChange(t, "1").Version))
+			if v.Kind != "push" || v.HeadSHA != head || session(v.SessionID) != session(c.session) {
+				t.Errorf("newest version of change 1 = %+v, want kind push at %s with session %s", v, head, session(c.session))
+			}
+
+			other := fmt.Sprintf("other%d", i)
+			branchWithCommit(t, dir, other)
+			runGit(t, dir, append(push, "-o", "parley.change", "origin", other)...)
+			if opened := w.demoChange(t, strconv.Itoa(2+i)); opened.Source.Branch != other || session(opened.SessionID) != session(c.session) {
+				t.Errorf("change %d = %+v, want one from %s with session %s", 2+i, opened, other, session(c.session))
+			}
+		})
 	}
 }
