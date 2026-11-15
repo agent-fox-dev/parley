@@ -23,9 +23,13 @@ const changeNotFound = `{"error":{"code":404,"message":"workspace demo has no ch
 // patch, with bytes JSON framing would change.
 const patchText = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\"old\"\t\n+new \\u00e9\n"
 
+// labelledChange is change 13 as the hub answers it, with two labels.
+const labelledChange = `{"number":13,"labels":["a","b"],"title":"T"}`
+
 // changeHub is a stub hub that answers every change route the tests of
 // this file call with 200 and hubAnswer: the diff with patchText as
-// text/x-diff when asked for format=patch. Change 99 does not exist.
+// text/x-diff when asked for format=patch, and a GET of change 13 with
+// labelledChange. Change 99 does not exist.
 func changeHub(t *testing.T) *stubHub {
 	t.Helper()
 	return newStubHub(t).
@@ -36,6 +40,12 @@ func changeHub(t *testing.T) *stubHub {
 		answer(http.MethodGet, changesPath+"/by-commit/"+changeSHA, http.StatusOK, hubAnswer).
 		answer(http.MethodGet, changesPath+"/12/versions", http.StatusOK, hubAnswer).
 		answer(http.MethodGet, changesPath+"/99", http.StatusNotFound, changeNotFound).
+		answer(http.MethodPatch, changesPath+"/12", http.StatusOK, hubAnswer).
+		answer(http.MethodPatch, "/api/v1/workspaces/a/b/changes/12", http.StatusOK, hubAnswer).
+		answer(http.MethodPost, changesPath+"/12/abandon", http.StatusOK, hubAnswer).
+		answer(http.MethodPost, changesPath+"/12/restore", http.StatusOK, hubAnswer).
+		answer(http.MethodGet, changesPath+"/13", http.StatusOK, labelledChange).
+		answer(http.MethodPatch, changesPath+"/13", http.StatusOK, hubAnswer).
 		handle(http.MethodGet, changesPath+"/12/diff", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Query().Get("format") == "patch" {
 				w.Header().Set("Content-Type", "text/x-diff")
@@ -258,6 +268,120 @@ func TestChangeDiff_SendsTheFlagsAndPrintsWhatTheHubAnswers(t *testing.T) {
 	}
 }
 
+func TestChange_LifecycleCommandsSendOneRequestWithTheMembersTheirFlagsName(t *testing.T) {
+	t.Parallel()
+	hub := changeHub(t)
+	file := localFile(t, "intent.txt", []byte("from file\n"))
+	edit := func(flags ...string) []string { return append([]string{"edit", "demo", "12"}, flags...) }
+	abandon := func(flags ...string) []string { return append([]string{"abandon", "demo", "12"}, flags...) }
+	tests := []struct {
+		name, stdin string
+		args        []string
+		method      string
+		rawPath     string
+		// body is the JSON document sent, "" for none.
+		body string
+	}{
+		{"edit a title", "", edit("--title", "T"), http.MethodPatch, changesPath + "/12", `{"title":"T"}`},
+		{"edit an empty title", "", edit("--title", ""), http.MethodPatch, changesPath + "/12", `{"title":""}`},
+		{"edit an intent", "", edit("--intent", "why"), http.MethodPatch, changesPath + "/12", `{"intent":"why"}`},
+		{"edit an intent from a file", "", edit("--intent", "@"+file), http.MethodPatch, changesPath + "/12", `{"intent":"from file\n"}`},
+		{"edit an intent from stdin", "from stdin", edit("--intent", "-"), http.MethodPatch, changesPath + "/12", `{"intent":"from stdin"}`},
+		{"set auto-land", "", edit("--auto-land"), http.MethodPatch, changesPath + "/12", `{"auto_land":true}`},
+		{"clear auto-land", "", edit("--no-auto-land"), http.MethodPatch, changesPath + "/12", `{"auto_land":false}`},
+		{"retarget", "", edit("--target", "release"), http.MethodPatch, changesPath + "/12", `{"target_branch":"release"}`},
+		{"edit a title and retarget", "", edit("--title", "T", "--target", "release"), http.MethodPatch, changesPath + "/12", `{"title":"T","target_branch":"release"}`},
+		{"ready", "", []string{"ready", "demo", "12"}, http.MethodPatch, changesPath + "/12", `{"state":"open"}`},
+		{"draft", "", []string{"draft", "demo", "12"}, http.MethodPatch, changesPath + "/12", `{"state":"draft"}`},
+		{"ready a slug as one segment", "", []string{"ready", "a/b", "12"}, http.MethodPatch, "/api/v1/workspaces/a%2Fb/changes/12", `{"state":"open"}`},
+		{"abandon", "", abandon(), http.MethodPost, changesPath + "/12/abandon", `{}`},
+		{"abandon for a reason", "", abandon("--reason", "old"), http.MethodPost, changesPath + "/12/abandon", `{"reason":"old"}`},
+		{"abandon reparenting", "", abandon("--dependants", "reparent"), http.MethodPost, changesPath + "/12/abandon", `{"dependants":"reparent"}`},
+		{
+			"abandon the stack above for a reason", "", abandon("--reason", "x", "--dependants", "abandon"),
+			http.MethodPost, changesPath + "/12/abandon", `{"reason":"x","dependants":"abandon"}`,
+		},
+		{"restore", "", []string{"restore", "demo", "12"}, http.MethodPost, changesPath + "/12/restore", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr, sent := runChange(t, hub, tt.stdin, tt.args...)
+
+			wantResult(t, code, stdout, stderr, hubAnswer)
+			got := wantOnlyRequest(t, sent, tt.method, tt.rawPath)
+			if tt.body == "" {
+				if got.body != "" {
+					t.Errorf("body = %q, want none", got.body)
+				}
+				return
+			}
+			wantJSONBody(t, got.body, tt.body)
+		})
+	}
+}
+
+func TestChangeEdit_SendsTheChangesLabelsWithTheLabelFlagsApplied(t *testing.T) {
+	t.Parallel()
+	hub := changeHub(t)
+	tests := []struct {
+		flags []string
+		body  string
+	}{
+		{[]string{"--label", "c"}, `{"labels":["a","b","c"]}`},
+		{[]string{"--remove-label", "a"}, `{"labels":["b"]}`},
+		{[]string{"--label", "a"}, `{"labels":["a","b"]}`},
+		{[]string{"--remove-label", "zz"}, `{"labels":["a","b"]}`},
+		{[]string{"--remove-label", "a", "--label", "a"}, `{"labels":["b","a"]}`},
+		{[]string{"--remove-label", "a", "--remove-label", "b"}, `{"labels":[]}`},
+		{[]string{"--label", "c", "--label", "c", "--title", "T"}, `{"labels":["a","b","c"],"title":"T"}`},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.flags, " "), func(t *testing.T) {
+			code, stdout, stderr, sent := runChange(t, hub, "", append([]string{"edit", "demo", "13"}, tt.flags...)...)
+
+			wantResult(t, code, stdout, stderr, hubAnswer)
+			if len(sent) != 2 || sent[0].method != http.MethodGet || sent[0].rawPath != changesPath+"/13" ||
+				sent[1].method != http.MethodPatch || sent[1].rawPath != changesPath+"/13" {
+				t.Fatalf("the hub got %v, want GET then PATCH of %s/13", sent, changesPath)
+			}
+			wantJSONBody(t, sent[1].body, tt.body)
+		})
+	}
+}
+
+func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		args         []string
+		method, path string
+		status       int
+		errorType    string
+	}{
+		{[]string{"edit", "demo", "12", "--title", "T"}, http.MethodPatch, changesPath + "/12", http.StatusConflict, "change_closed"},
+		{[]string{"edit", "demo", "12", "--label", "c"}, http.MethodGet, changesPath + "/12", http.StatusNotFound, "change_not_found"},
+		{[]string{"ready", "demo", "12"}, http.MethodPatch, changesPath + "/12", http.StatusBadRequest, "intent_required"},
+		{[]string{"abandon", "demo", "12"}, http.MethodPost, changesPath + "/12/abandon", http.StatusConflict, "has_dependants"},
+		{[]string{"restore", "demo", "12"}, http.MethodPost, changesPath + "/12/restore", http.StatusConflict, "source_workspace_gone"},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			t.Parallel()
+			refusal := envelope(tt.status, tt.errorType)
+			hub := newStubHub(t).answer(tt.method, tt.path, tt.status, refusal)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", tt.args...)
+
+			wantOnlyRequest(t, sent, tt.method, tt.path)
+			if code != 1 || stdout != "" {
+				t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
+			}
+			if want := indented(t, refusal); stderr != want {
+				t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
+			}
+		})
+	}
+}
+
 func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	t.Parallel()
 	hub := changeHub(t)
@@ -279,6 +403,14 @@ func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"diff", "demo", "+1"},
 		{"list", "demo", "--stack-of", "-1"},
 		{"list", "demo", "--stack-of", "1.5"},
+		{"edit", "demo", "12"},
+		{"edit", "demo", "12", "--auto-land", "--no-auto-land"},
+		{"edit", "demo", "x", "--title", "T"},
+		{"abandon", "demo", "12", "--dependants", "delete"},
+		{"abandon", "demo"},
+		{"ready", "demo"},
+		{"draft", "demo", "12", "13"},
+		{"restore"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {

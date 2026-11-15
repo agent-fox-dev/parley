@@ -1994,9 +1994,10 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its six commands open and read
-the changes of a workspace through the [change routes](api.md#changes) of
-the hub. Each sends one request with the credential as
+reads no credential and sends no request. Its eleven commands open, read,
+edit, abandon and restore the changes of a workspace through the
+[change routes](api.md#changes) of the hub. Each sends one request (`edit`
+with a label flag two, see below) with the credential as
 `Authorization: Bearer` and `<slug>` (and the `<sha>` of `find`) as one
 percent-encoded path segment (`parley change open a/b --source feat` sends
 `POST /api/v1/workspaces/a%2Fb/changes`).
@@ -2009,6 +2010,11 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change find <slug> <sha>` | `GET …/changes/by-commit/<sha>` | |
 | `parley change versions <slug> <number>` | `GET …/changes/<number>/versions` | |
 | `parley change diff <slug> <number> [--version <n>\|latest] [--against <n>] [--path <glob>]... [--patch \| --name-only]` | `GET …/changes/<number>/diff` | `version`, `against`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
+| `parley change edit <slug> <number> [--title <t>] [--intent <i>\|@<file>\|-] [--label <l>]... [--remove-label <l>]... [--auto-land \| --no-auto-land] [--target <branch>]` | `PATCH …/changes/<number>` | the body below |
+| `parley change ready <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"open"}` |
+| `parley change draft <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"draft"}` |
+| `parley change abandon <slug> <number> [--reason <text>] [--dependants reparent\|abandon]` | `POST …/changes/<number>/abandon` | `reason` and `dependants`, as given; `{}` without a flag |
+| `parley change restore <slug> <number>` | `POST …/changes/<number>/restore` | no body |
 
 A flag not given sends no parameter, so that the hub's default applies;
 text values are sent as given, for the hub to judge.
@@ -2026,6 +2032,19 @@ stdin that cannot be read is a `client_error` (`cannot read the intent:
 open /nonexist: no such file or directory`) with exit status `2`, and no
 request is sent.
 
+The body of `parley change edit` holds one member for each flag given and
+none for a flag not given, so that a member not named is left as it is:
+`--title` `title` (an empty `--title ""` is sent as `""`, for the hub to
+judge), `--intent` `intent` (read as for `open`, before any request),
+`--auto-land` `auto_land` `true`, `--no-auto-land` `auto_land` `false`,
+and `--target` `target_branch`. With `--label` or `--remove-label`, each
+repeatable, `edit` first reads the change with `GET …/changes/<number>`,
+takes its `labels`, removes every `--remove-label` value, appends every
+`--label` value it does not hold yet, in order, and sends the result as
+`labels` in the one `PATCH` (`--remove-label a --label a` on `["a","b"]`
+sends `["b","a"]`; removing every label sends `[]`). When that read fails,
+its error is printed as for any refusal and no `PATCH` is sent.
+
 Every command but `diff --patch` prints the hub's JSON answer on stdout, as
 every result is printed (see [Output](#output)), with exit status `0`;
 `open` prints the `201` change. `parley change diff --patch` prints the
@@ -2035,8 +2054,9 @@ received; `--name-only` prints the JSON answer, whose files carry no
 `next_cursor`.
 
 A refusal of the hub's (`404` `change_not_found`, `400`
-`source_not_related`, `409` `change_exists`, `400` `invalid_request`, among
-others) is written to stderr as received, with nothing on stdout and exit
+`source_not_related`, `409` `change_exists`, `400` `invalid_request`, `409`
+`change_closed`, `400` `intent_required`, `409` `has_dependants`, `409`
+`source_workspace_gone`, among others) is written to stderr as received, with nothing on stdout and exit
 status `1`. `open` is sent once and never retried.
 
 **Client checks.** A missing `--source`, a wrong number of arguments, a
@@ -2045,9 +2065,15 @@ positive integer in decimal digits (`parley change show takes a <number>
 that is a positive integer, got "x"`), a `--version` that is neither that
 nor `latest` (`parley change diff takes --version <n>, a positive integer
 or latest, got "x"`), `--patch` with `--name-only` (`parley change diff
-takes --patch or --name-only, not both`) and a `--limit` that is not an
-integer are refused with a `usage_error` and exit status `2` before any
-setting is read or any request sent.
+takes --patch or --name-only, not both`), a `--limit` that is not an
+integer, `edit` without any of its edit flags (`parley change edit needs
+at least one of --title, --intent, --label, --remove-label, --auto-land,
+--no-auto-land, --target`), `edit` with both `--auto-land` and
+`--no-auto-land` (`parley change edit takes --auto-land or --no-auto-land,
+not both`) and an `abandon --dependants` other than `reparent` and
+`abandon` (`parley change abandon takes --dependants reparent or abandon,
+got "delete"`) are refused with a `usage_error` and exit status `2` before
+any setting is read or any request sent.
 
 ### `parley scm`
 

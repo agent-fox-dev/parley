@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -26,11 +28,31 @@ var openStringFlags = []struct {
 	{"session", "session_id", "the id of the agent session the change belongs to"},
 }
 
+// changePath is the route of one change, which edit, ready and draft
+// patch.
+const changePath = "/workspaces/:slug/changes/:number"
+
+// editFlags are the flags of parley change edit, each of which edits one
+// member of the change; edit needs at least one of them.
+var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land", "no-auto-land", "target"}
+
 // newChangeCommand builds parley change: the changes of a workspace, their
-// versions and their diffs.
+// versions and their diffs, and their edits, abandon and restore.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list and read the changes of a workspace, their versions and their diffs",
+	return group("change", "Open, list, read, edit, abandon and restore the changes of a workspace, and read their versions and diffs",
 		newChangeOpenCommand(),
+		newChangeEditCommand(),
+		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
+		newChangeStateCommand("draft", "Move an open change back to draft", "draft"),
+		newChangeAbandonCommand(),
+		withNumbers(declare(command{
+			Name:        "restore",
+			Description: "Bring an abandoned change back to open at its last version, recreating its deleted source branch",
+			Method:      http.MethodPost,
+			Path:        changePath + "/restore",
+			Args:        []argSpec{slugArg, numberArg},
+			Auth:        authUser,
+		}), true),
 		withNumbers(scmRead{
 			command: command{Name: "list", Description: "List the changes of a workspace, the draft and open ones unless --state says otherwise", Path: "/workspaces/:slug/changes", Args: []argSpec{slugArg}},
 			query: []queryFlag{
@@ -138,6 +160,173 @@ func openChange(c *call) error {
 		body["labels"], _ = fs.GetStringArray("label")
 	}
 	return sendWith(c, nil, body)
+}
+
+// newChangeEditCommand builds parley change edit: a PATCH of a change
+// whose body holds a member for each flag given and none for a flag not
+// given, so that an empty --title is sent and a member not named is left
+// as it is.
+func newChangeEditCommand() *cobra.Command {
+	edit := declare(command{
+		Name:        "edit",
+		Description: "Edit the title, intent, labels, auto-land flag or target branch of a change",
+		Method:      http.MethodPatch,
+		Path:        changePath,
+		Args:        []argSpec{slugArg, numberArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("title", "", "the change's new title")
+			fs.String("intent", "", "the change's new intent; @<file> reads it from the file, - from stdin")
+			fs.StringArray("label", nil, "add this label unless the change has it, repeatable")
+			fs.StringArray("remove-label", nil, "remove this label, repeatable")
+			fs.Bool("auto-land", false, "land the change on its own once it is ready")
+			fs.Bool("no-auto-land", false, "stop landing the change on its own")
+			fs.String("target", "", "the branch the change proposes to land on from now on")
+		},
+		Run: editChange,
+	})
+	return checkFlags(withNumbers(edit, true), func(cmd *cobra.Command) error {
+		fs := cmd.Flags()
+		if !slices.ContainsFunc(editFlags, fs.Changed) {
+			return usageError("%s needs at least one of --%s", cmd.CommandPath(), strings.Join(editFlags, ", --"))
+		}
+		if fs.Changed("auto-land") && fs.Changed("no-auto-land") {
+			return usageError("%s takes --auto-land or --no-auto-land, not both", cmd.CommandPath())
+		}
+		return nil
+	})
+}
+
+// editChange is the run step of parley change edit. The intent is read
+// before anything is sent, so that a file that cannot be read sends no
+// request. With a label flag the change is read first, because the PATCH
+// replaces the whole list: a read that fails sends no PATCH.
+func editChange(c *call) error {
+	fs := c.cmd.Flags()
+	body := map[string]any{}
+	for flag, member := range map[string]string{"title": "title", "intent": "intent", "target": "target_branch"} {
+		if fs.Changed(flag) {
+			body[member], _ = fs.GetString(flag)
+		}
+	}
+	if fs.Changed("intent") {
+		intent, err := intentText(body["intent"].(string), c.opts.stdin)
+		if err != nil {
+			return err
+		}
+		body["intent"] = intent
+	}
+	if fs.Changed("auto-land") {
+		body["auto_land"], _ = fs.GetBool("auto-land")
+	}
+	if fs.Changed("no-auto-land") {
+		off, _ := fs.GetBool("no-auto-land")
+		body["auto_land"] = !off
+	}
+	if fs.Changed("label") || fs.Changed("remove-label") {
+		resp, err := c.client.request(c.ctx, http.MethodGet, routePath(c.decl.Path, c.args), nil, nil)
+		if err != nil {
+			return err
+		}
+		var change struct {
+			Labels []string `json:"labels"`
+		}
+		if err := json.Unmarshal(resp.body, &change); err != nil {
+			return clientError("cannot read the labels of the change: %v", err)
+		}
+		add, _ := fs.GetStringArray("label")
+		remove, _ := fs.GetStringArray("remove-label")
+		body["labels"] = editLabels(change.Labels, add, remove)
+	}
+	return sendWith(c, nil, body)
+}
+
+// editLabels is labels without the values of remove, then with each value
+// of add it does not hold yet appended in order. It is never nil, so that
+// removing every label sends an empty list.
+func editLabels(labels, add, remove []string) []string {
+	edited := []string{}
+	for _, label := range labels {
+		if !slices.Contains(remove, label) {
+			edited = append(edited, label)
+		}
+	}
+	for _, label := range add {
+		if !slices.Contains(edited, label) {
+			edited = append(edited, label)
+		}
+	}
+	return edited
+}
+
+// newChangeStateCommand builds parley change ready or draft: a PATCH of a
+// change that moves it to state and to nothing else.
+func newChangeStateCommand(name, description, state string) *cobra.Command {
+	return withNumbers(declare(command{
+		Name:        name,
+		Description: description,
+		Method:      http.MethodPatch,
+		Path:        changePath,
+		Args:        []argSpec{slugArg, numberArg},
+		Auth:        authUser,
+		Run: func(c *call) error {
+			return sendWith(c, nil, map[string]string{"state": state})
+		},
+	}), true)
+}
+
+// abandonDependants are the values --dependants of parley change abandon
+// takes, as the hub reads them.
+var abandonDependants = []string{"reparent", "abandon"}
+
+// newChangeAbandonCommand builds parley change abandon. Its body holds a
+// member for each flag given, so that the hub's default applies to the
+// others; without a flag it is {}.
+func newChangeAbandonCommand() *cobra.Command {
+	abandon := declare(command{
+		Name:        "abandon",
+		Description: "Abandon a change, saying what becomes of the changes stacked on it",
+		Method:      http.MethodPost,
+		Path:        changePath + "/abandon",
+		Args:        []argSpec{slugArg, numberArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("reason", "", "why the change is abandoned")
+			fs.String("dependants", "", "what becomes of the changes stacked on it: reparent stacks them on what it sat on, abandon abandons them too")
+		},
+		Run: func(c *call) error {
+			fs := c.cmd.Flags()
+			body := map[string]string{}
+			for _, flag := range []string{"reason", "dependants"} {
+				if fs.Changed(flag) {
+					body[flag], _ = fs.GetString(flag)
+				}
+			}
+			return sendWith(c, nil, body)
+		},
+	})
+	return checkFlags(withNumbers(abandon, true), func(cmd *cobra.Command) error {
+		if fs := cmd.Flags(); fs.Changed("dependants") {
+			if value, _ := fs.GetString("dependants"); !slices.Contains(abandonDependants, value) {
+				return usageError("%s takes --dependants reparent or abandon, got %q", cmd.CommandPath(), value)
+			}
+		}
+		return nil
+	})
+}
+
+// checkFlags makes cmd refuse, as a usage error before any setting is
+// resolved or any request sent (ADR 02), a combination of flags check
+// refuses, once the command line has been accepted otherwise.
+func checkFlags(cmd *cobra.Command, check func(cmd *cobra.Command) error) *cobra.Command {
+	checkLine := cmd.Args
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		return check(cmd)
+	}
+	return cmd
 }
 
 // intentText is the intent --intent value gives: the content of the file

@@ -4804,8 +4804,8 @@ answer it warns on stderr only when the answer holds `token.token`. `list`
 sends a query parameter for each flag given (`listForks`), `--mine` as
 `owner=me`, and prints one page.
 
-`parley change` (`change.go`) is `open`, `list`, `show`, `find`, `versions`
-and `diff`. The five reads are built like the reads of `parley scm`
+`parley change` (`change.go`) is `open`, `list`, `show`, `find`, `versions`,
+`diff`, `edit`, `ready`, `draft`, `abandon` and `restore`. The five reads are built like the reads of `parley scm`
 (`scm.go`), as an `scmRead` each, whose query flags become query
 parameters; `diff` shares with `parley scm diff` the check `onePatchForm`
 and the run step `diffRevisions`, which prints the patch text of `--patch`
@@ -4815,7 +4815,16 @@ before sending, a file that cannot be read being a `client_error`.
 `withNumbers` wraps the argument check of `open`, `list`, `show`,
 `versions` and `diff`, so that a `<number>`, `--depends-on`, `--stack-of`,
 `--version` (or `latest`) or `--against` that is not a positive integer is
-a usage error before any setting is resolved.
+a usage error before any setting is resolved; it wraps the five edits'
+`<number>` too. `edit` builds its `PATCH` body in `editChange`, a member
+only for a flag given and the intent through `intentText`; a label flag
+makes it read the change first and send the list `editLabels` computes
+from the change's `labels`. `ready` and `draft` (`newChangeStateCommand`)
+send only a `state`, `abandon` only the `reason` and `dependants` given,
+and `restore` no body. `checkFlags` wraps the argument check of `edit` and
+`abandon` with their flag rules (an edit flag needed, `--auto-land` with
+`--no-auto-land`, a `--dependants` value), refused as usage errors before
+any setting is resolved.
 
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
