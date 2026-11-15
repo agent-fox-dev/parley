@@ -93,6 +93,11 @@ func TestHistory_KeepsAndPagesTheCommitsAQueryAsksFor(t *testing.T) {
 		{"a path that reads as pathspec magic", gitrepo.HistoryQuery{Path: ":(glob)*.md"}, nil},
 		{"an author, without regard to case", gitrepo.HistoryQuery{Author: "ANN@"}, []string{"c4"}},
 		{"an author that reads as a pattern", gitrepo.HistoryQuery{Author: "a.*"}, nil},
+		{"an author spanning the name and the e-mail", gitrepo.HistoryQuery{Author: "n <an"}, nil},
+		{"an author holding only the e-mail's bracket", gitrepo.HistoryQuery{Author: "<"}, nil},
+		{"an author's name alone", gitrepo.HistoryQuery{Author: "ANN"}, []string{"c4"}},
+		{"an author, paged after the filter", gitrepo.HistoryQuery{Author: "a@example", Skip: 1, Count: 1}, []string{"c2"}},
+		{"an author on a renamed file followed", gitrepo.HistoryQuery{Path: "new.md", Follow: true, Author: "A@EX"}, []string{"c2", "c1"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got, err := f.repo.History(context.Background(), f.id["c4"], c.q)
