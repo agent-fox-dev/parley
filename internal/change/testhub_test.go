@@ -156,6 +156,24 @@ func (w *world) post(t *testing.T, slug, credential string, body any) (int, map[
 	return status, out
 }
 
+// get reads path, relative to /api/v1, with the credential, and returns
+// the status, the decoded answer and the answer as received.
+func (w *world) get(t *testing.T, path, credential string) (int, map[string]any, []byte) {
+	t.Helper()
+	status, raw := w.Call(t, http.MethodGet, "/api/v1"+path, credential, nil)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("GET %s answered %d %q: %v", path, status, raw, err)
+	}
+	return status, out, raw
+}
+
+// errorType is the error_type of a decoded error answer, "" for another.
+func errorType(out map[string]any) any {
+	e, _ := out["error"].(map[string]any)
+	return e["error_type"]
+}
+
 // mustPost is post that fails the test unless the answer is 201.
 func (w *world) mustPost(t *testing.T, body any) map[string]any {
 	t.Helper()

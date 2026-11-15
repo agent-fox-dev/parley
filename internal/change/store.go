@@ -442,8 +442,15 @@ const versionColumns = `version, head_sha, base_sha, kind, patch_id, patch_equiv
 // readVersions reads the versions of the change number of the workspace
 // through q, oldest first.
 func readVersions(ctx context.Context, q Querier, workspace string, number int64) ([]Version, error) {
+	return readVersionsAfter(ctx, q, workspace, number, 0, -1)
+}
+
+// readVersionsAfter reads the versions of the change number of the
+// workspace numbered above after, oldest first, at most limit of them (all
+// for a negative limit).
+func readVersionsAfter(ctx context.Context, q Querier, workspace string, number, after int64, limit int) ([]Version, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+versionColumns+` FROM change_versions
-WHERE workspace_slug = ? AND number = ? ORDER BY version`, workspace, number)
+WHERE workspace_slug = ? AND number = ? AND version > ? ORDER BY version LIMIT ?`, workspace, number, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("read the versions of %s: %w", Ref(workspace, number), err)
 	}

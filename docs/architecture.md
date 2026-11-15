@@ -3614,6 +3614,34 @@ write transactions: the second finds the first change and answers `409
 change_exists`, and the unique index answers the same should one slip
 through.
 
+The reads (`read.go`) are four `GET` routes with scope `changes:read` and
+read access to `:slug`, registered with the patterns of the contributor
+table of `internal/access` so that a token bound to a fork reaches them on
+its parent: `/workspaces/:slug/changes/:number`, `…/:number/versions`,
+`…/:number/versions/:version` and `/workspaces/:slug/changes/by-commit/:sha`,
+which the router prefers to `:number` as the more specific pattern. They
+read the store outside any transaction. The three `:number` routes resolve
+their change in one place, the unexported `changeOf`: a number that is not
+a positive integer, or that `readChange` does not find under `:slug` (so
+any number on a fork's slug, since a fork holds no changes), is `404
+change_not_found`, and so is, for a token bound to a fork calling on the
+fork's parent (`access.BindingOf`, relation `parent_of_bound_fork`), a
+change whose source workspace is not the bound fork. The version list is
+paged by version number (`readVersionsAfter`) in the list envelope, and one
+version (by number or `latest`) carries its `ref`. By-commit asks
+`ChangeOfCommit` of `:slug`, or of the bound fork for such a token, and
+answers only a change of `:slug`, so a fork's slug finds nothing though
+`ChangeOfCommit` answers it from the parent.
+
+`include` on the change (`expand.go`) takes `versions`, which the
+component serves from `readVersions`, and `approvals`, `checks`, `stack`
+and `overlaps`, each served by the `change.Expander` (`func(ctx, Change)
+(any, error)`) registered on the instance with
+`(*change.Component).RegisterExpander(name, fn)` (nil removes; a name
+outside those four panics); a name without an expander adds no member, and
+the members follow the change's own in that order. No feature registers an
+expander yet.
+
 ### Hub events
 
 `internal/hub/events.go` adds the part `composeEvents`, after `composeAccess`

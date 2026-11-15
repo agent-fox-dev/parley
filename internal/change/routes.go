@@ -9,12 +9,27 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// Routes are the change routes, for the server's router.
+// Routes are the change routes, for the server's router: the open and
+// the reads of one change, its versions and the change of a commit.
 func (c *Component) Routes() []server.Route {
-	return []server.Route{{
-		Method: http.MethodPost, Pattern: "/workspaces/:slug/changes", Scope: "changes:write", Create: true,
-		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.openRoute,
-	}}
+	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
+	read := func(pattern string, h server.HandlerFunc) server.Route {
+		return server.Route{Method: http.MethodGet, Pattern: pattern, Scope: "changes:read", Marks: need, Handler: h}
+	}
+	// The patterns are those of the contributor table of internal/access,
+	// parameter names included, so that a token bound to a fork reaches
+	// them on the fork's parent. The router prefers the literal by-commit
+	// to :number.
+	return []server.Route{
+		{
+			Method: http.MethodPost, Pattern: "/workspaces/:slug/changes", Scope: "changes:write", Create: true,
+			Marks: need, Handler: c.openRoute,
+		},
+		read("/workspaces/:slug/changes/:number", c.getChange),
+		read("/workspaces/:slug/changes/by-commit/:sha", c.byCommit),
+		read("/workspaces/:slug/changes/:number/versions", c.listVersions),
+		read("/workspaces/:slug/changes/:number/versions/:version", c.getVersion),
+	}
 }
 
 // openBody is the body of POST /workspaces/:slug/changes.

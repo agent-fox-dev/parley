@@ -3675,6 +3675,63 @@ answers `201` and the other `409` `change_exists`.
 | `409` `workspace_archived` | the target or the source workspace is archived |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
 
+## Reading a change
+
+`GET /api/v1/workspaces/{slug}/changes/{number}`,
+`GET /api/v1/workspaces/{slug}/changes/{number}/versions`,
+`GET /api/v1/workspaces/{slug}/changes/{number}/versions/{version}` and
+`GET /api/v1/workspaces/{slug}/changes/by-commit/{sha}` read a change of
+the workspace `{slug}`. Each needs, for a personal access token,
+`changes:read`, and read access to `{slug}`; a token without the scope is
+answered `403` `insufficient_scope` also when `{slug}` names no workspace,
+and a caller who cannot read `{slug}` `404` `not_found`, as for a slug
+that names none. `by-commit` is a path segment of its own: `{number}` is
+never `by-commit`.
+
+A change of `{slug}` that the request cannot name answers `404`
+`change_not_found` on the first three routes: a `{number}` that is not a
+positive integer, a number `{slug}` does not have, and any number on a task
+fork's slug, since a fork holds no changes (its changes belong to its
+parent). A token bound to a task fork reaches these four routes on the
+fork's parent, and there only the changes whose `source.workspace_slug` is
+that fork: every other change answers `404` `change_not_found` as if it did
+not exist, and `by-commit` finds only those changes.
+
+`GET …/changes/{number}` answers `200` with the change object. `include`, a
+comma list of `versions`, `approvals`, `checks`, `stack` and `overlaps`
+(also given more than once), adds a member of that name after the change's
+own: `versions` the list of versions, oldest first; each other name what
+the hub's feature for it computes, and no member while the hub has none
+(none has one yet). Any other name, the empty name included, answers `400`
+`invalid_request`.
+
+`GET …/changes/{number}/versions` answers `200` with the versions, oldest
+first, in the list envelope `{"items":[…],"next_cursor":…}`, paged by
+`limit` and `cursor` as every list. Each item is a version object.
+
+`GET …/changes/{number}/versions/{version}` answers `200` with one version
+object, `{version}` a version number or `latest`, the current version,
+plus `ref`, the name of its version ref:
+
+```json
+{"number":2,"head_sha":"…","base_sha":"…","kind":"push","patch_equivalent_to":null,"created_by":{"actor_type":"api_key","actor_id":"…","username":"owner"},"session_id":null,"stats":{"commits":2,"files_changed":1,"insertions":1,"deletions":0},"created_at":"2026-11-15T13:12:13Z","ref":"refs/parley/changes/1/2"}
+```
+
+A `{version}` that is neither a positive integer nor `latest` answers `400`
+`invalid_request`; a number the change does not have, `404` `not_found`.
+
+`GET …/changes/by-commit/{sha}` finds the change of `{slug}` that landed
+the commit `{sha}`, a full commit id of 40 hexadecimal characters, or has
+it as the head of a version. A change that landed it comes first, then the
+lowest number. The answer is `200` with
+`{"change": <change object>, "version": <int or null>, "landed": <bool>}`:
+`version` is the highest version of the change with this head, or, for a
+commit the change landed, the version it was landed from, `null` when
+there is none; `landed` is `true` only for a commit the change landed. A
+commit that is neither, also an inner commit of a version, and any commit
+on a task fork's slug, answers `404` `change_not_found`; a `{sha}` that is
+not 40 hexadecimal characters `400` `invalid_request`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

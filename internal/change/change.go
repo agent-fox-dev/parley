@@ -378,6 +378,7 @@ type Component struct {
 	observers []VersionObserver
 	guard     AutoLandGuard
 	activity  ForkActivity
+	expanders map[string]Expander
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
