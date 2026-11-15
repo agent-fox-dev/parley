@@ -2019,7 +2019,15 @@ slug to remove that one's copy (see Delete):
    `(*Service).RegisterPostCloneStep(mode, step)` runs, given the record and
    the copy opened at `RepoPath`; an error it returns is logged as
    `workspace post-clone step failed` and does not change the outcome.
-9. The status is set to `ready`.
+9. The status is set to `ready`, and in the same store transaction every
+   clone observer registered with `(*Service).RegisterCloneObserver(o)` is
+   told, in registration order, with the transaction and the slug, the copy
+   being at `RepoPath`. Each runs under a savepoint: one that fails has its
+   own writes undone and is logged as `workspace clone observer failed`,
+   and the workspace becomes `ready` all the same. Step 2 tells them too
+   when it keeps a copy. The change component is one (see Changes): it
+   abandons for `source_lost` the changes whose source branch the fresh
+   copy lacks.
 
 Any failure removes the clone directory and whatever lies at `RepoPath`,
 logs `workspace clone failed` and sets the status to `failed` with
@@ -2034,7 +2042,7 @@ has been renamed there (steps 7 to 9), the status is left as it is so that
 the work is taken up again, and `Clone` returns the context's error: a stop
 leaves nothing at the copy's place, and the next start clones afresh and
 runs the post-clone step. A workspace that is ready is recorded with one
-write after the step, so a hub that ends without its stop between the
+transaction after the step, so a hub that ends without its stop between the
 copy's rename and `ready` leaves the workspace in `cloning`, with a copy
 step 2 keeps at the next start.
 
@@ -3683,10 +3691,15 @@ and changes nothing, `updated_at` included, for the value it already has;
 `AutoLandSet`, not found while `auto_land` is off. The move to `landed`
 tells no recorder.
 
-What a deleted source does to a change is in `retention.go`; its three
-functions run in the caller's transaction and read only the change
-record, so a delete may call them after the workspace's own record is
-gone. `SourceDeleted(ctx, tx, workspace, branch, actor)` moves the draft
+What a deleted or lost source does to a change is in `retention.go`; its
+functions run in the caller's transaction, and those a delete calls read
+only the change record, so a delete may call them after the workspace's
+own record is gone. `SourceLost(ctx, tx, slug)`, the clone observer the
+changes part registers on the workspaces, moves every draft or open
+change whose source is a branch the copy of `slug` does not have to
+`abandoned` for `source_lost` through `Abandon`, by the system, and
+leaves a change whose branch is there alone; it opens the copy only when
+the workspace is the source of such a change. `SourceDeleted(ctx, tx, workspace, branch, actor)` moves the draft
 or open change of the source branch (`workspace` being the source
 workspace, as for `RecordVersion`) to `abandoned` for `source_deleted`
 through `Abandon` (below), so a fork source's recorder is told, and a

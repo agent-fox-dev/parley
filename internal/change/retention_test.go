@@ -14,6 +14,8 @@ import (
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 func TestSourceDeleted_AbandonsTheChangeOfTheBranchAndKeepsItsVersions(t *testing.T) {
@@ -298,6 +300,61 @@ func TestWorkspaceDeleted_DeletesTheWorkspacesChangesAndLeavesOthers(t *testing.
 			t.Errorf("POST changes = %d %v, want 201 with number 1", status, out)
 		}
 	})
+}
+
+func TestSourceLost_AbandonsTheChangesWhoseBranchTheRecloneDidNotBringBack(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.SmartOrigin(t)
+	w := newWorldWith(t, hubtest.Config{Env: map[string]string{"GIT_SSL_CAINFO": o.CAFile()}})
+	w.branch(t, "kept", "Kept\n\nWhy.\n")
+	w.branch(t, "lost", "Lost\n\nWhy.\n")
+	w.branch(t, "sketch", "Sketch\n\nWhy.\n")
+	gitrepotest.Git(t, w.demo, "push", "--quiet", o.Dir(), "main", "release", "kept")
+	kept := w.openBranch(t, "kept", nil).Number
+	lost := map[string]int64{
+		"an open change": w.openBranch(t, "lost", nil).Number,
+		"a draft":        w.openBranch(t, "sketch", func(in *change.OpenInput) { in.Draft = true }).Number,
+	}
+	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET git_url = ? WHERE slug = 'demo'`, o.URL())
+		return err
+	})
+	// Origin takes none of the branches the reclone offers it first, so
+	// that lost and sketch do not come back.
+	o.Reject("refused")
+	seq := w.seq(t)
+
+	if status, out := w.send(t, http.MethodPost, "/workspaces/demo/reclone", w.ownerKey, nil); status != http.StatusOK {
+		t.Fatalf("reclone = %d %v", status, out)
+	}
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		rec, _, err := workspace.BySlug(context.Background(), w.Store.Main(), "demo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Status == workspace.StatusReady {
+			break
+		}
+		if rec.Status == workspace.StatusFailed || time.Now().After(deadline) {
+			t.Fatalf("the clone after the reclone left demo %s (%v)", rec.Status, deref(rec.CloneError))
+		}
+	}
+	for name, n := range lost {
+		if ch := w.read(t, n); ch.State != change.StateAbandoned {
+			t.Errorf("%s reads %s once the workspace is ready, want abandoned", name, ch.State)
+		}
+		if got := abandonReason(t, w, n); got != change.ReasonSourceLost {
+			t.Errorf("%s was abandoned for %q, want source_lost", name, got)
+		}
+		events := w.changeEvents(t, seq, change.EventAbandon, n)
+		if len(events) != 1 || metadata(t, events[0])["reason"] != change.ReasonSourceLost {
+			t.Errorf("%s: abandon events %v, want one with reason source_lost", name, events)
+		}
+		wantSystemEvents(t, events)
+	}
+	if ch := w.read(t, kept); ch.State != change.StateOpen {
+		t.Errorf("the change whose branch came back reads %s, want open", ch.State)
+	}
 }
 
 // abandonReason is the stored reason the change number of demo was

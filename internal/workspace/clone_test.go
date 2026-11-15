@@ -2,6 +2,7 @@ package workspace_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -485,5 +488,58 @@ func TestClone_StoppedAfterTheMoveIntoPlaceLeavesNothingAndRunsTheStepAtTheNextR
 	}
 	if rec := w.clone(t, "stopped"); rec.Status != workspace.StatusReady || runs != 2 {
 		t.Errorf("the next run left status %s with the step run %d times, want ready and 2", rec.Status, runs)
+	}
+}
+
+// cloneObserver writes its name as the display name of the workspace it is
+// told of, and records the status the transaction holds for it then; fail
+// makes it fail after the write.
+type cloneObserver struct {
+	name   string
+	fail   bool
+	status []string
+}
+
+func (o *cloneObserver) Cloned(ctx context.Context, tx *sql.Tx, slug string) error {
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM workspaces WHERE slug = ?`, slug).Scan(&status); err != nil {
+		return err
+	}
+	o.status = append(o.status, status)
+	if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET display_name = ? WHERE slug = ?`, o.name, slug); err != nil {
+		return err
+	}
+	if o.fail {
+		return errors.New("the observer broke")
+	}
+	return nil
+}
+
+func TestClone_TellsTheCloneObserversInTheTransactionThatSetsReady(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	var log hubtest.LogBuffer
+	kept, broken := &cloneObserver{name: "kept"}, &cloneObserver{name: "broken", fail: true}
+	w := newWorld(t, withGitOrigin(o), withLog(&log), withCompose(func(c *hub.Composition) {
+		c.Workspaces().RegisterCloneObserver(kept)
+		c.Workspaces().RegisterCloneObserver(broken)
+	}))
+	w.createFrom(t, "demo", o.URL(), nil)
+
+	rec := w.clone(t, "demo")
+	if rec.Status != workspace.StatusReady {
+		t.Fatalf("the clone left demo %s (%v), want ready", rec.Status, deref(rec.CloneError))
+	}
+	for _, ob := range []*cloneObserver{kept, broken} {
+		if fmt.Sprint(ob.status) != "[ready]" {
+			t.Errorf("observer %s saw demo as %v, want once, ready", ob.name, ob.status)
+		}
+	}
+	if rec.DisplayName != "kept" {
+		t.Errorf("display name %q, want the write of the observer that did not fail, kept", rec.DisplayName)
+	}
+	if !strings.Contains(log.String(), "workspace clone observer failed") || !strings.Contains(log.String(), "slug=demo") {
+		t.Errorf("the log does not report the failed observer with the slug:\n%s", log.String())
 	}
 }
