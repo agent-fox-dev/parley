@@ -1,0 +1,185 @@
+package gitrepo_test
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+)
+
+// readFixture is a repository to read from: main with c1 and c2, feature/x
+// with x on top of c1, the annotated tag v2 at c2, the tag tree at c1's
+// tree, the commit gone that no ref reaches, and commits of which two share
+// the abbreviated id prefix. calls counts the git processes run on repo.
+type readFixture struct {
+	repo                          *gitrepo.Repo
+	calls                         *atomic.Int32
+	c1, c2, x, v2, blob, gone, tr string
+	prefix                        string
+}
+
+func newReadFixture(t *testing.T) readFixture {
+	t.Helper()
+	dir := t.TempDir()
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	const who = "committer T <t@example.invalid> 1700000000 +0000\n"
+	stream := "commit refs/heads/main\nmark :1\n" + who + "data 2\nc1\nM 100644 inline f.txt\ndata 4\none\n\n" +
+		"commit refs/heads/main\n" + who + "data 2\nc2\nM 100644 inline f.txt\ndata 4\ntwo\n\n" +
+		"commit refs/heads/feature/x\n" + who + "data 1\nx\nfrom :1\nM 100644 inline dir/x.txt\ndata 2\nx\n\n" +
+		"commit refs/heads/gone\n" + who + "data 4\ngone\nfrom :1\n\n" +
+		"tag v2\nfrom refs/heads/main\ntagger T <t@example.invalid> 1700000000 +0000\ndata 2\nv2\n"
+	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	f := readFixture{calls: new(atomic.Int32), prefix: gitrepotest.SharedPrefix(t, dir)}
+	ids := strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main~1", "main", "feature/x", "refs/tags/v2", "main~1:f.txt", "gone", "main~1^{tree}"))
+	f.c1, f.c2, f.x, f.v2, f.blob, f.gone, f.tr = ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6]
+	gitrepotest.Git(t, dir, "update-ref", "refs/tags/tree", f.tr)
+	gitrepotest.Git(t, dir, "update-ref", "-d", "refs/heads/gone")
+	repo, err := gitrepo.Git{Trace: func([]string) { f.calls.Add(1) }}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.repo = repo
+	return f
+}
+
+// check compares a read's outcome with the wanted id or error, and, when
+// noGit is set, asserts that the input reached no git process.
+func (f readFixture) check(t *testing.T, read func() (string, error), want string, wantErr error, noGit bool) {
+	t.Helper()
+	f.calls.Store(0)
+	got, err := read()
+	if !errors.Is(err, wantErr) || got != want {
+		t.Errorf("got %q, %v; want %q, %v", got, err, want, wantErr)
+	}
+	if n := f.calls.Load(); noGit && n != 0 {
+		t.Errorf("%d git processes ran for an input refused before git", n)
+	}
+}
+
+func TestListRefs_ListsTheRefsBelowAPrefixWithTheCommitTheyReach(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		prefixes []string
+		want     []gitrepo.Ref
+	}{
+		{[]string{"refs/tags/"}, []gitrepo.Ref{{"refs/tags/tree", f.tr, ""}, {"refs/tags/v2", f.v2, f.c2}}},
+		{[]string{"refs/heads/feature/", "refs/keep/none/"}, []gitrepo.Ref{{"refs/heads/feature/x", f.x, f.x}}},
+		{[]string{"refs/heads/"}, []gitrepo.Ref{{"refs/heads/feature/x", f.x, f.x}, {"refs/heads/main", f.c2, f.c2}}},
+	} {
+		got, err := f.repo.ListRefs(context.Background(), c.prefixes...)
+		if err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("ListRefs(%v) = %v, %v, want %v", c.prefixes, got, err, c.want)
+		}
+	}
+	for _, p := range []string{"refs/tags/v", "refs/heads/*/", "--all"} {
+		if got, err := f.repo.ListRefs(context.Background(), p); err == nil {
+			t.Errorf("ListRefs(%q) = %v, want an error for a prefix that is not one", p, got)
+		}
+	}
+}
+
+func TestResolveRef_PeelsAFullRefNameToItsCommit(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		name    string
+		want    string
+		wantErr error
+		noGit   bool
+	}{
+		{"refs/heads/main", f.c2, nil, false},
+		{"refs/tags/v2", f.c2, nil, false},
+		{"refs/heads/feature", "", gitrepo.ErrNotFound, false},
+		{"refs/heads/nope", "", gitrepo.ErrNotFound, false},
+		{"refs/tags/tree", "", gitrepo.ErrNotCommit, false},
+		{"main", "", gitrepo.ErrNotFound, true},
+		{"refs/heads/main~1", "", gitrepo.ErrNotFound, true},
+		{"refs/heads/../main", "", gitrepo.ErrNotFound, true},
+		{"refs/heads/a b", "", gitrepo.ErrNotFound, true},
+		{"refs/heads/x.lock", "", gitrepo.ErrNotFound, true},
+		{"refs/heads/*", "", gitrepo.ErrNotFound, true},
+		{"--all", "", gitrepo.ErrNotFound, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f.check(t, func() (string, error) { return f.repo.ResolveRef(context.Background(), c.name) }, c.want, c.wantErr, c.noGit)
+		})
+	}
+}
+
+func TestResolveCommit_FindsTheOneCommitAnIdNames(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		name, id string
+		want     string
+		wantErr  error
+		noGit    bool
+	}{
+		{"full id", f.c1, f.c1, nil, false},
+		{"abbreviated id", f.c1[:7], f.c1, nil, false},
+		{"upper case", strings.ToUpper(f.c1[:7]), f.c1, nil, false},
+		{"commit no ref reaches", f.gone, f.gone, nil, false},
+		{"prefix of two commits", f.prefix, "", gitrepo.ErrAmbiguous, false},
+		{"no such object", "ffffffffff", "", gitrepo.ErrNotFound, false},
+		{"blob", f.blob, "", gitrepo.ErrNotCommit, false},
+		{"annotated tag", f.v2, "", gitrepo.ErrNotCommit, false},
+		{"three characters", f.c1[:3], "", gitrepo.ErrNotFound, true},
+		{"longer than an id", f.c1 + "0", "", gitrepo.ErrNotFound, true},
+		{"not hexadecimal", "main", "", gitrepo.ErrNotFound, true},
+		{"option", "--all", "", gitrepo.ErrNotFound, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f.check(t, func() (string, error) { return f.repo.ResolveCommit(context.Background(), c.id) }, c.want, c.wantErr, c.noGit)
+		})
+	}
+}
+
+func TestPeelCommit_ReachesTheCommitOfAnObject(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		name, id string
+		want     string
+		wantErr  error
+		noGit    bool
+	}{
+		{"annotated tag", f.v2, f.c2, nil, false},
+		{"commit", f.c1, f.c1, nil, false},
+		{"blob", f.blob, "", gitrepo.ErrNotCommit, false},
+		{"no such object", strings.Repeat("f", 40), "", gitrepo.ErrNotFound, false},
+		{"abbreviated id", f.v2[:7], "", gitrepo.ErrNotFound, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f.check(t, func() (string, error) { return f.repo.PeelCommit(context.Background(), c.id) }, c.want, c.wantErr, c.noGit)
+		})
+	}
+}
+
+func TestObjectInfo_ReportsTypeAndSize(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	for _, c := range []struct {
+		name    string
+		want    gitrepo.Object
+		wantErr error
+	}{
+		{f.c1 + ":f.txt", gitrepo.Object{ID: f.blob, Type: gitrepo.ObjectBlob, Size: 4}, nil},
+		{f.x + ":dir", gitrepo.Object{ID: gitrepotest.Git(t, f.repo.Dir(), "rev-parse", f.x+":dir"), Type: gitrepo.ObjectTree, Size: 33}, nil},
+		{f.c1 + ":nope", gitrepo.Object{}, gitrepo.ErrNotFound},
+		{"main:f.txt", gitrepo.Object{}, gitrepo.ErrNotFound},
+		{f.c1 + ":f.txt\n" + f.c1, gitrepo.Object{}, gitrepo.ErrNotFound},
+	} {
+		got, err := f.repo.ObjectInfo(context.Background(), c.name)
+		if !errors.Is(err, c.wantErr) || got != c.want {
+			t.Errorf("ObjectInfo(%q) = %+v, %v, want %+v, %v", c.name, got, err, c.want, c.wantErr)
+		}
+	}
+}
