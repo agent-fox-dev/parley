@@ -25,8 +25,13 @@ Paths are matched exactly, segment by segment, and a path that does not
 match is never redirected. When two routes match a path, the one with a
 fixed segment where the other has a parameter, reading from the left, serves
 it: `GET /api/v1/workspaces/{slug}/changes/by-commit/stack` goes to
-`changes/by-commit/{sha}`, not to `changes/{number}/stack`. A request that
-no route serves is answered as follows:
+`changes/by-commit/{sha}`, not to `changes/{number}/stack`. A route's last
+parameter may take the rest of the path: `{name}` in
+`GET /api/v1/workspaces/{slug}/scm/refs/{name}` matches one or more
+segments, none of them empty, and its value is their unescaped texts joined
+by `/`, so `…/scm/refs/feature/x` has `name` `feature/x`; a route with a
+fixed segment or a single-segment parameter in its place serves a path both
+match. A request that no route serves is answered as follows:
 
 | Request | Answer |
 |---|---|
@@ -2594,6 +2599,98 @@ who reads it); the `limit` and `cursor` (`400`).
 ```json
 {"items":[{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":"2026-01-02T00:00:00Z","created_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
 ```
+
+## Source control reads
+
+The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
+repository without a clone. They are `GET` routes; so far they are the two
+refs routes below. Every one of them behaves alike in what follows.
+
+It takes the admin token, an API key or a PAT, and declares the scope
+`git:read` for a PAT, which a PAT holding `git:write` also satisfies. It
+needs read access to the workspace (see [Workspace access](#workspace-access)),
+so an org member reads as the owner does. These checks run before the route
+and touch no repository: no credential is `401` `unauthenticated`, a PAT
+with neither scope `403` `insufficient_scope` (`this route needs the scope
+git:read`), for an unknown slug as well, and a caller who cannot read the
+workspace `404` `not_found` (`workspace not found`), with the same bytes as
+for an unknown slug.
+
+The route then checks its query parameters (`400` `invalid_request`), then
+the state of the workspace, and only then opens the repository:
+
+| State | Answer |
+|---|---|
+| `ready`; `archived` with no operation running, which reads as it did before the archive | served |
+| a reclone, archive or delete running, on any status | `409` `workspace_busy` |
+| `pending` or `cloning` | `409` `workspace_busy` |
+| `failed` | `409` `workspace_not_ready` |
+| a task fork whose parent is in one of the three states above | the parent's answer, `409` `workspace_busy` or `workspace_not_ready`; a fork whose parent is `archived` is served |
+
+A task fork is read through its ref view, the one the git server
+advertises: its own branches, with `tracking` `false`, and the branches and
+tags it tracks at its parent's current heads, the branches with `tracking`
+`true`, so a read of a fork follows its parent's branch as soon as it
+moves. A fork shows no `refs/parley/` ref.
+
+No read emits an event. Each request a route handles, refused by the route
+itself or answered, is reported once to the hub's request recorder with the
+route's op (`refs` for both refs routes) and `ok` for a status below 400,
+`error` otherwise; a request the checks before the route refuse is not
+reported. The hub has no metric export yet, so the recorder discards what
+it is told.
+
+A ref object has exactly these members:
+
+| Member | Value |
+|---|---|
+| `name` | the full ref name, such as `refs/heads/main` |
+| `kind` | `branch` under `refs/heads/`, `tag` under `refs/tags/`, `hub` under `refs/parley/` |
+| `sha` | the full id of the commit the ref points at; for an annotated tag, the commit the tag peels to |
+| `protected` | `true` for a branch the workspace's effective `protected_branches` protect (a fork's are its parent's) and for every `refs/parley/` ref, else `false` |
+| `tracking` | `true` for a task fork's tracking branch, else `false` |
+| `change` | `{"workspace_slug": …, "number": …}` for the open or draft change whose source is the branch; always `null` until the hub records changes |
+
+Refs in any other namespace, such as `refs/notes/`, have no kind and are
+never listed, nor is a ref that reaches no commit.
+
+## `GET /api/v1/workspaces/{slug}/scm/refs`
+
+Lists the refs of the workspace whose full names begin with `prefix`, as
+ref objects in byte order of name. It is a list (see [Lists](#lists)), with
+the standard `limit` and `cursor`, and the query parameter:
+
+| Parameter | Meaning |
+|---|---|
+| `prefix` | the start of the full names listed, matched as text; default `refs/heads/`; `refs/` lists all three namespaces |
+
+The cursor carries the last name of the page, so a walk over the pages
+returns each ref once. A prefix no ref has answers
+`{"items":[],"next_cursor":null}`.
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of ref objects |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"name":"refs/heads/feature/x","kind":"branch","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","protected":false,"tracking":false,"change":null},{"name":"refs/heads/main","kind":"branch","sha":"4ad62a88646935da6b42d1a9b1462904e8d62e91","protected":true,"tracking":false,"change":null}],"next_cursor":null}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/refs/{name}`
+
+Answers the ref object of one ref. `{name}` takes the rest of the path (see
+[Routes and matching](#routes-and-matching)): a full ref name, such as
+`refs/tags/v1`, or a branch name, which is any name that does not begin with
+`refs/` and is read as `refs/heads/{name}`, so `…/refs/feature/x` and
+`…/refs/refs/heads/feature/x` answer the same object.
+
+| Status | When |
+|---|---|
+| `200 OK` | the ref object |
+| `404` `ref_not_found` | no listed ref has the name, or it is outside `refs/heads/`, `refs/tags/` and `refs/parley/` (`ref "refs/heads/nope" does not exist`); a tag name without `refs/tags/` is read as a branch name |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
 
 ## Admin routes
 

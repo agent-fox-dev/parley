@@ -2,13 +2,27 @@ package scm_test
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/scm"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // gitArgs records the arguments of every git process a repository runs.
@@ -91,3 +105,247 @@ func newRevisionRepo(t *testing.T) *revisionRepo {
 type refList []scm.Ref
 
 func (l refList) Refs(context.Context) ([]scm.Ref, error) { return l, nil }
+
+// world is a hub whose scm routes the tests call: the org acme with its
+// members owner and member, and outsider, who belongs to no org, each
+// with an API key; PATs of the owner holding git:read, git:write alone and
+// changes:read alone. The owner's workspace demo is ready, with the task
+// fork demo--t1 of it, which the member owns, tracking main and the tags
+// v1 and v2. The owner's workspace old is archived, with the task fork
+// old--t1 of it made while it was ready. The hub's scm routes report to
+// observed and count the repositories they open in opens.
+type world struct {
+	*hubtest.Hub
+	workspaces *workspace.Service
+	events     *event.Component
+	observed   *observations
+	opens      atomic.Int64
+
+	owner, member                    string
+	ownerKey, memberKey, outsiderKey string
+	readPAT, writePAT, changesPAT    string
+	// repo is the git directory of demo's repository, and id the ids of
+	// its commits c1, c2 and c3 and of the tag object v2tag (demoStream).
+	repo string
+	id   map[string]string
+}
+
+// demoStream is demo's history: c1 and c2 on main, each writing f.txt;
+// c3 on feature/x, on top of c2, adding x.txt; the branches dev and
+// release at c1 and topic at c2; the lightweight tag v1 at c1 and the
+// annotated tag v2 at c2; refs/parley/changes/12/3 at c3; and refs/notes/x,
+// a namespace the reads do not list, at c1.
+const demoStream = "commit refs/heads/main\nmark :1\n" + testCommitter + "data 2\nc1\nM 100644 inline f.txt\ndata 3\nc1\n\n" +
+	"commit refs/heads/main\nmark :2\n" + testCommitter + "data 2\nc2\nfrom :1\nM 100644 inline f.txt\ndata 3\nc2\n\n" +
+	"commit refs/heads/feature/x\nmark :3\n" + testCommitter + "data 2\nc3\nfrom :2\nM 100644 inline x.txt\ndata 3\nc3\n\n" +
+	"reset refs/heads/dev\nfrom :1\n\nreset refs/heads/release\nfrom :1\n\nreset refs/heads/topic\nfrom :2\n\n" +
+	"reset refs/tags/v1\nfrom :1\n\ntag v2\nfrom :2\ntagger T <t@example.invalid> 1700000000 +0000\ndata 2\nv2\n" +
+	"reset refs/parley/changes/12/3\nfrom :3\n\nreset refs/notes/x\nfrom :1\n\n"
+
+const testCommitter = "committer T <t@example.invalid> 1700000000 +0000\n"
+
+// newWorld starts the world's hub, with adjust changing the scm routes'
+// dependencies after the world's own changes.
+func newWorld(t *testing.T, adjust ...func(*scm.Deps)) *world {
+	t.Helper()
+	w := &world{observed: &observations{}, id: map[string]string{}}
+	w.Hub = hubtest.StartWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		w.workspaces, w.events = c.Workspaces(), c.Events()
+		c.AdjustSCM(func(d *scm.Deps) {
+			open := d.Open
+			d.Open = func(ctx context.Context, slug string) (scm.Repository, error) {
+				w.opens.Add(1)
+				return open(ctx, slug)
+			}
+			d.Recorder = w.observed
+			for _, a := range adjust {
+				a(d)
+			}
+		})
+	}})
+	now := time.Now().UTC()
+	w.owner, w.member = w.CreateUser(t, "owner"), w.CreateUser(t, "member")
+	w.ownerKey, w.memberKey, w.outsiderKey = w.IssueKey(t, w.owner), w.IssueKey(t, w.member), w.IssueKey(t, w.CreateUser(t, "outsider"))
+	pat := func(perm string) string {
+		return w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{perm}, CreatedAt: now})
+	}
+	w.readPAT, w.writePAT, w.changesPAT = pat("git:read"), pat("git:write"), pat("changes:read")
+	acme := w.CreateOrg(t, "acme")
+	w.AddMember(t, acme, w.owner)
+	w.AddMember(t, acme, w.member)
+
+	w.repo = w.addWorkspace(t, "demo", acme, demoStream)
+	ids := strings.Fields(gitrepotest.Git(t, w.repo, "rev-parse", "main~1", "main", "feature/x", "refs/tags/v2"))
+	for i, name := range []string{"c1", "c2", "c3", "v2tag"} {
+		w.id[name] = ids[i]
+	}
+	w.addFork(t, "demo", acme, []string{"main"}, []string{"v1", "v2"})
+	w.addWorkspace(t, "old", acme, "commit refs/heads/main\n"+testCommitter+"data 2\nc1\nM 100644 inline f.txt\ndata 3\nc1\n\n")
+	w.addFork(t, "old", acme, []string{"main"}, nil)
+	w.set(t, "old", "status", string(workspace.StatusArchived))
+	return w
+}
+
+// addWorkspace adds the ready workspace slug of the owner in org, its
+// repository made by stream, and returns the repository's git directory.
+func (w *world) addWorkspace(t *testing.T, slug, org, stream string) string {
+	t.Helper()
+	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	head := gitrepotest.Refs(t, dir, "refs/heads/")["main"]
+	rec := workspace.Workspace{
+		Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard,
+		GitURL: new("https://origin.test/" + slug + ".git"), DefaultBranch: new("main"), OwnerID: w.owner, OrgID: org,
+		Status: workspace.StatusReady, DisplayName: slug, HeadSHA: &head,
+		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, rec) }); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// addFork adds the ready task fork parent--t1 of parent, which the member
+// owns, tracking branches and tags, its repository borrowing the parent's
+// objects.
+func (w *world) addFork(t *testing.T, parent, org string, branches, tags []string) {
+	t.Helper()
+	ctx, now, slug := context.Background(), time.Now().UTC(), parent+"--t1"
+	head := gitrepotest.Refs(t, w.workspaces.RepoPath(parent), "refs/heads/")["main"]
+	f := fork.Fork{
+		Workspace: workspace.Workspace{
+			Slug: slug, Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
+			OwnerID: w.member, OrgID: org, Status: workspace.StatusReady, DisplayName: slug,
+			ParentSlug: new(parent), ForkPoint: &workspace.ForkPoint{Ref: "main", SHA: head},
+			ExpiresAt: new(now.Add(7 * 24 * time.Hour)), AutoChange: new(false),
+			CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+		},
+		TrackingBranches: branches, TrackingTags: tags,
+	}
+	if err := (gitrepo.Git{}).CreateFork(ctx, w.workspaces.RepoPath(parent), w.workspaces.RepoPath(slug)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return fork.Insert(ctx, tx, f) }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// set sets column of the workspace slug to value in the store, such as its
+// status or its maintenance marker.
+func (w *world) set(t *testing.T, slug, column, value string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET `+column+` = ? WHERE slug = ?`, value, slug)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// commit writes to dir a commit on top of parent that sets file to content,
+// reached by no ref, and returns its id.
+func commit(t *testing.T, dir, parent, file, content string) string {
+	t.Helper()
+	const tmp = "refs/scm-test/new"
+	stream := "commit " + tmp + "\n" + testCommitter + "data 4\nnext\nfrom " + parent + "\nM 100644 inline " + file + "\n" +
+		"data " + strconv.Itoa(len(content)) + "\n" + content + "\n"
+	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	id := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", tmp))
+	gitrepotest.Git(t, dir, "update-ref", "-d", tmp)
+	return id
+}
+
+// reply is an answer of the hub, its body read and, when it is a JSON
+// object, decoded.
+type reply struct {
+	status int
+	header http.Header
+	body   []byte
+	json   map[string]any
+}
+
+// errorType is the error_type of an error envelope, "" for any other body.
+func (r reply) errorType() string {
+	e, _ := r.json["error"].(map[string]any)
+	s, _ := e["error_type"].(string)
+	return s
+}
+
+// names are the name members of the items of a list.
+func (r reply) names() []string {
+	items, _ := r.json["items"].([]any)
+	names := []string{}
+	for _, it := range items {
+		o, _ := it.(map[string]any)
+		s, _ := o["name"].(string)
+		names = append(names, s)
+	}
+	return names
+}
+
+// get sends GET path, below /api/v1, with credential as the bearer
+// credential ("" for none) and the headers header names and values in
+// turn.
+func (w *world) get(t *testing.T, path, credential string, header ...string) reply {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, w.URL("/api/v1"+path), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	}
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Add(header[i], header[i+1])
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer res.Body.Close()
+	r := reply{status: res.StatusCode, header: res.Header}
+	if r.body, err = io.ReadAll(res.Body); err != nil {
+		t.Fatalf("GET %s: read the body: %v", path, err)
+	}
+	_ = json.Unmarshal(r.body, &r.json)
+	return r
+}
+
+// scmPath is the path, below /api/v1, of the read route path, such as
+// /refs, of the workspace slug.
+func scmPath(slug, path string) string { return "/workspaces/" + slug + "/scm" + path }
+
+// scmRoutes are the read routes: the op each reports, a path below /scm
+// that it answers 200 on demo, and one that it answers with an error.
+var scmRoutes = []struct{ op, ok, bad string }{
+	{"refs", "/refs", "/refs?limit=0"},
+	{"refs", "/refs/main", "/refs/nope"},
+}
+
+// observations is a request recorder that keeps what it was told, each
+// observation as its op and result joined by a space.
+type observations struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (o *observations) Observe(op, result string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seen = append(o.seen, op+" "+result)
+}
+
+// reset forgets what was observed and returns it.
+func (o *observations) reset() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	seen := o.seen
+	o.seen = nil
+	return seen
+}

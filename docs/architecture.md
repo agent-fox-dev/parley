@@ -30,7 +30,7 @@ command-line client. Both are written in Go, in the module
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
 | `internal/sandbox/runtime/runtimetest` | test support, imported by test code only: `Fake`, the in-memory runtime and the only test double of the runtime, with its test controls, and `RunContract`, the contract tests every implementation of the runtime client passes |
-| `internal/scm` | the read half of the source control API; so far the one revision resolver every read (and every later write that takes a revision) goes through: `NewResolver(repo, view, defaultBranch)` over a workspace's repository (the interface `Repository`, which `*gitrepo.Repo` satisfies) and its ref view (the interface `RefView`, whose `Refs` lists `Ref{Name, SHA, Commit, Tracking}` and is read at most once per request; `RepoRefs(repo)` is the view of a workspace that is what its repository holds, every ref of it), `Resolve(ctx, rev)` and `ResolveOptional(ctx, rev)` (an empty `rev` is the head of the default branch), returning `Resolved{SHA, Full}`, `Full` set when the caller wrote the full 40-character id; a `rev` starting with `refs/` is that full ref name only, otherwise the branch or the tag of that name (both existing is ambiguous), otherwise 4 to 40 hexadecimal characters are a commit id; every failure to name exactly one commit, an expression such as `main~2`, `HEAD` or `--all` included, is the API error `ref_not_found` (404) |
+| `internal/scm` | the read half of the source control API: the `GET` routes under `/workspaces/:slug/scm` (so far `refs` and `refs/*name`), served by an `scm.Component` (zero value, `Bind(scm.Deps)`, `Routes()`), with the state check, the request recorder and the lookups every read shares (see [Source control reads](#source-control-reads)); and the one revision resolver every read (and every later write that takes a revision) goes through: `NewResolver(repo, view, defaultBranch)` over a workspace's repository (the interface `Repository`, which `*gitrepo.Repo` satisfies) and its ref view (the interface `RefView`, whose `Refs` lists `Ref{Name, SHA, Commit, Tracking}` and is read at most once per request; `RepoRefs(repo)` is the view of a workspace that is what its repository holds, every ref of it), `Resolve(ctx, rev)` and `ResolveOptional(ctx, rev)` (an empty `rev` is the head of the default branch), returning `Resolved{SHA, Full}`, `Full` set when the caller wrote the full 40-character id; a `rev` starting with `refs/` is that full ref name only, otherwise the branch or the tag of that name (both existing is ambiguous), otherwise 4 to 40 hexadecimal characters are a commit id; every failure to name exactly one commit, an expression such as `main~2`, `HEAD` or `--all` included, is the API error `ref_not_found` (404) |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/secret` | the hub's secrets, whose values leave the hub through no response, log line or error: `LoadKeys` reads the operator's current key (`PARLEY_SECRETS_KEY`, or the file `[secrets].key_file` names) and previous key (`PARLEY_SECRETS_KEY_PREVIOUS`), each standard padded base64 of 32 bytes, into `Keys`, whose keys print, log and encode as JSON as `[key]` (an absent key encodes as `null`); `Seal` and `Open` seal a value with AES-256-GCM under the current key, a fresh 12-byte nonce and a binding of its owner as additional data, and open it with the current or the previous key by the `KeyID` (the first 8 bytes of the key's SHA-256 in hex) it carries; `SealValue`, `OpenValue` and `NeedsReseal` do the same for values that are not named secrets, with the key id in front of the sealed bytes; `Component` (the hub uses its zero value, bound once at start by `Bind(Deps)` to the store, the keys, the clock, the scrubber and the event log; `New(Deps)` builds a bound one; table `secrets`, created by `SchemaStep`, unique on scope, scope id and the key with A to Z lowered) is the one place secrets are read, stored and removed, in the scopes `ScopeUser`, `ScopeOrg` and `ScopeWorkspace`: `Get` reads one secret of exactly one scope on every call, matching the key ignoring ASCII case, registers the value with the scrubber and fails a value no key opens with `ErrUnreadable`, never as absent; `Put`, `Delete`, `RemoveScope` and the package function `RemoveWorkspace` change secrets inside the caller's transaction and write no event; `CreateEntries` (all or nothing, the limit of 100 checked before a conflict), `ListPage`, `UpdateEntry`, `DeleteEntry` and `Count` serve the secret routes; `Routes` are the secret routes and `ScopeCheck` the access check that resolves a route's scope from its `MarkScope` mark; `Available` reports whether a current key is configured; `StartReport` counts the stored values whose key id is neither configured key's and `(StartReport).Log` writes the start lines; `Reencrypt` is the maintenance task that re-seals the values under the previous key with the current one and runs the `Converter`s other parts add with `RegisterConverter`; `ErrUnavailable` (no current key), `ErrUnreadable` (no configured key opens the value), `ErrInvalid`, `ErrLimitReached`, `ErrConflict` and `ErrNotFound` are the errors to match, and `UnavailableError` is the `503 secrets_unavailable` the REST API answers for `ErrUnavailable` |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
@@ -127,7 +127,9 @@ else goes to `ServeMux.ServeHTTP`.
 
 A feature registers a REST route with `(*Server).Register(server.Route)`.
 `Route.Method` is an upper-case method, `Route.Pattern` a path relative to
-`/api/v1` with `:name` parameters (`/workspaces/:slug/tokens`), and
+`/api/v1` with `:name` parameters (`/workspaces/:slug/tokens`) and
+optionally a last `*name` parameter that takes one or more remaining
+segments (`/workspaces/:slug/scm/refs/*name`), and
 `Route.Handler` a `server.HandlerFunc`,
 `func(http.ResponseWriter, *http.Request) error`: it writes its own response
 on success, and an error it returns is written as the envelope. The route's
@@ -137,7 +139,8 @@ declarations are `Public`, `Create` with its `ShowOnce` members, its own
 and `Marks`, named values whose meaning the installed checks define.
 `Register` adds the route to the server's route table and panics on a
 pattern that does not start with a slash, ends in one, has an empty, `.` or
-`..` segment, a brace, or a parameter without a valid name or named twice, on
+`..` segment, a brace, a `*name` parameter that is not the last segment, or
+a parameter without a valid name or named twice, on
 a method that is not upper-case letters, on a missing handler and on a route
 already registered, which includes one that differs from a registered route
 of the same method only in its parameter names.
@@ -145,7 +148,11 @@ of the same method only in its parameter names.
 Each check and the handler read the route their request matched with
 `server.MatchedRoute(r)`: a `server.Matched` with the method and pattern as
 registered, the `Route` and the path parameter values (`Params`);
-`server.Param(r, name)` returns one value.
+`server.Param(r, name)` returns one value; a `*name` parameter's value is
+the unescaped segments it took, joined by `/`. Of two routes that match a
+path, the one whose first differing segment is a literal beats a
+parameter, and a parameter beats a `*name` parameter; when one pattern is
+the beginning of the other, the longer wins.
 
 ### The check pipeline
 
@@ -483,6 +490,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: none) |
 | `AdjustWorkspace(func(*workspace.Deps))` | a change to the workspace service's dependencies, applied after the start hook `workspaces` builds them and before it binds them, in the order added; tests replace a collaborator with it |
 | `AdjustGitServer(func(*gitserver.Deps))` | a change to the git server's dependencies, applied after the start hook `gitserver` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the git runner, the timeout or a service in place of the exchange |
+| `AdjustSCM(func(*scm.Deps))` | a change to the source control reads' dependencies, applied after the start hook `scm` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the repository opener or the request recorder |
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
@@ -3168,6 +3176,41 @@ the admin token, no actor id), the user as actor id for a PAT or an API
 key, metadata `{"shallow": bool, "filter": string or null}`. A nil `Events`
 writes nothing; an error is logged at error level with
 `"event":"parley.git.fetch"` and changes neither the answer nor the count.
+
+### Source control reads
+
+`internal/hub/scm.go` adds the part `composeSCM`, after `composeGitServer`
+in `parts`. It creates a zero `scm.Component`, registers its
+`Routes()` with `AddRoute`, and binds it in the start hook `scm` to
+`workspace.BySlug` over the store's main database (`Workspaces`), the fork
+component's `CheckParentState(ctx, slug, fork.UseRead)` (`ParentState`),
+the hub's git opening `(*workspace.Service).RepoPath(slug)` (`Open`), the
+ref view (`RefView`: for a task fork `forkRefs`, an adapter over
+`(*fork.Component).Refs` that names each branch `refs/heads/<name>` with its
+`Tracking` flag and each recorded tag `refs/tags/<name>`, left for the
+reads to peel, and no `refs/parley/` ref; for a repository workspace
+`scm.RepoRefs`, every ref of its repository) and `protectedBranches`
+(`Protected`), `pushrule.Protected` over the effective `protected_branches`
+the push rule engine's settings reader returns (a fork's are its
+parent's), after the functions added with `AdjustSCM` have changed those
+dependencies. `(*Composition).SCM()` returns the component. `Changes`
+(`OpenChangeOfBranch`, `ChangeOfCommit`), `Sessions` (`SessionOf`) and
+`Recorder` keep their defaults, which name nothing and record nothing: the
+change and session features and the metric export are not in the hub yet.
+
+Every read route is `GET /workspaces/:slug/scm/…`, declared with the scope
+`git:read` and the access need `read`, so the pipeline answers `401`,
+`403` `insufficient_scope` and `404` `not_found` before the handler. One
+wrapper around every handler reports the request to `Deps.Recorder`
+(`Observe(op, result)`): the route's op and `scm.ResultOK` when the status
+written, or the status of the error returned before anything was written,
+is below 400, `scm.ResultError` otherwise. A handler checks its query
+first, then begins the read: the record (`Workspaces`), the state check
+(`ready`, or `archived` with no maintenance marker, passes; anything else
+is `workspace.RequireReady`'s refusal), `ParentState`, and only then
+`Open` and the workspace's ref view, with a `Resolver` over both. So a
+refused read opens no repository. The protected-branch test is asked once
+per read; a `refs/parley/` ref is protected whatever it says.
 
 ### Hub events
 

@@ -1,14 +1,3 @@
-// Package scm serves the read half of the source control API: the refs,
-// commits, trees, files, diffs, comparisons, blame and content search of a
-// workspace's repository, each answer computed from commits named by their
-// full ids.
-//
-// A read names commits by revisions, which one resolver turns into commit
-// ids: the forms it accepts are a branch name, a tag name, a full ref name
-// and a full or abbreviated commit id, and nothing a caller writes is handed
-// to git as a revision expression or an option. Refs are read from the
-// workspace's ref view (RefView), so that a fork answers with its own view
-// of its parent's branches.
 package scm
 
 import (

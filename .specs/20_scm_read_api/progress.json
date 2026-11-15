@@ -3,7 +3,7 @@
   "spec_id": "20",
   "spec_name": "scm_read_api",
   "schema_version": 3,
-  "updated_at": "2026-11-15T06:58:55Z",
+  "updated_at": "2026-11-15T07:21:28Z",
   "tasks": [
     {
       "id": 1,
@@ -11,7 +11,7 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
