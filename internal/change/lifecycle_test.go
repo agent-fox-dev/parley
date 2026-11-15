@@ -16,6 +16,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
@@ -296,6 +297,33 @@ func TestAbandon_RefusesAnInvalidBody(t *testing.T) {
 	}
 }
 
+func TestAbandon_KeepsTheWaitingCheckWhenItsTransactionIsUndone(t *testing.T) {
+	t.Parallel()
+	// Checks are spaced by an hour, so that the check the trigger
+	// schedules waits.
+	w := newWorldWith(t, hubtest.Config{TOML: "[changes]\nmergeable_debounce = \"1h\"\n"})
+	w.branch(t, "b", "B\n\nWhy.\n")
+	n := w.openBranch(t, "b", nil).Number
+	w.settled(t, n)
+	w.trigger(t, n)
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if err := w.changes.Abandon(ctx, tx, "demo", n, "undone", change.Caller{}); err != nil {
+			return err
+		}
+		return errRollback
+	})
+	if !errors.Is(err, errRollback) {
+		t.Fatal(err)
+	}
+	if ch := w.read(t, n); ch.State != change.StateOpen || ch.Mergeable != change.MergeableUnknown {
+		t.Fatalf("after the undone abandon the change is %s and %s, want open and unknown", ch.State, ch.Mergeable)
+	}
+	if change.MergeableIdle(w.changes, "demo", n) {
+		t.Error("the undone abandon dropped the change's waiting check")
+	}
+}
+
 // restore sends POST …/restore to the change number of demo with the
 // credential, and returns the status and the decoded answer.
 func (w *world) restore(t *testing.T, number int64, credential string) (int, map[string]any) {
@@ -308,7 +336,7 @@ func (w *world) restore(t *testing.T, number int64, credential string) (int, map
 // returns its number and the head of version 2.
 func (m *miaWorld) abandonedTask(t *testing.T, branch string, draft bool) (int64, string) {
 	t.Helper()
-	mia := change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+	mia := m.caller()
 	one := commit(t, m.t1, branch, m.base, branch+"\n\nWhy.\n", map[string]string{branch + ".txt": "1\n"})
 	n := m.openBranch(t, branch, func(in *change.OpenInput) {
 		in.SourceWorkspace, in.Caller, in.Draft = "demo--t1", mia, draft
@@ -454,7 +482,7 @@ func TestRestore_RefusesWhileAnotherChangeHasItsSource(t *testing.T) {
 	m := newMiaWorld(t)
 	first, _ := m.abandonedTask(t, "feat", false)
 	second := m.openBranch(t, "feat", func(in *change.OpenInput) {
-		in.SourceWorkspace, in.Caller = "demo--t1", change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+		in.SourceWorkspace, in.Caller = "demo--t1", m.caller()
 	}).Number
 	status, out := m.restore(t, first, m.miaKey)
 	if msg, _ := out["error"].(map[string]any)["message"].(string); status != http.StatusConflict || errorType(out) != "change_exists" ||
@@ -540,5 +568,93 @@ func TestRestore_RefusesAChangeWithoutAnIntentLastOfAllChecks(t *testing.T) {
 	w.set(t, "demo", "settings", `{"changes.require_intent":false}`)
 	if status, out := w.restore(t, n, w.ownerKey); status != http.StatusOK || out["state"] != change.StateOpen {
 		t.Errorf("restore without the setting = %d %v, want 200 open", status, out)
+	}
+}
+
+func TestRestore_ChecksTheChangesIntoTheSourceBranchItCreates(t *testing.T) {
+	t.Parallel()
+	w := newWorldWith(t, hubtest.Config{TOML: zeroDebounce})
+	lowerHead := w.branch(t, "lower", "Lower\n\nWhy.\n")
+	lower := w.openBranch(t, "lower", nil).Number
+	commit(t, w.demo, "upper", lowerHead, "Upper\n\nWhy.\n", map[string]string{"u.txt": "u\n"})
+	upper := w.openBranch(t, "upper", func(in *change.OpenInput) { in.TargetBranch = new("lower") }).Number
+	w.settled(t, upper)
+	w.push(t, "lower", "", nil)
+	w.idle(t, upper)
+	if a, b := w.read(t, lower), w.read(t, upper); a.State != change.StateAbandoned || b.Mergeable != change.MergeableUnknown {
+		t.Fatalf("with lower deleted demo#%d is %s and demo#%d %s, want abandoned and unknown", lower, a.State, upper, b.Mergeable)
+	}
+	if status, out := w.restore(t, lower, w.ownerKey); status != http.StatusOK {
+		t.Fatalf("restore = %d %v, want 200", status, out)
+	}
+	w.idle(t, upper)
+	if ch := w.read(t, upper); ch.Mergeable != change.MergeableClean || ch.Landing.Status != change.LandingReady {
+		t.Errorf("after the restore demo#%d is %s with landing %+v, want clean and ready", upper, ch.Mergeable, ch.Landing)
+	}
+}
+
+// racingBranch reads the workspace records through WorkspaceReader and,
+// once armed, creates the branch of dir at head the first time demo is
+// read after demo--t1: a restore of a change of demo from demo--t1 without
+// an intent reads demo's setting after it found the source branch gone and
+// before it creates the branch.
+type racingBranch struct {
+	change.WorkspaceReader
+	mu                sync.Mutex
+	dir, branch, head string
+	sourceRead        bool
+	err               error
+}
+
+func (r *racingBranch) arm(dir, branch, head string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dir, r.branch, r.head = dir, branch, head
+}
+
+func (r *racingBranch) Workspace(ctx context.Context, q change.Querier, slug string) (change.Workspace, bool, error) {
+	r.mu.Lock()
+	switch {
+	case r.head == "":
+	case slug == "demo--t1":
+		r.sourceRead = true
+	case slug == "demo" && r.sourceRead:
+		_, r.err = gitrepotest.Run(r.dir, "", "update-ref", "refs/heads/"+r.branch, r.head)
+		r.head = ""
+	}
+	r.mu.Unlock()
+	return r.WorkspaceReader.Workspace(ctx, q, slug)
+}
+
+func TestRestore_TakesASourceBranchCreatedWhileItRuns(t *testing.T) {
+	t.Parallel()
+	race := &racingBranch{}
+	m := newMiaWorldWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		c.AdjustChange(func(d *change.Deps) { race.WorkspaceReader, d.Workspaces = d.Workspaces, race })
+	}})
+	m.set(t, "demo", "settings", `{"changes.require_intent":false}`)
+	last := commit(t, m.t1, "quiet", m.base, "Quiet\n", map[string]string{"q.txt": "q\n"})
+	n := m.openBranch(t, "quiet", func(in *change.OpenInput) {
+		in.SourceWorkspace, in.Intent, in.Caller = "demo--t1", new(""), m.caller()
+	}).Number
+	if status, out := m.abandon(t, n, m.miaKey, nil); status != http.StatusOK {
+		t.Fatalf("abandon = %d %v", status, out)
+	}
+	gitrepotest.Git(t, m.t1, "update-ref", "-d", "refs/heads/quiet")
+	other := commit(t, m.t1, "elsewhere", last, "Elsewhere\n", map[string]string{"q.txt": "e\n"})
+	m.quiet(t)
+	race.arm(m.t1, "quiet", other)
+	status, out := m.restore(t, n, m.miaKey)
+	race.mu.Lock()
+	created, err := race.head == "", race.err
+	race.mu.Unlock()
+	if !created || err != nil {
+		t.Fatalf("the branch was not created during the restore (created %v): %v", created, err)
+	}
+	if status != http.StatusOK || out["state"] != change.StateOpen || out["head_sha"] != other || out["version"] != 2.0 {
+		t.Errorf("restore = %d %v, want 200 open at version 2, %s", status, out, other)
+	}
+	if got := gitrepotest.Refs(t, m.t1, "refs/heads/")["quiet"]; got != other {
+		t.Errorf("the source branch is at %q, want %s as it was created", got, other)
 	}
 }

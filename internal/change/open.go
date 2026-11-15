@@ -410,10 +410,39 @@ func validate(in OpenInput) error {
 		return server.InvalidRequest("source.branch: required")
 	case in.DependsOn != nil && *in.DependsOn < 1:
 		return server.InvalidRequest("depends_on: must be a positive integer")
-	case len(in.Labels) > MaxLabels:
+	}
+	return checkLabels(in.Labels)
+}
+
+// checkTitle refuses a title, the caller's or a default, that is empty or
+// white space only, longer than MaxTitle characters or more than one line.
+func checkTitle(title string) error {
+	switch {
+	case strings.TrimSpace(title) == "":
+		return server.InvalidRequest("title: must not be empty")
+	case utf8.RuneCountInString(title) > MaxTitle:
+		return server.InvalidRequest(fmt.Sprintf("title: at most %d characters", MaxTitle))
+	case strings.ContainsAny(title, "\r\n"):
+		return server.InvalidRequest("title: must be one line")
+	}
+	return nil
+}
+
+// checkIntent refuses an intent longer than MaxIntent characters.
+func checkIntent(intent string) error {
+	if utf8.RuneCountInString(intent) > MaxIntent {
+		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
+	}
+	return nil
+}
+
+// checkLabels refuses more than MaxLabels labels, or one that labelPattern
+// does not match.
+func checkLabels(labels []string) error {
+	if len(labels) > MaxLabels {
 		return server.InvalidRequest(fmt.Sprintf("labels: at most %d", MaxLabels))
 	}
-	for _, l := range in.Labels {
+	for _, l := range labels {
 		if !labelPattern.MatchString(l) {
 			return server.InvalidRequest(fmt.Sprintf("labels: %q must match %s", l, labelPattern))
 		}
@@ -684,16 +713,13 @@ func (o *opening) describe(ctx context.Context, in OpenInput) error {
 	case o.source.Fork && o.source.Purpose != nil:
 		o.intent = cut(strings.TrimSpace(*o.source.Purpose), MaxIntent)
 	}
-	switch {
-	case strings.TrimSpace(o.title) == "":
-		return server.InvalidRequest("title: must not be empty")
-	case utf8.RuneCountInString(o.title) > MaxTitle:
-		return server.InvalidRequest(fmt.Sprintf("title: at most %d characters", MaxTitle))
-	case strings.ContainsAny(o.title, "\r\n"):
-		return server.InvalidRequest("title: must be one line")
-	case utf8.RuneCountInString(o.intent) > MaxIntent:
-		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
-	case strings.TrimSpace(o.intent) == "" && !in.Draft && o.target.RequireIntent:
+	if err := checkTitle(o.title); err != nil {
+		return err
+	}
+	if err := checkIntent(o.intent); err != nil {
+		return err
+	}
+	if strings.TrimSpace(o.intent) == "" && !in.Draft && o.target.RequireIntent {
 		return intentRequired(o.target.Slug)
 	}
 	return nil
@@ -787,6 +813,24 @@ func (c *Component) actorOf(ctx context.Context, tx *sql.Tx, caller Caller) (Act
 func intentRequired(workspace string) error {
 	return server.NewError("intent_required", http.StatusBadRequest,
 		fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", workspace))
+}
+
+// intentRule is the intent rule of an open change of the workspace, read
+// through q, as an edit or a restore would leave it with the intent: an
+// intent of white space only, or none, is intentRequired where the
+// workspace requires one, whose record is read only then.
+func (c *Component) intentRule(ctx context.Context, q Querier, workspace, intent string) error {
+	if strings.TrimSpace(intent) != "" {
+		return nil
+	}
+	target, _, err := c.deps.Workspaces.Workspace(ctx, q, workspace)
+	if err != nil {
+		return err
+	}
+	if target.RequireIntent {
+		return intentRequired(workspace)
+	}
+	return nil
 }
 
 // changeExists is the refusal of an open or a restore whose source another

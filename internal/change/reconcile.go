@@ -35,9 +35,17 @@ func (c *Component) Reconcile(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.reconcile(ctx, tx, k) }); err != nil {
+		var abandoned bool
+		err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+			abandoned, err = c.reconcile(ctx, tx, k)
+			return err
+		})
+		switch {
+		case err != nil:
 			c.deps.Logger.Error("the change was not reconciled with its source branch", "workspace", k.WorkspaceSlug,
 				"number", k.Number, "error", err)
+		case abandoned:
+			c.merge.drop(mergeKey{k.WorkspaceSlug, k.Number})
 		}
 	}
 	unknown, err := c.activeChanges(ctx, " AND mergeable = 'unknown'")
@@ -50,37 +58,38 @@ func (c *Component) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// reconcile brings the change k in line with its source branch in tx.
-func (c *Component) reconcile(ctx context.Context, tx *sql.Tx, k Key) error {
+// reconcile brings the change k in line with its source branch in tx, and
+// reports whether it abandoned the change.
+func (c *Component) reconcile(ctx context.Context, tx *sql.Tx, k Key) (abandoned bool, err error) {
 	ch, err := readChange(ctx, tx, k.WorkspaceSlug, k.Number)
 	if err != nil || (ch.State != StateDraft && ch.State != StateOpen) {
-		return err
+		return false, err
 	}
 	source := ch.Source.WorkspaceSlug
 	if _, found, err := c.deps.Workspaces.Workspace(ctx, tx, source); err != nil || !found {
 		if err == nil {
 			err = fmt.Errorf("its source workspace %s has no record", source)
 		}
-		return err
+		return false, err
 	}
 	repo, err := c.deps.Repos(ctx, source)
 	if err != nil {
-		return err
+		return false, err
 	}
 	head, found, err := repo.ResolveBranch(ctx, ch.Source.Branch)
 	switch {
 	case err != nil:
-		return err
+		return false, err
 	case !found:
-		return c.Abandon(ctx, tx, k.WorkspaceSlug, k.Number, ReasonSourceDeleted, Caller{})
+		return true, c.Abandon(ctx, tx, k.WorkspaceSlug, k.Number, ReasonSourceDeleted, Caller{})
 	case head == ch.HeadSHA:
-		return nil
+		return false, nil
 	}
 	v, err := c.RecordVersion(ctx, tx, VersionInput{Workspace: source, Branch: ch.Source.Branch, Head: head, Kind: KindRef})
 	if err == nil && v == nil {
 		err = fmt.Errorf("no version was recorded for %s at %s", ch.Source.Branch, head)
 	}
-	return err
+	return false, err
 }
 
 // activeChanges are the draft and open changes that also meet the SQL

@@ -394,12 +394,24 @@ func (s *starts) wait(t *testing.T, number int64, n int) []time.Time {
 
 func TestMergeability_SpacesTwoChecksOfAChangeByTheDebounce(t *testing.T) {
 	t.Parallel()
-	for _, debounce := range []time.Duration{200 * time.Millisecond, 0} {
-		t.Run(debounce.String(), func(t *testing.T) {
+	adjusted := func(debounce time.Duration) hubtest.Config {
+		return hubtest.Config{Compose: func(c *hub.Composition) {
+			c.AdjustChange(func(d *change.Deps) { d.MergeableDebounce = debounce })
+		}}
+	}
+	for _, tc := range []struct {
+		name     string
+		cfg      hubtest.Config
+		debounce time.Duration
+	}{
+		{"200ms", adjusted(200 * time.Millisecond), 200 * time.Millisecond},
+		{"0s", adjusted(0), 0},
+		{"1m from the configuration file", hubtest.Config{TOML: "[changes]\nmergeable_debounce = \"1m\"\n"}, time.Minute},
+	} {
+		debounce := tc.debounce
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			w := newWorldWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
-				c.AdjustChange(func(d *change.Deps) { d.MergeableDebounce = debounce })
-			}})
+			w := newWorldWith(t, tc.cfg)
 			w.branch(t, "a", "A")
 			w.openBranch(t, "a", nil)
 			w.branch(t, "b", "B")
@@ -421,11 +433,14 @@ func TestMergeability_SpacesTwoChecksOfAChangeByTheDebounce(t *testing.T) {
 				t.Errorf("demo#2 started %v after t0, want within 100ms", b[0].Sub(t0))
 			}
 			if debounce > 0 {
+				// Just short of the interval, which for a minute is well past
+				// the default's.
+				clock.advance(debounce - 40*time.Millisecond)
 				w.idle(t, 2)
 				if a := s.wait(t, 1, 1); len(a) != 1 {
 					t.Fatalf("demo#1 started again at %v, inside its interval", a[1].Sub(t0))
 				}
-				clock.advance(250 * time.Millisecond)
+				clock.advance(50 * time.Millisecond)
 			}
 			a := s.wait(t, 1, 2)
 			gap := a[1].Sub(a[0])

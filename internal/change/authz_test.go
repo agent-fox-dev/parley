@@ -67,6 +67,11 @@ func newMiaWorldWith(t *testing.T, cfg hubtest.Config) *miaWorld {
 	return m
 }
 
+// caller is mia using an API key of hers.
+func (m *miaWorld) caller() change.Caller {
+	return change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+}
+
 // openAsMia opens a change of demo from a new branch of demo--t1 by mia,
 // and returns its number as a path names it.
 func (m *miaWorld) openAsMia(t *testing.T, branch string) string {
@@ -74,7 +79,7 @@ func (m *miaWorld) openAsMia(t *testing.T, branch string) string {
 	commit(t, m.t1, branch, m.base, branch+"\n\nWhy.\n", map[string]string{branch + ".txt": branch + "\n"})
 	ch := m.openBranch(t, branch, func(in *change.OpenInput) {
 		in.SourceWorkspace = "demo--t1"
-		in.Caller = change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+		in.Caller = m.caller()
 	})
 	return strconv.FormatInt(ch.Number, 10)
 }

@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"slices"
-	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -52,26 +51,27 @@ func (c *Component) RegisterRestacker(r Restacker) {
 }
 
 // abandonRoute abandons the change :number of the workspace :slug, through
-// modify, as its body says. A check the abandon dropped from the waiting
-// mergeability checks is scheduled again when the transaction does not
-// commit, since the change then is still draft or open.
+// modify, as its body says. Once its transaction has committed, the
+// waiting mergeability checks of the changes it abandoned are dropped; a
+// transaction that does not commit leaves them waiting, since its changes
+// are then still draft or open.
 func (c *Component) abandonRoute(w http.ResponseWriter, r *http.Request) error {
-	var dropped []mergeKey
-	err := c.modify(w, r, func(r *http.Request) (operation, error) { return c.parseAbandon(r, &dropped) })
-	if err != nil {
-		for _, k := range dropped {
-			c.merge.pend(k)
-		}
+	var abandoned []mergeKey
+	if err := c.modify(w, r, func(r *http.Request) (operation, error) { return c.parseAbandon(r, &abandoned) }); err != nil {
+		return err
 	}
-	return err
+	for _, k := range abandoned {
+		c.merge.drop(k)
+	}
+	return nil
 }
 
 // parseAbandon decodes the abandon's body, which may be absent: none, or
 // one of white space only, is the same as an empty object. reason must be
 // a string, "" when absent, and dependants DependantsReparent or
-// DependantsAbandon. The operation adds to dropped the changes whose
-// waiting check it dropped.
-func (c *Component) parseAbandon(r *http.Request, dropped *[]mergeKey) (operation, error) {
+// DependantsAbandon. The operation adds to abandoned the changes it
+// abandoned.
+func (c *Component) parseAbandon(r *http.Request, abandoned *[]mergeKey) (operation, error) {
 	var body map[string]json.RawMessage
 	if err := decodeOptional(r, &body); err != nil {
 		return nil, err
@@ -87,7 +87,7 @@ func (c *Component) parseAbandon(r *http.Request, dropped *[]mergeKey) (operatio
 	if choice != nil && *choice != DependantsReparent && *choice != DependantsAbandon {
 		return nil, server.InvalidRequest(fmt.Sprintf("dependants: must be %q or %q", DependantsReparent, DependantsAbandon))
 	}
-	a := abandoning{co: c.collaborators(), dropped: dropped}
+	a := abandoning{co: c.collaborators(), abandoned: abandoned}
 	if reason != nil {
 		a.reason = *reason
 	}
@@ -103,7 +103,7 @@ func (c *Component) parseAbandon(r *http.Request, dropped *[]mergeKey) (operatio
 type abandoning struct {
 	reason, choice string
 	co             collaborators
-	dropped        *[]mergeKey
+	abandoned      *[]mergeKey
 }
 
 // abandonWith abandons the change ch as caller, in tx, and settles its
@@ -112,7 +112,7 @@ type abandoning struct {
 // choice 409 has_dependants, with nothing written.
 func (c *Component) abandonWith(ctx context.Context, tx *sql.Tx, ch Change, caller Caller, a abandoning) error {
 	if ch.State != StateDraft && ch.State != StateOpen {
-		return server.NewError("change_closed", http.StatusConflict, fmt.Sprintf("%s is %s and cannot be abandoned", ch.Ref, ch.State))
+		return changeClosed(ch, "cannot be abandoned")
 	}
 	if len(ch.Dependants) > 0 && a.choice == "" {
 		return server.NewError("has_dependants", http.StatusConflict,
@@ -129,13 +129,10 @@ func (c *Component) abandonWith(ctx context.Context, tx *sql.Tx, ch Change, call
 		}
 	}
 	for _, n := range append([]int64{ch.Number}, above...) {
-		dropped, err := c.abandon(ctx, tx, ch.WorkspaceSlug, n, a.reason, caller)
-		if err != nil {
+		if err := c.Abandon(ctx, tx, ch.WorkspaceSlug, n, a.reason, caller); err != nil {
 			return err
 		}
-		if dropped {
-			*a.dropped = append(*a.dropped, mergeKey{ch.WorkspaceSlug, n})
-		}
+		*a.abandoned = append(*a.abandoned, mergeKey{ch.WorkspaceSlug, n})
 	}
 	if a.choice == DependantsReparent {
 		return c.reparent(ctx, tx, a.co, ch)
@@ -196,27 +193,21 @@ func (c *Component) reparent(ctx context.Context, tx *sql.Tx, co collaborators, 
 // reason, as actor did, in tx, and writes parley.change.abandon with the
 // reason as given. The move goes through SetAbandoned, so a fork source's
 // activity recorder is told; it forgets the change's announcement as
-// landable, so that a restore announces it again, and drops its waiting
-// mergeability check. Its source branch and its version refs stay as they
-// are, and its dependants as they were.
+// landable, so that a restore announces it again. Its source branch and its
+// version refs stay as they are, and its dependants as they were.
+//
+// Its waiting mergeability check is left waiting, since tx may yet be
+// rolled back: a check that runs stores nothing for a change that is no
+// longer draft or open, and a caller that owns the transaction may drop
+// the check once it has committed.
 func (c *Component) Abandon(ctx context.Context, tx *sql.Tx, workspace string, number int64, reason string, actor Caller) error {
-	_, err := c.abandon(ctx, tx, workspace, number, reason, actor)
-	return err
-}
-
-// abandon is Abandon, which also reports whether it dropped a waiting
-// check, for a caller that schedules it again when tx does not commit.
-func (c *Component) abandon(ctx context.Context, tx *sql.Tx, workspace string, number int64, reason string, actor Caller) (dropped bool, err error) {
 	if err := c.SetAbandoned(ctx, tx, workspace, number, reason); err != nil {
-		return false, err
+		return err
 	}
 	if err := c.ForgetLandable(ctx, tx, workspace, number); err != nil {
-		return false, err
+		return err
 	}
-	if err := c.emitAbandon(ctx, tx, actor, workspace, number, reason); err != nil {
-		return false, err
-	}
-	return c.merge.drop(mergeKey{workspace, number}), nil
+	return c.emitAbandon(ctx, tx, actor, workspace, number, reason)
 }
 
 // restoreRoute brings the change :number of the workspace :slug back to
@@ -237,7 +228,9 @@ func (c *Component) restoreRoute(w http.ResponseWriter, r *http.Request) error {
 // intent_required). Nothing is written before the last refusal.
 //
 // A source branch that is gone is created at the last version's head, only
-// if it is still absent; one created meanwhile is taken as it is. The
+// if it is still absent; one created meanwhile is taken as it is. A branch
+// the restore creates has the checks of the draft and open changes into it
+// scheduled, since it bypasses the ref writer whose stage would. The
 // change then becomes open, its landing is evaluated again, its
 // mergeability is checked again, parley.change.restore is written for the
 // last version and a fork source's activity recorder is told. A branch
@@ -280,17 +273,11 @@ func (c *Component) restore(ctx context.Context, tx *sql.Tx, ch Change, caller C
 				ch.Ref, source.WorkspaceSlug, source.Branch, ch.HeadSHA, ch.Version))
 		}
 	}
-	if strings.TrimSpace(ch.Intent) == "" {
-		target, _, err := c.deps.Workspaces.Workspace(ctx, tx, ch.WorkspaceSlug)
-		if err != nil {
-			return err
-		}
-		if target.RequireIntent {
-			return intentRequired(ch.WorkspaceSlug)
-		}
+	if err := c.intentRule(ctx, tx, ch.WorkspaceSlug, ch.Intent); err != nil {
+		return err
 	}
+	var created bool
 	if !found {
-		var created bool
 		if head, created, err = recreateBranch(ctx, repo, source.Branch, ch.HeadSHA); err != nil {
 			return err
 		}
@@ -317,6 +304,11 @@ func (c *Component) restore(ctx context.Context, tx *sql.Tx, ch Change, caller C
 	}
 	if err := c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
+	}
+	if created {
+		if err := c.ScheduleTargetMergeable(ctx, tx, source.WorkspaceSlug, source.Branch); err != nil {
+			return err
+		}
 	}
 	if err := c.emit(ctx, tx, caller, ch, EventRestore, map[string]any{"version": ch.Version, "head_sha": ch.HeadSHA}); err != nil {
 		return err

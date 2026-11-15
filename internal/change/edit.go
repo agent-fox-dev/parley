@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -129,29 +128,21 @@ func isNull(raw json.RawMessage) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-// validate checks every member e names against its limits, counting
-// characters as code points, the labels after their duplicates are gone.
+// validate checks every member e names against its limits, as an open
+// checks them, the labels after their duplicates are gone.
 func (e edit) validate() error {
 	if e.title != nil {
-		switch t := *e.title; {
-		case strings.TrimSpace(t) == "":
-			return server.InvalidRequest("title: must not be empty")
-		case utf8.RuneCountInString(t) > MaxTitle:
-			return server.InvalidRequest(fmt.Sprintf("title: at most %d characters", MaxTitle))
-		case strings.ContainsAny(t, "\r\n"):
-			return server.InvalidRequest("title: must be one line")
+		if err := checkTitle(*e.title); err != nil {
+			return err
 		}
 	}
-	if e.intent != nil && utf8.RuneCountInString(*e.intent) > MaxIntent {
-		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
-	}
-	if len(e.labels) > MaxLabels {
-		return server.InvalidRequest(fmt.Sprintf("labels: at most %d", MaxLabels))
-	}
-	for _, l := range e.labels {
-		if !labelPattern.MatchString(l) {
-			return server.InvalidRequest(fmt.Sprintf("labels: %q must match %s", l, labelPattern))
+	if e.intent != nil {
+		if err := checkIntent(*e.intent); err != nil {
+			return err
 		}
+	}
+	if err := checkLabels(e.labels); err != nil {
+		return err
 	}
 	if e.state != nil && *e.state != StateDraft && *e.state != StateOpen {
 		return server.InvalidRequest(fmt.Sprintf("state: must be %q or %q", StateDraft, StateOpen))
@@ -159,9 +150,11 @@ func (e edit) validate() error {
 	return nil
 }
 
-// changeClosed is the refusal of an edit a closed change does not take.
-func changeClosed(ch Change, takes string) error {
-	return server.NewError("change_closed", http.StatusConflict, fmt.Sprintf("%s is %s and takes %s", ch.Ref, ch.State, takes))
+// changeClosed is the refusal, 409 change_closed, of what the closed
+// change ch does not take; refusal ends its message, such as "takes no
+// edit".
+func changeClosed(ch Change, refusal string) error {
+	return server.NewError("change_closed", http.StatusConflict, fmt.Sprintf("%s is %s and %s", ch.Ref, ch.State, refusal))
 }
 
 // applyEdit applies e to the change ch, as caller, in tx: the state rules
@@ -175,16 +168,21 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 	case !e.edits() && !e.hasDependsOn:
 		return nil
 	case ch.State == StateAbandoned && e.edits():
-		return changeClosed(ch, "no edit")
+		return changeClosed(ch, "takes no edit")
 	case ch.State == StateLanded && e.edits() && !e.labelsOnly():
-		return changeClosed(ch, "no edit but of its labels")
+		return changeClosed(ch, "takes no edit but of its labels")
 	}
-	// The target a draft or open change already has is no edit; a closed
-	// change was refused it above like any other member.
+	// The state and the target a draft or open change already has are no
+	// edit, before the intent rule as after it; a closed change was
+	// refused them above like any other member.
+	if e.state != nil && *e.state == ch.State {
+		e.state = nil
+	}
 	if e.targetBranch != nil && *e.targetBranch == ch.TargetBranch {
-		if e.targetBranch = nil; !e.edits() && !e.hasDependsOn {
-			return nil
-		}
+		e.targetBranch = nil
+	}
+	if !e.edits() && !e.hasDependsOn {
+		return nil
 	}
 	closed := ch.State != StateDraft && ch.State != StateOpen
 	state, intent := ch.State, ch.Intent
@@ -194,14 +192,9 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 	if e.intent != nil {
 		intent = *e.intent
 	}
-	if state == StateOpen && strings.TrimSpace(intent) == "" {
-		target, _, err := c.deps.Workspaces.Workspace(ctx, tx, ch.WorkspaceSlug)
-		if err != nil {
+	if state == StateOpen {
+		if err := c.intentRule(ctx, tx, ch.WorkspaceSlug, intent); err != nil {
 			return err
-		}
-		if target.RequireIntent {
-			return server.NewError("intent_required", http.StatusBadRequest,
-				fmt.Sprintf("intent: %s requires one unless the change is a draft; say why the change exists", ch.WorkspaceSlug))
 		}
 	}
 	if e.targetBranch != nil {
@@ -222,7 +215,7 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 	if e.intent != nil && *e.intent != ch.Intent {
 		set, args = append(set, "intent = ?"), append(args, *e.intent)
 	}
-	if e.state != nil && *e.state != ch.State {
+	if e.state != nil {
 		set, args = append(set, "state = ?"), append(args, *e.state)
 	}
 	if e.labels != nil && !slices.Equal(e.labels, ch.Labels) {
@@ -252,7 +245,7 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 			return err
 		}
 	}
-	if e.state != nil && *e.state != ch.State {
+	if e.state != nil {
 		return c.moveState(ctx, tx, ch.WorkspaceSlug, ch.Number, caller)
 	}
 	return nil

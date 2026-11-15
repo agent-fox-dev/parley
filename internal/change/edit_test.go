@@ -389,7 +389,7 @@ func TestEdit_OpensADraftAndTellsWhoMarkedItReady(t *testing.T) {
 	head := commit(t, m.t1, "task", m.base, "task\n\nWhy.\n", map[string]string{"task.txt": "task\n"})
 	n := m.openBranch(t, "task", func(in *change.OpenInput) {
 		in.SourceWorkspace, in.Draft, in.Title = "demo--t1", true, new("T")
-		in.Caller = change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+		in.Caller = m.caller()
 	}).Number
 	m.settled(t, n)
 	seq := m.seq(t)
@@ -445,15 +445,27 @@ func TestEdit_ChangesNothingForAValueTheChangeHas(t *testing.T) {
 	w := newWorld(t)
 	for i, c := range []struct {
 		draft bool
-		body  map[string]any
+		// noIntent opens the change without an intent before the
+		// workspace requires one.
+		noIntent bool
+		body     map[string]any
 	}{
-		{false, map[string]any{"state": change.StateOpen}},
-		{true, map[string]any{"state": change.StateDraft}},
-		{false, map[string]any{"target_branch": "main"}},
+		{false, false, map[string]any{"state": change.StateOpen}},
+		{true, false, map[string]any{"state": change.StateDraft}},
+		{false, false, map[string]any{"target_branch": "main"}},
+		{false, true, map[string]any{"state": change.StateOpen}},
 	} {
 		branch := "s" + strconv.Itoa(i)
 		w.branch(t, branch, branch+"\n")
-		n := w.openBranch(t, branch, func(in *change.OpenInput) { in.Draft = c.draft }).Number
+		if c.noIntent {
+			w.set(t, "demo", "settings", `{"changes.require_intent":false}`)
+		}
+		n := w.openBranch(t, branch, func(in *change.OpenInput) {
+			if in.Draft = c.draft; c.noIntent {
+				in.Intent = new("")
+			}
+		}).Number
+		w.set(t, "demo", "settings", `{}`)
 		w.settled(t, n)
 		before, _ := w.change(t, n)
 		seq, at := w.seq(t), w.updatedAt(t, n)
@@ -476,7 +488,7 @@ func diverged(t *testing.T, m *miaWorld) (int64, string) {
 	head := commit(t, m.t1, "task", main, "Task\n\nWhy.\n", map[string]string{"a.txt": "l1\nl2\nl3\nl4\n"})
 	ch := m.openBranch(t, "task", func(in *change.OpenInput) {
 		in.SourceWorkspace = "demo--t1"
-		in.Caller = change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+		in.Caller = m.caller()
 	})
 	return ch.Number, head
 }
@@ -486,6 +498,9 @@ func TestEdit_RetargetsTheChangeAtItsVersion(t *testing.T) {
 	m := newMiaWorld(t)
 	n, head := diverged(t, m)
 	m.settled(t, n)
+	if got := m.announced(t, n); got != head {
+		t.Fatalf("before the retarget the change is announced landable at %q, want %s", got, head)
+	}
 	versions := m.versions(t, "demo", n)
 	seq := m.seq(t)
 
@@ -519,6 +534,11 @@ func TestEdit_RetargetsTheChangeAtItsVersion(t *testing.T) {
 	}
 	if ch := m.settled(t, n); ch.TargetBranch != "release" || ch.Mergeable != change.MergeableClean {
 		t.Errorf("after its check the change is into %s and %s, want release and clean", ch.TargetBranch, ch.Mergeable)
+	}
+	// The retarget forgot the announcement, so that the change is
+	// announced landable into release, at the same head.
+	if ready := m.changeEvents(t, seq, change.EventReady, n); len(ready) != 1 || metadata(t, ready[0])["head_sha"] != head {
+		t.Errorf("ready events after the retarget = %+v, want one at %s", ready, head)
 	}
 }
 
@@ -568,6 +588,8 @@ func TestEdit_RefusesToRetargetAChangeOfAStack(t *testing.T) {
 	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
 		return w.changes.SetDependsOn(ctx, tx, "demo", 2, new(int64(1)))
 	})
+	w.settled(t, 1)
+	w.settled(t, 2)
 	for _, c := range []struct {
 		name   string
 		number int64
@@ -576,11 +598,15 @@ func TestEdit_RefusesToRetargetAChangeOfAStack(t *testing.T) {
 		{"the upper change", 2},
 	} {
 		_, before := w.change(t, c.number)
+		seq := w.seq(t)
 		if status, got := w.patch(t, c.number, w.ownerKey, map[string]any{"target_branch": "release"}); status != http.StatusConflict || errorType(got) != "conflict" {
 			t.Errorf("%s: PATCH = %d %v, want 409 conflict", c.name, status, got)
 		}
 		if _, after := w.change(t, c.number); !bytes.Equal(after, before) {
 			t.Errorf("%s: the refused retarget changed the change:\n%s\nwas\n%s", c.name, after, before)
+		}
+		if events := w.eventsAfter(t, seq); len(events) != 0 {
+			t.Errorf("%s: the refused retarget wrote %d events, e.g. %s", c.name, len(events), events[0].Type)
 		}
 	}
 }

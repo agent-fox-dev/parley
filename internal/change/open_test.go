@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
-	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -199,16 +197,17 @@ func TestOpen_WritesTheVersionEventAndTheOpenEventUnlessDraft(t *testing.T) {
 	t.Run("open", func(t *testing.T) {
 		seq := w.seq(t)
 		got := w.mustPost(t, map[string]any{"source": map[string]any{"workspace_slug": "demo--m1", "branch": "task"}, "session_id": sessionOne})
-		// The mergeability check announces the clean change after the open.
-		events := slices.DeleteFunc(w.eventsAfter(t, seq), func(e event.Record) bool { return e.Type == change.EventReady })
+		// The mergeability check, which mustPost waits for, announces the
+		// clean change after the open.
+		events := w.eventsAfter(t, seq)
 		var types []string
 		for _, e := range events {
 			types = append(types, e.Type)
 		}
-		if want := []string{"parley.change.version", "parley.change.open"}; !reflect.DeepEqual(types, want) {
+		if want := []string{"parley.change.version", "parley.change.open", change.EventReady}; !reflect.DeepEqual(types, want) {
 			t.Fatalf("event types = %v, want %v", types, want)
 		}
-		for _, e := range events {
+		for _, e := range events[:2] {
 			if e.ResourceType != "change" || e.ResourceID != "1" || e.Workspace == nil || *e.Workspace != "demo" ||
 				e.SessionID == nil || *e.SessionID != sessionOne || e.ActorType != "api_key" || e.ActorID == nil || *e.ActorID != w.owner {
 				t.Errorf("%s: %+v, want resource change 1 of demo in sessionOne by the owner's key", e.Type, e)

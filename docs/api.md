@@ -3592,7 +3592,7 @@ The change object:
 | `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
-| `mergeable`, `conflict` | whether the current version's own commits rebase onto what the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
+| `mergeable`, `conflict` | whether the commits of the current version that the onto-commit lacks rebase onto the onto-commit, the commit the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
 | `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
@@ -3951,7 +3951,10 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   `{"status":"blocked","reason":"draft"}`, its versions, labels,
   `auto_land` and `mergeable` stay, its landable announcement is
   forgotten, and no event is written. A `state` the change already has is
-  no edit. A `target_branch` other than the change's own retargets a
+  no edit, before the intent rule as after it: `{"state":"open"}` on an
+  open change whose intent is empty, opened before `{slug}` required one,
+  is answered `200` with nothing changed, while an edit of another member
+  of that change is answered `400` `intent_required`. A `target_branch` other than the change's own retargets a
   draft or open change. The branch is checked as an open checks its
   target, with the same answers: `400` `target_not_found` for a branch
   `{slug}` does not have, `403` `integration_branch` for the integration
@@ -3986,8 +3989,9 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   change depends (its `dependants`) is answered `409` `has_dependants`
   when the body has no `dependants`, with the numbers of the dependants
   in the error's `dependants` member, and nothing changes. The change
-  moves to `abandoned`, its waiting mergeability check is dropped and its
-  landable announcement forgotten, and `parley.change.abandon` is
+  moves to `abandoned` and its landable announcement is forgotten, its
+  waiting mergeability check is dropped once the abandon has committed,
+  and `parley.change.abandon` is
   written by the caller with `reason` as given (the empty string when
   absent), `number`, `ref`, `version` and `head_sha`. The source branch
   and the version refs stay. With `"abandon"`, every draft or open change
@@ -4015,7 +4019,10 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   while `{slug}`'s `changes.require_intent` is on is `400`
   `intent_required`. A source branch that no longer exists while that
   commit does is created at it, with a create-only ref update; a branch
-  that appeared in the meantime is taken at its head. The change moves
+  that appeared in the meantime is taken at its head. A branch the
+  restore created is a new target too: every draft or open change of the
+  source workspace into it has its `mergeable` set to `unknown` and checked
+  again, as a push creating it would. The change moves
   to `open` (a change that was a draft when abandoned too), its `landing`
   is evaluated again, `mergeable` becomes `unknown` and is checked again,
   and `parley.change.restore` is written by the caller with `number`,
@@ -4043,8 +4050,8 @@ no work tree in either repository.
 `mergeable` becomes `unknown`, with `conflict` `null`, in the transaction
 of what triggers a new check: a new version of the change, a new version
 of the change it depends on, a move, creation or deletion of its target
-branch by a push, the source control API, a landing or a sync, a
-retarget and a restore. It stays `unknown` until the check stores its result; a result
+branch by a push, the source control API, a landing or a sync, or by a
+restore that creates it as its source branch, a retarget and a restore. It stays `unknown` until the check stores its result; a result
 for a head or an onto-commit that is no longer the change's is
 discarded and computed again. Two checks of one change start at least
 `[changes].mergeable_debounce` apart (default `5s`, see

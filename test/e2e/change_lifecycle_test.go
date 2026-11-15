@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -125,7 +126,7 @@ func (h *lifecycleHub) changeEvents(t *testing.T, number string, after int64, ty
 		if err := rows.Scan(&ev.seq, &ev.typ, &meta); err != nil {
 			t.Fatal(err)
 		}
-		if len(types) > 0 && !contains(types, ev.typ) {
+		if len(types) > 0 && !slices.Contains(types, ev.typ) {
 			continue
 		}
 		if err := json.Unmarshal([]byte(meta), &ev.meta); err != nil {
@@ -134,15 +135,6 @@ func (h *lifecycleHub) changeEvents(t *testing.T, number string, after int64, ty
 		evs = append(evs, ev)
 	}
 	return evs
-}
-
-func contains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 func typesOf(evs []changeEvent) []string {
@@ -214,8 +206,10 @@ func TestChangeLifecycle_ATargetMoveMakesAChangeConflictAndANewVersionClearsIt(t
 		t.Fatalf("after the push to main demo#%s is %v, want open, conflicting on a.txt", n, c)
 	}
 	conflicts := h.changeEvents(t, n, 0, change.EventConflict)
-	if gotFiles, _ := json.Marshal(conflicts[0].meta["files"]); len(conflicts) != 1 || string(gotFiles) != `["a.txt"]` {
+	if len(conflicts) != 1 {
 		t.Errorf("the conflict events = %v, want one naming a.txt", conflicts)
+	} else if gotFiles, _ := json.Marshal(conflicts[0].meta["files"]); string(gotFiles) != `["a.txt"]` {
+		t.Errorf("the conflict event names %s, want a.txt", gotFiles)
 	}
 
 	dir := strings.TrimSpace(agent("rev-parse", "--show-toplevel"))

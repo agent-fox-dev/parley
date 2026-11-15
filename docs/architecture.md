@@ -3724,7 +3724,8 @@ answers the change re-read in the transaction. The routes declare
 reaches it. The edit (`edit.go`) decodes the body into optional members
 and checks each before the transaction's writes; its operation applies,
 in order, the closed-change rules (`409 change_closed`), the intent rule
-on the change as the edit would leave it (`400 intent_required`), the
+on the change as the edit would leave it (`intentRule`, `400
+intent_required`), the
 `AutoLandGuard` for a body with `auto_land`, then one `update` of the
 members whose value differs and `SetAutoLand`; a `depends_on` member goes
 to the `StackLinker`'s `SetDependsOn` for a draft or open change while
@@ -3746,15 +3747,27 @@ row only (`SetBase` would rewrite the current version too), runs
 `reevaluateLanding`, `ForgetLandable` and `ScheduleMergeable`, and writes
 `parley.change.version` by the caller with kind `retarget`
 (`KindRetarget`, an event kind no stored version has) for the current
-version. A `target_branch` equal to the change's own is no edit on a draft or
-open change; the closed-change rules count it like any other member.
+version. A `state` or a `target_branch` equal to the change's own is no
+edit on a draft or open change, dropped before the intent rule, so an open
+change left without an intent by a later `changes.require_intent` takes
+`{"state":"open"}` as no edit; the closed-change rules count either like
+any other member. The edit checks `title`, `intent` and `labels` with
+`checkTitle`, `checkIntent` and `checkLabels` (`open.go`), which the open
+uses too, so their answers are the open's.
 Every abandon of a change, by the route, a deleted source branch and the
 other callers in the hub, goes through
 `(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
-which is `SetAbandoned`, `ForgetLandable`, `parley.change.abandon` with the
-given reason, and the removal of the change from the mergeability
-worker's waiting checks; it touches no ref and leaves the change's
-dependants as they are. The abandon route's operation (`lifecycle.go`)
+which is `SetAbandoned`, `ForgetLandable` and `parley.change.abandon` with
+the given reason; it touches no ref and leaves the change's dependants as
+they are. It leaves the change's waiting mergeability check waiting,
+since the caller's transaction may still be rolled back, which would
+leave a draft or open change `unknown` with no check; a check that runs
+stores nothing for a change that is no longer draft or open. The abandon
+route drops the waiting checks of the changes it abandoned once its
+transaction has committed, and `Reconcile` drops a change's after the
+transaction that abandoned it; a deleted source branch (`SourceDeleted`)
+and an open that finds its source gone (`followSource`) leave theirs to
+the worker. The abandon route's operation (`lifecycle.go`)
 decodes an optional body (`reason` a string, `dependants`
 `DependantsReparent` or `DependantsAbandon`), refuses a closed change
 (`409 change_closed`) and, without a `dependants` member, one with draft
@@ -3767,9 +3780,7 @@ with `SetDependsOn`, then hands each to the `Restacker`
 registered with `(*change.Component).RegisterRestacker`, which the stack
 feature implements) with the trigger `abandon` (`TriggerAbandon`) inside
 the transaction, whose error rolls the abandon back; with no restacker
-registered it calls `ScheduleMergeable` on each instead. When the route's
-transaction does not commit, the checks the abandon dropped are
-scheduled again.
+registered it calls `ScheduleMergeable` on each instead.
 
 The restore route's operation (`restore` in `lifecycle.go`) checks, in
 this order and before it writes anything: the change is abandoned (`409
@@ -3781,8 +3792,8 @@ in the source workspace's repository either the source branch exists or
 the last version's head is still an object (`ResolveBranch`, then
 `Missing`, which sees a fork's parent's objects through its alternates;
 else `409 conflict`); the intent is not empty while the target
-workspace's `RequireIntent` is set (`intentRequired`, shared with the
-open, `400 intent_required`). A missing branch is then created at the
+workspace's `RequireIntent` is set (`intentRule`, shared with the edit,
+whose refusal `intentRequired` is the open's, `400 intent_required`). A missing branch is then created at the
 last version's head with `CompareAndSwapRef(ctx, ref, head, "")`;
 `ErrRefMoved` means it appeared in the meantime, and its head is read
 and taken as for a branch that exists. A branch the restore created is
@@ -3790,7 +3801,11 @@ deleted again (a compare-and-swap to the zero id) when the operation
 fails after it. In the route's transaction it then sets the change `open`
 with no `abandon_reason`, a violation of the unique index on the active
 source being answered as `409 change_exists`, runs `reevaluateLanding`,
-calls `ScheduleMergeable`, writes `parley.change.restore` (`EventRestore`,
+calls `ScheduleMergeable` and, for a branch it created,
+`ScheduleTargetMergeable` on the source workspace and branch (the
+create-only ref update bypasses the ref writer, whose `TargetsUpdated`
+stage would schedule the changes into the branch), writes
+`parley.change.restore` (`EventRestore`,
 metadata `number`, `ref`, `version`, `head_sha` of the last version),
 tells the `ForkActivity` of a fork source (its error logged), records a
 branch head other than the last version's through `RecordVersion` with
@@ -3850,7 +3865,8 @@ transaction and schedule the check at once:
 `ScheduleMergeable(ctx, tx, workspace, number)` for one draft or open
 change (restore; the retarget and the restack call it too), and
 `ScheduleTargetMergeable(ctx, tx, workspace, branch)` for the draft and
-open changes of the workspace whose target is the branch.
+open changes of the workspace whose target is the branch (the target
+stage, the sync observer and a restore that creates its source branch).
 
 `(*change.Component).Reconcile(ctx)` (`reconcile.go`) is the start-up
 reconciliation, which repairs what a stop between a ref update and its

@@ -24,7 +24,7 @@ func (m *miaWorld) task(t *testing.T, branch string, draft bool) int64 {
 	commit(t, m.t1, branch, m.base, branch+"\n\nWhy.\n", map[string]string{branch + ".txt": "1\n"})
 	return m.openBranch(t, branch, func(in *change.OpenInput) {
 		in.SourceWorkspace, in.Draft = "demo--t1", draft
-		in.Caller = change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+		in.Caller = m.caller()
 	}).Number
 }
 
