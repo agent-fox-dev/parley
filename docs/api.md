@@ -2609,7 +2609,7 @@ who reads it); the `limit` and `cursor` (`400`).
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
 refs routes, the two commits routes, the tree route, the file route, the
-diff route, the compare route and the blame route below. Every one of them behaves
+diff route, the compare route, the blame route and the search route below. Every one of them behaves
 alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
@@ -2642,7 +2642,7 @@ moves. A fork shows no `refs/parley/` ref.
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
-`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route) and `ok` for a status
+`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route, `search` for the search route) and `ok` for a status
 below 400 (a `206` included),
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
@@ -2663,7 +2663,7 @@ Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
 
 A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree`,
-`…/scm/file` and `…/scm/blame`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
+`…/scm/file`, `…/scm/blame` and `…/scm/search`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
 `…/scm/diff` and `…/scm/compare`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
@@ -3077,6 +3077,49 @@ NUL byte is among its first 8,000 bytes.
 
 ```json
 {"resolved_sha":"e94a3ed170581b5a82b33fbae52aa59e5440a85c","path":"f.txt","ranges":[{"start_line":2,"end_line":2,"commit":{"sha":"c879c916954e2527c2c290a3aefd9dbd29c583d5","parents":[],"tree_sha":"25112f361a479cb362affd349fdf98b7d9549372","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c1","change":null,"session_id":null},"original_path":"f.txt","original_start_line":2},{"start_line":3,"end_line":3,"commit":{"sha":"5ea6473f65744357e45e476ef873539eaabdf894","parents":["dccb1e2ac5045a0393b8c9ca78770ce76457e489"],"tree_sha":"156a012498a0d513b1aeead4e128793235401724","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c3","change":null,"session_id":null},"original_path":"f.txt","original_start_line":3},{"start_line":4,"end_line":4,"commit":{"sha":"dccb1e2ac5045a0393b8c9ca78770ce76457e489","parents":["c879c916954e2527c2c290a3aefd9dbd29c583d5"],"tree_sha":"c2db841be5755f9c5c38e623743dae67506a3265","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"c2","change":null,"session_id":null},"original_path":"f.txt","original_start_line":4}]}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/search`
+
+Searches the contents of every text file of the commit `ref` names for the
+lines that match `q`, and answers one item per matching line, ordered by
+path (byte order) and then by line. It is a list (see [Lists](#lists))
+whose `limit` defaults to 50 and may be 1 to 200, with `cursor`, and names
+after `next_cursor` the commit it searched in `resolved_sha`. Its query
+parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `q` | what to look for, required, 1 to 500 characters; by default a literal string, in which characters special in regular expressions match themselves |
+| `ref` | the revision whose files are searched; default the workspace's default branch |
+| `regex` | `true` takes `q` as an extended regular expression; default `false`. The escapes `\w`, `\W`, `\s` and `\S` outside a bracket expression mean `[[:alnum:]_]`, `[^[:alnum:]_]`, `[[:space:]]` and `[^[:space:]]` with every C library git is built on |
+| `case_sensitive` | `false` matches without regard to case; default `true` |
+| `path` | a glob, repeatable: only files whose path one of the globs matches are searched (`*` within a segment, `**` across segments, the whole path, case-sensitive); default every file |
+
+A file git treats as binary (a NUL byte among its first 8,000 bytes) is
+never searched, and neither is a submodule entry. A match:
+
+| Member | Value |
+|---|---|
+| `path` | the file's path from the root |
+| `line` | the line's number, 1-based |
+| `text` | the line without its line ending (`\n` or `\r\n`), cut to its first 500 characters (characters, not bytes, so no character is split) |
+
+A `q` that holds a newline matches no line. The cursor carries the commit
+the first page resolved and the path and line of the last match of the
+page, so every page of one search reads that commit, also when `ref` moves
+between pages; a cursor used with other query parameters is refused (see
+[Lists](#lists)).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of matches, with `resolved_sha`; `items` `[]` when nothing matches |
+| `400` `invalid_request` | a bad `limit` or `cursor`; no `q`, an empty `q` or one over 500 characters (`q must have 1 to 500 characters`); a `q` holding a NUL character (`q must not contain a NUL character`); `regex` or `case_sensitive` other than `true` or `false` (`regex must be true or false`); with `regex=true`, a `q` git refuses as an extended regular expression (`q "(x" is not a valid extended regular expression`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"path":"api/greeting.go","line":3,"text":"func Greeting() string {"},{"path":"docs/a.md","line":1,"text":"# Greeting"}],"next_cursor":null,"resolved_sha":"2ecc9343e95b57b9f37e0e94ee6bae610a47b8bd"}
 ```
 
 ## Admin routes

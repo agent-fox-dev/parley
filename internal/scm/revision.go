@@ -61,6 +61,10 @@ type Repository interface {
 	// line, of the file path of the commit of a full id by the commit that
 	// last changed them, following renames, in line order.
 	Blame(ctx context.Context, commit, path string, first, last int) ([]gitrepo.BlameRange, error)
+	// Grep searches the text files of the commit of a full id for the lines
+	// q matches, in path then line order, until each returns false; a
+	// pattern git cannot take is gitrepo.ErrInvalidPattern.
+	Grep(ctx context.Context, commit string, q gitrepo.GrepQuery, each func(gitrepo.GrepMatch) bool) error
 }
 
 // Ref is a ref of a workspace as its ref view shows it.

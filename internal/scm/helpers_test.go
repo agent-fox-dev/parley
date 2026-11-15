@@ -372,6 +372,15 @@ func (w *world) addBlame(t *testing.T) map[string]string {
 	return ids
 }
 
+// addSearch adds the ready workspace search of the owner, its repository
+// made from gitrepotest.SearchStream, and returns its git directory and the
+// id of its main.
+func (w *world) addSearch(t *testing.T) (dir, main string) {
+	t.Helper()
+	dir = w.addWorkspace(t, "search", w.org, gitrepotest.SearchStream())
+	return dir, strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
+}
+
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
@@ -480,6 +489,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"diff", "/diff?base=main&head=feature/x", "/diff?base=main"},
 	{"compare", "/compare?base=main&head=feature/x", "/compare?base=main"},
 	{"blame", "/blame?path=f.txt", "/blame?path=nope.txt"},
+	{"search", "/search?q=c1", "/search"},
 }
 
 // observations is a request recorder that keeps what it was told, each

@@ -27,3 +27,24 @@ from the target, `ours` being `null`. The tests
 `base-deletes` with `trimmed`, which is `main` and a commit deleting `f.txt`;
 the other three heads are compared with `main`, and every assertion of the
 check is made on all four.
+
+## A search query holding a NUL character is refused
+
+The package accepts any `q` of 1 to 500 characters. git takes the pattern
+as a process argument, which cannot hold a NUL byte, so a `q` holding the
+character U+0000 is `400 invalid_request` (`q must not contain a NUL
+character`) before the workspace's state is checked and before any git
+runs (`internal/scm/search.go`, `gitrepo.ErrInvalidPattern` in
+`internal/gitrepo/grep.go`). A NUL could only match a line of a file whose
+first 8,000 bytes hold none, since git skips any other as binary.
+
+## A search's regular expression is the same on every platform
+
+The package says `regex=true` takes `q` as an extended regular expression,
+and its check uses `\w`, which POSIX leaves undefined: git hands the
+expression to the C library's `regcomp`, and macOS's does not know `\w`
+where glibc's does. `gitrepo.(*Repo).Grep` writes `\w`, `\W`, `\s` and
+`\S` outside bracket expressions as `[[:alnum:]_]`, `[^[:alnum:]_]`,
+`[[:space:]]` and `[^[:space:]]` before git sees the expression, so they
+mean what they mean with glibc on Linux and on macOS alike. Other GNU
+escapes, such as `\b`, `\<` and `\>`, are left to the C library.
