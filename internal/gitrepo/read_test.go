@@ -3,6 +3,7 @@ package gitrepo_test
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"slices"
 	"strings"
@@ -235,5 +236,54 @@ func TestReadTree_TellsAMissingPathFromOneThatIsNoDirectory(t *testing.T) {
 		if got, err := f.repo.ReadTree(context.Background(), c.commit, c.path, false); !errors.Is(err, c.want) {
 			t.Errorf("ReadTree(%s, %q) = %+v, %v, want %v", c.commit, c.path, got, err, c.want)
 		}
+	}
+}
+
+func TestLookupFile_FindsTheFileAPathNamesAtACommit(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	id := func(rev string) string { return strings.TrimSpace(gitrepotest.Git(t, f.repo.Dir(), "rev-parse", rev)) }
+	file := func(path string, size int64) gitrepo.TreeEntry {
+		return gitrepo.TreeEntry{Path: path, Name: path[strings.LastIndex(path, "/")+1:], Mode: "100644", ID: id(f.x + ":" + path), Type: gitrepo.ObjectBlob, Size: size}
+	}
+	for _, c := range []struct {
+		commit, path string
+		want         gitrepo.TreeEntry
+		wantErr      error
+	}{
+		{f.x, "f.txt", file("f.txt", 4), nil},
+		{f.x, "dir/x.txt", file("dir/x.txt", 2), nil},
+		{f.x, "dir.md", file("dir.md", 0), nil},
+		{f.x, "dir", gitrepo.TreeEntry{}, gitrepo.ErrNotFile},
+		{f.x, "nope", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+		{f.x, "dir/nope", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+		{f.x, "nope/x.txt", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+		{f.x, "f.txt/deeper", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+		{f.x, "", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+		{strings.Repeat("f", 40), "f.txt", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+		{f.x[:7], "f.txt", gitrepo.TreeEntry{}, gitrepo.ErrNotFound},
+	} {
+		got, err := f.repo.LookupFile(context.Background(), c.commit, c.path)
+		if !errors.Is(err, c.wantErr) || got != c.want {
+			t.Errorf("LookupFile(%s, %q) = %+v, %v, want %+v, %v", c.commit, c.path, got, err, c.want, c.wantErr)
+		}
+	}
+}
+
+func TestWriteBlob_WritesTheBytesOfABlob(t *testing.T) {
+	t.Parallel()
+	f := newReadFixture(t)
+	var b strings.Builder
+	if err := f.repo.WriteBlob(context.Background(), f.blob, &b); err != nil || b.String() != "one\n" {
+		t.Errorf("WriteBlob(f.txt at c1) wrote %q, %v; want %q", b.String(), err, "one\n")
+	}
+	for _, id := range []string{f.tr, strings.Repeat("f", 40)} {
+		if err := f.repo.WriteBlob(context.Background(), id, io.Discard); err == nil {
+			t.Errorf("WriteBlob(%s), no blob, = nil, want an error", id)
+		}
+	}
+	f.calls.Store(0)
+	if err := f.repo.WriteBlob(context.Background(), f.blob[:7], io.Discard); !errors.Is(err, gitrepo.ErrNotFound) || f.calls.Load() != 0 {
+		t.Errorf("WriteBlob(abbreviated id) = %v after %d git processes, want ErrNotFound and none", err, f.calls.Load())
 	}
 }

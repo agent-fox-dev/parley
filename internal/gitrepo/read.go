@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,6 +28,9 @@ var (
 	// than a directory where a directory is read: a file, a symlink or a
 	// submodule.
 	ErrNotDirectory = errors.New("the path is not a directory")
+	// ErrNotFile is the error of a path that names a directory or a
+	// submodule where a file is read.
+	ErrNotFile = errors.New("the path is not a file")
 )
 
 // Ref is a ref of the repository.
@@ -87,20 +92,11 @@ func (r *Repo) ReadTree(ctx context.Context, commit, path string, recursive bool
 		return Tree{}, fmt.Errorf("tree %q: %w", commit+":"+path, ErrNotFound)
 	}
 	commit = strings.ToLower(commit)
-	parent, name := "", path
-	if i := strings.LastIndexByte(path, '/'); i >= 0 {
-		parent, name = path[:i], path[i+1:]
-	}
-	treeOf := func(dir string) string {
-		if dir == "" {
-			return commit + "^{tree}"
-		}
-		return commit + ":" + dir
-	}
+	parent, name := splitPath(path)
 	// One run looks up the path and its parent: a submodule's commit is not
 	// in the repository, so only the parent's entry tells a submodule from
 	// a path that does not exist.
-	names := []string{treeOf(path), treeOf(parent)}
+	names := []string{treeName(commit, path), treeName(commit, parent)}
 	lines, err := r.batchCheck(ctx, "%(objectname) %(objecttype)", names)
 	if err != nil {
 		return Tree{}, err
@@ -138,6 +134,89 @@ func (r *Repo) ReadTree(ctx context.Context, commit, path string, recursive bool
 	// git orders a tree's entries as if a directory's name ended in "/".
 	slices.SortFunc(entries, func(a, b TreeEntry) int { return strings.Compare(a.Path, b.Path) })
 	return Tree{ID: dir, Entries: entries}, nil
+}
+
+// LookupFile is the entry of the file path of the commit of the full id
+// commit: its mode, blob id, type and size. path is a path of the commit's
+// tree, which git takes literally. A path that names no entry, or a commit
+// id that names no commit, is ErrNotFound; a path that names a directory or
+// a submodule is ErrNotFile.
+func (r *Repo) LookupFile(ctx context.Context, commit, path string) (TreeEntry, error) {
+	if len(commit) != idLen || !isHexID(commit, idLen) || path == "" || strings.ContainsAny(path, "\n\x00") {
+		return TreeEntry{}, fmt.Errorf("file %q: %w", commit+":"+path, ErrNotFound)
+	}
+	commit = strings.ToLower(commit)
+	parent, name := splitPath(path)
+	// The entry's mode is only in its directory's listing, which also tells
+	// a submodule, whose commit is not in the repository, from a missing path.
+	dir := treeName(commit, parent)
+	lines, err := r.batchCheck(ctx, "%(objectname) %(objecttype)", []string{dir})
+	if err != nil {
+		return TreeEntry{}, err
+	}
+	tree, found := strings.CutSuffix(lines[0], " "+ObjectTree)
+	if !found {
+		return TreeEntry{}, fmt.Errorf("file %s:%s: %w", commit, path, ErrNotFound)
+	}
+	prefix := ""
+	if parent != "" {
+		prefix = parent + "/"
+	}
+	entries, err := r.lsTree(ctx, tree, prefix, false)
+	if err != nil {
+		return TreeEntry{}, err
+	}
+	for _, e := range entries {
+		switch {
+		case e.Name != name:
+		case e.Type != ObjectBlob:
+			return TreeEntry{}, fmt.Errorf("file %s:%s: %w", commit, path, ErrNotFile)
+		default:
+			return e, nil
+		}
+	}
+	return TreeEntry{}, fmt.Errorf("file %s:%s: %w", commit, path, ErrNotFound)
+}
+
+// WriteBlob writes the bytes of the blob of the full id id to w as git
+// reads them, so that a file is not held in memory on its way. An id that
+// is not a full id is ErrNotFound without running git.
+func (r *Repo) WriteBlob(ctx context.Context, id string, w io.Writer) error {
+	if len(id) != idLen || !isHexID(id, idLen) {
+		return fmt.Errorf("blob %q: %w", id, ErrNotFound)
+	}
+	dir, err := privateDir(false)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	cmd := r.g.command(ctx, dir, access{}, []string{"--git-dir=" + r.dir, "cat-file", "blob", strings.ToLower(id)})
+	errOut := &limitedBuffer{limit: stderrLimit}
+	cmd.Stdout, cmd.Stderr = w, errOut
+	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("git cat-file: %w", ctxErr)
+		}
+		return fmt.Errorf("git cat-file: %w: %s", err, strings.TrimSpace(errOut.String()))
+	}
+	return nil
+}
+
+// splitPath is path's directory, "" for the root, and its last segment.
+func splitPath(path string) (dir, name string) {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[:i], path[i+1:]
+	}
+	return "", path
+}
+
+// treeName is the object name of the directory dir, "" for the root, of the
+// commit of the full id commit.
+func treeName(commit, dir string) string {
+	if dir == "" {
+		return commit + "^{tree}"
+	}
+	return commit + ":" + dir
 }
 
 // lsTree lists the entries of the tree of the full id tree, each path

@@ -38,6 +38,7 @@ const (
 	opRefs    = "refs"
 	opCommits = "commits"
 	opTree    = "tree"
+	opFile    = "file"
 )
 
 // scopeRead is the scope a personal access token needs for every read;
@@ -80,6 +81,9 @@ type Deps struct {
 	// Recorder is told of every request a read route handles; nil tells
 	// no one.
 	Recorder Recorder
+	// MaxFileSize is the size in bytes of the largest file the file route
+	// serves; zero or less is DefaultMaxFileSize.
+	MaxFileSize int64
 }
 
 // Component serves the read routes. Its zero value is ready to be
@@ -105,6 +109,9 @@ func (c *Component) Bind(d Deps) {
 	if d.Recorder == nil {
 		d.Recorder = noRecorder{}
 	}
+	if d.MaxFileSize <= 0 {
+		d.MaxFileSize = DefaultMaxFileSize
+	}
 	c.deps = d
 }
 
@@ -116,6 +123,7 @@ func (c *Component) Routes() []server.Route {
 		c.route("/commits", opCommits, c.listCommits),
 		c.route("/commits/:sha", opCommits, c.getCommit),
 		c.route("/tree", opTree, c.listTree),
+		c.route("/file", opFile, c.getFile),
 	}
 }
 

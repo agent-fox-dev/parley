@@ -285,12 +285,17 @@ const treeReadme = "# Tree\n\nA fixture.\n"
 
 // addTree adds the ready workspace tree of the owner and returns its git
 // directory. Its main holds README.md (treeReadme), the executable run.sh,
-// the symlink link to README.md, docs/a.md, docs/api/b.md and the submodule
-// entry vendor/sub; its branch big holds 1,500 files at its root, f0000.txt
-// to f1499.txt.
-func (w *world) addTree(t *testing.T) string {
+// the symlink link to README.md, docs/a.md, docs/api/b.md, the submodule
+// entry vendor/sub and the files of files, given as path and content in
+// turn; its branch big holds 1,500 files at its root, f0000.txt to
+// f1499.txt.
+func (w *world) addTree(t *testing.T, files ...string) string {
 	t.Helper()
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+	var more strings.Builder
+	for i := 0; i+1 < len(files); i += 2 {
+		more.WriteString("M 100644 inline " + files[i] + "\n" + data(files[i+1]))
+	}
 	var big strings.Builder
 	big.WriteString("blob\nmark :9\n" + data("x") + "commit refs/heads/big\n" + testCommitter + data("big"))
 	for i := range 1500 {
@@ -299,7 +304,7 @@ func (w *world) addTree(t *testing.T) string {
 	return w.addWorkspace(t, "tree", w.org, "commit refs/heads/main\n"+testCommitter+data("tree")+
 		"M 100644 inline README.md\n"+data(treeReadme)+"M 100755 inline run.sh\n"+data("#!/bin/sh\necho run\n")+
 		"M 120000 inline link\n"+data("README.md")+"M 100644 inline docs/a.md\n"+data("a\n")+
-		"M 100644 inline docs/api/b.md\n"+data("b\n")+"M 160000 "+strings.Repeat("5", 40)+" vendor/sub\n\n"+
+		"M 100644 inline docs/api/b.md\n"+data("b\n")+"M 160000 "+strings.Repeat("5", 40)+" vendor/sub\n"+more.String()+"\n"+
 		big.String()+"\n")
 }
 
@@ -367,7 +372,7 @@ func (r reply) members(key string) []string {
 
 // get sends GET path, below /api/v1, with credential as the bearer
 // credential ("" for none) and the headers header names and values in
-// turn.
+// turn, a header whose value is "" left out.
 func (w *world) get(t *testing.T, path, credential string, header ...string) reply {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, w.URL("/api/v1"+path), nil)
@@ -378,7 +383,9 @@ func (w *world) get(t *testing.T, path, credential string, header ...string) rep
 		req.Header.Set("Authorization", "Bearer "+credential)
 	}
 	for i := 0; i+1 < len(header); i += 2 {
-		req.Header.Add(header[i], header[i+1])
+		if header[i+1] != "" {
+			req.Header.Add(header[i], header[i+1])
+		}
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -405,6 +412,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"commits", "/commits", "/commits?stats=yes"},
 	{"commits", "/commits/main", "/commits/nope"},
 	{"tree", "/tree", "/tree?path=nope"},
+	{"file", "/file?path=f.txt", "/file?path=nope.txt"},
 }
 
 // observations is a request recorder that keeps what it was told, each

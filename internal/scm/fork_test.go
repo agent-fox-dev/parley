@@ -19,6 +19,9 @@ func TestRead_AForkShowsItsOwnBranchesAndItsParentsCurrentHeads(t *testing.T) {
 	if r.status != http.StatusOK || r.json["sha"] != next || r.json["tracking"] != true {
 		t.Errorf("the fork's main: %d %s, want sha %s and tracking true", r.status, r.body, next)
 	}
+	if f := w.get(t, scmPath("demo--t1", "/file?ref=main&path=f.txt"), w.ownerKey); f.status != http.StatusOK || f.header.Get("X-Parley-Resolved-Sha") != next || string(f.body) != "next\n" {
+		t.Errorf("the fork's f.txt on main: %d %q from %q, want 200 %q from %s", f.status, f.body, f.header.Get("X-Parley-Resolved-Sha"), "next\n", next)
+	}
 	list := w.get(t, scmPath("demo--t1", "/refs"), w.ownerKey)
 	if want := []string{"refs/heads/main", "refs/heads/work"}; !slices.Equal(list.names(), want) {
 		t.Errorf("the fork's branches = %q, want %q", list.names(), want)

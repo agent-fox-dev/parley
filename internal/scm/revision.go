@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -35,6 +36,10 @@ type Repository interface {
 	// ReadTree reads the directory path, "" for the root, of the commit of
 	// a full id, with recursive every entry below it.
 	ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error)
+	// LookupFile is the entry of the file path of the commit of a full id.
+	LookupFile(ctx context.Context, commit, path string) (gitrepo.TreeEntry, error)
+	// WriteBlob writes the bytes of the blob of a full id to w.
+	WriteBlob(ctx context.Context, id string, w io.Writer) error
 }
 
 // Ref is a ref of a workspace as its ref view shows it.

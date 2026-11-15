@@ -2608,7 +2608,7 @@ who reads it); the `limit` and `cursor` (`400`).
 
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
-refs routes, the two commits routes and the tree route below. Every one of them behaves
+refs routes, the two commits routes, the tree route and the file route below. Every one of them behaves
 alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
@@ -2641,7 +2641,8 @@ moves. A fork shows no `refs/parley/` ref.
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
-`tree` for the tree route) and `ok` for a status below 400,
+`tree` for the tree route, `file` for the file route) and `ok` for a status
+below 400 (a `206` included),
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
 it is told.
@@ -2660,8 +2661,8 @@ A ref object has exactly these members:
 Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
 
-A revision parameter (`ref` of `…/scm/commits` and `…/scm/tree`, `{sha}` of
-`…/scm/commits/{sha}`) is a branch name, a tag name, a full ref name or a
+A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree` and
+`…/scm/file`, `{sha}` of `…/scm/commits/{sha}`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
 the tag of that name, where both existing is ambiguous; otherwise a commit
@@ -2671,7 +2672,10 @@ expression such as `main~2`, `HEAD` or `@{1}` included, is `404`
 `ref_not_found` (such as `revision "main~2" names no commit`, `revision
 "dup" is both a branch and a tag`, `revision "4ad6" names more than one
 commit`). A `ref` that is absent is the head of the workspace's default
-branch.
+branch. Each revision of a request is resolved once, against one reading of
+the workspace's refs, and the whole answer is computed from the commit ids
+it resolved to, so a read that runs while a ref moves answers for the old
+commit or the new one, never a mix.
 
 A `path` parameter of a read that names a path of the repository is
 relative, has no empty, `.` or `..` segment, has no segment `.git` and
@@ -2833,6 +2837,72 @@ refused (see [Lists](#lists)).
 
 ```json
 {"items":[{"path":"README.md","name":"README.md","type":"blob","mode":"100644","sha":"13bcb9b3fd97cada4cd021e2e72c979c8238efa1","size":19},{"path":"docs","name":"docs","type":"tree","mode":"040000","sha":"6da2702274f2abf0f9c6f803b21a74ba377d235f"},{"path":"link","name":"link","type":"symlink","mode":"120000","sha":"42061c01a1c70097d1e4579f29a5adf40abdec95"},{"path":"run.sh","name":"run.sh","type":"blob","mode":"100755","sha":"85ba14df52f8c72688537de6e7555fb402217b1e","size":19},{"path":"vendor","name":"vendor","type":"tree","mode":"040000","sha":"a379d76fcb2ec666646b67b3d22eb53bf9fe5489"}],"next_cursor":null,"resolved_sha":"b6916afb245765e766995f2bf355f74e2aee2453","tree_sha":"1cce13dc891e3208bb9939d7b515da0889e99ccf"}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/file`
+
+Answers the file or symbolic link `path` of the commit `ref` names. Its
+query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose file is read; default the workspace's default branch |
+| `path` | the file read, required (see [Source control reads](#source-control-reads) for the paths taken) |
+
+Without `Accept: application/json` the answer is the file's bytes, a
+symbolic link's being its target, with `Content-Type:
+application/octet-stream`, `Content-Length` and the headers:
+
+| Header | Value |
+|---|---|
+| `X-Parley-Blob-Sha` | the file's blob id |
+| `X-Parley-Resolved-Sha` | the full id of the commit `ref` resolved to |
+| `X-Parley-File-Mode` | git's mode of the file: `100644`, `100755` or `120000` for a symbolic link |
+
+A `Range` header of exactly one byte range, `bytes=a-b`, `bytes=a-` or
+`bytes=-n` (the last `n` bytes), is answered `206 Partial Content` with
+those bytes, the same headers and `Content-Range: bytes <first>-<last>/<size>`;
+an end past the file is cut to its last byte. A range that starts at or
+after the end of the file (on an empty file, every range) is `416`
+`range_not_satisfiable` with `Content-Range: bytes */<size>`. A header with
+several ranges, or one that is not a byte range, is ignored and the whole
+file answered `200`.
+
+When `Accept` names `application/json`, the answer is a JSON object and a
+`Range` header is ignored:
+
+| Member | Value |
+|---|---|
+| `path` | the file's path, as asked |
+| `sha` | the file's blob id |
+| `mode` | git's mode of the file |
+| `size` | the file's size in bytes |
+| `encoding` | `utf8` when the bytes are valid UTF-8, else `base64` |
+| `content` | the bytes as text for `utf8`, their standard base64 encoding for `base64` |
+| `resolved_sha` | the full id of the commit `ref` resolved to |
+
+A file larger than the hub's file size limit, 32 MiB (33,554,432 bytes), is
+refused before any of it is read, whole or in part, in both forms; a file of
+exactly the limit is served. An error is the JSON error envelope in both
+forms.
+
+| Status | When |
+|---|---|
+| `200 OK` | the file, raw or as JSON |
+| `206 Partial Content` | one range of the raw file |
+| `400` `invalid_request` | no `path` (`path is required`); an illegal `path`; a `path` that names a directory or a submodule entry (`path "docs" is a directory or a submodule at <sha>, not a file`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope.txt" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `413` `payload_too_large` | the file is over the limit (`file "big.dat" is 33554433 bytes, over the limit of 33554432`), with the member `size`, the file's size in bytes, inside `error` |
+| `416` `range_not_satisfiable` | the one range starts at or after the end of the file |
+
+```json
+{"path":"README.md","sha":"13bcb9b3fd97cada4cd021e2e72c979c8238efa1","mode":"100644","size":19,"encoding":"utf8","content":"# Tree\n\nA fixture.\n","resolved_sha":"b6916afb245765e766995f2bf355f74e2aee2453"}
+```
+
+```json
+{"error":{"code":413,"message":"file \"big.dat\" is 33554433 bytes, over the limit of 33554432","error_type":"payload_too_large","size":33554433}}
 ```
 
 ## Admin routes
