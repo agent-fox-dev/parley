@@ -3597,7 +3597,7 @@ The change object:
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
 | `mergeable`, `conflict` | whether the commits of the current version that the onto-commit lacks rebase onto the onto-commit, the commit the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
-| `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why. `stack_too_deep`: the change sits deeper in its stack than `[changes].max_stack_depth` (its depth is the number of changes in its chain of `depends_on` links down to a change with none, itself included); its version and its `depends_on` are recorded all the same, and the flag is cleared when a link below it changes so that it is back within the limit |
+| `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why. `stack_too_deep`: the change sits deeper in its stack than `[changes].max_stack_depth` (its depth is the number of changes in its chain of `depends_on` links down to a change with none, itself included); its version and its `depends_on` are recorded all the same, and the flag is cleared when a link below it changes so that it is back within the limit. A restack clears the flag for any other reason (see [Stacks and restack](#stacks-and-restack)) |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
 | `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements` |
@@ -3621,7 +3621,8 @@ the write is answered: a git push (kind `push`), a commit (`commit`), a ref
 move (`ref`) and a rebase (`rebase`) through the [source control
 writes](#source-control-writes), each by its caller and in its session;
 and a sync from origin (`sync`), by the hub (`created_by.actor_type`
-`system`). A direct push to a protected branch records the version too
+`system`); a restack (`restack`, see [Stacks and
+restack](#stacks-and-restack)) moves it too. A direct push to a protected branch records the version too
 when that branch is the source of a draft or open change; a landing
 records none.
 A git push that deletes the source branch abandons the change; the
@@ -4078,7 +4079,10 @@ no work tree in either repository.
 of what triggers a new check: a new version of the change, a new version
 of the change it depends on, a move, creation or deletion of its target
 branch by a push, the source control API, a landing or a sync, or by a
-restore that creates it as its source branch, a retarget and a restore. It stays `unknown` until the check stores its result; a result
+restore that creates it as its source branch, a retarget and a restore. It stays `unknown` until the check stores its result, and a
+check of a change with a pending restack stores nothing: its head still
+holds the old commits of the change below, so it stays `unknown` until
+the restack has ended; a result
 for a head or an onto-commit that is no longer the change's is
 discarded and computed again. Two checks of one change start at least
 `[changes].mergeable_debounce` apart (default `5s`, see
@@ -4114,6 +4118,48 @@ When the event cannot be written, or the transaction fails, neither the
 result nor the event is stored: `mergeable` stays `unknown`, the failure
 is logged as `the mergeability check failed`, and the change's next
 trigger computes it again.
+
+## Stacks and restack
+
+A new version of a change records, in the same store transaction, a
+pending restack of each `draft` or `open` change directly above it (its
+`dependants`) whose head does not have the new head, and the push or
+commit that made the version is answered without waiting for them. When
+the version cannot record them, the version is not recorded either. A
+change has at most one pending restack: a newer one replaces it, so that
+the change is restacked once, onto the newest head below.
+
+The hub runs the pending restacks in the background, one at a time, in
+the order they were recorded; those pending when `parleyd` stopped run
+after it starts again. A restack replays the commits of the change after
+its `base_sha` up to the head of its source branch, in order, onto the
+head of the change below, in the repository's object store (no work tree
+and no ref), each with its author and message and the hub as committer,
+so that a change below that was force-pushed to an unrelated head does
+not bring its old commits along. When the source branch already has the
+head below, nothing is recorded and no event is written. Otherwise the
+source branch is moved to the result with a compare-and-swap on the head
+the restack read; when it moved in between, the restack starts again from
+the new head, at most 5 times in one run, after which nothing is changed
+and the restack stays pending.
+
+The move is recorded as the change's next version, of kind `restack`,
+created by the hub (`created_by.actor_type` `system`), with the session of
+the version it replaces, `base_sha` the head below and
+`patch_equivalent_to` the earlier version with the same diff, as any
+version has it. `needs_restack` is cleared unless its reason is
+`stack_too_deep`, and the version restacks the changes above it in turn,
+bottom first. The hub writes, by `system`, `parley.change.version` with
+`kind` `restack` and then `parley.change.restack` with `number`, `ref`,
+`version`, `head_sha` (the dependant's new version and head), `onto_sha`
+(the head it was restacked onto) and `trigger` (`version`). A restack
+whose source branch already sat on the head below clears a
+`needs_restack` set for `conflict` or `auto_restack_off`. A restack
+whose replay conflicts moves nothing and ends; the change's mergeability
+check then reports the conflict. A restack that fails for another reason
+than a conflict changes nothing; it is logged as `the restack failed`
+with `workspace`, `number` and `error`, and stays pending until a newer
+restack of the change replaces it or `parleyd` starts again.
 
 ## Admin routes
 

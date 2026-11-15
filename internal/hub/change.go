@@ -35,6 +35,14 @@ const (
 	mergeabilityGrace = 5 * time.Second
 )
 
+// restackWork is the name of the background work that runs the pending
+// restacks; restackGrace is how long the stop waits for it, which ends the
+// git process of a running replay at once and leaves its restack pending.
+const (
+	restackWork  = "change_restack"
+	restackGrace = 5 * time.Second
+)
+
 // composeChanges adds the changes: the schema of the change record, the
 // change routes under /workspaces/:slug/changes, whose scope and access
 // need the shared checks decide, and the component, bound in a start hook to
@@ -115,6 +123,18 @@ const (
 // change record, the commit a change must sit on once the change below it
 // landed, is added by StackStep.
 //
+// A new version of a change records, in its transaction, a pending restack
+// of each change directly above it that is not built on the new head; the
+// table of pending restacks is added by RestackStep. The restacks run as
+// background work (RunRestacks), one at a time in the order they were
+// recorded, those pending at the start first: each replays the change's
+// own commits onto the head below in the object store, moves the source
+// branch with a compare-and-swap and records a version of kind restack by
+// the hub in one store transaction, with parley.change.restack after its
+// version event, which records the restacks of the changes above it in
+// turn. The mergeability check of a change with a pending restack stores
+// nothing until the restack has ended.
+//
 // No session linker, landing evaluator or auto_land guard is registered:
 // without a session linker an explicit session_id is refused and a
 // defaulted one dropped; without a landing evaluator every open change is
@@ -130,6 +150,7 @@ func composeChanges(c *Composition) {
 	c.AddSchemaStep(change.MergeableStep)
 	c.AddSchemaStep(change.AnnouncedStep)
 	c.AddSchemaStep(change.StackStep)
+	c.AddSchemaStep(change.RestackStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
@@ -184,6 +205,7 @@ func composeChanges(c *Composition) {
 	})
 	c.AddStartHook(reconcileHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
 	c.AddBackgroundWork(mergeabilityWork, mergeabilityGrace, func(ctx context.Context, _ *Runtime) { comp.RunMergeability(ctx) })
+	c.AddBackgroundWork(restackWork, restackGrace, func(ctx context.Context, _ *Runtime) { comp.RunRestacks(ctx) })
 }
 
 // changeWorkspaces reads the workspace records for the change component,

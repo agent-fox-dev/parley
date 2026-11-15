@@ -27,11 +27,37 @@ import (
 // left behind when it stops. The commits of a rebase that conflicts stay
 // unreferenced, for git's garbage collection.
 func (r *Repo) Rebase(ctx context.Context, onto, head string, at time.Time) (string, *ConflictReport, error) {
+	return r.rebase(ctx, onto, head, onto, at)
+}
+
+// RebaseFrom is Rebase of the commits that head reaches and base does not,
+// the commits of a branch made on base, on top of onto, which may share
+// nothing with base: base's own commits are not replayed, also when onto
+// does not have them. A base of "" replays every commit of head. The
+// report of a commit that does not apply names base as its base.
+func (r *Repo) RebaseFrom(ctx context.Context, base, head, onto string, at time.Time) (string, *ConflictReport, error) {
+	newHead, report, err := r.rebase(ctx, base, head, onto, at)
+	if report != nil {
+		report.BaseSHA = base
+	}
+	return newHead, report, err
+}
+
+// rebase replays the commits from..head, every commit of head for a from
+// of "", on top of onto, as Rebase says.
+func (r *Repo) rebase(ctx context.Context, from, head, onto string, at time.Time) (string, *ConflictReport, error) {
 	onto, head, err := rangeEnds(onto, head)
 	if err != nil {
 		return "", nil, err
 	}
-	commits, err := r.replayed(ctx, onto, head)
+	commitRange := head
+	if from != "" {
+		if from, _, err = rangeEnds(from, head); err != nil {
+			return "", nil, err
+		}
+		commitRange = from + ".." + head
+	}
+	commits, err := r.replayed(ctx, commitRange)
 	switch {
 	case err != nil:
 		return "", nil, err
@@ -46,7 +72,7 @@ func (r *Repo) Rebase(ctx context.Context, onto, head string, at time.Time) (str
 	if err != nil {
 		return "", nil, err
 	}
-	zones, err := r.authorZones(ctx, onto, head)
+	zones, err := r.authorZones(ctx, commitRange)
 	if err != nil {
 		return "", nil, err
 	}
@@ -73,10 +99,10 @@ func (r *Repo) Rebase(ctx context.Context, onto, head string, at time.Time) (str
 	return newHead, nil, nil
 }
 
-// authorZones maps each commit of the range onto..head to the zone of its
-// author's time, which ReadCommits gives in UTC.
-func (r *Repo) authorZones(ctx context.Context, onto, head string) (map[string]*time.Location, error) {
-	out, err := r.git(ctx, "rev-list", "--no-commit-header", "--date=raw", "--format=%H %ad", onto+".."+head)
+// authorZones maps each commit of the rev-list range commitRange to the
+// zone of its author's time, which ReadCommits gives in UTC.
+func (r *Repo) authorZones(ctx context.Context, commitRange string) (map[string]*time.Location, error) {
+	out, err := r.git(ctx, "rev-list", "--no-commit-header", "--date=raw", "--format=%H %ad", commitRange)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +126,8 @@ func (r *Repo) authorZones(ctx context.Context, onto, head string) (map[string]*
 	return zones, nil
 }
 
-// replay is the replay both rebases share: it replays commits, the range
-// onto..head that replayed lists, oldest first, on top of onto, each as a
+// replay is the replay the rebases and the trial share: it replays
+// commits, a range that replayed lists, which head ends, oldest first, on top of onto, each as a
 // three-way merge with its parent as the merge base, and returns the commit
 // the last one left to replay onto, or the report of the first that does
 // not apply.

@@ -236,13 +236,21 @@ func (c *Component) checkFailed(ctx context.Context, k mergeKey, err error) {
 // commit its check rebases onto: the head of the change it depends on
 // while that one is draft or open, otherwise the head of its target
 // branch, "" when that branch does not exist. live is false for a change
-// that is neither draft nor open, or that does not exist.
+// that is neither draft nor open, or that does not exist, and for one with
+// a pending restack: its head still holds the old commits of the change
+// below, which a check would replay onto the new ones and report as a
+// conflict; the end of the restack schedules its check again.
 func (c *Component) mergePair(ctx context.Context, q Querier, workspace string, number int64) (ch Change, onto string, live bool, err error) {
 	ch, err = readChange(ctx, q, workspace, number)
 	if errors.Is(err, ErrChangeNotFound) {
 		return Change{}, "", false, nil
 	}
 	if err != nil || (ch.State != StateDraft && ch.State != StateOpen) {
+		return ch, "", false, err
+	}
+	var pending bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM change_restacks WHERE workspace_slug = ? AND number = ?)`,
+		workspace, number).Scan(&pending); err != nil || pending {
 		return ch, "", false, err
 	}
 	if ch.DependsOn != nil {

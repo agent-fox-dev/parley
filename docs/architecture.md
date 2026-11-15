@@ -3533,9 +3533,10 @@ in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 `change.SchemaStep` (the step `changes`) and right after it
 `change.AutoLandSetterStep` (`change_auto_land_setter`),
 `change.MergeableStep` (`change_mergeable`), `change.AnnouncedStep`
-(`change_ready_announced`) and `change.StackStep` (`change_stack`, the
+(`change_ready_announced`), `change.StackStep` (`change_stack`, the
 column `restack_onto`: the commit a change must sit on once the change
-below it landed, `NULL` for none), registers its `Routes()` with
+below it landed, `NULL` for none) and `change.RestackStep`
+(`change_restacks`, the table of pending restacks), registers its `Routes()` with
 `AddRoute`, and binds it in the start hook `changes` to the store
 (`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
 (`Repos`), the access service (`Access`), `changeWorkspaces` (`Workspaces`), an adapter over
@@ -3547,7 +3548,8 @@ hub's clock and logger, and `[changes].mergeable_debounce`
 after it, the start hook `changes-reconcile` runs `Reconcile` (below), so
 it runs after the `push-journal` hook and before the listener is bound. It
 adds the background work `change_mergeability` (grace 5 s), which runs
-`RunMergeability` until the stop.
+`RunMergeability` until the stop, and `change_restack` (grace 5 s), which
+runs `RunRestacks` (below).
 
 The schema keeps `changes` (one row per change, keyed by target workspace
 and number, with the current version's head, base, stats, touched paths
@@ -3686,7 +3688,65 @@ with none, itself included) and of every draft or open change above it
 `SetNeedsRestack` on each one deeper than `Deps.MaxStackDepth` (from
 `[changes].max_stack_depth`, `DefaultMaxStackDepth` 20 when zero), and
 clears both on a change so flagged that is back within the limit. Depth
-never refuses a version or a link. `ReadChange(ctx, q, workspace, number)` reads
+never refuses a version or a link.
+
+Last, `LinkVersion` records a pending restack (`pendRestack`, trigger
+`version`) of each direct dependant of the change whose head does not
+have the new head (`IsAncestor` in the target's repository), in the
+version's transaction, so that an error writing it undoes the version.
+`pendRestack(ctx, tx, ch, trigger, onto)` is the one writer of a pending
+restack: `INSERT OR REPLACE` into `change_restacks` (`seq` `INTEGER
+PRIMARY KEY AUTOINCREMENT`, `workspace_slug`, `number`, `trigger`, `onto`
+— the commit to sit on when the record names one, `''` otherwise — unique
+per change, deleted with it), so a newer record replaces the older with a
+higher `seq`, then wakes the worker. `RunRestacks(ctx)`
+(`restack_queue.go`) is one goroutine: it runs a pass at the start, which
+runs what was pending when the hub stopped, and one each time it is
+woken; a pass reads, in a `Store.Tx` (so it waits for the transaction that
+recorded it), the lowest `seq` not marked failed in memory, runs it, and
+repeats until none is left. A restack that returns an error, or loses the
+swap 5 times, is logged as `the restack failed` (`workspace`, `number`,
+`error`) and marked failed with its `seq`, so it stays pending and runs
+again when a newer record replaces it or at the next start.
+
+The restack (`restack.go`, `restack(ctx, job, caller, session)`) reads the
+change in a `Store.Tx` (gone, or neither draft nor open: the record is
+removed) and the commit it must sit on (`sitOn`: the head of the
+`depends_on` change while that one is draft or open, else the record's
+`onto` or the change's `restack_onto`, else the head of the target branch
+in the target's repository). Outside any transaction it resolves the
+source branch in the source workspace's repository; when the head has the
+commit already (`IsAncestor`) the restack is up to date: in a transaction,
+the record is removed, a `needs_restack` with reason `conflict` or
+`auto_restack_off` is cleared, `restack_onto` is cleared, and the
+mergeability check is scheduled when a record was removed or a flag
+cleared. Otherwise it replays `base_sha..head` onto the commit with
+`(*gitrepo.Repo).RebaseFrom(ctx, base, head, onto, at)`, which differs from
+`Rebase` only in replaying the commits after `base` instead of those
+`onto` lacks, so that the old commits of a change below that was
+force-pushed or landed are not replayed; its conflict report's `base_sha`
+is `base`. A conflict ends the restack: the record is removed and the
+mergeability check scheduled, which reports it. Then, in one `Store.Tx`,
+it reads the change and the commit to sit on again (moved: the attempt
+starts again), moves the source branch with `CompareAndSwapRef` on the
+head it read (`ErrRefMoved`, also for a ref a push has locked: the
+attempt starts again, at most 5 in all), records the version with
+`RecordVersion` (kind `restack`, by the zero `Caller` for the hub, the
+session of the change's current version with `VersionInput.SessionChecked`
+set, so the session linker is not asked again; without a session linker
+the session is dropped), clears `needs_restack` unless its reason is
+`stack_too_deep` and `restack_onto`, writes `parley.change.restack`
+(`EventRestack`, metadata `version`, `head_sha`, `onto_sha`, `trigger`)
+after the version's event, schedules the changes whose target is the
+moved branch (`ScheduleTargetMergeable`, since no ref-updated stage saw
+the move) and removes the record by its `seq`, so that a newer record
+written meanwhile stays. When that transaction fails after the swap, the
+branch is set back with a compare-and-swap. The version runs the stack
+linker like any other, which records the restacks of the changes above
+it, so a stack is restacked bottom first. The tests set the replay and a
+hook before the swap through `export_test.go` (`SetRestackSeams`), hold
+the worker (`HoldRestacks`) and run passes in the test's goroutine
+(`RestackPass`). `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
 The change's `dependants` are not stored: every read derives them as the
@@ -3879,8 +3939,10 @@ ended check or the next due time. A check reads the change and its
 onto-commit in a `Store.Tx` of its own, which waits for the transaction
 that scheduled it: the head of the `depends_on` change while that one is
 draft or open, else the head of the target branch in the target
-workspace's repository. A change that is neither draft nor open is
-dropped; a missing target branch leaves `mergeable` `unknown` and runs
+workspace's repository. A change that is neither draft nor open, or that
+has a pending restack (`change_restacks`), is dropped, since its head
+still holds the old commits of the change below: the end of the restack
+schedules it again; a missing target branch leaves `mergeable` `unknown` and runs
 `reevaluateLanding` (draft: `blocked/draft`; else the structural reason
 `measureMove` finds, `target_not_found` here; else the landing evaluator
 with the current version; else ready). Otherwise the check runs

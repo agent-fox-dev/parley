@@ -66,6 +66,11 @@ const (
 	// RestackTooDeep is the reason of a change that sits deeper in its
 	// stack than [changes].max_stack_depth.
 	RestackTooDeep = "stack_too_deep"
+	// RestackConflict is the reason of a change whose restack conflicted.
+	RestackConflict = "conflict"
+	// RestackAutoOff is the reason of a change that a workspace with
+	// changes.auto_restack off does not restack.
+	RestackAutoOff = "auto_restack_off"
 )
 
 // DefaultMaxStackDepth is the deepest a change may sit in its stack when
@@ -401,7 +406,8 @@ type Component struct {
 	expanders map[string]Expander
 
 	// merge holds the scheduled mergeability checks.
-	merge mergeWorker
+	merge    mergeWorker
+	restacks restackWorker
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

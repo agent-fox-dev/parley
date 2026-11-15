@@ -138,6 +138,47 @@ func TestRebase_ReportsTheConflictAndLeavesNothingBehind(t *testing.T) {
 	}
 }
 
+func TestRebaseFrom_ReplaysOnlyTheCommitsAfterTheBase(t *testing.T) {
+	t.Parallel()
+	f := newRebaseFixture(t)
+	for _, c := range []struct {
+		name, base, head, onto string
+		// files are the files the new head changes on onto, its parent;
+		// kept is set for a head that comes back as it is.
+		files string
+		kept  bool
+	}{
+		{"the commits after a base below the head", "feature~1", "feature", "main", "b.txt", false},
+		{"no base replays every commit of the head", "", "both-add", "trimmed", "f.txt", false},
+		{"a base that is onto keeps the head", "main~1", "feature", "main~1", "", true},
+	} {
+		base := c.base
+		if base != "" {
+			base = f.id(t, base)
+		}
+		head, onto := f.id(t, c.head), f.id(t, c.onto)
+		got, report, err := f.repo.RebaseFrom(context.Background(), base, head, onto, rebaseAt)
+		switch {
+		case err != nil || report != nil:
+			t.Errorf("%s: RebaseFrom = %q, %+v, %v; want a new head", c.name, got, report, err)
+		case c.kept && got != head:
+			t.Errorf("%s: RebaseFrom = %s, want the head %s", c.name, got, head)
+		case !c.kept && (f.id(t, got+"^") != onto || gitrepotest.Git(t, f.dir, "diff", "--name-only", onto, got) != c.files):
+			t.Errorf("%s: the new head %s is not one commit on %s changing %s alone", c.name, got, c.onto, c.files)
+		}
+	}
+
+	base, head, onto := f.id(t, "both-edit~1"), f.id(t, "both-edit"), f.id(t, "main")
+	got, report, err := f.repo.RebaseFrom(context.Background(), base, head, onto, rebaseAt)
+	if got != "" || err != nil || report == nil {
+		t.Fatalf("RebaseFrom(both-edit~1, both-edit, main) = %q, %+v, %v; want a conflict", got, report, err)
+	}
+	if report.BaseSHA != base || report.CommitSHA != head || report.TargetSHA != onto || report.HeadSHA != head {
+		t.Errorf("the report names base %s, commit %s, target %s, head %s; want %s, %s, %s, %s",
+			report.BaseSHA, report.CommitSHA, report.TargetSHA, report.HeadSHA, base, head, onto, head)
+	}
+}
+
 // repoFiles are the paths of the files of the git directory dir outside
 // objects/, such as an index, a lock or a work tree a rebase could leave.
 func repoFiles(t *testing.T, dir string) []string {

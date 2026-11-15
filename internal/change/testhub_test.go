@@ -666,17 +666,16 @@ func (w *world) settled(t *testing.T, number int64) change.Change {
 	}
 }
 
-// quiet waits until no mergeability check is waiting or running, so that
-// the worker writes nothing until the next trigger; it returns at once
-// while hold keeps the checks from starting.
+// quiet waits until the restack worker has nothing to run and no
+// mergeability check is waiting or running, so that the workers write
+// nothing until the next trigger; it does not wait for the restacks while
+// holdRestacks holds them, or for the checks while hold keeps them from
+// starting. The restacks are asked first, since they schedule checks.
 func (w *world) quiet(t *testing.T) {
 	t.Helper()
-	if w.held {
-		return
-	}
-	for deadline := time.Now().Add(20 * time.Second); !change.MergeableQuiet(w.changes); time.Sleep(5 * time.Millisecond) {
+	for deadline := time.Now().Add(20 * time.Second); !change.RestacksQuiet(w.changes) || !(w.held || change.MergeableQuiet(w.changes)); time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatal("the mergeability checks did not end")
+			t.Fatal("the restacks and the mergeability checks did not end")
 		}
 	}
 }
@@ -698,4 +697,79 @@ func (w *world) trigger(t *testing.T, number int64) {
 	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
 		return w.changes.ScheduleMergeable(ctx, tx, "demo", number)
 	})
+}
+
+// holdRestacks keeps the restack worker from running any pending restack
+// until the test ends, so that the test runs them with runPending.
+func (w *world) holdRestacks(t *testing.T) {
+	t.Helper()
+	change.HoldRestacks(w.changes)
+}
+
+// runPending runs the pending restacks in the test's goroutine, those they
+// record too, until none is left that has not failed, then waits for the
+// mergeability checks they scheduled.
+func (w *world) runPending(t *testing.T) {
+	t.Helper()
+	change.RestackPass(context.Background(), w.changes)
+	w.quiet(t)
+}
+
+// pending are the numbers of the changes of demo with a pending restack,
+// in the order the restacks were recorded.
+func (w *world) pending(t *testing.T) []int64 {
+	t.Helper()
+	out, err := w.Store.Main().Query(`SELECT number FROM change_restacks WHERE workspace_slug = 'demo' ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	numbers := []int64{}
+	for out.Next() {
+		var n int64
+		if err := out.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		numbers = append(numbers, n)
+	}
+	return numbers
+}
+
+// head is the commit the branch of demo is at.
+func (w *world) head(t *testing.T, branch string) string {
+	t.Helper()
+	return gitrepotest.Refs(t, w.demo, "refs/heads/")[branch]
+}
+
+// amend replaces the tip commit of the branch of demo by one on the same
+// parent that sets files, records it as the next version of the branch's
+// change, pushed by the owner, and returns it.
+func (w *world) amend(t *testing.T, branch string, files map[string]string) string {
+	t.Helper()
+	head := commit(t, w.demo, branch, gitrepotest.Git(t, w.demo, "rev-parse", branch+"^"), branch+" amended\n", files)
+	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: branch, Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
+	return head
+}
+
+// subjects are the subjects of the commits of demo after base up to head,
+// oldest first.
+func (w *world) subjects(t *testing.T, base, head string) []string {
+	t.Helper()
+	out := gitrepotest.Git(t, w.demo, "log", "--reverse", "--format=%s", base+".."+head)
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+// restackEvents are the parley.change.restack events after seq, by the
+// number of their change.
+func (w *world) restackEvents(t *testing.T, seq int64) (numbers []string, meta []map[string]any) {
+	t.Helper()
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.Type == change.EventRestack {
+			numbers, meta = append(numbers, e.ResourceID), append(meta, metadata(t, e))
+		}
+	}
+	return numbers, meta
 }

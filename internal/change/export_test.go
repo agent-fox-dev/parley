@@ -62,3 +62,49 @@ func MergeableQuiet(c *Component) bool {
 	defer w.mu.Unlock()
 	return len(w.queued) == 0 && len(w.running) == 0
 }
+
+// RestackSeams replace what a restack runs with: the replay of a change's
+// commits after its base onto the commit it sits on, and a hook called
+// between the replay and the swap of the source branch with the attempt's
+// number, from 1; nil keeps the hub's.
+type RestackSeams struct {
+	Rebase     func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time) (string, *gitrepo.ConflictReport, error)
+	BeforeSwap func(ctx context.Context, workspace string, number int64, attempt int)
+}
+
+// SetRestackSeams makes s the seams of c's restacks.
+func SetRestackSeams(c *Component, s RestackSeams) {
+	w := &c.restacks
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.rebase, w.beforeSwap = s.Rebase, s.BeforeSwap
+}
+
+// HoldRestacks keeps c's restack worker from running any pending restack
+// from its return on, so that a test runs them with RestackPass.
+func HoldRestacks(c *Component) {
+	w := &c.restacks
+	for {
+		w.mu.Lock()
+		w.held = true
+		running := w.running
+		w.mu.Unlock()
+		if !running {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// RestackPass runs, in the caller's goroutine, the pending restacks of c
+// until none is left that has not failed, and returns how many ran.
+func RestackPass(ctx context.Context, c *Component) int { return c.restackPass(ctx, false) }
+
+// RestacksQuiet reports whether c's restack worker has nothing to run and
+// is not running, or is held.
+func RestacksQuiet(c *Component) bool {
+	w := &c.restacks
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.held || (!w.signaled && !w.running)
+}

@@ -40,12 +40,48 @@ type stacks struct{ c *Component }
 // it, the link is the nearest change below the head, or none, which
 // leaves the merge base with the target branch that recording the version
 // measured. The depth of ch, and of every change above it, follows the
-// link.
+// link. Each change directly above ch that is not built on the new head
+// gets a pending restack onto it, recorded in tx, so that a version is
+// never stored without the restacks it owes.
 func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Version, dependsOn *int64) error {
 	if err := s.link(ctx, tx, ch, v, dependsOn); err != nil {
 		return err
 	}
-	return s.recomputeDepth(ctx, tx, ch.WorkspaceSlug, ch.Number)
+	if err := s.recomputeDepth(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
+		return err
+	}
+	return s.pendDependants(ctx, tx, ch, v)
+}
+
+// pendDependants records a pending restack, for a new version, of each
+// direct dependant of the change ch whose head does not have the head of
+// ch's new version v. Ancestry is asked of the target's repository, which
+// holds every version head of its changes.
+func (s stacks) pendDependants(ctx context.Context, tx *sql.Tx, ch Change, v Version) error {
+	deps, err := dependants(ctx, tx, ch.WorkspaceSlug, ch.Number)
+	if err != nil || len(deps) == 0 {
+		return err
+	}
+	repo, err := s.c.deps.Repos(ctx, ch.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	for _, n := range deps {
+		d, err := readChange(ctx, tx, ch.WorkspaceSlug, n)
+		if err != nil {
+			return err
+		}
+		built, err := repo.IsAncestor(ctx, v.HeadSHA, d.HeadSHA)
+		if err != nil {
+			return err
+		}
+		if !built {
+			if err := s.c.pendRestack(ctx, tx, d, TriggerVersion, ""); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // link links the change ch for its new version v, as LinkVersion says.
