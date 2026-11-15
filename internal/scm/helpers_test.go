@@ -1,6 +1,7 @@
 package scm_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -157,6 +159,14 @@ func newWorld(t *testing.T, adjust ...func(*scm.Deps)) *world {
 // newConfiguredWorld is newWorld with toml added to the hub's config.toml.
 func newConfiguredWorld(t testing.TB, toml string, adjust ...func(*scm.Deps)) *world {
 	t.Helper()
+	return newComposedWorld(t, toml, nil, adjust...)
+}
+
+// newComposedWorld is newConfiguredWorld with compose, when it is not nil,
+// run on the hub's composition after the world's own changes, such as to
+// add a route or register a collaborator.
+func newComposedWorld(t testing.TB, toml string, compose func(*hub.Composition), adjust ...func(*scm.Deps)) *world {
+	t.Helper()
 	w := &world{observed: &observations{}, id: map[string]string{}}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{TOML: toml, Compose: func(c *hub.Composition) {
 		w.workspaces, w.events = c.Workspaces(), c.Events()
@@ -171,6 +181,9 @@ func newConfiguredWorld(t testing.TB, toml string, adjust ...func(*scm.Deps)) *w
 				a(d)
 			}
 		})
+		if compose != nil {
+			compose(c)
+		}
 	}})
 	now := time.Now().UTC()
 	w.owner, w.member = w.CreateUser(t, "owner"), w.CreateUser(t, "member")
@@ -552,9 +565,27 @@ func (w *world) get(t *testing.T, path, credential string, header ...string) rep
 // send is get with the method method.
 func (w *world) send(t *testing.T, method, path, credential string, header ...string) reply {
 	t.Helper()
-	req, err := http.NewRequest(method, w.URL("/api/v1"+path), nil)
+	return w.sendJSON(t, method, path, credential, nil, header...)
+}
+
+// sendJSON is send with body, when it is not nil, encoded as JSON as the
+// request's body.
+func (w *world) sendJSON(t *testing.T, method, path, credential string, body any, header ...string) reply {
+	t.Helper()
+	var content io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, w.URL("/api/v1"+path), content)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if credential != "" {
 		req.Header.Set("Authorization", "Bearer "+credential)
@@ -617,3 +648,307 @@ func (o *observations) reset() []string {
 	o.seen = nil
 	return seen
 }
+
+// writeWorld is a world whose writes the tests watch: the change linker
+// registered on its scm routes, scm, is linker and the session linker
+// sessions; stage is a ref-updated stage and pushes a post-push listener
+// registered with its ref writer.
+type writeWorld struct {
+	*world
+	scm      *scm.Component
+	linker   *fakeLinker
+	sessions *fakeSessions
+	stage    *recordingStage
+	pushes   *postPushes
+}
+
+// newWriteWorld starts a writeWorld, with toml added to the hub's
+// config.toml and adjust changing the scm routes' dependencies.
+func newWriteWorld(t *testing.T, toml string, adjust ...func(*scm.Deps)) *writeWorld {
+	t.Helper()
+	ww := &writeWorld{linker: &fakeLinker{changes: map[string]*scm.LinkedChange{}}, sessions: &fakeSessions{},
+		stage: &recordingStage{}, pushes: &postPushes{}}
+	ww.world = newComposedWorld(t, toml, func(c *hub.Composition) {
+		ww.scm = c.SCM()
+		ww.scm.RegisterChangeLinker(ww.linker)
+		ww.scm.RegisterSessionLinker(ww.sessions)
+		c.RefWriter().RegisterRefUpdatedStage(ww.stage.run)
+		c.RefWriter().RegisterPostPushListener(ww.pushes.listen)
+	}, adjust...)
+	return ww
+}
+
+// fakeLinker is a change linker that answers changes, by branch, to every
+// lookup and records the branches it was asked about, and the source
+// branches of the openings it was asked to check or open. Its checks pass
+// and its openings open nothing until script says otherwise.
+type fakeLinker struct {
+	mu       sync.Mutex
+	changes  map[string]*scm.LinkedChange
+	asked    []string
+	opened   []string
+	checkErr error
+	open     *scm.LinkedChange
+	openErr  error
+	look     func(scm.ChangeOpening) string
+	openings []opening
+}
+
+// opening is an opening the linker was asked to check or to open: kind is
+// check or open, and looked what the linker's look answered meanwhile.
+type opening struct {
+	kind   string
+	o      scm.ChangeOpening
+	looked string
+}
+
+// answer makes the linker name change as the source change of branch, none
+// when change is nil.
+func (f *fakeLinker) answer(branch string, change *scm.LinkedChange) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.changes[branch] = change
+}
+
+// script makes the linker's check answer checkErr and its opening answer
+// open and openErr, and run look, when it is not nil, with every opening
+// it checks or opens, keeping its answer; it forgets the openings it was
+// asked for.
+func (f *fakeLinker) script(checkErr error, open *scm.LinkedChange, openErr error, look func(scm.ChangeOpening) string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkErr, f.open, f.openErr, f.look, f.openings = checkErr, open, openErr, look, nil
+}
+
+func (f *fakeLinker) FindOpen(_ context.Context, slug, branch string) (*scm.LinkedChange, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, slug+" "+branch)
+	return f.changes[branch], nil
+}
+
+func (f *fakeLinker) CheckOpening(_ context.Context, o scm.ChangeOpening) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, "check "+o.SourceWorkspace+" "+o.SourceBranch)
+	f.record("check", o)
+	return f.checkErr
+}
+
+func (f *fakeLinker) Open(_ context.Context, o scm.ChangeOpening) (*scm.LinkedChange, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, "open "+o.SourceWorkspace+" "+o.SourceBranch)
+	f.record("open", o)
+	return f.open, f.openErr
+}
+
+// record keeps the opening o the linker was asked to check or open, as
+// kind; f.mu is held.
+func (f *fakeLinker) record(kind string, o scm.ChangeOpening) {
+	op := opening{kind: kind, o: o}
+	if f.look != nil {
+		op.looked = f.look(o)
+	}
+	f.openings = append(f.openings, op)
+}
+
+// calls forgets the lookups and openings the linker was asked for and
+// returns them.
+func (f *fakeLinker) calls() (asked, opened []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	asked, opened = f.asked, f.opened
+	f.asked, f.opened, f.openings = nil, nil, nil
+	return asked, opened
+}
+
+// asks forgets the openings the linker was asked to check or open, and the
+// lookups, and returns the openings.
+func (f *fakeLinker) asks() []opening {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ops := f.openings
+	f.asked, f.opened, f.openings = nil, nil, nil
+	return ops
+}
+
+// fakeSessions is a session linker that records what it is asked and
+// accepts every session id, giving it back in lower case, until refuse
+// makes it answer an error.
+type fakeSessions struct {
+	mu   sync.Mutex
+	err  error
+	seen []sessionCheck
+}
+
+// sessionCheck is one check the session linker was asked for.
+type sessionCheck struct {
+	caller        identity.Principal
+	session, slug string
+}
+
+// refuse makes the linker answer err to every check, accepting every id
+// again when err is nil, and forgets the checks it was asked for.
+func (f *fakeSessions) refuse(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err, f.seen = err, nil
+}
+
+func (f *fakeSessions) Check(_ context.Context, caller identity.Principal, session, slug string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, sessionCheck{caller: caller, session: session, slug: slug})
+	if f.err != nil {
+		return "", f.err
+	}
+	return strings.ToLower(session), nil
+}
+
+// checks forgets the checks the linker was asked for and returns them.
+func (f *fakeSessions) checks() []sessionCheck {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := f.seen
+	f.seen = nil
+	return seen
+}
+
+// postPushes is a post-push listener that keeps what it is told.
+type postPushes struct {
+	mu   sync.Mutex
+	seen []pushrule.PostPush
+}
+
+func (p *postPushes) listen(_ context.Context, pp pushrule.PostPush) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seen = append(p.seen, pp)
+	return nil
+}
+
+// wait is what the listener was told once it was told n times, or what it
+// was told by the time a few seconds have passed; each call runs on a
+// goroutine of its own, after the answer.
+func (p *postPushes) wait(n int) []pushrule.PostPush {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.mu.Lock()
+		seen := slices.Clone(p.seen)
+		p.mu.Unlock()
+		if len(seen) >= n || time.Now().After(deadline) {
+			return seen
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// recordingStage is a ref-updated stage that records what it is given and
+// reports versions, by ref, for the updates of a request; look, when set,
+// runs with each request it is given, its answer kept in looked.
+type recordingStage struct {
+	mu       sync.Mutex
+	versions map[string]*pushrule.Version
+	seen     []pushrule.StageInput
+	look     func(pushrule.StageInput) string
+	looked   []string
+}
+
+func (s *recordingStage) run(_ context.Context, _ *sql.Tx, in pushrule.StageInput) ([]*pushrule.Version, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen = append(s.seen, in)
+	if s.look != nil {
+		s.looked = append(s.looked, s.look(in))
+	}
+	versions := make([]*pushrule.Version, len(in.Updates))
+	for i, u := range in.Updates {
+		versions[i] = s.versions[u.Ref]
+	}
+	return versions, nil
+}
+
+// reset forgets what the stage was given and returns it.
+func (s *recordingStage) reset() []pushrule.StageInput {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := s.seen
+	s.seen, s.looked = nil, nil
+	return seen
+}
+
+// script makes the stage report versions and run look, and forgets what
+// it was given.
+func (s *recordingStage) script(versions map[string]*pushrule.Version, look func(pushrule.StageInput) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.versions, s.look, s.seen, s.looked = versions, look, nil, nil
+}
+
+// lookedAt is what look answered for each request since the last reset.
+func (s *recordingStage) lookedAt() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.looked)
+}
+
+// pushEvent is the metadata of a parley.git.push event.
+type pushEvent struct {
+	Ref                              string
+	Before, After                    *string
+	Created, Deleted, Forced, Direct bool
+	Via                              string
+}
+
+// lastSeq is the sequence number of the last event of the hub's log.
+func (w *world) lastSeq(t *testing.T) int64 {
+	t.Helper()
+	_, seq, err := w.events.ReadAfter(context.Background(), 0, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// eventsAfter are the types of the events after the sequence number seq,
+// and the metadata of those that are parley.git.push events.
+func (w *world) eventsAfter(t *testing.T, seq int64) (types []string, pushes []pushEvent) {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), seq, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range recs {
+		types = append(types, rec.Type)
+		if rec.Type != pushrule.EventPush {
+			continue
+		}
+		var p pushEvent
+		if err := json.Unmarshal(rec.Metadata, &p); err != nil {
+			t.Fatal(err)
+		}
+		pushes = append(pushes, p)
+	}
+	return types, pushes
+}
+
+// recordsAfter are the events of the hub's log after the sequence number
+// seq.
+func (w *world) recordsAfter(t *testing.T, seq int64) []event.Record {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), seq, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recs
+}
+
+// refsStream is the history of a workspace the writes of refs work on:
+// main is m1, adding README.md, api/old.go and docs/guide.md, then m2,
+// changing README.md.
+const refsStream = "commit refs/heads/main\nmark :1\n" + testCommitter + "data 2\nm1\n" +
+	"M 100644 inline README.md\ndata 7\nreadme\n\nM 100644 inline api/old.go\ndata 12\npackage api\n\n" +
+	"M 100644 inline docs/guide.md\ndata 6\nguide\n\n" +
+	"commit refs/heads/main\nmark :2\n" + testCommitter + "data 2\nm2\nfrom :1\n" +
+	"M 100644 inline README.md\ndata 8\nreadme2\n\n"

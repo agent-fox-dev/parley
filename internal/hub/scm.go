@@ -14,34 +14,51 @@ import (
 // API's read routes.
 const scmHook = "scm"
 
-// composeSCM adds the read half of the source control API: it registers
-// the read routes under /workspaces/:slug/scm, whose scope and access need
+// composeSCM adds the source control API: it registers the read and write
+// routes under /workspaces/:slug/scm, whose scope and access need
 // the shared checks decide, and binds the component in a start hook to the
 // workspace records in the store; to the fork component's parent-state
-// check for a read, so that a fork whose parent is busy or failed is
-// refused as every route that works on a fork refuses it; to the place of
+// check for a read and for a write, so that a fork whose parent is busy or
+// failed, or archived for a write, is refused as every route that works on
+// a fork refuses it; to the place of
 // each repository on disk, opened with the hub's git; to the ref view of a
 // workspace, which for a fork is the fork component's (its own branches
 // and its tracking branches and tags at the parent's current heads, the
 // names the git server advertises) and for a repository workspace what its
 // repository holds; and to the push rules' protected-branch test over the
 // workspace's effective protected_branches, a fork's from its parent's, so
-// that the reads call protected what a push meets as protected. Each read
-// is bounded by [scm].read_timeout and a file by [scm].max_file_size.
+// that the reads call protected what a push meets as protected; and to the
+// push rule engine and the ref writer of the git server's part, so that a
+// write is decided and written exactly as a push of the same ref update;
+// and to the hub's event log, which takes the parley.scm.commit event of
+// every commit a write makes, after the push event the ref writer emits.
+// Each read is bounded by [scm].read_timeout and a file by
+// [scm].max_file_size; the body of a commit request by
+// [scm].max_commit_size, which the start hook sets as the commit route's
+// own body limit, in place of [server].max_body_size; the commits a write
+// makes take their times from the hub's clock.
 //
 // The change, commit-change and session lookups keep their defaults, which
-// name none: the hub has no change or session records to ask. The hub
-// registers no request recorder; the default discards the observations.
+// name none: the hub has no change or session records to ask. Nothing
+// registers a change linker or a session linker on the component yet, so a
+// write that asks for a change is refused 400 invalid_request and every
+// session_id 400 unknown_session. The hub registers no request recorder;
+// the default discards the observations.
 //
 // The component exists from the composition on (SCM); tests change its
 // dependencies with AdjustSCM.
 func composeSCM(c *Composition) {
 	comp := &scm.Component{}
 	c.scm = comp
-	for _, r := range comp.Routes() {
+	first := len(c.routes)
+	routes := comp.Routes()
+	for _, r := range routes {
 		c.AddRoute(r)
 	}
 	c.AddStartHook(scmHook, func(_ context.Context, rt *Runtime) error {
+		// The configuration loads after the composition, and the start
+		// hooks run before the server installs the routes.
+		scm.LimitCommitBody(c.routes[first:first+len(routes)], rt.Config.SCM.MaxCommitSize)
 		git := gitFor(c.env)
 		db := rt.Store.Main()
 		d := scm.Deps{
@@ -50,6 +67,9 @@ func composeSCM(c *Composition) {
 			},
 			ParentState: func(ctx context.Context, slug string) error {
 				return c.forks.CheckParentState(ctx, slug, fork.UseRead)
+			},
+			WriteParentState: func(ctx context.Context, slug string) error {
+				return c.forks.CheckParentState(ctx, slug, fork.UseWrite)
 			},
 			Open: func(ctx context.Context, slug string) (scm.Repository, error) {
 				repo, err := git.Open(ctx, c.workspaces.RepoPath(slug))
@@ -65,8 +85,13 @@ func composeSCM(c *Composition) {
 				return scm.RepoRefs(repo)
 			},
 			Protected:   protectedBranches{pushSettings{db, c.workspaces.Settings()}},
+			Rules:       c.pushRules,
+			RefWriter:   c.refWriter,
 			ReadTimeout: rt.Config.SCM.ReadTimeout,
 			MaxFileSize: rt.Config.SCM.MaxFileSize,
+			Now:         rt.Now,
+			Events:      c.Events(),
+			Logger:      rt.Logger,
 		}
 		for _, adjust := range c.scmAdjusters {
 			adjust(&d)

@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -72,10 +75,10 @@ type scmRead struct {
 }
 
 // newSCMCommand builds parley scm: the reads of a workspace's repository
-// without a clone.
+// without a clone, and the commit and the rebase that write to it.
 func newSCMCommand() *cobra.Command {
 	slugOnly := []argSpec{slugArg}
-	return group("scm", "Read the refs, commits, files, diffs and blame of a workspace without a clone",
+	return group("scm", "Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone",
 		scmRead{
 			command: command{Name: "refs", Description: "List the branches, tags and hub-owned refs of a workspace", Path: "/workspaces/:slug/scm/refs", Args: slugOnly},
 			query: []queryFlag{
@@ -169,6 +172,8 @@ func newSCMCommand() *cobra.Command {
 				{name: "ignore-case", param: "case_sensitive", kind: switchFlag, sends: "false", usage: "match without regard to case"},
 			},
 		}.build(),
+		newSCMCommitCommand(),
+		newSCMRebaseCommand(),
 	)
 }
 
@@ -395,4 +400,235 @@ func conflictIn(result []byte) (bool, string) {
 		return false, ""
 	}
 	return true, "head does not rebase onto base without a conflict: mergeable is conflict"
+}
+
+// fileOperation is one member of the operations of a commit's body.
+type fileOperation struct {
+	Op   string `json:"op"`
+	Path string `json:"path,omitempty"`
+	// ContentBase64 is a put's file bytes, encoded; an empty file sends "".
+	ContentBase64 *string `json:"content_base64,omitempty"`
+	From          string  `json:"from,omitempty"`
+	To            string  `json:"to,omitempty"`
+}
+
+// operationFlag is one of --put, --delete and --move of parley scm commit.
+// The three append to one list, because the operations are sent in the
+// order of the command line and pflag keeps the order only within one flag.
+// A value is checked, and a --put file read, as the flag is parsed, so that
+// a bad one is a usage error before any setting is read or any request sent
+// (ADR 02).
+type operationFlag struct {
+	op    string
+	list  *[]fileOperation
+	given []string
+}
+
+func (f *operationFlag) Set(value string) error {
+	operation, err := parseOperation(f.op, value)
+	if err != nil {
+		return err
+	}
+	*f.list = append(*f.list, operation)
+	f.given = append(f.given, value)
+	return nil
+}
+
+// Type is the type of a repeatable string flag, as help shows it.
+func (f *operationFlag) Type() string { return "stringArray" }
+
+func (f *operationFlag) String() string { return "[" + strings.Join(f.given, ",") + "]" }
+
+// parseOperation is the operation of the flag --<op> given value: --delete
+// <repo-path>, --move <from>=<to>, or --put <repo-path>=<local-file> with
+// the local file's bytes. A pair is split at its first =, so a local file's
+// name may hold one.
+func parseOperation(op, value string) (fileOperation, error) {
+	if op == "delete" {
+		return fileOperation{Op: op, Path: value}, nil
+	}
+	left, right, found := strings.Cut(value, "=")
+	if !found || left == "" || right == "" {
+		if op == "move" {
+			return fileOperation{}, errors.New("want <from>=<to>, neither side empty")
+		}
+		return fileOperation{}, errors.New("want <repo-path>=<local-file>, neither side empty")
+	}
+	if op == "move" {
+		return fileOperation{Op: op, From: left, To: right}, nil
+	}
+	data, err := os.ReadFile(right)
+	if err != nil {
+		return fileOperation{}, fmt.Errorf("cannot read the local file: %v", err)
+	}
+	content := base64.StdEncoding.EncodeToString(data)
+	return fileOperation{Op: op, Path: left, ContentBase64: &content}, nil
+}
+
+// commitBody is the body of POST /workspaces/:slug/scm/commits. A member
+// that is a pointer is sent only for a flag given, so that the hub's
+// default applies otherwise.
+type commitBody struct {
+	Branch          string          `json:"branch"`
+	Message         string          `json:"message"`
+	ExpectedHeadSHA *string         `json:"expected_head_sha,omitempty"`
+	BaseRef         *string         `json:"base_ref,omitempty"`
+	Operations      []fileOperation `json:"operations"`
+	SessionID       *string         `json:"session_id,omitempty"`
+	// Change holds a member for each change flag given, and is left out
+	// when none is.
+	Change map[string]any `json:"change,omitempty"`
+}
+
+// changeFlags are the flags of parley scm commit that become the members
+// of its change object.
+var changeFlags = []struct{ flag, member string }{
+	{"change-target", "target_branch"},
+	{"title", "title"},
+	{"intent", "intent"},
+	{"draft", "draft"},
+}
+
+// newSCMCommitCommand builds parley scm commit: one commit of file
+// operations on a branch, which it creates or moves.
+func newSCMCommitCommand() *cobra.Command {
+	return declare(command{
+		Name:        "commit",
+		Description: "Commit files to a branch of a workspace without a clone, creating the branch or moving it",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/scm/commits",
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("branch", "", "the branch the commit is made on; created when it does not exist")
+			fs.String("message", "", "the commit message")
+			_ = cobra.MarkFlagRequired(fs, "branch")
+			_ = cobra.MarkFlagRequired(fs, "message")
+			fs.String("base", "", "the revision a new branch starts from; required when the branch does not exist yet")
+			fs.String("expected-head", "", "the branch head the commit is made on (default: the head read just before)")
+			var operations []fileOperation
+			fs.Var(&operationFlag{op: "put", list: &operations}, "put", "write <repo-path>=<local-file>, the local file's bytes, repeatable")
+			fs.Var(&operationFlag{op: "delete", list: &operations}, "delete", "delete <repo-path>, repeatable")
+			fs.Var(&operationFlag{op: "move", list: &operations}, "move", "move <from>=<to>, repeatable")
+			fs.String("session", "", "the id of the agent session the commit belongs to")
+			fs.String("change-target", "", "open a change of the branch into this branch")
+			fs.String("title", "", "the title of the change opened")
+			fs.String("intent", "", "the intent of the change opened")
+			fs.Bool("draft", false, "open the change as a draft")
+		},
+		Run: commitFiles,
+	})
+}
+
+// commitFiles is the run step of parley scm commit. Without
+// --expected-head it reads the branch first and sends its head, so that
+// the commit lands only on the head the command saw; a branch that does
+// not exist is created, and sends none.
+func commitFiles(c *call) error {
+	fs := c.cmd.Flags()
+	body := commitBody{
+		ExpectedHeadSHA: givenString(fs, "expected-head"),
+		BaseRef:         givenString(fs, "base"),
+		Operations:      *fs.Lookup("put").Value.(*operationFlag).list,
+		SessionID:       givenString(fs, "session"),
+	}
+	body.Branch, _ = fs.GetString("branch")
+	body.Message, _ = fs.GetString("message")
+	if body.Operations == nil {
+		body.Operations = []fileOperation{}
+	}
+	for _, f := range changeFlags {
+		if !fs.Changed(f.flag) {
+			continue
+		}
+		if body.Change == nil {
+			body.Change = map[string]any{}
+		}
+		if f.flag == "draft" {
+			body.Change[f.member], _ = fs.GetBool(f.flag)
+		} else {
+			body.Change[f.member], _ = fs.GetString(f.flag)
+		}
+	}
+	if body.ExpectedHeadSHA == nil {
+		head, err := branchHead(c, body.Branch)
+		if err != nil {
+			return err
+		}
+		body.ExpectedHeadSHA = head
+	}
+	return sendWith(c, nil, body)
+}
+
+// givenString is the value of the string flag name, or nil when it was not
+// given.
+func givenString(fs *pflag.FlagSet, name string) *string {
+	if !fs.Changed(name) {
+		return nil
+	}
+	value, _ := fs.GetString(name)
+	return &value
+}
+
+// branchHead is the head of branch in the workspace of c, read with GET
+// …/scm/refs/<branch>, the branch as one percent-encoded segment; nil when
+// the hub answers 404 ref_not_found, for a branch the commit creates. Any
+// other error answer is returned as received.
+func branchHead(c *call, branch string) (*string, error) {
+	path := routePath("/workspaces/:slug/scm/refs/:name", map[string]string{"slug": c.args[slugArg.Name], "name": branch})
+	resp, err := c.client.request(c.ctx, http.MethodGet, path, nil, nil)
+	var he *hubError
+	if errors.As(err, &he) && he.status == http.StatusNotFound && errorTypeOf(he.body) == "ref_not_found" {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ref struct {
+		SHA string `json:"sha"`
+	}
+	if json.Unmarshal(resp.body, &ref) != nil || ref.SHA == "" {
+		return nil, clientError("the hub's answer to the read of %s holds no sha", branch)
+	}
+	return &ref.SHA, nil
+}
+
+// errorTypeOf is the error_type of the hub's error envelope body.
+func errorTypeOf(body []byte) string {
+	var doc struct {
+		Error struct {
+			ErrorType string `json:"error_type"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	return doc.Error.ErrorType
+}
+
+// newSCMRebaseCommand builds parley scm rebase: a branch replayed onto
+// another revision on the hub. Both the rebase and a branch already up to
+// date are a success.
+func newSCMRebaseCommand() *cobra.Command {
+	return declare(command{
+		Name:        "rebase",
+		Description: "Rebase a branch of a workspace onto another revision on the hub",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/:slug/scm/rebase",
+		Args:        []argSpec{slugArg, {Name: "branch", Required: true}},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("onto", "", "the revision the branch is replayed onto")
+			_ = cobra.MarkFlagRequired(fs, "onto")
+			fs.String("expected-head", "", "the branch head the rebase starts from (default: the head the hub reads)")
+		},
+		Run: func(c *call) error {
+			fs := c.cmd.Flags()
+			onto, _ := fs.GetString("onto")
+			body := struct {
+				Branch          string  `json:"branch"`
+				Onto            string  `json:"onto"`
+				ExpectedHeadSHA *string `json:"expected_head_sha,omitempty"`
+			}{c.args["branch"], onto, givenString(fs, "expected-head")}
+			return sendWith(c, nil, body)
+		},
+	})
 }

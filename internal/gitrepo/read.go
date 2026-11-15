@@ -528,7 +528,7 @@ const minAbbrev = 4
 // another form is an error.
 func (r *Repo) ListRefs(ctx context.Context, prefixes ...string) ([]Ref, error) {
 	for _, p := range prefixes {
-		if !strings.HasSuffix(p, "/") || (p != "refs/" && !validRefName(strings.TrimSuffix(p, "/"))) {
+		if !strings.HasSuffix(p, "/") || (p != "refs/" && !ValidRefName(strings.TrimSuffix(p, "/"))) {
 			return nil, fmt.Errorf("list refs: %q is not a ref prefix", p)
 		}
 	}
@@ -540,21 +540,32 @@ func (r *Repo) ListRefs(ctx context.Context, prefixes ...string) ([]Ref, error) 
 // is ErrNotFound and runs no git for a name of the first kind; a ref that
 // reaches no commit is ErrNotCommit.
 func (r *Repo) ResolveRef(ctx context.Context, name string) (string, error) {
-	if !validRefName(name) {
+	ref, found, err := r.LookupRef(ctx, name)
+	switch {
+	case err != nil:
+		return "", err
+	case !found:
 		return "", fmt.Errorf("ref %q: %w", name, ErrNotFound)
+	case ref.Commit == "":
+		return "", fmt.Errorf("ref %s: %w", name, ErrNotCommit)
+	}
+	return ref.Commit, nil
+}
+
+// LookupRef is the ref of the full name name; found is false when no ref
+// has it, or it is a name git would not take for a ref, for which no git
+// runs.
+func (r *Repo) LookupRef(ctx context.Context, name string) (ref Ref, found bool, err error) {
+	if !ValidRefName(name) {
+		return Ref{}, false, nil
 	}
 	// for-each-ref takes the name as a pattern, which also matches the refs
 	// below it; rev-parse would also try other names that end in it.
 	refs, err := r.listRefs(ctx, []string{name}, func(n string) bool { return n == name })
-	switch {
-	case err != nil:
-		return "", err
-	case len(refs) == 0:
-		return "", fmt.Errorf("ref %s: %w", name, ErrNotFound)
-	case refs[0].Commit == "":
-		return "", fmt.Errorf("ref %s: %w", name, ErrNotCommit)
+	if err != nil || len(refs) == 0 {
+		return Ref{}, false, err
 	}
-	return refs[0].Commit, nil
+	return refs[0], true, nil
 }
 
 // ResolveCommit is the full id of the one commit whose id begins with hex,
@@ -730,11 +741,12 @@ func isHexID(s string, min int) bool {
 	return true
 }
 
-// validRefName reports whether name is a full ref name git takes for a
+// ValidRefName reports whether name is a full ref name git takes for a
 // ref, by the rules of git check-ref-format, below refs/: no component
 // that begins with "." or ends with ".lock", no "..", "@{", "//", control
-// character, space or any of ~^:?*[\, not ending in "/" or ".".
-func validRefName(name string) bool {
+// character, space or any of ~^:?*[\, not ending in "/" or ".". Every
+// surface that names a ref to write checks it with this one test.
+func ValidRefName(name string) bool {
 	rest, ok := strings.CutPrefix(name, "refs/")
 	if !ok || rest == "" || strings.HasSuffix(name, ".") ||
 		strings.Contains(name, "..") || strings.Contains(name, "@{") {

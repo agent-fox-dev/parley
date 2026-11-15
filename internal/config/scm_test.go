@@ -8,15 +8,17 @@ import (
 	"github.com/agent-fox-dev/parley/internal/config"
 )
 
-func TestLoad_ReadsTheReadLimitsOrTheirDefaults(t *testing.T) {
+func TestLoad_ReadsTheSCMLimitsOrTheirDefaults(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name, text string
 		want       config.SCM
 	}{
-		{"empty file", "", config.SCM{ReadTimeout: 30 * time.Second, MaxFileSize: 32 << 20}},
-		{"both keys", "[scm]\nread_timeout = \"5s\"\nmax_file_size = \"1KB\"\n", config.SCM{ReadTimeout: 5 * time.Second, MaxFileSize: 1024}},
-		{"only read_timeout", "[scm]\nread_timeout = \"2m\"\n", config.SCM{ReadTimeout: 2 * time.Minute, MaxFileSize: 32 << 20}},
+		{"empty file", "", config.SCM{ReadTimeout: 30 * time.Second, MaxFileSize: 32 << 20, MaxCommitSize: 32 << 20}},
+		{"every key", "[scm]\nread_timeout = \"5s\"\nmax_file_size = \"1KB\"\nmax_commit_size = \"64MB\"\n",
+			config.SCM{ReadTimeout: 5 * time.Second, MaxFileSize: 1024, MaxCommitSize: 64 << 20}},
+		{"only read_timeout", "[scm]\nread_timeout = \"2m\"\n", config.SCM{ReadTimeout: 2 * time.Minute, MaxFileSize: 32 << 20, MaxCommitSize: 32 << 20}},
+		{"only max_commit_size", "[scm]\nmax_commit_size = \"1KB\"\n", config.SCM{ReadTimeout: 30 * time.Second, MaxFileSize: 32 << 20, MaxCommitSize: 1024}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -32,7 +34,7 @@ func TestLoad_ReadsTheReadLimitsOrTheirDefaults(t *testing.T) {
 	}
 }
 
-func TestLoad_RefusesAReadLimitOfZeroOrBelow(t *testing.T) {
+func TestLoad_RefusesAnSCMLimitOfZeroOrBelow(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ text, key string }{
 		{`read_timeout = "0s"`, "scm.read_timeout"},
@@ -40,6 +42,8 @@ func TestLoad_RefusesAReadLimitOfZeroOrBelow(t *testing.T) {
 		{`max_file_size = "0"`, "scm.max_file_size"},
 		{`max_file_size = "0KB"`, "scm.max_file_size"},
 		{`max_file_size = "-1MB"`, "scm.max_file_size"},
+		{`max_commit_size = "0MB"`, "scm.max_commit_size"},
+		{`max_commit_size = "32"`, "scm.max_commit_size"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.text, func(t *testing.T) {

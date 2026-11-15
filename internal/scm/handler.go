@@ -1,9 +1,17 @@
-// Package scm serves the read half of the source control API: the refs,
+// Package scm serves the source control API: the reads of the refs,
 // commits, trees, files, diffs, comparisons, blame and content search of a
 // workspace's repository, each answer computed from commits named by their
-// full ids.
+// full ids, and the writes to it.
 //
-// The routes are GET routes under /workspaces/:slug/scm. Each needs read
+// Every write route is built by one wrapper (writeRoute), which needs, for a
+// personal access token, git:write and write access to the workspace, and
+// refuses a workspace, or a fork's parent, that cannot take a write before
+// the route's handler runs. Every ref a write moves goes through one step
+// (updateRef): the push rule engine decides it and the ref writer writes
+// it by compare-and-swap and emits its events, as for a git push, so this
+// package writes no ref of its own.
+//
+// The read routes are GET routes under /workspaces/:slug/scm. Each needs read
 // access to the workspace and, for a personal access token, git:read, which
 // the server's shared checks decide before a handler runs; each reads only
 // a workspace whose repository is intact, and reports every request it
@@ -31,18 +39,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The results a read reports to the request recorder.
+// The results a request reports to the request recorder: ResultOK for an
+// answer whose status is below 400 and ResultError for any other, except
+// that a write reports ResultRefMoved for a 409 ref_moved and ResultRefused
+// for a 403 of a push rule.
 const (
-	ResultOK    = "ok"
-	ResultError = "error"
+	ResultOK       = "ok"
+	ResultError    = "error"
+	ResultRefMoved = "ref_moved"
+	ResultRefused  = "refused"
 )
 
 // The ops the read routes report, one per kind of read.
@@ -77,7 +94,7 @@ type Recorder interface {
 	Observe(op, result string)
 }
 
-// Deps are what the read routes need. Workspaces and Open are required;
+// Deps are what the routes need. Workspaces and Open are required;
 // every other member has a default.
 type Deps struct {
 	// Workspaces reads the record of the workspace slug; found is false
@@ -87,6 +104,10 @@ type Deps struct {
 	// parent, nil for a workspace that is no fork, and otherwise the
 	// refusal the read answers; nil checks nothing.
 	ParentState func(ctx context.Context, slug string) error
+	// WriteParentState is the check a write to the fork slug makes of its
+	// parent, nil when the write may go on and otherwise the refusal the
+	// write answers, such as 409 parent_archived; nil checks nothing.
+	WriteParentState func(ctx context.Context, slug string) error
 	// Open opens the repository of the workspace slug.
 	Open func(ctx context.Context, slug string) (Repository, error)
 	// RefView is the ref view of the workspace w, whose repository repo
@@ -102,21 +123,61 @@ type Deps struct {
 	// Sessions names the session that introduced a commit; nil names
 	// none.
 	Sessions SessionLookup
-	// Recorder is told of every request a read route handles; nil tells
-	// no one.
+	// Recorder is told of every request a read or write route handles;
+	// nil tells no one.
 	Recorder Recorder
+	// Rules decide every ref update a write asks for; nil is a push rule
+	// engine with no lookups.
+	Rules Rules
+	// RefWriter writes every ref update the rules allow, and its events;
+	// nil is a ref writer with no store, no stages and no event log.
+	RefWriter RefWriter
 	// MaxFileSize is the size in bytes of the largest file the file route
 	// serves; zero or less is DefaultMaxFileSize.
 	MaxFileSize int64
 	// ReadTimeout is how long a read may run, from the moment its route
 	// begins handling it; zero or less is DefaultReadTimeout.
 	ReadTimeout time.Duration
+	// Now is the clock the commits a write makes take their times from;
+	// nil is time.Now.
+	Now func() time.Time
+	// Events stores the parley.scm.commit event of every commit a write
+	// makes; nil stores none.
+	Events EventWriter
+	// Logger is told of what fails after a write has moved its ref and so
+	// cannot change its answer; nil discards it.
+	Logger *slog.Logger
 }
 
-// Component serves the read routes. Its zero value is ready to be
-// registered; it serves once Bind has given it its dependencies, before
+// EventWriter stores one hub event in a store transaction of its own: the
+// hub's event log, *event.Component, is one.
+type EventWriter interface {
+	EmitNow(ctx context.Context, in event.Input) (event.Record, error)
+}
+
+// noEvents stores no event.
+type noEvents struct{}
+
+func (noEvents) EmitNow(context.Context, event.Input) (event.Record, error) {
+	return event.Record{}, nil
+}
+
+// Component serves the read and write routes. Its zero value is ready to
+// be registered; it serves once Bind has given it its dependencies, before
 // the first request.
-type Component struct{ deps Deps }
+type Component struct {
+	deps Deps
+
+	mu sync.RWMutex
+	// linker is the registered change linker, nil for none.
+	linker ChangeLinker
+	// sessions is the registered session linker, nil for none.
+	sessions SessionLinker
+	// replayed, when not nil, runs once a rebase has replayed its
+	// commits and before it moves the branch: a test's way to move the
+	// branch meanwhile.
+	replayed func()
+}
 
 // Bind gives the component its dependencies, the defaults in place of the
 // members d leaves nil.
@@ -136,18 +197,49 @@ func (c *Component) Bind(d Deps) {
 	if d.Recorder == nil {
 		d.Recorder = noRecorder{}
 	}
+	if d.Rules == nil {
+		d.Rules = &pushrule.Engine{}
+	}
+	if d.RefWriter == nil {
+		d.RefWriter = &pushrule.Writer{}
+	}
 	if d.MaxFileSize <= 0 {
 		d.MaxFileSize = DefaultMaxFileSize
 	}
 	if d.ReadTimeout <= 0 {
 		d.ReadTimeout = DefaultReadTimeout
 	}
+	if d.Now == nil {
+		d.Now = time.Now
+	}
+	if d.Events == nil {
+		d.Events = noEvents{}
+	}
+	if d.Logger == nil {
+		d.Logger = slog.New(slog.DiscardHandler)
+	}
 	c.deps = d
 }
 
-// Routes are the read routes, for the server's router.
+// Routes are the read and write routes, for the server's router. The
+// commit route's body limit is DefaultMaxCommitSize until LimitCommitBody
+// sets another. The three POST routes take an Idempotency-Key, whose replay
+// answers 200 with the first answer and moves nothing; PATCH and DELETE
+// need none, since expected_sha makes a retry safe.
 func (c *Component) Routes() []server.Route {
+	commit := c.writeRoute(http.MethodPost, commitsPattern, opCommit, c.createCommit)
+	commit.MaxBodySize = DefaultMaxCommitSize
+	createRef := c.writeRoute(http.MethodPost, "/refs", opRefCreate, c.createRef)
+	rebase := c.writeRoute(http.MethodPost, "/rebase", opRebase, c.rebase)
+	for _, r := range []*server.Route{&commit, &createRef, &rebase} {
+		r.Create = true
+	}
 	return []server.Route{
+		commit,
+		createRef,
+		c.writeRoute(http.MethodPatch, "/refs/*name", opRefMove, c.moveRef),
+		c.writeRoute(http.MethodDelete, "/refs/*name", opRefDelete, c.deleteRef),
+		rebase,
 		c.route("/refs", opRefs, c.listRefs),
 		c.route("/refs/*name", opRefs, c.getRef),
 		c.route("/commits", opCommits, c.listCommits),
