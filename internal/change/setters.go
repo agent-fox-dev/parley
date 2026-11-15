@@ -23,7 +23,10 @@ func (c *Component) SetDependsOn(ctx context.Context, tx *sql.Tx, workspace stri
 // paths and patch id, on the change and on the version. The measuring runs
 // in the change's own repository, which holds the head under its version
 // ref, also for a fork's change, and the new base, such as the head of the
-// change it now depends on or of the branch it now targets.
+// change it now depends on or of the branch it now targets. A base of ""
+// is none, for a head that shares no history with what it now targets:
+// the version is measured from the empty tree, every commit of its head
+// counted.
 func (c *Component) SetBase(ctx context.Context, tx *sql.Tx, workspace string, number int64, base string) error {
 	ch, err := readChange(ctx, tx, workspace, number)
 	if err != nil {

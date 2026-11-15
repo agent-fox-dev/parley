@@ -27,7 +27,7 @@ type diffFile struct {
 
 // diffAnswer is the JSON answer of GET …/changes/:number/diff.
 type diffAnswer struct {
-	BaseSHA      string        `json:"base_sha"`
+	BaseSHA      *string       `json:"base_sha"`
 	HeadSHA      string        `json:"head_sha"`
 	MergeBaseSHA *string       `json:"merge_base_sha"`
 	Files        []diffFile    `json:"files"`
@@ -146,8 +146,8 @@ func versionOf(ctx context.Context, q Querier, ch Change, number int64) (Version
 func present(ctx context.Context, repo *gitrepo.Repo, ch Change, versions []Version) error {
 	for _, v := range versions {
 		ids := []string{v.HeadSHA}
-		if v.BaseSHA != "" {
-			ids = append(ids, v.BaseSHA)
+		if base := baseColumn(v.BaseSHA); base != "" {
+			ids = append(ids, base)
 		}
 		missing, err := repo.Missing(ctx, ids)
 		if err != nil {
@@ -164,7 +164,7 @@ func present(ctx context.Context, repo *gitrepo.Repo, ch Change, versions []Vers
 // plainDiff answers the diff of the version from its base_sha to its
 // head_sha, computed by the source control API's diff.
 func plainDiff(ctx context.Context, w http.ResponseWriter, repo *gitrepo.Repo, v Version, dq diffQuery) error {
-	d, err := scm.ComputeDiff(ctx, repo, v.BaseSHA, v.HeadSHA, scm.DiffQuery{
+	d, err := scm.ComputeDiff(ctx, repo, baseColumn(v.BaseSHA), v.HeadSHA, scm.DiffQuery{
 		Globs: dq.globs, Patches: dq.patches, AsPatch: dq.asPatch, Context: scm.DefaultContext,
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func plainDiff(ctx context.Context, w http.ResponseWriter, repo *gitrepo.Repo, v
 		files = append(files, diffFile{FileChange: f})
 	}
 	server.WriteJSON(w, http.StatusOK, diffAnswer{
-		BaseSHA: v.BaseSHA, HeadSHA: v.HeadSHA, MergeBaseSHA: &v.BaseSHA, Files: files, Stats: d.Stats,
+		BaseSHA: v.BaseSHA, HeadSHA: v.HeadSHA, MergeBaseSHA: v.BaseSHA, Files: files, Stats: d.Stats,
 		Truncated: d.Truncated, Version: v.Number,
 	})
 	return nil
@@ -194,11 +194,11 @@ type ownChange struct {
 // ownChanges are the files the version changes against its own base, by
 // path.
 func ownChanges(ctx context.Context, repo *gitrepo.Repo, v Version) (map[string]ownChange, error) {
-	changes, err := repo.DiffChanges(ctx, v.BaseSHA, v.HeadSHA)
+	changes, err := repo.DiffChanges(ctx, baseColumn(v.BaseSHA), v.HeadSHA)
 	if err != nil {
 		return nil, err
 	}
-	return keyed(ctx, repo, v.BaseSHA, v.HeadSHA, changes)
+	return keyed(ctx, repo, baseColumn(v.BaseSHA), v.HeadSHA, changes)
 }
 
 // keyed are changes, the file changes from base to head, by path, each
@@ -326,7 +326,7 @@ func interdiff(ctx context.Context, w http.ResponseWriter, repo *gitrepo.Repo, a
 	// cut rather than be the same at both heads.
 	cut := d.Stats.FilesChanged > len(d.Files)
 	answer := diffAnswer{
-		BaseSHA: against.HeadSHA, HeadSHA: v.HeadSHA, Stats: d.Stats, Truncated: d.Truncated,
+		BaseSHA: &against.HeadSHA, HeadSHA: v.HeadSHA, Stats: d.Stats, Truncated: d.Truncated,
 		Version: v.Number, Against: &against.Number, Files: make([]diffFile, 0, min(len(paths), scm.MaxDiffFiles)),
 	}
 	if len(paths) > scm.MaxDiffFiles {

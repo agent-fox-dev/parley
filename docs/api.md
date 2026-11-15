@@ -3583,15 +3583,15 @@ The change object:
 | Member | Meaning |
 |---|---|
 | `state` | `draft`, `open`, `landed` or `abandoned` |
-| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; the empty string when the head shares no history with the target branch |
+| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; `null` when the head shares no history with the target branch |
 | `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
 | `mergeable`, `conflict` | `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` |
 | `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why |
-| `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha` |
+| `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
-| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked, else `null`, and the policy's `requirements` |
+| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements` |
 | `landed` | how it landed, `null` until then: `sha`, `at`, `by` (an author object), `land_id` and `commits`, each `{version_sha, landed_sha}` |
 | `reverts`, `reverted_by` | the number of the change it reverts, and of the change that reverts it, `null` for none |
 
@@ -3670,7 +3670,8 @@ the state of the target and the source workspace; the target branch
 exists; it is not the integration branch of a carry-patch workspace; the
 source workspace is `{slug}` or a fork of it; the source branch exists;
 it is not the target branch of the same workspace; it has a commit the
-target branch lacks; none of those is a merge commit; no draft or open
+target branch lacks; it shares history with the target branch; none of
+the commits the target lacks is a merge commit; no draft or open
 change has this source; the title and the intent; for a path-scoped
 token, every file the version changes against its base matches one of
 the token's globs. Of two opens of one source at the same time, one
@@ -3687,6 +3688,7 @@ answers `201` and the other `409` `change_exists`.
 | `400` `source_not_found` | no branch `source.branch` in the source workspace |
 | `400` `target_not_found` | no branch `target_branch` in the target workspace |
 | `400` `unknown_session` | the `session_id` is not accepted |
+| `400` `unrelated_history` | the source branch has no common ancestor with the target branch |
 | `403` `forbidden` | the caller reads the source workspace but cannot write it |
 | `403` `insufficient_scope` | a personal access token without `changes:write` |
 | `403` `integration_branch` | `target_branch` is the integration branch of a carry-patch workspace, which the hub rebuilds |
@@ -3781,7 +3783,9 @@ Without `against`, the answer is the diff of the version from its
 `direct` mode, with rename detection, 3 lines of context and the same
 limits (5,000 files, 8 MiB of patch text, then `truncated: true`). It has
 the members of the `…/scm/diff` answer, `base_sha` and `merge_base_sha`
-both the version's `base_sha`, and two more: `version`, the version's
+both the version's `base_sha` (both `null` for a version with no base,
+whose files are then diffed from the empty tree, every one `added`), and
+two more: `version`, the version's
 number, and `against`, `null`.
 
 With `against`, a file is listed when either version touches it against

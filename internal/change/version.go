@@ -32,8 +32,10 @@ type VersionInput struct {
 // A session must pass the session linker (without one, every session is
 // refused) or the answer is 400 unknown_session, before anything is
 // written. The version's base is the merge base of its head and the
-// target branch, or the previous version's base while the target branch
-// does not exist; it is patch-equivalent to the latest earlier version
+// target branch, none for a head that shares no history with it, or the
+// previous version's base while the target branch does not exist; a
+// version with no base is measured from the empty tree. It is
+// patch-equivalent to the latest earlier version
 // whose diff against its own base is the same. RecordVersion stores the
 // version with its creating credential, writes its ref
 // refs/parley/changes/<number>/<version> in the target's repository,
@@ -42,8 +44,9 @@ type VersionInput struct {
 // linker, the landing derivation and the version observers in that order
 // and writes parley.change.version. The landing of a draft stays
 // blocked/draft; a missing target branch, a head with no commit the target
-// lacks and a merge commit among the version's commits block it as
-// target_not_found, nothing_to_land and merge_commits without asking the
+// lacks, a head with no history in common with the target and a merge
+// commit among the version's commits block it as target_not_found,
+// nothing_to_land, unrelated_history and merge_commits without asking the
 // landing evaluator. The change keeps its state.
 //
 // As with Open, the version ref is written before the collaborators run
@@ -81,7 +84,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 		return nil, err
 	}
 	v := Version{
-		Number: ch.Version + 1, HeadSHA: in.Head, BaseSHA: o.base, Kind: in.Kind, PatchEquivalentTo: equivalent,
+		Number: ch.Version + 1, HeadSHA: in.Head, BaseSHA: baseOf(o.base), Kind: in.Kind, PatchEquivalentTo: equivalent,
 		CreatedBy: actor, SessionID: session, Stats: o.stats, CreatedAt: c.now(), Credential: in.Caller.Credential,
 		PatchID: o.patchID,
 	}
@@ -116,8 +119,8 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 // as Open measures version 1: its base, stats, touched paths and patch id,
 // read in the source's repository, which for a fork reads its parent's
 // objects. structural is the landing a cause in the version blocks, nil
-// for none: the target branch missing, no commit the target lacks, or a
-// merge commit among them.
+// for none: the target branch missing, no commit the target lacks, no
+// history in common with the target, or a merge commit among the commits.
 func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head string) (o *opening, structural *Landing, err error) {
 	o = &opening{head: head}
 	if o.targetRepo, err = c.deps.Repos(ctx, ch.WorkspaceSlug); err != nil {
@@ -137,11 +140,9 @@ func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head 
 		if o.base, err = versionBase(ctx, q, ch.WorkspaceSlug, ch.Number, ch.Version); err != nil {
 			return nil, nil, err
 		}
-		var ahead []string
-		if o.base != "" {
-			if ahead, err = o.sourceRepo.CommitsBetween(ctx, o.base, head, 0); err != nil {
-				return nil, nil, err
-			}
+		ahead, err := o.sourceRepo.CommitsBetween(ctx, o.base, head, 0)
+		if err != nil {
+			return nil, nil, err
 		}
 		l := blockedLanding("target_not_found")
 		return o, &l, o.measureFromBase(ctx, len(ahead))
@@ -155,6 +156,10 @@ func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head 
 	}
 	if len(ahead) == 0 {
 		l := blockedLanding("nothing_to_land")
+		return o, &l, nil
+	}
+	if o.base == "" {
+		l := blockedLanding("unrelated_history")
 		return o, &l, nil
 	}
 	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)

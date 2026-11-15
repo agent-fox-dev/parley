@@ -138,17 +138,29 @@ const committer = "committer T <t@example.invalid> 1700000000 +0000\n"
 // data is a fast-import data command for s.
 func data(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 
+// deref is the string p points to, "" for nil.
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
 // gone is the content commit gives a file to delete it.
 const gone = "\x00gone"
 
 // commit writes to the repository at dir a commit with message on top of
-// from (a commit id or a branch), setting each file of files to its
-// content, or deleting it for gone, and points branch at it, also when
-// that rewrites the branch; it returns the commit's id.
+// from (a commit id or a branch), or a root commit for from "", setting
+// each file of files to its content, or deleting it for gone, and points
+// branch at it, also when that rewrites the branch; it returns the
+// commit's id.
 func commit(t *testing.T, dir, branch, from, message string, files map[string]string) string {
 	t.Helper()
 	var s strings.Builder
-	s.WriteString("commit refs/heads/" + branch + "\n" + committer + data(message) + "from " + from + "\n")
+	s.WriteString("commit refs/heads/" + branch + "\n" + committer + data(message))
+	if from != "" {
+		s.WriteString("from " + from + "\n")
+	}
 	for _, path := range slices.Sorted(maps.Keys(files)) {
 		if files[path] == gone {
 			s.WriteString("D " + path + "\n")

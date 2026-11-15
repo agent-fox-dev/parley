@@ -168,3 +168,22 @@ links it through the session linker (design decision 34).
 
 `--version` takes a positive integer or `latest`, the two forms the diff
 route takes; any other value is a usage error before any request.
+
+## A head with no common ancestor has no base
+
+The package defines `base_sha` as the merge base of the head and the
+target branch and says nothing of a head that has none. An open whose
+source branch shares no history with the target branch is refused with
+`400 unrelated_history`, after `nothing_to_land` and before
+`merge_commits_unsupported`: with no common ancestor there is nothing to
+land the commits onto, and git refuses such a merge too. A later version
+with no merge base (a branch rewritten onto a root commit) is still
+recorded, as the package asks, with `base_sha` `null`, its stats, touched
+paths and patch id measured from the empty tree, every commit of its head
+counted, and the landing `blocked` with the structural reason
+`unrelated_history`, without asking the landing evaluator, as a merge
+commit is refused at open and blocks a later version. Its diff answers
+`base_sha` and `merge_base_sha` `null` and every file `added`. `SetBase`
+takes `""` as no base, measured the same way. In Go, `Change.BaseSHA` and
+`Version.BaseSHA` are `*string`; the store keeps the empty string for
+none.

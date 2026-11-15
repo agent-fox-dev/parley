@@ -260,7 +260,7 @@ type Change struct {
 	Source         Source          `json:"source"`
 	Version        int64           `json:"version"`
 	HeadSHA        string          `json:"head_sha"`
-	BaseSHA        string          `json:"base_sha"`
+	BaseSHA        *string         `json:"base_sha"`
 	DependsOn      *int64          `json:"depends_on"`
 	Dependants     []int64         `json:"dependants"`
 	Author         Actor           `json:"author"`
@@ -319,7 +319,7 @@ func (c Change) MarshalJSON() ([]byte, error) {
 type Version struct {
 	Number            int64     `json:"number"`
 	HeadSHA           string    `json:"head_sha"`
-	BaseSHA           string    `json:"base_sha"`
+	BaseSHA           *string   `json:"base_sha"`
 	Kind              string    `json:"kind"`
 	PatchEquivalentTo *int64    `json:"patch_equivalent_to"`
 	CreatedBy         Actor     `json:"created_by"`

@@ -375,16 +375,27 @@ func (r *Repo) AheadBehind(ctx context.Context, base, head string) (ahead, behin
 }
 
 // CommitsBetween lists the full ids of the commits that the commit of the
-// full id head reaches and that of base does not, oldest first, every
-// commit after its parents; when limit is above 0, the first limit of them.
+// full id head reaches and that of base does not, every commit head
+// reaches for base "", oldest first, every commit after its parents; when
+// limit is above 0, the first limit of them.
 func (r *Repo) CommitsBetween(ctx context.Context, base, head string, limit int) ([]string, error) {
-	base, head, err := rangeEnds(base, head)
+	from := base
+	if base == "" {
+		// Any full id stands in for the missing base while the ends are
+		// checked; the range is then head alone.
+		from = head
+	}
+	from, head, err := rangeEnds(from, head)
 	if err != nil {
 		return nil, err
 	}
+	revs := from + ".." + head
+	if base == "" {
+		revs = head
+	}
 	// rev-list cuts a listing before it reverses it, so the oldest come
 	// only from the whole list.
-	out, err := r.git(ctx, "rev-list", "--reverse", "--topo-order", base+".."+head)
+	out, err := r.git(ctx, "rev-list", "--reverse", "--topo-order", revs)
 	if err != nil {
 		return nil, err
 	}
