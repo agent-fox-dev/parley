@@ -83,7 +83,7 @@ func (l commitLookups) ChangeOfCommit(_ context.Context, _, sha string) (*scm.Co
 	if sha != *l.sha {
 		return nil, nil
 	}
-	return &scm.CommitChange{WorkspaceSlug: "demo", Number: 12, Version: 3}, nil
+	return &scm.CommitChange{WorkspaceSlug: "demo", Number: 12, Version: new(3)}, nil
 }
 
 func (l commitLookups) SessionOf(_ context.Context, _, sha string) (*string, error) {

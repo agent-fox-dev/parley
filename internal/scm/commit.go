@@ -191,7 +191,7 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 		events: []event.Input{c.commitEvent(ctx, wr, t.git, branch, parent, sha, session)}}
 	var explicit *ChangeOpening
 	if body.Change != nil {
-		o := opening(wr, branch, sha, body.Change)
+		o := opening(wr, branch, sha, session, body.Change)
 		explicit = &o
 		u.beforeWrite = func(ctx context.Context, d pushrule.Decision) error {
 			if d.Direct {
@@ -208,7 +208,7 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	// request's context, and changes the answer's status no more.
 	done := context.WithoutCancel(ctx)
 	answer := commitAnswer{}
-	answer.Change, answer.ChangeError = c.commitChange(done, wr, linker, up, explicit, branch, sha)
+	answer.Change, answer.ChangeError = c.commitChange(done, wr, linker, up, explicit, branch, sha, session)
 	return c.writeCommit(w, r.WithContext(done), t, branch, sha, session, answer)
 }
 
@@ -244,10 +244,11 @@ func (c *Component) commitEvent(ctx context.Context, wr *write, git *gitrepo.Rep
 // Without one, the change the ref writer recorded a version of is named;
 // and in a fork whose auto_change is on, a branch that is the source of no
 // draft or open change gets one opened in the parent, targeting the fork's
-// base branch. Either opening may fail once the branch has moved: the
-// commit is kept and the failure is the change error.
+// base branch, with the commit's session, nil for none. Either opening may
+// fail once the branch has moved: the commit is kept and the failure is the
+// change error.
 func (c *Component) commitChange(ctx context.Context, wr *write, linker ChangeLinker, up refUpdated, explicit *ChangeOpening,
-	branch, sha string) (*LinkedChange, *changeError) {
+	branch, sha string, session *string) (*LinkedChange, *changeError) {
 	if up.decision.Direct {
 		return nil, nil
 	}
@@ -263,7 +264,7 @@ func (c *Component) commitChange(ctx context.Context, wr *write, linker ChangeLi
 		if found.inUse() {
 			return nil, nil
 		}
-		auto := opening(wr, branch, sha, nil)
+		auto := opening(wr, branch, sha, session, nil)
 		o = &auto
 	}
 	change, err := linker.Open(ctx, *o)
@@ -283,10 +284,11 @@ func autoChange(wr *write) bool {
 // full name, is at sha: the change object ch of the request, nil for the
 // change an auto_change fork opens, which targets the branch the fork was
 // taken from. A fork's change is opened in its parent, with the fork's
-// branch as source.
-func opening(wr *write, branch, sha string, ch *commitChange) ChangeOpening {
+// branch as source, and with session, the commit's (nil for none), as the
+// session of its first version.
+func opening(wr *write, branch, sha string, session *string, ch *commitChange) ChangeOpening {
 	o := ChangeOpening{Caller: wr.principal, Workspace: wr.ws.Slug, SourceWorkspace: wr.ws.Slug,
-		SourceBranch: strings.TrimPrefix(branch, "refs/heads/"), Head: sha}
+		SourceBranch: strings.TrimPrefix(branch, "refs/heads/"), Head: sha, SessionID: session}
 	if wr.ws.Kind == access.KindFork && wr.ws.ParentSlug != nil {
 		o.Workspace = *wr.ws.ParentSlug
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
@@ -38,7 +39,8 @@ const (
 // exchange, to the hub's git, which runs upload-pack for a fetch and
 // receive-pack's advertisement for a push, and copies a fork's tracking
 // refs from its parent's repository into the fork's, to
-// the fork view, which names those refs from the fork's record, to the
+// the fork view, which names those refs from the fork's record and the
+// changes from the fork from the change component, to the
 // event log, which receives the event of an audited fetch, to the
 // workspace service's settings registry, from which a workspace's
 // audit_fetches is read, and to [git].timeout, which it registers and
@@ -98,7 +100,7 @@ func composeGitServer(c *Composition) {
 			Records: gitserver.StoreRecords(rt.Store.Main()), Parents: c.forks,
 			Repositories: gitserver.DiskRepositories(gitFor(c.env), c.workspaces.RepoPath),
 			Runner:       gitFor(c.env), Timeout: gitserver.TimeoutFrom(rt.Config), Logger: rt.Logger,
-			ForkView: forkView{rt.Store.Main()}, Copier: gitFor(c.env),
+			ForkView: forkView{rt.Store.Main(), c.changes}, Copier: gitFor(c.env),
 			Events: c.Events(), Settings: c.workspaces.Settings(), Push: c.receiver,
 		}
 		for _, adjust := range c.gitServerAdjusters {
@@ -171,11 +173,13 @@ func (t trackingBranches) IsTracking(ctx context.Context, forkSlug, branch strin
 
 // forkView is the git server's fork view: a fork's tracking refs are the
 // branches and tags its record holds, the names the fork feature recorded
-// when it created the fork. It names no change: which changes have a fork
-// as their source is recorded by the change feature, which the hub does not
-// have yet, so a fork advertises no version refs, and the copy deletes any
-// refs/parley/changes/ ref from the fork's repository.
-type forkView struct{ db *sql.DB }
+// when it created the fork, and its changes are those, in any state, whose
+// source is the fork, as the change component records them, whose version
+// refs the fork shows from its parent's repository.
+type forkView struct {
+	db      *sql.DB
+	changes *change.Component
+}
 
 func (v forkView) ForkRefs(ctx context.Context, slug string) (gitserver.ForkRefs, error) {
 	f, found, err := fork.BySlug(ctx, v.db, slug)
@@ -191,6 +195,13 @@ func (v forkView) ForkRefs(ctx context.Context, slug string) (gitserver.ForkRefs
 	}
 	for _, t := range f.TrackingTags {
 		refs.Tracking = append(refs.Tracking, "refs/tags/"+t)
+	}
+	from, err := v.changes.ChangeNumbersOfSource(ctx, v.db, slug)
+	if err != nil {
+		return gitserver.ForkRefs{}, err
+	}
+	for _, s := range from {
+		refs.Changes = append(refs.Changes, s.Number)
 	}
 	return refs, nil
 }

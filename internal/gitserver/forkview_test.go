@@ -175,8 +175,22 @@ func TestForkView_GivesUpWaitingForAStuckCopyAtTheTimeout(t *testing.T) {
 			status <- res.StatusCode
 		}
 	}
-	go get()
-	<-stuck.entered
+	// Under load the first request can be answered before it reaches the
+	// copier; the test needs a stuck copy, so it asks again until one is.
+	for attempt := 0; ; attempt++ {
+		go get()
+		select {
+		case <-stuck.entered:
+		case <-status:
+			if attempt < 5 {
+				continue
+			}
+			t.Fatal("no request reached the copier in 6 attempts")
+		case <-time.After(10 * time.Second):
+			t.Fatal("the first request neither reached the copier nor got an answer within 10s")
+		}
+		break
+	}
 	go get()
 	select {
 	case s := <-status:

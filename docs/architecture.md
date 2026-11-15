@@ -13,6 +13,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`, and the maintenance task `token_binding_sweep`, `SweepBindings`) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
+| `internal/change` | the changes: the change record and its versions (`SchemaStep`), opening (`Open`, `CheckOpen`, `Authorize`), recording versions (`RecordVersion`, and `RefUpdated`, the ref writer's ref-updated stage), retention (`SourceDeleted`, `ForkDeleted`, `WorkspaceDeleted`), the lookups and setters other features call in their own store transaction, the collaborators registered on the instance, and the routes under `/workspaces/:slug/changes` (see [Changes](#changes)) |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, a registry of keys and whole sections that decides what the file may hold, and the keys it owns itself, among them the fork limits of `[forks]` (`Config.Forks`), whose `max_ttl` it refuses when shorter than `default_ttl`, and the read bounds of `[scm]` (`Config.SCM{ReadTimeout, MaxFileSize}`), each refused at zero or below |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
@@ -2632,15 +2633,19 @@ compose time, the component as the fork remover of the workspace service's
 teardown set (`Teardown().RegisterForkRemover`), so that `DELETE
 /workspaces/:slug` of a fork and the delete of a parent reach it. No
 sandbox lifecycle is registered while the hub has no sandbox feature. The
-part registers `fork.ActivityStep` after `fork.DiscardStep`. It registers
-no change reader (`RegisterChangeReader`), since the hub has no change
-feature. Of the features that see a fork's activity (the push rules, the
-change feature, the landing), the push rules are in the hub: the part
-registers the component as the ref writer's fork activity recorder
-(`c.RefWriter().RegisterForkActivity`), which the writer calls after an
-accepted write through git or the source control API to a fork, outside
-any store transaction. The others are registered in this part when their
-feature arrives. It
+part registers `fork.ActivityStep` after `fork.DiscardStep`. The change
+part registers the change reader (`RegisterChangeReader`, see
+[Changes](#changes)). Of the features that see a fork's activity (the push
+rules, the change feature, the landing), the push rules and the change
+feature are in the hub: the part registers the component as the ref
+writer's fork activity recorder (`c.RefWriter().RegisterForkActivity`),
+which the writer calls after an accepted write through git or the source
+control API to a fork, outside any store transaction, and the change part
+registers `(*fork.Component).RecordActivityIn` as the change component's,
+which runs in the transaction that opens or abandons a change from the
+fork (`RecordActivity` opens a transaction of its own, which inside
+another would wait for it forever). The landing's is registered when it
+arrives. It
 adds the background work `fork_sweep` (grace 10 seconds), which runs
 `(*Component).RunSweep` from the bind to the stop, and the maintenance task
 `fork_expiry`, which runs one `RunPass` in each maintenance pass.
@@ -2905,9 +2910,10 @@ the git server's `Deps.Push` before the `AdjustGitServer` functions run. The
 hub's fork view (`forkView` in `internal/hub/gitserver.go`) reads the fork's
 record with `fork.BySlug` and names `refs/heads/<b>` for each of its
 `TrackingBranches` and `refs/tags/<t>` for each of its `TrackingTags`; it
-names no change, because the change feature, which records a change's
-source workspace, is not part of the hub yet, so a fork advertises no
-version ref. A slug that names no fork is `fork.ErrNotFork`.
+names as its changes the numbers of every change, in any state, whose
+source is the fork (`(*change.Component).ChangeNumbersOfSource`), whose
+version refs the fork then shows from its parent's repository. A slug that
+names no fork is `fork.ErrNotFork`.
 
 The routes are `GET /git/{org}/{repo}/info/refs`,
 `POST /git/{org}/{repo}/git-upload-pack` and
@@ -3204,11 +3210,12 @@ engine (`Rules`, `(*Composition).PushRules()`) and the ref writer
 (`RefWriter`, `(*Composition).RefWriter()`) of the git server's part, the
 event log (`Events`, `(*Composition).Events()`) and the hub's logger
 (`Logger`), after the functions added with `AdjustSCM` have changed those
-dependencies. `(*Composition).SCM()` returns the component. `Changes`
-(`OpenChangeOfBranch`, `ChangeOfCommit`), `Sessions` (`SessionOf`) and
-`Recorder` keep their defaults, which name nothing and record nothing, and
-no `ChangeLinker` or `SessionLinker` is registered: the change and session
-features and the metric export are not in the hub yet.
+dependencies. `(*Composition).SCM()` returns the component. The change
+part sets `Changes` (`OpenChangeOfBranch`, `ChangeOfCommit`) through
+`AdjustSCM` and registers the `ChangeLinker` (see [Changes](#changes));
+`Sessions` (`SessionOf`) and `Recorder` keep their defaults, which name
+nothing and record nothing, and no `SessionLinker` is registered: the
+session feature and the metric export are not in the hub yet.
 
 Every read route is `GET /workspaces/:slug/scm/…`, declared with the scope
 `git:read` and the access need `read`, so the pipeline answers `401`,
@@ -3541,7 +3548,8 @@ the component instance, with `RegisterSessionLinker`,
 `RegisterStackLinker`, `RegisterLandingEvaluator`, `AddVersionObserver`,
 `RegisterAutoLandGuard` and `RegisterForkActivity`
 ([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
-The hub registers none yet. `ReadChange(ctx, q, workspace, number)` reads
+The hub registers the fork activity recorder (below) and none of the
+others yet. `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
 The change's `dependants` are not stored: every read derives them as the
@@ -3601,8 +3609,58 @@ the same source takes the next number. `WorkspaceDeleted(ctx, tx,
 workspace)` deletes the workspace's changes, whose versions, session
 links and landed-commit records cascade, and its counter, so a later
 workspace of the same slug numbers from 1; the changes of other
-workspaces stay, also those whose source it was. The hub calls none of
-them yet.
+workspaces stay, also those whose source it was. The ref-updated stage
+calls `SourceDeleted` and the teardown remover the other two (below).
+
+The hub part connects the component to the features that move a change's
+source or ask about changes, all at composition, on the instances that
+call them:
+
+- `c.RefWriter().RegisterRefUpdatedStage((*change.Component).RefUpdated)`
+  (`refstage.go`). The ref writer runs the stage in the store transaction
+  of every accepted write of refs, after the refs are locked and before
+  they move. Unless `Via` is `land`, for each allowed update of
+  `refs/heads/<b>` that is not `Direct`: a `Deleted` one calls
+  `SourceDeleted` with the caller; with `VersionKind` `push`, `commit`,
+  `ref` or `rebase` the others call `RecordVersion` with that kind, the
+  caller (`pushrule.Caller`'s `UserID`, `CredentialType` and
+  `CredentialID`), the paths and the session, and report
+  `pushrule.Version{WorkspaceSlug, Number, Version}` at the update's index;
+  `VersionKind` none records nothing. `StageInput.Workspace` is the
+  workspace written to, the source; the change lives in its target. An
+  error, such as `400 unknown_session`, stops the write: no ref moves,
+  nothing of the transaction is kept, and the source control API answers
+  the API error as it is. A request that moves the source and deletes a
+  packed branch records its version while git holds the `packed-refs`
+  lock, since the version ref is a new loose ref.
+- `c.SCM().RegisterChangeLinker(changeLinker)`: `FindOpen` is
+  `OpenChangeOfBranch`; `CheckOpening` is
+  `(*change.Component).CheckOpen(ctx, q, in)` (`service.go`), which runs
+  `Open`'s whole check order, `Authorize` included, and writes nothing,
+  with `Head` the commit the write moves the branch to; `Open` is `Open`
+  in a store transaction of the linker, since the writes call both
+  outside any. Both take version kind `commit`, the write's session as
+  `TriggerSession`, and "" of a title, intent or target branch as the
+  default, and no `CheckPaths`.
+- `c.AdjustSCM` sets `scm.Deps.Changes` to `changeLookup`:
+  `OpenChangeOfBranch` and `ChangeOfCommit` with the numbers as `int`
+  (`scm.CommitChange.Version` is `nil` when the change has no such
+  version).
+- `c.Workspaces().RegisterBranchMoveObserver(syncVersions)`: a branch a
+  sync moved records a version of kind `sync` with the system actor
+  (`change.Caller{}`), in a `Store.Tx` of its own.
+- `c.Workspaces().Teardown().RegisterRemover`: in the delete's
+  transaction, `ForkDeleted` with the system actor and then
+  `WorkspaceDeleted`, for the deleted workspace and for each of its forks,
+  and for a fork the fork feature removes.
+- `c.Forks().RegisterChangeReader(forkChanges)`: `ChangesFrom` is
+  `ChangeNumbersOfSource` (branch and state).
+- `RegisterForkActivity(forkActivity)`: `(*fork.Component).RecordActivityIn`
+  in the caller's transaction.
+- `c.Events().SetChangeSources`: the change's source workspace through
+  `ReadChange`, "" for a change that does not exist.
+- the git server's fork view (`forkView`) names the numbers of
+  `ChangeNumbersOfSource` as `gitserver.ForkRefs.Changes`.
 
 The route `POST /workspaces/:slug/changes` (`routes.go`; scope
 `changes:write`, read access to `:slug`, an idempotent create, and on the
@@ -3850,9 +3908,9 @@ route). The rules:
   `event.ChangeSources` installed with `(*Component).SetChangeSources`.
   Without a covered set a bound token sees nothing; without a change lookup
   it sees none of the parent's events. The hub installs the covered set of
-  `access.Service` (see [Workspace access](#workspace-access)); nothing
-  installs a change lookup yet, so a fork-bound token sees none of the
-  parent's events.
+  `access.Service` (see [Workspace access](#workspace-access)) and the
+  change component's change lookup, which reads the change's source
+  workspace (`ReadChange`; a change that does not exist has none).
 
 A read that fails returns `false` with the error, never a grant. The
 covered set and the change lookup are kept apart from `Deps`, so the bind in

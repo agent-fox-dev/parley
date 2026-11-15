@@ -22,11 +22,13 @@ type Change struct {
 	Number        int    `json:"number"`
 }
 
-// CommitChange names the version of a change that a commit belongs to.
+// CommitChange names the version of a change that a commit belongs to:
+// the highest version whose head it is or, for a commit the change landed,
+// the version whose head it was landed from, nil when there is none.
 type CommitChange struct {
 	WorkspaceSlug string `json:"workspace_slug"`
 	Number        int    `json:"number"`
-	Version       int    `json:"version"`
+	Version       *int   `json:"version"`
 }
 
 // ChangeLookup names the change a branch or a commit of a workspace
@@ -53,8 +55,8 @@ func (defaultBranchOnly) ProtectedBranches(_ context.Context, w workspace.Worksp
 	return func(branch string) bool { return w.DefaultBranch != nil && branch == *w.DefaultBranch }, nil
 }
 
-// noChanges names no change: the hub has no change records to ask, so the
-// default answers none.
+// noChanges names no change, the default of a component without change
+// records to ask.
 type noChanges struct{}
 
 func (noChanges) OpenChangeOfBranch(context.Context, string, string) (*Change, error) {

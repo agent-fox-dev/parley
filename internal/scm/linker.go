@@ -59,8 +59,13 @@ type ChangeOpening struct {
 	// SourceWorkspace and SourceBranch name the source branch, without
 	// refs/heads/, and Head the commit the write moves it to.
 	SourceWorkspace, SourceBranch, Head string
-	TargetBranch, Title, Intent         string
-	Draft                               bool
+	// TargetBranch, Title and Intent are what the caller named, "" for the
+	// change component's defaults.
+	TargetBranch, Title, Intent string
+	Draft                       bool
+	// SessionID is the session of the write, which the session-linking
+	// rule accepted, nil for none.
+	SessionID *string
 }
 
 // RegisterChangeLinker makes l the linker the writes ask, replacing the one

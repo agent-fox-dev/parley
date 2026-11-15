@@ -783,7 +783,12 @@ A push that passed every check gets its ref advertisement from
     refs then move together by compare-and-swap against the old values
     sent: a ref that moved meanwhile is refused with `ref changed since it
     was read; fetch and try again`, so of two pushes of one ref from one
-    value exactly one goes through.
+    value exactly one goes through. In the same store transaction, before
+    the refs move, a pushed branch that is the source of a draft or open
+    change records the change's next version, of kind `push` (see
+    [Changes](#changes)), and a deleted one abandons its change; when that
+    fails, such as for a session the hub refuses, every ref is refused with
+    `internal error; try again` and nothing moves.
   - The answer is `200` with
     `Content-Type: application/x-git-receive-pack-result` and
     `Cache-Control: no-cache`. With `report-status` (or
@@ -832,8 +837,7 @@ on every git route, as of the moment of the request:
   or tag the parent gained after the fork is never advertised.
 - The version refs `refs/parley/changes/<number>/<version>` of the changes
   whose source is the fork are advertised under the parent's names, and
-  no version ref of another change. The hub records no change's source
-  yet, so a fork advertises no version ref.
+  no version ref of another change, whatever state the change is in.
 - The fork's own branches are advertised as they are.
 
 When those refs cannot be brought up to date, such as when the parent's
@@ -2338,8 +2342,7 @@ until a push to it or a change of it being opened, versioned, landed,
 abandoned or restored is recorded. A fork past its `expires_at` is
 removed once, with the reason `ttl`. A fork whose changes or sandboxes
 cannot be read is kept, the failure logged with its slug, until a later
-pass. The hub has no change feature yet: until one is added, no fork has
-changes and none is removed before its `expires_at`.
+pass.
 
 Each removal writes one `parley.fork.expire` event and no
 `parley.workspace.delete` event: actor `system`, `workspace` and
@@ -2667,7 +2670,7 @@ A ref object has exactly these members:
 | `sha` | the full id of the commit the ref points at; for an annotated tag, the commit the tag peels to |
 | `protected` | `true` for a branch the workspace's effective `protected_branches` protect (a fork's are its parent's) and for every `refs/parley/` ref, else `false` |
 | `tracking` | `true` for a task fork's tracking branch, else `false` |
-| `change` | `{"workspace_slug": …, "number": …}` for the open or draft change whose source is the branch; always `null` until the hub records changes |
+| `change` | `{"workspace_slug": …, "number": …}` for the open or draft change whose source is the branch, named under the workspace it belongs to (a task fork's parent for a fork's branch); `null` when there is none |
 
 Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
@@ -2730,7 +2733,7 @@ A commit object, as every route that answers commits writes it:
 | `tree_sha` | the full id of its tree |
 | `author`, `committer` | `{"name": …, "email": …, "time": …}`, `time` an RFC 3339 timestamp in UTC, such as `2026-01-02T03:04:05Z` |
 | `message` | the whole message, as written, its last newline included when it has one |
-| `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it; always `null` until the hub records changes |
+| `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it (a change that landed it first, then the lowest number); `version` is the highest version with the commit as its head or, for a landed commit, the version whose head it was landed from, `null` when there is none; on a task fork's slug, only the parent's changes whose source is the fork; `null` for a commit of no change |
 | `session_id` | the agent session that introduced the commit; always `null` until the hub records sessions |
 | `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
 
@@ -3233,7 +3236,13 @@ between is `409` `ref_moved`, with the commit it is at now in
 changes. An accepted write emits one `parley.git.push` event per ref, with
 `via` `"api"`, as a push does with `via` `"git"`, and the hub's ref writer
 tells the post-push listeners of it as of a push, with `via` `"api"` and
-the request's session; a refused write tells them nothing.
+the request's session; a refused write tells them nothing. As for a push,
+a branch that is the source of a draft or open change records the change's
+next version when the write moves it, in the store transaction of the
+move: of kind `commit` for a commit, `ref` for a ref move and `rebase` for
+a rebase (see [Changes](#changes)). A failure to record it, such as `400`
+`unknown_session` for a session the change component refuses, is the
+write's answer, and the branch does not move.
 
 The commit and the rebase route take a `session_id`, the agent session the
 write belongs to. It is checked after the body and before the branch is
@@ -3356,9 +3365,10 @@ and before the branch moves, and its refusal is the answer, unchanged
 (such as `403` `insufficient_scope`, `400` `target_not_found` or `409`
 `change_exists`), with nothing moved; once the branch has moved the change
 is opened, in a task fork in its parent, and `change` names it with
-version 1. No change component is registered yet, so a `change` object is
-`400` `invalid_request` (`this hub cannot open a change: no change
-component is registered`). In a task fork whose `auto_change` is `true`, a
+version 1 of kind `commit`, with the request's `session_id` as its
+session. The change component checks it as `POST
+/api/v1/workspaces/{slug}/changes` does, without the check of a
+path-scoped token's paths, which the push rules made of the commit. In a task fork whose `auto_change` is `true`, a
 commit without a `change` object to a branch that is the source of no
 draft or open change asks the change component to open one in the parent,
 with the fork's branch as source and the fork's base branch
@@ -3594,6 +3604,19 @@ for none), `created_by` (an author object), `session_id`, `stats` and
 `created_at`. A version recorded for a head that was already on the source
 branch, such as version 1 of a change opened through the route below, has
 kind `ref`.
+
+Every move of the source branch of a draft or open change to a new head
+records the next version in the same store transaction as the move, before
+the write is answered: a git push (kind `push`), a commit (`commit`), a ref
+move (`ref`) and a rebase (`rebase`) through the [source control
+writes](#source-control-writes), each by its caller and in its session;
+and a sync from origin (`sync`), by the hub (`created_by.actor_type`
+`system`). A direct push to a protected branch and a landing record none.
+A git push that deletes the source branch abandons the change; the
+deletion of its task fork abandons every draft and open change from it,
+and the deletion of the target workspace deletes its changes. Each
+abandonment writes `parley.change.abandon`, its `reason` `source_deleted`
+or `source_workspace_deleted`. The versions and their refs stay.
 
 ## `POST /api/v1/workspaces/{slug}/changes`
 
@@ -4889,7 +4912,9 @@ events of a workspace on which, or on whose fork parent, it has a level
 `parley.token.` and `parley.webhook.`), and an event of no workspace when its `metadata.scope`
 is `user` with the user's id, or `org` with an active org the user is a
 member of. A workspace-bound PAT sees, under its user's level, only the
-events of the workspaces its binding covers, and no event of no workspace.
+events of the workspaces its binding covers, and no event of no workspace;
+a token bound to a task fork also sees the change events (`resource_type`
+`change`) of the fork's parent whose change has the fork as its source.
 
 **Long-poll.** With `wait` above 0 and nothing to return, the hub holds the
 request until a visible, matching event is committed, and then answers with

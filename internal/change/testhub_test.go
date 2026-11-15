@@ -8,6 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -47,6 +51,7 @@ type world struct {
 	workspaces *workspace.Service
 	events     *event.Component
 	changes    *change.Component
+	forks      *fork.Component
 	sessions   *sessions
 
 	owner, ownerKey, org string
@@ -57,11 +62,23 @@ type world struct {
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
+	return newWorldWith(t, hubtest.Config{})
+}
+
+// newWorldWith is newWorld on a hub started with cfg, whose Compose runs
+// after the world's own registrations.
+func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
+	t.Helper()
 	w := &world{sessions: &sessions{accept: map[string]bool{sessionOne: true, sessionTwo: true}}}
-	w.Hub = hubtest.Start(t, func(c *hub.Composition) {
-		w.workspaces, w.events, w.changes = c.Workspaces(), c.Events(), c.Changes()
+	compose := cfg.Compose
+	cfg.Compose = func(c *hub.Composition) {
+		w.workspaces, w.events, w.changes, w.forks = c.Workspaces(), c.Events(), c.Changes(), c.Forks()
 		w.changes.RegisterSessionLinker(w.sessions)
-	})
+		if compose != nil {
+			compose(c)
+		}
+	}
+	w.Hub = hubtest.StartWith(t, cfg)
 	w.owner = w.CreateUser(t, "owner")
 	w.ownerKey = w.IssueKey(t, w.owner)
 	w.org = w.CreateOrg(t, "acme")
@@ -166,6 +183,58 @@ func (w *world) get(t *testing.T, path, credential string) (int, map[string]any,
 		t.Fatalf("GET %s answered %d %q: %v", path, status, raw, err)
 	}
 	return status, out, raw
+}
+
+// send sends a request with the method, path (relative to /api/v1), the
+// credential and body (nil for none), and returns the status and the
+// decoded answer, nil for an empty one.
+func (w *world) send(t *testing.T, method, path, credential string, body any) (int, map[string]any) {
+	t.Helper()
+	status, raw := w.Call(t, method, "/api/v1"+path, credential, body)
+	var out map[string]any
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("%s %s answered %d %q: %v", method, path, status, raw, err)
+		}
+	}
+	return status, out
+}
+
+// remote is the git URL of the workspace slug of the org acme on the hub,
+// with the owner's API key as its password, as a git client is given it.
+func (w *world) remote(slug string) string {
+	u, err := url.Parse(w.URL("/git/acme/" + slug + ".git"))
+	if err != nil {
+		panic(err)
+	}
+	u.User = url.UserPassword("x", w.ownerKey)
+	return u.String()
+}
+
+// clone clones the workspace slug over the hub's git URL with stock git
+// and returns the working tree, in which commits are made as P.
+func (w *world) clone(t *testing.T, slug string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), slug)
+	clientGit(t, "", "clone", "--quiet", w.remote(slug), dir)
+	clientGit(t, dir, "config", "user.name", "P")
+	clientGit(t, dir, "config", "user.email", "p@example.invalid")
+	return dir
+}
+
+// clientGit runs stock git with args in dir as a client of the hub, with
+// none of the host's configuration and no terminal prompt, fails the test
+// when git fails, and returns its output with surrounding space trimmed.
+func clientGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C"}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // errorType is the error_type of a decoded error answer, "" for another.

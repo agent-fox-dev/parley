@@ -46,15 +46,22 @@ var ActivityStep = store.Step{
 // since every event that can start or end the conditions of that removal
 // is an activity, the one instant is all the sweep needs to know how long
 // they have held. A slug that names no fork changes nothing. It opens a
-// transaction of the store, so it must not be called inside one.
+// transaction of the store, so it must not be called inside one: a caller
+// that holds one calls RecordActivityIn.
 func (c *Component) RecordActivity(ctx context.Context, slug string) error {
-	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET last_activity_at = ? WHERE slug = ? AND kind = ?`,
-			c.deps.Now().UnixNano(), slug, access.KindFork); err != nil {
-			return fmt.Errorf("record an activity of fork %q: %w", slug, err)
-		}
-		return nil
-	})
+	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.RecordActivityIn(ctx, tx, slug) })
+}
+
+// RecordActivityIn is RecordActivity in tx, the caller's transaction, such
+// as the one a change is opened or abandoned in: the store runs one write
+// transaction at a time, so a second one opened inside it would wait for
+// it forever.
+func (c *Component) RecordActivityIn(ctx context.Context, tx *sql.Tx, slug string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE workspaces SET last_activity_at = ? WHERE slug = ? AND kind = ?`,
+		c.deps.Now().UnixNano(), slug, access.KindFork); err != nil {
+		return fmt.Errorf("record an activity of fork %q: %w", slug, err)
+	}
+	return nil
 }
 
 // expireLanded is the early expiry of a pass at now: it judges, in
