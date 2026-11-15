@@ -39,8 +39,17 @@ type stacks struct{ c *Component }
 // the link when it can be one (else the invalid_dependency error); without
 // it, the link is the nearest change below the head, or none, which
 // leaves the merge base with the target branch that recording the version
-// measured.
+// measured. The depth of ch, and of every change above it, follows the
+// link.
 func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Version, dependsOn *int64) error {
+	if err := s.link(ctx, tx, ch, v, dependsOn); err != nil {
+		return err
+	}
+	return s.recomputeDepth(ctx, tx, ch.WorkspaceSlug, ch.Number)
+}
+
+// link links the change ch for its new version v, as LinkVersion says.
+func (s stacks) link(ctx context.Context, tx *sql.Tx, ch Change, v Version, dependsOn *int64) error {
 	if dependsOn != nil {
 		return s.linkTo(ctx, tx, ch, *dependsOn)
 	}
@@ -75,6 +84,9 @@ func (s stacks) SetDependsOn(ctx context.Context, tx *sql.Tx, ch Change, depends
 		err = s.unlink(ctx, tx, ch)
 	}
 	if err != nil {
+		return err
+	}
+	if err := s.recomputeDepth(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
 	}
 	return s.c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number)
@@ -178,6 +190,71 @@ func checkDependency(ctx context.Context, q Querier, ch Change, number int64) (C
 		down = next
 	}
 	return lower, nil
+}
+
+// recomputeDepth flags stack_too_deep each change of the workspace, from
+// the change number up through its dependants, that sits deeper in its
+// stack than the limit, and unflags one flagged so that no longer does. A
+// change past the limit keeps its link and its versions: the flag only
+// keeps it out of the restacks, whose cost grows with every change above
+// the one that moved.
+func (s stacks) recomputeDepth(ctx context.Context, tx *sql.Tx, workspace string, number int64) error {
+	above, err := stackAbove(ctx, tx, workspace, number)
+	if err != nil {
+		return err
+	}
+	depth, err := depthOf(ctx, tx, workspace, number)
+	if err != nil {
+		return err
+	}
+	// stackAbove lists a change after the change it depends on, so the
+	// depth of each change above is one more than that of its link.
+	depths := map[int64]int{number: depth}
+	for _, n := range append([]int64{number}, above...) {
+		if n != number {
+			link, err := linkOf(ctx, tx, workspace, n)
+			if err != nil {
+				return err
+			}
+			if link == nil {
+				return fmt.Errorf("depth of %s: it has no link", Ref(workspace, n))
+			}
+			depths[n] = depths[*link] + 1
+		}
+		var reason *string
+		err := tx.QueryRowContext(ctx, `SELECT restack_reason FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, n).Scan(&reason)
+		if err != nil {
+			return fmt.Errorf("depth of %s: %w", Ref(workspace, n), err)
+		}
+		deep, flagged := depths[n] > s.c.deps.MaxStackDepth, reason != nil && *reason == RestackTooDeep
+		switch {
+		case deep && !flagged:
+			err = s.c.SetNeedsRestack(ctx, tx, workspace, n, true, new(RestackTooDeep))
+		case !deep && flagged:
+			// Whether the change, back within the limit, must be restacked
+			// onto the change below it is decided here once the change
+			// is unflagged.
+			err = s.c.SetNeedsRestack(ctx, tx, workspace, n, false, nil)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// depthOf is the depth of the change number of the workspace in its stack:
+// the number of changes in its chain of depends_on links down to a change
+// with none, itself included. A loop, which the links never close, ends
+// the count where the chain meets itself.
+func depthOf(ctx context.Context, q Querier, workspace string, number int64) (int, error) {
+	seen := map[int64]bool{number: true}
+	link, err := linkOf(ctx, q, workspace, number)
+	for err == nil && link != nil && !seen[*link] {
+		seen[*link] = true
+		link, err = linkOf(ctx, q, workspace, *link)
+	}
+	return len(seen), err
 }
 
 // linkOf is the depends_on of the change number of the workspace, nil for

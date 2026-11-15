@@ -109,7 +109,9 @@ const (
 // only its own commits; with none below, the link is cleared and the
 // version keeps the merge base with its target branch. The depends_on an
 // open or a PATCH names is checked and taken in place of that rule, for
-// version 1 of an open. Its column of the
+// version 1 of an open. After each link, a change deeper in its stack
+// than [changes].max_stack_depth, and each such change above it, is flagged
+// stack_too_deep, and one back within the limit unflagged. Its column of the
 // change record, the commit a change must sit on once the change below it
 // landed, is added by StackStep.
 //
@@ -171,6 +173,7 @@ func composeChanges(c *Composition) {
 			Logger:     rt.Logger,
 
 			MergeableDebounce: rt.Config.Changes.MergeableDebounce,
+			MaxStackDepth:     rt.Config.Changes.MaxStackDepth,
 		}
 		for _, adjust := range c.changeAdjusters {
 			adjust(&d)

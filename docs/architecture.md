@@ -3677,7 +3677,16 @@ open, or one whose chain of `depends_on` links, walked down, reaches the
 change is `400 invalid_dependency`, which rolls back the open's or the
 `PATCH`'s transaction. An accepted link moves the base to the lower
 change's head only when the head is built on it (`IsAncestor`); otherwise
-the base stays. `ReadChange(ctx, q, workspace, number)` reads
+the base stays. After every link it stores (`LinkVersion` and
+`SetDependsOn` alike), `recomputeDepth` counts the depth of the change
+(`depthOf`: the changes in its chain of `depends_on` links down to one
+with none, itself included) and of every draft or open change above it
+(`stackAbove`, each one more than the change it depends on), and sets
+`needs_restack` with `restack_reason` `stack_too_deep` through
+`SetNeedsRestack` on each one deeper than `Deps.MaxStackDepth` (from
+`[changes].max_stack_depth`, `DefaultMaxStackDepth` 20 when zero), and
+clears both on a change so flagged that is back within the limit. Depth
+never refuses a version or a link. `ReadChange(ctx, q, workspace, number)` reads
 one change, through the caller's transaction or, with `nil`, the store;
 an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
 The change's `dependants` are not stored: every read derives them as the

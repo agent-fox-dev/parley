@@ -12,6 +12,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
 func TestLinkVersion_LinksAChangeToTheNearestChangeBelowIt(t *testing.T) {
@@ -347,5 +348,68 @@ func TestLinkVersion_KeepsAnExplicitLinkForTheFirstVersionOnly(t *testing.T) {
 	w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b", Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
 	if got := w.read(t, b).DependsOn; got == nil || *got != x.Number {
 		t.Errorf("depends_on after the next version = %v, want %d", got, x.Number)
+	}
+}
+
+func TestLinkVersion_FlagsTheChangesPastTheStackDepthLimit(t *testing.T) {
+	t.Parallel()
+	limited := newWorldWith(t, hubtest.Config{TOML: zeroDebounce + "max_stack_depth = 3\n"})
+	unconfigured := newWorld(t)
+	chain := func(p string, n int) []string {
+		var names []string
+		for i := range n {
+			names = append(names, fmt.Sprintf("%s%02d", p, i))
+		}
+		return names
+	}
+	cases := []struct {
+		name string
+		w    *world
+		// open opens the changes, each branch named with the prefix p, and
+		// returns them bottom first.
+		open func(t *testing.T, w *world, p string) []change.Change
+		// unflagged is how many changes at the bottom are within the limit.
+		unflagged int
+	}{
+		{"a limit of 3, five opened bottom first", limited, func(t *testing.T, w *world, p string) []change.Change {
+			return w.stacked(t, chain(p, 5)...)
+		}, 3},
+		{"no limit configured, twenty-one opened bottom first", unconfigured, func(t *testing.T, w *world, p string) []change.Change {
+			return w.stacked(t, chain(p, 21)...)
+		}, 20},
+		{"a limit of 3, a fourth attached by PATCH", limited, func(t *testing.T, w *world, p string) []change.Change {
+			s := w.stacked(t, chain(p, 3)...)
+			w.branch(t, p+"x", "X\n\nWhy.\n")
+			x := w.openBranch(t, p+"x", nil)
+			if status, got := w.patch(t, x.Number, w.ownerKey, map[string]any{"depends_on": s[2].Number}); status != http.StatusOK {
+				t.Fatalf("PATCH depends_on %d = %d %v, want 200", s[2].Number, status, got)
+			}
+			return append(s, x)
+		}, 3},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := c.open(t, c.w, fmt.Sprintf("d%d", i))
+			for j, opened := range s {
+				ch := c.w.read(t, opened.Number)
+				var want *string
+				if j >= c.unflagged {
+					want = new("stack_too_deep")
+				}
+				if ch.NeedsRestack != (want != nil) || deref(ch.RestackReason) != deref(want) {
+					t.Errorf("change %d at depth %d: needs_restack, restack_reason = %v, %v; want %v, %v", ch.Number, j+1, ch.NeedsRestack, deref(ch.RestackReason), want != nil, deref(want))
+				}
+				var below *int64
+				if j > 0 {
+					below = &s[j-1].Number
+				}
+				if (ch.DependsOn == nil) != (below == nil) || (below != nil && *ch.DependsOn != *below) {
+					t.Errorf("change %d at depth %d: depends_on = %v, want %v", ch.Number, j+1, ch.DependsOn, below)
+				}
+				if vs := c.w.versions(t, "demo", ch.Number); len(vs) == 0 || vs[0]["number"] != 1.0 {
+					t.Errorf("change %d at depth %d: versions = %v, want version 1 recorded", ch.Number, j+1, vs)
+				}
+			}
+		})
 	}
 }
