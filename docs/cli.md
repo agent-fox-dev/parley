@@ -389,7 +389,7 @@ Available Commands:
   login             Sign in to the hub and save the hub URL and the credential
   orgs              List and read the organizations you belong to
   sandbox           Work with the hub's sandboxes and their profiles
-  scm               Read the refs, commits, files, diffs and blame of a workspace without a clone
+  scm               Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   tokens            Create, read, change and revoke your personal access tokens
   user              Read and update your own profile
@@ -1993,8 +1993,8 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley scm`
 
 `parley scm` run without a command prints its help and exits `0`; it reads
-no credential and sends no request. Its nine commands read a workspace's
-repository without a clone, through the
+no credential and sends no request. Its nine read commands read a
+workspace's repository without a clone, through the
 [source control reads](api.md#source-control-reads) of the hub. Each sends
 one `GET` with the credential as `Authorization: Bearer`, `<slug>` (and the
 `<rev>` of `show`) as one percent-encoded path segment
@@ -2055,6 +2055,52 @@ positive integers `<start>:<end>` (`parley scm blame takes --lines
 <start>:<end>, two positive integers, got "3"`) and a `--limit` that is not
 an integer are refused with a `usage_error` and exit status `2` before any
 setting is read or any request sent.
+
+**Writes.** `parley scm commit` and `parley scm rebase` write to the
+repository through the [source control writes](api.md#source-control-writes)
+of the hub, each with one `POST`, `<slug>` as one percent-encoded path
+segment and the body below as JSON.
+
+| Command | Request | Body |
+|---|---|---|
+| `parley scm commit <slug> --branch <b> --message <m> [--base <rev>] [--expected-head <sha>] [--put <repo-path>=<local-file>]... [--delete <repo-path>]... [--move <from>=<to>]... [--session <id>] [--change-target <b>] [--title <t>] [--intent <i>] [--draft]` | `POST …/scm/commits` | `branch`, `message`, `operations`, `--base` `base_ref`, `--expected-head` `expected_head_sha`, `--session` `session_id`, `change` |
+| `parley scm rebase <slug> <branch> --onto <rev> [--expected-head <sha>]` | `POST …/scm/rebase` | `branch`, `onto`, `--expected-head` `expected_head_sha` |
+
+- `--put`, `--delete` and `--move` repeat, and become the commit's
+  `operations` in the order they are given on the command line, across the
+  three flags: `--put <repo-path>=<local-file>` is
+  `{"op":"put","path":…,"content_base64":…}`, the local file's bytes
+  base64-encoded and no `mode`; `--delete <repo-path>` is
+  `{"op":"delete","path":…}`; `--move <from>=<to>` is
+  `{"op":"move","from":…,"to":…}`. A pair is split at its first `=`.
+  Without any of them `operations` is `[]`.
+- `change` is sent when at least one of `--change-target`, `--title`,
+  `--intent` and `--draft` is given, and holds `target_branch`, `title`,
+  `intent` and `draft` only for the flags given. `base_ref`, `session_id`
+  and `expected_head_sha` are sent only for their flag.
+- Without `--expected-head`, `parley scm commit` first reads the branch with
+  `GET …/scm/refs/<branch>`, the branch as one percent-encoded segment
+  (`--branch feat/x` reads `…/scm/refs/feat%2Fx`), and sends its `sha` as
+  `expected_head_sha`, so the commit lands only on the head it read. A `404`
+  `ref_not_found` means a new branch, and the commit is sent without
+  `expected_head_sha`; any other refusal of the read is written to stderr
+  as received, with exit status `1` and no commit sent.
+
+Both print the hub's answer on stdout with exit status `0`: the commit's
+`201` body, and the rebase's `200` body whether its `status` is `rebased` or
+`up_to_date`. A refusal (`409` `ref_moved` with `details.current_sha`, `409`
+`rebase_conflict` with the conflict report in `details`, `403` of a push
+rule, among others) is written to stderr as received, `details` included,
+with nothing on stdout and exit status `1`. Each write is sent once and
+never retried.
+
+A missing `--branch`, `--message` or `--onto`, a wrong number of arguments,
+a `--put` or `--move` without `=` or with an empty side (`invalid argument
+"nopath" for "--put" flag: want <repo-path>=<local-file>, neither side
+empty`) and a `--put` local file that cannot be read (`invalid argument
+"p=/nonexist" for "--put" flag: cannot read the local file: open /nonexist:
+no such file or directory`) are refused with a `usage_error` and exit status
+`2` before any setting is read or any request sent.
 
 ### `parley credential-helper`
 

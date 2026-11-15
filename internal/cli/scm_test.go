@@ -246,7 +246,7 @@ func TestSCM_WithoutACommandPrintsItsHelp(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr)
 	}
-	for _, sub := range []string{"refs", "log", "show", "ls", "cat", "diff", "compare", "blame", "search"} {
+	for _, sub := range []string{"refs", "log", "show", "ls", "cat", "diff", "compare", "blame", "search", "commit", "rebase"} {
 		if !slices.ContainsFunc(nonEmptyLines(stdout), func(l string) bool { return strings.HasPrefix(strings.TrimSpace(l), sub+" ") }) {
 			t.Errorf("stdout does not list %s:\n%s", sub, stdout)
 		}
