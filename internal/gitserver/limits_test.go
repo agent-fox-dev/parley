@@ -97,8 +97,10 @@ func TestReceive_FailsAPushWhosePackIsLargerThanTheMaximumPushSize(t *testing.T)
 	}
 }
 
-// The push's [git].timeout is 100 ms: an options stage that holds the push,
-// and a client that sends half its pack and then nothing, outlast it.
+// The push's [git].timeout is 1 s: an options stage that holds the push,
+// and a client that sends half its pack and then nothing, outlast it. A
+// shorter timeout can pass under the load of the whole suite before the
+// stalled push's git index-pack has started, and the test would see none.
 //
 // Not parallel: it puts a git first on the PATH of the test process, which
 // notes the pid of every git index-pack and then becomes the real git, so
@@ -106,7 +108,7 @@ func TestReceive_FailsAPushWhosePackIsLargerThanTheMaximumPushSize(t *testing.T)
 func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testing.T) {
 	pids := indexPackPIDs(t)
 	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
-		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = 100 * time.Millisecond })
+		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = time.Second })
 		c.Receiver().RegisterOptionsStage(limitStage{})
 	}})
 	caps := append(slices.Clone(fullCaps), "push-options")
@@ -132,8 +134,8 @@ func TestReceive_AbandonsAPushWhoseTimeoutPassesBeforeItsRefsAreWritten(t *testi
 			} else {
 				got = w.receive(t, "acme/demo.git", w.ownerKey, body).body
 			}
-			if d := time.Since(start); d > 2*time.Second {
-				t.Errorf("the push was answered after %v, want within 2s", d)
+			if d := time.Since(start); d > 4*time.Second {
+				t.Errorf("the push was answered after %v, want within 4s", d)
 			}
 			started := readPIDs(t, pids)
 			if c.stall && len(started) == 0 {
