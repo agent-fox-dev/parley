@@ -166,7 +166,9 @@ func (c *Component) runChecks(ctx context.Context) {
 // checkMergeable computes the mergeable of the change k: it reads the
 // change's head and onto-commit, trial-rebases the head onto it in the
 // target's repository under the deadline, and stores the result when they
-// are still the change's; a pair that moved on is scheduled again. A
+// are still the change's, unless a restack stored its conflict since the
+// check was scheduled (holdsRestackConflict); a pair that moved on is
+// scheduled again. A
 // missing target branch leaves mergeable unknown and re-evaluates the
 // landing, which reports it. A trial rebase that fails or passes its
 // deadline leaves mergeable unknown and is logged; the change's next
@@ -210,6 +212,9 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 			return err
 		}
 		if moved = now.HeadSHA != ch.HeadSHA || ontoNow != onto; moved {
+			return nil
+		}
+		if holdsRestackConflict(now) {
 			return nil
 		}
 		return c.StoreMergeability(ctx, tx, k.workspace, k.number, ch.HeadSHA, onto, report)

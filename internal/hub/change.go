@@ -132,8 +132,12 @@ const (
 // branch with a compare-and-swap and records a version of kind restack by
 // the hub in one store transaction, with parley.change.restack after its
 // version event, which records the restacks of the changes above it in
-// turn. The mergeability check of a change with a pending restack stores
-// nothing until the restack has ended. The component's own restacker
+// turn. A restack whose replay conflicts moves nothing and stores the
+// conflict as the mergeability result, with needs_restack set for it, so
+// that StoreMergeability writes its parley.change.conflict; the changes
+// above are not restacked. The mergeability check of a change with a
+// pending restack stores nothing until the restack has ended. The
+// component's own restacker
 // (Restacker) records, in the abandon's transaction, the restack of each
 // dependant an abandon reparents. The entry point for a landed change
 // (OnLanded), which unlinks its dependants and restacks them onto the

@@ -413,3 +413,82 @@ func TestLinkVersion_FlagsTheChangesPastTheStackDepthLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestLinkVersion_ClearsANeedsRestackOnceTheChangeSitsOnWhatItMust(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.hold(t)
+	w.holdRestacks(t)
+	// conflictOnA amends the change below to clash with the change b,
+	// whose restack conflicts, and returns the new head below.
+	conflictOnA := func(t *testing.T, p string, _ change.Change) string {
+		head := w.amend(t, p+"a", map[string]string{p + "f.txt": "a2\n"})
+		w.runPending(t)
+		return head
+	}
+	// conflictOnLanded lands the change a below as a commit that clashes
+	// with b, whose restack conflicts, and returns the landed commit.
+	conflictOnLanded := func(t *testing.T, p string, a change.Change) string {
+		landed := w.land(t, a.Number, map[string]string{p + "f.txt": "a2\n"})
+		if err := w.changes.OnLanded(context.Background(), "demo", a.Number, landed); err != nil {
+			t.Fatalf("OnLanded = %v", err)
+		}
+		w.runPending(t)
+		return landed
+	}
+	for i, c := range []struct {
+		name string
+		// flag sets the needs_restack of the change b, which sits on the
+		// change a, for reason, and returns the commit the version b gets
+		// is made on, from the head below, the landed commit or the base.
+		flag    func(t *testing.T, p string, a change.Change) string
+		on      func(below, base string) string
+		reason  string
+		cleared bool
+		// linked is whether b still sits on a.
+		linked bool
+	}{
+		{"in conflict, rebased onto the head below", conflictOnA, func(below, _ string) string { return below }, change.RestackConflict, true, true},
+		{"with automatic restacks off, rebased onto the head below", func(t *testing.T, p string, a change.Change) string {
+			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+				return w.changes.SetNeedsRestack(ctx, tx, "demo", a.Number+1, true, new(change.RestackAutoOff))
+			})
+			return a.HeadSHA
+		}, func(below, _ string) string { return below }, change.RestackAutoOff, true, true},
+		{"in conflict on the landed commit, rebased onto it", conflictOnLanded, func(below, _ string) string { return below }, change.RestackConflict, true, false},
+		{"in conflict on the landed commit, amended on its old base", conflictOnLanded, func(_, base string) string { return base }, change.RestackConflict, false, false},
+		{"in conflict, rebased onto its target", conflictOnA, func(string, string) string { return w.base }, change.RestackConflict, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := fmt.Sprintf("x%d", i)
+			s := w.stacked(t, p+"a")
+			a := s[0]
+			commit(t, w.demo, p+"b", a.HeadSHA, "B\n", map[string]string{p + "f.txt": "b\n"})
+			b := w.openBranch(t, p+"b", nil)
+			if b.Number != a.Number+1 {
+				t.Fatalf("b is demo#%d, want demo#%d", b.Number, a.Number+1)
+			}
+			below := c.flag(t, p, a)
+			if got := w.read(t, b.Number); !got.NeedsRestack || deref(got.RestackReason) != c.reason {
+				t.Fatalf("before the version, needs_restack %v for %q; want true for %q", got.NeedsRestack, deref(got.RestackReason), c.reason)
+			}
+			head := commit(t, w.demo, p+"b", c.on(below, a.HeadSHA), "B again\n", map[string]string{p + "f.txt": "b2\n"})
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: p + "b", Head: head, Kind: change.KindPush, Caller: w.ownerCaller()})
+
+			got := w.read(t, b.Number)
+			want := c.reason
+			if c.cleared {
+				want = ""
+			}
+			if got.NeedsRestack == c.cleared || deref(got.RestackReason) != want {
+				t.Errorf("needs_restack %v for %q, want %v for %q", got.NeedsRestack, deref(got.RestackReason), !c.cleared, want)
+			}
+			if linked := got.DependsOn != nil && *got.DependsOn == a.Number; linked != c.linked || (!c.linked && got.DependsOn != nil) {
+				t.Errorf("depends_on %v, want on demo#%d: %v", got.DependsOn, a.Number, c.linked)
+			}
+			if deps := w.read(t, a.Number).Dependants; !c.linked && len(deps) != 0 {
+				t.Errorf("the dependants of demo#%d are %v, want none", a.Number, deps)
+			}
+		})
+	}
+}

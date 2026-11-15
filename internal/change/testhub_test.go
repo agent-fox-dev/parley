@@ -681,14 +681,15 @@ func (w *world) quiet(t *testing.T) {
 }
 
 // hold keeps every mergeability check from starting until the test ends,
-// so that mergeable stays unknown after a trigger and nothing else is
-// written.
-func (w *world) hold(t *testing.T) {
+// or until the function it returns lets them start, so that mergeable
+// stays unknown after a trigger and nothing else is written.
+func (w *world) hold(t *testing.T) (release func()) {
 	t.Helper()
 	g := newGate()
 	t.Cleanup(g.release)
 	change.SetMergeableSeams(w.changes, change.MergeableSeams{Gate: g.pass})
 	w.held = true
+	return func() { g.release(); w.held = false }
 }
 
 // trigger schedules a mergeability check of the change number of demo.

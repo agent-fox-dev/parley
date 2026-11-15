@@ -58,9 +58,10 @@ func (s stacks) RequestRestack(ctx context.Context, tx *sql.Tx, ch Change, trigg
 // it, the link is the nearest change below the head, or none, which
 // leaves the merge base with the target branch that recording the version
 // measured. The depth of ch, and of every change above it, follows the
-// link. Each change directly above ch that is not built on the new head
-// gets a pending restack onto it, recorded in tx, so that a version is
-// never stored without the restacks it owes.
+// link, and a restack ch was flagged as needing may be answered by the
+// version (settle). Each change directly above ch that is not built on the
+// new head gets a pending restack onto it, recorded in tx, so that a
+// version is never stored without the restacks it owes.
 func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Version, dependsOn *int64) error {
 	if err := s.link(ctx, tx, ch, v, dependsOn); err != nil {
 		return err
@@ -68,7 +69,54 @@ func (s stacks) LinkVersion(ctx context.Context, tx *sql.Tx, ch Change, v Versio
 	if err := s.recomputeDepth(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
 	}
+	if err := s.settle(ctx, tx, ch, v); err != nil {
+		return err
+	}
 	return s.pendDependants(ctx, tx, ch, v)
+}
+
+// settle clears in tx the needs_restack of the change ch, set because a
+// restack conflicted or automatic restacks are off, once its new version v
+// sits on the commit it must: the head of the change it now depends on, or
+// the commit the change below it landed as, which it then no longer keeps.
+// A change the version unlinked has no change below it to sit on, so its
+// flag goes with the link. Any other flag, and a version that does not sit
+// on that commit, leave the change as it is.
+func (s stacks) settle(ctx context.Context, tx *sql.Tx, ch Change, v Version) error {
+	now, err := readChange(ctx, tx, ch.WorkspaceSlug, ch.Number)
+	if err != nil {
+		return err
+	}
+	if reason := reasonOf(now); !now.NeedsRestack || (reason != RestackConflict && reason != RestackAutoOff) {
+		return nil
+	}
+	var must string
+	switch {
+	case now.DependsOn != nil:
+		lower, err := readChange(ctx, tx, ch.WorkspaceSlug, *now.DependsOn)
+		if err != nil {
+			return err
+		}
+		must = lower.HeadSHA
+	case ch.DependsOn == nil:
+		if must, err = landedBelow(ctx, tx, now); err != nil || must == "" {
+			return err
+		}
+	}
+	if must != "" {
+		repo, err := s.c.deps.Repos(ctx, ch.WorkspaceSlug)
+		if err != nil {
+			return err
+		}
+		built, err := repo.IsAncestor(ctx, must, v.HeadSHA)
+		if err != nil || !built {
+			return err
+		}
+	}
+	if err := s.c.SetNeedsRestack(ctx, tx, ch.WorkspaceSlug, ch.Number, false, nil); err != nil {
+		return err
+	}
+	return clearRestackOnto(ctx, tx, ch.WorkspaceSlug, ch.Number)
 }
 
 // pendDependants records a pending restack, for a new version, of each

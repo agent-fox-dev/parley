@@ -3691,6 +3691,13 @@ with none, itself included) and of every draft or open change above it
 clears both on a change so flagged that is back within the limit. Depth
 never refuses a version or a link.
 
+Then `settle` clears `needs_restack` and `restack_reason`, and
+`restack_onto`, of a change flagged for `conflict` or `auto_restack_off`
+whose new head has the commit it must sit on (`IsAncestor` in the target's
+repository): the head of the change it now depends on, or, unlinked, its
+`restack_onto`; a change the version unlinked is cleared without one,
+since it has no change below it to sit on. Other flags are left.
+
 Last, `LinkVersion` records a pending restack (`pendRestack`, trigger
 `version`) of each direct dependant of the change whose head does not
 have the new head (`IsAncestor` in the target's repository), in the
@@ -3729,8 +3736,18 @@ cleared. Otherwise it replays `base_sha..head` onto the commit with
 `Rebase` only in replaying the commits after `base` instead of those
 `onto` lacks, so that the old commits of a change below that was
 force-pushed or landed are not replayed; its conflict report's `base_sha`
-is `base`. A conflict ends the restack: the record is removed and the
-mergeability check scheduled, which reports it. Then, in one `Store.Tx`,
+is `base`. A conflict ends the restack (`restackConflicted`, in
+`conflict.go`): in one `Store.Tx` it reads the change and the commit to
+sit on again (a new head or a moved commit: the attempt starts again),
+removes the record, sets `needs_restack` with reason `conflict`
+(`SetNeedsRestack`) and then stores `mergeable` `conflict` with the report
+through `StoreMergeability` for the pair of the head it read and the
+commit it replayed onto, so that the `parley.change.conflict` that
+function writes on a transition carries `needs_restack` `true`. The report
+(`restackReport`) is the replay's, with `target_sha` that commit,
+`head_sha` the head, `base_sha` the change's base, and no landed changes,
+`landed_by` or change. No branch moves and nothing is recorded for the
+changes above. Otherwise, in one `Store.Tx`,
 it reads the change and the commit to sit on again (moved: the attempt
 starts again), moves the source branch with `CompareAndSwapRef` on the
 head it read (`ErrRefMoved`, also for a ref a push has locked: the
@@ -3962,7 +3979,7 @@ draft or open, else the head of the target branch in the target
 workspace's repository. A change that is neither draft nor open, or that
 has a pending restack (`change_restacks`), is dropped, since its head
 still holds the old commits of the change below: the end of the restack
-schedules it again; a missing target branch leaves `mergeable` `unknown` and runs
+schedules it again, or stores its conflict; a missing target branch leaves `mergeable` `unknown` and runs
 `reevaluateLanding` (draft: `blocked/draft`; else the structural reason
 `measureMove` finds, `target_not_found` here; else the landing evaluator
 with the current version; else ready). Otherwise the check runs
@@ -3972,7 +3989,13 @@ which writes no ref, index or work tree; an error or the deadline leaves
 `workspace` and `number`, and nothing retries it before the change's next
 trigger. The result is stored in a second `Store.Tx` only while the change
 is draft or open and its head and onto-commit are still those computed,
-else it is discarded and the change scheduled again. A check scheduled in
+else it is discarded and the change scheduled again. A change that holds
+the conflict a restack stored after the check was scheduled
+(`holdsRestackConflict`: `mergeable` `conflict`, `needs_restack` with
+reason `conflict`) keeps it: the result is discarded, since the trial
+replays the old commits of the change below that the change still
+carries and its report would replace the one of the change's own
+commits. A check scheduled in
 a transaction that is rolled back computes the change as it is.
 
 `(*change.Component).StoreMergeability(ctx, tx, workspace, number, head,

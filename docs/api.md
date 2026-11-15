@@ -4102,7 +4102,9 @@ and `number` and `ref` in its metadata. A result writes, by the hub
 - `parley.change.conflict` when the check finds a conflict and the value
   the last check computed was `clean`, or there was none: metadata
   `number`, `ref`, `version`, `head_sha`, `files` (the conflicted paths)
-  and `needs_restack`. A further conflict, for the same or a later
+  and `needs_restack`. A restack that conflicts stores its conflict the
+  same way, after it has set `needs_restack` (see
+  [Stacks and restack](#stacks-and-restack)). A further conflict, for the same or a later
   version or target head, replaces the conflict report and writes no
   event; an `unknown` in between does not count. A `clean` result clears
   the report, so the next conflict is announced again.
@@ -4171,9 +4173,35 @@ bottom first. The hub writes, by `system`, `parley.change.version` with
 (the commit it was restacked onto) and `trigger` (`version`, `land` or
 `abandon`). A restack whose source branch already sat on that commit
 clears a
-`needs_restack` set for `conflict` or `auto_restack_off`. A restack
-whose replay conflicts moves nothing and ends; the change's mergeability
-check then reports the conflict. A restack that fails for another reason
+`needs_restack` set for `conflict` or `auto_restack_off`.
+
+A restack whose replay conflicts moves no branch, records no version and
+records no restack of the changes above it, which keep their versions and
+their `depends_on`. In one store transaction its pending restack is
+removed, the change gets `needs_restack` `true` with `restack_reason`
+`conflict`, and then `mergeable` `conflict` with the conflict report, as a
+mergeability check stores them (see [Mergeability](#mergeability)): when
+the change was not in conflict already, the hub writes
+`parley.change.conflict` with `needs_restack` `true`; a later conflict
+replaces the report and writes no event. The report has the members
+`target_sha` (the commit the change was replayed onto), `head_sha` (the
+change's head), `base_sha` (the change's `base_sha`), `commit_sha` (the
+first of the change's own commits that did not apply), `files` (each with
+`path`, `kind`, `base`, `ours`, `theirs` and `landed_by` `[]`),
+`landed_changes` `[]` and `change` `null`. A mergeability check of the
+change that was scheduled before the restack stored the conflict keeps
+that report. When the change gets a version or the commit it must sit on
+moves while the replay runs, the restack starts again instead.
+
+A version recorded for a change whose `needs_restack` is set for
+`conflict` or `auto_restack_off` clears `needs_restack` and
+`restack_reason` when its head has the commit the change must sit on: the
+head of the change it depends on, or the landed commit of the change that
+was below it. A version that leaves a linked change with no `depends_on`
+clears them too, together with the link. Any other version leaves them
+as they are.
+
+A restack that fails for another reason
 than a conflict changes nothing; it is logged as `the restack failed`
 with `workspace`, `number` and `error`, and stays pending until a newer
 restack of the change replaces it or `parleyd` starts again.

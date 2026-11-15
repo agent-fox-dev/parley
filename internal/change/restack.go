@@ -122,7 +122,7 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 		return res, false, err
 	case report != nil:
 		res.outcome, res.report = restackConflict, report
-		return c.restackEnded(ctx, j, ch, res)
+		return c.restackConflicted(ctx, j, ch, res, onto)
 	}
 	if beforeSwap != nil {
 		beforeSwap(ctx, j.workspace, j.number, attempt)
@@ -210,13 +210,12 @@ func (c *Component) recordRestack(ctx context.Context, tx *sql.Tx, j restackJob,
 }
 
 // restackEnded stores, in a transaction of its own, the end of a restack
-// of the change ch that moved nothing, and removes the job's pending
-// record:
+// of the change ch that moved nothing and found no conflict
+// (restackConflicted stores that), and removes the job's pending record:
 //
 //   - up to date: a needs_restack set for a conflict or with automatic
 //     restacks off is cleared, since the change now sits on what it must,
 //     and so is the landed commit it had to sit on;
-//   - a conflict: the mergeability check reports it;
 //   - closed: nothing else.
 //
 // The mergeability check of a change with a pending record stores nothing
@@ -230,9 +229,6 @@ func (c *Component) restackEnded(ctx context.Context, j restackJob, ch Change, r
 		now, err := readChange(ctx, tx, j.workspace, j.number)
 		if err != nil || !active(now) {
 			return c.ignoreGone(ctx, tx, j, err)
-		}
-		if res.outcome == restackConflict {
-			return c.restackConflicted(ctx, tx, now, res.report)
 		}
 		cleared := false
 		if reason := reasonOf(now); now.NeedsRestack && (reason == RestackConflict || reason == RestackAutoOff) {
@@ -250,13 +246,6 @@ func (c *Component) restackEnded(ctx context.Context, j restackJob, ch Change, r
 		return c.ScheduleMergeable(ctx, tx, j.workspace, j.number)
 	})
 	return res, false, err
-}
-
-// restackConflicted stores in tx that the restack of the change ch found
-// the conflict the report describes: its mergeability check, which finds
-// it again, is scheduled.
-func (c *Component) restackConflicted(ctx context.Context, tx *sql.Tx, ch Change, _ *gitrepo.ConflictReport) error {
-	return c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number)
 }
 
 // ignoreGone is nil for err, the error of reading the change of the job in
@@ -288,13 +277,9 @@ func (c *Component) sitOn(ctx context.Context, q Querier, ch Change, onto string
 	if onto != "" {
 		return onto, nil
 	}
-	var landed sql.NullString
-	if err := q.QueryRowContext(ctx, `SELECT restack_onto FROM changes WHERE workspace_slug = ? AND number = ?`,
-		ch.WorkspaceSlug, ch.Number).Scan(&landed); err != nil {
-		return "", fmt.Errorf("read what %s sits on: %w", ch.Ref, err)
-	}
-	if landed.String != "" {
-		return landed.String, nil
+	landed, err := landedBelow(ctx, q, ch)
+	if err != nil || landed != "" {
+		return landed, err
 	}
 	repo, err := c.deps.Repos(ctx, ch.WorkspaceSlug)
 	if err != nil {
@@ -317,6 +302,17 @@ func sitsOn(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (b
 		return built, err
 	}
 	return repo.IsAncestor(ctx, base, onto)
+}
+
+// landedBelow is the commit the change below the change ch landed as,
+// which ch must sit on until it does, read through q; "" for none.
+func landedBelow(ctx context.Context, q Querier, ch Change) (string, error) {
+	var landed sql.NullString
+	if err := q.QueryRowContext(ctx, `SELECT restack_onto FROM changes WHERE workspace_slug = ? AND number = ?`,
+		ch.WorkspaceSlug, ch.Number).Scan(&landed); err != nil {
+		return "", fmt.Errorf("read what %s sits on: %w", ch.Ref, err)
+	}
+	return landed.String, nil
 }
 
 // clearRestackOnto forgets in tx the landed commit the change number of
