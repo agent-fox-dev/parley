@@ -225,6 +225,48 @@ func update(ctx context.Context, tx *sql.Tx, workspace string, number int64, now
 	return nil
 }
 
+// storeVersion makes the version v, with the touched paths of its version
+// (truncated when there were more), the current version of the change
+// number of the workspace: its number, head, base, patch id, stats, paths
+// and session, with mergeable back to unknown.
+func storeVersion(ctx context.Context, tx *sql.Tx, workspace string, number int64, v Version, paths []string, truncated bool) error {
+	b, err := json.Marshal(nonNil(paths))
+	if err != nil {
+		return err
+	}
+	return update(ctx, tx, workspace, number, v.CreatedAt, `version = ?, head_sha = ?, base_sha = ?, patch_id = ?,
+	commits = ?, files_changed = ?, insertions = ?, deletions = ?, paths = ?, paths_truncated = ?, session_id = ?,
+	mergeable = 'unknown'`, v.Number, v.HeadSHA, v.BaseSHA, v.PatchID, v.Stats.Commits, v.Stats.FilesChanged,
+		v.Stats.Insertions, v.Stats.Deletions, string(b), truncated, v.SessionID)
+}
+
+// versionBase is the base of the version of the change number of the
+// workspace.
+func versionBase(ctx context.Context, q Querier, workspace string, number, version int64) (string, error) {
+	var base string
+	err := q.QueryRowContext(ctx, `SELECT base_sha FROM change_versions WHERE workspace_slug = ? AND number = ? AND version = ?`,
+		workspace, number, version).Scan(&base)
+	if err != nil {
+		return "", fmt.Errorf("read the base of version %d of %s: %w", version, Ref(workspace, number), err)
+	}
+	return base, nil
+}
+
+// latestEquivalent is the number of the latest version of the change
+// number of the workspace whose patch id is patchID, nil for none.
+func latestEquivalent(ctx context.Context, q Querier, workspace string, number int64, patchID string) (*int64, error) {
+	var version int64
+	err := q.QueryRowContext(ctx, `SELECT version FROM change_versions WHERE workspace_slug = ? AND number = ? AND patch_id = ?
+ORDER BY version DESC LIMIT 1`, workspace, number, patchID).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find a version of %s like a new one: %w", Ref(workspace, number), err)
+	}
+	return &version, nil
+}
+
 // storeLanding stores the change's landing.
 func storeLanding(ctx context.Context, tx *sql.Tx, workspace string, number int64, l Landing, now time.Time) error {
 	b, err := json.Marshal(l)

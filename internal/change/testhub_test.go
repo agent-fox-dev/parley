@@ -123,7 +123,8 @@ func data(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + 
 
 // commit writes to the repository at dir a commit with message on top of
 // from (a commit id or a branch), setting each file of files to its
-// content, and points branch at it; it returns the commit's id.
+// content, and points branch at it, also when that rewrites the branch; it
+// returns the commit's id.
 func commit(t *testing.T, dir, branch, from, message string, files map[string]string) string {
 	t.Helper()
 	var s strings.Builder
@@ -131,7 +132,7 @@ func commit(t *testing.T, dir, branch, from, message string, files map[string]st
 	for _, path := range slices.Sorted(maps.Keys(files)) {
 		s.WriteString("M 100644 inline " + path + "\n" + data(files[path]))
 	}
-	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet"); err != nil {
+	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet", "--force"); err != nil {
 		t.Fatal(err)
 	}
 	return gitrepotest.Refs(t, dir, "refs/heads/")[branch]
@@ -339,4 +340,58 @@ func (w *world) refused(t *testing.T, slug, credential string, body any, status 
 func (w *world) patFor(t *testing.T, perms, paths []string) (token, id string) {
 	t.Helper()
 	return w.IssuePATID(t, identity.PATSpec{UserID: w.owner, Permissions: perms, Paths: paths, CreatedAt: time.Now().UTC()})
+}
+
+// ownerCaller is the owner using the API key k1.
+func (w *world) ownerCaller() change.Caller {
+	return change.Caller{UserID: w.owner, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k1"}}
+}
+
+// openBranch opens, through the component, a change of demo from its
+// branch with an intent, by the owner, adjusted by edit (nil for none),
+// and fails the test unless it opens.
+func (w *world) openBranch(t *testing.T, branch string, edit func(*change.OpenInput)) change.Change {
+	t.Helper()
+	in := change.OpenInput{Workspace: "demo", SourceBranch: branch, Intent: new("why"), Caller: w.ownerCaller(), Kind: change.KindRef}
+	if edit != nil {
+		edit(&in)
+	}
+	ch, err := w.open(t, in)
+	if err != nil {
+		t.Fatalf("Open %s: %v", branch, err)
+	}
+	return ch
+}
+
+// record calls RecordVersion with in in a transaction of its own, which it
+// commits when RecordVersion succeeds.
+func (w *world) record(t *testing.T, in change.VersionInput) (*change.Version, error) {
+	t.Helper()
+	var v *change.Version
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		v, err = w.changes.RecordVersion(context.Background(), tx, in)
+		return err
+	})
+	return v, err
+}
+
+// mustRecord is record that fails the test unless a version is recorded.
+func (w *world) mustRecord(t *testing.T, in change.VersionInput) *change.Version {
+	t.Helper()
+	v, err := w.record(t, in)
+	if err != nil || v == nil {
+		t.Fatalf("RecordVersion %+v = %v, %v; want a version", in, v, err)
+	}
+	return v
+}
+
+// read reads the change number of demo.
+func (w *world) read(t *testing.T, number int64) change.Change {
+	t.Helper()
+	ch, err := w.changes.ReadChange(context.Background(), nil, "demo", number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ch
 }

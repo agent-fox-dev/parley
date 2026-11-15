@@ -139,7 +139,7 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (Change,
 			return Change{}, err
 		}
 	}
-	if err := c.afterVersion(ctx, tx, co, ch.WorkspaceSlug, number, v, in.DependsOn); err != nil {
+	if err := c.afterVersion(ctx, tx, co, ch.WorkspaceSlug, number, v, in.DependsOn, nil); err != nil {
 		return Change{}, err
 	}
 	if o.source.Fork && co.activity != nil {
@@ -160,8 +160,10 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (Change,
 // workspace, the stack linker, the landing derivation and the version
 // observers, in that order, each with the change as stored at its turn, so
 // that an observer reads the landing of this version's evaluation. A draft
-// keeps its blocked landing and asks no evaluator.
-func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborators, workspace string, number int64, v Version, dependsOn *int64) error {
+// keeps its blocked landing and asks no evaluator; structural, when not
+// nil, is the landing a cause in the version's commits blocks, which is
+// stored without asking the evaluator.
+func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborators, workspace string, number int64, v Version, dependsOn *int64, structural *Landing) error {
 	ch, err := readChange(ctx, tx, workspace, number)
 	if err != nil {
 		return err
@@ -173,7 +175,9 @@ func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborato
 	}
 	if ch.State != StateDraft {
 		landing := readyLanding()
-		if co.evaluator != nil {
+		if structural != nil {
+			landing = *structural
+		} else if co.evaluator != nil {
 			if ch, err = readChange(ctx, tx, workspace, number); err != nil {
 				return err
 			}
@@ -414,11 +418,17 @@ func (c *Component) resolve(ctx context.Context, q Querier, co collaborators, in
 // against the target's head; ahead is the number of its commits the target
 // lacks.
 func (o *opening) measure(ctx context.Context, targetHead string, ahead int) error {
-	repo := o.sourceRepo
 	var err error
-	if o.base, err = repo.MergeBase(ctx, o.head, targetHead); err != nil {
+	if o.base, err = o.sourceRepo.MergeBase(ctx, o.head, targetHead); err != nil {
 		return err
 	}
+	return o.measureFromBase(ctx, ahead)
+}
+
+// measureFromBase computes the version's stats, touched paths and patch id
+// against its base, o.base; ahead is the number of its commits.
+func (o *opening) measureFromBase(ctx context.Context, ahead int) error {
+	repo := o.sourceRepo
 	changes, err := repo.DiffChanges(ctx, o.base, o.head)
 	if err != nil {
 		return err
@@ -583,17 +593,22 @@ func sourceNotRelated(source, target string) error {
 // emitOpen writes the events of the opened change ch: parley.change.version
 // for its version v, then parley.change.open unless it is a draft.
 func (c *Component) emitOpen(ctx context.Context, tx *sql.Tx, caller Caller, ch Change, v Version) error {
-	draft := ch.State == StateDraft
-	if err := c.emit(ctx, tx, caller, ch, EventVersion, map[string]any{
-		"version": v.Number, "head_sha": v.HeadSHA, "kind": v.Kind, "base_sha": v.BaseSHA,
-		"patch_equivalent_to": v.PatchEquivalentTo, "draft": draft,
-	}); err != nil || draft {
+	if err := c.emitVersion(ctx, tx, caller, ch, v); err != nil || ch.State == StateDraft {
 		return err
 	}
 	return c.emit(ctx, tx, caller, ch, EventOpen, map[string]any{
 		"version": ch.Version, "head_sha": ch.HeadSHA, "title": ch.Title, "target_branch": ch.TargetBranch,
 		"source_workspace": ch.Source.WorkspaceSlug, "source_branch": ch.Source.Branch, "depends_on": ch.DependsOn,
 		"was_draft": false,
+	})
+}
+
+// emitVersion writes parley.change.version for the version v of the change
+// ch.
+func (c *Component) emitVersion(ctx context.Context, tx *sql.Tx, caller Caller, ch Change, v Version) error {
+	return c.emit(ctx, tx, caller, ch, EventVersion, map[string]any{
+		"version": v.Number, "head_sha": v.HeadSHA, "kind": v.Kind, "base_sha": v.BaseSHA,
+		"patch_equivalent_to": v.PatchEquivalentTo, "draft": ch.State == StateDraft,
 	})
 }
 

@@ -3510,6 +3510,31 @@ version ref is written before `Open` returns, since a git ref cannot join
 the transaction; a ref left by a rolled-back transaction names no stored
 version and is overwritten when the number is next recorded.
 
+`(*change.Component).RecordVersion(ctx, tx, change.VersionInput{Workspace,
+Branch, Head, Kind, Caller, SessionID})` (`version.go`) records a move of a
+branch in the caller's transaction too. `Workspace` is the source
+workspace, whose branch moved; the change is the draft or open one of that
+source branch (`activeOfSource`), which lives in the target, the parent of
+a fork. With no such change, or a `Head` equal to the change's head, it
+returns no version and no error. A `SessionID` must pass the session
+linker (with none registered, every session is refused) or the answer is
+`400 unknown_session`, before anything is written. It measures the head as
+`Open` does, in the source's repository: the merge base with the target
+branch, or the previous version's base while the target branch does not
+exist, the stats, the touched paths and the patch id, and sets
+`patch_equivalent_to` to the latest earlier version with the same patch id.
+It inserts the version with the creating credential (`Caller.Credential`;
+the zero `Caller` is the hub, actor type `system`, no credential), writes
+`refs/parley/changes/<number>/<version>` as `Open` does, records the
+session link, makes it the change's current version (head, base, patch id,
+stats, paths, `session_id`, `mergeable` `unknown`, `updated_at`), then runs
+the stack linker, the landing derivation and the observers as at open, and
+emits `parley.change.version`. The landing of a draft stays
+`blocked`/`draft`; a missing target branch, a head with no commit the
+target lacks and a merge commit among the version's commits store
+`blocked` with `target_not_found`, `nothing_to_land` and `merge_commits`
+without asking the evaluator. The change keeps its state.
+
 The collaborators (`internal/change/collaborators.go`) are registered on
 the component instance, with `RegisterSessionLinker`,
 `RegisterStackLinker`, `RegisterLandingEvaluator`, `AddVersionObserver`,
