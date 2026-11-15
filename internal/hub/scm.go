@@ -18,8 +18,9 @@ const scmHook = "scm"
 // the read routes under /workspaces/:slug/scm, whose scope and access need
 // the shared checks decide, and binds the component in a start hook to the
 // workspace records in the store; to the fork component's parent-state
-// check for a read, so that a fork whose parent is busy or failed is
-// refused as every route that works on a fork refuses it; to the place of
+// check for a read and for a write, so that a fork whose parent is busy or
+// failed, or archived for a write, is refused as every route that works on
+// a fork refuses it; to the place of
 // each repository on disk, opened with the hub's git; to the ref view of a
 // workspace, which for a fork is the fork component's (its own branches
 // and its tracking branches and tags at the parent's current heads, the
@@ -50,6 +51,9 @@ func composeSCM(c *Composition) {
 			},
 			ParentState: func(ctx context.Context, slug string) error {
 				return c.forks.CheckParentState(ctx, slug, fork.UseRead)
+			},
+			WriteParentState: func(ctx context.Context, slug string) error {
+				return c.forks.CheckParentState(ctx, slug, fork.UseWrite)
 			},
 			Open: func(ctx context.Context, slug string) (scm.Repository, error) {
 				repo, err := git.Open(ctx, c.workspaces.RepoPath(slug))

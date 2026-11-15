@@ -1,7 +1,12 @@
-// Package scm serves the read half of the source control API: the refs,
+// Package scm serves the source control API: the reads of the refs,
 // commits, trees, files, diffs, comparisons, blame and content search of a
 // workspace's repository, each answer computed from commits named by their
-// full ids.
+// full ids, and the writes to it.
+//
+// Every write route is built by one wrapper (writeRoute), which needs, for a
+// personal access token, git:write and write access to the workspace, and
+// refuses a workspace, or a fork's parent, that cannot take a write before
+// the route's handler runs.
 //
 // The routes are GET routes under /workspaces/:slug/scm. Each needs read
 // access to the workspace and, for a personal access token, git:read, which
@@ -77,7 +82,7 @@ type Recorder interface {
 	Observe(op, result string)
 }
 
-// Deps are what the read routes need. Workspaces and Open are required;
+// Deps are what the routes need. Workspaces and Open are required;
 // every other member has a default.
 type Deps struct {
 	// Workspaces reads the record of the workspace slug; found is false
@@ -87,6 +92,10 @@ type Deps struct {
 	// parent, nil for a workspace that is no fork, and otherwise the
 	// refusal the read answers; nil checks nothing.
 	ParentState func(ctx context.Context, slug string) error
+	// WriteParentState is the check a write to the fork slug makes of its
+	// parent, nil when the write may go on and otherwise the refusal the
+	// write answers, such as 409 parent_archived; nil checks nothing.
+	WriteParentState func(ctx context.Context, slug string) error
 	// Open opens the repository of the workspace slug.
 	Open func(ctx context.Context, slug string) (Repository, error)
 	// RefView is the ref view of the workspace w, whose repository repo

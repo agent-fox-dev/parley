@@ -157,6 +157,14 @@ func newWorld(t *testing.T, adjust ...func(*scm.Deps)) *world {
 // newConfiguredWorld is newWorld with toml added to the hub's config.toml.
 func newConfiguredWorld(t testing.TB, toml string, adjust ...func(*scm.Deps)) *world {
 	t.Helper()
+	return newComposedWorld(t, toml, nil, adjust...)
+}
+
+// newComposedWorld is newConfiguredWorld with compose, when it is not nil,
+// run on the hub's composition after the world's own changes, such as to
+// add a route or register a collaborator.
+func newComposedWorld(t testing.TB, toml string, compose func(*hub.Composition), adjust ...func(*scm.Deps)) *world {
+	t.Helper()
 	w := &world{observed: &observations{}, id: map[string]string{}}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{TOML: toml, Compose: func(c *hub.Composition) {
 		w.workspaces, w.events = c.Workspaces(), c.Events()
@@ -171,6 +179,9 @@ func newConfiguredWorld(t testing.TB, toml string, adjust ...func(*scm.Deps)) *w
 				a(d)
 			}
 		})
+		if compose != nil {
+			compose(c)
+		}
 	}})
 	now := time.Now().UTC()
 	w.owner, w.member = w.CreateUser(t, "owner"), w.CreateUser(t, "member")

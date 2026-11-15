@@ -3,11 +3,11 @@
   "spec_id": "21",
   "spec_name": "scm_write_api",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-15T10:40:02Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
