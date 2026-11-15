@@ -3419,7 +3419,7 @@ Exactly one of `sha` and `ref` is given. A tag created so is lightweight.
 | `403` | a push rule refuses the creation, such as `hub_owned_ref` for a name below `refs/parley/` |
 | `404` `ref_not_found` | the target names no commit (`revision "nope" names no commit`, `revision "…" names an object that is not a commit`) |
 | `409` `ref_exists` | the ref exists (`ref refs/heads/main already exists`) |
-| `409` `ref_moved` | another write created the ref in between |
+| `409` `ref_moved` | another write created the ref in between, or another ref is in the way of the name (`refs/heads/feat/x` beside a new `refs/heads/feat`), `details.current_sha` then `null` |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
 
 ```json

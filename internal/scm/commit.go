@@ -206,7 +206,7 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	c.emitCommit(done, wr, t.git, branch, parent, sha, session)
 	answer := commitAnswer{}
 	answer.Change, answer.ChangeError = c.commitChange(done, wr, linker, up, explicit, branch, sha)
-	return c.writeCommit(w, r, t, branch, sha, session, answer)
+	return c.writeCommit(w, r.WithContext(done), t, branch, sha, session, answer)
 }
 
 // emitCommit emits the parley.scm.commit event of the commit sha that the
@@ -352,7 +352,7 @@ func (b *commitRequest) check() (string, []gitrepo.Operation, error) {
 	if b.Message == nil || *b.Message == "" {
 		return "", nil, server.InvalidRequest("message is required and must not be empty")
 	}
-	if b.ExpectedHeadSHA != nil && !isFullID(*b.ExpectedHeadSHA) {
+	if b.ExpectedHeadSHA != nil && !fullID(*b.ExpectedHeadSHA) {
 		return "", nil, server.InvalidRequest("expected_head_sha must be a full 40-character commit id")
 	}
 	if a := b.Author; a != nil && (!signaturePart(a.Name) || !signaturePart(a.Email)) {

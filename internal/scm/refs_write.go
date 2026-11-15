@@ -1,6 +1,7 @@
 package scm
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -50,7 +51,7 @@ func (c *Component) createRef(w http.ResponseWriter, r *http.Request, wr *write)
 	if (body.SHA == nil) == (body.Ref == nil) {
 		return server.InvalidRequest("give exactly one of sha and ref")
 	}
-	if body.SHA != nil && !isFullID(*body.SHA) {
+	if body.SHA != nil && !fullID(*body.SHA) {
 		return server.InvalidRequest("sha must be a full 40-character commit id")
 	}
 	ctx := r.Context()
@@ -79,7 +80,9 @@ func (c *Component) createRef(w http.ResponseWriter, r *http.Request, wr *write)
 		versionKind: pushrule.VersionKindRef}); err != nil {
 		return err
 	}
-	return t.writeRef(w, r, c, http.StatusCreated, Ref{Name: name, SHA: sha, Commit: sha})
+	// The ref exists now: the answer is built whatever becomes of the
+	// request's context, so that an accepted write is answered as one.
+	return t.writeRef(w, r.WithContext(context.WithoutCancel(ctx)), c, http.StatusCreated, Ref{Name: name, SHA: sha, Commit: sha})
 }
 
 // moveRef answers PATCH …/scm/refs/*name: the ref of the full name, or of
@@ -98,7 +101,7 @@ func (c *Component) moveRef(w http.ResponseWriter, r *http.Request, wr *write) e
 	if err := server.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	if body.SHA == nil || !isFullID(*body.SHA) || body.ExpectedSHA == nil || !isFullID(*body.ExpectedSHA) {
+	if body.SHA == nil || !fullID(*body.SHA) || body.ExpectedSHA == nil || !fullID(*body.ExpectedSHA) {
 		return server.InvalidRequest("sha and expected_sha must both be full 40-character commit ids")
 	}
 	ctx := r.Context()
@@ -125,7 +128,7 @@ func (c *Component) moveRef(w http.ResponseWriter, r *http.Request, wr *write) e
 		versionKind: pushrule.VersionKindRef}); err != nil {
 		return err
 	}
-	return t.writeRef(w, r, c, http.StatusOK, Ref{Name: name, SHA: sha, Commit: sha})
+	return t.writeRef(w, r.WithContext(context.WithoutCancel(ctx)), c, http.StatusOK, Ref{Name: name, SHA: sha, Commit: sha})
 }
 
 // deleteRef answers DELETE …/scm/refs/*name: the ref of the full name, or
@@ -141,7 +144,7 @@ func (c *Component) deleteRef(w http.ResponseWriter, r *http.Request, wr *write)
 	}
 	q := r.URL.Query()
 	expected := strings.ToLower(q.Get("expected_sha"))
-	if q.Has("expected_sha") && !isFullID(expected) {
+	if q.Has("expected_sha") && !fullID(expected) {
 		return server.InvalidRequest("expected_sha must be a full 40-character commit id")
 	}
 	ctx := r.Context()
@@ -224,6 +227,3 @@ func commitOf(ref gitrepo.Ref) string {
 	}
 	return ref.ID
 }
-
-// isFullID reports whether s is a full 40-character commit id.
-func isFullID(s string) bool { return len(s) == commitIDLen && isCommitID(s) }

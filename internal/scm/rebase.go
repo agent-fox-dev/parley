@@ -1,6 +1,7 @@
 package scm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -126,7 +127,9 @@ func (c *Component) rebase(w http.ResponseWriter, r *http.Request, wr *write) er
 		return err
 	}
 	answer.NewHeadSHA, answer.Change = newHead, up.change()
-	return c.writeRebase(w, r, t, branch, answer)
+	// The branch has moved: the answer is built whatever becomes of the
+	// request's context, so that an accepted write is answered as one.
+	return c.writeRebase(w, r.WithContext(context.WithoutCancel(ctx)), t, branch, answer)
 }
 
 // check is the full name of the branch the request names, or 400
@@ -142,7 +145,7 @@ func (b *rebaseRequest) check() (string, error) {
 	if b.Onto == nil || *b.Onto == "" {
 		return "", server.InvalidRequest("onto is required")
 	}
-	if b.ExpectedHeadSHA != nil && !isFullID(*b.ExpectedHeadSHA) {
+	if b.ExpectedHeadSHA != nil && !fullID(*b.ExpectedHeadSHA) {
 		return "", server.InvalidRequest("expected_head_sha must be a full 40-character commit id")
 	}
 	return branch, nil

@@ -96,7 +96,7 @@ func (r *Repo) trialStart(ctx context.Context, onto string, first Commit) (ontoT
 // for a merge that takes commits and not trees: git merge-tree before 2.45
 // takes no tree.
 func (r *Repo) trialCommit(ctx context.Context, tree string) (string, error) {
-	obj := "tree " + tree + "\nauthor parley <parley@localhost> 0 +0000\ncommitter parley <parley@localhost> 0 +0000\n\ntrial rebase\n"
+	obj := "tree " + tree + "\nauthor " + HubName + " <" + HubEmail + "> 0 +0000\ncommitter " + HubName + " <" + HubEmail + "> 0 +0000\n\ntrial rebase\n"
 	out, err := r.g.runInput(ctx, access{}, []byte(obj), "--git-dir="+r.dir, "hash-object", "-t", "commit", "-w", "--stdin")
 	if err != nil {
 		return "", err

@@ -504,7 +504,7 @@ func newSCMCommitCommand() *cobra.Command {
 			fs.String("message", "", "the commit message")
 			_ = cobra.MarkFlagRequired(fs, "branch")
 			_ = cobra.MarkFlagRequired(fs, "message")
-			fs.String("base", "", "the revision a new branch starts from (default: the workspace's default branch)")
+			fs.String("base", "", "the revision a new branch starts from; required when the branch does not exist yet")
 			fs.String("expected-head", "", "the branch head the commit is made on (default: the head read just before)")
 			var operations []fileOperation
 			fs.Var(&operationFlag{op: "put", list: &operations}, "put", "write <repo-path>=<local-file>, the local file's bytes, repeatable")

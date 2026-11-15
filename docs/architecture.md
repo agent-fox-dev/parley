@@ -3354,8 +3354,9 @@ hand over a `*gitrepo.Repo`, since the ref writer writes to one.
 The refs write routes take a full ref name or a branch name; a name must
 pass `gitrepo.ValidRefName` and lie below `refs/heads/` or `refs/tags/`, a
 name below `refs/parley/` being handed on to the rules, which refuse it.
-They read the ref's current value from the repository itself
-(`LookupRef`), check `expected_sha` against the commit it reaches (`409`
+They read the ref's current value through the workspace's ref view
+(`(*target).lookup`: the repository's own ref, or in a task fork a tracking
+branch at its parent's commit), check `expected_sha` against the commit it reaches (`409`
 `ref_moved` before the rules are asked), and pass that value as the
 update's before, so a write that races another loses at the ref writer's
 compare-and-swap. A delete asks the registered `ChangeLinker` whether the
@@ -3369,7 +3370,7 @@ opens the repository; then refuses a `change` object on a branch the
 workspace protects (`400` `invalid_request`), asking `Deps.Protected`, the
 push rules' protected-branch test over the effective `protected_branches`
 the engine reads, before any object is written; then resolves the parent: for an existing branch
-its head from `LookupRef`, which `expected_head_sha` must name (`409`
+its head through `(*target).lookup`, which `expected_head_sha` must name (`409`
 `ref_moved` otherwise, also when it is absent), for a new one the commit
 `base_ref` names through the revision resolver, before `pushrule.ZeroID`;
 then `ApplyOperations` (an `*gitrepo.OperationError` is `400`
@@ -3389,8 +3390,8 @@ it to `[scm].max_commit_size` with `scm.LimitCommitBody`.
 
 The rebase route (`rebase` in `rebase.go`) checks the body first (`branch`
 through the same branch-name check as the commit route, `onto` present,
-`expected_head_sha` a full id), then reads the branch's head with
-`LookupRef` (`404` `ref_not_found`; `409` `ref_moved` when
+`expected_head_sha` a full id), then reads the branch's head through
+`(*target).lookup` (`404` `ref_not_found`; `409` `ref_moved` when
 `expected_head_sha` names another commit) and resolves `onto` with the
 revision resolver. When `onto` is the head or an ancestor of it
 (`gitrepo.IsAncestor`) it answers `up_to_date` with the change the

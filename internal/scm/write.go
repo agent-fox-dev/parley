@@ -32,10 +32,8 @@ type write struct {
 	// decision is the access check's grant: the caller's level on the
 	// workspace, owner or admin, and the access rule's record of it.
 	decision access.Decision
-	// binding is the binding of a PAT bound to a workspace, when bound
-	// is true.
-	binding access.Binding
-	bound   bool
+	// bound is set for a PAT bound to a workspace.
+	bound bool
 	// ws is the workspace's record, read after the access check and
 	// found writable.
 	ws workspace.Workspace
@@ -135,6 +133,6 @@ func (c *Component) admit(r *http.Request) (*write, error) {
 		}
 	}
 	wr := &write{principal: principal, decision: decision, ws: ws}
-	wr.binding, wr.bound = access.BindingOf(r)
+	_, wr.bound = access.BindingOf(r)
 	return wr, nil
 }
