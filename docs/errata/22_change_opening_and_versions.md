@@ -187,3 +187,21 @@ commit is refused at open and blocks a later version. Its diff answers
 takes `""` as no base, measured the same way. In Go, `Change.BaseSHA` and
 `Version.BaseSHA` are `*string`; the store keeps the empty string for
 none.
+
+## The open of a commit's change follows a later move of its branch
+
+The source control API's commit route opens the change it asks for after
+the ref writer moved the branch, in a store transaction of its own. A git
+push or another write that moved or deleted the same branch in between
+found no change in its ref-updated stage. The open (`change.OpenInput`
+`AfterMove`, which the hub's change linker sets) therefore reads the
+source branch again in its transaction, once version 1, the commit, is
+recorded: a branch at another head records that head as version 2, of
+kind `ref` by the hub (`created_by.actor_type` `system`, no session), as
+the head was already on the branch and the write that put it there is not
+known; a branch that is gone abandons the change for `source_deleted`.
+The commit's answer names the change at its current version. The store
+runs its transactions one at a time and the ref writer moves the refs
+inside its own, so a write that moves the branch after the open's
+transaction finds the change in its stage and records its version as
+usual.

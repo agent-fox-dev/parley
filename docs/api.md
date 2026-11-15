@@ -3366,7 +3366,10 @@ and before the branch moves, and its refusal is the answer, unchanged
 `change_exists`), with nothing moved; once the branch has moved the change
 is opened, in a task fork in its parent, and `change` names it with
 version 1 of kind `commit`, with the request's `session_id` as its
-session. The change component checks it as `POST
+session. A write that moved the branch again between the commit and the
+open is recorded as version 2, of kind `ref` by the hub, and `change`
+names that version; one that deleted the branch abandons the change
+(`source_deleted`). The change component checks it as `POST
 /api/v1/workspaces/{slug}/changes` does, without the check of a
 path-scoped token's paths, which the push rules made of the commit. In a task fork whose `auto_change` is `true`, a
 commit without a `change` object to a branch that is the source of no

@@ -19,7 +19,8 @@ const (
 // of, and checks and opens the change a write asks for. Recording a version
 // is none of its operations: the ref writer's ref-updated stage records the
 // version a moved source branch makes, from the version kind each write
-// names.
+// names. Only Open, which comes after the branch moved, records a move of
+// the branch made since, which found no change to record a version of.
 type ChangeLinker interface {
 	// FindOpen is the draft or open change whose source is the branch,
 	// named without refs/heads/, of the workspace slug, with its current
@@ -29,7 +30,9 @@ type ChangeLinker interface {
 	// o asks for may be opened; an error is the write's refusal, answered
 	// as it is when it is an API error.
 	CheckOpening(ctx context.Context, o ChangeOpening) error
-	// Open opens the change o asks for, once its source branch has moved.
+	// Open opens the change o asks for, once its source branch has moved,
+	// and follows a later move or deletion of the branch, which found no
+	// change in its ref-updated stage.
 	Open(ctx context.Context, o ChangeOpening) (*LinkedChange, error)
 }
 
