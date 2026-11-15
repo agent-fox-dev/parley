@@ -14,7 +14,8 @@ import (
 )
 
 func TestRefs_ListsTheRefsBelowAPrefixInNameOrder(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	branches := []string{"refs/heads/dev", "refs/heads/feature/x", "refs/heads/main", "refs/heads/release", "refs/heads/topic"}
 	every := append(slices.Clone(branches), "refs/parley/changes/12/3", "refs/tags/v1", "refs/tags/v2")
 	tests := []struct {
@@ -55,7 +56,8 @@ func TestRefs_ListsTheRefsBelowAPrefixInNameOrder(t *testing.T) {
 }
 
 func TestRefs_DescribesARefByItsNamespaceAndTheLookups(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	tests := []struct {
 		name, kind, sha string
 		protected       bool
@@ -86,7 +88,8 @@ func TestRefs_DescribesARefByItsNamespaceAndTheLookups(t *testing.T) {
 }
 
 func TestRefs_ReadsANameThatDoesNotStartWithRefsAsABranch(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	a := w.get(t, scmPath("demo", "/refs/feature/x"), w.ownerKey)
 	b := w.get(t, scmPath("demo", "/refs/refs/heads/feature/x"), w.ownerKey)
 	if a.status != http.StatusOK || !reflect.DeepEqual(a.json, b.json) || a.json["name"] != "refs/heads/feature/x" {
@@ -98,7 +101,8 @@ func TestRefs_ReadsANameThatDoesNotStartWithRefsAsABranch(t *testing.T) {
 }
 
 func TestRefs_RefusesANameNoListedRefHas(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, name := range []string{"nope", "refs/heads/nope", "v1", "refs/notes/x"} {
 		t.Run(name, func(t *testing.T) {
 			r := w.get(t, scmPath("demo", "/refs/"+name), w.ownerKey)

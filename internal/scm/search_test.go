@@ -25,8 +25,9 @@ func (r reply) hits() []string {
 }
 
 func TestSearch_FindsALiteralStringInEveryTextFileAtARef(t *testing.T) {
-	w := newWorld(t)
-	_, main := w.addSearch(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	main := w.searchMain
 	want := []any{
 		map[string]any{"path": "api/greeting.go", "line": 3.0, "text": "func Greeting() string {"},
 		map[string]any{"path": "docs/a.md", "line": 1.0, "text": "# Greeting"},
@@ -58,8 +59,8 @@ func TestSearch_FindsALiteralStringInEveryTextFileAtARef(t *testing.T) {
 }
 
 func TestSearch_TakesARegularExpressionIgnoresCaseAndKeepsThePathsGlobsMatch(t *testing.T) {
-	w := newWorld(t)
-	w.addSearch(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, c := range []struct {
 		query string
 		want  []string
@@ -79,8 +80,8 @@ func TestSearch_TakesARegularExpressionIgnoresCaseAndKeepsThePathsGlobsMatch(t *
 }
 
 func TestSearch_SkipsBinaryFilesAndCutsALongLine(t *testing.T) {
-	w := newWorld(t)
-	w.addSearch(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	if r := w.get(t, scmPath("search", "/search?q=Greeting"), w.ownerKey); r.item("blob.bin") != nil {
 		t.Errorf("q=Greeting: %s, want no match in the binary blob.bin", r.body)
 	}
@@ -93,6 +94,7 @@ func TestSearch_SkipsBinaryFilesAndCutsALongLine(t *testing.T) {
 }
 
 func TestSearch_PagesMatchesFromTheCommitTheFirstPageResolved(t *testing.T) {
+	t.Parallel()
 	const query = "/search?q=hit&limit=200"
 	pages := func(t *testing.T, w *world, between func()) []reply {
 		t.Helper()
@@ -146,8 +148,8 @@ func TestSearch_PagesMatchesFromTheCommitTheFirstPageResolved(t *testing.T) {
 }
 
 func TestSearch_RefusesAMalformedQuery(t *testing.T) {
-	w := newWorld(t)
-	w.addSearch(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, query := range []string{
 		"", "q=", "q=" + url.QueryEscape(strings.Repeat("é", 501)), "q=" + url.QueryEscape("(unclosed") + "&regex=true",
 		"q=x&regex=1", "q=x&case_sensitive=no", "q=x&limit=201", "q=x&limit=0", "q=a%00b",

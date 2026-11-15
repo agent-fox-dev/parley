@@ -8,6 +8,7 @@ import (
 )
 
 func TestRead_ReportsEachRequestOnceToTheRecorder(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	_, seq, err := w.events.ReadAfter(context.Background(), 0, 10000)
 	if err != nil {

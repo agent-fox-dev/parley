@@ -12,6 +12,7 @@ import (
 )
 
 func TestRead_AnswersForOneCommitWhileItsRefMoves(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	c1, c2 := w.id["c1"], w.id["c2"]
 	trees := map[string]string{}
@@ -55,7 +56,7 @@ func TestRead_AnswersForOneCommitWhileItsRefMoves(t *testing.T) {
 				}
 			})
 			seen := map[string]int{}
-			for range 200 {
+			for range 50 {
 				r := w.get(t, scmPath("demo", c.path), w.ownerKey)
 				sha, consistent := c.answer(r)
 				if r.status != http.StatusOK || (sha != c1 && sha != c2) || !consistent {

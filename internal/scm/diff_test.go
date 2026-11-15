@@ -41,8 +41,9 @@ func (r reply) stat(key string) int {
 var featurePaths = []string{"docs/api/x.txt", "docs/guide.md", "edit.txt", "gone.txt", "img.bin", "kind", "moved/b.txt", "new.txt", "notes.md", "src/readme.md"}
 
 func TestDiff_ComparesHeadWithTheMergeBaseOrWithBase(t *testing.T) {
-	w := newWorld(t)
-	id := w.addDiff(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.diff
 
 	r := w.get(t, scmPath("diff", "/diff?base=main&head=feature"), w.ownerKey)
 	if r.status != http.StatusOK || r.json["base_sha"] != id["main"] || r.json["head_sha"] != id["feature"] || r.json["merge_base_sha"] != id["mb"] {
@@ -70,8 +71,9 @@ func TestDiff_ComparesHeadWithTheMergeBaseOrWithBase(t *testing.T) {
 }
 
 func TestDiff_DescribesEachFileChange(t *testing.T) {
-	w := newWorld(t)
-	id := w.addDiff(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.diff
 	blob := func(rev string) string {
 		return strings.TrimSpace(gitrepotest.Git(t, w.workspaces.RepoPath("diff"), "rev-parse", rev))
 	}
@@ -107,8 +109,9 @@ func TestDiff_DescribesEachFileChange(t *testing.T) {
 }
 
 func TestDiff_FiltersAndShapesTheDiff(t *testing.T) {
-	w := newWorld(t)
-	id := w.addDiff(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	id := w.diff
 	diff := scmPath("diff", "/diff?base=main&head=feature")
 
 	r := w.get(t, diff+"&path=docs/**&path=*.md", w.ownerKey)
@@ -157,6 +160,7 @@ func checkApplies(t *testing.T, repo, commit string, patch []byte) {
 }
 
 func TestDiff_CutsADiffOverTheLimits(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	// One stream: the empty root commit empty on main; many, adding 5,001
 	// one-line files; wide, adding three text files of 3 MiB each.
@@ -200,7 +204,8 @@ func TestDiff_CutsADiffOverTheLimits(t *testing.T) {
 }
 
 func TestDiff_RefusesAMalformedParameter(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, path := range []string{
 		"/diff?head=main", "/diff?base=main", "/diff?base=main&head=feature/x&mode=three_dot",
 		"/diff?base=main&head=feature/x&format=html", "/diff?base=main&head=feature/x&context=21",
@@ -214,7 +219,8 @@ func TestDiff_RefusesAMalformedParameter(t *testing.T) {
 }
 
 func TestDiff_ResolvesBothRevisionsThroughTheResolver(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	r := w.get(t, scmPath("demo", "/diff?base=v1&head=feature/x"), w.ownerKey)
 	if r.status != http.StatusOK || r.json["base_sha"] != w.id["c1"] || r.json["head_sha"] != w.id["c3"] {
 		t.Errorf("base=v1&head=feature/x: %d %s, want base_sha c1 and head_sha c3", r.status, r.body)

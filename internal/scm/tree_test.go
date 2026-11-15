@@ -23,8 +23,9 @@ func (r reply) item(path string) map[string]any {
 }
 
 func TestTree_ListsADirectoryAtARef(t *testing.T) {
-	w := newWorld(t)
-	dir := w.addTree(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	dir := w.tree
 	id := func(rev string) string { return strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", rev)) }
 
 	r := w.get(t, scmPath("tree", "/tree?ref=main"), w.ownerKey)
@@ -62,8 +63,9 @@ func TestTree_ListsADirectoryAtARef(t *testing.T) {
 }
 
 func TestTree_ListsEveryEntryBelowAPathInPagesFromOneCommit(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
-	dir := w.addTree(t)
+	dir := w.addTree(t, "tree")
 	r := w.get(t, scmPath("tree", "/tree?ref=main&recursive=true"), w.ownerKey)
 	paths := r.members("path")
 	if i := slices.Index(paths, "docs"); i < 0 || i+4 > len(paths) || !slices.Equal(paths[i:i+4], []string{"docs", "docs/a.md", "docs/api", "docs/api/b.md"}) {
@@ -91,8 +93,8 @@ func TestTree_ListsEveryEntryBelowAPathInPagesFromOneCommit(t *testing.T) {
 }
 
 func TestTree_RefusesAPathOrLimitItCannotList(t *testing.T) {
-	w := newWorld(t)
-	w.addTree(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, c := range []struct {
 		query  string
 		status int
@@ -123,7 +125,8 @@ func TestTree_RefusesAPathOrLimitItCannotList(t *testing.T) {
 // The tree route reads its ref through the resolver: a name, the default
 // branch without one, and a form the resolver refuses.
 func TestTree_ReadsTheCommitItsRefNames(t *testing.T) {
-	w := newWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, c := range []struct{ ref, want string }{
 		{"v2", w.id["c2"]}, {"", w.id["c2"]}, {"main~1", ""},
 	} {

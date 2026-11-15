@@ -13,8 +13,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
 
-// The files the file tests add to the tree workspace's main, beside what
-// addTree writes there.
+// The content of some of fileExtras.
 var (
 	binDat = func() string {
 		b := make([]byte, 256)
@@ -27,23 +26,21 @@ var (
 	digitsTxt = strings.Repeat("0123456789", 10)
 )
 
-// fileWorld is a world whose tree workspace also holds bin.dat (the bytes
-// 0x00 to 0xff), empty.txt, utf8.txt (multi-byte text), digits.txt (100
-// bytes), edge.dat (1,024 bytes) and big.dat (1,025 bytes), and the git
-// directory of that workspace; toml is added to the hub's config.toml.
-func fileWorld(t *testing.T, toml ...string) (*world, string) {
-	t.Helper()
-	w := newConfiguredWorld(t, strings.Join(toml, "\n"))
-	return w, w.addTree(t, "bin.dat", binDat, "empty.txt", "", "utf8.txt", utf8Txt, "digits.txt", digitsTxt,
-		"edge.dat", strings.Repeat("e", 1024), "big.dat", strings.Repeat("b", 1025))
-}
+// fileExtras are the files, as path and content in turn, that the files
+// workspace holds beside what addTree writes: bin.dat (the bytes 0x00 to
+// 0xff), empty.txt, utf8.txt (multi-byte text), digits.txt (100 bytes),
+// edge.dat (1,024 bytes) and big.dat (1,025 bytes).
+var fileExtras = []string{"bin.dat", binDat, "empty.txt", "", "utf8.txt", utf8Txt, "digits.txt", digitsTxt,
+	"edge.dat", strings.Repeat("e", 1024), "big.dat", strings.Repeat("b", 1025)}
 
 func fileURL(path string) string {
-	return scmPath("tree", "/file?ref=main&path="+url.QueryEscape(path))
+	return scmPath("files", "/file?ref=main&path="+url.QueryEscape(path))
 }
 
 func TestFile_AnswersTheBytesOfAFileAtARef(t *testing.T) {
-	w, dir := fileWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	dir := w.files
 	id := func(rev string) string { return strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", rev)) }
 	for _, c := range []struct{ path, body, mode string }{
 		{"README.md", treeReadme, "100644"},
@@ -70,7 +67,9 @@ func TestFile_AnswersTheBytesOfAFileAtARef(t *testing.T) {
 }
 
 func TestFile_AnswersOneRangeOfAFile(t *testing.T) {
-	w, dir := fileWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	dir := w.files
 	head := strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", "main"))
 	for _, c := range []struct {
 		rng, body, contentRange string
@@ -101,7 +100,9 @@ func TestFile_AnswersOneRangeOfAFile(t *testing.T) {
 }
 
 func TestFile_AnswersAFileAsJSON(t *testing.T) {
-	w, dir := fileWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
+	dir := w.files
 	id := func(rev string) string { return strings.TrimSpace(gitrepotest.Git(t, dir, "rev-parse", rev)) }
 	for _, c := range []struct{ path, body, encoding string }{
 		{"README.md", treeReadme, "utf8"},
@@ -134,7 +135,8 @@ func TestFile_AnswersAFileAsJSON(t *testing.T) {
 }
 
 func TestFile_RefusesAPathOrRangeItCannotServe(t *testing.T) {
-	w, _ := fileWorld(t)
+	t.Parallel()
+	w := readOnlyWorld(t)
 	for _, c := range []struct {
 		query, rng string
 		status     int
@@ -156,7 +158,7 @@ func TestFile_RefusesAPathOrRangeItCannotServe(t *testing.T) {
 				continue
 			}
 			t.Run(c.query+" "+c.rng+" "+accept, func(t *testing.T) {
-				r := w.get(t, scmPath("tree", "/file?ref=main&"+c.query), w.ownerKey, "Range", c.rng, "Accept", accept)
+				r := w.get(t, scmPath("files", "/file?ref=main&"+c.query), w.ownerKey, "Range", c.rng, "Accept", accept)
 				e, _ := r.json["error"].(map[string]any)
 				if r.status != c.status || r.errorType() != c.want || e["code"] != float64(c.status) || !strings.HasPrefix(r.header.Get("Content-Type"), "application/json") {
 					t.Errorf("%d %s, want the %d %s envelope", r.status, r.body, c.status, c.want)
@@ -170,7 +172,9 @@ func TestFile_RefusesAPathOrRangeItCannotServe(t *testing.T) {
 }
 
 func TestFile_RefusesAFileOverTheSizeLimit(t *testing.T) {
-	w, _ := fileWorld(t, "[scm]\nmax_file_size = \"1KB\"\n")
+	t.Parallel()
+	w := newConfiguredWorld(t, "[scm]\nmax_file_size = \"1KB\"\n")
+	w.addTree(t, "files", fileExtras...)
 	for _, accept := range []string{"", "application/json"} {
 		for _, rng := range []string{"", "bytes=0-9"} {
 			r := w.get(t, fileURL("big.dat"), w.ownerKey, "Accept", accept, "Range", rng)
@@ -188,6 +192,7 @@ func TestFile_RefusesAFileOverTheSizeLimit(t *testing.T) {
 // The resolver's forms of a revision, as the file route's ref parameter
 // takes them, the raw form naming the commit in a header.
 func TestFile_ReadsTheCommitItsRefNames(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	unreachable := commit(t, w.repo, w.id["c2"], "only.txt", "only\n")
 	w.set(t, "demo", "default_branch", "dev")
