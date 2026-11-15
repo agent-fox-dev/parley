@@ -19,8 +19,9 @@ import (
 // opCommit is the op a commit request reports.
 const opCommit = "commit"
 
-// EventCommit is the type of the event of a commit a write made, emitted
-// after the parley.git.push event of its branch.
+// EventCommit is the type of the event of a commit a write made, written
+// by the ref writer after the parley.git.push event of its branch, in the
+// same store transaction.
 const EventCommit = "parley.scm.commit"
 
 // msgChangeNotOpened is the change_error message of a change whose opening
@@ -131,10 +132,12 @@ type changeError struct {
 // moves and no event is emitted.
 //
 // Once the branch has moved the commit has the consequences of a push of
-// it: the ref writer has emitted parley.git.push and told the post-push
-// listeners, and the commit's own parley.scm.commit follows; the answer
-// names the change the ref writer recorded a version of, or the change it
-// opened (commitChange).
+// it: the ref writer has written parley.git.push and, after it in the same
+// store transaction, the commit's own parley.scm.commit, which it journals
+// with the push so that a hub stopping after the move writes both at its
+// next start, and told the post-push listeners; the answer names the
+// change the ref writer recorded a version of, or the change it opened
+// (commitChange).
 func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *write) error {
 	var body commitRequest
 	if err := server.DecodeJSON(r, &body); err != nil {
@@ -184,7 +187,8 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 		return err
 	}
 	linker := c.changeLinker()
-	u := refUpdate{ref: branch, before: before, after: sha, versionKind: pushrule.VersionKindCommit, sessionID: session}
+	u := refUpdate{ref: branch, before: before, after: sha, versionKind: pushrule.VersionKindCommit, sessionID: session,
+		events: []event.Input{c.commitEvent(ctx, wr, t.git, branch, parent, sha, session)}}
 	var explicit *ChangeOpening
 	if body.Change != nil {
 		o := opening(wr, branch, sha, body.Change)
@@ -203,20 +207,19 @@ func (c *Component) createCommit(w http.ResponseWriter, r *http.Request, wr *wri
 	// The branch has moved: what follows is done whatever becomes of the
 	// request's context, and changes the answer's status no more.
 	done := context.WithoutCancel(ctx)
-	c.emitCommit(done, wr, t.git, branch, parent, sha, session)
 	answer := commitAnswer{}
 	answer.Change, answer.ChangeError = c.commitChange(done, wr, linker, up, explicit, branch, sha)
 	return c.writeCommit(w, r.WithContext(done), t, branch, sha, session, answer)
 }
 
-// emitCommit emits the parley.scm.commit event of the commit sha that the
+// commitEvent is the parley.scm.commit event of the commit sha that the
 // write wr, of the session session (nil for none), made on top of parent
-// and moved branch, a full name, to: the branch's name, the commit, its
+// to move branch, a full name, to: the branch's name, the commit, its
 // parent and the paths it changed against it, a move counting as both of
 // its paths, in byte order and cut to the first 100. Its caller is the
-// event's actor, as for the push event before it. The branch has moved, so
-// a failure is logged and the write stays answered as it is.
-func (c *Component) emitCommit(ctx context.Context, wr *write, git *gitrepo.Repo, branch, parent, sha string, session *string) {
+// event's actor, as for the push event before it. Paths that cannot be read
+// are logged and left out, so that the commit is not refused for its event.
+func (c *Component) commitEvent(ctx context.Context, wr *write, git *gitrepo.Repo, branch, parent, sha string, session *string) event.Input {
 	files, err := git.ChangedPaths(ctx, sha)
 	if err != nil {
 		c.deps.Logger.Error("scm: the paths of a commit not read for its event", "workspace", wr.ws.Slug, "commit", sha, "error", err)
@@ -230,9 +233,7 @@ func (c *Component) emitCommit(ctx context.Context, wr *write, git *gitrepo.Repo
 	if pc.CredentialType != pushrule.CredentialAdminToken && pc.UserID != "" {
 		in.ActorID = &pc.UserID
 	}
-	if _, err := c.deps.Events.EmitNow(ctx, in); err != nil {
-		c.deps.Logger.Error("scm: commit event not written", "workspace", slug, "commit", sha, "error", err)
-	}
+	return in
 }
 
 // commitChange is the change the answer to a commit of the write wr names,

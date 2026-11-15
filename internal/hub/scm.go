@@ -90,7 +90,6 @@ func composeSCM(c *Composition) {
 			ReadTimeout: rt.Config.SCM.ReadTimeout,
 			MaxFileSize: rt.Config.SCM.MaxFileSize,
 			Now:         rt.Now,
-			Events:      c.Events(),
 			Logger:      rt.Logger,
 		}
 		for _, adjust := range c.scmAdjusters {

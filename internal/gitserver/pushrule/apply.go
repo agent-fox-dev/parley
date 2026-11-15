@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
 
@@ -171,7 +172,14 @@ func (w *Writer) RegisterForkActivity(f ForkActivity) {
 // request as a stage's does. AfterAbort, when set, runs when the request
 // stops with no ref moved after BeforeCommit ran, whether BeforeCommit
 // failed or a later step did; a push takes the objects it moved in out of
-// the repository again there. Its error is logged.
+// the repository again there. Its error is logged. Events are what the
+// request owes beside its parley.git.push events, such as the
+// parley.scm.commit event of a commit made through the API: they are
+// journaled with the request and written after its push events, in the
+// same store transaction, by Finish or at the next start, so that a hub
+// that stops after the refs moved writes them all or none. Each must be an
+// event the event log accepts, its metadata encodable as JSON; one that is
+// not keeps the request's events unwritten.
 type ApplyRequest struct {
 	Verdict          Verdict
 	Repo             *gitrepo.Repo
@@ -181,6 +189,7 @@ type ApplyRequest struct {
 	Via, VersionKind string
 	BeforeCommit     func(ctx context.Context) error
 	AfterAbort       func(ctx context.Context) error
+	Events           []event.Input
 }
 
 // UpdateResult is what became of one update: its decision as the verdict

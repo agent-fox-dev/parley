@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -108,11 +109,14 @@ func (t *target) lookup(ctx context.Context, name string) (ref gitrepo.Ref, foun
 // belongs to, nil for none. beforeWrite, when set, runs once the push rules
 // have allowed the update, with their decision, and before the ref writer
 // is asked to write it; its error is the write's answer and nothing moves.
+// events are what the write owes beside the push event of its ref, which
+// the ref writer journals and writes with it.
 type refUpdate struct {
 	ref, before, after string
 	versionKind        string
 	sessionID          *string
 	beforeWrite        func(ctx context.Context, d pushrule.Decision) error
+	events             []event.Input
 }
 
 // refUpdated is a ref update the ref writer made: the engine's decision,
@@ -172,7 +176,7 @@ func (c *Component) updateRef(ctx context.Context, wr *write, repo *gitrepo.Repo
 	}
 	res, err := c.deps.RefWriter.Apply(ctx, pushrule.ApplyRequest{
 		Verdict: verdict, Repo: repo, Workspace: pw, Caller: pc, SessionID: u.sessionID,
-		Via: pushrule.ViaAPI, VersionKind: u.versionKind,
+		Via: pushrule.ViaAPI, VersionKind: u.versionKind, Events: u.events,
 	})
 	switch res.Outcome {
 	case pushrule.OutcomeAccepted:

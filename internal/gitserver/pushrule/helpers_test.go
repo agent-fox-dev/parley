@@ -296,7 +296,7 @@ func newStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), store.Options{DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces")},
-		[]store.Step{event.SchemaStep, pushrule.JournalStep, {Name: "stage_rows", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
+		[]store.Step{event.SchemaStep, pushrule.JournalStep, pushrule.JournalEventsStep, {Name: "stage_rows", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx, `CREATE TABLE stage_rows (ref TEXT NOT NULL)`)
 			return err
 		}}})

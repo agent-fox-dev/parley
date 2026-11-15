@@ -45,7 +45,6 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
-	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -141,25 +140,9 @@ type Deps struct {
 	// Now is the clock the commits a write makes take their times from;
 	// nil is time.Now.
 	Now func() time.Time
-	// Events stores the parley.scm.commit event of every commit a write
-	// makes; nil stores none.
-	Events EventWriter
 	// Logger is told of what fails after a write has moved its ref and so
 	// cannot change its answer; nil discards it.
 	Logger *slog.Logger
-}
-
-// EventWriter stores one hub event in a store transaction of its own: the
-// hub's event log, *event.Component, is one.
-type EventWriter interface {
-	EmitNow(ctx context.Context, in event.Input) (event.Record, error)
-}
-
-// noEvents stores no event.
-type noEvents struct{}
-
-func (noEvents) EmitNow(context.Context, event.Input) (event.Record, error) {
-	return event.Record{}, nil
 }
 
 // Component serves the read and write routes. Its zero value is ready to
@@ -211,9 +194,6 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Now == nil {
 		d.Now = time.Now
-	}
-	if d.Events == nil {
-		d.Events = noEvents{}
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
