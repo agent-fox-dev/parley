@@ -112,8 +112,10 @@ type Tracking interface {
 }
 
 // EngineDeps are the lookups the engine asks while it evaluates. Settings
-// is the settings reader. Tracking is the tracking-branch lookup; nil means
-// no fork has tracking branches.
+// is the settings reader; nil means every workspace has the settings'
+// defaults, which protect its default branch and allow direct pushes.
+// Tracking is the tracking-branch lookup; nil means no fork has tracking
+// branches.
 type EngineDeps struct {
 	Settings SettingsReader
 	Tracking Tracking
@@ -177,9 +179,36 @@ func (e *Engine) Evaluate(ctx context.Context, req Request) Verdict {
 }
 
 // evaluation is one request under evaluation, with the lookups it asks.
+// The workspace's settings are read once, by the first rule that needs
+// them; cur is what the rules learnt about the update being decided.
 type evaluation struct {
 	deps EngineDeps
 	req  Request
+
+	settingsRead bool
+	settings     Settings
+	settingsErr  error
+
+	cur current
+}
+
+// current is what the rules learnt about one update while deciding it.
+type current struct {
+	direct              bool // the owner exemption let it pass the protected-branch rule
+	forcedKnown, forced bool
+}
+
+// pushSettings are the effective push settings of the request's workspace.
+func (ev *evaluation) pushSettings(ctx context.Context) (Settings, error) {
+	if !ev.settingsRead {
+		ev.settingsRead = true
+		if ev.deps.Settings == nil {
+			ev.settings = defaultSettings(ev.req.Workspace)
+		} else {
+			ev.settings, ev.settingsErr = ev.deps.Settings.PushSettings(ctx, ev.req.Workspace)
+		}
+	}
+	return ev.settings, ev.settingsErr
 }
 
 // errNoView is the failure of an ancestry question for a request that came
@@ -189,6 +218,7 @@ var errNoView = errors.New("no repository view to ask")
 // decide runs the rules over u in order, the first refusal deciding, and
 // allows u when none refuses.
 func (ev *evaluation) decide(ctx context.Context, u Update) Decision {
+	ev.cur = current{}
 	for _, r := range order {
 		if r == nil {
 			continue
@@ -197,7 +227,7 @@ func (ev *evaluation) decide(ctx context.Context, u Update) Decision {
 			return no.decision(u)
 		}
 	}
-	d := Decision{Update: u, Allowed: true, Created: u.Before == ZeroID, Deleted: u.After == ZeroID}
+	d := Decision{Update: u, Allowed: true, Created: u.Before == ZeroID, Deleted: u.After == ZeroID, Direct: ev.cur.direct}
 	if !d.Created && !d.Deleted {
 		forced, err := ev.forced(ctx, u)
 		if err != nil {
@@ -209,12 +239,21 @@ func (ev *evaluation) decide(ctx context.Context, u Update) Decision {
 	return d
 }
 
-// forced reports whether u, which neither creates nor deletes its ref,
-// moves it to a commit its old value is not an ancestor of.
+// forced reports whether u, the update being decided, which neither
+// creates nor deletes its ref, moves it to a commit its old value is not an
+// ancestor of. The answer is kept for the rest of the update's decision, so
+// git is asked once however many rules need it.
 func (ev *evaluation) forced(ctx context.Context, u Update) (bool, error) {
+	if ev.cur.forcedKnown {
+		return ev.cur.forced, nil
+	}
 	if ev.req.Repo == nil {
 		return false, errNoView
 	}
 	ancestor, err := ev.req.Repo.IsAncestor(ctx, u.Before, u.After)
-	return !ancestor, err
+	if err != nil {
+		return false, err
+	}
+	ev.cur.forcedKnown, ev.cur.forced = true, !ancestor
+	return ev.cur.forced, nil
 }

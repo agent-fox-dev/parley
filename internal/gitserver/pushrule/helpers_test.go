@@ -48,6 +48,9 @@ var (
 	ownerKey   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialAPIKey, CredentialID: "key-owner", UserID: "u-owner"}
 	ownerPAT   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-owner", UserID: "u-owner"}
 	boundPAT   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-bound", UserID: "u-owner", Bound: true}
+	pathsPAT   = pushrule.Caller{Level: access.LevelOwner, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-paths", UserID: "u-owner", Paths: []string{"**"}}
+	memberKey  = pushrule.Caller{Level: access.LevelMember, CredentialType: pushrule.CredentialAPIKey, CredentialID: "key-member", UserID: "u-member"}
+	memberPAT  = pushrule.Caller{Level: access.LevelMember, CredentialType: pushrule.CredentialPAT, CredentialID: "pat-member", UserID: "u-member"}
 )
 
 // The workspaces of the tests: a registered repository and a task fork of it.

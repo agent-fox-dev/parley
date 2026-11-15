@@ -45,7 +45,7 @@ type rule func(ctx context.Context, ev *evaluation, u Update) *refusal
 // engine does not hold yet, and is skipped.
 var order = [...]rule{
 	hubOwnedRef,
-	nil, // protected branches
+	protectedBranch,
 	defaultBranchDeletion,
 	trackingBranch,
 	nil, // carry-patch push control
