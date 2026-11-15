@@ -3725,7 +3725,13 @@ on the change as the edit would leave it (`400 intent_required`), the
 `AutoLandGuard` for a body with `auto_land`, then one `update` of the
 members whose value differs and `SetAutoLand`; a `depends_on` member goes
 to the `StackLinker`'s `SetDependsOn` for a draft or open change while
-one is registered, and is ignored otherwise. A differing `target_branch`
+one is registered, and is ignored otherwise. A `state` other than the
+change's own is completed last by `moveState`: `reevaluateLanding`, then,
+for a draft marked ready, `parley.change.open` by the caller with
+`was_draft` `true` (`emitOpened`, which `Open` shares) and
+`AnnounceLandable`, or, for a change made a draft, `ForgetLandable` and no
+event; neither schedules a mergeability check, since the head and the
+target stay. A differing `target_branch`
 is answered `501 not_implemented` for now. The abandon goes through
 `(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
 which is `SetAbandoned`, `ForgetLandable` and `parley.change.abandon` with
@@ -3775,8 +3781,8 @@ by the hub, metadata `version`, `head_sha`): it does nothing while
 `mergeable` is `unknown`; an `open` change with `landing.status` `ready`
 and `mergeable` `clean` whose `ready_announced_head` is not its head gets
 the event and the head stored; any other change has the column cleared
-through `ForgetLandable(ctx, tx, workspace, number)`, which the abandon
-(and the retarget) call too. The landing policy calls `AnnounceLandable`
+through `ForgetLandable(ctx, tx, workspace, number)`, which the abandon,
+the move to draft (and the retarget) call too. The landing policy calls `AnnounceLandable`
 in each transaction that stores a landing. `emit` (`open.go`) adds
 `number` and `ref` to the metadata of every change event. An error of
 the event writer rolls the storing transaction back, which leaves

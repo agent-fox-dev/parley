@@ -378,3 +378,84 @@ func TestEdit_AsksTheAutoLandGuardBeforeWritingAnything(t *testing.T) {
 		}
 	}
 }
+
+func TestEdit_OpensADraftAndTellsWhoMarkedItReady(t *testing.T) {
+	t.Parallel()
+	m := newMiaWorld(t)
+	head := commit(t, m.t1, "task", m.base, "task\n\nWhy.\n", map[string]string{"task.txt": "task\n"})
+	n := m.openBranch(t, "task", func(in *change.OpenInput) {
+		in.SourceWorkspace, in.Draft, in.Title = "demo--t1", true, new("T")
+		in.Caller = change.Caller{UserID: m.mia, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k"}}
+	}).Number
+	m.settled(t, n)
+	seq := m.seq(t)
+	status, got := m.patch(t, n, m.miaKey, map[string]any{"state": "open"})
+	landing, _ := got["landing"].(map[string]any)
+	if status != http.StatusOK || got["state"] != change.StateOpen || landing["reason"] == "draft" || landing["status"] != change.LandingReady {
+		t.Fatalf("PATCH state open = %d %v, want 200 open with landing ready", status, got)
+	}
+	events := m.changeEvents(t, seq, change.EventOpen, n)
+	if len(events) != 1 {
+		t.Fatalf("%d open events, want 1", len(events))
+	}
+	if e := events[0]; e.ActorID == nil || *e.ActorID != m.mia || e.ActorType != change.CredentialAPIKey {
+		t.Errorf("the open event is by %s %v, want mia's api_key", e.ActorType, e.ActorID)
+	}
+	want := map[string]any{"number": float64(n), "ref": "demo#" + strconv.FormatInt(n, 10), "version": 1.0, "head_sha": head,
+		"title": "T", "target_branch": "main", "source_workspace": "demo--t1", "source_branch": "task", "depends_on": nil, "was_draft": true}
+	if meta := metadata(t, events[0]); !reflect.DeepEqual(meta, want) {
+		t.Errorf("metadata of the open event = %v, want %v", meta, want)
+	}
+}
+
+func TestEdit_MovesAnOpenChangeBackToDraftKeepingWhatItHas(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.branch(t, "b", "B\n")
+	n := w.openBranch(t, "b", func(in *change.OpenInput) { in.AutoLand, in.Labels = new(true), []string{"x"} }).Number
+	if ch := w.settled(t, n); ch.Mergeable != change.MergeableClean || w.announced(t, n) == "" {
+		t.Fatalf("the change is %s and announced at %q, want clean and announced", ch.Mergeable, w.announced(t, n))
+	}
+	before, _ := w.change(t, n)
+	seq := w.seq(t)
+	status, got := w.patch(t, n, w.ownerKey, map[string]any{"state": "draft"})
+	landing, _ := got["landing"].(map[string]any)
+	if status != http.StatusOK || got["state"] != change.StateDraft || landing["status"] != change.LandingBlocked || landing["reason"] != "draft" {
+		t.Fatalf("PATCH state draft = %d %v, want 200 draft with landing blocked for draft", status, got)
+	}
+	for _, member := range []string{"version", "mergeable", "auto_land", "labels"} {
+		if !reflect.DeepEqual(got[member], before[member]) {
+			t.Errorf("%s = %v, was %v", member, got[member], before[member])
+		}
+	}
+	if events := w.eventsAfter(t, seq); len(events) != 0 {
+		t.Errorf("the move to draft wrote %d events, e.g. %s", len(events), events[0].Type)
+	}
+	if head := w.announced(t, n); head != "" {
+		t.Errorf("the draft is still announced landable at %s", head)
+	}
+}
+
+func TestEdit_ChangesNothingForTheStateTheChangeHas(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, c := range []struct {
+		state string
+		draft bool
+	}{
+		{change.StateOpen, false},
+		{change.StateDraft, true},
+	} {
+		w.branch(t, c.state, c.state+"\n")
+		n := w.openBranch(t, c.state, func(in *change.OpenInput) { in.Draft = c.draft }).Number
+		w.settled(t, n)
+		before, _ := w.change(t, n)
+		seq, at := w.seq(t), w.updatedAt(t, n)
+		if status, got := w.patch(t, n, w.ownerKey, map[string]any{"state": c.state}); status != http.StatusOK || !reflect.DeepEqual(got, before) || w.updatedAt(t, n) != at {
+			t.Errorf("PATCH state %s on a change in it = %d %v, want 200 with the change as it was, updated_at included:\n%v", c.state, status, got, before)
+		}
+		if events := w.eventsAfter(t, seq); len(events) != 0 {
+			t.Errorf("PATCH state %s on a change in it wrote %d events, e.g. %s", c.state, len(events), events[0].Type)
+		}
+	}
+}

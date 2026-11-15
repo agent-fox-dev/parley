@@ -42,26 +42,6 @@ func (w *world) announced(t *testing.T, number int64) string {
 	return head.String
 }
 
-// moveState moves the change number of demo to state with the landing a
-// move between draft and open stores, and runs the announcement step, in
-// one transaction.
-func (w *world) moveState(t *testing.T, number int64, state string) {
-	t.Helper()
-	landing := change.Landing{Status: change.LandingReady}
-	if state == change.StateDraft {
-		landing = change.Landing{Status: change.LandingBlocked, Reason: new("draft")}
-	}
-	w.write(t, func(ctx context.Context, tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `UPDATE changes SET state = ? WHERE workspace_slug = 'demo' AND number = ?`, state, number); err != nil {
-			return err
-		}
-		if err := w.changes.SetLanding(ctx, tx, "demo", number, landing); err != nil {
-			return err
-		}
-		return w.changes.AnnounceLandable(ctx, tx, "demo", number)
-	})
-}
-
 // fixedLanding is a landing evaluator that answers its status for every
 // change.
 type fixedLanding string
@@ -184,7 +164,15 @@ func TestMergeability_AnnouncesALandableChangeOncePerHead(t *testing.T) {
 			w.branch(t, "b", "B")
 			w.openBranch(t, "b", func(in *change.OpenInput) { in.Draft = true })
 			w.settled(t, 1)
-			w.moveState(t, 1, change.StateOpen)
+			seq := w.seq(t)
+			w.patch(t, 1, w.ownerKey, map[string]any{"state": change.StateOpen})
+			var types []string
+			for _, e := range w.eventsAfter(t, seq) {
+				types = append(types, e.Type)
+			}
+			if want := []string{change.EventOpen, change.EventReady}; !reflect.DeepEqual(types, want) {
+				t.Errorf("marking the draft ready wrote %v, want %v", types, want)
+			}
 		}, 1},
 		{"conflicting, then clean at a new version", func(t *testing.T, w *world) {
 			commit(t, w.demo, "b", w.base, "B", map[string]string{"a.txt": lineOneX})
@@ -257,8 +245,8 @@ func TestAnnounceLandable_AnnouncesAgainOnlyAfterTheChangeWasNotLandable(t *test
 			w.branch(t, "b", "B")
 			w.openBranch(t, "b", nil)
 			w.settled(t, 1)
-			w.moveState(t, 1, change.StateDraft)
-			w.moveState(t, 1, change.StateOpen)
+			w.patch(t, 1, w.ownerKey, map[string]any{"state": change.StateDraft})
+			w.patch(t, 1, w.ownerKey, map[string]any{"state": change.StateOpen})
 		}, 2},
 		{"announced, retargeted to release where it is clean", func(t *testing.T, w *world, _ int64) {
 			w.branch(t, "b", "B")

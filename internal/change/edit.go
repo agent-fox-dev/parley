@@ -162,8 +162,8 @@ func changeClosed(ch Change, takes string) error {
 // applyEdit applies e to the change ch, as caller, in tx: the state rules
 // of a closed change, the intent rule on the change as the edit would leave
 // it, the auto_land guard, then the writes, so that a refusal leaves every
-// member as it was. updated_at advances only when a stored value changes,
-// and no event is written for these members.
+// member as it was. updated_at advances only when a stored value changes;
+// of the members, only a move from draft to open writes an event.
 func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators, ch Change, caller Caller, e edit) error {
 	switch {
 	case !e.edits() && !e.hasDependsOn:
@@ -228,7 +228,35 @@ func (c *Component) applyEdit(ctx context.Context, tx *sql.Tx, co collaborators,
 		}
 	}
 	if e.hasDependsOn && !closed {
-		return co.stack.SetDependsOn(ctx, tx, ch, e.dependsOn)
+		if err := co.stack.SetDependsOn(ctx, tx, ch, e.dependsOn); err != nil {
+			return err
+		}
+	}
+	if e.state != nil && *e.state != ch.State {
+		return c.moveState(ctx, tx, ch.WorkspaceSlug, ch.Number, caller)
 	}
 	return nil
+}
+
+// moveState completes, in tx, the move the edit stored of the change number
+// of the workspace between draft and open: its landing is evaluated again,
+// so that a draft's block goes and comes back; a draft marked ready is
+// announced as opened, by caller, and as landable when it already is; a
+// change made a draft is no longer landable, so its announcement is
+// forgotten even while its mergeable is unknown, and nothing else is told.
+func (c *Component) moveState(ctx context.Context, tx *sql.Tx, workspace string, number int64, caller Caller) error {
+	if err := c.reevaluateLanding(ctx, tx, workspace, number); err != nil {
+		return err
+	}
+	ch, err := readChange(ctx, tx, workspace, number)
+	if err != nil {
+		return err
+	}
+	if ch.State == StateDraft {
+		return c.ForgetLandable(ctx, tx, workspace, number)
+	}
+	if err := c.emitOpened(ctx, tx, caller, ch, true); err != nil {
+		return err
+	}
+	return c.AnnounceLandable(ctx, tx, workspace, number)
 }

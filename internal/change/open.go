@@ -801,10 +801,16 @@ func (c *Component) emitOpen(ctx context.Context, tx *sql.Tx, caller Caller, ch 
 	if err := c.emitVersion(ctx, tx, caller, ch, v); err != nil || ch.State == StateDraft {
 		return err
 	}
+	return c.emitOpened(ctx, tx, caller, ch, false)
+}
+
+// emitOpened writes parley.change.open for the change ch by caller, as it
+// is opened or, wasDraft, as the draft it was is marked ready.
+func (c *Component) emitOpened(ctx context.Context, tx *sql.Tx, caller Caller, ch Change, wasDraft bool) error {
 	return c.emit(ctx, tx, caller, ch, EventOpen, map[string]any{
 		"version": ch.Version, "head_sha": ch.HeadSHA, "title": ch.Title, "target_branch": ch.TargetBranch,
 		"source_workspace": ch.Source.WorkspaceSlug, "source_branch": ch.Source.Branch, "depends_on": ch.DependsOn,
-		"was_draft": false,
+		"was_draft": wasDraft,
 	})
 }
 

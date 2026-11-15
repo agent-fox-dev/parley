@@ -3929,11 +3929,24 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   answered `400` `intent_required`. A body with `auto_land` asks the
   `auto_land` guard, when one is registered, before anything is stored;
   its refusal is the answer and nothing of the body is applied. A
-  `state` of `"open"` on a draft stores the state. A `target_branch`
+  `state` of `"open"` on a draft marks it ready: the change becomes
+  `open`, its `landing` is evaluated again without the `draft` block, and
+  `parley.change.open` is written by the caller with `number`, `ref`,
+  `version`, `head_sha`, `title`, `target_branch`, `source_workspace`,
+  `source_branch`, `depends_on` and `was_draft` (`true`), followed by
+  `parley.change.ready` when the change is then landable (see
+  [Mergeability](#mergeability)). A `state` of `"draft"` on an open change
+  makes it a draft: `landing` becomes
+  `{"status":"blocked","reason":"draft"}`, its versions, labels,
+  `auto_land` and `mergeable` stay, its landable announcement is
+  forgotten, and no event is written. A `state` the change already has is
+  no edit. A `target_branch`
   other than the change's own is answered `501` `not_implemented` (a
   change cannot be retargeted yet). The members are stored together, and
   `updated_at` advances only when a stored value changes; editing
-  `title`, `intent`, `labels` or `auto_land` writes no event.
+  `title`, `intent`, `labels` or `auto_land` writes no event, and the
+  events of a move from draft to open come after them, so they carry the
+  edited `title`.
 - `POST …/abandon` takes no body or a JSON object with `reason`, a string,
   and moves the change to `abandoned`, writing `parley.change.abandon` by
   the caller with `reason` as given (the empty string when absent),
