@@ -418,18 +418,47 @@ func parents(path string) func(yield func(string) bool) {
 }
 
 // ValidPath reports whether path can name a file of a tree: not empty, not
-// absolute, no empty, ".", ".." or ".git" segment, the last in any case
-// since git refuses it so on a file system that ignores case, and no NUL.
+// absolute, no empty, ".", ".." or ".git" segment, and no NUL. A segment
+// is ".git" when some file system reads it so: in any case, and also the
+// names git's own checkout refuses with core.protectHFS and
+// core.protectNTFS, which are off on a Linux hub, so a tree the hub writes
+// can be checked out on macOS and Windows.
 func ValidPath(path string) bool {
 	if path == "" || strings.ContainsRune(path, 0) {
 		return false
 	}
 	for seg := range strings.SplitSeq(path, "/") {
-		if seg == "" || seg == "." || seg == ".." || strings.EqualFold(seg, ".git") {
+		if seg == "" || seg == "." || seg == ".." || isDotGit(seg) {
 			return false
 		}
 	}
 	return true
+}
+
+// isDotGit reports whether seg names the .git directory on a file system
+// that ignores case, on HFS+, which also ignores some code points, or on
+// NTFS, which ignores trailing dots and spaces, takes "git~1" as the short
+// name of ".git", and ends a name at a backslash or a stream's ":" (git's
+// is_hfs_dotgit and is_ntfs_dotgit).
+func isDotGit(seg string) bool {
+	if strings.EqualFold(strings.Map(hfsIgnored, seg), ".git") {
+		return true
+	}
+	if i := strings.IndexAny(seg, `\:`); i >= 0 {
+		seg = seg[:i]
+	}
+	seg = strings.TrimRight(seg, ". ")
+	return strings.EqualFold(seg, ".git") || strings.EqualFold(seg, "git~1")
+}
+
+// hfsIgnored drops the code points HFS+ ignores in a name, and keeps every
+// other rune.
+func hfsIgnored(r rune) rune {
+	switch {
+	case r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
+		return -1
+	}
+	return r
 }
 
 // HubName and HubEmail are the identity of the hub, the committer of every

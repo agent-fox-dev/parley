@@ -3314,6 +3314,10 @@ An operation is one of:
 
 A path is relative to the root of the repository: not empty, not starting
 with `/`, without an empty, `.`, `..` or `.git` segment (at any depth).
+A segment is `.git` in any letter case, and also where macOS or Windows
+would read it as `.git`: with the code points HFS+ ignores (such as
+U+200C or U+FEFF), with trailing dots or spaces, up to a `\` or `:`, or as
+the short name `git~1`.
 
 The committer is the hub, `parley` `<parley@localhost>`; author and
 committer take the time of the request. The commit's parent is the head of
