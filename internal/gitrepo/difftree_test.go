@@ -182,3 +182,39 @@ func TestDiffPatches_ReadsThePatchOfEachFileInTheOrderOfItsChanges(t *testing.T)
 		t.Errorf("DiffPatches stopped after the second patch: %d calls, %v; want 2 calls and no error", calls, err)
 	}
 }
+
+// side adds s.txt on top of c1; moved adds the same s.txt on top of c2, as
+// a rebase of side would, and other adds another file there.
+func TestPatchID_IsEqualForTheSameChangeOnAnotherBase(t *testing.T) {
+	t.Parallel()
+	f := newDiffFixture(t)
+	ctx := context.Background()
+	dir := f.repo.Dir()
+	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+	const who = "committer T <t@example.invalid> 1700000001 +0000\n"
+	stream := "commit refs/heads/moved\n" + who + data("moved") + "from " + f.id["c2"] + "\nM 100644 inline s.txt\n" + data("s\n") +
+		"\ncommit refs/heads/other\n" + who + data("other") + "from " + f.id["c2"] + "\nM 100644 inline t.txt\n" + data("t\n") + "\n"
+	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	ids := strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "moved", "other"))
+	patchID := func(base, head string) string {
+		t.Helper()
+		id, err := f.repo.PatchID(ctx, base, head)
+		if err != nil || id == "" {
+			t.Fatalf("PatchID(%s, %s) = %q, %v", base, head, id, err)
+		}
+		return id
+	}
+	side, moved, other := patchID(f.id["c1"], f.id["side"]), patchID(f.id["c2"], ids[0]), patchID(f.id["c2"], ids[1])
+	if side != moved {
+		t.Errorf("the same change on another base: %q and %q, want equal", side, moved)
+	}
+	if other == side {
+		t.Errorf("another change has the patch id %q of side", other)
+	}
+	emptyOne, emptyTwo := patchID(f.id["c1"], f.id["c1"]), patchID(f.id["c2"], f.id["c2"])
+	if emptyOne != emptyTwo || emptyOne == side {
+		t.Errorf("empty diffs = %q and %q, want equal and unlike %q", emptyOne, emptyTwo, side)
+	}
+}

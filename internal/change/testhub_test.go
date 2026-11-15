@@ -1,0 +1,284 @@
+package change_test
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/fork"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/workspace"
+)
+
+// Session ids, which the event log takes only as UUIDs: sessionOne and
+// sessionTwo are sessions the world's session linker accepts, sessionOther
+// one it refuses.
+const (
+	sessionOne   = "11111111-1111-4111-8111-111111111111"
+	sessionTwo   = "22222222-2222-4222-8222-222222222222"
+	sessionOther = "33333333-3333-4333-8333-333333333333"
+)
+
+// world is a hub with the change component composed: the user owner, a
+// member of the org acme, with the API key ownerKey; the owner's ready
+// workspace demo, whose main and release are at one commit (base) holding
+// a.txt ("l1\nl2\nl3\n"); a session linker that accepts sessionOne and
+// sessionTwo, registered on the change component.
+type world struct {
+	*hubtest.Hub
+	workspaces *workspace.Service
+	events     *event.Component
+	changes    *change.Component
+	sessions   *sessions
+
+	owner, ownerKey, org string
+	// demo is the git directory of demo's repository, and base the commit
+	// its main and release are at.
+	demo, base string
+}
+
+func newWorld(t *testing.T) *world {
+	t.Helper()
+	w := &world{sessions: &sessions{accept: map[string]bool{sessionOne: true, sessionTwo: true}}}
+	w.Hub = hubtest.Start(t, func(c *hub.Composition) {
+		w.workspaces, w.events, w.changes = c.Workspaces(), c.Events(), c.Changes()
+		w.changes.RegisterSessionLinker(w.sessions)
+	})
+	w.owner = w.CreateUser(t, "owner")
+	w.ownerKey = w.IssueKey(t, w.owner)
+	w.org = w.CreateOrg(t, "acme")
+	w.AddMember(t, w.org, w.owner)
+	w.demo = w.addWorkspace(t, "demo")
+	w.base = gitrepotest.Refs(t, w.demo, "refs/heads/")["main"]
+	return w
+}
+
+// addWorkspace adds the owner's ready workspace slug, whose main and
+// release hold one commit with a.txt, and returns its git directory.
+func (w *world) addWorkspace(t *testing.T, slug string) string {
+	t.Helper()
+	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	if _, err := gitrepotest.Run(dir, "commit refs/heads/main\n"+committer+data("base")+
+		"M 100644 inline a.txt\n"+data("l1\nl2\nl3\n")+"\nreset refs/heads/release\nfrom refs/heads/main\n\n",
+		"fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	head := gitrepotest.Refs(t, dir, "refs/heads/")["main"]
+	rec := workspace.Workspace{
+		Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard,
+		GitURL: new("https://origin.test/" + slug + ".git"), DefaultBranch: new("main"), OwnerID: w.owner, OrgID: w.org,
+		Status: workspace.StatusReady, DisplayName: slug, HeadSHA: &head,
+		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, rec) }); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// addFork adds the owner's ready task fork slug of demo, based on base,
+// with purpose and session (nil for none), and returns its git directory.
+func (w *world) addFork(t *testing.T, slug, base string, purpose, session *string) string {
+	t.Helper()
+	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
+	f := fork.Fork{Workspace: workspace.Workspace{
+		Slug: slug, Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: new(base),
+		OwnerID: w.owner, OrgID: w.org, Status: workspace.StatusReady, DisplayName: slug,
+		ParentSlug: new("demo"), ForkPoint: &workspace.ForkPoint{Ref: base, SHA: w.base},
+		ExpiresAt: new(now.Add(7 * 24 * time.Hour)), AutoChange: new(false), Purpose: purpose, SessionID: session,
+		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+	}}
+	if err := (gitrepo.Git{}).CreateFork(ctx, w.demo, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return fork.Insert(ctx, tx, f) }); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+const committer = "committer T <t@example.invalid> 1700000000 +0000\n"
+
+// data is a fast-import data command for s.
+func data(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+
+// commit writes to the repository at dir a commit with message on top of
+// from (a commit id or a branch), setting each file of files to its
+// content, and points branch at it; it returns the commit's id.
+func commit(t *testing.T, dir, branch, from, message string, files map[string]string) string {
+	t.Helper()
+	var s strings.Builder
+	s.WriteString("commit refs/heads/" + branch + "\n" + committer + data(message) + "from " + from + "\n")
+	for _, path := range slices.Sorted(maps.Keys(files)) {
+		s.WriteString("M 100644 inline " + path + "\n" + data(files[path]))
+	}
+	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	return gitrepotest.Refs(t, dir, "refs/heads/")[branch]
+}
+
+// branch is commit on top of the world's base in demo.
+func (w *world) branch(t *testing.T, name, message string) string {
+	t.Helper()
+	return commit(t, w.demo, name, w.base, message, map[string]string{name + ".txt": name + "\n"})
+}
+
+// post opens a change in the workspace slug through the route, with the
+// credential and the body, and returns the status and the decoded answer.
+func (w *world) post(t *testing.T, slug, credential string, body any) (int, map[string]any) {
+	t.Helper()
+	status, raw := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/changes", credential, body)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("POST changes answered %d %q: %v", status, raw, err)
+	}
+	return status, out
+}
+
+// mustPost is post that fails the test unless the answer is 201.
+func (w *world) mustPost(t *testing.T, body any) map[string]any {
+	t.Helper()
+	status, out := w.post(t, "demo", w.ownerKey, body)
+	if status != http.StatusCreated {
+		t.Fatalf("POST changes = %d %v, want 201", status, out)
+	}
+	return out
+}
+
+// open calls Open with in in a transaction of its own, which it commits
+// when Open succeeds.
+func (w *world) open(t *testing.T, in change.OpenInput) (change.Change, error) {
+	t.Helper()
+	var ch change.Change
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		ch, err = w.changes.Open(context.Background(), tx, in)
+		return err
+	})
+	return ch, err
+}
+
+// versions are the stored versions of the change of demo, as JSON objects.
+func (w *world) versions(t *testing.T, workspace string, number int64) []map[string]any {
+	t.Helper()
+	vs, err := change.ReadVersions(context.Background(), w.Store.Main(), workspace, number)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []map[string]any
+	for _, v := range vs {
+		out = append(out, asJSON(t, v))
+	}
+	return out
+}
+
+// seq is the seq of the last event in the log.
+func (w *world) seq(t *testing.T) int64 {
+	t.Helper()
+	var seq int64
+	if err := w.Store.Main().QueryRow(`SELECT last_seq FROM hub_event_seq`).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// eventsAfter are the events the log holds after seq, oldest first.
+func (w *world) eventsAfter(t *testing.T, seq int64) []event.Record {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), seq, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recs
+}
+
+// rows counts the rows of each change table.
+func (w *world) rows(t *testing.T) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, table := range []string{"changes", "change_versions", "change_sessions"} {
+		var n int
+		if err := w.Store.Main().QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		out[table] = n
+	}
+	return out
+}
+
+// asJSON is v as a decoded JSON object.
+func asJSON(t *testing.T, v any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// metadata is the decoded metadata of the event.
+func metadata(t *testing.T, rec event.Record) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(rec.Metadata, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// sessions is a session linker that accepts the sessions of accept and
+// records every link it is asked to record.
+type sessions struct {
+	accept map[string]bool
+
+	mu      sync.Mutex
+	records []string
+}
+
+func (s *sessions) Check(_ context.Context, _ change.Caller, id, _ string) (string, error) {
+	id = strings.ToLower(id)
+	if !s.accept[id] {
+		return "", fmt.Errorf("session %s: %w", id, change.ErrUnknownSession)
+	}
+	return id, nil
+}
+
+func (s *sessions) Record(_ context.Context, _ *sql.Tx, id, workspace string, number, version int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, fmt.Sprintf("%s %s %d/%d", id, workspace, number, version))
+	return nil
+}
+
+// errRollback is what a test returns from a transaction to undo it.
+var errRollback = errors.New("roll back")
+
+// patFor issues a PAT of the owner with the permissions and path globs
+// (nil for none), and returns it with its token id.
+func (w *world) patFor(t *testing.T, perms, paths []string) (token, id string) {
+	t.Helper()
+	return w.IssuePATID(t, identity.PATSpec{UserID: w.owner, Permissions: perms, Paths: paths, CreatedAt: time.Now().UTC()})
+}

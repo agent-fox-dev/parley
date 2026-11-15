@@ -494,6 +494,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AdjustWorkspace(func(*workspace.Deps))` | a change to the workspace service's dependencies, applied after the start hook `workspaces` builds them and before it binds them, in the order added; tests replace a collaborator with it |
 | `AdjustGitServer(func(*gitserver.Deps))` | a change to the git server's dependencies, applied after the start hook `gitserver` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the git runner, the timeout or a service in place of the exchange |
 | `AdjustSCM(func(*scm.Deps))` | a change to the source control reads' dependencies, applied after the start hook `scm` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the repository opener or the request recorder |
+| `AdjustChange(func(*change.Deps))` | a change to the change component's dependencies, applied after the start hook `changes` builds them and before it binds them, in the order added |
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
@@ -3442,6 +3443,65 @@ the move keeps the commit and is the answer's `change_error`
 (`{error_type, message}`, an API error's own, else `internal`). A direct
 push calls no linker. The three `POST` routes are registered with
 `server.Route.Create`, so the server's idempotency stage replays them.
+
+### Changes
+
+`internal/hub/change.go` adds the part `composeChanges`, after `composeSCM`
+in `parts`. It creates a zero `change.Component` (`Changes()`), adds
+`change.SchemaStep` (the step `changes`), registers its `Routes()` with
+`AddRoute`, and binds it in the start hook `changes` to the store
+(`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
+(`Repos`), `changeWorkspaces` (`Workspaces`), an adapter over
+`workspace.BySlug`, read through the querier it is given, so in the
+caller's transaction, with `workspace.RequireReady` as `Unusable` and the
+effective `changes.require_intent`, the event component (`Events`), the
+hub's clock and logger; `AdjustChange` adjusters run before the bind.
+
+The schema keeps `changes` (one row per change, keyed by target workspace
+and number, with the current version's head, base, stats, touched paths
+and patch id copied onto it, the abandon reason, and lists and objects as
+JSON), `change_versions` (keyed by change and version, with the kind, the
+patch id, `patch_equivalent_to`, `created_by`, the creating credential's
+type and id, the session and the stats), `change_sessions` (the order of
+each session's first version), `change_landed_commits`
+(`version_sha`, `landed_sha`) and `change_counters` (the last number given
+per workspace, so a number is never given twice). The three child tables
+cascade from `changes`; a unique partial index keeps one draft or open
+change per source branch, and a violation answers `409 change_exists`.
+
+`(*change.Component).Open(ctx, tx, change.OpenInput)` runs in the caller's
+transaction and neither begins nor commits one. It reads the target and
+source workspaces, chooses the session (an explicit one the session linker
+must accept; else the trigger's, then the source fork's, dropped when
+refused), resolves the target and source branches, and measures the
+version in the source workspace's repository, which for a fork borrows the
+parent's objects: the merge base with the target branch, the file changes
+and stats, the touched paths and `gitrepo.(*Repo).PatchID` (`git patch-id
+--stable` over the base-to-head diff, `gitrepo.EmptyPatchID` for an empty
+one). It then takes the next number, inserts the change and version 1,
+writes `refs/parley/changes/<number>/1` in the target's repository
+(`SetRef`, or `SetRefFrom`, which pushes a fork's commit into the parent
+first), records the session link, asks the `AutoLandGuard` and stores
+`auto_land` through `SetAutoLand`, runs the `StackLinker`'s `LinkVersion`,
+the `LandingEvaluator` (not for a draft) whose answer it stores, and the
+`VersionObserver`s, each with the change re-read in the transaction, tells
+the `ForkActivity` recorder of a fork source (an error is logged), and
+emits `parley.change.version` and, unless draft, `parley.change.open`. The
+version ref is written before `Open` returns, since a git ref cannot join
+the transaction; a ref left by a rolled-back transaction names no stored
+version and is overwritten when the number is next recorded.
+
+The collaborators (`internal/change/collaborators.go`) are registered on
+the component instance, with `RegisterSessionLinker`,
+`RegisterStackLinker`, `RegisterLandingEvaluator`, `AddVersionObserver`,
+`RegisterAutoLandGuard` and `RegisterForkActivity`
+([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
+The hub registers none yet. `ReadChange(ctx, q, workspace, number)` reads
+one change, through the caller's transaction or, with `nil`, the store;
+an unknown change is `change.ErrChangeNotFound` (`404 change_not_found`).
+The route `POST /workspaces/:slug/changes` (scope `changes:write`, read
+access to `:slug`, an idempotent create) opens its own transaction and
+calls `Open` with version kind `ref`.
 
 ### Hub events
 

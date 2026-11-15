@@ -50,6 +50,35 @@ func (r *Repo) CompareAndSwapRef(ctx context.Context, ref, newID, expectedOld st
 	return err
 }
 
+// SetRef points ref, a full ref name, at the commit id, whatever it
+// points at now and whether or not it exists: for a ref only the hub
+// writes, such as a change's version ref, where a value left by an earlier
+// write that was undone is to be overwritten.
+func (r *Repo) SetRef(ctx context.Context, ref, id string) error {
+	_, err := r.git(ctx, "update-ref", "--no-deref", ref, id)
+	return err
+}
+
+// SetRefFrom is SetRef for a commit that may be missing from the
+// repository and that the repository at the git directory src holds, as a
+// fork holds its own commits apart from its parent: the commit and what it
+// reaches that the repository lacks are copied from src first. A commit the
+// repository holds already is pointed at without a copy.
+func (r *Repo) SetRefFrom(ctx context.Context, src, ref, id string) error {
+	missing, err := r.Missing(ctx, []string{id})
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		return r.SetRef(ctx, ref, id)
+	}
+	// A push from src sends exactly what this repository lacks and sets
+	// the ref in one step; a fetch by id would need src to allow wants of
+	// unadvertised objects.
+	_, err = r.g.run(ctx, access{}, "--git-dir="+src, "push", "--quiet", "--no-verify", "--", r.dir, "+"+id+":"+ref)
+	return err
+}
+
 // RefInTheWay is the ref whose name keeps ref from being created: one
 // whose name is a directory of ref's, such as refs/heads/feat for
 // refs/heads/feat/x, or one that lies below ref's name, such as

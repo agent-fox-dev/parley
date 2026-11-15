@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
@@ -70,6 +71,7 @@ var parts = []func(*Composition){
 	composeForks,
 	composeGitServer,
 	composeSCM,
+	composeChanges,
 	composeSandbox,
 }
 
@@ -208,6 +210,12 @@ type Composition struct {
 	// changed its dependencies (AdjustSCM).
 	scm          *scm.Component
 	scmAdjusters []func(*scm.Deps)
+
+	// changes is the change component composeChanges creates and binds in
+	// its start hook (Changes), after changeAdjusters have changed its
+	// dependencies (AdjustChange).
+	changes         *change.Component
+	changeAdjusters []func(*change.Deps)
 
 	// refWriter is the ref writer every surface that writes refs writes
 	// through (RefWriter). It exists from the composition on, so that a

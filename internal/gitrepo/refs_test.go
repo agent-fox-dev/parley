@@ -112,3 +112,51 @@ func TestIsAncestor(t *testing.T) {
 		}
 	}
 }
+
+func TestSetRef_PointsTheRefAtTheCommitWhateverItHeld(t *testing.T) {
+	t.Parallel()
+	repo, c1, c2, _ := threeCommits(t)
+	ctx := context.Background()
+	const ref = "refs/parley/changes/1/1"
+	for _, id := range []string{c1, c2} {
+		if err := repo.SetRef(ctx, ref, id); err != nil {
+			t.Fatalf("SetRef(%s): %v", id, err)
+		}
+		if got := gitrepotest.Refs(t, repo.Dir(), "")[ref]; got != id {
+			t.Errorf("after SetRef(%s), %s = %q", id, ref, got)
+		}
+	}
+}
+
+// A commit made in a fork is not in its parent's repository: SetRefFrom
+// brings it there under the ref, and points the ref at a commit the parent
+// already holds without copying anything.
+func TestSetRefFrom_BringsACommitOfAnotherRepositoryUnderTheRef(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	parent, head, _, _ := forkParent(t, 2)
+	fork := newFork(t, parent)
+	own := gitrepotest.PushCommit(t, parent, fork, "work", "only in the fork\n")
+	if readable(parent, own) {
+		t.Fatal("the parent holds the fork's commit before the copy")
+	}
+	repo, err := gitrepo.Git{}.Open(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ ref, id string }{
+		{"refs/parley/changes/1/1", own},
+		{"refs/parley/changes/2/1", head},
+		{"refs/parley/changes/1/1", head},
+	} {
+		if err := repo.SetRefFrom(ctx, fork, c.ref, c.id); err != nil {
+			t.Fatalf("SetRefFrom(%s, %s): %v", c.ref, c.id, err)
+		}
+		if got := gitrepotest.Refs(t, parent, "")[c.ref]; got != c.id {
+			t.Errorf("after SetRefFrom, %s = %q, want %s", c.ref, got, c.id)
+		}
+	}
+	if !readable(parent, own) {
+		t.Error("the parent cannot read the fork's commit after the copy")
+	}
+}

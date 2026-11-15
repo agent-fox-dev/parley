@@ -3550,6 +3550,102 @@ compare-and-swap.
 | `409` `rebase_conflict` | a commit does not apply; `details` is the conflict report |
 | `409` `conflict` | the `Idempotency-Key` was used with another body |
 
+## Changes
+
+A change is a numbered proposal to add the commits of a source branch to a
+target branch. It belongs to the workspace that holds its target branch
+(the target workspace) and is numbered there from 1; a number is never
+given twice, also after its change was abandoned. Its reference is
+`<workspace_slug>#<number>`, such as `demo#1`. The source branch is a
+branch of the target workspace or of a task fork of it.
+
+Every head the source branch had is a version, numbered from 1. The head
+of each version stays fetchable at `refs/parley/changes/<number>/<version>`
+in the target workspace's repository; for a fork source the commit is
+copied there from the fork.
+
+The change object:
+
+```json
+{"workspace_slug":"demo","number":1,"ref":"demo#1","title":"Add x","intent":"Because y","state":"open","target_branch":"main","source":{"workspace_slug":"demo","branch":"feat"},"version":1,"head_sha":"0b86db2bc73da0f067ec404140cfc00060162383","base_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","depends_on":null,"dependants":[],"author":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"sessions":[],"mergeable":"unknown","conflict":null,"needs_restack":false,"restack_reason":null,"stats":{"commits":1,"files_changed":1,"insertions":1,"deletions":0},"paths":["feat.txt"],"paths_truncated":false,"landing":{"status":"ready","reason":null,"requirements":[]},"auto_land":false,"labels":["docs"],"landed":null,"reverts":null,"reverted_by":null,"created_at":"2026-11-15T13:12:13Z","updated_at":"2026-11-15T13:12:13Z"}
+```
+
+| Member | Meaning |
+|---|---|
+| `state` | `draft`, `open`, `landed` or `abandoned` |
+| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch |
+| `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
+| `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
+| `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
+| `mergeable`, `conflict` | `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` |
+| `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why |
+| `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha` |
+| `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
+| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked, else `null`, and the policy's `requirements` |
+| `landed` | how it landed, `null` until then: `sha`, `at`, `by` (an author object), `land_id` and `commits`, each `{version_sha, landed_sha}` |
+| `reverts`, `reverted_by` | the number of the change it reverts, and of the change that reverts it, `null` for none |
+
+Arrays are never `null`; times are RFC 3339 in UTC with whole seconds.
+
+A version has `number`, `head_sha`, `base_sha`, `kind` (`push`, `commit`,
+`ref`, `rebase`, `restack`, `revert`, `sync`), `patch_equivalent_to` (the
+latest earlier version whose diff against its own base is the same, `null`
+for none), `created_by` (an author object), `session_id`, `stats` and
+`created_at`. A version recorded for a head that was already on the source
+branch, such as version 1 of a change opened through the route below, has
+kind `ref`.
+
+## `POST /api/v1/workspaces/{slug}/changes`
+
+Opens a change in the workspace `{slug}`, the target workspace. It needs,
+for a personal access token, `changes:write`, and read access to `{slug}`.
+The body:
+
+| Member | Meaning |
+|---|---|
+| `source` | required: `{"workspace_slug"?, "branch"}`; `workspace_slug` defaults to `{slug}` |
+| `target_branch` | defaults to the fork's base branch for a fork source, else to the workspace's default branch |
+| `title` | defaults to the subject of the head commit, cut to 200 characters |
+| `intent` | defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters |
+| `draft` | `true` opens the change as a draft |
+| `depends_on` | the number of the change this one depends on |
+| `auto_land` | defaults to `false` |
+| `labels` | defaults to `[]`; a repeated label is kept once |
+| `session_id` | defaults to the session recorded on the source fork; a defaulted session the session rule refuses is dropped |
+
+```json
+{"source":{"branch":"feat"},"labels":["docs"]}
+```
+
+The answer is `201` with the change object, at version 1: the head of the
+source branch, of kind `ref`, written at `refs/parley/changes/<number>/1`.
+`mergeable` is `unknown`. A draft has `landing`
+`{"status":"blocked","reason":"draft","requirements":[]}`; any other
+change the landing evaluation's answer, which until the hub has a landing
+policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
+hub has a session feature, every `session_id` is refused and a defaulted
+one dropped.
+
+The open writes `parley.change.version` for version 1, with `ref`,
+`version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to` and
+`draft` in its metadata, then, unless the change is a draft,
+`parley.change.open`, with `ref`, `version`, `head_sha`, `title`,
+`target_branch`, `source_workspace`, `source_branch`, `depends_on` and
+`was_draft` (`false`). Both have `resource_type` `change`, `resource_id`
+the number, the target workspace and the change's session. A refused open
+writes no change, version or event.
+
+| Status | When |
+|---|---|
+| `201 Created` | the change, as above; a replay of a recorded `Idempotency-Key` with the same body answers the first answer |
+| `400` `invalid_request` | a body member of the wrong type; no `title` while the head commit has no subject |
+| `400` `source_not_related` | no source workspace `source.workspace_slug` |
+| `400` `source_not_found` | no branch `source.branch` in the source workspace |
+| `400` `target_not_found` | no branch `target_branch` in the target workspace |
+| `400` `unknown_session` | the `session_id` is not accepted |
+| `409` `change_exists` | another draft or open change has this source; `details` is `{"workspace_slug", "number", "ref"}` of that change |
+| `409` `conflict` | the `Idempotency-Key` was used with another body |
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

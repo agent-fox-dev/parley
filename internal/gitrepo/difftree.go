@@ -173,6 +173,40 @@ func (r *Repo) MergeBase(ctx context.Context, a, b string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// EmptyPatchID is the patch id of a comparison that changes nothing, which
+// git patch-id gives none: two empty comparisons are equivalent.
+const EmptyPatchID = "empty"
+
+// PatchID is the stable patch id (git patch-id --stable) of the changes
+// from the tree of base to that of head, each a full id of a commit or a
+// tree, base "" being the empty tree, with renamed and copied files found
+// as DiffChanges finds them. Two comparisons have the same patch id when
+// they make the same changes, whatever their bases: a rebase that applied
+// cleanly keeps it. A comparison that changes nothing is EmptyPatchID.
+func (r *Repo) PatchID(ctx context.Context, base, head string) (string, error) {
+	base, head, err := r.diffSides(ctx, base, head)
+	if err != nil {
+		return "", err
+	}
+	args := append(append([]string{"diff-tree", "-r", "-p", "--full-index", "--binary"}, findRenames...), base, head)
+	patch, err := r.git(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	if len(bytes.TrimSpace(patch)) == 0 {
+		return EmptyPatchID, nil
+	}
+	out, err := r.g.runInput(ctx, access{}, patch, "--git-dir="+r.dir, "patch-id", "--stable")
+	if err != nil {
+		return "", err
+	}
+	id, _, _ := strings.Cut(strings.TrimSpace(string(out)), " ")
+	if id == "" {
+		return EmptyPatchID, nil
+	}
+	return id, nil
+}
+
 // PatchOptions choose how DiffPatches writes a file's patch.
 type PatchOptions struct {
 	// Context is the number of unchanged lines around each change.
