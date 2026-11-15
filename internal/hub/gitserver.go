@@ -42,7 +42,7 @@ const (
 // event log, which receives the event of an audited fetch, to the
 // workspace service's settings registry, from which a workspace's
 // audit_fetches is read, and to [git].timeout, which it registers and
-// which bounds each run. The server,
+// which bounds each run, and each push up to its ref transaction. The server,
 // and with it the limiter, is built after the start hooks, so the limiter
 // reaches the component through a server hook: the component holds a
 // serverLimiter, which the hook points at the limiter of the server that
@@ -62,8 +62,9 @@ const (
 // workspace's effective protected_branches and protect.owner_push from its
 // record, a fork's from its parent's, and to the tracking-branch lookup,
 // which asks the fork component. The push processor (Receiver) is bound to
-// the engine, the ref writer, the hub's git and the workspace service's
-// place of each repository on disk, and is the git server's Push, so that
+// the engine, the ref writer, the hub's git, the workspace service's
+// place of each repository on disk and [git].max_push_size, which the part
+// registers beside [git].timeout, and is the git server's Push, so that
 // a push that passed the checks is decided by the rules and written by the
 // ref writer.
 //
@@ -89,7 +90,8 @@ func composeGitServer(c *Composition) {
 			Settings: pushSettings{rt.Store.Main(), c.workspaces.Settings()}, Tracking: trackingBranches{c.forks},
 		})
 		c.receiver.Bind(gitserver.ReceiverDeps{
-			Engine: c.pushRules, Writer: c.refWriter, Git: gitFor(c.env), RepoPath: c.workspaces.RepoPath, Logger: rt.Logger,
+			Engine: c.pushRules, Writer: c.refWriter, Git: gitFor(c.env), RepoPath: c.workspaces.RepoPath,
+			MaxPushSize: gitserver.MaxPushSizeFrom(rt.Config), Logger: rt.Logger,
 		})
 		d := gitserver.Deps{
 			Credentials: c.identity, Limiter: limiter, Guard: c.access, Access: c.access,

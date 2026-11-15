@@ -314,22 +314,26 @@ func TestFetch_EndsARequestThatOutlivesTheTimeoutAndItsGit(t *testing.T) {
 	}
 }
 
-func TestFetch_TimeoutComesFromTheConfiguration(t *testing.T) {
+func TestRegister_ReadsTheGitSectionOfTheConfiguration(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
 		name, text string
-		want       time.Duration
-		invalid    bool
+		timeout    time.Duration
+		size       int64
+		invalid    string
 	}{
-		{"not set", "", gitserver.DefaultTimeout, false},
-		{"set", "[git]\ntimeout = \"90s\"\n", 90 * time.Second, false},
-		{"zero", "[git]\ntimeout = \"0s\"\n", 0, true},
-		{"not a duration", "[git]\ntimeout = \"soon\"\n", 0, true},
+		{"not set", "", gitserver.DefaultTimeout, 0, ""},
+		{"set", "timeout = \"90s\"\nmax_push_size = \"100MB\"\n", 90 * time.Second, 100 << 20, ""},
+		{"a size in bytes", "max_push_size = \"1048577\"\n", gitserver.DefaultTimeout, 1048577, ""},
+		{"zero timeout", "timeout = \"0s\"\n", 0, 0, "git.timeout"},
+		{"not a duration", "timeout = \"soon\"\n", 0, 0, "git.timeout"},
+		{"not a size", "max_push_size = \"lots\"\n", 0, 0, "git.max_push_size"},
+		{"a negative size", "max_push_size = \"-1\"\n", 0, 0, "git.max_push_size"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, config.FileName), []byte(c.text), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, config.FileName), []byte("[git]\n"+c.text), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			r := config.NewRegistry()
@@ -338,12 +342,12 @@ func TestFetch_TimeoutComesFromTheConfiguration(t *testing.T) {
 			}
 			cfg, err := r.Load(config.MapEnv(nil), dir)
 			switch {
-			case c.invalid && (err == nil || !strings.Contains(err.Error(), "git.timeout")):
-				t.Errorf("load = %v, want an error naming git.timeout", err)
-			case !c.invalid && err != nil:
+			case c.invalid != "" && (err == nil || !strings.Contains(err.Error(), c.invalid)):
+				t.Errorf("load = %v, want an error naming %s", err, c.invalid)
+			case c.invalid == "" && err != nil:
 				t.Fatalf("load: %v", err)
-			case !c.invalid && gitserver.TimeoutFrom(cfg) != c.want:
-				t.Errorf("timeout = %v, want %v", gitserver.TimeoutFrom(cfg), c.want)
+			case c.invalid == "" && (gitserver.TimeoutFrom(cfg) != c.timeout || gitserver.MaxPushSizeFrom(cfg) != c.size):
+				t.Errorf("timeout, max push size = %v, %d, want %v, %d", gitserver.TimeoutFrom(cfg), gitserver.MaxPushSizeFrom(cfg), c.timeout, c.size)
 			}
 		})
 	}

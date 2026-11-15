@@ -198,7 +198,7 @@ var ownKeys = []Key{
 	{Section: "server", Name: "port", Type: Int, Default: 8080, Validate: intBetween(0, 65535)},
 	{Section: "server", Name: "external_url", Type: String, Default: "", Validate: emptyOrHTTPURL},
 	{Section: "server", Name: "max_body_size", Type: String, Default: "1MB", Validate: func(v any) error {
-		_, err := parseSize(v.(string))
+		_, err := ParseSize(v.(string))
 		return err
 	}},
 	{Section: "database", Name: "path", Type: String, Default: "", Validate: nonEmpty},
@@ -253,9 +253,9 @@ func httpURL(s string) error {
 
 var sizePattern = regexp.MustCompile(`^([0-9]+)(kb|mb|gb)$`)
 
-// parseSize reads a positive integer followed by KB, MB or GB, in any letter
+// ParseSize reads a positive integer followed by KB, MB or GB, in any letter
 // case and in powers of 1024, as a number of bytes.
-func parseSize(s string) (int64, error) {
+func ParseSize(s string) (int64, error) {
 	bad := errors.New("must be a positive integer followed by KB, MB or GB, such as 1MB")
 	m := sizePattern.FindStringSubmatch(strings.ToLower(s))
 	if m == nil {

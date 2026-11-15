@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -72,14 +74,16 @@ type MappingStage interface {
 // ReceiverDeps are what the push processor works with: the push rule
 // engine, the ref writer, the hub's git, which opens a workspace's
 // repository and runs git index-pack, the place of each workspace's
-// repository on disk and the logger of the failures that are not the
-// client's doing.
+// repository on disk, the largest pack a push may send in bytes
+// ([git].max_push_size, 0 for no limit) and the logger of the failures
+// that are not the client's doing.
 type ReceiverDeps struct {
-	Engine   *pushrule.Engine
-	Writer   *pushrule.Writer
-	Git      gitrepo.Git
-	RepoPath func(slug string) string
-	Logger   *slog.Logger
+	Engine      *pushrule.Engine
+	Writer      *pushrule.Writer
+	Git         gitrepo.Git
+	RepoPath    func(slug string) string
+	MaxPushSize int64
+	Logger      *slog.Logger
 }
 
 // Receiver is the push processor behind git-receive-pack: it reads the
@@ -131,15 +135,27 @@ const msgInvalidRequest = "invalid receive-pack request"
 // ProcessPush processes one push, writes the whole answer and returns its
 // result: ok for an accepted push and for one without commands, refused
 // for one the options stage, a rule or the compare-and-swap refused, error
-// for a pack that cannot be read and for a failure of the hub's. A command
-// list that cannot be read is answered 400, since it has no ref to report
-// on.
+// for a pack that cannot be read or is larger than MaxPushSize, for a push
+// whose request context ended before its ref transaction started, and for
+// a failure of the hub's. A command list that cannot be read is answered
+// 400, since it has no ref to report on.
+//
+// The request's context bounds every stage before the ref transaction: the
+// git server ends it at [git].timeout. When it ends there, the push's git
+// processes are killed with it, its quarantine is discarded, nothing
+// changes and every ref is reported as the push timed out. Once the ref
+// transaction has started, the push is finished whatever the context says.
 func (p *Receiver) ProcessPush(w http.ResponseWriter, r *http.Request, caller PushCaller, ws workspace.Workspace) Result {
 	p.mu.RLock()
 	run := &push{deps: p.deps, options: p.options, mapping: p.mapping, caller: caller, ws: ws}
 	p.mu.RUnlock()
 	if run.deps.Logger == nil {
 		run.deps.Logger = slog.New(slog.DiscardHandler)
+	}
+	if deadline, ok := r.Context().Deadline(); ok {
+		// A read of the body waits for the client however the context
+		// ends; a deadline on the connection ends the read with it.
+		_ = http.NewResponseController(w).SetReadDeadline(deadline)
 	}
 	body, err := pushBody(r)
 	if err == nil {
@@ -153,7 +169,7 @@ func (p *Receiver) ProcessPush(w http.ResponseWriter, r *http.Request, caller Pu
 		begin(w, receivePackResult)
 		return ResultOK
 	}
-	rep, res := run.process(r.Context(), body)
+	rep, res := run.process(r.Context(), &packReader{r: body, max: run.deps.MaxPushSize})
 	run.caps.write(w, rep)
 	return res
 }
@@ -172,17 +188,20 @@ type push struct {
 }
 
 // process runs the stages of a push with at least one command, its
-// commands and options read from body, which holds its pack, and returns
-// its report and result.
-func (run *push) process(ctx context.Context, body *bufio.Reader) (report, Result) {
+// commands and options read, its pack to be read from body, and returns its
+// report and result.
+func (run *push) process(ctx context.Context, body *packReader) (report, Result) {
 	answer := OptionsAnswer{}
 	if run.options != nil {
 		var err error
-		if answer, err = run.options.CheckOptions(ctx, OptionsInput{run.ws, run.caller, run.updates, run.pushOpts}); err != nil {
+		answer, err = run.options.CheckOptions(ctx, OptionsInput{run.ws, run.caller, run.updates, run.pushOpts})
+		switch {
+		case expired(ctx):
+			return run.timedOut()
+		case err != nil:
 			_, _ = io.Copy(io.Discard, body)
 			return run.internal(ctx, "options stage", err)
-		}
-		if answer.Refusal != "" {
+		case answer.Refusal != "":
 			// The client sends its whole pack before it reads the answer.
 			_, _ = io.Copy(io.Discard, body)
 			return refuseAll(run.updates, answer.Refusal), ResultRefused
@@ -193,18 +212,24 @@ func (run *push) process(ctx context.Context, body *bufio.Reader) (report, Resul
 	}
 	repo, err := run.deps.Git.Open(ctx, run.repoPath(run.ws.Slug))
 	if err != nil {
-		return run.internal(ctx, "open the repository", err)
+		return run.failed(ctx, "open the repository", err)
 	}
 	view, beforeCommit := repo, func(context.Context) error { return nil }
 	if afters := run.afters(); len(afters) > 0 {
 		q, err := repo.NewQuarantine()
 		if err != nil {
-			return run.internal(ctx, "quarantine", err)
+			return run.failed(ctx, "quarantine", err)
 		}
 		// An accepted push's objects were moved out first, so this removes
 		// an empty directory; a refused push's objects go with it.
 		defer func() { _ = q.Discard() }()
 		if ok := run.unpack(ctx, q, body, afters); !ok {
+			switch {
+			case body.over():
+				return failAll(run.updates, unpackTooLarge, msgUnpackerErr), ResultError
+			case expired(ctx):
+				return run.timedOut()
+			}
 			return failAll(run.updates, unpackInvalid, msgUnpackerErr), ResultError
 		}
 		view, beforeCommit = q.View(), func(context.Context) error { return q.Migrate() }
@@ -217,10 +242,17 @@ func (run *push) process(ctx context.Context, body *bufio.Reader) (report, Resul
 		req.ParentRepo = run.repoPath(*run.ws.ParentSlug)
 	}
 	verdict := run.engine().Evaluate(ctx, req)
+	if expired(ctx) {
+		return run.timedOut()
+	}
+	// The ref writer stops at ctx's end only up to its ref transaction.
 	res, err := run.writer().Apply(ctx, pushrule.ApplyRequest{
 		Verdict: verdict, Repo: view, Workspace: pw, Caller: pc, SessionID: answer.SessionID,
 		Via: pushrule.ViaGit, VersionKind: pushrule.VersionKindPush, BeforeCommit: beforeCommit,
 	})
+	if res.Outcome == pushrule.OutcomeInternal && expired(ctx) {
+		return run.timedOut()
+	}
 	if err != nil {
 		run.logFailure(ctx, "write the refs", err)
 	}
@@ -231,6 +263,8 @@ func (run *push) process(ctx context.Context, body *bufio.Reader) (report, Resul
 		}
 		return rep, ResultRefused
 	}
+	// The refs have moved: the push is finished whatever ctx says.
+	ctx = context.WithoutCancel(ctx)
 	if run.mapping != nil {
 		rep.band = append(rep.band, run.mapping.MapPush(ctx, MappingInput{run.ws, run.caller, run.pushOpts, answer.SessionID, res.Updates})...)
 	}
@@ -261,6 +295,60 @@ func (run *push) afters() []string {
 	}
 	return ids
 }
+
+// failed reports a failure of step before the ref writer was asked: as the
+// push timed out when ctx has ended, else as internal.
+func (run *push) failed(ctx context.Context, step string, err error) (report, Result) {
+	if expired(ctx) {
+		return run.timedOut()
+	}
+	return run.internal(ctx, step, err)
+}
+
+// timedOut reports every ref of a push whose context ended before its ref
+// transaction started.
+func (run *push) timedOut() (report, Result) {
+	return failAll(run.updates, unpackTimedOut, msgUnpackerErr), ResultError
+}
+
+// expired reports whether ctx, a push's, has ended: its deadline has
+// passed, which a read of the body may notice first, or the client is gone.
+func expired(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	return ctx.Err() != nil || ok && !time.Now().Before(deadline)
+}
+
+// packReader is the rest of a push's body once its commands and options
+// are read, which holds its pack. With max above 0 it reads at most max
+// bytes and one more: the one more tells a pack over the limit, and the
+// read stops there.
+type packReader struct {
+	r    io.Reader
+	max  int64
+	read atomic.Int64
+}
+
+var errPackTooLarge = errors.New("the pack exceeds the maximum push size")
+
+func (p *packReader) Read(b []byte) (int, error) {
+	if p.max <= 0 {
+		return p.r.Read(b)
+	}
+	if p.over() {
+		return 0, errPackTooLarge
+	}
+	if rest := p.max + 1 - p.read.Load(); int64(len(b)) > rest {
+		b = b[:rest]
+	}
+	n, err := p.r.Read(b)
+	if p.read.Add(int64(n)) > p.max {
+		return n, errPackTooLarge
+	}
+	return n, err
+}
+
+// over reports whether more than max bytes were read.
+func (p *packReader) over() bool { return p.max > 0 && p.read.Load() > p.max }
 
 // internal reports every ref of the push refused as internal, for a failure
 // of the hub's before the ref writer was asked, and logs it.

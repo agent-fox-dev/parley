@@ -154,3 +154,34 @@ refused, is dropped without events as well, and logged as a warning. An
 entry whose repository cannot be opened or read, or whose transaction
 fails, is logged and kept for the next start rather than failing the
 start; the start fails only when the journal itself cannot be read.
+
+## A push's `[git].timeout` runs from its arrival to the preparation of its ref transaction
+
+The package bounds every stage of a push before its ref transaction by
+`[git].timeout` and says the push is finished once that transaction has
+started. The push shares the request's one deadline, `[git].timeout`
+after the request came in, with the git server's checks and a task fork's
+ref copy, as a fetch does (see the erratum of package 17); the processor
+has no limit of its own, so its limit is the git server's
+`Deps.Timeout`, read with `gitserver.TimeoutFrom`. The transaction counts
+as started once `git update-ref` has prepared it: `Writer.Apply` runs the
+forwards, the journal entry and the preparation under the caller's
+context, and everything after on one that does not end, for every surface.
+When the context ends before, `Apply` refuses the request as internal, as
+the forward section above says, and the processor reports that push, like
+one stopped in an earlier stage, as `unpack push timed out` with
+`ng <ref> unpacker error`. A client that went away is treated the same,
+though it reads no report. A deadline that passes while the command list
+is still being read leaves no ref to report on, so that request is
+answered `400 invalid receive-pack request`.
+
+## `[git].max_push_size` counts every byte after the commands and options
+
+The package bounds the pack. The processor counts every byte of the body
+after the command list and the push options, after gzip decoding, so
+whatever a client sends after its pack counts too, and it stops reading at
+one byte over the limit: also when it reads the rest of the body only to
+discard it, after the options stage has refused the push or for a push of
+deletes only, which is then answered as before. The key is a string, like
+`[server].max_body_size`: `"0"`, a whole number of bytes, or a whole number
+followed by `KB`, `MB` or `GB`.

@@ -225,6 +225,10 @@ func (r Result) Refused() bool { return r.Outcome != OutcomeAccepted }
 // and removes the entry. Via must be ViaGit, ViaAPI or ViaLand: another
 // value is an error before anything is done.
 //
+// ctx bounds the request up to its ref transaction: the forwards, the
+// journal entry and the preparation. Once the transaction is prepared the
+// request runs to its end whatever ctx says.
+//
 // No lock spans the request: two requests on one repository are ordered by
 // the ref transaction alone, in which a ref the other holds counts as
 // moved.
@@ -302,6 +306,10 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 		return res.internal(), err
 	}
 	defer func() { _ = tx.Abort() }()
+	// The refs are locked: from here the request is finished, or stopped by
+	// a failure of its own, whatever ctx says, so that the end of the
+	// caller's time cannot leave it between the ref and the store commit.
+	ctx = context.WithoutCancel(ctx)
 	if req.BeforeCommit != nil {
 		if err := req.BeforeCommit(ctx); err != nil {
 			_ = tx.Abort()

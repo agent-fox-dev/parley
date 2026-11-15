@@ -12,10 +12,14 @@ import (
 const receivePackResult = "application/x-git-receive-pack-result"
 
 // The texts of the status report the rules do not word: git's own for a
-// pack it cannot unpack, and the hub's for a failure before the rules ran.
+// pack it cannot unpack, and the hub's for a pack over [git].max_push_size,
+// for a push that outlasted [git].timeout and for a failure before the
+// rules ran.
 const (
 	unpackOK        = "ok"
 	unpackInvalid   = "invalid pack"
+	unpackTooLarge  = "pack exceeds the maximum push size"
+	unpackTimedOut  = "push timed out"
 	msgUnpackerErr  = "unpacker error"
 	msgPushInternal = "internal error; try again"
 )

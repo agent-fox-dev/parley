@@ -109,7 +109,8 @@ type Exchange struct {
 	// as a repository before the Service was called.
 	Repo string
 	// deadline is [git].timeout after the request came in: the end of a
-	// fork's ref copy and of the run of git, which share it.
+	// fork's ref copy and of the run of git or of the push processor's
+	// work before its ref transaction, which share it.
 	deadline time.Time
 }
 
@@ -171,7 +172,8 @@ type Deps struct {
 	// registered, audit_fetches is false.
 	Settings Settings
 	// Timeout bounds one git request: a task fork's ref copy and the run of
-	// git for ref discovery or a fetch together; zero is DefaultTimeout.
+	// git for ref discovery or a fetch, or the push processor's work up to
+	// its ref transaction, together; zero is DefaultTimeout.
 	Timeout time.Duration
 	// Logger receives the causes of 500 answers; nil discards them.
 	Logger *slog.Logger

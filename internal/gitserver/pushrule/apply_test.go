@@ -67,6 +67,8 @@ func TestApply_WritesNoRefOfARequestWithARefNotAtItsBefore(t *testing.T) {
 	}
 }
 
+// The hook ends the request's context: once the refs are locked, the
+// request is finished all the same.
 func TestApply_RunsTheRefUpdatedStagesInOrderInsideTheCommitStep(t *testing.T) {
 	r := newRepo(t)
 	st := newStore(t)
@@ -83,9 +85,12 @@ func TestApply_RunsTheRefUpdatedStagesInOrderInsideTheCommitStep(t *testing.T) {
 	caller := ownerKey
 	caller.CredentialID = "k1"
 	session := "s1"
-	res, err := w.Apply(context.Background(), pushrule.ApplyRequest{Verdict: allowed(updates...), Repo: r.view, Workspace: demo, Caller: caller,
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res, err := w.Apply(ctx, pushrule.ApplyRequest{Verdict: allowed(updates...), Repo: r.view, Workspace: demo, Caller: caller,
 		SessionID: &session, Via: pushrule.ViaAPI, VersionKind: pushrule.VersionKindCommit,
 		BeforeCommit: func(context.Context) error {
+			cancel()
 			log = append(log, "hook")
 			hookSaw = gitrepotest.Git(t, r.dir, "rev-parse", "refs/heads/feat")
 			return nil

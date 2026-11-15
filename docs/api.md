@@ -746,7 +746,16 @@ A push that passed every check gets its ref advertisement from
   - The pack is held apart from the repository until the push is accepted.
     A pack git cannot index, or a new value that names no object, is
     reported `unpack invalid pack` with `ng <ref> unpacker error` for every
-    ref.
+    ref. A pack larger than `[git].max_push_size` (no limit by default; see
+    [configuration.md](configuration.md)) is read no further and reported
+    `unpack pack exceeds the maximum push size` with
+    `ng <ref> unpacker error` for every ref; a pack of exactly the limit is
+    accepted.
+  - A push is bounded by `[git].timeout` from its arrival up to its ref
+    transaction: when it runs out before, the push's `git` processes are
+    killed, nothing changes, and every ref is reported
+    `unpack push timed out` with `ng <ref> unpacker error`; once the ref
+    transaction has started, the push is finished.
   - Every ref update is decided by the push rules, in the order hub-owned
     refs (`refs/parley/ is maintained by the hub and cannot be pushed to`),
     protected branches (`<branch> is protected and cannot be force-pushed
@@ -827,7 +836,12 @@ discovery, whichever service it asks for, `upload-pack` or `receive-pack`.
 every other refusal (`400`, `409`, `429`, `500`) and for an exchange that
 ended with one of the hub's `ERR` pkt-lines, a failed git or a timeout;
 `ok` for a served exchange; and, for a push handed to the push processor,
-the result the processor reports. The hub does not export the counter at
+the result the processor reports: `ok` for an accepted push and for one
+without commands, `refused` for a push refused by a rule, by the options
+stage or because a ref moved meanwhile, `error` for a pack that cannot be
+read or is over `[git].max_push_size`, a push that timed out, one refused
+with `internal error; try again` and a command list that cannot be read
+(`400`). The hub does not export the counter at
 `/metrics` yet.
 
 When the workspace's setting `audit_fetches` is `true` (for a task fork,
