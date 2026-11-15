@@ -342,6 +342,13 @@ func (w *world) addDiff(t *testing.T) map[string]string {
 	return ids
 }
 
+// addCompare adds the ready workspace cmp of the owner, its repository made
+// from gitrepotest.CompareStream, and returns its git directory.
+func (w *world) addCompare(t *testing.T) string {
+	t.Helper()
+	return w.addWorkspace(t, "cmp", w.org, gitrepotest.CompareStream())
+}
+
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
@@ -448,6 +455,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"tree", "/tree", "/tree?path=nope"},
 	{"file", "/file?path=f.txt", "/file?path=nope.txt"},
 	{"diff", "/diff?base=main&head=feature/x", "/diff?base=main"},
+	{"compare", "/compare?base=main&head=feature/x", "/compare?base=main"},
 }
 
 // observations is a request recorder that keeps what it was told, each

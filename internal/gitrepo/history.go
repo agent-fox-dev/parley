@@ -310,3 +310,59 @@ func (s *DiffStats) add(n numstat) {
 	s.Insertions += n.Insertions
 	s.Deletions += n.Deletions
 }
+
+// AheadBehind counts the commits that the commit of the full id head
+// reaches and that of base does not (ahead), and the reverse (behind).
+func (r *Repo) AheadBehind(ctx context.Context, base, head string) (ahead, behind int, err error) {
+	base, head, err = rangeEnds(base, head)
+	if err != nil {
+		return 0, 0, err
+	}
+	// The left side of base...head is what only base reaches.
+	out, err := r.git(ctx, "rev-list", "--left-right", "--count", base+"..."+head)
+	if err != nil {
+		return 0, 0, err
+	}
+	f := strings.Fields(string(out))
+	if len(f) != 2 {
+		return 0, 0, fmt.Errorf("ahead and behind: rev-list answered %q", out)
+	}
+	if behind, err = strconv.Atoi(f[0]); err == nil {
+		ahead, err = strconv.Atoi(f[1])
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("ahead and behind: rev-list answered %q", out)
+	}
+	return ahead, behind, nil
+}
+
+// CommitsBetween lists the full ids of the commits that the commit of the
+// full id head reaches and that of base does not, oldest first, every
+// commit after its parents; when limit is above 0, the first limit of them.
+func (r *Repo) CommitsBetween(ctx context.Context, base, head string, limit int) ([]string, error) {
+	base, head, err := rangeEnds(base, head)
+	if err != nil {
+		return nil, err
+	}
+	// rev-list cuts a listing before it reverses it, so the oldest come
+	// only from the whole list.
+	out, err := r.git(ctx, "rev-list", "--reverse", "--topo-order", base+".."+head)
+	if err != nil {
+		return nil, err
+	}
+	ids := strings.Fields(string(out))
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	return ids, nil
+}
+
+// rangeEnds are the full ids base and head as git takes them in a range.
+func rangeEnds(base, head string) (string, string, error) {
+	for _, id := range []string{base, head} {
+		if !isHexID(id, idLen) {
+			return "", "", fmt.Errorf("commits of %q: %w", id, ErrNotFound)
+		}
+	}
+	return strings.ToLower(base), strings.ToLower(head), nil
+}

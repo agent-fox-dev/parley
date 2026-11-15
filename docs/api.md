@@ -2641,7 +2641,7 @@ moves. A fork shows no `refs/parley/` ref.
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
-`tree` for the tree route, `file` for the file route, `diff` for the diff route) and `ok` for a status
+`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route) and `ok` for a status
 below 400 (a `206` included),
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
@@ -2663,7 +2663,7 @@ never listed, nor is a ref that reaches no commit.
 
 A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree` and
 `…/scm/file`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
-`…/scm/diff`) is a branch name, a tag name, a full ref name or a
+`…/scm/diff` and `…/scm/compare`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
 the tag of that name, where both existing is ambiguous; otherwise a commit
@@ -2699,7 +2699,7 @@ A commit object, as every route that answers commits writes it:
 | `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
 
 A file change, as every route that answers file changes writes it (the
-commit route with `files=true`, the diff route):
+commit route with `files=true`, the diff route, the compare route):
 
 | Member | Value |
 |---|---|
@@ -2959,6 +2959,75 @@ boundary by the same limits, and a cut answer carries the header
 
 ```json
 {"base_sha":"6c638ebb967a4ce0b52b308260b292f0dbdbd489","head_sha":"c7a58b21816fb50c8054f4b8d574c7d205f9a4bb","merge_base_sha":"4a5a3035a79aa72418c2fa14d64c763813e558a6","files":[{"path":"edit.txt","old_path":null,"status":"modified","insertions":2,"deletions":1,"binary":false,"old_sha":"b2f931a67315c95c5daab3aac6de62e534808476","new_sha":"c04cd7487d84c5531d5a28b8763a5982ba7b8501","patch":"diff --git a/edit.txt b/edit.txt\nindex b2f931a..c04cd74 100644\n--- a/edit.txt\n+++ b/edit.txt\n@@ -1,5 +1,6 @@\n one\n two\n-three\n+3a\n+3b\n four\n five\n"},{"path":"img.bin","old_path":null,"status":"modified","insertions":0,"deletions":0,"binary":true,"old_sha":"8352675d67aed6625ece79af41c27fdb4ee2e867","new_sha":"a903574af00b573ad9bdb2bccf8d93ed00c675de"},{"path":"new.txt","old_path":null,"status":"added","insertions":3,"deletions":0,"binary":false,"old_sha":null,"new_sha":"5804e5526e21ff0d1a3d282f07834c45f28612ca","patch":"diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..5804e55\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,3 @@\n+n1\n+n2\n+n3\n"}],"stats":{"files_changed":3,"insertions":5,"deletions":1},"truncated":false}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/compare`
+
+Answers how two revisions relate and whether `head` can be rebased onto
+`base`, from a trial rebase that moves no ref. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `base` | the revision `head` would be rebased onto, required |
+| `head` | the revision whose commits would be replayed, required |
+
+The trial replays the commits that `head` reaches and `base` does not,
+oldest first, on top of `base`, in the repository's object store alone: no
+work tree, no index and no ref is used or changed (it may leave objects no
+ref reaches, which git's garbage collection removes). It stops at the first
+commit that does not apply. It needs git 2.40 or later on the hub's `PATH`.
+
+The answer:
+
+| Member | Value |
+|---|---|
+| `base_sha`, `head_sha` | the full ids `base` and `head` resolved to |
+| `merge_base_sha` | the full id of their merge base; `null` when they share no ancestor |
+| `ahead` | the number of commits `head` reaches and `base` does not |
+| `behind` | the number of commits `base` reaches and `head` does not |
+| `commits` | the first 200 of the commits `head` reaches and `base` does not, oldest first, each a commit object (see [Source control reads](#source-control-reads)) without `stats` |
+| `files` | the first 5,000 file changes, in byte order of path, from the merge base (the empty tree when there is none) to `head`, without `patch` |
+| `mergeable` | `clean` when every commit applies, `conflict` when one does not |
+| `conflict` | `null` when `clean`; otherwise the conflict report |
+
+A `head` that `base` contains answers `ahead` `0`, `commits` `[]`, `files`
+`[]` and `clean`.
+
+The conflict report has every member, whichever is empty:
+
+| Member | Value |
+|---|---|
+| `target_sha` | the commit the head was rebased onto: `base_sha` |
+| `head_sha` | `head_sha` |
+| `base_sha` | the merge base: `merge_base_sha` |
+| `commit_sha` | the first commit of `head` that did not apply |
+| `files` | the conflicted files, in byte order of path: `{"path": …, "kind": …, "base": …, "ours": …, "theirs": …, "landed_by": []}` |
+| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` until the hub records which change landed which commit |
+| `change` | the change whose head was rebased; always `null` for the same reason |
+
+In a conflicted file, `base`, `ours` and `theirs` are the file on each side
+of the three-way merge that failed, `{"sha": …, "mode": …, "path": …}` (the
+blob id, git's six-digit octal mode and the path on that side, which a rename
+makes differ), or `null` on a side the file does not exist on: `base` the
+failed commit's parent, `ours` the target with the commits of `head` before
+the failed one replayed on it, `theirs` the failed commit. `kind` is
+`content` when both sides changed the same lines, `add_add` when both added
+the path, `modify_delete` when the target changed a file the head deleted,
+`delete_modify` for the reverse, and `rename`, `mode` (a file on one side, a
+symlink or another type on the other), `binary` or `submodule` where git
+names the conflict so. `landed_by` lists the landed changes that changed the
+file; always `[]` for now.
+
+| Status | When |
+|---|---|
+| `200 OK` | the comparison, `clean` or `conflict` |
+| `400` `invalid_request` | no `base` or no `head` (`base and head are required`) |
+| `400` `merge_commits_unsupported` | a merge commit is among the commits of `head` not in `base` (`the commits of head that are not in base include a merge commit, which a rebase cannot replay`), refused before anything is replayed |
+| `404` `ref_not_found` | `base` or `head` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"base_sha":"25f1fc8af806873de70bc5fcbc519d5252016e97","head_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","merge_base_sha":"a0ad1d035cc9cc15942e85b7855fab58d6d91173","ahead":2,"behind":1,"commits":[{"sha":"6df6be0f167d2a962d6b959a9adb8d07e5f8db0f","parents":["a0ad1d035cc9cc15942e85b7855fab58d6d91173"],"tree_sha":"fb9593de39c7271ab6cb836f1c86b5ce9d019732","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"e1","change":null,"session_id":null},{"sha":"6f061333631277a4de8c1b1608151c23149a7d0d","parents":["6df6be0f167d2a962d6b959a9adb8d07e5f8db0f"],"tree_sha":"401eeb772a93302aaa5152c4fdae59a78fd09088","author":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"committer":{"name":"T","email":"t@example.invalid","time":"2023-11-14T22:13:20Z"},"message":"e2","change":null,"session_id":null}],"files":[{"path":"e.txt","old_path":null,"status":"added","insertions":1,"deletions":0,"binary":false,"old_sha":null,"new_sha":"d905d9da82c97264ab6f4920e20242e088850ce9"},{"path":"f.txt","old_path":null,"status":"modified","insertions":1,"deletions":1,"binary":false,"old_sha":"df967b96a579e45a18b8251732d16804b2e56a55","new_sha":"564b12f45becba5fb2f70e270af067c1f13b3aab"}],"mergeable":"conflict","conflict":{"target_sha":"25f1fc8af806873de70bc5fcbc519d5252016e97","head_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","base_sha":"a0ad1d035cc9cc15942e85b7855fab58d6d91173","commit_sha":"6f061333631277a4de8c1b1608151c23149a7d0d","files":[{"path":"f.txt","kind":"content","base":{"sha":"df967b96a579e45a18b8251732d16804b2e56a55","mode":"100644","path":"f.txt"},"ours":{"sha":"ba2906d0666cf726c7eaadd2cd3db615dedfdf3a","mode":"100644","path":"f.txt"},"theirs":{"sha":"564b12f45becba5fb2f70e270af067c1f13b3aab","mode":"100644","path":"f.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}
 ```
 
 ## Admin routes

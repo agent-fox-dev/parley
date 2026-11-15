@@ -167,3 +167,31 @@ func TestCommitStats_CountsEachCommitAgainstItsFirstParent(t *testing.T) {
 		}
 	}
 }
+
+func TestCommitsBetween_ListsAndCountsTheCommitsOnlyOneSideHas(t *testing.T) {
+	t.Parallel()
+	f := newCompareFixture(t)
+	ctx := context.Background()
+	long := strings.Fields(gitrepotest.Git(t, f.dir, "rev-list", "--reverse", "main~1..long"))
+	for _, c := range []struct {
+		base, head    string
+		limit         int
+		ahead, behind int
+		want          []string
+	}{
+		{"main", "feature", 0, 2, 1, []string{f.id(t, "feature~1"), f.id(t, "feature")}},
+		{"main", "feature", 1, 2, 1, []string{f.id(t, "feature~1")}},
+		{"main", "main~1", 0, 0, 1, nil},
+		{"main", "long", 200, gitrepotest.LongCommits, 1, long[:200]},
+		{"feature", "main", 0, 1, 2, []string{f.id(t, "main")}},
+	} {
+		ahead, behind, err := f.repo.AheadBehind(ctx, f.id(t, c.base), f.id(t, c.head))
+		if err != nil || ahead != c.ahead || behind != c.behind {
+			t.Errorf("AheadBehind(%s, %s) = %d, %d, %v; want %d, %d", c.base, c.head, ahead, behind, err, c.ahead, c.behind)
+		}
+		got, err := f.repo.CommitsBetween(ctx, f.id(t, c.base), f.id(t, c.head), c.limit)
+		if err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("CommitsBetween(%s, %s, %d) = %v, %v; want %v", c.base, c.head, c.limit, got, err, c.want)
+		}
+	}
+}

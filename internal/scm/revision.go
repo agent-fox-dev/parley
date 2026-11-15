@@ -39,6 +39,17 @@ type Repository interface {
 	// MergeBase is the newest common ancestor of the commits of two full
 	// ids, "" when they have none.
 	MergeBase(ctx context.Context, a, b string) (string, error)
+	// AheadBehind counts the commits only head reaches (ahead) and only
+	// base reaches (behind), of two full ids.
+	AheadBehind(ctx context.Context, base, head string) (ahead, behind int, err error)
+	// CommitsBetween lists the commits head reaches and base does not, of
+	// two full ids, oldest first; with limit above 0, the first limit.
+	CommitsBetween(ctx context.Context, base, head string, limit int) ([]string, error)
+	// TrialRebase replays the commits of head not in onto on top of onto,
+	// two full ids, changing no ref, and reports the first that does not
+	// apply, nil when all do; a merge commit among them is
+	// gitrepo.ErrMergeCommit.
+	TrialRebase(ctx context.Context, onto, head string) (*gitrepo.ConflictReport, error)
 	// ReadTree reads the directory path, "" for the root, of the commit of
 	// a full id, with recursive every entry below it.
 	ReadTree(ctx context.Context, commit, path string, recursive bool) (gitrepo.Tree, error)

@@ -205,7 +205,7 @@ func TestDiff_RefusesAMalformedParameter(t *testing.T) {
 		"/diff?head=main", "/diff?base=main", "/diff?base=main&head=feature/x&mode=three_dot",
 		"/diff?base=main&head=feature/x&format=html", "/diff?base=main&head=feature/x&context=21",
 		"/diff?base=main&head=feature/x&context=-1", "/diff?base=main&head=feature/x&context=x",
-		"/diff?base=main&head=feature/x&patches=no",
+		"/diff?base=main&head=feature/x&patches=no", "/compare?base=main", "/compare?head=main",
 	} {
 		if r := w.get(t, scmPath("demo", path), w.ownerKey); r.status != http.StatusBadRequest || r.errorType() != "invalid_request" {
 			t.Errorf("GET %s = %d %s, want 400 invalid_request", path, r.status, r.body)
