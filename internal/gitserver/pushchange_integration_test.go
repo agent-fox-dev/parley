@@ -159,6 +159,7 @@ func TestPushChange_RefusesInvalidOptionsBeforeThePack(t *testing.T) {
 	}{
 		{"an unknown parley option", []string{"-o", "parley.titel=x"}, "invalid push option parley.titel: unknown option"},
 		{"too many options", many, "too many push options: at most 16 are accepted"},
+		{"an option name longer than a pkt-line", []string{"-o", strings.Repeat("a", 65500)}, "invalid push option " + strings.Repeat("a", 1024) + "...: longer than 1024 bytes"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			trace := filepath.Join(t.TempDir(), "trace")
