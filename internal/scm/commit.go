@@ -433,7 +433,7 @@ func (o fileOperation) operation() (gitrepo.Operation, error) {
 	}
 	for _, p := range paths {
 		if !gitrepo.ValidPath(p) {
-			return op, fmt.Errorf("path %q is missing, absolute, or has an empty, ., .. or .git segment", p)
+			return op, fmt.Errorf("path %q is missing, absolute, or has an empty, ., .. or .git segment (in any form a file system reads as .git)", p)
 		}
 	}
 	return op, nil
