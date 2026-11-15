@@ -59,6 +59,15 @@ func (r *Repo) SetRef(ctx context.Context, ref, id string) error {
 	return err
 }
 
+// DeleteRef removes ref, a full ref name, whatever it points at: for a
+// ref only the hub writes, such as a change's version ref, which a write
+// that was then refused must not leave behind. A ref that does not exist
+// is no error.
+func (r *Repo) DeleteRef(ctx context.Context, ref string) error {
+	_, err := r.git(ctx, "update-ref", "--no-deref", "-d", ref)
+	return err
+}
+
 // SetRefFrom is SetRef for a commit that may be missing from the
 // repository and that the repository at the git directory src holds, as a
 // fork holds its own commits apart from its parent: the commit and what it

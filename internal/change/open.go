@@ -79,11 +79,14 @@ type OpenInput struct {
 // a fork source, and writes parley.change.version and, unless the change is
 // a draft, parley.change.open. It returns the change as stored then.
 //
-// The version ref is written before Open returns, since a ref cannot join a
-// transaction: one left by a transaction that rolls back names no stored
+// The version ref is written before the collaborators run, which may read
+// the head from the target's repository, and before Open returns, since a
+// ref cannot join a transaction. When a later step fails, Open removes the
+// ref again, so that a refused open leaves none; one left by a
+// transaction the caller rolls back after Open succeeded names no stored
 // version and is overwritten when that number is next recorded. An error a
 // collaborator returns is returned unchanged.
-func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (Change, error) {
+func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (_ Change, err error) {
 	co := c.collaborators()
 	o, err := c.check(ctx, tx, co, in)
 	if err != nil {
@@ -124,6 +127,7 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (Change,
 	if err := o.writeVersionRef(ctx, number, 1); err != nil {
 		return Change{}, err
 	}
+	defer func() { c.dropVersionRef(ctx, o.targetRepo, o.target.Slug, number, 1, err) }()
 	if o.session != nil && co.sessions != nil {
 		if err := co.sessions.Record(ctx, tx, *o.session, ch.WorkspaceSlug, number, 1); err != nil {
 			return Change{}, err
@@ -300,98 +304,28 @@ func validate(in OpenInput) error {
 // commits in order, fills in the defaults and checks the title and the
 // intent, into o.
 func (c *Component) resolve(ctx context.Context, q Querier, co collaborators, in OpenInput, o *opening) error {
-	target, found, err := c.deps.Workspaces.Workspace(ctx, q, in.Workspace)
+	related, err := c.readWorkspaces(ctx, q, in, o)
 	if err != nil {
 		return err
 	}
-	if !found {
-		return server.NotFound(fmt.Sprintf("no workspace %q", in.Workspace))
-	}
-	o.target, o.source = target, target
-	related := true
-	if in.SourceWorkspace != "" && in.SourceWorkspace != in.Workspace {
-		source, found, err := c.deps.Workspaces.Workspace(ctx, q, in.SourceWorkspace)
-		if err != nil {
-			return err
-		}
-		o.source = source
-		related = found && source.Fork && source.Parent == target.Slug
-		if !found {
-			o.source = Workspace{Slug: in.SourceWorkspace}
-		}
-	}
-	if target.Unusable != nil {
-		return target.Unusable
-	}
-	if o.source.Unusable != nil {
-		return o.source.Unusable
-	}
-	o.targetBranch = target.DefaultBranch
-	if o.source.Fork && related {
-		o.targetBranch = o.source.DefaultBranch
-	}
-	if in.TargetBranch != nil {
-		o.targetBranch = *in.TargetBranch
-	}
-	if o.targetRepo, err = c.deps.Repos(ctx, target.Slug); err != nil {
-		return err
-	}
-	targetHead, found, err := o.targetRepo.ResolveBranch(ctx, o.targetBranch)
+	targetHead, err := c.targetBranch(ctx, in, o, related)
 	if err != nil {
 		return err
-	}
-	if !found {
-		return server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", o.targetBranch, target.Slug))
-	}
-	if target.CarryPatch && o.targetBranch == target.IntegrationBranch {
-		return server.NewError("integration_branch", http.StatusForbidden,
-			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", o.targetBranch, target.Slug))
 	}
 	if !related {
-		return sourceNotRelated(in.SourceWorkspace, target.Slug)
+		return sourceNotRelated(in.SourceWorkspace, o.target.Slug)
 	}
 	if in.SessionID == nil {
 		if o.session, err = c.session(ctx, co, in, o.source); err != nil {
 			return err
 		}
 	}
-	o.sourceRepo = o.targetRepo
-	if o.source.Slug != target.Slug {
-		if o.sourceRepo, err = c.deps.Repos(ctx, o.source.Slug); err != nil {
-			return err
-		}
-	}
-	if o.head = in.Head; o.head == "" {
-		if o.head, found, err = o.sourceRepo.ResolveBranch(ctx, in.SourceBranch); err != nil {
-			return err
-		}
-		if !found {
-			return server.NewError("source_not_found", http.StatusBadRequest, fmt.Sprintf("source.branch: no branch %q in %s", in.SourceBranch, o.source.Slug))
-		}
-	}
-	if o.source.Slug == target.Slug && in.SourceBranch == o.targetBranch {
-		return server.InvalidRequest(fmt.Sprintf("source.branch: %s is the target branch itself", in.SourceBranch))
-	}
-	// A fork's repository reads its parent's objects, so the commits are
-	// read and the version measured where its head is, before the head is
-	// brought into the target's repository.
-	ahead, err := o.sourceRepo.CommitsBetween(ctx, targetHead, o.head, 0)
-	if err != nil {
+	if err := c.sourceHead(ctx, in, o); err != nil {
 		return err
 	}
-	if len(ahead) == 0 {
-		return server.NewError("nothing_to_land", http.StatusBadRequest,
-			fmt.Sprintf("source.branch: %s has no commit that %s lacks", in.SourceBranch, o.targetBranch))
-	}
-	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)
+	ahead, err := o.commitsAhead(ctx, in, targetHead)
 	if err != nil {
 		return err
-	}
-	for _, cm := range commits {
-		if len(cm.Parents) > 1 {
-			return server.NewError("merge_commits_unsupported", http.StatusBadRequest,
-				fmt.Sprintf("source.branch: the merge commit %s is among the commits to land; rebase instead", cm.ID))
-		}
 	}
 	if _, _, found, err := activeOfSource(ctx, q, o.source.Slug, in.SourceBranch); err != nil || found {
 		if err != nil {
@@ -399,7 +333,7 @@ func (c *Component) resolve(ctx context.Context, q Querier, co collaborators, in
 		}
 		return c.changeExists(ctx, q, o.source.Slug, in.SourceBranch)
 	}
-	if err := o.measure(ctx, targetHead, len(ahead)); err != nil {
+	if err := o.measure(ctx, targetHead, ahead); err != nil {
 		return err
 	}
 	if err := o.describe(ctx, in); err != nil {
@@ -412,6 +346,126 @@ func (c *Component) resolve(ctx context.Context, q Querier, co collaborators, in
 		}
 	}
 	return nil
+}
+
+// readWorkspaces reads the target and the source workspace of the open in into
+// o and checks that both are usable, before whether the source is related:
+// related is false for a source workspace that does not exist or is
+// neither the target nor a fork of it.
+func (c *Component) readWorkspaces(ctx context.Context, q Querier, in OpenInput, o *opening) (related bool, err error) {
+	target, found, err := c.deps.Workspaces.Workspace(ctx, q, in.Workspace)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, server.NotFound(fmt.Sprintf("no workspace %q", in.Workspace))
+	}
+	o.target, o.source = target, target
+	related = true
+	if in.SourceWorkspace != "" && in.SourceWorkspace != in.Workspace {
+		source, found, err := c.deps.Workspaces.Workspace(ctx, q, in.SourceWorkspace)
+		if err != nil {
+			return false, err
+		}
+		o.source = source
+		related = found && source.Fork && source.Parent == target.Slug
+		if !found {
+			o.source = Workspace{Slug: in.SourceWorkspace}
+		}
+	}
+	if target.Unusable != nil {
+		return false, target.Unusable
+	}
+	if o.source.Unusable != nil {
+		return false, o.source.Unusable
+	}
+	return related, nil
+}
+
+// targetBranch fills in the target branch of the open in, the one named or
+// the default, the base branch of a fork source related to the target or
+// the target workspace's default branch, opens the target's repository and returns the
+// branch's head; a branch the repository does not have, or the integration
+// branch of a carry-patch workspace, is refused.
+func (c *Component) targetBranch(ctx context.Context, in OpenInput, o *opening, related bool) (string, error) {
+	target := o.target
+	o.targetBranch = target.DefaultBranch
+	if o.source.Fork && related {
+		o.targetBranch = o.source.DefaultBranch
+	}
+	if in.TargetBranch != nil {
+		o.targetBranch = *in.TargetBranch
+	}
+	var err error
+	if o.targetRepo, err = c.deps.Repos(ctx, target.Slug); err != nil {
+		return "", err
+	}
+	head, found, err := o.targetRepo.ResolveBranch(ctx, o.targetBranch)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", server.NewError("target_not_found", http.StatusBadRequest, fmt.Sprintf("target_branch: no branch %q in %s", o.targetBranch, target.Slug))
+	}
+	if target.CarryPatch && o.targetBranch == target.IntegrationBranch {
+		return "", server.NewError("integration_branch", http.StatusForbidden,
+			fmt.Sprintf("target_branch: %s is the integration branch of %s, which the hub rebuilds; target a patch branch", o.targetBranch, target.Slug))
+	}
+	return head, nil
+}
+
+// sourceHead opens the source's repository and fills in the head of the
+// open in: the one the trigger named, or the source branch's, which must
+// exist and must not be the target branch itself.
+func (c *Component) sourceHead(ctx context.Context, in OpenInput, o *opening) error {
+	o.sourceRepo = o.targetRepo
+	var err error
+	if o.source.Slug != o.target.Slug {
+		if o.sourceRepo, err = c.deps.Repos(ctx, o.source.Slug); err != nil {
+			return err
+		}
+	}
+	if o.head = in.Head; o.head == "" {
+		var found bool
+		if o.head, found, err = o.sourceRepo.ResolveBranch(ctx, in.SourceBranch); err != nil {
+			return err
+		}
+		if !found {
+			return server.NewError("source_not_found", http.StatusBadRequest, fmt.Sprintf("source.branch: no branch %q in %s", in.SourceBranch, o.source.Slug))
+		}
+	}
+	if o.source.Slug == o.target.Slug && in.SourceBranch == o.targetBranch {
+		return server.InvalidRequest(fmt.Sprintf("source.branch: %s is the target branch itself", in.SourceBranch))
+	}
+	return nil
+}
+
+// commitsAhead counts the commits of the head that the target branch, at
+// targetHead, lacks; there must be at least one and none may be a merge
+// commit.
+func (o *opening) commitsAhead(ctx context.Context, in OpenInput, targetHead string) (int, error) {
+	// A fork's repository reads its parent's objects, so the commits are
+	// read and the version measured where its head is, before the head is
+	// brought into the target's repository.
+	ahead, err := o.sourceRepo.CommitsBetween(ctx, targetHead, o.head, 0)
+	if err != nil {
+		return 0, err
+	}
+	if len(ahead) == 0 {
+		return 0, server.NewError("nothing_to_land", http.StatusBadRequest,
+			fmt.Sprintf("source.branch: %s has no commit that %s lacks", in.SourceBranch, o.targetBranch))
+	}
+	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)
+	if err != nil {
+		return 0, err
+	}
+	for _, cm := range commits {
+		if len(cm.Parents) > 1 {
+			return 0, server.NewError("merge_commits_unsupported", http.StatusBadRequest,
+				fmt.Sprintf("source.branch: the merge commit %s is among the commits to land; rebase instead", cm.ID))
+		}
+	}
+	return len(ahead), nil
 }
 
 // measure computes the version's base, stats, touched paths and patch id
@@ -440,7 +494,8 @@ func (o *opening) measureFromBase(ctx context.Context, ahead int) error {
 	if o.truncated {
 		o.paths = o.files[:MaxPaths]
 	}
-	o.patchID, err = repo.PatchID(ctx, o.base, o.head)
+	files, err := keyed(ctx, repo, o.base, o.head, changes)
+	o.patchID = patchID(files)
 	return err
 }
 
@@ -554,6 +609,23 @@ func (o *opening) writeVersionRef(ctx context.Context, number, version int64) er
 		return o.targetRepo.SetRef(ctx, ref, o.head)
 	}
 	return o.targetRepo.SetRefFrom(ctx, o.sourceRepo.Dir(), ref, o.head)
+}
+
+// dropVersionRef removes from repo, the target's repository, the ref of
+// the version of the change number of the workspace, which the open or the
+// version that failed with err wrote, so that a
+// refusal leaves no ref at a head never recorded, which a fork would copy
+// with the change's other refs. It does nothing when err is nil; a removal
+// that fails is logged.
+func (c *Component) dropVersionRef(ctx context.Context, repo *gitrepo.Repo, workspace string, number, version int64, err error) {
+	if err == nil {
+		return
+	}
+	ref := VersionRef(number, version)
+	// The request may have ended, which is often why the step failed.
+	if derr := repo.DeleteRef(context.WithoutCancel(ctx), ref); derr != nil {
+		c.deps.Logger.Warn("the version ref of a refused version was not removed", "workspace", workspace, "ref", ref, "error", derr)
+	}
 }
 
 // actorOf is the actor the caller is, with the user's name read in tx when

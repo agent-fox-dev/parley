@@ -2,14 +2,17 @@ package change_test
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -201,4 +204,56 @@ func TestChangeLinker_ChecksAndOpensTheChangeACommitAsksFor(t *testing.T) {
 			t.Errorf("DELETE refs/topic = %d %v, want 409 ref_in_use", status, out)
 		}
 	})
+}
+
+// Each update moves feat, the source of change 1, to h2; only the last
+// row is one the stage records a version for.
+func TestRefUpdated_RecordsAVersionOnlyForAnAllowedMoveOfABranchThatNamesAKind(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	h1 := w.branch(t, "feat", "Feat\n\nWhy.\n")
+	w.openBranch(t, "feat", nil)
+	h2 := commit(t, w.demo, "feat", h1, "Two\n", map[string]string{"two.txt": "2\n"})
+	caller := pushrule.Caller{Level: access.LevelOwner, CredentialType: change.CredentialAPIKey, CredentialID: "k1", UserID: w.owner}
+	move := func(ref string, direct, allowed bool) []pushrule.Decision {
+		return []pushrule.Decision{{Update: pushrule.Update{Ref: ref, Before: h1, After: h2}, Allowed: allowed, Direct: direct}}
+	}
+	for _, c := range []struct {
+		name, via, kind string
+		updates         []pushrule.Decision
+		want            *pushrule.Version
+	}{
+		{"a direct push", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", true, true), nil},
+		{"a refused update", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", false, false), nil},
+		{"a land", pushrule.ViaLand, pushrule.VersionKindNone, move("refs/heads/feat", false, true), nil},
+		{"a write that names no kind", pushrule.ViaAPI, pushrule.VersionKindNone, move("refs/heads/feat", false, true), nil},
+		{"a tag", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/tags/feat", false, true), nil},
+		{"a push of the source", pushrule.ViaGit, pushrule.VersionKindPush, move("refs/heads/feat", false, true),
+			&pushrule.Version{WorkspaceSlug: "demo", Number: 1, Version: 2}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var out []*pushrule.Version
+			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+				var err error
+				out, err = w.changes.RefUpdated(ctx, tx, pushrule.StageInput{Workspace: pushrule.Workspace{Slug: "demo", Kind: access.KindRepository},
+					Caller: caller, Via: c.via, VersionKind: c.kind, Updates: c.updates})
+				return err
+			})
+			// A land is answered before any update is looked at.
+			var want []*pushrule.Version
+			if c.via != pushrule.ViaLand {
+				want = []*pushrule.Version{c.want}
+			}
+			if !reflect.DeepEqual(out, want) {
+				t.Errorf("RefUpdated = %v, want %v", out, want)
+			}
+			wantVersion := int64(1)
+			if c.want != nil {
+				wantVersion = 2
+			}
+			if ch := w.read(t, 1); ch.Version != wantVersion {
+				t.Errorf("change 1 is at version %d, want %d", ch.Version, wantVersion)
+			}
+		})
+	}
 }

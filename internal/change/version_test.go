@@ -196,6 +196,8 @@ func TestRecordVersion_NamesTheLatestPatchEquivalentVersion(t *testing.T) {
 		{"an amended content", "", m1, "y\n", nil},
 		{"the amended content rebased", m2, m2, "y\n", new(int64(3))},
 		{"the first content again", "", m2, "x\n", new(int64(2))},
+		{"words apart", "", m2, "x y\n", nil},
+		{"the words together", "", m2, "xy\n", nil},
 	} {
 		if c.main != "" {
 			gitrepotest.Git(t, w.demo, "update-ref", "refs/heads/main", c.main)
@@ -209,6 +211,11 @@ func TestRecordVersion_NamesTheLatestPatchEquivalentVersion(t *testing.T) {
 		if got := w.versions(t, "demo", 1)[v.Number-1]["patch_equivalent_to"]; !reflect.DeepEqual(v.PatchEquivalentTo, c.want) || got != want {
 			t.Errorf("%s: version %d is patch-equivalent to %v (stored %v), want %v", c.name, v.Number, v.PatchEquivalentTo, got, want)
 		}
+	}
+	// The interdiff of two versions apart only by white space shows it.
+	status, got, _ := w.get(t, "/workspaces/demo/changes/1/diff?version=7&against=6", w.ownerKey)
+	if f := filesByPath(got)["x.txt"]; status != http.StatusOK || f["changed"] != true {
+		t.Errorf("GET diff?version=7&against=6 = %d %v, want x.txt changed", status, got)
 	}
 }
 
@@ -348,6 +355,19 @@ func TestRecordVersion_RunsTheCollaboratorsInOrderAndWritesTheVersionEvent(t *te
 		}
 		if events := w.eventsAfter(t, seq); len(events) != 0 {
 			t.Errorf("events = %+v, want none", events)
+		}
+	})
+	t.Run("an observer fails", func(t *testing.T) {
+		w.changes.AddVersionObserver(&observer{err: errors.New("observer down")})
+		before := w.read(t, 1)
+		head := commit(t, w.demo, "feat", "feat", "Observed\n", map[string]string{"o.txt": "o\n"})
+		if v, err := w.record(t, change.VersionInput{Workspace: "demo", Branch: "feat", Head: head, Kind: change.KindPush,
+			Caller: w.ownerCaller()}); v != nil || err == nil {
+			t.Errorf("RecordVersion = %+v, %v; want the observer's error", v, err)
+		}
+		ref := change.VersionRef(1, before.Version+1)
+		if got, found := gitrepotest.Refs(t, w.demo, "")[ref]; found {
+			t.Errorf("%s = %s, want no ref for a version never recorded", ref, got)
 		}
 	})
 }

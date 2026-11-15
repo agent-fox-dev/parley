@@ -3583,7 +3583,7 @@ The change object:
 | Member | Meaning |
 |---|---|
 | `state` | `draft`, `open`, `landed` or `abandoned` |
-| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch |
+| `version`, `head_sha`, `base_sha` | the current version, its head and its base: the merge base of the head and the target branch; while the target branch does not exist, the previous version's base; the empty string when the head shares no history with the target branch |
 | `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
@@ -3599,7 +3599,8 @@ Arrays are never `null`; times are RFC 3339 in UTC with whole seconds.
 
 A version has `number`, `head_sha`, `base_sha`, `kind` (`push`, `commit`,
 `ref`, `rebase`, `restack`, `revert`, `sync`), `patch_equivalent_to` (the
-latest earlier version whose diff against its own base is the same, `null`
+latest earlier version whose diff against its own base is the same, file by
+file, as the interdiff below compares them, white space included, `null`
 for none), `created_by` (an author object), `session_id`, `stats` and
 `created_at`. A version recorded for a head that was already on the source
 branch, such as version 1 of a change opened through the route below, has
@@ -3787,10 +3788,16 @@ With `against`, a file is listed when either version touches it against
 its own base, and carries `changed`: `true` when its patch (base to head,
 compared without the `index` line and the hunks' positions) differs
 between the two versions or only one of them touches it, else `false`.
-A changed file is described, with its `patch`, by the diff of its content
-at the head of `against` to its content at the head of `version`; a
-changed file whose content is the same at both heads (the bases differ) is
-`modified` with no line changed and an empty `patch`. An unchanged file
+A changed file is described, with its `patch`, by the diff of the head of
+`against` to the head of `version`, with rename detection: `added` when
+it is only at the head of `version`, `deleted` when it is only at the
+head of `against`, else `modified`. When that diff finds a rename that
+involves a changed file, the rename's one entry (`renamed`, with
+`old_path`) describes both of its paths: it is listed at its new path when
+that is a changed file, else at its old one, and the old path has no entry
+of its own. A changed file whose content is the same at both heads (the
+bases differ) is `modified` with no line changed, `old_sha` and `new_sha`
+both its blob at the heads, and an empty `patch`. An unchanged file
 has no `patch` and is described by the version's own diff (`against`'s
 when only that touches it). `base_sha` is the head of `against`,
 `head_sha` the head of `version`, `merge_base_sha` `null`, `version` and

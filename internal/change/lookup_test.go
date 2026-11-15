@@ -233,7 +233,7 @@ func TestSetters_StoreWhatOtherComponentsCompute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		patchID, err := repo.PatchID(ctx, b1, b2)
+		patchID, err := change.PatchID(ctx, repo, b1, b2)
 		if err != nil {
 			t.Fatal(err)
 		}

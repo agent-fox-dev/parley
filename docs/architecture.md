@@ -3503,9 +3503,11 @@ must accept; else the trigger's, then the source fork's, dropped when
 refused), resolves the target and source branches, and measures the
 version in the source workspace's repository, which for a fork borrows the
 parent's objects: the merge base with the target branch, the file changes
-and stats, the touched paths and `gitrepo.(*Repo).PatchID` (`git patch-id
---stable` over the base-to-head diff, `gitrepo.EmptyPatchID` for an empty
-one). It then takes the next number, inserts the change and version 1,
+and stats, the touched paths and the patch id (`patchID` in `diff.go`: a
+SHA-256 over the path and the patch key of each file of the base-to-head
+diff, in path order, the keys the interdiff compares, so that two versions
+have the same patch id exactly when their interdiff changes no file;
+`empty` for a diff that changes nothing). It then takes the next number, inserts the change and version 1,
 writes `refs/parley/changes/<number>/1` in the target's repository
 (`SetRef`, or `SetRefFrom`, which pushes a fork's commit into the parent
 first), records the session link, asks the `AutoLandGuard` and stores
@@ -3514,9 +3516,13 @@ the `LandingEvaluator` (not for a draft) whose answer it stores, and the
 `VersionObserver`s, each with the change re-read in the transaction, tells
 the `ForkActivity` recorder of a fork source (an error is logged), and
 emits `parley.change.version` and, unless draft, `parley.change.open`. The
-version ref is written before `Open` returns, since a git ref cannot join
-the transaction; a ref left by a rolled-back transaction names no stored
-version and is overwritten when the number is next recorded.
+version ref is written before the collaborators run, which may read the
+head from the target's repository, and before `Open` returns, since a git
+ref cannot join the transaction. When a step after it fails, `Open`
+removes the ref again (`gitrepo.(*Repo).DeleteRef`; a failed removal is
+logged), so a refused open leaves no ref; a ref left by a transaction the
+caller rolls back after `Open` succeeded names no stored version and is
+overwritten when the number is next recorded.
 
 `(*change.Component).RecordVersion(ctx, tx, change.VersionInput{Workspace,
 Branch, Head, Kind, Caller, SessionID})` (`version.go`) records a move of a
@@ -3533,7 +3539,8 @@ exist, the stats, the touched paths and the patch id, and sets
 `patch_equivalent_to` to the latest earlier version with the same patch id.
 It inserts the version with the creating credential (`Caller.Credential`;
 the zero `Caller` is the hub, actor type `system`, no credential), writes
-`refs/parley/changes/<number>/<version>` as `Open` does, records the
+`refs/parley/changes/<number>/<version>` as `Open` does (and removes it
+again when a later step fails), records the
 session link, makes it the change's current version (head, base, patch id,
 stats, paths, `session_id`, `mergeable` `unknown`, `updated_at`), then runs
 the stack linker, the landing derivation and the observers as at open, and
@@ -3737,11 +3744,17 @@ and patches (`DiffChanges`, `DiffPatches` against its base) and compares
 the patches of each path after dropping the `index` line and the hunk
 headers' positions (a binary file, or a patch over `MaxPatchBytes`, by its
 blob ids); a path either version touches is listed, changed when the two
-differ or only one touches it. The changed files' patches come from
-`ComputeDiff` of the two heads with `Keep` limited to the changed paths; a
-changed path absent from that diff (the same content at both heads) is
-answered `modified` with an empty patch and counted in `stats`, and an
-unchanged one with the file change of its own diff and no patch.
+differ or only one touches it. The patch id stored for each version is a
+hash of the same keys, so patch equivalence and the interdiff agree. The
+changed files come from `ComputeDiff` of the two heads with `Keep`
+(which is given the whole `gitrepo.FileChange`) accepting an entry whose
+path is a listed changed path, or a rename whose old path is one; a
+rename's entry is listed at its new path when that is a changed path,
+else at its old path, which then has no entry of its own. A changed path
+the heads' diff does not name (the same content at both heads) is
+answered `modified` with an empty patch and counted in `stats`, unless
+that diff cut its list of files, and an unchanged one with the file change
+of its own diff and no patch.
 
 ### Hub events
 

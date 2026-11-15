@@ -46,11 +46,13 @@ type VersionInput struct {
 // target_not_found, nothing_to_land and merge_commits without asking the
 // landing evaluator. The change keeps its state.
 //
-// As with Open, the version ref is written before RecordVersion returns: a
-// ref left by a transaction that rolls back names no stored version and is
-// overwritten when that number is next recorded. An error a collaborator
-// returns is returned unchanged.
-func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInput) (*Version, error) {
+// As with Open, the version ref is written before the collaborators run
+// and before RecordVersion returns, and removed again when a later step
+// fails; a ref left by a transaction the caller rolls back after
+// RecordVersion succeeded names no stored version and is overwritten when
+// that number is next recorded. An error a collaborator returns is
+// returned unchanged.
+func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInput) (_ *Version, err error) {
 	workspace, number, found, err := activeOfSource(ctx, tx, in.Workspace, in.Branch)
 	if err != nil || !found {
 		return nil, err
@@ -89,6 +91,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	if err := o.writeVersionRef(ctx, number, v.Number); err != nil {
 		return nil, err
 	}
+	defer func() { c.dropVersionRef(ctx, o.targetRepo, workspace, number, v.Number, err) }()
 	if session != nil {
 		if err := co.sessions.Record(ctx, tx, *session, workspace, number, v.Number); err != nil {
 			return nil, err

@@ -41,7 +41,7 @@ func newChangeCommand() *cobra.Command {
 				{name: "label", param: "label", usage: "only the changes with this label"},
 				{name: "path", param: "path", usage: "only the changes that touch a path matching this glob"},
 				{name: "mergeable", param: "mergeable", usage: "only the changes whose mergeable is this: clean, conflict or unknown"},
-				{name: "landing-status", param: "landing_status", usage: "only the changes whose landing status is this: ready or blocked"},
+				{name: "landing-status", param: "landing_status", usage: "only the changes whose landing status is this: ready, pending or blocked"},
 				{name: "stack-of", param: "stack_of", usage: "the stack of the change with this number, bottom first, in every state"},
 				limitFlag, cursorFlag,
 			},

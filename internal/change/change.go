@@ -330,7 +330,8 @@ type Version struct {
 	// Credential is the credential that created the version, none for a
 	// version the hub created.
 	Credential Credential `json:"-"`
-	// PatchID is the stable patch id of the version against its base.
+	// PatchID is the patch id of the version against its base, the same
+	// for two versions exactly when their interdiff changes no file.
 	PatchID string `json:"-"`
 }
 

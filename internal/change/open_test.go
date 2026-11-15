@@ -387,6 +387,12 @@ func TestOpen_LeavesNothingWhenACollaboratorFailsOrTheCallerRollsBack(t *testing
 			t.Errorf("ReadChange(demo, 1) = %v, want the change-not-found error", err)
 		}
 	}
+	noRefs := func(t *testing.T) {
+		t.Helper()
+		if refs := gitrepotest.Refs(t, w.demo, "refs/parley/changes/"); len(refs) != 0 {
+			t.Errorf("version refs = %v, want none", refs)
+		}
+	}
 
 	t.Run("the stack linker refuses", func(t *testing.T) {
 		w.changes.RegisterStackLinker(&stack{steps: &steps{}, err: server.NewError("invalid_dependency", http.StatusBadRequest, "no change 9")})
@@ -396,6 +402,7 @@ func TestOpen_LeavesNothingWhenACollaboratorFailsOrTheCallerRollsBack(t *testing
 			t.Errorf("POST = %d %v, want 400 invalid_dependency", status, got)
 		}
 		assertNothing(t)
+		noRefs(t)
 	})
 	t.Run("the caller rolls back", func(t *testing.T) {
 		err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
@@ -412,6 +419,7 @@ func TestOpen_LeavesNothingWhenACollaboratorFailsOrTheCallerRollsBack(t *testing
 		if !errors.Is(err, errRollback) {
 			t.Fatalf("the transaction = %v, want the rollback", err)
 		}
+		// The version ref may stay: it names no stored version.
 		assertNothing(t)
 	})
 	t.Run("an observer fails", func(t *testing.T) {
@@ -421,6 +429,7 @@ func TestOpen_LeavesNothingWhenACollaboratorFailsOrTheCallerRollsBack(t *testing
 			t.Errorf("POST = %d %v, want 500 internal", status, got)
 		}
 		assertNothing(t)
+		noRefs(t)
 	})
 }
 
@@ -460,7 +469,7 @@ func TestOpen_AsksTheAutoLandGuardBeforeStoringTheFlag(t *testing.T) {
 	}
 
 	t.Run("the guard refuses", func(t *testing.T) {
-		seq := w.seq(t)
+		before := w.snapshot(t)
 		g.err = server.PathNotAllowed("auto_land: src/x.go is outside the token's paths").With("path", "src/x.go")
 		defer func() { g.err = nil }()
 		status, got := open("refused", true)
@@ -473,11 +482,8 @@ func TestOpen_AsksTheAutoLandGuardBeforeStoringTheFlag(t *testing.T) {
 		if !reflect.DeepEqual(g.calls, want) {
 			t.Errorf("guard calls = %+v, want %+v", g.calls, want)
 		}
-		if got := w.rows(t); !reflect.DeepEqual(got, map[string]int{"changes": 0, "change_versions": 0, "change_sessions": 0}) {
-			t.Errorf("rows = %v, want none", got)
-		}
-		if events := w.eventsAfter(t, seq); len(events) != 0 {
-			t.Errorf("events = %+v, want none", events)
+		if after := w.snapshot(t); !reflect.DeepEqual(after, before) {
+			t.Errorf("a refused open wrote %+v, had %+v", after, before)
 		}
 	})
 	for _, c := range []struct {
@@ -714,7 +720,7 @@ func TestOpen_RefusesAnInvalidBody(t *testing.T) {
 // demo has merged, whose history ahead of main holds a merge commit, and
 // behind, at main's commit; elsewhere is the owner's unrelated workspace,
 // hidden one the owner cannot see, and cp a carry-patch workspace whose
-// integration branch is integration.
+// integration branch is integration and whose release is protected.
 func TestOpen_AnswersTheFirstFailingCheckOfTheSourceAndTarget(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
@@ -726,6 +732,7 @@ func TestOpen_AnswersTheFirstFailingCheckOfTheSourceAndTarget(t *testing.T) {
 	cp := w.addWorkspace(t, "cp")
 	w.set(t, "cp", "workspace_mode", "carry_patch")
 	w.set(t, "cp", "integration_branch", "integration")
+	w.set(t, "cp", "settings", `{"protected_branches":["release"]}`)
 	commit(t, cp, "integration", "refs/heads/main", "Upstream plus patches\n", map[string]string{"i.txt": "i\n"})
 	commit(t, cp, "patch", "refs/heads/main", "Patch\n\nWhy.\n", map[string]string{"p.txt": "p\n"})
 	side := commit(t, w.demo, "side", w.base, "Side\n", map[string]string{"s.txt": "s\n"})
@@ -766,7 +773,7 @@ func TestOpen_AnswersTheFirstFailingCheckOfTheSourceAndTarget(t *testing.T) {
 			w.refused(t, c.slug, w.ownerKey, c.body, c.status, c.errorType)
 		})
 	}
-	t.Run("a patch branch of a carry-patch workspace", func(t *testing.T) {
+	t.Run("a protected patch branch of a carry-patch workspace", func(t *testing.T) {
 		if status, got := w.post(t, "cp", w.ownerKey, body("", "patch", "release")); status != http.StatusCreated {
 			t.Errorf("POST = %d %v, want 201", status, got)
 		}

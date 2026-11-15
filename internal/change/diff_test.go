@@ -210,6 +210,34 @@ func TestDiff_ServesAVersionsDiffAndTheInterdiffOfTwoVersions(t *testing.T) {
 		}
 	})
 
+	// Change 3 edits x.txt; its version 2, on the same base, renames x.txt
+	// to y.txt with the same edit.
+	t.Run("a file renamed between versions", func(t *testing.T) {
+		x := "x1\nx2\nx3\nx4\nx5\n"
+		withX := commit(t, w.demo, "main", "main", "Main x\n", map[string]string{"x.txt": x})
+		commit(t, w.demo, "ren", withX, "Ren\n\nWhy.\n", map[string]string{"x.txt": x + "x6\n"})
+		w.openBranch(t, "ren", nil)
+		ren2 := commit(t, w.demo, "ren", withX, "Ren\n\nWhy.\n", map[string]string{"x.txt": gone, "y.txt": x + "x6\n"})
+		w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "ren", Head: ren2, Kind: change.KindPush, Caller: w.ownerCaller()})
+		for _, c := range []struct{ query, path, oldPath string }{
+			{"?version=2&against=1", "y.txt", "x.txt"},
+			{"?version=1&against=2", "x.txt", "y.txt"},
+		} {
+			status, got, _ := w.get(t, "/workspaces/demo/changes/3/diff"+c.query, w.ownerKey)
+			fs := files(got)
+			if status != http.StatusOK || len(fs) != 1 {
+				t.Errorf("GET changes/3/diff%s = %d %v, want 200 with the one entry of the rename", c.query, status, got)
+				continue
+			}
+			if f := fs[0]; f["path"] != c.path || f["old_path"] != c.oldPath || f["status"] != "renamed" || f["changed"] != true {
+				t.Errorf("GET changes/3/diff%s: %v, want %s renamed from %s, changed", c.query, f, c.path, c.oldPath)
+			}
+			if want := map[string]any{"files_changed": 1.0, "insertions": 0.0, "deletions": 0.0}; !reflect.DeepEqual(got["stats"], want) {
+				t.Errorf("GET changes/3/diff%s: stats = %v, want %v", c.query, got["stats"], want)
+			}
+		}
+	})
+
 	// A reclone: demo's repository again, holding only main.
 	t.Run("commits missing from the repository", func(t *testing.T) {
 		if err := os.RemoveAll(w.demo); err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -125,6 +126,26 @@ func TestSetRef_PointsTheRefAtTheCommitWhateverItHeld(t *testing.T) {
 		if got := gitrepotest.Refs(t, repo.Dir(), "")[ref]; got != id {
 			t.Errorf("after SetRef(%s), %s = %q", id, ref, got)
 		}
+	}
+}
+
+func TestDeleteRef_RemovesTheRefAndAcceptsOneThatIsGone(t *testing.T) {
+	t.Parallel()
+	repo, c1, _, _ := threeCommits(t)
+	ctx := context.Background()
+	const ref, other = "refs/parley/changes/1/1", "refs/parley/changes/1/2"
+	for _, r := range []string{ref, other} {
+		if err := repo.SetRef(ctx, r, c1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 2 {
+		if err := repo.DeleteRef(ctx, ref); err != nil {
+			t.Fatalf("DeleteRef(%s): %v", ref, err)
+		}
+	}
+	if got := gitrepotest.Refs(t, repo.Dir(), "refs/parley/changes/"); !reflect.DeepEqual(got, map[string]string{"1/2": c1}) {
+		t.Errorf("refs after DeleteRef = %v, want only %s", got, other)
 	}
 }
 

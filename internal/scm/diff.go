@@ -188,8 +188,10 @@ type DiffQuery struct {
 	// Globs are the path globs a file's path must match one of; none
 	// keeps every file.
 	Globs []string
-	// Keep, when not nil, must also keep a file's path.
-	Keep func(path string) bool
+	// Keep, when not nil, must also keep a file change, which it is given
+	// whole, so that a rename or a copy can be kept for either of its
+	// paths.
+	Keep func(ch gitrepo.FileChange) bool
 	// Patches gives each listed file its patch.
 	Patches bool
 	// AsPatch gives the patch text of the listed files, binary files as
@@ -224,7 +226,7 @@ func ComputeDiff(ctx context.Context, repo Repository, from, to string, q DiffQu
 	var kept []int
 	var keptChanges []gitrepo.FileChange
 	for i, ch := range changes {
-		if identity.MatchAny(q.Globs, ch.Path) && (q.Keep == nil || q.Keep(ch.Path)) {
+		if identity.MatchAny(q.Globs, ch.Path) && (q.Keep == nil || q.Keep(ch)) {
 			kept, keptChanges = append(kept, i), append(keptChanges, ch)
 		}
 	}
