@@ -3465,7 +3465,8 @@ patch id, `patch_equivalent_to`, `created_by`, the creating credential's
 type and id, the session and the stats), `change_sessions` (the order of
 each session's first version), `change_landed_commits`
 (`version_sha`, `landed_sha`) and `change_counters` (the last number given
-per workspace, so a number is never given twice). The three child tables
+per workspace, so a number is never given twice while the workspace
+exists). The three child tables
 cascade from `changes`; a unique partial index keeps one draft or open
 change per source branch, and a violation answers `409 change_exists`.
 
@@ -3578,6 +3579,30 @@ records), `SetReverts`, `SetRevertedBy`, `SetAbandoned` (state `abandoned`
 with a reason; for a fork source it tells the `ForkActivity` recorder,
 whose error is logged) and, from `Open`, `SetAutoLand`. The move to
 `landed` tells no recorder.
+
+What a deleted source does to a change is in `retention.go`; its three
+functions run in the caller's transaction and read only the change
+record, so a delete may call them after the workspace's own record is
+gone. `SourceDeleted(ctx, tx, workspace, branch, actor)` moves the draft
+or open change of the source branch (`workspace` being the source
+workspace, as for `RecordVersion`) to `abandoned` for `source_deleted`
+through `SetAbandoned`, so a fork source's recorder is told, and a branch
+with no such change changes nothing. `ForkDeleted(ctx, tx, fork, actor)`
+moves every draft or open change whose source is the fork, all of them
+the parent's, to `abandoned` for `source_workspace_deleted` without
+telling the recorder, and leaves landed and abandoned changes alone; a
+workspace's own changes are never its concern, so a repository's slug
+changes nothing. Both write one `parley.change.abandon` per change (the
+actor given, `resource_type` `change`, `resource_id` the number, the
+target workspace, the change's session, and the metadata `reason`,
+`ref`, `version` and `head_sha`), and keep every version and version
+ref: a later move of the branch records no version, and a new open of
+the same source takes the next number. `WorkspaceDeleted(ctx, tx,
+workspace)` deletes the workspace's changes, whose versions, session
+links and landed-commit records cascade, and its counter, so a later
+workspace of the same slug numbers from 1; the changes of other
+workspaces stay, also those whose source it was. The hub calls none of
+them yet.
 
 The route `POST /workspaces/:slug/changes` (`routes.go`; scope
 `changes:write`, read access to `:slug`, an idempotent create, and on the
