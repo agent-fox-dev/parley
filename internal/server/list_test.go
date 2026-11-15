@@ -96,8 +96,9 @@ func (c *collection) handler(bounds ...PageBounds) HandlerFunc {
 // listServer serves the collection c on several list routes, behind a
 // passing authenticator and without a rate limit, since a walk sends many
 // requests: GET /things, /owners/:owner/things and /others with the standard
-// bounds, GET /wide with bounds 1–1000 and default 100, and GET /empty, whose
-// handler gives the helper a nil slice.
+// bounds, GET /wide with bounds 1–1000 and default 100, GET /empty, whose
+// handler gives the helper a nil slice, and GET /pinned, whose pages add the
+// members resolved_sha and count.
 func listServer(c *collection) http.Handler {
 	s := New(Options{RateLimitDisabled: true})
 	s.SetAuthenticator(func(*http.Request) (Caller, error) { return testCaller, nil })
@@ -111,6 +112,19 @@ func listServer(c *collection) http.Handler {
 			return err
 		}
 		return WritePage[thing](w, page, nil, func(t thing) any { return t.ID })
+	}})
+	s.Register(Route{Method: http.MethodGet, Pattern: "/pinned", Handler: func(w http.ResponseWriter, r *http.Request) error {
+		page, err := ReadPage(r)
+		if err != nil {
+			return err
+		}
+		var after int
+		continuing, err := page.After(&after)
+		if err != nil {
+			return err
+		}
+		return WritePageWith(w, page, c.read(after, continuing, page.Limit+1), func(t thing) any { return t.ID },
+			Member{"resolved_sha", "4ad62a88"}, Member{"count", 2})
 	}})
 	return s.Handler()
 }
@@ -219,6 +233,26 @@ func TestList_WritesItemsAndANextCursorOnlyWhileMoreFollow(t *testing.T) {
 			t.Errorf("last page = %v with next_cursor %v, want [6] and null", last.ids, last.next)
 		}
 	})
+}
+
+func TestList_WritesTheMembersARouteAddsAfterNextCursor(t *testing.T) {
+	t.Parallel()
+	h := listServer(newCollection(3))
+	rec := do(h, newRequest(http.MethodGet, "/api/v1/pinned?limit=2", nil, ""))
+	var first struct {
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &first); err != nil || first.NextCursor == "" {
+		t.Fatalf("GET /pinned?limit=2 = %d %s, want a page with a cursor", rec.Code, rec.Body.Bytes())
+	}
+	want := `{"items":[{"id":2},{"id":4}],"next_cursor":"` + first.NextCursor + `","resolved_sha":"4ad62a88","count":2}` + "\n"
+	if rec.Code != http.StatusOK || rec.Body.String() != want {
+		t.Errorf("GET /pinned?limit=2 = %d %s, want 200 %s", rec.Code, rec.Body.Bytes(), want)
+	}
+	rec = do(h, newRequest(http.MethodGet, withCursor("/api/v1/pinned?limit=2", first.NextCursor), nil, ""))
+	if want := `{"items":[{"id":6}],"next_cursor":null,"resolved_sha":"4ad62a88","count":2}` + "\n"; rec.Body.String() != want {
+		t.Errorf("second page = %d %s, want %s", rec.Code, rec.Body.Bytes(), want)
+	}
 }
 
 func TestList_UsesALimitOf50WhenTheRequestStatesNone(t *testing.T) {

@@ -121,7 +121,7 @@ type world struct {
 	observed   *observations
 	opens      atomic.Int64
 
-	owner, member                    string
+	owner, member, org               string
 	ownerKey, memberKey, outsiderKey string
 	readPAT, writePAT, changesPAT    string
 	// repo is the git directory of demo's repository, and id the ids of
@@ -171,6 +171,7 @@ func newWorld(t *testing.T, adjust ...func(*scm.Deps)) *world {
 	}
 	w.readPAT, w.writePAT, w.changesPAT = pat("git:read"), pat("git:write"), pat("changes:read")
 	acme := w.CreateOrg(t, "acme")
+	w.org = acme
 	w.AddMember(t, acme, w.owner)
 	w.AddMember(t, acme, w.member)
 
@@ -233,6 +234,51 @@ func (w *world) addFork(t *testing.T, parent, org string, branches, tags []strin
 	}
 }
 
+// The committer times of the history workspace's commits, as the reads
+// answer them.
+const (
+	histT1 = "2026-01-01T00:00:00Z"
+	histT2 = "2026-01-02T03:04:05Z"
+	histT3 = "2026-01-03T00:00:00Z"
+	histT4 = "2026-01-04T00:00:00Z"
+)
+
+// histMessage is the message of the history workspace's commit c2.
+const histMessage = "Second\n\nBody one.\nBody two.\n"
+
+// addHistory adds the ready workspace hist of the owner and returns the ids
+// of its commits. Its main is c1 <- c2 <- m: c1, by Alice at histT1, adds
+// old.md and docs/a.md; c2, by Alice at histT2 with histMessage, changes
+// docs/a.md (two lines in, one out) and adds docs/b.md (three lines); m, by
+// Bob at histT4, merges side, whose commit s1, by Bob at histT3 on top of
+// c2, adds side.txt. The branch docs has r, by Bob <bob@example.org> at
+// histT3 on top of c2, which renames old.md to new.md.
+func (w *world) addHistory(t *testing.T) map[string]string {
+	t.Helper()
+	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
+	who := func(name, email, at string) string {
+		when, err := time.Parse(time.RFC3339, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig := name + " <" + email + "> " + strconv.FormatInt(when.Unix(), 10) + " +0000\n"
+		return "author " + sig + "committer " + sig
+	}
+	alice, bob := func(at string) string { return who("Alice", "alice@example.com", at) }, func(at string) string { return who("Bob", "bob@example.org", at) }
+	dir := w.addWorkspace(t, "hist", w.org, "commit refs/heads/main\nmark :1\n"+alice(histT1)+data("c1")+
+		"M 100644 inline old.md\n"+data("one\n")+"M 100644 inline docs/a.md\n"+data("a\n")+
+		"\ncommit refs/heads/main\nmark :2\n"+alice(histT2)+data(histMessage)+
+		"M 100644 inline docs/a.md\n"+data("a2\nmore\n")+"M 100644 inline docs/b.md\n"+data("x\ny\nz\n")+
+		"\ncommit refs/heads/side\nmark :3\n"+bob(histT3)+data("s1")+"from :2\nM 100644 inline side.txt\n"+data("side\n")+
+		"\ncommit refs/heads/main\nmark :4\n"+bob(histT4)+data("m")+"from :2\nmerge :3\nM 100644 inline side.txt\n"+data("side\n")+
+		"\ncommit refs/heads/docs\n"+bob(histT3)+data("rename")+"from :2\nD old.md\nM 100644 inline new.md\n"+data("one\n")+"\n")
+	ids := map[string]string{}
+	for i, id := range strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main~2", "main~1", "side", "main", "docs")) {
+		ids[[]string{"c1", "c2", "s1", "m", "r"}[i]] = id
+	}
+	return ids
+}
+
 // set sets column of the workspace slug to value in the store, such as its
 // status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
@@ -278,15 +324,21 @@ func (r reply) errorType() string {
 }
 
 // names are the name members of the items of a list.
-func (r reply) names() []string {
+func (r reply) names() []string { return r.members("name") }
+
+// shas are the sha members of the items of a list.
+func (r reply) shas() []string { return r.members("sha") }
+
+// members are the string members key of the items of a list.
+func (r reply) members(key string) []string {
 	items, _ := r.json["items"].([]any)
-	names := []string{}
+	values := []string{}
 	for _, it := range items {
 		o, _ := it.(map[string]any)
-		s, _ := o["name"].(string)
-		names = append(names, s)
+		s, _ := o[key].(string)
+		values = append(values, s)
 	}
-	return names
+	return values
 }
 
 // get sends GET path, below /api/v1, with credential as the bearer
@@ -326,6 +378,8 @@ func scmPath(slug, path string) string { return "/workspaces/" + slug + "/scm" +
 var scmRoutes = []struct{ op, ok, bad string }{
 	{"refs", "/refs", "/refs?limit=0"},
 	{"refs", "/refs/main", "/refs/nope"},
+	{"commits", "/commits", "/commits?stats=yes"},
+	{"commits", "/commits/main", "/commits/nope"},
 }
 
 // observations is a request recorder that keeps what it was told, each

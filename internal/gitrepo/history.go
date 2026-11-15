@@ -1,0 +1,433 @@
+package gitrepo
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Signature is who wrote or committed a commit, and when.
+type Signature struct {
+	Name, Email string
+	Time        time.Time
+}
+
+// Commit is a commit as the repository holds it.
+type Commit struct {
+	// ID, Parents and Tree are full ids; Parents in their order, the first
+	// parent first, none for a root commit.
+	ID      string
+	Parents []string
+	Tree    string
+	// Author and Committer are the commit's signatures.
+	Author, Committer Signature
+	// Message is the whole message, as written.
+	Message string
+}
+
+// HistoryQuery chooses which of the commits reachable from a commit a
+// history read returns.
+type HistoryQuery struct {
+	// FirstParent follows only the first parent of each merge.
+	FirstParent bool
+	// Path, when set, keeps only the commits that changed it, a file or
+	// the files below a directory, taken literally.
+	Path string
+	// Follow follows Path across renames; Path must name one file.
+	Follow bool
+	// Since and Until, when set, keep only the commits whose committer time
+	// is at or after Since and at or before Until.
+	Since, Until *time.Time
+	// Author, when set, keeps only the commits whose author's name or
+	// e-mail contains it, without regard to case.
+	Author string
+	// Skip leaves out the first Skip commits the query keeps; Count, when
+	// above 0, returns at most Count after them.
+	Skip, Count int
+}
+
+// DiffStats are the numbers of a change between two trees.
+type DiffStats struct {
+	FilesChanged, Insertions, Deletions int
+}
+
+// The statuses of a FileChange.
+const (
+	ChangeAdded       = "added"
+	ChangeModified    = "modified"
+	ChangeDeleted     = "deleted"
+	ChangeRenamed     = "renamed"
+	ChangeCopied      = "copied"
+	ChangeTypeChanged = "type_changed"
+)
+
+// FileChange is how one file differs between two trees.
+type FileChange struct {
+	// Path is the file's path on the new side, and on the old side for a
+	// deleted file; OldPath is the path on the old side of a renamed or
+	// copied file, "" otherwise.
+	Path, OldPath string
+	// Status is one of ChangeAdded, ChangeModified, ChangeDeleted,
+	// ChangeRenamed, ChangeCopied and ChangeTypeChanged.
+	Status string
+	// Insertions and Deletions count lines, both 0 for a binary file.
+	Insertions, Deletions int
+	Binary                bool
+	// OldID and NewID are the file's blob ids on each side, "" on the side
+	// it is missing from.
+	OldID, NewID string
+}
+
+// nullID is the id git writes for the side of a change a file is missing
+// from.
+var nullID = strings.Repeat("0", idLen)
+
+// History is the commits reachable from the commit of the full id from,
+// newest first, that q keeps. A path that no commit changed keeps none.
+func (r *Repo) History(ctx context.Context, from string, q HistoryQuery) ([]Commit, error) {
+	if !isHexID(from, idLen) {
+		return nil, fmt.Errorf("history of %q: %w", from, ErrNotFound)
+	}
+	if q.Follow && q.Path == "" {
+		return nil, errors.New("history: following renames needs a path")
+	}
+	// Every pathspec is taken literally: a path such as :(glob)*.md is a
+	// file's name, not pathspec magic.
+	args := []string{"--literal-pathspecs", "log", "--format=%H"}
+	if q.FirstParent {
+		args = append(args, "--first-parent")
+	}
+	if q.Since != nil {
+		// --since stops the walk at the first older commit, which would drop
+		// the newer ones behind it; --since-as-filter looks at every commit.
+		// A time within a second keeps the commits of the next one.
+		since := q.Since.Unix()
+		if q.Since.After(time.Unix(since, 0)) {
+			since++
+		}
+		args = append(args, "--since-as-filter="+gitTime(max(since, 0)))
+	}
+	if q.Until != nil {
+		if q.Until.Unix() < 0 {
+			return nil, nil
+		}
+		args = append(args, "--until="+gitTime(q.Until.Unix()))
+	}
+	if q.Author != "" {
+		args = append(args, "--regexp-ignore-case", "--fixed-strings", "--author="+q.Author)
+	}
+	// git counts the commits it skips before --follow drops those that did
+	// not change the file, so a followed history is counted here.
+	skip, count := max(q.Skip, 0), q.Count
+	if q.Follow {
+		args = append(args, "--follow")
+	} else {
+		args = append(args, "--skip="+strconv.Itoa(skip))
+		if count > 0 {
+			args = append(args, "--max-count="+strconv.Itoa(count))
+		}
+		skip = 0
+	}
+	args = append(args, strings.ToLower(from), "--")
+	if q.Path != "" {
+		args = append(args, q.Path)
+	}
+	out, err := r.git(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	ids := strings.Fields(string(out))
+	ids = ids[min(skip, len(ids)):]
+	if count > 0 {
+		ids = ids[:min(count, len(ids))]
+	}
+	return r.ReadCommits(ctx, ids)
+}
+
+// gitTime is the time of the Unix time t in the form git reads as that
+// time; a bare @t is read as one only when it is large enough.
+func gitTime(t int64) string { return "@" + strconv.FormatInt(t, 10) + " +0000" }
+
+// ReadCommits reads the commits of the full ids ids, in their order. An id
+// that is not a full id, or that names no object, is ErrNotFound, and one
+// whose object is not a commit is ErrNotCommit.
+func (r *Repo) ReadCommits(ctx context.Context, ids []string) ([]Commit, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	for _, id := range ids {
+		if !isHexID(id, idLen) {
+			return nil, fmt.Errorf("commit %q: %w", id, ErrNotFound)
+		}
+	}
+	// cat-file reads the ids from its standard input and answers each with
+	// a header line and the object as it is stored, whose length the
+	// header gives, so a message may hold any byte.
+	out, err := r.g.runInput(ctx, access{}, []byte(strings.ToLower(strings.Join(ids, "\n"))+"\n"),
+		"--git-dir="+r.dir, "cat-file", "--batch")
+	if err != nil {
+		return nil, err
+	}
+	commits := make([]Commit, 0, len(ids))
+	for _, id := range ids {
+		header, rest, ok := bytes.Cut(out, []byte("\n"))
+		if !ok {
+			return nil, fmt.Errorf("read commit %s: cat-file answered %q", id, out)
+		}
+		f := strings.Fields(string(header))
+		switch {
+		case len(f) == 2 && f[1] == "missing":
+			return nil, fmt.Errorf("commit %s: %w", id, ErrNotFound)
+		case len(f) != 3:
+			return nil, fmt.Errorf("read commit %s: cat-file answered %q", id, header)
+		}
+		size, err := strconv.Atoi(f[2])
+		if err != nil || size+1 > len(rest) {
+			return nil, fmt.Errorf("read commit %s: cat-file answered %q", id, header)
+		}
+		if f[1] != ObjectCommit {
+			return nil, fmt.Errorf("commit %s: %w", id, ErrNotCommit)
+		}
+		c, err := parseCommit(f[0], rest[:size])
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, c)
+		out = rest[size+1:]
+	}
+	return commits, nil
+}
+
+// parseCommit is the commit id whose object, as stored, is raw: header
+// lines, of which a line that begins with a space continues the one before,
+// an empty line, and the message.
+func parseCommit(id string, raw []byte) (Commit, error) {
+	c := Commit{ID: id}
+	headers, message, _ := bytes.Cut(raw, []byte("\n\n"))
+	c.Message = string(message)
+	for line := range strings.SplitSeq(string(headers), "\n") {
+		key, value, _ := strings.Cut(line, " ")
+		var err error
+		switch key {
+		case "tree":
+			c.Tree = value
+		case "parent":
+			c.Parents = append(c.Parents, value)
+		case "author":
+			c.Author, err = parseSignature(value)
+		case "committer":
+			c.Committer, err = parseSignature(value)
+		}
+		if err != nil {
+			return Commit{}, fmt.Errorf("read commit %s: %w", id, err)
+		}
+	}
+	if c.Tree == "" {
+		return Commit{}, fmt.Errorf("read commit %s: it names no tree", id)
+	}
+	return c, nil
+}
+
+// parseSignature reads a signature as a commit stores it: a name, an
+// e-mail address within <>, a Unix time and a zone offset.
+func parseSignature(s string) (Signature, error) {
+	open, end := strings.LastIndexByte(s, '<'), strings.LastIndexByte(s, '>')
+	if open < 0 || end < open {
+		return Signature{}, fmt.Errorf("signature %q has no e-mail address", s)
+	}
+	f := strings.Fields(s[end+1:])
+	if len(f) == 0 {
+		return Signature{}, fmt.Errorf("signature %q has no time", s)
+	}
+	at, err := strconv.ParseInt(f[0], 10, 64)
+	if err != nil {
+		return Signature{}, fmt.Errorf("signature %q has no time", s)
+	}
+	return Signature{Name: strings.TrimSpace(s[:open]), Email: s[open+1 : end], Time: time.Unix(at, 0).UTC()}, nil
+}
+
+// CommitStats are the numbers of each of commits against its first parent,
+// or against the empty tree for a commit without one, in their order.
+// Renamed files are found; a binary file counts as changed with no lines.
+func (r *Repo) CommitStats(ctx context.Context, commits []Commit) ([]DiffStats, error) {
+	if len(commits) == 0 {
+		return nil, nil
+	}
+	// One diff-tree reads every pair from its standard input: a commit and
+	// its first parent, or a root commit alone, which --root compares with
+	// the empty tree. --always names a commit that changed nothing too.
+	var in strings.Builder
+	for _, c := range commits {
+		in.WriteString(c.ID)
+		if len(c.Parents) > 0 {
+			in.WriteString(" " + c.Parents[0])
+		}
+		in.WriteString("\n")
+	}
+	out, err := r.g.runInput(ctx, access{}, []byte(in.String()),
+		"--git-dir="+r.dir, "diff-tree", "--stdin", "--always", "--root", "-r", "-z", "-M", "--numstat")
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	stats := make([]DiffStats, len(commits))
+	i := -1
+	for len(fields) > 0 && fields[0] != "" {
+		if !strings.Contains(fields[0], "\t") {
+			// The id of the next commit, which numstat lines follow.
+			if i++; i >= len(commits) || fields[0] != commits[i].ID {
+				return nil, fmt.Errorf("commit stats: diff-tree answered %q", fields[0])
+			}
+			fields = fields[1:]
+			continue
+		}
+		if i < 0 {
+			return nil, fmt.Errorf("commit stats: diff-tree answered %q", fields[0])
+		}
+		n, rest, err := parseNumstat(fields)
+		if err != nil {
+			return nil, err
+		}
+		stats[i].add(n)
+		fields = rest
+	}
+	return stats, nil
+}
+
+// DiffChanges are the file changes from the tree of from to that of to,
+// each a full id of a commit or a tree, from "" being the empty tree, in
+// byte order of path. Renamed files are found.
+func (r *Repo) DiffChanges(ctx context.Context, from, to string) ([]FileChange, error) {
+	if from == "" {
+		empty, err := r.emptyTree(ctx)
+		if err != nil {
+			return nil, err
+		}
+		from = empty
+	}
+	for _, id := range []string{from, to} {
+		if !isHexID(id, idLen) {
+			return nil, fmt.Errorf("diff of %q: %w", id, ErrNotFound)
+		}
+	}
+	out, err := r.git(ctx, "diff-tree", "-r", "-z", "-M", "--raw", "--numstat", strings.ToLower(from), strings.ToLower(to))
+	if err != nil {
+		return nil, err
+	}
+	// The raw entries come first, each ":<modes> <ids> <status>" and its
+	// paths, then a numstat entry for each, in the same order.
+	fields := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	var changes []FileChange
+	for len(fields) > 0 && strings.HasPrefix(fields[0], ":") {
+		f := strings.Fields(fields[0])
+		if len(f) != 5 || len(fields) < 2 {
+			return nil, fmt.Errorf("diff: diff-tree answered %q", fields[0])
+		}
+		c := FileChange{Path: fields[1], OldID: blobID(f[2]), NewID: blobID(f[3])}
+		fields = fields[2:]
+		switch f[4][0] {
+		case 'A':
+			c.Status = ChangeAdded
+		case 'D':
+			c.Status = ChangeDeleted
+		case 'M':
+			c.Status = ChangeModified
+		case 'T':
+			c.Status = ChangeTypeChanged
+		case 'R', 'C':
+			if len(fields) == 0 {
+				return nil, fmt.Errorf("diff: diff-tree answered %q without its new path", f[4])
+			}
+			c.Status = map[byte]string{'R': ChangeRenamed, 'C': ChangeCopied}[f[4][0]]
+			c.OldPath, c.Path = c.Path, fields[0]
+			fields = fields[1:]
+		default:
+			return nil, fmt.Errorf("diff: diff-tree answered the status %q", f[4])
+		}
+		changes = append(changes, c)
+	}
+	for i := range changes {
+		n, rest, err := parseNumstat(fields)
+		if err != nil {
+			return nil, err
+		}
+		changes[i].Insertions, changes[i].Deletions, changes[i].Binary = n.Insertions, n.Deletions, n.binary
+		fields = rest
+	}
+	return changes, nil
+}
+
+// blobID is the id git writes for one side of a change, "" for the side a
+// file is missing from.
+func blobID(id string) string {
+	if id == nullID {
+		return ""
+	}
+	return id
+}
+
+// emptyTree is the id of the tree that holds nothing, in the repository's
+// object format; git knows it whether or not the repository stores it.
+func (r *Repo) emptyTree(ctx context.Context) (string, error) {
+	out, err := r.g.runInput(ctx, access{}, []byte{}, "--git-dir="+r.dir, "hash-object", "-t", "tree", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// numstat is one file's line counts.
+type numstat struct {
+	Insertions, Deletions int
+	binary                bool
+}
+
+// parseNumstat reads the numstat entry fields begin with, written with -z:
+// "<insertions>\t<deletions>\t<path>", or, for a renamed or copied file,
+// the counts with an empty path followed by the old and the new path; a
+// binary file's counts are "-". It returns the fields after the entry.
+func parseNumstat(fields []string) (numstat, []string, error) {
+	if len(fields) == 0 {
+		return numstat{}, nil, errors.New("diff: diff-tree answered fewer counts than files")
+	}
+	f := strings.SplitN(fields[0], "\t", 3)
+	if len(f) != 3 {
+		return numstat{}, nil, fmt.Errorf("diff: diff-tree answered %q", fields[0])
+	}
+	rest := fields[1:]
+	if f[2] == "" {
+		if len(rest) < 2 {
+			return numstat{}, nil, fmt.Errorf("diff: diff-tree answered %q without its paths", fields[0])
+		}
+		rest = rest[2:]
+	}
+	if f[0] == "-" && f[1] == "-" {
+		return numstat{binary: true}, rest, nil
+	}
+	ins, errIns := strconv.Atoi(f[0])
+	del, errDel := strconv.Atoi(f[1])
+	if errIns != nil || errDel != nil {
+		return numstat{}, nil, fmt.Errorf("diff: diff-tree answered %q", fields[0])
+	}
+	return numstat{Insertions: ins, Deletions: del}, rest, nil
+}
+
+// add counts the file of n in s.
+func (s *DiffStats) add(n numstat) {
+	s.FilesChanged++
+	s.Insertions += n.Insertions
+	s.Deletions += n.Deletions
+}
+
+// Stats are the numbers of changes taken together.
+func Stats(changes []FileChange) DiffStats {
+	var s DiffStats
+	for _, c := range changes {
+		s.add(numstat{Insertions: c.Insertions, Deletions: c.Deletions})
+	}
+	return s
+}

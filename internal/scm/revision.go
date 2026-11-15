@@ -22,6 +22,16 @@ type Repository interface {
 	PeelCommit(ctx context.Context, id string) (string, error)
 	// ResolveCommit is the one commit a full or abbreviated id names.
 	ResolveCommit(ctx context.Context, hex string) (string, error)
+	// History is the commits reachable from the commit from, newest first,
+	// that q keeps.
+	History(ctx context.Context, from string, q gitrepo.HistoryQuery) ([]gitrepo.Commit, error)
+	// ReadCommits reads the commits of full ids, in their order.
+	ReadCommits(ctx context.Context, ids []string) ([]gitrepo.Commit, error)
+	// CommitStats are each commit's numbers against its first parent.
+	CommitStats(ctx context.Context, commits []gitrepo.Commit) ([]gitrepo.DiffStats, error)
+	// DiffChanges are the file changes between two full ids, from "" being
+	// the empty tree.
+	DiffChanges(ctx context.Context, from, to string) ([]gitrepo.FileChange, error)
 }
 
 // Ref is a ref of a workspace as its ref view shows it.

@@ -381,8 +381,8 @@ know are ignored.
 
 ## Lists
 
-Every route that answers a list answers one page of it, `200` with exactly
-these two members:
+Every route that answers a list answers one page of it, `200` with these
+two members first:
 
 ```json
 {"items":[{"id":2},{"id":4}],"next_cursor":"eyJwIjo0LCJmIjoi..."}
@@ -392,6 +392,10 @@ these two members:
 |---|---|
 | `items` | an array of the page's items, in the list's order; `[]` when the page is empty, never `null` |
 | `next_cursor` | a string when more items follow, `null` on the last page |
+
+A list that names more than its items, such as the commit it was read
+from, adds members after `next_cursor`, and its section of this page names
+them; every other list has these two alone.
 
 A list request takes two query parameters:
 
@@ -2604,7 +2608,8 @@ who reads it); the `limit` and `cursor` (`400`).
 
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
-refs routes below. Every one of them behaves alike in what follows.
+refs routes and the two commits routes below. Every one of them behaves
+alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
 `git:read` for a PAT, which a PAT holding `git:write` also satisfies. It
@@ -2635,7 +2640,8 @@ moves. A fork shows no `refs/parley/` ref.
 
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
-route's op (`refs` for both refs routes) and `ok` for a status below 400,
+route's op (`refs` for both refs routes, `commits` for both commits routes)
+and `ok` for a status below 400,
 `error` otherwise; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
 it is told.
@@ -2653,6 +2659,32 @@ A ref object has exactly these members:
 
 Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
+
+A revision parameter (`ref` of `…/scm/commits`, `{sha}` of
+`…/scm/commits/{sha}`) is a branch name, a tag name, a full ref name or a
+full or abbreviated commit id (4 to 40 hexadecimal characters). A string
+that begins with `refs/` is that full ref name only; otherwise the branch or
+the tag of that name, where both existing is ambiguous; otherwise a commit
+id, which names a commit whether or not a ref reaches it. An annotated tag
+names the commit it peels to. A revision that names no one commit, an
+expression such as `main~2`, `HEAD` or `@{1}` included, is `404`
+`ref_not_found` (such as `revision "main~2" names no commit`, `revision
+"dup" is both a branch and a tag`, `revision "4ad6" names more than one
+commit`). A `ref` that is absent is the head of the workspace's default
+branch.
+
+A commit object, as every route that answers commits writes it:
+
+| Member | Value |
+|---|---|
+| `sha` | the commit's full id |
+| `parents` | the full ids of its parents, the first parent first; `[]` for a root commit |
+| `tree_sha` | the full id of its tree |
+| `author`, `committer` | `{"name": …, "email": …, "time": …}`, `time` an RFC 3339 timestamp in UTC, such as `2026-01-02T03:04:05Z` |
+| `message` | the whole message, as written, its last newline included when it has one |
+| `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it; always `null` until the hub records changes |
+| `session_id` | the agent session that introduced the commit; always `null` until the hub records sessions |
+| `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed files are found, and a binary file counts as changed with no lines |
 
 ## `GET /api/v1/workspaces/{slug}/scm/refs`
 
@@ -2691,6 +2723,68 @@ Answers the ref object of one ref. `{name}` takes the rest of the path (see
 | `200 OK` | the ref object |
 | `404` `ref_not_found` | no listed ref has the name, or it is outside `refs/heads/`, `refs/tags/` and `refs/parley/` (`ref "refs/heads/nope" does not exist`); a tag name without `refs/tags/` is read as a branch name |
 | `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+## `GET /api/v1/workspaces/{slug}/scm/commits`
+
+Lists the commits reachable from `ref`, newest first, as commit objects. It
+is a list (see [Lists](#lists)), with the standard `limit` and `cursor`,
+and names the commit it was read from in `resolved_sha` after
+`next_cursor`. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose history is listed; default the workspace's default branch |
+| `first_parent` | `true` (default) follows only the first parent of each merge, so the commits a merge brought in are not listed; `false` lists them too |
+| `path` | only the commits that changed this path, a file or anything below a directory, taken literally; a path no commit changed answers `items: []` |
+| `follow` | `true` follows `path`, which must then name one file, across renames; default `false` |
+| `since`, `until` | RFC 3339 timestamps: only the commits whose committer time is at or after `since` and at or before `until` |
+| `author` | only the commits whose author's name or e-mail contains this text, without regard to case |
+| `stats` | `true` adds `stats` to each commit; default `false`, which leaves the member out |
+
+The filters are read together. The cursor carries the commit the first page
+resolved and how many commits the pages before held, so every page of one
+listing is read from that commit, also when `ref` moves between pages; a
+cursor used with other query parameters is refused (see [Lists](#lists)).
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of commit objects, with `resolved_sha` |
+| `400` `invalid_request` | a bad `limit` or `cursor`; `first_parent`, `follow` or `stats` other than `true` or `false` (`stats must be true or false`); `since` or `until` not an RFC 3339 timestamp (`since must be an RFC 3339 timestamp, such as 2026-01-02T03:04:05Z`); `follow=true` without `path` (`follow=true needs a path, the one file whose renames it follows`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"items":[{"sha":"4ad62a88646935da6b42d1a9b1462904e8d62e91","parents":["9fceb02d0ae598e95dc970b74767f19372d61af8"],"tree_sha":"e7849aa020dd1d5745b252959a661f3c67634838","author":{"name":"Alice","email":"alice@example.com","time":"2026-01-02T03:04:05Z"},"committer":{"name":"Alice","email":"alice@example.com","time":"2026-01-02T03:04:05Z"},"message":"Second\n\nBody one.\nBody two.\n","change":null,"session_id":null}],"next_cursor":"eyJwIjp7InNoYSI6...","resolved_sha":"4ad62a88646935da6b42d1a9b1462904e8d62e91"}
+```
+
+## `GET /api/v1/workspaces/{slug}/scm/commits/{sha}`
+
+Answers the commit object of the commit `{sha}` names, which is any
+revision (a branch name with a `/` is written with `%2F`, as
+`…/commits/feature%2Fx`), always with `stats`. With `files=true` it also
+has `files`, the commit's file changes against its first parent, or
+against the empty tree for a root commit, in byte order of path; without
+it, or with `files=false`, the member is absent. A file change:
+
+| Member | Value |
+|---|---|
+| `path` | the file's path, on the new side; for a deleted file, the path it had |
+| `old_path` | the path on the old side of a renamed or copied file, else `null` |
+| `status` | `added`, `modified`, `deleted`, `renamed`, `copied` or `type_changed` |
+| `insertions`, `deletions` | lines added and removed; `0` and `0` for a binary file |
+| `binary` | `true` for a file git treats as binary |
+| `old_sha`, `new_sha` | the file's blob id on each side, `null` on the side it is missing from |
+
+| Status | When |
+|---|---|
+| `200 OK` | the commit object, with `stats` and, with `files=true`, `files` |
+| `400` `invalid_request` | `files` other than `true` or `false` (`files must be true or false`) |
+| `404` `ref_not_found` | `{sha}` names no one commit |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+
+```json
+{"sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","parents":[],"tree_sha":"755f3edd3ea43bc4b9134fc17299060a0eae2c91","author":{"name":"Alice","email":"alice@example.com","time":"2026-01-01T00:00:00Z"},"committer":{"name":"Alice","email":"alice@example.com","time":"2026-01-01T00:00:00Z"},"message":"c1","change":null,"session_id":null,"stats":{"files_changed":1,"insertions":1,"deletions":0},"files":[{"path":"old.md","old_path":null,"status":"added","insertions":1,"deletions":0,"binary":false,"old_sha":null,"new_sha":"5626abf0f72e58d7a153368ba57db4c673c0e171"}]}
+```
 
 ## Admin routes
 

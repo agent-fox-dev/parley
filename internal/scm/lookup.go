@@ -22,15 +22,22 @@ type Change struct {
 	Number        int    `json:"number"`
 }
 
+// CommitChange names the version of a change that a commit belongs to.
+type CommitChange struct {
+	WorkspaceSlug string `json:"workspace_slug"`
+	Number        int    `json:"number"`
+	Version       int    `json:"version"`
+}
+
 // ChangeLookup names the change a branch or a commit of a workspace
 // belongs to; nil with a nil error is none.
 type ChangeLookup interface {
 	// OpenChangeOfBranch is the open or draft change whose source is the
 	// branch, named without refs/heads/, of the workspace slug.
 	OpenChangeOfBranch(ctx context.Context, slug, branch string) (*Change, error)
-	// ChangeOfCommit is the change a version of which holds the commit
-	// sha of the workspace slug.
-	ChangeOfCommit(ctx context.Context, slug, sha string) (*Change, error)
+	// ChangeOfCommit is the change, and its version, whose version head
+	// is the commit sha of the workspace slug or that landed it.
+	ChangeOfCommit(ctx context.Context, slug, sha string) (*CommitChange, error)
 }
 
 // SessionLookup names the agent session that introduced a commit of a
@@ -53,7 +60,9 @@ func (noChanges) OpenChangeOfBranch(context.Context, string, string) (*Change, e
 	return nil, nil
 }
 
-func (noChanges) ChangeOfCommit(context.Context, string, string) (*Change, error) { return nil, nil }
+func (noChanges) ChangeOfCommit(context.Context, string, string) (*CommitChange, error) {
+	return nil, nil
+}
 
 // noSessions names no session.
 type noSessions struct{}

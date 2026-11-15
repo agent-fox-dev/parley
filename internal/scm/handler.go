@@ -35,7 +35,8 @@ const (
 
 // The ops the read routes report, one per kind of read.
 const (
-	opRefs = "refs"
+	opRefs    = "refs"
+	opCommits = "commits"
 )
 
 // scopeRead is the scope a personal access token needs for every read;
@@ -111,6 +112,8 @@ func (c *Component) Routes() []server.Route {
 	return []server.Route{
 		c.route("/refs", opRefs, c.listRefs),
 		c.route("/refs/*name", opRefs, c.getRef),
+		c.route("/commits", opCommits, c.listCommits),
+		c.route("/commits/:sha", opCommits, c.getCommit),
 	}
 }
 

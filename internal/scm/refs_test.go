@@ -128,4 +128,6 @@ func (c changeOf) OpenChangeOfBranch(_ context.Context, _, branch string) (*scm.
 	return nil, nil
 }
 
-func (changeOf) ChangeOfCommit(context.Context, string, string) (*scm.Change, error) { return nil, nil }
+func (changeOf) ChangeOfCommit(context.Context, string, string) (*scm.CommitChange, error) {
+	return nil, nil
+}
