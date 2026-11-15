@@ -364,6 +364,9 @@ type Deps struct {
 	// Logger is told of what fails and changes nothing, such as a fork
 	// activity recorder's error; nil discards it.
 	Logger *slog.Logger
+	// MergeableDebounce is the shortest time between the starts of two
+	// mergeability checks of one change; zero, or below, for none.
+	MergeableDebounce time.Duration
 }
 
 // Component keeps the changes. Its zero value is ready to be registered and
@@ -380,6 +383,9 @@ type Component struct {
 	guard     AutoLandGuard
 	activity  ForkActivity
 	expanders map[string]Expander
+
+	// merge holds the scheduled mergeability checks.
+	merge mergeWorker
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

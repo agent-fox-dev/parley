@@ -72,10 +72,10 @@ type Registry struct {
 
 // NewRegistry returns a registry holding the keys the configuration loader
 // owns: those of [server], [database], [workspace], [logging], [limits],
-// [forks] and [scm].
+// [forks], [scm] and [changes].
 func NewRegistry() *Registry {
 	r := &Registry{keys: map[string]map[string]Key{}, sections: map[string]func(map[string]any) error{}}
-	for _, k := range slices.Concat(ownKeys, forkKeys, scmKeys) {
+	for _, k := range slices.Concat(ownKeys, forkKeys, scmKeys, changesKeys) {
 		// A refusal is remembered and fails the load; the loader's own keys
 		// are fixed and well formed, so there is none.
 		_ = r.Register(k)

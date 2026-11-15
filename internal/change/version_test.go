@@ -20,6 +20,7 @@ import (
 func TestRecordVersion_RecordsTheNewHeadAsTheNextVersion(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
+	w.hold(t)
 	h1 := commit(t, w.demo, "feat", w.base, "One\n", map[string]string{"x.txt": "x\n"})
 	w.openBranch(t, "feat", nil)
 	v1 := w.versions(t, "demo", 1)[0]

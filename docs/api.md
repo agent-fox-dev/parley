@@ -3592,7 +3592,7 @@ The change object:
 | `depends_on`, `dependants` | the change this one depends on, `null` for none, and the numbers of the draft and open changes that depend on this one, lowest first |
 | `author` | who opened it: `actor_type` (`admin_token`, `api_key`, `pat` or `system`), `actor_id` and `username`, both `null` for the admin token and the hub |
 | `session_id`, `sessions` | the session of the current version, `null` for none, and every session that contributed a version, in the order of its first one |
-| `mergeable`, `conflict` | `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` |
+| `mergeable`, `conflict` | whether the current version's own commits rebase onto what the change sits on: `clean`, `conflict` or `unknown`; the conflict report while it is `conflict`, else `null` (see [Mergeability](#mergeability)) |
 | `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
@@ -3654,7 +3654,7 @@ token opens only from a workspace its binding covers. The body:
 
 The answer is `201` with the change object, at version 1: the head of the
 source branch, of kind `ref`, written at `refs/parley/changes/<number>/1`.
-`mergeable` is `unknown`. A draft has `landing`
+`mergeable` is `unknown` until its first check. A draft has `landing`
 `{"status":"blocked","reason":"draft","requirements":[]}`; any other
 change the landing evaluation's answer, which until the hub has a landing
 policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
@@ -3942,7 +3942,34 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
 - `POST …/restore` takes no body and moves the change to `open` at its
   last version with `mergeable` `unknown`, writing
   `parley.change.restore` by the caller with `number`, `ref`, `version`
-  and `head_sha`.
+  and `head_sha`, and schedules its mergeability check.
+
+## Mergeability
+
+The hub computes `mergeable` in the background for every `draft` and
+`open` change, without being asked: it trial-rebases the commits of the
+current version that the onto-commit lacks onto the onto-commit, the head
+of the change named by `depends_on` while that change is `draft` or
+`open`, otherwise the head of the target branch. The result is `clean`,
+or `conflict` with the conflict report in `conflict`: `target_sha` (the
+onto-commit), `head_sha`, `base_sha`, `commit_sha` (the first commit that
+does not apply), `files` (each `path`, `kind`, `base`, `ours`, `theirs`,
+`landed_by`), `landed_changes` and `change`. The trial writes no ref and
+no work tree in either repository.
+
+`mergeable` becomes `unknown`, with `conflict` `null`, in the transaction
+of what triggers a new check: a new version of the change, a new version
+of the change it depends on, a move, creation or deletion of its target
+branch by a push, the source control API, a landing or a sync, and a
+restore. It stays `unknown` until the check stores its result; a result
+for a head or an onto-commit that is no longer the change's is
+discarded and computed again. Two checks of one change start at least
+`[changes].mergeable_debounce` apart (default `5s`, see
+[configuration.md](configuration.md#keys)). While the target branch does
+not exist, `mergeable` stays `unknown` and `landing` reports
+`{"status":"blocked","reason":"target_not_found"}`. A trial rebase that
+fails or runs past 30 seconds is stopped and leaves `mergeable`
+`unknown` until the change's next trigger.
 
 ## Admin routes
 

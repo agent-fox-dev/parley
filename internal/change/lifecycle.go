@@ -59,10 +59,13 @@ func (c *Component) restoreRoute(w http.ResponseWriter, r *http.Request) error {
 }
 
 // restore moves the change ch back to open at its last version, with
-// mergeable unknown, and writes parley.change.restore by caller.
+// mergeable unknown and its check scheduled, and writes
+// parley.change.restore by caller.
 func (c *Component) restore(ctx context.Context, tx *sql.Tx, ch Change, caller Caller) error {
-	if err := update(ctx, tx, ch.WorkspaceSlug, ch.Number, c.now(),
-		`state = 'open', abandon_reason = NULL, mergeable = 'unknown'`); err != nil {
+	if err := update(ctx, tx, ch.WorkspaceSlug, ch.Number, c.now(), `state = 'open', abandon_reason = NULL`); err != nil {
+		return err
+	}
+	if err := c.ScheduleMergeable(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 		return err
 	}
 	return c.emit(ctx, tx, caller, ch, EventRestore, map[string]any{"number": ch.Number, "version": ch.Version, "head_sha": ch.HeadSHA})
