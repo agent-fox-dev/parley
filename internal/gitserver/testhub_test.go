@@ -32,11 +32,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The paths of demo's ref discovery for fetch and of a push to a repository
-// that does not exist.
+// The paths of demo's four requests, and the X-Request-ID of every request
+// of the tests, which the hub echoes, so that two answers can be compared
+// byte for byte.
 const (
 	demoRefs     = "/git/acme/demo.git/info/refs?service=git-upload-pack"
-	nosuchPush   = "/git/acme/nosuch.git/git-receive-pack"
+	uploadPack   = "/git/acme/demo.git/git-upload-pack"
+	pushRefs     = "/git/acme/demo.git/info/refs?service=git-receive-pack"
+	receivePack  = "/git/acme/demo.git/git-receive-pack"
 	fixedRequest = "5f0c6a52-3a8e-4d43-9c55-0d8b1f0e2a41"
 )
 
@@ -193,20 +196,8 @@ func (w *world) addForkTracking(t *testing.T, branches, tags []string) {
 	}
 }
 
-// setStatus sets the status of the workspace slug in the store.
-func (w *world) setStatus(t *testing.T, slug, status string) {
-	t.Helper()
-	w.set(t, slug, "status", status)
-}
-
-// setMarker sets the maintenance marker of the workspace slug in the store,
-// as a running reclone, archive or delete holds it; "" releases it.
-func (w *world) setMarker(t *testing.T, slug string, m workspace.Marker) {
-	t.Helper()
-	w.set(t, slug, "maintenance", string(m))
-}
-
-// set sets column of the workspace slug to value in the store.
+// set sets column of the workspace slug to value in the store, such as its
+// status or its maintenance marker.
 func (w *world) set(t *testing.T, slug, column, value string) {
 	t.Helper()
 	ctx := context.Background()
@@ -227,13 +218,14 @@ type gitRequest struct {
 	label                string
 }
 
-// gitRequests are the four requests, the three routes among them.
-var gitRequests = []gitRequest{
-	{"fetch refs", http.MethodGet, "/info/refs?service=git-upload-pack", false, gitserver.LabelInfoRefs},
-	{"fetch", http.MethodPost, "/git-upload-pack", false, gitserver.LabelUploadPack},
-	{"push refs", http.MethodGet, "/info/refs?service=git-receive-pack", true, gitserver.LabelInfoRefs},
-	{"push", http.MethodPost, "/git-receive-pack", true, gitserver.LabelReceivePack},
-}
+// The four requests, the three routes among them.
+var (
+	reqFetchRefs = gitRequest{"fetch refs", http.MethodGet, "/info/refs?service=git-upload-pack", false, gitserver.LabelInfoRefs}
+	reqFetch     = gitRequest{"fetch", http.MethodPost, "/git-upload-pack", false, gitserver.LabelUploadPack}
+	reqPushRefs  = gitRequest{"push refs", http.MethodGet, "/info/refs?service=git-receive-pack", true, gitserver.LabelInfoRefs}
+	reqPush      = gitRequest{"push", http.MethodPost, "/git-receive-pack", true, gitserver.LabelReceivePack}
+	gitRequests  = []gitRequest{reqFetchRefs, reqFetch, reqPushRefs, reqPush}
+)
 
 // to is the path of the request for the repository segment pair repo, such
 // as "acme/demo.git".
@@ -257,6 +249,28 @@ func (a answer) dump() string {
 		}
 	}
 	return b.String() + a.body
+}
+
+// grown is the series of the counter that after holds more of than before,
+// with how much more.
+func grown(before, after map[gitserver.RequestLabels]uint64) map[gitserver.RequestLabels]uint64 {
+	d := map[gitserver.RequestLabels]uint64{}
+	for k, n := range after {
+		if n > before[k] {
+			d[k] = n - before[k]
+		}
+	}
+	return d
+}
+
+// counted fails the test unless the counter grew from before by one request
+// of service with result.
+func (w *world) counted(t *testing.T, before map[gitserver.RequestLabels]uint64, service string, result gitserver.Result) {
+	t.Helper()
+	want := map[gitserver.RequestLabels]uint64{{Service: service, Result: result}: 1}
+	if got := grown(before, w.git.Requests()); !maps.Equal(got, want) {
+		t.Errorf("the counter grew by %v, want %v", got, want)
+	}
 }
 
 // call sends method path to the hub with the Authorization header auth (""
@@ -388,13 +402,7 @@ func fetchRequest(want string, haves ...string) string {
 // "acme/demo.git", on the hub, with password in its user information, as a
 // git client is given it.
 func (w *world) remote(password, repo string) string {
-	return remoteAt(w.URL("/"), password, repo)
-}
-
-// remoteAt is remote on the server at base, such as a proxy in front of
-// the hub.
-func remoteAt(base, password, repo string) string {
-	u, err := url.Parse(base)
+	u, err := url.Parse(w.URL("/"))
 	if err != nil {
 		panic(err)
 	}
@@ -408,10 +416,10 @@ type history struct {
 	// dates, a day apart.
 	main  [4]string
 	dates [4]time.Time
-	// small and big are the blob ids of a.txt (10 bytes) and big.bin
-	// (200 kB), and bigSum the SHA-256 of big.bin's content.
-	small, big string
-	bigSum     [sha256.Size]byte
+	// big is the blob id of big.bin (200 kB), and bigSum the SHA-256 of
+	// its content.
+	big    string
+	bigSum [sha256.Size]byte
 	// change is the commit refs/parley/changes/1/1 points at, which is on
 	// no branch, and dangling a commit no ref reaches.
 	change, dangling string
@@ -458,9 +466,9 @@ func (w *world) extendHistory(t *testing.T) history {
 	if _, err := gitrepotest.Run(w.repo, s.String(), "fast-import", "--quiet", "--force", "--date-format=raw"); err != nil {
 		t.Fatal(err)
 	}
-	ids := strings.Fields(gitrepotest.Git(t, w.repo, "rev-parse", "main~3", "main~2", "main~1", "main", "main:a.txt", "main:big.bin", "refs/parley/changes/1/1"))
+	ids := strings.Fields(gitrepotest.Git(t, w.repo, "rev-parse", "main~3", "main~2", "main~1", "main", "main:big.bin", "refs/parley/changes/1/1"))
 	copy(h.main[:], ids)
-	h.small, h.big, h.change = ids[4], ids[5], ids[6]
+	h.big, h.change = ids[4], ids[5]
 	h.dangling = gitrepotest.Git(t, w.repo, "commit-tree", "-m", "dangling", h.main[3]+"^{tree}")
 	w.head = h.main[3]
 	return h
