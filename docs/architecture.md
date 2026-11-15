@@ -3053,7 +3053,21 @@ writes the whole answer; otherwise the component serves it (`fetch.go`):
   (`Quarantine.Unmigrate`) as `AfterAbort`; for an accepted
   push the mapping stage (`MappingStage`, registered with
   `RegisterMappingStage`), given the accepted updates with their direct
-  flags and versions, whose lines go on the side band; for an accepted
+  flags and versions, whose lines go on the side band (`ChangeMapper`,
+  `changemap.go`, is one, which the hub does not register yet: it takes
+  each created or updated branch in command order, through a
+  `ChangeService`, to one `Outcome`: a version the ref writer reported is
+  a new version, with no call; otherwise the branch's draft or open change
+  is looked up, and one found records nothing; a direct push opens nothing
+  and is warned of only when the push has `parley.change` or
+  `parley.target`; such a push, or any push to a task fork whose
+  `auto_change` is true, opens a change with the push's session, and an
+  open refused with a `*ChangeExistsError` records a version of that
+  change instead; a failing call is the reason `internal error`, logged.
+  `Outcome.Line`, `pushreport.go`, words the lines
+  `change <workspace>#<number> version <n>`,
+  `change <workspace>#<number> version 1 (opened)` or
+  `(opened, draft)`, and `warning: no change for <branch>: <reason>`); for an accepted
   push `Writer.Finish`, which writes its `parley.git.push` events and
   tells the post-push listeners; then the answer.
   The quarantine is discarded on every outcome, after its objects moved
