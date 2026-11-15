@@ -3,6 +3,7 @@ package change
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/store"
 )
 
 // The event types of a change this package writes.
@@ -243,11 +245,91 @@ func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborato
 	return nil
 }
 
+// AutoLandSetterStep gives the change record who turned auto_land on: the
+// user (NULL for the admin token and the hub), the credential type and the
+// path globs of a path-scoped token (NULL for none), so that whoever starts
+// an automatic land knows what the setter could do. It applies after
+// SchemaStep.
+var AutoLandSetterStep = store.Step{
+	Name:   "change_auto_land_setter",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		for _, column := range []string{"auto_land_user_id TEXT", "auto_land_credential_type TEXT", "auto_land_paths TEXT"} {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE changes ADD COLUMN `+column); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
 // SetAutoLand stores value as the auto_land of the change number of the
 // workspace in tx, set by caller; the auto_land guard has been asked
-// before. A change that does not exist is the change-not-found error.
-func (c *Component) SetAutoLand(ctx context.Context, tx *sql.Tx, workspace string, number int64, value bool, _ Caller) error {
-	return update(ctx, tx, workspace, number, c.now(), `auto_land = ?`, value)
+// before. Turning it on stores the caller as its setter, turning it off
+// forgets the setter, and the value it already has changes nothing, so
+// that the setter is who turned it on. A change that does not exist is the
+// change-not-found error.
+func (c *Component) SetAutoLand(ctx context.Context, tx *sql.Tx, workspace string, number int64, value bool, caller Caller) error {
+	var current bool
+	err := tx.QueryRowContext(ctx, `SELECT auto_land FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&current)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return errChangeNotFound(workspace, number)
+	case err != nil:
+		return err
+	case current == value:
+		return nil
+	case !value:
+		return update(ctx, tx, workspace, number, c.now(),
+			`auto_land = 0, auto_land_user_id = NULL, auto_land_credential_type = NULL, auto_land_paths = NULL`)
+	}
+	var user, paths *string
+	if caller.UserID != "" {
+		user = &caller.UserID
+	}
+	if len(caller.Paths) > 0 {
+		b, err := json.Marshal(caller.Paths)
+		if err != nil {
+			return err
+		}
+		paths = new(string(b))
+	}
+	return update(ctx, tx, workspace, number, c.now(),
+		`auto_land = 1, auto_land_user_id = ?, auto_land_credential_type = ?, auto_land_paths = ?`, user, caller.actor().ActorType, paths)
+}
+
+// AutoLandSet is who turned a change's auto_land on: the user (nil for the
+// admin token and the hub), the type of the credential they used and the
+// path globs that credential is limited to (nil for none).
+type AutoLandSet struct {
+	UserID         *string
+	CredentialType string
+	Paths          []string
+}
+
+// AutoLandSetter reads, through q (the caller's transaction, or nil for the
+// store), who turned on the auto_land of the change number of the
+// workspace; found is false while auto_land is off. A change that does not
+// exist is the change-not-found error.
+func (c *Component) AutoLandSetter(ctx context.Context, q Querier, workspace string, number int64) (s AutoLandSet, found bool, err error) {
+	var credential, paths sql.NullString
+	err = c.querier(q).QueryRowContext(ctx, `SELECT auto_land_user_id, auto_land_credential_type, auto_land_paths
+	FROM changes WHERE workspace_slug = ? AND number = ?`, workspace, number).Scan(&s.UserID, &credential, &paths)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return AutoLandSet{}, false, errChangeNotFound(workspace, number)
+	case err != nil:
+		return AutoLandSet{}, false, err
+	case !credential.Valid:
+		return AutoLandSet{}, false, nil
+	}
+	s.CredentialType = credential.String
+	if paths.Valid {
+		if err := json.Unmarshal([]byte(paths.String), &s.Paths); err != nil {
+			return AutoLandSet{}, false, fmt.Errorf("the auto_land setter of %s: %w", Ref(workspace, number), err)
+		}
+	}
+	return s, true, nil
 }
 
 // ReadChange reads the change number of the workspace, without a scope or

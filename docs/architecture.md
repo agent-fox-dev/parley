@@ -3522,7 +3522,8 @@ push calls no linker. The three `POST` routes are registered with
 
 `internal/hub/change.go` adds the part `composeChanges`, after `composeSCM`
 in `parts`. It creates a zero `change.Component` (`Changes()`), adds
-`change.SchemaStep` (the step `changes`), registers its `Routes()` with
+`change.SchemaStep` (the step `changes`) and right after it
+`change.AutoLandSetterStep` (`change_auto_land_setter`), registers its `Routes()` with
 `AddRoute`, and binds it in the start hook `changes` to the store
 (`Store`), the hub's git opening `(*workspace.Service).RepoPath(slug)`
 (`Repos`), the access service (`Access`), `changeWorkspaces` (`Workspaces`), an adapter over
@@ -3664,8 +3665,15 @@ of `""` is none, measured from the empty tree),
 `SetLanded` (state `landed`, the `landed` object and the landed-commit
 records), `SetReverts`, `SetRevertedBy`, `SetAbandoned` (state `abandoned`
 with a reason; for a fork source it tells the `ForkActivity` recorder,
-whose error is logged) and, from `Open`, `SetAutoLand`. The move to
-`landed` tells no recorder.
+whose error is logged) and, from `Open` and the edit, `SetAutoLand`
+(`open.go`), which stores who turned `auto_land` on beside the flag (the
+columns of the schema step `AutoLandSetterStep`, `change_auto_land_setter`:
+the user's id, NULL for the admin token, the credential type and the
+token's `paths` globs, NULL for none), forgets them when it is turned off
+and changes nothing, `updated_at` included, for the value it already has;
+`AutoLandSetter(ctx, q, workspace, number)` reads them back as an
+`AutoLandSet`, not found while `auto_land` is off. The move to `landed`
+tells no recorder.
 
 What a deleted source does to a change is in `retention.go`; its three
 functions run in the caller's transaction and read only the change
@@ -3705,7 +3713,15 @@ the target workspace's `Unusable` (`409 workspace_busy`,
 `workspace_not_ready`, `workspace_archived`), then the operation, and
 answers the change re-read in the transaction. The routes declare
 `changes:write` and the need `read`, so a member who opened a change
-reaches it. The edit stores `labels`; the abandon goes through
+reaches it. The edit (`edit.go`) decodes the body into optional members
+and checks each before the transaction's writes; its operation applies,
+in order, the closed-change rules (`409 change_closed`), the intent rule
+on the change as the edit would leave it (`400 intent_required`), the
+`AutoLandGuard` for a body with `auto_land`, then one `update` of the
+members whose value differs and `SetAutoLand`; a `depends_on` member goes
+to the `StackLinker`'s `SetDependsOn` for a draft or open change while
+one is registered, and is ignored otherwise. A differing `target_branch`
+is answered `501 not_implemented` for now. The abandon goes through
 `(*change.Component).Abandon(ctx, tx, workspace, number, reason, actor)`,
 which is `SetAbandoned` and `parley.change.abandon` with the given reason;
 the restore sets the change `open` with `mergeable` `unknown` and writes

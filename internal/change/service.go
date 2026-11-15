@@ -12,7 +12,8 @@ import "context"
 //     SetRevertedBy, SetAbandoned);
 //   - through a Querier, their transaction or nil for the store: ReadChange,
 //     OpenChangeOfBranch, ChangeOfCommit, ChangesOfSession,
-//     ChangeNumbersOfSource and CheckOpen; OpenCounts reads the store;
+//     ChangeNumbersOfSource, CheckOpen and AutoLandSetter; OpenCounts reads
+//     the store;
 //   - without the store: Authorize, the access rule of an open;
 //   - while the hub is composed, to register on the instance what they
 //     compute about a change: RegisterSessionLinker, RegisterStackLinker,

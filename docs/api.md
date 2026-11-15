@@ -3909,8 +3909,31 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
 `workspace_archived`. Each route answers `200` with the change object as
 `GET …/changes/{number}` returns it.
 
-- `PATCH` takes a JSON object; `labels`, an array of strings, replaces
-  the change's labels. Members it does not know are ignored.
+- `PATCH` takes a JSON object whose members `title`, `intent`, `labels`,
+  `auto_land`, `state` and `target_branch` edit the change; a member the
+  body does not name keeps its value, and members it does not know are
+  ignored. Every member it names is checked before anything is stored,
+  and one that fails refuses the whole body with `400` `invalid_request`:
+  `title` a string of 1 to 200 characters (Unicode code points; white
+  space only is empty) without a line feed or carriage return, `intent` a
+  string of at most 16,000 characters, `labels` an array of strings,
+  which replaces the whole list after its duplicates are removed (the
+  first kept), of at most 20 labels each matching
+  `^[a-z0-9][a-z0-9_.:/-]{0,62}$`, `auto_land` `true` or `false`, `state`
+  `"draft"` or `"open"`, and `target_branch` a string; `null` is the
+  wrong type for each. A body that names none of them changes nothing,
+  `updated_at` included, whatever the change's state. An abandoned change
+  takes no edit and a landed one only an edit of `labels` alone: else
+  `409` `change_closed`. An edit that would leave the change `open` with
+  an empty intent while `{slug}`'s `changes.require_intent` is on is
+  answered `400` `intent_required`. A body with `auto_land` asks the
+  `auto_land` guard, when one is registered, before anything is stored;
+  its refusal is the answer and nothing of the body is applied. A
+  `state` of `"open"` on a draft stores the state. A `target_branch`
+  other than the change's own is answered `501` `not_implemented` (a
+  change cannot be retargeted yet). The members are stored together, and
+  `updated_at` advances only when a stored value changes; editing
+  `title`, `intent`, `labels` or `auto_land` writes no event.
 - `POST …/abandon` takes no body or a JSON object with `reason`, a string,
   and moves the change to `abandoned`, writing `parley.change.abandon` by
   the caller with `reason` as given (the empty string when absent),

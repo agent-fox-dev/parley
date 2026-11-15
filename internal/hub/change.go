@@ -74,6 +74,7 @@ func composeChanges(c *Composition) {
 	comp := &change.Component{}
 	c.changes = comp
 	c.AddSchemaStep(change.SchemaStep)
+	c.AddSchemaStep(change.AutoLandSetterStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
