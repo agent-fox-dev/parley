@@ -10,9 +10,10 @@ import (
 
 // restackConflicted stores, in a transaction of its own, that the restack
 // of the change ch, whose commits after base up to head were replayed onto
-// onto, found the conflict of res.report, and moves nothing: no branch, and
-// no restack of the changes above, which still sit on ch as it is. The
-// change needs a restack for the conflict, set before its mergeability is
+// onto, found the conflict of res.report, named with the landed changes it
+// collided with (attribute), and moves nothing: no branch, and no restack
+// of the changes above, which still sit on ch as it is. The change needs a
+// restack for the conflict, set before its mergeability is
 // stored with the report, so that the parley.change.conflict the storing
 // function writes, when the change was not in conflict already, says so; a
 // change in conflict already gets the new report and no event. The pending
@@ -21,6 +22,10 @@ import (
 // longer has, and the restack starts again. The result carries the
 // report as stored.
 func (c *Component) restackConflicted(ctx context.Context, j restackJob, ch Change, res restackResult, onto string) (restackResult, bool, error) {
+	// Attributed before the transaction, which the attribution's reads of
+	// the store would wait for.
+	report := restackReport(res.report, onto, res.head, baseColumn(ch.BaseSHA))
+	c.attribute(ctx, j.workspace, report)
 	again := false
 	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		now, err := readChange(ctx, tx, j.workspace, j.number)
@@ -41,7 +46,7 @@ func (c *Component) restackConflicted(ctx context.Context, j restackJob, ch Chan
 		if err := c.SetNeedsRestack(ctx, tx, j.workspace, j.number, true, new(RestackConflict)); err != nil {
 			return err
 		}
-		res.report = restackReport(res.report, onto, res.head, baseColumn(now.BaseSHA))
+		res.report = report
 		return c.StoreMergeability(ctx, tx, j.workspace, j.number, res.head, onto, res.report)
 	})
 	if err != nil || again {
@@ -53,18 +58,24 @@ func (c *Component) restackConflicted(ctx context.Context, j restackJob, ch Chan
 // restackReport is the report of a restack that replayed the commits of
 // a change after base up to head onto onto: the replay's report, measured
 // from the change's own base rather than a merge base, since only the
-// change's commits were replayed. Which landed changes the conflict
-// involves, and the change itself, are not known here, so they stay empty.
+// change's commits were replayed, and naming no change.
 func restackReport(r *gitrepo.ConflictReport, onto, head, base string) *gitrepo.ConflictReport {
 	out := *r
-	out.TargetSHA, out.HeadSHA, out.BaseSHA = onto, head, base
-	out.LandedChanges, out.Change = nil, nil
-	out.Files = make([]gitrepo.ConflictFile, len(r.Files))
-	for i, f := range r.Files {
-		f.LandedBy = nil
-		out.Files[i] = f
-	}
+	out.TargetSHA, out.HeadSHA, out.BaseSHA, out.Change = onto, head, base, nil
 	return &out
+}
+
+// attribute names in report, a conflict of a replay in the workspace, the
+// landed changes it collided with, through the attribution the hub gives
+// (Deps.Attribute). An attribution that cannot be read is logged and the
+// report stands without it, since the conflict it reports is no less one.
+func (c *Component) attribute(ctx context.Context, workspace string, report *gitrepo.ConflictReport) {
+	if report == nil || c.deps.Attribute == nil {
+		return
+	}
+	if err := c.deps.Attribute(ctx, workspace, report); err != nil {
+		c.deps.Logger.Warn("conflict not attributed", "workspace", workspace, "error", err)
+	}
 }
 
 // holdsRestackConflict reports whether the change ch holds the conflict its

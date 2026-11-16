@@ -3057,7 +3057,7 @@ The conflict report has every member, whichever is empty:
 | `base_sha` | the merge base: `merge_base_sha` |
 | `commit_sha` | the first commit of `head` that did not apply |
 | `files` | the conflicted files, in byte order of path: `{"path": …, "kind": …, "base": …, "ours": …, "theirs": …, "landed_by": []}` |
-| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` in a comparison, filled in [a land's conflict report](#landing) |
+| `landed_changes` | the changes landed on the target between `base_sha` and `target_sha` that changed a conflicted file, as in [a land's conflict report](#landing) |
 | `change` | the change whose head was rebased; always `null` in a comparison |
 
 In a conflicted file, `base`, `ours` and `theirs` are the file on each side
@@ -3065,13 +3065,19 @@ of the three-way merge that failed, `{"sha": …, "mode": …, "path": …}` (th
 blob id, git's six-digit octal mode and the path on that side, which a rename
 makes differ), or `null` on a side the file does not exist on: `base` the
 failed commit's parent, `ours` the target with the commits of `head` before
-the failed one replayed on it, `theirs` the failed commit. `kind` is
-`content` when both sides changed the same lines, `add_add` when both added
-the path, `modify_delete` when the target changed a file the head deleted,
-`delete_modify` for the reverse, and `rename`, `mode` (a file on one side, a
-symlink or another type on the other), `binary` or `submodule` where git
-names the conflict so. `landed_by` lists the landed changes that changed the
-file; always `[]` in a comparison.
+the failed one replayed on it, `theirs` the failed commit. `kind` is one
+per file, the first that applies of: `submodule` (a side holds a submodule,
+mode `160000`), `binary` (both sides changed a file git treats as binary),
+`rename` (the sides renamed the file in ways that clash), `add_add` (both
+added the path with different content, or one put a file where the other
+put a directory), `modify_delete` (the target changed a file the head
+deleted), `delete_modify` (the target deleted a file the head changed),
+`mode` (the sides hold the file with different modes, such as a file and a
+symlink, or the same content added with two modes) and `content` (both
+changed the same lines). A file git moved aside to `<path>~<commit>` to
+record both sides is reported at its own `path`. `landed_by` lists the
+numbers of the landed changes in `landed_changes` that changed the file,
+`[]` for none.
 
 | Status | When |
 |---|---|
@@ -3544,9 +3550,9 @@ the conflicted files in byte order of path, each with its `kind`
 (`content`, `add_add`, `modify_delete`, `delete_modify`, `rename`, `mode`,
 `binary`, `submodule`) and the file on each side, `base` (the commit's
 parent), `ours` (`onto` with the commits replayed before it) and `theirs`
-(the commit), `null` on a side that lacks it. `landed_changes`, each
-`landed_by` and `change` are empty or `null` here: only [a land's conflict
-report](#landing) names the landed changes that touched the files.
+(the commit), `null` on a side that lacks it. `landed_changes` and each
+`landed_by` name the landed changes that touched the files, as in [a
+land's conflict report](#landing), and `change` is `null`.
 
 ```json
 {"error":{"code":409,"message":"commit 3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8 of refs/heads/clash does not apply on top of b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","error_type":"rebase_conflict","details":{"target_sha":"b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","head_sha":"2d165dbfc00967ebdead889de8ba17e45a81f98d","base_sha":"a5bc5c5cd7650975def32e01a71d7011f00bfeb6","commit_sha":"3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8","files":[{"path":"a.txt","kind":"content","base":{"sha":"814f4a422927b82f5f8a43f8fab6d3839e3983f2","mode":"100644","path":"a.txt"},"ours":{"sha":"4c1ee586b89c236961f884e55c2745659e6e45f6","mode":"100644","path":"a.txt"},"theirs":{"sha":"08a39ce7008d263b922cbee785e726af46facfac","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}}
@@ -4231,8 +4237,9 @@ replaces the report and writes no event. The report has the members
 `target_sha` (the commit the change was replayed onto), `head_sha` (the
 change's head), `base_sha` (the change's `base_sha`), `commit_sha` (the
 first of the change's own commits that did not apply), `files` (each with
-`path`, `kind`, `base`, `ours`, `theirs` and `landed_by` `[]`),
-`landed_changes` `[]` and `change` `null`. A mergeability check of the
+`path`, `kind`, `base`, `ours`, `theirs` and `landed_by`),
+`landed_changes`, as in [a land's conflict report](#landing), and `change`
+`null`. A mergeability check of the
 change that was scheduled before the restack stored the conflict keeps
 that report. When the change gets a version or the commit it must sit on
 moves while the replay runs, the restack starts again instead.

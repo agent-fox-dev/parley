@@ -6,16 +6,18 @@ import "encoding/json"
 const (
 	// ConflictContent: both sides changed the same lines.
 	ConflictContent = "content"
-	// ConflictAddAdd: both sides added the path.
+	// ConflictAddAdd: both sides added the path with different content,
+	// or one side a file and the other a directory there.
 	ConflictAddAdd = "add_add"
-	// ConflictModifyDelete: the target changed a file the head deleted.
+	// ConflictModifyDelete: the target (ours) changed a file the head
+	// (theirs) deleted.
 	ConflictModifyDelete = "modify_delete"
 	// ConflictDeleteModify: the target deleted a file the head changed.
 	ConflictDeleteModify = "delete_modify"
 	// ConflictRename: the sides renamed a file in ways that clash.
 	ConflictRename = "rename"
-	// ConflictMode: the sides gave the path different types, such as a
-	// file and a symlink.
+	// ConflictMode: the sides hold the path with different modes, such as
+	// a file and a symlink, or the same content added with two modes.
 	ConflictMode = "mode"
 	// ConflictBinary: both sides changed a binary file.
 	ConflictBinary = "binary"
@@ -27,10 +29,13 @@ const (
 // target: the commit that did not apply and the files it conflicts on. It
 // is the hub's one conflict report, whichever operation found the conflict.
 // Encoded as JSON, every member is present: a list it has none of is [],
-// and Change is null when it names none.
+// and Change is null when it names none. Every commit and blob id is the
+// full 40-character lowercase id.
 type ConflictReport struct {
 	// TargetSHA is the commit the head was rebased onto, HeadSHA the head's
-	// commit, and BaseSHA their merge base, "" (null) when they share no
+	// commit, and BaseSHA the commit the head's replayed commits were based
+	// on: the base a replay of a branch's own commits was given, otherwise
+	// the merge base of target and head, "" (null) when they share no
 	// ancestor.
 	TargetSHA string `json:"target_sha"`
 	HeadSHA   string `json:"head_sha"`
@@ -49,7 +54,8 @@ type ConflictReport struct {
 
 // ConflictFile is one conflicted file of a ConflictReport.
 type ConflictFile struct {
-	// Path is the file's path, the first path git names for the conflict.
+	// Path is the file's path, the first path git names for the conflict,
+	// as it was before git moved a side aside to <path>~<label>.
 	Path string `json:"path"`
 	// Kind is one of ConflictContent, ConflictAddAdd, ConflictModifyDelete,
 	// ConflictDeleteModify, ConflictRename, ConflictMode, ConflictBinary and

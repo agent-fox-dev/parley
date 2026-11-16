@@ -166,7 +166,8 @@ func (c *Component) runChecks(ctx context.Context) {
 // change's head and onto-commit, trial-rebases the head onto it in the
 // target's repository under the deadline, only the change's own commits for
 // a change in a stack (ownBase), and stores the result when they and the
-// change's base are still the change's, unless a restack stored its
+// change's base are still the change's, a conflict named with the landed
+// changes it collided with (attribute), unless a restack stored its
 // conflict since the check was scheduled (holdsRestackConflict), or a
 // conflict of the change's head onto its target's head was
 // (holdsTargetConflict); a pair that moved on is scheduled again. A
@@ -210,6 +211,7 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		c.checkFailed(ctx, k, err)
 		return
 	}
+	c.attribute(ctx, k.workspace, report)
 	var moved bool
 	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		now, ontoNow, live, err := c.mergePair(ctx, tx, k.workspace, k.number)

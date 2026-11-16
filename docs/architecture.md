@@ -3290,7 +3290,10 @@ event log (`Events`, `(*Composition).Events()`) and the hub's logger
 dependencies. `(*Composition).SCM()` returns the component. The change
 part sets `Changes` (`OpenChangeOfBranch`, `ChangeOfCommit`) through
 `AdjustSCM` and registers the `ChangeLinker` (see [Changes](#changes)).
-The land part sets `Sessions` (`SessionOf`) through `AdjustSCM` to
+The land part sets `Attribute` through `AdjustSCM` to
+`(*land.Component).Attribute`, which the comparison and the server-side
+rebase call on their conflict report (an error is logged and the report
+answered without it), and `Sessions` (`SessionOf`) to
 `commitSessions` (`internal/hub/land.go`), which answers from the records
 that hold sessions: for the head of a change's version, the session of
 the first version with that head (`(*change.Component).SessionOfHead`);
@@ -3298,6 +3301,12 @@ for a commit a land wrote in place of a version's commit
 (`ChangeOfCommit`, `Landed` with a `LandedFrom` other than the commit),
 the session of the attempt that landed the change
 (`(*land.Component).SessionOfLanding`); none for any other commit.
+It sets `change.Deps.Attribute` to the same function through
+`AdjustChange`, which the mergeability check calls on the report of its
+trial, outside any transaction, and a restack on the report of its replay,
+before its transaction; `internal/change` and `internal/scm` cannot import
+`internal/land`, so they take the attribution as a function value, and nil
+names no landed change.
 `Recorder` keeps its default, which records nothing, and no
 `SessionLinker` is registered: the session feature and the metric export
 are not in the hub yet.
@@ -3367,7 +3376,17 @@ merge base, the counts (`AheadBehind`), the first 200 commits only `head`
 has (`CommitsBetween`, `ReadCommits`, commit objects without `stats`) and
 the first 5,000 file changes from the merge base to `head` (`DiffChanges`,
 the empty tree when there is none). It needs git 2.40 or later, the first
-whose `merge-tree` takes `--merge-base`.
+whose `merge-tree` takes `--merge-base`. The replay (`replay`,
+`rebase.go`), which `Rebase`, `RebaseFrom`, `RebaseFromAs`, `TrialRebase`
+and `TrialRebaseFrom` share, merges each commit with `merge-tree
+--write-tree --messages`; a conflict is parsed from its stage entries and
+messages (`parseConflicts`), a side git moved aside to `<path>~<commit>`
+is given back its own path (`asidePath`), the files are sorted by path, and
+each gets one kind (`conflictKind`), the first that applies of submodule,
+binary, rename, add_add (no base and different content, or git's
+`CONFLICT (file/directory)`), modify_delete, delete_modify, mode (git's
+`CONFLICT (distinct modes)`, or two modes on ours and theirs) and content,
+the target being ours and the commit theirs.
 The blame route looks the file up (`LookupFile`), refuses a file over 2 MiB
 before reading it, reads it (`WriteBlob`) to refuse a binary one (a NUL
 byte in its first 8,000 bytes, as git decides) and to count its lines, which
@@ -3792,8 +3811,9 @@ through `StoreMergeability` for the pair of the head it read and the
 commit it replayed onto, so that the `parley.change.conflict` that
 function writes on a transition carries `needs_restack` `true`. The report
 (`restackReport`) is the replay's, with `target_sha` that commit,
-`head_sha` the head, `base_sha` the change's base, and no landed changes,
-`landed_by` or change. No branch moves and nothing is recorded for the
+`head_sha` the head, `base_sha` the change's base, and no change; the
+landed changes and each file's `landed_by` are named by the attribution
+(`Deps.Attribute`), before the transaction. No branch moves and nothing is recorded for the
 changes above. Otherwise (`swapRestack`), in one `Store.Tx`,
 it reads the change and the commit to sit on again (a new `head_sha` or
 `base_sha`, or a moved commit: the attempt starts again; a replay that
@@ -4430,8 +4450,9 @@ became. A replay that conflicts is reported in the hub's one
 classified them. `conflict` (`conflict.go`) completes the land's report:
 `target_sha` the head the attempt replayed onto, `head_sha` and
 `base_sha` of the stored version, `change` the number in a stack land.
-`(*land.Component).Attribute(ctx, workspace, report)`, exported for the
-other producers of a report, adds the landed changes: when `base_sha` is
+`(*land.Component).Attribute(ctx, workspace, report)`, which the hub
+hands the other producers of a report (comparison, server-side rebase,
+mergeability check, restack) as a function value, adds the landed changes: when `base_sha` is
 an ancestor of `target_sha`, it walks `CommitsBetween(base, target)`,
 keeps the commits `(*change.Component).ChangeOfCommit` finds landed, and
 those whose `ChangedPaths` meet a path of a conflicted file's sides give

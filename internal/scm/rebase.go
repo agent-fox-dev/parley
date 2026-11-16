@@ -114,6 +114,7 @@ func (c *Component) rebase(w http.ResponseWriter, r *http.Request, wr *write) er
 	case err != nil:
 		return err
 	case conflict != nil:
+		c.attribute(ctx, wr.ws.Slug, conflict)
 		return server.NewError("rebase_conflict", http.StatusConflict,
 			fmt.Sprintf("commit %s of %s does not apply on top of %s", conflict.CommitSHA, branch, onto.SHA)).
 			WithDetails(conflict)

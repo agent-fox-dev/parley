@@ -2,10 +2,14 @@ package land_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
 
@@ -75,4 +79,71 @@ func TestAttribute_NamesTheLandedChangesThatTouchedEachConflictedFile(t *testing
 			}
 		})
 	}
+}
+
+func TestConflictReports_NameTheLandedChangesWhicheverOperationFoundThem(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	base := commit(t, w.api, "main", w.base, "f", map[string]string{"f.txt": "l1\nl2\nl3\n"})
+	commit(t, w.api, "one", base, "one", map[string]string{"f.txt": "l1\nl2\none\n"})
+	commit(t, w.api, "two", base, "two", map[string]string{"f.txt": "l1\nl2\ntwo\n"})
+	commit(t, w.api, "three", base, "three", map[string]string{"f.txt": "l1\nl2\nthree\n"})
+	one, two := w.openBranch(t, "one", w.caller()), w.openBranch(t, "two", w.caller())
+	landed := w.landNow(t, one, w.caller(), nil)
+	w.mergeable(t, two.Number, change.MergeableConflict)
+	wantLanded := []any{map[string]any{"number": float64(one.Number), "title": one.Title,
+		"landed_sha": *landed.LandedSHA, "session_id": nil}}
+
+	// In this order: a restack's conflict replaces the one the check stored.
+	for _, c := range []struct {
+		name   string
+		report func(t *testing.T) map[string]any
+	}{
+		{"the mergeability check", func(t *testing.T) map[string]any {
+			var report map[string]any
+			if err := json.Unmarshal(w.readChange(t, two.Number).Conflict, &report); err != nil {
+				t.Fatalf("change %d stores the conflict %s: %v", two.Number, w.readChange(t, two.Number).Conflict, err)
+			}
+			return report
+		}},
+		{"the comparison", func(t *testing.T) map[string]any {
+			status, answer := w.get(t, "/workspaces/api/scm/compare?base=main&head=three", w.ownerKey)
+			if status != http.StatusOK {
+				t.Fatalf("the comparison answered %d %v", status, answer)
+			}
+			report, _ := answer["conflict"].(map[string]any)
+			return report
+		}},
+		{"the server-side rebase", func(t *testing.T) map[string]any {
+			return conflictDetails(t, w, "/api/v1/workspaces/api/scm/rebase", map[string]any{"branch": "three", "onto": "main"})
+		}},
+		{"the restack", func(t *testing.T) map[string]any {
+			return conflictDetails(t, w, fmt.Sprintf("/api/v1/workspaces/api/changes/%d/restack", two.Number), map[string]any{})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			report := c.report(t)
+			if !reflect.DeepEqual(report["landed_changes"], any(wantLanded)) {
+				t.Errorf("landed_changes is %v, want %v", report["landed_changes"], wantLanded)
+			}
+			files, _ := report["files"].([]any)
+			file, _ := files[0].(map[string]any)
+			if len(files) != 1 || file["path"] != "f.txt" || !reflect.DeepEqual(file["landed_by"], []any{float64(one.Number)}) {
+				t.Errorf("the report's files are %v, want f.txt landed by %d", files, one.Number)
+			}
+		})
+	}
+}
+
+// conflictDetails posts body to path with the owner's key and returns the
+// conflict report of its 409 rebase_conflict answer.
+func conflictDetails(t *testing.T, w *world, path string, body any) map[string]any {
+	t.Helper()
+	status, raw := w.Call(t, http.MethodPost, path, w.ownerKey, body)
+	var answer map[string]any
+	if err := json.Unmarshal(raw, &answer); err != nil || status != http.StatusConflict || errorType(answer) != "rebase_conflict" {
+		t.Fatalf("POST %s answered %d %s, want 409 rebase_conflict", path, status, raw)
+	}
+	report, _ := answer["error"].(map[string]any)["details"].(map[string]any)
+	return report
 }

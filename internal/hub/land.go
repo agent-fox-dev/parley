@@ -64,6 +64,12 @@ const (
 // The source control API's session lookup (commitSessions) is set here
 // through AdjustSCM, since it asks the change records and the land
 // attempts, which hold the sessions of the writes that introduced commits.
+// The landing's attribution of a conflict to the landed changes it
+// collided with (Attribute) is handed, as a function value, to the source
+// control API through AdjustSCM and to the change component through
+// AdjustChange, which cannot import the landing: the comparison, the
+// server-side rebase, the mergeability check and the restack thus name
+// the landed changes in their conflict reports as a land does.
 //
 // The teardown of a workspace deletes its land attempts in the delete's
 // transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
@@ -79,7 +85,8 @@ func composeLand(c *Composition) {
 		c.AddRoute(r)
 	}
 	c.workspaces.Teardown().RegisterRemover(comp.WorkspaceDeleted)
-	c.AdjustSCM(func(d *scm.Deps) { d.Sessions = commitSessions{c.changes, comp} })
+	c.AdjustSCM(func(d *scm.Deps) { d.Sessions, d.Attribute = commitSessions{c.changes, comp}, comp.Attribute })
+	c.AdjustChange(func(d *change.Deps) { d.Attribute = comp.Attribute })
 	comp.AddAfterLanding(func(ctx context.Context, in land.AfterLanding) error {
 		var errs []error
 		for _, ch := range in.Changes {

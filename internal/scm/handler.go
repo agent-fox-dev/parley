@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -122,6 +123,10 @@ type Deps struct {
 	// Sessions names the session that introduced a commit; nil names
 	// none.
 	Sessions SessionLookup
+	// Attribute names, in a conflict report of the workspace, the landed
+	// changes the conflict collided with; nil names none, and the report's
+	// lists stay empty.
+	Attribute func(ctx context.Context, workspace string, report *gitrepo.ConflictReport) error
 	// Recorder is told of every request a read or write route handles;
 	// nil tells no one.
 	Recorder Recorder
@@ -199,6 +204,19 @@ func (c *Component) Bind(d Deps) {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
 	c.deps = d
+}
+
+// attribute names in report, a conflict of a replay in the workspace, the
+// landed changes it collided with, through the attribution the hub gives
+// (Deps.Attribute). An attribution that cannot be read is logged and the
+// report stands without it, since the conflict it reports is no less one.
+func (c *Component) attribute(ctx context.Context, workspace string, report *gitrepo.ConflictReport) {
+	if report == nil || c.deps.Attribute == nil {
+		return
+	}
+	if err := c.deps.Attribute(ctx, workspace, report); err != nil {
+		c.deps.Logger.Warn("conflict not attributed", "workspace", workspace, "error", err)
+	}
 }
 
 // Routes are the read and write routes, for the server's router. The

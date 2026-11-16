@@ -132,7 +132,8 @@ func (r *Repo) trialCommit(ctx context.Context, tree string) (string, error) {
 
 // mergeTree merges the commit theirs into ours with the commit base as the
 // merge base, writing the result's objects, and returns the merged tree,
-// or the conflicted files when it does not merge cleanly.
+// or the conflicted files, in byte order of path, when it does not merge
+// cleanly.
 func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string, []ConflictFile, error) {
 	out, _, err := r.g.runOutput(ctx, access{}, nil, "--git-dir="+r.dir, "merge-tree", "--write-tree", "-z",
 		"--messages", "--merge-base="+base, ours, theirs)
@@ -144,12 +145,14 @@ func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string
 		// merge-tree exits with 1 when the merge has conflicts.
 		files, perr := parseConflicts(out)
 		for i := range files {
+			files[i].Path = asidePath(files[i].Path, ours, theirs)
 			for _, side := range []*ConflictSide{files[i].Base, files[i].Ours, files[i].Theirs} {
 				if side != nil {
 					side.Path = asidePath(side.Path, ours, theirs)
 				}
 			}
 		}
+		slices.SortFunc(files, func(a, b ConflictFile) int { return strings.Compare(a.Path, b.Path) })
 		return "", files, perr
 	}
 	return "", nil, err
@@ -157,9 +160,10 @@ func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string
 
 // asidePath is the path of a side of a conflict before git moved it aside.
 // To record both sides of a path the sides give different types, such as
-// a file and a symlink, git renames one of them to <path>~<label>, the label
-// being the commit merge-tree was given for that side; that path exists on
-// no side, and the side's own path is <path>.
+// a file and a symlink, or a file and a directory, git renames one of
+// them to <path>~<label>, the label being the commit merge-tree was given
+// for that side; that path exists on no side, and the side's own path is
+// <path>.
 func asidePath(path, ours, theirs string) string {
 	for _, label := range []string{ours, theirs} {
 		if p, ok := strings.CutSuffix(path, "~"+label); ok && p != "" {
@@ -258,17 +262,23 @@ func parseConflicts(out []byte) ([]ConflictFile, error) {
 		f.Kind = conflictKind(c.types, sides)
 		files = append(files, f)
 	}
-	slices.SortFunc(files, func(a, b ConflictFile) int { return strings.Compare(a.Path, b.Path) })
 	return files, nil
 }
 
 // conflictKind is the kind of a conflicted file whose messages are of the
-// types types and whose sides, by stage, are sides: what git names the
-// conflict when it names a submodule, a binary file, a rename or two types,
-// and otherwise which sides hold the file.
+// types types and whose sides, by stage, are sides: the first that applies
+// of submodule, binary and rename, as git names the conflict; add_add for
+// a file both sides added with different content, or a file one side put
+// where the other put a directory; modify_delete and delete_modify for a
+// file one side deleted, the target being ours and the change theirs; mode
+// for sides that hold the file with different modes, such as a file and a
+// symlink, or the same content added with two modes; content otherwise.
+// One kind for each path, in an order that goes from what a text
+// resolution can least express to what it can.
 func conflictKind(types []string, sides [4]*ConflictSide) string {
 	has := func(match func(string) bool) bool { return slices.ContainsFunc(types, match) }
 	submodule := slices.ContainsFunc(sides[1:], func(s *ConflictSide) bool { return s != nil && s.Mode == "160000" })
+	base, ours, theirs := sides[1], sides[2], sides[3]
 	switch {
 	case submodule || has(func(t string) bool { return strings.Contains(t, "submodule") }):
 		return ConflictSubmodule
@@ -276,17 +286,16 @@ func conflictKind(types []string, sides [4]*ConflictSide) string {
 		return ConflictBinary
 	case has(func(t string) bool { return strings.Contains(t, "rename") }):
 		return ConflictRename
-	case has(func(t string) bool { return t == "CONFLICT (distinct modes)" }):
-		return ConflictMode
-	}
-	base, ours, theirs := sides[1] != nil, sides[2] != nil, sides[3] != nil
-	switch {
-	case !base && ours && theirs:
+	case has(func(t string) bool { return t == "CONFLICT (file/directory)" }),
+		base == nil && ours != nil && theirs != nil && ours.SHA != theirs.SHA:
 		return ConflictAddAdd
-	case base && ours && !theirs:
+	case base != nil && ours != nil && theirs == nil:
 		return ConflictModifyDelete
-	case base && !ours && theirs:
+	case base != nil && ours == nil && theirs != nil:
 		return ConflictDeleteModify
+	case has(func(t string) bool { return t == "CONFLICT (distinct modes)" }),
+		ours != nil && theirs != nil && ours.Mode != theirs.Mode:
+		return ConflictMode
 	}
 	return ConflictContent
 }

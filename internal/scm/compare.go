@@ -67,6 +67,7 @@ func (c *Component) getCompare(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	c.attribute(ctx, rd.ws.Slug, conflict)
 	answer := compareAnswer{BaseSHA: base.SHA, HeadSHA: head.SHA, Mergeable: mergeableClean, Conflict: conflict}
 	if conflict != nil {
 		answer.Mergeable = mergeableConflict
