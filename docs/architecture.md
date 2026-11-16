@@ -12,6 +12,7 @@ command-line client. Both are written in Go, in the module
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`, and the maintenance task `token_binding_sweep`, `SweepBindings`) |
+| `internal/awareness` | awareness of other work: the index of the files each draft and open change touches, kept from the event log by a background worker, the overlaps between changes and their `parley.change.overlap` events, the activity query, and claims with their expiry, links to changes and cleanup (see [Awareness](#awareness)) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/change` | the changes: the change record and its versions (`SchemaStep`), opening (`Open`, `CheckOpen`, `Authorize`), recording versions (`RecordVersion`, and `RefUpdated`, the ref writer's ref-updated stage), retention (`SourceDeleted`, `ForkDeleted`, `WorkspaceDeleted`), the lookups and setters other features call in their own store transaction, the collaborators registered on the instance, and the routes under `/workspaces/:slug/changes` (see [Changes](#changes)) |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
@@ -502,6 +503,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AdjustAutoLand(func(*land.AutoLandDeps))` | a change to the automatic lander's dependencies, applied after the start hook `auto-land` builds them and before it binds them, in the order added; tests set its clock and interval with it |
 | `AdjustPolicy(func(*policy.Deps))` | a change to the policy component's dependencies, applied after the start hook `policy` builds them and before it binds them, in the order added |
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
+| `AdjustAwareness(func(*awareness.Deps))` | a change to the awareness component's dependencies, applied after the start hook `awareness` builds them and before it binds them, in the order added; tests set the index and expiry intervals or replace the event source, the change reader or the repositories with it |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
 `composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
@@ -4364,8 +4366,9 @@ and `overlaps`, each served by the `change.Expander` (`func(ctx, Change)
 outside those four panics); a name without an expander adds no member, and
 the members follow the change's own in that order. The hub registers
 `(*Component).Stack` for `stack`, and the policy component's
-`ExpandApprovals` and `ExpandChecks` for `approvals` and `checks`; no
-feature registers `overlaps` yet.
+`ExpandApprovals` and `ExpandChecks` for `approvals` and `checks`, and
+the awareness component's `Overlaps` for `overlaps` (see
+[Awareness](#awareness)).
 
 The diff (`diff.go`), `GET /workspaces/:slug/changes/:number/diff` with
 the same scope, need and contributor-table pattern, resolves its change
@@ -5029,6 +5032,119 @@ compare-and-swap against no ref, the next name on a lost race), opens the
 change with `change.Open` (`KindRevert`, `Reverts`, `AfterMove`,
 `SourceGranted`) and writes `parley.change.revert` in that transaction; an
 open that still fails deletes the branch again through the ref writer.
+
+### Awareness
+
+`internal/awareness` shows agents the other work on their paths: an index
+of the files each in-flight change touches, the overlaps it implies and
+their announcement, the activity query, and claims. `composeAwareness`
+(`internal/hub/awareness.go`) is the last part of `parts`, since it reads
+the change component, the event component, the access rule and the
+workspace service the earlier parts create. The package imports neither
+`internal/change` nor `internal/hub`: it declares what it needs in
+`deps.go` and the part adapts the hub's components to it.
+
+- `Deps.Events` is an `EventSource`, `ReadAfter(ctx, after, limit)`, which
+  `*event.Component` satisfies as it is; `Deps.Emitter` takes events in the
+  caller's transaction (`c.Events()`).
+- `Deps.Changes` is a `ChangeReader`, `ReadChange(ctx, q, workspace,
+  number) (awareness.Change, error)`, `ErrChangeNotFound` for none; the
+  hub's adapter `awarenessChanges` maps `(*change.Component).ReadChange`
+  onto the package's own `Change` (state, target, version, base and head,
+  `depends_on`, session, landed commit and time, and the summary members of
+  an overlap entry).
+- `Deps.Repos` opens a workspace's repository with the hub's git;
+  `Deps.DefaultBranch` reads a workspace's default branch
+  (`workspace.BySlug`); `Deps.Owns` is the access rule's `CanWrite` (level
+  owner), asked before a claim is renewed or released by someone other
+  than its creator or the admin token.
+- `Deps.Config` holds the three `[awareness]` keys (`ConfigKeys`,
+  `ConfigFrom`, which a configuration check of the part runs, so a default
+  longer than the maximum stops the start); `Deps.IndexInterval` (1 s) and
+  `Deps.ExpiryInterval` (1 min) are the two background periods, which tests
+  change through `(*Composition).AdjustAwareness`. `(*Composition).Awareness()`
+  returns the component.
+- The session interface, `Sessions` (`Check`, the session-linking rule, and
+  `Record`, the claim link of a session), is registered on the instance with
+  `RegisterSessions`. The hub registers none: until the agent sessions
+  feature does, every claim that names a `session_id` is refused `400`
+  `unknown_session`.
+
+The store schema is two steps. `SchemaStep` (`awareness_index`) creates
+`awareness_changes` (per workspace and number: target branch, `phase`
+`in_flight`, `landed` or `out`, landed commit and time, session),
+`awareness_files` (workspace, number, path), `awareness_pairs` (the
+announced pairs, workspace and the two numbers, lower first) and
+`awareness_position` (the one row of the worker's position in the event
+log). `ClaimSchemaStep` (`awareness_claims`) creates `awareness_claims`,
+times in UnixNano, with `ended_at` set when a claim is released, expired
+or fulfilled.
+
+**The index worker** (`worker.go`, `index.go`) runs as background work
+`awareness_index` (grace 5 s): `Run` calls `Pass` every `IndexInterval`, and
+passes are serialised by a mutex, so a test's own `Pass` never races the
+background one. A pass reads the log in batches of 100 from the stored
+position and acts on `parley.change.version`, `parley.change.land`,
+`parley.change.abandon` and `parley.change.restore` of resource `change`;
+for each it reads the change and, for a version or a restore, lists the
+files of its current version with one `DiffChanges(base or the empty tree,
+head)` in the target workspace's repository, both before it opens a
+transaction, so git never runs under the store's write lock. Then one
+`Store.Tx` runs `apply` (the index update: files and target replaced and
+in flight; landed with commit and time; out; in flight again), the claim
+link or fulfilment, the overlap comparison and the event's `seq` as the new
+position. Other events only move the position, stored once per batch. A
+version whose files cannot be listed is indexed with none and logged with
+the workspace and number; a change the reader no longer finds is skipped;
+a transaction that fails leaves the position, so the next pass applies the
+event again; a position the log has expired past
+(`event.ErrPositionExpired`) is logged and the pass goes on from the
+log's oldest event.
+
+**Overlaps** (`overlap.go`, `entry.go`, `overlaps.go`). `Partners` gives
+the other in-flight changes of the workspace and target with a file in
+common, leaving out the changes of the same stack, which it decides at
+every evaluation by following `depends_on` through the change reader to the
+bottom change (nothing about stacks is stored, so a `depends_on` edit needs
+no index update). At the end of every `apply`, the change's partners are
+compared with the recorded pairs that include it: a new pair gets one
+`parley.change.overlap` on each change (paths built with
+`event.PathList`) and a row in `awareness_pairs`; a recorded pair that no
+longer overlaps is deleted, so it is announced again when it returns.
+`Overlaps(ctx, q, ws, number)` builds the ordered entries (`EntryOf`) for
+`GET …/changes/:number/overlaps`, which pages them on the keyset `{count,
+number}`, and for the `overlaps` include expander the part registers on
+the change component.
+
+**Routes** (`routes.go`): `(*Component).Routes()` returns the seven
+routes, all declared with the access need `read`, the reads with the scope
+`changes:read` and the claim writes with `changes:write`, the four reads
+with the patterns of the contributor table of `internal/access`. Each acts
+on `actedOn(r)` (`resolve.go`): the record the access check attached
+(`access.DecisionOf`), or its parent for a task fork. The activity
+(`activity.go`) matches files and globs with `identity.MatchPath`, the
+path-limit matcher, and two globs with `canOverlap` (`glob.go`): either
+one matches the other's text before its first `*`.
+
+**Claims** (`claim.go`, `claim_create.go`, `claim_routes.go`). Every
+answer renders a claim with `objectOf(claim, now)`, which reports a stored
+`active` claim at or past `expires_at` as `expired`; the limits, the list's
+state filter, the activity and the renewal use the same reported state. A
+creation validates the body member by member, asks the session interface,
+then counts the live claims of the workspace and of the session, inserts
+the claim, records the session link and writes `parley.claim.create` in
+one `Store.Tx`; its answer's activity is built after the commit, since it
+runs git. A release writes `parley.claim.release` in the transaction that
+sets `released`. The expiry run (`expiry.go`, `ExpireClaims`, background
+work `awareness_claim_expiry`, grace 5 s) stores `expired` with `ended_at`
+set to `expires_at` and writes `parley.claim.expire`, one transaction per
+claim. The index worker links the active claims of a version-1 event's
+session (not a retarget) and fulfils the active claims of a landed or
+abandoned change (`claim_link.go`). The maintenance task `claim_cleanup`
+(`RemoveEndedClaims`, `cleanup.go`) deletes claims that ended 7 days ago
+or earlier, and `RemoveWorkspace`, registered on the workspace teardown
+([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)),
+deletes a workspace's claims and index rows in the delete's transaction.
 
 ### Hub events
 

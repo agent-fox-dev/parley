@@ -218,7 +218,9 @@ and `GET /changes`, `GET` and `PATCH /changes/:number`, `GET
 `/conflict/file`, `/approvals`, `/checks` and `/overlaps`, `GET /lands/:id`,
 `GET /policy`, `POST /policy/evaluate`, `GET /activity`, `GET /claims` and
 `GET /claims/:id`. The guard only lets them through, with the fork; confining
-them to the changes whose source is the fork is each route's own.
+them to the changes whose source is the fork is each route's own, and the
+four awareness reads do not confine: they show all of the parent's work
+(see [Awareness](#awareness)).
 
 **Routes that name no workspace** pass on the allowlist, with the binding,
 from which the route confines its result to the covered workspaces (the
@@ -3781,8 +3783,8 @@ stack, as `GET …/changes/{number}/stack` answers it for the same caller;
 `approvals` the verdicts on the current version, newest first, and
 `checks` the check results that apply to the current version, by name, as
 the lists of [Approvals and checks](#approvals-and-checks) answer them;
-each other name what the hub's feature for it computes, and no member
-while the hub has none (`overlaps` has none yet). Any other name, the empty name included, answers `400`
+and `overlaps` the change's overlap entries, unpaged, in the order of
+`GET …/changes/{number}/overlaps` (see [Awareness](#awareness)). Any other name, the empty name included, answers `400`
 `invalid_request`.
 
 `GET …/changes/{number}/versions` answers `200` with the versions, oldest
@@ -5440,6 +5442,192 @@ that version itself applies. A check no runner reports stays `pending`.
 A token bound to a task fork reaches the two lists on the fork's parent
 only for changes whose source workspace is that fork; every other change
 answers `404` `change_not_found`, with the body an unknown number gets.
+
+## Awareness
+
+Awareness shows an agent the other work on the paths it touches: the
+`draft` and `open` changes that touch the same files, the claims other
+sessions announced, and what landed. It is advisory: nothing here refuses a
+push, a commit, an open or a land.
+
+Every route is under `/api/v1/workspaces/{slug}` and answers in every
+workspace status. The four reads (`GET /activity`, `GET
+/changes/{number}/overlaps`, `GET /claims`, `GET /claims/{id}`) need the
+scope `changes:read` from a PAT and read access to the workspace; the three
+claim writes (`POST /claims`, `PATCH /claims/{id}`, `DELETE /claims/{id}`)
+need `changes:write` and read access, so a member of the workspace's
+organization may claim. Through a task fork's slug every route acts on the
+fork's **parent**: access is decided on the fork, and the changes, the
+change numbers, the claims and the default branch are the parent's; a claim
+made through a fork is stored on the parent. A token bound to a fork reaches
+the four reads on the parent (they are contributor routes, see
+[Workspace-bound tokens](#workspace-bound-tokens)) and is not confined to its
+own changes there; the claim writes answer it `403` `token_bound` on the
+parent.
+
+### The overlap index
+
+The hub keeps, per workspace and target branch, the complete set of files
+each change touches: the files that differ between the `base_sha` and the
+`head_sha` of its current version, a renamed or copied file under both of
+its paths, with no limit on their number (the change object's own `paths`
+stops at 2,000). A background worker follows the event log
+(`parley.change.version`, which also carries a retarget,
+`parley.change.land`, `parley.change.abandon` and `parley.change.restore`)
+and updates the index about a second after the request that caused the
+event, which is answered without waiting for it. A version whose files
+cannot be listed (its commits are gone) is indexed with no files. Each event
+is applied once, also across a restart.
+
+Two changes **overlap** when both are `draft` or `open`, have the same
+target branch and at least one touched file in common, and are not in one
+stack (two changes whose `depends_on` chains reach the same bottom change).
+Overlap is on paths, not lines.
+
+When an update of the index makes two changes overlap that did not overlap
+before, the hub writes `parley.change.overlap` on each of the two, naming the
+other: `resource_type` `change`, `resource_id` the number, the target
+workspace, the actor `system`, the session of the change the event is
+written on, and metadata `number`, `with` (`number` and `ref` of the other
+change), `with_session_id`, `paths` (the files in common, ascending, at most
+100, with `truncated: true` when it had to cut them) and `count`. A pair is
+announced once while it overlaps; once it stops (no file in common any
+more, different targets, or one of the two landed or abandoned) it is
+forgotten, and a later overlap is announced again.
+
+An **overlap entry** is
+
+```json
+{"change": {"number": 2, "ref": "demo#2", "title": "…", "intent": "…", "state": "open",
+            "author": {"actor_type": "api_key", "actor_id": "…", "username": "bob"},
+            "session_id": null, "version": 1, "updated_at": "2026-11-16T10:00:00Z",
+            "mergeable": "clean", "landing": {"status": "ready"}},
+ "paths": ["api/handler.go"], "paths_truncated": false, "count": 1}
+```
+
+with `intent` cut to its first 500 characters, `paths` the files in common
+in ascending byte order cut to the first 100, `paths_truncated` `true`
+exactly when there are more, and `count` the number of files in common.
+
+### `GET /api/v1/workspaces/{slug}/changes/{number}/overlaps`
+
+Answers `200` with a list (`{"items":[…],"next_cursor":…}`, paged by `limit`
+and `cursor`) of one overlap entry for every other change that overlaps
+this one, ordered by `count` descending, then `number` ascending. A change
+that is `landed` or `abandoned` has an empty list. A number that is not a
+positive integer, or names no change of the workspace acted on, answers
+`404` `change_not_found`. `GET …/changes/{number}?include=overlaps` adds
+the same entries, unpaged, as the member `overlaps`.
+
+### `GET /api/v1/workspaces/{slug}/activity`
+
+What touches a list of paths. Query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `paths` | required: one or more globs (`*` matches within a path segment, `**` across segments), as a comma list, repeated, or both; at most 50, each 1 to 255 characters and not starting with `/` |
+| `target` | the target branch; default the default branch of the workspace acted on (for a fork's slug, the parent's). It is not checked: an unknown branch gives `target_sha` `null` and, normally, empty lists |
+| `since` | exactly 40 hexadecimal characters is a commit id: the changes whose landed commit is not reachable from it are reported; anything else must be an RFC 3339 timestamp: the changes landed after it. Default: 24 hours before the request |
+| `exclude_session` | leaves out the changes, claims and landed changes of that session |
+| `exclude_change` | a positive integer: leaves out that change and the claims linked to it |
+
+It answers `200` with
+
+```json
+{"target_branch": "main", "target_sha": "<40 hex>",
+ "changes": [<overlap entry>…], "claims": [<claim>…], "landed": [<landed>…]}
+```
+
+- `target_sha` is the head of the target branch, `null` when the workspace
+  has no such branch;
+- `changes`: the `draft` and `open` changes on the target with a touched file
+  matching any glob, as overlap entries whose `paths` and `count` are the
+  matching files, ordered by `count` descending, then `number` ascending. It
+  shows a change whose source is a fork the caller cannot read, and drafts;
+- `claims`: the active claims on the target (not past `expires_at`) with a
+  glob that can match the same files as a requested glob, newest first. Two
+  globs are taken to match the same files when either one, used as a
+  pattern, matches the other's text before its first `*`; this errs towards
+  reporting;
+- `landed`: the changes landed on the target after `since` with a touched
+  file matching a glob, newest first, at most 100, each `{number, ref,
+  title, landed_sha, landed_at, session_id, paths}`, `paths` the matching
+  files cut to 100.
+
+The three lists are never `null`, and neither paged nor cut otherwise. `400`
+`invalid_request` for: no `paths` or only empty ones, more than 50 globs, a
+glob that is empty, longer than 255 characters or starts with `/`; a `since`
+that is neither a commit id nor a timestamp, or a commit id the repository
+does not hold; an `exclude_change` that is not a positive integer.
+
+### Claims
+
+A claim is an advisory, expiring statement that a session intends to work on
+some paths:
+
+```json
+{"id": "<uuid>", "workspace_slug": "demo", "paths": ["api/**"], "target_branch": "main",
+ "intent": "rework handlers", "by": {"actor_type": "api_key", "actor_id": "…", "username": "bob"},
+ "session_id": null, "change": null, "expires_at": "2026-11-16T11:00:00Z",
+ "state": "active", "created_at": "2026-11-16T10:00:00Z"}
+```
+
+`state` is `active`, `released`, `expired` or `fulfilled`. A claim past its
+`expires_at` reads `expired` at once, in every read, in the activity and in
+the limits, before the hub's expiry run (every minute) stores it as
+`expired` and writes `parley.claim.expire` (actor `system`, metadata
+`paths`). When a change is opened with a `session_id` that has active
+claims on the same workspace and target branch, its version 1 sets their
+`change` to its number; when that change lands or is abandoned, its claims
+still active become `fulfilled`, without an event (a restore does not turn
+them back). A claim that is `released`, `expired` or `fulfilled` is removed
+7 days after it ended by the `claim_cleanup` maintenance task, and every
+claim of a workspace goes with the workspace when it is deleted. Claims
+never conflict with each other and have no effect on pushes, commits,
+policy or landing.
+
+`POST /api/v1/workspaces/{slug}/claims` takes `{"paths", "intent",
+"target_branch"?, "ttl"?, "session_id"?}`: `paths` an array of 1 to 50
+globs (as for the activity), `intent` 1 to 2,000 characters,
+`target_branch` 1 to 255 characters (default the default branch of the
+workspace acted on), `ttl` a duration (a whole number followed by `s`, `m`,
+`h` or `d`) of at least `1s` and at most `[awareness].max_claim_ttl`
+(default `[awareness].default_claim_ttl`). It accepts an `Idempotency-Key`.
+It answers `201` with `{"claim": <claim>, "activity": <the activity answer
+for the claim's paths and target, without the claim itself>}` and writes
+`parley.claim.create` (`resource_type` `claim`, the caller as actor,
+metadata `paths`, `intent`, `target_branch`, `expires_at`). Refusals, which
+store nothing and write nothing: `400` `invalid_request` for a member that
+is missing, of the wrong type or out of bounds; `400` `unknown_session` for
+a `session_id` the session-linking rule refuses — the hub has no session
+store yet, so every `session_id` is refused this way for now; `429`
+`claim_limit_reached` when the workspace the claim would be stored on
+already has `[awareness].max_claims_per_workspace` active claims, or the
+session already has 50.
+
+`GET /api/v1/workspaces/{slug}/claims` lists the claims stored on the
+workspace acted on, newest first (`created_at`, then `id`, descending),
+paged by `limit` and `cursor`, filtered by `state` (default `active`; one of
+the four, by the state a read reports, else `400` `invalid_request`),
+`session_id` and `path` (a glob, matched by the rule of the activity).
+`GET …/claims/{id}` answers `200` with the claim.
+
+`PATCH …/claims/{id}` takes `{"ttl"?, "intent"?}`: `ttl` moves `expires_at`
+to the time of the request plus `ttl`, `intent` replaces the intent; it
+answers `200` with the claim and writes no event. A body with neither
+member, or an invalid one, is `400` `invalid_request`; a claim that is not
+active is `409` `claim_not_active`.
+
+`DELETE …/claims/{id}` releases an active claim: its state becomes
+`released` and `parley.claim.release` is written (the caller as actor,
+metadata `paths`). For a claim that is not active it changes nothing. Both
+answer `204` with no body.
+
+Only the user who created the claim (with any credential of that user), the
+owner of the workspace the claim is stored on and the admin token may
+`PATCH` or `DELETE` it; anyone else who can read it gets `403` `forbidden`.
+An id that is not a UUID, is unknown, or names a claim of another workspace
+answers `404` `claim_not_found` on all three routes of one claim.
 
 ## Admin routes
 
