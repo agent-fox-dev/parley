@@ -92,9 +92,10 @@ type Resolution struct {
 //
 // A resolved file has the mode it has in the commit replayed, else the
 // mode of the tree it is replayed onto, else ModeFile. It takes the place
-// of whatever is at its path, a directory too, and of a side git moved
-// aside to <path>~<commit>; a deleted one leaves a directory at its path
-// in place.
+// of whatever is at its path, a directory too, of a side git moved aside
+// to <path>~<commit>, and of the paths the conflict's other sides name,
+// such as both paths a file was renamed to; a deleted one leaves a
+// directory at its path in place.
 //
 // Like the rebase, the resolution happens in the object store alone: the
 // trees and blobs it writes are new objects, and no index is used.
@@ -120,11 +121,21 @@ func (r *Repo) resolver(ctx context.Context, resolutions map[string]Resolution) 
 	return func(ours, theirs, tree string, files []ConflictFile) (string, bool, error) {
 		edits := map[string]*treeEntry{}
 		for _, f := range files {
-			res, ok := resolutions[f.Path]
-			if !ok {
+			if _, ok := resolutions[f.Path]; !ok {
 				return "", false, nil
 			}
 			edits[f.Path+"~"+ours], edits[f.Path+"~"+theirs] = nil, nil
+			// The resolution stands in for the whole conflict: the paths
+			// its other sides name, such as where the change renamed a
+			// file the target renamed too, go.
+			for _, side := range []*ConflictSide{f.Base, f.Ours, f.Theirs} {
+				if side != nil && side.Path != f.Path {
+					edits[side.Path] = nil
+				}
+			}
+		}
+		for _, f := range files {
+			res := resolutions[f.Path]
 			if res.Delete {
 				edits[f.Path] = nil
 				continue

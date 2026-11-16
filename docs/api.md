@@ -3073,9 +3073,13 @@ added the path with different content, or one put a file where the other
 put a directory), `modify_delete` (the target changed a file the head
 deleted), `delete_modify` (the target deleted a file the head changed),
 `mode` (the sides hold the file with different modes, such as a file and a
-symlink, or the same content added with two modes) and `content` (both
-changed the same lines). A file git moved aside to `<path>~<commit>` to
-record both sides is reported at its own `path`. `landed_by` lists the
+symlink, or the same content added with two modes, and the content is the
+same or merges) and `content` (both changed the same lines, also where one
+side alone changed the mode, which merges). A file's `path` is its path in
+the target, `ours.path`, so a file both sides renamed is reported at the
+target's new path; where the target has no file (`delete_modify`) it is
+the path of the other sides. A file git moved aside to `<path>~<commit>`
+to record both sides is reported at its own `path`. `landed_by` lists the
 numbers of the landed changes in `landed_changes` that changed the file,
 `[]` for none.
 
@@ -4187,8 +4191,9 @@ written as a line `<<<<<<< target`, the lines of the target as replayed so
 far (the entry's `ours`), a line `=======`, the lines of the file in
 `commit_sha` (the entry's `theirs`) and a line `>>>>>>> change`. There is
 never a `||||||| base` section, whatever `merge.conflictStyle` a git
-configuration sets; an entry without a `base` (a file both sides added)
-merges from an empty file.
+configuration sets. Only a `content` entry is marked: a file both sides
+added with different content, which has no `base`, is `add_add` and
+answered `409` `not_text_conflict` (below).
 
 ```text
 one
@@ -4378,14 +4383,17 @@ included), an entry is not an object, a `path` is missing, not a string,
 empty, starts with `/` or has an empty, `.` or `..` segment, an entry has
 none or more than one of `content`, `content_base64` and `delete`,
 `content` or `content_base64` is not a string, `content_base64` is not
-standard base64, `delete` is not `true`, or two entries name the same
-path. An empty list is a restack without resolutions.
+standard base64 (padding bits set and line breaks are refused too),
+`delete` is not `true`, or two entries name the same path. An empty list
+is a restack without resolutions.
 
 The restack replays the change's commits onto the commit it must sit on,
 as above. At a commit that does not apply, when every conflicted path of
 that commit (each `path` of the report's `files`) has a resolution, the
 commit is replayed as git merged it with each conflicted path replaced by
-its resolution's bytes, or with no file there for `delete`, and the
+its resolution's bytes, or with no file there for `delete`, the paths
+its other sides name gone too (both paths of a file the two sides renamed
+leave only the resolution at the target's path), and the
 replay goes on; a path that conflicts at several commits gets its
 resolution at each. A resolved file has its mode in the change's commit,
 else its mode in the target as replayed so far, else `100644`; it takes

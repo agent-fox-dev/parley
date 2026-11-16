@@ -74,8 +74,13 @@ func readResolution(entry map[string]json.RawMessage) (gitrepo.Resolution, error
 	}
 	if encoded, err := member[string](entry, "content_base64", "a string"); err != nil || encoded != nil {
 		var content []byte
+		// The standard decoder skips line breaks and lets padding bits be
+		// set, so that one content would have several encodings.
+		if err == nil && strings.ContainsAny(*encoded, "\r\n") {
+			err = errors.New("line break")
+		}
 		if err == nil {
-			content, err = base64.StdEncoding.DecodeString(*encoded)
+			content, err = base64.StdEncoding.Strict().DecodeString(*encoded)
 		}
 		if err != nil {
 			return gitrepo.Resolution{}, errors.New("content_base64: must be a string in standard base64")

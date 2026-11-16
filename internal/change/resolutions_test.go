@@ -211,6 +211,8 @@ func TestRestackRoute_RefusesResolutionsThatAreNotAListOfValidEntries(t *testing
 		{"content that is no string", []any{map[string]any{"path": "a.txt", "content": 1}}},
 		{"content_base64 that is not standard base64", []any{map[string]any{"path": "a.txt", "content_base64": "***"}}},
 		{"content_base64 in the URL alphabet", []any{map[string]any{"path": "a.txt", "content_base64": "-_8="}}},
+		{"content_base64 with padding bits set", []any{map[string]any{"path": "a.txt", "content_base64": "YR=="}}},
+		{"content_base64 broken across lines", []any{map[string]any{"path": "a.txt", "content_base64": "YW\r\nJj"}}},
 		{"a path two entries name", []any{map[string]any{"path": "a.txt", "content": "a"}, map[string]any{"path": "a.txt", "delete": true}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

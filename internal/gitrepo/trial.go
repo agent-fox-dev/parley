@@ -154,6 +154,11 @@ func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string
 					side.Path = asidePath(side.Path, ours, theirs)
 				}
 			}
+			// A file is reported at its path in the target, which for a
+			// rename is not the first path git names.
+			if files[i].Ours != nil {
+				files[i].Path = files[i].Ours.Path
+			}
 		}
 		slices.SortFunc(files, func(a, b ConflictFile) int { return strings.Compare(a.Path, b.Path) })
 		return tree, files, perr
@@ -275,7 +280,9 @@ func parseConflicts(out []byte) ([]ConflictFile, error) {
 // where the other put a directory; modify_delete and delete_modify for a
 // file one side deleted, the target being ours and the change theirs; mode
 // for sides that hold the file with different modes, such as a file and a
-// symlink, or the same content added with two modes; content otherwise.
+// symlink, or the same content added with two modes, when their content
+// is the same or merges; content otherwise. A mode only one side changed
+// merges, so a file whose text conflicts there is content.
 // One kind for each path, in an order that goes from what a text
 // resolution can least express to what it can.
 func conflictKind(types []string, sides [4]*ConflictSide) string {
@@ -297,7 +304,9 @@ func conflictKind(types []string, sides [4]*ConflictSide) string {
 	case base != nil && ours == nil && theirs != nil:
 		return ConflictDeleteModify
 	case has(func(t string) bool { return t == "CONFLICT (distinct modes)" }),
-		ours != nil && theirs != nil && ours.Mode != theirs.Mode:
+		ours != nil && theirs != nil && ours.Mode != theirs.Mode &&
+			(base == nil || base.Mode != ours.Mode && base.Mode != theirs.Mode) &&
+			(ours.SHA == theirs.SHA || !has(func(t string) bool { return t == "CONFLICT (contents)" })):
 		return ConflictMode
 	}
 	return ConflictContent

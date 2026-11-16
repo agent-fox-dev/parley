@@ -17,9 +17,9 @@ import (
 // stored with the report, so that the parley.change.conflict the storing
 // function writes, when the change was not in conflict already, says so; a
 // change in conflict already gets the new report and no event. The pending
-// record goes. When the change got a version, or the commit it must sit on
-// moved, since the replay, the conflict is that of a pair the change no
-// longer has, and the restack starts again. The result carries the
+// record goes. When the change got a version or another base, or the
+// commit it must sit on moved, since the replay, the conflict is that of
+// commits the change no longer has, and the restack starts again. The result carries the
 // report as stored.
 func (c *Component) restackConflicted(ctx context.Context, j restackJob, ch Change, res restackResult, onto string) (restackResult, bool, error) {
 	// Attributed before the transaction, which the attribution's reads of
@@ -37,7 +37,7 @@ func (c *Component) restackConflicted(ctx context.Context, j restackJob, ch Chan
 		if err != nil {
 			return err
 		}
-		if again = now.HeadSHA != ch.HeadSHA || ontoNow != onto; again {
+		if again = now.HeadSHA != ch.HeadSHA || baseColumn(now.BaseSHA) != baseColumn(ch.BaseSHA) || ontoNow != onto; again {
 			return nil
 		}
 		if _, err := dropRestack(ctx, tx, j); err != nil {

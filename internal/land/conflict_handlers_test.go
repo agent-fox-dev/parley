@@ -217,16 +217,19 @@ func TestConflict_AnswersALandedOrAbandonedChangeFromWhatIsStored(t *testing.T) 
 	t.Parallel()
 	for _, c := range []struct {
 		name string
-		// setup makes the change and returns it; a change that holds a
-		// report is answered with it.
+		// setup makes the change and returns it.
 		setup func(t *testing.T, w *world) change.Change
+		// state is the change's state; holdsReport whether it holds a
+		// report, which is then the answer.
+		state       string
+		holdsReport bool
 	}{
 		{"a landed change with no report", func(t *testing.T, w *world) change.Change {
 			ch := w.openSetting(t, "f", map[string]string{"a.txt": lines("change")})
 			w.landNow(t, ch, w.caller(), nil)
 			commit(t, w.api, "main", head(t, w.api, "main"), "target", map[string]string{"a.txt": lines("target")})
 			return ch
-		}},
+		}, change.StateLanded, false},
 		{"an abandoned change with a stored report", func(t *testing.T, w *world) change.Change {
 			target := commit(t, w.api, "main", w.base, "target", map[string]string{"a.txt": lines("target")})
 			ch := w.openSetting(t, "f", map[string]string{"a.txt": lines("change")})
@@ -236,7 +239,7 @@ func TestConflict_AnswersALandedOrAbandonedChangeFromWhatIsStored(t *testing.T) 
 			})
 			commit(t, w.api, "main", target, "agree", map[string]string{"a.txt": lines("change")})
 			return ch
-		}},
+		}, change.StateAbandoned, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -244,8 +247,12 @@ func TestConflict_AnswersALandedOrAbandonedChangeFromWhatIsStored(t *testing.T) 
 			replays := land.CountReplays(w.land)
 			ch := c.setup(t, w)
 			stored := w.readChange(t, ch.Number)
+			report := decoded(t, stored.Conflict)
+			if stored.State != c.state || (report != nil) != c.holdsReport {
+				t.Fatalf("the change is %s holding the report %v; want %s, holding one %v", stored.State, report, c.state, c.holdsReport)
+			}
 			want := map[string]any{"mergeable": "clean", "conflict": nil}
-			if report := decoded(t, stored.Conflict); report != nil {
+			if c.holdsReport {
 				want = map[string]any{"mergeable": "conflict", "conflict": report}
 			}
 			status, answer := w.conflictOf(t, w.ownerKey, "api", ch.Number)
@@ -444,7 +451,7 @@ func TestConflictFile_RefusesAnEntryThatIsNoContentConflict(t *testing.T) {
 			map[string]treeEntry{"f.txt": text("target\n")}, map[string]treeEntry{"f.txt": {}}},
 		{"delete_modify", "f.txt", map[string]treeEntry{"f.txt": text("f\n")},
 			map[string]treeEntry{"f.txt": {}}, map[string]treeEntry{"f.txt": text("change\n")}},
-		{"rename", "f.txt", map[string]treeEntry{"f.txt": text(eight)},
+		{"rename", "g.txt", map[string]treeEntry{"f.txt": text(eight)},
 			map[string]treeEntry{"f.txt": {}, "g.txt": text(eight)}, map[string]treeEntry{"f.txt": {}, "h.txt": text(eight)}},
 		{"mode", "f.sh", nil, map[string]treeEntry{"f.sh": {"100755", "s\n"}}, map[string]treeEntry{"f.sh": text("s\n")}},
 		{"binary", "bin", map[string]treeEntry{"bin": text("\x00base")},

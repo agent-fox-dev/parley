@@ -13,18 +13,18 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 )
 
-// Two changes pushed by an agent set line 2 of app.txt differently; the
-// first lands. The agent, which never clones, reads the second's conflict
-// from the command line, prints the conflicted file with markers, resolves
-// it in a local file and hands it back with parley change resolve: the hub
-// rebuilds the change on main with the resolution, as a restack version of
-// the agent's, and the change no longer conflicts, while main stays where
-// the land left it.
-func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *testing.T) {
-	h := &lifecycleHub{forkHub: startForkHubWith(t, nil, func(c *hub.Composition) {
+// conflictingChanges serves a hub whose workspace demo holds app.txt, and
+// has the agent of the task fork demo--t1, with a token bound to it, push
+// two changes that set line 2 of app.txt differently; the first is landed,
+// and the second is in conflict. It returns the hub, the owner's clone of
+// demo, the agent's clone of the fork, the agent's token and the head of
+// main after the land.
+func conflictingChanges(t *testing.T) (h *lifecycleHub, owner, pusher func(...string) string, agent, main0 string) {
+	t.Helper()
+	h = &lifecycleHub{forkHub: startForkHubWith(t, nil, func(c *hub.Composition) {
 		c.AdjustChange(func(d *change.Deps) { d.MergeableDebounce = 0 })
 	})}
-	owner := cloneAs(t, h.forkHub, h.key, "demo")
+	owner = cloneAs(t, h.forkHub, h.key, "demo")
 	commitFile(t, owner, "app.txt", "one\ntwo\nthree\n", "Add app")
 	owner("push", "--quiet", "origin", "main")
 
@@ -36,8 +36,8 @@ func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *t
 	if status != http.StatusCreated {
 		t.Fatalf("create demo--t1 = %d %s, want 201", status, body)
 	}
-	agent := str(decoded(t, body), "token", "token")
-	pusher := cloneAs(t, h.forkHub, agent, "demo--t1")
+	agent = str(decoded(t, body), "token", "token")
+	pusher = cloneAs(t, h.forkHub, agent, "demo--t1")
 	for _, line := range []string{"TARGET", "CHANGE"} {
 		branch := strings.ToLower(line)
 		pusher("checkout", "--quiet", "-b", branch, "origin/main")
@@ -50,8 +50,20 @@ func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *t
 	if status, a := h.land(t, h.key, "1", ""); status != http.StatusOK {
 		t.Fatalf("the land of demo#1 = %d %v, want 200", status, a)
 	}
-	main0 := fetchMain(owner)
+	main0 = fetchMain(owner)
 	h.until(t, "2", "in conflict after the land of demo#1", func(c map[string]any) bool { return c["mergeable"] == "conflict" })
+	return h, owner, pusher, agent, main0
+}
+
+// Two changes pushed by an agent set line 2 of app.txt differently; the
+// first lands. The agent, which never clones, reads the second's conflict
+// from the command line, prints the conflicted file with markers, resolves
+// it in a local file and hands it back with parley change resolve: the hub
+// rebuilds the change on main with the resolution, as a restack version of
+// the agent's, and the change no longer conflicts, while main stays where
+// the land left it.
+func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *testing.T) {
+	h, owner, pusher, agent, main0 := conflictingChanges(t)
 
 	c := h.runAs(t, agent, "change", "conflict", "demo", "2", "--fail-on-conflict")
 	if c.code != 3 || c.errorType(t) != "condition_not_met" {
@@ -100,7 +112,7 @@ func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *t
 		t.Errorf("app.txt at the restacked head is %q, want the resolution %q", got, resolved)
 	}
 
-	status, body = h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/2/versions", agent, nil)
+	status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/demo/changes/2/versions", agent, nil)
 	items, _ := decoded(t, body)["items"].([]any)
 	if status != http.StatusOK || len(items) != 2 {
 		t.Fatalf("GET changes/2/versions = %d %s, want two versions", status, body)
@@ -109,10 +121,12 @@ func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *t
 	if last["kind"] != change.KindRestack || str(last, "created_by", "username") != "member" || last["head_sha"] != head {
 		t.Errorf("the last version of demo#2 is %v, want a restack to %s created by member", last, head)
 	}
-	read := h.read(t, agent, "2")
-	if read["head_sha"] != head || read["version"] != last["number"] || read["needs_restack"] != false || str(read, "landing", "status") != change.LandingReady {
-		t.Errorf("after the resolve demo#2 is at %v version %v, needs_restack %v, landing %v; want %s, version %v, false and ready",
-			read["head_sha"], read["version"], read["needs_restack"], read["landing"], head, last["number"])
+	// The check of the restacked version runs after it.
+	read := h.until(t, "2", "clean after the resolve", func(c map[string]any) bool { return c["mergeable"] == change.MergeableClean })
+	if read["head_sha"] != head || read["version"] != last["number"] || read["conflict"] != nil || read["needs_restack"] != false ||
+		str(read, "landing", "status") != change.LandingReady {
+		t.Errorf("after the resolve demo#2 is at %v version %v, conflict %v, needs_restack %v, landing %v; want %s, version %v, null, false and ready",
+			read["head_sha"], read["version"], read["conflict"], read["needs_restack"], read["landing"], head, last["number"])
 	}
 
 	c = h.runAs(t, agent, "change", "conflict", "demo", "2", "--fail-on-conflict")

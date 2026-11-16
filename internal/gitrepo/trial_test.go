@@ -82,7 +82,7 @@ func TestTrialRebase_ReportsTheFirstCommitThatDoesNotApply(t *testing.T) {
 	// The kinds git reports on top of the side each file is on.
 	for _, c := range []struct{ head, path, kind string }{
 		{"both-binary", "bin", gitrepo.ConflictBinary},
-		{"both-rename", "r.txt", gitrepo.ConflictRename},
+		{"both-rename", "r1.txt", gitrepo.ConflictRename},
 		{"both-type", "t.txt", gitrepo.ConflictMode},
 		{"both-submodule", "sub", gitrepo.ConflictSubmodule},
 	} {

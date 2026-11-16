@@ -190,6 +190,9 @@ var conflictCases = []conflictCase{
 	{name: "both edit a line", base: []edit{file("a.txt", "l1\nl2\n")},
 		target: []edit{file("a.txt", "target\nl2\n")}, work: []edit{file("a.txt", "work\nl2\n")},
 		path: "a.txt", kind: gitrepo.ConflictContent, sides: [3]string{"a.txt", "a.txt", "a.txt"}},
+	{name: "both edit a line the target also makes executable", base: []edit{file("a.txt", "l1\nl2\n")},
+		target: []edit{{"100755", "a.txt", "target\nl2\n"}}, work: []edit{file("a.txt", "work\nl2\n")},
+		path: "a.txt", kind: gitrepo.ConflictContent, sides: [3]string{"a.txt", "a.txt", "a.txt"}},
 	{name: "both add a file with different text",
 		target: []edit{file("f.txt", "target\n")}, work: []edit{file("f.txt", "work\n")},
 		path: "f.txt", kind: gitrepo.ConflictAddAdd, sides: [3]string{"", "f.txt", "f.txt"}},
@@ -202,7 +205,7 @@ var conflictCases = []conflictCase{
 	{name: "both rename a file elsewhere", base: []edit{file("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n")},
 		target: []edit{remove("f.txt"), file("g.txt", "1\n2\n3\n4\n5\n6\n7\n8\n")},
 		work:   []edit{remove("f.txt"), file("h.txt", "1\n2\n3\n4\n5\n6\n7\n8\n")},
-		path:   "f.txt", kind: gitrepo.ConflictRename, sides: [3]string{"f.txt", "g.txt", "h.txt"}},
+		path:   "g.txt", kind: gitrepo.ConflictRename, sides: [3]string{"f.txt", "g.txt", "h.txt"}},
 	{name: "both add a file with the same text and different modes",
 		target: []edit{{"100755", "f.sh", "s\n"}}, work: []edit{file("f.sh", "s\n")},
 		path: "f.sh", kind: gitrepo.ConflictMode, sides: [3]string{"", "f.sh", "f.sh"}},
@@ -438,6 +441,12 @@ func TestRebaseFromResolving_PutsEachResolutionInPlaceOfItsConflictedPath(t *tes
 			[]edit{file("d/x", "x\n")},
 			map[string]gitrepo.Resolution{"d": {Delete: true}},
 			map[string]string{"x.txt": "100644 x\n", "d/x": "100644 x\n"}},
+		{"a file both rename elsewhere, at the target's path alone",
+			[]edit{file("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n")},
+			[]edit{remove("f.txt"), file("g.txt", "1\n2\n3\n4\n5\n6\n7\n8\n")},
+			[]edit{remove("f.txt"), file("h.txt", "1\n2\n3\n4\n5\n6\n7\n8\n")},
+			map[string]gitrepo.Resolution{"g.txt": {Content: []byte("r\n")}},
+			map[string]string{"x.txt": "100644 x\n", "g.txt": "100644 r\n"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
