@@ -3,14 +3,18 @@ package policy
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -38,6 +42,10 @@ func (c *Component) Routes() []server.Route {
 	}, {
 		Method: http.MethodPut, Pattern: "/workspaces/:slug/policy", Scope: "workspaces:write",
 		Marks: map[string]string{access.MarkNeed: string(access.NeedOwner)}, Handler: c.putPolicy,
+		MaxBodySize: maxRequestBytes,
+	}, {
+		Method: http.MethodPost, Pattern: "/workspaces/:slug/policy/evaluate", Scope: "changes:read",
+		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.evaluatePolicy,
 		MaxBodySize: maxRequestBytes,
 	}}
 }
@@ -137,6 +145,154 @@ func (c *Component) putPolicy(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeRevision(w, rev)
 	return nil
+}
+
+// maxEvaluatePaths is how many paths an evaluation takes, as many as a
+// change's own list of files holds.
+const maxEvaluatePaths = 2000
+
+// maxBranchChars is the longest target branch an evaluation takes, in
+// characters.
+const maxBranchChars = 255
+
+// evaluation is the answer of the evaluate route: what the paths or the
+// change would need with no approval and no check result, and the stored
+// revision, whatever document they were evaluated against.
+type evaluation struct {
+	PolicyRevision int64         `json:"policy_revision"`
+	Status         string        `json:"status"`
+	Requirements   []Requirement `json:"requirements"`
+}
+
+// evaluatePolicy answers what the paths of the body, on a change into its
+// target branch or the workspace's default branch, or the change the body
+// names, would need, against the candidate document of the body or the
+// stored one, with nothing counted and no structural cause: the dry mode
+// of Preview. It opens no write transaction, so that an evaluation, valid
+// or refused, writes nothing. A token bound to a task fork calling on the
+// fork's parent reaches only the changes whose source is that fork, and
+// any other is answered as a number the workspace does not have.
+func (c *Component) evaluatePolicy(w http.ResponseWriter, r *http.Request) error {
+	ctx, slug := r.Context(), server.Param(r, "slug")
+	var body map[string]json.RawMessage
+	if err := server.DecodeJSON(r, &body); err != nil {
+		return err
+	}
+	req, err := parseEvaluate(body)
+	if err != nil {
+		return err
+	}
+	d, _ := access.DecisionOf(r)
+	stored, _, err := c.readRevision(ctx, slug, d.Record.Kind == access.KindFork, nil)
+	if err != nil {
+		return err
+	}
+	doc := &stored.Document
+	if raw, given := body["policy"]; given {
+		// The candidate's size is the length of its JSON text as sent.
+		candidate, err := Validate(ctx, raw, c.deps.Users)
+		if inv := (*InvalidPolicyError)(nil); errors.As(err, &inv) {
+			return inv.APIError()
+		}
+		if err != nil {
+			return err
+		}
+		doc = candidate
+	}
+	target, files := req.target, req.paths
+	if req.change == nil {
+		if target == "" {
+			ws, found, err := c.deps.Workspaces.Workspace(ctx, c.deps.Store.Main(), slug)
+			switch {
+			case err != nil:
+				return err
+			case !found:
+				return server.NotFound("workspace not found")
+			case ws.DefaultBranch == "":
+				return server.InvalidRequest("the workspace has no default branch yet; give target_branch")
+			}
+			target = ws.DefaultBranch
+		}
+	} else {
+		ch, err := c.deps.Changes.ReadChange(ctx, c.deps.Store.Main(), slug, *req.change)
+		if errors.Is(err, change.ErrChangeNotFound) {
+			return change.ErrChangeNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if b, ok := access.BindingOf(r); ok && b.Relation == access.RelationParentOfBoundFork && ch.Source.WorkspaceSlug != b.Workspace {
+			return change.ErrChangeNotFound
+		}
+		base := ""
+		if ch.BaseSHA != nil {
+			base = *ch.BaseSHA
+		}
+		if files, err = c.filesBetween(ctx, ch.WorkspaceSlug, base, ch.HeadSHA); err != nil {
+			return err
+		}
+		target = ch.TargetBranch
+	}
+	res := Preview(doc, target, files)
+	server.WriteJSON(w, http.StatusOK, evaluation{PolicyRevision: stored.Number, Status: res.Status, Requirements: res.Requirements})
+	return nil
+}
+
+// evaluateRequest is the body of an evaluation: exactly one of paths, each
+// once in byte order, and change, with target the target branch given
+// for paths, "" for none.
+type evaluateRequest struct {
+	paths  []string
+	change *int64
+	target string
+}
+
+// parseEvaluate reads the members of an evaluation's body, refusing with
+// 400 invalid_request a body without exactly one of paths and change, a
+// paths that is not 1 to maxEvaluatePaths non-empty strings that do not
+// start with '/' (counted as sent), a change that is not an integer, and a
+// target_branch given with change, empty, longer than maxBranchChars
+// characters or not a string. The candidate document is the validator's.
+func parseEvaluate(body map[string]json.RawMessage) (evaluateRequest, error) {
+	var req evaluateRequest
+	rawPaths, hasPaths := body["paths"]
+	rawChange, hasChange := body["change"]
+	rawTarget, hasTarget := body["target_branch"]
+	if hasPaths == hasChange {
+		return req, server.InvalidRequest("give exactly one of paths and change")
+	}
+	if hasChange {
+		var n int64
+		if string(rawChange) == "null" || json.Unmarshal(rawChange, &n) != nil {
+			return req, server.InvalidRequest("change must be an integer")
+		}
+		req.change = &n
+		if hasTarget {
+			return req, server.InvalidRequest("target_branch cannot be given with change, whose own target branch is used")
+		}
+		return req, nil
+	}
+	var entries []any
+	if json.Unmarshal(rawPaths, &entries) != nil || len(entries) == 0 || len(entries) > maxEvaluatePaths {
+		return req, server.InvalidRequest(fmt.Sprintf("paths must be a list of 1 to %d paths", maxEvaluatePaths))
+	}
+	for _, e := range entries {
+		p, ok := e.(string)
+		if !ok || p == "" || strings.HasPrefix(p, "/") {
+			return req, server.InvalidRequest("every path must be a non-empty string that does not start with '/'")
+		}
+		req.paths = append(req.paths, p)
+	}
+	slices.Sort(req.paths)
+	req.paths = slices.Compact(req.paths)
+	if hasTarget {
+		var target *string
+		if json.Unmarshal(rawTarget, &target) != nil || target == nil || *target == "" || utf8.RuneCountInString(*target) > maxBranchChars {
+			return req, server.InvalidRequest(fmt.Sprintf("target_branch must be a branch name of 1 to %d characters", maxBranchChars))
+		}
+		req.target = *target
+	}
+	return req, nil
 }
 
 // parseIfMatch is the revision the If-Match values name, bare or in double

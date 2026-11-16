@@ -2,6 +2,7 @@ package policy_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/policy"
@@ -427,5 +429,345 @@ func TestPutPolicy_GivesConcurrentReplacementsConsecutiveRevisions(t *testing.T)
 		if rev := w.revisionOf(t, policyPath); rev != n {
 			t.Errorf("round %d: revision = %v, want %v", round, rev, n)
 		}
+	}
+}
+
+// evalWorld is the world with the threeRules document stored as api's
+// revision 1 unless it is built without, an evidence source that would
+// count an approval and pass every check of every change, and api's
+// changes: billing, open, touching billing/a.go, whose stored landing that
+// evidence makes ready; draft, a draft touching docs/a.md; fromF1 and
+// fromM1, open, from the forks api--f1 and api--m1. web is pending with
+// no default branch yet, and wsWrite is a PAT of dana with only
+// workspaces:write.
+type evalWorld struct {
+	*world
+	billing, draft, fromF1, fromM1 int64
+	wsWrite                        string
+}
+
+func newEvalWorld(t *testing.T, stored bool) *evalWorld {
+	t.Helper()
+	w := &evalWorld{world: newWorld(t)}
+	if stored {
+		w.setPolicy(t, "api", threeRules, w.byDana(), time.Now())
+	}
+	w.policy.RegisterEvidence(allPassed{})
+	w.billing = w.openBilling(t, "billing")
+	w.draft = w.openTouching(t, "draft", "docs/a.md", func(in *change.OpenInput) { in.Draft = true })
+	w.fromF1 = w.openTouching(t, "f1", "docs/b.md", func(in *change.OpenInput) { in.SourceWorkspace = "api--f1" })
+	w.fromM1 = w.openTouching(t, "m1", "docs/c.md", func(in *change.OpenInput) { in.SourceWorkspace = "api--m1" })
+	// Once its mergeability is computed, nothing writes a change again
+	// until another trigger.
+	for _, n := range []int64{w.billing, w.draft, w.fromF1, w.fromM1} {
+		w.checked(t, "api", n)
+	}
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, default_branch = NULL WHERE slug = 'web'`, workspace.StatusPending)
+		return err
+	})
+	w.wsWrite = w.IssuePAT(t, identity.PATSpec{UserID: w.dana, Permissions: []string{"workspaces:write"}})
+	return w
+}
+
+// allPassed counts one approval and passes every check of every
+// requirement.
+type allPassed struct{}
+
+func (allPassed) Evidence(_ context.Context, _ policy.Querier, in policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
+	checks := map[string]string{}
+	for _, c := range in.Checks {
+		checks[c] = "passed"
+	}
+	return policy.EvidenceAnswer{Counted: 1, Checks: checks}, nil
+}
+
+// evalRow is one evaluate request, by credential (dana's key for "") on
+// slug (api for ""), with body, a value sent as JSON or a string sent as
+// it is, and the answer it wants: status, with errorType and details
+// (when not nil) for a refusal, and for 200 the landing status, the rules
+// of the requirements in order and the policy revision.
+type evalRow struct {
+	name, slug, credential string
+	body                   any
+	status                 int
+	errorType              string
+	details                map[string]any
+	landing                string
+	rules                  []string
+	revision               float64
+}
+
+// evaluate sends the row's request.
+func (w *evalWorld) evaluate(t *testing.T, r evalRow) answer {
+	t.Helper()
+	slug, credential := cmp.Or(r.slug, "api"), cmp.Or(r.credential, w.danaKey)
+	return w.send(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/policy/evaluate", credential, r.body, nil)
+}
+
+// check sends the row's request, asserts the answer it wants and returns
+// it. Every 200 holds exactly policy_revision, status and requirements,
+// counts no approval and has every check pending.
+func (w *evalWorld) check(t *testing.T, r evalRow) answer {
+	t.Helper()
+	a := w.evaluate(t, r)
+	if a.status != r.status {
+		t.Fatalf("= %d %s, want %d", a.status, a.body, r.status)
+	}
+	if r.status != http.StatusOK {
+		if a.errorType() != r.errorType {
+			t.Errorf("= %d %s, want %s", a.status, a.body, r.errorType)
+		}
+		if details := a.json["error"].(map[string]any)["details"]; r.details != nil && !reflect.DeepEqual(details, r.details) {
+			t.Errorf("details = %v, want %v", details, r.details)
+		}
+		return a
+	}
+	reqs, _ := a.json["requirements"].([]any)
+	var rules []string
+	for _, q := range reqs {
+		req, _ := q.(map[string]any)
+		rules = append(rules, req["rule"].(string))
+		if approvals, _ := req["approvals"].(map[string]any); approvals["counted"] != 0.0 {
+			t.Errorf("requirement %v counts %v approvals, want 0", req["rule"], approvals["counted"])
+		}
+		for _, c := range req["checks"].([]any) {
+			if c.(map[string]any)["status"] != "pending" {
+				t.Errorf("requirement %v has the check %v, want it pending", req["rule"], c)
+			}
+		}
+	}
+	if len(a.json) != 3 || a.json["status"] != r.landing || !slices.Equal(rules, r.rules) || a.json["policy_revision"] != r.revision {
+		t.Errorf("= %s, want only policy_revision %v, status %s and the requirements %v", a.body, r.revision, r.landing, r.rules)
+	}
+	return a
+}
+
+// manyPaths are n distinct paths that no rule of threeRules selects.
+func manyPaths(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "src/" + strconv.Itoa(i) + ".go"
+	}
+	return out
+}
+
+func pathRows(w *evalWorld) []evalRow {
+	return []evalRow{
+		{name: "docs", body: map[string]any{"paths": []string{"docs/a.md"}},
+			status: http.StatusOK, landing: "ready", rules: []string{"docs"}, revision: 1},
+		{name: "billing twice and docs", body: map[string]any{"paths": []string{"billing/a.go", "docs/a.md", "billing/a.go"}},
+			status: http.StatusOK, landing: "pending", rules: []string{"docs", "billing"}, revision: 1},
+		{name: "billing into a branch its targets do not match", body: map[string]any{"paths": []string{"billing/a.go"}, "target_branch": "dev"},
+			status: http.StatusOK, landing: "ready", rules: []string{"default"}, revision: 1},
+		{name: "billing into a release branch that does not exist", body: map[string]any{"paths": []string{"billing/a.go"}, "target_branch": "release/9"},
+			status: http.StatusOK, landing: "pending", rules: []string{"billing"}, revision: 1},
+		{name: "secrets", body: map[string]any{"paths": []string{"deploy/secrets/k"}},
+			status: http.StatusOK, landing: "blocked", rules: []string{"secrets"}, revision: 1},
+		{name: "2 000 paths", body: map[string]any{"paths": manyPaths(2000)},
+			status: http.StatusOK, landing: "ready", rules: []string{"default"}, revision: 1},
+		{name: "secrets on a fork's own slug", slug: "api--m1", body: map[string]any{"paths": []string{"deploy/secrets/k"}},
+			status: http.StatusOK, landing: "ready", rules: []string{"default"}, revision: 0},
+	}
+}
+
+func changeRows(w *evalWorld) []evalRow {
+	return []evalRow{
+		{name: "an open change whose evidence makes it ready", body: map[string]any{"change": w.billing},
+			status: http.StatusOK, landing: "pending", rules: []string{"billing"}, revision: 1},
+		{name: "a draft", body: map[string]any{"change": w.draft},
+			status: http.StatusOK, landing: "ready", rules: []string{"docs"}, revision: 1},
+	}
+}
+
+// stop blocks every file.
+const stop = `{"rules": [{"name": "stop", "paths": ["**"], "require": {"block": true}}]}`
+
+func candidateRows(w *evalWorld) []evalRow {
+	return []evalRow{
+		{name: "paths against a candidate", body: map[string]any{"paths": []string{"billing/a.go"}, "policy": json.RawMessage(threeRules)},
+			status: http.StatusOK, landing: "pending", rules: []string{"billing"}, revision: 0},
+		{name: "a change against a candidate", body: map[string]any{"change": w.billing, "policy": json.RawMessage(stop)},
+			status: http.StatusOK, landing: "blocked", rules: []string{"stop"}, revision: 0},
+	}
+}
+
+func invalidRequestRows(w *evalWorld) []evalRow {
+	refused := func(name string, body any) evalRow {
+		return evalRow{name: name, body: body, status: http.StatusBadRequest, errorType: "invalid_request"}
+	}
+	return []evalRow{
+		refused("neither paths nor change", map[string]any{}),
+		refused("both paths and change", map[string]any{"paths": []string{"a"}, "change": 1}),
+		refused("no path", map[string]any{"paths": []string{}}),
+		refused("2 001 paths", map[string]any{"paths": manyPaths(2001)}),
+		refused("an empty path", map[string]any{"paths": []string{""}}),
+		refused("an absolute path", map[string]any{"paths": []string{"/abs"}}),
+		refused("a path that is a number", map[string]any{"paths": []any{3}}),
+		refused("paths that are a string", map[string]any{"paths": "a"}),
+		refused("paths that are null", map[string]any{"paths": nil}),
+		refused("a change that is a string", map[string]any{"change": "1"}),
+		refused("a change that is a fraction", map[string]any{"change": 1.5}),
+		refused("a target branch with a change", map[string]any{"change": 1, "target_branch": "main"}),
+		refused("an empty target branch", map[string]any{"paths": []string{"a"}, "target_branch": ""}),
+		refused("a target branch of 256 characters", map[string]any{"paths": []string{"a"}, "target_branch": strings.Repeat("b", 256)}),
+		refused("a target branch that is a number", map[string]any{"paths": []string{"a"}, "target_branch": 1}),
+		refused("not an object", `[]`),
+		{name: "no target branch on a workspace without a default branch", slug: "web", body: map[string]any{"paths": []string{"a"}},
+			status: http.StatusBadRequest, errorType: "invalid_request"},
+		{name: "a target branch on a workspace without a default branch", slug: "web", body: map[string]any{"paths": []string{"a"}, "target_branch": "main"},
+			status: http.StatusOK, landing: "ready", rules: []string{"default"}, revision: 0},
+	}
+}
+
+func invalidCandidateRows(w *evalWorld) []evalRow {
+	tooLong := `{"rules": []` + strings.Repeat(" ", 65537-len(`{"rules": []}`)) + `}`
+	document := map[string]any{"rule": nil, "index": nil, "field": "document"}
+	return []evalRow{
+		{name: "a rule without paths", body: map[string]any{"paths": []string{"a"}, "policy": map[string]any{
+			"rules": []any{map[string]any{"name": "x", "paths": []string{}, "require": map[string]any{}}}}},
+			status: http.StatusBadRequest, errorType: "invalid_policy", details: map[string]any{"rule": "x", "index": 0.0, "field": "paths"}},
+		{name: "a list", body: map[string]any{"paths": []string{"a"}, "policy": []any{}},
+			status: http.StatusBadRequest, errorType: "invalid_policy", details: document},
+		{name: "a document of 65 537 bytes", body: `{"paths": ["a"], "policy": ` + tooLong + `}`,
+			status: http.StatusBadRequest, errorType: "invalid_policy", details: document},
+	}
+}
+
+func foreignChangeRows(w *evalWorld) []evalRow {
+	notFound := func(name, credential string, n int64) evalRow {
+		return evalRow{name: name, credential: credential, body: map[string]any{"change": n},
+			status: http.StatusNotFound, errorType: "change_not_found"}
+	}
+	return []evalRow{
+		notFound("a fork's token, a change of another fork", w.melM1, w.fromF1),
+		notFound("a fork's token, no such change", w.melM1, 9999),
+		notFound("the owner, no such change", w.danaKey, 9999),
+		{name: "a fork's token, a change of its fork", credential: w.melM1, body: map[string]any{"change": w.fromM1},
+			status: http.StatusOK, landing: "ready", rules: []string{"docs"}, revision: 1},
+	}
+}
+
+func callerRefusalRows(w *evalWorld) []evalRow {
+	return []evalRow{
+		{name: "a PAT without changes:read", credential: w.wsWrite, body: map[string]any{},
+			status: http.StatusForbidden, errorType: "insufficient_scope"},
+		{name: "an outsider", credential: w.ozKey, body: map[string]any{},
+			status: http.StatusNotFound, errorType: "not_found"},
+	}
+}
+
+func TestEvaluatePolicy_AnswersWhatPathsNeedUnderTheStoredDocument(t *testing.T) {
+	w := newEvalWorld(t, true)
+	rows := pathRows(w)
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+	billing := rows[1]
+	owner := w.check(t, billing)
+	if req := owner.json["requirements"].([]any)[1].(map[string]any); !reflect.DeepEqual(req["paths"], []any{"billing/a.go"}) {
+		t.Errorf("the billing requirement lists %v, want billing/a.go once", req["paths"])
+	}
+	for name, credential := range map[string]string{"org member": w.melKey, "token bound to the member's fork": w.melM1} {
+		t.Run(name, func(t *testing.T) {
+			billing.credential = credential
+			if a := w.evaluate(t, billing); a.status != http.StatusOK || !bytes.Equal(a.body, owner.body) {
+				t.Errorf("= %d %s, want 200 %s", a.status, a.body, owner.body)
+			}
+		})
+	}
+	t.Run("archived", func(t *testing.T) {
+		w.setStatus(t, "api", workspace.StatusArchived)
+		w.check(t, rows[0])
+	})
+}
+
+func TestEvaluatePolicy_AnswersWhatAChangeNeedsWithoutItsEvidenceOrCause(t *testing.T) {
+	w := newEvalWorld(t, true)
+	if l := w.landing(t, w.billing); l["status"] != change.LandingReady {
+		t.Fatalf("the stored landing of the billing change is %v, want ready", l)
+	}
+	for _, r := range changeRows(w) {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+	if l := w.landing(t, w.billing); l["status"] != change.LandingReady {
+		t.Errorf("after the evaluation the stored landing is %v, want ready still", l)
+	}
+}
+
+func TestEvaluatePolicy_TakesACandidateInPlaceOfTheStoredDocument(t *testing.T) {
+	w := newEvalWorld(t, false)
+	rows := candidateRows(w)
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+	t.Run("with a stored revision", func(t *testing.T) {
+		w.setPolicy(t, "api", oneRule, w.byDana(), time.Now())
+		r := rows[0]
+		r.revision = 1
+		w.check(t, r)
+	})
+}
+
+func TestEvaluatePolicy_RefusesAnInvalidRequest(t *testing.T) {
+	w := newEvalWorld(t, true)
+	for _, r := range invalidRequestRows(w) {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+}
+
+func TestEvaluatePolicy_RefusesAnInvalidCandidateAsAReplacementWould(t *testing.T) {
+	w := newEvalWorld(t, true)
+	for _, r := range invalidCandidateRows(w) {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+}
+
+func TestEvaluatePolicy_HidesAChangeOfAnotherSourceFromAForkBoundToken(t *testing.T) {
+	w := newEvalWorld(t, true)
+	rows := foreignChangeRows(w)
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+	foreign, unknown, owners := w.evaluate(t, rows[0]), w.evaluate(t, rows[1]), w.evaluate(t, rows[2])
+	if !bytes.Equal(foreign.body, unknown.body) || !bytes.Equal(foreign.body, owners.body) {
+		t.Errorf("a change of another fork = %s, no such change = %s and to the owner %s, want identical bodies", foreign.body, unknown.body, owners.body)
+	}
+}
+
+func TestEvaluatePolicy_RefusesWithoutTheScopeOrReadAccessBeforeTheBody(t *testing.T) {
+	w := newEvalWorld(t, true)
+	rows := callerRefusalRows(w)
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) { w.check(t, r) })
+	}
+	outsider, nope := rows[1], rows[1]
+	nope.slug = "nope"
+	if a, b := w.evaluate(t, outsider), w.evaluate(t, nope); !bytes.Equal(a.body, b.body) {
+		t.Errorf("outsider's answer %s differs from the answer for no workspace %s", a.body, b.body)
+	}
+}
+
+func TestEvaluatePolicy_WritesNothing(t *testing.T) {
+	w := newEvalWorld(t, true)
+	snapshot := func() []any {
+		out := []any{w.seq(t)}
+		for _, slug := range []string{"api", "web"} {
+			out = append(out, string(w.get(t, "/api/v1/workspaces/"+slug+"/policy", w.danaKey).body))
+		}
+		for _, n := range []int64{w.billing, w.draft, w.fromF1, w.fromM1} {
+			out = append(out, string(w.get(t, "/api/v1/workspaces/api/changes/"+strconv.FormatInt(n, 10), w.danaKey).body))
+		}
+		return out
+	}
+	before := snapshot()
+	for _, rows := range [][]evalRow{pathRows(w), changeRows(w), candidateRows(w), invalidRequestRows(w),
+		invalidCandidateRows(w), foreignChangeRows(w), callerRefusalRows(w)} {
+		for _, r := range rows {
+			w.evaluate(t, r)
+		}
+	}
+	if after := snapshot(); !reflect.DeepEqual(after, before) {
+		t.Errorf("after the evaluations the last event, the policies and the changes are\n%v\nwant\n%v", after, before)
 	}
 }

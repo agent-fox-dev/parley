@@ -4980,6 +4980,60 @@ change carries its new landing. Replacements of one workspace run one at a time:
 once without `If-Match` get consecutive revisions, and of two with the
 same `If-Match` one is stored and the other is `412` `revision_mismatch`.
 
+### `POST /api/v1/workspaces/{slug}/policy/evaluate`
+
+Answers what a list of paths, or an existing change, would need to land,
+with no approval counted and no check result, against the stored policy
+or a candidate document, and writes nothing: no revision, no event, no
+change's `landing`, whether the request is answered or refused. Needs the
+scope `changes:read` and `read` access, so an org member and a token
+bound to a task fork of `{slug}` (a contributor route) evaluate as the
+owner does, and an archived workspace is evaluated like any other. The
+access refusals come before the body is read: a token without the scope
+is `403` `insufficient_scope`, and a caller without access `404`
+`not_found` with the message `workspace not found`, as for a workspace
+that does not exist. The route takes a body of up to 1 MiB whatever
+`[server].max_body_size` says, so that a candidate over the format's limit
+reaches the validator.
+
+The body is a JSON object with exactly one of `paths` and `change`:
+
+| Member | Rule |
+|---|---|
+| `paths` | a list of 1 to 2 000 paths as sent, each a non-empty string that does not start with `/`; a repeated path counts once |
+| `target_branch` | with `paths` only: the branch the paths would land on, a string of 1 to 255 characters that need not name an existing branch; absent is the workspace's default branch |
+| `change` | an integer, the number of a change of `{slug}` in any state: its current version's files (those between its `base_sha` and its `head_sha`, as for its [landing](#the-landing-of-a-change)) on its own target branch |
+| `policy` | optional, a candidate document, validated as the body of `PUT` and evaluated in place of the stored one |
+
+On a task fork's own slug the stored document is revision 0, as `GET`
+answers it. The answer is `200` with the stored revision as
+`policy_revision`, also when a candidate was evaluated, and the `status`
+and `requirements` of [the landing of a change](#the-landing-of-a-change)
+as they would be with no approval and no check result: every `counted` is
+`0` and every check `pending`. No structural cause applies, so a draft is
+not `blocked` for being a draft. For the paths `billing/a.go`, `docs/a.md`
+and `billing/a.go` into `main`, under the document of the `PUT` example
+stored as revision 1:
+
+```json
+{"policy_revision":1,"status":"pending","requirements":[{"rule":"docs","paths":["docs/a.md"],"approvals":{"required":0,"counted":0,"approvers":["owner"]},"checks":[],"block":false,"satisfied":true},{"rule":"billing","paths":["billing/a.go"],"approvals":{"required":1,"counted":0,"approvers":["owner","user:dana"]},"checks":[{"name":"test","status":"pending"},{"name":"billing-e2e","status":"pending"}],"block":false,"satisfied":false}]}
+```
+
+The refusals after access come in this order:
+
+| Condition | Answer |
+|---|---|
+| the body is not one JSON object | `400` `invalid_request` (`request body must be a JSON object`, `request body is not valid JSON`, `request body is empty; want a JSON object`) |
+| both or neither of `paths` and `change` | `400` `invalid_request`, message `give exactly one of paths and change` |
+| `change` is not an integer (`"1"`, `1.5`, `null`) | `400` `invalid_request`, message `change must be an integer` |
+| `target_branch` with `change` | `400` `invalid_request`, message `target_branch cannot be given with change, whose own target branch is used` |
+| `paths` is not a list of 1 to 2 000 entries | `400` `invalid_request`, message `paths must be a list of 1 to 2000 paths` |
+| an entry of `paths` is not a non-empty string or starts with `/` | `400` `invalid_request`, message `every path must be a non-empty string that does not start with '/'` |
+| `target_branch` is not a string, is empty or is longer than 255 characters | `400` `invalid_request`, message `target_branch must be a branch name of 1 to 255 characters` |
+| `policy` breaks a rule of the document | `400` `invalid_policy` with `details` `{rule, index, field}` as for `PUT`; a `policy` that is not an object, or whose JSON text is over 65 536 bytes, is the field `document` |
+| `paths` without `target_branch` on a workspace with no default branch yet (a `pending` one) | `400` `invalid_request`, message `the workspace has no default branch yet; give target_branch` |
+| `change` names no change of `{slug}`, or the caller is a token bound to a task fork and the change's source is not that fork | `404` `change_not_found`, message `no such change`, the same body in both cases |
+
 ### The landing of a change
 
 The `landing` of a draft or open change is its current version evaluated

@@ -118,9 +118,18 @@ lives in `internal/hub/policy.go`, so that `internal/policy` does not import
   `identity.UserBySelector`, which reads a UUID-shaped value as an id and a
   value containing `@` as an e-mail. Usernames come from the providers and
   have neither shape.
-- **The policy routes have their own body limit.** `PUT …/policy`
-  declares `MaxBodySize` 1 MiB, so that a document of 65 537 bytes reaches
-  the validator, which names it, whatever `[server].max_body_size` is.
+- **The policy routes have their own body limit.** `PUT …/policy` and
+  `POST …/policy/evaluate` declare `MaxBodySize` 1 MiB, so that a document
+  of 65 537 bytes reaches the validator, which names it, whatever
+  `[server].max_body_size` is.
+- **An evaluation counts its paths as sent.** The 2 000 limit of `paths`
+  counts the entries as the body gives them: 2 001 entries are refused even
+  when some repeat. Repeated entries are then kept once.
+- **An evaluation's change_not_found names no change.** The change
+  component's own `404 change_not_found` names the number. The evaluate
+  route answers an unknown number and a change a fork-bound token may not
+  see with the constant `change.ErrChangeNotFound` (`no such change`), so
+  that the two bodies are identical.
 - **The changes a replacement re-evaluates are listed by the change
   component.** No lookup listed every draft and open change of a workspace
   (`ChangesInto` lists those into one branch), so the change component
