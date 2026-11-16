@@ -174,3 +174,30 @@ func scanClaim(scan func(dest ...any) error) (Claim, error) {
 	}
 	return cl, nil
 }
+
+// MaxClaimsPerSession is how many active claims one session may hold.
+const MaxClaimsPerSession = 50
+
+// countLiveClaimsOn is the number of claims stored on workspace that are
+// active at now, on any target branch, read through q.
+func countLiveClaimsOn(ctx context.Context, q Querier, workspace string, now time.Time) (int, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM awareness_claims
+WHERE workspace_slug = ? AND state = 'active' AND expires_at > ?`, workspace, now.UnixNano()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count the claims of %s: %w", workspace, err)
+	}
+	return n, nil
+}
+
+// countLiveClaimsOf is the number of claims naming the session that are
+// active at now, on any workspace, read through q.
+func countLiveClaimsOf(ctx context.Context, q Querier, session string, now time.Time) (int, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM awareness_claims
+WHERE session_id = ? AND state = 'active' AND expires_at > ?`, session, now.UnixNano()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count the claims of the session %s: %w", session, err)
+	}
+	return n, nil
+}

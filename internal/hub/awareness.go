@@ -7,6 +7,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -37,6 +38,11 @@ const (
 // awareness.Deps.IndexInterval, so that no request that records a version
 // or changes a change's state waits for the index.
 //
+// It registers the keys of [awareness] and checks, before any store is
+// opened, the rule that spans two of them: a default claim lifetime longer
+// than the maximum stops the start. No session interface is registered:
+// without the session feature every claim that names a session is refused.
+//
 // The component exists from the composition on (Awareness); tests change
 // its dependencies with AdjustAwareness.
 func composeAwareness(c *Composition) {
@@ -44,6 +50,14 @@ func composeAwareness(c *Composition) {
 	c.awareness = comp
 	c.AddSchemaStep(awareness.SchemaStep)
 	c.AddSchemaStep(awareness.ClaimSchemaStep)
+	for _, k := range awareness.ConfigKeys() {
+		c.RegisterKey(k)
+	}
+	var cfg awareness.Config
+	c.addConfigCheck(func(loaded *config.Config) (err error) {
+		cfg, err = awareness.ConfigFrom(loaded)
+		return err
+	})
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
@@ -71,6 +85,7 @@ func composeAwareness(c *Composition) {
 			},
 			Now:    rt.Now,
 			Logger: rt.Logger,
+			Config: cfg,
 		}
 		for _, adjust := range c.awarenessAdjusters {
 			adjust(&d)

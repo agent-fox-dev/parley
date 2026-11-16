@@ -8,11 +8,15 @@
 // pair once, with a parley.change.overlap event on each of the two, and
 // announces it again only after it stopped overlapping.
 //
-// The package needs four things of others, which it defines as narrow
+// A claim is an advisory, expiring statement that someone intends to work
+// on the files some globs match; creating one answers with the activity of
+// its globs.
+//
+// The package needs five things of others, which it defines as narrow
 // interfaces that the hub wires: the event log it follows (EventSource),
 // the change records it reads (ChangeReader), the repositories it lists a
-// version's files in (Deps.Repos), and the event log it writes its own
-// events to (Emitter).
+// version's files in (Deps.Repos), the event log it writes its own events
+// to (Emitter), and the sessions a claim may name (Sessions).
 package awareness
 
 import (
@@ -113,6 +117,24 @@ const (
 	StateAbandoned = "abandoned"
 )
 
+// ErrUnknownSession is the answer of a Sessions check that refuses a
+// session id.
+var ErrUnknownSession = errors.New("unknown session")
+
+// Sessions is the session-linking rule and the session record, which the
+// session feature keeps. Without one no session exists, and every claim
+// that names a session is refused.
+type Sessions interface {
+	// Check judges the session id a claim made by caller through the
+	// workspace slug names. It returns the id as it is to be stored when it
+	// accepts it, an error matching ErrUnknownSession when it refuses it,
+	// and any other error when it cannot tell.
+	Check(ctx context.Context, caller Actor, sessionID, workspace string) (string, error)
+	// Record links the session to the claim, stored on workspace, in tx,
+	// the transaction that stores the claim; its error undoes the claim.
+	Record(ctx context.Context, tx *sql.Tx, sessionID, workspace, claim string) error
+}
+
 // Deps are what the component needs from the hub.
 type Deps struct {
 	// Store holds the index and the worker's position.
@@ -139,12 +161,19 @@ type Deps struct {
 	// IndexInterval is the time between two looks of the index worker at
 	// the event log; zero is DefaultIndexInterval.
 	IndexInterval time.Duration
+	// Config is [awareness]; a zero member is DefaultConfig's.
+	Config Config
 }
 
 // Component is the awareness feature: the index of the changes by touched
 // file and the worker that keeps it.
 type Component struct {
 	deps Deps
+
+	// mu guards sessions, which is registered while the hub is composed
+	// and read by every claim creation.
+	mu       sync.RWMutex
+	sessions Sessions
 
 	// pass is held by a worker pass, so that two passes never process the
 	// same event at once.
@@ -173,9 +202,37 @@ func (c *Component) Bind(d Deps) {
 	if d.IndexInterval <= 0 {
 		d.IndexInterval = DefaultIndexInterval
 	}
+	def := DefaultConfig()
+	if d.Config.DefaultClaimTTL <= 0 {
+		d.Config.DefaultClaimTTL = def.DefaultClaimTTL
+	}
+	if d.Config.MaxClaimTTL <= 0 {
+		d.Config.MaxClaimTTL = def.MaxClaimTTL
+	}
+	if d.Config.MaxClaimsPerWorkspace <= 0 {
+		d.Config.MaxClaimsPerWorkspace = def.MaxClaimsPerWorkspace
+	}
 	c.pass.Lock()
 	defer c.pass.Unlock()
 	c.deps = d
+}
+
+// RegisterSessions makes s the session interface, replacing the one
+// before; nil removes it. Collaborators are registered on the instance
+// while the hub is composed, never in a registry of the package, so that
+// every hub has its own.
+func (c *Component) RegisterSessions(s Sessions) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessions = s
+}
+
+// registeredSessions is the session interface registered now, nil for
+// none.
+func (c *Component) registeredSessions() Sessions {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessions
 }
 
 // querier is q, or the store for nil.

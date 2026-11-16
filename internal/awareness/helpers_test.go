@@ -103,34 +103,57 @@ func (f *fixture) open() {
 type served struct {
 	*fixture
 	hub *hubtest.Hub
+	// owner is the user who owns demo and acme; key is the owner's API key.
+	owner, key string
+	// org is acme's id.
+	org string
+}
+
+// servedConfig is what newServedWith starts a served fixture's hub with.
+type servedConfig struct {
+	// TOML is added to the hub's config.toml, such as an [awareness]
+	// section.
+	TOML string
+	// Now is the awareness component's clock; nil for the hub's.
+	Now func() time.Time
 }
 
 // newServed is a served fixture with an empty bare repository, in which
 // the hub's admin token reaches demo.
 func newServed(t testing.TB) *served {
 	t.Helper()
+	return newServedWith(t, servedConfig{})
+}
+
+// newServedWith is newServed with the hub started as cfg says.
+func newServedWith(t testing.TB, cfg servedConfig) *served {
+	t.Helper()
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "demo.git")
 	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", repo)
 	f := &fixture{t: t, dir: dir, repo: repo, events: &eventFeed{}, changes: &changeBook{records: map[string]awareness.Change{}},
 		log: &hubtest.LogBuffer{}}
-	h := hubtest.Start(t, func(c *hub.Composition) {
+	h := hubtest.StartWith(t, hubtest.Config{TOML: cfg.TOML, Compose: func(c *hub.Composition) {
 		f.comp = c.Awareness()
 		c.AdjustAwareness(func(d *awareness.Deps) {
 			d.Events, d.Changes, d.IndexInterval = f.events, f.changes, time.Hour
 			d.Repos = func(ctx context.Context, _ string) (*gitrepo.Repo, error) { return gitrepo.Git{}.Open(ctx, f.repo) }
 			d.Logger = slog.New(slog.NewTextHandler(f.log, nil))
+			if cfg.Now != nil {
+				d.Now = cfg.Now
+			}
 		})
-	})
+	}})
 	f.store = h.Store
 	owner := h.CreateUser(t, "owner")
-	h.AddWorkspace(t, access.Record{Slug: "demo", OwnerID: owner, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository,
+	org := h.CreateOrg(t, "acme")
+	h.AddWorkspace(t, access.Record{Slug: "demo", OwnerID: owner, OrgID: org, Kind: access.KindRepository,
 		Status: access.StatusReady})
 	txOf(t, h.Store, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(context.Background(), `UPDATE workspaces SET default_branch = 'main' WHERE slug = 'demo'`)
 		return err
 	})
-	return &served{fixture: f, hub: h}
+	return &served{fixture: f, hub: h, owner: owner, key: h.IssueKey(t, owner), org: org}
 }
 
 // activity gets GET …/activity?query, which must answer 200 with exactly
@@ -683,4 +706,140 @@ func jsonHasKeys(t testing.TB, raw []byte, keys ...string) bool {
 	}
 	got := slices.Sorted(maps.Keys(obj))
 	return slices.Equal(got, slices.Sorted(slices.Values(keys)))
+}
+
+// clock is a clock that moves only when the test moves it.
+type clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// advance moves the clock d forward.
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// postClaim sends POST /api/v1/workspaces/<slug>/claims with the owner's
+// API key and body, and returns the answer's status and body.
+func (s *served) postClaim(t testing.TB, slug string, body any) (int, []byte) {
+	t.Helper()
+	return s.hub.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/claims", s.key, body)
+}
+
+// createClaim posts body to demo's claims, which must answer 201, and
+// returns the new claim's id.
+func (s *served) createClaim(t testing.TB, slug string, body any) string {
+	t.Helper()
+	status, raw := s.postClaim(t, slug, body)
+	if status != http.StatusCreated {
+		t.Fatalf("POST %s/claims %v = %d %s, want 201", slug, body, status, raw)
+	}
+	var created struct {
+		Claim struct {
+			ID string `json:"id"`
+		} `json:"claim"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+	return created.Claim.ID
+}
+
+// count is the number of rows of table in the hub's store.
+func (s *served) count(t testing.TB, table string) int {
+	t.Helper()
+	var n int
+	if err := s.hub.Store.Main().QueryRowContext(context.Background(), `SELECT count(*) FROM `+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// sessions is a session interface that accepts the session ids of
+// accepted and records each claim link it is told of.
+type sessions struct {
+	mu       sync.Mutex
+	accepted []string
+	records  []string
+}
+
+func (s *sessions) Check(_ context.Context, _ awareness.Actor, id, _ string) (string, error) {
+	if !slices.Contains(s.accepted, strings.ToLower(id)) {
+		return "", awareness.ErrUnknownSession
+	}
+	return strings.ToLower(id), nil
+}
+
+func (s *sessions) Record(_ context.Context, _ *sql.Tx, id, workspace, claim string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, id+" "+workspace+" "+claim)
+	return nil
+}
+
+// claimAnswer is the body of a claim creation's answer.
+type claimAnswer struct {
+	Claim    claimBody      `json:"claim"`
+	Activity activityAnswer `json:"activity"`
+}
+
+// claimBody is a claim object as an answer shows it.
+type claimBody struct {
+	ID           string   `json:"id"`
+	Workspace    string   `json:"workspace_slug"`
+	Paths        []string `json:"paths"`
+	TargetBranch string   `json:"target_branch"`
+	Intent       string   `json:"intent"`
+	By           struct {
+		ActorType string  `json:"actor_type"`
+		ActorID   *string `json:"actor_id"`
+		Username  *string `json:"username"`
+	} `json:"by"`
+	SessionID *string `json:"session_id"`
+	Change    *int64  `json:"change"`
+	ExpiresAt string  `json:"expires_at"`
+	State     string  `json:"state"`
+	CreatedAt string  `json:"created_at"`
+}
+
+// storedEvent is a row of the hub's event log.
+type storedEvent struct {
+	Type, ResourceType, ResourceID string
+	Workspace, ActorID, SessionID  *string
+	ActorType                      string
+	Metadata                       map[string]any
+}
+
+// lastEvent is the newest event of the hub's event log.
+func (s *served) lastEvent(t *testing.T) storedEvent {
+	t.Helper()
+	var ev storedEvent
+	var meta string
+	if err := s.hub.Store.Main().QueryRowContext(context.Background(), `SELECT type, resource_type, resource_id, workspace,
+	actor_type, actor_id, session_id, metadata FROM hub_events ORDER BY seq DESC LIMIT 1`).Scan(&ev.Type, &ev.ResourceType,
+		&ev.ResourceID, &ev.Workspace, &ev.ActorType, &ev.ActorID, &ev.SessionID, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(meta), &ev.Metadata); err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// firstMember is the member key of the JSON object raw.
+func firstMember(t testing.TB, raw []byte, key string) []byte {
+	t.Helper()
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("%s: %v", raw, err)
+	}
+	return obj[key]
 }
