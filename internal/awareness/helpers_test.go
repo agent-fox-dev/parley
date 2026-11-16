@@ -335,19 +335,31 @@ func (s *served) get(path string) (int, []byte) {
 type changeHub struct {
 	*hubtest.Hub
 	comp *awareness.Component
-	// key is the owner's API key.
-	key string
+	// owner is the id of demo's owner; key is the owner's API key.
+	owner, key string
 	// repo is demo's repository; base is main's head.
 	repo, base string
 }
 
 func newChangeHub(t testing.TB) *changeHub {
 	t.Helper()
+	return newChangeHubWith(t, nil, nil)
+}
+
+// newChangeHubWith is newChangeHub with clock as the hub's clock (nil for
+// its own) and adjust run on the awareness component's dependencies after
+// the fixture's own changes (nil for nothing), such as to give the worker
+// another interval.
+func newChangeHubWith(t testing.TB, clock func() time.Time, adjust func(*awareness.Deps)) *changeHub {
+	t.Helper()
 	var comp *awareness.Component
 	var workspaces *workspace.Service
-	h := hubtest.StartWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
+	h := hubtest.StartWith(t, hubtest.Config{Now: clock, Compose: func(c *hub.Composition) {
 		comp, workspaces = c.Awareness(), c.Workspaces()
 		c.AdjustAwareness(func(d *awareness.Deps) { d.IndexInterval = time.Hour })
+		if adjust != nil {
+			c.AdjustAwareness(adjust)
+		}
 	}})
 	owner := h.CreateUser(t, "owner")
 	key := h.IssueKey(t, owner)
@@ -364,12 +376,22 @@ func newChangeHub(t testing.TB) *changeHub {
 		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
 	}
 	txOf(t, h.Store, func(tx *sql.Tx) error { return workspace.Insert(context.Background(), tx, rec) })
-	return &changeHub{Hub: h, comp: comp, key: key, repo: dir, base: base}
+	return &changeHub{Hub: h, comp: comp, owner: owner, key: key, repo: dir, base: base}
 }
 
 // open opens a change of demo from a new branch whose commit on main's
 // head sets each of files, and returns its number.
 func (h *changeHub) open(t testing.TB, branch string, files map[string]string) int64 {
+	t.Helper()
+	var opened struct{ Number int64 }
+	if err := json.Unmarshal(h.opened(t, branch, files), &opened); err != nil {
+		t.Fatal(err)
+	}
+	return opened.Number
+}
+
+// opened is open's answer, the change as the open created it.
+func (h *changeHub) opened(t testing.TB, branch string, files map[string]string) []byte {
 	t.Helper()
 	commit(t, h.repo, branch, h.base, files)
 	status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/changes", h.key,
@@ -377,11 +399,7 @@ func (h *changeHub) open(t testing.TB, branch string, files map[string]string) i
 	if status != http.StatusCreated {
 		t.Fatalf("POST changes from %s = %d %s, want 201", branch, status, raw)
 	}
-	var opened struct{ Number int64 }
-	if err := json.Unmarshal(raw, &opened); err != nil {
-		t.Fatal(err)
-	}
-	return opened.Number
+	return raw
 }
 
 // restart closes the store and opens it again under a new component.

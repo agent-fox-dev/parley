@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -281,4 +282,70 @@ func (s *served) overlaps(t *testing.T, path string) overlapsPage {
 		t.Fatal(err)
 	}
 	return page
+}
+
+func TestOverlaps_LeaveOpeningAChangeOnClaimedPathsUnaffected(t *testing.T) {
+	t.Parallel()
+	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	// opening opens a change from other, which sets otherFile, lets a pass
+	// index it and, with claimed, has the admin claim api/a.go, then opens
+	// a change from feat, which sets api/a.go. It returns the answer to
+	// that open and feat as a read gives it after the next pass, which
+	// indexes it, each with the author's id, which is the hub's own owner,
+	// as "owner".
+	opening := func(otherFile string, claimed bool) (h *changeHub, number int64, opened, read map[string]any) {
+		h = newChangeHubWith(t, (&clock{now: at}).Now, nil)
+		h.open(t, "other", map[string]string{otherFile: "other\n"})
+		if err := h.comp.Pass(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if claimed {
+			body := map[string]any{"paths": []string{"api/a.go"}, "intent": "rework a"}
+			if status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/claims", h.Token, body); status != http.StatusCreated {
+				t.Fatalf("POST claims = %d %s, want 201", status, raw)
+			}
+		}
+		if err := json.Unmarshal(h.opened(t, "feat", map[string]string{"api/a.go": "feat\n"}), &opened); err != nil {
+			t.Fatal(err)
+		}
+		number = int64(opened["number"].(float64))
+		if err := h.comp.Pass(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		status, raw := h.Call(t, http.MethodGet, fmt.Sprintf("/api/v1/workspaces/demo/changes/%d", number), h.key, nil)
+		if status != http.StatusOK || json.Unmarshal(raw, &read) != nil {
+			t.Fatalf("GET change %d = %d %s, want 200 with the change", number, status, raw)
+		}
+		for _, ch := range []map[string]any{opened, read} {
+			author, _ := ch["author"].(map[string]any)
+			if author == nil || author["actor_id"] != h.owner {
+				t.Fatalf("author = %v, want demo's owner %s", ch["author"], h.owner)
+			}
+			author["actor_id"] = "owner"
+		}
+		return h, number, opened, read
+	}
+	_, _, alone, aloneRead := opening("docs/x.md", false)
+	h, number, crowded, crowdedRead := opening("api/a.go", true)
+
+	overlaps, err := h.comp.Overlaps(t.Context(), nil, "demo", number)
+	if err != nil || len(overlaps) != 1 {
+		t.Fatalf("overlaps of %d = %v, %v; want the other change", number, overlaps, err)
+	}
+	for _, c := range []struct {
+		what           string
+		crowded, alone map[string]any
+	}{{"the answer to the open", crowded, alone}, {"the read after a pass", crowdedRead, aloneRead}} {
+		for _, key := range slices.Sorted(maps.Keys(c.alone)) {
+			if !reflect.DeepEqual(c.crowded[key], c.alone[key]) {
+				t.Errorf("%s: %s = %v on claimed, overlapping paths, want %v as without them", c.what, key, c.crowded[key], c.alone[key])
+			}
+		}
+		if len(c.crowded) != len(c.alone) {
+			t.Errorf("%s has %d members on claimed, overlapping paths, want %d as without them", c.what, len(c.crowded), len(c.alone))
+		}
+	}
+	if crowded["state"] != "open" || crowded["version"] != float64(1) {
+		t.Errorf("state, version = %v, %v; want open, 1", crowded["state"], crowded["version"])
+	}
 }
