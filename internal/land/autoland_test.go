@@ -978,6 +978,68 @@ func (w *world) landerRows(t *testing.T, number int64) (n int) {
 	return n
 }
 
+func TestAutoLand_StartsALandThatMetAnUnknownMergeableOnceItIsCleanAgain(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// flag turns auto_land on for the change number, announced
+		// landable, after its mergeable turned unknown.
+		flag func(t *testing.T, w *world, clk *clock, number int64)
+	}{
+		{name: "its announcement",
+			// Through the change component, which makes no start due: the
+			// announcement alone is left.
+			flag: func(t *testing.T, w *world, _ *clock, number int64) {
+				w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+					return w.changes.SetAutoLand(ctx, tx, "api", number, true, w.caller())
+				})
+			}},
+		{name: "a start made due",
+			// The announcement is handled while the flag is off, and the
+			// flag turned on by PATCH makes a start due.
+			flag: func(t *testing.T, w *world, clk *clock, number int64) {
+				clk.advance(time.Second)
+				clk.waitAsked(t)
+				if status, answer := w.patchChange(t, w.ownerKey, number, map[string]any{"auto_land": true}); status != http.StatusOK {
+					t.Fatalf("PATCH auto_land true = %d %v, want 200", status, answer)
+				}
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			clk, lands := newClock(), &endingLands{ends: []string{land.StatusLanded}}
+			w := retryWorld(t, func() *clock { return clk }, lands)
+			ch := w.openWith(t, "unsettled", map[string]string{"unsettled.txt": "x\n"}, false, w.caller())
+			w.mergeable(t, ch.Number, change.MergeableClean)
+			until(t, ch.Ref+" is announced landable", func() bool { return w.readyCount(t, ch.Number) > 0 })
+			// A fresh mergeability check is under way, as after a restack or
+			// another change's land.
+			w.turnMergeable(t, ch.Number, change.MergeableUnknown)
+			c.flag(t, w, clk, ch.Number)
+			clk.advance(time.Second)
+			clk.waitAsked(t)
+			if n := lands.started(); n != 0 {
+				t.Fatalf("the lander started %d lands while %s's mergeable is unknown, want none", n, ch.Ref)
+			}
+
+			ready := w.readyCount(t, ch.Number)
+			w.turnMergeable(t, ch.Number, change.MergeableClean)
+			if n := w.readyCount(t, ch.Number); n != ready {
+				t.Fatalf("%s was announced landable %d times more once clean again, want none: it was announced at its head", ch.Ref, n-ready)
+			}
+			clk.advance(time.Second)
+			clk.waitAsked(t)
+
+			lands.mu.Lock()
+			starts := slices.Clone(lands.starts)
+			lands.mu.Unlock()
+			if len(starts) != 1 || starts[0].Number != ch.Number || starts[0].Trigger != land.TriggerAutoLand {
+				t.Errorf("the lander started %+v an interval later, want one land of %s with trigger auto_land", starts, ch.Ref)
+			}
+		})
+	}
+}
+
 func TestAutoLand_ForgetsAChangeOnceItsAutomaticLandLanded(t *testing.T) {
 	t.Parallel()
 	clk, lands := newClock(), &endingLands{ends: []string{land.StatusLanded}}

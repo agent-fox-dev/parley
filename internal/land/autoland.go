@@ -455,7 +455,11 @@ ON CONFLICT (workspace_slug, number) DO UPDATE SET due_at = COALESCE(MIN(due_at,
 // (hold), so that its landing has the change announced again (release).
 // A start that came due (due) for a change that is
 // not open, whose flag is off or that is not landable is dropped, and its
-// retries are counted from zero again. An announcement, or the start-up,
+// retries are counted from zero again. A change whose mergeable is unknown
+// while it is otherwise landable has its start made due again an Interval
+// later, by an announcement and a due start alike: the change component
+// does not announce it again once it is clean at the head it was
+// announced at. An announcement, or the start-up,
 // starts nothing for a change whose retry is due later: the retry is made
 // at its time. Then the setter of the flag must be allowed to
 // land the change now, as the land route would allow them, and the files
@@ -485,6 +489,8 @@ func (l *AutoLander) startProcedure(ctx context.Context, workspace string, numbe
 		return err
 	case verdict == notLandable && due:
 		return l.dropRetry(ctx, workspace, number)
+	case verdict == unsettled:
+		return l.retrySoon(ctx, workspace, number)
 	case verdict == heldBelow:
 		held, err := l.hold(ctx, ch)
 		if err != nil || held {
@@ -569,9 +575,17 @@ type verdict int
 const (
 	// startNow: the change is landable, and nothing holds its land back.
 	startNow verdict = iota
-	// notLandable: the change is not open, its flag is off or it is not
+	// notLandable: the change is not open, its flag is off, its landing
+	// is not ready or its mergeable is conflict. The change component
+	// forgets its announcement then, and announces it again once it is
 	// landable.
 	notLandable
+	// unsettled: the change is open, its flag on and its landing ready,
+	// but its mergeable is unknown while a check runs. The change
+	// component neither announces nor forgets a change then, so one
+	// announced landable before is not announced again once the check
+	// finds it clean: its start is tried again an Interval later instead.
+	unsettled
 	// notNow: a running attempt covers the change, or its retry is due
 	// later.
 	notNow
@@ -583,10 +597,11 @@ const (
 // startable judges whether the change ch may have its automatic land
 // started now: open, its flag on, landable, covered by no running attempt,
 // depending on no change that is not landed and, unless the start is the
-// one that came due (due), with no retry due later. A depends_on that
+// one that came due (due), with no retry due later. A mergeable that is
+// unknown is not yet known to be clean (unsettled). A depends_on that
 // names no change counts as none, as the land does.
 func (l *AutoLander) startable(ctx context.Context, ch change.Change, due bool) (verdict, error) {
-	if ch.State != change.StateOpen || !ch.AutoLand || ch.Landing.Status != change.LandingReady || ch.Mergeable != change.MergeableClean {
+	if ch.State != change.StateOpen || !ch.AutoLand || ch.Landing.Status != change.LandingReady || ch.Mergeable == change.MergeableConflict {
 		return notLandable, nil
 	}
 	running, err := l.deps.Lands.Running(ctx, ch.WorkspaceSlug, ch.Number)
@@ -599,6 +614,9 @@ func (l *AutoLander) startable(ctx context.Context, ch change.Change, due bool) 
 WHERE workspace_slug = ? AND number = ? AND due_at > ?)`, ch.WorkspaceSlug, ch.Number, l.now().UnixNano()).Scan(&pending); err != nil || pending {
 			return notNow, err
 		}
+	}
+	if ch.Mergeable != change.MergeableClean {
+		return unsettled, nil
 	}
 	if ch.DependsOn == nil {
 		return startNow, nil
