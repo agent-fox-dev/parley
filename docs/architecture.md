@@ -4420,7 +4420,13 @@ to land (`replay.go`: `build` replays each change's `base..head` of the
 version the attempt stored with `RebaseFromAs` onto the head, the
 landing identity `Deps.Committer`, default `Parley <parley@localhost>`,
 as committer, and keeps one `Commit` per commit that did not become
-`""`), and hands the result to `commit` (`commit.go`). A `commit` that
+`""`; a stack's changes bottom first, each onto the head the one below
+ended at, so that one move lands them all; under the strategy `squash`,
+`squash` (`squash.go`) makes of each change one commit with
+`(*gitrepo.Repo).CreateCommit` on the head it was replayed onto, the
+replay's tree, the author of the version's head commit and the message
+`squashMessage` writes, and none when the tree is unchanged), and hands
+the result to `commit` (`commit.go`). A `commit` that
 finds the target moved since it was read starts the next try on the new
 head; when the last try lost, the attempt ends `failed` `contention`. A
 gate, store or git error other than a conflict ends it `failed`

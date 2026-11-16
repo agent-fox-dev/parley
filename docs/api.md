@@ -4420,6 +4420,35 @@ When every commit was left out, the attempt ends `landed` with `noop`
 `commits` `[]`; the change is `landed` at that head, `parley.change.land`
 says `noop` `true`, and no `parley.git.push` is written.
 
+An attempt with the strategy `squash` replays each change's own commits
+the same way, then makes of each change one commit on the head it was
+replayed onto: its tree is the one the replay ended at, its author the
+author of the version's head commit, its committer the landing identity,
+and its message the change's title, a blank line, its intent and a blank
+line (both left out for a change without an intent), and the trailers:
+`Parley-Change: <slug>#<number>`, then `Parley-Session: <id>` when the
+change has a session, then one
+`Co-authored-by: Name <email>` per other author of the change's own
+commits, in the order they first wrote one. The change's one `commits`
+entry has `version_sha` the version's head. A change whose replay leaves
+the target's tree as it was gets no commit and no entry.
+
+A stack land covers the change and every change below it that is not
+`landed`, bottom first in `changes`; a change below that is already
+`landed` is left out and keeps its `landed`. It replays them bottom first,
+each onto the result of the one below, and moves the target once, to the
+top; with `squash` each change becomes one commit, in order. Every
+covered change is then `landed` by the attempt, with `landed.sha` the new
+target head and its own `commits`, and gets its `parley.change.land`
+event; one `parley.git.push` is written. A conflict, or a gate answer
+that is not `ready`, in any covered change ends the whole attempt with
+nothing landed: the target stays where it was, every covered change stays
+`open`, `conflict.change` or `blocked.change` names the change that
+stopped it, and that change alone gets `mergeable` `conflict` and the
+`parley.change.land_fail` event. The report's `target_sha` is then the
+head the attempt read, and `ours` of each file the side as replayed with
+the changes below.
+
 Before it replays anything the attempt asks the policy gate about each
 change it covers, once and bottom first, with the workspace, the change,
 the version being landed and the caller; a retry of the compare-and-swap

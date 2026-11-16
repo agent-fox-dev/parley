@@ -27,8 +27,10 @@ func (b built) noop() bool { return b.head == b.onto }
 // it is replayed onto is kept as it is, so a version on the target head
 // lands as it is; a commit whose change the target already has is left
 // out; every other commit is made anew with its author, author date and
-// message and the landing identity as committer. A commit that does not
-// apply ends the replay with its conflict report, completed (conflict).
+// message and the landing identity as committer. Under the squash
+// strategy each change becomes one commit instead (squash), with the tree
+// its replay ended at. A commit that does not apply ends the replay with
+// its conflict report, completed (conflict).
 func (c *Component) build(ctx context.Context, repo *gitrepo.Repo, a Attempt, onto string) (built, *gitrepo.ConflictReport, error) {
 	b := built{onto: onto, head: onto, commits: []Commit{}}
 	committer := gitrepo.Signature{Name: c.deps.Committer.Name, Email: c.deps.Committer.Email, Time: c.now()}
@@ -39,6 +41,16 @@ func (c *Component) build(ctx context.Context, repo *gitrepo.Repo, a Attempt, on
 		}
 		if report != nil {
 			return built{}, c.conflict(ctx, a, cov, onto, report), nil
+		}
+		if a.Strategy == StrategySquash {
+			squashed, err := c.squash(ctx, repo, a, cov, b.head, head, became, committer)
+			if err != nil {
+				return built{}, nil, err
+			}
+			if squashed != "" {
+				b.head, b.commits = squashed, append(b.commits, Commit{Change: cov.Number, VersionSHA: cov.Head, LandedSHA: squashed})
+			}
+			continue
 		}
 		b.head = head
 		for _, r := range became {

@@ -625,6 +625,63 @@ func (w *world) nextVersion(t *testing.T, ch change.Change) change.Change {
 	return w.readChange(t, ch.Number)
 }
 
+// opened opens, through the change component, the change in describes,
+// and returns it.
+func (w *world) opened(t *testing.T, in change.OpenInput) change.Change {
+	t.Helper()
+	var ch change.Change
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) (err error) {
+		ch, err = w.changes.Open(ctx, tx, in)
+		return err
+	})
+	return ch
+}
+
+// stack opens a stack of changes of api by the owner, one per entry of
+// files, bottom first, and returns them in that order: change i is the
+// branch <prefix><i> with one commit on the head of the branch below it
+// (on base for the first) that sets the files of its entry, or
+// <branch>.txt for nil, and the stack linker links it to the one below.
+// The bottom one is a draft for draft.
+func (w *world) stack(t *testing.T, prefix string, draft bool, files ...map[string]string) []change.Change {
+	t.Helper()
+	var out []change.Change
+	from := w.base
+	for i, f := range files {
+		branch := prefix + strconv.Itoa(i+1)
+		if f == nil {
+			f = map[string]string{branch + ".txt": branch + "\n"}
+		}
+		from = commit(t, w.api, branch, from, branch, f)
+		ch := w.opened(t, change.OpenInput{Workspace: "api", SourceBranch: branch, Intent: new("why"), Kind: change.KindRef,
+			Caller: w.caller(), Draft: draft && i == 0})
+		if i > 0 && (ch.DependsOn == nil || *ch.DependsOn != out[i-1].Number) {
+			t.Fatalf("%s depends on %v, want %d", ch.Ref, ch.DependsOn, out[i-1].Number)
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+// numbers are the numbers of the changes.
+func numbers(changes []change.Change) []any {
+	out := make([]any, len(changes))
+	for i, ch := range changes {
+		out[i] = float64(ch.Number)
+	}
+	return out
+}
+
+// anySession is a session linker of the change component that accepts
+// every session.
+type anySession struct{}
+
+func (anySession) Check(_ context.Context, _ change.Caller, id, _ string) (string, error) {
+	return strings.ToLower(id), nil
+}
+
+func (anySession) Record(context.Context, *sql.Tx, string, string, int64, int64) error { return nil }
+
 // run stores the running attempt a and runs it to its end in the
 // caller's goroutine, returning the engine's error and the attempt as it
 // is stored after the run.
