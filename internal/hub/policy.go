@@ -16,21 +16,22 @@ import (
 const policyHook = "policy"
 
 // composePolicy adds the landing policy: the schema of the policy
-// revisions, the policy routes, whose scope, binding and access the shared
-// checks decide, and the component, bound in a start hook to the store,
-// to the workspace records, to the users of the identity records, to the
-// event component, to the change component, to the workspaces'
-// repositories, to the hub's clock and to its logger. Its evidence source
-// is the one that reads none until a part registers another
-// (RegisterEvidence).
+// revisions and of the verdicts and check results it counts, the policy
+// routes, whose scope, binding and access the shared checks decide, and
+// the component, bound in a start hook to the store, to the workspace
+// records, to the users of the identity records, to the event component,
+// to the change component, to the workspaces' repositories, to the hub's
+// clock and to its logger. Its evidence source is the one that reads none
+// until a part registers another (RegisterEvidence).
 //
 // It comes before the change component's part, so that the component is
 // bound before the change component's own start hooks record versions,
 // which ask the landing evaluator composePolicyEvaluation registers once
 // the change and land components exist.
 //
-// The teardown of a workspace deletes its policy revisions in the delete's
-// transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
+// The teardown of a workspace deletes its policy revisions, verdicts and
+// check results in the delete's transaction
+// (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
 //
 // The component exists from the composition on (Policy); tests change its
 // dependencies with AdjustPolicy.
@@ -38,6 +39,7 @@ func composePolicy(c *Composition) {
 	comp := &policy.Component{}
 	c.policy = comp
 	c.AddSchemaStep(policy.SchemaStep)
+	c.AddSchemaStep(policy.ReviewStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}

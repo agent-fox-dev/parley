@@ -3,11 +3,11 @@
   "spec_id": "28",
   "spec_name": "approvals_and_checks",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-16T10:08:26Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

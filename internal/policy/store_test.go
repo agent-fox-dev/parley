@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,13 +14,13 @@ import (
 )
 
 // openStore opens a store with nothing but the schema of the policy
-// revisions.
+// revisions and of the verdicts and check results.
 func openStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
 	s, err := store.Open(context.Background(), store.Options{
 		DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces"),
-	}, []store.Step{policy.SchemaStep})
+	}, []store.Step{policy.SchemaStep, policy.ReviewStep})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -27,7 +28,7 @@ func openStore(t *testing.T) *store.Store {
 	return s
 }
 
-func TestWorkspaceDeleted_DropsTheRevisionsOfTheWorkspaceOnly(t *testing.T) {
+func TestWorkspaceDeleted_DropsThePolicyAndEvidenceOfTheWorkspaceOnly(t *testing.T) {
 	s, ctx, at := openStore(t), context.Background(), time.Now()
 	by := policy.Writer{ActorType: "admin_token"}
 	err := s.Tx(ctx, func(tx *sql.Tx) error {
@@ -35,6 +36,15 @@ func TestWorkspaceDeleted_DropsTheRevisionsOfTheWorkspaceOnly(t *testing.T) {
 			for n := int64(1); n <= 2; n++ {
 				rev := policy.Revision{Number: n, Document: policy.NeverSet, UpdatedAt: &at, UpdatedBy: &by}
 				if err := policy.InsertRevision(ctx, tx, slug, rev); err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx, `INSERT INTO change_approvals (id, workspace_slug, number, version, user_id,
+	username, credential_type, credential_id, verdict, comment, created_at) VALUES (?, ?, 1, ?, 'u1', 'dana', 'pat', 't1', 'approve', '', 0)`,
+					fmt.Sprintf("%s-%d", slug, n), slug, n); err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx, `INSERT INTO change_checks (workspace_slug, number, version, name, status, summary,
+	actor_type, updated_at) VALUES (?, 1, ?, 'test', 'passed', '', 'admin_token', 0)`, slug, n); err != nil {
 					return err
 				}
 			}
@@ -51,6 +61,12 @@ func TestWorkspaceDeleted_DropsTheRevisionsOfTheWorkspaceOnly(t *testing.T) {
 		}
 		if _, found, err := policy.RevisionAt(ctx, s.Main(), slug, 1); err != nil || found != (want > 0) {
 			t.Errorf("revision 1 of %s found = %v, %v; want %v", slug, found, err, want > 0)
+		}
+		for _, table := range []string{"change_approvals", "change_checks"} {
+			var n int64
+			if err := s.Main().QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE workspace_slug = ?`, slug).Scan(&n); err != nil || n != want {
+				t.Errorf("rows of %s in %s = %d, %v; want %d", slug, table, n, err, want)
+			}
 		}
 	}
 }

@@ -168,6 +168,39 @@ func TestLookups_AnswerFromTheChangeRecord(t *testing.T) {
 			t.Errorf("OpenCounts = %v, %v; want %v", got, err, want)
 		}
 	})
+	t.Run("ReadVersions", func(t *testing.T) {
+		b6 := w.branch(t, "b6", "B6\n\nWhy.\n")
+		n := w.openBranch(t, "b6", nil).Number
+		restacked := commit(t, w.demo, "b6", b6, "B6 again\n", map[string]string{"b6.txt": "b6 again\n"})
+		w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b6", Head: restacked, Kind: change.KindRestack})
+		pushed := commit(t, w.demo, "b6", restacked, "B6 more\n", map[string]string{"b6.txt": "b6 more\n"})
+		pat := change.Caller{UserID: w.owner, Credential: change.Credential{Type: change.CredentialPAT, ID: "t1"}}
+		w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b6", Head: pushed, Kind: change.KindPush, Caller: pat})
+		vs, err := w.changes.ReadVersions(ctx, nil, "demo", n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type made struct {
+			number     int64
+			head, by   string
+			credential change.Credential
+		}
+		var got []made
+		for _, v := range vs {
+			got = append(got, made{v.Number, v.HeadSHA, v.CreatedBy.ActorType, v.Credential})
+		}
+		want := []made{
+			{1, b6, change.CredentialAPIKey, change.Credential{Type: change.CredentialAPIKey, ID: "k1"}},
+			{2, restacked, change.ActorSystem, change.Credential{}},
+			{3, pushed, change.CredentialPAT, change.Credential{Type: change.CredentialPAT, ID: "t1"}},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("ReadVersions(demo, %d) = %+v, want %+v", n, got, want)
+		}
+		if vs, err := w.changes.ReadVersions(ctx, nil, "demo", 99); err != nil || len(vs) != 0 {
+			t.Errorf("ReadVersions(demo, 99) = %v, %v; want none", vs, err)
+		}
+	})
 }
 
 func TestChangesOfSession_ListsEveryChangeWithAVersionOfTheSession(t *testing.T) {
