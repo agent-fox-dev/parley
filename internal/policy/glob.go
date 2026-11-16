@@ -105,6 +105,9 @@ type subject struct {
 	touched []int32
 	// at and next are the positions reached before and after an element.
 	at, next []uint64
+	// steps counts the words of positions the elements matched so far have
+	// been stepped over, the measure of the matcher's work.
+	steps int
 }
 
 // class is where one character occurs in the path: pos holds every
@@ -182,6 +185,7 @@ func (s *subject) match(g pathGlob) bool {
 	clear(at)
 	at[0] = 1
 	for _, tok := range g {
+		s.steps += len(at)
 		var live bool
 		switch tok.kind {
 		case tokenAny:

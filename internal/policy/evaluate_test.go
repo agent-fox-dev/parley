@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
+	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/change"
 )
@@ -359,38 +359,44 @@ func crafted(glob func(rule int) string) (*Document, []string) {
 	return doc, files
 }
 
-func TestPreview_EvaluatesTheLargestRequestInBoundedTime(t *testing.T) {
-	for name, glob := range map[string]func(int) string{
-		// fails at its first character
-		"dead at once": func(int) string { return "b" + strings.Repeat("*a", 127) },
-		// keeps every position alive to its last character
-		"alive to the end": func(i int) string { return strings.Repeat("*a", 126) + "*" + string(rune('b'+i%20)) },
+func TestSelector_BoundsTheWorkOfTheLargestRequest(t *testing.T) {
+	// The work is counted in the words of positions the matcher steps over,
+	// not timed, so that a loaded machine cannot fail the test: one element
+	// of a glob against one path costs at most the path's words, and the
+	// matching of a glob stops at the first element no position survives.
+	steps := map[string]int{}
+	for _, tc := range []struct {
+		name string
+		glob func(int) string
+		// elements is how many elements of each glob the bound allows.
+		elements func(glob string) int
+	}{
+		{"dead at once", func(int) string { return "b" + strings.Repeat("*a", 127) }, func(string) int { return 1 }},
+		{"alive to the end", func(i int) string { return strings.Repeat("*a", 126) + "*" + string(rune('b'+i%20)) }, utf8.RuneCountInString},
 	} {
-		doc, files := crafted(glob)
-		done := make(chan error, 1)
-		start := time.Now()
-		go func() {
-			res, err := Preview(context.Background(), doc, "main", files)
-			if err == nil && !reflect.DeepEqual(rules(res), []string{"default"}) {
-				err = fmt.Errorf("rules %q, want only the default", rules(res))
+		doc, files := crafted(tc.glob)
+		bound := 0
+		for _, r := range doc.Rules {
+			for _, f := range files {
+				bound += tc.elements(r.Paths[0]) * (utf8.RuneCountInString(f)/64 + 1)
 			}
-			done <- err
-		}()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("%s: %v", name, err)
+		}
+		sel := newSelector(doc, "main")
+		for _, f := range files {
+			if r := sel.selectRule(f); r != defaultRule {
+				t.Fatalf("%s: %.20q selects %q, want the default", tc.name, f, r)
 			}
-			t.Logf("%s: %v", name, time.Since(start))
-		case <-time.After(previewBound):
-			t.Fatalf("%s: Preview has not returned after %v", name, previewBound)
+		}
+		steps[tc.name] = sel.path.steps
+		if sel.path.steps > bound {
+			t.Errorf("%s: the matcher stepped over %d words, more than %d", tc.name, sel.path.steps, bound)
 		}
 	}
+	if steps["alive to the end"] <= steps["dead at once"] {
+		t.Errorf("the matcher stepped over %d words for globs alive to the end and %d for globs dead at once; want more for the first",
+			steps["alive to the end"], steps["dead at once"])
+	}
 }
-
-// previewBound is how long the largest evaluation may take, many times what
-// it takes on a loaded machine.
-const previewBound = 10 * time.Second
 
 func TestPreview_StopsWhenTheContextEnds(t *testing.T) {
 	doc, files := crafted(func(int) string { return strings.Repeat("*a", 126) + "*b" })
