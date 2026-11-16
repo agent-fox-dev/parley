@@ -123,6 +123,7 @@ func newChangeCommand() *cobra.Command {
 		newChangeApprovalsCommand(),
 		newChangeCheckCommand(),
 		newChangeChecksCommand(),
+		newChangeOverlapsCommand(),
 	)
 }
 

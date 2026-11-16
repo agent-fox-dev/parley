@@ -1994,7 +1994,7 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its twenty-four commands open,
+reads no credential and sends no request. Its twenty-five commands open,
 read, edit, abandon, restore, restack, resolve, land, revert and wait for the
 changes of a workspace, read their stacks, conflicts and land attempts,
 and record and read the verdicts and check results on their versions,
@@ -2014,6 +2014,7 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change find <slug> <sha>` | `GET …/changes/by-commit/<sha>` | |
 | `parley change versions <slug> <number>` | `GET …/changes/<number>/versions` | |
 | `parley change stack <slug> <number>` | `GET …/changes/<number>/stack` | |
+| `parley change overlaps <slug> <number> [--fail-on-overlap]` | `GET …/changes/<number>/overlaps` | |
 | `parley change diff <slug> <number> [--version <n>\|latest] [--against <n>] [--path <glob>]... [--patch \| --name-only]` | `GET …/changes/<number>/diff` | `version`, `against`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
 | `parley change edit <slug> <number> [--title <t>] [--intent <i>\|@<file>\|-] [--label <l>]... [--remove-label <l>]... [--auto-land \| --no-auto-land] [--target <branch>]` | `PATCH …/changes/<number>` | the body below |
 | `parley change ready <slug> <number>` | `PATCH …/changes/<number>` | the body `{"state":"open"}` |
@@ -2232,6 +2233,41 @@ change approvals takes --withdraw <id>, not an empty one`) and a `wait` or `land
 duration above zero (see [Waiting](#waiting)) are refused with a
 `usage_error` and exit status `2` before any setting is read or any request
 sent.
+
+### `parley activity` and `parley claim`
+
+These commands drive the [awareness routes](api.md#awareness): what else
+touches a set of paths, and the claims that announce work on them. Each
+sends one request with the credential as `Authorization: Bearer` and
+`<slug>` (and `<id>`) as one percent-encoded path segment, and prints the
+hub's answer on stdout with exit status `0`; a refusal of the hub's is
+written to stderr as received, with nothing on stdout and exit status `1`.
+`parley claim` run without a command prints its help and exits `0`.
+`parley change overlaps` is listed with [`parley change`](#parley-change).
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley activity <slug> --paths <globs> [--target <branch>] [--since <sha>\|<time>] [--exclude-session <id>] [--exclude-change <n>] [--fail-on-overlap]` | `GET /api/v1/workspaces/<slug>/activity` | `--paths` as one `paths` value, comma list as given; `target`, `since`, `--exclude-session` `exclude_session`, `--exclude-change` `exclude_change` |
+| `parley claim create <slug> --paths <globs> --intent <text> [--target <branch>] [--ttl <duration>] [--session <id>]` | `POST /api/v1/workspaces/<slug>/claims` | the body `{"paths":[…],"intent":…}`, `paths` the comma list split into an array, with `--target` `target_branch`, `ttl` and `--session` `session_id` when given |
+| `parley claim list <slug> [--state <s>] [--session <id>] [--path <glob>] [--limit <n>] [--cursor <c>]` | `GET /api/v1/workspaces/<slug>/claims` | `state`, `--session` `session_id`, `path`, `limit`, `cursor` |
+| `parley claim renew <slug> <id> [--ttl <duration>]` | `PATCH /api/v1/workspaces/<slug>/claims/<id>` | the body `{"ttl":…}`, `1h` without `--ttl` |
+| `parley claim release <slug> <id>` | `DELETE /api/v1/workspaces/<slug>/claims/<id>` | no body; prints `{}` |
+
+A flag not given sends no parameter or member, so that the hub's default
+applies (`--target`: the workspace's default branch; `--since`: 24 hours
+ago; `--ttl` of `create`: `[awareness].default_claim_ttl`).
+
+**`--fail-on-overlap`**, on `parley activity` and `parley change overlaps`,
+prints the answer first and then, when something overlaps, writes a
+`condition_not_met` envelope on stderr and exits `3`: for `activity` when
+its `changes` or its `claims` holds an item (changes in `landed` do not
+count), for `change overlaps` when `items` holds an entry. Without the flag,
+or when the lists are empty, the exit status is `0`.
+
+`parley activity` and `parley claim create` without `--paths`, `parley claim
+create` without `--intent`, any of these commands with a wrong number of
+arguments, and an `--exclude-change` that is not a positive integer are a
+`usage_error` with exit status `2`, before any request is sent.
 
 ### `parley land`
 

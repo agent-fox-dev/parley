@@ -235,6 +235,10 @@ func failingStarts(hooks func(row string) func(*hub.Composition)) []failingStart
 				hooks(row)(c)
 			}}
 		}},
+		{"invalid awareness section", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig+"[awareness]\nmax_claims_per_workspace = 0\n"), compose: hooks(row),
+				want: "awareness.max_claims_per_workspace"}
+		}},
 		{"sandbox gateway refusing the hub", "", func(t *testing.T, row string) failedStart {
 			dir := workDir(t, localConfig+externalURL+sandboxSection)
 			for name, content := range sandboxFiles {
@@ -464,8 +468,8 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 				return err
 			}})
 			c.AddMaintenanceTask("patch_purge", insert("patch_purge"))
-			c.AddMaintenanceTask("claim_cleanup", func(context.Context, *hub.Runtime) error {
-				return errors.New("claims unreachable at https://u:p@h/x")
+			c.AddMaintenanceTask("forge_delivery_pruning", func(context.Context, *hub.Runtime) error {
+				return errors.New("deliveries unreachable at https://u:p@h/x")
 			})
 			c.AddMaintenanceTask("retention", insert("retention"))
 		},
@@ -493,8 +497,8 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 
 	for _, rec := range failures() {
 		text, _ := rec["error"].(string)
-		if rec["task"] != "claim_cleanup" || !strings.Contains(text, "https://h/x") || strings.Contains(text, "u:p") {
-			t.Errorf("error line %v, want task claim_cleanup and an error holding https://h/x without u:p", rec)
+		if rec["task"] != "forge_delivery_pruning" || !strings.Contains(text, "https://h/x") || strings.Contains(text, "u:p") {
+			t.Errorf("error line %v, want task forge_delivery_pruning and an error holding https://h/x without u:p", rec)
 		}
 	}
 	var health map[string]any

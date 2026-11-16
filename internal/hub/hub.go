@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -79,6 +80,7 @@ var parts = []func(*Composition){
 	composePolicyEvaluation,
 	composeLandRules,
 	composeSandbox,
+	composeAwareness,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -264,6 +266,12 @@ type Composition struct {
 	// changed its dependencies (AdjustAutoLand).
 	autoLander        *land.AutoLander
 	autoLandAdjusters []func(*land.AutoLandDeps)
+
+	// awareness is the awareness component composeAwareness creates and
+	// binds in its start hook (Awareness), after awarenessAdjusters have
+	// changed its dependencies (AdjustAwareness).
+	awareness          *awareness.Component
+	awarenessAdjusters []func(*awareness.Deps)
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).
