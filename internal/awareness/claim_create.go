@@ -87,13 +87,15 @@ func (c *Component) createClaimRoute(w http.ResponseWriter, r *http.Request) err
 		ID: uuid.NewV4().String(), Workspace: workspace, TargetBranch: target, Paths: req.paths, Intent: req.intent, By: by,
 		SessionID: session, State: ClaimActive, CreatedAt: now, ExpiresAt: now.Add(ttl),
 	}
-	if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.storeClaim(ctx, tx, cl, now) }); err != nil {
+	// The activity is built before the claim is stored: it reads the
+	// repository, which must not hold the store's write lock, it leaves the
+	// claim out without being told to, and a failure of it stores nothing
+	// rather than answer an error for a stored claim.
+	a, err := c.Activity(ctx, workspace, ActivityQuery{Paths: cl.Paths, TargetBranch: cl.TargetBranch})
+	if err != nil {
 		return err
 	}
-	// The activity reads the repository, so it is built once the claim's
-	// transaction has released the store's write lock.
-	a, err := c.Activity(ctx, workspace, ActivityQuery{Paths: cl.Paths, TargetBranch: cl.TargetBranch, LeaveOutClaim: cl.ID})
-	if err != nil {
+	if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.storeClaim(ctx, tx, cl, now) }); err != nil {
 		return err
 	}
 	server.WriteJSON(w, http.StatusCreated, ClaimCreated{Claim: objectOf(cl, now), Activity: a})

@@ -44,48 +44,55 @@ func wantFailOnOverlap(t *testing.T, code int, stdout, stderr, body string, want
 func TestActivity_SendsAParameterForEachFlagGivenAndPrintsTheAnswer(t *testing.T) {
 	t.Parallel()
 	answer := `{"target_branch": "main", "target_sha": null, "changes": [], "claims": [], "landed": []}`
-	hub := newStubHub(t).answer(http.MethodGet, activityPath, http.StatusOK, answer)
 	tests := []struct {
-		args []string
-		want url.Values
+		name    string
+		args    []string
+		want    url.Values
+		status  int
+		answers string
 	}{
-		{[]string{"activity", "demo", "--paths", "api/**,docs/**"}, url.Values{"paths": {"api/**,docs/**"}}},
 		{
+			"the paths alone", []string{"activity", "demo", "--paths", "api/**,docs/**"}, url.Values{"paths": {"api/**,docs/**"}},
+			http.StatusOK, answer,
+		},
+		{
+			"every flag",
 			[]string{"activity", "demo", "--paths", "api/**,docs/**", "--target", "release", "--since", changeSHA,
 				"--exclude-session", "s1", "--exclude-change", "4"},
 			url.Values{
 				"paths": {"api/**,docs/**"}, "target": {"release"}, "since": {changeSHA},
 				"exclude_session": {"s1"}, "exclude_change": {"4"},
 			},
+			http.StatusOK, answer,
+		},
+		{
+			"a refusal of the hub", []string{"activity", "demo", "--paths", "api/**"}, url.Values{"paths": {"api/**"}},
+			http.StatusNotFound, envelope(http.StatusNotFound, "not_found"),
 		},
 	}
 	for _, tt := range tests {
-		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).answer(http.MethodGet, activityPath, tt.status, tt.answers)
+
 			code, stdout, stderr, sent := runOnHub(t, hub, tt.args...)
 
-			wantResult(t, code, stdout, stderr, answer)
 			got := wantOnlyRequest(t, sent, http.MethodGet, activityPath)
 			wantQuery(t, got.query, tt.want)
 			if got.body != "" {
 				t.Errorf("body = %q, want none", got.body)
 			}
+			if tt.status == http.StatusOK {
+				wantResult(t, code, stdout, stderr, tt.answers)
+				return
+			}
+			if code != 1 || stdout != "" {
+				t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
+			}
+			if want := indented(t, tt.answers); stderr != want {
+				t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
+			}
 		})
-	}
-}
-
-func TestActivity_PrintsTheHubsRefusalAsReceived(t *testing.T) {
-	t.Parallel()
-	refusal := envelope(http.StatusNotFound, "not_found")
-	hub := newStubHub(t).answer(http.MethodGet, activityPath, http.StatusNotFound, refusal)
-
-	code, stdout, stderr, sent := runOnHub(t, hub, "activity", "demo", "--paths", "api/**")
-
-	wantOnlyRequest(t, sent, http.MethodGet, activityPath)
-	if code != 1 || stdout != "" {
-		t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
-	}
-	if want := indented(t, refusal); stderr != want {
-		t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 const renamed = "package a\n\nfunc A() int {\n\treturn 1\n}\n\nfunc B() int {\n\treturn 2\n}\n"
 
 func TestIndex_RecordsEveryFileOfTheCurrentVersion(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	base := commit(t, f.repo, "main", "", map[string]string{"a.go": renamed, "c.go": "c\n", "d.go": "d\n"})
 	v1 := commit(t, f.repo, "v1", base, map[string]string{"a.go": gone, "b.go": renamed, "c.go": "c2\n"})
@@ -58,6 +59,7 @@ func TestIndex_RecordsEveryFileOfTheCurrentVersion(t *testing.T) {
 }
 
 func TestIndex_FollowsLandAbandonAndRestore(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	base := commit(t, f.repo, "main", "", map[string]string{"api/a.go": "a\n"})
 	h1 := commit(t, f.repo, "one", base, map[string]string{"api/a.go": "one\n"})
@@ -109,11 +111,13 @@ func TestIndex_FollowsLandAbandonAndRestore(t *testing.T) {
 }
 
 func TestIndex_RecordsAVersionWhoseFilesCannotBeListedWithNoFiles(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	base := commit(t, f.repo, "main", "", map[string]string{"a.go": "a\n"})
 	head := commit(t, f.repo, "four", base, map[string]string{"a.go": "four\n"})
 	f.version(awareness.Change{Number: 3, Version: 1, BaseSHA: &base, HeadSHA: strings.Repeat("0", 40)})
-	second := f.version(awareness.Change{Number: 4, Version: 1, BaseSHA: &base, HeadSHA: head})
+	f.version(awareness.Change{Number: 4, Version: 1, BaseSHA: &base, HeadSHA: head})
+	last := f.version(awareness.Change{Number: 5, Version: 1, BaseSHA: &base, HeadSHA: head})
 
 	if err := f.comp.Pass(context.Background()); err != nil {
 		t.Fatalf("pass = %v, want no error", err)
@@ -127,8 +131,18 @@ func TestIndex_RecordsAVersionWhoseFilesCannotBeListedWithNoFiles(t *testing.T) 
 	if got := f.files(4); len(got) == 0 {
 		t.Error("files of 4 are empty, want the event after the failure processed")
 	}
-	if got := f.position(); got != second {
-		t.Errorf("position = %d, want %d", got, second)
+	if got := f.position(); got != last {
+		t.Errorf("position = %d, want %d", got, last)
+	}
+	// Change 3, with no files, overlaps none of the changes that touch
+	// one, and no overlap event names it.
+	for number, want := range map[int64][]int64{3: {}, 4: {5}, 5: {4}} {
+		if got := f.partners(number); !slices.Equal(got, want) {
+			t.Errorf("partners of %d = %v, want %v", number, got, want)
+		}
+	}
+	if got := f.announced(); !slices.Equal(got, []string{"4-5", "4-5"}) {
+		t.Errorf("announced pairs = %v, want two events for 4-5 alone", got)
 	}
 	if log := f.log.String(); !strings.Contains(log, "workspace=demo") || !strings.Contains(log, "number=3") {
 		t.Errorf("log = %q, want the workspace and the number of the change", log)

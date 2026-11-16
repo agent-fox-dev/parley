@@ -122,8 +122,8 @@ type Landed struct {
 const (
 	StateDraft     = "draft"
 	StateOpen      = "open"
-	StateLanded    = "landed"
-	StateAbandoned = "abandoned"
+	stateLanded    = "landed"
+	stateAbandoned = "abandoned"
 )
 
 // ErrUnknownSession is the answer of a Sessions check that refuses a
@@ -198,6 +198,10 @@ type Component struct {
 	// transaction, and its error rolls the transaction back; only tests set
 	// it.
 	beforeCommit func() error
+	// ancestryChecked, when set, is called before each check of an
+	// activity whether its since commit reaches a landed commit; only tests
+	// set it.
+	ancestryChecked func()
 }
 
 // errNotBound is the error of a component used before Bind.

@@ -30,11 +30,36 @@ type Partner struct {
 // most files in common first and, among equals, the lower number first.
 // A change the index does not hold in flight has none.
 //
+// The index can lag the change records, so a change counts only while its
+// record says draft or open: a change whose record says otherwise has no
+// partners and is no one's, also before the index has followed it out of
+// flight.
+//
 // Two changes are in one stack when following depends_on from each reaches
 // the same bottom change. The stack is read from the change records at
 // each call rather than kept in the index, so a depends_on edit needs no
 // index update.
 func (c *Component) Partners(ctx context.Context, q Querier, workspace string, number int64) ([]Partner, error) {
+	found, err := c.partners(ctx, q, workspace, number)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Partner, 0, len(found))
+	for _, p := range found {
+		out = append(out, p.Partner)
+	}
+	return out, nil
+}
+
+// partner is a Partner with its change record, as Partners read it.
+type partner struct {
+	Partner
+	record Change
+}
+
+// partners are the Partners of the change number of workspace, each with
+// its change record, read through q.
+func (c *Component) partners(ctx context.Context, q Querier, workspace string, number int64) ([]partner, error) {
 	q = c.querier(q)
 	rows, err := q.QueryContext(ctx, `SELECT o.number, o.path
 FROM awareness_changes mc
@@ -67,43 +92,58 @@ ORDER BY o.number, o.path`, workspace, number)
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	kept := []partner{}
 	if len(out) == 0 {
-		return []Partner{}, nil
+		return kept, nil
 	}
 
-	bottoms := map[int64]int64{}
-	own, err := c.bottom(ctx, q, workspace, number, bottoms)
+	w := stackWalk{workspace: workspace, bottoms: map[int64]int64{}, records: map[int64]Change{}}
+	own, err := c.bottom(ctx, q, &w, number)
 	if err != nil {
 		return nil, err
 	}
-	kept := out[:0]
+	if !inFlight(w.records[number].State) {
+		return kept, nil
+	}
 	for _, p := range out {
-		b, err := c.bottom(ctx, q, workspace, p.Number, bottoms)
+		b, err := c.bottom(ctx, q, &w, p.Number)
 		if err != nil {
 			return nil, err
 		}
-		if b != own {
-			kept = append(kept, p)
+		rec, found := w.records[p.Number]
+		if !found || !inFlight(rec.State) || b == own {
+			continue
 		}
+		rec.Workspace, rec.Number = workspace, p.Number
+		kept = append(kept, partner{Partner: p, record: rec})
 	}
-	slices.SortStableFunc(kept, func(a, b Partner) int {
+	slices.SortStableFunc(kept, func(a, b partner) int {
 		return cmp.Or(cmp.Compare(len(b.Paths), len(a.Paths)), cmp.Compare(a.Number, b.Number))
 	})
 	return kept, nil
 }
 
-// bottom is the bottom change of the stack of the change number of
+// stackWalk is what the stack walks of one Partners call share: the bottom
+// of each change of workspace found so far, and the record of each change
+// read on the way; a change the reader does not find has no record.
+type stackWalk struct {
+	workspace string
+	bottoms   map[int64]int64
+	records   map[int64]Change
+}
+
+// bottom is the bottom change of the stack of the change number of w's
 // workspace: the change reached by following depends_on from it until a
-// change depends on none, or on one the reader does not find. seen holds
-// the bottoms found before, and gets the ones found now. A depends_on that
-// leads back to a change already passed ends at that change, so that a
-// cycle cannot hold the worker.
-func (c *Component) bottom(ctx context.Context, q Querier, workspace string, number int64, seen map[int64]int64) (int64, error) {
+// change depends on none, or on one the reader does not find. It adds the
+// bottoms and the records it finds to w. A depends_on that leads back to a
+// change already passed ends at that change, so that a cycle cannot hold
+// the worker.
+func (c *Component) bottom(ctx context.Context, q Querier, w *stackWalk, number int64) (int64, error) {
 	var path []int64
 	visited := map[int64]bool{}
 	n := number
 	for {
-		if b, ok := seen[n]; ok {
+		if b, ok := w.bottoms[n]; ok {
 			n = b
 			break
 		}
@@ -112,20 +152,21 @@ func (c *Component) bottom(ctx context.Context, q Querier, workspace string, num
 		}
 		visited[n] = true
 		path = append(path, n)
-		ch, err := c.deps.Changes.ReadChange(ctx, q, workspace, n)
+		ch, err := c.deps.Changes.ReadChange(ctx, q, w.workspace, n)
 		if errors.Is(err, ErrChangeNotFound) {
 			break
 		}
 		if err != nil {
-			return 0, fmt.Errorf("read the stack of %s#%d: %w", workspace, number, err)
+			return 0, fmt.Errorf("read the stack of %s#%d: %w", w.workspace, number, err)
 		}
+		w.records[n] = ch
 		if ch.DependsOn == nil {
 			break
 		}
 		n = *ch.DependsOn
 	}
 	for _, p := range path {
-		seen[p] = n
+		w.bottoms[p] = n
 	}
 	return n, nil
 }
@@ -136,10 +177,10 @@ func (c *Component) bottom(ctx context.Context, q Querier, workspace string, num
 // changes a parley.change.overlap event each naming the other; a recorded
 // pair whose other change is no longer a partner, because the files in
 // common are gone, the target branches differ, the two are in one stack or
-// either left flight, is forgotten, so that the next time they overlap is
+// either left flight, in the index or in its record, is forgotten, so that the next time they overlap is
 // announced again.
 func (c *Component) announce(ctx context.Context, tx *sql.Tx, ch Change) error {
-	partners, err := c.Partners(ctx, tx, ch.Workspace, ch.Number)
+	partners, err := c.partners(ctx, tx, ch.Workspace, ch.Number)
 	if err != nil {
 		return err
 	}
@@ -153,14 +194,7 @@ func (c *Component) announce(ctx context.Context, tx *sql.Tx, ch Change) error {
 		if recorded[p.Number] {
 			continue
 		}
-		other, err := c.deps.Changes.ReadChange(ctx, tx, ch.Workspace, p.Number)
-		if errors.Is(err, ErrChangeNotFound) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("read %s#%d: %w", ch.Workspace, p.Number, err)
-		}
-		other.Workspace, other.Number = ch.Workspace, p.Number
+		other := p.record
 		if err := c.emitOverlap(ctx, tx, ch, other, p.Paths); err != nil {
 			return err
 		}

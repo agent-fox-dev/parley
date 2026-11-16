@@ -5477,7 +5477,11 @@ stops at 2,000). A background worker follows the event log
 and updates the index about a second after the request that caused the
 event, which is answered without waiting for it. A version whose files
 cannot be listed (its commits are gone) is indexed with no files. Each event
-is applied once, also across a restart.
+is applied once, also across a restart. Events the event log expired before
+the worker read them are skipped: the worker logs it and goes on from the
+oldest event the log still holds. A version or restore event read after the
+change landed or was abandoned leaves the change out of flight, as its
+record says.
 
 Two changes **overlap** when both are `draft` or `open`, have the same
 target branch and at least one touched file in common, and are not in one
@@ -5527,7 +5531,7 @@ What touches a list of paths. Query parameters:
 |---|---|
 | `paths` | required: one or more globs (`*` matches within a path segment, `**` across segments), as a comma list, repeated, or both; at most 50, each 1 to 255 characters and not starting with `/` |
 | `target` | the target branch; default the default branch of the workspace acted on (for a fork's slug, the parent's). It is not checked: an unknown branch gives `target_sha` `null` and, normally, empty lists |
-| `since` | exactly 40 hexadecimal characters is a commit id: the changes whose landed commit is not reachable from it are reported; anything else must be an RFC 3339 timestamp: the changes landed after it. Default: 24 hours before the request |
+| `since` | exactly 40 hexadecimal characters is a commit id: the changes whose landed commit is not reachable from it, or that the repository no longer holds, are reported; anything else must be an RFC 3339 timestamp: the changes landed after it. Default: 24 hours before the request |
 | `exclude_session` | leaves out the changes, claims and landed changes of that session |
 | `exclude_change` | a positive integer: leaves out that change and the claims linked to it |
 

@@ -1,17 +1,21 @@
 package awareness_test
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/event"
 )
 
 func TestOverlapEvents_AnnounceANewPairOnEachChange(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	f.version(f.touching(1, 1, session1, "api/a.go", "api/b.go"))
 	f.pass()
@@ -84,6 +88,7 @@ func TestOverlapEvents_AnnounceANewPairOnEachChange(t *testing.T) {
 }
 
 func TestOverlapEvents_AnnounceAPairOnceWhileItOverlaps(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	f.version(f.touching(1, 1, session1, "api/a.go"))
 	f.version(f.touching(2, 1, session2, "api/a.go"))
@@ -112,6 +117,7 @@ func TestOverlapEvents_AnnounceAPairOnceWhileItOverlaps(t *testing.T) {
 }
 
 func TestOverlapEvents_AnnounceAPairAgainAfterItStoppedOverlapping(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name         string
 		stop, resume func(f *fixture, two awareness.Change)
@@ -150,6 +156,7 @@ func TestOverlapEvents_AnnounceAPairAgainAfterItStoppedOverlapping(t *testing.T)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			f := newFixture(t)
 			f.version(f.touching(1, 1, session1, "api/a.go"))
 			two := f.touching(2, 1, session2, "api/a.go")
@@ -181,6 +188,7 @@ func TestOverlapEvents_AnnounceAPairAgainAfterItStoppedOverlapping(t *testing.T)
 }
 
 func TestOverlapEvents_AnnounceEachPairOneUpdateMakes(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	f.version(f.touching(1, 1, "", "a.go"))
 	f.version(f.touching(2, 1, "", "b.go"))
@@ -214,5 +222,96 @@ func TestOverlapEvents_AnnounceEachPairOneUpdateMakes(t *testing.T) {
 	}
 	if want := map[string]int{"1": 1, "2": 1, "3": 1}; !reflect.DeepEqual(namingFour, want) {
 		t.Errorf("events naming 4 per change = %v, want one on each of 1, 2 and 3", namingFour)
+	}
+}
+
+func TestOverlapEvents_PairOnlyChangesThatAreDraftOrOpen(t *testing.T) {
+	t.Parallel()
+	landedAt := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	landedSHA := strings.Repeat("5", 40)
+	// Each case puts change 2 on api/a.go, which in-flight change 1 touches,
+	// with an event the worker reads only after a record moved on; that
+	// pass announces nothing.
+	cases := []struct {
+		name string
+		// moved is what happens before the pass that follows change 2's
+		// event.
+		moved func(f *fixture, two awareness.Change)
+		// phase is change 2's phase in the index after the pass, and
+		// landed its landed commit ("" for none).
+		phase, landed string
+	}{
+		{
+			name: "a version of a change that landed since",
+			moved: func(f *fixture, two awareness.Change) {
+				f.version(two)
+				two.State, two.Landed = awareness.StateLanded, &awareness.Landed{SHA: landedSHA, At: landedAt}
+				f.changes.set(two)
+			},
+			phase: awareness.PhaseLanded, landed: landedSHA,
+		},
+		{
+			name: "a version of a change abandoned since",
+			moved: func(f *fixture, two awareness.Change) {
+				f.version(two)
+				two.State = awareness.StateAbandoned
+				f.changes.set(two)
+			},
+			phase: awareness.PhaseOut,
+		},
+		{
+			name: "a restore of a change abandoned again since",
+			moved: func(f *fixture, two awareness.Change) {
+				f.version(two)
+				two.State = awareness.StateAbandoned
+				f.emit(eventAbandon, two)
+				f.pass()
+				two.State = awareness.StateOpen
+				f.emit(eventRestore, two)
+				two.State = awareness.StateAbandoned
+				f.changes.set(two)
+			},
+			phase: awareness.PhaseOut,
+		},
+		{
+			name: "a version of a change whose partner landed before the index followed it",
+			moved: func(f *fixture, two awareness.Change) {
+				one, _ := f.changes.ReadChange(context.Background(), nil, "demo", 1)
+				one.State, one.Landed = awareness.StateLanded, &awareness.Landed{SHA: landedSHA, At: landedAt}
+				f.changes.set(one)
+				f.version(two)
+			},
+			phase: awareness.PhaseInFlight,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFixture(t)
+			f.version(f.touching(1, 1, session1, "api/a.go"))
+			f.pass()
+			two := f.touching(2, 1, session2, "api/a.go")
+			two.Workspace, two.TargetBranch, two.State = "demo", "main", awareness.StateOpen
+
+			tc.moved(f, two)
+			before := len(f.overlapEvents())
+			f.pass()
+			if got := f.overlapEvents()[before:]; len(got) != 0 {
+				t.Errorf("%d overlap events, want none: %v", len(got), got)
+			}
+			if got := f.pairs(); len(got) != 0 {
+				t.Errorf("recorded pairs = %v, want none", got)
+			}
+			ch, found, err := f.comp.Indexed(context.Background(), nil, "demo", 2)
+			if err != nil || !found {
+				t.Fatalf("Indexed(demo, 2) = %v, %v", found, err)
+			}
+			if ch.Phase != tc.phase || deref(ch.LandedSHA) != tc.landed {
+				t.Errorf("change 2 in the index: phase %q, landed %q; want %q, %q", ch.Phase, deref(ch.LandedSHA), tc.phase, tc.landed)
+			}
+			if tc.landed != "" && (ch.LandedAt == nil || !ch.LandedAt.Equal(landedAt)) {
+				t.Errorf("change 2 landed at %v, want %v", ch.LandedAt, landedAt)
+			}
+		})
 	}
 }

@@ -15,6 +15,7 @@ import (
 )
 
 func TestPartners_LeaveOutTheChangesOfTheSameStack(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		// dependsOn is each change's depends_on, 0 for none.
@@ -45,6 +46,7 @@ func TestPartners_LeaveOutTheChangesOfTheSameStack(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			f := newFixture(t)
 			for _, n := range slices.Sorted(maps.Keys(tc.dependsOn)) {
 				ch := f.touching(n, 1, "", "api/a.go")
@@ -74,6 +76,7 @@ func TestPartners_LeaveOutTheChangesOfTheSameStack(t *testing.T) {
 }
 
 func TestOverlapsRoute_ListsTheOtherInFlightChangesOnTheTargetByCount(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	for _, c := range []struct {
 		number int64
@@ -130,6 +133,7 @@ func TestOverlapsRoute_ListsTheOtherInFlightChangesOnTheTargetByCount(t *testing
 }
 
 func TestOverlapsRoute_ListsNoneForALandedOrAbandonedChange(t *testing.T) {
+	t.Parallel()
 	landed := func(ch *awareness.Change) string {
 		ch.State, ch.Landed = awareness.StateLanded, &awareness.Landed{SHA: strings.Repeat("5", 40), At: time.Now().UTC()}
 		return eventLand
@@ -149,6 +153,7 @@ func TestOverlapsRoute_ListsNoneForALandedOrAbandonedChange(t *testing.T) {
 		{"abandoned and not yet indexed", abandoned, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			s := newServed(t)
 			one := s.touching(1, 1, "", "api/a.go")
 			s.version(one)
@@ -172,6 +177,7 @@ func TestOverlapsRoute_ListsNoneForALandedOrAbandonedChange(t *testing.T) {
 }
 
 func TestOverlapsRoute_RefusesANumberThatNamesNoChange(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	s.version(s.touching(1, 1, "", "api/a.go"))
 	s.version(s.touching(2, 1, "", "api/a.go"))
@@ -195,6 +201,7 @@ func TestOverlapsRoute_RefusesANumberThatNamesNoChange(t *testing.T) {
 }
 
 func TestOverlapsRoute_IsWhatAReadOfTheChangeIncludes(t *testing.T) {
+	t.Parallel()
 	h := newChangeHub(t)
 	one := h.open(t, "feat-a", map[string]string{"api/a.go": "a2\n", "api/b.go": "b\n"})
 	two := h.open(t, "feat-b", map[string]string{"api/a.go": "a3\n", "api/b.go": "b2\n"})

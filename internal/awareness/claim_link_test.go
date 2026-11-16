@@ -19,6 +19,7 @@ func linked(cl awareness.Claim) string {
 }
 
 func TestClaimLink_LinksTheSessionsActiveClaimsToItsFirstVersion(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
 	clk := &clock{now: now}
 	f := newFixtureAt(t, clk.Now)
@@ -88,6 +89,7 @@ func TestClaimLink_LinksTheSessionsActiveClaimsToItsFirstVersion(t *testing.T) {
 }
 
 func TestClaimLink_FulfilsTheActiveClaimsOfALandedOrAbandonedChange(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		end  func(f *fixture, ch awareness.Change)
@@ -102,6 +104,7 @@ func TestClaimLink_FulfilsTheActiveClaimsOfALandedOrAbandonedChange(t *testing.T
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			now := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
 			clk := &clock{now: now}
 			f := newFixtureAt(t, clk.Now)

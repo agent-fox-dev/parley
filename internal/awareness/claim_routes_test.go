@@ -16,6 +16,7 @@ import (
 )
 
 func TestReadClaim_ReportsExpiredFromExpiresAtOn(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	clk := &clock{now: at}
 	s := newServedWith(t, servedConfig{Now: clk.Now})
@@ -38,6 +39,7 @@ func TestReadClaim_ReportsExpiredFromExpiresAtOn(t *testing.T) {
 }
 
 func TestListClaims_FiltersByStateSessionAndPathNewestFirst(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	s := newServedWith(t, servedConfig{Now: (&clock{now: at}).Now})
 	s.hub.AddWorkspace(t, access.Record{Slug: "other", OwnerID: s.owner, OrgID: s.org, Kind: access.KindRepository,
@@ -46,19 +48,19 @@ func TestListClaims_FiltersByStateSessionAndPathNewestFirst(t *testing.T) {
 		return func(cl *awareness.Claim) { cl.SessionID = &id }
 	}
 	s.seedClaims(
-		s.storedClaim(claimA, at.Add(-40*time.Minute), withSession(session1)),
-		s.storedClaim(claimB, at.Add(-30*time.Minute), func(cl *awareness.Claim) {
+		newClaim(claimA, at.Add(-40*time.Minute), withSession(session1)),
+		newClaim(claimB, at.Add(-30*time.Minute), func(cl *awareness.Claim) {
 			withSession(session2)(cl)
 			cl.Paths = []string{"docs/**"}
 		}),
-		s.storedClaim(claimC, at.Add(-20*time.Minute), func(cl *awareness.Claim) {
+		newClaim(claimC, at.Add(-20*time.Minute), func(cl *awareness.Claim) {
 			withSession(session1)(cl)
 			ended(awareness.ClaimReleased, at.Add(-10*time.Minute))(cl)
 		}),
 		// Stored as active, but past its expires_at.
-		s.storedClaim(claimD, at.Add(-10*time.Minute), func(cl *awareness.Claim) { cl.ExpiresAt = at.Add(-time.Second) }),
+		newClaim(claimD, at.Add(-10*time.Minute), func(cl *awareness.Claim) { cl.ExpiresAt = at.Add(-time.Second) }),
 		// A live claim of another workspace.
-		s.storedClaim(claimE, at.Add(-5*time.Minute), func(cl *awareness.Claim) { cl.Workspace = "other" }),
+		newClaim(claimE, at.Add(-5*time.Minute), func(cl *awareness.Claim) { cl.Workspace = "other" }),
 	)
 
 	list := func(t *testing.T, query string) (int, []byte, claimPage) {
@@ -126,6 +128,7 @@ func TestListClaims_FiltersByStateSessionAndPathNewestFirst(t *testing.T) {
 }
 
 func TestRenewClaim_SetsExpiresAtFromNowAndReplacesTheIntent(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	s := newServedWith(t, servedConfig{Now: (&clock{now: at.Add(30 * time.Minute)}).Now})
 	stamp := func(d time.Duration) string { return at.Add(d).Format(time.RFC3339) }
@@ -141,7 +144,7 @@ func TestRenewClaim_SetsExpiresAtFromNowAndReplacesTheIntent(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := []string{claimA, claimB, claimC}[i]
-			s.seedClaims(s.storedClaim(id, at, func(cl *awareness.Claim) { cl.SessionID = new(session1) }))
+			s.seedClaims(newClaim(id, at, func(cl *awareness.Claim) { cl.SessionID = new(session1) }))
 			before, _ := s.claim(t, id)
 			events := s.count(t, "hub_events")
 
@@ -172,6 +175,7 @@ func TestRenewClaim_SetsExpiresAtFromNowAndReplacesTheIntent(t *testing.T) {
 }
 
 func TestRenewClaim_RefusesAnInvalidBody(t *testing.T) {
+	t.Parallel()
 	s := newServedWith(t, servedConfig{Now: (&clock{now: time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)}).Now})
 	id := s.createClaim(t, "demo", map[string]any{"paths": []string{"api/**"}, "intent": "rework"})
 	for _, tc := range []struct {
@@ -204,16 +208,17 @@ func TestRenewClaim_RefusesAnInvalidBody(t *testing.T) {
 }
 
 func TestRenewClaim_RefusesAClaimThatIsNotActive(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	s := newServedWith(t, servedConfig{Now: (&clock{now: at}).Now})
 	for _, tc := range []struct {
 		name string
 		cl   awareness.Claim
 	}{
-		{"released", s.storedClaim(claimA, at.Add(-time.Hour), ended(awareness.ClaimReleased, at.Add(-time.Minute)))},
-		{"fulfilled", s.storedClaim(claimB, at.Add(-time.Hour), ended(awareness.ClaimFulfilled, at.Add(-time.Minute)))},
-		{"expired by the expiry run", s.storedClaim(claimC, at.Add(-2*time.Hour), ended(awareness.ClaimExpired, at.Add(-time.Hour)))},
-		{"active, past expires_at", s.storedClaim(claimD, at.Add(-time.Hour), func(cl *awareness.Claim) {
+		{"released", newClaim(claimA, at.Add(-time.Hour), ended(awareness.ClaimReleased, at.Add(-time.Minute)))},
+		{"fulfilled", newClaim(claimB, at.Add(-time.Hour), ended(awareness.ClaimFulfilled, at.Add(-time.Minute)))},
+		{"expired by the expiry run", newClaim(claimC, at.Add(-2*time.Hour), ended(awareness.ClaimExpired, at.Add(-time.Hour)))},
+		{"active, past expires_at", newClaim(claimD, at.Add(-time.Hour), func(cl *awareness.Claim) {
 			cl.ExpiresAt = at.Add(-time.Second)
 		})},
 	} {
@@ -232,6 +237,7 @@ func TestRenewClaim_RefusesAClaimThatIsNotActive(t *testing.T) {
 }
 
 func TestReleaseClaim_ReleasesAnActiveClaimAndAnnouncesIt(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	clk := &clock{now: at}
 	s := newServedWith(t, servedConfig{Now: clk.Now})
@@ -263,6 +269,7 @@ func TestReleaseClaim_ReleasesAnActiveClaimAndAnnouncesIt(t *testing.T) {
 }
 
 func TestReleaseClaim_ChangesNothingForAClaimThatIsNotActive(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	s := newServedWith(t, servedConfig{Now: (&clock{now: at}).Now})
 	for _, tc := range []struct {
@@ -270,10 +277,10 @@ func TestReleaseClaim_ChangesNothingForAClaimThatIsNotActive(t *testing.T) {
 		cl    awareness.Claim
 		state string
 	}{
-		{"released", s.storedClaim(claimA, at.Add(-time.Hour), ended(awareness.ClaimReleased, at.Add(-time.Minute))), awareness.ClaimReleased},
-		{"expired", s.storedClaim(claimB, at.Add(-2*time.Hour), ended(awareness.ClaimExpired, at.Add(-time.Hour))), awareness.ClaimExpired},
-		{"fulfilled", s.storedClaim(claimC, at.Add(-time.Hour), ended(awareness.ClaimFulfilled, at.Add(-time.Minute))), awareness.ClaimFulfilled},
-		{"active, past expires_at", s.storedClaim(claimD, at.Add(-time.Hour), func(cl *awareness.Claim) {
+		{"released", newClaim(claimA, at.Add(-time.Hour), ended(awareness.ClaimReleased, at.Add(-time.Minute))), awareness.ClaimReleased},
+		{"expired", newClaim(claimB, at.Add(-2*time.Hour), ended(awareness.ClaimExpired, at.Add(-time.Hour))), awareness.ClaimExpired},
+		{"fulfilled", newClaim(claimC, at.Add(-time.Hour), ended(awareness.ClaimFulfilled, at.Add(-time.Minute))), awareness.ClaimFulfilled},
+		{"active, past expires_at", newClaim(claimD, at.Add(-time.Hour), func(cl *awareness.Claim) {
 			cl.ExpiresAt = at.Add(-time.Second)
 		}), awareness.ClaimExpired},
 	} {
@@ -298,6 +305,7 @@ func TestReleaseClaim_ChangesNothingForAClaimThatIsNotActive(t *testing.T) {
 }
 
 func TestModifyClaim_AllowsOnlyTheCreatorTheOwnerAndTheAdminToken(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	creator, creatorKey := s.member(t, "creator")
 	_, otherKey := s.member(t, "other")
@@ -354,11 +362,12 @@ func TestModifyClaim_AllowsOnlyTheCreatorTheOwnerAndTheAdminToken(t *testing.T) 
 }
 
 func TestClaimRoutes_RefuseAnIDThatNamesNoClaimOfTheWorkspace(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	s := newServedWith(t, servedConfig{Now: (&clock{now: at}).Now})
 	s.hub.AddWorkspace(t, access.Record{Slug: "other", OwnerID: s.owner, OrgID: s.org, Kind: access.KindRepository,
 		Status: access.StatusReady})
-	s.seedClaims(s.storedClaim(claimF, at, func(cl *awareness.Claim) { cl.Workspace = "other" }))
+	s.seedClaims(newClaim(claimF, at, func(cl *awareness.Claim) { cl.Workspace = "other" }))
 	for _, method := range []string{http.MethodGet, http.MethodPatch, http.MethodDelete} {
 		for _, id := range []string{"7d1c3f0e-9b5a-4c2e-8f61-0a4b2d9e8c17", "not-a-uuid", claimF} {
 			var body any

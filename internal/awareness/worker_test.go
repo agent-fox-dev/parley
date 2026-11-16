@@ -10,6 +10,7 @@ import (
 )
 
 func TestWorker_IndexesAnOpenedChangeOnlyAfterAPass(t *testing.T) {
+	t.Parallel()
 	h := newChangeHub(t)
 	number := h.open(t, "feat", map[string]string{"api/a.go": "feat\n"})
 	ctx := context.Background()
@@ -29,6 +30,7 @@ func TestWorker_IndexesAnOpenedChangeOnlyAfterAPass(t *testing.T) {
 }
 
 func TestWorker_AppliesEachEventOnceAcrossARestartAndAFailedCommit(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	base := commit(t, f.repo, "main", "", map[string]string{"a.go": "a\n", "b.go": "b\n"})
 	var versions []awareness.Change

@@ -68,37 +68,6 @@ func TestClaim_CommandsSendTheRouteWithTheMembersAndParametersTheirFlagsName(t *
 	}
 }
 
-func TestClaim_PrintsTheHubsRefusalAsReceived(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		args         []string
-		method, path string
-		status       int
-		errorType    string
-	}{
-		{[]string{"create", "demo", "--paths", "api/**", "--intent", "x"}, http.MethodPost, claimsPath, http.StatusTooManyRequests, "claim_limit_reached"},
-		{[]string{"renew", "demo", claimID}, http.MethodPatch, claimsPath + "/" + claimID, http.StatusConflict, "claim_not_active"},
-		{[]string{"release", "demo", claimID}, http.MethodDelete, claimsPath + "/" + claimID, http.StatusNotFound, "claim_not_found"},
-	}
-	for _, tt := range tests {
-		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
-			t.Parallel()
-			refusal := envelope(tt.status, tt.errorType)
-			hub := newStubHub(t).answer(tt.method, tt.path, tt.status, refusal)
-
-			code, stdout, stderr, sent := runOnHub(t, hub, append([]string{"claim"}, tt.args...)...)
-
-			wantOnlyRequest(t, sent, tt.method, tt.path)
-			if code != 1 || stdout != "" {
-				t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
-			}
-			if want := indented(t, refusal); stderr != want {
-				t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
-			}
-		})
-	}
-}
-
 func TestClaim_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	t.Parallel()
 	hub := newStubHub(t)

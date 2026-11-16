@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,9 +19,8 @@ import (
 // nor open has none, also before the index has followed it out of flight.
 // A change the workspace does not have is ErrChangeNotFound.
 //
-// The partners are those of the index, and each one's state and summary
-// are read from its record, so a partner that has left flight since the
-// index last followed it is left out.
+// The partners are those of Partners, and each one's summary is read from
+// its record.
 func (c *Component) Overlaps(ctx context.Context, q Querier, workspace string, number int64) ([]Entry, error) {
 	q = c.querier(q)
 	ch, err := c.deps.Changes.ReadChange(ctx, q, workspace, number)
@@ -32,24 +30,13 @@ func (c *Component) Overlaps(ctx context.Context, q Querier, workspace string, n
 	if !inFlight(ch.State) {
 		return []Entry{}, nil
 	}
-	partners, err := c.Partners(ctx, q, workspace, number)
+	partners, err := c.partners(ctx, q, workspace, number)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]Entry, 0, len(partners))
 	for _, p := range partners {
-		other, err := c.deps.Changes.ReadChange(ctx, q, workspace, p.Number)
-		if errors.Is(err, ErrChangeNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read %s#%d: %w", workspace, p.Number, err)
-		}
-		if !inFlight(other.State) {
-			continue
-		}
-		other.Workspace, other.Number = workspace, p.Number
-		out = append(out, EntryOf(other, p.Paths))
+		out = append(out, EntryOf(p.record, p.Paths))
 	}
 	return out, nil
 }

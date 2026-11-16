@@ -643,11 +643,19 @@ func (e *eventFeed) ReadAfter(_ context.Context, after int64, limit int) ([]even
 }
 
 // changeBook is a change reader over the records a test sets, which counts
-// its reads.
+// its reads; while failing is set, every read fails with it.
 type changeBook struct {
 	mu      sync.Mutex
 	records map[string]awareness.Change
 	reads   int
+	failing error
+}
+
+// fail makes every read from now on fail with err.
+func (b *changeBook) fail(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failing = err
 }
 
 func (b *changeBook) set(ch awareness.Change) {
@@ -660,6 +668,9 @@ func (b *changeBook) ReadChange(_ context.Context, _ awareness.Querier, workspac
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.reads++
+	if b.failing != nil {
+		return awareness.Change{}, b.failing
+	}
 	ch, ok := b.records[workspace+"#"+strconv.FormatInt(number, 10)]
 	if !ok {
 		return awareness.Change{}, awareness.ErrChangeNotFound
@@ -948,21 +959,6 @@ func (s *served) eventsOf(t testing.TB, typ string) int {
 		t.Fatal(err)
 	}
 	return n
-}
-
-// storedClaim is an active claim id of demo on main for api/**, made by the
-// owner of s with an API key at created and expiring an hour later, as
-// edit (nil for none) changes it.
-func (s *served) storedClaim(id string, created time.Time, edit func(*awareness.Claim)) awareness.Claim {
-	cl := awareness.Claim{
-		ID: id, Workspace: "demo", TargetBranch: "main", Paths: []string{"api/**"}, Intent: "rework",
-		By:    awareness.Actor{ActorType: "api_key", ActorID: &s.owner, Username: new("owner")},
-		State: awareness.ClaimActive, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
-	}
-	if edit != nil {
-		edit(&cl)
-	}
-	return cl
 }
 
 // ended makes cl a claim that left the state active for state at at.

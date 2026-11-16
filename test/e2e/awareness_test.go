@@ -48,7 +48,9 @@ func (s changeSessions) Check(_ context.Context, _ change.Caller, id, _ string) 
 	return knownSessions(s).check(id, change.ErrUnknownSession)
 }
 
-func (changeSessions) Record(context.Context, *sql.Tx, string, string, int64, int64) error { return nil }
+func (changeSessions) Record(context.Context, *sql.Tx, string, string, int64, int64) error {
+	return nil
+}
 
 // claimSessions is knownSessions as the awareness component's sessions.
 type claimSessions knownSessions
@@ -58,17 +60,6 @@ func (s claimSessions) Check(_ context.Context, _ awareness.Actor, id, _ string)
 }
 
 func (claimSessions) Record(context.Context, *sql.Tx, string, string, string) error { return nil }
-
-// eventually checks cond every 50 ms until it holds, and fails the test
-// when it does not hold within d.
-func eventually(t *testing.T, d time.Duration, what string, cond func() bool) {
-	t.Helper()
-	for deadline := time.Now().Add(d); !cond(); time.Sleep(50 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s did not happen within %s", what, d)
-		}
-	}
-}
 
 // getOK is the JSON object GET path answers the credential with, failing
 // the test unless the answer is 200.
@@ -127,6 +118,35 @@ func (h *forkHub) logOf(t *testing.T, types ...string) []loggedRecord {
 	return page.Items
 }
 
+// overlapsNamed waits for the two parley.change.overlap events of demo
+// and returns, for each, the change it is on and the number of the change
+// it names, failing the test unless there are exactly two, each on a
+// change and naming one.
+func (h *forkHub) overlapsNamed(t *testing.T) map[string]float64 {
+	t.Helper()
+	var overlaps []loggedRecord
+	waitUntil(10*time.Second, func() bool {
+		overlaps = h.logOf(t, "parley.change.overlap")
+		return len(overlaps) >= 2
+	})
+	if len(overlaps) != 2 {
+		t.Fatalf("the log holds %d parley.change.overlap events, want 2", len(overlaps))
+	}
+	named := map[string]float64{}
+	for _, ev := range overlaps {
+		var meta struct {
+			With struct {
+				Number float64 `json:"number"`
+			} `json:"with"`
+		}
+		if err := json.Unmarshal(ev.Metadata, &meta); err != nil || ev.ResourceType != "change" {
+			t.Fatalf("overlap event on %s %s with metadata %s, want a change and a with", ev.ResourceType, ev.ResourceID, ev.Metadata)
+		}
+		named[ev.ResourceID] = meta.With.Number
+	}
+	return named
+}
+
 // Two agents start work on the same file: the second claims the paths and
 // sees the first one's change, opens its own change on the claimed,
 // overlapping file as it would without either, and each change is told
@@ -167,9 +187,14 @@ func TestAwareness_TwoAgentsOnOneFileAreEachToldAboutTheOther(t *testing.T) {
 		t.Fatalf("open change 1 from feat-a = %d %s, want 201", status, body)
 	}
 	activity := "/api/v1/workspaces/demo/activity?paths=" + url.QueryEscape("api/**")
-	eventually(t, 10*time.Second, "activity on api/** listing change 1", func() bool {
-		return slices.Equal(changeNumbers(objects(h.getOK(t, agentA, activity), "changes")), []float64{1})
+	var listed []float64
+	waitUntil(10*time.Second, func() bool {
+		listed = changeNumbers(objects(h.getOK(t, agentA, activity), "changes"))
+		return slices.Equal(listed, []float64{1})
 	})
+	if !slices.Equal(listed, []float64{1}) {
+		t.Fatalf("activity on api/** lists changes %v, want [1]", listed)
+	}
 
 	r := h.runAs(t, agentB, "claim", "create", "demo", "--paths", "api/**", "--intent", "rework handlers", "--session", sessionB)
 	if r.code != 0 {
@@ -190,27 +215,7 @@ func TestAwareness_TwoAgentsOnOneFileAreEachToldAboutTheOther(t *testing.T) {
 		t.Errorf("change 2 opened as number %v, state %v, version %v; want 2, open, 1", c["number"], c["state"], c["version"])
 	}
 
-	var overlaps []loggedRecord
-	eventually(t, 10*time.Second, "two parley.change.overlap events", func() bool {
-		overlaps = h.logOf(t, "parley.change.overlap")
-		return len(overlaps) >= 2
-	})
-	if len(overlaps) != 2 {
-		t.Fatalf("the log holds %d parley.change.overlap events, want 2", len(overlaps))
-	}
-	named := map[string]float64{}
-	for _, ev := range overlaps {
-		var meta struct {
-			With struct {
-				Number float64 `json:"number"`
-			} `json:"with"`
-		}
-		if err := json.Unmarshal(ev.Metadata, &meta); err != nil || ev.ResourceType != "change" {
-			t.Fatalf("overlap event on %s %s with metadata %s, want a change and a with", ev.ResourceType, ev.ResourceID, ev.Metadata)
-		}
-		named[ev.ResourceID] = meta.With.Number
-	}
-	if want := map[string]float64{"1": 2, "2": 1}; fmt.Sprint(named) != fmt.Sprint(want) {
+	if named, want := h.overlapsNamed(t), map[string]float64{"1": 2, "2": 1}; fmt.Sprint(named) != fmt.Sprint(want) {
 		t.Errorf("overlap events name %v (resource id: with.number), want %v", named, want)
 	}
 
@@ -277,7 +282,7 @@ func TestAwareness_ACrashedAgentsClaimExpiresAndIsRemoved(t *testing.T) {
 		return types
 	}
 	var types []string
-	eventually(t, 10*time.Second, "the expiry run's parley.claim.expire", func() bool {
+	waitUntil(10*time.Second, func() bool {
 		types = ofClaim()
 		return slices.Contains(types, "parley.claim.expire")
 	})
@@ -295,7 +300,7 @@ func TestAwareness_ACrashedAgentsClaimExpiresAndIsRemoved(t *testing.T) {
 	// A start of the hub runs a maintenance pass, claim_cleanup among its
 	// tasks.
 	h.Restart(t)
-	eventually(t, 10*time.Second, "the removal of the claim", func() bool {
+	waitUntil(10*time.Second, func() bool {
 		status, _ := h.Call(t, http.MethodGet, claimPath, h.key, nil)
 		return status == http.StatusNotFound
 	})

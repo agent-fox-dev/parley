@@ -7,6 +7,7 @@ import (
 )
 
 func TestCanOverlap_AnswersWhetherTwoGlobsCanMatchTheSameFile(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		a, b string
 		want bool

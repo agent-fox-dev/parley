@@ -11,6 +11,7 @@ import (
 )
 
 func TestExpireClaims_ExpiresEachClaimWhoseTimeHasComeOnce(t *testing.T) {
+	t.Parallel()
 	start := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
 	clk := &clock{now: start}
 	f := newFixtureAt(t, clk.Now)

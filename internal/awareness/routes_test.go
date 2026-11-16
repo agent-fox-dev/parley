@@ -39,6 +39,7 @@ func newAccessWorld(t *testing.T) *accessWorld {
 }
 
 func TestAwarenessReads_NeedChangesReadAndReadAccess(t *testing.T) {
+	t.Parallel()
 	w := newAccessWorld(t)
 	for _, route := range []string{"/activity?paths=api/**", "/changes/1/overlaps", "/claims", "/claims/" + w.claim} {
 		t.Run(route, func(t *testing.T) {
@@ -68,6 +69,7 @@ func TestAwarenessReads_NeedChangesReadAndReadAccess(t *testing.T) {
 }
 
 func TestAwarenessWrites_NeedChangesWriteAndLetAMemberClaim(t *testing.T) {
+	t.Parallel()
 	w := newAccessWorld(t)
 	body := map[string]any{"paths": []string{"api/**"}, "intent": "rework"}
 	writes := []struct {
@@ -117,6 +119,7 @@ func TestAwarenessWrites_NeedChangesWriteAndLetAMemberClaim(t *testing.T) {
 }
 
 func TestAwarenessRoutes_ServeTheParentsDataThroughAForksSlug(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	s.version(s.touching(1, 1, "", "api/a.go", "api/b.go"))
 	s.version(s.touching(2, 1, "", "api/a.go"))

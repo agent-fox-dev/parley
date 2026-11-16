@@ -13,9 +13,11 @@ import (
 )
 
 func TestEntryOf_SummarisesTheOtherChangeAndCutsTheCommonFiles(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{1, 100, 101, 2500} {
 		for _, chars := range []int{0, 500, 501} {
 			t.Run(fmt.Sprintf("%d files, intent of %d characters", n, chars), func(t *testing.T) {
+				t.Parallel()
 				common := make([]string, n)
 				for i := range common {
 					common[i] = fmt.Sprintf("src/f%04d.go", n-1-i)

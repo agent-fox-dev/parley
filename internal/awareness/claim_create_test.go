@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"reflect"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func TestCreateClaim_StoresTheClaimAndAnswersItsActivity(t *testing.T) {
+	t.Parallel()
 	at := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	s := newServedWith(t, servedConfig{Now: (&clock{now: at}).Now})
 	s.version(s.touching(1, 1, "", "api/a.go"))
@@ -96,6 +98,7 @@ func TestCreateClaim_StoresTheClaimAndAnswersItsActivity(t *testing.T) {
 }
 
 func TestCreateClaim_AcceptsClaimsOnTheSamePathsAndShowsEachInTheOther(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	s.comp.RegisterSessions(&sessions{accepted: []string{session1, session2}})
 	first := s.createClaim(t, "demo", map[string]any{"paths": []string{"api/**"}, "intent": "a", "session_id": session1})
@@ -117,6 +120,7 @@ func TestCreateClaim_AcceptsClaimsOnTheSamePathsAndShowsEachInTheOther(t *testin
 }
 
 func TestCreateClaim_RefusesAnInvalidBody(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	globs := func(n int) []string {
 		out := make([]string, n)
@@ -180,6 +184,7 @@ func TestCreateClaim_RefusesAnInvalidBody(t *testing.T) {
 }
 
 func TestCreateClaim_RefusesASessionTheLinkingRuleRefuses(t *testing.T) {
+	t.Parallel()
 	const (
 		sessionOK    = "0000000a-0000-4000-8000-00000000000a"
 		sessionOther = "0000000b-0000-4000-8000-00000000000b"
@@ -247,7 +252,9 @@ func TestCreateClaim_RefusesASessionTheLinkingRuleRefuses(t *testing.T) {
 }
 
 func TestCreateClaim_RefusesAClaimOverTheLimits(t *testing.T) {
+	t.Parallel()
 	t.Run("workspace", func(t *testing.T) {
+		t.Parallel()
 		clk := &clock{now: time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)}
 		s := newServedWith(t, servedConfig{TOML: "[awareness]\nmax_claims_per_workspace = 3\n", Now: clk.Now})
 		s.hub.AddWorkspace(t, access.Record{Slug: "demo-fork", OwnerID: s.owner, OrgID: s.org, Kind: access.KindFork,
@@ -297,6 +304,7 @@ func TestCreateClaim_RefusesAClaimOverTheLimits(t *testing.T) {
 	})
 
 	t.Run("session", func(t *testing.T) {
+		t.Parallel()
 		s := newServed(t)
 		s.comp.RegisterSessions(&sessions{accepted: []string{session1, session2}})
 		withSession := map[string]any{"paths": []string{"api/**"}, "intent": "rework", "session_id": session1}
@@ -314,4 +322,29 @@ func TestCreateClaim_RefusesAClaimOverTheLimits(t *testing.T) {
 		s.createClaim(t, "demo", map[string]any{"paths": []string{"api/**"}, "intent": "rework", "session_id": session2})
 		s.createClaim(t, "demo", map[string]any{"paths": []string{"api/**"}, "intent": "rework"})
 	})
+}
+
+func TestCreateClaim_StoresNothingWhenItsActivityFails(t *testing.T) {
+	t.Parallel()
+	s := newServed(t)
+	sess := &sessions{accepted: []string{session1}}
+	s.comp.RegisterSessions(sess)
+	s.version(s.touching(1, 1, "", "api/a.go"))
+	s.pass()
+	s.changes.fail(errors.New("the change records cannot be read"))
+
+	events := s.count(t, "hub_events")
+	status, raw := s.postClaim(t, "demo", map[string]any{"paths": []string{"api/**"}, "intent": "rework", "session_id": session1})
+	if status != http.StatusInternalServerError {
+		t.Errorf("POST claims while the activity fails = %d %s, want 500", status, raw)
+	}
+	if n := s.count(t, "awareness_claims"); n != 0 {
+		t.Errorf("%d claims stored, want none", n)
+	}
+	if n := s.count(t, "hub_events"); n != events {
+		t.Errorf("%d events in the log, want %d", n, events)
+	}
+	if len(sess.records) != 0 {
+		t.Errorf("session links recorded: %v, want none", sess.records)
+	}
 }

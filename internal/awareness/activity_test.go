@@ -1,6 +1,7 @@
 package awareness_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestActivity_ListsInFlightChangesMatchingTheGlobs(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	for _, c := range []struct {
 		number int64
@@ -80,6 +82,7 @@ func TestActivity_ListsInFlightChangesMatchingTheGlobs(t *testing.T) {
 }
 
 func TestActivity_ListsTheLiveClaimsWhoseGlobsCanMatch(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	claim := func(id, target, state string, created, expires time.Time, paths ...string) awareness.Claim {
@@ -122,6 +125,7 @@ func TestActivity_ListsTheLiveClaimsWhoseGlobsCanMatch(t *testing.T) {
 }
 
 func TestActivity_ListsWhatLandedOnTheTargetSince(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	now := time.Now().UTC()
 	// The versions' files come from one head; main holds the landed
@@ -181,6 +185,7 @@ func TestActivity_ListsWhatLandedOnTheTargetSince(t *testing.T) {
 	}
 
 	t.Run("at most 100", func(t *testing.T) {
+		t.Parallel()
 		s := newServed(t)
 		ch := s.touching(1, 1, "", "api/a.go")
 		for n := int64(1); n <= 101; n++ {
@@ -197,6 +202,7 @@ func TestActivity_ListsWhatLandedOnTheTargetSince(t *testing.T) {
 }
 
 func TestActivity_LeavesOutTheExcludedSessionAndChange(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	now := time.Now().UTC()
 	s.version(s.touching(1, 1, session1, "api/a.go"))
@@ -244,6 +250,7 @@ func TestActivity_LeavesOutTheExcludedSessionAndChange(t *testing.T) {
 }
 
 func TestActivity_RefusesAnInvalidQuery(t *testing.T) {
+	t.Parallel()
 	s := newServed(t)
 	s.version(s.touching(1, 1, "", "api/a.go"))
 	s.pass()
@@ -283,4 +290,54 @@ func TestActivity_RefusesAnInvalidQuery(t *testing.T) {
 			t.Errorf("GET activity with 50 globs of 255 characters = %d %s, want 200", status, raw)
 		}
 	})
+}
+
+func TestActivity_StopsAtTheFirstLandingTheSinceCommitReaches(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	// main holds 152 landed commits, one on the other, oldest first; since
+	// names the 150th, which reaches the 149 before it. The newest landing,
+	// 153, has a landed commit the repository does not hold, as after a
+	// reclone. The versions' files come from one head.
+	ch := f.touching(1, 1, "", "api/a.go")
+	var stream strings.Builder
+	for n := 1; n <= 152; n++ {
+		stream.WriteString("commit refs/heads/main\n" + committer + data(fmt.Sprint("land ", n)))
+		if n == 1 {
+			stream.WriteString("from " + f.base + "\n")
+		}
+		stream.WriteString("M 100644 inline api/a.go\n" + data(fmt.Sprint("landed ", n)))
+	}
+	if _, err := gitrepotest.Run(f.repo, stream.String()+"\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	shas := strings.Fields(gitrepotest.Git(t, f.repo, "rev-list", "--reverse", "main"))
+	shas = shas[len(shas)-152:]
+	at := time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
+	for i, sha := range append(shas, strings.Repeat("e", 40)) {
+		v := ch
+		v.Number = int64(i + 1)
+		f.landed(v, sha, at.Add(time.Duration(i)*time.Minute))
+	}
+	f.pass()
+
+	checks := awareness.CountAncestryChecks(f.comp)
+	a, err := f.comp.Activity(context.Background(), "demo",
+		awareness.ActivityQuery{Paths: []string{"api/**"}, TargetBranch: "main", SinceCommit: shas[149]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int64
+	for _, l := range a.Landed {
+		got = append(got, l.Number)
+	}
+	if !slices.Equal(got, []int64{153, 152, 151}) {
+		t.Errorf("landed = %v, want [153 152 151]", got)
+	}
+	if n := checks.Load(); n != 4 {
+		t.Errorf("%d ancestry checks, want 4: one for each landing kept and one for the first the since commit reaches", n)
+	}
+	if log := f.log.String(); !strings.Contains(log, "workspace=demo") || !strings.Contains(log, "number=153") {
+		t.Errorf("log = %q, want the workspace and the number of the landing whose commit cannot be checked", log)
+	}
 }

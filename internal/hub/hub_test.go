@@ -235,6 +235,10 @@ func failingStarts(hooks func(row string) func(*hub.Composition)) []failingStart
 				hooks(row)(c)
 			}}
 		}},
+		{"invalid awareness section", "data", func(t *testing.T, row string) failedStart {
+			return failedStart{dir: workDir(t, localConfig+"[awareness]\nmax_claims_per_workspace = 0\n"), compose: hooks(row),
+				want: "awareness.max_claims_per_workspace"}
+		}},
 		{"sandbox gateway refusing the hub", "", func(t *testing.T, row string) failedStart {
 			dir := workDir(t, localConfig+externalURL+sandboxSection)
 			for name, content := range sandboxFiles {

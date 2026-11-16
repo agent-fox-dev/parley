@@ -133,7 +133,7 @@ func (c *Component) prepare(ctx context.Context, rec event.Record) (update, bool
 		return update{}, false, err
 	}
 	ch.Workspace, ch.Number = workspace, number
-	u := update{seq: rec.Seq, typ: rec.Type, first: firstVersion(rec), change: ch}
+	u := update{typ: rec.Type, first: firstVersion(rec), change: ch}
 	switch rec.Type {
 	case eventVersion, eventRestore:
 		u.files, err = c.listFiles(ctx, ch)
@@ -146,20 +146,25 @@ func (c *Component) prepare(ctx context.Context, rec event.Record) (update, bool
 			u.files = nil
 		}
 	case eventLand:
-		u.landed = landedOf(ch, rec)
+		u.landed = c.landedOf(ch, rec)
 	}
 	return u, true, nil
 }
 
 // landedOf is how the change ch of the land event rec landed: as the
-// change record says, or, when it says nothing, as the event does.
-func landedOf(ch Change, rec event.Record) Landed {
+// change record says, or, when it says nothing, as the event does. Event
+// metadata that cannot be read leaves the landed commit empty, and is
+// logged with the workspace and the number.
+func (c *Component) landedOf(ch Change, rec event.Record) Landed {
 	if ch.Landed != nil {
 		return *ch.Landed
 	}
 	var meta struct {
 		LandedSHA string `json:"landed_sha"`
 	}
-	_ = json.Unmarshal(rec.Metadata, &meta)
+	if err := json.Unmarshal(rec.Metadata, &meta); err != nil {
+		c.deps.Logger.Warn("cannot read the landed commit of a land event; the awareness index records the landing without it",
+			"workspace", ch.Workspace, "number", ch.Number, "seq", rec.Seq, "error", err)
+	}
 	return Landed{SHA: meta.LandedSHA, At: rec.Time}
 }

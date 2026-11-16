@@ -13,6 +13,7 @@ import (
 )
 
 func TestClaimCleanup_RemovesTheClaimsThatEndedSevenDaysAgo(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
 	clk := &clock{now: now}
 	// passed hears of each maintenance pass once the tasks of known names,
@@ -40,11 +41,11 @@ func TestClaimCleanup_RemovesTheClaimsThatEndedSevenDaysAgo(t *testing.T) {
 	week := 7 * 24 * time.Hour
 	created := now.Add(-30 * 24 * time.Hour)
 	s.seedClaims(
-		s.storedClaim(claimA, created, ended(awareness.ClaimReleased, now.Add(-week))),
-		s.storedClaim(claimB, created, ended(awareness.ClaimExpired, now.Add(-week-time.Second))),
-		s.storedClaim(claimC, created, ended(awareness.ClaimFulfilled, now.Add(-8*24*time.Hour))),
-		s.storedClaim(claimD, created, ended(awareness.ClaimReleased, now.Add(-week+time.Second))),
-		s.storedClaim(claimE, created, func(cl *awareness.Claim) { cl.ExpiresAt = now.Add(time.Hour) }),
+		newClaim(claimA, created, ended(awareness.ClaimReleased, now.Add(-week))),
+		newClaim(claimB, created, ended(awareness.ClaimExpired, now.Add(-week-time.Second))),
+		newClaim(claimC, created, ended(awareness.ClaimFulfilled, now.Add(-8*24*time.Hour))),
+		newClaim(claimD, created, ended(awareness.ClaimReleased, now.Add(-week+time.Second))),
+		newClaim(claimE, created, func(cl *awareness.Claim) { cl.ExpiresAt = now.Add(time.Hour) }),
 	)
 
 	s.hub.Restart(t)
@@ -62,6 +63,7 @@ func TestClaimCleanup_RemovesTheClaimsThatEndedSevenDaysAgo(t *testing.T) {
 }
 
 func TestRemoveWorkspace_RemovesTheClaimsAndTheIndexOfOneWorkspace(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	now := time.Now().UTC()
 	f.seedClaims(

@@ -45,9 +45,6 @@ type ActivityQuery struct {
 	// ExcludeChange, when not 0, leaves out that change and every claim
 	// linked to it.
 	ExcludeChange int64
-	// LeaveOutClaim, when not "", is a claim the activity does not list:
-	// the one being created, whose activity it is.
-	LeaveOutClaim string
 }
 
 // Activity is the answer to "what touches these paths" on a target branch:
@@ -184,8 +181,7 @@ func activityClaims(ctx context.Context, q Querier, workspace, target string, aq
 	out := []ClaimObject{}
 	for _, cl := range claims {
 		switch {
-		case cl.ID == aq.LeaveOutClaim,
-			ofSession(cl.SessionID, aq.ExcludeSession),
+		case ofSession(cl.SessionID, aq.ExcludeSession),
 			aq.ExcludeChange != 0 && cl.Change != nil && *cl.Change == aq.ExcludeChange,
 			!overlapsAny(cl.Paths, aq.Paths):
 			continue
@@ -206,7 +202,9 @@ type landedSince struct {
 
 // activityLanded are the changes of workspace landed on target since since
 // with a file matching one of q's globs, landed_at descending and then
-// number descending, at most 100.
+// number descending, at most 100. For a since commit, the walk stops at the
+// first landing it reaches, so that it checks at most one landing more than
+// it lists.
 func (c *Component) activityLanded(ctx context.Context, q Querier, workspace, target string, aq ActivityQuery, since landedSince) ([]LandedItem, error) {
 	query := `SELECT c.number, f.path, c.landed_sha, c.landed_at, c.session_id FROM awareness_changes c
 JOIN awareness_files f ON f.workspace_slug = c.workspace_slug AND f.number = c.number
@@ -229,14 +227,23 @@ WHERE c.workspace_slug = ? AND c.target_branch = ? AND c.phase = 'landed'`
 			continue
 		}
 		if since.commit != "" && m.sha != "" {
-			// A landed commit the repository does not hold cannot be
-			// reachable from since.
+			if c.ancestryChecked != nil {
+				c.ancestryChecked()
+			}
 			reached, err := since.repo.IsAncestor(ctx, m.sha, since.commit)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if err == nil && reached {
-				continue
+			if err != nil {
+				// A landed commit the repository cannot resolve, as after a
+				// reclone, is not reachable from since.
+				c.deps.Logger.Warn("cannot tell whether an activity's since commit reaches a landed commit; the activity lists the landing",
+					"workspace", workspace, "number", m.number, "landed_sha", m.sha, "error", err)
+			}
+			if reached {
+				// The landings on one target branch are successive commits
+				// of it, so since reaches every older one too.
+				break
 			}
 		}
 		item := LandedItem{
