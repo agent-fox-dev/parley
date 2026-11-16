@@ -38,6 +38,9 @@ type patchCase struct {
 	query         url.Values
 	body          string
 	wantExitCode1 bool
+	// printed is what stdout must hold when it is not the answer, as for a
+	// confirmation printed on an answer without a body.
+	printed string
 }
 
 // runPatchCase runs tt and checks the one request sent and what was printed.
@@ -64,7 +67,11 @@ func runPatchCase(t *testing.T, method string, tt patchCase) {
 		wantHubFailure(t, code, stdout, stderr, tt.answer)
 		return
 	}
-	wantResult(t, code, stdout, stderr, tt.answer)
+	printed := tt.answer
+	if tt.printed != "" {
+		printed = tt.printed
+	}
+	wantResult(t, code, stdout, stderr, printed)
 }
 
 func TestPatchAdd_SendsOnlyGivenFlags(t *testing.T) {
@@ -152,6 +159,117 @@ func TestPatchShow_GetsOnePatch(t *testing.T) {
 	}
 }
 
+func TestPatchUpdate_SendsOnlyGivenFlags(t *testing.T) {
+	t.Parallel()
+	path := patchesPath + "/" + patchID
+	deleted := `{"error": {"code": 409, "message": "the patch is deleted", "error_type": "patch_deleted"}}`
+	tests := []patchCase{
+		{name: "--status", args: []string{"--status", "disabled"}, body: `{"status": "disabled"}`},
+		{name: "--position", args: []string{"--position", "2"}, body: `{"position": 2}`},
+		{name: "an empty --description", args: []string{"--description", ""}, body: `{"description": ""}`},
+		{name: "--upstream-pr", args: []string{"--upstream-pr", "https://example.test/pull/7"}, body: `{"upstream_pr_url": "https://example.test/pull/7"}`},
+		{
+			name: "every flag", args: []string{"--status", "active", "--position", "1", "--description", "d", "--upstream-pr", ""},
+			body: `{"status": "active", "position": 1, "description": "d", "upstream_pr_url": ""}`,
+		},
+		{name: "a status the hub decides on", args: []string{"--status", "bogus"}, body: `{"status": "bogus"}`},
+		{
+			name: "the hub refuses", args: []string{"--status", "disabled"}, body: `{"status": "disabled"}`,
+			status: http.StatusConflict, answer: deleted, wantExitCode1: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.args = append([]string{"update", "ws", patchID}, tt.args...)
+			tt.rawPath = path
+			if tt.status == 0 {
+				tt.status, tt.answer = http.StatusOK, patchAnswer
+			}
+			runPatchCase(t, http.MethodPatch, tt)
+		})
+	}
+}
+
+func TestPatchRemove_PrintsConfirmation(t *testing.T) {
+	t.Parallel()
+	notFound := `{"error": {"code": 404, "message": "patch not found", "error_type": "not_found"}}`
+	tests := []patchCase{
+		{
+			name: "a patch", args: []string{"remove", "ws", patchID},
+			status: http.StatusNoContent, rawPath: patchesPath + "/" + patchID,
+			printed: `{"status": "removed", "patch_id": "` + patchID + `"}`,
+		},
+		{
+			name: "the id as typed", args: []string{"remove", "ws", "p/1"},
+			status: http.StatusNoContent, rawPath: patchesPath + "/p%2F1",
+			printed: `{"status": "removed", "patch_id": "p/1"}`,
+		},
+		{
+			name: "the hub refuses", args: []string{"remove", "ws", patchID},
+			status: http.StatusNotFound, answer: notFound, rawPath: patchesPath + "/" + patchID, wantExitCode1: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runPatchCase(t, http.MethodDelete, tt)
+		})
+	}
+}
+
+func TestPatchRestore_PrintsPatch(t *testing.T) {
+	t.Parallel()
+	notDeleted := `{"error": {"code": 409, "message": "the patch is not deleted", "error_type": "patch_not_deleted"}}`
+	tests := []patchCase{
+		{
+			name: "a deleted patch", args: []string{"restore", "ws", patchID},
+			status: http.StatusOK, answer: patchAnswer, rawPath: patchesPath + "/" + patchID + "/restore",
+		},
+		{
+			name: "the hub refuses", args: []string{"restore", "ws", patchID},
+			status: http.StatusConflict, answer: notDeleted, rawPath: patchesPath + "/" + patchID + "/restore", wantExitCode1: true,
+		},
+		{
+			name: "a slug with a slash", args: []string{"restore", "a/b", patchID},
+			status: http.StatusOK, answer: patchAnswer, rawPath: "/api/v1/workspaces/a%2Fb/patches/" + patchID + "/restore",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runPatchCase(t, http.MethodPost, tt)
+		})
+	}
+}
+
+func TestPatchReorder_SendsIdsInOrder(t *testing.T) {
+	t.Parallel()
+	list := `{"items": [` + patchAnswer + `], "next_cursor": null}`
+	incomplete := `{"error": {"code": 400, "message": "patch_ids names 3 patches, the workspace has 4", "error_type": "invalid_request"}}`
+	tests := []patchCase{
+		{
+			name: "ids in argument order", args: []string{"reorder", "ws", "C", "A", "B"},
+			status: http.StatusOK, answer: list, rawPath: patchesPath + "/reorder", body: `{"patch_ids": ["C", "A", "B"]}`,
+		},
+		{
+			name: "one id", args: []string{"reorder", "ws", "A"},
+			status: http.StatusOK, answer: list, rawPath: patchesPath + "/reorder", body: `{"patch_ids": ["A"]}`,
+		},
+		{
+			name: "the hub refuses", args: []string{"reorder", "ws", "C", "A", "B"},
+			status: http.StatusBadRequest, answer: incomplete, rawPath: patchesPath + "/reorder",
+			body: `{"patch_ids": ["C", "A", "B"]}`, wantExitCode1: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runPatchCase(t, http.MethodPost, tt)
+		})
+	}
+}
+
 func TestPatch_UsageErrors(t *testing.T) {
 	t.Parallel()
 	hub := newStubHub(t)
@@ -167,6 +285,15 @@ func TestPatch_UsageErrors(t *testing.T) {
 		{[]string{"list", "a", "b"}, `got the extra argument "b"`},
 		{[]string{"show", "ws"}, "parley patch show needs the argument <id>"},
 		{[]string{"show", "ws", "id", "extra"}, `got the extra argument "extra"`},
+		{[]string{"update", "ws", "id"}, "parley patch update needs at least one of --status, --position, --description, --upstream-pr"},
+		{[]string{"update", "ws", "id", "--position", "two"}, `"two" for "--position" flag`},
+		{[]string{"update", "ws"}, "parley patch update needs the argument <id>"},
+		{[]string{"update", "ws", "id", "extra", "--status", "active"}, `got the extra argument "extra"`},
+		{[]string{"remove", "ws"}, "parley patch remove needs the argument <id>"},
+		{[]string{"remove", "ws", "id", "extra"}, `got the extra argument "extra"`},
+		{[]string{"restore", "ws"}, "parley patch restore needs the argument <id>"},
+		{[]string{"restore", "ws", "id", "extra"}, `got the extra argument "extra"`},
+		{[]string{"reorder", "ws"}, "parley patch reorder needs the argument <id>"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
