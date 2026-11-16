@@ -213,24 +213,22 @@ func TestPool_EndsAnAttemptPastItsDeadlineAsTimeout(t *testing.T) {
 	}
 }
 
-// slowRefWriter is the hub's ref writer taking delay more after each move
-// of a ref, as a move whose bookkeeping is slow.
-type slowRefWriter struct {
-	land.RefWriter
-	delay time.Duration
-}
+// slowRefWriter is the hub's ref writer that, once it moved a ref, returns
+// only after the context of the move ended, as a move whose bookkeeping
+// outlasts the attempt's deadline, however long the replay before it took.
+type slowRefWriter struct{ land.RefWriter }
 
 func (s slowRefWriter) Apply(ctx context.Context, req pushrule.ApplyRequest) (pushrule.Result, error) {
 	res, err := s.RefWriter.Apply(ctx, req)
-	time.Sleep(s.delay)
+	<-ctx.Done()
 	return res, err
 }
 
 func TestPool_RecordsALandWhoseDeadlinePassedWhileTheTargetMoved(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, func(d *land.Deps) {
-		d.Timeout = time.Second
-		d.RefWriter = slowRefWriter{d.RefWriter, 2 * time.Second}
+		d.Timeout = 5 * time.Second
+		d.RefWriter = slowRefWriter{d.RefWriter}
 	})
 	ch := w.open(t, "feature")
 
