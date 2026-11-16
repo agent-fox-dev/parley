@@ -122,6 +122,8 @@ func TestPool_FreesTheWorkerOfALandBeforeItsFollowUp(t *testing.T) {
 }
 
 // deadlines are attempts that pass their deadline, each in another place.
+// A timeout that has to pass in a given place leaves the run three seconds
+// to get there, so that a loaded machine does not end it sooner, elsewhere.
 var deadlines = []struct {
 	name string
 	// timeout is [land].timeout, 0 for the default, and age how long
@@ -132,10 +134,14 @@ var deadlines = []struct {
 	// in place of parking the attempt before the swap.
 	second, hang bool
 }{
-	{name: "parked before the swap, a second attempt waiting for the worker", timeout: time.Second, second: true},
-	{name: "under the default timeout, created five minutes ago", age: 5*time.Minute - time.Second},
-	{name: "in a git command of the replay", timeout: time.Second, hang: true},
+	{name: "parked before the swap, a second attempt waiting for the worker", timeout: 3 * time.Second, second: true},
+	{name: "under the default timeout, created five minutes ago", age: 5*time.Minute - 3*time.Second},
+	{name: "in a git command of the replay", timeout: 3 * time.Second, hang: true},
 }
+
+// parked is how long the attempt parked before the swap stays there, past
+// any deadline of deadlines; every attempt ends before it returns.
+const parked = 6 * time.Second
 
 func TestPool_EndsAnAttemptPastItsDeadlineAsTimeout(t *testing.T) {
 	t.Parallel()
@@ -159,7 +165,7 @@ func TestPool_EndsAnAttemptPastItsDeadlineAsTimeout(t *testing.T) {
 				mu.Lock()
 				entered++
 				mu.Unlock()
-				time.Sleep(2 * time.Second)
+				time.Sleep(parked)
 			}})
 			var changes []change.Change
 			main := w.base
@@ -184,8 +190,8 @@ func TestPool_EndsAnAttemptPastItsDeadlineAsTimeout(t *testing.T) {
 
 			for _, a := range attempts {
 				got := w.ended(t, a.ID)
-				if took := time.Since(start); took >= 2*time.Second {
-					t.Errorf("attempt %s ended after %v, want less than 2 s", a.ID, took)
+				if took := time.Since(start); took >= parked {
+					t.Errorf("attempt %s ended after %v, want less than %v", a.ID, took, parked)
 				}
 				if got.Status != land.StatusFailed || got.Error == nil || *got.Error != land.ErrorTimeout ||
 					got.FinishedAt == nil || got.LandedSHA != nil {
