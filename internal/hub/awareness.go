@@ -24,7 +24,8 @@ const (
 )
 
 // composeAwareness adds the awareness: the schema of the index of the
-// changes by touched file and of its worker's position, and the component,
+// changes by touched file and of its worker's position, its routes, the
+// overlaps a read of a change may include, and the component,
 // bound in a start hook to the store, to the hub's event log, which the
 // index worker follows and writes the overlap events to, to the change
 // records, which it reads through the change component, and to the place
@@ -41,6 +42,14 @@ func composeAwareness(c *Composition) {
 	comp := &awareness.Component{}
 	c.awareness = comp
 	c.AddSchemaStep(awareness.SchemaStep)
+	for _, r := range comp.Routes() {
+		c.AddRoute(r)
+	}
+	// The overlaps a read of a change includes are the entries its own
+	// overlaps route lists, in the same order and all of them.
+	c.changes.RegisterExpander("overlaps", func(ctx context.Context, ch change.Change) (any, error) {
+		return comp.Overlaps(ctx, nil, ch.WorkspaceSlug, ch.Number)
+	})
 	c.AddStartHook(awarenessHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := awareness.Deps{

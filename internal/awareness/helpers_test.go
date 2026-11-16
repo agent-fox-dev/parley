@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -15,14 +16,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/store"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // fixture is an awareness component on a real store and a real repository,
@@ -90,6 +94,101 @@ func (f *fixture) open() {
 		},
 		Logger: slog.New(slog.NewTextHandler(f.log, nil)),
 	})
+}
+
+// served is a fixture whose component is a running hub's: the hub serves
+// the awareness routes on the workspace demo over the index the fixture's
+// events build, and the worker runs only when the test calls pass. The
+// fixture's event log is not the hub's, so overlapEvents does not apply.
+type served struct {
+	*fixture
+	hub *hubtest.Hub
+}
+
+// newServed is a served fixture with an empty bare repository, in which
+// the hub's admin token reaches demo.
+func newServed(t testing.TB) *served {
+	t.Helper()
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "demo.git")
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", repo)
+	f := &fixture{t: t, dir: dir, repo: repo, events: &eventFeed{}, changes: &changeBook{records: map[string]awareness.Change{}},
+		log: &hubtest.LogBuffer{}}
+	h := hubtest.Start(t, func(c *hub.Composition) {
+		f.comp = c.Awareness()
+		c.AdjustAwareness(func(d *awareness.Deps) {
+			d.Events, d.Changes, d.IndexInterval = f.events, f.changes, time.Hour
+			d.Repos = func(ctx context.Context, _ string) (*gitrepo.Repo, error) { return gitrepo.Git{}.Open(ctx, f.repo) }
+			d.Logger = slog.New(slog.NewTextHandler(f.log, nil))
+		})
+	})
+	f.store = h.Store
+	owner := h.CreateUser(t, "owner")
+	h.AddWorkspace(t, access.Record{Slug: "demo", OwnerID: owner, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository,
+		Status: access.StatusReady})
+	return &served{fixture: f, hub: h}
+}
+
+// get sends GET /api/v1/workspaces/demo/<path> with the admin token and
+// returns the answer's status and body.
+func (s *served) get(path string) (int, []byte) {
+	s.t.Helper()
+	return s.hub.Call(s.t, http.MethodGet, "/api/v1/workspaces/demo/"+path, s.hub.Token, nil)
+}
+
+// changeHub is a hub whose awareness worker runs only when the test calls
+// Pass, with the ready workspace demo, owned by a member of acme, whose
+// repository holds main with api/a.go.
+type changeHub struct {
+	*hubtest.Hub
+	comp *awareness.Component
+	// key is the owner's API key.
+	key string
+	// repo is demo's repository; base is main's head.
+	repo, base string
+}
+
+func newChangeHub(t testing.TB) *changeHub {
+	t.Helper()
+	var comp *awareness.Component
+	var workspaces *workspace.Service
+	h := hubtest.StartWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		comp, workspaces = c.Awareness(), c.Workspaces()
+		c.AdjustAwareness(func(d *awareness.Deps) { d.IndexInterval = time.Hour })
+	}})
+	owner := h.CreateUser(t, "owner")
+	key := h.IssueKey(t, owner)
+	org := h.CreateOrg(t, "acme")
+	h.AddMember(t, org, owner)
+	dir := workspaces.RepoPath("demo")
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	base := commit(t, dir, "main", "", map[string]string{"api/a.go": "a\n"})
+	now := time.Now().UTC()
+	rec := workspace.Workspace{
+		Slug: "demo", Kind: access.KindRepository, Mode: workspace.ModeStandard,
+		GitURL: new("https://origin.test/demo.git"), DefaultBranch: new("main"), OwnerID: owner, OrgID: org,
+		Status: workspace.StatusReady, DisplayName: "demo", HeadSHA: &base,
+		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+	}
+	txOf(t, h.Store, func(tx *sql.Tx) error { return workspace.Insert(context.Background(), tx, rec) })
+	return &changeHub{Hub: h, comp: comp, key: key, repo: dir, base: base}
+}
+
+// open opens a change of demo from a new branch whose commit on main's
+// head sets each of files, and returns its number.
+func (h *changeHub) open(t testing.TB, branch string, files map[string]string) int64 {
+	t.Helper()
+	commit(t, h.repo, branch, h.base, files)
+	status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/changes", h.key,
+		map[string]any{"source": map[string]any{"branch": branch}, "title": "Rework " + branch, "intent": "Make it better."})
+	if status != http.StatusCreated {
+		t.Fatalf("POST changes from %s = %d %s, want 201", branch, status, raw)
+	}
+	var opened struct{ Number int64 }
+	if err := json.Unmarshal(raw, &opened); err != nil {
+		t.Fatal(err)
+	}
+	return opened.Number
 }
 
 // restart closes the store and opens it again under a new component.

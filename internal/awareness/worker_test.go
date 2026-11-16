@@ -2,69 +2,28 @@ package awareness_test
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
-	"net/http"
 	"slices"
 	"testing"
-	"time"
 
-	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/awareness"
-	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
-	"github.com/agent-fox-dev/parley/internal/hub"
-	"github.com/agent-fox-dev/parley/internal/hubtest"
-	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 func TestWorker_IndexesAnOpenedChangeOnlyAfterAPass(t *testing.T) {
-	var comp *awareness.Component
-	var workspaces *workspace.Service
-	h := hubtest.StartWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
-		comp, workspaces = c.Awareness(), c.Workspaces()
-		// The worker is under the test's control: its own passes come an
-		// hour apart.
-		c.AdjustAwareness(func(d *awareness.Deps) { d.IndexInterval = time.Hour })
-	}})
-	owner := h.CreateUser(t, "owner")
-	key := h.IssueKey(t, owner)
-	org := h.CreateOrg(t, "acme")
-	h.AddMember(t, org, owner)
-	dir := workspaces.RepoPath("demo")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
-	base := commit(t, dir, "main", "", map[string]string{"api/a.go": "a\n"})
-	commit(t, dir, "feat", base, map[string]string{"api/a.go": "feat\n"})
-	now := time.Now().UTC()
-	rec := workspace.Workspace{
-		Slug: "demo", Kind: access.KindRepository, Mode: workspace.ModeStandard,
-		GitURL: new("https://origin.test/demo.git"), DefaultBranch: new("main"), OwnerID: owner, OrgID: org,
-		Status: workspace.StatusReady, DisplayName: "demo", HeadSHA: &base,
-		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
-	}
-	txOf(t, h.Store, func(tx *sql.Tx) error { return workspace.Insert(context.Background(), tx, rec) })
-
-	status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/changes", key,
-		map[string]any{"source": map[string]any{"branch": "feat"}, "title": "Rework a", "intent": "Make a better."})
-	if status != http.StatusCreated {
-		t.Fatalf("POST changes = %d %s, want 201", status, raw)
-	}
-	var opened struct{ Number int64 }
-	if err := json.Unmarshal(raw, &opened); err != nil {
-		t.Fatal(err)
-	}
+	h := newChangeHub(t)
+	number := h.open(t, "feat", map[string]string{"api/a.go": "feat\n"})
 	ctx := context.Background()
-	if got, err := comp.InFlight(ctx, nil, "demo", "main"); err != nil || len(got) != 0 {
+	if got, err := h.comp.InFlight(ctx, nil, "demo", "main"); err != nil || len(got) != 0 {
 		t.Fatalf("in flight before a pass = %v, %v; want none", got, err)
 	}
 
-	if err := comp.Pass(ctx); err != nil {
+	if err := h.comp.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := comp.InFlight(ctx, nil, "demo", "main"); err != nil || !slices.Equal(got, []int64{opened.Number}) {
-		t.Errorf("in flight after a pass = %v, %v; want [%d]", got, err, opened.Number)
+	if got, err := h.comp.InFlight(ctx, nil, "demo", "main"); err != nil || !slices.Equal(got, []int64{number}) {
+		t.Errorf("in flight after a pass = %v, %v; want [%d]", got, err, number)
 	}
-	if got, err := comp.Files(ctx, nil, "demo", opened.Number); err != nil || !slices.Equal(got, []string{"api/a.go"}) {
+	if got, err := h.comp.Files(ctx, nil, "demo", number); err != nil || !slices.Equal(got, []string{"api/a.go"}) {
 		t.Errorf("files = %v, %v; want [api/a.go]", got, err)
 	}
 }

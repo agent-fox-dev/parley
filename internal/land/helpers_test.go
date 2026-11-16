@@ -20,6 +20,7 @@ import (
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
@@ -938,14 +939,21 @@ func (w *world) setMergeable(t *testing.T, number int64, value string, report js
 	})
 }
 
-// eventCount counts the hub's events.
+// eventCount counts the hub's events but the overlap announcements, which
+// the awareness worker writes in the background, not the request under test.
 func (w *world) eventCount(t *testing.T) int {
 	t.Helper()
 	recs, _, err := w.events.ReadAfter(context.Background(), 0, 100000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(recs)
+	n := 0
+	for _, r := range recs {
+		if r.Type != awareness.EventOverlap {
+			n++
+		}
+	}
+	return n
 }
 
 // patchChange sends PATCH of the change number of api with the body and
