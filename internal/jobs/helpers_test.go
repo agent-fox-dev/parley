@@ -121,6 +121,30 @@ func (f *fakeClock) WaitTimers(t testing.TB, n int) {
 	}
 }
 
+// WaitTimerAt waits until a timer that fires at at is pending on the clock,
+// so that a test knows the code under test waits for that moment. It fails
+// the test after 5 s.
+func (f *fakeClock) WaitTimerAt(t testing.TB, at time.Time) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		f.mu.Lock()
+		armed, changed := false, f.changed
+		for _, p := range f.timers {
+			armed = armed || p.at.Equal(at)
+		}
+		f.mu.Unlock()
+		if armed {
+			return
+		}
+		select {
+		case <-changed:
+		case <-deadline:
+			t.Fatalf("no timer for %v pending after 5 s", at)
+		}
+	}
+}
+
 // openStore opens the store of dir with the job table, closing it when the
 // test ends.
 func openStore(t testing.TB, dir string) *store.Store {
@@ -141,17 +165,64 @@ type testQueue struct {
 	*Queue
 	st    *store.Store
 	clock *fakeClock
+	// dir is the directory of the store.
+	dir string
 }
 
 // newTestQueue returns a queue over a new store in t.TempDir().
 func newTestQueue(t testing.TB) *testQueue {
 	t.Helper()
-	st := openStore(t, t.TempDir())
-	clock := newFakeClock(clockStart)
-	q := &testQueue{Queue: New(Deps{Store: st, Clock: clock, NoWake: true}), st: st, clock: clock}
+	return queueIn(t, t.TempDir(), newFakeClock(clockStart))
+}
+
+// queueIn returns a queue over the store of dir, on clock.
+func queueIn(t testing.TB, dir string, clock *fakeClock) *testQueue {
+	t.Helper()
+	st := openStore(t, dir)
+	q := &testQueue{Queue: New(Deps{Store: st, Clock: clock, NoWake: true}), st: st, clock: clock, dir: dir}
 	// Before the store closes: end the attempts a test left blocked.
 	t.Cleanup(func() { q.cancelAll(t) })
 	return q
+}
+
+// reopen abandons q as a process that stops at once leaves its queue: the
+// attempts it runs are neither ended nor settled, and its store is closed
+// under them. It returns a new queue over the store opened again from the
+// same directory, on the same clock.
+func (q *testQueue) reopen(t testing.TB) *testQueue {
+	t.Helper()
+	if err := q.st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	return queueIn(t, q.dir, q.clock)
+}
+
+// run starts the dispatcher of q on a goroutine of its own; stop cancels
+// its context, and stopped is closed once Run has returned.
+func (q *testQueue) run(t testing.TB) (stop context.CancelFunc, stopped <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		q.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		q.cancelAll(t)
+		waitClosed(t, done, "the dispatcher's stop")
+	})
+	return cancel, done
+}
+
+// returned reports whether c is closed.
+func returned(c <-chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
 }
 
 // cancelAll cancels every attempt the queue runs and waits until each has

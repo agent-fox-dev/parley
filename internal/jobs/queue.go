@@ -109,6 +109,9 @@ type worker struct {
 	// done is closed once the attempt has ended and its outcome is
 	// settled.
 	done chan struct{}
+	// abandoned is set, under the queue's lock, when a stop has given up
+	// on the attempt: its outcome is not settled.
+	abandoned bool
 }
 
 // ErrNotFound is the error of an operation on a job that does not exist.
@@ -327,15 +330,24 @@ func (q *Queue) drop(id string) {
 	q.poke()
 }
 
-// work runs the attempt of c and settles its outcome.
+// work runs the attempt of c and settles its outcome, unless a stop has
+// abandoned the attempt.
 func (q *Queue) work(d Deps, c claim) {
 	defer q.drop(c.job.ID)
 	err := runAttempt(c.ctx, c.handler, c.job)
+	q.mu.Lock()
+	abandoned := c.worker.abandoned
+	q.mu.Unlock()
+	if abandoned {
+		return
+	}
 	q.settle(context.WithoutCancel(c.ctx), d, c.handler, c.job.ID, err)
 }
 
 // Run is the dispatcher: it passes at once, then every Interval and
-// whenever it is woken, until ctx is cancelled.
+// whenever it is woken, until ctx is cancelled. Then it stops: it claims
+// nothing more and waits up to ShutdownGrace for the attempts that run
+// (stop).
 func (q *Queue) Run(ctx context.Context) {
 	d, err := q.deps()
 	if err != nil {
@@ -352,6 +364,7 @@ func (q *Queue) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			t.Stop()
+			q.stop(d)
 			return
 		case <-t.C():
 		case <-wake:
