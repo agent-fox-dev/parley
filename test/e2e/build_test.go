@@ -5,6 +5,7 @@ package e2e
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,16 @@ const moduleRoot = "../.."
 // linker and returns the binary's path.
 func build(t *testing.T, dir, pkg, version, commit, buildTime string) string {
 	t.Helper()
+	bin, err := buildProgram(dir, pkg, version, commit, buildTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// buildProgram is build without a test: the error says what go build
+// printed.
+func buildProgram(dir, pkg, version, commit, buildTime string) (string, error) {
 	const buildinfo = "github.com/agent-fox-dev/parley/internal/buildinfo"
 	bin := filepath.Join(dir, filepath.Base(pkg))
 	ldflags := strings.Join([]string{
@@ -30,9 +41,9 @@ func build(t *testing.T, dir, pkg, version, commit, buildTime string) string {
 	cmd := exec.Command("go", "build", "-ldflags", ldflags, "-o", bin, pkg)
 	cmd.Dir = moduleRoot
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go build %s: %v\n%s", pkg, err, out)
+		return "", fmt.Errorf("go build %s: %w\n%s", pkg, err, out)
 	}
-	return bin
+	return bin, nil
 }
 
 func TestBuild_RunsTheBuiltBinaries(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -31,11 +32,46 @@ type gitClient struct {
 	helper string
 }
 
-// newGitClient builds parley and returns the git client of the hub at hubURL
-// with credential.
+// helperBinary is the parley binary every git client of the test binary runs
+// as its credential helper. It is built once: a build per client cost the
+// package about a second each under the load of the whole suite.
+var helperBinary struct {
+	once sync.Once
+	// dir holds the binary; TestMain removes it.
+	dir, path string
+	err       error
+}
+
+// TestMain runs the package's tests and removes the credential helper they
+// built.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if helperBinary.dir != "" {
+		_ = os.RemoveAll(helperBinary.dir)
+	}
+	os.Exit(code)
+}
+
+// credentialHelper builds parley the first time a git client needs it and
+// returns the binary's path.
+func credentialHelper(t *testing.T) string {
+	t.Helper()
+	helperBinary.once.Do(func() {
+		helperBinary.dir, helperBinary.err = os.MkdirTemp("", "parley-e2e-")
+		if helperBinary.err == nil {
+			helperBinary.path, helperBinary.err = buildProgram(helperBinary.dir, "./cmd/parley", "dev", "none", "")
+		}
+	})
+	if helperBinary.err != nil {
+		t.Fatalf("build the credential helper: %v", helperBinary.err)
+	}
+	return helperBinary.path
+}
+
+// newGitClient returns the git client of the hub at hubURL with credential.
 func newGitClient(t *testing.T, hubURL, credential string) *gitClient {
 	t.Helper()
-	parley := build(t, t.TempDir(), "./cmd/parley", "dev", "none", "")
+	parley := credentialHelper(t)
 	return &gitClient{
 		env: []string{
 			"PATH=" + os.Getenv("PATH"),
