@@ -17,8 +17,9 @@ const policyHook = "policy"
 
 // composePolicy adds the landing policy: the schema of the policy
 // revisions and of the verdicts and check results it counts, the policy
-// routes, whose scope, binding and access the shared checks decide, and
-// the component, bound in a start hook to the store, to the workspace
+// routes and the route that records verdicts, whose scope, binding and
+// access the shared checks decide, and the component, bound in a start
+// hook to the store, to the workspace
 // records, to the users of the identity records, to the event component,
 // to the change component, to the workspaces' repositories, to the hub's
 // clock and to its logger. Its evidence source is the one that reads none

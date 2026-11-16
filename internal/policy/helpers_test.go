@@ -410,3 +410,73 @@ func asJSON(t *testing.T, v any) any {
 	}
 	return out
 }
+
+// pushed is a change of api opened by dana with her PAT patPush, which
+// holds git:write, changes:read, changes:write and changes:approve, so that
+// version 1 is created by that credential; patPushID is the PAT's id.
+type pushed struct {
+	number             int64
+	patPush, patPushID string
+}
+
+// openPushed opens a change of api from a new branch of base that adds the
+// file <branch>.txt, by dana with a new PAT patPush, with adjust run on the
+// input.
+func (w *world) openPushed(t *testing.T, branch string, adjust ...func(*change.OpenInput)) pushed {
+	t.Helper()
+	var p pushed
+	p.patPush, p.patPushID = w.IssuePATID(t, identity.PATSpec{UserID: w.dana,
+		Permissions: []string{"git:write", "changes:read", "changes:write", "changes:approve"}})
+	commit(t, w.api, branch, w.base, map[string]string{branch + ".txt": branch + "\n"})
+	byPAT := func(in *change.OpenInput) {
+		in.Caller = change.Caller{UserID: w.dana, Username: "dana", Credential: change.Credential{Type: change.CredentialPAT, ID: p.patPushID}}
+	}
+	p.number = w.open(t, "api", branch, append([]func(*change.OpenInput){byPAT}, adjust...)...).Number
+	return p
+}
+
+// approvalsPath is the path of the verdicts of the change number of api.
+func approvalsPath(number int64) string {
+	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/approvals"
+}
+
+// postVerdict sends body as a verdict on the change number of api with
+// credential.
+func (w *world) postVerdict(t *testing.T, number int64, credential string, body any) answer {
+	t.Helper()
+	return w.send(t, http.MethodPost, approvalsPath(number), credential, body, nil)
+}
+
+// count is the number of rows of the store table table.
+func (w *world) count(t *testing.T, table string) int {
+	t.Helper()
+	var n int
+	if err := w.Store.Main().QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// verdictIDs are the ids of the verdicts stored of the user on version
+// version of the change number of api.
+func (w *world) verdictIDs(t *testing.T, number, version int64, user string) []string {
+	t.Helper()
+	rows, err := w.Store.Main().Query(`SELECT id FROM change_approvals
+WHERE workspace_slug = 'api' AND number = ? AND version = ? AND user_id = ? ORDER BY id`, number, version, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
