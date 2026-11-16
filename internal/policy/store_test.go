@@ -3,6 +3,7 @@ package policy_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -50,6 +51,36 @@ func TestWorkspaceDeleted_DropsTheRevisionsOfTheWorkspaceOnly(t *testing.T) {
 		}
 		if _, found, err := policy.RevisionAt(ctx, s.Main(), slug, 1); err != nil || found != (want > 0) {
 			t.Errorf("revision 1 of %s found = %v, %v; want %v", slug, found, err, want > 0)
+		}
+	}
+}
+
+func TestReplace_KeepsTheFiftyHighestRevisions(t *testing.T) {
+	s, ctx, at := openStore(t), context.Background(), time.Now()
+	by := policy.Writer{ActorType: "admin_token"}
+	for slug, times := range map[string]int{"api": 52, "web": 50} {
+		for i := range times {
+			err := s.Tx(ctx, func(tx *sql.Tx) error {
+				rev, err := policy.Replace(ctx, tx, slug, policy.NeverSet, nil, by, at)
+				if err == nil && rev.Number != int64(i+1) {
+					err = errors.New("unexpected revision number")
+				}
+				return err
+			})
+			if err != nil {
+				t.Fatalf("replacement %d of %s: %v", i+1, slug, err)
+			}
+		}
+	}
+	for slug, kept := range map[string][2]int64{"api": {3, 52}, "web": {1, 50}} {
+		for n := int64(1); n <= kept[1]; n++ {
+			if _, found, err := policy.RevisionAt(ctx, s.Main(), slug, n); err != nil || found != (n >= kept[0]) {
+				t.Errorf("revision %d of %s found = %v, %v; want %v", n, slug, found, err, n >= kept[0])
+			}
+		}
+		var rows int
+		if err := s.Main().QueryRowContext(ctx, `SELECT count(*) FROM policy_revisions WHERE workspace_slug = ?`, slug).Scan(&rows); err != nil || rows != 50 {
+			t.Errorf("stored revisions of %s = %d, %v; want 50", slug, rows, err)
 		}
 	}
 }

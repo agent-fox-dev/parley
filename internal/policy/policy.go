@@ -13,6 +13,10 @@ type Deps struct {
 	Store *store.Store
 	// Workspaces reads the workspace records.
 	Workspaces WorkspaceReader
+	// Users answers whether the users a document names exist.
+	Users Users
+	// Events takes the policy events in the caller's transaction.
+	Events EventWriter
 	// Now is the hub's clock; nil is time.Now.
 	Now func() time.Time
 	// Logger is where the component logs; nil discards.

@@ -4,7 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"sync"
+
+	"github.com/agent-fox-dev/parley/internal/event"
 )
+
+// EventWriter takes the policy events in the caller's transaction, which an
+// error from it rolls back.
+type EventWriter interface {
+	Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error)
+}
 
 // Users is what the validator asks about the users a document names: whether
 // a user record with exactly that username exists, whatever its status. A

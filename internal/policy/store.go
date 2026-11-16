@@ -132,6 +132,41 @@ func InsertRevision(ctx context.Context, tx *sql.Tx, slug string, rev Revision) 
 	return nil
 }
 
+// keptRevisions is how many revisions of a workspace's policy are kept: a
+// replacement drops the ones below the highest keptRevisions in its own
+// transaction, so that no maintenance task is needed.
+const keptRevisions = 50
+
+// ErrRevisionMismatch is the answer of Replace when the revision the caller
+// expected is not the stored one.
+var ErrRevisionMismatch = errors.New("the policy's revision is not the one expected")
+
+// Replace stores doc in tx as the next revision of the workspace slug's
+// policy, written by by at at, drops the revisions that are no longer kept,
+// and returns the new revision. With ifMatch set and different from the
+// stored revision it writes nothing and returns ErrRevisionMismatch. The
+// read and the write are in tx, and the store runs one write transaction at
+// a time, so concurrent replacements get consecutive revisions and only one
+// of two with the same ifMatch is stored.
+func Replace(ctx context.Context, tx *sql.Tx, slug string, doc Document, ifMatch *int64, by Writer, at time.Time) (Revision, error) {
+	cur, err := CurrentRevision(ctx, tx, slug)
+	if err != nil {
+		return Revision{}, err
+	}
+	if ifMatch != nil && *ifMatch != cur.Number {
+		return Revision{}, ErrRevisionMismatch
+	}
+	rev := Revision{Number: cur.Number + 1, Document: doc, UpdatedAt: &at, UpdatedBy: &by}
+	if err := InsertRevision(ctx, tx, slug, rev); err != nil {
+		return Revision{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM policy_revisions WHERE workspace_slug = ? AND revision <= ?`,
+		slug, rev.Number-keptRevisions); err != nil {
+		return Revision{}, fmt.Errorf("drop the old policy revisions of %s: %w", slug, err)
+	}
+	return rev, nil
+}
+
 // scanRevision reads one row of selectRevision.
 func scanRevision(row *sql.Row) (Revision, error) {
 	var (

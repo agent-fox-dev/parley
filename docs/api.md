@@ -4884,6 +4884,83 @@ revision`; a value that is not a non-negative integer in decimal digits
 (empty, `-1`, `+1`, `1.5`, `abc`) is `400` `invalid_request` with the
 message `revision must be a non-negative integer`.
 
+### `PUT /api/v1/workspaces/{slug}/policy`
+
+Replaces the workspace's policy with the document in the body. Needs the
+scope `workspaces:write` and `owner` access: the workspace's owner or the
+admin token. The access refusals come before the body is read: a token
+without the scope is `403` `insufficient_scope`, an org member `403`
+`forbidden`, a token bound to a task fork of `{slug}` `403` `token_bound`
+(the route is not a contributor route), and a caller without access `404`
+`not_found`. The route takes a body of up to 1 MiB whatever
+`[server].max_body_size` says, so that a document over the format's limit
+reaches the validator.
+
+The body is the document, a JSON object:
+
+```json
+{"default":{"approvals":0},"rules":[{"name":"docs","paths":["docs/**","**/*.md"],"exclude":["docs/internal/**"],"require":{}},{"name":"billing","paths":["billing/**"],"targets":["main","release/*"],"require":{"approvals":1,"approvers":["owner","user:dana"],"checks":["test","billing-e2e"],"fresh_checks":true}},{"name":"secrets","paths":["deploy/secrets/**"],"require":{"block":true}}]}
+```
+
+| Member | Rule |
+|---|---|
+| the document | at most 65 536 bytes as sent |
+| `rules` | a list of at most 200 rules, in the order they are selected; absent is `[]` |
+| `default` | a requirement, the one of a file no rule selects; absent takes every member's default |
+| `name` | matches `^[a-z0-9][a-z0-9_-]{0,62}$`, is not `default`, and no earlier rule has it |
+| `paths` | a non-empty list of path globs, each 1 to 255 characters, not starting with `/` |
+| `exclude` | a list of path globs as `paths`; absent is `[]` |
+| `targets` | when present, a non-empty list of branch globs, each valid as a `protected_branches` entry; absent matches every branch |
+| `require` | a requirement, required on a rule |
+| `approvals` | an integer from 0 to 10; absent is `0` |
+| `approvers` | when present, a non-empty list of `owner`, `member` or `user:<username>` naming an existing user, whatever its status (as everywhere a user is selected, a value in UUID form is compared with the user's id and one with `@` with the e-mail); absent is `["owner"]` |
+| `checks` | a list of check names, each matching `^[a-z0-9][a-z0-9_.-]{0,62}$`; absent is `[]` |
+| `fresh_checks`, `block` | booleans; absent is `false` |
+
+The optional header `If-Match` names the revision the caller read, bare
+(`If-Match: 2`) or in double quotes as the `ETag` gives it (`If-Match:
+"2"`); without it the document replaces whatever revision is stored.
+
+The refusals after access come in this order, and each changes nothing:
+
+| Condition | Answer |
+|---|---|
+| `{slug}` is a task fork, whatever the body | `400` `not_supported_on_fork`, message `workspace "<slug>" is a task fork, which has no policy of its own; set the policy of its parent` |
+| the body is not one JSON object | `400` `invalid_request`, message `request body must be one JSON object` |
+| `If-Match` is not a non-negative integer, bare or in double quotes (`abc`, `-1`, `W/"1"`, several values) | `400` `invalid_request`, message `If-Match must be a policy revision, a non-negative integer, bare or in double quotes` |
+| the document breaks a rule above | `400` `invalid_policy` naming the first violation (below) |
+| the workspace is archived | `409` `workspace_archived`, message `workspace "<slug>" is archived` |
+| `If-Match` names another revision than the stored one | `412` `revision_mismatch`, message `the policy has been replaced since the revision named in If-Match; read it again` |
+
+A body over 65 536 bytes is refused as a document (`invalid_policy` with
+the field `document`) even when it is not JSON. The `invalid_policy`
+error carries `details` `{rule, index, field}`: `rule` is the rule's name,
+`default` for the default requirement, or `null` for the document as a
+whole and a rule without a usable name; `index` is the rule's zero-based
+position, `null` outside a rule; `field` is the member at fault, prefixed
+`require.` inside a rule's requirement and followed by `[i]` for one entry
+of a list. For example, a first rule `billing` asking for 11 approvals is
+
+```json
+{"error":{"code":400,"message":"invalid policy: rule \"billing\" (index 0), field require.approvals: must be an integer from 0 to 10","error_type":"invalid_policy","details":{"rule":"billing","index":0,"field":"require.approvals"}}}
+```
+
+and an unknown user in the default's approvers is `details`
+`{"rule":"default","index":null,"field":"approvers[0]"}`.
+
+A workspace in any other status (`pending`, `cloning`, `ready`, `failed`)
+takes the replacement. It stores the document's normal form as the stored
+revision plus 1, with the caller as `updated_by`, drops every revision
+numbered 50 or more below it (the 50 highest are kept), and records one
+`parley.policy.update` event with `resource_type` `policy`, `resource_id`
+the slug, the caller as actor and `metadata` `{"revision": <new
+revision>, "rules": <number of rules>}`, all in one transaction: a failure
+of any part stores nothing and is `500` `internal`. The answer is `200`
+with the policy object of the new revision and its `ETag`, as `GET`
+answers it. Replacements of one workspace run one at a time: two sent at
+once without `If-Match` get consecutive revisions, and of two with the
+same `If-Match` one is stored and the other is `412` `revision_mismatch`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
