@@ -3,6 +3,7 @@ package policy
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -121,7 +122,10 @@ func (c *Component) putCheck(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	p, _ := identity.PrincipalOf(ctx)
+	p, ok := identity.PrincipalOf(ctx)
+	if !ok {
+		return errors.New("a check report was reached without a caller")
+	}
 	by := writerOf(p)
 	var res checkResult
 	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
@@ -181,12 +185,9 @@ func parseCheck(body map[string]json.RawMessage) (checkRequest, error) {
 		(req.status != checkPending && req.status != checkPassed && req.status != checkFailed) {
 		return req, server.InvalidRequest("status must be pending, passed or failed")
 	}
-	if raw, given := body["summary"]; given {
-		var summary *string
-		if json.Unmarshal(raw, &summary) != nil || summary == nil || utf8.RuneCountInString(*summary) > maxSummaryChars {
-			return req, server.InvalidRequest(fmt.Sprintf("summary must be a string of at most %d characters", maxSummaryChars))
-		}
-		req.summary = *summary
+	var err error
+	if req.summary, err = optionalText(body, "summary", maxSummaryChars); err != nil {
+		return req, err
 	}
 	if raw, given := body["url"]; given {
 		if json.Unmarshal(raw, &req.url) != nil || req.url == nil || !webURL(*req.url) {
@@ -201,12 +202,8 @@ func parseCheck(body map[string]json.RawMessage) (checkRequest, error) {
 		}
 		req.details = raw
 	}
-	if raw, given := body["version"]; given {
-		if json.Unmarshal(raw, &req.version) != nil || req.version <= 0 {
-			return req, server.InvalidRequest("version must be a positive integer")
-		}
-	}
-	return req, nil
+	req.version, err = optionalVersion(body)
+	return req, err
 }
 
 // webURL reports whether s is an absolute http or https URL with a host, of

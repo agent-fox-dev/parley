@@ -30,6 +30,7 @@ func by(user, credType, credID string, version int64) verdict {
 }
 
 func TestCounts_ExcludesAVerdictGivenWithACredentialThatCreatedAVersionUpToItsOwn(t *testing.T) {
+	t.Parallel()
 	const pat, key = change.CredentialPAT, change.CredentialAPIKey
 	pool := approverPool{Owner: "alice", Members: map[string]bool{"alice": true, "bob": true}}
 	ownerOnly, ownerAndBob := []string{"owner"}, []string{"owner", "user:bob"}
@@ -65,6 +66,7 @@ func TestCounts_ExcludesAVerdictGivenWithACredentialThatCreatedAVersionUpToItsOw
 }
 
 func TestCounts_MatchesTheOwnerTheOrganizationsMembersAndExactUsernames(t *testing.T) {
+	t.Parallel()
 	pool := approverPool{Owner: "alice", Members: map[string]bool{"alice": true, "bob": true}}
 	hubOnly := creatorsOf([]change.Version{createdBy(1, "", "", "")})
 	for _, tc := range []struct {

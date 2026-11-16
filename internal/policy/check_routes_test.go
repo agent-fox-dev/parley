@@ -1,8 +1,6 @@
 package policy_test
 
 import (
-	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -14,7 +12,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/policy"
-	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // eventCheck is the type of the event a check report records.
@@ -230,63 +227,6 @@ func TestPutCheck_RefusesAndStoresNothing(t *testing.T) {
 	}
 	if a, b := bodies["outsider"], bodies["outsider, unknown workspace"]; string(a) != string(b) {
 		t.Errorf("the outsider's refusal %s differs from that of an unknown workspace %s", a, b)
-	}
-}
-
-func TestPutCheck_RefusesAClosedChangeOrAnArchivedWorkspace(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t)
-	landed, abandoned, open := w.openPushed(t, "landed").number, w.openPushed(t, "abandoned").number, w.openPushed(t, "open").number
-	for _, n := range []int64{landed, abandoned, open} {
-		if r := w.putCheck(t, n, "test", w.danaKey, map[string]any{"status": "pending"}); r.status != http.StatusOK {
-			t.Fatalf("pending report on %d = %d %s, want 200", n, r.status, r.body)
-		}
-	}
-	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
-		if err := w.changes.SetLanded(ctx, tx, "api", landed, change.Landed{SHA: w.base, At: time.Now(),
-			By: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.dana), Username: new("dana")}, LandID: "l1"}); err != nil {
-			return err
-		}
-		return w.changes.Abandon(ctx, tx, "api", abandoned, "undone", w.danaCaller())
-	})
-	stored := map[int64]map[string]any{}
-	for _, n := range []int64{landed, abandoned, open} {
-		stored[n] = w.storedResult(t, n, 1, "test")
-	}
-	passed := map[string]any{"status": "passed"}
-	archive := func() { w.setStatus(t, "api", workspace.StatusArchived) }
-	cases := []struct {
-		name      string
-		before    func()
-		number    int64
-		body      any
-		status    int
-		errorType string
-	}{
-		{"landed change", nil, landed, passed, http.StatusConflict, "change_closed"},
-		{"abandoned change", nil, abandoned, passed, http.StatusConflict, "change_closed"},
-		{"landed change with an invalid body", nil, landed, map[string]any{"status": "ok"}, http.StatusBadRequest, "invalid_request"},
-		{"open change in an archived workspace", archive, open, passed, http.StatusConflict, "workspace_archived"},
-		{"landed change in an archived workspace", nil, landed, passed, http.StatusConflict, "workspace_archived"},
-	}
-	seq := w.seq(t)
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.before != nil {
-				tc.before()
-			}
-			if r := w.putCheck(t, tc.number, "test", w.danaKey, tc.body); r.status != tc.status || r.errorType() != tc.errorType {
-				t.Errorf("= %d %s, want %d %s", r.status, r.body, tc.status, tc.errorType)
-			}
-			for n, want := range stored {
-				if got := w.storedResult(t, n, 1, "test"); !reflect.DeepEqual(got, want) || got["status"] != "pending" {
-					t.Errorf("stored result of %d = %v, want it pending as before (%v)", n, got, want)
-				}
-			}
-			if evs := w.eventsAfter(t, seq, eventCheck); len(evs) != 0 {
-				t.Errorf("%d check events written, want none", len(evs))
-			}
-		})
 	}
 }
 

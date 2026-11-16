@@ -169,7 +169,7 @@ func TestCarry_ANewVersionTakesTheVerdictsOfTheVersionItIsPatchEquivalentTo(t *t
 	}
 }
 
-func TestRecordApproval_OnAVersionTheCurrentOneIsPatchEquivalentToCarriesToTheCurrentOne(t *testing.T) {
+func TestRecordApproval_OnAVersionTheCurrentOneIsPatchEquivalentToCarriesToEveryVersionUpToIt(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	w.putPolicy(t, `{"default": {"approvals": 1, "approvers": ["owner"], "checks": []}}`)
@@ -185,21 +185,33 @@ func TestRecordApproval_OnAVersionTheCurrentOneIsPatchEquivalentToCarriesToTheCu
 		verdict string
 		version float64
 		status  string
-		// countsFor is what the copy on version 3 counts toward.
+		// carriedFrom is, for versions 2 and 3, the carried_from of dana's
+		// verdict there, nil for one given on that version itself.
+		carriedFrom [2]any
+		// countsFor is what the verdict on version 3 counts toward.
 		countsFor []any
 	}{
-		{"approve", 1, change.LandingReady, []any{"default"}},
-		{"reject", 2, change.LandingPending, []any{"default"}},
+		{"approve", 1, change.LandingReady, [2]any{1.0, 1.0}, []any{"default"}},
+		{"reject", 1, change.LandingPending, [2]any{1.0, 1.0}, []any{"default"}},
+		{"approve", 2, change.LandingReady, [2]any{nil, 2.0}, []any{"default"}},
+		{"reject", 2, change.LandingPending, [2]any{nil, 2.0}, []any{"default"}},
+		{"approve", 1, change.LandingReady, [2]any{1.0, 1.0}, []any{"default"}},
 	} {
 		r := w.postVerdict(t, p.number, w.danaKey, map[string]any{"verdict": s.verdict, "version": s.version})
-		if r.status != http.StatusCreated || r.json["version"] != s.version || r.json["carried_from"] != nil {
-			t.Errorf("%s version %v = %d %s, want 201 with the verdict on that version", s.verdict, s.version, r.status, r.body)
+		if (r.status != http.StatusCreated && r.status != http.StatusOK) || r.json["version"] != s.version || r.json["carried_from"] != nil {
+			t.Errorf("%s version %v = %d %s, want the verdict on that version", s.verdict, s.version, r.status, r.body)
 		}
-		cur := w.onVersion(t, p.number, 3)
-		if len(cur) != 1 || cur[0]["verdict"] != s.verdict || cur[0]["carried_from"] != s.version ||
-			cur[0]["by"].(map[string]any)["username"] != "dana" || !reflect.DeepEqual(cur[0]["counts_for"], s.countsFor) {
-			t.Errorf("after %s version %v, verdicts on version 3 = %v, want dana's %s carried from %v counting for %v",
-				s.verdict, s.version, cur, s.verdict, s.version, s.countsFor)
+		for i, version := range []int64{2, 3} {
+			on := w.onVersion(t, p.number, version)
+			if len(on) != 1 || on[0]["verdict"] != s.verdict || on[0]["carried_from"] != s.carriedFrom[i] ||
+				on[0]["by"].(map[string]any)["username"] != "dana" {
+				t.Errorf("after %s version %v, verdicts on version %d = %v, want dana's %s carried from %v",
+					s.verdict, s.version, version, on, s.verdict, s.carriedFrom[i])
+			}
+			if version == 3 && len(on) == 1 && !reflect.DeepEqual(on[0]["counts_for"], s.countsFor) {
+				t.Errorf("after %s version %v, dana's verdict on version 3 counts for %v, want %v",
+					s.verdict, s.version, on[0]["counts_for"], s.countsFor)
+			}
 		}
 		if l := w.landing(t, p.number); l["status"] != s.status {
 			t.Errorf("landing after %s version %v = %v, want %s", s.verdict, s.version, l, s.status)

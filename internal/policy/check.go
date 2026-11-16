@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"maps"
 	"slices"
 	"time"
 
@@ -76,15 +77,22 @@ ON CONFLICT (workspace_slug, number, version, name) DO UPDATE SET
 	return err
 }
 
-// checkColumns are the columns scanCheck reads, in its order.
+// checkColumns are the columns readChecks reads, in its order.
 const checkColumns = `workspace_slug, number, version, name, status, summary, url, details, actor_type, actor_id,
 username, updated_at`
 
 // readChecks is every result stored for the change number of the
-// workspace, on any version, read through q.
-func readChecks(ctx context.Context, q Querier, workspace string, number int64) ([]storedCheck, error) {
+// workspace on one of versions, read through q, as the list answers them.
+// Only the versions an equivalence chain names are read, so that the work
+// grows with the results that may apply rather than with every result the
+// change ever had.
+func readChecks(ctx context.Context, q Querier, workspace string, number int64, versions []int64) ([]storedCheck, error) {
+	in, err := json.Marshal(versions)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := q.QueryContext(ctx, `SELECT `+checkColumns+` FROM change_checks
-WHERE workspace_slug = ? AND number = ?`, workspace, number)
+WHERE workspace_slug = ? AND number = ? AND version IN (SELECT value FROM json_each(?))`, workspace, number, string(in))
 	if err != nil {
 		return nil, err
 	}
@@ -109,45 +117,99 @@ WHERE workspace_slug = ? AND number = ?`, workspace, number)
 	return out, rows.Err()
 }
 
-// applying is the result of the check name that applies to version of a
-// change whose versions are versions and whose stored results are results:
-// the one reported on that version, else the one on the nearest earlier
-// version it reaches through patch_equivalent_to. A result is not copied
-// when a version is recorded but looked up here, so that it keeps the
-// version it was reported on and a requirement with fresh_checks can tell
-// it from one reported on the version itself; given no versions, only the
-// version's own result applies.
-func applying(versions []change.Version, results []storedCheck, version int64, name string) (storedCheck, bool) {
-	for _, n := range equivalenceChain(versions, version) {
-		for _, r := range results {
-			if r.Version == n && r.Name == name {
-				return r, true
-			}
+// readCheckStatuses is the version, name and status of every result
+// stored for the change number of the workspace on one of versions for one
+// of the checks names, read through q: what the evaluator needs, without
+// the details a runner may have reported with each.
+func readCheckStatuses(ctx context.Context, q Querier, workspace string, number int64, versions []int64, names []string) ([]storedCheck, error) {
+	inVersions, err := json.Marshal(versions)
+	if err != nil {
+		return nil, err
+	}
+	inNames, err := json.Marshal(names)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT version, name, status FROM change_checks
+WHERE workspace_slug = ? AND number = ? AND version IN (SELECT value FROM json_each(?))
+AND name IN (SELECT value FROM json_each(?))`, workspace, number, string(inVersions), string(inNames))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []storedCheck
+	for rows.Next() {
+		s := storedCheck{Workspace: workspace, Number: number}
+		if err := rows.Scan(&s.Version, &s.Name, &s.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// checkIndex is the stored results of a change that may apply to one of
+// its versions, by check name, with the place in that version's
+// equivalence chain of each version they are on, 0 for the version itself.
+type checkIndex struct {
+	place  map[int64]int
+	byName map[string][]storedCheck
+}
+
+// indexChecks is results indexed for the version whose equivalence chain
+// is chain; a result on a version off the chain is left out, since it
+// cannot apply.
+func indexChecks(chain []int64, results []storedCheck) checkIndex {
+	x := checkIndex{place: make(map[int64]int, len(chain)), byName: map[string][]storedCheck{}}
+	for i, n := range chain {
+		x.place[n] = i
+	}
+	for _, r := range results {
+		if _, ok := x.place[r.Version]; ok {
+			x.byName[r.Name] = append(x.byName[r.Name], r)
 		}
 	}
-	return storedCheck{}, false
+	return x
+}
+
+// applying is the result of the check name that applies to the version x
+// was indexed for: the one reported on that version, else the one on the
+// nearest earlier version it reaches through patch_equivalent_to. A result
+// is not copied when a version is recorded but looked up here, so that it
+// keeps the version it was reported on and a requirement with fresh_checks
+// can tell it from one reported on the version itself; indexed for a chain
+// of the version alone, only the version's own result applies.
+func (x checkIndex) applying(name string) (storedCheck, bool) {
+	var (
+		best  storedCheck
+		found bool
+	)
+	for _, r := range x.byName[name] {
+		if !found || x.place[r.Version] < x.place[best.Version] {
+			best, found = r, true
+		}
+	}
+	return best, found
 }
 
 // listChecks is the results that apply to version of the change ch, one
 // per check name that has one, ordered by name, read through q and
 // answered as the routes answer them.
 func (c *Component) listChecks(ctx context.Context, q Querier, ch change.Change, version int64) ([]checkResult, error) {
-	results, err := readChecks(ctx, q, ch.WorkspaceSlug, ch.Number)
-	if err != nil || len(results) == 0 {
-		return []checkResult{}, err
-	}
 	versions, err := c.deps.Changes.ReadVersions(ctx, q, ch.WorkspaceSlug, ch.Number)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(results))
-	for _, r := range results {
-		names = append(names, r.Name)
+	chain := equivalenceChain(versions, version)
+	results, err := readChecks(ctx, q, ch.WorkspaceSlug, ch.Number, chain)
+	if err != nil {
+		return nil, err
 	}
-	slices.Sort(names)
-	out := []checkResult{}
-	for _, name := range slices.Compact(names) {
-		if r, ok := applying(versions, results, version, name); ok {
+	x := indexChecks(chain, results)
+	names := slices.Sorted(maps.Keys(x.byName))
+	out := make([]checkResult, 0, len(names))
+	for _, name := range names {
+		if r, ok := x.applying(name); ok {
 			out = append(out, checkOf(r))
 		}
 	}

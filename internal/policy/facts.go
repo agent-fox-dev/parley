@@ -2,8 +2,6 @@ package policy
 
 import (
 	"context"
-
-	"github.com/agent-fox-dev/parley/internal/change"
 )
 
 // Facts is the evidence source of the verdicts and check results the
@@ -56,26 +54,30 @@ func (f facts) Evidence(ctx context.Context, q Querier, in EvidenceQuery) (Evide
 
 // checkStatuses is the status of each check in.Checks names that has a
 // result applying to in.Version, read through q; a name with none is
-// left out, which the evaluator reads as pending. With in.FreshChecks
-// only a result reported on in.Version itself applies, so the versions
-// it reaches are not read.
+// left out, which the evaluator reads as pending. Only the named checks
+// on the versions of in.Version's equivalence chain are read; with
+// in.FreshChecks only a result reported on in.Version itself applies, so
+// the chain is that version alone and the versions are not read.
 func (f facts) checkStatuses(ctx context.Context, q Querier, in EvidenceQuery) (map[string]string, error) {
 	if len(in.Checks) == 0 {
 		return nil, nil
 	}
-	results, err := readChecks(ctx, q, in.Workspace, in.Number)
+	chain := []int64{in.Version}
+	if !in.FreshChecks {
+		versions, err := f.c.deps.Changes.ReadVersions(ctx, q, in.Workspace, in.Number)
+		if err != nil {
+			return nil, err
+		}
+		chain = equivalenceChain(versions, in.Version)
+	}
+	results, err := readCheckStatuses(ctx, q, in.Workspace, in.Number, chain, in.Checks)
 	if err != nil || len(results) == 0 {
 		return nil, err
 	}
-	var versions []change.Version
-	if !in.FreshChecks {
-		if versions, err = f.c.deps.Changes.ReadVersions(ctx, q, in.Workspace, in.Number); err != nil {
-			return nil, err
-		}
-	}
+	x := indexChecks(chain, results)
 	out := map[string]string{}
 	for _, name := range in.Checks {
-		if r, ok := applying(versions, results, in.Version, name); ok {
+		if r, ok := x.applying(name); ok {
 			out[name] = r.Status
 		}
 	}

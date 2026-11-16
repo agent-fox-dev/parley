@@ -65,9 +65,10 @@ type verdictRequest struct {
 // change the workspace does not have, a body that is not a valid verdict,
 // an archived workspace, a closed change and a version the change does not
 // have. A verdict on an earlier version that the current version is
-// patch-equivalent to is carried to the current version as well. The
-// verdict, its copy, the landing it re-evaluates and its event are written
-// in one store transaction, so that a failure of any of them writes none.
+// patch-equivalent to is carried to every version after it up to the
+// current one as well. The verdict, its copies, the landing it re-evaluates
+// and its event are written in one store transaction, so that a failure of
+// any of them writes none.
 func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 	ctx, slug := r.Context(), server.Param(r, "slug")
 	p, _ := identity.PrincipalOf(ctx)
@@ -111,7 +112,7 @@ func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 		if replaced, err = replaceVerdict(ctx, tx, v); err != nil {
 			return err
 		}
-		if err := c.carryToCurrent(ctx, tx, v, ch.Version); err != nil {
+		if err := c.carryForward(ctx, tx, v, ch.Version); err != nil {
 			return err
 		}
 		res, _, err := c.ReevaluateIn(ctx, tx, slug, number)
@@ -254,10 +255,18 @@ func (c *Component) readableChange(ctx context.Context, r *http.Request) (change
 	if err != nil {
 		return change.Change{}, err
 	}
-	if b, ok := access.BindingOf(r); ok && b.Relation == access.RelationParentOfBoundFork && ch.Source.WorkspaceSlug != b.Workspace {
+	if hiddenFromBoundFork(r, ch) {
 		return change.Change{}, change.ErrChangeNotFound
 	}
 	return ch, nil
+}
+
+// hiddenFromBoundFork reports whether the request's token is bound to a
+// task fork and calls on the fork's parent, where it reaches only the
+// changes whose source is the fork, and ch is not one of them.
+func hiddenFromBoundFork(r *http.Request, ch change.Change) bool {
+	b, ok := access.BindingOf(r)
+	return ok && b.Relation == access.RelationParentOfBoundFork && ch.Source.WorkspaceSlug != b.Workspace
 }
 
 // queriedVersion is the version of the change ch that the request's query
@@ -321,19 +330,43 @@ func parseVerdict(body map[string]json.RawMessage) (verdictRequest, error) {
 	if json.Unmarshal(body["verdict"], &req.verdict) != nil || (req.verdict != verdictApprove && req.verdict != verdictReject) {
 		return req, server.InvalidRequest("verdict must be approve or reject")
 	}
-	if raw, given := body["comment"]; given {
-		var comment *string
-		if json.Unmarshal(raw, &comment) != nil || comment == nil || utf8.RuneCountInString(*comment) > maxCommentChars {
-			return req, server.InvalidRequest(fmt.Sprintf("comment must be a string of at most %d characters", maxCommentChars))
-		}
-		req.comment = *comment
+	var err error
+	if req.comment, err = optionalText(body, "comment", maxCommentChars); err != nil {
+		return req, err
 	}
-	if raw, given := body["version"]; given {
-		if json.Unmarshal(raw, &req.version) != nil || req.version <= 0 {
-			return req, server.InvalidRequest("version must be a positive integer")
-		}
+	if req.version, err = optionalVersion(body); err != nil {
+		return req, err
 	}
 	return req, nil
+}
+
+// optionalText is the string member name of body, "" when the body has
+// none, refused with 400 invalid_request when it is not a string of at
+// most limit code points.
+func optionalText(body map[string]json.RawMessage, name string, limit int) (string, error) {
+	raw, given := body[name]
+	if !given {
+		return "", nil
+	}
+	var text *string
+	if json.Unmarshal(raw, &text) != nil || text == nil || utf8.RuneCountInString(*text) > limit {
+		return "", server.InvalidRequest(fmt.Sprintf("%s must be a string of at most %d characters", name, limit))
+	}
+	return *text, nil
+}
+
+// optionalVersion is the member version of body, 0 when the body has none,
+// refused with 400 invalid_request when it is not a positive integer.
+func optionalVersion(body map[string]json.RawMessage) (int64, error) {
+	raw, given := body["version"]
+	if !given {
+		return 0, nil
+	}
+	var version int64
+	if json.Unmarshal(raw, &version) != nil || version <= 0 {
+		return 0, server.InvalidRequest("version must be a positive integer")
+	}
+	return version, nil
 }
 
 // positive is s as a positive integer in decimal digits, and false for

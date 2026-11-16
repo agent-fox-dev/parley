@@ -110,13 +110,15 @@ func TestPostApproval_StoresTheVerdictOnTheNamedOrCurrentVersion(t *testing.T) {
 
 func TestPostApproval_ReplacesTheUsersVerdictOnTheVersion(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t)
+	clock := &stepClock{at: time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)}
+	w := newWorld(t, func(d *policy.Deps) { d.Now = clock.now })
 	n := w.openPushed(t, "work").number
 	melPAT := w.IssuePAT(t, identity.PATSpec{UserID: w.mel, Permissions: []string{"changes:approve"}})
 	first := w.postVerdict(t, n, w.melKey, map[string]any{"verdict": "approve"})
 	if first.status != http.StatusCreated {
 		t.Fatalf("first verdict = %d %s, want 201", first.status, first.body)
 	}
+	clock.tick()
 	second := w.postVerdict(t, n, melPAT, map[string]any{"verdict": "reject", "comment": "broke the build"})
 	if second.status != http.StatusOK {
 		t.Fatalf("second verdict = %d %s, want 200", second.status, second.body)
@@ -124,6 +126,11 @@ func TestPostApproval_ReplacesTheUsersVerdictOnTheVersion(t *testing.T) {
 	if second.json["id"] == first.json["id"] || second.json["verdict"] != "reject" ||
 		second.json["comment"] != "broke the build" || second.json["carried_from"] != nil {
 		t.Errorf("second verdict = %s, want a new id, reject, its comment and carried_from null (first %s)", second.body, first.body)
+	}
+	firstAt, err1 := time.Parse(time.RFC3339, first.json["created_at"].(string))
+	secondAt, err2 := time.Parse(time.RFC3339, second.json["created_at"].(string))
+	if err1 != nil || err2 != nil || !secondAt.After(firstAt) {
+		t.Errorf("second verdict created_at %v, want after the first's %v", second.json["created_at"], first.json["created_at"])
 	}
 	if ids := w.listedIDs(t, n, w.danaKey); !reflect.DeepEqual(ids, []string{second.json["id"].(string)}) {
 		t.Errorf("listed verdicts = %v, want only %v", ids, second.json["id"])
@@ -200,55 +207,6 @@ func TestPostApproval_RefusesAndStoresNothing(t *testing.T) {
 	}
 	if a, b := bodies["outsider"], bodies["outsider, unknown workspace"]; string(a) != string(b) {
 		t.Errorf("the outsider's refusal %s differs from that of an unknown workspace %s", a, b)
-	}
-}
-
-func TestPostApproval_RefusesAClosedChangeOrAnArchivedWorkspace(t *testing.T) {
-	t.Parallel()
-	w := newWorld(t)
-	landed, abandoned, open := w.openPushed(t, "landed").number, w.openPushed(t, "abandoned").number, w.openPushed(t, "open").number
-	if r := w.postVerdict(t, landed, w.melKey, map[string]any{"verdict": "approve"}); r.status != http.StatusCreated {
-		t.Fatalf("mel's verdict = %d %s, want 201", r.status, r.body)
-	}
-	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
-		if err := w.changes.SetLanded(ctx, tx, "api", landed, change.Landed{SHA: w.base, At: time.Now(),
-			By: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.dana), Username: new("dana")}, LandID: "l1"}); err != nil {
-			return err
-		}
-		return w.changes.Abandon(ctx, tx, "api", abandoned, "undone", w.danaCaller())
-	})
-	approve := map[string]any{"verdict": "approve"}
-	archive := func() { w.setStatus(t, "api", workspace.StatusArchived) }
-	cases := []struct {
-		name      string
-		before    func()
-		number    int64
-		body      any
-		status    int
-		errorType string
-	}{
-		{"landed change", nil, landed, approve, http.StatusConflict, "change_closed"},
-		{"abandoned change", nil, abandoned, approve, http.StatusConflict, "change_closed"},
-		{"landed change with an invalid body", nil, landed, map[string]any{"verdict": "maybe"}, http.StatusBadRequest, "invalid_request"},
-		{"open change in an archived workspace", archive, open, approve, http.StatusConflict, "workspace_archived"},
-		{"landed change in an archived workspace", nil, landed, approve, http.StatusConflict, "workspace_archived"},
-	}
-	seq := w.seq(t)
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.before != nil {
-				tc.before()
-			}
-			if r := w.postVerdict(t, tc.number, w.danaKey, tc.body); r.status != tc.status || r.errorType() != tc.errorType {
-				t.Errorf("= %d %s, want %d %s", r.status, r.body, tc.status, tc.errorType)
-			}
-			if got := w.count(t, "change_approvals"); got != 1 {
-				t.Errorf("%d verdicts stored, want mel's one as before", got)
-			}
-			if evs := w.verdictEvents(t, seq); len(evs) != 0 {
-				t.Errorf("%d verdict events written, want none", len(evs))
-			}
-		})
 	}
 }
 
@@ -465,6 +423,39 @@ func TestDeleteApproval_WithdrawsOnlyThatVerdict(t *testing.T) {
 			}
 		})
 	}
+
+	// A pure rebase carries dana's and mel's verdicts on version 1 to
+	// version 2; withdrawing one copy of a verdict leaves the other.
+	if v := w.postVerdict(t, n, w.melKey, map[string]any{"verdict": "approve"}); v.status != http.StatusCreated {
+		t.Fatalf("mel's verdict = %d %s, want 201", v.status, v.body)
+	}
+	w.record(t, "work", w.rebased(t, "work", map[string]string{"work.txt": "work\n"}), change.KindRebase, w.danaCaller())
+	onOne, onTwo := byUsername(w.onVersion(t, n, 1)), byUsername(w.onVersion(t, n, 2))
+	if len(onOne) != 2 || len(onTwo) != 2 {
+		t.Fatalf("verdicts on version 1 %v and on version 2 %v, want dana's and mel's on each", onOne, onTwo)
+	}
+	for _, tc := range []struct {
+		name string
+		// withdrawn is the verdict withdrawn, kept the copy that stays.
+		withdrawn, kept map[string]any
+	}{
+		{"dana's verdict on version 1 leaves its copy on version 2", onOne["dana"], onTwo["dana"]},
+		{"mel's copy on version 2 leaves the verdict on version 1", onTwo["mel"], onOne["mel"]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if r := w.withdraw(t, n, tc.withdrawn["id"].(string), w.danaKey); r.status != http.StatusNoContent {
+				t.Fatalf("withdraw = %d %s, want 204", r.status, r.body)
+			}
+			withdrawn := byUsername(w.onVersion(t, n, int64(tc.withdrawn["version"].(float64))))[tc.withdrawn["by"].(map[string]any)["username"].(string)]
+			if withdrawn != nil {
+				t.Errorf("after the withdrawal the withdrawn verdict is still listed: %v", withdrawn)
+			}
+			kept := byUsername(w.onVersion(t, n, int64(tc.kept["version"].(float64))))[tc.kept["by"].(map[string]any)["username"].(string)]
+			if kept == nil || kept["id"] != tc.kept["id"] {
+				t.Errorf("after the withdrawal the kept verdict = %v, want %v", kept, tc.kept)
+			}
+		})
+	}
 }
 
 func TestDeleteApproval_RefusesACallerWhoMayNotWithdraw(t *testing.T) {
@@ -507,7 +498,7 @@ func TestDeleteApproval_RefusesAndRemovesNothing(t *testing.T) {
 	w := newWorld(t)
 	ids := map[int64]string{}
 	numbers := map[string]int64{}
-	for _, b := range []string{"one", "two", "landed", "abandoned"} {
+	for _, b := range []string{"one", "two"} {
 		numbers[b] = w.openPushed(t, b).number
 		r := w.postVerdict(t, numbers[b], w.melKey, map[string]any{"verdict": "approve"})
 		if r.status != http.StatusCreated {
@@ -515,36 +506,21 @@ func TestDeleteApproval_RefusesAndRemovesNothing(t *testing.T) {
 		}
 		ids[numbers[b]] = r.json["id"].(string)
 	}
-	one, landed, abandoned := numbers["one"], numbers["landed"], numbers["abandoned"]
-	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
-		if err := w.changes.SetLanded(ctx, tx, "api", landed, change.Landed{SHA: w.base, At: time.Now(),
-			By: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.dana), Username: new("dana")}, LandID: "l1"}); err != nil {
-			return err
-		}
-		return w.changes.Abandon(ctx, tx, "api", abandoned, "undone", w.danaCaller())
-	})
+	one := numbers["one"]
 	cases := []struct {
 		name      string
-		before    func()
 		number    int64
 		id        string
 		status    int
 		errorType string
 	}{
-		{"a random UUID", nil, one, uuid.NewV4().String(), http.StatusNotFound, "not_found"},
-		{"not a UUID", nil, one, "not-a-uuid", http.StatusNotFound, "not_found"},
-		{"a verdict of another change", nil, one, ids[numbers["two"]], http.StatusNotFound, "not_found"},
-		{"a landed change", nil, landed, ids[landed], http.StatusConflict, "change_closed"},
-		{"an abandoned change", nil, abandoned, ids[abandoned], http.StatusConflict, "change_closed"},
-		{"an unknown change", nil, 99, ids[one], http.StatusNotFound, "change_not_found"},
-		{"an archived workspace", func() { w.setStatus(t, "api", workspace.StatusArchived) }, one, ids[one],
-			http.StatusConflict, "workspace_archived"},
+		{"a random UUID", one, uuid.NewV4().String(), http.StatusNotFound, "not_found"},
+		{"not a UUID", one, "not-a-uuid", http.StatusNotFound, "not_found"},
+		{"a verdict of another change", one, ids[numbers["two"]], http.StatusNotFound, "not_found"},
+		{"an unknown change", 99, ids[one], http.StatusNotFound, "change_not_found"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.before != nil {
-				tc.before()
-			}
 			if r := w.withdraw(t, tc.number, tc.id, w.danaKey); r.status != tc.status || r.errorType() != tc.errorType {
 				t.Errorf("= %d %s, want %d %s", r.status, r.body, tc.status, tc.errorType)
 			}
@@ -552,6 +528,111 @@ func TestDeleteApproval_RefusesAndRemovesNothing(t *testing.T) {
 				t.Errorf("%d verdicts stored, want the %d as before", got, len(ids))
 			}
 		})
+	}
+}
+
+func TestEvidenceWrites_RefuseAClosedChangeOrAnArchivedWorkspace(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	landed, abandoned, open := w.openPushed(t, "landed").number, w.openPushed(t, "abandoned").number, w.openPushed(t, "open").number
+	verdicts := map[int64]string{}
+	for _, n := range []int64{landed, abandoned, open} {
+		v := w.postVerdict(t, n, w.melKey, map[string]any{"verdict": "approve"})
+		if v.status != http.StatusCreated {
+			t.Fatalf("mel's verdict on %d = %d %s, want 201", n, v.status, v.body)
+		}
+		verdicts[n] = v.json["id"].(string)
+		if r := w.putCheck(t, n, "test", w.danaKey, map[string]any{"status": "pending"}); r.status != http.StatusOK {
+			t.Fatalf("pending report on %d = %d %s, want 200", n, r.status, r.body)
+		}
+	}
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		if err := w.changes.SetLanded(ctx, tx, "api", landed, change.Landed{SHA: w.base, At: time.Now(),
+			By: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.dana), Username: new("dana")}, LandID: "l1"}); err != nil {
+			return err
+		}
+		return w.changes.Abandon(ctx, tx, "api", abandoned, "undone", w.danaCaller())
+	})
+	stored := map[int64]map[string]any{}
+	for _, n := range []int64{landed, abandoned, open} {
+		stored[n] = w.storedResult(t, n, 1, "test")
+	}
+	// Each write route is sent, as dana, a valid body or, when invalid is
+	// set, one it refuses; the withdrawal has no body and names mel's
+	// verdict on the change.
+	routes := []struct {
+		name string
+		send func(number int64, invalid bool) answer
+		// hasBody is false for a route whose request has no body.
+		hasBody bool
+	}{
+		{"POST approvals", func(number int64, invalid bool) answer {
+			body := map[string]any{"verdict": "approve"}
+			if invalid {
+				body["verdict"] = "maybe"
+			}
+			return w.postVerdict(t, number, w.danaKey, body)
+		}, true},
+		{"PUT checks", func(number int64, invalid bool) answer {
+			body := map[string]any{"status": "passed"}
+			if invalid {
+				body["status"] = "ok"
+			}
+			return w.putCheck(t, number, "test", w.danaKey, body)
+		}, true},
+		{"DELETE approvals", func(number int64, _ bool) answer {
+			return w.withdraw(t, number, verdicts[number], w.danaKey)
+		}, false},
+	}
+	cases := []struct {
+		name string
+		// archived is whether the workspace is archived first; the cases
+		// that archive it come last.
+		archived, invalid bool
+		number            int64
+		status            int
+		errorType         string
+	}{
+		{"landed change", false, false, landed, http.StatusConflict, "change_closed"},
+		{"abandoned change", false, false, abandoned, http.StatusConflict, "change_closed"},
+		{"landed change with an invalid body", false, true, landed, http.StatusBadRequest, "invalid_request"},
+		{"open change in an archived workspace", true, false, open, http.StatusConflict, "workspace_archived"},
+		{"landed change in an archived workspace", true, false, landed, http.StatusConflict, "workspace_archived"},
+	}
+	seq := w.seq(t)
+	for _, tc := range cases {
+		if tc.archived {
+			w.setStatus(t, "api", workspace.StatusArchived)
+		}
+		for _, route := range routes {
+			if tc.invalid && !route.hasBody {
+				continue
+			}
+			t.Run(route.name+", "+tc.name, func(t *testing.T) {
+				if r := route.send(tc.number, tc.invalid); r.status != tc.status || r.errorType() != tc.errorType {
+					t.Errorf("= %d %s, want %d %s", r.status, r.body, tc.status, tc.errorType)
+				}
+				if got := w.count(t, "change_approvals"); got != len(verdicts) {
+					t.Errorf("%d verdicts stored, want mel's %d as before", got, len(verdicts))
+				}
+				for n, id := range verdicts {
+					if ids := w.verdictIDs(t, n, 1, w.mel); !reflect.DeepEqual(ids, []string{id}) {
+						t.Errorf("mel's verdicts on %d = %v, want [%s] as before", n, ids, id)
+					}
+				}
+				for n, want := range stored {
+					if got := w.storedResult(t, n, 1, "test"); !reflect.DeepEqual(got, want) || got["status"] != "pending" {
+						t.Errorf("stored result of %d = %v, want it pending as before (%v)", n, got, want)
+					}
+				}
+				if evs := w.verdictEvents(t, seq); len(evs) != 0 {
+					t.Errorf("%d verdict events written, want none", len(evs))
+				}
+				if evs := w.eventsAfter(t, seq, eventCheck); len(evs) != 0 {
+					t.Errorf("%d check events written, want none", len(evs))
+				}
+			})
+		}
 	}
 }
 

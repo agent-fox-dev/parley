@@ -7,6 +7,7 @@ import (
 )
 
 func TestApplying_IsTheOwnResultElseTheNearestOneThroughPatchEquivalence(t *testing.T) {
+	t.Parallel()
 	versions := []change.Version{{Number: 1}, {Number: 2, PatchEquivalentTo: new(int64(1))},
 		{Number: 3, PatchEquivalentTo: new(int64(2))}, {Number: 4}, {Number: 5, PatchEquivalentTo: new(int64(4))},
 		{Number: 6, PatchEquivalentTo: new(int64(3))}}
@@ -36,7 +37,7 @@ func TestApplying_IsTheOwnResultElseTheNearestOneThroughPatchEquivalence(t *test
 		{"test on 6 with a pending result on 3 is that one", ownPending, 6, "test", 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := applying(versions, tc.results, tc.version, tc.check)
+			got, ok := indexChecks(equivalenceChain(versions, tc.version), tc.results).applying(tc.check)
 			if !ok {
 				if tc.want != 0 {
 					t.Fatalf("no applying result, want the one on %d", tc.want)

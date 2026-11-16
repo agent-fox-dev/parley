@@ -5157,8 +5157,8 @@ zero approvals still lists in `counts_for` the verdicts that would count.
 **Carry-over.** When a version is recorded with `patch_equivalent_to`
 naming an earlier version, every verdict on that version is copied to the
 new one in the transaction that records it, with a new `id` and
-`carried_from` set, and the change is evaluated again; no event is written
-for the copies. A version that is not patch-equivalent starts with no
+`carried_from` set, and the change is evaluated again when any was
+copied; no event is written for the copies. A version that is not patch-equivalent starts with no
 verdicts. Check results are not copied: they are looked up through
 `patch_equivalent_to` when read (below).
 
@@ -5187,8 +5187,9 @@ with the approval; a later one by the same user on the same version, with
 any of the user's credentials, replaces it and is answered `200`: a new
 `id`, a new `created_at`, `carried_from` `null`. A verdict on an earlier
 version that the current version reaches through `patch_equivalent_to` is
-also copied to the current version, replacing the user's verdict there,
-with `carried_from` the named version; the answer is the verdict on the
+also copied to every version from the named one to the current one,
+replacing the user's verdict on each, with `carried_from` the named
+version; the answer is the verdict on the
 named version. A verdict on any other version is recorded and changes
 nothing. In the same transaction the change is evaluated again and one
 `parley.change.approve` or `parley.change.reject` event is written:

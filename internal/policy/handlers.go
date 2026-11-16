@@ -222,7 +222,7 @@ func (c *Component) evaluatePolicy(w http.ResponseWriter, r *http.Request) error
 		if err != nil {
 			return err
 		}
-		if b, ok := access.BindingOf(r); ok && b.Relation == access.RelationParentOfBoundFork && ch.Source.WorkspaceSlug != b.Workspace {
+		if hiddenFromBoundFork(r, ch) {
 			return change.ErrChangeNotFound
 		}
 		base := ""

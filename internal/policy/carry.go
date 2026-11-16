@@ -50,21 +50,31 @@ func (o carrier) VersionRecorded(ctx context.Context, tx *sql.Tx, ch change.Chan
 	return err
 }
 
-// carryToCurrent copies v, just recorded on an earlier version of its
-// change, onto the change's current version current, in place of the
-// verdict v's user had there, when current reaches v's version through
-// patch_equivalent_to: v still applies to the current version, and only
-// the verdicts on that version count toward its landing.
-func (c *Component) carryToCurrent(ctx context.Context, tx *sql.Tx, v storedVerdict, current int64) error {
+// carryForward copies v, just recorded on an earlier version of its
+// change, onto every version from the one after v's up to the change's
+// current version current, in place of the verdict v's user had on each,
+// when current reaches v's version through patch_equivalent_to: v still
+// applies to each of them, and a land of any of them is judged with that
+// version's own verdicts, so none may keep a copy v replaced.
+func (c *Component) carryForward(ctx context.Context, tx *sql.Tx, v storedVerdict, current int64) error {
 	if v.Version == current {
 		return nil
 	}
 	versions, err := c.deps.Changes.ReadVersions(ctx, tx, v.Workspace, v.Number)
-	if err != nil || !slices.Contains(equivalenceChain(versions, current), v.Version) {
+	if err != nil {
 		return err
 	}
-	_, err = replaceVerdict(ctx, tx, carriedTo(v, current, v.origin()))
-	return err
+	chain := equivalenceChain(versions, current)
+	i := slices.Index(chain, v.Version)
+	if i < 0 {
+		return nil
+	}
+	for _, n := range chain[:i] {
+		if _, err := replaceVerdict(ctx, tx, carriedTo(v, n, v.origin())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // origin is the version v was first given on: the one it was carried

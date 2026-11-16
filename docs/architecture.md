@@ -4839,7 +4839,11 @@ read through the caller's querier (`newCounter`).
   whether a counted `reject` is there, and the status of each named check
   whose result applies to it (`applying`, `check.go`: the version's own
   result, else the nearest one through `patch_equivalent_to`, walked by
-  `equivalenceChain`; with `FreshChecks` the version's own only).
+  `equivalenceChain`; with `FreshChecks` the version's own only). It reads
+  only the version, name and status of the named checks on the versions of
+  that chain (`readCheckStatuses`); the list reads the results of the chain
+  once and indexes them by name (`indexChecks`), so both grow with the
+  results that may apply.
 - `VersionObserver()` (`carry.go`) reads the recorded version as stored
   in the version's transaction, since the stack linker may have
   recomputed its `patch_equivalent_to`, copies every verdict of the version
@@ -4847,8 +4851,9 @@ read through the caller's querier (`newCounter`).
   `carried_from` or version), and runs `ReevaluateIn` when it copied any,
   because the change component stored the landing before telling its
   observers. A verdict recorded on an earlier version that the current
-  version reaches is copied to the current version by the route
-  (`carryToCurrent`).
+  version reaches is copied by the route to every version from the named
+  one to the current one, replacing the user's verdict on each
+  (`carryForward`).
 - `ExpandApprovals` and `ExpandChecks` (`expand.go`) serve the includes
   with the lists of the routes (`listApprovals`, `listChecks`), read
   through `Store.Main()` since an expander is given no transaction.
