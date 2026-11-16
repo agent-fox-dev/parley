@@ -499,6 +499,55 @@ func TestRun_FailsTheBackupWithOneLineAndRemovesWhatItWrote(t *testing.T) {
 	}
 }
 
+func TestCopyTree_LeavesOutWhatIsRemovedWhileItCopies(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		create func(t *testing.T, path string)
+	}{
+		{"a file", func(t *testing.T, path string) { writeFile(t, path, "lock") }},
+		{"a directory", func(t *testing.T, path string) { writeFile(t, filepath.Join(path, "inner"), "x") }},
+		{"a symbolic link", func(t *testing.T, path string) {
+			if err := os.Symlink("kept", path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			src := filepath.Join(t.TempDir(), "src")
+			writeFile(t, filepath.Join(src, "a", "file"), "a")
+			tc.create(t, filepath.Join(src, "b.lock"))
+			writeFile(t, filepath.Join(src, "kept"), "kept")
+			dst := filepath.Join(t.TempDir(), "dst")
+
+			// The walk has listed src when it reaches a: b.lock is removed
+			// after it was listed and before it is copied, as git removes
+			// a lock file while a running hub is backed up.
+			err := hub.CopyTree(src, dst, func(path string) bool {
+				if filepath.Base(path) == "a" {
+					if err := os.RemoveAll(filepath.Join(src, "b.lock")); err != nil {
+						t.Error(err)
+					}
+				}
+				return false
+			})
+
+			if err != nil {
+				t.Fatalf("copy = %v, want nil", err)
+			}
+			if got, want := dirNames(t, dst), []string{"a", "kept"}; !slices.Equal(got, want) {
+				t.Errorf("the copy holds %v, want %v", got, want)
+			}
+			for _, name := range []string{"a/file", "kept"} {
+				if _, err := os.Stat(filepath.Join(dst, name)); err != nil {
+					t.Errorf("the copy lacks %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
 func TestRun_BacksUpWithoutStartingAnythingOrWritingToTheDataOrConfigDirectory(t *testing.T) {
 	t.Parallel()
 	d := startDataHub(t).stopped(t)

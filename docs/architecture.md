@@ -650,7 +650,11 @@ the first failure:
    permission bits and symbolic links; the `objects` directory of each git
    directory (one that holds a `HEAD` file) is copied after the rest of the
    tree, so its refs, `packed-refs` and `HEAD` are read before its objects
-   and every copied ref points at a copied object.
+   and every copied ref points at a copied object. A file, symbolic link or
+   directory removed after its directory was listed and before it is copied
+   (git creates and removes lock and temporary files while a hub runs) is
+   left out, as if the snapshot were taken after its removal; any other
+   error of the copy fails the backup.
 
 A failure after the target was created or written to removes what the
 backup wrote (the target itself when it created it, else its entries) and

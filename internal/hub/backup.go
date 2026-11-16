@@ -183,18 +183,31 @@ func copyWorkspaceRoot(root, dst string) error {
 }
 
 // copyTree copies the directory src to dst, which must not exist, leaving
-// out the directories below src that deferred reports true for. The error names the path that
-// failed.
+// out the directories below src that deferred reports true for. An entry
+// below src that is removed after its directory was listed and before it is
+// copied is left out: git creates and removes lock and temporary files in a
+// repository while a running hub is backed up, and the snapshot is then as
+// if taken after the removal. The error names the path that failed.
 func copyTree(src, dst string, deferred func(path string) bool) error {
 	return filepath.WalkDir(src, func(path string, e fs.DirEntry, err error) error {
-		if err != nil {
-			return fmt.Errorf("copy %s: %w", path, err)
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
+		rel, relErr := filepath.Rel(src, path)
+		if relErr != nil {
+			return relErr
 		}
 		to := filepath.Join(dst, rel)
+		if err != nil {
+			if path != src && removed(path) {
+				// A directory that could not be read was created in dst
+				// before; it is left out with what it held.
+				if e != nil && e.IsDir() {
+					if err := os.RemoveAll(to); err != nil {
+						return fmt.Errorf("copy %s: %w", path, err)
+					}
+				}
+				return nil
+			}
+			return fmt.Errorf("copy %s: %w", path, err)
+		}
 		switch {
 		case e.IsDir():
 			if path != src && deferred(path) {
@@ -209,12 +222,12 @@ func copyTree(src, dst string, deferred func(path string) bool) error {
 			if err == nil {
 				err = os.Symlink(link, to)
 			}
-			if err != nil {
+			if err != nil && !removed(path) {
 				return fmt.Errorf("copy %s: %w", path, err)
 			}
 			return nil
 		case e.Type().IsRegular():
-			if err := copyFile(path, to); err != nil {
+			if err := copyFile(path, to); err != nil && !removed(path) {
 				return fmt.Errorf("copy %s: %w", path, err)
 			}
 			return nil
@@ -222,6 +235,12 @@ func copyTree(src, dst string, deferred func(path string) bool) error {
 			return fmt.Errorf("copy %s: not a regular file, directory or symbolic link", path)
 		}
 	})
+}
+
+// removed reports whether path no longer exists.
+func removed(path string) bool {
+	_, err := os.Lstat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // copyFile copies the regular file src to the new file dst with the same
