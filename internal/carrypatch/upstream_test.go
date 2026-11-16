@@ -252,8 +252,11 @@ func TestFetchUpstream_StopsAtDeadline(t *testing.T) {
 	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The deadline leaves git time to start and reach the upstream also on
+	// a loaded machine, where 200 ms did not.
+	const deadline = time.Second
 	f := newUpstreamFixture(t, srv.URL+"/upstream.git", []string{"GIT_SSL_CAINFO=" + ca},
-		secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, 200*time.Millisecond)
+		secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, deadline)
 	gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/upstream/main", commitIn(t, f.copy, "base"))
 	before := gitrepotest.Refs(t, f.copy, "")
 
@@ -262,8 +265,8 @@ func TestFetchUpstream_StopsAtDeadline(t *testing.T) {
 	if !errors.Is(err, carrypatch.ErrGitTimeout) || !errors.Is(err, gitrepo.ErrDeadline) {
 		t.Errorf("err = %v, want the deadline error", err)
 	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Errorf("FetchUpstream returned after %v, want within 2s", d)
+	if d := time.Since(start); d > deadline+2*time.Second {
+		t.Errorf("FetchUpstream returned after %v, want within 2s of the deadline %v", d, deadline)
 	}
 	if seen.Load() == 0 {
 		t.Fatal("upstream received no request")

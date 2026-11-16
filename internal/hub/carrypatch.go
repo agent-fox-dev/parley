@@ -11,12 +11,14 @@ import (
 // component.
 const carryPatchHook = "carry_patch"
 
-// composeCarryPatch adds the carry-patch work: the component, registered
-// with the workspace service as the post-clone step of the workspaces in
-// mode carry_patch, so that every fresh copy of one is set up (upstream
-// fetched, remembered resolutions on, the integration branch written)
-// before the workspace is ready, without the workspace package knowing the
-// mode's work. Its start hook binds the component to the store, the secret
+// composeCarryPatch adds the carry-patch work: the schema of the patch
+// lists, and the component, registered with the workspace service as the
+// post-clone step of the workspaces in mode carry_patch, so that every
+// fresh copy of one is set up (upstream fetched, remembered resolutions on,
+// the integration branch written) before the workspace is ready, and as the
+// patch-branch lookup of the push route, which leaves the patch branches to
+// the patch list, without the workspace package knowing the mode's work. A
+// workspace's delete removes its patches (ADR 07). Its start hook binds the component to the store, the secret
 // component, which holds the upstream and origin credentials, the hub's git
 // and the place of each copy on disk, after every adjuster
 // AdjustCarryPatch added has changed those dependencies. The hook runs
@@ -28,7 +30,10 @@ const carryPatchHook = "carry_patch"
 func composeCarryPatch(c *Composition) {
 	comp := &carrypatch.Component{}
 	c.carryPatch = comp
+	c.AddSchemaStep(carrypatch.SchemaStep)
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
+	c.workspaces.RegisterPatchBranchLookup(comp)
+	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
 	c.AddStartHook(carryPatchHook, func(_ context.Context, rt *Runtime) error {
 		d := carrypatch.Deps{
 			Store:    rt.Store,
