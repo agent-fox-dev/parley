@@ -130,11 +130,28 @@ func (c *Component) fail(ctx context.Context, a Attempt, err error) error {
 	return errors.Join(err, c.end(ctx, a))
 }
 
-// end writes the final status a holds, in a store transaction of its own;
-// the attempt's own context may have ended, its outcome is still written.
+// end writes the final status a holds, in a store transaction of its own.
+// An attempt whose context ended by its deadline ends failed timeout
+// whatever a holds, once: the pool may have ended it so already. One whose
+// context ended by the stop of the hub is not ended: it stays running for
+// the next start to run it again.
 func (c *Component) end(ctx context.Context, a Attempt) error {
+	timedOut := false
+	if ctx.Err() != nil {
+		cause := context.Cause(ctx)
+		if !errors.Is(cause, errTimedOut) {
+			return fmt.Errorf("land attempt %s left running: %w", a.ID, cause)
+		}
+		timedOut = true
+		a.Status, a.Error, a.FinishedAt = StatusFailed, new(ErrorTimeout), nil
+		a.OntoSHA, a.LandedSHA, a.Noop, a.Commits, a.Conflict, a.Blocked = nil, nil, false, nil, nil, nil
+	}
 	ctx = context.WithoutCancel(ctx)
-	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.finish(ctx, tx, a) })
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.finish(ctx, tx, a) })
+	if timedOut && errors.Is(err, errFinal) {
+		return nil
+	}
+	return err
 }
 
 // finish writes, in tx, the final status of the attempt a with its result

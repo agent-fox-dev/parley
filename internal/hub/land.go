@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/land"
@@ -16,13 +17,25 @@ const (
 	landJournalHook = "land-journal"
 )
 
+// landPoolWork is the name of the background work that runs the land
+// attempts; landPoolGrace is how long the stop waits for it, which ends
+// the git processes of the running attempts at once and leaves them
+// running for the next start.
+const (
+	landPoolWork  = "land_pool"
+	landPoolGrace = 5 * time.Second
+)
+
 // composeLand adds the landing: the schema of the land attempts, the read
 // routes of the attempts per change, per workspace and by id, whose scope
 // and access need the shared checks decide, and the component, bound in a
 // start hook to the store, to the place of each repository on disk, opened
 // with the hub's git, to the change component, to the workspace records
 // with their effective land settings, read in the caller's transaction, to
-// the access rule, to the hub's event log and to the ref writer.
+// the access rule, to the hub's event log, to the ref writer and to the
+// [land] options: the tries of one land, the workers of the pool, the
+// deadline of an attempt and the landing identity. The pool runs as
+// background work; the stop leaves its running attempts running.
 //
 // The teardown of a workspace deletes its land attempts in the delete's
 // transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
@@ -52,6 +65,11 @@ func composeLand(c *Composition) {
 			RefWriter:  c.refWriter,
 			Now:        rt.Now,
 			Logger:     rt.Logger,
+
+			MaxAttempts: rt.Config.Land.MaxAttempts,
+			Workers:     rt.Config.Land.Workers,
+			Timeout:     rt.Config.Land.Timeout,
+			Committer:   land.Committer{Name: rt.Config.Land.CommitterName, Email: rt.Config.Land.CommitterEmail},
 		}
 		for _, adjust := range c.landAdjusters {
 			adjust(&d)
@@ -60,6 +78,7 @@ func composeLand(c *Composition) {
 		return nil
 	})
 	c.AddStartHook(landJournalHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
+	c.AddBackgroundWork(landPoolWork, landPoolGrace, func(ctx context.Context, _ *Runtime) { comp.RunPool(ctx) })
 }
 
 // landWorkspaces reads the workspace records for the land component, with

@@ -61,3 +61,10 @@ func Journalled(ctx context.Context, s *store.Store) (n int, err error) {
 	err = s.Main().QueryRowContext(ctx, `SELECT COUNT(*) FROM land_journal`).Scan(&n)
 	return n, err
 }
+
+// Submit hands the running attempt a to the pool of c, its deadline
+// counted from its creation.
+func Submit(c *Component, a Attempt) { c.submit(a, a.CreatedAt) }
+
+// Ended is closed once the pool of c is done with the attempt id.
+func Ended(c *Component, id string) <-chan struct{} { return c.ended(id) }

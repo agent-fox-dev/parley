@@ -2,11 +2,13 @@
 // or a stack of changes, as a durable land attempt, lands an attempt by
 // replaying its changes onto the head of the target branch and moving the
 // target with a compare-and-swap recorded together with the land, and
-// serves the attempts read-only per change, per workspace and by id.
+// serves the attempts read-only per change, per workspace and by id. The
+// attempts run on a pool of a bounded number of workers, each under a
+// deadline.
 //
 // The package plugs into the hub through internal/hub/land.go, which adds
-// its schema step, routes and start hook, and binds the component to its
-// dependencies there
+// its schema step, routes, start hooks and the pool as background work,
+// and binds the component to its dependencies there
 // (docs/adr/01-compose-the-hub-in-one-package.md).
 package land
 
@@ -134,6 +136,17 @@ type Deps struct {
 	// MaxAttempts is how many times an attempt tries to move the target
 	// before it ends failed contention; 0 is DefaultMaxAttempts.
 	MaxAttempts int
+	// Workers is how many attempts the pool computes at once; 0 is
+	// DefaultWorkers.
+	Workers int
+	// Timeout is how long an attempt may take from its creation, or from
+	// its re-run at a start, before it ends failed timeout; 0 is
+	// DefaultTimeout.
+	Timeout time.Duration
+	// Paused makes the pool hold every attempt handed to it: none runs and
+	// none ends, as when the hub stops right after taking it, so that a
+	// test keeps attempts running across a restart.
+	Paused bool
 }
 
 // DefaultMaxAttempts is how many times an attempt tries to move the target
@@ -161,6 +174,7 @@ type Component struct {
 	gate     Gate
 	override OverrideRule
 
+	pool  pool
 	seams seams
 }
 
@@ -189,5 +203,13 @@ func (c *Component) Bind(d Deps) {
 	if d.MaxAttempts <= 0 {
 		d.MaxAttempts = DefaultMaxAttempts
 	}
+	if d.Workers <= 0 {
+		d.Workers = DefaultWorkers
+	}
+	if d.Timeout <= 0 {
+		d.Timeout = DefaultTimeout
+	}
 	c.deps = d
+	c.pool.jobs = map[string]*job{}
+	c.pool.slots = make(chan struct{}, d.Workers)
 }

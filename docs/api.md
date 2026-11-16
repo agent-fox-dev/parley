@@ -4391,14 +4391,17 @@ that head is used as it is, so a version made on the target head lands
 with its own commit ids; a commit whose change the target already holds is
 left out and has no `commits` entry; every other commit is made anew with
 the author, author date and message of the commit it replays and the
-landing identity as committer, `Parley <parley@localhost>` by default.
+landing identity as committer, `Parley <parley@localhost>` unless
+`[land].committer_name` and `[land].committer_email` name another
+([configuration.md](configuration.md)).
 The target then moves from `onto_sha` to `landed_sha` with a
 compare-and-swap, which is not a push: the push rules, a protected branch
 included, do not apply. When another write moved the target since it was
 read, the attempt reads the new head, replays the changes onto it and
 tries again; `attempts` counts every try, and `onto_sha` is the head the
-try that moved the target was built on. After 10 lost tries the attempt
-ends `failed` with `error` `contention`, nothing of it in the target and
+try that moved the target was built on. After `[land].max_attempts` lost
+tries (10 unless the configuration says otherwise) the attempt ends
+`failed` with `error` `contention`, nothing of it in the target and
 the change still `open`, so a new land may follow. A target branch that
 does not exist when the attempt reads or moves it, or a policy gate,
 store or git failure other than a conflict, ends the attempt `failed`
@@ -4416,6 +4419,20 @@ When every commit was left out, the attempt ends `landed` with `noop`
 `true`, `landed_sha` and `onto_sha` both the unchanged target head and
 `commits` `[]`; the change is `landed` at that head, `parley.change.land`
 says `noop` `true`, and no `parley.git.push` is written.
+
+Attempts run side by side, with no queue and no lock per workspace or
+branch: two attempts meet only in the compare-and-swap. At most
+`[land].workers` attempts (8 by default) are computed at once; a further
+attempt waits for a free worker, reads `running` meanwhile, and none
+fails because every worker is busy; waiting attempts start in no
+promised order. An attempt that is not final `[land].timeout` (5 minutes
+by default) after it was created, waiting for a worker included, is
+stopped, every `git` process of its work killed, and ends `failed` with
+`error` `timeout`, its change still `open`; it never moves the target
+afterwards. An attempt whose target has already begun to move when its
+time runs out ends as that move ends: `landed` when the target moved,
+`failed` `timeout` when it did not. A stop of the hub stops the attempts it runs without
+ending them: they stay `running`.
 
 The move and its record cannot share one transaction, so the hub enters
 the move in a journal first. A hub that stops at any point of a land

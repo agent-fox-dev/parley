@@ -286,22 +286,55 @@ func (w *world) landNow(t *testing.T, ch change.Change, by change.Caller, sessio
 func (w *world) runLand(t *testing.T, ch change.Change, by change.Caller, session *string) (land.Attempt, error) {
 	t.Helper()
 	ctx := context.Background()
+	a := attemptOf(ch, by, session, time.Now().UTC())
+	if err := land.InsertAttempt(ctx, w.Store, a); err != nil {
+		t.Fatal(err)
+	}
+	runErr := land.RunAttempt(ctx, w.land, a.Workspace, a.ID)
+	return w.attempt(t, a.ID), runErr
+}
+
+// attemptOf is a running manual rebase attempt landing the change ch at
+// its version on its target, by the caller by in the session (nil for
+// none), created at created.
+func attemptOf(ch change.Change, by change.Caller, session *string, created time.Time) land.Attempt {
 	a := land.Attempt{
 		ID: uuid.New().String(), Workspace: ch.WorkspaceSlug, TargetBranch: ch.TargetBranch, Status: land.StatusRunning,
 		Trigger: land.TriggerManual, Strategy: land.StrategyRebase,
 		RequestedBy:  change.Actor{ActorType: by.Credential.Type, ActorID: new(by.UserID), Username: new(by.Username)},
-		CredentialID: by.Credential.ID, SessionID: session, CreatedAt: time.Now().UTC(),
+		CredentialID: by.Credential.ID, SessionID: session, CreatedAt: created,
 		Covered: []land.CoveredChange{{Number: ch.Number, Version: ch.Version, Head: ch.HeadSHA,
 			SourceWorkspace: ch.Source.WorkspaceSlug, SourceBranch: ch.Source.Branch}},
 	}
 	if ch.BaseSHA != nil {
 		a.Covered[0].Base = *ch.BaseSHA
 	}
-	if err := land.InsertAttempt(ctx, w.Store, a); err != nil {
+	return a
+}
+
+// submit stores an attempt of the owner landing the change ch, created at
+// created, and hands it to the land pool, which counts its deadline from
+// then; it returns the attempt as it was created.
+func (w *world) submit(t *testing.T, ch change.Change, created time.Time) land.Attempt {
+	t.Helper()
+	a := attemptOf(ch, w.caller(), nil, created)
+	if err := land.InsertAttempt(context.Background(), w.Store, a); err != nil {
 		t.Fatal(err)
 	}
-	runErr := land.RunAttempt(ctx, w.land, a.Workspace, a.ID)
-	return w.attempt(t, a.ID), runErr
+	land.Submit(w.land, a)
+	return a
+}
+
+// ended waits until the pool is done with the attempt id, at most 30 s,
+// and returns the attempt as it is stored then.
+func (w *world) ended(t *testing.T, id string) land.Attempt {
+	t.Helper()
+	select {
+	case <-land.Ended(w.land, id):
+	case <-time.After(30 * time.Second):
+		t.Fatalf("land attempt %s did not end within 30 s", id)
+	}
+	return w.attempt(t, id)
 }
 
 // attempt is the attempt id of api as it is stored.

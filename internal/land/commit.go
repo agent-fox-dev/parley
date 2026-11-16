@@ -74,12 +74,22 @@ func (c *Component) commit(ctx context.Context, repo *gitrepo.Repo, ws Workspace
 	if err := c.fault(faultBeforeSwap); err != nil {
 		return false, err
 	}
+	if err := c.enterSwap(ctx, a.ID); err != nil {
+		// Past its deadline, or at the stop of the hub, the attempt moves
+		// nothing, also when its run went on after it was ended.
+		return false, errors.Join(err, c.deps.Store.Tx(context.WithoutCancel(ctx), func(tx *sql.Tx) error {
+			return unjournal(ctx, tx, a.ID)
+		}))
+	}
 	caller := callerOf(a)
 	res, err := c.deps.RefWriter.Apply(ctx, pushrule.ApplyRequest{
 		Verdict: verdict, Repo: repo, SessionID: a.SessionID, Via: pushrule.ViaLand, VersionKind: pushrule.VersionKindNone,
 		Workspace: pushrule.Workspace{Slug: ws.Slug, Kind: ws.Kind, Parent: ws.Parent, DefaultBranch: ws.DefaultBranch, Mode: ws.Mode},
 		Caller:    pushrule.Caller{CredentialType: caller.Credential.Type, CredentialID: caller.Credential.ID, UserID: caller.UserID},
 	})
+	if res.Outcome != pushrule.OutcomeAccepted {
+		c.leaveSwap(a.ID)
+	}
 	switch res.Outcome {
 	case pushrule.OutcomeAccepted:
 	case pushrule.OutcomeRefMoved:

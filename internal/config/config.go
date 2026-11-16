@@ -51,6 +51,7 @@ type Config struct {
 	Forks     Forks
 	SCM       SCM
 	Changes   Changes
+	Land      Land
 
 	values map[string]map[string]any
 	// sections holds the content of each section registered as a whole that
@@ -205,6 +206,7 @@ func (r *Registry) Load(env Env, workDir string) (*Config, error) {
 	c.Forks = forks
 	c.SCM = scmFrom(values)
 	c.Changes = changesFrom(values)
+	c.Land = landFrom(values)
 	c.sections = sections
 	return c, nil
 }
