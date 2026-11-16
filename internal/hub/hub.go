@@ -28,6 +28,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/awareness"
+	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -81,6 +82,7 @@ var parts = []func(*Composition){
 	composeLandRules,
 	composeSandbox,
 	composeAwareness,
+	composeCarryPatch,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -272,6 +274,12 @@ type Composition struct {
 	// changed its dependencies (AdjustAwareness).
 	awareness          *awareness.Component
 	awarenessAdjusters []func(*awareness.Deps)
+
+	// carryPatch is the carry-patch component composeCarryPatch creates
+	// and binds in its start hook (CarryPatch), after carryPatchAdjusters
+	// have changed its dependencies (AdjustCarryPatch).
+	carryPatch          *carrypatch.Component
+	carryPatchAdjusters []func(*carrypatch.Deps)
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).

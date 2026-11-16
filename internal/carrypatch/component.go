@@ -4,11 +4,15 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // Deps is what the component works with, given once by Bind.
 type Deps struct {
+	// Store holds the workspace records, whose integration_branch the
+	// set-up writes.
+	Store *store.Store
 	// Secrets reads a workspace's secrets, among them its upstream and
 	// origin credentials.
 	Secrets workspace.SecretReader
