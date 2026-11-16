@@ -4495,10 +4495,24 @@ nothing:
    `workspace_not_ready`;
 7. `session_id` must pass the session-linking rule: `400`
    `unknown_session` otherwise. Until the session feature is installed,
-   every `session_id` is refused.
+   every `session_id` is refused;
+8. the preconditions, read in the transaction that creates the attempt,
+   the first that fails being the answer:
+   1. every change the land covers is `open`: `409` `change_not_open` for
+      a `draft`, `landed` or `abandoned` change;
+   2. `expected_version`, when given, is the change's current version:
+      `409` `version_mismatch`;
+   3. no `running` attempt covers a change the land covers: `409`
+      `land_in_progress`, with that attempt in `error.details`. Of several
+      lands of one change that arrive at the same moment, exactly one
+      creates an attempt and the others get this answer;
+   4. without `stack`, every change down the change's `depends_on` is
+      `landed`: `409` `depends_on_unlanded`.
 
-Then the hub creates the land attempt, `running`, in one transaction with
-the link of its session: `trigger` `manual`, `strategy` the workspace's
+   Only `land_in_progress` carries `details`.
+
+In that transaction the hub creates the land attempt, `running`, with the
+link of its session: `trigger` `manual`, `strategy` the workspace's
 `land.strategy` at that moment, `attempts` `0`, `requested_by` the
 caller, and each change at its current version. The attempt runs on the
 hub's pool; nothing is locked while it runs, so the lands of different

@@ -640,3 +640,138 @@ func TestLand_AnswersARunningAttemptOnceTheWaitRanOut(t *testing.T) {
 		}
 	}
 }
+
+func TestLand_RefusesALandWhosePreconditionsFailWithTheFirstThatFails(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for i, c := range []struct {
+		name string
+		// state is the state the change is put in, "" for open; it is at
+		// version 2.
+		state string
+		// expected is the request's expected_version, 0 for none.
+		expected int64
+		// running stores a running attempt covering the change; below
+		// makes it depend on an open change.
+		running, below bool
+		want           string
+	}{
+		{name: "a draft change", state: change.StateDraft, want: "change_not_open"},
+		{name: "a landed change", state: change.StateLanded, want: "change_not_open"},
+		{name: "an abandoned change", state: change.StateAbandoned, want: "change_not_open"},
+		{name: "an earlier version expected", expected: 1, want: "version_mismatch"},
+		{name: "an open change below", below: true, want: "depends_on_unlanded"},
+		{name: "a draft change at another version than expected", state: change.StateDraft, expected: 1, want: "change_not_open"},
+		{name: "another version expected while an attempt runs", expected: 1, running: true, want: "version_mismatch"},
+		{name: "an attempt running with an open change below", running: true, below: true, want: "land_in_progress"},
+		{name: "another version expected with an open change below", expected: 1, below: true, want: "version_mismatch"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := "p" + strconv.Itoa(i)
+			ch := w.open
+			if c.state == change.StateDraft {
+				ch = w.openDraft
+			}
+			named := w.nextVersion(t, ch(t, branch))
+			switch c.state {
+			case change.StateLanded:
+				w.landNow(t, named, w.caller(), nil)
+			case change.StateAbandoned:
+				w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+					return w.changes.SetAbandoned(ctx, tx, "api", named.Number, "dropped")
+				})
+			}
+			var runs string
+			if c.running {
+				a := running(uuid.New().String(), "api", "main", time.Now().UTC(), named.Number)
+				w.insert(t, a)
+				runs = a.ID
+			}
+			if c.below {
+				below := w.open(t, branch+"-below")
+				w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+					return w.changes.SetDependsOn(ctx, tx, "api", named.Number, &below.Number)
+				})
+			}
+			body := map[string]any{}
+			if c.expected > 0 {
+				body["expected_version"] = c.expected
+			}
+			before, main := w.attempts(t), head(t, w.api, "main")
+			status, answer := w.landCall(t, w.ownerKey, named.Number, "", body)
+			if status != 409 || errorType(answer) != c.want {
+				t.Fatalf("land = %d %v, want 409 %s", status, answer, c.want)
+			}
+			details, has := answer["error"].(map[string]any)["details"]
+			if c.want == "land_in_progress" {
+				if d, _ := details.(map[string]any); d["id"] != runs || d["status"] != land.StatusRunning {
+					t.Errorf("details %v, want the running attempt %s", details, runs)
+				}
+			} else if has {
+				t.Errorf("the %s answer has details %v", c.want, details)
+			}
+			if n, got := w.attempts(t), head(t, w.api, "main"); n != before || got != main {
+				t.Errorf("the refused land made %d attempts and moved main to %s from %s", n-before, got, main)
+			}
+		})
+	}
+
+	at2 := w.nextVersion(t, w.open(t, "v"))
+	if status, a := w.landCall(t, w.ownerKey, at2.Number, "", map[string]any{"expected_version": 2}); status != 200 ||
+		a["status"] != land.StatusLanded {
+		t.Errorf("land expecting the current version = %d %v, want 200 landed", status, a)
+	}
+	one, two := w.open(t, "one"), w.open(t, "two")
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetDependsOn(ctx, tx, "api", two.Number, &one.Number)
+	})
+	for _, n := range []int64{one.Number, two.Number} {
+		if status, a := w.landCall(t, w.ownerKey, n, "", nil); status != 200 || a["status"] != land.StatusLanded {
+			t.Errorf("land of %d with every change below landed = %d %v, want 200 landed", n, status, a)
+		}
+	}
+}
+
+func TestLand_RefusesALandOfAChangeARunningAttemptCovers(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *land.Deps) { d.Paused = true })
+	ch := w.open(t, "f")
+	status, a := w.landCall(t, w.ownerKey, ch.Number, "wait=0", nil)
+	if status != 202 {
+		t.Fatalf("the first land = %d %v, want 202", status, a)
+	}
+	status, r := w.landCall(t, w.ownerKey, ch.Number, "wait=0", nil)
+	errObj, _ := r["error"].(map[string]any)
+	details, _ := errObj["details"].(map[string]any)
+	if status != 409 || errorType(r) != "land_in_progress" || details["id"] != a["id"] || details["status"] != land.StatusRunning {
+		t.Fatalf("the second land = %d %v, want 409 land_in_progress naming the running attempt %v", status, r, a["id"])
+	}
+
+	other := w.open(t, "g")
+	start, answers := make(chan struct{}), make(chan string, 8)
+	for range 8 {
+		go func() {
+			<-start
+			status, raw := w.post(t, w.ownerKey, "api", other.Number, "wait=0", nil)
+			var answer map[string]any
+			_ = json.Unmarshal(raw, &answer)
+			answers <- fmt.Sprintf("%d %s", status, errorType(answer))
+		}()
+	}
+	close(start)
+	got := map[string]int{}
+	for range 8 {
+		select {
+		case s := <-answers:
+			got[s]++
+		case <-time.After(30 * time.Second):
+			t.Fatalf("not every land was answered within 30 s: %v", got)
+		}
+	}
+	if want := map[string]int{"202 ": 1, "409 land_in_progress": 7}; !reflect.DeepEqual(got, want) {
+		t.Errorf("8 simultaneous lands answered %v, want %v", got, want)
+	}
+	if _, lands := w.get(t, fmt.Sprintf("/workspaces/api/changes/%d/lands", other.Number), w.ownerKey); len(ids(t, lands)) != 1 {
+		t.Errorf("change %d has attempts %v, want one", other.Number, ids(t, lands))
+	}
+}

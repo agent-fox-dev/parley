@@ -594,3 +594,39 @@ func (c *clock) waitAsked(t *testing.T) time.Duration {
 		return 0
 	}
 }
+
+// inTx runs fn in a store transaction, failing the test on its error.
+func (w *world) inTx(t *testing.T, fn func(ctx context.Context, tx *sql.Tx) error) {
+	t.Helper()
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return fn(ctx, tx) }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// openDraft is open with the change opened as a draft.
+func (w *world) openDraft(t *testing.T, branch string) change.Change {
+	t.Helper()
+	commit(t, w.api, branch, w.base, branch, map[string]string{branch + ".txt": branch + "\n"})
+	var ch change.Change
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) (err error) {
+		ch, err = w.changes.Open(ctx, tx, change.OpenInput{Workspace: "api", SourceBranch: branch, Kind: change.KindRef,
+			Caller: w.caller(), Draft: true})
+		return err
+	})
+	return ch
+}
+
+// nextVersion adds a commit to the source branch of the change ch of api,
+// records it as the change's next version and returns the change as it
+// is stored then.
+func (w *world) nextVersion(t *testing.T, ch change.Change) change.Change {
+	t.Helper()
+	branch := ch.Source.Branch
+	head := commit(t, w.api, branch, ch.HeadSHA, "next", map[string]string{branch + ".txt": "next\n"})
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := w.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: "api", Branch: branch, Head: head, Kind: change.KindRef})
+		return err
+	})
+	return w.readChange(t, ch.Number)
+}

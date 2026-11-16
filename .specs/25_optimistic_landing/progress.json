@@ -3,7 +3,7 @@
   "spec_id": "25",
   "spec_name": "optimistic_landing",
   "schema_version": 3,
-  "updated_at": "2026-11-16T00:46:41Z",
+  "updated_at": "2026-11-16T00:56:21Z",
   "tasks": [
     {
       "id": 1,
@@ -31,7 +31,7 @@
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,

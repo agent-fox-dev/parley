@@ -265,9 +265,10 @@ func parseLand(r *http.Request) (landRequest, error) {
 // invalid_request), the confinement of a token bound to a fork, calling on
 // the fork's parent, to the changes of the fork (403 token_bound), who may
 // land (authorize, 403 forbidden), the workspace's status (409, such as
-// workspace_archived) and the session (400 unknown_session); then the
-// running attempt is created and handed to the pool, and the request waits
-// for it (answer).
+// workspace_archived) and the session (400 unknown_session); then, in one
+// store transaction, the land's preconditions (admit, 409) and the
+// creation of the running attempt, which is handed to the pool, and the
+// request waits for it (answer).
 func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	slug := server.Param(r, "slug")

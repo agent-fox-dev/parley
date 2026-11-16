@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -308,6 +309,27 @@ WHERE id = ? AND workspace_slug = ? AND status = 'running'`,
 		return errors.Join(errFinal, err)
 	}
 	return nil
+}
+
+// runningCovering is the oldest running attempt of the workspace that
+// covers one of the changes numbers, other than the attempt except ("" for
+// none), read through q; found is false when there is none.
+func runningCovering(ctx context.Context, q Querier, workspace string, numbers []int64, except string) (a Attempt, found bool, err error) {
+	if len(numbers) == 0 {
+		return Attempt{}, false, nil
+	}
+	args := []any{workspace, except}
+	for _, n := range numbers {
+		args = append(args, n)
+	}
+	as, err := readAttempts(ctx, q, `SELECT `+attemptColumns+` FROM land_attempts a
+WHERE a.workspace_slug = ? AND a.status = 'running' AND a.id <> ? AND EXISTS (SELECT 1 FROM land_attempt_changes c
+	WHERE c.land_id = a.id AND c.number IN (`+strings.TrimSuffix(strings.Repeat("?, ", len(numbers)), ", ")+`))
+ORDER BY a.created_at, a.id LIMIT 1`, args...)
+	if err != nil || len(as) == 0 {
+		return Attempt{}, false, err
+	}
+	return as[0], true, nil
 }
 
 // attemptColumns are the columns readAttempts scans, of the table a.

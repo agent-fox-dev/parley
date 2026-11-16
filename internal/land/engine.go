@@ -223,8 +223,8 @@ type StartInput struct {
 // admitted, for a land no request asks for, such as the automatic landing
 // of a change: it checks that the workspace takes a land and the session,
 // creates the running attempt and hands it to the pool, which runs it to
-// its end. It asks no request guard. The attempt returned is as it was
-// created.
+// its end, once the land's preconditions hold (admit). It asks no
+// request guard. The attempt returned is as it was created.
 func (c *Component) Start(ctx context.Context, in StartInput) (Attempt, error) {
 	ws, err := c.workspace(ctx, in.Workspace)
 	if err != nil {
@@ -282,8 +282,10 @@ func (c *Component) session(ctx context.Context, in StartInput) (*linked, error)
 // in the session (nil for none), and hands it to the pool. The attempt is
 // created in one store transaction from what that transaction reads of
 // its changes, each at its current version, with the session's link to
-// it, so that what is judged of the changes there holds for the attempt
-// stored; the strategy is the workspace's land.strategy as read before.
+// it, once the land's preconditions hold there (admit), so that what is
+// judged of the changes holds for the attempt stored, and of simultaneous
+// lands of one change exactly one creates an attempt; the strategy is the
+// workspace's land.strategy as read before.
 // Nothing is held beyond that transaction: the attempts of different
 // changes run side by side, also on one target, and meet only in the
 // compare-and-swap of the target.
@@ -303,7 +305,7 @@ func (c *Component) create(ctx context.Context, ws Workspace, in StartInput, ses
 		if err != nil {
 			return err
 		}
-		chain, err := c.collect(ctx, tx, ch, in.Stack)
+		chain, err := c.admit(ctx, tx, ch, in.ExpectedVersion, in.Stack, "")
 		if err != nil {
 			return err
 		}
@@ -321,6 +323,58 @@ func (c *Component) create(ctx context.Context, ws Workspace, in StartInput, ses
 	}
 	c.submit(a, a.CreatedAt)
 	return a, nil
+}
+
+// admit checks the preconditions of a land of the change ch, as read
+// through q, and returns the changes the land covers, bottom first
+// (collect). The first that fails is the answer, in this order: every
+// covered change is open (409 change_not_open); expected, when not nil, is
+// ch's current version (409 version_mismatch); no running attempt other
+// than self covers a covered change (409 land_in_progress, with that
+// attempt as the error's details); and, unless stack, every change down
+// ch's depends_on is landed (409 depends_on_unlanded).
+//
+// A land request asks it in the transaction that creates the attempt, with
+// self "", so that the running attempt it finds none of is not created by
+// a simultaneous request in between; the run of an attempt again after a
+// restart asks it with self the attempt's id.
+func (c *Component) admit(ctx context.Context, q Querier, ch change.Change, expected *int64, stack bool, self string) ([]change.Change, error) {
+	below, err := c.collect(ctx, q, ch, true)
+	if err != nil {
+		return nil, err
+	}
+	chain := below
+	if !stack {
+		chain = below[len(below)-1:]
+	}
+	for _, cov := range slices.Backward(chain) {
+		if cov.State != change.StateOpen {
+			return nil, server.NewError("change_not_open", http.StatusConflict,
+				fmt.Sprintf("%s is %s: only an open change lands", cov.Ref, cov.State))
+		}
+	}
+	if expected != nil && *expected != ch.Version {
+		return nil, server.NewError("version_mismatch", http.StatusConflict,
+			fmt.Sprintf("%s is at version %d, not at the expected version %d", ch.Ref, ch.Version, *expected))
+	}
+	numbers := make([]int64, len(chain))
+	for i, cov := range chain {
+		numbers[i] = cov.Number
+	}
+	running, found, err := runningCovering(ctx, q, ch.WorkspaceSlug, numbers, self)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		return nil, server.NewError("land_in_progress", http.StatusConflict,
+			fmt.Sprintf("the land attempt %s of %s is running", running.ID, ch.Ref)).WithDetails(running)
+	}
+	if !stack && len(below) > 1 {
+		return nil, server.NewError("depends_on_unlanded", http.StatusConflict,
+			fmt.Sprintf("%s depends on %s, which is not landed: land it first, or the stack with stack true",
+				ch.Ref, below[len(below)-2].Ref))
+	}
+	return chain, nil
 }
 
 // collect is the changes a land of ch covers, bottom first, read through

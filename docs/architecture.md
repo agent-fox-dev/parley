@@ -4370,10 +4370,18 @@ while `land.by_author` is on; else `403 forbidden`), checks the
 workspace's `Ready`, then the session (`session`: the registered
 `SessionLinker`'s `Check`, `400 unknown_session` for a refused id and for
 every id while none is registered). `create` then reads the changes again
-in one store transaction, inserts the running attempt with each change's
-current version, head, base and source, and has the linker `Record` the
-session's link in that transaction; after it commits the attempt is
-handed to the pool (`submit`). Nothing is held across an attempt.
+in one store transaction, checks the preconditions there (`admit`: every
+covered change open, `expected_version`, no running attempt covering a
+covered change, found by `runningCovering`, and without `stack` every
+change down `depends_on` landed; the first that fails is the `409`),
+inserts the running attempt with each change's current version, head,
+base and source, and has the linker `Record` the session's link in that
+transaction; after it commits the attempt is handed to the pool
+(`submit`). Since the store runs its transactions one at a time, the
+check for a running attempt and the insert cannot be split by another
+land of the same change. `admit` takes the id of an attempt to leave out
+of that check, for the run of an attempt again after a restart. Nothing
+is held across an attempt.
 `answer` waits for `ended(id)`, `Deps.After(wait)` or the request's end,
 whichever comes first, then reads the attempt and answers `200` when it
 is final, `202` while it runs. `(*land.Component).Start(ctx, StartInput)`
