@@ -24,9 +24,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // serveHub serves a hub with no identity provider on a free loopback port
 // and returns its URL.
 func serveHub(t *testing.T) string {
@@ -35,6 +32,25 @@ func serveHub(t *testing.T) string {
 	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})
 	return hubtest.Serve(t, hub.Options{Env: env, WorkDir: dir}).URL("")
+}
+
+// A test that sets the process environment, through clientEnv or t.Setenv,
+// or signals the process, runs alone; every other test of the package runs
+// in parallel through parallel. The helpers that run parley against a
+// test's hub pass --endpoint-url and --api-key, so such a run reads neither
+// the environment nor a configuration file.
+
+// parallelSlots bounds how many tests of the package run at once. Each runs
+// a hub and git processes; unbounded, the package takes every core from the
+// packages go test runs beside it, whose timing tests then fail.
+var parallelSlots = make(chan struct{}, 3)
+
+// parallel runs t in parallel with the package's other parallel tests, at
+// most cap(parallelSlots) at a time, its cleanups included.
+func parallel(t *testing.T) {
+	t.Parallel()
+	parallelSlots <- struct{}{}
+	t.Cleanup(func() { <-parallelSlots })
 }
 
 // clientEnv points PARLEY_CONFIG_DIR at configDir and unsets

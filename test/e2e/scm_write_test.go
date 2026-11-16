@@ -85,6 +85,7 @@ func gitPushEvents(t *testing.T, h *workspaceHub, slug, ref string) []refPushEve
 // with stock git, and is told the branch moved when it commits again from a
 // head it has not seen.
 func TestSCMWrite_AnAgentCommitsToItsForkWithoutACloneAndIsToldTheBranchMoved(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	r := h.runAs(t, h.memberKey, "fork", "create", "demo", "--name", "t1", "--token-permissions", "git:read,git:write")
 	if r.code != 0 {
@@ -155,6 +156,7 @@ func TestSCMWrite_AnAgentCommitsToItsForkWithoutACloneAndIsToldTheBranchMoved(t 
 // commit reaches main, and the developer rebases the branch onto it from the
 // shell; the branch holds one commit on top of main's new head.
 func TestSCMWrite_ADeveloperCommitsALocalFileAndRebasesTheBranchFromTheShell(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	if status, body := h.Call(t, http.MethodPatch, "/api/v1/workspaces/demo", h.key,
 		map[string]any{"settings": map[string]any{"protected_branches": []string{}}}); status != http.StatusOK {
@@ -216,6 +218,7 @@ func TestSCMWrite_ADeveloperCommitsALocalFileAndRebasesTheBranchFromTheShell(t *
 // workspace is refused by the push rules, and an organization member's by
 // the write gate.
 func TestSCMWrite_TheOwnerPushesDirectlyToTheProtectedBranchAndOtherCredentialsCannot(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	bound := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"git:read", "git:write"}, Workspace: "demo", CreatedAt: time.Now()})
 	head := refHead(t, h.workspaceHub, "demo", "main", h.key)

@@ -156,6 +156,7 @@ func typesOf(evs []changeEvent) []string {
 // from the shell, marks it ready, and waits until the hub found it
 // landable in the background.
 func TestChangeLifecycle_AnAgentFinishesADraftMarksItReadyAndWaitsUntilItIsLandable(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	run := cloneAs(t, h.forkHub, h.agent, "demo--t1")
 	run("checkout", "--quiet", "-b", "feat")
@@ -194,6 +195,7 @@ func TestChangeLifecycle_AnAgentFinishesADraftMarksItReadyAndWaitsUntilItIsLanda
 // the hub announces once; the agent's rebased version applies again and is
 // announced landable again, and no check moved a ref.
 func TestChangeLifecycle_ATargetMoveMakesAChangeConflictAndANewVersionClearsIt(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	agent := cloneAs(t, h.forkHub, h.agent, "demo--t1")
 	agent("checkout", "--quiet", "-b", "feat")
@@ -243,6 +245,7 @@ func TestChangeLifecycle_ATargetMoveMakesAChangeConflictAndANewVersionClearsIt(t
 // git, and restores it from the shell, which brings the branch back at the
 // last version; a second restore is refused.
 func TestChangeLifecycle_ADeveloperAbandonsAChangeDeletesItsBranchAndRestoresIt(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	owner := cloneAs(t, h.forkHub, h.key, "demo")
 	owner("checkout", "--quiet", "-b", "feat")
@@ -306,6 +309,7 @@ func TestChangeLifecycle_ADeveloperAbandonsAChangeDeletesItsBranchAndRestoresIt(
 // bookkeeping: the hub records the head as a version before it answers, and
 // computes its mergeability without being asked.
 func TestChangeLifecycle_ARestartRecordsAHeadWhoseBookkeepingWasLost(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	agent := cloneAs(t, h.forkHub, h.agent, "demo--t1")
 	agent("checkout", "--quiet", "-b", "feat")

@@ -14,20 +14,13 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // identityHub is a hub bootstrapped with an admin token.
 type identityHub struct{ *hubtest.Hub }
 
-// startIdentityHub starts a hub bootstrapped with an admin token. The client
-// runs with an empty configuration directory, so every command takes the
-// hub URL and the credential from its flags.
+// startIdentityHub starts a hub bootstrapped with an admin token.
 func startIdentityHub(t *testing.T) *identityHub {
 	t.Helper()
-	h := &identityHub{hubtest.Start(t, nil)}
-	clientEnv(t, t.TempDir())
-	return h
+	return &identityHub{hubtest.Start(t, nil)}
 }
 
 // issueKey issues an API key for the user username, as a login does.
@@ -98,6 +91,7 @@ func itemValues(t *testing.T, r ran, member string) []any {
 }
 
 func TestIdentity_AnOperatorSetsUpATeamAndAMemberSeesTheirOrg(t *testing.T) {
+	parallel(t)
 	h := startIdentityHub(t)
 	admin := h.Token
 
@@ -144,6 +138,7 @@ func TestIdentity_AnOperatorSetsUpATeamAndAMemberSeesTheirOrg(t *testing.T) {
 }
 
 func TestIdentity_TheLastActiveAdminCanBeNeitherDemotedNorDeleted(t *testing.T) {
+	parallel(t)
 	h := startIdentityHub(t)
 	admin := h.Token
 	h.CreateUser(t, "alice")

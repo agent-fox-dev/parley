@@ -237,7 +237,7 @@ func rowWithEvent(t *testing.T, h *hubtest.Hub, name string, seq int64) bool {
 }
 
 func TestEvents_StreamResumesWithoutLoss(t *testing.T) {
-	t.Parallel()
+	parallel(t)
 	h := startEventsHub(t, hubtest.Config{})
 	dev, reviewer := teamOnAPI(t, h, "reviewer")
 	devKey := h.IssueKey(t, dev)
@@ -291,7 +291,7 @@ func (c *fakeNow) advance(d time.Duration) {
 }
 
 func TestEvents_LongPollAndExpiredCursor(t *testing.T) {
-	t.Parallel()
+	parallel(t)
 	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	clock := &fakeNow{now: t0}
 	var events *event.Component
@@ -383,7 +383,7 @@ func (b *lineBuffer) waitLines(t *testing.T, n int) []string {
 }
 
 func TestEvents_TailSurvivesRestart(t *testing.T) {
-	t.Parallel()
+	parallel(t)
 	// Each run of the hub composes a new event component; the test follows
 	// the current one to see when the tail's stream is open.
 	var events atomic.Pointer[event.Component]

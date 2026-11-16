@@ -12,9 +12,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // must runs parley against the hub with the developer's key and fails the
 // test unless it exits 0.
 func (h *workspaceHub) must(t *testing.T, args ...string) ran {
@@ -54,6 +51,7 @@ func decoded(t *testing.T, body []byte) map[string]any {
 }
 
 func TestWorkspaceReadUpdate_ADeveloperChangesAWorkspaceFromTheCLIAndReadsItBack(t *testing.T) {
+	parallel(t)
 	origin := newOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
 
@@ -98,6 +96,7 @@ func TestWorkspaceReadUpdate_ADeveloperChangesAWorkspaceFromTheCLIAndReadsItBack
 }
 
 func TestWorkspaceReadUpdate_ADeveloperMovesAWorkspaceIntoAnOrganizationAndAMemberFindsIt(t *testing.T) {
+	parallel(t)
 	origin := newOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
 	dev, err := identity.UserBySelector(context.Background(), h.Store.Main(), "dev")

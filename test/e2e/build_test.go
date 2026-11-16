@@ -47,7 +47,7 @@ func buildProgram(dir, pkg, version, commit, buildTime string) (string, error) {
 }
 
 func TestBuild_RunsTheBuiltBinaries(t *testing.T) {
-	t.Parallel()
+	parallel(t)
 	dir := t.TempDir()
 	parley := build(t, dir, "./cmd/parley", "9.9.9", "abc1234", "2026-01-02T03:04:05Z")
 	parleyd := build(t, dir, "./cmd/parleyd", "9.9.9", "abc1234", "2026-01-02T03:04:05Z")

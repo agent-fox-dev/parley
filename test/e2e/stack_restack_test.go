@@ -43,6 +43,7 @@ func (h *lifecycleHub) version(t *testing.T, number, v string) map[string]any {
 // background, bottom first, and the stack reads as built on the amended
 // commit.
 func TestStackRestack_AnAmendedBottomRestacksTheChangesAboveIt(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	owner := cloneAs(t, h.forkHub, h.key, "demo")
 	branches := []string{"low", "mid", "top"}

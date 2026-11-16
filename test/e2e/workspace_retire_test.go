@@ -17,9 +17,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // retireEvent is the metadata of an archive, reclone or delete event this
 // file reads, with the workspace it was written for.
 type retireEvent struct {
@@ -87,6 +84,7 @@ func (r *recordingRevoker) RevokeBoundTo(_ context.Context, _ *sql.Tx, slugs []s
 }
 
 func TestWorkspaceRetire_ADeveloperArchivesAWorkspaceAndReactivatesIt(t *testing.T) {
+	parallel(t)
 	origin := pushOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
 	h.createReady(t, "demo", origin.URL())
@@ -124,6 +122,7 @@ func TestWorkspaceRetire_ADeveloperArchivesAWorkspaceAndReactivatesIt(t *testing
 }
 
 func TestWorkspaceRetire_ADeveloperDeletesAnArchivedWorkspaceWithAForkAndRegistersTheSlugAgain(t *testing.T) {
+	parallel(t)
 	origin := pushOrigin(t)
 	revoker := &recordingRevoker{}
 	h := startWorkspaceHub(t, origin, "demo", func(c *hub.Composition) {
@@ -195,6 +194,7 @@ func TestWorkspaceRetire_ADeveloperDeletesAnArchivedWorkspaceWithAForkAndRegiste
 }
 
 func TestWorkspaceRetire_ADeveloperReclonesAWorkspaceFromTheShell(t *testing.T) {
+	parallel(t)
 	origin := pushOrigin(t)
 	originStale := origin.Branch("stale", "main")
 	h := startWorkspaceHub(t, origin, "demo")

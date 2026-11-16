@@ -149,6 +149,7 @@ func TestBoundTokens_ADeveloperMintsABoundTokenFromTheCLIThatConfinesTheAgent(t 
 }
 
 func TestBoundTokens_AnAgentLeavesItsBindingRepeatedlyAndTheOwnerGetsOneEventAMinute(t *testing.T) {
+	parallel(t)
 	clock := &fakeNow{now: time.Now()}
 	h := startBoundTokensHub(t, hubtest.Config{Now: clock.Now})
 	agent := h.IssuePAT(t, identity.PATSpec{UserID: aliceWithTwoWorkspaces(t, h), Permissions: []string{"git:read"}, Workspace: "w1"})
@@ -191,6 +192,7 @@ func TestBoundTokens_AnAgentLeavesItsBindingRepeatedlyAndTheOwnerGetsOneEventAMi
 }
 
 func TestBoundTokens_AMaintenancePassRevokesATokenWhoseWorkspaceIsGone(t *testing.T) {
+	parallel(t)
 	h := startBoundTokensHub(t, hubtest.Config{})
 	alice := h.CreateUser(t, "alice")
 	h.AddWorkspace(t, access.Record{Slug: "w1", OwnerID: alice, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository, Status: access.StatusReady})

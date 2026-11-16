@@ -10,9 +10,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // pushEventType is the event every push handed to origin writes.
 const pushEventType = "parley.workspace.push"
 
@@ -51,6 +48,7 @@ func pushOrigin(t *testing.T) *gitrepotest.Origin {
 }
 
 func TestWorkspacePush_ADeveloperPublishesALandedBranchFromTheShell(t *testing.T) {
+	parallel(t)
 	origin := pushOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
 	h.createReady(t, "demo", origin.URL())
@@ -77,6 +75,7 @@ func TestWorkspacePush_ADeveloperPublishesALandedBranchFromTheShell(t *testing.T
 }
 
 func TestWorkspacePush_AnAgentsForcedPushIsStoppedByTheLeaseAndSucceedsAfterASync(t *testing.T) {
+	parallel(t)
 	origin := pushOrigin(t)
 	origin.Branch("feature", "main")
 	h := startWorkspaceHub(t, origin, "demo")

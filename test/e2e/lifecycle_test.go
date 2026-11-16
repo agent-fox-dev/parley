@@ -57,6 +57,8 @@ func git(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// The test sends SIGTERM to its own process, which would stop every hub of
+// a test running beside it, so it runs alone.
 func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *testing.T) {
 	dir := t.TempDir()
 	const secret = "gh-secret-value-0451"
@@ -144,6 +146,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 }
 
 func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
+	parallel(t)
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Fatalf("git is needed: %v", err)
 	}
