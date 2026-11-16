@@ -274,6 +274,17 @@ func asJSON(t *testing.T, v any) map[string]any {
 // stored then.
 func (w *world) landNow(t *testing.T, ch change.Change, by change.Caller, session *string) land.Attempt {
 	t.Helper()
+	a, err := w.runLand(t, ch, by, session)
+	if err != nil {
+		t.Fatalf("run attempt of %s: %v", ch.Ref, err)
+	}
+	return a
+}
+
+// runLand is landNow returning the engine's error in place of failing the
+// test on it, with the attempt as it is stored after the run.
+func (w *world) runLand(t *testing.T, ch change.Change, by change.Caller, session *string) (land.Attempt, error) {
+	t.Helper()
 	ctx := context.Background()
 	a := land.Attempt{
 		ID: uuid.New().String(), Workspace: ch.WorkspaceSlug, TargetBranch: ch.TargetBranch, Status: land.StatusRunning,
@@ -289,14 +300,28 @@ func (w *world) landNow(t *testing.T, ch change.Change, by change.Caller, sessio
 	if err := land.InsertAttempt(ctx, w.Store, a); err != nil {
 		t.Fatal(err)
 	}
-	if err := land.RunAttempt(ctx, w.land, a.Workspace, a.ID); err != nil {
-		t.Fatalf("run attempt of %s: %v", ch.Ref, err)
-	}
-	out, found, err := land.ReadAttempt(ctx, w.Store, a.Workspace, a.ID)
+	runErr := land.RunAttempt(ctx, w.land, a.Workspace, a.ID)
+	return w.attempt(t, a.ID), runErr
+}
+
+// attempt is the attempt id of api as it is stored.
+func (w *world) attempt(t *testing.T, id string) land.Attempt {
+	t.Helper()
+	a, found, err := land.ReadAttempt(context.Background(), w.Store, "api", id)
 	if err != nil || !found {
-		t.Fatalf("read attempt %s: %v, %v", a.ID, found, err)
+		t.Fatalf("read attempt %s: %v, %v", id, found, err)
 	}
-	return out
+	return a
+}
+
+// readChange is the change number of api as it is stored.
+func (w *world) readChange(t *testing.T, number int64) change.Change {
+	t.Helper()
+	ch, err := w.changes.ReadChange(context.Background(), nil, "api", number)
+	if err != nil {
+		t.Fatalf("read change %d: %v", number, err)
+	}
+	return ch
 }
 
 // eventsOf are the hub events of the type typ, oldest first.

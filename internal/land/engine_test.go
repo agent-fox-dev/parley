@@ -3,12 +3,15 @@ package land_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
 
@@ -94,6 +97,156 @@ func TestRun_RecordsTheLandWithTheMoveOfTheTarget(t *testing.T) {
 			m := metadata(t, pushes[0])
 			if m["before"] != onto || m["after"] != landed || m["direct"] != false || m["forced"] != false {
 				t.Errorf("parley.git.push metadata %v, want main from %s to %s, not direct, not forced", m, onto, landed)
+			}
+		})
+	}
+}
+
+func TestRun_BuildsAgainOnATargetThatMovedBeforeTheSwap(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// byLand moves main by landing another change, else by a commit
+		// written to it directly.
+		byLand bool
+	}{
+		{"by the land of another change", true},
+		{"by a direct update", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			other, ch := w.open(t, "left"), w.open(t, "right")
+			var moved string
+			var first land.Attempt
+			tries := 0
+			land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) {
+				if tries++; tries > 1 {
+					return
+				}
+				if c.byLand {
+					first = w.landNow(t, other, w.caller(), nil)
+					moved = *first.LandedSHA
+				} else {
+					moved = commit(t, w.api, "main", w.base, "direct", map[string]string{"d.txt": "d\n"})
+				}
+			}})
+
+			a := w.landNow(t, ch, w.caller(), nil)
+
+			if a.Status != land.StatusLanded || a.Attempts != 2 || a.OntoSHA == nil || *a.OntoSHA != moved {
+				t.Fatalf("attempt = %s after %d tries onto %v; want landed after 2 onto %s", a.Status, a.Attempts, a.OntoSHA, moved)
+			}
+			if got := head(t, w.api, "main"); got != *a.LandedSHA {
+				t.Errorf("main is at %s, want the landed %s", got, *a.LandedSHA)
+			}
+			if parent := gitrepotest.Git(t, w.api, "rev-parse", *a.LandedSHA+"^"); parent != moved {
+				t.Errorf("the landed commit's parent is %s, want the moved head %s", parent, moved)
+			}
+			if c.byLand && first.Attempts != 1 {
+				t.Errorf("the other change's attempt took %d tries, want 1", first.Attempts)
+			}
+		})
+	}
+}
+
+func TestRun_EndsAsContentionWhenEveryTryLostTheSwap(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name  string
+		limit int // 0 is the default
+		want  int
+	}{
+		{"with a limit of 3", 3, 3},
+		{"with the default limit", 0, 10},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t, func(d *land.Deps) { d.MaxAttempts = c.limit })
+			ch := w.open(t, "feature")
+			moves := []string{"base"}
+			land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) {
+				n := strconv.Itoa(len(moves))
+				msg := "moved " + n
+				commit(t, w.api, "main", head(t, w.api, "main"), msg, map[string]string{"moved" + n + ".txt": n})
+				moves = append([]string{msg}, moves...)
+			}})
+
+			a := w.landNow(t, ch, w.caller(), nil)
+
+			if a.Status != land.StatusFailed || a.Error == nil || *a.Error != land.ErrorContention || a.Attempts != c.want ||
+				a.LandedSHA != nil || a.FinishedAt == nil {
+				t.Fatalf("attempt = %s (%v) after %d tries, landed %v; want failed contention after %d, nothing landed",
+					a.Status, a.Error, a.Attempts, a.LandedSHA, c.want)
+			}
+			if got := gitrepotest.Git(t, w.api, "log", "--format=%s", "main"); got != strings.Join(moves, "\n") || len(moves) != c.want+1 {
+				t.Errorf("main holds %q, want only the %d commits that moved it on base", got, c.want)
+			}
+			if got := w.readChange(t, ch.Number).State; got != change.StateOpen {
+				t.Errorf("the change is %s, want open", got)
+			}
+			land.SetSeams(w.land, land.Seams{})
+			if again := w.landNow(t, ch, w.caller(), nil); again.Status != land.StatusLanded {
+				t.Errorf("a new land of the change ended %s, want landed", again.Status)
+			}
+		})
+	}
+}
+
+// failingGate is a policy gate that cannot answer.
+type failingGate struct{}
+
+func (failingGate) Evaluate(context.Context, land.GateInput) (land.GateAnswer, error) {
+	return land.GateAnswer{}, errors.New("the policy cannot be read")
+}
+
+func TestRun_EndsAsInternalWhenTheTargetOrAStepFails(t *testing.T) {
+	t.Parallel()
+	deleteMain := func(t *testing.T, w *world) { gitrepotest.Git(t, w.api, "update-ref", "-d", "refs/heads/main") }
+	for _, c := range []struct {
+		name string
+		// before prepares the world before the run, swap runs before the
+		// compare-and-swap, and change alters the change the attempt
+		// covers.
+		before, swap func(t *testing.T, w *world)
+		change       func(ch *change.Change)
+		// deleted is set when main is gone.
+		deleted bool
+	}{
+		{name: "the target deleted between the replay and the swap", swap: deleteMain, deleted: true},
+		{name: "the target deleted before the run", before: deleteMain, deleted: true},
+		{name: "the policy gate failing", before: func(_ *testing.T, w *world) { w.land.RegisterGate(failingGate{}) }},
+		{name: "git failing in the replay", change: func(ch *change.Change) { ch.HeadSHA = strings.Repeat("f", 40) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			ch := w.open(t, "feature")
+			if c.before != nil {
+				c.before(t, w)
+			}
+			if c.swap != nil {
+				land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) { c.swap(t, w) }})
+			}
+			covered := ch
+			if c.change != nil {
+				c.change(&covered)
+			}
+
+			a, err := w.runLand(t, covered, w.caller(), nil)
+
+			if err == nil || a.Status != land.StatusFailed || a.Error == nil || *a.Error != land.ErrorInternal || a.LandedSHA != nil {
+				t.Fatalf("run = %v, attempt %s (%v) landed %v; want an error and failed internal", err, a.Status, a.Error, a.LandedSHA)
+			}
+			if got := w.readChange(t, ch.Number).State; got != change.StateOpen {
+				t.Errorf("the change is %s, want open", got)
+			}
+			want := w.base
+			if c.deleted {
+				want = ""
+			}
+			if got := head(t, w.api, "main"); got != want {
+				t.Errorf("main is at %q, want %q", got, want)
 			}
 		})
 	}

@@ -131,7 +131,14 @@ type Deps struct {
 	// land makes; a member left empty is the default's, Parley
 	// <parley@localhost>.
 	Committer Committer
+	// MaxAttempts is how many times an attempt tries to move the target
+	// before it ends failed contention; 0 is DefaultMaxAttempts.
+	MaxAttempts int
 }
+
+// DefaultMaxAttempts is how many times an attempt tries to move the target
+// when the hub names no limit.
+const DefaultMaxAttempts = 10
 
 // Committer is a name and e-mail address commits are made by.
 type Committer struct {
@@ -153,6 +160,15 @@ type Component struct {
 	mu       sync.RWMutex
 	gate     Gate
 	override OverrideRule
+
+	seams seams
+}
+
+// seams are where a test steers the engine; their zero value does
+// nothing.
+type seams struct {
+	beforeSwap func(ctx context.Context, id string, try int)
+	fault      func(point string) error
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
@@ -169,6 +185,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Committer.Email == "" {
 		d.Committer.Email = DefaultCommitterEmail
+	}
+	if d.MaxAttempts <= 0 {
+		d.MaxAttempts = DefaultMaxAttempts
 	}
 	c.deps = d
 }

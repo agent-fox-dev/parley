@@ -26,7 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target (`engine.go`, `replay.go`, `commit.go`), the policy gate and override rule registration points (`gate.go`), and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
+| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the policy gate and override rule registration points (`gate.go`), and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -4309,7 +4309,8 @@ of its own diff and no patch.
 
 `internal/hub/land.go` adds the part `composeLand`, after `composeChanges`
 in `parts`. It creates a zero `land.Component` (`Land()`), adds
-`land.SchemaStep` (the step `land_attempts`), registers its `Routes()`
+`land.SchemaStep` (the step `land_attempts`) and `land.JournalStep` (the
+step `land_journal`), registers its `Routes()`
 with `AddRoute`, registers `WorkspaceDeleted` as a remover of the
 workspace teardown, which deletes a deleted workspace's attempts in the
 delete's transaction, and binds the component in the start hook `land`
@@ -4321,7 +4322,8 @@ to the store (`Store`), the hub's git opening
 `land.by_author` and `land.delete_source`, the access service
 (`Access`), the event component (`Events`), the ref writer
 (`RefWriter`) and the hub's clock and logger; `AdjustLand` adjusters run
-before the bind.
+before the bind, and `Bind` defaults `MaxAttempts` to 10. The start hook
+`land-journal`, after `land`, runs `(*land.Component).Reconcile`.
 
 The schema keeps `land_attempts` (one row per attempt, keyed by its
 UUID, with the workspace, the target branch, the status, constrained to
@@ -4355,12 +4357,19 @@ classified them; `(*land.Component).Attribute(ctx, workspace, report)`
 
 The engine (`engine.go`) runs one running attempt: it reads the target
 workspace and opens its repository, asks the policy gate once per covered
-change, bottom first (`judge`), reads the target head, builds the commits
+change, bottom first (`judge`), then tries up to `Deps.MaxAttempts`
+times: it counts the try in `attempts`, reads the target head (a target
+branch that does not exist ends the attempt `failed` `internal`; a land
+never creates it), builds the commits
 to land (`replay.go`: `build` replays each change's `base..head` of the
 version the attempt stored with `RebaseFromAs` onto the head, the
 landing identity `Deps.Committer`, default `Parley <parley@localhost>`,
 as committer, and keeps one `Commit` per commit that did not become
-`""`), and hands the result to `commit` (`commit.go`). Every final status
+`""`), and hands the result to `commit` (`commit.go`). A `commit` that
+finds the target moved since it was read starts the next try on the new
+head; when the last try lost, the attempt ends `failed` `contention`. A
+gate, store or git error other than a conflict ends it `failed`
+`internal` and is returned to the engine's caller. Every final status
 is written by `finish`, in the transaction that ends the attempt; `end`
 runs it in a transaction of its own, `fail` ends the attempt `failed`
 `internal`.
@@ -4376,14 +4385,32 @@ change whose answer is not `ready` ends the attempt `blocked`.
 recorded without moving anything. Otherwise the target moves through the
 ref writer: `pushrule.AllowedVerdict` for the one update `refs/heads/<target>`
 from the head read to the new head, without `Evaluate`, so a protected
-target moves like any other, then `Apply` with `Via` `land` and no
-version kind (a `ref_moved` outcome ends the attempt `failed`
-`contention`). Once the ref moved the engine runs on
-`context.WithoutCancel`: `settle` records the land in one store
-transaction (`SetLanded` per change with `landed` and its commit mapping,
-the attempt finished `landed`, one `parley.change.land` per change), and
-`Finish` then writes the `parley.git.push` event. An error after the
-move leaves the attempt running.
+target moves like any other. Before the move, a `land_journal` row is
+committed in a transaction of its own: the attempt's id (one row per
+attempt, deleted with it), its workspace, the ref, its old and new heads,
+and as JSON the tries, the `commits` entries, the policy revision, the
+override and the finish time, which the running attempt's row does not
+hold. Then `Apply` with `Via` `land` and no version kind moves the ref; a
+`ref_moved` outcome, which a deleted or locked target also gives, deletes
+the row and returns to the engine for the next try. Once the ref moved
+the engine runs on `context.WithoutCancel`: `settle` records the land in
+one store transaction (`SetLanded` per change with `landed` and its
+commit mapping, the attempt finished `landed`, one `parley.change.land`
+per change), and `Finish` then writes the `parley.git.push` event. Every
+`finish` deletes the attempt's journal row in its transaction. An error
+after the move leaves the attempt running.
+
+`Reconcile`, before the listener binds, reads every journal row: one
+whose ref holds its new head is completed with `settle` in one
+transaction, as the engine would have (an attempt already final has its
+row deleted, nothing written twice), and the ref writer's own journal
+(`push-journal`) writes the `parley.git.push` of a move whose `Finish`
+did not run; any other row moved nothing and is deleted, its attempt left
+`running`. A row whose repository cannot be read or that cannot be
+settled is logged and kept for the next start. A second run finds no
+row. After a stop at any point of the step the hub thus comes up with
+the target at its old head and the change `open`, or with the target at
+the new head and the land recorded once.
 
 ### Hub events
 

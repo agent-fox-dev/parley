@@ -4394,7 +4394,16 @@ the author, author date and message of the commit it replays and the
 landing identity as committer, `Parley <parley@localhost>` by default.
 The target then moves from `onto_sha` to `landed_sha` with a
 compare-and-swap, which is not a push: the push rules, a protected branch
-included, do not apply. The move is followed by one store transaction
+included, do not apply. When another write moved the target since it was
+read, the attempt reads the new head, replays the changes onto it and
+tries again; `attempts` counts every try, and `onto_sha` is the head the
+try that moved the target was built on. After 10 lost tries the attempt
+ends `failed` with `error` `contention`, nothing of it in the target and
+the change still `open`, so a new land may follow. A target branch that
+does not exist when the attempt reads or moves it, or a policy gate,
+store or git failure other than a conflict, ends the attempt `failed`
+with `error` `internal`; a land never creates its target branch. The
+move is followed by one store transaction
 that marks each change `landed` (`landed` = `{sha, at, by, land_id,
 commits}`, every landed commit then found by the change's by-commit
 lookup), makes the attempt final and writes one `parley.change.land`
@@ -4407,6 +4416,14 @@ When every commit was left out, the attempt ends `landed` with `noop`
 `true`, `landed_sha` and `onto_sha` both the unchanged target head and
 `commits` `[]`; the change is `landed` at that head, `parley.change.land`
 says `noop` `true`, and no `parley.git.push` is written.
+
+The move and its record cannot share one transaction, so the hub enters
+the move in a journal first. A hub that stops at any point of a land
+comes up, before it serves a request, in one of two states: the target at
+its old head, the change `open`, no `parley.change.land` event and the
+attempt not `landed`; or the target at the new head, the change `landed`
+with every landed commit mapped, the attempt `landed` and the land's
+events written once.
 
 The three reads need the scope `changes:read` and read access to
 `{slug}`. Both lists are [lists](#lists) ordered newest first: by

@@ -16,6 +16,11 @@ import (
 // records the land as one step (commit.go). Every final status is written
 // by finish.
 //
+// A target that moved between the replay and the compare-and-swap has the
+// changes built again on its new head and the swap tried again, each try
+// counted in attempts, until Deps.MaxAttempts tries lost, which ends the
+// attempt failed contention.
+//
 // An error that leaves the attempt without a final status is returned:
 // one after the target moved leaves it running, since only the record of
 // the land may end it then.
@@ -40,32 +45,45 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 		a.Status, a.Blocked = StatusBlocked, blocked
 		return c.end(ctx, a)
 	}
-	a.Attempts++
-	onto, found, err := repo.ResolveBranch(ctx, a.TargetBranch)
-	if err == nil && !found {
-		err = fmt.Errorf("target branch %s of %s not found", a.TargetBranch, a.Workspace)
+	for {
+		a.Attempts++
+		onto, found, err := repo.ResolveBranch(ctx, a.TargetBranch)
+		if err == nil && !found {
+			// A land never creates its target: a branch deleted since the
+			// change was opened ends the attempt.
+			err = fmt.Errorf("target branch %s of %s not found", a.TargetBranch, a.Workspace)
+		}
+		if err != nil {
+			return c.fail(ctx, a, err)
+		}
+		b, report, err := c.build(ctx, repo, a, onto)
+		switch {
+		case err != nil:
+			return c.fail(ctx, a, err)
+		case report != nil:
+			a.Status, a.Conflict = StatusConflict, report
+			return c.end(ctx, a)
+		}
+		if c.seams.beforeSwap != nil {
+			c.seams.beforeSwap(ctx, a.ID, a.Attempts)
+		}
+		moved, err := c.commit(ctx, repo, ws, a, b)
+		switch {
+		case errors.Is(err, errStopped):
+			return err
+		case errors.Is(err, errTargetMoved):
+			// Another writer moved the target since it was read: the
+			// changes are built again on its new head, up to the limit.
+			if a.Attempts >= c.deps.MaxAttempts {
+				a.Status, a.Error = StatusFailed, new(ErrorContention)
+				return c.end(ctx, a)
+			}
+		case err != nil && !moved:
+			return c.fail(ctx, a, err)
+		default:
+			return err
+		}
 	}
-	if err != nil {
-		return c.fail(ctx, a, err)
-	}
-	b, report, err := c.build(ctx, repo, a, onto)
-	switch {
-	case err != nil:
-		return c.fail(ctx, a, err)
-	case report != nil:
-		a.Status, a.Conflict = StatusConflict, report
-		return c.end(ctx, a)
-	}
-	moved, err := c.commit(ctx, repo, ws, a, b)
-	switch {
-	case errors.Is(err, errTargetMoved):
-		// The target is no longer the head the commits were built on.
-		a.Status, a.Error = StatusFailed, new(ErrorContention)
-		return c.end(ctx, a)
-	case err != nil && !moved:
-		return c.fail(ctx, a, err)
-	}
-	return err
 }
 
 // judge asks the policy gate about each change a covers, bottom first, and
@@ -122,12 +140,35 @@ func (c *Component) end(ctx context.Context, a Attempt) error {
 // finish writes, in tx, the final status of the attempt a with its result
 // members, finished now unless a says when. It is the one place an attempt
 // becomes final.
+//
+// The attempt's entry in the land journal goes with it: a final attempt
+// has nothing left to complete at the next start.
 func (c *Component) finish(ctx context.Context, tx *sql.Tx, a Attempt) error {
 	if a.FinishedAt == nil {
 		a.FinishedAt = new(c.now())
 	}
-	return finishAttempt(ctx, tx, a)
+	if err := finishAttempt(ctx, tx, a); err != nil {
+		return err
+	}
+	return unjournal(ctx, tx, a.ID)
 }
+
+// fault is asked at each point of the atomic step whether the engine is
+// to stop there, as a stop of the process would stop it; it is nil but in
+// tests.
+func (c *Component) fault(point string) error {
+	if c.seams.fault == nil {
+		return nil
+	}
+	if err := c.seams.fault(point); err != nil {
+		return fmt.Errorf("%w %s: %w", errStopped, point, err)
+	}
+	return nil
+}
+
+// errStopped is the error of an engine stopped at a point of the atomic
+// step: it writes nothing more, as a hub process that stops there.
+var errStopped = errors.New("stopped")
 
 // now is the component's clock, in UTC.
 func (c *Component) now() time.Time { return c.deps.Now().UTC() }

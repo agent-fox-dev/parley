@@ -39,3 +39,25 @@ func RunAttempt(ctx context.Context, c *Component, workspace, id string) error {
 	}
 	return c.run(ctx, a)
 }
+
+// Seams are the points a test steers the engine at: BeforeSwap runs
+// between the replay and each compare-and-swap of the target, with the
+// number of the try; Fault is asked at each point of the atomic step
+// (before-journal, before-swap, after-swap, in-bookkeeping,
+// after-bookkeeping), and an error stops the engine there as a stop of
+// the process would, writing nothing more.
+type Seams struct {
+	BeforeSwap func(ctx context.Context, id string, try int)
+	Fault      func(point string) error
+}
+
+// SetSeams sets the seams of c, before it runs an attempt.
+func SetSeams(c *Component, s Seams) {
+	c.seams = seams{beforeSwap: s.BeforeSwap, fault: s.Fault}
+}
+
+// Journalled counts the entries of the land journal in s.
+func Journalled(ctx context.Context, s *store.Store) (n int, err error) {
+	err = s.Main().QueryRowContext(ctx, `SELECT COUNT(*) FROM land_journal`).Scan(&n)
+	return n, err
+}

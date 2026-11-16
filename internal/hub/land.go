@@ -8,8 +8,13 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// landHook is the name of the start hook that binds the land component.
-const landHook = "land"
+// landHook is the name of the start hook that binds the land component;
+// landJournalHook the name of the one after it that completes or drops
+// the lands a stop left in the land journal.
+const (
+	landHook        = "land"
+	landJournalHook = "land-journal"
+)
 
 // composeLand adds the landing: the schema of the land attempts, the read
 // routes of the attempts per change, per workspace and by id, whose scope
@@ -28,6 +33,7 @@ func composeLand(c *Composition) {
 	comp := &land.Component{}
 	c.land = comp
 	c.AddSchemaStep(land.SchemaStep)
+	c.AddSchemaStep(land.JournalStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
@@ -53,6 +59,7 @@ func composeLand(c *Composition) {
 		comp.Bind(d)
 		return nil
 	})
+	c.AddStartHook(landJournalHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
 }
 
 // landWorkspaces reads the workspace records for the land component, with
