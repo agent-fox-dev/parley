@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -39,10 +40,11 @@ const changePath = "/workspaces/:slug/changes/:number"
 var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land", "no-auto-land", "target"}
 
 // newChangeCommand builds parley change: the changes of a workspace, their
-// versions and their diffs, their stacks, their edits, abandon, restore,
-// restack and land, their land attempts, and waiting for one.
+// versions and their diffs, their stacks, their conflicts, their edits,
+// abandon, restore, restack and land, their land attempts, and waiting for
+// one.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list, read, edit, abandon, restore, restack, land and wait for the changes of a workspace, and read their versions, diffs, stacks and land attempts",
+	return group("change", "Open, list, read, edit, abandon, restore, restack, land and wait for the changes of a workspace, and read their versions, diffs, stacks, conflicts and land attempts",
 		newChangeOpenCommand(),
 		newChangeEditCommand(),
 		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
@@ -67,6 +69,7 @@ func newChangeCommand() *cobra.Command {
 				return sendWith(c, nil, map[string]any{})
 			},
 		}), true),
+		newChangeConflictCommand(),
 		newChangeLandCommand(),
 		newChangeLandsCommand(),
 		newChangeWaitCommand(),
@@ -113,6 +116,72 @@ func newChangeCommand() *cobra.Command {
 			send:  diffRevisions,
 		}.build(), true, "version", "against"),
 	)
+}
+
+// newChangeConflictCommand builds parley change conflict: the change's
+// current conflict report, or with --file one content-conflicted file of it
+// as text with conflict markers.
+func newChangeConflictCommand() *cobra.Command {
+	return withNumbers(scmRead{
+		command: command{
+			Name:        "conflict",
+			Description: "Show the conflict report of a change against what it would be rebased onto now, or one conflicted file of it with conflict markers",
+			Path:        changePath + "/conflict",
+			Args:        []argSpec{slugArg, numberArg},
+			FailOn: []failOn{{
+				Name:        "conflict",
+				Description: "exit 3 when the change does not rebase without a conflict",
+				Check:       changeConflictIn,
+			}},
+		},
+		query: []queryFlag{
+			{name: "file", param: "path", usage: "print the content-conflicted file at this path as text with target and change conflict markers, instead of the report"},
+		},
+		check: oneConflictForm,
+		send:  readConflict,
+	}.build(), true)
+}
+
+// oneConflictForm refuses --file with --fail-on-conflict: the file is
+// text, which holds no mergeable to fail on.
+func oneConflictForm(cmd *cobra.Command) error {
+	fs := cmd.Flags()
+	if failOn, _ := fs.GetBool("fail-on-conflict"); failOn && fs.Changed("file") {
+		return usageError("%s takes --file or --fail-on-conflict, not both", cmd.CommandPath())
+	}
+	return nil
+}
+
+// readConflict is the run step of parley change conflict. Without --file
+// it prints the report as JSON; with it, query holds the path alone and
+// the file route's text is written to stdout as received, without JSON
+// framing and without a newline added, once the hub has answered 200.
+func readConflict(c *call, query url.Values) error {
+	if !c.cmd.Flags().Changed("file") {
+		return sendWith(c, nil, nil)
+	}
+	// The file route is the report route's child; the declaration names
+	// the report route, which the JSON help shows.
+	file := *c
+	file.decl.Path = c.decl.Path + "/file"
+	// Any form but JSON is the text, and an error is JSON either way.
+	body, err := readRaw(&file, query, "*/*")
+	if err != nil {
+		return err
+	}
+	if _, err := c.stdout.Write(body); err != nil {
+		return clientError("cannot write the file's text: %v", err)
+	}
+	return nil
+}
+
+// changeConflictIn is the condition of parley change conflict
+// --fail-on-conflict: the answer's mergeable is conflict.
+func changeConflictIn(result []byte) (bool, string) {
+	if holds, _ := conflictIn(result); !holds {
+		return false, ""
+	}
+	return true, "the change does not rebase onto what it would sit on without a conflict: mergeable is conflict"
 }
 
 // newChangeOpenCommand builds parley change open: a change of a source
