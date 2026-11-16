@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -212,9 +213,15 @@ func (q *testQueue) count(t testing.TB, slug string) int {
 
 // scriptedHandler is a Handler that records every attempt it is given. A
 // blocking handler holds each attempt until the test releases it with the
-// error the attempt returns; one that does not block returns nil at once.
+// error the attempt returns; one that does not block returns nil at once,
+// or what run returns when the test sets it.
 type scriptedHandler struct {
 	block bool
+	// run, when set, is what an attempt of a handler that does not block
+	// does.
+	run func(ctx context.Context, j Job) error
+	// settled, when set, is what Settled does.
+	settled func(ctx context.Context, tx *sql.Tx, j Job, willRetry bool) error
 	// entered receives every job an attempt is given, as it begins.
 	entered chan Job
 
@@ -259,6 +266,9 @@ func (h *scriptedHandler) Run(ctx context.Context, j Job) error {
 	}()
 	h.entered <- j
 	if !h.block {
+		if h.run != nil {
+			return h.run(ctx, j)
+		}
 		return nil
 	}
 	select {
@@ -269,8 +279,14 @@ func (h *scriptedHandler) Run(ctx context.Context, j Job) error {
 	}
 }
 
-// Settled accepts every settlement.
-func (h *scriptedHandler) Settled(context.Context, *sql.Tx, Job, bool) error { return nil }
+// Settled does what settled does, and accepts every settlement when it is
+// not set.
+func (h *scriptedHandler) Settled(ctx context.Context, tx *sql.Tx, j Job, willRetry bool) error {
+	if h.settled != nil {
+		return h.settled(ctx, tx, j, willRetry)
+	}
+	return nil
+}
 
 // Calls are the ids of the jobs the attempts were given, in call order.
 func (h *scriptedHandler) Calls() []string {
@@ -374,28 +390,50 @@ func waitClosed(t testing.TB, c <-chan struct{}, what string) {
 	}
 }
 
-// status is the status of the job id as committed.
-func (q *testQueue) status(t testing.TB, id string) string {
+// get is the job id as committed.
+func (q *testQueue) get(t testing.TB, id string) Job {
 	t.Helper()
 	j, err := q.Get(context.Background(), id)
 	if err != nil {
 		t.Fatalf("Get %s: %v", id, err)
 	}
-	return j.Status
+	return j
 }
 
-// fail leaves the job id failed after its attempt number retries, with
-// errText and its next attempt at next, as a failed attempt's settlement
-// does.
-func (q *testQueue) fail(t testing.TB, id string, retries int, errText string, next time.Time) {
+// status is the status of the job id as committed.
+func (q *testQueue) status(t testing.TB, id string) string {
 	t.Helper()
-	err := q.st.Tx(context.Background(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(context.Background(),
-			`UPDATE jobs SET status = ?, retry_count = ?, error = ?, next_attempt_at = ? WHERE id = ?`,
-			StatusFailed, retries, errText, next.UnixNano(), id)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("fail job %s: %v", id, err)
+	return q.get(t, id).Status
+}
+
+// attempt runs one attempt of the job id through the queue and returns the
+// job as its settlement left it: when the job is failed, the clock moves to
+// its next attempt; a pass claims it, and the blocking handler h returns
+// err.
+func (q *testQueue) attempt(t testing.TB, h *scriptedHandler, id string, err error) Job {
+	t.Helper()
+	if j := q.get(t, id); j.Status == StatusFailed {
+		if j.NextAttemptAt == nil {
+			t.Fatalf("job %s is failed without a next attempt", id)
+		}
+		q.clock.Set(*j.NextAttemptAt)
+	}
+	q.pass(t)
+	if got := h.Enter(t); got.ID != id {
+		t.Fatalf("the pass ran job %s, want %s", got.ID, id)
+	}
+	q.finish(t, h, id, err)
+	return q.get(t, id)
+}
+
+// failTimes runs n attempts of the job id that fail retryably, each one
+// once the job's next attempt is due.
+func (q *testQueue) failTimes(t testing.TB, h *scriptedHandler, id string, n int) {
+	t.Helper()
+	for i := range n {
+		if j := q.attempt(t, h, id, errors.New("upstream unreachable")); j.Status != StatusFailed || j.RetryCount != i+1 {
+			t.Fatalf("after failure %d job %s is %s with retry count %d, want failed with %d", i+1, id, j.Status,
+				j.RetryCount, i+1)
+		}
 	}
 }

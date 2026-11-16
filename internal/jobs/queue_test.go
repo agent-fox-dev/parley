@@ -215,7 +215,8 @@ func TestPass_RunsOneJobOfATypeAndWorkspaceAtATime(t *testing.T) {
 			}
 			if tc.failFirst {
 				q.finish(t, h, a.ID, errors.New("upstream unreachable"))
-				q.fail(t, a.ID, 1, "upstream unreachable", q.clock.Now())
+				// The first retry is due 4 s after the failure.
+				q.clock.Advance(4 * time.Second)
 			}
 
 			q.pass(t)
@@ -377,7 +378,6 @@ func TestPass_RequeuesAFailedJobWhenItsNextAttemptIsDue(t *testing.T) {
 			h.Enter(t)
 			failedAt := q.clock.Now()
 			q.finish(t, h, j.ID, errors.New("upstream unreachable"))
-			q.fail(t, j.ID, 1, "upstream unreachable", failedAt.Add(4*time.Second))
 			if busy {
 				for i := range MaxRunning {
 					q.enqueue(t, "probe", fmt.Sprintf("busy%d", i), json.RawMessage(`{}`))

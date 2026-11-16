@@ -18,6 +18,10 @@ import (
 // MaxRunning is the most attempts the queue runs at once.
 const MaxRunning = 4
 
+// MaxRetries is the most retries of a job: the retryable failure of an
+// attempt at this retry count dead-letters the job.
+const MaxRetries = 20
+
 // DefaultInterval is how often the dispatcher passes when Deps sets no
 // interval, so that a queued job starts within seconds even without a wake.
 const DefaultInterval = time.Second
@@ -326,27 +330,8 @@ func (q *Queue) drop(id string) {
 // work runs the attempt of c and settles its outcome.
 func (q *Queue) work(d Deps, c claim) {
 	defer q.drop(c.job.ID)
-	err := c.handler.Run(c.ctx, c.job)
-	q.settle(context.WithoutCancel(c.ctx), d, c.job, err)
-}
-
-// settle records the outcome of an attempt of j. A completed attempt sets
-// the job completed in a transaction of its own; it is recorded only while
-// the job is still running.
-func (q *Queue) settle(ctx context.Context, d Deps, j Job, runErr error) {
-	if runErr != nil {
-		d.Logger.Error("job attempt failed", "job_id", j.ID, "error", runErr)
-		return
-	}
-	err := d.Store.Tx(ctx, func(tx *sql.Tx) error {
-		now := d.Clock.Now().UTC().UnixNano()
-		_, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, completed_at = ?, updated_at = ?, error = NULL,
-	detail = NULL, next_attempt_at = NULL WHERE id = ? AND status = ?`, StatusCompleted, now, now, j.ID, StatusRunning)
-		return err
-	})
-	if err != nil {
-		d.Logger.Error("settle job", "job_id", j.ID, "error", err)
-	}
+	err := runAttempt(c.ctx, c.handler, c.job)
+	q.settle(context.WithoutCancel(c.ctx), d, c.handler, c.job.ID, err)
 }
 
 // Run is the dispatcher: it passes at once, then every Interval and
