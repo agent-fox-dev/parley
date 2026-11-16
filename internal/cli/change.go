@@ -42,10 +42,10 @@ var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land"
 
 // newChangeCommand builds parley change: the changes of a workspace, their
 // versions and their diffs, their stacks, their conflicts, their edits,
-// abandon, restore, restack and land, their land attempts, and waiting for
-// one.
+// abandon, restore, restack and land, their land attempts, waiting for
+// one, and the verdicts and check results on their versions.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list, read, edit, abandon, restore, restack, land and wait for the changes of a workspace, and read their versions, diffs, stacks, conflicts and land attempts",
+	return group("change", "Open, list, read, edit, abandon, restore, restack, land and wait for the changes of a workspace, read their versions, diffs, stacks, conflicts and land attempts, and approve, reject and report checks on their versions",
 		newChangeOpenCommand(),
 		newChangeEditCommand(),
 		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
@@ -117,6 +117,11 @@ func newChangeCommand() *cobra.Command {
 			check: onePatchForm,
 			send:  diffRevisions,
 		}.build(), true, "version", "against"),
+		newChangeVerdictCommand("approve", "Approve a version of a change"),
+		newChangeVerdictCommand("reject", "Reject a version of a change, saying why"),
+		newChangeApprovalsCommand(),
+		newChangeCheckCommand(),
+		newChangeChecksCommand(),
 	)
 }
 
