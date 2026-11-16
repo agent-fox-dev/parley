@@ -92,3 +92,10 @@ func CountReplays(c *Component) func() int64 {
 	})
 	return n.Load
 }
+
+// RegisteredGate is the policy gate registered on c, nil for none.
+func (c *Component) RegisteredGate() Gate {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gate
+}

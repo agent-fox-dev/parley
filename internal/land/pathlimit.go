@@ -6,9 +6,11 @@ import (
 	"slices"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // CheckPaths holds a version to the path limits globs of a credential: it
@@ -40,6 +42,71 @@ func CheckPaths(ctx context.Context, repo *gitrepo.Repo, globs []string, base, h
 		}
 	}
 	return "", nil
+}
+
+// pathNotAllowed is the refusal of a write that would bring the file path,
+// outside a token's paths, into a version or a target: 403
+// path_not_allowed with the path as the member path of the error, as the
+// push rules and the source control API answer it.
+func pathNotAllowed(path string) error {
+	return server.PathNotAllowed(fmt.Sprintf("path %s is outside this token's allowed paths", path)).With("path", path)
+}
+
+// PathGuard holds a path-scoped token to its paths where a caller's
+// request makes a version or lands one: it is the version guard of the
+// manual restack and a request guard of the land call. A credential
+// without paths is not checked, and neither is what the hub does on its
+// own, which reaches neither guard.
+func (c *Component) PathGuard() PathGuard { return PathGuard{c} }
+
+// PathGuard is the path limit on the restacks and the lands of a
+// component's callers; see (*Component).PathGuard.
+type PathGuard struct{ c *Component }
+
+// CheckVersion refuses, with path_not_allowed, the version from base to
+// head a caller's restack of ch would record when a file of it is outside
+// the caller's paths, before the source branch moves. The replayed head is
+// read in the repository of the change's source, which the restack wrote
+// it to and which, for a fork, reads its parent's objects.
+func (g PathGuard) CheckVersion(ctx context.Context, caller change.Caller, ch change.Change, base, head string) error {
+	if caller.Paths == nil {
+		return nil
+	}
+	repo, err := g.c.deps.Repos(ctx, ch.Source.WorkspaceSlug)
+	if err != nil {
+		return err
+	}
+	refused, err := CheckPaths(ctx, repo, caller.Paths, base, head)
+	if err != nil || refused == "" {
+		return err
+	}
+	return pathNotAllowed(refused)
+}
+
+// Check refuses, with path_not_allowed, a land request when a file of the
+// current version of a change it would cover, bottom first, is outside the
+// caller's paths. It is asked before the land's preconditions, so a
+// refusal records no attempt, whatever else runs. The versions are read in
+// the target workspace's repository, which holds every version of its
+// changes.
+func (g PathGuard) Check(ctx context.Context, in RequestInput) error {
+	if in.Caller.Paths == nil {
+		return nil
+	}
+	repo, err := g.c.deps.Repos(ctx, in.Workspace)
+	if err != nil {
+		return err
+	}
+	for _, cc := range in.Changes {
+		refused, err := CheckPaths(ctx, repo, in.Caller.Paths, cc.Base, cc.Head)
+		if err != nil {
+			return err
+		}
+		if refused != "" {
+			return pathNotAllowed(refused)
+		}
+	}
+	return nil
 }
 
 // filesBetween are the paths that differ between base ("" for the empty

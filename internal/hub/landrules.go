@@ -16,6 +16,22 @@ package hub
 // records, the workspace records and the repositories the land component
 // is bound to, so it answers once the land component's start hook has
 // run, before the hub serves its first push.
+//
+// It registers the land component's path guard twice. As the change
+// component's version guard, asked by a caller's restack once the replay
+// is computed, with or without resolutions, and before the source branch
+// moves: a version with a file outside the caller's token paths is
+// refused 403 path_not_allowed, and nothing moves. The restacks the hub
+// makes on its own are not asked. And as a request guard of the land
+// call, asked after the caller is admitted and the body read and before
+// the land's preconditions: a change the attempt would cover, the changes
+// below it for a stack, with a file outside the paths is refused the same
+// way, and no attempt is recorded. Neither looks at the policy: a token
+// whose paths cover the change gets the answer any credential of its user
+// would.
 func composeLandRules(c *Composition) {
 	c.versionFiles = c.Land().VersionFiles()
+	paths := c.Land().PathGuard()
+	c.Changes().RegisterVersionGuard(paths)
+	c.Land().AddRequestGuard(paths)
 }

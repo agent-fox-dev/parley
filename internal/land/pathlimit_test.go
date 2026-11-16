@@ -287,3 +287,172 @@ func TestVersionFiles_AnswersTheFilesOfTheVersionAnUpdateMakes(t *testing.T) {
 		})
 	}
 }
+
+// refusal is the error_type and the member path of the error answer raw,
+// "" for those it does not have.
+func refusal(raw []byte) (errorType, path string) {
+	var answer struct {
+		Error struct {
+			ErrorType string `json:"error_type"`
+			Path      string `json:"path"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &answer)
+	return answer.Error.ErrorType, answer.Error.Path
+}
+
+func TestRestack_HoldsTheVersionItWouldRecordToTheTokensPaths(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name  string
+		globs []string
+		// conflicting moves main over docs/a.md too, so that the restack
+		// needs the resolution it is sent.
+		conflicting bool
+		refused     string
+	}{
+		{name: "a docs token without resolutions", globs: []string{"docs/**"}, refused: "src/b.go"},
+		{name: "a docs token with a resolution for docs/a.md", globs: []string{"docs/**"}, conflicting: true, refused: "src/b.go"},
+		{name: "a token whose globs cover every file", globs: []string{"docs/**", "src/**"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			commit(t, w.api, "feature", w.base, "change", map[string]string{"docs/a.md": "change\n", "src/b.go": "package b\n"})
+			ch := w.openBranch(t, "feature", w.caller())
+			moved := map[string]string{"m.txt": "m\n"}
+			body := map[string]any{}
+			if c.conflicting {
+				moved["docs/a.md"] = "main\n"
+				body["resolutions"] = []any{map[string]any{"path": "docs/a.md", "content": "resolved\n"}}
+			}
+			commit(t, w.api, "main", w.base, "moved", moved)
+			at := head(t, w.api, "feature")
+
+			status, raw := w.Call(t, http.MethodPost, fmt.Sprintf("/api/v1/workspaces/api/changes/%d/restack", ch.Number),
+				w.docsPAT(t, c.globs), body)
+
+			if c.refused != "" {
+				if typ, path := refusal(raw); status != http.StatusForbidden || typ != "path_not_allowed" || path != c.refused {
+					t.Fatalf("restack = %d %s, want 403 path_not_allowed with error.path %q", status, raw, c.refused)
+				}
+				if got := head(t, w.api, "feature"); got != at {
+					t.Errorf("feature moved to %s, want it at %s", got, at)
+				}
+				if v := w.readChange(t, ch.Number).Version; v != ch.Version {
+					t.Errorf("%s is at version %d, want %d", ch.Ref, v, ch.Version)
+				}
+				return
+			}
+			if status != http.StatusOK {
+				t.Fatalf("restack = %d %s, want 200", status, raw)
+			}
+			versions, err := w.changes.ReadVersions(context.Background(), nil, "api", ch.Number)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if last := versions[len(versions)-1]; len(versions) != 2 || last.Kind != change.KindRestack {
+				t.Errorf("%s has %d versions, the last of kind %s; want 2, the last a restack", ch.Ref, len(versions), last.Kind)
+			}
+		})
+	}
+}
+
+func TestLand_RefusesAChangeOutsideTheTokensPathsBeforeItsPreconditions(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	docs := w.docsPAT(t, []string{"docs/**"})
+	src := map[string]string{"src/main.go": "package main\n"}
+	for _, c := range []struct {
+		name string
+		// arrange returns the change to land, the land's body and the
+		// changes the land would cover.
+		arrange func(t *testing.T) (number int64, body any, covered []change.Change)
+	}{
+		{name: "a change touching src/main.go", arrange: func(t *testing.T) (int64, any, []change.Change) {
+			commit(t, w.api, "solo", w.base, "solo", src)
+			ch := w.openBranch(t, "solo", w.caller())
+			return ch.Number, nil, []change.Change{ch}
+		}},
+		{name: "a stack whose lower change touches src/main.go", arrange: func(t *testing.T) (int64, any, []change.Change) {
+			s := w.stack(t, "s", false, src, map[string]string{"docs/a.md": "a\n"})
+			return s[1].Number, stacked, s
+		}},
+		{name: "a change touching src/main.go with another attempt running", arrange: func(t *testing.T) (int64, any, []change.Change) {
+			commit(t, w.api, "busy", w.base, "busy", src)
+			ch := w.openBranch(t, "busy", w.caller())
+			w.insert(t, running(attemptID(1), "api", "main", time.Now().UTC(), ch.Number))
+			return ch.Number, nil, []change.Change{ch}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			number, body, covered := c.arrange(t)
+			for _, ch := range covered {
+				w.mergeable(t, ch.Number, change.MergeableClean)
+			}
+			attempts, events, target := w.attempts(t), w.eventCount(t), head(t, w.api, "main")
+
+			status, raw := w.post(t, docs, "api", number, "", body)
+
+			if typ, path := refusal(raw); status != http.StatusForbidden || typ != "path_not_allowed" || path != "src/main.go" {
+				t.Fatalf("land = %d %s, want 403 path_not_allowed with error.path src/main.go", status, raw)
+			}
+			if n := w.attempts(t); n != attempts {
+				t.Errorf("%d land attempts are recorded, want %d", n, attempts)
+			}
+			if got := head(t, w.api, "main"); got != target {
+				t.Errorf("main moved to %s, want it at %s", got, target)
+			}
+			if n := w.eventCount(t); n != events {
+				t.Errorf("%d events are written, want %d", n, events)
+			}
+		})
+	}
+}
+
+// A path-scoped token whose globs cover the change is answered by the
+// policy as a credential of the same user without paths is.
+func TestLand_AnswersATokenWithinItsPathsAsTheSameUserWithoutPaths(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.land.RegisterGate(w.policyGate)
+	policy := map[string]any{"default": map[string]any{"approvals": 0},
+		"rules": []any{map[string]any{"name": "docs", "paths": []string{"docs/**"}, "require": map[string]any{"approvals": 0, "checks": []string{"test"}}}}}
+	if status, raw := w.Call(t, http.MethodPut, "/api/v1/workspaces/api/policy", w.ownerKey, policy); status != http.StatusOK {
+		t.Fatalf("PUT api's policy = %d %s, want 200", status, raw)
+	}
+	for i, c := range []struct {
+		name  string
+		paths []string
+	}{
+		{name: "a token limited to docs", paths: []string{"docs/**"}},
+		{name: "a token of the same user without paths"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := "docs" + strconv.Itoa(i)
+			commit(t, w.api, branch, w.base, branch, map[string]string{"docs/" + branch + ".md": "a\n"})
+			ch := w.openBranch(t, branch, w.caller())
+			token := w.docsPAT(t, c.paths)
+
+			status, answer := w.landCall(t, token, ch.Number, "", nil)
+
+			errObj, _ := answer["error"].(map[string]any)
+			details, _ := errObj["details"].(map[string]any)
+			blocked, _ := details["blocked"].(map[string]any)
+			reqs, _ := blocked["requirements"].([]any)
+			if status != http.StatusConflict || errorType(answer) != "policy_blocked" || details["status"] != land.StatusBlocked || len(reqs) == 0 {
+				t.Fatalf("land before the check = %d %v, want 409 policy_blocked with the blocked attempt and its requirements", status, answer)
+			}
+			check := fmt.Sprintf("/api/v1/workspaces/api/changes/%d/checks/test", ch.Number)
+			if status, raw := w.Call(t, http.MethodPut, check, w.ownerKey, map[string]any{"status": "passed"}); status != http.StatusOK && status != http.StatusCreated {
+				t.Fatalf("PUT check test = %d %s, want it reported", status, raw)
+			}
+
+			status, answer = w.landCall(t, token, ch.Number, "", nil)
+
+			if status != http.StatusOK || answer["status"] != land.StatusLanded {
+				t.Errorf("land after the check = %d %v, want 200 landed", status, answer)
+			}
+		})
+	}
+}

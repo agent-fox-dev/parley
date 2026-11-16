@@ -47,6 +47,9 @@ type world struct {
 	workspaces *workspace.Service
 	// sessions is the session linker registered on the land component.
 	sessions *sessionStub
+	// policyGate is the landing policy's gate the hub registered, which
+	// the world removes and a test may register again.
+	policyGate land.Gate
 
 	owner, ownerKey, org string
 	// api is the git directory of api's repository, and base the commit
@@ -67,6 +70,7 @@ func newWorld(t *testing.T, adjust ...func(*land.Deps)) *world {
 			// The landing policy's gate is removed, so that a land is
 			// judged by the gate a test registers, every change ready
 			// without one.
+			w.policyGate = w.land.RegisteredGate()
 			w.land.RegisterGate(nil)
 			for _, fn := range adjust {
 				c.AdjustLand(fn)
