@@ -5,6 +5,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +20,9 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -82,6 +85,13 @@ var resetStates = []resetState{
 	{"the tips are equal with an earlier backup ref", func(t *testing.T, rc *resetCase) {
 		gitrepotest.Git(t, rc.copy, "update-ref", backupA, commitIn(t, rc.copy, "K"))
 	}, "none", "K"},
+}
+
+// resetTo brings rc into the first of resetStates whose reset takes action.
+func resetTo(t *testing.T, rc *resetCase, action string) {
+	t.Helper()
+	i := slices.IndexFunc(resetStates, func(s resetState) bool { return s.action == action })
+	resetStates[i].prepare(t, rc)
 }
 
 func TestResetToOrigin_AnswersPatchWithOutcome(t *testing.T) {
@@ -244,9 +254,8 @@ func TestResetToOrigin_EmitsEvents(t *testing.T) {
 	for _, action := range []string{"none", "created", "fast_forwarded", "replaced"} {
 		t.Run(action, func(t *testing.T) {
 			t.Parallel()
-			i := slices.IndexFunc(resetStates, func(s resetState) bool { return s.action == action })
 			rc := h.resetCarry(t, "events-"+strings.ReplaceAll(action, "_", "-"), nil)
-			resetStates[i].prepare(t, rc)
+			resetTo(t, rc, action)
 			local := refIn(rc.copy, headA)
 
 			if a := h.resetToOrigin(t, rc.slug, rc.patch.ID); a.status != http.StatusOK || a.patch["action"] != action {
@@ -438,15 +447,15 @@ func TestResetToOrigin_FetchFailures(t *testing.T) {
 			if e := h.patchEvents(t, rc.slug, ""); len(e) != 0 {
 				t.Errorf("the refusal wrote %d parley.patch.* events, want none", len(e))
 			}
+			if n := len(h.rebuilds.callsOf(rc.slug)); n != 0 {
+				t.Errorf("the refusal asked for %d rebuilds, want none", n)
+			}
 			for wait := time.Now(); open != nil && open.Load() != 0; time.Sleep(10 * time.Millisecond) {
 				if time.Since(wait) > 5*time.Second {
 					t.Fatal("a request to origin is still open 5 s after the answer: the fetch was not stopped")
 				}
 			}
 		})
-	}
-	if n := h.rebuilds.calls(); n != 0 {
-		t.Errorf("the refusals asked for %d rebuilds, want none", n)
 	}
 }
 
@@ -518,6 +527,9 @@ func TestResetToOrigin_LostRaceIsRefMoved(t *testing.T) {
 			if e := h.patchEvents(t, rc.slug, ""); len(e) != 0 {
 				t.Errorf("the lost race wrote %d parley.patch.* events, want none", len(e))
 			}
+			if n := len(h.rebuilds.callsOf(rc.slug)); n != 0 {
+				t.Errorf("the lost race asked for %d rebuilds, want none", n)
+			}
 
 			moves.Delete(rc.slug)
 			if a := h.resetToOrigin(t, rc.slug, rc.patch.ID); a.status != http.StatusOK {
@@ -525,7 +537,153 @@ func TestResetToOrigin_LostRaceIsRefMoved(t *testing.T) {
 			}
 		})
 	}
-	if n := h.rebuilds.calls(); n != 0 {
-		t.Errorf("the lost races asked for %d rebuilds, want none", n)
+}
+
+func TestResetToOrigin_QueuesRebuild(t *testing.T) {
+	t.Parallel()
+	h := startPatchHub(t)
+	// reset resets rc as the caller credential, whose reset event names the
+	// actor the enqueue must be given, and checks the answer and the one
+	// call of the enqueue.
+	reset := func(t *testing.T, rc *resetCase, credential, action, submitter string) {
+		t.Helper()
+		job := "job-" + rc.slug
+		h.rebuilds.answer(rc.slug, carrypatch.RebuildResult{Queued: true, JobID: job}, nil)
+
+		a := h.send(t, credential, http.MethodPost, "/workspaces/"+rc.slug+"/patches/"+rc.patch.ID+"/reset-to-origin", nil)
+		if a.status != http.StatusOK || a.patch["action"] != action || a.patch["rebuild_triggered"] != true || a.patch["rebuild_job_id"] != job {
+			t.Fatalf("reset = %d %s, want 200 with action %s, rebuild_triggered true and rebuild_job_id %s", a.status, a.raw, action, job)
+		}
+		e := h.patchEvents(t, rc.slug, carrypatch.EventPatchReset)
+		if len(e) != 1 {
+			t.Fatalf("the reset wrote %d parley.patch.reset events, want 1", len(e))
+		}
+		// The rebuild is asked for once the branch is at origin's tip and
+		// the reset is recorded.
+		want := []rebuildCall{{slug: rc.slug,
+			opts: carrypatch.RebuildOptions{SubmittedBy: submitter, ActorType: e[0].ActorType, ActorID: e[0].ActorID},
+			seen: rebuildSeen{head: rc.origin.Head("patch/a"), resets: 1}}}
+		if got := h.rebuilds.callsOf(rc.slug); !reflect.DeepEqual(got, want) {
+			t.Errorf("the enqueue got %+v, want %+v", got, want)
+		}
+	}
+	for _, action := range []string{"created", "fast_forwarded", "replaced"} {
+		for _, status := range []string{carrypatch.StatusActive, carrypatch.StatusConflict} {
+			t.Run(action+"/"+status, func(t *testing.T) {
+				t.Parallel()
+				rc := h.resetCarry(t, "queue-"+strings.ReplaceAll(action, "_", "-")+"-"+status, autoRebuild(true))
+				h.alter(t, rc.slug, rc.patch.ID, func(p *carrypatch.Patch) { p.Status = status })
+				resetTo(t, rc, action)
+				reset(t, rc, h.key, action, h.owner)
+			})
+		}
+	}
+	t.Run("the admin token, the setting at its default", func(t *testing.T) {
+		t.Parallel()
+		rc := h.resetCarry(t, "queue-admin", nil)
+		rc.origin.Commit("patch/a", "ahead")
+		reset(t, rc, h.Token, "fast_forwarded", event.ActorAdminToken)
+	})
+}
+
+func TestResetToOrigin_DoesNotQueueRebuild(t *testing.T) {
+	t.Parallel()
+	// turnOff holds the workspaces whose auto_rebuild_after_sync is turned
+	// off while their reset runs, after the reset read the workspace.
+	var turnOff sync.Map
+	var h *patchHub
+	h = startPatchHub(t, func(d *carrypatch.Deps) {
+		d.BeforeRefSwap = func(slug, _ string) {
+			if _, ok := turnOff.Load(slug); !ok {
+				return
+			}
+			if _, err := h.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = ?`, `{"auto_rebuild_after_sync":false}`, slug); err != nil {
+				t.Errorf("turn auto_rebuild_after_sync of %s off: %v", slug, err)
+			}
+		}
+	})
+	cases := []struct {
+		name, action, status string
+		setting, turnedOff   bool
+	}{
+		{"nothing to do", "none", carrypatch.StatusActive, true, false},
+		{"disabled patch fast-forwarded", "fast_forwarded", carrypatch.StatusDisabled, true, false},
+		{"disabled patch replaced", "replaced", carrypatch.StatusDisabled, true, false},
+		{"setting off, fast-forwarded", "fast_forwarded", carrypatch.StatusActive, false, false},
+		{"setting off, conflict patch replaced", "replaced", carrypatch.StatusConflict, false, false},
+		{"setting turned off while the reset runs", "fast_forwarded", carrypatch.StatusActive, true, true},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			rc := h.resetCarry(t, fmt.Sprintf("no-queue-%d", i), autoRebuild(c.setting))
+			h.alter(t, rc.slug, rc.patch.ID, func(p *carrypatch.Patch) { p.Status = c.status })
+			resetTo(t, rc, c.action)
+			h.rebuilds.answer(rc.slug, carrypatch.RebuildResult{Queued: true, JobID: "job-" + rc.slug}, nil)
+			if c.turnedOff {
+				turnOff.Store(rc.slug, true)
+			}
+
+			a := h.resetToOrigin(t, rc.slug, rc.patch.ID)
+			if _, job := a.patch["rebuild_job_id"]; a.status != http.StatusOK || a.patch["action"] != c.action ||
+				a.patch["rebuild_triggered"] != false || job {
+				t.Errorf("reset = %d %s, want 200 with action %s, rebuild_triggered false and no rebuild_job_id", a.status, a.raw, c.action)
+			}
+			if calls := h.rebuilds.callsOf(rc.slug); len(calls) != 0 {
+				t.Errorf("the reset asked for the rebuilds %+v, want none", calls)
+			}
+		})
+	}
+}
+
+func TestResetToOrigin_KeepsResetWhenNoRebuildIsQueued(t *testing.T) {
+	t.Parallel()
+	var log hubtest.LogBuffer
+	h := startPatchHub(t, func(d *carrypatch.Deps) { d.Logger = slog.New(slog.NewJSONHandler(&log, nil)) })
+	cases := []struct {
+		name   string
+		result carrypatch.RebuildResult
+		err    error
+		// logged is how many error records name the workspace.
+		logged int
+	}{
+		{"the workspace has a rebuild waiting already", carrypatch.RebuildResult{ExistingJobID: "job-waiting"}, nil, 0},
+		{"the enqueue fails", carrypatch.RebuildResult{}, errors.New("the job store refuses the job"), 1},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			rc := h.resetCarry(t, fmt.Sprintf("kept-%d", i), nil)
+			tip := rc.origin.Commit("patch/a", "ahead")
+			h.rebuilds.answer(rc.slug, c.result, c.err)
+
+			a := h.resetToOrigin(t, rc.slug, rc.patch.ID)
+			if _, job := a.patch["rebuild_job_id"]; a.status != http.StatusOK || a.patch["action"] != "fast_forwarded" ||
+				a.patch["rebuild_triggered"] != false || job {
+				t.Errorf("reset = %d %s, want 200 with action fast_forwarded, rebuild_triggered false and no rebuild_job_id", a.status, a.raw)
+			}
+			if head := refIn(rc.copy, headA); head != tip {
+				t.Errorf("the copy's patch/a = %s, want origin's tip %s", head, tip)
+			}
+			if e := h.patchEvents(t, rc.slug, carrypatch.EventPatchReset); len(e) != 1 {
+				t.Errorf("the reset wrote %d parley.patch.reset events, want 1", len(e))
+			}
+			if n := len(h.rebuilds.callsOf(rc.slug)); n != 1 {
+				t.Errorf("the reset asked for %d rebuilds, want 1", n)
+			}
+			logged := 0
+			for line := range strings.SplitSeq(log.String(), "\n") {
+				var rec map[string]any
+				if json.Unmarshal([]byte(line), &rec) == nil && rec["level"] == "ERROR" && rec["slug"] == rc.slug {
+					logged++
+					if c.err != nil && rec["error"] != c.err.Error() {
+						t.Errorf("the error record %s does not hold the enqueue's error %q", line, c.err)
+					}
+				}
+			}
+			if logged != c.logged {
+				t.Errorf("the log holds %d error records naming %s, want %d:\n%s", logged, rc.slug, c.logged, log.String())
+			}
+		})
 	}
 }

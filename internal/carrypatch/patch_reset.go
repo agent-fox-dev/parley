@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -40,12 +41,18 @@ const (
 // origin's tip.
 const originInSync = "in_sync"
 
+// autoRebuildAfterSyncKey is the workspace setting that tells whether a
+// patch branch moved to origin's tip queues a rebuild.
+const autoRebuildAfterSyncKey = "auto_rebuild_after_sync"
+
 // resetAnswer is the answer of a reset to origin: the patch, the action
-// the reset took and whether it queued a rebuild.
+// the reset took and whether it queued a rebuild, with the queued job's
+// id when it did.
 type resetAnswer struct {
 	Object
 	Action           string `json:"action"`
 	RebuildTriggered bool   `json:"rebuild_triggered"`
+	RebuildJobID     string `json:"rebuild_job_id,omitempty"`
 }
 
 // resetRoute answers POST /workspaces/:slug/patches/:id/reset-to-origin: it
@@ -61,10 +68,56 @@ func (c *Component) resetRoute(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	answer := resetAnswer{Object: ObjectOf(p, c.replacedSHA(r.Context(), ws.Slug, p.BranchName)), Action: action}
-	// The rebuild of a reset that moved the branch is asked for here, once
-	// the outcome is recorded; until then the answer reports none.
+	answer.RebuildTriggered, answer.RebuildJobID = c.rebuildAfterReset(r.Context(), ws, p, action, by)
 	server.WriteJSON(w, http.StatusOK, answer)
 	return nil
+}
+
+// rebuildAfterReset queues the rebuild of ws that a recorded reset taking
+// action on the patch p calls for, and reports whether a job was queued
+// and its id. It asks the registered RebuildEnqueuer only when the branch
+// moved, the patch is active or conflict, and the workspace's
+// auto_rebuild_after_sync, read now, is on. The caller submits the rebuild:
+// a user as its id, the admin token, which has none, as its actor type.
+// The reset stands whatever the enqueue answers: a workspace whose rebuild
+// is waiting already gets none, and an enqueue that fails is logged.
+func (c *Component) rebuildAfterReset(ctx context.Context, ws workspace.Workspace, p Patch, action string, by actor) (bool, string) {
+	// A reset that moved the branch asks for its rebuild also when the
+	// caller has left.
+	ctx = context.WithoutCancel(ctx)
+	if action == resetNone || p.Status != StatusActive && p.Status != StatusConflict || !c.autoRebuildAfterSync(ctx, ws) {
+		return false, ""
+	}
+	submitter := by.typ
+	if by.id != nil {
+		submitter = *by.id
+	}
+	res, err := c.Rebuilds().EnqueueRebuild(ctx, ws.Slug, RebuildOptions{SubmittedBy: submitter, ActorType: by.typ, ActorID: by.id})
+	if err != nil {
+		c.logger().LogAttrs(ctx, slog.LevelError, "queue the rebuild after a reset to origin",
+			slog.String("slug", ws.Slug), slog.String("branch", p.BranchName), slog.String("error", err.Error()))
+		return false, ""
+	}
+	if !res.Queued {
+		return false, ""
+	}
+	return true, res.JobID
+}
+
+// autoRebuildAfterSync reports whether the effective
+// auto_rebuild_after_sync of ws is on, read from the workspace's record
+// now, since a reset may have waited on origin for minutes; the record ws
+// was read from stands in when it cannot be read again. A missing key or
+// registry reads as the setting's default, on.
+func (c *Component) autoRebuildAfterSync(ctx context.Context, ws workspace.Workspace) bool {
+	if c.d.Settings == nil {
+		return true
+	}
+	if now, found, err := workspace.BySlug(ctx, c.d.Store.Main(), ws.Slug); err == nil && found {
+		ws = now
+	}
+	on, isBool := c.d.Settings.EffectiveSettings(ws.Settings, ws.DefaultBranch)[autoRebuildAfterSyncKey].(bool)
+	return on || !isBool
 }
 
 // resetToOrigin brings the branch of the patch id of ws to origin's tip and

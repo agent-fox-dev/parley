@@ -3,7 +3,7 @@
   "spec_id": "32",
   "spec_name": "patch_maintenance",
   "schema_version": 3,
-  "updated_at": "2026-11-16T21:57:54Z",
+  "updated_at": "2026-11-16T22:07:25Z",
   "tasks": [
     {
       "id": 1,
@@ -23,7 +23,7 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,

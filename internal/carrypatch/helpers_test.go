@@ -294,6 +294,14 @@ func startPatchHub(t *testing.T, adjust ...func(d *carrypatch.Deps)) *patchHub {
 	h.key = h.IssueKey(t, h.owner)
 	h.org = h.CreateOrg(t, "acme")
 	h.AddMember(t, h.org, h.owner)
+	h.rebuilds.observe = func(slug string) rebuildSeen {
+		var resets int
+		if err := h.Store.Main().QueryRow(`SELECT count(*) FROM hub_events WHERE workspace = ? AND type = ?`,
+			slug, carrypatch.EventPatchReset).Scan(&resets); err != nil {
+			t.Errorf("count the reset events of %s: %v", slug, err)
+		}
+		return rebuildSeen{head: refIn(h.repoPath(slug), "refs/heads/patch/a"), resets: resets}
+	}
 	return h
 }
 
@@ -532,6 +540,14 @@ func (h *patchHub) resetCarry(t *testing.T, slug string, edit func(w *workspace.
 	return &resetCase{slug: slug, origin: o, copy: dir, patch: p}
 }
 
+// autoRebuild is an edit of resetCarry that stores the setting
+// auto_rebuild_after_sync on.
+func autoRebuild(on bool) func(w *workspace.Workspace) {
+	return func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{"auto_rebuild_after_sync": json.RawMessage(fmt.Sprint(on))}
+	}
+}
+
 // withSettings is an edit of resetCarry that stores the settings
 // patch_branch_source source and patch_divergence_policy policy, "" for
 // none.
@@ -598,26 +614,79 @@ func (s *originSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, na
 	return "", false, nil
 }
 
-// recordingRebuilds is a rebuild enqueuer that records each call and
-// queues nothing.
+// recordingRebuilds is a rebuild enqueuer that records each call with
+// what the hub held when it was made, and answers a workspace as answer
+// set it: by default, that nothing was queued.
 type recordingRebuilds struct {
-	mu    sync.Mutex
-	slugs []string
-	opts  []carrypatch.RebuildOptions
+	mu      sync.Mutex
+	made    []rebuildCall
+	answers map[string]rebuildAnswer
+	// observe, when set, reads what the hub holds for a workspace when a
+	// rebuild of it is asked for.
+	observe func(slug string) rebuildSeen
+}
+
+// rebuildCall is a call of the recording enqueuer.
+type rebuildCall struct {
+	slug string
+	opts carrypatch.RebuildOptions
+	seen rebuildSeen
+}
+
+// rebuildSeen is what the hub held when a rebuild of a workspace was asked
+// for: the tip of patch/a in its copy, the branch of the reset cases, and
+// how many parley.patch.reset events it had.
+type rebuildSeen struct {
+	head   string
+	resets int
+}
+
+// rebuildAnswer is what the recording enqueuer answers a workspace.
+type rebuildAnswer struct {
+	result carrypatch.RebuildResult
+	err    error
+}
+
+// answer makes every later call for slug answer result and err.
+func (r *recordingRebuilds) answer(slug string, result carrypatch.RebuildResult, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.answers == nil {
+		r.answers = map[string]rebuildAnswer{}
+	}
+	r.answers[slug] = rebuildAnswer{result, err}
 }
 
 func (r *recordingRebuilds) EnqueueRebuild(_ context.Context, slug string, opts carrypatch.RebuildOptions) (carrypatch.RebuildResult, error) {
+	var seen rebuildSeen
+	if r.observe != nil {
+		seen = r.observe(slug)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.slugs, r.opts = append(r.slugs, slug), append(r.opts, opts)
-	return carrypatch.RebuildResult{}, nil
+	r.made = append(r.made, rebuildCall{slug: slug, opts: opts, seen: seen})
+	a := r.answers[slug]
+	return a.result, a.err
 }
 
 // calls is how often a rebuild was asked for.
 func (r *recordingRebuilds) calls() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.slugs)
+	return len(r.made)
+}
+
+// callsOf are the calls that asked for a rebuild of slug, oldest first.
+func (r *recordingRebuilds) callsOf(slug string) []rebuildCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []rebuildCall
+	for _, c := range r.made {
+		if c.slug == slug {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // countingSecrets is a secret reader that counts its reads.
