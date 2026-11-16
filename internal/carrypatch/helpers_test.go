@@ -280,6 +280,20 @@ func (h *patchHub) carryList(t *testing.T, slug string, status workspace.Status,
 	return ps
 }
 
+// bareCopy makes the hub's copy of slug a bare repository made by git init
+// holding the branches patch/a, patch/b and patch/c of carryList and the
+// backup ref of patch/a, and returns its directory.
+func (h *patchHub) bareCopy(t *testing.T, slug string) string {
+	t.Helper()
+	dir := h.repoPath(slug)
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	for _, b := range []string{"patch/a", "patch/b", "patch/c"} {
+		gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+b, commitIn(t, dir, b))
+	}
+	gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"patch/a", commitIn(t, dir, "replaced a"))
+	return dir
+}
+
 // patches are the stored patches of slug: those that are not deleted in
 // position order, then the deleted ones.
 func (h *patchHub) patches(t *testing.T, slug string) []carrypatch.Patch {
@@ -344,6 +358,20 @@ func (h *patchHub) send(t *testing.T, credential, method, path string, body any)
 func (h *patchHub) update(t *testing.T, slug, id string, body any) answer {
 	t.Helper()
 	return h.send(t, h.key, http.MethodPatch, "/workspaces/"+slug+"/patches/"+id, body)
+}
+
+// remove sends DELETE /workspaces/<slug>/patches/<id> as the owner with
+// body, nil for none.
+func (h *patchHub) remove(t *testing.T, slug, id string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodDelete, "/workspaces/"+slug+"/patches/"+id, body)
+}
+
+// restore sends POST /workspaces/<slug>/patches/<id>/restore as the owner
+// with body, nil for none.
+func (h *patchHub) restore(t *testing.T, slug, id string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/"+id+"/restore", body)
 }
 
 // patchEvents are the stored events of slug of type typ, every

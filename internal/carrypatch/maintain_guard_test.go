@@ -23,8 +23,8 @@ type maintenanceRoute struct {
 	// suffix is the path after /workspaces/<slug>/patches, with :id for the
 	// patch the route names.
 	suffix string
-	// body is a body of valid shape for a workspace whose patches are ids,
-	// in position order; nil sends none.
+	// body is a body the route accepts for a workspace whose patches are
+	// ids, in position order; nil sends none.
 	body func(ids []string) any
 }
 
@@ -32,7 +32,13 @@ type maintenanceRoute struct {
 // changes a patch list is added here when the component gets it.
 var maintenanceRoutes = []maintenanceRoute{
 	{name: "update", method: http.MethodPatch, suffix: "/:id", body: func([]string) any { return map[string]any{"description": "guarded"} }},
+	{name: "delete", method: http.MethodDelete, suffix: "/:id", body: func([]string) any { return ignoredBody }},
+	{name: "restore", method: http.MethodPost, suffix: "/:id/restore", body: func([]string) any { return ignoredBody }},
 }
+
+// ignoredBody is a body, not even JSON, that a route which takes none
+// ignores.
+const ignoredBody = "{not json"
 
 // namesPatch reports whether the route names a patch.
 func (rt maintenanceRoute) namesPatch() bool { return strings.Contains(rt.suffix, ":id") }
