@@ -159,6 +159,9 @@ func (r landWorkspaces) Workspace(ctx context.Context, q land.Querier, slug stri
 	if on, ok := settings["land.delete_source"].(bool); ok {
 		out.DeleteSource = on
 	}
+	if on, ok := settings["land.allow_override"].(bool); ok {
+		out.AllowOverride = on
+	}
 	return out, true, nil
 }
 

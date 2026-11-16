@@ -77,10 +77,11 @@ type Workspace struct {
 	// Ready is nil for a workspace a change may land in, and otherwise
 	// its refusal, such as 409 workspace_archived.
 	Ready error
-	// Strategy, ByAuthor and DeleteSource are the effective land.strategy,
-	// land.by_author and land.delete_source settings.
-	Strategy               string
-	ByAuthor, DeleteSource bool
+	// Strategy, ByAuthor, DeleteSource and AllowOverride are the effective
+	// land.strategy, land.by_author, land.delete_source and
+	// land.allow_override settings.
+	Strategy                              string
+	ByAuthor, DeleteSource, AllowOverride bool
 }
 
 // WorkspaceReader reads a workspace record through q, the caller's

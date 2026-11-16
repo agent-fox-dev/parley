@@ -1,5 +1,7 @@
 package hub
 
+import "github.com/agent-fox-dev/parley/internal/land"
+
 // composeLandRules adds the rules that surround landing once the change
 // component, the land component and the policy's evaluation exist, each
 // registered on the instance of the collaborator it plugs into
@@ -29,9 +31,23 @@ package hub
 // way, and no attempt is recorded. Neither looks at the policy: a token
 // whose paths cover the change gets the answer any credential of its user
 // would.
+//
+// It registers the override's two rules. The override guard, a request
+// guard of the land call asked after the path guard, refuses an override,
+// whatever the landing status of the changes, with 403
+// override_not_allowed and no attempt recorded: from a PAT bound to a
+// workspace or one of its forks, from anyone but the workspace's owner and
+// the admin token, and from everyone while the workspace's
+// land.allow_override is off. The override rule, asked by the land for a
+// gate answer that is not ready on a request the guard let through, lets a
+// pending change pass, one held back by approvals or checks, and never a
+// blocked one; the land records the override only when it let a change
+// pass. The policy's gate knows nothing of overrides.
 func composeLandRules(c *Composition) {
 	c.versionFiles = c.Land().VersionFiles()
 	paths := c.Land().PathGuard()
 	c.Changes().RegisterVersionGuard(paths)
 	c.Land().AddRequestGuard(paths)
+	c.Land().AddRequestGuard(c.Land().OverrideGuard())
+	c.Land().RegisterOverrideRule(land.PendingOverride{})
 }
