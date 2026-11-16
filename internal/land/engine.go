@@ -126,7 +126,8 @@ func (c *Component) judge(ctx context.Context, a Attempt) (revision int64, block
 			return 0, nil, false, err
 		}
 		answer, err := recovered("the policy gate", func() (GateAnswer, error) {
-			return gate.Evaluate(ctx, GateInput{Workspace: a.Workspace, Change: ch, Version: cov.Version, Caller: caller})
+			return gate.Evaluate(ctx, GateInput{Workspace: a.Workspace, Change: ch, Version: cov.Version,
+				Head: cov.Head, Base: cov.Base, Caller: caller})
 		})
 		if err != nil {
 			return 0, nil, false, fmt.Errorf("the policy gate on %s: %w", ref, err)

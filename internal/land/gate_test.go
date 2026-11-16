@@ -90,6 +90,31 @@ func TestRun_AsksTheGateOnceForEachChangeAndNotAgainOnARetry(t *testing.T) {
 	}
 }
 
+func TestRun_AsksTheGateAboutTheVersionTheAttemptLands(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	gate := &stubGate{}
+	w.land.RegisterGate(gate)
+	ch := w.open(t, "feature")
+	gate.answer(ch.Number, land.GateAnswer{Status: change.LandingBlocked})
+	a := attemptOf(ch, w.caller(), nil, time.Now().UTC())
+	newer := w.nextVersion(t, ch)
+
+	if _, err := w.run(t, a); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := gate.asked()
+	if len(calls) != 1 {
+		t.Fatalf("the gate was asked %d times, want once", len(calls))
+	}
+	if in := calls[0]; in.Version != ch.Version || in.Head != ch.HeadSHA || in.Base != *ch.BaseSHA {
+		t.Errorf("the gate was asked about version %d at %s on %s, want the landed version %d at %s on %s "+
+			"(the change is at version %d at %s)", in.Version, in.Head, in.Base, ch.Version, ch.HeadSHA, *ch.BaseSHA,
+			newer.Version, newer.HeadSHA)
+	}
+}
+
 func TestRun_RecordsTheOverrideOnlyWhenTheRuleLetAChangePass(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
