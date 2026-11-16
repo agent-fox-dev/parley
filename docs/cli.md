@@ -1994,8 +1994,8 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its twenty-three commands open,
-read, edit, abandon, restore, restack, resolve, land and wait for the
+reads no credential and sends no request. Its twenty-four commands open,
+read, edit, abandon, restore, restack, resolve, land, revert and wait for the
 changes of a workspace, read their stacks, conflicts and land attempts,
 and record and read the verdicts and check results on their versions,
 through the
@@ -2025,6 +2025,7 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change resolve <slug> <number> [--file <repo-path>=<local-file>]... [--delete <repo-path>]...` | `POST …/changes/<number>/restack` | the body below |
 | `parley change land <slug> <number> [--stack] [--expected-version <n>] [--override <reason>] [--session <id>] [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST …/changes/<number>/land`; with `--wait`, then `GET …/lands/<id>` once per poll | the body below |
 | `parley change lands <slug> <number>` | `GET …/changes/<number>/lands` | |
+| `parley change revert <slug> <number> [--title <t>] [--intent <i>] [--draft] [--auto-land] [--session <id>]` | `POST …/changes/<number>/revert` | the body below |
 | `parley change wait <slug> <number> [--for landed\|ready\|mergeable] [--timeout <duration>] [--poll-interval <duration>]` | `GET …/changes/<number>`, once per poll | |
 | `parley change approve <slug> <number> [--version <n>] [--comment <text>]` | `POST …/changes/<number>/approvals` | the body `{"verdict":"approve"}` with `version` (a number) and `comment` when given |
 | `parley change reject <slug> <number> --comment <text> [--version <n>]` | `POST …/changes/<number>/approvals` | the body `{"verdict":"reject","comment":…}` with `version` when given |
@@ -2132,6 +2133,21 @@ with exit status `0`, `conflict`, `blocked` and `failed` end it with the
 attempt on stdout and `wait_failed` on stderr (`the operation ended in the
 state "conflict", which is not a success`), and `running` keeps it going. A
 land answered `200` is not polled.
+
+`parley change revert` opens a change that undoes the landed change, on
+the new branch `revert/<number>` (see
+[`POST …/revert`](api.md#post-apiv1workspacesslugchangesnumberrevert)).
+Its body holds one member for each flag given and none for a flag not
+given, `{}` without a flag: `--title` `title`, `--intent` `intent` (sent
+as given), `--draft` `draft`, `--auto-land` `auto_land` and `--session`
+`session_id`. A `<number>` that is not a positive integer, a missing
+argument and an extra one are a `usage_error`, exit status `2`, before any
+request. The `201` answer, the new change, is printed on stdout with exit
+status `0`; a refusal (`409` `revert_conflict` with the conflict report in
+`error.details.conflict`, `409` `already_reverted` with
+`error.details.reverted_by`, `409` `change_not_landed`, `403`
+`path_not_allowed` with `error.path`, `403` `forbidden`, among others) is
+written to stderr as received, with nothing on stdout and exit status `1`.
 
 `parley change lands` prints the page of the change's land attempts the
 hub answers, newest first (see

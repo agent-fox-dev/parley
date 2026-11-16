@@ -777,8 +777,14 @@ A push that passed every check gets its ref advertisement from
     the parent workspace and is read-only in this fork; push a new
     branch`), the carry-patch controls and the paths of a path-scoped PAT
     (`path <path> is outside this token's allowed paths`: every path a new
-    commit changes, every path of a tree a ref is pointed at, and, for a
-    blob a ref is pointed at, which has no path, the ref's name); one that
+    commit changes; for an update that adds no commit of its own and moves
+    a branch that is the source of a draft or open change, or opens a
+    change, every file of the version it makes, the paths that differ
+    between the new head and its merge base with the change's target
+    branch (for an update that opens a change, the branch the open
+    defaults to), both paths of a rename, read from the repository; every
+    path of a tree a ref is pointed at; and, for a blob a ref is pointed
+    at, which has no path, the ref's name); one that
     cannot be decided is refused with `internal error; try again`. The
     refs then move together by compare-and-swap against the old values
     sent: a ref that moved meanwhile is refused with `ref changed since it
@@ -3612,7 +3618,7 @@ The change object:
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
 | `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements`, listed for a blocked change too (see [The landing of a change](#the-landing-of-a-change)) |
 | `landed` | how it landed, `null` until then: `sha`, `at`, `by` (an author object), `land_id` and `commits`, each `{version_sha, landed_sha}` |
-| `reverts`, `reverted_by` | the number of the change it reverts, and of the change that reverts it, `null` for none |
+| `reverts`, `reverted_by` | the number of the change it reverts, `null` for none, and the highest number of the `draft`, `open` or `landed` changes that revert it, `null` when there is none: an abandoned reverting change does not count (see [`POST …/revert`](#post-apiv1workspacesslugchangesnumberrevert)) |
 
 Arrays are never `null`; times are RFC 3339 in UTC with whole seconds.
 
@@ -3674,7 +3680,7 @@ token opens only from a workspace its binding covers. The body:
 | `intent` | at most 16,000 characters; defaults to the body of the head commit, then to the purpose of the source fork, cut to 16,000 characters; required (not empty or white space) unless `draft` is `true` or the target's setting `changes.require_intent` is `false` |
 | `draft` | `true` opens the change as a draft |
 | `depends_on` | the number of the change this one depends on, a positive integer: a draft or open change of `{slug}` with the same target branch. It is the change's link for version 1 in place of the one the commit graph gives, and `base_sha` is that change's head when the source branch is built on it; when it is not, the change is restacked onto it (see [Stacks and restack](#stacks-and-restack)) |
-| `auto_land` | defaults to `false` |
+| `auto_land` | defaults to `false`; `true` has the hub land the change by itself once it is landable (see [Automatic landing](#automatic-landing)). A path-scoped token is held to its paths for it as for the open itself |
 | `labels` | defaults to `[]`; at most 20, each matching `^[a-z0-9][a-z0-9_.:/-]{0,62}$`; a repeated label is kept once |
 | `session_id` | defaults to the session recorded on the source fork; a defaulted session the session rule refuses is dropped |
 
@@ -3965,9 +3971,16 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   takes no edit and a landed one only an edit of `labels` alone: else
   `409` `change_closed`. An edit that would leave the change `open` with
   an empty intent while `{slug}`'s `changes.require_intent` is on is
-  answered `400` `intent_required`. A body with `auto_land` asks the
-  `auto_land` guard, when one is registered, before anything is stored;
-  its refusal is the answer and nothing of the body is applied. A
+  answered `400` `intent_required`. A body with `auto_land` `true` from a
+  path-scoped token is held to the token's paths before anything is
+  stored: a file of the change's current version, from its base to its
+  head, that matches none of the token's globs is answered `403`
+  `path_not_allowed` with that file as `error.path` (`path <path> is
+  outside this token's allowed paths`), and nothing of the body is
+  applied. `auto_land` `false` is never refused. Turning `auto_land` on
+  stores the caller as the user who set it, with the type of the
+  credential and its globs, and a change that is landable already gets an
+  automatic land attempt (see [Automatic landing](#automatic-landing)). A
   `state` of `"open"` on a draft marks it ready: the change becomes
   `open`, its `landing` is evaluated again without the `draft` block, and
   `parley.change.open` is written by the caller with `number`, `ref`,
@@ -4443,7 +4456,11 @@ source branch moves, with the caller's credential and paths and the
 version's base (the commit sat on) and head; its refusal, such as `403`
 `path_not_allowed` with the `path`, is the answer, and nothing changes.
 It is not asked for an `up_to_date` answer, a conflict or a restack of
-the hub. No guard is registered yet, so every version passes.
+the hub. The hub's guard holds a path-scoped token to its paths: a file
+between the base and the replayed head, both paths of a rename, that
+matches none of its globs is answered `403` `path_not_allowed` with that
+file as `error.path`; the source branch keeps its head and no version is
+recorded. A credential without paths passes.
 
 A restack that fails for another reason answers `500` `internal`.
 
@@ -4545,7 +4562,9 @@ move is followed by one store transaction
 that marks each change `landed` (`landed` = `{sha, at, by, land_id,
 commits}`, every landed commit then found by the change's by-commit
 lookup), makes the attempt final and writes one `parley.change.land`
-event per change: resource `change` `{number}`, the requester as actor,
+event per change: resource `change` `{number}`, the requester as actor
+(the hub, `actor_type` `system` with `actor_id` `null`, for an attempt
+with `trigger` `auto_land`),
 the attempt's `session_id`, and metadata `land_id`, `target_branch`,
 `onto_sha`, `landed_sha`, `strategy`, `attempts`, `noop`, `trigger`,
 `override`, `policy_revision`, `number` and `ref`. One `parley.git.push`
@@ -4610,7 +4629,9 @@ request that carries an `override` is put to the override rule, and one
 the rule lets pass counts as `ready`; the attempt, and the metadata of
 its `parley.change.land` events, show `override` `{"reason": …}` only when
 the rule let the answer of at least one change pass, `null` otherwise.
-With no override rule installed no override is applied. The first change,
+The hub's override rule lets an answer `pending` pass, a change held back
+by approvals or checks, and never one `blocked`, by a `block` requirement
+or a structural cause. The first change,
 bottom first, whose answer is neither `ready` nor let pass ends the
 attempt `blocked`, with `blocked` the `change`, its `status` and its
 `requirements`, before anything is replayed or moved: the target stays
@@ -4643,8 +4664,9 @@ computes its mergeability again.
 An attempt that ends `conflict`, `blocked` or `failed` writes one
 `parley.change.land_fail` event in the transaction that ends it: resource
 `change` `{number}` of the change that stopped it (the one its conflict
-report or `blocked` names, else the top change), the requester as actor,
-the attempt's `session_id`, and metadata `land_id`, `status`, `reason`,
+report or `blocked` names, else the top change), the requester as actor
+(the hub, `system`, for an attempt with `trigger` `auto_land`), the
+attempt's `session_id`, and metadata `land_id`, `status`, `reason`,
 `number` and `ref`, with `files`, the conflicted paths (the first 100,
 and `truncated` `true` when there were more), for a conflict. `reason` is
 `conflict` for a conflict, the gate's or the target guard's reason for a
@@ -4752,7 +4774,7 @@ members not listed are ignored.
 |---|---|
 | `expected_version` | an integer of at least 1, the version the change must be at |
 | `stack` | a boolean, `false` when absent |
-| `override` | an object whose `reason` is a string that is not blank, kept with the attempt and put to the override rule for a change the policy gate does not answer `ready`. With no override rule registered it is accepted and never applied, and the attempt shows `override` `null` |
+| `override` | an object whose `reason` is a string that is not blank, kept with the attempt and put to the override rule for a change the policy gate does not answer `ready`: a change whose landing is `pending` passes, one `blocked` never does. Only the owner of `{slug}` with an API key or a PAT not bound to a workspace, and the admin token, may send it, and only while `{slug}`'s setting `land.allow_override` is `true` (check 8) |
 | `session_id` | a string, the session the land is asked in |
 
 The query parameter `wait`, a whole number of seconds from 0 to 60 (30
@@ -4791,7 +4813,21 @@ nothing:
    first, each at its current version) and the `override`: the first that
    refuses gives the answer as it gives it, its status, `error_type` and
    members such as `path` (for example `403` `path_not_allowed`), and the
-   guards after it are not asked. No request guard is installed yet;
+   guards after it are not asked. The hub has two, in this order:
+   1. a path-scoped token's paths: every file of the current version of
+      each change the land would cover, bottom first, from its base to its
+      head, both paths of a rename, must match one of its globs; the first
+      that matches none is `403` `path_not_allowed` with `error.path`
+      (`path <path> is outside this token's allowed paths`), whatever the
+      policy says and also while another attempt runs;
+   2. an `override`, whatever the policy status of the changes, is `403`
+      `override_not_allowed` for a PAT bound to the workspace or to one of
+      its forks (`a token bound to <workspace> may not land with an
+      override`), then for a caller that is neither the owner of `{slug}`
+      nor the admin token (`only the owner of <slug> or the admin token may
+      land with an override`), then, for every caller, while `{slug}`'s
+      `land.allow_override` is `false` (`land.allow_override is off in
+      <slug>`);
 9. the preconditions, read in the transaction that creates the attempt,
    the first that fails being the answer:
    1. every change the land covers is `open`: `409` `change_not_open` for
@@ -4857,6 +4893,136 @@ Answers `200` with the land attempt `{id}` of `{slug}`. An `{id}` that is
 not a UUID, that names no attempt, or that names an attempt of another
 workspace is `404` `land_not_found`, with the message `<slug> has no land
 attempt "<id>"`.
+
+### Automatic landing
+
+A change with `auto_land` `true` is landed by the hub itself once it is
+landable: `open`, its `landing.status` `ready` and its `mergeable`
+`clean`. The hub follows the `parley.change.ready` events of its log,
+which the change's landable announcement writes once each time the change
+becomes landable (see [The landing of a change](#the-landing-of-a-change)),
+from a position it stores, so each event starts at most one attempt and
+none is lost over a restart. It also starts one when `auto_land` is turned
+on for a change that is landable already, and, at start-up, for every open
+change with the flag on and no `running` attempt.
+
+When it handles a change it starts nothing, and leaves the flag as it is,
+while the change is not `open`, the flag is off, the change is not
+landable, an attempt for it is `running`, or its `depends_on` names a
+change that is not `landed`. Otherwise it checks the user who set the flag
+as of now: the admin token always may; a user must exist, not be blocked,
+and own `{slug}` or, while `land.by_author` is `true`, be the change's
+author; scopes are not looked at. When the flag was set with a
+path-scoped token, every file of the change's current version must match
+one of the globs stored with the flag, whether or not the token still
+exists. When either check fails, no attempt is created, the flag is
+cleared and one `parley.change.land_fail` is written on the change with
+actor `system` and metadata `land_id` `null`, `status` `blocked`, `reason`
+`not_permitted`, `number` and `ref`. Otherwise the hub starts a land
+attempt for that one change, never a stack, with `trigger` `auto_land`, no
+`override`, `session_id` `null`, `requested_by` the user who set the flag
+(`actor_type` the type of the credential they set it with) and its events
+written by `system`, as [`POST …/land`](#post-apiv1workspacesslugchangesnumberland)
+creates one from check 9 on.
+
+The outcome decides what follows:
+
+- `landed`, `conflict` or `blocked`: nothing more; the flag stays as it
+  is, and the next time the change becomes landable a new attempt starts.
+- `failed`: a new attempt starts after 2 s, then, while each retry fails
+  too, after 4, 8, 16, 32, 64, 128, 256, 300 and 300 s: at most 10 retries
+  after the first failed attempt, each a new attempt. When the tenth retry
+  fails as well, the flag is cleared and nothing more is started. The
+  count starts again from zero after any attempt that does not end
+  `failed`.
+
+A retry that comes due while the change is not `open`, the flag is off or
+the change is not landable is dropped and its count starts again from
+zero. The count and the due time are stored, so a retry pending when the
+hub stopped is made after the next start, at its due time or at once when
+that time has passed. Clearing the flag writes no event of its own.
+
+In a stack the change above waits: when the change below lands, the
+change above, restacked by the hub when the target moved, or already
+sitting on the landed commit, is announced landable again and its own
+attempt starts once the lower attempt has ended. An automatic attempt
+never lands more than its one change.
+
+### `POST /api/v1/workspaces/{slug}/changes/{number}/revert`
+
+Undoes the landed change `{number}` of `{slug}` as a change of its own.
+It is a create route (see [Idempotency](#idempotency)). The body is absent
+or a JSON object; members not listed are ignored:
+
+| Member | Value |
+|---|---|
+| `title` | a string of 1 to 200 characters without a line break; defaults to `Revert "<title of the original>"`, cut to 200 characters |
+| `intent` | a string of at most 16,000 characters; defaults to `Reverts change <slug>#<number>: <title of the original>.` |
+| `draft` | a boolean; `true` opens the reverting change as a draft |
+| `auto_land` | a boolean; `true` sets `auto_land` on the reverting change with the caller as the user who set it |
+| `session_id` | a string, the session the reverting change is opened in |
+
+The hub reads the head of the original's target branch and makes on it
+one commit per landed commit of the original (`landed.commits`), newest
+first, each undoing that commit, with the subject `Revert "<subject of
+the undone commit>"`, the body `This reverts commit <full id>.` and the
+landing identity as author and committer (`[land].committer_name`,
+`[land].committer_email`); an undo that would change nothing is left
+out. It creates the branch `revert/<number>` in `{slug}` at the last of
+them, or the first free name of `revert/<number>-2`, `revert/<number>-3`
+and so on, as an API ref creation: through the push rules and the ref
+writer with `via` `api`, so the creation is one `parley.git.push` with
+`created` `true`, and a push rule that refuses it is answered as for
+[`POST …/scm/refs`](#source-control-writes). It then opens a change from
+that branch into the original's target branch with `reverts` the
+original's number, a first version of kind `revert`, the caller as author
+and the body's members, which gets `parley.change.version` and, unless it
+is a draft, `parley.change.open`, as any opened change does, and writes
+`parley.change.revert` on the original, by the caller, with metadata
+`reverted_by`, `number` and `ref`. The answer is `201` with the new
+change as `GET …/changes/{number}` gives it; the original then shows it
+as `reverted_by`. The reverting change is an ordinary change: policy
+judges its files, and it lands through `POST …/land`. Reverting a
+reverting change is allowed and, once landed, restores what the original
+landed.
+
+The checks, in this order; each refusal creates nothing (no commit, no
+branch, no change, no event):
+
+1. the scope `changes:write` (`403` `insufficient_scope`) and read access
+   to `{slug}` (`404` `not_found`); a token bound to a task fork is `403`
+   `token_bound` on the fork's parent, since the revert is not a route it
+   reaches there;
+2. the change: `404` `change_not_found`;
+3. the body: `400` `invalid_request` (`title: must be a string`, `draft:
+   must be a boolean`, and the title and intent rules of an open);
+4. who may revert: the admin token, the owner of `{slug}` and, while
+   `land.by_author` is `true`, the original's author with any credential
+   of theirs; any other reader is `403` `forbidden` (`<slug>#<number> may
+   be reverted only by a writer of <slug>, the admin token or, while
+   land.by_author is on, its author`);
+5. `session_id` must pass the session-linking rule: `400`
+   `unknown_session`;
+6. the state of `{slug}`: `409` `workspace_archived`, `workspace_busy` or
+   `workspace_not_ready`;
+7. the change must be `landed`: `409` `change_not_landed`;
+8. a `draft`, `open` or `landed` change that reverts it already: `409`
+   `already_reverted`, with `error.details.reverted_by`;
+9. the original's target branch must still exist: `400`
+   `target_not_found`;
+10. a path-scoped token: every file of the landed version, from its base
+    to its head, must match one of its globs: `403` `path_not_allowed`
+    with `error.path`;
+11. something to undo: `400` `nothing_to_land` when the original landed
+    no commit (`noop`) or every undo would be empty;
+12. every undo must apply on the target's head: `409` `revert_conflict`,
+    with a conflict report in `error.details.conflict`, its `target_sha`
+    the target head, `commit_sha` the landed commit that could not be
+    undone, its conflicted `files`, `landed_changes` `[]` and `change`
+    `null`.
+
+With `auto_land` `true` a path-scoped token is also held to its paths by
+the open, as in [`PATCH`](#modifying-a-change).
 
 ## Landing policy
 
