@@ -21,8 +21,9 @@ const carryPatchHook = "carry_patch"
 // workspace's delete removes its patches (ADR 07). The component's routes,
 // the patch list's, are registered with the hub's router. Its start hook
 // binds the component to the store, the secret component, which holds the
-// upstream and origin credentials, the hub's git
-// and the place of each copy on disk, after every adjuster
+// upstream and origin credentials, the hub's git, the place of each copy on
+// disk and the workspace settings registry, through which a patch branch's
+// resolution reads patch_branch_source, after every adjuster
 // AdjustCarryPatch added has changed those dependencies. The hook runs
 // after the workspace part's, and like it before the clone workers launch,
 // so no clone runs the step before the component is bound.
@@ -45,6 +46,7 @@ func composeCarryPatch(c *Composition) {
 			Secrets:  c.Secrets(),
 			Git:      gitFor(c.env),
 			RepoPath: c.workspaces.RepoPath,
+			Settings: c.workspaces.Settings(),
 		}
 		for _, adjust := range c.carryPatchAdjusters {
 			adjust(&d)

@@ -26,6 +26,18 @@ type Deps struct {
 	// the deadline of each git operation of an upstream fetch; only tests
 	// set it.
 	UpstreamFetchDeadline time.Duration
+	// Settings is the registry of the workspace settings, through which
+	// ResolveBranch reads a workspace's patch_branch_source; nil reads it
+	// as hub for every workspace.
+	Settings *workspace.SettingsRegistry
+	// BranchFetchDeadline, when positive, replaces
+	// DefaultBranchFetchDeadline as the deadline of the single-branch fetch
+	// from origin of ResolveBranch; only tests set it.
+	BranchFetchDeadline time.Duration
+	// BeforeBranchCreate, when set, is called by ResolveBranch with the
+	// branch after its lookups and before it creates the branch; only tests
+	// set it, to write the branch in between as another writer would.
+	BeforeBranchCreate func(branch string)
 }
 
 // Component holds the carry-patch operations of the hub. Its zero value
