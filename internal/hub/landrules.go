@@ -97,8 +97,13 @@ const (
 // reset. The loop that follows the event log waits for the earliest due
 // start when it comes sooner than the next second, and stops with the hub,
 // leaving the due times stored; the next start of the hub makes those that
-// came due at once, with the count stored. Tests change its dependencies
-// with AdjustAutoLand.
+// came due at once, with the count stored. A change whose land is held
+// back while the change below it, which its depends_on names, is not
+// landed keeps its flag and is landed on its own once that change has
+// landed, whoever landed it: the lander, told of the land, has the change
+// announced landable again when it already sits on the landed commit,
+// and otherwise starts it from the announcement of the version the hub's
+// restack records. Tests change its dependencies with AdjustAutoLand.
 func composeLandRules(c *Composition) {
 	c.versionFiles = c.Land().VersionFiles()
 	paths := c.Land().PathGuard()

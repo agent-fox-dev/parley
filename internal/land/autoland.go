@@ -39,10 +39,12 @@ const (
 
 // AutoLandStep creates the store schema of the automatic lander: one row
 // per change whose auto_land is on, with the count of the retries of its
-// automatic land and the time the next start of it is due, NULL while none
-// is; and the position in the event log up to which the announcements of
-// landable changes have been handled. Who set the flag is not kept here:
-// the change record keeps it beside the flag.
+// automatic land, the time the next start of it is due, NULL while none
+// is, and the number of the change below it that held its start back
+// while it was not landed, NULL while none did; and the position in the
+// event log up to which the announcements of landable changes have been
+// handled. Who set the flag is not kept here: the change record keeps it
+// beside the flag.
 var AutoLandStep = store.Step{
 	Name:   "land_auto_land",
 	Target: store.Main,
@@ -53,6 +55,7 @@ var AutoLandStep = store.Step{
 	number INTEGER NOT NULL,
 	retries INTEGER NOT NULL DEFAULT 0,
 	due_at INTEGER,
+	held_by INTEGER,
 	PRIMARY KEY (workspace_slug, number)
 )`,
 			`CREATE INDEX land_auto_land_due ON land_auto_land (due_at) WHERE due_at IS NOT NULL`,
@@ -79,12 +82,15 @@ type Starter interface {
 
 // AutoLandChanges are the change records as the automatic lander reads
 // them, the setter of a change's auto_land, which the change record keeps,
-// and the flag, which the lander clears.
+// the flag, which the lander clears, and the announcement of a landable
+// change, which the lander has made again for a change it held back.
 type AutoLandChanges interface {
 	ReadChange(ctx context.Context, q change.Querier, workspace string, number int64) (change.Change, error)
 	AutoLandSetter(ctx context.Context, q change.Querier, workspace string, number int64) (change.AutoLandSet, bool, error)
 	SetAutoLand(ctx context.Context, tx *sql.Tx, workspace string, number int64, value bool, caller change.Caller) error
 	OpenAutoLand(ctx context.Context, q change.Querier) ([]change.Key, error)
+	ForgetLandable(ctx context.Context, tx *sql.Tx, workspace string, number int64) error
+	AnnounceLandable(ctx context.Context, tx *sql.Tx, workspace string, number int64) error
 }
 
 // EventLog is the hub's event log, which the automatic lander follows by
@@ -396,7 +402,9 @@ func (l *AutoLander) consider(ctx context.Context, workspace string, number int6
 // as it is, for a change that is not open, whose flag is off, that is not
 // landable, that a running attempt covers, or whose depends_on names a
 // change that is not landed: such a change is landed by a later
-// announcement, if any. A start that came due (due) for a change that is
+// announcement, if any; the change below that holds it back is noted
+// (hold), so that its landing has the change announced again (release).
+// A start that came due (due) for a change that is
 // not open, whose flag is off or that is not landable is dropped, and its
 // retries are counted from zero again. An announcement, or the start-up,
 // starts nothing for a change whose retry is due later: the retry is made
@@ -411,7 +419,8 @@ func (l *AutoLander) consider(ctx context.Context, workspace string, number int6
 //
 // seq, when not 0, is the position of the event the procedure runs for,
 // stored with what the procedure writes. Once a land is started, a start
-// of the change due by then is cleared: it is the one just made.
+// of the change due by then is cleared: it is the one just made; and so
+// is the change below that held it back.
 func (l *AutoLander) startProcedure(ctx context.Context, workspace string, number int64, seq int64, due bool) error {
 	ch, err := l.deps.Changes.ReadChange(ctx, nil, workspace, number)
 	if errors.Is(err, change.ErrChangeNotFound) {
@@ -425,6 +434,11 @@ func (l *AutoLander) startProcedure(ctx context.Context, workspace string, numbe
 		return err
 	case verdict == notLandable && due:
 		return l.dropRetry(ctx, workspace, number)
+	case verdict == heldBelow:
+		held, err := l.hold(ctx, ch)
+		if err != nil || held {
+			return err
+		}
 	case verdict != startNow:
 		return nil
 	}
@@ -465,9 +479,11 @@ func (l *AutoLander) startProcedure(ctx context.Context, workspace string, numbe
 	case err != nil:
 		return err
 	default:
-		// The retry the attempt's end may have made due is later than now.
-		if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land SET due_at = NULL
-WHERE workspace_slug = ? AND number = ? AND due_at <= ?`, workspace, number, now); err != nil {
+		// The retry the attempt's end may have made due is later than now,
+		// and no change below holds the change back any longer.
+		if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land
+SET due_at = CASE WHEN due_at <= ? THEN NULL ELSE due_at END, held_by = NULL
+WHERE workspace_slug = ? AND number = ?`, now, workspace, number); err != nil {
 			return fmt.Errorf("clear the due start of %s: %w", ch.Ref, err)
 		}
 	}
@@ -497,9 +513,12 @@ const (
 	// notLandable: the change is not open, its flag is off or it is not
 	// landable.
 	notLandable
-	// notNow: a running attempt covers the change, a change below it is
-	// not landed, or its retry is due later.
+	// notNow: a running attempt covers the change, or its retry is due
+	// later.
 	notNow
+	// heldBelow: the change below it, which its depends_on names, is not
+	// landed.
+	heldBelow
 )
 
 // startable judges whether the change ch may have its automatic land
@@ -532,16 +551,139 @@ WHERE workspace_slug = ? AND number = ? AND due_at > ?)`, ch.WorkspaceSlug, ch.N
 	case err != nil:
 		return notNow, err
 	case below.State != change.StateLanded:
-		return notNow, nil
+		return heldBelow, nil
 	}
 	return startNow, nil
 }
 
+// hold notes, for the change ch, whose depends_on names a change that was
+// not landed when its start was judged, that this change below holds its
+// start back, and reports true; once that change has landed, release has
+// ch announced landable again, since the change component announces a
+// change once per head and ch, landable at its head all along, would not
+// be announced again. The change below is read in the transaction that
+// notes it, so that a land that ends in between is not missed: a change
+// below found landed holds nothing back, and hold reports false.
+func (l *AutoLander) hold(ctx context.Context, ch change.Change) (held bool, err error) {
+	err = l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		below, err := l.deps.Changes.ReadChange(ctx, tx, ch.WorkspaceSlug, *ch.DependsOn)
+		switch {
+		case errors.Is(err, change.ErrChangeNotFound):
+			return nil
+		case err != nil:
+			return err
+		case below.State == change.StateLanded:
+			return nil
+		}
+		held = true
+		if _, err := tx.ExecContext(ctx, `INSERT INTO land_auto_land (workspace_slug, number, held_by) VALUES (?, ?, ?)
+ON CONFLICT (workspace_slug, number) DO UPDATE SET held_by = excluded.held_by`, ch.WorkspaceSlug, ch.Number, below.Number); err != nil {
+			return fmt.Errorf("note what holds %s back: %w", ch.Ref, err)
+		}
+		return nil
+	})
+	return held, err
+}
+
+// release is told of the attempt a that landed, whatever its trigger.
+// Each change whose start a change a landed held back (hold) is held no
+// longer, and when it already sits on the commit that change landed as,
+// so that no restack will give it a version to announce, it is announced
+// landable again in the same transaction: forgotten, then announced if it
+// is landable now, else once its mergeability, which the land made
+// unknown, is known again. Its land then starts from that announcement,
+// after a ended. A change that does not sit on the landed commit is left
+// to the version the hub's restack records, announced in its turn.
+func (l *AutoLander) release(ctx context.Context, a Attempt) error {
+	var errs []error
+	for _, landed := range afterLanding(a).Changes {
+		held, err := l.heldBy(ctx, a.Workspace, landed.Number)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, n := range held {
+			errs = append(errs, l.announceAgain(ctx, a.Workspace, n, landed))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// heldBy are the numbers of the changes of the workspace whose start the
+// change below numbered below holds back.
+func (l *AutoLander) heldBy(ctx context.Context, workspace string, below int64) ([]int64, error) {
+	rows, err := l.deps.Store.Main().QueryContext(ctx, `SELECT number FROM land_auto_land
+WHERE workspace_slug = ? AND held_by = ? ORDER BY number`, workspace, below)
+	if err != nil {
+		return nil, fmt.Errorf("read the changes %s holds back: %w", change.Ref(workspace, below), err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var n int64
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// announceAgain releases the change number of the workspace, which the
+// change landed held back (release).
+func (l *AutoLander) announceAgain(ctx context.Context, workspace string, number int64, landed LandedChange) error {
+	ch, err := l.deps.Changes.ReadChange(ctx, nil, workspace, number)
+	if errors.Is(err, change.ErrChangeNotFound) {
+		return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return forgetAutoLand(ctx, tx, workspace, number) })
+	}
+	if err != nil {
+		return err
+	}
+	repo, err := l.deps.Repos(ctx, workspace)
+	if err != nil {
+		return err
+	}
+	sits, err := repo.IsAncestor(ctx, landed.LandedSHA, ch.HeadSHA)
+	if err != nil {
+		return err
+	}
+	return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE land_auto_land SET held_by = NULL
+WHERE workspace_slug = ? AND number = ? AND held_by = ?`, workspace, number, landed.Number)
+		if err != nil {
+			return fmt.Errorf("release %s: %w", ch.Ref, err)
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 || !sits {
+			return err
+		}
+		now, err := l.deps.Changes.ReadChange(ctx, tx, workspace, number)
+		if err != nil || now.HeadSHA != ch.HeadSHA {
+			// A version recorded since is announced in its turn.
+			return err
+		}
+		if err := l.deps.Changes.ForgetLandable(ctx, tx, workspace, number); err != nil {
+			return err
+		}
+		return l.deps.Changes.AnnounceLandable(ctx, tx, workspace, number)
+	})
+}
+
 // Finished is the land component's final observer. For an automatic land
 // it keeps, makes or ends the retries of each change the attempt covered
-// (settle), and it ignores every other attempt.
+// (settle); and for every land that landed, whatever its trigger, it
+// releases the changes above those it landed that they held back
+// (release).
 func (l *AutoLander) Finished(ctx context.Context, f Final) {
-	if f.Attempt.Trigger != TriggerAutoLand || !l.bound.Load() {
+	if !l.bound.Load() {
+		return
+	}
+	if f.Result == StatusLanded {
+		if err := l.release(ctx, f.Attempt); err != nil {
+			l.deps.Logger.Warn("automatic land: the changes held back by a land were not released", "workspace",
+				f.Attempt.Workspace, "land_id", f.Attempt.ID, "error", err)
+		}
+	}
+	if f.Attempt.Trigger != TriggerAutoLand {
 		return
 	}
 	for _, cov := range f.Attempt.Covered {

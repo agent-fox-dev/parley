@@ -15,6 +15,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
@@ -86,9 +87,15 @@ func (w *world) landFails(t *testing.T, number int64) []event.Record {
 // until waits until cond holds, at most 30 s.
 func until(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	for deadline := time.Now().Add(30 * time.Second); !cond(); {
+	within(t, 30*time.Second, what, cond)
+}
+
+// within waits until cond holds, at most d.
+func within(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(d); !cond(); {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within 30 s", what)
+			t.Fatalf("%s: not within %v", what, d)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -423,6 +430,115 @@ func TestAutoLand_StartsAnAttemptAtStartUpForALandableChangeWithTheFlagOn(t *tes
 	}
 	if lands := w.lands(t, b.Number); len(lands) != 0 {
 		t.Errorf("%s has land attempts %v, want none", b.Ref, lands)
+	}
+}
+
+// openAbove opens, through the change component, a change of api by the
+// owner from a new branch with one commit on the head of the change below
+// that adds <branch>.txt, with auto_land as given, and returns it; the
+// stack linker links it to below.
+func (w *world) openAbove(t *testing.T, branch string, below change.Change, autoLand bool) change.Change {
+	t.Helper()
+	commit(t, w.api, branch, below.HeadSHA, branch, map[string]string{branch + ".txt": branch + "\n"})
+	ch := w.opened(t, change.OpenInput{Workspace: "api", SourceBranch: branch, Intent: new("why"), Kind: change.KindRef,
+		AutoLand: new(autoLand), Caller: w.caller()})
+	if ch.DependsOn == nil || *ch.DependsOn != below.Number {
+		t.Fatalf("%s depends on %v, want %d", ch.Ref, ch.DependsOn, below.Number)
+	}
+	return ch
+}
+
+func TestAutoLand_StartsNothingForAChangeAboveOneThatIsNotLanded(t *testing.T) {
+	t.Parallel()
+	// The lander follows the event log once an hour: the test runs it.
+	w := startWorld(t, autoLand(time.Hour, nil))
+	lower := w.openWith(t, "low", map[string]string{"low.txt": "low\n"}, false, w.caller())
+	upper := w.openAbove(t, "up", lower, true)
+	w.mergeable(t, upper.Number, change.MergeableClean)
+	until(t, upper.Ref+" is announced landable", func() bool { return w.readyCount(t, upper.Number) > 0 })
+	ctx := context.Background()
+
+	// The announcement, then the start the flag made due and the look the
+	// start-up takes at every change whose flag is on.
+	if err := w.lander.Pass(ctx); err != nil {
+		t.Fatalf("pass of the automatic lander: %v", err)
+	}
+	if err := w.lander.Recover(ctx); err != nil {
+		t.Fatalf("start-up of the automatic lander: %v", err)
+	}
+
+	if lands := w.lands(t, upper.Number); len(lands) != 0 {
+		t.Errorf("%s has land attempts %v while %s is not landed, want none", upper.Ref, lands, lower.Ref)
+	}
+	if got := w.readChange(t, upper.Number); !got.AutoLand || got.State != change.StateOpen {
+		t.Errorf("%s is %s with auto_land %t, want open with auto_land true", upper.Ref, got.State, got.AutoLand)
+	}
+	if fails := w.landFails(t, upper.Number); len(fails) != 0 {
+		t.Errorf("the land_fail events of %s are %+v, want none", upper.Ref, fails)
+	}
+}
+
+func TestAutoLand_LandsAStackFromTheBottomUpOneChangeAtATime(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// moved, when not nil, is a file main gets once the stack is
+		// opened, so that the change below lands as new commits and the
+		// hub restacks the one above onto them.
+		moved map[string]string
+		// log is the subjects of main's commits once both landed, oldest
+		// first.
+		log string
+	}{
+		{name: "the change below lands as its own commits", log: "base\nlow\nup"},
+		{name: "the change below lands on a moved main and the hub restacks the one above",
+			moved: map[string]string{"m.txt": "m\n"}, log: "base\nmoved\nlow\nup"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := startWorld(t, autoLand(50*time.Millisecond, nil))
+			w.checkPolicy(t, "**")
+			w.configure(t, `{"changes.auto_restack":true}`)
+			lower := w.openWith(t, "low", map[string]string{"low.txt": "low\n"}, true, w.caller())
+			upper := w.openAbove(t, "up", lower, true)
+			if c.moved != nil {
+				commit(t, w.api, "main", w.base, "moved", c.moved)
+			}
+			w.mergeable(t, lower.Number, change.MergeableClean)
+			w.mergeable(t, upper.Number, change.MergeableClean)
+			ctx := context.Background()
+
+			w.passCheck(t, upper.Number)
+			until(t, upper.Ref+" is announced landable", func() bool { return w.readyCount(t, upper.Number) > 0 })
+			if err := w.lander.Pass(ctx); err != nil {
+				t.Fatalf("pass of the automatic lander: %v", err)
+			}
+			if lands := w.lands(t, upper.Number); len(lands) != 0 {
+				t.Fatalf("%s has land attempts %v before %s landed, want none", upper.Ref, lands, lower.Ref)
+			}
+			w.passCheck(t, lower.Number)
+
+			within(t, time.Minute, "both changes land", func() bool {
+				return w.readChange(t, lower.Number).State == change.StateLanded && w.readChange(t, upper.Number).State == change.StateLanded
+			})
+			var ids []string
+			for _, ch := range []change.Change{lower, upper} {
+				lands := w.lands(t, ch.Number)
+				if len(lands) != 1 || lands[0]["trigger"] != land.TriggerAutoLand || lands[0]["status"] != land.StatusLanded ||
+					!reflect.DeepEqual(lands[0]["changes"], []any{float64(ch.Number)}) {
+					t.Fatalf("%s has land attempts %v, want one landed of it alone with trigger auto_land", ch.Ref, lands)
+				}
+				ids = append(ids, lands[0]["id"].(string))
+			}
+			low, up := w.attempt(t, ids[0]), w.attempt(t, ids[1])
+			if low.FinishedAt == nil || low.FinishedAt.After(up.CreatedAt) {
+				t.Errorf("%s's attempt finished at %v, %s's was created at %v, want it created after",
+					lower.Ref, low.FinishedAt, upper.Ref, up.CreatedAt)
+			}
+			if got := gitrepotest.Git(t, w.api, "log", "--reverse", "--format=%s", "main"); got != c.log {
+				t.Errorf("main holds the commits %q, oldest first, want %q", got, c.log)
+			}
+		})
 	}
 }
 
