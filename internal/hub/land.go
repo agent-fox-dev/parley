@@ -33,15 +33,17 @@ const (
 )
 
 // composeLand adds the landing: the schema of the land attempts, the land
-// route and the read routes of the attempts per change, per workspace and
-// by id, whose scope and access need the shared checks decide, and the
-// component, bound in a
+// route, the revert route and the read routes of the attempts per change,
+// per workspace and by id, whose scope and access need the shared checks
+// decide, and the component, bound in a
 // start hook to the store, to the place of each repository on disk, opened
 // with the hub's git, to the change component, to the workspace records
 // with their effective land settings, read in the caller's transaction, to
-// the access rule, to the hub's event log, to the ref writer and to the
-// [land] options: the tries of one land, the workers of the pool, the
-// deadline of an attempt and the landing identity. The pool runs as
+// the access rule, to the hub's event log, to the ref writer, to the push
+// rule engine, which decides the creation of a revert's branch as it
+// decides an API ref creation, and to the [land] options: the tries of one
+// land, the workers of the pool, the deadline of an attempt and the
+// landing identity, which also makes a revert's commits. The pool runs as
 // background work; the stop leaves its running attempts running, and the
 // next start, once the land journal is reconciled and before the listener
 // binds, hands them to the pool again, which runs them while requests are
@@ -115,6 +117,7 @@ func composeLand(c *Composition) {
 			Access:     c.access,
 			Events:     c.events,
 			RefWriter:  c.refWriter,
+			Rules:      c.pushRules,
 			Now:        rt.Now,
 			Logger:     rt.Logger,
 

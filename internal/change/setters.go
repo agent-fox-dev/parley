@@ -87,14 +87,11 @@ func (c *Component) SetLanded(ctx context.Context, tx *sql.Tx, workspace string,
 	return landChange(ctx, tx, workspace, number, l, c.now())
 }
 
-// SetReverts stores the change the change reverts, nil for none.
+// SetReverts stores the change the change reverts, nil for none. The
+// reverted change shows the newest live change that reverts it as its
+// reverted_by, derived where a change is read.
 func (c *Component) SetReverts(ctx context.Context, tx *sql.Tx, workspace string, number int64, reverts *int64) error {
 	return update(ctx, tx, workspace, number, c.now(), `reverts = ?`, reverts)
-}
-
-// SetRevertedBy stores the change that reverts the change, nil for none.
-func (c *Component) SetRevertedBy(ctx context.Context, tx *sql.Tx, workspace string, number int64, by *int64) error {
-	return update(ctx, tx, workspace, number, c.now(), `reverted_by = ?`, by)
 }
 
 // SetAbandoned moves the change to abandoned for reason and, when its

@@ -561,8 +561,8 @@ func TestOpen_RecordsARevertWithItsKindAndTheRevertedChange(t *testing.T) {
 	if len(events) == 0 || events[0].Type != "parley.change.version" || metadata(t, events[0])["kind"] != "revert" {
 		t.Errorf("events = %+v, want parley.change.version of kind revert first", events)
 	}
-	if reverted, err := w.changes.ReadChange(ctx, nil, "demo", 1); err != nil || reverted.RevertedBy != nil {
-		t.Errorf("ReadChange(demo, 1) = reverted_by %v, %v; want null", reverted.RevertedBy, err)
+	if reverted, err := w.changes.ReadChange(ctx, nil, "demo", 1); err != nil || reverted.RevertedBy == nil || *reverted.RevertedBy != ch.Number {
+		t.Errorf("ReadChange(demo, 1) = reverted_by %v, %v; want %d", reverted.RevertedBy, err, ch.Number)
 	}
 	got := w.mustPost(t, map[string]any{"source": map[string]any{"branch": "other"}})
 	if got["reverts"] != nil {

@@ -20,8 +20,9 @@ import (
 )
 
 // Routes are the land routes, for the server's router: the land of a
-// change, the attempts of a change, the attempts of a workspace, one
-// attempt by id, and the current conflict of a change and its files.
+// change, the revert of a landed change, the attempts of a change, the
+// attempts of a workspace, one attempt by id, and the current conflict of
+// a change and its files.
 func (c *Component) Routes() []server.Route {
 	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	read := func(pattern string, h server.HandlerFunc) server.Route {
@@ -31,11 +32,17 @@ func (c *Component) Routes() []server.Route {
 	// of a change's conflict and its files are those of the contributor
 	// table of internal/access, parameter names included, so that a token
 	// bound to a fork reaches them on the fork's parent. The land needs only read
-	// access: who may land is the land's own rule (authorize).
+	// access: who may land is the land's own rule (authorize). The revert
+	// is not in that table, so the binding guard refuses it to a token
+	// bound to a fork, and needs only read access too.
 	return []server.Route{
 		{
 			Method: http.MethodPost, Pattern: "/workspaces/:slug/changes/:number/land", Scope: "changes:write", Create: true,
 			Marks: need, Handler: c.landRoute,
+		},
+		{
+			Method: http.MethodPost, Pattern: "/workspaces/:slug/changes/:number/revert", Scope: "changes:write", Create: true,
+			Marks: need, Handler: c.revertRoute,
 		},
 		read("/workspaces/:slug/changes/:number/lands", c.changeLands),
 		read("/workspaces/:slug/lands", c.workspaceLands),

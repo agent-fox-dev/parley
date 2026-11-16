@@ -128,8 +128,12 @@ type Deps struct {
 	Access AccessRule
 	// Events takes the land events.
 	Events EventWriter
-	// RefWriter moves the target branch of a land.
+	// RefWriter moves the target branch of a land and creates the branch
+	// of a revert.
 	RefWriter RefWriter
+	// Rules are the push rules a revert's branch is created under; a
+	// revert fails without them.
+	Rules Rules
 	// Now is the clock of the stored times; nil is time.Now.
 	Now func() time.Time
 	// Logger is told of what fails and changes nothing; nil discards it.

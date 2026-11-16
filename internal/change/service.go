@@ -9,12 +9,14 @@ import "context"
 //     nor commits: Open, RecordVersion, SourceDeleted, ForkDeleted,
 //     WorkspaceDeleted, SetAutoLand and the setters (SetDependsOn, SetBase,
 //     SetMergeable, SetNeedsRestack, SetLanding, SetLanded, SetReverts,
-//     SetRevertedBy, SetAbandoned);
+//     SetAbandoned);
 //   - through a Querier, their transaction or nil for the store: ReadChange,
 //     ReadVersions, OpenChangeOfBranch, ChangeOfCommit, ChangesOfSession,
 //     ChangeNumbersOfSource, CheckOpen, AutoLandSetter and OpenAutoLand;
 //     OpenCounts reads the store;
-//   - without the store: Authorize, the access rule of an open;
+//   - without the store: Authorize, the access rule of an open, and
+//     CheckSession, its session-linking rule; CheckTitle and CheckIntent
+//     are its rules for a title and an intent;
 //   - while the hub is composed, to register on the instance what they
 //     compute about a change: RegisterSessionLinker, RegisterStackLinker,
 //     RegisterLandingEvaluator, AddVersionObserver, RegisterAutoLandGuard,

@@ -373,11 +373,20 @@ WHERE source_workspace = ? AND source_branch = ? AND state IN ('draft', 'open')`
 	return workspace, number, true, nil
 }
 
-// changeColumns are the columns scanChange reads, in its order.
+// changeColumns are the columns readChange reads, in its order.
+//
+// reverted_by is not read from its column but derived where the change is
+// read: the highest-numbered change of the workspace that reverts it and is
+// draft, open or landed, NULL for none. A derivation in this one place
+// follows every state move of a reverting change (an open, an abandon, a
+// deleted source, a restore, a land), which a stored value would have to
+// be kept up to date at, each.
 const changeColumns = `workspace_slug, number, title, intent, state, abandon_reason, target_branch, source_workspace,
 	source_branch, version, head_sha, base_sha, depends_on, author_type, author_id, author_username, session_id,
 	mergeable, conflict, needs_restack, restack_reason, commits, files_changed, insertions, deletions, paths,
-	paths_truncated, landing, auto_land, labels, landed, reverts, reverted_by, created_at, updated_at`
+	paths_truncated, landing, auto_land, labels, landed, reverts,
+	(SELECT MAX(r.number) FROM changes r WHERE r.workspace_slug = changes.workspace_slug AND r.reverts = changes.number
+		AND r.state IN ('draft', 'open', 'landed')), created_at, updated_at`
 
 // readChange reads the change number of the workspace through q, with the
 // members other rows hold: its dependants, sessions and landed commits.

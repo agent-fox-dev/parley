@@ -444,6 +444,28 @@ func checkIntent(intent string) error {
 	return nil
 }
 
+// CheckTitle refuses a title as an open refuses it: one that is empty or
+// white space only, longer than MaxTitle characters or more than one line
+// is 400 invalid_request.
+func CheckTitle(title string) error { return checkTitle(title) }
+
+// CheckIntent refuses an intent as an open refuses it: one longer than
+// MaxIntent characters is 400 invalid_request.
+func CheckIntent(intent string) error { return checkIntent(intent) }
+
+// CheckSession judges the session id named by caller for a change of the
+// workspace as an open judges an explicit session_id, for a write that
+// opens a change once it has done what the session must be known for: it
+// returns the id as it is to be stored, and 400 unknown_session for an id
+// the session linker refuses, and for every id while none is registered.
+func (c *Component) CheckSession(ctx context.Context, caller Caller, id, workspace string) (string, error) {
+	got, err := c.session(ctx, c.collaborators(), OpenInput{Workspace: workspace, SessionID: &id, Caller: caller}, Workspace{})
+	if err != nil {
+		return "", err
+	}
+	return *got, nil
+}
+
 // checkLabels refuses more than MaxLabels labels, or one that labelPattern
 // does not match.
 func checkLabels(labels []string) error {
