@@ -205,7 +205,7 @@ func (c *Component) listApprovals(ctx context.Context, q Querier, ch change.Chan
 	if err != nil {
 		return nil, err
 	}
-	k, err := c.newCounter(ctx, q, ch, reqs)
+	k, err := c.newCounter(ctx, q, ch.WorkspaceSlug, ch.Number, ch.Version, reqs)
 	if err != nil {
 		return nil, err
 	}
@@ -247,18 +247,20 @@ type counter struct {
 	members    map[string]bool
 }
 
-// newCounter is the counter of the change ch against the requirements reqs
-// of its landing, the one stored for its current version.
-func (c *Component) newCounter(ctx context.Context, q Querier, ch change.Change, reqs []Requirement) (*counter, error) {
-	rec, _, err := access.RecordBySlug(ctx, q, ch.WorkspaceSlug)
+// newCounter is the counter of the change number of the workspace against
+// the requirements reqs of its landing for version current: the one stored
+// for its current version, or the one a land of an older version is judged
+// with.
+func (c *Component) newCounter(ctx context.Context, q Querier, workspace string, number, current int64, reqs []Requirement) (*counter, error) {
+	rec, _, err := access.RecordBySlug(ctx, q, workspace)
 	if err != nil {
 		return nil, err
 	}
-	versions, err := c.deps.Changes.ReadVersions(ctx, q, ch.WorkspaceSlug, ch.Number)
+	versions, err := c.deps.Changes.ReadVersions(ctx, q, workspace, number)
 	if err != nil {
 		return nil, err
 	}
-	return &counter{q: q, owner: rec.OwnerID, org: rec.OrgID, current: ch.Version,
+	return &counter{q: q, owner: rec.OwnerID, org: rec.OrgID, current: current,
 		creators: creatorsOf(versions), reqs: reqs, members: map[string]bool{}}, nil
 }
 
@@ -267,20 +269,31 @@ func (c *Component) newCounter(ctx context.Context, q Querier, ch change.Change,
 // toward none: the landing is the current version's.
 func (k *counter) countsFor(ctx context.Context, v storedVerdict) ([]string, error) {
 	out := []string{}
-	if v.Version != k.current || len(k.reqs) == 0 {
-		return out, nil
-	}
-	member, err := k.isMember(ctx, v.UserID)
-	if err != nil {
-		return nil, err
-	}
-	pool := approverPool{Owner: k.owner, Members: map[string]bool{v.UserID: member}}
 	for _, r := range k.reqs {
-		if counts(v.counting(), r.Approvals.Approvers, pool, k.creators) {
+		ok, err := k.counts(ctx, v, r.Approvals.Approvers)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			out = append(out, r.Rule)
 		}
 	}
 	return out, nil
+}
+
+// counts reports whether v counts toward a requirement whose approvers are
+// approvers. Only a verdict on the counter's version can: the requirement
+// is that version's.
+func (k *counter) counts(ctx context.Context, v storedVerdict, approvers []string) (bool, error) {
+	if v.Version != k.current || len(approvers) == 0 {
+		return false, nil
+	}
+	member, err := k.isMember(ctx, v.UserID)
+	if err != nil {
+		return false, err
+	}
+	pool := approverPool{Owner: k.owner, Members: map[string]bool{v.UserID: member}}
+	return counts(v.counting(), approvers, pool, k.creators), nil
 }
 
 // isMember reports whether the user is a member of the workspace's

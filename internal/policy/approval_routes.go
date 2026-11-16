@@ -113,7 +113,7 @@ func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		k, err := c.newCounter(ctx, tx, ch, res.Requirements)
+		k, err := c.newCounter(ctx, tx, ch.WorkspaceSlug, ch.Number, ch.Version, res.Requirements)
 		if err != nil {
 			return err
 		}

@@ -424,10 +424,16 @@ type pushed struct {
 // input.
 func (w *world) openPushed(t *testing.T, branch string, adjust ...func(*change.OpenInput)) pushed {
 	t.Helper()
+	return w.openPushedFiles(t, branch, map[string]string{branch + ".txt": branch + "\n"}, adjust...)
+}
+
+// openPushedFiles is openPushed with a branch of base that sets files.
+func (w *world) openPushedFiles(t *testing.T, branch string, files map[string]string, adjust ...func(*change.OpenInput)) pushed {
+	t.Helper()
 	var p pushed
 	p.patPush, p.patPushID = w.IssuePATID(t, identity.PATSpec{UserID: w.dana,
 		Permissions: []string{"git:write", "changes:read", "changes:write", "changes:approve"}})
-	commit(t, w.api, branch, w.base, map[string]string{branch + ".txt": branch + "\n"})
+	commit(t, w.api, branch, w.base, files)
 	byPAT := func(in *change.OpenInput) {
 		in.Caller = change.Caller{UserID: w.dana, Username: "dana", Credential: change.Credential{Type: change.CredentialPAT, ID: p.patPushID}}
 	}
@@ -528,4 +534,38 @@ func (c *stepClock) tick() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.at = c.at.Add(time.Second)
+}
+
+// record records head of branch as the next version, of kind kind, of the
+// change of api whose source the branch is, by caller (the hub for the
+// zero Caller), and fails the test unless a version is recorded.
+func (w *world) record(t *testing.T, branch, head, kind string, caller change.Caller) {
+	t.Helper()
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		v, err := w.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: "api", Branch: branch, Head: head,
+			Kind: kind, Caller: caller})
+		if err == nil && v == nil {
+			err = errors.New("no version recorded of " + branch)
+		}
+		return err
+	})
+}
+
+// rebased moves api's main on by a commit that touches none of a
+// change's files, writes branch again on top of it with files, the edits
+// it had, so that its new head is patch-equivalent to the old one, and
+// returns that head.
+func (w *world) rebased(t *testing.T, branch string, files map[string]string) string {
+	t.Helper()
+	previous := gitrepotest.Refs(t, w.api, "refs/heads/")["main"]
+	main := commit(t, w.api, "main", previous, map[string]string{"main.txt": previous + "\n"})
+	return commit(t, w.api, branch, main, files)
+}
+
+// counted is the approvals counted toward the one requirement of the
+// landing GET answers for the change number of api.
+func (w *world) counted(t *testing.T, number int64) any {
+	t.Helper()
+	approvals, _ := only(w.landing(t, number))["approvals"].(map[string]any)
+	return approvals["counted"]
 }

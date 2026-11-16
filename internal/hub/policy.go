@@ -22,8 +22,9 @@ const policyHook = "policy"
 // hook to the store, to the workspace
 // records, to the users of the identity records, to the event component,
 // to the change component, to the workspaces' repositories, to the hub's
-// clock and to its logger. Its evidence source is the one that reads none
-// until a part registers another (RegisterEvidence).
+// clock and to its logger. Its evidence source is its own facts, the
+// verdicts it records, registered in place of the one that reads none;
+// tests register their own on the instance after it.
 //
 // It comes before the change component's part, so that the component is
 // bound before the change component's own start hooks record versions,
@@ -41,6 +42,7 @@ func composePolicy(c *Composition) {
 	c.policy = comp
 	c.AddSchemaStep(policy.SchemaStep)
 	c.AddSchemaStep(policy.ReviewStep)
+	comp.RegisterEvidence(comp.Facts())
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
