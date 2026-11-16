@@ -64,7 +64,9 @@ type verdictRequest struct {
 // anything else, since a verdict needs a user; then come, in this order, a
 // change the workspace does not have, a body that is not a valid verdict,
 // an archived workspace, a closed change and a version the change does not
-// have. The verdict, the landing it re-evaluates and its event are written
+// have. A verdict on an earlier version that the current version is
+// patch-equivalent to is carried to the current version as well. The
+// verdict, its copy, the landing it re-evaluates and its event are written
 // in one store transaction, so that a failure of any of them writes none.
 func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 	ctx, slug := r.Context(), server.Param(r, "slug")
@@ -107,6 +109,9 @@ func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 			return server.NotFound(fmt.Sprintf("%s has no version %d", ch.Ref, v.Version))
 		}
 		if replaced, err = replaceVerdict(ctx, tx, v); err != nil {
+			return err
+		}
+		if err := c.carryToCurrent(ctx, tx, v, ch.Version); err != nil {
 			return err
 		}
 		res, _, err := c.ReevaluateIn(ctx, tx, slug, number)

@@ -71,8 +71,14 @@ func composePolicy(c *Composition) {
 // every new version, retarget, move between draft and open and restore,
 // and as the land component's policy gate. Tests register their own on
 // the instances after it.
+//
+// It also adds, after the mergeability observer, the version observer that
+// carries a version's verdicts to a new version patch-equivalent to it; the
+// change component tells it after the version's landing is stored, and it
+// evaluates the landing again when it carried any.
 func composePolicyEvaluation(c *Composition) {
 	c.changes.RegisterLandingEvaluator(c.policy)
+	c.changes.AddVersionObserver(c.policy.VersionObserver())
 	c.land.RegisterGate(policyGate{c.policy})
 }
 

@@ -128,8 +128,9 @@ func TestFacts_ACountedRejectKeepsTheRequirementUnsatisfied(t *testing.T) {
 		n, _ := rejected(t, "rebased")
 		head := w.rebased(t, "rebased", map[string]string{"rebased.txt": "rebased\n"})
 		w.record(t, "rebased", head, change.KindRebase, w.danaCaller())
-		if l := w.landing(t, n); l["status"] != change.LandingPending {
-			t.Errorf("landing = %v, want pending", l)
+		l := w.landing(t, n)
+		if r := only(l); l["status"] != change.LandingPending || r["satisfied"] != false || r["approvals"].(map[string]any)["counted"] != 1.0 {
+			t.Errorf("landing = %v, want pending, unsatisfied with dana's carried approval counted", l)
 		}
 	})
 	t.Run("a reject by a user who is not an approver", func(t *testing.T) {

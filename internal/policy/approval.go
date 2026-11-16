@@ -88,12 +88,17 @@ WHERE workspace_slug = ? AND number = ? AND version = ? AND user_id = ?`, v.Work
 	if err != nil {
 		return false, err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO change_approvals
+	return deleted > 0, insertVerdict(ctx, tx, v)
+}
+
+// insertVerdict stores v in tx.
+func insertVerdict(ctx context.Context, tx *sql.Tx, v storedVerdict) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO change_approvals
 (id, workspace_slug, number, version, user_id, username, credential_type, credential_id, verdict, comment, carried_from, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.Workspace, v.Number, v.Version, v.UserID, v.Username, v.Credential.Type, v.Credential.ID,
 		v.Verdict, v.Comment, v.CarriedFrom, v.CreatedAt.UnixNano())
-	return deleted > 0, err
+	return err
 }
 
 // verdictColumns are the columns scanVerdict reads, in its order.
