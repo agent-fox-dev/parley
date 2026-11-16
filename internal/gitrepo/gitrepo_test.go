@@ -307,6 +307,14 @@ func TestRepo_WritesOriginHeadsConfigAndTheDefaultBranch(t *testing.T) {
 	if got, found, err := repo.Config(ctx, "parley.workspace"); err != nil || !found || got != "abc" {
 		t.Errorf("Config = %q, %v, %v; want abc", got, found, err)
 	}
+	for range 2 { // unsetting a key that is not set is no error
+		if err := repo.UnsetConfig(ctx, "parley.workspace"); err != nil {
+			t.Fatal(err)
+		}
+		if got, found, err := repo.Config(ctx, "parley.workspace"); err != nil || found {
+			t.Errorf("Config after UnsetConfig = %q, %v, %v; want not found", got, found, err)
+		}
+	}
 
 	if err := repo.SetDefaultBranch(ctx, "dev"); err != nil {
 		t.Fatal(err)

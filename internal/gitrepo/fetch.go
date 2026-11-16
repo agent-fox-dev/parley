@@ -45,7 +45,7 @@ type Fetched struct {
 // one, in one git fetch. Afterwards the copy's origin heads (the refs
 // refs/remotes/origin/<name>) are origin's branches exactly: created, moved,
 // backwards too, and removed for a branch origin no longer has (see
-// setOriginHeads). A fetch that fails, or whose fetched refs cannot be
+// setHeads). A fetch that fails, or whose fetched refs cannot be
 // removed, changes no origin head. No branch and no tag of the copy is
 // written: origin's tags come back in Fetched, with their objects in the
 // copy, for the caller to create those it wants. When deadline passes first,
@@ -57,7 +57,7 @@ func (g Git) FetchOrigin(ctx context.Context, dir, url string, cred Credential, 
 		return Fetched{}, err
 	}
 	ns := fetchNamespace + randomName() + "/"
-	fetched, err := repo.fetch(ctx, url, cred, deadline, ns)
+	fetched, err := repo.fetch(ctx, url, cred, deadline, ns, true)
 	// The namespace goes whatever the fetch did, even one cut off after its
 	// refs were written, and before any origin head is set, so that a
 	// removal that fails leaves the origin heads as they were.
@@ -70,22 +70,26 @@ func (g Git) FetchOrigin(ctx context.Context, dir, url string, cred Credential, 
 	if cleanErr != nil {
 		return Fetched{}, fmt.Errorf("remove the fetched refs: %w", cleanErr)
 	}
-	if err := repo.setOriginHeads(ctx, fetched.Branches); err != nil {
+	if err := repo.setHeads(ctx, originPrefix, fetched.Branches); err != nil {
 		return Fetched{}, err
 	}
 	return fetched, nil
 }
 
-// fetch runs the git fetch of FetchOrigin, origin's branches and tags
-// written below ns, and returns them.
-func (r *Repo) fetch(ctx context.Context, url string, cred Credential, deadline time.Duration, ns string) (Fetched, error) {
+// fetch runs the git fetch of FetchOrigin and FetchRemote, the remote's
+// branches, and its tags when withTags, written below ns, and returns them.
+func (r *Repo) fetch(ctx context.Context, url string, cred Credential, deadline time.Duration, ns string, withTags bool) (Fetched, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	_, err := r.g.run(fetchCtx, access{cred, url}, "-c", "credential.helper=", "--git-dir="+r.dir,
+	args := []string{"-c", "credential.helper=", "--git-dir=" + r.dir,
 		// Atomic, so that a fetch that fails writes no ref; --no-tags, so
 		// that git writes no tag of the copy on its own.
 		"fetch", "--quiet", "--atomic", "--force", "--no-tags", "--no-write-fetch-head",
-		"--", url, "+refs/heads/*:"+ns+"heads/*", "+refs/tags/*:"+ns+"tags/*")
+		"--", url, "+refs/heads/*:" + ns + "heads/*"}
+	if withTags {
+		args = append(args, "+refs/tags/*:"+ns+"tags/*")
+	}
+	_, err := r.g.run(fetchCtx, access{cred, url}, args...)
 	if err != nil {
 		if ctx.Err() == nil && errors.Is(fetchCtx.Err(), context.DeadlineExceeded) {
 			return Fetched{}, fmt.Errorf("git fetch: %w (%v)", ErrDeadline, deadline)
@@ -96,6 +100,9 @@ func (r *Repo) fetch(ctx context.Context, url string, cred Credential, deadline 
 	if err != nil {
 		return Fetched{}, err
 	}
+	if !withTags {
+		return Fetched{Branches: branches}, nil
+	}
 	tags, err := r.refs(ctx, ns+"tags/")
 	if err != nil {
 		return Fetched{}, err
@@ -103,27 +110,28 @@ func (r *Repo) fetch(ctx context.Context, url string, cred Credential, deadline 
 	return Fetched{Branches: branches, Tags: tags}, nil
 }
 
-// setOriginHeads makes the copy's origin heads exactly heads: those of
+// setHeads makes the copy's refs below prefix, the heads it keeps of a
+// remote's branches such as the origin heads, exactly heads: those of
 // branches heads lacks are removed, the others created or moved, in one
 // transaction of git's, so that they change together or not at all. Git
 // refuses that transaction when a new head's name is a directory of a
 // removed one, or the other way round (dev and dev/next); then the removals
-// are made first and the rest after them, since an origin head origin no
-// longer has is to go in any case.
-func (r *Repo) setOriginHeads(ctx context.Context, heads map[string]string) error {
-	current, err := r.OriginHeads(ctx)
+// are made first and the rest after them, since a head of a branch the
+// remote no longer has is to go in any case.
+func (r *Repo) setHeads(ctx context.Context, prefix string, heads map[string]string) error {
+	current, err := r.refs(ctx, prefix)
 	if err != nil {
 		return err
 	}
 	var removals, writes strings.Builder
 	for name := range current {
 		if _, kept := heads[name]; !kept {
-			fmt.Fprintf(&removals, "delete %s%s\n", originPrefix, name)
+			fmt.Fprintf(&removals, "delete %s%s\n", prefix, name)
 		}
 	}
 	for name, id := range heads {
 		if current[name] != id {
-			fmt.Fprintf(&writes, "update %s%s %s\n", originPrefix, name, id)
+			fmt.Fprintf(&writes, "update %s%s %s\n", prefix, name, id)
 		}
 	}
 	if removals.Len()+writes.Len() == 0 {
@@ -133,10 +141,10 @@ func (r *Repo) setOriginHeads(ctx context.Context, heads map[string]string) erro
 		return nil
 	}
 	if err := r.updateRefs(ctx, removals.String()); err != nil {
-		return fmt.Errorf("remove the origin heads of branches origin no longer has: %w", err)
+		return fmt.Errorf("remove the heads of branches the remote no longer has: %w", err)
 	}
 	if err := r.updateRefs(ctx, writes.String()); err != nil {
-		return fmt.Errorf("record the origin heads: %w", err)
+		return fmt.Errorf("record the remote's heads: %w", err)
 	}
 	return nil
 }

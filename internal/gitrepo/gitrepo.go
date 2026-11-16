@@ -237,6 +237,17 @@ func (r *Repo) SetConfig(ctx context.Context, key, value string) error {
 	return err
 }
 
+// UnsetConfig removes key from the repository's own configuration; a key
+// that is not set there is no error.
+func (r *Repo) UnsetConfig(ctx context.Context, key string) error {
+	_, err := r.git(ctx, "config", "--local", "--unset-all", key)
+	// git config exits with 5 for a key it does not find.
+	if exitCode(err) == 5 {
+		return nil
+	}
+	return err
+}
+
 // originPrefix is where a copy keeps the last head seen on origin of each
 // branch.
 const originPrefix = "refs/remotes/origin/"

@@ -2269,6 +2269,30 @@ create` without `--intent`, any of these commands with a wrong number of
 arguments, and an `--exclude-change` that is not a positive integer are a
 `usage_error` with exit status `2`, before any request is sent.
 
+### `parley patch`
+
+These commands drive the [patch routes](api.md#carry-patch-workspaces) of a
+carry-patch workspace. Each sends one request with the credential as
+`Authorization: Bearer` and `<slug>` (and `<patch-id>`) as one
+percent-encoded path segment (`parley patch list a/b` sends
+`/api/v1/workspaces/a%2Fb/patches`), and prints the hub's answer on stdout
+with exit status `0`, for a `201` and a `200` alike; a refusal of the
+hub's is written to stderr as received, with nothing on stdout and exit
+status `1`. `parley patch` run without a command prints its help and exits
+`0`.
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley patch add <slug> --branch <name> [--position <n>] [--upstream-pr <url>] [--description <text>] [--skip-branch-check] [--if-not-exists]` | `POST /api/v1/workspaces/<slug>/patches` | the body `{"branch_name":…}`, with `position` (a number), `--upstream-pr` `upstream_pr_url`, `description`, `skip_branch_check` and `if_not_exists` (`true`) when given |
+| `parley patch list <slug> [--include-deleted]` | `GET /api/v1/workspaces/<slug>/patches` | `include_deleted=true` with `--include-deleted` |
+| `parley patch show <slug> <patch-id>` | `GET /api/v1/workspaces/<slug>/patches/<patch-id>` | |
+
+A flag not given sends no member: `--description ''` sends `""`, which the
+hub stores as `null`, and leaving it out sends nothing. `parley patch add`
+without `--branch` or with a `--position` that is not an integer, and any
+of these commands with a wrong number of arguments, are a `usage_error`
+with exit status `2`, before any request is sent.
+
 ### `parley land`
 
 `parley land` run without a command prints its help and exits `0`; it
