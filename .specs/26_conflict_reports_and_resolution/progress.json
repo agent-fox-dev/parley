@@ -3,7 +3,7 @@
   "spec_id": "26",
   "spec_name": "conflict_reports_and_resolution",
   "schema_version": 3,
-  "updated_at": "2026-11-16T04:59:30Z",
+  "updated_at": "2026-11-16T05:09:21Z",
   "tasks": [
     {
       "id": 1,
@@ -31,7 +31,7 @@
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,

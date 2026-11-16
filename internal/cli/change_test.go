@@ -3,6 +3,7 @@ package cli
 import (
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -485,10 +486,60 @@ func TestChangeRestack_SendsAnEmptyObjectAndPrintsTheOutcome(t *testing.T) {
 	}
 }
 
+func TestChangeResolve_SendsAResolutionForEachFlagAndPrintsTheOutcome(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	merged := write("m.txt", []byte("merged\n"))
+	// The local file's name holds an =, which only the first = splits from
+	// the repository path.
+	binary := write("v=1.bin", []byte{0xff, 0x00})
+	empty := write("empty.txt", nil)
+	tests := []struct {
+		name  string
+		flags []string
+		body  string
+	}{
+		{
+			"files and a delete, in the order given",
+			[]string{"--file", "app.txt=" + merged, "--file", "logo.bin=" + binary, "--delete", "old.txt"},
+			`{"resolutions":[{"path":"app.txt","content_base64":"bWVyZ2VkCg=="},{"path":"logo.bin","content_base64":"/wA="},{"path":"old.txt","delete":true}]}`,
+		},
+		{
+			"a delete before a file",
+			[]string{"--delete", "old.txt", "--file", "dir/app.txt=" + merged},
+			`{"resolutions":[{"path":"old.txt","delete":true},{"path":"dir/app.txt","content_base64":"bWVyZ2VkCg=="}]}`,
+		},
+		{"an empty file", []string{"--file", "e.txt=" + empty}, `{"resolutions":[{"path":"e.txt","content_base64":""}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			answer := `{"status":"restacked","change":{"number":2,"version":3,"needs_restack":false}}`
+			hub := newStubHub(t).answer(http.MethodPost, changesPath+"/2/restack", http.StatusOK, answer)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", append([]string{"resolve", "demo", "2"}, tt.flags...)...)
+
+			got := wantOnlyRequest(t, sent, http.MethodPost, changesPath+"/2/restack")
+			wantQuery(t, got.query, nil)
+			// The comparison is exact, so no entry holds a content member.
+			wantJSONBody(t, got.body, tt.body)
+			wantResult(t, code, stdout, stderr, answer)
+		})
+	}
+}
+
 func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 	t.Parallel()
 	conflict := `{"error":{"code":409,"message":"demo#12 conflicts with what it must sit on","error_type":"rebase_conflict",` +
 		`"details":{"target_sha":"` + changeSHA + `","files":[{"path":"f.txt","kind":"content"}]}}}`
+	resolved := localFile(t, "f.txt", []byte("both\n"))
 	tests := []struct {
 		args         []string
 		method, path string
@@ -504,6 +555,8 @@ func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 		{[]string{"abandon", "demo", "12"}, http.MethodPost, changesPath + "/12/abandon", http.StatusConflict, "has_dependants", ""},
 		{[]string{"restore", "demo", "12"}, http.MethodPost, changesPath + "/12/restore", http.StatusConflict, "source_workspace_gone", ""},
 		{[]string{"restack", "demo", "12"}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
+		{[]string{"resolve", "demo", "12", "--file", "f.txt=" + resolved}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
+		{[]string{"resolve", "demo", "12", "--delete", "f.txt"}, http.MethodPost, changesPath + "/12/restack", http.StatusNotFound, "change_not_found", ""},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -530,6 +583,7 @@ func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	t.Parallel()
 	hub := changeHub(t)
+	local := localFile(t, "a.txt", []byte("a\n"))
 	tests := [][]string{
 		{"open", "demo"},
 		{"open"},
@@ -564,6 +618,19 @@ func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"conflict", "demo", "x"},
 		{"conflict", "demo", "2", "3"},
 		{"conflict", "demo", "2", "--file", "a", "--fail-on-conflict"},
+		{"resolve", "demo", "2"},
+		{"resolve", "demo", "2", "--file", "a.txt"},
+		{"resolve", "demo", "2", "--file", "=" + local},
+		{"resolve", "demo", "2", "--file", "a.txt="},
+		{"resolve", "demo", "2", "--file", "a.txt=/no/such/file"},
+		{"resolve", "demo", "2", "--file", "a.txt=" + filepath.Dir(local)},
+		{"resolve", "demo", "2", "--delete", ""},
+		{"resolve", "demo", "2", "--file", "a.txt=" + local, "--delete", "a.txt"},
+		{"resolve", "demo", "2", "--delete", "a.txt", "--delete", "a.txt"},
+		{"resolve", "demo", "2", "--file", "a.txt=" + local, "--file", "a.txt=" + local},
+		{"resolve", "demo", "--delete", "a.txt"},
+		{"resolve", "demo", "2", "3", "--delete", "a.txt"},
+		{"resolve", "demo", "x", "--delete", "a.txt"},
 		{"wait", "demo"},
 		{"wait", "demo", "12", "--for", "done"},
 		{"wait", "demo", "12", "--timeout", "0s"},

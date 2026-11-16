@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -70,6 +71,7 @@ func newChangeCommand() *cobra.Command {
 			},
 		}), true),
 		newChangeConflictCommand(),
+		newChangeResolveCommand(),
 		newChangeLandCommand(),
 		newChangeLandsCommand(),
 		newChangeWaitCommand(),
@@ -182,6 +184,84 @@ func changeConflictIn(result []byte) (bool, string) {
 		return false, ""
 	}
 	return true, "the change does not rebase onto what it would sit on without a conflict: mergeable is conflict"
+}
+
+// resolution is one member of the resolutions of a restack's body: the
+// bytes a conflicted path takes, or its removal.
+type resolution struct {
+	Path string `json:"path"`
+	// ContentBase64 is the local file's bytes, encoded, so that any file
+	// travels unchanged; an empty file sends "".
+	ContentBase64 *string `json:"content_base64,omitempty"`
+	Delete        bool    `json:"delete,omitempty"`
+}
+
+// resolutionFlag is --file or --delete of parley change resolve. The two
+// append to one list, in the order of the command line. A value is
+// checked, and a --file read, as the flag is parsed, so that a bad one is
+// a usage error before any setting is read or any request sent (ADR 02).
+type resolutionFlag struct {
+	delete bool
+	list   *[]resolution
+	given  []string
+}
+
+func (f *resolutionFlag) Set(value string) error {
+	r := resolution{Path: value, Delete: true}
+	if !f.delete {
+		// A --file value is split as a --put of parley scm commit is: at
+		// its first =, so that a local file's name may hold one.
+		put, err := parseOperation("put", value)
+		if err != nil {
+			return err
+		}
+		r = resolution{Path: put.Path, ContentBase64: put.ContentBase64}
+	} else if value == "" {
+		return errors.New("want a <repo-path>, not an empty one")
+	}
+	*f.list = append(*f.list, r)
+	f.given = append(f.given, value)
+	return nil
+}
+
+// Type is the type of a repeatable string flag, as help shows it.
+func (f *resolutionFlag) Type() string { return "stringArray" }
+
+func (f *resolutionFlag) String() string { return "[" + strings.Join(f.given, ",") + "]" }
+
+// newChangeResolveCommand builds parley change resolve: a restack of a
+// change that resolves its conflicted paths with local files, or by
+// removing them.
+func newChangeResolveCommand() *cobra.Command {
+	var resolutions []resolution
+	resolve := declare(command{
+		Name:        "resolve",
+		Description: "Restack a change onto what it would be rebased onto, resolving its conflicted files with local files or by deleting them",
+		Method:      http.MethodPost,
+		Path:        changePath + "/restack",
+		Args:        []argSpec{slugArg, numberArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.Var(&resolutionFlag{list: &resolutions}, "file", "resolve the conflicted <repo-path>=<local-file> with the local file's bytes, repeatable")
+			fs.Var(&resolutionFlag{delete: true, list: &resolutions}, "delete", "resolve the conflicted <repo-path> by deleting it, repeatable")
+		},
+		Run: func(c *call) error {
+			return sendWith(c, nil, map[string]any{"resolutions": resolutions})
+		},
+	})
+	return checkFlags(withNumbers(resolve, true), func(cmd *cobra.Command) error {
+		if len(resolutions) == 0 {
+			return usageError("%s needs at least one --file or --delete", cmd.CommandPath())
+		}
+		seen := map[string]bool{}
+		for _, r := range resolutions {
+			if seen[r.Path] {
+				return usageError("%s names the repository path %q twice; a path takes one resolution", cmd.CommandPath(), r.Path)
+			}
+			seen[r.Path] = true
+		}
+		return nil
+	})
 }
 
 // newChangeOpenCommand builds parley change open: a change of a source
