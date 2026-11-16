@@ -26,7 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
+| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the run again at a start of the attempts a stop left running (`recover.go`, `Recover`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -4339,9 +4339,12 @@ workspace, number, landed)` for each landed change, the other
 source workspace is not the target; each opens its own store transaction
 and the hooks are called outside any. No gate, override rule, request
 guard, target guard or final observer is registered. The start
-hook `land-journal`, after `land`, runs `(*land.Component).Reconcile`.
+hook `land-journal`, after `land`, runs `(*land.Component).Reconcile`;
+the start hook `land-recover`, after it, runs `(*land.Component).Recover`.
 The part adds the background work `land_pool` (grace 5 s), which runs
-`RunPool` until the stop.
+`RunPool` until the stop. A test starts the hub with the pool paused by
+setting `Deps.Paused` with `AdjustLand`; an adjuster that reads a flag of
+the test lets a later start run unpaused.
 
 The schema keeps `land_attempts` (one row per attempt, keyed by its
 UUID, with the workspace, the target branch, the status, constrained to
@@ -4564,6 +4567,24 @@ its follow-up and its report (`concluded`) then, the hooks registered at
 the composition being in place before the start hooks run; a land
 recorded before the stop has no row left, so its follow-up is not run
 again.
+
+`Recover` (`recover.go`), once `Reconcile` ran and before the listener
+binds, reads every attempt still `running`, whatever its workspace, oldest
+first, and hands each to the pool again (`hand`, the form of `submit` for
+an attempt run again) with a deadline counted from then, not from its
+creation; the pool starts them when `RunPool` runs, while requests are
+served, and since no request was served before, no attempt is handed
+over twice. Such an attempt runs through `rerun`: `readmit` checks the
+land's preconditions again with `admit`, for its top change, `stack` for
+an attempt covering more than one change, no expected version and the
+attempt itself left out of the running-attempt check; a precondition that
+no longer holds, such as a change abandoned while the hub was stopped,
+ends it `failed` `internal` (`fail`), with its `parley.change.land_fail`
+event. Otherwise `run` runs it as it runs a new attempt, with what the
+attempt stores: its changes at their stored versions, its strategy,
+trigger, session and requested override, and `requested_by`, the actor
+of its events; its id and `created_at` do not change, and a target that
+no longer exists ends it `failed` `internal` as in any run.
 
 ### Hub events
 

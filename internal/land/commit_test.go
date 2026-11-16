@@ -38,7 +38,9 @@ func TestCommit_ComesUpLandedOrUntouchedAfterAStopAtEachPoint(t *testing.T) {
 	} {
 		t.Run(c.point, func(t *testing.T) {
 			t.Parallel()
-			w := newWorld(t)
+			// The pool runs nothing, so that an attempt the stop left
+			// running is not run again at the start.
+			w := newWorld(t, func(d *land.Deps) { d.Paused = true })
 			ctx := context.Background()
 			ch := w.open(t, "feature")
 			stop := errors.New("the hub stops")

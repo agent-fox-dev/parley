@@ -4538,13 +4538,22 @@ branch: two attempts meet only in the compare-and-swap. At most
 attempt waits for a free worker, reads `running` meanwhile, and none
 fails because every worker is busy; waiting attempts start in no
 promised order. An attempt that is not final `[land].timeout` (5 minutes
-by default) after it was created, waiting for a worker included, is
-stopped, every `git` process of its work killed, and ends `failed` with
+by default) after it was created, or after a start ran it again,
+waiting for a worker included, is stopped, every `git` process of its work killed, and ends `failed` with
 `error` `timeout`, its change still `open`; it never moves the target
 afterwards. An attempt whose target has already begun to move when its
 time runs out ends as that move ends: `landed` when the target moved,
 `failed` `timeout` when it did not. A stop of the hub stops the attempts it runs without
-ending them: they stay `running`.
+ending them: they stay `running`, and the next start runs every attempt
+still `running` again, while it serves requests, until each is final.
+Such an attempt keeps its `id`, `created_at`, `trigger`, `session_id` and
+`requested_by`, who is the actor of its events, and lands the versions
+it was created with, by its strategy, with its override asked again. It
+runs from the preconditions: one that no longer holds, such as a change
+that is no longer `open`, ends it `failed` with
+`error` `internal`, the change left as it is, and a target branch that is
+gone ends it the same way; otherwise it ends `landed`, `conflict` or
+`blocked` as a new attempt would.
 
 The move and its record cannot share one transaction, so the hub enters
 the move in a journal first. A hub that stops at any point of a land

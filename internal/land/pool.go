@@ -38,13 +38,15 @@ type pool struct {
 }
 
 // job is one attempt the pool holds: the attempt as it was handed over,
-// when its deadline counts from, and done, closed once the attempt is
-// final or the pool has let go of it.
+// when its deadline counts from, whether a stop left it running and it
+// runs again (Recover), and done, closed once the attempt is final or the
+// pool has let go of it.
 type job struct {
-	a    Attempt
-	from time.Time
-	done chan struct{}
-	once sync.Once
+	a     Attempt
+	from  time.Time
+	again bool
+	done  chan struct{}
+	once  sync.Once
 
 	mu sync.Mutex
 	// swapping is set while the engine moves the target: the deadline
@@ -90,14 +92,17 @@ func (c *Component) RunPool(ctx context.Context) {
 // run now waits for a worker, and one handed over while the hub stops
 // stays running for the next start. An attempt the pool holds already is
 // not taken twice.
-func (c *Component) submit(a Attempt, from time.Time) {
+func (c *Component) submit(a Attempt, from time.Time) { c.hand(a, from, false) }
+
+// hand is submit, of an attempt a stop left running for again.
+func (c *Component) hand(a Attempt, from time.Time, again bool) {
 	p := &c.pool
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, held := p.jobs[a.ID]; held {
 		return
 	}
-	j := &job{a: a, from: from, done: make(chan struct{})}
+	j := &job{a: a, from: from, again: again, done: make(chan struct{})}
 	if p.stopped {
 		j.release()
 		return
@@ -157,7 +162,13 @@ func (c *Component) attend(j *job) {
 	}
 	defer func() { <-p.slots }()
 	ran := make(chan error, 1)
-	go func() { ran <- c.run(ctx, j.a) }()
+	go func() {
+		if j.again {
+			ran <- c.rerun(ctx, j.a)
+			return
+		}
+		ran <- c.run(ctx, j.a)
+	}()
 	var err error
 	select {
 	case err = <-ran:

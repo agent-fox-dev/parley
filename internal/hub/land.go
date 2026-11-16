@@ -12,10 +12,13 @@ import (
 
 // landHook is the name of the start hook that binds the land component;
 // landJournalHook the name of the one after it that completes or drops
-// the lands a stop left in the land journal.
+// the lands a stop left in the land journal; landRecoverHook the name of
+// the last, which hands the attempts a stop left running to the pool to
+// run them again.
 const (
 	landHook        = "land"
 	landJournalHook = "land-journal"
+	landRecoverHook = "land-recover"
 )
 
 // landPoolWork is the name of the background work that runs the land
@@ -37,7 +40,12 @@ const (
 // the access rule, to the hub's event log, to the ref writer and to the
 // [land] options: the tries of one land, the workers of the pool, the
 // deadline of an attempt and the landing identity. The pool runs as
-// background work; the stop leaves its running attempts running. No
+// background work; the stop leaves its running attempts running, and the
+// next start, once the land journal is reconciled and before the listener
+// binds, hands them to the pool again, which runs them while requests are
+// served. A test starts the hub with the pool paused by setting
+// land.Deps.Paused through AdjustLand: the attempts it is handed stay
+// running until a start without it. No
 // session linker is registered: until the session feature registers one,
 // every session_id a land names is refused.
 //
@@ -108,6 +116,7 @@ func composeLand(c *Composition) {
 		return nil
 	})
 	c.AddStartHook(landJournalHook, func(ctx context.Context, _ *Runtime) error { return comp.Reconcile(ctx) })
+	c.AddStartHook(landRecoverHook, func(ctx context.Context, _ *Runtime) error { return comp.Recover(ctx) })
 	c.AddBackgroundWork(landPoolWork, landPoolGrace, func(ctx context.Context, _ *Runtime) { comp.RunPool(ctx) })
 }
 
