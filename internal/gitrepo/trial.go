@@ -143,9 +143,30 @@ func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string
 	case exitCode(err) == 1 && ctx.Err() == nil:
 		// merge-tree exits with 1 when the merge has conflicts.
 		files, perr := parseConflicts(out)
+		for i := range files {
+			for _, side := range []*ConflictSide{files[i].Base, files[i].Ours, files[i].Theirs} {
+				if side != nil {
+					side.Path = asidePath(side.Path, ours, theirs)
+				}
+			}
+		}
 		return "", files, perr
 	}
 	return "", nil, err
+}
+
+// asidePath is the path of a side of a conflict before git moved it aside.
+// To record both sides of a path the sides give different types, such as
+// a file and a symlink, git renames one of them to <path>~<label>, the label
+// being the commit merge-tree was given for that side; that path exists on
+// no side, and the side's own path is <path>.
+func asidePath(path, ours, theirs string) string {
+	for _, label := range []string{ours, theirs} {
+		if p, ok := strings.CutSuffix(path, "~"+label); ok && p != "" {
+			return p
+		}
+	}
+	return path
 }
 
 // parseConflicts reads what git merge-tree -z writes for a merge with

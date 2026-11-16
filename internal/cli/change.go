@@ -39,10 +39,10 @@ const changePath = "/workspaces/:slug/changes/:number"
 var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land", "no-auto-land", "target"}
 
 // newChangeCommand builds parley change: the changes of a workspace, their
-// versions and their diffs, their stacks, their edits, abandon, restore and
-// restack, and waiting for one.
+// versions and their diffs, their stacks, their edits, abandon, restore,
+// restack and land, their land attempts, and waiting for one.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list, read, edit, abandon, restore, restack and wait for the changes of a workspace, and read their versions, diffs and stacks",
+	return group("change", "Open, list, read, edit, abandon, restore, restack, land and wait for the changes of a workspace, and read their versions, diffs, stacks and land attempts",
 		newChangeOpenCommand(),
 		newChangeEditCommand(),
 		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
@@ -67,6 +67,8 @@ func newChangeCommand() *cobra.Command {
 				return sendWith(c, nil, map[string]any{})
 			},
 		}), true),
+		newChangeLandCommand(),
+		newChangeLandsCommand(),
 		newChangeWaitCommand(),
 		withNumbers(scmRead{
 			command: command{Name: "list", Description: "List the changes of a workspace, the draft and open ones unless --state says otherwise", Path: "/workspaces/:slug/changes", Args: []argSpec{slugArg}},

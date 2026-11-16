@@ -70,8 +70,9 @@ const (
 // accepted write to a fork through git or the source control API, after
 // the refs moved and outside any store transaction, since RecordActivity
 // opens its own. The change part registers RecordActivityIn, which runs in
-// the transaction that opens or abandons the change. The landing is not in
-// the hub yet, so its hook is not registered.
+// the transaction that opens or abandons the change. The landing registers
+// RecordActivity as an after-landing hook (composeLand), called for each
+// landed change whose source is a fork, outside any store transaction.
 func composeForks(c *Composition) {
 	comp := &fork.Component{}
 	c.forks = comp

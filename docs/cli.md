@@ -581,8 +581,8 @@ sent as `%2E` or `%2E%2E`.
 Each request has 30 seconds to complete, from connecting to reading the
 whole answer, unless the command states another timeout (`parley version`:
 5 seconds; the callback of `parley login`: 60 seconds; `parley events
-list`: 30 seconds plus its `--wait`; `parley events tail`: none, see
-[`parley events`](#parley-events)). A request that has
+list`: 30 seconds plus its `--wait`; `parley change land`: 70 seconds;
+`parley events tail`: none, see [`parley events`](#parley-events)). A request that has
 not completed by then is abandoned with a `client_error`:
 
 ```json
@@ -1994,11 +1994,12 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its fourteen commands open,
-read, edit, abandon, restore, restack and wait for the changes of a
-workspace, and read their stacks, through the
-[change routes](api.md#changes) of the hub. Each sends one request (`edit`
-with a label flag two, `wait` one per poll, see below) with the credential as
+reads no credential and sends no request. Its sixteen commands open,
+read, edit, abandon, restore, restack, land and wait for the changes of a
+workspace, and read their stacks and land attempts, through the
+[change routes](api.md#changes) and the [land routes](api.md#landing) of
+the hub. Each sends one request (`edit` with a label flag two, `wait` and
+`land --wait` one more per poll, see below) with the credential as
 `Authorization: Bearer` and `<slug>` (and the `<sha>` of `find`) as one
 percent-encoded path segment (`parley change open a/b --source feat` sends
 `POST /api/v1/workspaces/a%2Fb/changes`).
@@ -2018,6 +2019,8 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change abandon <slug> <number> [--reason <text>] [--dependants reparent\|abandon]` | `POST …/changes/<number>/abandon` | `reason` and `dependants`, as given; `{}` without a flag |
 | `parley change restore <slug> <number>` | `POST …/changes/<number>/restore` | no body |
 | `parley change restack <slug> <number>` | `POST …/changes/<number>/restack` | the body `{}` |
+| `parley change land <slug> <number> [--stack] [--expected-version <n>] [--override <reason>] [--session <id>] [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST …/changes/<number>/land`; with `--wait`, then `GET …/lands/<id>` once per poll | the body below |
+| `parley change lands <slug> <number>` | `GET …/changes/<number>/lands` | |
 | `parley change wait <slug> <number> [--for landed\|ready\|mergeable] [--timeout <duration>] [--poll-interval <duration>]` | `GET …/changes/<number>`, once per poll | |
 
 A flag not given sends no parameter, so that the hub's default applies;
@@ -2064,6 +2067,34 @@ rebase the change onto what it must sit on now (see
 conflicts is the refusal `409` `rebase_conflict`, whose envelope holds the
 conflict report in `details`.
 
+`parley change land` lands the change, or with `--stack` its whole stack
+(see [`POST …/land`](api.md#post-apiv1workspacesslugchangesnumberland)).
+Its body holds one member for each flag given and none for a flag not
+given, `{}` without a flag: `--stack` `stack` (`true`),
+`--expected-version` `expected_version` (a number), `--override <reason>`
+`override` (`{"reason": "<reason>"}`) and `--session` `session_id`. It
+sends no `wait` query, so the hub holds the call for its default 30
+seconds, and its request has 70 seconds to complete. A `200` (the attempt
+`landed`) or `202` (the attempt still `running`) is printed as the land
+attempt on stdout with exit status `0`; without `--wait` a `202` is a
+success, since the hub took the land and its outcome is not known yet. A
+refusal (`409` `land_conflict` with the attempt and its conflict report in
+`error.details`, `409` `policy_blocked`, `503` `land_failed`, `409`
+`change_not_open`, `version_mismatch`, `land_in_progress` or
+`depends_on_unlanded`, `403` `forbidden` or `token_bound`, among others) is
+written to stderr as received, with nothing on stdout and exit status `1`,
+and is never polled. With `--wait` and a `202`, the command polls
+`GET /api/v1/workspaces/<slug>/lands/<id>`, `<id>` the attempt's `id`, as
+for [Waiting](#waiting), on the attempt's `status`: `landed` ends the wait
+with exit status `0`, `conflict`, `blocked` and `failed` end it with the
+attempt on stdout and `wait_failed` on stderr (`the operation ended in the
+state "conflict", which is not a success`), and `running` keeps it going. A
+land answered `200` is not polled.
+
+`parley change lands` prints the page of the change's land attempts the
+hub answers, newest first (see
+[`GET …/lands`](api.md#get-apiv1workspacesslugchangesnumberlands)).
+
 `parley change wait` reads the change at once, then again one
 `--poll-interval` (default `5s`) after each answer, until the change meets
 the condition of `--for` or can no longer meet it, under one deadline:
@@ -2103,7 +2134,10 @@ status `1`. `open` is sent once and never retried.
 **Client checks.** A missing `--source`, a wrong number of arguments, a
 `<number>`, `--against`, `--depends-on` or `--stack-of` that is not a
 positive integer in decimal digits (`parley change show takes a <number>
-that is a positive integer, got "x"`), a `--version` that is neither that
+that is a positive integer, got "x"`), a `land --expected-version` that is
+not one (`parley change land takes --expected-version <n>, a positive
+integer, got "0"`), a blank `land --override` (`parley change land takes
+--override <reason>, a reason that is not blank`), a `--version` that is neither that
 nor `latest` (`parley change diff takes --version <n>, a positive integer
 or latest, got "x"`), `--patch` with `--name-only` (`parley change diff
 takes --patch or --name-only, not both`), a `--limit` that is not an
@@ -2115,10 +2149,38 @@ not both`), an `abandon --dependants` other than `reparent` and
 `abandon` (`parley change abandon takes --dependants reparent or abandon,
 got "delete"`), a `wait --for` other than `landed`, `ready` and
 `mergeable` (`parley change wait takes --for landed, ready or mergeable,
-got "done"`) and a `wait --timeout` or `--poll-interval` that is not a
+got "done"`) and a `wait` or `land` `--timeout` or `--poll-interval` that is not a
 duration above zero (see [Waiting](#waiting)) are refused with a
 `usage_error` and exit status `2` before any setting is read or any request
 sent.
+
+### `parley land`
+
+`parley land` run without a command prints its help and exits `0`; it
+reads no credential and sends no request. Its two commands read the land
+attempts of a workspace through the [land routes](api.md#landing) of the
+hub. Each sends one `GET` with the credential as `Authorization: Bearer`,
+`<slug>` and `<land-id>` as one percent-encoded path segment each, and
+each flag given as query parameters, none for a flag not given, so that
+the hub's default applies; text values are sent as given, for the hub to
+judge.
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley land list <slug> [--status <s>]... [--target <branch>] [--since <time>] [--limit <n>] [--cursor <c>]` | `GET …/workspaces/<slug>/lands` | one `status` per `--status`, `--target` `target_branch`, `since`, `limit`, `cursor` |
+| `parley land show <slug> <land-id>` | `GET …/workspaces/<slug>/lands/<land-id>` | |
+
+`list` prints the one page of attempts the hub answered, newest first, and
+does not follow `next_cursor`; `show` prints the one attempt. Both print
+the JSON answer on stdout with exit status `0`. A refusal of the hub's
+(`404` `land_not_found`, `400` `invalid_request` for an unknown `status`
+or a `since` that is not an RFC 3339 timestamp, among others) is written to
+stderr as received, with nothing on stdout and exit status `1`.
+
+**Client checks.** A wrong number of arguments (`parley land show needs
+the argument <land-id>`) and a `--limit` that is not an integer are
+refused with a `usage_error` and exit status `2` before any setting is read
+or any request sent.
 
 ### `parley scm`
 

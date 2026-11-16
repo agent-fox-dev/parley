@@ -70,6 +70,18 @@ WHERE source_workspace = ? AND source_branch = ? AND state IN ('draft', 'open')`
 	return b, true, nil
 }
 
+// ChangesInto are the numbers of the draft and open changes of the
+// workspace whose target is branch, ascending, read through q (the
+// caller's transaction, or nil for the store).
+func (c *Component) ChangesInto(ctx context.Context, q Querier, workspace, branch string) ([]int64, error) {
+	numbers, err := queryList[int64](ctx, c.querier(q), `SELECT number FROM changes
+WHERE workspace_slug = ? AND target_branch = ? AND state IN ('draft', 'open') ORDER BY number`, workspace, branch)
+	if err != nil {
+		return nil, fmt.Errorf("find the changes into %s:%s: %w", workspace, branch, err)
+	}
+	return numbers, nil
+}
+
 // ofWorkspace selects the changes a workspace asks about: its own, and,
 // since a fork holds no changes, those of its parent whose source it is.
 const ofWorkspace = `(c.workspace_slug = ? OR c.source_workspace = ?)`

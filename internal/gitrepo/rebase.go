@@ -27,7 +27,8 @@ import (
 // left behind when it stops. The commits of a rebase that conflicts stay
 // unreferenced, for git's garbage collection.
 func (r *Repo) Rebase(ctx context.Context, onto, head string, at time.Time) (string, *ConflictReport, error) {
-	return r.rebase(ctx, onto, head, onto, at)
+	newHead, _, report, err := r.rebase(ctx, onto, head, onto, HubSignature(at))
+	return newHead, report, err
 }
 
 // RebaseFrom is Rebase of the commits that head reaches and base does not,
@@ -36,33 +37,32 @@ func (r *Repo) Rebase(ctx context.Context, onto, head string, at time.Time) (str
 // does not have them. A base of "" replays every commit of head. The
 // report of a commit that does not apply names base as its base.
 func (r *Repo) RebaseFrom(ctx context.Context, base, head, onto string, at time.Time) (string, *ConflictReport, error) {
-	newHead, report, err := r.rebase(ctx, base, head, onto, at)
-	if report != nil {
-		report.BaseSHA = base
-	}
+	newHead, _, report, err := r.RebaseFromAs(ctx, base, head, onto, HubSignature(at))
 	return newHead, report, err
 }
 
 // rebase replays the commits from..head, every commit of head for a from
-// of "", on top of onto, as Rebase says.
-func (r *Repo) rebase(ctx context.Context, from, head, onto string, at time.Time) (string, *ConflictReport, error) {
+// of "", on top of onto, as Rebase says, with committer as the committer
+// of each new commit, and returns the new head with what each commit
+// became, as RebaseFromAs says.
+func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Signature) (string, []ReplayedCommit, *ConflictReport, error) {
 	onto, head, err := rangeEnds(onto, head)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	commitRange := head
 	if from != "" {
 		if from, _, err = rangeEnds(from, head); err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		commitRange = from + ".." + head
 	}
 	commits, err := r.replayed(ctx, commitRange)
 	switch {
 	case err != nil:
-		return "", nil, err
+		return "", nil, nil, err
 	case len(commits) == 0:
-		return onto, nil, nil
+		return onto, nil, nil, nil
 	}
 	ids := make([]string, len(commits))
 	for i, c := range commits {
@@ -70,39 +70,60 @@ func (r *Repo) rebase(ctx context.Context, from, head, onto string, at time.Time
 	}
 	full, err := r.ReadCommits(ctx, ids)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	zones, err := r.authorZones(ctx, commitRange)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	i := 0
+	became := make([]ReplayedCommit, 0, len(commits))
 	newHead, report, err := r.replay(ctx, onto, head, commits, func(c Commit, ours, oursTree, tree string) (string, error) {
-		orig := full[i]
-		i++
+		orig := full[len(became)]
 		switch {
 		case len(c.Parents) > 0 && c.Parents[0] == ours:
+			became = append(became, ReplayedCommit{From: c.ID, To: c.ID})
 			return c.ID, nil
 		case tree == oursTree:
+			became = append(became, ReplayedCommit{From: c.ID})
 			return ours, nil
 		}
 		author := orig.Author
 		if zone, ok := zones[c.ID]; ok {
 			author.Time = author.Time.In(zone)
 		}
-		return r.CreateCommit(ctx, CommitSpec{Tree: tree, Parents: []string{ours}, Message: orig.Message,
-			Author: author, Committer: HubSignature(at)})
+		id, err := r.CreateCommit(ctx, CommitSpec{Tree: tree, Parents: []string{ours}, Message: orig.Message,
+			Author: author, Committer: committer})
+		became = append(became, ReplayedCommit{From: c.ID, To: id})
+		return id, err
 	})
 	if err != nil || report != nil {
-		return "", report, err
+		return "", nil, report, err
 	}
-	return newHead, nil, nil
+	return newHead, became, nil, nil
 }
 
-// authorZones maps each commit of the rev-list range commitRange to the
-// zone of its author's time, which ReadCommits gives in UTC.
-func (r *Repo) authorZones(ctx context.Context, commitRange string) (map[string]*time.Location, error) {
-	out, err := r.git(ctx, "rev-list", "--no-commit-header", "--date=raw", "--format=%H %ad", commitRange)
+// AuthorZone is the zone of the author's time of the commit id, a full id,
+// which ReadCommits gives in UTC, so that a commit made with that author
+// keeps the zone the author wrote in.
+func (r *Repo) AuthorZone(ctx context.Context, id string) (*time.Location, error) {
+	if !isHexID(id, idLen) {
+		return nil, fmt.Errorf("commit %q: %w", id, ErrNotFound)
+	}
+	zones, err := r.authorZones(ctx, "--no-walk", id)
+	if err != nil {
+		return nil, err
+	}
+	zone, ok := zones[strings.ToLower(id)]
+	if !ok {
+		return nil, fmt.Errorf("commit %s: %w", id, ErrNotFound)
+	}
+	return zone, nil
+}
+
+// authorZones maps each commit rev-list lists for revs to the zone of its
+// author's time, which ReadCommits gives in UTC.
+func (r *Repo) authorZones(ctx context.Context, revs ...string) (map[string]*time.Location, error) {
+	out, err := r.git(ctx, append([]string{"rev-list", "--no-commit-header", "--date=raw", "--format=%H %ad"}, revs...)...)
 	if err != nil {
 		return nil, err
 	}

@@ -3057,8 +3057,8 @@ The conflict report has every member, whichever is empty:
 | `base_sha` | the merge base: `merge_base_sha` |
 | `commit_sha` | the first commit of `head` that did not apply |
 | `files` | the conflicted files, in byte order of path: `{"path": …, "kind": …, "base": …, "ours": …, "theirs": …, "landed_by": []}` |
-| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` until the hub records which change landed which commit |
-| `change` | the change whose head was rebased; always `null` for the same reason |
+| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` in a comparison, filled in [a land's conflict report](#landing) |
+| `change` | the change whose head was rebased; always `null` in a comparison |
 
 In a conflicted file, `base`, `ours` and `theirs` are the file on each side
 of the three-way merge that failed, `{"sha": …, "mode": …, "path": …}` (the
@@ -3071,7 +3071,7 @@ the path, `modify_delete` when the target changed a file the head deleted,
 `delete_modify` for the reverse, and `rename`, `mode` (a file on one side, a
 symlink or another type on the other), `binary` or `submodule` where git
 names the conflict so. `landed_by` lists the landed changes that changed the
-file; always `[]` for now.
+file; always `[]` in a comparison.
 
 | Status | When |
 |---|---|
@@ -3545,8 +3545,8 @@ the conflicted files in byte order of path, each with its `kind`
 `binary`, `submodule`) and the file on each side, `base` (the commit's
 parent), `ours` (`onto` with the commits replayed before it) and `theirs`
 (the commit), `null` on a side that lacks it. `landed_changes`, each
-`landed_by` and `change` are empty or `null`: the hub does not say yet
-which landed change touched the files.
+`landed_by` and `change` are empty or `null` here: only [a land's conflict
+report](#landing) names the landed changes that touched the files.
 
 ```json
 {"error":{"code":409,"message":"commit 3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8 of refs/heads/clash does not apply on top of b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","error_type":"rebase_conflict","details":{"target_sha":"b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","head_sha":"2d165dbfc00967ebdead889de8ba17e45a81f98d","base_sha":"a5bc5c5cd7650975def32e01a71d7011f00bfeb6","commit_sha":"3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8","files":[{"path":"a.txt","kind":"content","base":{"sha":"814f4a422927b82f5f8a43f8fab6d3839e3983f2","mode":"100644","path":"a.txt"},"ours":{"sha":"4c1ee586b89c236961f884e55c2745659e6e45f6","mode":"100644","path":"a.txt"},"theirs":{"sha":"08a39ce7008d263b922cbee785e726af46facfac","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}}
@@ -4146,9 +4146,9 @@ the version cannot record them, the version is not recorded either. A
 change has at most one pending restack: a newer one replaces it, so that
 the change is restacked once, onto the newest head below.
 
-When a change lands as a commit on its target branch, each `draft` or
-`open` change directly above it, in one store transaction of its own,
-gets `depends_on` `null`, keeps the landed commit as the commit it must
+When a change lands (see [Landing](#landing)), once the land is recorded
+each `draft` or `open` change directly above it, in one store transaction
+of its own, gets `depends_on` `null`, keeps the landed commit as the commit it must
 sit on, and gets a pending restack onto that commit, with the trigger
 `land`; a change without dependants records nothing. The changes further
 up keep their `depends_on` and are restacked in turn onto the new head of
@@ -4346,6 +4346,365 @@ task fork, calling on the fork's parent, sees only the changes whose
 source is that fork. The `stack_of` filter of
 [the list](#get-apiv1workspacesslugchanges) walks the stack in every
 state instead.
+
+## Landing
+
+Landing adds a change's commits to its target branch. Every request to
+land a change, or a stack of changes, is recorded as a land attempt,
+which is kept for the life of its workspace: the teardown that deletes a
+workspace deletes its attempts. `POST …/changes/{number}/land` creates
+an attempt and answers it; three routes read the attempts.
+
+The land attempt object:
+
+```json
+{"id":"0f9a7f8e-5c1b-4d6e-9a3b-1c2d3e4f5a6b","workspace_slug":"demo","target_branch":"main","changes":[1,2],"status":"landed","trigger":"manual","strategy":"rebase","attempts":1,"onto_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","landed_sha":"5e3d0c1a2b4f6e8d0a1c3e5f7a9b1d3f5e7a9c1b","noop":false,"commits":[{"change":1,"version_sha":"0b86db2bc73da0f067ec404140cfc00060162383","landed_sha":"7c1e9a2b3d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b"},{"change":2,"version_sha":"1f2e3d4c5b6a7980a1b2c3d4e5f6a7b8c9d0e1f2","landed_sha":"5e3d0c1a2b4f6e8d0a1c3e5f7a9b1d3f5e7a9c1b"}],"conflict":null,"blocked":null,"error":null,"override":null,"policy_revision":0,"requested_by":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"created_at":"2026-11-16T09:00:00Z","finished_at":"2026-11-16T09:00:01Z"}
+```
+
+Every member is always present, `null` where the attempt has no value.
+
+| Member | Meaning |
+|---|---|
+| `id` | the attempt's UUID |
+| `workspace_slug`, `target_branch` | the workspace whose branch the attempt lands on, which holds the changes, and the branch |
+| `changes` | the numbers of the changes the attempt lands, bottom first. The attempt lands the version each change had when the attempt was created; a version that arrives later is not landed by it |
+| `status` | `running`, then one of the final `landed`, `conflict`, `blocked` and `failed`. A final attempt never changes, and reads the same on every later request |
+| `trigger` | `manual`, or `auto_land` for the automatic landing of a change |
+| `strategy` | `rebase` or `squash` |
+| `attempts` | the tries to move the target branch |
+| `onto_sha`, `landed_sha` | the target head the commits were landed on and the head the land made it |
+| `noop` | `true` for a land whose commits were all on the target already |
+| `commits` | each landed commit: the `change` it belongs to, the commit of its version (`version_sha`) and the commit it landed as (`landed_sha`); `[]` for none |
+| `conflict` | the conflict report of an attempt that ended `conflict`, in the form [the comparison](#get-apiv1workspacesslugscmcompare) gives it, with its landed changes attributed (below) |
+| `blocked` | the change whose landing requirements were not met: `change`, `status` and `requirements` (never `null`) |
+| `error` | why an attempt ended `failed`: `contention`, `timeout`, `origin_rejected` or `internal` |
+| `override` | `{"reason": …}`, the override the attempt applied |
+| `policy_revision` | the revision of the policy that judged the attempt, `null` until it was judged |
+| `requested_by` | who asked for the land: `actor_type` (`admin_token`, `api_key` or `pat`), `actor_id` and `username`, both `null` for the admin token |
+| `session_id` | the session the land was asked for in |
+| `created_at`, `finished_at` | when the attempt was created and when it ended, `null` while it runs |
+
+An attempt with the strategy `rebase` replays each change's own commits,
+those of its version that are not in its base, in order onto the head of
+the target branch it reads (`onto_sha`). A commit whose parent already is
+that head is used as it is, so a version made on the target head lands
+with its own commit ids; a commit whose change the target already holds is
+left out and has no `commits` entry; every other commit is made anew with
+the author, author date and message of the commit it replays and the
+landing identity as committer, `Parley <parley@localhost>` unless
+`[land].committer_name` and `[land].committer_email` name another
+([configuration.md](configuration.md)).
+The target then moves from `onto_sha` to `landed_sha` with a
+compare-and-swap, which is not a push: the push rules, a protected branch
+included, do not apply. When another write moved the target since it was
+read, the attempt reads the new head, replays the changes onto it and
+tries again; `attempts` counts every try, and `onto_sha` is the head the
+try that moved the target was built on. After `[land].max_attempts` lost
+tries (10 unless the configuration says otherwise) the attempt ends
+`failed` with `error` `contention`, nothing of it in the target and
+the change still `open`, so a new land may follow. A target branch that
+does not exist when the attempt reads or moves it, or a policy gate,
+store or git failure other than a conflict, a policy gate or override
+rule that fails or panics, and a change version without a base (one whose
+history the target does not share, `base_sha` `null`), ends the attempt
+`failed` with `error` `internal`; a land never creates its target branch.
+So does a change that is no longer `open` when the target is about to
+move, abandoned or set back to `draft` while the attempt ran: the target
+does not move and the change keeps its state. A change abandoned in the
+moment after that check, while the target moves, is `landed` all the
+same, since the target holds it then. The
+move is followed by one store transaction
+that marks each change `landed` (`landed` = `{sha, at, by, land_id,
+commits}`, every landed commit then found by the change's by-commit
+lookup), makes the attempt final and writes one `parley.change.land`
+event per change: resource `change` `{number}`, the requester as actor,
+the attempt's `session_id`, and metadata `land_id`, `target_branch`,
+`onto_sha`, `landed_sha`, `strategy`, `attempts`, `noop`, `trigger`,
+`override`, `policy_revision`, `number` and `ref`. One `parley.git.push`
+event follows for the target ref, with `via` `land` and `direct` `false`.
+When every commit was left out, the attempt ends `landed` with `noop`
+`true`, `landed_sha` and `onto_sha` both the unchanged target head and
+`commits` `[]`; the change is `landed` at that head, `parley.change.land`
+says `noop` `true`, and no `parley.git.push` is written.
+
+An attempt with the strategy `squash` replays each change's own commits
+the same way, then makes of each change one commit on the head it was
+replayed onto: its tree is the one the replay ended at, its author the
+author of the version's head commit, with its author date and that date's
+time zone, its committer the landing identity,
+and its message the change's title, a blank line, its intent and a blank
+line (both left out for a change without an intent), and the trailers:
+`Parley-Change: <slug>#<number>`, then `Parley-Session: <id>` when the
+change has a session, then one
+`Co-authored-by: Name <email>` per other author of the change's own
+commits, in the order they first wrote one. The change's one `commits`
+entry has `version_sha` the version's head. A change whose replay leaves
+the target's tree as it was gets no commit and no entry.
+
+A stack land covers the change and every change below it that is not
+`landed`, bottom first in `changes`; a change below that is already
+`landed` is left out and keeps its `landed`. It replays them bottom first,
+each onto the result of the one below, and moves the target once, to the
+top; with `squash` each change becomes one commit, in order. Every
+covered change is then `landed` by the attempt, with `landed.sha` the new
+target head and its own `commits`, and gets its `parley.change.land`
+event; one `parley.git.push` is written. A conflict, or a gate answer
+that is not `ready`, in any covered change ends the whole attempt with
+nothing landed: the target stays where it was, every covered change stays
+`open`, `conflict.change` or `blocked.change` names the change that
+stopped it, and that change alone gets `mergeable` `conflict` and the
+`parley.change.land_fail` event. The report's `target_sha` is then the
+head the attempt read, and `ours` of each file the side as replayed with
+the changes below.
+
+Before it replays anything the attempt asks the policy gate about each
+change it covers, once and bottom first, with the workspace, the change,
+the version being landed and the caller; a retry of the compare-and-swap
+asks nothing again. With no policy installed every change is `ready`, by
+revision 0, and `policy_revision` is the revision that answered, the
+highest when the answers differ. An answer `pending` or `blocked` on a
+request that carries an `override` is put to the override rule, and one
+the rule lets pass counts as `ready`; the attempt, and the metadata of
+its `parley.change.land` events, show `override` `{"reason": …}` only when
+the rule let the answer of at least one change pass, `null` otherwise.
+With no override rule installed no override is applied. The first change,
+bottom first, whose answer is neither `ready` nor let pass ends the
+attempt `blocked`, with `blocked` the `change`, its `status` and its
+`requirements`, before anything is replayed or moved: the target stays
+where it was and the change `open`.
+
+A commit of a change that does not apply on the target head ends the
+attempt `conflict`, the target where it was and the change `open`. Its
+`conflict` report gives `target_sha`, the head the attempt replayed onto,
+`head_sha` and `base_sha` of the version it landed, `commit_sha`, the
+first commit that did not apply, the conflicted `files`, and `change`:
+`null` for the land of one change, the number of the change whose commit
+did not apply in a stack land. `landed_changes` lists, in the order they
+landed, each change landed between `base_sha` and `target_sha` that
+changed a path of a conflicted file, as `{"number": …, "title": …,
+"landed_sha": …, "session_id": …}` (its `landed.sha` and its session), and
+each file's `landed_by` the numbers of those that changed it; both are
+`[]` when none did, when `base_sha` is `null` or not an ancestor of
+`target_sha`, and when the landed history cannot be read. In the
+transaction that ends the attempt the change gets `mergeable` `conflict`
+with the same report, as a mergeability check stores it, with
+`parley.change.conflict` when it was not in conflict already.
+
+An attempt that ends `conflict`, `blocked` or `failed` writes one
+`parley.change.land_fail` event in the transaction that ends it: resource
+`change` `{number}` of the change that stopped it (the one its conflict
+report or `blocked` names, else the top change), the requester as actor,
+the attempt's `session_id`, and metadata `land_id`, `status`, `reason`,
+`number` and `ref`, with `files`, the conflicted paths (the first 100,
+and `truncated` `true` when there were more), for a conflict. `reason` is
+`conflict` for a conflict, the gate's or the target guard's reason for a
+block or `policy` when it gave none, and the `error` of a failure
+(`contention`, `timeout`, `origin_rejected`, `internal`). A landed attempt
+writes none.
+
+A feature installed on the hub may guard the move of a target branch. Such
+a target guard is asked once, after the changes are replayed and before the
+first compare-and-swap, with the workspace, the target branch, its head
+before the land and the head the land would make it; a retry on a moved
+target asks it nothing again. A guard that refuses ends the attempt
+`blocked`, with `blocked` `{"change": <the top change>, "status":
+"blocked", "requirements": []}` and the guard's reason as the `reason` of
+`parley.change.land_fail`; a guard that reports a rejection by origin ends
+it `failed` with `error` `origin_rejected`; a guard that cannot decide ends
+it `failed` with `error` `internal`. In each case the target does not move
+and the change stays `open`. No target guard is installed yet, so every
+move is allowed.
+
+Once a land is recorded, a land that moved nothing included, the hub does
+its follow-up, each step on its own: a step that fails is logged and
+changes neither the attempt, nor the answer to the call, nor the steps
+after it. The answer to the call waits for the follow-up, which takes no
+worker of the pool: a follow-up that takes long delays no other land.
+
+- The source branch of each landed change is deleted, in the change's
+  source workspace, when the target workspace's setting
+  `land.delete_source` is `true` (its default), the branch is still at the
+  head of the version that landed and no other `draft` or `open` change
+  has it as its source. A branch that moved since keeps the work that did
+  not land and is left as it is, as is the default branch of the source
+  workspace. The branch is deleted directly with a compare-and-swap, not
+  as a push: no push rule applies and no `parley.git.push` is written; the
+  changes whose target is the deleted branch get a mergeability check.
+- Every other `draft` or `open` change whose target is the landed target
+  branch gets `mergeable` `unknown` and a mergeability check.
+- Each landed change's `draft` or `open` dependants are unlinked from it
+  and get a pending restack onto the commit the target held once it
+  landed (see [Stacks and restack](#stacks-and-restack)), and a task fork
+  that is the source of a landed change records an activity, from which
+  its early expiry counts.
+
+A land changes only the hub's own repositories and contacts neither origin
+nor a forge: publishing a landed branch is a push to origin of its own.
+
+Attempts run side by side, with no queue and no lock per workspace or
+branch: two attempts meet only in the compare-and-swap. At most
+`[land].workers` attempts (8 by default) are computed at once; a further
+attempt waits for a free worker, reads `running` meanwhile, and none
+fails because every worker is busy; waiting attempts start in no
+promised order. An attempt that is not final `[land].timeout` (5 minutes
+by default) after it was created, or after a start ran it again,
+waiting for a worker included, is stopped, every `git` process of its work killed, and ends `failed` with
+`error` `timeout`, its change still `open`; it never moves the target
+afterwards. An attempt whose target has already begun to move when its
+time runs out ends as that move ends: `landed` when the target moved,
+`failed` `timeout` when it did not. A stop of the hub stops the attempts it runs without
+ending them: they stay `running`, and the next start runs every attempt
+still `running` again, while it serves requests, until each is final.
+Such an attempt keeps its `id`, `created_at`, `trigger`, `session_id` and
+`requested_by`, who is the actor of its events, and lands the versions
+it was created with, by its strategy, with its override asked again. It
+runs from the preconditions: one that no longer holds, such as a change
+that is no longer `open`, ends it `failed` with
+`error` `internal`, the change left as it is, and a target branch that is
+gone ends it the same way; otherwise it ends `landed`, `conflict` or
+`blocked` as a new attempt would.
+
+The move and its record cannot share one transaction, so the hub enters
+the move in a journal first. A hub that stops at any point of a land
+comes up, before it serves a request, in one of two states: the target at
+its old head, the change `open`, no `parley.change.land` event and the
+attempt not `landed`; or the target at the new head, the change `landed`
+with every landed commit mapped, the attempt `landed` and the land's
+events written once, also when other writes moved the target on after
+the move. A land the start completes gets its follow-up (above)
+then; a land recorded before the stop does not get it again, so a stop
+during its follow-up leaves the rest of it undone. A journal entry the
+start cannot complete, such as one whose repository cannot be read, is
+kept for the next start, and its attempt stays `running` and is not run
+again until the entry is completed.
+
+The three reads need the scope `changes:read` and read access to
+`{slug}`. Both lists are [lists](#lists) ordered newest first: by
+`created_at` at the whole second it shows, then by `id`, both descending.
+A token bound to a task fork, calling on the fork's parent, reaches
+`GET …/changes/{number}/lands` for a change whose source is the fork and
+`GET …/lands/{id}` for an attempt one of whose changes comes from the
+fork; another change or attempt is answered `403` `token_bound` (the
+change routes answer such a change `404`), an unknown number or id keeps
+its `404`, and `GET …/lands` is always `403` `token_bound`.
+
+### `POST /api/v1/workspaces/{slug}/changes/{number}/land`
+
+Lands the change `{number}` of `{slug}` on its target branch, or, with
+`stack` `true`, the change and every change below it down its
+`depends_on` that is not `landed`, bottom first. It is a create route
+(see [Idempotency](#idempotency)). The body is absent or a JSON object;
+members not listed are ignored.
+
+| Member | Value |
+|---|---|
+| `expected_version` | an integer of at least 1, the version the change must be at |
+| `stack` | a boolean, `false` when absent |
+| `override` | an object whose `reason` is a string that is not blank, kept with the attempt and put to the override rule for a change the policy gate does not answer `ready`. With no override rule registered it is accepted and never applied, and the attempt shows `override` `null` |
+| `session_id` | a string, the session the land is asked in |
+
+The query parameter `wait`, a whole number of seconds from 0 to 60 (30
+when absent), is how long the call waits for the attempt's end.
+
+The checks, in this order, each refusal creating no attempt and moving
+nothing:
+
+1. the scope `changes:write` (`403` `insufficient_scope`, whether or not
+   `{slug}` exists) and read access to `{slug}` (`404` `not_found`, with
+   the same body as for a workspace that does not exist);
+2. the change: a `{number}` that is not a positive integer or names no
+   change of `{slug}` is `404` `change_not_found`;
+3. the body and `wait`: `400` `invalid_request`, such as
+   `expected_version: must be an integer of at least 1`, `stack: must be a
+   boolean`, `override: must be an object whose reason is a string that is
+   not blank`, `session_id: must be a string` or `wait must be a whole
+   number of seconds from 0 to 60`;
+4. a token bound to a task fork, calling on the fork's parent, lands only
+   changes whose source is the fork, a whole stack included: `403`
+   `token_bound` otherwise;
+5. who may land: the admin token, the owner of `{slug}`, and, while the
+   workspace setting `land.by_author` is `true` (its default), the
+   change's author with any credential of theirs, such as an org member
+   landing the change they opened from their fork; with `stack`, the
+   author of every change the land covers, so that a change below by
+   someone else makes it `403`. Anyone else who reads `{slug}` gets `403`
+   `forbidden`;
+6. the state of `{slug}`: `409` `workspace_archived`, `workspace_busy` or
+   `workspace_not_ready`;
+7. `session_id` must pass the session-linking rule: `400`
+   `unknown_session` otherwise. Until the session feature is installed,
+   every `session_id` is refused;
+8. the request guards a feature installed on the hub registers, each asked
+   with the caller, `{slug}`, the changes the land would cover (bottom
+   first, each at its current version) and the `override`: the first that
+   refuses gives the answer as it gives it, its status, `error_type` and
+   members such as `path` (for example `403` `path_not_allowed`), and the
+   guards after it are not asked. No request guard is installed yet;
+9. the preconditions, read in the transaction that creates the attempt,
+   the first that fails being the answer:
+   1. every change the land covers is `open`: `409` `change_not_open` for
+      a `draft`, `landed` or `abandoned` change;
+   2. `expected_version`, when given, is the change's current version:
+      `409` `version_mismatch`;
+   3. no `running` attempt covers a change the land covers: `409`
+      `land_in_progress`, with that attempt in `error.details`. Of several
+      lands of one change that arrive at the same moment, exactly one
+      creates an attempt and the others get this answer;
+   4. without `stack`, every change down the change's `depends_on` is
+      `landed`: `409` `depends_on_unlanded`;
+   5. the changes the land covers, each at its version, are those the
+      checks 4, 5 and 8 judged: a change that got a new version, or a
+      stack whose changes changed, since then is `409` `version_mismatch`.
+
+   Only `land_in_progress` carries `details`.
+
+In that transaction the hub creates the land attempt, `running`, with the
+link of its session: `trigger` `manual`, `strategy` the workspace's
+`land.strategy` at that moment, `attempts` `0`, `requested_by` the
+caller, and each change at its current version. The attempt runs on the
+hub's pool; nothing is locked while it runs, so the lands of different
+changes, also on one target branch, run side by side and meet only in the
+compare-and-swap. The call waits up to `wait` seconds for the attempt's
+end and answers it in the form of its status once it is final: `200`
+with the land attempt when it is `landed`, `409` `land_conflict` when
+`conflict`, `409` `policy_blocked` when `blocked` and `503` `land_failed`
+when `failed`, each error with the land attempt in `error.details`; or
+`202` with the attempt still `running` when the wait runs out, `wait=0`
+answering at once. The attempt goes on whatever becomes of the call: a
+caller that goes away stops nothing, and `GET …/lands/{id}` gives its
+final form later.
+
+### `GET /api/v1/workspaces/{slug}/changes/{number}/lands`
+
+Lists the attempts that cover the change `{number}` of `{slug}`, those of
+a stack it is part of included; `items` is `[]` for a change with none.
+A `{number}` that is not a positive integer, or that `{slug}` has no change
+of, is `404` `change_not_found`.
+
+### `GET /api/v1/workspaces/{slug}/lands`
+
+Lists the attempts whose target is `{slug}`, narrowed by every filter the
+query gives:
+
+| Parameter | Keeps |
+|---|---|
+| `status` | the attempts in that status; repeatable, any of the values given |
+| `target_branch` | the attempts on that branch |
+| `since` | the attempts created at or after that RFC 3339 timestamp |
+
+A task fork holds no changes, so its attempts are never listed on its
+parent. `400` `invalid_request` answers a `status` that is not one of the
+five (`status must be one of running, landed, conflict, blocked, failed`),
+a `since` that does not parse (`since must be an RFC 3339 timestamp`), a
+`limit` outside 1 to 200 and a cursor that is malformed or that a query
+with other filters issued.
+
+### `GET /api/v1/workspaces/{slug}/lands/{id}`
+
+Answers `200` with the land attempt `{id}` of `{slug}`. An `{id}` that is
+not a UUID, that names no attempt, or that names an attempt of another
+workspace is `404` `land_not_found`, with the message `<slug> has no land
+attempt "<id>"`.
 
 ## Admin routes
 

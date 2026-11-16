@@ -75,10 +75,9 @@ func (c *Component) ScheduleMergeable(ctx context.Context, tx *sql.Tx, workspace
 // change of the workspace whose target is branch, which moved, was created
 // or was deleted; a branch that is the target of none schedules nothing.
 func (c *Component) ScheduleTargetMergeable(ctx context.Context, tx *sql.Tx, workspace, branch string) error {
-	numbers, err := queryList[int64](ctx, tx, `SELECT number FROM changes
-WHERE workspace_slug = ? AND target_branch = ? AND state IN ('draft', 'open') ORDER BY number`, workspace, branch)
+	numbers, err := c.ChangesInto(ctx, tx, workspace, branch)
 	if err != nil {
-		return fmt.Errorf("find the changes into %s:%s: %w", workspace, branch, err)
+		return err
 	}
 	for _, n := range numbers {
 		if err := c.ScheduleMergeable(ctx, tx, workspace, n); err != nil {

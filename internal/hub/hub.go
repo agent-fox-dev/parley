@@ -34,6 +34,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/scm"
@@ -72,6 +73,7 @@ var parts = []func(*Composition){
 	composeGitServer,
 	composeSCM,
 	composeChanges,
+	composeLand,
 	composeSandbox,
 }
 
@@ -216,6 +218,12 @@ type Composition struct {
 	// dependencies (AdjustChange).
 	changes         *change.Component
 	changeAdjusters []func(*change.Deps)
+
+	// land is the land component composeLand creates and binds in its
+	// start hook (Land), after landAdjusters have changed its
+	// dependencies (AdjustLand).
+	land          *land.Component
+	landAdjusters []func(*land.Deps)
 
 	// refWriter is the ref writer every surface that writes refs writes
 	// through (RefWriter). It exists from the composition on, so that a
