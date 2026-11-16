@@ -5382,6 +5382,18 @@ deadline counted from its start, and decides each answer with
 (`newDurationValue`), the tests' `pollInterval` and `waitEnded`, which
 turns a passed deadline into `wait_timeout`.
 
+`parley change land` and `parley change lands`, and the group `parley
+land` (`list`, `show`) that `newLandCommand` builds and `root.go` adds to
+the root, live in `land.go`. `change land` declares `Wait`, so the shared
+wait of `wait.go` runs it: its `Start` sends the body `landBody` builds
+from the flags given, its `Poll` reads the attempt's `id` and asks for
+`GET /workspaces/<slug>/lands/<id>`, and `byState` classifies `status`
+(`landed` a success; `conflict`, `blocked` and `failed` failures). It
+declares `Timeout` 70 seconds (`landRequestTimeout`), above the 60 seconds
+the hub may hold a land, and `withNumbers` and `checkFlags` refuse a
+`--expected-version` that is not a positive integer and a blank
+`--override`. The reads are `scmRead`s.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with
