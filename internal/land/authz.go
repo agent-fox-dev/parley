@@ -21,27 +21,36 @@ import (
 // reads the workspace since the route's shared checks passed, is answered
 // 403 forbidden.
 func (c *Component) authorize(ctx context.Context, caller change.Caller, chain []change.Change, ws Workspace) error {
-	if caller.Credential.Type == change.CredentialAdminToken {
-		return nil
+	may, err := mayLand(ctx, c.deps.Access, caller, chain, ws)
+	if err != nil || may {
+		return err
 	}
 	ch := chain[len(chain)-1]
-	if caller.UserID != "" {
-		writes, err := c.deps.Access.CanWrite(ctx, caller.UserID, ws.Slug)
-		if err != nil || writes {
-			return err
-		}
-		if ws.ByAuthor && !slices.ContainsFunc(chain, func(cov change.Change) bool {
-			return cov.Author.ActorID == nil || *cov.Author.ActorID != caller.UserID
-		}) {
-			return nil
-		}
-	}
 	if len(chain) > 1 {
 		return server.Forbidden(fmt.Sprintf("the stack of %s may be landed only by a writer of %s, the admin token or, "+
 			"while land.by_author is on, the author of each of its changes", ch.Ref, ws.Slug))
 	}
 	return server.Forbidden(fmt.Sprintf("%s may be landed only by a writer of %s, the admin token or, while land.by_author is on, its author",
 		ch.Ref, ws.Slug))
+}
+
+// mayLand reports whether caller may land chain on the workspace ws by the
+// rule authorize gives, asking rule who writes the workspace. The
+// automatic lander asks it about the setter of a flag.
+func mayLand(ctx context.Context, rule AccessRule, caller change.Caller, chain []change.Change, ws Workspace) (bool, error) {
+	if caller.Credential.Type == change.CredentialAdminToken {
+		return true, nil
+	}
+	if caller.UserID == "" {
+		return false, nil
+	}
+	writes, err := rule.CanWrite(ctx, caller.UserID, ws.Slug)
+	if err != nil || writes {
+		return writes, err
+	}
+	return ws.ByAuthor && !slices.ContainsFunc(chain, func(cov change.Change) bool {
+		return cov.Author.ActorID == nil || *cov.Author.ActorID != caller.UserID
+	}), nil
 }
 
 // confinedTo is the fork a request's token is bound to when it calls on

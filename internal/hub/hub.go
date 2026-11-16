@@ -259,6 +259,12 @@ type Composition struct {
 	// component exists, still hands it on.
 	versionFiles pushrule.VersionFiles
 
+	// autoLander is the automatic lander composeLandRules creates and
+	// binds in its start hook (AutoLander), after autoLandAdjusters have
+	// changed its dependencies (AdjustAutoLand).
+	autoLander        *land.AutoLander
+	autoLandAdjusters []func(*land.AutoLandDeps)
+
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).
 	serverHooks []func(*server.Server)

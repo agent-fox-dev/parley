@@ -456,3 +456,58 @@ func TestLand_AnswersATokenWithinItsPathsAsTheSameUserWithoutPaths(t *testing.T)
 		})
 	}
 }
+
+func TestAutoLand_HoldsTheFlagATokenSetsToItsPaths(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	docs := w.docsPAT(t, []string{"docs/**"})
+	for i, c := range []struct {
+		name string
+		// files are what the change, opened by the owner's key, sets; on
+		// is its auto_land before the edit.
+		files map[string]string
+		on    bool
+		body  map[string]any
+		// refused is the path of a refusal, "" for an accepted edit.
+		refused string
+	}{
+		{name: "the flag on over a file outside the globs", files: map[string]string{"src/main.go": "package main\n"},
+			body: map[string]any{"auto_land": true, "title": "x"}, refused: "src/main.go"},
+		{name: "the flag off over a file outside the globs", files: map[string]string{"src/main.go": "package main\n"}, on: true,
+			body: map[string]any{"auto_land": false}},
+		{name: "the flag on over files within the globs", files: map[string]string{"docs/a.md": "a\n"},
+			body: map[string]any{"auto_land": true}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := "flag" + strconv.Itoa(i)
+			commit(t, w.api, branch, w.base, branch, c.files)
+			ch := w.opened(t, change.OpenInput{Workspace: "api", SourceBranch: branch, Intent: new("why"), Kind: change.KindRef,
+				AutoLand: new(c.on), Caller: w.caller()})
+
+			status, answer := w.patchChange(t, docs, ch.Number, c.body)
+
+			after := w.readChange(t, ch.Number)
+			if c.refused != "" {
+				errObj, _ := answer["error"].(map[string]any)
+				if status != http.StatusForbidden || errorType(answer) != "path_not_allowed" || errObj["path"] != c.refused {
+					t.Fatalf("PATCH %v = %d %v, want 403 path_not_allowed with error.path %s", c.body, status, answer, c.refused)
+				}
+				if after.AutoLand != c.on || after.Title != ch.Title {
+					t.Errorf("the refused edit left auto_land %t and title %q, want %t and %q", after.AutoLand, after.Title, c.on, ch.Title)
+				}
+				return
+			}
+			want := c.body["auto_land"].(bool)
+			if status != http.StatusOK || answer["auto_land"] != want || after.AutoLand != want {
+				t.Fatalf("PATCH %v = %d %v, want 200 with auto_land %t", c.body, status, answer, want)
+			}
+			s, found, err := w.changes.AutoLandSetter(context.Background(), nil, "api", ch.Number)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want && (!found || s.CredentialType != change.CredentialPAT || !slices.Equal(s.Paths, []string{"docs/**"})) {
+				t.Errorf("the flag's setter is %+v (found %t), want the PAT with its globs docs/**", s, found)
+			}
+		})
+	}
+}

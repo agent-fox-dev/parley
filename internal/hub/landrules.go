@@ -1,6 +1,26 @@
 package hub
 
-import "github.com/agent-fox-dev/parley/internal/land"
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/land"
+	"github.com/agent-fox-dev/parley/internal/store"
+)
+
+// autoLandHook is the name of the start hook that binds the automatic
+// lander and runs its start-up, after the land component's landRecoverHook;
+// autoLandWork the name of the background work that runs it, and
+// autoLandGrace how long the stop waits for it, which lets a start it is
+// making commit.
+const (
+	autoLandHook  = "auto-land"
+	autoLandWork  = "auto_land"
+	autoLandGrace = 5 * time.Second
+)
 
 // composeLandRules adds the rules that surround landing once the change
 // component, the land component and the policy's evaluation exist, each
@@ -43,6 +63,27 @@ import "github.com/agent-fox-dev/parley/internal/land"
 // pending change pass, one held back by approvals or checks, and never a
 // blocked one; the land records the override only when it let a change
 // pass. The policy's gate knows nothing of overrides.
+//
+// It adds the automatic lander, with the schema of its rows, as the change
+// component's auto_land guard: a path-scoped credential may turn a
+// change's auto_land on only when every file of its current version is
+// within its paths, refused 403 path_not_allowed with nothing of the
+// request applied otherwise; turning the flag on for a change whose flag
+// was off makes a start of its land due, in the request's transaction, so
+// that a change landable already is landed too; turning it off is never
+// refused. The lander is bound in a start hook that runs after the land
+// component recovered its running attempts, to the store, the land
+// component, the change component, the event log, the user records, the
+// access rule, the workspace records with their effective land settings,
+// the repositories and the hub's clock, and it then runs the start
+// procedure for every open change whose flag is on. As background work,
+// off the request path and stopped with the hub, it follows the
+// parley.change.ready announcements in the event log from its stored
+// position and starts the lands that are due, every second: a land of the
+// change alone, trigger auto_land, as the user who set the flag, if they
+// may land it and its files are within the paths their credential had;
+// otherwise the flag is cleared and a parley.change.land_fail by system
+// tells why. Tests change its dependencies with AdjustAutoLand.
 func composeLandRules(c *Composition) {
 	c.versionFiles = c.Land().VersionFiles()
 	paths := c.Land().PathGuard()
@@ -50,4 +91,51 @@ func composeLandRules(c *Composition) {
 	c.Land().AddRequestGuard(paths)
 	c.Land().AddRequestGuard(c.Land().OverrideGuard())
 	c.Land().RegisterOverrideRule(land.PendingOverride{})
+	lander := &land.AutoLander{}
+	c.autoLander = lander
+	c.AddSchemaStep(land.AutoLandStep)
+	c.Changes().RegisterAutoLandGuard(lander)
+	c.AddStartHook(autoLandHook, func(ctx context.Context, rt *Runtime) error {
+		git := gitFor(c.env)
+		d := land.AutoLandDeps{
+			Store: rt.Store, Lands: c.Land(), Changes: c.Changes(), Events: c.Events(), Users: landUsers{rt.Store},
+			Access: c.access, Workspaces: landWorkspaces{c.workspaces.Settings()},
+			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
+				return git.Open(ctx, c.workspaces.RepoPath(slug))
+			},
+			Now: rt.Now, Logger: rt.Logger,
+		}
+		for _, adjust := range c.autoLandAdjusters {
+			adjust(&d)
+		}
+		lander.Bind(d)
+		return lander.Recover(ctx)
+	})
+	c.AddBackgroundWork(autoLandWork, autoLandGrace, func(ctx context.Context, _ *Runtime) { lander.Run(ctx) })
+}
+
+// landUsers reads the user records for the automatic lander: a user who
+// was deleted or is blocked may not act.
+type landUsers struct{ store *store.Store }
+
+func (u landUsers) User(ctx context.Context, id string) (string, bool, error) {
+	user, err := identity.UserByID(ctx, u.store.Main(), id)
+	switch {
+	case errors.Is(err, identity.ErrNotFound):
+		return "", false, nil
+	case err != nil:
+		return "", false, err
+	}
+	return user.Username, user.Status != identity.StatusBlocked, nil
+}
+
+// AutoLander returns the hub's automatic lander, which runs once its start
+// hook has run.
+func (c *Composition) AutoLander() *land.AutoLander { return c.autoLander }
+
+// AdjustAutoLand adds fn to the functions that change the automatic
+// lander's dependencies after the start hook has built them and before it
+// binds them, in the order they were added.
+func (c *Composition) AdjustAutoLand(fn func(*land.AutoLandDeps)) {
+	c.autoLandAdjusters = append(c.autoLandAdjusters, fn)
 }

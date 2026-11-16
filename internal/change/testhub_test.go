@@ -29,6 +29,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -82,6 +83,9 @@ func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 		w.workspaces, w.events, w.changes, w.forks = c.Workspaces(), c.Events(), c.Changes(), c.Forks()
 		w.changes.RegisterSessionLinker(w.sessions)
 		w.changes.RegisterLandingEvaluator(nil)
+		// The automatic lander follows the event log once an hour, so that
+		// a change with auto_land stays as the test leaves it.
+		c.AdjustAutoLand(func(d *land.AutoLandDeps) { d.Interval = time.Hour })
 		if compose != nil {
 			compose(c)
 		}
