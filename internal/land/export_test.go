@@ -3,7 +3,9 @@ package land
 import (
 	"context"
 	"database/sql"
+	"sync/atomic"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -79,3 +81,14 @@ func Submit(c *Component, a Attempt) { c.submit(a, a.CreatedAt) }
 
 // Ended is closed once the pool of c is done with the attempt id.
 func Ended(c *Component, id string) <-chan struct{} { return c.ended(id) }
+
+// CountReplays makes the conflict reads of c count the trial replays they
+// run, and returns what reads the count.
+func CountReplays(c *Component) func() int64 {
+	var n atomic.Int64
+	c.setTrial(func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
+		n.Add(1)
+		return change.TrialRebase(ctx, repo, base, head, onto)
+	})
+	return n.Load
+}

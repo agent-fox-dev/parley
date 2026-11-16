@@ -188,6 +188,9 @@ type Component struct {
 
 	pool  pool
 	seams seams
+	// trialSeam is the trial rebase of the conflict reads, set by a test;
+	// nil is the mergeability check's.
+	trialSeam trialFunc
 }
 
 // seams are where a test steers the engine; their zero value does

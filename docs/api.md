@@ -4141,6 +4141,42 @@ result nor the event is stored: `mergeable` stays `unknown`, the failure
 is logged as `the mergeability check failed`, and the change's next
 trigger computes it again.
 
+### `GET /api/v1/workspaces/{slug}/changes/{number}/conflict`
+
+Answers `200` with the change's conflict as it is now,
+`{"mergeable": …, "conflict": …}`: `mergeable` is `clean` or `conflict`,
+never `unknown`, and `conflict` is the conflict report described above, or
+`null` when `clean`. It needs, for a personal access token,
+`changes:read`, and read access to `{slug}`, and refuses as the routes of
+[Reading a change](#reading-a-change) do: `403` `insufficient_scope`, `404`
+`not_found`, and `404` `change_not_found` for a change the request cannot
+name. A token bound to a task fork reaches it on the fork's parent for the
+changes whose `source.workspace_slug` is that fork; any other change answers
+`404` `change_not_found`, as if it did not exist (unlike the land routes'
+`403` `token_bound`).
+
+- A `landed` or `abandoned` change answers what it holds, without a
+  replay: `conflict` with the stored report, otherwise `clean`.
+- A `draft` or `open` change whose `mergeable` is `conflict` with a report
+  whose `target_sha` is the present onto-commit and whose `head_sha` is the
+  change's `head_sha` answers that report, without a replay.
+- Any other `draft` or `open` change is trial-rebased now, as the
+  mergeability check does it: onto the head of the `draft` or `open` change
+  named by `depends_on`, otherwise onto the head of the target branch, and
+  only its own commits for a change in a stack. A conflict names the landed
+  changes it collided with.
+
+The read stores nothing on the change and writes no event: a result it
+computes is not the change's `mergeable`, which only the check stores.
+While the target branch of a `draft` or `open` change does not exist the
+answer is `409` `conflict` (`<ref> has no conflict report: its target branch
+<branch> does not exist`); a merge commit among the commits to replay is
+`400` `merge_commits_unsupported`.
+
+```json
+{"mergeable":"conflict","conflict":{"target_sha":"…","head_sha":"…","base_sha":"…","commit_sha":"…","files":[{"path":"a.txt","kind":"content","base":{"sha":"…","mode":"100644","path":"a.txt"},"ours":{"sha":"…","mode":"100644","path":"a.txt"},"theirs":{"sha":"…","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}
+```
+
 ## Stacks and restack
 
 A new version of a change records, in the same store transaction, a

@@ -846,3 +846,50 @@ func waitGone(t *testing.T, pidFile string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// lines is the a.txt of base with s as its second line.
+func lines(s string) string { return "l1\n" + s + "\nl3\n" }
+
+// openSetting opens, through the change component, a change of api by the
+// owner from a new branch of base that sets the files, and returns it.
+func (w *world) openSetting(t *testing.T, branch string, files map[string]string) change.Change {
+	t.Helper()
+	commit(t, w.api, branch, w.base, branch, files)
+	return w.openBranch(t, branch, w.caller())
+}
+
+// conflictingAbove opens a stack of two changes of api, lower and upper,
+// where upper, made on lower's first version, sets the second line of
+// a.txt, and then lower records a version that sets it otherwise, whose
+// check it waits for: upper conflicts with lower's head and not with main.
+func (w *world) conflictingAbove(t *testing.T) (lower, upper change.Change) {
+	t.Helper()
+	stack := w.stack(t, "s", false, nil, map[string]string{"a.txt": lines("upper")})
+	lower, upper = stack[0], stack[1]
+	next := commit(t, w.api, lower.Source.Branch, lower.HeadSHA, "next", map[string]string{"a.txt": lines("lower")})
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := w.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: "api", Branch: lower.Source.Branch, Head: next, Kind: change.KindRef})
+		return err
+	})
+	w.mergeable(t, lower.Number, change.MergeableClean)
+	return lower, upper
+}
+
+// setMergeable stores value and report as the mergeable of the change
+// number of api, as a check would have stored them.
+func (w *world) setMergeable(t *testing.T, number int64, value string, report json.RawMessage) {
+	t.Helper()
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetMergeable(ctx, tx, "api", number, value, report)
+	})
+}
+
+// eventCount counts the hub's events.
+func (w *world) eventCount(t *testing.T) int {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), 0, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(recs)
+}

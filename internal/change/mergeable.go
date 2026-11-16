@@ -294,21 +294,45 @@ func (c *Component) mergePair(ctx context.Context, q Querier, workspace string, 
 	if pending, err := hasPendingRestack(ctx, q, workspace, number); err != nil || pending {
 		return ch, "", false, err
 	}
+	onto, err = c.ontoOf(ctx, q, ch)
+	return ch, onto, err == nil, err
+}
+
+// ontoOf is the commit a replay of the change ch, read through q, builds
+// on: the head of the change it depends on while that one is draft or
+// open, otherwise the head of its target branch, "" when that branch does
+// not exist.
+func (c *Component) ontoOf(ctx context.Context, q Querier, ch Change) (string, error) {
 	if ch.DependsOn != nil {
-		lower, err := readChange(ctx, q, workspace, *ch.DependsOn)
+		lower, err := readChange(ctx, q, ch.WorkspaceSlug, *ch.DependsOn)
 		switch {
 		case err == nil && (lower.State == StateDraft || lower.State == StateOpen):
-			return ch, lower.HeadSHA, true, nil
+			return lower.HeadSHA, nil
 		case err != nil && !errors.Is(err, ErrChangeNotFound):
-			return ch, "", false, err
+			return "", err
 		}
 	}
-	repo, err := c.deps.Repos(ctx, workspace)
+	repo, err := c.deps.Repos(ctx, ch.WorkspaceSlug)
 	if err != nil {
-		return ch, "", false, err
+		return "", err
 	}
-	onto, _, err = repo.ResolveBranch(ctx, ch.TargetBranch)
-	return ch, onto, err == nil, err
+	onto, _, err := repo.ResolveBranch(ctx, ch.TargetBranch)
+	return onto, err
+}
+
+// ReplayPair is what a mergeability check of the change ch, read through
+// q, replays its head with (TrialRebase): onto, the commit it builds on,
+// "" when its target branch does not exist (ontoOf), and base, the commit
+// after which its own commits begin when it is in a stack, "" for
+// onto..head (ownBase). A report the check stored is of this pair, so a
+// read of the change's conflict that replays it computes what the check
+// would.
+func (c *Component) ReplayPair(ctx context.Context, q Querier, ch Change) (onto, base string, err error) {
+	if onto, err = c.ontoOf(ctx, q, ch); err != nil || onto == "" {
+		return "", "", err
+	}
+	base, err = ownBase(ctx, q, ch)
+	return onto, base, err
 }
 
 // ownBase is, for the change ch read through q, the commit after which its
@@ -458,7 +482,10 @@ func (wallClock) After(d time.Duration) <-chan time.Time { return time.After(d) 
 // otherwise.
 type trialFunc func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error)
 
-func trialRebase(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
+// TrialRebase is the trial rebase of a mergeability check, a trialFunc:
+// TrialRebaseFrom of the commits after base for a base, TrialRebase of
+// onto..head for none.
+func TrialRebase(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
 	if base == "" {
 		return repo.TrialRebase(ctx, onto, head)
 	}
@@ -585,7 +612,7 @@ func (w *mergeWorker) seams() (trialFunc, time.Duration, func(context.Context, s
 	defer w.mu.Unlock()
 	trial, deadline := w.trial, w.deadline
 	if trial == nil {
-		trial = trialRebase
+		trial = TrialRebase
 	}
 	if deadline <= 0 {
 		deadline = mergeableDeadline
