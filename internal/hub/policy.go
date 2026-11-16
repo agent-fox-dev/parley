@@ -16,21 +16,24 @@ import (
 const policyHook = "policy"
 
 // composePolicy adds the landing policy: the schema of the policy
-// revisions, the policy routes, whose scope, binding and access the shared
-// checks decide, and the component, bound in a start hook to the store,
-// to the workspace records, to the users of the identity records, to the
-// event component, to the change component, to the workspaces'
-// repositories, to the hub's clock and to its logger. Its evidence source
-// is the one that reads none until a part registers another
-// (RegisterEvidence).
+// revisions and of the verdicts and check results it counts, the policy
+// routes and the routes of the verdicts and check results, whose scope,
+// binding and access the shared checks decide, and the component, bound in
+// a start hook to the store, to the workspace records, to the users of the
+// identity records, to the event component, to the change component, to
+// the workspaces' repositories, to the hub's clock and to its logger. Its
+// evidence source is its own facts, the verdicts and check results it
+// records, registered in place of the one that reads none; tests register
+// their own on the instance after it.
 //
 // It comes before the change component's part, so that the component is
 // bound before the change component's own start hooks record versions,
 // which ask the landing evaluator composePolicyEvaluation registers once
 // the change and land components exist.
 //
-// The teardown of a workspace deletes its policy revisions in the delete's
-// transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
+// The teardown of a workspace deletes its policy revisions, verdicts and
+// check results in the delete's transaction
+// (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
 //
 // The component exists from the composition on (Policy); tests change its
 // dependencies with AdjustPolicy.
@@ -38,6 +41,8 @@ func composePolicy(c *Composition) {
 	comp := &policy.Component{}
 	c.policy = comp
 	c.AddSchemaStep(policy.SchemaStep)
+	c.AddSchemaStep(policy.ReviewStep)
+	comp.RegisterEvidence(comp.Facts())
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
@@ -66,8 +71,18 @@ func composePolicy(c *Composition) {
 // every new version, retarget, move between draft and open and restore,
 // and as the land component's policy gate. Tests register their own on
 // the instances after it.
+//
+// It also adds, after the mergeability observer, the version observer that
+// carries a version's verdicts to a new version patch-equivalent to it; the
+// change component tells it after the version's landing is stored, and it
+// evaluates the landing again when it carried any. And it registers the
+// expanders of the change read's include names approvals and checks: the
+// verdicts on the current version and the results that apply to it.
 func composePolicyEvaluation(c *Composition) {
 	c.changes.RegisterLandingEvaluator(c.policy)
+	c.changes.AddVersionObserver(c.policy.VersionObserver())
+	c.changes.RegisterExpander("approvals", c.policy.ExpandApprovals)
+	c.changes.RegisterExpander("checks", c.policy.ExpandChecks)
 	c.land.RegisterGate(policyGate{c.policy})
 }
 

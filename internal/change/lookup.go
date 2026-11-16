@@ -245,3 +245,11 @@ WHERE state IN ('draft', 'open') GROUP BY workspace_slug`)
 	}
 	return out, rows.Err()
 }
+
+// ReadVersions reads the versions of the change number of the workspace
+// through q (the caller's transaction, or nil for the store), oldest first,
+// each as stored, with the credential that created it (none for a version
+// the hub created); none for a change that does not exist.
+func (c *Component) ReadVersions(ctx context.Context, q Querier, workspace string, number int64) ([]Version, error) {
+	return readVersions(ctx, c.querier(q), workspace, number)
+}

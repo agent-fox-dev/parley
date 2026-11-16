@@ -410,3 +410,209 @@ func asJSON(t *testing.T, v any) any {
 	}
 	return out
 }
+
+// pushed is a change of api opened by dana with her PAT patPush, which
+// holds git:write, changes:read, changes:write and changes:approve, so that
+// version 1 is created by that credential; patPushID is the PAT's id.
+type pushed struct {
+	number             int64
+	patPush, patPushID string
+}
+
+// openPushed opens a change of api from a new branch of base that adds the
+// file <branch>.txt, by dana with a new PAT patPush, with adjust run on the
+// input.
+func (w *world) openPushed(t *testing.T, branch string, adjust ...func(*change.OpenInput)) pushed {
+	t.Helper()
+	return w.openPushedFiles(t, branch, map[string]string{branch + ".txt": branch + "\n"}, adjust...)
+}
+
+// openPushedFiles is openPushed with a branch of base that sets files.
+func (w *world) openPushedFiles(t *testing.T, branch string, files map[string]string, adjust ...func(*change.OpenInput)) pushed {
+	t.Helper()
+	var p pushed
+	p.patPush, p.patPushID = w.IssuePATID(t, identity.PATSpec{UserID: w.dana,
+		Permissions: []string{"git:write", "changes:read", "changes:write", "changes:approve"}})
+	commit(t, w.api, branch, w.base, files)
+	byPAT := func(in *change.OpenInput) {
+		in.Caller = change.Caller{UserID: w.dana, Username: "dana", Credential: change.Credential{Type: change.CredentialPAT, ID: p.patPushID}}
+	}
+	p.number = w.open(t, "api", branch, append([]func(*change.OpenInput){byPAT}, adjust...)...).Number
+	return p
+}
+
+// approvalsPath is the path of the verdicts of the change number of api.
+func approvalsPath(number int64) string {
+	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/approvals"
+}
+
+// postVerdict sends body as a verdict on the change number of api with
+// credential.
+func (w *world) postVerdict(t *testing.T, number int64, credential string, body any) answer {
+	t.Helper()
+	return w.send(t, http.MethodPost, approvalsPath(number), credential, body, nil)
+}
+
+// count is the number of rows of the store table table.
+func (w *world) count(t *testing.T, table string) int {
+	t.Helper()
+	var n int
+	if err := w.Store.Main().QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// verdictIDs are the ids of the verdicts stored of the user on version
+// version of the change number of api.
+func (w *world) verdictIDs(t *testing.T, number, version int64, user string) []string {
+	t.Helper()
+	rows, err := w.Store.Main().Query(`SELECT id FROM change_approvals
+WHERE workspace_slug = 'api' AND number = ? AND version = ? AND user_id = ? ORDER BY id`, number, version, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// withdraw sends DELETE of the verdict id of the change number of api with
+// credential. A withdrawal answers 204 with no body, so the body is decoded
+// only when there is one.
+func (w *world) withdraw(t *testing.T, number int64, id, credential string) answer {
+	t.Helper()
+	status, h, raw := w.Exchange(t, http.MethodDelete, approvalsPath(number)+"/"+id, credential, nil, nil)
+	a := answer{status: status, header: h, body: raw}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &a.json); err != nil {
+			t.Errorf("DELETE %s = %d %s: not a JSON object: %v", id, status, raw, err)
+		}
+	}
+	return a
+}
+
+// listedIDs are the ids of the verdicts of the change number of api that
+// the list answers credential, newest first.
+func (w *world) listedIDs(t *testing.T, number int64, credential string) []string {
+	t.Helper()
+	r := w.get(t, approvalsPath(number), credential)
+	if r.status != http.StatusOK {
+		t.Fatalf("list the verdicts of %d = %d %s, want 200", number, r.status, r.body)
+	}
+	var ids []string
+	for _, item := range r.json["items"].([]any) {
+		ids = append(ids, item.(map[string]any)["id"].(string))
+	}
+	return ids
+}
+
+// stepClock is a hub clock that stands still until the test moves it on.
+type stepClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *stepClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+// tick moves the clock on by one second.
+func (c *stepClock) tick() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(time.Second)
+}
+
+// record records head of branch as the next version, of kind kind, of the
+// change of api whose source the branch is, by caller (the hub for the
+// zero Caller), and fails the test unless a version is recorded.
+func (w *world) record(t *testing.T, branch, head, kind string, caller change.Caller) {
+	t.Helper()
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		v, err := w.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: "api", Branch: branch, Head: head,
+			Kind: kind, Caller: caller})
+		if err == nil && v == nil {
+			err = errors.New("no version recorded of " + branch)
+		}
+		return err
+	})
+}
+
+// rebased moves api's main on by a commit that touches none of a
+// change's files, writes branch again on top of it with files, the edits
+// it had, so that its new head is patch-equivalent to the old one, and
+// returns that head.
+func (w *world) rebased(t *testing.T, branch string, files map[string]string) string {
+	t.Helper()
+	previous := gitrepotest.Refs(t, w.api, "refs/heads/")["main"]
+	main := commit(t, w.api, "main", previous, map[string]string{"main.txt": previous + "\n"})
+	return commit(t, w.api, branch, main, files)
+}
+
+// counted is the approvals counted toward the one requirement of the
+// landing GET answers for the change number of api.
+func (w *world) counted(t *testing.T, number int64) any {
+	t.Helper()
+	approvals, _ := only(w.landing(t, number))["approvals"].(map[string]any)
+	return approvals["counted"]
+}
+
+// checkPath is the path of the check name of the change number of api.
+func checkPath(number int64, name string) string {
+	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/checks/" + name
+}
+
+// checksPath is the path of the check results of the change number of
+// api.
+func checksPath(number int64) string {
+	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/checks"
+}
+
+// putCheck sends body as the result of the check name of the change
+// number of api with credential.
+func (w *world) putCheck(t *testing.T, number int64, name, credential string, body any) answer {
+	t.Helper()
+	return w.send(t, http.MethodPut, checkPath(number, name), credential, body, nil)
+}
+
+// storedResult is the row of the check name on version version of the
+// change number of api, its columns by name, with updated_at in seconds;
+// nil when there is none.
+func (w *world) storedResult(t *testing.T, number, version int64, name string) map[string]any {
+	t.Helper()
+	var (
+		status, summary, actorType      string
+		url, details, actorID, username sql.NullString
+		updated                         int64
+	)
+	err := w.Store.Main().QueryRow(`SELECT status, summary, url, details, actor_type, actor_id, username, updated_at
+FROM change_checks WHERE workspace_slug = 'api' AND number = ? AND version = ? AND name = ?`, number, version, name).
+		Scan(&status, &summary, &url, &details, &actorType, &actorID, &username, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	orNil := func(s sql.NullString) any {
+		if !s.Valid {
+			return nil
+		}
+		return s.String
+	}
+	return map[string]any{"status": status, "summary": summary, "url": orNil(url), "details": orNil(details),
+		"actor_type": actorType, "actor_id": orNil(actorID), "username": orNil(username), "updated_at": updated / 1e9}
+}

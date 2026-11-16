@@ -27,7 +27,7 @@ command-line client. Both are written in Go, in the module
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, `CallWith` does so with added request headers and `Exchange` also returns the answer's headers, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the run again at a start of the attempts a stop left running (`recover.go`, `Recover`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, the read routes of the attempts per change, per workspace and by id, and the reads of a change's current conflict report and of a `content` file of it as text with conflict markers (`current_conflict.go`, `conflict_handlers.go`) (see [Landing](#landing)) |
-| `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause; both select the rules of one evaluation through one selector, which decides the rules' `targets` once and compiles their globs once, and stop with the context's error when it ends, looked at before each file; `MatchPath` matches one element of a glob against 64 positions of the path at a time and stops when no position is left, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, the event writer, `EventWriter`, the change records, `Changes`, which the change component is, and the repository opener, `Repos`), which serves `GET` and `PUT /workspaces/:slug/policy` and `POST /workspaces/:slug/policy/evaluate`, the dry evaluation of paths or a change that writes nothing (`Routes`), deletes a deleted workspace's revisions (`WorkspaceDeleted`), reads the files of a change (`Files`, its `ChangeFiles`: those between the change's `base_sha` and `head_sha` in its target workspace's repository, both paths of a rename or copy, no cap), is the change component's landing evaluator (`EvaluateLanding`), re-evaluates and stores a change's landing (`Reevaluate`, in a transaction of its own, and `ReevaluateIn`, in the caller's; `ErrChangeNotFound`, `ErrChangeClosed`), and every draft and open change of the workspace in the transaction of a `PUT`, and judges the version a land lands (`JudgeVersion`: the change read and the version judged in one transaction, the landing stored for the current version only); see [Landing policy](#landing-policy) |
+| `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause; both select the rules of one evaluation through one selector, which decides the rules' `targets` once and compiles their globs once, and stop with the context's error when it ends, looked at before each file; `MatchPath` matches one element of a glob against 64 positions of the path at a time and stops when no position is left, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the verdicts and check results on a change's versions (`ReviewStep`, the tables `change_approvals` and `change_checks`), the evidence source over them (`Facts`), the version observer that carries verdicts to a patch-equivalent version (`VersionObserver`), and the include expanders of the change (`ExpandApprovals`, `ExpandChecks`), the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, the event writer, `EventWriter`, the change records, `Changes`, which the change component is, and the repository opener, `Repos`), which serves `GET` and `PUT /workspaces/:slug/policy` and `POST /workspaces/:slug/policy/evaluate`, the dry evaluation of paths or a change that writes nothing, and the five routes of verdicts and check results (`Routes`), deletes a deleted workspace's revisions, verdicts and check results (`WorkspaceDeleted`), reads the files of a change (`Files`, its `ChangeFiles`: those between the change's `base_sha` and `head_sha` in its target workspace's repository, both paths of a rename or copy, no cap), is the change component's landing evaluator (`EvaluateLanding`), re-evaluates and stores a change's landing (`Reevaluate`, in a transaction of its own, and `ReevaluateIn`, in the caller's; `ErrChangeNotFound`, `ErrChangeClosed`), and every draft and open change of the workspace in the transaction of a `PUT`, and judges the version a land lands (`JudgeVersion`: the change read and the version judged in one transaction, the landing stored for the current version only); see [Landing policy](#landing-policy) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -3958,8 +3958,10 @@ fork; `ChangesOfSession(ctx, q, session)` lists the `change.Key`s
 session, across workspaces, ordered by slug and number;
 `ChangeNumbersOfSource(ctx, q, workspace)` lists every change, in any
 state, whose source workspace it is (`change.SourceChange{WorkspaceSlug,
-Number, Branch, State}`), ordered by number; `OpenCounts(ctx)` counts the
-draft and open changes per workspace slug.
+Number, Branch, State}`), ordered by number; `ReadVersions(ctx, q,
+workspace, number)` reads every version of a change, oldest first, with
+the credential that created each (`Version.Credential`, not marshalled);
+`OpenCounts(ctx)` counts the draft and open changes per workspace slug.
 
 The setters (`setters.go`) store, in the caller's transaction, what other
 features compute, set `updated_at`, and answer the change-not-found error
@@ -4347,8 +4349,9 @@ and `overlaps`, each served by the `change.Expander` (`func(ctx, Change)
 `(*change.Component).RegisterExpander(name, fn)` (nil removes; a name
 outside those four panics); a name without an expander adds no member, and
 the members follow the change's own in that order. The hub registers
-`(*Component).Stack` for `stack`; no feature registers the other three
-yet.
+`(*Component).Stack` for `stack`, and the policy component's
+`ExpandApprovals` and `ExpandChecks` for `approvals` and `checks`; no
+feature registers `overlaps` yet.
 
 The diff (`diff.go`), `GET /workspaces/:slug/changes/:number/diff` with
 the same scope, need and contributor-table pattern, resolves its change
@@ -4714,10 +4717,12 @@ no longer exists ends it `failed` `internal` as in any run.
 `composeSCM` and before `composeChanges` in `parts`, so that the start hook
 `policy` binds the component before the change component's start hooks
 record versions, which ask the landing evaluator. It creates a zero `policy.Component` (`Policy()`), adds
-`policy.SchemaStep` (the step `policy_revisions`), registers its `Routes()`
+`policy.SchemaStep` (the step `policy_revisions`) and `policy.ReviewStep`
+(the step `change_approvals_checks`), registers the component's evidence
+source (`RegisterEvidence(comp.Facts())`), registers its `Routes()`
 with `AddRoute`, registers `WorkspaceDeleted` as a remover of the
-workspace teardown, which deletes a deleted workspace's revisions in the
-delete's transaction, and binds the component in the start hook `policy`
+workspace teardown, which deletes a deleted workspace's revisions,
+verdicts and check results in the delete's transaction, and binds the component in the start hook `policy`
 to the store (`Store`), `policyWorkspaces` (`Workspaces`), an adapter over
 `workspace.BySlug` read through the querier it is given, answering the
 workspace's kind, status and default branch (`policy.Workspace`),
@@ -4729,12 +4734,15 @@ component (`Events`), the change component (`Changes`), an opener of the
 workspaces' repositories (`Repos`), and the hub's clock and logger;
 `AdjustPolicy` adjusters run before the bind. The component embeds
 `policy.EvidenceSlot`, so `RegisterEvidence` is called on the hub's
-instance; none is registered, and the evaluation reads `NoEvidence`.
+instance, and a test's `Compose` or a test world replaces the source.
 
 `composePolicyEvaluation` comes after `composeLand`. It registers the
 component on the change component as its landing evaluator
 (`RegisterLandingEvaluator`) and `policyGate` on the land component as its
-policy gate (`RegisterGate`), both while the hub is composed, so that a
+policy gate (`RegisterGate`), adds the component's `VersionObserver()`
+after the mergeability observer (`AddVersionObserver`) and registers
+`ExpandApprovals` and `ExpandChecks` as the expanders `approvals` and
+`checks` (`RegisterExpander`), all while the hub is composed, so that a
 test's `Compose` replaces them.
 
 The evaluation of a change (`evaluate`, `reevaluate.go`) reads, through
@@ -4796,6 +4804,59 @@ while none is stored; `InsertRevision(ctx, tx, slug, rev)` stores a
 revision with a positive number, a time and a writer. `Revision` marshals
 as the routes answer it: `revision`, `default`, `rules`, `updated_at`
 (whole seconds, UTC) and `updated_by`.
+
+The step `change_approvals_checks` (`ReviewStep`, `review_schema.go`)
+keeps the evidence, with no foreign key to the changes:
+`change_approvals`, one verdict per row (`id`, the change and version, the
+user's id and username, the credential's type and id, `verdict`,
+`comment`, `carried_from`, `created_at` in Unix nanoseconds), unique on
+`(workspace_slug, number, version, user_id)`, and `change_checks`, one
+result per `(workspace_slug, number, version, name)` with the status,
+summary, url, details as JSON text and the reporter. No table keeps who
+created a version: the counting rule (`counts`, `counting.go`, a pure
+function of the verdict, the requirement's approvers, the workspace's
+owner and organization members and the versions' creators) reads each
+version's creating credential from the change component
+(`ReadVersions`, through `creatorsOf`), which records it with the version
+and again when a raced write re-attributes it. Owner and organization come
+from `access.RecordBySlug` and membership from `identity.ActiveOrgIDs`,
+read through the caller's querier (`newCounter`).
+
+- The routes (`approval_routes.go`, `check_routes.go`) read the change
+  outside the transaction only to answer `change_not_found` before the
+  body is judged; in one `Store.Tx` they check the workspace's status and
+  the change's state (`writableChange`) and the version, write the row,
+  run `ReevaluateIn` and `Emit` the event. A failure returns the error as
+  it is, so the pipeline answers `500 internal` and nothing is committed.
+  Write transactions run one at a time, so two verdicts of one user on
+  one version, or two reports of one check, both succeed and leave one
+  row; the unique keys are a backstop. The two lists confine a token bound
+  to a task fork, on the fork's parent, to changes whose source is the
+  fork (`readableChange`), with the constant `change.ErrChangeNotFound`.
+- `Facts()` is the evidence source. Asked about one version
+  (`EvidenceQuery.Version`, which `JudgeVersion` sets to an older version
+  of a land), it answers the counted `approve` verdicts on that version,
+  whether a counted `reject` is there, and the status of each named check
+  whose result applies to it (`applying`, `check.go`: the version's own
+  result, else the nearest one through `patch_equivalent_to`, walked by
+  `equivalenceChain`; with `FreshChecks` the version's own only). It reads
+  only the version, name and status of the named checks on the versions of
+  that chain (`readCheckStatuses`); the list reads the results of the chain
+  once and indexes them by name (`indexChecks`), so both grow with the
+  results that may apply.
+- `VersionObserver()` (`carry.go`) reads the recorded version as stored
+  in the version's transaction, since the stack linker may have
+  recomputed its `patch_equivalent_to`, copies every verdict of the version
+  it names to the new one (new `id`, `carried_from` the source's
+  `carried_from` or version), and runs `ReevaluateIn` when it copied any,
+  because the change component stored the landing before telling its
+  observers. A verdict recorded on an earlier version that the current
+  version reaches is copied by the route to every version from the named
+  one to the current one, replacing the user's verdict on each
+  (`carryForward`).
+- `ExpandApprovals` and `ExpandChecks` (`expand.go`) serve the includes
+  with the lists of the routes (`listApprovals`, `listChecks`), read
+  through `Store.Main()` since an expander is given no transaction.
 
 `GET /workspaces/:slug/policy` is registered with the scope `changes:read`
 and the need `read`, under the pattern of the contributor table, so the

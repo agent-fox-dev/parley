@@ -34,9 +34,10 @@ const eventUpdate = "parley.policy.update"
 // the reads are those of the contributor table of internal/access, so that
 // a token bound to a task fork reaches them on the fork's parent, where the
 // table does not let it replace the policy; the scope, the binding and the
-// access decision come from the shared pipeline before a handler runs.
+// access decision come from the shared pipeline before a handler runs. The
+// routes of the evidence it counts follow them.
 func (c *Component) Routes() []server.Route {
-	return []server.Route{{
+	return append([]server.Route{{
 		Method: http.MethodGet, Pattern: "/workspaces/:slug/policy", Scope: "changes:read",
 		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.getPolicy,
 	}, {
@@ -47,7 +48,7 @@ func (c *Component) Routes() []server.Route {
 		Method: http.MethodPost, Pattern: "/workspaces/:slug/policy/evaluate", Scope: "changes:read",
 		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.evaluatePolicy,
 		MaxBodySize: maxRequestBytes,
-	}}
+	}}, slices.Concat(c.approvalRoutes(), c.checkRoutes())...)
 }
 
 // getPolicy answers the current revision of the workspace's policy, or the
@@ -221,7 +222,7 @@ func (c *Component) evaluatePolicy(w http.ResponseWriter, r *http.Request) error
 		if err != nil {
 			return err
 		}
-		if b, ok := access.BindingOf(r); ok && b.Relation == access.RelationParentOfBoundFork && ch.Source.WorkspaceSlug != b.Workspace {
+		if hiddenFromBoundFork(r, ch) {
 			return change.ErrChangeNotFound
 		}
 		base := ""

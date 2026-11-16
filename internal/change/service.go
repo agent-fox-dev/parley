@@ -11,7 +11,7 @@ import "context"
 //     SetMergeable, SetNeedsRestack, SetLanding, SetLanded, SetReverts,
 //     SetRevertedBy, SetAbandoned);
 //   - through a Querier, their transaction or nil for the store: ReadChange,
-//     OpenChangeOfBranch, ChangeOfCommit, ChangesOfSession,
+//     ReadVersions, OpenChangeOfBranch, ChangeOfCommit, ChangesOfSession,
 //     ChangeNumbersOfSource, CheckOpen and AutoLandSetter; OpenCounts reads
 //     the store;
 //   - without the store: Authorize, the access rule of an open;

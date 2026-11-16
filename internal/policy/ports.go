@@ -47,13 +47,14 @@ type WorkspaceReader interface {
 
 // Changes is what the policy reads and writes of the change records, which
 // the change component keeps: the numbers of a workspace's draft and open
-// changes, a change, the cause it cannot land for whatever the policy
-// requires, its landing, and the announcement step that is the one writer
-// of parley.change.ready. Every call goes through the caller's querier or
-// transaction.
+// changes, a change, its versions with the credential that created each,
+// the cause it cannot land for whatever the policy requires, its landing,
+// and the announcement step that is the one writer of parley.change.ready.
+// Every call goes through the caller's querier or transaction.
 type Changes interface {
 	DraftAndOpen(ctx context.Context, q change.Querier, workspace string) ([]int64, error)
 	ReadChange(ctx context.Context, q change.Querier, workspace string, number int64) (change.Change, error)
+	ReadVersions(ctx context.Context, q change.Querier, workspace string, number int64) ([]change.Version, error)
 	LandingCause(ctx context.Context, q change.Querier, ch change.Change) (*string, error)
 	SetLanding(ctx context.Context, tx *sql.Tx, workspace string, number int64, l change.Landing) error
 	AnnounceLandable(ctx context.Context, tx *sql.Tx, workspace string, number int64) error

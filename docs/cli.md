@@ -1994,12 +1994,13 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its eighteen commands open,
+reads no credential and sends no request. Its twenty-three commands open,
 read, edit, abandon, restore, restack, resolve, land and wait for the
-changes of a workspace, and read their stacks, conflicts and land
-attempts, through the
-[change routes](api.md#changes) and the [land routes](api.md#landing) of
-the hub. Each sends one request (`edit` with a label flag two, `wait` and
+changes of a workspace, read their stacks, conflicts and land attempts,
+and record and read the verdicts and check results on their versions,
+through the
+[change routes](api.md#changes), the [land routes](api.md#landing) and
+the [approval and check routes](api.md#approvals-and-checks) of the hub. Each sends one request (`edit` with a label flag two, `wait` and
 `land --wait` one more per poll, see below) with the credential as
 `Authorization: Bearer` and `<slug>` (and the `<sha>` of `find`) as one
 percent-encoded path segment (`parley change open a/b --source feat` sends
@@ -2025,6 +2026,11 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change land <slug> <number> [--stack] [--expected-version <n>] [--override <reason>] [--session <id>] [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST …/changes/<number>/land`; with `--wait`, then `GET …/lands/<id>` once per poll | the body below |
 | `parley change lands <slug> <number>` | `GET …/changes/<number>/lands` | |
 | `parley change wait <slug> <number> [--for landed\|ready\|mergeable] [--timeout <duration>] [--poll-interval <duration>]` | `GET …/changes/<number>`, once per poll | |
+| `parley change approve <slug> <number> [--version <n>] [--comment <text>]` | `POST …/changes/<number>/approvals` | the body `{"verdict":"approve"}` with `version` (a number) and `comment` when given |
+| `parley change reject <slug> <number> --comment <text> [--version <n>]` | `POST …/changes/<number>/approvals` | the body `{"verdict":"reject","comment":…}` with `version` when given |
+| `parley change approvals <slug> <number> [--version <n> \| --withdraw <id>]` | `GET …/changes/<number>/approvals`; with `--withdraw`, `DELETE …/changes/<number>/approvals/<id>` | `version` |
+| `parley change check <slug> <number> <name> --status pending\|passed\|failed [--version <n>] [--summary <text>] [--url <url>]` | `PUT …/changes/<number>/checks/<name>` | the body `{"status":…}` with `version` (a number), `summary` and `url` when given |
+| `parley change checks <slug> <number> [--version <n>]` | `GET …/changes/<number>/checks` | `version` |
 
 A flag not given sends no parameter, so that the hub's default applies;
 text values are sent as given, for the hub to judge.
@@ -2165,7 +2171,8 @@ A refusal of the hub's (`404` `change_not_found`, `400`
 `change_closed`, `400` `intent_required`, `409` `has_dependants`, `409`
 `source_workspace_gone`, `409` `rebase_conflict` with its conflict report,
 `404` `path_not_found`, `409` `not_text_conflict`, among others) is written to stderr as received, with nothing on stdout and exit
-status `1`. `open` is sent once and never retried.
+status `1`. `open` is sent once and never retried. `approvals
+--withdraw`, whose route answers `204`, prints `{}`.
 
 **Client checks.** A missing `--source`, a wrong number of arguments, a
 `<number>`, `--against`, `--depends-on` or `--stack-of` that is not a
@@ -2197,7 +2204,15 @@ not both`), an `abandon --dependants` other than `reparent` and
 `abandon` (`parley change abandon takes --dependants reparent or abandon,
 got "delete"`), a `wait --for` other than `landed`, `ready` and
 `mergeable` (`parley change wait takes --for landed, ready or mergeable,
-got "done"`) and a `wait` or `land` `--timeout` or `--poll-interval` that is not a
+got "done"`), a `--version` of `approve`, `reject`, `approvals`, `check`
+or `checks` that is not a positive integer (`parley change approve takes
+--version <n>, a positive integer, got "0"`), `reject` without `--comment`
+(a required flag) or with an empty one (`parley change reject takes a
+--comment that says why, not an empty one`), `check` without `--status` or with another status
+(`parley change check takes --status pending, passed or failed, got
+"ok"`), `approvals --withdraw` with `--version` (`parley change approvals
+takes --withdraw or --version, not both`) or with an empty id (`parley
+change approvals takes --withdraw <id>, not an empty one`) and a `wait` or `land` `--timeout` or `--poll-interval` that is not a
 duration above zero (see [Waiting](#waiting)) are refused with a
 `usage_error` and exit status `2` before any setting is read or any request
 sent.

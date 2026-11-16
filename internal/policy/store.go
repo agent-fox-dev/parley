@@ -185,13 +185,20 @@ func scanRevision(row *sql.Row) (Revision, error) {
 	return rev, nil
 }
 
-// WorkspaceDeleted deletes every policy revision of the workspace slug in
-// tx, the teardown's transaction, so that a workspace registered later
-// under the same slug starts at revision 0
+// WorkspaceDeleted deletes every policy revision, verdict and check result
+// of the workspace slug in tx, the teardown's transaction, so that a
+// workspace registered later under the same slug starts at revision 0 and
+// its changes, numbered again from 1, start with no evidence
 // (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
 func (c *Component) WorkspaceDeleted(ctx context.Context, tx *sql.Tx, slug string) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM policy_revisions WHERE workspace_slug = ?`, slug); err != nil {
-		return fmt.Errorf("delete the policy revisions of %s: %w", slug, err)
+	for _, d := range []struct{ table, what string }{
+		{"policy_revisions", "policy revisions"},
+		{"change_approvals", "verdicts"},
+		{"change_checks", "check results"},
+	} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE workspace_slug = ?`, slug); err != nil {
+			return fmt.Errorf("delete the %s of %s: %w", d.what, slug, err)
+		}
 	}
 	return nil
 }

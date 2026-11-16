@@ -3772,9 +3772,11 @@ comma list of `versions`, `approvals`, `checks`, `stack` and `overlaps`
 (also given more than once), adds a member of that name after the change's
 own: `versions` the list of versions, oldest first; `stack` the change's
 stack, as `GET …/changes/{number}/stack` answers it for the same caller;
+`approvals` the verdicts on the current version, newest first, and
+`checks` the check results that apply to the current version, by name, as
+the lists of [Approvals and checks](#approvals-and-checks) answer them;
 each other name what the hub's feature for it computes, and no member
-while the hub has none (`approvals`, `checks` and `overlaps` have none
-yet). Any other name, the empty name included, answers `400`
+while the hub has none (`overlaps` has none yet). Any other name, the empty name included, answers `400`
 `invalid_request`.
 
 `GET …/changes/{number}/versions` answers `200` with the versions, oldest
@@ -5067,8 +5069,9 @@ Each selected rule, then `default`, gives one requirement:
 | `block` | the rule's `block` |
 | `satisfied` | `true` when the rule does not block, enough approvals count, no rejection is outstanding and every check passed |
 
-Until approvals and check results are recorded, nothing is counted and
-every check is `pending`. The `status` is `blocked`, with the `reason`,
+`counted` and the check statuses come from the verdicts and check
+results recorded on the version being evaluated ([Approvals and
+checks](#approvals-and-checks)). The `status` is `blocked`, with the `reason`,
 for a draft (`draft`). It is also `blocked`, with the `reason`, for a
 change with a structural cause (`target_not_found`, `nothing_to_land`,
 `unrelated_history`, `merge_commits`), whatever its requirements say.
@@ -5085,6 +5088,10 @@ The landing is evaluated again and stored on each of these:
 - a mergeability check of a change whose target branch is missing or found
   again;
 - a replacement of the policy of its target workspace (`PUT` above);
+- a verdict recorded, replaced or withdrawn, and a check result reported
+  ([Approvals and checks](#approvals-and-checks));
+- verdicts carried to a new version that is patch-equivalent to an
+  earlier one;
 - the policy gate of a land.
 
 A re-evaluation that runs at the same time as a replacement of the policy
@@ -5098,6 +5105,170 @@ in the same transaction. `parley.change.ready` is therefore written once
 when the change becomes landable, and a failure of either step stores
 neither. Every re-evaluation sets the change's `updated_at`. A landed or
 abandoned change keeps the landing it had when it closed.
+
+## Approvals and checks
+
+The evidence the [landing](#the-landing-of-a-change) counts about one
+version of a change: a user's verdict, `approve` or `reject`, and the named
+results of external check runners. Both are recorded against the exact
+version they were given on. The routes are under
+`/api/v1/workspaces/{slug}/changes/{number}`, where `{slug}` is the
+workspace that holds the change's target branch. A `{number}` that is not a
+positive integer, or names no change of `{slug}`, answers `404`
+`change_not_found` with the message `no such change`. A `version` (query
+or body) that is not a positive integer is `400` `invalid_request`
+(`version must be a positive integer`), and one the change does not have
+is `404` `not_found` (`demo#1 has no version 7`).
+
+The approval object:
+
+```json
+{"id":"7192e863-b4a0-4a41-8357-49ca6ca19a64","change":1,"version":2,"verdict":"approve","comment":"","by":{"actor_type":"api_key","actor_id":"53874e1f-8c16-48ae-a95a-51563b197fc7","username":"dev"},"counts_for":["default"],"carried_from":1,"created_at":"2026-11-16T11:13:37Z"}
+```
+
+| Member | Meaning |
+|---|---|
+| `id` | a UUID |
+| `change`, `version` | the version the verdict is on |
+| `verdict` | `approve` or `reject` |
+| `comment` | at most 16 000 characters, `""` when none was given |
+| `by` | the credential that gave it: `actor_type` (`api_key` or `pat`), `actor_id` and `username`, the user's |
+| `counts_for` | the `rule` of every requirement of the change's stored `landing` toward which the verdict counts, in the order of the requirements, computed when it is read; `[]` for a verdict that is not on the current version |
+| `carried_from` | for a copy carried to a patch-equivalent version, the version the verdict was first given on; else `null` |
+| `created_at` | when it was given; a carried copy keeps the original's |
+
+**The counting rule.** A verdict counts toward a requirement when its user
+is among the requirement's `approvers` (`owner` the workspace's owner,
+`member` every member of the workspace's organization, `user:<username>`
+the user of exactly that username, compared case-sensitively) and its
+credential created no version of the change numbered at or below the
+verdict's own. Credentials are compared, not users: a person approving
+their agent's push with their own API key counts, an agent approving the
+version it pushed does not, and a person who pushed with one token and
+approves with another counts. A version the hub created (`created_by`
+`system`: a restack, a sync) excludes nobody. A version with no recorded
+credential that the hub did not create excludes every credential of its
+`created_by` user. The landing counts the `approve` verdicts on the
+version evaluated that count, and a `reject` that counts keeps its
+requirement unsatisfied until its author replaces or withdraws it or a
+version that is not patch-equivalent arrives. A requirement that needs
+zero approvals still lists in `counts_for` the verdicts that would count.
+
+**Carry-over.** When a version is recorded with `patch_equivalent_to`
+naming an earlier version, every verdict on that version is copied to the
+new one in the transaction that records it, with a new `id` and
+`carried_from` set, and the change is evaluated again when any was
+copied; no event is written for the copies. A version that is not patch-equivalent starts with no
+verdicts. Check results are not copied: they are looked up through
+`patch_equivalent_to` when read (below).
+
+### `POST /api/v1/workspaces/{slug}/changes/{number}/approvals`
+
+Records the caller's verdict. Needs `read` access and, for a PAT, the
+scope `changes:approve`, which no other scope implies (`changes:write`
+alone is `403` `insufficient_scope`). Any user who can read the change may
+give a verdict, an org member included; whether it counts is the rule
+above. The admin token is `403` `forbidden` (`a verdict is given by a
+user; the admin token cannot give one`), whatever the body. A token bound
+to a task fork of `{slug}` is `403` `token_bound`.
+
+The body is a JSON object with `verdict` (`approve` or `reject`), an
+optional `comment` string and an optional `version`, and no other member;
+anything else is `400` `invalid_request` (`verdict must be approve or
+reject`, `comment must be a string of at most 16000 characters`, `unknown
+member "x"; a verdict has verdict, comment and version`). The checks run
+in this order: the change exists, the body is valid, the workspace is not
+archived (`409` `workspace_archived`), the change is draft or open (`409`
+`change_closed`), the version exists. Without `version` the verdict is on
+the current version.
+
+A user has at most one verdict per version. The first is answered `201`
+with the approval; a later one by the same user on the same version, with
+any of the user's credentials, replaces it and is answered `200`: a new
+`id`, a new `created_at`, `carried_from` `null`. A verdict on an earlier
+version that the current version reaches through `patch_equivalent_to` is
+also copied to every version from the named one to the current one,
+replacing the user's verdict on each, with `carried_from` the named
+version; the answer is the verdict on the
+named version. A verdict on any other version is recorded and changes
+nothing. In the same transaction the change is evaluated again and one
+`parley.change.approve` or `parley.change.reject` event is written:
+`resource_type` `change`, `resource_id` the number, the caller as actor,
+`session_id` `null`, metadata `{version, approval_id, counts_for, number,
+ref}` with the answer's `counts_for`. A failure of any part answers `500`
+`internal` and writes nothing.
+
+### `GET /api/v1/workspaces/{slug}/changes/{number}/approvals`
+
+Needs `read` access and, for a PAT, `changes:read`. Answers `200` with the
+verdicts of every version, or of the version `version` names, as approval
+objects in the list envelope, newest first (`created_at` descending, then
+`id` descending), paged by `limit` and `cursor`.
+
+### `DELETE /api/v1/workspaces/{slug}/changes/{number}/approvals/{id}`
+
+Withdraws one verdict. Needs `read` access and, for a PAT,
+`changes:approve`; a token bound to a task fork of `{slug}` is `403`
+`token_bound`. In order: the change exists, the workspace is not archived
+(`409` `workspace_archived`), the change is draft or open (`409`
+`change_closed`), `{id}` names a verdict of this change (`404`
+`not_found`, also for a string that is not a UUID), and the caller is the
+verdict's user (with any credential), the workspace's owner or the admin
+token (`403` `forbidden`, `only the verdict's user, the workspace's owner
+or the admin token may withdraw it`). It removes exactly that verdict
+(copies of it on other versions are verdicts of their own), evaluates the
+change again in the same transaction, writes no event of its own and
+answers `204` with no body.
+
+The check object:
+
+```json
+{"name":"test","change":1,"version":1,"status":"passed","summary":"42 tests","url":"https://ci.example/run/7","details":{"duration_ms":812},"reported_by":{"actor_type":"pat","actor_id":"53874e1f-8c16-48ae-a95a-51563b197fc7","username":"dev"},"updated_at":"2026-11-16T11:13:37Z"}
+```
+
+`name` matches `^[a-z0-9][a-z0-9_.-]{0,62}$`; `status` is `pending`,
+`passed` or `failed`; `summary` is `""` and `url` and `details` `null`
+when the report gave none; `reported_by` is `admin_token` with `null` id
+and username for the admin token. There is one result per version and
+name.
+
+### `PUT /api/v1/workspaces/{slug}/changes/{number}/checks/{name}`
+
+Reports a check result. Needs `write` access (the owner; a member is `403`
+`forbidden`) and, for a PAT, the scope `checks:write`, which no other scope
+implies, so a PAT holding only `checks:write` can report and do nothing
+else. The admin token may report. A token bound to a task fork of `{slug}`
+is `403` `token_bound`.
+
+The body is a JSON object with `status` and the optional `summary` (at
+most 2 000 characters), `url` (an absolute `http` or `https` URL of at
+most 2 048 characters), `details` (a JSON object whose text as received is
+at most 16 384 bytes) and `version`, and no other member; a `{name}` that
+does not match the pattern, or a body that breaks a rule, is `400`
+`invalid_request`. The order of the other checks is that of the verdict.
+The result replaces the version's result of that name whole, so a member
+the new report omits is empty; the answer is `200` with the check for a
+first report and a replacement alike. In the same transaction the change
+is evaluated again and one `parley.change.check` event is written for
+every report, the status changed or not, with metadata `{version, name,
+status, number, ref}` and `session_id` `null`.
+
+### `GET /api/v1/workspaces/{slug}/changes/{number}/checks`
+
+Needs `read` access and, for a PAT, `changes:read`. Answers `200` with the
+results that apply to the current version, or to the version `version`
+names, one per name, ordered by name, in the list envelope. The result
+that applies to a version for a name is the one reported on that version,
+else the one reported on the nearest earlier version reached by following
+`patch_equivalent_to`; a result reached that way keeps the `version` it
+was reported on. The landing sees, for each check a requirement names,
+the status of the result that applies to the version evaluated, or
+`pending` when none does; with `fresh_checks` only a result reported on
+that version itself applies. A check no runner reports stays `pending`.
+
+A token bound to a task fork reaches the two lists on the fork's parent
+only for changes whose source workspace is that fork; every other change
+answers `404` `change_not_found`, with the body an unknown number gets.
 
 ## Admin routes
 
