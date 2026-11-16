@@ -42,10 +42,10 @@ var editFlags = []string{"title", "intent", "label", "remove-label", "auto-land"
 
 // newChangeCommand builds parley change: the changes of a workspace, their
 // versions and their diffs, their stacks, their conflicts, their edits,
-// abandon, restore, restack and land, their land attempts, waiting for
-// one, and the verdicts and check results on their versions.
+// abandon, restore, restack, land and revert, their land attempts, waiting
+// for one, and the verdicts and check results on their versions.
 func newChangeCommand() *cobra.Command {
-	return group("change", "Open, list, read, edit, abandon, restore, restack, land and wait for the changes of a workspace, read their versions, diffs, stacks, conflicts and land attempts, and approve, reject and report checks on their versions",
+	return group("change", "Open, list, read, edit, abandon, restore, restack, land, revert and wait for the changes of a workspace, read their versions, diffs, stacks, conflicts and land attempts, and approve, reject and report checks on their versions",
 		newChangeOpenCommand(),
 		newChangeEditCommand(),
 		newChangeStateCommand("ready", "Mark a draft change ready for review and landing", "open"),
@@ -74,6 +74,7 @@ func newChangeCommand() *cobra.Command {
 		newChangeResolveCommand(),
 		newChangeLandCommand(),
 		newChangeLandsCommand(),
+		newChangeRevertCommand(),
 		newChangeWaitCommand(),
 		withNumbers(scmRead{
 			command: command{Name: "list", Description: "List the changes of a workspace, the draft and open ones unless --state says otherwise", Path: "/workspaces/:slug/changes", Args: []argSpec{slugArg}},
@@ -123,6 +124,47 @@ func newChangeCommand() *cobra.Command {
 		newChangeCheckCommand(),
 		newChangeChecksCommand(),
 	)
+}
+
+// newChangeRevertCommand builds parley change revert: one call that opens
+// a change undoing a landed change, on the new branch revert/<number>.
+func newChangeRevertCommand() *cobra.Command {
+	return withNumbers(declare(command{
+		Name:        "revert",
+		Description: "Open a change that undoes a landed change, on a new branch revert/<number> built on the target branch",
+		Method:      http.MethodPost,
+		Path:        changePath + "/revert",
+		Args:        []argSpec{slugArg, numberArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("title", "", `the reverting change's title (default: Revert "<title of the landed change>")`)
+			fs.String("intent", "", "why the change is reverted (default: a line naming the reverted change)")
+			fs.Bool("draft", false, "open the reverting change as a draft")
+			fs.Bool("auto-land", false, "land the reverting change by itself once it is landable")
+			fs.String("session", "", "the id of the agent session the revert belongs to")
+		},
+		Run: func(c *call) error {
+			return sendWith(c, nil, revertBody(c.cmd.Flags()))
+		},
+	}), true)
+}
+
+// revertBody is the body of a revert: a member for each flag given and
+// none for a flag not given, so that the hub's default applies; without a
+// flag it is {}.
+func revertBody(fs *pflag.FlagSet) map[string]any {
+	body := map[string]any{}
+	for _, f := range []struct{ flag, member string }{{"title", "title"}, {"intent", "intent"}, {"session", "session_id"}} {
+		if fs.Changed(f.flag) {
+			body[f.member], _ = fs.GetString(f.flag)
+		}
+	}
+	for _, f := range []struct{ flag, member string }{{"draft", "draft"}, {"auto-land", "auto_land"}} {
+		if fs.Changed(f.flag) {
+			body[f.member], _ = fs.GetBool(f.flag)
+		}
+	}
+	return body
 }
 
 // newChangeConflictCommand builds parley change conflict: the change's
