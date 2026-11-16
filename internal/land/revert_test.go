@@ -18,6 +18,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
 
@@ -491,5 +492,141 @@ func TestRevert_OfALandedRevertRestoresWhatTheOriginalLanded(t *testing.T) {
 	w.landChange(t, int64(got["number"].(float64)))
 	if tree := w.tree(t, "main"); tree != after {
 		t.Errorf("main's tree is %s, want %s, what it was after the original landed", tree, after)
+	}
+}
+
+func TestRevert_AdmitsAWriterTheAdminTokenAndTheAuthorTheSettingAllows(t *testing.T) {
+	t.Parallel()
+	w := newRevertWorld(t)
+	w.configure(t, `{"changes.auto_restack":false,"land.by_author":true}`)
+	authorID, authorKey := w.member(t, "member-a")
+	dir := w.fork(t, "api--a", authorID)
+	author := change.Caller{UserID: authorID, Username: "member-a", Credential: change.Credential{Type: change.CredentialAPIKey, ID: "ka"}}
+	// There is no write access but the owner's, so the writer with a PAT
+	// is the owner with one.
+	ownerPAT := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"changes:read", "changes:write"}})
+	for i, c := range []struct {
+		name, credential string
+		// fromFork opens the original from the author's fork, by the
+		// author, rather than from api by the owner.
+		fromFork bool
+		author   map[string]any
+	}{
+		{"the owner with an API key", w.ownerKey, false,
+			map[string]any{"actor_type": change.CredentialAPIKey, "actor_id": w.owner, "username": "owner"}},
+		{"the owner with a PAT that may write changes", ownerPAT, false,
+			map[string]any{"actor_type": change.CredentialPAT, "actor_id": w.owner, "username": "owner"}},
+		{"the admin token", w.Token, false,
+			map[string]any{"actor_type": change.CredentialAdminToken, "actor_id": nil, "username": nil}},
+		{"an org member who authored the change from a fork, by land.by_author, with an API key", authorKey, true,
+			map[string]any{"actor_type": change.CredentialAPIKey, "actor_id": authorID, "username": "member-a"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := "who" + strconv.Itoa(i)
+			var orig change.Change
+			if c.fromFork {
+				orig = w.openFrom(t, "api--a", dir, branch, author)
+				w.landChange(t, orig.Number)
+			} else {
+				orig, _ = w.landed(t, branch, "Add "+branch, map[string]string{branch + ".txt": branch + "\n"})
+			}
+
+			status, got := w.revertCall(t, c.credential, orig.Number, nil)
+
+			if status != http.StatusCreated || got["reverts"] != float64(orig.Number) || !reflect.DeepEqual(got["author"], c.author) {
+				t.Fatalf("revert = %d %v, want 201 reverting %d by %v", status, got, orig.Number, c.author)
+			}
+		})
+	}
+}
+
+func TestRevert_RefusesACallerWhoMayNotRevert(t *testing.T) {
+	t.Parallel()
+	w := newRevertWorld(t)
+	authorID, authorKey := w.member(t, "member-a")
+	_, otherKey := w.member(t, "member-b")
+	strangerKey := w.IssueKey(t, w.CreateUser(t, "stranger"))
+	dir := w.fork(t, "api--a", authorID)
+	author := change.Caller{UserID: authorID, Username: "member-a", Credential: change.Credential{Type: change.CredentialAPIKey, ID: "ka"}}
+	reader := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"changes:read"}})
+	forkBound := w.IssuePAT(t, identity.PATSpec{UserID: authorID, Permissions: []string{"changes:read", "changes:write"}, Workspace: "api--a"})
+	orig := w.openFrom(t, "api--a", dir, "theirs", author)
+	w.landChange(t, orig.Number)
+	open := w.open(t, "unlanded")
+	for _, c := range []struct {
+		name, credential string
+		number           int64
+		byAuthor         bool
+		status           int
+		errorType        string
+	}{
+		{"a PAT without changes:write", reader, orig.Number, true, 403, "insufficient_scope"},
+		{"a reader who is neither a writer nor the author", otherKey, orig.Number, true, 403, "forbidden"},
+		{"the author without write access while land.by_author is false", authorKey, orig.Number, false, 403, "forbidden"},
+		{"a token bound to a fork of the workspace", forkBound, orig.Number, true, 403, "token_bound"},
+		{"a caller who cannot read the workspace", strangerKey, orig.Number, true, 404, "not_found"},
+		{"an unknown change number", w.ownerKey, 999, true, 404, "change_not_found"},
+		{"a reader who is neither a writer nor the author, on a change that is not landed", otherKey, open.Number, true, 403, "forbidden"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w.configure(t, fmt.Sprintf(`{"changes.auto_restack":false,"land.by_author":%t}`, c.byAuthor))
+			refs, changes, events := gitrepotest.Git(t, w.api, "for-each-ref"), w.changeCount(t), w.revertEvents(t)
+
+			status, answer := w.revertCall(t, c.credential, c.number, nil)
+
+			if status != c.status || errorType(answer) != c.errorType {
+				t.Errorf("revert of %d = %d %v, want %d %s", c.number, status, answer, c.status, c.errorType)
+			}
+			if r, n, e := gitrepotest.Git(t, w.api, "for-each-ref"), w.changeCount(t), w.revertEvents(t); r != refs || n != changes || e != events {
+				t.Errorf("the refused revert changed the refs from\n%s\nto\n%s\nthe changes from %d to %d, the events from %d to %d",
+					refs, r, changes, n, events, e)
+			}
+		})
+	}
+}
+
+func TestRevert_HoldsAPathScopedTokenToTheFilesOfTheLandedVersion(t *testing.T) {
+	t.Parallel()
+	w := newRevertWorld(t)
+	token := w.docsPAT(t, []string{"docs/**"})
+	src, _ := w.landed(t, "psrc", "Add main", map[string]string{"src/main.go": "package main\n"})
+	gone, _ := w.landed(t, "pgone", "Add gone", map[string]string{"src/gone.go": "package gone\n"})
+	w.landed(t, "pungone", "Remove gone", map[string]string{"src/gone.go": ""})
+	docs, _ := w.landed(t, "pdocs", "Add docs", map[string]string{"docs/a.md": "a\n"})
+	moreDocs, _ := w.landed(t, "pmore", "Add more docs", map[string]string{"docs/b.md": "b\n"})
+	for _, c := range []struct {
+		name   string
+		number int64
+		body   any
+		// path is the file the revert is refused for, "" for a revert
+		// that is accepted.
+		path string
+	}{
+		{"a change touching src/main.go", src.Number, nil, "src/main.go"},
+		{"a change touching src/main.go, with auto_land", src.Number, map[string]any{"auto_land": true}, "src/main.go"},
+		{"a change touching src/gone.go, which there is nothing to undo of", gone.Number, nil, "src/gone.go"},
+		{"a change touching only docs/a.md", docs.Number, nil, ""},
+		{"a change touching only docs/b.md, with auto_land", moreDocs.Number, map[string]any{"auto_land": true}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			refs, changes, events := gitrepotest.Git(t, w.api, "for-each-ref"), w.changeCount(t), w.revertEvents(t)
+
+			status, answer := w.revertCall(t, token, c.number, c.body)
+
+			if c.path == "" {
+				if status != http.StatusCreated || answer["reverts"] != float64(c.number) {
+					t.Errorf("revert of %d with %v = %d %v, want 201", c.number, c.body, status, answer)
+				}
+				return
+			}
+			errObj, _ := answer["error"].(map[string]any)
+			if status != http.StatusForbidden || errorType(answer) != "path_not_allowed" || errObj["path"] != c.path {
+				t.Errorf("revert of %d with %v = %d %v, want 403 path_not_allowed for %s", c.number, c.body, status, answer, c.path)
+			}
+			if r, n, e := gitrepotest.Git(t, w.api, "for-each-ref"), w.changeCount(t), w.revertEvents(t); r != refs || n != changes || e != events {
+				t.Errorf("the refused revert changed the refs from\n%s\nto\n%s\nthe changes from %d to %d, the events from %d to %d",
+					refs, r, changes, n, events, e)
+			}
+		})
 	}
 }

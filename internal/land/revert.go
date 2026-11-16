@@ -106,12 +106,14 @@ func parseRevert(r *http.Request) (revertRequest, error) {
 // change.
 //
 // In this order, after the shared checks: the change (404
-// change_not_found), the body (400 invalid_request), the session (400
-// unknown_session), the workspace's status (409, such as
+// change_not_found), the body (400 invalid_request), who may revert (403
+// forbidden, see mayRevert), the session (400 unknown_session), the workspace's status (409, such as
 // workspace_archived), a change that is not landed (409
 // change_not_landed), one a draft, open or landed change already reverts
 // (409 already_reverted, with details.reverted_by), a target branch that is
-// gone (400 target_not_found), nothing to undo (400 nothing_to_land: no
+// gone (400 target_not_found), a file of the landed version outside a
+// path-scoped caller's paths (403 path_not_allowed, with the path), nothing
+// to undo (400 nothing_to_land: no
 // landed commit, or every undo empty) and an undo that does not apply (409
 // revert_conflict with the conflict report as details.conflict). A refusal
 // creates nothing: no commit is referenced, and no branch, change or event
@@ -133,16 +135,19 @@ func (c *Component) revertRoute(w http.ResponseWriter, r *http.Request) error {
 	}
 	p, _ := identity.PrincipalOf(ctx)
 	caller := change.CallerOf(p)
+	ws, err := c.workspace(ctx, slug)
+	if err != nil {
+		return err
+	}
+	if err := c.mayRevert(ctx, caller, orig, ws); err != nil {
+		return err
+	}
 	if req.sessionID != nil {
 		id, err := c.deps.Changes.CheckSession(ctx, caller, *req.sessionID, slug)
 		if err != nil {
 			return err
 		}
 		req.sessionID = &id
-	}
-	ws, err := c.workspace(ctx, slug)
-	if err != nil {
-		return err
 	}
 	if ws.Ready != nil {
 		return ws.Ready
@@ -168,6 +173,19 @@ func (c *Component) revertRoute(w http.ResponseWriter, r *http.Request) error {
 		return server.NewError("target_not_found", http.StatusBadRequest,
 			fmt.Sprintf("%s landed on %s, which %s no longer has", orig.Ref, orig.TargetBranch, slug))
 	}
+	// A path-scoped token reverts only what it could have landed: the
+	// files of the landed version, as recorded, before any undo is made.
+	base := ""
+	if orig.BaseSHA != nil {
+		base = *orig.BaseSHA
+	}
+	refused, err := CheckPaths(ctx, repo, caller.Paths, base, orig.HeadSHA)
+	if err != nil {
+		return err
+	}
+	if refused != "" {
+		return pathNotAllowed(refused)
+	}
 	head, err := c.undo(ctx, repo, orig, target)
 	if err != nil {
 		return err
@@ -178,6 +196,23 @@ func (c *Component) revertRoute(w http.ResponseWriter, r *http.Request) error {
 	}
 	server.WriteJSON(w, http.StatusCreated, ch)
 	return nil
+}
+
+// mayRevert admits caller to revert the change orig of the workspace ws by
+// the rule of who may land it: the admin token, a writer of the workspace,
+// which is its owner, and, while land.by_author is on, the change's author
+// with any credential of theirs. Every other caller, who reads the
+// workspace since the route's shared checks passed, is answered 403
+// forbidden. A token bound to a fork never gets here: the revert is not a
+// route the binding guard lets such a token reach on the fork's parent,
+// so that it cannot undo work there.
+func (c *Component) mayRevert(ctx context.Context, caller change.Caller, orig change.Change, ws Workspace) error {
+	may, err := mayLand(ctx, c.deps.Access, caller, []change.Change{orig}, ws)
+	if err != nil || may {
+		return err
+	}
+	return server.Forbidden(fmt.Sprintf("%s may be reverted only by a writer of %s, the admin token or, while land.by_author is on, its author",
+		orig.Ref, ws.Slug))
 }
 
 // undo makes, in repo, the commits that undo the landed commits of the
@@ -230,6 +265,10 @@ func (c *Component) openRevert(ctx context.Context, r *http.Request, repo *gitre
 		Workspace: ws.Slug, Head: head, TargetBranch: &orig.TargetBranch, Title: req.title, Intent: req.intent,
 		AutoLand: req.autoLand, SessionID: req.sessionID, Draft: req.draft, Caller: caller, Kind: change.KindRevert,
 		Reverts: &orig.Number,
+		// Who may revert, and so open the revert from its branch in ws, is
+		// decided: an author land.by_author lets revert, who only reads ws,
+		// opens it all the same.
+		SourceGranted: true,
 	}
 	if in.Title == nil {
 		title := []rune(`Revert "` + orig.Title + `"`)

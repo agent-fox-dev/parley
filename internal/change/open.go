@@ -70,6 +70,12 @@ type OpenInput struct {
 	// in its ref-updated stage. Open then reads the branch in tx, once
 	// version 1 is recorded.
 	AfterMove bool
+	// SourceGranted says that the operation opening the change has itself
+	// decided that the caller may open it from the source, as a revert
+	// does for the author whom land.by_author lets revert their change:
+	// Open then still asks that the caller read the target, but not that
+	// they write the source.
+	SourceGranted bool
 }
 
 // Open opens a change in tx, the caller's transaction, which it neither
@@ -395,7 +401,7 @@ func (c *Component) check(ctx context.Context, q Querier, co collaborators, in O
 			return nil, err
 		}
 	}
-	if err := c.authorizeAccess(ctx, in.Caller, in.Workspace, in.SourceWorkspace); err != nil {
+	if err := c.authorizeAccess(ctx, in.Caller, in.Workspace, in.SourceWorkspace, in.SourceGranted); err != nil {
 		return nil, err
 	}
 	if err := c.resolve(ctx, q, co, in, o); err != nil {
