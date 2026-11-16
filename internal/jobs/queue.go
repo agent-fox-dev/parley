@@ -2,13 +2,21 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/store"
 )
+
+// MaxRunning is the most attempts the queue runs at once.
+const MaxRunning = 4
 
 // DefaultInterval is how often the dispatcher passes when Deps sets no
 // interval, so that a queued job starts within seconds even without a wake.
@@ -78,6 +86,25 @@ type Queue struct {
 	// wake holds one token: an enqueue leaves it for the dispatcher, which
 	// passes at once instead of at its next interval.
 	wake chan struct{}
+	// handlers are the registered handlers, by job type.
+	handlers map[string]Handler
+	// running are the attempts this queue has claimed and not yet seen
+	// end, by job id. Its size is what the limit of MaxRunning counts.
+	running map[string]*worker
+	// workers counts the goroutines of the attempts in running.
+	workers sync.WaitGroup
+	// stopping is set once the queue stops claiming: a pass then claims
+	// nothing.
+	stopping bool
+}
+
+// worker is an attempt of a job the queue runs.
+type worker struct {
+	// cancel cancels the context of the attempt.
+	cancel context.CancelFunc
+	// done is closed once the attempt has ended and its outcome is
+	// settled.
+	done chan struct{}
 }
 
 // ErrNotFound is the error of an operation on a job that does not exist.
@@ -159,4 +186,269 @@ func (q *Queue) List(ctx context.Context, typ, slug, status string, after *ListP
 		return nil, err
 	}
 	return listJobs(ctx, d.Store.Main(), typ, slug, status, after, limit)
+}
+
+// claim is a job a pass claimed, with the handler of its type and the
+// worker that runs its attempt.
+type claim struct {
+	job     Job
+	handler Handler
+	ctx     context.Context
+	worker  *worker
+}
+
+// Pass is one pass of the dispatcher. It returns every failed job whose
+// next attempt is due to queued, then claims queued jobs, oldest first, for
+// the types that have a handler: at most MaxRunning attempts run at once,
+// and at most one per type and workspace. Each claimed job's attempt starts
+// on a goroutine of its own once the claim has committed. A pass that finds
+// nothing to do opens no write transaction, and a pass of a stopping queue
+// does nothing.
+func (q *Queue) Pass(ctx context.Context) error {
+	d, err := q.deps()
+	if err != nil {
+		return err
+	}
+	q.mu.Lock()
+	stopping, room := q.stopping, len(q.running) < MaxRunning
+	types := slices.Sorted(maps.Keys(q.handlers))
+	q.mu.Unlock()
+	if stopping {
+		return nil
+	}
+	if !room {
+		types = nil
+	}
+	work, err := hasWork(ctx, d.Store.Main(), d.Clock.Now(), types)
+	if err != nil || !work {
+		return err
+	}
+
+	// An attempt outlives the pass that started it: the queue cancels it,
+	// not the pass's caller.
+	base := context.WithoutCancel(ctx)
+	var claimed []claim
+	err = d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		now := d.Clock.Now().UTC()
+		if err := requeueDue(ctx, tx, now); err != nil {
+			return err
+		}
+		if len(types) == 0 {
+			return nil
+		}
+		candidates, err := queuedJobs(ctx, tx, types)
+		if err != nil {
+			return err
+		}
+		// The type and workspace of a job this pass claimed: one of each runs
+		// at a time, also when two of its jobs were queued.
+		taken := map[[2]string]bool{}
+		for _, j := range candidates {
+			key := [2]string{j.Type, j.Workspace}
+			if taken[key] {
+				continue
+			}
+			c, full := q.reserve(base, j)
+			if full {
+				break
+			}
+			if c.worker == nil {
+				continue
+			}
+			ok, err := claimJob(ctx, tx, j.ID, now)
+			if err != nil || !ok {
+				q.drop(j.ID)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			taken[key] = true
+			c.job.Status, c.job.Result, c.job.UpdatedAt = StatusRunning, nil, now
+			claimed = append(claimed, c)
+		}
+		return nil
+	})
+	if err != nil {
+		for _, c := range claimed {
+			q.drop(c.job.ID)
+		}
+		return err
+	}
+	for _, c := range claimed {
+		go q.work(d, c)
+	}
+	return nil
+}
+
+// reserve takes a worker for j when the queue has a handler for its type
+// and fewer than MaxRunning attempts run; full reports that it has not and
+// will not before an attempt ends. Reserving under the queue's lock keeps
+// the limit across passes that run at the same time.
+func (q *Queue) reserve(base context.Context, j Job) (c claim, full bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stopping || len(q.running) >= MaxRunning {
+		return claim{}, true
+	}
+	h, ok := q.handlers[j.Type]
+	if _, runs := q.running[j.ID]; !ok || runs {
+		return claim{}, false
+	}
+	ctx, cancel := context.WithCancel(base)
+	w := &worker{cancel: cancel, done: make(chan struct{})}
+	if q.running == nil {
+		q.running = map[string]*worker{}
+	}
+	q.running[j.ID] = w
+	q.workers.Add(1)
+	return claim{job: j, handler: h, ctx: ctx, worker: w}, false
+}
+
+// drop gives up the worker of the job id: its claim did not commit, or its
+// attempt has ended. The dispatcher is woken, since a worker is free.
+func (q *Queue) drop(id string) {
+	q.mu.Lock()
+	w, ok := q.running[id]
+	if ok {
+		delete(q.running, id)
+	}
+	q.mu.Unlock()
+	if !ok {
+		return
+	}
+	w.cancel()
+	close(w.done)
+	q.workers.Done()
+	q.poke()
+}
+
+// work runs the attempt of c and settles its outcome.
+func (q *Queue) work(d Deps, c claim) {
+	defer q.drop(c.job.ID)
+	err := c.handler.Run(c.ctx, c.job)
+	q.settle(context.WithoutCancel(c.ctx), d, c.job, err)
+}
+
+// settle records the outcome of an attempt of j. A completed attempt sets
+// the job completed in a transaction of its own; it is recorded only while
+// the job is still running.
+func (q *Queue) settle(ctx context.Context, d Deps, j Job, runErr error) {
+	if runErr != nil {
+		d.Logger.Error("job attempt failed", "job_id", j.ID, "error", runErr)
+		return
+	}
+	err := d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		now := d.Clock.Now().UTC().UnixNano()
+		_, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, completed_at = ?, updated_at = ?, error = NULL,
+	detail = NULL, next_attempt_at = NULL WHERE id = ? AND status = ?`, StatusCompleted, now, now, j.ID, StatusRunning)
+		return err
+	})
+	if err != nil {
+		d.Logger.Error("settle job", "job_id", j.ID, "error", err)
+	}
+}
+
+// Run is the dispatcher: it passes at once, then every Interval and
+// whenever it is woken, until ctx is cancelled.
+func (q *Queue) Run(ctx context.Context) {
+	d, err := q.deps()
+	if err != nil {
+		return
+	}
+	q.mu.Lock()
+	wake := q.wake
+	q.mu.Unlock()
+	for {
+		if err := q.Pass(ctx); err != nil && ctx.Err() == nil {
+			d.Logger.Error("job dispatcher pass", "error", err)
+		}
+		t := d.Clock.NewTimer(d.Interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C():
+		case <-wake:
+			t.Stop()
+		}
+	}
+}
+
+// inTypes is the SQL condition and arguments of a job of one of types.
+func inTypes(types []string) (string, []any) {
+	args := make([]any, len(types))
+	for i, t := range types {
+		args[i] = t
+	}
+	return `type IN (?` + strings.Repeat(`, ?`, len(types)-1) + `)`, args
+}
+
+// hasWork reports whether a pass has something to do at now: a failed job
+// whose next attempt is due, or a queued job of one of types.
+func hasWork(ctx context.Context, q querier, now time.Time, types []string) (bool, error) {
+	query := `SELECT EXISTS (SELECT 1 FROM jobs WHERE status = ? AND next_attempt_at <= ?)`
+	args := []any{StatusFailed, now.UnixNano()}
+	if len(types) > 0 {
+		cond, targs := inTypes(types)
+		query += ` OR EXISTS (SELECT 1 FROM jobs WHERE status = ? AND ` + cond + `)`
+		args = append(append(args, StatusQueued), targs...)
+	}
+	var work bool
+	if err := q.QueryRowContext(ctx, query, args...).Scan(&work); err != nil {
+		return false, fmt.Errorf("look for due jobs: %w", err)
+	}
+	return work, nil
+}
+
+// requeueDue returns, in tx, every failed job whose next attempt is due at
+// now to queued, keeping its retry count and error.
+func requeueDue(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, next_attempt_at = NULL, updated_at = ?
+WHERE status = ? AND next_attempt_at <= ?`, StatusQueued, now.UnixNano(), StatusFailed, now.UnixNano())
+	if err != nil {
+		return fmt.Errorf("requeue due jobs: %w", err)
+	}
+	return nil
+}
+
+// queuedJobs reads, in tx, the queued jobs of types whose type and
+// workspace have no running job, in claim order: created_at as a record
+// shows it, ascending, then id ascending.
+func queuedJobs(ctx context.Context, tx *sql.Tx, types []string) ([]Job, error) {
+	cond, args := inTypes(types)
+	rows, err := tx.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE status = ? AND `+cond+`
+	AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.type = jobs.type AND r.workspace_slug = jobs.workspace_slug AND r.status = ?)
+	ORDER BY `+secondsOf+`, id`, append(append([]any{StatusQueued}, args...), StatusRunning)...)
+	if err != nil {
+		return nil, fmt.Errorf("read queued jobs: %w", err)
+	}
+	defer rows.Close()
+	var jobs []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("read queued jobs: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read queued jobs: %w", err)
+	}
+	return jobs, nil
+}
+
+// claimJob sets the queued job id running in tx, emptying its result; it
+// reports false when the job was no longer queued, a claim lost.
+func claimJob(ctx context.Context, tx *sql.Tx, id string, now time.Time) (bool, error) {
+	res, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, result = NULL, updated_at = ? WHERE id = ? AND status = ?`,
+		StatusRunning, now.UnixNano(), id, StatusQueued)
+	if err != nil {
+		return false, fmt.Errorf("claim job %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim job %s: %w", id, err)
+	}
+	return n == 1, nil
 }

@@ -147,7 +147,22 @@ func newTestQueue(t testing.TB) *testQueue {
 	t.Helper()
 	st := openStore(t, t.TempDir())
 	clock := newFakeClock(clockStart)
-	return &testQueue{Queue: New(Deps{Store: st, Clock: clock, NoWake: true}), st: st, clock: clock}
+	q := &testQueue{Queue: New(Deps{Store: st, Clock: clock, NoWake: true}), st: st, clock: clock}
+	// Before the store closes: end the attempts a test left blocked.
+	t.Cleanup(func() { q.cancelAll(t) })
+	return q
+}
+
+// cancelAll cancels every attempt the queue runs and waits until each has
+// ended.
+func (q *Queue) cancelAll(t testing.TB) {
+	t.Helper()
+	q.mu.Lock()
+	for _, w := range q.running {
+		w.cancel()
+	}
+	q.mu.Unlock()
+	q.settleAll(t)
 }
 
 // enqueue queues a job of typ for slug in a transaction of its own.
@@ -193,4 +208,194 @@ func (q *testQueue) count(t testing.TB, slug string) int {
 		t.Fatalf("count jobs of %s: %v", slug, err)
 	}
 	return n
+}
+
+// scriptedHandler is a Handler that records every attempt it is given. A
+// blocking handler holds each attempt until the test releases it with the
+// error the attempt returns; one that does not block returns nil at once.
+type scriptedHandler struct {
+	block bool
+	// entered receives every job an attempt is given, as it begins.
+	entered chan Job
+
+	mu              sync.Mutex
+	calls           []string
+	jobs            []Job
+	active, maxSeen int
+	release         map[string]chan error
+}
+
+// newScriptedHandler returns a handler that blocks every attempt when block
+// is set.
+func newScriptedHandler(block bool) *scriptedHandler {
+	return &scriptedHandler{block: block, entered: make(chan Job, 256), release: map[string]chan error{}}
+}
+
+// releaseOf is the channel the attempt of id waits on.
+func (h *scriptedHandler) releaseOf(id string) chan error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c, ok := h.release[id]
+	if !ok {
+		c = make(chan error, 1)
+		h.release[id] = c
+	}
+	return c
+}
+
+// Run records the attempt and, when the handler blocks, waits for its
+// release or for ctx.
+func (h *scriptedHandler) Run(ctx context.Context, j Job) error {
+	h.mu.Lock()
+	h.calls = append(h.calls, j.ID)
+	h.jobs = append(h.jobs, j)
+	h.active++
+	h.maxSeen = max(h.maxSeen, h.active)
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		h.active--
+		h.mu.Unlock()
+	}()
+	h.entered <- j
+	if !h.block {
+		return nil
+	}
+	select {
+	case err := <-h.releaseOf(j.ID):
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Settled accepts every settlement.
+func (h *scriptedHandler) Settled(context.Context, *sql.Tx, Job, bool) error { return nil }
+
+// Calls are the ids of the jobs the attempts were given, in call order.
+func (h *scriptedHandler) Calls() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.calls...)
+}
+
+// Jobs are the jobs the attempts were given, in call order.
+func (h *scriptedHandler) Jobs() []Job {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]Job(nil), h.jobs...)
+}
+
+// MaxActive is the most attempts that were running at once.
+func (h *scriptedHandler) MaxActive() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.maxSeen
+}
+
+// Enter waits for the next attempt to begin and returns its job; it fails
+// the test after 5 s.
+func (h *scriptedHandler) Enter(t testing.TB) Job {
+	t.Helper()
+	select {
+	case j := <-h.entered:
+		return j
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no attempt began within 5 s")
+		return Job{}
+	}
+}
+
+// Idle reports that no attempt began that the test has not taken with
+// Enter.
+func (h *scriptedHandler) Idle(t testing.TB) {
+	t.Helper()
+	select {
+	case j := <-h.entered:
+		t.Fatalf("an attempt of job %s began, want none", j.ID)
+	default:
+	}
+}
+
+// pass runs one dispatcher pass and fails the test on its error.
+func (q *testQueue) pass(t testing.TB) {
+	t.Helper()
+	if err := q.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+}
+
+// doneOf is the channel that is closed once the running attempt of id has
+// ended and its outcome is settled; nil when the queue runs no attempt of
+// id.
+func (q *Queue) doneOf(id string) <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if w, ok := q.running[id]; ok {
+		return w.done
+	}
+	return nil
+}
+
+// finish releases the blocked attempt of id with err and waits until the
+// queue has settled it; it fails the test after 5 s.
+func (q *testQueue) finish(t testing.TB, h *scriptedHandler, id string, err error) {
+	t.Helper()
+	done := q.doneOf(id)
+	if done == nil {
+		t.Fatalf("the queue runs no attempt of job %s", id)
+	}
+	h.releaseOf(id) <- err
+	waitClosed(t, done, "the settlement of job "+id)
+}
+
+// settleAll waits until every attempt the queue runs now has ended and is
+// settled; it fails the test after 5 s.
+func (q *Queue) settleAll(t testing.TB) {
+	t.Helper()
+	q.mu.Lock()
+	var dones []chan struct{}
+	for _, w := range q.running {
+		dones = append(dones, w.done)
+	}
+	q.mu.Unlock()
+	for _, d := range dones {
+		waitClosed(t, d, "a settlement")
+	}
+}
+
+// waitClosed waits for c to be closed; it fails the test after 5 s.
+func waitClosed(t testing.TB, c <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-c:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not happen within 5 s", what)
+	}
+}
+
+// status is the status of the job id as committed.
+func (q *testQueue) status(t testing.TB, id string) string {
+	t.Helper()
+	j, err := q.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Get %s: %v", id, err)
+	}
+	return j.Status
+}
+
+// fail leaves the job id failed after its attempt number retries, with
+// errText and its next attempt at next, as a failed attempt's settlement
+// does.
+func (q *testQueue) fail(t testing.TB, id string, retries int, errText string, next time.Time) {
+	t.Helper()
+	err := q.st.Tx(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(),
+			`UPDATE jobs SET status = ?, retry_count = ?, error = ?, next_attempt_at = ? WHERE id = ?`,
+			StatusFailed, retries, errText, next.UnixNano(), id)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("fail job %s: %v", id, err)
+	}
 }
