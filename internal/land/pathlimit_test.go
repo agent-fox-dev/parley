@@ -63,11 +63,19 @@ func TestCheckPaths_AllowsAVersionOnlyWhenEveryFileItChangesMatchesAGlob(t *test
 		{name: "a deleted file", globs: []string{"docs/**"}, refused: "lib/z",
 			entries: map[string]treeEntry{"lib/z": {}}},
 		{name: "a file beyond the paths a change stores", globs: []string{"docs/**"}, refused: "zz/last", entries: many},
+		// A credential without paths, which the hub's own writes carry
+		// too, is held to nothing: neither a repository nor a version is
+		// there to read.
+		{name: "a credential without paths"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			head := commitEntries(t, dir, "v"+strconv.Itoa(i), base, "", c.name, c.entries)
+			var r *gitrepo.Repo
+			head := "0123456789abcdef0123456789abcdef01234567"
+			if c.globs != nil {
+				r, head = repo, commitEntries(t, dir, "v"+strconv.Itoa(i), base, "", c.name, c.entries)
+			}
 
-			refused, err := land.CheckPaths(context.Background(), repo, c.globs, base, head)
+			refused, err := land.CheckPaths(context.Background(), r, c.globs, base, head)
 
 			if err != nil || refused != c.refused {
 				t.Errorf("CheckPaths(%q) = %q, %v; want %q", c.globs, refused, err, c.refused)
@@ -86,18 +94,6 @@ func TestCheckPaths_ReturnsAnErrorWhenGitFails(t *testing.T) {
 
 	if err == nil || refused != "" {
 		t.Errorf("CheckPaths of a missing head = %q, %v; want an error and no path", refused, err)
-	}
-}
-
-// A credential without paths, which the hub's own writes carry too, is
-// held to nothing, and the repository is not read for it.
-func TestCheckPaths_AllowsEveryVersionOfACredentialWithoutPaths(t *testing.T) {
-	t.Parallel()
-
-	refused, err := land.CheckPaths(context.Background(), nil, nil, "", "0123456789abcdef0123456789abcdef01234567")
-
-	if err != nil || refused != "" {
-		t.Errorf("CheckPaths without globs = %q, %v; want allowed", refused, err)
 	}
 }
 
@@ -151,13 +147,9 @@ func TestPathLimits_LeaveACredentialWithoutPathsAndTheHubsOwnVersionsUnchecked(t
 			t.Fatalf("land of %s = %d %v, want 200", lower.Ref, status, a)
 		}
 
-		deadline := time.Now().Add(30 * time.Second)
-		for w.readChange(t, upper.Number).Version == upper.Version {
-			if time.Now().After(deadline) {
-				t.Fatalf("%s was not restacked after %s landed", upper.Ref, lower.Ref)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
+		until(t, upper.Ref+" is restacked after "+lower.Ref+" landed", func() bool {
+			return w.readChange(t, upper.Number).Version != upper.Version
+		})
 		versions, err := w.changes.ReadVersions(context.Background(), nil, "api", upper.Number)
 		if err != nil {
 			t.Fatal(err)

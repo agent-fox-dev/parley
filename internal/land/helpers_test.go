@@ -959,3 +959,20 @@ func (w *world) patchChange(t *testing.T, credential string, number int64, body 
 	}
 	return status, out
 }
+
+// until waits until cond holds, at most 30 s.
+func until(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	within(t, 30*time.Second, what, cond)
+}
+
+// within waits until cond holds, at most d.
+func within(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(d); !cond(); {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within %v", what, d)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

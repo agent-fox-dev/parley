@@ -285,10 +285,14 @@ func (l *AutoLander) wait(ctx context.Context) time.Duration {
 // procedure for the change of each parley.change.ready among them, and
 // stores the position the read reached. The position of an event whose
 // procedure wrote something is stored with what it wrote, or, for a start,
-// right after it, so that an event starts at most one land. A position
-// whose events have left the log unread is moved to where the log now
-// begins, and every open change whose flag is on is looked at, since the
-// lost events may have been about any of them.
+// right after it, so that an event starts at most one land. An event whose
+// procedure failed is passed once its start is made due again (consider),
+// since the change is announced once per landable head and would not be
+// again; when not even that could be stored, the pass stops before the
+// event, to read it again. A position whose events have left the log
+// unread is moved to where the log now begins, and every open change whose
+// flag is on is looked at, since the lost events may have been about any
+// of them.
 func (l *AutoLander) Pass(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -301,7 +305,7 @@ func (l *AutoLander) Pass(ctx context.Context) error {
 		var expired *event.PositionExpiredError
 		if errors.As(err, &expired) {
 			pos = expired.OldestSeq - 1
-			if err := l.storePosition(ctx, l.deps.Store.Main(), pos); err != nil {
+			if err := l.storePositionTx(ctx, pos); err != nil {
 				return err
 			}
 			if err := l.scan(ctx); err != nil {
@@ -320,10 +324,12 @@ func (l *AutoLander) Pass(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
-			l.consider(ctx, *rec.Workspace, number, rec.Seq, false)
+			if err := l.consider(ctx, *rec.Workspace, number, rec.Seq, false); err != nil {
+				return errors.Join(err, l.storePositionTx(ctx, rec.Seq-1))
+			}
 		}
 		if examined > pos {
-			if err := l.storePosition(ctx, l.deps.Store.Main(), examined); err != nil {
+			if err := l.storePositionTx(ctx, examined); err != nil {
 				return err
 			}
 			pos = examined
@@ -365,14 +371,19 @@ WHERE due_at IS NOT NULL AND due_at <= ? ORDER BY due_at, workspace_slug, number
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	var errs []error
 	for _, k := range due {
-		if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land SET due_at = NULL
-WHERE workspace_slug = ? AND number = ? AND due_at <= ?`, k.WorkspaceSlug, k.Number, now); err != nil {
+		err := l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE land_auto_land SET due_at = NULL
+WHERE workspace_slug = ? AND number = ? AND due_at <= ?`, k.WorkspaceSlug, k.Number, now)
+			return err
+		})
+		if err != nil {
 			return fmt.Errorf("clear the due time of %s: %w", change.Ref(k.WorkspaceSlug, k.Number), err)
 		}
-		l.consider(ctx, k.WorkspaceSlug, k.Number, 0, true)
+		errs = append(errs, l.consider(ctx, k.WorkspaceSlug, k.Number, 0, true))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // scan runs the start procedure for every open change whose flag is on.
@@ -381,20 +392,58 @@ func (l *AutoLander) scan(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, k := range keys {
-		l.consider(ctx, k.WorkspaceSlug, k.Number, 0, false)
+		errs = append(errs, l.consider(ctx, k.WorkspaceSlug, k.Number, 0, false))
+	}
+	return errors.Join(errs...)
+}
+
+// consider runs the start procedure for the change number of the
+// workspace, for the event at seq (0 for none) or a start that came due.
+// When the procedure fails, or the land component refuses the start for a
+// reason that may pass, such as a busy workspace, the start is made due
+// again an Interval later (retrySoon) and what failed is logged: one
+// change the lander cannot judge holds up no other, and the announcement
+// it ran for, made once per landable head, is not lost. The error returned
+// is that the start could not even be made due again.
+func (l *AutoLander) consider(ctx context.Context, workspace string, number int64, seq int64, due bool) error {
+	err := l.startProcedure(ctx, workspace, number, seq, due)
+	if err == nil || ctx.Err() != nil {
+		return nil
+	}
+	ref := change.Ref(workspace, number)
+	if refusal := (*server.Error)(nil); errors.As(err, &refusal) {
+		l.deps.Logger.Debug("automatic land: not started, tried again later", "change", ref, "reason", refusal.Message())
+	} else {
+		l.deps.Logger.Warn("automatic land: the start procedure failed, tried again later", "change", ref, "error", err)
+	}
+	if err := l.retrySoon(ctx, workspace, number); err != nil {
+		return fmt.Errorf("make the start of %s due again: %w", ref, err)
 	}
 	return nil
 }
 
-// consider runs the start procedure for the change number of the
-// workspace, for the event at seq (0 for none) or a start that came due,
-// and logs what fails: one change the lander cannot judge holds up no
-// other.
-func (l *AutoLander) consider(ctx context.Context, workspace string, number int64, seq int64, due bool) {
-	if err := l.startProcedure(ctx, workspace, number, seq, due); err != nil && ctx.Err() == nil {
-		l.deps.Logger.Warn("automatic land: the start procedure failed", "change", change.Ref(workspace, number), "error", err)
-	}
+// retrySoon makes the start of the change number of the workspace due an
+// Interval from now, unless one is due sooner, while the change is open
+// with its flag on. It is no retry of a failed attempt: the count of those
+// stays as it is.
+func (l *AutoLander) retrySoon(ctx context.Context, workspace string, number int64) error {
+	return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		ch, err := l.deps.Changes.ReadChange(ctx, tx, workspace, number)
+		switch {
+		case errors.Is(err, change.ErrChangeNotFound):
+			return forgetAutoLand(ctx, tx, workspace, number)
+		case err != nil:
+			return err
+		case ch.State != change.StateOpen || !ch.AutoLand:
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO land_auto_land (workspace_slug, number, retries, due_at) VALUES (?, ?, 0, ?)
+ON CONFLICT (workspace_slug, number) DO UPDATE SET due_at = COALESCE(MIN(due_at, excluded.due_at), excluded.due_at)`,
+			workspace, number, l.now().Add(l.deps.Interval).UnixNano())
+		return err
+	})
 }
 
 // startProcedure starts the automatic land of the change number of the
@@ -420,7 +469,9 @@ func (l *AutoLander) consider(ctx context.Context, workspace string, number int6
 // seq, when not 0, is the position of the event the procedure runs for,
 // stored with what the procedure writes. Once a land is started, a start
 // of the change due by then is cleared: it is the one just made; and so
-// is the change below that held it back.
+// is the change below that held it back. The land component's refusal of
+// the start is returned, for consider to make the start due again, unless
+// it is land_in_progress: the running attempt's end decides what follows.
 func (l *AutoLander) startProcedure(ctx context.Context, workspace string, number int64, seq int64, due bool) error {
 	ch, err := l.deps.Changes.ReadChange(ctx, nil, workspace, number)
 	if errors.Is(err, change.ErrChangeNotFound) {
@@ -471,34 +522,42 @@ func (l *AutoLander) startProcedure(ctx context.Context, workspace string, numbe
 	})
 	var refusal *server.Error
 	switch {
-	case errors.As(err, &refusal):
-		// A precondition of the land stopped holding since the change was
-		// read, such as another attempt or a new version, which a later
-		// announcement starts from.
+	case errors.As(err, &refusal) && refusal.Type() == "land_in_progress":
+		// An attempt started since the change was read: its end decides
+		// what follows.
 		l.deps.Logger.Debug("automatic land: not started", "change", ch.Ref, "reason", refusal.Message())
 	case err != nil:
+		// Any other refusal, such as a busy workspace, may pass: consider
+		// makes the start due again.
 		return err
-	default:
-		// The retry the attempt's end may have made due is later than now,
-		// and no change below holds the change back any longer.
-		if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land
+	}
+	return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if err == nil {
+			// The retry the attempt's end may have made due is later than
+			// now, and no change below holds the change back any longer.
+			if _, err := tx.ExecContext(ctx, `UPDATE land_auto_land
 SET due_at = CASE WHEN due_at <= ? THEN NULL ELSE due_at END, held_by = NULL
 WHERE workspace_slug = ? AND number = ?`, now, workspace, number); err != nil {
-			return fmt.Errorf("clear the due start of %s: %w", ch.Ref, err)
+				return fmt.Errorf("clear the due start of %s: %w", ch.Ref, err)
+			}
 		}
-	}
-	if seq == 0 {
-		return nil
-	}
-	return l.storePosition(ctx, l.deps.Store.Main(), seq)
+		if seq == 0 {
+			return nil
+		}
+		return l.storePosition(ctx, tx, seq)
+	})
 }
 
 // dropRetry drops the start of the change number of the workspace that
 // came due while it was not to be landed, and counts its retries from
 // zero again: the change is landed again from its next announcement.
 func (l *AutoLander) dropRetry(ctx context.Context, workspace string, number int64) error {
-	if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land SET retries = 0, due_at = NULL
-WHERE workspace_slug = ? AND number = ?`, workspace, number); err != nil {
+	err := l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE land_auto_land SET retries = 0, due_at = NULL
+WHERE workspace_slug = ? AND number = ?`, workspace, number)
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("drop the retry of %s: %w", change.Ref(workspace, number), err)
 	}
 	return nil
@@ -695,16 +754,20 @@ func (l *AutoLander) Finished(ctx context.Context, f Final) {
 }
 
 // settle follows up the end, with the status result, of an automatic
-// land of the change number of the workspace, in one transaction. An end
-// that is not failed counts the retries from zero again and makes no
-// start due: a conflict or a block waits for the change to be announced
-// landable again, and the flag stays as it is. A failed end of a change
+// land of the change number of the workspace, in one transaction. A
+// landed change is forgotten: its flag no longer matters. Any other end
+// that is not failed counts the retries from zero again and makes no start
+// due: a conflict or a block waits for the change to be announced landable
+// again, and the flag stays as it is. A failed end of a change
 // whose flag is still on makes its next retry due, the count one more,
 // after a delay that doubles with each retry already made (retryDelay);
 // once autoLandRetries were made the flag is cleared instead, and the
 // change keeps its state.
 func (l *AutoLander) settle(ctx context.Context, workspace string, number int64, result string) error {
 	return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if result == StatusLanded {
+			return forgetAutoLand(ctx, tx, workspace, number)
+		}
 		if result != StatusFailed {
 			_, err := tx.ExecContext(ctx, `UPDATE land_auto_land SET retries = 0, due_at = NULL
 WHERE workspace_slug = ? AND number = ?`, workspace, number)
@@ -819,26 +882,32 @@ func (l *AutoLander) position(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := l.deps.Store.Main().ExecContext(ctx, `INSERT INTO land_auto_land_position (id, seq) VALUES (1, ?)
-ON CONFLICT (id) DO NOTHING`, b.LastSeq); err != nil {
+	err = l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO land_auto_land_position (id, seq) VALUES (1, ?)
+ON CONFLICT (id) DO NOTHING`, b.LastSeq)
+		return err
+	})
+	if err != nil {
 		return 0, fmt.Errorf("store the automatic lander's position: %w", err)
 	}
 	return b.LastSeq, nil
 }
 
-// execer is a store connection or a transaction.
-type execer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
-// storePosition stores seq as the lander's position through q, unless the
+// storePosition stores seq as the lander's position in tx, unless the
 // position stored is past it already.
-func (l *AutoLander) storePosition(ctx context.Context, q execer, seq int64) error {
-	if _, err := q.ExecContext(ctx, `INSERT INTO land_auto_land_position (id, seq) VALUES (1, ?)
+func (l *AutoLander) storePosition(ctx context.Context, tx *sql.Tx, seq int64) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO land_auto_land_position (id, seq) VALUES (1, ?)
 ON CONFLICT (id) DO UPDATE SET seq = excluded.seq WHERE excluded.seq > seq`, seq); err != nil {
 		return fmt.Errorf("store the automatic lander's position: %w", err)
 	}
 	return nil
+}
+
+// storePositionTx is storePosition in a store transaction of its own: the
+// store writes one transaction at a time, and a write outside one would
+// not wait its turn.
+func (l *AutoLander) storePositionTx(ctx context.Context, seq int64) error {
+	return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return l.storePosition(ctx, tx, seq) })
 }
 
 // now is the lander's clock, in UTC.

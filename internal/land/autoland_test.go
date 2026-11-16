@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // autoLand makes the world's automatic lander follow the event log every
@@ -82,23 +84,6 @@ func (w *world) landFails(t *testing.T, number int64) []event.Record {
 		}
 	}
 	return out
-}
-
-// until waits until cond holds, at most 30 s.
-func until(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	within(t, 30*time.Second, what, cond)
-}
-
-// within waits until cond holds, at most d.
-func within(t *testing.T, d time.Duration, what string, cond func() bool) {
-	t.Helper()
-	for deadline := time.Now().Add(d); !cond(); {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within %v", what, d)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }
 
 // openWith opens, through the change component, a change of api by the
@@ -622,15 +607,19 @@ func numberOf(t *testing.T, raw []byte) int64 {
 // which tells the lander it is bound to of each end, as the land
 // component tells its final observers. It keeps what it was asked to
 // start and the change's auto_land as each start found it, and answers
-// that no attempt is running.
+// that no attempt is running. While busy is true it refuses every start
+// 409 workspace_busy, as the land component refuses one while the
+// workspace is busy, and counts the refusals.
 type endingLands struct {
 	ends []string
+	busy atomic.Bool
 
 	mu      sync.Mutex
 	lander  *land.AutoLander
 	changes land.AutoLandChanges
 	starts  []land.StartInput
 	flags   []bool
+	refused int
 }
 
 // bind makes s tell lander of the ends of its attempts and read the
@@ -643,6 +632,11 @@ func (s *endingLands) bind(lander *land.AutoLander, changes land.AutoLandChanges
 
 func (s *endingLands) Start(ctx context.Context, in land.StartInput) (land.Attempt, error) {
 	s.mu.Lock()
+	if s.busy.Load() {
+		s.refused++
+		s.mu.Unlock()
+		return land.Attempt{}, server.NewError("workspace_busy", http.StatusConflict, in.Workspace+" is busy")
+	}
 	status := s.ends[min(len(s.starts), len(s.ends)-1)]
 	s.starts = append(s.starts, in)
 	n, lander, changes := len(s.starts), s.lander, s.changes
@@ -889,7 +883,9 @@ func TestAutoLand_DropsADueRetryOfAChangeThatIsNotToBeLandedNow(t *testing.T) {
 				}
 			}},
 		{name: "mergeable turned conflict",
-			drop:  func(t *testing.T, w *world, ch change.Change) { w.turnMergeable(t, ch.Number, change.MergeableConflict) },
+			drop: func(t *testing.T, w *world, ch change.Change) {
+				w.turnMergeable(t, ch.Number, change.MergeableConflict)
+			},
 			again: func(t *testing.T, w *world, ch change.Change) { w.turnMergeable(t, ch.Number, change.MergeableClean) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -940,6 +936,58 @@ func TestAutoLand_StartsTheRetriesAgainAfterAnAttemptThatDidNotFail(t *testing.T
 	}
 
 	retryAfter(t, clk, lands, 2*time.Second)
+}
+
+func TestAutoLand_StartsALandTheWorkspaceRefusedAgainAnIntervalLater(t *testing.T) {
+	t.Parallel()
+	clk, lands := newClock(), &endingLands{ends: []string{land.StatusFailed}}
+	w := retryWorld(t, func() *clock { return clk }, lands)
+	lands.busy.Store(true)
+	ch := w.openWith(t, "busy", map[string]string{"busy.txt": "x\n"}, true, w.caller())
+	w.mergeable(t, ch.Number, change.MergeableClean)
+	until(t, ch.Ref+" is announced landable", func() bool { return w.readyCount(t, ch.Number) > 0 })
+	clk.advance(time.Second)
+	clk.waitAsked(t)
+	lands.mu.Lock()
+	refused := lands.refused
+	lands.mu.Unlock()
+	if refused == 0 || lands.started() != 0 {
+		t.Fatalf("the busy workspace refused %d starts and %d lands started, want a refusal and none started", refused, lands.started())
+	}
+
+	lands.busy.Store(false)
+	clk.advance(time.Second)
+	clk.waitAsked(t)
+
+	if n := lands.started(); n != 1 {
+		t.Fatalf("the lander started %d lands an interval after the refusal, want 1", n)
+	}
+	// The refusal is no failed attempt: the retry of the one that failed
+	// is the first, 2 s after it.
+	retryAfter(t, clk, lands, 2*time.Second)
+}
+
+// landerRows counts the rows the automatic lander keeps of the change
+// number of api.
+func (w *world) landerRows(t *testing.T, number int64) (n int) {
+	t.Helper()
+	if err := w.Store.Main().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM land_auto_land WHERE workspace_slug = 'api' AND number = ?`, number).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestAutoLand_ForgetsAChangeOnceItsAutomaticLandLanded(t *testing.T) {
+	t.Parallel()
+	clk, lands := newClock(), &endingLands{ends: []string{land.StatusLanded}}
+	w := retryWorld(t, func() *clock { return clk }, lands)
+
+	ch := firstLand(t, w, clk, lands, "forgotten")
+
+	if n := w.landerRows(t, ch.Number); n != 0 {
+		t.Errorf("the automatic lander keeps %d rows of %s once its land landed, want none", n, ch.Ref)
+	}
 }
 
 func TestAutoLand_MakesAPendingRetryAfterARestartWithItsStoredCount(t *testing.T) {

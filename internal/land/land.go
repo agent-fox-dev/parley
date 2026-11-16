@@ -204,6 +204,9 @@ type seams struct {
 	beforeSwap    func(ctx context.Context, id string, try int)
 	fault         func(point string) error
 	sourceChecked func()
+	// revertBranched runs once a revert's checks passed and its branch
+	// was created, before the reverting change is opened.
+	revertBranched func()
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

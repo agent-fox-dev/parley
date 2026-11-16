@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -473,6 +474,74 @@ func TestRevert_ReportsTheNewestLiveRevertAsRevertedBy(t *testing.T) {
 	k := w.reverted(t, orig.Number, nil)
 	if by := w.revertedBy(t, orig.Number); by != float64(k) {
 		t.Errorf("reverted_by after the second revert = %v, want %d", by, k)
+	}
+}
+
+func TestRevert_OpensOneRevertOfAChangeRevertedTwiceAtOnce(t *testing.T) {
+	t.Parallel()
+	w := newRevertWorld(t)
+	orig, _ := w.landed(t, "twice", "Add twice", map[string]string{"twice.txt": "t\n"})
+	changes, seq := w.changeCount(t), w.lastSeq(t)
+	// The first revert is held once its checks passed and its branch
+	// exists, until the second one has been answered.
+	reached, release := make(chan struct{}), make(chan struct{})
+	var held atomic.Bool
+	land.SetSeams(w.land, land.Seams{RevertBranched: func() {
+		if held.CompareAndSwap(false, true) {
+			close(reached)
+			<-release
+		}
+	}})
+	type answer struct {
+		status int
+		body   map[string]any
+	}
+	first := make(chan answer, 1)
+	go func() {
+		status, raw := w.Call(t, http.MethodPost, fmt.Sprintf("/api/v1/workspaces/api/changes/%d/revert", orig.Number), w.ownerKey, nil)
+		body := map[string]any{}
+		_ = json.Unmarshal(raw, &body)
+		first <- answer{status, body}
+	}()
+	select {
+	case <-reached:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first revert did not create its branch within 30 s")
+	}
+
+	status, second := w.revertCall(t, w.ownerKey, orig.Number, nil)
+	close(release)
+	var held1 answer
+	select {
+	case held1 = <-first:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first revert was not answered within 30 s")
+	}
+
+	if status != http.StatusCreated {
+		t.Fatalf("the second revert = %d %v, want 201", status, second)
+	}
+	m := second["number"].(float64)
+	errObj, _ := held1.body["error"].(map[string]any)
+	details, _ := errObj["details"].(map[string]any)
+	if held1.status != http.StatusConflict || errorType(held1.body) != "already_reverted" || details["reverted_by"] != m {
+		t.Errorf("the first revert = %d %v, want 409 already_reverted with details.reverted_by %v", held1.status, held1.body, m)
+	}
+	if n := w.changeCount(t); n != changes+1 {
+		t.Errorf("%d changes were opened, want 1", n-changes)
+	}
+	var reverts int
+	for _, e := range w.eventsAfter(t, seq) {
+		if e.Type == land.EventRevert {
+			reverts++
+		}
+	}
+	if reverts != 1 {
+		t.Errorf("%d parley.change.revert events were written, want 1", reverts)
+	}
+	branches := gitrepotest.Git(t, w.api, "for-each-ref", "--format=%(refname:short)", "refs/heads/revert/")
+	if want := second["source"].(map[string]any)["branch"]; branches != want {
+		t.Errorf("api has the revert branches %q, want only %v", branches, want)
 	}
 }
 

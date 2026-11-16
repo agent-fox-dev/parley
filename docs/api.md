@@ -4986,8 +4986,10 @@ judges its files, and it lands through `POST …/land`. Reverting a
 reverting change is allowed and, once landed, restores what the original
 landed.
 
-The checks, in this order; each refusal creates nothing (no commit, no
-branch, no change, no event):
+The checks, in this order; each refusal leaves nothing referenced: no
+branch, no change, no event (the undo commits of a refusal that comes
+after them may remain in the object store, unreferenced, until git's
+garbage collection removes them):
 
 1. the scope `changes:write` (`403` `insufficient_scope`) and read access
    to `{slug}` (`404` `not_found`); a token bound to a task fork is `403`
@@ -5007,7 +5009,10 @@ branch, no change, no event):
    `workspace_not_ready`;
 7. the change must be `landed`: `409` `change_not_landed`;
 8. a `draft`, `open` or `landed` change that reverts it already: `409`
-   `already_reverted`, with `error.details.reverted_by`;
+   `already_reverted`, with `error.details.reverted_by`; checked again
+   when the reverting change is opened, so that of two reverts asked at
+   once one is opened and the other answered so, its branch deleted
+   again;
 9. the original's target branch must still exist: `400`
    `target_not_found`;
 10. a path-scoped token: every file of the landed version, from its base

@@ -157,9 +157,7 @@ func (c *Component) revertRoute(w http.ResponseWriter, r *http.Request) error {
 		return server.NewError("change_not_landed", http.StatusConflict,
 			fmt.Sprintf("%s is %s; only a landed change is reverted", orig.Ref, orig.State))
 	case orig.RevertedBy != nil:
-		return server.NewError("already_reverted", http.StatusConflict,
-			fmt.Sprintf("%s is reverted by %s already", orig.Ref, change.Ref(slug, *orig.RevertedBy))).
-			WithDetails(map[string]any{"reverted_by": *orig.RevertedBy})
+		return alreadyReverted(orig)
 	}
 	repo, err := c.deps.Repos(ctx, slug)
 	if err != nil {
@@ -255,10 +253,12 @@ func (c *Component) undo(ctx context.Context, repo *gitrepo.Repo, orig change.Ch
 // The open is checked before the branch is created, so that a refused
 // open creates no branch, and is made after it, reading the branch again
 // in its transaction, as a write that opens a change once it moved the
-// source does. Should it fail all the same, the branch just created is
-// deleted again through the ref writer, compare-and-swap from head, so
-// that its deletion is journalled and written as a push event like its
-// creation, and the open's error is the answer.
+// source does; orig is read again in that transaction too, and a revert of
+// it opened in between is 409 already_reverted. Should the open fail, the
+// branch just created is deleted again through the ref writer,
+// compare-and-swap from head, so that its deletion is journalled and
+// written as a push event like its creation, and the open's error is the
+// answer.
 func (c *Component) openRevert(ctx context.Context, r *http.Request, repo *gitrepo.Repo, ws Workspace, caller change.Caller,
 	orig change.Change, req revertRequest, head string) (change.Change, error) {
 	in := change.OpenInput{
@@ -287,8 +287,21 @@ func (c *Component) openRevert(ctx context.Context, r *http.Request, repo *gitre
 		return change.Change{}, err
 	}
 	in.SourceBranch, in.AfterMove = ref[len("refs/heads/"):], true
+	if c.seams.revertBranched != nil {
+		c.seams.revertBranched()
+	}
 	var ch change.Change
 	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		// A revert of orig opened since it was read is seen here, in the
+		// one write transaction at a time, so that two reverts asked at
+		// once open one reverting change, not two.
+		now, err := c.deps.Changes.ReadChange(ctx, tx, ws.Slug, orig.Number)
+		if err != nil {
+			return err
+		}
+		if now.RevertedBy != nil {
+			return alreadyReverted(now)
+		}
 		if ch, err = c.deps.Changes.Open(ctx, tx, in); err != nil {
 			return err
 		}
@@ -305,6 +318,14 @@ func (c *Component) openRevert(ctx context.Context, r *http.Request, repo *gitre
 		return change.Change{}, err
 	}
 	return ch, nil
+}
+
+// alreadyReverted is the refusal of a revert of orig, which a draft, open
+// or landed change reverts already: 409 already_reverted naming it.
+func alreadyReverted(orig change.Change) error {
+	return server.NewError("already_reverted", http.StatusConflict,
+		fmt.Sprintf("%s is reverted by %s already", orig.Ref, change.Ref(orig.WorkspaceSlug, *orig.RevertedBy))).
+		WithDetails(map[string]any{"reverted_by": *orig.RevertedBy})
 }
 
 // createRevertBranch creates, in repo, the branch revert/<number>, or the
