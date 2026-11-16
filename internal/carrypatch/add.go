@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 	"uuid"
 
@@ -47,71 +48,94 @@ type addRequest struct {
 // object or, for a batch, an array of them; anything else is 400
 // invalid_request. The body is validated before the guard and before any
 // lookup, so that an invalid body is answered as such on any workspace and
-// changes nothing; the patch list is then checked before the branch is
-// resolved, so that neither patch_exists nor the existing patch of
-// if_not_exists creates a ref.
+// changes nothing. A single add answers 201 with the patch; a batch answers
+// 201 with the one member items, its patches in request order.
 func (c *Component) addRoute(w http.ResponseWriter, r *http.Request) error {
 	raw, err := decodeAddBody(r)
 	if err != nil {
 		return err
 	}
-	if raw[0] == '[' {
-		return c.addBatch(w, r, raw)
+	integration := sync.OnceValues(func() (string, error) { return c.integrationBranchOf(r) })
+	batch := raw[0] == '['
+	var reqs []addRequest
+	if batch {
+		reqs, err = batchRequestsOf(raw, integration)
+	} else {
+		var req addRequest
+		req, err = addRequestOf(raw, integration)
+		reqs = []addRequest{req}
 	}
-	req, err := addRequestOf(raw)
 	if err != nil {
-		return err
-	}
-	if err := c.checkNotIntegration(r, req.branch, ""); err != nil {
 		return err
 	}
 	ws, err := c.Guard(r)
 	if err != nil {
 		return err
 	}
-	ctx := r.Context()
-	existing, found, err := LivePatchOfBranch(ctx, c.d.Store.Main(), ws.Slug, req.branch)
-	if err != nil {
-		return fmt.Errorf("add the patch of %s to %s: %w", req.branch, ws.Slug, err)
-	}
-	if found {
-		return answerExisting(w, existing, req)
-	}
-	// No lock is held while the branch is resolved: the store's write
-	// transaction below is what orders concurrent adds.
-	resolution, err := c.ResolveBranch(ctx, ws, req.branch, req.skipCheck)
+	created, existing, err := c.addPatches(r, ws, reqs)
 	if err != nil {
 		return err
 	}
-	actor, err := actorOf(r)
-	if err != nil {
-		return err
+	if existing != nil {
+		// A batch refuses if_not_exists, so only a single add answers
+		// with the existing patch.
+		return answerExisting(w, *existing, !batch && reqs[0].ifNotExists)
 	}
-	p, purged, err := c.insertPatch(ctx, ws.Slug, req, resolution, actor)
-	if errors.Is(err, ErrPatchExists) {
-		// A concurrent add registered the branch after the check above:
-		// the answer is the one the check would have given.
-		existing, found, rerr := LivePatchOfBranch(ctx, c.d.Store.Main(), ws.Slug, req.branch)
-		if rerr != nil || !found {
-			return errPatchExists(req.branch)
-		}
-		return answerExisting(w, existing, req)
+	if batch {
+		writeBatch(w, created)
+		return nil
 	}
-	if err != nil {
-		return err
-	}
-	if purged {
-		c.deleteBackupRef(ctx, ws.Slug, req.branch)
-	}
-	server.WriteJSON(w, http.StatusCreated, ObjectOf(p, ""))
+	server.WriteJSON(w, http.StatusCreated, ObjectOf(created[0], ""))
 	return nil
 }
 
-// addBatch answers a body that is an array of patch objects. Batches are
-// not registered by this route yet, so the array is refused as a body the
-// route does not take.
-func (c *Component) addBatch(_ http.ResponseWriter, _ *http.Request, _ json.RawMessage) error {
-	return server.InvalidRequest("request body must be one patch object")
+// addPatches registers the patches reqs, validated, of the workspace ws,
+// all or none. The patch list is checked for every branch before any branch
+// is resolved, so that a branch that is a patch already creates no ref: its
+// patch is returned as existing, and nothing is written. The branches are
+// then resolved in order; the first refusal is returned, and a branch an
+// earlier resolution created stays. No lock is held while they are
+// resolved: the store's write transaction of insertPatches is what orders
+// concurrent adds. The patches it created are returned in the order of
+// reqs, each at its final position.
+func (c *Component) addPatches(r *http.Request, ws workspace.Workspace, reqs []addRequest) (created []Patch, existing *Patch, err error) {
+	ctx := r.Context()
+	for _, req := range reqs {
+		p, found, err := LivePatchOfBranch(ctx, c.d.Store.Main(), ws.Slug, req.branch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("add the patch of %s to %s: %w", req.branch, ws.Slug, err)
+		}
+		if found {
+			return nil, &p, nil
+		}
+	}
+	resolutions := make([]string, len(reqs))
+	for i, req := range reqs {
+		if resolutions[i], err = c.ResolveBranch(ctx, ws, req.branch, req.skipCheck); err != nil {
+			return nil, nil, err
+		}
+	}
+	by, err := actorOf(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	created, purged, conflict, err := c.insertPatches(ctx, ws.Slug, reqs, resolutions, by)
+	if errors.Is(err, ErrPatchExists) {
+		// A concurrent add registered the branch after the check above:
+		// the answer is the one the check would have given.
+		p, found, rerr := LivePatchOfBranch(ctx, c.d.Store.Main(), ws.Slug, conflict)
+		if rerr != nil || !found {
+			return nil, nil, errPatchExists(conflict)
+		}
+		return nil, &p, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, branch := range purged {
+		c.deleteBackupRef(ctx, ws.Slug, branch)
+	}
+	return created, nil, nil
 }
 
 // decodeAddBody reads the body as one JSON value, which must be an object
@@ -142,9 +166,9 @@ func decodeAddBody(r *http.Request) (json.RawMessage, error) {
 // name, position a JSON integer of at least 1, upstream_pr_url and
 // description strings, skip_branch_check and if_not_exists booleans. A null
 // member is absent, and members the object does not define are ignored.
-// The integration branch is checked by checkNotIntegration, which needs
-// the workspace.
-func addRequestOf(raw json.RawMessage) (addRequest, error) {
+// branch_name must not be the workspace's integration branch, which
+// integration reads.
+func addRequestOf(raw json.RawMessage, integration func() (string, error)) (addRequest, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return addRequest{}, server.InvalidRequest("a patch must be a JSON object")
@@ -175,6 +199,13 @@ func addRequestOf(raw json.RawMessage) (addRequest, error) {
 	}
 	if req.ifNotExists, err = boolMember(members, "if_not_exists"); err != nil {
 		return addRequest{}, err
+	}
+	integ, err := integration()
+	if err != nil {
+		return addRequest{}, err
+	}
+	if req.branch == integ {
+		return addRequest{}, server.InvalidRequest(fmt.Sprintf("branch_name %q is the workspace's integration branch", req.branch))
 	}
 	return req, nil
 }
@@ -238,36 +269,35 @@ func positionMember(members map[string]json.RawMessage) (int, error) {
 	return int(n), nil
 }
 
-// checkNotIntegration refuses branch when it is the integration branch of
-// the workspace the request names, which the hub rebuilds and which can
-// never be a patch; prefix starts the message. The record is read here,
-// before the guard, because a body that names it is invalid whatever the
-// workspace's mode and state; a workspace gone since the access check is
-// left to the guard.
-func (c *Component) checkNotIntegration(r *http.Request, branch, prefix string) error {
+// integrationBranchOf is the integration branch of the workspace the
+// request names, which the hub rebuilds and which can never be a patch;
+// "" when the workspace is gone since the access check, which is left to
+// the guard. The record is read before the guard, because a body that
+// names the branch is invalid whatever the workspace's mode and state.
+func (c *Component) integrationBranchOf(r *http.Request) (string, error) {
 	d, ok := access.DecisionOf(r)
 	if !ok {
-		return server.Internal("the add found no access decision")
+		return "", server.Internal("the add found no access decision")
 	}
 	if c.d.Store == nil {
-		return errNotBound
+		return "", errNotBound
 	}
 	ws, found, err := workspace.BySlug(r.Context(), c.d.Store.Main(), d.Record.Slug)
 	if err != nil {
-		return fmt.Errorf("read the workspace %q: %w", d.Record.Slug, err)
+		return "", fmt.Errorf("read the workspace %q: %w", d.Record.Slug, err)
 	}
-	if found && branch == IntegrationBranch(ws) {
-		return server.InvalidRequest(fmt.Sprintf("%sbranch_name %q is the workspace's integration branch", prefix, branch))
+	if !found {
+		return "", nil
 	}
-	return nil
+	return IntegrationBranch(ws), nil
 }
 
 // answerExisting answers an add whose branch is that of the patch existing,
 // which is not deleted: 200 with it unchanged for if_not_exists, else 409
 // patch_exists.
-func answerExisting(w http.ResponseWriter, existing Patch, req addRequest) error {
-	if !req.ifNotExists {
-		return errPatchExists(req.branch)
+func answerExisting(w http.ResponseWriter, existing Patch, ifNotExists bool) error {
+	if !ifNotExists {
+		return errPatchExists(existing.BranchName)
 	}
 	server.WriteJSON(w, http.StatusOK, ObjectOf(existing, ""))
 	return nil
@@ -301,66 +331,113 @@ func actorOf(r *http.Request) (actor, error) {
 	return a, nil
 }
 
-// insertPatch registers the patch req of the workspace slug in one store
-// transaction, with its event: it removes for good the deleted patches of
-// the same branch (purged reports that it did, so that the backup ref
-// goes), places the patch at its position, moving the patches at and after
-// it down, and writes parley.patch.create. The store runs one write
+// insertPatches registers the patches reqs of the workspace slug, whose
+// branches resolved as resolutions, in one store transaction with their
+// events. It removes for good the deleted patches of their branches
+// (purged names the branches that had one, so that their backup refs go).
+// It places the patches that carry a position first, in the order of reqs,
+// each by the rule of a single add against the list as it then stands: a
+// position at most the list's length takes that place and moves the
+// patches at and after it down, any other the end. It then appends the
+// others in order. Each parley.patch.create carries its patch's final
+// position, known once every patch is placed. The store runs one write
 // transaction at a time, so the count and the positions it reads cannot
 // change before it commits. A branch another add registered first is an
-// error matching ErrPatchExists, and nothing is written.
-func (c *Component) insertPatch(ctx context.Context, slug string, req addRequest, resolution string, by actor) (Patch, bool, error) {
+// error matching ErrPatchExists, with that branch as conflict; on any
+// error nothing is written.
+func (c *Component) insertPatches(ctx context.Context, slug string, reqs []addRequest, resolutions []string, by actor) (created []Patch, purged []string, conflict string, err error) {
 	if c.d.Events == nil {
-		return Patch{}, false, errNotBound
+		return nil, nil, "", errNotBound
 	}
 	now := c.now().UTC().Truncate(time.Second)
-	p := Patch{
-		ID: uuid.New().String(), Workspace: slug, BranchName: req.branch, Status: StatusActive,
-		ConflictFiles: []string{}, UpstreamPRURL: nonEmpty(req.upstreamPR), Description: nonEmpty(req.description),
-		AddedAt: now, UpdatedAt: now,
-	}
-	purged := false
-	err := c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
-		purged = false
-		for {
-			old, found, err := DeletedPatchOfBranch(ctx, tx, slug, req.branch)
+	err = c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		created, purged, conflict = make([]Patch, len(reqs)), nil, ""
+		for _, req := range reqs {
+			removed, err := purgeDeleted(ctx, tx, slug, req.branch)
 			if err != nil {
 				return err
 			}
-			if !found {
-				break
+			if removed {
+				purged = append(purged, req.branch)
 			}
-			if err := DeletePatch(ctx, tx, slug, old.ID); err != nil {
-				return err
-			}
-			purged = true
 		}
 		n, err := CountLivePatches(ctx, tx, slug)
 		if err != nil {
 			return err
 		}
-		pos := n + 1
-		if req.position != 0 && req.position <= n {
-			pos = req.position
-			if err := ShiftPositions(ctx, tx, slug, pos); err != nil {
+		positions := make([]int, len(reqs)) // 0 until placed
+		place := func(i int) error {
+			req := reqs[i]
+			pos := n + 1
+			if req.position != 0 && req.position <= n {
+				pos = req.position
+				if err := ShiftPositions(ctx, tx, slug, pos); err != nil {
+					return err
+				}
+				for j, at := range positions {
+					if at >= pos {
+						positions[j]++
+					}
+				}
+			}
+			positions[i] = pos
+			n++
+			p := Patch{
+				ID: uuid.New().String(), Workspace: slug, BranchName: req.branch, Position: &pos, Status: StatusActive,
+				ConflictFiles: []string{}, UpstreamPRURL: nonEmpty(req.upstreamPR), Description: nonEmpty(req.description),
+				AddedAt: now, UpdatedAt: now,
+			}
+			if err := InsertPatch(ctx, tx, p); err != nil {
+				if errors.Is(err, ErrPatchExists) {
+					conflict = req.branch
+				}
+				return err
+			}
+			created[i] = p
+			return nil
+		}
+		for _, explicit := range []bool{true, false} {
+			for i, req := range reqs {
+				if (req.position != 0) == explicit {
+					if err := place(i); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		for i := range created {
+			p, pos := &created[i], positions[i]
+			p.Position = &pos
+			if _, err := c.d.Events.Emit(ctx, tx, event.Input{
+				Type: EventPatchCreate, Workspace: &slug, ActorType: by.typ, ActorID: by.id,
+				ResourceType: "patch", ResourceID: p.ID,
+				Metadata: map[string]any{"branch_name": p.BranchName, "position": pos, "branch_resolution": resolutions[i]},
+			}); err != nil {
 				return err
 			}
 		}
-		p.Position = &pos
-		if err := InsertPatch(ctx, tx, p); err != nil {
-			return err
-		}
-		_, err = c.d.Events.Emit(ctx, tx, event.Input{
-			Type: EventPatchCreate, Workspace: &slug, ActorType: by.typ, ActorID: by.id,
-			ResourceType: "patch", ResourceID: p.ID,
-			Metadata: map[string]any{"branch_name": p.BranchName, "position": pos, "branch_resolution": resolution},
-		})
-		return err
+		return nil
 	})
 	if err != nil {
-		return Patch{}, false, err
+		return nil, nil, conflict, err
 	}
-	return p, purged, nil
+	return created, purged, "", nil
+}
+
+// purgeDeleted removes for good every deleted patch of branch in the
+// workspace slug, and reports whether there was one.
+func purgeDeleted(ctx context.Context, tx *sql.Tx, slug, branch string) (bool, error) {
+	removed := false
+	for {
+		old, found, err := DeletedPatchOfBranch(ctx, tx, slug, branch)
+		if err != nil || !found {
+			return removed, err
+		}
+		if err := DeletePatch(ctx, tx, slug, old.ID); err != nil {
+			return removed, err
+		}
+		removed = true
+	}
 }
 
 // deleteBackupRef deletes the backup ref of branch in the copy of the
