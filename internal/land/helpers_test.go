@@ -127,6 +127,21 @@ func commit(t *testing.T, dir, branch, from, message string, files map[string]st
 // the commit's author; "" makes the committer the author.
 func commitAs(t *testing.T, dir, branch, from, author, message string, files map[string]string) string {
 	t.Helper()
+	entries := make(map[string]treeEntry, len(files))
+	for path, content := range files {
+		entries[path] = treeEntry{"100644", content}
+	}
+	return commitEntries(t, dir, branch, from, author, message, entries)
+}
+
+// treeEntry is what a commit holds at a path: a file of the mode with the
+// content, a gitlink to the commit id content for mode 160000, and
+// nothing for the zero treeEntry, which removes the path.
+type treeEntry struct{ mode, content string }
+
+// commitEntries is commitAs with each path of entries set to its entry.
+func commitEntries(t *testing.T, dir, branch, from, author, message string, entries map[string]treeEntry) string {
+	t.Helper()
 	var s strings.Builder
 	s.WriteString("commit refs/heads/" + branch + "\n")
 	if author != "" {
@@ -136,8 +151,15 @@ func commitAs(t *testing.T, dir, branch, from, author, message string, files map
 	if from != "" {
 		s.WriteString("from " + from + "\n")
 	}
-	for _, path := range slices.Sorted(maps.Keys(files)) {
-		s.WriteString("M 100644 inline " + path + "\n" + data(files[path]))
+	for _, path := range slices.Sorted(maps.Keys(entries)) {
+		switch e := entries[path]; e.mode {
+		case "":
+			s.WriteString("D " + path + "\n")
+		case "160000":
+			s.WriteString("M 160000 " + e.content + " " + path + "\n")
+		default:
+			s.WriteString("M " + e.mode + " inline " + path + "\n" + data(e.content))
+		}
 	}
 	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet", "--force"); err != nil {
 		t.Fatal(err)

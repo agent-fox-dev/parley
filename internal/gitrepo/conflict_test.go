@@ -316,3 +316,62 @@ func entries(t *testing.T, dir string) []string {
 	}
 	return names
 }
+
+// Not parallel: it points the process's temporary directory at a
+// directory of its own, to see what the merge leaves there.
+func TestConflictText_MarksEachOverlapAsTheTargetsLinesThenTheChangesWhateverTheGitConfig(t *testing.T) {
+	scratch := t.TempDir()
+	t.Setenv("TMPDIR", scratch)
+	ctx := context.Background()
+	for _, c := range []struct {
+		name               string
+		base, target, work []edit
+		want               string
+	}{
+		{"both change a line and the change adds one",
+			[]edit{file("app.txt", "one\ntwo\nthree\n")},
+			[]edit{file("app.txt", "one\nTARGET\nthree\n")},
+			[]edit{file("app.txt", "one\nCHANGE\nthree\nfour\n")},
+			"one\n<<<<<<< target\nTARGET\n=======\nCHANGE\n>>>>>>> change\nthree\nfour\n"},
+		{"both add the file, from an empty base",
+			nil,
+			[]edit{file("app.txt", "one\nTARGET\n")},
+			[]edit{file("app.txt", "one\nCHANGE\n")},
+			"one\n<<<<<<< target\nTARGET\n=======\nCHANGE\n>>>>>>> change\n"},
+	} {
+		r := newConflictRepo(t, c.base, c.target, c.work)
+		// The repository's own config and the hub's environment both ask
+		// for a base section, which the text never has.
+		gitrepotest.Git(t, r.dir, "config", "merge.conflictStyle", "zdiff3")
+		repo, err := (gitrepo.Git{Env: []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=merge.conflictStyle",
+			"GIT_CONFIG_VALUE_0=diff3"}}).Open(ctx, r.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := repo.TrialRebaseFrom(ctx, r.base, r.head(), r.target)
+		if err != nil || report == nil || len(report.Files) != 1 {
+			t.Fatalf("%s: TrialRebaseFrom = %+v, %v; want a conflict in app.txt", c.name, report, err)
+		}
+		before := entries(t, scratch)
+
+		text, err := repo.ConflictText(ctx, report.Files[0])
+
+		if err != nil || string(text) != c.want {
+			t.Errorf("%s: ConflictText = %q, %v; want %q", c.name, text, err, c.want)
+		}
+		if after := entries(t, scratch); !slices.Equal(after, before) {
+			t.Errorf("%s: the temporary directory held %v, then %v", c.name, before, after)
+		}
+	}
+
+	r := newConflictRepo(t, nil, []edit{file("app.txt", "target\n")}, []edit{file("app.txt", "work\n")})
+	before := entries(t, scratch)
+	missing := &gitrepo.ConflictSide{SHA: strings.Repeat("0", 40), Mode: "100644", Path: "app.txt"}
+	if text, err := r.repo.ConflictText(ctx, gitrepo.ConflictFile{Path: "app.txt", Kind: gitrepo.ConflictContent,
+		Ours: missing, Theirs: missing}); err == nil {
+		t.Errorf("ConflictText of blobs the repository does not hold = %q, want an error", text)
+	}
+	if after := entries(t, scratch); !slices.Equal(after, before) {
+		t.Errorf("a failed merge: the temporary directory held %v, then %v", before, after)
+	}
+}

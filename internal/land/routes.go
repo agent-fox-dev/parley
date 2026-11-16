@@ -21,16 +21,16 @@ import (
 
 // Routes are the land routes, for the server's router: the land of a
 // change, the attempts of a change, the attempts of a workspace, one
-// attempt by id and the current conflict of a change.
+// attempt by id, and the current conflict of a change and its files.
 func (c *Component) Routes() []server.Route {
 	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	read := func(pattern string, h server.HandlerFunc) server.Route {
 		return server.Route{Method: http.MethodGet, Pattern: pattern, Scope: "changes:read", Marks: need, Handler: h}
 	}
 	// The patterns of the land, of a change's attempts, of one attempt and
-	// of a change's conflict are those of the contributor table of
-	// internal/access, parameter names included, so that a token bound to
-	// a fork reaches them on the fork's parent. The land needs only read
+	// of a change's conflict and its files are those of the contributor
+	// table of internal/access, parameter names included, so that a token
+	// bound to a fork reaches them on the fork's parent. The land needs only read
 	// access: who may land is the land's own rule (authorize).
 	return []server.Route{
 		{
@@ -41,6 +41,7 @@ func (c *Component) Routes() []server.Route {
 		read("/workspaces/:slug/lands", c.workspaceLands),
 		read("/workspaces/:slug/lands/:id", c.getLand),
 		read("/workspaces/:slug/changes/:number/conflict", c.conflictRoute),
+		read("/workspaces/:slug/changes/:number/conflict/file", c.conflictFileRoute),
 	}
 }
 

@@ -4177,6 +4177,43 @@ answer is `409` `conflict` (`<ref> has no conflict report: its target branch
 {"mergeable":"conflict","conflict":{"target_sha":"…","head_sha":"…","base_sha":"…","commit_sha":"…","files":[{"path":"a.txt","kind":"content","base":{"sha":"…","mode":"100644","path":"a.txt"},"ours":{"sha":"…","mode":"100644","path":"a.txt"},"theirs":{"sha":"…","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}
 ```
 
+### `GET /api/v1/workspaces/{slug}/changes/{number}/conflict/file?path=`
+
+Answers `200` with `Content-Type: text/plain; charset=utf-8` and, as the
+whole body, the file `path` (percent-encoded in the query) of the change's
+current conflict report merged as text: every line that both sides keep, or
+that one side alone changed, appears once, and each region both changed is
+written as a line `<<<<<<< target`, the lines of the target as replayed so
+far (the entry's `ours`), a line `=======`, the lines of the file in
+`commit_sha` (the entry's `theirs`) and a line `>>>>>>> change`. There is
+never a `||||||| base` section, whatever `merge.conflictStyle` a git
+configuration sets; an entry without a `base` (a file both sides added)
+merges from an empty file.
+
+```text
+one
+<<<<<<< target
+TARGET
+=======
+CHANGE
+>>>>>>> change
+three
+four
+```
+
+The report is the one [`GET …/conflict`](#get-apiv1workspacesslugchangesnumberconflict)
+answers, taken by the same rule (stored for the present pair, replayed
+otherwise), and the route needs the same scope and access, resolves the
+change the same way, confines a token bound to a fork the same way and
+refuses with the same errors (`409` `conflict` for a `draft` or `open`
+change whose target branch does not exist). After the change is resolved:
+
+| Status and `error_type` | When |
+|---|---|
+| `400` `invalid_request` | the query has no `path`, or an empty one (`path: must name a file of the change's conflict report`) |
+| `404` `path_not_found` | `path` is no entry's `path` in the current report, which every path of a `clean` change is (`<ref> has no conflict in "<path>"`) |
+| `409` `not_text_conflict` | the entry's `kind` is not `content` (`<ref> conflicts in "<path>" as <kind>, which has no text to mark`) |
+
 ## Stacks and restack
 
 A new version of a change records, in the same store transaction, a
