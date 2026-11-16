@@ -70,5 +70,8 @@ func (c *Component) Routes() []server.Route {
 		Route(WriteRoute, server.Route{Method: http.MethodPatch, Pattern: "/workspaces/:slug/patches/:id", Handler: c.updateRoute}),
 		Route(WriteRoute, server.Route{Method: http.MethodDelete, Pattern: "/workspaces/:slug/patches/:id", Handler: c.deleteRoute}),
 		Route(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/patches/:id/restore", Handler: c.restoreRoute}),
+		// The router prefers a literal segment to a parameter, so reorder is
+		// never taken for the id of a patch.
+		Route(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/patches/reorder", Handler: c.reorderRoute}),
 	}
 }

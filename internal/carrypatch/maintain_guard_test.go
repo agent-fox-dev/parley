@@ -34,6 +34,7 @@ var maintenanceRoutes = []maintenanceRoute{
 	{name: "update", method: http.MethodPatch, suffix: "/:id", body: func([]string) any { return map[string]any{"description": "guarded"} }},
 	{name: "delete", method: http.MethodDelete, suffix: "/:id", body: func([]string) any { return ignoredBody }},
 	{name: "restore", method: http.MethodPost, suffix: "/:id/restore", body: func([]string) any { return ignoredBody }},
+	{name: "reorder", method: http.MethodPost, suffix: "/reorder", body: func(ids []string) any { return map[string]any{"patch_ids": ids} }},
 }
 
 // ignoredBody is a body, not even JSON, that a route which takes none
@@ -132,9 +133,13 @@ func TestMaintenanceRoutes_RefuseStandardWorkspaces(t *testing.T) {
 		}
 	}
 	t.Run("an invalid body is refused before the mode", func(t *testing.T) {
-		a := h.update(t, "plain", ps["A"].ID, map[string]any{"status": "bogus"})
-		if a.status != http.StatusBadRequest || a.Error.ErrorType != "invalid_request" {
-			t.Errorf("PATCH on plain with status bogus = %d %s, want 400 invalid_request", a.status, a.raw)
+		for _, a := range []answer{
+			h.update(t, "plain", ps["A"].ID, map[string]any{"status": "bogus"}),
+			h.reorder(t, "plain", map[string]any{"patch_ids": "A"}),
+		} {
+			if a.status != http.StatusBadRequest || a.Error.ErrorType != "invalid_request" {
+				t.Errorf("an invalid body on plain = %d %s, want 400 invalid_request", a.status, a.raw)
+			}
 		}
 	})
 }

@@ -249,6 +249,9 @@ func startPatchHub(t *testing.T) *patchHub {
 	}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Now: h.clock,
+		// The order tests send thousands of requests as one caller, more
+		// than the rate limit lets through.
+		TOML: "[limits]\nrequests_per_minute = 0\n",
 		Compose: func(c *hub.Composition) {
 			c.CarryPatch().RegisterRebuildEnqueuer(h.rebuilds)
 			c.AdjustCarryPatch(func(d *carrypatch.Deps) {
@@ -277,6 +280,20 @@ func (h *patchHub) carryList(t *testing.T, slug string, status workspace.Status,
 		ps[letter] = livePatch(slug, "patch/"+strings.ToLower(letter), i+1)
 		h.put(t, ps[letter])
 	}
+	return ps
+}
+
+// carryOf stores the ready carry-patch workspace slug of the owner holding
+// n active patches, of the branches patch/1 to patch/n, at positions 1 to n,
+// and returns them in position order.
+func (h *patchHub) carryOf(t *testing.T, slug string, n int) []carrypatch.Patch {
+	t.Helper()
+	h.add(t, slug, workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone)
+	ps := make([]carrypatch.Patch, n)
+	for i := range ps {
+		ps[i] = livePatch(slug, fmt.Sprintf("patch/%d", i+1), i+1)
+	}
+	h.put(t, ps...)
 	return ps
 }
 
@@ -372,6 +389,13 @@ func (h *patchHub) remove(t *testing.T, slug, id string, body any) answer {
 func (h *patchHub) restore(t *testing.T, slug, id string, body any) answer {
 	t.Helper()
 	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/"+id+"/restore", body)
+}
+
+// reorder sends POST /workspaces/<slug>/patches/reorder as the owner with
+// body.
+func (h *patchHub) reorder(t *testing.T, slug string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/reorder", body)
 }
 
 // patchEvents are the stored events of slug of type typ, every
