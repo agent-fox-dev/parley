@@ -104,7 +104,7 @@ func (c *Component) ResolveBranch(ctx context.Context, w workspace.Workspace, br
 	} else if blocked {
 		return "", nameInTheWay(branch, blocker)
 	}
-	tip, err := c.fetchBranch(ctx, repo, w, branch)
+	tip, err := c.fetchBranch(ctx, repo, w, branch, branchNotFound)
 	if err != nil {
 		return "", err
 	}
@@ -122,8 +122,9 @@ func (c *Component) fromOrigin(w workspace.Workspace) bool {
 }
 
 // fetchBranch fetches branch from the origin of w into the copy repo and
-// returns its head on origin.
-func (c *Component) fetchBranch(ctx context.Context, repo *gitrepo.Repo, w workspace.Workspace, branch string) (string, error) {
+// returns its head on origin; when origin has no such branch, the error is
+// missing(branch), the answer of the caller's route.
+func (c *Component) fetchBranch(ctx context.Context, repo *gitrepo.Repo, w workspace.Workspace, branch string, missing func(branch string) error) (string, error) {
 	if w.GitURL == nil || *w.GitURL == "" {
 		return "", originFetchFailed(branch, "the workspace has no git_url")
 	}
@@ -146,7 +147,7 @@ func (c *Component) fetchBranch(ctx context.Context, repo *gitrepo.Repo, w works
 	case err == nil:
 		return tip, nil
 	case errors.Is(err, gitrepo.ErrNoSuchBranch):
-		return "", branchNotFound(branch)
+		return "", missing(branch)
 	case errors.Is(err, gitrepo.ErrRefNameConflict):
 		return "", nameConflict(ctx, repo, branch, "refs/remotes/origin/"+branch)
 	case ctx.Err() != nil:

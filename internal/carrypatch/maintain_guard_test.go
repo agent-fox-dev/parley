@@ -35,6 +35,7 @@ var maintenanceRoutes = []maintenanceRoute{
 	{name: "delete", method: http.MethodDelete, suffix: "/:id", body: func([]string) any { return ignoredBody }},
 	{name: "restore", method: http.MethodPost, suffix: "/:id/restore", body: func([]string) any { return ignoredBody }},
 	{name: "reorder", method: http.MethodPost, suffix: "/reorder", body: func(ids []string) any { return map[string]any{"patch_ids": ids} }},
+	{name: "reset", method: http.MethodPost, suffix: "/:id/reset-to-origin", body: func([]string) any { return ignoredBody }},
 }
 
 // ignoredBody is a body, not even JSON, that a route which takes none

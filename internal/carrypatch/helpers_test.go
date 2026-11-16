@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -231,21 +232,39 @@ func str(s *string) string {
 
 // patchHub is an addHub for the routes that maintain a patch list. Its
 // carry-patch component counts the reads of workspace secrets, which every
-// fetch from origin makes first to resolve its credential, records the
-// rebuilds it is asked to queue, and writes its events through an emitter
-// the test can make fail, which rolls back the transaction of the change.
+// fetch from origin makes first to resolve its credential, takes the origin
+// credentials from origins, records the rebuilds it is asked to queue, and
+// writes its events through an emitter the test can make fail, which rolls
+// back the transaction of the change. Its git trusts the origins given to
+// trust and records the arguments of every invocation.
 type patchHub struct {
 	*addHub
 	rebuilds    *recordingRebuilds
 	secretReads atomic.Int64
 	failEvents  atomic.Bool
+	origins     *originSecrets
+
+	// caBundle is the file GIT_SSL_CAINFO names for the hub's git; cas are
+	// the certificates it holds.
+	caBundle string
+	caMu     sync.Mutex
+	cas      []byte
+
+	argsMu  sync.Mutex
+	gitArgs [][]string
 }
 
-func startPatchHub(t *testing.T) *patchHub {
+// startPatchHub starts the patch hub, with the carry-patch dependencies
+// changed further by adjust.
+func startPatchHub(t *testing.T, adjust ...func(d *carrypatch.Deps)) *patchHub {
 	t.Helper()
 	h := &patchHub{
 		addHub:   &addHub{readHub: &readHub{}, now: time.Now().UTC().Truncate(time.Second).Add(700 * time.Millisecond)},
 		rebuilds: &recordingRebuilds{},
+		caBundle: filepath.Join(t.TempDir(), "ca-bundle.pem"),
+	}
+	if err := os.WriteFile(h.caBundle, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Now: h.clock,
@@ -256,8 +275,18 @@ func startPatchHub(t *testing.T) *patchHub {
 			c.CarryPatch().RegisterRebuildEnqueuer(h.rebuilds)
 			c.AdjustCarryPatch(func(d *carrypatch.Deps) {
 				h.repoPath = d.RepoPath
-				d.Secrets = countingSecrets{SecretReader: d.Secrets, n: &h.secretReads}
+				h.origins = &originSecrets{SecretReader: d.Secrets, tokens: map[string]string{}, fail: map[string]error{}, reads: map[string]int{}}
+				d.Secrets = countingSecrets{SecretReader: h.origins, n: &h.secretReads}
 				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
+				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+h.caBundle)
+				d.Git.Trace = func(args []string) {
+					h.argsMu.Lock()
+					defer h.argsMu.Unlock()
+					h.gitArgs = append(h.gitArgs, args)
+				}
+				for _, fn := range adjust {
+					fn(d)
+				}
 			})
 		},
 	})
@@ -427,6 +456,146 @@ FROM hub_events WHERE workspace = ? AND type LIKE ? ORDER BY seq`, slug, typ)
 		t.Fatal(err)
 	}
 	return out
+}
+
+// trust makes the hub's git trust the certificate in the PEM file caFile,
+// such as an origin's CAFile, besides those it trusts already. The bundle
+// is replaced in one step, so that a git reading it meanwhile sees the old
+// or the new one.
+func (h *patchHub) trust(t *testing.T, caFile string) {
+	t.Helper()
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.caMu.Lock()
+	defer h.caMu.Unlock()
+	h.cas = append(h.cas, pem...)
+	next := h.caBundle + ".next"
+	if err := os.WriteFile(next, h.cas, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, h.caBundle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gitArgHolding is the first argument of a git invocation of the hub that
+// holds s, "" when none does.
+func (h *patchHub) gitArgHolding(s string) string {
+	h.argsMu.Lock()
+	defer h.argsMu.Unlock()
+	for _, args := range h.gitArgs {
+		for _, a := range args {
+			if strings.Contains(a, s) {
+				return a
+			}
+		}
+	}
+	return ""
+}
+
+// resetCase is a carry-patch workspace of the reset tests: its origin,
+// which takes the GIT_PAT originToken alone, the hub's copy of it, and its
+// patch A of the branch patch/a.
+type resetCase struct {
+	slug   string
+	origin *gitrepotest.Origin
+	copy   string
+	patch  carrypatch.Patch
+}
+
+// resetCarry stores the ready carry-patch workspace slug of the owner,
+// changed by edit when it is not nil, whose git_url is a new origin that
+// holds the branches patch/a and other at one commit each, whose GIT_PAT is
+// originToken, and whose copy, the bare copy of carry, also holds
+// origin's branches and origin heads of them, as a clone of origin would.
+// It holds patch A of patch/a, active, at position 1. The hub's git trusts
+// the origin.
+func (h *patchHub) resetCarry(t *testing.T, slug string, edit func(w *workspace.Workspace)) *resetCase {
+	t.Helper()
+	o := tokenOrigin(t)
+	o.Commit("patch/a", "a1")
+	o.Commit("other", "o1")
+	h.trust(t, o.CAFile())
+	url := o.URL()
+	dir := h.carry(t, slug, func(w *workspace.Workspace) {
+		w.GitURL = &url
+		if edit != nil {
+			edit(w)
+		}
+	})
+	gitrepotest.Git(t, dir, "fetch", "--quiet", "--no-tags", o.Dir(), "+refs/heads/*:refs/heads/*", "+refs/heads/*:refs/remotes/origin/*")
+	h.origins.set(slug, originToken, nil)
+	p := livePatch(slug, "patch/a", 1)
+	h.put(t, p)
+	return &resetCase{slug: slug, origin: o, copy: dir, patch: p}
+}
+
+// withSettings is an edit of resetCarry that stores the settings
+// patch_branch_source source and patch_divergence_policy policy, "" for
+// none.
+func withSettings(source, policy string) func(w *workspace.Workspace) {
+	return func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{}
+		if source != "" {
+			w.Settings["patch_branch_source"] = json.RawMessage(`"` + source + `"`)
+		}
+		if policy != "" {
+			w.Settings["patch_divergence_policy"] = json.RawMessage(`"` + policy + `"`)
+		}
+	}
+}
+
+// resetToOrigin sends POST /workspaces/<slug>/patches/<id>/reset-to-origin
+// as the owner with no body.
+func (h *patchHub) resetToOrigin(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/"+id+"/reset-to-origin", nil)
+}
+
+// originSecrets is the origin credential resolver of the patch hub: the
+// GIT_PAT of a workspace given to set is its token, or its error; the
+// secrets of every other workspace are read from the hub's reader. It
+// counts the reads per workspace.
+type originSecrets struct {
+	workspace.SecretReader
+	mu     sync.Mutex
+	tokens map[string]string
+	fail   map[string]error
+	reads  map[string]int
+}
+
+// set makes token the GIT_PAT of slug, or, when err is not nil, every read
+// of its secrets fail with err.
+func (s *originSecrets) set(slug, token string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokens[slug], s.fail[slug] = token, err
+}
+
+// readsOf is how often the secrets of slug were read.
+func (s *originSecrets) readsOf(slug string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads[slug]
+}
+
+func (s *originSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, name string) (string, bool, error) {
+	s.mu.Lock()
+	token, set := s.tokens[scopeID]
+	err := s.fail[scopeID]
+	s.reads[scopeID]++
+	s.mu.Unlock()
+	switch {
+	case !set || scope != secret.ScopeWorkspace:
+		return s.SecretReader.Get(ctx, scope, scopeID, name)
+	case err != nil:
+		return "", false, err
+	case name == workspace.SecretGitPAT:
+		return token, true, nil
+	}
+	return "", false, nil
 }
 
 // recordingRebuilds is a rebuild enqueuer that records each call and
