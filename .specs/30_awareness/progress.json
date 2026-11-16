@@ -3,11 +3,11 @@
   "spec_id": "30",
   "spec_name": "awareness",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-16T16:11:33Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
