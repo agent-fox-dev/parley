@@ -39,9 +39,9 @@ const scmHook = "scm"
 // makes take their times from the hub's clock.
 //
 // The change part (composeChanges) sets the change and commit-change
-// lookups through AdjustSCM and registers the change linker. The session
-// lookup keeps its default, which names none, and nothing registers a
-// session linker yet, so every session_id is refused 400 unknown_session.
+// lookups through AdjustSCM and registers the change linker; the land part
+// (composeLand) sets the session lookup. Nothing registers a session
+// linker yet, so every session_id is refused 400 unknown_session.
 // The hub registers no request recorder; the default discards the
 // observations.
 //

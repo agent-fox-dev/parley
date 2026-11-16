@@ -3289,10 +3289,18 @@ event log (`Events`, `(*Composition).Events()`) and the hub's logger
 (`Logger`), after the functions added with `AdjustSCM` have changed those
 dependencies. `(*Composition).SCM()` returns the component. The change
 part sets `Changes` (`OpenChangeOfBranch`, `ChangeOfCommit`) through
-`AdjustSCM` and registers the `ChangeLinker` (see [Changes](#changes));
-`Sessions` (`SessionOf`) and `Recorder` keep their defaults, which name
-nothing and record nothing, and no `SessionLinker` is registered: the
-session feature and the metric export are not in the hub yet.
+`AdjustSCM` and registers the `ChangeLinker` (see [Changes](#changes)).
+The land part sets `Sessions` (`SessionOf`) through `AdjustSCM` to
+`commitSessions` (`internal/hub/land.go`), which answers from the records
+that hold sessions: for the head of a change's version, the session of
+the first version with that head (`(*change.Component).SessionOfHead`);
+for a commit a land wrote in place of a version's commit
+(`ChangeOfCommit`, `Landed` with a `LandedFrom` other than the commit),
+the session of the attempt that landed the change
+(`(*land.Component).SessionOfLanding`); none for any other commit.
+`Recorder` keeps its default, which records nothing, and no
+`SessionLinker` is registered: the session feature and the metric export
+are not in the hub yet.
 
 Every read route is `GET /workspaces/:slug/scm/…`, declared with the scope
 `git:read` and the access need `read`, so the pipeline answers `401`,

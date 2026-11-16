@@ -30,7 +30,7 @@ func TestLookups_AnswerFromTheChangeRecord(t *testing.T) {
 			{"the highest version with the head", "demo", f.task1, true, change.CommitChange{WorkspaceSlug: "demo", Number: 1, Version: new(int64(3))}},
 			{"an earlier version's head", "demo", f.task2, true, change.CommitChange{WorkspaceSlug: "demo", Number: 1, Version: new(int64(2))}},
 			{"the lowest number of two changes with the head", "demo", f.b2, true, change.CommitChange{WorkspaceSlug: "demo", Number: 2, Version: new(int64(1))}},
-			{"a landed commit before a version head of a lower number", "demo", f.landed, true, change.CommitChange{WorkspaceSlug: "demo", Number: 3, Version: new(int64(1)), Landed: true}},
+			{"a landed commit before a version head of a lower number", "demo", f.landed, true, change.CommitChange{WorkspaceSlug: "demo", Number: 3, Version: new(int64(1)), Landed: true, LandedFrom: f.b3}},
 			{"the head a change landed", "demo", f.b3, true, change.CommitChange{WorkspaceSlug: "demo", Number: 3, Version: new(int64(1))}},
 			{"a commit of no change", "demo", w.base, false, change.CommitChange{}},
 			{"a fork's commit asked of the fork", "demo--m1", f.task2, true, change.CommitChange{WorkspaceSlug: "demo", Number: 1, Version: new(int64(2))}},
@@ -51,7 +51,7 @@ func TestLookups_AnswerFromTheChangeRecord(t *testing.T) {
 				return err
 			}
 			got, found, err := w.changes.ChangeOfCommit(ctx, tx, "demo", landed)
-			if want := (change.CommitChange{WorkspaceSlug: "demo", Number: 4, Landed: true}); err != nil || !found || !reflect.DeepEqual(got, want) {
+			if want := (change.CommitChange{WorkspaceSlug: "demo", Number: 4, Landed: true, LandedFrom: w.base}); err != nil || !found || !reflect.DeepEqual(got, want) {
 				t.Errorf("ChangeOfCommit = %+v, %v, %v; want %+v without a version", got, found, err, want)
 			}
 			return errRollback

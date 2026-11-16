@@ -2738,7 +2738,7 @@ A commit object, as every route that answers commits writes it:
 | `author`, `committer` | `{"name": …, "email": …, "time": …}`, `time` an RFC 3339 timestamp in UTC, such as `2026-01-02T03:04:05Z` |
 | `message` | the whole message, as written, its last newline included when it has one |
 | `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it (a change that landed it first, then the lowest number); `version` is the highest version with the commit as its head or, for a landed commit, the version whose head it was landed from, `null` when there is none; on a task fork's slug, only the parent's changes whose source is the fork; `null` for a commit of no change |
-| `session_id` | the agent session that introduced the commit; always `null` until the hub records sessions |
+| `session_id` | the agent session that introduced the commit: for the head of a change's version, the session of the first version with that head (the push, API commit or rebase that recorded it); for a commit a land wrote in place of a version's commit, the session the land was asked in; `null` for a write in no session and for any other commit, such as one below a version's head or on a branch that is no change's source. No session feature is registered yet, so every session is refused and every `session_id` here is `null` |
 | `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
 
 A file change, as every route that answers file changes writes it (the

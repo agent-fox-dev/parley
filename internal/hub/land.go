@@ -5,8 +5,10 @@ import (
 	"errors"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/land"
+	"github.com/agent-fox-dev/parley/internal/scm"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -59,6 +61,10 @@ const (
 // or final observer is registered: every change is ready to land, an
 // override passes nothing and every request and move is allowed.
 //
+// The source control API's session lookup (commitSessions) is set here
+// through AdjustSCM, since it asks the change records and the land
+// attempts, which hold the sessions of the writes that introduced commits.
+//
 // The teardown of a workspace deletes its land attempts in the delete's
 // transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
 //
@@ -73,6 +79,7 @@ func composeLand(c *Composition) {
 		c.AddRoute(r)
 	}
 	c.workspaces.Teardown().RegisterRemover(comp.WorkspaceDeleted)
+	c.AdjustSCM(func(d *scm.Deps) { d.Sessions = commitSessions{c.changes, comp} })
 	comp.AddAfterLanding(func(ctx context.Context, in land.AfterLanding) error {
 		var errs []error
 		for _, ch := range in.Changes {
@@ -157,4 +164,29 @@ func (c *Composition) Land() *land.Component { return c.land }
 // them, in the order they were added.
 func (c *Composition) AdjustLand(fn func(*land.Deps)) {
 	c.landAdjusters = append(c.landAdjusters, fn)
+}
+
+// commitSessions is the source control API's session lookup: the session
+// of the write that introduced a commit. A commit that is the head of a
+// change's version was introduced by the first write that recorded it, a
+// push, an API commit or a rebase, in its session; a commit a land wrote
+// in place of a version's commit, by the land, in the session it was asked
+// in. Any other commit, such as one below a version's head, has no session
+// recorded for it.
+type commitSessions struct {
+	changes *change.Component
+	lands   *land.Component
+}
+
+func (s commitSessions) SessionOf(ctx context.Context, slug, sha string) (*string, error) {
+	session, found, err := s.changes.SessionOfHead(ctx, nil, slug, sha)
+	if err != nil || found {
+		return session, err
+	}
+	cc, found, err := s.changes.ChangeOfCommit(ctx, nil, slug, sha)
+	if err != nil || !found || !cc.Landed || cc.LandedFrom == sha {
+		return nil, err
+	}
+	session, _, err = s.lands.SessionOfLanding(ctx, cc.WorkspaceSlug, cc.Number)
+	return session, err
 }
