@@ -41,8 +41,9 @@ type fakeProvider struct {
 	requests []fakeRequest
 
 	// abandoned receives the path of each delayed or held answer whose
-	// client went away first.
-	abandoned chan string
+	// client went away first, and holding the path of each held answer's
+	// request as it arrives.
+	abandoned, holding chan string
 }
 
 type fakeAnswer struct {
@@ -60,7 +61,7 @@ type fakeRequest struct {
 
 func newFakeProvider(t *testing.T) *fakeProvider {
 	t.Helper()
-	f := &fakeProvider{answers: map[string]fakeAnswer{}, abandoned: make(chan string, 16)}
+	f := &fakeProvider{answers: map[string]fakeAnswer{}, abandoned: make(chan string, 16), holding: make(chan string, 16)}
 	f.answer(fakeTokenPath, http.StatusOK, map[string]any{"access_token": "at-1"})
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(func() {
@@ -119,7 +120,12 @@ func (f *fakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var answerAt <-chan time.Time
-	if !a.hold {
+	if a.hold {
+		select {
+		case f.holding <- r.URL.Path:
+		default:
+		}
+	} else {
 		answerAt = time.After(a.delay)
 	}
 	select {
@@ -328,13 +334,24 @@ func TestOAuthClient_ReportsARejectedCodeOrAFailingProvider(t *testing.T) {
 
 func TestOAuthClient_AbandonsACallThatOutlastsTheTimeout(t *testing.T) {
 	t.Parallel()
-	for _, slow := range []string{fakeTokenPath, fakeUserPath} {
-		t.Run(strings.TrimPrefix(slow, "/")+" URL", func(t *testing.T) {
+	cases := []struct {
+		name, slow string
+		lag        time.Duration
+	}{
+		{"token URL", fakeTokenPath, 0},
+		{"user URL", fakeUserPath, 0},
+		{"token URL on a loaded machine", fakeTokenPath, 100 * time.Millisecond},
+		{"user URL on a loaded machine", fakeUserPath, 100 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		slow := tc.slow
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newFakeProvider(t)
 			f.answer(fakeUserPath, http.StatusOK, map[string]any{"id": 123, "login": "alice", "email": "a@x"})
 			f.hold(slow)
-			client := identity.NewOAuthClient([]config.Provider{f.provider("github")}, nil, 50*time.Millisecond)
+			hc := &http.Client{Transport: steady{f, slow, tc.lag}}
+			client := identity.NewOAuthClient([]config.Provider{f.provider("github")}, hc, 50*time.Millisecond)
 
 			// The provider never answers, so the call can end only by the
 			// client giving up; the default timeout would take far longer.
@@ -362,4 +379,39 @@ func TestOAuthClient_AbandonsACallThatOutlastsTheTimeout(t *testing.T) {
 			}
 		})
 	}
+}
+
+// steady is the transport of the client in a test of its timeout. It sends
+// each request after lag, as a loaded machine does, and keeps that lag from
+// deciding the outcome: the timeout does not cut short a call the fake
+// answers, and the client giving up on the held call reaches the fake only
+// once the fake has its request, so the fake always sees that call
+// abandoned.
+type steady struct {
+	f    *fakeProvider
+	held string
+	lag  time.Duration
+}
+
+func (s steady) RoundTrip(req *http.Request) (*http.Response, error) {
+	time.Sleep(s.lag)
+	base := s.f.srv.Client().Transport
+	if req.URL.Path != s.held {
+		return base.RoundTrip(req.WithContext(context.WithoutCancel(req.Context())))
+	}
+	ctx, cancel := context.WithCancel(context.WithoutCancel(req.Context()))
+	go func() {
+		// The bound only keeps a regression from hanging the suite.
+		bound := time.After(30 * time.Second)
+		select {
+		case <-req.Context().Done():
+		case <-bound:
+		}
+		select {
+		case <-s.f.holding:
+		case <-bound:
+		}
+		cancel()
+	}()
+	return base.RoundTrip(req.WithContext(ctx))
 }
