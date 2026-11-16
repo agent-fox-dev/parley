@@ -26,16 +26,19 @@ const (
 	landPoolGrace = 5 * time.Second
 )
 
-// composeLand adds the landing: the schema of the land attempts, the read
-// routes of the attempts per change, per workspace and by id, whose scope
-// and access need the shared checks decide, and the component, bound in a
+// composeLand adds the landing: the schema of the land attempts, the land
+// route and the read routes of the attempts per change, per workspace and
+// by id, whose scope and access need the shared checks decide, and the
+// component, bound in a
 // start hook to the store, to the place of each repository on disk, opened
 // with the hub's git, to the change component, to the workspace records
 // with their effective land settings, read in the caller's transaction, to
 // the access rule, to the hub's event log, to the ref writer and to the
 // [land] options: the tries of one land, the workers of the pool, the
 // deadline of an attempt and the landing identity. The pool runs as
-// background work; the stop leaves its running attempts running.
+// background work; the stop leaves its running attempts running. No
+// session linker is registered: until the session feature registers one,
+// every session_id a land names is refused.
 //
 // The teardown of a workspace deletes its land attempts in the delete's
 // transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).

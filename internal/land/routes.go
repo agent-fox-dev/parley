@@ -1,7 +1,11 @@
 package land
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -11,20 +15,28 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// Routes are the land routes, for the server's router: the attempts of a
-// change, the attempts of a workspace and one attempt by id.
+// Routes are the land routes, for the server's router: the land of a
+// change, the attempts of a change, the attempts of a workspace and one
+// attempt by id.
 func (c *Component) Routes() []server.Route {
 	need := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	read := func(pattern string, h server.HandlerFunc) server.Route {
 		return server.Route{Method: http.MethodGet, Pattern: pattern, Scope: "changes:read", Marks: need, Handler: h}
 	}
-	// The patterns of a change's attempts and of one attempt are those of
-	// the contributor table of internal/access, parameter names included,
-	// so that a token bound to a fork reaches them on the fork's parent.
+	// The patterns of the land, of a change's attempts and of one attempt
+	// are those of the contributor table of internal/access, parameter
+	// names included, so that a token bound to a fork reaches them on the
+	// fork's parent. The land needs only read access: who may land is the
+	// land's own rule (authorize).
 	return []server.Route{
+		{
+			Method: http.MethodPost, Pattern: "/workspaces/:slug/changes/:number/land", Scope: "changes:write", Create: true,
+			Marks: need, Handler: c.landRoute,
+		},
 		read("/workspaces/:slug/changes/:number/lands", c.changeLands),
 		read("/workspaces/:slug/lands", c.workspaceLands),
 		read("/workspaces/:slug/lands/:id", c.getLand),
@@ -68,7 +80,8 @@ type listPosition struct {
 // changeLands answers the attempts that cover the change :number of the
 // workspace :slug, newest first, in pages of the list envelope. A :number
 // that is not a positive integer, or that the workspace has no change of,
-// is 404 change_not_found.
+// is 404 change_not_found; one whose source is not the fork a token is
+// bound to, calling on the fork's parent, is 403 token_bound.
 func (c *Component) changeLands(w http.ResponseWriter, r *http.Request) error {
 	page, err := server.ReadPage(r)
 	if err != nil {
@@ -79,7 +92,11 @@ func (c *Component) changeLands(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return change.ErrChangeNotFound
 	}
-	if _, err := c.deps.Changes.ReadChange(r.Context(), c.deps.Store.Main(), slug, number); err != nil {
+	ch, err := c.deps.Changes.ReadChange(r.Context(), c.deps.Store.Main(), slug, number)
+	if err != nil {
+		return err
+	}
+	if err := confine(r, ch); err != nil {
 		return err
 	}
 	return c.writeList(w, r, page, []string{`a.workspace_slug = ?`,
@@ -143,7 +160,8 @@ func (c *Component) writeList(w http.ResponseWriter, r *http.Request, page serve
 
 // getLand answers the attempt :id of the workspace :slug: an id that is no
 // UUID, unknown, or of an attempt of another workspace is 404
-// land_not_found.
+// land_not_found; an attempt none of whose changes comes from the fork a
+// token is bound to, calling on the fork's parent, is 403 token_bound.
 func (c *Component) getLand(w http.ResponseWriter, r *http.Request) error {
 	slug, id := server.Param(r, "slug"), server.Param(r, "id")
 	if !isUUID(id) {
@@ -156,6 +174,184 @@ func (c *Component) getLand(w http.ResponseWriter, r *http.Request) error {
 	if !found {
 		return errLandNotFound(slug, id)
 	}
+	if err := confineAttempt(r, a); err != nil {
+		return err
+	}
 	server.WriteJSON(w, http.StatusOK, a)
+	return nil
+}
+
+// The bounds of the wait query of a land request, in seconds, and the wait
+// when it names none.
+const (
+	maxWait     = 60
+	defaultWait = 30 * time.Second
+)
+
+// landRequest is what a land request carries: its body's members, nil or
+// false where absent, and the wait of its query.
+type landRequest struct {
+	expectedVersion *int64
+	stack           bool
+	override        *Override
+	sessionID       *string
+	wait            time.Duration
+}
+
+// parseLand reads the land request r: a body that is none or a JSON
+// object, whose expected_version is an integer of at least 1, stack a
+// boolean, override an object whose reason is a string that is not blank,
+// and session_id a string, and a wait query that is a whole number of
+// seconds from 0 to 60. Members it does not know are ignored; anything
+// else is 400 invalid_request.
+func parseLand(r *http.Request) (landRequest, error) {
+	req := landRequest{wait: defaultWait}
+	if q := r.URL.Query(); q.Has("wait") {
+		s := q.Get("wait")
+		n, err := strconv.Atoi(s)
+		if s == "" || strings.Trim(s, "0123456789") != "" || err != nil || n > maxWait {
+			return req, server.InvalidRequest(fmt.Sprintf("wait must be a whole number of seconds from 0 to %d", maxWait))
+		}
+		req.wait = time.Duration(n) * time.Second
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return req, server.InvalidRequest("request body could not be read")
+	}
+	body := map[string]json.RawMessage{}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		if err := server.DecodeJSON(r, &body); err != nil {
+			return req, err
+		}
+	}
+	for name, raw := range body {
+		// A null is no value of any member's type.
+		null := bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+		switch name {
+		case "expected_version":
+			var v int64
+			if null || json.Unmarshal(raw, &v) != nil || v < 1 {
+				return req, server.InvalidRequest("expected_version: must be an integer of at least 1")
+			}
+			req.expectedVersion = &v
+		case "stack":
+			if null || json.Unmarshal(raw, &req.stack) != nil {
+				return req, server.InvalidRequest("stack: must be a boolean")
+			}
+		case "override":
+			var o struct {
+				Reason *string `json:"reason"`
+			}
+			if null || bytes.TrimSpace(raw)[0] != '{' || json.Unmarshal(raw, &o) != nil || o.Reason == nil ||
+				strings.TrimSpace(*o.Reason) == "" {
+				return req, server.InvalidRequest("override: must be an object whose reason is a string that is not blank")
+			}
+			req.override = &Override{Reason: *o.Reason}
+		case "session_id":
+			var s string
+			if null || json.Unmarshal(raw, &s) != nil {
+				return req, server.InvalidRequest("session_id: must be a string")
+			}
+			req.sessionID = &s
+		}
+	}
+	return req, nil
+}
+
+// landRoute lands the change :number of the workspace :slug, with the
+// changes below it for stack, and answers the land attempt. In this order:
+// the change (404 change_not_found), the body and the wait (400
+// invalid_request), the confinement of a token bound to a fork, calling on
+// the fork's parent, to the changes of the fork (403 token_bound), who may
+// land (authorize, 403 forbidden), the workspace's status (409, such as
+// workspace_archived) and the session (400 unknown_session); then the
+// running attempt is created and handed to the pool, and the request waits
+// for it (answer).
+func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	slug := server.Param(r, "slug")
+	number, ok := positive(server.Param(r, "number"))
+	if !ok {
+		return change.ErrChangeNotFound
+	}
+	ch, err := c.deps.Changes.ReadChange(ctx, nil, slug, number)
+	if err != nil {
+		return err
+	}
+	req, err := parseLand(r)
+	if err != nil {
+		return err
+	}
+	chain, err := c.collect(ctx, nil, ch, req.stack)
+	if err != nil {
+		return err
+	}
+	if err := confine(r, chain...); err != nil {
+		return err
+	}
+	ws, err := c.workspace(ctx, slug)
+	if err != nil {
+		return err
+	}
+	p, _ := identity.PrincipalOf(ctx)
+	caller := change.CallerOf(p)
+	if err := c.authorize(ctx, caller, ch, ws); err != nil {
+		return err
+	}
+	if ws.Ready != nil {
+		return ws.Ready
+	}
+	in := StartInput{
+		Workspace: slug, Number: number, Stack: req.stack, ExpectedVersion: req.expectedVersion, Trigger: TriggerManual,
+		RequestedBy: actorOf(caller), Caller: caller, SessionID: req.sessionID, Override: req.override,
+	}
+	session, err := c.session(ctx, in)
+	if err != nil {
+		return err
+	}
+	a, err := c.create(ctx, ws, in, session)
+	if err != nil {
+		return err
+	}
+	return c.answer(ctx, w, a, req.wait)
+}
+
+// actorOf is the actor caller is, as an attempt's requested_by names it.
+func actorOf(caller change.Caller) change.Actor {
+	a := change.Actor{ActorType: caller.Credential.Type}
+	if caller.UserID != "" {
+		a.ActorID = new(caller.UserID)
+	}
+	if caller.Username != "" {
+		a.Username = new(caller.Username)
+	}
+	return a
+}
+
+// answer waits up to wait for the attempt a to end, and answers it as it
+// then is: 200 when it is final, 202 while it runs on. The attempt runs on
+// the pool whatever becomes of the request: a caller that goes away ends
+// only the wait.
+func (c *Component) answer(ctx context.Context, w http.ResponseWriter, a Attempt, wait time.Duration) error {
+	if wait > 0 {
+		select {
+		case <-c.ended(a.ID):
+		case <-c.deps.After(wait):
+		case <-ctx.Done():
+		}
+	}
+	got, found, err := readAttempt(context.WithoutCancel(ctx), c.deps.Store.Main(), a.Workspace, a.ID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errLandNotFound(a.Workspace, a.ID)
+	}
+	status := http.StatusOK
+	if got.Status == StatusRunning {
+		status = http.StatusAccepted
+	}
+	server.WriteJSON(w, status, got)
 	return nil
 }

@@ -4352,8 +4352,8 @@ state instead.
 Landing adds a change's commits to its target branch. Every request to
 land a change, or a stack of changes, is recorded as a land attempt,
 which is kept for the life of its workspace: the teardown that deletes a
-workspace deletes its attempts. The land route that creates attempts is
-not served yet; the hub serves the attempts read-only.
+workspace deletes its attempts. `POST …/changes/{number}/land` creates
+an attempt and answers it; three routes read the attempts.
 
 The land attempt object:
 
@@ -4446,8 +4446,69 @@ The three reads need the scope `changes:read` and read access to
 `{slug}`. Both lists are [lists](#lists) ordered newest first: by
 `created_at` at the whole second it shows, then by `id`, both descending.
 A token bound to a task fork, calling on the fork's parent, reaches
-`GET …/changes/{number}/lands` and `GET …/lands/{id}`; `GET …/lands` is
-answered `403` `token_bound`.
+`GET …/changes/{number}/lands` for a change whose source is the fork and
+`GET …/lands/{id}` for an attempt one of whose changes comes from the
+fork; another change or attempt is answered `403` `token_bound` (the
+change routes answer such a change `404`), an unknown number or id keeps
+its `404`, and `GET …/lands` is always `403` `token_bound`.
+
+### `POST /api/v1/workspaces/{slug}/changes/{number}/land`
+
+Lands the change `{number}` of `{slug}` on its target branch, or, with
+`stack` `true`, the change and every change below it down its
+`depends_on` that is not `landed`, bottom first. It is a create route
+(see [Idempotency](#idempotency)). The body is absent or a JSON object;
+members not listed are ignored.
+
+| Member | Value |
+|---|---|
+| `expected_version` | an integer of at least 1, the version the change must be at |
+| `stack` | a boolean, `false` when absent |
+| `override` | an object whose `reason` is a string that is not blank. With no override rule registered it is accepted and never applied, and the attempt shows `override` `null` |
+| `session_id` | a string, the session the land is asked in |
+
+The query parameter `wait`, a whole number of seconds from 0 to 60 (30
+when absent), is how long the call waits for the attempt's end.
+
+The checks, in this order, each refusal creating no attempt and moving
+nothing:
+
+1. the scope `changes:write` (`403` `insufficient_scope`, whether or not
+   `{slug}` exists) and read access to `{slug}` (`404` `not_found`, with
+   the same body as for a workspace that does not exist);
+2. the change: a `{number}` that is not a positive integer or names no
+   change of `{slug}` is `404` `change_not_found`;
+3. the body and `wait`: `400` `invalid_request`, such as
+   `expected_version: must be an integer of at least 1`, `stack: must be a
+   boolean`, `override: must be an object whose reason is a string that is
+   not blank`, `session_id: must be a string` or `wait must be a whole
+   number of seconds from 0 to 60`;
+4. a token bound to a task fork, calling on the fork's parent, lands only
+   changes whose source is the fork, a whole stack included: `403`
+   `token_bound` otherwise;
+5. who may land: the admin token, the owner of `{slug}`, and, while the
+   workspace setting `land.by_author` is `true` (its default), the
+   change's author with any credential of theirs, such as an org member
+   landing the change they opened from their fork. Anyone else who reads
+   `{slug}` gets `403` `forbidden`;
+6. the state of `{slug}`: `409` `workspace_archived`, `workspace_busy` or
+   `workspace_not_ready`;
+7. `session_id` must pass the session-linking rule: `400`
+   `unknown_session` otherwise. Until the session feature is installed,
+   every `session_id` is refused.
+
+Then the hub creates the land attempt, `running`, in one transaction with
+the link of its session: `trigger` `manual`, `strategy` the workspace's
+`land.strategy` at that moment, `attempts` `0`, `requested_by` the
+caller, and each change at its current version. The attempt runs on the
+hub's pool; nothing is locked while it runs, so the lands of different
+changes, also on one target branch, run side by side and meet only in the
+compare-and-swap. The call waits up to `wait` seconds for the attempt's
+end and answers `200` with the land attempt once it is final, or `202`
+with the attempt still `running` when the wait runs out, `wait=0`
+answering at once. The attempt goes on whatever becomes of the call: a
+caller that goes away stops nothing, and `GET …/lands/{id}` gives its
+final form later.
 
 ### `GET /api/v1/workspaces/{slug}/changes/{number}/lands`
 

@@ -26,7 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
+| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -4325,7 +4325,9 @@ to the store (`Store`), the hub's git opening
 `config.Land` (`MaxAttempts`, `Workers`, `Timeout`, and the committer name
 and e-mail as `Committer`);
 `AdjustLand` adjusters run before the bind, and `Bind` defaults
-`MaxAttempts` to 10, `Workers` to 8 and `Timeout` to 5 minutes. The start
+`MaxAttempts` to 10, `Workers` to 8, `Timeout` to 5 minutes and `After`,
+the clock a land request waits on, to `time.After`. No session linker is
+registered. The start
 hook `land-journal`, after `land`, runs `(*land.Component).Reconcile`.
 The part adds the background work `land_pool` (grace 5 s), which runs
 `RunPool` until the stop.
@@ -4351,6 +4353,32 @@ the workspace does not have is `404 change_not_found`, and selects the
 attempts with a covered change of that number; `GET …/lands` adds a
 condition per filter. Both order by `created_at / 1000000000` (the shown
 second) and `id`, descending, and page by keyset on those two values.
+For a token bound to a fork, calling on the fork's parent
+(`access.BindingOf`, relation `parent_of_bound_fork`), `authz.go`'s
+`confine` answers `403 token_bound` for a change whose source is not the
+fork and `confineAttempt` for an attempt none of whose covered changes
+comes from it; `GET …/lands` is refused by the binding guard, since it is
+not a contributor route.
+
+The land route (`routes.go`, `landRoute`) reads the change, then the
+body and the `wait` query (`parseLand`), collects the changes it covers
+(`collect`: the change, or for `stack` the changes down its `depends_on`
+up to a landed one, bottom first, a cycle ending the walk), confines a
+fork-bound token to them, admits the caller (`authorize`: the admin
+token, a user for whom `Access.CanWrite` holds, or the change's author
+while `land.by_author` is on; else `403 forbidden`), checks the
+workspace's `Ready`, then the session (`session`: the registered
+`SessionLinker`'s `Check`, `400 unknown_session` for a refused id and for
+every id while none is registered). `create` then reads the changes again
+in one store transaction, inserts the running attempt with each change's
+current version, head, base and source, and has the linker `Record` the
+session's link in that transaction; after it commits the attempt is
+handed to the pool (`submit`). Nothing is held across an attempt.
+`answer` waits for `ended(id)`, `Deps.After(wait)` or the request's end,
+whichever comes first, then reads the attempt and answers `200` when it
+is final, `202` while it runs. `(*land.Component).Start(ctx, StartInput)`
+does the same from the workspace's `Ready` on, without a request, for a
+land with the trigger `auto_land`.
 
 A land replays a change with `(*gitrepo.Repo).RebaseFromAs`, which takes
 the landing identity as committer and says what each commit of the change

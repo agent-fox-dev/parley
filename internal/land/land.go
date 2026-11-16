@@ -147,6 +147,9 @@ type Deps struct {
 	// none ends, as when the hub stops right after taking it, so that a
 	// test keeps attempts running across a restart.
 	Paused bool
+	// After is the clock a land request waits on for its attempt's end;
+	// nil is time.After.
+	After func(time.Duration) <-chan time.Time
 }
 
 // DefaultMaxAttempts is how many times an attempt tries to move the target
@@ -173,6 +176,7 @@ type Component struct {
 	mu       sync.RWMutex
 	gate     Gate
 	override OverrideRule
+	sessions SessionLinker
 
 	pool  pool
 	seams seams
@@ -209,7 +213,43 @@ func (c *Component) Bind(d Deps) {
 	if d.Timeout <= 0 {
 		d.Timeout = DefaultTimeout
 	}
+	if d.After == nil {
+		d.After = time.After
+	}
 	c.deps = d
 	c.pool.jobs = map[string]*job{}
 	c.pool.slots = make(chan struct{}, d.Workers)
+}
+
+// SessionLinker is the session-linking rule and the session record, which
+// the session feature keeps. Without one no session exists, so that every
+// session_id a land names is refused: an unchecked id would attribute the
+// land to a session nobody verified.
+type SessionLinker interface {
+	// Check judges the session id named for a land in the workspace, the
+	// target, by caller. It returns the id as it is to be stored when it
+	// accepts it, an error matching change.ErrUnknownSession when it
+	// refuses it, and any other error when it cannot tell.
+	Check(ctx context.Context, caller change.Caller, sessionID, workspace string) (string, error)
+	// Record links the session to the land attempt landID of the
+	// workspace in tx, the transaction that creates the attempt; its error
+	// undoes the attempt.
+	Record(ctx context.Context, tx *sql.Tx, sessionID, workspace, landID string) error
+}
+
+// RegisterSessionLinker makes l the session linker, replacing the one
+// before; nil removes it. It is registered on the instance while the hub
+// is composed, so that every hub has its own
+// (docs/adr/08-register-the-push-collaborators-on-the-ref-writer.md).
+func (c *Component) RegisterSessionLinker(l SessionLinker) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessions = l
+}
+
+// sessionLinker is the registered session linker, nil for none.
+func (c *Component) sessionLinker() SessionLinker {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessions
 }

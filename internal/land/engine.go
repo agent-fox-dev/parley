@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // run runs the running attempt a to its final status: it asks the policy
@@ -189,3 +193,174 @@ var errStopped = errors.New("stopped")
 
 // now is the component's clock, in UTC.
 func (c *Component) now() time.Time { return c.deps.Now().UTC() }
+
+// StartInput is a land to start: the change, how it was asked for and by
+// whom.
+type StartInput struct {
+	// Workspace is the slug of the workspace whose change Number is to
+	// land on its target branch; Stack lands it with every change below
+	// it that is not landed.
+	Workspace string
+	Number    int64
+	Stack     bool
+	// ExpectedVersion is the version the change must be at, nil for any.
+	ExpectedVersion *int64
+	// Trigger is TriggerManual or TriggerAutoLand.
+	Trigger string
+	// RequestedBy is who the attempt shows as having asked for it, and
+	// the actor of its events. Caller is who it runs as: the session
+	// linker and the policy gate judge it, and its credential is stored
+	// with the attempt.
+	RequestedBy change.Actor
+	Caller      change.Caller
+	// SessionID is the session the land is asked in, nil for none.
+	SessionID *string
+	// Override is the override the land is asked with, nil for none.
+	Override *Override
+}
+
+// Start starts the land in, as the land route does once its caller is
+// admitted, for a land no request asks for, such as the automatic landing
+// of a change: it checks that the workspace takes a land and the session,
+// creates the running attempt and hands it to the pool, which runs it to
+// its end. It asks no request guard. The attempt returned is as it was
+// created.
+func (c *Component) Start(ctx context.Context, in StartInput) (Attempt, error) {
+	ws, err := c.workspace(ctx, in.Workspace)
+	if err != nil {
+		return Attempt{}, err
+	}
+	if ws.Ready != nil {
+		return Attempt{}, ws.Ready
+	}
+	session, err := c.session(ctx, in)
+	if err != nil {
+		return Attempt{}, err
+	}
+	return c.create(ctx, ws, in, session)
+}
+
+// workspace is the workspace record slug, 404 not_found for none.
+func (c *Component) workspace(ctx context.Context, slug string) (Workspace, error) {
+	ws, found, err := c.deps.Workspaces.Workspace(ctx, c.deps.Store.Main(), slug)
+	if err == nil && !found {
+		err = server.NotFound(fmt.Sprintf("no workspace %q", slug))
+	}
+	return ws, err
+}
+
+// linked is a session the session linker accepted, with the linker that
+// records the land's link to it.
+type linked struct {
+	id     string
+	linker SessionLinker
+}
+
+// session is the session the land in is asked in, as the session linker
+// accepts it; nil for none. A session the linker refuses, and every
+// session while none is registered, is 400 unknown_session.
+func (c *Component) session(ctx context.Context, in StartInput) (*linked, error) {
+	if in.SessionID == nil {
+		return nil, nil
+	}
+	unknown := server.NewError("unknown_session", http.StatusBadRequest, fmt.Sprintf("session_id: no session %q", *in.SessionID))
+	linker := c.sessionLinker()
+	if linker == nil {
+		return nil, unknown
+	}
+	id, err := linker.Check(ctx, in.Caller, *in.SessionID, in.Workspace)
+	switch {
+	case errors.Is(err, change.ErrUnknownSession):
+		return nil, unknown
+	case err != nil:
+		return nil, err
+	}
+	return &linked{id, linker}, nil
+}
+
+// create creates the running attempt of the land in on the workspace ws,
+// in the session (nil for none), and hands it to the pool. The attempt is
+// created in one store transaction from what that transaction reads of
+// its changes, each at its current version, with the session's link to
+// it, so that what is judged of the changes there holds for the attempt
+// stored; the strategy is the workspace's land.strategy as read before.
+// Nothing is held beyond that transaction: the attempts of different
+// changes run side by side, also on one target, and meet only in the
+// compare-and-swap of the target.
+func (c *Component) create(ctx context.Context, ws Workspace, in StartInput, session *linked) (Attempt, error) {
+	a := Attempt{
+		ID: uuid.New().String(), Workspace: ws.Slug, Status: StatusRunning, Trigger: in.Trigger, Strategy: ws.Strategy,
+		RequestedBy: in.RequestedBy, CredentialID: in.Caller.Credential.ID,
+	}
+	if a.Strategy == "" {
+		a.Strategy = StrategyRebase
+	}
+	if session != nil {
+		a.SessionID = &session.id
+	}
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		ch, err := c.deps.Changes.ReadChange(ctx, tx, ws.Slug, in.Number)
+		if err != nil {
+			return err
+		}
+		chain, err := c.collect(ctx, tx, ch, in.Stack)
+		if err != nil {
+			return err
+		}
+		a.TargetBranch, a.Covered, a.CreatedAt = ch.TargetBranch, covered(chain), c.now()
+		if err := insertAttempt(ctx, tx, a); err != nil {
+			return err
+		}
+		if session != nil {
+			return session.linker.Record(ctx, tx, session.id, ws.Slug, a.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return Attempt{}, err
+	}
+	c.submit(a, a.CreatedAt)
+	return a, nil
+}
+
+// collect is the changes a land of ch covers, bottom first, read through
+// q (nil for the store): ch alone, or for a stack ch and the changes below
+// it down its depends_on, up to the first that is landed or does not
+// exist. A depends_on that leads back to a change already collected ends
+// the walk, so that a cycle cannot hold it.
+func (c *Component) collect(ctx context.Context, q Querier, ch change.Change, stack bool) ([]change.Change, error) {
+	chain := []change.Change{ch}
+	for cur := ch; stack && cur.DependsOn != nil; {
+		next := *cur.DependsOn
+		if slices.ContainsFunc(chain, func(x change.Change) bool { return x.Number == next }) {
+			break
+		}
+		below, err := c.deps.Changes.ReadChange(ctx, q, ch.WorkspaceSlug, next)
+		if errors.Is(err, change.ErrChangeNotFound) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if below.State == change.StateLanded {
+			break
+		}
+		chain, cur = append(chain, below), below
+	}
+	slices.Reverse(chain)
+	return chain, nil
+}
+
+// covered is each change of chain as an attempt covers it: at its current
+// version, with that version's head and base and the change's source.
+func covered(chain []change.Change) []CoveredChange {
+	out := make([]CoveredChange, len(chain))
+	for i, ch := range chain {
+		out[i] = CoveredChange{Number: ch.Number, Version: ch.Version, Head: ch.HeadSHA,
+			SourceWorkspace: ch.Source.WorkspaceSlug, SourceBranch: ch.Source.Branch}
+		if ch.BaseSHA != nil {
+			out[i].Base = *ch.BaseSHA
+		}
+	}
+	return out
+}

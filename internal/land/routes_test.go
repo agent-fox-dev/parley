@@ -2,15 +2,30 @@ package land_test
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"reflect"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
+
+// isUUID reports whether s is a UUID in its 36-character form.
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return len(s) == 36 && err == nil
+}
 
 // ids are the ids of the items of a list answer, in order.
 func ids(t *testing.T, answer map[string]any) []string {
@@ -227,5 +242,401 @@ func TestLand_AnswersTheWorkspacesAttemptByID(t *testing.T) {
 	}
 	if _, again := w.get(t, path, key); !reflect.DeepEqual(again, after) {
 		t.Errorf("the final attempt reads %v on a later request, had %v", again, after)
+	}
+}
+
+func TestLand_RefusesATokenWithoutTheRoutesScope(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	ch := w.open(t, "f")
+	reader := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"changes:read"}})
+	gitOnly := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"git:read"}})
+	for _, slug := range []string{"api", "nope"} {
+		for _, c := range []struct{ method, path, credential string }{
+			{http.MethodPost, fmt.Sprintf("/workspaces/%s/changes/%d/land", slug, ch.Number), reader},
+			{http.MethodGet, fmt.Sprintf("/workspaces/%s/changes/%d/lands", slug, ch.Number), gitOnly},
+			{http.MethodGet, "/workspaces/" + slug + "/lands", gitOnly},
+			{http.MethodGet, "/workspaces/" + slug + "/lands/" + attemptID(1), gitOnly},
+		} {
+			status, raw := w.Call(t, c.method, "/api/v1"+c.path, c.credential, nil)
+			var answer map[string]any
+			_ = json.Unmarshal(raw, &answer)
+			if status != 403 || errorType(answer) != "insufficient_scope" {
+				t.Errorf("%s %s = %d %s, want 403 insufficient_scope", c.method, c.path, status, raw)
+			}
+		}
+	}
+	if n := w.attempts(t); n != 0 {
+		t.Errorf("%d land attempts, want none", n)
+	}
+}
+
+func TestLand_AdmitsAWriterOfTheTargetAndTheAuthorTheSettingAllows(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	authorID, authorKey := w.member(t, "member-a")
+	_, otherKey := w.member(t, "member-b")
+	strangerKey := w.IssueKey(t, w.CreateUser(t, "stranger"))
+	dir := w.fork(t, "api--a", authorID)
+	author := change.Caller{UserID: authorID, Username: "member-a", Credential: change.Credential{Type: change.CredentialAPIKey, ID: "ka"}}
+	for i, c := range []struct {
+		name, credential string
+		byAuthor         bool
+		status           int
+		errorType        string
+	}{
+		{"the owner", w.ownerKey, true, 200, ""},
+		{"the admin token", w.Token, true, 200, ""},
+		{"the author while land.by_author is true", authorKey, true, 200, ""},
+		{"the author while land.by_author is false", authorKey, false, 403, "forbidden"},
+		{"a member who is not the author", otherKey, true, 403, "forbidden"},
+		{"a user who cannot read the workspace", strangerKey, true, 404, "not_found"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w.configure(t, fmt.Sprintf(`{"changes.auto_restack":false,"land.by_author":%t}`, c.byAuthor))
+			ch := w.openFrom(t, "api--a", dir, "f"+strconv.Itoa(i), author)
+			before, main := w.attempts(t), head(t, w.api, "main")
+			status, raw := w.post(t, c.credential, "api", ch.Number, "", nil)
+			var answer map[string]any
+			_ = json.Unmarshal(raw, &answer)
+			if status != c.status || errorType(answer) != c.errorType {
+				t.Fatalf("POST land = %d %s, want %d %s", status, raw, c.status, c.errorType)
+			}
+			if status == 200 {
+				if answer["status"] != land.StatusLanded {
+					t.Errorf("the attempt is %v, want landed", answer["status"])
+				}
+				return
+			}
+			if after := w.attempts(t); after != before {
+				t.Errorf("a refused land made %d attempts", after-before)
+			}
+			if got := head(t, w.api, "main"); got != main {
+				t.Errorf("a refused land moved main from %s to %s", main, got)
+			}
+			if status == 404 {
+				if _, nope := w.post(t, c.credential, "nope", ch.Number, "", nil); string(nope) != string(raw) {
+					t.Errorf("the answer on api %s differs from the one on nope %s", raw, nope)
+				}
+			}
+		})
+	}
+}
+
+func TestLand_ConfinesATokenBoundToAForkToTheForksChanges(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	f, g := w.fork(t, "api--f", w.owner), w.fork(t, "api--g", w.owner)
+	ofF, ofG := w.openFrom(t, "api--f", f, "f1", w.caller()), w.openFrom(t, "api--g", g, "g1", w.caller())
+	above := w.openFrom(t, "api--f", f, "f2", w.caller())
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		return w.changes.SetDependsOn(ctx, tx, "api", above.Number, &ofG.Number)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	onlyG := finished(running(attemptID(1), "api", "main", time.Now().UTC(), ofG.Number), land.StatusFailed)
+	onlyG.Covered[0].SourceWorkspace = "api--g"
+	w.insert(t, onlyG)
+	bound := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{"changes:read", "changes:write"}, Workspace: "api--f"})
+
+	status, landed := w.landCall(t, bound, ofF.Number, "", nil)
+	if status != 200 || landed["status"] != land.StatusLanded {
+		t.Fatalf("the bound token's land of its fork's change = %d %v, want 200 landed", status, landed)
+	}
+	before := w.attempts(t)
+	for _, c := range []struct {
+		name, method, path string
+		body               any
+		status             int
+		errorType          string
+	}{
+		{"the attempts of the fork's change", http.MethodGet, fmt.Sprintf("changes/%d/lands", ofF.Number), nil, 200, ""},
+		{"the attempt that landed it", http.MethodGet, "lands/" + landed["id"].(string), nil, 200, ""},
+		{"the land of another fork's change", http.MethodPost, fmt.Sprintf("changes/%d/land", ofG.Number), nil, 403, "token_bound"},
+		{"the attempts of another fork's change", http.MethodGet, fmt.Sprintf("changes/%d/lands", ofG.Number), nil, 403, "token_bound"},
+		{"an attempt of another fork's change only", http.MethodGet, "lands/" + onlyG.ID, nil, 403, "token_bound"},
+		{"a stack whose lower change is another fork's", http.MethodPost, fmt.Sprintf("changes/%d/land", above.Number), map[string]any{"stack": true}, 403, "token_bound"},
+		{"the workspace's attempts", http.MethodGet, "lands", nil, 403, "token_bound"},
+		{"an unknown attempt", http.MethodGet, "lands/" + attemptID(42), nil, 404, "land_not_found"},
+		{"an unknown change", http.MethodPost, "changes/999/land", nil, 404, "change_not_found"},
+	} {
+		status, raw := w.Call(t, c.method, "/api/v1/workspaces/api/"+c.path, bound, c.body)
+		var answer map[string]any
+		_ = json.Unmarshal(raw, &answer)
+		if status != c.status || errorType(answer) != c.errorType {
+			t.Errorf("%s: %s %s = %d %s, want %d %s", c.name, c.method, c.path, status, raw, c.status, c.errorType)
+		}
+	}
+	if after := w.attempts(t); after != before {
+		t.Errorf("the refused lands made %d attempts", after-before)
+	}
+}
+
+func TestLand_RefusesARequestItCannotTakeAndCreatesNothing(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	ch := w.open(t, "f")
+	main := head(t, w.api, "main")
+	for _, c := range []struct {
+		number          any
+		query           string
+		body            any
+		status          int
+		errorType, path string
+	}{
+		{number: 999, status: 404, errorType: "change_not_found"},
+		{number: "abc", status: 404, errorType: "change_not_found"},
+		{path: "/workspaces/api/changes/999/lands", status: 404, errorType: "change_not_found"},
+		{body: map[string]any{"expected_version": 0}},
+		{body: map[string]any{"expected_version": "x"}},
+		{body: map[string]any{"expected_version": 1.5}},
+		{body: map[string]any{"stack": "yes"}},
+		{body: map[string]any{"override": map[string]any{}}},
+		{body: map[string]any{"override": map[string]any{"reason": ""}}},
+		{body: map[string]any{"override": map[string]any{"reason": "   "}}},
+		{body: map[string]any{"override": map[string]any{"reason": 7}}},
+		{body: map[string]any{"override": "text"}},
+		{body: map[string]any{"session_id": 5}},
+		{body: "[]"},
+		{query: "wait=-1"},
+		{query: "wait=61"},
+		{query: "wait=abc"},
+		{query: "wait=1.5"},
+		{query: "wait="},
+	} {
+		if c.status == 0 {
+			c.status, c.errorType = 400, "invalid_request"
+		}
+		if c.number == nil {
+			c.number = ch.Number
+		}
+		var status int
+		var answer map[string]any
+		if c.path != "" {
+			status, answer = w.get(t, c.path, w.ownerKey)
+		} else {
+			status, answer = w.landCall(t, w.ownerKey, c.number, c.query, c.body)
+		}
+		if status != c.status || errorType(answer) != c.errorType {
+			t.Errorf("land %v?%s %v = %d %v, want %d %s", c.number, c.query, c.body, status, answer, c.status, c.errorType)
+		}
+	}
+	if n, got := w.attempts(t), head(t, w.api, "main"); n != 0 || got != main {
+		t.Errorf("the refused requests made %d attempts and moved main to %s from %s", n, got, main)
+	}
+
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = 'archived' WHERE slug = 'api'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if status, answer := w.landCall(t, w.ownerKey, ch.Number, "", nil); status != 409 || errorType(answer) != "workspace_archived" {
+		t.Errorf("land in an archived workspace = %d %v, want 409 workspace_archived", status, answer)
+	}
+	if n := w.attempts(t); n != 0 {
+		t.Errorf("the land in an archived workspace made %d attempts", n)
+	}
+}
+
+func TestLand_TakesTheWaitsAtTheEndsOfItsRange(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, query := range []string{"wait=0", "wait=60"} {
+		ch := w.open(t, "w"+strings.TrimPrefix(query, "wait="))
+		if status, answer := w.landCall(t, w.ownerKey, ch.Number, query, map[string]any{}); status != 200 && status != 202 {
+			t.Errorf("land ?%s = %d %v, want 200 or 202", query, status, answer)
+		}
+	}
+}
+
+func TestLand_RefusesASessionTheLinkingRuleRefuses(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	other := w.CreateUser(t, "other")
+	dir := w.fork(t, "api--f", w.owner)
+	ch := w.openFrom(t, "api--f", dir, "f", w.caller())
+	unknown, others, unrelated, own := uuid.New().String(), uuid.New().String(), uuid.New().String(), uuid.New().String()
+	w.sessions.add(others, other, "api")
+	w.sessions.add(unrelated, w.owner, "web")
+	w.sessions.add(own, w.owner, "api--f")
+	for _, id := range []string{unknown, others, unrelated} {
+		status, answer := w.landCall(t, w.ownerKey, ch.Number, "wait=0", map[string]any{"session_id": id})
+		if status != 400 || errorType(answer) != "unknown_session" {
+			t.Errorf("land in session %s = %d %v, want 400 unknown_session", id, status, answer)
+		}
+	}
+	if n := w.attempts(t); n != 0 {
+		t.Fatalf("the refused sessions made %d attempts", n)
+	}
+
+	w.land.RegisterSessionLinker(nil)
+	if status, answer := w.landCall(t, w.ownerKey, ch.Number, "wait=0", map[string]any{"session_id": own}); status != 400 ||
+		errorType(answer) != "unknown_session" {
+		t.Errorf("land in a session with no session linker = %d %v, want 400 unknown_session", status, answer)
+	}
+	w.land.RegisterSessionLinker(w.sessions)
+
+	status, answer := w.landCall(t, w.ownerKey, ch.Number, "", map[string]any{"session_id": own})
+	if status != 200 || answer["session_id"] != own {
+		t.Fatalf("land in the caller's session of the source fork = %d %v, want 200 in %s", status, answer, own)
+	}
+	if want := []string{own + " api " + answer["id"].(string)}; !reflect.DeepEqual(w.sessions.recorded(), want) {
+		t.Errorf("links %v, want %v", w.sessions.recorded(), want)
+	}
+}
+
+func TestLand_CreatesARunningAttemptBeforeAnyReplay(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *land.Deps) { d.Paused = true })
+	w.open(t, "one")
+	two, three := w.open(t, "two"), w.open(t, "three")
+	s := uuid.New().String()
+	w.sessions.add(s, w.owner, "api")
+
+	status, a := w.landCall(t, w.ownerKey, three.Number, "wait=0", map[string]any{"session_id": s})
+	if status != 202 {
+		t.Fatalf("land = %d %v, want 202", status, a)
+	}
+	if id, _ := a["id"].(string); !isUUID(id) {
+		t.Errorf("id %v is no UUID", a["id"])
+	}
+	want := map[string]any{"workspace_slug": "api", "target_branch": "main", "changes": []any{float64(three.Number)},
+		"status": "running", "trigger": "manual", "strategy": "rebase", "attempts": float64(0), "noop": false,
+		"commits": []any{}, "session_id": s, "onto_sha": nil, "landed_sha": nil, "conflict": nil, "blocked": nil,
+		"error": nil, "override": nil, "finished_at": nil, "policy_revision": nil,
+		"requested_by": map[string]any{"actor_type": "api_key", "actor_id": w.owner, "username": "owner"}}
+	for k, v := range want {
+		if got, ok := a[k]; !ok || !reflect.DeepEqual(got, v) {
+			t.Errorf("%s = %v (present %t), want %v", k, got, ok, v)
+		}
+	}
+	if created, _ := a["created_at"].(string); !regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$`).MatchString(created) {
+		t.Errorf("created_at %v is not RFC 3339 UTC in whole seconds", a["created_at"])
+	}
+	if got := w.attempt(t, a["id"].(string)); got.Status != land.StatusRunning || !reflect.DeepEqual(asJSON(t, got), a) {
+		t.Errorf("the store holds %v, answered %v", asJSON(t, got), a)
+	}
+	if _, read := w.get(t, "/workspaces/api/lands/"+a["id"].(string), w.ownerKey); !reflect.DeepEqual(read, a) {
+		t.Errorf("GET the attempt = %v, want %v", read, a)
+	}
+
+	w.configure(t, `{"changes.auto_restack":false,"land.strategy":"squash"}`)
+	if status, b := w.landCall(t, w.ownerKey, two.Number, "wait=0", nil); status != 202 || b["strategy"] != "squash" {
+		t.Errorf("land under land.strategy squash = %d, strategy %v; want 202 squash", status, b["strategy"])
+	}
+
+	auto, err := w.land.Start(context.Background(), land.StartInput{
+		Workspace: "api", Number: 1, Trigger: land.TriggerAutoLand,
+		RequestedBy: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.owner), Username: new("owner")},
+		Caller:      w.caller(),
+	})
+	if err != nil || auto.Trigger != land.TriggerAutoLand || auto.Status != land.StatusRunning || !reflect.DeepEqual(auto.Numbers(), []int64{1}) {
+		t.Fatalf("Start = %+v, %v; want a running auto_land attempt of change 1", auto, err)
+	}
+	if got := w.attempt(t, auto.ID); got.Trigger != land.TriggerAutoLand || *got.RequestedBy.ActorID != w.owner {
+		t.Errorf("the store holds %+v, want the auto_land attempt requested by the owner", got)
+	}
+}
+
+func TestLand_AnswersARunningAttemptOnceTheWaitRanOut(t *testing.T) {
+	t.Parallel()
+	clk := newClock()
+	w := newWorld(t, func(d *land.Deps) { d.After = clk.After })
+	release, parked := make(chan struct{}), make(chan string, 8)
+	land.SetSeams(w.land, land.Seams{BeforeSwap: func(_ context.Context, id string, try int) {
+		if try == 1 {
+			parked <- id
+			<-release
+		}
+	}})
+	type answer struct {
+		status int
+		body   map[string]any
+	}
+	send := func(ch change.Change, query string) <-chan answer {
+		out := make(chan answer, 1)
+		go func() {
+			status, raw := w.post(t, w.ownerKey, "api", ch.Number, query, nil)
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			out <- answer{status, body}
+		}()
+		return out
+	}
+	var ids []string
+	for _, c := range []struct {
+		query string
+		// asked is the wait the request asks the clock for, 0 for none.
+		asked time.Duration
+	}{{"wait=0", 0}, {"wait=2", 2 * time.Second}, {"", 30 * time.Second}} {
+		ch := w.open(t, "w"+strconv.Itoa(len(ids)))
+		got := send(ch, c.query)
+		if c.asked > 0 {
+			if d := clk.waitAsked(t); d != c.asked {
+				t.Fatalf("?%s waits %v, want %v", c.query, d, c.asked)
+			}
+			clk.advance(c.asked - time.Second)
+			select {
+			case a := <-got:
+				t.Fatalf("?%s answered %d %v before its wait ran out", c.query, a.status, a.body)
+			case <-time.After(200 * time.Millisecond):
+			}
+			clk.advance(time.Second)
+		}
+		var a answer
+		select {
+		case a = <-got:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("?%s was not answered within 30 s", c.query)
+		}
+		if id, _ := a.body["id"].(string); a.status != 202 || a.body["status"] != land.StatusRunning || id == "" {
+			t.Fatalf("?%s = %d %v, want 202 running", c.query, a.status, a.body)
+		}
+		ids = append(ids, a.body["id"].(string))
+	}
+
+	// A caller that goes away while it waits leaves its attempt running.
+	ch := w.open(t, "gone")
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL(fmt.Sprintf("/api/v1/workspaces/api/changes/%d/land", ch.Number)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+w.ownerKey)
+	sent := make(chan error, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		sent <- err
+	}()
+	clk.waitAsked(t)
+	cancel()
+	if err := <-sent; err == nil {
+		t.Fatal("the cancelled request was answered")
+	}
+	for range 4 {
+		select {
+		case id := <-parked:
+			if !slices.Contains(ids, id) {
+				ids = append(ids, id)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("fewer than 4 attempts reached the swap within 30 s")
+		}
+	}
+
+	close(release)
+	for _, id := range ids {
+		if a := w.ended(t, id); a.Status != land.StatusLanded {
+			t.Errorf("attempt %s ended %s (%v), want landed", id, a.Status, a.Error)
+		}
+		if _, got := w.get(t, "/workspaces/api/lands/"+id, w.ownerKey); got["status"] != land.StatusLanded {
+			t.Errorf("GET attempt %s reads %v, want landed", id, got["status"])
+		}
 	}
 }

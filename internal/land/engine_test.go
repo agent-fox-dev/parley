@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -249,5 +253,79 @@ func TestRun_EndsAsInternalWhenTheTargetOrAStepFails(t *testing.T) {
 				t.Errorf("main is at %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestLand_RunsTheLandsOfDifferentChangesOnOneTargetSideBySide(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	var changes []change.Change
+	for i := range 6 {
+		changes = append(changes, w.open(t, "c"+strconv.Itoa(i)))
+	}
+	start := make(chan struct{})
+	answers := make(chan map[string]any, len(changes))
+	var wg sync.WaitGroup
+	for _, ch := range changes {
+		wg.Go(func() {
+			<-start
+			status, a := w.landCall(t, w.ownerKey, ch.Number, "", nil)
+			if status != 200 || a["status"] != land.StatusLanded {
+				t.Errorf("land of %s = %d %v, want 200 landed", ch.Ref, status, a)
+			}
+			answers <- a
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(answers)
+	sum := 0
+	for a := range answers {
+		n, _ := a["attempts"].(float64)
+		if n < 1 || n > 6 {
+			t.Errorf("attempt %v took %v tries, want 1 to 6", a["id"], a["attempts"])
+		}
+		sum += int(n)
+	}
+	if sum < 6 {
+		t.Errorf("%d tries in all, want at least 6", sum)
+	}
+	files := strings.Fields(gitrepotest.Git(t, w.api, "ls-tree", "--name-only", "main"))
+	for i := range 6 {
+		if !slices.Contains(files, "c"+strconv.Itoa(i)+".txt") {
+			t.Errorf("main holds %q, want c%d.txt", files, i)
+		}
+	}
+	if merges := gitrepotest.Git(t, w.api, "rev-list", "--min-parents=2", "main"); merges != "" {
+		t.Errorf("main has merge commits %q, want a linear history", merges)
+	}
+
+	parked, release := make(chan string, 1), make(chan struct{})
+	var taken atomic.Bool
+	land.SetSeams(w.land, land.Seams{BeforeSwap: func(_ context.Context, id string, _ int) {
+		if taken.CompareAndSwap(false, true) {
+			parked <- id
+			<-release
+		}
+	}})
+	first, second := w.open(t, "parked"), w.open(t, "passing")
+	if status, a := w.landCall(t, w.ownerKey, first.Number, "wait=0", nil); status != 202 {
+		t.Fatalf("land of the parked change = %d %v, want 202", status, a)
+	}
+	var id string
+	select {
+	case id = <-parked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the attempt did not reach the swap within 30 s")
+	}
+	if status, a := w.landCall(t, w.ownerKey, second.Number, "", nil); status != 200 || a["status"] != land.StatusLanded {
+		t.Errorf("land beside a parked attempt = %d %v, want 200 landed", status, a)
+	}
+	if a := w.attempt(t, id); a.Status != land.StatusRunning {
+		t.Errorf("the parked attempt is %s, want running", a.Status)
+	}
+	close(release)
+	if a := w.ended(t, id); a.Status != land.StatusLanded || a.Attempts != 2 {
+		t.Errorf("the parked attempt ended %s after %d tries, want landed after 2", a.Status, a.Attempts)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"uuid"
@@ -19,6 +20,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/fork"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -40,6 +42,8 @@ type world struct {
 	forks      *fork.Component
 	events     *event.Component
 	workspaces *workspace.Service
+	// sessions is the session linker registered on the land component.
+	sessions *sessionStub
 
 	owner, ownerKey, org string
 	// api is the git directory of api's repository, and base the commit
@@ -51,11 +55,12 @@ type world struct {
 // dependencies before they are bound.
 func newWorld(t *testing.T, adjust ...func(*land.Deps)) *world {
 	t.Helper()
-	w := &world{}
+	w := &world{sessions: &sessionStub{known: map[string]session{}}}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
 		TOML: "[changes]\nmergeable_debounce = \"0s\"\n",
 		Compose: func(c *hub.Composition) {
 			w.land, w.changes, w.forks, w.events, w.workspaces = c.Land(), c.Changes(), c.Forks(), c.Events(), c.Workspaces()
+			w.land.RegisterSessionLinker(w.sessions)
 			for _, fn := range adjust {
 				c.AdjustLand(fn)
 			}
@@ -401,4 +406,191 @@ func (w *world) landPushes(t *testing.T) []event.Record {
 		}
 	}
 	return out
+}
+
+// fork adds a ready task fork slug of api, owned by the user owner and
+// made from base, and returns its git directory.
+func (w *world) fork(t *testing.T, slug, owner string) string {
+	t.Helper()
+	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
+	f := fork.Fork{Workspace: workspace.Workspace{
+		Slug: slug, Kind: access.KindFork, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
+		OwnerID: owner, OrgID: w.org, Status: workspace.StatusReady, DisplayName: slug,
+		ParentSlug: new("api"), ForkPoint: &workspace.ForkPoint{Ref: "main", SHA: w.base},
+		ExpiresAt: new(now.Add(7 * 24 * time.Hour)), AutoChange: new(false),
+		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
+	}}
+	if err := (gitrepo.Git{}).CreateFork(ctx, w.api, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { return fork.Insert(ctx, tx, f) }); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// openFrom opens, through the change component, a change of api by the
+// caller by from a new branch of base in the fork at dir, slug, that adds
+// the file <branch>.txt, and returns it.
+func (w *world) openFrom(t *testing.T, slug, dir, branch string, by change.Caller) change.Change {
+	t.Helper()
+	commit(t, dir, branch, w.base, branch, map[string]string{branch + ".txt": branch + "\n"})
+	in := change.OpenInput{Workspace: "api", SourceWorkspace: slug, SourceBranch: branch, Intent: new("why"),
+		Kind: change.KindRef, Caller: by}
+	var ch change.Change
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		ch, err = w.changes.Open(ctx, tx, in)
+		return err
+	}); err != nil {
+		t.Fatalf("open %s from %s: %v", branch, slug, err)
+	}
+	return ch
+}
+
+// configure sets the settings of api to the JSON object settings.
+func (w *world) configure(t *testing.T, settings string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET settings = ? WHERE slug = 'api'`, settings)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// post sends the land request of the change number of the workspace slug,
+// with the query ("" for none), the body (nil for none) and the
+// credential, and returns the status and the raw answer.
+func (w *world) post(t *testing.T, credential, slug string, number any, query string, body any) (int, []byte) {
+	t.Helper()
+	path := fmt.Sprintf("/api/v1/workspaces/%s/changes/%v/land", slug, number)
+	if query != "" {
+		path += "?" + query
+	}
+	return w.Call(t, http.MethodPost, path, credential, body)
+}
+
+// landCall is post on api, with the answer decoded.
+func (w *world) landCall(t *testing.T, credential string, number any, query string, body any) (int, map[string]any) {
+	t.Helper()
+	status, raw := w.post(t, credential, "api", number, query, body)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("POST land of %v answered %d %q: %v", number, status, raw, err)
+	}
+	return status, out
+}
+
+// errorType is the error_type of an error answer, "" for any other.
+func errorType(answer map[string]any) string {
+	errObj, _ := answer["error"].(map[string]any)
+	s, _ := errObj["error_type"].(string)
+	return s
+}
+
+// attempts counts the land attempts in the store.
+func (w *world) attempts(t *testing.T) (n int) {
+	t.Helper()
+	if err := w.Store.Main().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM land_attempts`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// session is a session as the session stub knows it: the user who
+// created it and the workspace it runs in.
+type session struct{ user, workspace string }
+
+// sessionStub is the session linker of the world: it accepts a session it
+// knows that the caller created, or any session for the admin token,
+// whose workspace is the target, a task fork of api or api for a fork,
+// and keeps every link recorded as "<session> <workspace> <land id>".
+type sessionStub struct {
+	mu    sync.Mutex
+	known map[string]session
+	links []string
+}
+
+func (s *sessionStub) add(id, user, workspace string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.known[id] = session{user, workspace}
+}
+
+func (s *sessionStub) Check(_ context.Context, caller change.Caller, id, workspace string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.known[id]
+	related := func(a, b string) bool { return a == b || strings.HasPrefix(a, b+"--") || strings.HasPrefix(b, a+"--") }
+	if !ok || rec.user != caller.UserID && caller.Credential.Type != change.CredentialAdminToken || !related(rec.workspace, workspace) {
+		return "", change.ErrUnknownSession
+	}
+	return id, nil
+}
+
+func (s *sessionStub) Record(_ context.Context, _ *sql.Tx, id, workspace, landID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.links = append(s.links, id+" "+workspace+" "+landID)
+	return nil
+}
+
+func (s *sessionStub) recorded() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.links)
+}
+
+// clock is a clock the test moves: After answers once the test has moved
+// it past the duration asked for, and tells asked of every duration.
+type clock struct {
+	mu     sync.Mutex
+	now    time.Duration
+	timers []timer
+	asked  chan time.Duration
+}
+
+type timer struct {
+	at time.Duration
+	ch chan time.Time
+}
+
+func newClock() *clock { return &clock{asked: make(chan time.Duration, 16)} }
+
+func (c *clock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	ch := make(chan time.Time, 1)
+	c.timers = append(c.timers, timer{c.now + d, ch})
+	c.mu.Unlock()
+	c.asked <- d
+	return ch
+}
+
+// advance moves the clock on by d and fires every timer due.
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now += d
+	c.timers = slices.DeleteFunc(c.timers, func(tm timer) bool {
+		if tm.at > c.now {
+			return false
+		}
+		tm.ch <- time.Now()
+		return true
+	})
+}
+
+// waitAsked waits until the clock is asked for a duration, at most 30 s,
+// and returns it.
+func (c *clock) waitAsked(t *testing.T) time.Duration {
+	t.Helper()
+	select {
+	case d := <-c.asked:
+		return d
+	case <-time.After(30 * time.Second):
+		t.Fatal("nobody waited on the clock within 30 s")
+		return 0
+	}
 }
