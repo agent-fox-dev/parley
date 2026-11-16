@@ -11,11 +11,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/land"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // another opens a second change from the fork slug's feat into release
@@ -113,6 +115,61 @@ func TestLand_DeletesTheSourceBranchOnlyWhenNothingElseNeedsIt(t *testing.T) {
 				gitrepotest.Git(t, dir, "cat-file", "-e", want+"^{commit}")
 			}
 		})
+	}
+}
+
+// A change opened from a landed change's source branch while the land
+// deletes that branch either keeps the branch or is refused for want of
+// it: the land's check that nothing else needs the branch and its delete
+// leave no opening between them.
+func TestLand_KeepsTheSourceBranchOfAChangeOpenedWhileItIsDeleted(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	gitrepotest.Git(t, w.api, "branch", "release", w.base)
+	slug := "api--race"
+	dir := w.fork(t, slug, w.owner)
+	w.configure(t, `{"changes.auto_restack":false}`)
+	from := commit(t, dir, "feat", w.base, "feat", map[string]string{"race.txt": "x\n"})
+	ch := w.opened(t, change.OpenInput{Workspace: "api", SourceWorkspace: slug, SourceBranch: "feat", Intent: new("why"),
+		Kind: change.KindRef, Caller: w.caller()})
+	opened := make(chan struct{})
+	var openErr error
+	var once sync.Once
+	land.SetSeams(w.land, land.Seams{SourceChecked: func() {
+		once.Do(func() {
+			go func() {
+				defer close(opened)
+				ctx := context.Background()
+				openErr = w.Store.Tx(ctx, func(tx *sql.Tx) error {
+					_, err := w.changes.Open(ctx, tx, change.OpenInput{Workspace: "api", SourceWorkspace: slug, SourceBranch: "feat",
+						TargetBranch: new("release"), Intent: new("why"), Kind: change.KindRef, Caller: w.caller()})
+					return err
+				})
+			}()
+			// The opening gets its turn here unless the land holds the
+			// store until the branch is deleted.
+			select {
+			case <-opened:
+			case <-time.After(time.Second):
+			}
+		})
+	}})
+
+	status, a := w.landCall(t, w.ownerKey, ch.Number, "", nil)
+	<-opened
+
+	if status != 200 || a["status"] != land.StatusLanded {
+		t.Fatalf("land = %d %v, want 200 landed", status, a)
+	}
+	got := head(t, dir, "feat")
+	var refused *server.Error
+	switch {
+	case openErr == nil && got != from:
+		t.Errorf("the second change opened and feat at %q, want it kept at %s", got, from)
+	case openErr != nil && (!errors.As(openErr, &refused) || refused.Type() != "source_not_found"):
+		t.Errorf("opening the second change = %v, want it opened or refused source_not_found", openErr)
+	case openErr != nil && got != "":
+		t.Errorf("the second change refused and feat at %q, want it deleted", got)
 	}
 }
 
