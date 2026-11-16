@@ -22,6 +22,19 @@ type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// Workspace is what the policy routes know of a workspace besides the
+// access decision: its kind (repository or fork), its status, and its
+// default branch, "" for none.
+type Workspace struct {
+	Kind, Status, DefaultBranch string
+}
+
+// WorkspaceReader reads a workspace record through q, the caller's
+// transaction or the store; found is false for a slug no workspace has.
+type WorkspaceReader interface {
+	Workspace(ctx context.Context, q Querier, slug string) (w Workspace, found bool, err error)
+}
+
 // ChangeFacts is what the evaluator knows of a change besides its files.
 type ChangeFacts struct {
 	// Workspace is the slug the change lives under, its target workspace.

@@ -36,6 +36,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
+	"github.com/agent-fox-dev/parley/internal/policy"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/scm"
 	"github.com/agent-fox-dev/parley/internal/scrub"
@@ -74,6 +75,7 @@ var parts = []func(*Composition){
 	composeSCM,
 	composeChanges,
 	composeLand,
+	composePolicy,
 	composeSandbox,
 }
 
@@ -224,6 +226,12 @@ type Composition struct {
 	// dependencies (AdjustLand).
 	land          *land.Component
 	landAdjusters []func(*land.Deps)
+
+	// policy is the policy component composePolicy creates and binds in
+	// its start hook (Policy), after policyAdjusters have changed its
+	// dependencies (AdjustPolicy).
+	policy          *policy.Component
+	policyAdjusters []func(*policy.Deps)
 
 	// refWriter is the ref writer every surface that writes refs writes
 	// through (RefWriter). It exists from the composition on, so that a

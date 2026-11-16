@@ -4841,6 +4841,49 @@ not a UUID, that names no attempt, or that names an attempt of another
 workspace is `404` `land_not_found`, with the message `<slug> has no land
 attempt "<id>"`.
 
+## Landing policy
+
+A workspace's landing policy is a document of ordered rules that says what
+each part of the repository needs before a change touching it may land.
+Every replacement of the document is a new revision of it, numbered from
+1 and kept with when and by whom it was written; the teardown that deletes
+a workspace deletes its revisions. A workspace that never set a policy is
+at revision 0, the never-set document: no rules, and a default that
+requires nothing. Revision 0 is never stored. A task fork has no policy
+of its own and is always at revision 0, whatever its parent's policy is.
+
+The policy object:
+
+```json
+{"revision":2,"default":{"approvals":0,"approvers":["owner"],"checks":[],"fresh_checks":false,"block":false},"rules":[{"name":"all","paths":["**"],"exclude":[],"require":{"approvals":2,"approvers":["owner"],"checks":[],"fresh_checks":false,"block":false}}],"updated_at":"2026-11-16T10:00:03Z","updated_by":{"actor_type":"admin_token","actor_id":null,"username":null}}
+```
+
+| Member | Meaning |
+|---|---|
+| `revision` | the revision's number, `0` for the never-set document |
+| `default`, `rules` | the document in normal form: every requirement member present, `exclude` `[]` where it was absent, and `targets` only on a rule that gave it |
+| `updated_at` | when the revision was written, `null` at revision 0 |
+| `updated_by` | who wrote it: `actor_type` (`api_key`, `pat` or `admin_token`), `actor_id` and `username`, the user's id and username, both `null` for the admin token; `null` at revision 0 |
+
+The revision-0 object is
+`{"revision":0,"default":{"approvals":0,"approvers":["owner"],"checks":[],"fresh_checks":false,"block":false},"rules":[],"updated_at":null,"updated_by":null}`.
+
+### `GET /api/v1/workspaces/{slug}/policy`
+
+Needs the scope `changes:read` and `read` access, so an org member, a
+token bound to a task fork of `{slug}` (a contributor route) and any
+reader of an archived workspace read it as the owner does. Answers `200`
+with the policy object of the current revision and the header `ETag:
+"<revision>"`, the number in double quotes. The query parameter
+`revision` asks for an earlier revision: `200` with that revision as it
+was written, and its number as the `ETag`, while it is kept; revision `0`
+only while no policy was ever set (on a task fork, always). A revision
+that is not kept, `0` after a policy was set, and any other revision of a
+task fork, is `404` `not_found` with the message `no such policy
+revision`; a value that is not a non-negative integer in decimal digits
+(empty, `-1`, `+1`, `1.5`, `abc`) is `400` `invalid_request` with the
+message `revision must be a non-negative integer`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
