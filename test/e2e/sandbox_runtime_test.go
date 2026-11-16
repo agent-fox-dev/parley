@@ -31,9 +31,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // gatewayRelease is the release the gateway of these tests reports, inside
 // the supported range.
 const gatewayRelease = "0.1.8"
@@ -122,6 +119,7 @@ func TestSandboxRuntime_AnOperatorEnablesSandboxesAndADeveloperListsTheProfiles(
 }
 
 func TestSandboxRuntime_AnOperatorStartsTheHubAgainstAGatewayThatIsNotThere(t *testing.T) {
+	parallel(t)
 	gatewayPort, hubPort := closedPort(t), closedPort(t)
 	dir := t.TempDir()
 	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = "+strconv.Itoa(hubPort)+"\nexternal_url = \"https://hub.test\"\n"+
@@ -167,6 +165,7 @@ func TestSandboxRuntime_AnOperatorStartsTheHubAgainstAGatewayThatIsNotThere(t *t
 }
 
 func TestSandboxRuntime_AnAgentAsksAHubWithoutSandboxesForTheProfiles(t *testing.T) {
+	parallel(t)
 	h := hubtest.StartWith(t, hubtest.Config{Compose: func(c *hub.Composition) {
 		c.SetSandboxRuntime(func(*sandbox.Settings, sandbox.RuntimeDeps) (runtime.Client, error) {
 			t.Error("the hub built a runtime client without a [sandbox] section")
@@ -186,6 +185,7 @@ func TestSandboxRuntime_AnAgentAsksAHubWithoutSandboxesForTheProfiles(t *testing
 }
 
 func TestSandboxRuntime_TheGatewayGoesAwayWhileTheHubRuns(t *testing.T) {
+	parallel(t)
 	gw := &countingGateway{ClientInterface: newGateway()}
 	src := oneSandbox{sandbox.Item{
 		CreatedAt: time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC), ID: "sb-1",

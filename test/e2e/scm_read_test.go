@@ -16,9 +16,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // startSCMHub starts a hub whose workspace demo is cloned, the way a
 // workspace is registered through the API (create, then clone), from an
 // origin that holds what stream imports, and returns the hub and the place
@@ -75,6 +72,7 @@ func scmGet(t *testing.T, h *workspaceHub, path, credential string, header ...st
 // between two commits of the history, all without a clone and without
 // moving a ref.
 func TestSCMRead_AnAgentReadsAFileByNameThenByIdThenADiff(t *testing.T) {
+	parallel(t)
 	const readmeV2 = "second version\n"
 	h, repo := startSCMHub(t, ""+
 		"commit refs/heads/main\nmark :1\ncommitter A <a@example.com> 1700000000 +0000\ndata 6\nfirst\n"+

@@ -19,9 +19,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // syncEventType is the event a completed sync writes.
 const syncEventType = "parley.workspace.sync"
 
@@ -77,6 +74,7 @@ func syncResults(t *testing.T, answer map[string]any) map[string]string {
 }
 
 func TestWorkspaceSync_ADeveloperSyncsFromTheShellAndIsToldWhichBranchDiverged(t *testing.T) {
+	parallel(t)
 	origin := newOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", syncToken))
 	origin.Branch("release/1.x", "main")
 	h := startWorkspaceHub(t, origin, "my-project")
@@ -237,6 +235,7 @@ func (p *switchedProxy) down() {
 }
 
 func TestWorkspaceSync_AnAgentsSyncFailsWhileOriginIsUnreachableAndSucceedsWhenItIsBack(t *testing.T) {
+	parallel(t)
 	origin := newOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", syncToken))
 	h := startWorkspaceHub(t, origin, "my-project")
 	originAddr := strings.TrimPrefix(strings.TrimSuffix(origin.URL(), "/origin.git"), "https://")

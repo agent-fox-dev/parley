@@ -38,6 +38,7 @@ func (h *workspaceHub) changeEventTypes(t *testing.T, slug string) []string {
 // shell, reads it back by number and by commit, and fetches its first
 // version's ref with stock git.
 func TestChange_ADeveloperOpensAChangeAndReadsItBackByNumberCommitAndRef(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	g := newGitClient(t, h.URL(""), h.key)
 	dir := filepath.Join(t.TempDir(), "demo")
@@ -116,6 +117,7 @@ func TestChange_ADeveloperOpensAChangeAndReadsItBackByNumberCommitAndRef(t *test
 // control API, which records the second version with the ref update, and
 // reads the versions and the interdiff of the two from the shell.
 func TestChange_AnAgentCommitsToTheSourceAndReadsWhatMovedBetweenTwoVersions(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	agent := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"git:write", "changes:write", "changes:read"}, CreatedAt: time.Now()})
 	commits := "/api/v1/workspaces/demo/scm/commits"

@@ -63,6 +63,7 @@ func (h *lifecycleHub) policyUpdates(t *testing.T) []map[string]any {
 // changes of demo follow it at once, and the revision reads back as the set
 // command printed it.
 func TestPolicy_ADeveloperSetsAPolicyAndTheOpenChangesFollowIt(t *testing.T) {
+	parallel(t)
 	h, file := startPolicyHub(t)
 	owner := cloneAs(t, h.forkHub, h.key, "demo")
 	top := strings.TrimSpace(owner("rev-parse", "--show-toplevel"))
@@ -108,6 +109,7 @@ func TestPolicy_ADeveloperSetsAPolicyAndTheOpenChangesFollowIt(t *testing.T) {
 // need under the parent's policy before any change exists, and cannot
 // replace that policy.
 func TestPolicy_AnAgentAsksWhatPathsWouldNeedAndCannotSetThePolicy(t *testing.T) {
+	parallel(t)
 	h, file := startPolicyHub(t)
 	var doc map[string]any
 	if err := json.Unmarshal([]byte(examplePolicy), &doc); err != nil {

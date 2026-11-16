@@ -13,9 +13,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 func TestKeys_ADeveloperRefreshesTheKeyOnTheirMachine(t *testing.T) {
 	h := startIdentityHub(t)
 	h.CreateUser(t, "alice")

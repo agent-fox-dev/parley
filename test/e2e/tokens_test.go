@@ -9,9 +9,6 @@ import (
 	"testing"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // sendJSON sends method to url with authorization as the Authorization
 // header and body as JSON, and returns the status and the answer as a JSON
 // object.
@@ -53,6 +50,7 @@ func itemByID(t *testing.T, r ran, id string, value any) map[string]any {
 }
 
 func TestTokens_ADeveloperMintsAPathScopedTokenThatAnAgentNarrowsAndTheDeveloperRevokes(t *testing.T) {
+	parallel(t)
 	h := startIdentityHub(t)
 	h.CreateUser(t, "alice")
 	key := h.issueKey(t, "alice")
@@ -98,6 +96,7 @@ func TestTokens_ADeveloperMintsAPathScopedTokenThatAnAgentNarrowsAndTheDeveloper
 }
 
 func TestTokens_AnOperatorRevokesAUsersToken(t *testing.T) {
+	parallel(t)
 	h := startIdentityHub(t)
 	h.CreateUser(t, "alice")
 	pat := h.must(t, h.issueKey(t, "alice"), "tokens", "create", "--name", "ops", "--permissions", "users:read").json(t)

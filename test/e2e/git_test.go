@@ -133,6 +133,7 @@ func gitRequests(h *forkHub, before map[gitserver.RequestLabels]uint64) map[gits
 }
 
 func TestGit_ADeveloperClonesAWorkspaceWithStockGitAndTheCredentialHelper(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	head := seedGitHistory(t, h.repo("demo"))
 	url := h.URL("/git/acme/demo.git")
@@ -196,6 +197,7 @@ func (v withChange) ForkRefs(ctx context.Context, slug string) (gitserver.ForkRe
 }
 
 func TestGit_AnAgentFetchesFromATaskForkWithABoundToken(t *testing.T) {
+	parallel(t)
 	h := startForkHubWith(t, nil, func(c *hub.Composition) {
 		c.AdjustGitServer(func(d *gitserver.Deps) { d.ForkView = withChange{d.ForkView, 7} })
 	})

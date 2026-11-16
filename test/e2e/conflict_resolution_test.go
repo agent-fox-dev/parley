@@ -63,6 +63,7 @@ func conflictingChanges(t *testing.T) (h *lifecycleHub, owner, pusher func(...st
 // the agent's, and the change no longer conflicts, while main stays where
 // the land left it.
 func TestConflictResolution_AnAgentWithoutACloneReadsAConflictAndResolvesIt(t *testing.T) {
+	parallel(t)
 	h, owner, pusher, agent, main0 := conflictingChanges(t)
 
 	c := h.runAs(t, agent, "change", "conflict", "demo", "2", "--fail-on-conflict")

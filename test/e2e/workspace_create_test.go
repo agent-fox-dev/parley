@@ -23,9 +23,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // workspaceHub is a hub whose git trusts a test origin, with its
 // repository root in a directory of the test's own, two clone workers, an
 // external URL and a secret key, and a user with an API key.
@@ -90,7 +87,6 @@ func startWorkspaceHubAt(t *testing.T, origin *gitrepotest.Origin, slug string, 
 	})
 	h.user = h.CreateUser(t, "dev")
 	h.key = h.IssueKey(t, h.user)
-	clientEnv(t, t.TempDir())
 	return h
 }
 
@@ -177,6 +173,7 @@ func (h *workspaceHub) events(t *testing.T, typ, slug string) []string {
 }
 
 func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t *testing.T) {
+	parallel(t)
 	origin := newOrigin(t)
 	h := startWorkspaceHub(t, origin, "demo")
 
@@ -204,6 +201,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPublicRepositoryAndTheHubClonesIt(t
 }
 
 func TestWorkspaceCreate_ADeveloperRegistersAPrivateRepositoryWithAToken(t *testing.T) {
+	parallel(t)
 	const token = "tok-123"
 	origin := newOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", token))
 	h := startWorkspaceHub(t, origin, "priv")
@@ -264,6 +262,7 @@ func TestWorkspaceCreate_ADeveloperRegistersAPrivateRepositoryWithAToken(t *test
 }
 
 func TestWorkspaceCreate_AnOperatorRestartsTheHubAndAnInterruptedCloneIsResumed(t *testing.T) {
+	parallel(t)
 	origin := newOrigin(t)
 	h := startWorkspaceHub(t, origin, "slow")
 	origin.Block()

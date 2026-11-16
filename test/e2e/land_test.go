@@ -96,6 +96,7 @@ func fetchMain(run func(...string) string) string {
 // landing identity on top of the developer's, while the fork's branch goes
 // and origin is not touched.
 func TestLand_AnAgentLandsAChangeFromTheCommandLine(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	originMain := h.origin.Head("main")
 	agent := cloneAs(t, h.forkHub, h.agent, "demo--t1")
@@ -159,6 +160,7 @@ func TestLand_AnAgentLandsAChangeFromTheCommandLine(t *testing.T) {
 // linear history, and the moves of main chain from the old head to the
 // new.
 func TestLand_EightChangesLandOnOneTargetAtTheSameMoment(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	owner := cloneAs(t, h.forkHub, h.key, "demo")
 	old := fetchMain(owner)
@@ -243,6 +245,7 @@ func TestLand_EightChangesLandOnOneTargetAtTheSameMoment(t *testing.T) {
 // collided with, and leaves main and the second change as they were but
 // for the conflict it reads.
 func TestLand_AConflictingLandComesBackAsAReportAndChangesNothing(t *testing.T) {
+	parallel(t)
 	h := startLifecycleHub(t)
 	owner := cloneAs(t, h.forkHub, h.key, "demo")
 	commitFile(t, owner, "f.txt", "1\n2\n3\n4\n5\n", "Add f")
@@ -301,6 +304,7 @@ func TestLand_AConflictingLandComesBackAsAReportAndChangesNothing(t *testing.T) 
 // A land is asked for and answered still running when the hub stops
 // before a worker took it up; the next start runs it to its end, once.
 func TestLand_ALandInFlightDuringARestartFinishesAfterwards(t *testing.T) {
+	parallel(t)
 	paused := true
 	h := &lifecycleHub{forkHub: startForkHubWith(t, nil, func(c *hub.Composition) {
 		c.AdjustLand(func(d *land.Deps) { d.Paused = paused })

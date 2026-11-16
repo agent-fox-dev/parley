@@ -20,9 +20,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // forkHub is a workspace hub holding demo, cloned by its workers from an
 // origin whose main has three commits, in the organization acme of the
 // developer and of a second member, who has an API key. Its fork sweep runs
@@ -108,6 +105,7 @@ func str(v map[string]any, members ...string) string {
 }
 
 func TestForkWithTokenEndToEnd(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t, "other")
 	agent, agentKey := h.member, h.memberKey
 	parentDir := h.repo("demo")
@@ -170,6 +168,7 @@ func TestForkWithTokenEndToEnd(t *testing.T) {
 }
 
 func TestMemberForkFollowsParent(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	ctx := context.Background()
 

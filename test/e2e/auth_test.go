@@ -57,6 +57,7 @@ func addWhoami(c *hub.Composition) {
 }
 
 func TestAuth_TheOperatorCallsTheHubWithTheAdminToken(t *testing.T) {
+	parallel(t)
 	dir := t.TempDir()
 	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
 	env := config.MapEnv(map[string]string{"XDG_CONFIG_HOME": dir, "XDG_DATA_HOME": dir})

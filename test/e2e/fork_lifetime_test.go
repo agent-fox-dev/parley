@@ -11,9 +11,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
 
-// The tests of this file set environment variables, so they must not run in
-// parallel.
-
 // loggedEvent is an event of the hub's event log as a reader gets it.
 type loggedEvent struct {
 	Type      string          `json:"type"`
@@ -66,6 +63,7 @@ func expiresAt(t *testing.T, w map[string]any) time.Time {
 }
 
 func TestForkLifetime_AnAgentExtendsItsForkAndDeletesItFromTheShell(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	parentDir := h.repo("demo")
 	parentRefs := gitrepotest.Refs(t, parentDir, "")
@@ -126,6 +124,7 @@ func TestForkLifetime_AnAgentExtendsItsForkAndDeletesItFromTheShell(t *testing.T
 }
 
 func TestForkLifetime_TheSweepRemovesAForkWhoseLifetimeHasEnded(t *testing.T) {
+	parallel(t)
 	clock := &fakeNow{now: time.Now().Truncate(time.Second)}
 	h := startForkHubAt(t, clock.Now)
 	parentRefs := gitrepotest.Refs(t, h.repo("demo"), "")

@@ -39,6 +39,7 @@ func cloneAs(t *testing.T, h *forkHub, credential, slug string) func(args ...str
 // option, adds a version with a plain push, and reads the change the git
 // output named as soon as the push returns.
 func TestPushChange_AnAgentOpensAChangeByPushingAndAddsAVersionWithTheNextPush(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	agent := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"git:read", "git:write", "changes:read", "changes:write"}, CreatedAt: time.Now()})
 	run := cloneAs(t, h, agent, "demo")
@@ -89,6 +90,7 @@ func gitPushEventsOf(t *testing.T, h *forkHub, ref string) int {
 // A developer who mistypes a push option has the whole push refused before
 // anything is written, and is told which option and why.
 func TestPushChange_APushWithAnInvalidOptionIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	g := newGitClient(t, h.URL(""), h.key)
 	dir := filepath.Join(t.TempDir(), "demo")
@@ -125,6 +127,7 @@ func TestPushChange_APushWithAnInvalidOptionIsRefusedBeforeAnythingIsWritten(t *
 // fork's base branch and with the fork's purpose as its intent, while the
 // branch stays in the fork.
 func TestPushChange_APushToATaskForkOpensAChangeInTheParent(t *testing.T) {
+	parallel(t)
 	h := startForkHub(t)
 	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/forks", h.key, map[string]any{
 		"name": "t1", "auto_change": true, "purpose": "speed up retries",
@@ -170,6 +173,7 @@ func (h pushHold) RecordActivity(context.Context, string) error {
 // first opens the change, which follows the branch to the second push's
 // head, and the second push is told that version, recorded as its own.
 func TestPushChange_TwoRacingPushesToATaskForkEachGetTheirVersion(t *testing.T) {
+	parallel(t)
 	hold := make(pushHold)
 	h := startForkHubWith(t, nil, func(c *hub.Composition) { c.RefWriter().RegisterForkActivity(hold) })
 	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/forks", h.key, map[string]any{
