@@ -224,34 +224,17 @@ func claimRequestOf(r *http.Request, maxTTL time.Duration) (claimRequest, error)
 	}
 	req.paths = globs
 
-	intent, ok, err := stringMember(body, "intent")
+	intent, ok, err := intentMember(body)
 	switch {
 	case err != nil:
 		return claimRequest{}, err
 	case !ok:
 		return claimRequest{}, server.InvalidRequest("intent is required")
-	case intent == "":
-		return claimRequest{}, server.InvalidRequest("intent must not be empty")
-	case utf8.RuneCountInString(intent) > maxIntentLength:
-		return claimRequest{}, server.InvalidRequest(fmt.Sprintf("intent is longer than %d characters", maxIntentLength))
 	}
 	req.intent = intent
 
-	ttl, ok, err := stringMember(body, "ttl")
-	if err != nil {
+	if req.ttl, _, err = ttlMember(body, maxTTL); err != nil {
 		return claimRequest{}, err
-	}
-	if ok {
-		d, err := timefmt.ParseDuration(ttl)
-		switch {
-		case err != nil:
-			return claimRequest{}, server.InvalidRequest("ttl must be a duration with a unit of s, m, h or d, such as 1h: " + err.Error())
-		case d < minClaimTTL:
-			return claimRequest{}, server.InvalidRequest("ttl must be at least 1s")
-		case d > maxTTL:
-			return claimRequest{}, server.InvalidRequest("ttl " + ttl + " is longer than [awareness].max_claim_ttl allows")
-		}
-		req.ttl = d
 	}
 
 	target, ok, err := stringMember(body, "target_branch")
@@ -273,6 +256,42 @@ func claimRequestOf(r *http.Request, maxTTL time.Duration) (claimRequest, error)
 		req.session = &session
 	}
 	return req, nil
+}
+
+// intentMember is the member intent of body, and whether it is present and
+// not null: a string of 1 to maxIntentLength characters, else a 400
+// invalid_request.
+func intentMember(body map[string]json.RawMessage) (string, bool, error) {
+	intent, ok, err := stringMember(body, "intent")
+	switch {
+	case err != nil || !ok:
+		return "", false, err
+	case intent == "":
+		return "", false, server.InvalidRequest("intent must not be empty")
+	case utf8.RuneCountInString(intent) > maxIntentLength:
+		return "", false, server.InvalidRequest(fmt.Sprintf("intent is longer than %d characters", maxIntentLength))
+	}
+	return intent, true, nil
+}
+
+// ttlMember is the member ttl of body, and whether it is present and not
+// null: a duration string of at least minClaimTTL and at most maxTTL, else
+// a 400 invalid_request.
+func ttlMember(body map[string]json.RawMessage, maxTTL time.Duration) (time.Duration, bool, error) {
+	ttl, ok, err := stringMember(body, "ttl")
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	d, err := timefmt.ParseDuration(ttl)
+	switch {
+	case err != nil:
+		return 0, false, server.InvalidRequest("ttl must be a duration with a unit of s, m, h or d, such as 1h: " + err.Error())
+	case d < minClaimTTL:
+		return 0, false, server.InvalidRequest("ttl must be at least 1s")
+	case d > maxTTL:
+		return 0, false, server.InvalidRequest("ttl " + ttl + " is longer than [awareness].max_claim_ttl allows")
+	}
+	return d, true, nil
 }
 
 // stringMember is the member name of body as a string, and whether it is

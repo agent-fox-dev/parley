@@ -83,6 +83,7 @@ func composeAwareness(c *Composition) {
 				}
 				return *w.DefaultBranch, nil
 			},
+			Owns:   c.access.CanWrite,
 			Now:    rt.Now,
 			Logger: rt.Logger,
 			Config: cfg,

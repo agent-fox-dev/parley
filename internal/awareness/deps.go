@@ -12,11 +12,16 @@
 // on the files some globs match; creating one answers with the activity of
 // its globs.
 //
-// The package needs five things of others, which it defines as narrow
-// interfaces that the hub wires: the event log it follows (EventSource),
-// the change records it reads (ChangeReader), the repositories it lists a
-// version's files in (Deps.Repos), the event log it writes its own events
-// to (Emitter), and the sessions a claim may name (Sessions).
+// A claim is renewed and released by the user who made it, the owner of
+// the workspace it is stored on, or the admin token.
+//
+// The package needs things of others, which it defines as narrow
+// interfaces and functions that the hub wires: the event log it follows
+// (EventSource), the change records it reads (ChangeReader), the
+// repositories it lists a version's files in (Deps.Repos), the event log it
+// writes its own events to (Emitter), the sessions a claim may name
+// (Sessions), a workspace's default branch (Deps.DefaultBranch) and who
+// owns a workspace (Deps.Owns).
 package awareness
 
 import (
@@ -153,6 +158,10 @@ type Deps struct {
 	// of an activity that names none; nil, or "", for a workspace without
 	// one.
 	DefaultBranch func(ctx context.Context, slug string) (string, error)
+	// Owns reports whether the user userID owns the workspace slug, by the
+	// access rule's level: the owner may renew and release every claim
+	// stored on it. nil owns nothing.
+	Owns func(ctx context.Context, userID, slug string) (bool, error)
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
 	// Logger is told of what fails and stops nothing, such as a version
@@ -198,6 +207,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.DefaultBranch == nil {
 		d.DefaultBranch = func(context.Context, string) (string, error) { return "", nil }
+	}
+	if d.Owns == nil {
+		d.Owns = func(context.Context, string, string) (bool, error) { return false, nil }
 	}
 	if d.IndexInterval <= 0 {
 		d.IndexInterval = DefaultIndexInterval

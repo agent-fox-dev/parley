@@ -24,6 +24,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -842,4 +843,121 @@ func firstMember(t testing.TB, raw []byte, key string) []byte {
 		t.Fatalf("%s: %v", raw, err)
 	}
 	return obj[key]
+}
+
+// member makes a new user name a member of acme and returns the user's id
+// and an API key of theirs.
+func (s *served) member(t testing.TB, name string) (id, key string) {
+	t.Helper()
+	id = s.hub.CreateUser(t, name)
+	s.hub.AddMember(t, s.org, id)
+	return id, s.hub.IssueKey(t, id)
+}
+
+// pat issues a PAT of the user that holds perms.
+func (s *served) pat(t testing.TB, user string, perms ...string) string {
+	t.Helper()
+	return s.hub.IssuePAT(t, identity.PATSpec{UserID: user, Permissions: perms})
+}
+
+// call sends method /api/v1/workspaces/<path> with credential and body and
+// returns the answer's status and body.
+func (s *served) call(t testing.TB, method, path, credential string, body any) (int, []byte) {
+	t.Helper()
+	return s.hub.Call(t, method, "/api/v1/workspaces/"+path, credential, body)
+}
+
+// claim gets demo's claim id with the admin token, which must answer 200,
+// and returns it decoded and as it was sent.
+func (s *served) claim(t testing.TB, id string) (claimBody, []byte) {
+	t.Helper()
+	return s.claimOn(t, "demo", id)
+}
+
+// claimOn is claim for the claim id of the workspace slug.
+func (s *served) claimOn(t testing.TB, slug, id string) (claimBody, []byte) {
+	t.Helper()
+	status, raw := s.call(t, http.MethodGet, slug+"/claims/"+id, s.hub.Token, nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET %s/claims/%s = %d %s, want 200", slug, id, status, raw)
+	}
+	var cl claimBody
+	if err := json.Unmarshal(raw, &cl); err != nil {
+		t.Fatal(err)
+	}
+	return cl, raw
+}
+
+// claimRows are the stored claims, every column, one line each, by id.
+func (s *served) claimRows(t testing.TB) []string {
+	t.Helper()
+	rows, err := s.hub.Store.Main().QueryContext(context.Background(), `SELECT id, workspace_slug, target_branch, paths, intent,
+	actor_type, actor_id, username, session_id, change_number, state, created_at, expires_at, ended_at
+	FROM awareness_claims ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		vals := make([]any, 14)
+		ptrs := make([]any, len(vals))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprint(vals...))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// eventsOf is the number of events of type typ in the hub's event log.
+func (s *served) eventsOf(t testing.TB, typ string) int {
+	t.Helper()
+	var n int
+	if err := s.hub.Store.Main().QueryRowContext(context.Background(), `SELECT count(*) FROM hub_events WHERE type = ?`,
+		typ).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// storedClaim is an active claim id of demo on main for api/**, made by the
+// owner of s with an API key at created and expiring an hour later, as
+// edit (nil for none) changes it.
+func (s *served) storedClaim(id string, created time.Time, edit func(*awareness.Claim)) awareness.Claim {
+	cl := awareness.Claim{
+		ID: id, Workspace: "demo", TargetBranch: "main", Paths: []string{"api/**"}, Intent: "rework",
+		By:    awareness.Actor{ActorType: "api_key", ActorID: &s.owner, Username: new("owner")},
+		State: awareness.ClaimActive, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}
+	if edit != nil {
+		edit(&cl)
+	}
+	return cl
+}
+
+// ended makes cl a claim that left the state active for state at at.
+func ended(state string, at time.Time) func(*awareness.Claim) {
+	return func(cl *awareness.Claim) { cl.State, cl.EndedAt = state, &at }
+}
+
+// claimPage is the body of a page of the claim list.
+type claimPage struct {
+	Items      []claimBody `json:"items"`
+	NextCursor *string     `json:"next_cursor"`
+}
+
+// ids are the ids of the page's claims, in order.
+func (p claimPage) ids() []string {
+	out := []string{}
+	for _, c := range p.Items {
+		out = append(out, c.ID)
+	}
+	return out
 }

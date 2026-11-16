@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -200,4 +201,103 @@ WHERE session_id = ? AND state = 'active' AND expires_at > ?`, session, now.Unix
 		return 0, fmt.Errorf("count the claims of the session %s: %w", session, err)
 	}
 	return n, nil
+}
+
+// readClaim is the claim id stored on workspace, read through q, and
+// whether there is one.
+func readClaim(ctx context.Context, q Querier, workspace, id string) (Claim, bool, error) {
+	cl, err := scanClaim(q.QueryRowContext(ctx, `SELECT `+claimColumns+` FROM awareness_claims
+WHERE id = ? AND workspace_slug = ?`, id, workspace).Scan)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Claim{}, false, nil
+	case err != nil:
+		return Claim{}, false, fmt.Errorf("read the claim %s of %s: %w", id, workspace, err)
+	}
+	return cl, true, nil
+}
+
+// claimFilter is what a list of claims selects: the claims in a reported
+// state, of a session ("" for any) and with a glob able to match the same
+// files as path ("" for any).
+type claimFilter struct {
+	state, session, path string
+}
+
+// claimPosition is a claim's place in the claim list, which is ordered by
+// created_at descending, then id descending.
+type claimPosition struct {
+	CreatedAt int64  `json:"created_at"`
+	ID        string `json:"id"`
+}
+
+// positionOfClaim is the place of the claim cl in the claim list.
+func positionOfClaim(cl Claim) claimPosition {
+	return claimPosition{CreatedAt: cl.CreatedAt.UnixNano(), ID: cl.ID}
+}
+
+// listClaims are the claims stored on workspace that f selects, as a read at
+// now reports their state, in the order of the claim list, after the
+// position after (nil for the first), at most limit of them, read through
+// q.
+func listClaims(ctx context.Context, q Querier, workspace string, f claimFilter, now time.Time, after *claimPosition, limit int) ([]Claim, error) {
+	query := `SELECT ` + claimColumns + ` FROM awareness_claims WHERE workspace_slug = ?`
+	args := []any{workspace}
+	switch f.state {
+	case ClaimActive:
+		query += ` AND state = 'active' AND expires_at > ?`
+		args = append(args, now.UnixNano())
+	case ClaimExpired:
+		// A claim stored as active is expired from its expires_at on, before
+		// the expiry run has stored it so.
+		query += ` AND (state = 'expired' OR (state = 'active' AND expires_at <= ?))`
+		args = append(args, now.UnixNano())
+	default:
+		query += ` AND state = ?`
+		args = append(args, f.state)
+	}
+	if f.session != "" {
+		query += ` AND session_id = ?`
+		args = append(args, f.session)
+	}
+	if after != nil {
+		query += ` AND (created_at < ? OR (created_at = ? AND id < ?))`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
+	}
+	rows, err := q.QueryContext(ctx, query+` ORDER BY created_at DESC, id DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list the claims of %s: %w", workspace, err)
+	}
+	defer rows.Close()
+	out := []Claim{}
+	for rows.Next() && len(out) < limit {
+		cl, err := scanClaim(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		if f.path != "" && !overlapsAny(cl.Paths, []string{f.path}) {
+			continue
+		}
+		out = append(out, cl)
+	}
+	return out, rows.Err()
+}
+
+// renewClaim stores, in tx, the expires_at and the intent of the claim cl.
+func renewClaim(ctx context.Context, tx *sql.Tx, cl Claim) error {
+	_, err := tx.ExecContext(ctx, `UPDATE awareness_claims SET expires_at = ?, intent = ? WHERE id = ?`,
+		cl.ExpiresAt.UnixNano(), cl.Intent, cl.ID)
+	if err != nil {
+		return fmt.Errorf("renew the claim %s: %w", cl.ID, err)
+	}
+	return nil
+}
+
+// releaseClaim stores, in tx, the claim id as released at now.
+func releaseClaim(ctx context.Context, tx *sql.Tx, id string, now time.Time) error {
+	_, err := tx.ExecContext(ctx, `UPDATE awareness_claims SET state = 'released', ended_at = ? WHERE id = ?`, now.UnixNano(), id)
+	if err != nil {
+		return fmt.Errorf("release the claim %s: %w", id, err)
+	}
+	return nil
 }
