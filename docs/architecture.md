@@ -4435,7 +4435,8 @@ and goes on.
 
 The engine (`engine.go`) runs one running attempt: it reads the target
 workspace and opens its repository, asks the policy gate once per covered
-change, bottom first (`judge`), then tries up to `Deps.MaxAttempts`
+change, bottom first (`judge`), about the version the attempt covers (its
+number, head and base, beside the change as it reads now), then tries up to `Deps.MaxAttempts`
 times: it counts the try in `attempts`, reads the target head (a target
 branch that does not exist ends the attempt `failed` `internal`; a land
 never creates it), builds the commits

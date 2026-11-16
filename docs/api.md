@@ -4459,7 +4459,9 @@ the changes below.
 
 Before it replays anything the attempt asks the policy gate about each
 change it covers, once and bottom first, with the workspace, the change,
-the version being landed and the caller; a retry of the compare-and-swap
+the version being landed with its head and base commits, and the caller,
+so that a change that got a newer version while the attempt waited is
+judged at the version the attempt lands; a retry of the compare-and-swap
 asks nothing again. With no policy installed every change is `ready`, by
 revision 0, and `policy_revision` is the revision that answered, the
 highest when the answers differ. An answer `pending` or `blocked` on a

@@ -8,13 +8,20 @@ import (
 )
 
 // GateInput is what the policy gate is asked about: one change of an
-// attempt, of the workspace, with the version the attempt lands and the
-// caller who asked for the land.
+// attempt, of the workspace, with the version the attempt lands, the
+// commits of that version, and the caller who asked for the land.
+//
+// Change is the change as it reads when the gate is asked, which may
+// already be at a newer version than the attempt lands; its head, base,
+// stats and paths are then those of the newer version. The gate judges
+// the version the attempt lands: Version, with Head its commit and Base
+// the commit it is based on ("" for none).
 type GateInput struct {
-	Workspace string
-	Change    change.Change
-	Version   int64
-	Caller    change.Caller
+	Workspace  string
+	Change     change.Change
+	Version    int64
+	Head, Base string
+	Caller     change.Caller
 }
 
 // GateAnswer is the policy gate's answer for one change: its status, one
