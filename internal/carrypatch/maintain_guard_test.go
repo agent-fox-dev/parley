@@ -1,13 +1,10 @@
 package carrypatch_test
 
 import (
-	"context"
-	"database/sql"
 	"net/http"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -101,6 +98,7 @@ func TestMaintenanceRoutes_RefuseCallersWithoutWriteAccess(t *testing.T) {
 	for _, rt := range maintenanceRoutes {
 		for _, c := range callers {
 			t.Run(rt.name+"/"+c.name, func(t *testing.T) {
+				t.Parallel()
 				a := rt.call(t, h, c.credential, c.slug, ps["A"].ID, idsOf(ps))
 				if a.status != c.status || a.Error.ErrorType != c.errorType {
 					t.Errorf("%s = %d %s, want %d %s", rt.name, a.status, a.raw, c.status, c.errorType)
@@ -117,11 +115,15 @@ func TestMaintenanceRoutes_RefuseStandardWorkspaces(t *testing.T) {
 	ps := h.carryList(t, "carry", workspace.StatusReady, workspace.MarkerNone)
 	before := h.patches(t, "carry")
 	h.add(t, "plain", workspace.ModeStandard, workspace.StatusReady, workspace.MarkerNone)
-	storeFork(t, h, "carry-fork", "carry")
+	// A task fork is always in mode standard, whatever its parent's mode.
+	h.add(t, "carry-fork", workspace.ModeStandard, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
+		w.Kind, w.ParentSlug, w.GitURL = access.KindFork, new("carry"), nil
+	})
 	ids := []string{uuid.New().String(), uuid.New().String(), uuid.New().String()}
 	for _, rt := range maintenanceRoutes {
 		for _, slug := range []string{"plain", "carry-fork"} {
 			t.Run(rt.name+"/"+slug, func(t *testing.T) {
+				t.Parallel()
 				a := rt.call(t, h, h.key, slug, ids[0], ids)
 				if a.status != http.StatusBadRequest || a.Error.ErrorType != "workspace_mode_mismatch" {
 					t.Errorf("%s on %s = %d %s, want 400 workspace_mode_mismatch", rt.name, slug, a.status, a.raw)
@@ -167,6 +169,7 @@ func TestMaintenanceRoutes_RefuseByWorkspaceStatus(t *testing.T) {
 		before := h.patches(t, s.slug)
 		for _, rt := range maintenanceRoutes {
 			t.Run(rt.name+"/"+s.slug, func(t *testing.T) {
+				t.Parallel()
 				a := rt.call(t, h, h.key, s.slug, ps["A"].ID, idsOf(ps))
 				if a.status != http.StatusConflict || a.Error.ErrorType != s.want {
 					t.Errorf("%s on %s = %d %s, want 409 %s", rt.name, s.slug, a.status, a.raw, s.want)
@@ -196,6 +199,7 @@ func TestMaintenanceRoutes_UnknownPatchIsNotFound(t *testing.T) {
 		}
 		for name, id := range ids {
 			t.Run(rt.name+"/"+name, func(t *testing.T) {
+				t.Parallel()
 				a := rt.call(t, h, h.key, "carry", id, idsOf(ps))
 				if a.status != http.StatusNotFound || a.Error.ErrorType != "not_found" || a.Error.Message != "patch not found" {
 					t.Errorf("%s with %s = %d %s, want 404 not_found %q", rt.name, name, a.status, a.raw, "patch not found")
@@ -206,21 +210,5 @@ func TestMaintenanceRoutes_UnknownPatchIsNotFound(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-// storeFork stores the task fork slug of the workspace parent, owned by
-// the owner; a fork is always in mode standard.
-func storeFork(t *testing.T, h *patchHub, slug, parent string) {
-	t.Helper()
-	now := time.Now().UTC()
-	w := workspace.Workspace{
-		Slug: slug, Kind: access.KindFork, ParentSlug: &parent, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
-		OwnerID: h.owner, OrgID: h.org, Status: workspace.StatusReady, DisplayName: slug,
-		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
-	}
-	ctx := context.Background()
-	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, w) }); err != nil {
-		t.Fatalf("store the fork %s: %v", slug, err)
 	}
 }

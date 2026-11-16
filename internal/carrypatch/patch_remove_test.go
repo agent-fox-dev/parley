@@ -24,6 +24,7 @@ func TestDeletePatch_SoftDeletes(t *testing.T) {
 		{"C", []string{"patch/a", "patch/b"}},
 	}
 	for i, c := range cases {
+		// Serial: each row advances the hub's clock and reads its stamp.
 		t.Run(c.letter, func(t *testing.T) {
 			slug := fmt.Sprintf("delete-%d", i)
 			ps := h.carryList(t, slug, workspace.StatusReady, workspace.MarkerNone)
@@ -152,6 +153,7 @@ func TestRestorePatch_AppendsAsActive(t *testing.T) {
 		}},
 	}
 	for i, w := range ways {
+		// Serial: each row advances the hub's clock and reads its stamp.
 		t.Run(w.name, func(t *testing.T) {
 			slug := fmt.Sprintf("restore-%d", i)
 			ps := h.carryList(t, slug, workspace.StatusReady, workspace.MarkerNone)

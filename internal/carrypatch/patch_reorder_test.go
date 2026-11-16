@@ -44,6 +44,7 @@ func TestReorderPatches(t *testing.T) {
 		{"C,B,A", []string{"C", "B", "A"}},
 	}
 	for i, o := range orders {
+		// Serial: each row advances the hub's clock and reads it back.
 		t.Run(o.name, func(t *testing.T) {
 			slug := fmt.Sprintf("reorder-%d", i)
 			ps := h.carryList(t, slug, workspace.StatusReady, workspace.MarkerNone)
@@ -113,6 +114,7 @@ func TestReorderPatches_EmitsOneEvent(t *testing.T) {
 	h := startPatchHub(t)
 	for i, letters := range [][]string{{"C", "A", "B"}, {"A", "B", "C"}} {
 		t.Run(strings.Join(letters, ","), func(t *testing.T) {
+			t.Parallel()
 			slug := fmt.Sprintf("emit-%d", i)
 			ps := h.carryList(t, slug, workspace.StatusReady, workspace.MarkerNone)
 			ids := idsIn(ps, letters...)

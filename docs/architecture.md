@@ -5291,11 +5291,17 @@ of `refs/parley/replaced/<branch>`, which needs no request so that a sync
 can call it; then it moves the branch with `CompareAndSwapRef` against the
 tip it compared (`""` for `created`). A lost swap (`gitrepo.ErrRefMoved`)
 is `409 ref_moved` with the branch's current commit. From the choice of
-action on, the reset runs on `context.WithoutCancel`, and one `store.Tx`
-records the origin fields (when `patch_branch_source` is `origin`) and
-emits `parley.patch.reset` and, for `replaced`, `parley.patch.replace`.
-The test-only `Deps.BeforeRefSwap(slug, branch)` runs between the compare
-and the swap.
+action on, the reset runs on `context.WithoutCancel`. The record and the
+moves are one `store.Tx`: it reads the patch again and refuses one now
+`merged_upstream` or `deleted` (`409 patch_status_invalid`), records the
+origin fields (when `patch_branch_source` is `origin`), emits
+`parley.patch.reset` and, for `replaced`, `parley.patch.replace`, and
+only then writes the backup ref and swaps the branch, so that a failed
+record moves nothing and a lost swap rolls the record back. The git work
+held in the store's write turn is two local `update-ref`s at most. When
+the commit itself fails after the swap, the branch is swapped back. The
+test-only `Deps.BeforeRefSwap(slug, branch)` runs after the compare and
+before that transaction, for every action.
 
 **The rebuild trigger.** `RebuildEnqueuer` (`EnqueueRebuild(ctx, slug,
 RebuildOptions) (RebuildResult, error)`) is the interface every source of a

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
@@ -123,17 +124,18 @@ func (c *Component) autoRebuildAfterSync(ctx context.Context, ws workspace.Works
 // resetToOrigin brings the branch of the patch id of ws to origin's tip and
 // returns the patch as recorded afterwards and the action taken. Only an
 // active, conflict or disabled patch is reset: any other is 409
-// patch_status_invalid, before origin is asked. The one branch is fetched
-// from origin with the origin credential read now (409 missing_on_origin
-// when origin has no such branch, 502 origin_fetch_failed when the fetch
-// fails or outlasts its deadline), and the action is the first that
-// applies: created, none, fast_forwarded, replaced. A replaced tip is saved
-// to the backup ref before the branch moves; the branch moves by a
-// compare-and-swap against the tip compared, so that one another writer
-// moved, created or deleted in between is 409 ref_moved and left as that
-// writer has it. Neither workspace setting of patches changes the action:
-// it follows from the two tips alone. A refusal changes no patch field and
-// writes no event.
+// patch_status_invalid, before origin is asked and again as the reset is
+// recorded, for a patch deleted or changed meanwhile. The one branch is
+// fetched from origin with the origin credential read now (409
+// missing_on_origin when origin has no such branch, 502
+// origin_fetch_failed when the fetch fails or outlasts its deadline), and
+// the action is the first that applies: created, none, fast_forwarded,
+// replaced. A replaced tip is saved to the backup ref before the branch
+// moves; the branch moves by a compare-and-swap against the tip compared,
+// so that one another writer moved, created or deleted in between is 409
+// ref_moved and left as that writer has it. Neither workspace setting of patches changes the action:
+// it follows from the two tips alone. A refusal, or a record that fails,
+// changes no patch field, writes no event and leaves the branch as it was.
 func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, id string, by actor) (Patch, string, error) {
 	if c.d.Events == nil {
 		return Patch{}, "", errNotBound
@@ -145,9 +147,8 @@ func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, i
 	if !found {
 		return Patch{}, "", errPatchNotFound()
 	}
-	if p.Status == StatusMergedUpstream || p.Status == StatusDeleted {
-		return Patch{}, "", server.NewError("patch_status_invalid", http.StatusConflict,
-			fmt.Sprintf("the patch of %s is %s; only an active, conflict or disabled patch is reset to origin", p.BranchName, p.Status))
+	if err := resettable(p); err != nil {
+		return Patch{}, "", err
 	}
 	branch, head := p.BranchName, headsPrefix+p.BranchName
 	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(ws.Slug))
@@ -183,23 +184,82 @@ func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, i
 	// From here the reset runs to its end also when the caller leaves: a
 	// branch moved without its record would be a change no event reports.
 	ctx = context.WithoutCancel(ctx)
-	if action != resetNone {
-		if err := c.moveToOrigin(ctx, repo, ws.Slug, branch, action, local.ID, tip); err != nil {
-			return Patch{}, "", err
-		}
+	if c.d.BeforeRefSwap != nil {
+		// Outside the transaction below: a test writes the store through
+		// the hook, and a Store.Tx inside another would wait for its own
+		// turn forever.
+		c.d.BeforeRefSwap(ws.Slug, branch)
 	}
-	p, err = c.recordReset(ctx, ws, id, by, action, local.ID, tip)
-	return p, action, err
+	// The record and the move are one transaction, the move last in it. A
+	// delete or a status change of the patch commits before it or after
+	// it, never in between, so a patch the reset no longer applies to
+	// moves nothing; a record that fails moves nothing; and a lost swap
+	// rolls the record back. The git work held in it is local and short,
+	// two update-refs at most, which is why it may hold the store's write
+	// turn.
+	var out Patch
+	var moved bool
+	err = c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		p, err := c.recordReset(ctx, tx, ws, id, by, action, local.ID, tip)
+		if err != nil {
+			return err
+		}
+		if action != resetNone {
+			if err := c.moveToOrigin(ctx, repo, ws.Slug, branch, action, local.ID, tip); err != nil {
+				return err
+			}
+			moved = true
+		}
+		out = p
+		return nil
+	})
+	if err != nil {
+		if moved {
+			// The commit failed after the branch moved: nothing records
+			// the move, so it is taken back.
+			c.undoMove(ctx, repo, ws.Slug, branch, local.ID, tip)
+		}
+		return Patch{}, "", err
+	}
+	return out, action, nil
+}
+
+// resettable is nil for a patch a reset to origin applies to, active,
+// conflict or disabled, and 409 patch_status_invalid for any other.
+func resettable(p Patch) error {
+	if p.Status == StatusMergedUpstream || p.Status == StatusDeleted {
+		return server.NewError("patch_status_invalid", http.StatusConflict,
+			fmt.Sprintf("the patch of %s is %s; only an active, conflict or disabled patch is reset to origin", p.BranchName, p.Status))
+	}
+	return nil
+}
+
+// undoMove puts the branch of the workspace slug in repo back from origin's
+// tip to local, removing it when local is "", after the record of the
+// reset that moved it failed to commit. It moves the branch only from tip,
+// so that one another writer moved since is left as that writer has it,
+// and logs an undo that fails. The backup ref a replace wrote stays, as
+// after a lost swap.
+func (c *Component) undoMove(ctx context.Context, repo *gitrepo.Repo, slug, branch, local, tip string) {
+	back := local
+	if back == "" {
+		// git's null id as the new value removes the ref.
+		back = strings.Repeat("0", len(tip))
+	}
+	err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		return repo.CompareAndSwapRef(ctx, headsPrefix+branch, back, tip)
+	})
+	if err != nil {
+		c.logger().LogAttrs(ctx, slog.LevelError, "put back a branch whose reset to origin was not recorded",
+			slog.String("slug", slug), slog.String("branch", branch), slog.String("back_to", local), slog.String("error", err.Error()))
+	}
 }
 
 // moveToOrigin moves the branch of the workspace slug in repo from local,
 // "" for none, to origin's tip, saving local to the backup ref first when
 // action is replaced. The backup stays when the move then loses to another
-// writer, which is 409 ref_moved.
+// writer, which is 409 ref_moved. It runs inside the reset's transaction.
 func (c *Component) moveToOrigin(ctx context.Context, repo *gitrepo.Repo, slug, branch, action, local, tip string) error {
-	if c.d.BeforeRefSwap != nil {
-		c.d.BeforeRefSwap(slug, branch)
-	}
 	if action == resetReplaced {
 		if err := WriteBackupRef(ctx, repo, branch, local); err != nil {
 			return fmt.Errorf("reset the branch %s of %s: %w", branch, slug, err)
@@ -219,59 +279,59 @@ func (c *Component) moveToOrigin(ctx context.Context, repo *gitrepo.Repo, slug, 
 	return fmt.Errorf("reset the branch %s of %s: %w", branch, slug, err)
 }
 
-// recordReset records the reset of the patch id of ws in one store
-// transaction: origin's tip as the patch's origin state when the
-// workspace's patch_branch_source is origin, and parley.patch.reset, with
-// parley.patch.replace for a replaced branch. local is the branch's tip
-// before the reset, "" when it had none. It returns the patch as recorded.
-func (c *Component) recordReset(ctx context.Context, ws workspace.Workspace, id string, by actor, action, local, tip string) (Patch, error) {
-	var out Patch
-	err := c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
-		p, found, err := ReadPatch(ctx, tx, ws.Slug, id)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return errPatchNotFound()
-		}
-		if c.fromOrigin(ws) {
-			now := c.now().UTC().Truncate(time.Second)
-			if _, err := tx.ExecContext(ctx, `UPDATE patches SET origin_sync_state = ?, origin_sha = ?, origin_synced_at = ?
+// recordReset records the reset of the patch id of ws in tx: origin's tip
+// as the patch's origin state when the workspace's patch_branch_source is
+// origin, and parley.patch.reset, with parley.patch.replace for a replaced
+// branch. local is the branch's tip before the reset, "" when it had none.
+// The patch is read again first: one deleted, or whose status no longer
+// allows a reset, since the reset first read it is refused as before the
+// fetch. It returns the patch as recorded.
+func (c *Component) recordReset(ctx context.Context, tx *sql.Tx, ws workspace.Workspace, id string, by actor, action, local, tip string) (Patch, error) {
+	p, found, err := ReadPatch(ctx, tx, ws.Slug, id)
+	if err != nil {
+		return Patch{}, err
+	}
+	if !found {
+		return Patch{}, errPatchNotFound()
+	}
+	if err := resettable(p); err != nil {
+		return Patch{}, err
+	}
+	if c.fromOrigin(ws) {
+		now := c.now().UTC().Truncate(time.Second)
+		if _, err := tx.ExecContext(ctx, `UPDATE patches SET origin_sync_state = ?, origin_sha = ?, origin_synced_at = ?
 WHERE workspace_slug = ? AND id = ?`, originInSync, tip, now.UnixNano(), ws.Slug, id); err != nil {
-				return fmt.Errorf("record the origin state of the patch %s of %s: %w", p.BranchName, ws.Slug, err)
-			}
-			p.OriginSyncState, p.OriginSHA, p.OriginSyncedAt = new(originInSync), &tip, &now
+			return Patch{}, fmt.Errorf("record the origin state of the patch %s of %s: %w", p.BranchName, ws.Slug, err)
 		}
-		var localSHA, replacedSHA any // null unless set
-		if local != "" {
-			localSHA = local
-		}
-		if action == resetReplaced {
-			replacedSHA = local
-		}
-		events := []event.Input{{
-			Type: EventPatchReset, Workspace: &ws.Slug, ActorType: by.typ, ActorID: by.id,
+		p.OriginSyncState, p.OriginSHA, p.OriginSyncedAt = new(originInSync), &tip, &now
+	}
+	var localSHA, replacedSHA any // null unless set
+	if local != "" {
+		localSHA = local
+	}
+	if action == resetReplaced {
+		replacedSHA = local
+	}
+	events := []event.Input{{
+		Type: EventPatchReset, Workspace: &ws.Slug, ActorType: by.typ, ActorID: by.id,
+		ResourceType: "patch", ResourceID: p.ID,
+		Metadata: map[string]any{"branch_name": p.BranchName, "action": action, "local_sha": localSHA,
+			"origin_sha": tip, "replaced_sha": replacedSHA},
+	}}
+	if action == resetReplaced {
+		events = append(events, event.Input{
+			Type: EventPatchReplace, Workspace: &ws.Slug, ActorType: by.typ, ActorID: by.id,
 			ResourceType: "patch", ResourceID: p.ID,
-			Metadata: map[string]any{"branch_name": p.BranchName, "action": action, "local_sha": localSHA,
-				"origin_sha": tip, "replaced_sha": replacedSHA},
-		}}
-		if action == resetReplaced {
-			events = append(events, event.Input{
-				Type: EventPatchReplace, Workspace: &ws.Slug, ActorType: by.typ, ActorID: by.id,
-				ResourceType: "patch", ResourceID: p.ID,
-				Metadata: map[string]any{"branch_name": p.BranchName, "replaced_sha": local, "origin_sha": tip,
-					"trigger": "reset_to_origin"},
-			})
+			Metadata: map[string]any{"branch_name": p.BranchName, "replaced_sha": local, "origin_sha": tip,
+				"trigger": "reset_to_origin"},
+		})
+	}
+	for _, in := range events {
+		if _, err := c.d.Events.Emit(ctx, tx, in); err != nil {
+			return Patch{}, err
 		}
-		for _, in := range events {
-			if _, err := c.d.Events.Emit(ctx, tx, in); err != nil {
-				return err
-			}
-		}
-		out = p
-		return nil
-	})
-	return out, err
+	}
+	return p, nil
 }
 
 // refMovedNow is 409 ref_moved for branch of repo, which another writer

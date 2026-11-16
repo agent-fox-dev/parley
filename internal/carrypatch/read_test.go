@@ -44,14 +44,17 @@ func startReadHub(t *testing.T) *readHub {
 }
 
 // add stores the workspace slug of the owner in mode, with status and the
-// maintenance marker given.
-func (h *readHub) add(t *testing.T, slug, mode string, status workspace.Status, marker workspace.Marker) {
+// maintenance marker given, changed further by edit.
+func (h *readHub) add(t *testing.T, slug, mode string, status workspace.Status, marker workspace.Marker, edit ...func(w *workspace.Workspace)) {
 	t.Helper()
 	now := time.Now().UTC()
 	w := workspace.Workspace{
 		Slug: slug, Kind: access.KindRepository, Mode: mode, GitURL: new("https://origin.test/" + slug + ".git"),
 		DefaultBranch: new("main"), OwnerID: h.owner, OrgID: h.org, Status: status, DisplayName: slug,
 		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(), Marker: marker,
+	}
+	for _, fn := range edit {
+		fn(&w)
 	}
 	ctx := context.Background()
 	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return workspace.Insert(ctx, tx, w) }); err != nil {

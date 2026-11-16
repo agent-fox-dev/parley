@@ -2973,10 +2973,14 @@ that applies:
 | the hub's tip is an ancestor of origin's | moves the branch forward | `fast_forwarded` |
 | otherwise (diverged, or the hub ahead) | saves the hub's tip to `refs/parley/replaced/<branch>`, overwriting an earlier backup, then moves the branch | `replaced` |
 
-Every move is a compare-and-swap against the tip the hub compared
-(against "no such ref" for `created`); a branch another writer moved,
-created or deleted in between is `409` `ref_moved`, and is left as that
-writer has it. A backup ref already written stays; nothing else changes.
+The hub records the outcome and moves the refs in one store transaction,
+in which it reads the patch again: a patch deleted or marked
+`merged_upstream` while origin was fetched is `409`
+`patch_status_invalid`, and nothing is moved. Every move is a
+compare-and-swap against the tip the hub compared (against "no such ref"
+for `created`); a branch another writer moved, created or deleted in
+between is `409` `ref_moved`, and is left as that writer has it. A backup
+ref already written stays; nothing else changes.
 
 When the reset succeeded and `patch_branch_source` is `origin`, the patch's
 `origin_sync_state` becomes `in_sync`, `origin_sha` origin's tip and
@@ -2998,8 +3002,9 @@ queues nothing.
 | `409` `patch_status_invalid` | the patch is `merged_upstream` or `deleted` (`the patch of <branch> is <status>; only an active, conflict or disabled patch is reset to origin`) |
 | `409` `missing_on_origin` | origin has no such branch (`origin has no branch "<b>"`) |
 | `409` `ref_moved` | the branch moved in between (`the branch "<b>" moved while it was reset to origin; read it again and retry`); `details.current_sha` is where it is now, `null` when it is gone |
-| `409` `conflict` | another ref of the copy is in the way of `refs/remotes/origin/<branch>` |
+| `409` `conflict` | another ref of the copy is in the way of `refs/remotes/origin/<branch>` or of `refs/heads/<branch>` |
 | `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | recording the outcome failed; the branch, the backup ref and the patch are as they were |
 | `502` `origin_fetch_failed` | the workspace has no `git_url`, the origin credential cannot be read, origin cannot be reached or refuses it, or the fetch passed its 2 minutes (`fetch the branch "<b>" from origin: <cause>`, with no credential and URL user information as `***@`) |
 
 ```json

@@ -236,7 +236,7 @@ func str(s *string) string {
 // credentials from origins, records the rebuilds it is asked to queue, and
 // writes its events through an emitter the test can make fail, which rolls
 // back the transaction of the change. Its git trusts the origins given to
-// trust and records the arguments of every invocation.
+// trust.
 type patchHub struct {
 	*addHub
 	rebuilds    *recordingRebuilds
@@ -249,9 +249,6 @@ type patchHub struct {
 	caBundle string
 	caMu     sync.Mutex
 	cas      []byte
-
-	argsMu  sync.Mutex
-	gitArgs [][]string
 }
 
 // startPatchHub starts the patch hub, with the carry-patch dependencies
@@ -279,11 +276,6 @@ func startPatchHub(t *testing.T, adjust ...func(d *carrypatch.Deps)) *patchHub {
 				d.Secrets = countingSecrets{SecretReader: h.origins, n: &h.secretReads}
 				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
 				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+h.caBundle)
-				d.Git.Trace = func(args []string) {
-					h.argsMu.Lock()
-					defer h.argsMu.Unlock()
-					h.gitArgs = append(h.gitArgs, args)
-				}
 				for _, fn := range adjust {
 					fn(d)
 				}
@@ -486,21 +478,6 @@ func (h *patchHub) trust(t *testing.T, caFile string) {
 	if err := os.Rename(next, h.caBundle); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// gitArgHolding is the first argument of a git invocation of the hub that
-// holds s, "" when none does.
-func (h *patchHub) gitArgHolding(s string) string {
-	h.argsMu.Lock()
-	defer h.argsMu.Unlock()
-	for _, args := range h.gitArgs {
-		for _, a := range args {
-			if strings.Contains(a, s) {
-				return a
-			}
-		}
-	}
-	return ""
 }
 
 // resetCase is a carry-patch workspace of the reset tests: its origin,

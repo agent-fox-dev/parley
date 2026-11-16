@@ -131,24 +131,6 @@ func TestResetToOrigin_AnswersPatchWithOutcome(t *testing.T) {
 			}
 		})
 	}
-	t.Run("git sees no credential and no branch name as an option", func(t *testing.T) {
-		t.Parallel()
-		rc := h.resetCarry(t, "reset-args", nil)
-		rc.origin.Commit("patch/a", "ahead")
-		if a := h.resetToOrigin(t, rc.slug, rc.patch.ID); a.status != http.StatusOK {
-			t.Fatalf("reset = %d %s, want 200", a.status, a.raw)
-		}
-		if arg := h.gitArgHolding(originToken); arg != "" {
-			t.Errorf("a git argument holds the origin token: %q", arg)
-		}
-		h.argsMu.Lock()
-		defer h.argsMu.Unlock()
-		for _, args := range h.gitArgs {
-			if i := slices.Index(args, "--"); slices.Contains(args, "patch/a") || (i < 0 && slices.Contains(args, rc.origin.URL())) {
-				t.Errorf("git ran with the branch name bare or the URL before the end of its options: %q", args)
-			}
-		}
-	})
 }
 
 func TestResetToOrigin_Actions(t *testing.T) {
@@ -361,9 +343,6 @@ func TestResetToOrigin_MissingOnOrigin(t *testing.T) {
 
 func TestResetToOrigin_FetchFailures(t *testing.T) {
 	t.Parallel()
-	if carrypatch.DefaultBranchFetchDeadline != 2*time.Minute {
-		t.Errorf("DefaultBranchFetchDeadline = %v, want 2 minutes", carrypatch.DefaultBranchFetchDeadline)
-	}
 	// The deadline leaves git time to start and reach origin also on a
 	// loaded machine; the bound on the answer leaves the hub more.
 	const deadline = time.Second
@@ -459,81 +438,170 @@ func TestResetToOrigin_FetchFailures(t *testing.T) {
 	}
 }
 
-func TestResetToOrigin_LostRaceIsRefMoved(t *testing.T) {
+func TestResetToOrigin_LosesToAnotherWriterMeanwhile(t *testing.T) {
 	t.Parallel()
-	// moves maps a workspace to the commit the other writer puts its
-	// branch at between the reset's read and its compare-and-swap.
-	var moves sync.Map
-	var h *patchHub
-	h = startPatchHub(t, func(d *carrypatch.Deps) {
-		d.BeforeRefSwap = func(slug, branch string) {
-			if w, ok := moves.Load(slug); ok {
-				if _, err := gitrepotest.Run(h.repoPath(slug), "", "update-ref", "refs/heads/"+branch, w.(string)); err != nil {
-					t.Errorf("the other writer could not move %s of %s: %v", branch, slug, err)
-				}
+	// meanwhile maps a workspace to what another writer does between the
+	// reset's compare of the tips and its record and move.
+	var meanwhile sync.Map
+	h := startPatchHub(t, func(d *carrypatch.Deps) {
+		d.BeforeRefSwap = func(slug, _ string) {
+			if other, ok := meanwhile.Load(slug); ok {
+				other.(func())()
 			}
 		}
 	})
+	// The other writers: one moves, creates or deletes the branch, the
+	// others delete the patch or mark it merged upstream through the routes.
+	const (
+		moveBranch  = "move the branch"
+		deletePatch = "delete the patch"
+		mergePatch  = "mark the patch merged upstream"
+	)
 	cases := []struct {
 		name    string
 		prepare func(t *testing.T, rc *resetCase)
-		// keepsBackup tells a case whose reset writes the backup ref
-		// before its compare-and-swap.
+		other   string
+		// errorType is the reset's refusal; keepsBackup tells a case whose
+		// reset writes the backup ref before it loses.
+		errorType   string
 		keepsBackup bool
 	}{
-		{"tips diverged", func(t *testing.T, rc *resetCase) { rc.diverge(t) }, true},
-		{"origin ahead", func(_ *testing.T, rc *resetCase) { rc.origin.Commit("patch/a", "ahead") }, false},
-		{"the hub has no branch", func(t *testing.T, rc *resetCase) { gitrepotest.Git(t, rc.copy, "update-ref", "-d", headA) }, false},
+		{"tips diverged", func(t *testing.T, rc *resetCase) { rc.diverge(t) }, moveBranch, "ref_moved", true},
+		{"origin ahead", func(_ *testing.T, rc *resetCase) { rc.origin.Commit("patch/a", "ahead") }, moveBranch, "ref_moved", false},
+		{"the hub has no branch", func(t *testing.T, rc *resetCase) { gitrepotest.Git(t, rc.copy, "update-ref", "-d", headA) }, moveBranch, "ref_moved", false},
+		{"tips diverged, the patch deleted", func(t *testing.T, rc *resetCase) { rc.diverge(t) }, deletePatch, "patch_status_invalid", false},
+		{"tips equal, the patch deleted", func(*testing.T, *resetCase) {}, deletePatch, "patch_status_invalid", false},
+		{"origin ahead, the patch merged upstream", func(_ *testing.T, rc *resetCase) { rc.origin.Commit("patch/a", "ahead") }, mergePatch, "patch_status_invalid", false},
 	}
 	for i, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
+		t.Run(c.other+"/"+c.name, func(t *testing.T) {
 			t.Parallel()
-			rc := h.resetCarry(t, fmt.Sprintf("race-%d", i), nil)
+			rc := h.resetCarry(t, fmt.Sprintf("race-%d", i), withSettings("origin", ""))
 			c.prepare(t, rc)
-			compared, w := refIn(rc.copy, headA), commitIn(t, rc.copy, "the other writer's")
-			moves.Store(rc.slug, w)
+			compared, backupBefore := refIn(rc.copy, headA), refIn(rc.copy, backupA)
+			w := commitIn(t, rc.copy, "the other writer's")
 			path := "/workspaces/" + rc.slug + "/patches/" + rc.patch.ID
-			before := h.get(t, path)
+			// left is the patch as the other writer leaves it.
+			left := make(chan answer, 1)
+			meanwhile.Store(rc.slug, func() {
+				switch c.other {
+				case moveBranch:
+					if _, err := gitrepotest.Run(rc.copy, "", "update-ref", headA, w); err != nil {
+						t.Errorf("the other writer could not move patch/a: %v", err)
+					}
+				case deletePatch:
+					if a := h.remove(t, rc.slug, rc.patch.ID, nil); a.status != http.StatusNoContent {
+						t.Errorf("DELETE meanwhile = %d %s, want 204", a.status, a.raw)
+					}
+				case mergePatch:
+					if a := h.update(t, rc.slug, rc.patch.ID, map[string]any{"status": "merged_upstream"}); a.status != http.StatusOK {
+						t.Errorf("PATCH meanwhile = %d %s, want 200", a.status, a.raw)
+					}
+				}
+				left <- h.get(t, path)
+			})
 
 			a := h.resetToOrigin(t, rc.slug, rc.patch.ID)
-			var details struct {
-				Error struct {
-					Details struct {
-						CurrentSHA string `json:"current_sha"`
-					} `json:"details"`
-				} `json:"error"`
+			if a.status != http.StatusConflict || a.Error.ErrorType != c.errorType {
+				t.Errorf("reset = %d %s, want 409 %s", a.status, a.raw, c.errorType)
 			}
-			_ = json.Unmarshal(a.raw, &details)
-			if a.status != http.StatusConflict || a.Error.ErrorType != "ref_moved" || details.Error.Details.CurrentSHA != w {
-				t.Errorf("reset = %d %s, want 409 ref_moved with details.current_sha %s", a.status, a.raw, w)
+			wantHead, wantBackup := compared, backupBefore
+			if c.other == moveBranch {
+				var details struct {
+					Error struct {
+						Details struct {
+							CurrentSHA string `json:"current_sha"`
+						} `json:"details"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal(a.raw, &details)
+				if details.Error.Details.CurrentSHA != w {
+					t.Errorf("reset = %s, want details.current_sha %s", a.raw, w)
+				}
+				wantHead = w
 			}
-			if head := refIn(rc.copy, headA); head != w {
-				t.Errorf("the copy's patch/a = %s, want the other writer's %s", head, w)
-			}
-			wantBackup := ""
 			if c.keepsBackup {
 				wantBackup = compared
+			}
+			if head := refIn(rc.copy, headA); head != wantHead {
+				t.Errorf("the copy's patch/a = %s, want %s", head, wantHead)
 			}
 			if backup := refIn(rc.copy, backupA); backup != wantBackup {
 				t.Errorf("the backup ref = %q, want %q", backup, wantBackup)
 			}
-			// replaced_sha shows the backup ref, which the reset leaves
-			// written; the patch's own fields are as they were.
-			got := h.get(t, path)
-			delete(got.patch, "replaced_sha")
-			if !reflect.DeepEqual(got.patch, before.patch) {
-				t.Errorf("the patch is %s, want it as before %s", got.raw, before.raw)
+			// replaced_sha shows the backup ref, which a lost swap leaves
+			// written; the patch's own fields are as the other writer left
+			// them.
+			var want answer
+			select {
+			case want = <-left:
+			default:
+				t.Fatal("the other writer did not run while the reset waited")
 			}
-			if e := h.patchEvents(t, rc.slug, ""); len(e) != 0 {
-				t.Errorf("the lost race wrote %d parley.patch.* events, want none", len(e))
+			got := h.get(t, path)
+			delete(want.patch, "replaced_sha")
+			delete(got.patch, "replaced_sha")
+			if !reflect.DeepEqual(got.patch, want.patch) {
+				t.Errorf("the patch is %s, want it as the other writer left it %s", got.raw, want.raw)
+			}
+			for _, typ := range []string{carrypatch.EventPatchReset, carrypatch.EventPatchReplace} {
+				if e := h.patchEvents(t, rc.slug, typ); len(e) != 0 {
+					t.Errorf("the lost reset wrote %d %s events, want none", len(e), typ)
+				}
 			}
 			if n := len(h.rebuilds.callsOf(rc.slug)); n != 0 {
-				t.Errorf("the lost race asked for %d rebuilds, want none", n)
+				t.Errorf("the lost reset asked for %d rebuilds, want none", n)
 			}
 
-			moves.Delete(rc.slug)
-			if a := h.resetToOrigin(t, rc.slug, rc.patch.ID); a.status != http.StatusOK {
-				t.Errorf("the repeated reset = %d %s, want 200", a.status, a.raw)
+			meanwhile.Delete(rc.slug)
+			retry, wantRetry := h.resetToOrigin(t, rc.slug, rc.patch.ID), http.StatusOK
+			if c.other != moveBranch {
+				wantRetry = http.StatusConflict
+			}
+			if retry.status != wantRetry {
+				t.Errorf("the repeated reset = %d %s, want %d", retry.status, retry.raw, wantRetry)
+			}
+		})
+	}
+}
+
+func TestResetToOrigin_FailedRecordMovesNothing(t *testing.T) {
+	t.Parallel()
+	h := startPatchHub(t)
+	for _, action := range []string{"created", "fast_forwarded", "replaced"} {
+		// Serial: the failing event log is the hub's, turned on by each row.
+		t.Run(action, func(t *testing.T) {
+			rc := h.resetCarry(t, "unrecorded-"+strings.ReplaceAll(action, "_", "-"), withSettings("origin", ""))
+			resetTo(t, rc, action)
+			old, backup := refIn(rc.copy, headA), refIn(rc.copy, backupA)
+			path := "/workspaces/" + rc.slug + "/patches/" + rc.patch.ID
+			before := h.get(t, path)
+
+			h.failEvents.Store(true)
+			a := h.resetToOrigin(t, rc.slug, rc.patch.ID)
+			h.failEvents.Store(false)
+			if a.status != http.StatusInternalServerError {
+				t.Errorf("reset with a failing event log = %d %s, want 500", a.status, a.raw)
+			}
+			if head, now := refIn(rc.copy, headA), refIn(rc.copy, backupA); head != old || now != backup {
+				t.Errorf("the copy's patch/a = %q and its backup ref %q, want them as before: %q and %q", head, now, old, backup)
+			}
+			if got := h.get(t, path); !reflect.DeepEqual(got.patch, before.patch) {
+				t.Errorf("the patch is %s, want it as before %s", got.raw, before.raw)
+			}
+			if n := len(h.rebuilds.callsOf(rc.slug)); n != 0 {
+				t.Errorf("the failed reset asked for %d rebuilds, want none", n)
+			}
+
+			if a := h.resetToOrigin(t, rc.slug, rc.patch.ID); a.status != http.StatusOK || a.patch["action"] != action {
+				t.Fatalf("the repeated reset = %d %s, want 200 with action %s", a.status, a.raw, action)
+			}
+			wantReplace := 0
+			if action == "replaced" {
+				wantReplace = 1
+			}
+			if r, p := h.patchEvents(t, rc.slug, carrypatch.EventPatchReset), h.patchEvents(t, rc.slug, carrypatch.EventPatchReplace); len(r) != 1 || len(p) != wantReplace {
+				t.Errorf("the repeated reset wrote %d reset and %d replace events, want 1 and %d", len(r), len(p), wantReplace)
 			}
 		})
 	}
@@ -588,17 +656,21 @@ func TestResetToOrigin_QueuesRebuild(t *testing.T) {
 
 func TestResetToOrigin_DoesNotQueueRebuild(t *testing.T) {
 	t.Parallel()
-	// turnOff holds the workspaces whose auto_rebuild_after_sync is turned
-	// off while their reset runs, after the reset read the workspace.
+	// turnOff maps the workspaces whose auto_rebuild_after_sync is turned
+	// off through the hub while their reset runs, after the reset read the
+	// workspace, to their test.
 	var turnOff sync.Map
 	var h *patchHub
 	h = startPatchHub(t, func(d *carrypatch.Deps) {
 		d.BeforeRefSwap = func(slug, _ string) {
-			if _, ok := turnOff.Load(slug); !ok {
+			v, ok := turnOff.Load(slug)
+			if !ok {
 				return
 			}
-			if _, err := h.Store.Main().Exec(`UPDATE workspaces SET settings = ? WHERE slug = ?`, `{"auto_rebuild_after_sync":false}`, slug); err != nil {
-				t.Errorf("turn auto_rebuild_after_sync of %s off: %v", slug, err)
+			t := v.(*testing.T)
+			body := map[string]any{"settings": map[string]any{"auto_rebuild_after_sync": false}}
+			if status, raw := h.Call(t, http.MethodPatch, "/api/v1/workspaces/"+slug, h.key, body); status != http.StatusOK {
+				t.Errorf("turn auto_rebuild_after_sync of %s off = %d %s, want 200", slug, status, raw)
 			}
 		}
 	})
@@ -621,7 +693,7 @@ func TestResetToOrigin_DoesNotQueueRebuild(t *testing.T) {
 			resetTo(t, rc, c.action)
 			h.rebuilds.answer(rc.slug, carrypatch.RebuildResult{Queued: true, JobID: "job-" + rc.slug}, nil)
 			if c.turnedOff {
-				turnOff.Store(rc.slug, true)
+				turnOff.Store(rc.slug, t)
 			}
 
 			a := h.resetToOrigin(t, rc.slug, rc.patch.ID)

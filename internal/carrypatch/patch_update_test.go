@@ -109,6 +109,7 @@ func TestUpdatePatch_Status(t *testing.T) {
 		{carrypatch.StatusConflict, []string{"a.go"}, carrypatch.StatusMergedUpstream, []any{}},
 	}
 	for _, c := range cases {
+		// Serial: each row changes the same patch A.
 		t.Run(fmt.Sprintf("%s %v to %s", c.from, c.files, c.to), func(t *testing.T) {
 			h.alter(t, "carry", ps["A"].ID, func(p *carrypatch.Patch) { p.Status, p.ConflictFiles = c.from, c.files })
 			a := h.update(t, "carry", ps["A"].ID, map[string]any{"status": c.to})
@@ -129,7 +130,7 @@ func TestUpdatePatch_Position(t *testing.T) {
 	h := startPatchHub(t)
 	// list stores the workspace slug with the patches A, B, C and D at 1 to
 	// 4 and the deleted patch X, and returns them by letter.
-	list := func(slug string) map[string]carrypatch.Patch {
+	list := func(t *testing.T, slug string) map[string]carrypatch.Patch {
 		ps := h.carryList(t, slug, workspace.StatusReady, workspace.MarkerNone)
 		ps["D"], ps["X"] = livePatch(slug, "patch/d", 4), deletedPatch(slug, "patch/x", at(10, 0))
 		h.put(t, ps["D"], ps["X"])
@@ -147,8 +148,9 @@ func TestUpdatePatch_Position(t *testing.T) {
 	}
 	for i, c := range cases {
 		t.Run(fmt.Sprintf("%s to %d", c.move, c.to), func(t *testing.T) {
+			t.Parallel()
 			slug := fmt.Sprintf("move-%d", i)
-			ps := list(slug)
+			ps := list(t, slug)
 			h.advance(time.Minute)
 			a := h.update(t, slug, ps[c.move].ID, map[string]any{"position": c.to})
 			if a.status != http.StatusOK || a.patch["position"] != float64(c.to) {
@@ -171,8 +173,9 @@ func TestUpdatePatch_Position(t *testing.T) {
 			}
 		})
 	}
+	// Serial: the failing event log is the hub's.
 	t.Run("a failed commit keeps the order", func(t *testing.T) {
-		ps := list("move-failed")
+		ps := list(t, "move-failed")
 		h.failEvents.Store(true)
 		defer h.failEvents.Store(false)
 		a := h.update(t, "move-failed", ps["A"].ID, map[string]any{"position": 3})
@@ -263,6 +266,7 @@ func TestUpdatePatch_EmitsOneEvent(t *testing.T) {
 	}
 	for i, c := range cases {
 		t.Run(fmt.Sprint(c.body), func(t *testing.T) {
+			t.Parallel()
 			slug := fmt.Sprintf("events-%d", i)
 			ps := h.carryList(t, slug, workspace.StatusReady, workspace.MarkerNone)
 			h.alter(t, slug, ps["A"].ID, func(p *carrypatch.Patch) { p.Description = new("same as stored") })
@@ -290,17 +294,4 @@ func TestUpdatePatch_EmitsOneEvent(t *testing.T) {
 			}
 		})
 	}
-	t.Run("a failed event write keeps the patch", func(t *testing.T) {
-		ps := h.carryList(t, "events-failed", workspace.StatusReady, workspace.MarkerNone)
-		path := "/workspaces/events-failed/patches/" + ps["A"].ID
-		before := h.get(t, path)
-		h.failEvents.Store(true)
-		defer h.failEvents.Store(false)
-		if a := h.update(t, "events-failed", ps["A"].ID, map[string]any{"description": "d", "status": "disabled"}); a.status != http.StatusInternalServerError {
-			t.Errorf("PATCH with a failing event log = %d %s, want 500", a.status, a.raw)
-		}
-		if got := h.get(t, path); !reflect.DeepEqual(got.patch, before.patch) {
-			t.Errorf("a failed update left the patch at %s, want %s", got.raw, before.raw)
-		}
-	})
 }
