@@ -492,36 +492,41 @@ func TestCallback_RefusesALoginTheProviderRejectsOrFailsAndChangesNothing(t *tes
 	cases := []struct {
 		name, provider     string
 		script             func(f *fakeProvider)
+		timeout            time.Duration // the provider client's; 0 is identity.DefaultProviderTimeout
 		status             int
 		errorType, message string
 	}{
 		{"the token URL rejects the code", "github", func(f *fakeProvider) {
 			f.answer(fakeTokenPath, http.StatusOK, object{"error": "bad_verification_code"})
-		}, 401, "unauthenticated", "the identity provider rejected the code"},
+		}, 0, 401, "unauthenticated", "the identity provider rejected the code"},
+		{"the token URL rejects the code after a slow answer", "github", func(f *fakeProvider) {
+			f.answer(fakeTokenPath, http.StatusOK, object{"error": "bad_verification_code"})
+			f.delay(fakeTokenPath, 100*time.Millisecond)
+		}, 0, 401, "unauthenticated", "the identity provider rejected the code"},
 		{"the token URL answers 503", "github", func(f *fakeProvider) {
 			f.answer(fakeTokenPath, http.StatusServiceUnavailable, "boom-body")
-		}, 502, "upstream_error", "the identity provider failed"},
+		}, 0, 502, "upstream_error", "the identity provider failed"},
 		{"the token URL outlasts the timeout", "github", func(f *fakeProvider) {
 			f.delay(fakeTokenPath, 500*time.Millisecond)
-		}, 502, "upstream_error", "the identity provider failed"},
+		}, 50 * time.Millisecond, 502, "upstream_error", "the identity provider failed"},
 		{"the user URL answers 500", "github", func(f *fakeProvider) {
 			f.answer(fakeUserPath, http.StatusInternalServerError, "boom-body")
-		}, 502, "upstream_error", "the identity provider failed"},
+		}, 0, 502, "upstream_error", "the identity provider failed"},
 		{"the user has no id", "github", func(f *fakeProvider) {
 			f.answer(fakeUserPath, http.StatusOK, object{"login": "alice", "email": "a@x"})
-		}, 502, "upstream_error", "the identity provider failed"},
+		}, 0, 502, "upstream_error", "the identity provider failed"},
 		{"google has not verified the e-mail", "google", func(f *fakeProvider) {
 			f.answer(fakeUserPath, http.StatusOK, object{"sub": "1099", "name": "alice", "email": "a@x", "email_verified": false})
-		}, 502, "upstream_error", "the identity provider failed"},
+		}, 0, 502, "upstream_error", "the identity provider failed"},
 		{"github hides the e-mail and lists no primary verified one", "github", func(f *fakeProvider) {
 			f.answer(fakeUserPath, http.StatusOK, hidden)
 			f.answer(fakeEmailsPath, http.StatusOK, []object{{"email": "a@x", "primary": true, "verified": false}})
-		}, 502, "upstream_error", "the identity provider failed"},
+		}, 0, 502, "upstream_error", "the identity provider failed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			h, f := newOAuthHub(t, 50*time.Millisecond, []string{"github", "google"})
+			h, f := newOAuthHub(t, tc.timeout, []string{"github", "google"})
 			alice := h.seedAlice()
 			_, k1 := h.seedKey(alice.ID, 90)
 			tc.script(f)
