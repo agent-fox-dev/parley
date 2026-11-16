@@ -4485,12 +4485,16 @@ the pool's timeouts included, `commit` after the record of a land, a
 final status `finish` refuses tells nobody, so each attempt is reported
 once. `follow` runs each step in `step`, which logs its error or its
 panic and goes on: `deleteSource` per covered change (when the target's
-`land.delete_source` is on, `OpenChangeOfBranch` finds no draft or open
-change of the source branch and it is not the source workspace's default
-branch, a `PrepareRefs` delete of `refs/heads/<branch>` expecting the
-version's head, `Commit`, then `ScheduleTargetMergeable` of the source
-workspace and branch in a transaction of its own; a branch that moved is
-`ErrRefMoved` and kept), `scheduleOthers` (`Deps.Mergeability.ScheduleMergeable`
+`land.delete_source` is on and the branch is not the source workspace's
+default branch, one store transaction in which `OpenChangeOfBranch`
+finds no draft or open change of the source branch, a `PrepareRefs`
+delete of `refs/heads/<branch>` expects the version's head,
+`ScheduleTargetMergeable` of the source workspace and branch is written,
+and the ref transaction commits before the store's; a branch that moved
+is `ErrRefMoved` and kept. Since a change opens in a store transaction
+that reads its source branch there, and the store runs its transactions
+one at a time, a change opened from the branch meanwhile is either seen
+by the check or finds no branch), `scheduleOthers` (`Deps.Mergeability.ScheduleMergeable`
 for every change `(*change.Component).ChangesInto` gives for the target
 other than those landed, in one transaction), then each after-landing
 hook, with each change's landed commit its last `commits` entry, else

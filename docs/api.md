@@ -4534,7 +4534,9 @@ worker of the pool: a follow-up that takes long delays no other land.
   not land and is left as it is, as is the default branch of the source
   workspace. The branch is deleted directly with a compare-and-swap, not
   as a push: no push rule applies and no `parley.git.push` is written; the
-  changes whose target is the deleted branch get a mergeability check.
+  changes whose target is the deleted branch get a mergeability check. A
+  change opened from the branch while it is being deleted either keeps it
+  or is refused with `source_not_found`.
 - Every other `draft` or `open` change whose target is the landed target
   branch gets `mergeable` `unknown` and a mergeability check.
 - Each landed change's `draft` or `open` dependants are unlinked from it

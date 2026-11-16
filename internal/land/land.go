@@ -189,8 +189,9 @@ type Component struct {
 // seams are where a test steers the engine; their zero value does
 // nothing.
 type seams struct {
-	beforeSwap func(ctx context.Context, id string, try int)
-	fault      func(point string) error
+	beforeSwap    func(ctx context.Context, id string, try int)
+	fault         func(point string) error
+	sourceChecked func()
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

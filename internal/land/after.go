@@ -83,6 +83,13 @@ func (c *Component) step(a Attempt, name string, fn func() error) {
 // land and is kept. The default branch of the source workspace is never
 // deleted, since the repository's HEAD names it.
 //
+// The check and the delete run in one store transaction, the ref moved
+// before it commits, as the ref writer does: a change opens in a store
+// transaction of its own, which reads the branch there, and the store
+// runs its transactions one at a time, so a change opened from the branch
+// is either seen by the check and keeps it, or opens after the delete and
+// finds no branch.
+//
 // The branch is deleted directly with a compare-and-swap, not through the
 // ref writer: the push rules judge what a caller writes, and the hub
 // writes this. So no push event is written, and the mergeability of the
@@ -90,10 +97,6 @@ func (c *Component) step(a Attempt, name string, fn func() error) {
 func (c *Component) deleteSource(ctx context.Context, ws Workspace, cov CoveredChange) error {
 	if !ws.DeleteSource || cov.SourceBranch == "" || cov.Head == "" {
 		return nil
-	}
-	_, used, err := c.deps.Changes.OpenChangeOfBranch(ctx, nil, cov.SourceWorkspace, cov.SourceBranch)
-	if err != nil || used {
-		return err
 	}
 	src, found, err := c.deps.Workspaces.Workspace(ctx, c.deps.Store.Main(), cov.SourceWorkspace)
 	if err != nil || !found || src.DefaultBranch == cov.SourceBranch {
@@ -104,18 +107,29 @@ func (c *Component) deleteSource(ctx context.Context, ws Workspace, cov CoveredC
 		return err
 	}
 	ref := "refs/heads/" + cov.SourceBranch
-	rtx, err := repo.PrepareRefs(ctx, []gitrepo.RefUpdate{{Ref: ref, Old: cov.Head}})
-	if errors.Is(err, gitrepo.ErrRefMoved) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("delete %s of %s: %w", ref, cov.SourceWorkspace, err)
-	}
-	if err := rtx.Commit(); err != nil {
-		return fmt.Errorf("delete %s of %s: %w", ref, cov.SourceWorkspace, err)
-	}
 	return c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		return c.deps.Changes.ScheduleTargetMergeable(ctx, tx, cov.SourceWorkspace, cov.SourceBranch)
+		_, used, err := c.deps.Changes.OpenChangeOfBranch(ctx, tx, cov.SourceWorkspace, cov.SourceBranch)
+		if err != nil || used {
+			return err
+		}
+		if c.seams.sourceChecked != nil {
+			c.seams.sourceChecked()
+		}
+		rtx, err := repo.PrepareRefs(ctx, []gitrepo.RefUpdate{{Ref: ref, Old: cov.Head}})
+		if errors.Is(err, gitrepo.ErrRefMoved) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("delete %s of %s: %w", ref, cov.SourceWorkspace, err)
+		}
+		if err := c.deps.Changes.ScheduleTargetMergeable(ctx, tx, cov.SourceWorkspace, cov.SourceBranch); err != nil {
+			_ = rtx.Abort()
+			return err
+		}
+		if err := rtx.Commit(); err != nil {
+			return fmt.Errorf("delete %s of %s: %w", ref, cov.SourceWorkspace, err)
+		}
+		return nil
 	})
 }
 

@@ -45,15 +45,18 @@ func RunAttempt(ctx context.Context, c *Component, workspace, id string) error {
 // number of the try; Fault is asked at each point of the atomic step
 // (before-journal, before-swap, after-swap, in-bookkeeping,
 // after-bookkeeping), and an error stops the engine there as a stop of
-// the process would, writing nothing more.
+// the process would, writing nothing more. SourceChecked runs once a
+// landed change's source branch was found needed by no other change, before
+// it is deleted.
 type Seams struct {
-	BeforeSwap func(ctx context.Context, id string, try int)
-	Fault      func(point string) error
+	BeforeSwap    func(ctx context.Context, id string, try int)
+	Fault         func(point string) error
+	SourceChecked func()
 }
 
 // SetSeams sets the seams of c, before it runs an attempt.
 func SetSeams(c *Component, s Seams) {
-	c.seams = seams{beforeSwap: s.BeforeSwap, fault: s.Fault}
+	c.seams = seams{beforeSwap: s.BeforeSwap, fault: s.Fault, sourceChecked: s.SourceChecked}
 }
 
 // Journalled counts the entries of the land journal in s.
