@@ -41,25 +41,20 @@ func startPolicyHub(t *testing.T) (*lifecycleHub, string) {
 }
 
 // policyUpdates are the metadata of the parley.policy.update events of demo
-// in the hub's log, oldest first.
+// that the owner reads in the event log, oldest first.
 func (h *lifecycleHub) policyUpdates(t *testing.T) []map[string]any {
 	t.Helper()
-	rows, err := h.Store.Main().Query(`SELECT metadata FROM hub_events
-		WHERE type = 'parley.policy.update' AND workspace = 'demo' ORDER BY seq`)
-	if err != nil {
-		t.Fatal(err)
+	const path = "/api/v1/events/log?after=0&workspace=demo&types=parley.policy.update"
+	status, body := h.Call(t, http.MethodGet, path, h.key, nil)
+	var page struct {
+		Items []loggedEvent `json:"items"`
 	}
-	defer rows.Close()
+	if status != http.StatusOK || json.Unmarshal(body, &page) != nil {
+		t.Fatalf("GET %s = %d %s, want 200 with a page", path, status, body)
+	}
 	var updates []map[string]any
-	for rows.Next() {
-		var meta string
-		if err := rows.Scan(&meta); err != nil {
-			t.Fatal(err)
-		}
-		updates = append(updates, decoded(t, []byte(meta)))
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
+	for _, e := range page.Items {
+		updates = append(updates, decoded(t, e.Metadata))
 	}
 	return updates
 }
