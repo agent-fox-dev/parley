@@ -23,6 +23,15 @@ func FailNextCommit(c *Component, err error) {
 	}
 }
 
+// PassRunning reports whether a pass of the index worker of c is running.
+func PassRunning(c *Component) bool {
+	if c.pass.TryLock() {
+		c.pass.Unlock()
+		return false
+	}
+	return true
+}
+
 // CanOverlap reports whether the globs a and b can match the same files.
 func CanOverlap(a, b string) bool { return canOverlap(a, b) }
 
