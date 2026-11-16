@@ -27,7 +27,7 @@ command-line client. Both are written in Go, in the module
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, `CallWith` does so with added request headers and `Exchange` also returns the answer's headers, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the run again at a start of the attempts a stop left running (`recover.go`, `Recover`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, the read routes of the attempts per change, per workspace and by id, and the reads of a change's current conflict report and of a `content` file of it as text with conflict markers (`current_conflict.go`, `conflict_handlers.go`) (see [Landing](#landing)) |
-| `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, and the event writer, `EventWriter`), which serves `GET` and `PUT /workspaces/:slug/policy` (`Routes`) and deletes a deleted workspace's revisions (`WorkspaceDeleted`); see [Landing policy](#landing-policy) |
+| `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, the event writer, `EventWriter`, the change records, `Changes`, which the change component is, and the repository opener, `Repos`), which serves `GET` and `PUT /workspaces/:slug/policy` (`Routes`), deletes a deleted workspace's revisions (`WorkspaceDeleted`), reads the files of a change (`Files`, its `ChangeFiles`: those between the change's `base_sha` and `head_sha` in its target workspace's repository, both paths of a rename or copy, no cap), is the change component's landing evaluator (`EvaluateLanding`), re-evaluates and stores a change's landing (`Reevaluate`, in a transaction of its own, and `ReevaluateIn`, in the caller's; `ErrChangeNotFound`, `ErrChangeClosed`) and evaluates an older version without storing it (`EvaluateVersion`); see [Landing policy](#landing-policy) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -3575,7 +3575,7 @@ push calls no linker. The three `POST` routes are registered with
 
 ### Changes
 
-`internal/hub/change.go` adds the part `composeChanges`, after `composeSCM`
+`internal/hub/change.go` adds the part `composeChanges`, after `composePolicy`
 in `parts`. It creates a zero `change.Component` (`Changes()`), adds
 `change.SchemaStep` (the step `changes`) and right after it
 `change.AutoLandSetterStep` (`change_auto_land_setter`),
@@ -3646,7 +3646,7 @@ writes `refs/parley/changes/<number>/1` in the target's repository
 (`SetRef`, or `SetRefFrom`, which pushes a fork's commit into the parent
 first), records the session link, asks the `AutoLandGuard` and stores
 `auto_land` through `SetAutoLand`, runs the `StackLinker`'s `LinkVersion`,
-the `LandingEvaluator` (not for a draft) whose answer it stores, and the
+the `LandingEvaluator` (for a draft too, given the cause `draft`) whose answer it stores, and the
 `VersionObserver`s, each with the change re-read in the transaction, tells
 the `ForkActivity` recorder of a fork source (an error is logged), and
 emits `parley.change.version` and, unless draft, `parley.change.open`. The
@@ -3681,12 +3681,16 @@ the stack linker, the landing derivation and the observers as at open, and
 emits `parley.change.version` with the version re-read from the
 transaction (`storedVersion`), since the stack linker may have moved its
 base, and so its stats and `patch_equivalent_to`; `Open` does the same.
-The landing of a draft stays
-`blocked`/`draft`; a missing target branch, a head with no commit the
-target lacks, a head with no history in common with the target and a
-merge commit among the version's commits store `blocked` with
+A draft has the cause `draft`. A missing target branch, a head with no
+commit the target lacks, a head with no history in common with the target
+and a merge commit among the version's commits have the causes
 `target_not_found`, `nothing_to_land`, `unrelated_history` and
-`merge_commits` without asking the evaluator. The change keeps its state.
+`merge_commits`, which `measureMove` returns. A registered evaluator is
+asked in every case with that cause (`EvaluateLanding(ctx, tx, ch, v,
+cause)`), and its answer, blocked for the cause with the requirements
+still listed, is stored. Without one, a cause stores `blocked` with it and
+no requirements, a draft's landing is left as it is, and any other change
+is `ready`. The change keeps its state.
 A version with no merge base has `BaseSHA` nil (stored as the empty
 string) and is measured from the empty tree, every commit of its head
 counted.
@@ -3699,8 +3703,9 @@ abandon in `lifecycle.go`, `RegisterRestacker`
 ([ADR 08](adr/08-register-the-push-collaborators-on-the-ref-writer.md)).
 The hub registers the fork activity recorder (below) and the component's
 own stack linker (`StackLinker()`) and restacker (`Restacker()`), both the
-type `stacks` (below), and no session linker, landing evaluator or
-auto_land guard.
+type `stacks` (below), and no session linker or auto_land guard; the
+landing policy's part registers the landing evaluator (see
+[Landing policy](#landing-policy)).
 
 The stack linker (`stack.go`, the type `stacks`) links each new version,
 at open and after, from the commit graph: of the other draft and open
@@ -4119,9 +4124,11 @@ workspace's repository. A change that is neither draft nor open, or that
 has a pending restack (`change_restacks`), is dropped, since its head
 still holds the old commits of the change below: the end of the restack
 schedules it again, or stores its conflict; a missing target branch leaves `mergeable` `unknown` and runs
-`reevaluateLanding` (draft: `blocked/draft`; else the structural reason
-`measureMove` finds, `target_not_found` here; else the landing evaluator
-with the current version; else ready). Otherwise the check runs
+`reevaluateLanding`. It reads the cause with `LandingCause` (`draft` for
+a draft, which is not measured, else the structural reason `measureMove`
+finds, `target_not_found` here). The registered landing evaluator answers
+with that cause and the current version; without one, the cause blocks
+the landing, else it is ready. Otherwise the check runs
 `(*gitrepo.Repo).TrialRebase(ctx, onto, head)` under a 30 s deadline,
 or, for a change in a stack (`ownBase`: it has a `depends_on`, a
 `needs_restack` or a `restack_onto`) with a `base_sha`,
@@ -4159,8 +4166,9 @@ by the hub, metadata `version`, `head_sha`): it does nothing while
 and `mergeable` `clean` whose `ready_announced_head` is not its head gets
 the event and the head stored; any other change has the column cleared
 through `ForgetLandable(ctx, tx, workspace, number)`, which the abandon,
-the move to draft (and the retarget) call too. The landing policy calls `AnnounceLandable`
-in each transaction that stores a landing. `emit` (`open.go`) adds
+the move to draft (and the retarget) call too. The landing policy's
+re-evaluation (`ReevaluateIn`) calls `AnnounceLandable` after `SetLanding`,
+in the transaction that stores the landing. `emit` (`open.go`) adds
 `number` and `ref` to the metadata of every change event. An error of
 the event writer rolls the storing transaction back, which leaves
 `mergeable` `unknown` and is logged as a failed check.
@@ -4576,8 +4584,10 @@ contacts origin or a forge.
 `gate.go` holds the two registration points on the component: the policy
 gate (`RegisterGate`; `Gate.Evaluate` takes the workspace, the change,
 the version and the caller and answers a status, a reason, requirements
-and a revision), whose default answers `ready` with revision 0, and the
-override rule (`RegisterOverrideRule`), whose default passes nothing.
+and a revision), whose default answers `ready` with revision 0 and in
+whose place the landing policy registers its gate (see
+[Landing policy](#landing-policy)), and the override rule
+(`RegisterOverrideRule`), whose default passes nothing.
 `judge` asks the gate before the first try only; an answer that is not
 `ready` on an attempt with a requested override is put to the rule, and
 one it lets pass counts as `ready` and sets the attempt's `override` to
@@ -4689,8 +4699,10 @@ no longer exists ends it `failed` `internal` as in any run.
 
 ### Landing policy
 
-`internal/hub/policy.go` adds the part `composePolicy`, after `composeLand`
-in `parts`. It creates a zero `policy.Component` (`Policy()`), adds
+`internal/hub/policy.go` adds two parts. `composePolicy` comes after
+`composeSCM` and before `composeChanges` in `parts`, so that the start hook
+`policy` binds the component before the change component's start hooks
+record versions, which ask the landing evaluator. It creates a zero `policy.Component` (`Policy()`), adds
 `policy.SchemaStep` (the step `policy_revisions`), registers its `Routes()`
 with `AddRoute`, registers `WorkspaceDeleted` as a remover of the
 workspace teardown, which deletes a deleted workspace's revisions in the
@@ -4701,10 +4713,46 @@ workspace's kind, status and default branch (`policy.Workspace`),
 `policyUsers` (`Users`), an adapter over `identity.UserBySelector` on
 `Store.Main()` that answers whether a user of that username exists
 (`identity.ErrNotFound` is no, any other error is returned), the event
-component (`Events`), and the hub's clock and logger; `AdjustPolicy` adjusters run before the bind. The
-component embeds `policy.EvidenceSlot`, so `RegisterEvidence` is called on
-the hub's instance; none is registered, and the evaluation reads
-`NoEvidence`.
+component (`Events`), the change component (`Changes`), an opener of the
+workspaces' repositories (`Repos`), and the hub's clock and logger;
+`AdjustPolicy` adjusters run before the bind. The component embeds
+`policy.EvidenceSlot`, so `RegisterEvidence` is called on the hub's
+instance; none is registered, and the evaluation reads `NoEvidence`.
+
+`composePolicyEvaluation` comes after `composeLand`. It registers the
+component on the change component as its landing evaluator
+(`RegisterLandingEvaluator`) and `policyGate` on the land component as its
+policy gate (`RegisterGate`), both while the hub is composed, so that a
+test's `Compose` replaces them.
+
+The evaluation of a change (`evaluate`, `reevaluate.go`) reads, through
+the querier it is given, the current revision of the policy of the change's
+target workspace. That is revision 0 for a task fork, as the kind from
+`Deps.Workspaces` says. It then runs `Evaluate` with `factsOf` the change
+(`changeadapter.go`), the cause, the component's `Files` and the installed
+evidence source.
+
+- `Files` reads the change, then `DiffChanges(base_sha, head_sha)` in the
+  repository of the change's target workspace. That repository holds every
+  version head, a fork's included. It keeps `Path` and `OldPath` of every
+  file, sorted and each once, with no cap.
+- `EvaluateLanding(ctx, tx, ch, v, cause)` is the change component's
+  evaluator. It runs inside the change component's transaction, reads
+  everything through it, never opens `Store.Tx` (which would deadlock) and
+  does not announce: the change component's callers do.
+- `ReevaluateIn(ctx, tx, workspace, number)` reads the change. An unknown
+  one is `ErrChangeNotFound`, the change component's
+  `change.ErrChangeNotFound`, and a landed or abandoned one
+  `ErrChangeClosed`, with nothing written. It reads the cause with
+  `Changes.LandingCause` and evaluates. It then stores the result with
+  `Changes.SetLanding` and runs `Changes.AnnounceLandable`, all in `tx`, and
+  returns the result and the revision. `Reevaluate` runs it in a
+  `Store.Tx` of its own.
+- `policyGate` (`internal/hub/policy.go`) answers the land's gate. For the
+  change's current version it runs `Reevaluate`. For an older version it
+  runs `EvaluateVersion`, which evaluates the files `Base..Head` against the
+  current revision through `Store.Main()` with no cause and stores nothing.
+  It converts the result with `Result.Landing` into the `GateAnswer`.
 
 The schema keeps `policy_revisions`: one row per stored revision, keyed by
 `(workspace_slug, revision)` with `revision > 0`, holding the document in

@@ -3596,7 +3596,7 @@ copied there from the fork.
 The change object:
 
 ```json
-{"workspace_slug":"demo","number":1,"ref":"demo#1","title":"Add x","intent":"Because y","state":"open","target_branch":"main","source":{"workspace_slug":"demo","branch":"feat"},"version":1,"head_sha":"0b86db2bc73da0f067ec404140cfc00060162383","base_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","depends_on":null,"dependants":[],"author":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"sessions":[],"mergeable":"unknown","conflict":null,"needs_restack":false,"restack_reason":null,"stats":{"commits":1,"files_changed":1,"insertions":1,"deletions":0},"paths":["feat.txt"],"paths_truncated":false,"landing":{"status":"ready","reason":null,"requirements":[]},"auto_land":false,"labels":["docs"],"landed":null,"reverts":null,"reverted_by":null,"created_at":"2026-11-15T13:12:13Z","updated_at":"2026-11-15T13:12:13Z"}
+{"workspace_slug":"demo","number":1,"ref":"demo#1","title":"Add x","intent":"Because y","state":"open","target_branch":"main","source":{"workspace_slug":"demo","branch":"feat"},"version":1,"head_sha":"0b86db2bc73da0f067ec404140cfc00060162383","base_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","depends_on":null,"dependants":[],"author":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"sessions":[],"mergeable":"unknown","conflict":null,"needs_restack":false,"restack_reason":null,"stats":{"commits":1,"files_changed":1,"insertions":1,"deletions":0},"paths":["feat.txt"],"paths_truncated":false,"landing":{"status":"ready","reason":null,"requirements":[{"rule":"default","paths":["feat.txt"],"approvals":{"required":0,"counted":0,"approvers":["owner"]},"checks":[],"block":false,"satisfied":true}]},"auto_land":false,"labels":["docs"],"landed":null,"reverts":null,"reverted_by":null,"created_at":"2026-11-15T13:12:13Z","updated_at":"2026-11-15T13:12:13Z"}
 ```
 
 | Member | Meaning |
@@ -3610,7 +3610,7 @@ The change object:
 | `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why. `stack_too_deep`: the change sits deeper in its stack than `[changes].max_stack_depth` (its depth is the number of changes in its chain of `depends_on` links down to a change with none, itself included); its version and its `depends_on` are recorded all the same, the hub restacks neither it nor the changes above it, and the flag is cleared when a link below it changes so that it is back within the limit. `auto_restack_off`: the workspace's `changes.auto_restack` is `false` and the change is not built on what it must sit on. `conflict`: its restack conflicted. A restack clears the flag for any reason but `stack_too_deep` (see [Stacks and restack](#stacks-and-restack)) |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
-| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements` |
+| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements`, listed for a blocked change too (see [The landing of a change](#the-landing-of-a-change)) |
 | `landed` | how it landed, `null` until then: `sha`, `at`, `by` (an author object), `land_id` and `commits`, each `{version_sha, landed_sha}` |
 | `reverts`, `reverted_by` | the number of the change it reverts, and of the change that reverts it, `null` for none |
 
@@ -3684,10 +3684,12 @@ token opens only from a workspace its binding covers. The body:
 
 The answer is `201` with the change object, at version 1: the head of the
 source branch, of kind `ref`, written at `refs/parley/changes/<number>/1`.
-`mergeable` is `unknown` until its first check. A draft has `landing`
-`{"status":"blocked","reason":"draft","requirements":[]}`; any other
-change the landing evaluation's answer, which until the hub has a landing
-policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
+`mergeable` is `unknown` until its first check. `landing` is version 1
+evaluated against the current revision of the policy of `{slug}` (see
+[The landing of a change](#the-landing-of-a-change)): a draft is
+`blocked` for `draft`, with its requirements listed. Under the revision-0
+document, whose default requires nothing, every other change is `ready`,
+its files listed under the `default` requirement. Until the
 hub has a session feature, every `session_id` is refused and a defaulted
 one dropped.
 
@@ -3971,8 +3973,8 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   `source_branch`, `depends_on` and `was_draft` (`true`), followed by
   `parley.change.ready` when the change is then landable (see
   [Mergeability](#mergeability)). A `state` of `"draft"` on an open change
-  makes it a draft: `landing` becomes
-  `{"status":"blocked","reason":"draft"}`, its versions, labels,
+  makes it a draft: `landing` becomes `blocked` for `draft`, with the
+  policy's requirements still listed, its versions, labels,
   `auto_land` and `mergeable` stay, its landable announcement is
   forgotten, and no event is written. A `state` the change already has is
   no edit, before the intent rule as after it: `{"state":"open"}` on an
@@ -4586,9 +4588,17 @@ change it covers, once and bottom first, with the workspace, the change,
 the version being landed with its head and base commits, and the caller,
 so that a change that got a newer version while the attempt waited is
 judged at the version the attempt lands; a retry of the compare-and-swap
-asks nothing again. With no policy installed every change is `ready`, by
-revision 0, and `policy_revision` is the revision that answered, the
-highest when the answers differ. An answer `pending` or `blocked` on a
+asks nothing again. The gate is the landing policy of the change's target
+workspace. For the change's current version, it evaluates the change again
+as [The landing of a change](#the-landing-of-a-change) says: it stores the
+change's `landing`, announces the change when it is landable, and answers
+that landing. For an older version, it evaluates that version's files
+against the current revision and stores nothing. A workspace that never
+set a policy is at revision 0, whose default requires nothing, so its
+changes are `ready` unless they are drafts or a structural cause blocks
+them. A change abandoned or landed since the attempt was asked fails the
+attempt. `policy_revision` is the revision that answered, the highest when
+the answers differ. An answer `pending` or `blocked` on a
 request that carries an `override` is put to the override rule, and one
 the rule lets pass counts as `ready`; the attempt, and the metadata of
 its `parley.change.land` events, show `override` `{"reason": …}` only when
@@ -4960,6 +4970,59 @@ with the policy object of the new revision and its `ETag`, as `GET`
 answers it. Replacements of one workspace run one at a time: two sent at
 once without `If-Match` get consecutive revisions, and of two with the
 same `If-Match` one is stored and the other is `412` `revision_mismatch`.
+
+### The landing of a change
+
+The `landing` of a draft or open change is its current version evaluated
+against the current revision of the policy of its target workspace. A
+change into a task fork is evaluated against revision 0. The change's
+files are those that differ between its `base_sha` and its `head_sha`,
+with no cap. A file renamed or copied counts under both of its paths. A
+change stacked on another therefore counts only the files of its own
+commits. Each file selects the first rule, in document order, whose
+`targets` match the change's `target_branch` (absent `targets` match every
+branch), one of whose `paths` matches the file and none of whose `exclude`
+does. A file that no rule selects selects `default`. A path glob matches
+the whole path: `*` matches any run of characters without `/`, `**` any
+run including `/`, both possibly empty, `?` exactly one character other
+than `/`, and every other character itself.
+
+Each selected rule, then `default`, gives one requirement:
+
+| Member | Meaning |
+|---|---|
+| `rule` | the rule's name, or `default` |
+| `paths` | the change's files that selected it, in ascending byte order, the first 50 |
+| `approvals` | `required` (the rule's `approvals`), `counted` and `approvers` |
+| `checks` | each of the rule's checks once, with its `status`: `passed`, `failed` or `pending` (no result) |
+| `block` | the rule's `block` |
+| `satisfied` | `true` when the rule does not block, enough approvals count, no rejection is outstanding and every check passed |
+
+Until approvals and check results are recorded, nothing is counted and
+every check is `pending`. The `status` is `blocked`, with the `reason`,
+for a draft (`draft`). It is also `blocked`, with the `reason`, for a
+change with a structural cause (`target_not_found`, `nothing_to_land`,
+`unrelated_history`, `merge_commits`), whatever its requirements say.
+Otherwise it is `blocked` when a requirement blocks, `pending` when one is
+not satisfied, and `ready` otherwise or when there is none. The
+requirements are listed in every case.
+
+The landing is evaluated again and stored on each of these:
+
+- a new version;
+- a retarget;
+- a move between draft and open;
+- a restore;
+- a mergeability check of a change whose target branch is missing or found
+  again;
+- the policy gate of a land.
+
+When the policy re-evaluates a change itself, as the gate does, it stores
+the landing and then runs the announcement of [Mergeability](#mergeability)
+in the same transaction. `parley.change.ready` is therefore written once
+when the change becomes landable, and a failure of either step stores
+neither. Every re-evaluation sets the change's `updated_at`. A landed or
+abandoned change keeps the landing it had when it closed.
 
 ## Admin routes
 

@@ -32,6 +32,8 @@ a draft is blocked for `draft`; otherwise the structural reason the
 measurement of the current head finds (`target_not_found`,
 `nothing_to_land`, `unrelated_history`, `merge_commits`); otherwise the
 registered landing evaluator; otherwise ready.
+Erratum 27 has the registered evaluator asked in every case, given the
+cause.
 
 ## A retarget writes the change and not its version
 

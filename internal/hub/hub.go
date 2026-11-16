@@ -73,9 +73,10 @@ var parts = []func(*Composition){
 	composeForks,
 	composeGitServer,
 	composeSCM,
+	composePolicy,
 	composeChanges,
 	composeLand,
-	composePolicy,
+	composePolicyEvaluation,
 	composeSandbox,
 }
 

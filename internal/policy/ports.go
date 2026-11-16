@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"sync"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
 
 // EventWriter takes the policy events in the caller's transaction, which an
@@ -42,6 +44,21 @@ type Workspace struct {
 type WorkspaceReader interface {
 	Workspace(ctx context.Context, q Querier, slug string) (w Workspace, found bool, err error)
 }
+
+// Changes is what the policy reads and writes of the change records, which
+// the change component keeps: a change, the cause it cannot land for
+// whatever the policy requires, its landing, and the announcement step
+// that is the one writer of parley.change.ready. Every call goes through
+// the caller's querier or transaction.
+type Changes interface {
+	ReadChange(ctx context.Context, q change.Querier, workspace string, number int64) (change.Change, error)
+	LandingCause(ctx context.Context, q change.Querier, ch change.Change) (*string, error)
+	SetLanding(ctx context.Context, tx *sql.Tx, workspace string, number int64, l change.Landing) error
+	AnnounceLandable(ctx context.Context, tx *sql.Tx, workspace string, number int64) error
+}
+
+// Repos opens the repository of the workspace slug.
+type Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
 
 // ChangeFacts is what the evaluator knows of a change besides its files.
 type ChangeFacts struct {

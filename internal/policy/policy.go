@@ -17,6 +17,10 @@ type Deps struct {
 	Users Users
 	// Events takes the policy events in the caller's transaction.
 	Events EventWriter
+	// Changes reads the changes and stores their landings.
+	Changes Changes
+	// Repos opens the repositories the files of a change are read in.
+	Repos Repos
 	// Now is the hub's clock; nil is time.Now.
 	Now func() time.Time
 	// Logger is where the component logs; nil discards.

@@ -82,8 +82,8 @@ type OpenInput struct {
 // version 1 with its ref refs/parley/changes/<number>/1 in the target's
 // repository, links its session, stores the change draft or open with
 // mergeable unknown, asks the auto_land guard before it stores auto_land,
-// then runs the stack linker, the landing evaluator (not for a draft) and
-// the version observers in that order, tells the fork activity recorder of
+// then runs the stack linker, the landing evaluator (for a draft too, with
+// the cause draft) and the version observers in that order, tells the fork activity recorder of
 // a fork source, and writes parley.change.version, with the version as
 // stored then (the stack linker may have measured it from the change
 // below), and, unless the change is a draft, parley.change.open. It
@@ -131,7 +131,7 @@ func (c *Component) Open(ctx context.Context, tx *sql.Tx, in OpenInput) (_ Chang
 		Landing: readyLanding(), Labels: o.labels, Reverts: in.Reverts, CreatedAt: now, UpdatedAt: now,
 	}
 	if in.Draft {
-		ch.State, ch.Landing = StateDraft, blockedLanding("draft")
+		ch.State, ch.Landing = StateDraft, blockedLanding(reasonDraft)
 	}
 	if err := insertChange(ctx, tx, ch, v); err != nil {
 		if errors.Is(err, errSourceTaken) {
@@ -209,11 +209,12 @@ func (c *Component) followSource(ctx context.Context, tx *sql.Tx, o *opening, ch
 // afterVersion runs, for the new version v of the change number of the
 // workspace, the stack linker, the landing derivation and the version
 // observers, in that order, each with the change as stored at its turn, so
-// that an observer reads the landing of this version's evaluation. A draft
-// keeps its blocked landing and asks no evaluator; structural, when not
-// nil, is the landing a cause in the version's commits blocks, which is
-// stored without asking the evaluator.
-func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborators, workspace string, number int64, v Version, dependsOn *int64, structural *Landing) error {
+// that an observer reads the landing of this version's evaluation.
+// structural is the cause in the version's commits that blocks it, nil for
+// none; a draft is blocked for draft instead. A registered evaluator is
+// asked with that cause in every case; without one a draft keeps its
+// blocked landing.
+func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborators, workspace string, number int64, v Version, dependsOn *int64, structural *string) error {
 	ch, err := readChange(ctx, tx, workspace, number)
 	if err != nil {
 		return err
@@ -223,17 +224,19 @@ func (c *Component) afterVersion(ctx context.Context, tx *sql.Tx, co collaborato
 			return err
 		}
 	}
-	if ch.State != StateDraft {
-		landing := readyLanding()
-		if structural != nil {
-			landing = *structural
-		} else if co.evaluator != nil {
+	if ch.State != StateDraft || co.evaluator != nil {
+		cause := structural
+		if ch.State == StateDraft {
+			cause = new(reasonDraft)
+		}
+		if co.evaluator != nil {
 			if ch, err = readChange(ctx, tx, workspace, number); err != nil {
 				return err
 			}
-			if landing, err = co.evaluator.EvaluateLanding(ctx, tx, ch, v); err != nil {
-				return err
-			}
+		}
+		landing, err := landingOf(ctx, tx, co.evaluator, ch, v, cause)
+		if err != nil {
+			return err
 		}
 		if err := storeLanding(ctx, tx, workspace, number, landing, c.now()); err != nil {
 			return err

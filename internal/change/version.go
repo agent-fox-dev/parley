@@ -50,12 +50,13 @@ type VersionInput struct {
 // linker, the landing derivation and the version observers in that order
 // and writes parley.change.version with the version as stored then, whose
 // base and patch equivalence the stack linker may have measured again
-// from the change below. The landing of a draft stays
-// blocked/draft; a missing target branch, a head with no commit the target
-// lacks, a head with no history in common with the target and a merge
-// commit among the version's commits block it as target_not_found,
-// nothing_to_land, unrelated_history and merge_commits without asking the
-// landing evaluator. The change keeps its state.
+// from the change below. A draft is blocked for draft; a missing target
+// branch, a head with no commit the target lacks, a head with no history in
+// common with the target and a merge commit among the version's commits
+// block it as target_not_found, nothing_to_land, unrelated_history and
+// merge_commits. A registered landing evaluator is asked in every case,
+// with that cause, and its answer is the landing; without one the landing
+// of a draft stays as it is. The change keeps its state.
 //
 // As with Open, the version ref is written before the collaborators run
 // and before RecordVersion returns, and removed again when a later step
@@ -84,7 +85,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 			return nil, err
 		}
 	}
-	o, structural, err := c.measureMove(ctx, tx, ch, in.Head)
+	o, cause, err := c.measureMove(ctx, tx, ch, in.Head)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +117,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	if err := storeVersion(ctx, tx, workspace, number, v, o.paths, o.truncated); err != nil {
 		return nil, err
 	}
-	if err := c.afterVersion(ctx, tx, co, workspace, number, v, nil, structural); err != nil {
+	if err := c.afterVersion(ctx, tx, co, workspace, number, v, nil, cause); err != nil {
 		return nil, err
 	}
 	if ch, err = readChange(ctx, tx, workspace, number); err != nil {
@@ -202,10 +203,12 @@ func (c *Component) RecordRacedVersion(ctx context.Context, tx *sql.Tx, workspac
 // measureMove measures head, the new head of the change ch's source branch,
 // as Open measures version 1: its base, stats, touched paths and patch id,
 // read in the source's repository, which for a fork reads its parent's
-// objects. structural is the landing a cause in the version blocks, nil
-// for none: the target branch missing, no commit the target lacks, no
-// history in common with the target, or a merge commit among the commits.
-func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head string) (o *opening, structural *Landing, err error) {
+// objects. cause is the structural reason the version cannot land for,
+// nil for none: target_not_found for the target branch missing,
+// nothing_to_land for no commit the target lacks, unrelated_history for no
+// history in common with the target, and merge_commits for a merge commit
+// among the commits.
+func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head string) (o *opening, cause *string, err error) {
 	o = &opening{head: head}
 	if o.targetRepo, err = c.deps.Repos(ctx, ch.WorkspaceSlug); err != nil {
 		return nil, nil, err
@@ -228,8 +231,7 @@ func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head 
 		if err != nil {
 			return nil, nil, err
 		}
-		l := blockedLanding("target_not_found")
-		return o, &l, o.measureFromBase(ctx, len(ahead))
+		return o, new("target_not_found"), o.measureFromBase(ctx, len(ahead))
 	}
 	ahead, err := o.sourceRepo.CommitsBetween(ctx, targetHead, head, 0)
 	if err != nil {
@@ -239,12 +241,10 @@ func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head 
 		return nil, nil, err
 	}
 	if len(ahead) == 0 {
-		l := blockedLanding("nothing_to_land")
-		return o, &l, nil
+		return o, new("nothing_to_land"), nil
 	}
 	if o.base == "" {
-		l := blockedLanding("unrelated_history")
-		return o, &l, nil
+		return o, new("unrelated_history"), nil
 	}
 	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)
 	if err != nil {
@@ -252,8 +252,7 @@ func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head 
 	}
 	for _, cm := range commits {
 		if len(cm.Parents) > 1 {
-			l := blockedLanding("merge_commits")
-			return o, &l, nil
+			return o, new("merge_commits"), nil
 		}
 	}
 	return o, nil, nil

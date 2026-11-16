@@ -423,41 +423,67 @@ func (c *Component) emitConflict(ctx context.Context, tx *sql.Tx, ch Change, rep
 }
 
 // reevaluateLanding derives again, in tx, the landing of the change number
-// of the workspace at its current version, as a new version derives it: a
-// draft is blocked/draft; a missing target branch, nothing to land,
-// unrelated history and merge commits block it without asking the
-// landing evaluator; otherwise the evaluator answers, ready without one.
+// of the workspace at its current version, as a new version derives it,
+// with the cause LandingCause reads: the registered evaluator answers,
+// given the cause; without one the change is blocked for its cause, or
+// ready.
 func (c *Component) reevaluateLanding(ctx context.Context, tx *sql.Tx, workspace string, number int64) error {
 	ch, err := readChange(ctx, tx, workspace, number)
 	if err != nil {
 		return err
 	}
-	landing := blockedLanding("draft")
-	if ch.State != StateDraft {
-		_, structural, err := c.measureMove(ctx, tx, ch, ch.HeadSHA)
+	cause, err := c.LandingCause(ctx, tx, ch)
+	if err != nil {
+		return err
+	}
+	evaluator := c.collaborators().evaluator
+	var v Version
+	if evaluator != nil {
+		current, err := readVersionsAfter(ctx, tx, workspace, number, ch.Version-1, 1)
 		if err != nil {
 			return err
 		}
-		evaluator := c.collaborators().evaluator
-		switch {
-		case structural != nil:
-			landing = *structural
-		case evaluator != nil:
-			current, err := readVersionsAfter(ctx, tx, workspace, number, ch.Version-1, 1)
-			if err != nil {
-				return err
-			}
-			if len(current) == 0 {
-				return fmt.Errorf("re-evaluate the landing of %s: version %d is missing", ch.Ref, ch.Version)
-			}
-			if landing, err = evaluator.EvaluateLanding(ctx, tx, ch, current[0]); err != nil {
-				return err
-			}
-		default:
-			landing = readyLanding()
+		if len(current) == 0 {
+			return fmt.Errorf("re-evaluate the landing of %s: version %d is missing", ch.Ref, ch.Version)
 		}
+		v = current[0]
+	}
+	landing, err := landingOf(ctx, tx, evaluator, ch, v, cause)
+	if err != nil {
+		return err
 	}
 	return storeLanding(ctx, tx, workspace, number, landing, c.now())
+}
+
+// reasonDraft is the reason a draft cannot land for.
+const reasonDraft = "draft"
+
+// LandingCause is the reason the change ch cannot land for whatever the
+// landing policy requires, read through q and in the repositories, nil for
+// none: draft for a draft, which is not measured; otherwise the structural
+// reason its head, measured against its target branch as a new version is,
+// gives: target_not_found, nothing_to_land, unrelated_history or
+// merge_commits.
+func (c *Component) LandingCause(ctx context.Context, q Querier, ch Change) (*string, error) {
+	if ch.State == StateDraft {
+		return new(reasonDraft), nil
+	}
+	_, cause, err := c.measureMove(ctx, q, ch, ch.HeadSHA)
+	return cause, err
+}
+
+// landingOf is the landing of the change ch at its version v that cause
+// (nil for none) blocks: the answer of the evaluator, which is given the
+// cause, or without one blocked for the cause with no requirements, or
+// ready.
+func landingOf(ctx context.Context, tx *sql.Tx, evaluator LandingEvaluator, ch Change, v Version, cause *string) (Landing, error) {
+	switch {
+	case evaluator != nil:
+		return evaluator.EvaluateLanding(ctx, tx, ch, v, cause)
+	case cause != nil:
+		return blockedLanding(*cause), nil
+	}
+	return readyLanding(), nil
 }
 
 // mergeKey names a change.

@@ -45,7 +45,8 @@ const (
 // member of the org acme, with the API key ownerKey; the owner's ready
 // workspace demo, whose main and release are at one commit (base) holding
 // a.txt ("l1\nl2\nl3\n"); a session linker that accepts sessionOne and
-// sessionTwo, registered on the change component. Its mergeability checks
+// sessionTwo, registered on the change component, and no landing
+// evaluator, the landing policy's being removed. Its mergeability checks
 // are not spaced, unless the configuration has a [changes] table.
 type world struct {
 	*hubtest.Hub
@@ -80,6 +81,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 	cfg.Compose = func(c *hub.Composition) {
 		w.workspaces, w.events, w.changes, w.forks = c.Workspaces(), c.Events(), c.Changes(), c.Forks()
 		w.changes.RegisterSessionLinker(w.sessions)
+		w.changes.RegisterLandingEvaluator(nil)
 		if compose != nil {
 			compose(c)
 		}
