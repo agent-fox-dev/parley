@@ -75,7 +75,11 @@ func TestLand_LeavesTheLandedChangesBelowOutOfAStack(t *testing.T) {
 	if status != 200 {
 		t.Fatalf("land of %s = %d %v, want 200", s[0].Ref, status, first)
 	}
-	// The change above keeps its link to the landed change.
+	// The landing unlinked the change above from the landed change; it is
+	// linked again, so that the stack below it holds a landed change.
+	if dep := w.readChange(t, s[1].Number).DependsOn; dep != nil {
+		t.Fatalf("%s depends on %d after %s landed, want on nothing", s[1].Ref, *dep, s[0].Ref)
+	}
 	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
 		return w.changes.SetDependsOn(ctx, tx, "api", s[1].Number, &s[0].Number)
 	})

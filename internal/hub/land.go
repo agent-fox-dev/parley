@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -40,6 +41,16 @@ const (
 // session linker is registered: until the session feature registers one,
 // every session_id a land names is refused.
 //
+// Two after-landing hooks are registered here for the features built
+// before the landing: the change feature's entry point for a landed change
+// (OnLanded), which unlinks each landed change's dependants and restacks
+// them onto its landed commit, and the fork feature's activity recorder
+// (RecordActivity), told of each landed change whose source is a task
+// fork. Both open their own store transaction; the hooks are called
+// outside any. No policy gate, override rule, request guard, target guard
+// or final observer is registered: every change is ready to land, an
+// override passes nothing and every request and move is allowed.
+//
 // The teardown of a workspace deletes its land attempts in the delete's
 // transaction (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
 //
@@ -54,6 +65,22 @@ func composeLand(c *Composition) {
 		c.AddRoute(r)
 	}
 	c.workspaces.Teardown().RegisterRemover(comp.WorkspaceDeleted)
+	comp.AddAfterLanding(func(ctx context.Context, in land.AfterLanding) error {
+		var errs []error
+		for _, ch := range in.Changes {
+			errs = append(errs, c.changes.OnLanded(ctx, in.Workspace, ch.Number, ch.LandedSHA))
+		}
+		return errors.Join(errs...)
+	})
+	comp.AddAfterLanding(func(ctx context.Context, in land.AfterLanding) error {
+		var errs []error
+		for _, ch := range in.Changes {
+			if ch.SourceWorkspace != in.Workspace {
+				errs = append(errs, c.forks.RecordActivity(ctx, ch.SourceWorkspace))
+			}
+		}
+		return errors.Join(errs...)
+	})
 	c.AddStartHook(landHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := land.Deps{

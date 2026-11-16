@@ -4146,9 +4146,9 @@ the version cannot record them, the version is not recorded either. A
 change has at most one pending restack: a newer one replaces it, so that
 the change is restacked once, onto the newest head below.
 
-When a change lands as a commit on its target branch, each `draft` or
-`open` change directly above it, in one store transaction of its own,
-gets `depends_on` `null`, keeps the landed commit as the commit it must
+When a change lands (see [Landing](#landing)), once the land is recorded
+each `draft` or `open` change directly above it, in one store transaction
+of its own, gets `depends_on` `null`, keeps the landed commit as the commit it must
 sit on, and gets a pending restack onto that commit, with the trigger
 `land`; a change without dependants records nothing. The changes further
 up keep their `depends_on` and are restacked in turn onto the new head of
@@ -4489,9 +4489,48 @@ report or `blocked` names, else the top change), the requester as actor,
 the attempt's `session_id`, and metadata `land_id`, `status`, `reason`,
 `number` and `ref`, with `files`, the conflicted paths (the first 100,
 and `truncated` `true` when there were more), for a conflict. `reason` is
-`conflict` for a conflict, the gate's reason for a block or `policy` when
-it gave none, and the `error` of a failure (`contention`, `timeout`,
-`internal`). A landed attempt writes none.
+`conflict` for a conflict, the gate's or the target guard's reason for a
+block or `policy` when it gave none, and the `error` of a failure
+(`contention`, `timeout`, `origin_rejected`, `internal`). A landed attempt
+writes none.
+
+A feature installed on the hub may guard the move of a target branch. Such
+a target guard is asked once, after the changes are replayed and before the
+first compare-and-swap, with the workspace, the target branch, its head
+before the land and the head the land would make it; a retry on a moved
+target asks it nothing again. A guard that refuses ends the attempt
+`blocked`, with `blocked` `{"change": <the top change>, "status":
+"blocked", "requirements": []}` and the guard's reason as the `reason` of
+`parley.change.land_fail`; a guard that reports a rejection by origin ends
+it `failed` with `error` `origin_rejected`; a guard that cannot decide ends
+it `failed` with `error` `internal`. In each case the target does not move
+and the change stays `open`. No target guard is installed yet, so every
+move is allowed.
+
+Once a land is recorded, a land that moved nothing included, the hub does
+its follow-up, each step on its own: a step that fails is logged and
+changes neither the attempt, nor the answer to the call, nor the steps
+after it. The answer to the call waits for the follow-up.
+
+- The source branch of each landed change is deleted, in the change's
+  source workspace, when the target workspace's setting
+  `land.delete_source` is `true` (its default), the branch is still at the
+  head of the version that landed and no other `draft` or `open` change
+  has it as its source. A branch that moved since keeps the work that did
+  not land and is left as it is, as is the default branch of the source
+  workspace. The branch is deleted directly with a compare-and-swap, not
+  as a push: no push rule applies and no `parley.git.push` is written; the
+  changes whose target is the deleted branch get a mergeability check.
+- Every other `draft` or `open` change whose target is the landed target
+  branch gets `mergeable` `unknown` and a mergeability check.
+- Each landed change's `draft` or `open` dependants are unlinked from it
+  and get a pending restack onto the commit the target held once it
+  landed (see [Stacks and restack](#stacks-and-restack)), and a task fork
+  that is the source of a landed change records an activity, from which
+  its early expiry counts.
+
+A land changes only the hub's own repositories and contacts neither origin
+nor a forge: publishing a landed branch is a push to origin of its own.
 
 Attempts run side by side, with no queue and no lock per workspace or
 branch: two attempts meet only in the compare-and-swap. At most
@@ -4513,7 +4552,9 @@ comes up, before it serves a request, in one of two states: the target at
 its old head, the change `open`, no `parley.change.land` event and the
 attempt not `landed`; or the target at the new head, the change `landed`
 with every landed commit mapped, the attempt `landed` and the land's
-events written once.
+events written once. A land the start completes gets its follow-up (above)
+then; a land recorded before the stop does not get it again, so a stop
+during its follow-up leaves the rest of it undone.
 
 The three reads need the scope `changes:read` and read access to
 `{slug}`. Both lists are [lists](#lists) ordered newest first: by
@@ -4569,7 +4610,13 @@ nothing:
 7. `session_id` must pass the session-linking rule: `400`
    `unknown_session` otherwise. Until the session feature is installed,
    every `session_id` is refused;
-8. the preconditions, read in the transaction that creates the attempt,
+8. the request guards a feature installed on the hub registers, each asked
+   with the caller, `{slug}`, the changes the land would cover (bottom
+   first, each at its current version) and the `override`: the first that
+   refuses gives the answer as it gives it, its status, `error_type` and
+   members such as `path` (for example `403` `path_not_allowed`), and the
+   guards after it are not asked. No request guard is installed yet;
+9. the preconditions, read in the transaction that creates the attempt,
    the first that fails being the answer:
    1. every change the land covers is `open`: `409` `change_not_open` for
       a `draft`, `landed` or `abandoned` change;

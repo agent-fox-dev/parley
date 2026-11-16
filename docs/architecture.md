@@ -26,7 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
+| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -2654,8 +2654,9 @@ control API to a fork, outside any store transaction, and the change part
 registers `(*fork.Component).RecordActivityIn` as the change component's,
 which runs in the transaction that opens or abandons a change from the
 fork (`RecordActivity` opens a transaction of its own, which inside
-another would wait for it forever). The landing's is registered when it
-arrives. It
+another would wait for it forever). The landing part registers an
+after-landing hook that calls `RecordActivity` for each landed change
+whose source is not the target (see [Landing](#landing)). It
 adds the background work `fork_sweep` (grace 10 seconds), which runs
 `(*Component).RunSweep` from the bind to the stop, and the maintenance task
 `fork_expiry`, which runs one `RunPass` in each maintenance pass.
@@ -3857,8 +3858,9 @@ each direct dependant gets `depends_on` nil (`SetDependsOn`, its base
 kept, so that only its own commits are replayed), `restack_onto` the
 landed commit, its depth recomputed, then `pendRestack` with
 `TriggerLand` (`land`) and `onto` the landed commit; the changes further
-up keep their links. No landing calls it yet: the hub registers it nowhere,
-and its tests call it directly. `stacks.RequestRestack(ctx, tx, ch,
+up keep their links. The landing part registers an after-landing hook
+that calls it for each landed change, with the commit the target held once
+that change landed (see [Landing](#landing)). `stacks.RequestRestack(ctx, tx, ch,
 trigger)`, the `Restacker` an abandon with `DependantsReparent` calls
 after it has set the dependant's `depends_on`, recomputes the depth of
 `ch` and the changes above it and calls `pendRestack(ctx, tx, ch,
@@ -3878,7 +3880,9 @@ being the store, and answer "none" with a nil error:
 `OpenChangeOfBranch(ctx, q, workspace, branch)` is the draft or open
 change of a source branch (`change.BranchChange{WorkspaceSlug, Number,
 Version, State}`, named under its target, the parent for a fork's
-branch); `ChangeOfCommit(ctx, q, workspace, sha)` is the change that
+branch); `ChangesInto(ctx, q, workspace, branch)` the numbers of the
+draft and open changes whose target is the branch, ascending, which
+`ScheduleTargetMergeable` and the landing's follow-up use; `ChangeOfCommit(ctx, q, workspace, sha)` is the change that
 landed the commit (a `change_landed_commits` record) or else has it as a
 version head, the lowest number first (`change.CommitChange{WorkspaceSlug,
 Number, Version, Landed}`, `Version` the highest version with that head
@@ -4326,8 +4330,15 @@ to the store (`Store`), the hub's git opening
 and e-mail as `Committer`);
 `AdjustLand` adjusters run before the bind, and `Bind` defaults
 `MaxAttempts` to 10, `Workers` to 8, `Timeout` to 5 minutes and `After`,
-the clock a land request waits on, to `time.After`. No session linker is
-registered. The start
+the clock a land request waits on, to `time.After`, and `Mergeability`,
+the scheduler of the mergeability checks a land leaves, to `Changes`. No
+session linker is registered. The part registers two after-landing hooks,
+outside the start hook: one calls `(*change.Component).OnLanded(ctx,
+workspace, number, landed)` for each landed change, the other
+`(*fork.Component).RecordActivity(ctx, slug)` for each landed change whose
+source workspace is not the target; each opens its own store transaction
+and the hooks are called outside any. No gate, override rule, request
+guard, target guard or final observer is registered. The start
 hook `land-journal`, after `land`, runs `(*land.Component).Reconcile`.
 The part adds the background work `land_pool` (grace 5 s), which runs
 `RunPool` until the stop.
@@ -4371,7 +4382,10 @@ token, a user for whom `Access.CanWrite` holds, or the change's author
 while `land.by_author` is on; else `403 forbidden`), checks the
 workspace's `Ready`, then the session (`session`: the registered
 `SessionLinker`'s `Check`, `400 unknown_session` for a refused id and for
-every id while none is registered). `create` then reads the changes again
+every id while none is registered), then asks the request guards
+(`askRequestGuards`) with the caller, the workspace, the changes it covers
+(`covered`) and the requested override, the first refusal being the
+answer as the guard returns it. `create` then reads the changes again
 in one store transaction, checks the preconditions there (`admit`: every
 covered change open, `expected_version`, no running attempt covering a
 covered change, found by `runningCovering`, and without `stack` every
@@ -4389,8 +4403,9 @@ whichever comes first, then reads the attempt and answers `202` while it
 runs, `200` when it landed, and otherwise the `*server.Error` of `final`
 with the attempt as its details: `409 land_conflict`, `409
 policy_blocked` or `503 land_failed`. `(*land.Component).Start(ctx, StartInput)`
-does the same from the workspace's `Ready` on, without a request, for a
-land with the trigger `auto_land`.
+does the same from the workspace's `Ready` on, without a request and
+without asking the request guards, for a land with the trigger
+`auto_land`.
 
 A land replays a change with `(*gitrepo.Repo).RebaseFromAs`, which takes
 the landing identity as committer and says what each commit of the change
@@ -4430,10 +4445,47 @@ the result to `commit` (`commit.go`). A `commit` that
 finds the target moved since it was read starts the next try on the new
 head; when the last try lost, the attempt ends `failed` `contention`. A
 gate, store or git error other than a conflict ends it `failed`
-`internal` and is returned to the engine's caller. Every final status
+`internal` and is returned to the engine's caller. On the first try,
+once the build did not conflict, `judgeTarget` asks each target guard
+(`TargetGuard.Check` with the workspace, the branch, the head read and the
+built head): a refusal ends the attempt `blocked` with `blocked` the top
+change, status `blocked`, no requirements and the guard's reason for the
+event, an origin rejection `failed` `origin_rejected` (its message
+logged), and an error or a panic `failed` `internal`. Every final status
 is written by `finish`, in the transaction that ends the attempt; `end`
 runs it in a transaction of its own, `fail` ends the attempt `failed`
 `internal`.
+
+`hooks.go` holds four more registration points, each a list called in
+the order of registration: `AddRequestGuard` (`RequestGuard.Check(ctx,
+RequestInput{Caller, Workspace, Changes, Override}) error`, a non-nil
+error refusing the request as given), `AddTargetGuard`
+(`TargetGuard.Check(ctx, TargetInput{Workspace, Branch, Old, New})
+(TargetAnswer{Refuse, OriginRejected}, error)`), `AddAfterLanding`
+(`AfterLandingHook(ctx, AfterLanding{Attempt, Workspace, Update{Ref,
+Before, After}, SessionID, Changes []LandedChange{Number,
+SourceWorkspace, SourceBranch, LandedSHA}}) error`) and
+`AddFinalObserver` (`FinalObserver(ctx, Final{Attempt, Result, Attempts,
+Duration})`). Once a transaction that makes an attempt final has
+committed, `concluded` (`after.go`) runs: for a landed attempt `follow`,
+then `report`, which tells every final observer of it, `Duration` from
+`created_at` to `finished_at`. `end` calls it for every attempt it ends,
+the pool's timeouts included, `commit` after the record of a land, a
+`noop` one included, and `Reconcile` after a land it records; a second
+final status `finish` refuses tells nobody, so each attempt is reported
+once. `follow` runs each step in `step`, which logs its error or its
+panic and goes on: `deleteSource` per covered change (when the target's
+`land.delete_source` is on, `OpenChangeOfBranch` finds no draft or open
+change of the source branch and it is not the source workspace's default
+branch, a `PrepareRefs` delete of `refs/heads/<branch>` expecting the
+version's head, `Commit`, then `ScheduleTargetMergeable` of the source
+workspace and branch in a transaction of its own; a branch that moved is
+`ErrRefMoved` and kept), `scheduleOthers` (`Deps.Mergeability.ScheduleMergeable`
+for every change `(*change.Component).ChangesInto` gives for the target
+other than those landed, in one transaction), then each after-landing
+hook, with each change's landed commit its last `commits` entry, else
+that of the change below it, else `onto_sha`. Nothing of the land
+contacts origin or a forge.
 
 `gate.go` holds the two registration points on the component: the policy
 gate (`RegisterGate`; `Gate.Evaluate` takes the workspace, the change,
@@ -4507,7 +4559,11 @@ did not run; any other row moved nothing and is deleted, its attempt left
 settled is logged and kept for the next start. A second run finds no
 row. After a stop at any point of the step the hub thus comes up with
 the target at its old head and the change `open`, or with the target at
-the new head and the land recorded once.
+the new head and the land recorded once. A land `Reconcile` records gets
+its follow-up and its report (`concluded`) then, the hooks registered at
+the composition being in place before the start hooks run; a land
+recorded before the stop has no row left, so its follow-up is not run
+again.
 
 ### Hub events
 

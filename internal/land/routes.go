@@ -265,10 +265,10 @@ func parseLand(r *http.Request) (landRequest, error) {
 // invalid_request), the confinement of a token bound to a fork, calling on
 // the fork's parent, to the changes of the fork (403 token_bound), who may
 // land (authorize, 403 forbidden), the workspace's status (409, such as
-// workspace_archived) and the session (400 unknown_session); then, in one
-// store transaction, the land's preconditions (admit, 409) and the
-// creation of the running attempt, which is handed to the pool, and the
-// request waits for it (answer).
+// workspace_archived), the session (400 unknown_session) and the request
+// guards (askRequestGuards); then, in one store transaction, the land's
+// preconditions (admit, 409) and the creation of the running attempt,
+// which is handed to the pool, and the request waits for it (answer).
 func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	slug := server.Param(r, "slug")
@@ -311,11 +311,27 @@ func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := c.askRequestGuards(ctx, RequestInput{Caller: caller, Workspace: slug, Changes: covered(chain),
+		Override: req.override}); err != nil {
+		return err
+	}
 	a, err := c.create(ctx, ws, in, session)
 	if err != nil {
 		return err
 	}
 	return c.answer(ctx, w, a, req.wait)
+}
+
+// askRequestGuards asks each request guard about the land request in, in
+// the order they were registered, and returns the first refusal as the
+// guard gives it; the guards after it are not asked.
+func (c *Component) askRequestGuards(ctx context.Context, in RequestInput) error {
+	for _, g := range c.registrations().requestGuards {
+		if err := g.Check(ctx, in); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // actorOf is the actor caller is, as an attempt's requested_by names it.

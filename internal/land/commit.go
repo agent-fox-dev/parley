@@ -54,12 +54,17 @@ const (
 // (docs/adr/08-register-the-push-collaborators-on-the-ref-writer.md).
 // moved reports whether the target moved; from then on the record and
 // the push event are written whatever becomes of ctx, and an error leaves
-// the attempt running.
+// the attempt running. Once the land is recorded its follow-up runs and
+// the final observers are told of it (concluded).
 func (c *Component) commit(ctx context.Context, repo *gitrepo.Repo, ws Workspace, a Attempt, b built) (moved bool, err error) {
 	a.Status, a.OntoSHA, a.LandedSHA, a.Noop, a.Commits = StatusLanded, new(b.onto), new(b.head), b.noop(), b.commits
 	a.FinishedAt = new(c.now())
 	if a.Noop {
-		return false, c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.settle(ctx, tx, a) })
+		if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.settle(ctx, tx, a) }); err != nil {
+			return false, err
+		}
+		c.concluded(ctx, ws, a)
+		return false, nil
 	}
 	ref := "refs/heads/" + a.TargetBranch
 	verdict, err := pushrule.AllowedVerdict(ctx, repo, []pushrule.Update{{Ref: ref, Before: b.onto, After: b.head}})
@@ -122,6 +127,9 @@ func (c *Component) commit(ctx context.Context, repo *gitrepo.Repo, ws Workspace
 		return true, err
 	}
 	c.deps.RefWriter.Finish(ctx, res)
+	if err == nil {
+		c.concluded(ctx, ws, a)
+	}
 	return true, err
 }
 
@@ -257,15 +265,25 @@ ORDER BY rowid`)
 // and is dropped, its attempt left running. An entry whose repository
 // cannot be read, or that cannot be settled, is kept and logged for the
 // next start. A second run finds nothing left to do.
+//
+// A land it records has the follow-up a land recorded by its run has, and
+// its final observers are told of it (concluded), since nothing did that
+// before the stop: its source branch is deleted, the changes into its
+// target are checked again and the after-landing hooks are called, with
+// the effects those have, such as the restack of the landed changes'
+// dependants. A stop after the record and before or during the follow-up
+// leaves no entry, so that follow-up is not done again.
 func (c *Component) Reconcile(ctx context.Context) error {
 	entries, err := journalEntries(ctx, c.deps.Store.Main())
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
+		var settled *Attempt
 		moved, err := c.moved(ctx, e)
 		if err == nil {
 			err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+				settled = nil
 				if !moved {
 					return unjournal(ctx, tx, e.id)
 				}
@@ -277,12 +295,23 @@ func (c *Component) Reconcile(ctx context.Context) error {
 					// Recorded already: nothing is written twice.
 					return unjournal(ctx, tx, e.id)
 				}
-				return c.settle(ctx, tx, e.landed(a))
+				a = e.landed(a)
+				settled = &a
+				return c.settle(ctx, tx, a)
 			})
 		}
 		if err != nil {
 			c.deps.Logger.Error("land journal: entry kept, it cannot be completed", "workspace", e.workspace,
 				"land_id", e.id, "error", err)
+			continue
+		}
+		if settled != nil {
+			ws, _, err := c.deps.Workspaces.Workspace(ctx, c.deps.Store.Main(), e.workspace)
+			if err != nil {
+				c.deps.Logger.Error("land journal: the target of a recorded land cannot be read", "workspace", e.workspace,
+					"land_id", e.id, "error", err)
+			}
+			c.concluded(ctx, ws, *settled)
 		}
 	}
 	return nil

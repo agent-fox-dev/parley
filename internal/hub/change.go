@@ -144,7 +144,8 @@ const (
 // (Restacker) records, in the abandon's transaction, the restack of each
 // dependant an abandon reparents. The entry point for a landed change
 // (OnLanded), which unlinks its dependants and restacks them onto the
-// landed commit, is not registered: no landing exists to call it. A change
+// landed commit, is registered by the landing as an after-landing hook
+// (composeLand). A change
 // too deep in its stack gets no restack; with the workspace setting
 // changes.auto_restack false, which changeWorkspaces reads, none is
 // recorded and a change behind is flagged auto_restack_off instead.

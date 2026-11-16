@@ -150,6 +150,9 @@ type Deps struct {
 	// After is the clock a land request waits on for its attempt's end;
 	// nil is time.After.
 	After func(time.Duration) <-chan time.Time
+	// Mergeability schedules the mergeability checks of the changes a land
+	// leaves on its target; nil is Changes.
+	Mergeability MergeabilityScheduler
 }
 
 // DefaultMaxAttempts is how many times an attempt tries to move the target
@@ -177,6 +180,7 @@ type Component struct {
 	gate     Gate
 	override OverrideRule
 	sessions SessionLinker
+	hooks    registered
 
 	pool  pool
 	seams seams
@@ -215,6 +219,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.After == nil {
 		d.After = time.After
+	}
+	if d.Mergeability == nil && d.Changes != nil {
+		d.Mergeability = d.Changes
 	}
 	c.deps = d
 	c.pool.jobs = map[string]*job{}

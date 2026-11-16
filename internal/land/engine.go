@@ -54,7 +54,7 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 		a.Status, a.Blocked = StatusBlocked, blocked
 		return c.end(ctx, a)
 	}
-	for {
+	for guarded := false; ; {
 		a.Attempts++
 		onto, found, err := repo.ResolveBranch(ctx, a.TargetBranch)
 		if err == nil && !found {
@@ -72,6 +72,18 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 		case report != nil:
 			a.Status, a.Conflict = StatusConflict, report
 			return c.end(ctx, a)
+		}
+		if !guarded {
+			// The target guards judge the move once: a retry on a moved
+			// target makes the same land.
+			guarded = true
+			stop, err := c.judgeTarget(ctx, a, b)
+			if err != nil {
+				return c.fail(ctx, a, err)
+			}
+			if stop != nil {
+				return c.end(ctx, *stop)
+			}
 		}
 		if c.seams.beforeSwap != nil {
 			c.seams.beforeSwap(ctx, a.ID, a.Attempts)
@@ -136,6 +148,45 @@ func (c *Component) judge(ctx context.Context, a Attempt) (revision int64, block
 	return revision, nil, overridden, nil
 }
 
+// judgeTarget asks each target guard about the move of the target the
+// attempt a would make with what b built, and returns a ended as the first
+// guard that does not allow it says: blocked, the guard's reason the
+// reason of its parley.change.land_fail event, for a refusal, and failed
+// origin_rejected for a rejection by origin. A guard that cannot decide,
+// or panics, is the error; nil and nil let the land go on.
+func (c *Component) judgeTarget(ctx context.Context, a Attempt, b built) (*Attempt, error) {
+	in := TargetInput{Workspace: a.Workspace, Branch: a.TargetBranch, Old: b.onto, New: b.head}
+	for _, g := range c.registrations().targetGuards {
+		answer, err := askTarget(ctx, g, in)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("a target guard on %s of %s: %w", a.TargetBranch, a.Workspace, err)
+		case answer.Refuse != "":
+			reason := answer.Refuse
+			a.Status = StatusBlocked
+			a.Blocked = &Blocked{Change: a.Covered[len(a.Covered)-1].Number, Status: change.LandingBlocked, reason: &reason}
+			return &a, nil
+		case answer.OriginRejected != "":
+			c.deps.Logger.Warn("land attempt: origin rejected the land", "workspace", a.Workspace, "land_id", a.ID,
+				"message", answer.OriginRejected)
+			a.Status, a.Error = StatusFailed, new(ErrorOriginRejected)
+			return &a, nil
+		}
+	}
+	return nil, nil
+}
+
+// askTarget asks the target guard g about in, a panic of the guard as its
+// error.
+func askTarget(ctx context.Context, g TargetGuard, in TargetInput) (answer TargetAnswer, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = errGuardPanicked(p)
+		}
+	}()
+	return g.Check(ctx, in)
+}
+
 // callerOf is who asked for the attempt a, as a change names its caller.
 func callerOf(a Attempt) change.Caller {
 	caller := change.Caller{Credential: change.Credential{Type: a.RequestedBy.ActorType, ID: a.CredentialID}}
@@ -155,11 +206,12 @@ func (c *Component) fail(ctx context.Context, a Attempt, err error) error {
 	return errors.Join(err, c.end(ctx, a))
 }
 
-// end writes the final status a holds, in a store transaction of its own.
-// An attempt whose context ended by its deadline ends failed timeout
-// whatever a holds, once: the pool may have ended it so already. One whose
-// context ended by the stop of the hub is not ended: it stays running for
-// the next start to run it again.
+// end writes the final status a holds, in a store transaction of its own,
+// and then tells the final observers of it. An attempt whose context ended
+// by its deadline ends failed timeout whatever a holds, once: the pool may
+// have ended it so already, and told of it then. One whose context ended
+// by the stop of the hub is not ended: it stays running for the next start
+// to run it again.
 func (c *Component) end(ctx context.Context, a Attempt) error {
 	timedOut := false
 	if ctx.Err() != nil {
@@ -172,7 +224,13 @@ func (c *Component) end(ctx context.Context, a Attempt) error {
 		a.OntoSHA, a.LandedSHA, a.Noop, a.Commits, a.Conflict, a.Blocked = nil, nil, false, nil, nil, nil
 	}
 	ctx = context.WithoutCancel(ctx)
+	if a.FinishedAt == nil {
+		a.FinishedAt = new(c.now())
+	}
 	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.finish(ctx, tx, a) })
+	if err == nil {
+		c.concluded(ctx, Workspace{}, a)
+	}
 	if timedOut && errors.Is(err, errFinal) {
 		return nil
 	}
