@@ -22,6 +22,10 @@ var ErrChangeClosed = errors.New("the change is closed")
 // Reevaluate evaluates again, in a store transaction of its own, the
 // landing of the change number of the workspace, as ReevaluateIn does, and
 // returns it with the revision of the policy it was evaluated against.
+// The revision is read inside that transaction, never before it: write
+// transactions run one at a time, so one that races a replacement of the
+// policy either runs first, and the replacement's pass evaluates the change
+// again, or runs after it, against the new revision.
 func (c *Component) Reevaluate(ctx context.Context, workspace string, number int64) (Result, int64, error) {
 	var (
 		res Result
@@ -77,6 +81,28 @@ func (c *Component) ReevaluateIn(ctx context.Context, tx *sql.Tx, workspace stri
 		return Result{}, 0, err
 	}
 	return res, rev, nil
+}
+
+// reevaluateWorkspace evaluates again, in tx, the transaction that has just
+// stored a new revision of the workspace's policy, the landing of each of
+// its draft and open changes, in ascending number order, against that
+// revision, and announces each one the new landing makes landable. Landed
+// and abandoned changes keep the landing they closed with. The new revision
+// and every landing commit together or not at all, so the first failure
+// fails the replacement as a whole. It is the hub's failure whatever it
+// says, a refusal of the change component included, so it is answered 500,
+// never as the caller's error.
+func (c *Component) reevaluateWorkspace(ctx context.Context, tx *sql.Tx, workspace string) error {
+	numbers, err := c.deps.Changes.DraftAndOpen(ctx, tx, workspace)
+	if err != nil {
+		return fmt.Errorf("list the changes of %s to re-evaluate: %v", workspace, err)
+	}
+	for _, n := range numbers {
+		if _, _, err := c.ReevaluateIn(ctx, tx, workspace, n); err != nil {
+			return fmt.Errorf("re-evaluate %s against the new policy: %v", change.Ref(workspace, n), err)
+		}
+	}
+	return nil
 }
 
 // EvaluateLanding is the landing the change component stores for the

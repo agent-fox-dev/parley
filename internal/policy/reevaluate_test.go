@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,8 +30,297 @@ const (
 // billing/a.go, and returns its number.
 func (w *world) openBilling(t *testing.T, branch string) int64 {
 	t.Helper()
-	commit(t, w.api, branch, w.base, map[string]string{"billing/a.go": branch + "\n"})
-	return w.open(t, "api", branch).Number
+	return w.openTouching(t, branch, "billing/a.go")
+}
+
+// openTouching opens a change of api from a new branch of base that adds
+// the file path, with adjust run on the input, and returns its number. A
+// change whose source is a task fork of api has the branch made in the
+// fork's repository.
+func (w *world) openTouching(t *testing.T, branch, path string, adjust ...func(*change.OpenInput)) int64 {
+	t.Helper()
+	in := change.OpenInput{SourceWorkspace: "api"}
+	for _, fn := range adjust {
+		fn(&in)
+	}
+	commit(t, w.workspaces.RepoPath(in.SourceWorkspace), branch, w.base, map[string]string{path: branch + "\n"})
+	return w.open(t, "api", branch, adjust...).Number
+}
+
+// landing is the landing GET answers for the change number of api.
+func (w *world) landing(t *testing.T, number int64) map[string]any {
+	t.Helper()
+	r := w.get(t, "/api/v1/workspaces/api/changes/"+strconv.FormatInt(number, 10), w.danaKey)
+	l, ok := r.json["landing"].(map[string]any)
+	if r.status != http.StatusOK || !ok {
+		t.Fatalf("GET %s = %d %s, want the change with its landing", change.Ref("api", number), r.status, r.body)
+	}
+	return l
+}
+
+// only is the one requirement of the landing l, nil when it has none or
+// more than one.
+func only(l map[string]any) map[string]any {
+	reqs, _ := l["requirements"].([]any)
+	if len(reqs) != 1 {
+		return nil
+	}
+	req, _ := reqs[0].(map[string]any)
+	return req
+}
+
+// putPolicy replaces api's policy with doc through the route, as dana,
+// and fails the test unless it answers 200.
+func (w *world) putPolicy(t *testing.T, doc string) {
+	t.Helper()
+	if r := w.put(t, "/api/v1/workspaces/api/policy", w.danaKey, doc, ""); r.status != http.StatusOK {
+		t.Fatalf("PUT the policy = %d %s, want 200", r.status, r.body)
+	}
+}
+
+func TestPutPolicy_ReevaluatesEveryDraftAndOpenChangeAndLeavesClosedOnes(t *testing.T) {
+	w := newWorld(t)
+	fromFork := func(in *change.OpenInput) { in.SourceWorkspace = "api--f1" }
+	asDraft := func(in *change.OpenInput) { in.Draft = true }
+	pendingChecks := []any{map[string]any{"name": "test", "status": "pending"}, map[string]any{"name": "billing-e2e", "status": "pending"}}
+	billing := map[string]any{"block": false, "checks": pendingChecks,
+		"approvals": map[string]any{"required": 1.0, "counted": 0.0, "approvers": []any{"owner", "user:dana"}}}
+	rows := []struct {
+		name, branch, path string
+		adjust             []func(*change.OpenInput)
+		// closes, when set, lands or abandons the change before the
+		// update, which must leave its landing as it is.
+		closes func(ctx context.Context, tx *sql.Tx, n int64) error
+		// before is the status and reason of the landing under the
+		// never-set policy, whose one requirement is the default.
+		before [2]any
+		// status, reason and rule are those of the landing after the
+		// update, whose one requirement has the members of members.
+		status  string
+		reason  any
+		rule    string
+		members map[string]any
+		n       int64
+	}{
+		{name: "an open change on docs", branch: "docs", path: "docs/a.md", before: [2]any{change.LandingReady, nil},
+			status: change.LandingReady, rule: "docs", members: map[string]any{"block": false, "checks": []any{}}},
+		{name: "an open change on billing", branch: "billing", path: "billing/a.go", before: [2]any{change.LandingReady, nil},
+			status: change.LandingPending, rule: "billing", members: billing},
+		{name: "an open change on secrets", branch: "secrets", path: "deploy/secrets/k", before: [2]any{change.LandingReady, nil},
+			status: change.LandingBlocked, rule: "secrets", members: map[string]any{"block": true}},
+		{name: "a draft on billing", branch: "draft", path: "billing/b.go", adjust: []func(*change.OpenInput){asDraft},
+			before: [2]any{change.LandingBlocked, "draft"}, status: change.LandingBlocked, reason: "draft", rule: "billing", members: billing},
+		{name: "an open change on billing from a task fork", branch: "forked", path: "billing/c.go", adjust: []func(*change.OpenInput){fromFork},
+			before: [2]any{change.LandingReady, nil}, status: change.LandingPending, rule: "billing", members: billing},
+		{name: "an abandoned change on billing", branch: "gone", path: "billing/a.go", closes: func(ctx context.Context, tx *sql.Tx, n int64) error {
+			return w.changes.Abandon(ctx, tx, "api", n, "undone", w.danaCaller())
+		}},
+		{name: "a landed change on billing", branch: "done", path: "billing/a.go", closes: func(ctx context.Context, tx *sql.Tx, n int64) error {
+			return w.changes.SetLanded(ctx, tx, "api", n, change.Landed{SHA: w.base, At: time.Now(),
+				By: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.dana), Username: new("dana")}, LandID: "l1"})
+		}},
+	}
+	closed := map[int64]map[string]any{}
+	for i := range rows {
+		r := &rows[i]
+		r.n = w.openTouching(t, r.branch, r.path, r.adjust...)
+		w.checked(t, "api", r.n)
+		if r.closes != nil {
+			w.inTx(t, func(ctx context.Context, tx *sql.Tx) error { return r.closes(ctx, tx, r.n) })
+			closed[r.n] = w.landing(t, r.n)
+			continue
+		}
+		if l := w.landing(t, r.n); l["status"] != r.before[0] || l["reason"] != r.before[1] || only(l)["rule"] != "default" {
+			t.Fatalf("%s: under the never-set policy the landing is %v, want %v on the default requirement", r.name, l, r.before)
+		}
+	}
+	w.putPolicy(t, threeRules)
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			l := w.landing(t, r.n)
+			if r.closes != nil {
+				if !reflect.DeepEqual(l, closed[r.n]) {
+					t.Errorf("the landing is %v, was %v before the update", l, closed[r.n])
+				}
+				return
+			}
+			req := only(l)
+			if l["status"] != r.status || l["reason"] != r.reason || req["rule"] != r.rule {
+				t.Fatalf("the landing is %v, want %s (reason %v) on the one requirement %s", l, r.status, r.reason, r.rule)
+			}
+			for name, want := range r.members {
+				if !reflect.DeepEqual(req[name], want) {
+					t.Errorf("%s of the requirement = %v, want %v", name, req[name], want)
+				}
+			}
+		})
+	}
+}
+
+func TestPutPolicy_AnnouncesEveryChangeItMakesLandableOnce(t *testing.T) {
+	w := newWorld(t)
+	docs, billing, secrets := w.openTouching(t, "docs", "docs/a.md"), w.openBilling(t, "billing"), w.openTouching(t, "secrets", "deploy/secrets/k")
+	for _, n := range []int64{docs, billing, secrets} {
+		if ch := w.checked(t, "api", n); ch.Mergeable != change.MergeableClean {
+			t.Fatalf("%s is %s, want clean", ch.Ref, ch.Mergeable)
+		}
+	}
+	w.putPolicy(t, threeRules)
+	for _, c := range []struct {
+		name, doc string
+		// ready are the changes the update announces.
+		ready []int64
+	}{
+		{"pending and blocked to ready, ready kept", `{}`, []int64{billing, secrets}},
+		{"ready to pending and blocked, ready kept", threeRules, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			seq := w.seq(t)
+			w.putPolicy(t, c.doc)
+			var got []int64
+			for _, e := range w.eventsAfter(t, seq, change.EventReady) {
+				n, _ := strconv.ParseInt(e.ResourceID, 10, 64)
+				got = append(got, n)
+			}
+			if !reflect.DeepEqual(got, c.ready) {
+				t.Errorf("parley.change.ready was written for %v, want %v", got, c.ready)
+			}
+		})
+	}
+	if l := w.landing(t, billing); l["status"] != change.LandingPending {
+		t.Errorf("the billing change is %v, want pending again", l["status"])
+	}
+}
+
+// kept is an evidence source that holds, for one version of one change of
+// api, one counted approval and a passed result of the check test, and
+// records every query asked of it.
+type kept struct {
+	number, version int64
+	mu              sync.Mutex
+	asked           []policy.EvidenceQuery
+}
+
+func (k *kept) Evidence(_ context.Context, _ policy.Querier, in policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.asked = append(k.asked, in)
+	if in.Workspace != "api" || in.Number != k.number || in.Version != k.version {
+		return policy.EvidenceAnswer{}, nil
+	}
+	return policy.EvidenceAnswer{Counted: 1, Checks: map[string]string{"test": "passed"}}, nil
+}
+
+func TestPutPolicy_CountsTheEvidenceOfAChangeUnderTheNewRules(t *testing.T) {
+	w := newWorld(t)
+	n := w.openBilling(t, "billing")
+	ch := w.checked(t, "api", n)
+	ev := &kept{number: n, version: ch.Version}
+	w.policy.RegisterEvidence(ev)
+	if l := w.landing(t, n); l["status"] != change.LandingReady {
+		t.Fatalf("under the never-set policy the change is %v, want ready", l["status"])
+	}
+	w.putPolicy(t, `{"rules": [{"name": "billing", "paths": ["billing/**"], "require": {"approvals": 1, "checks": ["test"]}}]}`)
+	l := w.landing(t, n)
+	req := only(l)
+	approvals, _ := req["approvals"].(map[string]any)
+	if l["status"] != change.LandingReady || req["rule"] != "billing" || approvals["counted"] != 1.0 ||
+		!reflect.DeepEqual(req["checks"], []any{map[string]any{"name": "test", "status": "passed"}}) {
+		t.Errorf("the landing is %v, want ready on billing with one counted approval and test passed", l)
+	}
+	// The evidence source is only ever read: its one method is a query.
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	if len(ev.asked) == 0 {
+		t.Error("the update did not read the evidence of the change")
+	}
+	for _, q := range ev.asked {
+		if q.Workspace != "api" || q.Number != n || q.Version != ch.Version {
+			t.Errorf("the evidence was asked for %s at version %d, want %s at %d", change.Ref(q.Workspace, q.Number), q.Version, ch.Ref, ch.Version)
+		}
+	}
+}
+
+// failingFor is an evidence source that fails for the change number of
+// api and has nothing for any other.
+type failingFor struct{ number int64 }
+
+func (f failingFor) Evidence(_ context.Context, _ policy.Querier, in policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
+	if in.Workspace == "api" && in.Number == f.number {
+		return policy.EvidenceAnswer{}, errors.New("the evidence cannot be read")
+	}
+	return policy.EvidenceAnswer{}, nil
+}
+
+func TestPutPolicy_FailsAsAWholeWhenAChangeCannotBeReevaluated(t *testing.T) {
+	w := newWorld(t)
+	docs, secrets, billing := w.openTouching(t, "docs", "docs/a.md"), w.openTouching(t, "secrets", "deploy/secrets/k"), w.openBilling(t, "billing")
+	for _, n := range []int64{docs, secrets, billing} {
+		w.checked(t, "api", n)
+	}
+	// The docs change, clean and pending, would be made landable by the
+	// update, and announced, before the third change fails it.
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		if err := w.changes.SetLanding(ctx, tx, "api", docs, change.Landing{Status: change.LandingPending}); err != nil {
+			return err
+		}
+		return w.changes.AnnounceLandable(ctx, tx, "api", docs)
+	})
+	before := map[int64]map[string]any{}
+	for _, n := range []int64{docs, secrets, billing} {
+		before[n] = w.landing(t, n)
+	}
+	w.policy.RegisterEvidence(failingFor{billing})
+	seq := w.seq(t)
+	r := w.put(t, "/api/v1/workspaces/api/policy", w.danaKey, threeRules, "")
+	if r.status != http.StatusInternalServerError || r.errorType() != "internal" {
+		t.Fatalf("PUT the policy = %d %s, want 500 internal", r.status, r.body)
+	}
+	if p := w.get(t, "/api/v1/workspaces/api/policy", w.danaKey); p.json["revision"] != 0.0 {
+		t.Errorf("the policy is at revision %v, want 0", p.json["revision"])
+	}
+	for n, l := range before {
+		if got := w.landing(t, n); !reflect.DeepEqual(got, l) {
+			t.Errorf("the landing of %s is %v, was %v", change.Ref("api", n), got, l)
+		}
+	}
+	for _, typ := range []string{"parley.policy.update", change.EventReady} {
+		if events := w.eventsAfter(t, seq, typ); len(events) != 0 {
+			t.Errorf("%d %s events were written", len(events), typ)
+		}
+	}
+}
+
+func TestReevaluate_RacingAPolicyUpdateLeavesTheLandingOfTheNewerRevision(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	n := w.openBilling(t, "billing")
+	w.checked(t, "api", n)
+	for round := range 50 {
+		w.putPolicy(t, `{}`)
+		start := make(chan struct{})
+		var (
+			wg     sync.WaitGroup
+			status int
+			err    error
+		)
+		wg.Go(func() {
+			<-start
+			status = w.put(t, "/api/v1/workspaces/api/policy", w.danaKey, threeRules, "").status
+		})
+		wg.Go(func() {
+			<-start
+			_, _, err = w.policy.Reevaluate(ctx, "api", n)
+		})
+		close(start)
+		wg.Wait()
+		if status != http.StatusOK || err != nil {
+			t.Fatalf("round %d: PUT = %d and Reevaluate = %v, want 200 and no error", round, status, err)
+		}
+		if l := w.landing(t, n); l["status"] != change.LandingPending || only(l)["rule"] != "billing" {
+			t.Fatalf("round %d: the landing is %v, want pending on billing, the newer revision's", round, l)
+		}
+	}
 }
 
 func TestReevaluate_StoresTheLandingOfTheCurrentVersionAndReturnsItWithTheRevision(t *testing.T) {

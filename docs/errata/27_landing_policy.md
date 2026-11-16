@@ -121,3 +121,9 @@ lives in `internal/hub/policy.go`, so that `internal/policy` does not import
 - **The policy routes have their own body limit.** `PUT …/policy`
   declares `MaxBodySize` 1 MiB, so that a document of 65 537 bytes reaches
   the validator, which names it, whatever `[server].max_body_size` is.
+- **The changes a replacement re-evaluates are listed by the change
+  component.** No lookup listed every draft and open change of a workspace
+  (`ChangesInto` lists those into one branch), so the change component
+  gained `DraftAndOpen(ctx, q, workspace)`: the numbers, ascending, read
+  through the replacement's transaction. A repository's list includes the
+  changes from its task forks, which belong to it.

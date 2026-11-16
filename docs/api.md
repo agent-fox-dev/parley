@@ -4964,10 +4964,19 @@ revision plus 1, with the caller as `updated_by`, drops every revision
 numbered 50 or more below it (the 50 highest are kept), and records one
 `parley.policy.update` event with `resource_type` `policy`, `resource_id`
 the slug, the caller as actor and `metadata` `{"revision": <new
-revision>, "rules": <number of rules>}`, all in one transaction: a failure
-of any part stores nothing and is `500` `internal`. The answer is `200`
-with the policy object of the new revision and its `ETag`, as `GET`
-answers it. Replacements of one workspace run one at a time: two sent at
+revision>, "rules": <number of rules>}`. Then it evaluates again, in
+ascending number order, the [landing](#the-landing-of-a-change) of every
+draft and open change whose target workspace is `{slug}`, those from its
+task forks included, against the new revision, with the approvals and
+check results the changes have (none of them is changed), stores each and
+runs the announcement of [Mergeability](#mergeability) for it, so that a
+change that is open and `clean` and becomes `ready` gets one
+`parley.change.ready`. Landed and abandoned changes keep their landing.
+All of this is one transaction: a failure of any part, the evaluation of
+any one change included, stores nothing (no revision, no event, no
+landing) and is `500` `internal`. The answer is `200` with the policy
+object of the new revision and its `ETag`, as `GET` answers it, once every
+change carries its new landing. Replacements of one workspace run one at a time: two sent at
 once without `If-Match` get consecutive revisions, and of two with the
 same `If-Match` one is stored and the other is `412` `revision_mismatch`.
 
@@ -5015,9 +5024,15 @@ The landing is evaluated again and stored on each of these:
 - a restore;
 - a mergeability check of a change whose target branch is missing or found
   again;
+- a replacement of the policy of its target workspace (`PUT` above);
 - the policy gate of a land.
 
-When the policy re-evaluates a change itself, as the gate does, it stores
+A re-evaluation that runs at the same time as a replacement of the policy
+reads the revision in its own transaction, and transactions that write run
+one at a time: the landing left is the one of the newer revision.
+
+When the policy re-evaluates a change itself, as the gate and a
+replacement do, it stores
 the landing and then runs the announcement of [Mergeability](#mergeability)
 in the same transaction. `parley.change.ready` is therefore written once
 when the change becomes landable, and a failure of either step stores

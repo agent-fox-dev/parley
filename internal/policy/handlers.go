@@ -130,20 +130,12 @@ func (c *Component) putPolicy(w http.ResponseWriter, r *http.Request) error {
 		}); err != nil {
 			return err
 		}
-		return c.afterReplace(ctx, tx, slug)
+		return c.reevaluateWorkspace(ctx, tx, slug)
 	})
 	if err != nil {
 		return err
 	}
 	writeRevision(w, rev)
-	return nil
-}
-
-// afterReplace runs in the transaction of a replacement of the workspace
-// slug's policy, after the new revision is stored and before it commits;
-// an error from it rolls the replacement back. The landings of the
-// workspace's changes are not evaluated against the new revision yet.
-func (c *Component) afterReplace(context.Context, *sql.Tx, string) error {
 	return nil
 }
 
