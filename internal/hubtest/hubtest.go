@@ -56,6 +56,11 @@ type Served struct {
 
 	code   chan int
 	cancel context.CancelFunc
+	// client sends Call's requests. It is this run's own, so that a call
+	// after a restart never goes over a connection the stopped run kept
+	// open, which a request the client may not retry, such as a DELETE,
+	// would fail on.
+	client *http.Client
 }
 
 // Serve runs hub.Run with opts, its stderr captured in Log, and waits up to
@@ -63,7 +68,8 @@ type Served struct {
 func Serve(t testing.TB, opts hub.Options) *Served {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Served{Log: &LogBuffer{}, code: make(chan int, 1), cancel: cancel}
+	s := &Served{Log: &LogBuffer{}, code: make(chan int, 1), cancel: cancel,
+		client: &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}}
 	opts.Stderr = s.Log
 	go func() { s.code <- hub.Run(ctx, opts) }()
 	t.Cleanup(func() {
@@ -72,6 +78,7 @@ func Serve(t testing.TB, opts hub.Options) *Served {
 		case <-s.code:
 		case <-time.After(5 * time.Second):
 		}
+		s.client.CloseIdleConnections()
 	})
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -250,6 +257,7 @@ func (h *Hub) restart(t testing.TB, env config.Env) {
 	if code := h.ExitCode(t, 10*time.Second); code != 0 {
 		t.Fatalf("the hub stopped with %d, want 0; stderr = %q", code, h.Log.String())
 	}
+	h.client.CloseIdleConnections()
 	h.opts.Env = env
 	opts := h.opts
 	opts.Port = &port
@@ -410,7 +418,7 @@ func (s *Served) Exchange(t testing.TB, method, path, credential string, body an
 			req.Header.Add(k, v)
 		}
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := s.client.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
