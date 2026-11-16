@@ -5652,6 +5652,24 @@ the hub may hold a land, and `withNumbers` and `checkFlags` refuse a
 `--expected-version` that is not a positive integer and a blank
 `--override`. The reads are `scmRead`s.
 
+The group `parley policy` (`get`, `set`, `evaluate`), which
+`newPolicyCommand` builds and `root.go` adds to the root, lives in
+`policy.go`. `checkFlags` wraps each command's argument check:
+`nonNegativeFlags` refuses a `--revision`, `--if-revision` or `--change`
+that is not a non-negative integer (`withNumbers` takes positive ones
+only, and a revision or a change number may be 0), `evaluate` takes
+exactly one of `--paths` and `--change`, and `readPolicy` reads the file
+of `set --file` and `evaluate --policy-file` there too, so that a file
+that cannot be read or is neither JSON nor TOML is a usage error before
+any setting is resolved. `readPolicy` reads `-` from standard input, a
+name ending in `.toml` as TOML, anything else as JSON and, when it is not
+valid JSON, as TOML, whose decoded document is sent as JSON (integers stay
+numbers, booleans booleans); a JSON document is sent as it is, for the hub
+to judge. `get` sends `--revision` as the query `revision`; `set` sends
+the document with `PUT` and `--if-revision <n>` as `If-Match: "<n>"`
+through the request's own `header`; `evaluate` sends a member only for a
+flag given, the `--paths` values split at commas in command-line order.
+
 Help lives in `internal/cli/help.go`. `installHelp` keeps cobra's own text
 help, sets the root's help function, which `--help` on any command and a
 group run without a word reach, and replaces cobra's help command with
@@ -5692,11 +5710,14 @@ hub URL it resolves.
 `parley version` included. `newClient(hubURL, credential, timeout)` drops
 the URL's trailing slashes. An `apiRequest` holds the method, the path
 (relative to `/api/v1`, or with `outsideAPI` to the hub URL itself, as
-`GET /version` is), the query, the body and an optional timeout of its own.
-`raw(ctx, r)` sends it to `<hub URL>/api/v1<path>` with
+`GET /version` is), the query, the body, an optional timeout of its own and
+optional headers of its own (`header`, such as the `If-Match` of `parley
+policy set`). `raw(ctx, r)` sends it to `<hub URL>/api/v1<path>` with
+those headers, then
 `Authorization: Bearer <credential>` (none when the credential is empty),
 `Accept: application/json`, and the body encoded as JSON with
-`Content-Type: application/json` only when there is one, and returns the
+`Content-Type: application/json` only when there is one, which take
+precedence over a request header of the same name, and returns the
 status and the whole body whatever they hold, for a command whose output is
 not one JSON document. The timeout is a context around connecting, sending
 and reading the whole body; when it runs out the answer is a `client_error`

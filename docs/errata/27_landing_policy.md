@@ -136,3 +136,8 @@ lives in `internal/hub/policy.go`, so that `internal/policy` does not import
   gained `DraftAndOpen(ctx, q, workspace)`: the numbers, ascending, read
   through the replacement's transaction. A repository's list includes the
   changes from its task forks, which belong to it.
+- **The end-to-end scenarios use demo.** The package's scenarios name the
+  workspace `api` and the fork `api--t1`. The end-to-end harness
+  (`startForkHubWith`) creates `demo` from an origin and forks it through
+  `POST /workspaces/demo/forks` with a bound token, so
+  `test/e2e/policy_test.go` runs them on `demo` and `demo--t1`.
