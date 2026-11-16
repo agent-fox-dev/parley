@@ -31,13 +31,23 @@ const (
 
 // approvalRoutes are the routes of the verdicts. Recording one needs the
 // scope changes:approve, which no other scope implies, and read access: a
-// reviewer need not be able to write the workspace. Its pattern is not in
-// the contributor table of internal/access, so that a token bound to a
-// task fork cannot certify, on the fork's parent, the work it pushed.
+// reviewer need not be able to write the workspace. Withdrawing one needs
+// the same, and the handler then decides whose verdict the caller may
+// withdraw. Neither write pattern is in the contributor table of
+// internal/access, so that a token bound to a task fork cannot certify, on
+// the fork's parent, the work it pushed, nor take back the verdicts given
+// on it.
 func (c *Component) approvalRoutes() []server.Route {
+	read := map[string]string{access.MarkNeed: string(access.NeedRead)}
 	return []server.Route{{
 		Method: http.MethodPost, Pattern: "/workspaces/:slug/changes/:number/approvals", Scope: "changes:approve",
-		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.postApproval, Create: true,
+		Marks: read, Handler: c.postApproval, Create: true,
+	}, {
+		Method: http.MethodGet, Pattern: "/workspaces/:slug/changes/:number/approvals", Scope: "changes:read",
+		Marks: read, Handler: c.getApprovals,
+	}, {
+		Method: http.MethodDelete, Pattern: "/workspaces/:slug/changes/:number/approvals/:id", Scope: "changes:approve",
+		Marks: read, Handler: c.deleteApproval,
 	}}
 }
 
@@ -62,10 +72,11 @@ func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 	if p.User == nil {
 		return server.Forbidden("a verdict is given by a user; the admin token cannot give one")
 	}
-	number, err := c.existingChange(ctx, r)
+	found, err := c.existingChange(ctx, r)
 	if err != nil {
 		return err
 	}
+	number := found.Number
 	var body map[string]json.RawMessage
 	if err := server.DecodeJSON(r, &body); err != nil {
 		return err
@@ -134,20 +145,105 @@ func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// existingChange is the number of the change the request's :number names
-// in the workspace :slug, read from the store, refused alike with the
-// constant change_not_found for a :number that is not a positive integer
-// and for a number the workspace does not have.
-func (c *Component) existingChange(ctx context.Context, r *http.Request) (int64, error) {
+// getApprovals answers the verdicts of the change, of every version or of
+// the version the query names, newest first, in pages of the list
+// envelope. After the page come, in this order, a change the workspace
+// does not have, a version that is not a positive integer and a version
+// the change does not have. Every status of the workspace answers the
+// read.
+func (c *Component) getApprovals(w http.ResponseWriter, r *http.Request) error {
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	ctx := r.Context()
+	ch, err := c.existingChange(ctx, r)
+	if err != nil {
+		return err
+	}
+	var f verdictFilter
+	if q := r.URL.Query(); q.Has("version") {
+		v, ok := positive(q.Get("version"))
+		if !ok {
+			return server.InvalidRequest("version must be a positive integer")
+		}
+		if v > ch.Version {
+			return server.NotFound(fmt.Sprintf("%s has no version %d", ch.Ref, v))
+		}
+		f.Version = v
+	}
+	var after verdictPosition
+	more, err := page.After(&after)
+	if err != nil {
+		return err
+	}
+	if more {
+		f.After = &after
+	}
+	f.Limit = page.Limit + 1
+	items, err := c.listApprovals(ctx, c.deps.Store.Main(), ch, f)
+	if err != nil {
+		return err
+	}
+	return server.WritePage(w, page, items, positionOf)
+}
+
+// deleteApproval withdraws the verdict :id of the change and answers 204.
+// The refusals come in this order: a change the workspace does not have,
+// an archived workspace, a closed change, an id that names no verdict of
+// the change, and a caller who is neither the verdict's user, with any
+// credential, nor the workspace's owner nor the admin token. The removal
+// and the landing it re-evaluates are written in one store transaction;
+// a withdrawal writes no event of its own.
+func (c *Component) deleteApproval(w http.ResponseWriter, r *http.Request) error {
+	ctx, slug, id := r.Context(), server.Param(r, "slug"), server.Param(r, "id")
+	p, _ := identity.PrincipalOf(ctx)
+	d, _ := access.DecisionOf(r)
+	found, err := c.existingChange(ctx, r)
+	if err != nil {
+		return err
+	}
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		ch, err := c.writableChange(ctx, tx, slug, found.Number)
+		if err != nil {
+			return err
+		}
+		v, ok, err := readVerdict(ctx, tx, slug, ch.Number, id)
+		switch {
+		case err != nil:
+			return err
+		case !ok:
+			return server.NotFound(fmt.Sprintf("%s has no verdict %q", ch.Ref, id))
+		case d.Level != access.LevelAdmin && d.Level != access.LevelOwner && (p.User == nil || p.User.ID != v.UserID):
+			return server.Forbidden("only the verdict's user, the workspace's owner or the admin token may withdraw it")
+		}
+		if err := deleteVerdict(ctx, tx, v.ID); err != nil {
+			return err
+		}
+		_, _, err = c.ReevaluateIn(ctx, tx, slug, ch.Number)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// existingChange is the change the request's :number names in the
+// workspace :slug, read from the store, refused alike with the constant
+// change_not_found for a :number that is not a positive integer and for a
+// number the workspace does not have.
+func (c *Component) existingChange(ctx context.Context, r *http.Request) (change.Change, error) {
 	number, ok := positive(server.Param(r, "number"))
 	if !ok {
-		return 0, change.ErrChangeNotFound
+		return change.Change{}, change.ErrChangeNotFound
 	}
-	_, err := c.deps.Changes.ReadChange(ctx, c.deps.Store.Main(), server.Param(r, "slug"), number)
+	ch, err := c.deps.Changes.ReadChange(ctx, c.deps.Store.Main(), server.Param(r, "slug"), number)
 	if errors.Is(err, change.ErrChangeNotFound) {
-		return 0, change.ErrChangeNotFound
+		return change.Change{}, change.ErrChangeNotFound
 	}
-	return number, err
+	return ch, err
 }
 
 // writableChange reads, in tx, the change number of the workspace slug,

@@ -480,3 +480,52 @@ WHERE workspace_slug = 'api' AND number = ? AND version = ? AND user_id = ? ORDE
 	}
 	return ids
 }
+
+// withdraw sends DELETE of the verdict id of the change number of api with
+// credential. A withdrawal answers 204 with no body, so the body is decoded
+// only when there is one.
+func (w *world) withdraw(t *testing.T, number int64, id, credential string) answer {
+	t.Helper()
+	status, h, raw := w.Exchange(t, http.MethodDelete, approvalsPath(number)+"/"+id, credential, nil, nil)
+	a := answer{status: status, header: h, body: raw}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &a.json); err != nil {
+			t.Errorf("DELETE %s = %d %s: not a JSON object: %v", id, status, raw, err)
+		}
+	}
+	return a
+}
+
+// listedIDs are the ids of the verdicts of the change number of api that
+// the list answers credential, newest first.
+func (w *world) listedIDs(t *testing.T, number int64, credential string) []string {
+	t.Helper()
+	r := w.get(t, approvalsPath(number), credential)
+	if r.status != http.StatusOK {
+		t.Fatalf("list the verdicts of %d = %d %s, want 200", number, r.status, r.body)
+	}
+	var ids []string
+	for _, item := range r.json["items"].([]any) {
+		ids = append(ids, item.(map[string]any)["id"].(string))
+	}
+	return ids
+}
+
+// stepClock is a hub clock that stands still until the test moves it on.
+type stepClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *stepClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+// tick moves the clock on by one second.
+func (c *stepClock) tick() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(time.Second)
+}

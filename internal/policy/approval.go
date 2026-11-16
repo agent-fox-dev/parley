@@ -3,7 +3,11 @@ package policy
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -90,6 +94,144 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.Workspace, v.Number, v.Version, v.UserID, v.Username, v.Credential.Type, v.Credential.ID,
 		v.Verdict, v.Comment, v.CarriedFrom, v.CreatedAt.UnixNano())
 	return deleted > 0, err
+}
+
+// verdictColumns are the columns scanVerdict reads, in its order.
+const verdictColumns = `id, workspace_slug, number, version, user_id, username, credential_type, credential_id,
+verdict, comment, carried_from, created_at`
+
+// verdictSeconds is created_at, stored in nanoseconds, at the resolution
+// the approval object shows it, so that the list's order is the order of
+// the values the caller sees, and ties among them go by id.
+const verdictSeconds = `(created_at / 1000000000)`
+
+// verdictPosition is a verdict's place in the list's order.
+type verdictPosition struct {
+	Seconds int64  `json:"t"`
+	ID      string `json:"id"`
+}
+
+// positionOf is a's place in the list's order.
+func positionOf(a approval) any {
+	return verdictPosition{time.Time(a.CreatedAt).Unix(), a.ID}
+}
+
+// verdictFilter narrows the verdicts of a change: to those on Version, all
+// of them for 0; to those after the position After in the list's order,
+// from the first for nil; to the first Limit of them, all for 0.
+type verdictFilter struct {
+	Version int64
+	After   *verdictPosition
+	Limit   int
+}
+
+// readVerdicts is the verdicts of the change number of the workspace that
+// f lets through, read through q, newest first: by created_at, as shown,
+// descending, then by id descending.
+func readVerdicts(ctx context.Context, q Querier, workspace string, number int64, f verdictFilter) ([]storedVerdict, error) {
+	where, args := []string{`workspace_slug = ?`, `number = ?`}, []any{workspace, number}
+	if f.Version != 0 {
+		where, args = append(where, `version = ?`), append(args, f.Version)
+	}
+	if f.After != nil {
+		where = append(where, `(`+verdictSeconds+` < ? OR (`+verdictSeconds+` = ? AND id < ?))`)
+		args = append(args, f.After.Seconds, f.After.Seconds, f.After.ID)
+	}
+	query := `SELECT ` + verdictColumns + ` FROM change_approvals WHERE ` + strings.Join(where, ` AND `) +
+		` ORDER BY ` + verdictSeconds + ` DESC, id DESC`
+	if f.Limit > 0 {
+		query, args = query+` LIMIT ?`, append(args, f.Limit)
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []storedVerdict
+	for rows.Next() {
+		v, err := scanVerdict(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// readVerdict is the verdict id of the change number of the workspace,
+// read through q; found is false when the change has no verdict of that
+// id, also when another change has one.
+func readVerdict(ctx context.Context, q Querier, workspace string, number int64, id string) (v storedVerdict, found bool, err error) {
+	v, err = scanVerdict(q.QueryRowContext(ctx, `SELECT `+verdictColumns+` FROM change_approvals
+WHERE workspace_slug = ? AND number = ? AND id = ?`, workspace, number, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return storedVerdict{}, false, nil
+	}
+	return v, err == nil, err
+}
+
+// scanVerdict reads a row of verdictColumns.
+func scanVerdict(row interface{ Scan(...any) error }) (storedVerdict, error) {
+	var (
+		v       storedVerdict
+		created int64
+	)
+	if err := row.Scan(&v.ID, &v.Workspace, &v.Number, &v.Version, &v.UserID, &v.Username, &v.Credential.Type,
+		&v.Credential.ID, &v.Verdict, &v.Comment, &v.CarriedFrom, &created); err != nil {
+		return storedVerdict{}, err
+	}
+	v.CreatedAt = time.Unix(0, created).UTC()
+	return v, nil
+}
+
+// deleteVerdict removes the verdict id in tx, and only it: a copy of it
+// carried to another version is a verdict of its own.
+func deleteVerdict(ctx context.Context, tx *sql.Tx, id string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM change_approvals WHERE id = ?`, id)
+	return err
+}
+
+// listApprovals is the verdicts of the change ch that f lets through, read
+// through q, newest first, as the routes answer them: counts_for is
+// decided when they are read, against the landing stored for the change's
+// current version, so that it follows the policy and the versions as they
+// are now.
+func (c *Component) listApprovals(ctx context.Context, q Querier, ch change.Change, f verdictFilter) ([]approval, error) {
+	verdicts, err := readVerdicts(ctx, q, ch.WorkspaceSlug, ch.Number, f)
+	if err != nil || len(verdicts) == 0 {
+		return []approval{}, err
+	}
+	reqs, err := requirementsOf(ch.Landing)
+	if err != nil {
+		return nil, err
+	}
+	k, err := c.newCounter(ctx, q, ch, reqs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]approval, 0, len(verdicts))
+	for _, v := range verdicts {
+		countsFor, err := k.countsFor(ctx, v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, approvalOf(v, countsFor))
+	}
+	return out, nil
+}
+
+// requirementsOf is the requirements of the landing l as the change record
+// stores them, which the evaluation wrote from Requirement values.
+func requirementsOf(l change.Landing) ([]Requirement, error) {
+	reqs := make([]Requirement, 0, len(l.Requirements))
+	for _, raw := range l.Requirements {
+		var r Requirement
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return nil, fmt.Errorf("decode a stored requirement: %w", err)
+		}
+		reqs = append(reqs, r)
+	}
+	return reqs, nil
 }
 
 // counter decides which requirements of one change the verdicts on it
