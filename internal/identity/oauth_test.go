@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,14 +40,16 @@ type fakeProvider struct {
 	answers  map[string]fakeAnswer
 	requests []fakeRequest
 
-	// abandoned counts the delayed answers whose client went away first.
-	abandoned atomic.Int64
+	// abandoned receives the path of each delayed or held answer whose
+	// client went away first.
+	abandoned chan string
 }
 
 type fakeAnswer struct {
 	status int // 0 is 200
 	body   string
 	delay  time.Duration
+	hold   bool // answer only after the client went away, which it never sees
 }
 
 type fakeRequest struct {
@@ -59,10 +60,14 @@ type fakeRequest struct {
 
 func newFakeProvider(t *testing.T) *fakeProvider {
 	t.Helper()
-	f := &fakeProvider{answers: map[string]fakeAnswer{}}
+	f := &fakeProvider{answers: map[string]fakeAnswer{}, abandoned: make(chan string, 16)}
 	f.answer(fakeTokenPath, http.StatusOK, map[string]any{"access_token": "at-1"})
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
-	t.Cleanup(f.srv.Close)
+	t.Cleanup(func() {
+		// Closing the connections releases a held answer whose client stayed.
+		f.srv.CloseClientConnections()
+		f.srv.Close()
+	})
 	return f
 }
 
@@ -79,7 +84,9 @@ func (f *fakeProvider) answer(path string, status int, body any) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.answers[path] = fakeAnswer{status: status, body: raw, delay: f.answers[path].delay}
+	a := f.answers[path]
+	a.status, a.body = status, raw
+	f.answers[path] = a
 }
 
 // delay holds path's answer back by d, or until the client goes away.
@@ -88,6 +95,16 @@ func (f *fakeProvider) delay(path string, d time.Duration) {
 	defer f.mu.Unlock()
 	a := f.answers[path]
 	a.delay = d
+	f.answers[path] = a
+}
+
+// hold holds path's answer back until the client goes away, so that a call
+// that ends does so because its client gave up, however slowly the test runs.
+func (f *fakeProvider) hold(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a := f.answers[path]
+	a.hold = true
 	f.answers[path] = a
 }
 
@@ -101,10 +118,17 @@ func (f *fakeProvider) serve(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	var answerAt <-chan time.Time
+	if !a.hold {
+		answerAt = time.After(a.delay)
+	}
 	select {
-	case <-time.After(a.delay):
+	case <-answerAt:
 	case <-r.Context().Done():
-		f.abandoned.Add(1)
+		select {
+		case f.abandoned <- r.URL.Path:
+		default:
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -309,9 +333,11 @@ func TestOAuthClient_AbandonsACallThatOutlastsTheTimeout(t *testing.T) {
 			t.Parallel()
 			f := newFakeProvider(t)
 			f.answer(fakeUserPath, http.StatusOK, map[string]any{"id": 123, "login": "alice", "email": "a@x"})
-			f.delay(slow, 500*time.Millisecond)
+			f.hold(slow)
 			client := identity.NewOAuthClient([]config.Provider{f.provider("github")}, nil, 50*time.Millisecond)
 
+			// The provider never answers, so the call can end only by the
+			// client giving up; the default timeout would take far longer.
 			start := time.Now()
 			got, err := client.Identity(context.Background(), "github", "code-1", redirectURI)
 			elapsed := time.Since(start)
@@ -321,14 +347,18 @@ func TestOAuthClient_AbandonsACallThatOutlastsTheTimeout(t *testing.T) {
 			if got != (identity.Identity{}) {
 				t.Errorf("identity = %+v, want none", got)
 			}
-			if elapsed >= 300*time.Millisecond {
-				t.Errorf("Identity returned after %v, want under 300ms", elapsed)
+			if elapsed >= identity.DefaultProviderTimeout/3 {
+				t.Errorf("Identity returned after %v, want it to give up after its own 50ms timeout", elapsed)
 			}
-			// The provider sees the connection closed before its answer.
-			for deadline := time.Now().Add(time.Second); f.abandoned.Load() == 0; time.Sleep(5 * time.Millisecond) {
-				if time.Now().After(deadline) {
-					t.Fatal("the delayed call was not abandoned")
+			// The provider sees the connection closed. The bound only keeps a
+			// regression from hanging the suite.
+			select {
+			case path := <-f.abandoned:
+				if path != slow {
+					t.Errorf("the call to %s was abandoned, want %s", path, slow)
 				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the held call was not abandoned")
 			}
 		})
 	}
