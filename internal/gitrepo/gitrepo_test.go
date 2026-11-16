@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -326,13 +327,69 @@ func TestOpen_RefusesWhatIsNotARepository(t *testing.T) {
 	if err := os.Mkdir(empty, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// partial is a bare repository with one of its parts taken away or
+	// broken by change.
+	partial := func(name string, change func(dir string) error) string {
+		dir := filepath.Join(root, name)
+		gitrepotest.Git(t, root, "init", "--quiet", "--bare", dir)
+		if err := change(dir); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
 	for name, dir := range map[string]string{
 		"a plain file":       file,
 		"an empty directory": empty,
 		"nothing":            filepath.Join(root, "missing.git"),
+		"no objects directory": partial("no-objects.git", func(dir string) error {
+			return os.RemoveAll(filepath.Join(dir, "objects"))
+		}),
+		"no refs directory": partial("no-refs.git", func(dir string) error {
+			return os.RemoveAll(filepath.Join(dir, "refs"))
+		}),
+		"no HEAD": partial("no-head.git", func(dir string) error {
+			return os.Remove(filepath.Join(dir, "HEAD"))
+		}),
+		"a HEAD that is neither a ref nor an id": partial("bad-head.git", func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "HEAD"), []byte("main\n"), 0o644)
+		}),
+		"a HEAD that names a ref outside refs/": partial("outside-head.git", func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: heads/main\n"), 0o644)
+		}),
 	} {
 		if _, err := (gitrepo.Git{}).Open(context.Background(), dir); err == nil {
 			t.Errorf("Open(%s) = nil error, want an error", name)
+		}
+	}
+}
+
+func TestOpen_OpensAGitDirectoryWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	unborn := filepath.Join(root, "unborn.git")
+	gitrepotest.Git(t, root, "init", "--quiet", "--bare", "--initial-branch=main", unborn)
+	detached := filepath.Join(root, "detached.git")
+	gitrepotest.Git(t, root, "init", "--quiet", "--bare", "--initial-branch=main", detached)
+	if _, err := gitrepotest.Run(detached, "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nc\n\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, detached, "update-ref", "--no-deref", "HEAD", "main")
+	gitrepotest.Git(t, detached, "pack-refs", "--all")
+	for name, dir := range map[string]string{
+		"a bare repository whose branch has no commit yet": unborn,
+		"a bare repository with a detached HEAD":           detached,
+	} {
+		var calls atomic.Int32
+		repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), dir)
+		if err != nil {
+			t.Errorf("Open(%s) = %v, want a repository", name, err)
+			continue
+		}
+		if n := calls.Load(); n != 0 {
+			t.Errorf("Open(%s) ran %d git processes, want none", name, n)
+		}
+		if repo.Dir() != dir {
+			t.Errorf("Open(%s).Dir() = %q, want %q", name, repo.Dir(), dir)
 		}
 	}
 }
@@ -426,8 +483,8 @@ func TestGit_RemovesItsPrivateDirectoryOnceGitHasRun(t *testing.T) {
 			_, err := gitrepo.Git{}.ListRemote(ctx, "https://example.invalid/a.git", gitrepo.Credential{Username: "u", Password: "p"})
 			return err
 		}},
-		{"Open", func() error {
-			_, err := gitrepo.Git{}.Open(ctx, t.TempDir())
+		{"ListRemote without a credential", func() error {
+			_, err := gitrepo.Git{}.ListRemote(ctx, "https://example.invalid/a.git", gitrepo.Credential{})
 			return err
 		}},
 	} {

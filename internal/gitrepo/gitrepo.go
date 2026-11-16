@@ -107,17 +107,70 @@ type Repo struct {
 
 // Open opens the repository whose git directory is dir, as a bare copy has
 // it. It returns an error when dir does not exist or is not a repository: a
-// file, an empty directory or a directory git does not take for one.
+// file, an empty directory or a directory git does not take for one, or
+// when ctx has ended.
+//
+// It runs no git process: the hub opens a repository for nearly every
+// request that reads one, and a process per open was a fifth of all it
+// started. It checks the layout git itself requires of a git directory
+// instead (see isGitDir); a repository git refuses for another reason, such
+// as a format it does not know, fails at the first command run on it.
 func (g Git) Open(ctx context.Context, dir string) (*Repo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("open %s: %w", dir, err)
+	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dir, err)
 	}
-	r := &Repo{g: g, dir: abs}
-	if _, err := r.git(ctx, "rev-parse", "--git-dir"); err != nil {
-		return nil, fmt.Errorf("open %s: %w", dir, err)
+	if err := isGitDir(abs); err != nil {
+		return nil, fmt.Errorf("open %s: not a git repository: %w", dir, err)
 	}
-	return r, nil
+	return &Repo{g: g, dir: abs}, nil
+}
+
+// isGitDir checks that dir is what git takes for a git directory: an
+// objects and a refs directory, and a HEAD that is a symbolic link into
+// refs/, a symbolic ref ("ref: refs/...") or a full object id.
+func isGitDir(dir string) error {
+	for _, sub := range []string{"objects", "refs"} {
+		info, err := os.Stat(filepath.Join(dir, sub))
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", sub)
+		}
+	}
+	head := filepath.Join(dir, "HEAD")
+	info, err := os.Lstat(head)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(head)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(target, "refs/") {
+			return errors.New("HEAD links outside refs/")
+		}
+		return nil
+	}
+	b, err := os.ReadFile(head)
+	if err != nil {
+		return err
+	}
+	if rest, ok := strings.CutPrefix(string(b), "ref:"); ok {
+		if !strings.HasPrefix(strings.TrimLeft(rest, " \t"), "refs/") {
+			return errors.New("HEAD names a ref outside refs/")
+		}
+		return nil
+	}
+	if !isHexID(strings.TrimRight(string(b), "\n"), idLen) {
+		return errors.New("HEAD is neither a ref nor an object id")
+	}
+	return nil
 }
 
 // Dir is the repository's git directory.
