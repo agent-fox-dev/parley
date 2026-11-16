@@ -233,7 +233,10 @@ func (c *Component) evaluatePolicy(w http.ResponseWriter, r *http.Request) error
 		}
 		target = ch.TargetBranch
 	}
-	res := Preview(doc, target, files)
+	res, err := Preview(ctx, doc, target, files)
+	if err != nil {
+		return err
+	}
 	server.WriteJSON(w, http.StatusOK, evaluation{PolicyRevision: stored.Number, Status: res.Status, Requirements: res.Requirements})
 	return nil
 }

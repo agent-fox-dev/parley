@@ -15,9 +15,40 @@ import (
 // match target, whose paths match file and whose exclude does not, or
 // "default" when no rule qualifies.
 func Select(doc *Document, target, file string) string {
+	return newSelector(doc, target).selectRule(file)
+}
+
+// selector selects the rule of each file of one evaluation: the rules whose
+// targets match its target branch, decided once, with their globs compiled
+// once.
+type selector struct {
+	rules []compiledRule
+	path  *subject
+}
+
+// compiledRule is a rule whose targets match, with its globs compiled.
+type compiledRule struct {
+	name           string
+	paths, exclude []pathGlob
+}
+
+func newSelector(doc *Document, target string) *selector {
+	gs := newGlobSet()
+	rules := make([]compiledRule, 0, len(doc.Rules))
 	for _, r := range doc.Rules {
-		if targetMatches(r.Targets, target) && matchesAny(r.Paths, file) && !matchesAny(r.Exclude, file) {
-			return r.Name
+		if targetMatches(r.Targets, target) {
+			rules = append(rules, compiledRule{name: r.Name, paths: gs.compileAll(r.Paths), exclude: gs.compileAll(r.Exclude)})
+		}
+	}
+	return &selector{rules: rules, path: gs.subject()}
+}
+
+// selectRule is Select for file.
+func (sel *selector) selectRule(file string) string {
+	sel.path.reset(file)
+	for _, r := range sel.rules {
+		if sel.path.matchAny(r.paths) && !sel.path.matchAny(r.exclude) {
+			return r.name
 		}
 	}
 	return defaultRule
@@ -29,16 +60,6 @@ func Select(doc *Document, target, file string) string {
 // it means what the same glob means in protected_branches.
 func targetMatches(globs []string, branch string) bool {
 	return globs == nil || workspace.MatchAnyBranchGlob(globs, branch)
-}
-
-// matchesAny reports whether at least one path glob of globs matches file.
-func matchesAny(globs []string, file string) bool {
-	for _, g := range globs {
-		if MatchPath(g, file) {
-			return true
-		}
-	}
-	return false
 }
 
 // Result is the landing of a change: its status, the structural reason it
@@ -79,15 +100,19 @@ type Check struct {
 // selects; each group becomes a requirement whose approvals and checks are
 // counted from ev, asked once per requirement through q. A draft, or a
 // change with a structural cause, is blocked whatever its requirements say,
-// and they are still listed. A failure to read the files or the evidence
-// fails the evaluation as a whole, with the zero Result.
+// and they are still listed. A failure to read the files or the evidence,
+// or the end of ctx, fails the evaluation as a whole, with the zero Result.
 func Evaluate(ctx context.Context, q Querier, doc *Document, ch ChangeFacts, files ChangeFiles, ev Evidence) (Result, error) {
 	paths, err := files.Files(ctx, q, ch.Workspace, ch.Number)
 	if err != nil {
 		return Result{}, fmt.Errorf("read the files of change %d: %w", ch.Number, err)
 	}
+	groups, err := group(ctx, doc, ch.TargetBranch, paths)
+	if err != nil {
+		return Result{}, err
+	}
 	reqs := make([]Requirement, 0)
-	for _, g := range group(doc, ch.TargetBranch, paths) {
+	for _, g := range groups {
 		a, err := ev.Evidence(ctx, q, EvidenceQuery{
 			Workspace: ch.Workspace, Number: ch.Number, Version: ch.Version,
 			Approvers: g.require.Approvers, Checks: distinct(g.require.Checks), FreshChecks: g.require.FreshChecks,
@@ -106,13 +131,19 @@ func Evaluate(ctx context.Context, q Querier, doc *Document, ch ChangeFacts, fil
 
 // Preview computes what the files would need on a change into target under
 // doc, before or apart from any change: no evidence is asked, so nothing is
-// counted and every check is pending, and no structural cause applies.
-func Preview(doc *Document, target string, files []string) Result {
+// counted and every check is pending, and no structural cause applies. The
+// end of ctx stops it with the zero Result and ctx's error, so that a
+// request its caller abandoned stops costing the hub.
+func Preview(ctx context.Context, doc *Document, target string, files []string) (Result, error) {
+	groups, err := group(ctx, doc, target, files)
+	if err != nil {
+		return Result{}, err
+	}
 	reqs := make([]Requirement, 0)
-	for _, g := range group(doc, target, files) {
+	for _, g := range groups {
 		reqs = append(reqs, requirement(g, EvidenceAnswer{}))
 	}
-	return result(reqs, nil)
+	return result(reqs, nil), nil
 }
 
 // Landing is r as the change record stores it.
@@ -150,11 +181,16 @@ type selection struct {
 // group selects a rule for each file and returns one selection per rule
 // selected, in document order with the default last, each with its files in
 // ascending byte order, a repeated file once, cut to the first
-// maxRequirementPaths.
-func group(doc *Document, target string, files []string) []selection {
+// maxRequirementPaths. It looks at ctx before each file, and returns its
+// error once it has ended.
+func group(ctx context.Context, doc *Document, target string, files []string) ([]selection, error) {
+	sel := newSelector(doc, target)
 	byRule := map[string][]string{}
 	for _, f := range files {
-		r := Select(doc, target, f)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		r := sel.selectRule(f)
 		byRule[r] = append(byRule[r], f)
 	}
 	var out []selection
@@ -171,7 +207,7 @@ func group(doc *Document, target string, files []string) []selection {
 		add(r.Name, r.Require)
 	}
 	add(defaultRule, doc.Default)
-	return out
+	return out, nil
 }
 
 // requirement is the requirement of a selection given its evidence. A named

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
 )
@@ -328,14 +330,75 @@ func TestPreview_EvaluatesWithoutEvidenceOrCause(t *testing.T) {
 		{"billing/a.go", "docs/a.md"},
 		{"deploy/secrets/k", "src/a.go"},
 	} {
-		got := Preview(example("test"), "main", files)
+		got, err := Preview(context.Background(), example("test"), "main", files)
+		if err != nil {
+			t.Fatalf("Preview(%q): %v", files, err)
+		}
 		if want := evaluate(t, example("test"), openChange, files, NoEvidence); !reflect.DeepEqual(got, want) {
 			t.Errorf("Preview(%q) = %+v, want %+v", files, got, want)
 		}
 	}
-	got := Preview(example(), "dev", []string{"billing/a.go", "docs/a.md", "billing/a.go"})
-	if !reflect.DeepEqual(rules(got), []string{"docs", "default"}) || !reflect.DeepEqual(requirementOf(t, got, "default").Paths, []string{"billing/a.go"}) {
+	got, err := Preview(context.Background(), example(), "dev", []string{"billing/a.go", "docs/a.md", "billing/a.go"})
+	if err != nil || !reflect.DeepEqual(rules(got), []string{"docs", "default"}) || !reflect.DeepEqual(requirementOf(t, got, "default").Paths, []string{"billing/a.go"}) {
 		t.Errorf("Preview on dev with a repeated path: %+v", got)
+	}
+}
+
+// crafted is a document of 190 rules, each one glob of 255 characters made
+// of glob, and 2 000 distinct paths of 450 characters that no rule matches:
+// the most an evaluation's body lets a caller ask the matcher.
+func crafted(glob func(rule int) string) (*Document, []string) {
+	doc := &Document{Default: NeverSet.Default, Rules: []Rule{}}
+	for i := range 190 {
+		doc.Rules = append(doc.Rules, Rule{Name: fmt.Sprintf("r%d", i), Paths: []string{glob(i)}, Exclude: []string{}})
+	}
+	files := make([]string, 0, 2000)
+	for i := range 2000 {
+		files = append(files, fmt.Sprintf("%s%04d", strings.Repeat("a", 446), i))
+	}
+	return doc, files
+}
+
+func TestPreview_EvaluatesTheLargestRequestInBoundedTime(t *testing.T) {
+	for name, glob := range map[string]func(int) string{
+		// fails at its first character
+		"dead at once": func(int) string { return "b" + strings.Repeat("*a", 127) },
+		// keeps every position alive to its last character
+		"alive to the end": func(i int) string { return strings.Repeat("*a", 126) + "*" + string(rune('b'+i%20)) },
+	} {
+		doc, files := crafted(glob)
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			res, err := Preview(context.Background(), doc, "main", files)
+			if err == nil && !reflect.DeepEqual(rules(res), []string{"default"}) {
+				err = fmt.Errorf("rules %q, want only the default", rules(res))
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+			t.Logf("%s: %v", name, time.Since(start))
+		case <-time.After(previewBound):
+			t.Fatalf("%s: Preview has not returned after %v", name, previewBound)
+		}
+	}
+}
+
+// previewBound is how long the largest evaluation may take, many times what
+// it takes on a loaded machine.
+const previewBound = 10 * time.Second
+
+func TestPreview_StopsWhenTheContextEnds(t *testing.T) {
+	doc, files := crafted(func(int) string { return strings.Repeat("*a", 126) + "*b" })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := Preview(ctx, doc, "main", files)
+	if !errors.Is(err, context.Canceled) || !reflect.DeepEqual(res, Result{}) {
+		t.Errorf("Preview after the context ended = status %q with %d requirements, %v; want the zero result and context.Canceled", res.Status, len(res.Requirements), err)
 	}
 }
 
