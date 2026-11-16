@@ -18,78 +18,63 @@ import (
 	"github.com/agent-fox-dev/parley/internal/land"
 )
 
+// another opens a second change from the fork slug's feat into release
+// once the land is recorded, a draft for draft, and abandons it for
+// abandon.
+func another(w *world, slug string, draft, abandon bool) func(point string) error {
+	return func(point string) error {
+		if point != "after-bookkeeping" {
+			return nil
+		}
+		ctx := context.Background()
+		return w.Store.Tx(ctx, func(tx *sql.Tx) error {
+			ch, err := w.changes.Open(ctx, tx, change.OpenInput{Workspace: "api", SourceWorkspace: slug, SourceBranch: "feat",
+				TargetBranch: new("release"), Intent: new("why"), Kind: change.KindRef, Caller: w.caller(), Draft: draft})
+			if err != nil || !abandon {
+				return err
+			}
+			return w.changes.SetAbandoned(ctx, tx, "api", ch.Number, "done")
+		})
+	}
+}
+
+// sourceDeletes are the lands of a change from feat of a fork, and whether
+// each deletes feat.
+var sourceDeletes = []struct {
+	name     string
+	settings string
+	// arrange returns what runs at the points of the land, nil for
+	// nothing; moved moves feat on before the swap.
+	arrange func(t *testing.T, w *world, slug, dir string) func(point string) error
+	moved   bool
+	// deleted says whether feat is gone afterwards, else it is kept at its
+	// head.
+	deleted bool
+}{
+	{name: "by default", deleted: true},
+	{name: "with land.delete_source false", settings: `,"land.delete_source":false`},
+	{name: "moved since the attempt was created", moved: true},
+	{name: "the source of another open change",
+		arrange: func(_ *testing.T, w *world, slug, _ string) func(string) error { return another(w, slug, false, false) }},
+	{name: "the source of another draft change",
+		arrange: func(_ *testing.T, w *world, slug, _ string) func(string) error { return another(w, slug, true, false) }},
+	{name: "the source of an abandoned change", deleted: true,
+		arrange: func(_ *testing.T, w *world, slug, _ string) func(string) error { return another(w, slug, false, true) }},
+	{name: "whose delete fails",
+		arrange: func(t *testing.T, _ *world, _, dir string) func(string) error {
+			if err := os.WriteFile(filepath.Join(dir, "refs", "heads", "feat.lock"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+}
+
 func TestLand_DeletesTheSourceBranchOnlyWhenNothingElseNeedsIt(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	gitrepotest.Git(t, w.api, "branch", "release", w.base)
-	// during runs at the points of the atomic step the row asks for, in the
-	// pool's goroutine; failures are reported once the land answered.
-	var (
-		mu     sync.Mutex
-		during func(point string) error
-	)
-	land.SetSeams(w.land, land.Seams{
-		BeforeSwap: func(context.Context, string, int) {
-			mu.Lock()
-			defer mu.Unlock()
-			if during != nil {
-				_ = during("before-swap")
-			}
-		},
-		Fault: func(point string) error {
-			mu.Lock()
-			defer mu.Unlock()
-			if during != nil && point != "before-swap" {
-				return during(point)
-			}
-			return nil
-		},
-	})
-	// another opens a second change from the fork's feat into release
-	// once the land is recorded, a draft for draft, and abandons it for
-	// abandon.
-	another := func(slug string, draft, abandon bool) func(point string) error {
-		return func(point string) error {
-			if point != "after-bookkeeping" {
-				return nil
-			}
-			ctx := context.Background()
-			return w.Store.Tx(ctx, func(tx *sql.Tx) error {
-				ch, err := w.changes.Open(ctx, tx, change.OpenInput{Workspace: "api", SourceWorkspace: slug, SourceBranch: "feat",
-					TargetBranch: new("release"), Intent: new("why"), Kind: change.KindRef, Caller: w.caller(), Draft: draft})
-				if err != nil || !abandon {
-					return err
-				}
-				return w.changes.SetAbandoned(ctx, tx, "api", ch.Number, "done")
-			})
-		}
-	}
-	for i, c := range []struct {
-		name     string
-		settings string
-		// arrange returns what runs during the land, nil for nothing.
-		arrange func(t *testing.T, slug, dir string) func(point string) error
-		// deleted says whether feat is gone afterwards, else it is kept
-		// at its head.
-		deleted bool
-	}{
-		{name: "by default", deleted: true},
-		{name: "with land.delete_source false", settings: `,"land.delete_source":false`},
-		{name: "moved since the attempt was created"},
-		{name: "the source of another open change",
-			arrange: func(_ *testing.T, slug, _ string) func(string) error { return another(slug, false, false) }},
-		{name: "the source of another draft change",
-			arrange: func(_ *testing.T, slug, _ string) func(string) error { return another(slug, true, false) }},
-		{name: "the source of an abandoned change", deleted: true,
-			arrange: func(_ *testing.T, slug, _ string) func(string) error { return another(slug, false, true) }},
-		{name: "whose delete fails",
-			arrange: func(t *testing.T, _, dir string) func(string) error {
-				if err := os.WriteFile(filepath.Join(dir, "refs", "heads", "feat.lock"), nil, 0o644); err != nil {
-					t.Fatal(err)
-				}
-				return nil
-			}},
-	} {
+	points := w.atPoints()
+	for i, c := range sourceDeletes {
 		t.Run(c.name, func(t *testing.T) {
 			slug := "api--d" + string(rune('a'+i))
 			dir := w.fork(t, slug, w.owner)
@@ -101,8 +86,8 @@ func TestLand_DeletesTheSourceBranchOnlyWhenNothingElseNeedsIt(t *testing.T) {
 			var run func(string) error
 			switch {
 			case c.arrange != nil:
-				run = c.arrange(t, slug, dir)
-			case c.name == "moved since the attempt was created":
+				run = c.arrange(t, w, slug, dir)
+			case c.moved:
 				run = func(point string) error {
 					if point == "before-swap" {
 						want = commit(t, dir, "feat", from, "later", map[string]string{"later.txt": "later\n"})
@@ -110,30 +95,12 @@ func TestLand_DeletesTheSourceBranchOnlyWhenNothingElseNeedsIt(t *testing.T) {
 					return nil
 				}
 			}
-			var failed []error
-			mu.Lock()
-			during = func(point string) error {
-				if run == nil {
-					return nil
-				}
-				if err := run(point); err != nil {
-					failed = append(failed, err)
-				}
-				return nil
-			}
-			mu.Unlock()
-			t.Cleanup(func() {
-				mu.Lock()
-				defer mu.Unlock()
-				during = nil
-			})
+			failed := points.set(t, run)
 
 			status, a := w.landCall(t, w.ownerKey, ch.Number, "", nil)
 
-			mu.Lock()
-			defer mu.Unlock()
-			if len(failed) > 0 {
-				t.Fatalf("arranging the row failed: %v", errors.Join(failed...))
+			if err := failed(); err != nil {
+				t.Fatalf("arranging the row failed: %v", err)
 			}
 			if status != 200 || a["status"] != land.StatusLanded {
 				t.Fatalf("land = %d %v, want 200 landed", status, a)

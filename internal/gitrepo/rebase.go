@@ -102,10 +102,28 @@ func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Si
 	return newHead, became, nil, nil
 }
 
-// authorZones maps each commit of the rev-list range commitRange to the
-// zone of its author's time, which ReadCommits gives in UTC.
-func (r *Repo) authorZones(ctx context.Context, commitRange string) (map[string]*time.Location, error) {
-	out, err := r.git(ctx, "rev-list", "--no-commit-header", "--date=raw", "--format=%H %ad", commitRange)
+// AuthorZone is the zone of the author's time of the commit id, a full id,
+// which ReadCommits gives in UTC, so that a commit made with that author
+// keeps the zone the author wrote in.
+func (r *Repo) AuthorZone(ctx context.Context, id string) (*time.Location, error) {
+	if !isHexID(id, idLen) {
+		return nil, fmt.Errorf("commit %q: %w", id, ErrNotFound)
+	}
+	zones, err := r.authorZones(ctx, "--no-walk", id)
+	if err != nil {
+		return nil, err
+	}
+	zone, ok := zones[strings.ToLower(id)]
+	if !ok {
+		return nil, fmt.Errorf("commit %s: %w", id, ErrNotFound)
+	}
+	return zone, nil
+}
+
+// authorZones maps each commit rev-list lists for revs to the zone of its
+// author's time, which ReadCommits gives in UTC.
+func (r *Repo) authorZones(ctx context.Context, revs ...string) (map[string]*time.Location, error) {
+	out, err := r.git(ctx, append([]string{"rev-list", "--no-commit-header", "--date=raw", "--format=%H %ad"}, revs...)...)
 	if err != nil {
 		return nil, err
 	}

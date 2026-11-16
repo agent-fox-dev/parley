@@ -149,11 +149,19 @@ func (c *Component) start(j *job) {
 // attend runs the attempt of j under its deadline once a worker is free,
 // and ends it failed timeout when the deadline passes first, whether the
 // attempt waits for a worker or runs. The worker stays taken until the
-// engine has returned, so that no more replays than workers run at once.
+// engine has returned, so that no more replays than workers run at once,
+// and no longer: what follows the end of the attempt (concluded), the
+// after-landing hooks among it, runs once the worker is free, so that a
+// hook that takes long holds no worker. It still runs in the job's
+// goroutine, which the stop of the pool waits for, and before the attempt's
+// waiters are woken.
 func (c *Component) attend(j *job) {
 	p := &c.pool
-	ctx, cancel := context.WithTimeoutCause(p.ctx, c.deps.Timeout-c.now().Sub(j.from), errTimedOut)
+	var after deferred
+	ctx, cancel := context.WithTimeoutCause(context.WithValue(p.ctx, deferredKey{}, &after),
+		c.deps.Timeout-c.now().Sub(j.from), errTimedOut)
 	defer cancel()
+	defer after.run()
 	select {
 	case p.slots <- struct{}{}:
 	case <-ctx.Done():
@@ -184,7 +192,8 @@ func (c *Component) attend(j *job) {
 // expire ends the attempt of j failed timeout once its context ended by
 // its deadline, unless its engine is moving the target, which then ends
 // the attempt itself; a context ended by the stop of the hub leaves it
-// running.
+// running. The final observers are told of the timeout before its waiters
+// are woken, as for any other end.
 func (c *Component) expire(ctx context.Context, j *job) {
 	if !errors.Is(context.Cause(ctx), errTimedOut) {
 		return
@@ -195,7 +204,7 @@ func (c *Component) expire(ctx context.Context, j *job) {
 	if swapping {
 		return
 	}
-	if err := c.end(ctx, j.a); err != nil {
+	if err := c.end(context.WithValue(ctx, deferredKey{}, (*deferred)(nil)), j.a); err != nil {
 		c.deps.Logger.Error("land attempt: end past its deadline", "workspace", j.a.Workspace, "land_id", j.a.ID, "error", err)
 	}
 	j.release()
@@ -234,5 +243,39 @@ func (c *Component) leaveSwap(id string) {
 		j.mu.Lock()
 		j.swapping = false
 		j.mu.Unlock()
+	}
+}
+
+// deferred is what follows the end of the attempts of one run of the
+// pool, held until its worker is free.
+type deferred struct {
+	mu  sync.Mutex
+	fns []func()
+}
+
+// deferredKey is the context key of the deferred work of a pool run.
+type deferredKey struct{}
+
+// later runs fn once the worker that runs ctx's attempt is free, or now
+// when ctx is not the context of a pool run.
+func later(ctx context.Context, fn func()) {
+	d, _ := ctx.Value(deferredKey{}).(*deferred)
+	if d == nil {
+		fn()
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.fns = append(d.fns, fn)
+}
+
+// run runs, in order, what was deferred.
+func (d *deferred) run() {
+	d.mu.Lock()
+	fns := d.fns
+	d.fns = nil
+	d.mu.Unlock()
+	for _, fn := range fns {
+		fn()
 	}
 }

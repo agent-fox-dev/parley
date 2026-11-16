@@ -72,6 +72,9 @@ func TestLand_SquashesTheChangeIntoOneCommitOnTheTargetHead(t *testing.T) {
 				got.Committer.Email != "parley@localhost" {
 				t.Errorf("author %+v, committer %+v; want Ann and the landing identity", got.Author, got.Committer)
 			}
+			if author := strings.TrimSpace(gitrepotest.Git(t, w.api, "show", "-s", "--date=raw", "--format=%an <%ae> %ad", landed)); author != ann {
+				t.Errorf("author %q, want %q, the author, time and zone of the version's head", author, ann)
+			}
 			message := got.Message
 			trailers := c.trailers
 			if c.session {

@@ -17,12 +17,17 @@ import (
 // none of it contacts origin or a forge: a land changes the hub's own
 // repositories alone, and publishing a landed branch is a push to origin
 // of its own.
+//
+// In the pool it runs once the attempt's worker is free (later), so that a
+// hook or an observer that takes long holds no worker.
 func (c *Component) concluded(ctx context.Context, ws Workspace, a Attempt) {
-	ctx = context.WithoutCancel(ctx)
-	if a.Status == StatusLanded {
-		c.follow(ctx, ws, a)
-	}
-	c.report(ctx, a)
+	later(ctx, func() {
+		ctx := context.WithoutCancel(ctx)
+		if a.Status == StatusLanded {
+			c.follow(ctx, ws, a)
+		}
+		c.report(ctx, a)
+	})
 }
 
 // follow does the work a land leaves, once it is recorded, each step on

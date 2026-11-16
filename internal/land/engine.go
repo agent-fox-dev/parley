@@ -114,7 +114,8 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 // override let the answer of a change pass. An answer that is not ready
 // on a request with an override is put to the override rule, and one the
 // rule lets pass counts as ready. The run asks it before its first try
-// only, so that a retry of the compare-and-swap judges nothing again.
+// only, so that a retry of the compare-and-swap judges nothing again. A
+// gate or rule that fails or panics is the error.
 func (c *Component) judge(ctx context.Context, a Attempt) (revision int64, blocked *Blocked, overridden bool, err error) {
 	gate, rule := c.policy()
 	caller := callerOf(a)
@@ -124,7 +125,9 @@ func (c *Component) judge(ctx context.Context, a Attempt) (revision int64, block
 		if err != nil {
 			return 0, nil, false, err
 		}
-		answer, err := gate.Evaluate(ctx, GateInput{Workspace: a.Workspace, Change: ch, Version: cov.Version, Caller: caller})
+		answer, err := recovered("the policy gate", func() (GateAnswer, error) {
+			return gate.Evaluate(ctx, GateInput{Workspace: a.Workspace, Change: ch, Version: cov.Version, Caller: caller})
+		})
 		if err != nil {
 			return 0, nil, false, fmt.Errorf("the policy gate on %s: %w", ref, err)
 		}
@@ -133,7 +136,9 @@ func (c *Component) judge(ctx context.Context, a Attempt) (revision int64, block
 			continue
 		}
 		if a.RequestedOverride != nil {
-			passes, err := rule.Passes(ctx, *a.RequestedOverride, answer)
+			passes, err := recovered("the override rule", func() (bool, error) {
+				return rule.Passes(ctx, *a.RequestedOverride, answer)
+			})
 			if err != nil {
 				return 0, nil, false, fmt.Errorf("the override rule on %s: %w", ref, err)
 			}
@@ -185,6 +190,18 @@ func askTarget(ctx context.Context, g TargetGuard, in TargetInput) (answer Targe
 		}
 	}()
 	return g.Check(ctx, in)
+}
+
+// recovered is what fn answers, a panic of it, the registered collaborator
+// what, as its error: a gate or rule that panics fails the attempt, not
+// the hub.
+func recovered[T any](what string, fn func() (T, error)) (v T, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%s panicked: %v", what, p)
+		}
+	}()
+	return fn()
 }
 
 // callerOf is who asked for the attempt a, as a change names its caller.
@@ -364,6 +381,10 @@ type StartInput struct {
 	SessionID *string
 	// Override is the override the land is asked with, nil for none.
 	Override *Override
+
+	// judged are the changes, each at its version, that the land route
+	// judged before the attempt is created, nil when nothing judged them.
+	judged []CoveredChange
 }
 
 // Start starts the land in, as the land route does once its caller is
@@ -432,7 +453,9 @@ func (c *Component) session(ctx context.Context, in StartInput) (*linked, error)
 // it, once the land's preconditions hold there (admit), so that what is
 // judged of the changes holds for the attempt stored, and of simultaneous
 // lands of one change exactly one creates an attempt; the strategy is the
-// workspace's land.strategy as read before.
+// workspace's land.strategy as read before. A land whose changes the route
+// judged before (in.judged) is refused 409 version_mismatch when the
+// transaction reads other changes, or other versions of them.
 // Nothing is held beyond that transaction: the attempts of different
 // changes run side by side, also on one target, and meet only in the
 // compare-and-swap of the target.
@@ -457,6 +480,13 @@ func (c *Component) create(ctx context.Context, ws Workspace, in StartInput, ses
 			return err
 		}
 		a.TargetBranch, a.Covered, a.CreatedAt = ch.TargetBranch, covered(chain), c.now()
+		if in.judged != nil && !sameVersions(in.judged, a.Covered) {
+			// Who may land, the confinement of a bound token and the request
+			// guards judged the changes as read before this transaction: a
+			// land of other changes, or of other versions, was not judged.
+			return server.NewError("version_mismatch", http.StatusConflict, fmt.Sprintf(
+				"the changes of the land of %s moved on while it was judged: ask again", ch.Ref))
+		}
 		if err := insertAttempt(ctx, tx, a); err != nil {
 			return err
 		}
@@ -470,6 +500,12 @@ func (c *Component) create(ctx context.Context, ws Workspace, in StartInput, ses
 	}
 	c.submit(a, a.CreatedAt)
 	return a, nil
+}
+
+// sameVersions reports whether a and b are the same changes, each at the
+// same version, in the same order.
+func sameVersions(a, b []CoveredChange) bool {
+	return slices.EqualFunc(a, b, func(x, y CoveredChange) bool { return x.Number == y.Number && x.Version == y.Version })
 }
 
 // admit checks the preconditions of a land of the change ch, as read

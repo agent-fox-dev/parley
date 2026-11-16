@@ -1,6 +1,7 @@
 package land_test
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -204,53 +205,97 @@ func (failingGate) Evaluate(context.Context, land.GateInput) (land.GateAnswer, e
 	return land.GateAnswer{}, errors.New("the policy cannot be read")
 }
 
+// panicking is a policy gate that panics, for gate, or else answers every
+// change blocked, and an override rule that panics.
+type panicking struct{ gate bool }
+
+func (p panicking) Evaluate(context.Context, land.GateInput) (land.GateAnswer, error) {
+	if p.gate {
+		panic("the gate broke")
+	}
+	return land.GateAnswer{Status: change.LandingBlocked}, nil
+}
+
+func (panicking) Passes(context.Context, land.Override, land.GateAnswer) (bool, error) {
+	panic("the rule broke")
+}
+
 func TestRun_EndsAsInternalWhenTheTargetOrAStepFails(t *testing.T) {
 	t.Parallel()
-	deleteMain := func(t *testing.T, w *world) { gitrepotest.Git(t, w.api, "update-ref", "-d", "refs/heads/main") }
+	deleteMain := func(t *testing.T, w *world, _ change.Change) {
+		gitrepotest.Git(t, w.api, "update-ref", "-d", "refs/heads/main")
+	}
 	for _, c := range []struct {
 		name string
 		// before prepares the world before the run, swap runs before the
-		// compare-and-swap, and change alters the change the attempt
-		// covers.
-		before, swap func(t *testing.T, w *world)
-		change       func(ch *change.Change)
-		// deleted is set when main is gone.
+		// compare-and-swap, and alter alters the attempt that covers the
+		// change.
+		before, swap func(t *testing.T, w *world, ch change.Change)
+		alter        func(a *land.Attempt)
+		// deleted is set when main is gone; state is the change's state
+		// after the run, "" for open.
 		deleted bool
+		state   string
 	}{
 		{name: "the target deleted between the replay and the swap", swap: deleteMain, deleted: true},
 		{name: "the target deleted before the run", before: deleteMain, deleted: true},
-		{name: "the policy gate failing", before: func(_ *testing.T, w *world) { w.land.RegisterGate(failingGate{}) }},
-		{name: "git failing in the replay", change: func(ch *change.Change) { ch.HeadSHA = strings.Repeat("f", 40) }},
+		{name: "the policy gate failing", before: func(_ *testing.T, w *world, _ change.Change) { w.land.RegisterGate(failingGate{}) }},
+		{name: "the policy gate panicking", before: func(_ *testing.T, w *world, _ change.Change) {
+			w.land.RegisterGate(panicking{gate: true})
+		}},
+		{name: "the override rule panicking",
+			before: func(_ *testing.T, w *world, _ change.Change) {
+				w.land.RegisterGate(panicking{})
+				w.land.RegisterOverrideRule(panicking{})
+			},
+			alter: func(a *land.Attempt) { a.RequestedOverride = &land.Override{Reason: "r"} }},
+		{name: "git failing in the replay", alter: func(a *land.Attempt) { a.Covered[0].Head = strings.Repeat("f", 40) }},
+		{name: "a version without a base", alter: func(a *land.Attempt) { a.Covered[0].Base = "" }},
+		{name: "the change abandoned between the replay and the swap", state: change.StateAbandoned,
+			swap: func(t *testing.T, w *world, ch change.Change) {
+				w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+					return w.changes.SetAbandoned(ctx, tx, "api", ch.Number, "dropped")
+				})
+			}},
+		{name: "the change set back to draft between the replay and the swap", state: change.StateDraft,
+			swap: func(t *testing.T, w *world, ch change.Change) {
+				status, raw := w.Call(t, "PATCH", "/api/v1/workspaces/api/changes/"+strconv.FormatInt(ch.Number, 10),
+					w.ownerKey, map[string]any{"state": change.StateDraft})
+				if status != 200 {
+					t.Errorf("PATCH state draft = %d %s", status, raw)
+				}
+			}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			w := newWorld(t)
 			ch := w.open(t, "feature")
 			if c.before != nil {
-				c.before(t, w)
+				c.before(t, w, ch)
 			}
 			if c.swap != nil {
-				land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) { c.swap(t, w) }})
+				land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) { c.swap(t, w, ch) }})
 			}
-			covered := ch
-			if c.change != nil {
-				c.change(&covered)
+			a := attemptOf(ch, w.caller(), nil, time.Now().UTC())
+			if c.alter != nil {
+				c.alter(&a)
 			}
 
-			a, err := w.runLand(t, covered, w.caller(), nil)
+			a, err := w.run(t, a)
 
 			if err == nil || a.Status != land.StatusFailed || a.Error == nil || *a.Error != land.ErrorInternal || a.LandedSHA != nil {
 				t.Fatalf("run = %v, attempt %s (%v) landed %v; want an error and failed internal", err, a.Status, a.Error, a.LandedSHA)
 			}
-			if got := w.readChange(t, ch.Number).State; got != change.StateOpen {
-				t.Errorf("the change is %s, want open", got)
+			want := cmp.Or(c.state, change.StateOpen)
+			if got := w.readChange(t, ch.Number).State; got != want {
+				t.Errorf("the change is %s, want %s", got, want)
 			}
-			want := w.base
+			main := w.base
 			if c.deleted {
-				want = ""
+				main = ""
 			}
-			if got := head(t, w.api, "main"); got != want {
-				t.Errorf("main is at %q, want %q", got, want)
+			if got := head(t, w.api, "main"); got != main {
+				t.Errorf("main is at %q, want %q", got, main)
 			}
 		})
 	}

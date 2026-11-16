@@ -284,21 +284,44 @@ func TestLand_AdmitsAWriterOfTheTargetAndTheAuthorTheSettingAllows(t *testing.T)
 	for i, c := range []struct {
 		name, credential string
 		byAuthor         bool
-		status           int
-		errorType        string
+		// below, when set, is who opened the change below the author's,
+		// the author from the fork or the owner from api, which is landed
+		// as a stack.
+		below     string
+		status    int
+		errorType string
 	}{
-		{"the owner", w.ownerKey, true, 200, ""},
-		{"the admin token", w.Token, true, 200, ""},
-		{"the author while land.by_author is true", authorKey, true, 200, ""},
-		{"the author while land.by_author is false", authorKey, false, 403, "forbidden"},
-		{"a member who is not the author", otherKey, true, 403, "forbidden"},
-		{"a user who cannot read the workspace", strangerKey, true, 404, "not_found"},
+		{"the owner", w.ownerKey, true, "", 200, ""},
+		{"the admin token", w.Token, true, "", 200, ""},
+		{"the author while land.by_author is true", authorKey, true, "", 200, ""},
+		{"the author while land.by_author is false", authorKey, false, "", 403, "forbidden"},
+		{"a member who is not the author", otherKey, true, "", 403, "forbidden"},
+		{"a user who cannot read the workspace", strangerKey, true, "", 404, "not_found"},
+		{"the author of every change of a stack", authorKey, true, "author", 200, ""},
+		{"the author of a stack whose change below the owner opened", authorKey, true, "owner", 403, "forbidden"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w.configure(t, fmt.Sprintf(`{"changes.auto_restack":false,"land.by_author":%t}`, c.byAuthor))
-			ch := w.openFrom(t, "api--a", dir, "f"+strconv.Itoa(i), author)
+			branch := "f" + strconv.Itoa(i)
+			var ch change.Change
+			var body any
+			switch c.below {
+			case "":
+				ch = w.openFrom(t, "api--a", dir, branch, author)
+			default:
+				var bottom change.Change
+				if c.below == "owner" {
+					bottom = w.open(t, branch+"-below")
+				} else {
+					bottom = w.openFrom(t, "api--a", dir, branch+"-below", author)
+				}
+				commit(t, dir, branch, bottom.HeadSHA, branch, map[string]string{branch + ".txt": branch + "\n"})
+				ch = w.opened(t, change.OpenInput{Workspace: "api", SourceWorkspace: "api--a", SourceBranch: branch,
+					Intent: new("why"), Kind: change.KindRef, Caller: author, DependsOn: &bottom.Number})
+				body = map[string]any{"stack": true}
+			}
 			before, main := w.attempts(t), head(t, w.api, "main")
-			status, raw := w.post(t, c.credential, "api", ch.Number, "", nil)
+			status, raw := w.post(t, c.credential, "api", ch.Number, "", body)
 			var answer map[string]any
 			_ = json.Unmarshal(raw, &answer)
 			if status != c.status || errorType(answer) != c.errorType {
@@ -884,9 +907,12 @@ func TestLand_AnswersAFinalAttemptInTheFormOfItsStatus(t *testing.T) {
 			}},
 		{name: "contention", status: 503, errorType: "land_failed", final: land.StatusFailed, reason: land.ErrorContention,
 			arrange: func(*testing.T, change.Change) { contend.Store(true) }},
+		{name: "a gate that cannot answer", status: 503, errorType: "land_failed", final: land.StatusFailed,
+			reason: land.ErrorInternal, arrange: func(*testing.T, change.Change) { w.land.RegisterGate(failingGate{}) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			defer contend.Store(false)
+			defer w.land.RegisterGate(gate)
 			ch := w.open(t, "s"+strconv.Itoa(i))
 			if c.arrange != nil {
 				c.arrange(t, ch)

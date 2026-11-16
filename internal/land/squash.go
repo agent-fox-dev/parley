@@ -14,8 +14,9 @@ import (
 // commits were replayed onto, given replayed, the head that replay ended
 // at, and became, what each of its own commits became: a commit on onto
 // whose tree is replayed's, whose author is the author of the version's
-// head commit and whose committer is the landing identity committer, with
-// the message squashMessage writes. It is "" when the replay left the tree
+// head commit, with the time and zone of its authorship, and whose
+// committer is the landing identity committer, with the message
+// squashMessage writes. It is "" when the replay left the tree
 // of onto as it was, since the target already holds the change.
 func (c *Component) squash(ctx context.Context, repo *gitrepo.Repo, a Attempt, cov CoveredChange, onto, replayed string,
 	became []gitrepo.ReplayedCommit, committer gitrepo.Signature) (string, error) {
@@ -42,9 +43,17 @@ func (c *Component) squash(ctx context.Context, repo *gitrepo.Repo, a Attempt, c
 	if err != nil {
 		return "", err
 	}
+	// The author's time is read in UTC: the commit keeps the zone the
+	// author wrote in, as a replayed commit does.
+	author := commits[len(commits)-1].Author
+	zone, err := repo.AuthorZone(ctx, cov.Head)
+	if err != nil {
+		return "", fmt.Errorf("squash %s: %w", ref, err)
+	}
+	author.Time = author.Time.In(zone)
 	id, err := repo.CreateCommit(ctx, gitrepo.CommitSpec{
 		Tree: heads[1].Tree, Parents: []string{onto}, Message: squashMessage(ch, commits),
-		Author: commits[len(commits)-1].Author, Committer: committer,
+		Author: author, Committer: committer,
 	})
 	if err != nil {
 		return "", fmt.Errorf("squash %s: %w", ref, err)

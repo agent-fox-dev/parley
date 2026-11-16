@@ -267,8 +267,10 @@ func parseLand(r *http.Request) (landRequest, error) {
 // land (authorize, 403 forbidden), the workspace's status (409, such as
 // workspace_archived), the session (400 unknown_session) and the request
 // guards (askRequestGuards); then, in one store transaction, the land's
-// preconditions (admit, 409) and the creation of the running attempt,
-// which is handed to the pool, and the request waits for it (answer).
+// preconditions (admit, 409), the check that the changes it covers are
+// still those judged before, each at the version judged (409
+// version_mismatch), and the creation of the running attempt, which is
+// handed to the pool, and the request waits for it (answer).
 func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	slug := server.Param(r, "slug")
@@ -297,7 +299,7 @@ func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	}
 	p, _ := identity.PrincipalOf(ctx)
 	caller := change.CallerOf(p)
-	if err := c.authorize(ctx, caller, ch, ws); err != nil {
+	if err := c.authorize(ctx, caller, chain, ws); err != nil {
 		return err
 	}
 	if ws.Ready != nil {
@@ -311,7 +313,8 @@ func (c *Component) landRoute(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := c.askRequestGuards(ctx, RequestInput{Caller: caller, Workspace: slug, Changes: covered(chain),
+	in.judged = covered(chain)
+	if err := c.askRequestGuards(ctx, RequestInput{Caller: caller, Workspace: slug, Changes: in.judged,
 		Override: req.override}); err != nil {
 		return err
 	}

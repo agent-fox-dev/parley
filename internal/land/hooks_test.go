@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,15 +177,19 @@ func TestRun_ReportsEveryFinalAttemptOnceToEachObserver(t *testing.T) {
 }
 
 // requestGuard answers every request with refusal and keeps what it was
-// asked.
+// asked; while it is asked it runs during, when set.
 type requestGuard struct {
 	refusal error
+	during  func()
 
 	mu    sync.Mutex
 	asked []land.RequestInput
 }
 
 func (g *requestGuard) Check(_ context.Context, in land.RequestInput) error {
+	if g.during != nil {
+		g.during()
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.asked = append(g.asked, in)
@@ -255,4 +261,45 @@ func TestLand_AsksTheRequestGuardsBeforeThePreconditions(t *testing.T) {
 			t.Errorf("Start = %+v, %v after %d guard calls; want an attempt and no further call", a, err, len(first.calls()))
 		}
 	})
+}
+
+func TestLand_RefusesALandWhoseChangesMovedOnWhileItWasJudged(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	var moving atomic.Pointer[change.Change]
+	w.land.AddRequestGuard(&requestGuard{during: func() {
+		if ch := moving.Load(); ch != nil {
+			w.nextVersion(t, *ch)
+		}
+	}})
+	for i, c := range []struct {
+		name  string
+		stack bool
+		// moved is the index, in the stack, of the change that gets a new
+		// version while the request guards judge the land.
+		moved int
+	}{
+		{"the change", false, 0},
+		{"the change below in a stack", true, 0},
+		{"the top change of a stack", true, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := []change.Change{w.open(t, "m"+strconv.Itoa(i))}
+			if c.stack {
+				s = w.stack(t, "m"+strconv.Itoa(i)+"-", false, nil, nil)
+			}
+			moving.Store(&s[c.moved])
+			defer moving.Store(nil)
+			before, main := w.attempts(t), head(t, w.api, "main")
+
+			status, answer := w.landCall(t, w.ownerKey, s[len(s)-1].Number, "", map[string]any{"stack": c.stack})
+
+			if status != http.StatusConflict || errorType(answer) != "version_mismatch" {
+				t.Errorf("land = %d %v, want 409 version_mismatch", status, answer)
+			}
+			if n, got := w.attempts(t), head(t, w.api, "main"); n != before || got != main {
+				t.Errorf("the refused land made %d attempts and moved main to %s from %s", n-before, got, main)
+			}
+		})
+	}
 }

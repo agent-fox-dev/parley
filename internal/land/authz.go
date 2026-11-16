@@ -11,25 +11,34 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// authorize admits caller to land the change ch on the workspace ws: the
-// admin token, a user who writes the workspace, which is its owner, and,
-// while the workspace's land.by_author is on, the change's author with
-// any credential of theirs, so that an org member lands the change they
-// opened from their fork into a workspace they only read. Every other
-// caller, who reads the workspace since the route's shared checks passed,
-// is answered 403 forbidden.
-func (c *Component) authorize(ctx context.Context, caller change.Caller, ch change.Change, ws Workspace) error {
+// authorize admits caller to land chain, the changes a land covers,
+// bottom first, the named change last, on the workspace ws: the admin
+// token, a user who writes the workspace, which is its owner, and, while
+// the workspace's land.by_author is on, the author of every change of
+// chain with any credential of theirs, so that an org member lands the
+// changes they opened from their fork into a workspace they only read,
+// and no change of another author with them. Every other caller, who
+// reads the workspace since the route's shared checks passed, is answered
+// 403 forbidden.
+func (c *Component) authorize(ctx context.Context, caller change.Caller, chain []change.Change, ws Workspace) error {
 	if caller.Credential.Type == change.CredentialAdminToken {
 		return nil
 	}
+	ch := chain[len(chain)-1]
 	if caller.UserID != "" {
 		writes, err := c.deps.Access.CanWrite(ctx, caller.UserID, ws.Slug)
 		if err != nil || writes {
 			return err
 		}
-		if ws.ByAuthor && ch.Author.ActorID != nil && *ch.Author.ActorID == caller.UserID {
+		if ws.ByAuthor && !slices.ContainsFunc(chain, func(cov change.Change) bool {
+			return cov.Author.ActorID == nil || *cov.Author.ActorID != caller.UserID
+		}) {
 			return nil
 		}
+	}
+	if len(chain) > 1 {
+		return server.Forbidden(fmt.Sprintf("the stack of %s may be landed only by a writer of %s, the admin token or, "+
+			"while land.by_author is on, the author of each of its changes", ch.Ref, ws.Slug))
 	}
 	return server.Forbidden(fmt.Sprintf("%s may be landed only by a writer of %s, the admin token or, while land.by_author is on, its author",
 		ch.Ref, ws.Slug))

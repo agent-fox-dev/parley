@@ -30,11 +30,18 @@ func (b built) noop() bool { return b.head == b.onto }
 // message and the landing identity as committer. Under the squash
 // strategy each change becomes one commit instead (squash), with the tree
 // its replay ended at. A commit that does not apply ends the replay with
-// its conflict report, completed (conflict).
+// its conflict report, completed (conflict). A version without a base is
+// an error.
 func (c *Component) build(ctx context.Context, repo *gitrepo.Repo, a Attempt, onto string) (built, *gitrepo.ConflictReport, error) {
 	b := built{onto: onto, head: onto, commits: []Commit{}}
 	committer := gitrepo.Signature{Name: c.deps.Committer.Name, Email: c.deps.Committer.Email, Time: c.now()}
 	for _, cov := range a.Covered {
+		if cov.Base == "" {
+			// A version with no base, whose history the target does not
+			// share, has no own commits to tell from the rest: replaying
+			// from no base would land its whole history.
+			return built{}, nil, fmt.Errorf("%s: its version %d has no base on the target", change.Ref(a.Workspace, cov.Number), cov.Version)
+		}
 		head, became, report, err := repo.RebaseFromAs(ctx, cov.Base, cov.Head, b.head, committer)
 		if err != nil {
 			return built{}, nil, fmt.Errorf("replay %s onto %s: %w", change.Ref(a.Workspace, cov.Number), b.head, err)

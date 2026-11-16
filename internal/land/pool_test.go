@@ -2,18 +2,13 @@ package land_test
 
 import (
 	"context"
-	"errors"
-	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
-	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
@@ -89,45 +84,73 @@ func TestPool_RunsAtMostWorkersAttemptsAtOnce(t *testing.T) {
 	}
 }
 
+func TestPool_FreesTheWorkerOfALandBeforeItsFollowUp(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *land.Deps) { d.Workers = 1 })
+	// The hook holds the follow-up of the first land until the test lets
+	// it go.
+	entered, release := make(chan struct{}), make(chan struct{})
+	free := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(free)
+	var held atomic.Bool
+	w.land.AddAfterLanding(func(context.Context, land.AfterLanding) error {
+		if held.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+		return nil
+	})
+	one := w.submit(t, w.open(t, "one"), time.Now().UTC())
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first land's follow-up did not start within 30 s")
+	}
+
+	two := w.submit(t, w.open(t, "two"), time.Now().UTC())
+
+	if got := w.ended(t, two.ID); got.Status != land.StatusLanded {
+		t.Errorf("the second attempt ended %s (%v), want landed", got.Status, got.Error)
+	}
+	if got := w.attempt(t, one.ID); got.Status != land.StatusLanded {
+		t.Errorf("the first attempt reads %s while its follow-up runs, want landed", got.Status)
+	}
+	free()
+	if got := w.ended(t, one.ID); got.Status != land.StatusLanded {
+		t.Errorf("the first attempt ended %s (%v), want landed", got.Status, got.Error)
+	}
+}
+
+// deadlines are attempts that pass their deadline, each in another place.
+var deadlines = []struct {
+	name string
+	// timeout is [land].timeout, 0 for the default, and age how long
+	// before their submission the attempts were created.
+	timeout, age time.Duration
+	// second hands a second attempt to the pool, which waits for its one
+	// worker; hang has the replay run a merge whose command never ends,
+	// in place of parking the attempt before the swap.
+	second, hang bool
+}{
+	{name: "parked before the swap, a second attempt waiting for the worker", timeout: time.Second, second: true},
+	{name: "under the default timeout, created five minutes ago", age: 5*time.Minute - time.Second},
+	{name: "in a git command of the replay", timeout: time.Second, hang: true},
+}
+
 func TestPool_EndsAnAttemptPastItsDeadlineAsTimeout(t *testing.T) {
 	t.Parallel()
-	for _, c := range []struct {
-		name string
-		// timeout is [land].timeout, 0 for the default, and age how long
-		// before their submission the attempts were created.
-		timeout, age time.Duration
-		// second hands a second attempt to the pool, which waits for its
-		// one worker; hang has the replay run a merge whose command never
-		// ends, in place of parking the attempt before the swap.
-		second, hang bool
-	}{
-		{name: "parked before the swap, a second attempt waiting for the worker", timeout: time.Second, second: true},
-		{name: "under the default timeout, created five minutes ago", age: 5*time.Minute - time.Second},
-		{name: "in a git command of the replay", timeout: time.Second, hang: true},
-	} {
+	for _, c := range deadlines {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			dir := t.TempDir()
-			pidFile, attributes := filepath.Join(dir, "pid"), filepath.Join(dir, "attributes")
-			if err := os.WriteFile(attributes, []byte("* merge=hang\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
 			var w *world
+			hanging, pidFile := hangingMerges(t, func(slug string) string { return w.workspaces.RepoPath(slug) })
 			w = newWorld(t, func(d *land.Deps) {
 				d.Workers = 1
 				if c.timeout > 0 {
 					d.Timeout = c.timeout
 				}
 				if c.hang {
-					// Every content merge of the land's replay runs the
-					// merge driver hang, which writes its process id and
-					// sleeps.
-					git := gitrepo.Git{Env: []string{"GIT_CONFIG_COUNT=2",
-						"GIT_CONFIG_KEY_0=merge.hang.driver", "GIT_CONFIG_VALUE_0=echo $$ > " + pidFile + "; exec sleep 60",
-						"GIT_CONFIG_KEY_1=core.attributesFile", "GIT_CONFIG_VALUE_1=" + attributes}}
-					d.Repos = func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
-						return git.Open(ctx, w.workspaces.RepoPath(slug))
-					}
+					d.Repos = hanging
 				}
 			})
 			var mu sync.Mutex
@@ -171,20 +194,7 @@ func TestPool_EndsAnAttemptPastItsDeadlineAsTimeout(t *testing.T) {
 				}
 			}
 			if c.hang {
-				raw, err := os.ReadFile(pidFile)
-				if err != nil {
-					t.Fatalf("the replay never ran the merge driver: %v", err)
-				}
-				pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-				if err != nil {
-					t.Fatal(err)
-				}
-				for deadline := time.Now().Add(10 * time.Second); !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH); {
-					if time.Now().After(deadline) {
-						t.Fatalf("the merge driver's process %d outlived the attempt's deadline by 10 s", pid)
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
+				waitGone(t, pidFile)
 			}
 			mu.Lock()
 			if !c.hang && entered != 1 {

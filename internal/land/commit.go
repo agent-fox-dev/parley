@@ -33,6 +33,35 @@ const (
 	faultAfterBookkeeping = "after-bookkeeping"
 )
 
+// settleTries is how often the record of a land whose target moved is
+// tried, settleBackoff the wait after the first failed try, which grows
+// with each.
+const (
+	settleTries   = 3
+	settleBackoff = 100 * time.Millisecond
+)
+
+// stillOpen refuses, in tx, the land of the attempt a when a change it
+// covers is no longer open, as one abandoned or set back to draft while
+// the attempt ran: a land that moved nothing ends then without moving the
+// target. It is asked in the transaction that enters the move in the
+// journal, the last one before the move. A change abandoned between that
+// transaction and the record of the land is landed all the same: the
+// target holds it by then, and the land is the one record that agrees
+// with the target.
+func (c *Component) stillOpen(ctx context.Context, tx *sql.Tx, a Attempt) error {
+	for _, cov := range a.Covered {
+		ch, err := c.deps.Changes.ReadChange(ctx, tx, a.Workspace, cov.Number)
+		if err != nil {
+			return err
+		}
+		if ch.State != change.StateOpen {
+			return fmt.Errorf("%s is %s since the land attempt %s was created: only an open change lands", ch.Ref, ch.State, a.ID)
+		}
+	}
+	return nil
+}
+
 // commit lands what b built for the attempt a of the target workspace ws:
 // it moves the target from b.onto to b.head with a compare-and-swap, then
 // records the land in one store transaction (settle), then has the push
@@ -60,7 +89,12 @@ func (c *Component) commit(ctx context.Context, repo *gitrepo.Repo, ws Workspace
 	a.Status, a.OntoSHA, a.LandedSHA, a.Noop, a.Commits = StatusLanded, new(b.onto), new(b.head), b.noop(), b.commits
 	a.FinishedAt = new(c.now())
 	if a.Noop {
-		if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return c.settle(ctx, tx, a) }); err != nil {
+		if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+			if err := c.stillOpen(ctx, tx, a); err != nil {
+				return err
+			}
+			return c.settle(ctx, tx, a)
+		}); err != nil {
 			return false, err
 		}
 		c.concluded(ctx, ws, a)
@@ -74,7 +108,12 @@ func (c *Component) commit(ctx context.Context, repo *gitrepo.Repo, ws Workspace
 	if err := c.fault(faultBeforeJournal); err != nil {
 		return false, err
 	}
-	if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return journal(ctx, tx, a, ref) }); err != nil {
+	if err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if err := c.stillOpen(ctx, tx, a); err != nil {
+			return err
+		}
+		return journal(ctx, tx, a, ref)
+	}); err != nil {
 		return false, err
 	}
 	if err := c.fault(faultBeforeSwap); err != nil {
@@ -114,12 +153,24 @@ func (c *Component) commit(ctx context.Context, repo *gitrepo.Repo, ws Workspace
 		return true, err
 	}
 	ctx = context.WithoutCancel(ctx)
-	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		if err := c.settle(ctx, tx, a); err != nil {
-			return err
+	// The target moved: recording the land is all that is left, so a
+	// transaction that fails is tried again before the entry is left to
+	// the next start. Only a running attempt is settled, so a try that
+	// committed although it failed is not recorded twice.
+	for try := 1; ; try++ {
+		err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+			if err := c.settle(ctx, tx, a); err != nil {
+				return err
+			}
+			return c.fault(faultInBookkeeping)
+		})
+		if err == nil || errors.Is(err, errStopped) || errors.Is(err, errFinal) || try == settleTries {
+			break
 		}
-		return c.fault(faultInBookkeeping)
-	})
+		c.deps.Logger.Warn("land attempt: recording the land failed, trying again", "workspace", a.Workspace,
+			"land_id", a.ID, "try", try, "error", err)
+		time.Sleep(time.Duration(try) * settleBackoff)
+	}
 	if err == nil {
 		err = c.fault(faultAfterBookkeeping)
 	}
@@ -259,12 +310,13 @@ ORDER BY rowid`)
 
 // Reconcile completes or drops, at the start before the hub serves, the
 // lands a stop left in the land journal. An entry whose ref holds the head
-// the land moved it to has its land recorded as the engine would have
+// the land moved it to, or a commit after it, has its land recorded as the engine would have
 // recorded it (settle), its events written once; the push event of the
 // move is the ref writer's own journal's. Any other entry moved nothing
 // and is dropped, its attempt left running. An entry whose repository
 // cannot be read, or that cannot be settled, is kept and logged for the
-// next start. A second run finds nothing left to do.
+// next start, and its attempt stays running, not run again (Recover). A
+// second run finds nothing left to do.
 //
 // A land it records has the follow-up a land recorded by its run has, and
 // its final observers are told of it (concluded), since nothing did that
@@ -317,7 +369,9 @@ func (c *Component) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// moved reports whether the ref of e holds the head the land moved it to.
+// moved reports whether the ref of e holds the head the land moved it to,
+// itself or a commit after it: other lands, or pushes, may have moved the
+// target on since the swap when the record of the land failed.
 func (c *Component) moved(ctx context.Context, e entry) (bool, error) {
 	repo, err := c.deps.Repos(ctx, e.workspace)
 	if err != nil {
@@ -327,5 +381,12 @@ func (c *Component) moved(ctx context.Context, e entry) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return values[e.ref] == e.new, nil
+	at, found := values[e.ref]
+	switch {
+	case !found:
+		return false, nil
+	case at == e.new:
+		return true, nil
+	}
+	return repo.IsAncestor(ctx, e.new, at)
 }

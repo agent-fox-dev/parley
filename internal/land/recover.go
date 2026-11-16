@@ -15,9 +15,15 @@ import (
 // is handed over twice; the pool runs them while requests are served. An
 // attempt keeps its id, its creation and who asked for it, whose land its
 // events are.
+//
+// An attempt whose entry in the land journal Reconcile kept is left out:
+// its target may have moved, which only the record of that land may end,
+// so it stays running, its entry kept for the next start to complete,
+// rather than run again.
 func (c *Component) Recover(ctx context.Context) error {
 	running, err := readAttempts(ctx, c.deps.Store.Main(), `SELECT `+attemptColumns+` FROM land_attempts a
-WHERE a.status = 'running' ORDER BY a.created_at, a.id`)
+WHERE a.status = 'running' AND NOT EXISTS (SELECT 1 FROM land_journal j WHERE j.land_id = a.id)
+ORDER BY a.created_at, a.id`)
 	if err != nil {
 		return err
 	}

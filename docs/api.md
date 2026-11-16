@@ -4404,8 +4404,15 @@ tries (10 unless the configuration says otherwise) the attempt ends
 `failed` with `error` `contention`, nothing of it in the target and
 the change still `open`, so a new land may follow. A target branch that
 does not exist when the attempt reads or moves it, or a policy gate,
-store or git failure other than a conflict, ends the attempt `failed`
-with `error` `internal`; a land never creates its target branch. The
+store or git failure other than a conflict, a policy gate or override
+rule that fails or panics, and a change version without a base (one whose
+history the target does not share, `base_sha` `null`), ends the attempt
+`failed` with `error` `internal`; a land never creates its target branch.
+So does a change that is no longer `open` when the target is about to
+move, abandoned or set back to `draft` while the attempt ran: the target
+does not move and the change keeps its state. A change abandoned in the
+moment after that check, while the target moves, is `landed` all the
+same, since the target holds it then. The
 move is followed by one store transaction
 that marks each change `landed` (`landed` = `{sha, at, by, land_id,
 commits}`, every landed commit then found by the change's by-commit
@@ -4423,7 +4430,8 @@ says `noop` `true`, and no `parley.git.push` is written.
 An attempt with the strategy `squash` replays each change's own commits
 the same way, then makes of each change one commit on the head it was
 replayed onto: its tree is the one the replay ended at, its author the
-author of the version's head commit, its committer the landing identity,
+author of the version's head commit, with its author date and that date's
+time zone, its committer the landing identity,
 and its message the change's title, a blank line, its intent and a blank
 line (both left out for a change without an intent), and the trailers:
 `Parley-Change: <slug>#<number>`, then `Parley-Session: <id>` when the
@@ -4510,7 +4518,8 @@ move is allowed.
 Once a land is recorded, a land that moved nothing included, the hub does
 its follow-up, each step on its own: a step that fails is logged and
 changes neither the attempt, nor the answer to the call, nor the steps
-after it. The answer to the call waits for the follow-up.
+after it. The answer to the call waits for the follow-up, which takes no
+worker of the pool: a follow-up that takes long delays no other land.
 
 - The source branch of each landed change is deleted, in the change's
   source workspace, when the target workspace's setting
@@ -4561,9 +4570,13 @@ comes up, before it serves a request, in one of two states: the target at
 its old head, the change `open`, no `parley.change.land` event and the
 attempt not `landed`; or the target at the new head, the change `landed`
 with every landed commit mapped, the attempt `landed` and the land's
-events written once. A land the start completes gets its follow-up (above)
+events written once, also when other writes moved the target on after
+the move. A land the start completes gets its follow-up (above)
 then; a land recorded before the stop does not get it again, so a stop
-during its follow-up leaves the rest of it undone.
+during its follow-up leaves the rest of it undone. A journal entry the
+start cannot complete, such as one whose repository cannot be read, is
+kept for the next start, and its attempt stays `running` and is not run
+again until the entry is completed.
 
 The three reads need the scope `changes:read` and read access to
 `{slug}`. Both lists are [lists](#lists) ordered newest first: by
@@ -4612,8 +4625,10 @@ nothing:
 5. who may land: the admin token, the owner of `{slug}`, and, while the
    workspace setting `land.by_author` is `true` (its default), the
    change's author with any credential of theirs, such as an org member
-   landing the change they opened from their fork. Anyone else who reads
-   `{slug}` gets `403` `forbidden`;
+   landing the change they opened from their fork; with `stack`, the
+   author of every change the land covers, so that a change below by
+   someone else makes it `403`. Anyone else who reads `{slug}` gets `403`
+   `forbidden`;
 6. the state of `{slug}`: `409` `workspace_archived`, `workspace_busy` or
    `workspace_not_ready`;
 7. `session_id` must pass the session-linking rule: `400`
@@ -4636,7 +4651,10 @@ nothing:
       lands of one change that arrive at the same moment, exactly one
       creates an attempt and the others get this answer;
    4. without `stack`, every change down the change's `depends_on` is
-      `landed`: `409` `depends_on_unlanded`.
+      `landed`: `409` `depends_on_unlanded`;
+   5. the changes the land covers, each at its version, are those the
+      checks 4, 5 and 8 judged: a change that got a new version, or a
+      stack whose changes changed, since then is `409` `version_mismatch`.
 
    Only `land_in_progress` carries `details`.
 

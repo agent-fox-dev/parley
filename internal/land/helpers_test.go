@@ -4,14 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"uuid"
@@ -751,4 +754,95 @@ func (g *stubGate) asked() []land.GateInput {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return slices.Clone(g.calls)
+}
+
+// points runs what a test sets at each point of the atomic step of the
+// world's land component, and before each swap as "before-swap", in the
+// pool's goroutine; the errors it returns are kept for the test, not given
+// to the engine.
+type points struct {
+	mu     sync.Mutex
+	run    func(point string) error
+	failed []error
+}
+
+// atPoints sets the seams of the world's land component to the points it
+// returns.
+func (w *world) atPoints() *points {
+	p := &points{}
+	land.SetSeams(w.land, land.Seams{
+		BeforeSwap: func(context.Context, string, int) { p.at("before-swap") },
+		Fault: func(point string) error {
+			if point != "before-swap" {
+				p.at(point)
+			}
+			return nil
+		},
+	})
+	return p
+}
+
+func (p *points) at(point string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.run == nil {
+		return
+	}
+	if err := p.run(point); err != nil {
+		p.failed = append(p.failed, err)
+	}
+}
+
+// set makes run (nil for nothing) what runs at each point until the test
+// ends, and returns what reports the errors it returned.
+func (p *points) set(t *testing.T, run func(point string) error) func() error {
+	p.mu.Lock()
+	p.run, p.failed = run, nil
+	p.mu.Unlock()
+	t.Cleanup(func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.run = nil
+	})
+	return func() error {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return errors.Join(p.failed...)
+	}
+}
+
+// hangingMerges is a Deps.Repos that opens the repository of a workspace
+// at path(slug) so that every content merge runs the merge driver hang,
+// which writes its process id to pidFile and sleeps for a minute.
+func hangingMerges(t *testing.T, path func(slug string) string) (repos func(context.Context, string) (*gitrepo.Repo, error), pidFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	pidFile, attributes := filepath.Join(dir, "pid"), filepath.Join(dir, "attributes")
+	if err := os.WriteFile(attributes, []byte("* merge=hang\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git := gitrepo.Git{Env: []string{"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=merge.hang.driver", "GIT_CONFIG_VALUE_0=echo $$ > " + pidFile + "; exec sleep 60",
+		"GIT_CONFIG_KEY_1=core.attributesFile", "GIT_CONFIG_VALUE_1=" + attributes}}
+	return func(ctx context.Context, slug string) (*gitrepo.Repo, error) { return git.Open(ctx, path(slug)) }, pidFile
+}
+
+// waitGone waits until the process whose id pidFile holds is gone, at
+// most 10 s.
+func waitGone(t *testing.T, pidFile string) {
+	t.Helper()
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("the process never wrote its id: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH); {
+		if time.Now().After(deadline) {
+			t.Fatalf("the process %d outlived its deadline by 10 s", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

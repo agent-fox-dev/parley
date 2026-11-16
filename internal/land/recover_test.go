@@ -3,14 +3,17 @@ package land_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
@@ -96,5 +99,55 @@ func TestRecover_RunsTheAttemptsAStopLeftRunningToTheirEnd(t *testing.T) {
 		events[0].ActorType != change.CredentialAPIKey || events[0].ActorID == nil || *events[0].ActorID != w.owner ||
 		events[0].SessionID == nil || *events[0].SessionID != s {
 		t.Errorf("parley.change.land events of change 1 = %+v, want one by the owner's API key in session %s", events, s)
+	}
+}
+
+func TestRecover_LeavesAnAttemptWhoseJournalEntryIsKeptRunning(t *testing.T) {
+	t.Parallel()
+	// The second start cannot read api's repository, so the journal entry
+	// the stop left cannot be completed then; the third can.
+	var broken atomic.Bool
+	w := newWorld(t, func(d *land.Deps) {
+		repos := d.Repos
+		d.Repos = func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
+			if broken.Load() {
+				return nil, errors.New("the repository cannot be read")
+			}
+			return repos(ctx, slug)
+		}
+	})
+	ctx := context.Background()
+	ch := w.open(t, "feature")
+	stop := errors.New("the hub stops")
+	land.SetSeams(w.land, land.Seams{Fault: func(point string) error {
+		if point == "after-swap" {
+			return stop
+		}
+		return nil
+	}})
+	a, err := w.runLand(t, ch, w.caller(), nil)
+	if !errors.Is(err, stop) {
+		t.Fatalf("run = %v, want it stopped after the swap", err)
+	}
+	moved := head(t, w.api, "main")
+
+	broken.Store(true)
+	w.Restart(t)
+
+	if got := w.ended(t, a.ID); got.Status != land.StatusRunning {
+		t.Errorf("the attempt whose entry was kept ended %s (%v), want still running", got.Status, got.Error)
+	}
+	if n, err := land.Journalled(ctx, w.Store); err != nil || n != 1 {
+		t.Errorf("%d journal entries (%v), want the one kept", n, err)
+	}
+
+	broken.Store(false)
+	w.Restart(t)
+
+	if got := w.ended(t, a.ID); got.Status != land.StatusLanded || got.LandedSHA == nil || *got.LandedSHA != moved {
+		t.Errorf("after the next start the attempt is %s landing %v, want landed at %s", got.Status, got.LandedSHA, moved)
+	}
+	if got := w.readChange(t, ch.Number).State; got != change.StateLanded {
+		t.Errorf("the change is %s, want landed", got)
 	}
 }

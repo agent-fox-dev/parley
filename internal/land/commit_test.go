@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -26,15 +27,19 @@ func TestCommit_ComesUpLandedOrUntouchedAfterAStopAtEachPoint(t *testing.T) {
 	// The follow-up of a land the start records runs then, with its source
 	// branch deleted; that of a land recorded before the stop does not run
 	// again.
+	// A land whose target another writer moved on after the swap and before
+	// the start is recorded all the same.
 	for _, c := range []struct {
-		point            string
-		landed, followed bool
+		point                     string
+		landed, followed, movedOn bool
 	}{
-		{"before-journal", false, false},
-		{"before-swap", false, false},
-		{"after-swap", true, true},
-		{"in-bookkeeping", true, true},
-		{"after-bookkeeping", true, false},
+		{"before-journal", false, false, false},
+		{"before-swap", false, false, false},
+		{"after-swap", true, true, false},
+		{"after-swap, the target moved on since", true, true, true},
+		{"in-bookkeeping", true, true, false},
+		{"in-bookkeeping, the target moved on since", true, true, true},
+		{"after-bookkeeping", true, false, false},
 	} {
 		t.Run(c.point, func(t *testing.T) {
 			t.Parallel()
@@ -45,7 +50,7 @@ func TestCommit_ComesUpLandedOrUntouchedAfterAStopAtEachPoint(t *testing.T) {
 			ch := w.open(t, "feature")
 			stop := errors.New("the hub stops")
 			land.SetSeams(w.land, land.Seams{Fault: func(point string) error {
-				if point == c.point {
+				if strings.HasPrefix(c.point, point+",") || point == c.point {
 					return stop
 				}
 				return nil
@@ -53,6 +58,11 @@ func TestCommit_ComesUpLandedOrUntouchedAfterAStopAtEachPoint(t *testing.T) {
 			a, err := w.runLand(t, ch, w.caller(), nil)
 			if !errors.Is(err, stop) {
 				t.Fatalf("run = %v, want it stopped at %s", err, c.point)
+			}
+
+			swapped := head(t, w.api, "main")
+			if c.movedOn {
+				commit(t, w.api, "main", swapped, "on", map[string]string{"on.txt": "on\n"})
 			}
 
 			w.Restart(t)
@@ -86,7 +96,10 @@ func TestCommit_ComesUpLandedOrUntouchedAfterAStopAtEachPoint(t *testing.T) {
 				if landed.LandedSHA == nil {
 					t.Fatalf("attempt = %s with nothing landed, want landed", landed.Status)
 				}
-				want = landState{Main: *landed.LandedSHA, Source: ch.HeadSHA, Change: change.StateLanded,
+				if *landed.LandedSHA != swapped {
+					t.Errorf("the attempt landed %s, want %s, the head the swap moved main to", *landed.LandedSHA, swapped)
+				}
+				want = landState{Main: head(t, w.api, "main"), Source: ch.HeadSHA, Change: change.StateLanded,
 					Attempt: land.StatusLanded, Mapped: 1, Lands: 1, Pushes: 1}
 			}
 			if c.followed {
