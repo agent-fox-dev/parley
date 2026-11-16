@@ -42,10 +42,7 @@ func (gitTimeout) Is(target error) bool { return target == gitrepo.ErrDeadline }
 //     cred, the credential the operation presents, are removed. The error
 //     still matches what op's error matches (errors.Is, errors.As).
 func RunGit(ctx context.Context, limit time.Duration, cred gitrepo.Credential, op func(ctx context.Context, deadline time.Duration) error) error {
-	deadline := DefaultGitDeadline
-	if limit > 0 && limit < deadline {
-		deadline = limit
-	}
+	deadline := gitDeadline(limit)
 	opCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	err := op(opCtx, deadline)
@@ -56,6 +53,16 @@ func RunGit(ctx context.Context, limit time.Duration, cred gitrepo.Credential, o
 		return fmt.Errorf("%w (%v)", ErrGitTimeout, deadline)
 	}
 	return &cleanedError{text: gitrepo.SanitizeGitText(err.Error(), cred.Username, cred.Password), err: err}
+}
+
+// gitDeadline is the deadline a git operation given limit runs under:
+// limit when it is positive and shorter than DefaultGitDeadline, else
+// DefaultGitDeadline.
+func gitDeadline(limit time.Duration) time.Duration {
+	if limit > 0 && limit < DefaultGitDeadline {
+		return limit
+	}
+	return DefaultGitDeadline
 }
 
 // cleanedError is an error of git whose text was cleaned of credentials:

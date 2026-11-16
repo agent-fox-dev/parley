@@ -443,10 +443,13 @@ func purgeDeleted(ctx context.Context, tx *sql.Tx, slug, branch string) (bool, e
 // deleteBackupRef deletes the backup ref of branch in the copy of the
 // workspace slug, once the deleted patch it belonged to is gone. The patch
 // is registered whatever happens here, so a failure is logged, with the
-// ref, and not answered.
+// ref, and not answered. It runs to its end, under RunGit's deadline, also
+// when the request's client has left: the patch is committed by then, and
+// a ref left behind would show the removed patch's commit as the new
+// one's replaced_sha.
 func (c *Component) deleteBackupRef(ctx context.Context, slug, branch string) {
 	ref := ReplacedRefPrefix + branch
-	err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+	err := RunGit(context.WithoutCancel(ctx), 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
 		repo, err := c.d.Git.Open(ctx, c.d.RepoPath(slug))
 		if err != nil {
 			return err

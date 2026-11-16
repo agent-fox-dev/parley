@@ -453,6 +453,23 @@ func TestAdd_ReplacesSoftDeletedPatch(t *testing.T) {
 	})
 }
 
+func TestDeleteBackupRef_OutlivesTheRequest(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "carry.git")
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"p1", commitIn(t, dir, "replaced"))
+	comp := &carrypatch.Component{}
+	comp.Bind(carrypatch.Deps{RepoPath: func(string) string { return dir }})
+	// The client left right after the add's transaction committed.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	carrypatch.DeleteBackupRef(ctx, comp, "carry", "p1")
+	if id := refIn(dir, carrypatch.ReplacedRefPrefix+"p1"); id != "" {
+		t.Errorf("the backup ref of p1 is still at %s after the request ended", id)
+	}
+}
+
 func TestAdd_Concurrent(t *testing.T) {
 	t.Parallel()
 	h := startAddHub(t)

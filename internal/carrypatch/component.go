@@ -23,9 +23,9 @@ type Deps struct {
 	Git gitrepo.Git
 	// RepoPath is the git directory of the copy of the workspace slug.
 	RepoPath func(slug string) string
-	// UpstreamFetchDeadline, when positive, replaces DefaultGitDeadline as
-	// the deadline of each git operation of an upstream fetch; only tests
-	// set it.
+	// UpstreamFetchDeadline, when positive and shorter, replaces
+	// DefaultGitDeadline as the one deadline of a whole upstream fetch;
+	// only tests set it.
 	UpstreamFetchDeadline time.Duration
 	// Settings is the registry of the workspace settings, through which
 	// ResolveBranch reads a workspace's patch_branch_source; nil reads it

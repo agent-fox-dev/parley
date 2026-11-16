@@ -32,8 +32,10 @@ The package asks the upstream for its default branch after the fetch.
 `FetchUpstream` lists the upstream (`ls-remote`) first, then fetches, then
 writes `parley.upstreamDefaultBranch`, so that a failure of either network
 operation leaves the upstream refs and the recorded default branch as they
-were. Both run under the one 10-minute limit of the runner, each with its
-own deadline.
+were. Both, and the write of the record after them, share one 10-minute
+deadline set when the fetch starts: each runs through the runner with what
+the earlier ones left of it, so that the whole upstream fetch, the listing
+included, never takes longer than 10 minutes.
 
 ## The set-up's error tells a missing base from a failed fetch
 

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -171,13 +173,17 @@ func (c *Component) replacedSHA(ctx context.Context, slug, branch string) string
 	if c.d.RepoPath == nil {
 		return ""
 	}
-	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(slug))
-	if err != nil {
-		return ""
-	}
-	ref, found, err := repo.LookupRef(ctx, ReplacedRefPrefix+branch)
-	if err != nil || !found {
-		return ""
-	}
-	return ref.Commit
+	var replaced string
+	_ = RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		repo, err := c.d.Git.Open(ctx, c.d.RepoPath(slug))
+		if err != nil {
+			return err
+		}
+		ref, found, err := repo.LookupRef(ctx, ReplacedRefPrefix+branch)
+		if err == nil && found {
+			replaced = ref.Commit
+		}
+		return err
+	})
+	return replaced
 }

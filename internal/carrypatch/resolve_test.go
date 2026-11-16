@@ -239,6 +239,11 @@ func TestResolveBranch_OriginFetchFailed(t *testing.T) {
 			o.Close()
 			return o.URL(), o.Env(), nil
 		}, nil, ""},
+		{"origin with a password in its URL is stopped", func(t *testing.T) (string, []string, *atomic.Int32) {
+			o := tokenOrigin(t)
+			o.Close()
+			return strings.Replace(o.URL(), "https://", "https://someone:url-secret@", 1), o.Env(), nil
+		}, nil, ""},
 		{"origin answers 401 to GIT_PAT", func(t *testing.T) (string, []string, *atomic.Int32) {
 			o := gitrepotest.NewOrigin(t, gitrepotest.WithBasicAuth("x-token-auth", "another-token"))
 			o.Commit("p6", "on origin")
@@ -286,7 +291,7 @@ func TestResolveBranch_OriginFetchFailed(t *testing.T) {
 			if !strings.Contains(e.Message(), c.why) {
 				t.Errorf("the message %q does not name the cause %q", e.Message(), c.why)
 			}
-			if strings.Contains(e.Message(), originToken) || strings.Contains(e.Message(), "another-token") {
+			if strings.Contains(e.Message(), originToken) || strings.Contains(e.Message(), "another-token") || strings.Contains(e.Message(), "url-secret") {
 				t.Errorf("the message shows a credential: %s", e.Message())
 			}
 			if refs := gitrepotest.Refs(t, f.copy, ""); len(refs) != 0 {

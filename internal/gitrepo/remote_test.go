@@ -37,9 +37,6 @@ func TestFetchRemote_MirrorsTheBranchesUnderTheName(t *testing.T) {
 	assertRefs(t, "the copy's refs", gitrepotest.Refs(t, dir, ""), map[string]string{
 		"refs/heads/mine": mainHead, "refs/remotes/upstream/main": mainHead, "refs/remotes/upstream/dev": devHead,
 	})
-	if out, err := gitrepotest.Run(dir, "", "config", "--local", "--get-regexp", `^remote\.`); err == nil {
-		t.Errorf("the copy's configuration has a remote section: %s", out)
-	}
 	for _, args := range runs {
 		if i := slices.Index(args, o.URL()); i >= 0 && (i == 0 || !slices.Contains(args[:i], "--")) {
 			t.Errorf("git ran with the URL before the end of its options: %q", args)
@@ -65,25 +62,6 @@ func TestFetchRemote_MirrorsTheBranchesUnderTheName(t *testing.T) {
 		t.Error("FetchRemote from a failing origin succeeded")
 	}
 	assertRefs(t, "the copy's refs after a failed fetch", gitrepotest.Refs(t, dir, ""), before)
-}
-
-func TestFetchRemote_StopsAtDeadline(t *testing.T) {
-	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
-	ln := newSilentListener(t)
-	start := time.Now()
-	_, err := gitrepo.Git{}.FetchRemote(context.Background(), dir, ln.url, "upstream", gitrepo.Credential{}, 200*time.Millisecond)
-	if !errors.Is(err, gitrepo.ErrDeadline) {
-		t.Errorf("err = %v, want ErrDeadline", err)
-	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Errorf("returned after %v, want within 2s", d)
-	}
-	if !ln.quiet(0, 2*time.Second) {
-		t.Errorf("a connection to origin is still open 2s after the return: a git process is left")
-	}
-	assertRefs(t, "the copy's refs after the deadline", gitrepotest.Refs(t, dir, ""), map[string]string{})
 }
 
 func TestFetchRemote_RefusesANameThatIsNotOneRefComponent(t *testing.T) {

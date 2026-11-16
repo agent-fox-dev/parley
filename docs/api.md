@@ -2662,8 +2662,9 @@ password); `UPSTREAM_GIT_USERNAME` with `UPSTREAM_GIT_PASSWORD` when both
 are not empty; the workspace's origin credential (`GIT_PAT`, else
 `GIT_USERNAME` with `GIT_PASSWORD`); none. A rotated secret counts at the
 next use. A secret that cannot be read fails the fetch without contacting
-the upstream; there is no anonymous attempt. One upstream fetch may take
-10 minutes; past that its git process is stopped and the fetch has failed.
+the upstream; there is no anonymous attempt. One upstream fetch, the listing
+of the upstream's branches included, may take 10 minutes in all; past that
+its git process is stopped and the fetch has failed.
 
 ### The patch object
 

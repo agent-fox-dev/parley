@@ -5196,7 +5196,10 @@ cred, deadline)` (every branch into `refs/remotes/upstream/*` through a
 private namespace, pruned, no tags, no remote configuration), and then sets
 or unsets the copy's `parley.upstreamDefaultBranch`
 (`Repo.UnsetConfig`); a failure changes no ref and not the recorded
-branch. `UpstreamBase(ctx, w)` reads only the copy:
+branch. The three share one deadline, `DefaultGitDeadline` or the shorter
+`Deps.UpstreamFetchDeadline`, set when the call starts: each runs through
+`RunGit` with what the earlier ones left of it, and a passed deadline is
+`ErrGitTimeout`. `UpstreamBase(ctx, w)` reads only the copy:
 `refs/remotes/upstream/<recorded default>`, else
 `refs/remotes/upstream/<default_branch>`, else `ErrNoUpstreamBase`.
 
@@ -5240,8 +5243,10 @@ validation: it reads the record the access decision names with
 than `carry_patch` (a fork's mode is always `standard`), and for a write
 route applies `workspace.RequireReady`. The reads (`read.go`) page one
 total order, `{d, p, t, i}`: the live patches by position, then the deleted
-ones by `deleted_at` descending and id, one store query of `Limit+1` rows
-per page; the single read adds `replaced_sha` from
+ones by `deleted_at` descending and id, up to `Limit+1` rows per page from
+one store query, or from two when the page runs from the live patches into
+the deleted ones (the second asks only for the rows the first left); the
+single read adds `replaced_sha` from
 `refs/parley/replaced/<branch>` (`ReplacedRefPrefix`) when it resolves. The
 add (`add.go`, `batch.go`) decodes one object or an array, validates every
 element before the guard, checks every branch against the live patches

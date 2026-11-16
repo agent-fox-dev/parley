@@ -34,13 +34,30 @@ var ErrNoUpstreamBase = errors.New("no upstream base: the copy holds no upstream
 // its error is returned and no git runs, so that no anonymous request is
 // made in its place.
 //
-// Each git operation runs through RunGit, with DefaultGitDeadline: when it
-// passes, the error matches ErrGitTimeout. The error text has no
-// credential. A fetch that fails leaves the upstream refs and the recorded
-// default branch as they were: the default branch is asked for first, and
-// the refs and the record change only after both git operations with the
-// upstream succeeded.
+// The whole fetch, the listing and the record included, has one deadline,
+// DefaultGitDeadline or the shorter Deps.UpstreamFetchDeadline, so that
+// an upstream that answers slowly cannot hold the workspace for a
+// deadline per git operation: each runs through RunGit with what the
+// earlier ones left of it, and when the deadline passes the error matches
+// ErrGitTimeout. The error text has no credential. A fetch that fails
+// leaves the upstream refs and the recorded default branch as they were:
+// the default branch is asked for first, and the refs and the record
+// change only after both git operations with the upstream succeeded.
 func (c *Component) FetchUpstream(ctx context.Context, w workspace.Workspace) error {
+	limit := gitDeadline(c.d.UpstreamFetchDeadline)
+	end := time.Now().Add(limit)
+	run := func(cred gitrepo.Credential, op func(ctx context.Context, deadline time.Duration) error) error {
+		left := time.Until(end)
+		if left <= 0 {
+			return fmt.Errorf("%w (%v)", ErrGitTimeout, limit)
+		}
+		err := RunGit(ctx, left, cred, op)
+		if errors.Is(err, ErrGitTimeout) {
+			// RunGit names the time that was left; the caller set limit.
+			return fmt.Errorf("%w (%v)", ErrGitTimeout, limit)
+		}
+		return err
+	}
 	if w.UpstreamURL == nil || *w.UpstreamURL == "" {
 		return fmt.Errorf("fetch the upstream of %s: the workspace has no upstream_url", w.Slug)
 	}
@@ -54,7 +71,7 @@ func (c *Component) FetchUpstream(ctx context.Context, w workspace.Workspace) er
 		return fmt.Errorf("fetch the upstream of %s: %w", w.Slug, err)
 	}
 	var remote gitrepo.Remote
-	err = RunGit(ctx, c.d.UpstreamFetchDeadline, cred, func(ctx context.Context, _ time.Duration) error {
+	err = run(cred, func(ctx context.Context, _ time.Duration) error {
 		var listErr error
 		remote, listErr = c.d.Git.ListRemote(ctx, url, cred)
 		return listErr
@@ -62,14 +79,14 @@ func (c *Component) FetchUpstream(ctx context.Context, w workspace.Workspace) er
 	if err != nil {
 		return fmt.Errorf("ask the upstream of %s for its branches: %w", w.Slug, err)
 	}
-	err = RunGit(ctx, c.d.UpstreamFetchDeadline, cred, func(ctx context.Context, deadline time.Duration) error {
+	err = run(cred, func(ctx context.Context, deadline time.Duration) error {
 		_, err := c.d.Git.FetchRemote(ctx, repo.Dir(), url, UpstreamRemote, cred, deadline)
 		return err
 	})
 	if err != nil {
 		return fmt.Errorf("fetch the upstream of %s: %w", w.Slug, err)
 	}
-	err = RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+	err = run(gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
 		if remote.DefaultBranch == "" {
 			return repo.UnsetConfig(ctx, upstreamDefaultKey)
 		}

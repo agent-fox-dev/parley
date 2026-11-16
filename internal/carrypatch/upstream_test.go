@@ -173,6 +173,11 @@ func TestFetchUpstream_FailureChangesNothing(t *testing.T) {
 				RepoPath: func(string) string { return f.copy },
 			})
 		}},
+		{"the upstream URL with a password in it is stopped", func(f *upstreamFixture, up *gitrepotest.Origin) {
+			up.Close()
+			withUser := strings.Replace(up.URL(), "https://", "https://someone:url-secret@", 1)
+			f.ws.UpstreamURL = &withUser
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -197,7 +202,7 @@ func TestFetchUpstream_FailureChangesNothing(t *testing.T) {
 			if err == nil {
 				t.Fatal("FetchUpstream succeeded, want an error")
 			}
-			if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "another-token") {
+			if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "another-token") || strings.Contains(err.Error(), "url-secret") {
 				t.Errorf("the error shows a credential: %v", err)
 			}
 			if got := gitrepotest.Refs(t, f.copy, ""); !maps.Equal(got, before) {
@@ -241,22 +246,16 @@ func TestFetchUpstream_StopsAtDeadline(t *testing.T) {
 	// An upstream that takes each request and never answers it: a request
 	// ends only when the git process holding its connection is gone.
 	var seen, open atomic.Int32
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	url, env := tlsUpstream(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		seen.Add(1)
 		open.Add(1)
 		defer open.Add(-1)
 		<-r.Context().Done()
 	}))
-	t.Cleanup(srv.Close)
-	ca := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	// The deadline leaves git time to start and reach the upstream also on
 	// a loaded machine, where 200 ms did not.
 	const deadline = time.Second
-	f := newUpstreamFixture(t, srv.URL+"/upstream.git", []string{"GIT_SSL_CAINFO=" + ca},
-		secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, deadline)
+	f := newUpstreamFixture(t, url, env, secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, deadline)
 	gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/upstream/main", commitIn(t, f.copy, "base"))
 	before := gitrepotest.Refs(t, f.copy, "")
 
@@ -279,6 +278,60 @@ func TestFetchUpstream_StopsAtDeadline(t *testing.T) {
 	if got := gitrepotest.Refs(t, f.copy, ""); !maps.Equal(got, before) {
 		t.Errorf("the copy's refs = %v, want them as before %v", got, before)
 	}
+}
+
+func TestFetchUpstream_OneDeadlineForListingAndFetch(t *testing.T) {
+	t.Parallel()
+	up := gitrepotest.NewOrigin(t)
+	up.Commit("main", "one")
+	// The upstream answers the listing late, with part of the deadline
+	// left, and never answers the fetch that follows: info/refs is the
+	// first request of each.
+	const deadline, listing = 2 * time.Second, 1200 * time.Millisecond
+	var infoRefs atomic.Int32
+	files := http.StripPrefix("/upstream.git", http.FileServer(http.Dir(up.Dir())))
+	url, env := tlsUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/info/refs") {
+			wait := time.After(listing)
+			if infoRefs.Add(1) > 1 {
+				wait = nil
+			}
+			select {
+			case <-wait:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		files.ServeHTTP(w, r)
+	}))
+	f := newUpstreamFixture(t, url, env, secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, deadline)
+
+	start := time.Now()
+	err := f.comp.FetchUpstream(context.Background(), f.ws)
+	if !errors.Is(err, carrypatch.ErrGitTimeout) || !errors.Is(err, gitrepo.ErrDeadline) {
+		t.Errorf("err = %v, want the deadline error", err)
+	}
+	// The fetch had only what the listing left of the deadline; with one
+	// of its own it would end after listing+deadline.
+	if d := time.Since(start); d > deadline+time.Second {
+		t.Errorf("FetchUpstream returned after %v, want within 1s of the deadline %v", d, deadline)
+	}
+	if got := gitrepotest.Refs(t, f.copy, ""); len(got) != 0 {
+		t.Errorf("the copy's refs = %v, want none", got)
+	}
+}
+
+// tlsUpstream serves h over TLS until the test ends and returns the URL of
+// a repository on it and the variables a git that trusts it runs with.
+func tlsUpstream(t *testing.T, h http.Handler) (url string, env []string) {
+	t.Helper()
+	srv := httptest.NewTLSServer(h)
+	t.Cleanup(srv.Close)
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return srv.URL + "/upstream.git", []string{"GIT_SSL_CAINFO=" + ca}
 }
 
 func TestUpstreamBase_Rule(t *testing.T) {
