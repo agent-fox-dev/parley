@@ -17,14 +17,14 @@ const policyHook = "policy"
 
 // composePolicy adds the landing policy: the schema of the policy
 // revisions and of the verdicts and check results it counts, the policy
-// routes and the route that records verdicts, whose scope, binding and
-// access the shared checks decide, and the component, bound in a start
-// hook to the store, to the workspace
-// records, to the users of the identity records, to the event component,
-// to the change component, to the workspaces' repositories, to the hub's
-// clock and to its logger. Its evidence source is its own facts, the
-// verdicts it records, registered in place of the one that reads none;
-// tests register their own on the instance after it.
+// routes and the routes of the verdicts and check results, whose scope,
+// binding and access the shared checks decide, and the component, bound in
+// a start hook to the store, to the workspace records, to the users of the
+// identity records, to the event component, to the change component, to
+// the workspaces' repositories, to the hub's clock and to its logger. Its
+// evidence source is its own facts, the verdicts and check results it
+// records, registered in place of the one that reads none; tests register
+// their own on the instance after it.
 //
 // It comes before the change component's part, so that the component is
 // bound before the change component's own start hooks record versions,
@@ -75,10 +75,14 @@ func composePolicy(c *Composition) {
 // It also adds, after the mergeability observer, the version observer that
 // carries a version's verdicts to a new version patch-equivalent to it; the
 // change component tells it after the version's landing is stored, and it
-// evaluates the landing again when it carried any.
+// evaluates the landing again when it carried any. And it registers the
+// expanders of the change read's include names approvals and checks: the
+// verdicts on the current version and the results that apply to it.
 func composePolicyEvaluation(c *Composition) {
 	c.changes.RegisterLandingEvaluator(c.policy)
 	c.changes.AddVersionObserver(c.policy.VersionObserver())
+	c.changes.RegisterExpander("approvals", c.policy.ExpandApprovals)
+	c.changes.RegisterExpander("checks", c.policy.ExpandChecks)
 	c.land.RegisterGate(policyGate{c.policy})
 }
 

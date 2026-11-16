@@ -2,13 +2,22 @@ package policy_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"reflect"
+	"slices"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/policy"
 )
 
 // approves and rejects are the bodies of a verdict on the current version.
@@ -348,5 +357,292 @@ func TestFacts_AResultOnAVersionTheCurrentOneDoesNotReachChangesNoStatus(t *test
 	var meta map[string]any
 	if len(evs) != 1 || json.Unmarshal(evs[0].Metadata, &meta) != nil || meta["version"] != 1.0 {
 		t.Errorf("check events = %v, want one with metadata.version 1", evs)
+	}
+}
+
+func TestFacts_EachWriteOfEvidenceReevaluatesTheLanding(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.putPolicy(t, `{"default": {"approvals": 1, "approvers": ["owner"], "checks": ["test"]}}`)
+	open := w.openPushed(t, "work").number
+	draft := w.openPushed(t, "draft", func(in *change.OpenInput) { in.Draft = true }).number
+	// approved is the id of dana's last approval on each change.
+	approved := map[int64]string{}
+	steps := []struct {
+		name string
+		do   func(t *testing.T, n int64)
+		// want is the landing's status on the open change.
+		want string
+	}{
+		{"no evidence", func(*testing.T, int64) {}, change.LandingPending},
+		{"test passed", func(t *testing.T, n int64) { w.report(t, n, "test", map[string]any{"status": "passed"}) },
+			change.LandingPending},
+		{"dana approves", func(t *testing.T, n int64) { approved[n] = w.give(t, n, w.danaKey, approves)["id"].(string) },
+			change.LandingReady},
+		{"dana withdraws her approval", func(t *testing.T, n int64) {
+			if r := w.withdraw(t, n, approved[n], w.danaKey); r.status != http.StatusNoContent {
+				t.Fatalf("withdraw = %d %s, want 204", r.status, r.body)
+			}
+		}, change.LandingPending},
+		{"dana approves again", func(t *testing.T, n int64) { w.give(t, n, w.danaKey, approves) }, change.LandingReady},
+		{"test failed", func(t *testing.T, n int64) { w.report(t, n, "test", map[string]any{"status": "failed"}) },
+			change.LandingPending},
+		{"dana rejects instead", func(t *testing.T, n int64) { w.give(t, n, w.danaKey, rejects) }, change.LandingPending},
+		{"test passed again", func(t *testing.T, n int64) { w.report(t, n, "test", map[string]any{"status": "passed"}) },
+			change.LandingPending},
+	}
+	for _, s := range steps {
+		s.do(t, open)
+		if l := w.landing(t, open); l["status"] != s.want {
+			t.Errorf("after %s: landing of the open change %v, want %s", s.name, l, s.want)
+		}
+		s.do(t, draft)
+		if l := w.landing(t, draft); l["status"] != change.LandingBlocked || l["reason"] != "draft" {
+			t.Errorf("after %s: landing of the draft %v, want blocked for draft", s.name, l)
+		}
+	}
+}
+
+// downWriter passes the policy component's events on, and refuses every
+// one while down is set, as an event log that cannot be written.
+type downWriter struct {
+	policy.EventWriter
+	down atomic.Bool
+}
+
+func (d *downWriter) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	if d.down.Load() {
+		return event.Record{}, errors.New("writer down")
+	}
+	return d.EventWriter.Emit(ctx, tx, in)
+}
+
+// rows is every row of the store table table, each as its column values,
+// in the order of its first columns.
+func (w *world) rows(t *testing.T, table string) [][]any {
+	t.Helper()
+	rs, err := w.Store.Main().Query(`SELECT * FROM ` + table + ` ORDER BY 1, 2, 3, 4`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.Close()
+	cols, err := rs.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out [][]any
+	for rs.Next() {
+		row, ptrs := make([]any, len(cols)), make([]any, len(cols))
+		for i := range row {
+			ptrs[i] = &row[i]
+		}
+		if err := rs.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, row)
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestEvidenceWrites_AFailingPartRollsTheWholeWriteBack(t *testing.T) {
+	t.Parallel()
+	writer := &downWriter{}
+	w := newWorld(t, func(d *policy.Deps) { writer.EventWriter, d.Events = d.Events, writer })
+	w.putPolicy(t, `{"default": {"approvals": 1, "approvers": ["owner"], "checks": ["test"]}}`)
+	n := w.openPushed(t, "work").number
+	approved := w.give(t, n, w.danaKey, approves)["id"].(string)
+	w.report(t, n, "test", map[string]any{"status": "passed"})
+	// Once the mergeability is known nothing writes the change again
+	// until a write of the test, which leaves its landing ready.
+	w.checked(t, "api", n)
+	if l := w.landing(t, n); l["status"] != change.LandingReady {
+		t.Fatalf("landing before the writes = %v, want ready", l)
+	}
+	triggers := map[string]string{
+		"refuse_verdict_insert": `BEFORE INSERT ON change_approvals`, "refuse_verdict_delete": `BEFORE DELETE ON change_approvals`,
+		"refuse_check_insert": `BEFORE INSERT ON change_checks`, "refuse_check_update": `BEFORE UPDATE ON change_checks`,
+	}
+	exec := func(t *testing.T, stmt string) {
+		t.Helper()
+		if _, err := w.Store.Main().Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parts := []struct {
+		name, cause string
+		fail        func(t *testing.T) (restore func())
+	}{
+		{"the event writer fails", "writer down", func(*testing.T) func() {
+			writer.down.Store(true)
+			return func() { writer.down.Store(false) }
+		}},
+		{"the evaluator fails", "the evidence cannot be read", func(*testing.T) func() {
+			w.policy.RegisterEvidence(&evidence{fail: n})
+			return func() { w.policy.RegisterEvidence(w.policy.Facts()) }
+		}},
+		{"the row write fails", "refused", func(t *testing.T) func() {
+			for name, when := range triggers {
+				exec(t, `CREATE TRIGGER `+name+` `+when+` BEGIN SELECT RAISE(ABORT, 'refused'); END`)
+			}
+			return func() {
+				for name := range triggers {
+					exec(t, `DROP TRIGGER `+name)
+				}
+			}
+		}},
+	}
+	writes := []struct {
+		name string
+		// emits is whether the write records an event.
+		emits bool
+		send  func(t *testing.T) answer
+	}{
+		{"record a verdict", true, func(t *testing.T) answer { return w.postVerdict(t, n, w.danaKey, rejects) }},
+		{"withdraw a verdict", false, func(t *testing.T) answer { return w.withdraw(t, n, approved, w.danaKey) }},
+		{"report a check", true, func(t *testing.T) answer {
+			return w.putCheck(t, n, "test", w.danaKey, map[string]any{"status": "failed"})
+		}},
+	}
+	for _, write := range writes {
+		for _, part := range parts {
+			if part.cause == "writer down" && !write.emits {
+				continue
+			}
+			t.Run(write.name+", "+part.name, func(t *testing.T) {
+				verdicts, checks, landing, seq := w.rows(t, "change_approvals"), w.rows(t, "change_checks"), w.landing(t, n), w.seq(t)
+				restore := part.fail(t)
+				r := write.send(t)
+				restore()
+				if r.status != http.StatusInternalServerError || r.errorType() != "internal" || strings.Contains(string(r.body), part.cause) {
+					t.Errorf("answer = %d %s, want 500 internal without %q", r.status, r.body, part.cause)
+				}
+				if got := w.rows(t, "change_approvals"); !reflect.DeepEqual(got, verdicts) {
+					t.Errorf("verdicts = %v, want them as before: %v", got, verdicts)
+				}
+				if got := w.rows(t, "change_checks"); !reflect.DeepEqual(got, checks) {
+					t.Errorf("check results = %v, want them as before: %v", got, checks)
+				}
+				if got := w.landing(t, n); !reflect.DeepEqual(got, landing) {
+					t.Errorf("landing = %v, want it as before: %v", got, landing)
+				}
+				if evs := w.eventsAfter(t, seq, ""); len(evs) != 0 {
+					t.Errorf("events committed = %v, want none", evs)
+				}
+			})
+		}
+	}
+}
+
+func TestEvidenceWrites_ConcurrentWritesOfOneVerdictOrOneCheckBothSucceed(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.putPolicy(t, `{"default": {"approvals": 1, "approvers": ["member"], "checks": ["test"]}}`)
+	n := w.openPushed(t, "work").number
+	reports := []struct{ name, status string }{{"test", "passed"}, {"test", "failed"}, {"lint", "passed"}}
+	for round := range 20 {
+		var (
+			wg       sync.WaitGroup
+			verdicts [2]answer
+			checks   [3]answer
+		)
+		for i, body := range []map[string]any{approves, rejects} {
+			wg.Go(func() { verdicts[i] = w.postVerdict(t, n, w.melKey, body) })
+		}
+		wg.Wait()
+		answered := []int{verdicts[0].status, verdicts[1].status}
+		slices.Sort(answered)
+		if !slices.Equal(answered, []int{http.StatusOK, http.StatusCreated}) {
+			t.Fatalf("round %d: verdicts = %d %s and %d %s, want one 201 and one 200",
+				round, verdicts[0].status, verdicts[0].body, verdicts[1].status, verdicts[1].body)
+		}
+		kept := verdicts[0]
+		if verdicts[1].status == http.StatusOK {
+			kept = verdicts[1]
+		}
+		if items := w.get(t, approvalsPath(n), w.danaKey).json["items"].([]any); len(items) != 1 || !reflect.DeepEqual(items[0], kept.json) {
+			t.Errorf("round %d: listed verdicts %v, want only the one answered 200: %v", round, items, kept.json)
+		}
+
+		for i, c := range reports {
+			wg.Go(func() { checks[i] = w.putCheck(t, n, c.name, w.danaKey, map[string]any{"status": c.status}) })
+		}
+		wg.Wait()
+		for i, r := range checks {
+			if r.status != http.StatusOK {
+				t.Fatalf("round %d: report %v = %d %s, want 200", round, reports[i], r.status, r.body)
+			}
+		}
+		stored := w.storedResult(t, n, 1, "test")
+		var tests []any
+		for _, item := range w.get(t, checksPath(n), w.danaKey).json["items"].([]any) {
+			if item.(map[string]any)["name"] == "test" {
+				tests = append(tests, item)
+			}
+		}
+		if len(tests) != 1 || tests[0].(map[string]any)["status"] != stored["status"] {
+			t.Errorf("round %d: listed test results %v, want one with the stored status %v", round, tests, stored["status"])
+		}
+		// The stored evidence evaluates to: mel's verdict counted when it
+		// approves, test with its stored status, ready only with both.
+		counted, status := 0.0, change.LandingPending
+		if kept.json["verdict"] == "approve" {
+			counted = 1
+		}
+		if counted == 1 && stored["status"] == "passed" {
+			status = change.LandingReady
+		}
+		l := w.landing(t, n)
+		if r := only(l); l["status"] != status || r["approvals"].(map[string]any)["counted"] != counted ||
+			!reflect.DeepEqual(r["checks"], statuses("test", stored["status"].(string))) {
+			t.Errorf("round %d: landing %v, want %s with %v counted and test %v", round, l, status, counted, stored["status"])
+		}
+		if r := w.withdraw(t, n, kept.json["id"].(string), w.melKey); r.status != http.StatusNoContent {
+			t.Fatalf("round %d: withdraw = %d %s, want 204", round, r.status, r.body)
+		}
+	}
+}
+
+func TestFacts_IncludeAddsTheVerdictsAndResultsOfTheCurrentVersion(t *testing.T) {
+	t.Parallel()
+	clock := &stepClock{at: time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)}
+	w := newWorld(t, func(d *policy.Deps) { d.Now = clock.now })
+	files := map[string]string{"work.txt": "work\n"}
+	n := w.openPushedFiles(t, "work", files).number
+	w.give(t, n, w.melKey, approves)
+	w.report(t, n, "test", map[string]any{"status": "passed"})
+	clock.tick()
+	w.record(t, "work", w.rebased(t, "work", files), change.KindRebase, w.danaCaller())
+	w.give(t, n, w.danaKey, rejects)
+	path := "/api/v1/workspaces/api/changes/" + strconv.FormatInt(n, 10)
+
+	c := w.get(t, path+"?include=approvals,checks", w.danaKey).json
+	approvals, _ := c["approvals"].([]any)
+	var names []any
+	for _, a := range approvals {
+		a := a.(map[string]any)
+		names = append(names, a["by"].(map[string]any)["username"])
+		if a["version"] != 2.0 {
+			t.Errorf("approval %v, want it on version 2", a)
+		}
+	}
+	if !reflect.DeepEqual(names, []any{"dana", "mel"}) || approvals[1].(map[string]any)["carried_from"] != 1.0 {
+		t.Errorf("approvals = %v, want dana's and then mel's, carried from 1", approvals)
+	}
+	if listed := w.get(t, approvalsPath(n)+"?version=2", w.danaKey).json["items"]; !reflect.DeepEqual(c["approvals"], listed) {
+		t.Errorf("approvals = %v, want the verdicts listed on version 2: %v", c["approvals"], listed)
+	}
+	if listed := w.get(t, checksPath(n), w.danaKey).json["items"].([]any); len(listed) != 1 || !reflect.DeepEqual(c["checks"], listed) {
+		t.Errorf("checks = %v, want the one result listed for the current version: %v", c["checks"], listed)
+	}
+	for include, want := range map[string][]bool{"": {false, false}, "?include=approvals": {true, false}, "?include=checks": {false, true}} {
+		got := w.get(t, path+include, w.danaKey).json
+		_, hasApprovals := got["approvals"]
+		_, hasChecks := got["checks"]
+		if hasApprovals != want[0] || hasChecks != want[1] {
+			t.Errorf("GET %s has approvals %v and checks %v, want %v", include, hasApprovals, hasChecks, want)
+		}
 	}
 }
