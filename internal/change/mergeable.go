@@ -166,9 +166,10 @@ func (c *Component) runChecks(ctx context.Context) {
 // change's head and onto-commit, trial-rebases the head onto it in the
 // target's repository under the deadline, only the change's own commits for
 // a change in a stack (ownBase), and stores the result when they and the
-// change's base are still the change's, unless a restack stored its conflict since the
-// check was scheduled (holdsRestackConflict); a pair that moved on is
-// scheduled again. A
+// change's base are still the change's, unless a restack stored its
+// conflict since the check was scheduled (holdsRestackConflict), or a
+// conflict of the change's head onto its target's head was
+// (holdsTargetConflict); a pair that moved on is scheduled again. A
 // missing target branch leaves mergeable unknown and re-evaluates the
 // landing, which reports it. A trial rebase that fails or passes its
 // deadline leaves mergeable unknown and is logged; the change's next
@@ -221,6 +222,9 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 		if holdsRestackConflict(now) {
 			return nil
 		}
+		if held, err := c.holdsTargetConflict(ctx, tx, now); err != nil || held {
+			return err
+		}
 		return c.StoreMergeability(ctx, tx, k.workspace, k.number, ch.HeadSHA, onto, report)
 	})
 	if err != nil {
@@ -230,6 +234,34 @@ func (c *Component) checkMergeable(ctx context.Context, k mergeKey) {
 	if moved {
 		c.merge.pend(k)
 	}
+}
+
+// holdsTargetConflict reports whether the change ch, read in tx, reads a
+// conflict that was stored, since its check was last scheduled, for its
+// current head onto the current head of its target branch: the conflict a
+// land of it found, which names the changes that landed there. The check
+// would replace it with a report of the same head that names none, or, for
+// a change on an open change below, with what it finds onto that change.
+// A trigger after it sets the mergeable unknown, so that its check stores
+// what it computes.
+func (c *Component) holdsTargetConflict(ctx context.Context, tx *sql.Tx, ch Change) (bool, error) {
+	if ch.Mergeable != MergeableConflict {
+		return false, nil
+	}
+	var head, onto sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT mergeable_head, mergeable_onto FROM changes WHERE workspace_slug = ? AND number = ?`,
+		ch.WorkspaceSlug, ch.Number).Scan(&head, &onto); err != nil {
+		return false, fmt.Errorf("read the mergeable of %s: %w", ch.Ref, err)
+	}
+	if head.String != ch.HeadSHA || onto.String == "" {
+		return false, nil
+	}
+	repo, err := c.deps.Repos(ctx, ch.WorkspaceSlug)
+	if err != nil {
+		return false, err
+	}
+	target, found, err := repo.ResolveBranch(ctx, ch.TargetBranch)
+	return found && target == onto.String, err
 }
 
 // checkFailed logs the error of the check of k, which leaves its
