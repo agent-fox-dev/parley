@@ -39,6 +39,13 @@ type Deps struct {
 	// branch after its lookups and before it creates the branch; only tests
 	// set it, to write the branch in between as another writer would.
 	BeforeBranchCreate func(branch string)
+	// BeforeRefSwap, when set, is called by a reset to origin with the
+	// workspace and the branch after it compared the branch's tip with
+	// origin's and before it records the reset, writes the backup ref and
+	// moves the branch, outside any store transaction; only tests set it,
+	// to move the branch or change the patch in between as another writer
+	// would.
+	BeforeRefSwap func(slug, branch string)
 	// Events writes the events of the patch list in the transaction of the
 	// change they report.
 	Events Emitter

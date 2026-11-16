@@ -2272,7 +2272,8 @@ arguments, and an `--exclude-change` that is not a positive integer are a
 ### `parley patch`
 
 These commands drive the [patch routes](api.md#carry-patch-workspaces) of a
-carry-patch workspace. Each sends one request with the credential as
+carry-patch workspace. Each sends one request (`reset-to-origin --wait`
+then polls, below) with the credential as
 `Authorization: Bearer` and `<slug>` (and `<patch-id>`) as one
 percent-encoded path segment (`parley patch list a/b` sends
 `/api/v1/workspaces/a%2Fb/patches`), and prints the hub's answer on stdout
@@ -2286,12 +2287,36 @@ status `1`. `parley patch` run without a command prints its help and exits
 | `parley patch add <slug> --branch <name> [--position <n>] [--upstream-pr <url>] [--description <text>] [--skip-branch-check] [--if-not-exists]` | `POST /api/v1/workspaces/<slug>/patches` | the body `{"branch_name":…}`, with `position` (a number), `--upstream-pr` `upstream_pr_url`, `description`, `skip_branch_check` and `if_not_exists` (`true`) when given |
 | `parley patch list <slug> [--include-deleted]` | `GET /api/v1/workspaces/<slug>/patches` | `include_deleted=true` with `--include-deleted` |
 | `parley patch show <slug> <patch-id>` | `GET /api/v1/workspaces/<slug>/patches/<patch-id>` | |
+| `parley patch update <slug> <patch-id> [--status <s>] [--position <n>] [--description <text>] [--upstream-pr <url>]` | `PATCH /api/v1/workspaces/<slug>/patches/<patch-id>` | a body with one member per flag given: `status` (sent as typed; the hub judges it), `position` (a number), `description`, `--upstream-pr` `upstream_pr_url` |
+| `parley patch remove <slug> <patch-id>` | `DELETE /api/v1/workspaces/<slug>/patches/<patch-id>` | |
+| `parley patch restore <slug> <patch-id>` | `POST /api/v1/workspaces/<slug>/patches/<patch-id>/restore` | no body |
+| `parley patch reorder <slug> <patch-id>...` | `POST /api/v1/workspaces/<slug>/patches/reorder` | the body `{"patch_ids":[…]}`, the ids in argument order |
+| `parley patch reset-to-origin <slug> <patch-id> [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST /api/v1/workspaces/<slug>/patches/<patch-id>/reset-to-origin`; with `--wait` and a `rebuild_job_id`, then `GET /api/v1/workspaces/<slug>/rebuilds/<id>` until `completed`, `dead_letter` or `cancelled` | no body |
 
 A flag not given sends no member: `--description ''` sends `""`, which the
-hub stores as `null`, and leaving it out sends nothing. `parley patch add`
-without `--branch` or with a `--position` that is not an integer, and any
-of these commands with a wrong number of arguments, are a `usage_error`
-with exit status `2`, before any request is sent.
+hub stores as `null` (on an update it clears the field), and leaving it out
+sends nothing. `parley patch remove` answers the hub's `204` with
+`{"status":"removed","patch_id":"<patch-id>"}`, the id as typed.
+
+`parley patch reset-to-origin` prints the hub's answer as it is without
+`--wait`, and also with `--wait` when the answer names no
+`rebuild_job_id` (no rebuild was queued); it then sends nothing more. With
+`--wait` and a `rebuild_job_id` it follows the rebuild job through the
+shared [wait](#waiting): `queued`, `running` and `failed` (waiting to
+retry) go on, `completed` ends it with exit status `0`, and `dead_letter`
+or `cancelled` with `wait_failed` and exit status `1`. Either way it
+prints one document, the reset answer with its members untouched plus
+the member `rebuild`, the final job record. A wait that passes `--timeout`
+prints nothing on stdout, reports `wait_timeout` and exits `1`, and asks
+the hub to cancel nothing.
+
+`parley patch add` without `--branch`, `parley patch update` with none of
+its four flags (`parley patch update needs at least one of --status,
+--position, --description, --upstream-pr`), `parley patch reorder` without
+a patch id, a `--position` that is not an integer, a `--timeout` or
+`--poll-interval` that is not a duration, and any of these commands with a
+wrong number of arguments, are a `usage_error` with exit status `2`, before
+any request is sent.
 
 ### `parley land`
 

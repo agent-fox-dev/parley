@@ -2691,17 +2691,30 @@ deleted. A workspace's patches are removed with it by its delete.
 
 Every route of this section is under `/api/v1/workspaces/{slug}/patches`.
 The reads need the scope `patches:read` from a PAT (`patches:write` also
-satisfies it) and read access to the workspace; the add needs
+satisfies it) and read access to the workspace; the writes (the add, the
+update, the delete, the restore, the reorder and the reset to origin) need
 `patches:write` and write access (see [Workspace access](#workspace-access)).
-After its own validation, each route refuses a workspace whose
+After its own validation of the body, each route refuses a workspace whose
 `workspace_mode` is not `carry_patch`, every task fork included, with
 `400` `workspace_mode_mismatch`
 (`workspace "<slug>" is in mode standard; patches need a workspace in mode carry_patch`),
 before it looks at the workspace's status. The reads answer in every
-status of the workspace, from the stored list; the add then needs the
+status of the workspace, from the stored list; a write then needs the
 workspace to be `ready` with no archive, reclone or delete running
 (`409` `workspace_busy`, `workspace_not_ready` or `workspace_archived`, as
-for a [sync](#post-apiv1workspacesslugsync)).
+for a [sync](#post-apiv1workspacesslugsync)). Only then does a route that
+names a patch look it up: an `{id}` that is not a UUID, names no patch or a
+patch of another workspace is `404` `not_found` (`patch not found`). A
+refused write changes no patch, moves no ref, contacts no remote and emits
+no event.
+
+Every write that changes positions (an update with a `position`, a delete,
+a restore, a reorder) reads and rewrites the order in one store
+transaction, and the store runs one write transaction at a time: two such
+requests that arrive together run one after the other, neither fails
+because of the other, and the patches that are not deleted hold the
+positions `1` to N without a gap or a duplicate afterwards. A patch whose
+position a write changes gets a new `updated_at`.
 
 ## `POST /api/v1/workspaces/{slug}/patches`
 
@@ -2812,6 +2825,200 @@ otherwise, and when the copy is not on disk, the member is absent.
 | `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
 | `403` `insufficient_scope` | a PAT with neither `patches:read` nor `patches:write` |
 | `404` `not_found` | the caller cannot read the workspace (`workspace not found`); or `{id}` is not a UUID, names no patch, or a patch of another workspace (`patch not found`) |
+
+## `PATCH /api/v1/workspaces/{slug}/patches/{id}`
+
+Changes a patch's status, position, description and upstream pull request
+URL. The body is a JSON object; each member is optional:
+
+| Member | Rule |
+|---|---|
+| `status` | `active`, `disabled`, `merged_upstream` or `conflict` |
+| `position` | a JSON integer from 1 to N, the number of patches that are not deleted |
+| `description`, `upstream_pr_url` | strings; `""` clears the field to `null` |
+
+A member that is absent or `null` leaves its field as it is; `branch_name`
+and unknown members are ignored. A value equal to the stored one is not a
+change: when nothing changes, the empty object included, nothing is
+written, `updated_at` stays and no event is emitted. A status other than
+`conflict` clears `conflict_files` to `[]`; setting `conflict` leaves it as
+it is. A new position takes the patch out of the order and puts it back at
+that place, the others keeping their relative order. No update queues a
+rebuild.
+
+The shape of the body is checked before the [common rules](#common-rules);
+the patch lookup, the deleted check and the upper bound of `position` come
+after them, so an unknown `status` on a deleted patch is `400` and a
+`position` of 99 on one is `409` `patch_deleted`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the patch object as it now stands (with `replaced_sha` as for the [get](#get-apiv1workspacesslugpatchesid)) |
+| `400` `invalid_request` | the body is not a JSON object (`request body must be a JSON object`, `request body is not valid JSON`); a member of the wrong JSON type (`status must be a string`, `description must be a string`, `upstream_pr_url must be a string`, `position must be an integer of at least 1`); `status "<s>" is not one of [active disabled merged_upstream conflict]`, `deleted` included; `position must be between 1 and <N>, the number of patches` |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT without `patches:write` |
+| `403` `forbidden` | a caller with read access only |
+| `404` `not_found` | the caller cannot read the workspace, no workspace has the slug, or `patch not found` |
+| `409` `patch_deleted` | the patch is deleted, whatever the body (`the patch of <branch> is deleted; restore it before changing it`) |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | storing failed; nothing changed and no event remains |
+
+An update that changed something emits `parley.patch.update` with
+`resource_type` `patch`, the patch's id as `resource_id`, the caller as
+actor, and in `metadata` `branch_name` and `changed`, the names of the
+fields that changed in the order `status`, `position`, `description`,
+`upstream_pr_url`; a status change adds `from`, `to` and `reason: "api"`:
+
+```json
+{"type":"parley.patch.update","resource_type":"patch","resource_id":"5c0e0000-0000-4000-8000-000000000002","metadata":{"branch_name":"patch/b","changed":["status"],"from":"active","to":"disabled","reason":"api"}}
+```
+
+## `DELETE /api/v1/workspaces/{slug}/patches/{id}`
+
+Soft-deletes a patch: in one transaction it becomes `deleted`, with
+`deleted_at` and `updated_at` set to now, `position` `null` and
+`conflict_files` `[]`, and the patches that are not deleted are renumbered
+`1` to N-1 in their order. Its row stays, so the get route and the list
+with `include_deleted=true` still show it; the patch branch and its backup
+ref `refs/parley/replaced/<branch>` are not touched. A request body is
+ignored. Deleting a deleted patch answers `204` and changes nothing:
+`deleted_at` keeps its value and no event is emitted. No delete queues a
+rebuild.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the patch is deleted; the body is empty |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT without `patches:write` |
+| `403` `forbidden` | a caller with read access only |
+| `404` `not_found` | the caller cannot read the workspace, no workspace has the slug, or `patch not found` |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | storing failed; the patch and the order are as they were |
+
+A delete that deleted emits `parley.patch.delete`, with the patch as the
+resource, the caller as actor and `metadata`
+`{"branch_name":"<branch>","reason":"api"}`.
+
+## `POST /api/v1/workspaces/{slug}/patches/{id}/restore`
+
+Brings a deleted patch back, as the last of the order: in one transaction
+it becomes `active` at position N+1 (N the patches that are not deleted),
+with `deleted_at` `null`, `conflict_files` `[]` and `updated_at` now. It
+restores a patch a caller deleted and one a rebuild removed as merged
+upstream alike. A request body is ignored.
+
+| Status | When |
+|---|---|
+| `200 OK` | the restored patch object |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT without `patches:write` |
+| `403` `forbidden` | a caller with read access only |
+| `404` `not_found` | the caller cannot read the workspace, no workspace has the slug, or `patch not found` |
+| `409` `patch_not_deleted` | the patch is `active`, `disabled`, `conflict` or `merged_upstream` (`the patch of <branch> is <status>, not deleted`) |
+| `409` `patch_exists` | another patch of the workspace that is not deleted has the branch (`branch "<b>" is a patch of the workspace already`) |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | storing failed; the patch stays deleted |
+
+A restore emits `parley.patch.restore`, with the patch as the resource, the
+caller as actor and `metadata` `{"branch_name":"<branch>","position":<n>}`,
+the position it took.
+
+## `POST /api/v1/workspaces/{slug}/patches/reorder`
+
+Sets the whole order in one step. The body is
+`{"patch_ids":["<id>",…]}`, which must name every patch of the workspace
+that is not deleted exactly once. In one transaction the patches take the
+positions `1` to N in the order of `patch_ids`; only those whose position
+changed get a new `updated_at`. Asking for the current order succeeds and
+emits its event too. A workspace with no patch that is not deleted accepts
+`{"patch_ids":[]}` and answers `200` with no items and no event.
+
+The shape of the body is checked before the [common rules](#common-rules);
+the list is checked against the patches after them, the first failure
+answering: an id given twice, an id of no patch of the workspace, the id of
+a deleted patch, a number of ids other than N. Ids are compared in their
+canonical UUID form. Nothing is changed by a refusal.
+
+| Status | When |
+|---|---|
+| `200 OK` | `{"items":[…],"next_cursor":null}`, every patch that is not deleted in the new order |
+| `400` `invalid_request` | the body is not a JSON object, or `patch_ids` is absent or not an array of strings (`patch_ids must be an array of strings`); `patch_ids names <id> more than once`; `patch_ids names <id>, which is no patch of <slug>`; `patch_ids names <id>, a deleted patch; restore it before ordering it`; `patch_ids names <given> patches; <slug> has <N> that are not deleted, and each must be named once` |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT without `patches:write` |
+| `403` `forbidden` | a caller with read access only |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | storing failed; the order is as it was |
+
+A reorder emits one `parley.patch.reorder`, whose `resource_id` is the
+first patch of the new order, with the caller as actor and `metadata`
+`{"patch_ids":[…]}`, the new order. No reorder queues a rebuild.
+
+## `POST /api/v1/workspaces/{slug}/patches/{id}/reset-to-origin`
+
+Forces the hub's copy of a patch branch to origin's current tip, whatever
+the settings `patch_branch_source` and `patch_divergence_policy` say. A
+request body is ignored. Only an `active`, `conflict` or `disabled` patch is
+reset; for another status origin is not contacted.
+
+The hub fetches that one branch from origin (`git_url`) into
+`refs/remotes/origin/<branch>`, with the workspace's origin credential read
+at the time of the call, within 2 minutes; then it takes the first action
+that applies:
+
+| Situation | What the hub does | `action` |
+|---|---|---|
+| the hub has no such branch | creates it at origin's tip | `created` |
+| the hub's tip equals origin's | writes nothing | `none` |
+| the hub's tip is an ancestor of origin's | moves the branch forward | `fast_forwarded` |
+| otherwise (diverged, or the hub ahead) | saves the hub's tip to `refs/parley/replaced/<branch>`, overwriting an earlier backup, then moves the branch | `replaced` |
+
+The hub records the outcome and moves the refs in one store transaction,
+in which it reads the patch again: a patch deleted or marked
+`merged_upstream` while origin was fetched is `409`
+`patch_status_invalid`, and nothing is moved. Every move is a
+compare-and-swap against the tip the hub compared (against "no such ref"
+for `created`); a branch another writer moved, created or deleted in
+between is `409` `ref_moved`, and is left as that writer has it. A backup
+ref already written stays; nothing else changes.
+
+When the reset succeeded and `patch_branch_source` is `origin`, the patch's
+`origin_sync_state` becomes `in_sync`, `origin_sha` origin's tip and
+`origin_synced_at` now; with `hub` the three fields are left alone. A reset
+does not change `updated_at`. When the branch moved, the patch is `active`
+or `conflict` and `auto_rebuild_after_sync` (read at that moment) is
+`true`, the hub queues a rebuild of the workspace with the caller as its
+submitter; a rebuild already waiting, or an enqueue that fails (logged as
+`queue the rebuild after a reset to origin`), leaves the reset in place and
+queues nothing.
+
+| Status | When |
+|---|---|
+| `200 OK` | the patch object with three more members: `action`; `rebuild_triggered`, `true` only when this call queued a rebuild; `rebuild_job_id`, present only then; and `replaced_sha` whenever `refs/parley/replaced/<branch>` exists after the call (also one an earlier reset left) |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT without `patches:write` |
+| `403` `forbidden` | a caller with read access only |
+| `404` `not_found` | the caller cannot read the workspace, no workspace has the slug, or `patch not found` |
+| `409` `patch_status_invalid` | the patch is `merged_upstream` or `deleted` (`the patch of <branch> is <status>; only an active, conflict or disabled patch is reset to origin`) |
+| `409` `missing_on_origin` | origin has no such branch (`origin has no branch "<b>"`) |
+| `409` `ref_moved` | the branch moved in between (`the branch "<b>" moved while it was reset to origin; read it again and retry`); `details.current_sha` is where it is now, `null` when it is gone |
+| `409` `conflict` | another ref of the copy is in the way of `refs/remotes/origin/<branch>` or of `refs/heads/<branch>` |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | recording the outcome failed; the branch, the backup ref and the patch are as they were |
+| `502` `origin_fetch_failed` | the workspace has no `git_url`, the origin credential cannot be read, origin cannot be reached or refuses it, or the fetch passed its 2 minutes (`fetch the branch "<b>" from origin: <cause>`, with no credential and URL user information as `***@`) |
+
+```json
+{"id":"5c0e0000-0000-4000-8000-000000000001","workspace_slug":"variant","branch_name":"patch/a","position":1,"status":"active","conflict_files":[],"upstream_pr_url":null,"description":null,"added_at":"2026-11-16T10:30:15Z","updated_at":"2026-11-16T10:30:15Z","deleted_at":null,"origin_sync_state":null,"origin_sha":null,"origin_synced_at":null,"replaced_sha":"0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e","action":"replaced","rebuild_triggered":false}
+```
+
+A successful reset emits `parley.patch.reset`, whatever the action, with
+the patch as the resource, the caller as actor and `metadata`
+`branch_name`, `action`, `local_sha` (the hub's tip before the call,
+`null` for `created`), `origin_sha` and `replaced_sha` (the tip this call
+saved, `null` unless the action is `replaced`). A `replaced` reset also
+emits `parley.patch.replace` with `metadata` `branch_name`,
+`replaced_sha`, `origin_sha` and `trigger: "reset_to_origin"`. A refused
+reset emits nothing and changes no patch field.
 
 ## Source control reads
 

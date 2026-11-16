@@ -6,14 +6,20 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -222,4 +228,464 @@ func str(s *string) string {
 		return "<nil>"
 	}
 	return *s
+}
+
+// patchHub is an addHub for the routes that maintain a patch list. Its
+// carry-patch component counts the reads of workspace secrets, which every
+// fetch from origin makes first to resolve its credential, takes the origin
+// credentials from origins, records the rebuilds it is asked to queue, and
+// writes its events through an emitter the test can make fail, which rolls
+// back the transaction of the change. Its git trusts the origins given to
+// trust.
+type patchHub struct {
+	*addHub
+	rebuilds    *recordingRebuilds
+	secretReads atomic.Int64
+	failEvents  atomic.Bool
+	origins     *originSecrets
+
+	// caBundle is the file GIT_SSL_CAINFO names for the hub's git; cas are
+	// the certificates it holds.
+	caBundle string
+	caMu     sync.Mutex
+	cas      []byte
+}
+
+// startPatchHub starts the patch hub, with the carry-patch dependencies
+// changed further by adjust.
+func startPatchHub(t *testing.T, adjust ...func(d *carrypatch.Deps)) *patchHub {
+	t.Helper()
+	h := &patchHub{
+		addHub:   &addHub{readHub: &readHub{}, now: time.Now().UTC().Truncate(time.Second).Add(700 * time.Millisecond)},
+		rebuilds: &recordingRebuilds{},
+		caBundle: filepath.Join(t.TempDir(), "ca-bundle.pem"),
+	}
+	if err := os.WriteFile(h.caBundle, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.Hub = hubtest.StartWith(t, hubtest.Config{
+		Now: h.clock,
+		// The order tests send thousands of requests as one caller, more
+		// than the rate limit lets through.
+		TOML: "[limits]\nrequests_per_minute = 0\n",
+		Compose: func(c *hub.Composition) {
+			c.CarryPatch().RegisterRebuildEnqueuer(h.rebuilds)
+			c.AdjustCarryPatch(func(d *carrypatch.Deps) {
+				h.repoPath = d.RepoPath
+				h.origins = &originSecrets{SecretReader: d.Secrets, tokens: map[string]string{}, fail: map[string]error{}, reads: map[string]int{}}
+				d.Secrets = countingSecrets{SecretReader: h.origins, n: &h.secretReads}
+				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
+				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+h.caBundle)
+				for _, fn := range adjust {
+					fn(d)
+				}
+			})
+		},
+	})
+	h.owner = h.CreateUser(t, "owner")
+	h.key = h.IssueKey(t, h.owner)
+	h.org = h.CreateOrg(t, "acme")
+	h.AddMember(t, h.org, h.owner)
+	h.rebuilds.observe = func(slug string) rebuildSeen {
+		var resets int
+		if err := h.Store.Main().QueryRow(`SELECT count(*) FROM hub_events WHERE workspace = ? AND type = ?`,
+			slug, carrypatch.EventPatchReset).Scan(&resets); err != nil {
+			t.Errorf("count the reset events of %s: %v", slug, err)
+		}
+		return rebuildSeen{head: refIn(h.repoPath(slug), "refs/heads/patch/a"), resets: resets}
+	}
+	return h
+}
+
+// carryList stores the carry-patch workspace slug of the owner, in status
+// and with the maintenance marker given, holding the active patches A, B
+// and C of the branches patch/a, patch/b and patch/c at positions 1 to 3,
+// and returns them by letter.
+func (h *patchHub) carryList(t *testing.T, slug string, status workspace.Status, marker workspace.Marker) map[string]carrypatch.Patch {
+	t.Helper()
+	h.add(t, slug, workspace.ModeCarryPatch, status, marker)
+	ps := map[string]carrypatch.Patch{}
+	for i, letter := range []string{"A", "B", "C"} {
+		ps[letter] = livePatch(slug, "patch/"+strings.ToLower(letter), i+1)
+		h.put(t, ps[letter])
+	}
+	return ps
+}
+
+// carryOf stores the ready carry-patch workspace slug of the owner holding
+// n active patches, of the branches patch/1 to patch/n, at positions 1 to n,
+// and returns them in position order.
+func (h *patchHub) carryOf(t *testing.T, slug string, n int) []carrypatch.Patch {
+	t.Helper()
+	h.add(t, slug, workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone)
+	ps := make([]carrypatch.Patch, n)
+	for i := range ps {
+		ps[i] = livePatch(slug, fmt.Sprintf("patch/%d", i+1), i+1)
+	}
+	h.put(t, ps...)
+	return ps
+}
+
+// bareCopy makes the hub's copy of slug a bare repository made by git init
+// holding the branches patch/a, patch/b and patch/c of carryList and the
+// backup ref of patch/a, and returns its directory.
+func (h *patchHub) bareCopy(t *testing.T, slug string) string {
+	t.Helper()
+	dir := h.repoPath(slug)
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	for _, b := range []string{"patch/a", "patch/b", "patch/c"} {
+		gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+b, commitIn(t, dir, b))
+	}
+	gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"patch/a", commitIn(t, dir, "replaced a"))
+	return dir
+}
+
+// patches are the stored patches of slug: those that are not deleted in
+// position order, then the deleted ones.
+func (h *patchHub) patches(t *testing.T, slug string) []carrypatch.Patch {
+	t.Helper()
+	ctx := context.Background()
+	live, err := carrypatch.ListLivePatches(ctx, h.Store.Main(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := carrypatch.ListDeletedPatches(ctx, h.Store.Main(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(live, deleted...)
+}
+
+// stored is the stored patch id of slug.
+func (h *patchHub) stored(t *testing.T, slug, id string) carrypatch.Patch {
+	t.Helper()
+	p, found, err := carrypatch.ReadPatch(context.Background(), h.Store.Main(), slug, id)
+	if err != nil || !found {
+		t.Fatalf("read the patch %s of %s: found %v, %v", id, slug, found, err)
+	}
+	return p
+}
+
+// alter changes the stored patch id of slug by edit, as an earlier change
+// would have left it.
+func (h *patchHub) alter(t *testing.T, slug, id string, edit func(p *carrypatch.Patch)) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		p, found, err := carrypatch.ReadPatch(ctx, tx, slug, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("%s has no patch %s", slug, id)
+		}
+		edit(&p)
+		if err := carrypatch.DeletePatch(ctx, tx, slug, id); err != nil {
+			return err
+		}
+		return carrypatch.InsertPatch(ctx, tx, p)
+	}); err != nil {
+		t.Fatalf("alter the patch %s of %s: %v", id, slug, err)
+	}
+}
+
+// send sends method /api/v1+path with credential and body, and decodes the
+// answer.
+func (h *patchHub) send(t *testing.T, credential, method, path string, body any) answer {
+	t.Helper()
+	status, raw := h.Call(t, method, "/api/v1"+path, credential, body)
+	a := answer{status: status, raw: raw}
+	_ = json.Unmarshal(raw, &a)
+	_ = json.Unmarshal(raw, &a.patch)
+	return a
+}
+
+// update sends PATCH /workspaces/<slug>/patches/<id> as the owner with body.
+func (h *patchHub) update(t *testing.T, slug, id string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPatch, "/workspaces/"+slug+"/patches/"+id, body)
+}
+
+// remove sends DELETE /workspaces/<slug>/patches/<id> as the owner with
+// body, nil for none.
+func (h *patchHub) remove(t *testing.T, slug, id string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodDelete, "/workspaces/"+slug+"/patches/"+id, body)
+}
+
+// restore sends POST /workspaces/<slug>/patches/<id>/restore as the owner
+// with body, nil for none.
+func (h *patchHub) restore(t *testing.T, slug, id string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/"+id+"/restore", body)
+}
+
+// reorder sends POST /workspaces/<slug>/patches/reorder as the owner with
+// body.
+func (h *patchHub) reorder(t *testing.T, slug string, body any) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/reorder", body)
+}
+
+// patchEvents are the stored events of slug of type typ, every
+// parley.patch.* event when typ is "", oldest first.
+func (h *patchHub) patchEvents(t *testing.T, slug, typ string) []patchEvent {
+	t.Helper()
+	if typ == "" {
+		typ = "parley.patch.%"
+	}
+	rows, err := h.Store.Main().Query(`SELECT resource_type, resource_id, actor_type, actor_id, metadata
+FROM hub_events WHERE workspace = ? AND type LIKE ? ORDER BY seq`, slug, typ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []patchEvent
+	for rows.Next() {
+		var e patchEvent
+		var meta string
+		if err := rows.Scan(&e.ResourceType, &e.ResourceID, &e.ActorType, &e.ActorID, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(meta), &e.Metadata); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// trust makes the hub's git trust the certificate in the PEM file caFile,
+// such as an origin's CAFile, besides those it trusts already. The bundle
+// is replaced in one step, so that a git reading it meanwhile sees the old
+// or the new one.
+func (h *patchHub) trust(t *testing.T, caFile string) {
+	t.Helper()
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.caMu.Lock()
+	defer h.caMu.Unlock()
+	h.cas = append(h.cas, pem...)
+	next := h.caBundle + ".next"
+	if err := os.WriteFile(next, h.cas, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, h.caBundle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// resetCase is a carry-patch workspace of the reset tests: its origin,
+// which takes the GIT_PAT originToken alone, the hub's copy of it, and its
+// patch A of the branch patch/a.
+type resetCase struct {
+	slug   string
+	origin *gitrepotest.Origin
+	copy   string
+	patch  carrypatch.Patch
+}
+
+// resetCarry stores the ready carry-patch workspace slug of the owner,
+// changed by edit when it is not nil, whose git_url is a new origin that
+// holds the branches patch/a and other at one commit each, whose GIT_PAT is
+// originToken, and whose copy, the bare copy of carry, also holds
+// origin's branches and origin heads of them, as a clone of origin would.
+// It holds patch A of patch/a, active, at position 1. The hub's git trusts
+// the origin.
+func (h *patchHub) resetCarry(t *testing.T, slug string, edit func(w *workspace.Workspace)) *resetCase {
+	t.Helper()
+	o := tokenOrigin(t)
+	o.Commit("patch/a", "a1")
+	o.Commit("other", "o1")
+	h.trust(t, o.CAFile())
+	url := o.URL()
+	dir := h.carry(t, slug, func(w *workspace.Workspace) {
+		w.GitURL = &url
+		if edit != nil {
+			edit(w)
+		}
+	})
+	gitrepotest.Git(t, dir, "fetch", "--quiet", "--no-tags", o.Dir(), "+refs/heads/*:refs/heads/*", "+refs/heads/*:refs/remotes/origin/*")
+	h.origins.set(slug, originToken, nil)
+	p := livePatch(slug, "patch/a", 1)
+	h.put(t, p)
+	return &resetCase{slug: slug, origin: o, copy: dir, patch: p}
+}
+
+// autoRebuild is an edit of resetCarry that stores the setting
+// auto_rebuild_after_sync on.
+func autoRebuild(on bool) func(w *workspace.Workspace) {
+	return func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{"auto_rebuild_after_sync": json.RawMessage(fmt.Sprint(on))}
+	}
+}
+
+// withSettings is an edit of resetCarry that stores the settings
+// patch_branch_source source and patch_divergence_policy policy, "" for
+// none.
+func withSettings(source, policy string) func(w *workspace.Workspace) {
+	return func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{}
+		if source != "" {
+			w.Settings["patch_branch_source"] = json.RawMessage(`"` + source + `"`)
+		}
+		if policy != "" {
+			w.Settings["patch_divergence_policy"] = json.RawMessage(`"` + policy + `"`)
+		}
+	}
+}
+
+// resetToOrigin sends POST /workspaces/<slug>/patches/<id>/reset-to-origin
+// as the owner with no body.
+func (h *patchHub) resetToOrigin(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.send(t, h.key, http.MethodPost, "/workspaces/"+slug+"/patches/"+id+"/reset-to-origin", nil)
+}
+
+// originSecrets is the origin credential resolver of the patch hub: the
+// GIT_PAT of a workspace given to set is its token, or its error; the
+// secrets of every other workspace are read from the hub's reader. It
+// counts the reads per workspace.
+type originSecrets struct {
+	workspace.SecretReader
+	mu     sync.Mutex
+	tokens map[string]string
+	fail   map[string]error
+	reads  map[string]int
+}
+
+// set makes token the GIT_PAT of slug, or, when err is not nil, every read
+// of its secrets fail with err.
+func (s *originSecrets) set(slug, token string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokens[slug], s.fail[slug] = token, err
+}
+
+// readsOf is how often the secrets of slug were read.
+func (s *originSecrets) readsOf(slug string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads[slug]
+}
+
+func (s *originSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, name string) (string, bool, error) {
+	s.mu.Lock()
+	token, set := s.tokens[scopeID]
+	err := s.fail[scopeID]
+	s.reads[scopeID]++
+	s.mu.Unlock()
+	switch {
+	case !set || scope != secret.ScopeWorkspace:
+		return s.SecretReader.Get(ctx, scope, scopeID, name)
+	case err != nil:
+		return "", false, err
+	case name == workspace.SecretGitPAT:
+		return token, true, nil
+	}
+	return "", false, nil
+}
+
+// recordingRebuilds is a rebuild enqueuer that records each call with
+// what the hub held when it was made, and answers a workspace as answer
+// set it: by default, that nothing was queued.
+type recordingRebuilds struct {
+	mu      sync.Mutex
+	made    []rebuildCall
+	answers map[string]rebuildAnswer
+	// observe, when set, reads what the hub holds for a workspace when a
+	// rebuild of it is asked for.
+	observe func(slug string) rebuildSeen
+}
+
+// rebuildCall is a call of the recording enqueuer.
+type rebuildCall struct {
+	slug string
+	opts carrypatch.RebuildOptions
+	seen rebuildSeen
+}
+
+// rebuildSeen is what the hub held when a rebuild of a workspace was asked
+// for: the tip of patch/a in its copy, the branch of the reset cases, and
+// how many parley.patch.reset events it had.
+type rebuildSeen struct {
+	head   string
+	resets int
+}
+
+// rebuildAnswer is what the recording enqueuer answers a workspace.
+type rebuildAnswer struct {
+	result carrypatch.RebuildResult
+	err    error
+}
+
+// answer makes every later call for slug answer result and err.
+func (r *recordingRebuilds) answer(slug string, result carrypatch.RebuildResult, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.answers == nil {
+		r.answers = map[string]rebuildAnswer{}
+	}
+	r.answers[slug] = rebuildAnswer{result, err}
+}
+
+func (r *recordingRebuilds) EnqueueRebuild(_ context.Context, slug string, opts carrypatch.RebuildOptions) (carrypatch.RebuildResult, error) {
+	var seen rebuildSeen
+	if r.observe != nil {
+		seen = r.observe(slug)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.made = append(r.made, rebuildCall{slug: slug, opts: opts, seen: seen})
+	a := r.answers[slug]
+	return a.result, a.err
+}
+
+// calls is how often a rebuild was asked for.
+func (r *recordingRebuilds) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.made)
+}
+
+// callsOf are the calls that asked for a rebuild of slug, oldest first.
+func (r *recordingRebuilds) callsOf(slug string) []rebuildCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []rebuildCall
+	for _, c := range r.made {
+		if c.slug == slug {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// countingSecrets is a secret reader that counts its reads.
+type countingSecrets struct {
+	workspace.SecretReader
+	n *atomic.Int64
+}
+
+func (s countingSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, name string) (string, bool, error) {
+	s.n.Add(1)
+	return s.SecretReader.Get(ctx, scope, scopeID, name)
+}
+
+// failingEmitter is an emitter that refuses every write while fail is set.
+type failingEmitter struct {
+	carrypatch.Emitter
+	fail *atomic.Bool
+}
+
+func (e failingEmitter) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	if e.fail.Load() {
+		return event.Record{}, errors.New("the event log refuses the write")
+	}
+	return e.Emitter.Emit(ctx, tx, in)
 }

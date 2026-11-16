@@ -505,7 +505,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AdjustPolicy(func(*policy.Deps))` | a change to the policy component's dependencies, applied after the start hook `policy` builds them and before it binds them, in the order added |
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 | `AdjustAwareness(func(*awareness.Deps))` | a change to the awareness component's dependencies, applied after the start hook `awareness` builds them and before it binds them, in the order added; tests set the index and expiry intervals or replace the event source, the change reader or the repositories with it |
-| `AdjustCarryPatch(func(*carrypatch.Deps))` | a change to the carry-patch component's dependencies, applied after the start hook `carry_patch` builds them and before it binds them, in the order added; tests replace the secret reader or the git, or set the fetch deadlines and the branch-create hook with it |
+| `AdjustCarryPatch(func(*carrypatch.Deps))` | a change to the carry-patch component's dependencies, applied after the start hook `carry_patch` builds them and before it binds them, in the order added; tests replace the secret reader or the git, or set the fetch deadlines, the branch-create hook and the reset's swap hook (`BeforeRefSwap`) with it |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
 `composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
@@ -5262,10 +5262,57 @@ patches of the branches, places and inserts the patches and emits one
 time orders concurrent adds; no other lock is held. Backup refs of purged
 patches are deleted after the commit.
 
+**Maintaining the list.** The update (`patch_update.go`), the delete and
+the restore (`patch_remove.go`) and the reorder (`patch_reorder.go`) check
+the body's shape, call the guard, and then do everything else in one
+`store.Tx`: read the patch or the live list, check it, write, and emit
+their event (`parley.patch.update`, `.delete`, `.restore`, `.reorder`); an
+event that cannot be written rolls the change back. Every change of the
+order goes through `renumber(ctx, tx, order, now)` (`patch_order.go`),
+which gives the live patches in their new order the positions 1 to N and
+stamps `updated_at` only on those whose position changes. The store runs
+one write transaction at a time, so concurrent position changes are
+serialized by that alone and the order never shows a gap or a duplicate.
+A delete sets `status` and a NULL `position` in one `UPDATE` (the table's
+check ties them) before renumbering the rest; a restore sets `active` and
+position N+1 in one `UPDATE` and moves nothing else. No git ref is
+touched by these four.
+
+**The reset to origin.** `patch_reset.go` reads the patch (only `active`,
+`conflict` and `disabled` are reset), fetches its one branch with
+`fetchBranch` (the origin credential read now, `Git.FetchOriginBranch`
+through `RunGit` under `DefaultBranchFetchDeadline`; the missing-branch
+answer is the caller's, `missing_on_origin` here and `branch_not_found` for
+the add), compares the hub's tip with origin's (`LookupRef`,
+`IsAncestor`) and takes the action `created`, `none`, `fast_forwarded` or
+`replaced`. For `replaced` it first saves the hub's tip with
+`WriteBackupRef(ctx, repo, branch, id)` (`backup_ref.go`), the one writer
+of `refs/parley/replaced/<branch>`, which needs no request so that a sync
+can call it; then it moves the branch with `CompareAndSwapRef` against the
+tip it compared (`""` for `created`). A lost swap (`gitrepo.ErrRefMoved`)
+is `409 ref_moved` with the branch's current commit. From the choice of
+action on, the reset runs on `context.WithoutCancel`. The record and the
+moves are one `store.Tx`: it reads the patch again and refuses one now
+`merged_upstream` or `deleted` (`409 patch_status_invalid`), records the
+origin fields (when `patch_branch_source` is `origin`), emits
+`parley.patch.reset` and, for `replaced`, `parley.patch.replace`, and
+only then writes the backup ref and swaps the branch, so that a failed
+record moves nothing and a lost swap rolls the record back. The git work
+held in the store's write turn is two local `update-ref`s at most. When
+the commit itself fails after the swap, the branch is swapped back. The
+test-only `Deps.BeforeRefSwap(slug, branch)` runs after the compare and
+before that transaction, for every action.
+
 **The rebuild trigger.** `RebuildEnqueuer` (`EnqueueRebuild(ctx, slug,
 RebuildOptions) (RebuildResult, error)`) is the interface every source of a
 rebuild calls; the component holds a default that queues nothing, which
-`RegisterRebuildEnqueuer` replaces and `Rebuilds()` returns.
+`RegisterRebuildEnqueuer` replaces and `Rebuilds()` returns. A reset that
+moved the branch of an `active` or `conflict` patch calls it once its
+outcome is recorded, when the workspace's `auto_rebuild_after_sync`, read
+from the record again then, is on; `SubmittedBy` is the caller's user id
+(the admin token's actor type for the admin token). A result that is not
+`Queued` and an error (logged) leave the reset in place and report no
+job.
 
 ### Hub events
 
