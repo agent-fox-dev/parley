@@ -100,6 +100,9 @@ type Queue struct {
 	// stopping is set once the queue stops claiming: a pass then claims
 	// nothing.
 	stopping bool
+	// removals counts the goroutines that cancel the attempts of the jobs
+	// a workspace removal deleted.
+	removals sync.WaitGroup
 }
 
 // worker is an attempt of a job the queue runs.
@@ -449,4 +452,97 @@ func claimJob(ctx context.Context, tx *sql.Tx, id string, now time.Time) (bool, 
 		return false, fmt.Errorf("claim job %s: %w", id, err)
 	}
 	return n == 1, nil
+}
+
+// Depth is the number of jobs in each status, for every type with a
+// registered handler: all six statuses are there, 0 for one no job is in.
+func (q *Queue) Depth(ctx context.Context) (map[string]map[string]int, error) {
+	d, err := q.deps()
+	if err != nil {
+		return nil, err
+	}
+	q.mu.Lock()
+	depth := make(map[string]map[string]int, len(q.handlers))
+	for typ := range q.handlers {
+		depth[typ] = make(map[string]int, len(Statuses))
+		for _, status := range Statuses {
+			depth[typ][status] = 0
+		}
+	}
+	q.mu.Unlock()
+	if len(depth) == 0 {
+		return depth, nil
+	}
+	err = countJobs(ctx, d.Store.Main(), func(typ, status string, n int) {
+		if byStatus, ok := depth[typ]; ok {
+			byStatus[status] = n
+		}
+	})
+	return depth, err
+}
+
+// RemoveWorkspace deletes every job of the workspace slug, of every type
+// and status, in tx, the transaction of the workspace's removal; it is a
+// remover of the workspace's owned data (ADR 07). An attempt of a deleted
+// job is cancelled once that transaction has committed, and its outcome
+// then finds no job to settle, so it is dropped. A rolled-back removal
+// cancels nothing.
+func (q *Queue) RemoveWorkspace(ctx context.Context, tx *sql.Tx, slug string) error {
+	ids, err := deleteWorkspaceJobs(ctx, tx, slug)
+	if err != nil {
+		return err
+	}
+	// A claim commits in a write transaction too, so while tx is open the
+	// attempts the queue runs are all it will run of these jobs.
+	q.mu.Lock()
+	var attempts []string
+	for _, id := range ids {
+		if _, ok := q.running[id]; ok {
+			attempts = append(attempts, id)
+		}
+	}
+	d := q.d
+	q.mu.Unlock()
+	if len(attempts) == 0 {
+		return nil
+	}
+	q.removals.Add(1)
+	go func() {
+		defer q.removals.Done()
+		q.cancelRemoved(context.WithoutCancel(ctx), d, attempts)
+	}()
+	return nil
+}
+
+// cancelRemoved cancels the attempts of the jobs ids that no longer exist.
+// A remover sees only its transaction and the store has no commit hook, so
+// this waits for a write transaction of its own: the store runs them one
+// at a time, in the order they are asked for, so the removal's has ended
+// by then, and the jobs are gone only if it committed.
+func (q *Queue) cancelRemoved(ctx context.Context, d Deps, ids []string) {
+	var gone []string
+	err := d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		for _, id := range ids {
+			_, err := readJob(ctx, tx, id)
+			if errors.Is(err, ErrNotFound) {
+				gone = append(gone, id)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		d.Logger.Error("attempts of removed jobs not cancelled", "job_ids", ids, "error", err)
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, id := range gone {
+		if w, ok := q.running[id]; ok {
+			w.cancel()
+		}
+	}
 }

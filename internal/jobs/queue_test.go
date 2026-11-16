@@ -421,3 +421,34 @@ func TestPass_RequeuesAFailedJobWhenItsNextAttemptIsDue(t *testing.T) {
 		})
 	}
 }
+
+func TestDepth_CountsTheJobsOfEveryRegisteredTypeByStatus(t *testing.T) {
+	t.Parallel()
+	q := newTestQueue(t)
+	q.Register("probe", newScriptedHandler(true))
+	q.Register("rebuild", newScriptedHandler(true))
+	want := map[string]int{
+		StatusQueued: 2, StatusRunning: 1, StatusFailed: 1, StatusCompleted: 3, StatusDeadLetter: 1, StatusCancelled: 1,
+	}
+	n := 0
+	for _, status := range Statuses {
+		for range want[status] {
+			// One workspace each, so that the pending jobs do not refuse one
+			// another.
+			q.seed(t, "probe", fmt.Sprintf("w%d", n), status)
+			n++
+		}
+	}
+
+	got, err := q.Depth(context.Background())
+	if err != nil {
+		t.Fatalf("Depth: %v", err)
+	}
+	zero := map[string]int{}
+	for _, status := range Statuses {
+		zero[status] = 0
+	}
+	if wantAll := map[string]map[string]int{"probe": want, "rebuild": zero}; !reflect.DeepEqual(got, wantAll) {
+		t.Errorf("Depth = %v, want %v", got, wantAll)
+	}
+}

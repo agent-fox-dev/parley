@@ -189,3 +189,49 @@ func listJobs(ctx context.Context, q querier, typ, slug, status string, after *L
 	}
 	return jobs, nil
 }
+
+// countJobs reads through q the number of jobs of every type in every
+// status that has one, and gives each to add.
+func countJobs(ctx context.Context, q querier, add func(typ, status string, n int)) error {
+	rows, err := q.QueryContext(ctx, `SELECT type, status, count(*) FROM jobs GROUP BY type, status`)
+	if err != nil {
+		return fmt.Errorf("count jobs: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			typ, status string
+			n           int
+		)
+		if err := rows.Scan(&typ, &status, &n); err != nil {
+			return fmt.Errorf("count jobs: %w", err)
+		}
+		add(typ, status, n)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("count jobs: %w", err)
+	}
+	return nil
+}
+
+// deleteWorkspaceJobs deletes, in tx, every job of the workspace slug and
+// returns their ids.
+func deleteWorkspaceJobs(ctx context.Context, tx *sql.Tx, slug string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `DELETE FROM jobs WHERE workspace_slug = ? RETURNING id`, slug)
+	if err != nil {
+		return nil, fmt.Errorf("delete the jobs of %s: %w", slug, err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("delete the jobs of %s: %w", slug, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delete the jobs of %s: %w", slug, err)
+	}
+	return ids, nil
+}
