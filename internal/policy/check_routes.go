@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"unicode/utf8"
 
@@ -31,12 +32,57 @@ const eventCheck = "parley.change.check"
 // token can do nothing else, and write access to the workspace. The
 // pattern is not in the contributor table of internal/access, so that a
 // token bound to a task fork cannot report on the fork's parent a result
-// for the work it pushed.
+// for the work it pushed. Listing them needs changes:read and read
+// access; the list is in the contributor table, and the handler confines
+// it to the fork's own changes.
 func (c *Component) checkRoutes() []server.Route {
 	return []server.Route{{
 		Method: http.MethodPut, Pattern: "/workspaces/:slug/changes/:number/checks/:name", Scope: "checks:write",
 		Marks: map[string]string{access.MarkNeed: string(access.NeedWrite)}, Handler: c.putCheck,
+	}, {
+		Method: http.MethodGet, Pattern: "/workspaces/:slug/changes/:number/checks", Scope: "changes:read",
+		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.getChecks,
 	}}
+}
+
+// getChecks answers the results that apply to the change's current
+// version, or to the version the query names, by the same rule for every
+// version: one per check name, ordered by name, in pages of the list
+// envelope. A result carried from an earlier version shows the version it
+// was reported on. The refusals are those of the list of verdicts.
+func (c *Component) getChecks(w http.ResponseWriter, r *http.Request) error {
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	ctx := r.Context()
+	ch, err := c.readableChange(ctx, r)
+	if err != nil {
+		return err
+	}
+	version, err := queriedVersion(r, ch)
+	if err != nil {
+		return err
+	}
+	if version == 0 {
+		version = ch.Version
+	}
+	var after checkPosition
+	more, err := page.After(&after)
+	if err != nil {
+		return err
+	}
+	items, err := c.listChecks(ctx, c.deps.Store.Main(), ch, version)
+	if err != nil {
+		return err
+	}
+	// The list is computed whole, since which result applies to a name
+	// depends on every version it reaches, so the page is cut from it.
+	if more {
+		items = items[min(len(items), sort.Search(len(items), func(i int) bool { return items[i].Name > after.Name })):]
+	}
+	items = items[:min(len(items), page.Limit+1)]
+	return server.WritePage(w, page, items, func(r checkResult) any { return checkPosition{r.Name} })
 }
 
 // checkRequest is the body of a check report: version is 0 for the change's

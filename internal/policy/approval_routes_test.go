@@ -554,3 +554,71 @@ func TestDeleteApproval_RefusesAndRemovesNothing(t *testing.T) {
 		})
 	}
 }
+
+// evidenceLists are the routes that list the evidence on a change: its
+// verdicts and its check results.
+var evidenceLists = []string{"approvals", "checks"}
+
+// listPath is the path of the list route of the change number of api.
+func listPath(number, route string) string {
+	return "/api/v1/workspaces/api/changes/" + number + "/" + route
+}
+
+func TestEvidenceLists_RefuseABadVersionAnUnknownChangeAndACallerWithoutAccess(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	if n := w.openPushed(t, "work").number; n != 1 {
+		t.Fatalf("the change is number %d, want 1", n)
+	}
+	noRead := w.IssuePAT(t, identity.PATSpec{UserID: w.dana, Permissions: []string{"changes:approve", "checks:write"}})
+	for _, route := range evidenceLists {
+		for _, tc := range []struct {
+			name, number, query, credential string
+			status                          int
+			errorType                       string
+		}{
+			{"version 0", "1", "?version=0", w.melKey, http.StatusBadRequest, "invalid_request"},
+			{"version not a number", "1", "?version=abc", w.melKey, http.StatusBadRequest, "invalid_request"},
+			{"version the change does not have", "1", "?version=9", w.melKey, http.StatusNotFound, "not_found"},
+			{"unknown change", "99", "", w.melKey, http.StatusNotFound, "change_not_found"},
+			{"PAT without changes:read", "1", "", noRead, http.StatusForbidden, "insufficient_scope"},
+			{"outsider", "1", "", w.ozKey, http.StatusNotFound, "not_found"},
+		} {
+			t.Run(route+", "+tc.name, func(t *testing.T) {
+				if r := w.get(t, listPath(tc.number, route)+tc.query, tc.credential); r.status != tc.status || r.errorType() != tc.errorType {
+					t.Errorf("= %d %s, want %d %s", r.status, r.body, tc.status, tc.errorType)
+				}
+			})
+		}
+	}
+}
+
+func TestEvidenceLists_ShowATokenBoundToAForkOnlyTheChangesFromTheFork(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	own := w.openPushed(t, "work").number
+	fromFork := w.openTouching(t, "forked", "f.txt", func(in *change.OpenInput) { in.SourceWorkspace = "api--m1" })
+	if own != 1 || fromFork != 2 {
+		t.Fatalf("the changes are numbers %d and %d, want 1 and 2", own, fromFork)
+	}
+	w.give(t, fromFork, w.danaKey, approves)
+	w.report(t, fromFork, "test", map[string]any{"status": "passed"})
+	for _, route := range evidenceLists {
+		t.Run(route, func(t *testing.T) {
+			want := w.get(t, listPath("2", route), w.danaKey).json["items"]
+			if items, _ := want.([]any); len(items) != 1 {
+				t.Fatalf("dana's list of change 2 = %v, want one item", want)
+			}
+			if r := w.get(t, listPath("2", route), w.melM1); r.status != http.StatusOK || !reflect.DeepEqual(r.json["items"], want) {
+				t.Errorf("change from the fork = %d %s, want 200 with %v", r.status, r.body, want)
+			}
+			hidden, unknown := w.get(t, listPath("1", route), w.melM1), w.get(t, listPath("99", route), w.melM1)
+			if hidden.status != http.StatusNotFound || hidden.errorType() != "change_not_found" {
+				t.Errorf("change from api = %d %s, want 404 change_not_found", hidden.status, hidden.body)
+			}
+			if string(hidden.body) != string(unknown.body) {
+				t.Errorf("change from api answers %s, an unknown change %s; want the same body", hidden.body, unknown.body)
+			}
+		})
+	}
+}

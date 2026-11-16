@@ -575,6 +575,12 @@ func checkPath(number int64, name string) string {
 	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/checks/" + name
 }
 
+// checksPath is the path of the check results of the change number of
+// api.
+func checksPath(number int64) string {
+	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/checks"
+}
+
 // putCheck sends body as the result of the check name of the change
 // number of api with credential.
 func (w *world) putCheck(t *testing.T, number int64, name, credential string, body any) answer {

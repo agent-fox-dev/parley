@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"slices"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
@@ -72,4 +74,87 @@ ON CONFLICT (workspace_slug, number, version, name) DO UPDATE SET
 		s.Workspace, s.Number, s.Version, s.Name, s.Status, s.Summary, s.URL, details,
 		s.By.ActorType, s.By.ActorID, s.By.Username, s.UpdatedAt.UnixNano())
 	return err
+}
+
+// checkColumns are the columns scanCheck reads, in its order.
+const checkColumns = `workspace_slug, number, version, name, status, summary, url, details, actor_type, actor_id,
+username, updated_at`
+
+// readChecks is every result stored for the change number of the
+// workspace, on any version, read through q.
+func readChecks(ctx context.Context, q Querier, workspace string, number int64) ([]storedCheck, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+checkColumns+` FROM change_checks
+WHERE workspace_slug = ? AND number = ?`, workspace, number)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []storedCheck
+	for rows.Next() {
+		var (
+			s       storedCheck
+			details sql.NullString
+			updated int64
+		)
+		if err := rows.Scan(&s.Workspace, &s.Number, &s.Version, &s.Name, &s.Status, &s.Summary, &s.URL, &details,
+			&s.By.ActorType, &s.By.ActorID, &s.By.Username, &updated); err != nil {
+			return nil, err
+		}
+		if details.Valid {
+			s.Details = json.RawMessage(details.String)
+		}
+		s.UpdatedAt = time.Unix(0, updated).UTC()
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// applying is the result of the check name that applies to version of a
+// change whose versions are versions and whose stored results are results:
+// the one reported on that version, else the one on the nearest earlier
+// version it reaches through patch_equivalent_to. A result is not copied
+// when a version is recorded but looked up here, so that it keeps the
+// version it was reported on and a requirement with fresh_checks can tell
+// it from one reported on the version itself; given no versions, only the
+// version's own result applies.
+func applying(versions []change.Version, results []storedCheck, version int64, name string) (storedCheck, bool) {
+	for _, n := range equivalenceChain(versions, version) {
+		for _, r := range results {
+			if r.Version == n && r.Name == name {
+				return r, true
+			}
+		}
+	}
+	return storedCheck{}, false
+}
+
+// listChecks is the results that apply to version of the change ch, one
+// per check name that has one, ordered by name, read through q and
+// answered as the routes answer them.
+func (c *Component) listChecks(ctx context.Context, q Querier, ch change.Change, version int64) ([]checkResult, error) {
+	results, err := readChecks(ctx, q, ch.WorkspaceSlug, ch.Number)
+	if err != nil || len(results) == 0 {
+		return []checkResult{}, err
+	}
+	versions, err := c.deps.Changes.ReadVersions(ctx, q, ch.WorkspaceSlug, ch.Number)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(results))
+	for _, r := range results {
+		names = append(names, r.Name)
+	}
+	slices.Sort(names)
+	out := []checkResult{}
+	for _, name := range slices.Compact(names) {
+		if r, ok := applying(versions, results, version, name); ok {
+			out = append(out, checkOf(r))
+		}
+	}
+	return out, nil
+}
+
+// checkPosition is a result's place in the list's order.
+type checkPosition struct {
+	Name string `json:"name"`
 }

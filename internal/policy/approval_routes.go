@@ -153,29 +153,22 @@ func (c *Component) postApproval(w http.ResponseWriter, r *http.Request) error {
 // getApprovals answers the verdicts of the change, of every version or of
 // the version the query names, newest first, in pages of the list
 // envelope. After the page come, in this order, a change the workspace
-// does not have, a version that is not a positive integer and a version
-// the change does not have. Every status of the workspace answers the
-// read.
+// does not have or a token bound to a task fork may not see, a version
+// that is not a positive integer and a version the change does not have.
+// Every status of the workspace answers the read.
 func (c *Component) getApprovals(w http.ResponseWriter, r *http.Request) error {
 	page, err := server.ReadPage(r)
 	if err != nil {
 		return err
 	}
 	ctx := r.Context()
-	ch, err := c.existingChange(ctx, r)
+	ch, err := c.readableChange(ctx, r)
 	if err != nil {
 		return err
 	}
 	var f verdictFilter
-	if q := r.URL.Query(); q.Has("version") {
-		v, ok := positive(q.Get("version"))
-		if !ok {
-			return server.InvalidRequest("version must be a positive integer")
-		}
-		if v > ch.Version {
-			return server.NotFound(fmt.Sprintf("%s has no version %d", ch.Ref, v))
-		}
-		f.Version = v
+	if f.Version, err = queriedVersion(r, ch); err != nil {
+		return err
 	}
 	var after verdictPosition
 	more, err := page.After(&after)
@@ -249,6 +242,41 @@ func (c *Component) existingChange(ctx context.Context, r *http.Request) (change
 		return change.Change{}, change.ErrChangeNotFound
 	}
 	return ch, err
+}
+
+// readableChange is existingChange for a read of the evidence on the
+// change. A token bound to a task fork reads, on the fork's parent, only
+// the changes whose source is the fork; any other is answered with the
+// constant change_not_found of a number the workspace does not have, so
+// that the answer tells nothing of it.
+func (c *Component) readableChange(ctx context.Context, r *http.Request) (change.Change, error) {
+	ch, err := c.existingChange(ctx, r)
+	if err != nil {
+		return change.Change{}, err
+	}
+	if b, ok := access.BindingOf(r); ok && b.Relation == access.RelationParentOfBoundFork && ch.Source.WorkspaceSlug != b.Workspace {
+		return change.Change{}, change.ErrChangeNotFound
+	}
+	return ch, nil
+}
+
+// queriedVersion is the version of the change ch that the request's query
+// parameter version names, 0 when it names none, refused with 400
+// invalid_request when it is not a positive integer and with 404
+// not_found when the change has no such version.
+func queriedVersion(r *http.Request, ch change.Change) (int64, error) {
+	q := r.URL.Query()
+	if !q.Has("version") {
+		return 0, nil
+	}
+	v, ok := positive(q.Get("version"))
+	if !ok {
+		return 0, server.InvalidRequest("version must be a positive integer")
+	}
+	if v > ch.Version {
+		return 0, server.NotFound(fmt.Sprintf("%s has no version %d", ch.Ref, v))
+	}
+	return v, nil
 }
 
 // writableChange reads, in tx, the change number of the workspace slug,

@@ -2,6 +2,7 @@ package policy_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -227,5 +228,125 @@ func TestFacts_VerdictsCountOnlyOnTheVersionTheyAreOn(t *testing.T) {
 	res, _, err := w.policy.JudgeVersion(ctx, "api", n, 1, w.base, first)
 	if err != nil || res.Status != change.LandingPending || res.Requirements[0].Approvals.Counted != 0 {
 		t.Errorf("JudgeVersion of version 1 = %+v, %v; want pending with none counted", res, err)
+	}
+}
+
+// requirementFor is the requirement of the rule rule in the landing l, nil
+// when it has none.
+func requirementFor(l map[string]any, rule string) map[string]any {
+	reqs, _ := l["requirements"].([]any)
+	for _, r := range reqs {
+		if req, _ := r.(map[string]any); req["rule"] == rule {
+			return req
+		}
+	}
+	return nil
+}
+
+// statuses are the named checks with their status, in the requirement's
+// order, as the landing shows them.
+func statuses(pairs ...string) []any {
+	out := []any{}
+	for i := 0; i+1 < len(pairs); i += 2 {
+		out = append(out, map[string]any{"name": pairs[i], "status": pairs[i+1]})
+	}
+	return out
+}
+
+func TestFacts_ChecksHaveTheStatusOfTheResultThatAppliesToTheCurrentVersion(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.putPolicy(t, `{"default": {"approvals": 0, "checks": ["test", "lint"]}}`)
+	files := map[string]string{"work.txt": "work\n"}
+	n := w.openPushedFiles(t, "work", files).number
+	steps := []struct {
+		name string
+		do   func(t *testing.T)
+		// status is the landing's, checks the requirement's.
+		status string
+		checks []any
+	}{
+		{"no result", func(*testing.T) {}, change.LandingPending, statuses("test", "pending", "lint", "pending")},
+		{"test passed", func(t *testing.T) { w.report(t, n, "test", map[string]any{"status": "passed"}) },
+			change.LandingPending, statuses("test", "passed", "lint", "pending")},
+		{"lint failed", func(t *testing.T) { w.report(t, n, "lint", map[string]any{"status": "failed"}) },
+			change.LandingPending, statuses("test", "passed", "lint", "failed")},
+		{"lint passed", func(t *testing.T) { w.report(t, n, "lint", map[string]any{"status": "passed"}) },
+			change.LandingReady, statuses("test", "passed", "lint", "passed")},
+		{"docs, which no requirement names, failed", func(t *testing.T) { w.report(t, n, "docs", map[string]any{"status": "failed"}) },
+			change.LandingReady, statuses("test", "passed", "lint", "passed")},
+		{"a pure rebase", func(t *testing.T) {
+			w.record(t, "work", w.rebased(t, "work", files), change.KindRebase, w.danaCaller())
+		}, change.LandingReady, statuses("test", "passed", "lint", "passed")},
+		{"test pending on the rebased version", func(t *testing.T) { w.report(t, n, "test", map[string]any{"status": "pending"}) },
+			change.LandingPending, statuses("test", "pending", "lint", "passed")},
+		{"a version that changes content", func(t *testing.T) { w.edited(t, "work", "work.txt") },
+			change.LandingPending, statuses("test", "pending", "lint", "pending")},
+	}
+	for _, s := range steps {
+		s.do(t)
+		l := w.landing(t, n)
+		if l["status"] != s.status || !reflect.DeepEqual(only(l)["checks"], s.checks) {
+			t.Errorf("after %s: landing %v, want %s with checks %v", s.name, l, s.status, s.checks)
+		}
+	}
+}
+
+func TestFacts_FreshChecksCountOnlyResultsOnTheCurrentVersion(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.putPolicy(t, `{"default": {"approvals": 0, "checks": ["test"]},
+"rules": [{"name": "billing", "paths": ["billing/**"], "require": {"checks": ["test"], "fresh_checks": true}}]}`)
+	files := map[string]string{"billing/a.go": "package billing\n", "README.md": "work\n"}
+	n := w.openPushedFiles(t, "work", files).number
+	w.report(t, n, "test", map[string]any{"status": "passed"})
+	if l := w.landing(t, n); l["status"] != change.LandingReady {
+		t.Fatalf("landing after test passed on version 1 = %v, want ready", l)
+	}
+	w.record(t, "work", w.rebased(t, "work", files), change.KindRebase, w.danaCaller())
+	l := w.landing(t, n)
+	if r := requirementFor(l, "billing"); !reflect.DeepEqual(r["checks"], statuses("test", "pending")) || r["satisfied"] != false {
+		t.Errorf("billing requirement after a pure rebase = %v, want test pending and unsatisfied", r)
+	}
+	if r := requirementFor(l, "default"); !reflect.DeepEqual(r["checks"], statuses("test", "passed")) || r["satisfied"] != true {
+		t.Errorf("default requirement after a pure rebase = %v, want test passed and satisfied", r)
+	}
+	if l["status"] != change.LandingPending {
+		t.Errorf("landing after a pure rebase = %v, want pending", l["status"])
+	}
+	w.report(t, n, "test", map[string]any{"status": "passed"})
+	if l := w.landing(t, n); l["status"] != change.LandingReady {
+		t.Errorf("landing after test passed on version 2 = %v, want ready", l)
+	}
+}
+
+func TestFacts_AResultOnAVersionTheCurrentOneDoesNotReachChangesNoStatus(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.putPolicy(t, `{"default": {"approvals": 0, "checks": ["test"]}}`)
+	n := w.openPushed(t, "work").number
+	w.edited(t, "work", "work.txt")
+	before, seq := w.landing(t, n), w.seq(t)
+	if before["status"] != change.LandingPending {
+		t.Fatalf("landing before = %v, want pending", before)
+	}
+	r := w.putCheck(t, n, "test", w.danaKey, map[string]any{"status": "passed", "version": 1})
+	if r.status != http.StatusOK || r.json["version"] != 1.0 {
+		t.Fatalf("report on version 1 = %d %s, want 200 on version 1", r.status, r.body)
+	}
+	if after := w.landing(t, n); !reflect.DeepEqual(after, before) {
+		t.Errorf("landing = %v, want it as before: %v", after, before)
+	}
+	if items := w.get(t, checksPath(n), w.danaKey).json["items"]; !reflect.DeepEqual(items, []any{}) {
+		t.Errorf("results of the current version = %v, want none", items)
+	}
+	if items, _ := w.get(t, checksPath(n)+"?version=1", w.danaKey).json["items"].([]any); len(items) != 1 ||
+		items[0].(map[string]any)["status"] != "passed" {
+		t.Errorf("results of version 1 = %v, want test passed", items)
+	}
+	evs := w.eventsAfter(t, seq, eventCheck)
+	var meta map[string]any
+	if len(evs) != 1 || json.Unmarshal(evs[0].Metadata, &meta) != nil || meta["version"] != 1.0 {
+		t.Errorf("check events = %v, want one with metadata.version 1", evs)
 	}
 }

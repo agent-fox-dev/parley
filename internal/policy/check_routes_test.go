@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,6 +19,18 @@ import (
 
 // eventCheck is the type of the event a check report records.
 const eventCheck = "parley.change.check"
+
+// report puts body as the result of the check name of the change number
+// of api, as dana, and fails the test unless it is stored; it returns the
+// check as answered.
+func (w *world) report(t *testing.T, number int64, name string, body map[string]any) any {
+	t.Helper()
+	r := w.putCheck(t, number, name, w.danaKey, body)
+	if r.status != http.StatusOK {
+		t.Fatalf("report %s %v on %d = %d %s, want 200", name, body, number, r.status, r.body)
+	}
+	return r.json
+}
 
 // detailsOf is a details object whose JSON text is size bytes long.
 func detailsOf(size int) json.RawMessage {
@@ -136,8 +149,8 @@ func TestPutCheck_ReplacesTheStoredResult(t *testing.T) {
 	if got := w.storedResult(t, n, 1, "test"); !reflect.DeepEqual(got, want) {
 		t.Errorf("stored result = %v, want %v", got, want)
 	}
-	if got := w.count(t, "change_checks"); got != 1 {
-		t.Errorf("%d results stored, want 1", got)
+	if l := w.get(t, checksPath(n), w.danaKey); !reflect.DeepEqual(l.json["items"], []any{r.json}) {
+		t.Errorf("listed results = %s, want the replacement alone", l.body)
 	}
 }
 
@@ -328,5 +341,49 @@ func TestPutCheck_WritesOneEventInTheResultsTransaction(t *testing.T) {
 				t.Errorf("the event's transaction read %v, want the result as stored now (%s at %v)", probe.results, tc.status, at)
 			}
 		})
+	}
+}
+
+func TestListChecks_ListsTheResultsThatApplyToTheVersionByName(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	files := map[string]string{"work.txt": "work\n"}
+	n := w.openPushedFiles(t, "work", files).number
+	melRead := w.IssuePAT(t, identity.PATSpec{UserID: w.mel, Permissions: []string{"changes:read"}})
+	on := func(status string, version int) map[string]any {
+		return map[string]any{"status": status, "version": version}
+	}
+	test1, lint1, build1 := w.report(t, n, "test", on("passed", 1)), w.report(t, n, "lint", on("failed", 1)),
+		w.report(t, n, "build", on("passed", 1))
+	w.record(t, "work", w.rebased(t, "work", files), change.KindRebase, w.danaCaller())
+	lint2 := w.report(t, n, "lint", on("passed", 2))
+	if r := w.get(t, checksPath(n), melRead); r.status != http.StatusOK || !reflect.DeepEqual(r.json["items"], []any{build1, lint2, test1}) ||
+		r.json["next_cursor"] != nil {
+		t.Errorf("list of the current version 2 = %d %s, want build and test carried from 1 and lint on 2", r.status, r.body)
+	}
+	w.edited(t, "work", "work.txt")
+	for _, tc := range []struct {
+		name, query string
+		want        []any
+		more        bool
+	}{
+		{"the current version 3, which reaches none", "", []any{}, false},
+		{"version 2, with the results carried from 1", "?version=2", []any{build1, lint2, test1}, false},
+		{"version 1", "?version=1", []any{build1, lint1, test1}, false},
+		{"version 3", "?version=3", []any{}, false},
+		{"a page of two of version 2", "?version=2&limit=2", []any{build1, lint2}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := w.get(t, checksPath(n)+tc.query, melRead)
+			if r.status != http.StatusOK || !reflect.DeepEqual(r.json["items"], tc.want) || (r.json["next_cursor"] != nil) != tc.more {
+				t.Errorf("= %d %s, want %v with a next cursor %v", r.status, r.body, tc.want, tc.more)
+			}
+		})
+	}
+	first := w.get(t, checksPath(n)+"?version=2&limit=2", melRead)
+	cursor, _ := first.json["next_cursor"].(string)
+	next := w.get(t, checksPath(n)+"?version=2&limit=2&cursor="+url.QueryEscape(cursor), melRead)
+	if next.status != http.StatusOK || !reflect.DeepEqual(next.json["items"], []any{test1}) || next.json["next_cursor"] != nil {
+		t.Errorf("second page of two = %d %s, want the result of test on 1 alone", next.status, next.body)
 	}
 }
