@@ -371,6 +371,14 @@ func (s *Served) Call(t testing.TB, method, path, credential string, body any) (
 // as an Idempotency-Key.
 func (s *Served) CallWith(t testing.TB, method, path, credential string, body any, header http.Header) (int, []byte) {
 	t.Helper()
+	status, _, b := s.Exchange(t, method, path, credential, body, header)
+	return status, b
+}
+
+// Exchange is CallWith that also returns the headers of the answer, such
+// as an ETag.
+func (s *Served) Exchange(t testing.TB, method, path, credential string, body any, header http.Header) (int, http.Header, []byte) {
+	t.Helper()
 	var data io.Reader
 	switch b := body.(type) {
 	case nil:
@@ -411,5 +419,5 @@ func (s *Served) CallWith(t testing.TB, method, path, credential string, body an
 	if err != nil {
 		t.Fatalf("%s %s: read the body: %v", method, path, err)
 	}
-	return res.StatusCode, b
+	return res.StatusCode, res.Header, b
 }

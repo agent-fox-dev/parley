@@ -64,6 +64,10 @@ func newWorld(t *testing.T, adjust ...func(*land.Deps)) *world {
 		Compose: func(c *hub.Composition) {
 			w.land, w.changes, w.forks, w.events, w.workspaces = c.Land(), c.Changes(), c.Forks(), c.Events(), c.Workspaces()
 			w.land.RegisterSessionLinker(w.sessions)
+			// The landing policy's gate is removed, so that a land is
+			// judged by the gate a test registers, every change ready
+			// without one.
+			w.land.RegisterGate(nil)
 			for _, fn := range adjust {
 				c.AdjustLand(fn)
 			}

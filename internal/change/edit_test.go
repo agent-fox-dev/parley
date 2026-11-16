@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -437,6 +438,33 @@ func TestEdit_MovesAnOpenChangeBackToDraftKeepingWhatItHas(t *testing.T) {
 	}
 	if head := w.announced(t, n); head != "" {
 		t.Errorf("the draft is still announced landable at %s", head)
+	}
+}
+
+func TestEdit_AsksTheEvaluatorWithTheDraftCauseOnAMoveBetweenDraftAndOpen(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.branch(t, "b", "B\n")
+	n := w.openBranch(t, "b", nil).Number
+	w.settled(t, n)
+	e := &evaluator{steps: &steps{}, landing: change.Landing{Status: change.LandingPending,
+		Requirements: []json.RawMessage{json.RawMessage(`{"rule":"default"}`)}}}
+	w.changes.RegisterLandingEvaluator(e)
+	for _, c := range []struct {
+		state, cause string
+		want         map[string]any
+	}{
+		{change.StateDraft, "draft", map[string]any{"status": "blocked", "reason": "draft", "requirements": []any{map[string]any{"rule": "default"}}}},
+		{change.StateOpen, "", map[string]any{"status": "pending", "reason": nil, "requirements": []any{map[string]any{"rule": "default"}}}},
+	} {
+		called := len(e.asked(0))
+		status, got := w.patch(t, n, w.ownerKey, map[string]any{"state": c.state})
+		if status != http.StatusOK || !reflect.DeepEqual(got["landing"], c.want) {
+			t.Errorf("PATCH state %s = %d with landing %v, want 200 with %v", c.state, status, got["landing"], c.want)
+		}
+		if asked := e.asked(called); len(asked) != 1 || asked[0] != c.cause {
+			t.Errorf("PATCH state %s asked the evaluator with %q, want once with %q", c.state, asked, c.cause)
+		}
 	}
 }
 

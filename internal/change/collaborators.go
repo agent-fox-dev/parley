@@ -93,11 +93,16 @@ type StackLinker interface {
 	SetDependsOn(ctx context.Context, tx *sql.Tx, ch Change, dependsOn *int64) error
 }
 
-// LandingEvaluator answers the landing of a change that is not a draft,
-// which the landing policy computes. Without one every such change is
-// ready.
+// LandingEvaluator answers the landing of the change ch at its version v,
+// which the landing policy computes, in tx. It is asked for every new
+// version and every re-evaluation, a draft's and a structurally blocked
+// change's included, with cause the reason the change cannot land
+// whatever the policy requires ("draft", or a structural reason such as
+// nothing_to_land), nil for none: it blocks the landing for cause and
+// still lists the requirements. Without one a change is ready with no
+// requirements, or blocked for its cause with none.
 type LandingEvaluator interface {
-	EvaluateLanding(ctx context.Context, tx *sql.Tx, ch Change, v Version) (Landing, error)
+	EvaluateLanding(ctx context.Context, tx *sql.Tx, ch Change, v Version, cause *string) (Landing, error)
 }
 
 // VersionObserver is told of every new version, in tx, after the change's

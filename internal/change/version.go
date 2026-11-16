@@ -50,12 +50,13 @@ type VersionInput struct {
 // linker, the landing derivation and the version observers in that order
 // and writes parley.change.version with the version as stored then, whose
 // base and patch equivalence the stack linker may have measured again
-// from the change below. The landing of a draft stays
-// blocked/draft; a missing target branch, a head with no commit the target
-// lacks, a head with no history in common with the target and a merge
-// commit among the version's commits block it as target_not_found,
-// nothing_to_land, unrelated_history and merge_commits without asking the
-// landing evaluator. The change keeps its state.
+// from the change below. A draft is blocked for draft; a missing target
+// branch, a head with no commit the target lacks, a head with no history in
+// common with the target and a merge commit among the version's commits
+// block it as target_not_found, nothing_to_land, unrelated_history and
+// merge_commits. A registered landing evaluator is asked in every case,
+// with that cause, and its answer is the landing; without one the landing
+// of a draft stays as it is. The change keeps its state.
 //
 // As with Open, the version ref is written before the collaborators run
 // and before RecordVersion returns, and removed again when a later step
@@ -84,7 +85,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 			return nil, err
 		}
 	}
-	o, structural, err := c.measureMove(ctx, tx, ch, in.Head)
+	o, cause, err := c.measureMove(ctx, tx, ch, in.Head)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +117,7 @@ func (c *Component) RecordVersion(ctx context.Context, tx *sql.Tx, in VersionInp
 	if err := storeVersion(ctx, tx, workspace, number, v, o.paths, o.truncated); err != nil {
 		return nil, err
 	}
-	if err := c.afterVersion(ctx, tx, co, workspace, number, v, nil, structural); err != nil {
+	if err := c.afterVersion(ctx, tx, co, workspace, number, v, nil, cause); err != nil {
 		return nil, err
 	}
 	if ch, err = readChange(ctx, tx, workspace, number); err != nil {
@@ -202,59 +203,72 @@ func (c *Component) RecordRacedVersion(ctx context.Context, tx *sql.Tx, workspac
 // measureMove measures head, the new head of the change ch's source branch,
 // as Open measures version 1: its base, stats, touched paths and patch id,
 // read in the source's repository, which for a fork reads its parent's
-// objects. structural is the landing a cause in the version blocks, nil
-// for none: the target branch missing, no commit the target lacks, no
-// history in common with the target, or a merge commit among the commits.
-func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head string) (o *opening, structural *Landing, err error) {
+// objects, and cause, the structural reason moveCause finds.
+func (c *Component) measureMove(ctx context.Context, q Querier, ch Change, head string) (*opening, *string, error) {
+	o, ahead, cause, err := c.moveCause(ctx, q, ch, head)
+	if err != nil {
+		return nil, nil, err
+	}
+	return o, cause, o.measureFromBase(ctx, ahead)
+}
+
+// moveCause reads what decides the structural reason head, a head of the
+// change ch's source branch, cannot land for, without the diff, the stats
+// or the patch id measureMove adds: the target's head, the commits of head
+// it lacks, whose number is ahead, the base into o.base, and the parents
+// of those commits. cause is nil for none: target_not_found for the target
+// branch missing, nothing_to_land for no commit the target lacks,
+// unrelated_history for no history in common with the target, and
+// merge_commits for a merge commit among the commits. Without a target
+// branch the base is the version's own.
+func (c *Component) moveCause(ctx context.Context, q Querier, ch Change, head string) (o *opening, ahead int, cause *string, err error) {
 	o = &opening{head: head}
 	if o.targetRepo, err = c.deps.Repos(ctx, ch.WorkspaceSlug); err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 	o.sourceRepo = o.targetRepo
 	if ch.Source.WorkspaceSlug != ch.WorkspaceSlug {
 		if o.sourceRepo, err = c.deps.Repos(ctx, ch.Source.WorkspaceSlug); err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
 	}
 	targetHead, found, err := o.targetRepo.ResolveBranch(ctx, ch.TargetBranch)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 	if !found {
 		if o.base, err = versionBase(ctx, q, ch.WorkspaceSlug, ch.Number, ch.Version); err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
-		ahead, err := o.sourceRepo.CommitsBetween(ctx, o.base, head, 0)
+		commits, err := o.sourceRepo.CommitsBetween(ctx, o.base, head, 0)
 		if err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
-		l := blockedLanding("target_not_found")
-		return o, &l, o.measureFromBase(ctx, len(ahead))
+		return o, len(commits), new("target_not_found"), nil
 	}
-	ahead, err := o.sourceRepo.CommitsBetween(ctx, targetHead, head, 0)
+	commits, err := o.sourceRepo.CommitsBetween(ctx, targetHead, head, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
-	if err := o.measure(ctx, targetHead, len(ahead)); err != nil {
-		return nil, nil, err
+	// A head that shares no history with the target has no base, and is
+	// measured from the empty tree.
+	if o.base, err = o.sourceRepo.MergeBase(ctx, head, targetHead); err != nil {
+		return nil, 0, nil, err
 	}
-	if len(ahead) == 0 {
-		l := blockedLanding("nothing_to_land")
-		return o, &l, nil
+	switch {
+	case len(commits) == 0:
+		return o, 0, new("nothing_to_land"), nil
+	case o.base == "":
+		return o, len(commits), new("unrelated_history"), nil
 	}
-	if o.base == "" {
-		l := blockedLanding("unrelated_history")
-		return o, &l, nil
-	}
-	commits, err := o.sourceRepo.ReadCommits(ctx, ahead)
+	read, err := o.sourceRepo.ReadCommits(ctx, commits)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
-	for _, cm := range commits {
+	for _, cm := range read {
 		if len(cm.Parents) > 1 {
-			l := blockedLanding("merge_commits")
-			return o, &l, nil
+			return o, len(commits), new("merge_commits"), nil
 		}
 	}
-	return o, nil, nil
+	return o, len(commits), nil, nil
 }

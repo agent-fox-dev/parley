@@ -96,6 +96,9 @@ type apiRequest struct {
 	// application/json, for a route that answers another form unless JSON
 	// is asked for.
 	accept string
+	// header holds the request's own headers, such as a condition; the
+	// headers the client sets itself take precedence over them.
+	header http.Header
 }
 
 // response is the hub's answer to one request: its status and its whole
@@ -169,6 +172,9 @@ func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
 	req, err := http.NewRequestWithContext(reqCtx, r.method, target, payload)
 	if err != nil {
 		return nil, clientError("cannot build a request to the hub at %s: %v", c.hubURL, err)
+	}
+	for name, values := range r.header {
+		req.Header[http.CanonicalHeaderKey(name)] = values
 	}
 	if c.credential != "" {
 		req.Header.Set("Authorization", "Bearer "+c.credential)

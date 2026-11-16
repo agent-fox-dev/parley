@@ -136,6 +136,32 @@ func TestLookups_AnswerFromTheChangeRecord(t *testing.T) {
 			t.Errorf("ReadChange = %v, want the answer %v", got, posted)
 		}
 	})
+	t.Run("DraftAndOpen", func(t *testing.T) {
+		for _, c := range []struct {
+			name, workspace string
+			want            []int64
+		}{
+			{"a repository's, from its fork too, without the landed one", "demo", []int64{1, 2, 4, 5}},
+			{"a fork, which holds none", "demo--m1", []int64{}},
+			{"another workspace", "other", []int64{}},
+		} {
+			if got, err := w.changes.DraftAndOpen(ctx, nil, c.workspace); err != nil || !reflect.DeepEqual(got, c.want) {
+				t.Errorf("%s: DraftAndOpen(%s) = %v, %v; want %v", c.name, c.workspace, got, err, c.want)
+			}
+		}
+		err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+			if err := w.changes.Abandon(ctx, tx, "demo", 4, "undone", w.ownerCaller()); err != nil {
+				return err
+			}
+			if got, err := w.changes.DraftAndOpen(ctx, tx, "demo"); err != nil || !reflect.DeepEqual(got, []int64{1, 2, 5}) {
+				t.Errorf("DraftAndOpen in the transaction that abandoned 4 = %v, %v; want [1 2 5]", got, err)
+			}
+			return errRollback
+		})
+		if !errors.Is(err, errRollback) {
+			t.Fatal(err)
+		}
+	})
 	t.Run("OpenCounts", func(t *testing.T) {
 		got, err := w.changes.OpenCounts(ctx)
 		if want := map[string]int{"demo": 4}; err != nil || !reflect.DeepEqual(got, want) {

@@ -3,9 +3,11 @@ package change_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -220,15 +222,16 @@ func TestRecordVersion_NamesTheLatestPatchEquivalentVersion(t *testing.T) {
 	}
 }
 
-func TestRecordVersion_StoresTheStructuralLandingWithoutTheEvaluator(t *testing.T) {
+func TestRecordVersion_AsksTheEvaluatorWithTheStructuralCause(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	commit(t, w.demo, "feat", w.base, "Feat\n", map[string]string{"x.txt": "x\n"})
 	w.openBranch(t, "feat", nil)
 	w.branch(t, "drafty", "Drafty\n")
 	w.openBranch(t, "drafty", func(in *change.OpenInput) { in.Draft = true })
-	calls := &steps{}
-	w.changes.RegisterLandingEvaluator(&evaluator{steps: calls, landing: change.Landing{Status: change.LandingReady}})
+	requirement := []json.RawMessage{json.RawMessage(`{"rule":"default"}`)}
+	e := &evaluator{steps: &steps{}, landing: change.Landing{Status: change.LandingReady, Requirements: requirement}}
+	w.changes.RegisterLandingEvaluator(e)
 	main := commit(t, w.demo, "main", "main", "Main moves\n", map[string]string{"m.txt": "m\n"})
 	side := commit(t, w.demo, "side", w.base, "Side\n", map[string]string{"s.txt": "s\n"})
 	merge := func(t *testing.T) string {
@@ -245,8 +248,8 @@ func TestRecordVersion_StoresTheStructuralLandingWithoutTheEvaluator(t *testing.
 		number int64
 		// move moves the change's branch and returns its new head.
 		move func(t *testing.T) string
-		// reason is the landing's blocked reason, "" for the evaluator's
-		// answer.
+		// reason is the cause the evaluator is asked with and the
+		// landing's blocked reason, "" for none.
 		reason string
 	}{
 		{"the head of main", 1, func(*testing.T) string { return main }, "nothing_to_land"},
@@ -269,24 +272,25 @@ func TestRecordVersion_StoresTheStructuralLandingWithoutTheEvaluator(t *testing.
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			before := w.read(t, c.number)
-			called := len(calls.order)
+			called := len(e.asked(0))
 			branch := map[int64]string{1: "feat", 2: "drafty"}[c.number]
 			v := w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: branch, Head: c.move(t), Kind: change.KindPush, Caller: w.ownerCaller()})
 			ch := w.read(t, c.number)
 			if ch.Version != before.Version+1 || v.Number != ch.Version || ch.State != before.State {
 				t.Errorf("version %d and state %s, want version %d and state %s", ch.Version, ch.State, before.Version+1, before.State)
 			}
-			wantCalls, want := called, change.LandingReady
-			if c.reason == "" {
-				wantCalls++
-			} else {
+			want := change.LandingReady
+			if c.reason != "" {
 				want = change.LandingBlocked
 			}
-			if reason := ch.Landing.Reason; ch.Landing.Status != want || (c.reason == "") != (reason == nil) || (reason != nil && *reason != c.reason) {
-				t.Errorf("landing = %+v, want %s %s", ch.Landing, want, c.reason)
+			if reason := ch.Landing.Reason; ch.Landing.Status != want || (c.reason == "") != (reason == nil) || (reason != nil && *reason != c.reason) ||
+				len(ch.Landing.Requirements) != 1 {
+				t.Errorf("landing = %+v, want the evaluator's answer, %s %s with its requirement", ch.Landing, want, c.reason)
 			}
-			if len(calls.order) != wantCalls {
-				t.Errorf("the evaluator was called %d times, want %d", len(calls.order)-called, wantCalls-called)
+			// The mergeability check of a change whose target is gone asks
+			// again, with the same cause.
+			if asked := e.asked(called); len(asked) == 0 || slices.ContainsFunc(asked, func(s string) bool { return s != c.reason }) {
+				t.Errorf("the evaluator was asked with the causes %q, want %q", asked, c.reason)
 			}
 			if c.reason == "unrelated_history" && (v.BaseSHA != nil || ch.BaseSHA != nil ||
 				ch.Stats != (change.Stats{Commits: 1, FilesChanged: 1, Insertions: 1}) || !reflect.DeepEqual(ch.Paths, []string{"r.txt"})) {

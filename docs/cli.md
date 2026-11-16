@@ -2230,6 +2230,87 @@ the argument <land-id>`) and a `--limit` that is not an integer are
 refused with a `usage_error` and exit status `2` before any setting is read
 or any request sent.
 
+### `parley policy`
+
+`parley policy` run without a command prints its help and exits `0`; it
+reads no credential and sends no request. Its three commands read, replace
+and try out the landing policy of a workspace through the
+[landing policy routes](api.md#landing-policy) of the hub. Each sends one
+request with the credential as `Authorization: Bearer` and `<slug>` as one
+percent-encoded path segment, and prints the hub's JSON answer on stdout
+with exit status `0`.
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley policy get <slug> [--revision <n>]` | `GET …/workspaces/<slug>/policy` | `--revision` as the query `revision` |
+| `parley policy set <slug> --file <path>\|- [--if-revision <n>]` | `PUT …/workspaces/<slug>/policy` | the document of the file as the body; `--if-revision <n>` as the header `If-Match: "<n>"` |
+| `parley policy evaluate <slug> --paths <list>... \| --change <n> [--target <branch>] [--policy-file <path>\|-]` | `POST …/workspaces/<slug>/policy/evaluate` | the body below |
+
+`set` prints the stored policy with its new `revision`; without
+`--if-revision` it sends no `If-Match` and replaces whatever revision is
+stored. `get` prints the current policy, or with `--revision` one of the
+revisions the hub keeps.
+
+The body of `parley policy evaluate` holds one member for each flag given,
+none for a flag not given: `paths`, a list of the values of every `--paths`
+flag split at commas, in command-line order (`--paths billing/a.go,docs/x.md
+--paths src/b.go` sends `["billing/a.go","docs/x.md","src/b.go"]`);
+`change`, the `--change` number; `target_branch`, the `--target` value; and
+`policy`, the document of `--policy-file`. It prints what the paths, or the
+change's files, would need, and writes nothing.
+
+**Policy files.** `set --file` and `evaluate --policy-file` read the
+document the same way: `-` reads standard input; a name ending in `.toml`
+is read as TOML; anything else is read as JSON and, when it is not valid
+JSON, as TOML. A JSON document is sent as it is. A TOML document is sent
+as the JSON document of the same content: its table `default` and its
+array of tables `rules` become the members `default` and `rules`,
+integers stay JSON numbers and booleans JSON booleans, so
+
+```toml
+[default]
+approvals = 0
+
+[[rules]]
+name = "billing"
+paths = ["billing/**"]
+
+[rules.require]
+approvals = 1
+checks = ["test"]
+```
+
+is sent as `{"default":{"approvals":0},"rules":[{"name":"billing","paths":["billing/**"],"require":{"approvals":1,"checks":["test"]}}]}`.
+The document is read before any request; whether it is a valid policy is
+the hub's to judge. A file or standard input that is empty or holds only
+white space is refused, although it is valid TOML: its document would be
+the empty one, which lets every change land, and an empty pipe or a
+truncated file must not replace the policy with it.
+
+A refusal of the hub's (`400` `invalid_policy` with its `details`, `412`
+`revision_mismatch`, `403` `token_bound` for a token bound to a task fork
+that runs `set` on the fork's parent, `400` `not_supported_on_fork`, `409`
+`workspace_archived`, `404` `not_found` for a revision the hub does not
+keep, `404` `change_not_found`, `400` `invalid_request`, among others) is
+written to stderr as received, with nothing on stdout and exit status `1`.
+
+**Client checks.** A wrong number of arguments (`parley policy get needs
+the argument <slug>`), `set` without `--file` (`parley policy set needs the
+flag --file`), a `--revision`, `--if-revision` or `--change` that is not a
+non-negative integer in decimal digits (`parley policy get takes
+--revision <n>, a non-negative integer, got "x"`), `evaluate` with both or
+neither of `--paths` and `--change` (`parley policy evaluate takes exactly
+one of --paths and --change`), a policy file that cannot be read (`parley
+policy set cannot read the policy of --file: open /nonexist: no such file
+or directory`), a `.toml` file that is not valid TOML (`parley policy set
+takes --file <path>, a policy document: j.toml is not valid TOML: …`), a
+file or standard input that is empty or blank (`parley policy set takes
+--file <path>, a policy document: standard input is empty`) and any other
+file, or standard input, that is neither valid JSON nor valid
+TOML (`parley policy set takes --file <path>, a policy document: bad.json
+is neither valid JSON nor valid TOML: …`) are refused with a `usage_error`
+and exit status `2` before any setting is read or any request sent.
+
 ### `parley scm`
 
 `parley scm` run without a command prints its help and exits `0`; it reads

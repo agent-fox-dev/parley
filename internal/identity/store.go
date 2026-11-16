@@ -280,6 +280,13 @@ func UserByID(ctx context.Context, q Querier, id string) (User, error) {
 	return userWhere(ctx, q, `id = ?`, id)
 }
 
+// UserByUsername returns the user whose username is username, compared
+// exactly, letter case included, or ErrNotFound. Unlike UserBySelector it
+// never reads the value as an id or an e-mail.
+func UserByUsername(ctx context.Context, q Querier, username string) (User, error) {
+	return userWhere(ctx, q, `username = ?`, username)
+}
+
 // UserByProvider returns the user who signs in as providerID at the
 // identity provider provider, or ErrNotFound.
 func UserByProvider(ctx context.Context, q Querier, provider, providerID string) (User, error) {

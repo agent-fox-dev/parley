@@ -44,10 +44,13 @@ func (w *world) announced(t *testing.T, number int64) string {
 }
 
 // fixedLanding is a landing evaluator that answers its status for every
-// change.
+// change without a cause, and blocks one with a cause for it.
 type fixedLanding string
 
-func (s fixedLanding) EvaluateLanding(context.Context, *sql.Tx, change.Change, change.Version) (change.Landing, error) {
+func (s fixedLanding) EvaluateLanding(_ context.Context, _ *sql.Tx, _ change.Change, _ change.Version, cause *string) (change.Landing, error) {
+	if cause != nil {
+		return change.Landing{Status: change.LandingBlocked, Reason: cause}, nil
+	}
 	return change.Landing{Status: string(s)}, nil
 }
 

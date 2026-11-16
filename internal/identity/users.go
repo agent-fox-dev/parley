@@ -21,7 +21,7 @@ func UserBySelector(ctx context.Context, q Querier, sel string) (User, error) {
 	case strings.Contains(sel, "@"):
 		return userWhere(ctx, q, `email = ?`, sel)
 	default:
-		return userWhere(ctx, q, `username = ?`, sel)
+		return UserByUsername(ctx, q, sel)
 	}
 }
 

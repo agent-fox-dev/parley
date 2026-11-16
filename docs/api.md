@@ -3596,7 +3596,7 @@ copied there from the fork.
 The change object:
 
 ```json
-{"workspace_slug":"demo","number":1,"ref":"demo#1","title":"Add x","intent":"Because y","state":"open","target_branch":"main","source":{"workspace_slug":"demo","branch":"feat"},"version":1,"head_sha":"0b86db2bc73da0f067ec404140cfc00060162383","base_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","depends_on":null,"dependants":[],"author":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"sessions":[],"mergeable":"unknown","conflict":null,"needs_restack":false,"restack_reason":null,"stats":{"commits":1,"files_changed":1,"insertions":1,"deletions":0},"paths":["feat.txt"],"paths_truncated":false,"landing":{"status":"ready","reason":null,"requirements":[]},"auto_land":false,"labels":["docs"],"landed":null,"reverts":null,"reverted_by":null,"created_at":"2026-11-15T13:12:13Z","updated_at":"2026-11-15T13:12:13Z"}
+{"workspace_slug":"demo","number":1,"ref":"demo#1","title":"Add x","intent":"Because y","state":"open","target_branch":"main","source":{"workspace_slug":"demo","branch":"feat"},"version":1,"head_sha":"0b86db2bc73da0f067ec404140cfc00060162383","base_sha":"dc54adf9e0607cad9039738e34a4c3061a859f17","depends_on":null,"dependants":[],"author":{"actor_type":"api_key","actor_id":"bce9bb4d-cbcb-47c3-ab7a-d18f4b5ab95a","username":"owner"},"session_id":null,"sessions":[],"mergeable":"unknown","conflict":null,"needs_restack":false,"restack_reason":null,"stats":{"commits":1,"files_changed":1,"insertions":1,"deletions":0},"paths":["feat.txt"],"paths_truncated":false,"landing":{"status":"ready","reason":null,"requirements":[{"rule":"default","paths":["feat.txt"],"approvals":{"required":0,"counted":0,"approvers":["owner"]},"checks":[],"block":false,"satisfied":true}]},"auto_land":false,"labels":["docs"],"landed":null,"reverts":null,"reverted_by":null,"created_at":"2026-11-15T13:12:13Z","updated_at":"2026-11-15T13:12:13Z"}
 ```
 
 | Member | Meaning |
@@ -3610,7 +3610,7 @@ The change object:
 | `needs_restack`, `restack_reason` | whether the change must be rebased onto what it depends on, and why. `stack_too_deep`: the change sits deeper in its stack than `[changes].max_stack_depth` (its depth is the number of changes in its chain of `depends_on` links down to a change with none, itself included); its version and its `depends_on` are recorded all the same, the hub restacks neither it nor the changes above it, and the flag is cleared when a link below it changes so that it is back within the limit. `auto_restack_off`: the workspace's `changes.auto_restack` is `false` and the change is not built on what it must sit on. `conflict`: its restack conflicted. A restack clears the flag for any reason but `stack_too_deep` (see [Stacks and restack](#stacks-and-restack)) |
 | `stats` | the `commits`, `files_changed`, `insertions` and `deletions` of `base_sha..head_sha`; with no `base_sha`, of every commit of the head, its files measured from the empty tree |
 | `paths`, `paths_truncated` | the files the current version touches, both sides of a rename, in byte order, at most 2,000; `paths_truncated` is `true` when it touches more |
-| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements` |
+| `landing` | whether it may land: `status` (`ready`, `pending`, `blocked`), the `reason` it is blocked for a structural cause (`draft`, `target_not_found`, `nothing_to_land`, `unrelated_history`, `merge_commits`), else `null`, and the policy's `requirements`, listed for a blocked change too (see [The landing of a change](#the-landing-of-a-change)) |
 | `landed` | how it landed, `null` until then: `sha`, `at`, `by` (an author object), `land_id` and `commits`, each `{version_sha, landed_sha}` |
 | `reverts`, `reverted_by` | the number of the change it reverts, and of the change that reverts it, `null` for none |
 
@@ -3684,10 +3684,12 @@ token opens only from a workspace its binding covers. The body:
 
 The answer is `201` with the change object, at version 1: the head of the
 source branch, of kind `ref`, written at `refs/parley/changes/<number>/1`.
-`mergeable` is `unknown` until its first check. A draft has `landing`
-`{"status":"blocked","reason":"draft","requirements":[]}`; any other
-change the landing evaluation's answer, which until the hub has a landing
-policy is `{"status":"ready","reason":null,"requirements":[]}`. Until the
+`mergeable` is `unknown` until its first check. `landing` is version 1
+evaluated against the current revision of the policy of `{slug}` (see
+[The landing of a change](#the-landing-of-a-change)): a draft is
+`blocked` for `draft`, with its requirements listed. Under the revision-0
+document, whose default requires nothing, every other change is `ready`,
+its files listed under the `default` requirement. Until the
 hub has a session feature, every `session_id` is refused and a defaulted
 one dropped.
 
@@ -3971,8 +3973,8 @@ failed, `409` `workspace_not_ready`; when it is archived, `409`
   `source_branch`, `depends_on` and `was_draft` (`true`), followed by
   `parley.change.ready` when the change is then landable (see
   [Mergeability](#mergeability)). A `state` of `"draft"` on an open change
-  makes it a draft: `landing` becomes
-  `{"status":"blocked","reason":"draft"}`, its versions, labels,
+  makes it a draft: `landing` becomes `blocked` for `draft`, with the
+  policy's requirements still listed, its versions, labels,
   `auto_land` and `mergeable` stay, its landable announcement is
   forgotten, and no event is written. A `state` the change already has is
   no edit, before the intent rule as after it: `{"state":"open"}` on an
@@ -4586,9 +4588,22 @@ change it covers, once and bottom first, with the workspace, the change,
 the version being landed with its head and base commits, and the caller,
 so that a change that got a newer version while the attempt waited is
 judged at the version the attempt lands; a retry of the compare-and-swap
-asks nothing again. With no policy installed every change is `ready`, by
-revision 0, and `policy_revision` is the revision that answered, the
-highest when the answers differ. An answer `pending` or `blocked` on a
+asks nothing again. The gate is the landing policy of the change's target
+workspace. It reads the change and judges the version being landed in one
+transaction, so a version pushed meanwhile is never judged in its place.
+When the version being landed is still the change's current version, it
+evaluates the change again as
+[The landing of a change](#the-landing-of-a-change) says: it stores the
+change's `landing`, announces the change when it is landable, and answers
+that landing. When the change has a newer version by then, it evaluates
+the files of the version being landed, from its base to its head, against
+the current revision, with that version's approvals and check results and
+no structural cause, and stores nothing. A workspace that never
+set a policy is at revision 0, whose default requires nothing, so its
+changes are `ready` unless they are drafts or a structural cause blocks
+them. A change abandoned or landed since the attempt was asked fails the
+attempt. `policy_revision` is the revision that answered, the highest when
+the answers differ. An answer `pending` or `blocked` on a
 request that carries an `override` is put to the override rule, and one
 the rule lets pass counts as `ready`; the attempt, and the metadata of
 its `parley.change.land` events, show `override` `{"reason": …}` only when
@@ -4840,6 +4855,249 @@ Answers `200` with the land attempt `{id}` of `{slug}`. An `{id}` that is
 not a UUID, that names no attempt, or that names an attempt of another
 workspace is `404` `land_not_found`, with the message `<slug> has no land
 attempt "<id>"`.
+
+## Landing policy
+
+A workspace's landing policy is a document of ordered rules that says what
+each part of the repository needs before a change touching it may land.
+Every replacement of the document is a new revision of it, numbered from
+1 and kept with when and by whom it was written; the teardown that deletes
+a workspace deletes its revisions. A workspace that never set a policy is
+at revision 0, the never-set document: no rules, and a default that
+requires nothing. Revision 0 is never stored. A task fork has no policy
+of its own and is always at revision 0, whatever its parent's policy is.
+
+The policy object:
+
+```json
+{"revision":2,"default":{"approvals":0,"approvers":["owner"],"checks":[],"fresh_checks":false,"block":false},"rules":[{"name":"all","paths":["**"],"exclude":[],"require":{"approvals":2,"approvers":["owner"],"checks":[],"fresh_checks":false,"block":false}}],"updated_at":"2026-11-16T10:00:03Z","updated_by":{"actor_type":"admin_token","actor_id":null,"username":null}}
+```
+
+| Member | Meaning |
+|---|---|
+| `revision` | the revision's number, `0` for the never-set document |
+| `default`, `rules` | the document in normal form: every requirement member present, `exclude` `[]` where it was absent, and `targets` only on a rule that gave it |
+| `updated_at` | when the revision was written, `null` at revision 0 |
+| `updated_by` | who wrote it: `actor_type` (`api_key`, `pat` or `admin_token`), `actor_id` and `username`, the user's id and username, both `null` for the admin token; `null` at revision 0 |
+
+The revision-0 object is
+`{"revision":0,"default":{"approvals":0,"approvers":["owner"],"checks":[],"fresh_checks":false,"block":false},"rules":[],"updated_at":null,"updated_by":null}`.
+
+### `GET /api/v1/workspaces/{slug}/policy`
+
+Needs the scope `changes:read` and `read` access, so an org member, a
+token bound to a task fork of `{slug}` (a contributor route) and any
+reader of an archived workspace read it as the owner does. Answers `200`
+with the policy object of the current revision and the header `ETag:
+"<revision>"`, the number in double quotes. The query parameter
+`revision` asks for an earlier revision: `200` with that revision as it
+was written, and its number as the `ETag`, while it is kept; revision `0`
+only while no policy was ever set (on a task fork, always). A revision
+that is not kept, `0` after a policy was set, and any other revision of a
+task fork, is `404` `not_found` with the message `no such policy
+revision`, a number too large for any revision included; a value that is
+not a non-negative integer in decimal digits
+(empty, `-1`, `+1`, `1.5`, `abc`) is `400` `invalid_request` with the
+message `revision must be a non-negative integer`.
+
+### `PUT /api/v1/workspaces/{slug}/policy`
+
+Replaces the workspace's policy with the document in the body. Needs the
+scope `workspaces:write` and `owner` access: the workspace's owner or the
+admin token. The access refusals come before the body is read: a token
+without the scope is `403` `insufficient_scope`, an org member `403`
+`forbidden`, a token bound to a task fork of `{slug}` `403` `token_bound`
+(the route is not a contributor route), and a caller without access `404`
+`not_found`. The route takes a body of up to 1 MiB whatever
+`[server].max_body_size` says, so that a document over the format's limit
+reaches the validator.
+
+The body is the document, a JSON object:
+
+```json
+{"default":{"approvals":0},"rules":[{"name":"docs","paths":["docs/**","**/*.md"],"exclude":["docs/internal/**"],"require":{}},{"name":"billing","paths":["billing/**"],"targets":["main","release/*"],"require":{"approvals":1,"approvers":["owner","user:dana"],"checks":["test","billing-e2e"],"fresh_checks":true}},{"name":"secrets","paths":["deploy/secrets/**"],"require":{"block":true}}]}
+```
+
+| Member | Rule |
+|---|---|
+| the document | at most 65 536 bytes as sent |
+| `rules` | a list of at most 200 rules, in the order they are selected; absent is `[]` |
+| `default` | a requirement, the one of a file no rule selects; absent takes every member's default |
+| `name` | matches `^[a-z0-9][a-z0-9_-]{0,62}$`, is not `default`, and no earlier rule has it |
+| `paths` | a non-empty list of path globs, each 1 to 255 characters, not starting with `/` |
+| `exclude` | a list of path globs as `paths`; absent is `[]` |
+| `targets` | when present, a non-empty list of branch globs, each valid as a `protected_branches` entry; absent matches every branch |
+| `require` | a requirement, required on a rule |
+| `approvals` | an integer from 0 to 10; absent is `0` |
+| `approvers` | when present, a non-empty list of `owner`, `member` or `user:<username>` naming an existing user by username, whatever its status; the value is compared with usernames only, exactly, never with ids or e-mails; absent is `["owner"]` |
+| `checks` | a list of check names, each matching `^[a-z0-9][a-z0-9_.-]{0,62}$`; absent is `[]` |
+| `fresh_checks`, `block` | booleans; absent is `false` |
+
+The optional header `If-Match` names the revision the caller read, bare
+(`If-Match: 2`) or in double quotes as the `ETag` gives it (`If-Match:
+"2"`); without it the document replaces whatever revision is stored.
+
+The refusals after access come in this order, and each changes nothing:
+
+| Condition | Answer |
+|---|---|
+| `{slug}` is a task fork, whatever the body | `400` `not_supported_on_fork`, message `workspace "<slug>" is a task fork, which has no policy of its own; set the policy of its parent` |
+| `If-Match` is not a non-negative integer, bare or in double quotes (`abc`, `-1`, `W/"1"`, several values) | `400` `invalid_request`, message `If-Match must be a policy revision, a non-negative integer, bare or in double quotes` |
+| the body is not one JSON object | `400` `invalid_request`, message `request body must be one JSON object` |
+| the document breaks a rule above | `400` `invalid_policy` naming the first violation (below) |
+| the workspace is archived | `409` `workspace_archived`, message `workspace "<slug>" is archived` |
+| `If-Match` names another revision than the stored one, a number too large for any revision included | `412` `revision_mismatch`, message `the policy has been replaced since the revision named in If-Match; read it again` |
+
+A body over 65 536 bytes is refused as a document (`invalid_policy` with
+the field `document`) even when it is not JSON. The `invalid_policy`
+error carries `details` `{rule, index, field}`: `rule` is the rule's name,
+`default` for the default requirement, or `null` for the document as a
+whole and a rule without a usable name; `index` is the rule's zero-based
+position, `null` outside a rule; `field` is the member at fault, prefixed
+`require.` inside a rule's requirement and followed by `[i]` for one entry
+of a list. For example, a first rule `billing` asking for 11 approvals is
+
+```json
+{"error":{"code":400,"message":"invalid policy: rule \"billing\" (index 0), field require.approvals: must be an integer from 0 to 10","error_type":"invalid_policy","details":{"rule":"billing","index":0,"field":"require.approvals"}}}
+```
+
+and an unknown user in the default's approvers is `details`
+`{"rule":"default","index":null,"field":"approvers[0]"}`.
+
+A workspace in any other status (`pending`, `cloning`, `ready`, `failed`)
+takes the replacement. It stores the document's normal form as the stored
+revision plus 1, with the caller as `updated_by`, drops every revision
+numbered 50 or more below it (the 50 highest are kept), and records one
+`parley.policy.update` event with `resource_type` `policy`, `resource_id`
+the slug, the caller as actor and `metadata` `{"revision": <new
+revision>, "rules": <number of rules>}`. Then it evaluates again, in
+ascending number order, the [landing](#the-landing-of-a-change) of every
+draft and open change whose target workspace is `{slug}`, those from its
+task forks included, against the new revision, with the approvals and
+check results the changes have (none of them is changed), stores each and
+runs the announcement of [Mergeability](#mergeability) for it, so that a
+change that is open and `clean` and becomes `ready` gets one
+`parley.change.ready`. Landed and abandoned changes keep their landing.
+All of this is one transaction: a failure of any part, the evaluation of
+any one change included, stores nothing (no revision, no event, no
+landing) and is `500` `internal`. The answer is `200` with the policy
+object of the new revision and its `ETag`, as `GET` answers it, once every
+change carries its new landing. Replacements of one workspace run one at a time: two sent at
+once without `If-Match` get consecutive revisions, and of two with the
+same `If-Match` one is stored and the other is `412` `revision_mismatch`.
+
+### `POST /api/v1/workspaces/{slug}/policy/evaluate`
+
+Answers what a list of paths, or an existing change, would need to land,
+with no approval counted and no check result, against the stored policy
+or a candidate document, and writes nothing: no revision, no event, no
+change's `landing`, whether the request is answered or refused. Needs the
+scope `changes:read` and `read` access, so an org member and a token
+bound to a task fork of `{slug}` (a contributor route) evaluate as the
+owner does, and an archived workspace is evaluated like any other. The
+access refusals come before the body is read: a token without the scope
+is `403` `insufficient_scope`, and a caller without access `404`
+`not_found` with the message `workspace not found`, as for a workspace
+that does not exist. The route takes a body of up to 1 MiB whatever
+`[server].max_body_size` says, so that a candidate over the format's limit
+reaches the validator.
+
+The body is a JSON object with exactly one of `paths` and `change`:
+
+| Member | Rule |
+|---|---|
+| `paths` | a list of 1 to 2 000 paths as sent, each a non-empty string that does not start with `/`; a repeated path counts once |
+| `target_branch` | with `paths` only: the branch the paths would land on, a string of 1 to 255 characters that need not name an existing branch; absent is the workspace's default branch |
+| `change` | an integer, the number of a change of `{slug}` in any state: its current version's files (those between its `base_sha` and its `head_sha`, as for its [landing](#the-landing-of-a-change)) on its own target branch |
+| `policy` | optional, a candidate document, validated as the body of `PUT` and evaluated in place of the stored one |
+
+On a task fork's own slug the stored document is revision 0, as `GET`
+answers it. The answer is `200` with the stored revision as
+`policy_revision`, also when a candidate was evaluated, and the `status`
+and `requirements` of [the landing of a change](#the-landing-of-a-change)
+as they would be with no approval and no check result: every `counted` is
+`0` and every check `pending`. No structural cause applies, so a draft is
+not `blocked` for being a draft. For the paths `billing/a.go`, `docs/a.md`
+and `billing/a.go` into `main`, under the document of the `PUT` example
+stored as revision 1:
+
+```json
+{"policy_revision":1,"status":"pending","requirements":[{"rule":"docs","paths":["docs/a.md"],"approvals":{"required":0,"counted":0,"approvers":["owner"]},"checks":[],"block":false,"satisfied":true},{"rule":"billing","paths":["billing/a.go"],"approvals":{"required":1,"counted":0,"approvers":["owner","user:dana"]},"checks":[{"name":"test","status":"pending"},{"name":"billing-e2e","status":"pending"}],"block":false,"satisfied":false}]}
+```
+
+The refusals after access come in this order:
+
+| Condition | Answer |
+|---|---|
+| the body is not one JSON object | `400` `invalid_request` (`request body must be a JSON object`, `request body is not valid JSON`, `request body is empty; want a JSON object`) |
+| both or neither of `paths` and `change` | `400` `invalid_request`, message `give exactly one of paths and change` |
+| `change` is not an integer (`"1"`, `1.5`, `null`) | `400` `invalid_request`, message `change must be an integer` |
+| `target_branch` with `change` | `400` `invalid_request`, message `target_branch cannot be given with change, whose own target branch is used` |
+| `paths` is not a list of 1 to 2 000 entries | `400` `invalid_request`, message `paths must be a list of 1 to 2000 paths` |
+| an entry of `paths` is not a non-empty string or starts with `/` | `400` `invalid_request`, message `every path must be a non-empty string that does not start with '/'` |
+| `target_branch` is not a string, is empty or is longer than 255 characters | `400` `invalid_request`, message `target_branch must be a branch name of 1 to 255 characters` |
+| `policy` breaks a rule of the document | `400` `invalid_policy` with `details` `{rule, index, field}` as for `PUT`; a `policy` that is not an object, or whose JSON text is over 65 536 bytes, is the field `document` |
+| `paths` without `target_branch` on a workspace with no default branch yet (a `pending` one) | `400` `invalid_request`, message `the workspace has no default branch yet; give target_branch` |
+| `change` names no change of `{slug}`, or the caller is a token bound to a task fork and the change's source is not that fork | `404` `change_not_found`, message `no such change`, the same body in both cases |
+
+### The landing of a change
+
+The `landing` of a draft or open change is its current version evaluated
+against the current revision of the policy of its target workspace. A
+change into a task fork is evaluated against revision 0. The change's
+files are those that differ between its `base_sha` and its `head_sha`,
+with no cap. A file renamed or copied counts under both of its paths. A
+change stacked on another therefore counts only the files of its own
+commits. Each file selects the first rule, in document order, whose
+`targets` match the change's `target_branch` (absent `targets` match every
+branch), one of whose `paths` matches the file and none of whose `exclude`
+does. A file that no rule selects selects `default`. A path glob matches
+the whole path: `*` matches any run of characters without `/`, `**` any
+run including `/`, both possibly empty, `?` exactly one character other
+than `/`, and every other character itself.
+
+Each selected rule, then `default`, gives one requirement:
+
+| Member | Meaning |
+|---|---|
+| `rule` | the rule's name, or `default` |
+| `paths` | the change's files that selected it, in ascending byte order, the first 50 |
+| `approvals` | `required` (the rule's `approvals`), `counted` and `approvers` |
+| `checks` | each of the rule's checks once, with its `status`: `passed`, `failed` or `pending` (no result) |
+| `block` | the rule's `block` |
+| `satisfied` | `true` when the rule does not block, enough approvals count, no rejection is outstanding and every check passed |
+
+Until approvals and check results are recorded, nothing is counted and
+every check is `pending`. The `status` is `blocked`, with the `reason`,
+for a draft (`draft`). It is also `blocked`, with the `reason`, for a
+change with a structural cause (`target_not_found`, `nothing_to_land`,
+`unrelated_history`, `merge_commits`), whatever its requirements say.
+Otherwise it is `blocked` when a requirement blocks, `pending` when one is
+not satisfied, and `ready` otherwise or when there is none. The
+requirements are listed in every case.
+
+The landing is evaluated again and stored on each of these:
+
+- a new version;
+- a retarget;
+- a move between draft and open;
+- a restore;
+- a mergeability check of a change whose target branch is missing or found
+  again;
+- a replacement of the policy of its target workspace (`PUT` above);
+- the policy gate of a land.
+
+A re-evaluation that runs at the same time as a replacement of the policy
+reads the revision in its own transaction, and transactions that write run
+one at a time: the landing left is the one of the newer revision.
+
+When the policy re-evaluates a change itself, as the gate and a
+replacement do, it stores
+the landing and then runs the announcement of [Mergeability](#mergeability)
+in the same transaction. `parley.change.ready` is therefore written once
+when the change becomes landable, and a failure of either step stores
+neither. Every re-evaluation sets the change's `updated_at`. A landed or
+abandoned change keeps the landing it had when it closed.
 
 ## Admin routes
 

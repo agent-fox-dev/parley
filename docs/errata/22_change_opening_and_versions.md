@@ -44,6 +44,8 @@ A draft's landing is `{blocked, draft}` and the landing evaluator is not
 asked for it; the stack linker and the version observers still run at open
 and for every version of a draft, as design decision 32 has them run for
 every version.
+Erratum 27 has the landing evaluator asked for a draft too, with the cause
+`draft`.
 
 ## The path limit of a path-scoped token is checked on the REST open only
 
@@ -187,6 +189,8 @@ commit is refused at open and blocks a later version. Its diff answers
 takes `""` as no base, measured the same way. In Go, `Change.BaseSHA` and
 `Version.BaseSHA` are `*string`; the store keeps the empty string for
 none.
+Erratum 27 has the landing evaluator asked with a structural reason as the
+cause.
 
 ## The open of a commit's change follows a later move of its branch
 

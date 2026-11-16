@@ -84,6 +84,19 @@ WHERE workspace_slug = ? AND target_branch = ? AND state IN ('draft', 'open') OR
 	return numbers, nil
 }
 
+// DraftAndOpen are the numbers of the draft and open changes of the
+// workspace, whatever their target branch, ascending, read through q (the
+// caller's transaction, or nil for the store). A repository's include
+// those from its task forks, which belong to it.
+func (c *Component) DraftAndOpen(ctx context.Context, q Querier, workspace string) ([]int64, error) {
+	numbers, err := queryList[int64](ctx, c.querier(q), `SELECT number FROM changes
+WHERE workspace_slug = ? AND state IN ('draft', 'open') ORDER BY number`, workspace)
+	if err != nil {
+		return nil, fmt.Errorf("find the draft and open changes of %s: %w", workspace, err)
+	}
+	return numbers, nil
+}
+
 // ofWorkspace selects the changes a workspace asks about: its own, and,
 // since a fork holds no changes, those of its parent whose source it is.
 const ofWorkspace = `(c.workspace_slug = ? OR c.source_workspace = ?)`

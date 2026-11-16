@@ -287,15 +287,31 @@ func (s *stack) LinkVersion(ctx context.Context, tx *sql.Tx, ch change.Change, _
 
 func (s *stack) SetDependsOn(context.Context, *sql.Tx, change.Change, *int64) error { return nil }
 
-// evaluator answers the landing it holds.
+// evaluator answers the landing it holds, blocked for the cause it is
+// given with the same requirements, and records each cause ("" for none).
 type evaluator struct {
 	*steps
 	landing change.Landing
+	mu      sync.Mutex
+	causes  []string
 }
 
-func (e *evaluator) EvaluateLanding(context.Context, *sql.Tx, change.Change, change.Version) (change.Landing, error) {
+func (e *evaluator) EvaluateLanding(_ context.Context, _ *sql.Tx, _ change.Change, _ change.Version, cause *string) (change.Landing, error) {
 	e.add("evaluator")
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.causes = append(e.causes, deref(cause))
+	if cause != nil {
+		return change.Landing{Status: change.LandingBlocked, Reason: cause, Requirements: e.landing.Requirements}, nil
+	}
 	return e.landing, nil
+}
+
+// asked are the causes the evaluator was asked with, from the n-th call on.
+func (e *evaluator) asked(n int) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.causes[min(n, len(e.causes)):]...)
 }
 
 // observer records each version it is told of, with the landing of the
