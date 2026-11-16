@@ -20,7 +20,7 @@ type ReplayedCommit struct {
 // The git processes run under ctx and are killed when it ends; a failure
 // of git that is not a conflict is an error.
 func (r *Repo) RebaseFromAs(ctx context.Context, base, head, onto string, committer Signature) (string, []ReplayedCommit, *ConflictReport, error) {
-	newHead, became, report, err := r.rebase(ctx, base, head, onto, committer)
+	newHead, became, report, err := r.rebase(ctx, base, head, onto, committer, nil)
 	if report != nil {
 		report.BaseSHA = base
 	}

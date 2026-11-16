@@ -534,6 +534,24 @@ func PushCommit(t testing.TB, src, dest, branch, content string) string {
 // holds git's standard error: for a test that feeds git an input, or
 // expects it to fail, where Git would fail the test.
 func Run(dir, stdin string, args ...string) (string, error) {
+	out, err := run(dir, stdin, args...)
+	return strings.TrimSpace(string(out)), err
+}
+
+// Blob is the content of the blob rev, such as <commit>:<path>, of the
+// repository whose git directory is dir, byte for byte, failing the test
+// when there is none.
+func Blob(t testing.TB, dir, rev string) []byte {
+	t.Helper()
+	out, err := run(dir, "", "cat-file", "blob", rev)
+	if err != nil {
+		t.Fatalf("in %s: %v", dir, err)
+	}
+	return out
+}
+
+// run is Run with git's standard output as it is.
+func run(dir, stdin string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Env = append(os.Environ(),
 		"GIT_DIR="+dir,
@@ -547,7 +565,7 @@ func Run(dir, stdin string, args ...string) (string, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return out, nil
 }

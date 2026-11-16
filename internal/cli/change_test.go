@@ -3,6 +3,7 @@ package cli
 import (
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -275,6 +276,115 @@ func TestChangeDiff_SendsTheFlagsAndPrintsWhatTheHubAnswers(t *testing.T) {
 	}
 }
 
+// conflictAnswer is the hub's answer to a read of change 2's conflict,
+// mergeable as given and a report only for conflict.
+func conflictAnswer(mergeable string) string {
+	if mergeable != "conflict" {
+		return `{"mergeable":"` + mergeable + `","conflict":null}`
+	}
+	return `{"mergeable":"conflict","conflict":{"target_sha":"` + changeSHA + `","head_sha":"` + changeSHA + `","base_sha":null,` +
+		`"commit_sha":"` + changeSHA + `","files":[{"path":"app.txt","kind":"content"}],"landed_changes":[{"number":1}],"change":null}}`
+}
+
+func TestChangeConflict_PrintsTheChangesCurrentReport(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		mergeable string
+		flags     []string
+		want      int
+	}{
+		{"clean", nil, 0},
+		{"conflict", nil, 0},
+		{"clean", []string{"--fail-on-conflict"}, 0},
+		{"conflict", []string{"--fail-on-conflict"}, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mergeable+" "+strings.Join(tt.flags, " "), func(t *testing.T) {
+			t.Parallel()
+			answer := conflictAnswer(tt.mergeable)
+			hub := newStubHub(t).answer(http.MethodGet, changesPath+"/2/conflict", http.StatusOK, answer)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", append([]string{"conflict", "demo", "2"}, tt.flags...)...)
+
+			got := wantOnlyRequest(t, sent, http.MethodGet, changesPath+"/2/conflict")
+			wantQuery(t, got.query, nil)
+			if tt.want == 0 {
+				wantResult(t, code, stdout, stderr, answer)
+				return
+			}
+			if code != tt.want {
+				t.Errorf("exit status = %d, want %d (stderr %q)", code, tt.want, stderr)
+			}
+			if want := indented(t, answer); stdout != want {
+				t.Errorf("stdout = %q, want the report %q", stdout, want)
+			}
+			if gotCode, message, errorType := clientEnvelope(t, stderr); gotCode != 0 || errorType != "condition_not_met" || message == "" {
+				t.Errorf("envelope code %v, error_type %q, message %q; want 0, condition_not_met and a message", gotCode, errorType, message)
+			}
+		})
+	}
+}
+
+func TestChangeConflict_WritesAConflictedFileAsTheHubSentIt(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, text string }{
+		{"without a final newline", "a\n<<<<<<< target\nb\n=======\nc\n>>>>>>> change"},
+		{"with a final newline", "a\n<<<<<<< target\n\"b\"\t\n=======\nc\n>>>>>>> change\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).handle(http.MethodGet, changesPath+"/2/conflict/file", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Write([]byte(tt.text))
+			})
+
+			code, stdout, stderr, sent := runChange(t, hub, "", "conflict", "demo", "2", "--file", "dir/a b&c.txt")
+
+			got := wantOnlyRequest(t, sent, http.MethodGet, changesPath+"/2/conflict/file")
+			wantQuery(t, got.query, url.Values{"path": {"dir/a b&c.txt"}})
+			if code != 0 || stderr != "" {
+				t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr)
+			}
+			if stdout != tt.text {
+				t.Errorf("stdout = %q, want the file as received %q", stdout, tt.text)
+			}
+		})
+	}
+}
+
+func TestChangeConflict_PrintsTheHubsRefusalAsReceived(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		flags     []string
+		rawPath   string
+		status    int
+		errorType string
+	}{
+		{"an unknown change", nil, changesPath + "/2/conflict", http.StatusNotFound, "change_not_found"},
+		{"a file of another kind", []string{"--file", "a"}, changesPath + "/2/conflict/file", http.StatusConflict, "not_text_conflict"},
+		{"a path of no conflicted file", []string{"--file", "a"}, changesPath + "/2/conflict/file", http.StatusNotFound, "path_not_found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			refusal := envelope(tt.status, tt.errorType)
+			hub := newStubHub(t).answer(http.MethodGet, tt.rawPath, tt.status, refusal)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", append([]string{"conflict", "demo", "2"}, tt.flags...)...)
+
+			wantOnlyRequest(t, sent, http.MethodGet, tt.rawPath)
+			if code != 1 || stdout != "" {
+				t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
+			}
+			if want := indented(t, refusal); stderr != want {
+				t.Errorf("stderr = %q, want the hub's envelope %q", stderr, want)
+			}
+		})
+	}
+}
+
 func TestChange_LifecycleCommandsSendOneRequestWithTheMembersTheirFlagsName(t *testing.T) {
 	t.Parallel()
 	hub := changeHub(t)
@@ -376,10 +486,60 @@ func TestChangeRestack_SendsAnEmptyObjectAndPrintsTheOutcome(t *testing.T) {
 	}
 }
 
+func TestChangeResolve_SendsAResolutionForEachFlagAndPrintsTheOutcome(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	merged := write("m.txt", []byte("merged\n"))
+	// The local file's name holds an =, which only the first = splits from
+	// the repository path.
+	binary := write("v=1.bin", []byte{0xff, 0x00})
+	empty := write("empty.txt", nil)
+	tests := []struct {
+		name  string
+		flags []string
+		body  string
+	}{
+		{
+			"files and a delete, in the order given",
+			[]string{"--file", "app.txt=" + merged, "--file", "logo.bin=" + binary, "--delete", "old.txt"},
+			`{"resolutions":[{"path":"app.txt","content_base64":"bWVyZ2VkCg=="},{"path":"logo.bin","content_base64":"/wA="},{"path":"old.txt","delete":true}]}`,
+		},
+		{
+			"a delete before a file",
+			[]string{"--delete", "old.txt", "--file", "dir/app.txt=" + merged},
+			`{"resolutions":[{"path":"old.txt","delete":true},{"path":"dir/app.txt","content_base64":"bWVyZ2VkCg=="}]}`,
+		},
+		{"an empty file", []string{"--file", "e.txt=" + empty}, `{"resolutions":[{"path":"e.txt","content_base64":""}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			answer := `{"status":"restacked","change":{"number":2,"version":3,"needs_restack":false}}`
+			hub := newStubHub(t).answer(http.MethodPost, changesPath+"/2/restack", http.StatusOK, answer)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", append([]string{"resolve", "demo", "2"}, tt.flags...)...)
+
+			got := wantOnlyRequest(t, sent, http.MethodPost, changesPath+"/2/restack")
+			wantQuery(t, got.query, nil)
+			// The comparison is exact, so no entry holds a content member.
+			wantJSONBody(t, got.body, tt.body)
+			wantResult(t, code, stdout, stderr, answer)
+		})
+	}
+}
+
 func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 	t.Parallel()
 	conflict := `{"error":{"code":409,"message":"demo#12 conflicts with what it must sit on","error_type":"rebase_conflict",` +
 		`"details":{"target_sha":"` + changeSHA + `","files":[{"path":"f.txt","kind":"content"}]}}}`
+	resolved := localFile(t, "f.txt", []byte("both\n"))
 	tests := []struct {
 		args         []string
 		method, path string
@@ -395,6 +555,8 @@ func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 		{[]string{"abandon", "demo", "12"}, http.MethodPost, changesPath + "/12/abandon", http.StatusConflict, "has_dependants", ""},
 		{[]string{"restore", "demo", "12"}, http.MethodPost, changesPath + "/12/restore", http.StatusConflict, "source_workspace_gone", ""},
 		{[]string{"restack", "demo", "12"}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
+		{[]string{"resolve", "demo", "12", "--file", "f.txt=" + resolved}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
+		{[]string{"resolve", "demo", "12", "--delete", "f.txt"}, http.MethodPost, changesPath + "/12/restack", http.StatusNotFound, "change_not_found", ""},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -421,6 +583,7 @@ func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 	t.Parallel()
 	hub := changeHub(t)
+	local := localFile(t, "a.txt", []byte("a\n"))
 	tests := [][]string{
 		{"open", "demo"},
 		{"open"},
@@ -451,6 +614,23 @@ func TestChange_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"restack", "demo", "0"},
 		{"stack", "demo", "x"},
 		{"stack", "demo", "1", "2"},
+		{"conflict", "demo"},
+		{"conflict", "demo", "x"},
+		{"conflict", "demo", "2", "3"},
+		{"conflict", "demo", "2", "--file", "a", "--fail-on-conflict"},
+		{"resolve", "demo", "2"},
+		{"resolve", "demo", "2", "--file", "a.txt"},
+		{"resolve", "demo", "2", "--file", "=" + local},
+		{"resolve", "demo", "2", "--file", "a.txt="},
+		{"resolve", "demo", "2", "--file", "a.txt=/no/such/file"},
+		{"resolve", "demo", "2", "--file", "a.txt=" + filepath.Dir(local)},
+		{"resolve", "demo", "2", "--delete", ""},
+		{"resolve", "demo", "2", "--file", "a.txt=" + local, "--delete", "a.txt"},
+		{"resolve", "demo", "2", "--delete", "a.txt", "--delete", "a.txt"},
+		{"resolve", "demo", "2", "--file", "a.txt=" + local, "--file", "a.txt=" + local},
+		{"resolve", "demo", "--delete", "a.txt"},
+		{"resolve", "demo", "2", "3", "--delete", "a.txt"},
+		{"resolve", "demo", "x", "--delete", "a.txt"},
 		{"wait", "demo"},
 		{"wait", "demo", "12", "--for", "done"},
 		{"wait", "demo", "12", "--timeout", "0s"},

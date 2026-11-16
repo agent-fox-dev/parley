@@ -100,7 +100,7 @@ func (c *Component) restackOnce(ctx context.Context, j restackJob, by Caller, se
 		return c.restackEnded(ctx, j, restackResult{outcome: rd.outcome, head: rd.head})
 	}
 	rebase, beforeSwap := c.restacks.seams()
-	newHead, report, err := rebase(ctx, rd.repo, baseColumn(rd.ch.BaseSHA), rd.head, rd.onto, c.now())
+	newHead, report, err := rebase(ctx, rd.repo, baseColumn(rd.ch.BaseSHA), rd.head, rd.onto, c.now(), j.resolutions)
 	switch {
 	case err != nil:
 		return restackResult{head: rd.head}, false, err

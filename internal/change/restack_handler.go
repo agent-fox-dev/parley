@@ -45,8 +45,9 @@ const (
 // with the outcome. In one store transaction and in the order of modify,
 // changeOf resolves the change (404 change_not_found), AuthorizeModify
 // applies the caller rule (403 forbidden), the body, none or a JSON
-// object, is read: session_id must pass the session-linking rule (400
-// unknown_session), and resolutions is not read here; then the target
+// object, is read: resolutions must be a list of valid resolutions
+// (readResolutions, 400 invalid_request), and session_id must pass the
+// session-linking rule (400 unknown_session); then the target
 // workspace's status (409), the change's state (409 change_closed) and
 // the commit it must sit on (400 target_not_found when it is the head of
 // a target branch that does not exist). The restack runs after that
@@ -54,6 +55,11 @@ const (
 // session or the replaced version's, and ends the change's pending
 // restack when it ends. A change too deep in its stack is restacked too,
 // and keeps its flag.
+//
+// The replay takes, at each commit that does not apply, the resolution of
+// every path that conflicts there, and stops at the first commit with a
+// conflicted path that has none (gitrepo.Repo.RebaseFromResolving); a
+// change that already sits on the commit ignores them.
 //
 // It answers 200 {status, change}: restacked with the restack version, or
 // up_to_date when the change already sits on the commit; 409
@@ -84,6 +90,10 @@ func (c *Component) restackRoute(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
+		resolutions, err := readResolutions(body)
+		if err != nil {
+			return err
+		}
 		if named != nil {
 			if session, err = c.session(ctx, c.collaborators(), OpenInput{Workspace: ch.WorkspaceSlug, SessionID: named, Caller: caller}, Workspace{}); err != nil {
 				return err
@@ -97,7 +107,7 @@ func (c *Component) restackRoute(w http.ResponseWriter, r *http.Request) error {
 		}
 		// The job takes over the change's pending restack, so that it is
 		// removed when this one ends.
-		j = restackJob{workspace: ch.WorkspaceSlug, number: ch.Number, trigger: TriggerManual}
+		j = restackJob{workspace: ch.WorkspaceSlug, number: ch.Number, trigger: TriggerManual, resolutions: resolutions}
 		if j.seq, j.onto, err = pendingRestack(ctx, tx, ch.WorkspaceSlug, ch.Number); err != nil {
 			return err
 		}

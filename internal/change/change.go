@@ -380,6 +380,10 @@ type Deps struct {
 	// Logger is told of what fails and changes nothing, such as a fork
 	// activity recorder's error; nil discards it.
 	Logger *slog.Logger
+	// Attribute names, in a conflict report of the workspace, the landed
+	// changes the conflict collided with; nil names none, and the report's
+	// lists stay empty.
+	Attribute func(ctx context.Context, workspace string, report *gitrepo.ConflictReport) error
 	// MergeableDebounce is the shortest time between the starts of two
 	// mergeability checks of one change; zero, or below, for none.
 	MergeableDebounce time.Duration

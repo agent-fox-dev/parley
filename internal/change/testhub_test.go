@@ -152,8 +152,12 @@ func deref(p *string) string {
 	return *p
 }
 
-// gone is the content commit gives a file to delete it.
-const gone = "\x00gone"
+// gone is the content commit gives a file to delete it, and executable the
+// prefix of a content commit writes, without it, with the mode 100755.
+const (
+	gone       = "\x00gone"
+	executable = "\x00exec:"
+)
 
 // commit writes to the repository at dir a commit with message on top of
 // from (a commit id or a branch), or a root commit for from "", setting
@@ -172,7 +176,11 @@ func commit(t *testing.T, dir, branch, from, message string, files map[string]st
 			s.WriteString("D " + path + "\n")
 			continue
 		}
-		s.WriteString("M 100644 inline " + path + "\n" + data(files[path]))
+		mode, content := "100644", files[path]
+		if rest, ok := strings.CutPrefix(content, executable); ok {
+			mode, content = "100755", rest
+		}
+		s.WriteString("M " + mode + " inline " + path + "\n" + data(content))
 	}
 	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet", "--force"); err != nil {
 		t.Fatal(err)

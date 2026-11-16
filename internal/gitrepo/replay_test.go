@@ -90,7 +90,7 @@ func TestRebaseFromAs_ReportsEachConflictedFileWithItsKindAndSides(t *testing.T)
 		{"main", "both-add", "f.txt", gitrepo.ConflictAddAdd, "base"},
 		{"main", "head-deletes", "f.txt", gitrepo.ConflictModifyDelete, "theirs"},
 		{"trimmed", "base-deletes", "f.txt", gitrepo.ConflictDeleteModify, "ours"},
-		{"main", "both-rename", "r.txt", gitrepo.ConflictRename, ""},
+		{"main", "both-rename", "r1.txt", gitrepo.ConflictRename, ""},
 		{"main", "both-type", "t.txt", gitrepo.ConflictMode, ""},
 		{"main", "both-binary", "bin", gitrepo.ConflictBinary, ""},
 		{"main", "both-submodule", "sub", gitrepo.ConflictSubmodule, ""},

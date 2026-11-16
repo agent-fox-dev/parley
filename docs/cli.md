@@ -1994,9 +1994,10 @@ setting is read or any request sent. `--confirm` is an unknown flag of
 ### `parley change`
 
 `parley change` run without a command prints its help and exits `0`; it
-reads no credential and sends no request. Its sixteen commands open,
-read, edit, abandon, restore, restack, land and wait for the changes of a
-workspace, and read their stacks and land attempts, through the
+reads no credential and sends no request. Its eighteen commands open,
+read, edit, abandon, restore, restack, resolve, land and wait for the
+changes of a workspace, and read their stacks, conflicts and land
+attempts, through the
 [change routes](api.md#changes) and the [land routes](api.md#landing) of
 the hub. Each sends one request (`edit` with a label flag two, `wait` and
 `land --wait` one more per poll, see below) with the credential as
@@ -2019,6 +2020,8 @@ percent-encoded path segment (`parley change open a/b --source feat` sends
 | `parley change abandon <slug> <number> [--reason <text>] [--dependants reparent\|abandon]` | `POST …/changes/<number>/abandon` | `reason` and `dependants`, as given; `{}` without a flag |
 | `parley change restore <slug> <number>` | `POST …/changes/<number>/restore` | no body |
 | `parley change restack <slug> <number>` | `POST …/changes/<number>/restack` | the body `{}` |
+| `parley change conflict <slug> <number> [--fail-on-conflict \| --file <path>]` | `GET …/changes/<number>/conflict`; with `--file`, `GET …/changes/<number>/conflict/file` | with `--file`, `path` alone, percent-encoded |
+| `parley change resolve <slug> <number> [--file <repo-path>=<local-file>]... [--delete <repo-path>]...` | `POST …/changes/<number>/restack` | the body below |
 | `parley change land <slug> <number> [--stack] [--expected-version <n>] [--override <reason>] [--session <id>] [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST …/changes/<number>/land`; with `--wait`, then `GET …/lands/<id>` once per poll | the body below |
 | `parley change lands <slug> <number>` | `GET …/changes/<number>/lands` | |
 | `parley change wait <slug> <number> [--for landed\|ready\|mergeable] [--timeout <duration>] [--poll-interval <duration>]` | `GET …/changes/<number>`, once per poll | |
@@ -2052,7 +2055,7 @@ takes its `labels`, removes every `--remove-label` value, appends every
 sends `["b","a"]`; removing every label sends `[]`). When that read fails,
 its error is printed as for any refusal and no `PATCH` is sent.
 
-Every command but `diff --patch` prints the hub's JSON answer on stdout, as
+Every command but `diff --patch` and `conflict --file` prints the hub's JSON answer on stdout, as
 every result is printed (see [Output](#output)), with exit status `0`;
 `open` prints the `201` change. `parley change diff --patch` prints the
 unified diff text the hub answers (`Content-Type: text/x-diff`) as
@@ -2066,6 +2069,39 @@ rebase the change onto what it must sit on now (see
 `{"status": "restacked" | "up_to_date", "change": …}`; a restack that
 conflicts is the refusal `409` `rebase_conflict`, whose envelope holds the
 conflict report in `details`.
+
+`parley change conflict` prints the change's current conflict report, as
+the hub computes it against what the change would be rebased onto now
+(see [the conflict route](api.md#get-apiv1workspacesslugchangesnumberconflict)):
+`{"mergeable": …, "conflict": …}`, `conflict` `null` when the change is
+clean. With `--fail-on-conflict` and `mergeable` `conflict` it still
+prints the answer, then ends with a `condition_not_met` envelope on
+stderr (`the change does not rebase onto what it would sit on without a
+conflict: mergeable is conflict`) and exit status `3`; a clean answer
+exits `0`. With `--file <path>` it writes the text the hub answers for
+that content-conflicted file (see
+[the conflict file route](api.md#get-apiv1workspacesslugchangesnumberconflictfilepath)),
+between `<<<<<<< target` and `>>>>>>> change` markers, to stdout byte for
+byte: no JSON framing and no newline added. A refusal of the file route
+(`404` `path_not_found`, `409` `not_text_conflict`, `400`
+`invalid_request` for an empty path) writes nothing to stdout.
+
+`parley change resolve` restacks the change as `restack` does, with the
+resolutions of its conflicted files (see
+[Manual restack](api.md#manual-restack)): it needs at least one `--file`
+or `--delete`, each repeatable. Its body is
+`{"resolutions": [...]}`, one entry per flag in the order of the command
+line: `--file <repo-path>=<local-file>`, split at its first `=` so that
+the local file's name may hold one, sends
+`{"path": "<repo-path>", "content_base64": "<the local file's bytes in
+standard base64>"}` (`""` for an empty file), never `content`, so that a
+binary file travels unchanged; `--delete <repo-path>` sends
+`{"path": "<repo-path>", "delete": true}`. Every local file is read
+before anything is sent. It prints the answer,
+`{"status": "restacked" | "up_to_date", "change": …}`, with exit status
+`0`; a conflicted path left without a resolution is the refusal `409`
+`rebase_conflict`, whose envelope, with the conflict report in `details`,
+is written to stderr as received, exit status `1`.
 
 `parley change land` lands the change, or with `--stack` its whole stack
 (see [`POST …/land`](api.md#post-apiv1workspacesslugchangesnumberland)).
@@ -2128,7 +2164,7 @@ A refusal of the hub's (`404` `change_not_found`, `400`
 `source_not_related`, `409` `change_exists`, `400` `invalid_request`, `409`
 `change_closed`, `400` `intent_required`, `409` `has_dependants`, `409`
 `source_workspace_gone`, `409` `rebase_conflict` with its conflict report,
-among others) is written to stderr as received, with nothing on stdout and exit
+`404` `path_not_found`, `409` `not_text_conflict`, among others) is written to stderr as received, with nothing on stdout and exit
 status `1`. `open` is sent once and never retried.
 
 **Client checks.** A missing `--source`, a wrong number of arguments, a
@@ -2140,7 +2176,19 @@ integer, got "0"`), a blank `land --override` (`parley change land takes
 --override <reason>, a reason that is not blank`), a `--version` that is neither that
 nor `latest` (`parley change diff takes --version <n>, a positive integer
 or latest, got "x"`), `--patch` with `--name-only` (`parley change diff
-takes --patch or --name-only, not both`), a `--limit` that is not an
+takes --patch or --name-only, not both`), `conflict --file` with
+`--fail-on-conflict` (`parley change conflict takes --file or
+--fail-on-conflict, not both`), `resolve` without `--file` or `--delete`
+(`parley change resolve needs at least one --file or --delete`), a
+`resolve --file` without `=` or with an empty side (`invalid argument
+"a.txt" for "--file" flag: want <repo-path>=<local-file>, neither side
+empty`) or whose local file cannot be read (`invalid argument
+"a.txt=/nonexist" for "--file" flag: cannot read the local file: open
+/nonexist: no such file or directory`), an empty `resolve --delete`
+(`invalid argument "" for "--delete" flag: want a <repo-path>, not an
+empty one`), a repository path named twice across `--file` and
+`--delete` (`parley change resolve names the repository path "a.txt"
+twice; a path takes one resolution`), a `--limit` that is not an
 integer, `edit` without any of its edit flags (`parley change edit needs
 at least one of --title, --intent, --label, --remove-label, --auto-land,
 --no-auto-land, --target`), `edit` with both `--auto-land` and

@@ -3,7 +3,10 @@ package land
 import (
 	"context"
 	"database/sql"
+	"sync/atomic"
 
+	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -65,9 +68,27 @@ func Journalled(ctx context.Context, s *store.Store) (n int, err error) {
 	return n, err
 }
 
+// CompleteConflict completes, as a land of the workspace's one change
+// whose version went from base to head does, the report of its replay
+// that stopped on onto, and returns it.
+func CompleteConflict(ctx context.Context, c *Component, workspace, onto, head, base string, report *gitrepo.ConflictReport) *gitrepo.ConflictReport {
+	return c.conflict(ctx, Attempt{Workspace: workspace}, CoveredChange{Head: head, Base: base}, onto, report)
+}
+
 // Submit hands the running attempt a to the pool of c, its deadline
 // counted from its creation.
 func Submit(c *Component, a Attempt) { c.submit(a, a.CreatedAt) }
 
 // Ended is closed once the pool of c is done with the attempt id.
 func Ended(c *Component, id string) <-chan struct{} { return c.ended(id) }
+
+// CountReplays makes the conflict reads of c count the trial replays they
+// run, and returns what reads the count.
+func CountReplays(c *Component) func() int64 {
+	var n atomic.Int64
+	c.setTrial(func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string) (*gitrepo.ConflictReport, error) {
+		n.Add(1)
+		return change.TrialRebase(ctx, repo, base, head, onto)
+	})
+	return n.Load
+}

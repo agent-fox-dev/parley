@@ -56,14 +56,17 @@ const TriggerManual = "manual"
 // pending record it runs, 0 for none. background is set for a job the
 // worker runs, which a change too deep in its stack skips; a caller's job,
 // without it, restacks such a change too, and has its version judged by
-// the version guard.
+// the version guard. resolutions, by path, are the files a caller gives
+// for the paths that do not merge in the replay; the worker's jobs have
+// none.
 type restackJob struct {
-	workspace  string
-	number     int64
-	seq        int64
-	trigger    string
-	onto       string
-	background bool
+	workspace   string
+	number      int64
+	seq         int64
+	trigger     string
+	onto        string
+	background  bool
+	resolutions map[string]gitrepo.Resolution
 }
 
 // pendRestack records in tx, the transaction of what caused it, that the
@@ -297,11 +300,12 @@ type restackWorker struct {
 }
 
 // rebaseFunc replays the commits of repo after base up to head on top of
-// onto, as gitrepo.Repo.RebaseFrom does.
-type rebaseFunc func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time) (string, *gitrepo.ConflictReport, error)
+// onto, with the resolutions of the paths that do not merge, none for a
+// restack without them, as gitrepo.Repo.RebaseFromResolving does.
+type rebaseFunc func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time, resolutions map[string]gitrepo.Resolution) (string, *gitrepo.ConflictReport, error)
 
-func rebaseFrom(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time) (string, *gitrepo.ConflictReport, error) {
-	return repo.RebaseFrom(ctx, base, head, onto, at)
+func rebaseFrom(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time, resolutions map[string]gitrepo.Resolution) (string, *gitrepo.ConflictReport, error) {
+	return repo.RebaseFromResolving(ctx, base, head, onto, at, resolutions)
 }
 
 // wake tells the worker that a restack was recorded.

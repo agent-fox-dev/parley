@@ -1,6 +1,7 @@
 package land
 
 import (
+	"cmp"
 	"context"
 	"slices"
 
@@ -24,28 +25,20 @@ func (c *Component) conflict(ctx context.Context, a Attempt, cov CoveredChange, 
 	return report
 }
 
-// collided is a landed change a conflict report names, as its
-// landed_changes list shows it.
-type collided struct {
-	Number    int64   `json:"number"`
-	Title     string  `json:"title"`
-	LandedSHA string  `json:"landed_sha"`
-	SessionID *string `json:"session_id"`
-}
-
 // Attribute gives a conflict report of the workspace its landed changes:
-// LandedChanges, each change landed between the report's base and target
-// that touched a conflicted file, in the order they landed, and in each
-// conflicted file LandedBy, the numbers of those that touched it. A landed
-// change is one the landed-commit mapping of the change component names
-// for a commit, and a file is touched by a commit that changes a path one
-// of its sides has. Each starts empty, so that a file no landed change
-// touched reads landed_by [] whichever operation found the conflict, and
-// both stay empty for a report without a base, or whose base is not an
-// ancestor of its target, and when the mapping or the history cannot be
-// read, which is the error. The files and their sides stay as the replay
-// of internal/gitrepo classified them, since the report has one type and
-// one classification for every producer.
+// LandedChanges, each landed change with a commit between the report's
+// base and target that touched a conflicted file, once and by number, and
+// in each conflicted file LandedBy, the numbers, ascending, of those that
+// touched it. A file is touched by a commit that changes a path one of its
+// sides has, and a commit belongs to the landed change the component's
+// lookup (landed) names for it; a commit of no change, as a direct push,
+// names none. Each list starts empty, so that a file no landed change touched reads landed_by []
+// whichever operation found the conflict, and both stay empty for a
+// report without a base, or whose base is not an ancestor of its target,
+// and when the lookup or the history cannot be read, which is the error.
+// The files and their sides stay as the replay of internal/gitrepo
+// classified them, since the report has one type and one classification
+// for every producer.
 func (c *Component) Attribute(ctx context.Context, workspace string, report *gitrepo.ConflictReport) error {
 	if report == nil {
 		return nil
@@ -54,31 +47,20 @@ func (c *Component) Attribute(ctx context.Context, workspace string, report *git
 	for i := range report.Files {
 		report.Files[i].LandedBy = []any{}
 	}
-	if report.BaseSHA == "" || len(report.Files) == 0 {
+	lookup := c.landed()
+	if lookup == nil || report.BaseSHA == "" || len(report.Files) == 0 {
 		return nil
 	}
-	touched, order, err := c.landedTouching(ctx, workspace, report)
-	if err != nil || len(order) == 0 {
+	landed, touched, err := c.landedTouching(ctx, workspace, lookup, report)
+	if err != nil || len(landed) == 0 {
 		return err
 	}
-	changes := make([]any, 0, len(order))
-	for _, n := range order {
-		ch, err := c.deps.Changes.ReadChange(ctx, nil, workspace, n)
-		if err != nil {
-			return err
-		}
-		landed := collided{Number: n, Title: ch.Title, SessionID: ch.SessionID}
-		if ch.Landed != nil {
-			landed.LandedSHA = ch.Landed.SHA
-		}
-		changes = append(changes, landed)
-	}
-	report.LandedChanges = changes
-	for i := range report.Files {
-		for _, n := range order {
-			if slices.Contains(touched[n], i) {
-				report.Files[i].LandedBy = append(report.Files[i].LandedBy, n)
-			}
+	// By number, so that two reports of one conflict read the same.
+	slices.SortFunc(landed, func(a, b CollidedChange) int { return cmp.Compare(a.Number, b.Number) })
+	for _, ch := range landed {
+		report.LandedChanges = append(report.LandedChanges, ch)
+		for _, i := range touched[ch.Number] {
+			report.Files[i].LandedBy = append(report.Files[i].LandedBy, ch.Number)
 		}
 	}
 	return nil
@@ -86,10 +68,10 @@ func (c *Component) Attribute(ctx context.Context, workspace string, report *git
 
 // landedTouching reads, for the commits between the report's base and
 // target, oldest first, the landed changes that touched a conflicted file:
-// for each change the indexes of the files it touched, and the changes in
-// the order they first did; none when the base is not an ancestor of the
-// target.
-func (c *Component) landedTouching(ctx context.Context, workspace string, report *gitrepo.ConflictReport) (map[int64][]int, []int64, error) {
+// the changes, each once, and for each change the indexes of the files it
+// touched; none when the base is not an ancestor of the target. A commit
+// is looked up only once it touched a conflicted file.
+func (c *Component) landedTouching(ctx context.Context, workspace string, lookup LandedLookup, report *gitrepo.ConflictReport) ([]CollidedChange, map[int64][]int, error) {
 	repo, err := c.deps.Repos(ctx, workspace)
 	if err != nil {
 		return nil, nil, err
@@ -112,29 +94,40 @@ func (c *Component) landedTouching(ctx context.Context, workspace string, report
 			files[f.Path] = append(files[f.Path], i)
 		}
 	}
-	touched, order := map[int64][]int{}, []int64{}
+	var landed []CollidedChange
+	touched := map[int64][]int{}
 	for _, id := range commits {
-		cc, found, err := c.deps.Changes.ChangeOfCommit(ctx, nil, workspace, id)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !found || !cc.Landed {
-			continue
-		}
 		paths, err := repo.ChangedPaths(ctx, id)
 		if err != nil {
 			return nil, nil, err
 		}
+		var hit []int
 		for _, p := range paths {
 			for _, i := range files[p] {
-				if !slices.Contains(touched[cc.Number], i) {
-					if len(touched[cc.Number]) == 0 {
-						order = append(order, cc.Number)
-					}
-					touched[cc.Number] = append(touched[cc.Number], i)
+				if !slices.Contains(hit, i) {
+					hit = append(hit, i)
 				}
 			}
 		}
+		if len(hit) == 0 {
+			continue
+		}
+		ch, found, err := lookup.LandedChange(ctx, workspace, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !found {
+			continue
+		}
+		if _, seen := touched[ch.Number]; !seen {
+			landed = append(landed, ch)
+			touched[ch.Number] = []int{}
+		}
+		for _, i := range hit {
+			if !slices.Contains(touched[ch.Number], i) {
+				touched[ch.Number] = append(touched[ch.Number], i)
+			}
+		}
 	}
-	return touched, order, nil
+	return landed, touched, nil
 }

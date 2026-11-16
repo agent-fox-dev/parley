@@ -56,6 +56,13 @@ func (c *Component) changeOf(r *http.Request, q Querier) (Change, error) {
 	return ch, nil
 }
 
+// RequestedChange is the change the request's :number names in the
+// workspace :slug, refused as every route under /changes/:number refuses
+// it (changeOf), for such a route that another package serves.
+func (c *Component) RequestedChange(r *http.Request) (Change, error) {
+	return c.changeOf(r, c.deps.Store.Main())
+}
+
 // getChange answers the change object, with the members include asks for.
 func (c *Component) getChange(w http.ResponseWriter, r *http.Request) error {
 	names, err := parseInclude(r.URL.Query()["include"])

@@ -3057,7 +3057,7 @@ The conflict report has every member, whichever is empty:
 | `base_sha` | the merge base: `merge_base_sha` |
 | `commit_sha` | the first commit of `head` that did not apply |
 | `files` | the conflicted files, in byte order of path: `{"path": …, "kind": …, "base": …, "ours": …, "theirs": …, "landed_by": []}` |
-| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` in a comparison, filled in [a land's conflict report](#landing) |
+| `landed_changes` | the changes landed on the target between `base_sha` and `target_sha` that changed a conflicted file, as in [a land's conflict report](#landing) |
 | `change` | the change whose head was rebased; always `null` in a comparison |
 
 In a conflicted file, `base`, `ours` and `theirs` are the file on each side
@@ -3065,13 +3065,23 @@ of the three-way merge that failed, `{"sha": …, "mode": …, "path": …}` (th
 blob id, git's six-digit octal mode and the path on that side, which a rename
 makes differ), or `null` on a side the file does not exist on: `base` the
 failed commit's parent, `ours` the target with the commits of `head` before
-the failed one replayed on it, `theirs` the failed commit. `kind` is
-`content` when both sides changed the same lines, `add_add` when both added
-the path, `modify_delete` when the target changed a file the head deleted,
-`delete_modify` for the reverse, and `rename`, `mode` (a file on one side, a
-symlink or another type on the other), `binary` or `submodule` where git
-names the conflict so. `landed_by` lists the landed changes that changed the
-file; always `[]` in a comparison.
+the failed one replayed on it, `theirs` the failed commit. `kind` is one
+per file, the first that applies of: `submodule` (a side holds a submodule,
+mode `160000`), `binary` (both sides changed a file git treats as binary),
+`rename` (the sides renamed the file in ways that clash), `add_add` (both
+added the path with different content, or one put a file where the other
+put a directory), `modify_delete` (the target changed a file the head
+deleted), `delete_modify` (the target deleted a file the head changed),
+`mode` (the sides hold the file with different modes, such as a file and a
+symlink, or the same content added with two modes, and the content is the
+same or merges) and `content` (both changed the same lines, also where one
+side alone changed the mode, which merges). A file's `path` is its path in
+the target, `ours.path`, so a file both sides renamed is reported at the
+target's new path; where the target has no file (`delete_modify`) it is
+the path of the other sides. A file git moved aside to `<path>~<commit>`
+to record both sides is reported at its own `path`. `landed_by` lists the
+numbers of the landed changes in `landed_changes` that changed the file,
+`[]` for none.
 
 | Status | When |
 |---|---|
@@ -3544,9 +3554,9 @@ the conflicted files in byte order of path, each with its `kind`
 (`content`, `add_add`, `modify_delete`, `delete_modify`, `rename`, `mode`,
 `binary`, `submodule`) and the file on each side, `base` (the commit's
 parent), `ours` (`onto` with the commits replayed before it) and `theirs`
-(the commit), `null` on a side that lacks it. `landed_changes`, each
-`landed_by` and `change` are empty or `null` here: only [a land's conflict
-report](#landing) names the landed changes that touched the files.
+(the commit), `null` on a side that lacks it. `landed_changes` and each
+`landed_by` name the landed changes that touched the files, as in [a
+land's conflict report](#landing), and `change` is `null`.
 
 ```json
 {"error":{"code":409,"message":"commit 3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8 of refs/heads/clash does not apply on top of b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","error_type":"rebase_conflict","details":{"target_sha":"b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","head_sha":"2d165dbfc00967ebdead889de8ba17e45a81f98d","base_sha":"a5bc5c5cd7650975def32e01a71d7011f00bfeb6","commit_sha":"3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8","files":[{"path":"a.txt","kind":"content","base":{"sha":"814f4a422927b82f5f8a43f8fab6d3839e3983f2","mode":"100644","path":"a.txt"},"ours":{"sha":"4c1ee586b89c236961f884e55c2745659e6e45f6","mode":"100644","path":"a.txt"},"theirs":{"sha":"08a39ce7008d263b922cbee785e726af46facfac","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}}
@@ -4135,6 +4145,80 @@ result nor the event is stored: `mergeable` stays `unknown`, the failure
 is logged as `the mergeability check failed`, and the change's next
 trigger computes it again.
 
+### `GET /api/v1/workspaces/{slug}/changes/{number}/conflict`
+
+Answers `200` with the change's conflict as it is now,
+`{"mergeable": …, "conflict": …}`: `mergeable` is `clean` or `conflict`,
+never `unknown`, and `conflict` is the conflict report described above, or
+`null` when `clean`. It needs, for a personal access token,
+`changes:read`, and read access to `{slug}`, and refuses as the routes of
+[Reading a change](#reading-a-change) do: `403` `insufficient_scope`, `404`
+`not_found`, and `404` `change_not_found` for a change the request cannot
+name. A token bound to a task fork reaches it on the fork's parent for the
+changes whose `source.workspace_slug` is that fork; any other change answers
+`404` `change_not_found`, as if it did not exist (unlike the land routes'
+`403` `token_bound`).
+
+- A `landed` or `abandoned` change answers what it holds, without a
+  replay: `conflict` with the stored report, otherwise `clean`.
+- A `draft` or `open` change whose `mergeable` is `conflict` with a report
+  whose `target_sha` is the present onto-commit and whose `head_sha` is the
+  change's `head_sha` answers that report, without a replay.
+- Any other `draft` or `open` change is trial-rebased now, as the
+  mergeability check does it: onto the head of the `draft` or `open` change
+  named by `depends_on`, otherwise onto the head of the target branch, and
+  only its own commits for a change in a stack. A conflict names the landed
+  changes it collided with.
+
+The read stores nothing on the change and writes no event: a result it
+computes is not the change's `mergeable`, which only the check stores.
+While the target branch of a `draft` or `open` change does not exist the
+answer is `409` `conflict` (`<ref> has no conflict report: its target branch
+<branch> does not exist`); a merge commit among the commits to replay is
+`400` `merge_commits_unsupported`.
+
+```json
+{"mergeable":"conflict","conflict":{"target_sha":"…","head_sha":"…","base_sha":"…","commit_sha":"…","files":[{"path":"a.txt","kind":"content","base":{"sha":"…","mode":"100644","path":"a.txt"},"ours":{"sha":"…","mode":"100644","path":"a.txt"},"theirs":{"sha":"…","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}
+```
+
+### `GET /api/v1/workspaces/{slug}/changes/{number}/conflict/file?path=`
+
+Answers `200` with `Content-Type: text/plain; charset=utf-8` and, as the
+whole body, the file `path` (percent-encoded in the query) of the change's
+current conflict report merged as text: every line that both sides keep, or
+that one side alone changed, appears once, and each region both changed is
+written as a line `<<<<<<< target`, the lines of the target as replayed so
+far (the entry's `ours`), a line `=======`, the lines of the file in
+`commit_sha` (the entry's `theirs`) and a line `>>>>>>> change`. There is
+never a `||||||| base` section, whatever `merge.conflictStyle` a git
+configuration sets. Only a `content` entry is marked: a file both sides
+added with different content, which has no `base`, is `add_add` and
+answered `409` `not_text_conflict` (below).
+
+```text
+one
+<<<<<<< target
+TARGET
+=======
+CHANGE
+>>>>>>> change
+three
+four
+```
+
+The report is the one [`GET …/conflict`](#get-apiv1workspacesslugchangesnumberconflict)
+answers, taken by the same rule (stored for the present pair, replayed
+otherwise), and the route needs the same scope and access, resolves the
+change the same way, confines a token bound to a fork the same way and
+refuses with the same errors (`409` `conflict` for a `draft` or `open`
+change whose target branch does not exist). After the change is resolved:
+
+| Status and `error_type` | When |
+|---|---|
+| `400` `invalid_request` | the query has no `path`, or an empty one (`path: must name a file of the change's conflict report`) |
+| `404` `path_not_found` | `path` is no entry's `path` in the current report, which every path of a `clean` change is (`<ref> has no conflict in "<path>"`) |
+| `409` `not_text_conflict` | the entry's `kind` is not `content` (`<ref> conflicts in "<path>" as <kind>, which has no text to mark`) |
+
 ## Stacks and restack
 
 A new version of a change records, in the same store transaction, a
@@ -4231,8 +4315,9 @@ replaces the report and writes no event. The report has the members
 `target_sha` (the commit the change was replayed onto), `head_sha` (the
 change's head), `base_sha` (the change's `base_sha`), `commit_sha` (the
 first of the change's own commits that did not apply), `files` (each with
-`path`, `kind`, `base`, `ours`, `theirs` and `landed_by` `[]`),
-`landed_changes` `[]` and `change` `null`. A mergeability check of the
+`path`, `kind`, `base`, `ours`, `theirs` and `landed_by`),
+`landed_changes`, as in [a land's conflict report](#landing), and `change`
+`null`. A mergeability check of the
 change that was scheduled before the restack stored the conflict keeps
 that report. When the change gets a version or the commit it must sit on
 moves while the replay runs, the restack starts again instead.
@@ -4272,15 +4357,52 @@ caller who writes `{slug}`, or the admin token; anyone else who reads
 `{slug}` gets `403` `forbidden`), then the body, then the state of
 `{slug}` (`409` `workspace_busy`, `workspace_not_ready`,
 `workspace_archived`). The body is absent or a JSON object; its member
-`session_id`, a string, must pass the session-linking rule (`400`
-`unknown_session`, before any replay), and its other members, such as
-`resolutions`, are ignored. A change that is `landed` or `abandoned` is
+`resolutions`, when present, is a list of resolutions (below), and its
+member `session_id`, a string, must pass the session-linking rule (`400`
+`unknown_session`); both are checked before any replay, and other members
+are ignored. A change that is `landed` or `abandoned` is
 answered `409` `change_closed`, and a change with `depends_on` `null`
 whose target branch does not exist `400` `target_not_found`; neither
 changes anything.
 
+Each resolution is an object with a `path` and exactly one of
+`content` (the file's text), `content_base64` (its bytes in standard
+base64) and `delete` (`true`: no file at the path):
+
+```json
+{"resolutions": [
+  {"path": "app.txt", "content": "one\nMERGED\nthree\n"},
+  {"path": "logo.bin", "content_base64": "AAEC"},
+  {"path": "old.txt", "delete": true}
+]}
+```
+
+The list is refused as a whole with `400` `invalid_request`, before any
+replay and with nothing moved, when `resolutions` is not a list (`null`
+included), an entry is not an object, a `path` is missing, not a string,
+empty, starts with `/` or has an empty, `.` or `..` segment, an entry has
+none or more than one of `content`, `content_base64` and `delete`,
+`content` or `content_base64` is not a string, `content_base64` is not
+standard base64 (padding bits set and line breaks are refused too),
+`delete` is not `true`, or two entries name the same path. An empty list
+is a restack without resolutions.
+
 The restack replays the change's commits onto the commit it must sit on,
-as above. The change's pending restack, if it has one, is taken over and
+as above. At a commit that does not apply, when every conflicted path of
+that commit (each `path` of the report's `files`) has a resolution, the
+commit is replayed as git merged it with each conflicted path replaced by
+its resolution's bytes, or with no file there for `delete`, the paths
+its other sides name gone too (both paths of a file the two sides renamed
+leave only the resolution at the target's path), and the
+replay goes on; a path that conflicts at several commits gets its
+resolution at each. A resolved file has its mode in the change's commit,
+else its mode in the target as replayed so far, else `100644`; it takes
+the place of whatever is at its path, a directory too, and `delete`
+leaves a directory at its path in place. A resolution whose path does not
+conflict at a commit changes nothing there, and a commit that a
+resolution leaves with no change of its own is left out, as any replayed
+commit that changes nothing. A conflicted path without a resolution ends
+the restack as a conflict, below. The change's pending restack, if it has one, is taken over and
 removed when the restack ends. A change too deep in its stack is restacked
 too and keeps `needs_restack` with `restack_reason` `stack_too_deep`. It
 answers:
@@ -4294,11 +4416,13 @@ answers:
   `parley.change.restack` with the trigger `manual`, both with the caller
   as actor.
 - `200` `{"status": "up_to_date", "change": <change object>}` when the
-  change already sits on that commit: no version and no event; a
+  change already sits on that commit, whatever `resolutions` says: no
+  version and no event; a
   `needs_restack` set for `conflict` or `auto_restack_off` is cleared and
   the change's mergeability is computed again.
 - `409` `rebase_conflict` with the conflict report as the envelope's
-  `details` when a commit does not apply: the change is left as a
+  `details` when a commit does not apply and one of its conflicted paths
+  has no resolution: the change is left as a
   conflicting background restack leaves it (`needs_restack` for
   `conflict`, `mergeable` `conflict` with the report,
   `parley.change.conflict` unless it was in conflict already), and nothing
@@ -4481,13 +4605,15 @@ attempt `conflict`, the target where it was and the change `open`. Its
 `head_sha` and `base_sha` of the version it landed, `commit_sha`, the
 first commit that did not apply, the conflicted `files`, and `change`:
 `null` for the land of one change, the number of the change whose commit
-did not apply in a stack land. `landed_changes` lists, in the order they
-landed, each change landed between `base_sha` and `target_sha` that
+did not apply in a stack land. `landed_changes` lists, once each and by
+number, each change landed between `base_sha` and `target_sha` that
 changed a path of a conflicted file, as `{"number": …, "title": …,
 "landed_sha": …, "session_id": …}` (its `landed.sha` and its session), and
-each file's `landed_by` the numbers of those that changed it; both are
+each file's `landed_by` the numbers, ascending, of those that changed it;
+a commit no change landed, such as a direct push, names none. Both are
 `[]` when none did, when `base_sha` is `null` or not an ancestor of
-`target_sha`, and when the landed history cannot be read. In the
+`target_sha`, and when the landed history cannot be read; the report is
+answered all the same. In the
 transaction that ends the attempt the change gets `mergeable` `conflict`
 with the same report, as a mergeability check stores it, with
 `parley.change.conflict` when it was not in conflict already. A

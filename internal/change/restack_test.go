@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -566,32 +567,59 @@ func TestRestack_ReportsTheConflictOfTheChangesOwnCommits(t *testing.T) {
 	}
 }
 
-func TestRestack_StartsAgainWhenTheChangeGetsAVersionDuringAConflictingReplay(t *testing.T) {
+func TestRestack_StartsAgainWhenTheChangeMovesDuringAConflictingReplay(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t)
-	w.hold(t)
-	w.holdRestacks(t)
-	a := commit(t, w.demo, "a", w.base, "A\n", map[string]string{"f.txt": "a\n"})
-	w.openBranch(t, "a", nil)
-	commit(t, w.demo, "b", a, "B\n", map[string]string{"f.txt": "b\n"})
-	b := w.openBranch(t, "b", nil)
-	onto := w.amend(t, "a", map[string]string{"f.txt": "a2\n"})
-	change.SetRestackSeams(w.changes, change.RestackSeams{
-		Rebase: func(ctx context.Context, repo *gitrepo.Repo, base, head, to string, at time.Time) (string, *gitrepo.ConflictReport, error) {
-			if head == b.HeadSHA {
-				// The author pushes b rebased by hand while the replay runs.
-				fixed := commit(t, w.demo, "b", onto, "B\n", map[string]string{"f.txt": "b\n"})
-				w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b", Head: fixed, Kind: change.KindPush, Caller: w.ownerCaller()})
+	for _, c := range []struct {
+		name string
+		// move changes demo#b while its replay runs; onto is the new head
+		// of the change below it.
+		move func(t *testing.T, w *world, b change.Change, onto string)
+		// conflict is whether the restack that starts again conflicts too.
+		conflict bool
+	}{
+		{"the author pushes b rebased by hand", func(t *testing.T, w *world, b change.Change, onto string) {
+			fixed := commit(t, w.demo, "b", onto, "B\n", map[string]string{"f.txt": "b\n"})
+			w.mustRecord(t, change.VersionInput{Workspace: "demo", Branch: "b", Head: fixed, Kind: change.KindPush, Caller: w.ownerCaller()})
+		}, false},
+		{"b is measured from another base", func(t *testing.T, w *world, b change.Change, _ string) {
+			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE changes SET base_sha = ? WHERE workspace_slug = 'demo' AND number = ?`, w.base, b.Number)
+				return err
+			})
+		}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			w.hold(t)
+			w.holdRestacks(t)
+			a := commit(t, w.demo, "a", w.base, "A\n", map[string]string{"f.txt": "a\n"})
+			w.openBranch(t, "a", nil)
+			commit(t, w.demo, "b", a, "B\n", map[string]string{"f.txt": "b\n"})
+			b := w.openBranch(t, "b", nil)
+			onto := w.amend(t, "a", map[string]string{"f.txt": "a2\n"})
+			var moved atomic.Bool
+			change.SetRestackSeams(w.changes, change.RestackSeams{
+				Rebase: func(ctx context.Context, repo *gitrepo.Repo, base, head, to string, at time.Time) (string, *gitrepo.ConflictReport, error) {
+					if head == b.HeadSHA && !moved.Swap(true) {
+						c.move(t, w, b, onto)
+					}
+					return repo.RebaseFrom(ctx, base, head, to, at)
+				},
+			})
+			seq := w.seq(t)
+			w.runPending(t)
+			got := w.read(t, b.Number)
+			events := w.changeEvents(t, seq, change.EventConflict, b.Number)
+			if (got.Mergeable == change.MergeableConflict) != c.conflict || got.NeedsRestack != c.conflict || len(events) != map[bool]int{false: 0, true: 1}[c.conflict] || len(w.pending(t)) != 0 {
+				t.Errorf("mergeable %s, needs_restack %v, %d conflict events, pending %v; want a conflict %v, no pending restack",
+					got.Mergeable, got.NeedsRestack, len(events), w.pending(t), c.conflict)
 			}
-			return repo.RebaseFrom(ctx, base, head, to, at)
-		},
-	})
-	seq := w.seq(t)
-	w.runPending(t)
-	got := w.read(t, b.Number)
-	if events := w.changeEvents(t, seq, change.EventConflict, b.Number); got.NeedsRestack || got.Mergeable == change.MergeableConflict || len(events) != 0 || len(w.pending(t)) != 0 {
-		t.Errorf("needs_restack %v, mergeable %s, %d conflict events, pending %v; want false, not conflict, none, none",
-			got.NeedsRestack, got.Mergeable, len(events), w.pending(t))
+			// A stored report is one of the change as it is now.
+			if report := asJSON(t, got.Conflict); c.conflict && (report["base_sha"] != deref(got.BaseSHA) || report["head_sha"] != got.HeadSHA) {
+				t.Errorf("the report is on the base %v of the head %v, want %s of %s", report["base_sha"], report["head_sha"], deref(got.BaseSHA), got.HeadSHA)
+			}
+		})
 	}
 }
 
