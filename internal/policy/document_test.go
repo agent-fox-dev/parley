@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/policy"
-	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // knownUsers answers the validator's user lookup from a fixed set of
@@ -60,7 +58,7 @@ func TestValidate_AcceptsADocumentAndReturnsItsNormalForm(t *testing.T) {
 		raw  string
 		want policy.Document
 	}{
-		{"empty object", `{}`, policy.Document{Default: owner(), Rules: []policy.Rule{}}},
+		{"empty object, the never-set document", `{}`, policy.NeverSet},
 		{"three rules", threeRules, policy.Document{Default: owner(), Rules: []policy.Rule{
 			{Name: "docs", Paths: []string{"docs/**", "**/*.md"}, Exclude: []string{"docs/internal/**"}, Require: owner()},
 			{Name: "billing", Paths: []string{"billing/**"}, Exclude: []string{}, Targets: []string{"main", "release/*"},
@@ -91,16 +89,6 @@ func TestValidate_AcceptsADocumentAndReturnsItsNormalForm(t *testing.T) {
 				t.Fatalf("validating the normal form again = %+v, %v, want %+v", again, err, nf)
 			}
 		})
-	}
-}
-
-func TestValidate_NeverSetIsTheNormalFormOfAnEmptyDocument(t *testing.T) {
-	nf, err := validate(t, `{}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(*nf, policy.NeverSet) {
-		t.Fatalf("NeverSet = %+v, want %+v", policy.NeverSet, *nf)
 	}
 }
 
@@ -286,40 +274,6 @@ func TestValidate_ReportsTheFirstViolation(t *testing.T) {
 				wantViolation(t, nf, err, tc.want)
 			}
 		})
-	}
-}
-
-func TestInvalidPolicyError_AnswersInvalidPolicyWithItsDetails(t *testing.T) {
-	cases := []struct {
-		raw  string
-		want string
-	}{
-		{`[]`, `{"rule":null,"index":null,"field":"document"}`},
-		{`{"default": {"block": 1}}`, `{"rule":"default","index":null,"field":"block"}`},
-		{inRule(`"require": {"approvals": 11}`), `{"rule":"r","index":0,"field":"require.approvals"}`},
-	}
-	for _, tc := range cases {
-		_, err := validate(t, tc.raw)
-		var invalid *policy.InvalidPolicyError
-		if !errors.As(err, &invalid) {
-			t.Fatalf("%s: err = %v", tc.raw, err)
-		}
-		rec := httptest.NewRecorder()
-		server.WriteError(rec, invalid.APIError())
-		var body struct {
-			Error struct {
-				Code      int             `json:"code"`
-				ErrorType string          `json:"error_type"`
-				Message   string          `json:"message"`
-				Details   json.RawMessage `json:"details"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatal(err)
-		}
-		if rec.Code != 400 || body.Error.ErrorType != "invalid_policy" || body.Error.Message == "" || string(body.Error.Details) != tc.want {
-			t.Errorf("%s: %d %s", tc.raw, rec.Code, rec.Body)
-		}
 	}
 }
 

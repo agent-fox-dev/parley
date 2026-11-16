@@ -2282,7 +2282,10 @@ checks = ["test"]
 
 is sent as `{"default":{"approvals":0},"rules":[{"name":"billing","paths":["billing/**"],"require":{"approvals":1,"checks":["test"]}}]}`.
 The document is read before any request; whether it is a valid policy is
-the hub's to judge.
+the hub's to judge. A file or standard input that is empty or holds only
+white space is refused, although it is valid TOML: its document would be
+the empty one, which lets every change land, and an empty pipe or a
+truncated file must not replace the policy with it.
 
 A refusal of the hub's (`400` `invalid_policy` with its `details`, `412`
 `revision_mismatch`, `403` `token_bound` for a token bound to a task fork
@@ -2300,8 +2303,10 @@ neither of `--paths` and `--change` (`parley policy evaluate takes exactly
 one of --paths and --change`), a policy file that cannot be read (`parley
 policy set cannot read the policy of --file: open /nonexist: no such file
 or directory`), a `.toml` file that is not valid TOML (`parley policy set
-takes --file <path>, a policy document: j.toml is not valid TOML: …`) and
-any other file, or standard input, that is neither valid JSON nor valid
+takes --file <path>, a policy document: j.toml is not valid TOML: …`), a
+file or standard input that is empty or blank (`parley policy set takes
+--file <path>, a policy document: standard input is empty`) and any other
+file, or standard input, that is neither valid JSON nor valid
 TOML (`parley policy set takes --file <path>, a policy document: bad.json
 is neither valid JSON nor valid TOML: …`) are refused with a `usage_error`
 and exit status `2` before any setting is read or any request sent.

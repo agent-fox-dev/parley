@@ -645,18 +645,6 @@ func (o *opening) commitsAhead(ctx context.Context, in OpenInput, targetHead str
 	return len(ahead), nil
 }
 
-// measure computes the version's base, stats, touched paths and patch id
-// against the target's head; ahead is the number of its commits the target
-// lacks. A head that shares no history with the target has no base, and is
-// measured from the empty tree.
-func (o *opening) measure(ctx context.Context, targetHead string, ahead int) error {
-	var err error
-	if o.base, err = o.sourceRepo.MergeBase(ctx, o.head, targetHead); err != nil {
-		return err
-	}
-	return o.measureFromBase(ctx, ahead)
-}
-
 // measureFromBase computes the version's stats, touched paths and patch id
 // against its base, o.base, the empty tree for none; ahead is the number
 // of its commits.

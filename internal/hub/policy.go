@@ -71,25 +71,17 @@ func composePolicyEvaluation(c *Composition) {
 	c.land.RegisterGate(policyGate{c.policy})
 }
 
-// policyGate is the policy gate of the lands: the change's landing
-// evaluated again. A land of the change's current version runs its
-// re-evaluation, which stores the landing and announces the change when
-// it is landable; one of an older version, as a land whose change moved on
-// since it was asked, evaluates that version's commits and stores
-// nothing. A change that closed since is the gate's error.
+// policyGate is the policy gate of the lands: the version the attempt
+// lands judged by JudgeVersion, which reads the change in the transaction
+// it judges in. A land of the change's current version stores the landing
+// and announces the change when it is landable; one of an older version,
+// as a land whose change moved on since it was asked, evaluates that
+// version's commits and stores nothing. A change that closed since is the
+// gate's error.
 type policyGate struct{ policy *policy.Component }
 
 func (g policyGate) Evaluate(ctx context.Context, in land.GateInput) (land.GateAnswer, error) {
-	var (
-		res policy.Result
-		rev int64
-		err error
-	)
-	if in.Version == in.Change.Version {
-		res, rev, err = g.policy.Reevaluate(ctx, in.Workspace, in.Change.Number)
-	} else {
-		res, rev, err = g.policy.EvaluateVersion(ctx, in.Change, in.Version, in.Base, in.Head)
-	}
+	res, rev, err := g.policy.JudgeVersion(ctx, in.Workspace, in.Change.Number, in.Version, in.Base, in.Head)
 	if err != nil {
 		return land.GateAnswer{}, err
 	}
@@ -118,11 +110,13 @@ func (policyWorkspaces) Workspace(ctx context.Context, q policy.Querier, slug st
 // policyUsers answers whether the users a policy document names exist,
 // from the identity records: a user with that username, whatever its
 // status, since disabling or deleting a user later does not invalidate the
-// document either.
+// document either. The lookup is by username alone, never by id or e-mail,
+// so that a reader trying out a candidate document cannot probe the hub's
+// e-mails and ids through it.
 type policyUsers struct{ q identity.Querier }
 
 func (u policyUsers) UserExists(ctx context.Context, username string) (bool, error) {
-	_, err := identity.UserBySelector(ctx, u.q, username)
+	_, err := identity.UserByUsername(ctx, u.q, username)
 	if errors.Is(err, identity.ErrNotFound) {
 		return false, nil
 	}

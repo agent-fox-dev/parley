@@ -348,11 +348,14 @@ func writeRevision(w http.ResponseWriter, rev Revision) {
 }
 
 // nonNegative is s as a non-negative integer in decimal digits, and false
-// for anything else, such as "", -1, +1 or 1.5.
+// for anything else, such as "", -1, +1 or 1.5. Digits beyond the range of
+// int64 are still a non-negative integer, read as math.MaxInt64, a revision
+// that is never stored: such a value is a revision that does not exist,
+// not a malformed one.
 func nonNegative(s string) (int64, bool) {
 	if s == "" || strings.Trim(s, "0123456789") != "" {
 		return 0, false
 	}
 	n, err := strconv.ParseInt(s, 10, 64)
-	return n, err == nil
+	return n, err == nil || errors.Is(err, strconv.ErrRange)
 }

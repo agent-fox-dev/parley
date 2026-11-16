@@ -55,13 +55,30 @@ func (c *Component) Reevaluate(ctx context.Context, workspace string, number int
 // ErrChangeClosed, with nothing written. Any other error leaves tx to be
 // rolled back, the landing and the event with it.
 func (c *Component) ReevaluateIn(ctx context.Context, tx *sql.Tx, workspace string, number int64) (Result, int64, error) {
-	ch, err := c.deps.Changes.ReadChange(ctx, tx, workspace, number)
+	ch, err := c.openChange(ctx, tx, workspace, number)
 	if err != nil {
 		return Result{}, 0, err
 	}
-	if ch.State != change.StateDraft && ch.State != change.StateOpen {
-		return Result{}, 0, fmt.Errorf("re-evaluate %s, which is %s: %w", ch.Ref, ch.State, ErrChangeClosed)
+	return c.reevaluate(ctx, tx, ch)
+}
+
+// openChange reads, through tx, the change number of the workspace, which
+// must be a draft or open: ErrChangeNotFound for none, ErrChangeClosed for
+// a landed or abandoned one.
+func (c *Component) openChange(ctx context.Context, tx *sql.Tx, workspace string, number int64) (change.Change, error) {
+	ch, err := c.deps.Changes.ReadChange(ctx, tx, workspace, number)
+	if err != nil {
+		return change.Change{}, err
 	}
+	if ch.State != change.StateDraft && ch.State != change.StateOpen {
+		return change.Change{}, fmt.Errorf("re-evaluate %s, which is %s: %w", ch.Ref, ch.State, ErrChangeClosed)
+	}
+	return ch, nil
+}
+
+// reevaluate is ReevaluateIn for the draft or open change ch, read through
+// tx.
+func (c *Component) reevaluate(ctx context.Context, tx *sql.Tx, ch change.Change) (Result, int64, error) {
 	cause, err := c.deps.Changes.LandingCause(ctx, tx, ch)
 	if err != nil {
 		return Result{}, 0, err
@@ -119,18 +136,44 @@ func (c *Component) EvaluateLanding(ctx context.Context, tx *sql.Tx, ch change.C
 	return res.Landing()
 }
 
-// EvaluateVersion evaluates, without storing anything, the landing of the
-// version of the change ch whose commits are those from base ("" for
-// none) to head, against the current policy of its target workspace, with
-// the evidence of that version, and returns it with the revision. A land
-// of a version older than the change's current one is judged by it: the
-// stored landing is the current version's.
-func (c *Component) EvaluateVersion(ctx context.Context, ch change.Change, version int64, base, head string) (Result, int64, error) {
-	files, err := c.filesBetween(ctx, ch.WorkspaceSlug, base, head)
+// JudgeVersion is the landing of version version of the change number of
+// the workspace, whose commits are those from base ("" for none) to head,
+// as a land of that version is judged, with the revision of the policy
+// that judged it. The change is read, and the version judged, in one store
+// transaction, so that a version recorded meanwhile cannot be judged in
+// place of the one the land lands. While version is the change's current
+// one, it is ReevaluateIn: the landing is stored and the change announced.
+// For an older version, as for a land whose change moved on since it was
+// asked, the files base..head are evaluated with the evidence of that
+// version against the current revision, with no structural cause, which
+// the change component measures at the current head only, and nothing is
+// stored. A change that does not exist is ErrChangeNotFound and one that
+// closed ErrChangeClosed, whatever the version.
+func (c *Component) JudgeVersion(ctx context.Context, workspace string, number, version int64, base, head string) (Result, int64, error) {
+	var (
+		res Result
+		rev int64
+	)
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		ch, err := c.openChange(ctx, tx, workspace, number)
+		if err != nil {
+			return err
+		}
+		if ch.Version == version {
+			res, rev, err = c.reevaluate(ctx, tx, ch)
+			return err
+		}
+		files, err := c.filesBetween(ctx, ch.WorkspaceSlug, base, head)
+		if err != nil {
+			return err
+		}
+		res, rev, err = c.evaluate(ctx, tx, ch, version, nil, listedFiles(files))
+		return err
+	})
 	if err != nil {
 		return Result{}, 0, err
 	}
-	return c.evaluate(ctx, c.deps.Store.Main(), ch, version, nil, listedFiles(files))
+	return res, rev, nil
 }
 
 // evaluate evaluates, through q, the version of the change ch with cause

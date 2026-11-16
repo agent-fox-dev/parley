@@ -97,27 +97,62 @@ tree.
 
 The gate is asked outside any transaction, about the version the attempt
 lands (`GateInput.Version`, `Head`, `Base`). Since repair #189 that version
-can be older than the change's current one. When it is the current version,
-`policyGate` runs `Reevaluate`, which stores the landing, announces the
-change and answers its status, reason, requirements and revision. For an
-older version it calls `EvaluateVersion`, which evaluates the files
-`Base..Head` with the evidence of that version against the current revision
-and stores nothing. No structural cause is applied to an older version:
-the change component measures the cause at the current head, which says
-nothing about the older version's commits. A change that closed after
-the land was asked is the gate's error, and the attempt fails. The adapter
-lives in `internal/hub/policy.go`, so that `internal/policy` does not import
+can be older than the change's current one. `policyGate` calls
+`(*policy.Component).JudgeVersion(ctx, workspace, number, version, base,
+head)`, which reads the change and judges the version in one store
+transaction. The `GateInput.Change` the land read before is not used to
+decide which case applies: a version recorded between that read and the
+judgement would otherwise be judged in place of the one the attempt
+lands.
+
+- When `version` is the change's current version, it does what
+  `ReevaluateIn` does: it stores the landing, announces the change and
+  answers its status, reason, requirements and revision.
+- For an older version it evaluates the files `Base..Head` with the
+  evidence of that version against the current revision and stores
+  nothing. No structural cause is applied to an older version: the change
+  component measures the cause at the current head, which says nothing
+  about the older version's commits.
+
+A change that does not exist is `ErrChangeNotFound`, and one that landed
+or was abandoned after the land was asked is `ErrChangeClosed`, on both
+paths; it is the gate's error, and the attempt fails. The adapter lives in
+`internal/hub/policy.go`, so that `internal/policy` does not import
 `internal/land`.
+
+## The structural cause is decided without the version's measurement
+
+`LandingCause` is asked for every draft and open change of a workspace
+inside the transaction of a policy replacement. It decides the cause with
+`moveCause`: the target's head, the commits ahead, the merge base and the
+parents of those commits. It does not compute the diff, the stats or the
+patch id, which a new version's `measureMove` adds on top of `moveCause`.
+The two share the decision, so they cannot disagree.
 
 ## Other decisions
 
 - **The event's action is derived.** The package names action `update` on
   `parley.policy.update`. `event.Input` has no action: the event component
   derives `update` from the last segment of the type.
-- **The user lookup is by selector.** A `user:` entry is looked up with
-  `identity.UserBySelector`, which reads a UUID-shaped value as an id and a
-  value containing `@` as an e-mail. Usernames come from the providers and
-  have neither shape.
+- **The user lookup is by username alone.** A `user:` entry is looked up
+  with `identity.UserByUsername`, which compares the username exactly and
+  never reads the value as an id or an e-mail, as `identity.UserBySelector`
+  does. `user:<e-mail>` and `user:<id>` are therefore unknown users, and a
+  reader evaluating a candidate document cannot use it to learn whether an
+  e-mail or an id exists on the hub.
+- **An out-of-range revision is a revision that does not exist.** The
+  `revision` parameter of `GET …/policy` and the `If-Match` of
+  `PUT …/policy` take decimal digits. Digits beyond the range of a 64-bit
+  integer are still a non-negative integer: they name a revision that is
+  never stored, so `GET` answers `404 not_found` and `PUT` answers
+  `412 revision_mismatch`, not `400 invalid_request`.
+- **The CLI refuses an empty policy file.** An empty or blank file, or
+  standard input, is valid TOML whose document is the empty one, which
+  lets every change land. `parley policy set --file` and
+  `parley policy evaluate --policy-file` refuse it as a usage error (exit
+  status 2, no request), so that a truncated file or an empty pipe does
+  not replace the policy with it. To set the empty policy on purpose, send
+  `{}`.
 - **The policy routes have their own body limit.** `PUT …/policy` and
   `POST …/policy/evaluate` declare `MaxBodySize` 1 MiB, so that a document
   of 65 537 bytes reaches the validator, which names it, whatever

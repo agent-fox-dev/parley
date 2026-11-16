@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -79,6 +78,7 @@ func (w *world) putPolicy(t *testing.T, doc string) {
 }
 
 func TestPutPolicy_ReevaluatesEveryDraftAndOpenChangeAndLeavesClosedOnes(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	fromFork := func(in *change.OpenInput) { in.SourceWorkspace = "api--f1" }
 	asDraft := func(in *change.OpenInput) { in.Draft = true }
@@ -158,6 +158,7 @@ func TestPutPolicy_ReevaluatesEveryDraftAndOpenChangeAndLeavesClosedOnes(t *test
 }
 
 func TestPutPolicy_AnnouncesEveryChangeItMakesLandableOnce(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	docs, billing, secrets := w.openTouching(t, "docs", "docs/a.md"), w.openBilling(t, "billing"), w.openTouching(t, "secrets", "deploy/secrets/k")
 	for _, n := range []int64{docs, billing, secrets} {
@@ -192,30 +193,12 @@ func TestPutPolicy_AnnouncesEveryChangeItMakesLandableOnce(t *testing.T) {
 	}
 }
 
-// kept is an evidence source that holds, for one version of one change of
-// api, one counted approval and a passed result of the check test, and
-// records every query asked of it.
-type kept struct {
-	number, version int64
-	mu              sync.Mutex
-	asked           []policy.EvidenceQuery
-}
-
-func (k *kept) Evidence(_ context.Context, _ policy.Querier, in policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.asked = append(k.asked, in)
-	if in.Workspace != "api" || in.Number != k.number || in.Version != k.version {
-		return policy.EvidenceAnswer{}, nil
-	}
-	return policy.EvidenceAnswer{Counted: 1, Checks: map[string]string{"test": "passed"}}, nil
-}
-
 func TestPutPolicy_CountsTheEvidenceOfAChangeUnderTheNewRules(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	n := w.openBilling(t, "billing")
 	ch := w.checked(t, "api", n)
-	ev := &kept{number: n, version: ch.Version}
+	ev := &evidence{number: n, version: ch.Version, approvals: 1, pass: true}
 	w.policy.RegisterEvidence(ev)
 	if l := w.landing(t, n); l["status"] != change.LandingReady {
 		t.Fatalf("under the never-set policy the change is %v, want ready", l["status"])
@@ -241,18 +224,8 @@ func TestPutPolicy_CountsTheEvidenceOfAChangeUnderTheNewRules(t *testing.T) {
 	}
 }
 
-// failingFor is an evidence source that fails for the change number of
-// api and has nothing for any other.
-type failingFor struct{ number int64 }
-
-func (f failingFor) Evidence(_ context.Context, _ policy.Querier, in policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
-	if in.Workspace == "api" && in.Number == f.number {
-		return policy.EvidenceAnswer{}, errors.New("the evidence cannot be read")
-	}
-	return policy.EvidenceAnswer{}, nil
-}
-
 func TestPutPolicy_FailsAsAWholeWhenAChangeCannotBeReevaluated(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	docs, secrets, billing := w.openTouching(t, "docs", "docs/a.md"), w.openTouching(t, "secrets", "deploy/secrets/k"), w.openBilling(t, "billing")
 	for _, n := range []int64{docs, secrets, billing} {
@@ -270,7 +243,7 @@ func TestPutPolicy_FailsAsAWholeWhenAChangeCannotBeReevaluated(t *testing.T) {
 	for _, n := range []int64{docs, secrets, billing} {
 		before[n] = w.landing(t, n)
 	}
-	w.policy.RegisterEvidence(failingFor{billing})
+	w.policy.RegisterEvidence(&evidence{fail: billing})
 	seq := w.seq(t)
 	r := w.put(t, "/api/v1/workspaces/api/policy", w.danaKey, threeRules, "")
 	if r.status != http.StatusInternalServerError || r.errorType() != "internal" {
@@ -291,39 +264,43 @@ func TestPutPolicy_FailsAsAWholeWhenAChangeCannotBeReevaluated(t *testing.T) {
 	}
 }
 
-func TestReevaluate_RacingAPolicyUpdateLeavesTheLandingOfTheNewerRevision(t *testing.T) {
+func TestReevaluate_ReadsTheRevisionInsideItsTransaction(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
-	ctx := context.Background()
 	n := w.openBilling(t, "billing")
 	w.checked(t, "api", n)
-	for round := range 50 {
-		w.putPolicy(t, `{}`)
-		start := make(chan struct{})
-		var (
-			wg     sync.WaitGroup
-			status int
-			err    error
-		)
-		wg.Go(func() {
-			<-start
-			status = w.put(t, "/api/v1/workspaces/api/policy", w.danaKey, threeRules, "").status
-		})
-		wg.Go(func() {
-			<-start
-			_, _, err = w.policy.Reevaluate(ctx, "api", n)
-		})
-		close(start)
-		wg.Wait()
-		if status != http.StatusOK || err != nil {
-			t.Fatalf("round %d: PUT = %d and Reevaluate = %v, want 200 and no error", round, status, err)
+	var (
+		res  policy.Result
+		rev  int64
+		done = make(chan error, 1)
+	)
+	// The re-evaluation asks for its transaction while this one holds the
+	// store with revision 1 stored and not yet committed.
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		doc, err := validate(t, threeRules)
+		if err != nil {
+			return err
 		}
-		if l := w.landing(t, n); l["status"] != change.LandingPending || only(l)["rule"] != "billing" {
-			t.Fatalf("round %d: the landing is %v, want pending on billing, the newer revision's", round, l)
+		if _, err := policy.Replace(ctx, tx, "api", *doc, nil, w.byDana(), time.Now()); err != nil {
+			return err
 		}
+		go func() {
+			var err error
+			res, rev, err = w.policy.Reevaluate(ctx, "api", n)
+			done <- err
+		}()
+		return nil
+	})
+	if err := <-done; err != nil || rev != 1 || res.Status != change.LandingPending {
+		t.Fatalf("Reevaluate = %s by revision %d, %v; want pending by revision 1", res.Status, rev, err)
+	}
+	if l := w.landing(t, n); l["status"] != change.LandingPending || only(l)["rule"] != "billing" {
+		t.Errorf("the landing is %v, want pending on billing, revision 1's", l)
 	}
 }
 
 func TestReevaluate_StoresTheLandingOfTheCurrentVersionAndReturnsItWithTheRevision(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	w.setPolicy(t, "api", threeRules, w.byDana(), time.Now())
@@ -363,15 +340,20 @@ func TestReevaluate_StoresTheLandingOfTheCurrentVersionAndReturnsItWithTheRevisi
 }
 
 func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
-	ev := &counted{}
+	ev := &evidence{}
 	w.policy.RegisterEvidence(ev)
 	ctx := context.Background()
+	// Every row runs on the one change, which arrange sets as the row needs
+	// it.
+	n := w.openBilling(t, "b")
+	w.checked(t, "api", n)
 	// to is a document and the approvals the evidence counts, which give
 	// the status a re-evaluation finds.
 	type to struct {
 		doc       string
-		approvals int64
+		approvals int
 		status    string
 	}
 	ready, pending, blocked := to{approval, 1, change.LandingReady}, to{approval, 0, change.LandingPending}, to{blocking, 1, change.LandingBlocked}
@@ -379,17 +361,15 @@ func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
 	reevaluate := func(t *testing.T, n int64, now to) {
 		t.Helper()
 		w.setPolicy(t, "api", now.doc, w.byDana(), time.Now())
-		ev.n.Store(now.approvals)
+		ev.count(now.approvals)
 		if res, _, err := w.policy.Reevaluate(ctx, "api", n); err != nil || res.Status != now.status {
 			t.Fatalf("Reevaluate = %s, %v; want %s", res.Status, err, now.status)
 		}
 	}
-	// arrange gives the change n, whose check has run, the landing status
-	// before while it is clean, announced as the hub announces it, and
-	// then the mergeable.
+	// arrange gives the change n the landing status before while it is
+	// clean, announced as the hub announces it, and then the mergeable.
 	arrange := func(t *testing.T, n int64, before, mergeable string) {
 		t.Helper()
-		w.checked(t, "api", n)
 		w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
 			if err := w.changes.SetMergeable(ctx, tx, "api", n, change.MergeableClean, nil); err != nil {
 				return err
@@ -404,7 +384,7 @@ func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
 		})
 	}
 
-	for i, c := range []struct {
+	for _, c := range []struct {
 		name              string
 		before, mergeable string
 		now               to
@@ -420,7 +400,6 @@ func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
 		{"pending with other requirements, clean", change.LandingPending, change.MergeableClean, pendingOther, 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			n := w.openBilling(t, "row"+strconv.Itoa(i))
 			arrange(t, n, c.before, c.mergeable)
 			seq := w.seq(t)
 			reevaluate(t, n, c.now)
@@ -451,7 +430,7 @@ func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
 			return w.changes.StoreMergeability(ctx, tx, "api", n, ch.HeadSHA, w.base, nil)
 		})
 	}
-	for i, c := range []struct {
+	for _, c := range []struct {
 		name      string
 		mergeable string
 		steps     []func(t *testing.T, n int64)
@@ -473,7 +452,6 @@ func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
 		}, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			n := w.openBilling(t, "seq"+strconv.Itoa(i))
 			arrange(t, n, change.LandingPending, c.mergeable)
 			seq := w.seq(t)
 			for _, step := range c.steps {
@@ -487,6 +465,7 @@ func TestReevaluate_AnnouncesAChangeOnceWhenItBecomesLandable(t *testing.T) {
 }
 
 func TestReevaluate_RefusesAClosedOrUnknownChangeAndWritesNothing(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	abandoned, landed := w.openBilling(t, "gone"), w.openBilling(t, "done")
@@ -533,8 +512,9 @@ func TestReevaluate_RefusesAClosedOrUnknownChangeAndWritesNothing(t *testing.T) 
 }
 
 func TestReevaluate_StoresNothingWhenTheReadyEventCannotBeWritten(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
-	ev := &counted{}
+	ev := &evidence{}
 	w.policy.RegisterEvidence(ev)
 	ctx := context.Background()
 	w.setPolicy(t, "api", approval, w.byDana(), time.Now())
@@ -543,7 +523,7 @@ func TestReevaluate_StoresNothingWhenTheReadyEventCannotBeWritten(t *testing.T) 
 		t.Fatalf("the change is %s and %s, want clean and pending", ch.Mergeable, ch.Landing.Status)
 	}
 	seq := w.seq(t)
-	ev.n.Store(1)
+	ev.count(1)
 	w.readyGate.fail.Store(true)
 	if _, _, err := w.policy.Reevaluate(ctx, "api", n); err == nil {
 		t.Fatal("Reevaluate succeeded with a log that cannot take the ready event")
@@ -561,6 +541,7 @@ func TestReevaluate_StoresNothingWhenTheReadyEventCannotBeWritten(t *testing.T) 
 }
 
 func TestReevaluate_GovernsAChangeIntoATaskForkByTheNeverSetDocument(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	w.setPolicy(t, "api", threeRules, w.byDana(), time.Now())
 	commit(t, w.workspaces.RepoPath("api--f1"), "f", w.base, map[string]string{"deploy/secrets/k": "k\n"})
@@ -572,6 +553,7 @@ func TestReevaluate_GovernsAChangeIntoATaskForkByTheNeverSetDocument(t *testing.
 }
 
 func TestLand_IsJudgedByThePolicyOfTheChangesTarget(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	w.setPolicy(t, "api", threeRules, w.byDana(), time.Now())
 	for _, c := range []struct {
@@ -604,28 +586,72 @@ func TestLand_IsJudgedByThePolicyOfTheChangesTarget(t *testing.T) {
 	}
 }
 
-func TestEvaluateVersion_JudgesTheCommitsOfAnOlderVersionAndStoresNothing(t *testing.T) {
+func TestJudgeVersion_JudgesTheVersionALandLandsAgainstTheChangeReadInItsTransaction(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
 	w.setPolicy(t, "api", threeRules, w.byDana(), time.Now())
-	first := w.readChange(t, "api", w.openBilling(t, "b"))
+	// Version 1 touches the secrets the policy blocks, version 2 docs only.
+	n := w.openTouching(t, "b", "deploy/secrets/k")
+	older := w.checked(t, "api", n)
 	head := commit(t, w.api, "b", w.base, map[string]string{"docs/x.md": "x\n"})
 	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
 		_, err := w.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: "api", Branch: "b", Head: head,
 			Kind: change.KindPush, Caller: w.danaCaller()})
 		return err
 	})
-	ch := w.readChange(t, "api", first.Number)
-	res, rev, err := w.policy.EvaluateVersion(ctx, ch, first.Version, *first.BaseSHA, first.HeadSHA)
-	if err != nil || rev != 1 || res.Status != change.LandingPending || len(res.Requirements) != 1 || res.Requirements[0].Rule != "billing" {
-		t.Errorf("EvaluateVersion of version 1 = %+v, %d, %v; want pending on billing by revision 1", res, rev, err)
+	current := w.checked(t, "api", n)
+	// A stored landing that the judgement of the older version leaves and
+	// that of the current version replaces.
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.SetLanding(ctx, tx, "api", n, change.Landing{Status: change.LandingPending})
+	})
+	for _, c := range []struct {
+		name         string
+		v            change.Change
+		status, rule string
+		stored       string
+	}{
+		{"an older version, by its own commits", older, change.LandingBlocked, "secrets", change.LandingPending},
+		{"the current version, stored", current, change.LandingReady, "docs", change.LandingReady},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			seq := w.seq(t)
+			res, rev, err := w.policy.JudgeVersion(ctx, "api", n, c.v.Version, *c.v.BaseSHA, c.v.HeadSHA)
+			if err != nil || rev != 1 || res.Status != c.status || len(res.Requirements) != 1 || res.Requirements[0].Rule != c.rule {
+				t.Errorf("JudgeVersion of version %d = %+v, %d, %v; want %s on %s by revision 1", c.v.Version, res, rev, err, c.status, c.rule)
+			}
+			if l := w.readChange(t, "api", n).Landing; l.Status != c.stored {
+				t.Errorf("the stored landing is %s, want %s", l.Status, c.stored)
+			}
+			if c.stored == change.LandingPending && len(w.eventsAfter(t, seq, "")) != 0 {
+				t.Error("judging an older version wrote events")
+			}
+		})
 	}
-	if l := w.readChange(t, "api", ch.Number).Landing; l.Status != change.LandingReady {
-		t.Errorf("the stored landing is %s, want the current version's, ready", l.Status)
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		return w.changes.Abandon(ctx, tx, "api", n, "undone", w.danaCaller())
+	})
+	for _, c := range []struct {
+		name   string
+		number int64
+		v      change.Change
+		want   error
+	}{
+		{"a closed change, at an older version", n, older, policy.ErrChangeClosed},
+		{"a closed change, at its current version", n, current, policy.ErrChangeClosed},
+		{"an unknown change", 9999, older, policy.ErrChangeNotFound},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if _, _, err := w.policy.JudgeVersion(ctx, "api", c.number, c.v.Version, *c.v.BaseSHA, c.v.HeadSHA); !errors.Is(err, c.want) {
+				t.Errorf("JudgeVersion = %v, want %v", err, c.want)
+			}
+		})
 	}
 }
 
 func TestEvaluateLanding_AnswersForAVersionTheHubRecordsAsItStarts(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t)
 	w.setPolicy(t, "api", threeRules, w.byDana(), time.Now())
 	n := w.openBilling(t, "b")

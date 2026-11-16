@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -273,12 +274,43 @@ func (g *readyGate) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event
 	return g.EventWriter.Emit(ctx, tx, in)
 }
 
-// counted is an evidence source that counts n approvals for every
-// requirement and reports no check result.
-type counted struct{ n atomic.Int64 }
+// evidence is an evidence source for the changes of api: for the change
+// number at version version (0 for any) it counts approvals approvals and,
+// with pass set, has every check it is asked for passed; it fails for the
+// change fail, and has nothing for any other. It records every query.
+type evidence struct {
+	mu                    sync.Mutex
+	number, version, fail int64
+	approvals             int
+	pass                  bool
+	asked                 []policy.EvidenceQuery
+}
 
-func (c *counted) Evidence(context.Context, policy.Querier, policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
-	return policy.EvidenceAnswer{Counted: int(c.n.Load())}, nil
+// count sets the approvals the source counts.
+func (e *evidence) count(n int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.approvals = n
+}
+
+func (e *evidence) Evidence(_ context.Context, _ policy.Querier, in policy.EvidenceQuery) (policy.EvidenceAnswer, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.asked = append(e.asked, in)
+	switch {
+	case in.Number == e.fail:
+		return policy.EvidenceAnswer{}, errors.New("the evidence cannot be read")
+	case e.number != 0 && in.Number != e.number, e.version != 0 && in.Version != e.version:
+		return policy.EvidenceAnswer{}, nil
+	}
+	answer := policy.EvidenceAnswer{Counted: e.approvals}
+	if e.pass {
+		answer.Checks = map[string]string{}
+		for _, c := range in.Checks {
+			answer.Checks[c] = "passed"
+		}
+	}
+	return answer, nil
 }
 
 // setStatus sets the status of slug, which no clone worker acts on once the
@@ -362,23 +394,6 @@ func (w *world) send(t *testing.T, method, path, credential string, body any, he
 		t.Errorf("%s %s = %d %s: not a JSON object: %v", method, path, status, raw, err)
 	}
 	return a
-}
-
-// updates are the parley.policy.update events of the workspace slug, in
-// log order.
-func (w *world) updates(t *testing.T, slug string) []event.Record {
-	t.Helper()
-	recs, _, err := w.events.ReadAfter(context.Background(), 0, 10000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out []event.Record
-	for _, r := range recs {
-		if r.Type == "parley.policy.update" && r.Workspace != nil && *r.Workspace == slug {
-			out = append(out, r)
-		}
-	}
-	return out
 }
 
 // asJSON is v encoded and decoded as JSON, for comparing with a decoded

@@ -4589,11 +4589,16 @@ the version being landed with its head and base commits, and the caller,
 so that a change that got a newer version while the attempt waited is
 judged at the version the attempt lands; a retry of the compare-and-swap
 asks nothing again. The gate is the landing policy of the change's target
-workspace. For the change's current version, it evaluates the change again
-as [The landing of a change](#the-landing-of-a-change) says: it stores the
+workspace. It reads the change and judges the version being landed in one
+transaction, so a version pushed meanwhile is never judged in its place.
+When the version being landed is still the change's current version, it
+evaluates the change again as
+[The landing of a change](#the-landing-of-a-change) says: it stores the
 change's `landing`, announces the change when it is landable, and answers
-that landing. For an older version, it evaluates that version's files
-against the current revision and stores nothing. A workspace that never
+that landing. When the change has a newer version by then, it evaluates
+the files of the version being landed, from its base to its head, against
+the current revision, with that version's approvals and check results and
+no structural cause, and stores nothing. A workspace that never
 set a policy is at revision 0, whose default requires nothing, so its
 changes are `ready` unless they are drafts or a structural cause blocks
 them. A change abandoned or landed since the attempt was asked fails the
@@ -4890,7 +4895,8 @@ was written, and its number as the `ETag`, while it is kept; revision `0`
 only while no policy was ever set (on a task fork, always). A revision
 that is not kept, `0` after a policy was set, and any other revision of a
 task fork, is `404` `not_found` with the message `no such policy
-revision`; a value that is not a non-negative integer in decimal digits
+revision`, a number too large for any revision included; a value that is
+not a non-negative integer in decimal digits
 (empty, `-1`, `+1`, `1.5`, `abc`) is `400` `invalid_request` with the
 message `revision must be a non-negative integer`.
 
@@ -4923,7 +4929,7 @@ The body is the document, a JSON object:
 | `targets` | when present, a non-empty list of branch globs, each valid as a `protected_branches` entry; absent matches every branch |
 | `require` | a requirement, required on a rule |
 | `approvals` | an integer from 0 to 10; absent is `0` |
-| `approvers` | when present, a non-empty list of `owner`, `member` or `user:<username>` naming an existing user, whatever its status (as everywhere a user is selected, a value in UUID form is compared with the user's id and one with `@` with the e-mail); absent is `["owner"]` |
+| `approvers` | when present, a non-empty list of `owner`, `member` or `user:<username>` naming an existing user by username, whatever its status; the value is compared with usernames only, exactly, never with ids or e-mails; absent is `["owner"]` |
 | `checks` | a list of check names, each matching `^[a-z0-9][a-z0-9_.-]{0,62}$`; absent is `[]` |
 | `fresh_checks`, `block` | booleans; absent is `false` |
 
@@ -4936,11 +4942,11 @@ The refusals after access come in this order, and each changes nothing:
 | Condition | Answer |
 |---|---|
 | `{slug}` is a task fork, whatever the body | `400` `not_supported_on_fork`, message `workspace "<slug>" is a task fork, which has no policy of its own; set the policy of its parent` |
-| the body is not one JSON object | `400` `invalid_request`, message `request body must be one JSON object` |
 | `If-Match` is not a non-negative integer, bare or in double quotes (`abc`, `-1`, `W/"1"`, several values) | `400` `invalid_request`, message `If-Match must be a policy revision, a non-negative integer, bare or in double quotes` |
+| the body is not one JSON object | `400` `invalid_request`, message `request body must be one JSON object` |
 | the document breaks a rule above | `400` `invalid_policy` naming the first violation (below) |
 | the workspace is archived | `409` `workspace_archived`, message `workspace "<slug>" is archived` |
-| `If-Match` names another revision than the stored one | `412` `revision_mismatch`, message `the policy has been replaced since the revision named in If-Match; read it again` |
+| `If-Match` names another revision than the stored one, a number too large for any revision included | `412` `revision_mismatch`, message `the policy has been replaced since the revision named in If-Match; read it again` |
 
 A body over 65 536 bytes is refused as a document (`invalid_policy` with
 the field `document`) even when it is not JSON. The `invalid_policy`

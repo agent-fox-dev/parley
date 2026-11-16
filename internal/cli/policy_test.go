@@ -195,6 +195,10 @@ func TestPolicy_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		"bad.json":    localFile(t, "bad.json", []byte("{not json or = toml")),
 		// A .toml file is read as TOML alone.
 		"json.toml": localFile(t, "json.toml", []byte(policyJSON)),
+		// Empty TOML is a valid empty document, which would let everything
+		// land.
+		"empty.json": localFile(t, "empty.json", nil),
+		"blank.toml": localFile(t, "blank.toml", []byte(" \n\t\n")),
 	}
 	tests := [][]string{
 		{"get"},
@@ -206,6 +210,9 @@ func TestPolicy_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"set", "api", "--file", "a-directory"},
 		{"set", "api", "--file", "bad.json"},
 		{"set", "api", "--file", "json.toml"},
+		{"set", "api", "--file", "empty.json"},
+		{"set", "api", "--file", "blank.toml"},
+		{"set", "api", "--file", "-"},
 		{"set", "api", "--file", "good.json", "--if-revision", "x"},
 		{"set", "api", "--file", "good.json", "--if-revision", "-1"},
 		{"set", "api", "--file", "good.json", "--if-revision", "1.5"},
@@ -219,6 +226,7 @@ func TestPolicy_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"evaluate", "api", "--change", "-1"},
 		{"evaluate", "api", "--paths", "a", "--policy-file", "/no/such/file"},
 		{"evaluate", "api", "--paths", "a", "--policy-file", "bad.json"},
+		{"evaluate", "api", "--paths", "a", "--policy-file", "empty.json"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {

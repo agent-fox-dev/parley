@@ -461,14 +461,16 @@ const reasonDraft = "draft"
 // LandingCause is the reason the change ch cannot land for whatever the
 // landing policy requires, read through q and in the repositories, nil for
 // none: draft for a draft, which is not measured; otherwise the structural
-// reason its head, measured against its target branch as a new version is,
-// gives: target_not_found, nothing_to_land, unrelated_history or
-// merge_commits.
+// reason its head gives against its target branch, decided as a new
+// version decides it (moveCause) but without the diff and the patch id a
+// version's measurement adds, since a policy replacement asks it of every
+// change in its transaction: target_not_found, nothing_to_land,
+// unrelated_history or merge_commits.
 func (c *Component) LandingCause(ctx context.Context, q Querier, ch Change) (*string, error) {
 	if ch.State == StateDraft {
 		return new(reasonDraft), nil
 	}
-	_, cause, err := c.measureMove(ctx, q, ch, ch.HeadSHA)
+	_, _, cause, err := c.moveCause(ctx, q, ch, ch.HeadSHA)
 	return cause, err
 }
 

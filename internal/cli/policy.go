@@ -192,7 +192,8 @@ func nonNegative(s string) (int64, bool) {
 // TOML, whose table default and array of tables rules become the members
 // of the same name. Owners keep the policy in either form beside their
 // code, so both are read; the hub judges the document itself. A file that
-// cannot be read or is neither is a usage error, before any request.
+// cannot be read, is empty or blank, or is neither is a usage error, before
+// any request.
 func readPolicy(cmd *cobra.Command, flag string) (json.RawMessage, error) {
 	name, _ := cmd.Flags().GetString(flag)
 	var data []byte
@@ -205,16 +206,22 @@ func readPolicy(cmd *cobra.Command, flag string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, usageError("%s cannot read the policy of --%s: %v", cmd.CommandPath(), flag, err)
 	}
+	source := name
+	if name == "-" {
+		source = "standard input"
+	}
+	// Empty TOML is a valid empty document, the policy that lets every
+	// change land: a file truncated or a pipe that gave nothing must not
+	// replace the policy with it.
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, usageError("%s takes --%s <path>, a policy document: %s is empty", cmd.CommandPath(), flag, source)
+	}
 	isTOML := strings.HasSuffix(name, ".toml")
 	if !isTOML && json.Valid(data) {
 		return data, nil
 	}
 	var doc map[string]any
 	if err := toml.Unmarshal(data, &doc); err != nil {
-		source := name
-		if name == "-" {
-			source = "standard input"
-		}
 		if isTOML {
 			return nil, usageError("%s takes --%s <path>, a policy document: %s is not valid TOML: %v", cmd.CommandPath(), flag, source, err)
 		}
