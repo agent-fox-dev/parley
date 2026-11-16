@@ -3,7 +3,9 @@ package cli
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,11 +260,32 @@ func TestWait_TimesOutWithoutPrintingOrChangingTheOperation(t *testing.T) {
 			// run side by side.
 			t.Parallel()
 			hub := jobHub(t, "queued", tt.polls...)
+			// The requests are counted as the command sends them: the
+			// hub records one only when its handler runs, which under
+			// load can come after the command has returned for a poll it
+			// sent and abandoned at the deadline.
+			opts := waitOptions(50 * time.Millisecond)
+			var mu sync.Mutex
+			var sent []string
+			opts.transport = func(next http.RoundTripper) http.RoundTripper {
+				return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					mu.Lock()
+					sent = append(sent, r.Method+" "+r.URL.Path)
+					mu.Unlock()
+					return next.RoundTrip(r)
+				})
+			}
+			requests := func() []string {
+				mu.Lock()
+				defer mu.Unlock()
+				return slices.Clone(sent)
+			}
 
 			start := time.Now()
-			code, stdout, stderr := runCLIWith(t, waitOptions(50*time.Millisecond),
+			code, stdout, stderr := runCLIWith(t, opts,
 				onHub(hub.URL, "probe", "run", "--wait", "--timeout", "1s")...)
 			took := time.Since(start)
+			ended := requests()
 
 			if code != 1 {
 				t.Errorf("exit status = %d, want 1", code)
@@ -277,18 +300,17 @@ func TestWait_TimesOutWithoutPrintingOrChangingTheOperation(t *testing.T) {
 			if took < time.Second || took >= 2*time.Second {
 				t.Errorf("the command took %v, want from 1 s to less than 2 s", took)
 			}
-			requests := hub.recorded()
-			if len(requests) < 2 || requests[0].method != http.MethodPost {
-				t.Fatalf("the hub got %d requests, want the start and at least one poll", len(requests))
+			if len(ended) < 2 || ended[0] != "POST /api/v1/jobs" {
+				t.Fatalf("the command sent %q, want the start and at least one poll", ended)
 			}
-			for _, r := range requests[1:] {
-				if r.method != http.MethodGet {
-					t.Errorf("after the start the hub got %s %s, want only GET", r.method, r.path)
+			for _, r := range ended[1:] {
+				if r != "GET /api/v1/jobs/j1" {
+					t.Errorf("after the start the command sent %s, want only GET /api/v1/jobs/j1", r)
 				}
 			}
 			time.Sleep(200 * time.Millisecond)
-			if n := len(hub.recorded()); n != len(requests) {
-				t.Errorf("the hub got %d requests after the command ended", n-len(requests))
+			if n := len(requests()); n != len(ended) {
+				t.Errorf("the command sent %d requests after it ended", n-len(ended))
 			}
 		})
 	}
