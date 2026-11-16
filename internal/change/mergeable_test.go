@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -635,6 +636,78 @@ func TestMergeability_ReportsOnlyTheOwnCommitsOfAChangeInAStack(t *testing.T) {
 			if got.Mergeable != change.MergeableConflict || rep["commit_sha"] != b.HeadSHA || rep["base_sha"] != a || rep["head_sha"] != b.HeadSHA {
 				t.Errorf("demo#%d: mergeable %s with the report %v; want conflict at its own commit %s from its base %s",
 					b.Number, got.Mergeable, rep, b.HeadSHA, a)
+			}
+		})
+	}
+}
+
+func TestMergeability_KeepsAConflictALandStoredSinceTheCheckWasScheduled(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// open opens the change the land conflicts on and returns it.
+		open func(t *testing.T, w *world) change.Change
+		// moved moves main again after the land replayed onto it, as a push
+		// racing the land does, and schedules the checks the move does.
+		moved bool
+		kept  bool
+	}{
+		{"a change into its target", func(t *testing.T, w *world) change.Change {
+			commit(t, w.demo, "b", w.base, "B", map[string]string{"a.txt": lineOneX})
+			return w.openBranch(t, "b", nil)
+		}, false, true},
+		{"a change on an open change below, which it rebases onto cleanly", func(t *testing.T, w *world) change.Change {
+			a := commit(t, w.demo, "a", w.base, "A", map[string]string{"f.txt": "a\n"})
+			w.openBranch(t, "a", nil)
+			commit(t, w.demo, "b", a, "B", map[string]string{"a.txt": lineOneX})
+			return w.openBranch(t, "b", nil)
+		}, false, true},
+		{"a change whose target moved after the land replayed onto it", func(t *testing.T, w *world) change.Change {
+			commit(t, w.demo, "b", w.base, "B", map[string]string{"a.txt": lineOneX})
+			return w.openBranch(t, "b", nil)
+		}, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			b := c.open(t, w)
+			w.settled(t, b.Number)
+			held := newGate()
+			change.SetMergeableSeams(w.changes, change.MergeableSeams{Gate: held.pass})
+			t.Cleanup(held.release)
+			replayedOnto := commit(t, w.demo, "main", "main", "M", map[string]string{"a.txt": lineOneM})
+			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+				return w.changes.ScheduleTargetMergeable(ctx, tx, "demo", "main")
+			})
+			held.waitPassed(t, 1)
+			target := replayedOnto
+			if c.moved {
+				target = commit(t, w.demo, "main", "main", "M2", map[string]string{"m.txt": "m\n"})
+				w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+					return w.changes.ScheduleTargetMergeable(ctx, tx, "demo", "main")
+				})
+			}
+			landed := &gitrepo.ConflictReport{
+				TargetSHA: replayedOnto, HeadSHA: b.HeadSHA, BaseSHA: *b.BaseSHA, CommitSHA: b.HeadSHA,
+				Files:         []gitrepo.ConflictFile{{Path: "a.txt", Kind: gitrepo.ConflictContent, LandedBy: []any{7}}},
+				LandedChanges: []any{map[string]any{"number": 7, "title": "landed", "landed_sha": replayedOnto, "session_id": nil}},
+			}
+			w.write(t, func(ctx context.Context, tx *sql.Tx) error {
+				return w.changes.StoreMergeability(ctx, tx, "demo", b.Number, b.HeadSHA, replayedOnto, landed)
+			})
+			held.release()
+			w.quiet(t)
+
+			got := w.read(t, b.Number)
+			if got.Mergeable != change.MergeableConflict {
+				t.Fatalf("demo#%d reads mergeable %s, want conflict", b.Number, got.Mergeable)
+			}
+			report := asJSON(t, got.Conflict)
+			if kept := reflect.DeepEqual(report, asJSON(t, landed)); kept != c.kept {
+				t.Errorf("demo#%d reads the report %v; the land's report kept = %v, want %v", b.Number, report, kept, c.kept)
+			}
+			if report["target_sha"] != target {
+				t.Errorf("demo#%d reads a report onto %v, want onto main's head %s", b.Number, report["target_sha"], target)
 			}
 		})
 	}

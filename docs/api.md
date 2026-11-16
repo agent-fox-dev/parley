@@ -4488,7 +4488,12 @@ each file's `landed_by` the numbers of those that changed it; both are
 `target_sha`, and when the landed history cannot be read. In the
 transaction that ends the attempt the change gets `mergeable` `conflict`
 with the same report, as a mergeability check stores it, with
-`parley.change.conflict` when it was not in conflict already.
+`parley.change.conflict` when it was not in conflict already. A
+mergeability check of the change that was scheduled before the land
+stored the conflict keeps that report while the change's head and its
+target's head are still the ones the land replayed, also for a change in
+a stack, whose check rebases it onto the change below; the next trigger
+computes its mergeability again.
 
 An attempt that ends `conflict`, `blocked` or `failed` writes one
 `parley.change.land_fail` event in the transaction that ends it: resource
