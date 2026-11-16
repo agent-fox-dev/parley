@@ -4488,13 +4488,15 @@ attempt `conflict`, the target where it was and the change `open`. Its
 `head_sha` and `base_sha` of the version it landed, `commit_sha`, the
 first commit that did not apply, the conflicted `files`, and `change`:
 `null` for the land of one change, the number of the change whose commit
-did not apply in a stack land. `landed_changes` lists, in the order they
-landed, each change landed between `base_sha` and `target_sha` that
+did not apply in a stack land. `landed_changes` lists, once each and by
+number, each change landed between `base_sha` and `target_sha` that
 changed a path of a conflicted file, as `{"number": …, "title": …,
 "landed_sha": …, "session_id": …}` (its `landed.sha` and its session), and
-each file's `landed_by` the numbers of those that changed it; both are
+each file's `landed_by` the numbers, ascending, of those that changed it;
+a commit no change landed, such as a direct push, names none. Both are
 `[]` when none did, when `base_sha` is `null` or not an ancestor of
-`target_sha`, and when the landed history cannot be read. In the
+`target_sha`, and when the landed history cannot be read; the report is
+answered all the same. In the
 transaction that ends the attempt the change gets `mergeable` `conflict`
 with the same report, as a mergeability check stores it, with
 `parley.change.conflict` when it was not in conflict already. A

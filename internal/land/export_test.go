@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -63,6 +64,13 @@ func SetSeams(c *Component, s Seams) {
 func Journalled(ctx context.Context, s *store.Store) (n int, err error) {
 	err = s.Main().QueryRowContext(ctx, `SELECT COUNT(*) FROM land_journal`).Scan(&n)
 	return n, err
+}
+
+// CompleteConflict completes, as a land of the workspace's one change
+// whose version went from base to head does, the report of its replay
+// that stopped on onto, and returns it.
+func CompleteConflict(ctx context.Context, c *Component, workspace, onto, head, base string, report *gitrepo.ConflictReport) *gitrepo.ConflictReport {
+	return c.conflict(ctx, Attempt{Workspace: workspace}, CoveredChange{Head: head, Base: base}, onto, report)
 }
 
 // Submit hands the running attempt a to the pool of c, its deadline

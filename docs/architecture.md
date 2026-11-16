@@ -4454,13 +4454,18 @@ classified them. `conflict` (`conflict.go`) completes the land's report:
 hands the other producers of a report (comparison, server-side rebase,
 mergeability check, restack) as a function value, adds the landed changes: when `base_sha` is
 an ancestor of `target_sha`, it walks `CommitsBetween(base, target)`,
-keeps the commits `(*change.Component).ChangeOfCommit` finds landed, and
-those whose `ChangedPaths` meet a path of a conflicted file's sides give
-`landed_changes` (`{number, title, landed_sha, session_id}` read from
-the change, in the order they landed) and each file's `landed_by`; a file
-no landed change touched reads `landed_by` `[]`, and a history or mapping
-it cannot read is its error, with both left empty, which the engine logs
-and goes on.
+keeps the commits whose `ChangedPaths` meet a path of a conflicted file's
+sides, and asks the landed-change lookup (`land.LandedLookup`,
+`landed_lookup.go`) for each one's landed change, a `CollidedChange`
+`{number, title, landed_sha, session_id}`; a commit it finds no change
+for (a direct push) names none. `Deps.Landed` sets the lookup; nil is the
+one over the change component, `(*change.Component).ChangeOfCommit` (a
+landed commit only) then `ReadChange` for the title, session and
+`landed.sha`. The changes found give `landed_changes`, once each and by
+number, and each file's `landed_by`, ascending; a file no landed change
+touched reads `landed_by` `[]`, and a history or lookup it cannot read is
+its error, with both left empty, which every producer logs, keeping the
+report.
 
 The engine (`engine.go`) runs one running attempt: it reads the target
 workspace and opens its repository, asks the policy gate once per covered

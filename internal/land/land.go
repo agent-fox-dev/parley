@@ -117,6 +117,10 @@ type Deps struct {
 	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
 	// Changes is the change component, which reads and lands changes.
 	Changes *change.Component
+	// Landed finds the landed change a commit belongs to, for the
+	// attribution of a conflict; nil is the landed-commit mapping of
+	// Changes.
+	Landed LandedLookup
 	// Workspaces reads the workspace records.
 	Workspaces WorkspaceReader
 	// Access is the access rule asked who may land.
