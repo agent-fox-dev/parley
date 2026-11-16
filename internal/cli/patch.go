@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"net/http"
 	"slices"
 	"strings"
@@ -41,7 +42,7 @@ var patchArg = argSpec{Name: "id", Required: true}
 // newPatchCommand builds parley patch: the patches of a carry-patch
 // workspace, the branches the hub applies, in order, on top of upstream.
 func newPatchCommand() *cobra.Command {
-	return group("patch", "Register, read, update, remove, restore and reorder the patches of a carry-patch workspace: the branches applied, in order, on top of upstream",
+	return group("patch", "Register, read, update, remove, restore, reorder and reset the patches of a carry-patch workspace: the branches applied, in order, on top of upstream",
 		declare(command{
 			Name:        "add",
 			Description: "Register a branch as a patch of a carry-patch workspace, at the end of the order unless --position says where",
@@ -116,7 +117,55 @@ func newPatchCommand() *cobra.Command {
 			Auth:        authUser,
 			Run:         reorderPatches,
 		}),
+		declare(command{
+			Name:        "reset-to-origin",
+			Description: "Move a patch's branch to origin's tip, keeping the hub's discarded tip, and with --wait wait for the rebuild it queued",
+			Method:      http.MethodPost,
+			Path:        patchesRoute + "/:id/reset-to-origin",
+			Args:        []argSpec{slugArg, patchArg},
+			Auth:        authUser,
+			// The wait is the shared one, built per run by resetPatch once the
+			// answer names the rebuild job; this gives the command its flags
+			// and the job's terminal states.
+			Wait: &waitFor{Classify: byState("status", []string{"completed"}, []string{"dead_letter", "cancelled"})},
+			Run:  resetPatch,
+		}),
 	)
+}
+
+// resetPatch is the run step of parley patch reset-to-origin. It sends the
+// reset once, with no body, and prints the answer, unless --wait is given and
+// the answer names a rebuild job: then the shared wait reads that job at once
+// and polls it until it is completed, dead_letter or cancelled (failed is a
+// job waiting to retry), and prints the answer with the final job as its
+// member rebuild. The job is read, never the answer's status, which is the
+// patch's own.
+func resetPatch(c *call) error {
+	answer, err := c.client.send(c.ctx, apiRequest{method: c.decl.Method, path: routePath(c.decl.Path, c.args)})
+	if err != nil {
+		return err
+	}
+	var named struct {
+		RebuildJobID string `json:"rebuild_job_id"`
+	}
+	// The client let only JSON through; an answer that is not an object
+	// names no job.
+	_ = json.Unmarshal(answer.body, &named)
+	if waiting, _ := c.cmd.Flags().GetBool(waitFlag); !waiting || named.RebuildJobID == "" {
+		return c.printAnswer(answer)
+	}
+	job := apiRequest{
+		method: http.MethodGet,
+		path:   "/workspaces/" + pathSegment(c.args[slugArg.Name]) + "/rebuilds/" + pathSegment(named.RebuildJobID),
+	}
+	w := *c.decl.Wait
+	w.Start = func(*call) (apiRequest, error) { return job, nil }
+	w.Poll = func(*call, []byte) (apiRequest, error) { return job, nil }
+	w.Document = func(_ *call, _, final []byte) ([]byte, error) {
+		return withMember(answer.body, "rebuild", final)
+	}
+	c.decl.Wait = &w
+	return c.wait()
 }
 
 // newPatchUpdateCommand builds parley patch update: a PATCH of a patch whose
