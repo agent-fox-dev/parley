@@ -563,7 +563,28 @@ func TestPush_CompletesAfterTheCallerLeaves(t *testing.T) {
 			p := newSyncWorld(t, opts...)
 			head, n := grow(t, p.copy, "feature", ref(t, p.copy, "refs/heads/main"), "hub"), len(p.eventsOf(t, pushEvent))
 			p.origin.Block()
-			p.postAndLeave(t, p.uKey, "/api/v1/workspaces/"+syncSlug+"/branches/feature/push", p.asked())
+			var started <-chan struct{}
+			left := make(chan struct{})
+			if c.outcome == "pushed" {
+				started = p.asked()
+			} else {
+				// The push stalls as at a stalled origin, and does not end
+				// before the caller has left, however long the deadline
+				// takes to pass: a git that has not reached origin by then
+				// would let the hub answer first. A caller's cancellation
+				// reaching the push would show as an outcome other than
+				// the timeout.
+				reached := make(chan struct{})
+				started = reached
+				p.pushes.answerWith(func(ctx context.Context) (gitrepo.PushResult, error) {
+					close(reached)
+					<-left
+					<-ctx.Done()
+					return "", ctx.Err()
+				})
+			}
+			p.postAndLeave(t, p.uKey, "/api/v1/workspaces/"+syncSlug+"/branches/feature/push", started)
+			close(left)
 			if c.outcome == "pushed" {
 				p.origin.Release()
 			}
