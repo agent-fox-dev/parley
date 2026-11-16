@@ -25,6 +25,17 @@ const (
 	awarenessIndexGrace = 5 * time.Second
 )
 
+// awarenessExpiryWork is the name of the background work that expires the
+// claims whose time has come; awarenessExpiryGrace is how long the stop
+// waits for it, which leaves the claims a cancelled run did not reach for
+// the next start. claimCleanupTask is the maintenance task that removes
+// the claims that ended a week ago.
+const (
+	awarenessExpiryWork  = "awareness_claim_expiry"
+	awarenessExpiryGrace = 5 * time.Second
+	claimCleanupTask     = "claim_cleanup"
+)
+
 // composeAwareness adds the awareness: the schema of the index of the
 // changes by touched file and of its worker's position, its routes, the
 // overlaps a read of a change may include, and the component,
@@ -36,7 +47,11 @@ const (
 //
 // The index worker runs as background work, a pass every
 // awareness.Deps.IndexInterval, so that no request that records a version
-// or changes a change's state waits for the index.
+// or changes a change's state waits for the index. The claim expiry runs as
+// background work too, every awareness.Deps.ExpiryInterval; the claims that
+// ended a week ago are removed by the maintenance task claim_cleanup, and
+// a workspace's delete removes its claims and its part of the index (ADR
+// 07).
 //
 // It registers the keys of [awareness] and checks, before any store is
 // opened, the rule that spans two of them: a default claim lifetime longer
@@ -95,6 +110,9 @@ func composeAwareness(c *Composition) {
 		return nil
 	})
 	c.AddBackgroundWork(awarenessIndexWork, awarenessIndexGrace, func(ctx context.Context, _ *Runtime) { comp.Run(ctx) })
+	c.AddBackgroundWork(awarenessExpiryWork, awarenessExpiryGrace, func(ctx context.Context, _ *Runtime) { comp.RunClaimExpiry(ctx) })
+	c.AddMaintenanceTask(claimCleanupTask, func(ctx context.Context, _ *Runtime) error { return comp.RemoveEndedClaims(ctx) })
+	c.workspaces.Teardown().RegisterRemover(awareness.RemoveWorkspace)
 }
 
 // awarenessChanges is the awareness component's change reader: the change

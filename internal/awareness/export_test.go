@@ -19,3 +19,9 @@ func CanOverlap(a, b string) bool { return canOverlap(a, b) }
 
 // InsertClaim stores the claim cl in tx.
 func InsertClaim(ctx context.Context, tx *sql.Tx, cl Claim) error { return insertClaim(ctx, tx, cl) }
+
+// ReadClaim is the claim id stored on workspace, read through q, and
+// whether there is one.
+func ReadClaim(ctx context.Context, q Querier, workspace, id string) (Claim, bool, error) {
+	return readClaim(ctx, q, workspace, id)
+}

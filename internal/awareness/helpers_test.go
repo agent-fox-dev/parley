@@ -42,6 +42,8 @@ type fixture struct {
 	events  *eventFeed
 	changes *changeBook
 	log     *hubtest.LogBuffer
+	// now is the component's clock; nil for time.Now.
+	now func() time.Time
 	// hubEvents is the real event log the component writes its events to,
 	// on the fixture's store.
 	hubEvents *event.Component
@@ -55,17 +57,30 @@ type fixture struct {
 // that every workspace's slug opens.
 func newFixture(t testing.TB) *fixture {
 	t.Helper()
+	return newFixtureAt(t, nil)
+}
+
+// newFixtureAt is newFixture with now as the component's clock.
+func newFixtureAt(t testing.TB, now func() time.Time) *fixture {
+	t.Helper()
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "demo.git")
 	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", repo)
-	return newFixtureOn(t, repo)
+	return fixtureOn(t, repo, now)
 }
 
 // newFixtureOn is a fixture on a fresh store and the repository repo.
 func newFixtureOn(t testing.TB, repo string) *fixture {
 	t.Helper()
+	return fixtureOn(t, repo, nil)
+}
+
+// fixtureOn is a fixture on a fresh store and the repository repo, with now
+// as the component's clock (nil for time.Now).
+func fixtureOn(t testing.TB, repo string, now func() time.Time) *fixture {
+	t.Helper()
 	f := &fixture{t: t, dir: t.TempDir(), repo: repo, events: &eventFeed{}, changes: &changeBook{records: map[string]awareness.Change{}},
-		log: &hubtest.LogBuffer{}}
+		log: &hubtest.LogBuffer{}, now: now}
 	f.open()
 	return f
 }
@@ -94,6 +109,7 @@ func (f *fixture) open() {
 			return gitrepo.Git{}.Open(ctx, f.repo)
 		},
 		Logger: slog.New(slog.NewTextHandler(f.log, nil)),
+		Now:    f.now,
 	})
 }
 
@@ -117,6 +133,9 @@ type servedConfig struct {
 	TOML string
 	// Now is the awareness component's clock; nil for the hub's.
 	Now func() time.Time
+	// Compose is run on the hub's composition after the fixture's own
+	// changes; nil for nothing.
+	Compose func(*hub.Composition)
 }
 
 // newServed is a served fixture with an empty bare repository, in which
@@ -137,13 +156,16 @@ func newServedWith(t testing.TB, cfg servedConfig) *served {
 	h := hubtest.StartWith(t, hubtest.Config{TOML: cfg.TOML, Compose: func(c *hub.Composition) {
 		f.comp = c.Awareness()
 		c.AdjustAwareness(func(d *awareness.Deps) {
-			d.Events, d.Changes, d.IndexInterval = f.events, f.changes, time.Hour
+			d.Events, d.Changes, d.IndexInterval, d.ExpiryInterval = f.events, f.changes, time.Hour, time.Hour
 			d.Repos = func(ctx context.Context, _ string) (*gitrepo.Repo, error) { return gitrepo.Git{}.Open(ctx, f.repo) }
 			d.Logger = slog.New(slog.NewTextHandler(f.log, nil))
 			if cfg.Now != nil {
 				d.Now = cfg.Now
 			}
 		})
+		if cfg.Compose != nil {
+			cfg.Compose(c)
+		}
 	}})
 	f.store = h.Store
 	owner := h.CreateUser(t, "owner")
@@ -380,7 +402,8 @@ func (f *fixture) pass() {
 }
 
 // emit makes ch the change's record and appends an event of type typ
-// naming it, and returns the event's seq.
+// naming it, with ch's version in its metadata as the change events carry
+// it, and returns the event's seq.
 func (f *fixture) emit(typ string, ch awareness.Change) int64 {
 	if ch.Workspace == "" {
 		ch.Workspace = "demo"
@@ -389,7 +412,7 @@ func (f *fixture) emit(typ string, ch awareness.Change) int64 {
 		ch.TargetBranch = "main"
 	}
 	f.changes.set(ch)
-	return f.events.add(typ, ch.Workspace, ch.Number)
+	return f.events.add(typ, ch.Workspace, ch.Number, fmt.Sprintf(`{"version":%d}`, ch.Version))
 }
 
 // version emits a parley.change.version event of ch, in flight.
@@ -591,14 +614,14 @@ type eventFeed struct {
 	records []event.Record
 }
 
-func (e *eventFeed) add(typ, workspace string, number int64) int64 {
+func (e *eventFeed) add(typ, workspace string, number int64, meta string) int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	seq := int64(len(e.records) + 1)
 	e.records = append(e.records, event.Record{
 		Seq: seq, ID: strconv.FormatInt(seq, 10), Type: typ, Time: time.Unix(1700000000+seq, 0).UTC(), Workspace: &workspace,
 		ActorType: event.ActorSystem, ResourceType: "change", ResourceID: strconv.FormatInt(number, 10),
-		Metadata: []byte(`{}`),
+		Metadata: []byte(meta),
 	})
 	return seq
 }
@@ -958,6 +981,76 @@ func (p claimPage) ids() []string {
 	out := []string{}
 	for _, c := range p.Items {
 		out = append(out, c.ID)
+	}
+	return out
+}
+
+// newClaim is an active claim id of demo on main for api/**, made with an
+// API key at created and expiring an hour later, as edit (nil for none)
+// changes it.
+func newClaim(id string, created time.Time, edit func(*awareness.Claim)) awareness.Claim {
+	cl := awareness.Claim{
+		ID: id, Workspace: "demo", TargetBranch: "main", Paths: []string{"api/**"}, Intent: "rework",
+		By:    awareness.Actor{ActorType: "api_key", ActorID: new("u1"), Username: new("dev")},
+		State: awareness.ClaimActive, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}
+	if edit != nil {
+		edit(&cl)
+	}
+	return cl
+}
+
+// stored is the claim id of demo as the fixture's store holds it.
+func (f *fixture) stored(id string) awareness.Claim {
+	f.t.Helper()
+	return storedOn(f.t, f.store, "demo", id)
+}
+
+// storedOn is the claim id of workspace as st holds it, which must exist.
+func storedOn(t testing.TB, st *store.Store, workspace, id string) awareness.Claim {
+	t.Helper()
+	cl, found, err := awareness.ReadClaim(context.Background(), st.Main(), workspace, id)
+	if err != nil || !found {
+		t.Fatalf("the claim %s of %s: found %v, %v", id, workspace, found, err)
+	}
+	return cl
+}
+
+// claimIDsIn are the ids of every claim st holds, sorted.
+func claimIDsIn(t testing.TB, st *store.Store) []string {
+	t.Helper()
+	rows, err := st.Main().QueryContext(context.Background(), `SELECT id FROM awareness_claims ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// logged are the events of the fixture's event log whose type starts with
+// prefix, in seq order.
+func (f *fixture) logged(prefix string) []event.Record {
+	f.t.Helper()
+	recs, _, err := f.hubEvents.ReadAfter(context.Background(), 0, 10000)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	var out []event.Record
+	for _, r := range recs {
+		if strings.HasPrefix(r.Type, prefix) {
+			out = append(out, r)
+		}
 	}
 	return out
 }

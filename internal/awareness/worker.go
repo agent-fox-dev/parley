@@ -133,7 +133,7 @@ func (c *Component) prepare(ctx context.Context, rec event.Record) (update, bool
 		return update{}, false, err
 	}
 	ch.Workspace, ch.Number = workspace, number
-	u := update{seq: rec.Seq, typ: rec.Type, change: ch}
+	u := update{seq: rec.Seq, typ: rec.Type, first: firstVersion(rec), change: ch}
 	switch rec.Type {
 	case eventVersion, eventRestore:
 		u.files, err = c.listFiles(ctx, ch)

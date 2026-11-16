@@ -55,6 +55,8 @@ type update struct {
 	// seq and typ are the event's.
 	seq int64
 	typ string
+	// first is whether a version event records the change's first version.
+	first bool
 	// change is the change the event names, as the change reader read it,
 	// and files the files of its current version for a version or a
 	// restore.
@@ -70,20 +72,31 @@ type update struct {
 // files, an abandon takes it out of flight, a restore puts it back in
 // flight with the files of its current version. What else an index update
 // causes is written here too, so that it commits with the update and the
-// worker's position: after every kind of update, the announced pairs that
-// include the change are brought up to date with its partners.
+// worker's position: the first version of a change links the active claims
+// of its session to it, a land or an abandon fulfils the active claims
+// linked to the change (a restore turns none back), and, after every kind
+// of update, the announced pairs that include the change are brought up to
+// date with its partners.
 func (c *Component) apply(ctx context.Context, tx *sql.Tx, u update) error {
 	ch := u.change
+	now := c.deps.Now()
 	var err error
 	switch u.typ {
 	case eventVersion, eventRestore:
 		if err = putChange(ctx, tx, ch, PhaseInFlight, nil); err == nil {
 			err = putFiles(ctx, tx, ch.Workspace, ch.Number, u.files)
 		}
+		if err == nil && u.typ == eventVersion && u.first {
+			err = linkClaims(ctx, tx, ch, now)
+		}
 	case eventLand:
-		err = putChange(ctx, tx, ch, PhaseLanded, &u.landed)
+		if err = putChange(ctx, tx, ch, PhaseLanded, &u.landed); err == nil {
+			err = fulfilClaims(ctx, tx, ch.Workspace, ch.Number, now)
+		}
 	case eventAbandon:
-		err = putChange(ctx, tx, ch, PhaseOut, nil)
+		if err = putChange(ctx, tx, ch, PhaseOut, nil); err == nil {
+			err = fulfilClaims(ctx, tx, ch.Workspace, ch.Number, now)
+		}
 	}
 	if err != nil {
 		return err

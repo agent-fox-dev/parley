@@ -41,6 +41,10 @@ import (
 // looks at the event log when Deps.IndexInterval is zero.
 const DefaultIndexInterval = time.Second
 
+// DefaultExpiryInterval is how long the claim expiry waits between two runs
+// when Deps.ExpiryInterval is zero.
+const DefaultExpiryInterval = time.Minute
+
 // Querier is what a read goes through: the store's *sql.DB or the caller's
 // open *sql.Tx, so that a read inside a transaction sees what it wrote.
 type Querier interface {
@@ -170,6 +174,9 @@ type Deps struct {
 	// IndexInterval is the time between two looks of the index worker at
 	// the event log; zero is DefaultIndexInterval.
 	IndexInterval time.Duration
+	// ExpiryInterval is the time between two runs of the claim expiry; zero
+	// is DefaultExpiryInterval.
+	ExpiryInterval time.Duration
 	// Config is [awareness]; a zero member is DefaultConfig's.
 	Config Config
 }
@@ -213,6 +220,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.IndexInterval <= 0 {
 		d.IndexInterval = DefaultIndexInterval
+	}
+	if d.ExpiryInterval <= 0 {
+		d.ExpiryInterval = DefaultExpiryInterval
 	}
 	def := DefaultConfig()
 	if d.Config.DefaultClaimTTL <= 0 {
