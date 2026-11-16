@@ -47,6 +47,11 @@ type world struct {
 	workspaces *workspace.Service
 	// sessions is the session linker registered on the land component.
 	sessions *sessionStub
+	// policyGate is the landing policy's gate the hub registered, which
+	// the world removes and a test may register again.
+	policyGate land.Gate
+	// lander is the hub's automatic lander.
+	lander *land.AutoLander
 
 	owner, ownerKey, org string
 	// api is the git directory of api's repository, and base the commit
@@ -58,18 +63,31 @@ type world struct {
 // dependencies before they are bound.
 func newWorld(t *testing.T, adjust ...func(*land.Deps)) *world {
 	t.Helper()
+	return startWorld(t, nil, adjust...)
+}
+
+// startWorld is newWorld with compose, when not nil, run on the
+// composition after the world's own registrations, at every start of the
+// hub.
+func startWorld(t *testing.T, compose func(*hub.Composition), adjust ...func(*land.Deps)) *world {
+	t.Helper()
 	w := &world{sessions: &sessionStub{known: map[string]session{}}}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
 		TOML: "[changes]\nmergeable_debounce = \"0s\"\n",
 		Compose: func(c *hub.Composition) {
 			w.land, w.changes, w.forks, w.events, w.workspaces = c.Land(), c.Changes(), c.Forks(), c.Events(), c.Workspaces()
+			w.lander = c.AutoLander()
 			w.land.RegisterSessionLinker(w.sessions)
 			// The landing policy's gate is removed, so that a land is
 			// judged by the gate a test registers, every change ready
 			// without one.
+			w.policyGate = w.land.RegisteredGate()
 			w.land.RegisterGate(nil)
 			for _, fn := range adjust {
 				c.AdjustLand(fn)
+			}
+			if compose != nil {
+				compose(c)
 			}
 		},
 	})
@@ -605,6 +623,16 @@ func (c *clock) advance(d time.Duration) {
 	})
 }
 
+// clockEpoch is the time a clock is at before the test moves it.
+var clockEpoch = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+// Now is the time the clock is at.
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return clockEpoch.Add(c.now)
+}
+
 // waitAsked waits until the clock is asked for a duration, at most 30 s,
 // and returns it.
 func (c *clock) waitAsked(t *testing.T) time.Duration {
@@ -918,4 +946,33 @@ func (w *world) eventCount(t *testing.T) int {
 		t.Fatal(err)
 	}
 	return len(recs)
+}
+
+// patchChange sends PATCH of the change number of api with the body and
+// the credential, and returns the status and the decoded answer.
+func (w *world) patchChange(t *testing.T, credential string, number int64, body any) (int, map[string]any) {
+	t.Helper()
+	status, raw := w.Call(t, http.MethodPatch, fmt.Sprintf("/api/v1/workspaces/api/changes/%d", number), credential, body)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("PATCH change %d answered %d %q: %v", number, status, raw, err)
+	}
+	return status, out
+}
+
+// until waits until cond holds, at most 30 s.
+func until(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	within(t, 30*time.Second, what, cond)
+}
+
+// within waits until cond holds, at most d.
+func within(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(d); !cond(); {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within %v", what, d)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

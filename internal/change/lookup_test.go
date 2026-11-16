@@ -348,15 +348,13 @@ func TestSetters_StoreWhatOtherComponentsCompute(t *testing.T) {
 			t.Errorf("landing = %v, want %v", got, asJSON(t, l))
 		}
 	})
-	t.Run("reverts and reverted_by", func(t *testing.T) {
+	t.Run("reverts, which the reverted change shows as reverted_by", func(t *testing.T) {
 		if ch := set(t, 2, func(ctx context.Context, tx *sql.Tx) error {
 			return w.changes.SetReverts(ctx, tx, "demo", 2, new(int64(1)))
 		}); ch.Reverts == nil || *ch.Reverts != 1 {
 			t.Errorf("reverts = %v, want 1", ch.Reverts)
 		}
-		if ch := set(t, 1, func(ctx context.Context, tx *sql.Tx) error {
-			return w.changes.SetRevertedBy(ctx, tx, "demo", 1, new(int64(2)))
-		}); ch.RevertedBy == nil || *ch.RevertedBy != 2 {
+		if ch := w.read(t, 1); ch.RevertedBy == nil || *ch.RevertedBy != 2 {
 			t.Errorf("reverted_by = %v, want 2", ch.RevertedBy)
 		}
 	})
@@ -391,8 +389,7 @@ func TestSetters_StoreWhatOtherComponentsCompute(t *testing.T) {
 			"SetLanded": func(ctx context.Context, tx *sql.Tx) error {
 				return w.changes.SetLanded(ctx, tx, "demo", 99, change.Landed{SHA: b1, Commits: []change.LandedCommit{{VersionSHA: b1, LandedSHA: b1}}})
 			},
-			"SetReverts":    func(ctx context.Context, tx *sql.Tx) error { return w.changes.SetReverts(ctx, tx, "demo", 99, nil) },
-			"SetRevertedBy": func(ctx context.Context, tx *sql.Tx) error { return w.changes.SetRevertedBy(ctx, tx, "demo", 99, nil) },
+			"SetReverts": func(ctx context.Context, tx *sql.Tx) error { return w.changes.SetReverts(ctx, tx, "demo", 99, nil) },
 			"SetAbandoned": func(ctx context.Context, tx *sql.Tx) error {
 				return w.changes.SetAbandoned(ctx, tx, "demo", 99, "gone")
 			},

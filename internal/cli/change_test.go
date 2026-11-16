@@ -486,6 +486,65 @@ func TestChangeRestack_SendsAnEmptyObjectAndPrintsTheOutcome(t *testing.T) {
 	}
 }
 
+func TestChangeRevert_SendsAMemberForEachFlagGiven(t *testing.T) {
+	t.Parallel()
+	// reverting is the new change the hub answers a revert of change 7 with.
+	const reverting = `{"number":8,"state":"open","kind":"revert","reverts":7,"source":{"workspace_slug":"demo","branch":"revert/7"}}`
+	all := []string{"--title", "t", "--intent", "i", "--draft", "--auto-land", "--session", "s"}
+	tests := []struct {
+		name string
+		args []string
+		body string
+	}{
+		{"no flag", nil, `{}`},
+		{"title and intent", []string{"--title", "t", "--intent", "i"}, `{"title":"t","intent":"i"}`},
+		{"draft", []string{"--draft"}, `{"draft":true}`},
+		{"auto-land", []string{"--auto-land"}, `{"auto_land":true}`},
+		{"session", []string{"--session", "s"}, `{"session_id":"s"}`},
+		{"every flag", all, `{"title":"t","intent":"i","draft":true,"auto_land":true,"session_id":"s"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).answer(http.MethodPost, changesPath+"/7/revert", http.StatusCreated, reverting)
+
+			code, stdout, stderr, sent := runChange(t, hub, "", append([]string{"revert", "demo", "7"}, tt.args...)...)
+
+			got := wantOnlyRequest(t, sent, http.MethodPost, changesPath+"/7/revert")
+			wantQuery(t, got.query, nil)
+			wantJSONBody(t, got.body, tt.body)
+			wantResult(t, code, stdout, stderr, reverting)
+		})
+	}
+}
+
+func TestChangeRevert_RefusesAMalformedCommandLineBeforeAnyRequest(t *testing.T) {
+	t.Parallel()
+	hub := newStubHub(t)
+	tests := []struct {
+		args []string
+		// inMessage is the part of the message that names the refusal.
+		inMessage string
+	}{
+		{[]string{"revert", "demo"}, "parley change revert needs the argument <number>"},
+		{[]string{"revert", "demo", "7", "x"}, `parley change revert takes at most 2 arguments, got the extra argument "x"`},
+		{[]string{"revert", "demo", "0"}, `parley change revert takes a <number> that is a positive integer, got "0"`},
+		{[]string{"revert", "demo", "abc"}, `parley change revert takes a <number> that is a positive integer, got "abc"`},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			code, stdout, stderr, sent := runChange(t, hub, "", tt.args...)
+
+			if message := wantClientFailure(t, code, stdout, stderr, "usage_error"); !strings.Contains(message, tt.inMessage) {
+				t.Errorf("message = %q, want it to contain %q", message, tt.inMessage)
+			}
+			if len(sent) != 0 {
+				t.Errorf("the hub got %v, want no request", sent)
+			}
+		})
+	}
+}
+
 func TestChangeResolve_SendsAResolutionForEachFlagAndPrintsTheOutcome(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -539,6 +598,10 @@ func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 	t.Parallel()
 	conflict := `{"error":{"code":409,"message":"demo#12 conflicts with what it must sit on","error_type":"rebase_conflict",` +
 		`"details":{"target_sha":"` + changeSHA + `","files":[{"path":"f.txt","kind":"content"}]}}}`
+	revertConflict := `{"error":{"code":409,"message":"the revert of demo#7 does not apply","error_type":"revert_conflict",` +
+		`"details":{"conflict":{"target_sha":"` + changeSHA + `","files":[{"path":"f.txt","kind":"content"}],"landed_changes":[],"change":null}}}}`
+	reverted := `{"error":{"code":409,"message":"demo#7 is already reverted","error_type":"already_reverted","details":{"reverted_by":9}}}`
+	outside := `{"error":{"code":403,"message":"path src/a.go is outside this token's allowed paths","error_type":"path_not_allowed","path":"src/a.go"}}`
 	resolved := localFile(t, "f.txt", []byte("both\n"))
 	tests := []struct {
 		args         []string
@@ -557,6 +620,9 @@ func TestChange_LifecycleCommandsPrintTheHubsRefusal(t *testing.T) {
 		{[]string{"restack", "demo", "12"}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
 		{[]string{"resolve", "demo", "12", "--file", "f.txt=" + resolved}, http.MethodPost, changesPath + "/12/restack", http.StatusConflict, "rebase_conflict", conflict},
 		{[]string{"resolve", "demo", "12", "--delete", "f.txt"}, http.MethodPost, changesPath + "/12/restack", http.StatusNotFound, "change_not_found", ""},
+		{[]string{"revert", "demo", "7"}, http.MethodPost, changesPath + "/7/revert", http.StatusConflict, "revert_conflict", revertConflict},
+		{[]string{"revert", "demo", "7", "--draft"}, http.MethodPost, changesPath + "/7/revert", http.StatusConflict, "already_reverted", reverted},
+		{[]string{"revert", "demo", "7", "--auto-land"}, http.MethodPost, changesPath + "/7/revert", http.StatusForbidden, "path_not_allowed", outside},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {

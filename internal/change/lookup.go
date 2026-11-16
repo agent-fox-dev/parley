@@ -97,6 +97,27 @@ WHERE workspace_slug = ? AND state IN ('draft', 'open') ORDER BY number`, worksp
 	return numbers, nil
 }
 
+// OpenAutoLand are the open changes whose auto_land is on, across
+// workspaces, ordered by workspace slug and number, read through q (the
+// caller's transaction, or nil for the store).
+func (c *Component) OpenAutoLand(ctx context.Context, q Querier) ([]Key, error) {
+	rows, err := c.querier(q).QueryContext(ctx, `SELECT workspace_slug, number FROM changes
+WHERE state = 'open' AND auto_land = 1 ORDER BY workspace_slug, number`)
+	if err != nil {
+		return nil, fmt.Errorf("find the open changes with auto_land on: %w", err)
+	}
+	defer rows.Close()
+	out := []Key{}
+	for rows.Next() {
+		var k Key
+		if err := rows.Scan(&k.WorkspaceSlug, &k.Number); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 // ofWorkspace selects the changes a workspace asks about: its own, and,
 // since a fork holds no changes, those of its parent whose source it is.
 const ofWorkspace = `(c.workspace_slug = ? OR c.source_workspace = ?)`

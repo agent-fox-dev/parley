@@ -77,10 +77,11 @@ type Workspace struct {
 	// Ready is nil for a workspace a change may land in, and otherwise
 	// its refusal, such as 409 workspace_archived.
 	Ready error
-	// Strategy, ByAuthor and DeleteSource are the effective land.strategy,
-	// land.by_author and land.delete_source settings.
-	Strategy               string
-	ByAuthor, DeleteSource bool
+	// Strategy, ByAuthor, DeleteSource and AllowOverride are the effective
+	// land.strategy, land.by_author, land.delete_source and
+	// land.allow_override settings.
+	Strategy                              string
+	ByAuthor, DeleteSource, AllowOverride bool
 }
 
 // WorkspaceReader reads a workspace record through q, the caller's
@@ -127,8 +128,12 @@ type Deps struct {
 	Access AccessRule
 	// Events takes the land events.
 	Events EventWriter
-	// RefWriter moves the target branch of a land.
+	// RefWriter moves the target branch of a land and creates the branch
+	// of a revert.
 	RefWriter RefWriter
+	// Rules are the push rules a revert's branch is created under; a
+	// revert fails without them.
+	Rules Rules
 	// Now is the clock of the stored times; nil is time.Now.
 	Now func() time.Time
 	// Logger is told of what fails and changes nothing; nil discards it.
@@ -199,6 +204,9 @@ type seams struct {
 	beforeSwap    func(ctx context.Context, id string, try int)
 	fault         func(point string) error
 	sourceChecked func()
+	// revertBranched runs once a revert's checks passed and its branch
+	// was created, before the reverting change is opened.
+	revertBranched func()
 }
 
 // Bind gives the component its dependencies, the defaults in place of the

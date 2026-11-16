@@ -44,7 +44,7 @@ func (c *Component) Authorize(ctx context.Context, caller Caller, target, source
 	if err := c.authorizeBinding(ctx, caller, target, source); err != nil {
 		return err
 	}
-	return c.authorizeAccess(ctx, caller, target, source)
+	return c.authorizeAccess(ctx, caller, target, source, false)
 }
 
 // accessCaller is the caller as the access rule takes it.
@@ -92,9 +92,10 @@ func (c *Component) authorizeBinding(ctx context.Context, caller Caller, target,
 	return server.NotFound(fmt.Sprintf("no workspace %q", target))
 }
 
-// authorizeAccess asks the access rule whether the caller reads target and
-// writes source.
-func (c *Component) authorizeAccess(ctx context.Context, caller Caller, target, source string) error {
+// authorizeAccess asks the access rule whether the caller reads target and,
+// unless granted says the operation opening the change decided that the
+// caller may open it from source, writes source.
+func (c *Component) authorizeAccess(ctx context.Context, caller Caller, target, source string, granted bool) error {
 	if caller.Credential.Type == CredentialAdminToken || caller.Credential.Type == "" {
 		return nil
 	}
@@ -108,6 +109,9 @@ func (c *Component) authorizeAccess(ctx context.Context, caller Caller, target, 
 	}
 	if level == access.LevelNone {
 		return server.NotFound(fmt.Sprintf("no workspace %q", target))
+	}
+	if granted {
+		return nil
 	}
 	writes, err := c.deps.Access.CanWrite(ctx, caller.UserID, source)
 	if err != nil || writes {

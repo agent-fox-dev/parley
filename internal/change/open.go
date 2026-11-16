@@ -70,6 +70,12 @@ type OpenInput struct {
 	// in its ref-updated stage. Open then reads the branch in tx, once
 	// version 1 is recorded.
 	AfterMove bool
+	// SourceGranted says that the operation opening the change has itself
+	// decided that the caller may open it from the source, as a revert
+	// does for the author whom land.by_author lets revert their change:
+	// Open then still asks that the caller read the target, but not that
+	// they write the source.
+	SourceGranted bool
 }
 
 // Open opens a change in tx, the caller's transaction, which it neither
@@ -395,7 +401,7 @@ func (c *Component) check(ctx context.Context, q Querier, co collaborators, in O
 			return nil, err
 		}
 	}
-	if err := c.authorizeAccess(ctx, in.Caller, in.Workspace, in.SourceWorkspace); err != nil {
+	if err := c.authorizeAccess(ctx, in.Caller, in.Workspace, in.SourceWorkspace, in.SourceGranted); err != nil {
 		return nil, err
 	}
 	if err := c.resolve(ctx, q, co, in, o); err != nil {
@@ -442,6 +448,28 @@ func checkIntent(intent string) error {
 		return server.InvalidRequest(fmt.Sprintf("intent: at most %d characters", MaxIntent))
 	}
 	return nil
+}
+
+// CheckTitle refuses a title as an open refuses it: one that is empty or
+// white space only, longer than MaxTitle characters or more than one line
+// is 400 invalid_request.
+func CheckTitle(title string) error { return checkTitle(title) }
+
+// CheckIntent refuses an intent as an open refuses it: one longer than
+// MaxIntent characters is 400 invalid_request.
+func CheckIntent(intent string) error { return checkIntent(intent) }
+
+// CheckSession judges the session id named by caller for a change of the
+// workspace as an open judges an explicit session_id, for a write that
+// opens a change once it has done what the session must be known for: it
+// returns the id as it is to be stored, and 400 unknown_session for an id
+// the session linker refuses, and for every id while none is registered.
+func (c *Component) CheckSession(ctx context.Context, caller Caller, id, workspace string) (string, error) {
+	got, err := c.session(ctx, c.collaborators(), OpenInput{Workspace: workspace, SessionID: &id, Caller: caller}, Workspace{})
+	if err != nil {
+		return "", err
+	}
+	return *got, nil
 }
 
 // checkLabels refuses more than MaxLabels labels, or one that labelPattern

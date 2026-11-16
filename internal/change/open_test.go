@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -561,8 +562,8 @@ func TestOpen_RecordsARevertWithItsKindAndTheRevertedChange(t *testing.T) {
 	if len(events) == 0 || events[0].Type != "parley.change.version" || metadata(t, events[0])["kind"] != "revert" {
 		t.Errorf("events = %+v, want parley.change.version of kind revert first", events)
 	}
-	if reverted, err := w.changes.ReadChange(ctx, nil, "demo", 1); err != nil || reverted.RevertedBy != nil {
-		t.Errorf("ReadChange(demo, 1) = reverted_by %v, %v; want null", reverted.RevertedBy, err)
+	if reverted, err := w.changes.ReadChange(ctx, nil, "demo", 1); err != nil || reverted.RevertedBy == nil || *reverted.RevertedBy != ch.Number {
+		t.Errorf("ReadChange(demo, 1) = reverted_by %v, %v; want %d", reverted.RevertedBy, err, ch.Number)
 	}
 	got := w.mustPost(t, map[string]any{"source": map[string]any{"branch": "other"}})
 	if got["reverts"] != nil {
@@ -641,6 +642,47 @@ func TestOpen_LetsOnlyACallerWhoWritesTheSourceOpen(t *testing.T) {
 			source, _ := got["source"].(map[string]any)
 			if status != http.StatusCreated || got["workspace_slug"] != "demo" || source["workspace_slug"] != "demo--m1" || got["target_branch"] != "main" {
 				t.Errorf("POST = %d %v, want 201 in demo from demo--m1 onto main", status, got)
+			}
+		})
+	}
+}
+
+func TestOpen_LeavesTheSourceWriteCheckToAnOperationThatDecidedWhoMayOpen(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	m, _ := w.member(t, "m")
+	stranger := w.CreateUser(t, "stranger")
+	for i, c := range []struct {
+		name    string
+		user    string
+		granted bool
+		// errorType is the refusal, "" for an open.
+		errorType string
+	}{
+		{"a member who only reads the source, without the decision", m, false, "forbidden"},
+		{"a member who only reads the source, with the decision", m, true, ""},
+		{"a user who cannot read the target, with the decision", stranger, true, "not_found"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			branch := "granted" + strconv.Itoa(i)
+			w.branch(t, branch, "Granted\n\nWhy.\n")
+			in := change.OpenInput{Workspace: "demo", SourceBranch: branch, Kind: change.KindRef, SourceGranted: c.granted,
+				Caller: change.Caller{UserID: c.user, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k1"}}}
+
+			checked := w.changes.CheckOpen(context.Background(), nil, in)
+			ch, err := w.open(t, in)
+
+			if c.errorType == "" {
+				if checked != nil || err != nil || ch.Author.ActorID == nil || *ch.Author.ActorID != c.user {
+					t.Errorf("CheckOpen = %v; Open = %+v, %v; want a change by %s", checked, ch, err, c.user)
+				}
+				return
+			}
+			for _, got := range []error{checked, err} {
+				var se *server.Error
+				if !errors.As(got, &se) || se.Type() != c.errorType {
+					t.Errorf("CheckOpen, Open = %v, %v; want %s from both", checked, err, c.errorType)
+				}
 			}
 		})
 	}

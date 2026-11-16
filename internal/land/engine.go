@@ -329,11 +329,17 @@ func (a Attempt) covering(number int64, otherwise CoveredChange) CoveredChange {
 
 // emit writes, in tx, the land event typ of the attempt a on the change
 // number, by whoever asked for the land, in the session they named, with
-// meta and the change's number and ref.
+// meta and the change's number and ref. The events of an automatic land
+// are by system: the hub started it, while the attempt's requested_by
+// keeps who set the flag, whose permissions it ran with.
 func (c *Component) emit(ctx context.Context, tx *sql.Tx, a Attempt, typ string, number int64, meta map[string]any) error {
 	meta["number"], meta["ref"] = number, change.Ref(a.Workspace, number)
+	actorType, actorID := a.RequestedBy.ActorType, a.RequestedBy.ActorID
+	if a.Trigger == TriggerAutoLand {
+		actorType, actorID = event.ActorSystem, nil
+	}
 	_, err := c.deps.Events.Emit(ctx, tx, event.Input{
-		Type: typ, Workspace: &a.Workspace, ActorType: a.RequestedBy.ActorType, ActorID: a.RequestedBy.ActorID,
+		Type: typ, Workspace: &a.Workspace, ActorType: actorType, ActorID: actorID,
 		ResourceType: "change", ResourceID: strconv.FormatInt(number, 10), SessionID: a.SessionID, Metadata: meta,
 	})
 	return err

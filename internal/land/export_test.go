@@ -50,16 +50,18 @@ func RunAttempt(ctx context.Context, c *Component, workspace, id string) error {
 // after-bookkeeping), and an error stops the engine there as a stop of
 // the process would, writing nothing more. SourceChecked runs once a
 // landed change's source branch was found needed by no other change, before
-// it is deleted.
+// it is deleted. RevertBranched runs once a revert's checks passed and its
+// branch was created, before the reverting change is opened.
 type Seams struct {
-	BeforeSwap    func(ctx context.Context, id string, try int)
-	Fault         func(point string) error
-	SourceChecked func()
+	BeforeSwap     func(ctx context.Context, id string, try int)
+	Fault          func(point string) error
+	SourceChecked  func()
+	RevertBranched func()
 }
 
 // SetSeams sets the seams of c, before it runs an attempt.
 func SetSeams(c *Component, s Seams) {
-	c.seams = seams{beforeSwap: s.BeforeSwap, fault: s.Fault, sourceChecked: s.SourceChecked}
+	c.seams = seams{beforeSwap: s.BeforeSwap, fault: s.Fault, sourceChecked: s.SourceChecked, revertBranched: s.RevertBranched}
 }
 
 // Journalled counts the entries of the land journal in s.
@@ -91,4 +93,11 @@ func CountReplays(c *Component) func() int64 {
 		return change.TrialRebase(ctx, repo, base, head, onto)
 	})
 	return n.Load
+}
+
+// RegisteredGate is the policy gate registered on c, nil for none.
+func (c *Component) RegisteredGate() Gate {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gate
 }
