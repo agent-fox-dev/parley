@@ -1477,7 +1477,7 @@ a member that the table allows to be `null` counts as absent when it is:
 | `description` | no | a string or `null` of at most 1024 characters (Unicode code points); absent, the empty string |
 | `workspace_mode` | no | a string or `null`: `standard` or `carry_patch`; absent, `null` or empty, `standard` |
 | `upstream_url` | with `carry_patch` | a string or `null`; required with `carry_patch` and checked by the `git_url` rule; with `standard` only `null` is accepted |
-| `integration_branch` | no | a string or `null`; with `carry_patch` a valid branch name, stored as given (`null` when absent); with `standard` only `null` is accepted |
+| `integration_branch` | no | a string or `null`; with `carry_patch` a valid branch name, stored as given (`null` when absent, until the set-up after the first clone stores `deploy`, see [Carry-patch workspaces](#carry-patch-workspaces)); with `standard` only `null` is accepted |
 | `settings` | no | an object or `null`: each key one of the [workspace settings](#workspace-settings) with a value its rule accepts, a key with the value `null` keeping its default; only the keys set are stored. Absent or `null`, every key keeps its default |
 | `git_pat` | no | a string, not empty; not with `git_username` or `git_password` |
 | `git_username`, `git_password` | no | strings, not empty, given together or not at all |
@@ -2618,6 +2618,199 @@ who reads it); the `limit` and `cursor` (`400`).
 ```json
 {"items":[{"token_id":"k3x9m2pq","user_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","name":"agent","permissions":["git:read"],"paths":null,"workspace":"w1","expires_at":"2026-01-31T00:00:00Z","revoked_at":"2026-01-02T00:00:00Z","created_at":"2026-01-01T00:00:00Z"}],"next_cursor":null}
 ```
+
+## Carry-patch workspaces
+
+A workspace whose `workspace_mode` is `carry_patch` keeps a variant of an
+upstream project it does not control: the hub tracks both origin
+(`git_url`) and the upstream (`upstream_url`), and keeps an ordered list of
+**patches**, branches of the workspace that the hub rebuilds on top of the
+upstream into the **integration branch**.
+
+### The set-up after a clone
+
+After every fresh clone of a `carry_patch` workspace (the first clone, a
+reclone, a reactivation that cannot keep its copy) and before the workspace
+becomes `ready`, the hub sets it up in four steps, each attempted whatever
+the earlier ones did:
+
+1. when the record has no `integration_branch`, it stores `deploy`, so the
+   workspace object shows `"integration_branch":"deploy"` from then on
+   (`updated_at` does not change);
+2. it fetches the upstream: every branch of `upstream_url` into
+   `refs/remotes/upstream/<branch>` of the hub's copy, removing those the
+   upstream no longer has, and no tag; the upstream's default branch is
+   remembered in the copy's configuration (`parley.upstreamDefaultBranch`);
+3. it turns on remembered resolutions (git's `rerere.enabled`) in the copy;
+4. it writes `refs/heads/<integration_branch>` at the **upstream base**,
+   the head of the upstream's default branch (else of the upstream branch
+   named like the workspace's `default_branch`), or at the workspace's
+   `head_sha` (the head of origin's default branch) when the fetch failed
+   or no base resolves. A branch of that name the clone brought from origin
+   is replaced; `refs/remotes/origin/<name>` stays as origin has it.
+
+A failed step is logged (`workspace post-clone step failed`, with the slug
+and the failed steps, scrubbed of credentials) and never keeps the
+workspace from `ready`: `clone_error` stays `null`. The set-up writes no
+`upstream_head_sha` and emits no event. A copy that clone work keeps
+instead of cloning is not set up again, and a `standard` workspace never.
+
+The upstream credential is read from the workspace's
+[secrets](#secrets) at every use, the first that applies:
+`UPSTREAM_GIT_PAT` when not empty (user name `x-token-auth`, the token as
+password); `UPSTREAM_GIT_USERNAME` with `UPSTREAM_GIT_PASSWORD` when both
+are not empty; the workspace's origin credential (`GIT_PAT`, else
+`GIT_USERNAME` with `GIT_PASSWORD`); none. A rotated secret counts at the
+next use. A secret that cannot be read fails the fetch without contacting
+the upstream; there is no anonymous attempt. One upstream fetch may take
+10 minutes; past that its git process is stopped and the fetch has failed.
+
+### The patch object
+
+Every patch route answers patches as this object, every member present
+(`null` when unset):
+
+| Member | Value |
+|---|---|
+| `id` | a UUID |
+| `workspace_slug` | the workspace's slug |
+| `branch_name` | the patch's branch, without `refs/heads/` |
+| `position` | its place in the order, `1` to N without gaps among the patches that are not deleted; `null` for a deleted patch |
+| `status` | `active`, `conflict`, `disabled`, `merged_upstream` or `deleted` |
+| `conflict_files` | an array of paths, `[]` unless `status` is `conflict` |
+| `upstream_pr_url`, `description` | strings, or `null` |
+| `added_at`, `updated_at` | timestamps (see [Timestamps and durations](#timestamps-and-durations)) |
+| `deleted_at` | a timestamp, or `null` |
+| `origin_sync_state`, `origin_sha`, `origin_synced_at` | `null` for a new patch |
+
+A branch is the branch of at most one patch of a workspace that is not
+deleted. A workspace's patches are removed with it by its delete.
+
+### Common rules
+
+Every route of this section is under `/api/v1/workspaces/{slug}/patches`.
+The reads need the scope `patches:read` from a PAT (`patches:write` also
+satisfies it) and read access to the workspace; the add needs
+`patches:write` and write access (see [Workspace access](#workspace-access)).
+After its own validation, each route refuses a workspace whose
+`workspace_mode` is not `carry_patch`, every task fork included, with
+`400` `workspace_mode_mismatch`
+(`workspace "<slug>" is in mode standard; patches need a workspace in mode carry_patch`),
+before it looks at the workspace's status. The reads answer in every
+status of the workspace, from the stored list; the add then needs the
+workspace to be `ready` with no archive, reclone or delete running
+(`409` `workspace_busy`, `workspace_not_ready` or `workspace_archived`, as
+for a [sync](#post-apiv1workspacesslugsync)).
+
+## `POST /api/v1/workspaces/{slug}/patches`
+
+Registers one patch, or a batch of them all or nothing. It accepts an
+`Idempotency-Key` (see [Idempotency](#idempotency)). The body is one patch
+object or a non-empty array of them:
+
+| Member | Required | Rule |
+|---|---|---|
+| `branch_name` | yes | a string, a valid branch name, not the workspace's integration branch (its `integration_branch`, `deploy` while that is `null`) |
+| `position` | no | a JSON integer of at least 1; absent, `null` or greater than N+1 appends the patch |
+| `upstream_pr_url`, `description` | no | strings; absent, `null` or empty is stored as `null` |
+| `skip_branch_check` | no | a boolean; `true` registers the branch without looking it up |
+| `if_not_exists` | no | a boolean; `true` answers an already registered branch with its patch; refused in a batch |
+
+`null` counts as absent and unknown members are ignored. The body is
+validated before anything is looked up; in a batch every element is, in
+order, and the message of a refusal starts with `patch[<i>]: `, `<i>` the
+zero-based index of the element (the later one of two that name the same
+branch).
+
+Then, after the [common rules](#common-rules):
+
+1. **Already registered.** A branch that is the branch of a patch that is
+   not deleted is `409` `patch_exists`; with `if_not_exists: true` the
+   answer is `200` with that patch, unchanged. In a batch every element is
+   checked before any branch is looked up.
+2. **Branch resolution**, unless `skip_branch_check` is `true`
+   (`skipped`), in array order: `refs/heads/<branch>` of the hub's copy is
+   taken as it is (`local`); else the hub creates the branch at
+   `refs/remotes/origin/<branch>`, origin's head as of the last fetch
+   (`origin_tracking`); else, when the workspace setting
+   `patch_branch_source` is `origin`, the hub fetches that one branch from
+   origin with the origin credential, within 2 minutes, records it as
+   `refs/remotes/origin/<branch>` and creates the branch at its tip
+   (`origin_fetch`). A branch found nowhere is `404` `branch_not_found`;
+   origin unreachable, refusing, its credential unreadable or the limit
+   passed is `502` `origin_fetch_failed`. A branch created by resolution
+   stays even when the request then fails.
+3. **Storing**, in one transaction with the events: a deleted patch of the
+   same branch is removed for good and its backup ref
+   `refs/parley/replaced/<branch>` deleted after the commit (a failure to
+   delete it is logged, `delete the backup ref of a removed patch`, and
+   does not change the answer). With N patches that are not deleted, a
+   patch with a `position` of at most N+1 takes it and the patches at and
+   after it move down by one; the others are appended. In a batch the
+   elements with a `position` are placed first, in array order, each in the
+   list as it then stands, then the others are appended in array order.
+   Each new patch is `active` with `conflict_files` `[]`, and `added_at`
+   equal to `updated_at`.
+
+Concurrent adds on a workspace never fail because of each other: of two
+adds of one branch, one creates the patch and the other is answered as
+already registered, and the positions stay 1 to N without gaps.
+
+| Status | When |
+|---|---|
+| `201 Created` | the patch was registered; the body is the patch object. A batch answers `{"items":[…]}`, the patches in request order, each at its final position |
+| `200 OK` | `if_not_exists: true` for a registered branch (the existing patch), or a replay of a recorded `Idempotency-Key` (the first answer) |
+| `400` `invalid_request` | the body is not a patch object or an array of them (`request body must be a patch object or an array of them`), an empty array (`a batch must hold at least one patch object`), an element that is not an object (`patch[<i>]: a patch must be a JSON object`), `branch_name is required`, `branch_name "<b>" is not a valid branch name: <rule>`, `branch_name "<b>" is the workspace's integration branch`, `position must be an integer of at least 1`, `<member> must be a string`, `<member> must be a boolean`, `patch[<i>]: if_not_exists cannot be true in a batch`, `patch[<i>]: branch_name "<b>" is named by patch[<j>] already` |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT without `patches:write` |
+| `403` `forbidden` | a caller with read access only |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug |
+| `404` `branch_not_found` | the branch is found by none of the lookups that apply (`branch "<b>" not found`) |
+| `409` `patch_exists` | the branch is the branch of a patch that is not deleted (`branch "<b>" is a patch of the workspace already`) |
+| `409` `conflict` | another branch of the copy is in the way of the branch's name, such as `feat` for `feat/x` (`the branch "feat/x" cannot be created in the hub's copy: refs/heads/feat is in the way of its name`) |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+| `500` `internal` | storing failed; no patch of the request and no event remain |
+| `502` `origin_fetch_failed` | the single-branch fetch from origin failed (`fetch the branch "<b>" from origin: <cause>`, with no credential and URL user information as `***@`) |
+
+Each created patch emits `parley.patch.create` with `resource_type`
+`patch`, the patch's id as `resource_id`, the caller as actor, and in
+`metadata` `branch_name`, `position` (the final one) and
+`branch_resolution` (`local`, `origin_tracking`, `origin_fetch` or
+`skipped`):
+
+```json
+{"seq":31,"id":"…","type":"parley.patch.create","time":"2026-11-16T10:30:15Z","workspace":"variant","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"patch","resource_id":"5c0e0000-0000-4000-8000-000000000001","action":"create","session_id":null,"metadata":{"branch_name":"fix-dial","branch_resolution":"origin_tracking","position":1}}
+```
+
+## `GET /api/v1/workspaces/{slug}/patches`
+
+Lists the patches that are not deleted in position order. With
+`include_deleted=true` the deleted patches follow, newest `deleted_at`
+first and by `id` among equal ones. It is a list (see [Lists](#lists)), with
+`limit` and `cursor`; the cursor continues across the boundary between the
+two groups.
+
+| Status | When |
+|---|---|
+| `200 OK` | a page, `items` an array of patch objects (`[]` when there are none) |
+| `400` `invalid_request` | `include_deleted` other than exactly `true` or `false`, empty or given more than once included (`include_deleted must be given once, as true or false`); a bad `limit` or `cursor` |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT with neither `patches:read` nor `patches:write` |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug |
+
+## `GET /api/v1/workspaces/{slug}/patches/{id}`
+
+Answers one patch of the workspace, deleted or not. When the hub's copy
+holds the backup ref `refs/parley/replaced/<branch_name>`, the patch object
+has one more member, `replaced_sha`, the full commit id the ref points at;
+otherwise, and when the copy is not on disk, the member is absent.
+
+| Status | When |
+|---|---|
+| `200 OK` | the patch object |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `403` `insufficient_scope` | a PAT with neither `patches:read` nor `patches:write` |
+| `404` `not_found` | the caller cannot read the workspace (`workspace not found`); or `{id}` is not a UUID, names no patch, or a patch of another workspace (`patch not found`) |
 
 ## Source control reads
 
