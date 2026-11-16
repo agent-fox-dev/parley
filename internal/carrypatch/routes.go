@@ -60,11 +60,13 @@ func Route(kind RouteKind, rt server.Route) server.Route {
 // hub registers with its router: the patch list and a single patch, read
 // routes that serve in every state of the workspace, and the add, a write
 // route that creates, so that the server answers a repeated
-// Idempotency-Key with the first answer.
+// Idempotency-Key with the first answer, and the write routes that
+// maintain the list.
 func (c *Component) Routes() []server.Route {
 	return []server.Route{
 		Route(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/patches", Handler: c.listRoute}),
 		Route(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/patches/:id", Handler: c.getRoute}),
 		Route(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/patches", Handler: c.addRoute, Create: true}),
+		Route(WriteRoute, server.Route{Method: http.MethodPatch, Pattern: "/workspaces/:slug/patches/:id", Handler: c.updateRoute}),
 	}
 }
