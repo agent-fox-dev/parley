@@ -324,8 +324,11 @@ func TestStream_HeartbeatAdvancesPosition(t *testing.T) {
 		}
 	}
 
+	// The clock never moves 60 s past a stream's last write: the client may
+	// read a frame before the writer marks its write done, and a write still
+	// marked under way at the idle-write limit ends the stream.
 	w.clock.WaitTimers(t, 2)
-	w.clock.Set(start.Add(3 * time.Hour))
+	w.clock.Advance(30 * time.Second)
 	wantHeartbeat("10")
 	w.clock.WaitTimers(t, 2)
 	w.emitMany(5)
@@ -335,7 +338,7 @@ func TestStream_HeartbeatAdvancesPosition(t *testing.T) {
 		t.Fatalf("filtered stream: heartbeat id %s, want 15", hb.id)
 	}
 
-	if oldest, err := w.events.Expire(context.Background(), start.Add(time.Hour)); err != nil || oldest != 11 {
+	if oldest, err := w.events.Expire(context.Background(), start.Add(time.Minute)); err != nil || oldest != 11 {
 		t.Fatalf("Expire = %d, %v, want 11", oldest, err)
 	}
 	again := w.openStream(t, w.admin, "types=parley.nothing.*", "15")
