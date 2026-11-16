@@ -8,7 +8,7 @@ import (
 )
 
 // Routes are the awareness routes, for the server's router: the overlaps
-// of a change.
+// of a change and the activity of a list of path globs.
 //
 // The patterns are those of the contributor table of internal/access,
 // parameter names included, so that a token bound to a fork reaches them
@@ -21,6 +21,10 @@ func (c *Component) Routes() []server.Route {
 		{
 			Method: http.MethodGet, Pattern: "/workspaces/:slug/changes/:number/overlaps", Scope: "changes:read",
 			Marks: need, Handler: c.overlapsRoute,
+		},
+		{
+			Method: http.MethodGet, Pattern: "/workspaces/:slug/activity", Scope: "changes:read",
+			Marks: need, Handler: c.activityRoute,
 		},
 	}
 }

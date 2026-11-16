@@ -76,7 +76,7 @@ func (f *fixture) open() {
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(f.dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(f.dir, "workspaces"),
-	}, []store.Step{event.SchemaStep, awareness.SchemaStep})
+	}, []store.Step{event.SchemaStep, awareness.SchemaStep, awareness.ClaimSchemaStep})
 	if err != nil {
 		f.t.Fatalf("open store: %v", err)
 	}
@@ -126,7 +126,154 @@ func newServed(t testing.TB) *served {
 	owner := h.CreateUser(t, "owner")
 	h.AddWorkspace(t, access.Record{Slug: "demo", OwnerID: owner, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository,
 		Status: access.StatusReady})
+	txOf(t, h.Store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(), `UPDATE workspaces SET default_branch = 'main' WHERE slug = 'demo'`)
+		return err
+	})
 	return &served{fixture: f, hub: h}
+}
+
+// activity gets GET …/activity?query, which must answer 200 with exactly
+// the five members of the activity and three arrays.
+func (s *served) activity(t *testing.T, query string) activityAnswer {
+	t.Helper()
+	status, raw := s.get("activity?" + query)
+	if status != http.StatusOK {
+		t.Fatalf("GET activity?%s = %d %s, want 200", query, status, raw)
+	}
+	if !jsonHasKeys(t, raw, "target_branch", "target_sha", "changes", "claims", "landed") {
+		t.Errorf("GET activity?%s = %s, want exactly target_branch, target_sha, changes, claims and landed", query, raw)
+	}
+	var lists map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &lists); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"changes", "claims", "landed"} {
+		if !strings.HasPrefix(string(lists[key]), "[") {
+			t.Errorf("%s = %s, want an array", key, lists[key])
+		}
+	}
+	var a activityAnswer
+	if err := json.Unmarshal(raw, &a); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// activityAnswer is the body of an activity answer.
+type activityAnswer struct {
+	TargetBranch string  `json:"target_branch"`
+	TargetSHA    *string `json:"target_sha"`
+	Changes      []struct {
+		Change struct {
+			Number int64 `json:"number"`
+		} `json:"change"`
+		Paths []string `json:"paths"`
+		Count int      `json:"count"`
+	} `json:"changes"`
+	Claims []struct {
+		ID string `json:"id"`
+	} `json:"claims"`
+	Landed []struct {
+		Number int64 `json:"number"`
+	} `json:"landed"`
+}
+
+// changeCounts are the changes of the answer, each as "number:count", in
+// order.
+func (a activityAnswer) changeCounts() []string {
+	out := []string{}
+	for _, e := range a.Changes {
+		out = append(out, fmt.Sprintf("%d:%d", e.Change.Number, e.Count))
+	}
+	return out
+}
+
+// claimIDs are the ids of the claims of the answer, in order.
+func (a activityAnswer) claimIDs() []string {
+	out := []string{}
+	for _, c := range a.Claims {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
+// landedNumbers are the numbers of the landed changes of the answer, in
+// order.
+func (a activityAnswer) landedNumbers() []int64 {
+	out := []int64{}
+	for _, l := range a.Landed {
+		out = append(out, l.Number)
+	}
+	return out
+}
+
+// The ids of the tests' claims.
+const (
+	claimA = "aaaaaaaa-0000-4000-8000-00000000000a"
+	claimB = "aaaaaaaa-0000-4000-8000-00000000000b"
+	claimC = "aaaaaaaa-0000-4000-8000-00000000000c"
+	claimD = "aaaaaaaa-0000-4000-8000-00000000000d"
+	claimE = "aaaaaaaa-0000-4000-8000-00000000000e"
+	claimF = "aaaaaaaa-0000-4000-8000-00000000000f"
+)
+
+// seedClaims stores each of claims as it is.
+func (f *fixture) seedClaims(claims ...awareness.Claim) {
+	f.t.Helper()
+	txOf(f.t, f.store, func(tx *sql.Tx) error {
+		for _, cl := range claims {
+			if err := awareness.InsertClaim(context.Background(), tx, cl); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// landed emits a version event of ch, in flight, and then a land event of
+// ch landed as sha at at.
+func (f *fixture) landed(ch awareness.Change, sha string, at time.Time) {
+	f.version(ch)
+	ch.State, ch.Landed = awareness.StateLanded, &awareness.Landed{SHA: sha, At: at}
+	f.emit(eventLand, ch)
+}
+
+// firstOf is the first element of the array member key of the JSON object
+// raw.
+func firstOf(t testing.TB, raw []byte, key string) json.RawMessage {
+	t.Helper()
+	var obj map[string]json.RawMessage
+	var list []json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("%s: %v", raw, err)
+	}
+	if err := json.Unmarshal(obj[key], &list); err != nil || len(list) == 0 {
+		t.Fatalf("%s has no %s", raw, key)
+	}
+	return list[0]
+}
+
+// errorType is the error_type of the error answer raw.
+func errorType(t testing.TB, raw []byte) string {
+	t.Helper()
+	var body struct {
+		Error struct {
+			ErrorType string `json:"error_type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("body %s: %v", raw, err)
+	}
+	return body.Error.ErrorType
+}
+
+// deref is *p, or "" for nil.
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // get sends GET /api/v1/workspaces/demo/<path> with the admin token and

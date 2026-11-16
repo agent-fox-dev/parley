@@ -127,6 +127,10 @@ type Deps struct {
 	// Repos opens the repository of the workspace slug, where a change's
 	// versions are listed.
 	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
+	// DefaultBranch is the default branch of the workspace slug, the target
+	// of an activity that names none; nil, or "", for a workspace without
+	// one.
+	DefaultBranch func(ctx context.Context, slug string) (string, error)
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
 	// Logger is told of what fails and stops nothing, such as a version
@@ -162,6 +166,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.DefaultBranch == nil {
+		d.DefaultBranch = func(context.Context, string) (string, error) { return "", nil }
 	}
 	if d.IndexInterval <= 0 {
 		d.IndexInterval = DefaultIndexInterval

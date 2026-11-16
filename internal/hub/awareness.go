@@ -8,6 +8,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // awarenessHook is the name of the start hook that binds the awareness
@@ -42,6 +43,7 @@ func composeAwareness(c *Composition) {
 	comp := &awareness.Component{}
 	c.awareness = comp
 	c.AddSchemaStep(awareness.SchemaStep)
+	c.AddSchemaStep(awareness.ClaimSchemaStep)
 	for _, r := range comp.Routes() {
 		c.AddRoute(r)
 	}
@@ -59,6 +61,13 @@ func composeAwareness(c *Composition) {
 			Emitter: c.events,
 			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
+			},
+			DefaultBranch: func(ctx context.Context, slug string) (string, error) {
+				w, found, err := workspace.BySlug(ctx, rt.Store.Main(), slug)
+				if err != nil || !found || w.DefaultBranch == nil {
+					return "", err
+				}
+				return *w.DefaultBranch, nil
 			},
 			Now:    rt.Now,
 			Logger: rt.Logger,
