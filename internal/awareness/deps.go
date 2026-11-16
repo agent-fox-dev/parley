@@ -4,10 +4,15 @@
 // log after each new version, retarget, land, abandon and restore, without
 // delaying the request that caused it.
 //
-// The package needs three things of others, which it defines as narrow
+// When an index update makes two changes overlap, the worker announces the
+// pair once, with a parley.change.overlap event on each of the two, and
+// announces it again only after it stopped overlapping.
+//
+// The package needs four things of others, which it defines as narrow
 // interfaces that the hub wires: the event log it follows (EventSource),
-// the change records it reads (ChangeReader), and the repositories it lists
-// a version's files in (Deps.Repos).
+// the change records it reads (ChangeReader), the repositories it lists a
+// version's files in (Deps.Repos), and the event log it writes its own
+// events to (Emitter).
 package awareness
 
 import (
@@ -40,6 +45,12 @@ type Querier interface {
 // fails with an error matching event.ErrPositionExpired.
 type EventSource interface {
 	ReadAfter(ctx context.Context, after int64, limit int) ([]event.Record, int64, error)
+}
+
+// Emitter writes one hub event in the caller's transaction, so that the
+// event commits or rolls back with the state change it reports.
+type Emitter interface {
+	Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error)
 }
 
 // ChangeReader reads one change of a workspace by its number, through q
@@ -110,6 +121,9 @@ type Deps struct {
 	Events EventSource
 	// Changes reads the change records the events name.
 	Changes ChangeReader
+	// Emitter writes the overlap events, in the transaction of the index
+	// update that causes them.
+	Emitter Emitter
 	// Repos opens the repository of the workspace slug, where a change's
 	// versions are listed.
 	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)

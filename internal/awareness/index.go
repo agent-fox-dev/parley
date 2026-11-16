@@ -70,21 +70,25 @@ type update struct {
 // files, an abandon takes it out of flight, a restore puts it back in
 // flight with the files of its current version. What else an index update
 // causes is written here too, so that it commits with the update and the
-// worker's position.
+// worker's position: after every kind of update, the announced pairs that
+// include the change are brought up to date with its partners.
 func (c *Component) apply(ctx context.Context, tx *sql.Tx, u update) error {
 	ch := u.change
+	var err error
 	switch u.typ {
 	case eventVersion, eventRestore:
-		if err := putChange(ctx, tx, ch, PhaseInFlight, nil); err != nil {
-			return err
+		if err = putChange(ctx, tx, ch, PhaseInFlight, nil); err == nil {
+			err = putFiles(ctx, tx, ch.Workspace, ch.Number, u.files)
 		}
-		return putFiles(ctx, tx, ch.Workspace, ch.Number, u.files)
 	case eventLand:
-		return putChange(ctx, tx, ch, PhaseLanded, &u.landed)
+		err = putChange(ctx, tx, ch, PhaseLanded, &u.landed)
 	case eventAbandon:
-		return putChange(ctx, tx, ch, PhaseOut, nil)
+		err = putChange(ctx, tx, ch, PhaseOut, nil)
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	return c.announce(ctx, tx, ch)
 }
 
 // putChange records ch in the index under its current target branch, in

@@ -26,9 +26,10 @@ const (
 // composeAwareness adds the awareness: the schema of the index of the
 // changes by touched file and of its worker's position, and the component,
 // bound in a start hook to the store, to the hub's event log, which the
-// index worker follows, to the change records, which it reads through the
-// change component, and to the place of each repository on disk, opened
-// with the hub's git, where it lists the files of a change's version.
+// index worker follows and writes the overlap events to, to the change
+// records, which it reads through the change component, and to the place
+// of each repository on disk, opened with the hub's git, where it lists
+// the files of a change's version.
 //
 // The index worker runs as background work, a pass every
 // awareness.Deps.IndexInterval, so that no request that records a version
@@ -46,6 +47,7 @@ func composeAwareness(c *Composition) {
 			Store:   rt.Store,
 			Events:  c.events,
 			Changes: awarenessChanges{c.changes},
+			Emitter: c.events,
 			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
 			},

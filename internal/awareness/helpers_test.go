@@ -3,6 +3,7 @@ package awareness_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -36,6 +37,13 @@ type fixture struct {
 	events  *eventFeed
 	changes *changeBook
 	log     *hubtest.LogBuffer
+	// hubEvents is the real event log the component writes its events to,
+	// on the fixture's store.
+	hubEvents *event.Component
+	// base is the root commit the heads of head start from, made at its
+	// first call; heads counts the heads made.
+	base  string
+	heads int
 }
 
 // newFixture is a fixture on a fresh store, with an empty bare repository
@@ -64,15 +72,19 @@ func (f *fixture) open() {
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath:  filepath.Join(f.dir, "parley.db"),
 		WorkspaceRoot: filepath.Join(f.dir, "workspaces"),
-	}, []store.Step{awareness.SchemaStep})
+	}, []store.Step{event.SchemaStep, awareness.SchemaStep})
 	if err != nil {
 		f.t.Fatalf("open store: %v", err)
 	}
 	f.t.Cleanup(func() { st.Close() })
 	f.store = st
+	f.hubEvents, err = event.New(event.Deps{Store: st, Clock: event.SystemClock(nil)})
+	if err != nil {
+		f.t.Fatalf("bind the event component: %v", err)
+	}
 	f.comp = &awareness.Component{}
 	f.comp.Bind(awareness.Deps{
-		Store: st, Events: f.events, Changes: f.changes,
+		Store: st, Events: f.events, Changes: f.changes, Emitter: f.hubEvents,
 		Repos: func(ctx context.Context, _ string) (*gitrepo.Repo, error) {
 			return gitrepo.Git{}.Open(ctx, f.repo)
 		},
@@ -117,6 +129,129 @@ func (f *fixture) version(ch awareness.Change) int64 {
 	}
 	return f.emit(change.EventVersion, ch)
 }
+
+// head makes a commit that touches each of paths, on top of a root commit
+// all heads share, and returns the root and the head; a later head that
+// touches a path again gives it other content.
+func (f *fixture) head(paths ...string) (base, head string) {
+	f.t.Helper()
+	if f.base == "" {
+		f.base = commit(f.t, f.repo, "main", "", map[string]string{"README": "demo\n"})
+	}
+	f.heads++
+	files := map[string]string{}
+	for _, p := range paths {
+		files[p] = fmt.Sprintf("%s %d\n", p, f.heads)
+	}
+	return f.base, commit(f.t, f.repo, fmt.Sprintf("h%d", f.heads), f.base, files)
+}
+
+// touching is version v of change number, in flight on main, its version
+// touching paths and its session session ("" for none).
+func (f *fixture) touching(number, v int64, session string, paths ...string) awareness.Change {
+	f.t.Helper()
+	base, head := f.head(paths...)
+	ch := awareness.Change{Number: number, Version: v, BaseSHA: &base, HeadSHA: head}
+	if session != "" {
+		ch.SessionID = &session
+	}
+	return ch
+}
+
+// overlapEvents are the parley.change.overlap events of the event log, in
+// seq order.
+func (f *fixture) overlapEvents() []event.Record {
+	f.t.Helper()
+	recs, _, err := f.hubEvents.ReadAfter(context.Background(), 0, 10000)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	var out []event.Record
+	for _, r := range recs {
+		if r.Type == awareness.EventOverlap {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// overlapMeta is the metadata of a parley.change.overlap event.
+type overlapMeta struct {
+	Number int64 `json:"number"`
+	With   struct {
+		Number int64  `json:"number"`
+		Ref    string `json:"ref"`
+	} `json:"with"`
+	WithSessionID *string  `json:"with_session_id"`
+	Paths         []string `json:"paths"`
+	Truncated     bool     `json:"truncated"`
+	Count         int      `json:"count"`
+}
+
+// metaOf decodes the metadata of the overlap event r.
+func metaOf(t testing.TB, r event.Record) overlapMeta {
+	t.Helper()
+	var m overlapMeta
+	if err := json.Unmarshal(r.Metadata, &m); err != nil {
+		t.Fatalf("metadata %s: %v", r.Metadata, err)
+	}
+	return m
+}
+
+// announced are the pairs the overlap events name, each as "low-high" and
+// once per event, sorted.
+func (f *fixture) announced() []string {
+	f.t.Helper()
+	var out []string
+	for _, r := range f.overlapEvents() {
+		m := metaOf(f.t, r)
+		out = append(out, fmt.Sprintf("%d-%d", min(m.Number, m.With.Number), max(m.Number, m.With.Number)))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// pairs are the pairs the index records as announced, each as "low-high",
+// sorted.
+func (f *fixture) pairs() []string {
+	f.t.Helper()
+	rows, err := f.store.Main().QueryContext(context.Background(), `SELECT low, high FROM awareness_pairs ORDER BY low, high`)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var low, high int64
+		if err := rows.Scan(&low, &high); err != nil {
+			f.t.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%d-%d", low, high))
+	}
+	return out
+}
+
+// partners are the numbers of the changes that overlap change number of
+// demo, in the order Partners gives them.
+func (f *fixture) partners(number int64) []int64 {
+	f.t.Helper()
+	got, err := f.comp.Partners(context.Background(), nil, "demo", number)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	out := []int64{}
+	for _, p := range got {
+		out = append(out, p.Number)
+	}
+	return out
+}
+
+// The sessions of the tests' changes; the event log takes a session id only
+// in UUID form.
+const (
+	session1 = "11111111-1111-4111-8111-111111111111"
+	session2 = "22222222-2222-4222-8222-222222222222"
+)
 
 // files are the files the index holds for change number of demo.
 func (f *fixture) files(number int64) []string {
@@ -290,4 +425,16 @@ func txOf(t testing.TB, st *store.Store, fn func(*sql.Tx) error) {
 	if err := st.Tx(context.Background(), fn); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// jsonHasKeys reports whether raw is a JSON object with exactly the
+// members keys.
+func jsonHasKeys(t testing.TB, raw []byte, keys ...string) bool {
+	t.Helper()
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("%s is not a JSON object: %v", raw, err)
+	}
+	got := slices.Sorted(maps.Keys(obj))
+	return slices.Equal(got, slices.Sorted(slices.Values(keys)))
 }
