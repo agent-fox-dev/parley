@@ -331,9 +331,10 @@ func actorOf(caller change.Caller) change.Actor {
 }
 
 // answer waits up to wait for the attempt a to end, and answers it as it
-// then is: 200 when it is final, 202 while it runs on. The attempt runs on
-// the pool whatever becomes of the request: a caller that goes away ends
-// only the wait.
+// then is: 202 while it runs on, 200 when it landed, and for an attempt
+// that ended otherwise the error of its status with the attempt as its
+// details (final). The attempt runs on the pool whatever becomes of the
+// request: a caller that goes away ends only the wait.
 func (c *Component) answer(ctx context.Context, w http.ResponseWriter, a Attempt, wait time.Duration) error {
 	if wait > 0 {
 		select {
@@ -349,10 +350,35 @@ func (c *Component) answer(ctx context.Context, w http.ResponseWriter, a Attempt
 	if !found {
 		return errLandNotFound(a.Workspace, a.ID)
 	}
-	status := http.StatusOK
-	if got.Status == StatusRunning {
-		status = http.StatusAccepted
+	switch got.Status {
+	case StatusRunning:
+		server.WriteJSON(w, http.StatusAccepted, got)
+	case StatusLanded:
+		server.WriteJSON(w, http.StatusOK, got)
+	default:
+		return final(got)
 	}
-	server.WriteJSON(w, status, got)
 	return nil
+}
+
+// final is the answer for the attempt a that ended without landing: 409
+// land_conflict for a conflict, 409 policy_blocked for a block and 503
+// land_failed for a failure, each with a as its details.
+func final(a Attempt) error {
+	var e *server.Error
+	switch {
+	case a.Status == StatusConflict && a.Conflict != nil:
+		e = server.NewError("land_conflict", http.StatusConflict, fmt.Sprintf(
+			"land attempt %s: commit %s does not apply on top of %s", a.ID, a.Conflict.CommitSHA, a.Conflict.TargetSHA))
+	case a.Status == StatusBlocked && a.Blocked != nil:
+		e = server.NewError("policy_blocked", http.StatusConflict, fmt.Sprintf(
+			"land attempt %s: the landing of %s is %s", a.ID, change.Ref(a.Workspace, a.Blocked.Change), a.Blocked.Status))
+	default:
+		reason := a.Status
+		if a.Error != nil {
+			reason = *a.Error
+		}
+		e = server.NewError("land_failed", http.StatusServiceUnavailable, fmt.Sprintf("land attempt %s failed: %s", a.ID, reason))
+	}
+	return e.WithDetails(a)
 }

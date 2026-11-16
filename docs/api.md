@@ -3057,8 +3057,8 @@ The conflict report has every member, whichever is empty:
 | `base_sha` | the merge base: `merge_base_sha` |
 | `commit_sha` | the first commit of `head` that did not apply |
 | `files` | the conflicted files, in byte order of path: `{"path": …, "kind": …, "base": …, "ours": …, "theirs": …, "landed_by": []}` |
-| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` until the hub records which change landed which commit |
-| `change` | the change whose head was rebased; always `null` for the same reason |
+| `landed_changes` | the changes landed on the target that the conflict involves; always `[]` in a comparison, filled in [a land's conflict report](#landing) |
+| `change` | the change whose head was rebased; always `null` in a comparison |
 
 In a conflicted file, `base`, `ours` and `theirs` are the file on each side
 of the three-way merge that failed, `{"sha": …, "mode": …, "path": …}` (the
@@ -3071,7 +3071,7 @@ the path, `modify_delete` when the target changed a file the head deleted,
 `delete_modify` for the reverse, and `rename`, `mode` (a file on one side, a
 symlink or another type on the other), `binary` or `submodule` where git
 names the conflict so. `landed_by` lists the landed changes that changed the
-file; always `[]` for now.
+file; always `[]` in a comparison.
 
 | Status | When |
 |---|---|
@@ -3545,8 +3545,8 @@ the conflicted files in byte order of path, each with its `kind`
 `binary`, `submodule`) and the file on each side, `base` (the commit's
 parent), `ours` (`onto` with the commits replayed before it) and `theirs`
 (the commit), `null` on a side that lacks it. `landed_changes`, each
-`landed_by` and `change` are empty or `null`: the hub does not say yet
-which landed change touched the files.
+`landed_by` and `change` are empty or `null` here: only [a land's conflict
+report](#landing) names the landed changes that touched the files.
 
 ```json
 {"error":{"code":409,"message":"commit 3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8 of refs/heads/clash does not apply on top of b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","error_type":"rebase_conflict","details":{"target_sha":"b68c63f9e524e8f13781aff3a3e31a0c7ab1fe6e","head_sha":"2d165dbfc00967ebdead889de8ba17e45a81f98d","base_sha":"a5bc5c5cd7650975def32e01a71d7011f00bfeb6","commit_sha":"3282e695c40b91d83c5ab6b916b3bb6eb1cafbc8","files":[{"path":"a.txt","kind":"content","base":{"sha":"814f4a422927b82f5f8a43f8fab6d3839e3983f2","mode":"100644","path":"a.txt"},"ours":{"sha":"4c1ee586b89c236961f884e55c2745659e6e45f6","mode":"100644","path":"a.txt"},"theirs":{"sha":"08a39ce7008d263b922cbee785e726af46facfac","mode":"100644","path":"a.txt"},"landed_by":[]}],"landed_changes":[],"change":null}}}
@@ -4375,7 +4375,7 @@ Every member is always present, `null` where the attempt has no value.
 | `onto_sha`, `landed_sha` | the target head the commits were landed on and the head the land made it |
 | `noop` | `true` for a land whose commits were all on the target already |
 | `commits` | each landed commit: the `change` it belongs to, the commit of its version (`version_sha`) and the commit it landed as (`landed_sha`); `[]` for none |
-| `conflict` | the conflict report of an attempt that ended `conflict`, in the form [the comparison](#get-apiv1workspacesslugscmcompare) gives it |
+| `conflict` | the conflict report of an attempt that ended `conflict`, in the form [the comparison](#get-apiv1workspacesslugscmcompare) gives it, with its landed changes attributed (below) |
 | `blocked` | the change whose landing requirements were not met: `change`, `status` and `requirements` (never `null`) |
 | `error` | why an attempt ended `failed`: `contention`, `timeout`, `origin_rejected` or `internal` |
 | `override` | `{"reason": …}`, the override the attempt applied |
@@ -4419,6 +4419,50 @@ When every commit was left out, the attempt ends `landed` with `noop`
 `true`, `landed_sha` and `onto_sha` both the unchanged target head and
 `commits` `[]`; the change is `landed` at that head, `parley.change.land`
 says `noop` `true`, and no `parley.git.push` is written.
+
+Before it replays anything the attempt asks the policy gate about each
+change it covers, once and bottom first, with the workspace, the change,
+the version being landed and the caller; a retry of the compare-and-swap
+asks nothing again. With no policy installed every change is `ready`, by
+revision 0, and `policy_revision` is the revision that answered, the
+highest when the answers differ. An answer `pending` or `blocked` on a
+request that carries an `override` is put to the override rule, and one
+the rule lets pass counts as `ready`; the attempt, and the metadata of
+its `parley.change.land` events, show `override` `{"reason": …}` only when
+the rule let the answer of at least one change pass, `null` otherwise.
+With no override rule installed no override is applied. The first change,
+bottom first, whose answer is neither `ready` nor let pass ends the
+attempt `blocked`, with `blocked` the `change`, its `status` and its
+`requirements`, before anything is replayed or moved: the target stays
+where it was and the change `open`.
+
+A commit of a change that does not apply on the target head ends the
+attempt `conflict`, the target where it was and the change `open`. Its
+`conflict` report gives `target_sha`, the head the attempt replayed onto,
+`head_sha` and `base_sha` of the version it landed, `commit_sha`, the
+first commit that did not apply, the conflicted `files`, and `change`:
+`null` for the land of one change, the number of the change whose commit
+did not apply in a stack land. `landed_changes` lists, in the order they
+landed, each change landed between `base_sha` and `target_sha` that
+changed a path of a conflicted file, as `{"number": …, "title": …,
+"landed_sha": …, "session_id": …}` (its `landed.sha` and its session), and
+each file's `landed_by` the numbers of those that changed it; both are
+`[]` when none did, when `base_sha` is `null` or not an ancestor of
+`target_sha`, and when the landed history cannot be read. In the
+transaction that ends the attempt the change gets `mergeable` `conflict`
+with the same report, as a mergeability check stores it, with
+`parley.change.conflict` when it was not in conflict already.
+
+An attempt that ends `conflict`, `blocked` or `failed` writes one
+`parley.change.land_fail` event in the transaction that ends it: resource
+`change` `{number}` of the change that stopped it (the one its conflict
+report or `blocked` names, else the top change), the requester as actor,
+the attempt's `session_id`, and metadata `land_id`, `status`, `reason`,
+`number` and `ref`, with `files`, the conflicted paths (the first 100,
+and `truncated` `true` when there were more), for a conflict. `reason` is
+`conflict` for a conflict, the gate's reason for a block or `policy` when
+it gave none, and the `error` of a failure (`contention`, `timeout`,
+`internal`). A landed attempt writes none.
 
 Attempts run side by side, with no queue and no lock per workspace or
 branch: two attempts meet only in the compare-and-swap. At most
@@ -4464,7 +4508,7 @@ members not listed are ignored.
 |---|---|
 | `expected_version` | an integer of at least 1, the version the change must be at |
 | `stack` | a boolean, `false` when absent |
-| `override` | an object whose `reason` is a string that is not blank. With no override rule registered it is accepted and never applied, and the attempt shows `override` `null` |
+| `override` | an object whose `reason` is a string that is not blank, kept with the attempt and put to the override rule for a change the policy gate does not answer `ready`. With no override rule registered it is accepted and never applied, and the attempt shows `override` `null` |
 | `session_id` | a string, the session the land is asked in |
 
 The query parameter `wait`, a whole number of seconds from 0 to 60 (30
@@ -4518,8 +4562,11 @@ caller, and each change at its current version. The attempt runs on the
 hub's pool; nothing is locked while it runs, so the lands of different
 changes, also on one target branch, run side by side and meet only in the
 compare-and-swap. The call waits up to `wait` seconds for the attempt's
-end and answers `200` with the land attempt once it is final, or `202`
-with the attempt still `running` when the wait runs out, `wait=0`
+end and answers it in the form of its status once it is final: `200`
+with the land attempt when it is `landed`, `409` `land_conflict` when
+`conflict`, `409` `policy_blocked` when `blocked` and `503` `land_failed`
+when `failed`, each error with the land attempt in `error.details`; or
+`202` with the attempt still `running` when the wait runs out, `wait=0`
 answering at once. The attempt goes on whatever becomes of the call: a
 caller that goes away stops nothing, and `GET …/lands/{id}` gives its
 final form later.

@@ -51,6 +51,11 @@ type Attempt struct {
 	Error *string
 	// Override is the override the attempt applied, nil for none.
 	Override *Override
+	// RequestedOverride is the override the request carried, nil for
+	// none, kept with the attempt so that its run after a restart asks the
+	// override rule as the first would have; the attempt object shows only
+	// the override it applied.
+	RequestedOverride *Override
 	// PolicyRevision is the revision of the policy that judged the
 	// attempt, nil until it was judged.
 	PolicyRevision *int64
@@ -97,6 +102,9 @@ type Blocked struct {
 	Change       int64             `json:"change"`
 	Status       string            `json:"status"`
 	Requirements []json.RawMessage `json:"requirements"`
+	// reason is the reason the gate gave, nil for none, which the
+	// parley.change.land_fail event carries and the attempt does not show.
+	reason *string
 }
 
 // MarshalJSON writes the blocked change with requirements never null.
@@ -175,6 +183,7 @@ var schema = []string{
 	blocked TEXT,
 	error TEXT,
 	override TEXT,
+	override_requested TEXT,
 	policy_revision INTEGER,
 	actor_type TEXT NOT NULL,
 	actor_id TEXT,
@@ -265,13 +274,19 @@ func insertAttempt(ctx context.Context, tx *sql.Tx, a Attempt) error {
 	if err != nil {
 		return err
 	}
+	var requested *string
+	if a.RequestedOverride != nil {
+		if requested, err = jsonOf(a.RequestedOverride); err != nil {
+			return err
+		}
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO land_attempts (id, workspace_slug, target_branch, status, trigger, strategy,
-	attempts, onto_sha, landed_sha, noop, commits, conflict, blocked, error, override, policy_revision, actor_type,
-	actor_id, username, credential_id, session_id, created_at, finished_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	attempts, onto_sha, landed_sha, noop, commits, conflict, blocked, error, override, override_requested,
+	policy_revision, actor_type, actor_id, username, credential_id, session_id, created_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Workspace, a.TargetBranch, a.Status, a.Trigger, a.Strategy, a.Attempts, a.OntoSHA, a.LandedSHA, a.Noop,
-		commits, conflict, blocked, a.Error, override, a.PolicyRevision, a.RequestedBy.ActorType, a.RequestedBy.ActorID,
-		a.RequestedBy.Username, a.CredentialID, a.SessionID, a.CreatedAt.UnixNano(), nanos(a.FinishedAt))
+		commits, conflict, blocked, a.Error, override, requested, a.PolicyRevision, a.RequestedBy.ActorType,
+		a.RequestedBy.ActorID, a.RequestedBy.Username, a.CredentialID, a.SessionID, a.CreatedAt.UnixNano(), nanos(a.FinishedAt))
 	if err != nil {
 		return fmt.Errorf("store land attempt %s: %w", a.ID, err)
 	}
@@ -334,8 +349,8 @@ ORDER BY a.created_at, a.id LIMIT 1`, args...)
 
 // attemptColumns are the columns readAttempts scans, of the table a.
 const attemptColumns = `a.id, a.workspace_slug, a.target_branch, a.status, a.trigger, a.strategy, a.attempts, a.onto_sha,
-	a.landed_sha, a.noop, a.commits, a.conflict, a.blocked, a.error, a.override, a.policy_revision, a.actor_type,
-	a.actor_id, a.username, a.credential_id, a.session_id, a.created_at, a.finished_at`
+	a.landed_sha, a.noop, a.commits, a.conflict, a.blocked, a.error, a.override, a.override_requested, a.policy_revision,
+	a.actor_type, a.actor_id, a.username, a.credential_id, a.session_id, a.created_at, a.finished_at`
 
 // readAttempt reads the attempt id of the workspace through q; found is
 // false for an id the workspace has no attempt of.
@@ -379,11 +394,11 @@ func readAttempts(ctx context.Context, q Querier, query string, args ...any) ([]
 func scanAttempt(rows *sql.Rows) (Attempt, error) {
 	var a Attempt
 	var commits string
-	var conflict, blocked, override sql.NullString
+	var conflict, blocked, override, requested sql.NullString
 	var created int64
 	var finished *int64
 	if err := rows.Scan(&a.ID, &a.Workspace, &a.TargetBranch, &a.Status, &a.Trigger, &a.Strategy, &a.Attempts, &a.OntoSHA,
-		&a.LandedSHA, &a.Noop, &commits, &conflict, &blocked, &a.Error, &override, &a.PolicyRevision,
+		&a.LandedSHA, &a.Noop, &commits, &conflict, &blocked, &a.Error, &override, &requested, &a.PolicyRevision,
 		&a.RequestedBy.ActorType, &a.RequestedBy.ActorID, &a.RequestedBy.Username, &a.CredentialID, &a.SessionID,
 		&created, &finished); err != nil {
 		return Attempt{}, fmt.Errorf("read a land attempt: %w", err)
@@ -398,7 +413,7 @@ func scanAttempt(rows *sql.Rows) (Attempt, error) {
 	for _, m := range []struct {
 		raw sql.NullString
 		dst any
-	}{{conflict, &a.Conflict}, {blocked, &a.Blocked}, {override, &a.Override}} {
+	}{{conflict, &a.Conflict}, {blocked, &a.Blocked}, {override, &a.Override}, {requested, &a.RequestedOverride}} {
 		if !m.raw.Valid {
 			continue
 		}

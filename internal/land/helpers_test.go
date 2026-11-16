@@ -290,13 +290,7 @@ func (w *world) landNow(t *testing.T, ch change.Change, by change.Caller, sessio
 // test on it, with the attempt as it is stored after the run.
 func (w *world) runLand(t *testing.T, ch change.Change, by change.Caller, session *string) (land.Attempt, error) {
 	t.Helper()
-	ctx := context.Background()
-	a := attemptOf(ch, by, session, time.Now().UTC())
-	if err := land.InsertAttempt(ctx, w.Store, a); err != nil {
-		t.Fatal(err)
-	}
-	runErr := land.RunAttempt(ctx, w.land, a.Workspace, a.ID)
-	return w.attempt(t, a.ID), runErr
+	return w.run(t, attemptOf(ch, by, session, time.Now().UTC()))
 }
 
 // attemptOf is a running manual rebase attempt landing the change ch at
@@ -629,4 +623,75 @@ func (w *world) nextVersion(t *testing.T, ch change.Change) change.Change {
 		return err
 	})
 	return w.readChange(t, ch.Number)
+}
+
+// run stores the running attempt a and runs it to its end in the
+// caller's goroutine, returning the engine's error and the attempt as it
+// is stored after the run.
+func (w *world) run(t *testing.T, a land.Attempt) (land.Attempt, error) {
+	t.Helper()
+	ctx := context.Background()
+	if err := land.InsertAttempt(ctx, w.Store, a); err != nil {
+		t.Fatal(err)
+	}
+	runErr := land.RunAttempt(ctx, w.land, a.Workspace, a.ID)
+	return w.attempt(t, a.ID), runErr
+}
+
+// mergeable waits until the change number of api reads the mergeable
+// want, at most 30 s.
+func (w *world) mergeable(t *testing.T, number int64, want string) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); w.readChange(t, number).Mergeable != want; {
+		if time.Now().After(deadline) {
+			t.Fatalf("change %d does not read mergeable %s within 30 s", number, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// landEvents are the events of the type typ written for the land attempt
+// id, oldest first.
+func (w *world) landEvents(t *testing.T, typ, id string) []event.Record {
+	t.Helper()
+	var out []event.Record
+	for _, e := range w.eventsOf(t, typ) {
+		if metadata(t, e)["land_id"] == id {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// stubGate is a policy gate that gives each change the answer set for
+// its number, ready by revision 0 for any other, and keeps every call.
+type stubGate struct {
+	mu      sync.Mutex
+	answers map[int64]land.GateAnswer
+	calls   []land.GateInput
+}
+
+func (g *stubGate) answer(number int64, a land.GateAnswer) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.answers == nil {
+		g.answers = map[int64]land.GateAnswer{}
+	}
+	g.answers[number] = a
+}
+
+func (g *stubGate) Evaluate(_ context.Context, in land.GateInput) (land.GateAnswer, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls = append(g.calls, in)
+	if a, ok := g.answers[in.Change.Number]; ok {
+		return a, nil
+	}
+	return land.GateAnswer{Status: change.LandingReady}, nil
+}
+
+func (g *stubGate) asked() []land.GateInput {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.calls)
 }

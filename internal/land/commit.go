@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
-	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -18,6 +16,9 @@ import (
 
 // EventLand is the event of a change that landed.
 const EventLand = "parley.change.land"
+
+// EventLandFail is the event of a land attempt that ended without landing.
+const EventLandFail = "parley.change.land_fail"
 
 // errTargetMoved is commit's error when the target was no longer at the
 // head the commits were built on: nothing moved and nothing was recorded.
@@ -145,14 +146,10 @@ func (c *Component) settle(ctx context.Context, tx *sql.Tx, a Attempt) error {
 		return err
 	}
 	for _, cov := range a.Covered {
-		if _, err := c.deps.Events.Emit(ctx, tx, event.Input{
-			Type: EventLand, Workspace: &a.Workspace, ActorType: a.RequestedBy.ActorType, ActorID: a.RequestedBy.ActorID,
-			ResourceType: "change", ResourceID: strconv.FormatInt(cov.Number, 10), SessionID: a.SessionID,
-			Metadata: map[string]any{
-				"land_id": a.ID, "target_branch": a.TargetBranch, "onto_sha": a.OntoSHA, "landed_sha": a.LandedSHA,
-				"strategy": a.Strategy, "attempts": a.Attempts, "noop": a.Noop, "trigger": a.Trigger, "override": a.Override,
-				"policy_revision": a.PolicyRevision, "number": cov.Number, "ref": change.Ref(a.Workspace, cov.Number),
-			},
+		if err := c.emit(ctx, tx, a, EventLand, cov.Number, map[string]any{
+			"land_id": a.ID, "target_branch": a.TargetBranch, "onto_sha": a.OntoSHA, "landed_sha": a.LandedSHA,
+			"strategy": a.Strategy, "attempts": a.Attempts, "noop": a.Noop, "trigger": a.Trigger, "override": a.Override,
+			"policy_revision": a.PolicyRevision,
 		}); err != nil {
 			return err
 		}

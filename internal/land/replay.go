@@ -28,7 +28,7 @@ func (b built) noop() bool { return b.head == b.onto }
 // lands as it is; a commit whose change the target already has is left
 // out; every other commit is made anew with its author, author date and
 // message and the landing identity as committer. A commit that does not
-// apply ends the replay with its conflict report.
+// apply ends the replay with its conflict report, completed (conflict).
 func (c *Component) build(ctx context.Context, repo *gitrepo.Repo, a Attempt, onto string) (built, *gitrepo.ConflictReport, error) {
 	b := built{onto: onto, head: onto, commits: []Commit{}}
 	committer := gitrepo.Signature{Name: c.deps.Committer.Name, Email: c.deps.Committer.Email, Time: c.now()}
@@ -38,7 +38,7 @@ func (c *Component) build(ctx context.Context, repo *gitrepo.Repo, a Attempt, on
 			return built{}, nil, fmt.Errorf("replay %s onto %s: %w", change.Ref(a.Workspace, cov.Number), b.head, err)
 		}
 		if report != nil {
-			return built{}, report, nil
+			return built{}, c.conflict(ctx, a, cov, onto, report), nil
 		}
 		b.head = head
 		for _, r := range became {

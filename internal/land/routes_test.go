@@ -12,11 +12,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/land"
 )
@@ -531,13 +533,14 @@ func TestLand_CreatesARunningAttemptBeforeAnyReplay(t *testing.T) {
 	auto, err := w.land.Start(context.Background(), land.StartInput{
 		Workspace: "api", Number: 1, Trigger: land.TriggerAutoLand,
 		RequestedBy: change.Actor{ActorType: change.CredentialAPIKey, ActorID: new(w.owner), Username: new("owner")},
-		Caller:      w.caller(),
+		Caller:      w.caller(), Override: &land.Override{Reason: "auto"},
 	})
 	if err != nil || auto.Trigger != land.TriggerAutoLand || auto.Status != land.StatusRunning || !reflect.DeepEqual(auto.Numbers(), []int64{1}) {
 		t.Fatalf("Start = %+v, %v; want a running auto_land attempt of change 1", auto, err)
 	}
-	if got := w.attempt(t, auto.ID); got.Trigger != land.TriggerAutoLand || *got.RequestedBy.ActorID != w.owner {
-		t.Errorf("the store holds %+v, want the auto_land attempt requested by the owner", got)
+	if got := w.attempt(t, auto.ID); got.Trigger != land.TriggerAutoLand || *got.RequestedBy.ActorID != w.owner ||
+		got.RequestedOverride == nil || got.RequestedOverride.Reason != "auto" || got.Override != nil {
+		t.Errorf("the store holds %+v, want the auto_land attempt requested by the owner with the override asked, none applied", got)
 	}
 }
 
@@ -773,5 +776,159 @@ func TestLand_RefusesALandOfAChangeARunningAttemptCovers(t *testing.T) {
 	}
 	if _, lands := w.get(t, fmt.Sprintf("/workspaces/api/changes/%d/lands", other.Number), w.ownerKey); len(ids(t, lands)) != 1 {
 		t.Errorf("change %d has attempts %v, want one", other.Number, ids(t, lands))
+	}
+}
+
+func TestLand_AnswersAConflictWithItsReportAndLeavesTheTargetWhereItWas(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	base := commit(t, w.api, "main", w.base, "f", map[string]string{"f.txt": "l1\nl2\nl3\n"})
+	commit(t, w.api, "one", base, "one", map[string]string{"f.txt": "l1\nl2\none\n"})
+	theirs := commit(t, w.api, "two", base, "two", map[string]string{"f.txt": "l1\nl2\ntwo\n"})
+	one, two := w.openBranch(t, "one", w.caller()), w.openBranch(t, "two", w.caller())
+	if status, r := w.landCall(t, w.ownerKey, one.Number, "", nil); status != 200 {
+		t.Fatalf("land of change 1 = %d %v, want 200", status, r)
+	}
+	// The check the move of main scheduled stores its own report first,
+	// which the land's would otherwise race with.
+	w.mergeable(t, two.Number, change.MergeableConflict)
+	target, refs := head(t, w.api, "main"), gitrepotest.Refs(t, w.api, "refs/")
+
+	status, r := w.landCall(t, w.ownerKey, two.Number, "", nil)
+
+	if status != 409 || errorType(r) != "land_conflict" {
+		t.Fatalf("land of change 2 = %d %v, want 409 land_conflict", status, r)
+	}
+	a, _ := r["error"].(map[string]any)["details"].(map[string]any)
+	if a["status"] != land.StatusConflict || a["landed_sha"] != nil || a["finished_at"] == nil {
+		t.Errorf("the attempt is %v, landed %v, finished %v; want conflict, nothing landed, finished",
+			a["status"], a["landed_sha"], a["finished_at"])
+	}
+	k, _ := a["conflict"].(map[string]any)
+	for member, want := range map[string]any{"target_sha": target, "head_sha": theirs, "base_sha": base, "commit_sha": theirs,
+		"change": nil, "landed_changes": []any{map[string]any{"number": float64(one.Number), "title": one.Title,
+			"landed_sha": target, "session_id": nil}}} {
+		if !reflect.DeepEqual(k[member], want) {
+			t.Errorf("the report's %s is %v, want %v", member, k[member], want)
+		}
+	}
+	files, _ := k["files"].([]any)
+	file, _ := files[0].(map[string]any)
+	if len(files) != 1 || file["path"] != "f.txt" || file["kind"] != "content" ||
+		!reflect.DeepEqual(file["landed_by"], []any{float64(one.Number)}) {
+		t.Errorf("the report's files are %v, want f.txt, content, landed by %d", files, one.Number)
+	}
+	for _, side := range []string{"base", "ours", "theirs"} {
+		if s, _ := file[side].(map[string]any); s["sha"] == nil || s["mode"] == nil || s["path"] != "f.txt" {
+			t.Errorf("the %s side is %v, want f.txt with its sha and mode", side, file[side])
+		}
+	}
+	if got := head(t, w.api, "main"); got != target {
+		t.Errorf("main moved to %s from %s", got, target)
+	}
+	if got := gitrepotest.Refs(t, w.api, "refs/"); !reflect.DeepEqual(got, refs) {
+		t.Errorf("the refs are %v after the land, want %v", got, refs)
+	}
+	_, ch := w.get(t, fmt.Sprintf("/workspaces/api/changes/%d", two.Number), w.ownerKey)
+	if ch["state"] != change.StateOpen || ch["mergeable"] != change.MergeableConflict || !reflect.DeepEqual(ch["conflict"], any(k)) {
+		t.Errorf("change 2 reads %v, mergeable %v, conflict %v; want open, conflict, the land's report",
+			ch["state"], ch["mergeable"], ch["conflict"])
+	}
+	fails := w.landEvents(t, land.EventLandFail, a["id"].(string))
+	if len(fails) != 1 {
+		t.Fatalf("%d land_fail events, want 1", len(fails))
+	}
+	if m := metadata(t, fails[0]); m["status"] != land.StatusConflict || m["reason"] != "conflict" ||
+		!reflect.DeepEqual(m["files"], []any{"f.txt"}) {
+		t.Errorf("land_fail metadata %v, want conflict, conflict, files [f.txt]", m)
+	}
+}
+
+func TestLand_AnswersAFinalAttemptInTheFormOfItsStatus(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *land.Deps) { d.MaxAttempts = 1 })
+	gate := &stubGate{}
+	w.land.RegisterGate(gate)
+	var contend atomic.Bool
+	land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) {
+		if contend.Load() {
+			commit(t, w.api, "main", head(t, w.api, "main"), "moved", map[string]string{"m.txt": "m\n"})
+		}
+	}})
+	unmet := json.RawMessage(`{"kind":"approvals","satisfied":false}`)
+	for i, c := range []struct {
+		name string
+		// arrange makes the land of the change ch end as wanted.
+		arrange func(t *testing.T, ch change.Change)
+		status  int
+		// errorType, final and reason are the answer's error type, the
+		// attempt's status and the land_fail event's reason.
+		errorType, final, reason string
+		blocked                  map[string]any
+	}{
+		{name: "landed", status: 200, final: land.StatusLanded},
+		{name: "a conflict", status: 409, errorType: "land_conflict", final: land.StatusConflict, reason: "conflict",
+			arrange: func(t *testing.T, ch change.Change) {
+				commit(t, w.api, "main", head(t, w.api, "main"), "clash", map[string]string{ch.Source.Branch + ".txt": "main\n"})
+			}},
+		{name: "a gate pending with one unsatisfied requirement", status: 409, errorType: "policy_blocked",
+			final: land.StatusBlocked, reason: "policy",
+			blocked: map[string]any{"status": "pending", "requirements": []any{map[string]any{"kind": "approvals", "satisfied": false}}},
+			arrange: func(_ *testing.T, ch change.Change) {
+				gate.answer(ch.Number, land.GateAnswer{Status: change.LandingPending, Requirements: []json.RawMessage{unmet}})
+			}},
+		{name: "a gate blocking for merge commits", status: 409, errorType: "policy_blocked", final: land.StatusBlocked,
+			reason: "merge_commits", blocked: map[string]any{"status": "blocked", "requirements": []any{}},
+			arrange: func(_ *testing.T, ch change.Change) {
+				gate.answer(ch.Number, land.GateAnswer{Status: change.LandingBlocked, Reason: new("merge_commits")})
+			}},
+		{name: "contention", status: 503, errorType: "land_failed", final: land.StatusFailed, reason: land.ErrorContention,
+			arrange: func(*testing.T, change.Change) { contend.Store(true) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			defer contend.Store(false)
+			ch := w.open(t, "s"+strconv.Itoa(i))
+			if c.arrange != nil {
+				c.arrange(t, ch)
+			}
+			main := head(t, w.api, "main")
+
+			status, r := w.landCall(t, w.ownerKey, ch.Number, "", nil)
+
+			if c.errorType == "" {
+				if status != c.status || r["status"] != c.final {
+					t.Fatalf("land = %d %v, want %d %s", status, r, c.status, c.final)
+				}
+				return
+			}
+			errObj, _ := r["error"].(map[string]any)
+			d, _ := errObj["details"].(map[string]any)
+			id, _ := d["id"].(string)
+			if status != c.status || errorType(r) != c.errorType || errObj["code"] != float64(c.status) || !isUUID(id) ||
+				d["status"] != c.final {
+				t.Fatalf("land = %d %v, want %d %s with the %s attempt in details", status, r, c.status, c.errorType, c.final)
+			}
+			if _, read := w.get(t, "/workspaces/api/lands/"+id, w.ownerKey); !reflect.DeepEqual(read, d) {
+				t.Errorf("GET the attempt = %v, want the details %v", read, d)
+			}
+			if fails := w.landEvents(t, land.EventLandFail, id); len(fails) != 1 || metadata(t, fails[0])["status"] != c.final ||
+				metadata(t, fails[0])["reason"] != c.reason {
+				t.Errorf("land_fail events %v, want one %s with reason %s", fails, c.final, c.reason)
+			}
+			if c.blocked == nil {
+				return
+			}
+			c.blocked["change"] = float64(ch.Number)
+			if !reflect.DeepEqual(d["blocked"], any(c.blocked)) || d["finished_at"] == nil || d["landed_sha"] != nil {
+				t.Errorf("the attempt is blocked %v, finished %v, landed %v; want %v, finished, nothing landed",
+					d["blocked"], d["finished_at"], d["landed_sha"], c.blocked)
+			}
+			if got, state := head(t, w.api, "main"), w.readChange(t, ch.Number).State; got != main || state != change.StateOpen {
+				t.Errorf("main moved to %s from %s, the change is %s; want it unmoved and open", got, main, state)
+			}
+			if lands := w.landEvents(t, land.EventLand, id); len(lands) != 0 {
+				t.Errorf("%d parley.change.land events for the blocked attempt, want none", len(lands))
+			}
+		})
 	}
 }

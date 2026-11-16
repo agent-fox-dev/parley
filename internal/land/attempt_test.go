@@ -24,6 +24,7 @@ func TestAttempt_StoresAndEncodesEveryMember(t *testing.T) {
 
 	fresh := running(attemptID(1), "api", "main", created, 5)
 	fresh.SessionID = new("11111111-1111-4111-8111-111111111111")
+	fresh.RequestedOverride = &land.Override{Reason: "asked"}
 
 	conflict := running(attemptID(2), "api", "release/1", created, 5, 7)
 	conflict.Covered = []land.CoveredChange{
@@ -80,9 +81,10 @@ func TestAttempt_StoresAndEncodesEveryMember(t *testing.T) {
 			if enc := asJSON(t, got); !reflect.DeepEqual(enc, want) {
 				t.Errorf("stored attempt encodes as\n%v\nwant\n%v", enc, want)
 			}
-			if !reflect.DeepEqual(got.Covered, tc.attempt.Covered) || got.CredentialID != tc.attempt.CredentialID {
-				t.Errorf("stored attempt covers %+v by credential %q, want %+v by %q", got.Covered, got.CredentialID,
-					tc.attempt.Covered, tc.attempt.CredentialID)
+			if !reflect.DeepEqual(got.Covered, tc.attempt.Covered) || got.CredentialID != tc.attempt.CredentialID ||
+				!reflect.DeepEqual(got.RequestedOverride, tc.attempt.RequestedOverride) {
+				t.Errorf("stored attempt covers %+v by credential %q asking %v, want %+v by %q asking %v", got.Covered,
+					got.CredentialID, got.RequestedOverride, tc.attempt.Covered, tc.attempt.CredentialID, tc.attempt.RequestedOverride)
 			}
 		})
 	}

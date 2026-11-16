@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -40,11 +42,14 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 	if err != nil {
 		return c.fail(ctx, a, err)
 	}
-	revision, blocked, err := c.judge(ctx, a)
+	revision, blocked, overridden, err := c.judge(ctx, a)
 	if err != nil {
 		return c.fail(ctx, a, err)
 	}
 	a.PolicyRevision = &revision
+	if overridden {
+		a.Override = a.RequestedOverride
+	}
 	if blocked != nil {
 		a.Status, a.Blocked = StatusBlocked, blocked
 		return c.end(ctx, a)
@@ -90,29 +95,45 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 	}
 }
 
-// judge asks the policy gate about each change a covers, bottom first, and
-// returns the revision of the policy that answered, the highest when the
-// answers differ, and the change whose answer was not ready, nil when
-// every change may land.
-func (c *Component) judge(ctx context.Context, a Attempt) (int64, *Blocked, error) {
-	gate, _ := c.policy()
+// judge asks the policy gate about each change a covers, once and bottom
+// first, and returns the revision of the policy that answered, the
+// highest when the answers differ, the first change whose answer was not
+// ready, nil when every change may land, and whether the request's
+// override let the answer of a change pass. An answer that is not ready
+// on a request with an override is put to the override rule, and one the
+// rule lets pass counts as ready. The run asks it before its first try
+// only, so that a retry of the compare-and-swap judges nothing again.
+func (c *Component) judge(ctx context.Context, a Attempt) (revision int64, blocked *Blocked, overridden bool, err error) {
+	gate, rule := c.policy()
 	caller := callerOf(a)
-	var revision int64
 	for _, cov := range a.Covered {
+		ref := change.Ref(a.Workspace, cov.Number)
 		ch, err := c.deps.Changes.ReadChange(ctx, nil, a.Workspace, cov.Number)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, false, err
 		}
 		answer, err := gate.Evaluate(ctx, GateInput{Workspace: a.Workspace, Change: ch, Version: cov.Version, Caller: caller})
 		if err != nil {
-			return 0, nil, fmt.Errorf("the policy gate on %s: %w", change.Ref(a.Workspace, cov.Number), err)
+			return 0, nil, false, fmt.Errorf("the policy gate on %s: %w", ref, err)
 		}
 		revision = max(revision, answer.Revision)
-		if answer.Status != change.LandingReady {
-			return revision, &Blocked{Change: cov.Number, Status: answer.Status, Requirements: answer.Requirements}, nil
+		if answer.Status == change.LandingReady {
+			continue
 		}
+		if a.RequestedOverride != nil {
+			passes, err := rule.Passes(ctx, *a.RequestedOverride, answer)
+			if err != nil {
+				return 0, nil, false, fmt.Errorf("the override rule on %s: %w", ref, err)
+			}
+			if passes {
+				overridden = true
+				continue
+			}
+		}
+		return revision, &Blocked{Change: cov.Number, Status: answer.Status, Requirements: answer.Requirements,
+			reason: answer.Reason}, overridden, nil
 	}
-	return revision, nil, nil
+	return revision, nil, overridden, nil
 }
 
 // callerOf is who asked for the attempt a, as a change names its caller.
@@ -163,7 +184,8 @@ func (c *Component) end(ctx context.Context, a Attempt) error {
 // becomes final.
 //
 // The attempt's entry in the land journal goes with it: a final attempt
-// has nothing left to complete at the next start.
+// has nothing left to complete at the next start. An attempt that did not
+// land is told in the same transaction (stopped).
 func (c *Component) finish(ctx context.Context, tx *sql.Tx, a Attempt) error {
 	if a.FinishedAt == nil {
 		a.FinishedAt = new(c.now())
@@ -171,7 +193,74 @@ func (c *Component) finish(ctx context.Context, tx *sql.Tx, a Attempt) error {
 	if err := finishAttempt(ctx, tx, a); err != nil {
 		return err
 	}
-	return unjournal(ctx, tx, a.ID)
+	if err := unjournal(ctx, tx, a.ID); err != nil {
+		return err
+	}
+	if a.Status == StatusLanded {
+		return nil
+	}
+	return c.stopped(ctx, tx, a)
+}
+
+// stopped writes, in tx, what an attempt a that ended without landing
+// leaves: one parley.change.land_fail event on the change that stopped
+// it, the one its conflict report or its block names, else the top
+// change, with the reason: conflict, the gate's reason or policy when it
+// gave none, or the error of a failure. A conflict is also the
+// mergeability of that change, with the same report, so that the change
+// reads the conflict the land found.
+func (c *Component) stopped(ctx context.Context, tx *sql.Tx, a Attempt) error {
+	if len(a.Covered) == 0 {
+		return nil
+	}
+	by := a.Covered[len(a.Covered)-1]
+	meta := map[string]any{"land_id": a.ID, "status": a.Status}
+	switch {
+	case a.Status == StatusConflict && a.Conflict != nil:
+		if n, ok := a.Conflict.Change.(int64); ok {
+			by = a.covering(n, by)
+		}
+		files := make([]string, len(a.Conflict.Files))
+		for i, f := range a.Conflict.Files {
+			files[i] = f.Path
+		}
+		meta["reason"] = "conflict"
+		event.PathList(meta, "files", files)
+		if err := c.deps.Changes.StoreMergeability(ctx, tx, a.Workspace, by.Number, by.Head, a.Conflict.TargetSHA, a.Conflict); err != nil {
+			return err
+		}
+	case a.Status == StatusBlocked && a.Blocked != nil:
+		by, meta["reason"] = a.covering(a.Blocked.Change, by), "policy"
+		if a.Blocked.reason != nil {
+			meta["reason"] = *a.Blocked.reason
+		}
+	case a.Error != nil:
+		meta["reason"] = *a.Error
+	}
+	return c.emit(ctx, tx, a, EventLandFail, by.Number, meta)
+}
+
+// covering is the change number of those a covers, or, for a number it
+// does not cover, otherwise.
+func (a Attempt) covering(number int64, otherwise CoveredChange) CoveredChange {
+	for _, cov := range a.Covered {
+		if cov.Number == number {
+			return cov
+		}
+	}
+	return otherwise
+}
+
+// emit writes, in tx, the land event typ of the attempt a on the change
+// number, by whoever asked for the land, in the session they named, with
+// meta and the change's number and ref.
+func (c *Component) emit(ctx context.Context, tx *sql.Tx, a Attempt, typ string, number int64, meta map[string]any) error {
+	meta["number"], meta["ref"] = number, change.Ref(a.Workspace, number)
+	_, err := c.deps.Events.Emit(ctx, tx, event.Input{
+		Type: typ, Workspace: &a.Workspace, ActorType: a.RequestedBy.ActorType, ActorID: a.RequestedBy.ActorID,
+		ResourceType: "change", ResourceID: strconv.FormatInt(number, 10), SessionID: a.SessionID, Metadata: meta,
+	})
+	return err
 }
 
 // fault is asked at each point of the atomic step whether the engine is
@@ -292,7 +381,7 @@ func (c *Component) session(ctx context.Context, in StartInput) (*linked, error)
 func (c *Component) create(ctx context.Context, ws Workspace, in StartInput, session *linked) (Attempt, error) {
 	a := Attempt{
 		ID: uuid.New().String(), Workspace: ws.Slug, Status: StatusRunning, Trigger: in.Trigger, Strategy: ws.Strategy,
-		RequestedBy: in.RequestedBy, CredentialID: in.Caller.Credential.ID,
+		RequestedBy: in.RequestedBy, CredentialID: in.Caller.Credential.ID, RequestedOverride: in.Override,
 	}
 	if a.Strategy == "" {
 		a.Strategy = StrategyRebase

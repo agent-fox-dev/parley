@@ -329,3 +329,87 @@ func TestLand_RunsTheLandsOfDifferentChangesOnOneTargetSideBySide(t *testing.T) 
 		t.Errorf("the parked attempt ended %s after %d tries, want landed after 2", a.Status, a.Attempts)
 	}
 }
+
+func TestRun_WritesOneLandFailEventOnTheChangeThatStoppedIt(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// stop arranges, before the land of the change ch, that it ends
+		// as wanted; created is how long before now the attempt was
+		// created.
+		stop    func(t *testing.T, w *world, ch change.Change)
+		adjust  func(d *land.Deps)
+		created time.Duration
+		// status and reason are the event's, "" for no event; files are
+		// the conflicted paths it names.
+		status, reason string
+		files          []any
+	}{
+		{name: "a conflict on a.txt", status: land.StatusConflict, reason: "conflict", files: []any{"a.txt"},
+			stop: func(t *testing.T, w *world, _ change.Change) {
+				commit(t, w.api, "main", w.base, "main", map[string]string{"a.txt": "l1\nl2\nmain\n"})
+			}},
+		{name: "blocked by the gate without a reason", status: land.StatusBlocked, reason: "policy",
+			stop: func(_ *testing.T, w *world, ch change.Change) {
+				gate := &stubGate{}
+				gate.answer(ch.Number, land.GateAnswer{Status: change.LandingPending})
+				w.land.RegisterGate(gate)
+			}},
+		{name: "failed by contention", status: land.StatusFailed, reason: land.ErrorContention,
+			adjust: func(d *land.Deps) { d.MaxAttempts = 1 },
+			stop: func(t *testing.T, w *world, _ change.Change) {
+				land.SetSeams(w.land, land.Seams{BeforeSwap: func(context.Context, string, int) {
+					commit(t, w.api, "main", head(t, w.api, "main"), "moved", map[string]string{"m.txt": "m\n"})
+				}})
+			}},
+		{name: "failed by timeout", status: land.StatusFailed, reason: land.ErrorTimeout, created: 10 * time.Minute},
+		{name: "failed internally", status: land.StatusFailed, reason: land.ErrorInternal,
+			stop: func(_ *testing.T, w *world, _ change.Change) { w.land.RegisterGate(failingGate{}) }},
+		{name: "landed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			var adjust []func(*land.Deps)
+			if c.adjust != nil {
+				adjust = append(adjust, c.adjust)
+			}
+			w := newWorld(t, adjust...)
+			commit(t, w.api, "feature", w.base, "change", map[string]string{"a.txt": "l1\nl2\nchange\n"})
+			ch := w.openBranch(t, "feature", w.caller())
+			if c.stop != nil {
+				c.stop(t, w, ch)
+			}
+			session := uuid.New().String()
+			a := attemptOf(ch, w.caller(), &session, time.Now().UTC().Add(-c.created))
+			if err := land.InsertAttempt(context.Background(), w.Store, a); err != nil {
+				t.Fatal(err)
+			}
+			land.Submit(w.land, a)
+			got := w.ended(t, a.ID)
+
+			fails := w.eventsOf(t, land.EventLandFail)
+			if c.status == "" {
+				if got.Status != land.StatusLanded || len(fails) != 0 {
+					t.Errorf("attempt %s wrote %d land_fail events, want landed and none", got.Status, len(fails))
+				}
+				return
+			}
+			if got.Status != c.status || len(fails) != 1 {
+				t.Fatalf("attempt %s (%v) wrote %d land_fail events, want %s and one", got.Status, got.Error, len(fails), c.status)
+			}
+			e := fails[0]
+			if e.ResourceType != "change" || e.ResourceID != strconv.FormatInt(ch.Number, 10) || e.ActorType != "api_key" ||
+				e.ActorID == nil || *e.ActorID != w.owner || e.SessionID == nil || *e.SessionID != session {
+				t.Errorf("land_fail of %s %s by %s %v in session %v; want of change %d by the owner's key in %s",
+					e.ResourceType, e.ResourceID, e.ActorType, e.ActorID, e.SessionID, ch.Number, session)
+			}
+			want := map[string]any{"land_id": a.ID, "status": c.status, "reason": c.reason, "number": float64(ch.Number), "ref": ch.Ref}
+			if c.files != nil {
+				want["files"] = c.files
+			}
+			if m := metadata(t, e); !reflect.DeepEqual(m, want) {
+				t.Errorf("land_fail metadata %v, want %v", m, want)
+			}
+		})
+	}
+}

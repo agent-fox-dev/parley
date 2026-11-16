@@ -4335,8 +4335,10 @@ The part adds the background work `land_pool` (grace 5 s), which runs
 The schema keeps `land_attempts` (one row per attempt, keyed by its
 UUID, with the workspace, the target branch, the status, constrained to
 the five, the trigger, the strategy, the result members, `commits`,
-`conflict`, `blocked` and `override` as JSON, who requested it with the
-credential's id, and `created_at` and `finished_at` in nanoseconds), with
+`conflict`, `blocked` and `override` as JSON, the override the request
+carried (`override_requested`, JSON, which the attempt object does not
+show and its run after a restart puts to the rule again), who requested
+it with the credential's id, and `created_at` and `finished_at` in nanoseconds), with
 indexes on the workspace with the status and with `created_at`, and
 `land_attempt_changes` (keyed by attempt and position, the changes an
 attempt covers bottom first, each with the version it had when the
@@ -4383,8 +4385,10 @@ land of the same change. `admit` takes the id of an attempt to leave out
 of that check, for the run of an attempt again after a restart. Nothing
 is held across an attempt.
 `answer` waits for `ended(id)`, `Deps.After(wait)` or the request's end,
-whichever comes first, then reads the attempt and answers `200` when it
-is final, `202` while it runs. `(*land.Component).Start(ctx, StartInput)`
+whichever comes first, then reads the attempt and answers `202` while it
+runs, `200` when it landed, and otherwise the `*server.Error` of `final`
+with the attempt as its details: `409 land_conflict`, `409
+policy_blocked` or `503 land_failed`. `(*land.Component).Start(ctx, StartInput)`
 does the same from the workspace's `Ready` on, without a request, for a
 land with the trigger `auto_land`.
 
@@ -4392,9 +4396,19 @@ A land replays a change with `(*gitrepo.Repo).RebaseFromAs`, which takes
 the landing identity as committer and says what each commit of the change
 became. A replay that conflicts is reported in the hub's one
 `gitrepo.ConflictReport`, its files, kinds and sides as the replay
-classified them; `(*land.Component).Attribute(ctx, workspace, report)`
-(`conflict.go`) adds the landed changes, `landed_changes` and each file's
-`landed_by`, and gives a file no landed change touched `landed_by` `[]`.
+classified them. `conflict` (`conflict.go`) completes the land's report:
+`target_sha` the head the attempt replayed onto, `head_sha` and
+`base_sha` of the stored version, `change` the number in a stack land.
+`(*land.Component).Attribute(ctx, workspace, report)`, exported for the
+other producers of a report, adds the landed changes: when `base_sha` is
+an ancestor of `target_sha`, it walks `CommitsBetween(base, target)`,
+keeps the commits `(*change.Component).ChangeOfCommit` finds landed, and
+those whose `ChangedPaths` meet a path of a conflicted file's sides give
+`landed_changes` (`{number, title, landed_sha, session_id}` read from
+the change, in the order they landed) and each file's `landed_by`; a file
+no landed change touched reads `landed_by` `[]`, and a history or mapping
+it cannot read is its error, with both left empty, which the engine logs
+and goes on.
 
 The engine (`engine.go`) runs one running attempt: it reads the target
 workspace and opens its repository, asks the policy gate once per covered
@@ -4419,8 +4433,21 @@ runs it in a transaction of its own, `fail` ends the attempt `failed`
 gate (`RegisterGate`; `Gate.Evaluate` takes the workspace, the change,
 the version and the caller and answers a status, a reason, requirements
 and a revision), whose default answers `ready` with revision 0, and the
-override rule (`RegisterOverrideRule`), whose default passes nothing. A
-change whose answer is not `ready` ends the attempt `blocked`.
+override rule (`RegisterOverrideRule`), whose default passes nothing.
+`judge` asks the gate before the first try only; an answer that is not
+`ready` on an attempt with a requested override is put to the rule, and
+one it lets pass counts as `ready` and sets the attempt's `override` to
+the requested one. The first change whose answer is neither ends the
+attempt `blocked` with the gate's reason kept in memory for the event.
+
+`finish`, for an attempt that did not land, calls `stopped` in the same
+transaction: one `parley.change.land_fail` (`emit`, which `settle` uses
+too, adds `number` and `ref` to the metadata) on the change the conflict
+report or the block names, else the top change, with `reason` and, for a
+conflict, `files` through `event.PathList`; a conflict is also stored as
+the change's mergeability through `(*change.Component).StoreMergeability`
+with the version's head and the report's `target_sha`. A timeout ended
+by the pool goes through `end` and `finish` like every other end.
 
 `commit` is the atomic step. A build with nothing left (`noop`) is
 recorded without moving anything. Otherwise the target moves through the
