@@ -1,6 +1,7 @@
 package carrypatch
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -38,6 +39,14 @@ type Deps struct {
 	// branch after its lookups and before it creates the branch; only tests
 	// set it, to write the branch in between as another writer would.
 	BeforeBranchCreate func(branch string)
+	// Events writes the events of the patch list in the transaction of the
+	// change they report.
+	Events Emitter
+	// Now is the clock of the patch list's times; nil is time.Now.
+	Now func() time.Time
+	// Logger receives what fails after an answer is decided, such as the
+	// deletion of a removed patch's backup ref; nil discards it.
+	Logger *slog.Logger
 }
 
 // Component holds the carry-patch operations of the hub. Its zero value
@@ -53,4 +62,20 @@ type Component struct {
 // Bind gives the component its Deps, before its first use.
 func (c *Component) Bind(d Deps) {
 	c.d = d
+}
+
+// now is the time of the component's clock.
+func (c *Component) now() time.Time {
+	if c.d.Now == nil {
+		return time.Now()
+	}
+	return c.d.Now()
+}
+
+// logger is the component's logger, one that discards when none is bound.
+func (c *Component) logger() *slog.Logger {
+	if c.d.Logger == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return c.d.Logger
 }

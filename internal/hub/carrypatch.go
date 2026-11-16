@@ -19,11 +19,13 @@ const carryPatchHook = "carry_patch"
 // patch-branch lookup of the push route, which leaves the patch branches to
 // the patch list, without the workspace package knowing the mode's work. A
 // workspace's delete removes its patches (ADR 07). The component's routes,
-// the patch list's, are registered with the hub's router. Its start hook
-// binds the component to the store, the secret component, which holds the
-// upstream and origin credentials, the hub's git, the place of each copy on
-// disk and the workspace settings registry, through which a patch branch's
-// resolution reads patch_branch_source, after every adjuster
+// the patch list's reads and its add, are registered with the hub's router.
+// Its start hook binds the component to the store, the secret component,
+// which holds the upstream and origin credentials, the hub's git, the place
+// of each copy on disk, the workspace settings registry, through which a
+// patch branch's resolution reads patch_branch_source, the event component,
+// which writes an add's event in its transaction (ADR 05), and the hub's
+// clock and logger, after every adjuster
 // AdjustCarryPatch added has changed those dependencies. The hook runs
 // after the workspace part's, and like it before the clone workers launch,
 // so no clone runs the step before the component is bound.
@@ -47,6 +49,9 @@ func composeCarryPatch(c *Composition) {
 			Git:      gitFor(c.env),
 			RepoPath: c.workspaces.RepoPath,
 			Settings: c.workspaces.Settings(),
+			Events:   c.Events(),
+			Now:      rt.Now,
+			Logger:   rt.Logger,
 		}
 		for _, adjust := range c.carryPatchAdjusters {
 			adjust(&d)
