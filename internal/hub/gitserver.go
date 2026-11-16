@@ -62,8 +62,11 @@ const (
 // stopped are written then. The push rule
 // engine (PushRules) is bound to the settings reader, which reads a
 // workspace's effective protected_branches and protect.owner_push from its
-// record, a fork's from its parent's, and to the tracking-branch lookup,
-// which asks the fork component. The push processor (Receiver) is bound to
+// record, a fork's from its parent's, to the tracking-branch lookup,
+// which asks the fork component, and to the version-files lookup a later
+// part sets (composeLandRules), with which a path-scoped token is held to
+// its paths on an update that adds no commit; without one, such an update
+// is held to none. The push processor (Receiver) is bound to
 // the engine, the ref writer, the hub's git, the workspace service's
 // place of each repository on disk and [git].max_push_size, which the part
 // registers beside [git].timeout, and is the git server's Push, so that
@@ -95,6 +98,7 @@ func composeGitServer(c *Composition) {
 		})
 		c.pushRules.Bind(pushrule.EngineDeps{
 			Settings: pushSettings{rt.Store.Main(), c.workspaces.Settings()}, Tracking: trackingBranches{c.forks},
+			VersionFiles: c.versionFiles,
 		})
 		c.pushOptions.Bind(rt.Logger)
 		c.receiver.Bind(gitserver.ReceiverDeps{

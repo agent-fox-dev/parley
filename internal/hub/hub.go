@@ -77,6 +77,7 @@ var parts = []func(*Composition){
 	composeChanges,
 	composeLand,
 	composePolicyEvaluation,
+	composeLandRules,
 	composeSandbox,
 }
 
@@ -251,6 +252,12 @@ type Composition struct {
 	pushRules   *pushrule.Engine
 	receiver    *gitserver.Receiver
 	pushOptions *gitserver.PushOptionsStage
+	// versionFiles is the push rule engine's version-files lookup, nil
+	// until composeLandRules sets it. composeGitServer binds it to the
+	// engine in its start hook, which runs after every part has been
+	// composed, so that the git server's part, composed before the land
+	// component exists, still hands it on.
+	versionFiles pushrule.VersionFiles
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).
