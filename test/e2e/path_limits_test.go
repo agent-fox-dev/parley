@@ -64,3 +64,34 @@ func TestPathLimits_APushOfExistingCommitsOutsideTheTokensPathsIsRefused(t *test
 		t.Errorf("GET changes/1 = %d %s, want version 1 at %s", status, body, feature)
 	}
 }
+
+// An agent whose token may change only docs/ asks to land a change of its
+// owner that touches src/main.go and is refused, naming the file, with no
+// land attempt recorded; it lands a change that touches only docs/a.md
+// with the same token.
+func TestPathLimits_ATokenLandsInsideItsPathsAndIsRefusedOutsideThem(t *testing.T) {
+	parallel(t)
+	h := startLifecycleHub(t)
+	docs := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"changes:read", "changes:write"},
+		Paths: []string{"docs/**"}, CreatedAt: time.Now()})
+	h.commitOnBranch(t, "src", "src/main.go", "package main\n", "Add main")
+	outside := h.open(t, h.key, "demo", "src", map[string]any{"intent": "why"})
+	h.commitOnBranch(t, "docs", "docs/a.md", "a\n", "Document a")
+	inside := h.open(t, h.key, "demo", "docs", map[string]any{"intent": "why"})
+	h.until(t, outside, "computed", computed)
+	h.until(t, inside, "computed", computed)
+
+	status, refused := h.land(t, docs, outside, "")
+	if status != http.StatusForbidden || str(refused, "error", "error_type") != "path_not_allowed" || str(refused, "error", "path") != "src/main.go" {
+		t.Errorf("the land of demo#%s with the docs token = %d %v, want 403 path_not_allowed naming src/main.go", outside, status, refused)
+	}
+	if attempts, _ := h.get(t, "/workspaces/demo/changes/"+outside+"/lands")["items"].([]any); len(attempts) != 0 {
+		t.Errorf("demo#%s has the land attempts %v, want none", outside, attempts)
+	}
+	if status, a := h.land(t, docs, inside, ""); status != http.StatusOK || a["status"] != "landed" {
+		t.Errorf("the land of demo#%s with the docs token = %d %v, want 200 landed", inside, status, a)
+	}
+	if c := h.read(t, h.key, inside); c["state"] != "landed" {
+		t.Errorf("demo#%s is %v, want landed", inside, c["state"])
+	}
+}

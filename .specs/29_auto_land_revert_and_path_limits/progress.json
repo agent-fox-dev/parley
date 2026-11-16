@@ -3,7 +3,7 @@
   "spec_id": "29",
   "spec_name": "auto_land_revert_and_path_limits",
   "schema_version": 3,
-  "updated_at": "2026-11-16T13:59:42Z",
+  "updated_at": "2026-11-16T14:04:29Z",
   "tasks": [
     {
       "id": 1,
@@ -43,7 +43,7 @@
     },
     {
       "id": 10,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
