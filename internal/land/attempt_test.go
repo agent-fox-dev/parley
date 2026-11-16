@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -144,5 +145,56 @@ func TestWorkspaceDeleted_RemovesOnlyThatWorkspacesAttempts(t *testing.T) {
 	var rows int
 	if err := s.Main().QueryRow(`SELECT count(*) FROM land_attempt_changes`).Scan(&rows); err != nil || rows != 1 {
 		t.Errorf("covered changes left = %d (%v), want 1, the other workspace's", rows, err)
+	}
+}
+
+// versionSessions is a session linker of the change component that accepts
+// every session.
+type versionSessions struct{}
+
+func (versionSessions) Check(_ context.Context, _ change.Caller, id, _ string) (string, error) {
+	return strings.ToLower(id), nil
+}
+
+func (versionSessions) Record(context.Context, *sql.Tx, string, string, int64, int64) error {
+	return nil
+}
+
+func TestCommitReads_NameTheSessionThatIntroducedEachCommit(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.changes.RegisterSessionLinker(versionSessions{})
+	pushed, landedIn := uuid.New().String(), uuid.New().String()
+	w.sessions.add(landedIn, w.owner, "api")
+	c1 := commit(t, w.api, "feature", w.base, "c1", map[string]string{"c1.txt": "c1\n"})
+	c2 := commit(t, w.api, "feature", c1, "c2", map[string]string{"c2.txt": "c2\n"})
+	commit(t, w.api, "main", w.base, "moved", map[string]string{"b.txt": "b\n"})
+	ctx := context.Background()
+	var ch change.Change
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		ch, err = w.changes.Open(ctx, tx, change.OpenInput{Workspace: "api", SourceBranch: "feature", Intent: new("why"),
+			Kind: change.KindPush, Caller: w.caller(), SessionID: new(pushed)})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a := w.landNow(t, ch, w.caller(), &landedIn)
+	if a.Status != land.StatusLanded || len(a.Commits) != 2 || a.Commits[0].LandedSHA == c1 {
+		t.Fatalf("attempt = %s with commits %+v, want landed as two new commits", a.Status, a.Commits)
+	}
+
+	for _, c := range []struct {
+		name, sha string
+		want      any
+	}{
+		{"the head of the version a push in a session recorded", c2, pushed},
+		{"a commit the land rewrote", a.Commits[0].LandedSHA, landedIn},
+		{"the commit the land made the target's head", a.Commits[1].LandedSHA, landedIn},
+		{"a commit of no change", w.base, nil},
+	} {
+		status, got := w.get(t, "/workspaces/api/scm/commits/"+c.sha, w.ownerKey)
+		if status != 200 || got["session_id"] != c.want {
+			t.Errorf("%s: GET the commit = %d, session_id %v; want %v", c.name, status, got["session_id"], c.want)
+		}
 	}
 }

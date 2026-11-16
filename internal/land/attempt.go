@@ -352,6 +352,23 @@ const attemptColumns = `a.id, a.workspace_slug, a.target_branch, a.status, a.tri
 	a.landed_sha, a.noop, a.commits, a.conflict, a.blocked, a.error, a.override, a.override_requested, a.policy_revision,
 	a.actor_type, a.actor_id, a.username, a.credential_id, a.session_id, a.created_at, a.finished_at`
 
+// SessionOfLanding is the session of the attempt that landed the change
+// number of the workspace, nil for an attempt in none; found is false,
+// with a nil error, while no attempt landed it.
+func (c *Component) SessionOfLanding(ctx context.Context, workspace string, number int64) (session *string, found bool, err error) {
+	err = c.deps.Store.Main().QueryRowContext(ctx, `SELECT a.session_id FROM land_attempts a
+JOIN land_attempt_changes c ON c.land_id = a.id
+WHERE a.workspace_slug = ? AND c.number = ? AND a.status = 'landed' ORDER BY a.finished_at DESC LIMIT 1`,
+		workspace, number).Scan(&session)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("find the land of %s: %w", change.Ref(workspace, number), err)
+	}
+	return session, true, nil
+}
+
 // readAttempt reads the attempt id of the workspace through q; found is
 // false for an id the workspace has no attempt of.
 func readAttempt(ctx context.Context, q Querier, workspace, id string) (Attempt, bool, error) {

@@ -62,3 +62,21 @@ in one form, `section.key` (`forks.max_per_workspace`,
 `internal/config/scm_test.go` asserts that form). `parleyd` stops with exit
 status 1 and that one error line before it listens, as for every refused
 configuration.
+
+## A commit's session is that of the version or the land that wrote it
+
+The package leaves the session lookup to the packages that record which
+session introduced a commit. No package records it per commit: the
+sessions are kept on a change's versions (`change_versions.session_id`)
+and on its land attempt (`land_attempts.session_id`). The hub's lookup
+(`commitSessions` in `internal/hub/land.go`, set through `AdjustSCM`)
+answers from those: the head of a version names the session of the first
+version with that head (`change.(*Component).SessionOfHead`); a commit a
+land wrote in place of a version's commit names the session of the
+attempt that landed the change (`ChangeOfCommit`, whose `LandedFrom` is
+another commit, then `land.(*Component).SessionOfLanding`); a commit a
+land kept as it was is asked as a version head. Every other commit, one
+below a version's head of a push or a rebase, or one on a branch that is
+no change's source, has no session recorded and answers `null`
+(`TestCommitReads_NameTheSessionThatIntroducedEachCommit` in
+`internal/land/attempt_test.go`).

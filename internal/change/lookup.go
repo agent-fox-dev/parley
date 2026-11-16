@@ -26,12 +26,14 @@ type BranchChange struct {
 // to, its number, the highest version whose head the commit is or, for a
 // commit the change landed, the highest version whose head the commit was
 // landed from (nil when there is none), and whether the change landed the
-// commit.
+// commit, with the commit of the version it landed from, which is the
+// commit itself when the land kept it.
 type CommitChange struct {
 	WorkspaceSlug string
 	Number        int64
 	Version       *int64
 	Landed        bool
+	LandedFrom    string
 }
 
 // SourceChange is a change of a source workspace: the workspace it belongs
@@ -105,7 +107,7 @@ WHERE l.landed_sha = ? AND `+ofWorkspace+` ORDER BY c.number, l.position LIMIT 1
 		Scan(&cc.WorkspaceSlug, &cc.Number, &versionSHA)
 	switch {
 	case err == nil:
-		cc.Landed = true
+		cc.Landed, cc.LandedFrom = true, versionSHA
 		if cc.Version, err = highestVersionAt(ctx, q, cc.WorkspaceSlug, cc.Number, versionSHA); err != nil {
 			return CommitChange{}, false, err
 		}
@@ -126,6 +128,26 @@ WHERE v.head_sha = ? AND `+ofWorkspace+` GROUP BY c.workspace_slug, c.number ORD
 	}
 	cc.Version = &version
 	return cc, true, nil
+}
+
+// SessionOfHead is the session of the first version whose head is the
+// commit sha, given in full, of a change of the workspace slug, read
+// through q (the caller's transaction, or nil for the store): the session
+// of the write that introduced it, nil for a version of none. Among
+// several changes the lowest number answers. For a fork's slug it answers
+// from the parent's changes whose source is the fork. found is false, with
+// a nil error, for a commit that is no version's head.
+func (c *Component) SessionOfHead(ctx context.Context, q Querier, workspace, sha string) (session *string, found bool, err error) {
+	err = c.querier(q).QueryRowContext(ctx, `SELECT v.session_id FROM change_versions v
+JOIN changes c ON c.workspace_slug = v.workspace_slug AND c.number = v.number
+WHERE v.head_sha = ? AND `+ofWorkspace+` ORDER BY c.number, v.version LIMIT 1`, sha, workspace, workspace).Scan(&session)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("find the session of %s: %w", sha, err)
+	}
+	return session, true, nil
 }
 
 // highestVersionAt is the highest version of the change number of the
