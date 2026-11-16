@@ -26,7 +26,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
-| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
+| `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target (`engine.go`, `replay.go`, `commit.go`), the policy gate and override rule registration points (`gate.go`), and the read routes of the attempts per change, per workspace and by id (see [Landing](#landing)) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
@@ -4352,6 +4352,38 @@ became. A replay that conflicts is reported in the hub's one
 classified them; `(*land.Component).Attribute(ctx, workspace, report)`
 (`conflict.go`) adds the landed changes, `landed_changes` and each file's
 `landed_by`, and gives a file no landed change touched `landed_by` `[]`.
+
+The engine (`engine.go`) runs one running attempt: it reads the target
+workspace and opens its repository, asks the policy gate once per covered
+change, bottom first (`judge`), reads the target head, builds the commits
+to land (`replay.go`: `build` replays each change's `base..head` of the
+version the attempt stored with `RebaseFromAs` onto the head, the
+landing identity `Deps.Committer`, default `Parley <parley@localhost>`,
+as committer, and keeps one `Commit` per commit that did not become
+`""`), and hands the result to `commit` (`commit.go`). Every final status
+is written by `finish`, in the transaction that ends the attempt; `end`
+runs it in a transaction of its own, `fail` ends the attempt `failed`
+`internal`.
+
+`gate.go` holds the two registration points on the component: the policy
+gate (`RegisterGate`; `Gate.Evaluate` takes the workspace, the change,
+the version and the caller and answers a status, a reason, requirements
+and a revision), whose default answers `ready` with revision 0, and the
+override rule (`RegisterOverrideRule`), whose default passes nothing. A
+change whose answer is not `ready` ends the attempt `blocked`.
+
+`commit` is the atomic step. A build with nothing left (`noop`) is
+recorded without moving anything. Otherwise the target moves through the
+ref writer: `pushrule.AllowedVerdict` for the one update `refs/heads/<target>`
+from the head read to the new head, without `Evaluate`, so a protected
+target moves like any other, then `Apply` with `Via` `land` and no
+version kind (a `ref_moved` outcome ends the attempt `failed`
+`contention`). Once the ref moved the engine runs on
+`context.WithoutCancel`: `settle` records the land in one store
+transaction (`SetLanded` per change with `landed` and its commit mapping,
+the attempt finished `landed`, one `parley.change.land` per change), and
+`Finish` then writes the `parley.git.push` event. An error after the
+move leaves the attempt running.
 
 ### Hub events
 

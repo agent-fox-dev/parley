@@ -1,6 +1,8 @@
 // Package land lands changes: it records every request to land a change,
-// or a stack of changes, as a durable land attempt, and serves the
-// attempts read-only per change, per workspace and by id.
+// or a stack of changes, as a durable land attempt, lands an attempt by
+// replaying its changes onto the head of the target branch and moving the
+// target with a compare-and-swap recorded together with the land, and
+// serves the attempts read-only per change, per workspace and by id.
 //
 // The package plugs into the hub through internal/hub/land.go, which adds
 // its schema step, routes and start hook, and binds the component to its
@@ -12,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -124,13 +127,32 @@ type Deps struct {
 	Now func() time.Time
 	// Logger is told of what fails and changes nothing; nil discards it.
 	Logger *slog.Logger
+	// Committer is the landing identity, the committer of every commit a
+	// land makes; a member left empty is the default's, Parley
+	// <parley@localhost>.
+	Committer Committer
 }
+
+// Committer is a name and e-mail address commits are made by.
+type Committer struct {
+	Name, Email string
+}
+
+// The landing identity of a hub that names none.
+const (
+	DefaultCommitterName  = "Parley"
+	DefaultCommitterEmail = "parley@localhost"
+)
 
 // Component keeps the land attempts. Its zero value is ready to be
 // registered; it serves once Bind has given it its dependencies, before
 // the first request.
 type Component struct {
 	deps Deps
+
+	mu       sync.RWMutex
+	gate     Gate
+	override OverrideRule
 }
 
 // Bind gives the component its dependencies, the defaults in place of the
@@ -141,6 +163,12 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.Committer.Name == "" {
+		d.Committer.Name = DefaultCommitterName
+	}
+	if d.Committer.Email == "" {
+		d.Committer.Email = DefaultCommitterEmail
 	}
 	c.deps = d
 }

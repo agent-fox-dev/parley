@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -46,13 +47,18 @@ type world struct {
 	api, base string
 }
 
-func newWorld(t *testing.T) *world {
+// newWorld starts the world, each of adjust changing the land component's
+// dependencies before they are bound.
+func newWorld(t *testing.T, adjust ...func(*land.Deps)) *world {
 	t.Helper()
 	w := &world{}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
 		TOML: "[changes]\nmergeable_debounce = \"0s\"\n",
 		Compose: func(c *hub.Composition) {
 			w.land, w.changes, w.forks, w.events, w.workspaces = c.Land(), c.Changes(), c.Forks(), c.Events(), c.Workspaces()
+			for _, fn := range adjust {
+				c.AdjustLand(fn)
+			}
 		},
 	})
 	w.owner = w.CreateUser(t, "owner")
@@ -103,11 +109,22 @@ func data(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + 
 // commit writes to the repository at dir a commit with message on top of
 // from (a commit id or a branch), or a root commit for from "", setting
 // each file of files to its content, and points branch at it; it returns
-// the commit's id.
+// the commit's id. Its author is its committer.
 func commit(t *testing.T, dir, branch, from, message string, files map[string]string) string {
 	t.Helper()
+	return commitAs(t, dir, branch, from, "", message, files)
+}
+
+// commitAs is commit with author, "Name <email> <unix time> <zone>", as
+// the commit's author; "" makes the committer the author.
+func commitAs(t *testing.T, dir, branch, from, author, message string, files map[string]string) string {
+	t.Helper()
 	var s strings.Builder
-	s.WriteString("commit refs/heads/" + branch + "\n" + committer + data(message))
+	s.WriteString("commit refs/heads/" + branch + "\n")
+	if author != "" {
+		s.WriteString("author " + author + "\n")
+	}
+	s.WriteString(committer + data(message))
 	if from != "" {
 		s.WriteString("from " + from + "\n")
 	}
@@ -126,8 +143,20 @@ func commit(t *testing.T, dir, branch, from, message string, files map[string]st
 func (w *world) open(t *testing.T, branch string) change.Change {
 	t.Helper()
 	commit(t, w.api, branch, w.base, branch, map[string]string{branch + ".txt": branch + "\n"})
-	in := change.OpenInput{Workspace: "api", SourceBranch: branch, Intent: new("why"), Kind: change.KindRef,
-		Caller: change.Caller{UserID: w.owner, Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k1"}}}
+	return w.openBranch(t, branch, w.caller())
+}
+
+// caller is the owner with their API key k1, as a change and a land name
+// them.
+func (w *world) caller() change.Caller {
+	return change.Caller{UserID: w.owner, Username: "owner", Credential: change.Credential{Type: change.CredentialAPIKey, ID: "k1"}}
+}
+
+// openBranch opens, through the change component, a change of api by the
+// caller from its branch, whose commits the test made, and returns it.
+func (w *world) openBranch(t *testing.T, branch string, by change.Caller) change.Change {
+	t.Helper()
+	in := change.OpenInput{Workspace: "api", SourceBranch: branch, Intent: new("why"), Kind: change.KindRef, Caller: by}
 	var ch change.Change
 	ctx := context.Background()
 	if err := w.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
@@ -235,6 +264,83 @@ func asJSON(t *testing.T, v any) map[string]any {
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatalf("decode %s: %v", raw, err)
+	}
+	return out
+}
+
+// landNow lands the change ch of api at its version on its target, by the
+// caller by with the session (nil for none): it stores a running manual
+// rebase attempt covering ch, runs it to its end and returns it as it is
+// stored then.
+func (w *world) landNow(t *testing.T, ch change.Change, by change.Caller, session *string) land.Attempt {
+	t.Helper()
+	ctx := context.Background()
+	a := land.Attempt{
+		ID: uuid.New().String(), Workspace: ch.WorkspaceSlug, TargetBranch: ch.TargetBranch, Status: land.StatusRunning,
+		Trigger: land.TriggerManual, Strategy: land.StrategyRebase,
+		RequestedBy:  change.Actor{ActorType: by.Credential.Type, ActorID: new(by.UserID), Username: new(by.Username)},
+		CredentialID: by.Credential.ID, SessionID: session, CreatedAt: time.Now().UTC(),
+		Covered: []land.CoveredChange{{Number: ch.Number, Version: ch.Version, Head: ch.HeadSHA,
+			SourceWorkspace: ch.Source.WorkspaceSlug, SourceBranch: ch.Source.Branch}},
+	}
+	if ch.BaseSHA != nil {
+		a.Covered[0].Base = *ch.BaseSHA
+	}
+	if err := land.InsertAttempt(ctx, w.Store, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := land.RunAttempt(ctx, w.land, a.Workspace, a.ID); err != nil {
+		t.Fatalf("run attempt of %s: %v", ch.Ref, err)
+	}
+	out, found, err := land.ReadAttempt(ctx, w.Store, a.Workspace, a.ID)
+	if err != nil || !found {
+		t.Fatalf("read attempt %s: %v, %v", a.ID, found, err)
+	}
+	return out
+}
+
+// eventsOf are the hub events of the type typ, oldest first.
+func (w *world) eventsOf(t *testing.T, typ string) []event.Record {
+	t.Helper()
+	recs, _, err := w.events.ReadAfter(context.Background(), 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []event.Record
+	for _, r := range recs {
+		if r.Type == typ {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// metadata is the decoded metadata of the event rec.
+func metadata(t *testing.T, rec event.Record) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(rec.Metadata, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// head is the commit the branch of the repository at dir points at, ""
+// for none.
+func head(t *testing.T, dir, branch string) string {
+	t.Helper()
+	return gitrepotest.Refs(t, dir, "refs/heads/")[branch]
+}
+
+// landPushes are the parley.git.push events of api's main written for a
+// land, oldest first.
+func (w *world) landPushes(t *testing.T) []event.Record {
+	t.Helper()
+	var out []event.Record
+	for _, e := range w.eventsOf(t, "parley.git.push") {
+		if m := metadata(t, e); m["ref"] == "refs/heads/main" && m["via"] == "land" {
+			out = append(out, e)
+		}
 	}
 	return out
 }

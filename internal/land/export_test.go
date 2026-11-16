@@ -26,3 +26,16 @@ func FinishAttempt(ctx context.Context, s *store.Store, a Attempt) error {
 func ReadAttempt(ctx context.Context, s *store.Store, workspace, id string) (Attempt, bool, error) {
 	return readAttempt(ctx, s.Main(), workspace, id)
 }
+
+// RunAttempt runs the running attempt id of the workspace to its end, in
+// the caller's goroutine.
+func RunAttempt(ctx context.Context, c *Component, workspace, id string) error {
+	a, found, err := readAttempt(ctx, c.deps.Store.Main(), workspace, id)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errFinal
+	}
+	return c.run(ctx, a)
+}

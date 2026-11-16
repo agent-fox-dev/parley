@@ -4384,6 +4384,30 @@ Every member is always present, `null` where the attempt has no value.
 | `session_id` | the session the land was asked for in |
 | `created_at`, `finished_at` | when the attempt was created and when it ended, `null` while it runs |
 
+An attempt with the strategy `rebase` replays each change's own commits,
+those of its version that are not in its base, in order onto the head of
+the target branch it reads (`onto_sha`). A commit whose parent already is
+that head is used as it is, so a version made on the target head lands
+with its own commit ids; a commit whose change the target already holds is
+left out and has no `commits` entry; every other commit is made anew with
+the author, author date and message of the commit it replays and the
+landing identity as committer, `Parley <parley@localhost>` by default.
+The target then moves from `onto_sha` to `landed_sha` with a
+compare-and-swap, which is not a push: the push rules, a protected branch
+included, do not apply. The move is followed by one store transaction
+that marks each change `landed` (`landed` = `{sha, at, by, land_id,
+commits}`, every landed commit then found by the change's by-commit
+lookup), makes the attempt final and writes one `parley.change.land`
+event per change: resource `change` `{number}`, the requester as actor,
+the attempt's `session_id`, and metadata `land_id`, `target_branch`,
+`onto_sha`, `landed_sha`, `strategy`, `attempts`, `noop`, `trigger`,
+`override`, `policy_revision`, `number` and `ref`. One `parley.git.push`
+event follows for the target ref, with `via` `land` and `direct` `false`.
+When every commit was left out, the attempt ends `landed` with `noop`
+`true`, `landed_sha` and `onto_sha` both the unchanged target head and
+`commits` `[]`; the change is `landed` at that head, `parley.change.land`
+says `noop` `true`, and no `parley.git.push` is written.
+
 The three reads need the scope `changes:read` and read access to
 `{slug}`. Both lists are [lists](#lists) ordered newest first: by
 `created_at` at the whole second it shows, then by `id`, both descending.
