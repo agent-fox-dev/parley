@@ -257,19 +257,22 @@ func TestReplay_LeavesEveryRefAndNoTemporaryFileWhateverItEndsIn(t *testing.T) {
 	scratch := t.TempDir()
 	t.Setenv("TMPDIR", scratch)
 	ctx := context.Background()
+	// path is the path the replay's conflict is in, which the resolving
+	// rebase is given a resolution for.
 	type replay struct {
 		name string
 		r    conflictRepo
 		head string
+		path string
 	}
 	var replays []replay
 	for _, c := range conflictCases {
 		r := newConflictRepo(t, c.base, c.target, c.work)
-		replays = append(replays, replay{c.name, r, r.head()})
+		replays = append(replays, replay{c.name, r, r.head(), c.path})
 	}
 	clean := newConflictRepo(t, []edit{file("a.txt", "a\n")}, []edit{file("a.txt", "target\n")}, []edit{file("c.txt", "c\n")})
-	replays = append(replays, replay{"work that applies", clean, clean.head()},
-		replay{"a head that is no commit", clean, strings.Repeat("0", 40)})
+	replays = append(replays, replay{"work that applies", clean, clean.head(), "a.txt"},
+		replay{"a head that is no commit", clean, strings.Repeat("0", 40), "a.txt"})
 
 	for _, p := range replays {
 		for _, run := range []struct {
@@ -279,6 +282,11 @@ func TestReplay_LeavesEveryRefAndNoTemporaryFileWhateverItEndsIn(t *testing.T) {
 			{"TrialRebaseFrom", func() error { _, err := p.r.repo.TrialRebaseFrom(ctx, p.r.base, p.head, p.r.target); return err }},
 			{"RebaseFrom", func() error {
 				_, _, err := p.r.repo.RebaseFrom(ctx, p.r.base, p.head, p.r.target, rebaseAt)
+				return err
+			}},
+			{"RebaseFromResolving", func() error {
+				_, _, err := p.r.repo.RebaseFromResolving(ctx, p.r.base, p.head, p.r.target, rebaseAt,
+					map[string]gitrepo.Resolution{p.path: {Content: []byte("resolved\n")}})
 				return err
 			}},
 		} {
@@ -373,5 +381,79 @@ func TestConflictText_MarksEachOverlapAsTheTargetsLinesThenTheChangesWhateverThe
 	}
 	if after := entries(t, scratch); !slices.Equal(after, before) {
 		t.Errorf("a failed merge: the temporary directory held %v, then %v", before, after)
+	}
+}
+
+// files are the entries other than directories of the tree of the commit
+// at of the repository at dir, each as its mode, a space and its content,
+// by path.
+func files(t *testing.T, dir, at string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for line := range strings.SplitSeq(gitrepotest.Git(t, dir, "ls-tree", "-r", "--format=%(objectmode) %(objectname) %(path)", at), "\n") {
+		f := strings.SplitN(line, " ", 3)
+		if len(f) != 3 {
+			t.Fatalf("ls-tree answered %q", line)
+		}
+		out[f[2]] = f[0] + " " + string(gitrepotest.Blob(t, dir, f[1]))
+	}
+	return out
+}
+
+func TestRebaseFromResolving_PutsEachResolutionInPlaceOfItsConflictedPath(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name               string
+		base, target, work []edit
+		resolutions        map[string]gitrepo.Resolution
+		want               map[string]string
+	}{
+		{"a file in a directory, with the mode the change gives it",
+			[]edit{file("dir/sub/a.sh", "l1\nl2\n"), file("dir/keep.txt", "k\n")},
+			[]edit{file("dir/sub/a.sh", "target\nl2\n")},
+			[]edit{{"100755", "dir/sub/a.sh", "work\nl2\n"}},
+			map[string]gitrepo.Resolution{"dir/sub/a.sh": {Content: []byte("both\nl2\n")}},
+			map[string]string{"x.txt": "100644 x\n", "dir/keep.txt": "100644 k\n", "dir/sub/a.sh": "100755 both\nl2\n"}},
+		{"a file the change deletes, with the mode the target gives it",
+			[]edit{{"100755", "f.sh", "f\n"}},
+			[]edit{{"100755", "f.sh", "target\n"}},
+			[]edit{remove("f.sh")},
+			map[string]gitrepo.Resolution{"f.sh": {Content: []byte("kept\n")}},
+			map[string]string{"x.txt": "100644 x\n", "f.sh": "100755 kept\n"}},
+		{"a file the target deletes, deleted",
+			[]edit{file("f.txt", "f\n")},
+			[]edit{remove("f.txt")},
+			[]edit{file("f.txt", "work\n")},
+			map[string]gitrepo.Resolution{"f.txt": {Delete: true}},
+			map[string]string{"x.txt": "100644 x\n"}},
+		{"a file of the target where the change adds a directory, kept as a file",
+			nil,
+			[]edit{file("d", "d\n")},
+			[]edit{file("d/x", "x\n")},
+			map[string]gitrepo.Resolution{"d": {Content: []byte("file\n")}},
+			map[string]string{"x.txt": "100644 x\n", "d": "100644 file\n"}},
+		{"a file of the target where the change adds a directory, deleted",
+			nil,
+			[]edit{file("d", "d\n")},
+			[]edit{file("d/x", "x\n")},
+			map[string]gitrepo.Resolution{"d": {Delete: true}},
+			map[string]string{"x.txt": "100644 x\n", "d/x": "100644 x\n"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			r := newConflictRepo(t, c.base, c.target, c.work)
+
+			head, report, err := r.repo.RebaseFromResolving(context.Background(), r.base, r.head(), r.target, rebaseAt, c.resolutions)
+
+			if err != nil || report != nil || head == "" {
+				t.Fatalf("RebaseFromResolving = %q, %+v, %v; want a head", head, report, err)
+			}
+			if _, err := gitrepotest.Run(r.dir, "", "merge-base", "--is-ancestor", r.target, head); err != nil {
+				t.Errorf("the head %s is not built on the target %s: %v", head, r.target, err)
+			}
+			if got := files(t, r.dir, head); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("the head holds %q, want %q", got, c.want)
+			}
+		})
 	}
 }

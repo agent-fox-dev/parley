@@ -61,7 +61,7 @@ func (r *Repo) trial(ctx context.Context, from, head, onto string) (*ConflictRep
 	// The commit itself holds the tree its replay makes when that is its
 	// own tree; otherwise only the tree is known, and the next merge that
 	// needs it as a commit writes one (trialCommit).
-	_, report, err := r.replay(ctx, onto, head, commits, func(c Commit, _, _, tree string) (string, error) {
+	_, report, err := r.replay(ctx, onto, head, commits, nil, func(c Commit, _, _, tree string) (string, error) {
 		if tree == c.Tree {
 			return c.ID, nil
 		}
@@ -132,8 +132,10 @@ func (r *Repo) trialCommit(ctx context.Context, tree string) (string, error) {
 
 // mergeTree merges the commit theirs into ours with the commit base as the
 // merge base, writing the result's objects, and returns the merged tree,
-// or the conflicted files, in byte order of path, when it does not merge
-// cleanly.
+// and the conflicted files, in byte order of path, when it does not merge
+// cleanly: the tree then holds what git leaves of each conflicted file,
+// such as its text with conflict markers, or a side moved aside to
+// <path>~<commit>.
 func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string, []ConflictFile, error) {
 	out, _, err := r.g.runOutput(ctx, access{}, nil, "--git-dir="+r.dir, "merge-tree", "--write-tree", "-z",
 		"--messages", "--merge-base="+base, ours, theirs)
@@ -143,6 +145,7 @@ func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string
 		return tree, nil, nil
 	case exitCode(err) == 1 && ctx.Err() == nil:
 		// merge-tree exits with 1 when the merge has conflicts.
+		tree, _, _ := strings.Cut(string(out), "\x00")
 		files, perr := parseConflicts(out)
 		for i := range files {
 			files[i].Path = asidePath(files[i].Path, ours, theirs)
@@ -153,7 +156,7 @@ func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string
 			}
 		}
 		slices.SortFunc(files, func(a, b ConflictFile) int { return strings.Compare(a.Path, b.Path) })
-		return "", files, perr
+		return tree, files, perr
 	}
 	return "", nil, err
 }

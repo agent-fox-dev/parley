@@ -64,9 +64,10 @@ func MergeableQuiet(c *Component) bool {
 }
 
 // RestackSeams replace what a restack runs with: the replay of a change's
-// commits after its base onto the commit it sits on, and a hook called
-// between the replay and the swap of the source branch with the attempt's
-// number, from 1; nil keeps the hub's.
+// commits after its base onto the commit it sits on, which is not given
+// the resolutions of a manual restack, and a hook called between the
+// replay and the swap of the source branch with the attempt's number,
+// from 1; nil keeps the hub's.
 type RestackSeams struct {
 	Rebase     func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time) (string, *gitrepo.ConflictReport, error)
 	BeforeSwap func(ctx context.Context, workspace string, number int64, attempt int)
@@ -77,7 +78,12 @@ func SetRestackSeams(c *Component, s RestackSeams) {
 	w := &c.restacks
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.rebase, w.beforeSwap = s.Rebase, s.BeforeSwap
+	w.rebase, w.beforeSwap = nil, s.BeforeSwap
+	if s.Rebase != nil {
+		w.rebase = func(ctx context.Context, repo *gitrepo.Repo, base, head, onto string, at time.Time, _ map[string]gitrepo.Resolution) (string, *gitrepo.ConflictReport, error) {
+			return s.Rebase(ctx, repo, base, head, onto, at)
+		}
+	}
 }
 
 // HoldRestacks keeps c's restack worker from running any pending restack

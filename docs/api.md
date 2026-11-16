@@ -4352,15 +4352,49 @@ caller who writes `{slug}`, or the admin token; anyone else who reads
 `{slug}` gets `403` `forbidden`), then the body, then the state of
 `{slug}` (`409` `workspace_busy`, `workspace_not_ready`,
 `workspace_archived`). The body is absent or a JSON object; its member
-`session_id`, a string, must pass the session-linking rule (`400`
-`unknown_session`, before any replay), and its other members, such as
-`resolutions`, are ignored. A change that is `landed` or `abandoned` is
+`resolutions`, when present, is a list of resolutions (below), and its
+member `session_id`, a string, must pass the session-linking rule (`400`
+`unknown_session`); both are checked before any replay, and other members
+are ignored. A change that is `landed` or `abandoned` is
 answered `409` `change_closed`, and a change with `depends_on` `null`
 whose target branch does not exist `400` `target_not_found`; neither
 changes anything.
 
+Each resolution is an object with a `path` and exactly one of
+`content` (the file's text), `content_base64` (its bytes in standard
+base64) and `delete` (`true`: no file at the path):
+
+```json
+{"resolutions": [
+  {"path": "app.txt", "content": "one\nMERGED\nthree\n"},
+  {"path": "logo.bin", "content_base64": "AAEC"},
+  {"path": "old.txt", "delete": true}
+]}
+```
+
+The list is refused as a whole with `400` `invalid_request`, before any
+replay and with nothing moved, when `resolutions` is not a list (`null`
+included), an entry is not an object, a `path` is missing, not a string,
+empty, starts with `/` or has an empty, `.` or `..` segment, an entry has
+none or more than one of `content`, `content_base64` and `delete`,
+`content` or `content_base64` is not a string, `content_base64` is not
+standard base64, `delete` is not `true`, or two entries name the same
+path. An empty list is a restack without resolutions.
+
 The restack replays the change's commits onto the commit it must sit on,
-as above. The change's pending restack, if it has one, is taken over and
+as above. At a commit that does not apply, when every conflicted path of
+that commit (each `path` of the report's `files`) has a resolution, the
+commit is replayed as git merged it with each conflicted path replaced by
+its resolution's bytes, or with no file there for `delete`, and the
+replay goes on; a path that conflicts at several commits gets its
+resolution at each. A resolved file has its mode in the change's commit,
+else its mode in the target as replayed so far, else `100644`; it takes
+the place of whatever is at its path, a directory too, and `delete`
+leaves a directory at its path in place. A resolution whose path does not
+conflict at a commit changes nothing there, and a commit that a
+resolution leaves with no change of its own is left out, as any replayed
+commit that changes nothing. A conflicted path without a resolution ends
+the restack as a conflict, below. The change's pending restack, if it has one, is taken over and
 removed when the restack ends. A change too deep in its stack is restacked
 too and keeps `needs_restack` with `restack_reason` `stack_too_deep`. It
 answers:
@@ -4374,11 +4408,13 @@ answers:
   `parley.change.restack` with the trigger `manual`, both with the caller
   as actor.
 - `200` `{"status": "up_to_date", "change": <change object>}` when the
-  change already sits on that commit: no version and no event; a
+  change already sits on that commit, whatever `resolutions` says: no
+  version and no event; a
   `needs_restack` set for `conflict` or `auto_restack_off` is cleared and
   the change's mergeability is computed again.
 - `409` `rebase_conflict` with the conflict report as the envelope's
-  `details` when a commit does not apply: the change is left as a
+  `details` when a commit does not apply and one of its conflicted paths
+  has no resolution: the change is left as a
   conflicting background restack leaves it (`needs_restack` for
   `conflict`, `mergeable` `conflict` with the report,
   `parley.change.conflict` unless it was in conflict already), and nothing

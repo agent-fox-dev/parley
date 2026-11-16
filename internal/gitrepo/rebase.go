@@ -27,7 +27,7 @@ import (
 // left behind when it stops. The commits of a rebase that conflicts stay
 // unreferenced, for git's garbage collection.
 func (r *Repo) Rebase(ctx context.Context, onto, head string, at time.Time) (string, *ConflictReport, error) {
-	newHead, _, report, err := r.rebase(ctx, onto, head, onto, HubSignature(at))
+	newHead, _, report, err := r.rebase(ctx, onto, head, onto, HubSignature(at), nil)
 	return newHead, report, err
 }
 
@@ -44,8 +44,10 @@ func (r *Repo) RebaseFrom(ctx context.Context, base, head, onto string, at time.
 // rebase replays the commits from..head, every commit of head for a from
 // of "", on top of onto, as Rebase says, with committer as the committer
 // of each new commit, and returns the new head with what each commit
-// became, as RebaseFromAs says.
-func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Signature) (string, []ReplayedCommit, *ConflictReport, error) {
+// became, as RebaseFromAs says. A commit that does not apply is resolved
+// with resolutions, by path, as RebaseFromResolving says; none leaves it
+// a conflict.
+func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Signature, resolutions map[string]Resolution) (string, []ReplayedCommit, *ConflictReport, error) {
 	onto, head, err := rangeEnds(onto, head)
 	if err != nil {
 		return "", nil, nil, err
@@ -76,8 +78,12 @@ func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Si
 	if err != nil {
 		return "", nil, nil, err
 	}
+	var resolve resolveFunc
+	if len(resolutions) > 0 {
+		resolve = r.resolver(ctx, resolutions)
+	}
 	became := make([]ReplayedCommit, 0, len(commits))
-	newHead, report, err := r.replay(ctx, onto, head, commits, func(c Commit, ours, oursTree, tree string) (string, error) {
+	newHead, report, err := r.replay(ctx, onto, head, commits, resolve, func(c Commit, ours, oursTree, tree string) (string, error) {
 		orig := full[len(became)]
 		switch {
 		case len(c.Parents) > 0 && c.Parents[0] == ours:
@@ -153,12 +159,16 @@ func (r *Repo) authorZones(ctx context.Context, revs ...string) (map[string]*tim
 // the last one left to replay onto, or the report of the first that does
 // not apply.
 //
+// resolve, nil for none, is asked for the tree of each commit that does
+// not apply; the commit is replayed as that tree when it gives one, and
+// is the report otherwise.
+//
 // keep is given each commit c that applies with what it was replayed onto,
 // the commit ours ("" when only its tree oursTree is known) and the tree
 // the replay of c makes, and returns the commit the next one is replayed
 // onto: one whose tree is that tree, or "" when it makes none, for a replay
 // that keeps no result.
-func (r *Repo) replay(ctx context.Context, onto, head string, commits []Commit,
+func (r *Repo) replay(ctx context.Context, onto, head string, commits []Commit, resolve resolveFunc,
 	keep func(c Commit, ours, oursTree, tree string) (string, error)) (string, *ConflictReport, error) {
 	// Without merges, the commits form one line: each one's parent is the
 	// one before it, and the first one's is outside the range, or none.
@@ -180,6 +190,15 @@ func (r *Repo) replay(ctx context.Context, onto, head string, commits []Commit,
 			var files []ConflictFile
 			if tree, files, err = r.mergeTree(ctx, parent, ours, c.ID); err != nil {
 				return "", nil, err
+			}
+			if files != nil && resolve != nil {
+				resolved, ok, err := resolve(ours, c.ID, tree, files)
+				if err != nil {
+					return "", nil, err
+				}
+				if ok {
+					tree, files = resolved, nil
+				}
 			}
 			if files != nil {
 				base, err := r.MergeBase(ctx, onto, head)
