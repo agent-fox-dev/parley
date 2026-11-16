@@ -254,14 +254,42 @@ func TestPostApproval_RefusesAClosedChangeOrAnArchivedWorkspace(t *testing.T) {
 
 // txProbe passes the policy component's events on and records, for each
 // verdict event, whether the verdict it names is visible through the
-// transaction the event is written in.
+// transaction the event is written in, and for each check event the status
+// and updated_at, in seconds, of the result it names as that transaction
+// reads them.
 type txProbe struct {
 	policy.EventWriter
 	mu      sync.Mutex
 	visible map[string]bool
+	results [][2]any
 }
 
 func (p *txProbe) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error) {
+	if in.Type == eventCheck {
+		raw, err := json.Marshal(in.Metadata)
+		if err != nil {
+			return event.Record{}, err
+		}
+		var meta struct {
+			Number, Version int64
+			Name            string
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return event.Record{}, err
+		}
+		var (
+			status  string
+			updated int64
+		)
+		if err := tx.QueryRowContext(ctx, `SELECT status, updated_at FROM change_checks
+WHERE workspace_slug = ? AND number = ? AND version = ? AND name = ?`, *in.Workspace, meta.Number, meta.Version, meta.Name).
+			Scan(&status, &updated); err != nil {
+			return event.Record{}, err
+		}
+		p.mu.Lock()
+		p.results = append(p.results, [2]any{status, updated / 1e9})
+		p.mu.Unlock()
+	}
 	if in.Type == eventApprove || in.Type == eventReject {
 		raw, err := json.Marshal(in.Metadata)
 		if err != nil {

@@ -569,3 +569,44 @@ func (w *world) counted(t *testing.T, number int64) any {
 	approvals, _ := only(w.landing(t, number))["approvals"].(map[string]any)
 	return approvals["counted"]
 }
+
+// checkPath is the path of the check name of the change number of api.
+func checkPath(number int64, name string) string {
+	return "/api/v1/workspaces/api/changes/" + strconv.FormatInt(number, 10) + "/checks/" + name
+}
+
+// putCheck sends body as the result of the check name of the change
+// number of api with credential.
+func (w *world) putCheck(t *testing.T, number int64, name, credential string, body any) answer {
+	t.Helper()
+	return w.send(t, http.MethodPut, checkPath(number, name), credential, body, nil)
+}
+
+// storedResult is the row of the check name on version version of the
+// change number of api, its columns by name, with updated_at in seconds;
+// nil when there is none.
+func (w *world) storedResult(t *testing.T, number, version int64, name string) map[string]any {
+	t.Helper()
+	var (
+		status, summary, actorType      string
+		url, details, actorID, username sql.NullString
+		updated                         int64
+	)
+	err := w.Store.Main().QueryRow(`SELECT status, summary, url, details, actor_type, actor_id, username, updated_at
+FROM change_checks WHERE workspace_slug = 'api' AND number = ? AND version = ? AND name = ?`, number, version, name).
+		Scan(&status, &summary, &url, &details, &actorType, &actorID, &username, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	orNil := func(s sql.NullString) any {
+		if !s.Valid {
+			return nil
+		}
+		return s.String
+	}
+	return map[string]any{"status": status, "summary": summary, "url": orNil(url), "details": orNil(details),
+		"actor_type": actorType, "actor_id": orNil(actorID), "username": orNil(username), "updated_at": updated / 1e9}
+}

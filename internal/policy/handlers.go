@@ -48,7 +48,7 @@ func (c *Component) Routes() []server.Route {
 		Method: http.MethodPost, Pattern: "/workspaces/:slug/policy/evaluate", Scope: "changes:read",
 		Marks: map[string]string{access.MarkNeed: string(access.NeedRead)}, Handler: c.evaluatePolicy,
 		MaxBodySize: maxRequestBytes,
-	}}, c.approvalRoutes()...)
+	}}, slices.Concat(c.approvalRoutes(), c.checkRoutes())...)
 }
 
 // getPolicy answers the current revision of the workspace's policy, or the
