@@ -623,6 +623,16 @@ func (c *clock) advance(d time.Duration) {
 	})
 }
 
+// clockEpoch is the time a clock is at before the test moves it.
+var clockEpoch = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+// Now is the time the clock is at.
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return clockEpoch.Add(c.now)
+}
+
 // waitAsked waits until the clock is asked for a duration, at most 30 s,
 // and returns it.
 func (c *clock) waitAsked(t *testing.T) time.Duration {

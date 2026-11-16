@@ -83,7 +83,22 @@ const (
 // change alone, trigger auto_land, as the user who set the flag, if they
 // may land it and its files are within the paths their credential had;
 // otherwise the flag is cleared and a parley.change.land_fail by system
-// tells why. Tests change its dependencies with AdjustAutoLand.
+// tells why.
+//
+// The lander is the land component's final observer too, told of every
+// attempt that ended, and it follows up those with trigger auto_land: an
+// attempt that landed, ended conflict or was blocked counts the change's
+// retries from zero and makes no start due, so that the change waits,
+// with its flag on, to be announced landable again; one that failed makes
+// a retry due 2 s later, the delay doubling with each retry made since the
+// last attempt that did not fail, at most 5 min, and the eleventh failure
+// in a row clears the flag instead. A retry that comes due for a change
+// that is no longer open, landable or flagged is dropped and its count
+// reset. The loop that follows the event log waits for the earliest due
+// start when it comes sooner than the next second, and stops with the hub,
+// leaving the due times stored; the next start of the hub makes those that
+// came due at once, with the count stored. Tests change its dependencies
+// with AdjustAutoLand.
 func composeLandRules(c *Composition) {
 	c.versionFiles = c.Land().VersionFiles()
 	paths := c.Land().PathGuard()
@@ -95,6 +110,7 @@ func composeLandRules(c *Composition) {
 	c.autoLander = lander
 	c.AddSchemaStep(land.AutoLandStep)
 	c.Changes().RegisterAutoLandGuard(lander)
+	c.Land().AddFinalObserver(lander.Finished)
 	c.AddStartHook(autoLandHook, func(ctx context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := land.AutoLandDeps{

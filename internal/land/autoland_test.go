@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -498,4 +499,348 @@ func numberOf(t *testing.T, raw []byte) int64 {
 		t.Fatalf("no number in %s: %v", raw, err)
 	}
 	return answer.Number
+}
+
+// endingLands is a land component whose attempts end as soon as they are
+// started, with the statuses of ends in turn, the last one repeated, and
+// which tells the lander it is bound to of each end, as the land
+// component tells its final observers. It keeps what it was asked to
+// start and the change's auto_land as each start found it, and answers
+// that no attempt is running.
+type endingLands struct {
+	ends []string
+
+	mu      sync.Mutex
+	lander  *land.AutoLander
+	changes land.AutoLandChanges
+	starts  []land.StartInput
+	flags   []bool
+}
+
+// bind makes s tell lander of the ends of its attempts and read the
+// changes through changes.
+func (s *endingLands) bind(lander *land.AutoLander, changes land.AutoLandChanges) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lander, s.changes = lander, changes
+}
+
+func (s *endingLands) Start(ctx context.Context, in land.StartInput) (land.Attempt, error) {
+	s.mu.Lock()
+	status := s.ends[min(len(s.starts), len(s.ends)-1)]
+	s.starts = append(s.starts, in)
+	n, lander, changes := len(s.starts), s.lander, s.changes
+	s.mu.Unlock()
+	ch, err := changes.ReadChange(ctx, nil, in.Workspace, in.Number)
+	if err != nil {
+		return land.Attempt{}, err
+	}
+	s.mu.Lock()
+	s.flags = append(s.flags, ch.AutoLand)
+	s.mu.Unlock()
+	a := land.Attempt{ID: attemptID(n), Workspace: in.Workspace, Status: status, Trigger: in.Trigger, Attempts: 1,
+		Covered: []land.CoveredChange{{Number: in.Number, Version: ch.Version}}}
+	if status == land.StatusFailed {
+		a.Error = new(land.ErrorContention)
+	}
+	lander.Finished(ctx, land.Final{Attempt: a, Result: status, Attempts: 1})
+	return a, nil
+}
+
+func (s *endingLands) Running(context.Context, string, int64) (bool, error) { return false, nil }
+
+// started counts the lands s was asked to start.
+func (s *endingLands) started() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.starts)
+}
+
+// later is a new clock d after c, the clock of a hub started again d after
+// it stopped.
+func (c *clock) later(d time.Duration) *clock {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := newClock()
+	next.now = c.now + d
+	return next
+}
+
+// retryWorld is a world whose automatic lander runs every second on the
+// clock clk returns at each start of the hub, and starts its lands
+// through lands, or through the land component when lands is nil. It
+// takes the first wait of the lander's loop, so that each move of the
+// clock wakes the loop once and each wait it takes is the end of a run.
+func retryWorld(t *testing.T, clk func() *clock, lands *endingLands) *world {
+	t.Helper()
+	w := startWorld(t, func(c *hub.Composition) {
+		lander := c.AutoLander()
+		c.AdjustAutoLand(func(d *land.AutoLandDeps) {
+			now := clk()
+			d.Now, d.After, d.Interval = now.Now, now.After, time.Second
+			if lands != nil {
+				d.Lands = lands
+				lands.bind(lander, d.Changes)
+			}
+		})
+	})
+	clk().waitAsked(t)
+	return w
+}
+
+// firstLand opens a change of api from branch by its owner with auto_land
+// on, waits until it is landable, and lets the lander run once, which
+// starts its first automatic land through lands.
+func firstLand(t *testing.T, w *world, clk *clock, lands *endingLands, branch string) change.Change {
+	t.Helper()
+	ch := w.openWith(t, branch, map[string]string{branch + ".txt": "x\n"}, true, w.caller())
+	w.mergeable(t, ch.Number, change.MergeableClean)
+	clk.advance(time.Second)
+	clk.waitAsked(t)
+	if n := lands.started(); n != 1 {
+		t.Fatalf("the lander started %d lands for the landable %s, want 1", n, ch.Ref)
+	}
+	return ch
+}
+
+// retryAfter moves clk on by d less a millisecond and fails unless lands
+// started nothing, then by the millisecond and fails unless lands started
+// exactly one land: the start of a retry d after the attempt before it
+// ended.
+func retryAfter(t *testing.T, clk *clock, lands *endingLands, d time.Duration) {
+	t.Helper()
+	n := lands.started()
+	clk.advance(d - time.Millisecond)
+	clk.waitAsked(t)
+	if got := lands.started() - n; got != 0 {
+		t.Fatalf("%d lands started %v after the attempt ended, want none before %v", got, d-time.Millisecond, d)
+	}
+	clk.advance(time.Millisecond)
+	clk.waitAsked(t)
+	if got := lands.started() - n; got != 1 {
+		t.Fatalf("%d lands started %v after the attempt ended, want exactly one", got, d)
+	}
+}
+
+// turnMergeable stores value as the mergeable of the change number of api
+// and runs the change's announcement step, as a mergeability check does.
+func (w *world) turnMergeable(t *testing.T, number int64, value string) {
+	t.Helper()
+	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+		if err := w.changes.SetMergeable(ctx, tx, "api", number, value, nil); err != nil {
+			return err
+		}
+		return w.changes.AnnounceLandable(ctx, tx, "api", number)
+	})
+}
+
+// readyCount counts the announcements that the change number of api is
+// landable.
+func (w *world) readyCount(t *testing.T, number int64) (n int) {
+	t.Helper()
+	for _, e := range w.eventsOf(t, change.EventReady) {
+		if e.ResourceID == strconv.FormatInt(number, 10) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestAutoLand_KeepsTheFlagAndWaitsForTheChangeToBeLandableAgainAfterAConflictOrABlock(t *testing.T) {
+	t.Parallel()
+	t.Run("a conflict with a change that landed first on the same line", func(t *testing.T) {
+		t.Parallel()
+		clk := newClock()
+		w := retryWorld(t, func() *clock { return clk }, nil)
+		ch := w.openWith(t, "late", map[string]string{"a.txt": lines("late")}, true, w.caller())
+		w.mergeable(t, ch.Number, change.MergeableClean)
+		// main moves under the change's edit, unseen by its mergeability.
+		commit(t, w.api, "main", w.base, "main", map[string]string{"a.txt": lines("main")})
+
+		clk.advance(time.Second)
+		clk.waitAsked(t)
+
+		until(t, ch.Ref+"'s automatic land ends conflict", func() bool {
+			lands := w.lands(t, ch.Number)
+			return len(lands) == 1 && lands[0]["status"] == land.StatusConflict
+		})
+		if !w.readChange(t, ch.Number).AutoLand {
+			t.Errorf("auto_land of %s is false after the conflict, want true", ch.Ref)
+		}
+		clk.advance(time.Hour)
+		clk.waitAsked(t)
+		if lands := w.lands(t, ch.Number); len(lands) != 1 {
+			t.Fatalf("%s has %d land attempts an hour after the conflict, want 1: %v", ch.Ref, len(lands), lands)
+		}
+
+		resolved := commit(t, w.api, ch.Source.Branch, head(t, w.api, "main"), "resolved", map[string]string{"a.txt": lines("late")})
+		w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
+			_, err := w.changes.RecordVersion(ctx, tx, change.VersionInput{Workspace: "api", Branch: ch.Source.Branch, Head: resolved, Kind: change.KindRef})
+			return err
+		})
+		w.mergeable(t, ch.Number, change.MergeableClean)
+		clk.advance(time.Second)
+		clk.waitAsked(t)
+
+		until(t, ch.Ref+" lands", func() bool { return w.readChange(t, ch.Number).State == change.StateLanded })
+		lands := w.lands(t, ch.Number)
+		if len(lands) != 2 || lands[0]["trigger"] != land.TriggerAutoLand || lands[1]["trigger"] != land.TriggerAutoLand {
+			t.Errorf("%s has land attempts %v, want two with trigger auto_land", ch.Ref, lands)
+		}
+	})
+	t.Run("an attempt blocked", func(t *testing.T) {
+		t.Parallel()
+		clk, lands := newClock(), &endingLands{ends: []string{land.StatusBlocked}}
+		w := retryWorld(t, func() *clock { return clk }, lands)
+		ch := firstLand(t, w, clk, lands, "blocked")
+
+		clk.advance(time.Hour)
+		clk.waitAsked(t)
+
+		if !w.readChange(t, ch.Number).AutoLand {
+			t.Errorf("auto_land of %s is false after the block, want true", ch.Ref)
+		}
+		if n := lands.started(); n != 1 {
+			t.Errorf("the lander started %d lands in the hour after the block, want 1 in all", n)
+		}
+	})
+}
+
+func TestAutoLand_RetriesAFailedAttemptWithADoublingDelayAndThenClearsTheFlag(t *testing.T) {
+	t.Parallel()
+	clk, lands := newClock(), &endingLands{ends: []string{land.StatusFailed}}
+	w := retryWorld(t, func() *clock { return clk }, lands)
+	ch := firstLand(t, w, clk, lands, "retried")
+
+	for _, seconds := range []time.Duration{2, 4, 8, 16, 32, 64, 128, 256, 300, 300} {
+		retryAfter(t, clk, lands, seconds*time.Second)
+	}
+
+	lands.mu.Lock()
+	starts, flags := slices.Clone(lands.starts), slices.Clone(lands.flags)
+	lands.mu.Unlock()
+	if len(starts) != 11 {
+		t.Fatalf("the lander started %d lands, want 11", len(starts))
+	}
+	for i, in := range starts {
+		if in.Trigger != land.TriggerAutoLand || in.Number != ch.Number || !flags[i] {
+			t.Errorf("start %d is of change %d with trigger %s and auto_land %t, want %d, auto_land, true",
+				i+1, in.Number, in.Trigger, flags[i], ch.Number)
+		}
+	}
+	if got := w.readChange(t, ch.Number); got.AutoLand || got.State != change.StateOpen {
+		t.Errorf("%s is %s with auto_land %t after the tenth retry failed, want open with auto_land false", ch.Ref, got.State, got.AutoLand)
+	}
+	clk.advance(time.Hour)
+	clk.waitAsked(t)
+	if n := lands.started(); n != 11 {
+		t.Errorf("the lander started %d lands, want no more than 11 an hour later", n)
+	}
+}
+
+func TestAutoLand_DropsADueRetryOfAChangeThatIsNotToBeLandedNow(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// drop makes the change ch no longer one to land, and again makes
+		// it landable with its flag on, to be started by the next run.
+		drop, again func(t *testing.T, w *world, ch change.Change)
+	}{
+		{name: "the change abandoned",
+			drop: func(t *testing.T, w *world, ch change.Change) {
+				path := fmt.Sprintf("/api/v1/workspaces/api/changes/%d/abandon", ch.Number)
+				if status, raw := w.Call(t, http.MethodPost, path, w.ownerKey, nil); status != http.StatusOK {
+					t.Fatalf("abandon %s = %d %s, want 200", ch.Ref, status, raw)
+				}
+			},
+			again: func(t *testing.T, w *world, ch change.Change) {
+				ready := w.readyCount(t, ch.Number)
+				path := fmt.Sprintf("/api/v1/workspaces/api/changes/%d/restore", ch.Number)
+				if status, raw := w.Call(t, http.MethodPost, path, w.ownerKey, nil); status != http.StatusOK {
+					t.Fatalf("restore %s = %d %s, want 200", ch.Ref, status, raw)
+				}
+				until(t, ch.Ref+" is announced landable again", func() bool { return w.readyCount(t, ch.Number) > ready })
+			}},
+		{name: "the flag set to false by PATCH",
+			drop: func(t *testing.T, w *world, ch change.Change) {
+				if status, answer := w.patchChange(t, w.ownerKey, ch.Number, map[string]any{"auto_land": false}); status != http.StatusOK {
+					t.Fatalf("PATCH auto_land false = %d %v, want 200", status, answer)
+				}
+			},
+			again: func(t *testing.T, w *world, ch change.Change) {
+				if status, answer := w.patchChange(t, w.ownerKey, ch.Number, map[string]any{"auto_land": true}); status != http.StatusOK {
+					t.Fatalf("PATCH auto_land true = %d %v, want 200", status, answer)
+				}
+			}},
+		{name: "mergeable turned conflict",
+			drop:  func(t *testing.T, w *world, ch change.Change) { w.turnMergeable(t, ch.Number, change.MergeableConflict) },
+			again: func(t *testing.T, w *world, ch change.Change) { w.turnMergeable(t, ch.Number, change.MergeableClean) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			clk, lands := newClock(), &endingLands{ends: []string{land.StatusFailed}}
+			w := retryWorld(t, func() *clock { return clk }, lands)
+			ch := firstLand(t, w, clk, lands, "dropped")
+			retryAfter(t, clk, lands, 2*time.Second)
+			retryAfter(t, clk, lands, 4*time.Second)
+			c.drop(t, w, ch)
+			flag := w.readChange(t, ch.Number).AutoLand
+
+			// The third failed attempt's retry was due 8 s after it.
+			clk.advance(time.Minute)
+			clk.waitAsked(t)
+
+			if n := lands.started(); n != 3 {
+				t.Fatalf("the lander started %d lands, want none after the third", n-3)
+			}
+			if got := w.readChange(t, ch.Number).AutoLand; got != flag {
+				t.Errorf("auto_land of %s is %t after the retry was dropped, want it kept at %t", ch.Ref, got, flag)
+			}
+			c.again(t, w, ch)
+			clk.advance(time.Second)
+			clk.waitAsked(t)
+			if n := lands.started(); n != 4 {
+				t.Fatalf("the lander started %d lands once %s is landable again, want 1", n-3, ch.Ref)
+			}
+			retryAfter(t, clk, lands, 2*time.Second)
+		})
+	}
+}
+
+func TestAutoLand_StartsTheRetriesAgainAfterAnAttemptThatDidNotFail(t *testing.T) {
+	t.Parallel()
+	clk := newClock()
+	lands := &endingLands{ends: []string{land.StatusFailed, land.StatusFailed, land.StatusConflict, land.StatusFailed}}
+	w := retryWorld(t, func() *clock { return clk }, lands)
+	ch := firstLand(t, w, clk, lands, "reset")
+	retryAfter(t, clk, lands, 2*time.Second)
+	retryAfter(t, clk, lands, 4*time.Second)
+	w.turnMergeable(t, ch.Number, change.MergeableConflict)
+	w.turnMergeable(t, ch.Number, change.MergeableClean)
+	clk.advance(time.Second)
+	clk.waitAsked(t)
+	if n := lands.started(); n != 4 {
+		t.Fatalf("the lander started %d lands once %s is landable again, want 1", n-3, ch.Ref)
+	}
+
+	retryAfter(t, clk, lands, 2*time.Second)
+}
+
+func TestAutoLand_MakesAPendingRetryAfterARestartWithItsStoredCount(t *testing.T) {
+	t.Parallel()
+	clk, lands := newClock(), &endingLands{ends: []string{land.StatusFailed}}
+	w := retryWorld(t, func() *clock { return clk }, lands)
+	firstLand(t, w, clk, lands, "restarted")
+	// The second attempt fails: its retry is due 4 s later.
+	retryAfter(t, clk, lands, 2*time.Second)
+
+	// The hub stops, and starts again on the same store 10 s later.
+	clk = clk.later(10 * time.Second)
+	w.Restart(t)
+	clk.waitAsked(t)
+
+	if n := lands.started(); n != 3 {
+		t.Fatalf("the lander started %d lands at the restart, want 1", n-2)
+	}
+	retryAfter(t, clk, lands, 8*time.Second)
 }

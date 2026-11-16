@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -24,6 +25,17 @@ const DefaultAutoLandInterval = time.Second
 
 // autoLandBatch is how many events one read of the event log takes.
 const autoLandBatch = 500
+
+// An automatic land that ends failed is tried again, up to autoLandRetries
+// times after the last attempt that did not end failed: the first retry
+// firstRetryDelay after the failure, each further one after twice the
+// delay before it, at most lastRetryDelay. A transient failure is retried
+// without anyone watching, and not forever.
+const (
+	autoLandRetries = 10
+	firstRetryDelay = 2 * time.Second
+	lastRetryDelay  = 300 * time.Second
+)
 
 // AutoLandStep creates the store schema of the automatic lander: one row
 // per change whose auto_land is on, with the count of the retries of its
@@ -133,6 +145,10 @@ type AutoLandDeps struct {
 // guard; it runs once Bind has given it its dependencies.
 type AutoLander struct {
 	deps AutoLandDeps
+	// bound is set once Bind has given the lander its dependencies: the
+	// land component may tell its final observers of an attempt it
+	// recovered before the lander is bound.
+	bound atomic.Bool
 	// mu makes one run of the lander at a time, so that an announcement or
 	// a due start is handled once, whoever asks for the run.
 	mu sync.Mutex
@@ -154,6 +170,7 @@ func (l *AutoLander) Bind(d AutoLandDeps) {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
 	l.deps = d
+	l.bound.Store(true)
 }
 
 // CheckAutoLand is the change component's auto_land guard, asked in tx,
@@ -199,35 +216,63 @@ ON CONFLICT (workspace_slug, number) DO UPDATE SET retries = 0, due_at = exclude
 
 // Recover runs at the start of the hub, once the land component has
 // handed the attempts a stop left running to its pool: it stores the end
-// of the event log as the lander's position when none is stored yet, and
-// runs the start procedure for every open change whose flag is on, so that
-// a change that became landable while the hub was stopped, or was
-// announced before the lander first ran, is not left waiting for an
-// announcement that does not come.
+// of the event log as the lander's position when none is stored yet,
+// makes the starts that came due while the hub was stopped, retries
+// among them, with the retry counts stored, and runs the start procedure
+// for every other open change whose flag is on, so that a change that
+// became landable while the hub was stopped, or was announced before the
+// lander first ran, is not left waiting for an announcement that does not
+// come. A start due later is left to the loop (Run), at its time.
 func (l *AutoLander) Recover(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, err := l.position(ctx); err != nil {
 		return err
 	}
+	if err := l.startDue(ctx); err != nil {
+		return err
+	}
 	return l.scan(ctx)
 }
 
-// Run runs the lander until ctx ends, every Interval: it follows the event
-// log (Pass) and starts the lands that are due. It is the hub's background
-// work, off the request path, and returns once ctx ended.
+// Run runs the lander until ctx ends: it follows the event log (Pass) and
+// starts the lands that are due, every Interval, and at the time the
+// earliest start is due when that comes first, so that a retry starts at
+// its due time. It is the hub's one loop of pending starts, its
+// background work, off the request path; it returns once ctx ended and
+// leaves the due times stored, for the next start of the hub.
 func (l *AutoLander) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-l.deps.After(l.deps.Interval):
+		case <-l.deps.After(l.wait(ctx)):
 		}
 		err := errors.Join(l.Pass(ctx), l.runDue(ctx))
 		if err != nil && ctx.Err() == nil {
 			l.deps.Logger.Warn("automatic land: a run failed", "error", err)
 		}
 	}
+}
+
+// wait is how long the loop waits before its next run: Interval, or the
+// time until the earliest start is due when that is sooner, none for a
+// start due already. A start made due while it waits, by a failed
+// attempt, is seen at the latest an Interval later, and then waited for
+// to its time.
+func (l *AutoLander) wait(ctx context.Context) time.Duration {
+	var next sql.NullInt64
+	err := l.deps.Store.Main().QueryRowContext(ctx, `SELECT MIN(due_at) FROM land_auto_land`).Scan(&next)
+	if err != nil {
+		if ctx.Err() == nil {
+			l.deps.Logger.Warn("automatic land: the due starts were not read", "error", err)
+		}
+		return l.deps.Interval
+	}
+	if !next.Valid {
+		return l.deps.Interval
+	}
+	return min(l.deps.Interval, max(time.Duration(next.Int64-l.now().UnixNano()), 0))
 }
 
 // Pass reads the events after the stored position, runs the start
@@ -269,7 +314,7 @@ func (l *AutoLander) Pass(ctx context.Context) error {
 			if err != nil {
 				continue
 			}
-			l.consider(ctx, *rec.Workspace, number, rec.Seq)
+			l.consider(ctx, *rec.Workspace, number, rec.Seq, false)
 		}
 		if examined > pos {
 			if err := l.storePosition(ctx, l.deps.Store.Main(), examined); err != nil {
@@ -284,11 +329,17 @@ func (l *AutoLander) Pass(ctx context.Context) error {
 }
 
 // runDue runs the start procedure for every change whose start is due by
-// now, each due time cleared first, so that a start that fails is not
-// tried again at every run.
+// now (startDue).
 func (l *AutoLander) runDue(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.startDue(ctx)
+}
+
+// startDue runs the start procedure for every change whose start is due
+// by now, each due time cleared first, so that a start that fails is not
+// tried again at every run. The caller holds mu.
+func (l *AutoLander) startDue(ctx context.Context) error {
 	now := l.now().UnixNano()
 	rows, err := l.deps.Store.Main().QueryContext(ctx, `SELECT workspace_slug, number FROM land_auto_land
 WHERE due_at IS NOT NULL AND due_at <= ? ORDER BY due_at, workspace_slug, number`, now)
@@ -313,7 +364,7 @@ WHERE due_at IS NOT NULL AND due_at <= ? ORDER BY due_at, workspace_slug, number
 WHERE workspace_slug = ? AND number = ? AND due_at <= ?`, k.WorkspaceSlug, k.Number, now); err != nil {
 			return fmt.Errorf("clear the due time of %s: %w", change.Ref(k.WorkspaceSlug, k.Number), err)
 		}
-		l.consider(ctx, k.WorkspaceSlug, k.Number, 0)
+		l.consider(ctx, k.WorkspaceSlug, k.Number, 0, true)
 	}
 	return nil
 }
@@ -325,16 +376,17 @@ func (l *AutoLander) scan(ctx context.Context) error {
 		return err
 	}
 	for _, k := range keys {
-		l.consider(ctx, k.WorkspaceSlug, k.Number, 0)
+		l.consider(ctx, k.WorkspaceSlug, k.Number, 0, false)
 	}
 	return nil
 }
 
 // consider runs the start procedure for the change number of the
-// workspace, for the event at seq (0 for none), and logs what fails: one
-// change the lander cannot judge holds up no other.
-func (l *AutoLander) consider(ctx context.Context, workspace string, number int64, seq int64) {
-	if err := l.startProcedure(ctx, workspace, number, seq); err != nil && ctx.Err() == nil {
+// workspace, for the event at seq (0 for none) or a start that came due,
+// and logs what fails: one change the lander cannot judge holds up no
+// other.
+func (l *AutoLander) consider(ctx context.Context, workspace string, number int64, seq int64, due bool) {
+	if err := l.startProcedure(ctx, workspace, number, seq, due); err != nil && ctx.Err() == nil {
 		l.deps.Logger.Warn("automatic land: the start procedure failed", "change", change.Ref(workspace, number), "error", err)
 	}
 }
@@ -344,7 +396,11 @@ func (l *AutoLander) consider(ctx context.Context, workspace string, number int6
 // as it is, for a change that is not open, whose flag is off, that is not
 // landable, that a running attempt covers, or whose depends_on names a
 // change that is not landed: such a change is landed by a later
-// announcement, if any. Then the setter of the flag must be allowed to
+// announcement, if any. A start that came due (due) for a change that is
+// not open, whose flag is off or that is not landable is dropped, and its
+// retries are counted from zero again. An announcement, or the start-up,
+// starts nothing for a change whose retry is due later: the retry is made
+// at its time. Then the setter of the flag must be allowed to
 // land the change now, as the land route would allow them, and the files
 // of its current version must be within the paths of the credential they
 // set the flag with, whether or not that credential still exists: when
@@ -354,8 +410,9 @@ func (l *AutoLander) consider(ctx context.Context, workspace string, number int6
 // trigger auto_land, as the setter.
 //
 // seq, when not 0, is the position of the event the procedure runs for,
-// stored with what the procedure writes.
-func (l *AutoLander) startProcedure(ctx context.Context, workspace string, number int64, seq int64) error {
+// stored with what the procedure writes. Once a land is started, a start
+// of the change due by then is cleared: it is the one just made.
+func (l *AutoLander) startProcedure(ctx context.Context, workspace string, number int64, seq int64, due bool) error {
 	ch, err := l.deps.Changes.ReadChange(ctx, nil, workspace, number)
 	if errors.Is(err, change.ErrChangeNotFound) {
 		return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return forgetAutoLand(ctx, tx, workspace, number) })
@@ -363,8 +420,13 @@ func (l *AutoLander) startProcedure(ctx context.Context, workspace string, numbe
 	if err != nil {
 		return err
 	}
-	if start, err := l.startable(ctx, ch); err != nil || !start {
+	switch verdict, err := l.startable(ctx, ch, due); {
+	case err != nil:
 		return err
+	case verdict == notLandable && due:
+		return l.dropRetry(ctx, workspace, number)
+	case verdict != startNow:
+		return nil
 	}
 	setter, found, err := l.deps.Changes.AutoLandSetter(ctx, nil, workspace, number)
 	if err != nil || !found {
@@ -388,47 +450,164 @@ func (l *AutoLander) startProcedure(ctx context.Context, workspace string, numbe
 	if !permitted {
 		return l.refuse(ctx, ch, seq)
 	}
+	now := l.now().UnixNano()
 	_, err = l.deps.Lands.Start(ctx, StartInput{
 		Workspace: workspace, Number: number, ExpectedVersion: &ch.Version, Trigger: TriggerAutoLand,
 		RequestedBy: actorOf(caller), Caller: caller,
 	})
 	var refusal *server.Error
-	if errors.As(err, &refusal) {
+	switch {
+	case errors.As(err, &refusal):
 		// A precondition of the land stopped holding since the change was
 		// read, such as another attempt or a new version, which a later
 		// announcement starts from.
 		l.deps.Logger.Debug("automatic land: not started", "change", ch.Ref, "reason", refusal.Message())
-		err = nil
-	}
-	if err != nil || seq == 0 {
+	case err != nil:
 		return err
+	default:
+		// The retry the attempt's end may have made due is later than now.
+		if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land SET due_at = NULL
+WHERE workspace_slug = ? AND number = ? AND due_at <= ?`, workspace, number, now); err != nil {
+			return fmt.Errorf("clear the due start of %s: %w", ch.Ref, err)
+		}
+	}
+	if seq == 0 {
+		return nil
 	}
 	return l.storePosition(ctx, l.deps.Store.Main(), seq)
 }
 
-// startable reports whether the change ch may have its automatic land
-// started now: open, its flag on, landable, covered by no running attempt
-// and depending on no change that is not landed. A depends_on that names
-// no change counts as none, as the land does.
-func (l *AutoLander) startable(ctx context.Context, ch change.Change) (bool, error) {
+// dropRetry drops the start of the change number of the workspace that
+// came due while it was not to be landed, and counts its retries from
+// zero again: the change is landed again from its next announcement.
+func (l *AutoLander) dropRetry(ctx context.Context, workspace string, number int64) error {
+	if _, err := l.deps.Store.Main().ExecContext(ctx, `UPDATE land_auto_land SET retries = 0, due_at = NULL
+WHERE workspace_slug = ? AND number = ?`, workspace, number); err != nil {
+		return fmt.Errorf("drop the retry of %s: %w", change.Ref(workspace, number), err)
+	}
+	return nil
+}
+
+// A verdict is whether the start procedure starts a change's land now.
+type verdict int
+
+const (
+	// startNow: the change is landable, and nothing holds its land back.
+	startNow verdict = iota
+	// notLandable: the change is not open, its flag is off or it is not
+	// landable.
+	notLandable
+	// notNow: a running attempt covers the change, a change below it is
+	// not landed, or its retry is due later.
+	notNow
+)
+
+// startable judges whether the change ch may have its automatic land
+// started now: open, its flag on, landable, covered by no running attempt,
+// depending on no change that is not landed and, unless the start is the
+// one that came due (due), with no retry due later. A depends_on that
+// names no change counts as none, as the land does.
+func (l *AutoLander) startable(ctx context.Context, ch change.Change, due bool) (verdict, error) {
 	if ch.State != change.StateOpen || !ch.AutoLand || ch.Landing.Status != change.LandingReady || ch.Mergeable != change.MergeableClean {
-		return false, nil
+		return notLandable, nil
 	}
 	running, err := l.deps.Lands.Running(ctx, ch.WorkspaceSlug, ch.Number)
 	if err != nil || running {
-		return false, err
+		return notNow, err
+	}
+	if !due {
+		var pending bool
+		if err := l.deps.Store.Main().QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM land_auto_land
+WHERE workspace_slug = ? AND number = ? AND due_at > ?)`, ch.WorkspaceSlug, ch.Number, l.now().UnixNano()).Scan(&pending); err != nil || pending {
+			return notNow, err
+		}
 	}
 	if ch.DependsOn == nil {
-		return true, nil
+		return startNow, nil
 	}
 	below, err := l.deps.Changes.ReadChange(ctx, nil, ch.WorkspaceSlug, *ch.DependsOn)
 	switch {
 	case errors.Is(err, change.ErrChangeNotFound):
-		return true, nil
+		return startNow, nil
 	case err != nil:
-		return false, err
+		return notNow, err
+	case below.State != change.StateLanded:
+		return notNow, nil
 	}
-	return below.State == change.StateLanded, nil
+	return startNow, nil
+}
+
+// Finished is the land component's final observer. For an automatic land
+// it keeps, makes or ends the retries of each change the attempt covered
+// (settle), and it ignores every other attempt.
+func (l *AutoLander) Finished(ctx context.Context, f Final) {
+	if f.Attempt.Trigger != TriggerAutoLand || !l.bound.Load() {
+		return
+	}
+	for _, cov := range f.Attempt.Covered {
+		if err := l.settle(ctx, f.Attempt.Workspace, cov.Number, f.Result); err != nil {
+			l.deps.Logger.Warn("automatic land: the end of an attempt was not followed up", "change",
+				change.Ref(f.Attempt.Workspace, cov.Number), "land_id", f.Attempt.ID, "error", err)
+		}
+	}
+}
+
+// settle follows up the end, with the status result, of an automatic
+// land of the change number of the workspace, in one transaction. An end
+// that is not failed counts the retries from zero again and makes no
+// start due: a conflict or a block waits for the change to be announced
+// landable again, and the flag stays as it is. A failed end of a change
+// whose flag is still on makes its next retry due, the count one more,
+// after a delay that doubles with each retry already made (retryDelay);
+// once autoLandRetries were made the flag is cleared instead, and the
+// change keeps its state.
+func (l *AutoLander) settle(ctx context.Context, workspace string, number int64, result string) error {
+	return l.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if result != StatusFailed {
+			_, err := tx.ExecContext(ctx, `UPDATE land_auto_land SET retries = 0, due_at = NULL
+WHERE workspace_slug = ? AND number = ?`, workspace, number)
+			return err
+		}
+		ch, err := l.deps.Changes.ReadChange(ctx, tx, workspace, number)
+		switch {
+		case errors.Is(err, change.ErrChangeNotFound):
+			return forgetAutoLand(ctx, tx, workspace, number)
+		case err != nil:
+			return err
+		case !ch.AutoLand:
+			return forgetAutoLand(ctx, tx, workspace, number)
+		}
+		var retries int
+		err = tx.QueryRowContext(ctx, `SELECT retries FROM land_auto_land WHERE workspace_slug = ? AND number = ?`,
+			workspace, number).Scan(&retries)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if retries >= autoLandRetries {
+			if err := l.deps.Changes.SetAutoLand(ctx, tx, workspace, number, false, change.Caller{}); err != nil {
+				return err
+			}
+			return forgetAutoLand(ctx, tx, workspace, number)
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO land_auto_land (workspace_slug, number, retries, due_at) VALUES (?, ?, ?, ?)
+ON CONFLICT (workspace_slug, number) DO UPDATE SET retries = excluded.retries, due_at = excluded.due_at`,
+			workspace, number, retries+1, l.now().Add(retryDelay(retries)).UnixNano())
+		return err
+	})
+}
+
+// retryDelay is the delay before the retry that follows the given number
+// of retries already made: firstRetryDelay, doubled for each, at most
+// lastRetryDelay.
+func retryDelay(retries int) time.Duration {
+	d := firstRetryDelay
+	for range retries {
+		if d >= lastRetryDelay {
+			break
+		}
+		d *= 2
+	}
+	return min(d, lastRetryDelay)
 }
 
 // permitted reports whether the setter s may land ch now, and returns
