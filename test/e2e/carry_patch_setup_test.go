@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -78,5 +79,20 @@ func TestCarryPatch_CreateAndSetUp(t *testing.T) {
 	}
 	if got := gitrepotest.Git(t, copyDir, "config", "--local", "--get", "rerere.enabled"); got != "true" {
 		t.Errorf("rerere.enabled = %q, want true", got)
+	}
+
+	// The new workspace's patch list is empty; a standard workspace has none.
+	status, body = h.Call(t, http.MethodGet, "/api/v1/workspaces/variant/patches", h.key, nil)
+	if status != http.StatusOK || !strings.Contains(string(body), `"items":[]`) {
+		t.Errorf("GET the patches of variant = %d %s, want 200 with items []", status, body)
+	}
+	status, body = h.Call(t, http.MethodPost, "/api/v1/workspaces", h.key, map[string]any{"slug": "plain", "git_url": origin.URL()})
+	if status != http.StatusCreated {
+		t.Fatalf("create the standard workspace = %d %s, want 201", status, body)
+	}
+	h.waitStatus(t, "plain", workspace.StatusReady)
+	status, body = h.Call(t, http.MethodGet, "/api/v1/workspaces/plain/patches", h.key, nil)
+	if status != http.StatusBadRequest || !strings.Contains(string(body), `"workspace_mode_mismatch"`) {
+		t.Errorf("GET the patches of a standard workspace = %d %s, want 400 workspace_mode_mismatch", status, body)
 	}
 }

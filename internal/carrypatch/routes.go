@@ -55,3 +55,13 @@ func Route(kind RouteKind, rt server.Route) server.Route {
 	}
 	return rt
 }
+
+// Routes are the carry-patch routes, each declared with Route, which the
+// hub registers with its router: the patch list and a single patch, read
+// routes that serve in every state of the workspace.
+func (c *Component) Routes() []server.Route {
+	return []server.Route{
+		Route(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/patches", Handler: c.listRoute}),
+		Route(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/patches/:id", Handler: c.getRoute}),
+	}
+}

@@ -18,8 +18,10 @@ const carryPatchHook = "carry_patch"
 // the integration branch written) before the workspace is ready, and as the
 // patch-branch lookup of the push route, which leaves the patch branches to
 // the patch list, without the workspace package knowing the mode's work. A
-// workspace's delete removes its patches (ADR 07). Its start hook binds the component to the store, the secret
-// component, which holds the upstream and origin credentials, the hub's git
+// workspace's delete removes its patches (ADR 07). The component's routes,
+// the patch list's, are registered with the hub's router. Its start hook
+// binds the component to the store, the secret component, which holds the
+// upstream and origin credentials, the hub's git
 // and the place of each copy on disk, after every adjuster
 // AdjustCarryPatch added has changed those dependencies. The hook runs
 // after the workspace part's, and like it before the clone workers launch,
@@ -34,6 +36,9 @@ func composeCarryPatch(c *Composition) {
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
+	for _, rt := range comp.Routes() {
+		c.AddRoute(rt)
+	}
 	c.AddStartHook(carryPatchHook, func(_ context.Context, rt *Runtime) error {
 		d := carrypatch.Deps{
 			Store:    rt.Store,
