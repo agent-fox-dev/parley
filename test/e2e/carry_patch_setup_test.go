@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -19,6 +21,14 @@ import (
 // trusts both origin and the upstream up: each test origin has a
 // certificate authority of its own, so git is given a bundle of the two.
 func startCarryPatchHub(t *testing.T, origin, up *gitrepotest.Origin) *workspaceHub {
+	t.Helper()
+	return startCarryPatchHubWith(t, origin, up, nil, nil)
+}
+
+// startCarryPatchHubWith starts a hub as startCarryPatchHub does, whose
+// clock is now (time.Now when nil) and whose composition compose changes
+// (nothing when nil), such as the job queue's handlers and clock.
+func startCarryPatchHubWith(t *testing.T, origin, up *gitrepotest.Origin, now func() time.Time, compose func(*hub.Composition)) *workspaceHub {
 	t.Helper()
 	var bundle []byte
 	for _, o := range []*gitrepotest.Origin{origin, up} {
@@ -38,9 +48,11 @@ func startCarryPatchHub(t *testing.T, origin, up *gitrepotest.Origin) *workspace
 	}
 	h := &workspaceHub{root: t.TempDir(), origin: origin}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
-		Server: `external_url = "https://hub.example/"`,
-		TOML:   "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n",
-		Env:    map[string]string{"GIT_SSL_CAINFO": caFile, secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw)},
+		Server:  `external_url = "https://hub.example/"`,
+		TOML:    "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n",
+		Env:     map[string]string{"GIT_SSL_CAINFO": caFile, secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw)},
+		Now:     now,
+		Compose: compose,
 	})
 	h.user = h.CreateUser(t, "dev")
 	h.key = h.IssueKey(t, h.user)

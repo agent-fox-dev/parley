@@ -3020,6 +3020,174 @@ emits `parley.patch.replace` with `metadata` `branch_name`,
 `replaced_sha`, `origin_sha` and `trigger: "reset_to_origin"`. A refused
 reset emits nothing and changes no patch field.
 
+## Rebuild jobs
+
+A rebuild recreates the integration branch of a `carry_patch` workspace
+from its upstream and its patches. The hub runs it as a **durable job**:
+the job is stored before the request that asked for it is answered,
+survives a restart of the hub and is retried with growing delays. The
+hub runs the jobs itself, in `parleyd`; there is no worker process.
+
+A job is in one of six statuses:
+
+| Status | Meaning | Final |
+|---|---|---|
+| `queued` | waiting for a worker | no |
+| `running` | a worker runs it | no |
+| `failed` | the last attempt failed with an error that may pass; the job waits to retry at `next_attempt_at` | no |
+| `completed` | succeeded | yes |
+| `dead_letter` | failed for good: a permanent error, or its retries are spent; can be requeued | yes, until requeued |
+| `cancelled` | cancelled while queued | yes |
+
+`failed` is never final. A workspace has at most one rebuild job that is
+`queued`, `running` or `failed`; the one exception is the follow-up a
+running rebuild queues for itself, which starts after it. At most 4 jobs
+run at once across the hub, and one per workspace; queued jobs start
+oldest first, within 5 seconds when a worker is free.
+
+An attempt that fails with an error that may pass is retried: after the
+*n*-th such failure the job is `failed` with `retry_count` *n* and
+`next_attempt_at` `min(2 s × 2ⁿ, 2 h)` later (4 s, 8 s, 16 s, … 4096 s
+after the 11th, 2 h from the 12th on). The 21st such failure, and any
+permanent failure, makes the job `dead_letter`, with `retry_count`
+unchanged. A job the hub finds `running` when it starts (the hub stopped
+during the attempt) returns to `queued` with `retry_count` unchanged and
+runs again from the start. At a stop the hub starts no further job and
+gives running attempts 30 seconds; one still running then is left
+`running` and recovered at the next start. A workspace's jobs are deleted
+with the workspace.
+
+What an attempt does is the rebuild handler's: this version of the hub
+registers none, so a rebuild job stays `queued` until a hub with the
+rebuild handler runs it.
+
+### The rebuild job record
+
+Every route below that returns a job returns this object, with every
+member present (`null` when unset); times are RFC 3339 UTC with whole
+seconds.
+
+| Member | Type | Meaning |
+|---|---|---|
+| `id` | UUID | the job's id |
+| `workspace_slug` | string | |
+| `status` | enum | one of the six statuses |
+| `strategy` | `rebase` \| `merge` | captured when the job was queued |
+| `fail_mode` | `fail_fast` \| `continue` | captured when the job was queued |
+| `integration_branch` | string | captured when the job was queued |
+| `submitted_by` | string | the user id of the caller who queued it (`admin_token` for the admin token), or `system:push`, `system:land`, `system:followup` |
+| `retry_count` | integer | the failures that may pass so far |
+| `next_attempt_at` | timestamp or `null` | set only while `failed` |
+| `error` | string or `null` | the text of the last failure; kept while the job is retried, cleared when it completes or is requeued |
+| `conflict` | object or `null` | the detail of the last failure (a conflict report) |
+| `created_at`, `updated_at` | timestamp | |
+| `completed_at` | timestamp or `null` | set in `completed`, `dead_letter` and `cancelled` |
+| `upstream_head_sha`, `integration_head_sha`, `previous_integration_head_sha` | string or `null` | from the attempt's result |
+| `patches_applied`, `patches_skipped`, `patches_conflicted`, `patches_removed` | integer | from the attempt's result; `0` without one |
+| `integration_branch_pushed` | boolean | from the attempt's result; `false` without one |
+| `patch_results` | array | from the attempt's result; `[]` without one |
+
+The members "from the attempt's result" are what the running attempt last
+stored: a claim of the job empties the result, so a job that runs again
+starts from none.
+
+```json
+{"id":"7b1c0e2a-4d5f-4a6b-9c8d-0e1f2a3b4c5d","workspace_slug":"variant","status":"queued","strategy":"rebase","fail_mode":"fail_fast","integration_branch":"deploy","submitted_by":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","retry_count":0,"next_attempt_at":null,"error":null,"conflict":null,"created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z","completed_at":null,"upstream_head_sha":null,"integration_head_sha":null,"previous_integration_head_sha":null,"patches_applied":0,"patches_skipped":0,"patches_conflicted":0,"patches_removed":0,"integration_branch_pushed":false,"patch_results":[]}
+```
+
+### Checks common to the five routes
+
+The two `GET` routes need `rebuilds:read` and read access; the other three
+need `rebuilds:write` and write access. The routes check, in this order:
+the scope (`403` `insufficient_scope`, whether or not the workspace
+exists), access (`404` `not_found` for a workspace the caller cannot read
+or an unknown slug, `403` `forbidden` for read access on a write route),
+the request (`400` `invalid_request`), the workspace's mode (`400`
+`workspace_mode_mismatch` unless it is `carry_patch`, also for a task
+fork), on the three write routes its status (`409` `workspace_busy` while
+it is `pending` or `cloning` or a reclone, archive or delete runs, `409`
+`workspace_not_ready` when `failed`, `409` `workspace_archived`), then the
+job: an id that is not a UUID, names no job, or names a job of another
+workspace is `404` `not_found` with the message `rebuild job not found`.
+The two `GET` routes answer in every workspace status.
+
+## `POST /api/v1/workspaces/{slug}/rebuild`
+
+Queues a rebuild. The body is optional: no body, an empty one and `{}`
+are alike.
+
+| Member | Type | Meaning |
+|---|---|---|
+| `strategy` | `rebase` \| `merge` \| `null` | omitted, `null` or `""`: the workspace setting `rebuild_strategy` |
+| `fail_mode` | `fail_fast` \| `continue` \| `null` | omitted, `null` or `""`: the workspace setting `rebuild_fail_mode` |
+
+The job captures the strategy, the fail mode and the workspace's
+integration branch; later changes of the settings do not change it.
+`submitted_by` is the caller's user id. The hub stores the job and
+`parley.rebuild.enqueue` in one transaction, before it answers. The route
+takes `Idempotency-Key`: a repeat answers `200` with the first answer's
+body and queues nothing.
+
+| Status | When |
+|---|---|
+| `202 Accepted` | the rebuild job record, `status` `queued`, `retry_count` `0` |
+| `400` `invalid_request` | `strategy` or `fail_mode` is not a string or `null` (`strategy must be a string`), or not one of its values (`strategy must be one of ["rebase" "merge"], not "squash"`, `fail_mode must be one of ["fail_fast" "continue"], not "stop"`) |
+| `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
+| `400` `no_active_patches` | no patch is `active` or `conflict` (`workspace "<slug>" has no patch in active or conflict to rebuild`) |
+| `403` `insufficient_scope`, `forbidden`; `404` `not_found` | see [the common checks](#checks-common-to-the-five-routes) |
+| `409` `concurrent_rebuild` | a rebuild job of the workspace is `queued`, `running` or `failed` (`workspace "<slug>" has the rebuild job <id> queued, running or failed`) |
+| `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
+
+`parley.rebuild.enqueue` has the job as its resource (`resource_type`
+`rebuild`, `resource_id` the job id), the caller as actor and `metadata`
+`submitted_by`, `strategy`, `fail_mode` and `patch_count`, the number of
+patches in `active` or `conflict`. Every other source of a rebuild (a
+reset to origin, and later a sync, a push to a patch branch, a landing on
+one, a follow-up) queues through the same operation and writes the same
+event, but skips the `no_active_patches` check and, when a rebuild is
+already pending, queues nothing and writes nothing.
+
+## `GET /api/v1/workspaces/{slug}/rebuilds`
+
+The workspace's rebuild jobs as a [list](#lists) of job records, newest
+first: `created_at` descending, then `id` descending.
+
+| Query | Meaning |
+|---|---|
+| `status` | one of the six statuses, given once; any other value, an empty one or a repeat is `400` `invalid_request` (`status must be given once, as one of ["queued" "running" "failed" "completed" "dead_letter" "cancelled"]`) |
+| `limit`, `cursor` | as for every list |
+
+## `GET /api/v1/workspaces/{slug}/rebuilds/{id}`
+
+`200` with the job record. A `running` job shows the result its attempt
+last stored.
+
+## `DELETE /api/v1/workspaces/{slug}/rebuilds/{id}`
+
+Cancels a `queued` job: it becomes `cancelled` with `completed_at` set, in
+one transaction with `parley.rebuild.cancel` (the caller as actor, the job
+as resource, no `metadata`). A cancel and a worker's claim exclude each
+other: a cancelled job never runs.
+
+| Status | When |
+|---|---|
+| `200 OK` | the job record, `status` `cancelled` |
+| `409` `job_not_cancellable` | the job is not `queued`, also when a worker claimed it a moment earlier (`rebuild job <id> is not queued; only a queued job can be cancelled`) |
+
+## `POST /api/v1/workspaces/{slug}/rebuilds/{id}/requeue`
+
+Moves a `dead_letter` job back to `queued`: `retry_count` `0`, `error`,
+`conflict`, `next_attempt_at` and `completed_at` `null`, in one
+transaction with `parley.rebuild.requeue` (the caller as actor, the job as
+resource, no `metadata`). The job keeps its id, `created_at`, strategy,
+fail mode, integration branch and `submitted_by`. A body is ignored.
+
+| Status | When |
+|---|---|
+| `200 OK` | the job record, `status` `queued` |
+| `409` `job_not_requeueable` | the job is not `dead_letter`, whatever the other jobs are (`rebuild job <id> is not dead_letter; only a dead_letter job can be requeued`) |
+| `409` `concurrent_rebuild` | another rebuild job of the workspace is `queued`, `running` or `failed` |
+
 ## Source control reads
 
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's

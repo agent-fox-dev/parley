@@ -36,6 +36,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
 	"github.com/agent-fox-dev/parley/internal/policy"
@@ -82,6 +83,7 @@ var parts = []func(*Composition){
 	composeLandRules,
 	composeSandbox,
 	composeAwareness,
+	composeJobs,
 	composeCarryPatch,
 }
 
@@ -274,6 +276,12 @@ type Composition struct {
 	// changed its dependencies (AdjustAwareness).
 	awareness          *awareness.Component
 	awarenessAdjusters []func(*awareness.Deps)
+
+	// jobs is the durable job queue composeJobs creates and binds in its
+	// start hook (Jobs), after jobsAdjusters have changed its dependencies
+	// (AdjustJobs).
+	jobs          *jobs.Queue
+	jobsAdjusters []func(*jobs.Deps)
 
 	// carryPatch is the carry-patch component composeCarryPatch creates
 	// and binds in its start hook (CarryPatch), after carryPatchAdjusters

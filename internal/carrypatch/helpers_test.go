@@ -23,6 +23,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -688,4 +689,434 @@ func (e failingEmitter) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (e
 		return event.Record{}, errors.New("the event log refuses the write")
 	}
 	return e.Emitter.Emit(ctx, tx, in)
+}
+
+// rebuildHub is an addHub for the rebuild routes. Its job queue stamps jobs
+// with the hub's clock and passes only when a test calls pass: its
+// interval timer never fires and nothing wakes it. Its runner is the
+// handler of rebuild jobs: an attempt of a job a test scripted (drive)
+// does what the test says, any other completes at once. Its carry-patch
+// component writes events through an emitter the test can make fail.
+type rebuildHub struct {
+	*addHub
+	comp       *carrypatch.Component
+	queue      *jobs.Queue
+	runner     *rebuildRunner
+	failEvents atomic.Bool
+}
+
+// startRebuildHub starts a rebuild hub with an owner who holds an API key
+// and whose organization owns the workspaces it stores.
+func startRebuildHub(t *testing.T) *rebuildHub {
+	t.Helper()
+	h := &rebuildHub{
+		addHub: &addHub{readHub: &readHub{}, now: time.Now().UTC().Truncate(time.Second).Add(700 * time.Millisecond)},
+		runner: &rebuildRunner{attempts: map[string]*rebuildAttempt{}, calls: map[string]int{}, done: make(chan struct{})},
+	}
+	// The queue's timers never fire: the test does not advance its clock.
+	clock := hubtest.NewJobClock(h.clock)
+	h.Hub = hubtest.StartWith(t, hubtest.Config{
+		Now:  h.clock,
+		TOML: "[limits]\nrequests_per_minute = 0\n",
+		Compose: func(c *hub.Composition) {
+			h.comp, h.queue = c.CarryPatch(), c.Jobs()
+			h.queue.Register(carrypatch.RebuildJobType, h.runner)
+			c.AdjustJobs(func(d *jobs.Deps) { d.Clock, d.NoWake = clock, true })
+			c.AdjustCarryPatch(func(d *carrypatch.Deps) {
+				h.repoPath = d.RepoPath
+				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
+			})
+		},
+	})
+	// Registered after the hub's own clean-up, so it runs first: the
+	// attempts still running end before the hub's stop waits for them.
+	t.Cleanup(h.runner.stop)
+	// The dispatcher's own pass at its start could claim a test's first
+	// job; from here on only the test's passes do.
+	hubtest.WaitClosed(t, clock.Armed(jobs.DefaultInterval), "the job queue's first pass")
+	h.owner = h.CreateUser(t, "owner")
+	h.key = h.IssueKey(t, h.owner)
+	h.org = h.CreateOrg(t, "acme")
+	h.AddMember(t, h.org, h.owner)
+	return h
+}
+
+// carryWith stores the ready carry-patch workspace slug of the owner, whose
+// integration branch is deploy and whose stored settings are settings
+// (none when nil), holding one patch of the branch patch/<n> in each status
+// of statuses, in order.
+func (h *rebuildHub) carryWith(t *testing.T, slug string, settings map[string]string, statuses ...string) {
+	t.Helper()
+	h.add(t, slug, workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
+		w.IntegrationBranch = new("deploy")
+		if settings != nil {
+			w.Settings = map[string]json.RawMessage{}
+			for k, v := range settings {
+				w.Settings[k] = json.RawMessage(`"` + v + `"`)
+			}
+		}
+	})
+	var ps []carrypatch.Patch
+	for i, status := range statuses {
+		branch := fmt.Sprintf("patch/%d", i+1)
+		if status == carrypatch.StatusDeleted {
+			ps = append(ps, deletedPatch(slug, branch, at(10, 0)))
+			continue
+		}
+		p := livePatch(slug, branch, len(ps)+1)
+		p.Status = status
+		ps = append(ps, p)
+	}
+	h.put(t, ps...)
+}
+
+// configure stores settings among the settings of slug through the
+// workspace's update route.
+func (h *rebuildHub) configure(t *testing.T, slug string, settings map[string]string) {
+	t.Helper()
+	if status, raw := h.Call(t, http.MethodPatch, "/api/v1/workspaces/"+slug, h.key, map[string]any{"settings": settings}); status != http.StatusOK {
+		t.Fatalf("set the settings %v of %s = %d %s, want 200", settings, slug, status, raw)
+	}
+}
+
+// call sends method /api/v1+path with credential, body and the headers
+// header, and decodes the answer: a record is in patch.
+func (h *rebuildHub) call(t *testing.T, credential, method, path string, body any, header http.Header) answer {
+	t.Helper()
+	status, raw := h.CallWith(t, method, "/api/v1"+path, credential, body, header)
+	a := answer{status: status, raw: raw}
+	_ = json.Unmarshal(raw, &a)
+	_ = json.Unmarshal(raw, &a.patch)
+	return a
+}
+
+// submit sends POST /workspaces/<slug>/rebuild as the owner with body (nil
+// for none) and the headers header.
+func (h *rebuildHub) submit(t *testing.T, slug string, body any, header http.Header) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodPost, "/workspaces/"+slug+"/rebuild", body, header)
+}
+
+// readRebuild sends GET /workspaces/<slug>/rebuilds/<id> as the owner.
+func (h *rebuildHub) readRebuild(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodGet, "/workspaces/"+slug+"/rebuilds/"+id, nil, nil)
+}
+
+// cancel sends DELETE /workspaces/<slug>/rebuilds/<id> as the owner.
+func (h *rebuildHub) cancel(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodDelete, "/workspaces/"+slug+"/rebuilds/"+id, nil, nil)
+}
+
+// requeue sends POST /workspaces/<slug>/rebuilds/<id>/requeue as the owner.
+func (h *rebuildHub) requeue(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodPost, "/workspaces/"+slug+"/rebuilds/"+id+"/requeue", nil, nil)
+}
+
+// mustSubmit submits a rebuild of slug with no body, fails the test unless
+// the answer is 202, and returns the job's id.
+func (h *rebuildHub) mustSubmit(t *testing.T, slug string) string {
+	t.Helper()
+	a := h.submit(t, slug, nil, nil)
+	id, _ := a.patch["id"].(string)
+	if a.status != http.StatusAccepted || id == "" {
+		t.Fatalf("submit a rebuild of %s = %d %s, want 202 with the job", slug, a.status, a.raw)
+	}
+	return id
+}
+
+// queueRebuild queues a rebuild of slug through the shared enqueue, which
+// looks neither at the workspace's state nor for an active patch, and
+// returns the job's id.
+func (h *rebuildHub) queueRebuild(t *testing.T, slug string) string {
+	t.Helper()
+	res, err := h.comp.EnqueueRebuild(context.Background(), slug, carrypatch.RebuildOptions{ActorType: event.ActorSystem, SubmittedBy: event.ActorSystem})
+	if err != nil || !res.Queued {
+		t.Fatalf("queue a rebuild of %s = %+v, %v, want a queued job", slug, res, err)
+	}
+	return res.JobID
+}
+
+// setState stores status and the maintenance marker on the record of the
+// workspace slug, as a clone or a maintenance operation would leave it.
+func (h *readHub) setState(t *testing.T, slug string, status workspace.Status, marker workspace.Marker) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, maintenance = ? WHERE slug = ?`, status, marker, slug)
+		return err
+	}); err != nil {
+		t.Fatalf("set the state of %s: %v", slug, err)
+	}
+}
+
+// job is the stored job id.
+func (h *rebuildHub) job(t *testing.T, id string) jobs.Job {
+	t.Helper()
+	j, err := h.queue.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read the job %s: %v", id, err)
+	}
+	return j
+}
+
+// jobsOf are the rebuild jobs of slug, newest first.
+func (h *rebuildHub) jobsOf(t *testing.T, slug string) []jobs.Job {
+	t.Helper()
+	js, err := h.queue.List(context.Background(), carrypatch.RebuildJobType, slug, "", nil, 200)
+	if err != nil {
+		t.Fatalf("list the rebuild jobs of %s: %v", slug, err)
+	}
+	return js
+}
+
+// recordOf is the stored job id as the API shows a rebuild job.
+func (h *rebuildHub) recordOf(t *testing.T, id string) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(carrypatch.RebuildRecordOf(h.job(t, id)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// rebuildEvent is a stored parley.rebuild.* event.
+type rebuildEvent struct {
+	ResourceType, ResourceID, ActorType string
+	ActorID, SessionID                  *string
+	Metadata                            map[string]any
+}
+
+// rebuildEvents are the stored events of slug of type typ, oldest first.
+func (h *rebuildHub) rebuildEvents(t *testing.T, slug, typ string) []rebuildEvent {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT resource_type, resource_id, actor_type, actor_id, session_id, metadata
+FROM hub_events WHERE workspace = ? AND type = ? ORDER BY seq`, slug, typ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []rebuildEvent
+	for rows.Next() {
+		var e rebuildEvent
+		var meta string
+		if err := rows.Scan(&e.ResourceType, &e.ResourceID, &e.ActorType, &e.ActorID, &e.SessionID, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(meta), &e.Metadata); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// pass runs one pass of the job queue.
+func (h *rebuildHub) pass(t *testing.T) {
+	t.Helper()
+	if err := h.queue.Pass(context.Background()); err != nil {
+		t.Fatalf("pass the job queue: %v", err)
+	}
+}
+
+// drive moves the queued job id to status through the queue: a pass claims
+// it and its attempt runs on (running, until finish or the end of the
+// test), completes (completed), fails and waits for its retry (failed) or
+// fails for good (dead_letter); a cancel cancels it (cancelled).
+func (h *rebuildHub) drive(t *testing.T, id, status string) {
+	t.Helper()
+	switch status {
+	case jobs.StatusCancelled:
+		ctx := context.Background()
+		if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+			_, err := h.queue.Cancel(ctx, tx, id)
+			return err
+		}); err != nil {
+			t.Fatalf("cancel the job %s: %v", id, err)
+		}
+	case jobs.StatusRunning:
+		a := h.runner.expect(id)
+		// Ends with the test, unless the test finishes it first.
+		t.Cleanup(func() {
+			select {
+			case a.outcome <- nil:
+			default:
+			}
+		})
+		h.pass(t)
+		hubtest.WaitClosed(t, a.entered, "the attempt of the job "+id+" to begin")
+	case jobs.StatusCompleted:
+		h.attempt(t, id, nil)
+	case jobs.StatusFailed:
+		h.attempt(t, id, errors.New("the upstream is unreachable"))
+	case jobs.StatusDeadLetter:
+		h.attempt(t, id, jobs.Permanent(errors.New("the patch list cannot be applied")))
+	default:
+		t.Fatalf("drive the job %s to %s: not a status a test drives a job to", id, status)
+	}
+	h.wantStatus(t, id, status)
+}
+
+// attempt runs an attempt of the job id, queued or due for its retry, that
+// returns err, and waits until its outcome is settled.
+func (h *rebuildHub) attempt(t *testing.T, id string, err error) {
+	t.Helper()
+	a := h.runner.expect(id)
+	a.outcome <- err
+	h.pass(t)
+	hubtest.WaitClosed(t, a.entered, "the attempt of the job "+id+" to begin")
+	h.settled(t, a)
+}
+
+// fail runs n attempts of the job id that fail with a retryable error, and
+// moves the clock on to the next attempt after each: the job is then due
+// for that attempt with the retry count n.
+func (h *rebuildHub) fail(t *testing.T, id string, n int) {
+	t.Helper()
+	for range n {
+		h.attempt(t, id, errors.New("fetch failed"))
+		h.advance(h.job(t, id).NextAttemptAt.Sub(h.clock()))
+	}
+}
+
+// finish ends the running attempt of the job id, which drive started, with
+// err, and waits until its outcome is settled.
+func (h *rebuildHub) finish(t *testing.T, id string, err error) {
+	t.Helper()
+	a := h.runner.expect(id)
+	a.outcome <- err
+	h.settled(t, a)
+}
+
+// settled waits until the outcome of the attempt a is settled and the
+// settlement has committed: the store runs its write transactions one at a
+// time, in the order they are asked for, so an empty one asked for once
+// the settlement hook ran ends after the settlement.
+func (h *rebuildHub) settled(t *testing.T, a *rebuildAttempt) {
+	t.Helper()
+	hubtest.WaitClosed(t, a.settled, "the outcome of the attempt to be settled")
+	if err := h.Store.Tx(context.Background(), func(*sql.Tx) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantStatus fails the test unless the job id is in status.
+func (h *rebuildHub) wantStatus(t *testing.T, id, status string) {
+	t.Helper()
+	if got := h.job(t, id).Status; got != status {
+		t.Fatalf("the job %s is %s, want %s", id, got, status)
+	}
+}
+
+// rebuildRunner is the handler of rebuild jobs of the rebuild hub. An
+// attempt of a job expect scripted returns what the test sends on its
+// outcome, or nil once the runner stops; an attempt of any other job
+// completes at once, so that a pass a test runs for its own job does not
+// leave another test's job holding a worker. It counts the attempts of
+// every job.
+type rebuildRunner struct {
+	mu       sync.Mutex
+	attempts map[string]*rebuildAttempt
+	calls    map[string]int
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+// rebuildAttempt is the script of a job's attempt.
+type rebuildAttempt struct {
+	// outcome takes what the attempt returns.
+	outcome chan error
+	// entered is closed once the attempt has begun, settled once its
+	// outcome is being settled.
+	entered, settled         chan struct{}
+	enteredOnce, settledOnce sync.Once
+	// payload is the payload the attempt was given.
+	payload json.RawMessage
+}
+
+// expect scripts the attempt of the job id, and returns its script: that
+// of the attempt scripted last, unless it has been settled, when it scripts
+// the next.
+func (r *rebuildRunner) expect(id string) *rebuildAttempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.attempts[id]
+	if ok {
+		select {
+		case <-a.settled:
+			ok = false
+		default:
+		}
+	}
+	if !ok {
+		a = &rebuildAttempt{outcome: make(chan error, 1), entered: make(chan struct{}), settled: make(chan struct{})}
+		r.attempts[id] = a
+	}
+	return a
+}
+
+// scripted is the script of the job id, nil when it has none.
+func (r *rebuildRunner) scripted(id string) *rebuildAttempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.attempts[id]
+}
+
+// payloadOf is the payload the attempt of the scripted job id was given.
+func (r *rebuildRunner) payloadOf(id string) json.RawMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if a := r.attempts[id]; a != nil {
+		return a.payload
+	}
+	return nil
+}
+
+// callsOf is the number of attempts of the job id the runner was called
+// for.
+func (r *rebuildRunner) callsOf(id string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[id]
+}
+
+// stop ends every attempt still running.
+func (r *rebuildRunner) stop() { r.stopOnce.Do(func() { close(r.done) }) }
+
+func (r *rebuildRunner) Run(ctx context.Context, j jobs.Job) error {
+	r.mu.Lock()
+	r.calls[j.ID]++
+	a := r.attempts[j.ID]
+	if a != nil {
+		a.payload = j.Payload
+	}
+	r.mu.Unlock()
+	if a == nil {
+		return nil
+	}
+	a.enteredOnce.Do(func() { close(a.entered) })
+	select {
+	case err := <-a.outcome:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.done:
+		return nil
+	}
+}
+
+func (r *rebuildRunner) Settled(_ context.Context, _ *sql.Tx, j jobs.Job, _ bool) error {
+	if a := r.scripted(j.ID); a != nil {
+		a.settledOnce.Do(func() { close(a.settled) })
+	}
+	return nil
 }
