@@ -23,9 +23,10 @@ import (
 // by finish.
 //
 // A target that moved between the replay and the compare-and-swap has the
-// changes built again on its new head and the swap tried again, each try
-// counted in attempts, until Deps.MaxAttempts tries lost, which ends the
-// attempt failed contention.
+// changes built again on its new head, the target guards asked again about
+// the head built, and the swap tried again, each try counted in attempts,
+// until Deps.MaxAttempts tries lost, which ends the attempt failed
+// contention.
 //
 // An error that leaves the attempt without a final status is returned:
 // one after the target moved leaves it running, since only the record of
@@ -54,7 +55,8 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 		a.Status, a.Blocked = StatusBlocked, blocked
 		return c.end(ctx, a)
 	}
-	for guarded := false; ; {
+	// judged is the head the target guards last allowed the move to.
+	for judged := ""; ; {
 		a.Attempts++
 		onto, found, err := repo.ResolveBranch(ctx, a.TargetBranch)
 		if err == nil && !found {
@@ -73,10 +75,11 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 			a.Status, a.Conflict = StatusConflict, report
 			return c.end(ctx, a)
 		}
-		if !guarded {
-			// The target guards judge the move once: a retry on a moved
-			// target makes the same land.
-			guarded = true
+		if b.head != judged {
+			// The target guards judge every head the land would swap in:
+			// a guard may act on the head it allows, as carry-patch push
+			// control forwards it to origin, so a head rebuilt on a target
+			// that moved since is a move they were not asked about.
 			stop, err := c.judgeTarget(ctx, a, b)
 			if err != nil {
 				return c.fail(ctx, a, err)
@@ -84,6 +87,7 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 			if stop != nil {
 				return c.end(ctx, *stop)
 			}
+			judged = b.head
 		}
 		if c.seams.beforeSwap != nil {
 			c.seams.beforeSwap(ctx, a.ID, a.Attempts)

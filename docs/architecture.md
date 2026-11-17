@@ -4581,10 +4581,11 @@ the result to `commit` (`commit.go`). A `commit` that
 finds the target moved since it was read starts the next try on the new
 head; when the last try lost, the attempt ends `failed` `contention`. A
 gate, store or git error other than a conflict ends it `failed`
-`internal` and is returned to the engine's caller. On the first try,
-once the build did not conflict, `judgeTarget` asks each target guard
-(`TargetGuard.Check` with the workspace, the branch, the head read and the
-built head): a refusal ends the attempt `blocked` with `blocked` the top
+`internal` and is returned to the engine's caller. On each try whose
+build did not conflict and made a head the guards have not allowed yet
+(the first, and each retry on a moved target), `judgeTarget` asks each
+target guard (`TargetGuard.Check` with the workspace, the branch, the head
+read and the built head) before the swap: a refusal ends the attempt `blocked` with `blocked` the top
 change, status `blocked`, no requirements and the guard's reason for the
 event, an origin rejection `failed` `origin_rejected` (its message
 logged), and an error or a panic `failed` `internal`. Every final status

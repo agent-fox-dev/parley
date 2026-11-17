@@ -178,15 +178,18 @@ is not the attempt's, which ends with the attempt, but one that ends when
 the hub's stop begins, as the post-push listener's does. A land that moved
 nothing (`before` equal to `after`) triggers nothing.
 
-## A land retried on a moved target is not judged again
+## A land retried on a moved target is judged again
 
-Package 25 asks the target guards once per attempt, after the first replay,
-and a retry on a target that moved meanwhile replays the changes onto the
-new head and swaps it without asking them again. With
+Package 25 asks the target guards after the replay and before the first
+compare-and-swap, and says nothing of a retry on a target that moved
+meanwhile, which replays the changes onto the new head and swaps that. With
 `patch_branch_source` `origin` and `push_patches_to_origin` `true` the
-guard forwards the first replay's head to origin; when the patch branch
-moves between that forward and the compare-and-swap (a sync's origin
-refresh, a reset to origin), the retry lands a head origin never received.
-The guard cannot see the retry, so the fix belongs to the landing's retry
-loop, which must ask the target guards again for the new head; it is
-tracked as an open item of this package.
+guard forwards the head it allows to origin; asked only once, it would let
+a retry swap in a head origin never received when the patch branch moved
+between the forward and the swap (a sync's origin refresh, a reset to
+origin). The guard cannot see the retry, so the landing's retry loop
+(`internal/land/engine.go`) asks the target guards again before it swaps
+in a head they have not allowed yet, and the retry ends as their answer
+says: a forward origin rejects, such as the non-fast-forward of a head
+rebuilt beside the one it took, ends the attempt `failed`
+`origin_rejected` with the target where the other writer left it.
