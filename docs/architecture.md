@@ -5220,9 +5220,11 @@ among them, `ErrNoUpstreamBase` when only the base was missing.
 copy by the clone work: it writes the branch with `SetRef`, so a branch of
 that name the clone brought from origin is replaced, and the clone logs its
 error. `EnsureSetup(ctx, w)` is the form for a ready workspace, for the
-rebuild and the sync: it creates the branch only when absent
+sync: it creates the branch only when absent
 (`CompareAndSwapRef(ref, id, "")`, `ErrRefMoved` leaving it), never moving
-one.
+one. `Setup.LeaveBranch` leaves the branch step out, as a rebuild's
+repeat of the set-up does: the rebuild writes the integration branch at
+its publish alone.
 
 **The patch list.** The `patches` table holds a row per patch (`Patch`):
 UUID id, `workspace_slug`, `branch_name`, `position` (NULL exactly when
@@ -5425,8 +5427,10 @@ and the hooks `BeforeRebuildPatch`, `BeforeRebuildPublish` and
 (`rebuild.go`), whose `rebuildRun` holds the attempt's state and runs its
 steps in order, each returning nil to go on or the attempt's outcome
 (completed, retryable, permanent, or ended when the workspace is gone):
-`start` (the workspace check through `admit`, `EnsureSetup`,
-`UpstreamBase`), `listPatches` and `build` (`rebuild_build.go`), `publish`
+`start` (the workspace check through `admit`, the set-up repeated with
+`LeaveBranch`, so the integration branch is not written before the
+publish, `UpstreamBase`; a set-up that fails while the attempt's context
+is cancelled is `shutdown`, not `upstream_fetch_failed`), `listPatches` and `build` (`rebuild_build.go`), `publish`
 (`rebuild_publish.go`), `push` (`rebuild_push.go`), `complete`, then
 `followUp` (`rebuild_followup.go`) after a completion or a `fail_fast`
 conflict. Every git operation runs through `RunGit` under
@@ -5434,8 +5438,8 @@ conflict. Every git operation runs through `RunGit` under
 of the whole `rebuildResult`, so the result is kept in memory and written
 after each patch. `Run` maps the outcome to `nil`, a plain error,
 `jobs.Permanent` or `jobs.WithDetail(jobs.Permanent(…), report)`, its text
-scrubbed with the attempt's credential values, and keeps it by job id for
-`Settled`, which writes `parley.rebuild.complete` or `parley.rebuild.fail`
+and reason scrubbed with the attempt's credential values, and keeps it,
+without those values, by job id for `Settled`, which writes `parley.rebuild.complete` or `parley.rebuild.fail`
 and `parley.rebuild.followup` in the settlement's transaction; a
 settlement without a kept outcome (a panic) is reason `git_error`.
 
@@ -5455,9 +5459,11 @@ with automatic staging set per command (`rerere.go`), never in the
 repository's configuration file; the resolutions live in the bare
 repository's own `rr-cache`, so they are per workspace and go with a
 reclone. A conflict's id↔path pairs are read from `MERGE_RR` before the
-tree is reset. `(*Repo).ConflictFiles(ctx, target, commit, paths)`
-(`trial.go`) describes a report's files with `git merge-tree` (base the
-commit's first parent). `BuildConflictReport` (`rebuild_conflict.go`)
+tree is reset. `(*Repo).ConflictFiles(ctx, base, target, commit, paths)`
+(`trial.go`) describes a report's files with `git merge-tree` over the
+three-way base the caller names: `BuildConflictReport` gives the first
+parent of the commit that did not apply for `rebase`, the merge base of
+the source and the target for `merge` (`PatchConflict.Merge`). `BuildConflictReport` (`rebuild_conflict.go`)
 builds the report, `ConflictReport` (`patch_id` plus the hub's
 `gitrepo.ConflictReport`), which the rebuild preview is meant to share.
 
@@ -5473,9 +5479,10 @@ remembered resolutions builds on. `RemoveRerereEntries` is a remover of
 owned data (ADR 07), and `PostClone` deletes the workspace's entries
 before the set-up, since a fresh clone starts with an empty `rr-cache`.
 
-The publish is one `Store.Tx`: the patch-list changes and their events
-are written, then the workspace is checked through the transaction and
-the compare-and-swap made; an error, `gitrepo.ErrRefMoved` included,
+The publish reads the integration branch's head, then opens one
+`Store.Tx`: the patch-list changes and their events are written, then the
+workspace is checked through the transaction and the compare-and-swap
+against the head read made; an error, `gitrepo.ErrRefMoved` included,
 rolls the transaction back. The job's heads are stored by `SetResult`
 right after the commit, because `SetResult` opens a transaction of its
 own. The push uses `gitrepo.Git.Push` with `Force` and an explicit

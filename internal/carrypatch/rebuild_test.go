@@ -10,11 +10,15 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,7 +47,8 @@ const (
 // whose branch main holds one commit at the start, its origin another one
 // that takes pushes, and its copy a bare repository made by git init that
 // the set-up gave the upstream's branches and the integration branch deploy
-// at the upstream base. The hub's job queue passes only when the test runs
+// at the upstream base; the record's head_sha is that base too, as a clone
+// of an origin at the upstream's head would leave it. The hub's job queue passes only when the test runs
 // an attempt, and its rebuild jobs run the hub's rebuild attempt.
 type rebuildFixture struct {
 	*addHub
@@ -58,6 +63,9 @@ type rebuildFixture struct {
 	secrets    *rebuildSecrets
 	runner     *attemptRunner
 	hooks      rebuildHooks
+	// stopFetch, once set, makes every upstream fetch cancel the attempt
+	// that runs and fail with its context's error.
+	stopFetch atomic.Bool
 }
 
 // rebuildHooks are what a test runs at the points of an attempt the
@@ -141,8 +149,21 @@ func startRebuildFixtureWith(t *testing.T, deps func(d *carrypatch.Deps), edit .
 // configuration given toml, after its [server] section.
 func startRebuildFixtureOn(t *testing.T, toml string, deps func(d *carrypatch.Deps), edit ...func(w *workspace.Workspace)) *rebuildFixture {
 	t.Helper()
+	return startRebuildFixtureFrom(t, nil, toml, deps, edit...)
+}
+
+// startRebuildFixtureFrom is startRebuildFixtureOn with the upstream's
+// first commit holding files, when it is not nil, rather than the test
+// origin's own file.
+func startRebuildFixtureFrom(t *testing.T, files map[string]string, toml string, deps func(d *carrypatch.Deps), edit ...func(w *workspace.Workspace)) *rebuildFixture {
+	t.Helper()
 	up := gitrepotest.NewOrigin(t)
-	up.Commit("main", "U1")
+	var u1 string
+	if files == nil {
+		u1 = up.Commit("main", "U1")
+	} else {
+		u1 = up.Branch("main", gitrepotest.Commit(t, up.Dir(), "U1", files))
+	}
 	origin := gitrepotest.SmartOrigin(t)
 	bundle := filepath.Join(t.TempDir(), "ca-bundle.pem")
 	var pems []byte
@@ -180,6 +201,15 @@ func startRebuildFixtureOn(t *testing.T, toml string, deps func(d *carrypatch.De
 				d.Secrets = f.secrets
 				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+bundle)
 				d.BeforeRebuildPatch, d.BeforeRebuildPublish, d.BeforeRebuildSwap = f.hooks.patch, f.hooks.publish, f.hooks.swap
+				g := d.Git
+				d.FetchRemote = func(ctx context.Context, dir, url, name string, cred gitrepo.Credential, deadline time.Duration) (map[string]string, error) {
+					if f.stopFetch.Load() {
+						f.runner.cancelAttempt()
+						<-ctx.Done()
+						return nil, ctx.Err()
+					}
+					return g.FetchRemote(ctx, dir, url, name, cred, deadline)
+				}
 				if deps != nil {
 					deps(d)
 				}
@@ -199,6 +229,7 @@ func startRebuildFixtureOn(t *testing.T, toml string, deps func(d *carrypatch.De
 			w.IntegrationBranch = new("deploy")
 			w.UpstreamURL = new(up.URL())
 			w.GitURL = new(origin.URL())
+			w.HeadSHA = new(u1)
 		},
 	}, edit...)...)
 	f.copy = f.repoPath(f.slug)
@@ -230,7 +261,7 @@ func (f *rebuildFixture) record(t *testing.T) workspace.Workspace {
 func (f *rebuildFixture) addPatch(t *testing.T, branch string, edit ...func(p *carrypatch.Patch)) carrypatch.Patch {
 	t.Helper()
 	file := strings.ReplaceAll(branch, "/", "-") + ".txt"
-	return f.putPatch(t, branch, commitFiles(t, f.copy, f.base, branch, map[string]string{file: branch + "\n"}), edit...)
+	return f.putPatch(t, branch, gitrepotest.Commit(t, f.copy, branch, map[string]string{file: branch + "\n"}, f.base), edit...)
 }
 
 // putPatch stores an active patch of branch at the end of the patch list,
@@ -262,7 +293,7 @@ func withStatus(status string, conflictFiles ...string) func(p *carrypatch.Patch
 // base.
 func (f *rebuildFixture) moveUpstream(t *testing.T, msg string, files map[string]string) string {
 	t.Helper()
-	return f.upstream.Branch("main", commitFiles(t, f.upstream.Dir(), f.upstream.Head("main"), msg, files))
+	return f.upstream.Branch("main", gitrepotest.Commit(t, f.upstream.Dir(), msg, files, f.upstream.Head("main")))
 }
 
 // stored is the stored patch id of the workspace.
@@ -398,18 +429,6 @@ func (f *rebuildFixture) patchResults(t *testing.T, id string) []map[string]any 
 	return results
 }
 
-// commitFiles writes into the repository dir a commit with the message msg
-// on parent ("" for a root commit) whose tree is parent's with the files,
-// at the top level, holding the content given, and returns its id.
-func commitFiles(t *testing.T, dir, parent, msg string, files map[string]string) string {
-	t.Helper()
-	args := []string{"commit-tree", treeWith(t, dir, parent, files), "-m", msg}
-	if parent != "" {
-		args = append(args, "-p", parent)
-	}
-	return gitrepotest.Git(t, dir, args...)
-}
-
 // commitAs writes into the repository dir a commit with the message msg,
 // the author line author (name <email> unix-time zone) and the parents
 // given, the first parent first, whose tree is the first parent's with the
@@ -421,42 +440,12 @@ func commitAs(t *testing.T, dir, msg, author string, files map[string]string, pa
 		first = parents[0]
 	}
 	var obj strings.Builder
-	obj.WriteString("tree " + treeWith(t, dir, first, files) + "\n")
+	obj.WriteString("tree " + gitrepotest.Tree(t, dir, first, files) + "\n")
 	for _, p := range parents {
 		obj.WriteString("parent " + p + "\n")
 	}
 	obj.WriteString("author " + author + "\ncommitter Origin <origin@example.invalid> 1500000000 +0000\n\n" + msg + "\n")
 	id, err := gitrepotest.Run(dir, obj.String(), "hash-object", "-t", "commit", "-w", "--stdin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id
-}
-
-// treeWith writes into the repository dir the tree of the commit parent
-// ("" for none) with the files, at the top level, holding the content
-// given, and returns its id.
-func treeWith(t *testing.T, dir, parent string, files map[string]string) string {
-	t.Helper()
-	entries := map[string]string{}
-	if parent != "" {
-		for line := range strings.Lines(gitrepotest.Git(t, dir, "ls-tree", parent)) {
-			meta, name, _ := strings.Cut(strings.TrimSuffix(line, "\n"), "\t")
-			entries[name] = meta
-		}
-	}
-	for name, content := range files {
-		blob, err := gitrepotest.Run(dir, content, "hash-object", "-w", "--stdin")
-		if err != nil {
-			t.Fatal(err)
-		}
-		entries[name] = "100644 blob " + blob
-	}
-	var tree strings.Builder
-	for _, name := range slices.Sorted(maps.Keys(entries)) {
-		fmt.Fprintf(&tree, "%s\t%s\n", entries[name], name)
-	}
-	id, err := gitrepotest.Run(dir, tree.String(), "mktree")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,6 +499,9 @@ type attemptRunner struct {
 	// cancel cancels the context of the attempt that runs, as a stop of the
 	// hub would.
 	cancel context.CancelFunc
+	// afterRun, when set, is called once an expected attempt has its
+	// outcome, before the job queue settles it.
+	afterRun func(j jobs.Job)
 }
 
 // cancelAttempt cancels the context of the attempt that runs.
@@ -570,6 +562,12 @@ func (r *attemptRunner) Run(ctx context.Context, j jobs.Job) error {
 	}
 	var err error
 	run.out, err = carrypatch.RunRebuild(ctx, r.comp, j)
+	r.mu.Lock()
+	after := r.afterRun
+	r.mu.Unlock()
+	if after != nil {
+		after(j)
+	}
 	return err
 }
 
@@ -584,6 +582,545 @@ func (r *attemptRunner) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, wil
 		run.atSettle(j)
 	}
 	return err
+}
+
+// visibleRefs maps every ref of the repository dir under refs/heads/,
+// refs/tags/ and refs/parley/, the refs a client sees or the hub keeps, by
+// its full name to its id. It fails no test, so that a hook may call it.
+func visibleRefs(dir string) (map[string]string, error) {
+	out, err := gitrepotest.Run(dir, "", "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", "refs/tags/", "refs/parley/")
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	for line := range strings.Lines(out) {
+		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
+		refs[name] = id
+	}
+	return refs, nil
+}
+
+// deleteNow archives the fixture's workspace and deletes it, with its jobs
+// and its copy, through the workspace's delete route. It fails no test, so
+// that a hook may call it.
+func (f *rebuildFixture) deleteNow() error {
+	if err := f.storeState(f.slug, workspace.StatusArchived, workspace.MarkerNone); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodDelete, f.URL("/api/v1/workspaces/"+f.slug), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+f.key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("DELETE /workspaces/%s = %d %s, want 204", f.slug, res.StatusCode, body)
+	}
+	return nil
+}
+
+// lastEvent is the sequence number of the newest stored event of the
+// fixture's workspace, 0 when there is none.
+func (f *rebuildFixture) lastEvent() (int64, error) {
+	var seq sql.NullInt64
+	err := f.Store.Main().QueryRow(`SELECT max(seq) FROM hub_events WHERE workspace = ?`, f.slug).Scan(&seq)
+	return seq.Int64, err
+}
+
+// recordingDescriber is a conflict-file describer that records every call
+// and returns, for each path it is given, a content entry whose ours and
+// theirs are the path's blobs in the two commits it is given.
+type recordingDescriber struct {
+	mu    sync.Mutex
+	calls []describeCall
+}
+
+// describeCall is one call of a conflict-file describer.
+type describeCall struct {
+	base, target, commit string
+	paths                []string
+}
+
+func (d *recordingDescriber) ConflictFiles(_ context.Context, repo *gitrepo.Repo, base, target, commit string, paths []string) ([]gitrepo.ConflictFile, error) {
+	d.mu.Lock()
+	d.calls = append(d.calls, describeCall{base, target, commit, slices.Clone(paths)})
+	d.mu.Unlock()
+	files := make([]gitrepo.ConflictFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, describedFile(repo.Dir(), target, commit, p))
+	}
+	return files, nil
+}
+
+// recorded are the calls the describer had.
+func (d *recordingDescriber) recorded() []describeCall {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.calls)
+}
+
+// describedFile is the entry the recording describer gives for path.
+func describedFile(dir, target, commit, path string) gitrepo.ConflictFile {
+	return gitrepo.ConflictFile{Path: path, Kind: gitrepo.ConflictContent, Ours: blobSide(dir, target, path), Theirs: blobSide(dir, commit, path)}
+}
+
+// blobSide is the file path of the commit rev of the repository dir as a
+// side of a conflict, nil when rev holds none.
+func blobSide(dir, rev, path string) *gitrepo.ConflictSide {
+	out, err := gitrepotest.Run(dir, "", "ls-tree", rev, "--", path)
+	if fields := strings.Fields(out); err == nil && len(fields) == 4 {
+		return &gitrepo.ConflictSide{SHA: fields[2], Mode: fields[0], Path: path}
+	}
+	return nil
+}
+
+// conflictFixture is the rebuild fixture with the recording describer,
+// whose upstream's main holds a.txt and b.txt of three lines each; cut is
+// that commit, in the copy too, which conflicting patches are cut from.
+type conflictFixture struct {
+	*rebuildFixture
+	describer *recordingDescriber
+	cut       string
+}
+
+// startConflictFixture starts the conflict fixture with the carry-patch
+// component's dependencies changed by deps, when it is not nil.
+func startConflictFixture(t *testing.T, deps func(d *carrypatch.Deps)) *conflictFixture {
+	t.Helper()
+	desc := &recordingDescriber{}
+	f := startRebuildFixtureFrom(t, map[string]string{"a.txt": "1\n2\n3\n", "b.txt": "1\n2\n3\n"}, "", func(d *carrypatch.Deps) {
+		d.ConflictFiles = desc
+		if deps != nil {
+			deps(d)
+		}
+	})
+	return &conflictFixture{rebuildFixture: f, describer: desc, cut: f.base}
+}
+
+// conflictingPatch stores an active patch of branch, cut from the upstream's
+// main, of two commits: the first adds a file of its own, the second
+// changes line 3 of each of files, as moveOn does on upstream. It returns
+// the patch and its two commits.
+func (f *conflictFixture) conflictingPatch(t *testing.T, branch string, files ...string) (carrypatch.Patch, [2]string) {
+	t.Helper()
+	name := strings.ReplaceAll(branch, "/", "-")
+	first := gitrepotest.Commit(t, f.copy, name+" adds", map[string]string{name + ".txt": branch + "\n"}, f.cut)
+	changes := map[string]string{}
+	for _, file := range files {
+		changes[file] = "1\n2\n3 " + branch + "\n"
+	}
+	second := gitrepotest.Commit(t, f.copy, name+" changes", changes, first)
+	return f.putPatch(t, branch, second), [2]string{first, second}
+}
+
+// moveOn gives the upstream's main a commit that changes line 3 of a.txt
+// and b.txt, and returns it: the upstream base of the next attempt.
+func (f *conflictFixture) moveOn(t *testing.T) string {
+	t.Helper()
+	return f.moveUpstream(t, "U3", map[string]string{"a.txt": "1\n2\n3 upstream\n", "b.txt": "1\n2\n3 upstream\n"})
+}
+
+// continueRebase are the options of a rebuild by rebase that goes on past
+// a conflicting patch.
+var continueRebase = carrypatch.RebuildOptions{Strategy: new("rebase"), FailMode: new("continue")}
+
+// slowGitLimit is the per-operation limit of the attempt whose replay
+// sleeps: far below the filter's sleep, and above what any other git
+// operation of the attempt takes under load.
+const slowGitLimit = 5 * time.Second
+
+// slowFilter gives slow.txt, in the repository dir's own configuration, a
+// smudge filter that writes its process id to a file and then sleeps for a
+// minute, and returns that file.
+func slowFilter(t *testing.T, dir string) string {
+	t.Helper()
+	tmp := t.TempDir()
+	pid, script, attrs := filepath.Join(tmp, "pid"), filepath.Join(tmp, "slow.sh"), filepath.Join(tmp, "attributes")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho $$ > "+pid+"\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(attrs, []byte("slow.txt filter=slow\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, dir, "config", "core.attributesFile", attrs)
+	gitrepotest.Git(t, dir, "config", "filter.slow.smudge", script)
+	return pid
+}
+
+// waitGone waits for the process whose id the file pidFile holds to be
+// gone, and fails the test when it is still there after ten seconds: the
+// process sleeps for a minute unless it is killed.
+func waitGone(t *testing.T, pidFile string) {
+	t.Helper()
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("the filter of slow.txt did not run: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if !alive(pid) {
+			return
+		}
+	}
+	t.Errorf("the git child process %d is still alive after the attempt", pid)
+}
+
+// alive reports whether the process pid runs: one that exited and is not
+// yet reaped by its parent does not.
+func alive(pid int) bool {
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false
+	}
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	stat := strings.TrimSpace(string(out))
+	return err == nil && stat != "" && !strings.HasPrefix(stat, "Z")
+}
+
+// resolvedA is the content a.txt is resolved to.
+const resolvedA = "1\n2\n3 resolved\n"
+
+// seedResolution records in the repository dir the resolution of the
+// conflict that replaying commit onto onto meets, as a developer resolving
+// it once in a working tree of the repository with rerere on would: the
+// files of resolved get the content given, every other conflicted path is
+// left unresolved.
+func seedResolution(t *testing.T, dir, onto, commit string, resolved map[string]string) {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "seed")
+	gitrepotest.Git(t, dir, "worktree", "add", "--quiet", "--detach", wt, onto)
+	defer gitrepotest.Git(t, dir, "worktree", "remove", "--force", wt)
+	rerere := func(args ...string) error {
+		_, err := gitrepotest.Run(filepath.Join(dir, "worktrees", "seed"), "", append([]string{"-C", wt, "-c", "rerere.enabled=true"}, args...)...)
+		return err
+	}
+	if err := rerere("cherry-pick", "--no-commit", commit); err == nil {
+		t.Fatalf("%s applies onto %s; want a conflict to resolve", commit, onto)
+	}
+	for name, content := range resolved {
+		if err := os.WriteFile(filepath.Join(wt, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rerere("rerere"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fetch fetches the upstream into the hub's copy, as an attempt would.
+func (f *conflictFixture) fetch(t *testing.T) {
+	t.Helper()
+	if err := f.comp.EnsureSetup(context.Background(), f.record(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// entries are the remembered-resolution entries of the fixture's workspace.
+func (f *conflictFixture) entries(t *testing.T) []carrypatch.RerereEntry {
+	t.Helper()
+	e, err := f.comp.RerereEntries(context.Background(), f.slug)
+	if err != nil {
+		t.Fatalf("the remembered-resolution entries of %s: %v", f.slug, err)
+	}
+	return e
+}
+
+// rrCacheIDs are the ids of the conflicts the rr-cache of the repository
+// dir holds.
+func rrCacheIDs(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "rr-cache"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, e := range entries {
+		ids = append(ids, e.Name())
+	}
+	return ids
+}
+
+// sameEntries reports whether got are the entries want.
+func sameEntries(got, want []carrypatch.RerereEntry) bool {
+	return slices.EqualFunc(got, want, func(a, b carrypatch.RerereEntry) bool {
+		return a.ID == b.ID && a.Path == b.Path && a.Resolved == b.Resolved && a.RecordedAt.Equal(b.RecordedAt)
+	})
+}
+
+// fileIn is the content of path in rev of the repository dir.
+func fileIn(t *testing.T, dir, rev, path string) string {
+	t.Helper()
+	return string(gitrepotest.Blob(t, dir, rev+":"+path))
+}
+
+// another is a second carry-patch workspace slug of the fixture's hub, set
+// up like the fixture's own, with its own copy, which the fixture's attempts
+// rebuild when they are run through it.
+func (f *conflictFixture) another(t *testing.T, slug string) *conflictFixture {
+	t.Helper()
+	w := f.record(t)
+	f.add(t, slug, workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(n *workspace.Workspace) {
+		n.IntegrationBranch, n.UpstreamURL, n.GitURL = w.IntegrationBranch, w.UpstreamURL, w.GitURL
+	})
+	g := &rebuildFixture{addHub: f.addHub, slug: slug, upstream: f.upstream, origin: f.origin,
+		copy: f.repoPath(slug), comp: f.comp, queue: f.queue, secrets: f.secrets, runner: f.runner}
+	gitrepotest.Git(t, g.copy, "init", "--quiet", "--bare", g.copy)
+	if err := g.comp.EnsureSetup(context.Background(), g.record(t)); err != nil {
+		t.Fatalf("set up the workspace %s: %v", slug, err)
+	}
+	g.base = refIn(g.copy, "refs/heads/deploy")
+	return &conflictFixture{rebuildFixture: g, describer: f.describer, cut: refIn(g.copy, "refs/remotes/upstream/main")}
+}
+
+// noScratchLeft fails the test when the repository dir holds a scratch
+// working tree, or a record of one.
+func noScratchLeft(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, gitrepo.ScratchParent))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("%s holds %q, want no entry", gitrepo.ScratchParent, names)
+	}
+	if got := gitrepotest.Git(t, dir, "worktree", "list", "--porcelain"); strings.Count(got, "worktree ") != 1 {
+		t.Errorf("git worktree list = %q, want the repository alone", got)
+	}
+}
+
+// job is the stored job id.
+func (f *rebuildFixture) job(t *testing.T, id string) jobs.Job {
+	t.Helper()
+	j, err := f.queue.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read the job %s: %v", id, err)
+	}
+	return j
+}
+
+// pushSetting is the workspace setting that makes a rebuild push its
+// integration branch to origin.
+const pushSetting = "rebuild_push_integration_branch"
+
+// pushOn is an edit of the workspace that turns the push of the integration
+// branch on.
+func pushOn(w *workspace.Workspace) {
+	w.Settings = map[string]json.RawMessage{pushSetting: json.RawMessage("true")}
+}
+
+// recordingPusher pushes as the hub does, through push, and keeps every
+// request it was given.
+type recordingPusher struct {
+	push func(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)
+	mu   sync.Mutex
+	reqs []gitrepo.PushRequest
+}
+
+// pushWith makes the component push through a recording pusher whose
+// pushes run fn, given the hub's git; nil is the hub's own push.
+func (p *recordingPusher) pushWith(fn func(g gitrepo.Git, ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)) func(d *carrypatch.Deps) {
+	return func(d *carrypatch.Deps) {
+		g := d.Git
+		if fn == nil {
+			fn = func(g gitrepo.Git, ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
+				return g.Push(ctx, req)
+			}
+		}
+		p.push = func(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) { return fn(g, ctx, req) }
+		d.Push = p.Push
+	}
+}
+
+func (p *recordingPusher) Push(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
+	p.mu.Lock()
+	p.reqs = append(p.reqs, req)
+	p.mu.Unlock()
+	return p.push(ctx, req)
+}
+
+// requests are the requests the pusher was given.
+func (p *recordingPusher) requests() []gitrepo.PushRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]gitrepo.PushRequest(nil), p.reqs...)
+}
+
+// setSettingNow stores value as the workspace setting name of the fixture's
+// workspace, as a caller changing the settings during an attempt would. It
+// fails no test, so that a hook may call it.
+func (f *rebuildFixture) setSettingNow(name string, value any) error {
+	ctx := context.Background()
+	return f.Store.Tx(ctx, func(tx *sql.Tx) error {
+		v, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE workspaces SET settings = json_set(settings, ?, json(?)) WHERE slug = ?`,
+			"$."+name, string(v), f.slug)
+		return err
+	})
+}
+
+// onOrigin gives origin's deploy a commit of the hub's copy on the upstream
+// base, which the hub records as origin's head of deploy when recorded is
+// set, and returns it.
+func (f *rebuildFixture) onOrigin(t *testing.T, recorded bool) string {
+	t.Helper()
+	x := gitrepotest.Commit(t, f.copy, "deployed elsewhere", map[string]string{"deployed.txt": "x\n"}, f.base)
+	gitrepotest.Git(t, f.copy, "push", "--quiet", f.origin.Dir(), x+":refs/heads/deploy")
+	if recorded {
+		gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/origin/deploy", x)
+	}
+	return x
+}
+
+// cleanUpdates are the events of updates that are parley.patch.update with
+// the reason rebuild_clean, of a patch a rebuild applied again.
+func cleanUpdates(updates []patchEvent) []patchEvent {
+	var out []patchEvent
+	for _, e := range updates {
+		if e.Metadata["reason"] == "rebuild_clean" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// resultMember is the member name of the job's result document doc, nil
+// when it has none or doc does not decode.
+func resultMember(doc []byte, name string) any {
+	m := map[string]any{}
+	_ = json.Unmarshal(doc, &m)
+	return m[name]
+}
+
+// position is the position p as a test prints it, "none" when nil.
+func position(p *int) string {
+	if p == nil {
+		return "none"
+	}
+	return fmt.Sprint(*p)
+}
+
+// followUpSettings is an edit of the workspace that stores the rebuild
+// options rebase and fail_fast and the two settings that decide which
+// stale inputs queue a follow-up rebuild.
+func followUpSettings(afterPush, afterSync bool) func(w *workspace.Workspace) {
+	return func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{
+			"rebuild_strategy":        json.RawMessage(`"rebase"`),
+			"rebuild_fail_mode":       json.RawMessage(`"fail_fast"`),
+			"auto_rebuild_after_push": json.RawMessage(boolJSON(afterPush)),
+			"auto_rebuild_after_sync": json.RawMessage(boolJSON(afterSync)),
+		}
+	}
+}
+
+func boolJSON(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// setRefNow points ref of the hub's copy at id, or deletes it when id is
+// "", as another writer would while an attempt runs. It fails no test
+// fatally, so that a hook may call it.
+func (f *rebuildFixture) setRefNow(t *testing.T, ref, id string) {
+	args := []string{"update-ref", ref, id}
+	if id == "" {
+		args = []string{"update-ref", "-d", ref}
+	}
+	if _, err := gitrepotest.Run(f.copy, "", args...); err != nil {
+		t.Errorf("git %v: %v", args, err)
+	}
+}
+
+// softDeleteNow deletes the patch id as a caller's removal would while an
+// attempt runs. It fails no test fatally, so that a hook may call it.
+func (f *rebuildFixture) softDeleteNow(t *testing.T, id string) {
+	ctx := context.Background()
+	err := f.Store.Tx(ctx, func(tx *sql.Tx) error {
+		p, found, err := carrypatch.ReadPatch(ctx, tx, f.slug, id)
+		if err != nil || !found {
+			return fmt.Errorf("read the patch: found %v, %w", found, err)
+		}
+		return carrypatch.MarkDeleted(ctx, tx, p, f.clock())
+	})
+	if err != nil {
+		t.Errorf("delete the patch %s: %v", id, err)
+	}
+}
+
+// rebuildJobs are the rebuild jobs of the fixture's workspace in status,
+// every one when status is "", newest first.
+func (f *rebuildFixture) rebuildJobs(t *testing.T, status string) []jobs.Job {
+	t.Helper()
+	js, err := f.queue.List(context.Background(), carrypatch.RebuildJobType, f.slug, status, nil, 200)
+	if err != nil {
+		t.Fatalf("list the rebuild jobs of %s: %v", f.slug, err)
+	}
+	return js
+}
+
+// payloadOf is the payload of the job j as a JSON object.
+func payloadOf(t *testing.T, j jobs.Job) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(j.Payload, &m); err != nil {
+		t.Fatalf("the payload of the job %s is not a JSON object: %v", j.ID, err)
+	}
+	return m
+}
+
+// checkFollowUp checks that the ended job id queued exactly one follow-up
+// rebuild, still queued, whose payload holds want, and wrote one
+// parley.rebuild.followup about id with the stale inputs given, and
+// returns the follow-up job.
+func (f *rebuildFixture) checkFollowUp(t *testing.T, id string, want map[string]any, stalePatches []any, upstreamStale bool) jobs.Job {
+	t.Helper()
+	queued := f.rebuildJobs(t, jobs.StatusQueued)
+	if len(queued) != 1 || queued[0].ID == id {
+		t.Fatalf("the queued rebuild jobs are %v, want one follow-up of %s", queued, id)
+	}
+	next := queued[0]
+	payload := payloadOf(t, next)
+	for k, v := range want {
+		if payload[k] != v {
+			t.Errorf("the follow-up's %s = %v, want %v", k, payload[k], v)
+		}
+	}
+	events := f.rebuildEvents(t, f.slug, carrypatch.EventRebuildFollowUp)
+	if len(events) != 1 {
+		t.Fatalf("%d parley.rebuild.followup events, want one", len(events))
+	}
+	e := events[0]
+	if e.ResourceType != "rebuild" || e.ResourceID != id || e.ActorType != event.ActorSystem || e.ActorID != nil {
+		t.Errorf("the event is about %s %s by %s %v, want rebuild %s by system", e.ResourceType, e.ResourceID, e.ActorType, e.ActorID, id)
+	}
+	meta := map[string]any{"follow_up_job_id": next.ID, "stale_patches": stalePatches, "upstream_stale": upstreamStale}
+	if !reflect.DeepEqual(e.Metadata, meta) {
+		t.Errorf("the event's metadata = %v, want %v", e.Metadata, meta)
+	}
+	return next
+}
+
+// show is the commit rev of the repository dir with the git log format
+// given.
+func show(t *testing.T, dir, rev, format string) string {
+	t.Helper()
+	return gitrepotest.Git(t, dir, "log", "-1", "--date=raw", "--format="+format, rev)
 }
 
 func TestRebuild_FetchesUpstreamAndRecordsBase(t *testing.T) {
@@ -674,21 +1211,30 @@ func TestRebuild_BaseFallsBackToWorkspaceDefaultBranch(t *testing.T) {
 
 func TestRebuild_UpstreamFailuresAreRetryable(t *testing.T) {
 	t.Parallel()
+	gone := func(t *testing.T, f *rebuildFixture) {
+		if err := os.RemoveAll(f.upstream.Dir()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unknown := func(t *testing.T, f *rebuildFixture) {
+		gitrepotest.Git(t, f.upstream.Dir(), "update-ref", "-d", "refs/heads/main")
+		f.upstream.Commit("trunk", "T1")
+		f.upstream.SetDefaultBranch("gone")
+	}
+	// stop makes the fetch stop the hub, as a stop during the fetch would,
+	// and fail with the cancelled context.
+	stop := func(t *testing.T, f *rebuildFixture) { f.stopFetch.Store(true) }
 	cases := []struct {
 		name   string
 		breaks func(t *testing.T, f *rebuildFixture)
-		reason string
+		// noDeploy deletes the integration branch before the attempt, which
+		// must not create it.
+		noDeploy bool
+		reason   string
 	}{
-		{"the upstream repository is gone", func(t *testing.T, f *rebuildFixture) {
-			if err := os.RemoveAll(f.upstream.Dir()); err != nil {
-				t.Fatal(err)
-			}
-		}, "upstream_fetch_failed"},
-		{"no upstream branch to start from", func(t *testing.T, f *rebuildFixture) {
-			gitrepotest.Git(t, f.upstream.Dir(), "update-ref", "-d", "refs/heads/main")
-			f.upstream.Commit("trunk", "T1")
-			f.upstream.SetDefaultBranch("gone")
-		}, "upstream_unknown"},
+		{"the upstream repository is gone and deploy does not exist", gone, true, "upstream_fetch_failed"},
+		{"no upstream branch to start from and deploy does not exist", unknown, true, "upstream_unknown"},
+		{"the hub stops during the fetch", stop, false, "shutdown"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -696,6 +1242,9 @@ func TestRebuild_UpstreamFailuresAreRetryable(t *testing.T) {
 			f := startRebuildFixture(t)
 			f.addPatch(t, "patch/1")
 			f.addPatch(t, "patch/2")
+			if tc.noDeploy {
+				gitrepotest.Git(t, f.copy, "update-ref", "-d", "refs/heads/deploy")
+			}
 			deploy := refIn(f.copy, "refs/heads/deploy")
 			patches := f.patchList(t)
 			tips := gitrepotest.Refs(t, f.copy, "refs/heads/patch/")
@@ -713,7 +1262,7 @@ func TestRebuild_UpstreamFailuresAreRetryable(t *testing.T) {
 				t.Errorf("upstream_head_sha = %v, want null", res["upstream_head_sha"])
 			}
 			if got := refIn(f.copy, "refs/heads/deploy"); got != deploy {
-				t.Errorf("deploy = %s, want it where it was, %s", got, deploy)
+				t.Errorf("deploy = %q, want it as it was, %q", got, deploy)
 			}
 			if got := f.patchList(t); !reflect.DeepEqual(got, patches) {
 				t.Errorf("the patches = %+v, want them as they were, %+v", got, patches)
@@ -763,7 +1312,7 @@ func TestRebuild_ListsPatchesInPositionOrder(t *testing.T) {
 	f := startRebuildFixture(t)
 	tips := map[string]string{}
 	for _, b := range []string{"p1", "p2", "p3", "p4"} {
-		tips[b] = commitFiles(t, f.copy, f.base, b, map[string]string{b + ".txt": b + "\n"})
+		tips[b] = gitrepotest.Commit(t, f.copy, b, map[string]string{b + ".txt": b + "\n"}, f.base)
 		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+b, tips[b])
 	}
 	// The list's order is not the order the patches were stored in.
@@ -787,65 +1336,6 @@ func TestRebuild_ListsPatchesInPositionOrder(t *testing.T) {
 	}
 }
 
-// visibleRefs maps every ref of the repository dir under refs/heads/,
-// refs/tags/ and refs/parley/, the refs a client sees or the hub keeps, by
-// its full name to its id. It fails no test, so that a hook may call it.
-func visibleRefs(dir string) (map[string]string, error) {
-	out, err := gitrepotest.Run(dir, "", "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", "refs/tags/", "refs/parley/")
-	if err != nil {
-		return nil, err
-	}
-	refs := map[string]string{}
-	for line := range strings.Lines(out) {
-		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
-		refs[name] = id
-	}
-	return refs, nil
-}
-
-// setStatusNow stores status on the fixture's workspace, as an archive or a
-// reclone would during an attempt. It fails no test, so that a hook may
-// call it.
-func (f *rebuildFixture) setStatusNow(status workspace.Status) error {
-	ctx := context.Background()
-	return f.Store.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ? WHERE slug = ?`, status, f.slug)
-		return err
-	})
-}
-
-// deleteNow archives the fixture's workspace and deletes it, with its jobs
-// and its copy, through the workspace's delete route. It fails no test, so
-// that a hook may call it.
-func (f *rebuildFixture) deleteNow() error {
-	if err := f.setStatusNow(workspace.StatusArchived); err != nil {
-		return err
-	}
-	req, err := http.NewRequest(http.MethodDelete, f.URL("/api/v1/workspaces/"+f.slug), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+f.key)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
-	if res.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("DELETE /workspaces/%s = %d %s, want 204", f.slug, res.StatusCode, body)
-	}
-	return nil
-}
-
-// lastEvent is the sequence number of the newest stored event of the
-// fixture's workspace, 0 when there is none.
-func (f *rebuildFixture) lastEvent() (int64, error) {
-	var seq sql.NullInt64
-	err := f.Store.Main().QueryRow(`SELECT max(seq) FROM hub_events WHERE workspace = ?`, f.slug).Scan(&seq)
-	return seq.Int64, err
-}
-
 func TestRebuild_WorkspaceLeavesReadyDuringRun(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -858,7 +1348,7 @@ func TestRebuild_WorkspaceLeavesReadyDuringRun(t *testing.T) {
 		{"archived before the second patch", func(t *testing.T, f *rebuildFixture, _ *int64) {
 			f.hooks.beforePatch(func(i int) {
 				if i == 1 {
-					if err := f.setStatusNow(workspace.StatusArchived); err != nil {
+					if err := f.storeState(f.slug, workspace.StatusArchived, workspace.MarkerNone); err != nil {
 						t.Errorf("archive the workspace: %v", err)
 					}
 				}
@@ -866,7 +1356,7 @@ func TestRebuild_WorkspaceLeavesReadyDuringRun(t *testing.T) {
 		}, attemptPermanent, "workspace_archived"},
 		{"recloned before the publish", func(t *testing.T, f *rebuildFixture, _ *int64) {
 			f.hooks.beforePublish(func() {
-				if err := f.setStatusNow(workspace.StatusCloning); err != nil {
+				if err := f.storeState(f.slug, workspace.StatusCloning, workspace.MarkerNone); err != nil {
 					t.Errorf("reclone the workspace: %v", err)
 				}
 			})

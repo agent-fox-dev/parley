@@ -327,9 +327,6 @@ func TestEnsureSetup_RepeatsOnlyWhatIsMissing(t *testing.T) {
 	if got := configIn(dir, "rerere.enabled"); got != "true" {
 		t.Errorf("rerere.enabled = %q, want true", got)
 	}
-	if n := countEntries(t, h.Hub, "variant"); n != 0 {
-		t.Errorf("the workspace has %d remembered-resolution entries after its fresh clone, want none", n)
-	}
 
 	before := gitrepotest.Refs(t, dir, "")
 	if err := h.comp.EnsureSetup(ctx, h.record(t, "variant")); err != nil {

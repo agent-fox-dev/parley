@@ -45,20 +45,23 @@ func (r *rebuildRun) publish(ctx context.Context) *attemptOutcome {
 		return attemptFailed(attemptRetryable, reasonGitError, errNotBound)
 	}
 	ref := "refs/heads/" + r.payload.IntegrationBranch
+	// The branch is read before the store transaction, which holds the
+	// store's one writer slot: the swap against what was read catches any
+	// move in between.
 	var previous string
-	var removed int
-	err := r.c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
-		previous = ""
-		err := r.git(ctx, func(ctx context.Context) error {
-			cur, found, err := r.repo.LookupRef(ctx, ref)
-			if found {
-				previous = cur.ID
-			}
-			return err
-		})
-		if err != nil {
-			return fmt.Errorf("read %s: %w", ref, err)
+	err := r.git(ctx, func(ctx context.Context) error {
+		cur, found, err := r.repo.LookupRef(ctx, ref)
+		if found {
+			previous = cur.ID
 		}
+		return err
+	})
+	if err != nil {
+		return r.failed(ctx, fmt.Errorf("rebuild of %s: publish: read %s: %w", r.ws.Slug, ref, err))
+	}
+	var removed int
+	err = r.c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
 		if removed, err = r.settlePatches(ctx, tx); err != nil {
 			return err
 		}

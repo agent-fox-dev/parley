@@ -3,11 +3,9 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net/http"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -15,41 +13,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// commitIn writes into the repository dir a commit with the message msg
-// and the parents given, the first parent first, whose tree is the first
-// parent's with the files, at the top level, holding the content given,
-// and returns its id.
-func commitIn(t *testing.T, dir, msg string, files map[string]string, parents ...string) string {
-	t.Helper()
-	entries := map[string]string{}
-	if len(parents) > 0 {
-		for line := range strings.Lines(gitrepotest.Git(t, dir, "ls-tree", parents[0])) {
-			meta, name, _ := strings.Cut(strings.TrimSuffix(line, "\n"), "\t")
-			entries[name] = meta
-		}
-	}
-	for name, content := range files {
-		blob, err := gitrepotest.Run(dir, content, "hash-object", "-w", "--stdin")
-		if err != nil {
-			t.Fatal(err)
-		}
-		entries[name] = "100644 blob " + blob
-	}
-	var tree strings.Builder
-	for _, name := range slices.Sorted(maps.Keys(entries)) {
-		fmt.Fprintf(&tree, "%s\t%s\n", entries[name], name)
-	}
-	treeID, err := gitrepotest.Run(dir, tree.String(), "mktree")
-	if err != nil {
-		t.Fatal(err)
-	}
-	args := []string{"commit-tree", treeID, "-m", msg}
-	for _, p := range parents {
-		args = append(args, "-p", p)
-	}
-	return gitrepotest.Git(t, dir, args...)
-}
 
 // startForkOfUpstream makes an upstream whose main is the commit made of
 // files, and an origin cloned from it whose branch of each entry of patches
@@ -61,7 +24,7 @@ func commitIn(t *testing.T, dir, msg string, files map[string]string, parents ..
 func startForkOfUpstream(t *testing.T, smart bool, files map[string]string, settings map[string]any, patches []forkPatch) (*workspaceHub, *gitrepotest.Origin, *gitrepotest.Origin, string) {
 	t.Helper()
 	up := gitrepotest.NewOrigin(t)
-	up.Branch("main", commitIn(t, up.Dir(), "u1", files))
+	up.Branch("main", gitrepotest.Commit(t, up.Dir(), "u1", files))
 	var origin *gitrepotest.Origin
 	if smart {
 		origin = gitrepotest.SmartOrigin(t)
@@ -71,7 +34,7 @@ func startForkOfUpstream(t *testing.T, smart bool, files map[string]string, sett
 	gitrepotest.Git(t, up.Dir(), "push", "--quiet", origin.Dir(), "refs/heads/main:refs/heads/main")
 	origin.Branch("main", "main")
 	for _, p := range patches {
-		origin.Branch(p.branch, commitIn(t, origin.Dir(), p.msg, p.files, origin.Head("main")))
+		origin.Branch(p.branch, gitrepotest.Commit(t, origin.Dir(), p.msg, p.files, origin.Head("main")))
 	}
 	h := startCarryPatchHub(t, origin, up)
 	body := map[string]any{"slug": "acme-fork", "git_url": origin.URL(), "workspace_mode": "carry_patch", "upstream_url": up.URL()}
@@ -128,7 +91,7 @@ func TestRebuild_PublishesAndPushes(t *testing.T) {
 		{"patch/two", "patch two", map[string]string{"two.txt": "two\n"}},
 		{"patch/three", "patch three", map[string]string{"three.txt": "three\n"}},
 	})
-	upstreamHead := up.Branch("main", commitIn(t, up.Dir(), "u2", map[string]string{"u2.txt": "u2\n"}, up.Head("main")))
+	upstreamHead := up.Branch("main", gitrepotest.Commit(t, up.Dir(), "u2", map[string]string{"u2.txt": "u2\n"}, up.Head("main")))
 
 	status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/acme-fork/patches", h.key, []map[string]any{
 		{"branch_name": "patch/one"}, {"branch_name": "patch/two"}, {"branch_name": "patch/three"},
@@ -208,7 +171,7 @@ func TestRebuild_ConflictThenLearnedResolution(t *testing.T) {
 	if status != http.StatusCreated || pid == "" {
 		t.Fatalf("register feature/a = %d %v, want 201 with a patch", status, p)
 	}
-	upstreamHead := up.Branch("main", commitIn(t, up.Dir(), "u2", map[string]string{"a.txt": "1\n2\n3 upstream\n"}, up.Head("main")))
+	upstreamHead := up.Branch("main", gitrepotest.Commit(t, up.Dir(), "u2", map[string]string{"a.txt": "1\n2\n3 upstream\n"}, up.Head("main")))
 	before := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/deploy")
 
 	status, job := h.forkCall(t, http.MethodPost, "/rebuild", nil)
@@ -236,7 +199,7 @@ func TestRebuild_ConflictThenLearnedResolution(t *testing.T) {
 	// leave it in the hub's repository.
 	const resolved = "1\n2\n3 feature and upstream\n"
 	tip := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/feature/a")
-	merge := commitIn(t, copyDir, "merge upstream into feature/a", map[string]string{"a.txt": resolved}, tip, upstreamHead)
+	merge := gitrepotest.Commit(t, copyDir, "merge upstream into feature/a", map[string]string{"a.txt": resolved}, tip, upstreamHead)
 	gitrepotest.Git(t, copyDir, "update-ref", "refs/heads/feature/a", merge, tip)
 	if status, job := h.forkCall(t, http.MethodPost, "/rebuilds/"+id+"/requeue", nil); status != http.StatusOK {
 		t.Fatalf("requeue = %d %v, want 200", status, job)

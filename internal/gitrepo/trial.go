@@ -315,16 +315,23 @@ func conflictKind(types []string, sides [4]*ConflictSide) string {
 // ConflictFiles describes the files of paths, the paths left in conflict
 // when the commit of the full id commit was applied onto the commit
 // target, for a conflict report: one entry per path, in byte order of
-// path. The entries are those of the three-way merge that replays commit
-// onto target, whose base is commit's first parent (the empty tree for a
-// root commit), ours the file in target and theirs the file in commit. A
-// path that merge reports no conflict for, such as one that conflicted only
-// because of other commits merged with commit, gets an entry whose sides
-// are read from those three commits.
-func (r *Repo) ConflictFiles(ctx context.Context, target, commit string, paths []string) ([]ConflictFile, error) {
+// path. The entries are those of the three-way merge of target and commit
+// whose base is the commit of the full id base, the empty tree when base
+// is "", ours the file in target and theirs the file in commit. The caller
+// names the base, since it depends on how commit was applied: a replayed
+// commit's base is its first parent, a merged one's the merge base of the
+// two sides. A path that merge reports no conflict for, such as one that
+// conflicted only because of other commits merged with commit, gets an
+// entry whose sides are read from those three commits.
+func (r *Repo) ConflictFiles(ctx context.Context, base, target, commit string, paths []string) ([]ConflictFile, error) {
 	target, commit, err := rangeEnds(target, commit)
 	if err != nil {
 		return nil, err
+	}
+	if base != "" {
+		if base, _, err = rangeEnds(base, commit); err != nil {
+			return nil, err
+		}
 	}
 	want := slices.Clone(paths)
 	slices.Sort(want)
@@ -332,14 +339,7 @@ func (r *Repo) ConflictFiles(ctx context.Context, target, commit string, paths [
 	if len(want) == 0 {
 		return []ConflictFile{}, nil
 	}
-	commits, err := r.ReadCommits(ctx, []string{commit})
-	if err != nil {
-		return nil, err
-	}
-	var base string
-	if parents := commits[0].Parents; len(parents) > 0 {
-		base = parents[0]
-	} else {
+	if base == "" {
 		tree, err := r.emptyTree(ctx)
 		if err != nil {
 			return nil, err

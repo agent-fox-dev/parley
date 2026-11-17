@@ -2,98 +2,18 @@ package carrypatch_test
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
-	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// pushSetting is the workspace setting that makes a rebuild push its
-// integration branch to origin.
-const pushSetting = "rebuild_push_integration_branch"
-
-// pushOn is an edit of the workspace that turns the push of the integration
-// branch on.
-func pushOn(w *workspace.Workspace) {
-	w.Settings = map[string]json.RawMessage{pushSetting: json.RawMessage("true")}
-}
-
-// recordingPusher pushes as the hub does, through push, and keeps every
-// request it was given.
-type recordingPusher struct {
-	push func(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)
-	mu   sync.Mutex
-	reqs []gitrepo.PushRequest
-}
-
-// pushWith makes the component push through a recording pusher whose
-// pushes run fn, given the hub's git; nil is the hub's own push.
-func (p *recordingPusher) pushWith(fn func(g gitrepo.Git, ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)) func(d *carrypatch.Deps) {
-	return func(d *carrypatch.Deps) {
-		g := d.Git
-		if fn == nil {
-			fn = func(g gitrepo.Git, ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
-				return g.Push(ctx, req)
-			}
-		}
-		p.push = func(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) { return fn(g, ctx, req) }
-		d.Push = p.Push
-	}
-}
-
-func (p *recordingPusher) Push(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error) {
-	p.mu.Lock()
-	p.reqs = append(p.reqs, req)
-	p.mu.Unlock()
-	return p.push(ctx, req)
-}
-
-// requests are the requests the pusher was given.
-func (p *recordingPusher) requests() []gitrepo.PushRequest {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]gitrepo.PushRequest(nil), p.reqs...)
-}
-
-// setSettingNow stores value as the workspace setting name of the fixture's
-// workspace, as a caller changing the settings during an attempt would. It
-// fails no test, so that a hook may call it.
-func (f *rebuildFixture) setSettingNow(name string, value any) error {
-	ctx := context.Background()
-	return f.Store.Tx(ctx, func(tx *sql.Tx) error {
-		v, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE workspaces SET settings = json_set(settings, ?, json(?)) WHERE slug = ?`,
-			"$."+name, string(v), f.slug)
-		return err
-	})
-}
-
-// onOrigin gives origin's deploy a commit of the hub's copy on the upstream
-// base, which the hub records as origin's head of deploy when recorded is
-// set, and returns it.
-func (f *rebuildFixture) onOrigin(t *testing.T, recorded bool) string {
-	t.Helper()
-	x := commitFiles(t, f.copy, f.base, "deployed elsewhere", map[string]string{"deployed.txt": "x\n"})
-	gitrepotest.Git(t, f.copy, "push", "--quiet", f.origin.Dir(), x+":refs/heads/deploy")
-	if recorded {
-		gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/origin/deploy", x)
-	}
-	return x
-}
 
 func TestRebuild_PushesTheIntegrationBranch(t *testing.T) {
 	t.Parallel()

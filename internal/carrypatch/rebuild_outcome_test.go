@@ -21,26 +21,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// noScratchLeft fails the test when the repository dir holds a scratch
-// working tree, or a record of one.
-func noScratchLeft(t *testing.T, dir string) {
-	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, gitrepo.ScratchParent))
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		var names []string
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Errorf("%s holds %q, want no entry", gitrepo.ScratchParent, names)
-	}
-	if got := gitrepotest.Git(t, dir, "worktree", "list", "--porcelain"); strings.Count(got, "worktree ") != 1 {
-		t.Errorf("git worktree list = %q, want the repository alone", got)
-	}
-}
-
 func TestRebuild_ScratchTreeIsAlwaysRemoved(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -116,8 +96,8 @@ func TestRebuild_DiscardsLeftoverScratchTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An earlier job stopped half-way through the replay of a commit.
-	ours := commitFiles(t, f.copy, f.base, "ours", map[string]string{"x.txt": "ours\n"})
-	theirs := commitFiles(t, f.copy, f.base, "theirs", map[string]string{"x.txt": "theirs\n"})
+	ours := gitrepotest.Commit(t, f.copy, "ours", map[string]string{"x.txt": "ours\n"}, f.base)
+	theirs := gitrepotest.Commit(t, f.copy, "theirs", map[string]string{"x.txt": "theirs\n"}, f.base)
 	left, err := repo.AddScratch(ctx, "an-earlier-job", ours)
 	if err != nil {
 		t.Fatal(err)
@@ -138,16 +118,6 @@ func TestRebuild_DiscardsLeftoverScratchTree(t *testing.T) {
 		t.Errorf("the leftover scratch working tree is still there: %v", err)
 	}
 	noScratchLeft(t, f.copy)
-}
-
-// job is the stored job id.
-func (f *rebuildFixture) job(t *testing.T, id string) jobs.Job {
-	t.Helper()
-	j, err := f.queue.Get(context.Background(), id)
-	if err != nil {
-		t.Fatalf("read the job %s: %v", id, err)
-	}
-	return j
 }
 
 func TestRebuild_CompletionRecordsCountsAndEmitsComplete(t *testing.T) {
@@ -359,6 +329,8 @@ func TestRebuild_FailureTextIsScrubbed(t *testing.T) {
 				f.secrets.set(name, value)
 			}
 			failing.Store(true)
+			var kept string
+			f.runner.afterRun = func(j jobs.Job) { kept = carrypatch.KeptOutcome(f.comp, j.ID) }
 
 			out, id := f.attempt(t, nil)
 			if out.Reason != "upstream_fetch_failed" {
@@ -371,6 +343,16 @@ func TestRebuild_FailureTextIsScrubbed(t *testing.T) {
 			for _, v := range tc.hidden {
 				if j.Error != nil && strings.Contains(*j.Error, v) {
 					t.Errorf("the job's error %q holds %q", *j.Error, v)
+				}
+			}
+			// The outcome outlives the attempt until its settlement, or for
+			// good when the job is deleted before it.
+			if kept == "" {
+				t.Errorf("no outcome was kept for the settlement of the job %s", id)
+			}
+			for _, v := range append([]string{"ghp_SECRETVALUE", "ghp_ORIGINVALUE"}, tc.hidden...) {
+				if strings.Contains(kept, v) {
+					t.Errorf("the outcome kept for the settlement %s holds %q", kept, v)
 				}
 			}
 			events := f.rebuildEvents(t, f.slug, carrypatch.EventRebuildFail)

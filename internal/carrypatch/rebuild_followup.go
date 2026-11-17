@@ -90,7 +90,8 @@ func (r *rebuildRun) followUp(ctx context.Context) *followUp {
 
 // staleInputs are the branch names of the patches whose tips moved since
 // the run listed them, in their present order, and whether the upstream
-// base moved since the run resolved it. What cannot be read is not stale.
+// base moved since the run resolved it. What cannot be read is not stale,
+// and is logged.
 func (r *rebuildRun) staleInputs(ctx context.Context) (stale []string, upstreamStale bool) {
 	if r.repo == nil {
 		return nil, false
@@ -116,9 +117,14 @@ func (r *rebuildRun) staleInputs(ctx context.Context) (stale []string, upstreamS
 			tip, found, err = r.repo.ResolveBranch(ctx, p.BranchName)
 			return err
 		})
+		if err != nil {
+			r.c.logger().Warn("rebuild could not read a patch branch for the follow-up",
+				"workspace", r.job.Workspace, "job_id", r.job.ID, "branch", p.BranchName, "error", err)
+			continue
+		}
 		// A branch deleted meanwhile is not stale: a delete queues no
 		// rebuild.
-		if err != nil || !found {
+		if !found {
 			continue
 		}
 		if source == nil || *source != tip {
@@ -126,7 +132,12 @@ func (r *rebuildRun) staleInputs(ctx context.Context) (stale []string, upstreamS
 		}
 	}
 	base, err := r.c.UpstreamBase(ctx, r.ws)
-	return stale, err == nil && base != r.base
+	if err != nil {
+		r.c.logger().Warn("rebuild could not resolve the upstream base for the follow-up",
+			"workspace", r.job.Workspace, "job_id", r.job.ID, "error", err)
+		return stale, false
+	}
+	return stale, base != r.base
 }
 
 // autoRebuildOn reports whether the effective boolean setting key of ws is

@@ -3,7 +3,6 @@ package carrypatch
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
@@ -154,7 +153,7 @@ func (r *rebuildRun) pushFailed(ctx context.Context, err error) {
 		_, err := r.c.d.Events.Emit(ctx, tx, in)
 		return err
 	})
-	if werr != nil && !errors.Is(werr, context.Canceled) {
+	if werr != nil {
 		r.c.logger().Warn("rebuild could not report its failed push",
 			"workspace", slug, "job_id", r.job.ID, "error", werr)
 	}

@@ -2,121 +2,18 @@ package carrypatch_test
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
-	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/jobs"
-	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// followUpSettings is an edit of the workspace that stores the rebuild
-// options rebase and fail_fast and the two settings that decide which
-// stale inputs queue a follow-up rebuild.
-func followUpSettings(afterPush, afterSync bool) func(w *workspace.Workspace) {
-	return func(w *workspace.Workspace) {
-		w.Settings = map[string]json.RawMessage{
-			"rebuild_strategy":        json.RawMessage(`"rebase"`),
-			"rebuild_fail_mode":       json.RawMessage(`"fail_fast"`),
-			"auto_rebuild_after_push": json.RawMessage(boolJSON(afterPush)),
-			"auto_rebuild_after_sync": json.RawMessage(boolJSON(afterSync)),
-		}
-	}
-}
-
-func boolJSON(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
-}
-
-// setRefNow points ref of the hub's copy at id, or deletes it when id is
-// "", as another writer would while an attempt runs. It fails no test
-// fatally, so that a hook may call it.
-func (f *rebuildFixture) setRefNow(t *testing.T, ref, id string) {
-	args := []string{"update-ref", ref, id}
-	if id == "" {
-		args = []string{"update-ref", "-d", ref}
-	}
-	if _, err := gitrepotest.Run(f.copy, "", args...); err != nil {
-		t.Errorf("git %v: %v", args, err)
-	}
-}
-
-// softDeleteNow deletes the patch id as a caller's removal would while an
-// attempt runs. It fails no test fatally, so that a hook may call it.
-func (f *rebuildFixture) softDeleteNow(t *testing.T, id string) {
-	ctx := context.Background()
-	now := f.clock().UnixNano()
-	err := f.Store.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE patches SET status = ?, position = NULL, deleted_at = ?, updated_at = ?
-WHERE workspace_slug = ? AND id = ?`, carrypatch.StatusDeleted, now, now, f.slug, id)
-		return err
-	})
-	if err != nil {
-		t.Errorf("delete the patch %s: %v", id, err)
-	}
-}
-
-// rebuildJobs are the rebuild jobs of the fixture's workspace in status,
-// every one when status is "", newest first.
-func (f *rebuildFixture) rebuildJobs(t *testing.T, status string) []jobs.Job {
-	t.Helper()
-	js, err := f.queue.List(context.Background(), carrypatch.RebuildJobType, f.slug, status, nil, 200)
-	if err != nil {
-		t.Fatalf("list the rebuild jobs of %s: %v", f.slug, err)
-	}
-	return js
-}
-
-// payloadOf is the payload of the job j as a JSON object.
-func payloadOf(t *testing.T, j jobs.Job) map[string]any {
-	t.Helper()
-	var m map[string]any
-	if err := json.Unmarshal(j.Payload, &m); err != nil {
-		t.Fatalf("the payload of the job %s is not a JSON object: %v", j.ID, err)
-	}
-	return m
-}
-
-// checkFollowUp checks that the ended job id queued exactly one follow-up
-// rebuild, still queued, whose payload holds want, and wrote one
-// parley.rebuild.followup about id with the stale inputs given, and
-// returns the follow-up job.
-func (f *rebuildFixture) checkFollowUp(t *testing.T, id string, want map[string]any, stalePatches []any, upstreamStale bool) jobs.Job {
-	t.Helper()
-	queued := f.rebuildJobs(t, jobs.StatusQueued)
-	if len(queued) != 1 || queued[0].ID == id {
-		t.Fatalf("the queued rebuild jobs are %v, want one follow-up of %s", queued, id)
-	}
-	next := queued[0]
-	payload := payloadOf(t, next)
-	for k, v := range want {
-		if payload[k] != v {
-			t.Errorf("the follow-up's %s = %v, want %v", k, payload[k], v)
-		}
-	}
-	events := f.rebuildEvents(t, f.slug, carrypatch.EventRebuildFollowUp)
-	if len(events) != 1 {
-		t.Fatalf("%d parley.rebuild.followup events, want one", len(events))
-	}
-	e := events[0]
-	if e.ResourceType != "rebuild" || e.ResourceID != id || e.ActorType != event.ActorSystem || e.ActorID != nil {
-		t.Errorf("the event is about %s %s by %s %v, want rebuild %s by system", e.ResourceType, e.ResourceID, e.ActorType, e.ActorID, id)
-	}
-	meta := map[string]any{"follow_up_job_id": next.ID, "stale_patches": stalePatches, "upstream_stale": upstreamStale}
-	if !reflect.DeepEqual(e.Metadata, meta) {
-		t.Errorf("the event's metadata = %v, want %v", e.Metadata, meta)
-	}
-	return next
-}
 
 func TestRebuild_FollowUpAfterPublish(t *testing.T) {
 	t.Parallel()
@@ -151,8 +48,8 @@ func TestRebuild_FollowUpAfterPublish(t *testing.T) {
 			t.Parallel()
 			f := startRebuildFixture(t, followUpSettings(tc.afterPush, tc.afterSync))
 			p1 := f.addPatch(t, "feature/a")
-			moved := commitFiles(t, f.copy, f.base, "feature/a again", map[string]string{"feature-a.txt": "again\n"})
-			upstream := commitFiles(t, f.copy, f.base, "U2", map[string]string{"u2.txt": "u2\n"})
+			moved := gitrepotest.Commit(t, f.copy, "feature/a again", map[string]string{"feature-a.txt": "again\n"}, f.base)
+			upstream := gitrepotest.Commit(t, f.copy, "U2", map[string]string{"u2.txt": "u2\n"}, f.base)
 			f.hooks.beforePublish(func() {
 				if tc.change&deletePatch != 0 {
 					f.softDeleteNow(t, p1.ID)
@@ -202,7 +99,7 @@ func TestRebuild_FollowUpAfterFailFastConflict(t *testing.T) {
 	f := startConflictFixture(t, nil)
 	f.conflictingPatch(t, "feature/a", "a.txt")
 	f.moveOn(t)
-	applies := commitFiles(t, f.copy, f.cut, "feature/a without a.txt", map[string]string{"feature-a.txt": "feature/a\n"})
+	applies := gitrepotest.Commit(t, f.copy, "feature/a without a.txt", map[string]string{"feature-a.txt": "feature/a\n"}, f.cut)
 	f.hooks.beforePatch(func(i int) {
 		if i == 0 {
 			f.setRefNow(t, "refs/heads/feature/a", applies)
@@ -224,7 +121,7 @@ func TestRebuild_NoFollowUpAfterRetryableFailure(t *testing.T) {
 	f := startRebuildFixture(t)
 	f.addPatch(t, "feature/a")
 	tip := refIn(f.copy, "refs/heads/feature/a")
-	moved := commitFiles(t, f.copy, f.base, "feature/a again", map[string]string{"feature-a.txt": "again\n"})
+	moved := gitrepotest.Commit(t, f.copy, "feature/a again", map[string]string{"feature-a.txt": "again\n"}, f.base)
 	f.hooks.beforePatch(func(i int) {
 		if i != 0 {
 			return
@@ -273,7 +170,7 @@ func TestRebuild_DuplicateFollowUpIsSkippedSilently(t *testing.T) {
 				f.addPatch(t, "feature/a")
 			}
 			f.moveOn(t)
-			moved := commitFiles(t, f.copy, f.cut, "feature/a again", map[string]string{"feature-a.txt": "again\n"})
+			moved := gitrepotest.Commit(t, f.copy, "feature/a again", map[string]string{"feature-a.txt": "again\n"}, f.cut)
 			f.hooks.beforePatch(func(i int) {
 				if i == 0 {
 					f.setRefNow(t, "refs/heads/feature/a", moved)
@@ -305,5 +202,38 @@ func TestRebuild_DuplicateFollowUpIsSkippedSilently(t *testing.T) {
 				t.Errorf("parley.rebuild.followup events %v, want none", events)
 			}
 		})
+	}
+}
+
+func TestRebuild_UnreadableFollowUpInputsAreLogged(t *testing.T) {
+	t.Parallel()
+	log := &hubtest.LogBuffer{}
+	var copyDir string
+	f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
+		d.Logger = slog.New(slog.NewTextHandler(log, nil))
+		// The push, the last step before the check of the inputs, takes the
+		// hub's copy away, so that neither a branch tip nor the upstream base
+		// can be read.
+		d.Push = func(context.Context, gitrepo.PushRequest) (gitrepo.PushResult, error) {
+			return gitrepo.PushPushed, os.Rename(copyDir, copyDir+".away")
+		}
+	}, pushOn)
+	copyDir = f.copy
+	f.addPatch(t, "p1")
+
+	out, _ := f.attempt(t, nil)
+	if out.Kind != attemptCompleted {
+		t.Fatalf("the attempt = %+v, want completed", out)
+	}
+	if err := os.Rename(copyDir+".away", copyDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"rebuild could not read a patch branch for the follow-up", "rebuild could not resolve the upstream base for the follow-up"} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("the component's log does not say %q:\n%s", want, log.String())
+		}
+	}
+	if events := f.rebuildEvents(t, f.slug, carrypatch.EventRebuildFollowUp); len(events) != 0 {
+		t.Errorf("parley.rebuild.followup events %v, want none", events)
 	}
 }

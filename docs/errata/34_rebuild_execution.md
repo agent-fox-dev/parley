@@ -23,14 +23,34 @@ handler is `(*Component).RebuildHandler()`, registered by
 The package takes a report's file entries from "the conflict report
 component of `internal/land`". `internal/land` has no operation that makes
 file entries: it fills `landed_by` (`Attribute`), which a rebuild leaves
-`[]`. The entries are made by `(*gitrepo.Repo).ConflictFiles(ctx, target,
-commit, paths)`, built on the same `git merge-tree` reading every conflict
-report of the hub uses, with the commit's first parent as the three-way
-base (also with `merge`, where the commit is `source_sha`); a path the
-merge does not report is still described from the three commits. The
+`[]`. The entries are made by `(*gitrepo.Repo).ConflictFiles(ctx, base,
+target, commit, paths)`, built on the same `git merge-tree` reading every
+conflict report of the hub uses. The caller names the three-way base:
+with `rebase` the first parent of the commit that did not apply, with
+`merge` the merge base of `source_sha` and the target, the report's
+`base_sha` (`""` is the empty tree). A path the merge does not report is
+still described from the three commits. The describer interface
+`carrypatch.ConflictFileDescriber` takes the base too, and
+`carrypatch.PatchConflict.Merge` tells `BuildConflictReport` which base
+to give it. The
 hub wires it as `carrypatch.GitConflictFiles{}`, which is also used when
 `Deps.ConflictFiles` is nil. The report is `carrypatch.ConflictReport`,
 `patch_id` followed by the members of `gitrepo.ConflictReport`.
+
+## The set-up at the start of an attempt
+
+An attempt repeats the workspace's set-up (`Setup` of package 31: the
+record's default `integration_branch`, the upstream fetch, `rerere.enabled`)
+with `Setup.LeaveBranch` set, so it never writes the integration branch:
+`EnsureSetup` would create a missing one at the upstream base or
+`head_sha`, and the publish is the one write of the branch. An attempt
+that fails or stops at a conflict before the publish leaves a missing
+branch missing, and the publish that creates it reports
+`previous_integration_head_sha: null`. `EnsureSetup` itself, for its other
+callers, still creates a missing branch. A set-up that fails while the
+attempt's context is cancelled (the hub stops, the workspace is deleted)
+ends the attempt as `shutdown` (or with nothing written), not as
+`upstream_fetch_failed`.
 
 ## The rerere entries after a fresh clone
 
@@ -62,6 +82,11 @@ patch-list transaction commits. A reader at the swap sees neither; after
 the publish it sees both. A stop between the commit and `SetResult` leaves
 the job without the heads until its next attempt publishes again.
 
+The publish reads the integration branch's head before it opens that
+transaction, which holds the store's one writer slot; the swap, inside
+the transaction, is made against the head read, so a move in between
+still fails it with `ref_moved`.
+
 ## Order at the end of a run
 
 The stale-input check and the follow-up enqueue run after the counts are
@@ -70,7 +95,8 @@ stored, not between the push and the completion: the job is still
 attempt retryable after a follow-up was queued. Every patch the run
 listed that is not deleted is checked, whatever its status; a branch that
 was missing at the listing and exists now is stale, since its tip differs
-from the `null` the run recorded.
+from the `null` the run recorded. A branch tip or upstream base the check
+cannot read is logged and counts as not stale.
 
 ## A push cut off by a stop
 
@@ -84,8 +110,10 @@ again. Every other push failure emits the event and the job completes.
 
 The failure text stored as the job's `error` and the `reason` of the
 events pass through the hub's scrubber with the attempt's upstream and
-origin credential values. The `parley.rebuild.fail` event carries no
-message member. The conflict report is not scrubbed: it holds commit and
+origin credential values. The outcome the handler keeps from its `Run` to
+the job's settlement holds the scrubbed text and reason and not the
+values, since a job deleted before its settlement leaves it kept. The
+`parley.rebuild.fail` event carries no message member. The conflict report is not scrubbed: it holds commit and
 blob ids, modes and repository paths, and the scrubber's cut to 1024 bytes
 would make its JSON invalid.
 

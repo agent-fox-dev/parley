@@ -1,127 +1,20 @@
 package carrypatch_test
 
 import (
-	"context"
 	"encoding/json"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
-
-// recordingDescriber is a conflict-file describer that records every call
-// and returns, for each path it is given, a content entry whose ours and
-// theirs are the path's blobs in the two commits it is given.
-type recordingDescriber struct {
-	mu    sync.Mutex
-	calls []describeCall
-}
-
-// describeCall is one call of a conflict-file describer.
-type describeCall struct {
-	target, commit string
-	paths          []string
-}
-
-func (d *recordingDescriber) ConflictFiles(_ context.Context, repo *gitrepo.Repo, target, commit string, paths []string) ([]gitrepo.ConflictFile, error) {
-	d.mu.Lock()
-	d.calls = append(d.calls, describeCall{target, commit, slices.Clone(paths)})
-	d.mu.Unlock()
-	files := make([]gitrepo.ConflictFile, 0, len(paths))
-	for _, p := range paths {
-		files = append(files, describedFile(repo.Dir(), target, commit, p))
-	}
-	return files, nil
-}
-
-// recorded are the calls the describer had.
-func (d *recordingDescriber) recorded() []describeCall {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return slices.Clone(d.calls)
-}
-
-// describedFile is the entry the recording describer gives for path.
-func describedFile(dir, target, commit, path string) gitrepo.ConflictFile {
-	return gitrepo.ConflictFile{Path: path, Kind: gitrepo.ConflictContent, Ours: blobSide(dir, target, path), Theirs: blobSide(dir, commit, path)}
-}
-
-// blobSide is the file path of the commit rev of the repository dir as a
-// side of a conflict, nil when rev holds none.
-func blobSide(dir, rev, path string) *gitrepo.ConflictSide {
-	out, err := gitrepotest.Run(dir, "", "ls-tree", rev, "--", path)
-	if fields := strings.Fields(out); err == nil && len(fields) == 4 {
-		return &gitrepo.ConflictSide{SHA: fields[2], Mode: fields[0], Path: path}
-	}
-	return nil
-}
-
-// conflictFixture is the rebuild fixture with the recording describer,
-// whose upstream's main holds a.txt and b.txt of three lines each; cut is
-// that commit, in the copy too, which conflicting patches are cut from.
-type conflictFixture struct {
-	*rebuildFixture
-	describer *recordingDescriber
-	cut       string
-}
-
-// startConflictFixture starts the conflict fixture with the carry-patch
-// component's dependencies changed by deps, when it is not nil.
-func startConflictFixture(t *testing.T, deps func(d *carrypatch.Deps)) *conflictFixture {
-	t.Helper()
-	desc := &recordingDescriber{}
-	f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
-		d.ConflictFiles = desc
-		if deps != nil {
-			deps(d)
-		}
-	})
-	f.moveUpstream(t, "U2", map[string]string{"a.txt": "1\n2\n3\n", "b.txt": "1\n2\n3\n"})
-	if err := f.comp.EnsureSetup(context.Background(), f.record(t)); err != nil {
-		t.Fatal(err)
-	}
-	return &conflictFixture{rebuildFixture: f, describer: desc, cut: refIn(f.copy, "refs/remotes/upstream/main")}
-}
-
-// conflictingPatch stores an active patch of branch, cut from the upstream's
-// main, of two commits: the first adds a file of its own, the second
-// changes line 3 of each of files, as moveOn does on upstream. It returns
-// the patch and its two commits.
-func (f *conflictFixture) conflictingPatch(t *testing.T, branch string, files ...string) (carrypatch.Patch, [2]string) {
-	t.Helper()
-	name := strings.ReplaceAll(branch, "/", "-")
-	first := commitFiles(t, f.copy, f.cut, name+" adds", map[string]string{name + ".txt": branch + "\n"})
-	changes := map[string]string{}
-	for _, file := range files {
-		changes[file] = "1\n2\n3 " + branch + "\n"
-	}
-	second := commitFiles(t, f.copy, first, name+" changes", changes)
-	return f.putPatch(t, branch, second), [2]string{first, second}
-}
-
-// moveOn gives the upstream's main a commit that changes line 3 of a.txt
-// and b.txt, and returns it: the upstream base of the next attempt.
-func (f *conflictFixture) moveOn(t *testing.T) string {
-	t.Helper()
-	return f.moveUpstream(t, "U3", map[string]string{"a.txt": "1\n2\n3 upstream\n", "b.txt": "1\n2\n3 upstream\n"})
-}
-
-// continueRebase are the options of a rebuild by rebase that goes on past
-// a conflicting patch.
-var continueRebase = carrypatch.RebuildOptions{Strategy: new("rebase"), FailMode: new("continue")}
 
 func TestRebuild_ConflictUndoesThePatchAndMarksIt(t *testing.T) {
 	t.Parallel()
@@ -221,7 +114,13 @@ func TestRebuild_ConflictReportMembers(t *testing.T) {
 					t.Errorf("%s of the report = %v, want %v", k, rep[k], v)
 				}
 			}
-			if got, want := f.describer.recorded(), []describeCall{{target, commit, []string{"a.txt"}}}; !reflect.DeepEqual(got, want) {
+			// The three-way base the describer is given: the replayed commit's
+			// parent, or the merge base of a merged patch.
+			threeWay := commits[0]
+			if tc.strategy == "merge" {
+				threeWay = mergeBase
+			}
+			if got, want := f.describer.recorded(), []describeCall{{threeWay, target, commit, []string{"a.txt"}}}; !reflect.DeepEqual(got, want) {
 				t.Errorf("the describer's calls = %+v, want %+v", got, want)
 			}
 			raw, err := json.Marshal([]gitrepo.ConflictFile{describedFile(f.copy, target, commit, "a.txt")})
@@ -246,7 +145,9 @@ func TestRebuild_FailFastStopsAndPublishesNothing(t *testing.T) {
 	f.conflictingPatch(t, "feature/b", "a.txt")
 	p3 := f.addPatch(t, "p3")
 	f.moveOn(t)
-	before := refIn(f.copy, "refs/heads/deploy")
+	// A run that publishes nothing leaves a missing integration branch
+	// missing.
+	gitrepotest.Git(t, f.copy, "update-ref", "-d", "refs/heads/deploy")
 	stored := f.stored(t, p3.ID)
 
 	out, id := f.attemptWith(t, carrypatch.RebuildOptions{FailMode: new("fail_fast")}, nil)
@@ -273,8 +174,8 @@ func TestRebuild_FailFastStopsAndPublishesNothing(t *testing.T) {
 	if res["integration_head_sha"] != nil {
 		t.Errorf("integration_head_sha = %v, want null", res["integration_head_sha"])
 	}
-	if got := refIn(f.copy, "refs/heads/deploy"); got != before {
-		t.Errorf("deploy = %s, want it where it was, %s", got, before)
+	if got := refIn(f.copy, "refs/heads/deploy"); got != "" {
+		t.Errorf("deploy = %s, want it still missing", got)
 	}
 	if got := f.stored(t, p3.ID); !reflect.DeepEqual(got, stored) {
 		t.Errorf("p3 after the attempt = %+v, want it unchanged, %+v", got, stored)
@@ -355,7 +256,7 @@ func TestRebuild_NonConflictFailuresAreRetryable(t *testing.T) {
 			if tc.reason == "timeout" {
 				// The replay of p2 checks out slow.txt, whose filter sleeps.
 				pid = slowFilter(t, f.copy)
-				p2 = f.putPatch(t, "p2", commitFiles(t, f.copy, f.base, "p2", map[string]string{"slow.txt": "slow\n"}))
+				p2 = f.putPatch(t, "p2", gitrepotest.Commit(t, f.copy, "p2", map[string]string{"slow.txt": "slow\n"}, f.base))
 			} else {
 				p2 = f.addPatch(t, "p2")
 			}
@@ -384,57 +285,38 @@ func TestRebuild_NonConflictFailuresAreRetryable(t *testing.T) {
 	}
 }
 
-// slowGitLimit is the per-operation limit of the attempt whose replay
-// sleeps: far below the filter's sleep, and above what any other git
-// operation of the attempt takes under load.
-const slowGitLimit = 5 * time.Second
+func TestRebuild_MergeConflictFilesDescribeTheMergeBase(t *testing.T) {
+	t.Parallel()
+	f := startConflictFixture(t, func(d *carrypatch.Deps) { d.ConflictFiles = nil })
+	// The first commit of p1 meets upstream's change of a.txt; the second,
+	// the branch's tip, leaves a.txt alone.
+	first := gitrepotest.Commit(t, f.copy, "p1 changes", map[string]string{"a.txt": "1\n2\n3 p1\n"}, f.cut)
+	tip := gitrepotest.Commit(t, f.copy, "p1 adds", map[string]string{"p1.txt": "p1\n"}, first)
+	f.putPatch(t, "p1", tip)
+	target := f.moveOn(t)
 
-// slowFilter gives slow.txt, in the repository dir's own configuration, a
-// smudge filter that writes its process id to a file and then sleeps for a
-// minute, and returns that file.
-func slowFilter(t *testing.T, dir string) string {
-	t.Helper()
-	tmp := t.TempDir()
-	pid, script, attrs := filepath.Join(tmp, "pid"), filepath.Join(tmp, "slow.sh"), filepath.Join(tmp, "attributes")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho $$ > "+pid+"\nexec sleep 60\n"), 0o755); err != nil {
-		t.Fatal(err)
+	out, id := f.attemptWith(t, carrypatch.RebuildOptions{Strategy: new("merge"), FailMode: new("continue")}, nil)
+	if out.Kind != attemptCompleted {
+		t.Fatalf("the attempt = %+v, want completed", out)
 	}
-	if err := os.WriteFile(attrs, []byte("slow.txt filter=slow\n"), 0o600); err != nil {
-		t.Fatal(err)
+	rep, ok := f.patchResults(t, id)[0]["conflict"].(map[string]any)
+	if !ok {
+		t.Fatalf("p1's result = %v, want a conflict report", f.patchResults(t, id)[0])
 	}
-	gitrepotest.Git(t, dir, "config", "core.attributesFile", attrs)
-	gitrepotest.Git(t, dir, "config", "filter.slow.smudge", script)
-	return pid
-}
-
-// waitGone waits for the process whose id the file pidFile holds to be
-// gone, and fails the test when it is still there after ten seconds: the
-// process sleeps for a minute unless it is killed.
-func waitGone(t *testing.T, pidFile string) {
-	t.Helper()
-	b, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("the filter of slow.txt did not run: %v", err)
+	if rep["base_sha"] != f.cut {
+		t.Errorf("base_sha of the report = %v, want the merge base %s", rep["base_sha"], f.cut)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	raw, err := json.Marshal([]gitrepo.ConflictFile{{Path: "a.txt", Kind: gitrepo.ConflictContent,
+		Base: blobSide(f.copy, f.cut, "a.txt"), Ours: blobSide(f.copy, target, "a.txt"), Theirs: blobSide(f.copy, tip, "a.txt"),
+		LandedBy: []any{}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-		if !alive(pid) {
-			return
-		}
+	var want []any
+	if err := json.Unmarshal(raw, &want); err != nil {
+		t.Fatal(err)
 	}
-	t.Errorf("the git child process %d is still alive after the attempt", pid)
-}
-
-// alive reports whether the process pid runs: one that exited and is not
-// yet reaped by its parent does not.
-func alive(pid int) bool {
-	if err := syscall.Kill(pid, 0); err != nil {
-		return false
+	if !reflect.DeepEqual(rep["files"], want) {
+		t.Errorf("files of the report = %v, want a.txt of the merge base, upstream and p1's tip: %v", rep["files"], want)
 	}
-	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
-	stat := strings.TrimSpace(string(out))
-	return err == nil && stat != "" && !strings.HasPrefix(stat, "Z")
 }

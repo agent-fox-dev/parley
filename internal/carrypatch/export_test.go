@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -60,4 +61,23 @@ const (
 // workspace slug for each of the conflicts that has none, at the time at.
 func RecordRerereEntries(ctx context.Context, tx *sql.Tx, slug string, conflicts []gitrepo.RerereConflict, at time.Time) error {
 	return recordRerereEntries(ctx, tx, slug, conflicts, at, false)
+}
+
+// KeptOutcome is the outcome of the attempt of the job id the component
+// keeps for the job's settlement, printed with every field, "" when it
+// keeps none.
+func KeptOutcome(c *Component, id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out, ok := c.outcomes[id]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%+v", out)
+}
+
+// MarkDeleted is markDeleted: it marks the stored patch p deleted at now in
+// tx, as a removal does, without renumbering the others.
+func MarkDeleted(ctx context.Context, tx *sql.Tx, p Patch, now time.Time) error {
+	return markDeleted(ctx, tx, p, now)
 }

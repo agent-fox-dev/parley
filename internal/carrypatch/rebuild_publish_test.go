@@ -3,7 +3,6 @@ package carrypatch_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"reflect"
@@ -33,17 +32,11 @@ func TestRebuild_PublishMovesOnlyTheIntegrationBranch(t *testing.T) {
 			f.addPatch(t, "p2")
 			var previous any
 			if tc.exists {
-				h0 := commitFiles(t, f.copy, f.base, "H0", map[string]string{"h0.txt": "h0\n"})
+				h0 := gitrepotest.Commit(t, f.copy, "H0", map[string]string{"h0.txt": "h0\n"}, f.base)
 				gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/deploy", h0)
 				previous = h0
 			} else {
-				// The set-up at the attempt's start creates a missing
-				// integration branch: it goes after that.
-				f.hooks.beforePublish(func() {
-					if _, err := gitrepotest.Run(f.copy, "", "update-ref", "-d", "refs/heads/deploy"); err != nil {
-						t.Errorf("delete deploy: %v", err)
-					}
-				})
+				gitrepotest.Git(t, f.copy, "update-ref", "-d", "refs/heads/deploy")
 			}
 			before, err := visibleRefs(f.copy)
 			if err != nil {
@@ -116,7 +109,7 @@ func TestRebuild_LostCompareAndSwapIsRetryable(t *testing.T) {
 	p1 := f.addPatch(t, "p1", withStatus(carrypatch.StatusMergedUpstream))
 	p2 := f.addPatch(t, "p2", withStatus(carrypatch.StatusConflict, "p2.txt"))
 	f.moveUpstream(t, "U2", map[string]string{"u2.txt": "u2\n"})
-	w := commitFiles(t, f.copy, f.base, "W", map[string]string{"w.txt": "w\n"})
+	w := gitrepotest.Commit(t, f.copy, "W", map[string]string{"w.txt": "w\n"}, f.base)
 	before := map[string]carrypatch.Patch{p1.ID: f.stored(t, p1.ID), p2.ID: f.stored(t, p2.ID)}
 	f.hooks.beforeSwap(func() {
 		if _, err := gitrepotest.Run(f.copy, "", "update-ref", "refs/heads/deploy", w); err != nil {
@@ -142,8 +135,8 @@ func TestRebuild_LostCompareAndSwapIsRetryable(t *testing.T) {
 	if got := cleanUpdates(f.patchEvents(t, carrypatch.EventPatchUpdate)); len(got) != 0 {
 		t.Errorf("parley.patch.update events with reason rebuild_clean = %+v, want none", got)
 	}
-	if n := f.eventsOfType(t, "parley.rebuild.complete"); n != 0 {
-		t.Errorf("%d parley.rebuild.complete events, want none", n)
+	if got := f.rebuildEvents(t, f.slug, carrypatch.EventRebuildComplete); len(got) != 0 {
+		t.Errorf("parley.rebuild.complete events = %+v, want none", got)
 	}
 	if res := f.result(t, id); res["integration_head_sha"] != nil || res["previous_integration_head_sha"] != nil {
 		t.Errorf("integration_head_sha = %v, previous_integration_head_sha = %v; want both null", res["integration_head_sha"], res["previous_integration_head_sha"])
@@ -246,43 +239,4 @@ func TestRebuild_PublishUpdatesThePatchList(t *testing.T) {
 	if len(clean) != 1 || clean[0].ResourceID != p2.ID || clean[0].ActorType != event.ActorSystem || !reflect.DeepEqual(clean[0].Metadata, wantMeta) {
 		t.Errorf("parley.patch.update events with reason rebuild_clean = %+v, want one for p2 by system, %v", clean, wantMeta)
 	}
-}
-
-// cleanUpdates are the events of updates that are parley.patch.update with
-// the reason rebuild_clean, of a patch a rebuild applied again.
-func cleanUpdates(updates []patchEvent) []patchEvent {
-	var out []patchEvent
-	for _, e := range updates {
-		if e.Metadata["reason"] == "rebuild_clean" {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// eventsOfType is how many stored events of the fixture's workspace have
-// type typ.
-func (f *rebuildFixture) eventsOfType(t *testing.T, typ string) int {
-	t.Helper()
-	var n int
-	if err := f.Store.Main().QueryRow(`SELECT count(*) FROM hub_events WHERE workspace = ? AND type = ?`, f.slug, typ).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
-
-// resultMember is the member name of the job's result document doc, nil
-// when it has none or doc does not decode.
-func resultMember(doc []byte, name string) any {
-	m := map[string]any{}
-	_ = json.Unmarshal(doc, &m)
-	return m[name]
-}
-
-// position is the position p as a test prints it, "none" when nil.
-func position(p *int) string {
-	if p == nil {
-		return "none"
-	}
-	return fmt.Sprint(*p)
 }

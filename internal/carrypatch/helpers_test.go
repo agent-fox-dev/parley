@@ -843,13 +843,19 @@ func (h *rebuildHub) queueRebuild(t *testing.T, slug string) string {
 // workspace slug, as a clone or a maintenance operation would leave it.
 func (h *readHub) setState(t *testing.T, slug string, status workspace.Status, marker workspace.Marker) {
 	t.Helper()
-	ctx := context.Background()
-	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, maintenance = ? WHERE slug = ?`, status, marker, slug)
-		return err
-	}); err != nil {
+	if err := h.storeState(slug, status, marker); err != nil {
 		t.Fatalf("set the state of %s: %v", slug, err)
 	}
+}
+
+// storeState is setState for a caller that must not fail the test, such
+// as a hook the code under test calls from another goroutine.
+func (h *readHub) storeState(slug string, status workspace.Status, marker workspace.Marker) error {
+	ctx := context.Background()
+	return h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, maintenance = ? WHERE slug = ?`, status, marker, slug)
+		return err
+	})
 }
 
 // job is the stored job id.

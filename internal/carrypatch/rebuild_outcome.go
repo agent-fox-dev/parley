@@ -41,7 +41,9 @@ func (h rebuildHandler) Run(ctx context.Context, j jobs.Job) error {
 
 // run runs one attempt of j, keeps its outcome for the settlement and
 // returns it with the error the queue settles it with. The failure's text
-// is scrubbed first, with the values of the credentials the attempt read.
+// and reason are scrubbed first, with the values of the credentials the
+// attempt read, which the kept outcome then leaves out: the outcome of a
+// job deleted before its settlement stays kept, and must hold no secret.
 // An attempt whose workspace was deleted with its jobs keeps nothing, as
 // no settlement will find the job.
 func (h rebuildHandler) run(ctx context.Context, j jobs.Job) (attemptOutcome, error) {
@@ -53,6 +55,8 @@ func (h rebuildHandler) run(ctx context.Context, j jobs.Job) (attemptOutcome, er
 		return out, fmt.Errorf("rebuild of %s ended: the workspace no longer exists", j.Workspace)
 	}
 	out.text = h.c.scrub(out.text, out.secrets...)
+	out.reason = h.c.scrub(out.reason, out.secrets...)
+	out.secrets = nil
 	h.c.keepOutcome(j.ID, out)
 	err := errors.New(out.text)
 	switch out.kind {
@@ -117,7 +121,7 @@ func (h rebuildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, wil
 		}
 		in.Type = EventRebuildFail
 		in.Metadata = map[string]any{
-			"reason":      h.c.scrub(reason, out.secrets...),
+			"reason":      reason,
 			"will_retry":  willRetry,
 			"retry_count": j.RetryCount,
 			"conflict":    conflict,

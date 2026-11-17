@@ -3075,11 +3075,14 @@ client, and moves the branch once at the end.
    upstream branch into `refs/remotes/upstream/*` (no tags) with the
    upstream credential (`UPSTREAM_GIT_PAT`, else `UPSTREAM_GIT_USERNAME`
    with `UPSTREAM_GIT_PASSWORD`, else the origin credential) and repeats a
-   missing set-up step. The **upstream base** is the head of the upstream's
-   default branch, else of the upstream branch named like the workspace's
-   `default_branch`; it is stored as `upstream_head_sha`. A failed fetch is
-   a retryable `upstream_fetch_failed`, a base that does not resolve a
-   retryable `upstream_unknown`; no patch is touched.
+   missing set-up step, except the integration branch, which only the
+   publish writes: an attempt that ends before the publish leaves it as it
+   was, missing included. The **upstream base** is the head of the
+   upstream's default branch, else of the upstream branch named like the
+   workspace's `default_branch`; it is stored as `upstream_head_sha`. A
+   failed fetch is a retryable `upstream_fetch_failed` (`shutdown` when the
+   hub stops during it), a base that does not resolve a retryable
+   `upstream_unknown`; no patch is touched.
 3. **The patch list.** The non-deleted patches are listed in position order
    and the tip of each patch branch is read once as its `source_sha` (`null`
    for a missing branch); only these commits are used. A push to a patch
@@ -3149,8 +3152,9 @@ client, and moves the branch once at the end.
    resolved now differs from `upstream_head_sha` (when
    `auto_rebuild_after_sync` is `true`). Anything stale queues one
    follow-up rebuild with the job's strategy and fail mode and
-   `submitted_by` `system:followup`; a duplicate is skipped silently. No
-   check follows a retryable failure, since the job runs again.
+   `submitted_by` `system:followup`; a duplicate is skipped silently. A tip
+   or a base the check cannot read is logged and is not stale. No check
+   follows a retryable failure, since the job runs again.
 
 A git failure that is not a conflict (`git_error`), a git operation that
 runs longer than 10 minutes (`timeout`) and a stop of the hub (`shutdown`)
@@ -3181,9 +3185,11 @@ head under construction before the patch: the upstream base for the first
 applied patch), `head_sha` (the patch's `source_sha`), `base_sha` (the merge
 base of the two), `commit_sha` (with `rebase` the first commit that did not
 apply, with `merge` `source_sha`), `files` (one entry per path still in
-conflict after remembered resolutions, with `path`, `kind`, `base`, `ours`
-(the file in `target_sha`), `theirs` (the file in `commit_sha`) and
-`landed_by: []`), `landed_changes: []` and `change: null`.
+conflict after remembered resolutions, with `path`, `kind`, `base` (the
+file in the base of the three-way merge: with `rebase` the parent of
+`commit_sha`, with `merge` `base_sha`), `ours` (the file in `target_sha`),
+`theirs` (the file in `commit_sha`) and `landed_by: []`),
+`landed_changes: []` and `change: null`.
 
 ### The events of an attempt
 

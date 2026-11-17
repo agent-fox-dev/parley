@@ -332,10 +332,3 @@ func TestRebuild_CommitterComesFromConfiguration(t *testing.T) {
 		})
 	}
 }
-
-// show is the commit rev of the repository dir with the git log format
-// given.
-func show(t *testing.T, dir, rev, format string) string {
-	t.Helper()
-	return gitrepotest.Git(t, dir, "log", "-1", "--date=raw", "--format="+format, rev)
-}

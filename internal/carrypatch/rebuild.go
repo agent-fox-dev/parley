@@ -51,7 +51,8 @@ type attemptOutcome struct {
 	// at, nil for any other outcome.
 	conflict json.RawMessage
 	// secrets are the values of the credentials the attempt read, which
-	// must not reach the job's error or an event.
+	// must not reach the job's error or an event; the handler scrubs the
+	// outcome with them and clears them before it keeps the outcome.
 	secrets []string
 	// followUp is the follow-up rebuild the attempt queued, nil for none.
 	followUp *followUp
@@ -121,7 +122,10 @@ func (c *Component) runRebuildAttempt(ctx context.Context, j jobs.Job) attemptOu
 
 // start begins the attempt: it checks the workspace, empties the job's
 // result, repeats the workspace's set-up, which fetches upstream, and
-// stores the upstream base. A non-nil outcome ends the attempt.
+// stores the upstream base. The set-up leaves the integration branch
+// alone: the publish is the one write of it, so that an attempt that ends
+// before the publish leaves it as it was, missing included. A non-nil
+// outcome ends the attempt.
 func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 	if out := r.readWorkspace(ctx); out != nil {
 		return out
@@ -131,7 +135,12 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 		return out
 	}
 	r.readSecrets(ctx)
-	if err := r.c.EnsureSetup(ctx, r.ws); err != nil {
+	if err := r.c.ensureSetup(ctx, r.ws, true); err != nil {
+		// A stop of the hub or a delete of the workspace during the set-up
+		// fails its steps too; it is not the upstream's failure.
+		if ctx.Err() != nil {
+			return r.failed(ctx, err)
+		}
 		if errors.Is(err, ErrUpstreamFetch) {
 			return attemptFailed(attemptRetryable, reasonUpstreamFetchFailed, err)
 		}
@@ -141,7 +150,7 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 			"workspace", r.ws.Slug, "job_id", r.job.ID, "error", err)
 	}
 	base, err := r.c.UpstreamBase(ctx, r.ws)
-	if errors.Is(err, ErrNoUpstreamBase) {
+	if errors.Is(err, ErrNoUpstreamBase) && ctx.Err() == nil {
 		return attemptFailed(attemptRetryable, reasonUpstreamUnknown, err)
 	}
 	if err != nil {

@@ -75,24 +75,28 @@ type CopyWriter interface {
 // name brought from origin is replaced (refs/remotes/origin/* stay as the
 // clone recorded them); false creates it only when it does not exist and
 // never moves an existing one, as on a ready workspace.
+//
+// LeaveBranch leaves the last step out: the integration branch is neither
+// created nor moved, as for a rebuild, which writes it at its publish alone
+// so that an attempt that fails or stops before the publish leaves it as it
+// was.
 type Setup struct {
-	Record   RecordWriter
-	Upstream UpstreamFetcher
-	Copy     CopyWriter
-	Replace  bool
+	Record      RecordWriter
+	Upstream    UpstreamFetcher
+	Copy        CopyWriter
+	Replace     bool
+	LeaveBranch bool
 }
 
-// Run runs the four steps of the set-up of w, each whatever the earlier
-// ones did, and returns nil or one error that names every step that
-// failed; it matches ErrUpstreamFetch when the upstream fetch was one of
-// them. A fetch that succeeded after which no upstream base resolves is
-// reported as a failure too, though the integration branch is then
-// written at head_sha. The set-up writes neither upstream_head_sha nor
+// Run runs the steps of the set-up of w, each whatever the earlier ones
+// did, and returns nil or one error that names every step that failed; it matches ErrUpstreamFetch when the upstream fetch was one of
+// them. Unless LeaveBranch is set, a fetch that succeeded after which no
+// upstream base resolves is reported as a failure too, though the
+// integration branch is then written at head_sha. The set-up writes neither upstream_head_sha nor
 // clone_error and emits no event. Every git operation on the copy runs
 // through RunGit, so that its error text is cleaned like the fetch's.
 func (s Setup) Run(ctx context.Context, w workspace.Workspace) error {
 	var failed []error
-	branch := IntegrationBranch(w)
 	if w.IntegrationBranch == nil {
 		if err := s.Record.DefaultIntegrationBranch(ctx, w.Slug, DefaultIntegrationBranch); err != nil {
 			failed = append(failed, fmt.Errorf("record integration_branch %s: %w", DefaultIntegrationBranch, err))
@@ -111,9 +115,25 @@ func (s Setup) Run(ctx context.Context, w workspace.Workspace) error {
 		failed = append(failed, fmt.Errorf("turn on %s: %w", rerereKey, err))
 	}
 
+	if !s.LeaveBranch {
+		failed = append(failed, s.branch(ctx, w, IntegrationBranch(w), fetchErr == nil)...)
+	}
+
+	if len(failed) == 0 {
+		return nil
+	}
+	return &setupError{slug: w.Slug, failed: failed}
+}
+
+// branch is the last step of the set-up of w: it writes the integration
+// branch named branch at the upstream base when fetched says the fetch
+// succeeded and a base resolves, else at head_sha, and returns what
+// failed.
+func (s Setup) branch(ctx context.Context, w workspace.Workspace, branch string, fetched bool) []error {
+	var failed []error
 	ref := "refs/heads/" + branch
 	target := ""
-	if fetchErr == nil {
+	if fetched {
 		base, err := s.Upstream.UpstreamBase(ctx, w)
 		if err != nil {
 			failed = append(failed, fmt.Errorf("upstream base, %s set at origin's head instead: %w", ref, err))
@@ -126,11 +146,7 @@ func (s Setup) Run(ctx context.Context, w workspace.Workspace) error {
 	if err := s.writeBranch(ctx, ref, target); err != nil {
 		failed = append(failed, fmt.Errorf("write the integration branch %s: %w", ref, err))
 	}
-
-	if len(failed) == 0 {
-		return nil
-	}
-	return &setupError{slug: w.Slug, failed: failed}
+	return failed
 }
 
 // writeBranch writes the integration branch ref at target in the form
@@ -195,6 +211,12 @@ func (c *Component) PostClone(ctx context.Context, w workspace.Workspace, repo *
 // when it does not exist, never moving an existing one. It returns nil
 // when every step succeeded, else the error Setup.Run describes.
 func (c *Component) EnsureSetup(ctx context.Context, w workspace.Workspace) error {
+	return c.ensureSetup(ctx, w, false)
+}
+
+// ensureSetup is EnsureSetup, with the integration branch left alone when
+// leaveBranch is set.
+func (c *Component) ensureSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool) error {
 	var cp CopyWriter
 	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(w.Slug))
 	if err != nil {
@@ -202,7 +224,7 @@ func (c *Component) EnsureSetup(ctx context.Context, w workspace.Workspace) erro
 	} else {
 		cp = repo
 	}
-	return Setup{Record: c.record(), Upstream: c, Copy: cp}.Run(ctx, w)
+	return Setup{Record: c.record(), Upstream: c, Copy: cp, LeaveBranch: leaveBranch}.Run(ctx, w)
 }
 
 // record is the RecordWriter of the component's store.

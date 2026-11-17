@@ -168,12 +168,12 @@ func TestConflictFiles_DescribesEachGivenPath(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := f.repo.ConflictFiles(ctx, m2, f.id(t, tc.commit), tc.paths)
+			got, err := f.repo.ConflictFiles(ctx, m1, m2, f.id(t, tc.commit), tc.paths)
 			if err != nil {
 				t.Fatalf("ConflictFiles = %v", err)
 			}
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("ConflictFiles(main, %s, %q) =\n%s\nwant\n%s", tc.commit, tc.paths, describeFiles(got), describeFiles(tc.want))
+				t.Errorf("ConflictFiles(main~1, main, %s, %q) =\n%s\nwant\n%s", tc.commit, tc.paths, describeFiles(got), describeFiles(tc.want))
 			}
 		})
 	}

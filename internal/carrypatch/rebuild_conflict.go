@@ -18,10 +18,12 @@ const reasonRebuildConflict = "rebuild_conflict"
 
 // ConflictFileDescriber gives the file entries of a conflict report: for
 // each of paths, left in conflict when the commit commit was applied onto
-// the commit target in the repository repo, the file's path, kind and its
-// sides, ours being the file in target and theirs the file in commit.
+// the commit target in the repository repo in a three-way merge whose base
+// is the commit base ("" for the empty tree), the file's path, kind and its
+// sides, base being the file in base, ours the file in target and theirs
+// the file in commit.
 type ConflictFileDescriber interface {
-	ConflictFiles(ctx context.Context, repo *gitrepo.Repo, target, commit string, paths []string) ([]gitrepo.ConflictFile, error)
+	ConflictFiles(ctx context.Context, repo *gitrepo.Repo, base, target, commit string, paths []string) ([]gitrepo.ConflictFile, error)
 }
 
 // GitConflictFiles is the conflict-file describer that reads the entries
@@ -29,8 +31,8 @@ type ConflictFileDescriber interface {
 type GitConflictFiles struct{}
 
 // ConflictFiles is repo.ConflictFiles.
-func (GitConflictFiles) ConflictFiles(ctx context.Context, repo *gitrepo.Repo, target, commit string, paths []string) ([]gitrepo.ConflictFile, error) {
-	return repo.ConflictFiles(ctx, target, commit, paths)
+func (GitConflictFiles) ConflictFiles(ctx context.Context, repo *gitrepo.Repo, base, target, commit string, paths []string) ([]gitrepo.ConflictFile, error) {
+	return repo.ConflictFiles(ctx, base, target, commit, paths)
 }
 
 // ConflictReport is the conflict report of a patch that did not apply in
@@ -66,6 +68,9 @@ type PatchConflict struct {
 	Target string
 	// Commit is the commit that did not apply: with strategy merge, Source.
 	Commit string
+	// Merge is set when the patch was merged (strategy merge) rather than
+	// replayed commit by commit (strategy rebase).
+	Merge bool
 	// Paths are the paths left in conflict.
 	Paths []string
 }
@@ -75,8 +80,11 @@ type PatchConflict struct {
 // construction before the patch is target_sha, the patch's source
 // head_sha, their merge base base_sha (null when they share none), the
 // commit that did not apply commit_sha, and the files are the describer's
-// entries for the paths, in path order, each with landed_by []. A rebuild
-// knows of no landed change, so landed_changes is [] and change null.
+// entries for the paths, in path order, each with landed_by []. The
+// describer is given the base of the three-way merge that left the paths
+// in conflict: for a merged patch the merge base, for a replayed commit
+// its first parent. A rebuild knows of no landed change, so landed_changes
+// is [] and change null.
 func (c *Component) BuildConflictReport(ctx context.Context, repo *gitrepo.Repo, in PatchConflict) (ConflictReport, error) {
 	paths := slices.Clone(in.Paths)
 	slices.Sort(paths)
@@ -85,7 +93,18 @@ func (c *Component) BuildConflictReport(ctx context.Context, repo *gitrepo.Repo,
 	if err != nil {
 		return ConflictReport{}, err
 	}
-	files, err := c.describer().ConflictFiles(ctx, repo, in.Target, in.Commit, paths)
+	threeWay := base
+	if !in.Merge {
+		commits, err := repo.ReadCommits(ctx, []string{in.Commit})
+		if err != nil {
+			return ConflictReport{}, err
+		}
+		threeWay = ""
+		if parents := commits[0].Parents; len(parents) > 0 {
+			threeWay = parents[0]
+		}
+	}
+	files, err := c.describer().ConflictFiles(ctx, repo, threeWay, in.Target, in.Commit, paths)
 	if err != nil {
 		return ConflictReport{}, fmt.Errorf("describe the conflicted files of %s: %w", in.Commit, err)
 	}
@@ -130,7 +149,8 @@ func (r *rebuildRun) conflict(ctx context.Context, scratch *gitrepo.Scratch, p r
 	var report ConflictReport
 	err = r.git(ctx, func(ctx context.Context) (err error) {
 		report, err = r.c.BuildConflictReport(ctx, r.repo, PatchConflict{
-			PatchID: p.ID, Source: *p.source, Target: before, Commit: at.commit, Paths: at.paths,
+			PatchID: p.ID, Source: *p.source, Target: before, Commit: at.commit,
+			Merge: r.payload.Strategy == strategyMerge, Paths: at.paths,
 		})
 		return err
 	})
