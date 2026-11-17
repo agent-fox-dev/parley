@@ -79,6 +79,15 @@ type Deps struct {
 	// ConflictFiles describes the files of the conflict report of a patch
 	// that did not apply in a rebuild; nil is GitConflictFiles.
 	ConflictFiles ConflictFileDescriber
+	// Push, when set, replaces gitrepo.Git.Push as the push of the
+	// integration branch to origin after a rebuild's publish, and is called
+	// as RunGit calls that; only tests set it, to see the push or make it
+	// fail.
+	Push func(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)
+	// RebuildPushDeadline, when positive and shorter, replaces
+	// DefaultRebuildPushDeadline as the deadline of that push; only tests
+	// set it.
+	RebuildPushDeadline time.Duration
 	// RebuildGitDeadline, when positive and shorter, replaces
 	// DefaultGitDeadline as the deadline of each git operation of a rebuild
 	// attempt; only tests set it.

@@ -93,15 +93,16 @@ type rebuildRun struct {
 // then empties the job's result, fetches upstream and stores the upstream
 // base it starts from. It lists the patches with the tips of their
 // branches, builds the new head from the base and those tips alone in a
-// scratch working tree, and publishes it as the integration branch. Last,
-// it stores the counts over what it did with the patches.
+// scratch working tree, and publishes it as the integration branch, which
+// it pushes to origin when the workspace asks for it. Last, it stores the
+// counts over what it did with the patches.
 func (c *Component) runRebuildAttempt(ctx context.Context, j jobs.Job) attemptOutcome {
 	r := &rebuildRun{c: c, job: j}
 	// A payload that does not decode leaves the options at their defaults,
 	// as the job's record shows them.
 	_ = json.Unmarshal(j.Payload, &r.payload)
 	out := attemptOutcome{kind: attemptCompleted}
-	for _, step := range []func(context.Context) *attemptOutcome{r.start, r.listPatches, r.build, r.publish, r.complete} {
+	for _, step := range []func(context.Context) *attemptOutcome{r.start, r.listPatches, r.build, r.publish, r.push, r.complete} {
 		if stop := step(ctx); stop != nil {
 			out = *stop
 			break

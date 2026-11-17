@@ -3,7 +3,7 @@
   "spec_id": "34",
   "spec_name": "rebuild_execution",
   "schema_version": 3,
-  "updated_at": "2026-11-17T03:04:55Z",
+  "updated_at": "2026-11-17T03:12:12Z",
   "tasks": [
     {
       "id": 1,
@@ -39,7 +39,7 @@
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,
