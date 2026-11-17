@@ -152,6 +152,11 @@ type Component struct {
 	// fetches into one repository lock the same refs and its configuration,
 	// and one of them fails.
 	setups slugLocks
+
+	// triggers are held by the trigger of an accepted request, so that the
+	// triggers of one workspace run one at a time; apart from setups, which
+	// an upstream fetch holds for minutes.
+	triggers slugLocks
 }
 
 // slugLocks is a mutex per workspace slug, which exists only while someone

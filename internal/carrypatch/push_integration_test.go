@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,8 +17,10 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -170,6 +173,86 @@ func TestGitPush_ForwardsPatchBranchesToOriginAndRefusesThePushWhenOriginRefuses
 	if got := f.eventCount(t, "parley.git.push"); got != pushes {
 		t.Errorf("%d parley.git.push events after the refused push, want %d", got, pushes)
 	}
+
+	// Once a forwarded push is accepted its commit is in the hub's copy,
+	// which records it as origin's head.
+	a3 := f.commit(t, a, "a3")
+	if out, err := f.push(t, f.key, a3+":refs/heads/patch/a"); err != nil {
+		t.Fatalf("the forwarded push of patch/a failed: %v\n%s", err, out)
+	}
+	if got := f.origin.Head("patch/a"); got != a3 {
+		t.Errorf("origin's patch/a = %q, want the forwarded %s", got, a3)
+	}
+	waitFor(t, "origin's head of patch/a recorded in the hub's copy", func() bool {
+		return refIn(f.copy, "refs/remotes/origin/patch/a") == a3
+	})
+}
+
+func TestGitPush_QueuesARebuildOnlyAfterTheClientHasItsAnswer(t *testing.T) {
+	t.Parallel()
+	const session = "6f1c2e3a-4b5d-4e6f-8a9b-0c1d2e3f4a5b"
+	held := &heldRebuilds{recordingRebuilds: &recordingRebuilds{}, entered: make(chan string, 4), release: make(chan struct{}),
+		hold: func(_ string, opts carrypatch.RebuildOptions) bool { return opts.SubmittedBy == "system:push" }}
+	f := startPushFixtureWith(t, func(c *hub.Composition) {
+		c.CarryPatch().RegisterRebuildEnqueuer(held)
+		c.PushOptions().RegisterSessionLinker(anyPushSession{})
+	})
+	tips := f.registerPatches(t, "patch/a")
+	pushed := func() []wantCall {
+		var out []wantCall
+		for _, c := range held.callsOf(f.slug) {
+			if c.opts.SubmittedBy == "system:push" {
+				out = append(out, wantCall{c.slug, c.opts.SubmittedBy, c.opts.SessionID})
+			}
+		}
+		return out
+	}
+
+	a2 := f.commit(t, tips["patch/a"], "a2")
+	answered := make(chan error, 1)
+	var out string
+	go func() {
+		var err error
+		out, err = f.push(t, f.key, a2+":refs/heads/patch/a")
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Fatalf("git push of patch/a failed: %v\n%s", err, out)
+		}
+	case <-time.After(30 * time.Second):
+		close(held.release)
+		t.Fatal("git push did not exit while the rebuild enqueue was held")
+	}
+	hubtest.WaitClosed(t, held.enteredBy(f.slug), "the trigger held in the rebuild enqueue")
+	if got := refIn(f.copy, "refs/heads/patch/a"); got != a2 {
+		t.Errorf("hub's patch/a = %s while the trigger is held, want the pushed %s", got, a2)
+	}
+	if got := pushed(); len(got) != 0 {
+		t.Errorf("rebuilds %v queued while the enqueue is held, want none yet", got)
+	}
+	close(held.release)
+	waitFor(t, "the rebuild of the push", func() bool { return len(pushed()) == 1 })
+	if got, want := fmt.Sprint(pushed()), fmt.Sprint([]wantCall{{f.slug, "system:push", nil}}); got != want {
+		t.Errorf("rebuild calls %s, want %s", got, want)
+	}
+
+	a3 := f.commit(t, a2, "a3")
+	if out, err := f.push(t, f.key, "--push-option=parley.session="+session, a3+":refs/heads/patch/a"); err != nil {
+		t.Fatalf("git push of patch/a with a session failed: %v\n%s", err, out)
+	}
+	waitFor(t, "the rebuild of the push with a session", func() bool { return len(pushed()) == 2 })
+	if got, want := pushed()[1].String(), (wantCall{f.slug, "system:push", ptr(session)}).String(); got != want {
+		t.Errorf("the second rebuild call %s, want %s", got, want)
+	}
+}
+
+// anyPushSession is a push session linker that accepts every session.
+type anyPushSession struct{}
+
+func (anyPushSession) Check(_ context.Context, _ gitserver.PushCaller, sessionID, _ string) (string, error) {
+	return strings.ToLower(sessionID), nil
 }
 
 // pushFixture is the sync fixture's workspace acme with a git client of
@@ -188,10 +271,20 @@ type pushFixture struct {
 // without a git process.
 func startPushFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *pushFixture {
 	t.Helper()
+	return startPushFixtureWith(t, nil, edit...)
+}
+
+// startPushFixtureWith is startPushFixture with the composition changed by
+// compose, when it is not nil, after the fixture's own changes.
+func startPushFixtureWith(t *testing.T, compose func(c *hub.Composition), edit ...func(w *workspace.Workspace)) *pushFixture {
+	t.Helper()
 	f := &pushFixture{control: &countingControl{}}
 	f.syncFixture = startSyncFixtureWith(t, syncOptions{compose: func(c *hub.Composition) {
 		f.control.inner = c.PushControl()
 		c.PushRules().RegisterController(f.control)
+		if compose != nil {
+			compose(c)
+		}
 	}}, edit...)
 	f.client = filepath.Join(t.TempDir(), "client.git")
 	gitrepotest.InitBare(t, f.client, "")
@@ -231,7 +324,8 @@ func (f *pushFixture) commit(t *testing.T, parent, msg string) string {
 
 // push runs git push from the client to the workspace over the hub's git
 // route with refspecs, sending credential as the Basic password, and
-// returns git's output and its error.
+// returns git's output and its error. An option of git push, such as
+// --push-option=..., may come among the refspecs.
 func (f *pushFixture) push(t *testing.T, credential string, refspecs ...string) (string, error) {
 	t.Helper()
 	u, err := url.Parse(f.URL("/git/acme/" + f.slug + ".git"))

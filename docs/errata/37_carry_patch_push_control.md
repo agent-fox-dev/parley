@@ -41,16 +41,29 @@ compare-and-swap does), the quarantine is discarded. A record written
 through the view would then name an object the copy does not have: a
 broken ref that `git gc`, `fsck` and a backup trip over.
 
-So after a successful forward, `Component.Forward` writes the record only
-when the copy holds the commit (`Repo.Missing`). That is the case for a
-forward from the copy (`repo` nil, the landing guard) and for an update
-whose objects are already in the copy. For a git push the record is left
-as it was. The hub does not lose anything by it: for a patch branch whose
-authority is origin, the record is read by the next sync's origin refresh,
-which fetches origin's real head first (erratum 36). Neither the mirror
-(authority hub) nor package 13's forced push (refused for patch branches)
-uses it as a lease. A failed record write is logged and the forward stands,
-since origin holds the commit.
+So the record is written once the copy holds the commit:
+
+- `Component.Forward` writes it right after a successful forward only when
+  the copy holds the commit (`Repo.Missing`): a forward from the copy
+  (`repo` nil, the landing guard), or an update whose objects are already
+  in the copy.
+- For a git push or a source control API write, the carry-patch post-push
+  listener writes it after the write is accepted, when the copy holds the
+  pushed objects: for each accepted update whose decision carried a
+  forward and that is not a delete, it records the update's `after` as
+  origin's head of the branch. It does so only while the hub's branch is
+  still at `after`, and under the workspace's trigger lock: when a later
+  write has already moved the branch, that write's listener, which runs
+  after it, records the newer commit, so an older commit never overwrites
+  a newer record.
+
+Between the forward and the listener the record still holds the older
+head. Nothing reads it in between: for a patch branch whose authority is
+origin, the record is read by the next sync's origin refresh, which fetches
+origin's real head first (erratum 36), and neither the mirror (authority
+hub) nor package 13's forced push (refused for patch branches) uses it as a
+lease. A failed record write is logged and the write stands, since origin
+holds the commit.
 
 ## Origin's own message is what its hooks wrote
 
@@ -94,3 +107,16 @@ one the hub registered, not one of its own, or it would pass whether the
 hub registers one or not. A test wraps it from `hubtest.Config.Compose`,
 which runs after the hub's parts, and registers the wrapper with
 `PushRules().RegisterController`, which replaces it.
+
+## A trigger ends when the hub stops
+
+The package runs the triggers after the client's answer and says nothing of
+a stop. The ref writer starts each post-push listener on a goroutine of its
+own with a context that never ends, and the hub's stop does not wait for
+it; a trigger may wait for the one before it and, once the mirror runs,
+push for up to 120 s. So the hub registers the listener with a context
+that ends when the stop begins (`Composition.ShuttingDown`): a trigger
+still waiting for its workspace's lock does not run, and an enqueue or git
+cut off by the stop fails instead of using the stores after they close.
+A trigger cut short this way is lost and logged; a rebuild can be queued
+by hand after the restart.
