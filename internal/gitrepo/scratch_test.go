@@ -146,10 +146,8 @@ func TestScratch_AddsAndRemovesAWorkingTreeThatNoRefPointsTo(t *testing.T) {
 
 func TestScratch_PickReplaysOneCommitOntoItsHead(t *testing.T) {
 	t.Parallel()
-	f := newScratchRepo(t, scratchStream)
 	ctx := context.Background()
 	committer := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0).In(time.FixedZone("", 3600))}
-	m2 := f.id(t, "main")
 	cases := []struct {
 		branch    string
 		outcome   gitrepo.PickOutcome
@@ -162,6 +160,12 @@ func TestScratch_PickReplaysOneCommitOntoItsHead(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.branch, func(t *testing.T) {
 			t.Parallel()
+			// Each case has a repository of its own: git does not support
+			// working trees of one repository being added and removed at
+			// once, and the hub never does it (one rebuild of a workspace
+			// runs at a time).
+			f := newScratchRepo(t, scratchStream)
+			m2 := f.id(t, "main")
 			s, err := f.repo.AddScratch(ctx, "job-"+tc.branch, m2)
 			if err != nil {
 				t.Fatalf("AddScratch = %v", err)
@@ -204,7 +208,6 @@ func TestScratch_PickReplaysOneCommitOntoItsHead(t *testing.T) {
 
 func TestScratch_MergeAlwaysMakesAMergeCommit(t *testing.T) {
 	t.Parallel()
-	f := newScratchRepo(t, scratchStream)
 	ctx := context.Background()
 	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0).In(time.FixedZone("", 3600))}
 	const sig = "Hub <hub@example.org> 1760000000 +0100"
@@ -229,6 +232,8 @@ func TestScratch_MergeAlwaysMakesAMergeCommit(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			// A repository of each case's own, as in the replay test.
+			f := newScratchRepo(t, scratchStream)
 			head := f.id(t, tc.at)
 			s, err := f.repo.AddScratch(ctx, fmt.Sprintf("job-%d", i), head)
 			if err != nil {
@@ -365,7 +370,6 @@ theirs
 
 func TestScratch_ResetUndoesAConflictedReplayOrMerge(t *testing.T) {
 	t.Parallel()
-	f := newScratchRepo(t, scratchStream)
 	ctx := context.Background()
 	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)}
 	cases := []struct {
@@ -377,10 +381,12 @@ func TestScratch_ResetUndoesAConflictedReplayOrMerge(t *testing.T) {
 			return s.Merge(ctx, commit, "Merge branch 'conflict'", hub, hub)
 		}},
 	}
-	m2 := f.id(t, "main")
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			// A repository of each case's own, as in the replay test.
+			f := newScratchRepo(t, scratchStream)
+			m2 := f.id(t, "main")
 			name := fmt.Sprintf("job-%d", i)
 			s, err := f.repo.AddScratch(ctx, name, m2)
 			if err != nil {
