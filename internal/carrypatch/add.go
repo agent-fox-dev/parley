@@ -321,6 +321,12 @@ func actorOf(r *http.Request) (actor, error) {
 	if !ok {
 		return actor{}, server.Unauthenticated("a patch is added by an authenticated caller")
 	}
+	return actorOfPrincipal(p), nil
+}
+
+// actorOfPrincipal is the caller p as an event's actor: the credential
+// type, and the user's id, none for the admin token.
+func actorOfPrincipal(p identity.Principal) actor {
 	a := actor{typ: p.Type}
 	if p.Type == identity.TypeAdmin {
 		a.typ = event.ActorAdminToken
@@ -328,7 +334,7 @@ func actorOf(r *http.Request) (actor, error) {
 	if p.User != nil {
 		a.id = &p.User.ID
 	}
-	return a, nil
+	return a
 }
 
 // insertPatches registers the patches reqs of the workspace slug, whose

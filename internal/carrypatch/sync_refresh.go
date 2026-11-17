@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -15,6 +16,10 @@ import (
 type BranchMoveNotifier interface {
 	NotifyBranchMove(ctx context.Context, m workspace.BranchMove)
 }
+
+// EventPatchSync is the type of the event that reports what a sync's
+// origin refresh did with one patch branch.
+const EventPatchSync = "parley.patch.sync"
 
 // The states of a patch branch against origin after a sync's refresh,
 // besides originInSync.
@@ -57,6 +62,9 @@ type refreshStep struct {
 	p             Patch
 	action, state string
 	local, origin string
+	// at is when the tips were compared, cut to the second as the store
+	// keeps it.
+	at time.Time
 }
 
 // moves reports whether the step creates or moves the patch's branch.
@@ -147,6 +155,7 @@ func (s *syncPass) compareWithOrigin(ctx context.Context, p Patch, replaces bool
 	if err != nil {
 		return refreshStep{}, fmt.Errorf("compare the patch branch %q with origin: %w", p.BranchName, err)
 	}
+	st.at = s.c.now().UTC().Truncate(time.Second)
 	if exists {
 		st.local = local.ID
 	}
@@ -168,9 +177,11 @@ func (s *syncPass) compareWithOrigin(ctx context.Context, p Patch, replaces bool
 }
 
 // applyRefresh records the refresh outcome st of one patch in one store
-// transaction, with the branch's move last in it, and reports whether it
-// was recorded: a patch deleted, merged or otherwise no longer refreshable
-// since it was listed is left out. A swap that loses to another writer
+// transaction: the patch's origin fields, the events that report the
+// outcome and, last, the branch's move, so that none of them exists
+// without the others. It reports whether the outcome was recorded: a
+// patch deleted, merged or otherwise no longer refreshable since it was
+// listed is left out. A swap that loses to another writer
 // rolls the transaction back and leaves the branch as that writer has it,
 // while the backup a replace wrote stays; a commit that fails after the
 // swap puts the branch back. The git work held in the transaction is
@@ -194,6 +205,9 @@ func (s *syncPass) applyRefresh(ctx context.Context, st refreshStep) (bool, erro
 		if !found || !refreshable(p.Status) {
 			return nil
 		}
+		if err := s.recordOutcome(ctx, tx, p, st); err != nil {
+			return err
+		}
 		if st.moves() {
 			if err := s.moveToOrigin(ctx, st); err != nil {
 				return err
@@ -212,6 +226,68 @@ func (s *syncPass) applyRefresh(ctx context.Context, st refreshStep) (bool, erro
 		return false, fmt.Errorf("refresh the patch branch %q from origin: %w", branch, err)
 	}
 	return recorded, nil
+}
+
+// recordOutcome stores the outcome st on the patch p, as read in tx
+// before the outcome is recorded, and emits in tx the events that report
+// it: parley.patch.sync when the branch is created or moved or the state
+// differs from the one stored, a first refresh's included, and
+// parley.patch.replace for a replaced branch.
+func (s *syncPass) recordOutcome(ctx context.Context, tx *sql.Tx, p Patch, st refreshStep) error {
+	slug := s.run.Workspace.Slug
+	var originSHA any // null when origin lacks the branch
+	if st.origin != "" {
+		originSHA = st.origin
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE patches SET origin_sync_state = ?, origin_sha = ?, origin_synced_at = ?
+WHERE workspace_slug = ? AND id = ?`, st.state, originSHA, st.at.UnixNano(), slug, p.ID); err != nil {
+		return fmt.Errorf("record the origin state: %w", err)
+	}
+	var events []event.Input
+	if st.moves() || p.OriginSyncState == nil || *p.OriginSyncState != st.state {
+		e := st.entry()
+		events = append(events, event.Input{
+			Type: EventPatchSync, Workspace: &slug, ActorType: s.by.typ, ActorID: s.by.id,
+			ResourceType: "patch", ResourceID: p.ID,
+			Metadata: map[string]any{"branch_name": e.BranchName, "action": e.Action, "state": e.State,
+				"local_sha": e.LocalSHA, "origin_sha": e.OriginSHA},
+		})
+	}
+	if st.action == resetReplaced {
+		events = append(events, event.Input{
+			Type: EventPatchReplace, Workspace: &slug, ActorType: s.by.typ, ActorID: s.by.id,
+			ResourceType: "patch", ResourceID: p.ID,
+			Metadata: map[string]any{"branch_name": p.BranchName, "replaced_sha": st.local, "origin_sha": st.origin,
+				"trigger": "sync"},
+		})
+	}
+	for _, in := range events {
+		if _, err := s.c.d.Events.Emit(ctx, tx, in); err != nil {
+			return fmt.Errorf("emit %s: %w", in.Type, err)
+		}
+	}
+	return nil
+}
+
+// clearOriginFields sets the three origin fields to null, without an
+// event, on the patches whose branch does not follow origin: every patch of
+// the workspace under the hub as the authority, and every merged_upstream
+// patch under origin. Their branch is no longer compared with origin, so a
+// stored comparison would describe a state the sync no longer keeps.
+func (s *syncPass) clearOriginFields(ctx context.Context) error {
+	query := `UPDATE patches SET origin_sync_state = NULL, origin_sha = NULL, origin_synced_at = NULL
+WHERE workspace_slug = ? AND (origin_sync_state IS NOT NULL OR origin_sha IS NOT NULL OR origin_synced_at IS NOT NULL)`
+	args := []any{s.run.Workspace.Slug}
+	if s.c.fromOrigin(s.run.Workspace) {
+		query += ` AND status = ?`
+		args = append(args, StatusMergedUpstream)
+	}
+	return s.c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("clear the origin fields of the patches that do not follow origin: %w", err)
+		}
+		return nil
+	})
 }
 
 // moveToOrigin moves the patch's branch from the hub's tip compared, or

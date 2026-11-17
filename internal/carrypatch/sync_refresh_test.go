@@ -3,8 +3,12 @@ package carrypatch_test
 import (
 	"errors"
 	"maps"
+	"net/http"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -263,5 +267,212 @@ func TestRefresh_NotifiesBranchMoveObservers(t *testing.T) {
 	}
 	if got := obs.movesUnder("patch/"); !slices.Equal(got, want) {
 		t.Errorf("the observer's moves of patch branches = %+v, want %+v", got, want)
+	}
+}
+
+// Each refresh outcome is stored on its patch: the state, origin's tip
+// (null when origin lacks the branch) and the time of the comparison, cut
+// to the second.
+func TestRefresh_StoresOriginState(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("report"))
+	a := f.addPatch(t, "patch/a")
+	f.originBranch(t, "patch/a", refIn(f.copy, "refs/heads/patch/a"))
+	b := f.addPatch(t, "patch/b")
+	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
+	c := f.addPatch(t, "patch/c")
+	at := f.clock().UTC().Truncate(time.Second)
+
+	f.mustSync(t)
+	for _, want := range []struct {
+		p          carrypatch.Patch
+		state, tip string
+	}{
+		{a, "in_sync", f.origin.Head("patch/a")},
+		{b, "diverged", f.origin.Head("patch/b")},
+		{c, "missing_on_origin", ""},
+	} {
+		got := f.stored(t, want.p.ID)
+		if str(got.OriginSyncState) != want.state || str(got.OriginSHA) != orNil(want.tip) || !equalTime(got.OriginSyncedAt, &at) {
+			t.Errorf("%s's origin fields = %s, %s, %v; want %s, %s, %v", want.p.BranchName,
+				str(got.OriginSyncState), str(got.OriginSHA), got.OriginSyncedAt, want.state, orNil(want.tip), at)
+		}
+	}
+}
+
+// The three origin fields are null after a sync on every patch under the
+// hub as the authority, and on every merged_upstream patch under origin.
+func TestRefresh_OriginFieldsNull(t *testing.T) {
+	t.Parallel()
+	setUp := func(t *testing.T) (*syncFixture, carrypatch.Patch, carrypatch.Patch) {
+		f := startSyncFixture(t)
+		f.setSettings(t, originAuthority("replace"))
+		a, b := f.addPatch(t, "patch/a"), f.addPatch(t, "patch/b")
+		for _, p := range []carrypatch.Patch{a, b} {
+			f.originBranch(t, p.BranchName, refIn(f.copy, "refs/heads/"+p.BranchName))
+		}
+		f.mustSync(t)
+		for _, p := range []carrypatch.Patch{a, b} {
+			if got := f.stored(t, p.ID); got.OriginSyncState == nil || got.OriginSHA == nil || got.OriginSyncedAt == nil {
+				t.Fatalf("after the first sync %s's origin fields = %+v, want them set", p.BranchName, got)
+			}
+		}
+		return f, a, b
+	}
+	wantNull := func(t *testing.T, f *syncFixture, p carrypatch.Patch) {
+		t.Helper()
+		if got := f.stored(t, p.ID); got.OriginSyncState != nil || got.OriginSHA != nil || got.OriginSyncedAt != nil {
+			t.Errorf("%s's origin fields = %s, %s, %v; want all null", p.BranchName, str(got.OriginSyncState), str(got.OriginSHA), got.OriginSyncedAt)
+		}
+	}
+
+	t.Run("hub is the authority", func(t *testing.T) {
+		t.Parallel()
+		f, a, b := setUp(t)
+		before := f.eventCount(t, "parley.patch.%")
+		f.setSettings(t, map[string]any{"patch_branch_source": "hub"})
+		f.mustSync(t)
+		wantNull(t, f, a)
+		wantNull(t, f, b)
+		if n := f.eventCount(t, "parley.patch.%"); n != before {
+			t.Errorf("parley.patch.* events = %d, want %d: clearing emits none", n, before)
+		}
+	})
+	t.Run("a merged_upstream patch under origin", func(t *testing.T) {
+		t.Parallel()
+		f, a, b := setUp(t)
+		if _, err := f.Store.Main().Exec(`UPDATE patches SET status = ? WHERE id = ?`, carrypatch.StatusMergedUpstream, a.ID); err != nil {
+			t.Fatal(err)
+		}
+		f.mustSync(t)
+		wantNull(t, f, a)
+		if got := f.stored(t, a.ID).Status; got != carrypatch.StatusMergedUpstream {
+			t.Errorf("patch/a's status = %s, want merged_upstream", got)
+		}
+		if got := str(f.stored(t, b.ID).OriginSyncState); got != "in_sync" {
+			t.Errorf("patch/b's origin_sync_state = %s, want in_sync", got)
+		}
+	})
+}
+
+// wantSyncEvent checks that the event e reports the refresh outcome entry
+// of the patch p, done by the owner: its metadata is the entry without
+// replaced_sha.
+func wantSyncEvent(t *testing.T, f *syncFixture, e patchEvent, p carrypatch.Patch, entry syncedEntry) {
+	t.Helper()
+	ptr := func(s *string) any {
+		if s == nil {
+			return nil
+		}
+		return *s
+	}
+	want := map[string]any{"branch_name": entry.BranchName, "action": entry.Action, "state": entry.State,
+		"local_sha": ptr(entry.LocalSHA), "origin_sha": ptr(entry.OriginSHA)}
+	if e.ResourceType != "patch" || e.ResourceID != p.ID || str(e.ActorID) != f.owner || !reflect.DeepEqual(e.Metadata, want) {
+		t.Errorf("event = %s %s by %s %+v; want patch %s by %s %+v",
+			e.ResourceType, e.ResourceID, str(e.ActorID), e.Metadata, p.ID, f.owner, want)
+	}
+}
+
+// A refresh emits one parley.patch.sync per patch whose branch it created
+// or moved or whose state changed, in position order, and none for a patch
+// it left as it was.
+func TestRefresh_EmitsPatchSyncEvents(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("replace"))
+	ps := map[string]carrypatch.Patch{}
+	for _, branch := range []string{"patch/a", "patch/b", "patch/c", "patch/d"} {
+		ps[branch] = f.addPatch(t, branch)
+		f.originBranch(t, branch, refIn(f.copy, "refs/heads/"+branch))
+	}
+	f.mustSync(t)
+	setup := len(f.patchEvents(t, carrypatch.EventPatchSync))
+
+	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, refIn(f.copy, "refs/heads/patch/a")))
+	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
+	gitrepotest.Git(t, f.origin.Dir(), "update-ref", "-d", "refs/heads/patch/c")
+
+	r := f.mustSync(t)
+	ev := f.patchEvents(t, carrypatch.EventPatchSync)[setup:]
+	var names []string
+	for _, e := range ev {
+		name, _ := e.Metadata["branch_name"].(string)
+		names = append(names, name)
+	}
+	if want := []string{"patch/a", "patch/b", "patch/c"}; !slices.Equal(names, want) {
+		t.Fatalf("parley.patch.sync events name %v, want %v", names, want)
+	}
+	for _, e := range ev {
+		branch := e.Metadata["branch_name"].(string)
+		wantSyncEvent(t, f, e, ps[branch], r.syncedOf(t, branch))
+	}
+	if ev[2].Metadata["state"] != "missing_on_origin" || ev[2].Metadata["action"] != "none" {
+		t.Errorf("patch/c's event = %+v, want action none, state missing_on_origin", ev[2].Metadata)
+	}
+
+	f.mustSync(t)
+	if n := len(f.patchEvents(t, carrypatch.EventPatchSync)); n != setup+len(ev) {
+		t.Errorf("parley.patch.sync events after a sync that changed nothing = %d, want %d", n, setup+len(ev))
+	}
+}
+
+// A replaced patch branch is reported by one parley.patch.replace with the
+// replaced tip, origin's tip and the trigger sync.
+func TestRefresh_EmitsPatchReplaceEvent(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("replace"))
+	f.addPatch(t, "patch/a")
+	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, refIn(f.copy, "refs/heads/patch/a")))
+	b := f.addPatch(t, "patch/b")
+	old := refIn(f.copy, "refs/heads/patch/b")
+	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
+
+	f.mustSync(t)
+	ev := f.patchEvents(t, carrypatch.EventPatchReplace)
+	if len(ev) != 1 {
+		t.Fatalf("parley.patch.replace events = %+v, want one", ev)
+	}
+	want := map[string]any{"branch_name": "patch/b", "replaced_sha": old, "origin_sha": f.origin.Head("patch/b"), "trigger": "sync"}
+	if e := ev[0]; e.ResourceType != "patch" || e.ResourceID != b.ID || str(e.ActorID) != f.owner || !reflect.DeepEqual(e.Metadata, want) {
+		t.Errorf("event = %s %s by %s %+v; want patch %s by %s %+v", e.ResourceType, e.ResourceID, str(e.ActorID), e.Metadata, b.ID, f.owner, want)
+	}
+}
+
+// An outcome whose event cannot be written is not stored either, and its
+// branch does not move: the sync stops with 500.
+func TestRefresh_OutcomeAndEventAreAtomic(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("replace"))
+	a := f.addPatch(t, "patch/a")
+	tip := refIn(f.copy, "refs/heads/patch/a")
+	f.originBranch(t, "patch/a", tip)
+	f.mustSync(t)
+	f.advance(time.Hour)
+	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, tip))
+	if _, err := f.Store.Main().Exec(`CREATE TRIGGER refuse_patch_sync BEFORE INSERT ON hub_events
+WHEN NEW.type = 'parley.patch.sync' AND NEW.resource_id = '` + a.ID + `'
+BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	before, events := f.stored(t, a.ID), len(f.patchEvents(t, carrypatch.EventPatchSync))
+
+	r := f.sync(t, "")
+	if r.status != http.StatusInternalServerError || !strings.Contains(r.Error.Message, "patch/a") {
+		t.Fatalf("sync = %d %s, want 500 naming patch/a", r.status, r.raw)
+	}
+	after := f.stored(t, a.ID)
+	if str(after.OriginSyncState) != str(before.OriginSyncState) || str(after.OriginSHA) != str(before.OriginSHA) || !equalTime(after.OriginSyncedAt, before.OriginSyncedAt) {
+		t.Errorf("patch/a's origin fields = %s, %s, %v; want %s, %s, %v unchanged", str(after.OriginSyncState), str(after.OriginSHA),
+			after.OriginSyncedAt, str(before.OriginSyncState), str(before.OriginSHA), before.OriginSyncedAt)
+	}
+	if n := len(f.patchEvents(t, carrypatch.EventPatchSync)); n != events {
+		t.Errorf("parley.patch.sync events = %d, want %d", n, events)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/a"); got != tip {
+		t.Errorf("patch/a = %s, want %s unmoved", got, tip)
 	}
 }

@@ -90,6 +90,9 @@ func (c *Component) BeforeCompletion(ctx context.Context, run workspace.SyncRun,
 	if err == nil {
 		err = s.refreshFromOrigin(ctx)
 	}
+	if err == nil {
+		err = s.clearOriginFields(ctx)
+	}
 	if err != nil {
 		return workspace.SyncAddition{}, fmt.Errorf("the sync of workspace %q stopped: %w", run.Workspace.Slug, err)
 	}
@@ -103,6 +106,8 @@ type syncPass struct {
 	c    *Component
 	run  workspace.SyncRun
 	repo *gitrepo.Repo
+	// by is the sync's caller, the actor of the events the pass emits.
+	by actor
 	// base is the upstream base as of this sync's upstream fetch.
 	base   string
 	report syncReport
@@ -152,7 +157,7 @@ func (c *Component) startSyncPass(ctx context.Context, run workspace.SyncRun) (*
 	if err != nil {
 		return nil, err
 	}
-	s := &syncPass{c: c, run: run, repo: repo, base: base, report: syncReport{
+	s := &syncPass{c: c, run: run, repo: repo, by: actorOfPrincipal(run.Actor), base: base, report: syncReport{
 		OriginFetched:   true,
 		PatchesMerged:   []string{},
 		PatchesSynced:   []syncEntry{},
