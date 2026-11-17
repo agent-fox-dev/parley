@@ -2,6 +2,7 @@ package gitrepo_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -645,6 +646,48 @@ func TestBranchesTagsAndOriginHeads_ReadTheRefsWithoutRunningGit(t *testing.T) {
 	}
 	if got := forEachRef(t, dir, "refs/heads/"); len(got) != 4 || got["gone"] != "" {
 		t.Errorf("the fixture's branches are %v; want main, packed, feature/moved and loose/deep/name", got)
+	}
+}
+
+func TestOriginHeadAndALostCompareAndSwap_ReadTheRefWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.InitBare(t, dir, "main")
+	c1 := gitrepotest.Commit(t, dir, "c1", map[string]string{"f.txt": "1\n"})
+	c2 := gitrepotest.Commit(t, dir, "c2", map[string]string{"f.txt": "2\n"}, c1)
+	gitrepotest.SetRef(t, dir, "refs/remotes/origin/main", c1)
+	gitrepotest.SetRef(t, dir, "refs/heads/b", c2)
+	var mu sync.Mutex
+	var ran [][]string
+	repo, err := gitrepo.Git{Trace: func(args []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		ran = append(ran, args)
+	}}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	took := func() [][]string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := ran
+		ran = nil
+		return out
+	}
+
+	if id, found, err := repo.OriginHead(context.Background(), "main"); err != nil || !found || id != c1 {
+		t.Errorf("OriginHead(main) = %q, %v, %v; want %s", id, found, err, c1)
+	}
+	if got := took(); len(got) != 0 {
+		t.Errorf("OriginHead(main) ran git %v, want none", got)
+	}
+	// A swap that loses runs git update-ref, and reads where the ref went
+	// itself.
+	if err := repo.CompareAndSwapRef(context.Background(), "refs/heads/b", c1, c1); !errors.Is(err, gitrepo.ErrRefMoved) {
+		t.Errorf("CompareAndSwapRef from a moved ref = %v, want ErrRefMoved", err)
+	}
+	if got := took(); len(got) != 1 {
+		t.Errorf("the lost CompareAndSwapRef ran git %v, want its update-ref alone", got)
 	}
 }
 

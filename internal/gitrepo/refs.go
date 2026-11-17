@@ -169,8 +169,18 @@ func (r *Repo) Tags(ctx context.Context) (map[string]string, error) {
 }
 
 // peek is the object id ref points at, whatever its type; found is false
-// when there is no such ref.
+// when there is no such ref. A full ref name that exists is read in process
+// (readRef); git is asked about the rest, since rev-parse tries other names
+// for a ref it does not find.
 func (r *Repo) peek(ctx context.Context, ref string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		if id, found, ok := readRef(r.dir, ref); ok && found {
+			return id, true, nil
+		}
+	}
 	out, err := r.git(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
 	if exitCode(err) == 1 {
 		return "", false, nil

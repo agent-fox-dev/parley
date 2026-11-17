@@ -334,8 +334,16 @@ func Remove(dir string) error {
 }
 
 // resolve is the commit id ref points at; found is false when there is no
-// such ref or it points at no commit.
+// such ref or it points at no commit. A full ref name that names a commit
+// is read in process (readRef); git is asked about the rest, since
+// rev-parse tries other names for a ref it does not find.
 func (r *Repo) resolve(ctx context.Context, ref string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if read, found, ok := r.readRef(ref); ok && found && read.Commit == read.ID {
+		return read.ID, true, nil
+	}
 	out, err := r.git(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
 	if exitCode(err) == 1 {
 		return "", false, nil
