@@ -2,19 +2,25 @@ package carrypatch_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -368,6 +374,240 @@ func TestPreview_TakesTheUpstreamBaseFromTheLastFetch(t *testing.T) {
 					t.Errorf("the preview contacted a remote: %s", cmd)
 				}
 			}
+		})
+	}
+}
+
+// previewState is what a preview leaves as it found it: the refs of the
+// copy, the patch rows and job rows of the workspace, and the number of
+// events in the hub's log.
+type previewState struct {
+	Refs    string
+	Patches []carrypatch.Patch
+	Jobs    []jobs.Job
+	Events  int
+}
+
+func (h *rebuildHub) previewState(t *testing.T, slug string) previewState {
+	t.Helper()
+	ctx := context.Background()
+	live, err := carrypatch.ListLivePatches(ctx, h.Store.Main(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := carrypatch.ListDeletedPatches(ctx, h.Store.Main(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := previewState{Refs: gitrepotest.Git(t, h.repoPath(slug), "for-each-ref"), Patches: append(live, deleted...), Jobs: h.jobsOf(t, slug)}
+	if err := h.Store.Main().QueryRowContext(ctx, `SELECT count(*) FROM hub_events`).Scan(&s.Events); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// leftAsItWas fails the test when the preview state of slug differs from
+// before.
+func (h *rebuildHub) leftAsItWas(t *testing.T, slug string, before previewState) {
+	t.Helper()
+	if after := h.previewState(t, slug); !reflect.DeepEqual(after, before) {
+		t.Errorf("the preview of %s changed its refs, patches, jobs or the event log:\n got %+v\nwant %+v", slug, after, before)
+	}
+}
+
+// outcomes are the entries of p, each "<branch> <status> <conflict files>".
+func outcomes(p previewAnswer) []string {
+	out := []string{}
+	for _, r := range p.PatchResults {
+		out = append(out, fmt.Sprintf("%s %s %q", r.BranchName, r.Status, r.ConflictFiles))
+	}
+	return out
+}
+
+func TestPreview_TestsAMergeWhateverTheStrategy(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	// The first commit of patch/b conflicts with the upstream when it is
+	// replayed alone and its second restores the upstream's content, so a
+	// replay commit by commit conflicts and a merge of the tip does not.
+	h.previewCarry(t, "w", previewCase{
+		history: []histCommit{
+			{from: -1, files: map[string]string{"f.txt": lines("1", "2", "3")}},
+			{from: 0, files: map[string]string{"f.txt": lines("u", "2", "3")}},
+			{from: 0, files: map[string]string{"f.txt": lines("p", "2", "3")}},
+			{from: 2, files: map[string]string{"f.txt": lines("u", "2", "3")}},
+			{from: 0, files: map[string]string{"f.txt": lines("c", "2", "3")}},
+		},
+		upstream: 1,
+		patches:  []previewPatch{{"b", carrypatch.StatusActive, 3}, {"c", carrypatch.StatusActive, 4}},
+	})
+	want := []string{`patch/b would_succeed []`, `patch/c would_conflict ["f.txt"]`}
+	// The rows change the setting of w in turn, so they run one after the
+	// other.
+	for _, strategy := range []string{"rebase", "merge"} {
+		t.Run(strategy, func(t *testing.T) {
+			h.configure(t, "w", map[string]string{"rebuild_strategy": strategy})
+			if got := outcomes(decodePreview(t, h.preview(t, "w"))); !slices.Equal(got, want) {
+				t.Errorf("with rebuild_strategy %s the preview predicted %q, want %q", strategy, got, want)
+			}
+		})
+	}
+}
+
+func TestPreview_IgnoresRememberedResolutions(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	f := h.previewCarry(t, "w", previewCase{
+		history: []histCommit{
+			{from: -1, files: map[string]string{"f.txt": lines("1", "2", "3")}},
+			{from: 0, files: map[string]string{"f.txt": lines("u", "2", "3")}},
+			{from: 0, files: map[string]string{"f.txt": lines("b", "2", "3")}},
+		},
+		upstream: 1,
+		patches:  []previewPatch{{"b", carrypatch.StatusActive, 2}},
+	})
+	// The copy remembers resolutions, as its set-up leaves it, and holds
+	// one for exactly the conflict of patch/b with the upstream.
+	gitrepotest.Git(t, f.dir, "config", "rerere.enabled", "true")
+	seedResolution(t, f.dir, f.ids[1], f.ids[2], map[string]string{"f.txt": lines("resolved", "2", "3")})
+	before := rrCache(t, f.dir)
+	if !slices.ContainsFunc(slices.Collect(maps.Keys(before)), func(p string) bool { return strings.HasSuffix(p, "/postimage") }) {
+		t.Fatalf("the rr-cache holds %q, want a recorded resolution", slices.Sorted(maps.Keys(before)))
+	}
+
+	p := decodePreview(t, h.preview(t, "w"))
+	if got, want := outcomes(p), []string{`patch/b would_conflict ["f.txt"]`}; !slices.Equal(got, want) {
+		t.Errorf("the preview predicted %q, want %q", got, want)
+	}
+	if after := rrCache(t, f.dir); !reflect.DeepEqual(after, before) {
+		t.Errorf("the rr-cache holds %q after the preview, want %q as before", slices.Sorted(maps.Keys(after)), slices.Sorted(maps.Keys(before)))
+	}
+}
+
+// rrCache is the content of every file in the rr-cache of the repository
+// dir, by its path there.
+func rrCache(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	root := filepath.Join(dir, "rr-cache")
+	files := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, e fs.DirEntry, err error) error {
+		if err != nil || e.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		rel, _ := filepath.Rel(root, path)
+		files[filepath.ToSlash(rel)] = string(content)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+func TestPreview_ChangesNothing(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	f := h.previewCarry(t, "w", previewCase{
+		history: []histCommit{
+			{from: -1, files: map[string]string{"f.txt": lines("1", "2", "3")}},
+			{from: 0, files: map[string]string{"f.txt": lines("u", "2", "3")}},
+			{from: 0, files: map[string]string{"a.txt": "a\n"}},
+			{from: 0, files: map[string]string{"f.txt": lines("b", "2", "3")}},
+		},
+		upstream: 1,
+		patches:  []previewPatch{{"a", carrypatch.StatusActive, 2}, {"b", carrypatch.StatusActive, 3}},
+	})
+	h.settledRebuild(t, "w", rebuiltFrom(f.ids[0], f.ids[1]), nil)
+
+	before := h.previewState(t, "w")
+	p := decodePreview(t, h.preview(t, "w"))
+	if got, want := outcomes(p), []string{`patch/a would_succeed []`, `patch/b would_conflict ["f.txt"]`}; !slices.Equal(got, want) {
+		t.Fatalf("the preview predicted %q, want %q", got, want)
+	}
+	h.leftAsItWas(t, "w", before)
+	for _, s := range before.Patches {
+		if s.Status != carrypatch.StatusActive || len(s.ConflictFiles) != 0 {
+			t.Errorf("the stored %s has status %s and conflict files %q, want active and none", s.BranchName, s.Status, s.ConflictFiles)
+		}
+	}
+
+	gitrepotest.Git(t, f.dir, "update-ref", "-d", "refs/remotes/upstream/main")
+	before = h.previewState(t, "w")
+	if a := h.preview(t, "w"); a.status != http.StatusConflict || a.Error.ErrorType != "upstream_unknown" {
+		t.Fatalf("preview without an upstream base = %d %s, want 409 upstream_unknown", a.status, a.raw)
+	}
+	h.leftAsItWas(t, "w", before)
+}
+
+func TestPreview_AnswersBesideARebuild(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	// The cases pass the queue in turn, so they run one after the other.
+	for _, status := range []string{jobs.StatusQueued, jobs.StatusRunning, jobs.StatusFailed} {
+		t.Run(status, func(t *testing.T) {
+			slug := "w-" + status
+			h.previewCarry(t, slug, previewCase{
+				history: []histCommit{{from: -1, files: map[string]string{"base.txt": "base\n"}}, {from: 0, files: map[string]string{"a.txt": "a\n"}}},
+				patches: []previewPatch{{"a", carrypatch.StatusActive, 1}},
+			})
+			job := h.queueRebuild(t, slug)
+			if status != jobs.StatusQueued {
+				h.drive(t, job, status)
+			}
+			before := h.previewState(t, slug)
+			p := decodePreview(t, h.preview(t, slug))
+			if got, want := outcomes(p), []string{`patch/a would_succeed []`}; !slices.Equal(got, want) {
+				t.Errorf("the preview beside a %s rebuild predicted %q, want %q", status, got, want)
+			}
+			h.leftAsItWas(t, slug, before)
+		})
+	}
+}
+
+func TestPreview_GitFailureIsInternalError(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	// The cases count the hub's events in turn, so they run one after the
+	// other.
+	for i, c := range []struct {
+		name string
+		err  error
+	}{
+		{"a git failure that is no conflict", errors.New("fatal: unable to read tree of https://user:s3cret@upstream.example/r.git")},
+		{"a merge stopped by the deadline", fmt.Errorf("git merge-tree: %w", gitrepo.ErrDeadline)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			slug := fmt.Sprintf("w%d", i)
+			f := h.previewCarry(t, slug, previewCase{
+				history: []histCommit{
+					{from: -1, files: map[string]string{"base.txt": "base\n"}},
+					{from: 0, files: map[string]string{"a.txt": "a\n"}},
+					{from: 0, files: map[string]string{"b.txt": "b\n"}},
+				},
+				patches: []previewPatch{{"a", carrypatch.StatusActive, 1}, {"b", carrypatch.StatusActive, 2}},
+			})
+			// The merge of the second patch fails.
+			var failed atomic.Int32
+			h.onTrialMerge(f.dir, func(_, theirs string) error {
+				if theirs != f.ids[2] {
+					return nil
+				}
+				failed.Add(1)
+				return c.err
+			})
+			before := h.previewState(t, slug)
+			a := h.preview(t, slug)
+			if a.status != http.StatusInternalServerError || a.Error.ErrorType != "internal" {
+				t.Errorf("preview = %d %s, want 500 internal", a.status, a.raw)
+			}
+			if bytes.Contains(a.raw, []byte("patch_results")) || bytes.Contains(a.raw, []byte("s3cret")) {
+				t.Errorf("preview answered %s, want no patch_results and no git text", a.raw)
+			}
+			if n := failed.Load(); n != 1 {
+				t.Errorf("the merge of patch/b failed %d times, want once", n)
+			}
+			h.leftAsItWas(t, slug, before)
 		})
 	}
 }

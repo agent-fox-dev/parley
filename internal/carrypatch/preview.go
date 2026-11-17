@@ -178,11 +178,18 @@ func (c *Component) predict(ctx context.Context, repo *gitrepo.Repo, p Patch, st
 }
 
 // trialMerge merges theirs into ours in a trial merge of repo, which
-// changes no ref and reads no remembered resolution.
+// changes no ref and neither reads nor records a remembered resolution:
+// git merge-tree needs no working tree and never consults rr-cache. It is
+// Deps.TrialMerge when that is set. Its failure, a timeout included, is an
+// error of the whole preview, never a conflict.
 func (c *Component) trialMerge(ctx context.Context, repo *gitrepo.Repo, ours, theirs string) (gitrepo.TrialMergeResult, error) {
 	var merged gitrepo.TrialMergeResult
 	err := previewGit(ctx, func(ctx context.Context) (err error) {
-		merged, err = repo.TrialMerge(ctx, ours, theirs)
+		if c.d.TrialMerge != nil {
+			merged, err = c.d.TrialMerge(ctx, repo, ours, theirs)
+		} else {
+			merged, err = repo.TrialMerge(ctx, ours, theirs)
+		}
 		return err
 	})
 	return merged, err

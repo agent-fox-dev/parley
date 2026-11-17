@@ -85,6 +85,11 @@ type Deps struct {
 	// ConflictFiles describes the files of the conflict report of a patch
 	// that did not apply in a rebuild; nil is GitConflictFiles.
 	ConflictFiles ConflictFileDescriber
+	// TrialMerge, when set, replaces gitrepo.Repo.TrialMerge as the trial
+	// merge of a patch tip onto the predicted state in a preview, and is
+	// called as RunGit calls that; only tests set it, to make the merge of
+	// a patch fail.
+	TrialMerge func(ctx context.Context, repo *gitrepo.Repo, ours, theirs string) (gitrepo.TrialMergeResult, error)
 	// Push, when set, replaces gitrepo.Git.Push as the push of the
 	// integration branch to origin after a rebuild's publish, and is called
 	// as RunGit calls that; only tests set it, to see the push or make it

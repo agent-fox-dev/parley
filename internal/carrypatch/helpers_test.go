@@ -22,6 +22,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -716,6 +717,8 @@ type rebuildHub struct {
 	failEvents atomic.Bool
 	// rollbackHooks are the hooks onRollbackSwap gave workspaces, by slug.
 	rollbackHooks sync.Map
+	// trialMerges are the failures onTrialMerge gave copies, by directory.
+	trialMerges sync.Map
 	// gitRun are the arguments of every git command of the carry-patch
 	// component, in the order they ran.
 	gitMu  sync.Mutex
@@ -743,6 +746,7 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 				h.repoPath = d.RepoPath
 				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
 				d.BeforeRollbackSwap = h.beforeRollbackSwap
+				d.TrialMerge = h.trialMerge
 				trace := d.Git.Trace
 				d.Git.Trace = func(args []string) {
 					if trace != nil {
@@ -805,6 +809,22 @@ func (h *rebuildHub) beforeRollbackSwap(slug, _ string) {
 	if fn, ok := h.rollbackHooks.Load(slug); ok {
 		fn.(func())()
 	}
+}
+
+// onTrialMerge makes fail decide each trial merge of a preview of the copy
+// whose git directory is dir: the merge of theirs onto ours fails with the
+// error fail returns, and runs when that is nil.
+func (h *rebuildHub) onTrialMerge(dir string, fail func(ours, theirs string) error) {
+	h.trialMerges.Store(filepath.Clean(dir), fail)
+}
+
+func (h *rebuildHub) trialMerge(ctx context.Context, repo *gitrepo.Repo, ours, theirs string) (gitrepo.TrialMergeResult, error) {
+	if fail, ok := h.trialMerges.Load(repo.Dir()); ok {
+		if err := fail.(func(string, string) error)(ours, theirs); err != nil {
+			return gitrepo.TrialMergeResult{}, err
+		}
+	}
+	return repo.TrialMerge(ctx, ours, theirs)
 }
 
 // gitCommands are the git commands the carry-patch component ran so far,
