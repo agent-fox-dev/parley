@@ -47,6 +47,21 @@ type Deps struct {
 	// to move the branch or change the patch in between as another writer
 	// would.
 	BeforeRefSwap func(slug, branch string)
+	// CommitterName and CommitterEmail are the landing identity, the
+	// committer of every commit a rebuild makes; empty, they are
+	// DefaultCommitterName and DefaultCommitterEmail.
+	CommitterName, CommitterEmail string
+	// BeforeRebuildPatch, when set, is called by an attempt of the rebuild
+	// job with the job's id and the index, from 0, of a patch of the run's
+	// list before the run takes it up, outside any store transaction; only
+	// tests set it, to look at the repository and the job between patches
+	// or to change them as another writer would.
+	BeforeRebuildPatch func(job string, i int)
+	// BeforeRebuildPublish, when set, is called by an attempt of the
+	// rebuild job with the job's id once every patch is processed and
+	// before the publish reads the integration branch, outside any store
+	// transaction; only tests set it.
+	BeforeRebuildPublish func(job string)
 	// Events writes the events of the patch list in the transaction of the
 	// change they report.
 	Events Emitter
@@ -58,6 +73,13 @@ type Deps struct {
 	// deletion of a removed patch's backup ref; nil discards it.
 	Logger *slog.Logger
 }
+
+// The landing identity of a hub that names none, the same as the land
+// component's.
+const (
+	DefaultCommitterName  = "Parley"
+	DefaultCommitterEmail = "parley@localhost"
+)
 
 // Component holds the carry-patch operations of the hub. Its zero value
 // is usable once Bind has given it its Deps.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -32,6 +33,7 @@ const (
 	reasonUpstreamFetchFailed = "upstream_fetch_failed"
 	reasonUpstreamUnknown     = "upstream_unknown"
 	reasonGitError            = "git_error"
+	reasonRefMoved            = "ref_moved"
 	reasonWorkspaceBusy       = "workspace_busy"
 	reasonWorkspaceNotReady   = "workspace_not_ready"
 	reasonWorkspaceArchived   = "workspace_archived"
@@ -54,26 +56,39 @@ func attemptFailed(kind attemptKind, reason string, err error) *attemptOutcome {
 // rebuildRun is one attempt of a rebuild job: the job, what it was queued
 // with, the workspace as the attempt last read it and the result document
 // it keeps whole in memory, since every store of it replaces the job's.
+// Once the upstream base is resolved, it also holds the workspace's
+// repository, the base, the patches as the run listed them, what it did
+// with each and the head under construction.
 type rebuildRun struct {
 	c       *Component
 	job     jobs.Job
 	payload rebuildPayload
 	ws      workspace.Workspace
 	result  rebuildResult
+	results []patchResult
+
+	repo    *gitrepo.Repo
+	base    string
+	patches []runPatch
+	head    string
 }
 
 // runRebuildAttempt runs one attempt of the rebuild job j, which the queue
 // has set running, and returns its outcome; it never ends the process. The
 // attempt reads the workspace first and goes on only when it is ready; it
 // then empties the job's result, fetches upstream and stores the upstream
-// base it starts from.
+// base it starts from. It lists the patches with the tips of their
+// branches, builds the new head from the base and those tips alone in a
+// scratch working tree, and publishes it as the integration branch.
 func (c *Component) runRebuildAttempt(ctx context.Context, j jobs.Job) attemptOutcome {
 	r := &rebuildRun{c: c, job: j}
 	// A payload that does not decode leaves the options at their defaults,
 	// as the job's record shows them.
 	_ = json.Unmarshal(j.Payload, &r.payload)
-	if out := r.start(ctx); out != nil {
-		return *out
+	for _, step := range []func(context.Context) *attemptOutcome{r.start, r.listPatches, r.build, r.publish} {
+		if out := step(ctx); out != nil {
+			return *out
+		}
 	}
 	return attemptOutcome{kind: attemptCompleted}
 }
@@ -85,7 +100,7 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 	if out := r.readWorkspace(ctx); out != nil {
 		return out
 	}
-	r.result = rebuildResult{PatchResults: json.RawMessage("[]")}
+	r.result, r.results = rebuildResult{}, []patchResult{}
 	if out := r.store(ctx); out != nil {
 		return out
 	}
@@ -105,7 +120,7 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 	if err != nil {
 		return attemptFailed(attemptRetryable, reasonGitError, err)
 	}
-	r.result.UpstreamHeadSHA = &base
+	r.base, r.result.UpstreamHeadSHA = base, &base
 	return r.store(ctx)
 }
 
@@ -147,6 +162,11 @@ func (r *rebuildRun) store(ctx context.Context) *attemptOutcome {
 	if r.c.d.Jobs == nil {
 		return attemptFailed(attemptRetryable, reasonGitError, errNotBound)
 	}
+	results, err := json.Marshal(r.results)
+	if err != nil {
+		return attemptFailed(attemptRetryable, reasonGitError, err)
+	}
+	r.result.PatchResults = results
 	doc, err := json.Marshal(r.result)
 	if err != nil {
 		return attemptFailed(attemptRetryable, reasonGitError, err)

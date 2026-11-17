@@ -54,6 +54,48 @@ type rebuildFixture struct {
 	queue      *jobs.Queue
 	secrets    *rebuildSecrets
 	runner     *attemptRunner
+	hooks      rebuildHooks
+}
+
+// rebuildHooks are what a test runs at the points of an attempt the
+// carry-patch component calls its test hooks at: before the run takes up
+// its i-th patch, from 0, and before the publish.
+type rebuildHooks struct {
+	mu        sync.Mutex
+	onPatch   func(i int)
+	onPublish func()
+}
+
+// beforePatch sets fn to run before the run takes up each patch.
+func (h *rebuildHooks) beforePatch(fn func(i int)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onPatch = fn
+}
+
+// beforePublish sets fn to run before the publish.
+func (h *rebuildHooks) beforePublish(fn func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onPublish = fn
+}
+
+func (h *rebuildHooks) patch(_ string, i int) {
+	h.mu.Lock()
+	fn := h.onPatch
+	h.mu.Unlock()
+	if fn != nil {
+		fn(i)
+	}
+}
+
+func (h *rebuildHooks) publish(string) {
+	h.mu.Lock()
+	fn := h.onPublish
+	h.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // startRebuildFixture starts the rebuild fixture, with the workspace's
@@ -97,6 +139,7 @@ func startRebuildFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *re
 				f.secrets.SecretReader = d.Secrets
 				d.Secrets = f.secrets
 				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+bundle)
+				d.BeforeRebuildPatch, d.BeforeRebuildPublish = f.hooks.patch, f.hooks.publish
 			})
 		},
 	})
@@ -142,16 +185,30 @@ func (f *rebuildFixture) record(t *testing.T) workspace.Workspace {
 // adds a file of its own, and returns it.
 func (f *rebuildFixture) addPatch(t *testing.T, branch string) carrypatch.Patch {
 	t.Helper()
+	file := strings.ReplaceAll(branch, "/", "-") + ".txt"
+	return f.putPatch(t, branch, commitFiles(t, f.copy, f.base, branch, map[string]string{file: branch + "\n"}))
+}
+
+// putPatch stores an active patch of branch at the end of the patch list,
+// with its branch in the hub's copy at tip, and returns it.
+func (f *rebuildFixture) putPatch(t *testing.T, branch, tip string) carrypatch.Patch {
+	t.Helper()
 	live, err := carrypatch.ListLivePatches(context.Background(), f.Store.Main(), f.slug)
 	if err != nil {
 		t.Fatal(err)
 	}
-	file := strings.ReplaceAll(branch, "/", "-") + ".txt"
-	tip := commitFiles(t, f.copy, f.base, branch, map[string]string{file: branch + "\n"})
 	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
 	p := livePatch(f.slug, branch, len(live)+1)
 	f.put(t, p)
 	return p
+}
+
+// moveUpstream gives the upstream's main a commit on top of its head that
+// writes the files given, and returns it: the next attempt's upstream
+// base.
+func (f *rebuildFixture) moveUpstream(t *testing.T, msg string, files map[string]string) string {
+	t.Helper()
+	return f.upstream.Branch("main", commitFiles(t, f.upstream.Dir(), f.upstream.Head("main"), msg, files))
 }
 
 // patchList is every stored patch of the workspace: those that are not
@@ -238,10 +295,61 @@ func (f *rebuildFixture) result(t *testing.T, id string) map[string]any {
 	return m
 }
 
+// patchResults is the patch_results of the result document of the job id.
+func (f *rebuildFixture) patchResults(t *testing.T, id string) []map[string]any {
+	t.Helper()
+	raw, ok := f.result(t, id)["patch_results"].([]any)
+	if !ok {
+		t.Fatalf("the result of the job %s holds no patch_results list", id)
+	}
+	results := make([]map[string]any, len(raw))
+	for i, r := range raw {
+		if results[i], ok = r.(map[string]any); !ok {
+			t.Fatalf("patch_results[%d] of the job %s = %v, not an object", i, id, r)
+		}
+	}
+	return results
+}
+
 // commitFiles writes into the repository dir a commit with the message msg
 // on parent ("" for a root commit) whose tree is parent's with the files,
 // at the top level, holding the content given, and returns its id.
 func commitFiles(t *testing.T, dir, parent, msg string, files map[string]string) string {
+	t.Helper()
+	args := []string{"commit-tree", treeWith(t, dir, parent, files), "-m", msg}
+	if parent != "" {
+		args = append(args, "-p", parent)
+	}
+	return gitrepotest.Git(t, dir, args...)
+}
+
+// commitAs writes into the repository dir a commit with the message msg,
+// the author line author (name <email> unix-time zone) and the parents
+// given, the first parent first, whose tree is the first parent's with the
+// files given, and returns its id.
+func commitAs(t *testing.T, dir, msg, author string, files map[string]string, parents ...string) string {
+	t.Helper()
+	first := ""
+	if len(parents) > 0 {
+		first = parents[0]
+	}
+	var obj strings.Builder
+	obj.WriteString("tree " + treeWith(t, dir, first, files) + "\n")
+	for _, p := range parents {
+		obj.WriteString("parent " + p + "\n")
+	}
+	obj.WriteString("author " + author + "\ncommitter Origin <origin@example.invalid> 1500000000 +0000\n\n" + msg + "\n")
+	id, err := gitrepotest.Run(dir, obj.String(), "hash-object", "-t", "commit", "-w", "--stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// treeWith writes into the repository dir the tree of the commit parent
+// ("" for none) with the files, at the top level, holding the content
+// given, and returns its id.
+func treeWith(t *testing.T, dir, parent string, files map[string]string) string {
 	t.Helper()
 	entries := map[string]string{}
 	if parent != "" {
@@ -265,11 +373,18 @@ func commitFiles(t *testing.T, dir, parent, msg string, files map[string]string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"commit-tree", id, "-m", msg}
-	if parent != "" {
-		args = append(args, "-p", parent)
+	return id
+}
+
+// commitsIn are the commits of the repository dir that head reaches and
+// base does not, oldest first, each shown with the git log format given.
+func commitsIn(t *testing.T, dir, base, head, format string) []string {
+	t.Helper()
+	out := gitrepotest.Git(t, dir, "log", "--reverse", "--date=raw", "--format="+format, base+".."+head)
+	if out == "" {
+		return nil
 	}
-	return gitrepotest.Git(t, dir, args...)
+	return strings.Split(out, "\n")
 }
 
 // rebuildSecrets are the workspace secrets of the rebuild fixture, which the
@@ -530,4 +645,49 @@ func TestRebuild_WorkspaceStateAtStart(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRebuild_ListsPatchesInPositionOrder(t *testing.T) {
+	t.Parallel()
+	f := startRebuildFixture(t)
+	tips := map[string]string{}
+	for _, b := range []string{"p1", "p2", "p3", "p4"} {
+		tips[b] = commitFiles(t, f.copy, f.base, b, map[string]string{b + ".txt": b + "\n"})
+		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+b, tips[b])
+	}
+	// The list's order is not the order the patches were stored in.
+	p1, p2, p3 := livePatch(f.slug, "p1", 1), livePatch(f.slug, "p2", 2), livePatch(f.slug, "p3", 3)
+	f.put(t, p3, p1, deletedPatch(f.slug, "p4", at(10, 0)), p2)
+
+	out, id := f.attempt(t, nil)
+	if out.Kind != attemptCompleted {
+		t.Fatalf("the attempt = %+v, want completed", out)
+	}
+	got := f.patchResults(t, id)
+	want := []carrypatch.Patch{p1, p2, p3}
+	if len(got) != len(want) {
+		t.Fatalf("patch_results = %v, want one entry for each of p1, p2 and p3", got)
+	}
+	for i, p := range want {
+		r := got[i]
+		if r["patch_id"] != p.ID || r["branch_name"] != p.BranchName || r["position"] != float64(*p.Position) || r["source_sha"] != tips[p.BranchName] {
+			t.Errorf("patch_results[%d] = %v, want patch %s of %s at position %d from %s", i, r, p.ID, p.BranchName, *p.Position, tips[p.BranchName])
+		}
+	}
+}
+
+// visibleRefs maps every ref of the repository dir under refs/heads/,
+// refs/tags/ and refs/parley/, the refs a client sees or the hub keeps, by
+// its full name to its id. It fails no test, so that a hook may call it.
+func visibleRefs(dir string) (map[string]string, error) {
+	out, err := gitrepotest.Run(dir, "", "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/", "refs/tags/", "refs/parley/")
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	for line := range strings.Lines(out) {
+		name, id, _ := strings.Cut(strings.TrimSpace(line), " ")
+		refs[name] = id
+	}
+	return refs, nil
 }
