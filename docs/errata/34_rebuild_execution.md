@@ -117,6 +117,17 @@ values, since a job deleted before its settlement leaves it kept. The
 blob ids, modes and repository paths, and the scrubber's cut to 1024 bytes
 would make its JSON invalid.
 
+## The 10-minute limit is per step of the scratch tree
+
+The package bounds each single git operation of a run to 10 minutes. The
+limit (`Deps.RebuildGitDeadline`, `DefaultGitDeadline` in production) is
+set by `RunGit` around each step of the build instead: one replay of a
+commit (`Scratch.Pick`), one merge, one learning, one conflict report,
+the discard of leftovers with the creation of the scratch tree. Each step
+runs a few git processes, and a step whose processes together run longer
+than 10 minutes ends the attempt as a retryable `timeout`, its processes
+killed with their process groups.
+
 ## Checks
 
 - The time-limit check of a git operation sets the limit to 5 s, not
