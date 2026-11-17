@@ -3,6 +3,7 @@ package carrypatch
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -20,6 +22,12 @@ import (
 const (
 	scopeRebuildsRead  = "rebuilds:read"
 	scopeRebuildsWrite = "rebuilds:write"
+)
+
+// The events of a cancel and of a requeue of a rebuild job.
+const (
+	EventRebuildCancel  = "parley.rebuild.cancel"
+	EventRebuildRequeue = "parley.rebuild.requeue"
 )
 
 // rebuildRoute declares the rebuild route rt as a carry-patch route of
@@ -37,13 +45,16 @@ func rebuildRoute(kind RouteKind, rt server.Route) server.Route {
 
 // rebuildRoutes are the routes of the rebuild jobs: the submit, a write
 // route that creates, so that the server answers a repeated
-// Idempotency-Key with the first answer, and the list and the read of one
-// job, read routes that serve in every state of the workspace.
+// Idempotency-Key with the first answer; the list and the read of one
+// job, read routes that serve in every state of the workspace; and the
+// cancel and the requeue of one job, write routes that change it.
 func (c *Component) rebuildRoutes() []server.Route {
 	return []server.Route{
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuild", Handler: c.submitRoute, Create: true}),
 		rebuildRoute(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/rebuilds", Handler: c.listRebuildsRoute}),
 		rebuildRoute(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/rebuilds/:id", Handler: c.readRebuildRoute}),
+		rebuildRoute(WriteRoute, server.Route{Method: http.MethodDelete, Pattern: "/workspaces/:slug/rebuilds/:id", Handler: c.cancelRebuildRoute}),
+		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuilds/:id/requeue", Handler: c.requeueRebuildRoute}),
 	}
 }
 
@@ -148,6 +159,80 @@ func (c *Component) rebuildJob(ctx context.Context, slug, id string) (jobs.Job, 
 // errRebuildNotFound is the 404 of a rebuild job the workspace does not
 // have.
 func errRebuildNotFound() error { return server.NotFound("rebuild job not found") }
+
+// cancelRebuildRoute answers DELETE /workspaces/:slug/rebuilds/:id: it
+// cancels the queued job and answers its record; a job in any other status
+// is 409 job_not_cancellable.
+func (c *Component) cancelRebuildRoute(w http.ResponseWriter, r *http.Request) error {
+	if c.d.Jobs == nil {
+		return errNotBound
+	}
+	return c.changeRebuild(w, r, EventRebuildCancel, c.d.Jobs.Cancel)
+}
+
+// requeueRebuildRoute answers POST /workspaces/:slug/rebuilds/:id/requeue,
+// whatever its body: it queues the dead-lettered job again, from a retry
+// count of 0, and answers its record. A job in any other status is 409
+// job_not_requeueable, whatever the workspace's other jobs are; a
+// dead-lettered one while another rebuild of the workspace is queued,
+// running or failed is 409 concurrent_rebuild, naming that job.
+func (c *Component) requeueRebuildRoute(w http.ResponseWriter, r *http.Request) error {
+	if c.d.Jobs == nil {
+		return errNotBound
+	}
+	return c.changeRebuild(w, r, EventRebuildRequeue, c.d.Jobs.Requeue)
+}
+
+// changeRebuild answers a route that changes one rebuild job: after the
+// guard and the lookup, change and the event typ, with the caller as its
+// actor and no metadata, are written in one store transaction, and the
+// answer is the record of the job as change left it.
+func (c *Component) changeRebuild(w http.ResponseWriter, r *http.Request, typ string,
+	change func(ctx context.Context, tx *sql.Tx, id string) (jobs.Job, error)) error {
+	if c.d.Store == nil || c.d.Events == nil {
+		return errNotBound
+	}
+	ws, err := c.Guard(r)
+	if err != nil {
+		return err
+	}
+	j, err := c.rebuildJob(r.Context(), ws.Slug, server.Param(r, "id"))
+	if err != nil {
+		return err
+	}
+	by, err := actorOf(r)
+	if err != nil {
+		return err
+	}
+	ctx := r.Context()
+	var changed jobs.Job
+	err = c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if changed, err = change(ctx, tx, j.ID); err != nil {
+			return err
+		}
+		_, err = c.d.Events.Emit(ctx, tx, event.Input{
+			Type: typ, Workspace: &ws.Slug, ActorType: by.typ, ActorID: by.id, ResourceType: rebuildResource, ResourceID: j.ID,
+		})
+		return err
+	})
+	if dup, ok := errors.AsType[*jobs.DuplicateError](err); ok {
+		return errConcurrentRebuild(ws.Slug, dup.JobID)
+	}
+	switch {
+	case errors.Is(err, jobs.ErrNotCancellable):
+		return server.NewError("job_not_cancellable", http.StatusConflict, fmt.Sprintf("rebuild job %s is not queued; only a queued job can be cancelled", j.ID))
+	case errors.Is(err, jobs.ErrNotRequeueable):
+		return server.NewError("job_not_requeueable", http.StatusConflict, fmt.Sprintf("rebuild job %s is not dead_letter; only a dead_letter job can be requeued", j.ID))
+	case errors.Is(err, jobs.ErrNotFound):
+		// Removed with its workspace since the lookup.
+		return errRebuildNotFound()
+	case err != nil:
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, RebuildRecordOf(changed))
+	return nil
+}
 
 // submitRoute answers POST /workspaces/:slug/rebuild: it queues a rebuild
 // of the workspace and answers 202 with the job's record. The body is

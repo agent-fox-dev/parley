@@ -711,7 +711,7 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 	t.Helper()
 	h := &rebuildHub{
 		addHub: &addHub{readHub: &readHub{}, now: time.Now().UTC().Truncate(time.Second).Add(700 * time.Millisecond)},
-		runner: &rebuildRunner{attempts: map[string]*rebuildAttempt{}, done: make(chan struct{})},
+		runner: &rebuildRunner{attempts: map[string]*rebuildAttempt{}, calls: map[string]int{}, done: make(chan struct{})},
 	}
 	clock := &stillClock{now: h.clock, armed: make(chan struct{})}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
@@ -800,6 +800,18 @@ func (h *rebuildHub) submit(t *testing.T, slug string, body any, header http.Hea
 func (h *rebuildHub) readRebuild(t *testing.T, slug, id string) answer {
 	t.Helper()
 	return h.call(t, h.key, http.MethodGet, "/workspaces/"+slug+"/rebuilds/"+id, nil, nil)
+}
+
+// cancel sends DELETE /workspaces/<slug>/rebuilds/<id> as the owner.
+func (h *rebuildHub) cancel(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodDelete, "/workspaces/"+slug+"/rebuilds/"+id, nil, nil)
+}
+
+// requeue sends POST /workspaces/<slug>/rebuilds/<id>/requeue as the owner.
+func (h *rebuildHub) requeue(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodPost, "/workspaces/"+slug+"/rebuilds/"+id+"/requeue", nil, nil)
 }
 
 // mustSubmit submits a rebuild of slug with no body, fails the test unless
@@ -893,26 +905,20 @@ func (h *rebuildHub) pass(t *testing.T) {
 // drive moves the queued job id to status through the queue: a pass claims
 // it and its attempt runs on (running, until finish or the end of the
 // test), completes (completed), fails and waits for its retry (failed) or
-// fails for good (dead_letter). A cancelled job is written as a cancel
-// leaves it.
+// fails for good (dead_letter); a cancel cancels it (cancelled).
 func (h *rebuildHub) drive(t *testing.T, id, status string) {
 	t.Helper()
-	if status == jobs.StatusCancelled {
+	switch status {
+	case jobs.StatusCancelled:
 		ctx := context.Background()
-		now := h.clock().UnixNano()
 		if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, completed_at = ?, updated_at = ? WHERE id = ? AND status = ?`,
-				jobs.StatusCancelled, now, now, id, jobs.StatusQueued)
+			_, err := h.queue.Cancel(ctx, tx, id)
 			return err
 		}); err != nil {
 			t.Fatalf("cancel the job %s: %v", id, err)
 		}
-		h.wantStatus(t, id, status)
-		return
-	}
-	a := h.runner.expect(id)
-	switch status {
 	case jobs.StatusRunning:
+		a := h.runner.expect(id)
 		// Ends with the test, unless the test finishes it first.
 		t.Cleanup(func() {
 			select {
@@ -920,21 +926,40 @@ func (h *rebuildHub) drive(t *testing.T, id, status string) {
 			default:
 			}
 		})
+		h.pass(t)
+		within(t, a.entered, "the attempt of the job "+id+" to begin")
 	case jobs.StatusCompleted:
-		a.outcome <- nil
+		h.attempt(t, id, nil)
 	case jobs.StatusFailed:
-		a.outcome <- errors.New("the upstream is unreachable")
+		h.attempt(t, id, errors.New("the upstream is unreachable"))
 	case jobs.StatusDeadLetter:
-		a.outcome <- jobs.Permanent(errors.New("the patch list cannot be applied"))
+		h.attempt(t, id, jobs.Permanent(errors.New("the patch list cannot be applied")))
 	default:
 		t.Fatalf("drive the job %s to %s: not a status a test drives a job to", id, status)
 	}
+	h.wantStatus(t, id, status)
+}
+
+// attempt runs an attempt of the job id, queued or due for its retry, that
+// returns err, and waits until its outcome is settled.
+func (h *rebuildHub) attempt(t *testing.T, id string, err error) {
+	t.Helper()
+	a := h.runner.expect(id)
+	a.outcome <- err
 	h.pass(t)
 	within(t, a.entered, "the attempt of the job "+id+" to begin")
-	if status != jobs.StatusRunning {
-		h.settled(t, a)
+	h.settled(t, a)
+}
+
+// fail runs n attempts of the job id that fail with a retryable error, and
+// moves the clock on to the next attempt after each: the job is then due
+// for that attempt with the retry count n.
+func (h *rebuildHub) fail(t *testing.T, id string, n int) {
+	t.Helper()
+	for range n {
+		h.attempt(t, id, errors.New("fetch failed"))
+		h.advance(h.job(t, id).NextAttemptAt.Sub(h.clock()))
 	}
-	h.wantStatus(t, id, status)
 }
 
 // finish ends the running attempt of the job id, which drive started, with
@@ -980,10 +1005,12 @@ func within(t *testing.T, ch <-chan struct{}, what string) {
 // attempt of a job expect scripted returns what the test sends on its
 // outcome, or nil once the runner stops; an attempt of any other job
 // completes at once, so that a pass a test runs for its own job does not
-// leave another test's job holding a worker.
+// leave another test's job holding a worker. It counts the attempts of
+// every job.
 type rebuildRunner struct {
 	mu       sync.Mutex
 	attempts map[string]*rebuildAttempt
+	calls    map[string]int
 	done     chan struct{}
 	stopOnce sync.Once
 }
@@ -1000,11 +1027,20 @@ type rebuildAttempt struct {
 	payload json.RawMessage
 }
 
-// expect scripts the attempt of the job id, and returns its script.
+// expect scripts the attempt of the job id, and returns its script: that
+// of the attempt scripted last, unless it has been settled, when it scripts
+// the next.
 func (r *rebuildRunner) expect(id string) *rebuildAttempt {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	a, ok := r.attempts[id]
+	if ok {
+		select {
+		case <-a.settled:
+			ok = false
+		default:
+		}
+	}
 	if !ok {
 		a = &rebuildAttempt{outcome: make(chan error, 1), entered: make(chan struct{}), settled: make(chan struct{})}
 		r.attempts[id] = a
@@ -1029,17 +1065,28 @@ func (r *rebuildRunner) payloadOf(id string) json.RawMessage {
 	return nil
 }
 
+// callsOf is the number of attempts of the job id the runner was called
+// for.
+func (r *rebuildRunner) callsOf(id string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[id]
+}
+
 // stop ends every attempt still running.
 func (r *rebuildRunner) stop() { r.stopOnce.Do(func() { close(r.done) }) }
 
 func (r *rebuildRunner) Run(ctx context.Context, j jobs.Job) error {
-	a := r.scripted(j.ID)
+	r.mu.Lock()
+	r.calls[j.ID]++
+	a := r.attempts[j.ID]
+	if a != nil {
+		a.payload = j.Payload
+	}
+	r.mu.Unlock()
 	if a == nil {
 		return nil
 	}
-	r.mu.Lock()
-	a.payload = j.Payload
-	r.mu.Unlock()
 	a.enteredOnce.Do(func() { close(a.entered) })
 	select {
 	case err := <-a.outcome:

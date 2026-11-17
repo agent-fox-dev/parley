@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -20,6 +22,13 @@ import (
 // shell, in order. It returns the hub, origin and the ids of the patches.
 func startPatchHub(t *testing.T, branches ...string) (*workspaceHub, *gitrepotest.Origin, []string) {
 	t.Helper()
+	return startPatchHubWith(t, nil, nil, branches...)
+}
+
+// startPatchHubWith is startPatchHub with the hub's clock now and the change
+// compose to its composition, as startCarryPatchHubWith takes them.
+func startPatchHubWith(t *testing.T, now func() time.Time, compose func(*hub.Composition), branches ...string) (*workspaceHub, *gitrepotest.Origin, []string) {
+	t.Helper()
 	origin := gitrepotest.NewOrigin(t)
 	origin.Commit("main", "o1")
 	for _, branch := range branches {
@@ -28,7 +37,7 @@ func startPatchHub(t *testing.T, branches ...string) (*workspaceHub, *gitrepotes
 	}
 	up := gitrepotest.NewOrigin(t)
 	up.Commit("main", "u1")
-	h := startCarryPatchHub(t, origin, up)
+	h := startCarryPatchHubWith(t, origin, up, now, compose)
 	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces", h.key, map[string]any{
 		"slug": "carry", "git_url": origin.URL(), "workspace_mode": "carry_patch", "upstream_url": up.URL(),
 	})

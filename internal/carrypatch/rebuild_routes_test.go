@@ -252,6 +252,17 @@ func TestRebuild_KeepsTheOptionsItWasQueuedWith(t *testing.T) {
 	h.wantStatus(t, id, jobs.StatusDeadLetter)
 	captured("dead-lettered,")
 
+	if a := h.requeue(t, "w", id); a.status != http.StatusOK {
+		t.Fatalf("requeue = %d %s, want 200", a.status, a.raw)
+	}
+	captured("requeued,")
+	first := h.runner.payloadOf(id)
+	h.drive(t, id, jobs.StatusCompleted)
+	if again := h.runner.payloadOf(id); string(again) != string(first) {
+		t.Errorf("the attempt after the requeue was given %s, want %s", again, first)
+	}
+	captured("completed after its requeue,")
+
 	// A job queued now takes the settings as they are now.
 	if a := h.submit(t, "w", nil, nil); a.status != http.StatusAccepted || a.patch["strategy"] != "merge" || a.patch["fail_mode"] != "continue" {
 		t.Errorf("a later submit = %d %s, want 202 with merge and continue", a.status, a.raw)
@@ -332,6 +343,13 @@ func TestReadRebuild_AnswersTheWholeRecordInEveryStatus(t *testing.T) {
 			return m
 		}()},
 		{"cancelled", jobs.StatusCancelled, func(t *testing.T, id string) { h.drive(t, id, jobs.StatusCancelled) }, defaults},
+		{"requeued", jobs.StatusQueued, func(t *testing.T, id string) {
+			h.fail(t, id, 1)
+			h.attempt(t, id, jobs.WithDetail(jobs.Permanent(errors.New("patch 2 conflicts")), json.RawMessage(conflict)))
+			if a := h.requeue(t, h.job(t, id).Workspace, id); a.status != http.StatusOK {
+				t.Fatalf("requeue = %d %s, want 200", a.status, a.raw)
+			}
+		}, defaults},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			slug := fmt.Sprintf("w%d", i)
@@ -468,7 +486,7 @@ func TestRebuildJob_AnswersNotFoundForAJobTheWorkspaceDoesNotHold(t *testing.T) 
 	}
 	before := map[string]jobs.Job{deadLetter: h.job(t, deadLetter), queued: h.job(t, queued), otherType.ID: h.job(t, otherType.ID)}
 
-	routes := []struct{ method, suffix string }{{http.MethodGet, ""}}
+	routes := []struct{ method, suffix string }{{http.MethodGet, ""}, {http.MethodDelete, ""}, {http.MethodPost, "/requeue"}}
 	ids := map[string]string{
 		"not a UUID": "abc", "an unknown UUID": uuid.NewV4().String(), "a queued job of w2": queued,
 		"a dead-lettered job of w2": deadLetter, "a job of another type": otherType.ID,
@@ -490,10 +508,265 @@ func TestRebuildJob_AnswersNotFoundForAJobTheWorkspaceDoesNotHold(t *testing.T) 
 				t.Errorf("the job %s is %+v after the refusals, want %+v", id, after, j)
 			}
 		}
-		for _, typ := range []string{"parley.rebuild.cancel", "parley.rebuild.requeue"} {
-			if got := h.rebuildEvents(t, "w2", typ); len(got) != 0 {
-				t.Errorf("w2 has %d %s events, want none", len(got), typ)
+		for _, slug := range []string{"w", "w2"} {
+			for _, typ := range []string{carrypatch.EventRebuildCancel, carrypatch.EventRebuildRequeue} {
+				if got := h.rebuildEvents(t, slug, typ); len(got) != 0 {
+					t.Errorf("%s has %d %s events, want none", slug, len(got), typ)
+				}
 			}
 		}
 	})
+}
+
+// callerEvent is the one event of typ the owner's cancel or requeue of the
+// job id writes: the caller as actor, no metadata.
+func (h *rebuildHub) callerEvent(id string) []rebuildEvent {
+	return []rebuildEvent{{ResourceType: "rebuild", ResourceID: id, ActorType: "api_key", ActorID: &h.owner, Metadata: map[string]any{}}}
+}
+
+func TestCancelRebuild_CancelsAQueuedJob(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	h.carryWith(t, "w", nil, carrypatch.StatusActive)
+	id := h.mustSubmit(t, "w")
+
+	a := h.cancel(t, "w", id)
+	if a.status != http.StatusOK || a.patch["status"] != jobs.StatusCancelled || a.patch["completed_at"] == nil {
+		t.Fatalf("cancel = %d %s, want 200 cancelled with completed_at", a.status, a.raw)
+	}
+	if want := h.recordOf(t, id); !reflect.DeepEqual(a.patch, want) {
+		t.Errorf("cancel answered %s, want the job's record %v", a.raw, want)
+	}
+	if got, want := h.rebuildEvents(t, "w", carrypatch.EventRebuildCancel), h.callerEvent(id); !reflect.DeepEqual(got, want) {
+		t.Errorf("the cancel events are %+v, want %+v", got, want)
+	}
+	h.pass(t)
+	h.wantStatus(t, id, jobs.StatusCancelled)
+	if n := h.runner.callsOf(id); n != 0 {
+		t.Errorf("the handler was called %d times for the cancelled job, want never", n)
+	}
+	if a := h.submit(t, "w", nil, nil); a.status != http.StatusAccepted {
+		t.Errorf("a submit after the cancel = %d %s, want 202", a.status, a.raw)
+	}
+}
+
+func TestCancelRebuild_RefusesAJobThatIsNotQueued(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	// The cases pass the queue in turn, so they run one after the other.
+	for i, status := range []string{jobs.StatusRunning, jobs.StatusFailed, jobs.StatusCompleted, jobs.StatusDeadLetter, jobs.StatusCancelled} {
+		t.Run(status, func(t *testing.T) {
+			slug := fmt.Sprintf("w%d", i)
+			h.carryWith(t, slug, nil, carrypatch.StatusActive)
+			id := h.mustSubmit(t, slug)
+			h.drive(t, id, status)
+			before, events := h.job(t, id), len(h.rebuildEvents(t, slug, carrypatch.EventRebuildCancel))
+
+			if a := h.cancel(t, slug, id); a.status != http.StatusConflict || a.Error.ErrorType != "job_not_cancellable" {
+				t.Errorf("cancel = %d %s, want 409 job_not_cancellable", a.status, a.raw)
+			}
+			if after := h.job(t, id); !reflect.DeepEqual(after, before) {
+				t.Errorf("the job is %+v after the refusal, want %+v", after, before)
+			}
+			if got := len(h.rebuildEvents(t, slug, carrypatch.EventRebuildCancel)); got != events {
+				t.Errorf("%s has %d cancel events after the refusal, want %d", slug, got, events)
+			}
+		})
+	}
+}
+
+func TestCancelRebuild_EitherCancelsOrLosesToTheClaim(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	h.carryWith(t, "w", nil, carrypatch.StatusActive)
+	// Every other pass is preceded by a request like the cancel, a read of
+	// the job, so that the claim reaches the store first in some rounds and
+	// the cancel in others.
+	transport := &http.Transport{}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport}
+	outcomes := map[int]int{}
+	for i := range 100 {
+		id := h.mustSubmit(t, "w")
+		attempt := h.runner.expect(id)
+		attempt.outcome <- nil
+		passed := make(chan error, 1)
+		go func() {
+			req, err := http.NewRequest(http.MethodGet, h.URL("/api/v1/workspaces/w/rebuilds/"+id), nil)
+			if err == nil && i%2 == 1 {
+				req.Header.Set("Authorization", "Bearer "+h.key)
+				var res *http.Response
+				if res, err = client.Do(req); err == nil {
+					err = res.Body.Close()
+				}
+			}
+			if err != nil {
+				passed <- err
+				return
+			}
+			passed <- h.queue.Pass(context.Background())
+		}()
+		a := h.cancel(t, "w", id)
+		if err := <-passed; err != nil {
+			t.Fatalf("pass the job queue: %v", err)
+		}
+		outcomes[a.status]++
+		switch {
+		case a.status == http.StatusOK && a.patch["status"] == jobs.StatusCancelled:
+			h.wantStatus(t, id, jobs.StatusCancelled)
+			if n := h.runner.callsOf(id); n != 0 {
+				t.Fatalf("the handler was called %d times for the cancelled job %s, want never", n, id)
+			}
+		case a.status == http.StatusConflict && a.Error.ErrorType == "job_not_cancellable":
+			h.settled(t, attempt)
+			h.wantStatus(t, id, jobs.StatusCompleted)
+			if n := h.runner.callsOf(id); n != 1 {
+				t.Fatalf("the handler was called %d times for the claimed job %s, want once", n, id)
+			}
+		default:
+			t.Fatalf("cancel = %d %s, want 200 cancelled or 409 job_not_cancellable", a.status, a.raw)
+		}
+	}
+	t.Logf("cancels answered by status: %v", outcomes)
+}
+
+func TestRequeueRebuild_QueuesADeadLetteredJobAgain(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	const detail = `{"files":["a.go"],"kind":"content"}`
+	// The cases pass the queue in turn, so they run one after the other.
+	for i, c := range []struct {
+		name       string
+		deadLetter func(t *testing.T, id string)
+		retries    int
+	}{
+		{"a permanent error with a detail", func(t *testing.T, id string) {
+			h.attempt(t, id, jobs.WithDetail(jobs.Permanent(errors.New("patch 2 conflicts")), json.RawMessage(detail)))
+		}, 0},
+		{"its retries exhausted", func(t *testing.T, id string) {
+			h.fail(t, id, jobs.MaxRetries)
+			h.attempt(t, id, errors.New("fetch failed"))
+		}, jobs.MaxRetries},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			slug := fmt.Sprintf("w%d", i)
+			h.carryWith(t, slug, nil, carrypatch.StatusActive)
+			id := h.mustSubmit(t, slug)
+			c.deadLetter(t, id)
+			before := h.recordOf(t, id)
+			if before["status"] != jobs.StatusDeadLetter || before["retry_count"] != float64(c.retries) || before["error"] == nil {
+				t.Fatalf("the job before the requeue is %v, want dead_letter with an error at retry_count %d", before, c.retries)
+			}
+			payload, calls := h.runner.payloadOf(id), h.runner.callsOf(id)
+
+			a := h.requeue(t, slug, id)
+			if a.status != http.StatusOK {
+				t.Fatalf("requeue = %d %s, want 200", a.status, a.raw)
+			}
+			want := map[string]any{"status": jobs.StatusQueued, "retry_count": 0.0, "error": nil, "conflict": nil, "completed_at": nil, "next_attempt_at": nil}
+			for _, k := range []string{"id", "created_at", "strategy", "fail_mode", "integration_branch", "submitted_by"} {
+				want[k] = before[k]
+			}
+			for k, v := range want {
+				if !reflect.DeepEqual(a.patch[k], v) {
+					t.Errorf("requeue answered %s %v, want %v", k, a.patch[k], v)
+				}
+			}
+			if stored := h.recordOf(t, id); !reflect.DeepEqual(a.patch, stored) {
+				t.Errorf("requeue answered %s, want the job's record %v", a.raw, stored)
+			}
+			if got, want := h.rebuildEvents(t, slug, carrypatch.EventRebuildRequeue), h.callerEvent(id); !reflect.DeepEqual(got, want) {
+				t.Errorf("the requeue events are %+v, want %+v", got, want)
+			}
+
+			h.drive(t, id, jobs.StatusCompleted)
+			if n, again := h.runner.callsOf(id), h.runner.payloadOf(id); n != calls+1 || string(again) != string(payload) {
+				t.Errorf("after the requeue the handler was called %d more times with %s, want once with %s", n-calls, again, payload)
+			}
+		})
+	}
+}
+
+func TestRequeueRebuild_RefusesAJobThatIsNotDeadLettered(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	// The cases pass the queue in turn, so they run one after the other.
+	for i, c := range []struct {
+		status string
+		// otherQueued queues another job of the workspace before the requeue.
+		otherQueued bool
+	}{
+		{jobs.StatusQueued, false}, {jobs.StatusRunning, false}, {jobs.StatusFailed, false},
+		{jobs.StatusCompleted, false}, {jobs.StatusCancelled, false},
+		{jobs.StatusCompleted, true}, {jobs.StatusCancelled, true},
+	} {
+		t.Run(fmt.Sprintf("%s another queued %v", c.status, c.otherQueued), func(t *testing.T) {
+			slug := fmt.Sprintf("w%d", i)
+			h.carryWith(t, slug, nil, carrypatch.StatusActive)
+			id := h.mustSubmit(t, slug)
+			if c.status != jobs.StatusQueued {
+				h.drive(t, id, c.status)
+			}
+			if c.otherQueued {
+				h.mustSubmit(t, slug)
+			}
+			before := h.job(t, id)
+
+			if a := h.requeue(t, slug, id); a.status != http.StatusConflict || a.Error.ErrorType != "job_not_requeueable" {
+				t.Errorf("requeue = %d %s, want 409 job_not_requeueable", a.status, a.raw)
+			}
+			if after := h.job(t, id); !reflect.DeepEqual(after, before) {
+				t.Errorf("the job is %+v after the refusal, want %+v", after, before)
+			}
+			if got := h.rebuildEvents(t, slug, carrypatch.EventRebuildRequeue); len(got) != 0 {
+				t.Errorf("%s has %d requeue events, want none", slug, len(got))
+			}
+		})
+	}
+}
+
+func TestRequeueRebuild_RefusesWhileAnotherRebuildIsPending(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	// The cases pass the queue in turn, so they run one after the other.
+	for i, c := range []struct {
+		other string
+		want  int
+	}{
+		{jobs.StatusQueued, http.StatusConflict}, {jobs.StatusRunning, http.StatusConflict}, {jobs.StatusFailed, http.StatusConflict},
+		{jobs.StatusCompleted, http.StatusOK}, {jobs.StatusCancelled, http.StatusOK}, {jobs.StatusDeadLetter, http.StatusOK},
+	} {
+		t.Run("the other "+c.other, func(t *testing.T) {
+			slug := fmt.Sprintf("w%d", i)
+			h.carryWith(t, slug, nil, carrypatch.StatusActive)
+			id := h.mustSubmit(t, slug)
+			h.drive(t, id, jobs.StatusDeadLetter)
+			other := h.mustSubmit(t, slug)
+			if c.other != jobs.StatusQueued {
+				h.drive(t, other, c.other)
+			}
+			before, otherBefore := h.job(t, id), h.job(t, other)
+
+			a := h.requeue(t, slug, id)
+			if a.status != c.want {
+				t.Fatalf("requeue = %d %s, want %d", a.status, a.raw, c.want)
+			}
+			if after := h.job(t, other); !reflect.DeepEqual(after, otherBefore) {
+				t.Errorf("the other job is %+v after the requeue, want %+v", after, otherBefore)
+			}
+			if c.want == http.StatusOK {
+				h.wantStatus(t, id, jobs.StatusQueued)
+				return
+			}
+			if a.Error.ErrorType != "concurrent_rebuild" || !strings.Contains(a.Error.Message, other) {
+				t.Errorf("requeue = %s, want concurrent_rebuild naming %s", a.raw, other)
+			}
+			if after := h.job(t, id); !reflect.DeepEqual(after, before) {
+				t.Errorf("the job is %+v after the refusal, want %+v", after, before)
+			}
+			if got := h.rebuildEvents(t, slug, carrypatch.EventRebuildRequeue); len(got) != 0 {
+				t.Errorf("%s has %d requeue events, want none", slug, len(got))
+			}
+		})
+	}
 }

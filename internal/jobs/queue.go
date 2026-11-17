@@ -440,7 +440,9 @@ func queuedJobs(ctx context.Context, tx *sql.Tx, types []string) ([]Job, error) 
 }
 
 // claimJob sets the queued job id running in tx, emptying its result; it
-// reports false when the job was no longer queued, a claim lost.
+// reports false when the job was no longer queued, a claim lost. Cancel
+// takes a job on the same condition, so a job is claimed or cancelled,
+// never both.
 func claimJob(ctx context.Context, tx *sql.Tx, id string, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx, `UPDATE jobs SET status = ?, result = NULL, updated_at = ? WHERE id = ? AND status = ?`,
 		StatusRunning, now.UnixNano(), id, StatusQueued)
