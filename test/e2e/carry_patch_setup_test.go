@@ -30,6 +30,13 @@ func startCarryPatchHub(t *testing.T, origin, up *gitrepotest.Origin) *workspace
 // (nothing when nil), such as the job queue's handlers and clock.
 func startCarryPatchHubWith(t *testing.T, origin, up *gitrepotest.Origin, now func() time.Time, compose func(*hub.Composition)) *workspaceHub {
 	t.Helper()
+	return startCarryPatchHubConfig(t, origin, up, hubtest.Config{Now: now, Compose: compose})
+}
+
+// startCarryPatchHubConfig starts a hub as startCarryPatchHub does, with
+// what cfg sets of its clock, composition and maintenance interval.
+func startCarryPatchHubConfig(t *testing.T, origin, up *gitrepotest.Origin, cfg hubtest.Config) *workspaceHub {
+	t.Helper()
 	var bundle []byte
 	for _, o := range []*gitrepotest.Origin{origin, up} {
 		b, err := os.ReadFile(o.CAFile())
@@ -51,8 +58,9 @@ func startCarryPatchHubWith(t *testing.T, origin, up *gitrepotest.Origin, now fu
 		Server:  `external_url = "https://hub.example/"`,
 		TOML:    "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n",
 		Env:     map[string]string{"GIT_SSL_CAINFO": caFile, secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw)},
-		Now:     now,
-		Compose: compose,
+		Now:                 cfg.Now,
+		Compose:             cfg.Compose,
+		MaintenanceInterval: cfg.MaintenanceInterval,
 	})
 	h.user = h.CreateUser(t, "dev")
 	h.key = h.IssueKey(t, h.user)

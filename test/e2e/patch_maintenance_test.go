@@ -1,17 +1,21 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -29,6 +33,13 @@ func startPatchHub(t *testing.T, branches ...string) (*workspaceHub, *gitrepotes
 // compose to its composition, as startCarryPatchHubWith takes them.
 func startPatchHubWith(t *testing.T, now func() time.Time, compose func(*hub.Composition), branches ...string) (*workspaceHub, *gitrepotest.Origin, []string) {
 	t.Helper()
+	return startPatchHubConfig(t, hubtest.Config{Now: now, Compose: compose}, branches...)
+}
+
+// startPatchHubConfig is startPatchHub on a hub started with what cfg sets
+// of its clock, composition and maintenance interval.
+func startPatchHubConfig(t *testing.T, cfg hubtest.Config, branches ...string) (*workspaceHub, *gitrepotest.Origin, []string) {
+	t.Helper()
 	origin := gitrepotest.NewOrigin(t)
 	origin.Commit("main", "o1")
 	for _, branch := range branches {
@@ -37,7 +48,7 @@ func startPatchHubWith(t *testing.T, now func() time.Time, compose func(*hub.Com
 	}
 	up := gitrepotest.NewOrigin(t)
 	up.Commit("main", "u1")
-	h := startCarryPatchHubWith(t, origin, up, now, compose)
+	h := startCarryPatchHubConfig(t, origin, up, cfg)
 	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces", h.key, map[string]any{
 		"slug": "carry", "git_url": origin.URL(), "workspace_mode": "carry_patch", "upstream_url": up.URL(),
 	})
@@ -209,5 +220,94 @@ func TestPatchMaintenance_ResetToOrigin(t *testing.T) {
 
 	if again := h.document(t, "patch", "reset-to-origin", "carry", a); again["action"] != "none" {
 		t.Errorf("a second patch reset-to-origin printed %v, want action none", again)
+	}
+}
+
+// A developer soft-deleted one patch more than 7 days ago and another
+// yesterday: the hub's maintenance passes purge the first, with its backup
+// ref, and keep its branch and the second patch; the passes go on after a
+// restart, the purge failing in none of them.
+func TestPatchMaintenance_APassPurgesAPatchDeletedMoreThanSevenDaysAgo(t *testing.T) {
+	parallel(t)
+	clock := &fakeNow{now: time.Now().UTC()}
+	// passes counts the maintenance passes that reached the task after
+	// patch_purge: a task the loop does not know runs after those it does.
+	var passes atomic.Int32
+	h, _, ids := startPatchHubConfig(t, hubtest.Config{
+		Now:                 clock.Now,
+		MaintenanceInterval: 50 * time.Millisecond,
+		Compose: func(c *hub.Composition) {
+			c.AddMaintenanceTask("test-after-purge", func(context.Context, *hub.Runtime) error {
+				passes.Add(1)
+				return nil
+			})
+		},
+	}, "p-old", "p-new")
+	copyDir := filepath.Join(h.root, "carry.git")
+	gitrepotest.Git(t, copyDir, "update-ref", "refs/parley/replaced/p-old", "refs/heads/p-old")
+	oldTip := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/p-old")
+	remove := func(id string) {
+		t.Helper()
+		if status, body := h.Call(t, http.MethodDelete, "/api/v1/workspaces/carry/patches/"+id, h.key, nil); status != http.StatusOK && status != http.StatusNoContent {
+			t.Fatalf("DELETE the patch %s = %d %s, want it soft-deleted", id, status, body)
+		}
+	}
+	remove(ids[0])
+	clock.advance(7 * 24 * time.Hour)
+	remove(ids[1])
+	clock.advance(24 * time.Hour)
+
+	branchesListed := func() []string {
+		status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/carry/patches?include_deleted=true", h.key, nil)
+		var list patchItems
+		if status != http.StatusOK || json.Unmarshal(body, &list) != nil {
+			t.Fatalf("GET the patches with include_deleted=true = %d %s", status, body)
+		}
+		var branches []string
+		for _, p := range list.Items {
+			branches = append(branches, p.BranchName)
+		}
+		return branches
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !slices.Equal(branchesListed(), []string{"p-new"}) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the patches with include_deleted=true are %v after 10 s, want p-new alone", branchesListed())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	h.Restart(t)
+	after := passes.Load()
+	deadline = time.Now().Add(10 * time.Second)
+	for passes.Load() < after+2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d maintenance passes reached the end after the restart within 10 s, want at least 2", passes.Load()-after)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := branchesListed(); !slices.Equal(got, []string{"p-new"}) {
+		t.Errorf("the patches with include_deleted=true after the restart are %v, want p-new alone", got)
+	}
+	for line := range strings.SplitSeq(h.Log.String(), "\n") {
+		if strings.Contains(line, "maintenance task failed") && strings.Contains(line, "patch_purge") {
+			t.Errorf("the restarted hub logged a failed purge: %s", line)
+		}
+	}
+
+	g := newGitClient(t, h.URL(""), h.key)
+	hubURL := h.URL("/git/dev/carry.git")
+	refs, err := g.git("", "ls-remote", hubURL)
+	if err != nil {
+		t.Fatalf("git ls-remote %s: %v\n%s", hubURL, err, refs)
+	}
+	if !strings.Contains(refs, oldTip+"\trefs/heads/p-old") {
+		t.Errorf("git ls-remote of the hub = %q, want refs/heads/p-old at %s", refs, oldTip)
+	}
+	if strings.Contains(refs, "refs/parley/replaced/p-old") {
+		t.Errorf("git ls-remote of the hub = %q, want no refs/parley/replaced/p-old", refs)
+	}
+	if out, err := exec.Command("git", "--git-dir="+copyDir, "rev-parse", "--verify", "--quiet", "refs/parley/replaced/p-old").Output(); err == nil {
+		t.Errorf("the hub's copy still holds refs/parley/replaced/p-old at %s", out)
 	}
 }

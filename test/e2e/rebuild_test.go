@@ -1,16 +1,22 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -22,6 +28,13 @@ import (
 // the hub, the upstream, the origin and the hub's repository of the
 // workspace.
 func startForkOfUpstream(t *testing.T, smart bool, files map[string]string, settings map[string]any, patches []forkPatch) (*workspaceHub, *gitrepotest.Origin, *gitrepotest.Origin, string) {
+	t.Helper()
+	return startForkOfUpstreamOn(t, hubtest.Config{}, smart, files, settings, patches)
+}
+
+// startForkOfUpstreamOn is startForkOfUpstream on a hub started with what
+// cfg sets of its clock, composition and maintenance interval.
+func startForkOfUpstreamOn(t *testing.T, cfg hubtest.Config, smart bool, files map[string]string, settings map[string]any, patches []forkPatch) (*workspaceHub, *gitrepotest.Origin, *gitrepotest.Origin, string) {
 	t.Helper()
 	up := gitrepotest.NewOrigin(t)
 	up.Branch("main", gitrepotest.Commit(t, up.Dir(), "u1", files))
@@ -36,7 +49,7 @@ func startForkOfUpstream(t *testing.T, smart bool, files map[string]string, sett
 	for _, p := range patches {
 		origin.Branch(p.branch, gitrepotest.Commit(t, origin.Dir(), p.msg, p.files, origin.Head("main")))
 	}
-	h := startCarryPatchHub(t, origin, up)
+	h := startCarryPatchHubConfig(t, origin, up, cfg)
 	body := map[string]any{"slug": "acme-fork", "git_url": origin.URL(), "workspace_mode": "carry_patch", "upstream_url": up.URL()}
 	if settings != nil {
 		body["settings"] = settings
@@ -236,5 +249,125 @@ func TestRebuild_ConflictThenLearnedResolution(t *testing.T) {
 	}
 	if want := []string{carrypatch.EventRebuildFail + " conflict false", carrypatch.EventRebuildComplete}; !slices.Equal(got, want) {
 		t.Errorf("the rebuild events of the job are %q, want %q", got, want)
+	}
+
+	// The developer reads what the hub learned from the shell, and takes it
+	// back.
+	listed := h.run(t, "rerere", "list", "acme-fork")
+	items, _ := listed.json(t)["items"].([]any)
+	entry, _ := firstOf(items).(map[string]any)
+	if listed.code != 0 || len(items) != 1 || entry["path"] != "a.txt" || entry["resolved"] != true {
+		t.Fatalf("parley rerere list exited %d with %q, want one resolved entry for a.txt", listed.code, listed.stdout)
+	}
+	forgot := h.run(t, "rerere", "forget", "acme-fork", "a.txt")
+	if doc := forgot.json(t); forgot.code != 0 || doc["status"] != "forgotten" || doc["pathspec"] != "a.txt" || len(doc) != 2 {
+		t.Errorf("parley rerere forget exited %d with %q, want {status: forgotten, pathspec: a.txt}", forgot.code, forgot.stdout)
+	}
+	listed = h.run(t, "rerere", "list", "acme-fork")
+	if items, ok := listed.json(t)["items"].([]any); listed.code != 0 || !ok || len(items) != 0 {
+		t.Errorf("parley rerere list after the forget exited %d with %q, want items []", listed.code, listed.stdout)
+	}
+	if n, err := carrypatch.CountRerereEntries(context.Background(), h.Store.Main(), "acme-fork"); err != nil || n != 0 {
+		t.Errorf("the store holds %d remembered resolutions of acme-fork (%v), want none", n, err)
+	}
+	if cache, err := os.ReadDir(filepath.Join(copyDir, "rr-cache")); err != nil && !os.IsNotExist(err) || len(cache) != 0 {
+		t.Errorf("the copy's rr-cache holds %v (%v), want no entry", cache, err)
+	}
+}
+
+// firstOf is the first element of items, nil when there is none.
+func firstOf(items []any) any {
+	if len(items) == 0 {
+		return nil
+	}
+	return items[0]
+}
+
+// A rebuild is running when the operator stops the hub, and does not end
+// within the job queue's grace, since upstream holds its fetch; the hub
+// started again on the same data discards what the stop left in the copy,
+// runs the job from the start, and publishes the integration branch once.
+func TestRebuild_RunsAgainFromTheStartAfterAStopCutItOff(t *testing.T) {
+	parallel(t)
+	clock := &fakeNow{now: time.Now().UTC()}
+	jobsClock := hubtest.NewJobClock(clock.Now)
+	h, up, _, copyDir := startForkOfUpstreamOn(t, hubtest.Config{
+		Now: jobsClock.Now,
+		Compose: func(c *hub.Composition) {
+			c.AdjustJobs(func(d *jobs.Deps) { d.Clock = jobsClock })
+		},
+	}, false, map[string]string{"README": "upstream\n"}, map[string]any{"auto_rebuild_after_push": false}, []forkPatch{
+		{"patch/one", "patch one", map[string]string{"one.txt": "one\n"}},
+		{"patch/two", "patch two", map[string]string{"two.txt": "two\n"}},
+	})
+	if status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/acme-fork/patches", h.key, []map[string]any{
+		{"branch_name": "patch/one"}, {"branch_name": "patch/two"},
+	}); status != http.StatusCreated {
+		t.Fatalf("register the patches = %d %s, want 201", status, raw)
+	}
+	before := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/deploy")
+
+	up.Block()
+	status, job := h.forkCall(t, http.MethodPost, "/rebuild", nil)
+	id, _ := job["id"].(string)
+	if status != http.StatusAccepted || id == "" {
+		t.Fatalf("POST rebuild = %d %v, want 202 with a job", status, job)
+	}
+	h.waitForkRebuild(t, id, "running")
+	deadline := time.Now().Add(10 * time.Second)
+	for up.Requests() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the rebuild did not reach upstream within 10 s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// What a stop that killed the hub mid-build leaves: a scratch working
+	// tree and its registration in the copy.
+	gitrepotest.Git(t, copyDir, "worktree", "add", "--quiet", "--detach", filepath.Join(copyDir, "parley-rebuild", "left-by-the-stop"), before)
+
+	// The stop waits for the attempt for the queue's grace, on its clock.
+	go func() {
+		select {
+		case <-jobsClock.Armed(jobs.ShutdownGrace):
+			jobsClock.Advance(jobs.ShutdownGrace)
+		case <-time.After(10 * time.Second):
+		}
+	}()
+	h.Restart(t)
+	if _, j := h.forkCall(t, http.MethodGet, "/rebuilds/"+id, nil); j["status"] == "completed" || j["status"] == "dead_letter" || j["status"] == "cancelled" {
+		t.Errorf("the job after the stop = %v, want it not final while upstream holds the fetch", j)
+	}
+	if got := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/deploy"); got != before {
+		t.Errorf("deploy after the stop = %s, want %s as before", got, before)
+	}
+	up.Release()
+
+	done := h.waitForkRebuild(t, id, "completed")
+	results, _ := done["patch_results"].([]any)
+	if len(results) != 2 {
+		t.Fatalf("the completed job = %v, want two patch results", done)
+	}
+	for _, r := range results {
+		if res, _ := r.(map[string]any); res["status"] != "success" {
+			t.Errorf("a patch result of the job = %v, want status success", r)
+		}
+	}
+	if head := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/deploy"); head == before || head != done["integration_head_sha"] {
+		t.Errorf("deploy = %s, want the job's integration_head_sha %v, moved from %s", head, done["integration_head_sha"], before)
+	}
+	if got := gitrepotest.Git(t, copyDir, "worktree", "list", "--porcelain"); strings.Count(got, "worktree ") != 1 {
+		t.Errorf("git worktree list of the copy = %q, want the repository alone", got)
+	}
+	if left, err := os.ReadDir(filepath.Join(copyDir, "parley-rebuild")); err != nil && !os.IsNotExist(err) || len(left) != 0 {
+		t.Errorf("the copy's rebuild work area holds %v (%v), want nothing", left, err)
+	}
+	published := 0
+	for _, e := range h.patchEvents(t, "acme-fork", carrypatch.EventRebuildComplete) {
+		if e.ResourceID == id {
+			published++
+		}
+	}
+	if published != 1 {
+		t.Errorf("the job completed %d times in the event log, want once", published)
 	}
 }
