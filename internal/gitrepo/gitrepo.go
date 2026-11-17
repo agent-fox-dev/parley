@@ -10,9 +10,9 @@
 // environment of the one process that needs it (see Credential).
 //
 // What a git process would cost many times over to read, a git directory's
-// layout, a branch's head and a key of its own configuration, it reads
-// from git's own files in process, and it asks git whenever those files
-// are not what it reads.
+// layout, a branch's head, the refs below a prefix and a key of its own
+// configuration, it reads from git's own files in process, and it asks git
+// whenever those files are not what it reads.
 package gitrepo
 
 import (
@@ -20,12 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -221,50 +219,6 @@ func (r *Repo) ResolveBranch(ctx context.Context, branch string) (id string, fou
 	return r.resolve(ctx, ref)
 }
 
-// readBranch is the commit id the branch ref names in the git directory
-// dir, read from its loose ref file, else from packed-refs, in the order
-// git reads them: git pack-refs writes a ref into packed-refs before it
-// removes its loose file, so a ref a concurrent pack-refs moves is found
-// in one or the other. git writes nothing but a commit to a branch, so the
-// id needs no peeling. ok is false for what it does not read: an invalid
-// name, what is no longer a git directory, a linked worktree's git
-// directory, the reftable backend, a symbolic ref and anything it does not
-// understand; the caller asks git then.
-func readBranch(dir, ref string) (id string, found, ok bool) {
-	if !ValidRefName(ref) || isGitDir(dir) != nil {
-		return "", false, false
-	}
-	for _, other := range []string{"commondir", "reftable"} {
-		if _, err := os.Lstat(filepath.Join(dir, other)); !errors.Is(err, fs.ErrNotExist) {
-			return "", false, false
-		}
-	}
-	raw, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(ref)))
-	switch {
-	case err == nil:
-		v := strings.TrimSpace(string(raw))
-		return v, true, isHexID(v, idLen)
-	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EISDIR):
-		// No loose ref: a directory of refs below the name is none either.
-	default:
-		return "", false, false
-	}
-	packed, err := os.ReadFile(filepath.Join(dir, "packed-refs"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", false, true
-	}
-	if err != nil {
-		return "", false, false
-	}
-	for line := range strings.Lines(string(packed)) {
-		id, name, cut := strings.Cut(strings.TrimRight(line, "\n"), " ")
-		if cut && name == ref {
-			return id, true, isHexID(id, idLen)
-		}
-	}
-	return "", false, true
-}
-
 // Branches maps every branch of the repository to its commit id.
 func (r *Repo) Branches(ctx context.Context) (map[string]string, error) {
 	return r.refs(ctx, "refs/heads/")
@@ -383,8 +337,16 @@ func (r *Repo) resolve(ctx context.Context, ref string) (string, bool, error) {
 }
 
 // refs maps every ref below prefix, by its name without the prefix, to the
-// object id it points at.
+// object id it points at. It reads them from git's files ref backend in
+// process (readRefs), and asks git only about what it does not read that
+// way.
 func (r *Repo) refs(ctx context.Context, prefix string) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if refs, ok := readRefs(r.dir, prefix); ok {
+		return refs, nil
+	}
 	out, err := r.git(ctx, "for-each-ref", "--format=%(objectname) %(refname)", prefix)
 	if err != nil {
 		return nil, err

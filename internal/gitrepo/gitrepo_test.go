@@ -585,6 +585,94 @@ func TestResolveBranch_ReadsTheBranchWithoutRunningGit(t *testing.T) {
 	}
 }
 
+// forEachRef is what git for-each-ref lists below prefix in dir, by name
+// without the prefix.
+func forEachRef(t *testing.T, dir, prefix string) map[string]string {
+	t.Helper()
+	refs := map[string]string{}
+	for line := range strings.Lines(gitrepotest.Git(t, dir, "for-each-ref", "--format=%(objectname) %(refname)", prefix)) {
+		id, name, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if name, under := strings.CutPrefix(name, prefix); under && name != "HEAD" {
+			refs[name] = id
+		}
+	}
+	return refs
+}
+
+func TestBranchesTagsAndOriginHeads_ReadTheRefsWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.Git(t, filepath.Dir(dir), "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	who := "committer T <t@example.invalid> 1700000000 +0000\n"
+	if _, err := gitrepotest.Run(dir, "commit refs/heads/main\n"+who+"data 2\nc1\n\n"+
+		"commit refs/heads/packed\n"+who+"data 2\nc2\nfrom refs/heads/main\n\n"+
+		"commit refs/heads/feature/moved\n"+who+"data 2\nc3\nfrom refs/heads/main\n\n"+
+		"commit refs/heads/gone\n"+who+"data 2\nc4\nfrom refs/heads/main\n\n"+
+		"tag v1\nfrom refs/heads/main\ntagger T <t@example.invalid> 1700000000 +0000\ndata 2\nv1\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, dir, "pack-refs", "--all")
+	main := gitrepotest.Git(t, dir, "rev-parse", "main")
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/feature/moved", main)
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/loose/deep/name", main)
+	gitrepotest.Git(t, dir, "update-ref", "-d", "refs/heads/gone")
+	gitrepotest.Git(t, dir, "tag", "v2", main)
+	gitrepotest.Git(t, dir, "update-ref", "refs/remotes/origin/main", main)
+	var calls atomic.Int32
+	repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, c := range []struct {
+		prefix string
+		read   func() (map[string]string, error)
+	}{
+		{"refs/heads/", func() (map[string]string, error) { return repo.Branches(ctx) }},
+		{"refs/tags/", func() (map[string]string, error) { return repo.Tags(ctx) }},
+		{"refs/remotes/origin/", func() (map[string]string, error) { return repo.OriginHeads(ctx) }},
+	} {
+		want := forEachRef(t, dir, c.prefix)
+		calls.Store(0)
+		got, err := c.read()
+		if err != nil {
+			t.Fatalf("%s: %v", c.prefix, err)
+		}
+		assertRefs(t, c.prefix, got, want)
+		if n := calls.Load(); n != 0 {
+			t.Errorf("reading %s ran %d git processes, want none", c.prefix, n)
+		}
+	}
+	if got := forEachRef(t, dir, "refs/heads/"); len(got) != 4 || got["gone"] != "" {
+		t.Errorf("the fixture's branches are %v; want main, packed, feature/moved and loose/deep/name", got)
+	}
+}
+
+func TestBranches_AsksGitAboutWhatItDoesNotReadItself(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.Git(t, filepath.Dir(dir), "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	if _, err := gitrepotest.Run(dir, "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nc\n\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, dir, "symbolic-ref", "refs/heads/alias", "refs/heads/main")
+	repo, err := gitrepo.Git{}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.Branches(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRefs(t, "Branches with a symbolic ref", got, forEachRef(t, dir, "refs/heads/"))
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.Branches(context.Background()); err == nil {
+		t.Errorf("Branches of a removed repository = %v, nil; want an error", got)
+	}
+}
+
 func TestResolveBranch_AsksGitAboutWhatItDoesNotReadItself(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "copy.git")
