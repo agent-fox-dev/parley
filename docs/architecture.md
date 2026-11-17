@@ -135,7 +135,10 @@ A feature registers a REST route with `(*Server).Register(server.Route)`.
 `Route.Method` is an upper-case method, `Route.Pattern` a path relative to
 `/api/v1` with `:name` parameters (`/workspaces/:slug/tokens`) and
 optionally a last `*name` parameter that takes one or more remaining
-segments (`/workspaces/:slug/scm/refs/*name`), and
+segments (`/workspaces/:slug/scm/refs/*name`), or, for a route that sets
+`EmptyCatchAll`, also the empty remainder of a path that ends in a slash
+where the parameter begins (the forget of remembered resolutions, whose
+handler answers an empty pathspec `400`), and
 `Route.Handler` a `server.HandlerFunc`,
 `func(http.ResponseWriter, *http.Request) error`: it writes its own response
 on success, and an error it returns is written as the envelope. The route's
@@ -5173,6 +5176,10 @@ cannot be imported by (ADR 01, ADR 07):
   (`IsPatchBranch`: a patch of the branch exists that is not deleted);
 - `carrypatch.RemoveWorkspace` as a remover of owned data, so a delete
   removes a workspace's patches in its transaction.
+
+It also adds the start hook `carry_patch_recovery`, which discards what an
+interrupted rebuild left in the copies, and the maintenance task
+`patch_purge` (see below).
 - the component itself as the sync's `SyncExtension` and its
   `ExcludedBranchProvider` (`RegisterSyncExtension`,
   `RegisterExcludedBranchProvider`); the start hook sets
@@ -5192,9 +5199,23 @@ deadline, `DefaultGitDeadline` (10 minutes) or the caller's shorter
 `limit` (`DefaultBranchFetchDeadline`, 2 minutes, for a single-branch
 fetch); when it passes, the context's end kills git's process group and the
 error matches `ErrGitTimeout` and `gitrepo.ErrDeadline`. The text of any
-other failure is cleaned with `gitrepo.SanitizeGitText` (URL user
-information becomes `***@`, the credential's values are removed) while
-`errors.Is` still matches the cause.
+other failure is cleaned with `gitrepo.SanitizeGitText` (the credential's
+values are removed first, then URL user information becomes `***@`, so the
+result is the same when it is cleaned again) while `errors.Is` still
+matches the cause. `RequestError(err)` maps an operation the runner cut
+off to `500 internal` (`a git operation did not finish within its time
+limit`) for a request handler and passes any other error through.
+Underneath, `internal/gitrepo` refuses, before git starts, a remote whose
+URL is not `https://`, `ssh://` or `[user@]host:path` (`CheckTransport`,
+an error matching `ErrTransportRefused` that names the transport, run by
+every process with a remote URL: `ListRemote`, `Clone`, the fetches and
+the pushes) and runs every such process with
+`GIT_ALLOW_PROTOCOL=https:ssh`, after `Git.Env`, so a redirect or a remote
+helper cannot leave those transports; and the operations carry-patch code
+calls with a caller's value (`ResolveBranch`, `IsAncestor`, `LookupRef`,
+`CompareAndSwapRef`, `SetRef`, `DeleteRef`, `FetchOriginBranch`) refuse a
+value that begins with `-` with an error matching `ErrInvalidArgument`
+before git starts, and hand git the others after `--end-of-options`.
 
 **The upstream.** `ResolveUpstreamCredential(ctx, secrets, slug)` reads
 `UPSTREAM_GIT_PAT`, then `UPSTREAM_GIT_USERNAME` with
@@ -5622,6 +5643,46 @@ from git. `(*Component).RerereEntries`, `CountRerereEntries` and
 remembered resolutions builds on. `RemoveRerereEntries` is a remover of
 owned data (ADR 07), and `PostClone` deletes the workspace's entries
 before the set-up, since a fresh clone starts with an empty `rr-cache`.
+An entry whose copy is missing or unreadable is listed unresolved.
+
+**Remembered resolutions, patch status, recovery and purge.**
+`rerere.go` adds the list (`GET /workspaces/:slug/rerere`, built on
+`RerereEntries`, sorted newest `recorded_at` first, then `id`, and paged
+in memory with a cursor of the two) and the forget (`DELETE
+/workspaces/:slug/rerere/*pathspec`, `EmptyCatchAll`), each declared with
+`Route` and its scope set to `workspaces:read` or `workspaces:write`, as
+`rebuildRoute` does for the rebuilds. The forget validates the pathspec
+before `Guard`, selects the entry whose id equals it, else every entry
+whose path does, and removes each by its own id: `(*gitrepo.Repo).ForgetRerere(id)`
+(a hex id only; `rr-cache/<id>` is renamed into a fresh directory, then
+removed) through `RunGit`, then `RemoveRerereEntry` in one `Store.Tx`,
+under `context.WithoutCancel`. `patchstatus.go` adds `GET
+/workspaces/:slug/patch-status`, a read route with the scope
+`workspaces:read`: the record from `Guard`, `IntegrationBranch` and its
+head through `ResolveBranch` in the copy, the two newest rebuilds through
+`Jobs.List` (limit 1, any status, then `completed`), `ListLivePatches`,
+each patch's `last_rebuild_result` from the job history read newest first
+in pages of 100 until every patch has one, and `CountRerereEntries`.
+`recovery.go`'s `DiscardRebuildLeftovers` calls `DiscardScratches`
+through `RunGit` for the copy of every carry-patch workspace whose clone
+work is not outstanding, logging a copy it cannot open or clean with
+`workspace` and going on; `composeCarryPatch` registers it as the start
+hook `carry_patch_recovery`, right after `carry_patch`, so it runs after
+the queue's `Recover` and before the job workers start. `purge.go`'s
+`PurgeDeletedPatches(ctx, now)` selects, over every workspace, the patches
+`deleted` more than `PurgeAge` (7 days) before `now`, and for each opens
+one `Store.Tx`: a `DELETE` conditional on the patch being still deleted
+and still due, then, when a row went and no patch that is not deleted uses
+the branch, `DeleteRef` of `refs/parley/replaced/<branch>` through
+`RunGit` (a missing copy or ref is no failure); a failure rolls back, is
+logged with `workspace` and `patch_id`, and makes the pass return an error
+once every due patch was tried. `Deps.BeforePurgePatch` is its test hook
+between the selection and each removal. `composeCarryPatch` registers it
+as the maintenance task `patch_purge`, with the runtime's clock. An
+attempt's set-up holds each git operation of its upstream fetch to
+`RebuildGitDeadline` as well as to the whole fetch's deadline
+(`limitedUpstream`); `Deps.BeforeRebuildGit` is a test hook at the start
+of each git operation of an attempt.
 
 The publish reads the integration branch's head, then opens one
 `Store.Tx`: the patch-list changes and their events are written, then the

@@ -1852,6 +1852,22 @@ and exit status `2` before any request.
 | `parley workspace reclone <slug> --confirm [--wait]` | `POST /api/v1/workspaces/<slug>/reclone`; with `--wait`, then `GET /api/v1/workspaces/<slug>` until `ready` or `failed` |
 | `parley workspace delete <slug> --confirm` | `DELETE /api/v1/workspaces/<slug>` |
 
+#### `parley workspace patch-status`
+
+```
+parley workspace patch-status <slug>
+```
+
+Sends [`GET /api/v1/workspaces/<slug>/patch-status`](api.md#get-apiv1workspacesslugpatch-status)
+with the credential as `Authorization: Bearer` and `<slug>` as one
+percent-encoded path segment, and prints the hub's answer, the summary of a
+carry-patch workspace, on stdout with exit status `0`. The hub builds it
+from what it holds, so it answers while origin and upstream are down. A
+refusal of the hub's (`400` `workspace_mode_mismatch` for a workspace not
+in mode `carry_patch`, among others) is written to stderr as received, with
+nothing on stdout and exit status `1`; a wrong number of arguments is a
+`usage_error` with exit status `2`, before any request is sent.
+
 ### `parley fork`
 
 `parley fork` run without a command prints its help and exits `0`; it reads
@@ -2364,6 +2380,46 @@ submit takes --strategy rebase or merge, got "squash"`), a `--timeout` or
 `--poll-interval` that is not a positive [duration](#waiting) (`0s` and
 `-1s` are refused too), and a wrong number of arguments are a
 `usage_error` with exit status `2`, before any request is sent.
+
+### `parley rerere`
+
+```
+parley rerere list <slug>
+parley rerere forget <slug> <id-or-path>
+```
+
+These commands read and forget the conflict resolutions the rebuilds of a
+carry-patch workspace remember (see [the hub's
+routes](api.md#remembered-resolutions-and-the-patch-status)). Each sends one
+request with the credential as `Authorization: Bearer` and `<slug>` as one
+percent-encoded path segment. `parley rerere` run without a command prints
+its help and exits `0`.
+
+- `list` sends `GET /api/v1/workspaces/<slug>/rerere` and prints the hub's
+  answer, the first page of entries, newest first, with exit status `0`. It
+  takes no `--limit` or `--cursor` and does not follow `next_cursor`.
+- `forget` sends `DELETE /api/v1/workspaces/<slug>/rerere/<id-or-path>`.
+  The argument is split at `/`, each part percent-encoded on its own and
+  the parts joined with `/` again, so the hub reads it as the path it is
+  (`parley rerere forget demo "docs/read me.md"` sends
+  `…/rerere/docs/read%20me.md`, `a/b?c#d` sends `…/rerere/a/b%3Fc%23d`; a
+  part `.` or `..` is sent as `%2E` or `%2E%2E`). The hub answers `204`
+  with no body, so the command prints a document that carries the argument
+  as given, with exit status `0`:
+
+  ```json
+  {
+    "status": "forgotten",
+    "pathspec": "src/net/dial.go"
+  }
+  ```
+
+A refusal of the hub's (`404` `not_found` `resolution not found`, `400`
+`invalid_request` for a pathspec that starts with `-`, given after `--`,
+`400` `workspace_mode_mismatch`, `403` `insufficient_scope`, among others)
+is written to stderr as received, with nothing on stdout and exit status
+`1`. A wrong number of arguments is a `usage_error` with exit status `2`,
+before any request is sent.
 
 ### `parley land`
 

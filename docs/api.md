@@ -3087,6 +3087,19 @@ ignored. Deleting a deleted patch answers `204` and changes nothing:
 `deleted_at` keeps its value and no event is emitted. No delete queues a
 rebuild.
 
+A patch that has stayed `deleted` for more than 7 days (its `deleted_at`
+more than 7 days before the pass; one deleted exactly 7 days ago stays) is
+removed by the maintenance task `patch_purge`, which runs in the first
+maintenance pass after the hub starts and in every hourly pass, for the
+workspaces in every status. With the patch it deletes the backup ref
+`refs/parley/replaced/<branch>` in the copy, unless a patch of the
+workspace that is not deleted uses the same branch; the patch branch
+stays. Afterwards the get route answers `404` for the patch and the list
+with `include_deleted=true` no longer shows it. A restore that comes first
+wins: the patch stays, with its backup ref. A patch whose removal fails is
+logged with the workspace's slug and the patch id, stays `deleted` and is
+tried again in the next pass; the purge writes no event.
+
 | Status | When |
 |---|---|
 | `204 No Content` | the patch is deleted; the body is empty |
@@ -3361,8 +3374,15 @@ client, and moves the branch once at the end.
 A git failure that is not a conflict (`git_error`), a git operation that
 runs longer than 10 minutes (`timeout`) and a stop of the hub (`shutdown`)
 are retryable, record no result for the patch in work, change no patch and
-publish nothing. Every attempt removes its scratch working tree, and
-discards one left by an earlier attempt before it builds. Failure text in
+publish nothing. The limit holds each git operation of an attempt on its
+own, those of the upstream fetch the attempt repeats included (one that
+passes it there fails the attempt as `upstream_fetch_failed`), not the
+attempt as a whole. Every attempt removes its scratch working tree, and
+discards one left by an earlier attempt before it builds; and each start of
+the hub, before any job runs, discards the scratch working trees and their
+registrations a stop left in the copy of every carry-patch workspace,
+logging a copy it cannot clean or does not find, with the workspace's slug,
+and starting all the same. Failure text in
 `error` and in events passes through the hub's scrubber, with the
 attempt's credential values.
 
@@ -3620,6 +3640,108 @@ predicted state the patch was tested against (the upstream base for the
 first tested patch, otherwise a commit no ref points to), `head_sha` and
 `commit_sha` the patch tip, `base_sha` the merge base of the two, and the
 files' `base` the file in `base_sha`.
+
+## Remembered resolutions and the patch status
+
+A rebuild records each conflict git's rerere meets in the workspace's
+copy, and the resolution it learns from a merge on the patch branch, which
+later rebuilds replay (see [Rebuild jobs](#rebuild-jobs)). The hub keeps
+one **entry** per recorded conflict: `id`, git's id of the conflict (its
+directory in the copy's `rr-cache`, 40 hexadecimal digits), `path`, the
+file it was first met at, `resolved`, read from the copy (`true` when git
+holds a resolution for it), and `recorded_at`, when the conflict, or later
+its resolution, was recorded, in whole seconds UTC. A fresh clone and a
+reclone start with no entry; the delete of the workspace removes them.
+
+The three routes check, in this order: the scope (`403`
+`insufficient_scope`, whether or not the workspace exists), access (`404`
+`not_found` for a workspace the caller cannot read or an unknown slug,
+`403` `forbidden` for read access on the `DELETE`), the request (`400`
+`invalid_request`), the workspace's mode (`400` `workspace_mode_mismatch`
+unless it is `carry_patch`, also for every task fork), and on the `DELETE`
+only its status (`409` `workspace_busy` while it is `pending` or `cloning`
+or a reclone, archive or delete runs, `409` `workspace_not_ready` when
+`failed`, `409` `workspace_archived`). The two `GET` routes answer in
+every status.
+
+| Route | Scope | Access |
+|---|---|---|
+| `GET /api/v1/workspaces/{slug}/rerere` | `workspaces:read` | read |
+| `DELETE /api/v1/workspaces/{slug}/rerere/{pathspec}` | `workspaces:write` | write |
+| `GET /api/v1/workspaces/{slug}/patch-status` | `workspaces:read` | read |
+
+## `GET /api/v1/workspaces/{slug}/rerere`
+
+The workspace's entries as a [list](#lists), resolved or not, newest
+`recorded_at` first, then by `id` ascending. Each item has exactly `id`,
+`path`, `resolved` and `recorded_at`. A workspace without an entry, which
+includes one whose copy is not on disk yet, answers `items: []`. An entry
+whose copy is missing or unreadable is listed with `resolved` `false`. The
+route reads the store and the copy's `rr-cache`, runs no git command,
+contacts no remote and changes nothing.
+
+| Status | When |
+|---|---|
+| `200 OK` | a page of entries |
+| `400` `invalid_request` | a bad `limit` or `cursor` |
+| `400` `workspace_mode_mismatch`; `403` `insufficient_scope`; `404` `not_found` | see the checks above |
+
+## `DELETE /api/v1/workspaces/{slug}/rerere/{pathspec}`
+
+Forgets remembered resolutions. `{pathspec}` is the rest of the path after
+`/rerere/`, slashes included, compared after percent-decoding, byte for
+byte: when it equals an entry's `id`, that entry alone is forgotten;
+otherwise every entry whose `path` equals it. A prefix of a path, a path
+in another letter case and a value such as `../x` match nothing. Each
+entry is removed by its own id: first git's record of the conflict and its
+resolution (`rr-cache/<id>` in the copy, every variant in it), then the
+stored entry, so a forget cut short leaves an entry without a resolution,
+which the list shows unresolved, never a resolution without an entry. An
+entry already gone counts as removed, so two forgets of one entry at once
+answer `204` and `204` or `404`.
+
+A forget only changes what later rebuilds replay: a rebuild that meets
+the conflict again stops at it, and records it again unresolved. It
+changes no rebuild job, no patch and no ref, queues no rebuild and writes
+no event.
+
+| Status | When |
+|---|---|
+| `204 No Content` | entries were forgotten |
+| `400` `invalid_request` | the pathspec is empty (`the pathspec is empty; give the id or the path of a remembered resolution`) or starts with `-` (`the pathspec must not start with '-'`), checked before the mode and the status |
+| `404` `not_found` | no entry has the pathspec as its id or its path (`resolution not found`); nothing is removed |
+| `400` `workspace_mode_mismatch`; `403` `insufficient_scope`, `forbidden`; `404` `not_found`; `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | see the checks above |
+| `500` `internal` | git did not finish within its time limit (`a git operation did not finish within its time limit`), or another failure |
+
+## `GET /api/v1/workspaces/{slug}/patch-status`
+
+One document that summarises the workspace from what the hub holds: its
+record, its patches, its rebuild jobs, its entries and its copy. The hub
+fetches nothing, contacts neither origin nor upstream and changes nothing,
+so the answer comes while both are unreachable, and `upstream_head_sha` is
+the stored value, not upstream's present head. Every member is present,
+`null` where unset.
+
+| Member | Meaning |
+|---|---|
+| `workspace_slug`, `workspace_mode`, `status` | from the workspace record |
+| `git_url`, `upstream_url` | the stored values |
+| `integration_branch` | the workspace's integration branch, `deploy` when the record names none |
+| `clone_error`, `sync_error`, `upstream_head_sha`, `last_sync_at` | from the record, or `null` |
+| `integration_head_sha` | the full commit id of `refs/heads/<integration_branch>` in the copy; `null` when the branch, or the copy, does not exist |
+| `last_rebuild` | `{id, status, created_at, completed_at}` of the newest rebuild job in any status, by `created_at`; `null` without one |
+| `last_completed_rebuild` | the same for the newest `completed` job |
+| `patches` | every patch that is not deleted, in position order, each with exactly `id`, `branch_name`, `position`, `status`, `conflict_files` (never `null`), `last_rebuild_result`, `origin_sync_state`, `origin_sha` and `origin_synced_at`; not paged |
+| `summary` | `total_patches` (the patches that are not deleted), `active`, `conflict`, `disabled`, `merged_upstream` (those patches by status), `rerere_resolutions` (the entries, resolved or not), `patches_diverged` and `patches_missing_on_origin` (those patches by `origin_sync_state`); `0` when there is nothing to count |
+
+`last_rebuild_result` is the `status` (`success`, `conflict` or `skipped`)
+of the patch's entry in the `patch_results` of the newest rebuild job, by
+`created_at`, that has one for it, or `null`.
+
+| Status | When |
+|---|---|
+| `200 OK` | the document |
+| `400` `workspace_mode_mismatch`; `403` `insufficient_scope`; `404` `not_found` | see the checks above |
 
 ## Source control reads
 
