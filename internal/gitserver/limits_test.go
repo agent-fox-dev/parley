@@ -51,7 +51,7 @@ func (limitStage) CheckOptions(ctx context.Context, in gitserver.OptionsInput) (
 func bigPack(t *testing.T) (id, pack string) {
 	t.Helper()
 	dir := t.TempDir() + "/big.git"
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	content := make([]byte, 4<<10)
 	_, _ = rand.Read(content)
 	stream := fmt.Sprintf("commit refs/heads/big\ncommitter P <p@example.invalid> 0 +0000\ndata 3\nbig\nM 100644 inline big.bin\ndata %d\n%s\n", len(content), content)

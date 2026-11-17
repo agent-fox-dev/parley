@@ -34,7 +34,7 @@ type readFixture struct {
 func newReadFixture(t *testing.T) readFixture {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	const who = "committer T <t@example.invalid> 1700000000 +0000\n"
 	stream := "commit refs/heads/main\nmark :1\n" + who + "data 2\nc1\nM 100644 inline f.txt\ndata 4\none\n\n" +
 		"commit refs/heads/main\n" + who + "data 2\nc2\nM 100644 inline f.txt\ndata 4\ntwo\n\n" +
@@ -253,7 +253,7 @@ func TestReadTree_ListsADirectoryOfACommitInPathOrder(t *testing.T) {
 func pagedTree(t *testing.T) (*gitrepo.Repo, string) {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nx\n"
 	for _, p := range []string{"a/x", "a/y/z", "a.b", "a-b/c", "a0", "b/1", "b/2/3", "b/2/4", ":c/q", "z*[/w", "é/ö", "\xff"} {
 		stream += "M 100644 inline " + p + "\ndata 2\nx\n\n"
@@ -321,7 +321,7 @@ func TestReadTree_ListsAPageOfTheEntriesAfterAPath(t *testing.T) {
 func TestReadTree_ListsMoreDirectoriesThanOneRunOfGitTakes(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	// 300 directories of 250-byte names take more than 64 KiB of command line.
 	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nx\n"
 	for i := range 300 {
@@ -478,7 +478,7 @@ func (w *stallingWriter) Write(p []byte) (int, error) {
 func TestWriteBlob_EndsGitWhenItsContextEndsMidRead(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	big := strings.Repeat("0123456789abcdef", 1<<16) // 1 MiB, far more than a pipe holds
 	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 3\nbig\n" +
 		"M 100644 inline big.dat\ndata " + strconv.Itoa(len(big)) + "\n" + big + "\n\n"

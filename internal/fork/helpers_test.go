@@ -99,7 +99,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 	w.AddMember(t, w.acme, w.dev)
 	w.AddMember(t, w.acme, w.mia)
 	w.parent = w.workspaces.RepoPath(parentSlug)
-	gitrepotest.Git(t, w.parent, "init", "--quiet", "--bare", "--initial-branch=main", w.parent)
+	gitrepotest.InitBare(t, w.parent, "main")
 	stream := "commit refs/heads/main\nmark :1\ncommitter P <p@example.invalid> now\ndata 5\nfirst\nM 100644 inline README\ndata 2\n1\n" +
 		"commit refs/heads/main\nmark :2\ncommitter P <p@example.invalid> now\ndata 6\nsecond\nfrom :1\nM 100644 inline README\ndata 2\n2\n" +
 		"commit refs/heads/release\nmark :3\ncommitter P <p@example.invalid> now\ndata 7\nrelease\nfrom :1\nM 100644 inline README\ndata 2\n3\n" +

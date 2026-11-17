@@ -15,7 +15,7 @@ import (
 func bareRepo(t *testing.T) (*gitrepo.Repo, string) {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	repo, err := gitrepo.Git{}.Open(context.Background(), dir)
 	if err != nil {
 		t.Fatal(err)

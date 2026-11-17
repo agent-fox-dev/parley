@@ -12,7 +12,7 @@ import (
 
 func TestBlame_GroupsTheLinesOfAFileByTheCommitThatLastChangedThem(t *testing.T) {
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	if _, err := gitrepotest.Run(dir, gitrepotest.BlameStream(), "fast-import", "--quiet"); err != nil {
 		t.Fatal(err)
 	}

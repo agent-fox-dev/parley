@@ -17,7 +17,7 @@ import (
 func copyOf(t *testing.T, o *gitrepotest.Origin) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	gitrepotest.Git(t, dir, "fetch", "--quiet", o.Dir(), "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 	return dir
 }

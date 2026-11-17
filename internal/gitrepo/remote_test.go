@@ -22,7 +22,7 @@ func TestFetchRemote_MirrorsTheBranchesUnderTheName(t *testing.T) {
 	g := gitrepo.Git{Env: o.Env(), Trace: func(args []string) { runs = append(runs, args) }}
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	// A ref of the copy's own, which the fetch leaves alone.
 	gitrepotest.Git(t, dir, "fetch", "--quiet", "--no-tags", o.Dir(), "refs/heads/main:refs/heads/mine")
 
@@ -67,7 +67,7 @@ func TestFetchRemote_MirrorsTheBranchesUnderTheName(t *testing.T) {
 func TestFetchRemote_RefusesANameThatIsNotOneRefComponent(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	for _, name := range []string{"", "up/stream", "up*", "a:b", ".hidden", ".."} {
 		ran := false
 		g := gitrepo.Git{Trace: func([]string) { ran = true }}
@@ -88,7 +88,7 @@ func TestFetchOriginBranch_FetchesTheOneBranch(t *testing.T) {
 	g := gitrepo.Git{Env: o.Env(), Trace: func(args []string) { runs = append(runs, args) }}
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	// A stale origin head of another branch, which the fetch leaves alone.
 	gitrepotest.Git(t, dir, "fetch", "--quiet", "--no-tags", o.Dir(), "refs/heads/dev:refs/remotes/origin/main")
 

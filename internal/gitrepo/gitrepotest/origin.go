@@ -542,7 +542,7 @@ func ObjectCounts(t testing.TB, dir string) map[string]string {
 func PushCommit(t testing.TB, src, dest, branch, content string) string {
 	t.Helper()
 	client := filepath.Join(t.TempDir(), "client.git")
-	Git(t, client, "init", "--quiet", "--bare", client)
+	InitBare(t, client, "")
 	Git(t, client, "fetch", "--quiet", src, "main:main")
 	blob, err := Run(client, content, "hash-object", "-w", "--stdin")
 	if err != nil {

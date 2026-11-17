@@ -304,7 +304,7 @@ func TestLand_ContactsNoOrigin(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	origin := filepath.Join(t.TempDir(), "origin.git")
-	gitrepotest.Git(t, origin, "init", "--quiet", "--bare", "--initial-branch=main", origin)
+	gitrepotest.InitBare(t, origin, "main")
 	commit(t, origin, "main", "", "A", map[string]string{"a.txt": "A\n"})
 	w.inTx(t, func(ctx context.Context, tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET git_url = ? WHERE slug = 'api'`, "file://"+origin)

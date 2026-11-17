@@ -28,7 +28,7 @@ func forEachRef(t *testing.T, dir, prefix string) map[string]string {
 func TestRefs_ReadWhatForEachRefLists(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "r.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	one := gitrepotest.Commit(t, dir, "one", map[string]string{"a": "1\n"})
 	two := gitrepotest.Commit(t, dir, "two", map[string]string{"a": "2\n"}, one)
 	gitrepotest.Git(t, dir, "update-ref", "refs/heads/main", two)

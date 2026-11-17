@@ -30,7 +30,7 @@ type historyFixture struct {
 func newHistoryFixture(t *testing.T) historyFixture {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	who := func(at int) string {
 		return "author A <a@example.com> " + strconv.Itoa(at) + " +0000\ncommitter A <a@example.com> " + strconv.Itoa(at) + " +0000\n"

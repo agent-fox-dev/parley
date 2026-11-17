@@ -113,7 +113,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config) *world {
 func (w *world) addWorkspace(t *testing.T, slug string) string {
 	t.Helper()
 	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	head, err := gitrepotest.Run(dir, "commit refs/heads/main\nmark :1\n"+committer+data("base")+
 		"M 100644 inline a.txt\n"+data("l1\nl2\nl3\n")+"\nreset refs/heads/release\nfrom refs/heads/main\n\nget-mark :1\n",
 		"fast-import", "--quiet")

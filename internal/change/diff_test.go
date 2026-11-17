@@ -243,7 +243,7 @@ func TestDiff_ServesAVersionsDiffAndTheInterdiffOfTwoVersions(t *testing.T) {
 		if err := os.RemoveAll(w.demo); err != nil {
 			t.Fatal(err)
 		}
-		gitrepotest.Git(t, w.demo, "init", "--quiet", "--bare", "--initial-branch=main", w.demo)
+		gitrepotest.InitBare(t, w.demo, "main")
 		if _, err := gitrepotest.Run(w.demo, "commit refs/heads/main\n"+committer+data("Recloned")+"M 100644 inline a.txt\n"+data(a)+"\n",
 			"fast-import", "--quiet"); err != nil {
 			t.Fatal(err)

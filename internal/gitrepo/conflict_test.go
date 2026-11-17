@@ -42,7 +42,7 @@ func remove(path string) edit        { return edit{"", path, ""} }
 func newConflictRepo(t *testing.T, base, target []edit, work ...[]edit) conflictRepo {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	commit := func(ref, mark, from string, edits []edit) string {
 		s := "commit refs/heads/" + ref + "\nmark :" + mark + "\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\n" + mark + "\n"
 		if from != "" {

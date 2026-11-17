@@ -199,7 +199,7 @@ func (l landedTable) LandedChange(_ context.Context, _, sha string) (land.Collid
 func bareRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	return dir
 }
 

@@ -76,7 +76,7 @@ three
 func newScratchRepo(t *testing.T, stream string) compareFixture {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
 		t.Fatal(err)
 	}

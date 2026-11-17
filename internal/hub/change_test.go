@@ -43,7 +43,7 @@ func pushChangesHub(t *testing.T) (*hubtest.Hub, gitserver.ChangeService, string
 		}
 		return gitrepotest.Refs(t, dir, "refs/heads/")[branch]
 	}
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	base := commit("main", "", "a.txt")
 	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
 		return workspace.Insert(ctx, tx, workspace.Workspace{

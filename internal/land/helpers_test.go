@@ -115,7 +115,7 @@ func startWorld(t *testing.T, compose func(*hub.Composition), adjust ...func(*la
 func (w *world) addWorkspace(t *testing.T, slug string) string {
 	t.Helper()
 	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	commit(t, dir, "main", "", "base", map[string]string{"a.txt": "l1\nl2\nl3\n"})
 	head := gitrepotest.Refs(t, dir, "refs/heads/")["main"]
 	rec := workspace.Workspace{

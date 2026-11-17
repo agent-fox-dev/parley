@@ -33,7 +33,7 @@ type repo struct {
 func newRepo(t *testing.T) *repo {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "demo.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	stream := "commit refs/heads/main\nmark :1\ncommitter P <p@example.invalid> now\ndata 5\nbase\nM 100644 inline README\ndata 2\n1\n" +
 		"commit refs/heads/main\nmark :2\ncommitter P <p@example.invalid> now\ndata 5\nhead\nfrom :1\nM 100644 inline README\ndata 2\n2\n" +
 		"commit refs/heads/side\nmark :3\ncommitter P <p@example.invalid> now\ndata 5\nside\nfrom :1\nM 100644 inline src/a.go\ndata 2\n3\n" +

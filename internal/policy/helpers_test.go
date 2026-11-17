@@ -114,7 +114,7 @@ func (w *world) addWorkspace(t *testing.T, slug, owner string) string {
 		CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
 	}
 	if owner == "" {
-		gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+		gitrepotest.InitBare(t, dir, "main")
 		rec.HeadSHA = new(commit(t, dir, "main", "", map[string]string{"a.txt": "a\n"}))
 	} else {
 		if err := (gitrepo.Git{}).CreateFork(ctx, w.api, dir); err != nil {
