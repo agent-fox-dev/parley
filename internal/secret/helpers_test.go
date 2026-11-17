@@ -469,3 +469,64 @@ func (w *world) createVars(t *testing.T, cred, path string, keys ...string) {
 		t.Fatalf("create %d variables in %s = %d %.300s, want 201", len(keys), path, a.status, a.body)
 	}
 }
+
+// varPageOf decodes the answer a, which must be 200, as a page of
+// variables: its items, each checked as varsOf checks them, and its
+// next_cursor, which must be present.
+func varPageOf(t *testing.T, a answer) ([]variable, *string) {
+	t.Helper()
+	items := varsOf(t, a, http.StatusOK)
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(a.body, &top); err != nil || len(top) != 2 || top["items"] == nil || top["next_cursor"] == nil {
+		t.Fatalf("the page %.300s (%v) has not exactly the members items and next_cursor", a.body, err)
+	}
+	if bytes.HasPrefix(top["items"], []byte("null")) {
+		t.Errorf("the page %.300s has items null, want an array", a.body)
+	}
+	var next *string
+	if err := json.Unmarshal(top["next_cursor"], &next); err != nil {
+		t.Fatalf("next_cursor of %.300s: %v", a.body, err)
+	}
+	return items, next
+}
+
+// listVars are the variables the collection path answers cred with, as
+// one page of up to 200, which must be the last.
+func (w *world) listVars(t *testing.T, cred, path string) []variable {
+	t.Helper()
+	items, next := varPageOf(t, w.do(t, cred, http.MethodGet, path+"?limit=200", nil))
+	if next != nil {
+		t.Fatalf("GET %s: next_cursor %q, want null", path, *next)
+	}
+	return items
+}
+
+// varOf decodes the answer a, which must have the status given, as one
+// variable with exactly the members key, value, created_at and updated_at.
+func varOf(t *testing.T, a answer, status int) variable {
+	t.Helper()
+	if a.status != status {
+		t.Fatalf("answer = %d %.300s, want %d", a.status, a.body, status)
+	}
+	var raw map[string]json.RawMessage
+	var v variable
+	if err := json.Unmarshal(a.body, &raw); err != nil {
+		t.Fatalf("decode the variable %.300s: %v", a.body, err)
+	}
+	if err := json.Unmarshal(a.body, &v); err != nil {
+		t.Fatalf("decode the variable %.300s: %v", a.body, err)
+	}
+	if members := slices.Sorted(maps.Keys(raw)); !slices.Equal(members, []string{"created_at", "key", "updated_at", "value"}) {
+		t.Errorf("variable members = %v, want exactly key, value, created_at, updated_at", members)
+	}
+	return v
+}
+
+// keysOf are the keys of vars, in order.
+func keysOf(vars []variable) []string {
+	out := make([]string, len(vars))
+	for i, v := range vars {
+		out[i] = v.Key
+	}
+	return out
+}

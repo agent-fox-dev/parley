@@ -3,7 +3,7 @@
   "spec_id": "40",
   "spec_name": "variables_and_resolution",
   "schema_version": 3,
-  "updated_at": "2026-11-17T18:06:55Z",
+  "updated_at": "2026-11-17T18:12:58Z",
   "tasks": [
     {
       "id": 1,
@@ -11,7 +11,7 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,

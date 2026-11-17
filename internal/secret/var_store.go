@@ -91,6 +91,80 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	return vars, nil
 }
 
+// ListVars returns at most limit variables of a scope, with their values,
+// in the order of their keys with A to Z lowered, beginning after the
+// variable whose Position is after, or at the first when after is empty.
+func (c *Component) ListVars(ctx context.Context, scope Scope, scopeID, after string, limit int) ([]Variable, error) {
+	if c.deps.Store == nil {
+		return nil, errNotBound
+	}
+	rows, err := c.deps.Store.Main().QueryContext(ctx, `
+SELECT key, value, created_at, updated_at FROM variables
+WHERE scope = ? AND scope_id = ? AND key_lower > ?
+ORDER BY key_lower LIMIT ?`, scope, scopeID, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list variables: %w", err)
+	}
+	defer rows.Close()
+	vars := []Variable{}
+	for rows.Next() {
+		var v Variable
+		var created, updated int64
+		if err := rows.Scan(&v.Key, &v.Value, &created, &updated); err != nil {
+			return nil, fmt.Errorf("list variables: %w", err)
+		}
+		v.CreatedAt, v.UpdatedAt = fromNanos(created), fromNanos(updated)
+		vars = append(vars, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list variables: %w", err)
+	}
+	return vars, nil
+}
+
+// UpdateVar replaces, inside tx, the value of the variable whose key
+// matches name ignoring ASCII case, and returns the variable: it keeps the
+// key as first stored and its creation time, and is updated now. It
+// returns an error matching ErrInvalid for a value over the limit, and then
+// an error matching ErrNotFound, whose message names name, when the scope
+// holds no such variable.
+func (c *Component) UpdateVar(ctx context.Context, tx *sql.Tx, scope Scope, scopeID, name, value string) (Variable, error) {
+	if err := CheckValue(name, value); err != nil {
+		return Variable{}, err
+	}
+	v, err := findVar(ctx, tx, scope, scopeID, name)
+	if err != nil {
+		return Variable{}, err
+	}
+	v.Value, v.UpdatedAt = value, c.now()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE variables SET value = ?, updated_at = ? WHERE scope = ? AND scope_id = ? AND key_lower = ?`,
+		value, v.UpdatedAt.UnixNano(), scope, scopeID, asciiLower(name)); err != nil {
+		return Variable{}, fmt.Errorf("update variable: %w", err)
+	}
+	return v, nil
+}
+
+// DeleteVar removes, inside tx, the variable whose key matches name
+// ignoring ASCII case, and returns what it was. It returns an error
+// matching ErrNotFound, whose message names name, when the scope holds no
+// such variable.
+func (c *Component) DeleteVar(ctx context.Context, tx *sql.Tx, scope Scope, scopeID, name string) (Variable, error) {
+	var v Variable
+	var created, updated int64
+	err := tx.QueryRowContext(ctx,
+		`DELETE FROM variables WHERE scope = ? AND scope_id = ? AND key_lower = ? RETURNING key, value, created_at, updated_at`,
+		scope, scopeID, asciiLower(name)).Scan(&v.Key, &v.Value, &created, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Variable{}, notFound(name)
+	}
+	if err != nil {
+		return Variable{}, fmt.Errorf("delete variable: %w", err)
+	}
+	v.CreatedAt, v.UpdatedAt = fromNanos(created), fromNanos(updated)
+	return v, nil
+}
+
 // findVar returns the variable matching name ignoring ASCII case, or an
 // error matching ErrNotFound.
 func findVar(ctx context.Context, q querier, scope Scope, scopeID, name string) (Variable, error) {

@@ -2,9 +2,11 @@ package secret_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -45,6 +47,9 @@ func TestCreateVars_StoresEveryEntryInRequestOrder(t *testing.T) {
 		stored := w.storedVars(t, pl.scope, pl.id)
 		if wantStored := []string{"alpha=", long + "=" + big, "Zed=1"}; !slices.Equal(stored, wantStored) {
 			t.Errorf("%s: the scope holds %d variables %.80v, want alpha=, the long key and Zed=1", pl.path, len(stored), stored)
+		}
+		if listed := w.listVars(t, w.ownerKey, pl.path); !slices.Equal(listed, []variable{want[1], want[2], want[0]}) {
+			t.Errorf("%s: the list holds %d variables %.80v, want alpha, the long key and Zed as created", pl.path, len(listed), keysOf(listed))
 		}
 	}
 }
@@ -128,12 +133,18 @@ func TestCreateVars_RefusesABadRequestWhole(t *testing.T) {
 		if got := w.storedVars(t, pl.scope, pl.id); !slices.Equal(got, []string{"Token=old"}) {
 			t.Errorf("%s: after the refusals the scope holds %.80v, want only Token=old", pl.path, got)
 		}
+		if got := w.listVars(t, w.ownerKey, pl.path); len(got) != 1 || got[0].Key != "Token" || got[0].Value != "old" {
+			t.Errorf("%s: after the refusals the list holds %.80v, want only Token=old", pl.path, got)
+		}
 	}
 	for _, c := range firstFault {
 		refuse(w.member2Key, "/user/vars", c)
 	}
 	if n := len(w.storedVars(t, secret.ScopeUser, w.member2ID)); n != secret.MaxEntries {
 		t.Errorf("after the refusals the full scope holds %d variables, want %d", n, secret.MaxEntries)
+	}
+	if n := len(w.listVars(t, w.member2Key, "/user/vars")); n != secret.MaxEntries {
+		t.Errorf("after the refusals the full scope lists %d variables, want %d", n, secret.MaxEntries)
 	}
 }
 
@@ -210,5 +221,171 @@ func TestVarRoutes_ServeWithoutAnEncryptionKey(t *testing.T) {
 		if got := w.storedVars(t, pl.scope, pl.id); !slices.Equal(got, []string{"K=readable"}) {
 			t.Errorf("%s: the scope holds %v, want K=readable", pl.path, got)
 		}
+		if got := w.listVars(t, w.ownerKey, pl.path); len(got) != 1 || got[0].Key != "K" || got[0].Value != "readable" {
+			t.Errorf("%s: the list holds %v, want K=readable", pl.path, got)
+		}
+	}
+}
+
+func TestListVars_PagesAScopesOwnVariablesInCaseFoldedOrder(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	at := w.clock().Truncate(time.Second).Format(time.RFC3339)
+	const col = "/workspaces/acme/vars"
+	set := func(k, v string) map[string]any { return map[string]any{"key": k, "value": v} }
+	if a := w.do(t, w.ownerKey, http.MethodPost, col, entries(set("b", "vb"), set("A", "vA"), set("c", "vc"), set("B2", "vB2"))); a.status != http.StatusCreated {
+		t.Fatalf("create the variables = %d %s, want 201", a.status, a.body)
+	}
+	want := []variable{{"A", "vA", at, at}, {"b", "vb", at, at}, {"B2", "vB2", at, at}, {"c", "vc", at, at}}
+	// The owner and a member, who reads the workspace and may not change
+	// it, are answered the same list.
+	for _, cred := range []string{w.ownerKey, w.memberKey} {
+		got, next := varPageOf(t, w.do(t, cred, http.MethodGet, col, nil))
+		if !slices.Equal(got, want) || next != nil {
+			t.Errorf("list = %v, next_cursor %v; want %v and null", got, next, want)
+		}
+	}
+
+	first, next := varPageOf(t, w.do(t, w.ownerKey, http.MethodGet, col+"?limit=2", nil))
+	if len(first) != 2 || next == nil {
+		t.Fatalf("page 1 = %v, next_cursor %v; want 2 items and a cursor", first, next)
+	}
+	second, last := varPageOf(t, w.do(t, w.ownerKey, http.MethodGet, col+"?limit=2&cursor="+url.QueryEscape(*next), nil))
+	if got := append(first, second...); !slices.Equal(got, want) || last != nil {
+		t.Errorf("pages = %v, last next_cursor %v; want %v and null", got, last, want)
+	}
+
+	w.createVars(t, w.memberKey, "/workspaces/acme-fork/vars", "Own")
+	if got := keysOf(w.listVars(t, w.memberKey, "/workspaces/acme-fork/vars")); !slices.Equal(got, []string{"Own"}) {
+		t.Errorf("the fork's list = %v, want only its own Own, none of its parent's", got)
+	}
+
+	empty := w.do(t, w.ownerKey, http.MethodGet, "/orgs/acme/vars", nil)
+	if got, next := varPageOf(t, empty); len(got) != 0 || next != nil || !bytes.Contains(empty.body, []byte(`"items":[]`)) {
+		t.Errorf("an empty scope's list = %s, want items [] and next_cursor null", empty.body)
+	}
+
+	many := numbered("K", 51)
+	w.createVars(t, w.ownerKey, "/user/vars", many...)
+	page1, next := varPageOf(t, w.do(t, w.ownerKey, http.MethodGet, "/user/vars", nil))
+	if len(page1) != 50 || next == nil {
+		t.Fatalf("the first page of 51 = %d items, next_cursor %v; want 50 and a cursor", len(page1), next)
+	}
+	page2, last := varPageOf(t, w.do(t, w.ownerKey, http.MethodGet, "/user/vars?cursor="+url.QueryEscape(*next), nil))
+	if got := keysOf(append(page1, page2...)); !slices.Equal(got, slices.Sorted(slices.Values(many))) || last != nil {
+		t.Errorf("the pages of 51 = %v, last next_cursor %v; want the 51 keys in order once each and null", got, last)
+	}
+}
+
+func TestUpdateVar_ReplacesTheValueAndKeepsTheKey(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	values := []string{"b", "", strings.Repeat("x", secret.MaxValueSize)}
+	for _, pl := range w.varPlaces() {
+		created := w.clock().Truncate(time.Second).Format(time.RFC3339)
+		if a := w.do(t, w.ownerKey, http.MethodPost, pl.path, entries(map[string]any{"key": "ApiUrl", "value": "a"})); a.status != http.StatusCreated {
+			t.Fatalf("%s: create ApiUrl = %d %s, want 201", pl.path, a.status, a.body)
+		}
+		for _, v := range values {
+			now := w.advance(time.Minute).Truncate(time.Second).Format(time.RFC3339)
+			want := variable{"ApiUrl", v, created, now}
+			got := varOf(t, w.do(t, w.ownerKey, http.MethodPatch, pl.path+"/APIURL", map[string]any{"value": v}), http.StatusOK)
+			if got != want {
+				t.Errorf("%s: PATCH APIURL to %s = %s %s %s %s, want ApiUrl created %s, updated %s",
+					pl.path, short(v), got.Key, short(got.Value), got.CreatedAt, got.UpdatedAt, created, now)
+			}
+			if listed := w.listVars(t, w.ownerKey, pl.path); !slices.Equal(listed, []variable{want}) {
+				t.Errorf("%s: after PATCH to %s the list holds %d variables %.80v, want only the updated ApiUrl", pl.path, short(v), len(listed), keysOf(listed))
+			}
+		}
+	}
+}
+
+func TestUpdateVar_RefusesABadValueWhetherOrNotTheKeyExists(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	bodies := []struct {
+		name string
+		body any
+	}{
+		{"no value", map[string]any{}},
+		{"a null value", map[string]any{"value": nil}},
+		{"a value not a string", map[string]any{"value": 3}},
+		{"a value one byte too large", map[string]any{"value": strings.Repeat("x", secret.MaxValueSize+1)}},
+	}
+	for _, pl := range w.varPlaces() {
+		w.createVars(t, w.ownerKey, pl.path, "Kept")
+		before := w.listVars(t, w.ownerKey, pl.path)
+		w.advance(time.Minute)
+		for _, key := range []string{"kept", "Missing"} {
+			for _, b := range bodies {
+				a := w.do(t, w.ownerKey, http.MethodPatch, pl.path+"/"+key, b.body)
+				if typ, _ := errorOf(t, a); a.status != http.StatusBadRequest || typ != "invalid_request" {
+					t.Errorf("%s/%s, %s: %d %.200s, want 400 invalid_request", pl.path, key, b.name, a.status, a.body)
+				}
+			}
+		}
+		if after := w.listVars(t, w.ownerKey, pl.path); !slices.Equal(after, before) {
+			t.Errorf("%s: after the refusals the list holds %v, want %v", pl.path, after, before)
+		}
+	}
+}
+
+func TestVarKeyRoutes_AnswerNotFoundForAKeyTheScopeLacks(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	const col = "/workspaces/acme/vars"
+	w.createVars(t, w.ownerKey, "/user/vars", "UserOnly")
+	w.createVars(t, w.ownerKey, col, "Kept")
+	w.seed(t, secret.ScopeWorkspace, "acme", "SecretOnly")
+	userBefore, before := w.listVars(t, w.ownerKey, "/user/vars"), w.listVars(t, w.ownerKey, col)
+	w.advance(time.Minute)
+	keys := []struct{ name, key string }{
+		{"a key never created", "NeVer"},
+		{"a key of the owner's user scope", "useronly"},
+		{"a key no rule allows", "a-b"},
+		{"a key the scope holds as a secret", "secretonly"},
+	}
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		var body any
+		if method == http.MethodPatch {
+			body = map[string]any{"value": "new"}
+		}
+		for _, k := range keys {
+			a := w.do(t, w.ownerKey, method, col+"/"+k.key, body)
+			typ, msg := errorOf(t, a)
+			if want := fmt.Sprintf("key %q not found", k.key); a.status != http.StatusNotFound || typ != "not_found" || msg != want {
+				t.Errorf("%s %s, %s: %d %s %q, want 404 not_found %q", method, k.key, k.name, a.status, typ, msg, want)
+			}
+		}
+	}
+	if got := w.listVars(t, w.ownerKey, col); !slices.Equal(got, before) {
+		t.Errorf("the workspace's variables are %v, want %v", got, before)
+	}
+	if got := w.listVars(t, w.ownerKey, "/user/vars"); !slices.Equal(got, userBefore) {
+		t.Errorf("the owner's variables are %v, want %v", got, userBefore)
+	}
+	if v, found, err := w.secrets.Get(context.Background(), secret.ScopeWorkspace, "acme", "SecretOnly"); !found || err != nil || v != valueOf("SecretOnly") {
+		t.Errorf("the secret SecretOnly = %q, %v, %v; want it unchanged", v, found, err)
+	}
+}
+
+func TestDeleteVar_RemovesTheVariable(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	for _, pl := range w.varPlaces() {
+		w.createVars(t, w.ownerKey, pl.path, "Region", "Other")
+		a := w.do(t, w.ownerKey, http.MethodDelete, pl.path+"/region", nil)
+		if a.status != http.StatusNoContent || len(a.body) != 0 {
+			t.Errorf("%s: DELETE region = %d %q, want 204 and no body", pl.path, a.status, a.body)
+		}
+		if got := keysOf(w.listVars(t, w.ownerKey, pl.path)); !slices.Equal(got, []string{"Other"}) {
+			t.Errorf("%s: after the delete the list holds %v, want only Other", pl.path, got)
+		}
+		again := w.do(t, w.ownerKey, http.MethodDelete, pl.path+"/region", nil)
+		if typ, msg := errorOf(t, again); again.status != http.StatusNotFound || typ != "not_found" || msg != `key "region" not found` {
+			t.Errorf("%s: a second DELETE = %d %s %q, want 404 not_found", pl.path, again.status, typ, msg)
+		}
+		w.createVars(t, w.ownerKey, pl.path, "REGION")
 	}
 }
