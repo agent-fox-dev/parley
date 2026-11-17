@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -49,6 +50,8 @@ type Deps struct {
 	// Events writes the events of the patch list in the transaction of the
 	// change they report.
 	Events Emitter
+	// Jobs is the hub's job queue, which holds the rebuild jobs.
+	Jobs *jobs.Queue
 	// Now is the clock of the patch list's times; nil is time.Now.
 	Now func() time.Time
 	// Logger receives what fails after an answer is decided, such as the

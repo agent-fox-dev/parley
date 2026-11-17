@@ -18,14 +18,17 @@ const carryPatchHook = "carry_patch"
 // the integration branch written) before the workspace is ready, and as the
 // patch-branch lookup of the push route, which leaves the patch branches to
 // the patch list, without the workspace package knowing the mode's work. A
-// workspace's delete removes its patches (ADR 07). The component's routes,
-// the patch list's reads and its add, are registered with the hub's router.
+// workspace's delete removes its patches (ADR 07). The component is the
+// hub's rebuild enqueuer, through which every source of a rebuild queues
+// one as a job of the hub's queue. The component's routes, those of the
+// patch list and of the rebuild jobs, are registered with the hub's router.
 // Its start hook binds the component to the store, the secret component,
 // which holds the upstream and origin credentials, the hub's git, the place
 // of each copy on disk, the workspace settings registry, through which a
 // patch branch's resolution reads patch_branch_source, the event component,
-// which writes an add's event in its transaction (ADR 05), and the hub's
-// clock and logger, after every adjuster
+// which writes an add's event in its transaction (ADR 05), the job queue,
+// which the jobs part's hook binds before this one, and the hub's clock and
+// logger, after every adjuster
 // AdjustCarryPatch added has changed those dependencies. The hook runs
 // after the workspace part's, and like it before the clone workers launch,
 // so no clone runs the step before the component is bound.
@@ -39,6 +42,7 @@ func composeCarryPatch(c *Composition) {
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
+	comp.RegisterRebuildEnqueuer(comp)
 	for _, rt := range comp.Routes() {
 		c.AddRoute(rt)
 	}
@@ -50,6 +54,7 @@ func composeCarryPatch(c *Composition) {
 			RepoPath: c.workspaces.RepoPath,
 			Settings: c.workspaces.Settings(),
 			Events:   c.Events(),
+			Jobs:     c.Jobs(),
 			Now:      rt.Now,
 			Logger:   rt.Logger,
 		}

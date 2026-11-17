@@ -153,6 +153,17 @@ func CountLivePatches(ctx context.Context, q Querier, workspace string) (int, er
 	return n, nil
 }
 
+// countApplicable counts the patches of the workspace a rebuild applies:
+// those in active or conflict.
+func countApplicable(ctx context.Context, q Querier, workspace string) (int, error) {
+	var n int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM patches WHERE workspace_slug = ? AND status IN (?, ?)`,
+		workspace, StatusActive, StatusConflict).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count the patches of %s to rebuild: %w", workspace, err)
+	}
+	return n, nil
+}
+
 // DeletePatch removes the row of the patch id of the workspace for good; a
 // patch that does not exist is no error.
 func DeletePatch(ctx context.Context, tx *sql.Tx, workspace, id string) error {
