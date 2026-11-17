@@ -5225,12 +5225,17 @@ among them, `ErrNoUpstreamBase` when only the base was missing.
 `PostClone(ctx, w, repo)` is the replacing form, given the record and the
 copy by the clone work: it writes the branch with `SetRef`, so a branch of
 that name the clone brought from origin is replaced, and the clone logs its
-error. `EnsureSetup(ctx, w)` is the form for a ready workspace, for the
-sync: it creates the branch only when absent
-(`CompareAndSwapRef(ref, id, "")`, `ErrRefMoved` leaving it), never moving
-one. `Setup.LeaveBranch` leaves the branch step out, as a rebuild's
-repeat of the set-up does: the rebuild writes the integration branch at
-its publish alone.
+error. `EnsureSetup(ctx, w)` is the form for a ready workspace: it
+creates the branch only when absent (`CompareAndSwapRef(ref, id, "")`,
+`ErrRefMoved` leaving it), never moving one. `Setup.LeaveBranch` leaves
+the branch step out, as a rebuild's and a sync's repeat of the set-up do:
+the rebuild writes the integration branch at its publish alone, the sync
+creates a missing one at the base once it resolved
+(`createIntegrationBranch`). Every repeat of the set-up of one workspace
+holds the component's per-workspace set-up lock (`Component.setups`, a
+`slugLocks` whose wait ends with the caller's context), so that two
+upstream fetches never run into one copy at once, where they would fail
+on each other's ref and configuration locks.
 
 **The patch list.** The `patches` table holds a row per patch (`Patch`):
 UUID id, `workspace_slug`, `branch_name`, `position` (NULL exactly when
@@ -5295,11 +5300,13 @@ through `RunGit` under `DefaultBranchFetchDeadline`; the missing-branch
 answer is the caller's, `missing_on_origin` here and `branch_not_found` for
 the add), compares the hub's tip with origin's (`LookupRef`,
 `IsAncestor`) and takes the action `created`, `none`, `fast_forwarded` or
-`replaced`. For `replaced` it first saves the hub's tip with
-`WriteBackupRef(ctx, repo, branch, id)` (`backup_ref.go`), the one writer
-of `refs/parley/replaced/<branch>`, which needs no request so that a sync
-can call it; then it moves the branch with `CompareAndSwapRef` against the
-tip it compared (`""` for `created`). A lost swap (`gitrepo.ErrRefMoved`)
+`replaced` (`compareWithOrigin`, shared with the sync's refresh). For
+`replaced` it first saves the hub's tip with
+`WriteBackupRef(ctx, repo, branch, id)` (`backup_ref.go`), which with its
+compare-and-swap form `SwapBackupRef(ctx, repo, branch, id, was)`, the
+sync's, is the one writer of `refs/parley/replaced/<branch>`; then it
+moves the branch with `CompareAndSwapRef` against the tip it compared
+(`""` for `created`); `swapToOrigin` is these two writes for both. A lost swap (`gitrepo.ErrRefMoved`)
 is `409 ref_moved` with the branch's current commit. From the choice of
 action on, the reset runs on `context.WithoutCancel`. The record and the
 moves are one `store.Tx`: it reads the patch again and refuses one now
@@ -5327,10 +5334,11 @@ job.
 **The sync.** The component is package 12's sync extension and its
 excluded-branch provider. `ExcludedBranches` (`excluded.go`) names the
 branch of every patch of `ListLivePatches`, the store's error unchanged.
-`AfterFetch` (`sync.go`) runs `EnsureSetup`, whose upstream fetch failure
-(the step matching `ErrUpstreamFetch`) it returns alone, logging other
-failed steps, then resolves the base with `UpstreamBase`; no base is an
-error. `BeforeCompletion` cannot take state from the first stage, so
+`AfterFetch` (`sync.go`) holds the set-up lock and runs the set-up with
+`LeaveBranch`, whose upstream fetch failure (the step matching
+`ErrUpstreamFetch`) it returns alone, logging other failed steps, then
+resolves the base with `UpstreamBase` (no base is an error) and only then
+creates a missing integration branch at the base. `BeforeCompletion` cannot take state from the first stage, so
 `startSyncPass` resolves the base again and computes `upstream_advanced`
 and `force_push_detected` (`Repo.Missing` before `IsAncestor`, since a
 stored head the copy lacks counts as forced), then runs, each on success
@@ -5338,15 +5346,24 @@ of the one before: `refreshFromOrigin` (`sync_refresh.go`), `detectMerges`
 (`merge_detect.go`), `clearOriginFields`, `triggerRebuild`, and
 `addition`, which marshals the eight members into `SyncAddition.Members`
 and sets `UpstreamHeadSHA` only when upstream advanced. The refresh reads
-origin's head from `SyncRun.OriginHeads` (this sync's fetch), calls
-`Deps.BeforeRefSwap` before a moving outcome, and records each outcome in
-one `Store.Tx`: the patch read again, the origin fields, the events,
-`WriteBackupRef` for a replace, and the compare-and-swap last, so a lost
-swap rolls back the fields and events and keeps the backup; a commit that
-fails after the swap puts the branch back. A move is told to
-`Deps.BranchMoves` after the commit. A refresh error stops the walk with
-no retry; `rebuildAfterFailedRefresh` queues a rebuild when an `active` or
-`conflict` patch's branch had moved. Detection uses
+origin's head from `SyncRun.OriginHeads` (this sync's fetch); syncs wait
+for one another only during their origin fetch, so when the hub's tip
+would be replaced it compares the tip again with the copy's
+`refs/remotes/origin/<branch>`, which a later sync's fetch may have moved
+and that sync's refresh moved the branch to, and takes `none` or
+`fast_forwarded` towards that head when the hub's tip is it or its
+ancestor, never moving a branch back. For a replace it reads the backup
+ref at the comparison. It calls `Deps.BeforeRefSwap` before a moving
+outcome and records each outcome in one `Store.Tx`: the patch read again,
+the origin fields, the events, `SwapBackupRef` for a replace (expecting
+the backup read at the comparison), and the compare-and-swap last, so a
+lost swap, of the branch or of its backup, rolls back the fields and
+events, a branch swap lost keeps the backup written; a commit that fails
+after the swap puts the branch back. A move is told to `Deps.BranchMoves`
+after the commit. A refresh error stops the walk with no retry; a failure
+of the refresh, `detectMerges` or `clearOriginFields` runs
+`rebuildAfterFailure`, which queues a rebuild when an `active` or
+`conflict` patch's branch had moved or a patch was marked merged. Detection uses
 `gitrepo.(*Repo).Cherry` and `Subjects` (`internal/gitrepo/cherry.go`,
 full 40-hex ids only, so no revision is read as an option), through
 `RunGit` like every git call of the package, and marks a merged patch in

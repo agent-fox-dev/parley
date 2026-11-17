@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,8 +23,10 @@ const squashMergeDetectionKey = "squash_merge_detection"
 // on the first sync, and after upstream was force-pushed.
 const prWindow = 50
 
-// pullNumber finds the pull request number in a patch's upstream_pr_url.
-var pullNumber = regexp.MustCompile(`/pull/([0-9]+)`)
+// pullNumber finds the pull request number in a patch's upstream_pr_url:
+// the digits after /pull/ that end the URL or a part of its path, or come
+// before its query or fragment.
+var pullNumber = regexp.MustCompile(`/pull/([0-9]+)(?:[/?#]|$)`)
 
 // mergeTests are the tests the effective squash_merge_detection of the
 // sync's workspace selects; a missing key or registry reads as the
@@ -161,16 +164,21 @@ func (d *mergeDetection) merged(ctx context.Context, p Patch, tip string) (bool,
 	return len(commits) > 0, nil
 }
 
-// prNumber is the pull request number of p's upstream_pr_url, "" when it
-// names none.
+// prNumber is the pull request number of p's upstream_pr_url in decimal
+// without leading zeros, as a subject writes it, "" when it names none.
 func prNumber(p Patch) string {
 	if p.UpstreamPRURL == nil {
 		return ""
 	}
-	if m := pullNumber.FindStringSubmatch(*p.UpstreamPRURL); m != nil {
-		return m[1]
+	m := pullNumber.FindStringSubmatch(*p.UpstreamPRURL)
+	if m == nil {
+		return ""
 	}
-	return ""
+	n, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil {
+		return ""
+	}
+	return strconv.FormatUint(n, 10)
 }
 
 // upstreamSubjects are the subjects of the upstream commits this sync

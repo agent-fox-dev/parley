@@ -1,6 +1,7 @@
 package carrypatch_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,8 +27,9 @@ func originAuthority(policy string) map[string]any {
 
 // Under origin as the authority, every active, conflict or disabled patch
 // gets the outcome of the first rule that fits its two tips, reported in
-// position order, and its branch moves to origin's tip only for created,
-// fast_forwarded and replaced.
+// position order by an entry of exactly six members, and stored on the
+// patch with the time of the comparison, cut to the second; its branch
+// moves to origin's tip only for created, fast_forwarded and replaced.
 func TestRefresh_Outcomes(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)
@@ -49,7 +52,9 @@ func TestRefresh_Outcomes(t *testing.T) {
 		{"hub tip is an ancestor of origin's", "patch/ff", carrypatch.StatusActive, f1, commit("ff2", f1), "fast_forwarded", "in_sync"},
 		{"each side has a commit the other lacks, policy report", "patch/div", carrypatch.StatusConflict, divHub, commit("div-origin", d), "none", "diverged"},
 		{"hub tip ahead of origin's, policy report", "patch/ahead", carrypatch.StatusDisabled, commit("ahead2", a1), a1, "none", "diverged"},
+		{"neither side has the branch", "patch/none", carrypatch.StatusActive, "", "", "none", "missing_on_origin"},
 	}
+	ids := make([]string, len(rows))
 	for i, row := range rows {
 		p := livePatch(f.slug, row.branch, i+1)
 		p.Status = row.status
@@ -63,21 +68,25 @@ func TestRefresh_Outcomes(t *testing.T) {
 			f.originBranch(t, row.branch, row.origin)
 		}
 		f.put(t, p)
+		ids[i] = p.ID
 	}
+	at := f.clock().UTC().Truncate(time.Second)
 
 	r := f.mustSync(t)
-	entries := r.synced(t)
-	var names []string
-	for _, e := range entries {
-		names = append(names, e.BranchName)
-	}
 	var want []string
 	for _, row := range rows {
 		want = append(want, row.branch)
 	}
-	if !slices.Equal(names, want) {
+	if names := r.syncedNames(t); !slices.Equal(names, want) {
 		t.Fatalf("patches_synced names %v, want %v in position order", names, want)
 	}
+	keys := []string{"action", "branch_name", "local_sha", "origin_sha", "replaced_sha", "state"}
+	for _, e := range answerList[map[string]json.RawMessage](t, r, "patches_synced") {
+		if got := slices.Sorted(maps.Keys(e)); !slices.Equal(got, keys) {
+			t.Errorf("entry %s has the members %v, want exactly %v", e["branch_name"], got, keys)
+		}
+	}
+	entries := answerList[syncedEntry](t, r, "patches_synced")
 	for i, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
 			e := entries[i]
@@ -97,8 +106,18 @@ func TestRefresh_Outcomes(t *testing.T) {
 			if got, want := str(e.OriginSHA), orNil(row.origin); got != want {
 				t.Errorf("origin_sha = %s, want %s", got, want)
 			}
+			for _, id := range []*string{e.LocalSHA, e.OriginSHA} {
+				if id != nil && len(*id) != 40 {
+					t.Errorf("the id %s is not in full", *id)
+				}
+			}
 			if e.ReplacedSHA != nil {
 				t.Errorf("replaced_sha = %s, want null", *e.ReplacedSHA)
+			}
+			got := f.stored(t, ids[i])
+			if str(got.OriginSyncState) != row.state || str(got.OriginSHA) != orNil(row.origin) || !equalTime(got.OriginSyncedAt, &at) {
+				t.Errorf("origin fields = %s, %s, %v; want %s, %s, %v", str(got.OriginSyncState), str(got.OriginSHA),
+					got.OriginSyncedAt, row.state, orNil(row.origin), at)
 			}
 		})
 	}
@@ -108,8 +127,8 @@ func TestRefresh_Outcomes(t *testing.T) {
 		f.setSettings(t, originAuthority("replace"))
 		row := rows[4]
 		e := f.mustSync(t).syncedOf(t, row.branch)
-		if e.Action != "replaced" || e.State != "in_sync" {
-			t.Errorf("entry = %s/%s, want replaced/in_sync", e.Action, e.State)
+		if e.Action != "replaced" || e.State != "in_sync" || str(e.ReplacedSHA) != row.hub {
+			t.Errorf("entry = %s/%s with replaced_sha %s, want replaced/in_sync with %s", e.Action, e.State, str(e.ReplacedSHA), row.hub)
 		}
 		if got := refIn(f.copy, "refs/heads/"+row.branch); got != row.origin {
 			t.Errorf("%s = %s, want origin's %s", row.branch, got, row.origin)
@@ -126,64 +145,53 @@ func orNil(id string) string {
 }
 
 // A replace saves the hub's tip to the branch's backup ref, overwriting an
-// earlier backup, before it moves the branch, and reports the saved tip.
+// earlier backup, before it moves the branch, reports the saved tip and
+// emits one parley.patch.replace with the replaced tip, origin's tip and
+// the trigger sync. A protected patch branch is moved by the same rules as
+// any other.
 func TestRefresh_ReplaceSavesBackup(t *testing.T) {
-	t.Parallel()
-	f := startSyncFixture(t)
-	f.setSettings(t, originAuthority("replace"))
-	a := f.addPatch(t, "patch/a")
-	aTip := refIn(f.copy, "refs/heads/patch/a")
-	f.originBranch(t, a.BranchName, gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, aTip))
-	f.addPatch(t, "patch/b")
-	old := refIn(f.copy, "refs/heads/patch/b")
-	older := gitrepotest.Commit(t, f.copy, "older", map[string]string{"b.txt": "older\n"}, f.base)
-	gitrepotest.Git(t, f.copy, "update-ref", carrypatch.ReplacedRefPrefix+"patch/b", older)
-	theirs := gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base)
-	f.originBranch(t, "patch/b", theirs)
-
-	r := f.mustSync(t)
-	e := r.syncedOf(t, "patch/b")
-	if e.Action != "replaced" || str(e.ReplacedSHA) != old {
-		t.Errorf("patch/b's entry = %s with replaced_sha %s, want replaced with %s", e.Action, str(e.ReplacedSHA), old)
-	}
-	if got := refIn(f.copy, carrypatch.ReplacedRefPrefix+"patch/b"); got != old {
-		t.Errorf("the backup ref of patch/b = %s, want the hub's tip %s", got, old)
-	}
-	if got := refIn(f.copy, "refs/heads/patch/b"); got != theirs {
-		t.Errorf("patch/b = %s, want origin's %s", got, theirs)
-	}
-	for _, e := range r.synced(t) {
-		if e.BranchName != "patch/b" && e.ReplacedSHA != nil {
-			t.Errorf("%s's replaced_sha = %s, want null", e.BranchName, *e.ReplacedSHA)
-		}
-	}
-}
-
-// A protected patch branch is moved by the same rules as any other.
-func TestRefresh_MovesProtectedPatchBranches(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)
 	settings := originAuthority("replace")
 	settings["protected_branches"] = []string{"patch/a", "patch/b"}
 	f.setSettings(t, settings)
 	f.addPatch(t, "patch/a")
-	aOrigin := gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, refIn(f.copy, "refs/heads/patch/a"))
-	f.originBranch(t, "patch/a", aOrigin)
-	f.addPatch(t, "patch/b")
-	bOrigin := gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base)
-	f.originBranch(t, "patch/b", bOrigin)
+	aOrigin := f.originAhead(t, "patch/a", "origin")
+	b := f.addPatch(t, "patch/b")
+	old := refIn(f.copy, "refs/heads/patch/b")
+	older := f.commitOn(t, f.base, "older", map[string]string{"b.txt": "older\n"})
+	gitrepotest.Git(t, f.copy, "update-ref", carrypatch.ReplacedRefPrefix+"patch/b", older)
+	theirs := f.commitOn(t, f.base, "B on origin", map[string]string{"b.txt": "origin\n"})
+	f.originBranch(t, "patch/b", theirs)
 
 	r := f.mustSync(t)
 	for branch, want := range map[string]struct{ action, tip string }{
 		"patch/a": {"fast_forwarded", aOrigin},
-		"patch/b": {"replaced", bOrigin},
+		"patch/b": {"replaced", theirs},
 	} {
-		if got := r.syncedOf(t, branch).Action; got != want.action {
-			t.Errorf("%s's action = %s, want %s", branch, got, want.action)
+		e := r.syncedOf(t, branch)
+		if e.Action != want.action {
+			t.Errorf("%s's action = %s, want %s", branch, e.Action, want.action)
 		}
 		if got := refIn(f.copy, "refs/heads/"+branch); got != want.tip {
 			t.Errorf("%s = %s, want origin's %s", branch, got, want.tip)
 		}
+		if branch == "patch/b" && str(e.ReplacedSHA) != old {
+			t.Errorf("patch/b's replaced_sha = %s, want the hub's tip %s", str(e.ReplacedSHA), old)
+		} else if branch != "patch/b" && e.ReplacedSHA != nil {
+			t.Errorf("%s's replaced_sha = %s, want null", branch, *e.ReplacedSHA)
+		}
+	}
+	if got := refIn(f.copy, carrypatch.ReplacedRefPrefix+"patch/b"); got != old {
+		t.Errorf("the backup ref of patch/b = %s, want the hub's tip %s", got, old)
+	}
+	ev := f.patchEvents(t, carrypatch.EventPatchReplace)
+	if len(ev) != 1 {
+		t.Fatalf("parley.patch.replace events = %+v, want one", ev)
+	}
+	want := map[string]any{"branch_name": "patch/b", "replaced_sha": old, "origin_sha": theirs, "trigger": "sync"}
+	if e := ev[0]; e.ResourceType != "patch" || e.ResourceID != b.ID || str(e.ActorID) != f.owner || !reflect.DeepEqual(e.Metadata, want) {
+		t.Errorf("event = %s %s by %s %+v; want patch %s by %s %+v", e.ResourceType, e.ResourceID, str(e.ActorID), e.Metadata, b.ID, f.owner, want)
 	}
 }
 
@@ -194,7 +202,7 @@ func TestRefresh_NotRunWhenHubIsAuthority(t *testing.T) {
 	f := startSyncFixture(t)
 	f.setSettings(t, map[string]any{"patch_branch_source": "hub"})
 	f.addPatch(t, "patch/a")
-	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, refIn(f.copy, "refs/heads/patch/a")))
+	f.originAhead(t, "patch/a", "origin")
 	f.addPatch(t, "patch/b")
 	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
 	before := gitrepotest.Refs(t, f.copy, "refs/heads/patch/")
@@ -222,18 +230,13 @@ func TestRefresh_SkipsMergedAndDeleted(t *testing.T) {
 	f.originBranch(t, "patch/a", refIn(f.copy, "refs/heads/patch/a"))
 	f.addPatch(t, "patch/m", withStatus(carrypatch.StatusMergedUpstream))
 	before := refIn(f.copy, "refs/heads/patch/m")
-	f.originBranch(t, "patch/m", gitrepotest.Commit(t, f.copy, "M2", map[string]string{"m.txt": "2\n"}, before))
+	f.originAhead(t, "patch/m", "origin")
 	gone := gitrepotest.Commit(t, f.copy, "G1", map[string]string{"gone.txt": "1\n"}, f.base)
 	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/patch/gone", gone)
 	f.put(t, deletedPatch(f.slug, "patch/gone", f.clock()))
-	f.originBranch(t, "patch/gone", gitrepotest.Commit(t, f.copy, "G2", map[string]string{"gone.txt": "2\n"}, gone))
+	f.originAhead(t, "patch/gone", "origin")
 
-	r := f.mustSync(t)
-	var names []string
-	for _, e := range r.synced(t) {
-		names = append(names, e.BranchName)
-	}
-	if !slices.Equal(names, []string{"patch/a"}) {
+	if names := f.mustSync(t).syncedNames(t); !slices.Equal(names, []string{"patch/a"}) {
 		t.Errorf("patches_synced names %v, want [patch/a]", names)
 	}
 	if got := refIn(f.copy, "refs/heads/patch/m"); got != before {
@@ -253,8 +256,7 @@ func TestRefresh_NotifiesBranchMoveObservers(t *testing.T) {
 	f.setSettings(t, originAuthority("replace"))
 	f.addPatch(t, "patch/a")
 	old := refIn(f.copy, "refs/heads/patch/a")
-	theirs := gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, old)
-	f.originBranch(t, "patch/a", theirs)
+	theirs := f.originAhead(t, "patch/a", "origin")
 	f.addPatch(t, "patch/b")
 	f.originBranch(t, "patch/b", refIn(f.copy, "refs/heads/patch/b"))
 	f.put(t, livePatch(f.slug, "patch/c", 3))
@@ -271,101 +273,62 @@ func TestRefresh_NotifiesBranchMoveObservers(t *testing.T) {
 	}
 }
 
-// Each refresh outcome is stored on its patch: the state, origin's tip
-// (null when origin lacks the branch) and the time of the comparison, cut
-// to the second.
-func TestRefresh_StoresOriginState(t *testing.T) {
-	t.Parallel()
-	f := startSyncFixture(t)
-	f.setSettings(t, originAuthority("report"))
-	a := f.addPatch(t, "patch/a")
-	f.originBranch(t, "patch/a", refIn(f.copy, "refs/heads/patch/a"))
-	b := f.addPatch(t, "patch/b")
-	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
-	c := f.addPatch(t, "patch/c")
-	at := f.clock().UTC().Truncate(time.Second)
-
-	f.mustSync(t)
-	for _, want := range []struct {
-		p          carrypatch.Patch
-		state, tip string
-	}{
-		{a, "in_sync", f.origin.Head("patch/a")},
-		{b, "diverged", f.origin.Head("patch/b")},
-		{c, "missing_on_origin", ""},
-	} {
-		got := f.stored(t, want.p.ID)
-		if str(got.OriginSyncState) != want.state || str(got.OriginSHA) != orNil(want.tip) || !equalTime(got.OriginSyncedAt, &at) {
-			t.Errorf("%s's origin fields = %s, %s, %v; want %s, %s, %v", want.p.BranchName,
-				str(got.OriginSyncState), str(got.OriginSHA), got.OriginSyncedAt, want.state, orNil(want.tip), at)
-		}
-	}
-}
-
 // The three origin fields are null after a sync on every patch under the
-// hub as the authority, and on every merged_upstream patch under origin.
+// hub as the authority, and on every merged_upstream patch under origin,
+// one already merged or one upstream merged in this sync. The subtests are
+// consecutive syncs of one workspace.
 func TestRefresh_OriginFieldsNull(t *testing.T) {
 	t.Parallel()
-	setUp := func(t *testing.T) (*syncFixture, carrypatch.Patch, carrypatch.Patch) {
-		f := startSyncFixture(t)
-		f.setSettings(t, originAuthority("replace"))
-		a, b := f.addPatch(t, "patch/a"), f.addPatch(t, "patch/b")
-		for _, p := range []carrypatch.Patch{a, b} {
-			f.originBranch(t, p.BranchName, refIn(f.copy, "refs/heads/"+p.BranchName))
-		}
-		f.mustSync(t)
-		for _, p := range []carrypatch.Patch{a, b} {
-			if got := f.stored(t, p.ID); got.OriginSyncState == nil || got.OriginSHA == nil || got.OriginSyncedAt == nil {
-				t.Fatalf("after the first sync %s's origin fields = %+v, want them set", p.BranchName, got)
-			}
-		}
-		return f, a, b
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("replace"))
+	a, b, c, d := f.addPatch(t, "patch/a"), f.addPatch(t, "patch/b"), f.addPatch(t, "patch/c"), f.addPatch(t, "patch/d")
+	for _, p := range []carrypatch.Patch{a, b, c, d} {
+		f.originBranch(t, p.BranchName, refIn(f.copy, "refs/heads/"+p.BranchName))
 	}
-	wantNull := func(t *testing.T, f *syncFixture, p carrypatch.Patch) {
+	f.mustSync(t)
+	for _, p := range []carrypatch.Patch{a, b, c, d} {
+		if got := f.stored(t, p.ID); got.OriginSyncState == nil || got.OriginSHA == nil || got.OriginSyncedAt == nil {
+			t.Fatalf("after the first sync %s's origin fields = %+v, want them set", p.BranchName, got)
+		}
+	}
+	wantNull := func(t *testing.T, p carrypatch.Patch) {
 		t.Helper()
 		if got := f.stored(t, p.ID); got.OriginSyncState != nil || got.OriginSHA != nil || got.OriginSyncedAt != nil {
 			t.Errorf("%s's origin fields = %s, %s, %v; want all null", p.BranchName, str(got.OriginSyncState), str(got.OriginSHA), got.OriginSyncedAt)
 		}
 	}
+	wantMergedInSync := func(t *testing.T, merged carrypatch.Patch, others ...carrypatch.Patch) {
+		t.Helper()
+		wantNull(t, merged)
+		if got := f.stored(t, merged.ID).Status; got != carrypatch.StatusMergedUpstream {
+			t.Errorf("%s's status = %s, want merged_upstream", merged.BranchName, got)
+		}
+		for _, p := range others {
+			if got := str(f.stored(t, p.ID).OriginSyncState); got != "in_sync" {
+				t.Errorf("%s's origin_sync_state = %s, want in_sync", p.BranchName, got)
+			}
+		}
+	}
 
+	t.Run("a merged_upstream patch under origin", func(t *testing.T) {
+		f.setStatus(t, a.ID, carrypatch.StatusMergedUpstream)
+		f.mustSync(t)
+		wantMergedInSync(t, a, b, c, d)
+	})
+	t.Run("a patch upstream merged in this sync", func(t *testing.T) {
+		f.upstreamTo(t, refIn(f.copy, "refs/heads/patch/b"))
+		wantMerged(t, f.mustSync(t), "patch/b")
+		wantMergedInSync(t, b, c, d)
+	})
 	t.Run("hub is the authority", func(t *testing.T) {
-		t.Parallel()
-		f, a, b := setUp(t)
 		before := f.eventCount(t, "parley.patch.%")
 		f.setSettings(t, map[string]any{"patch_branch_source": "hub"})
 		f.mustSync(t)
-		wantNull(t, f, a)
-		wantNull(t, f, b)
+		for _, p := range []carrypatch.Patch{a, b, c, d} {
+			wantNull(t, p)
+		}
 		if n := f.eventCount(t, "parley.patch.%"); n != before {
 			t.Errorf("parley.patch.* events = %d, want %d: clearing emits none", n, before)
-		}
-	})
-	t.Run("a merged_upstream patch under origin", func(t *testing.T) {
-		t.Parallel()
-		f, a, b := setUp(t)
-		if _, err := f.Store.Main().Exec(`UPDATE patches SET status = ? WHERE id = ?`, carrypatch.StatusMergedUpstream, a.ID); err != nil {
-			t.Fatal(err)
-		}
-		f.mustSync(t)
-		wantNull(t, f, a)
-		if got := f.stored(t, a.ID).Status; got != carrypatch.StatusMergedUpstream {
-			t.Errorf("patch/a's status = %s, want merged_upstream", got)
-		}
-		if got := str(f.stored(t, b.ID).OriginSyncState); got != "in_sync" {
-			t.Errorf("patch/b's origin_sync_state = %s, want in_sync", got)
-		}
-	})
-	t.Run("a patch upstream merged in this sync", func(t *testing.T) {
-		t.Parallel()
-		f, a, b := setUp(t)
-		f.upstreamTo(t, refIn(f.copy, "refs/heads/patch/a"))
-		wantMerged(t, f.mustSync(t), "patch/a")
-		wantNull(t, f, a)
-		if got := f.stored(t, a.ID).Status; got != carrypatch.StatusMergedUpstream {
-			t.Errorf("patch/a's status = %s, want merged_upstream", got)
-		}
-		if got := str(f.stored(t, b.ID).OriginSyncState); got != "in_sync" {
-			t.Errorf("patch/b's origin_sync_state = %s, want in_sync", got)
 		}
 	})
 }
@@ -404,18 +367,13 @@ func TestRefresh_EmitsPatchSyncEvents(t *testing.T) {
 	f.mustSync(t)
 	setup := len(f.patchEvents(t, carrypatch.EventPatchSync))
 
-	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, refIn(f.copy, "refs/heads/patch/a")))
-	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
+	f.originAhead(t, "patch/a", "origin")
+	f.originBranch(t, "patch/b", f.commitOn(t, f.base, "B on origin", map[string]string{"b.txt": "origin\n"}))
 	gitrepotest.Git(t, f.origin.Dir(), "update-ref", "-d", "refs/heads/patch/c")
 
 	r := f.mustSync(t)
 	ev := f.patchEvents(t, carrypatch.EventPatchSync)[setup:]
-	var names []string
-	for _, e := range ev {
-		name, _ := e.Metadata["branch_name"].(string)
-		names = append(names, name)
-	}
-	if want := []string{"patch/a", "patch/b", "patch/c"}; !slices.Equal(names, want) {
+	if names, want := eventBranches(ev), []string{"patch/a", "patch/b", "patch/c"}; !slices.Equal(names, want) {
 		t.Fatalf("parley.patch.sync events name %v, want %v", names, want)
 	}
 	for _, e := range ev {
@@ -432,29 +390,6 @@ func TestRefresh_EmitsPatchSyncEvents(t *testing.T) {
 	}
 }
 
-// A replaced patch branch is reported by one parley.patch.replace with the
-// replaced tip, origin's tip and the trigger sync.
-func TestRefresh_EmitsPatchReplaceEvent(t *testing.T) {
-	t.Parallel()
-	f := startSyncFixture(t)
-	f.setSettings(t, originAuthority("replace"))
-	f.addPatch(t, "patch/a")
-	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, refIn(f.copy, "refs/heads/patch/a")))
-	b := f.addPatch(t, "patch/b")
-	old := refIn(f.copy, "refs/heads/patch/b")
-	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
-
-	f.mustSync(t)
-	ev := f.patchEvents(t, carrypatch.EventPatchReplace)
-	if len(ev) != 1 {
-		t.Fatalf("parley.patch.replace events = %+v, want one", ev)
-	}
-	want := map[string]any{"branch_name": "patch/b", "replaced_sha": old, "origin_sha": f.origin.Head("patch/b"), "trigger": "sync"}
-	if e := ev[0]; e.ResourceType != "patch" || e.ResourceID != b.ID || str(e.ActorID) != f.owner || !reflect.DeepEqual(e.Metadata, want) {
-		t.Errorf("event = %s %s by %s %+v; want patch %s by %s %+v", e.ResourceType, e.ResourceID, str(e.ActorID), e.Metadata, b.ID, f.owner, want)
-	}
-}
-
 // An outcome whose event cannot be written is not stored either, and its
 // branch does not move: the sync stops with 500.
 func TestRefresh_OutcomeAndEventAreAtomic(t *testing.T) {
@@ -466,7 +401,7 @@ func TestRefresh_OutcomeAndEventAreAtomic(t *testing.T) {
 	f.originBranch(t, "patch/a", tip)
 	f.mustSync(t)
 	f.advance(time.Hour)
-	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, tip))
+	f.originAhead(t, "patch/a", "origin")
 	if _, err := f.Store.Main().Exec(`CREATE TRIGGER refuse_patch_sync BEFORE INSERT ON hub_events
 WHEN NEW.type = 'parley.patch.sync' AND NEW.resource_id = '` + a.ID + `'
 BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
@@ -509,11 +444,6 @@ func TestRefresh_LostSwap(t *testing.T) {
 	f.mustSync(t)
 	f.dropRebuilds(t)
 	f.advance(time.Hour)
-	// ahead gives origin's branch a commit on the hub's tip.
-	ahead := func(t *testing.T, branch, label string) {
-		file := strings.ReplaceAll(branch, "/", "-") + "-" + label + ".txt"
-		f.originBranch(t, branch, f.commitOn(t, refIn(f.copy, "refs/heads/"+branch), branch+" "+label, map[string]string{file: label + "\n"}))
-	}
 	// interfere makes another writer move branch to a commit of its own
 	// just before the refresh's swap of it.
 	interfere := func(t *testing.T, branch, label string) string {
@@ -530,8 +460,8 @@ func TestRefresh_LostSwap(t *testing.T) {
 
 	// Origin is ahead on patch/a and patch/c, patch/b diverged from origin
 	// at B, and upstream merged patch/c by fast-forward.
-	ahead(t, "patch/a", "origin")
-	ahead(t, "patch/c", "origin")
+	f.originAhead(t, "patch/a", "origin")
+	f.originAhead(t, "patch/c", "origin")
 	bTip, cTip := refIn(f.copy, "refs/heads/patch/b"), refIn(f.copy, "refs/heads/patch/c")
 	f.originBranch(t, "patch/b", f.commitOn(t, f.base, "patch/b on origin", map[string]string{"patch-b.txt": "origin\n"}))
 	f.upstreamTo(t, cTip)
@@ -569,12 +499,7 @@ func TestRefresh_LostSwap(t *testing.T) {
 		if got := str(f.stored(t, a.ID).OriginSyncState); got != "in_sync" {
 			t.Errorf("patch/a's origin_sync_state = %s, want in_sync", got)
 		}
-		var names []string
-		for _, e := range f.patchEvents(t, carrypatch.EventPatchSync)[syncEvents:] {
-			name, _ := e.Metadata["branch_name"].(string)
-			names = append(names, name)
-		}
-		if !slices.Equal(names, []string{"patch/a"}) {
+		if names := eventBranches(f.patchEvents(t, carrypatch.EventPatchSync)[syncEvents:]); !slices.Equal(names, []string{"patch/a"}) {
 			t.Errorf("parley.patch.sync events name %v, want [patch/a]", names)
 		}
 		if got := refIn(f.copy, carrypatch.ReplacedRefPrefix+"patch/b"); got != bTip {
@@ -599,11 +524,7 @@ func TestRefresh_LostSwap(t *testing.T) {
 		if r.body["upstream_advanced"] != true {
 			t.Errorf("upstream_advanced = %v, want true", r.body["upstream_advanced"])
 		}
-		var names []string
-		for _, e := range r.synced(t) {
-			names = append(names, e.BranchName)
-		}
-		if !slices.Equal(names, []string{"patch/a", "patch/b", "patch/c"}) {
+		if names := r.syncedNames(t); !slices.Equal(names, []string{"patch/a", "patch/b", "patch/c"}) {
 			t.Errorf("patches_synced names %v, want [patch/a patch/b patch/c]", names)
 		}
 		if got := r.syncedOf(t, "patch/a").Action; got != "none" {
@@ -614,6 +535,22 @@ func TestRefresh_LostSwap(t *testing.T) {
 		}
 		if got, want := r.body["upstream_head_sha"], f.upstream.Head("main"); got != want || r.body["last_sync_at"] == nil {
 			t.Errorf("upstream_head_sha, last_sync_at = %v, %v; want %s and a time", got, r.body["last_sync_at"], want)
+		}
+	})
+
+	t.Run("a lost backup swap keeps the backup another writer saved", func(t *testing.T) {
+		f.originBranch(t, "patch/b", f.commitOn(t, f.base, "patch/b on origin again", map[string]string{"patch-b.txt": "again\n"}))
+		// Another writer replaces patch/b between the comparison and the
+		// swap, as a reset to origin does, saving the tip it replaced.
+		saved := f.commitOn(t, f.base, "pushed meanwhile", map[string]string{"x.txt": "pushed\n"})
+		moved := f.commitOn(t, f.base, "reset meanwhile", map[string]string{"x.txt": "reset\n"})
+		mover.armBackup(f.copy, "patch/b", moved, saved)
+		wantStopped(t, f.sync(t, ""), "patch/b")
+		if got := refIn(f.copy, carrypatch.ReplacedRefPrefix+"patch/b"); got != saved {
+			t.Errorf("the backup ref of patch/b = %s, want %s, which the other writer saved", got, saved)
+		}
+		if got := refIn(f.copy, "refs/heads/patch/b"); got != moved {
+			t.Errorf("patch/b = %s, want %s where the other writer put it", got, moved)
 		}
 	})
 
@@ -629,22 +566,39 @@ func TestRefresh_LostSwap(t *testing.T) {
 			queued  bool
 		}{
 			{"an earlier branch moved", true, func(t *testing.T) string {
-				ahead(t, "patch/a", "r1")
-				ahead(t, "patch/b", "r1")
+				f.originAhead(t, "patch/a", "r1")
+				f.originAhead(t, "patch/b", "r1")
 				interfere(t, "patch/b", "r1")
 				return "patch/b"
 			}, true},
 			{"the first patch's swap is lost after upstream advanced", true, func(t *testing.T) string {
 				f.moveUpstream(t, "U2", map[string]string{"u2.txt": "2\n"})
-				ahead(t, "patch/a", "r2")
+				f.originAhead(t, "patch/a", "r2")
 				interfere(t, "patch/a", "r2")
 				return "patch/a"
 			}, false},
 			{"an earlier branch moved with auto_rebuild_after_sync off", false, func(t *testing.T) string {
-				ahead(t, "patch/a", "r3")
+				f.originAhead(t, "patch/a", "r3")
 				interfere(t, "patch/b", "r3")
 				return "patch/b"
 			}, false},
+			{"merge detection fails after the refresh moved a branch", true, func(t *testing.T) string {
+				// patch/e's branch moves onto a commit upstream holds, while
+				// upstream stays where the last completed sync found it.
+				e := f.commitOn(t, f.upstream.Head("main"), "patch/e", map[string]string{"e.txt": "e\n"})
+				taken := f.commitOn(t, e, "upstream takes patch/e", map[string]string{"taken.txt": "taken\n"})
+				f.upstreamTo(t, taken)
+				f.mustSync(t)
+				f.dropRebuilds(t)
+				f.putPatch(t, "patch/e", e)
+				f.originBranch(t, "patch/e", taken)
+				if _, err := f.Store.Main().Exec(`CREATE TRIGGER refuse_merged BEFORE UPDATE OF status ON patches
+WHEN NEW.status = 'merged_upstream' BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _, _ = f.Store.Main().Exec(`DROP TRIGGER refuse_merged`) })
+				return "patch/e"
+			}, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				f.dropRebuilds(t)
@@ -661,15 +615,80 @@ func TestRefresh_LostSwap(t *testing.T) {
 				if len(js) != 1 {
 					t.Fatalf("rebuild jobs = %v, want one", js)
 				}
-				status, raw := f.Call(t, http.MethodGet, "/api/v1/workspaces/"+f.slug+"/rebuilds/"+js[0].ID, f.key, nil)
-				var job map[string]any
-				if err := json.Unmarshal(raw, &job); status != http.StatusOK || err != nil {
-					t.Fatalf("read the rebuild %s = %d %s, want 200 and a record", js[0].ID, status, raw)
-				}
-				if job["status"] != "queued" || job["submitted_by"] != f.owner {
+				if job := f.rebuildRecord(t, js[0].ID); job["status"] != "queued" || job["submitted_by"] != f.owner {
 					t.Errorf("the rebuild is %v, submitted by %v; want queued by %s", job["status"], job["submitted_by"], f.owner)
 				}
 			})
 		}
 	})
+}
+
+// holdingObserver is a branch-move observer that holds the sync telling it
+// of the first move of branch until release is closed, after closing
+// reached.
+type holdingObserver struct {
+	branch           string
+	reached, release chan struct{}
+	once             sync.Once
+}
+
+func (o *holdingObserver) BranchMoved(_ context.Context, m workspace.BranchMove) error {
+	if m.Branch == o.branch {
+		o.once.Do(func() {
+			close(o.reached)
+			<-o.release
+		})
+	}
+	return nil
+}
+
+// A sync that fetched origin before a later sync fetched a newer tip of a
+// patch branch, and moved the hub's branch to it, leaves the branch at that
+// newer tip: it never moves a branch back to the older tip it fetched, and
+// replaces and saves nothing.
+func TestRefresh_EarlierFetchNeverMovesBack(t *testing.T) {
+	t.Parallel()
+	hold := &holdingObserver{branch: "feat", reached: make(chan struct{}), release: make(chan struct{})}
+	f := startSyncFixtureWith(t, syncOptions{compose: func(c *hub.Composition) {
+		c.Workspaces().RegisterBranchMoveObserver(hold)
+	}})
+	f.setSettings(t, originAuthority("replace"))
+	a := f.addPatch(t, "patch/a")
+	f.originAhead(t, "patch/a", "o1")
+	// The earlier sync is held in its per-branch pass, after its origin
+	// fetch, by its move of feat.
+	f.originAhead(t, "feat", "f2")
+	earlier := f.startSync(t)
+	defer close(hold.release)
+	select {
+	case <-hold.reached:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the earlier sync did not move feat within 20 s")
+	}
+	o2 := f.originAhead(t, "patch/a", "o2")
+	if got := f.mustSync(t).syncedOf(t, "patch/a").Action; got != "fast_forwarded" {
+		t.Fatalf("the later sync's action on patch/a = %s, want fast_forwarded", got)
+	}
+	replaces := f.eventCount(t, carrypatch.EventPatchReplace)
+	hold.release <- struct{}{}
+
+	r := earlier()
+	if r.status != http.StatusOK {
+		t.Fatalf("the earlier sync = %d %s, want 200", r.status, r.raw)
+	}
+	if e := r.syncedOf(t, "patch/a"); e.Action != "none" || e.State != "in_sync" || str(e.OriginSHA) != o2 {
+		t.Errorf("the earlier sync's patch/a = %s/%s with origin_sha %s, want none/in_sync at %s", e.Action, e.State, str(e.OriginSHA), o2)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/a"); got != o2 {
+		t.Errorf("patch/a = %s, want the later sync's %s", got, o2)
+	}
+	if got := refIn(f.copy, carrypatch.ReplacedRefPrefix+"patch/a"); got != "" {
+		t.Errorf("the backup ref of patch/a = %s, want none", got)
+	}
+	if n := f.eventCount(t, carrypatch.EventPatchReplace); n != replaces {
+		t.Errorf("parley.patch.replace events = %d, want %d", n, replaces)
+	}
+	if got := f.stored(t, a.ID); str(got.OriginSyncState) != "in_sync" || str(got.OriginSHA) != o2 {
+		t.Errorf("patch/a's origin fields = %s, %s; want in_sync, %s", str(got.OriginSyncState), str(got.OriginSHA), o2)
+	}
 }

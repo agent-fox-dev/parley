@@ -1808,17 +1808,25 @@ extension, so on a `carry_patch` workspace:
   `502` with `upstream base cannot be resolved for workspace "<slug>":
   upstream has neither a default branch nor a branch named like the
   default branch`. Another set-up step that fails is logged and does not
-  fail the sync.
+  fail the sync. A missing integration branch is created at the upstream
+  base only once the base resolves, so a sync that fails creates none. The
+  upstream fetch of a sync waits for one that a rebuild or another sync of
+  the workspace is running.
 - After the comparison of every branch, with `patch_branch_source`
   `origin`, every `active`, `conflict` or `disabled` patch is refreshed in
   position order against origin's head of its branch as this sync fetched
-  it. The first rule that fits gives `action` and `state`: origin lacks the
+  it, or, when the hub's head is neither that head nor its ancestor but is
+  a newer head a later sync fetched, or its ancestor, against that newer
+  head, so that a sync never moves a patch branch back to an older head of
+  origin. The first rule that fits gives `action` and `state`: origin lacks the
   branch, `none` and `missing_on_origin`; the hub lacks it, `created` and
   `in_sync`; equal heads, `none` and `in_sync`; the hub's head an ancestor
   of origin's, `fast_forwarded` and `in_sync`; otherwise, under
   `patch_divergence_policy` `report`, `none` and `diverged`, and under
   `replace`, `replaced` and `in_sync`, after the hub's head is saved to
-  `refs/parley/replaced/<branch>`. Every create and move is a
+  `refs/parley/replaced/<branch>`, only while that ref holds what it held
+  at the comparison (a backup another writer saved meanwhile is kept, and
+  the refresh fails as for a lost swap). Every create and move is a
   compare-and-swap that expects the head compared; protected branches move
   too. The outcome is stored on the patch (`origin_sync_state`,
   `origin_sha`, `origin_synced_at`) in one transaction with its events:
@@ -1830,17 +1838,20 @@ extension, so on a `carry_patch` workspace:
   `sync`. With `patch_branch_source` `hub` no patch branch is compared and
   the three origin fields of every patch become `null`; under `origin`
   they are `null` on every `merged_upstream` patch.
-- A refresh that fails (a branch moved in the hub between the comparison
-  and the swap, a git or a store failure) stops the sync at that patch:
-  later patches are not refreshed, nothing below runs, and the answer is
-  `500` `internal` naming the branch (`the sync of workspace "<slug>"
-  stopped: refresh the patch branch "<branch>" from origin: it moved in the
-  hub between the comparison and the swap; sync again: …` for a lost
-  swap). The outcomes of the patches before it, their events and a backup
-  ref written stay; `upstream_head_sha`, `last_sync_at` and `sync_error`
-  are not written. When the branch of an `active` or `conflict` patch was
-  moved before the failure and `auto_rebuild_after_sync` is on, a rebuild
-  is queued first.
+- A refresh that fails (a branch or its backup ref moved in the hub
+  between the comparison and the swap, a git or a store failure) stops the
+  sync at that patch: later patches are not refreshed, nothing below runs,
+  and the answer is `500` `internal` naming the branch (`the sync of
+  workspace "<slug>" stopped: refresh the patch branch "<branch>" from
+  origin: it or its backup ref moved in the hub between the comparison and
+  the swap; sync again: …` for a lost swap). The outcomes of the patches
+  before it, their events and a backup ref written stay; `upstream_head_sha`,
+  `last_sync_at` and `sync_error` are not written. When the refresh, merge
+  detection or the clearing of the origin fields fails after the branch of
+  an `active` or `conflict` patch was moved or a patch was marked
+  `merged_upstream`, and `auto_rebuild_after_sync` is on, a rebuild is
+  queued before the `500`, since the next sync does not see those changes
+  again.
 - When upstream advanced or the refresh created or moved a patch branch,
   merge detection examines the `active` and `conflict` patches whose branch
   the hub has, in position order. `squash_merge_detection` selects the
@@ -1848,8 +1859,9 @@ extension, so on a `carry_patch` workspace:
   upstream base or its ancestor; by content (`content_based`, `both`),
   `git cherry <base> <head>` lists at least one commit and every one has an
   equivalent upstream; by pull request number (`content_based`, `both`),
-  `upstream_pr_url` holds `/pull/<n>` and a new upstream commit's subject
-  ends with `(#<n>)`. The new commits are those of the base not reachable
+  `upstream_pr_url` holds `/pull/<n>`, the digits ending the URL or
+  followed by `/`, `?` or `#`, and a new upstream commit's subject ends
+  with `(#<n>)`, `<n>` without leading zeros. The new commits are those of the base not reachable
   from the stored `upstream_head_sha`, or the 50 newest of the base on the
   first sync and after a force-push. A merged patch becomes
   `merged_upstream` with `conflict_files` `[]` and its origin fields

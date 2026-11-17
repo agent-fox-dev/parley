@@ -63,6 +63,10 @@ type refreshStep struct {
 	p             Patch
 	action, state string
 	local, origin string
+	// backup is the tip the branch's backup ref held when the tips were
+	// compared, "" for none: a replace saves the hub's tip there only while
+	// the ref still holds it.
+	backup string
 	// at is when the tips were compared, cut to the second as the store
 	// keeps it.
 	at time.Time
@@ -95,14 +99,14 @@ func (st refreshStep) entry() syncEntry {
 // disabled patch, in position order, in line with origin when the
 // workspace's patch_branch_source is origin, and reports each outcome in
 // patches_synced. Under the hub as the authority it reads and moves
-// nothing. Origin's tip is the one this sync fetched, not what the copy's
-// origin heads hold now, which a concurrent sync may have moved since. A
-// patch branch is moved only by a compare-and-swap against the tip
-// compared, whether or not protected_branches lists it: the refresh is a
-// sync from origin, which a protected branch admits, so no push rule is
-// asked. The first failure of a patch, a lost swap included, stops the
-// refresh there with an error naming the branch, without a retry and
-// without taking up a later patch; what was done before it stays.
+// nothing. Origin's tip is the one this sync fetched, unless a later sync
+// fetched a newer one the hub's tip has reached (see compare). A patch
+// branch is moved only by a compare-and-swap against the tip compared,
+// whether or not protected_branches lists it: the refresh is a sync from
+// origin, which a protected branch admits, so no push rule is asked. The
+// first failure of a patch, a lost swap included, stops the refresh there
+// with an error naming the branch, without a retry and without taking up a
+// later patch; what was done before it stays.
 func (s *syncPass) refreshFromOrigin(ctx context.Context) error {
 	w := s.run.Workspace
 	if !s.c.fromOrigin(w) {
@@ -117,7 +121,7 @@ func (s *syncPass) refreshFromOrigin(ctx context.Context) error {
 		if !refreshable(p.Status) {
 			continue
 		}
-		st, err := s.compareWithOrigin(ctx, p, replaces)
+		st, err := s.compare(ctx, p, replaces)
 		if err != nil {
 			return err
 		}
@@ -137,45 +141,66 @@ func (s *syncPass) refreshFromOrigin(ctx context.Context) error {
 	return nil
 }
 
-// compareWithOrigin chooses the refresh outcome of the patch p by the first
-// rule that fits its branch's two tips: origin has none, the hub has none,
-// the tips are equal, the hub's is an ancestor of origin's; any other pair,
-// the hub's tip ahead of origin's among them, is replaced or reported as
+// compare chooses the refresh outcome of the patch p by the first rule
+// that fits its branch's two tips: origin has none, the hub has none, the
+// tips are equal, the hub's is an ancestor of origin's; any other pair, the
+// hub's tip ahead of origin's among them, is replaced or reported as
 // diverged as replaces says.
-func (s *syncPass) compareWithOrigin(ctx context.Context, p Patch, replaces bool) (refreshStep, error) {
-	st := refreshStep{p: p, origin: s.run.OriginHeads[p.BranchName]}
-	var local gitrepo.Ref
-	var exists, behind bool
-	err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
-		var err error
-		if local, exists, err = s.repo.LookupRef(ctx, headsPrefix+p.BranchName); err != nil || !exists || st.origin == "" || local.ID == st.origin {
+//
+// Syncs of one workspace wait for one another only during their origin
+// fetch, so a later sync may fetch a newer tip of the branch and move the
+// hub's branch to it while this one runs. Compared with the older tip this
+// sync fetched, the hub's would look diverged, and a replace would move the
+// branch back. So when the hub's tip is neither origin's tip as this sync
+// fetched it nor its ancestor, it is compared with the copy's origin head
+// of the branch now: when the hub's tip is that head or its ancestor, the
+// outcome is the one towards that head, none or fast_forwarded, and the
+// branch never moves back to an older tip of origin.
+func (s *syncPass) compare(ctx context.Context, p Patch, replaces bool) (refreshStep, error) {
+	branch := p.BranchName
+	st := refreshStep{p: p, origin: s.run.OriginHeads[branch]}
+	local, action, err := compareWithOrigin(ctx, s.repo, branch, st.origin)
+	if err == nil && action == resetReplaced {
+		var now gitrepo.Ref
+		var found bool
+		err = RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) (err error) {
+			now, found, err = s.repo.LookupRef(ctx, "refs/remotes/origin/"+branch)
 			return err
+		})
+		if err == nil && found && now.ID != st.origin {
+			var nowLocal, toNow string
+			nowLocal, toNow, err = compareWithOrigin(ctx, s.repo, branch, now.ID)
+			if toNow == resetNone || toNow == resetFastForwarded {
+				local, st.origin, action = nowLocal, now.ID, toNow
+			}
 		}
-		behind, err = s.repo.IsAncestor(ctx, local.ID, st.origin)
-		return err
-	})
+	}
+	if err == nil && action == resetReplaced {
+		st.backup, err = s.backupTip(ctx, branch)
+	}
 	if err != nil {
-		return refreshStep{}, fmt.Errorf("compare the patch branch %q with origin: %w", p.BranchName, err)
+		return refreshStep{}, fmt.Errorf("compare the patch branch %q with origin: %w", branch, err)
 	}
-	st.at = s.c.now().UTC().Truncate(time.Second)
-	if exists {
-		st.local = local.ID
-	}
+	st.at, st.local = s.c.now().UTC().Truncate(time.Second), local
 	switch {
 	case st.origin == "":
 		st.action, st.state = resetNone, originMissing
-	case !exists:
-		st.action, st.state = resetCreated, originInSync
-	case st.local == st.origin:
-		st.action, st.state = resetNone, originInSync
-	case behind:
-		st.action, st.state = resetFastForwarded, originInSync
-	case replaces:
-		st.action, st.state = resetReplaced, originInSync
-	default:
+	case action == resetReplaced && !replaces:
 		st.action, st.state = resetNone, originDiverged
+	default:
+		st.action, st.state = action, originInSync
 	}
 	return st, nil
+}
+
+// backupTip is the tip the backup ref of branch holds, "" for none.
+func (s *syncPass) backupTip(ctx context.Context, branch string) (string, error) {
+	var ref gitrepo.Ref
+	err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) (err error) {
+		ref, _, err = s.repo.LookupRef(ctx, ReplacedRefPrefix+branch)
+		return err
+	})
+	return ref.ID, err
 }
 
 // applyRefresh records the refresh outcome st of one patch in one store
@@ -183,12 +208,13 @@ func (s *syncPass) compareWithOrigin(ctx context.Context, p Patch, replaces bool
 // outcome and, last, the branch's move, so that none of them exists
 // without the others. It reports whether the outcome was recorded: a
 // patch deleted, merged or otherwise no longer refreshable since it was
-// listed is left out. A swap that loses to another writer
-// rolls the transaction back and leaves the branch as that writer has it,
-// while the backup a replace wrote stays; a commit that fails after the
-// swap puts the branch back. The git work held in the transaction is
-// local and short, two update-refs at most, which is why it may hold the
-// store's write turn.
+// listed is left out. A swap that loses to another writer rolls the
+// transaction back and leaves the branch as that writer has it, while the
+// backup a replace wrote stays; a backup ref that another writer changed
+// since the comparison is a lost swap too, which keeps that writer's backup
+// and moves nothing; a commit that fails after the swap puts the branch
+// back. The git work held in the transaction is local and short, two
+// update-refs at most, which is why it may hold the store's write turn.
 func (s *syncPass) applyRefresh(ctx context.Context, st refreshStep) (bool, error) {
 	slug, branch := s.run.Workspace.Slug, st.p.BranchName
 	if st.moves() && s.c.d.BeforeRefSwap != nil {
@@ -211,7 +237,7 @@ func (s *syncPass) applyRefresh(ctx context.Context, st refreshStep) (bool, erro
 			return err
 		}
 		if st.moves() {
-			if err := s.moveToOrigin(ctx, st); err != nil {
+			if err := swapToOrigin(ctx, s.repo, branch, st.action, st.local, st.origin, &st.backup); err != nil {
 				return err
 			}
 			moved = true
@@ -227,7 +253,7 @@ func (s *syncPass) applyRefresh(ctx context.Context, st refreshStep) (bool, erro
 		}
 		if errors.Is(err, gitrepo.ErrRefMoved) {
 			// Not retried: the next sync compares the branch again.
-			return false, fmt.Errorf("refresh the patch branch %q from origin: it moved in the hub between the comparison and the swap; sync again: %w", branch, err)
+			return false, fmt.Errorf("refresh the patch branch %q from origin: it or its backup ref moved in the hub between the comparison and the swap; sync again: %w", branch, err)
 		}
 		return false, fmt.Errorf("refresh the patch branch %q from origin: %w", branch, err)
 	}
@@ -293,21 +319,6 @@ WHERE workspace_slug = ? AND (origin_sync_state IS NOT NULL OR origin_sha IS NOT
 			return fmt.Errorf("clear the origin fields of the patches that do not follow origin: %w", err)
 		}
 		return nil
-	})
-}
-
-// moveToOrigin moves the patch's branch from the hub's tip compared, or
-// creates it when the hub had none, to origin's tip, saving the hub's tip
-// to the backup ref first for a replace, so that a replaced tip stays
-// reachable even when the swap then loses.
-func (s *syncPass) moveToOrigin(ctx context.Context, st refreshStep) error {
-	if st.action == resetReplaced {
-		if err := WriteBackupRef(ctx, s.repo, st.p.BranchName, st.local); err != nil {
-			return err
-		}
-	}
-	return RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
-		return s.repo.CompareAndSwapRef(ctx, headsPrefix+st.p.BranchName, st.origin, st.local)
 	})
 }
 

@@ -10,6 +10,9 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
 
+// Merge detection runs when upstream advanced or the origin refresh moved
+// a patch branch, and not when neither did, whatever the patch branches
+// hold.
 func TestMergeDetection_Trigger(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)
@@ -55,6 +58,9 @@ type mergeCase struct {
 	wantDone bool
 }
 
+// Each setting of squash_merge_detection finds a patch merged by the tests
+// it selects: the tip an ancestor of the upstream base, every commit taken
+// under a new id, or the pull request number ending an upstream subject.
 func TestMergeDetection_Tests(t *testing.T) {
 	t.Parallel()
 	// The rows run one after another in one workspace, each on what the
@@ -110,31 +116,38 @@ func TestMergeDetection_Tests(t *testing.T) {
 		{"both", "another number in a subject", subject("Add dialer (#421)"), pr42, false},
 		{"both", "the number not at the subject's end", subject("(#42) add dialer"), pr42, false},
 		{"both", "no pull request URL", subject("Add dialer (#42)"), nil, false},
+		{"both", "pull request number with a leading zero", subject("Add dialer (#42)"), pr("https://forge.example/o/r/pull/042"), true},
+		{"both", "pull request URL with a path after the number", subject("Add dialer (#42)"), pr("https://forge.example/o/r/pull/42/files"), true},
+		{"both", "pull request URL with letters after the digits", subject("Add dialer (#4)"), pr("https://forge.example/o/r/pull/4x"), false},
 		{"both", "conflict, tip an ancestor of the base", ancestor, []func(p *carrypatch.Patch){withStatus(carrypatch.StatusConflict)}, true},
 	}
 	f := startSyncFixture(t)
 	f.mustSync(t)
 	for i, c := range cases {
-		label := c.setting + ", " + c.name
-		f.setSettings(t, map[string]any{"squash_merge_detection": c.setting})
-		base := f.upstream.Head("main")
-		branch, file := fmt.Sprintf("patch/%d", i), fmt.Sprintf("p%d.txt", i)
-		tip, up := c.build(t, f, base, file)
-		p := f.putPatch(t, branch, tip, c.edit...)
-		f.upstreamTo(t, up)
-		r := f.mustSync(t)
-		if got := slices.Contains(r.merged(t), branch); got != c.wantDone {
-			t.Errorf("%s: %s in patches_merged %q = %v, want %v", label, branch, r.merged(t), got, c.wantDone)
-		}
-		if got := f.stored(t, p.ID).Status; (got == carrypatch.StatusMergedUpstream) != c.wantDone {
-			t.Errorf("%s: %s is %s, want merged_upstream %v", label, branch, got, c.wantDone)
-		}
-		if !c.wantDone {
-			f.setStatus(t, p.ID, carrypatch.StatusDisabled)
-		}
+		t.Run(c.setting+", "+c.name, func(t *testing.T) {
+			f.setSettings(t, map[string]any{"squash_merge_detection": c.setting})
+			base := f.upstream.Head("main")
+			branch, file := fmt.Sprintf("patch/%d", i), fmt.Sprintf("p%d.txt", i)
+			tip, up := c.build(t, f, base, file)
+			p := f.putPatch(t, branch, tip, c.edit...)
+			f.upstreamTo(t, up)
+			merged := answerList[string](t, f.mustSync(t), "patches_merged")
+			if got := slices.Contains(merged, branch); got != c.wantDone {
+				t.Errorf("%s in patches_merged %q = %v, want %v", branch, merged, got, c.wantDone)
+			}
+			if got := f.stored(t, p.ID).Status; (got == carrypatch.StatusMergedUpstream) != c.wantDone {
+				t.Errorf("%s is %s, want merged_upstream %v", branch, got, c.wantDone)
+			}
+			if !c.wantDone {
+				f.setStatus(t, p.ID, carrypatch.StatusDisabled)
+			}
+		})
 	}
 }
 
+// The pull request number test examines the upstream commits new since the
+// stored upstream head, or the 50 newest of the base on the first sync and
+// after a force-push.
 func TestMergeDetection_PRNumberWindow(t *testing.T) {
 	t.Parallel()
 	// The rows run one after another in one workspace; a row's patch that
@@ -150,8 +163,9 @@ func TestMergeDetection_PRNumberWindow(t *testing.T) {
 	}
 	check := func(label string, p carrypatch.Patch, r syncAnswer, want bool) {
 		t.Helper()
-		if got := slices.Contains(r.merged(t), p.BranchName); got != want {
-			t.Errorf("%s: %s in patches_merged %q = %v, want %v", label, p.BranchName, r.merged(t), got, want)
+		merged := answerList[string](t, r, "patches_merged")
+		if got := slices.Contains(merged, p.BranchName); got != want {
+			t.Errorf("%s: %s in patches_merged %q = %v, want %v", label, p.BranchName, merged, got, want)
 		}
 		if !want {
 			f.setStatus(t, p.ID, carrypatch.StatusDisabled)
@@ -193,6 +207,8 @@ func TestMergeDetection_PRNumberWindow(t *testing.T) {
 	forced("force-push, the 51st newest", 51, false)
 }
 
+// A patch found merged is marked merged_upstream with no conflict files,
+// in position order, each with one parley.patch.update by the caller.
 func TestMergeDetection_MarksPatchMerged(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)
@@ -231,6 +247,8 @@ func TestMergeDetection_MarksPatchMerged(t *testing.T) {
 	}
 }
 
+// Disabled, merged_upstream and branchless patches are not examined, so a
+// sync never changes their status.
 func TestMergeDetection_NotExamined(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)

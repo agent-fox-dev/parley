@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
-	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 )
@@ -54,9 +53,7 @@ func TestExcludedBranches_StoreFailure(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)
 	f.addPatch(t, "patch/a")
-	feat1 := gitrepotest.Commit(t, f.copy, "F1", map[string]string{"feat.txt": "1\n"}, f.base)
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/feat", feat1)
-	f.originBranch(t, "feat", gitrepotest.Commit(t, f.copy, "F2", map[string]string{"feat.txt": "2\n"}, feat1))
+	f.originAhead(t, "feat", "origin")
 	if _, err := f.Store.Main().Exec(`ALTER TABLE patches RENAME TO patches_hidden`); err != nil {
 		t.Fatalf("hide the patch list: %v", err)
 	}

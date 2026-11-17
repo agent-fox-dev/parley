@@ -337,6 +337,15 @@ func actorOfPrincipal(p identity.Principal) actor {
 	return a
 }
 
+// submitter is the actor as the submitter of a rebuild it calls for: a
+// user as its id, the admin token, which has none, as its actor type.
+func (a actor) submitter() string {
+	if a.id != nil {
+		return *a.id
+	}
+	return a.typ
+}
+
 // insertPatches registers the patches reqs of the workspace slug, whose
 // branches resolved as resolutions, in one store transaction with their
 // events. It removes for good the deleted patches of their branches

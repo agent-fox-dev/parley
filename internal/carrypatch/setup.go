@@ -169,6 +169,19 @@ func (s Setup) writeBranch(ctx context.Context, ref, target string) error {
 	})
 }
 
+// createIntegrationBranch creates the integration branch of w in repo at
+// base, the upstream base, when it does not exist, and never moves an
+// existing one: the last step of the set-up of a ready workspace, for a
+// caller that took it out of the set-up to run it only once the base
+// resolved.
+func createIntegrationBranch(ctx context.Context, repo CopyWriter, w workspace.Workspace, base string) error {
+	ref := "refs/heads/" + IntegrationBranch(w)
+	if err := (Setup{Copy: repo}).writeBranch(ctx, ref, base); err != nil {
+		return fmt.Errorf("write the integration branch %s: %w", ref, err)
+	}
+	return nil
+}
+
 // setupError is the error of a set-up: the failure of each step that
 // failed, in step order.
 type setupError struct {
@@ -217,6 +230,28 @@ func (c *Component) EnsureSetup(ctx context.Context, w workspace.Workspace) erro
 // ensureSetup is EnsureSetup, with the integration branch left alone when
 // leaveBranch is set.
 func (c *Component) ensureSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool) error {
+	unlock, err := c.lockSetup(ctx, w.Slug)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return c.runSetup(ctx, w, leaveBranch)
+}
+
+// lockSetup waits until no other repeated set-up of the workspace slug
+// runs, or until ctx ends, which is then its error, and returns the
+// function that lets the next one run.
+func (c *Component) lockSetup(ctx context.Context, slug string) (unlock func(), err error) {
+	unlock, err = c.setups.lock(ctx, slug)
+	if err != nil {
+		return nil, fmt.Errorf("wait for the other set-up of %s to end: %w", slug, err)
+	}
+	return unlock, nil
+}
+
+// runSetup is ensureSetup for a caller that holds the workspace's
+// set-up lock.
+func (c *Component) runSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool) error {
 	var cp CopyWriter
 	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(w.Slug))
 	if err != nil {

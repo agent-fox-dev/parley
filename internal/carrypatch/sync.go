@@ -18,27 +18,43 @@ var _ workspace.SyncExtension = (*Component)(nil)
 
 // AfterFetch is the first stage of the sync of a carry-patch workspace,
 // which the workspace service runs once origin is fetched and before any
-// tag or branch of the copy is created or moved: it repeats the set-up
-// (EnsureSetup), which fetches upstream with the upstream credential read
-// at this moment, and resolves the upstream base, so that a sync that
-// cannot reach upstream fails before it has moved anything. Its error, the
-// failed fetch's own or the base's, names upstream; the workspace service
-// answers it as a failed fetch. A failure of another step of the set-up is
-// logged and does not fail the sync: the sync does not depend on it, and
-// the next sync or rebuild repeats it.
+// tag or branch of the copy is created or moved: it repeats the set-up,
+// which fetches upstream with the upstream credential read at this moment,
+// and resolves the upstream base, so that a sync that cannot reach upstream
+// fails before it has moved anything. Only then does it create a missing
+// integration branch, at the base, as the set-up would: a sync that fails
+// creates nothing. Its error, the failed fetch's own or the base's, names
+// upstream; the workspace service answers it as a failed fetch. A failure
+// of another step of the set-up is logged and does not fail the sync: the
+// sync does not depend on it, and the next sync or rebuild repeats it. It
+// waits for a set-up of the workspace that a rebuild or another sync runs,
+// so that two upstream fetches never run into one copy at once.
 func (c *Component) AfterFetch(ctx context.Context, run workspace.SyncRun) error {
 	if c.d.RepoPath == nil {
 		return errNotBound
 	}
 	w := run.Workspace
-	if err := c.EnsureSetup(ctx, w); err != nil {
+	unlock, err := c.lockSetup(ctx, w.Slug)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := c.runSetup(ctx, w, true); err != nil {
 		if fetchErr := upstreamFetchFailure(err); fetchErr != nil {
 			return fetchErr
 		}
 		c.logger().Warn("carry-patch sync could not repeat a set-up step", "slug", w.Slug, "error", err.Error())
 	}
-	if _, err := c.syncBase(ctx, w); err != nil {
+	base, err := c.syncBase(ctx, w)
+	if err != nil {
 		return err
+	}
+	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(w.Slug))
+	if err == nil {
+		err = createIntegrationBranch(ctx, repo, w, base)
+	}
+	if err != nil {
+		c.logger().Warn("carry-patch sync could not create the integration branch", "slug", w.Slug, "error", err.Error())
 	}
 	return nil
 }
@@ -84,31 +100,36 @@ func (c *Component) syncBase(ctx context.Context, w workspace.Workspace) (string
 // upstream base as the upstream_head_sha to record when upstream advanced.
 // Its error stops the sync before the completion is recorded, so that the
 // next sync sees the same upstream movement again and repeats what this one
-// did not finish; a refresh that stops part way still queues the rebuild
-// its moves call for, and runs no merge detection.
+// did not finish; a refresh that stops part way runs no merge detection.
+// The branch moves and merge marks made before the error stay, and the
+// next sync does not see them again, so a failure after them still queues
+// the rebuild they call for.
 func (c *Component) BeforeCompletion(ctx context.Context, run workspace.SyncRun, _ []workspace.BranchResult) (workspace.SyncAddition, error) {
 	if c.d.RepoPath == nil {
 		return workspace.SyncAddition{}, errNotBound
 	}
 	s, err := c.startSyncPass(ctx, run)
 	if err == nil {
-		if err = s.refreshFromOrigin(ctx); err != nil {
-			s.rebuildAfterFailedRefresh(ctx)
-		}
-	}
-	if err == nil {
-		err = s.detectMerges(ctx)
-	}
-	if err == nil {
-		err = s.clearOriginFields(ctx)
-	}
-	if err == nil {
-		err = s.triggerRebuild(ctx)
+		err = s.runSteps(ctx)
 	}
 	if err != nil {
 		return workspace.SyncAddition{}, fmt.Errorf("the sync of workspace %q stopped: %w", run.Workspace.Slug, err)
 	}
 	return s.addition()
+}
+
+// runSteps runs the steps of the pass in order: the origin refresh, merge
+// detection, the clearing of the origin fields and the rebuild trigger,
+// stopping at the first that fails. A failure of one of the first three
+// queues the rebuild that what was done before it calls for.
+func (s *syncPass) runSteps(ctx context.Context) error {
+	for _, step := range []func(context.Context) error{s.refreshFromOrigin, s.detectMerges, s.clearOriginFields} {
+		if err := step(ctx); err != nil {
+			s.rebuildAfterFailure(ctx)
+			return err
+		}
+	}
+	return s.triggerRebuild(ctx)
 }
 
 // syncPass is the second stage of one sync of a carry-patch workspace: the
@@ -230,20 +251,21 @@ func (s *syncPass) triggerRebuild(ctx context.Context) error {
 	return s.queueRebuild(ctx)
 }
 
-// rebuildAfterFailedRefresh queues the rebuild of the integration branch,
-// with the same duplicate skip, after an origin refresh that stopped part
-// way when the refresh had already created or moved the branch of an
-// active or conflict patch and auto_rebuild_after_sync is on. Those moves
-// stay, and a rebuild must take them in even though the sync fails;
-// upstream's movement does not count, since the failed sync records no
-// upstream head and the next sync sees it again. A failed enqueue is only
-// logged: the sync answers the refresh's failure.
-func (s *syncPass) rebuildAfterFailedRefresh(ctx context.Context) {
-	if !s.movedApplicable() || !s.c.autoRebuildAfterSync(ctx, s.run.Workspace) {
+// rebuildAfterFailure queues the rebuild of the integration branch, with
+// the same duplicate skip, after a step of the pass failed, when the pass
+// had already created or moved the branch of an active or conflict patch
+// or marked a patch merged, and auto_rebuild_after_sync is on. Those
+// changes stay and the next sync does not see them again, so a rebuild
+// must take them in even though the sync fails; upstream's movement does
+// not count, since the failed sync records no upstream head and the next
+// sync sees it again. A failed enqueue is only logged: the sync answers the
+// step's failure.
+func (s *syncPass) rebuildAfterFailure(ctx context.Context) {
+	if !s.movedApplicable() && len(s.report.PatchesMerged) == 0 || !s.c.autoRebuildAfterSync(ctx, s.run.Workspace) {
 		return
 	}
 	if err := s.queueRebuild(ctx); err != nil {
-		s.c.logger().Warn("carry-patch sync could not queue the rebuild after a failed origin refresh",
+		s.c.logger().Warn("carry-patch sync could not queue the rebuild after a failed step",
 			"slug", s.run.Workspace.Slug, "error", err.Error())
 	}
 }
@@ -259,20 +281,17 @@ func (s *syncPass) movedApplicable() bool {
 
 // queueRebuild queues a rebuild of the workspace through the registered
 // RebuildEnqueuer, in the strategy and fail mode of the workspace's
-// settings, submitted by the caller, a user as its id and the admin token,
-// which has none, as its actor type. A queued job is reported as triggered
-// with its id. A rebuild already queued, running or failed is no failure:
-// the sync queues none and reports none, since that rebuild will build
-// from the inputs as this sync leaves them. Any other failure of the
-// enqueue is the error, so that the sync records no completion and the
-// next sync sees the same changes and queues the rebuild again.
+// settings, submitted by the caller (see actor.submitter). A queued job is
+// reported as triggered with its id. A rebuild already queued, running or
+// failed is no failure: the sync queues none and reports none, since that
+// rebuild will build from the inputs as this sync leaves them. Any other
+// failure of the enqueue is the error, so that the sync records no
+// completion: the next sync sees the same upstream movement and queues the
+// rebuild again, but not the branch moves and merge marks this sync made,
+// which no later sync calls a rebuild for.
 func (s *syncPass) queueRebuild(ctx context.Context) error {
-	submitter := s.by.typ
-	if s.by.id != nil {
-		submitter = *s.by.id
-	}
 	res, err := s.c.Rebuilds().EnqueueRebuild(ctx, s.run.Workspace.Slug, RebuildOptions{
-		SubmittedBy: submitter, ActorType: s.by.typ, ActorID: s.by.id,
+		SubmittedBy: s.by.submitter(), ActorType: s.by.typ, ActorID: s.by.id,
 	})
 	if err != nil {
 		return fmt.Errorf("queue the rebuild of the integration branch: %w", err)

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -1334,12 +1335,22 @@ type syncFixture struct {
 }
 
 // upstreamFetches counts the upstream fetches of the carry-patch
-// component, and calls onFetch, when set, at the start of each, before git
-// runs.
+// component, and the most that ran at once, and calls onFetch, when set, at
+// the start of each, before git runs.
 type upstreamFetches struct {
 	mu      sync.Mutex
 	calls   int
+	running int
+	most    int
 	onFetch func()
+}
+
+// mostAtOnce is the most upstream fetches that ran at the same time since
+// the fixture started.
+func (u *upstreamFetches) mostAtOnce() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.most
 }
 
 // count is the number of upstream fetches since the fixture started.
@@ -1385,8 +1396,15 @@ func startSyncFixtureWith(t *testing.T, o syncOptions, edit ...func(w *workspace
 			d.FetchRemote = func(ctx context.Context, dir, url, name string, cred gitrepo.Credential, deadline time.Duration) (map[string]string, error) {
 				u.mu.Lock()
 				u.calls++
+				u.running++
+				u.most = max(u.most, u.running)
 				fn := u.onFetch
 				u.mu.Unlock()
+				defer func() {
+					u.mu.Lock()
+					u.running--
+					u.mu.Unlock()
+				}()
 				if fn != nil {
 					fn()
 				}
@@ -1399,7 +1417,7 @@ func startSyncFixtureWith(t *testing.T, o syncOptions, edit ...func(w *workspace
 	}, edit...)
 	// The set-up of the fixture fetched upstream; the count starts after it.
 	u.mu.Lock()
-	u.calls = 0
+	u.calls, u.most = 0, 0
 	u.mu.Unlock()
 	return f
 }
@@ -1425,14 +1443,63 @@ func (f *syncFixture) sync(t *testing.T, query string) syncAnswer {
 		path += "?" + query
 	}
 	status, body := f.Call(t, http.MethodPost, path, f.key, nil)
+	return decodeSync(t, status, body)
+}
+
+// decodeSync decodes the answer of the sync route, status and body.
+func decodeSync(t *testing.T, status int, body []byte) syncAnswer {
+	t.Helper()
 	a := syncAnswer{status: status, raw: body}
 	if err := json.Unmarshal(body, &a); err != nil {
-		t.Fatalf("POST %s = %d %s: %v", path, status, body, err)
+		t.Fatalf("sync = %d %s: %v", status, body, err)
 	}
 	if err := json.Unmarshal(body, &a.body); err != nil {
-		t.Fatalf("POST %s = %d %s: %v", path, status, body, err)
+		t.Fatalf("sync = %d %s: %v", status, body, err)
 	}
 	return a
+}
+
+// syncRequest is POST /api/v1/workspaces/<slug>/sync as the owner, sent
+// with ctx.
+func (f *syncFixture) syncRequest(t *testing.T, ctx context.Context) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL("/api/v1/workspaces/"+f.slug+"/sync"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.key)
+	return req
+}
+
+// startSync sends POST /api/v1/workspaces/<slug>/sync as the owner in the
+// background and returns the function that waits for its answer.
+func (f *syncFixture) startSync(t *testing.T) (wait func() syncAnswer) {
+	t.Helper()
+	type answer struct {
+		status int
+		body   []byte
+		err    error
+	}
+	done := make(chan answer, 1)
+	req := f.syncRequest(t, context.Background())
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- answer{err: err}
+			return
+		}
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		done <- answer{res.StatusCode, body, err}
+	}()
+	return func() syncAnswer {
+		t.Helper()
+		a := <-done
+		if a.err != nil {
+			t.Fatalf("sync %s: %v", f.slug, a.err)
+		}
+		return decodeSync(t, a.status, a.body)
+	}
 }
 
 // mustSync syncs the workspace and fails the test unless the sync
@@ -1453,6 +1520,22 @@ func (f *syncFixture) originBranch(t *testing.T, branch, id string) {
 	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.origin.Dir(), id+":refs/heads/"+branch)
 }
 
+// originAhead gives origin's branch a commit, labelled label, on the hub's
+// tip of branch, creating the branch in the hub at the upstream base when
+// the hub has none, and returns the commit: origin is ahead of the hub.
+func (f *syncFixture) originAhead(t *testing.T, branch, label string) string {
+	t.Helper()
+	tip := refIn(f.copy, "refs/heads/"+branch)
+	if tip == "" {
+		tip = f.base
+		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
+	}
+	file := strings.ReplaceAll(branch, "/", "-") + "-" + label + ".txt"
+	id := f.commitOn(t, tip, branch+" "+label, map[string]string{file: label + "\n"})
+	f.originBranch(t, branch, id)
+	return id
+}
+
 // upstreamTo moves the upstream's main to the commit id, which the hub's
 // copy holds, whether or not that is a fast-forward.
 func (f *syncFixture) upstreamTo(t *testing.T, id string) {
@@ -1467,7 +1550,7 @@ func wantMerged(t *testing.T, a syncAnswer, want ...string) {
 	if want == nil {
 		want = []string{}
 	}
-	if got := a.merged(t); !slices.Equal(got, want) {
+	if got := answerList[string](t, a, "patches_merged"); !slices.Equal(got, want) {
 		t.Errorf("patches_merged = %q, want %q", got, want)
 	}
 }
@@ -1538,7 +1621,11 @@ func (f *syncFixture) setColumn(t *testing.T, column string, value any) {
 // heads are the branches of the hub's copy, by name without refs/heads/.
 func (f *syncFixture) heads(t *testing.T) map[string]string {
 	t.Helper()
-	return gitrepotest.Refs(t, f.copy, "refs/heads/")
+	heads, err := headsIn(f.copy)
+	if err != nil {
+		t.Fatalf("read the branches of %s: %v", f.copy, err)
+	}
+	return heads
 }
 
 // eventCount is the number of stored events of the workspace whose type
@@ -1594,16 +1681,26 @@ func (a syncAnswer) branches(t *testing.T) map[string]string {
 	return results
 }
 
-// merged is the answer's patches_merged, in the answer's order.
-func (a syncAnswer) merged(t *testing.T) []string {
+// answerList is the answer's list member, in the answer's order; the test
+// fails when the answer has no such list.
+func answerList[T any](t *testing.T, a syncAnswer, member string) []T {
 	t.Helper()
-	var body struct {
-		Merged *[]string `json:"patches_merged"`
+	var list *[]T
+	err := json.Unmarshal(a.members(t)[member], &list)
+	if err != nil || list == nil {
+		t.Fatalf("the answer %s has no %s list: %v", a.raw, member, err)
 	}
-	if err := json.Unmarshal(a.raw, &body); err != nil || body.Merged == nil {
-		t.Fatalf("the answer %s has no patches_merged list: %v", a.raw, err)
+	return *list
+}
+
+// eventBranches are the branch_name of each event of ev, in order.
+func eventBranches(ev []patchEvent) []string {
+	names := make([]string, 0, len(ev))
+	for _, e := range ev {
+		name, _ := e.Metadata["branch_name"].(string)
+		names = append(names, name)
 	}
-	return *body.Merged
+	return names
 }
 
 // syncedEntry is one entry of a sync answer's patches_synced.
@@ -1616,22 +1713,21 @@ type syncedEntry struct {
 	ReplacedSHA *string `json:"replaced_sha"`
 }
 
-// synced is the answer's patches_synced, in the answer's order.
-func (a syncAnswer) synced(t *testing.T) []syncedEntry {
+// syncedNames are the branch names of the answer's patches_synced, in the
+// answer's order.
+func (a syncAnswer) syncedNames(t *testing.T) []string {
 	t.Helper()
-	var body struct {
-		Synced *[]syncedEntry `json:"patches_synced"`
+	var names []string
+	for _, e := range answerList[syncedEntry](t, a, "patches_synced") {
+		names = append(names, e.BranchName)
 	}
-	if err := json.Unmarshal(a.raw, &body); err != nil || body.Synced == nil {
-		t.Fatalf("the answer %s has no patches_synced list: %v", a.raw, err)
-	}
-	return *body.Synced
+	return names
 }
 
 // syncedOf is the entry of the answer's patches_synced for branch.
 func (a syncAnswer) syncedOf(t *testing.T, branch string) syncedEntry {
 	t.Helper()
-	for _, e := range a.synced(t) {
+	for _, e := range answerList[syncedEntry](t, a, "patches_synced") {
 		if e.BranchName == branch {
 			return e
 		}
@@ -1687,13 +1783,21 @@ func (f *syncFixture) wantRebuildQueued(t *testing.T, a syncAnswer) map[string]a
 	if a.body["rebuild_triggered"] != true || id == "" {
 		t.Fatalf("rebuild_triggered, rebuild_job_id = %v, %v, want true and a job", a.body["rebuild_triggered"], a.body["rebuild_job_id"])
 	}
+	record := f.rebuildRecord(t, id)
+	if record["status"] != "queued" {
+		t.Errorf("the rebuild %s is %v, want queued", id, record["status"])
+	}
+	return record
+}
+
+// rebuildRecord is the record of the rebuild id of the workspace as the
+// rebuild route answers it to the owner.
+func (f *syncFixture) rebuildRecord(t *testing.T, id string) map[string]any {
+	t.Helper()
 	status, raw := f.Call(t, http.MethodGet, "/api/v1/workspaces/"+f.slug+"/rebuilds/"+id, f.key, nil)
 	var record map[string]any
 	if err := json.Unmarshal(raw, &record); status != http.StatusOK || err != nil {
 		t.Fatalf("read the rebuild %s = %d %s, want 200 and a record", id, status, raw)
-	}
-	if record["status"] != "queued" {
-		t.Errorf("the rebuild %s is %v, want queued", id, record["status"])
 	}
 	return record
 }
@@ -1710,22 +1814,31 @@ func wantNoRebuild(t *testing.T, a syncAnswer) {
 
 // refMover is a BeforeRefSwap hook that plays another writer: armed with a
 // branch, it moves that branch of the repository dir to a commit of its
-// own the next time a swap of the branch is about to happen, once, and it
-// counts the swaps about to happen per branch.
+// own the next time a swap of the branch is about to happen, once, and
+// sets the branch's backup ref too when armed with one; it counts the swaps
+// about to happen per branch.
 type refMover struct {
 	mu     sync.Mutex
 	dir    string
 	branch string
 	to     string
+	backup string
 	calls  map[string]int
 	err    error
 }
 
 // arm makes the next swap of branch in the repository dir find it at to.
 func (m *refMover) arm(dir, branch, to string) {
+	m.armBackup(dir, branch, to, "")
+}
+
+// armBackup makes the next swap of branch in the repository dir find it at
+// to and its backup ref at backup, as a reset to origin that replaced the
+// branch in between leaves them; backup "" leaves the backup ref alone.
+func (m *refMover) armBackup(dir, branch, to, backup string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.dir, m.branch, m.to = dir, branch, to
+	m.dir, m.branch, m.to, m.backup = dir, branch, to, backup
 }
 
 func (m *refMover) hook(_, branch string) {
@@ -1740,6 +1853,12 @@ func (m *refMover) hook(_, branch string) {
 	}
 	m.branch = ""
 	if _, err := gitrepotest.Run(m.dir, "", "update-ref", "refs/heads/"+branch, m.to); err != nil {
+		m.err = err
+	}
+	if m.backup == "" {
+		return
+	}
+	if _, err := gitrepotest.Run(m.dir, "", "update-ref", carrypatch.ReplacedRefPrefix+branch, m.backup); err != nil {
 		m.err = err
 	}
 }
@@ -1762,29 +1881,13 @@ func (a syncAnswer) members(t *testing.T) map[string]json.RawMessage {
 	return members
 }
 
-// diverged is the answer's patches_diverged, in the answer's order.
-func (a syncAnswer) diverged(t *testing.T) []string {
-	t.Helper()
-	var body struct {
-		Diverged *[]string `json:"patches_diverged"`
-	}
-	if err := json.Unmarshal(a.raw, &body); err != nil || body.Diverged == nil {
-		t.Fatalf("the answer %s has no patches_diverged list: %v", a.raw, err)
-	}
-	return *body.Diverged
-}
-
 // syncAndLeave sends POST /api/v1/workspaces/<slug>/sync as the owner and
 // leaves, cancelling the request, once started is closed.
 func (f *syncFixture) syncAndLeave(t *testing.T, started <-chan struct{}) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL("/api/v1/workspaces/"+f.slug+"/sync"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+f.key)
+	req := f.syncRequest(t, ctx)
 	sent := make(chan error, 1)
 	go func() {
 		res, err := http.DefaultClient.Do(req)
