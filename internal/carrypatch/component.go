@@ -46,13 +46,17 @@ type Deps struct {
 	// branch after its lookups and before it creates the branch; only tests
 	// set it, to write the branch in between as another writer would.
 	BeforeBranchCreate func(branch string)
-	// BeforeRefSwap, when set, is called by a reset to origin with the
-	// workspace and the branch after it compared the branch's tip with
-	// origin's and before it records the reset, writes the backup ref and
-	// moves the branch, outside any store transaction; only tests set it,
-	// to move the branch or change the patch in between as another writer
-	// would.
+	// BeforeRefSwap, when set, is called by a reset to origin or a sync's
+	// origin refresh with the workspace and the branch after it compared
+	// the branch's tip with origin's and before it records the outcome,
+	// writes the backup ref and moves the branch, outside any store
+	// transaction; only tests set it, to move the branch or change the
+	// patch in between as another writer would.
 	BeforeRefSwap func(slug, branch string)
+	// BranchMoves is told of every patch branch a sync's origin refresh
+	// created or moved, after the move is recorded, so that the features
+	// observing a sync's branch moves see those too; nil tells nobody.
+	BranchMoves BranchMoveNotifier
 	// BeforeRollbackSwap, when set, is called by a rollback with the
 	// workspace and the full name of its integration branch after the
 	// rollback read the branch's head and before its compare-and-swap,
@@ -138,6 +142,60 @@ type Component struct {
 	mu       sync.Mutex
 	rebuilds RebuildEnqueuer
 	outcomes map[string]attemptOutcome
+
+	// setups are held by a repeated set-up of a workspace's copy, a sync's
+	// or a rebuild attempt's, which fetches upstream into it: two git
+	// fetches into one repository lock the same refs and its configuration,
+	// and one of them fails.
+	setups slugLocks
+}
+
+// slugLocks is a mutex per workspace slug, which exists only while someone
+// holds or waits for it. Its zero value is ready for use.
+type slugLocks struct {
+	mu    sync.Mutex
+	locks map[string]*slugLock
+}
+
+// slugLock is the mutex of one slug, a channel that holds one token so that
+// a waiter can give up when its context ends, and the number of its holders
+// and waiters.
+type slugLock struct {
+	token chan struct{}
+	users int
+}
+
+// lock waits until the mutex of slug is free or ctx ends, takes it and
+// returns the function that frees it.
+func (k *slugLocks) lock(ctx context.Context, slug string) (unlock func(), err error) {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[string]*slugLock{}
+	}
+	l := k.locks[slug]
+	if l == nil {
+		l = &slugLock{token: make(chan struct{}, 1)}
+		k.locks[slug] = l
+	}
+	l.users++
+	k.mu.Unlock()
+	leave := func() {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		if l.users--; l.users == 0 {
+			delete(k.locks, slug)
+		}
+	}
+	select {
+	case l.token <- struct{}{}:
+		return func() {
+			<-l.token
+			leave()
+		}, nil
+	case <-ctx.Done():
+		leave()
+		return nil, ctx.Err()
+	}
 }
 
 // Bind gives the component its Deps, before its first use.

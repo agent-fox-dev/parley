@@ -841,6 +841,9 @@ func TestSync_SkipsCarryPatchBranches(t *testing.T) {
 	s.svc.RegisterExcludedBranchProvider(provider)
 	observer := s.observe(t, nil)
 	s.setMode(t, workspace.ModeCarryPatch, "integration")
+	// The sync of a carry-patch workspace without the extension the hub
+	// registers, which would fetch an upstream this workspace has not.
+	s.svc.RegisterSyncExtension(nil)
 
 	r := s.sync(t, workspace.SyncOptions{ResetToOrigin: true})
 	var names []string
@@ -897,6 +900,7 @@ func TestSync_ExcludedBranchProviderFailure(t *testing.T) {
 	t.Parallel()
 	s := newSyncWorld(t)
 	s.setMode(t, workspace.ModeCarryPatch, "integration")
+	s.svc.RegisterSyncExtension(nil)
 	s.origin.Commit("main", "after the clone")
 	s.svc.RegisterExcludedBranchProvider(&excluding{err: errors.New("cannot read https://x:s3cr3t@example.test/patches.git")})
 	before, _ := s.workspace(t, syncSlug)

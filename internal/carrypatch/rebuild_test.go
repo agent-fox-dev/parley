@@ -157,6 +157,28 @@ func startRebuildFixtureOn(t *testing.T, toml string, deps func(d *carrypatch.De
 // origin's own file.
 func startRebuildFixtureFrom(t *testing.T, files map[string]string, toml string, deps func(d *carrypatch.Deps), edit ...func(w *workspace.Workspace)) *rebuildFixture {
 	t.Helper()
+	return startFixture(t, fixtureOptions{files: files, toml: toml, deps: deps}, edit...)
+}
+
+// fixtureOptions are what a test changes of the rebuild fixture: the files
+// of the upstream's first commit, when not nil, the hub's configuration
+// after its [server] section, the carry-patch component's dependencies,
+// changed by deps after the fixture's own changes, and the composition,
+// changed by compose after the fixture's own changes.
+type fixtureOptions struct {
+	files   map[string]string
+	toml    string
+	deps    func(d *carrypatch.Deps)
+	compose func(c *hub.Composition)
+}
+
+// startFixture starts the rebuild fixture with o, with the workspace's
+// record changed by edit before it is stored. Every git of the hub, the
+// workspace service's that fetches origin for a sync included, trusts the
+// upstream and the origin.
+func startFixture(t *testing.T, o fixtureOptions, edit ...func(w *workspace.Workspace)) *rebuildFixture {
+	t.Helper()
+	files, toml, deps := o.files, o.toml, o.deps
 	up := gitrepotest.NewOrigin(t)
 	var u1 string
 	if files == nil {
@@ -190,6 +212,7 @@ func startRebuildFixtureFrom(t *testing.T, files map[string]string, toml string,
 	f.Hub = hubtest.StartWith(t, hubtest.Config{
 		Now:  f.clock,
 		TOML: toml,
+		Env:  map[string]string{"GIT_SSL_CAINFO": bundle},
 		Compose: func(c *hub.Composition) {
 			f.comp, f.queue = c.CarryPatch(), c.Jobs()
 			f.runner.comp = f.comp
@@ -214,6 +237,9 @@ func startRebuildFixtureFrom(t *testing.T, files map[string]string, toml string,
 					deps(d)
 				}
 			})
+			if o.compose != nil {
+				o.compose(c)
+			}
 		},
 	})
 	// The dispatcher's own pass at its start could claim the first job; from
@@ -464,11 +490,21 @@ func commitsIn(t *testing.T, dir, base, head, format string) []string {
 }
 
 // rebuildSecrets are the workspace secrets of the rebuild fixture, which the
-// test sets; every other secret is read from the hub's reader.
+// test sets; every other secret is read from the hub's reader. While fail
+// is set, a read of an upstream credential's secret fails with it.
 type rebuildSecrets struct {
 	workspace.SecretReader
 	mu     sync.Mutex
 	values map[string]string
+	fail   error
+}
+
+// failUpstream makes every read of an upstream credential's secret fail
+// with err from now on; nil makes them succeed again.
+func (s *rebuildSecrets) failUpstream(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fail = err
 }
 
 // set stores value as the workspace secret name.
@@ -484,6 +520,9 @@ func (s *rebuildSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, n
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.fail != nil && strings.HasPrefix(name, "UPSTREAM_") {
+		return "", false, s.fail
+	}
 	v, ok := s.values[name]
 	return v, ok, nil
 }

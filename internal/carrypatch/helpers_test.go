@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -1244,11 +1245,15 @@ func (r *rebuildRunner) Settled(_ context.Context, _ *sql.Tx, j jobs.Job, _ bool
 }
 
 // histCommit is a commit writeHistory writes: on top of the commit of the
-// earlier entry at index from (-1 for a root commit), whose tree it takes
-// with files holding the content given and deleted removed; refs are the
-// full names of the refs that end at it.
+// earlier entry at index from, or, for from -1, of the commit parent the
+// repository holds already (a root commit when parent is ""), whose tree
+// it takes with files holding the content given and deleted removed; refs
+// are the full names of the refs that end at it, and msg its message,
+// c<index> when "".
 type histCommit struct {
 	from    int
+	parent  string
+	msg     string
 	files   map[string]string
 	deleted []string
 	refs    []string
@@ -1264,9 +1269,16 @@ func writeHistory(t *testing.T, dir string, commits []histCommit) []string {
 	for i, c := range commits {
 		// Each commit has a branch of its own, so that a root commit has no
 		// parent; the resets at the end leave those branches unwritten.
-		fmt.Fprintf(&s, "commit refs/history/%d\nmark :%d\ncommitter T <t@example.invalid> 1700000000 +0000\n%s", i, i+1, data(fmt.Sprintf("c%d\n", i)))
-		if c.from >= 0 {
+		msg := c.msg
+		if msg == "" {
+			msg = fmt.Sprintf("c%d", i)
+		}
+		fmt.Fprintf(&s, "commit refs/history/%d\nmark :%d\ncommitter T <t@example.invalid> 1700000000 +0000\n%s", i, i+1, data(msg+"\n"))
+		switch {
+		case c.from >= 0:
 			fmt.Fprintf(&s, "from :%d\n", c.from+1)
+		case c.parent != "":
+			fmt.Fprintf(&s, "from %s\n", c.parent)
 		}
 		for _, name := range slices.Sorted(maps.Keys(c.files)) {
 			fmt.Fprintf(&s, "M 100644 inline %s\n%s", name, data(c.files[name]))
@@ -1313,4 +1325,594 @@ func (h *rebuildHub) previewCopy(t *testing.T, slug string, commits []histCommit
 func (h *rebuildHub) preview(t *testing.T, slug string) answer {
 	t.Helper()
 	return h.call(t, h.key, http.MethodGet, "/workspaces/"+slug+"/rebuild-preview", nil, nil)
+}
+
+// syncFixture is the rebuild fixture for the sync of its workspace, whose
+// upstream fetches it counts and lets a test look in on.
+type syncFixture struct {
+	*rebuildFixture
+	fetches *upstreamFetches
+}
+
+// upstreamFetches counts the upstream fetches of the carry-patch
+// component, and the most that ran at once, and calls onFetch, when set, at
+// the start of each, before git runs.
+type upstreamFetches struct {
+	mu      sync.Mutex
+	calls   int
+	running int
+	most    int
+	onFetch func()
+}
+
+// mostAtOnce is the most upstream fetches that ran at the same time since
+// the fixture started.
+func (u *upstreamFetches) mostAtOnce() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.most
+}
+
+// count is the number of upstream fetches since the fixture started.
+func (u *upstreamFetches) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
+}
+
+// before makes fn run at the start of every upstream fetch from now on,
+// on the goroutine of the fetch; nil runs nothing.
+func (u *upstreamFetches) before(fn func()) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.onFetch = fn
+}
+
+// syncOptions are what a test changes of the sync fixture: the carry-patch
+// component's dependencies, changed by deps after the fixture's own
+// changes, and the composition, changed by compose after the fixture's own.
+type syncOptions struct {
+	deps    func(d *carrypatch.Deps)
+	compose func(c *hub.Composition)
+}
+
+// startSyncFixture starts the sync fixture, with the workspace's record
+// changed by edit before it is stored.
+func startSyncFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *syncFixture {
+	t.Helper()
+	return startSyncFixtureWith(t, syncOptions{}, edit...)
+}
+
+// startSyncFixtureWith starts the sync fixture with o, with the
+// workspace's record changed by edit before it is stored.
+func startSyncFixtureWith(t *testing.T, o syncOptions, edit ...func(w *workspace.Workspace)) *syncFixture {
+	t.Helper()
+	u := &upstreamFetches{}
+	f := &syncFixture{fetches: u}
+	f.rebuildFixture = startFixture(t, fixtureOptions{
+		compose: o.compose,
+		deps: func(d *carrypatch.Deps) {
+			fetch := d.FetchRemote
+			d.FetchRemote = func(ctx context.Context, dir, url, name string, cred gitrepo.Credential, deadline time.Duration) (map[string]string, error) {
+				u.mu.Lock()
+				u.calls++
+				u.running++
+				u.most = max(u.most, u.running)
+				fn := u.onFetch
+				u.mu.Unlock()
+				defer func() {
+					u.mu.Lock()
+					u.running--
+					u.mu.Unlock()
+				}()
+				if fn != nil {
+					fn()
+				}
+				return fetch(ctx, dir, url, name, cred, deadline)
+			}
+			if o.deps != nil {
+				o.deps(d)
+			}
+		},
+	}, edit...)
+	// The set-up of the fixture fetched upstream; the count starts after it.
+	u.mu.Lock()
+	u.calls, u.most = 0, 0
+	u.mu.Unlock()
+	return f
+}
+
+// syncAnswer is a decoded answer of the sync route: the members of a
+// completed sync in body, or an error.
+type syncAnswer struct {
+	status int
+	raw    []byte
+	body   map[string]any
+	Error  struct {
+		ErrorType string `json:"error_type"`
+		Message   string `json:"message"`
+	} `json:"error"`
+}
+
+// sync sends POST /api/v1/workspaces/<slug>/sync, with the query given
+// when it is not "", as the owner and decodes the answer.
+func (f *syncFixture) sync(t *testing.T, query string) syncAnswer {
+	t.Helper()
+	path := "/api/v1/workspaces/" + f.slug + "/sync"
+	if query != "" {
+		path += "?" + query
+	}
+	status, body := f.Call(t, http.MethodPost, path, f.key, nil)
+	return decodeSync(t, status, body)
+}
+
+// decodeSync decodes the answer of the sync route, status and body.
+func decodeSync(t *testing.T, status int, body []byte) syncAnswer {
+	t.Helper()
+	a := syncAnswer{status: status, raw: body}
+	if err := json.Unmarshal(body, &a); err != nil {
+		t.Fatalf("sync = %d %s: %v", status, body, err)
+	}
+	if err := json.Unmarshal(body, &a.body); err != nil {
+		t.Fatalf("sync = %d %s: %v", status, body, err)
+	}
+	return a
+}
+
+// syncRequest is POST /api/v1/workspaces/<slug>/sync as the owner, sent
+// with ctx.
+func (f *syncFixture) syncRequest(t *testing.T, ctx context.Context) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL("/api/v1/workspaces/"+f.slug+"/sync"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.key)
+	return req
+}
+
+// startSync sends POST /api/v1/workspaces/<slug>/sync as the owner in the
+// background and returns the function that waits for its answer.
+func (f *syncFixture) startSync(t *testing.T) (wait func() syncAnswer) {
+	t.Helper()
+	type answer struct {
+		status int
+		body   []byte
+		err    error
+	}
+	done := make(chan answer, 1)
+	req := f.syncRequest(t, context.Background())
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- answer{err: err}
+			return
+		}
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		done <- answer{res.StatusCode, body, err}
+	}()
+	return func() syncAnswer {
+		t.Helper()
+		a := <-done
+		if a.err != nil {
+			t.Fatalf("sync %s: %v", f.slug, a.err)
+		}
+		return decodeSync(t, a.status, a.body)
+	}
+}
+
+// mustSync syncs the workspace and fails the test unless the sync
+// completed.
+func (f *syncFixture) mustSync(t *testing.T) syncAnswer {
+	t.Helper()
+	a := f.sync(t, "")
+	if a.status != http.StatusOK {
+		t.Fatalf("sync %s = %d %s, want 200", f.slug, a.status, a.raw)
+	}
+	return a
+}
+
+// originBranch sets branch on origin to the commit id, which the hub's
+// copy holds.
+func (f *syncFixture) originBranch(t *testing.T, branch, id string) {
+	t.Helper()
+	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.origin.Dir(), id+":refs/heads/"+branch)
+}
+
+// originAhead gives origin's branch a commit, labelled label, on the hub's
+// tip of branch, creating the branch in the hub at the upstream base when
+// the hub has none, and returns the commit: origin is ahead of the hub.
+func (f *syncFixture) originAhead(t *testing.T, branch, label string) string {
+	t.Helper()
+	tip := refIn(f.copy, "refs/heads/"+branch)
+	if tip == "" {
+		tip = f.base
+		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
+	}
+	file := strings.ReplaceAll(branch, "/", "-") + "-" + label + ".txt"
+	id := f.commitOn(t, tip, branch+" "+label, map[string]string{file: label + "\n"})
+	f.originBranch(t, branch, id)
+	return id
+}
+
+// upstreamTo moves the upstream's main to the commit id, which the hub's
+// copy holds, whether or not that is a fast-forward.
+func (f *syncFixture) upstreamTo(t *testing.T, id string) {
+	t.Helper()
+	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.upstream.Dir(), id+":refs/heads/main")
+	gitrepotest.Git(t, f.upstream.Dir(), "update-server-info")
+}
+
+// wantMerged fails the test unless the answer's patches_merged is want.
+func wantMerged(t *testing.T, a syncAnswer, want ...string) {
+	t.Helper()
+	if want == nil {
+		want = []string{}
+	}
+	if got := answerList[string](t, a, "patches_merged"); !slices.Equal(got, want) {
+		t.Errorf("patches_merged = %q, want %q", got, want)
+	}
+}
+
+// commitOn writes into the hub's copy a commit on parent with msg that
+// writes the files given, and returns it.
+func (f *syncFixture) commitOn(t *testing.T, parent, msg string, files map[string]string) string {
+	t.Helper()
+	return gitrepotest.Commit(t, f.copy, msg, files, parent)
+}
+
+// setStatus stores status on the patch id, as an update would leave it.
+func (f *syncFixture) setStatus(t *testing.T, id, status string) {
+	t.Helper()
+	if _, err := f.Store.Main().Exec(`UPDATE patches SET status = ? WHERE id = ?`, status, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// upstreamChain writes into the hub's copy a line of commits on parent (a
+// root commit first when parent is ""), the k-th of them, from 0, the
+// pull request commit with the subject "Fix the dialer (#7)", and returns
+// the last; all are written in one run of git fast-import.
+func (f *syncFixture) upstreamChain(t *testing.T, label, parent string, n, k int) string {
+	t.Helper()
+	commits := make([]histCommit, n)
+	for i := range commits {
+		commits[i] = histCommit{from: i - 1, msg: fmt.Sprintf("%s: upstream %d", label, i),
+			files: map[string]string{"up.txt": fmt.Sprintf("%s %d\n", label, i)}}
+		if i == 0 {
+			commits[i].parent = parent
+		}
+		if i == k {
+			commits[i].msg = "Fix the dialer (#7)"
+		}
+	}
+	ids := writeHistory(t, f.copy, commits)
+	return ids[n-1]
+}
+
+// addPatchOn stores an active patch of branch at the end of the patch
+// list, changed by edit, whose branch in the hub's copy holds one commit
+// on base that adds a file of its own, and returns it.
+func (f *syncFixture) addPatchOn(t *testing.T, branch, base string, edit ...func(p *carrypatch.Patch)) carrypatch.Patch {
+	t.Helper()
+	file := strings.ReplaceAll(branch, "/", "-") + ".txt"
+	return f.putPatch(t, branch, f.commitOn(t, base, branch, map[string]string{file: branch + "\n"}), edit...)
+}
+
+// setSettings sets the workspace's settings given through the workspace
+// update route, as the owner.
+func (f *syncFixture) setSettings(t *testing.T, settings map[string]any) {
+	t.Helper()
+	if status, raw := f.Call(t, http.MethodPatch, "/api/v1/workspaces/"+f.slug, f.key, map[string]any{"settings": settings}); status != http.StatusOK {
+		t.Fatalf("set the settings %v of %s = %d %s, want 200", settings, f.slug, status, raw)
+	}
+}
+
+// setColumn stores value as the column of the workspace's record, as the
+// hub's own writes would leave it.
+func (f *syncFixture) setColumn(t *testing.T, column string, value any) {
+	t.Helper()
+	if _, err := f.Store.Main().Exec(`UPDATE workspaces SET `+column+` = ? WHERE slug = ?`, value, f.slug); err != nil {
+		t.Fatalf("set %s of %s: %v", column, f.slug, err)
+	}
+}
+
+// heads are the branches of the hub's copy, by name without refs/heads/.
+func (f *syncFixture) heads(t *testing.T) map[string]string {
+	t.Helper()
+	heads, err := headsIn(f.copy)
+	if err != nil {
+		t.Fatalf("read the branches of %s: %v", f.copy, err)
+	}
+	return heads
+}
+
+// eventCount is the number of stored events of the workspace whose type
+// is like typ, a pattern of SQL's LIKE.
+func (f *syncFixture) eventCount(t *testing.T, typ string) int {
+	t.Helper()
+	var n int
+	if err := f.Store.Main().QueryRow(`SELECT COUNT(*) FROM hub_events WHERE workspace = ? AND type LIKE ?`, f.slug, typ).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// rebuildJobs are the rebuild jobs of the workspace, newest first.
+func (f *syncFixture) rebuildJobs(t *testing.T) []jobs.Job {
+	t.Helper()
+	js, err := f.queue.List(context.Background(), carrypatch.RebuildJobType, f.slug, "", nil, 200)
+	if err != nil {
+		t.Fatalf("list the rebuild jobs of %s: %v", f.slug, err)
+	}
+	return js
+}
+
+// headsIn are the branches of the repository dir, by name without
+// refs/heads/, for a caller off the test's goroutine.
+func headsIn(dir string) (map[string]string, error) {
+	out, err := gitrepotest.Run(dir, "", "for-each-ref", "--format=%(refname:lstrip=2) %(objectname)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	heads := map[string]string{}
+	for line := range strings.Lines(out) {
+		if name, id, ok := strings.Cut(strings.TrimSpace(line), " "); ok {
+			heads[name] = id
+		}
+	}
+	return heads, nil
+}
+
+// branches are the results of the answer's branch list, by branch name.
+func (a syncAnswer) branches(t *testing.T) map[string]string {
+	t.Helper()
+	list, ok := a.body["branches"].([]any)
+	if !ok {
+		t.Fatalf("the answer %s has no branch list", a.raw)
+	}
+	results := map[string]string{}
+	for _, e := range list {
+		entry, _ := e.(map[string]any)
+		name, _ := entry["name"].(string)
+		results[name], _ = entry["result"].(string)
+	}
+	return results
+}
+
+// answerList is the answer's list member, in the answer's order; the test
+// fails when the answer has no such list.
+func answerList[T any](t *testing.T, a syncAnswer, member string) []T {
+	t.Helper()
+	var list *[]T
+	err := json.Unmarshal(a.members(t)[member], &list)
+	if err != nil || list == nil {
+		t.Fatalf("the answer %s has no %s list: %v", a.raw, member, err)
+	}
+	return *list
+}
+
+// eventBranches are the branch_name of each event of ev, in order.
+func eventBranches(ev []patchEvent) []string {
+	names := make([]string, 0, len(ev))
+	for _, e := range ev {
+		name, _ := e.Metadata["branch_name"].(string)
+		names = append(names, name)
+	}
+	return names
+}
+
+// syncedEntry is one entry of a sync answer's patches_synced.
+type syncedEntry struct {
+	BranchName  string  `json:"branch_name"`
+	Action      string  `json:"action"`
+	State       string  `json:"state"`
+	LocalSHA    *string `json:"local_sha"`
+	OriginSHA   *string `json:"origin_sha"`
+	ReplacedSHA *string `json:"replaced_sha"`
+}
+
+// syncedNames are the branch names of the answer's patches_synced, in the
+// answer's order.
+func (a syncAnswer) syncedNames(t *testing.T) []string {
+	t.Helper()
+	var names []string
+	for _, e := range answerList[syncedEntry](t, a, "patches_synced") {
+		names = append(names, e.BranchName)
+	}
+	return names
+}
+
+// syncedOf is the entry of the answer's patches_synced for branch.
+func (a syncAnswer) syncedOf(t *testing.T, branch string) syncedEntry {
+	t.Helper()
+	for _, e := range answerList[syncedEntry](t, a, "patches_synced") {
+		if e.BranchName == branch {
+			return e
+		}
+	}
+	t.Fatalf("patches_synced of %s has no entry for %s", a.raw, branch)
+	return syncedEntry{}
+}
+
+// moveRecorder is a branch-move observer that records every move it is
+// told of and answers err.
+type moveRecorder struct {
+	err   error
+	mu    sync.Mutex
+	moves []workspace.BranchMove
+}
+
+func (o *moveRecorder) BranchMoved(_ context.Context, m workspace.BranchMove) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.moves = append(o.moves, m)
+	return o.err
+}
+
+// movesUnder are the moves told so far of the branches whose name starts
+// with prefix, in the order told.
+func (o *moveRecorder) movesUnder(prefix string) []workspace.BranchMove {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var moves []workspace.BranchMove
+	for _, m := range o.moves {
+		if strings.HasPrefix(m.Branch, prefix) {
+			moves = append(moves, m)
+		}
+	}
+	return moves
+}
+
+// dropRebuilds removes the rebuild jobs of the workspace, as if none had
+// been queued, so that the next sync's rebuild is not a duplicate.
+func (f *syncFixture) dropRebuilds(t *testing.T) {
+	t.Helper()
+	if _, err := f.Store.Main().Exec(`DELETE FROM jobs WHERE type = ? AND workspace_slug = ?`, carrypatch.RebuildJobType, f.slug); err != nil {
+		t.Fatalf("remove the rebuild jobs of %s: %v", f.slug, err)
+	}
+}
+
+// wantRebuildQueued fails the test unless the answer reports a rebuild
+// queued by the sync, whose job is still queued, and returns the job's
+// record as the rebuild route answers it.
+func (f *syncFixture) wantRebuildQueued(t *testing.T, a syncAnswer) map[string]any {
+	t.Helper()
+	id, _ := a.body["rebuild_job_id"].(string)
+	if a.body["rebuild_triggered"] != true || id == "" {
+		t.Fatalf("rebuild_triggered, rebuild_job_id = %v, %v, want true and a job", a.body["rebuild_triggered"], a.body["rebuild_job_id"])
+	}
+	record := f.rebuildRecord(t, id)
+	if record["status"] != "queued" {
+		t.Errorf("the rebuild %s is %v, want queued", id, record["status"])
+	}
+	return record
+}
+
+// rebuildRecord is the record of the rebuild id of the workspace as the
+// rebuild route answers it to the owner.
+func (f *syncFixture) rebuildRecord(t *testing.T, id string) map[string]any {
+	t.Helper()
+	status, raw := f.Call(t, http.MethodGet, "/api/v1/workspaces/"+f.slug+"/rebuilds/"+id, f.key, nil)
+	var record map[string]any
+	if err := json.Unmarshal(raw, &record); status != http.StatusOK || err != nil {
+		t.Fatalf("read the rebuild %s = %d %s, want 200 and a record", id, status, raw)
+	}
+	return record
+}
+
+// wantNoRebuild fails the test unless the answer reports that the sync
+// queued no rebuild: rebuild_triggered false and rebuild_job_id null.
+func wantNoRebuild(t *testing.T, a syncAnswer) {
+	t.Helper()
+	id, present := a.body["rebuild_job_id"]
+	if a.body["rebuild_triggered"] != false || !present || id != nil {
+		t.Errorf("rebuild_triggered, rebuild_job_id = %v, %v (present %v), want false and null", a.body["rebuild_triggered"], id, present)
+	}
+}
+
+// refMover is a BeforeRefSwap hook that plays another writer: armed with a
+// branch, it moves that branch of the repository dir to a commit of its
+// own the next time a swap of the branch is about to happen, once, and
+// sets the branch's backup ref too when armed with one; it counts the swaps
+// about to happen per branch.
+type refMover struct {
+	mu     sync.Mutex
+	dir    string
+	branch string
+	to     string
+	backup string
+	calls  map[string]int
+	err    error
+}
+
+// arm makes the next swap of branch in the repository dir find it at to.
+func (m *refMover) arm(dir, branch, to string) {
+	m.armBackup(dir, branch, to, "")
+}
+
+// armBackup makes the next swap of branch in the repository dir find it at
+// to and its backup ref at backup, as a reset to origin that replaced the
+// branch in between leaves them; backup "" leaves the backup ref alone.
+func (m *refMover) armBackup(dir, branch, to, backup string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dir, m.branch, m.to, m.backup = dir, branch, to, backup
+}
+
+func (m *refMover) hook(_, branch string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.calls == nil {
+		m.calls = map[string]int{}
+	}
+	m.calls[branch]++
+	if branch != m.branch {
+		return
+	}
+	m.branch = ""
+	if _, err := gitrepotest.Run(m.dir, "", "update-ref", "refs/heads/"+branch, m.to); err != nil {
+		m.err = err
+	}
+	if m.backup == "" {
+		return
+	}
+	if _, err := gitrepotest.Run(m.dir, "", "update-ref", carrypatch.ReplacedRefPrefix+branch, m.backup); err != nil {
+		m.err = err
+	}
+}
+
+// swaps is the number of swaps of branch that were about to happen, and
+// the error of a move the mover could not make.
+func (m *refMover) swaps(branch string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls[branch], m.err
+}
+
+// members are the answer's top-level members as the hub wrote them.
+func (a syncAnswer) members(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(a.raw, &members); err != nil {
+		t.Fatalf("the answer %s is not an object: %v", a.raw, err)
+	}
+	return members
+}
+
+// syncAndLeave sends POST /api/v1/workspaces/<slug>/sync as the owner and
+// leaves, cancelling the request, once started is closed.
+func (f *syncFixture) syncAndLeave(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := f.syncRequest(t, ctx)
+	sent := make(chan error, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		sent <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sync did not reach the point to leave at within 10 s")
+	}
+	cancel()
+	if err := <-sent; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the request ended with %v, want it cancelled by the caller", err)
+	}
+}
+
+// waitSynced waits until the workspace records a completed sync.
+func (f *syncFixture) waitSynced(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); f.record(t).LastSyncAt == nil; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the sync recorded no completion within 20 s")
+		}
+	}
 }

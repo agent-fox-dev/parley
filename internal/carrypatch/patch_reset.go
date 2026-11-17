@@ -89,11 +89,7 @@ func (c *Component) rebuildAfterReset(ctx context.Context, ws workspace.Workspac
 	if action == resetNone || p.Status != StatusActive && p.Status != StatusConflict || !c.autoRebuildAfterSync(ctx, ws) {
 		return false, ""
 	}
-	submitter := by.typ
-	if by.id != nil {
-		submitter = *by.id
-	}
-	res, err := c.Rebuilds().EnqueueRebuild(ctx, ws.Slug, RebuildOptions{SubmittedBy: submitter, ActorType: by.typ, ActorID: by.id})
+	res, err := c.Rebuilds().EnqueueRebuild(ctx, ws.Slug, RebuildOptions{SubmittedBy: by.submitter(), ActorType: by.typ, ActorID: by.id})
 	if err != nil {
 		c.logger().LogAttrs(ctx, slog.LevelError, "queue the rebuild after a reset to origin",
 			slog.String("slug", ws.Slug), slog.String("branch", p.BranchName), slog.String("error", err.Error()))
@@ -150,7 +146,7 @@ func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, i
 	if err := resettable(p); err != nil {
 		return Patch{}, "", err
 	}
-	branch, head := p.BranchName, headsPrefix+p.BranchName
+	branch := p.BranchName
 	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(ws.Slug))
 	if err != nil {
 		return Patch{}, "", fmt.Errorf("reset the branch %s of %s: %w", branch, ws.Slug, err)
@@ -159,27 +155,9 @@ func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, i
 	if err != nil {
 		return Patch{}, "", err
 	}
-	var local gitrepo.Ref
-	var exists, behind bool
-	err = RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
-		var err error
-		if local, exists, err = repo.LookupRef(ctx, head); err != nil || !exists || local.ID == tip {
-			return err
-		}
-		behind, err = repo.IsAncestor(ctx, local.ID, tip)
-		return err
-	})
+	local, action, err := compareWithOrigin(ctx, repo, branch, tip)
 	if err != nil {
 		return Patch{}, "", fmt.Errorf("reset the branch %s of %s: %w", branch, ws.Slug, err)
-	}
-	action := resetReplaced
-	switch {
-	case !exists:
-		action = resetCreated
-	case local.ID == tip:
-		action = resetNone
-	case behind:
-		action = resetFastForwarded
 	}
 	// From here the reset runs to its end also when the caller leaves: a
 	// branch moved without its record would be a change no event reports.
@@ -200,12 +178,12 @@ func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, i
 	var out Patch
 	var moved bool
 	err = c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
-		p, err := c.recordReset(ctx, tx, ws, id, by, action, local.ID, tip)
+		p, err := c.recordReset(ctx, tx, ws, id, by, action, local, tip)
 		if err != nil {
 			return err
 		}
 		if action != resetNone {
-			if err := c.moveToOrigin(ctx, repo, ws.Slug, branch, action, local.ID, tip); err != nil {
+			if err := c.moveToOrigin(ctx, repo, ws.Slug, branch, action, local, tip); err != nil {
 				return err
 			}
 			moved = true
@@ -217,11 +195,45 @@ func (c *Component) resetToOrigin(ctx context.Context, ws workspace.Workspace, i
 		if moved {
 			// The commit failed after the branch moved: nothing records
 			// the move, so it is taken back.
-			c.undoMove(ctx, repo, ws.Slug, branch, local.ID, tip)
+			c.undoMove(ctx, repo, ws.Slug, branch, local, tip)
 		}
 		return Patch{}, "", err
 	}
 	return out, action, nil
+}
+
+// compareWithOrigin reads the branch of repo and compares its tip with
+// tip, origin's, "" when origin has none, for a reset to origin and a
+// sync's origin refresh alike. It returns the hub's tip, "" when the hub
+// has no such branch, and the action that brings the branch to tip, the
+// first that applies: created, none, fast_forwarded, replaced; without a
+// tip, the action is "".
+func compareWithOrigin(ctx context.Context, repo *gitrepo.Repo, branch, tip string) (local, action string, err error) {
+	err = RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		ref, exists, err := repo.LookupRef(ctx, headsPrefix+branch)
+		if err != nil {
+			return err
+		}
+		local, action = ref.ID, ""
+		switch {
+		case tip == "":
+		case !exists:
+			action = resetCreated
+		case local == tip:
+			action = resetNone
+		default:
+			behind, err := repo.IsAncestor(ctx, local, tip)
+			if err != nil {
+				return err
+			}
+			action = resetReplaced
+			if behind {
+				action = resetFastForwarded
+			}
+		}
+		return nil
+	})
+	return local, action, err
 }
 
 // resettable is nil for a patch a reset to origin applies to, active,
@@ -257,17 +269,11 @@ func (c *Component) undoMove(ctx context.Context, repo *gitrepo.Repo, slug, bran
 
 // moveToOrigin moves the branch of the workspace slug in repo from local,
 // "" for none, to origin's tip, saving local to the backup ref first when
-// action is replaced. The backup stays when the move then loses to another
-// writer, which is 409 ref_moved. It runs inside the reset's transaction.
+// action is replaced (swapToOrigin). The backup stays when the move then
+// loses to another writer, which is 409 ref_moved. It runs inside the
+// reset's transaction.
 func (c *Component) moveToOrigin(ctx context.Context, repo *gitrepo.Repo, slug, branch, action, local, tip string) error {
-	if action == resetReplaced {
-		if err := WriteBackupRef(ctx, repo, branch, local); err != nil {
-			return fmt.Errorf("reset the branch %s of %s: %w", branch, slug, err)
-		}
-	}
-	err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
-		return repo.CompareAndSwapRef(ctx, headsPrefix+branch, tip, local)
-	})
+	err := swapToOrigin(ctx, repo, branch, action, local, tip, nil)
 	switch {
 	case err == nil:
 		return nil
@@ -277,6 +283,29 @@ func (c *Component) moveToOrigin(ctx context.Context, repo *gitrepo.Repo, slug, 
 		return nameConflict(ctx, repo, branch, headsPrefix+branch)
 	}
 	return fmt.Errorf("reset the branch %s of %s: %w", branch, slug, err)
+}
+
+// swapToOrigin moves branch of repo by a compare-and-swap from local, ""
+// for none, to tip, origin's, saving local to the backup ref first when
+// action is replaced, so that a replaced tip stays reachable even when the
+// swap then loses. With backupWas nil the backup is written whatever the
+// backup ref holds (WriteBackupRef); else only while it holds *backupWas
+// (SwapBackupRef), and a lost backup swap moves nothing.
+func swapToOrigin(ctx context.Context, repo *gitrepo.Repo, branch, action, local, tip string, backupWas *string) error {
+	if action == resetReplaced {
+		var err error
+		if backupWas == nil {
+			err = WriteBackupRef(ctx, repo, branch, local)
+		} else {
+			err = SwapBackupRef(ctx, repo, branch, local, *backupWas)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		return repo.CompareAndSwapRef(ctx, headsPrefix+branch, tip, local)
+	})
 }
 
 // recordReset records the reset of the patch id of ws in tx: origin's tip
