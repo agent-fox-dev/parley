@@ -5,8 +5,12 @@ import (
 	"errors"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -300,9 +304,11 @@ func TestForward_FailsWithItsReasonAndLeavesOriginAndTheRecordAsTheyWere(t *test
 	}
 }
 
+// Not parallel: it puts a git that records its process id first on the
+// PATH of the test process, so that the test sees the forward's git itself.
 func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
-	t.Parallel()
 	f := newForwardFixture(t)
+	gits := recordGits(t)
 	f.origin.Block()
 	for _, tc := range []struct {
 		name   string
@@ -323,8 +329,25 @@ func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, tc.cancel)
 				defer cancel()
 			}
+			gits.reset(t)
 			start := time.Now()
 			err := c.Forward(ctx, nil, f.ws, "patch/a", f.commit)
+			pushes := gits.started(t, "push")
+			if len(pushes) == 0 {
+				t.Fatalf("the forward started no git push (it returned %v)", err)
+			}
+			// The forward waited for its git: by its return git is gone, not
+			// even left for its parent to reap. Its transport helpers ran in
+			// git's process group, killed with it, and origin still holds
+			// their requests, so one left alive would stay alive.
+			for _, pid := range pushes {
+				if !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+					t.Errorf("the forward's git push (pid %d) still exists after the forward returned", pid)
+				}
+				if left := liveInGroup(t, pid, 2*time.Second); len(left) > 0 {
+					t.Errorf("processes %v started by the forward's git push (pid %d) still run 2s after the forward returned", left, pid)
+				}
+			}
 			if took := time.Since(start); took >= 5*time.Second {
 				t.Errorf("the forward returned after %v, want well within 5s", took)
 			}
@@ -336,11 +359,93 @@ func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
 			}
 		})
 	}
-	// Git and every process it started are gone: once origin lets the held
-	// requests through, nobody is left to push.
+	// Once origin lets the held requests through, nobody is left to push.
 	f.origin.Release()
 	time.Sleep(200 * time.Millisecond)
 	if got := f.origin.Head("patch/a"); got != f.base {
 		t.Errorf("origin's patch/a = %.7s after the held requests were let through, want %.7s", got, f.base)
+	}
+}
+
+// gitLog is the record of the git processes started while it is in place:
+// a git first on the PATH of the test process that writes its process id
+// and arguments to the log and then runs as the real git, in the same
+// process.
+type gitLog struct{ path string }
+
+// recordGits puts the recording git in place until the test ends.
+func recordGits(t *testing.T) *gitLog {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	l := &gitLog{path: filepath.Join(bin, "started")}
+	script := "#!/bin/sh\necho \"$$ $*\" >> '" + l.path + "'\nexec '" + gitPath + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// macOS checks a new executable the first time it runs, which may take
+	// longer than a forward's limit in the test: run it once beforehand.
+	if out, err := exec.Command("git", "--version").CombinedOutput(); err != nil {
+		t.Fatalf("the recording git does not run: %v: %s", err, out)
+	}
+	l.reset(t)
+	return l
+}
+
+// reset forgets the git processes recorded so far.
+func (l *gitLog) reset(t *testing.T) {
+	t.Helper()
+	if err := os.Remove(l.path); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+// started is the process ids of the recorded git processes that ran the
+// git command cmd.
+func (l *gitLog) started(t *testing.T, cmd string) []int {
+	t.Helper()
+	b, err := os.ReadFile(l.path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var pids []int
+	for line := range strings.Lines(string(b)) {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !slices.Contains(fields[1:], cmd) {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			t.Fatalf("the recording git wrote %q", line)
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// liveInGroup is the processes of the process group pgid that still run,
+// zombies left out, once they all ended or wait passed.
+func liveInGroup(t *testing.T, pgid int, wait time.Duration) []int {
+	t.Helper()
+	for deadline := time.Now().Add(wait); ; time.Sleep(20 * time.Millisecond) {
+		out, err := exec.Command("ps", "-A", "-o", "pid=,pgid=,stat=").Output()
+		if err != nil {
+			t.Fatalf("ps: %v", err)
+		}
+		var live []int
+		for line := range strings.Lines(string(out)) {
+			f := strings.Fields(line)
+			if len(f) == 3 && f[1] == strconv.Itoa(pgid) && !strings.HasPrefix(f[2], "Z") {
+				pid, _ := strconv.Atoi(f[0])
+				live = append(live, pid)
+			}
+		}
+		if len(live) == 0 || time.Now().After(deadline) {
+			return live
+		}
 	}
 }
