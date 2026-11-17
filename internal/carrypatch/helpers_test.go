@@ -703,6 +703,16 @@ func (s countingSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, n
 	return s.SecretReader.Get(ctx, scope, scopeID, name)
 }
 
+// eventCount is the number of events the hub stored.
+func (h *readHub) eventCount(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := h.Store.Main().QueryRow(`SELECT count(*) FROM hub_events`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // failingEmitter is an emitter that refuses every write while fail is set.
 type failingEmitter struct {
 	carrypatch.Emitter
@@ -733,6 +743,8 @@ type rebuildHub struct {
 	rollbackHooks sync.Map
 	// trialMerges are the failures onTrialMerge gave copies, by directory.
 	trialMerges sync.Map
+	// forgetHooks are the hooks onForgetRecord gave workspaces, by slug.
+	forgetHooks sync.Map
 	// gitRun are the arguments of every git command of the carry-patch
 	// component, in the order they ran.
 	gitMu  sync.Mutex
@@ -760,6 +772,11 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 				h.repoPath = d.RepoPath
 				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
 				d.BeforeRollbackSwap = h.beforeRollbackSwap
+				d.BeforeRerereForgetRecord = func(slug, id string) {
+					if fn, ok := h.forgetHooks.Load(slug); ok {
+						fn.(func(string))(id)
+					}
+				}
 				d.TrialMerge = h.trialMerge
 				trace := d.Git.Trace
 				d.Git.Trace = func(args []string) {
@@ -824,6 +841,10 @@ func (h *rebuildHub) beforeRollbackSwap(slug, _ string) {
 		fn.(func())()
 	}
 }
+
+// onForgetRecord makes fn run with the id of each entry a forget of slug
+// removes, once git's record of it is removed and before the store's is.
+func (h *rebuildHub) onForgetRecord(slug string, fn func(id string)) { h.forgetHooks.Store(slug, fn) }
 
 // onTrialMerge makes fail decide each trial merge of a preview of the copy
 // whose git directory is dir: the merge of theirs onto ours fails with the

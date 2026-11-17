@@ -57,15 +57,25 @@ func (c *Component) PurgeDeletedPatches(ctx context.Context, now time.Time) erro
 	return nil
 }
 
+// purgeRefLimit is the deadline of each git the purge runs on a backup
+// ref. The deletion runs inside the patch's store transaction, and every
+// write of the hub waits on that transaction: a git that hangs must not
+// hold them for DefaultGitDeadline.
+const purgeRefLimit = 30 * time.Second
+
 // purgePatch removes the patch p, chosen as deleted before cutoff, in one
 // store transaction: the row, only while it is still deleted before
 // cutoff, so that a restore that committed first makes it remove nothing,
 // then, when no patch of the workspace that is not deleted uses its branch,
 // the branch's backup ref in the copy. A failure of either rolls the
-// transaction back, so the next pass tries both again. A workspace without
-// a copy has no backup ref to delete.
+// transaction back, so the next pass tries both again. The ref is deleted
+// before the commit, so a transaction that fails after the deletion would
+// leave the row without its ref: the ref is then set back to the commit it
+// held. A workspace without a copy has no backup ref to delete.
 func (c *Component) purgePatch(ctx context.Context, p Patch, cutoff time.Time) error {
-	return c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+	var repo *gitrepo.Repo
+	var deleted gitrepo.Ref
+	err := c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `DELETE FROM patches WHERE workspace_slug = ? AND id = ? AND status = ? AND deleted_at < ?`,
 			p.Workspace, p.ID, StatusDeleted, cutoff.UnixNano())
 		if err != nil {
@@ -81,7 +91,7 @@ func (c *Component) purgePatch(ctx context.Context, p Patch, cutoff time.Time) e
 		} else if held {
 			return nil
 		}
-		repo, err := c.d.Git.Open(ctx, c.d.RepoPath(p.Workspace))
+		repo, err = c.d.Git.Open(ctx, c.d.RepoPath(p.Workspace))
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
@@ -89,11 +99,43 @@ func (c *Component) purgePatch(ctx context.Context, p Patch, cutoff time.Time) e
 			return fmt.Errorf("open the copy: %w", err)
 		}
 		ref := ReplacedRefPrefix + p.BranchName
-		if err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
-			return repo.DeleteRef(ctx, ref)
+		if err := RunGit(ctx, purgeRefLimit, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+			old, found, err := repo.LookupRef(ctx, ref)
+			if err != nil || !found {
+				return err
+			}
+			if err := repo.DeleteRef(ctx, ref); err != nil {
+				return err
+			}
+			deleted = old
+			return nil
 		}); err != nil {
 			return fmt.Errorf("delete %s: %w", ref, err)
 		}
+		if deleted.Name != "" && c.d.AfterPurgeRef != nil {
+			return c.d.AfterPurgeRef(p.Workspace, p.ID)
+		}
 		return nil
 	})
+	if err != nil && deleted.Name != "" {
+		c.restorePurgedRef(ctx, repo, p, deleted)
+	}
+	return err
+}
+
+// restorePurgedRef sets the backup ref ref of the patch p back to the
+// commit it held before a purge whose transaction failed deleted it. It
+// creates the ref only while it is absent, so that a value another writer
+// gave it since is kept, and runs whether or not the caller left: the row
+// is kept, and its ref goes with it. A failure is logged.
+func (c *Component) restorePurgedRef(ctx context.Context, repo *gitrepo.Repo, p Patch, ref gitrepo.Ref) {
+	ctx = context.WithoutCancel(ctx)
+	err := RunGit(ctx, purgeRefLimit, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		return repo.CompareAndSwapRef(ctx, ref.Name, ref.ID, "")
+	})
+	if err != nil {
+		c.logger().LogAttrs(ctx, slog.LevelError, "backup ref of a patch not purged not restored",
+			slog.String("workspace", p.Workspace), slog.String("patch_id", p.ID),
+			slog.String("ref", ref.Name), slog.String("commit", ref.ID), slog.String("error", err.Error()))
+	}
 }

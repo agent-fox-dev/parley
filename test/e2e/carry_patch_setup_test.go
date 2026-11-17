@@ -55,9 +55,9 @@ func startCarryPatchHubConfig(t *testing.T, origin, up *gitrepotest.Origin, cfg 
 	}
 	h := &workspaceHub{root: t.TempDir(), origin: origin}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
-		Server:  `external_url = "https://hub.example/"`,
-		TOML:    "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n",
-		Env:     map[string]string{"GIT_SSL_CAINFO": caFile, secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw)},
+		Server:              `external_url = "https://hub.example/"`,
+		TOML:                "[workspace]\npath = " + quote(h.root) + "\nworkers = 2\n",
+		Env:                 map[string]string{"GIT_SSL_CAINFO": caFile, secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(raw)},
 		Now:                 cfg.Now,
 		Compose:             cfg.Compose,
 		MaintenanceInterval: cfg.MaintenanceInterval,

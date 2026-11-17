@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -229,20 +230,45 @@ func TestPatchMaintenance_ResetToOrigin(t *testing.T) {
 // restart, the purge failing in none of them.
 func TestPatchMaintenance_APassPurgesAPatchDeletedMoreThanSevenDaysAgo(t *testing.T) {
 	parallel(t)
-	clock := &fakeNow{now: time.Now().UTC()}
+	// A whole second, as deleted_at is stored: the patch deleted 7 days
+	// before the clock is deleted exactly 7 days ago.
+	clock := &fakeNow{now: time.Now().UTC().Truncate(time.Second)}
 	// passes counts the maintenance passes that reached the task after
-	// patch_purge: a task the loop does not know runs after those it does.
-	var passes atomic.Int32
+	// patch_purge, which a pass runs after the tasks it knows; purgedFirst
+	// is what that task found of p-old's row in the first pass of each run.
+	var passes, starts atomic.Int32
+	var oldID atomic.Value
+	var mu sync.Mutex
+	purgedFirst := map[int32]bool{}
 	h, _, ids := startPatchHubConfig(t, hubtest.Config{
 		Now:                 clock.Now,
 		MaintenanceInterval: 50 * time.Millisecond,
 		Compose: func(c *hub.Composition) {
-			c.AddMaintenanceTask("test-after-purge", func(context.Context, *hub.Runtime) error {
-				passes.Add(1)
+			// The day passes while the hub is stopped: from the restart on,
+			// p-old has been deleted for 8 days.
+			c.AddStartHook("test-day-passes", func(context.Context, *hub.Runtime) error {
+				if starts.Add(1) > 1 {
+					clock.advance(24 * time.Hour)
+				}
 				return nil
+			})
+			c.AddMaintenanceTask("test-after-purge", func(ctx context.Context, rt *hub.Runtime) error {
+				passes.Add(1)
+				run := starts.Load()
+				mu.Lock()
+				defer mu.Unlock()
+				if _, seen := purgedFirst[run]; seen {
+					return nil
+				}
+				id, _ := oldID.Load().(string)
+				var n int
+				err := rt.Store.Main().QueryRowContext(ctx, `SELECT count(*) FROM patches WHERE id = ?`, id).Scan(&n)
+				purgedFirst[run] = err == nil && id != "" && n == 0
+				return err
 			})
 		},
 	}, "p-old", "p-new")
+	oldID.Store(ids[0])
 	copyDir := filepath.Join(h.root, "carry.git")
 	gitrepotest.Git(t, copyDir, "update-ref", "refs/parley/replaced/p-old", "refs/heads/p-old")
 	oldTip := gitrepotest.Git(t, copyDir, "rev-parse", "refs/heads/p-old")
@@ -255,7 +281,6 @@ func TestPatchMaintenance_APassPurgesAPatchDeletedMoreThanSevenDaysAgo(t *testin
 	remove(ids[0])
 	clock.advance(7 * 24 * time.Hour)
 	remove(ids[1])
-	clock.advance(24 * time.Hour)
 
 	branchesListed := func() []string {
 		status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/carry/patches?include_deleted=true", h.key, nil)
@@ -269,22 +294,30 @@ func TestPatchMaintenance_APassPurgesAPatchDeletedMoreThanSevenDaysAgo(t *testin
 		}
 		return branches
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for !slices.Equal(branchesListed(), []string{"p-new"}) {
-		if time.Now().After(deadline) {
-			t.Fatalf("the patches with include_deleted=true are %v after 10 s, want p-new alone", branchesListed())
+	waitPasses := func(n int32) {
+		t.Helper()
+		from := passes.Load()
+		deadline := time.Now().Add(10 * time.Second)
+		for passes.Load() < from+n {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d maintenance passes reached the end within 10 s, want at least %d", passes.Load()-from, n)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(20 * time.Millisecond)
+	}
+	// Deleted exactly 7 days ago, p-old outlives the passes.
+	waitPasses(2)
+	if got := branchesListed(); !slices.Equal(got, []string{"p-new", "p-old"}) && !slices.Equal(got, []string{"p-old", "p-new"}) {
+		t.Fatalf("the patches with include_deleted=true before the restart are %v, want p-old and p-new", got)
 	}
 
 	h.Restart(t)
-	after := passes.Load()
-	deadline = time.Now().Add(10 * time.Second)
-	for passes.Load() < after+2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("%d maintenance passes reached the end after the restart within 10 s, want at least 2", passes.Load()-after)
-		}
-		time.Sleep(10 * time.Millisecond)
+	waitPasses(2)
+	mu.Lock()
+	first, seen := purgedFirst[2]
+	mu.Unlock()
+	if !seen || !first {
+		t.Errorf("the first maintenance pass after the restart found p-old's row purged: %v (pass seen: %v), want purged", first, seen)
 	}
 	if got := branchesListed(); !slices.Equal(got, []string{"p-new"}) {
 		t.Errorf("the patches with include_deleted=true after the restart are %v, want p-new alone", got)

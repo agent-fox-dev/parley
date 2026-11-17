@@ -129,158 +129,176 @@ func (a answer) ids() []string {
 // rerereID is a conflict id made of the hex digit d.
 func rerereID(d string) string { return strings.Repeat(d, 40) }
 
+// rerereListPath is the list route of the workspace %s.
+const rerereListPath = "/workspaces/%s/rerere"
+
 func TestRerereList(t *testing.T) {
 	t.Parallel()
 	h := startReadHub(t)
-	const list = "/workspaces/%s/rerere"
 
 	t.Run("every entry newest first, resolved as git holds it, and nothing changed or contacted", func(t *testing.T) {
 		t.Parallel()
-		origin, upstream := gitrepotest.NewOrigin(t), gitrepotest.NewOrigin(t)
-		h.add(t, "demo", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
-			w.GitURL, w.UpstreamURL = new(origin.URL()), new(upstream.URL())
-		})
-		copyDir := h.repoPath("demo")
-		gitrepotest.InitBare(t, copyDir, "")
-		rootsAt(t, copyDir, map[string]string{"refs/heads/deploy": "deploy"})
-		tie := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
-		entries := map[string]rerereEntry{
-			"A": {rerereID("a"), "src/a.go", tie, true},
-			"B": {rerereID("b"), "src/b.go", tie, false},
-			"C": {rerereID("c"), "src/c.go", tie.Add(time.Hour + 5*time.Second + 700*time.Millisecond), true},
-			"D": {rerereID("d"), "src/d.go", tie.Add(-time.Hour), false},
-		}
-		all := slices.Collect(maps.Values(entries))
-		h.recordAt(t, "demo", all...)
-		rrCacheOf(t, copyDir, all...)
-		rowsBefore, filesBefore := h.storedEntries(t, "demo"), filesIn(t, copyDir)
-
-		a := h.get(t, fmt.Sprintf(list, "demo"))
-		want := []string{entries["C"].id, entries["A"].id, entries["B"].id, entries["D"].id}
-		if a.status != http.StatusOK || !slices.Equal(a.ids(), want) || a.Next != nil {
-			t.Fatalf("GET rerere = %d %v next %v (%s), want 200 %v and no next_cursor", a.status, a.ids(), a.Next, a.raw, want)
-		}
-		wantItems := []map[string]any{
-			{"id": entries["C"].id, "path": "src/c.go", "resolved": true, "recorded_at": "2026-11-16T11:00:05Z"},
-			{"id": entries["A"].id, "path": "src/a.go", "resolved": true, "recorded_at": "2026-11-16T10:00:00Z"},
-			{"id": entries["B"].id, "path": "src/b.go", "resolved": false, "recorded_at": "2026-11-16T10:00:00Z"},
-			{"id": entries["D"].id, "path": "src/d.go", "resolved": false, "recorded_at": "2026-11-16T09:00:00Z"},
-		}
-		for i, it := range a.Items {
-			if !maps.Equal(it, wantItems[i]) {
-				t.Errorf("item %d = %v, want exactly %v", i, it, wantItems[i])
-			}
-		}
-		if got := h.storedEntries(t, "demo"); !slices.Equal(got, rowsBefore) {
-			t.Errorf("the entry rows after the list = %v, want them unchanged, %v", got, rowsBefore)
-		}
-		if got := filesIn(t, copyDir); !maps.Equal(got, filesBefore) {
-			t.Errorf("the files of the copy changed in the list: %v, want %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(filesBefore)))
-		}
-		if o, u := origin.Requests(), upstream.Requests(); o != 0 || u != 0 {
-			t.Errorf("the origin and the upstream received %d and %d requests, want none", o, u)
-		}
+		rerereListNewestFirst(t, h)
 	})
 
 	t.Run("an entry git cannot answer for is listed unresolved", func(t *testing.T) {
 		t.Parallel()
-		at := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
-		gone, broken := rerereEntry{rerereID("e"), "e.go", at, true}, rerereEntry{rerereID("f"), "f.go", at, true}
-		h.add(t, "nocopy", workspace.ModeCarryPatch, workspace.StatusFailed, workspace.MarkerNone)
-		h.recordAt(t, "nocopy", gone)
-		h.add(t, "broken", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone)
-		copyDir := h.repoPath("broken")
-		gitrepotest.InitBare(t, copyDir, "")
-		h.recordAt(t, "broken", gone, broken)
-		rrCacheOf(t, copyDir, gone)
-		// Git cannot read a conflict whose directory is a file.
-		if err := os.WriteFile(filepath.Join(copyDir, "rr-cache", broken.id), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		for slug, want := range map[string]map[string]bool{
-			"nocopy": {gone.id: false},
-			"broken": {gone.id: true, broken.id: false},
-		} {
-			a := h.get(t, fmt.Sprintf(list, slug))
-			if a.status != http.StatusOK || len(a.Items) != len(want) {
-				t.Errorf("GET rerere of %s = %d %s, want 200 with %d items", slug, a.status, a.raw, len(want))
-				continue
-			}
-			for _, it := range a.Items {
-				if it["resolved"] != want[fmt.Sprint(it["id"])] {
-					t.Errorf("%s lists %v resolved %v, want %v", slug, it["id"], it["resolved"], want[fmt.Sprint(it["id"])])
-				}
-			}
-		}
+		rerereListUnresolvedWhenGitCannotAnswer(t, h)
 	})
 
 	t.Run("pages hold every entry once, in the order of the list", func(t *testing.T) {
 		t.Parallel()
-		h.add(t, "paged", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone)
-		copyDir := h.repoPath("paged")
-		gitrepotest.InitBare(t, copyDir, "")
-		tie := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
-		entries := []rerereEntry{
-			{rerereID("1"), "1.go", tie, false},
-			{rerereID("2"), "2.go", tie, true},
-			{rerereID("3"), "3.go", tie, false},
-			{rerereID("4"), "4.go", tie.Add(time.Minute), false},
-			{rerereID("5"), "5.go", tie.Add(-time.Minute), true},
-		}
-		h.recordAt(t, "paged", entries...)
-		rrCacheOf(t, copyDir, entries...)
-
-		whole := h.get(t, fmt.Sprintf(list, "paged")+"?limit=200")
-		if whole.status != http.StatusOK || len(whole.Items) != 5 || whole.Next != nil {
-			t.Fatalf("GET rerere?limit=200 = %d %s, want 200 with 5 items and no next_cursor", whole.status, whole.raw)
-		}
-		var paged []string
-		cursor, pages := "", 0
-		for {
-			q := "?limit=2"
-			if cursor != "" {
-				q += "&cursor=" + url.QueryEscape(cursor)
-			}
-			a := h.get(t, fmt.Sprintf(list, "paged")+q)
-			if a.status != http.StatusOK {
-				t.Fatalf("GET rerere%s = %d %s, want 200", q, a.status, a.raw)
-			}
-			pages++
-			paged = append(paged, a.ids()...)
-			if a.Next == nil {
-				break
-			}
-			if len(a.Items) != 2 || pages > 5 {
-				t.Fatalf("page %d holds %v with a next_cursor, want 2 items and at most 3 pages", pages, a.ids())
-			}
-			cursor = *a.Next
-		}
-		if pages != 3 || !slices.Equal(paged, whole.ids()) {
-			t.Errorf("the pages of limit 2 hold %v over %d pages, want %v over 3", paged, pages, whole.ids())
-		}
+		rerereListPages(t, h)
 	})
 
 	t.Run("no entry is an empty list", func(t *testing.T) {
 		t.Parallel()
-		for _, tc := range []struct {
-			slug     string
-			status   workspace.Status
-			withCopy bool
-		}{
-			{"pending", workspace.StatusPending, false},
-			{"failed", workspace.StatusFailed, false},
-			{"empty", workspace.StatusReady, true},
-		} {
-			h.add(t, tc.slug, workspace.ModeCarryPatch, tc.status, workspace.MarkerNone)
-			if tc.withCopy {
-				gitrepotest.InitBare(t, h.repoPath(tc.slug), "")
-			}
-			a := h.get(t, fmt.Sprintf(list, tc.slug))
-			if a.status != http.StatusOK || !strings.Contains(string(a.raw), `"items":[]`) || a.Next != nil {
-				t.Errorf("GET rerere of a %s workspace = %d %s, want 200 with items [] and next_cursor null", tc.status, a.status, a.raw)
+		rerereListEmpty(t, h)
+	})
+}
+
+func rerereListNewestFirst(t *testing.T, h *readHub) {
+	origin, upstream := gitrepotest.NewOrigin(t), gitrepotest.NewOrigin(t)
+	h.add(t, "demo", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
+		w.GitURL, w.UpstreamURL = new(origin.URL()), new(upstream.URL())
+	})
+	copyDir := h.repoPath("demo")
+	gitrepotest.InitBare(t, copyDir, "")
+	rootsAt(t, copyDir, map[string]string{"refs/heads/deploy": "deploy"})
+	tie := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	entries := map[string]rerereEntry{
+		"A": {rerereID("a"), "src/a.go", tie, true},
+		"B": {rerereID("b"), "src/b.go", tie, false},
+		"C": {rerereID("c"), "src/c.go", tie.Add(time.Hour + 5*time.Second + 700*time.Millisecond), true},
+		"D": {rerereID("d"), "src/d.go", tie.Add(-time.Hour), false},
+	}
+	all := slices.Collect(maps.Values(entries))
+	h.recordAt(t, "demo", all...)
+	rrCacheOf(t, copyDir, all...)
+	rowsBefore, filesBefore := h.storedEntries(t, "demo"), filesIn(t, copyDir)
+
+	a := h.get(t, fmt.Sprintf(rerereListPath, "demo"))
+	want := []string{entries["C"].id, entries["A"].id, entries["B"].id, entries["D"].id}
+	if a.status != http.StatusOK || !slices.Equal(a.ids(), want) || a.Next != nil {
+		t.Fatalf("GET rerere = %d %v next %v (%s), want 200 %v and no next_cursor", a.status, a.ids(), a.Next, a.raw, want)
+	}
+	wantItems := []map[string]any{
+		{"id": entries["C"].id, "path": "src/c.go", "resolved": true, "recorded_at": "2026-11-16T11:00:05Z"},
+		{"id": entries["A"].id, "path": "src/a.go", "resolved": true, "recorded_at": "2026-11-16T10:00:00Z"},
+		{"id": entries["B"].id, "path": "src/b.go", "resolved": false, "recorded_at": "2026-11-16T10:00:00Z"},
+		{"id": entries["D"].id, "path": "src/d.go", "resolved": false, "recorded_at": "2026-11-16T09:00:00Z"},
+	}
+	for i, it := range a.Items {
+		if !maps.Equal(it, wantItems[i]) {
+			t.Errorf("item %d = %v, want exactly %v", i, it, wantItems[i])
+		}
+	}
+	if got := h.storedEntries(t, "demo"); !slices.Equal(got, rowsBefore) {
+		t.Errorf("the entry rows after the list = %v, want them unchanged, %v", got, rowsBefore)
+	}
+	if got := filesIn(t, copyDir); !maps.Equal(got, filesBefore) {
+		t.Errorf("the files of the copy changed in the list: %v, want %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(filesBefore)))
+	}
+	if o, u := origin.Requests(), upstream.Requests(); o != 0 || u != 0 {
+		t.Errorf("the origin and the upstream received %d and %d requests, want none", o, u)
+	}
+}
+
+func rerereListUnresolvedWhenGitCannotAnswer(t *testing.T, h *readHub) {
+	at := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	gone, broken := rerereEntry{rerereID("e"), "e.go", at, true}, rerereEntry{rerereID("f"), "f.go", at, true}
+	h.add(t, "nocopy", workspace.ModeCarryPatch, workspace.StatusFailed, workspace.MarkerNone)
+	h.recordAt(t, "nocopy", gone)
+	h.add(t, "broken", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone)
+	copyDir := h.repoPath("broken")
+	gitrepotest.InitBare(t, copyDir, "")
+	h.recordAt(t, "broken", gone, broken)
+	rrCacheOf(t, copyDir, gone)
+	// Git cannot read a conflict whose directory is a file.
+	if err := os.WriteFile(filepath.Join(copyDir, "rr-cache", broken.id), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for slug, want := range map[string]map[string]bool{
+		"nocopy": {gone.id: false},
+		"broken": {gone.id: true, broken.id: false},
+	} {
+		a := h.get(t, fmt.Sprintf(rerereListPath, slug))
+		if a.status != http.StatusOK || len(a.Items) != len(want) {
+			t.Errorf("GET rerere of %s = %d %s, want 200 with %d items", slug, a.status, a.raw, len(want))
+			continue
+		}
+		for _, it := range a.Items {
+			if it["resolved"] != want[fmt.Sprint(it["id"])] {
+				t.Errorf("%s lists %v resolved %v, want %v", slug, it["id"], it["resolved"], want[fmt.Sprint(it["id"])])
 			}
 		}
-	})
+	}
+}
+
+func rerereListPages(t *testing.T, h *readHub) {
+	h.add(t, "paged", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone)
+	copyDir := h.repoPath("paged")
+	gitrepotest.InitBare(t, copyDir, "")
+	tie := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	entries := []rerereEntry{
+		{rerereID("1"), "1.go", tie, false},
+		{rerereID("2"), "2.go", tie, true},
+		{rerereID("3"), "3.go", tie, false},
+		{rerereID("4"), "4.go", tie.Add(time.Minute), false},
+		{rerereID("5"), "5.go", tie.Add(-time.Minute), true},
+	}
+	h.recordAt(t, "paged", entries...)
+	rrCacheOf(t, copyDir, entries...)
+
+	whole := h.get(t, fmt.Sprintf(rerereListPath, "paged")+"?limit=200")
+	if whole.status != http.StatusOK || len(whole.Items) != 5 || whole.Next != nil {
+		t.Fatalf("GET rerere?limit=200 = %d %s, want 200 with 5 items and no next_cursor", whole.status, whole.raw)
+	}
+	var paged []string
+	cursor, pages := "", 0
+	for {
+		q := "?limit=2"
+		if cursor != "" {
+			q += "&cursor=" + url.QueryEscape(cursor)
+		}
+		a := h.get(t, fmt.Sprintf(rerereListPath, "paged")+q)
+		if a.status != http.StatusOK {
+			t.Fatalf("GET rerere%s = %d %s, want 200", q, a.status, a.raw)
+		}
+		pages++
+		paged = append(paged, a.ids()...)
+		if a.Next == nil {
+			break
+		}
+		if len(a.Items) != 2 || pages > 5 {
+			t.Fatalf("page %d holds %v with a next_cursor, want 2 items and at most 3 pages", pages, a.ids())
+		}
+		cursor = *a.Next
+	}
+	if pages != 3 || !slices.Equal(paged, whole.ids()) {
+		t.Errorf("the pages of limit 2 hold %v over %d pages, want %v over 3", paged, pages, whole.ids())
+	}
+}
+
+func rerereListEmpty(t *testing.T, h *readHub) {
+	for _, tc := range []struct {
+		slug     string
+		status   workspace.Status
+		withCopy bool
+	}{
+		{"pending", workspace.StatusPending, false},
+		{"failed", workspace.StatusFailed, false},
+		{"empty", workspace.StatusReady, true},
+	} {
+		h.add(t, tc.slug, workspace.ModeCarryPatch, tc.status, workspace.MarkerNone)
+		if tc.withCopy {
+			gitrepotest.InitBare(t, h.repoPath(tc.slug), "")
+		}
+		a := h.get(t, fmt.Sprintf(rerereListPath, tc.slug))
+		if a.status != http.StatusOK || !strings.Contains(string(a.raw), `"items":[]`) || a.Next != nil {
+			t.Errorf("GET rerere of a %s workspace = %d %s, want 200 with items [] and next_cursor null", tc.status, a.status, a.raw)
+		}
+	}
 }
 
 // dialFile is the file of the conflict the rebuild tests of the entries
@@ -396,177 +414,217 @@ func rowsWithout(rows []string, entries ...rerereEntry) []string {
 func TestRerereForget(t *testing.T) {
 	t.Parallel()
 	h := startRebuildHub(t)
-	const list = "/workspaces/%s/rerere"
-	when := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
-
 	// Runs before the parallel subtests, so that the git commands of the
 	// hub are this subtest's alone.
 	t.Run("an empty or option-like pathspec is refused before anything is read", func(t *testing.T) {
-		e := rerereEntry{rerereID("a"), "-rf", when, true}
-		dir := h.rerereCopy(t, "flags", e)
-		h.add(t, "flagsbusy", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerArchive)
-		h.add(t, "flagsplain", workspace.ModeStandard, workspace.StatusReady, workspace.MarkerNone)
-		rows, files, git := h.storedEntries(t, "flags"), filesIn(t, dir), h.gitCommands()
-		for _, slug := range []string{"flags", "flagsbusy", "flagsplain"} {
-			for _, pathspec := range []string{"", "-rf", "--all", "%2Dx"} {
-				a := h.forget(t, slug, pathspec)
-				if a.status != http.StatusBadRequest || a.Error.ErrorType != "invalid_request" {
-					t.Errorf("DELETE rerere/%s of %s = %d %s, want 400 invalid_request", pathspec, slug, a.status, a.raw)
-				}
-			}
-		}
-		if got := h.storedEntries(t, "flags"); !slices.Equal(got, rows) {
-			t.Errorf("the entry rows after the refusals = %v, want them unchanged, %v", got, rows)
-		}
-		if got := filesIn(t, dir); !maps.Equal(got, files) {
-			t.Errorf("the files of the copy changed in the refusals: %v", slices.Sorted(maps.Keys(got)))
-		}
-		if got := h.gitCommands(); !slices.Equal(got, git) {
-			t.Errorf("the hub ran git in the refusals: %q", got[len(git):])
-		}
+		forgetRefusesAnEmptyOrOptionLikePathspec(t, h)
 	})
-
 	t.Run("an id removes its entry alone, also beside an entry whose path is that id", func(t *testing.T) {
 		t.Parallel()
-		x, y := rerereEntry{rerereID("1"), "src/x.go", when, true}, rerereEntry{rerereID("2"), "src/y.go", when, false}
-		z := rerereEntry{rerereID("3"), x.id, when.Add(time.Minute), true}
-		dir := h.rerereCopy(t, "byid", x, y, z)
-		rows, files := h.storedEntries(t, "byid"), filesIn(t, dir)
-
-		if a := h.forget(t, "byid", x.id); a.status != http.StatusNoContent || len(a.raw) != 0 {
-			t.Fatalf("DELETE rerere/<id of X> = %d %q, want 204 with an empty body", a.status, a.raw)
-		}
-		if ids := h.get(t, fmt.Sprintf(list, "byid")).ids(); slices.Contains(ids, x.id) || !slices.Contains(ids, y.id) || !slices.Contains(ids, z.id) {
-			t.Errorf("the list after the forget of X holds %v, want Y and Z and not X", ids)
-		}
-		if got, want := h.storedEntries(t, "byid"), rowsWithout(rows, x); !slices.Equal(got, want) {
-			t.Errorf("the entry rows after the forget of X = %v, want %v", got, want)
-		}
-		if got, want := filesIn(t, dir), filesWithout(files, x); !maps.Equal(got, want) {
-			t.Errorf("the files of the copy after the forget of X = %v, want %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
-		}
+		forgetByID(t, h)
 	})
-
 	t.Run("a path removes every entry of that path, compared byte for byte", func(t *testing.T) {
 		t.Parallel()
-		dial1, dial2 := rerereEntry{rerereID("4"), "src/net/dial.go", when, true}, rerereEntry{rerereID("5"), "src/net/dial.go", when, false}
-		listen, readMe := rerereEntry{rerereID("6"), "src/net/listen.go", when, true}, rerereEntry{rerereID("7"), "docs/read me.md", when, true}
-		for i, tc := range []struct {
-			pathspec, path string
-			removed        []rerereEntry
-		}{
-			{"src/net/dial.go", "src/net/dial.go", []rerereEntry{dial1, dial2}},
-			{"docs/read%20me.md", "docs/read me.md", []rerereEntry{readMe}},
-		} {
-			slug := fmt.Sprintf("bypath%d", i)
-			dir := h.rerereCopy(t, slug, dial1, dial2, listen, readMe)
-			rows, files := h.storedEntries(t, slug), filesIn(t, dir)
-			if a := h.forget(t, slug, tc.pathspec); a.status != http.StatusNoContent || len(a.raw) != 0 {
-				t.Errorf("DELETE rerere/%s = %d %q, want 204 with an empty body", tc.pathspec, a.status, a.raw)
-				continue
-			}
-			l := h.get(t, fmt.Sprintf(list, slug))
-			paths := make([]any, 0, len(l.Items))
-			for _, it := range l.Items {
-				paths = append(paths, it["path"])
-			}
-			if slices.Contains(paths, any(tc.path)) || !slices.Contains(paths, any(listen.path)) {
-				t.Errorf("the list after DELETE rerere/%s holds the paths %v, want none %q and %q still", tc.pathspec, paths, tc.path, listen.path)
-			}
-			if got, want := h.storedEntries(t, slug), rowsWithout(rows, tc.removed...); !slices.Equal(got, want) {
-				t.Errorf("the entry rows after DELETE rerere/%s = %v, want %v", tc.pathspec, got, want)
-			}
-			if got, want := filesIn(t, dir), filesWithout(files, tc.removed...); !maps.Equal(got, want) {
-				t.Errorf("the files of the copy after DELETE rerere/%s = %v, want %v", tc.pathspec, slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
-			}
-		}
+		forgetByPath(t, h)
 	})
-
 	t.Run("a pathspec that is no entry's id or path is not found and removes nothing", func(t *testing.T) {
 		t.Parallel()
-		x := rerereEntry{rerereID("8"), "src/net/dial.go", when, true}
-		dirs := map[string]string{"nomatch": h.rerereCopy(t, "nomatch", x), "noentry": h.rerereCopy(t, "noentry")}
-		for slug, pathspecs := range map[string][]string{
-			// The dots are escaped, so that they reach the hub as they are.
-			"nomatch": {rerereID("9"), "src/other.go", "src/net", "SRC/NET/DIAL.GO", "%2E%2E/rr-cache/" + x.id, "%2E%2E", "refs/heads/main"},
-			"noentry": {x.id, x.path},
-		} {
-			rows, files := h.storedEntries(t, slug), filesIn(t, dirs[slug])
-			for _, pathspec := range pathspecs {
-				a := h.forget(t, slug, pathspec)
-				if a.status != http.StatusNotFound || a.Error.ErrorType != "not_found" || a.Error.Message != "resolution not found" {
-					t.Errorf("DELETE rerere/%s of %s = %d %s, want 404 not_found 'resolution not found'", pathspec, slug, a.status, a.raw)
-				}
-			}
-			if got := h.storedEntries(t, slug); !slices.Equal(got, rows) {
-				t.Errorf("the entry rows of %s after the refusals = %v, want them unchanged, %v", slug, got, rows)
-			}
-			if got := filesIn(t, dirs[slug]); !maps.Equal(got, files) {
-				t.Errorf("the files of the copy of %s changed in the refusals: %v", slug, slices.Sorted(maps.Keys(got)))
-			}
-		}
+		forgetNotFound(t, h)
 	})
-
 	t.Run("a forget touches no job, patch or ref and writes no event", func(t *testing.T) {
 		t.Parallel()
-		h.carryWith(t, "quiet", nil, carrypatch.StatusActive, carrypatch.StatusActive)
-		dir := h.repoPath("quiet")
-		gitrepotest.InitBare(t, dir, "")
-		rootsAt(t, dir, map[string]string{"refs/heads/deploy": "deploy", "refs/heads/patch/1": "p1", "refs/heads/patch/2": "p2"})
-		completed := h.queueRebuild(t, "quiet")
-		h.drive(t, completed, jobs.StatusCompleted)
-		h.queueRebuild(t, "quiet")
-		e1, e2 := rerereEntry{rerereID("b"), "a.go", when, true}, rerereEntry{rerereID("c"), "b.go", when, false}
-		h.recordAt(t, "quiet", e1, e2)
-		rrCacheOf(t, dir, e1, e2)
-		for _, tc := range []struct {
-			name, pathspec string
-			status         int
-		}{
-			{"by id", e1.id, http.StatusNoContent},
-			{"by path", e2.path, http.StatusNoContent},
-			{"answered 404", "c.go", http.StatusNotFound},
-		} {
-			before := h.previewState(t, "quiet")
-			if a := h.forget(t, "quiet", tc.pathspec); a.status != tc.status {
-				t.Errorf("the forget %s = %d %s, want %d", tc.name, a.status, a.raw, tc.status)
-			}
-			if after := h.previewState(t, "quiet"); !reflect.DeepEqual(after, before) {
-				t.Errorf("the forget %s changed the refs, patches, jobs or the event log:\n got %+v\nwant %+v", tc.name, after, before)
-			}
-		}
+		forgetTouchesNothingElse(t, h)
 	})
-
 	t.Run("two forgets of one entry at once remove it once", func(t *testing.T) {
 		t.Parallel()
-		dir := h.rerereCopy(t, "race")
-		for i := range 50 {
-			e := rerereEntry{fmt.Sprintf("%040x", i+1), "race.go", when, true}
-			h.recordAt(t, "race", e)
-			rrCacheOf(t, dir, e)
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-			statuses := make([]int, 2)
-			for j := range statuses {
-				wg.Go(func() {
-					<-start
-					statuses[j] = h.forget(t, "race", e.id).status
-				})
-			}
-			close(start)
-			wg.Wait()
-			slices.Sort(statuses)
-			if !slices.Equal(statuses, []int{204, 204}) && !slices.Equal(statuses, []int{204, 404}) {
-				t.Errorf("round %d: two forgets at once answered %v, want 204 and 204 or 404", i, statuses)
-			}
-			if ids := h.get(t, fmt.Sprintf(list, "race")).ids(); slices.Contains(ids, e.id) {
-				t.Errorf("round %d: the list after the forgets holds %v, want the entry gone", i, ids)
-			}
-			if _, err := os.Stat(filepath.Join(dir, "rr-cache", e.id)); !os.IsNotExist(err) {
-				t.Errorf("round %d: rr-cache/%s after the forgets: %v, want it gone", i, e.id, err)
+		forgetRacingForget(t, h)
+	})
+	t.Run("a resolution learned again while the forget runs goes with its entry", func(t *testing.T) {
+		t.Parallel()
+		forgetRacingALearningRebuild(t, h)
+	})
+}
+
+// forgetWhen is the time the forget tests record their entries at.
+var forgetWhen = time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+
+func forgetRefusesAnEmptyOrOptionLikePathspec(t *testing.T, h *rebuildHub) {
+	e := rerereEntry{rerereID("a"), "-rf", forgetWhen, true}
+	dir := h.rerereCopy(t, "flags", e)
+	rows, files, git := h.storedEntries(t, "flags"), filesIn(t, dir), h.gitCommands()
+	for _, pathspec := range []string{"", "-rf", "--all", "%2Dx"} {
+		a := h.forget(t, "flags", pathspec)
+		if a.status != http.StatusBadRequest || a.Error.ErrorType != "invalid_request" {
+			t.Errorf("DELETE rerere/%s = %d %s, want 400 invalid_request", pathspec, a.status, a.raw)
+		}
+	}
+	if got := h.storedEntries(t, "flags"); !slices.Equal(got, rows) {
+		t.Errorf("the entry rows after the refusals = %v, want them unchanged, %v", got, rows)
+	}
+	if got := filesIn(t, dir); !maps.Equal(got, files) {
+		t.Errorf("the files of the copy changed in the refusals: %v", slices.Sorted(maps.Keys(got)))
+	}
+	if got := h.gitCommands(); !slices.Equal(got, git) {
+		t.Errorf("the hub ran git in the refusals: %q", got[len(git):])
+	}
+}
+
+func forgetByID(t *testing.T, h *rebuildHub) {
+	x, y := rerereEntry{rerereID("1"), "src/x.go", forgetWhen, true}, rerereEntry{rerereID("2"), "src/y.go", forgetWhen, false}
+	z := rerereEntry{rerereID("3"), x.id, forgetWhen.Add(time.Minute), true}
+	dir := h.rerereCopy(t, "byid", x, y, z)
+	rows, files := h.storedEntries(t, "byid"), filesIn(t, dir)
+
+	if a := h.forget(t, "byid", x.id); a.status != http.StatusNoContent || len(a.raw) != 0 {
+		t.Fatalf("DELETE rerere/<id of X> = %d %q, want 204 with an empty body", a.status, a.raw)
+	}
+	if ids := h.get(t, fmt.Sprintf(rerereListPath, "byid")).ids(); slices.Contains(ids, x.id) || !slices.Contains(ids, y.id) || !slices.Contains(ids, z.id) {
+		t.Errorf("the list after the forget of X holds %v, want Y and Z and not X", ids)
+	}
+	if got, want := h.storedEntries(t, "byid"), rowsWithout(rows, x); !slices.Equal(got, want) {
+		t.Errorf("the entry rows after the forget of X = %v, want %v", got, want)
+	}
+	if got, want := filesIn(t, dir), filesWithout(files, x); !maps.Equal(got, want) {
+		t.Errorf("the files of the copy after the forget of X = %v, want %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
+	}
+}
+
+func forgetByPath(t *testing.T, h *rebuildHub) {
+	dial1, dial2 := rerereEntry{rerereID("4"), "src/net/dial.go", forgetWhen, true}, rerereEntry{rerereID("5"), "src/net/dial.go", forgetWhen, false}
+	listen, readMe := rerereEntry{rerereID("6"), "src/net/listen.go", forgetWhen, true}, rerereEntry{rerereID("7"), "docs/read me.md", forgetWhen, true}
+	for i, tc := range []struct {
+		pathspec, path string
+		removed        []rerereEntry
+	}{
+		{"src/net/dial.go", "src/net/dial.go", []rerereEntry{dial1, dial2}},
+		{"docs/read%20me.md", "docs/read me.md", []rerereEntry{readMe}},
+	} {
+		slug := fmt.Sprintf("bypath%d", i)
+		dir := h.rerereCopy(t, slug, dial1, dial2, listen, readMe)
+		rows, files := h.storedEntries(t, slug), filesIn(t, dir)
+		if a := h.forget(t, slug, tc.pathspec); a.status != http.StatusNoContent || len(a.raw) != 0 {
+			t.Errorf("DELETE rerere/%s = %d %q, want 204 with an empty body", tc.pathspec, a.status, a.raw)
+			continue
+		}
+		l := h.get(t, fmt.Sprintf(rerereListPath, slug))
+		paths := make([]any, 0, len(l.Items))
+		for _, it := range l.Items {
+			paths = append(paths, it["path"])
+		}
+		if slices.Contains(paths, any(tc.path)) || !slices.Contains(paths, any(listen.path)) {
+			t.Errorf("the list after DELETE rerere/%s holds the paths %v, want none %q and %q still", tc.pathspec, paths, tc.path, listen.path)
+		}
+		if got, want := h.storedEntries(t, slug), rowsWithout(rows, tc.removed...); !slices.Equal(got, want) {
+			t.Errorf("the entry rows after DELETE rerere/%s = %v, want %v", tc.pathspec, got, want)
+		}
+		if got, want := filesIn(t, dir), filesWithout(files, tc.removed...); !maps.Equal(got, want) {
+			t.Errorf("the files of the copy after DELETE rerere/%s = %v, want %v", tc.pathspec, slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
+		}
+	}
+}
+
+func forgetNotFound(t *testing.T, h *rebuildHub) {
+	x := rerereEntry{rerereID("8"), "src/net/dial.go", forgetWhen, true}
+	dirs := map[string]string{"nomatch": h.rerereCopy(t, "nomatch", x), "noentry": h.rerereCopy(t, "noentry")}
+	for slug, pathspecs := range map[string][]string{
+		// The dots are escaped, so that they reach the hub as they are.
+		"nomatch": {rerereID("9"), "src/other.go", "src/net", "SRC/NET/DIAL.GO", "%2E%2E/rr-cache/" + x.id, "%2E%2E", "refs/heads/main"},
+		"noentry": {x.id, x.path},
+	} {
+		rows, files := h.storedEntries(t, slug), filesIn(t, dirs[slug])
+		for _, pathspec := range pathspecs {
+			a := h.forget(t, slug, pathspec)
+			if a.status != http.StatusNotFound || a.Error.ErrorType != "not_found" || a.Error.Message != "resolution not found" {
+				t.Errorf("DELETE rerere/%s of %s = %d %s, want 404 not_found 'resolution not found'", pathspec, slug, a.status, a.raw)
 			}
 		}
+		if got := h.storedEntries(t, slug); !slices.Equal(got, rows) {
+			t.Errorf("the entry rows of %s after the refusals = %v, want them unchanged, %v", slug, got, rows)
+		}
+		if got := filesIn(t, dirs[slug]); !maps.Equal(got, files) {
+			t.Errorf("the files of the copy of %s changed in the refusals: %v", slug, slices.Sorted(maps.Keys(got)))
+		}
+	}
+}
+
+func forgetTouchesNothingElse(t *testing.T, h *rebuildHub) {
+	h.carryWith(t, "quiet", nil, carrypatch.StatusActive, carrypatch.StatusActive)
+	dir := h.repoPath("quiet")
+	gitrepotest.InitBare(t, dir, "")
+	rootsAt(t, dir, map[string]string{"refs/heads/deploy": "deploy", "refs/heads/patch/1": "p1", "refs/heads/patch/2": "p2"})
+	completed := h.queueRebuild(t, "quiet")
+	h.drive(t, completed, jobs.StatusCompleted)
+	h.queueRebuild(t, "quiet")
+	e1, e2 := rerereEntry{rerereID("b"), "a.go", forgetWhen, true}, rerereEntry{rerereID("c"), "b.go", forgetWhen, false}
+	h.recordAt(t, "quiet", e1, e2)
+	rrCacheOf(t, dir, e1, e2)
+	for _, tc := range []struct {
+		name, pathspec string
+		status         int
+	}{
+		{"by id", e1.id, http.StatusNoContent},
+		{"by path", e2.path, http.StatusNoContent},
+		{"answered 404", "c.go", http.StatusNotFound},
+	} {
+		before := h.previewState(t, "quiet")
+		if a := h.forget(t, "quiet", tc.pathspec); a.status != tc.status {
+			t.Errorf("the forget %s = %d %s, want %d", tc.name, a.status, a.raw, tc.status)
+		}
+		if after := h.previewState(t, "quiet"); !reflect.DeepEqual(after, before) {
+			t.Errorf("the forget %s changed the refs, patches, jobs or the event log:\n got %+v\nwant %+v", tc.name, after, before)
+		}
+	}
+}
+
+func forgetRacingForget(t *testing.T, h *rebuildHub) {
+	dir := h.rerereCopy(t, "race")
+	for i := range 50 {
+		e := rerereEntry{fmt.Sprintf("%040x", i+1), "race.go", forgetWhen, true}
+		h.recordAt(t, "race", e)
+		rrCacheOf(t, dir, e)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		statuses := make([]int, 2)
+		for j := range statuses {
+			wg.Go(func() {
+				<-start
+				statuses[j] = h.forget(t, "race", e.id).status
+			})
+		}
+		close(start)
+		wg.Wait()
+		slices.Sort(statuses)
+		if !slices.Equal(statuses, []int{204, 204}) && !slices.Equal(statuses, []int{204, 404}) {
+			t.Errorf("round %d: two forgets at once answered %v, want 204 and 204 or 404", i, statuses)
+		}
+		if ids := h.get(t, fmt.Sprintf(rerereListPath, "race")).ids(); slices.Contains(ids, e.id) {
+			t.Errorf("round %d: the list after the forgets holds %v, want the entry gone", i, ids)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "rr-cache", e.id)); !os.IsNotExist(err) {
+			t.Errorf("round %d: rr-cache/%s after the forgets: %v, want it gone", i, e.id, err)
+		}
+	}
+}
+
+func forgetRacingALearningRebuild(t *testing.T, h *rebuildHub) {
+	e := rerereEntry{rerereID("d"), "src/relearn.go", forgetWhen, true}
+	dir := h.rerereCopy(t, "relearn", e)
+	// A rebuild that meets the conflict between git's removal and the
+	// store's writes the resolution again, and its entry with it.
+	h.onForgetRecord("relearn", func(id string) {
+		if id == e.id {
+			rrCacheOf(t, dir, e)
+		}
 	})
+	if a := h.forget(t, "relearn", e.id); a.status != http.StatusNoContent {
+		t.Fatalf("DELETE rerere/<id> = %d %s, want 204", a.status, a.raw)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "rr-cache", e.id)); !os.IsNotExist(err) {
+		t.Errorf("rr-cache/%s after the forget: %v, want it gone with its entry", e.id, err)
+	}
+	if rows := h.storedEntries(t, "relearn"); len(rows) != 0 {
+		t.Errorf("the entry rows after the forget = %v, want none", rows)
+	}
 }
 
 func TestRerereForget_ARebuildAfterTheForgetMeetsTheConflictAgain(t *testing.T) {

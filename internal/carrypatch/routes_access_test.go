@@ -82,11 +82,31 @@ func (h *rebuildHub) refused(t *testing.T, rt workspaceRoute, credential, slug s
 	return a
 }
 
-// The rows share one hub and its workspaces, set up first, and run one
-// after the other, so that the git commands the hub runs during a row are
-// that row's alone.
-func TestResolutionAndStatusRoutes_RefuseCallersAndWorkspacesTheyDoNotServe(t *testing.T) {
-	t.Parallel()
+// unreadyWorkspace is a carry-patch workspace outside the ready state,
+// which holds the entry, and a copy where the state has one; want is the
+// error_type a forget there answers.
+type unreadyWorkspace struct {
+	slug   string
+	status workspace.Status
+	marker workspace.Marker
+	copy   bool
+	want   string
+}
+
+// routesFixture is a rebuild hub with the workspaces the refusals of the
+// resolution and status routes are sent to: demo, a ready carry-patch
+// workspace holding entry, the standard workspace plain, task forks of
+// both, and the unready workspaces.
+type routesFixture struct {
+	h       *rebuildHub
+	entry   rerereEntry
+	unready []unreadyWorkspace
+	routes  []workspaceRoute
+	demo    entriesState
+}
+
+func startRoutesFixture(t *testing.T) *routesFixture {
+	t.Helper()
 	h := startRebuildHub(t)
 	entry := rerereEntry{rerereID("a"), "src/a.go", time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), true}
 	h.rerereCopy(t, "demo", entry)
@@ -100,15 +120,7 @@ func TestResolutionAndStatusRoutes_RefuseCallersAndWorkspacesTheyDoNotServe(t *t
 			w.Kind, w.ParentSlug, w.GitURL = access.KindFork, new(f.parent), nil
 		})
 	}
-	// Carry-patch workspaces outside the ready state, each with the entry,
-	// and a copy where the state has one.
-	unready := []struct {
-		slug   string
-		status workspace.Status
-		marker workspace.Marker
-		copy   bool
-		want   string // the forget's error_type
-	}{
+	unready := []unreadyWorkspace{
 		{"pending", workspace.StatusPending, workspace.MarkerNone, false, "workspace_busy"},
 		{"cloning", workspace.StatusCloning, workspace.MarkerNone, false, "workspace_busy"},
 		{"recloning", workspace.StatusReady, workspace.MarkerReclone, true, "workspace_busy"},
@@ -126,107 +138,140 @@ func TestResolutionAndStatusRoutes_RefuseCallersAndWorkspacesTheyDoNotServe(t *t
 			h.recordAt(t, s.slug, entry)
 		}
 	}
-	routes := resolutionRoutes(entry.id)
-	demo := h.entriesState(t, "demo")
-	listed := func(t *testing.T) {
-		t.Helper()
-		if a := routes[0].send(t, h, h.key, "demo"); a.status != http.StatusOK || !slices.Equal(a.ids(), []string{entry.id}) {
-			t.Errorf("GET rerere of demo as the owner = %d %s, want the entry %s", a.status, a.raw, entry.id)
-		}
-		h.keptEntries(t, "demo", demo)
+	return &routesFixture{h: h, entry: entry, unready: unready, routes: resolutionRoutes(entry.id), demo: h.entriesState(t, "demo")}
+}
+
+// listed fails the test unless the owner's list of demo still holds the
+// entry and the entries of demo are as they were.
+func (f *routesFixture) listed(t *testing.T) {
+	t.Helper()
+	if a := f.routes[0].send(t, f.h, f.h.key, "demo"); a.status != http.StatusOK || !slices.Equal(a.ids(), []string{f.entry.id}) {
+		t.Errorf("GET rerere of demo as the owner = %d %s, want the entry %s", a.status, a.raw, f.entry.id)
 	}
+	f.h.keptEntries(t, "demo", f.demo)
+}
+
+// The rows share one hub and its workspaces, set up first, and run one
+// after the other, so that the git commands the hub runs during a row are
+// that row's alone.
+func TestResolutionAndStatusRoutes_RefuseCallersAndWorkspacesTheyDoNotServe(t *testing.T) {
+	t.Parallel()
+	f := startRoutesFixture(t)
 
 	t.Run("a token without the scope of the route is refused, whether the workspace exists or not", func(t *testing.T) {
-		patchesRead := h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"patches:read"}})
-		rebuildsRead := h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"rebuilds:read"}})
-		workspacesRead := h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"workspaces:read"}})
-		for _, c := range []struct {
-			name, credential string
-			routes           []workspaceRoute
-		}{
-			{"patches:read only", patchesRead, routes},
-			{"rebuilds:read only", rebuildsRead, routes},
-			{"workspaces:read only", workspacesRead, routes[2:]},
-		} {
-			for _, rt := range c.routes {
-				for _, slug := range []string{"demo", "nosuch"} {
-					t.Run(c.name+"/"+rt.String()+"/"+slug, func(t *testing.T) {
-						h.refused(t, rt, c.credential, slug, http.StatusForbidden, "insufficient_scope")
-					})
-				}
-			}
-		}
-		listed(t)
+		routesRefuseATokenWithoutTheScope(t, f)
 	})
 
 	t.Run("a caller without access learns nothing and a reader may not forget", func(t *testing.T) {
-		member := h.CreateUser(t, "member")
-		h.AddMember(t, h.org, member)
-		memberKey := h.IssueKey(t, member)
-		outsiderKey := h.IssueKey(t, h.CreateUser(t, "outsider"))
-		for _, rt := range routes {
-			t.Run("a user outside the organization/"+rt.String(), func(t *testing.T) {
-				outsider := h.refused(t, rt, outsiderKey, "demo", http.StatusNotFound, "not_found")
-				unknown := h.refused(t, rt, h.key, "nosuch", http.StatusNotFound, "not_found")
-				if string(outsider.raw) != string(unknown.raw) {
-					t.Errorf("%s answered the outsider %s and the owner on nosuch %s, want the same", rt, outsider.raw, unknown.raw)
-				}
-			})
-			t.Run("a member with read access/"+rt.String(), func(t *testing.T) {
-				if rt.write {
-					h.refused(t, rt, memberKey, "demo", http.StatusForbidden, "forbidden")
-					return
-				}
-				if a := rt.send(t, h, memberKey, "demo"); a.status != http.StatusOK {
-					t.Errorf("%s on demo as a member with read access = %d %s, want 200", rt, a.status, a.raw)
-				}
-			})
-		}
-		listed(t)
+		routesRefuseACallerWithoutAccess(t, f)
 	})
 
 	t.Run("a workspace not in carry-patch mode is refused", func(t *testing.T) {
-		for _, slug := range []string{"plain", "plain-fork", "demo-fork"} {
-			for _, rt := range resolutionRoutes("abc") {
-				t.Run(slug+"/"+rt.String(), func(t *testing.T) {
-					h.refused(t, rt, h.key, slug, http.StatusBadRequest, "workspace_mode_mismatch")
-				})
-			}
-		}
-		listed(t)
+		routesRefuseAWorkspaceNotInCarryPatchMode(t, f)
 	})
 
-	t.Run("a forget outside a ready workspace is refused and the reads are served", func(t *testing.T) {
-		for _, s := range unready {
-			t.Run(s.slug, func(t *testing.T) {
-				before := h.entriesState(t, s.slug)
-				h.refused(t, routes[2], h.key, s.slug, http.StatusConflict, s.want)
-				h.keptEntries(t, s.slug, before)
-				if _, err := os.Stat(filepath.Join(h.repoPath(s.slug), "rr-cache", entry.id)); s.copy && err != nil {
-					t.Errorf("the entry's directory in the copy of %s: %v, want it kept", s.slug, err)
-				}
-				for _, rt := range routes[:2] {
-					if a := rt.send(t, h, h.key, s.slug); a.status != http.StatusOK {
-						t.Errorf("%s on %s = %d %s, want 200: a read serves in every state", rt, s.slug, a.status, a.raw)
-					}
-				}
-			})
-		}
+	t.Run("a forget outside a ready workspace is refused and the list is served", func(t *testing.T) {
+		routesRefuseAForgetOutsideAReadyWorkspace(t, f)
 	})
 
 	t.Run("a forget checks the request, then the mode, then the state", func(t *testing.T) {
-		for _, c := range []struct {
-			name, slug, pathspec string
-			status               int
-			want                 string
-		}{
-			{"an option-like pathspec on a standard workspace", "plain", "-x", http.StatusBadRequest, "invalid_request"},
-			{"a valid pathspec on an archived task fork", "demo-fork-archived", entry.id, http.StatusBadRequest, "workspace_mode_mismatch"},
-			{"an option-like pathspec on an archived carry-patch workspace", "archived", "-x", http.StatusBadRequest, "invalid_request"},
-		} {
-			t.Run(c.name, func(t *testing.T) {
-				h.refused(t, workspaceRoute{http.MethodDelete, "/rerere/" + c.pathspec, true}, h.key, c.slug, c.status, c.want)
+		routesForgetChecksInOrder(t, f)
+	})
+}
+
+func routesRefuseATokenWithoutTheScope(t *testing.T, f *routesFixture) {
+	h := f.h
+	patchesRead := h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"patches:read"}})
+	rebuildsRead := h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"rebuilds:read"}})
+	workspacesRead := h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"workspaces:read"}})
+	for _, c := range []struct {
+		name, credential string
+		routes           []workspaceRoute
+	}{
+		{"patches:read only", patchesRead, f.routes},
+		{"rebuilds:read only", rebuildsRead, f.routes},
+		{"workspaces:read only", workspacesRead, f.routes[2:]},
+	} {
+		for _, rt := range c.routes {
+			for _, slug := range []string{"demo", "nosuch"} {
+				t.Run(c.name+"/"+rt.String()+"/"+slug, func(t *testing.T) {
+					h.refused(t, rt, c.credential, slug, http.StatusForbidden, "insufficient_scope")
+				})
+			}
+		}
+	}
+	f.listed(t)
+}
+
+func routesRefuseACallerWithoutAccess(t *testing.T, f *routesFixture) {
+	h := f.h
+	member := h.CreateUser(t, "member")
+	h.AddMember(t, h.org, member)
+	memberKey := h.IssueKey(t, member)
+	outsiderKey := h.IssueKey(t, h.CreateUser(t, "outsider"))
+	for _, rt := range f.routes {
+		t.Run("a user outside the organization/"+rt.String(), func(t *testing.T) {
+			outsider := h.refused(t, rt, outsiderKey, "demo", http.StatusNotFound, "not_found")
+			unknown := h.refused(t, rt, h.key, "nosuch", http.StatusNotFound, "not_found")
+			if string(outsider.raw) != string(unknown.raw) {
+				t.Errorf("%s answered the outsider %s and the owner on nosuch %s, want the same", rt, outsider.raw, unknown.raw)
+			}
+		})
+		t.Run("a member with read access/"+rt.String(), func(t *testing.T) {
+			if rt.write {
+				h.refused(t, rt, memberKey, "demo", http.StatusForbidden, "forbidden")
+				return
+			}
+			if a := rt.send(t, h, memberKey, "demo"); a.status != http.StatusOK {
+				t.Errorf("%s on demo as a member with read access = %d %s, want 200", rt, a.status, a.raw)
+			}
+		})
+	}
+	f.listed(t)
+}
+
+func routesRefuseAWorkspaceNotInCarryPatchMode(t *testing.T, f *routesFixture) {
+	h := f.h
+	for _, slug := range []string{"plain", "plain-fork", "demo-fork"} {
+		for _, rt := range resolutionRoutes("abc") {
+			t.Run(slug+"/"+rt.String(), func(t *testing.T) {
+				h.refused(t, rt, h.key, slug, http.StatusBadRequest, "workspace_mode_mismatch")
 			})
 		}
-	})
+	}
+	f.listed(t)
+}
+
+func routesRefuseAForgetOutsideAReadyWorkspace(t *testing.T, f *routesFixture) {
+	h := f.h
+	for _, s := range f.unready {
+		t.Run(s.slug, func(t *testing.T) {
+			before := h.entriesState(t, s.slug)
+			h.refused(t, f.routes[2], h.key, s.slug, http.StatusConflict, s.want)
+			h.keptEntries(t, s.slug, before)
+			if _, err := os.Stat(filepath.Join(h.repoPath(s.slug), "rr-cache", f.entry.id)); s.copy && err != nil {
+				t.Errorf("the entry's directory in the copy of %s: %v, want it kept", s.slug, err)
+			}
+			if a := f.routes[0].send(t, h, h.key, s.slug); a.status != http.StatusOK {
+				t.Errorf("%s on %s = %d %s, want 200: the list serves in every state", f.routes[0], s.slug, a.status, a.raw)
+			}
+		})
+	}
+}
+
+func routesForgetChecksInOrder(t *testing.T, f *routesFixture) {
+	h := f.h
+	for _, c := range []struct {
+		name, slug, pathspec string
+		status               int
+		want                 string
+	}{
+		{"an option-like pathspec on a standard workspace", "plain", "-x", http.StatusBadRequest, "invalid_request"},
+		{"a valid pathspec on an archived task fork", "demo-fork-archived", f.entry.id, http.StatusBadRequest, "workspace_mode_mismatch"},
+		{"an option-like pathspec on an archived carry-patch workspace", "archived", "-x", http.StatusBadRequest, "invalid_request"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h.refused(t, workspaceRoute{http.MethodDelete, "/rerere/" + c.pathspec, true}, h.key, c.slug, c.status, c.want)
+		})
+	}
 }

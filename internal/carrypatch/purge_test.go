@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -254,6 +255,10 @@ func TestPurgeDeletedPatches_KeepsAPatchItCannotRemoveAndPurgesTheOthers(t *test
 				}
 			}
 		}},
+		{"the transaction fails after the backup ref is deleted", func(_ *testing.T, _ string, p carrypatch.Patch) func() {
+			h.refFault.Store(p.ID, errors.New("the transaction fails after the ref's deletion"))
+			return func() { h.refFault.Delete(p.ID) }
+		}},
 		{"the store refuses the delete", func(t *testing.T, _ string, p carrypatch.Patch) func() {
 			h.exec(t, fmt.Sprintf(`CREATE TRIGGER refuse_purge BEFORE DELETE ON patches WHEN OLD.id = '%s'
 BEGIN SELECT RAISE(ABORT, 'the store refuses the delete'); END`, p.ID))
@@ -318,6 +323,9 @@ type purgeHub struct {
 	*addHub
 	comp *carrypatch.Component
 	hook atomic.Pointer[func(slug, id string)]
+	// refFault is the error the purge's transaction of the patch it names
+	// fails with once its backup ref is deleted.
+	refFault sync.Map
 
 	gitMu   sync.Mutex
 	gitDirs []string
@@ -344,6 +352,12 @@ func startPurgeHub(t *testing.T) *purgeHub {
 					if fn := h.hook.Load(); fn != nil {
 						(*fn)(slug, id)
 					}
+				}
+				d.AfterPurgeRef = func(_, id string) error {
+					if err, ok := h.refFault.Load(id); ok {
+						return err.(error)
+					}
+					return nil
 				}
 				trace := d.Git.Trace
 				d.Git.Trace = func(args []string) {
@@ -460,16 +474,6 @@ func (h *purgeHub) exec(t *testing.T, stmt string) {
 	}); err != nil {
 		t.Fatalf("%s: %v", stmt, err)
 	}
-}
-
-// eventCount is the number of events the hub stored.
-func (h *purgeHub) eventCount(t *testing.T) int {
-	t.Helper()
-	var n int
-	if err := h.Store.Main().QueryRow(`SELECT count(*) FROM hub_events`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
 }
 
 // storedIDs are the ids of every stored patch, sorted.

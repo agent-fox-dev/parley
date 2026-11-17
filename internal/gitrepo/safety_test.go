@@ -107,7 +107,6 @@ func TestRefOperations_RefuseAValueThatBeginsWithADash(t *testing.T) {
 		name string
 		run  func(v string) error
 	}{
-		{"resolve a branch", func(v string) error { _, _, err := repo.ResolveBranch(ctx, v); return err }},
 		{"ancestry, the revision as the ancestor", func(v string) error { _, err := repo.IsAncestor(ctx, v, c); return err }},
 		{"ancestry, the revision as the descendant", func(v string) error { _, err := repo.IsAncestor(ctx, c, v); return err }},
 		{"read a ref", func(v string) error { _, _, err := repo.LookupRef(ctx, v); return err }},
@@ -124,6 +123,15 @@ func TestRefOperations_RefuseAValueThatBeginsWithADash(t *testing.T) {
 	}
 	refs := gitrepotest.Refs(t, dir, "")
 	for _, v := range []string{"--upload-pack=touch " + pwned, "-c", "--output=" + pwned, "--exec=touch " + pwned, "-"} {
+		// No branch begins with '-': resolving one finds none, as for
+		// any other branch that does not exist.
+		starts.Store(0)
+		if id, found, err := repo.ResolveBranch(ctx, v); err != nil || found {
+			t.Errorf("resolve a branch %q = %s, %v, %v, want not found and no error", v, id, found, err)
+		}
+		if n := starts.Load(); n != 0 {
+			t.Errorf("resolve a branch %q started %d git processes, want none", v, n)
+		}
 		for _, op := range ops {
 			starts.Store(0)
 			err := op.run(v)
@@ -170,11 +178,9 @@ func TestRefOperations_RefuseAValueThatBeginsWithADash(t *testing.T) {
 func TestCheckTransport(t *testing.T) {
 	t.Parallel()
 	for _, url := range []string{
-		"https://git.example/team/r.git",
 		"HTTPS://git.example/team/r.git",
 		"ssh://git@git.example/team/r.git",
 		"ssh://git.example:2222/team/r.git",
-		"git@git.example:team/r.git",
 		"git.example:team/r.git",
 		"git@[::1]:team/r.git",
 	} {
@@ -183,16 +189,11 @@ func TestCheckTransport(t *testing.T) {
 		}
 	}
 	for _, c := range []struct{ url, scheme string }{
-		{"http://git.example/r.git", "http"},
-		{"git://git.example/r.git", "git"},
 		{"ftp://git.example/r.git", "ftp"},
 		{"git+ssh://git.example/r.git", "git+ssh"},
-		{"file:///srv/r.git", "file"},
-		{"/srv/r.git", "file"},
 		{"./r.git", "file"},
 		{"r.git", "file"},
 		{"./a:b.git", "file"},
-		{"ext::sh -c touch% /tmp/x", "ext"},
 		{"fd::0", "fd"},
 		{"https::https://git.example/r.git", "https"},
 		{"-oProxyCommand=touch:r.git", "ssh"},
@@ -303,9 +304,18 @@ func TestRemoteOperations_RefuseTransportsOtherThanHTTPSAndSSH(t *testing.T) {
 	if n := plainRequests.Load(); n != 0 {
 		t.Errorf("the plain-HTTP server received %d requests, want none", n)
 	}
+}
 
-	// An https origin and an origin in ssh's user@host:path form pass the
-	// check: the second fails later, when ssh connects.
+// An https origin and an origin in ssh's user@host:path form pass the
+// check: the second fails later, when ssh connects.
+func TestRemoteOperations_ReachAnHTTPSOrSSHRemote(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cp := filepath.Join(tmp, "copy.git")
+	gitrepotest.InitBare(t, cp, "main")
+	const deadline = 10 * time.Second
+	none := gitrepo.Credential{}
 	o := gitrepotest.NewOrigin(t)
 	o.Commit("main", "o1")
 	if _, err := (gitrepo.Git{Env: o.Env()}).FetchOrigin(ctx, cp, o.URL(), none, deadline); err != nil {

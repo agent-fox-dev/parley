@@ -152,6 +152,12 @@ func (c *Component) forgetRerereRoute(w http.ResponseWriter, r *http.Request) er
 // resolution git would replay without an entry that shows it. An entry
 // already gone, from the store or from git, counts as removed: of two
 // forgets of one entry at once, neither fails.
+//
+// A rebuild running meanwhile may learn a resolution again after git's
+// record is removed and store its entry before the transaction removes
+// that: git's record is removed once more after the transaction commits.
+// A rebuild that writes it after that also stores its entry after the
+// transaction, so the entry stays and shows the resolution.
 func (c *Component) forgetRerere(ctx context.Context, slug string, entries []RerereEntry) error {
 	if c.d.Store == nil || c.d.RepoPath == nil {
 		return errNotBound
@@ -163,20 +169,40 @@ func (c *Component) forgetRerere(ctx context.Context, slug string, entries []Rer
 	case err != nil:
 		return err
 	default:
-		for _, e := range entries {
-			if err := RunGit(ctx, 0, gitrepo.Credential{}, func(context.Context, time.Duration) error {
-				return repo.ForgetRerere(e.ID)
-			}); err != nil {
-				return err
+		if err := forgetRerereRecords(ctx, repo, entries); err != nil {
+			return err
+		}
+		if c.d.BeforeRerereForgetRecord != nil {
+			for _, e := range entries {
+				c.d.BeforeRerereForgetRecord(slug, e.ID)
 			}
 		}
 	}
-	return c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
+	if err := c.d.Store.Tx(ctx, func(tx *sql.Tx) error {
 		for _, e := range entries {
 			if _, err := RemoveRerereEntry(ctx, tx, slug, e.ID); err != nil {
 				return err
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if repo == nil {
+		return nil
+	}
+	return forgetRerereRecords(ctx, repo, entries)
+}
+
+// forgetRerereRecords removes git's record of the conflict of each of the
+// entries from repo; a record already gone counts as removed.
+func forgetRerereRecords(ctx context.Context, repo *gitrepo.Repo, entries []RerereEntry) error {
+	for _, e := range entries {
+		if err := RunGit(ctx, 0, gitrepo.Credential{}, func(context.Context, time.Duration) error {
+			return repo.ForgetRerere(e.ID)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

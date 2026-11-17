@@ -207,14 +207,15 @@ func (r *Repo) SetDefaultBranch(ctx context.Context, branch string) error {
 }
 
 // ResolveBranch is the commit id branch points at; found is false, with no
-// error, when there is no such branch or it points at no commit. A branch
-// that begins with '-' is ErrInvalidArgument, and no git runs.
+// error, when there is no such branch or it points at no commit. No branch
+// name begins with '-', so such a branch is not found, and no git runs:
+// callers answer it as the missing branch it is.
 //
 // It reads the branch from git's files ref backend in process, as git
 // does, and asks git only about what it does not read that way.
 func (r *Repo) ResolveBranch(ctx context.Context, branch string) (id string, found bool, err error) {
-	if err := refuseOption("branch", branch); err != nil {
-		return "", false, err
+	if strings.HasPrefix(branch, "-") {
+		return "", false, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return "", false, err

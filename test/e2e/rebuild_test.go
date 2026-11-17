@@ -253,6 +253,14 @@ func TestRebuild_ConflictThenLearnedResolution(t *testing.T) {
 
 	// The developer reads what the hub learned from the shell, and takes it
 	// back.
+	h.forgetTheLearnedResolution(t, copyDir)
+}
+
+// forgetTheLearnedResolution lists acme-fork's remembered resolutions from
+// the shell, which hold one resolved entry for a.txt, forgets the path, and
+// checks that the list, the store and the copy's rr-cache hold none.
+func (h *workspaceHub) forgetTheLearnedResolution(t *testing.T, copyDir string) {
+	t.Helper()
 	listed := h.run(t, "rerere", "list", "acme-fork")
 	items, _ := listed.json(t)["items"].([]any)
 	entry, _ := firstOf(items).(map[string]any)

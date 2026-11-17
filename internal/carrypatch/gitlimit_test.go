@@ -295,12 +295,17 @@ func TestRebuild_EndsAnAttemptWhoseGitOperationOutlastsTheLimitAsRetryable(t *te
 
 func TestRebuild_HoldsEachGitOperationToTheLimitAndNotTheirSum(t *testing.T) {
 	t.Parallel()
-	const limit, delay = 500 * time.Millisecond, 100 * time.Millisecond
+	// The first delayed operations sum past the limit, and each keeps more
+	// than a second of it for git itself, which a loaded machine needs for
+	// a replay of several git processes.
+	const limit, delay, delayed = 3 * time.Second, 1200 * time.Millisecond, 3
 	var ops atomic.Int64
 	f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
 		d.RebuildGitDeadline = limit
 		d.BeforeRebuildGit = func(ctx context.Context) {
-			ops.Add(1)
+			if ops.Add(1) > delayed {
+				return
+			}
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -321,8 +326,8 @@ func TestRebuild_HoldsEachGitOperationToTheLimitAndNotTheirSum(t *testing.T) {
 	if j := f.job(t, id); j.Status != jobs.StatusCompleted {
 		t.Errorf("the job has status %s, want completed", j.Status)
 	}
-	if n := ops.Load(); time.Duration(n)*delay <= limit || took <= limit {
-		t.Errorf("the attempt ran %d git operations, delayed by %v each, in %v; want them to sum to more than %v", n, delay, took, limit)
+	if n := ops.Load(); n < delayed || took <= limit {
+		t.Errorf("the attempt ran %d git operations, the first %d delayed by %v each, in %v; want them to sum to more than %v", n, delayed, delay, took, limit)
 	}
 	if res := f.result(t, id); res["patches_applied"] != float64(3) {
 		t.Errorf("patches_applied = %v, want 3", res["patches_applied"])
