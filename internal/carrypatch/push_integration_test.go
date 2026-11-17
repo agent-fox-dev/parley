@@ -248,6 +248,47 @@ func TestGitPush_QueuesARebuildOnlyAfterTheClientHasItsAnswer(t *testing.T) {
 	}
 }
 
+func TestLand_IsBlockedOntoAPatchBranchSyncedFromOriginWithoutForwarding(t *testing.T) {
+	t.Parallel()
+	f := startPushFixture(t, func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{"patch_branch_source": json.RawMessage(`"origin"`)}
+	})
+	tips := f.registerPatches(t, "patch/a")
+	fix := gitrepotest.Commit(t, f.copy, "fix tls", map[string]string{"tls.txt": "fix\n"}, tips["patch/a"])
+	gitrepotest.SetRef(t, f.copy, "refs/heads/fix/tls", fix)
+	if status, raw := f.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/changes", f.key, map[string]any{
+		"source": map[string]any{"branch": "fix/tls"}, "target_branch": "patch/a",
+		"title": "Fix TLS patch", "intent": "Fix the TLS patch.",
+	}); status != http.StatusCreated {
+		t.Fatalf("open the change from fix/tls onto patch/a = %d %s, want 201", status, raw)
+	}
+
+	status, raw := f.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/changes/1/land", f.key, map[string]any{})
+	var answer struct {
+		Error struct {
+			ErrorType string `json:"error_type"`
+			Details   struct {
+				Status string `json:"status"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &answer); err != nil || status != http.StatusConflict ||
+		answer.Error.ErrorType != "policy_blocked" || answer.Error.Details.Status != "blocked" {
+		t.Errorf("land the change = %d %s, want 409 policy_blocked with the attempt blocked", status, raw)
+	}
+	// The attempt does not show a guard's reason; its land_fail event does.
+	want := "branch is synced from origin; push to " + f.origin.URL() + " instead"
+	if evs := f.rebuildEvents(t, f.slug, "parley.change.land_fail"); len(evs) != 1 || evs[0].Metadata["reason"] != want {
+		t.Errorf("parley.change.land_fail events = %+v, want one with the reason %q", evs, want)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/a"); got != tips["patch/a"] {
+		t.Errorf("hub's patch/a = %s after the blocked land, want %s", got, tips["patch/a"])
+	}
+	if got := f.rebuildJobs(t); len(got) != 0 {
+		t.Errorf("rebuild jobs %+v after the blocked land, want none", got)
+	}
+}
+
 // anyPushSession is a push session linker that accepts every session.
 type anyPushSession struct{}
 

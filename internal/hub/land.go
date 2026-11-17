@@ -59,9 +59,11 @@ const (
 // them onto its landed commit, and the fork feature's activity recorder
 // (RecordActivity), told of each landed change whose source is a task
 // fork. Both open their own store transaction; the hooks are called
-// outside any. No policy gate, override rule, request guard, target guard
-// or final observer is registered: every change is ready to land, an
-// override passes nothing and every request and move is allowed.
+// outside any. No policy gate, override rule, request guard or final
+// observer is registered here: every change is ready to land, an override
+// passes nothing and every request is allowed. The carry-patch part
+// (composeCarryPatch), composed after this one, registers a target guard,
+// which judges a land onto a patch branch, and an after-landing hook.
 //
 // The source control API's session lookup (commitSessions) is set here
 // through AdjustSCM, since it asks the change records and the land

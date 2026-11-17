@@ -149,3 +149,27 @@ the same run is pushed is pushed by the trigger of the request that moved
 it, which runs after this one under the same per-workspace lock, so origin
 still ends at the hub's last head. A successful push whose head is already
 the recorded origin head writes no record.
+
+## A blocked land shows its reason in its event, not in its answer
+
+The package has a land onto a patch branch synced from origin, without
+forwarding, answer 409 with a text that holds `branch is synced from origin;
+push to <git_url> instead`. The landing (package 25) answers a blocked
+attempt with 409 `policy_blocked`, the message `land attempt <id>: the
+landing of <ref> is blocked` and the attempt as its details, and a target
+guard's reason is not a member of the attempt object. The reason is the
+`reason` of the attempt's `parley.change.land_fail` event. The guard
+answers the reason as the package says; the land route is package 25's and
+stays as it is. The hub's test asserts the 409, `policy_blocked`, the
+attempt's status `blocked` and the reason in the `land_fail` event.
+
+## The landing hook runs the trigger on a goroutine of its own
+
+The landing calls its after-landing hooks synchronously when the attempt
+does not run on its pool, so a trigger run in the hook, which may push to
+origin for up to 120 s, would delay the land's answer. The hub's
+after-landing hook starts the trigger (source `land`, the landing's
+session) on a goroutine of its own and returns at once, with a context that
+is not the attempt's, which ends with the attempt, but one that ends when
+the hub's stop begins, as the post-push listener's does. A land that moved
+nothing (`before` equal to `after`) triggers nothing.

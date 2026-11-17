@@ -5,6 +5,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
+	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -53,6 +54,17 @@ const carryPatchHook = "carry_patch"
 // after-landing hook. Its context ends when the hub's stop begins
 // (ShuttingDown), since the stop does not wait for it and the stores close
 // after the stop; a mirror cut off so reports nothing.
+// The component's landing guard (LandGuard) is registered with the landing
+// as a target guard, which holds a land onto a patch branch to the rules a
+// push of it obeys before the land moves the branch: blocked when origin is
+// the branches' authority without push_patches_to_origin, and with it
+// allowed only once the forward of the new head to origin succeeded, failed
+// origin_rejected otherwise. The trigger is registered as an after-landing
+// hook too, with the source land and the landing's session: for a land
+// that moved its target it runs on a goroutine of its own, so that the
+// land's answer never waits for it, with a context that ends when the
+// hub's stop begins, as the listener's does; a land that moved nothing
+// triggers nothing.
 // A workspace's delete removes its patches
 // and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
@@ -90,6 +102,20 @@ func composeCarryPatch(c *Composition) {
 		ctx, cancel := untilShutdown(ctx, c.ShuttingDown())
 		defer cancel()
 		return listen(ctx, p)
+	})
+	c.Land().AddTargetGuard(comp.LandGuard())
+	trigger := comp.Trigger()
+	c.Land().AddAfterLanding(func(ctx context.Context, in land.AfterLanding) error {
+		if in.Update.Before == in.Update.After {
+			return nil
+		}
+		ctx, cancel := untilShutdown(context.WithoutCancel(ctx), c.ShuttingDown())
+		updates := []pushrule.Update{{Ref: in.Update.Ref, Before: in.Update.Before, After: in.Update.After}}
+		go func() {
+			defer cancel()
+			trigger.AfterUpdates(ctx, in.Workspace, updates, carrypatch.SourceLand, in.SessionID)
+		}()
+		return nil
 	})
 	c.workspaces.RegisterSyncExtension(comp)
 	c.workspaces.RegisterExcludedBranchProvider(comp)
