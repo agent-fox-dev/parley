@@ -354,6 +354,19 @@ func TestRefresh_OriginFieldsNull(t *testing.T) {
 			t.Errorf("patch/b's origin_sync_state = %s, want in_sync", got)
 		}
 	})
+	t.Run("a patch upstream merged in this sync", func(t *testing.T) {
+		t.Parallel()
+		f, a, b := setUp(t)
+		f.upstreamTo(t, refIn(f.copy, "refs/heads/patch/a"))
+		wantMerged(t, f.mustSync(t), "patch/a")
+		wantNull(t, f, a)
+		if got := f.stored(t, a.ID).Status; got != carrypatch.StatusMergedUpstream {
+			t.Errorf("patch/a's status = %s, want merged_upstream", got)
+		}
+		if got := str(f.stored(t, b.ID).OriginSyncState); got != "in_sync" {
+			t.Errorf("patch/b's origin_sync_state = %s, want in_sync", got)
+		}
+	})
 }
 
 // wantSyncEvent checks that the event e reports the refresh outcome entry

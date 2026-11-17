@@ -1244,11 +1244,15 @@ func (r *rebuildRunner) Settled(_ context.Context, _ *sql.Tx, j jobs.Job, _ bool
 }
 
 // histCommit is a commit writeHistory writes: on top of the commit of the
-// earlier entry at index from (-1 for a root commit), whose tree it takes
-// with files holding the content given and deleted removed; refs are the
-// full names of the refs that end at it.
+// earlier entry at index from, or, for from -1, of the commit parent the
+// repository holds already (a root commit when parent is ""), whose tree
+// it takes with files holding the content given and deleted removed; refs
+// are the full names of the refs that end at it, and msg its message,
+// c<index> when "".
 type histCommit struct {
 	from    int
+	parent  string
+	msg     string
 	files   map[string]string
 	deleted []string
 	refs    []string
@@ -1264,9 +1268,16 @@ func writeHistory(t *testing.T, dir string, commits []histCommit) []string {
 	for i, c := range commits {
 		// Each commit has a branch of its own, so that a root commit has no
 		// parent; the resets at the end leave those branches unwritten.
-		fmt.Fprintf(&s, "commit refs/history/%d\nmark :%d\ncommitter T <t@example.invalid> 1700000000 +0000\n%s", i, i+1, data(fmt.Sprintf("c%d\n", i)))
-		if c.from >= 0 {
+		msg := c.msg
+		if msg == "" {
+			msg = fmt.Sprintf("c%d", i)
+		}
+		fmt.Fprintf(&s, "commit refs/history/%d\nmark :%d\ncommitter T <t@example.invalid> 1700000000 +0000\n%s", i, i+1, data(msg+"\n"))
+		switch {
+		case c.from >= 0:
 			fmt.Fprintf(&s, "from :%d\n", c.from+1)
+		case c.parent != "":
+			fmt.Fprintf(&s, "from %s\n", c.parent)
 		}
 		for _, name := range slices.Sorted(maps.Keys(c.files)) {
 			fmt.Fprintf(&s, "M 100644 inline %s\n%s", name, data(c.files[name]))
@@ -1442,6 +1453,70 @@ func (f *syncFixture) originBranch(t *testing.T, branch, id string) {
 	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.origin.Dir(), id+":refs/heads/"+branch)
 }
 
+// upstreamTo moves the upstream's main to the commit id, which the hub's
+// copy holds, whether or not that is a fast-forward.
+func (f *syncFixture) upstreamTo(t *testing.T, id string) {
+	t.Helper()
+	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.upstream.Dir(), id+":refs/heads/main")
+	gitrepotest.Git(t, f.upstream.Dir(), "update-server-info")
+}
+
+// wantMerged fails the test unless the answer's patches_merged is want.
+func wantMerged(t *testing.T, a syncAnswer, want ...string) {
+	t.Helper()
+	if want == nil {
+		want = []string{}
+	}
+	if got := a.merged(t); !slices.Equal(got, want) {
+		t.Errorf("patches_merged = %q, want %q", got, want)
+	}
+}
+
+// commitOn writes into the hub's copy a commit on parent with msg that
+// writes the files given, and returns it.
+func (f *syncFixture) commitOn(t *testing.T, parent, msg string, files map[string]string) string {
+	t.Helper()
+	return gitrepotest.Commit(t, f.copy, msg, files, parent)
+}
+
+// setStatus stores status on the patch id, as an update would leave it.
+func (f *syncFixture) setStatus(t *testing.T, id, status string) {
+	t.Helper()
+	if _, err := f.Store.Main().Exec(`UPDATE patches SET status = ? WHERE id = ?`, status, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// upstreamChain writes into the hub's copy a line of commits on parent (a
+// root commit first when parent is ""), the k-th of them, from 0, the
+// pull request commit with the subject "Fix the dialer (#7)", and returns
+// the last; all are written in one run of git fast-import.
+func (f *syncFixture) upstreamChain(t *testing.T, label, parent string, n, k int) string {
+	t.Helper()
+	commits := make([]histCommit, n)
+	for i := range commits {
+		commits[i] = histCommit{from: i - 1, msg: fmt.Sprintf("%s: upstream %d", label, i),
+			files: map[string]string{"up.txt": fmt.Sprintf("%s %d\n", label, i)}}
+		if i == 0 {
+			commits[i].parent = parent
+		}
+		if i == k {
+			commits[i].msg = "Fix the dialer (#7)"
+		}
+	}
+	ids := writeHistory(t, f.copy, commits)
+	return ids[n-1]
+}
+
+// addPatchOn stores an active patch of branch at the end of the patch
+// list, changed by edit, whose branch in the hub's copy holds one commit
+// on base that adds a file of its own, and returns it.
+func (f *syncFixture) addPatchOn(t *testing.T, branch, base string, edit ...func(p *carrypatch.Patch)) carrypatch.Patch {
+	t.Helper()
+	file := strings.ReplaceAll(branch, "/", "-") + ".txt"
+	return f.putPatch(t, branch, f.commitOn(t, base, branch, map[string]string{file: branch + "\n"}), edit...)
+}
+
 // setSettings sets the workspace's settings given through the workspace
 // update route, as the owner.
 func (f *syncFixture) setSettings(t *testing.T, settings map[string]any) {
@@ -1517,6 +1592,18 @@ func (a syncAnswer) branches(t *testing.T) map[string]string {
 		results[name], _ = entry["result"].(string)
 	}
 	return results
+}
+
+// merged is the answer's patches_merged, in the answer's order.
+func (a syncAnswer) merged(t *testing.T) []string {
+	t.Helper()
+	var body struct {
+		Merged *[]string `json:"patches_merged"`
+	}
+	if err := json.Unmarshal(a.raw, &body); err != nil || body.Merged == nil {
+		t.Fatalf("the answer %s has no patches_merged list: %v", a.raw, err)
+	}
+	return *body.Merged
 }
 
 // syncedEntry is one entry of a sync answer's patches_synced.
