@@ -11,6 +11,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -171,17 +172,20 @@ func (p *patchStub) readCount() int {
 	return p.reads
 }
 
-// forwardStub records the forwards it is asked to run.
+// forwardStub records the forwards it is asked to run, and the repository
+// each was handed.
 type forwardStub struct {
 	mu    sync.Mutex
 	calls []string
+	repos []*gitrepo.Repo
 	err   error
 }
 
-func (f *forwardStub) Forward(_ context.Context, slug, branch, commit string) error {
+func (f *forwardStub) Forward(_ context.Context, repo *gitrepo.Repo, w workspace.Workspace, branch, commit string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, slug+" "+branch+" "+commit)
+	f.calls = append(f.calls, w.Slug+" "+branch+" "+commit)
+	f.repos = append(f.repos, repo)
 	return f.err
 }
 
@@ -403,13 +407,18 @@ func TestPushControl_ForwardsAPatchBranchSyncedFromOriginOnlyAfterDeciding(t *te
 			continue
 		}
 		// The forward is bound to the workspace, the branch and the update's
-		// after commit, and its failure is the forward's.
+		// after commit, pushes from the repository the ref writer hands it,
+		// and its failure is the forward's.
 		f.forwards.err = errors.New("origin rejected push: frozen")
-		if err := d.Forward(context.Background()); err == nil || err.Error() != "origin rejected push: frozen" {
+		repo := new(gitrepo.Repo)
+		if err := d.Forward(context.Background(), repo); err == nil || err.Error() != "origin rejected push: frozen" {
 			t.Errorf("%s: the forward returned %v, want the forwarder's error", u.name, err)
 		}
 		if got, want := f.forwards.asked(), []string{"demo patch/a " + u.after}; !slices.Equal(got, want) {
 			t.Errorf("%s: forwarded %q, want %q", u.name, got, want)
+		}
+		if len(f.forwards.repos) != 1 || f.forwards.repos[0] != repo {
+			t.Errorf("%s: the forwarder was handed %v, want the ref writer's repository", u.name, f.forwards.repos)
 		}
 	}
 

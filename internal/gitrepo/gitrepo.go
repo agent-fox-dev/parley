@@ -99,7 +99,8 @@ func (g Git) Clone(ctx context.Context, url string, cred Credential, dir string)
 }
 
 // Repo is a repository on disk, opened with Git.Open. Its methods run git on
-// it alone: never against origin and never with a credential.
+// it alone, never against origin and never with a credential, except Push,
+// which pushes one of its commits to origin.
 type Repo struct {
 	g   Git
 	dir string

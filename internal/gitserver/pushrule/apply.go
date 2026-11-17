@@ -279,7 +279,7 @@ func (w *Writer) Apply(ctx context.Context, req ApplyRequest) (Result, error) {
 	if req.Repo == nil {
 		return res.internal(), errors.New("apply: no repository to write to")
 	}
-	if refusedRes, ok, err := res.forward(ctx, deps.ForwardLimit, req.Verdict.Decisions); !ok {
+	if refusedRes, ok, err := res.forward(ctx, deps.ForwardLimit, req.Repo, req.Verdict.Decisions); !ok {
 		return refusedRes, err
 	}
 	wr := &written{entry: journalEntryOf(req), updates: req.Verdict.Decisions}
@@ -369,15 +369,16 @@ func writeRefs(ctx context.Context, deps WriterDeps, stages []RefUpdatedStage, l
 }
 
 // forward runs the pending forwards of ds to origin, in command order, each
-// under limit (DefaultForwardLimit when zero), and reports whether all of
-// them went through. The first that fails, or has not finished when its
+// under limit (DefaultForwardLimit when zero) and handed repo, the
+// repository the request writes to, and reports whether all of them went
+// through. The first that fails, or has not finished when its
 // limit passes, stops the request: no later forward runs, the earlier ones
 // are left as origin has them, since a forward cannot be taken back, and
 // the result refuses that update with the forward's message, or the
 // timed-out one, as patch_branch, and the others as not updated. A forward
 // is expected to end when its context does. When ctx itself ends, every
 // update is refused as internal with ctx's error.
-func (r Result) forward(ctx context.Context, limit time.Duration, ds []Decision) (Result, bool, error) {
+func (r Result) forward(ctx context.Context, limit time.Duration, repo *gitrepo.Repo, ds []Decision) (Result, bool, error) {
 	if limit <= 0 {
 		limit = DefaultForwardLimit
 	}
@@ -386,7 +387,7 @@ func (r Result) forward(ctx context.Context, limit time.Duration, ds []Decision)
 			continue
 		}
 		fctx, cancel := context.WithTimeout(ctx, limit)
-		err := d.Forward(fctx)
+		err := d.Forward(fctx, repo)
 		timedOut := errors.Is(fctx.Err(), context.DeadlineExceeded)
 		cancel()
 		var message string

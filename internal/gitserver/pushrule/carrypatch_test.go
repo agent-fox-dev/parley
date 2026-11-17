@@ -49,7 +49,7 @@ func TestEvaluate_TakesTheCarryPatchControllersAnswerForWhatRulesOneToThreeAllow
 		if d.Forward == nil {
 			continue
 		}
-		if err := d.Forward(context.Background()); err != nil {
+		if err := d.Forward(context.Background(), r.view); err != nil {
 			t.Fatal(err)
 		}
 		if _, forwarded := cp.counts(); forwarded != 1 {

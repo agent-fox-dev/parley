@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -45,11 +46,14 @@ type PatchReader interface {
 	LivePatchOfBranch(ctx context.Context, slug, branch string) (p Patch, found bool, err error)
 }
 
-// Forwarder pushes commit to refs/heads/<branch> on the origin of the
-// workspace slug, without force, and returns nil once origin took it, or an
-// error whose text is the message the update is refused with.
+// Forwarder pushes commit, read from repo, to refs/heads/<branch> on the
+// origin of the workspace w, without force, and returns nil once origin
+// took it, or an error whose text is the message the update is refused
+// with. repo is the repository the update is written to, which holds the
+// commit (for a git push the view of its quarantine); nil is the hub's
+// copy of the workspace, for an update whose commit is already there.
 type Forwarder interface {
-	Forward(ctx context.Context, slug, branch, commit string) error
+	Forward(ctx context.Context, repo *gitrepo.Repo, w workspace.Workspace, branch, commit string) error
 }
 
 // PushControl is the carry-patch controller of the push rules: it decides
@@ -65,9 +69,10 @@ type PushControl struct {
 }
 
 // PushControl is the component's carry-patch controller, which reads the
-// component's own store and settings registry.
+// component's own store and settings registry and forwards with the
+// component's Forward.
 func (c *Component) PushControl() *PushControl {
-	return &PushControl{Records: c, Settings: c, Patches: c}
+	return &PushControl{Records: c, Settings: c, Patches: c, Forwarder: c}
 }
 
 // Decide answers for one update of the carry-patch workspace ws:
@@ -127,9 +132,9 @@ func (p *PushControl) Decide(ctx context.Context, ws pushrule.Workspace, _ pushr
 	case p.Forwarder == nil:
 		return pushrule.Answer{}, fmt.Errorf("decide %s of %s: %w", u.Ref, ws.Slug, errNoForwarder)
 	}
-	f, slug, after := p.Forwarder, ws.Slug, u.After
-	return pushrule.AllowAfterForward(func(ctx context.Context) error {
-		return f.Forward(ctx, slug, branch, after)
+	f, after := p.Forwarder, u.After
+	return pushrule.AllowAfterForward(func(ctx context.Context, repo *gitrepo.Repo) error {
+		return f.Forward(ctx, repo, rec, branch, after)
 	}), nil
 }
 

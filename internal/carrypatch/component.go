@@ -107,6 +107,10 @@ type Deps struct {
 	// DefaultGitDeadline as the deadline of each git operation of a rebuild
 	// attempt; only tests set it.
 	RebuildGitDeadline time.Duration
+	// ForwardLimit, when positive and shorter, replaces DefaultForwardLimit
+	// as the limit of a forward of a patch branch to origin; only tests set
+	// it.
+	ForwardLimit time.Duration
 	// Scrubber removes credentials from the text of a rebuild's failure and
 	// of its events before they are stored; nil is a scrubber that knows no
 	// secret value of the hub's, which still removes the values given to
