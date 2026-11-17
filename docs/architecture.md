@@ -28,6 +28,7 @@ command-line client. Both are written in Go, in the module
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, `CallWith` does so with added request headers and `Exchange` also returns the answer's headers, and `LogBuffer` holds a running hub's log for the test to read |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
+| `internal/jobs` | the durable job queue: jobs of a type and workspace with an opaque payload and result, stored in the transactional store (`SchemaStep`), enqueued with one pending job per type and workspace (`Enqueue`, `EnqueueFollowUp`, `DuplicateError`), claimed by a dispatcher (`Run`, `Pass`) that runs at most 4 attempts at once and one per type and workspace on the handler registered for the type (`Handler`, `Register`), settled as `completed`, `failed` with backoff or `dead_letter` (`Permanent`, `WithDetail`), recovered at start (`Recover`), stopped with a 30-second grace, counted (`Depth`), cancelled, requeued and removed with their workspace (see [Durable jobs](#durable-jobs)) |
 | `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the run again at a start of the attempts a stop left running (`recover.go`, `Recover`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, the read routes of the attempts per change, per workspace and by id, and the reads of a change's current conflict report and of a `content` file of it as text with conflict markers (`current_conflict.go`, `conflict_handlers.go`); and the rules around landing (see [Land rules](#land-rules)): the path limit of a path-scoped token (`pathlimit.go`: `CheckPaths`, the version-files lookup `VersionFiles()` of the push rule engine, and `PathGuard()`, the restack's version guard and a request guard), the override (`override.go`: `OverrideGuard()`, a request guard, and `PendingOverride`, the override rule), the automatic lander (`autoland.go`: `AutoLander`, `AutoLandStep`) and the revert route (`revert.go`) (see [Landing](#landing)) |
 | `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause; both select the rules of one evaluation through one selector, which decides the rules' `targets` once and compiles their globs once, and stop with the context's error when it ends, looked at before each file; `MatchPath` matches one element of a glob against 64 positions of the path at a time and stops when no position is left, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the verdicts and check results on a change's versions (`ReviewStep`, the tables `change_approvals` and `change_checks`), the evidence source over them (`Facts`), the version observer that carries verdicts to a patch-equivalent version (`VersionObserver`), and the include expanders of the change (`ExpandApprovals`, `ExpandChecks`), the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, the event writer, `EventWriter`, the change records, `Changes`, which the change component is, and the repository opener, `Repos`), which serves `GET` and `PUT /workspaces/:slug/policy` and `POST /workspaces/:slug/policy/evaluate`, the dry evaluation of paths or a change that writes nothing, and the five routes of verdicts and check results (`Routes`), deletes a deleted workspace's revisions, verdicts and check results (`WorkspaceDeleted`), reads the files of a change (`Files`, its `ChangeFiles`: those between the change's `base_sha` and `head_sha` in its target workspace's repository, both paths of a rename or copy, no cap), is the change component's landing evaluator (`EvaluateLanding`), re-evaluates and stores a change's landing (`Reevaluate`, in a transaction of its own, and `ReevaluateIn`, in the caller's; `ErrChangeNotFound`, `ErrChangeClosed`), and every draft and open change of the workspace in the transaction of a `PUT`, and judges the version a land lands (`JudgeVersion`: the change read and the version judged in one transaction, the landing stored for the current version only); see [Landing policy](#landing-policy) |
 | `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages |
@@ -506,6 +507,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 | `AdjustAwareness(func(*awareness.Deps))` | a change to the awareness component's dependencies, applied after the start hook `awareness` builds them and before it binds them, in the order added; tests set the index and expiry intervals or replace the event source, the change reader or the repositories with it |
 | `AdjustCarryPatch(func(*carrypatch.Deps))` | a change to the carry-patch component's dependencies, applied after the start hook `carry_patch` builds them and before it binds them, in the order added; tests replace the secret reader or the git, or set the fetch deadlines, the branch-create hook and the reset's swap hook (`BeforeRefSwap`) with it |
+| `Jobs()`, `AdjustJobs(func(*jobs.Deps))` | the hub's job queue, on which a part or `Options.Compose` registers the handler of a job type; and a change to its dependencies, applied after the start hook `jobs` builds them and before it binds them and recovers, in the order added; tests set its clock, its interval and `NoWake` with it |
 
 `(*Composition).Sandbox()` returns the `*sandbox.Service` that
 `composeSandbox` (`internal/hub/sandbox.go`) creates: a part listed after it,
@@ -5313,6 +5315,92 @@ from the record again then, is on; `SubmittedBy` is the caller's user id
 (the admin token's actor type for the admin token). A result that is not
 `Queued` and an error (logged) leave the reset in place and report no
 job.
+
+### Durable jobs
+
+`internal/jobs` is the hub's durable job queue. It knows a job's type, its
+workspace and two opaque JSON documents, the payload fixed at enqueue and
+the result the attempt writes; what a job means is the business of the
+handler registered for its type. Rebuilds (`internal/carrypatch`, type
+`rebuild`) are its one type so far.
+
+**The part.** `composeJobs` (`internal/hub/jobs.go`) comes right before
+`composeCarryPatch` in `parts`. It creates the `*jobs.Queue`, which
+`(*Composition).Jobs()` returns from the composition on, adds
+`jobs.SchemaStep` (the table `jobs`, times in UnixNano, indexes for "the
+pending jobs of a type and workspace" and "a workspace's jobs newest
+first"), registers `q.RemoveWorkspace` as a remover of owned data (ADR 07),
+and adds the start hook `jobs`, which builds `jobs.Deps` (the store, the
+hub's clock as `jobs.SystemClock(rt.Now)`, the logger), applies the
+adjusters of `AdjustJobs`, binds them and runs `Recover`, and the
+background work `jobs` with the grace `jobs.ShutdownGrace` (30 s), which
+runs `Run`. A handler is registered with `c.Jobs().Register(type, h)`
+from a part or from `Options.Compose` ([ADR 09](adr/09-run-durable-jobs-on-a-queue-the-hub-composes.md)); a type without a handler
+keeps its jobs `queued`.
+
+**Enqueue.** `Enqueue(ctx, tx, type, slug, payload)` stores a `queued` job
+(a `uuid.NewV4` id) in the caller's transaction, after checking in the
+same transaction that no job of that type and workspace is `queued`,
+`running` or `failed`; one that is is reported as `*jobs.DuplicateError`
+naming it. `Store.Tx` admits one write transaction at a time, so the check
+and the insert are atomic without a unique index (which the follow-up,
+a queued job beside a running one, would break). `EnqueueFollowUp(ctx, tx,
+runningID, payload)` queues the one follow-up a running job may have.
+Both poke the dispatcher.
+
+**The dispatcher.** `Run(ctx)` makes a pass at once, then every
+`Deps.Interval` (1 s) on the queue's `Clock` and whenever it is poked (an
+enqueue, a requeue, a registration, every settlement). `Pass(ctx)` returns
+the `failed` jobs whose `next_attempt_at` has come to `queued`, then claims
+`queued` jobs of the types with a handler, oldest first (`created_at` in
+whole seconds, then id), skipping a type and workspace that has a job
+`running`, while fewer than `MaxRunning` (4) attempts run; each claim is a
+conditional `UPDATE … WHERE status = 'queued'` that also empties the
+result, inside one `Store.Tx`, and the attempts start on goroutines of
+their own once it has committed. An unprompted pass first looks for work
+on a read connection and opens no write transaction without it; a poked
+pass goes straight to the write transaction, since the poke may come from
+a transaction still open, whose job only a transaction that waits for it
+can see.
+
+**Settlement.** `settle.go` records an attempt's outcome in one
+`Store.Tx`, only while the job is still `running` (a job removed or
+abandoned in between is left alone): `nil` is `completed`; an error is
+retryable unless `jobs.Permanent` marked it, and `jobs.WithDetail`
+attaches the detail document; a retryable error below `MaxRetries` (20)
+is `failed` with the backoff `min(2 s × 2ⁿ, 2 h)`, and otherwise the job is
+`dead_letter`; a panic of the handler is a retryable error naming it. The
+handler's `Settled(ctx, tx, job, willRetry)` hook runs in the same
+transaction under a savepoint: an error or a panic rolls back to the
+savepoint, is logged with the job id, and the settlement commits.
+`SetResult(ctx, id, doc)` replaces the result of a running job.
+
+**Start, stop and removal.** `Recover` returns every `running` job to
+`queued` before the first pass. At the stop `Run` claims nothing more,
+settles the attempts that end within `ShutdownGrace` on the queue's clock,
+then cancels the rest and returns without settling them, so their jobs stay
+`running` for the next start. `RemoveWorkspace(ctx, tx, slug)` deletes the
+workspace's jobs in the delete's transaction and, since a remover cannot
+see the commit, cancels the attempts of the removed jobs from a store
+transaction of its own, which runs only after the delete's has ended.
+`Depth(ctx)` counts the jobs of each registered type by status, the
+source of `parley_jobqueue_depth`. `Cancel(ctx, tx, id)` and
+`Requeue(ctx, tx, id)` serve the rebuild routes.
+
+**Rebuilds.** `internal/carrypatch` implements its `RebuildEnqueuer` with
+`(*Component).EnqueueRebuild`, which `composeCarryPatch` registers with
+`RegisterRebuildEnqueuer`; the queue reaches the component as
+`carrypatch.Deps.Jobs`. One unexported operation, `enqueueRebuild`, serves
+it and the route `POST …/rebuild`: in one `Store.Tx` it counts the
+`active` and `conflict` patches (the route alone refuses none with
+`no_active_patches`), resolves the strategy and fail mode against the
+settings, enqueues the payload `{strategy, fail_mode, integration_branch,
+submitted_by, session_id}` and writes `parley.rebuild.enqueue`; a
+duplicate stores and writes nothing. `RebuildRecordOf(job)`
+(`rebuild_record.go`) builds the job record of the five routes
+(`rebuild_routes.go`), declared with `carrypatch.Route` and the scopes
+`rebuilds:read` and `rebuilds:write`; every one of them looks a job up
+with `rebuildJob` after the guard.
 
 ### Hub events
 

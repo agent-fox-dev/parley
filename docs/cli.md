@@ -2318,6 +2318,43 @@ a patch id, a `--position` that is not an integer, a `--timeout` or
 wrong number of arguments, are a `usage_error` with exit status `2`, before
 any request is sent.
 
+### `parley rebuild`
+
+These commands drive the [rebuild job routes](api.md#rebuild-jobs) of a
+carry-patch workspace. Each sends one request (`submit --wait` and
+`requeue --wait` then poll, below) with the credential as
+`Authorization: Bearer` and `<slug>` and `<rebuild-id>` as one
+percent-encoded path segment each, and prints the hub's answer on stdout
+with exit status `0`, for a `202` and a `200` alike; a refusal of the
+hub's is written to stderr as received, with nothing on stdout and exit
+status `1`. `parley rebuild` run without a command prints its help and
+exits `0`.
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley rebuild submit <slug> [--strategy <rebase\|merge>] [--fail-mode <fail_fast\|continue>] [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST /api/v1/workspaces/<slug>/rebuild` | a body with `strategy` and `fail_mode` for the flags given, `{}` with neither |
+| `parley rebuild list <slug> [--status <status>]` | `GET /api/v1/workspaces/<slug>/rebuilds` | `status=<status>` only when `--status` is given |
+| `parley rebuild status <slug> <rebuild-id>` | `GET /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>` | |
+| `parley rebuild cancel <slug> <rebuild-id>` | `DELETE /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>` | |
+| `parley rebuild requeue <slug> <rebuild-id> [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>/requeue` | no body |
+
+With `--wait`, `submit` and `requeue` follow the job the answer names
+through the shared [wait](#waiting), polling
+`GET /api/v1/workspaces/<slug>/rebuilds/<id>`: `queued`, `running` and
+`failed` (waiting to retry) go on, `completed` ends it with exit status
+`0`, and `dead_letter` or `cancelled` with the final job record on stdout,
+`wait_failed` on stderr and exit status `1`. A wait that passes
+`--timeout` prints nothing on stdout, reports `wait_timeout` and exits
+`1`, and asks the hub to cancel nothing. Without `--wait` they print the
+hub's answer and exit `0`.
+
+A `--strategy` other than `rebase` or `merge`, a `--fail-mode` other than
+`fail_fast` or `continue`, a `--status` other than `queued`, `running`,
+`failed`, `completed`, `dead_letter` or `cancelled` (`parley rebuild
+submit takes --strategy rebase or merge, got "squash"`), a `--timeout` or
+`--poll-interval` that is not a duration, and a wrong number of arguments
+are a `usage_error` with exit status `2`, before any request is sent.
+
 ### `parley land`
 
 `parley land` run without a command prints its help and exits `0`; it
