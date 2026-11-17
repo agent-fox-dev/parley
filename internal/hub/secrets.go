@@ -40,16 +40,19 @@ const (
 // org's secrets on the identity service, so that the delete of a user or an
 // org removes them in its own transaction and a refused or failed delete
 // keeps them (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
-// The secret routes are registered with the component's scope check as an
-// access check: it is added after identity's and the workspace access
-// checks, so a workspace secret route has its access decided before the
-// scope is resolved. The component exists from the
+// The secret routes, and the variable routes, which are a second collection
+// of the same component and need no key, are registered with the
+// component's scope check as an access check: it is added after identity's
+// and the workspace access checks, so a workspace route has its access
+// decided before the scope is resolved. The variable table is added beside
+// the secret table. The component exists from the
 // composition on, so a later part keeps it through Composition.Secrets; the
 // hooks that run after this one may use it.
 func composeSecrets(c *Composition) {
 	c.secrets = &secret.Component{}
 	c.RegisterKey(config.Key{Section: secretsSection, Name: keyFileName, Type: config.String, Default: ""})
 	c.AddSchemaStep(secret.SchemaStep)
+	c.AddSchemaStep(secret.VarSchemaStep)
 	var keys secret.Keys
 	c.addConfigCheck(func(cfg *config.Config) (err error) {
 		keys, err = secret.LoadKeys(c.env, keyFilePath(cfg))
@@ -72,7 +75,7 @@ func composeSecrets(c *Composition) {
 		return c.secrets.RemoveScope(ctx, tx, secret.ScopeOrg, id)
 	})
 	c.AddAccessCheck(c.secrets.ScopeCheck)
-	for _, r := range c.secrets.Routes() {
+	for _, r := range append(c.secrets.Routes(), c.secrets.VarRoutes()...) {
 		c.AddRoute(r)
 	}
 }

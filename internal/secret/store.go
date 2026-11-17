@@ -281,19 +281,8 @@ func removeScope(ctx context.Context, tx *sql.Tx, scope Scope, scopeID string) e
 // holds, and then an error matching ErrConflict whose message names the
 // first key, as given, that the scope already holds ignoring ASCII case.
 func (c *Component) CreateEntries(ctx context.Context, tx *sql.Tx, scope Scope, scopeID string, entries []Entry) ([]Item, error) {
-	seen := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		if err := CheckKey(e.Key); err != nil {
-			return nil, err
-		}
-		if err := CheckValue(e.Key, e.Value); err != nil {
-			return nil, err
-		}
-		lower := asciiLower(e.Key)
-		if seen[lower] {
-			return nil, invalid("key %q is given more than once", e.Key)
-		}
-		seen[lower] = true
+	if err := checkEntries(entries); err != nil {
+		return nil, err
 	}
 	if !c.Available() {
 		return nil, ErrUnavailable
@@ -307,7 +296,7 @@ func (c *Component) CreateEntries(ctx context.Context, tx *sql.Tx, scope Scope, 
 	}
 	for _, e := range entries {
 		if _, err := find(ctx, tx, scope, scopeID, e.Key); err == nil {
-			return nil, &keyError{kind: ErrConflict, msg: fmt.Sprintf("key %q already exists", e.Key)}
+			return nil, conflict(e.Key)
 		} else if !errors.Is(err, ErrNotFound) {
 			return nil, err
 		}
@@ -321,6 +310,27 @@ func (c *Component) CreateEntries(ctx context.Context, tx *sql.Tx, scope Scope, 
 		items[i] = Item{Key: e.Key, CreatedAt: now, UpdatedAt: now}
 	}
 	return items, nil
+}
+
+// checkEntries returns an error matching ErrInvalid, naming the key, for the
+// first entry whose key or value is outside the limits, and then for the
+// first key given twice ignoring ASCII case.
+func checkEntries(entries []Entry) error {
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if err := CheckKey(e.Key); err != nil {
+			return err
+		}
+		if err := CheckValue(e.Key, e.Value); err != nil {
+			return err
+		}
+		lower := asciiLower(e.Key)
+		if seen[lower] {
+			return invalid("key %q is given more than once", e.Key)
+		}
+		seen[lower] = true
+	}
+	return nil
 }
 
 // UpdateEntry seals a new value for the entry whose key matches name ignoring
@@ -461,6 +471,11 @@ func count(ctx context.Context, q querier, scope Scope, scopeID string) (int, er
 		return 0, fmt.Errorf("count secrets: %w", err)
 	}
 	return n, nil
+}
+
+// conflict is the error for a created key the scope already holds.
+func conflict(key string) error {
+	return &keyError{kind: ErrConflict, msg: fmt.Sprintf("key %q already exists", key)}
 }
 
 func notFound(name string) error {

@@ -124,11 +124,23 @@ type world struct {
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	_, key := newKey(t)
+	return newWorldEnv(t, map[string]string{secret.EnvCurrentKey: key})
+}
+
+// newKeylessWorld builds the world in a hub with no secret key configured.
+func newKeylessWorld(t *testing.T) *world {
+	t.Helper()
+	return newWorldEnv(t, nil)
+}
+
+// newWorldEnv builds the world in a hub with env added to its environment.
+func newWorldEnv(t *testing.T, env map[string]string) *world {
+	t.Helper()
 	// Halfway through a second, so that a stored time is seen cut to whole
 	// seconds.
 	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(-time.Second / 2)}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		Env:     map[string]string{secret.EnvCurrentKey: key},
+		Env:     env,
 		Now:     w.clock,
 		Compose: func(c *hub.Composition) { w.secrets, w.events = c.Secrets(), c.Events() },
 	})
@@ -378,3 +390,82 @@ func ptr(s string) *string { return &s }
 
 // equalPtr reports whether a and b are both nil or point to equal strings.
 func equalPtr(a, b *string) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
+
+// varPlaces are owner's user variables, those of the org acme and those of
+// the workspace acme.
+func (w *world) varPlaces() []place {
+	return []place{
+		{secret.ScopeUser, w.ownerID, "/user/vars"},
+		{secret.ScopeOrg, w.orgID, "/orgs/acme/vars"},
+		{secret.ScopeWorkspace, "acme", "/workspaces/acme/vars"},
+	}
+}
+
+// variable is a variable as an answer gives it.
+type variable struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// varsOf decodes the answer a, which must have the status given, as
+// {"items": [...]}, and checks that each item has exactly the members key,
+// value, created_at and updated_at.
+func varsOf(t *testing.T, a answer, status int) []variable {
+	t.Helper()
+	if a.status != status {
+		t.Fatalf("answer = %d %.300s, want %d", a.status, a.body, status)
+	}
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	var p struct {
+		Items []variable `json:"items"`
+	}
+	if err := json.Unmarshal(a.body, &raw); err != nil {
+		t.Fatalf("decode the items %.300s: %v", a.body, err)
+	}
+	if err := json.Unmarshal(a.body, &p); err != nil {
+		t.Fatalf("decode the items %.300s: %v", a.body, err)
+	}
+	for _, it := range raw.Items {
+		if members := slices.Sorted(maps.Keys(it)); !slices.Equal(members, []string{"created_at", "key", "updated_at", "value"}) {
+			t.Errorf("item members = %v, want exactly key, value, created_at, updated_at", members)
+		}
+	}
+	return p.Items
+}
+
+// storedVars are the variables a scope holds, as key=value, in the order of
+// their keys with A to Z lowered, read from the store.
+func (w *world) storedVars(t *testing.T, scope secret.Scope, id string) []string {
+	t.Helper()
+	rows, err := w.Store.Main().QueryContext(context.Background(),
+		`SELECT key, value FROM variables WHERE scope = ? AND scope_id = ? ORDER BY key_lower`, scope, id)
+	if err != nil {
+		t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+		}
+		out = append(out, k+"="+v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+	}
+	return out
+}
+
+// createVars creates the variables keys, each with no value, through the
+// collection path with cred, and fails the test unless it is answered 201.
+func (w *world) createVars(t *testing.T, cred, path string, keys ...string) {
+	t.Helper()
+	if a := w.do(t, cred, http.MethodPost, path, keyed(keys...)); a.status != http.StatusCreated {
+		t.Fatalf("create %d variables in %s = %d %.300s, want 201", len(keys), path, a.status, a.body)
+	}
+}
