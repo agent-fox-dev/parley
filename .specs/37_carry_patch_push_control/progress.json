@@ -3,7 +3,7 @@
   "spec_id": "37",
   "spec_name": "carry_patch_push_control",
   "schema_version": 3,
-  "updated_at": "2026-11-17T12:03:35Z",
+  "updated_at": "2026-11-17T12:07:29Z",
   "tasks": [
     {
       "id": 1,
@@ -31,7 +31,7 @@
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

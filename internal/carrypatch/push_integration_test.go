@@ -2,6 +2,7 @@ package carrypatch_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
+	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -288,6 +290,170 @@ func TestLand_IsBlockedOntoAPatchBranchSyncedFromOriginWithoutForwarding(t *test
 		t.Errorf("rebuild jobs %+v after the blocked land, want none", got)
 	}
 }
+
+func TestGitPush_APatchBranchIsRebuiltAndMirroredAndTheIntegrationBranchStaysTheHubs(t *testing.T) {
+	t.Parallel()
+	f := startPushFixture(t, func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{
+			"patch_branch_source": json.RawMessage(`"hub"`), "push_patches_to_origin": json.RawMessage(`true`),
+			"auto_rebuild_after_push": json.RawMessage(`true`),
+		}
+	})
+	tips := f.registerPatches(t, "patch/tls")
+	pat := f.IssuePAT(t, identity.PATSpec{UserID: f.owner, Permissions: []string{"git:read", "git:write", "rebuilds:read"}})
+
+	tls := f.commit(t, tips["patch/tls"], "tls2")
+	if out, err := f.push(t, pat, tls+":refs/heads/patch/tls"); err != nil {
+		t.Fatalf("the agent's push of patch/tls failed: %v\n%s", err, out)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/tls"); got != tls {
+		t.Errorf("hub's patch/tls = %s, want the pushed %s", got, tls)
+	}
+	waitFor(t, "the mirror of patch/tls to origin", func() bool { return f.origin.Head("patch/tls") == tls })
+	if got := f.listRebuilds(t, pat); len(got) != 1 || got[0].SubmittedBy != "system:push" {
+		t.Errorf("rebuilds of %s = %+v, want one submitted by system:push", f.slug, got)
+	}
+
+	deploy, originDeploy := refIn(f.copy, "refs/heads/deploy"), f.origin.Head("deploy")
+	out, err := f.push(t, pat, f.commit(t, tls, "on deploy")+":refs/heads/deploy")
+	wantPushRefused(t, out, err, "integration branch deploy is maintained by the hub; push a patch branch and rebuild instead")
+	if got := refIn(f.copy, "refs/heads/deploy"); got != deploy {
+		t.Errorf("hub's deploy = %s after the refused push, want %s", got, deploy)
+	}
+	if got := f.origin.Head("deploy"); got != originDeploy {
+		t.Errorf("origin's deploy = %q after the refused push, want %q", got, originDeploy)
+	}
+	if n := f.eventCount(t, carrypatch.EventPatchMirrorFailed); n != 0 {
+		t.Errorf("%d %s events, want none", n, carrypatch.EventPatchMirrorFailed)
+	}
+}
+
+func TestGitPush_ADeveloperIsPointedToOriginThenForwardsThroughTheHub(t *testing.T) {
+	t.Parallel()
+	const token = "tok-path-2"
+	f := startPushFixture(t, func(w *workspace.Workspace) {
+		w.Settings = map[string]json.RawMessage{
+			"patch_branch_source": json.RawMessage(`"origin"`), "push_patches_to_origin": json.RawMessage(`false`),
+			"auto_rebuild_after_push": json.RawMessage(`false`),
+		}
+	})
+	tips := f.registerPatches(t, "patch/tls")
+	f.secrets.set(workspace.SecretGitPAT, token)
+	f.origin.Accept("x-token-auth", token)
+	h0, o0 := tips["patch/tls"], f.origin.Head("patch/tls")
+	pushes := f.eventCount(t, "parley.git.push")
+
+	tls := f.commit(t, h0, "tls2")
+	out, err := f.push(t, f.key, tls+":refs/heads/patch/tls")
+	wantPushRefused(t, out, err, "branch is synced from origin; push to "+f.origin.URL()+" instead")
+	if strings.Contains(out, token) {
+		t.Errorf("git's output shows the origin credential:\n%s", out)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/tls"); got != h0 {
+		t.Errorf("hub's patch/tls = %s after the refused push, want %s", got, h0)
+	}
+	if got := f.origin.Head("patch/tls"); got != o0 {
+		t.Errorf("origin's patch/tls = %q after the refused push, want %q", got, o0)
+	}
+
+	f.setSettings(t, map[string]any{"push_patches_to_origin": true})
+	if out, err := f.push(t, f.key, tls+":refs/heads/patch/tls"); err != nil {
+		t.Fatalf("the forwarded push of patch/tls failed: %v\n%s", err, out)
+	}
+	if got, hub := f.origin.Head("patch/tls"), refIn(f.copy, "refs/heads/patch/tls"); got != tls || hub != tls {
+		t.Errorf("origin's patch/tls = %q and hub's = %s, want both the pushed %s", got, hub, tls)
+	}
+	var tlsPushes int
+	for _, ev := range f.rebuildEvents(t, f.slug, "parley.git.push")[pushes:] {
+		if ev.Metadata["ref"] == "refs/heads/patch/tls" {
+			tlsPushes++
+		}
+	}
+	if tlsPushes != 1 {
+		t.Errorf("%d parley.git.push events for refs/heads/patch/tls, want 1", tlsPushes)
+	}
+	if got := f.listRebuilds(t, f.key); len(got) != 0 {
+		t.Errorf("rebuilds of %s = %+v, want none", f.slug, got)
+	}
+}
+
+func TestLand_APatchBranchLandedOnIsRebuiltWithTheLandingsSessionAndMirrored(t *testing.T) {
+	t.Parallel()
+	const session = "0b8f3d6e-2c4a-4f1e-9d7b-5a6c8e0f1a2b"
+	f := startPushFixtureWith(t, func(c *hub.Composition) { c.Land().RegisterSessionLinker(anyLandSession{}) },
+		func(w *workspace.Workspace) {
+			w.Settings = map[string]json.RawMessage{
+				"patch_branch_source": json.RawMessage(`"hub"`), "push_patches_to_origin": json.RawMessage(`true`),
+				"auto_rebuild_after_push": json.RawMessage(`true`),
+			}
+		})
+	tips := f.registerPatches(t, "patch/tls")
+	pat := f.IssuePAT(t, identity.PATSpec{UserID: f.owner, Permissions: []string{"git:read", "git:write", "changes:write", "rebuilds:read"}})
+
+	fix := f.commit(t, tips["patch/tls"], "fix tls")
+	if out, err := f.push(t, pat, fix+":refs/heads/fix/tls"); err != nil {
+		t.Fatalf("the push of fix/tls failed: %v\n%s", err, out)
+	}
+	if got := f.listRebuilds(t, pat); len(got) != 0 {
+		t.Fatalf("rebuilds of %s = %+v after the push of fix/tls, want none", f.slug, got)
+	}
+	if status, raw := f.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/changes", pat, map[string]any{
+		"source": map[string]any{"branch": "fix/tls"}, "target_branch": "patch/tls",
+		"title": "Fix TLS patch", "intent": "Fix the TLS patch.",
+	}); status != http.StatusCreated {
+		t.Fatalf("open the change from fix/tls onto patch/tls = %d %s, want 201", status, raw)
+	}
+
+	status, raw := f.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/changes/1/land", pat, map[string]any{"session_id": session})
+	var attempt struct {
+		Status    string `json:"status"`
+		LandedSHA string `json:"landed_sha"`
+	}
+	if err := json.Unmarshal(raw, &attempt); err != nil || status != http.StatusOK || attempt.Status != "landed" || attempt.LandedSHA == "" {
+		t.Fatalf("land the change = %d %s, want 200 with the attempt landed", status, raw)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/tls"); got != attempt.LandedSHA {
+		t.Errorf("hub's patch/tls = %s, want the landed %s", got, attempt.LandedSHA)
+	}
+	waitFor(t, "the rebuild of the land", func() bool { return len(f.listRebuilds(t, pat)) == 1 })
+	if got := f.listRebuilds(t, pat); got[0].SubmittedBy != "system:land" {
+		t.Errorf("rebuilds of %s = %+v, want one submitted by system:land", f.slug, got)
+	}
+	if evs := f.rebuildEvents(t, f.slug, carrypatch.EventRebuildEnqueue); len(evs) != 1 || evs[0].SessionID == nil || *evs[0].SessionID != session {
+		t.Errorf("%s events = %+v, want one of the session %s", carrypatch.EventRebuildEnqueue, evs, session)
+	}
+	waitFor(t, "the mirror of patch/tls to origin", func() bool { return f.origin.Head("patch/tls") == attempt.LandedSHA })
+}
+
+// listRebuilds is the rebuild list of the workspace as GET
+// /workspaces/:slug/rebuilds answers it to credential.
+func (f *pushFixture) listRebuilds(t *testing.T, credential string) []listedRebuild {
+	t.Helper()
+	status, raw := f.Call(t, http.MethodGet, "/api/v1/workspaces/"+f.slug+"/rebuilds", credential, nil)
+	var page struct {
+		Items []listedRebuild `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil || status != http.StatusOK {
+		t.Fatalf("list the rebuilds of %s = %d %s, want 200", f.slug, status, raw)
+	}
+	return page.Items
+}
+
+// listedRebuild is what the smoke tests read of a listed rebuild.
+type listedRebuild struct {
+	ID          string `json:"id"`
+	SubmittedBy string `json:"submitted_by"`
+}
+
+// anyLandSession is a land session linker that accepts every session and
+// records nothing.
+type anyLandSession struct{}
+
+func (anyLandSession) Check(_ context.Context, _ change.Caller, sessionID, _ string) (string, error) {
+	return strings.ToLower(sessionID), nil
+}
+
+func (anyLandSession) Record(context.Context, *sql.Tx, string, string, string) error { return nil }
 
 // anyPushSession is a push session linker that accepts every session.
 type anyPushSession struct{}
