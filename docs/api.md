@@ -3057,9 +3057,152 @@ gives running attempts 30 seconds; one still running then is left
 `running` and recovered at the next start. A workspace's jobs are deleted
 with the workspace.
 
-What an attempt does is the rebuild handler's: this version of the hub
-registers none, so a rebuild job stays `queued` until a hub with the
-rebuild handler runs it.
+### What an attempt does
+
+An attempt recomputes the integration branch as "the upstream base plus
+every patch that still applies, in position order", out of sight of every
+client, and moves the branch once at the end.
+
+1. **The workspace.** `archived` ends the job for good (reason
+   `workspace_archived`), `failed` too (`workspace_not_ready`); `pending` or
+   `cloning` fails the attempt for a retry (`workspace_busy`). A workspace
+   that was deleted took its jobs with it: the attempt ends with nothing
+   written and no event. The same test is made again before every patch
+   and inside the publish, right before the branch moves, so an archive, a
+   reclone or a delete during a run ends it at its next step without
+   moving the branch. A rebuild never blocks them.
+2. **Upstream.** `patch_results` starts as `[]`. The hub fetches every
+   upstream branch into `refs/remotes/upstream/*` (no tags) with the
+   upstream credential (`UPSTREAM_GIT_PAT`, else `UPSTREAM_GIT_USERNAME`
+   with `UPSTREAM_GIT_PASSWORD`, else the origin credential) and repeats a
+   missing set-up step. The **upstream base** is the head of the upstream's
+   default branch, else of the upstream branch named like the workspace's
+   `default_branch`; it is stored as `upstream_head_sha`. A failed fetch is
+   a retryable `upstream_fetch_failed`, a base that does not resolve a
+   retryable `upstream_unknown`; no patch is touched.
+3. **The patch list.** The non-deleted patches are listed in position order
+   and the tip of each patch branch is read once as its `source_sha` (`null`
+   for a missing branch); only these commits are used. A push to a patch
+   branch during the run is accepted as at any other time and changes
+   nothing the run builds.
+4. **Each patch**, in a scratch working tree `<slug>.git/parley-rebuild/<job
+   id>` that no ref points to (no ref a client can read changes before the
+   publish, except `refs/remotes/upstream/*`):
+   - `disabled` and `merged_upstream` patches are `skipped` with that
+     reason, a patch without a branch with `branch_not_found`;
+   - `active` and `conflict` patches are applied. With `rebase`, the commits
+     reachable from `source_sha` and not from the upstream base are replayed
+     oldest first, merge commits left out, each with its author, author date
+     and message and the landing identity (`[land].committer_name`,
+     `[land].committer_email`) as committer; a commit whose change is
+     already present is dropped. With `merge`, the tip is merged with a merge
+     commit (never a fast-forward), message `Merge branch '<branch_name>'`,
+     first parent the head under construction, second `source_sha`, the
+     landing identity as author and committer. A patch that adds nothing
+     (no commit left to replay, or a tip already reachable) is `skipped`
+     with `nothing_to_apply`; one that applies is `success` with
+     `new_head_sha`.
+   - The results so far are stored on the job after every patch, so a read
+     of a `running` job shows progress; the four counts stay `0` until the
+     job is `completed`.
+5. **Conflicts.** When a commit (with `merge`, the tip) does not apply, git
+   replays the workspace's remembered resolutions (git rerere, per
+   workspace). When paths remain in conflict and the patch has two-parent
+   merge commits among the commits the upstream base lacks, the hub redoes
+   the newest 50 of them; where one conflicts, the merge commit's content is
+   recorded as the resolution, and the commit is tried once more. A path
+   still in conflict undoes the patch: the patch becomes `conflict` with
+   `conflict_files` (sorted), `parley.patch.update` is emitted when its
+   status changed (`{branch_name, changed: ["status"], from, to: "conflict",
+   reason: "rebuild_conflict"}`, actor `system`), and its result is
+   `conflict` with a [conflict report](#the-rebuild-conflict-report). With
+   `fail_fast` the run stops: nothing is published and the job is
+   `dead_letter` with the report as `conflict` and the `error` `rebuild of
+   <slug>: the patch <branch> does not apply: <n> file(s) in conflict`.
+   With `continue` the run goes on from the head before the patch.
+6. **Publish.** In one store transaction the hub soft-deletes every patch
+   the run skipped as `merged_upstream` that is still `merged_upstream`
+   (`parley.patch.delete`, `{branch_name, reason: "merged_upstream"}`), sets
+   every patch the run applied that is still `conflict` to `active` with
+   `[]` (`parley.patch.update`, `from: "conflict"`, `to: "active"`,
+   `reason: "rebuild_clean"`), renumbers the rest 1..N, and moves
+   `refs/heads/<integration_branch>` to the new head with one
+   compare-and-swap against the head it read (creating the branch when
+   absent). The transaction commits only when the swap won; a branch moved
+   by another writer meanwhile is a retryable `ref_moved` that changes no
+   patch. A run with no applicable patch publishes the upstream base. The
+   job gets `integration_head_sha` and `previous_integration_head_sha`
+   (`null` when the branch did not exist) right after the commit.
+7. **Push.** When `rebuild_push_integration_branch`, read now, is `true`,
+   the branch is pushed to origin with the origin credential and
+   force-with-lease against `refs/remotes/origin/<integration_branch>` (or
+   "origin has no such branch" when the hub has none), within 120 seconds;
+   success sets `integration_branch_pushed` and records the pushed head as
+   origin's. A failure emits `parley.rebuild.push_failed` and does not fail
+   the rebuild. When the setting is `false`, origin is not contacted.
+8. **Completion and follow-up.** The counts are stored
+   (`patches_removed` is the number of merged patches soft-deleted). After
+   a publish, and after a `fail_fast` conflict, the hub compares its inputs
+   with the present without fetching: a listed patch, not deleted since,
+   whose branch exists at another tip than its `source_sha` is stale (when
+   `auto_rebuild_after_push` is `true`), and so is upstream when the base
+   resolved now differs from `upstream_head_sha` (when
+   `auto_rebuild_after_sync` is `true`). Anything stale queues one
+   follow-up rebuild with the job's strategy and fail mode and
+   `submitted_by` `system:followup`; a duplicate is skipped silently. No
+   check follows a retryable failure, since the job runs again.
+
+A git failure that is not a conflict (`git_error`), a git operation that
+runs longer than 10 minutes (`timeout`) and a stop of the hub (`shutdown`)
+are retryable, record no result for the patch in work, change no patch and
+publish nothing. Every attempt removes its scratch working tree, and
+discards one left by an earlier attempt before it builds. Failure text in
+`error` and in events passes through the hub's scrubber, with the
+attempt's credential values.
+
+### The patch result
+
+Each entry of `patch_results` has every member:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `patch_id`, `branch_name`, `position` | | the patch as listed at the start of the run |
+| `status` | `success` \| `conflict` \| `skipped` | |
+| `skipped_reason` | string or `null` | `disabled`, `merged_upstream`, `branch_not_found` or `nothing_to_apply`; `null` unless `skipped` |
+| `source_sha` | string or `null` | the tip read at the listing; `null` for a missing branch |
+| `new_head_sha` | string or `null` | the head under construction after the patch; `null` unless `success` |
+| `conflict_files` | array of strings | `[]` unless `conflict` |
+| `conflict` | object or `null` | the [conflict report](#the-rebuild-conflict-report); `null` unless `conflict` |
+
+### The rebuild conflict report
+
+`patch_id`, then the members of the hub's conflict report: `target_sha` (the
+head under construction before the patch: the upstream base for the first
+applied patch), `head_sha` (the patch's `source_sha`), `base_sha` (the merge
+base of the two), `commit_sha` (with `rebase` the first commit that did not
+apply, with `merge` `source_sha`), `files` (one entry per path still in
+conflict after remembered resolutions, with `path`, `kind`, `base`, `ours`
+(the file in `target_sha`), `theirs` (the file in `commit_sha`) and
+`landed_by: []`), `landed_changes: []` and `change: null`.
+
+### The events of an attempt
+
+Each has `resource_type` `rebuild`, the job id as `resource_id`, actor
+`system` and the job's session id when it has one, and is written in the
+transaction of the state change it reports.
+
+| Event | Metadata |
+|---|---|
+| `parley.rebuild.complete` | `upstream_head_sha`, `integration_head_sha`, `previous_integration_head_sha`, `patches_applied`, `patches_skipped`, `patches_conflicted`, `patches_removed` |
+| `parley.rebuild.fail` | `reason`, `will_retry` (`false` when the job is dead-lettered), `retry_count` (after the attempt), `conflict` (the report for reason `conflict`, else `null`) |
+| `parley.rebuild.followup` | `follow_up_job_id`, `stale_patches` (branch names), `upstream_stale` |
+| `parley.rebuild.push_failed` | `integration_branch`, `reason` |
+
+The `reason` of `parley.rebuild.fail` is one of `conflict`,
+`upstream_fetch_failed`, `upstream_unknown`, `git_error`, `timeout`,
+`shutdown`, `ref_moved`, `workspace_busy`, `workspace_not_ready` and
+`workspace_archived`. A move of the integration branch by a rebuild
+emits no `parley.git.push`; `parley.rebuild.complete` carries both heads.
 
 ### The rebuild job record
 
