@@ -546,3 +546,91 @@ func keysOf(vars []variable) []string {
 	}
 	return out
 }
+
+// putVars creates, through the collection path with cred, the variables
+// pairs names as key, value, key, value and so on, and fails the test
+// unless it is answered 201.
+func (w *world) putVars(t *testing.T, cred, path string, pairs ...string) {
+	t.Helper()
+	e := make([]any, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		e = append(e, map[string]any{"key": pairs[i], "value": pairs[i+1]})
+	}
+	if a := w.do(t, cred, http.MethodPost, path, entries(e...)); a.status != http.StatusCreated {
+		t.Fatalf("create %v in %s = %d %.300s, want 201", pairs, path, a.status, a.body)
+	}
+}
+
+// admin sends method path, below /api/v1, as the admin token, and fails
+// the test unless it is answered 2xx.
+func (w *world) admin(t *testing.T, method, path string) {
+	t.Helper()
+	if a := w.do(t, w.Token, method, path, nil); a.status/100 != 2 {
+		t.Fatalf("%s %s as the admin token = %d %.300s, want 2xx", method, path, a.status, a.body)
+	}
+}
+
+// resolved is a resolved variable as an answer gives it.
+type resolved struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Origin    string `json:"origin"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// resolvedPageOf decodes the answer a, which must be 200, as a page of
+// resolved variables: its items, each with exactly the members key, value,
+// origin, created_at and updated_at, and its next_cursor; the page has
+// exactly those two members and items is an array.
+func resolvedPageOf(t *testing.T, a answer) ([]resolved, *string) {
+	t.Helper()
+	if a.status != http.StatusOK {
+		t.Fatalf("answer = %d %.300s, want 200", a.status, a.body)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(a.body, &top); err != nil || len(top) != 2 || top["items"] == nil || top["next_cursor"] == nil {
+		t.Fatalf("the page %.300s (%v) has not exactly the members items and next_cursor", a.body, err)
+	}
+	var raw []map[string]json.RawMessage
+	if err := json.Unmarshal(top["items"], &raw); err != nil || raw == nil {
+		t.Fatalf("the items of %.300s are not an array: %v", a.body, err)
+	}
+	for _, it := range raw {
+		if members := slices.Sorted(maps.Keys(it)); !slices.Equal(members, []string{"created_at", "key", "origin", "updated_at", "value"}) {
+			t.Errorf("item members = %v, want exactly key, value, origin, created_at, updated_at", members)
+		}
+	}
+	items := []resolved{}
+	if err := json.Unmarshal(top["items"], &items); err != nil {
+		t.Fatalf("decode the items of %.300s: %v", a.body, err)
+	}
+	var next *string
+	if err := json.Unmarshal(top["next_cursor"], &next); err != nil {
+		t.Fatalf("next_cursor of %.300s: %v", a.body, err)
+	}
+	return items, next
+}
+
+// resolve is the resolved variables of the workspace slug that cred is
+// answered, as one page of up to 200, which must be the last.
+func (w *world) resolve(t *testing.T, cred, slug string) []resolved {
+	t.Helper()
+	items, next := resolvedPageOf(t, w.do(t, cred, http.MethodGet, "/workspaces/"+slug+"/vars/resolved?limit=200", nil))
+	if next != nil {
+		t.Fatalf("the resolved variables of %s: next_cursor %q, want null", slug, *next)
+	}
+	return items
+}
+
+// stamp is the time t as an answer gives it: whole seconds, RFC 3339.
+func stamp(t time.Time) string { return t.Truncate(time.Second).Format(time.RFC3339) }
+
+// keysOfResolved are the keys of vars, in order.
+func keysOfResolved(vars []resolved) []string {
+	out := make([]string, len(vars))
+	for i, v := range vars {
+		out[i] = v.Key
+	}
+	return out
+}

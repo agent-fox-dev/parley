@@ -48,9 +48,22 @@ func varMarks(scope Scope, need access.Need) map[string]string {
 // create is a create route, so that a retried request with its
 // Idempotency-Key creates nothing twice. No route needs an encryption key.
 // A variable has no GET of its own: the router answers one 405 with the
-// methods its path has.
+// methods its path has. A workspace's resolved variables have a GET route
+// of their own, on the literal path resolved beside its variables' paths;
+// PATCH and DELETE on it are routes that answer 405 as the router would,
+// because the router ranks only the routes of the request's method and
+// would otherwise hand them to the variable routes as the key "resolved".
+// They are public, so that no authentication, scope or access check runs
+// before the 405, as none runs before the router's; the server's rate limit
+// and body stages still do. A variable stored under the key resolved is reached by
+// another casing of it, which the literal path does not match.
 func (c *Component) VarRoutes() []server.Route {
-	routes := make([]server.Route, 0, 4*len(varCollections))
+	const resolved = "/workspaces/:slug/vars/resolved"
+	routes := []server.Route{
+		{Method: http.MethodGet, Pattern: resolved, Scope: varScopeRead, Marks: varMarks(ScopeWorkspace, access.NeedRead), Handler: c.resolvedVars},
+		{Method: http.MethodPatch, Pattern: resolved, Public: true, Handler: onlyGet},
+		{Method: http.MethodDelete, Pattern: resolved, Public: true, Handler: onlyGet},
+	}
 	for _, col := range varCollections {
 		read, write := varMarks(col.scope, access.NeedRead), varMarks(col.scope, access.NeedWrite)
 		one := col.pattern + "/:key"
@@ -62,6 +75,13 @@ func (c *Component) VarRoutes() []server.Route {
 		)
 	}
 	return routes
+}
+
+// onlyGet answers a method the resolved path does not have, as the router
+// answers one: 405 naming GET, its one method.
+func onlyGet(w http.ResponseWriter, _ *http.Request) error {
+	w.Header().Set("Allow", http.MethodGet)
+	return server.MethodNotAllowed("method not allowed")
 }
 
 // varItem is a variable as the routes answer it: its key, its value and

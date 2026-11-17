@@ -98,7 +98,20 @@ func (c *Component) ListVars(ctx context.Context, scope Scope, scopeID, after st
 	if c.deps.Store == nil {
 		return nil, errNotBound
 	}
-	rows, err := c.deps.Store.Main().QueryContext(ctx, `
+	return listVars(ctx, c.deps.Store.Main(), scope, scopeID, after, limit)
+}
+
+// rowsQuerier is what a read of several variables goes through: a
+// transaction or the store's database.
+type rowsQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// listVars reads through q at most limit variables of a scope, every one
+// when limit is negative, in the order of their keys with A to Z lowered,
+// beginning after the variable whose Position is after.
+func listVars(ctx context.Context, q rowsQuerier, scope Scope, scopeID, after string, limit int) ([]Variable, error) {
+	rows, err := q.QueryContext(ctx, `
 SELECT key, value, created_at, updated_at FROM variables
 WHERE scope = ? AND scope_id = ? AND key_lower > ?
 ORDER BY key_lower LIMIT ?`, scope, scopeID, after, limit)

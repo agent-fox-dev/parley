@@ -3,10 +3,13 @@ package hub
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"path/filepath"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
@@ -31,7 +34,9 @@ const (
 // loaded stops the start as its one error line before any store is opened
 // (docs/adr/06-load-the-secret-keys-before-the-stores-open.md). Its start
 // hook binds the secret component to the stores, the loaded keys, the hub's
-// clock and scrubber and the event component, and reads the start report,
+// clock and scrubber, the event component, and the workspace records, the
+// memberships and the users a workspace's chain is built from, and reads
+// the start report,
 // which the hub writes once it has bound the listener: the `secret
 // encryption` line, and the warning that secrets cannot be stored when no
 // current key is configured. Every maintenance pass runs the re-encryption
@@ -60,7 +65,9 @@ func composeSecrets(c *Composition) {
 	})
 	var report secret.StartReport
 	c.AddStartHook(secretsHook, func(ctx context.Context, rt *Runtime) (err error) {
-		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: keys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events})
+		db := rt.Store.Main()
+		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: keys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events,
+			Records: access.StoreRecords(db), Memberships: activeOrgs(db), UserExists: userExists(db)})
 		report, err = c.secrets.StartReport(ctx)
 		return err
 	})
@@ -77,6 +84,18 @@ func composeSecrets(c *Composition) {
 	c.AddAccessCheck(c.secrets.ScopeCheck)
 	for _, r := range append(c.secrets.Routes(), c.secrets.VarRoutes()...) {
 		c.AddRoute(r)
+	}
+}
+
+// userExists is the question a workspace's chain asks of identity: whether
+// its owner is still a user.
+func userExists(db *sql.DB) func(ctx context.Context, userID string) (bool, error) {
+	return func(ctx context.Context, userID string) (bool, error) {
+		_, err := identity.UserByID(ctx, db, userID)
+		if errors.Is(err, identity.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
 	}
 }
 

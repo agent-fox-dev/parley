@@ -389,3 +389,44 @@ func TestDeleteVar_RemovesTheVariable(t *testing.T) {
 		w.createVars(t, w.ownerKey, pl.path, "REGION")
 	}
 }
+
+func TestVarRoutes_RefuseAMethodTheirPathLacks(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	const resolved = "/api/v1/workspaces/acme/vars/resolved"
+	w.putVars(t, w.ownerKey, "/workspaces/acme/vars", "resolved", "kept")
+	before := w.storedVars(t, secret.ScopeWorkspace, "acme")
+	w.advance(time.Minute)
+	refused := []struct {
+		name, method, path, cred string
+		body                     any
+		allow                    []string
+	}{
+		{"PATCH on the resolved path", http.MethodPatch, resolved, w.ownerKey, changed, []string{"GET"}},
+		{"DELETE on the resolved path", http.MethodDelete, resolved, w.ownerKey, nil, []string{"GET"}},
+		{"PATCH on the resolved path by a member", http.MethodPatch, resolved, w.memberKey, changed, []string{"GET"}},
+		{"DELETE on the resolved path with no credential", http.MethodDelete, resolved, "", nil, []string{"GET"}},
+		{"GET on a user variable", http.MethodGet, "/api/v1/user/vars/A", w.ownerKey, nil, []string{"DELETE", "PATCH"}},
+		{"GET on an org variable", http.MethodGet, "/api/v1/orgs/acme/vars/A", w.ownerKey, nil, []string{"DELETE", "PATCH"}},
+		{"GET on a workspace variable", http.MethodGet, "/api/v1/workspaces/acme/vars/A", w.ownerKey, nil, []string{"DELETE", "PATCH"}},
+	}
+	for _, r := range refused {
+		status, header, body := w.Exchange(t, r.method, r.path, r.cred, r.body, nil)
+		typ := ""
+		if status == http.StatusMethodNotAllowed {
+			typ, _ = errorOf(t, answer{status, body})
+		}
+		allow := strings.Split(header.Get("Allow"), ", ")
+		slices.Sort(allow)
+		if status != http.StatusMethodNotAllowed || typ != "method_not_allowed" || !slices.Equal(allow, r.allow) {
+			t.Errorf("%s = %d %s, Allow %q; want 405 method_not_allowed, Allow %v", r.name, status, body, header.Get("Allow"), r.allow)
+		}
+	}
+	if got := w.storedVars(t, secret.ScopeWorkspace, "acme"); !slices.Equal(got, before) {
+		t.Errorf("after the refusals the workspace holds %v, want %v", got, before)
+	}
+	v := varOf(t, w.do(t, w.ownerKey, http.MethodPatch, "/workspaces/acme/vars/RESOLVED", map[string]any{"value": "x"}), http.StatusOK)
+	if v.Key != "resolved" || v.Value != "x" {
+		t.Errorf("PATCH RESOLVED changed %s to %q, want resolved to x", v.Key, v.Value)
+	}
+}

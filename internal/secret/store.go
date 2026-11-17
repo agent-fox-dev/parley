@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -86,6 +88,14 @@ type Deps struct {
 	Scrubber *scrub.Scrubber
 	// Events writes the events of the secret routes.
 	Events Emitter
+	// Records reads the workspace records a chain is built from.
+	Records access.RecordReader
+	// Memberships answers the active orgs of a workspace's owner, of which
+	// the chain's org step needs the workspace's.
+	Memberships access.Memberships
+	// UserExists reports whether a user exists; a chain has no user step
+	// for an owner who does not.
+	UserExists func(ctx context.Context, userID string) (bool, error)
 }
 
 // Component is the one place the hub reads, stores and removes secrets, so
@@ -100,6 +110,10 @@ type Component struct {
 	// converters re-seal the values other parts keep outside the secret
 	// table when the maintenance pass re-encrypts after a rotation.
 	converters []Converter
+	// readVars, when set, reads the variables of one scope for a
+	// resolution in place of the store, so that a test can make the read
+	// of one scope fail.
+	readVars atomic.Pointer[varReader]
 }
 
 // New returns a component bound to d.
