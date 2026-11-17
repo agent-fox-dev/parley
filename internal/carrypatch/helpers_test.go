@@ -28,6 +28,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
+// TestMain runs the package's tests at most hubtest.HubParallel at a time:
+// they start many hubs, which contend for one lock past that (see
+// hubtest.HubParallel).
+func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
+	os.Exit(m.Run())
+}
+
 // carryHub is a hub whose clone workers run the clone work of every
 // workspace created, with its repository root in a directory of the test's
 // own, a secret key, a git that trusts the test origins it was started

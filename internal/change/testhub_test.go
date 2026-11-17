@@ -33,6 +33,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
+// TestMain runs the package's tests at most hubtest.HubParallel at a time:
+// they start many hubs, which contend for one lock past that (see
+// hubtest.HubParallel).
+func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
+	os.Exit(m.Run())
+}
+
 // Session ids, which the event log takes only as UUIDs: sessionOne and
 // sessionTwo are sessions the world's session linker accepts, sessionOther
 // one it refuses.
@@ -106,12 +114,12 @@ func (w *world) addWorkspace(t *testing.T, slug string) string {
 	t.Helper()
 	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
 	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
-	if _, err := gitrepotest.Run(dir, "commit refs/heads/main\n"+committer+data("base")+
-		"M 100644 inline a.txt\n"+data("l1\nl2\nl3\n")+"\nreset refs/heads/release\nfrom refs/heads/main\n\n",
-		"fast-import", "--quiet"); err != nil {
+	head, err := gitrepotest.Run(dir, "commit refs/heads/main\nmark :1\n"+committer+data("base")+
+		"M 100644 inline a.txt\n"+data("l1\nl2\nl3\n")+"\nreset refs/heads/release\nfrom refs/heads/main\n\nget-mark :1\n",
+		"fast-import", "--quiet")
+	if err != nil {
 		t.Fatal(err)
 	}
-	head := gitrepotest.Refs(t, dir, "refs/heads/")["main"]
 	rec := workspace.Workspace{
 		Slug: slug, Kind: access.KindRepository, Mode: workspace.ModeStandard,
 		GitURL: new("https://origin.test/" + slug + ".git"), DefaultBranch: new("main"), OwnerID: w.owner, OrgID: w.org,
@@ -173,7 +181,7 @@ const (
 func commit(t *testing.T, dir, branch, from, message string, files map[string]string) string {
 	t.Helper()
 	var s strings.Builder
-	s.WriteString("commit refs/heads/" + branch + "\n" + committer + data(message))
+	s.WriteString("commit refs/heads/" + branch + "\nmark :1\n" + committer + data(message))
 	if from != "" {
 		s.WriteString("from " + from + "\n")
 	}
@@ -188,10 +196,13 @@ func commit(t *testing.T, dir, branch, from, message string, files map[string]st
 		}
 		s.WriteString("M " + mode + " inline " + path + "\n" + data(content))
 	}
-	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet", "--force"); err != nil {
+	// get-mark answers the commit's id, which spares a git process to read
+	// the branch.
+	id, err := gitrepotest.Run(dir, s.String()+"\nget-mark :1\n", "fast-import", "--quiet", "--force")
+	if err != nil {
 		t.Fatal(err)
 	}
-	return gitrepotest.Refs(t, dir, "refs/heads/")[branch]
+	return id
 }
 
 // branch is commit on top of the world's base in demo.

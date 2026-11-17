@@ -131,21 +131,24 @@ func (o *Origin) Dir() string { return o.dir }
 
 // Commit adds a commit with message msg on top of branch, creating the
 // branch with a root commit when it does not exist, and returns its id.
-// Every commit changes the content of the one file of the tree.
+// Every commit changes the content of the one file of the tree. It writes
+// the commit in one run of git fast-import rather than one git process per
+// object: a test process that starts git pays for every process it forks.
 func (o *Origin) Commit(branch, msg string) string {
 	o.t.Helper()
 	o.mu.Lock()
 	o.seq++
 	content := fmt.Sprintf("%s\n%d\n", msg, o.seq)
 	o.mu.Unlock()
-	blob := o.git(content, "hash-object", "-w", "--stdin")
-	tree := o.git("100644 blob "+blob+"\tREADME\n", "mktree")
-	args := []string{"commit-tree", tree, "-m", msg}
+	var stream strings.Builder
+	fmt.Fprintf(&stream, "commit refs/heads/%s\nmark :1\ncommitter Origin <origin@example.invalid> now\n%s", branch, fastData(msg+"\n"))
 	if parent := o.Head(branch); parent != "" {
-		args = append(args, "-p", parent)
+		fmt.Fprintf(&stream, "from %s\n", parent)
 	}
-	id := o.git("", args...)
-	o.git("", "update-ref", "refs/heads/"+branch, id)
+	// deleteall leaves README the tree's one file, whatever the parent's
+	// tree holds.
+	fmt.Fprintf(&stream, "deleteall\nM 100644 inline README\n%s\nget-mark :1\n", fastData(content))
+	id := o.git(stream.String(), "fast-import", "--quiet", "--force", "--date-format=now")
 	o.publish()
 	return id
 }
@@ -181,6 +184,9 @@ func (o *Origin) SetDefaultBranch(branch string) {
 // branch.
 func (o *Origin) Head(branch string) string {
 	o.t.Helper()
+	if refs, ok := readRefs(o.dir, "refs/heads/"); ok {
+		return refs[branch]
+	}
 	out, err := o.run("", "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
 	if err != nil {
 		return ""
@@ -340,9 +346,12 @@ func (o *Origin) backend() http.Handler {
 }
 
 // publish writes the files git's file-based HTTP transport reads the refs
-// from.
+// from. An origin that serves the smart transport has no use for them.
 func (o *Origin) publish() {
 	o.t.Helper()
+	if o.smart {
+		return
+	}
 	o.git("", "update-server-info")
 }
 
@@ -443,9 +452,14 @@ func Git(t testing.TB, dir string, args ...string) string {
 
 // Refs maps every ref below prefix of the repository whose git directory is
 // dir, by its name without prefix ("" for every ref, by its full name), to
-// the object id it points at.
+// the object id it points at. It reads the ref files itself where it can
+// rather than start git, since a test process pays for every process it
+// forks (see readRefs).
 func Refs(t testing.TB, dir, prefix string) map[string]string {
 	t.Helper()
+	if refs, ok := readRefs(dir, prefix); ok {
+		return refs
+	}
 	args := []string{"for-each-ref", "--format=%(refname) %(objectname)"}
 	if prefix != "" {
 		args = append(args, prefix) // an empty pattern would match no ref

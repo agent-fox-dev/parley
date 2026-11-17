@@ -7,6 +7,7 @@ import (
 	"errors"
 	"maps"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +28,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/policy"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
+
+// TestMain runs the package's tests at most hubtest.HubParallel at a time:
+// they start many hubs, which contend for one lock past that (see
+// hubtest.HubParallel).
+func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
+	os.Exit(m.Run())
+}
 
 // world is a hub with the policy composed: the org o1, whose members are
 // dana and mel, and the outsider oz, each with an API key; dana's ready
