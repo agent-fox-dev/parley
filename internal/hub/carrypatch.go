@@ -19,7 +19,10 @@ const carryPatchHook = "carry_patch"
 // remembered resolutions on, the integration branch written) before the
 // workspace is ready, and as the patch-branch lookup of the push route,
 // which leaves the patch branches to the patch list, without the workspace
-// package knowing the mode's work. A workspace's delete removes its patches
+// package knowing the mode's work, and as the extension of the syncs of
+// those workspaces, which fetches upstream before a sync moves anything and
+// reports the upstream's movement in the sync's answer and its record. A
+// workspace's delete removes its patches
 // and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
 // one as a job of the hub's queue, and the handler of those jobs, which
@@ -49,6 +52,7 @@ func composeCarryPatch(c *Composition) {
 	c.AddSchemaStep(carrypatch.RerereSchemaStep)
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
+	c.workspaces.RegisterSyncExtension(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveRerereEntries)
 	comp.RegisterRebuildEnqueuer(comp)

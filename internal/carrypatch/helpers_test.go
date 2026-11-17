@@ -1314,3 +1314,191 @@ func (h *rebuildHub) preview(t *testing.T, slug string) answer {
 	t.Helper()
 	return h.call(t, h.key, http.MethodGet, "/workspaces/"+slug+"/rebuild-preview", nil, nil)
 }
+
+// syncFixture is the rebuild fixture for the sync of its workspace, whose
+// upstream fetches it counts and lets a test look in on.
+type syncFixture struct {
+	*rebuildFixture
+	fetches *upstreamFetches
+}
+
+// upstreamFetches counts the upstream fetches of the carry-patch
+// component, and calls onFetch, when set, at the start of each, before git
+// runs.
+type upstreamFetches struct {
+	mu      sync.Mutex
+	calls   int
+	onFetch func()
+}
+
+// count is the number of upstream fetches since the fixture started.
+func (u *upstreamFetches) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
+}
+
+// before makes fn run at the start of every upstream fetch from now on,
+// on the goroutine of the fetch; nil runs nothing.
+func (u *upstreamFetches) before(fn func()) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.onFetch = fn
+}
+
+// syncOptions are what a test changes of the sync fixture: the carry-patch
+// component's dependencies, changed by deps after the fixture's own
+// changes, and the composition, changed by compose after the fixture's own.
+type syncOptions struct {
+	deps    func(d *carrypatch.Deps)
+	compose func(c *hub.Composition)
+}
+
+// startSyncFixture starts the sync fixture, with the workspace's record
+// changed by edit before it is stored.
+func startSyncFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *syncFixture {
+	t.Helper()
+	return startSyncFixtureWith(t, syncOptions{}, edit...)
+}
+
+// startSyncFixtureWith starts the sync fixture with o, with the
+// workspace's record changed by edit before it is stored.
+func startSyncFixtureWith(t *testing.T, o syncOptions, edit ...func(w *workspace.Workspace)) *syncFixture {
+	t.Helper()
+	u := &upstreamFetches{}
+	f := &syncFixture{fetches: u}
+	f.rebuildFixture = startFixture(t, fixtureOptions{
+		compose: o.compose,
+		deps: func(d *carrypatch.Deps) {
+			fetch := d.FetchRemote
+			d.FetchRemote = func(ctx context.Context, dir, url, name string, cred gitrepo.Credential, deadline time.Duration) (map[string]string, error) {
+				u.mu.Lock()
+				u.calls++
+				fn := u.onFetch
+				u.mu.Unlock()
+				if fn != nil {
+					fn()
+				}
+				return fetch(ctx, dir, url, name, cred, deadline)
+			}
+			if o.deps != nil {
+				o.deps(d)
+			}
+		},
+	}, edit...)
+	// The set-up of the fixture fetched upstream; the count starts after it.
+	u.mu.Lock()
+	u.calls = 0
+	u.mu.Unlock()
+	return f
+}
+
+// syncAnswer is a decoded answer of the sync route: the members of a
+// completed sync in body, or an error.
+type syncAnswer struct {
+	status int
+	raw    []byte
+	body   map[string]any
+	Error  struct {
+		ErrorType string `json:"error_type"`
+		Message   string `json:"message"`
+	} `json:"error"`
+}
+
+// sync sends POST /api/v1/workspaces/<slug>/sync, with the query given
+// when it is not "", as the owner and decodes the answer.
+func (f *syncFixture) sync(t *testing.T, query string) syncAnswer {
+	t.Helper()
+	path := "/api/v1/workspaces/" + f.slug + "/sync"
+	if query != "" {
+		path += "?" + query
+	}
+	status, body := f.Call(t, http.MethodPost, path, f.key, nil)
+	a := syncAnswer{status: status, raw: body}
+	if err := json.Unmarshal(body, &a); err != nil {
+		t.Fatalf("POST %s = %d %s: %v", path, status, body, err)
+	}
+	if err := json.Unmarshal(body, &a.body); err != nil {
+		t.Fatalf("POST %s = %d %s: %v", path, status, body, err)
+	}
+	return a
+}
+
+// mustSync syncs the workspace and fails the test unless the sync
+// completed.
+func (f *syncFixture) mustSync(t *testing.T) syncAnswer {
+	t.Helper()
+	a := f.sync(t, "")
+	if a.status != http.StatusOK {
+		t.Fatalf("sync %s = %d %s, want 200", f.slug, a.status, a.raw)
+	}
+	return a
+}
+
+// originBranch sets branch on origin to the commit id, which the hub's
+// copy holds.
+func (f *syncFixture) originBranch(t *testing.T, branch, id string) {
+	t.Helper()
+	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.origin.Dir(), id+":refs/heads/"+branch)
+}
+
+// setSettings sets the workspace's settings given through the workspace
+// update route, as the owner.
+func (f *syncFixture) setSettings(t *testing.T, settings map[string]any) {
+	t.Helper()
+	if status, raw := f.Call(t, http.MethodPatch, "/api/v1/workspaces/"+f.slug, f.key, map[string]any{"settings": settings}); status != http.StatusOK {
+		t.Fatalf("set the settings %v of %s = %d %s, want 200", settings, f.slug, status, raw)
+	}
+}
+
+// setColumn stores value as the column of the workspace's record, as the
+// hub's own writes would leave it.
+func (f *syncFixture) setColumn(t *testing.T, column string, value any) {
+	t.Helper()
+	if _, err := f.Store.Main().Exec(`UPDATE workspaces SET `+column+` = ? WHERE slug = ?`, value, f.slug); err != nil {
+		t.Fatalf("set %s of %s: %v", column, f.slug, err)
+	}
+}
+
+// heads are the branches of the hub's copy, by name without refs/heads/.
+func (f *syncFixture) heads(t *testing.T) map[string]string {
+	t.Helper()
+	return gitrepotest.Refs(t, f.copy, "refs/heads/")
+}
+
+// eventCount is the number of stored events of the workspace whose type
+// is like typ, a pattern of SQL's LIKE.
+func (f *syncFixture) eventCount(t *testing.T, typ string) int {
+	t.Helper()
+	var n int
+	if err := f.Store.Main().QueryRow(`SELECT COUNT(*) FROM hub_events WHERE workspace = ? AND type LIKE ?`, f.slug, typ).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// rebuildJobs are the rebuild jobs of the workspace, newest first.
+func (f *syncFixture) rebuildJobs(t *testing.T) []jobs.Job {
+	t.Helper()
+	js, err := f.queue.List(context.Background(), carrypatch.RebuildJobType, f.slug, "", nil, 200)
+	if err != nil {
+		t.Fatalf("list the rebuild jobs of %s: %v", f.slug, err)
+	}
+	return js
+}
+
+// headsIn are the branches of the repository dir, by name without
+// refs/heads/, for a caller off the test's goroutine.
+func headsIn(dir string) (map[string]string, error) {
+	out, err := gitrepotest.Run(dir, "", "for-each-ref", "--format=%(refname:lstrip=2) %(objectname)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	heads := map[string]string{}
+	for line := range strings.Lines(out) {
+		if name, id, ok := strings.Cut(strings.TrimSpace(line), " "); ok {
+			heads[name] = id
+		}
+	}
+	return heads, nil
+}
