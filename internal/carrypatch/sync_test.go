@@ -309,3 +309,67 @@ func TestSync_WritesUpstreamHead(t *testing.T) {
 		t.Errorf("stored upstream_head_sha = %s, want %s", got, head)
 	}
 }
+
+// The per-branch pass leaves the branches of live patches alone, whether
+// origin is ahead of or diverged from them, with or without a reset to
+// origin, while it still syncs every other branch.
+func TestSync_PatchBranchesLeftOutOfBranchPass(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, map[string]any{"patch_branch_source": "hub"})
+	a := f.addPatch(t, "patch/a")
+	f.addPatch(t, "patch/b", withStatus(carrypatch.StatusDisabled))
+	aTip := refIn(f.copy, "refs/heads/patch/a")
+	f.originBranch(t, "patch/a", gitrepotest.Commit(t, f.copy, "A2", map[string]string{"a.txt": "2\n"}, aTip))
+	f.originBranch(t, "patch/b", gitrepotest.Commit(t, f.copy, "B on origin", map[string]string{"b.txt": "origin\n"}, f.base))
+	f.originBranch(t, "deploy", gitrepotest.Commit(t, f.copy, "D on origin", map[string]string{"d.txt": "origin\n"}, f.base))
+	feat1 := gitrepotest.Commit(t, f.copy, "F1", map[string]string{"feat.txt": "1\n"}, f.base)
+	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/feat", feat1)
+	f.originBranch(t, "feat", gitrepotest.Commit(t, f.copy, "F2", map[string]string{"feat.txt": "2\n"}, feat1))
+
+	// The rows are consecutive syncs of one workspace.
+	for _, query := range []string{"reset_to_origin=false", "reset_to_origin=true"} {
+		t.Run(query, func(t *testing.T) {
+			before := f.heads(t)
+			r := f.sync(t, query)
+			if r.status != http.StatusOK {
+				t.Fatalf("sync = %d %s, want 200", r.status, r.raw)
+			}
+			results := r.branches(t)
+			if _, ok := results["feat"]; !ok {
+				t.Errorf("branches = %v, want an entry for feat", results)
+			}
+			for _, name := range []string{a.BranchName, "patch/b", "deploy"} {
+				if res, ok := results[name]; ok {
+					t.Errorf("branches has %s with %s, want it left out", name, res)
+				}
+			}
+			after := f.heads(t)
+			for _, name := range []string{a.BranchName, "patch/b"} {
+				if after[name] != before[name] {
+					t.Errorf("%s = %s, want %s unchanged", name, after[name], before[name])
+				}
+			}
+		})
+	}
+}
+
+// The branch of a deleted patch is an ordinary branch of the per-branch
+// pass.
+func TestSync_DeletedPatchBranchIsOrdinary(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	gone := gitrepotest.Commit(t, f.copy, "G1", map[string]string{"gone.txt": "1\n"}, f.base)
+	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/patch/gone", gone)
+	f.put(t, deletedPatch(f.slug, "patch/gone", f.clock()))
+	theirs := gitrepotest.Commit(t, f.copy, "G2", map[string]string{"gone.txt": "2\n"}, gone)
+	f.originBranch(t, "patch/gone", theirs)
+
+	r := f.mustSync(t)
+	if got := r.branches(t)["patch/gone"]; got != string(workspace.BranchFastForward) {
+		t.Errorf("patch/gone's result = %q, want %s", got, workspace.BranchFastForward)
+	}
+	if got := refIn(f.copy, "refs/heads/patch/gone"); got != theirs {
+		t.Errorf("patch/gone = %s, want origin's %s", got, theirs)
+	}
+}

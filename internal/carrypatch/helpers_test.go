@@ -1502,3 +1502,19 @@ func headsIn(dir string) (map[string]string, error) {
 	}
 	return heads, nil
 }
+
+// branches are the results of the answer's branch list, by branch name.
+func (a syncAnswer) branches(t *testing.T) map[string]string {
+	t.Helper()
+	list, ok := a.body["branches"].([]any)
+	if !ok {
+		t.Fatalf("the answer %s has no branch list", a.raw)
+	}
+	results := map[string]string{}
+	for _, e := range list {
+		entry, _ := e.(map[string]any)
+		name, _ := entry["name"].(string)
+		results[name], _ = entry["result"].(string)
+	}
+	return results
+}
