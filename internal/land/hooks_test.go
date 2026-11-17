@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/change"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -104,6 +105,90 @@ func TestRun_EndsTheAttemptAsTheTargetGuardSays(t *testing.T) {
 			fails := w.landEvents(t, land.EventLandFail, a.ID)
 			if len(fails) != 1 || metadata(t, fails[0])["reason"] != c.reason {
 				t.Errorf("land_fail events %v, want one with reason %s", fails, c.reason)
+			}
+		})
+	}
+}
+
+// scriptedTargetGuard answers its nth question with answers[n], allowing
+// every question past the last answer, and keeps what it was asked.
+type scriptedTargetGuard struct {
+	mu      sync.Mutex
+	answers []land.TargetAnswer
+	asked   []land.TargetInput
+}
+
+func (g *scriptedTargetGuard) Check(_ context.Context, in land.TargetInput) (land.TargetAnswer, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := len(g.asked)
+	g.asked = append(g.asked, in)
+	if n < len(g.answers) {
+		return g.answers[n], nil
+	}
+	return land.TargetAnswer{}, nil
+}
+
+func (g *scriptedTargetGuard) calls() []land.TargetInput {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.asked)
+}
+
+// A guard that forwards the head it allows to origin, as carry-patch push
+// control does, must be asked about the head a retry rebuilt on a target
+// that moved, or the land would swap in a head origin never received.
+func TestRun_AsksTheTargetGuardsAgainAboutTheHeadARetryRebuilt(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		// second is the guard's answer about the rebuilt head.
+		second land.TargetAnswer
+		status string
+		error  string
+	}{
+		{name: "the rebuilt head is allowed too", status: land.StatusLanded},
+		{name: "origin rejects the rebuilt head", second: land.TargetAnswer{OriginRejected: "non-fast-forward"},
+			status: land.StatusFailed, error: land.ErrorOriginRejected},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t)
+			guard := &scriptedTargetGuard{answers: []land.TargetAnswer{{}, c.second}}
+			w.land.AddTargetGuard(guard)
+			ch := w.open(t, "feature")
+			before := head(t, w.api, "main")
+			var moved string
+			land.SetSeams(w.land, land.Seams{BeforeSwap: func(_ context.Context, _ string, try int) {
+				if try == 1 {
+					// Another writer moves the target after the guard
+					// allowed the first head and before it is swapped.
+					moved = commit(t, w.api, "main", before, "moved", map[string]string{"moved.txt": "m\n"})
+				}
+			}})
+
+			a := w.landNow(t, ch, w.caller(), nil)
+
+			if a.Status != c.status || a.Attempts != 2 || c.error != "" && (a.Error == nil || *a.Error != c.error) {
+				t.Fatalf("attempt %s (%v) after %d tries, want %s %s after 2", a.Status, a.Error, a.Attempts, c.status, c.error)
+			}
+			asked := guard.calls()
+			if len(asked) != 2 {
+				t.Fatalf("guard asked %+v, want once about each try's head", asked)
+			}
+			if asked[0].Old != before || asked[1].Old != moved || asked[1].New == asked[0].New {
+				t.Errorf("guard asked %+v, want the first head onto %.7s, then a rebuilt head onto the moved %.7s",
+					asked, before, moved)
+			}
+			if parent := gitrepotest.Git(t, w.api, "rev-parse", asked[1].New+"^"); parent != moved {
+				t.Errorf("the head of the second question has parent %.7s, want the moved head %.7s", parent, moved)
+			}
+			want := moved
+			if c.status == land.StatusLanded {
+				want = asked[1].New
+			}
+			if got := head(t, w.api, "main"); got != want {
+				t.Errorf("main is at %.7s, want %.7s", got, want)
 			}
 		})
 	}

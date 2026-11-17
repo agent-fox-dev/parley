@@ -54,9 +54,9 @@ type TargetAnswer struct {
 }
 
 // TargetGuard judges the move of a land's target once the changes are
-// replayed and before the target is first swapped. An error in place of an
-// answer ends the attempt failed internal: a guard that cannot decide
-// never allows.
+// replayed and before the target is swapped, again for each head a retry
+// on a moved target rebuilds. An error in place of an answer ends the
+// attempt failed internal: a guard that cannot decide never allows.
 type TargetGuard interface {
 	Check(ctx context.Context, in TargetInput) (TargetAnswer, error)
 }

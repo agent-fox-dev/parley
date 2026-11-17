@@ -5679,10 +5679,11 @@ block or `policy` when it gave none, and the `error` of a failure
 writes none.
 
 A feature installed on the hub may guard the move of a target branch. Such
-a target guard is asked once, after the changes are replayed and before the
+a target guard is asked after the changes are replayed and before the
 first compare-and-swap, with the workspace, the target branch, its head
-before the land and the head the land would make it; a retry on a moved
-target asks it nothing again. A guard that refuses ends the attempt
+before the land and the head the land would make it; a retry on a target
+that moved meanwhile asks it again about the head rebuilt on the new one,
+before that head is swapped in. A guard that refuses ends the attempt
 `blocked`, with `blocked` `{"change": <the top change>, "status":
 "blocked", "requirements": []}` and the guard's reason as the `reason` of
 `parley.change.land_fail`; a guard that reports a rejection by origin ends
