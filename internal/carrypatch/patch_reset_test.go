@@ -33,11 +33,18 @@ const (
 )
 
 // commitOn writes a commit with the message msg and an empty tree on top of
-// parent into the repository dir and returns its id.
+// parent into the repository dir and returns its id, in one run of git
+// fast-import; deleteall empties the tree whatever parent's holds.
 func commitOn(t *testing.T, dir, parent, msg string) string {
 	t.Helper()
-	tree := gitrepotest.Git(t, dir, "hash-object", "-t", "tree", "-w", "--stdin")
-	return gitrepotest.Git(t, dir, "commit-tree", tree, "-p", parent, "-m", msg)
+	const scratch = "refs/carrypatch-test/commit"
+	stream := fmt.Sprintf("commit %s\nmark :1\ncommitter Origin <origin@example.invalid> now\ndata %d\n%s\n\nfrom %s\ndeleteall\n\nget-mark :1\nreset %s\n\n",
+		scratch, len(msg)+1, msg, parent, scratch)
+	id, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet", "--date-format=now")
+	if err != nil {
+		t.Fatalf("write a commit on %s into %s: %v", parent, dir, err)
+	}
+	return id
 }
 
 // diverge gives the copy's patch/a a commit on top of origin's tip and
@@ -45,7 +52,7 @@ func commitOn(t *testing.T, dir, parent, msg string) string {
 func (rc *resetCase) diverge(t *testing.T) string {
 	t.Helper()
 	hub := commitOn(t, rc.copy, refIn(rc.copy, headA), "on the hub")
-	gitrepotest.Git(t, rc.copy, "update-ref", headA, hub)
+	gitrepotest.SetRef(t, rc.copy, headA, hub)
 	rc.origin.Commit("patch/a", "on origin")
 	return hub
 }
@@ -76,14 +83,14 @@ var resetStates = []resetState{
 	}, "fast_forwarded", ""},
 	{"both sides have a commit the other lacks", func(t *testing.T, rc *resetCase) { rc.diverge(t) }, "replaced", "old"},
 	{"the hub is ahead of origin by 1 commit", func(t *testing.T, rc *resetCase) {
-		gitrepotest.Git(t, rc.copy, "update-ref", headA, commitOn(t, rc.copy, refIn(rc.copy, headA), "on the hub"))
+		gitrepotest.SetRef(t, rc.copy, headA, commitOn(t, rc.copy, refIn(rc.copy, headA), "on the hub"))
 	}, "replaced", "old"},
 	{"diverged with an earlier backup ref", func(t *testing.T, rc *resetCase) {
-		gitrepotest.Git(t, rc.copy, "update-ref", backupA, commitIn(t, rc.copy, "K"))
+		rootsAt(t, rc.copy, map[string]string{backupA: "K"})
 		rc.diverge(t)
 	}, "replaced", "old"},
 	{"the tips are equal with an earlier backup ref", func(t *testing.T, rc *resetCase) {
-		gitrepotest.Git(t, rc.copy, "update-ref", backupA, commitIn(t, rc.copy, "K"))
+		rootsAt(t, rc.copy, map[string]string{backupA: "K"})
 	}, "none", "K"},
 }
 
@@ -319,7 +326,7 @@ func TestResetToOrigin_MissingOnOrigin(t *testing.T) {
 		p.OriginSyncState, p.OriginSHA = new("in_sync"), new(refIn(rc.copy, headA))
 	})
 	gitrepotest.Git(t, rc.origin.Dir(), "update-ref", "-d", headA)
-	gitrepotest.Git(t, rc.origin.Dir(), "update-server-info")
+	rc.origin.Publish()
 	path := "/workspaces/" + rc.slug + "/patches/" + rc.patch.ID
 	before, refs := h.get(t, path), gitrepotest.Refs(t, rc.copy, "")
 

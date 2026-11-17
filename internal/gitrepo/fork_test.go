@@ -25,7 +25,7 @@ import (
 func forkParent(t *testing.T, n int) (dir, mainHead, release, v1 string) {
 	t.Helper()
 	dir = filepath.Join(t.TempDir(), "parent.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	var s strings.Builder
 	commit := func(ref string, mark int, from int) {
 		msg, content := fmt.Sprintf("commit %d", mark), fmt.Sprintf("content %d\n", mark)

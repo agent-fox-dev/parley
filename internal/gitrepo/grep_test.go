@@ -16,7 +16,7 @@ import (
 func searchRepo(t *testing.T) (*gitrepo.Repo, string) {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	if _, err := gitrepotest.Run(dir, gitrepotest.SearchStream(), "fast-import", "--quiet"); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestGrep_ContinuesAfterAMatch(t *testing.T) {
 
 func TestGrep_ContinuesAfterAnyPath(t *testing.T) {
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	paths := []string{":x/1", "a b", "a*b", "a-b", "a.b/c", "a/b", "a/b/c", "a[b]", "a\\b", "a?", "ab", "é/ü", "\xff"}
 	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nx\n"
 	for _, p := range paths {

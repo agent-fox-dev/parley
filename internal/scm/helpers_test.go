@@ -69,7 +69,7 @@ type revisionRepo struct {
 func newRevisionRepo(t *testing.T) *revisionRepo {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	const who = "committer T <t@example.invalid> 1700000000 +0000\n"
 	commit := func(ref, msg, from, file string) string {
 		s := "commit " + ref + "\nmark :" + msg[1:] + "\n" + who + "data 2\n" + msg + "\n"
@@ -307,7 +307,7 @@ func (p *packageTB) cleanup() {
 func (w *world) addWorkspace(t testing.TB, slug, org, stream string) string {
 	t.Helper()
 	ctx, now, dir := context.Background(), time.Now().UTC(), w.workspaces.RepoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
 		t.Fatal(err)
 	}

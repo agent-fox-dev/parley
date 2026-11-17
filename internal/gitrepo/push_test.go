@@ -17,7 +17,7 @@ func TestPush_SendsOnlyTheOneBranch(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.SmartOrigin(t)
 	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	tree := gitrepotest.Git(t, dir, "mktree")
 	a := gitrepotest.Git(t, dir, "commit-tree", tree, "-m", "on a")
 	b := gitrepotest.Git(t, dir, "commit-tree", tree, "-p", a, "-m", "on b")
@@ -38,7 +38,7 @@ func TestPush_SendsOnlyTheOneBranch(t *testing.T) {
 func TestPush_ClassifiesTheFailuresOfTheSSHTransport(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "copy.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	commit := gitrepotest.Git(t, dir, "commit-tree", gitrepotest.Git(t, dir, "mktree"), "-m", "a")
 	// The ssh git starts for a git@ origin writes what a real one or the
 	// forge behind it writes, and fails.

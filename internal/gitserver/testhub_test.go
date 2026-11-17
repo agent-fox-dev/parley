@@ -132,7 +132,7 @@ func startWorld(t *testing.T, cfg hubtest.Config, service *recorder) *world {
 	w.AddWorkspace(t, access.Record{Slug: "solo", OwnerID: w.owner, OrgID: "org-deleted", Kind: access.KindRepository, Status: access.StatusReady})
 	w.AddWorkspace(t, access.Record{Slug: "other", OwnerID: w.stranger, OrgID: beta, Kind: access.KindRepository, Status: access.StatusReady})
 	w.repo = w.workspaces.RepoPath("demo")
-	gitrepotest.Git(t, w.repo, "init", "--quiet", "--bare", "--initial-branch=main", w.repo)
+	gitrepotest.InitBare(t, w.repo, "main")
 	stream := "commit refs/heads/main\nmark :1\ncommitter P <p@example.invalid> now\ndata 5\nfirst\nM 100644 inline README\ndata 2\n1\n" +
 		"commit refs/heads/main\nmark :2\ncommitter P <p@example.invalid> now\ndata 6\nsecond\nfrom :1\nM 100644 inline README\ndata 2\n2\n"
 	if _, err := gitrepotest.Run(w.repo, stream, "fast-import", "--quiet", "--date-format=now"); err != nil {

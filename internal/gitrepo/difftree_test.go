@@ -26,7 +26,7 @@ type diffFixture struct {
 func newDiffFixture(t *testing.T) diffFixture {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	const who = "committer T <t@example.invalid> 1700000000 +0000\n"
 	stream := "commit refs/heads/main\nmark :1\n" + who + data("c1") +

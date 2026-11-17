@@ -21,7 +21,7 @@ var revertAs = gitrepo.Signature{Name: "Lander", Email: "lander@example.invalid"
 func newRevertFixture(t *testing.T) compareFixture {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	const committer = "committer T <t@example.invalid> 1700000000 +0000\n"
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	commit := func(ref, mark, from, msg string, files ...string) string {

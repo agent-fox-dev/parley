@@ -85,7 +85,17 @@ func WithSmartHTTP() Option {
 func SmartOrigin(t testing.TB, opts ...Option) *Origin {
 	t.Helper()
 	o := NewOrigin(t, append(opts, WithSmartHTTP())...)
-	o.git("", "config", "http.receivepack", "true")
+	// What git config http.receivepack true writes, without a git process.
+	cfg, err := os.OpenFile(filepath.Join(o.dir, "config"), os.O_APPEND|os.O_WRONLY, 0)
+	if err == nil {
+		_, err = cfg.WriteString("[http]\n\treceivepack = true\n")
+		if cerr := cfg.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		t.Fatalf("origin: enable receive-pack: %v", err)
+	}
 	return o
 }
 
@@ -98,8 +108,8 @@ func NewOrigin(t testing.TB, opts ...Option) *Origin {
 	for _, opt := range opts {
 		opt(o)
 	}
-	o.git("", "init", "--quiet", "--bare", "--initial-branch=main")
-	o.publish()
+	InitBare(t, o.dir, "main")
+	o.Publish()
 	o.files = http.StripPrefix("/"+repoName, http.FileServer(http.Dir(o.dir)))
 	if o.smart {
 		o.files = o.backend()
@@ -149,7 +159,7 @@ func (o *Origin) Commit(branch, msg string) string {
 	// tree holds.
 	fmt.Fprintf(&stream, "deleteall\nM 100644 inline README\n%s\nget-mark :1\n", fastData(content))
 	id := o.git(stream.String(), "fast-import", "--quiet", "--force", "--date-format=now")
-	o.publish()
+	o.Publish()
 	return id
 }
 
@@ -158,8 +168,8 @@ func (o *Origin) Commit(branch, msg string) string {
 func (o *Origin) Branch(branch, ref string) string {
 	o.t.Helper()
 	id := o.git("", "rev-parse", "--verify", ref+"^{commit}")
-	o.git("", "update-ref", "refs/heads/"+branch, id)
-	o.publish()
+	SetRef(o.t, o.dir, "refs/heads/"+branch, id)
+	o.Publish()
 	return id
 }
 
@@ -169,7 +179,7 @@ func (o *Origin) Tag(name, ref string) string {
 	o.t.Helper()
 	id := o.git("", "rev-parse", "--verify", ref+"^{commit}")
 	o.git("", "update-ref", "refs/tags/"+name, id)
-	o.publish()
+	o.Publish()
 	return id
 }
 
@@ -177,7 +187,7 @@ func (o *Origin) Tag(name, ref string) string {
 func (o *Origin) SetDefaultBranch(branch string) {
 	o.t.Helper()
 	o.git("", "symbolic-ref", "HEAD", "refs/heads/"+branch)
-	o.publish()
+	o.Publish()
 }
 
 // Head is the commit id branch points at, or "" when there is no such
@@ -345,11 +355,16 @@ func (o *Origin) backend() http.Handler {
 	}
 }
 
-// publish writes the files git's file-based HTTP transport reads the refs
-// from. An origin that serves the smart transport has no use for them.
-func (o *Origin) publish() {
+// Publish writes the files git's file-based HTTP transport reads the refs
+// from, as git update-server-info does, which a test calls after it wrote
+// into the origin's repository with git itself; Commit, Branch, Tag and the
+// other writers of Origin publish on their own. An origin that serves the
+// smart transport has no use for the files. It writes them itself where it
+// can rather than start git, since a test process pays for every process it
+// forks.
+func (o *Origin) Publish() {
 	o.t.Helper()
-	if o.smart {
+	if o.smart || writeServerInfo(o.dir) {
 		return
 	}
 	o.git("", "update-server-info")
@@ -401,7 +416,7 @@ func (o *Origin) History() (mainHead, devHead, v1 string) {
 	if len(heads) != 3 {
 		o.t.Fatalf("origin: the history's heads are %v, want three", heads)
 	}
-	o.publish()
+	o.Publish()
 	return heads[0], heads[1], heads[2]
 }
 
@@ -527,7 +542,7 @@ func ObjectCounts(t testing.TB, dir string) map[string]string {
 func PushCommit(t testing.TB, src, dest, branch, content string) string {
 	t.Helper()
 	client := filepath.Join(t.TempDir(), "client.git")
-	Git(t, client, "init", "--quiet", "--bare", client)
+	InitBare(t, client, "")
 	Git(t, client, "fetch", "--quiet", src, "main:main")
 	blob, err := Run(client, content, "hash-object", "-w", "--stdin")
 	if err != nil {

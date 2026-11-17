@@ -259,7 +259,7 @@ func startFixture(t *testing.T, o fixtureOptions, edit ...func(w *workspace.Work
 		},
 	}, edit...)...)
 	f.copy = f.repoPath(f.slug)
-	gitrepotest.Git(t, f.copy, "init", "--quiet", "--bare", f.copy)
+	gitrepotest.InitBare(t, f.copy, "")
 	if err := f.comp.EnsureSetup(context.Background(), f.record(t)); err != nil {
 		t.Fatalf("set up the workspace %s: %v", f.slug, err)
 	}
@@ -299,7 +299,7 @@ func (f *rebuildFixture) putPatch(t *testing.T, branch, tip string, edit ...func
 	if err != nil {
 		t.Fatal(err)
 	}
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/"+branch, tip)
 	p := livePatch(f.slug, branch, len(live)+1)
 	for _, fn := range edit {
 		fn(&p)
@@ -910,7 +910,7 @@ func (f *conflictFixture) another(t *testing.T, slug string) *conflictFixture {
 	})
 	g := &rebuildFixture{addHub: f.addHub, slug: slug, upstream: f.upstream, origin: f.origin,
 		copy: f.repoPath(slug), comp: f.comp, queue: f.queue, secrets: f.secrets, runner: f.runner}
-	gitrepotest.Git(t, g.copy, "init", "--quiet", "--bare", g.copy)
+	gitrepotest.InitBare(t, g.copy, "")
 	if err := g.comp.EnsureSetup(context.Background(), g.record(t)); err != nil {
 		t.Fatalf("set up the workspace %s: %v", slug, err)
 	}
@@ -1019,7 +1019,7 @@ func (f *rebuildFixture) onOrigin(t *testing.T, recorded bool) string {
 	x := gitrepotest.Commit(t, f.copy, "deployed elsewhere", map[string]string{"deployed.txt": "x\n"}, f.base)
 	gitrepotest.Git(t, f.copy, "push", "--quiet", f.origin.Dir(), x+":refs/heads/deploy")
 	if recorded {
-		gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/origin/deploy", x)
+		gitrepotest.SetRef(t, f.copy, "refs/remotes/origin/deploy", x)
 	}
 	return x
 }
@@ -1352,7 +1352,7 @@ func TestRebuild_ListsPatchesInPositionOrder(t *testing.T) {
 	tips := map[string]string{}
 	for _, b := range []string{"p1", "p2", "p3", "p4"} {
 		tips[b] = gitrepotest.Commit(t, f.copy, b, map[string]string{b + ".txt": b + "\n"}, f.base)
-		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+b, tips[b])
+		gitrepotest.SetRef(t, f.copy, "refs/heads/"+b, tips[b])
 	}
 	// The list's order is not the order the patches were stored in.
 	p1, p2, p3 := livePatch(f.slug, "p1", 1), livePatch(f.slug, "p2", 2), livePatch(f.slug, "p3", 3)

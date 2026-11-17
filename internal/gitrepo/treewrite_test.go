@@ -34,7 +34,7 @@ type entry struct{ mode, id string }
 func newTreeFixture(t *testing.T) treeFixture {
 	t.Helper()
 	dir := t.TempDir()
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	data := func(s string) string { return "data " + strconv.Itoa(len(s)) + "\n" + s + "\n" }
 	stream := "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\n" + data("c1") +
 		"M 100644 inline a.txt\n" + data("a\n") +

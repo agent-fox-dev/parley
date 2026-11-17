@@ -62,7 +62,7 @@ func TestRefresh_Outcomes(t *testing.T) {
 			p.ConflictFiles = []string{"conflict.txt"}
 		}
 		if row.hub != "" {
-			gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+row.branch, row.hub)
+			gitrepotest.SetRef(t, f.copy, "refs/heads/"+row.branch, row.hub)
 		}
 		if row.origin != "" {
 			f.originBranch(t, row.branch, row.origin)
@@ -160,7 +160,7 @@ func TestRefresh_ReplaceSavesBackup(t *testing.T) {
 	b := f.addPatch(t, "patch/b")
 	old := refIn(f.copy, "refs/heads/patch/b")
 	older := f.commitOn(t, f.base, "older", map[string]string{"b.txt": "older\n"})
-	gitrepotest.Git(t, f.copy, "update-ref", carrypatch.ReplacedRefPrefix+"patch/b", older)
+	gitrepotest.SetRef(t, f.copy, carrypatch.ReplacedRefPrefix+"patch/b", older)
 	theirs := f.commitOn(t, f.base, "B on origin", map[string]string{"b.txt": "origin\n"})
 	f.originBranch(t, "patch/b", theirs)
 
@@ -232,7 +232,7 @@ func TestRefresh_SkipsMergedAndDeleted(t *testing.T) {
 	before := refIn(f.copy, "refs/heads/patch/m")
 	f.originAhead(t, "patch/m", "origin")
 	gone := gitrepotest.Commit(t, f.copy, "G1", map[string]string{"gone.txt": "1\n"}, f.base)
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/patch/gone", gone)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/patch/gone", gone)
 	f.put(t, deletedPatch(f.slug, "patch/gone", f.clock()))
 	f.originAhead(t, "patch/gone", "origin")
 

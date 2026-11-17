@@ -366,7 +366,7 @@ func newChangeHubWith(t testing.TB, clock func() time.Time, adjust func(*awarene
 	org := h.CreateOrg(t, "acme")
 	h.AddMember(t, org, owner)
 	dir := workspaces.RepoPath("demo")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	base := commit(t, dir, "main", "", map[string]string{"api/a.go": "a\n"})
 	now := time.Now().UTC()
 	rec := workspace.Workspace{

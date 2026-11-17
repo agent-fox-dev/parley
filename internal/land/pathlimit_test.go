@@ -24,7 +24,7 @@ import (
 func pathRepo(t *testing.T) (*gitrepo.Repo, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "repo.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	gitrepotest.InitBare(t, dir, "main")
 	repo, err := (gitrepo.Git{}).Open(context.Background(), dir)
 	if err != nil {
 		t.Fatal(err)

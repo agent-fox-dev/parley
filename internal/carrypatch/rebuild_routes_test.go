@@ -849,7 +849,7 @@ func (h *rebuildHub) unchanged(t *testing.T, slug string, before rebuildState) {
 func (h *rebuildHub) routeJobs(t *testing.T, slug string) map[string]string {
 	t.Helper()
 	dir, h1, h2 := h.rollbackRepo(t, slug)
-	gitrepotest.Git(t, dir, "update-ref", "refs/remotes/upstream/main", h1)
+	gitrepotest.SetRef(t, dir, "refs/remotes/upstream/main", h1)
 	completed := h.settledRebuild(t, slug, rebuiltFrom(h1, h2), nil)
 	deadLetter := h.queueRebuild(t, slug)
 	h.drive(t, deadLetter, jobs.StatusDeadLetter)

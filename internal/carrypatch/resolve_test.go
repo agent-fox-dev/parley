@@ -48,7 +48,7 @@ type resolveFixture struct {
 func newResolveFixture(t *testing.T, url string, env []string, source string) *resolveFixture {
 	t.Helper()
 	f := &resolveFixture{copy: filepath.Join(t.TempDir(), "acme.git")}
-	gitrepotest.Git(t, f.copy, "init", "--quiet", "--bare", f.copy)
+	gitrepotest.InitBare(t, f.copy, "")
 	branch := "main"
 	f.ws = workspace.Workspace{Slug: "acme", Mode: workspace.ModeCarryPatch, Status: workspace.StatusReady,
 		GitURL: &url, DefaultBranch: &branch, Settings: map[string]json.RawMessage{}}
@@ -84,7 +84,7 @@ func (f *resolveFixture) rebind(adjust func(d *carrypatch.Deps)) {
 // setRef points ref of the copy at id.
 func (f *resolveFixture) setRef(t *testing.T, ref, id string) {
 	t.Helper()
-	gitrepotest.Git(t, f.copy, "update-ref", ref, id)
+	gitrepotest.SetRef(t, f.copy, ref, id)
 }
 
 // commit writes a commit with the message msg into the copy, on no ref.

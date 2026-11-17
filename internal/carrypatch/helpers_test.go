@@ -215,14 +215,27 @@ func (h *carryHub) eventTypes(t *testing.T, slug string) []string {
 	return types
 }
 
-// refIn is the commit id ref points at in the repository dir, "" when it
-// does not exist.
+// refIn is the commit id ref, named in full, points at in the repository
+// dir, "" when it does not exist.
 func refIn(dir, ref string) string {
-	id, err := gitrepotest.Run(dir, "", "rev-parse", "--verify", "--quiet", ref)
-	if err != nil {
-		return ""
+	return gitrepotest.Ref(dir, ref)
+}
+
+// rootsAt writes into the repository dir, in one run of git fast-import, a
+// root commit with an empty tree at each ref msgs names, with the message
+// msgs gives it, and returns their ids by ref.
+func rootsAt(t *testing.T, dir string, msgs map[string]string) map[string]string {
+	t.Helper()
+	refs := slices.Sorted(maps.Keys(msgs))
+	commits := make([]histCommit, len(refs))
+	for i, ref := range refs {
+		commits[i] = histCommit{from: -1, msg: msgs[ref], refs: []string{ref}}
 	}
-	return id
+	ids := map[string]string{}
+	for i, id := range writeHistory(t, dir, commits) {
+		ids[refs[i]] = id
+	}
+	return ids
 }
 
 // configIn is the value of key in the repository dir's own configuration,
@@ -345,11 +358,11 @@ func (h *patchHub) carryOf(t *testing.T, slug string, n int) []carrypatch.Patch 
 func (h *patchHub) bareCopy(t *testing.T, slug string) string {
 	t.Helper()
 	dir := h.repoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
-	for _, b := range []string{"patch/a", "patch/b", "patch/c"} {
-		gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+b, commitIn(t, dir, b))
-	}
-	gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"patch/a", commitIn(t, dir, "replaced a"))
+	gitrepotest.InitBare(t, dir, "")
+	rootsAt(t, dir, map[string]string{
+		"refs/heads/patch/a": "patch/a", "refs/heads/patch/b": "patch/b", "refs/heads/patch/c": "patch/c",
+		carrypatch.ReplacedRefPrefix + "patch/a": "replaced a",
+	})
 	return dir
 }
 
@@ -846,10 +859,10 @@ func (h *rebuildHub) gitCommands() []string {
 func (h *rebuildHub) rollbackRepo(t *testing.T, slug string) (dir, h1, h2 string) {
 	t.Helper()
 	dir = h.repoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	h1 = gitrepotest.Commit(t, dir, "H1", map[string]string{"a.txt": "1\n"})
 	h2 = gitrepotest.Commit(t, dir, "H2", map[string]string{"a.txt": "2\n"}, h1)
-	gitrepotest.Git(t, dir, "update-ref", "refs/heads/deploy", h2)
+	gitrepotest.SetRef(t, dir, "refs/heads/deploy", h2)
 	return dir, h1, h2
 }
 
@@ -1317,7 +1330,7 @@ func blobID(content string) string {
 func (h *rebuildHub) previewCopy(t *testing.T, slug string, commits []histCommit) (dir string, ids []string) {
 	t.Helper()
 	dir = h.repoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	gitrepotest.InitBare(t, dir, "")
 	return dir, writeHistory(t, dir, commits)
 }
 
@@ -1528,7 +1541,7 @@ func (f *syncFixture) originAhead(t *testing.T, branch, label string) string {
 	tip := refIn(f.copy, "refs/heads/"+branch)
 	if tip == "" {
 		tip = f.base
-		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
+		gitrepotest.SetRef(t, f.copy, "refs/heads/"+branch, tip)
 	}
 	file := strings.ReplaceAll(branch, "/", "-") + "-" + label + ".txt"
 	id := f.commitOn(t, tip, branch+" "+label, map[string]string{file: label + "\n"})
@@ -1541,7 +1554,7 @@ func (f *syncFixture) originAhead(t *testing.T, branch, label string) string {
 func (f *syncFixture) upstreamTo(t *testing.T, id string) {
 	t.Helper()
 	gitrepotest.Git(t, f.copy, "push", "--quiet", "--force", f.upstream.Dir(), id+":refs/heads/main")
-	gitrepotest.Git(t, f.upstream.Dir(), "update-server-info")
+	f.upstream.Publish()
 }
 
 // wantMerged fails the test unless the answer's patches_merged is want.
