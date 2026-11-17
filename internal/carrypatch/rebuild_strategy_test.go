@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
 
@@ -196,4 +197,147 @@ func TestRebuild_BuildsOutOfSight(t *testing.T) {
 	if got := refIn(f.copy, "refs/heads/deploy"); got != made[1] {
 		t.Errorf("deploy = %s after the publish, want the run's head %s", got, made[1])
 	}
+}
+
+func TestRebuild_NothingToApply(t *testing.T) {
+	t.Parallel()
+	const author = "Ada <ada@example.com> 1600000000 +0200"
+	cases := []struct {
+		name     string
+		strategy string
+		setup    func(t *testing.T, f *rebuildFixture)
+	}{
+		{"rebase: the patch branch points at the upstream base", "rebase", func(t *testing.T, f *rebuildFixture) {
+			f.putPatch(t, "p1", f.base)
+		}},
+		{"rebase: upstream holds the change of the patch's only commit as another commit", "rebase", func(t *testing.T, f *rebuildFixture) {
+			f.putPatch(t, "p1", commitAs(t, f.copy, "c1", author, map[string]string{"x.txt": "x\n"}, f.base))
+			f.moveUpstream(t, "upstream takes c1", map[string]string{"x.txt": "x\n"})
+		}},
+		{"merge: the patch branch points at an ancestor of the upstream base", "merge", func(t *testing.T, f *rebuildFixture) {
+			f.putPatch(t, "p1", f.base)
+			f.moveUpstream(t, "U2", map[string]string{"u2.txt": "u2\n"})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := startRebuildFixture(t)
+			tc.setup(t, f)
+
+			out, id := f.attemptWith(t, carrypatch.RebuildOptions{Strategy: &tc.strategy}, nil)
+			if out.Kind != attemptCompleted {
+				t.Fatalf("the attempt = %+v, want completed", out)
+			}
+			results := f.patchResults(t, id)
+			if len(results) != 1 {
+				t.Fatalf("patch_results = %v, want one", results)
+			}
+			if r := results[0]; r["status"] != "skipped" || r["skipped_reason"] != "nothing_to_apply" || r["new_head_sha"] != nil {
+				t.Errorf("the result of p1 = %v, want skipped with nothing_to_apply and no new_head_sha", r)
+			}
+			base, _ := f.result(t, id)["upstream_head_sha"].(string)
+			if got := refIn(f.copy, "refs/heads/deploy"); base == "" || got != base {
+				t.Errorf("deploy = %s, want the upstream base %q", got, base)
+			}
+		})
+	}
+}
+
+func TestRebuild_MergeAlwaysMakesAMergeCommit(t *testing.T) {
+	t.Parallel()
+	const author = "Ada <ada@example.com> 1600000000 +0200"
+	cases := []struct {
+		name         string
+		moveUpstream bool
+	}{
+		{"the patch branch could fast-forward", false},
+		{"upstream has moved so a real merge is needed", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := startRebuildFixture(t)
+			source := commitAs(t, f.copy, "x1", author, map[string]string{"x.txt": "x\n"}, f.base)
+			f.putPatch(t, "feature/x", source)
+			if tc.moveUpstream {
+				f.moveUpstream(t, "U2", map[string]string{"u2.txt": "u2\n"})
+			}
+
+			merge := "merge"
+			out, id := f.attemptWith(t, carrypatch.RebuildOptions{Strategy: &merge}, nil)
+			if out.Kind != attemptCompleted {
+				t.Fatalf("the attempt = %+v, want completed", out)
+			}
+			results := f.patchResults(t, id)
+			if len(results) != 1 || results[0]["status"] != "success" {
+				t.Fatalf("patch_results = %v, want one success", results)
+			}
+			m, _ := results[0]["new_head_sha"].(string)
+			before, _ := f.result(t, id)["upstream_head_sha"].(string)
+			if m == "" || m == before || m == source {
+				t.Fatalf("new_head_sha = %q, want a merge commit of its own (base %s, source %s)", m, before, source)
+			}
+			want := []string{before + " " + source, "Merge branch 'feature/x'", "Parley <parley@localhost>", "Parley <parley@localhost>"}
+			if got := strings.Split(show(t, f.copy, m, "%P|%s|%an <%ae>|%cn <%ce>"), "|"); !slices.Equal(got, want) {
+				t.Errorf("parents|subject|author|committer of the merge = %q, want %q", got, want)
+			}
+			if got := refIn(f.copy, "refs/heads/deploy"); got != m {
+				t.Errorf("deploy = %s, want the merge commit %s", got, m)
+			}
+		})
+	}
+}
+
+// The test sets variables of the process's environment, which no other
+// test may see: it does not run in parallel.
+func TestRebuild_CommitterComesFromConfiguration(t *testing.T) {
+	const (
+		author = "Ada <ada@example.com>"
+		hubBot = "Hub Bot <bot@hub.example>"
+	)
+	for _, strategy := range []string{"rebase", "merge"} {
+		t.Run(strategy, func(t *testing.T) {
+			f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
+				d.CommitterName, d.CommitterEmail = "Hub Bot", "bot@hub.example"
+			})
+			gitrepotest.Git(t, f.copy, "config", "user.name", "Mallory")
+			gitrepotest.Git(t, f.copy, "config", "user.email", "mallory@example.com")
+			a1 := commitAs(t, f.copy, "a1", author+" 1600000000 +0200", map[string]string{"a1.txt": "a1\n"}, f.base)
+			f.putPatch(t, "p1", commitAs(t, f.copy, "a2", author+" 1600000100 +0200", map[string]string{"a2.txt": "a2\n"}, a1))
+			f.moveUpstream(t, "U2", map[string]string{"u2.txt": "u2\n"})
+			// Set once every commit of the test's own is written: the git
+			// the test runs reads them too.
+			for _, v := range []string{"GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"} {
+				t.Setenv(v, "Mallory")
+			}
+			for _, v := range []string{"GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"} {
+				t.Setenv(v, "mallory@example.com")
+			}
+
+			out, id := f.attemptWith(t, carrypatch.RebuildOptions{Strategy: &strategy}, nil)
+			if out.Kind != attemptCompleted {
+				t.Fatalf("the attempt = %+v, want completed", out)
+			}
+			base, _ := f.result(t, id)["upstream_head_sha"].(string)
+			deploy := refIn(f.copy, "refs/heads/deploy")
+			// The commits the run made: the replayed ones, or the merge, whose
+			// second parent brings the patch's own commits.
+			made := gitrepotest.Git(t, f.copy, "log", "--first-parent", "--format=%an <%ae>|%cn <%ce>", base+".."+deploy)
+			want := map[string]string{"rebase": author + "|" + hubBot + "\n" + author + "|" + hubBot, "merge": hubBot + "|" + hubBot}[strategy]
+			if made != want {
+				t.Errorf("author|committer of the commits the run made = %q, want %q", made, want)
+			}
+			if raw := gitrepotest.Git(t, f.copy, "log", "--format=raw", base+".."+deploy); strings.Contains(raw, "allory") {
+				t.Errorf("a commit of base..deploy names Mallory:\n%s", raw)
+			}
+		})
+	}
+}
+
+// show is the commit rev of the repository dir with the git log format
+// given.
+func show(t *testing.T, dir, rev, format string) string {
+	t.Helper()
+	return gitrepotest.Git(t, dir, "log", "-1", "--date=raw", "--format="+format, rev)
 }

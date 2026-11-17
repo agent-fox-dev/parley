@@ -2,6 +2,7 @@ package gitrepo_test
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -201,6 +202,90 @@ func TestScratch_PickReplaysOneCommitOntoItsHead(t *testing.T) {
 	}
 }
 
+func TestScratch_MergeAlwaysMakesAMergeCommit(t *testing.T) {
+	t.Parallel()
+	f := newScratchRepo(t, scratchStream)
+	ctx := context.Background()
+	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0).In(time.FixedZone("", 3600))}
+	const sig = "Hub <hub@example.org> 1760000000 +0100"
+	cases := []struct {
+		name string
+		// at is where HEAD starts; merges are the branches merged in turn.
+		at        string
+		merges    []string
+		outcome   gitrepo.PickOutcome
+		conflicts []string
+		// files are files of the last merge commit's tree and their
+		// content.
+		files map[string]string
+	}{
+		{"a fast-forward is possible", "main~1", []string{"add"}, gitrepo.PickApplied, nil,
+			map[string]string{"f.txt": "base", "a.txt": "a"}},
+		{"a real merge, then another", "main", []string{"add", "present"}, gitrepo.PickApplied, nil,
+			map[string]string{"f.txt": "two", "a.txt": "a"}},
+		{"the change does not merge", "main", []string{"conflict"}, gitrepo.PickConflicted, []string{"f.txt"}, nil},
+		{"HEAD already reaches the commit", "main", []string{"main~1"}, gitrepo.PickDropped, nil, nil},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			head := f.id(t, tc.at)
+			s, err := f.repo.AddScratch(ctx, fmt.Sprintf("job-%d", i), head)
+			if err != nil {
+				t.Fatalf("AddScratch = %v", err)
+			}
+			t.Cleanup(func() { _ = s.Remove(ctx) })
+			refs := gitrepotest.Refs(t, f.dir, "")
+			var merged gitrepo.Picked
+			for _, branch := range tc.merges {
+				from := f.id(t, branch)
+				msg := "Merge branch '" + branch + "'"
+				merged, err = s.Merge(ctx, from, msg, hub, hub)
+				if err != nil {
+					t.Fatalf("Merge(%s) = %v", branch, err)
+				}
+				got, err := s.Head(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if merged.Outcome != gitrepo.PickApplied {
+					break
+				}
+				if got != merged.Commit {
+					t.Errorf("HEAD after Merge(%s) = %s, want the merge commit %s", branch, got, merged.Commit)
+				}
+				if want := head + " " + from; show(t, f.dir, merged.Commit, "%P") != want {
+					t.Errorf("the parents of the merge of %s = %s, want HEAD before, then the commit: %s", branch, show(t, f.dir, merged.Commit, "%P"), want)
+				}
+				if got := show(t, f.dir, merged.Commit, "%B"); got != msg {
+					t.Errorf("the message of the merge of %s = %q, want %q", branch, got, msg)
+				}
+				if got := show(t, f.dir, merged.Commit, "%an <%ae> %ad|%cn <%ce> %cd"); got != sig+"|"+sig {
+					t.Errorf("author|committer of the merge of %s = %q, want %q for both", branch, got, sig)
+				}
+				head = merged.Commit
+			}
+			if merged.Outcome != tc.outcome || !reflect.DeepEqual(merged.Conflicts, tc.conflicts) {
+				t.Fatalf("the last Merge = %+v, want %s with the conflicts %v", merged, tc.outcome, tc.conflicts)
+			}
+			if got := gitrepotest.Refs(t, f.dir, ""); !maps.Equal(got, refs) {
+				t.Errorf("the refs after the merges = %v, want them as they were, %v", got, refs)
+			}
+			if tc.outcome != gitrepo.PickApplied {
+				if got, err := s.Head(ctx); err != nil || merged.Commit != "" || got != head {
+					t.Errorf("Merge made %q and left HEAD at %s (%v), want no commit and HEAD at %s", merged.Commit, got, err, head)
+				}
+				return
+			}
+			for name, content := range tc.files {
+				if got := gitrepotest.Git(t, f.dir, "show", merged.Commit+":"+name); got != content {
+					t.Errorf("%s of the merge commit = %q, want %q", name, got, content)
+				}
+			}
+		})
+	}
+}
+
 func TestScratch_RunsNoHookAndNoAttributeOfTheContent(t *testing.T) {
 	t.Parallel()
 	// Every commit's .gitattributes asks for the union merge driver and the
@@ -245,21 +330,33 @@ theirs
 	if err := os.MkdirAll(filepath.Join(f.dir, "hooks"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, hook := range []string{"post-checkout", "reference-transaction", "pre-commit", "post-commit", "post-merge"} {
+	for _, hook := range []string{"post-checkout", "reference-transaction", "pre-commit", "post-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-merge"} {
 		if err := os.WriteFile(filepath.Join(f.dir, "hooks", hook), []byte(touch), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	gitrepotest.Git(t, f.dir, "config", "filter.mark.smudge", "echo smudge >> "+marker+"; cat")
 
-	s, err := f.repo.AddScratch(ctx, "job-1", f.id(t, "main"))
-	if err != nil {
-		t.Fatalf("AddScratch = %v", err)
+	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)}
+	ops := []struct {
+		name string
+		run  func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error)
+	}{
+		{"Pick", func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error) { return s.Pick(ctx, commit, hub) }},
+		{"Merge", func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error) {
+			return s.Merge(ctx, commit, "Merge branch 'theirs'", hub, hub)
+		}},
 	}
-	t.Cleanup(func() { _ = s.Remove(ctx) })
-	picked, err := s.Pick(ctx, f.id(t, "theirs"), gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)})
-	if err != nil || picked.Outcome != gitrepo.PickConflicted || !reflect.DeepEqual(picked.Conflicts, []string{"f.txt"}) {
-		t.Errorf("Pick(theirs) = %+v, %v; want a conflict in f.txt, not the union merge the content asks for", picked, err)
+	for _, op := range ops {
+		s, err := f.repo.AddScratch(ctx, "job-"+op.name, f.id(t, "main"))
+		if err != nil {
+			t.Fatalf("AddScratch = %v", err)
+		}
+		t.Cleanup(func() { _ = s.Remove(ctx) })
+		got, err := op.run(s, f.id(t, "theirs"))
+		if err != nil || got.Outcome != gitrepo.PickConflicted || !reflect.DeepEqual(got.Conflicts, []string{"f.txt"}) {
+			t.Errorf("%s(theirs) = %+v, %v; want a conflict in f.txt, not the union merge the content asks for", op.name, got, err)
+		}
 	}
 	if b, err := os.ReadFile(marker); err == nil {
 		t.Errorf("a hook or the content's filter ran: %q", b)

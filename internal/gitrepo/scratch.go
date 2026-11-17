@@ -44,22 +44,24 @@ type Scratch struct {
 	dir string
 }
 
-// PickOutcome is what the replay of one commit in a scratch working tree
-// did.
+// PickOutcome is what the replay or the merge of one commit in a scratch
+// working tree did.
 type PickOutcome string
 
 // The outcomes of a replay.
 const (
-	// PickApplied made a new commit on top of HEAD and moved HEAD to it.
+	// PickApplied made a new commit on top of HEAD, a merge commit for a
+	// merge, and moved HEAD to it.
 	PickApplied PickOutcome = "applied"
-	// PickDropped made no commit: HEAD already holds the commit's change.
+	// PickDropped made no commit: HEAD already holds the commit's change,
+	// or for a merge already reaches the commit.
 	PickDropped PickOutcome = "dropped"
 	// PickConflicted made no commit: the change does not apply to HEAD.
 	PickConflicted PickOutcome = "conflicted"
 )
 
-// Picked is the result of the replay of one commit in a scratch working
-// tree.
+// Picked is the result of the replay or the merge of one commit in a
+// scratch working tree.
 type Picked struct {
 	Outcome PickOutcome
 	// Commit is the new commit of PickApplied, "" otherwise.
@@ -167,6 +169,71 @@ func (s *Scratch) Pick(ctx context.Context, commit string, committer Signature) 
 	}
 	// The index and the files hold the new commit's tree already: only
 	// HEAD, the scratch working tree's own, moves.
+	if _, err := s.git(ctx, "update-ref", "--no-deref", "HEAD", id, head); err != nil {
+		return Picked{}, err
+	}
+	return Picked{Outcome: PickApplied, Commit: id}, nil
+}
+
+// Merge merges the commit of the full id commit into HEAD with a merge
+// commit, made even when HEAD could fast-forward to commit: its first
+// parent is HEAD, its second commit, and its message, author and committer
+// are written as given and never taken from the environment or a
+// configuration. HEAD then moves to it; the result is PickApplied.
+//
+// A commit HEAD already reaches is PickDropped, with nothing made. A merge
+// that does not apply is PickConflicted with the paths that did not merge;
+// the scratch working tree is left in that state, the merge in progress and
+// its files holding git's conflict markers, for the caller to resolve or
+// undo, and HEAD does not move. An error is a failure of git.
+func (s *Scratch) Merge(ctx context.Context, commit, message string, author, committer Signature) (Picked, error) {
+	if !isHexID(commit, idLen) {
+		return Picked{}, fmt.Errorf("merge %q: %w", commit, ErrNotFound)
+	}
+	commit = strings.ToLower(commit)
+	head, err := s.Head(ctx)
+	if err != nil {
+		return Picked{}, err
+	}
+	reached, err := s.r.IsAncestor(ctx, commit, head)
+	if err != nil {
+		return Picked{}, err
+	}
+	if reached {
+		return Picked{Outcome: PickDropped}, nil
+	}
+	// The merge stops before its commit, which is written here with the
+	// identities given; the options the repository's configuration could
+	// otherwise change are given on the command line.
+	if _, err := s.git(ctx, "merge", "--no-commit", "--no-ff", "--no-squash", "--no-verify-signatures",
+		"--no-log", "--no-stat", "--no-autostash", "--quiet", commit); err != nil {
+		if ctx.Err() != nil {
+			return Picked{}, err
+		}
+		paths, uerr := s.unmerged(ctx)
+		if uerr != nil {
+			return Picked{}, errors.Join(err, uerr)
+		}
+		if len(paths) == 0 {
+			return Picked{}, err
+		}
+		return Picked{Outcome: PickConflicted, Conflicts: paths}, nil
+	}
+	tree, err := s.git(ctx, "write-tree")
+	if err != nil {
+		return Picked{}, err
+	}
+	id, err := s.r.CreateCommit(ctx, CommitSpec{Tree: strings.TrimSpace(string(tree)), Parents: []string{head, commit},
+		Message: message, Author: author, Committer: committer})
+	if err != nil {
+		return Picked{}, err
+	}
+	// The merge in progress is forgotten, the index and the files kept: they
+	// hold the merge commit's tree already, and only HEAD, the scratch
+	// working tree's own, moves.
+	if _, err := s.git(ctx, "merge", "--quit"); err != nil {
+		return Picked{}, err
+	}
 	if _, err := s.git(ctx, "update-ref", "--no-deref", "HEAD", id, head); err != nil {
 		return Picked{}, err
 	}

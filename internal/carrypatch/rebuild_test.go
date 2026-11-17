@@ -105,6 +105,15 @@ func (h *rebuildHooks) publish(string) {
 // record changed by edit before it is stored.
 func startRebuildFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *rebuildFixture {
 	t.Helper()
+	return startRebuildFixtureWith(t, nil, edit...)
+}
+
+// startRebuildFixtureWith starts the rebuild fixture with the carry-patch
+// component's dependencies changed by deps, when it is not nil, after the
+// fixture's own changes, and the workspace's record changed by edit before
+// it is stored.
+func startRebuildFixtureWith(t *testing.T, deps func(d *carrypatch.Deps), edit ...func(w *workspace.Workspace)) *rebuildFixture {
+	t.Helper()
 	up := gitrepotest.NewOrigin(t)
 	up.Commit("main", "U1")
 	origin := gitrepotest.SmartOrigin(t)
@@ -143,6 +152,9 @@ func startRebuildFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *re
 				d.Secrets = f.secrets
 				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+bundle)
 				d.BeforeRebuildPatch, d.BeforeRebuildPublish = f.hooks.patch, f.hooks.publish
+				if deps != nil {
+					deps(d)
+				}
 			})
 		},
 	})
@@ -247,8 +259,16 @@ func (f *rebuildFixture) patchList(t *testing.T) []carrypatch.Patch {
 // the outcome and the job's id.
 func (f *rebuildFixture) attempt(t *testing.T, before func(ctx context.Context, j jobs.Job)) (carrypatch.AttemptOutcome, string) {
 	t.Helper()
+	return f.attemptWith(t, carrypatch.RebuildOptions{}, before)
+}
+
+// attemptWith is attempt with the rebuild queued with the strategy and
+// the fail mode of opts.
+func (f *rebuildFixture) attemptWith(t *testing.T, opts carrypatch.RebuildOptions, before func(ctx context.Context, j jobs.Job)) (carrypatch.AttemptOutcome, string) {
+	t.Helper()
 	ctx := context.Background()
-	res, err := f.comp.EnqueueRebuild(ctx, f.slug, carrypatch.RebuildOptions{ActorType: event.ActorSystem, SubmittedBy: event.ActorSystem})
+	opts.ActorType, opts.SubmittedBy = event.ActorSystem, event.ActorSystem
+	res, err := f.comp.EnqueueRebuild(ctx, f.slug, opts)
 	if err != nil || !res.Queued {
 		t.Fatalf("queue a rebuild of %s = %+v, %v, want a queued job", f.slug, res, err)
 	}
