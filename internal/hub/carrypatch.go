@@ -11,10 +11,13 @@ import (
 
 // carryPatchHook is the name of the start hook that binds the carry-patch
 // component; carryPatchRecoveryHook is the name of the start hook that
-// discards what a rebuild interrupted by the last stop left in the copies.
+// discards what a rebuild interrupted by the last stop left in the copies;
+// patchPurgeTask is the name of the maintenance task that removes the
+// patches deleted long ago.
 const (
 	carryPatchHook         = "carry_patch"
 	carryPatchRecoveryHook = "carry_patch_recovery"
+	patchPurgeTask         = "patch_purge"
 )
 
 // composeCarryPatch adds the carry-patch work: the schema of the patch
@@ -97,6 +100,10 @@ const (
 // rebuild, among them the job the jobs part's hook has just returned to
 // queued, works in a copy while it runs; a copy it cannot clean is logged
 // and does not stop the start.
+// The maintenance task patch_purge removes, at every maintenance pass, the
+// patches deleted more than seven days before the hub's clock says it is,
+// with their backup refs, in every workspace; a patch it cannot remove
+// fails the task for that pass and is tried again at the next.
 //
 // The component exists from the composition on (CarryPatch); tests change
 // its dependencies with AdjustCarryPatch.
@@ -163,6 +170,9 @@ func composeCarryPatch(c *Composition) {
 	})
 	c.AddStartHook(carryPatchRecoveryHook, func(ctx context.Context, _ *Runtime) error {
 		return comp.DiscardRebuildLeftovers(ctx)
+	})
+	c.AddMaintenanceTask(patchPurgeTask, func(ctx context.Context, rt *Runtime) error {
+		return comp.PurgeDeletedPatches(ctx, rt.Now())
 	})
 }
 

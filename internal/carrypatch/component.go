@@ -112,6 +112,11 @@ type Deps struct {
 	// operation's deadline, with the operation's context; only tests set
 	// it, to make every operation take longer.
 	BeforeRebuildGit func(ctx context.Context)
+	// BeforePurgePatch, when set, is called by the purge of deleted patches
+	// with the workspace and the id of each patch it selected as due, before
+	// it removes that patch, outside any store transaction; only tests set
+	// it, to restore the patch in between as a restore would.
+	BeforePurgePatch func(slug, id string)
 	// ForwardLimit, when positive and shorter, replaces DefaultForwardLimit
 	// as the limit of a forward of a patch branch to origin; only tests set
 	// it.
