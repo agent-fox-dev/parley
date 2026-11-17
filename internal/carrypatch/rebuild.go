@@ -53,6 +53,8 @@ type attemptOutcome struct {
 	// secrets are the values of the credentials the attempt read, which
 	// must not reach the job's error or an event.
 	secrets []string
+	// followUp is the follow-up rebuild the attempt queued, nil for none.
+	followUp *followUp
 }
 
 // attemptFailed is the outcome of an attempt that failed with reason, retryable
@@ -94,8 +96,10 @@ type rebuildRun struct {
 // base it starts from. It lists the patches with the tips of their
 // branches, builds the new head from the base and those tips alone in a
 // scratch working tree, and publishes it as the integration branch, which
-// it pushes to origin when the workspace asks for it. Last, it stores the
-// counts over what it did with the patches.
+// it pushes to origin when the workspace asks for it. Then it stores the
+// counts over what it did with the patches. Last, once it completed or
+// stopped at a conflict in fail_fast, never after a failure a retry may
+// cure, it queues a follow-up rebuild when inputs it read went stale.
 func (c *Component) runRebuildAttempt(ctx context.Context, j jobs.Job) attemptOutcome {
 	r := &rebuildRun{c: c, job: j}
 	// A payload that does not decode leaves the options at their defaults,
@@ -107,6 +111,9 @@ func (c *Component) runRebuildAttempt(ctx context.Context, j jobs.Job) attemptOu
 			out = *stop
 			break
 		}
+	}
+	if out.kind == attemptCompleted || out.kind == attemptPermanent && out.reason == reasonConflict {
+		out.followUp = r.followUp(ctx)
 	}
 	out.secrets = r.secrets
 	return out

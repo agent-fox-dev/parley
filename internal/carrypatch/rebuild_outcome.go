@@ -26,8 +26,8 @@ const (
 // when the run stopped at a conflict, so that the queue's settlement
 // stores them as the job's error and conflict. Its Settled writes, in the
 // settlement's transaction, parley.rebuild.complete or parley.rebuild.fail,
-// so that the event and the job's new status are seen together or not at
-// all.
+// and parley.rebuild.followup when the attempt queued a follow-up, so that
+// the events and the job's new status are seen together or not at all.
 func (c *Component) RebuildHandler() jobs.Handler { return rebuildHandler{c} }
 
 // rebuildHandler runs the attempts of rebuild jobs with its component,
@@ -73,8 +73,10 @@ func (h rebuildHandler) run(ctx context.Context, j jobs.Job) (attemptOutcome, er
 // the attempt, whether the job will be retried, its retry count after the
 // settlement and the conflict report it stopped at. A settlement for which
 // no outcome was kept, that of an attempt that panicked, fails with reason
-// git_error. Every event is the system's, about the job, in the agent
-// session the job was queued in.
+// git_error. When the attempt queued a follow-up rebuild, it also emits
+// parley.rebuild.followup with the follow-up's job id and the stale
+// inputs that queued it. Every event is the system's, about the job, in
+// the agent session the job was queued in.
 func (h rebuildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, willRetry bool) error {
 	out, kept := h.c.takeOutcome(j.ID)
 	if h.c.d.Events == nil {
@@ -120,6 +122,18 @@ func (h rebuildHandler) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, wil
 			"retry_count": j.RetryCount,
 			"conflict":    conflict,
 		}
+	}
+	if _, err := h.c.d.Events.Emit(ctx, tx, in); err != nil {
+		return err
+	}
+	if !kept || out.followUp == nil {
+		return nil
+	}
+	in.Type = EventRebuildFollowUp
+	in.Metadata = map[string]any{
+		"follow_up_job_id": out.followUp.jobID,
+		"stale_patches":    append([]string{}, out.followUp.stalePatches...),
+		"upstream_stale":   out.followUp.upstreamStale,
 	}
 	_, err := h.c.d.Events.Emit(ctx, tx, in)
 	return err
