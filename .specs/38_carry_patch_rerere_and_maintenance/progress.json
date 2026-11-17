@@ -3,7 +3,7 @@
   "spec_id": "38",
   "spec_name": "carry_patch_rerere_and_maintenance",
   "schema_version": 3,
-  "updated_at": "2026-11-17T14:16:57Z",
+  "updated_at": "2026-11-17T14:22:27Z",
   "tasks": [
     {
       "id": 1,
@@ -23,7 +23,7 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
