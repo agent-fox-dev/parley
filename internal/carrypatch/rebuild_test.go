@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -181,17 +184,19 @@ func (f *rebuildFixture) record(t *testing.T) workspace.Workspace {
 }
 
 // addPatch stores an active patch of branch at the end of the patch list,
-// whose branch in the hub's copy holds one commit on the upstream base that
-// adds a file of its own, and returns it.
-func (f *rebuildFixture) addPatch(t *testing.T, branch string) carrypatch.Patch {
+// changed by edit before it is stored, whose branch in the hub's copy holds
+// one commit on the upstream base that adds a file of its own, and returns
+// it.
+func (f *rebuildFixture) addPatch(t *testing.T, branch string, edit ...func(p *carrypatch.Patch)) carrypatch.Patch {
 	t.Helper()
 	file := strings.ReplaceAll(branch, "/", "-") + ".txt"
-	return f.putPatch(t, branch, commitFiles(t, f.copy, f.base, branch, map[string]string{file: branch + "\n"}))
+	return f.putPatch(t, branch, commitFiles(t, f.copy, f.base, branch, map[string]string{file: branch + "\n"}), edit...)
 }
 
 // putPatch stores an active patch of branch at the end of the patch list,
-// with its branch in the hub's copy at tip, and returns it.
-func (f *rebuildFixture) putPatch(t *testing.T, branch, tip string) carrypatch.Patch {
+// changed by edit before it is stored, with its branch in the hub's copy at
+// tip, and returns it.
+func (f *rebuildFixture) putPatch(t *testing.T, branch, tip string, edit ...func(p *carrypatch.Patch)) carrypatch.Patch {
 	t.Helper()
 	live, err := carrypatch.ListLivePatches(context.Background(), f.Store.Main(), f.slug)
 	if err != nil {
@@ -199,8 +204,17 @@ func (f *rebuildFixture) putPatch(t *testing.T, branch, tip string) carrypatch.P
 	}
 	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
 	p := livePatch(f.slug, branch, len(live)+1)
+	for _, fn := range edit {
+		fn(&p)
+	}
 	f.put(t, p)
 	return p
+}
+
+// withStatus is an edit of a patch that gives it status and the conflict
+// files given.
+func withStatus(status string, conflictFiles ...string) func(p *carrypatch.Patch) {
+	return func(p *carrypatch.Patch) { p.Status, p.ConflictFiles = status, conflictFiles }
 }
 
 // moveUpstream gives the upstream's main a commit on top of its head that
@@ -690,4 +704,274 @@ func visibleRefs(dir string) (map[string]string, error) {
 		refs[name] = id
 	}
 	return refs, nil
+}
+
+// setStatusNow stores status on the fixture's workspace, as an archive or a
+// reclone would during an attempt. It fails no test, so that a hook may
+// call it.
+func (f *rebuildFixture) setStatusNow(status workspace.Status) error {
+	ctx := context.Background()
+	return f.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ? WHERE slug = ?`, status, f.slug)
+		return err
+	})
+}
+
+// deleteNow archives the fixture's workspace and deletes it, with its jobs
+// and its copy, through the workspace's delete route. It fails no test, so
+// that a hook may call it.
+func (f *rebuildFixture) deleteNow() error {
+	if err := f.setStatusNow(workspace.StatusArchived); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodDelete, f.URL("/api/v1/workspaces/"+f.slug), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+f.key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("DELETE /workspaces/%s = %d %s, want 204", f.slug, res.StatusCode, body)
+	}
+	return nil
+}
+
+// lastEvent is the sequence number of the newest stored event of the
+// fixture's workspace, 0 when there is none.
+func (f *rebuildFixture) lastEvent() (int64, error) {
+	var seq sql.NullInt64
+	err := f.Store.Main().QueryRow(`SELECT max(seq) FROM hub_events WHERE workspace = ?`, f.slug).Scan(&seq)
+	return seq.Int64, err
+}
+
+func TestRebuild_WorkspaceLeavesReadyDuringRun(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		// leave makes the workspace leave ready at the attempt's step its
+		// hooks give.
+		leave        func(t *testing.T, f *rebuildFixture, left *int64)
+		kind, reason string
+	}{
+		{"archived before the second patch", func(t *testing.T, f *rebuildFixture, _ *int64) {
+			f.hooks.beforePatch(func(i int) {
+				if i == 1 {
+					if err := f.setStatusNow(workspace.StatusArchived); err != nil {
+						t.Errorf("archive the workspace: %v", err)
+					}
+				}
+			})
+		}, attemptPermanent, "workspace_archived"},
+		{"recloned before the publish", func(t *testing.T, f *rebuildFixture, _ *int64) {
+			f.hooks.beforePublish(func() {
+				if err := f.setStatusNow(workspace.StatusCloning); err != nil {
+					t.Errorf("reclone the workspace: %v", err)
+				}
+			})
+		}, attemptRetryable, "workspace_busy"},
+		{"deleted with its jobs before the second patch", func(t *testing.T, f *rebuildFixture, left *int64) {
+			f.hooks.beforePatch(func(i int) {
+				if i != 1 {
+					return
+				}
+				if err := f.deleteNow(); err != nil {
+					t.Errorf("delete the workspace: %v", err)
+				}
+				seq, err := f.lastEvent()
+				if err != nil {
+					t.Errorf("read the workspace's events: %v", err)
+				}
+				*left = seq
+			})
+		}, attemptEnded, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := startRebuildFixture(t)
+			f.addPatch(t, "p1")
+			f.addPatch(t, "p2")
+			deploy := refIn(f.copy, "refs/heads/deploy")
+			var left int64
+			tc.leave(t, f, &left)
+
+			out, id := f.attempt(t, nil)
+			if out.Kind != tc.kind || out.Reason != tc.reason {
+				t.Errorf("the attempt = %+v, want %s with reason %q", out, tc.kind, tc.reason)
+			}
+			if _, err := os.Stat(f.copy); err == nil {
+				if got := refIn(f.copy, "refs/heads/deploy"); got != deploy {
+					t.Errorf("deploy = %s, want it where it was, %s", got, deploy)
+				}
+			}
+			if tc.kind != attemptEnded {
+				return
+			}
+			if _, err := f.queue.Get(context.Background(), id); !errors.Is(err, jobs.ErrNotFound) {
+				t.Errorf("read the job %s after the delete = %v, want %v", id, err, jobs.ErrNotFound)
+			}
+			if seq, err := f.lastEvent(); err != nil || seq != left {
+				t.Errorf("the newest event of %s = %d, %v; want none after the delete's, %d", f.slug, seq, err, left)
+			}
+		})
+	}
+}
+
+func TestRebuild_PushDuringRunDoesNotChangeTheResult(t *testing.T) {
+	t.Parallel()
+	f := startRebuildFixture(t)
+	f.addPatch(t, "p1")
+	f.addPatch(t, "p2")
+	tip := refIn(f.copy, "refs/heads/p2")
+	f.hooks.beforePatch(func(i int) {
+		if i != 0 {
+			return
+		}
+		x, err := gitrepotest.Run(f.copy, "", "commit-tree", tip+"^{tree}", "-p", tip, "-m", "pushed during the run")
+		if err != nil {
+			t.Errorf("write the commit X: %v", err)
+			return
+		}
+		ctx := context.Background()
+		repo, err := gitrepo.Git{}.Open(ctx, f.copy)
+		if err == nil {
+			err = repo.CompareAndSwapRef(ctx, "refs/heads/p2", x, tip)
+		}
+		if err != nil {
+			t.Errorf("move p2 from %s to %s during the run = %v, want it moved at once", tip, x, err)
+		}
+	})
+
+	out, id := f.attempt(t, nil)
+	if out.Kind != attemptCompleted {
+		t.Fatalf("the attempt = %+v, want completed", out)
+	}
+	if got := f.patchResults(t, id)[1]["source_sha"]; got != tip {
+		t.Errorf("source_sha of p2 = %v, want the tip read at the listing, %s", got, tip)
+	}
+	deploy := refIn(f.copy, "refs/heads/deploy")
+	if log := commitsIn(t, f.copy, f.base, deploy, "%s"); slices.Contains(log, "pushed during the run") || !slices.Contains(log, "p2") {
+		t.Errorf("base..deploy = %q, want p2's commit and not the one pushed during the run", log)
+	}
+	if got := gitrepotest.Git(t, f.copy, "show", deploy+":p2.txt"); got != "p2" {
+		t.Errorf("p2.txt in deploy = %q, want p2's change", got)
+	}
+}
+
+func TestRebuild_SkipsPatchesThatDoNotApplyToTheRun(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		status string
+		// gone deletes the patch's branch before the attempt.
+		gone   bool
+		reason string
+	}{
+		{"disabled", carrypatch.StatusDisabled, false, "disabled"},
+		{"merged upstream", carrypatch.StatusMergedUpstream, false, "merged_upstream"},
+		{"active without its branch", carrypatch.StatusActive, true, "branch_not_found"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := startRebuildFixture(t)
+			f.addPatch(t, "p1", withStatus(tc.status))
+			var source any = refIn(f.copy, "refs/heads/p1")
+			if tc.gone {
+				gitrepotest.Git(t, f.copy, "update-ref", "-d", "refs/heads/p1")
+				source = nil
+			}
+			base := f.moveUpstream(t, "U2", map[string]string{"u2.txt": "u2\n"})
+
+			out, id := f.attempt(t, nil)
+			if out.Kind != attemptCompleted {
+				t.Fatalf("the attempt = %+v, want completed", out)
+			}
+			results := f.patchResults(t, id)
+			if len(results) != 1 {
+				t.Fatalf("patch_results = %v, want one", results)
+			}
+			want := map[string]any{"status": "skipped", "skipped_reason": tc.reason, "source_sha": source,
+				"new_head_sha": nil, "conflict_files": []any{}, "conflict": nil}
+			for k, v := range want {
+				if got := results[0][k]; !reflect.DeepEqual(got, v) {
+					t.Errorf("%s of p1's result = %v, want %v", k, got, v)
+				}
+			}
+			if got := refIn(f.copy, "refs/heads/deploy"); got != base {
+				t.Errorf("deploy = %s, want the upstream base %s", got, base)
+			}
+		})
+	}
+}
+
+func TestRebuild_TriesConflictPatchesAgain(t *testing.T) {
+	t.Parallel()
+	f := startRebuildFixture(t)
+	f.addPatch(t, "p1", withStatus(carrypatch.StatusConflict, "f.txt"))
+
+	out, id := f.attempt(t, nil)
+	if out.Kind != attemptCompleted {
+		t.Fatalf("the attempt = %+v, want completed", out)
+	}
+	deploy := refIn(f.copy, "refs/heads/deploy")
+	if r := f.patchResults(t, id)[0]; r["status"] != "success" || r["new_head_sha"] != deploy || deploy == f.base {
+		t.Errorf("p1's result = %v, deploy = %s; want success with new_head_sha the published head", r, deploy)
+	}
+}
+
+func TestRebuild_StoresProgressAfterEveryPatch(t *testing.T) {
+	t.Parallel()
+	f := startRebuildFixture(t)
+	for _, b := range []string{"p1", "p2", "p3"} {
+		f.addPatch(t, b)
+	}
+	var id string
+	var seen []jobs.Job
+	f.hooks.beforePatch(func(i int) {
+		if i == 0 {
+			return
+		}
+		j, err := f.queue.Get(context.Background(), id)
+		if err != nil {
+			t.Errorf("read the job before patch %d: %v", i, err)
+			return
+		}
+		seen = append(seen, j)
+	})
+
+	out, _ := f.attempt(t, func(_ context.Context, j jobs.Job) { id = j.ID })
+	if out.Kind != attemptCompleted {
+		t.Fatalf("the attempt = %+v, want completed", out)
+	}
+	final := f.patchResults(t, id)
+	if len(seen) != 2 {
+		t.Fatalf("read the job %d times between patches, want 2", len(seen))
+	}
+	for n, j := range seen {
+		var res struct {
+			Applied      int              `json:"patches_applied"`
+			Skipped      int              `json:"patches_skipped"`
+			Conflicted   int              `json:"patches_conflicted"`
+			Removed      int              `json:"patches_removed"`
+			PatchResults []map[string]any `json:"patch_results"`
+		}
+		if err := json.Unmarshal(j.Result, &res); err != nil {
+			t.Fatalf("the job's result before patch %d = %s: %v", n+2, j.Result, err)
+		}
+		if j.Status != jobs.StatusRunning {
+			t.Errorf("the job before patch %d is %s, want running", n+2, j.Status)
+		}
+		if !reflect.DeepEqual(res.PatchResults, final[:n+1]) {
+			t.Errorf("patch_results before patch %d = %v, want the first %d of %v", n+2, res.PatchResults, n+1, final)
+		}
+		if res.Applied+res.Skipped+res.Conflicted+res.Removed != 0 {
+			t.Errorf("the counts before patch %d = %+v, want 0", n+2, res)
+		}
+	}
 }

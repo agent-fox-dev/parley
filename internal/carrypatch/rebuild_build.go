@@ -8,22 +8,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 )
 
-// The statuses of a patch's result in a rebuild.
-const resultSuccess = "success"
-
-// patchResult is what a run did with one patch, as the job's patch_results
-// lists it: the patch as the run listed it, the tip of its branch the run
-// read then (nil when the branch did not exist), and the head under
-// construction after it.
-type patchResult struct {
-	PatchID    string  `json:"patch_id"`
-	BranchName string  `json:"branch_name"`
-	Position   int     `json:"position"`
-	Status     string  `json:"status"`
-	SourceSHA  *string `json:"source_sha"`
-	NewHeadSHA *string `json:"new_head_sha"`
-}
-
 // runPatch is a patch as the run listed it, with the tip of its branch the
 // run read then: source is nil when the branch did not exist. The run uses
 // this tip alone, whatever the branch becomes meanwhile.
@@ -92,17 +76,26 @@ func (r *rebuildRun) build(ctx context.Context) *attemptOutcome {
 		if hook := r.c.d.BeforeRebuildPatch; hook != nil {
 			hook(r.job.ID, i)
 		}
-		res := patchResult{PatchID: p.ID, BranchName: p.BranchName, Position: *p.Position, SourceSHA: p.source}
-		if p.source == nil {
-			r.results = append(r.results, res)
-			continue
-		}
-		if out := r.rebase(ctx, scratch, p); out != nil {
+		// An archive, a reclone or a delete of the workspace does not wait
+		// for a rebuild: the run ends at its next step instead.
+		if out := r.readWorkspace(ctx); out != nil {
 			return out
 		}
-		head := r.head
-		res.Status, res.NewHeadSHA = resultSuccess, &head
+		res := resultOf(p)
+		if reason := skipReason(p); reason != "" {
+			res.Status, res.SkippedReason = resultSkipped, &reason
+		} else {
+			if out := r.rebase(ctx, scratch, p); out != nil {
+				return out
+			}
+			head := r.head
+			res.Status, res.NewHeadSHA = resultSuccess, &head
+		}
+		// A caller waiting for the job sees each patch as it is finished.
 		r.results = append(r.results, res)
+		if out := r.store(ctx); out != nil {
+			return out
+		}
 	}
 	return nil
 }

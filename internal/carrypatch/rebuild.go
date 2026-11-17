@@ -127,11 +127,15 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 // readWorkspace reads the job's workspace and ends the attempt unless it is
 // ready: an archived or failed workspace fails the job for good, one that
 // is being cloned fails the attempt, and one that no longer exists ends it.
+// The attempt reads it at its start, before every patch and just before
+// the publish's swap.
 func (r *rebuildRun) readWorkspace(ctx context.Context) *attemptOutcome {
 	if r.c.d.Store == nil {
 		return attemptFailed(attemptRetryable, reasonGitError, errNotBound)
 	}
-	ws, found, err := workspace.BySlug(ctx, r.c.d.Store.Main(), r.job.Workspace)
+	// A delete of the workspace cancels the attempt with its job: the read
+	// must still tell that the workspace is gone.
+	ws, found, err := workspace.BySlug(context.WithoutCancel(ctx), r.c.d.Store.Main(), r.job.Workspace)
 	if err != nil {
 		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("read the workspace %s: %w", r.job.Workspace, err))
 	}

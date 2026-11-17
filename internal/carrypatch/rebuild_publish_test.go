@@ -1,9 +1,11 @@
 package carrypatch_test
 
 import (
+	"fmt"
 	"maps"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 )
 
@@ -64,6 +66,38 @@ func TestRebuild_PublishMovesOnlyTheIntegrationBranch(t *testing.T) {
 			delete(before, "refs/heads/deploy")
 			if !maps.Equal(after, before) {
 				t.Errorf("the refs other than deploy after the publish = %v, want them as before, %v", after, before)
+			}
+		})
+	}
+}
+
+func TestRebuild_PublishesTheUpstreamBaseWhenNothingApplies(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		statuses []string
+	}{
+		{"no patch at all", nil},
+		{"one disabled and one merged upstream patch", []string{carrypatch.StatusDisabled, carrypatch.StatusMergedUpstream}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := startRebuildFixture(t)
+			for i, status := range tc.statuses {
+				f.addPatch(t, fmt.Sprintf("p%d", i+1), withStatus(status))
+			}
+			base := f.moveUpstream(t, "U2", map[string]string{"u2.txt": "u2\n"})
+
+			out, id := f.attempt(t, nil)
+			if out.Kind != attemptCompleted {
+				t.Fatalf("the attempt = %+v, want completed", out)
+			}
+			res := f.result(t, id)
+			deploy := refIn(f.copy, "refs/heads/deploy")
+			if deploy != base || res["integration_head_sha"] != base || res["upstream_head_sha"] != base {
+				t.Errorf("deploy = %s, integration_head_sha = %v, upstream_head_sha = %v; want all three the upstream base %s",
+					deploy, res["integration_head_sha"], res["upstream_head_sha"], base)
 			}
 		})
 	}

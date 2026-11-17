@@ -33,3 +33,18 @@ func RunRebuildAttempt(ctx context.Context, c *Component, j jobs.Job) AttemptOut
 	out := c.runRebuildAttempt(ctx, j)
 	return AttemptOutcome{Kind: attemptKindNames[out.kind], Reason: out.reason, Text: out.text}
 }
+
+// PatchResult is what a rebuild did with one patch, as the job's
+// patch_results lists it.
+type PatchResult = patchResult
+
+// The statuses of a patch's result and the reasons a run skips a patch.
+const (
+	ResultSuccess         = resultSuccess
+	ResultConflict        = resultConflict
+	ResultSkipped         = resultSkipped
+	SkippedDisabled       = skippedDisabled
+	SkippedMergedUpstream = skippedMergedUpstream
+	SkippedBranchNotFound = skippedBranchNotFound
+	SkippedNothingToApply = skippedNothingToApply
+)
