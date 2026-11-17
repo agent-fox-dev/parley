@@ -826,6 +826,31 @@ func (h *rebuildHub) mustSubmit(t *testing.T, slug string) string {
 	return id
 }
 
+// queueRebuild queues a rebuild of slug through the shared enqueue, which
+// looks neither at the workspace's state nor for an active patch, and
+// returns the job's id.
+func (h *rebuildHub) queueRebuild(t *testing.T, slug string) string {
+	t.Helper()
+	res, err := h.comp.EnqueueRebuild(context.Background(), slug, carrypatch.RebuildOptions{ActorType: event.ActorSystem, SubmittedBy: event.ActorSystem})
+	if err != nil || !res.Queued {
+		t.Fatalf("queue a rebuild of %s = %+v, %v, want a queued job", slug, res, err)
+	}
+	return res.JobID
+}
+
+// setState stores status and the maintenance marker on the record of the
+// workspace slug, as a clone or a maintenance operation would leave it.
+func (h *readHub) setState(t *testing.T, slug string, status workspace.Status, marker workspace.Marker) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE workspaces SET status = ?, maintenance = ? WHERE slug = ?`, status, marker, slug)
+		return err
+	}); err != nil {
+		t.Fatalf("set the state of %s: %v", slug, err)
+	}
+}
+
 // job is the stored job id.
 func (h *rebuildHub) job(t *testing.T, id string) jobs.Job {
 	t.Helper()
