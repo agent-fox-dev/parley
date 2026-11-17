@@ -1,14 +1,20 @@
 package carrypatch_test
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/jobs"
@@ -94,8 +100,8 @@ func TestSubmitRebuild_QueuesAJobAndAnswersItsRecord(t *testing.T) {
 			if want := h.queuedRecord(id, slug, c.strategy, c.failMode); !reflect.DeepEqual(a.patch, want) {
 				t.Errorf("submit answered %s, want %v", a.raw, want)
 			}
-			if stored := h.recordOf(t, id); !reflect.DeepEqual(stored, a.patch) {
-				t.Errorf("the stored job is %v, want the record answered %s", stored, a.raw)
+			if r := h.readRebuild(t, slug, id); r.status != http.StatusOK || !reflect.DeepEqual(r.patch, a.patch) {
+				t.Errorf("GET the job = %d %s, want 200 with the record answered %s", r.status, r.raw, a.raw)
 			}
 		})
 	}
@@ -268,4 +274,226 @@ func TestSubmitRebuild_ReplaysARepeatedIdempotencyKey(t *testing.T) {
 	if js, events := h.jobsOf(t, "w"), h.rebuildEvents(t, "w", carrypatch.EventRebuildEnqueue); len(js) != 1 || len(events) != 1 {
 		t.Errorf("w has %d jobs and %d enqueue events, want 1 and 1", len(js), len(events))
 	}
+}
+
+func TestReadRebuild_AnswersTheWholeRecordInEveryStatus(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	ctx := context.Background()
+	setResult := func(t *testing.T, id, doc string) {
+		t.Helper()
+		if err := h.queue.SetResult(ctx, id, json.RawMessage(doc)); err != nil {
+			t.Fatalf("store the result of %s: %v", id, err)
+		}
+	}
+	const conflict = `{"files":["a.go"],"kind":"content"}`
+	const full = `{"upstream_head_sha":"u1","integration_head_sha":"i1","previous_integration_head_sha":"i0",` +
+		`"patches_applied":2,"patches_skipped":1,"patches_conflicted":0,"patches_removed":1,` +
+		`"integration_branch_pushed":true,"patch_results":[{"patch_id":"p1"},{"patch_id":"p2"}]}`
+	defaults := map[string]any{
+		"error": nil, "conflict": nil, "retry_count": 0.0, "upstream_head_sha": nil, "integration_head_sha": nil,
+		"patches_applied": 0.0, "integration_branch_pushed": false, "patch_results": []any{},
+	}
+	decode := func(doc string) map[string]any {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(doc), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	// The cases pass the queue in turn, so they run one after the other.
+	for i, c := range []struct {
+		name, status string
+		reach        func(t *testing.T, id string)
+		want         map[string]any
+	}{
+		{"queued", jobs.StatusQueued, func(*testing.T, string) {}, defaults},
+		{"running with no result", jobs.StatusRunning, func(t *testing.T, id string) { h.drive(t, id, jobs.StatusRunning) }, defaults},
+		{"running with a result", jobs.StatusRunning, func(t *testing.T, id string) {
+			h.drive(t, id, jobs.StatusRunning)
+			setResult(t, id, `{"patch_results":[{"patch_id":"p1"}],"upstream_head_sha":"S"}`)
+		}, map[string]any{"patch_results": []any{map[string]any{"patch_id": "p1"}}, "upstream_head_sha": "S",
+			"integration_head_sha": nil, "patches_applied": 0.0, "integration_branch_pushed": false}},
+		{"failed", jobs.StatusFailed, func(t *testing.T, id string) {
+			h.drive(t, id, jobs.StatusRunning)
+			h.finish(t, id, errors.New("fetch failed"))
+		}, map[string]any{"error": "fetch failed", "retry_count": 1.0, "conflict": nil}},
+		{"dead-lettered with a detail", jobs.StatusDeadLetter, func(t *testing.T, id string) {
+			h.drive(t, id, jobs.StatusRunning)
+			h.finish(t, id, jobs.WithDetail(jobs.Permanent(errors.New("patch 2 conflicts")), json.RawMessage(conflict)))
+		}, map[string]any{"error": "patch 2 conflicts", "conflict": decode(conflict), "retry_count": 0.0}},
+		{"completed with a full result", jobs.StatusCompleted, func(t *testing.T, id string) {
+			h.drive(t, id, jobs.StatusRunning)
+			setResult(t, id, full)
+			h.finish(t, id, nil)
+		}, func() map[string]any {
+			m := decode(full)
+			m["error"], m["conflict"] = nil, nil
+			return m
+		}()},
+		{"cancelled", jobs.StatusCancelled, func(t *testing.T, id string) { h.drive(t, id, jobs.StatusCancelled) }, defaults},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			slug := fmt.Sprintf("w%d", i)
+			h.carryWith(t, slug, nil, carrypatch.StatusActive)
+			id := h.mustSubmit(t, slug)
+			c.reach(t, id)
+			h.wantStatus(t, id, c.status)
+
+			r := h.readRebuild(t, slug, id)
+			if r.status != http.StatusOK || r.patch["status"] != c.status {
+				t.Fatalf("GET the job = %d %s, want 200 %s", r.status, r.raw, c.status)
+			}
+			if got, want := slices.Sorted(maps.Keys(r.patch)), slices.Sorted(maps.Keys(h.queuedRecord("", "", "", ""))); !slices.Equal(got, want) {
+				t.Errorf("the record has the members %v, want %v", got, want)
+			}
+			if failed := c.status == jobs.StatusFailed; (r.patch["next_attempt_at"] != nil) != failed {
+				t.Errorf("next_attempt_at is %v in %s", r.patch["next_attempt_at"], c.status)
+			}
+			if ended := jobs.Final(c.status); (r.patch["completed_at"] != nil) != ended {
+				t.Errorf("completed_at is %v in %s", r.patch["completed_at"], c.status)
+			}
+			for k, v := range c.want {
+				if !reflect.DeepEqual(r.patch[k], v) {
+					t.Errorf("%s is %v, want %v", k, r.patch[k], v)
+				}
+			}
+		})
+	}
+}
+
+// rebuildIDs are the ids of a list's items, in order.
+func rebuildIDs(a answer) []string {
+	out := make([]string, 0, len(a.Items))
+	for _, it := range a.Items {
+		out = append(out, fmt.Sprint(it["id"]))
+	}
+	return out
+}
+
+func TestListRebuilds_NewestFirstFilteredAndPaged(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	for _, slug := range []string{"w", "w2", "empty"} {
+		h.carryWith(t, slug, nil, carrypatch.StatusActive)
+	}
+	// Five jobs of w, made t, t+1s, t+1s, t+2s and t+3s, and one of w2.
+	var made []string
+	for _, step := range []struct {
+		advance time.Duration
+		status  string
+	}{
+		{0, jobs.StatusCompleted}, {time.Second, jobs.StatusDeadLetter}, {0, jobs.StatusCancelled},
+		{time.Second, jobs.StatusCompleted}, {time.Second, jobs.StatusQueued},
+	} {
+		h.advance(step.advance)
+		id := h.mustSubmit(t, "w")
+		if step.status != jobs.StatusQueued {
+			h.drive(t, id, step.status)
+		}
+		made = append(made, id)
+	}
+	h.mustSubmit(t, "w2")
+	sameSecond := []string{made[1], made[2]}
+	slices.Sort(sameSecond)
+	newestFirst := []string{made[4], made[3], sameSecond[1], sameSecond[0], made[0]}
+
+	path := "/workspaces/w/rebuilds"
+	a := h.get(t, path)
+	if a.status != http.StatusOK || !slices.Equal(rebuildIDs(a), newestFirst) || a.Next != nil {
+		t.Fatalf("GET %s = %d %v next %v (%s), want 200 %v and no next_cursor", path, a.status, rebuildIDs(a), a.Next, a.raw, newestFirst)
+	}
+	for _, it := range a.Items {
+		if want := h.recordOf(t, fmt.Sprint(it["id"])); !reflect.DeepEqual(it, want) {
+			t.Errorf("the item %v, want the job's record %v", it, want)
+		}
+	}
+	if a := h.get(t, path+"?status=completed"); !slices.Equal(rebuildIDs(a), []string{made[3], made[0]}) || a.Next != nil {
+		t.Errorf("GET ?status=completed = %d %s, want the two completed jobs newest first", a.status, a.raw)
+	}
+	for _, p := range []string{path + "?status=running", "/workspaces/empty/rebuilds"} {
+		if a := h.get(t, p); a.status != http.StatusOK || !strings.Contains(string(a.raw), `"items":[]`) || a.Next != nil {
+			t.Errorf("GET %s = %d %s, want 200 with no items and no next_cursor", p, a.status, a.raw)
+		}
+	}
+
+	var pages [][]string
+	query := "?limit=2"
+	for range 5 {
+		a := h.get(t, path+query)
+		if a.status != http.StatusOK {
+			t.Fatalf("GET %s%s = %d %s, want 200", path, query, a.status, a.raw)
+		}
+		pages = append(pages, rebuildIDs(a))
+		if a.Next == nil {
+			break
+		}
+		query = "?limit=2&cursor=" + url.QueryEscape(*a.Next)
+	}
+	if want := [][]string{newestFirst[:2], newestFirst[2:4], newestFirst[4:]}; !slices.EqualFunc(pages, want, slices.Equal) {
+		t.Errorf("the pages of 2 are %v, want %v", pages, want)
+	}
+}
+
+func TestListRebuilds_RefusesAStatusOutsideTheSix(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	h.carryWith(t, "w", nil, carrypatch.StatusActive)
+	for _, query := range []string{"status=done", "status=QUEUED", "status=", "status=queued,failed", "status=queued&status=failed"} {
+		t.Run(query, func(t *testing.T) {
+			t.Parallel()
+			if a := h.get(t, "/workspaces/w/rebuilds?"+query); a.status != http.StatusBadRequest || a.Error.ErrorType != "invalid_request" {
+				t.Errorf("GET ?%s = %d %s, want 400 invalid_request", query, a.status, a.raw)
+			}
+		})
+	}
+}
+
+func TestRebuildJob_AnswersNotFoundForAJobTheWorkspaceDoesNotHold(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	ctx := context.Background()
+	h.carryWith(t, "w", nil, carrypatch.StatusActive)
+	h.carryWith(t, "w2", nil, carrypatch.StatusActive)
+	deadLetter := h.mustSubmit(t, "w2")
+	h.drive(t, deadLetter, jobs.StatusDeadLetter)
+	queued := h.mustSubmit(t, "w2")
+	var otherType jobs.Job
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		otherType, err = h.queue.Enqueue(ctx, tx, "probe", "w", json.RawMessage(`{}`))
+		return err
+	}); err != nil {
+		t.Fatalf("queue a job of another type: %v", err)
+	}
+	before := map[string]jobs.Job{deadLetter: h.job(t, deadLetter), queued: h.job(t, queued), otherType.ID: h.job(t, otherType.ID)}
+
+	routes := []struct{ method, suffix string }{{http.MethodGet, ""}}
+	ids := map[string]string{
+		"not a UUID": "abc", "an unknown UUID": uuid.NewV4().String(), "a queued job of w2": queued,
+		"a dead-lettered job of w2": deadLetter, "a job of another type": otherType.ID,
+	}
+	for _, rt := range routes {
+		for name, id := range ids {
+			t.Run(rt.method+" "+name, func(t *testing.T) {
+				t.Parallel()
+				a := h.call(t, h.key, rt.method, "/workspaces/w/rebuilds/"+id+rt.suffix, nil, nil)
+				if a.status != http.StatusNotFound || a.Error.ErrorType != "not_found" || a.Error.Message != "rebuild job not found" {
+					t.Errorf("%s %s = %d %s, want 404 not_found 'rebuild job not found'", rt.method, id, a.status, a.raw)
+				}
+			})
+		}
+	}
+	t.Cleanup(func() {
+		for id, j := range before {
+			if after := h.job(t, id); !reflect.DeepEqual(after, j) {
+				t.Errorf("the job %s is %+v after the refusals, want %+v", id, after, j)
+			}
+		}
+		for _, typ := range []string{"parley.rebuild.cancel", "parley.rebuild.requeue"} {
+			if got := h.rebuildEvents(t, "w2", typ); len(got) != 0 {
+				t.Errorf("w2 has %d %s events, want none", len(got), typ)
+			}
+		}
+	})
 }

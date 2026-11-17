@@ -2,12 +2,17 @@ package carrypatch
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
+	"uuid"
 
+	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -32,12 +37,117 @@ func rebuildRoute(kind RouteKind, rt server.Route) server.Route {
 
 // rebuildRoutes are the routes of the rebuild jobs: the submit, a write
 // route that creates, so that the server answers a repeated
-// Idempotency-Key with the first answer.
+// Idempotency-Key with the first answer, and the list and the read of one
+// job, read routes that serve in every state of the workspace.
 func (c *Component) rebuildRoutes() []server.Route {
 	return []server.Route{
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuild", Handler: c.submitRoute, Create: true}),
+		rebuildRoute(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/rebuilds", Handler: c.listRebuildsRoute}),
+		rebuildRoute(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/rebuilds/:id", Handler: c.readRebuildRoute}),
 	}
 }
+
+// listRebuildsRoute answers GET /workspaces/:slug/rebuilds: a page of the
+// workspace's rebuild jobs, in the status the query names when it names
+// one, newest first. The query is checked before the guard, so that an
+// invalid one is answered as such on any workspace.
+func (c *Component) listRebuildsRoute(w http.ResponseWriter, r *http.Request) error {
+	page, err := server.ReadPage(r)
+	if err != nil {
+		return err
+	}
+	status, err := statusFilter(r.URL.Query())
+	if err != nil {
+		return err
+	}
+	var after jobs.ListPosition
+	paged, err := page.After(&after)
+	if err != nil {
+		return err
+	}
+	ws, err := c.Guard(r)
+	if err != nil {
+		return err
+	}
+	if c.d.Jobs == nil {
+		return errNotBound
+	}
+	var from *jobs.ListPosition
+	if paged {
+		from = &after
+	}
+	js, err := c.d.Jobs.List(r.Context(), RebuildJobType, ws.Slug, status, from, page.Limit+1)
+	if err != nil {
+		return err
+	}
+	items := make([]RebuildRecord, 0, len(js))
+	keys := make(map[string]jobs.ListPosition, len(js))
+	for _, j := range js {
+		items = append(items, RebuildRecordOf(j))
+		keys[j.ID] = j.Position()
+	}
+	return server.WritePage(w, page, items, func(rec RebuildRecord) any { return keys[rec.ID] })
+}
+
+// statusFilter reads the query parameter status: absent lists every job,
+// one of the six statuses of a job lists those in it; anything else, the
+// empty value, a list and a repeated parameter included, is 400
+// invalid_request rather than a guess.
+func statusFilter(query url.Values) (string, error) {
+	values, ok := query["status"]
+	if !ok {
+		return "", nil
+	}
+	if len(values) == 1 && slices.Contains(jobs.Statuses, values[0]) {
+		return values[0], nil
+	}
+	return "", server.InvalidRequest(fmt.Sprintf("status must be given once, as one of %q", jobs.Statuses))
+}
+
+// readRebuildRoute answers GET /workspaces/:slug/rebuilds/:id with the
+// job's record; that of a running job holds the result its attempt stored
+// last.
+func (c *Component) readRebuildRoute(w http.ResponseWriter, r *http.Request) error {
+	ws, err := c.Guard(r)
+	if err != nil {
+		return err
+	}
+	j, err := c.rebuildJob(r.Context(), ws.Slug, server.Param(r, "id"))
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, RebuildRecordOf(j))
+	return nil
+}
+
+// rebuildJob is the rebuild job id of the workspace slug, the lookup of
+// every route of one job, made after the guard so that the workspace's
+// mode and state are answered first. An id that is not a UUID, that names
+// no job, a job of another workspace or a job of another type is the one
+// 404, so that an answer does not tell which jobs other workspaces hold.
+func (c *Component) rebuildJob(ctx context.Context, slug, id string) (jobs.Job, error) {
+	if c.d.Jobs == nil {
+		return jobs.Job{}, errNotBound
+	}
+	if _, err := uuid.Parse(id); err != nil || len(id) != 36 {
+		return jobs.Job{}, errRebuildNotFound()
+	}
+	j, err := c.d.Jobs.Get(ctx, id)
+	if errors.Is(err, jobs.ErrNotFound) {
+		return jobs.Job{}, errRebuildNotFound()
+	}
+	if err != nil {
+		return jobs.Job{}, fmt.Errorf("read the rebuild job %s: %w", id, err)
+	}
+	if j.Workspace != slug || j.Type != RebuildJobType {
+		return jobs.Job{}, errRebuildNotFound()
+	}
+	return j, nil
+}
+
+// errRebuildNotFound is the 404 of a rebuild job the workspace does not
+// have.
+func errRebuildNotFound() error { return server.NotFound("rebuild job not found") }
 
 // submitRoute answers POST /workspaces/:slug/rebuild: it queues a rebuild
 // of the workspace and answers 202 with the job's record. The body is

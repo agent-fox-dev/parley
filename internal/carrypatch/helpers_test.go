@@ -796,6 +796,12 @@ func (h *rebuildHub) submit(t *testing.T, slug string, body any, header http.Hea
 	return h.call(t, h.key, http.MethodPost, "/workspaces/"+slug+"/rebuild", body, header)
 }
 
+// readRebuild sends GET /workspaces/<slug>/rebuilds/<id> as the owner.
+func (h *rebuildHub) readRebuild(t *testing.T, slug, id string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodGet, "/workspaces/"+slug+"/rebuilds/"+id, nil, nil)
+}
+
 // mustSubmit submits a rebuild of slug with no body, fails the test unless
 // the answer is 202, and returns the job's id.
 func (h *rebuildHub) mustSubmit(t *testing.T, slug string) string {
