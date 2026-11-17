@@ -3,27 +3,27 @@
   "spec_id": "35",
   "spec_name": "rebuild_rollback_and_preview",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-17T06:11:49Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

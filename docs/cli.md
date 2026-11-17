@@ -2337,6 +2337,8 @@ exits `0`.
 | `parley rebuild status <slug> <rebuild-id>` | `GET /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>` | |
 | `parley rebuild cancel <slug> <rebuild-id>` | `DELETE /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>` | |
 | `parley rebuild requeue <slug> <rebuild-id> [--wait] [--timeout <duration>] [--poll-interval <duration>]` | `POST /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>/requeue` | no body |
+| `parley rebuild rollback <slug> <rebuild-id>` | `POST /api/v1/workspaces/<slug>/rebuilds/<rebuild-id>/rollback` | no body |
+| `parley rebuild preview <slug> [--fail-on-conflict]` | `GET /api/v1/workspaces/<slug>/rebuild-preview` | |
 
 With `--wait`, `submit` and `requeue` follow the job the answer names
 through the shared [wait](#waiting), polling
@@ -2347,6 +2349,13 @@ through the shared [wait](#waiting), polling
 `--timeout` prints nothing on stdout, reports `wait_timeout` and exits
 `1`, and asks the hub to cancel nothing. Without `--wait` they print the
 hub's answer and exit `0`.
+
+**`--fail-on-conflict`.** After `preview` prints the answer, it collects
+the `branch_name` of every entry of `patch_results` whose `status` is
+`would_conflict`. When there is any, it writes a `condition_not_met` error
+naming them in the preview's order (`would conflict with the upstream:
+patch/b`) and exits `3`; otherwise, and without the flag, it exits `0`. A
+refusal of the hub's still exits `1` with nothing on stdout.
 
 A `--strategy` other than `rebase` or `merge`, a `--fail-mode` other than
 `fail_fast` or `continue`, a `--status` other than `queued`, `running`,

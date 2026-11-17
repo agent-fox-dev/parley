@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,10 +9,14 @@ import (
 )
 
 // The routes parley rebuild submit my-project and parley rebuild requeue
-// my-project j1 post to, as sent; both wait at jobPath.
+// my-project j1 post to, as sent; both wait at jobPath. rollbackPath is the
+// route of parley rebuild rollback my-project j1, previewPath the one of
+// parley rebuild preview my-project.
 const (
-	submitPath  = "/api/v1/workspaces/my-project/rebuild"
-	requeuePath = jobPath + "/requeue"
+	submitPath   = "/api/v1/workspaces/my-project/rebuild"
+	requeuePath  = jobPath + "/requeue"
+	rollbackPath = jobPath + "/rollback"
+	previewPath  = "/api/v1/workspaces/my-project/rebuild-preview"
 )
 
 // rebuildWaits are the two commands that can wait for a rebuild job, each
@@ -57,7 +62,11 @@ func TestRebuild_SendsTheCommandsRequestAndPrintsTheAnswer(t *testing.T) {
 		{[]string{"rebuild", "status", "w", "j1"}, sentRequest{http.MethodGet, jobs + "/j1", "", ""}},
 		{[]string{"rebuild", "cancel", "w", "j1"}, sentRequest{http.MethodDelete, jobs + "/j1", "", ""}},
 		{[]string{"rebuild", "requeue", "w", "j1"}, sentRequest{http.MethodPost, jobs + "/j1/requeue", "", ""}},
+		{[]string{"rebuild", "rollback", "w", "j1"}, sentRequest{http.MethodPost, jobs + "/j1/rollback", "", ""}},
+		{[]string{"rebuild", "preview", "w"}, sentRequest{http.MethodGet, "/api/v1/workspaces/w/rebuild-preview", "", ""}},
 		{[]string{"rebuild", "status", "a/b", "j/1"}, sentRequest{http.MethodGet, "/api/v1/workspaces/a%2Fb/rebuilds/j%2F1", "", ""}},
+		{[]string{"rebuild", "rollback", "a/b", "j/1"}, sentRequest{http.MethodPost, "/api/v1/workspaces/a%2Fb/rebuilds/j%2F1/rollback", "", ""}},
+		{[]string{"rebuild", "preview", "a/b"}, sentRequest{http.MethodGet, "/api/v1/workspaces/a%2Fb/rebuild-preview", "", ""}},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -94,6 +103,8 @@ func TestRebuild_PrintsTheHubsRefusalAsReceived(t *testing.T) {
 		{[]string{"rebuild", "status", "my-project", "j1"}, http.MethodGet, jobPath, http.StatusNotFound, "not_found"},
 		{[]string{"rebuild", "cancel", "my-project", "j1"}, http.MethodDelete, jobPath, http.StatusConflict, "job_not_cancellable"},
 		{[]string{"rebuild", "requeue", "my-project", "j1"}, http.MethodPost, requeuePath, http.StatusConflict, "job_not_requeueable"},
+		{[]string{"rebuild", "rollback", "my-project", "j1"}, http.MethodPost, rollbackPath, http.StatusConflict, "rollback_unavailable"},
+		{[]string{"rebuild", "preview", "my-project"}, http.MethodGet, previewPath, http.StatusConflict, "upstream_unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -220,6 +231,11 @@ func TestRebuild_RefusesAWrongCommandLineWithoutARequest(t *testing.T) {
 		{[]string{"cancel", "w"}, "needs the argument <id>"},
 		{[]string{"requeue", "w"}, "needs the argument <id>"},
 		{[]string{"cancel", "w", "j1", "x"}, `got the extra argument "x"`},
+		{[]string{"rollback"}, "needs the argument <slug>"},
+		{[]string{"rollback", "w"}, "needs the argument <id>"},
+		{[]string{"rollback", "w", "j1", "x"}, `got the extra argument "x"`},
+		{[]string{"preview"}, "needs the argument <slug>"},
+		{[]string{"preview", "w", "x"}, `got the extra argument "x"`},
 		{[]string{"submit", "w", "--wait", "--timeout", "0s"}, `"0s" for "--timeout" flag: want a whole number above 0`},
 		{[]string{"requeue", "w", "j1", "--poll-interval", "-1s"}, `"-1s" for "--poll-interval" flag: want a whole number above 0`},
 	}
@@ -235,6 +251,105 @@ func TestRebuild_RefusesAWrongCommandLineWithoutARequest(t *testing.T) {
 			}
 			if n := len(hub.recorded()); n != 0 {
 				t.Errorf("the hub got %d requests, want none", n)
+			}
+		})
+	}
+}
+
+// previewAnswer is a preview of my-project whose patches, given as
+// branch name and status, sit at positions 1, 2 and on.
+func previewAnswer(patches ...[2]string) string {
+	results := make([]string, len(patches))
+	for i, p := range patches {
+		results[i] = fmt.Sprintf(`{"patch_id":"p%d","branch_name":%q,"position":%d,"status":%q,"conflict_files":[],"conflict":null}`, i+1, p[0], i+1, p[1])
+	}
+	return `{"upstream_head_sha":"` + strings.Repeat("a", 40) + `","patch_results":[` + strings.Join(results, ",") + `]}`
+}
+
+func TestRebuildPreview_FailOnConflict(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		flag   bool
+		status int
+		answer string
+		// code is the exit status; names are what the condition_not_met
+		// message must name, and others what it must not.
+		code          int
+		names, others []string
+	}{
+		{
+			"a conflicting patch after a clean one", true, http.StatusOK,
+			previewAnswer([2]string{"patch/a", "would_succeed"}, [2]string{"patch/b", "would_conflict"}),
+			3, []string{"patch/b"}, []string{"patch/a"},
+		},
+		{
+			"two conflicting patches", true, http.StatusOK,
+			previewAnswer([2]string{"patch/a", "would_conflict"}, [2]string{"patch/b", "would_skip"}, [2]string{"patch/c", "would_conflict"}),
+			3, []string{"patch/a", "patch/c"}, []string{"patch/b"},
+		},
+		{
+			"clean and skipped patches only", true, http.StatusOK,
+			previewAnswer([2]string{"patch/a", "would_succeed"}, [2]string{"patch/b", "would_skip"}),
+			0, nil, nil,
+		},
+		{"no patch to test", true, http.StatusOK, previewAnswer(), 0, nil, nil},
+		{
+			"a conflicting patch without the flag", false, http.StatusOK,
+			previewAnswer([2]string{"patch/a", "would_succeed"}, [2]string{"patch/b", "would_conflict"}),
+			0, nil, nil,
+		},
+		{
+			"the hub's refusal", true, http.StatusConflict,
+			`{"error":{"code":409,"message":"refused","error_type":"upstream_unknown"}}`,
+			1, nil, nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).answer(http.MethodGet, previewPath, tt.status, tt.answer)
+			args := []string{"rebuild", "preview", "my-project"}
+			if tt.flag {
+				args = append(args, "--fail-on-conflict")
+			}
+
+			code, stdout, stderr := runWorkspace(t, hub, args...)
+
+			if code != tt.code {
+				t.Errorf("exit status = %d, want %d (stderr %q)", code, tt.code, stderr)
+			}
+			if n := len(hub.recorded()); n != 1 {
+				t.Errorf("the hub got %d requests, want 1", n)
+			}
+			if tt.status != http.StatusOK {
+				if stdout != "" || stderr != indented(t, tt.answer) {
+					t.Errorf("stdout %q, stderr %q; want nothing and the hub's envelope as received", stdout, stderr)
+				}
+				return
+			}
+			if want := indented(t, tt.answer); stdout != want {
+				t.Errorf("stdout = %q, want the whole answer %q", stdout, want)
+			}
+			if tt.code == 0 {
+				if stderr != "" {
+					t.Errorf("stderr = %q, want it empty", stderr)
+				}
+				return
+			}
+			gotCode, message, errorType := clientEnvelope(t, stderr)
+			if gotCode != 0 || errorType != "condition_not_met" {
+				t.Errorf("envelope code %v, error_type %q; want 0 and condition_not_met", gotCode, errorType)
+			}
+			for _, name := range tt.names {
+				if !strings.Contains(message, name) {
+					t.Errorf("message = %q, want it to name %s", message, name)
+				}
+			}
+			for _, name := range tt.others {
+				if strings.Contains(message, name) {
+					t.Errorf("message = %q, want it not to name %s", message, name)
+				}
 			}
 		})
 	}

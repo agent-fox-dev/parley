@@ -272,7 +272,7 @@ func (c *Component) moveToOrigin(ctx context.Context, repo *gitrepo.Repo, slug, 
 	case err == nil:
 		return nil
 	case errors.Is(err, gitrepo.ErrRefMoved):
-		return refMovedNow(ctx, repo, branch)
+		return refMovedNow(ctx, repo, branch, "reset to origin")
 	case errors.Is(err, gitrepo.ErrRefNameConflict):
 		return nameConflict(ctx, repo, branch, headsPrefix+branch)
 	}
@@ -335,10 +335,10 @@ WHERE workspace_slug = ? AND id = ?`, originInSync, tip, now.UnixNano(), ws.Slug
 }
 
 // refMovedNow is 409 ref_moved for branch of repo, which another writer
-// moved, created or deleted between the reset's read and its
-// compare-and-swap, with the commit it is at now as details.current_sha,
-// null when the writer deleted it.
-func refMovedNow(ctx context.Context, repo *gitrepo.Repo, branch string) error {
+// moved, created or deleted between the read and the compare-and-swap of
+// the operation that was doing what doing says, with the commit it is at
+// now as details.current_sha, null when the writer deleted it.
+func refMovedNow(ctx context.Context, repo *gitrepo.Repo, branch, doing string) error {
 	var ref gitrepo.Ref
 	var found bool
 	err := RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
@@ -354,7 +354,7 @@ func refMovedNow(ctx context.Context, repo *gitrepo.Repo, branch string) error {
 		current = &ref.ID
 	}
 	return server.NewError("ref_moved", http.StatusConflict,
-		fmt.Sprintf("the branch %q moved while it was reset to origin; read it again and retry", branch)).
+		fmt.Sprintf("the branch %q moved while it was %s; read it again and retry", branch, doing)).
 		WithDetails(map[string]any{"current_sha": current})
 }
 

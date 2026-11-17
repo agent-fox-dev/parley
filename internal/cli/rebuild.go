@@ -32,7 +32,7 @@ var rebuildStatuses = []string{"queued", "running", "failed", "completed", "dead
 // newRebuildCommand builds parley rebuild: the rebuild jobs that recreate a
 // carry-patch workspace's integration branch from upstream and its patches.
 func newRebuildCommand() *cobra.Command {
-	return group("rebuild", "Queue, list, read, cancel and requeue the rebuild jobs of a carry-patch workspace",
+	return group("rebuild", "Queue, list, read, cancel, requeue and roll back the rebuild jobs of a carry-patch workspace, and preview a rebuild",
 		checkFlags(declare(command{
 			Name:        "submit",
 			Description: "Queue a rebuild of a carry-patch workspace's integration branch; with --wait, wait until it ends",
@@ -84,7 +84,52 @@ func newRebuildCommand() *cobra.Command {
 			Auth:        authUser,
 			Wait:        rebuildWait(nil),
 		}),
+		declare(command{
+			Name:        "rollback",
+			Description: "Move a carry-patch workspace's integration branch back to the head it had before a completed rebuild",
+			Method:      http.MethodPost,
+			Path:        rebuildsRoute + "/:id/rollback",
+			Args:        []argSpec{slugArg, rebuildArg},
+			Auth:        authUser,
+		}),
+		declare(command{
+			Name:        "preview",
+			Description: "Predict which patches of a carry-patch workspace a rebuild would apply, skip or stop at with a conflict, against the upstream as last fetched, changing nothing",
+			Method:      http.MethodGet,
+			Path:        "/workspaces/:slug/rebuild-preview",
+			Args:        []argSpec{slugArg},
+			Auth:        authUser,
+			FailOn: []failOn{{
+				Name:        "conflict",
+				Description: "exit 3 when a patch would conflict, naming the conflicting branches on stderr",
+				Check:       previewConflicts,
+			}},
+		}),
 	)
+}
+
+// previewConflicts holds when a patch of a rebuild preview would conflict,
+// and names the branch of every such patch, in the preview's order.
+func previewConflicts(result []byte) (bool, string) {
+	var preview struct {
+		PatchResults []struct {
+			BranchName string `json:"branch_name"`
+			Status     string `json:"status"`
+		} `json:"patch_results"`
+	}
+	// The document is the hub's answer, printed already; one this cannot
+	// read names no conflict.
+	_ = json.Unmarshal(result, &preview)
+	var names []string
+	for _, p := range preview.PatchResults {
+		if p.Status == "would_conflict" {
+			names = append(names, p.BranchName)
+		}
+	}
+	if len(names) == 0 {
+		return false, ""
+	}
+	return true, "would conflict with the upstream: " + strings.Join(names, ", ")
 }
 
 // rebuildWait is the wait of a command that starts a rebuild job, with

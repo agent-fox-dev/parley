@@ -19,6 +19,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -775,7 +776,7 @@ func TestRequeueRebuild_RefusesWhileAnotherRebuildIsPending(t *testing.T) {
 	}
 }
 
-// jobRoute is one of the five rebuild routes as the refusal tests send it.
+// jobRoute is one of the rebuild routes as the refusal tests send it.
 type jobRoute struct {
 	method string
 	// path follows /workspaces/<slug>; :id stands for the job the route
@@ -784,19 +785,26 @@ type jobRoute struct {
 	write bool
 	// names is the status of the job the route names, "" for none.
 	names string
+	// ready is set on a route that refuses outside a ready workspace: every
+	// write route, and the preview, a read route that reads the copy rather
+	// than stored state.
+	ready bool
 }
 
 func (rt jobRoute) String() string { return rt.method + " " + rt.path }
 
-// jobRoutes are the five rebuild routes. The cancel names a queued job and
-// the requeue a dead-lettered one, so that only the refusal under test
-// stands between the request and a change.
+// jobRoutes are the rebuild routes. The cancel names a queued job, the
+// requeue a dead-lettered one and the rollback a completed one with a
+// previous head, so that only the refusal under test stands between the
+// request and a change.
 var jobRoutes = []jobRoute{
-	{http.MethodPost, "/rebuild", true, ""},
-	{http.MethodGet, "/rebuilds", false, ""},
-	{http.MethodGet, "/rebuilds/:id", false, jobs.StatusQueued},
-	{http.MethodDelete, "/rebuilds/:id", true, jobs.StatusQueued},
-	{http.MethodPost, "/rebuilds/:id/requeue", true, jobs.StatusDeadLetter},
+	{http.MethodPost, "/rebuild", true, "", true},
+	{http.MethodGet, "/rebuilds", false, "", false},
+	{http.MethodGet, "/rebuilds/:id", false, jobs.StatusQueued, false},
+	{http.MethodDelete, "/rebuilds/:id", true, jobs.StatusQueued, true},
+	{http.MethodPost, "/rebuilds/:id/requeue", true, jobs.StatusDeadLetter, true},
+	{http.MethodPost, "/rebuilds/:id/rollback", true, jobs.StatusCompleted, true},
+	{http.MethodGet, "/rebuild-preview", false, "", true},
 }
 
 // send sends the route for slug with credential and body; the job it
@@ -807,16 +815,18 @@ func (rt jobRoute) send(t *testing.T, h *rebuildHub, credential, slug string, id
 }
 
 // rebuildState is what the rebuild routes change in a workspace: its
-// rebuild jobs, and how many parley.rebuild.* events of each type it has.
+// rebuild jobs, how many parley.rebuild.* events of each type it has, and
+// the head of its integration branch deploy, "" when it has none.
 type rebuildState struct {
 	Jobs   []jobs.Job
 	Events map[string]int
+	Deploy string
 }
 
 func (h *rebuildHub) rebuildState(t *testing.T, slug string) rebuildState {
 	t.Helper()
-	s := rebuildState{Jobs: h.jobsOf(t, slug), Events: map[string]int{}}
-	for _, typ := range []string{carrypatch.EventRebuildEnqueue, carrypatch.EventRebuildCancel, carrypatch.EventRebuildRequeue} {
+	s := rebuildState{Jobs: h.jobsOf(t, slug), Events: map[string]int{}, Deploy: refIn(h.repoPath(slug), "refs/heads/deploy")}
+	for _, typ := range []string{carrypatch.EventRebuildEnqueue, carrypatch.EventRebuildCancel, carrypatch.EventRebuildRequeue, carrypatch.EventRebuildRollback} {
 		s.Events[typ] = len(h.rebuildEvents(t, slug, typ))
 	}
 	return s
@@ -831,20 +841,26 @@ func (h *rebuildHub) unchanged(t *testing.T, slug string, before rebuildState) {
 	}
 }
 
-// queuedAndDeadLetter gives slug a dead-lettered rebuild job, then a queued
-// one, and returns their ids by status.
-func (h *rebuildHub) queuedAndDeadLetter(t *testing.T, slug string) map[string]string {
+// routeJobs gives slug a copy made by rollbackRepo, whose upstream branch
+// main, the workspace's default branch, is at H1 so that a preview has a
+// base, and the jobs the routes name: a completed rebuild that moved
+// deploy from H1 to H2, a dead-lettered one, then a queued one; it returns
+// their ids by status.
+func (h *rebuildHub) routeJobs(t *testing.T, slug string) map[string]string {
 	t.Helper()
+	dir, h1, h2 := h.rollbackRepo(t, slug)
+	gitrepotest.Git(t, dir, "update-ref", "refs/remotes/upstream/main", h1)
+	completed := h.settledRebuild(t, slug, rebuiltFrom(h1, h2), nil)
 	deadLetter := h.queueRebuild(t, slug)
 	h.drive(t, deadLetter, jobs.StatusDeadLetter)
-	return map[string]string{jobs.StatusDeadLetter: deadLetter, jobs.StatusQueued: h.queueRebuild(t, slug)}
+	return map[string]string{jobs.StatusCompleted: completed, jobs.StatusDeadLetter: deadLetter, jobs.StatusQueued: h.queueRebuild(t, slug)}
 }
 
 func TestRebuildRoutes_RefuseCallersWithoutTheScopeOrAccess(t *testing.T) {
 	t.Parallel()
 	h := startRebuildHub(t)
 	h.carryWith(t, "w", nil, carrypatch.StatusActive)
-	ids := h.queuedAndDeadLetter(t, "w")
+	ids := h.routeJobs(t, "w")
 	before := h.rebuildState(t, "w")
 	member := h.CreateUser(t, "member")
 	h.AddMember(t, h.org, member)
@@ -871,18 +887,32 @@ func TestRebuildRoutes_RefuseCallersWithoutTheScopeOrAccess(t *testing.T) {
 		{"the owner on an unknown slug", h.key, "missing", notFound, notFound},
 		{"a member with read access", memberKey, "w", want{http.StatusForbidden, "forbidden"}, served},
 	}
+	bodies := map[string]map[jobRoute]string{}
 	for _, c := range callers {
+		bodies[c.name] = map[jobRoute]string{}
 		for _, rt := range jobRoutes {
 			t.Run(c.name+"/"+rt.String(), func(t *testing.T) {
 				w := c.read
 				if rt.write {
 					w = c.write
 				}
-				if a := rt.send(t, h, c.credential, c.slug, ids, nil); a.status != w.status || a.Error.ErrorType != w.errorType {
+				gits := len(h.gitCommands())
+				a := rt.send(t, h, c.credential, c.slug, ids, nil)
+				if a.status != w.status || a.Error.ErrorType != w.errorType {
 					t.Errorf("%s = %d %s, want %d %s", rt, a.status, a.raw, w.status, w.errorType)
 				}
+				if ran := h.gitCommands()[gits:]; w.status != http.StatusOK && len(ran) != 0 {
+					t.Errorf("the refused %s ran git: %q", rt, ran)
+				}
+				bodies[c.name][rt] = string(a.raw)
 				h.unchanged(t, "w", before)
 			})
+		}
+	}
+	// An outsider learns nothing a caller naming no workspace would not.
+	for _, rt := range jobRoutes {
+		if outsider, unknown := bodies["a user outside the organization"][rt], bodies["the owner on an unknown slug"][rt]; outsider != unknown {
+			t.Errorf("%s answered the outsider %s and the unknown slug %s, want the same", rt, outsider, unknown)
 		}
 	}
 	t.Run("a member's invalid submit is refused for the access first", func(t *testing.T) {
@@ -898,14 +928,16 @@ func TestRebuildRoutes_RefuseAWorkspaceNotInCarryPatchMode(t *testing.T) {
 	h := startRebuildHub(t)
 	h.carryWith(t, "w", nil, carrypatch.StatusActive)
 	h.add(t, "plain", workspace.ModeStandard, workspace.StatusReady, workspace.MarkerNone)
+	// The mode is answered before the state.
+	h.add(t, "plain-archived", workspace.ModeStandard, workspace.StatusArchived, workspace.MarkerNone)
 	// A task fork is always in mode standard, whatever its parent's mode.
 	h.add(t, "w-fork", workspace.ModeStandard, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
 		w.Kind, w.ParentSlug, w.GitURL = access.KindFork, new("w"), nil
 	})
 	// Ids that name no job: the mode is answered before the job is looked
 	// up.
-	ids := map[string]string{jobs.StatusQueued: uuid.NewV4().String(), jobs.StatusDeadLetter: uuid.NewV4().String()}
-	for _, slug := range []string{"plain", "w-fork"} {
+	ids := map[string]string{jobs.StatusQueued: uuid.NewV4().String(), jobs.StatusDeadLetter: uuid.NewV4().String(), jobs.StatusCompleted: uuid.NewV4().String()}
+	for _, slug := range []string{"plain", "plain-archived", "w-fork"} {
 		for _, rt := range jobRoutes {
 			t.Run(slug+"/"+rt.String(), func(t *testing.T) {
 				if a := rt.send(t, h, h.key, slug, ids, nil); a.status != http.StatusBadRequest || a.Error.ErrorType != "workspace_mode_mismatch" {
@@ -921,6 +953,8 @@ func TestRebuildRoutes_RefuseAWorkspaceNotInCarryPatchMode(t *testing.T) {
 	})
 }
 
+// The writes, and the preview, which reads the copy, are refused outside a
+// ready workspace without running git; the reads of stored jobs are served.
 func TestRebuildRoutes_RefuseWritesButServeReadsOutsideAReadyWorkspace(t *testing.T) {
 	t.Parallel()
 	h := startRebuildHub(t)
@@ -928,7 +962,7 @@ func TestRebuildRoutes_RefuseWritesButServeReadsOutsideAReadyWorkspace(t *testin
 	// refused for that.
 	h.carryWith(t, "w", nil)
 	h.drive(t, h.queueRebuild(t, "w"), jobs.StatusCompleted)
-	ids := h.queuedAndDeadLetter(t, "w")
+	ids := h.routeJobs(t, "w")
 	if a := jobRoutes[0].send(t, h, h.key, "w", ids, nil); a.status != http.StatusBadRequest || a.Error.ErrorType != "no_active_patches" {
 		t.Fatalf("submit on the ready workspace = %d %s, want 400 no_active_patches", a.status, a.raw)
 	}
@@ -943,7 +977,7 @@ func TestRebuildRoutes_RefuseWritesButServeReadsOutsideAReadyWorkspace(t *testin
 		}
 	}
 	before := h.rebuildState(t, "w")
-	unknown := map[string]string{jobs.StatusQueued: uuid.NewV4().String(), jobs.StatusDeadLetter: uuid.NewV4().String()}
+	unknown := map[string]string{jobs.StatusQueued: uuid.NewV4().String(), jobs.StatusDeadLetter: uuid.NewV4().String(), jobs.StatusCompleted: uuid.NewV4().String()}
 
 	// The cases change the state of w in turn, so they run one after the
 	// other.
@@ -956,13 +990,16 @@ func TestRebuildRoutes_RefuseWritesButServeReadsOutsideAReadyWorkspace(t *testin
 		{"pending", workspace.StatusPending, workspace.MarkerNone, "workspace_busy"},
 		{"cloning", workspace.StatusCloning, workspace.MarkerNone, "workspace_busy"},
 		{"a reclone running", workspace.StatusReady, workspace.MarkerReclone, "workspace_busy"},
+		{"an archive running", workspace.StatusReady, workspace.MarkerArchive, "workspace_busy"},
+		{"a delete running", workspace.StatusReady, workspace.MarkerDelete, "workspace_busy"},
 		{"failed", workspace.StatusFailed, workspace.MarkerNone, "workspace_not_ready"},
 		{"archived", workspace.StatusArchived, workspace.MarkerNone, "workspace_archived"},
 	} {
 		t.Run(s.name, func(t *testing.T) {
 			h.setState(t, "w", s.status, s.marker)
+			gits := len(h.gitCommands())
 			for _, rt := range jobRoutes {
-				if !rt.write {
+				if !rt.ready {
 					if a := rt.send(t, h, h.key, "w", ids, nil); a.status != http.StatusOK || !bytes.Equal(a.raw, kept[rt]) {
 						t.Errorf("%s = %d %s, want 200 %s as in the ready workspace", rt, a.status, a.raw, kept[rt])
 					}
@@ -973,6 +1010,9 @@ func TestRebuildRoutes_RefuseWritesButServeReadsOutsideAReadyWorkspace(t *testin
 						t.Errorf("%s for the job %s = %d %s, want 409 %s", rt, named[rt.names], a.status, a.raw, s.want)
 					}
 				}
+			}
+			if ran := h.gitCommands()[gits:]; len(ran) != 0 {
+				t.Errorf("the requests ran git: %q", ran)
 			}
 			h.unchanged(t, "w", before)
 		})
