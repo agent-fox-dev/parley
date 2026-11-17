@@ -1,12 +1,14 @@
 package carrypatch
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/jobs"
+	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -24,6 +26,10 @@ type Deps struct {
 	Git gitrepo.Git
 	// RepoPath is the git directory of the copy of the workspace slug.
 	RepoPath func(slug string) string
+	// FetchRemote, when set, replaces the git fetch of FetchUpstream,
+	// gitrepo.Git.FetchRemote, and is called as RunGit calls that; only
+	// tests set it, to make the fetch fail with the text they give.
+	FetchRemote func(ctx context.Context, dir, url, name string, cred gitrepo.Credential, deadline time.Duration) (map[string]string, error)
 	// UpstreamFetchDeadline, when positive and shorter, replaces
 	// DefaultGitDeadline as the one deadline of a whole upstream fetch;
 	// only tests set it.
@@ -47,6 +53,50 @@ type Deps struct {
 	// to move the branch or change the patch in between as another writer
 	// would.
 	BeforeRefSwap func(slug, branch string)
+	// CommitterName and CommitterEmail are the landing identity, the
+	// committer of every commit a rebuild makes; empty, they are
+	// DefaultCommitterName and DefaultCommitterEmail.
+	CommitterName, CommitterEmail string
+	// BeforeRebuildPatch, when set, is called by an attempt of the rebuild
+	// job with the job's id and the index, from 0, of a patch of the run's
+	// list before the run takes it up, outside any store transaction; only
+	// tests set it, to look at the repository and the job between patches
+	// or to change them as another writer would.
+	BeforeRebuildPatch func(job string, i int)
+	// BeforeRebuildPublish, when set, is called by an attempt of the
+	// rebuild job with the job's id once every patch is processed and
+	// before the publish reads the integration branch, outside any store
+	// transaction; only tests set it.
+	BeforeRebuildPublish func(job string)
+	// BeforeRebuildSwap, when set, is called by an attempt of the rebuild
+	// job with the job's id after the publish read the integration branch
+	// and prepared the patch list's changes, and before its compare-and-swap.
+	// The publish's store transaction is open then: the hook may read the
+	// store and move refs, but a write through Store.Tx would wait for ever.
+	// Only tests set it, to move the branch as another writer would or to
+	// look at what a reader sees.
+	BeforeRebuildSwap func(job string)
+	// ConflictFiles describes the files of the conflict report of a patch
+	// that did not apply in a rebuild; nil is GitConflictFiles.
+	ConflictFiles ConflictFileDescriber
+	// Push, when set, replaces gitrepo.Git.Push as the push of the
+	// integration branch to origin after a rebuild's publish, and is called
+	// as RunGit calls that; only tests set it, to see the push or make it
+	// fail.
+	Push func(ctx context.Context, req gitrepo.PushRequest) (gitrepo.PushResult, error)
+	// RebuildPushDeadline, when positive and shorter, replaces
+	// DefaultRebuildPushDeadline as the deadline of that push; only tests
+	// set it.
+	RebuildPushDeadline time.Duration
+	// RebuildGitDeadline, when positive and shorter, replaces
+	// DefaultGitDeadline as the deadline of each git operation of a rebuild
+	// attempt; only tests set it.
+	RebuildGitDeadline time.Duration
+	// Scrubber removes credentials from the text of a rebuild's failure and
+	// of its events before they are stored; nil is a scrubber that knows no
+	// secret value of the hub's, which still removes the values given to
+	// each call and the user information of URLs.
+	Scrubber *scrub.Scrubber
 	// Events writes the events of the patch list in the transaction of the
 	// change they report.
 	Events Emitter
@@ -59,14 +109,24 @@ type Deps struct {
 	Logger *slog.Logger
 }
 
+// The landing identity of a hub that names none, the same as the land
+// component's.
+const (
+	DefaultCommitterName  = "Parley"
+	DefaultCommitterEmail = "parley@localhost"
+)
+
 // Component holds the carry-patch operations of the hub. Its zero value
 // is usable once Bind has given it its Deps.
 type Component struct {
 	d Deps
 
-	// mu guards rebuilds, the registered rebuild enqueuer.
+	// mu guards rebuilds, the registered rebuild enqueuer, and outcomes,
+	// the outcome of the last attempt of each rebuild job whose settlement
+	// has not yet reported it, by job id.
 	mu       sync.Mutex
 	rebuilds RebuildEnqueuer
+	outcomes map[string]attemptOutcome
 }
 
 // Bind gives the component its Deps, before its first use.

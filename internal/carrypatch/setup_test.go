@@ -116,6 +116,9 @@ func TestSetup_RunsAfterFreshCloneBeforeReady(t *testing.T) {
 	u := up.Commit("main", "u1")
 	release := up.Commit("release", "r1")
 	h := startCarryHub(t, origin, up)
+	// Entries a copy of the same name left behind describe an rr-cache the
+	// fresh copy does not have.
+	recordEntries(t, h.Hub, "variant", strings.Repeat("a", 40))
 
 	h.create(t, "variant", origin, carryPatch(up, map[string]any{"integration_branch": "integration"}))
 	h.create(t, "plain", origin, nil)
@@ -133,6 +136,9 @@ func TestSetup_RunsAfterFreshCloneBeforeReady(t *testing.T) {
 	}
 	if got := configIn(dir, "rerere.enabled"); got != "true" {
 		t.Errorf("rerere.enabled = %q, want true", got)
+	}
+	if n := countEntries(t, h.Hub, "variant"); n != 0 {
+		t.Errorf("the workspace has %d remembered-resolution entries after its fresh clone, want none", n)
 	}
 	wantUpstream := map[string]string{"main": u, "release": release}
 	if got := gitrepotest.Refs(t, dir, "refs/remotes/upstream/"); !maps.Equal(got, wantUpstream) {

@@ -12,23 +12,30 @@ import (
 const carryPatchHook = "carry_patch"
 
 // composeCarryPatch adds the carry-patch work: the schema of the patch
-// lists, and the component, registered with the workspace service as the
-// post-clone step of the workspaces in mode carry_patch, so that every
-// fresh copy of one is set up (upstream fetched, remembered resolutions on,
-// the integration branch written) before the workspace is ready, and as the
-// patch-branch lookup of the push route, which leaves the patch branches to
-// the patch list, without the workspace package knowing the mode's work. A
-// workspace's delete removes its patches (ADR 07). The component is the
+// lists and of the remembered-resolution entries, and the component,
+// registered with the workspace service as the post-clone step of the
+// workspaces in mode carry_patch, so that every fresh copy of one is set up
+// (its remembered-resolution entries forgotten, upstream fetched,
+// remembered resolutions on, the integration branch written) before the
+// workspace is ready, and as the patch-branch lookup of the push route,
+// which leaves the patch branches to the patch list, without the workspace
+// package knowing the mode's work. A workspace's delete removes its patches
+// and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
-// one as a job of the hub's queue. The component's routes, those of the
+// one as a job of the hub's queue, and the handler of those jobs, which
+// runs every attempt of a rebuild and writes the event of its outcome in
+// the settlement's transaction. The component's routes, those of the
 // patch list and of the rebuild jobs, are registered with the hub's router.
 // Its start hook binds the component to the store, the secret component,
 // which holds the upstream and origin credentials, the hub's git, the place
 // of each copy on disk, the workspace settings registry, through which a
-// patch branch's resolution reads patch_branch_source, the event component,
-// which writes an add's event in its transaction (ADR 05), the job queue,
-// which the jobs part's hook binds before this one, and the hub's clock and
-// logger, after every adjuster
+// patch branch's resolution reads patch_branch_source, the landing
+// identity of [land], the committer of every commit a rebuild makes, the
+// conflict-file describer of internal/gitrepo, which gives a rebuild's
+// conflict report its files, the hub's scrubber, which cleans the text of a
+// rebuild's failure, the event component, which writes an add's event in
+// its transaction (ADR 05), the job queue, which the jobs part's hook binds
+// before this one, and the hub's clock and logger, after every adjuster
 // AdjustCarryPatch added has changed those dependencies. The hook runs
 // after the workspace part's, and like it before the clone workers launch,
 // so no clone runs the step before the component is bound.
@@ -39,24 +46,31 @@ func composeCarryPatch(c *Composition) {
 	comp := &carrypatch.Component{}
 	c.carryPatch = comp
 	c.AddSchemaStep(carrypatch.SchemaStep)
+	c.AddSchemaStep(carrypatch.RerereSchemaStep)
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
+	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveRerereEntries)
 	comp.RegisterRebuildEnqueuer(comp)
+	c.Jobs().Register(carrypatch.RebuildJobType, comp.RebuildHandler())
 	for _, rt := range comp.Routes() {
 		c.AddRoute(rt)
 	}
 	c.AddStartHook(carryPatchHook, func(_ context.Context, rt *Runtime) error {
 		d := carrypatch.Deps{
-			Store:    rt.Store,
-			Secrets:  c.Secrets(),
-			Git:      gitFor(c.env),
-			RepoPath: c.workspaces.RepoPath,
-			Settings: c.workspaces.Settings(),
-			Events:   c.Events(),
-			Jobs:     c.Jobs(),
-			Now:      rt.Now,
-			Logger:   rt.Logger,
+			Store:          rt.Store,
+			Secrets:        c.Secrets(),
+			Git:            gitFor(c.env),
+			RepoPath:       c.workspaces.RepoPath,
+			Settings:       c.workspaces.Settings(),
+			CommitterName:  rt.Config.Land.CommitterName,
+			CommitterEmail: rt.Config.Land.CommitterEmail,
+			ConflictFiles:  carrypatch.GitConflictFiles{},
+			Scrubber:       rt.Scrubber,
+			Events:         c.Events(),
+			Jobs:           c.Jobs(),
+			Now:            rt.Now,
+			Logger:         rt.Logger,
 		}
 		for _, adjust := range c.carryPatchAdjusters {
 			adjust(&d)

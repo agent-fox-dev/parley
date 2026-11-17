@@ -69,8 +69,9 @@ Several things had to be settled that the code, not the spec, decides:
 - A package with a job type registers its handler from its own part; tests
   register scripted handlers through `hubtest.Config.Compose` and control
   the queue's clock through `AdjustJobs`.
-- Until a package registers the `rebuild` handler, rebuild jobs are stored,
-  listed, cancelled and requeued but never run.
+- The `rebuild` handler is the carry-patch component's
+  (`(*carrypatch.Component).RebuildHandler()`), registered by
+  `composeCarryPatch`; a test that registers its own replaces it.
 - Dedup relies on the single writer of `Store.Tx`: a second process on
   the same data directory, which the hub does not support, would break it.
 - The queue's grace and the hub's stop limit are both 30 seconds; in
