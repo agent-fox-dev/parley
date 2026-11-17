@@ -3244,21 +3244,22 @@ starts from none.
 {"id":"7b1c0e2a-4d5f-4a6b-9c8d-0e1f2a3b4c5d","workspace_slug":"variant","status":"queued","strategy":"rebase","fail_mode":"fail_fast","integration_branch":"deploy","submitted_by":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","retry_count":0,"next_attempt_at":null,"error":null,"conflict":null,"created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z","completed_at":null,"upstream_head_sha":null,"integration_head_sha":null,"previous_integration_head_sha":null,"patches_applied":0,"patches_skipped":0,"patches_conflicted":0,"patches_removed":0,"integration_branch_pushed":false,"patch_results":[]}
 ```
 
-### Checks common to the five routes
+### Checks common to the rebuild routes
 
-The two `GET` routes need `rebuilds:read` and read access; the other three
+The three `GET` routes need `rebuilds:read` and read access; the other four
 need `rebuilds:write` and write access. The routes check, in this order:
 the scope (`403` `insufficient_scope`, whether or not the workspace
 exists), access (`404` `not_found` for a workspace the caller cannot read
 or an unknown slug, `403` `forbidden` for read access on a write route),
 the request (`400` `invalid_request`), the workspace's mode (`400`
 `workspace_mode_mismatch` unless it is `carry_patch`, also for a task
-fork), on the three write routes its status (`409` `workspace_busy` while
-it is `pending` or `cloning` or a reclone, archive or delete runs, `409`
-`workspace_not_ready` when `failed`, `409` `workspace_archived`), then the
-job: an id that is not a UUID, names no job, or names a job of another
-workspace is `404` `not_found` with the message `rebuild job not found`.
-The two `GET` routes answer in every workspace status.
+fork), on the four write routes and the preview its status (`409`
+`workspace_busy` while it is `pending` or `cloning` or a reclone, archive
+or delete runs, `409` `workspace_not_ready` when `failed`, `409`
+`workspace_archived`), then the job: an id that is not a UUID, names no
+job, or names a job of another workspace is `404` `not_found` with the
+message `rebuild job not found`. The list and the read of one job answer
+in every workspace status.
 
 ## `POST /api/v1/workspaces/{slug}/rebuild`
 
@@ -3283,7 +3284,7 @@ body and queues nothing.
 | `400` `invalid_request` | `strategy` or `fail_mode` is not a string or `null` (`strategy must be a string`), or not one of its values (`strategy must be one of ["rebase" "merge"], not "squash"`, `fail_mode must be one of ["fail_fast" "continue"], not "stop"`) |
 | `400` `workspace_mode_mismatch` | the workspace is not in mode `carry_patch` |
 | `400` `no_active_patches` | no patch is `active` or `conflict` (`workspace "<slug>" has no patch in active or conflict to rebuild`) |
-| `403` `insufficient_scope`, `forbidden`; `404` `not_found` | see [the common checks](#checks-common-to-the-five-routes) |
+| `403` `insufficient_scope`, `forbidden`; `404` `not_found` | see [the common checks](#checks-common-to-the-rebuild-routes) |
 | `409` `concurrent_rebuild` | a rebuild job of the workspace is `queued`, `running` or `failed` (`workspace "<slug>" has the rebuild job <id> queued, running or failed`) |
 | `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | the workspace's status does not allow the write |
 
@@ -3336,6 +3337,87 @@ fail mode, integration branch and `submitted_by`. A body is ignored.
 | `200 OK` | the job record, `status` `queued` |
 | `409` `job_not_requeueable` | the job is not `dead_letter`, whatever the other jobs are (`rebuild job <id> is not dead_letter; only a dead_letter job can be requeued`) |
 | `409` `concurrent_rebuild` | another rebuild job of the workspace is `queued`, `running` or `failed` |
+
+## `POST /api/v1/workspaces/{slug}/rebuilds/{id}/rollback`
+
+Moves the workspace's integration branch back to the head it had before
+the completed rebuild `{id}`: the job's `previous_integration_head_sha`.
+The hub reads the branch's head and moves the branch with one
+compare-and-swap against the head it read; a branch that does not exist
+is created at the target, the swap expecting it absent. A body is ignored,
+and the route takes no `Idempotency-Key`. A branch already at the target
+is swapped to it again and answered `200` with both members equal.
+
+Nothing else changes: no patch (its status, position, `conflict_files` or
+deletion), no job, no other ref, nothing on origin. The branch is not
+pushed, whatever `rebuild_push_integration_branch` says, and no rebuild is
+queued. A rebuild job of the workspace that is `queued`, `running` or
+`failed` neither delays nor refuses it. The next rebuild that publishes
+replaces the rolled-back head; to keep it, turn `auto_rebuild_after_push`
+and `auto_rebuild_after_sync` off or disable the patch at fault.
+
+| Status | When |
+|---|---|
+| `200 OK` | `{"rolled_back_to": "<the job's previous_integration_head_sha>", "previous_head_sha": "<the head it replaced>"}`, both full commit ids; `previous_head_sha` is `null` when the rollback created the branch |
+| `400` `workspace_mode_mismatch`; `403` `insufficient_scope`, `forbidden`; `404` `not_found`; `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | see [the common checks](#checks-common-to-the-rebuild-routes) |
+| `409` `rollback_unavailable` | the job is not `completed` (`rebuild job <id> is <status>; only a completed rebuild can be rolled back`), recorded no previous head, the first rebuild (`rebuild job <id> recorded no previous head of the integration branch`), or its previous head is not a commit of the repository, such as after a reclone (`the previous head <sha> of rebuild job <id> is not a commit of the repository`) |
+| `409` `ref_moved` | another writer (a rebuild's publish, another rollback) moved the branch between the read and the swap; `details.current_sha` is the branch's head as read after the miss, `null` when it is gone, and the branch keeps that writer's value (`the branch "<branch>" moved while it was rolled back; read it again and retry`) |
+| `409` `conflict` | the branch is missing and another ref's name is in the way of its name |
+
+A successful rollback writes `parley.rebuild.rollback` once the branch has
+moved: the job as its resource (`resource_type` `rebuild`, `resource_id`
+the job id), the caller as actor, the workspace's slug, and `metadata`
+`integration_branch`, `rolled_back_to` and `previous_head_sha` (`null`
+when the branch was created). A refused rollback writes nothing. Should
+the event fail to commit, the hub swaps the branch back from the target to
+the head it read and answers `500` `internal`.
+
+## `GET /api/v1/workspaces/{slug}/rebuild-preview`
+
+Predicts what a rebuild would do with each patch, against the upstream
+base as the last upstream fetch left it: the head of the upstream's
+default branch under `refs/remotes/upstream/`, else the upstream branch
+named like the workspace's `default_branch`. The hub fetches nothing and
+contacts neither upstream nor origin, so a preview works from the last
+fetched base while upstream is unreachable. Unlike the list and the read
+of one job, the route refuses a workspace that is not ready. It takes no
+query parameter and no `Idempotency-Key`.
+
+The hub lists the patches that are not deleted, in position order, leaves
+out those `disabled` and `merged_upstream`, reads the tip of each
+remaining patch branch once, and starts a predicted state at the upstream
+base. Each tip is merged onto the state in a trial merge (`git merge-tree
+--write-tree`: no working tree, no ref moved, no remembered resolution
+read or recorded), whatever `rebuild_strategy` says:
+
+| Situation | `status` | The predicted state |
+|---|---|---|
+| the patch branch does not exist | `would_skip` | unchanged |
+| the tip merges without a conflict, a tip the state already holds included | `would_succeed` | becomes a merge commit of the state and the tip that no ref points to (unchanged for a tip it already holds) |
+| the merge has a conflict | `would_conflict` | unchanged: the later patches are tested without this one |
+
+A preview is a prediction: a patch reported `would_conflict` may apply in
+a real rebuild, through a remembered resolution or the `rebase` strategy.
+It changes no ref, no patch (a `would_conflict` patch keeps its status and
+`conflict_files`), no job, no remembered resolution, and writes no event;
+it may leave commit objects of the predicted state that no ref reaches,
+which git's housekeeping removes. It runs while a rebuild runs.
+
+| Status | When |
+|---|---|
+| `200 OK` | `{"upstream_head_sha": "<base used>", "patch_results": [{"patch_id", "branch_name", "position", "status", "conflict_files", "conflict"}]}`, one entry per tested patch in position order, `[]` when there is none |
+| `400` `workspace_mode_mismatch`; `403` `insufficient_scope`; `404` `not_found`; `409` `workspace_busy`, `workspace_not_ready`, `workspace_archived` | see [the common checks](#checks-common-to-the-rebuild-routes) |
+| `409` `upstream_unknown` | neither upstream ref resolves (`workspace "<slug>" has no upstream base: its copy holds no upstream branch to start from; sync it first`) |
+| `500` `internal` | a git command failed for another reason than a conflict, its time limit included; no partial result is returned |
+
+`conflict_files` is `[]` unless the status is `would_conflict`; then it
+lists the conflicted paths in ascending order. `conflict` is `null` unless
+the status is `would_conflict`; then it is [the rebuild conflict
+report](#the-rebuild-conflict-report) of a merge: `target_sha` is the
+predicted state the patch was tested against (the upstream base for the
+first tested patch, otherwise a commit no ref points to), `head_sha` and
+`commit_sha` the patch tip, `base_sha` the merge base of the two, and the
+files' `base` the file in `base_sha`.
 
 ## Source control reads
 
