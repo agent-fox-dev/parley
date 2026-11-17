@@ -29,6 +29,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
+// TestMain runs the package's tests at most hubtest.HubParallel at a time:
+// they start many hubs, which contend for one lock past that (see
+// hubtest.HubParallel).
+func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
+	os.Exit(m.Run())
+}
+
 // The event types a create, an update and a sync write.
 const (
 	createEvent = "parley.workspace.create"

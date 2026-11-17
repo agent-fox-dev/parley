@@ -42,16 +42,35 @@ func Tree(t testing.TB, dir, parent string, files map[string]string) string {
 // with the message msg and the parents given, the first parent first (none
 // for a root commit), whose tree is the first parent's with the files, at
 // the top level, holding the content given, and returns its id. It writes
-// no ref.
+// no ref. It writes the commit in one run of git fast-import rather than
+// one git process per object: a test process that starts git pays for every
+// process it forks.
 func Commit(t testing.TB, dir, msg string, files map[string]string, parents ...string) string {
 	t.Helper()
-	first := ""
-	if len(parents) > 0 {
-		first = parents[0]
+	// fast-import commits on a branch; the reset at the end leaves the ref
+	// unwritten, so the name only has to be one no test reads.
+	const scratch = "refs/gitrepotest/commit"
+	var stream strings.Builder
+	fmt.Fprintf(&stream, "commit %s\nmark :1\ncommitter Origin <origin@example.invalid> now\n%s", scratch, fastData(msg+"\n"))
+	for i, p := range parents {
+		if i == 0 {
+			fmt.Fprintf(&stream, "from %s\n", p)
+		} else {
+			fmt.Fprintf(&stream, "merge %s\n", p)
+		}
 	}
-	args := []string{"commit-tree", Tree(t, dir, first, files), "-m", msg}
-	for _, p := range parents {
-		args = append(args, "-p", p)
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		fmt.Fprintf(&stream, "M 100644 inline %s\n%s", name, fastData(files[name]))
 	}
-	return Git(t, dir, args...)
+	fmt.Fprintf(&stream, "\nget-mark :1\nreset %s\n\n", scratch)
+	id, err := Run(dir, stream.String(), "fast-import", "--quiet", "--date-format=now")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// fastData is git fast-import's data command for content, given whole.
+func fastData(content string) string {
+	return fmt.Sprintf("data %d\n%s\n", len(content), content)
 }

@@ -251,8 +251,11 @@ func readOnlyWorld(t *testing.T) *readWorld {
 	return readOnly.w
 }
 
-// TestMain runs the package's tests, then stops the shared world.
+// TestMain runs the package's tests, at most hubtest.HubParallel at a time
+// since they start many hubs, which contend for one lock past that (see
+// hubtest.HubParallel), then stops the shared world.
 func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
 	code := m.Run()
 	readOnly.tb.cleanup()
 	os.Exit(code)

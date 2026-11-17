@@ -33,6 +33,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
+// TestMain runs the package's tests at most hubtest.HubParallel at a time:
+// they start many hubs, which contend for one lock past that (see
+// hubtest.HubParallel).
+func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
+	os.Exit(m.Run())
+}
+
 // world is a hub with the landing composed: the user owner, a member of
 // the org acme, with the API key ownerKey; the owner's ready workspace
 // api, whose main holds one commit (base) with a.txt ("l1\nl2\nl3\n") and
@@ -166,7 +174,7 @@ type treeEntry struct{ mode, content string }
 func commitEntries(t *testing.T, dir, branch, from, author, message string, entries map[string]treeEntry) string {
 	t.Helper()
 	var s strings.Builder
-	s.WriteString("commit refs/heads/" + branch + "\n")
+	s.WriteString("commit refs/heads/" + branch + "\nmark :1\n")
 	if author != "" {
 		s.WriteString("author " + author + "\n")
 	}
@@ -184,10 +192,13 @@ func commitEntries(t *testing.T, dir, branch, from, author, message string, entr
 			s.WriteString("M " + e.mode + " inline " + path + "\n" + data(e.content))
 		}
 	}
-	if _, err := gitrepotest.Run(dir, s.String()+"\n", "fast-import", "--quiet", "--force"); err != nil {
+	// get-mark answers the commit's id, which spares a git process to read
+	// the branch.
+	id, err := gitrepotest.Run(dir, s.String()+"\nget-mark :1\n", "fast-import", "--quiet", "--force")
+	if err != nil {
 		t.Fatal(err)
 	}
-	return gitrepotest.Refs(t, dir, "refs/heads/")[branch]
+	return id
 }
 
 // open opens, through the change component, a change of api by the owner
