@@ -148,6 +148,118 @@ func TestLookupRef_FindsTheRefOfAFullName(t *testing.T) {
 	}
 }
 
+func TestLookupRef_ReadsTheRefWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.InitBare(t, dir, "main")
+	lines := strings.Repeat("a line git can store as a delta of another blob's\n", 200)
+	blobs := map[string]string{}
+	for name, content := range map[string]string{"base": lines, "changed": lines + "one more\n"} {
+		id, err := gitrepotest.Run(dir, content, "hash-object", "-w", "--stdin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		blobs[name] = id
+		gitrepotest.SetRef(t, dir, "refs/blobs/"+name, id)
+	}
+	c1 := gitrepotest.Commit(t, dir, "c1", map[string]string{"f.txt": "1\n"})
+	gitrepotest.SetRef(t, dir, "refs/heads/main", c1)
+	gitrepotest.SetRef(t, dir, "refs/remotes/upstream/main", c1)
+	gitrepotest.SetRef(t, dir, "refs/parley/tree", gitrepotest.Git(t, dir, "rev-parse", c1+"^{tree}"))
+	var calls atomic.Int32
+	repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"refs/heads/main", "refs/remotes/upstream/main", "refs/parley/tree", "refs/blobs/base", "refs/blobs/changed", "refs/heads/nope", "refs/blobs"}
+	check := func(stage string) {
+		t.Helper()
+		for _, name := range names {
+			want, wantFound := forEachRefOf(t, dir, name)
+			calls.Store(0)
+			got, found, err := repo.LookupRef(context.Background(), name)
+			if err != nil || found != wantFound || got != want {
+				t.Errorf("%s: LookupRef(%s) = %v, %v, %v; want %v, %v", stage, name, got, found, err, want, wantFound)
+			}
+			if n := calls.Load(); n != 0 {
+				t.Errorf("%s: LookupRef(%s) ran %d git processes, want none", stage, name, n)
+			}
+		}
+	}
+
+	check("before the repack")
+	// A pack whose deltas name their bases by offset, then one whose deltas
+	// name them by id, with the refs packed too.
+	for _, offsets := range []string{"true", "false"} {
+		gitrepotest.Git(t, dir, "-c", "repack.useDeltaBaseOffset="+offsets, "repack", "-adfq")
+		gitrepotest.Git(t, dir, "pack-refs", "--all")
+		idx, _ := filepath.Glob(filepath.Join(dir, "objects", "pack", "*.idx"))
+		if len(idx) != 1 || !deltified(t, dir, idx[0], blobs["base"], blobs["changed"]) {
+			t.Fatalf("the repack with useDeltaBaseOffset=%s made the packs %v, want one storing a blob as a delta", offsets, idx)
+		}
+		check("packed objects, useDeltaBaseOffset=" + offsets)
+	}
+}
+
+func TestLookupRef_AsksGitAboutWhatItDoesNotReadItself(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.InitBare(t, dir, "main")
+	c1 := gitrepotest.Commit(t, dir, "c1", map[string]string{"f.txt": "1\n"})
+	gitrepotest.SetRef(t, dir, "refs/heads/main", c1)
+	gitrepotest.Git(t, dir, "symbolic-ref", "refs/heads/alias", "refs/heads/main")
+	gitrepotest.Git(t, dir, "tag", "-a", "-m", "v1", "v1", c1)
+	repo, err := gitrepo.Git{}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"refs/heads/alias", "refs/tags/v1"} {
+		want, wantFound := forEachRefOf(t, dir, name)
+		want.Commit = c1
+		got, found, err := repo.LookupRef(context.Background(), name)
+		if err != nil || found != wantFound || got != want {
+			t.Errorf("LookupRef(%s) = %v, %v, %v; want %v, %v", name, got, found, err, want, wantFound)
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := repo.LookupRef(context.Background(), "refs/heads/main"); err == nil {
+		t.Errorf("LookupRef of a removed repository = %v, %v, nil; want an error", got, found)
+	}
+}
+
+// forEachRefOf is the ref of the full name name as git for-each-ref lists
+// it in dir, its commit read from the object type, and whether it is there.
+func forEachRefOf(t *testing.T, dir, name string) (gitrepo.Ref, bool) {
+	t.Helper()
+	out := gitrepotest.Git(t, dir, "for-each-ref", "--format=%(refname) %(objectname) %(objecttype)", name)
+	for line := range strings.Lines(out) {
+		f := strings.Fields(line)
+		if len(f) == 3 && f[0] == name {
+			ref := gitrepo.Ref{Name: name, ID: f[1]}
+			if f[2] == "commit" {
+				ref.Commit = f[1]
+			}
+			return ref, true
+		}
+	}
+	return gitrepo.Ref{}, false
+}
+
+// deltified reports whether the pack of the index idx in dir stores one of
+// the objects ids as a delta.
+func deltified(t *testing.T, dir, idx string, ids ...string) bool {
+	t.Helper()
+	for line := range strings.Lines(gitrepotest.Git(t, dir, "verify-pack", "-v", idx)) {
+		// A delta's line ends in its depth and its base's id.
+		if f := strings.Fields(line); len(f) == 7 && slices.Contains(ids, f[0]) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestResolveCommit_FindsTheOneCommitAnIdNames(t *testing.T) {
 	t.Parallel()
 	f := newReadFixture(t)

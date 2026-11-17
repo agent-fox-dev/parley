@@ -34,12 +34,11 @@ func filesBackend(dir string) bool {
 	return true
 }
 
-// readBranch is the commit id the branch ref names in the git directory
-// dir, and whether it exists. git writes nothing but a commit to a branch,
-// so the id needs no peeling. ok is false for an invalid name, a directory
-// filesBackend refuses, a symbolic ref and anything else it does not
-// understand.
-func readBranch(dir, ref string) (id string, found, ok bool) {
+// readRef is the object id the ref of the full name ref names in the git
+// directory dir, unpeeled, and whether it exists. ok is false for an
+// invalid name, a directory filesBackend refuses, a symbolic ref and
+// anything else it does not understand.
+func readRef(dir, ref string) (id string, found, ok bool) {
 	if !ValidRefName(ref) || !filesBackend(dir) {
 		return "", false, false
 	}
@@ -63,7 +62,7 @@ func readBranch(dir, ref string) (id string, found, ok bool) {
 
 // readRefs is what git for-each-ref lists below prefix, a ref name prefix
 // ending in "/", in the git directory dir: each ref's object id, unpeeled,
-// by its name without prefix, HEAD left out. ok is false for a directory
+// by its name without prefix. ok is false for a directory
 // filesBackend refuses, a symbolic ref, a name git would refuse and
 // anything else it does not understand.
 func readRefs(dir, prefix string) (refs map[string]string, ok bool) {
@@ -108,9 +107,7 @@ func readRefs(dir, prefix string) (refs map[string]string, ok bool) {
 			if !ValidRefName(ref) || !isHexID(id, idLen) {
 				return nil, false
 			}
-			if name := strings.TrimPrefix(ref, prefix); name != "HEAD" {
-				refs[name] = id
-			}
+			refs[strings.TrimPrefix(ref, prefix)] = id
 		}
 	}
 	return refs, true

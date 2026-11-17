@@ -141,18 +141,32 @@ func (o *Origin) Dir() string { return o.dir }
 
 // Commit adds a commit with message msg on top of branch, creating the
 // branch with a root commit when it does not exist, and returns its id.
-// Every commit changes the content of the one file of the tree. It writes
-// the commit in one run of git fast-import rather than one git process per
-// object: a test process that starts git pays for every process it forks.
+// Every commit changes the content of the one file of the tree. A test
+// process pays for every process it forks, so it writes the commit's
+// objects and the branch itself where it can (see writeCommitOf and
+// SetRef), and otherwise in one run of git fast-import rather than one git
+// process per object.
 func (o *Origin) Commit(branch, msg string) string {
 	o.t.Helper()
 	o.mu.Lock()
 	o.seq++
 	content := fmt.Sprintf("%s\n%d\n", msg, o.seq)
 	o.mu.Unlock()
+	parent := o.Head(branch)
+	var parents []string
+	if parent != "" {
+		parents = []string{parent}
+	}
+	if _, loose := commitTree(o.dir, parent); parent == "" || loose {
+		if id, ok := writeCommitOf(o.dir, msg, nil, map[string]string{"README": content}, parents, time.Now()); ok {
+			SetRef(o.t, o.dir, "refs/heads/"+branch, id)
+			o.Publish()
+			return id
+		}
+	}
 	var stream strings.Builder
 	fmt.Fprintf(&stream, "commit refs/heads/%s\nmark :1\ncommitter Origin <origin@example.invalid> now\n%s", branch, fastData(msg+"\n"))
-	if parent := o.Head(branch); parent != "" {
+	if parent != "" {
 		fmt.Fprintf(&stream, "from %s\n", parent)
 	}
 	// deleteall leaves README the tree's one file, whatever the parent's

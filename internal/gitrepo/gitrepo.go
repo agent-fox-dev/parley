@@ -220,8 +220,10 @@ func (r *Repo) ResolveBranch(ctx context.Context, branch string) (id string, fou
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
+	// git writes nothing but a commit to a branch, so the id needs no
+	// peeling.
 	ref := "refs/heads/" + branch
-	if id, found, ok := readBranch(r.dir, ref); ok {
+	if id, found, ok := readRef(r.dir, ref); ok {
 		return id, found, nil
 	}
 	return r.resolve(ctx, ref)
@@ -332,8 +334,16 @@ func Remove(dir string) error {
 }
 
 // resolve is the commit id ref points at; found is false when there is no
-// such ref or it points at no commit.
+// such ref or it points at no commit. A full ref name that names a commit
+// is read in process (readRef); git is asked about the rest, since
+// rev-parse tries other names for a ref it does not find.
 func (r *Repo) resolve(ctx context.Context, ref string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if read, found, ok := r.readRef(ref); ok && found && read.Commit == read.ID {
+		return read.ID, true, nil
+	}
 	out, err := r.git(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
 	if exitCode(err) == 1 {
 		return "", false, nil
@@ -353,6 +363,7 @@ func (r *Repo) refs(ctx context.Context, prefix string) (map[string]string, erro
 		return nil, err
 	}
 	if refs, ok := readRefs(r.dir, prefix); ok {
+		delete(refs, "HEAD")
 		return refs, nil
 	}
 	out, err := r.git(ctx, "for-each-ref", "--format=%(objectname) %(refname)", prefix)

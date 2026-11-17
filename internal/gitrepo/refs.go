@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 )
@@ -168,8 +169,18 @@ func (r *Repo) Tags(ctx context.Context) (map[string]string, error) {
 }
 
 // peek is the object id ref points at, whatever its type; found is false
-// when there is no such ref.
+// when there is no such ref. A full ref name that exists is read in process
+// (readRef); git is asked about the rest, since rev-parse tries other names
+// for a ref it does not find.
 func (r *Repo) peek(ctx context.Context, ref string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		if id, found, ok := readRef(r.dir, ref); ok && found {
+			return id, true, nil
+		}
+	}
 	out, err := r.git(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
 	if exitCode(err) == 1 {
 		return "", false, nil
@@ -180,14 +191,28 @@ func (r *Repo) peek(ctx context.Context, ref string) (string, bool, error) {
 	return strings.TrimSpace(string(out)), true, nil
 }
 
-// deleteUnder removes every ref below prefix, all in one transaction of
-// git's.
+// deleteUnder removes every ref below prefix, a ref name prefix ending in
+// "/", all in one transaction of git's. It lists them in process
+// (readRefs), and asks git only when it does not read them that way.
 func (r *Repo) deleteUnder(ctx context.Context, prefix string) error {
-	out, err := r.git(ctx, "for-each-ref", "--format=delete %(refname)", prefix)
-	if err != nil || len(out) == 0 {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err = r.g.runInput(ctx, access{}, out, "--git-dir="+r.dir, "update-ref", "--stdin")
+	var out []byte
+	if refs, ok := readRefs(r.dir, prefix); ok {
+		for _, name := range slices.Sorted(maps.Keys(refs)) {
+			out = fmt.Appendf(out, "delete %s%s\n", prefix, name)
+		}
+	} else {
+		var err error
+		if out, err = r.git(ctx, "for-each-ref", "--format=delete %(refname)", prefix); err != nil {
+			return err
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	_, err := r.g.runInput(ctx, access{}, out, "--git-dir="+r.dir, "update-ref", "--stdin")
 	return err
 }
 
