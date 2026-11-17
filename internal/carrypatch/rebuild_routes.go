@@ -52,7 +52,8 @@ func rebuildRoute(kind RouteKind, rt server.Route) server.Route {
 // cancel and the requeue of one job, write routes that change it; and the
 // rollback of the integration branch to the head before one completed job,
 // a write route that creates nothing, so that a repeated Idempotency-Key is
-// not answered from the first answer.
+// not answered from the first answer; and the preview of a rebuild, a read
+// route that reads the copy and so refuses a workspace that is not ready.
 func (c *Component) rebuildRoutes() []server.Route {
 	return []server.Route{
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuild", Handler: c.submitRoute, Create: true}),
@@ -61,6 +62,7 @@ func (c *Component) rebuildRoutes() []server.Route {
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodDelete, Pattern: "/workspaces/:slug/rebuilds/:id", Handler: c.cancelRebuildRoute}),
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuilds/:id/requeue", Handler: c.requeueRebuildRoute}),
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuilds/:id/rollback", Handler: c.rollbackRoute}),
+		rebuildRoute(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/rebuild-preview", Handler: c.previewRoute}),
 	}
 }
 

@@ -3,11 +3,13 @@ package carrypatch_test
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -704,7 +706,8 @@ func (e failingEmitter) Emit(ctx context.Context, tx *sql.Tx, in event.Input) (e
 // interval timer never fires and nothing wakes it. Its runner is the
 // handler of rebuild jobs: an attempt of a job a test scripted (drive)
 // does what the test says, any other completes at once. Its carry-patch
-// component writes events through an emitter the test can make fail.
+// component writes events through an emitter the test can make fail, and
+// its git records every command it runs.
 type rebuildHub struct {
 	*addHub
 	comp       *carrypatch.Component
@@ -713,6 +716,10 @@ type rebuildHub struct {
 	failEvents atomic.Bool
 	// rollbackHooks are the hooks onRollbackSwap gave workspaces, by slug.
 	rollbackHooks sync.Map
+	// gitRun are the arguments of every git command of the carry-patch
+	// component, in the order they ran.
+	gitMu  sync.Mutex
+	gitRun [][]string
 }
 
 // startRebuildHub starts a rebuild hub with an owner who holds an API key
@@ -736,6 +743,15 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 				h.repoPath = d.RepoPath
 				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
 				d.BeforeRollbackSwap = h.beforeRollbackSwap
+				trace := d.Git.Trace
+				d.Git.Trace = func(args []string) {
+					if trace != nil {
+						trace(args)
+					}
+					h.gitMu.Lock()
+					defer h.gitMu.Unlock()
+					h.gitRun = append(h.gitRun, args)
+				}
 			})
 		},
 	})
@@ -789,6 +805,18 @@ func (h *rebuildHub) beforeRollbackSwap(slug, _ string) {
 	if fn, ok := h.rollbackHooks.Load(slug); ok {
 		fn.(func())()
 	}
+}
+
+// gitCommands are the git commands the carry-patch component ran so far,
+// each its arguments joined by spaces.
+func (h *rebuildHub) gitCommands() []string {
+	h.gitMu.Lock()
+	defer h.gitMu.Unlock()
+	out := make([]string, 0, len(h.gitRun))
+	for _, args := range h.gitRun {
+		out = append(out, strings.Join(args, " "))
+	}
+	return out
 }
 
 // rollbackRepo makes the hub's copy of slug a bare repository made by git
@@ -1193,4 +1221,76 @@ func (r *rebuildRunner) Settled(_ context.Context, _ *sql.Tx, j jobs.Job, _ bool
 		a.settledOnce.Do(func() { close(a.settled) })
 	}
 	return nil
+}
+
+// histCommit is a commit writeHistory writes: on top of the commit of the
+// earlier entry at index from (-1 for a root commit), whose tree it takes
+// with files holding the content given and deleted removed; refs are the
+// full names of the refs that end at it.
+type histCommit struct {
+	from    int
+	files   map[string]string
+	deleted []string
+	refs    []string
+}
+
+// writeHistory writes commits, and the refs they name, into the
+// repository whose git directory is dir in one run of git fast-import,
+// rather than one git process per object, and returns their ids in order.
+func writeHistory(t *testing.T, dir string, commits []histCommit) []string {
+	t.Helper()
+	data := func(content string) string { return fmt.Sprintf("data %d\n%s\n", len(content), content) }
+	var s strings.Builder
+	for i, c := range commits {
+		// Each commit has a branch of its own, so that a root commit has no
+		// parent; the resets at the end leave those branches unwritten.
+		fmt.Fprintf(&s, "commit refs/history/%d\nmark :%d\ncommitter T <t@example.invalid> 1700000000 +0000\n%s", i, i+1, data(fmt.Sprintf("c%d\n", i)))
+		if c.from >= 0 {
+			fmt.Fprintf(&s, "from :%d\n", c.from+1)
+		}
+		for _, name := range slices.Sorted(maps.Keys(c.files)) {
+			fmt.Fprintf(&s, "M 100644 inline %s\n%s", name, data(c.files[name]))
+		}
+		for _, name := range c.deleted {
+			fmt.Fprintf(&s, "D %s\n", name)
+		}
+		s.WriteString("\n")
+	}
+	for i, c := range commits {
+		fmt.Fprintf(&s, "reset refs/history/%d\n\n", i)
+		for _, ref := range c.refs {
+			fmt.Fprintf(&s, "reset %s\nfrom :%d\n\n", ref, i+1)
+		}
+		fmt.Fprintf(&s, "get-mark :%d\n", i+1)
+	}
+	out, err := gitrepotest.Run(dir, s.String(), "fast-import", "--quiet")
+	if err != nil {
+		t.Fatalf("write the history into %s: %v", dir, err)
+	}
+	ids := strings.Fields(out)
+	if len(ids) != len(commits) {
+		t.Fatalf("fast-import answered %q for %d commits", out, len(commits))
+	}
+	return ids
+}
+
+// blobID is the id git gives a blob of content.
+func blobID(content string) string {
+	return fmt.Sprintf("%x", sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(content), content))))
+}
+
+// previewCopy makes the hub's copy of slug a bare repository made by git
+// init that holds commits, written by writeHistory, and returns its
+// directory and the commits' ids.
+func (h *rebuildHub) previewCopy(t *testing.T, slug string, commits []histCommit) (dir string, ids []string) {
+	t.Helper()
+	dir = h.repoPath(slug)
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	return dir, writeHistory(t, dir, commits)
+}
+
+// preview sends GET /workspaces/<slug>/rebuild-preview as the owner.
+func (h *rebuildHub) preview(t *testing.T, slug string) answer {
+	t.Helper()
+	return h.call(t, h.key, http.MethodGet, "/workspaces/"+slug+"/rebuild-preview", nil, nil)
 }
