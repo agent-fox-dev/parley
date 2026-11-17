@@ -5212,10 +5212,11 @@ every process with a remote URL: `ListRemote`, `Clone`, the fetches and
 the pushes) and runs every such process with
 `GIT_ALLOW_PROTOCOL=https:ssh`, after `Git.Env`, so a redirect or a remote
 helper cannot leave those transports; and the operations carry-patch code
-calls with a caller's value (`ResolveBranch`, `IsAncestor`, `LookupRef`,
+calls with a caller's value (`IsAncestor`, `LookupRef`,
 `CompareAndSwapRef`, `SetRef`, `DeleteRef`, `FetchOriginBranch`) refuse a
 value that begins with `-` with an error matching `ErrInvalidArgument`
-before git starts, and hand git the others after `--end-of-options`.
+before git starts, and hand git the others after `--end-of-options`;
+`ResolveBranch` answers such a branch as not found, with no git started.
 
 **The upstream.** `ResolveUpstreamCredential(ctx, secrets, slug)` reads
 `UPSTREAM_GIT_PAT`, then `UPSTREAM_GIT_USERNAME` with
@@ -5656,7 +5657,11 @@ before `Guard`, selects the entry whose id equals it, else every entry
 whose path does, and removes each by its own id: `(*gitrepo.Repo).ForgetRerere(id)`
 (a hex id only; `rr-cache/<id>` is renamed into a fresh directory, then
 removed) through `RunGit`, then `RemoveRerereEntry` in one `Store.Tx`,
-under `context.WithoutCancel`. `patchstatus.go` adds `GET
+under `context.WithoutCancel`, and once that has committed `ForgetRerere`
+again for each id, so a rebuild that learned the resolution in between
+leaves neither the resolution nor, since it records its entry after it,
+an entry without one (`Deps.BeforeRerereForgetRecord` is the test hook
+before the transaction). `patchstatus.go` adds `GET
 /workspaces/:slug/patch-status`, a read route with the scope
 `workspaces:read`: the record from `Guard`, `IntegrationBranch` and its
 head through `ResolveBranch` in the copy, the two newest rebuilds through
@@ -5674,10 +5679,14 @@ the queue's `Recover` and before the job workers start. `purge.go`'s
 one `Store.Tx`: a `DELETE` conditional on the patch being still deleted
 and still due, then, when a row went and no patch that is not deleted uses
 the branch, `DeleteRef` of `refs/parley/replaced/<branch>` through
-`RunGit` (a missing copy or ref is no failure); a failure rolls back, is
-logged with `workspace` and `patch_id`, and makes the pass return an error
-once every due patch was tried. `Deps.BeforePurgePatch` is its test hook
-between the selection and each removal. `composeCarryPatch` registers it
+`RunGit` (a missing copy or ref is no failure), its value read first; a
+failure rolls back, sets a deleted ref back to that value
+(`CompareAndSwapRef` from missing), is logged with `workspace` and
+`patch_id`, and makes the pass return an error once every due patch was
+tried. Its git calls run under `purgeRefLimit` (30 s), since every hub
+write waits on that transaction. `Deps.BeforePurgePatch` is its test hook
+between the selection and each removal, `Deps.AfterPurgeRef` one after
+the ref's deletion inside the transaction. `composeCarryPatch` registers it
 as the maintenance task `patch_purge`, with the runtime's clock. An
 attempt's set-up holds each git operation of its upstream fetch to
 `RebuildGitDeadline` as well as to the whole fetch's deadline

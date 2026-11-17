@@ -66,10 +66,15 @@ deadline alone.
 
 ## The argument guard covers the operations carry-patch calls
 
-The guard refuses a value beginning with `-` in `ResolveBranch`,
-`IsAncestor`, `LookupRef`, `CompareAndSwapRef`, `SetRef`, `DeleteRef` and
+The guard refuses a value beginning with `-` in `IsAncestor`,
+`LookupRef`, `CompareAndSwapRef`, `SetRef`, `DeleteRef` and
 `FetchOriginBranch`, and passes the values git reads after
-`--end-of-options`. `MergeBase`, `CommitsBetween`, `Cherry` and `Subjects`
+`--end-of-options`. `ResolveBranch` answers such a branch as not found,
+with no error and no git started, rather than `ErrInvalidArgument`: it
+hands git the branch only as `refs/heads/<branch>`, and its callers across
+the hub (changes, landing, workspaces) answer every error with `500`, so
+opening a change from a branch `-x` would have answered `500` instead of
+`400 source_not_found`. `MergeBase`, `CommitsBetween`, `Cherry` and `Subjects`
 only receive ids read from git and are unchanged. A full ref name is
 refused only when it begins with `-` itself: `refs/heads/-x` is passed
 whole, since git cannot read it as an option and landing, changes and the
