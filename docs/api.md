@@ -777,7 +777,11 @@ A push that passed every check gets its ref advertisement from
     limited to paths), the default branch (`<branch> is the default branch
     and cannot be deleted`), a fork's tracking branches (`<branch> tracks
     the parent workspace and is read-only in this fork; push a new
-    branch`), the carry-patch controls and the paths of a path-scoped PAT
+    branch`), the carry-patch controls of a `carry_patch` workspace's
+    integration branch and patch branches (see [Pushes to the integration
+    branch and patch branches](#pushes-to-the-integration-branch-and-patch-branches),
+    which also forward an update to origin before it is written) and the
+    paths of a path-scoped PAT
     (`path <path> is outside this token's allowed paths`: every path a new
     commit changes; for an update that adds no commit of its own and moves
     a branch that is the source of a draft or open change, or opens a
@@ -2771,6 +2775,97 @@ next use. A secret that cannot be read fails the fetch without contacting
 the upstream; there is no anonymous attempt. One upstream fetch, the listing
 of the upstream's branches included, may take 10 minutes in all; past that
 its git process is stopped and the fetch has failed.
+
+### Pushes to the integration branch and patch branches
+
+Two kinds of branch of a `carry_patch` workspace are not ordinary
+branches: the integration branch, `refs/heads/<integration_branch>`
+(`deploy` while the record holds none), which only the hub writes, and the
+**patch branches**, `refs/heads/<branch_name>` of every patch that is not
+`deleted`. Every client write of a ref decides them by one set of rules,
+whether it arrives as a [git push](#git-over-http), through the source
+control API or as a [land](#landing): the fourth push rule, after the
+hub-owned refs (`refs/parley/`, the backups of replaced patch tips
+included), the protected branches, the default branch and a fork's
+tracking branches. A task fork is a `standard` workspace and is never
+asked. The settings `patch_branch_source` and `push_patches_to_origin`
+are read at every decision, so a change counts at the next push.
+
+| Ref | `patch_branch_source` | `push_patches_to_origin` | Update | Answer |
+|---|---|---|---|---|
+| the integration branch | any | any | create, update, delete, by any caller, the admin token included | refused, `integration_branch`: `integration branch <name> is maintained by the hub; push a patch branch and rebuild instead` |
+| a patch branch | `hub` | any | create, update, forced update, delete | allowed; a deleted branch's patch stays registered |
+| a patch branch | `origin` | `false` | create, update, delete | refused, `patch_branch`: `branch is synced from origin; push to <git_url> instead` |
+| a patch branch | `origin` | `true` | delete | refused, `patch_branch`: `branch is synced from origin; delete it on origin instead` |
+| a patch branch | `origin` | `true` | create, update | allowed once forwarded to origin (below) |
+| any other ref: a tag or note named like the integration branch, a deleted patch's branch, any other branch | any | any | any | allowed |
+
+`<git_url>` is the workspace's origin URL without user information; a
+`git@host:path` origin is shown as stored. A patch branch listed in
+`protected_branches` is refused by the protected-branch rule first; the
+owner's direct fast-forward passes that rule and then meets this table.
+Over git a refusal fails the whole push; over the source control API it is
+`403` with the error type. When the workspace record, its settings or the
+patch list cannot be read the update is refused with `internal error; try
+again` (`500` `internal` through the API), never allowed.
+
+**Forwarding.** Deciding never contacts origin. Once every ref of a
+request has passed every rule, each update to forward is pushed, in
+command order, to `refs/heads/<branch>` on origin as a push without force,
+with the workspace's origin credential read at that moment, within
+120 seconds. Origin takes it: the hub's branch moves and, once the
+request is accepted, `refs/remotes/origin/<branch>` of the hub's copy
+records the commit. Otherwise the update is refused, `patch_branch`, with
+`origin rejected push: <reason>`: origin's own message for an update its
+rules or hooks refused, `non-fast-forward`, `authentication failed`,
+`permission denied`, `repository not found`, `origin unreachable`,
+`timed out` or `push failed`, scrubbed of credentials and URL user
+information and cut to 1024 bytes; or with `failed to resolve origin
+credentials` when the credential cannot be read, in which case origin is
+not contacted. A refused update fails the whole push; a branch of the same
+push already forwarded stays on origin and returns through the next sync.
+
+**Landing.** A land onto a patch branch is judged by the same table before
+the target moves (see [Landing](#landing)): a refusal ends the attempt
+`blocked` with the refusal as the reason of `parley.change.land_fail`; with
+forwarding, the landed head is forwarded first, and a forward that fails
+ends the attempt `failed` with `error` `origin_rejected`; a decision that
+cannot be made ends it `failed` with `error` `internal`. In each case the
+target does not move.
+
+**After an accepted write.** After every accepted git push, source
+control API write or land that created or moved a patch branch (a delete
+counts for nothing, nor does the branch of a deleted patch), the hub,
+once the client has its answer and one request of a workspace at a time:
+
+1. queues one rebuild for the request when `auto_rebuild_after_push` is
+   `true` (its default), with `submitted_by` `system:push` (a push or an
+   API write) or `system:land`, actor `system` and the request's session;
+   a rebuild already queued, running or waiting to retry is left as it is,
+   silently;
+2. mirrors, when `patch_branch_source` is `hub` and
+   `push_patches_to_origin` is `true`, whatever `auto_rebuild_after_push`
+   says, each patch branch the request created or moved, in the order of
+   the updates: the head the branch has when the mirror starts is pushed
+   to origin with force-with-lease against `refs/remotes/origin/<branch>`
+   (or against origin having no such branch), within 120 seconds, and on
+   success recorded there. A branch that fails emits
+   `parley.patch.mirror_failed` and the mirror goes on with the next.
+
+Neither step changes the answer the client already has. The hub's stop
+ends them; a mirror cut off by it emits nothing. Forwarding, the mirror and
+a rebuild's push of the integration branch are the only ways these
+branches reach origin.
+
+`parley.patch.mirror_failed` has `resource_type` `patch`, the patch's id as
+`resource_id`, actor `system` and `metadata` `branch_name` and `error`: the
+reason alone, without `origin rejected push: `, one of the forward's
+reasons, `origin moved` for a stale lease, `timed out` or `failed to
+resolve origin credentials`.
+
+```json
+{"seq":52,"id":"…","type":"parley.patch.mirror_failed","time":"2026-11-17T10:30:00Z","workspace":"variant","actor_type":"system","actor_id":null,"resource_type":"patch","resource_id":"5c0e0000-0000-4000-8000-000000000001","action":"mirror_failed","session_id":null,"metadata":{"branch_name":"patch/tls","error":"origin moved"}}
+```
 
 ### The patch object
 
@@ -5592,8 +5687,11 @@ target asks it nothing again. A guard that refuses ends the attempt
 `parley.change.land_fail`; a guard that reports a rejection by origin ends
 it `failed` with `error` `origin_rejected`; a guard that cannot decide ends
 it `failed` with `error` `internal`. In each case the target does not move
-and the change stays `open`. No target guard is installed yet, so every
-move is allowed.
+and the change stays `open`. The hub installs one, carry-patch push
+control, which judges a land onto a patch branch of a `carry_patch`
+workspace (see [Pushes to the integration branch and patch
+branches](#pushes-to-the-integration-branch-and-patch-branches)); every
+other move is allowed.
 
 Once a land is recorded, a land that moved nothing included, the hub does
 its follow-up, each step on its own: a step that fails is logged and
@@ -5619,9 +5717,15 @@ worker of the pool: a follow-up that takes long delays no other land.
   landed (see [Stacks and restack](#stacks-and-restack)), and a task fork
   that is the source of a landed change records an activity, from which
   its early expiry counts.
+- On a `carry_patch` workspace, a land that moved a patch branch queues a
+  rebuild with `submitted_by` `system:land` and mirrors the branch to
+  origin, as the settings say (see [Pushes to the integration branch and
+  patch branches](#pushes-to-the-integration-branch-and-patch-branches)).
+  This step runs on its own: the answer to the call does not wait for it.
 
-A land changes only the hub's own repositories and contacts neither origin
-nor a forge: publishing a landed branch is a push to origin of its own.
+A land changes only the hub's own repositories and contacts no forge, and
+origin only where carry-patch push control forwards or mirrors a patch
+branch: publishing any other landed branch is a push to origin of its own.
 
 Attempts run side by side, with no queue and no lock per workspace or
 branch: two attempts meet only in the compare-and-swap. At most
