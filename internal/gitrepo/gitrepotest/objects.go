@@ -18,19 +18,9 @@ import (
 // writeCommit writes the commit Commit makes as loose objects of the
 // repository whose git directory is dir, as git fast-import would write it
 // at the time when, and returns its id. ok is false, with nothing a caller
-// could reach written, for what it leaves to git fast-import: a repository
-// whose objects are not git's SHA-1 ones, a parent that is not a full id of
-// a loose commit, a file name that is not a plain top-level name, and
-// anything it cannot read or write.
+// could reach written, for what it leaves to git fast-import: a parent that
+// is not a full id of a loose commit, and what writeCommitOf leaves.
 func writeCommit(dir, msg string, files map[string]string, parents []string, when time.Time) (id string, ok bool) {
-	if !sha1Repository(dir) {
-		return "", false
-	}
-	for name := range files {
-		if name == "" || name == "." || name == ".." || name[0] == '"' || strings.ContainsAny(name, "/\x00\n") {
-			return "", false
-		}
-	}
 	entries := map[string]treeEntry{}
 	for i, p := range parents {
 		tree, ok := commitTree(dir, p)
@@ -44,19 +34,42 @@ func writeCommit(dir, msg string, files map[string]string, parents []string, whe
 			return "", false
 		}
 	}
+	return writeCommitOf(dir, msg, entries, files, parents, when)
+}
+
+// writeCommitOf writes, as loose objects of the repository whose git
+// directory is dir, the commit by Origin at the time when with the message
+// msg and the parents given, whose tree is entries with the files, at the
+// top level, holding the content given, and returns its id. It does not
+// check the parents. ok is false, with nothing a caller could reach
+// written, for a repository whose objects are not git's SHA-1 ones, a file
+// name that is not a plain top-level name, and anything it cannot write.
+func writeCommitOf(dir, msg string, entries map[string]treeEntry, files map[string]string, parents []string, when time.Time) (id string, ok bool) {
+	if !sha1Repository(dir) {
+		return "", false
+	}
+	for name := range files {
+		if name == "" || name == "." || name == ".." || name[0] == '"' || strings.ContainsAny(name, "/\x00\n") {
+			return "", false
+		}
+	}
+	tree := maps.Clone(entries)
+	if tree == nil {
+		tree = map[string]treeEntry{}
+	}
 	for _, name := range slices.Sorted(maps.Keys(files)) {
 		blob, ok := writeObject(dir, "blob", []byte(files[name]))
 		if !ok {
 			return "", false
 		}
-		entries[name] = treeEntry{mode: "100644", id: blob}
+		tree[name] = treeEntry{mode: "100644", id: blob}
 	}
-	tree, ok := writeObject(dir, "tree", treeContent(entries))
+	treeID, ok := writeObject(dir, "tree", treeContent(tree))
 	if !ok {
 		return "", false
 	}
 	var c bytes.Buffer
-	fmt.Fprintf(&c, "tree %s\n", tree)
+	fmt.Fprintf(&c, "tree %s\n", treeID)
 	for _, p := range parents {
 		fmt.Fprintf(&c, "parent %s\n", strings.ToLower(p))
 	}
