@@ -72,6 +72,27 @@ var routes = []route{
 	{secret.ScopeWorkspace, http.MethodDelete, "/workspaces/%s/secrets/route_key", nil, "secrets:write", http.StatusNoContent},
 }
 
+// varRoutes are every variable route that an access check guards, in the
+// order of routes: a scope's POST creates ROUTE_KEY, its PATCH changes it
+// and its DELETE removes it. The access tests iterate them, so a route added
+// here is held to the access rules of its scope. PATCH and DELETE on the
+// resolved path answer 405 before any check and are not here.
+var varRoutes = []route{
+	{secret.ScopeUser, http.MethodGet, "/user/vars", nil, "vars:read", http.StatusOK},
+	{secret.ScopeOrg, http.MethodGet, "/orgs/%s/vars", nil, "vars:read", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodGet, "/workspaces/%s/vars", nil, "vars:read", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodGet, "/workspaces/%s/vars/resolved", nil, "vars:read", http.StatusOK},
+	{secret.ScopeUser, http.MethodPost, "/user/vars", created, "vars:write", http.StatusCreated},
+	{secret.ScopeOrg, http.MethodPost, "/orgs/%s/vars", created, "vars:write", http.StatusCreated},
+	{secret.ScopeWorkspace, http.MethodPost, "/workspaces/%s/vars", created, "vars:write", http.StatusCreated},
+	{secret.ScopeUser, http.MethodPatch, "/user/vars/ROUTE_KEY", changed, "vars:write", http.StatusOK},
+	{secret.ScopeOrg, http.MethodPatch, "/orgs/%s/vars/ROUTE_KEY", changed, "vars:write", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodPatch, "/workspaces/%s/vars/ROUTE_KEY", changed, "vars:write", http.StatusOK},
+	{secret.ScopeUser, http.MethodDelete, "/user/vars/route_key", nil, "vars:write", http.StatusNoContent},
+	{secret.ScopeOrg, http.MethodDelete, "/orgs/%s/vars/route_key", nil, "vars:write", http.StatusNoContent},
+	{secret.ScopeWorkspace, http.MethodDelete, "/workspaces/%s/vars/route_key", nil, "vars:write", http.StatusNoContent},
+}
+
 // changed is an update body.
 var changed = map[string]any{"value": "changed"}
 
@@ -473,6 +494,30 @@ func (w *world) storedVars(t *testing.T, scope secret.Scope, id string) []string
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+	}
+	return out
+}
+
+// allVars are every variable the store holds, as scope/scope id/key=value,
+// in that order.
+func (w *world) allVars(t *testing.T) []string {
+	t.Helper()
+	rows, err := w.Store.Main().QueryContext(context.Background(),
+		`SELECT scope, scope_id, key, value FROM variables ORDER BY scope, scope_id, key_lower`)
+	if err != nil {
+		t.Fatalf("read the variables: %v", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var scope, id, k, v string
+		if err := rows.Scan(&scope, &id, &k, &v); err != nil {
+			t.Fatalf("read the variables: %v", err)
+		}
+		out = append(out, scope+"/"+id+"/"+k+"="+v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the variables: %v", err)
 	}
 	return out
 }
