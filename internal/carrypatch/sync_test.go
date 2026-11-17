@@ -1,16 +1,19 @@
 package carrypatch_test
 
 import (
+	"context"
 	"errors"
 	"maps"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -372,4 +375,191 @@ func TestSync_DeletedPatchBranchIsOrdinary(t *testing.T) {
 	if got := refIn(f.copy, "refs/heads/patch/gone"); got != theirs {
 		t.Errorf("patch/gone = %s, want origin's %s", got, theirs)
 	}
+}
+
+// A sync queues a rebuild, in the workspace's strategy and fail mode and
+// submitted by the caller, when auto_rebuild_after_sync is on and upstream
+// advanced, the refresh moved the branch of an active or conflict patch,
+// or a patch was found merged; in every other case it queues none.
+func TestSync_RebuildTrigger(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, map[string]any{"rebuild_strategy": "merge", "rebuild_fail_mode": "continue",
+		"patch_branch_source": "origin", "patch_divergence_policy": "replace"})
+	f.addPatch(t, "patch/a")
+	f.addPatch(t, "patch/c", withStatus(carrypatch.StatusConflict, "c.txt"))
+	f.addPatch(t, "patch/d", withStatus(carrypatch.StatusDisabled))
+	f.mustSync(t)
+	// originAhead gives origin's branch a commit on the hub's tip, which
+	// the refresh then fast-forwards the hub's branch to.
+	originAhead := func(t *testing.T, branch string) {
+		tip := refIn(f.copy, "refs/heads/"+branch)
+		file := strings.ReplaceAll(branch, "/", "-") + "-origin.txt"
+		f.originBranch(t, branch, f.commitOn(t, tip, branch+" on origin", map[string]string{file: "origin\n"}))
+	}
+
+	// The rows are consecutive syncs of one workspace, each from a
+	// workspace with no rebuild job.
+	for _, tc := range []struct {
+		name    string
+		auto    bool
+		arrange func(t *testing.T)
+		// moved is the patch branch the refresh fast-forwards, merged the
+		// patch the sync finds merged, "" for none.
+		moved, merged string
+		triggered     bool
+	}{
+		{"upstream advanced", true, func(t *testing.T) {
+			f.moveUpstream(t, "U2", map[string]string{"u2.txt": "2\n"})
+		}, "", "", true},
+		{"origin moved the branch of an active patch", true, func(t *testing.T) {
+			originAhead(t, "patch/a")
+		}, "patch/a", "", true},
+		{"origin moved the branch of a conflict patch", true, func(t *testing.T) {
+			originAhead(t, "patch/c")
+		}, "patch/c", "", true},
+		{"origin moved only the branch of a disabled patch", true, func(t *testing.T) {
+			originAhead(t, "patch/d")
+		}, "patch/d", "", false},
+		{"nothing changed", true, func(*testing.T) {}, "", "", false},
+		{"upstream advanced with auto_rebuild_after_sync off", false, func(t *testing.T) {
+			f.moveUpstream(t, "U3", map[string]string{"u3.txt": "3\n"})
+		}, "", "", false},
+		{"upstream advanced and a patch merged with auto_rebuild_after_sync off", false, func(t *testing.T) {
+			m := f.addPatchOn(t, "patch/m", f.upstream.Head("main"))
+			f.upstreamTo(t, refIn(f.copy, "refs/heads/"+m.BranchName))
+		}, "", "patch/m", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f.dropRebuilds(t)
+			f.setSettings(t, map[string]any{"auto_rebuild_after_sync": tc.auto})
+			tc.arrange(t)
+			r := f.mustSync(t)
+			if tc.moved != "" {
+				if got := r.syncedOf(t, tc.moved).Action; got != "fast_forwarded" {
+					t.Fatalf("%s's refresh action = %s, want fast_forwarded", tc.moved, got)
+				}
+			}
+			if tc.merged != "" {
+				wantMerged(t, r, tc.merged)
+			}
+			if !tc.triggered {
+				wantNoRebuild(t, r)
+				if js := f.rebuildJobs(t); len(js) != 0 {
+					t.Errorf("rebuild jobs = %v, want none", js)
+				}
+				return
+			}
+			job := f.wantRebuildQueued(t, r)
+			if job["submitted_by"] != f.owner || job["strategy"] != "merge" || job["fail_mode"] != "continue" {
+				t.Errorf("the rebuild is submitted by %v with %v and %v, want %s with merge and continue",
+					job["submitted_by"], job["strategy"], job["fail_mode"], f.owner)
+			}
+		})
+	}
+}
+
+// A sync that would queue a rebuild while the workspace has one queued,
+// running or failed queues none and still completes.
+func TestSync_RebuildSkippedOnDuplicate(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	id, _ := f.wantRebuildQueued(t, f.mustSync(t))["id"].(string)
+
+	// The rows are consecutive syncs of one workspace, each after upstream
+	// advanced, with the first sync's rebuild in the row's status.
+	for _, status := range []string{"queued", "running", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			if _, err := f.Store.Main().Exec(`UPDATE jobs SET status = ? WHERE id = ?`, status, id); err != nil {
+				t.Fatal(err)
+			}
+			f.moveUpstream(t, status, map[string]string{status + ".txt": status + "\n"})
+			f.advance(time.Minute)
+			now := f.clock()
+			r := f.mustSync(t)
+			wantNoRebuild(t, r)
+			if js := f.rebuildJobs(t); len(js) != 1 || js[0].ID != id || js[0].Status != status {
+				t.Errorf("rebuild jobs = %v, want the %s job %s alone", js, status, id)
+			}
+			if got := r.body["upstream_head_sha"]; got != f.upstream.Head("main") {
+				t.Errorf("upstream_head_sha = %v, want upstream's main %s", got, f.upstream.Head("main"))
+			}
+			if got := r.body["last_sync_at"]; got != timefmt.Format(now) {
+				t.Errorf("last_sync_at = %v, want %s", got, timefmt.Format(now))
+			}
+		})
+	}
+}
+
+// A sync queues its rebuild also when no patch is active or conflict,
+// which the rebuild route would refuse.
+func TestSync_RebuildQueuedWithoutActivePatches(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	// The rows are consecutive syncs of one workspace, each after upstream
+	// advanced.
+	for _, tc := range []struct {
+		name    string
+		arrange func(t *testing.T)
+	}{
+		{"no patch at all", func(*testing.T) {}},
+		{"the only patch is disabled", func(t *testing.T) {
+			f.addPatch(t, "patch/d", withStatus(carrypatch.StatusDisabled))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f.dropRebuilds(t)
+			tc.arrange(t)
+			f.moveUpstream(t, tc.name, map[string]string{"up.txt": tc.name + "\n"})
+			f.wantRebuildQueued(t, f.mustSync(t))
+		})
+	}
+}
+
+// failingRebuilds is a rebuild enqueuer that, once armed, fails its next
+// call with a store error, and passes every other call on.
+type failingRebuilds struct {
+	carrypatch.RebuildEnqueuer
+	armed atomic.Bool
+}
+
+func (r *failingRebuilds) EnqueueRebuild(ctx context.Context, slug string, opts carrypatch.RebuildOptions) (carrypatch.RebuildResult, error) {
+	if r.armed.CompareAndSwap(true, false) {
+		return carrypatch.RebuildResult{}, errors.New("queue a rebuild: database disk image is malformed")
+	}
+	return r.RebuildEnqueuer.EnqueueRebuild(ctx, slug, opts)
+}
+
+// A sync whose rebuild cannot be queued answers 500 and records no
+// completion, so that the next sync sees the same upstream movement and
+// queues the rebuild.
+func TestSync_EnqueueFailure(t *testing.T) {
+	t.Parallel()
+	rebuilds := &failingRebuilds{}
+	f := startSyncFixtureWith(t, syncOptions{compose: func(c *hub.Composition) {
+		rebuilds.RebuildEnqueuer = c.CarryPatch()
+		c.CarryPatch().RegisterRebuildEnqueuer(rebuilds)
+	}})
+	f.mustSync(t)
+	f.dropRebuilds(t)
+	f.moveUpstream(t, "U2", map[string]string{"u2.txt": "2\n"})
+	f.advance(time.Minute)
+	rebuilds.armed.Store(true)
+
+	w0 := f.record(t)
+	r1 := f.sync(t, "")
+	if r1.status != http.StatusInternalServerError || r1.Error.ErrorType != "internal" {
+		t.Fatalf("sync = %d %s, want 500 internal", r1.status, r1.raw)
+	}
+	w1 := f.record(t)
+	if str(w1.UpstreamHeadSHA) != str(w0.UpstreamHeadSHA) || !equalTime(w1.LastSyncAt, w0.LastSyncAt) {
+		t.Errorf("upstream_head_sha, last_sync_at = %s, %v, want %s, %v unchanged",
+			str(w1.UpstreamHeadSHA), w1.LastSyncAt, str(w0.UpstreamHeadSHA), w0.LastSyncAt)
+	}
+
+	r2 := f.mustSync(t)
+	if r2.body["upstream_advanced"] != true {
+		t.Errorf("the next sync's upstream_advanced = %v, want true", r2.body["upstream_advanced"])
+	}
+	f.wantRebuildQueued(t, r2)
 }

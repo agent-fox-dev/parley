@@ -1668,3 +1668,42 @@ func (o *moveRecorder) movesUnder(prefix string) []workspace.BranchMove {
 	}
 	return moves
 }
+
+// dropRebuilds removes the rebuild jobs of the workspace, as if none had
+// been queued, so that the next sync's rebuild is not a duplicate.
+func (f *syncFixture) dropRebuilds(t *testing.T) {
+	t.Helper()
+	if _, err := f.Store.Main().Exec(`DELETE FROM jobs WHERE type = ? AND workspace_slug = ?`, carrypatch.RebuildJobType, f.slug); err != nil {
+		t.Fatalf("remove the rebuild jobs of %s: %v", f.slug, err)
+	}
+}
+
+// wantRebuildQueued fails the test unless the answer reports a rebuild
+// queued by the sync, whose job is still queued, and returns the job's
+// record as the rebuild route answers it.
+func (f *syncFixture) wantRebuildQueued(t *testing.T, a syncAnswer) map[string]any {
+	t.Helper()
+	id, _ := a.body["rebuild_job_id"].(string)
+	if a.body["rebuild_triggered"] != true || id == "" {
+		t.Fatalf("rebuild_triggered, rebuild_job_id = %v, %v, want true and a job", a.body["rebuild_triggered"], a.body["rebuild_job_id"])
+	}
+	status, raw := f.Call(t, http.MethodGet, "/api/v1/workspaces/"+f.slug+"/rebuilds/"+id, f.key, nil)
+	var record map[string]any
+	if err := json.Unmarshal(raw, &record); status != http.StatusOK || err != nil {
+		t.Fatalf("read the rebuild %s = %d %s, want 200 and a record", id, status, raw)
+	}
+	if record["status"] != "queued" {
+		t.Errorf("the rebuild %s is %v, want queued", id, record["status"])
+	}
+	return record
+}
+
+// wantNoRebuild fails the test unless the answer reports that the sync
+// queued no rebuild: rebuild_triggered false and rebuild_job_id null.
+func wantNoRebuild(t *testing.T, a syncAnswer) {
+	t.Helper()
+	id, present := a.body["rebuild_job_id"]
+	if a.body["rebuild_triggered"] != false || !present || id != nil {
+		t.Errorf("rebuild_triggered, rebuild_job_id = %v, %v (present %v), want false and null", a.body["rebuild_triggered"], id, present)
+	}
+}

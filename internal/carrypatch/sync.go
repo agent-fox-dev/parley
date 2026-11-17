@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -77,7 +78,8 @@ func (c *Component) syncBase(ctx context.Context, w workspace.Workspace) (string
 // workspace, which the workspace service runs after its per-branch pass and
 // before it records the completion: it refreshes the patch branches from
 // origin when origin is their authority, then marks the patches upstream
-// merged, reports what the sync found and did
+// merged, queues the rebuild of the integration branch when the sync
+// changed what it is built from, reports what the sync found and did
 // on the carry-patch side as the answer's carry-patch members, and gives the
 // upstream base as the upstream_head_sha to record when upstream advanced.
 // Its error stops the sync before the completion is recorded, so that the
@@ -96,6 +98,9 @@ func (c *Component) BeforeCompletion(ctx context.Context, run workspace.SyncRun,
 	}
 	if err == nil {
 		err = s.clearOriginFields(ctx)
+	}
+	if err == nil {
+		err = s.triggerRebuild(ctx)
 	}
 	if err != nil {
 		return workspace.SyncAddition{}, fmt.Errorf("the sync of workspace %q stopped: %w", run.Workspace.Slug, err)
@@ -204,6 +209,57 @@ func (s *syncPass) upstreamMovement(ctx context.Context, stored *string) (advanc
 		return false, false, fmt.Errorf("compare the upstream base with the stored upstream head: %w", err)
 	}
 	return true, forced, nil
+}
+
+// triggerRebuild queues the rebuild of the integration branch when the
+// sync changed what it is built from: upstream advanced, the origin refresh
+// created or moved the branch of a patch that was active or conflict, or a
+// patch was found merged, and the workspace's auto_rebuild_after_sync is
+// on. The branch of a disabled patch is not part of a rebuild, so its move
+// alone queues none.
+func (s *syncPass) triggerRebuild(ctx context.Context) error {
+	if !s.report.UpstreamAdvanced && len(s.report.PatchesMerged) == 0 && !s.movedApplicable() {
+		return nil
+	}
+	if !s.c.autoRebuildAfterSync(ctx, s.run.Workspace) {
+		return nil
+	}
+	return s.queueRebuild(ctx)
+}
+
+// movedApplicable reports whether the origin refresh created or moved the
+// branch of a patch that was active or conflict when the refresh listed
+// it.
+func (s *syncPass) movedApplicable() bool {
+	return slices.ContainsFunc(s.moved, func(p Patch) bool {
+		return p.Status == StatusActive || p.Status == StatusConflict
+	})
+}
+
+// queueRebuild queues a rebuild of the workspace through the registered
+// RebuildEnqueuer, in the strategy and fail mode of the workspace's
+// settings, submitted by the caller, a user as its id and the admin token,
+// which has none, as its actor type. A queued job is reported as triggered
+// with its id. A rebuild already queued, running or failed is no failure:
+// the sync queues none and reports none, since that rebuild will build
+// from the inputs as this sync leaves them. Any other failure of the
+// enqueue is the error, so that the sync records no completion and the
+// next sync sees the same changes and queues the rebuild again.
+func (s *syncPass) queueRebuild(ctx context.Context) error {
+	submitter := s.by.typ
+	if s.by.id != nil {
+		submitter = *s.by.id
+	}
+	res, err := s.c.Rebuilds().EnqueueRebuild(ctx, s.run.Workspace.Slug, RebuildOptions{
+		SubmittedBy: submitter, ActorType: s.by.typ, ActorID: s.by.id,
+	})
+	if err != nil {
+		return fmt.Errorf("queue the rebuild of the integration branch: %w", err)
+	}
+	if res.Queued {
+		s.report.RebuildTriggered, s.report.RebuildJobID = true, new(res.JobID)
+	}
+	return nil
 }
 
 // addition is what the pass adds to the completed sync: its report as the
