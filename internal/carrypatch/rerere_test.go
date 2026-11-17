@@ -278,3 +278,41 @@ func TestRerereList(t *testing.T) {
 		}
 	})
 }
+
+func TestRerereList_ShowsTheEntryARebuildRecordsAndThenLearns(t *testing.T) {
+	t.Parallel()
+	const file = "src/net/dial.go"
+	f := startRebuildFixtureFrom(t, map[string]string{file: "1\n2\n3\n"}, "", nil)
+	c := gitrepotest.Commit(t, f.copy, "p1 dials", map[string]string{file: "1\n2\n3 p1\n"}, f.base)
+	f.putPatch(t, "p1", c)
+	up := f.moveUpstream(t, "U2", map[string]string{file: "1\n2\n3 upstream\n"})
+	list := "/workspaces/" + f.slug + "/rerere"
+
+	if out, _ := f.attemptWith(t, carrypatch.RebuildOptions{FailMode: new("fail_fast")}, nil); out.Kind != attemptPermanent || out.Reason != "conflict" {
+		t.Fatalf("the first rebuild = %+v, want permanent with reason conflict", out)
+	}
+	l1 := f.get(t, list)
+	if l1.status != http.StatusOK || len(l1.Items) != 1 || l1.Items[0]["path"] != file || l1.Items[0]["resolved"] != false {
+		t.Fatalf("GET rerere after the conflict = %d %s, want one entry for %s, unresolved", l1.status, l1.raw, file)
+	}
+	first := l1.Items[0]
+
+	// The developer merges the upstream into the patch branch and resolves.
+	m := gitrepotest.Commit(t, f.copy, "Merge upstream", map[string]string{file: "1\n2\n3 resolved\n"}, c, up)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/p1", m)
+	f.advance(time.Minute)
+	if out, id := f.attemptWith(t, carrypatch.RebuildOptions{FailMode: new("fail_fast")}, nil); out.Kind != attemptCompleted {
+		t.Fatalf("the second rebuild = %+v (%v), want completed", out, f.patchResults(t, id))
+	}
+	l2 := f.get(t, list)
+	i := slices.IndexFunc(l2.Items, func(it map[string]any) bool { return it["id"] == first["id"] })
+	if l2.status != http.StatusOK || i < 0 {
+		t.Fatalf("GET rerere after the learning = %d %s, want the entry %v", l2.status, l2.raw, first["id"])
+	}
+	e := l2.Items[i]
+	before, _ := time.Parse(time.RFC3339, fmt.Sprint(first["recorded_at"]))
+	after, err := time.Parse(time.RFC3339, fmt.Sprint(e["recorded_at"]))
+	if e["path"] != file || e["resolved"] != true || err != nil || after.Before(before) {
+		t.Errorf("the entry after the learning = %v, want %v resolved, at %s or later", e, first["id"], first["recorded_at"])
+	}
+}
