@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -583,4 +584,83 @@ func keys(m map[string][]byte) []string {
 	}
 	slices.Sort(ks)
 	return ks
+}
+
+func TestStore_CloseLeavesNoWriteAheadLog(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, db := range []struct {
+		name string
+		file string
+		of   func(*store.Store) *sql.DB
+	}{
+		{"transactional store", "parley.db", (*store.Store).Main},
+		{"analytical store", "analytics.db", (*store.Store).Analytics},
+	} {
+		for _, tc := range []struct {
+			name string
+			// before brings db, whose file is path, into the situation and
+			// returns what ends it once Close has begun, or nil.
+			before func(t *testing.T, db *sql.DB, path string) func()
+		}{
+			{"a connection in use when Close begins", func(t *testing.T, db *sql.DB, _ string) func() {
+				// An open result holds its connection in use, as a
+				// transaction whose context ended does until database/sql's
+				// own goroutine has rolled it back, which can be after its
+				// caller returned.
+				rows, err := db.QueryContext(ctx, `SELECT 1`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return func() { rows.Close() }
+			}},
+			{"a log the closed connections left behind", func(t *testing.T, db *sql.DB, path string) func() {
+				// The store's connections close while a read-only one is
+				// open, so none of them is the last; the read-only one,
+				// which cannot write, closes last.
+				ro := rawDB(t, path)
+				if err := ro.PingContext(ctx); err != nil {
+					t.Fatal(err)
+				}
+				db.SetMaxIdleConns(0)
+				if err := db.PingContext(ctx); err != nil {
+					t.Fatal(err)
+				}
+				ro.Close()
+				if _, err := os.Lstat(path + "-wal"); err != nil {
+					t.Fatalf("the log is not left behind: %v", err)
+				}
+				return nil
+			}},
+		} {
+			t.Run(db.name+", "+tc.name, func(t *testing.T) {
+				t.Parallel()
+				dir := t.TempDir()
+				st := mustOpen(t, options(dir), nil)
+				path := filepath.Join(dir, "data", db.file)
+				end := tc.before(t, db.of(st), path)
+				left := make(chan []string, 1)
+				go func() {
+					if err := st.Close(); err != nil {
+						t.Errorf("Close: %v", err)
+					}
+					var files []string
+					for _, suffix := range []string{"-wal", "-shm"} {
+						if _, err := os.Lstat(path + suffix); err == nil {
+							files = append(files, db.file+suffix)
+						}
+					}
+					left <- files
+				}()
+				if end != nil {
+					time.Sleep(50 * time.Millisecond)
+					end()
+				}
+
+				if got := <-left; len(got) != 0 {
+					t.Errorf("Close returned with %v in the data directory, want none", got)
+				}
+			})
+		}
+	}
 }
