@@ -264,8 +264,48 @@ func (s *Scratch) Remove(ctx context.Context) error {
 	if err := os.RemoveAll(s.dir); err != nil {
 		return fmt.Errorf("remove the scratch working tree %s: %w", s.dir, err)
 	}
-	// git drops the entry of every working tree whose directory is gone.
-	_, err := s.r.g.run(ctx, access{}, append(slices.Clone(scratchConfig), "--git-dir="+s.r.dir, "worktree", "prune")...)
+	return s.r.pruneWorktrees(ctx)
+}
+
+// Reset returns the scratch working tree to the commit of the full id
+// commit, which undoes a replay or a merge that did not apply: the replay
+// or merge in progress is given up, and HEAD, the index and the files are
+// commit's, with no file git does not track left in the tree.
+func (s *Scratch) Reset(ctx context.Context, commit string) error {
+	if !isHexID(commit, idLen) {
+		return fmt.Errorf("reset the scratch working tree to %q: %w", commit, ErrNotFound)
+	}
+	// A hard reset also forgets the merge or the replay in progress.
+	if _, err := s.git(ctx, "reset", "--hard", "--quiet", "--no-recurse-submodules", strings.ToLower(commit)); err != nil {
+		return err
+	}
+	_, err := s.git(ctx, "clean", "-f", "-f", "-d", "-x", "--quiet")
+	return err
+}
+
+// DiscardScratches removes every entry under the repository's
+// parley-rebuild directory, the scratch working trees that work which ended
+// without its cleanup left there among them, and then the repository's
+// record of every working tree whose directory is gone. It is for when no
+// scratch working tree of the repository is in use.
+func (r *Repo) DiscardScratches(ctx context.Context) error {
+	parent := filepath.Join(r.dir, ScratchParent)
+	entries, err := os.ReadDir(parent)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("discard the scratch working trees: %w", err)
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(parent, e.Name())); err != nil {
+			return fmt.Errorf("discard the scratch working trees: %w", err)
+		}
+	}
+	return r.pruneWorktrees(ctx)
+}
+
+// pruneWorktrees drops the repository's entry of every working tree whose
+// directory is gone.
+func (r *Repo) pruneWorktrees(ctx context.Context) error {
+	_, err := r.g.run(ctx, access{}, append(slices.Clone(scratchConfig), "--git-dir="+r.dir, "worktree", "prune")...)
 	return err
 }
 

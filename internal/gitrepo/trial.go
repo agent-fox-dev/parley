@@ -311,3 +311,98 @@ func conflictKind(types []string, sides [4]*ConflictSide) string {
 	}
 	return ConflictContent
 }
+
+// ConflictFiles describes the files of paths, the paths left in conflict
+// when the commit of the full id commit was applied onto the commit
+// target, for a conflict report: one entry per path, in byte order of
+// path. The entries are those of the three-way merge that replays commit
+// onto target, whose base is commit's first parent (the empty tree for a
+// root commit), ours the file in target and theirs the file in commit. A
+// path that merge reports no conflict for, such as one that conflicted only
+// because of other commits merged with commit, gets an entry whose sides
+// are read from those three commits.
+func (r *Repo) ConflictFiles(ctx context.Context, target, commit string, paths []string) ([]ConflictFile, error) {
+	target, commit, err := rangeEnds(target, commit)
+	if err != nil {
+		return nil, err
+	}
+	want := slices.Clone(paths)
+	slices.Sort(want)
+	want = slices.Compact(want)
+	if len(want) == 0 {
+		return []ConflictFile{}, nil
+	}
+	commits, err := r.ReadCommits(ctx, []string{commit})
+	if err != nil {
+		return nil, err
+	}
+	var base string
+	if parents := commits[0].Parents; len(parents) > 0 {
+		base = parents[0]
+	} else {
+		tree, err := r.emptyTree(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if base, err = r.trialCommit(ctx, tree); err != nil {
+			return nil, err
+		}
+	}
+	_, merged, err := r.mergeTree(ctx, base, target, commit)
+	if err != nil {
+		return nil, err
+	}
+	reported := map[string]ConflictFile{}
+	for _, f := range merged {
+		if _, ok := reported[f.Path]; !ok {
+			reported[f.Path] = f
+		}
+	}
+	var missing []string
+	for _, p := range want {
+		if _, ok := reported[p]; !ok {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) > 0 {
+		var sides [3]map[string]*ConflictSide
+		for i, rev := range []string{base, target, commit} {
+			if sides[i], err = r.sidesOf(ctx, rev, missing); err != nil {
+				return nil, err
+			}
+		}
+		for _, p := range missing {
+			f := ConflictFile{Path: p, Base: sides[0][p], Ours: sides[1][p], Theirs: sides[2][p]}
+			f.Kind = conflictKind(nil, [4]*ConflictSide{nil, f.Base, f.Ours, f.Theirs})
+			reported[p] = f
+		}
+	}
+	files := make([]ConflictFile, 0, len(want))
+	for _, p := range want {
+		files = append(files, reported[p])
+	}
+	return files, nil
+}
+
+// sidesOf are the files of paths in the commit rev, each as a side of a
+// conflict, by path; a path rev holds no file at is absent.
+func (r *Repo) sidesOf(ctx context.Context, rev string, paths []string) (map[string]*ConflictSide, error) {
+	out, err := r.git(ctx, append([]string{"--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree", rev, "--"}, paths...)...)
+	if err != nil {
+		return nil, err
+	}
+	wanted := map[string]bool{}
+	for _, p := range paths {
+		wanted[p] = true
+	}
+	sides := map[string]*ConflictSide{}
+	for entry := range strings.SplitSeq(string(out), "\x00") {
+		info, path, ok := strings.Cut(entry, "\t")
+		f := strings.Fields(info)
+		if !ok || len(f) != 3 || !wanted[path] {
+			continue
+		}
+		sides[path] = &ConflictSide{SHA: f[2], Mode: f[0], Path: path}
+	}
+	return sides, nil
+}

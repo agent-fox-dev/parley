@@ -237,6 +237,19 @@ func (f *rebuildFixture) moveUpstream(t *testing.T, msg string, files map[string
 	return f.upstream.Branch("main", commitFiles(t, f.upstream.Dir(), f.upstream.Head("main"), msg, files))
 }
 
+// stored is the stored patch id of the workspace.
+func (f *rebuildFixture) stored(t *testing.T, id string) carrypatch.Patch {
+	t.Helper()
+	return (&patchHub{addHub: f.addHub}).stored(t, f.slug, id)
+}
+
+// patchEvents are the stored events of the workspace of type typ, every
+// parley.patch.* event when typ is "", oldest first.
+func (f *rebuildFixture) patchEvents(t *testing.T, typ string) []patchEvent {
+	t.Helper()
+	return (&patchHub{addHub: f.addHub}).patchEvents(t, f.slug, typ)
+}
+
 // patchList is every stored patch of the workspace: those that are not
 // deleted in position order, then the deleted ones.
 func (f *rebuildFixture) patchList(t *testing.T) []carrypatch.Patch {
@@ -453,6 +466,18 @@ type attemptRunner struct {
 	comp *carrypatch.Component
 	mu   sync.Mutex
 	runs map[string]*attemptRun
+	// cancel cancels the context of the attempt that runs, as a stop of the
+	// hub would.
+	cancel context.CancelFunc
+}
+
+// cancelAttempt cancels the context of the attempt that runs.
+func (r *attemptRunner) cancelAttempt() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cancel != nil {
+		r.cancel()
+	}
 }
 
 // attemptRun is the attempt of a job a test expects.
@@ -488,6 +513,11 @@ func (r *attemptRunner) Run(ctx context.Context, j jobs.Job) error {
 	if run == nil {
 		return nil
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r.mu.Lock()
+	r.cancel = cancel
+	r.mu.Unlock()
 	if run.before != nil {
 		run.before(ctx, j)
 	}

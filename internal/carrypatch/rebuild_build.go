@@ -22,12 +22,12 @@ type runPatch struct {
 func (r *rebuildRun) listPatches(ctx context.Context) *attemptOutcome {
 	repo, err := r.c.d.Git.Open(ctx, r.c.d.RepoPath(r.ws.Slug))
 	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: %w", r.ws.Slug, err))
+		return r.failed(ctx, fmt.Errorf("rebuild of %s: %w", r.ws.Slug, err))
 	}
 	r.repo = repo
 	live, err := ListLivePatches(ctx, r.c.d.Store.Main(), r.ws.Slug)
 	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: list the patches: %w", r.ws.Slug, err))
+		return r.failed(ctx, fmt.Errorf("rebuild of %s: list the patches: %w", r.ws.Slug, err))
 	}
 	r.patches = make([]runPatch, 0, len(live))
 	for _, p := range live {
@@ -38,7 +38,7 @@ func (r *rebuildRun) listPatches(ctx context.Context) *attemptOutcome {
 			return err
 		})
 		if err != nil {
-			return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: read the branch %s: %w", r.ws.Slug, p.BranchName, err))
+			return r.failed(ctx, fmt.Errorf("rebuild of %s: read the branch %s: %w", r.ws.Slug, p.BranchName, err))
 		}
 		rp := runPatch{Patch: p}
 		if found {
@@ -51,26 +51,37 @@ func (r *rebuildRun) listPatches(ctx context.Context) *attemptOutcome {
 
 // build makes the head under construction, from the upstream base, by
 // applying each patch in order in a scratch working tree of the
-// workspace's repository, which no ref points to and which is removed
-// when the build ends. It records what it did with each patch.
+// workspace's repository, which no ref points to. It first discards what
+// an earlier attempt that ended without its cleanup left there, which no
+// other work uses: the queue runs one rebuild of a workspace at a time.
+// The scratch working tree is removed when the build ends, however it
+// ends. It records what it did with each patch; a patch that conflicts is
+// undone, and the run stops there unless its fail mode is continue.
 func (r *rebuildRun) build(ctx context.Context) *attemptOutcome {
 	var scratch *gitrepo.Scratch
 	err := r.git(ctx, func(ctx context.Context) (err error) {
+		if err := r.repo.DiscardScratches(ctx); err != nil {
+			return err
+		}
 		scratch, err = r.repo.AddScratch(ctx, r.job.ID, r.base)
 		return err
 	})
-	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: make the scratch working tree: %w", r.ws.Slug, err))
-	}
 	defer func() {
 		// The removal runs when the attempt's context may have ended.
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
-		if err := scratch.Remove(ctx); err != nil {
+		remove := r.repo.DiscardScratches
+		if scratch != nil {
+			remove = scratch.Remove
+		}
+		if err := remove(ctx); err != nil {
 			r.c.logger().Warn("scratch working tree of a rebuild not removed",
 				"workspace", r.ws.Slug, "job_id", r.job.ID, "error", err)
 		}
 	}()
+	if err != nil {
+		return r.failed(ctx, fmt.Errorf("rebuild of %s: make the scratch working tree: %w", r.ws.Slug, err))
+	}
 	r.head = r.base
 	for i, p := range r.patches {
 		if hook := r.c.d.BeforeRebuildPatch; hook != nil {
@@ -85,14 +96,20 @@ func (r *rebuildRun) build(ctx context.Context) *attemptOutcome {
 		if reason := skipReason(p); reason != "" {
 			res.Status, res.SkippedReason = resultSkipped, &reason
 		} else {
-			applied, out := r.apply(ctx, scratch, p)
+			before := r.head
+			applied, conflict, out := r.apply(ctx, scratch, p)
 			if out != nil {
 				return out
 			}
-			if applied {
+			switch {
+			case conflict != nil:
+				if out := r.conflict(ctx, scratch, p, before, *conflict, &res); out != nil {
+					return out
+				}
+			case applied:
 				head := r.head
 				res.Status, res.NewHeadSHA = resultSuccess, &head
-			} else {
+			default:
 				reason := skippedNothingToApply
 				res.Status, res.SkippedReason = resultSkipped, &reason
 			}
@@ -102,14 +119,19 @@ func (r *rebuildRun) build(ctx context.Context) *attemptOutcome {
 		if out := r.store(ctx); out != nil {
 			return out
 		}
+		if res.Status == resultConflict && r.payload.FailMode != failModeContinue {
+			return r.stopAtConflict(res)
+		}
 	}
 	return nil
 }
 
 // apply applies the patch p onto the head under construction with the
 // run's strategy, and reports whether it changed the head: a patch that
-// leaves nothing to apply does not.
-func (r *rebuildRun) apply(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *attemptOutcome) {
+// leaves nothing to apply does not. A patch that does not apply returns
+// where it conflicted, and leaves the scratch working tree for the caller
+// to undo.
+func (r *rebuildRun) apply(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *conflictAt, *attemptOutcome) {
 	if r.payload.Strategy == strategyMerge {
 		return r.merge(ctx, scratch, p)
 	}
@@ -119,8 +141,9 @@ func (r *rebuildRun) apply(ctx context.Context, scratch *gitrepo.Scratch, p runP
 // rebase applies the patch p by replaying, oldest first, onto the head
 // under construction every commit its source reaches and the upstream base
 // does not, leaving out merge commits; a commit whose change the head
-// already holds is dropped. It reports whether any commit was replayed.
-func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *attemptOutcome) {
+// already holds is dropped. It reports whether any commit was replayed, or
+// the first commit that does not apply.
+func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *conflictAt, *attemptOutcome) {
 	var commits []gitrepo.Commit
 	err := r.git(ctx, func(ctx context.Context) error {
 		ids, err := r.repo.CommitsBetween(ctx, r.base, *p.source, 0)
@@ -131,7 +154,7 @@ func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p run
 		return err
 	})
 	if err != nil {
-		return false, attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: read the commits of %s: %w", r.ws.Slug, p.BranchName, err))
+		return false, nil, r.failed(ctx, fmt.Errorf("rebuild of %s: read the commits of %s: %w", r.ws.Slug, p.BranchName, err))
 	}
 	committer := r.c.committer()
 	applied := false
@@ -145,24 +168,25 @@ func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p run
 			return err
 		})
 		if err != nil {
-			return false, attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: replay %s of %s: %w", r.ws.Slug, c.ID, p.BranchName, err))
+			return false, nil, r.failed(ctx, fmt.Errorf("rebuild of %s: replay %s of %s: %w", r.ws.Slug, c.ID, p.BranchName, err))
 		}
 		switch picked.Outcome {
 		case gitrepo.PickApplied:
 			r.head, applied = picked.Commit, true
 		case gitrepo.PickConflicted:
-			return false, attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: %s of %s does not apply: conflict in %d files", r.ws.Slug, c.ID, p.BranchName, len(picked.Conflicts)))
+			return false, &conflictAt{commit: c.ID, paths: picked.Conflicts}, nil
 		}
 	}
-	return applied, nil
+	return applied, nil, nil
 }
 
 // merge applies the patch p by merging its source into the head under
 // construction with a merge commit, even where the head could fast-forward
 // to it. The hub makes that commit itself, so the landing identity is its
 // author as well as its committer. A source the head already reaches
-// leaves nothing to apply. It reports whether the merge commit was made.
-func (r *rebuildRun) merge(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *attemptOutcome) {
+// leaves nothing to apply. It reports whether the merge commit was made,
+// or that the source does not merge.
+func (r *rebuildRun) merge(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *conflictAt, *attemptOutcome) {
 	identity := r.c.committer()
 	var merged gitrepo.Picked
 	err := r.git(ctx, func(ctx context.Context) (err error) {
@@ -170,21 +194,23 @@ func (r *rebuildRun) merge(ctx context.Context, scratch *gitrepo.Scratch, p runP
 		return err
 	})
 	if err != nil {
-		return false, attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: merge %s: %w", r.ws.Slug, p.BranchName, err))
+		return false, nil, r.failed(ctx, fmt.Errorf("rebuild of %s: merge %s: %w", r.ws.Slug, p.BranchName, err))
 	}
 	switch merged.Outcome {
 	case gitrepo.PickApplied:
 		r.head = merged.Commit
-		return true, nil
+		return true, nil, nil
 	case gitrepo.PickConflicted:
-		return false, attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: %s does not merge: conflict in %d files", r.ws.Slug, p.BranchName, len(merged.Conflicts)))
+		return false, &conflictAt{commit: *p.source, paths: merged.Conflicts}, nil
 	}
-	return false, nil
+	return false, nil, nil
 }
 
-// git runs op, one git operation of the attempt, through RunGit.
+// git runs op, one git operation of the attempt, through RunGit, under the
+// deadline of every git operation of carry-patch work or the shorter one a
+// test gives.
 func (r *rebuildRun) git(ctx context.Context, op func(ctx context.Context) error) error {
-	return RunGit(ctx, 0, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error { return op(ctx) })
+	return RunGit(ctx, r.c.d.RebuildGitDeadline, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error { return op(ctx) })
 }
 
 // committer is the landing identity at the clock's present time: the

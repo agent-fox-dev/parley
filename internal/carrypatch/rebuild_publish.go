@@ -30,7 +30,7 @@ func (r *rebuildRun) publish(ctx context.Context) *attemptOutcome {
 		return err
 	})
 	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: read %s: %w", r.ws.Slug, ref, err))
+		return r.failed(ctx, fmt.Errorf("rebuild of %s: read %s: %w", r.ws.Slug, ref, err))
 	}
 	// The last look at the workspace, so that one archived, recloned or
 	// deleted during the run keeps its integration branch.
@@ -44,7 +44,7 @@ func (r *rebuildRun) publish(ctx context.Context) *attemptOutcome {
 		return attemptFailed(attemptRetryable, reasonRefMoved, fmt.Errorf("rebuild of %s: %s was moved by another writer: %w", r.ws.Slug, ref, err))
 	}
 	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("rebuild of %s: move %s: %w", r.ws.Slug, ref, err))
+		return r.failed(ctx, fmt.Errorf("rebuild of %s: move %s: %w", r.ws.Slug, ref, err))
 	}
 	head := r.head
 	r.result.IntegrationHeadSHA = &head

@@ -362,3 +362,124 @@ theirs
 		t.Errorf("a hook or the content's filter ran: %q", b)
 	}
 }
+
+func TestScratch_ResetUndoesAConflictedReplayOrMerge(t *testing.T) {
+	t.Parallel()
+	f := newScratchRepo(t, scratchStream)
+	ctx := context.Background()
+	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)}
+	cases := []struct {
+		name string
+		run  func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error)
+	}{
+		{"a replay", func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error) { return s.Pick(ctx, commit, hub) }},
+		{"a merge", func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error) {
+			return s.Merge(ctx, commit, "Merge branch 'conflict'", hub, hub)
+		}},
+	}
+	m2 := f.id(t, "main")
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			name := fmt.Sprintf("job-%d", i)
+			s, err := f.repo.AddScratch(ctx, name, m2)
+			if err != nil {
+				t.Fatalf("AddScratch = %v", err)
+			}
+			t.Cleanup(func() { _ = s.Remove(ctx) })
+			if picked, err := tc.run(s, f.id(t, "conflict")); err != nil || picked.Outcome != gitrepo.PickConflicted {
+				t.Fatalf("%s of conflict = %+v, %v; want conflicted", tc.name, picked, err)
+			}
+			// Something git does not track is left in the tree as well.
+			if err := os.WriteFile(filepath.Join(s.Dir(), "stray.txt"), []byte("stray\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := s.Reset(ctx, m2); err != nil {
+				t.Fatalf("Reset(main) = %v", err)
+			}
+			if head, err := s.Head(ctx); err != nil || head != m2 {
+				t.Errorf("Head after Reset = %q, %v; want main %s", head, err, m2)
+			}
+			admin := filepath.Join(f.dir, "worktrees", name)
+			for _, state := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD"} {
+				if _, err := os.Stat(filepath.Join(admin, state)); !os.IsNotExist(err) {
+					t.Errorf("%s of the scratch working tree is still there after Reset: %v", state, err)
+				}
+			}
+			entries, err := os.ReadDir(s.Dir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			if want := []string{".git", "f.txt"}; !reflect.DeepEqual(names, want) {
+				t.Errorf("the scratch working tree holds %q after Reset, want %q", names, want)
+			}
+			if b, err := os.ReadFile(filepath.Join(s.Dir(), "f.txt")); err != nil || string(b) != "two\n" {
+				t.Errorf("f.txt after Reset = %q, %v; want main's \"two\\n\"", b, err)
+			}
+			// The tree takes the next replay as if nothing had happened.
+			picked, err := s.Pick(ctx, f.id(t, "add"), hub)
+			if err != nil || picked.Outcome != gitrepo.PickApplied {
+				t.Fatalf("Pick(add) after Reset = %+v, %v; want applied", picked, err)
+			}
+			if got := show(t, f.dir, picked.Commit, "%P"); got != m2 {
+				t.Errorf("the parent of the replay after Reset = %s, want main %s", got, m2)
+			}
+		})
+	}
+}
+
+func TestScratch_DiscardRemovesEveryLeftover(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	t.Run("leftovers of earlier work", func(t *testing.T) {
+		t.Parallel()
+		f := newScratchRepo(t, scratchStream)
+		hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)}
+		m2 := f.id(t, "main")
+		if _, err := f.repo.AddScratch(ctx, "job-1", m2); err != nil {
+			t.Fatal(err)
+		}
+		half, err := f.repo.AddScratch(ctx, "job-2", m2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if picked, err := half.Pick(ctx, f.id(t, "conflict"), hub); err != nil || picked.Outcome != gitrepo.PickConflicted {
+			t.Fatalf("Pick(conflict) = %+v, %v; want conflicted", picked, err)
+		}
+		if err := os.WriteFile(filepath.Join(f.dir, gitrepo.ScratchParent, "stray"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		refs := gitrepotest.Refs(t, f.dir, "")
+
+		if err := f.repo.DiscardScratches(ctx); err != nil {
+			t.Fatalf("DiscardScratches = %v", err)
+		}
+		if entries, err := os.ReadDir(filepath.Join(f.dir, gitrepo.ScratchParent)); err != nil && !os.IsNotExist(err) || len(entries) != 0 {
+			t.Errorf("%s holds %v (%v) after DiscardScratches, want no entry", gitrepo.ScratchParent, entries, err)
+		}
+		if got := gitrepotest.Git(t, f.dir, "worktree", "list", "--porcelain"); strings.Count(got, "worktree ") != 1 {
+			t.Errorf("git worktree list = %q, want the repository alone", got)
+		}
+		if got := gitrepotest.Refs(t, f.dir, ""); !maps.Equal(got, refs) {
+			t.Errorf("the refs after DiscardScratches = %v, want them as they were, %v", got, refs)
+		}
+		// The names are free again.
+		s, err := f.repo.AddScratch(ctx, "job-2", m2)
+		if err != nil {
+			t.Fatalf("AddScratch(job-2) after DiscardScratches = %v", err)
+		}
+		_ = s.Remove(ctx)
+	})
+	t.Run("nothing to discard", func(t *testing.T) {
+		t.Parallel()
+		f := newScratchRepo(t, scratchStream)
+		if err := f.repo.DiscardScratches(ctx); err != nil {
+			t.Fatalf("DiscardScratches of a repository without scratch working trees = %v", err)
+		}
+	})
+}

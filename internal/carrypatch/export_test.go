@@ -2,6 +2,7 @@ package carrypatch
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/agent-fox-dev/parley/internal/jobs"
 )
@@ -17,6 +18,8 @@ func DeleteBackupRef(ctx context.Context, c *Component, slug, branch string) {
 // word and its text.
 type AttemptOutcome struct {
 	Kind, Reason, Text string
+	// Conflict is the conflict report a fail_fast attempt stopped with.
+	Conflict json.RawMessage
 }
 
 // attemptKindNames are the names of the kinds of an attempt's outcome.
@@ -31,7 +34,7 @@ var attemptKindNames = map[attemptKind]string{
 // component c and returns its outcome.
 func RunRebuildAttempt(ctx context.Context, c *Component, j jobs.Job) AttemptOutcome {
 	out := c.runRebuildAttempt(ctx, j)
-	return AttemptOutcome{Kind: attemptKindNames[out.kind], Reason: out.reason, Text: out.text}
+	return AttemptOutcome{Kind: attemptKindNames[out.kind], Reason: out.reason, Text: out.text, Conflict: out.conflict}
 }
 
 // PatchResult is what a rebuild did with one patch, as the job's

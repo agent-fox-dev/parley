@@ -26,13 +26,15 @@ const (
 	attemptEnded
 )
 
-// The reasons of a failed attempt that the start of an attempt gives. A
-// workspace that is not ready reuses the names of the workspace routes'
-// refusals.
+// The reasons of a failed attempt. A workspace that is not ready reuses
+// the names of the workspace routes' refusals.
 const (
+	reasonConflict            = "conflict"
 	reasonUpstreamFetchFailed = "upstream_fetch_failed"
 	reasonUpstreamUnknown     = "upstream_unknown"
 	reasonGitError            = "git_error"
+	reasonTimeout             = "timeout"
+	reasonShutdown            = "shutdown"
 	reasonRefMoved            = "ref_moved"
 	reasonWorkspaceBusy       = "workspace_busy"
 	reasonWorkspaceNotReady   = "workspace_not_ready"
@@ -45,6 +47,9 @@ type attemptOutcome struct {
 	kind   attemptKind
 	reason string
 	text   string
+	// conflict is the conflict report of the patch a fail_fast run stopped
+	// at, nil for any other outcome.
+	conflict json.RawMessage
 }
 
 // attemptFailed is the outcome of an attempt that failed with reason, retryable
@@ -118,7 +123,7 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 		return attemptFailed(attemptRetryable, reasonUpstreamUnknown, err)
 	}
 	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, err)
+		return r.failed(ctx, err)
 	}
 	r.base, r.result.UpstreamHeadSHA = base, &base
 	return r.store(ctx)
@@ -180,7 +185,26 @@ func (r *rebuildRun) store(ctx context.Context) *attemptOutcome {
 		return &attemptOutcome{kind: attemptEnded}
 	}
 	if err != nil {
-		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("store the result of the rebuild job %s: %w", r.job.ID, err))
+		return r.failed(ctx, fmt.Errorf("store the result of the rebuild job %s: %w", r.job.ID, err))
 	}
 	return nil
+}
+
+// failed is the outcome of an attempt whose git operation or store access
+// failed with err, not for a conflict: a retryable failure, shutdown when
+// the attempt's context was cancelled, as at a stop of the hub, timeout for
+// a git operation that outlasted its deadline, git_error otherwise. A
+// workspace deleted meanwhile, which cancels its jobs' attempts too, ends
+// the attempt instead.
+func (r *rebuildRun) failed(ctx context.Context, err error) *attemptOutcome {
+	switch {
+	case ctx.Err() != nil:
+		if out := r.readWorkspace(ctx); out != nil && out.kind == attemptEnded {
+			return out
+		}
+		return attemptFailed(attemptRetryable, reasonShutdown, err)
+	case errors.Is(err, ErrGitTimeout):
+		return attemptFailed(attemptRetryable, reasonTimeout, err)
+	}
+	return attemptFailed(attemptRetryable, reasonGitError, err)
 }

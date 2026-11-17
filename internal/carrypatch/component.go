@@ -62,6 +62,13 @@ type Deps struct {
 	// before the publish reads the integration branch, outside any store
 	// transaction; only tests set it.
 	BeforeRebuildPublish func(job string)
+	// ConflictFiles describes the files of the conflict report of a patch
+	// that did not apply in a rebuild; nil is GitConflictFiles.
+	ConflictFiles ConflictFileDescriber
+	// RebuildGitDeadline, when positive and shorter, replaces
+	// DefaultGitDeadline as the deadline of each git operation of a rebuild
+	// attempt; only tests set it.
+	RebuildGitDeadline time.Duration
 	// Events writes the events of the patch list in the transaction of the
 	// change they report.
 	Events Emitter

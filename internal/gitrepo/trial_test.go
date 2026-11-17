@@ -143,3 +143,55 @@ func TestTrialRebase_ReadsNoCommitMessage(t *testing.T) {
 		t.Errorf("the trial rebases read whole objects: %v", read)
 	}
 }
+
+func TestConflictFiles_DescribesEachGivenPath(t *testing.T) {
+	t.Parallel()
+	f := newScratchRepo(t, scratchStream)
+	ctx := context.Background()
+	m1, m2 := f.id(t, "main~1"), f.id(t, "main")
+	content := func(path, base, ours, theirs string) gitrepo.ConflictFile {
+		cf := gitrepo.ConflictFile{Path: path, Kind: gitrepo.ConflictContent}
+		cf.Base, cf.Ours, cf.Theirs = f.side(t, base, path), f.side(t, ours, path), f.side(t, theirs, path)
+		return cf
+	}
+	cases := []struct {
+		name   string
+		commit string
+		paths  []string
+		want   []gitrepo.ConflictFile
+	}{
+		{"a path the commit conflicts on", "conflict", []string{"f.txt"},
+			[]gitrepo.ConflictFile{content("f.txt", m1, m2, f.id(t, "conflict"))}},
+		{"paths a merge of the commit alone does not report, in order and once each", "add", []string{"f.txt", "a.txt", "f.txt"},
+			[]gitrepo.ConflictFile{content("a.txt", m1, m2, f.id(t, "add")), content("f.txt", m1, m2, f.id(t, "add"))}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := f.repo.ConflictFiles(ctx, m2, f.id(t, tc.commit), tc.paths)
+			if err != nil {
+				t.Fatalf("ConflictFiles = %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ConflictFiles(main, %s, %q) =\n%s\nwant\n%s", tc.commit, tc.paths, describeFiles(got), describeFiles(tc.want))
+			}
+		})
+	}
+}
+
+// describeFiles shows conflict files for a test's failure.
+func describeFiles(files []gitrepo.ConflictFile) string {
+	var b strings.Builder
+	for _, cf := range files {
+		b.WriteString(cf.Path + " " + cf.Kind)
+		for _, s := range []*gitrepo.ConflictSide{cf.Base, cf.Ours, cf.Theirs} {
+			if s == nil {
+				b.WriteString(" -")
+				continue
+			}
+			b.WriteString(" " + s.SHA + ":" + s.Mode + ":" + s.Path)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
