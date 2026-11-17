@@ -8,12 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -71,6 +73,27 @@ var routes = []route{
 	{secret.ScopeWorkspace, http.MethodDelete, "/workspaces/%s/secrets/route_key", nil, "secrets:write", http.StatusNoContent},
 }
 
+// varRoutes are every variable route that an access check guards, in the
+// order of routes: a scope's POST creates ROUTE_KEY, its PATCH changes it
+// and its DELETE removes it. The access tests iterate them, so a route added
+// here is held to the access rules of its scope. PATCH and DELETE on the
+// resolved path answer 405 before any check and are not here.
+var varRoutes = []route{
+	{secret.ScopeUser, http.MethodGet, "/user/vars", nil, "vars:read", http.StatusOK},
+	{secret.ScopeOrg, http.MethodGet, "/orgs/%s/vars", nil, "vars:read", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodGet, "/workspaces/%s/vars", nil, "vars:read", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodGet, "/workspaces/%s/vars/resolved", nil, "vars:read", http.StatusOK},
+	{secret.ScopeUser, http.MethodPost, "/user/vars", created, "vars:write", http.StatusCreated},
+	{secret.ScopeOrg, http.MethodPost, "/orgs/%s/vars", created, "vars:write", http.StatusCreated},
+	{secret.ScopeWorkspace, http.MethodPost, "/workspaces/%s/vars", created, "vars:write", http.StatusCreated},
+	{secret.ScopeUser, http.MethodPatch, "/user/vars/ROUTE_KEY", changed, "vars:write", http.StatusOK},
+	{secret.ScopeOrg, http.MethodPatch, "/orgs/%s/vars/ROUTE_KEY", changed, "vars:write", http.StatusOK},
+	{secret.ScopeWorkspace, http.MethodPatch, "/workspaces/%s/vars/ROUTE_KEY", changed, "vars:write", http.StatusOK},
+	{secret.ScopeUser, http.MethodDelete, "/user/vars/route_key", nil, "vars:write", http.StatusNoContent},
+	{secret.ScopeOrg, http.MethodDelete, "/orgs/%s/vars/route_key", nil, "vars:write", http.StatusNoContent},
+	{secret.ScopeWorkspace, http.MethodDelete, "/workspaces/%s/vars/route_key", nil, "vars:write", http.StatusNoContent},
+}
+
 // changed is an update body.
 var changed = map[string]any{"value": "changed"}
 
@@ -124,11 +147,23 @@ type world struct {
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	_, key := newKey(t)
+	return newWorldEnv(t, map[string]string{secret.EnvCurrentKey: key})
+}
+
+// newKeylessWorld builds the world in a hub with no secret key configured.
+func newKeylessWorld(t *testing.T) *world {
+	t.Helper()
+	return newWorldEnv(t, nil)
+}
+
+// newWorldEnv builds the world in a hub with env added to its environment.
+func newWorldEnv(t *testing.T, env map[string]string) *world {
+	t.Helper()
 	// Halfway through a second, so that a stored time is seen cut to whole
 	// seconds.
 	w := &world{now: time.Now().UTC().Truncate(time.Second).Add(-time.Second / 2)}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		Env:     map[string]string{secret.EnvCurrentKey: key},
+		Env:     env,
 		Now:     w.clock,
 		Compose: func(c *hub.Composition) { w.secrets, w.events = c.Secrets(), c.Events() },
 	})
@@ -198,6 +233,29 @@ func (w *world) do(t *testing.T, cred, method, path string, body any) answer {
 	return answer{status: status, body: b}
 }
 
+// post sends body as JSON to path, below /api/v1, with cred as the bearer
+// credential, and returns the answer or the error of sending it, never
+// failing the test, so that a goroutine of the test may call it.
+func (w *world) post(cred, path string, body any) (answer, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return answer{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, w.URL("/api/v1"+path), bytes.NewReader(raw))
+	if err != nil {
+		return answer{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return answer{}, err
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	return answer{status: res.StatusCode, body: b}, err
+}
+
 // seed stores the secrets keys in one scope through the component, each
 // with the value valueOf gives it.
 func (w *world) seed(t *testing.T, scope secret.Scope, id string, keys ...string) {
@@ -213,6 +271,25 @@ func (w *world) seed(t *testing.T, scope secret.Scope, id string, keys ...string
 	})
 	if err != nil {
 		t.Fatalf("seed %v in %s %s: %v", keys, scope, id, err)
+	}
+}
+
+// putSecrets stores, through the component, the secrets pairs names in
+// one scope as key, value, key, value and so on; a key the scope holds
+// ignoring case gets the new value.
+func (w *world) putSecrets(t *testing.T, scope secret.Scope, id string, pairs ...string) {
+	t.Helper()
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i+1 < len(pairs); i += 2 {
+			if err := w.secrets.Put(ctx, tx, scope, id, pairs[i], pairs[i+1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("store %v in %s %s: %v", pairs, scope, id, err)
 	}
 }
 
@@ -235,6 +312,21 @@ func (w *world) eventsAfter(t *testing.T, seq int64) ([]event.Record, int64) {
 		t.Fatalf("read the events after %d: %v", seq, err)
 	}
 	return recs, last
+}
+
+// varEventsAfter returns the variable events of the log after seq and the
+// log's last seq. It leaves out the events other components write in every
+// hub, such as the overlaps the awareness worker finds on its own time.
+func (w *world) varEventsAfter(t *testing.T, seq int64) ([]event.Record, int64) {
+	t.Helper()
+	recs, last := w.eventsAfter(t, seq)
+	vars := []event.Record{}
+	for _, ev := range recs {
+		if strings.HasPrefix(ev.Type, "parley.variable.") {
+			vars = append(vars, ev)
+		}
+	}
+	return vars, last
 }
 
 // valueOf is the value seed stores under key: text no answer may hold.
@@ -378,3 +470,273 @@ func ptr(s string) *string { return &s }
 
 // equalPtr reports whether a and b are both nil or point to equal strings.
 func equalPtr(a, b *string) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
+
+// varPlaces are owner's user variables, those of the org acme and those of
+// the workspace acme.
+func (w *world) varPlaces() []place {
+	return []place{
+		{secret.ScopeUser, w.ownerID, "/user/vars"},
+		{secret.ScopeOrg, w.orgID, "/orgs/acme/vars"},
+		{secret.ScopeWorkspace, "acme", "/workspaces/acme/vars"},
+	}
+}
+
+// variable is a variable as an answer gives it.
+type variable struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// varsOf decodes the answer a, which must have the status given, as
+// {"items": [...]}, and checks that each item has exactly the members key,
+// value, created_at and updated_at.
+func varsOf(t *testing.T, a answer, status int) []variable {
+	t.Helper()
+	if a.status != status {
+		t.Fatalf("answer = %d %.300s, want %d", a.status, a.body, status)
+	}
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	var p struct {
+		Items []variable `json:"items"`
+	}
+	if err := json.Unmarshal(a.body, &raw); err != nil {
+		t.Fatalf("decode the items %.300s: %v", a.body, err)
+	}
+	if err := json.Unmarshal(a.body, &p); err != nil {
+		t.Fatalf("decode the items %.300s: %v", a.body, err)
+	}
+	for _, it := range raw.Items {
+		if members := slices.Sorted(maps.Keys(it)); !slices.Equal(members, []string{"created_at", "key", "updated_at", "value"}) {
+			t.Errorf("item members = %v, want exactly key, value, created_at, updated_at", members)
+		}
+	}
+	return p.Items
+}
+
+// storedVars are the variables a scope holds, as key=value, in the order of
+// their keys with A to Z lowered, read from the store.
+func (w *world) storedVars(t *testing.T, scope secret.Scope, id string) []string {
+	t.Helper()
+	rows, err := w.Store.Main().QueryContext(context.Background(),
+		`SELECT key, value FROM variables WHERE scope = ? AND scope_id = ? ORDER BY key_lower`, scope, id)
+	if err != nil {
+		t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+		}
+		out = append(out, k+"="+v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the variables of %s %s: %v", scope, id, err)
+	}
+	return out
+}
+
+// allVars are every variable the store holds, as scope/scope id/key=value,
+// in that order.
+func (w *world) allVars(t *testing.T) []string {
+	t.Helper()
+	rows, err := w.Store.Main().QueryContext(context.Background(),
+		`SELECT scope, scope_id, key, value FROM variables ORDER BY scope, scope_id, key_lower`)
+	if err != nil {
+		t.Fatalf("read the variables: %v", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var scope, id, k, v string
+		if err := rows.Scan(&scope, &id, &k, &v); err != nil {
+			t.Fatalf("read the variables: %v", err)
+		}
+		out = append(out, scope+"/"+id+"/"+k+"="+v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the variables: %v", err)
+	}
+	return out
+}
+
+// seedVars stores the variables keys in one scope through the component,
+// each with the value "v-" and its key, and writes no event.
+func (w *world) seedVars(t *testing.T, scope secret.Scope, id string, keys ...string) {
+	t.Helper()
+	e := make([]secret.Entry, len(keys))
+	for i, k := range keys {
+		e[i] = secret.Entry{Key: k, Value: "v-" + k}
+	}
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := w.secrets.CreateVars(ctx, tx, scope, id, e)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("seed the variables %v in %s %s: %v", keys, scope, id, err)
+	}
+}
+
+// createVars creates the variables keys, each with no value, through the
+// collection path with cred, and fails the test unless it is answered 201.
+func (w *world) createVars(t *testing.T, cred, path string, keys ...string) {
+	t.Helper()
+	if a := w.do(t, cred, http.MethodPost, path, keyed(keys...)); a.status != http.StatusCreated {
+		t.Fatalf("create %d variables in %s = %d %.300s, want 201", len(keys), path, a.status, a.body)
+	}
+}
+
+// varPageOf decodes the answer a, which must be 200, as a page of
+// variables: its items, each checked as varsOf checks them, and its
+// next_cursor, which must be present.
+func varPageOf(t *testing.T, a answer) ([]variable, *string) {
+	t.Helper()
+	items := varsOf(t, a, http.StatusOK)
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(a.body, &top); err != nil || len(top) != 2 || top["items"] == nil || top["next_cursor"] == nil {
+		t.Fatalf("the page %.300s (%v) has not exactly the members items and next_cursor", a.body, err)
+	}
+	if bytes.HasPrefix(top["items"], []byte("null")) {
+		t.Errorf("the page %.300s has items null, want an array", a.body)
+	}
+	var next *string
+	if err := json.Unmarshal(top["next_cursor"], &next); err != nil {
+		t.Fatalf("next_cursor of %.300s: %v", a.body, err)
+	}
+	return items, next
+}
+
+// listVars are the variables the collection path answers cred with, as
+// one page of up to 200, which must be the last.
+func (w *world) listVars(t *testing.T, cred, path string) []variable {
+	t.Helper()
+	items, next := varPageOf(t, w.do(t, cred, http.MethodGet, path+"?limit=200", nil))
+	if next != nil {
+		t.Fatalf("GET %s: next_cursor %q, want null", path, *next)
+	}
+	return items
+}
+
+// varOf decodes the answer a, which must have the status given, as one
+// variable with exactly the members key, value, created_at and updated_at.
+func varOf(t *testing.T, a answer, status int) variable {
+	t.Helper()
+	if a.status != status {
+		t.Fatalf("answer = %d %.300s, want %d", a.status, a.body, status)
+	}
+	var raw map[string]json.RawMessage
+	var v variable
+	if err := json.Unmarshal(a.body, &raw); err != nil {
+		t.Fatalf("decode the variable %.300s: %v", a.body, err)
+	}
+	if err := json.Unmarshal(a.body, &v); err != nil {
+		t.Fatalf("decode the variable %.300s: %v", a.body, err)
+	}
+	if members := slices.Sorted(maps.Keys(raw)); !slices.Equal(members, []string{"created_at", "key", "updated_at", "value"}) {
+		t.Errorf("variable members = %v, want exactly key, value, created_at, updated_at", members)
+	}
+	return v
+}
+
+// keysOf are the keys of vars, in order.
+func keysOf(vars []variable) []string {
+	out := make([]string, len(vars))
+	for i, v := range vars {
+		out[i] = v.Key
+	}
+	return out
+}
+
+// putVars creates, through the collection path with cred, the variables
+// pairs names as key, value, key, value and so on, and fails the test
+// unless it is answered 201.
+func (w *world) putVars(t *testing.T, cred, path string, pairs ...string) {
+	t.Helper()
+	e := make([]any, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		e = append(e, map[string]any{"key": pairs[i], "value": pairs[i+1]})
+	}
+	if a := w.do(t, cred, http.MethodPost, path, entries(e...)); a.status != http.StatusCreated {
+		t.Fatalf("create %v in %s = %d %.300s, want 201", pairs, path, a.status, a.body)
+	}
+}
+
+// admin sends method path, below /api/v1, as the admin token, and fails
+// the test unless it is answered 2xx.
+func (w *world) admin(t *testing.T, method, path string) {
+	t.Helper()
+	if a := w.do(t, w.Token, method, path, nil); a.status/100 != 2 {
+		t.Fatalf("%s %s as the admin token = %d %.300s, want 2xx", method, path, a.status, a.body)
+	}
+}
+
+// resolved is a resolved variable as an answer gives it.
+type resolved struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Origin    string `json:"origin"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// resolvedPageOf decodes the answer a, which must be 200, as a page of
+// resolved variables: its items, each with exactly the members key, value,
+// origin, created_at and updated_at, and its next_cursor; the page has
+// exactly those two members and items is an array.
+func resolvedPageOf(t *testing.T, a answer) ([]resolved, *string) {
+	t.Helper()
+	if a.status != http.StatusOK {
+		t.Fatalf("answer = %d %.300s, want 200", a.status, a.body)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(a.body, &top); err != nil || len(top) != 2 || top["items"] == nil || top["next_cursor"] == nil {
+		t.Fatalf("the page %.300s (%v) has not exactly the members items and next_cursor", a.body, err)
+	}
+	var raw []map[string]json.RawMessage
+	if err := json.Unmarshal(top["items"], &raw); err != nil || raw == nil {
+		t.Fatalf("the items of %.300s are not an array: %v", a.body, err)
+	}
+	for _, it := range raw {
+		if members := slices.Sorted(maps.Keys(it)); !slices.Equal(members, []string{"created_at", "key", "origin", "updated_at", "value"}) {
+			t.Errorf("item members = %v, want exactly key, value, origin, created_at, updated_at", members)
+		}
+	}
+	items := []resolved{}
+	if err := json.Unmarshal(top["items"], &items); err != nil {
+		t.Fatalf("decode the items of %.300s: %v", a.body, err)
+	}
+	var next *string
+	if err := json.Unmarshal(top["next_cursor"], &next); err != nil {
+		t.Fatalf("next_cursor of %.300s: %v", a.body, err)
+	}
+	return items, next
+}
+
+// resolve is the resolved variables of the workspace slug that cred is
+// answered, as one page of up to 200, which must be the last.
+func (w *world) resolve(t *testing.T, cred, slug string) []resolved {
+	t.Helper()
+	items, next := resolvedPageOf(t, w.do(t, cred, http.MethodGet, "/workspaces/"+slug+"/vars/resolved?limit=200", nil))
+	if next != nil {
+		t.Fatalf("the resolved variables of %s: next_cursor %q, want null", slug, *next)
+	}
+	return items
+}
+
+// stamp is the time t as an answer gives it: whole seconds, RFC 3339.
+func stamp(t time.Time) string { return t.Truncate(time.Second).Format(time.RFC3339) }
+
+// keysOfResolved are the keys of vars, in order.
+func keysOfResolved(vars []resolved) []string {
+	out := make([]string, len(vars))
+	for i, v := range vars {
+		out[i] = v.Key
+	}
+	return out
+}

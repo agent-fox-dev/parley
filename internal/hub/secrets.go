@@ -3,10 +3,13 @@ package hub
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"path/filepath"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
@@ -31,25 +34,31 @@ const (
 // loaded stops the start as its one error line before any store is opened
 // (docs/adr/06-load-the-secret-keys-before-the-stores-open.md). Its start
 // hook binds the secret component to the stores, the loaded keys, the hub's
-// clock and scrubber and the event component, and reads the start report,
-// which the hub writes once it has bound the listener: the `secret
+// clock and scrubber, the event component, and the workspace records, the
+// memberships and the users a workspace's chain is built from, and the
+// access service's write-access question, which decides whether a fork's
+// secrets are resolved from its parent, and reads the start report, which
+// the hub writes once it has bound the listener: the `secret
 // encryption` line, and the warning that secrets cannot be stored when no
 // current key is configured. Every maintenance pass runs the re-encryption
 // under the name secret_reencryption, which finishes a key rotation and
 // reports what remains under another key. It registers the removal of a user's and an
-// org's secrets on the identity service, so that the delete of a user or an
-// org removes them in its own transaction and a refused or failed delete
-// keeps them (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
-// The secret routes are registered with the component's scope check as an
-// access check: it is added after identity's and the workspace access
-// checks, so a workspace secret route has its access decided before the
-// scope is resolved. The component exists from the
+// org's secrets, and then of their variables, on the identity service, so
+// that the delete of a user or an org removes them in its own transaction
+// and a refused or failed delete keeps them (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
+// The secret routes, and the variable routes, which are a second collection
+// of the same component and need no key, are registered with the
+// component's scope check as an access check: it is added after identity's
+// and the workspace access checks, so a workspace route has its access
+// decided before the scope is resolved. The variable table is added beside
+// the secret table. The component exists from the
 // composition on, so a later part keeps it through Composition.Secrets; the
 // hooks that run after this one may use it.
 func composeSecrets(c *Composition) {
 	c.secrets = &secret.Component{}
 	c.RegisterKey(config.Key{Section: secretsSection, Name: keyFileName, Type: config.String, Default: ""})
 	c.AddSchemaStep(secret.SchemaStep)
+	c.AddSchemaStep(secret.VarSchemaStep)
 	var keys secret.Keys
 	c.addConfigCheck(func(cfg *config.Config) (err error) {
 		keys, err = secret.LoadKeys(c.env, keyFilePath(cfg))
@@ -57,7 +66,10 @@ func composeSecrets(c *Composition) {
 	})
 	var report secret.StartReport
 	c.AddStartHook(secretsHook, func(ctx context.Context, rt *Runtime) (err error) {
-		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: keys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events})
+		db := rt.Store.Main()
+		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: keys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events,
+			Records: access.StoreRecords(db), Memberships: activeOrgs(db), UserExists: userExists(db),
+			CanWrite: c.access.CanWrite})
 		report, err = c.secrets.StartReport(ctx)
 		return err
 	})
@@ -71,9 +83,27 @@ func composeSecrets(c *Composition) {
 	c.identity.RegisterOrgRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
 		return c.secrets.RemoveScope(ctx, tx, secret.ScopeOrg, id)
 	})
+	c.identity.RegisterUserRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
+		return secret.RemoveVarScope(ctx, tx, secret.ScopeUser, id)
+	})
+	c.identity.RegisterOrgRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
+		return secret.RemoveVarScope(ctx, tx, secret.ScopeOrg, id)
+	})
 	c.AddAccessCheck(c.secrets.ScopeCheck)
-	for _, r := range c.secrets.Routes() {
+	for _, r := range append(c.secrets.Routes(), c.secrets.VarRoutes()...) {
 		c.AddRoute(r)
+	}
+}
+
+// userExists is the question a workspace's chain asks of identity: whether
+// its owner is still a user.
+func userExists(db *sql.DB) func(ctx context.Context, userID string) (bool, error) {
+	return func(ctx context.Context, userID string) (bool, error) {
+		_, err := identity.UserByID(ctx, db, userID)
+		if errors.Is(err, identity.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
 	}
 }
 

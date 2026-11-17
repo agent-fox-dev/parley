@@ -15,14 +15,29 @@ import (
 // for: the most the hub serves, so the list takes the fewest requests.
 const listPageLimit = "200"
 
-// secretScope is one scope a secret command acts on: its name as create
-// prints it and the path of its secret routes, encoded already.
-type secretScope struct {
-	name, path string
+// secretsCollection is the last segment of the secret routes of a scope.
+const secretsCollection = "secrets"
+
+// scope is one scope a command of a scoped collection, secrets or
+// variables, acts on: its name as create prints it, and the organization or
+// workspace slug of the org and workspace scopes.
+type scope struct {
+	name, slug string
 }
 
-// secretEntry is one KEY=VALUE of a create, as the hub takes it.
-type secretEntry struct {
+// path is the route of the collection in s, the slug encoded already.
+func (s scope) path(collection string) string {
+	switch s.name {
+	case "org":
+		return "/orgs/" + pathSegment(s.slug) + "/" + collection
+	case "workspace":
+		return "/workspaces/" + pathSegment(s.slug) + "/" + collection
+	}
+	return "/user/" + collection
+}
+
+// entry is one KEY=VALUE of a create, as the hub takes it.
+type entry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
@@ -32,26 +47,26 @@ type secretEntry struct {
 // none of these commands prints one.
 func newSecretsCommand() *cobra.Command {
 	return group("secrets", "Create, list, update and delete secrets, whose values the hub never shows",
-		withSecretArgs(declare(command{
+		withScopeArgs(declare(command{
 			Name:        "create",
 			Description: "Create secrets in your user scope, an organization's or a workspace's",
 			Method:      http.MethodPost,
 			Path:        "/user/secrets",
 			Args:        []argSpec{{Name: "KEY=VALUE", Required: true, Repeats: true}},
 			Auth:        authUser,
-			Flags:       secretFlags(true, "create the secrets in"),
-			Run:         createSecrets,
+			Flags:       scopeFlags(true, "create the secrets in"),
+			Run:         createEntries(secretsCollection),
 		}), true, checkEntries),
-		withSecretArgs(declare(command{
+		withScopeArgs(declare(command{
 			Name:        "list",
 			Description: "List the keys of a scope's secrets, every page of them",
 			Method:      http.MethodGet,
 			Path:        "/user/secrets",
 			Auth:        authUser,
-			Flags:       secretFlags(false, "list the secrets of"),
-			Run:         listSecrets,
+			Flags:       scopeFlags(false, "list the secrets of"),
+			Run:         listEntries(secretsCollection),
 		}), false, nil),
-		withSecretArgs(declare(command{
+		withScopeArgs(declare(command{
 			Name:        "update",
 			Description: "Replace the value of one secret",
 			Method:      http.MethodPatch,
@@ -60,26 +75,26 @@ func newSecretsCommand() *cobra.Command {
 			// message, unlike the count of arguments', quotes no value.
 			Args:  []argSpec{{Name: "KEY=VALUE", Required: true, Repeats: true}},
 			Auth:  authUser,
-			Flags: secretFlags(true, "update the secret of"),
-			Run:   updateSecret,
+			Flags: scopeFlags(true, "update the secret of"),
+			Run:   updateEntry(secretsCollection),
 		}), false, checkOneEntry),
-		withSecretArgs(declare(command{
+		withScopeArgs(declare(command{
 			Name:        "delete",
 			Description: "Delete one secret",
 			Method:      http.MethodDelete,
 			Path:        "/user/secrets/:key",
 			Args:        []argSpec{{Name: "KEY", Required: true}},
 			Auth:        authUser,
-			Flags:       secretFlags(false, "delete the secret of"),
-			Run:         deleteSecret,
-			Confirm:     func(c *call) any { return map[string]string{"deleted": c.args["KEY"]} },
+			Flags:       scopeFlags(false, "delete the secret of"),
+			Run:         deleteEntry(secretsCollection),
+			Confirm:     deletedKey,
 		}), false, checkKey),
 	)
 }
 
-// secretFlags registers the scope flags, and --from-stdin when fromStdin,
+// scopeFlags registers the scope flags, and --from-stdin when fromStdin,
 // with what the command does to the scope in their help.
-func secretFlags(fromStdin bool, does string) func(fs *pflag.FlagSet) {
+func scopeFlags(fromStdin bool, does string) func(fs *pflag.FlagSet) {
 	return func(fs *pflag.FlagSet) {
 		fs.Bool("user", false, does+" your user scope (the scope without a flag)")
 		fs.String("org", "", does+" the organization with this slug or id")
@@ -90,50 +105,58 @@ func secretFlags(fromStdin bool, does string) func(fs *pflag.FlagSet) {
 	}
 }
 
-// withSecretArgs refuses, as usage errors with the other usage errors and
+// withScopeArgs refuses, as usage errors with the other usage errors and
 // before any setting is resolved or any request sent, an empty --org or
 // --workspace, which would name no scope; more than one scope flag unless
 // many; and arguments check refuses. A refused command line sends nothing,
 // so no part of it can reach a scope it did not mean.
-func withSecretArgs(cmd *cobra.Command, many bool, check func(cmd *cobra.Command, args []string) error) *cobra.Command {
-	checkLine := cmd.Args
-	cmd.Args = func(cmd *cobra.Command, args []string) error {
-		if err := checkLine(cmd, args); err != nil {
-			return err
-		}
+func withScopeArgs(cmd *cobra.Command, many bool, check cobra.PositionalArgs) *cobra.Command {
+	return withArgsCheck(cmd, func(cmd *cobra.Command, args []string) error {
 		fs := cmd.Flags()
 		for _, name := range []string{"org", "workspace"} {
 			if slug, _ := fs.GetString(name); fs.Changed(name) && slug == "" {
 				return usageError("%s needs a slug as the value of --%s", cmd.CommandPath(), name)
 			}
 		}
-		if !many && len(secretScopes(cmd)) > 1 {
+		if !many && len(scopesOf(cmd)) > 1 {
 			return usageError("%s takes at most one of --user, --org and --workspace", cmd.CommandPath())
 		}
 		if check != nil {
 			return check(cmd, args)
 		}
 		return nil
+	})
+}
+
+// withArgsCheck has cmd refuse, after the count of its arguments and its
+// required flags, what check refuses.
+func withArgsCheck(cmd *cobra.Command, check cobra.PositionalArgs) *cobra.Command {
+	checkLine := cmd.Args
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		return check(cmd, args)
 	}
 	return cmd
 }
 
-// secretScopes are the scopes the scope flags of cmd name, in the order
-// user, org, workspace, or the user's alone when none is given.
-func secretScopes(cmd *cobra.Command) []secretScope {
+// scopesOf are the scopes the scope flags of cmd name, in the order user,
+// org, workspace, or the user's alone when none is given.
+func scopesOf(cmd *cobra.Command) []scope {
 	fs := cmd.Flags()
-	var scopes []secretScope
+	var scopes []scope
 	if user, _ := fs.GetBool("user"); user {
-		scopes = append(scopes, secretScope{"user", "/user/secrets"})
+		scopes = append(scopes, scope{name: "user"})
 	}
 	if slug, _ := fs.GetString("org"); fs.Changed("org") {
-		scopes = append(scopes, secretScope{"org", "/orgs/" + pathSegment(slug) + "/secrets"})
+		scopes = append(scopes, scope{"org", slug})
 	}
 	if slug, _ := fs.GetString("workspace"); fs.Changed("workspace") {
-		scopes = append(scopes, secretScope{"workspace", "/workspaces/" + pathSegment(slug) + "/secrets"})
+		scopes = append(scopes, scope{"workspace", slug})
 	}
 	if len(scopes) == 0 {
-		scopes = append(scopes, secretScope{"user", "/user/secrets"})
+		scopes = append(scopes, scope{name: "user"})
 	}
 	return scopes
 }
@@ -149,17 +172,17 @@ func fromStdin(cmd *cobra.Command) bool {
 // value may hold = but not a comma. Key names are the hub's to judge. A
 // message names an entry by its position, never by its text, which may be
 // part of a value.
-func parseEntries(cmd *cobra.Command, args []string) ([]secretEntry, error) {
-	var entries []secretEntry
-	for i, entry := range strings.Split(strings.Join(args, ","), ",") {
-		key, value, ok := strings.Cut(entry, "=")
+func parseEntries(cmd *cobra.Command, args []string) ([]entry, error) {
+	var entries []entry
+	for i, word := range strings.Split(strings.Join(args, ","), ",") {
+		key, value, ok := strings.Cut(word, "=")
 		switch {
 		case !ok:
 			return nil, usageError("%s: entry %d has no =: give KEY=VALUE, or one KEY with --from-stdin", cmd.CommandPath(), i+1)
 		case key == "":
 			return nil, usageError("%s: entry %d has no key before =", cmd.CommandPath(), i+1)
 		}
-		entries = append(entries, secretEntry{Key: key, Value: value})
+		entries = append(entries, entry{Key: key, Value: value})
 	}
 	return entries, nil
 }
@@ -205,9 +228,9 @@ func checkKey(cmd *cobra.Command, args []string) error {
 }
 
 // entriesOf is the entries of the command line c runs, the arguments as
-// withSecretArgs accepted them, or with --from-stdin the one key with what
+// withScopeArgs accepted them, or with --from-stdin the one key with what
 // standard input holds, without one trailing line ending.
-func entriesOf(c *call) ([]secretEntry, error) {
+func entriesOf(c *call) ([]entry, error) {
 	args := c.cmd.Flags().Args()
 	if !fromStdin(c.cmd) {
 		return parseEntries(c.cmd, args)
@@ -220,15 +243,21 @@ func entriesOf(c *call) ([]secretEntry, error) {
 	if len(value) < len(data) {
 		value = strings.TrimSuffix(value, "\r")
 	}
-	return []secretEntry{{Key: args[0], Value: value}}, nil
+	return []entry{{Key: args[0], Value: value}}, nil
 }
 
-// createSecrets is the run step of parley secrets create. It sends the
-// entries to every scope given, going on after one fails, prints the items
-// of the scopes that succeeded and writes the error of each that failed to
-// stderr once. The last failure is returned, and run prints it, so each is
-// written once and the exit status is that failure's.
-func createSecrets(c *call) error {
+// createEntries is the run step of the create of collection,
+// createInScopes.
+func createEntries(collection string) func(c *call) error {
+	return func(c *call) error { return createInScopes(c, collection) }
+}
+
+// createInScopes sends the entries to collection in every scope given,
+// going on after one fails, prints the items of the scopes that succeeded
+// and writes the error of each that failed to stderr once. The last failure
+// is returned, and run prints it, so each is written once and the exit
+// status is that failure's.
+func createInScopes(c *call, collection string) error {
 	entries, err := entriesOf(c)
 	if err != nil {
 		return err
@@ -239,8 +268,8 @@ func createSecrets(c *call) error {
 	}
 	results := []result{}
 	var failures []error
-	for _, s := range secretScopes(c.cmd) {
-		items, err := createIn(c, s, entries)
+	for _, s := range scopesOf(c.cmd) {
+		items, err := createIn(c, s.path(collection), s.name, entries)
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -263,10 +292,10 @@ func createSecrets(c *call) error {
 	return failures[len(failures)-1]
 }
 
-// createIn sends entries to the secrets of scope s and returns the items
-// the hub answered.
-func createIn(c *call, s secretScope, entries []secretEntry) (json.RawMessage, error) {
-	resp, err := c.client.request(c.ctx, http.MethodPost, s.path, nil, map[string]any{"entries": entries})
+// createIn sends entries to the collection at path, of the scope named
+// name, and returns the items the hub answered.
+func createIn(c *call, path, name string, entries []entry) (json.RawMessage, error) {
+	resp, err := c.client.request(c.ctx, http.MethodPost, path, nil, map[string]any{"entries": entries})
 	if err != nil {
 		return nil, err
 	}
@@ -274,15 +303,15 @@ func createIn(c *call, s secretScope, entries []secretEntry) (json.RawMessage, e
 		Items json.RawMessage `json:"items"`
 	}
 	if json.Unmarshal(resp.body, &answer) != nil || answer.Items == nil {
-		return nil, clientError("the hub answered %d to the create in the %s scope without items", resp.status, s.name)
+		return nil, clientError("the hub answered %d to the create in the %s scope without items", resp.status, name)
 	}
 	return answer.Items, nil
 }
 
-// listSecrets is the run step of parley secrets list: every page of the
-// scope's secrets as one document.
-func listSecrets(c *call) error {
-	return printWholeList(c, secretScopes(c.cmd)[0].path)
+// listEntries is the run step of the list of collection: every page of the
+// scope's entries as one document.
+func listEntries(collection string) func(c *call) error {
+	return func(c *call) error { return printWholeList(c, scopesOf(c.cmd)[0].path(collection)) }
 }
 
 // printWholeList reads every page of the list at path, the largest pages the
@@ -321,34 +350,43 @@ func printWholeList(c *call, path string) error {
 	return c.printResult(doc)
 }
 
-// keyPath is the route of the secret key in the scope the flags of c name,
-// the key encoded as one path segment.
-func keyPath(c *call, key string) string {
-	return secretScopes(c.cmd)[0].path + "/" + pathSegment(key)
+// keyPath is the route of the key in collection of the scope the flags of c
+// name, the key encoded as one path segment.
+func keyPath(c *call, collection, key string) string {
+	return scopesOf(c.cmd)[0].path(collection) + "/" + pathSegment(key)
 }
 
-// updateSecret is the run step of parley secrets update: the new value to
-// the secret's route, and the hub's answer, the entry without a value.
-func updateSecret(c *call) error {
-	entries, err := entriesOf(c)
-	if err != nil {
-		return err
+// updateEntry is the run step of the update of collection: the new value to
+// the key's route, and the hub's answer, the entry (a secret's without its
+// value).
+func updateEntry(collection string) func(c *call) error {
+	return func(c *call) error {
+		entries, err := entriesOf(c)
+		if err != nil {
+			return err
+		}
+		e := entries[0]
+		resp, err := c.client.request(c.ctx, http.MethodPatch, keyPath(c, collection, e.Key), nil, map[string]string{"value": e.Value})
+		if err != nil {
+			return err
+		}
+		return c.printAnswer(resp)
 	}
-	e := entries[0]
-	resp, err := c.client.request(c.ctx, http.MethodPatch, keyPath(c, e.Key), nil, map[string]string{"value": e.Value})
-	if err != nil {
-		return err
-	}
-	return c.printAnswer(resp)
 }
 
-// deleteSecret is the run step of parley secrets delete. The hub answers no
-// body, so the command prints its confirmation, {"deleted":"<KEY>"} with the
-// key as typed.
-func deleteSecret(c *call) error {
-	resp, err := c.client.request(c.ctx, http.MethodDelete, keyPath(c, c.args["KEY"]), nil, nil)
-	if err != nil {
-		return err
+// deleteEntry is the run step of the delete of collection. The hub answers
+// no body, so the command prints its confirmation, {"deleted":"<KEY>"} with
+// the key as typed.
+func deleteEntry(collection string) func(c *call) error {
+	return func(c *call) error {
+		resp, err := c.client.request(c.ctx, http.MethodDelete, keyPath(c, collection, c.args["KEY"]), nil, nil)
+		if err != nil {
+			return err
+		}
+		return c.printAnswer(resp)
 	}
-	return c.printAnswer(resp)
 }
+
+// deletedKey is the confirmation of a delete: the key as typed, since the
+// hub answers no body.
+func deletedKey(c *call) any { return map[string]string{"deleted": c.args["KEY"]} }

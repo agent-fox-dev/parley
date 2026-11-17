@@ -394,6 +394,7 @@ Available Commands:
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   tokens            Create, read, change and revoke your personal access tokens
   user              Read and update your own profile
+  vars              Create, list, update, delete and resolve variables
   version           Print the client's build and, given a hub URL, the hub's build
   workspace         Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub
 
@@ -1493,6 +1494,68 @@ or `delete` (`parley secrets list takes at most one of --user, --org and
 --workspace`); and `--org` or `--workspace` with an empty value
 (`parley secrets list needs a slug as the value of --org`). A message names
 an entry by its position, never by its text, which may hold a value.
+
+### `parley vars`
+
+These commands call the [variable routes](api.md#variables) of the hub with
+the credential as `Authorization: Bearer`. Unlike a secret's, a variable's
+value is shown. `parley vars` run without a command prints its help and
+exits `0`; it reads no credential and sends no request.
+
+| Command | Request | Prints |
+|---|---|---|
+| `parley vars create <KEY=VALUE[,KEY=VALUE…]>…` | `POST /api/v1/<scope>/vars` with `{"entries":[{"key","value"},…]}`, once per scope flag | `{"results":[{"scope","items"},…]}` |
+| `parley vars create <KEY> --from-stdin` | the same, with the one entry `KEY` and the value read from stdin | the same |
+| `parley vars list` | `GET /api/v1/<scope>/vars?limit=200`, then every following page | `{"items":[…]}` |
+| `parley vars update <KEY=VALUE>` | `PATCH /api/v1/<scope>/vars/<KEY>` with `{"value"}` | the hub's answer, the variable |
+| `parley vars update <KEY> --from-stdin` | the same, with the value read from stdin | the same |
+| `parley vars delete <KEY>` | `DELETE /api/v1/<scope>/vars/<KEY>` | `{"deleted":"<KEY>"}` |
+| `parley vars resolve <WORKSPACE>` | `GET /api/v1/workspaces/<WORKSPACE>/vars/resolved?limit=200`, then every following page | `{"items":[…]}`, each item with its `origin` |
+
+The scope flags `--user`, `--org <slug>` and `--workspace <slug>` choose
+`<scope>` as for [`parley secrets`](#parley-secrets): the user's scope when
+no flag is given; `list`, `update` and `delete` take at most one; `create`
+sends one request per scope in the order `user`, `org`, `workspace`.
+`resolve` takes no scope flag. Entries, `--from-stdin`, the percent-encoding
+of the slug and `<KEY>`, and the usage errors are those of `parley secrets`,
+with `parley vars` in the messages (`parley vars list takes at most one of
+--user, --org and --workspace`, `parley vars resolve needs the argument
+<WORKSPACE>`).
+
+```
+parley vars create LOG_LEVEL=info,REGION=eu --org acme --workspace acme-api
+```
+
+**create** prints the hub's `items` of every scope that succeeded, values
+included, in the order `user`, `org`, `workspace`, and `{"results":[]}`
+when none did; each failed scope's error is written to stderr once, as
+received. The exit status is `0` when every scope succeeded and otherwise
+that of the last failure: `1` for an error the hub answered, `2` for a
+failure on the client's side such as a hub that cannot be reached.
+
+**list** and **resolve** read the whole list, pages of 200 followed to the
+last, and print the items of every page as one document without
+`next_cursor`:
+
+```json
+{
+  "items": [
+    {
+      "key": "LOG_LEVEL",
+      "value": "info",
+      "origin": "org",
+      "created_at": "2026-11-17T10:30:15Z",
+      "updated_at": "2026-11-17T10:30:15Z"
+    }
+  ]
+}
+```
+
+**update** prints the hub's answer, the variable with its value; **delete**
+prints `{"deleted":"<KEY>"}` with the key as it was typed. An error the hub
+answers to `list`, `update`, `delete` or `resolve`, on any page, is written
+to stderr as received, nothing is written to stdout, and the exit status is
+`1`.
 
 ### `parley workspace`
 

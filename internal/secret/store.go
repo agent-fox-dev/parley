@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -86,6 +88,18 @@ type Deps struct {
 	Scrubber *scrub.Scrubber
 	// Events writes the events of the secret routes.
 	Events Emitter
+	// Records reads the workspace records a chain is built from.
+	Records access.RecordReader
+	// Memberships answers the active orgs of a workspace's owner, of which
+	// the chain's org step needs the workspace's.
+	Memberships access.Memberships
+	// UserExists reports whether a user exists; a chain has no user step
+	// for an owner who does not.
+	UserExists func(ctx context.Context, userID string) (bool, error)
+	// CanWrite reports whether a user, who need not be the one asking, has
+	// write access to a workspace: a fork's secret resolution searches its
+	// parent's scope only while the fork's owner has.
+	CanWrite func(ctx context.Context, userID, slug string) (bool, error)
 }
 
 // Component is the one place the hub reads, stores and removes secrets, so
@@ -100,6 +114,13 @@ type Component struct {
 	// converters re-seal the values other parts keep outside the secret
 	// table when the maintenance pass re-encrypts after a rotation.
 	converters []Converter
+	// readVars, when set, reads the variables of one scope for a
+	// resolution in place of the store, so that a test can make the read
+	// of one scope fail.
+	readVars atomic.Pointer[varReader]
+	// readSecret, when set, reads the secrets of a resolution in place of
+	// Get, so that a test can see every read.
+	readSecret atomic.Pointer[secretReader]
 }
 
 // New returns a component bound to d.
@@ -281,19 +302,8 @@ func removeScope(ctx context.Context, tx *sql.Tx, scope Scope, scopeID string) e
 // holds, and then an error matching ErrConflict whose message names the
 // first key, as given, that the scope already holds ignoring ASCII case.
 func (c *Component) CreateEntries(ctx context.Context, tx *sql.Tx, scope Scope, scopeID string, entries []Entry) ([]Item, error) {
-	seen := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		if err := CheckKey(e.Key); err != nil {
-			return nil, err
-		}
-		if err := CheckValue(e.Key, e.Value); err != nil {
-			return nil, err
-		}
-		lower := asciiLower(e.Key)
-		if seen[lower] {
-			return nil, invalid("key %q is given more than once", e.Key)
-		}
-		seen[lower] = true
+	if err := checkEntries(entries); err != nil {
+		return nil, err
 	}
 	if !c.Available() {
 		return nil, ErrUnavailable
@@ -307,7 +317,7 @@ func (c *Component) CreateEntries(ctx context.Context, tx *sql.Tx, scope Scope, 
 	}
 	for _, e := range entries {
 		if _, err := find(ctx, tx, scope, scopeID, e.Key); err == nil {
-			return nil, &keyError{kind: ErrConflict, msg: fmt.Sprintf("key %q already exists", e.Key)}
+			return nil, conflict(e.Key)
 		} else if !errors.Is(err, ErrNotFound) {
 			return nil, err
 		}
@@ -321,6 +331,27 @@ func (c *Component) CreateEntries(ctx context.Context, tx *sql.Tx, scope Scope, 
 		items[i] = Item{Key: e.Key, CreatedAt: now, UpdatedAt: now}
 	}
 	return items, nil
+}
+
+// checkEntries returns an error matching ErrInvalid, naming the key, for the
+// first entry whose key or value is outside the limits, and then for the
+// first key given twice ignoring ASCII case.
+func checkEntries(entries []Entry) error {
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if err := CheckKey(e.Key); err != nil {
+			return err
+		}
+		if err := CheckValue(e.Key, e.Value); err != nil {
+			return err
+		}
+		lower := asciiLower(e.Key)
+		if seen[lower] {
+			return invalid("key %q is given more than once", e.Key)
+		}
+		seen[lower] = true
+	}
+	return nil
 }
 
 // UpdateEntry seals a new value for the entry whose key matches name ignoring
@@ -461,6 +492,11 @@ func count(ctx context.Context, q querier, scope Scope, scopeID string) (int, er
 		return 0, fmt.Errorf("count secrets: %w", err)
 	}
 	return n, nil
+}
+
+// conflict is the error for a created key the scope already holds.
+func conflict(key string) error {
+	return &keyError{kind: ErrConflict, msg: fmt.Sprintf("key %q already exists", key)}
 }
 
 func notFound(name string) error {

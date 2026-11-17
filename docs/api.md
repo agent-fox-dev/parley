@@ -2360,7 +2360,7 @@ were deleted makes the delete answer `409` `workspace_busy` with nothing
 changed, so it can be repeated. Then, in one store transaction,
 the forks are removed in ascending slug order and then the workspace: for
 each, the tokens bound to it are revoked, the data other features keep
-for it (its secrets among them) is removed, its remaining agent sessions
+for it (its secrets and [variables](#variables) among them) is removed, its remaining agent sessions
 are ended with the reason `workspace deleted`, its record is removed with
 its settings, and one `parley.workspace.delete` event is written, the
 workspace's last. When anything in that transaction fails, nothing has
@@ -2408,12 +2408,12 @@ its parent and the admin token have write access to it. First the fork's
 sandboxes are deleted, without a checkpoint; when that fails the answer is
 `500 internal` and nothing else has changed. Then, in one store
 transaction, the tokens bound to the fork are revoked, the data other
-features keep for it (its secrets among them) is removed, its remaining
+features keep for it (its secrets and [variables](#variables) among them) is removed, its remaining
 agent sessions are ended with the reason `workspace deleted`, its record
 is removed and one `parley.workspace.delete` event is written. When
 anything in that transaction fails, nothing has changed: the fork still
 answers `GET` with its `expires_at`, its tokens still authenticate, its
-secrets and its own branches are still there. Once it has committed the
+secrets, its variables and its own branches are still there. Once it has committed the
 fork's repository, with its own branches, is removed from disk; the
 parent's branches are never touched. A repository that cannot be removed
 is logged and kept for a later removal, and the answer stays `204`. A fork
@@ -7205,7 +7205,7 @@ the delete run in one write transaction, like a demotion's (see
 [Role and status of a user](#role-and-status-of-a-user)).
 
 Data that other parts of the hub keep for the user, the user's
-[secrets](#secrets) among them, is removed in the same
+[secrets](#secrets) and [variables](#variables) among them, is removed in the same
 transaction, before the user (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
 When that removal fails, the delete is undone as a whole, and the answer is
 `500` `internal`.
@@ -7480,7 +7480,7 @@ former members' [`GET /api/v1/user/orgs`](#get-apiv1userorgs), and a new
 org may take its name and its slug.
 
 Data that other parts of the hub keep for the org, the org's
-[secrets](#secrets) among them, is removed in the same
+[secrets](#secrets) and [variables](#variables) among them, is removed in the same
 transaction (see [ADR 03](adr/03-register-removers-of-owned-data-on-the-identity-service.md)).
 When that removal fails, the delete is undone as a whole, and the answer is
 `500` `internal`.
@@ -7679,6 +7679,212 @@ secret stays and the answer is `500`. A removed key can be created again.
 | `403` `insufficient_scope` | a PAT without `secrets:write` (`this route needs the scope secrets:write`) |
 | `403` `forbidden` | as for the list (see above) |
 | `404` `not_found` | as for the update (see above) |
+
+## Variables
+
+A variable is a named value that is readable through the API. Each
+variable belongs to one of three scopes, each with its own routes:
+
+| Scope | Routes | Owner |
+|---|---|---|
+| user | `/api/v1/user/vars` | the caller's user |
+| org | `/api/v1/orgs/{slug}/vars` | the org `{slug}` names, by its slug or its id (see [Org selectors](#org-selectors)) |
+| workspace | `/api/v1/workspaces/{slug}/vars` | the workspace `{slug}`, and no other: a task fork's own variables are not its parent's |
+
+Variables are stored in the clear and apart from [secrets](#secrets): a key
+may name a secret and a variable in the same scope, the 100 entries of a
+scope are counted for each apart, and every variable route works on a hub
+without an encryption key. A PAT needs `vars:read` for a list and for the
+[resolved](#get-apiv1workspacesslugvarsresolved) variables, which `vars:write`
+satisfies, and `vars:write` for a change. The user and org scopes answer
+exactly as the [secret](#secrets) routes do: the admin token is refused on
+`/user/vars` (`403` `forbidden`, `user-scoped endpoints require a user
+credential`), and one `404` `not_found` body (`org not found`) answers an org
+that does not exist, one the user is not a member of and a blocked one,
+while the admin token reaches every org. On a workspace the lists and the
+resolved variables need `read` and the changes need `write` (see
+[Workspace access](#workspace-access)): the owner and the admin token read
+and change, a member of the workspace's org reads, and a member's change is
+`403` `forbidden` with the message `org members have read-only access to
+this workspace`; anyone else gets the `404` `workspace not found` of a slug
+with no workspace. The workspace's status and a maintenance operation play
+no part. A workspace-bound PAT is confined by the binding guard first (see
+[Workspace-bound tokens](#workspace-bound-tokens)).
+
+No route reads one variable by key: `GET` on `…/vars/{key}` is `405`
+`method_not_allowed` with `Allow: DELETE, PATCH`. Under
+`/api/v1/workspaces/{slug}/vars/` the segment `resolved` names the resolved
+variables: `PATCH` and `DELETE` on it are `405` `method_not_allowed` with
+`Allow: GET`, before authentication and every other check but the rate
+limit and the body limit, and never reach a variable. A variable stored
+under the key `resolved` is reached under another casing, such as
+`…/vars/RESOLVED`.
+
+The variables of a user go with the user's deletion
+([`DELETE /api/v1/users/{id}`](#delete-apiv1usersid)), those of an org with
+the org's ([`DELETE /api/v1/orgs/{id}`](#delete-apiv1orgsid)), and those of a
+workspace or a task fork with its deletion or expiry, in the transaction of
+the delete and without a `parley.variable.delete` event; a delete that is
+refused or undone keeps them, and a workspace created again under the slug
+starts with none.
+
+Every create, update and delete writes, in the transaction of the change,
+one event per variable it changes: `parley.variable.create`,
+`parley.variable.update` or `parley.variable.delete`, with `resource_type`
+`variable`, `resource_id` the key as it is stored, `metadata` exactly
+`{"scope","scope_id","key"}` (`scope_id` the user id, the org id or the
+workspace slug), `workspace` the slug on the workspace routes and `null`
+otherwise, and the caller as the actor. No event holds a value. If the event
+cannot be written, nothing changes and the answer is `500` `internal`. A
+refused request and a replayed create write none.
+
+## `GET /api/v1/user/vars`, `GET /api/v1/orgs/{slug}/vars`, `GET /api/v1/workspaces/{slug}/vars`
+
+Lists the variables of the scope, with their values, a [list](#lists) in the
+standard pages. Who may call each route is in [Variables](#variables).
+
+The list holds the scope's own variables, a task fork's without its
+parent's, ordered by `key` ascending, compared byte by byte with `A` to `Z`
+lowered. Each item has exactly `key`, as it was first stored, `value`,
+`created_at` and `updated_at`, RFC 3339 in UTC with whole seconds. An empty
+scope gets `items` `[]`.
+
+```json
+{"items":[{"key":"LOG_LEVEL","value":"info","created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z"}],"next_cursor":null}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page: `items` are variables as above |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT without `vars:read` or `vars:write` (`this route needs the scope vars:read`) |
+| `403` `forbidden` | the admin token on `/user/vars` (`user-scoped endpoints require a user credential`) |
+| `404` `not_found` | an org the caller may not reach or that does not exist (`org not found`); a workspace the caller has no level on or that does not exist (`workspace not found`) |
+
+## `POST /api/v1/user/vars`, `POST /api/v1/orgs/{slug}/vars`, `POST /api/v1/workspaces/{slug}/vars`
+
+Creates variables in the scope, all of them or none. Who may call each route
+is in [Variables](#variables). It is a create route (see
+[Idempotency](#idempotency)).
+
+The body is a JSON object with `entries`, an array of at least one object
+with `key` and `value`, held to the rules of a
+[secret](#post-apiv1usersecrets-post-apiv1orgsslugsecrets-post-apiv1workspacesslugsecrets)'s
+entries: a `key` of 1 to 255 ASCII letters, digits and `_`, not beginning
+with a digit, stored as given; a `value` string of at most 262144 bytes,
+absent the empty string.
+
+```json
+{"entries":[{"key":"LOG_LEVEL","value":"info"},{"key":"REGION","value":"eu"}]}
+```
+
+The body is checked in this order, and the first fault is answered:
+`entries` is a non-empty array; every entry's key, in request order; every
+entry's value, in request order; then no two keys are equal ignoring the
+case of `A` to `Z`. So a request whose first entry has a bad value and whose
+second a bad key is answered naming the second's key (a secret create
+checks entry by entry instead). Then, in one
+transaction: when the scope's variables and the entries together would be
+more than 100, `429`, also when a key already exists; otherwise, when the
+scope already holds a key equal to one of the entries ignoring case, `409`
+naming the first such key in request order, as the request spells it.
+Otherwise every entry is stored with one creation time, and one
+`parley.variable.create` event is written per entry, in request order. Of
+two creates of one key at the same time, one is answered `201` and the
+other `409`.
+
+The answer holds the entries in request order: exactly `key`, `value`,
+`created_at` and `updated_at`, the times equal and the same for every item.
+
+```json
+{"items":[{"key":"LOG_LEVEL","value":"info","created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z"},{"key":"REGION","value":"eu","created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z"}]}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | every entry was stored; the body is `items` as above |
+| `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer; nothing is stored |
+| `400` `invalid_request` | the body is refused, with the messages of a secret create (such as `key "1A" must not begin with a digit` or `the value of key "K" is longer than 262144 bytes`); nothing is stored |
+| `403` `insufficient_scope` | a PAT without `vars:write` (`this route needs the scope vars:write`) |
+| `403` `forbidden` | the admin token on `/user/vars`; a member of the workspace's org on `/workspaces/{slug}/vars` (`org members have read-only access to this workspace`) |
+| `404` `not_found` | as for the list (see above) |
+| `409` `conflict` | the scope holds one of the keys, ignoring case (`key "TOKEN" already exists`); nothing is stored |
+| `413` `payload_too_large` | the body is over the hub's body limit (see [Request bodies](#request-bodies)) |
+| `429` `secret_limit_reached` | the scope would hold more than 100 variables (`maximum of 100 entries per scope exceeded`); nothing is stored |
+
+## `PATCH /api/v1/user/vars/{key}`, `PATCH /api/v1/orgs/{slug}/vars/{key}`, `PATCH /api/v1/workspaces/{slug}/vars/{key}`
+
+Replaces the value of the scope's variable whose key equals `{key}` ignoring
+the case of `A` to `Z`. Who may call each route is in
+[Variables](#variables). The body is a JSON object with `value`, a string of
+at most 262144 bytes, the empty string included; it is checked before the
+variable is looked up. The key keeps the casing it was first stored with
+and its `created_at`; `updated_at` is the time of the update. One
+`parley.variable.update` event is written, naming the key as it is stored.
+
+```json
+{"key":"LOG_LEVEL","value":"debug","created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:31:45Z"}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the value was replaced; the body is the variable as above |
+| `400` `invalid_request` | `value` is absent, `null`, not a string (`the value of key "K" must be a string`) or longer than 262144 bytes (`the value of key "K" is longer than 262144 bytes`), `K` the key as the path gives it, whether or not the scope holds it. Nothing changes |
+| `403` `insufficient_scope` | a PAT without `vars:write` (`this route needs the scope vars:write`) |
+| `403` `forbidden` | as for the create (see above) |
+| `404` `not_found` | as for the list (see above); or the scope holds no such variable (`key "K" not found`, `K` as the path gives it). A key held only by another scope, a task fork's parent included, or only as a secret is not found |
+
+## `DELETE /api/v1/user/vars/{key}`, `DELETE /api/v1/orgs/{slug}/vars/{key}`, `DELETE /api/v1/workspaces/{slug}/vars/{key}`
+
+Removes the scope's variable whose key equals `{key}` ignoring the case of
+`A` to `Z`, and writes one `parley.variable.delete` event naming the key as
+it was stored. Who may call each route is in [Variables](#variables). A
+removed key can be created again.
+
+| Status | When |
+|---|---|
+| `204 No Content` | the variable was removed; the body is empty |
+| `403` `insufficient_scope` | a PAT without `vars:write` (`this route needs the scope vars:write`) |
+| `403` `forbidden` | as for the create (see above) |
+| `404` `not_found` | as for the update (see above) |
+
+## `GET /api/v1/workspaces/{slug}/vars/resolved`
+
+The variables the workspace or task fork `{slug}` runs with, a [list](#lists)
+in the standard pages. It needs `read` on `{slug}` alone, and for a PAT
+`vars:read` or `vars:write` (see [Variables](#variables)); it needs no access
+to the other scopes it reads.
+
+The workspace's chain of scopes is worked out at every request from its
+record, never from the caller, so every caller gets the same answer. Highest
+priority first:
+
+| `origin` | Scope | When |
+|---|---|---|
+| `workspace` | the workspace's own | always |
+| `parent` | the parent's workspace scope | a task fork whose parent still exists |
+| `org` | the org of the workspace (of a fork, its parent's) | while the workspace's owner is a member of it and it is `active` |
+| `user` | the user scope of the workspace's owner (of a fork, its creator) | while the owner exists |
+
+For each key, compared ignoring the case of `A` to `Z`, the variable of the
+first scope that holds it is answered whole, with its key casing, value and
+times and that scope's `origin`; the items are ordered by key as on every
+variable list. Deleting a fork's own variable shows its parent's again at
+the next read. The chain is worked out first; the variables of all its
+scopes are then read in one consistent read.
+
+```json
+{"items":[{"key":"LOG_LEVEL","value":"info","origin":"org","created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z"},{"key":"REGION","value":"eu","origin":"parent","created_at":"2026-11-17T10:32:00Z","updated_at":"2026-11-17T10:32:00Z"}],"next_cursor":null}
+```
+
+| Status | When |
+|---|---|
+| `200 OK` | the body is a page of the merged variables, each with `origin` |
+| `400` `invalid_request` | a bad `limit` or `cursor` (see [Lists](#lists)) |
+| `403` `insufficient_scope` | a PAT without `vars:read` or `vars:write` |
+| `404` `not_found` | a workspace the caller has no level on or that does not exist (`workspace not found`) |
+| `405` `method_not_allowed` | `PATCH` or `DELETE` on this path (`Allow: GET`) |
+| `500` `internal` | a scope could not be read (`internal error`); no items are answered |
 
 ## `GET /api/v1/events`
 

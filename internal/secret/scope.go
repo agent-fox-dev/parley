@@ -134,9 +134,9 @@ func (c *Component) resolveOrg(r *http.Request) (target, error) {
 
 // resolveWorkspace gives the scope of the workspace the path's slug names.
 // The workspace access check, which runs before the scope check on a route
-// that needs owner, has decided already: it answers a member 403 and
-// everyone else without access 404 workspace not found. The workspace's
-// status plays no part.
+// marked with the need it has, has decided already: on a change it answers
+// a member 403 and everyone else without access 404 workspace not found.
+// The workspace's status plays no part.
 func resolveWorkspace(r *http.Request) (target, error) {
 	if _, ok := access.DecisionOf(r); !ok {
 		return target{}, errors.New("a workspace secret route was reached without a workspace access decision")
