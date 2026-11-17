@@ -140,6 +140,47 @@ func TestRun_StartsAQueuedJobWithinFiveSeconds(t *testing.T) {
 	}
 }
 
+func TestRun_ClaimsAJobWhoseWakeCameBeforeItsTransactionCommitted(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	st := openStore(t, t.TempDir())
+	// The clock's timers fire only when the test advances it, which it
+	// never does: the wake of the enqueue is the one way to a pass.
+	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	q := New(Deps{Store: st, Clock: clock})
+	h := newScriptedHandler(false)
+	q.Register("probe", h)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		q.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		waitClosed(t, stopped, "the dispatcher's stop")
+		q.settleAll(t)
+	}()
+	clock.WaitTimers(t, 1) // the first pass is over; the dispatcher waits
+
+	var j Job
+	err := st.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if j, err = q.Enqueue(ctx, tx, "probe", "w", json.RawMessage(`{}`)); err != nil {
+			return err
+		}
+		// A route enqueues inside its own transaction and commits later:
+		// leave the woken dispatcher the time to look before the commit.
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if got := h.Enter(t); got.ID != j.ID {
+		t.Errorf("handler got job %s, want %s", got.ID, j.ID)
+	}
+}
+
 func TestPass_RunsAtMostFourJobsAtOnce(t *testing.T) {
 	t.Parallel()
 	q := newTestQueue(t)

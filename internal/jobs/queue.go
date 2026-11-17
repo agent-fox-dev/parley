@@ -215,6 +215,13 @@ type claim struct {
 // nothing to do opens no write transaction, and a pass of a stopping queue
 // does nothing.
 func (q *Queue) Pass(ctx context.Context) error {
+	return q.pass(ctx, false)
+}
+
+// pass is Pass. A woken pass skips the look for work outside a transaction:
+// the wake may come from a transaction that is still open, whose job only
+// the write transaction, which waits for it to end, can see.
+func (q *Queue) pass(ctx context.Context, woken bool) error {
 	d, err := q.deps()
 	if err != nil {
 		return err
@@ -229,9 +236,11 @@ func (q *Queue) Pass(ctx context.Context) error {
 	if !room {
 		types = nil
 	}
-	work, err := hasWork(ctx, d.Store.Main(), d.Clock.Now(), types)
-	if err != nil || !work {
-		return err
+	if !woken {
+		work, err := hasWork(ctx, d.Store.Main(), d.Clock.Now(), types)
+		if err != nil || !work {
+			return err
+		}
 	}
 
 	// An attempt outlives the pass that started it: the queue cancels it,
@@ -359,10 +368,12 @@ func (q *Queue) Run(ctx context.Context) {
 	q.mu.Lock()
 	wake := q.wake
 	q.mu.Unlock()
+	woken := false
 	for {
-		if err := q.Pass(ctx); err != nil && ctx.Err() == nil {
+		if err := q.pass(ctx, woken); err != nil && ctx.Err() == nil {
 			d.Logger.Error("job dispatcher pass", "error", err)
 		}
+		woken = false
 		t := d.Clock.NewTimer(d.Interval)
 		select {
 		case <-ctx.Done():
@@ -372,6 +383,7 @@ func (q *Queue) Run(ctx context.Context) {
 		case <-t.C():
 		case <-wake:
 			t.Stop()
+			woken = true
 		}
 	}
 }

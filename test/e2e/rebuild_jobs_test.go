@@ -82,28 +82,40 @@ func (h *rebuildHub) waitRebuild(t *testing.T, path string, fn func(rebuildAnswe
 }
 
 // stepWhile is a condition of waitRebuild that holds once the first job
-// the answer holds, the job or the first of a list, has a status other
-// than status, and that moves the job queue's clock on by a second each
-// time it does not. Each step fires the dispatcher's timer for its next
-// pass, whether or not the dispatcher had armed it when the step before
-// moved the clock. A job is not left to the wake its enqueue gives: that
-// wake can come while the enqueuing request's transaction is still open,
-// and the pass it starts then finds no job.
+// the answer holds has a status other than status, and that moves the job
+// queue's clock on by a second each time it does not. Each step fires the
+// dispatcher's timer for its next pass, whether or not the dispatcher had
+// armed it when the step before moved the clock.
 func (h *rebuildHub) stepWhile(status string) func(rebuildAnswer) bool {
 	return func(r rebuildAnswer) bool {
-		job := r.record
-		if r.Items != nil {
-			if len(r.Items) == 0 {
-				return false
-			}
-			job = r.Items[0]
-		}
-		if job["status"] == status {
+		job, ok := firstJob(r)
+		if ok && job["status"] == status {
 			h.jobsClock.advance(time.Second)
 			return false
 		}
-		return true
+		return ok
 	}
+}
+
+// leaves is a condition of waitRebuild that holds once the first job the
+// answer holds has a status other than status. It moves no clock: the job
+// queue's own wakes must get the job past status.
+func leaves(status string) func(rebuildAnswer) bool {
+	return func(r rebuildAnswer) bool {
+		job, ok := firstJob(r)
+		return ok && job["status"] != status
+	}
+}
+
+// firstJob is the job an answer holds: the job, or the first of a list.
+func firstJob(r rebuildAnswer) (map[string]any, bool) {
+	if r.Items != nil {
+		if len(r.Items) == 0 {
+			return nil, false
+		}
+		return r.Items[0], true
+	}
+	return r.record, r.record != nil
 }
 
 // rebuildAnswer is an answer of a rebuild route: a job's record, a list of
@@ -379,9 +391,9 @@ func TestRebuildJobs_SubmitAndWaitThroughARetry(t *testing.T) {
 		args := []string{"--endpoint-url", h.URL(""), "--api-key", h.key, "rebuild", "submit", "carry", "--wait", "--poll-interval", "1s"}
 		exited <- cli.Run(context.Background(), args, &stdout, stderr)
 	}()
-	// The queued job is claimed on a pass of the dispatcher, which the
-	// queue's clock times.
-	claimed := h.stepWhile("queued")
+	// The enqueue wakes the dispatcher, which claims the job without the
+	// queue's clock moving.
+	claimed := leaves("queued")
 	h.waitRebuild(t, "/rebuilds", func(r rebuildAnswer) bool {
 		select {
 		case code := <-exited:
@@ -484,7 +496,7 @@ func TestRebuildJobs_ARunningRebuildSurvivesARestart(t *testing.T) {
 	if post.status != http.StatusAccepted || id == "" {
 		t.Fatalf("POST rebuild = %d %s, want 202 with a job", post.status, post.raw)
 	}
-	h.waitRebuild(t, "/rebuilds/"+id, h.stepWhile("queued"))
+	h.waitRebuild(t, "/rebuilds/"+id, leaves("queued"))
 	waitClosed(t, started, "the first attempt")
 	if r := h.rebuildCall(t, http.MethodGet, "/rebuilds/"+id); r.record["status"] != "running" {
 		t.Fatalf("GET the job = %d %s, want running", r.status, r.raw)
