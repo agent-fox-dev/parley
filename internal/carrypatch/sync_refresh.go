@@ -3,6 +3,7 @@ package carrypatch
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -99,8 +100,9 @@ func (st refreshStep) entry() syncEntry {
 // patch branch is moved only by a compare-and-swap against the tip
 // compared, whether or not protected_branches lists it: the refresh is a
 // sync from origin, which a protected branch admits, so no push rule is
-// asked. The first failure stops the refresh with an error naming the
-// branch; what was done before it stays.
+// asked. The first failure of a patch, a lost swap included, stops the
+// refresh there with an error naming the branch, without a retry and
+// without taking up a later patch; what was done before it stays.
 func (s *syncPass) refreshFromOrigin(ctx context.Context) error {
 	w := s.run.Workspace
 	if !s.c.fromOrigin(w) {
@@ -222,6 +224,10 @@ func (s *syncPass) applyRefresh(ctx context.Context, st refreshStep) (bool, erro
 			// The commit failed after the branch moved: nothing records
 			// the move, so it is taken back.
 			s.c.undoMove(ctx, s.repo, slug, branch, st.local, st.origin)
+		}
+		if errors.Is(err, gitrepo.ErrRefMoved) {
+			// Not retried: the next sync compares the branch again.
+			return false, fmt.Errorf("refresh the patch branch %q from origin: it moved in the hub between the comparison and the swap; sync again: %w", branch, err)
 		}
 		return false, fmt.Errorf("refresh the patch branch %q from origin: %w", branch, err)
 	}

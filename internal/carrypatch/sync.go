@@ -84,14 +84,17 @@ func (c *Component) syncBase(ctx context.Context, w workspace.Workspace) (string
 // upstream base as the upstream_head_sha to record when upstream advanced.
 // Its error stops the sync before the completion is recorded, so that the
 // next sync sees the same upstream movement again and repeats what this one
-// did not finish.
+// did not finish; a refresh that stops part way still queues the rebuild
+// its moves call for, and runs no merge detection.
 func (c *Component) BeforeCompletion(ctx context.Context, run workspace.SyncRun, _ []workspace.BranchResult) (workspace.SyncAddition, error) {
 	if c.d.RepoPath == nil {
 		return workspace.SyncAddition{}, errNotBound
 	}
 	s, err := c.startSyncPass(ctx, run)
 	if err == nil {
-		err = s.refreshFromOrigin(ctx)
+		if err = s.refreshFromOrigin(ctx); err != nil {
+			s.rebuildAfterFailedRefresh(ctx)
+		}
 	}
 	if err == nil {
 		err = s.detectMerges(ctx)
@@ -225,6 +228,24 @@ func (s *syncPass) triggerRebuild(ctx context.Context) error {
 		return nil
 	}
 	return s.queueRebuild(ctx)
+}
+
+// rebuildAfterFailedRefresh queues the rebuild of the integration branch,
+// with the same duplicate skip, after an origin refresh that stopped part
+// way when the refresh had already created or moved the branch of an
+// active or conflict patch and auto_rebuild_after_sync is on. Those moves
+// stay, and a rebuild must take them in even though the sync fails;
+// upstream's movement does not count, since the failed sync records no
+// upstream head and the next sync sees it again. A failed enqueue is only
+// logged: the sync answers the refresh's failure.
+func (s *syncPass) rebuildAfterFailedRefresh(ctx context.Context) {
+	if !s.movedApplicable() || !s.c.autoRebuildAfterSync(ctx, s.run.Workspace) {
+		return
+	}
+	if err := s.queueRebuild(ctx); err != nil {
+		s.c.logger().Warn("carry-patch sync could not queue the rebuild after a failed origin refresh",
+			"slug", s.run.Workspace.Slug, "error", err.Error())
+	}
 }
 
 // movedApplicable reports whether the origin refresh created or moved the

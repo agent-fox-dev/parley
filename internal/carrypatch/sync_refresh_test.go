@@ -1,6 +1,7 @@
 package carrypatch_test
 
 import (
+	"encoding/json"
 	"errors"
 	"maps"
 	"net/http"
@@ -488,4 +489,187 @@ BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
 	if got := refIn(f.copy, "refs/heads/patch/a"); got != tip {
 		t.Errorf("patch/a = %s, want %s unmoved", got, tip)
 	}
+}
+
+// A refresh that loses a swap to another writer stops the sync at that
+// branch with 500, without a retry, a later patch or merge detection; it
+// keeps what earlier patches' outcomes did, writes no completion, still
+// queues the rebuild of a branch it moved, and the next sync completes
+// the rest. The subtests are consecutive steps of one workspace.
+func TestRefresh_LostSwap(t *testing.T) {
+	t.Parallel()
+	mover := &refMover{}
+	f := startSyncFixtureWith(t, syncOptions{deps: func(d *carrypatch.Deps) { d.BeforeRefSwap = mover.hook }})
+	f.setSettings(t, originAuthority("replace"))
+	a, b, c := f.addPatch(t, "patch/a"), f.addPatch(t, "patch/b"), f.addPatch(t, "patch/c")
+	patches := []carrypatch.Patch{a, b, c}
+	for _, p := range patches {
+		f.originBranch(t, p.BranchName, refIn(f.copy, "refs/heads/"+p.BranchName))
+	}
+	f.mustSync(t)
+	f.dropRebuilds(t)
+	f.advance(time.Hour)
+	// ahead gives origin's branch a commit on the hub's tip.
+	ahead := func(t *testing.T, branch, label string) {
+		file := strings.ReplaceAll(branch, "/", "-") + "-" + label + ".txt"
+		f.originBranch(t, branch, f.commitOn(t, refIn(f.copy, "refs/heads/"+branch), branch+" "+label, map[string]string{file: label + "\n"}))
+	}
+	// interfere makes another writer move branch to a commit of its own
+	// just before the refresh's swap of it.
+	interfere := func(t *testing.T, branch, label string) string {
+		x := f.commitOn(t, f.base, "another writer "+label, map[string]string{"x.txt": label + "\n"})
+		mover.arm(f.copy, branch, x)
+		return x
+	}
+	wantStopped := func(t *testing.T, r syncAnswer, branch string) {
+		t.Helper()
+		if r.status != http.StatusInternalServerError || r.Error.ErrorType != "internal" || !strings.Contains(r.Error.Message, branch) {
+			t.Fatalf("sync = %d %s, want 500 internal naming %s", r.status, r.raw, branch)
+		}
+	}
+
+	// Origin is ahead on patch/a and patch/c, patch/b diverged from origin
+	// at B, and upstream merged patch/c by fast-forward.
+	ahead(t, "patch/a", "origin")
+	ahead(t, "patch/c", "origin")
+	bTip, cTip := refIn(f.copy, "refs/heads/patch/b"), refIn(f.copy, "refs/heads/patch/c")
+	f.originBranch(t, "patch/b", f.commitOn(t, f.base, "patch/b on origin", map[string]string{"patch-b.txt": "origin\n"}))
+	f.upstreamTo(t, cTip)
+	x := interfere(t, "patch/b", "X")
+	w0, bBefore := f.record(t), f.stored(t, b.ID)
+	syncEvents, completions := len(f.patchEvents(t, carrypatch.EventPatchSync)), f.eventCount(t, "parley.workspace.sync")
+
+	r := f.sync(t, "")
+	wantStopped(t, r, "patch/b")
+
+	t.Run("stops the sync at the branch without retrying", func(t *testing.T) {
+		if got := refIn(f.copy, "refs/heads/patch/b"); got != x {
+			t.Errorf("patch/b = %s, want %s where the other writer put it", got, x)
+		}
+		if got := refIn(f.copy, "refs/heads/patch/c"); got != cTip {
+			t.Errorf("patch/c = %s, want %s unrefreshed", got, cTip)
+		}
+		for _, p := range patches {
+			if got := f.stored(t, p.ID).Status; got != carrypatch.StatusActive {
+				t.Errorf("%s's status = %s, want active: no merge detection", p.BranchName, got)
+			}
+		}
+		n, err := mover.swaps("patch/b")
+		if err != nil {
+			t.Fatalf("the other writer could not move patch/b: %v", err)
+		}
+		if later, _ := mover.swaps("patch/c"); n != 1 || later != 0 {
+			t.Errorf("swaps of patch/b, patch/c = %d, %d; want 1, 0", n, later)
+		}
+	})
+	t.Run("keeps the earlier outcomes and the backup", func(t *testing.T) {
+		if got, want := refIn(f.copy, "refs/heads/patch/a"), f.origin.Head("patch/a"); got != want {
+			t.Errorf("patch/a = %s, want origin's %s", got, want)
+		}
+		if got := str(f.stored(t, a.ID).OriginSyncState); got != "in_sync" {
+			t.Errorf("patch/a's origin_sync_state = %s, want in_sync", got)
+		}
+		var names []string
+		for _, e := range f.patchEvents(t, carrypatch.EventPatchSync)[syncEvents:] {
+			name, _ := e.Metadata["branch_name"].(string)
+			names = append(names, name)
+		}
+		if !slices.Equal(names, []string{"patch/a"}) {
+			t.Errorf("parley.patch.sync events name %v, want [patch/a]", names)
+		}
+		if got := refIn(f.copy, carrypatch.ReplacedRefPrefix+"patch/b"); got != bTip {
+			t.Errorf("the backup ref of patch/b = %s, want the tip %s saved before the lost swap", got, bTip)
+		}
+		if got := f.stored(t, b.ID).OriginSyncedAt; !equalTime(got, bBefore.OriginSyncedAt) {
+			t.Errorf("patch/b's origin_synced_at = %v, want %v unchanged", got, bBefore.OriginSyncedAt)
+		}
+	})
+	t.Run("writes no completion", func(t *testing.T) {
+		w1 := f.record(t)
+		if str(w1.UpstreamHeadSHA) != str(w0.UpstreamHeadSHA) || !equalTime(w1.LastSyncAt, w0.LastSyncAt) || str(w1.SyncError) != str(w0.SyncError) {
+			t.Errorf("upstream_head_sha, last_sync_at, sync_error = %s, %v, %s; want %s, %v, %s unchanged",
+				str(w1.UpstreamHeadSHA), w1.LastSyncAt, str(w1.SyncError), str(w0.UpstreamHeadSHA), w0.LastSyncAt, str(w0.SyncError))
+		}
+		if n := f.eventCount(t, "parley.workspace.sync"); n != completions {
+			t.Errorf("parley.workspace.sync events = %d, want %d", n, completions)
+		}
+	})
+	t.Run("the next sync completes the rest", func(t *testing.T) {
+		r := f.mustSync(t)
+		if r.body["upstream_advanced"] != true {
+			t.Errorf("upstream_advanced = %v, want true", r.body["upstream_advanced"])
+		}
+		var names []string
+		for _, e := range r.synced(t) {
+			names = append(names, e.BranchName)
+		}
+		if !slices.Equal(names, []string{"patch/a", "patch/b", "patch/c"}) {
+			t.Errorf("patches_synced names %v, want [patch/a patch/b patch/c]", names)
+		}
+		if got := r.syncedOf(t, "patch/a").Action; got != "none" {
+			t.Errorf("patch/a's action = %s, want none", got)
+		}
+		if got, want := refIn(f.copy, "refs/heads/patch/c"), f.origin.Head("patch/c"); got != want {
+			t.Errorf("patch/c = %s, want origin's %s", got, want)
+		}
+		if got, want := r.body["upstream_head_sha"], f.upstream.Head("main"); got != want || r.body["last_sync_at"] == nil {
+			t.Errorf("upstream_head_sha, last_sync_at = %v, %v; want %s and a time", got, r.body["last_sync_at"], want)
+		}
+	})
+
+	// The rows are consecutive failed syncs, each from a workspace with no
+	// rebuild job.
+	t.Run("still queues the rebuild", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			auto bool
+			// arrange readies the sync and returns the branch whose swap
+			// is lost.
+			arrange func(t *testing.T) string
+			queued  bool
+		}{
+			{"an earlier branch moved", true, func(t *testing.T) string {
+				ahead(t, "patch/a", "r1")
+				ahead(t, "patch/b", "r1")
+				interfere(t, "patch/b", "r1")
+				return "patch/b"
+			}, true},
+			{"the first patch's swap is lost after upstream advanced", true, func(t *testing.T) string {
+				f.moveUpstream(t, "U2", map[string]string{"u2.txt": "2\n"})
+				ahead(t, "patch/a", "r2")
+				interfere(t, "patch/a", "r2")
+				return "patch/a"
+			}, false},
+			{"an earlier branch moved with auto_rebuild_after_sync off", false, func(t *testing.T) string {
+				ahead(t, "patch/a", "r3")
+				interfere(t, "patch/b", "r3")
+				return "patch/b"
+			}, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f.dropRebuilds(t)
+				f.setSettings(t, map[string]any{"auto_rebuild_after_sync": tc.auto})
+				stopsAt := tc.arrange(t)
+				wantStopped(t, f.sync(t, ""), stopsAt)
+				js := f.rebuildJobs(t)
+				if !tc.queued {
+					if len(js) != 0 {
+						t.Errorf("rebuild jobs = %v, want none", js)
+					}
+					return
+				}
+				if len(js) != 1 {
+					t.Fatalf("rebuild jobs = %v, want one", js)
+				}
+				status, raw := f.Call(t, http.MethodGet, "/api/v1/workspaces/"+f.slug+"/rebuilds/"+js[0].ID, f.key, nil)
+				var job map[string]any
+				if err := json.Unmarshal(raw, &job); status != http.StatusOK || err != nil {
+					t.Fatalf("read the rebuild %s = %d %s, want 200 and a record", js[0].ID, status, raw)
+				}
+				if job["status"] != "queued" || job["submitted_by"] != f.owner {
+					t.Errorf("the rebuild is %v, submitted by %v; want queued by %s", job["status"], job["submitted_by"], f.owner)
+				}
+			})
+		}
+	})
 }

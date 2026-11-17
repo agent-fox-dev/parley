@@ -1707,3 +1707,47 @@ func wantNoRebuild(t *testing.T, a syncAnswer) {
 		t.Errorf("rebuild_triggered, rebuild_job_id = %v, %v (present %v), want false and null", a.body["rebuild_triggered"], id, present)
 	}
 }
+
+// refMover is a BeforeRefSwap hook that plays another writer: armed with a
+// branch, it moves that branch of the repository dir to a commit of its
+// own the next time a swap of the branch is about to happen, once, and it
+// counts the swaps about to happen per branch.
+type refMover struct {
+	mu     sync.Mutex
+	dir    string
+	branch string
+	to     string
+	calls  map[string]int
+	err    error
+}
+
+// arm makes the next swap of branch in the repository dir find it at to.
+func (m *refMover) arm(dir, branch, to string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dir, m.branch, m.to = dir, branch, to
+}
+
+func (m *refMover) hook(_, branch string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.calls == nil {
+		m.calls = map[string]int{}
+	}
+	m.calls[branch]++
+	if branch != m.branch {
+		return
+	}
+	m.branch = ""
+	if _, err := gitrepotest.Run(m.dir, "", "update-ref", "refs/heads/"+branch, m.to); err != nil {
+		m.err = err
+	}
+}
+
+// swaps is the number of swaps of branch that were about to happen, and
+// the error of a move the mover could not make.
+func (m *refMover) swaps(branch string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls[branch], m.err
+}
