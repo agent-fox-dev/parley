@@ -35,9 +35,10 @@ const (
 // (docs/adr/06-load-the-secret-keys-before-the-stores-open.md). Its start
 // hook binds the secret component to the stores, the loaded keys, the hub's
 // clock and scrubber, the event component, and the workspace records, the
-// memberships and the users a workspace's chain is built from, and reads
-// the start report,
-// which the hub writes once it has bound the listener: the `secret
+// memberships and the users a workspace's chain is built from, and the
+// access service's write-access question, which decides whether a fork's
+// secrets are resolved from its parent, and reads the start report, which
+// the hub writes once it has bound the listener: the `secret
 // encryption` line, and the warning that secrets cannot be stored when no
 // current key is configured. Every maintenance pass runs the re-encryption
 // under the name secret_reencryption, which finishes a key rotation and
@@ -67,7 +68,8 @@ func composeSecrets(c *Composition) {
 	c.AddStartHook(secretsHook, func(ctx context.Context, rt *Runtime) (err error) {
 		db := rt.Store.Main()
 		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: keys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events,
-			Records: access.StoreRecords(db), Memberships: activeOrgs(db), UserExists: userExists(db)})
+			Records: access.StoreRecords(db), Memberships: activeOrgs(db), UserExists: userExists(db),
+			CanWrite: c.access.CanWrite})
 		report, err = c.secrets.StartReport(ctx)
 		return err
 	})

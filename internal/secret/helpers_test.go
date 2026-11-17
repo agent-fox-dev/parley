@@ -250,6 +250,25 @@ func (w *world) seed(t *testing.T, scope secret.Scope, id string, keys ...string
 	}
 }
 
+// putSecrets stores, through the component, the secrets pairs names in
+// one scope as key, value, key, value and so on; a key the scope holds
+// ignoring case gets the new value.
+func (w *world) putSecrets(t *testing.T, scope secret.Scope, id string, pairs ...string) {
+	t.Helper()
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i+1 < len(pairs); i += 2 {
+			if err := w.secrets.Put(ctx, tx, scope, id, pairs[i], pairs[i+1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("store %v in %s %s: %v", pairs, scope, id, err)
+	}
+}
+
 // count is the number of secrets a scope holds.
 func (w *world) count(t *testing.T, scope secret.Scope, id string) int {
 	t.Helper()

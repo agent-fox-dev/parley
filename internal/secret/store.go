@@ -96,6 +96,10 @@ type Deps struct {
 	// UserExists reports whether a user exists; a chain has no user step
 	// for an owner who does not.
 	UserExists func(ctx context.Context, userID string) (bool, error)
+	// CanWrite reports whether a user, who need not be the one asking, has
+	// write access to a workspace: a fork's secret resolution searches its
+	// parent's scope only while the fork's owner has.
+	CanWrite func(ctx context.Context, userID, slug string) (bool, error)
 }
 
 // Component is the one place the hub reads, stores and removes secrets, so
@@ -114,6 +118,9 @@ type Component struct {
 	// resolution in place of the store, so that a test can make the read
 	// of one scope fail.
 	readVars atomic.Pointer[varReader]
+	// readSecret, when set, reads the secrets of a resolution in place of
+	// Get, so that a test can see every read.
+	readSecret atomic.Pointer[secretReader]
 }
 
 // New returns a component bound to d.

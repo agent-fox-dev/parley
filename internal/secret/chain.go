@@ -53,16 +53,22 @@ var errChainNotBound = errors.New("the secret component is not bound to the work
 // calls. A slug with no record is ErrWorkspaceNotFound; a read that fails is
 // another error.
 func (c *Component) Chain(ctx context.Context, slug string) ([]Step, error) {
+	_, steps, err := c.chain(ctx, slug)
+	return steps, err
+}
+
+// chain is Chain, which also returns the workspace's record.
+func (c *Component) chain(ctx context.Context, slug string) (access.Record, []Step, error) {
 	d := c.deps
 	if d.Records == nil || d.Memberships == nil || d.UserExists == nil {
-		return nil, errChainNotBound
+		return access.Record{}, nil, errChainNotBound
 	}
 	rec, found, err := d.Records.Record(ctx, slug)
 	if err != nil {
-		return nil, fmt.Errorf("read the chain of %s: %w", slug, err)
+		return access.Record{}, nil, fmt.Errorf("read the chain of %s: %w", slug, err)
 	}
 	if !found {
-		return nil, ErrWorkspaceNotFound
+		return access.Record{}, nil, ErrWorkspaceNotFound
 	}
 	steps := []Step{{Origin: OriginWorkspace, Scope: ScopeWorkspace, ScopeID: rec.Slug}}
 	// A fork's org is its parent's; the fork's own record carries a copy of
@@ -71,7 +77,7 @@ func (c *Component) Chain(ctx context.Context, slug string) ([]Step, error) {
 	if rec.Kind == access.KindFork {
 		parent, found, err := d.Records.Record(ctx, rec.ParentSlug)
 		if err != nil {
-			return nil, fmt.Errorf("read the chain of %s: %w", slug, err)
+			return access.Record{}, nil, fmt.Errorf("read the chain of %s: %w", slug, err)
 		}
 		if found {
 			steps = append(steps, Step{Origin: OriginParent, Scope: ScopeWorkspace, ScopeID: parent.Slug})
@@ -80,17 +86,17 @@ func (c *Component) Chain(ctx context.Context, slug string) ([]Step, error) {
 	}
 	orgs, err := d.Memberships.ActiveOrgIDs(ctx, rec.OwnerID)
 	if err != nil {
-		return nil, fmt.Errorf("read the chain of %s: %w", slug, err)
+		return access.Record{}, nil, fmt.Errorf("read the chain of %s: %w", slug, err)
 	}
 	if slices.Contains(orgs, orgID) {
 		steps = append(steps, Step{Origin: OriginOrg, Scope: ScopeOrg, ScopeID: orgID})
 	}
 	exists, err := d.UserExists(ctx, rec.OwnerID)
 	if err != nil {
-		return nil, fmt.Errorf("read the chain of %s: %w", slug, err)
+		return access.Record{}, nil, fmt.Errorf("read the chain of %s: %w", slug, err)
 	}
 	if exists {
 		steps = append(steps, Step{Origin: OriginUser, Scope: ScopeUser, ScopeID: rec.OwnerID})
 	}
-	return steps, nil
+	return rec, steps, nil
 }

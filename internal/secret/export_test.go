@@ -14,3 +14,14 @@ func (c *Component) FailVarReadsOf(scope Scope, err error) {
 	})
 	c.readVars.Store(&read)
 }
+
+// RecordSecretReads makes every later read a secret resolution makes report
+// its scope, scope id and name to record before it reads the store as
+// before.
+func (c *Component) RecordSecretReads(record func(scope Scope, scopeID, name string)) {
+	read := secretReader(func(ctx context.Context, s Scope, id, name string) (string, bool, error) {
+		record(s, id, name)
+		return c.Get(ctx, s, id, name)
+	})
+	c.readSecret.Store(&read)
+}
