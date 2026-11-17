@@ -259,8 +259,9 @@ func TestMirror_ReportsEachBranchItCouldNotPushAndGoesOnWithTheNext(t *testing.T
 			fault:  func(t *testing.T, c *mirrorCase) { h.origins.set(c.slug, "", errors.New("secret store sealed")) },
 			failed: []string{"patch/a", "patch/b"}, want: "failed to resolve origin credentials"},
 		// The limit leaves patch/b's push, which runs within it too, room
-		// on a loaded machine.
-		{name: "origin holds the push past the limit", limit: time.Second,
+		// on a machine the whole suite loads: a local push there has taken
+		// over a second.
+		{name: "origin holds the push past the limit", limit: 3 * time.Second,
 			fault:  func(t *testing.T, c *mirrorCase) { c.origin.StallRef("refs/heads/patch/a") },
 			failed: []string{"patch/a"}, want: "timed out", bPushed: true},
 		{name: "nothing listens at origin's address",

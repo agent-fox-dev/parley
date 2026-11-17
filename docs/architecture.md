@@ -5399,8 +5399,10 @@ tests replace them), read at every use:
   the hub's copy), through `RunGit` under `ForwardLimit()`
   (`Deps.ForwardLimit`, else `DefaultForwardLimit`, 120 s), maps the
   failure to `origin rejected push: <reason>` (origin's hook text from
-  `PushError.OriginMessage`, else a fixed reason per class), scrubbed, and
-  records origin's head (`SetOriginHead`) only of a commit the copy holds.
+  `PushError.OriginMessage`, else a fixed reason per class), scrubbed, and,
+  called without a repository (the landing guard), records origin's head
+  (`SetOriginHead`) of a commit the copy holds; a write's forward leaves
+  the record to the trigger.
 - `Trigger` (`trigger.go`, `(*Component).Trigger()`): `AfterUpdates(ctx,
   slug, updates, source, sessionID)` runs, one request of a workspace at a
   time (`Component.triggers`, a per-slug lock apart from `setups`), on a

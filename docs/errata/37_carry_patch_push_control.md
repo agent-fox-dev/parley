@@ -44,9 +44,13 @@ broken ref that `git gc`, `fsck` and a backup trip over.
 So the record is written once the copy holds the commit:
 
 - `Component.Forward` writes it right after a successful forward only when
-  the copy holds the commit (`Repo.Missing`): a forward from the copy
-  (`repo` nil, the landing guard), or an update whose objects are already
-  in the copy.
+  it is called without a repository, as the landing guard calls it, which
+  forwards from the copy, and the copy holds the commit (`Repo.Missing`).
+  A forward the ref writer runs, handed the repository of a write it has
+  not accepted yet, records nothing, even when the copy holds the commit
+  already (a source control API write): recorded there, outside the trigger
+  lock, it could be overwritten by the older commit of an earlier write
+  whose listener ran late.
 - For a git push or a source control API write, the carry-patch post-push
   listener writes it after the write is accepted, when the copy holds the
   pushed objects: for each accepted update whose decision carried a
@@ -173,3 +177,16 @@ session) on a goroutine of its own and returns at once, with a context that
 is not the attempt's, which ends with the attempt, but one that ends when
 the hub's stop begins, as the post-push listener's does. A land that moved
 nothing (`before` equal to `after`) triggers nothing.
+
+## A land retried on a moved target is not judged again
+
+Package 25 asks the target guards once per attempt, after the first replay,
+and a retry on a target that moved meanwhile replays the changes onto the
+new head and swaps it without asking them again. With
+`patch_branch_source` `origin` and `push_patches_to_origin` `true` the
+guard forwards the first replay's head to origin; when the patch branch
+moves between that forward and the compare-and-swap (a sync's origin
+refresh, a reset to origin), the retry lands a head origin never received.
+The guard cannot see the retry, so the fix belongs to the landing's retry
+loop, which must ask the target guards again for the new head; it is
+tracked as an open item of this package.

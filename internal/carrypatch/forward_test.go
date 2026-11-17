@@ -158,6 +158,39 @@ func TestForward_PushesTheCommitToOriginAndRecordsItsHead(t *testing.T) {
 	if _, err := gitrepotest.Run(f.copy, "", "cat-file", "-e", pushed); err == nil {
 		t.Errorf("the copy holds %.7s outside the quarantine", pushed)
 	}
+
+	// A write the ref writer forwards is not accepted yet when its forward
+	// returns, even when the copy holds its commit already: the forward it
+	// hands a repository records nothing, and the write's trigger records
+	// the head once the write is accepted.
+	gitrepotest.SetRef(t, f.origin.Dir(), "refs/heads/patch/a", next)
+	written := gitrepotest.Commit(t, f.copy, "api", map[string]string{"api.txt": "api\n"}, next)
+	if err := c.Forward(ctx, repo, f.ws, "patch/a", written); err != nil {
+		t.Fatalf("the forward of a commit the copy holds failed: %v", err)
+	}
+	if got := f.origin.Head("patch/a"); got != written {
+		t.Errorf("origin's patch/a = %.7s, want the forwarded %.7s", got, written)
+	}
+	if got := f.recorded("patch/a"); got != next {
+		t.Errorf("the recorded origin head of patch/a = %.7s after a write's forward, want it left at %.7s", got, next)
+	}
+}
+
+func TestForward_ACallerGoneWhileTheCredentialIsReadTimesTheForwardOut(t *testing.T) {
+	t.Parallel()
+	f := newForwardFixture(t)
+	c := f.component(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.secrets.set("demo", "", context.Canceled)
+	requests := f.origin.Requests()
+	err := c.Forward(ctx, nil, f.ws, "patch/a", f.commit)
+	if err == nil || err.Error() != "origin rejected push: timed out" {
+		t.Errorf("the forward of a caller that left = %v, want origin rejected push: timed out", err)
+	}
+	if n := f.origin.Requests() - requests; n != 0 {
+		t.Errorf("origin received %d requests, want none", n)
+	}
 }
 
 // quarantined is a commit on top of parent, a commit of the repository dir,

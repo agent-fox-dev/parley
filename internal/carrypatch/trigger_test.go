@@ -309,6 +309,51 @@ func TestTrigger_LogsOneErrorAndReturnsWhenAStepFails(t *testing.T) {
 	}
 }
 
+func TestTrigger_EndedByTheHubsStopLogsNoError(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		fault func(f *triggerFixture, cancel context.CancelFunc)
+	}{
+		{"while the workspace record is read", func(f *triggerFixture, cancel context.CancelFunc) {
+			f.trigger.Records = cancellingRecords{cancel}
+		}},
+		{"while the rebuild is queued", func(f *triggerFixture, cancel context.CancelFunc) {
+			f.comp.RegisterRebuildEnqueuer(cancellingRebuilds{cancel})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newTrigger(t, map[string]any{"patch_branch_source": "hub", "push_patches_to_origin": false})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tc.fault(f, cancel)
+			f.trigger.AfterUpdates(ctx, "demo", []pushrule.Update{updateOf("patch/a")}, carrypatch.SourcePush, nil)
+			if errs := f.logged("ERROR"); len(errs) != 0 {
+				t.Errorf("error records %q for a trigger the hub's stop ended, want none", errs)
+			}
+		})
+	}
+}
+
+// cancellingRecords is a record reader that ends the trigger's context, as
+// the hub's stop does, and fails with the context's error.
+type cancellingRecords struct{ cancel context.CancelFunc }
+
+func (r cancellingRecords) WorkspaceRecord(ctx context.Context, _ string) (workspace.Workspace, bool, error) {
+	r.cancel()
+	return workspace.Workspace{}, false, ctx.Err()
+}
+
+// cancellingRebuilds is a rebuild enqueuer that ends the trigger's context,
+// as the hub's stop does, and fails with the context's error.
+type cancellingRebuilds struct{ cancel context.CancelFunc }
+
+func (r cancellingRebuilds) EnqueueRebuild(ctx context.Context, _ string, _ carrypatch.RebuildOptions) (carrypatch.RebuildResult, error) {
+	r.cancel()
+	return carrypatch.RebuildResult{}, ctx.Err()
+}
+
 func TestTrigger_RunsTheTriggersOfOneWorkspaceOneAtATime(t *testing.T) {
 	t.Parallel()
 	f := newTrigger(t, hubPatches(true))

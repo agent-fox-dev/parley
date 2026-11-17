@@ -2782,12 +2782,13 @@ Two kinds of branch of a `carry_patch` workspace are not ordinary
 branches: the integration branch, `refs/heads/<integration_branch>`
 (`deploy` while the record holds none), which only the hub writes, and the
 **patch branches**, `refs/heads/<branch_name>` of every patch that is not
-`deleted`. Every client write of a ref decides them by one set of rules,
-whether it arrives as a [git push](#git-over-http), through the source
-control API or as a [land](#landing): the fourth push rule, after the
-hub-owned refs (`refs/parley/`, the backups of replaced patch tips
-included), the protected branches, the default branch and a fork's
-tracking branches. A task fork is a `standard` workspace and is never
+`deleted`. A client write of a ref that arrives as a [git
+push](#git-over-http) or through the source control API is decided by the
+fourth push rule, after the hub-owned refs (`refs/parley/`, the backups of
+replaced patch tips included), the protected branches, the default branch
+and a fork's tracking branches; a [land](#landing) onto a patch branch is
+judged by the same table before its target moves (below), and no change
+can target the integration branch. A task fork is a `standard` workspace and is never
 asked. The settings `patch_branch_source` and `push_patches_to_origin`
 are read at every decision, so a change counts at the next push.
 
@@ -2814,8 +2815,8 @@ request has passed every rule, each update to forward is pushed, in
 command order, to `refs/heads/<branch>` on origin as a push without force,
 with the workspace's origin credential read at that moment, within
 120 seconds. Origin takes it: the hub's branch moves and, once the
-request is accepted, `refs/remotes/origin/<branch>` of the hub's copy
-records the commit. Otherwise the update is refused, `patch_branch`, with
+request is accepted and while the branch is still at that commit,
+`refs/remotes/origin/<branch>` of the hub's copy records it. Otherwise the update is refused, `patch_branch`, with
 `origin rejected push: <reason>`: origin's own message for an update its
 rules or hooks refused, `non-fast-forward`, `authentication failed`,
 `permission denied`, `repository not found`, `origin unreachable`,

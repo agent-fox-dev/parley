@@ -127,7 +127,7 @@ func (t *Trigger) run(ctx context.Context, log *slog.Logger, slug string, update
 	rec, found, err := t.Records.WorkspaceRecord(ctx, slug)
 	switch {
 	case err != nil:
-		log.Error("carry-patch trigger failed: the workspace record cannot be read", "error", err)
+		failed(ctx, log, "carry-patch trigger failed: the workspace record cannot be read", err)
 		return
 	case !found:
 		log.Debug("carry-patch trigger skipped: the workspace is gone")
@@ -137,7 +137,7 @@ func (t *Trigger) run(ctx context.Context, log *slog.Logger, slug string, update
 	}
 	patches, err := t.movedPatches(ctx, slug, updates)
 	if err != nil {
-		log.Error("carry-patch trigger failed: the patch list cannot be read", "error", err)
+		failed(ctx, log, "carry-patch trigger failed: the patch list cannot be read", err)
 		return
 	}
 	if len(patches) == 0 {
@@ -145,7 +145,7 @@ func (t *Trigger) run(ctx context.Context, log *slog.Logger, slug string, update
 	}
 	settings, err := t.Settings.EffectiveSettings(ctx, rec)
 	if err != nil {
-		log.Error("carry-patch trigger failed: the settings cannot be read", "error", err)
+		failed(ctx, log, "carry-patch trigger failed: the settings cannot be read", err)
 		return
 	}
 	t.queueRebuild(ctx, log, slug, settings, source, sessionID)
@@ -195,7 +195,7 @@ func (t *Trigger) queueRebuild(ctx context.Context, log *slog.Logger, slug strin
 	})
 	switch {
 	case err != nil:
-		log.Error("carry-patch trigger could not queue a rebuild", "error", err)
+		failed(ctx, log, "carry-patch trigger could not queue a rebuild", err)
 	case !res.Queued:
 		log.Debug("carry-patch trigger queued no rebuild: one is already queued", "existing_job_id", res.ExistingJobID)
 	}
@@ -204,7 +204,7 @@ func (t *Trigger) queueRebuild(ctx context.Context, log *slog.Logger, slug strin
 // recordForwardedHeads records, for each update of an accepted write that
 // the ref writer forwarded to origin before accepting it, its commit as
 // origin's head of the branch in the hub's copy: origin took the commit,
-// and now that the write is accepted the copy holds it too (erratum 37).
+// and now that the write is accepted the copy holds it too.
 // A branch the hub has moved on from since is left to the write that moved
 // it, whose trigger runs after this one under the same lock, so that an
 // older commit never overwrites a newer record. A failure is logged and
@@ -239,4 +239,15 @@ func (t *Trigger) recordForwardedHeads(ctx context.Context, log *slog.Logger, sl
 			log.Warn("forwarded to origin, and origin's head could not be recorded", "branch", branch, "error", err)
 		}
 	}
+}
+
+// failed logs a step of the trigger that failed with err: as an error, or,
+// when ctx has ended, the hub's stop having ended the trigger, at debug
+// level, since nothing failed that a person must look at.
+func failed(ctx context.Context, log *slog.Logger, msg string, err error) {
+	if ctx.Err() != nil {
+		log.Debug(msg+": the trigger was ended", "error", err)
+		return
+	}
+	log.Error(msg, "error", err)
 }

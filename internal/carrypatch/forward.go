@@ -53,8 +53,13 @@ func (c *Component) ForwardLimit() time.Duration {
 // within the forward limit and ctx: when either ends first git is killed
 // and the forward fails as timed out.
 //
-// Forward returns nil once origin took the commit, and then records it as
-// origin's head of branch in the hub's copy, when the copy holds it. It
+// Forward returns nil once origin took the commit. Called without a
+// repository, as the landing guard calls it, it then records the commit as
+// origin's head of branch in the hub's copy, which holds it; called with
+// the repository of a write the ref writer has not accepted yet, it records
+// nothing, and the write's trigger records the head once the write is
+// accepted, under the workspace's trigger lock, so that the record of an
+// older write never overwrites a newer one. It
 // never writes the hub's branch. A failure is an error whose text is the
 // message the update is refused with, "origin rejected push: <reason>" or
 // the credential's, scrubbed of the credential and of URL user information
@@ -70,17 +75,22 @@ func (c *Component) Forward(ctx context.Context, repo *gitrepo.Repo, w workspace
 		return errors.New(msgNoOriginCredential)
 	}
 	cred, err := workspace.ResolveOriginCredential(ctx, c.d.Secrets, w.Slug)
+	if err != nil && ctx.Err() != nil {
+		// The caller gave up, or its limit passed, before the credential
+		// was read: the forward timed out, whatever the read reports.
+		return errors.New(msgOriginRejected + reasonTimedOut)
+	}
 	if err != nil {
 		log.Warn("forward to origin failed: the origin credential cannot be read", "error", c.scrub(err.Error()))
 		return errors.New(msgNoOriginCredential)
 	}
 	var copyRepo *gitrepo.Repo
-	if c.d.RepoPath != nil {
-		copyRepo, err = c.d.Git.Open(ctx, c.d.RepoPath(w.Slug))
-	} else {
-		err = errNotBound
-	}
 	if repo == nil {
+		if c.d.RepoPath != nil {
+			copyRepo, err = c.d.Git.Open(ctx, c.d.RepoPath(w.Slug))
+		} else {
+			err = errNotBound
+		}
 		repo = copyRepo
 	}
 	if repo == nil {
