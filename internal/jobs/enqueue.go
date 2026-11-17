@@ -46,12 +46,14 @@ func (q *Queue) Enqueue(ctx context.Context, tx *sql.Tx, typ, slug string, paylo
 }
 
 // EnqueueFollowUp queues, in tx, the follow-up of the running job
-// runningID: a job of its type and workspace with payload, which runs once
-// the running one has ended. The running job must be the only pending job
-// of its type and workspace. An unknown runningID is ErrNotFound; otherwise
-// a refusal is a *DuplicateError naming another pending job when there is
-// one, else the named job.
-func (q *Queue) EnqueueFollowUp(ctx context.Context, tx *sql.Tx, runningID string, payload json.RawMessage) (Job, error) {
+// runningID: a job of typ for the workspace slug with payload, which runs
+// once the running one has ended. The running job must be of typ and slug,
+// and the only pending job of them. An unknown runningID, or one of another
+// type or workspace, is ErrNotFound, so that a caller cannot queue a job
+// for a workspace it did not name; otherwise a refusal is a
+// *DuplicateError naming another pending job when there is one, else the
+// named job.
+func (q *Queue) EnqueueFollowUp(ctx context.Context, tx *sql.Tx, typ, slug, runningID string, payload json.RawMessage) (Job, error) {
 	d, err := q.deps()
 	if err != nil {
 		return Job{}, err
@@ -60,7 +62,10 @@ func (q *Queue) EnqueueFollowUp(ctx context.Context, tx *sql.Tx, runningID strin
 	if err != nil {
 		return Job{}, err
 	}
-	other, err := pendingJobOf(ctx, tx, running.Type, running.Workspace, running.ID)
+	if running.Type != typ || running.Workspace != slug {
+		return Job{}, ErrNotFound
+	}
+	other, err := pendingJobOf(ctx, tx, typ, slug, running.ID)
 	if err != nil {
 		return Job{}, err
 	}
@@ -70,7 +75,7 @@ func (q *Queue) EnqueueFollowUp(ctx context.Context, tx *sql.Tx, runningID strin
 	if running.Status != StatusRunning {
 		return Job{}, &DuplicateError{JobID: running.ID}
 	}
-	return q.insert(ctx, tx, d, running.Type, running.Workspace, payload)
+	return q.insert(ctx, tx, d, typ, slug, payload)
 }
 
 // insert stores a new queued job in tx and wakes the dispatcher for it.

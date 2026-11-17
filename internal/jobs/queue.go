@@ -95,14 +95,13 @@ type Queue struct {
 	// running are the attempts this queue has claimed and not yet seen
 	// end, by job id. Its size is what the limit of MaxRunning counts.
 	running map[string]*worker
-	// workers counts the goroutines of the attempts in running.
-	workers sync.WaitGroup
 	// stopping is set once the queue stops claiming: a pass then claims
 	// nothing.
 	stopping bool
-	// removals counts the goroutines that cancel the attempts of the jobs
-	// a workspace removal deleted.
-	removals sync.WaitGroup
+	// removals are the cancellations of the attempts of jobs a workspace
+	// removal deleted that have not ended yet, each closed once it has: a
+	// stop waits for them, since each needs the store.
+	removals map[chan struct{}]bool
 }
 
 // worker is an attempt of a job the queue runs.
@@ -115,6 +114,10 @@ type worker struct {
 	// abandoned is set, under the queue's lock, when a stop has given up
 	// on the attempt: its outcome is not settled.
 	abandoned bool
+	// settling is set, under the queue's lock, once the attempt has
+	// returned and its outcome is being settled: a stop no longer abandons
+	// it, and waits for the settlement to end.
+	settling bool
 }
 
 // ErrNotFound is the error of an operation on a job that does not exist.
@@ -320,7 +323,6 @@ func (q *Queue) reserve(base context.Context, j Job) (c claim, full bool) {
 		q.running = map[string]*worker{}
 	}
 	q.running[j.ID] = w
-	q.workers.Add(1)
 	return claim{job: j, handler: h, ctx: ctx, worker: w}, false
 }
 
@@ -338,7 +340,6 @@ func (q *Queue) drop(id string) {
 	}
 	w.cancel()
 	close(w.done)
-	q.workers.Done()
 	q.poke()
 }
 
@@ -349,6 +350,7 @@ func (q *Queue) work(d Deps, c claim) {
 	err := runAttempt(c.ctx, c.handler, c.job)
 	q.mu.Lock()
 	abandoned := c.worker.abandoned
+	c.worker.settling = !abandoned
 	q.mu.Unlock()
 	if abandoned {
 		return
@@ -398,14 +400,17 @@ func inTypes(types []string) (string, []any) {
 }
 
 // hasWork reports whether a pass has something to do at now: a failed job
-// whose next attempt is due, or a queued job of one of types.
+// whose next attempt is due, or a queued job of one of types that a pass
+// could claim, one whose type and workspace have no running job (queuedJobs),
+// so that a follow-up waiting for its running job costs no write
+// transaction.
 func hasWork(ctx context.Context, q querier, now time.Time, types []string) (bool, error) {
 	query := `SELECT EXISTS (SELECT 1 FROM jobs WHERE status = ? AND next_attempt_at <= ?)`
 	args := []any{StatusFailed, now.UnixNano()}
 	if len(types) > 0 {
 		cond, targs := inTypes(types)
-		query += ` OR EXISTS (SELECT 1 FROM jobs WHERE status = ? AND ` + cond + `)`
-		args = append(append(args, StatusQueued), targs...)
+		query += ` OR EXISTS (SELECT 1 FROM jobs WHERE status = ? AND ` + cond + ` AND ` + noneRunning + `)`
+		args = append(append(append(args, StatusQueued), targs...), StatusRunning)
 	}
 	var work bool
 	if err := q.QueryRowContext(ctx, query, args...).Scan(&work); err != nil {
@@ -425,13 +430,16 @@ WHERE status = ? AND next_attempt_at <= ?`, StatusQueued, now.UnixNano(), Status
 	return nil
 }
 
+// noneRunning is the SQL condition, with the running status as its
+// argument, that a job's type and workspace have no running job.
+const noneRunning = `NOT EXISTS (SELECT 1 FROM jobs r WHERE r.type = jobs.type AND r.workspace_slug = jobs.workspace_slug AND r.status = ?)`
+
 // queuedJobs reads, in tx, the queued jobs of types whose type and
 // workspace have no running job, in claim order: created_at as a record
 // shows it, ascending, then id ascending.
 func queuedJobs(ctx context.Context, tx *sql.Tx, types []string) ([]Job, error) {
 	cond, args := inTypes(types)
-	rows, err := tx.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE status = ? AND `+cond+`
-	AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.type = jobs.type AND r.workspace_slug = jobs.workspace_slug AND r.status = ?)
+	rows, err := tx.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE status = ? AND `+cond+` AND `+noneRunning+`
 	ORDER BY `+secondsOf+`, id`, append(append([]any{StatusQueued}, args...), StatusRunning)...)
 	if err != nil {
 		return nil, fmt.Errorf("read queued jobs: %w", err)
@@ -516,16 +524,31 @@ func (q *Queue) RemoveWorkspace(ctx context.Context, tx *sql.Tx, slug string) er
 		}
 	}
 	d := q.d
+	var done chan struct{}
+	if len(attempts) > 0 {
+		done = make(chan struct{})
+		if q.removals == nil {
+			q.removals = map[chan struct{}]bool{}
+		}
+		q.removals[done] = true
+	}
 	q.mu.Unlock()
-	if len(attempts) == 0 {
+	if done == nil {
 		return nil
 	}
-	q.removals.Add(1)
 	go func() {
-		defer q.removals.Done()
+		defer q.removalEnded(done)
 		q.cancelRemoved(context.WithoutCancel(ctx), d, attempts)
 	}()
 	return nil
+}
+
+// removalEnded marks the cancellation done as ended.
+func (q *Queue) removalEnded(done chan struct{}) {
+	q.mu.Lock()
+	delete(q.removals, done)
+	q.mu.Unlock()
+	close(done)
 }
 
 // cancelRemoved cancels the attempts of the jobs ids that no longer exist.

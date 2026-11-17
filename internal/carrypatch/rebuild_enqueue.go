@@ -112,7 +112,7 @@ func (c *Component) enqueueRebuild(ctx context.Context, ws workspace.Workspace, 
 				fmt.Sprintf("workspace %q has no patch in active or conflict to rebuild", ws.Slug))
 		}
 		if opts.FollowUpOf != nil {
-			job, err = c.d.Jobs.EnqueueFollowUp(ctx, tx, *opts.FollowUpOf, doc)
+			job, err = c.d.Jobs.EnqueueFollowUp(ctx, tx, RebuildJobType, ws.Slug, *opts.FollowUpOf, doc)
 		} else {
 			job, err = c.d.Jobs.Enqueue(ctx, tx, RebuildJobType, ws.Slug, doc)
 		}

@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -195,8 +196,9 @@ func TestRun_StopsClaimingAndSettlesTheAttemptsThatEndWithinTheGrace(t *testing.
 	}
 }
 
+// Not parallel: it counts the goroutines of every queue's stop, and those
+// of other tests would be counted too.
 func TestRun_AbandonsTheAttemptsStillRunningAtTheEndOfTheGrace(t *testing.T) {
-	t.Parallel()
 	q := newTestQueue(t)
 	attempts := make(chan context.Context, 1)
 	proceed := make(chan struct{})
@@ -227,10 +229,53 @@ func TestRun_AbandonsTheAttemptsStillRunningAtTheEndOfTheGrace(t *testing.T) {
 	q.clock.Set(stoppedAt.Add(ShutdownGrace))
 	waitClosed(t, attemptCtx.Done(), "the cancellation of the attempt")
 	waitClosed(t, stopped, "Run's return at the end of the grace")
+	// The attempt ignores its cancellation: nothing of the stop may be left
+	// waiting for it.
+	if n := goroutinesOf("jobs.(*Queue).stop"); n != 0 {
+		t.Errorf("%d goroutines of the stop are left after Run returned, want 0", n)
+	}
 
 	release()
 	waitClosed(t, done, "the end of the abandoned attempt")
 	if got := q.get(t, j.ID); got.Status != StatusRunning || got.RetryCount != 0 || got.Error != nil {
 		t.Errorf("abandoned job = %+v, want running with retry count 0 and no error", got)
+	}
+}
+
+func TestRun_WaitsAtTheEndOfTheGraceForASettlementUnderWay(t *testing.T) {
+	t.Parallel()
+	q := newTestQueue(t)
+	h := newScriptedHandler(true)
+	settling, hold := make(chan struct{}), make(chan struct{})
+	h.settled = func(context.Context, *sql.Tx, Job, bool) error {
+		close(settling)
+		<-hold
+		return nil
+	}
+	q.Register("probe", h)
+	j := q.enqueue(t, "probe", "w", json.RawMessage(`{}`))
+	stop, stopped := q.run(t)
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release) // before the queue's cleanup waits for the settlement
+	h.Enter(t)
+
+	stop()
+	stoppedAt := q.clock.Now()
+	q.clock.WaitTimerAt(t, stoppedAt.Add(ShutdownGrace))
+	h.releaseOf(j.ID) <- nil
+	waitClosed(t, settling, "the settlement of the attempt")
+	q.clock.Set(stoppedAt.Add(ShutdownGrace))
+	// Run returning is what the stop must not do while the settlement it
+	// waits for is held; there is nothing to wait for that says it has not.
+	select {
+	case <-stopped:
+		t.Fatal("Run returned at the end of the grace while a settlement was under way")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	release()
+	waitClosed(t, stopped, "Run's return once the settlement ended")
+	if s := q.status(t, j.ID); s != StatusCompleted {
+		t.Errorf("the job whose attempt ended within the grace is %s, want completed", s)
 	}
 }

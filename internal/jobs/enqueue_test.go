@@ -170,7 +170,7 @@ func TestEnqueueFollowUp_QueuesBehindTheRunningJob(t *testing.T) {
 	var f Job
 	err := q.st.Tx(ctx, func(tx *sql.Tx) error {
 		var err error
-		f, err = q.EnqueueFollowUp(ctx, tx, running.ID, json.RawMessage(`{"follow_up":true}`))
+		f, err = q.EnqueueFollowUp(ctx, tx, "probe", "w", running.ID, json.RawMessage(`{"follow_up":true}`))
 		return err
 	})
 	if err != nil {
@@ -215,7 +215,7 @@ func TestEnqueueFollowUp_RefusesUnlessTheNamedJobIsTheOnePendingAndRunning(t *te
 			var f Job
 			err := q.st.Tx(context.Background(), func(tx *sql.Tx) error {
 				var err error
-				f, err = q.EnqueueFollowUp(context.Background(), tx, running.ID, json.RawMessage(`{}`))
+				f, err = q.EnqueueFollowUp(context.Background(), tx, "probe", "w", running.ID, json.RawMessage(`{}`))
 				return err
 			})
 			if err != nil {
@@ -227,6 +227,12 @@ func TestEnqueueFollowUp_RefusesUnlessTheNamedJobIsTheOnePendingAndRunning(t *te
 			q.seed(t, "probe", "w", StatusRunning)
 			return uuid.NewV4().String(), ""
 		}},
+		{"running job of another workspace", func(t *testing.T, q *testQueue) (string, string) {
+			return q.seed(t, "probe", "other", StatusRunning).ID, ""
+		}},
+		{"running job of another type", func(t *testing.T, q *testQueue) (string, string) {
+			return q.seed(t, "other", "w", StatusRunning).ID, ""
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,10 +240,10 @@ func TestEnqueueFollowUp_RefusesUnlessTheNamedJobIsTheOnePendingAndRunning(t *te
 			ctx := context.Background()
 			q := newTestQueue(t)
 			named, want := tc.arrange(t, q)
-			before := q.count(t, "w")
+			before := q.count(t, "w") + q.count(t, "other")
 
 			err := q.st.Tx(ctx, func(tx *sql.Tx) error {
-				_, err := q.EnqueueFollowUp(ctx, tx, named, json.RawMessage(`{}`))
+				_, err := q.EnqueueFollowUp(ctx, tx, "probe", "w", named, json.RawMessage(`{}`))
 				return err
 			})
 			var dup *DuplicateError
@@ -247,8 +253,8 @@ func TestEnqueueFollowUp_RefusesUnlessTheNamedJobIsTheOnePendingAndRunning(t *te
 			case want != "" && (!errors.As(err, &dup) || dup.JobID != want):
 				t.Errorf("EnqueueFollowUp: err %v, want a duplicate naming %s", err, want)
 			}
-			if n := q.count(t, "w"); n != before {
-				t.Errorf("jobs of w = %d, want %d", n, before)
+			if n := q.count(t, "w") + q.count(t, "other"); n != before {
+				t.Errorf("jobs = %d, want %d", n, before)
 			}
 		})
 	}

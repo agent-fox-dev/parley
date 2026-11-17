@@ -2352,8 +2352,9 @@ A `--strategy` other than `rebase` or `merge`, a `--fail-mode` other than
 `fail_fast` or `continue`, a `--status` other than `queued`, `running`,
 `failed`, `completed`, `dead_letter` or `cancelled` (`parley rebuild
 submit takes --strategy rebase or merge, got "squash"`), a `--timeout` or
-`--poll-interval` that is not a duration, and a wrong number of arguments
-are a `usage_error` with exit status `2`, before any request is sent.
+`--poll-interval` that is not a positive [duration](#waiting) (`0s` and
+`-1s` are refused too), and a wrong number of arguments are a
+`usage_error` with exit status `2`, before any request is sent.
 
 ### `parley land`
 

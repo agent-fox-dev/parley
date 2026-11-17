@@ -26,13 +26,6 @@ const (
 // Statuses are the six statuses of a job.
 var Statuses = []string{StatusQueued, StatusRunning, StatusFailed, StatusCompleted, StatusDeadLetter, StatusCancelled}
 
-// Pending reports whether status is one a job still has work ahead in:
-// queued, running or failed. A type and workspace have at most one pending
-// job, apart from the follow-up of a running one.
-func Pending(status string) bool {
-	return status == StatusQueued || status == StatusRunning || status == StatusFailed
-}
-
 // Final reports whether status is an end state: completed, dead_letter or
 // cancelled. Only a requeue takes a job out of dead_letter.
 func Final(status string) bool {

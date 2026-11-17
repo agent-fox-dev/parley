@@ -713,7 +713,8 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 		addHub: &addHub{readHub: &readHub{}, now: time.Now().UTC().Truncate(time.Second).Add(700 * time.Millisecond)},
 		runner: &rebuildRunner{attempts: map[string]*rebuildAttempt{}, calls: map[string]int{}, done: make(chan struct{})},
 	}
-	clock := &stillClock{now: h.clock, armed: make(chan struct{})}
+	// The queue's timers never fire: the test does not advance its clock.
+	clock := hubtest.NewJobClock(h.clock)
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Now:  h.clock,
 		TOML: "[limits]\nrequests_per_minute = 0\n",
@@ -732,7 +733,7 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 	t.Cleanup(h.runner.stop)
 	// The dispatcher's own pass at its start could claim a test's first
 	// job; from here on only the test's passes do.
-	within(t, clock.armed, "the job queue's first pass")
+	hubtest.WaitClosed(t, clock.Armed(jobs.DefaultInterval), "the job queue's first pass")
 	h.owner = h.CreateUser(t, "owner")
 	h.key = h.IssueKey(t, h.owner)
 	h.org = h.CreateOrg(t, "acme")
@@ -952,7 +953,7 @@ func (h *rebuildHub) drive(t *testing.T, id, status string) {
 			}
 		})
 		h.pass(t)
-		within(t, a.entered, "the attempt of the job "+id+" to begin")
+		hubtest.WaitClosed(t, a.entered, "the attempt of the job "+id+" to begin")
 	case jobs.StatusCompleted:
 		h.attempt(t, id, nil)
 	case jobs.StatusFailed:
@@ -972,7 +973,7 @@ func (h *rebuildHub) attempt(t *testing.T, id string, err error) {
 	a := h.runner.expect(id)
 	a.outcome <- err
 	h.pass(t)
-	within(t, a.entered, "the attempt of the job "+id+" to begin")
+	hubtest.WaitClosed(t, a.entered, "the attempt of the job "+id+" to begin")
 	h.settled(t, a)
 }
 
@@ -1002,7 +1003,7 @@ func (h *rebuildHub) finish(t *testing.T, id string, err error) {
 // the settlement hook ran ends after the settlement.
 func (h *rebuildHub) settled(t *testing.T, a *rebuildAttempt) {
 	t.Helper()
-	within(t, a.settled, "the outcome of the attempt to be settled")
+	hubtest.WaitClosed(t, a.settled, "the outcome of the attempt to be settled")
 	if err := h.Store.Tx(context.Background(), func(*sql.Tx) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -1013,16 +1014,6 @@ func (h *rebuildHub) wantStatus(t *testing.T, id, status string) {
 	t.Helper()
 	if got := h.job(t, id).Status; got != status {
 		t.Fatalf("the job %s is %s, want %s", id, got, status)
-	}
-}
-
-// within waits up to 10 s for ch to be closed, and fails the test then.
-func within(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("waited 10 s for %s", what)
 	}
 }
 
@@ -1129,26 +1120,3 @@ func (r *rebuildRunner) Settled(_ context.Context, _ *sql.Tx, j jobs.Job, _ bool
 	}
 	return nil
 }
-
-// stillClock is a job queue's clock whose time is now and whose timers
-// never fire: the queue passes only when a test asks it to. armed is
-// closed once the dispatcher has asked for its first timer, which it does
-// after the pass it makes as it starts.
-type stillClock struct {
-	now   func() time.Time
-	once  sync.Once
-	armed chan struct{}
-}
-
-func (c *stillClock) Now() time.Time { return c.now() }
-
-func (c *stillClock) NewTimer(time.Duration) jobs.Timer {
-	c.once.Do(func() { close(c.armed) })
-	return stillTimer{}
-}
-
-type stillTimer struct{}
-
-func (stillTimer) C() <-chan time.Time { return nil }
-
-func (stillTimer) Stop() bool { return true }

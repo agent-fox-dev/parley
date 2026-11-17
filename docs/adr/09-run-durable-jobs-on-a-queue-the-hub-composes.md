@@ -75,3 +75,6 @@ Several things had to be settled that the code, not the spec, decides:
   the same data directory, which the hub does not support, would break it.
 - The queue's grace and the hub's stop limit are both 30 seconds; in
   production they expire together.
+- A settlement whose own store transaction fails is logged with the job
+  id and not retried: the job stays `running`, and holds its type and
+  workspace, until the next start's `Recover` queues it again.

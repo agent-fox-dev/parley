@@ -36,39 +36,70 @@ func (q *Queue) Recover(ctx context.Context) error {
 
 // stop ends the queue's work once Run's context is cancelled: no pass
 // claims a job any more, and it waits up to ShutdownGrace for the attempts
-// that run, whose outcomes are settled as they arrive. It returns as soon
-// as the last of them is settled, at once when none runs. The attempts
-// still running at the end of the grace are cancelled and abandoned: an
-// outcome they return later is dropped, so that their jobs stay running
-// for Recover.
+// that run, whose outcomes are settled as they arrive, and for the
+// cancellations of removed jobs' attempts, which use the store the hub
+// closes once Run has returned. It returns as soon as the last of them has
+// ended, at once when none is under way. At the end of the grace, the
+// attempts still running are cancelled and abandoned: an outcome they
+// return later is dropped, so that their jobs stay running for Recover.
+// The settlements already under way then are waited for, since they write
+// to the store; a cancellation of removed jobs' attempts still under way is
+// not, so that a stop is never held beyond the grace by the store.
 func (q *Queue) stop(d Deps) {
 	q.mu.Lock()
 	q.stopping = true
-	idle := len(q.running) == 0
 	q.mu.Unlock()
-	if idle {
+
+	// No worker is reserved once stopping is set; a removal may still start
+	// a cancellation, so the work under way is looked for again each time a
+	// part of it ends. Nothing here starts a goroutine, so that nothing is
+	// left waiting for an attempt that ignores its cancellation.
+	next := q.underWay()
+	if next == nil {
 		return
 	}
-
-	// No worker is reserved once stopping is set, so the wait sees every
-	// attempt there is.
-	ended := make(chan struct{})
-	go func() {
-		q.workers.Wait()
-		close(ended)
-	}()
 	grace := d.Clock.NewTimer(ShutdownGrace)
 	defer grace.Stop()
-	select {
-	case <-ended:
-		return
-	case <-grace.C():
+	for next != nil {
+		select {
+		case <-next:
+			next = q.underWay()
+		case <-grace.C():
+			q.abandon()
+			return
+		}
 	}
+}
 
+// abandon cancels and abandons every attempt still running at the end of a
+// stop's grace, and waits for the settlements already under way.
+func (q *Queue) abandon() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
+	var settling []chan struct{}
 	for _, w := range q.running {
+		if w.settling {
+			settling = append(settling, w.done)
+			continue
+		}
 		w.abandoned = true
 		w.cancel()
 	}
+	q.mu.Unlock()
+	for _, done := range settling {
+		<-done
+	}
+}
+
+// underWay is the channel of an attempt or of a removal's cancellation
+// that has not ended yet, closed once it has; nil when there is none.
+func (q *Queue) underWay() <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, w := range q.running {
+		return w.done
+	}
+	for done := range q.removals {
+		return done
+	}
+	return nil
 }

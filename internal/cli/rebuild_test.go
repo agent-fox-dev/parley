@@ -64,6 +64,18 @@ func TestRebuild_SendsTheCommandsRequestAndPrintsTheAnswer(t *testing.T) {
 			wantSends(t, tt.args, tt.want)
 		})
 	}
+	t.Run("rebuild submit answered 202", func(t *testing.T) {
+		hub := rebuildHub(t, submitPath)
+
+		code, stdout, stderr := runWorkspace(t, hub, "rebuild", "submit", "my-project")
+
+		if code != 0 || stdout != indented(t, rebuildJob("queued", 0)) {
+			t.Errorf("exit status %d, stdout %q (stderr %q); want 0 and the queued job's record", code, stdout, stderr)
+		}
+		if n := len(hub.recorded()); n != 1 {
+			t.Errorf("the hub got %d requests, want 1", n)
+		}
+	})
 }
 
 func TestRebuild_PrintsTheHubsRefusalAsReceived(t *testing.T) {

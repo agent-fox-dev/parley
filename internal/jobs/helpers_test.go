@@ -1,11 +1,13 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -451,6 +453,21 @@ func (q *Queue) settleAll(t testing.TB) {
 	}
 }
 
+// waitRemovals waits until every cancellation of removed jobs' attempts
+// under way now has ended; it fails the test after 5 s.
+func (q *Queue) waitRemovals(t testing.TB) {
+	t.Helper()
+	q.mu.Lock()
+	var dones []chan struct{}
+	for d := range q.removals {
+		dones = append(dones, d)
+	}
+	q.mu.Unlock()
+	for _, d := range dones {
+		waitClosed(t, d, "a removal's cancellation")
+	}
+}
+
 // waitClosed waits for c to be closed; it fails the test after 5 s.
 func waitClosed(t testing.TB, c <-chan struct{}, what string) {
 	t.Helper()
@@ -507,4 +524,37 @@ func (q *testQueue) failTimes(t testing.TB, h *scriptedHandler, id string, n int
 				j.RetryCount, i+1)
 		}
 	}
+}
+
+// failAt sets the next attempt of the failed job id at next.
+func (q *testQueue) failAt(t testing.TB, id string, next time.Time) {
+	t.Helper()
+	err := q.st.Tx(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(), `UPDATE jobs SET next_attempt_at = ? WHERE id = ?`, next.UnixNano(), id)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("set the next attempt of %s: %v", id, err)
+	}
+}
+
+// goroutinesOf is the number of goroutines whose stack, or the line that
+// says what created them, names fn.
+func goroutinesOf(fn string) int {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, g := range bytes.Split(buf, []byte("\n\n")) {
+		if bytes.Contains(g, []byte(fn)) {
+			count++
+		}
+	}
+	return count
 }

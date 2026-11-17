@@ -61,7 +61,9 @@ type querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// pendingStatuses is the SQL list of the statuses Pending reports.
+// pendingStatuses is the SQL list of the statuses a job still has work
+// ahead in. A type and workspace have at most one pending job, apart from
+// the follow-up of a running one.
 const pendingStatuses = `('queued', 'running', 'failed')`
 
 // secondsOf is created_at, stored in nanoseconds, at the whole seconds a

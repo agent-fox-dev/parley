@@ -18,6 +18,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/hub"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/jobs"
 )
 
@@ -28,8 +29,9 @@ type rebuildHub struct {
 	*workspaceHub
 	queue *jobs.Queue
 	clock *fakeNow
-	// jobsClock is the job queue's clock, on clock.
-	jobsClock *jobsClock
+	// jobsClock is the job queue's clock, on clock, and the hub's: what
+	// it is advanced by moves both.
+	jobsClock *hubtest.JobClock
 }
 
 // startRebuildHub starts a rebuild hub whose rebuild jobs handler runs. Its
@@ -39,8 +41,8 @@ type rebuildHub struct {
 func startRebuildHub(t *testing.T, handler jobs.Handler, adjust func(*jobs.Deps)) *rebuildHub {
 	t.Helper()
 	h := &rebuildHub{clock: &fakeNow{now: time.Now().UTC()}}
-	h.jobsClock = &jobsClock{fakeNow: h.clock, timers: map[*jobsTimer]bool{}, armed: map[time.Duration]chan struct{}{}}
-	h.workspaceHub, _, _ = startPatchHubWith(t, h.clock.Now, func(c *hub.Composition) {
+	h.jobsClock = hubtest.NewJobClock(h.clock.Now)
+	h.workspaceHub, _, _ = startPatchHubWith(t, h.jobsClock.Now, func(c *hub.Composition) {
 		h.queue = c.Jobs()
 		h.queue.Register(carrypatch.RebuildJobType, handler)
 		c.AdjustJobs(func(d *jobs.Deps) {
@@ -52,7 +54,7 @@ func startRebuildHub(t *testing.T, handler jobs.Handler, adjust func(*jobs.Deps)
 	}, "patch/a")
 	// The dispatcher's own pass at its start could claim a job of the test;
 	// from here on only the test's passes, the wake and the clock do.
-	waitClosed(t, h.jobsClock.armedFor(jobs.DefaultInterval), "the job queue's first pass")
+	hubtest.WaitClosed(t, h.jobsClock.Armed(jobs.DefaultInterval), "the job queue's first pass")
 	return h
 }
 
@@ -90,7 +92,7 @@ func (h *rebuildHub) stepWhile(status string) func(rebuildAnswer) bool {
 	return func(r rebuildAnswer) bool {
 		job, ok := firstJob(r)
 		if ok && job["status"] == status {
-			h.jobsClock.advance(time.Second)
+			h.jobsClock.Advance(time.Second)
 			return false
 		}
 		return ok
@@ -141,83 +143,6 @@ func (h *rebuildHub) rebuildCall(t *testing.T, method, path string) rebuildAnswe
 	return a
 }
 
-// jobsClock is a job queue's clock on the test's clock whose timers fire
-// when the test advances it with advance.
-type jobsClock struct {
-	*fakeNow
-	mu     sync.Mutex
-	timers map[*jobsTimer]bool
-	// armed holds, for each duration, a channel closed once a timer of it
-	// has been asked for.
-	armed map[time.Duration]chan struct{}
-}
-
-type jobsTimer struct {
-	clock *jobsClock
-	at    time.Time
-	c     chan time.Time
-}
-
-func (c *jobsClock) NewTimer(d time.Duration) jobs.Timer {
-	t := &jobsTimer{clock: c, at: c.Now().Add(d), c: make(chan time.Time, 1)}
-	armed := c.armedFor(d)
-	c.mu.Lock()
-	c.timers[t] = true
-	select {
-	case <-armed:
-	default:
-		close(armed)
-	}
-	c.mu.Unlock()
-	return t
-}
-
-// armedFor is a channel closed once a timer of d has been asked for.
-func (c *jobsClock) armedFor(d time.Duration) chan struct{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ch, ok := c.armed[d]
-	if !ok {
-		ch = make(chan struct{})
-		c.armed[d] = ch
-	}
-	return ch
-}
-
-// advance moves the clock on by d and fires the timers that are due.
-func (c *jobsClock) advance(d time.Duration) {
-	c.fakeNow.advance(d)
-	now := c.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for t := range c.timers {
-		if !t.at.After(now) {
-			delete(c.timers, t)
-			t.c <- now
-		}
-	}
-}
-
-func (t *jobsTimer) C() <-chan time.Time { return t.c }
-
-func (t *jobsTimer) Stop() bool {
-	t.clock.mu.Lock()
-	defer t.clock.mu.Unlock()
-	pending := t.clock.timers[t]
-	delete(t.clock.timers, t)
-	return pending
-}
-
-// waitClosed waits up to 10 s for ch to be closed, and fails the test then.
-func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("waited 10 s for %s", what)
-	}
-}
-
 // failsForGoodOnce is a rebuild handler whose first attempt fails for good
 // with a conflict report as its detail, and whose later attempts run until
 // they are cancelled. settled is closed once the first attempt's outcome
@@ -255,7 +180,7 @@ func TestRebuildJobs_CancelAQueuedRebuildAndRequeueADeadLetteredOne(t *testing.T
 		t.Fatalf("POST rebuild = %d %s, want 202 with a job", first.status, first.raw)
 	}
 	h.pass(t)
-	waitClosed(t, handler.settled, "the first attempt to be settled")
+	hubtest.WaitClosed(t, handler.settled, "the first attempt to be settled")
 	// The store runs its write transactions one at a time, in the order
 	// they are asked for: an empty one asked for now ends after the
 	// settlement's.
@@ -420,7 +345,7 @@ func TestRebuildJobs_SubmitAndWaitThroughARetry(t *testing.T) {
 		t.Fatalf("the job waiting to retry = %v, want failed with retry_count 1 and its next attempt 4 s after the failure", failed)
 	}
 
-	h.jobsClock.advance(4 * time.Second)
+	h.jobsClock.Advance(4 * time.Second)
 	h.waitRebuild(t, "/rebuilds/"+id, h.stepWhile("failed"))
 	var code int
 	select {
@@ -497,15 +422,15 @@ func TestRebuildJobs_ARunningRebuildSurvivesARestart(t *testing.T) {
 		t.Fatalf("POST rebuild = %d %s, want 202 with a job", post.status, post.raw)
 	}
 	h.waitRebuild(t, "/rebuilds/"+id, leaves("queued"))
-	waitClosed(t, started, "the first attempt")
+	hubtest.WaitClosed(t, started, "the first attempt")
 	if r := h.rebuildCall(t, http.MethodGet, "/rebuilds/"+id); r.record["status"] != "running" {
 		t.Fatalf("GET the job = %d %s, want running", r.status, r.raw)
 	}
 	// The stop waits for the attempt for the queue's grace, on its clock.
 	go func() {
 		select {
-		case <-h.jobsClock.armedFor(jobs.ShutdownGrace):
-			h.jobsClock.advance(jobs.ShutdownGrace)
+		case <-h.jobsClock.Armed(jobs.ShutdownGrace):
+			h.jobsClock.Advance(jobs.ShutdownGrace)
 		case <-time.After(10 * time.Second):
 		}
 	}()

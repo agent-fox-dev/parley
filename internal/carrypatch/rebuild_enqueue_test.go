@@ -172,3 +172,23 @@ func TestEnqueueRebuild_QueuesWithoutTheActivePatchCheckAndReportsADuplicate(t *
 		})
 	}
 }
+
+func TestEnqueueRebuild_RefusesAFollowUpOfAnotherWorkspacesJob(t *testing.T) {
+	t.Parallel()
+	h := startRebuildHub(t)
+	h.carryWith(t, "w", nil, carrypatch.StatusActive)
+	h.carryWith(t, "other", nil, carrypatch.StatusActive)
+	foreign, _ := h.enqueue(t, "other", carrypatch.RebuildOptions{SubmittedBy: "system:push", ActorType: event.ActorSystem})
+	h.drive(t, foreign, jobs.StatusRunning)
+
+	opts := carrypatch.RebuildOptions{SubmittedBy: "system:followup", ActorType: event.ActorSystem, FollowUpOf: &foreign}
+	res, err := h.comp.Rebuilds().EnqueueRebuild(context.Background(), "w", opts)
+	if err == nil {
+		t.Errorf("the follow-up of a job of another workspace = %+v, want an error", res)
+	}
+	for slug, want := range map[string]int{"w": 0, "other": 1} {
+		if js, events := h.jobsOf(t, slug), h.rebuildEvents(t, slug, carrypatch.EventRebuildEnqueue); len(js) != want || len(events) != want {
+			t.Errorf("%s has %d jobs and %d enqueue events, want %d of each", slug, len(js), len(events), want)
+		}
+	}
+}

@@ -137,7 +137,7 @@ func TestRemoveWorkspace_CancelsTheAttemptsOfItsJobsOnceTheRemovalCommits(t *tes
 			return nil
 		})
 		// What the removal set off has run.
-		q.removals.Wait()
+		q.waitRemovals(t)
 		return err
 	}
 

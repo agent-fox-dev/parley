@@ -17,8 +17,9 @@ type RebuildOptions struct {
 	ActorType string
 	ActorID   *string
 	SessionID *string
-	// FollowUpOf is the id of the job this rebuild follows up, nil for
-	// none.
+	// FollowUpOf is the id of the running rebuild job of the same workspace
+	// this rebuild follows up, nil for none; a job of another workspace or
+	// type is an error, and nothing is queued.
 	FollowUpOf *string
 }
 

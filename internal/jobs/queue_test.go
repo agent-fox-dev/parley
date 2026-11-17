@@ -13,41 +13,30 @@ import (
 	"time"
 )
 
-func TestList_ReadsAWorkspacesJobsOfATypeNewestFirst(t *testing.T) {
+// The order, status filter, workspace and pages of List are those of the
+// rebuild list route, tested there; these are what its jobs do not show.
+func TestList_LeavesOutOtherTypesAndResumesWithinOneSecondByID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	q := newTestQueue(t)
-	// first and second share the second their created_at shows, so the id
-	// orders them; third is the newest.
 	first := q.seed(t, "probe", "w", StatusCompleted)
 	q.clock.Advance(400 * time.Millisecond)
 	second := q.seed(t, "probe", "w", StatusCancelled)
-	q.clock.Advance(2 * time.Second)
-	third := q.seed(t, "probe", "w", StatusQueued)
-	q.seed(t, "probe", "other", StatusQueued)
 	q.seed(t, "other", "w", StatusQueued)
 	sameSecond := []string{first.ID, second.ID}
 	slices.Sort(sameSecond)
-	slices.Reverse(sameSecond)
-	all := append([]string{third.ID}, sameSecond...)
-	afterThird := third.Position()
 
 	cases := []struct {
-		name   string
-		status string
-		after  *ListPosition
-		limit  int
-		want   []string
+		name  string
+		after *ListPosition
+		want  []string
 	}{
-		{"all", "", nil, 10, all},
-		{"one status", StatusCancelled, nil, 10, []string{second.ID}},
-		{"limited", "", nil, 2, all[:2]},
-		{"after the newest", "", &afterThird, 10, all[1:]},
-		{"after one of the same second", "", &ListPosition{Seconds: first.CreatedAt.Unix(), ID: sameSecond[0]}, 10, all[2:]},
+		{"from the start", nil, []string{sameSecond[1], sameSecond[0]}},
+		{"after the greater id of the second", &ListPosition{Seconds: first.CreatedAt.Unix(), ID: sameSecond[1]}, sameSecond[:1]},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			jobs, err := q.List(ctx, "probe", "w", tc.status, tc.after, tc.limit)
+			jobs, err := q.List(ctx, "probe", "w", "", tc.after, 10)
 			if err != nil {
 				t.Fatalf("List: %v", err)
 			}
@@ -248,7 +237,7 @@ func TestPass_RunsOneJobOfATypeAndWorkspaceAtATime(t *testing.T) {
 			var f Job
 			err := q.st.Tx(ctx, func(tx *sql.Tx) error {
 				var err error
-				f, err = q.EnqueueFollowUp(ctx, tx, a.ID, json.RawMessage(`{"follow":true}`))
+				f, err = q.EnqueueFollowUp(ctx, tx, "probe", "w", a.ID, json.RawMessage(`{"follow":true}`))
 				return err
 			})
 			if err != nil {
@@ -491,5 +480,46 @@ func TestDepth_CountsTheJobsOfEveryRegisteredTypeByStatus(t *testing.T) {
 	}
 	if wantAll := map[string]map[string]int{"probe": want, "rebuild": zero}; !reflect.DeepEqual(got, wantAll) {
 		t.Errorf("Depth = %v, want %v", got, wantAll)
+	}
+}
+
+func TestHasWork_FindsOnlyWhatAPassWouldDo(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		// arrange stores the jobs of the case.
+		arrange func(t *testing.T, q *testQueue)
+		want    bool
+	}{
+		{"no job", func(*testing.T, *testQueue) {}, false},
+		{"a queued job", func(t *testing.T, q *testQueue) { q.seed(t, "probe", "w", StatusQueued) }, true},
+		{"a queued job of a type without handler", func(t *testing.T, q *testQueue) { q.seed(t, "other", "w", StatusQueued) }, false},
+		{"a queued follow-up behind its running job", func(t *testing.T, q *testQueue) {
+			running := q.seed(t, "probe", "w", StatusRunning)
+			err := q.st.Tx(context.Background(), func(tx *sql.Tx) error {
+				_, err := q.EnqueueFollowUp(context.Background(), tx, "probe", "w", running.ID, json.RawMessage(`{}`))
+				return err
+			})
+			if err != nil {
+				t.Fatalf("EnqueueFollowUp: %v", err)
+			}
+		}, false},
+		{"a failed job whose next attempt is due", func(t *testing.T, q *testQueue) {
+			q.failAt(t, q.seed(t, "probe", "w", StatusFailed).ID, q.clock.Now())
+		}, true},
+		{"a failed job whose next attempt is not due", func(t *testing.T, q *testQueue) {
+			q.failAt(t, q.seed(t, "probe", "w", StatusFailed).ID, q.clock.Now().Add(time.Second))
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q := newTestQueue(t)
+			tc.arrange(t, q)
+			got, err := hasWork(context.Background(), q.st.Main(), q.clock.Now(), []string{"probe"})
+			if err != nil || got != tc.want {
+				t.Errorf("hasWork = %v, %v; want %v", got, err, tc.want)
+			}
+		})
 	}
 }
