@@ -324,6 +324,146 @@ func TestRepo_WritesOriginHeadsConfigAndTheDefaultBranch(t *testing.T) {
 	}
 }
 
+// configRepo is a bare repository whose own configuration holds what git
+// init wrote and then extra, opened with a count of the git processes it
+// runs.
+func configRepo(t *testing.T, extra string) (dir string, repo *gitrepo.Repo, calls *atomic.Int32) {
+	t.Helper()
+	dir = filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.Git(t, filepath.Dir(dir), "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	f, err := os.OpenFile(filepath.Join(dir, "config"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(extra); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls = new(atomic.Int32)
+	repo, err = gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, repo, calls
+}
+
+// gitConfig is what git config --local --get says of key in dir.
+func gitConfig(t *testing.T, dir, key string) (string, bool) {
+	t.Helper()
+	out, err := gitrepotest.Run(dir, "", "config", "--local", "--get", key)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSuffix(out, "\n"), true
+}
+
+func TestConfig_ReadsTheRepositorysOwnConfigurationWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	dir, repo, calls := configRepo(t, `[remote "origin"]
+	url = https://example.invalid/a.git # where it came from
+	fetch = +refs/heads/*:refs/remotes/origin/*
+; a comment
+[parley]
+	workspace = abc
+	upstreamDefaultBranch = main
+[Parley]
+	UPSTREAMDEFAULTBRANCH  =   trunk   line   ; the last one counts
+	empty =
+[parley.sub]
+	key = in a subsection
+[parley "sub"]
+	key = in a subsection too
+[other]
+	workspace = not this one
+`)
+	for _, c := range []struct {
+		key, want string
+		found     bool
+	}{
+		{"parley.workspace", "abc", true},
+		{"parley.upstreamDefaultBranch", "trunk   line", true},
+		{"PARLEY.UpstreamDefaultBranch", "trunk   line", true},
+		{"parley.empty", "", true},
+		{"parley.key", "", false},
+		{"parley.missing", "", false},
+		{"core.bare", "true", true},
+	} {
+		want, wantFound := gitConfig(t, dir, c.key)
+		if want != c.want || wantFound != c.found {
+			t.Fatalf("git config --get %s = %q, %v; the case wants %q, %v", c.key, want, wantFound, c.want, c.found)
+		}
+		calls.Store(0)
+		got, found, err := repo.Config(context.Background(), c.key)
+		if err != nil || found != c.found || got != c.want {
+			t.Errorf("Config(%s) = %q, %v, %v; want %q, %v", c.key, got, found, err, c.want, c.found)
+		}
+		if n := calls.Load(); n != 0 {
+			t.Errorf("Config(%s) ran %d git processes, want none", c.key, n)
+		}
+	}
+}
+
+func TestConfig_AsksGitAboutWhatItDoesNotReadItself(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct{ extra, key string }{
+		"a quoted value":      {"[parley]\n\tworkspace = \"a # b\"\n", "parley.workspace"},
+		"an escape":           {"[parley]\n\tworkspace = a\\tb\n", "parley.workspace"},
+		"a continued line":    {"[parley]\n\tworkspace = a\\\n b\n", "parley.workspace"},
+		"a key with no value": {"[parley]\n\tworkspace\n", "parley.workspace"},
+		"an include":          {"[include]\n\tpath = other\n", "parley.workspace"},
+		"a header and a key":  {"[parley] workspace = abc\n", "parley.workspace"},
+	} {
+		dir, repo, _ := configRepo(t, c.extra)
+		if name == "an include" {
+			if err := os.WriteFile(filepath.Join(dir, "other"), []byte("[parley]\n\tworkspace = included\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want, wantFound := gitConfig(t, dir, c.key)
+		got, found, err := repo.Config(context.Background(), c.key)
+		if err != nil || found != wantFound || got != want {
+			t.Errorf("%s: Config(%s) = %q, %v, %v; want git's %q, %v", name, c.key, got, found, err, want, wantFound)
+		}
+	}
+}
+
+func TestSetConfig_LeavesAKeyThatHoldsTheValueAlready(t *testing.T) {
+	t.Parallel()
+	dir, repo, calls := configRepo(t, "[parley]\n\tworkspace = abc\n\ttwice = a\n\ttwice = a\n")
+	ctx := context.Background()
+	for _, c := range []struct {
+		name  string
+		write func() error
+		key   string
+		want  string
+		found bool
+		git   bool
+	}{
+		{"the value it holds", func() error { return repo.SetConfig(ctx, "parley.workspace", "abc") }, "parley.workspace", "abc", true, false},
+		{"another value", func() error { return repo.SetConfig(ctx, "parley.workspace", "def") }, "parley.workspace", "def", true, true},
+		{"a key that is not set", func() error { return repo.SetConfig(ctx, "parley.new", "x") }, "parley.new", "x", true, true},
+		{"the removal of a key that is not set", func() error { return repo.UnsetConfig(ctx, "parley.gone") }, "parley.gone", "", false, false},
+		{"the removal of a key that is set", func() error { return repo.UnsetConfig(ctx, "parley.new") }, "parley.new", "", false, true},
+	} {
+		calls.Store(0)
+		if err := c.write(); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got, found := gitConfig(t, dir, c.key); got != c.want || found != c.found {
+			t.Errorf("%s: git config --get %s = %q, %v; want %q, %v", c.name, c.key, got, found, c.want, c.found)
+		}
+		if ran := calls.Load() != 0; ran != c.git {
+			t.Errorf("%s: ran git = %v, want %v", c.name, ran, c.git)
+		}
+	}
+	// A key set twice is git's to refuse.
+	if err := repo.SetConfig(ctx, "parley.twice", "a"); err == nil {
+		t.Errorf("SetConfig of a key set twice = nil, want git's refusal")
+	}
+}
+
 func TestOpen_RefusesWhatIsNotARepository(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -399,6 +539,88 @@ func TestOpen_OpensAGitDirectoryWithoutRunningGit(t *testing.T) {
 		if repo.Dir() != dir {
 			t.Errorf("Open(%s).Dir() = %q, want %q", name, repo.Dir(), dir)
 		}
+	}
+}
+
+func TestResolveBranch_ReadsTheBranchWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.Git(t, filepath.Dir(dir), "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	who := "committer T <t@example.invalid> 1700000000 +0000\n"
+	if _, err := gitrepotest.Run(dir, "commit refs/heads/main\n"+who+"data 2\nc1\n\n"+
+		"commit refs/heads/packed\n"+who+"data 2\nc2\nfrom refs/heads/main\n\n"+
+		"commit refs/heads/feature/moved\n"+who+"data 2\nc3\nfrom refs/heads/main\n\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	gitrepotest.Git(t, dir, "pack-refs", "--all")
+	main := gitrepotest.Git(t, dir, "rev-parse", "main")
+	// A loose ref written after pack-refs takes the place of the packed one.
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/feature/moved", main)
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/loose", main)
+	packed := gitrepotest.Git(t, dir, "rev-parse", "packed")
+	var calls atomic.Int32
+	repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		branch, want string
+		found        bool
+	}{
+		{"main", main, true},
+		{"packed", packed, true},
+		{"feature/moved", main, true},
+		{"loose", main, true},
+		{"nope", "", false},
+		{"feature", "", false},
+	} {
+		calls.Store(0)
+		got, found, err := repo.ResolveBranch(context.Background(), c.branch)
+		if err != nil || found != c.found || got != c.want {
+			t.Errorf("ResolveBranch(%s) = %q, %v, %v; want %q, %v", c.branch, got, found, err, c.want, c.found)
+		}
+		if n := calls.Load(); n != 0 {
+			t.Errorf("ResolveBranch(%s) ran %d git processes, want none", c.branch, n)
+		}
+	}
+}
+
+func TestResolveBranch_AsksGitAboutWhatItDoesNotReadItself(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	gitrepotest.Git(t, filepath.Dir(dir), "init", "--quiet", "--bare", "--initial-branch=main", dir)
+	if _, err := gitrepotest.Run(dir, "commit refs/heads/main\ncommitter T <t@example.invalid> 1700000000 +0000\ndata 1\nc\n\n", "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	main := gitrepotest.Git(t, dir, "rev-parse", "main")
+	gitrepotest.Git(t, dir, "symbolic-ref", "refs/heads/alias", "refs/heads/main")
+	gitrepotest.Git(t, dir, "symbolic-ref", "refs/heads/dangling", "refs/heads/gone")
+	if err := os.WriteFile(filepath.Join(dir, "refs", "heads", "garbled"), []byte("not an id\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := gitrepo.Git{}.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		branch, want string
+		found        bool
+	}{
+		{"alias", main, true},
+		{"dangling", "", false},
+		{"garbled", "", false},
+		{"../HEAD", "", false},
+	} {
+		got, found, err := repo.ResolveBranch(context.Background(), c.branch)
+		if err != nil || found != c.found || got != c.want {
+			t.Errorf("ResolveBranch(%s) = %q, %v, %v; want %q, %v", c.branch, got, found, err, c.want, c.found)
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := repo.ResolveBranch(context.Background(), "main"); err == nil {
+		t.Errorf("ResolveBranch(main) of a removed repository = %q, %v, nil; want an error", got, found)
 	}
 }
 
