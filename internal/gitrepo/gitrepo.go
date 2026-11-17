@@ -8,6 +8,11 @@
 // hub, with terminal prompts disabled, and is killed with every process it
 // started when its context ends. A credential reaches git only through the
 // environment of the one process that needs it (see Credential).
+//
+// What a git process would cost many times over to read, a git directory's
+// layout, a branch's head, the refs below a prefix and a key of its own
+// configuration, it reads from git's own files in process, and it asks git
+// whenever those files are not what it reads.
 package gitrepo
 
 import (
@@ -200,8 +205,18 @@ func (r *Repo) SetDefaultBranch(ctx context.Context, branch string) error {
 
 // ResolveBranch is the commit id branch points at; found is false, with no
 // error, when there is no such branch or it points at no commit.
+//
+// It reads the branch from git's files ref backend in process, as git
+// does, and asks git only about what it does not read that way.
 func (r *Repo) ResolveBranch(ctx context.Context, branch string) (id string, found bool, err error) {
-	return r.resolve(ctx, "refs/heads/"+branch)
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	ref := "refs/heads/" + branch
+	if id, found, ok := readBranch(r.dir, ref); ok {
+		return id, found, nil
+	}
+	return r.resolve(ctx, ref)
 }
 
 // Branches maps every branch of the repository to its commit id.
@@ -220,8 +235,15 @@ func (r *Repo) OriginURL(ctx context.Context) (string, error) {
 }
 
 // Config reads the value of key from the repository's own configuration;
-// found is false, with no error, when it is not set there.
+// found is false, with no error, when it is not set there. It reads the
+// file in process, and asks git when the file is not what it reads.
 func (r *Repo) Config(ctx context.Context, key string) (value string, found bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if value, n, ok := readConfig(r.dir, key); ok {
+		return value, n > 0, nil
+	}
 	out, err := r.git(ctx, "config", "--local", "--get", key)
 	if exitCode(err) == 1 {
 		return "", false, nil
@@ -232,8 +254,15 @@ func (r *Repo) Config(ctx context.Context, key string) (value string, found bool
 	return strings.TrimSuffix(string(out), "\n"), true, nil
 }
 
-// SetConfig writes value under key in the repository's own configuration.
+// SetConfig writes value under key in the repository's own configuration;
+// a key that holds value once already is left as it is.
 func (r *Repo) SetConfig(ctx context.Context, key, value string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if v, n, ok := readConfig(r.dir, key); ok && n == 1 && v == value {
+		return nil
+	}
 	_, err := r.git(ctx, "config", "--local", key, value)
 	return err
 }
@@ -241,6 +270,12 @@ func (r *Repo) SetConfig(ctx context.Context, key, value string) error {
 // UnsetConfig removes key from the repository's own configuration; a key
 // that is not set there is no error.
 func (r *Repo) UnsetConfig(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, n, ok := readConfig(r.dir, key); ok && n == 0 {
+		return nil
+	}
 	_, err := r.git(ctx, "config", "--local", "--unset-all", key)
 	// git config exits with 5 for a key it does not find.
 	if exitCode(err) == 5 {
@@ -302,8 +337,16 @@ func (r *Repo) resolve(ctx context.Context, ref string) (string, bool, error) {
 }
 
 // refs maps every ref below prefix, by its name without the prefix, to the
-// object id it points at.
+// object id it points at. It reads them from git's files ref backend in
+// process (readRefs), and asks git only about what it does not read that
+// way.
 func (r *Repo) refs(ctx context.Context, prefix string) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if refs, ok := readRefs(r.dir, prefix); ok {
+		return refs, nil
+	}
 	out, err := r.git(ctx, "for-each-ref", "--format=%(objectname) %(refname)", prefix)
 	if err != nil {
 		return nil, err

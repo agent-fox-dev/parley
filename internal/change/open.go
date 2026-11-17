@@ -365,7 +365,11 @@ type opening struct {
 	targetRepo, sourceRepo *gitrepo.Repo
 	targetBranch           string
 	head, base, patchID    string
-	stats                  Stats
+	// message is the head commit's message, read with the commits the
+	// head is ahead by; messageRead says it was.
+	message     string
+	messageRead bool
+	stats       Stats
 	// files are every file the version touches, in byte order; paths the
 	// first MaxPaths of them, truncated set when there were more.
 	files, paths  []string
@@ -669,6 +673,9 @@ func (o *opening) commitsAhead(ctx context.Context, in OpenInput, targetHead str
 			return 0, server.NewError("merge_commits_unsupported", http.StatusBadRequest,
 				fmt.Sprintf("source.branch: the merge commit %s is among the commits to land; rebase instead", cm.ID))
 		}
+		if strings.EqualFold(cm.ID, o.head) {
+			o.message, o.messageRead = cm.Message, true
+		}
 	}
 	return len(ahead), nil
 }
@@ -709,17 +716,21 @@ func touchedPaths(changes []gitrepo.FileChange) []string {
 }
 
 // describe fills in the title and the intent: the caller's, or the
-// subject and the body of the head commit, the intent then the source
-// fork's purpose, each default cut to its limit. A title must then be one
-// line of at most MaxTitle characters, a given intent at most MaxIntent,
-// and the intent must say something, unless the change is a draft or the
-// target workspace does not require an intent.
+// subject and the body of the head commit, which commitsAhead read with the
+// commits ahead, the intent then the source fork's purpose, each default
+// cut to its limit. A title must then be one line of at most MaxTitle
+// characters, a given intent at most MaxIntent, and the intent must say
+// something, unless the change is a draft or the target workspace does not
+// require an intent.
 func (o *opening) describe(ctx context.Context, in OpenInput) error {
-	commits, err := o.sourceRepo.ReadCommits(ctx, []string{o.head})
-	if err != nil {
-		return err
+	if !o.messageRead {
+		commits, err := o.sourceRepo.ReadCommits(ctx, []string{o.head})
+		if err != nil {
+			return err
+		}
+		o.message, o.messageRead = commits[0].Message, true
 	}
-	subject, body, _ := strings.Cut(commits[0].Message, "\n")
+	subject, body, _ := strings.Cut(o.message, "\n")
 	subject, body = strings.TrimSpace(subject), strings.TrimSpace(body)
 	switch {
 	case in.Title != nil:
