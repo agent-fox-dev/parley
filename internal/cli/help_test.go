@@ -104,7 +104,15 @@ func TestHelp_PrintsTheHelpOfTheRootOrAGroupGivenNoCommand(t *testing.T) {
 			"orgs":    "List and read the organizations you belong to",
 			"secrets": "Create, list, update and delete secrets, whose values the hub never shows",
 			"user":    "Read and update your own profile",
+			"vars":    "Create, list, update, delete and resolve variables",
 			"version": "Print the client's build and, given a hub URL, the hub's build",
+		}},
+		{[]string{"vars"}, map[string]string{
+			"create":  "Create variables in your user scope, an organization's or a workspace's",
+			"list":    "List a scope's variables with their values, every page of them",
+			"update":  "Replace the value of one variable",
+			"delete":  "Delete one variable",
+			"resolve": "List the variables a workspace runs with and where each comes from",
 		}},
 		{[]string{"secrets"}, map[string]string{
 			"create": "Create secrets in your user scope, an organization's or a workspace's",

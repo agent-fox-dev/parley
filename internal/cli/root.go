@@ -130,7 +130,7 @@ func newRootCommand(opts options) *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 
 	installHelp(root)
-	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newKeysCommand(), newTokensCommand(), newSandboxCommand(), newEventsCommand(), newSecretsCommand(), newWorkspaceCommand(), newForkCommand(), newChangeCommand(), newActivityCommand(), newClaimCommand(), newPatchCommand(), newRebuildCommand(), newRerereCommand(), newLandCommand(), newPolicyCommand(), newSCMCommand(), newCredentialHelperCommand(), newAdminCommand())
+	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newKeysCommand(), newTokensCommand(), newSandboxCommand(), newEventsCommand(), newSecretsCommand(), newVarsCommand(), newWorkspaceCommand(), newForkCommand(), newChangeCommand(), newActivityCommand(), newClaimCommand(), newPatchCommand(), newRebuildCommand(), newRerereCommand(), newLandCommand(), newPolicyCommand(), newSCMCommand(), newCredentialHelperCommand(), newAdminCommand())
 	for _, build := range opts.extra {
 		root.AddCommand(build())
 	}
