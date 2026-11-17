@@ -3,6 +3,7 @@ package pushrule
 import (
 	"context"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -10,8 +11,11 @@ import (
 // returns nil once origin took the update, or an error whose text is the
 // message the update is refused with. The ref writer runs it after every
 // update of the request is allowed and before any ref is written, with a
-// context that ends at its time limit; Evaluate never runs it.
-type Forward func(ctx context.Context) error
+// context that ends at its time limit and repo, the repository the request
+// writes to: for a git push the view of its quarantine, the only place the
+// pushed objects are readable before the request is accepted. Evaluate
+// never runs it.
+type Forward func(ctx context.Context, repo *gitrepo.Repo) error
 
 // answerKind tells the answers of a controller apart. The zero value is no
 // answer at all, which refuses the update as internal rather than allowing

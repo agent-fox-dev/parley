@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
+	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
+	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -27,6 +29,42 @@ const carryPatchHook = "carry_patch"
 // The workspace service is also what the component tells of each patch
 // branch a sync's origin refresh moved, so that its branch-move observers
 // see those moves as they see the per-branch pass's.
+// The component's controller (PushControl) is registered with the push
+// rules as their carry-patch controller, which decides every update of a
+// carry_patch workspace that the rules before it let through: it refuses
+// the integration branch, holds the patch branches to the workspace's
+// patch settings, and forwards a patch branch to origin, within the
+// component's forward limit of 120 s, before the hub accepts it when
+// origin is the branches' authority. Without it every such update would be
+// refused as internal. The controller reads the record, the settings and
+// the patch list when it decides, through the component, so it serves once
+// the start hook has bound the component.
+// The component's trigger is registered with the ref writer as a post-push
+// listener: after every accepted git push or source control API write it
+// records origin's head of each branch the write forwarded to origin, now
+// that the hub's copy holds the commit, and, when the write created or
+// moved the branch of a patch that is not deleted and
+// auto_rebuild_after_push is on, queues one rebuild submitted by
+// system:push with the write's session; then, when the hub is the
+// authority of the patch branches and push_patches_to_origin is on, it
+// mirrors each such branch to origin within the component's forward limit,
+// reporting a failed mirror with parley.patch.mirror_failed. It runs on the
+// listener's own goroutine, after the client has its answer, one at a time
+// per workspace, and ignores a land, which reaches it through the
+// after-landing hook. Its context ends when the hub's stop begins
+// (ShuttingDown), since the stop does not wait for it and the stores close
+// after the stop; a mirror cut off so reports nothing.
+// The component's landing guard (LandGuard) is registered with the landing
+// as a target guard, which holds a land onto a patch branch to the rules a
+// push of it obeys before the land moves the branch: blocked when origin is
+// the branches' authority without push_patches_to_origin, and with it
+// allowed only once the forward of the new head to origin succeeded, failed
+// origin_rejected otherwise. The trigger is registered as an after-landing
+// hook too, with the source land and the landing's session: for a land
+// that moved its target it runs on a goroutine of its own, so that the
+// land's answer never waits for it, with a context that ends when the
+// hub's stop begins, as the listener's does; a land that moved nothing
+// triggers nothing.
 // A workspace's delete removes its patches
 // and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
@@ -57,6 +95,28 @@ func composeCarryPatch(c *Composition) {
 	c.AddSchemaStep(carrypatch.RerereSchemaStep)
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
+	c.pushControl = comp.PushControl()
+	c.PushRules().RegisterController(c.pushControl)
+	listen := comp.PostPushListener()
+	c.RefWriter().RegisterPostPushListener(func(ctx context.Context, p pushrule.PostPush) error {
+		ctx, cancel := untilShutdown(ctx, c.ShuttingDown())
+		defer cancel()
+		return listen(ctx, p)
+	})
+	c.Land().AddTargetGuard(comp.LandGuard())
+	trigger := comp.Trigger()
+	c.Land().AddAfterLanding(func(ctx context.Context, in land.AfterLanding) error {
+		if in.Update.Before == in.Update.After {
+			return nil
+		}
+		ctx, cancel := untilShutdown(context.WithoutCancel(ctx), c.ShuttingDown())
+		updates := []pushrule.Update{{Ref: in.Update.Ref, Before: in.Update.Before, After: in.Update.After}}
+		go func() {
+			defer cancel()
+			trigger.AfterUpdates(ctx, in.Workspace, updates, carrypatch.SourceLand, in.SessionID)
+		}()
+		return nil
+	})
 	c.workspaces.RegisterSyncExtension(comp)
 	c.workspaces.RegisterExcludedBranchProvider(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
@@ -94,6 +154,28 @@ func composeCarryPatch(c *Composition) {
 // CarryPatch returns the hub's carry-patch component, which serves once its
 // start hook has run.
 func (c *Composition) CarryPatch() *carrypatch.Component { return c.carryPatch }
+
+// PushControl returns the carry-patch controller the hub registered with
+// its push rules, which reads the carry-patch component's store and
+// settings and forwards with it once its start hook has run. A test that
+// counts the controller's decisions registers a wrapper of it with
+// PushRules().RegisterController, which replaces it.
+func (c *Composition) PushControl() *carrypatch.PushControl { return c.pushControl }
+
+// untilShutdown is ctx, ended as well when shutdown is closed, the hub's
+// stop: work that runs after a request's answer, which the stop does not
+// wait for, so ends before the stores close.
+func untilShutdown(ctx context.Context, shutdown <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-shutdown:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
 
 // AdjustCarryPatch adds fn to the functions that change the carry-patch
 // component's dependencies after the start hook has built them and before

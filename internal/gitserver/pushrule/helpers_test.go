@@ -159,7 +159,7 @@ func (c *controller) Decide(_ context.Context, ws pushrule.Workspace, caller pus
 	return pushrule.Allow(), nil
 }
 
-func (c *controller) forward(context.Context) error {
+func (c *controller) forward(context.Context, *gitrepo.Repo) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.forwarded++
@@ -378,9 +378,9 @@ func (r *reports) SetHead(_ context.Context, slug, id string) error {
 }
 
 // forwards makes forwards to origin that record, in order, each run: the
-// ref forwarded and the value it held in the repository at dir then.
+// ref forwarded and the value it held then in the repository the forward
+// was handed.
 type forwards struct {
-	dir    string
 	runs   []string
 	ctxErr error // what the context of a forward that blocked said once it ended
 }
@@ -388,8 +388,12 @@ type forwards struct {
 // of is a forward of ref that records its run and answers err; one that
 // blocks waits for its context to end and answers the context's error.
 func (f *forwards) of(ref string, err error, blocks bool) pushrule.Forward {
-	return func(ctx context.Context) error {
-		at, _ := gitrepotest.Run(f.dir, "", "rev-parse", "--verify", "--quiet", ref)
+	return func(ctx context.Context, repo *gitrepo.Repo) error {
+		if repo == nil {
+			f.runs = append(f.runs, ref+" without a repository")
+			return err
+		}
+		at, _ := gitrepotest.Run(repo.Dir(), "", "rev-parse", "--verify", "--quiet", ref)
 		f.runs = append(f.runs, ref+"="+strings.TrimSpace(at))
 		if blocks {
 			<-ctx.Done()

@@ -255,12 +255,60 @@ func (o *Origin) Reject(message string) {
 	o.t.Helper()
 	hook := filepath.Join(o.dir, "hooks", "pre-receive")
 	if message == "" {
+		o.releaseStalled()
 		if err := os.Remove(hook); err != nil && !os.IsNotExist(err) {
 			o.t.Fatalf("origin: %v", err)
 		}
 		return
 	}
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' " + shellQuote(message) + " >&2\nexit 1\n"
+	o.writeHook(hook, "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' "+shellQuote(message)+" >&2\nexit 1\n")
+}
+
+// RejectRef makes the origin's server-side hook refuse every push that
+// updates ref, a full ref name such as refs/heads/patch/b, writing message,
+// which the pushing git shows as origin's remote: lines, and take every
+// other push. It replaces what Reject or an earlier RejectRef set; ""
+// makes the origin take every push again.
+func (o *Origin) RejectRef(ref, message string) {
+	o.t.Helper()
+	hook := filepath.Join(o.dir, "hooks", "pre-receive")
+	if message == "" {
+		o.Reject("")
+		return
+	}
+	o.writeHook(hook, "#!/bin/sh\nrefuse=\nwhile read -r old new ref; do\n\t[ \"$ref\" = "+shellQuote(ref)+" ] && refuse=1\ndone\n"+
+		"[ -z \"$refuse\" ] && exit 0\nprintf '%s\\n' "+shellQuote(message)+" >&2\nexit 1\n")
+}
+
+// StallRef makes the origin's server-side hook hold every push that
+// updates ref, a full ref name such as refs/heads/patch/a, until Reject("")
+// or Close, and then refuse it, so that a push whose client gave up never
+// lands later; every other push is taken. It replaces what Reject,
+// RejectRef or an earlier StallRef set.
+func (o *Origin) StallRef(ref string) {
+	o.t.Helper()
+	stall := o.stallFile()
+	if err := os.WriteFile(stall, nil, 0o600); err != nil {
+		o.t.Fatalf("origin: %v", err)
+	}
+	o.writeHook(filepath.Join(o.dir, "hooks", "pre-receive"),
+		"#!/bin/sh\nhold=\nwhile read -r old new ref; do\n\t[ \"$ref\" = "+shellQuote(ref)+" ] && hold=1\ndone\n"+
+			"[ -z \"$hold\" ] && exit 0\nwhile [ -e "+shellQuote(stall)+" ]; do sleep 0.05; done\necho stalled >&2\nexit 1\n")
+}
+
+// stallFile is the file whose existence holds the pushes StallRef stalls.
+func (o *Origin) stallFile() string { return o.dir + ".stall" }
+
+// releaseStalled lets the pushes StallRef holds end, refused.
+func (o *Origin) releaseStalled() {
+	if err := os.Remove(o.stallFile()); err != nil && !os.IsNotExist(err) {
+		o.t.Errorf("origin: %v", err)
+	}
+}
+
+// writeHook writes the executable hook script.
+func (o *Origin) writeHook(hook, script string) {
+	o.t.Helper()
 	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
 		o.t.Fatalf("origin: %v", err)
 	}
@@ -295,11 +343,13 @@ func (o *Origin) tlsConfig(*tls.ClientHelloInfo) (*tls.Config, error) {
 	return &tls.Config{Certificates: []tls.Certificate{*o.untrusted}}, nil
 }
 
-// Close releases the held requests and shuts the server down, so that later
-// requests find nothing listening. Calling it again does nothing.
+// Close releases the held requests, those StallRef holds included, and
+// shuts the server down, so that later requests find nothing listening.
+// Calling it again does nothing.
 func (o *Origin) Close() {
 	o.closeOnce.Do(func() {
 		o.Release()
+		o.releaseStalled()
 		o.srv.Close()
 	})
 }

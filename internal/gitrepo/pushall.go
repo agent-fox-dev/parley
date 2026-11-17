@@ -76,7 +76,8 @@ func (g Git) PushBranches(ctx context.Context, req PushBranchesRequest) ([]Branc
 		case flag == '!' && (strings.Contains(summary, "(non-fast-forward)") || strings.Contains(summary, "(fetch first)")):
 			p.Err = fmt.Errorf("git push of %s: %w", b, ErrNonFastForward)
 		case flag == '!' && strings.HasPrefix(summary, "[remote rejected]"):
-			p.Err = &PushError{Branch: b, Class: ErrOriginRejected, Reason: rejectReason(summary, stderr), Err: err}
+			reason, said := rejectReason(summary, stderr)
+			p.Err = &PushError{Branch: b, Class: ErrOriginRejected, Reason: reason, OriginMessage: said, Err: err}
 		default:
 			p.Err = &PushError{Branch: b, Class: ErrPushFailed, Reason: fmt.Sprintf("git reported %q for the ref", summary), Err: err}
 		}

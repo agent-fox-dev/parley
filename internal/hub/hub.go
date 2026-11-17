@@ -288,6 +288,9 @@ type Composition struct {
 	// have changed its dependencies (AdjustCarryPatch).
 	carryPatch          *carrypatch.Component
 	carryPatchAdjusters []func(*carrypatch.Deps)
+	// pushControl is the carry-patch controller composeCarryPatch
+	// registers with the push rules (PushControl).
+	pushControl *carrypatch.PushControl
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).

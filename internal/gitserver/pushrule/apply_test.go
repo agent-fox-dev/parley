@@ -316,7 +316,7 @@ func TestApply_WritesALandVerdictWithoutAskingTheEngine(t *testing.T) {
 
 func TestApply_RunsTheForwardsInCommandOrderBeforeAnyRefIsWritten(t *testing.T) {
 	r := newRepo(t)
-	f := &forwards{dir: r.dir}
+	f := &forwards{}
 	ev := &emitted{}
 	var w pushrule.Writer
 	w.Bind(pushrule.WriterDeps{Transact: newStore(t).Tx, Events: ev})
@@ -367,7 +367,7 @@ func TestApply_RefusesTheWholeRequestWhenAForwardFailsOrOutlastsItsLimit(t *test
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRepo(t)
-			f := &forwards{dir: r.dir}
+			f := &forwards{}
 			var log []string
 			st, ev := newStore(t), &emitted{}
 			var w pushrule.Writer

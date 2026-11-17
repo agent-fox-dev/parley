@@ -65,6 +65,10 @@ type PushError struct {
 	// origin's reason for the ref with the text its hooks wrote, otherwise
 	// git's standard error without its boilerplate, one line per line.
 	Reason string
+	// OriginMessage is, for ErrOriginRejected, the text origin's hooks
+	// wrote alone, the lines git shows after remote:, one per line; "" when
+	// they wrote none or the class is another.
+	OriginMessage string
 	// Err is git's error.
 	Err error
 }
@@ -131,7 +135,8 @@ func (g Git) Push(ctx context.Context, req PushRequest) (PushResult, error) {
 	case reported && flag == '!' && (strings.Contains(summary, "(non-fast-forward)") || strings.Contains(summary, "(fetch first)")):
 		return "", fmt.Errorf("git push of %s: %w", req.Branch, ErrNonFastForward)
 	case reported && flag == '!' && strings.HasPrefix(summary, "[remote rejected]"):
-		return "", &PushError{Branch: req.Branch, Class: ErrOriginRejected, Reason: rejectReason(summary, stderr), Err: err}
+		reason, said := rejectReason(summary, stderr)
+		return "", &PushError{Branch: req.Branch, Class: ErrOriginRejected, Reason: reason, OriginMessage: said, Err: err}
 	case err != nil && ctx.Err() != nil:
 		return "", err
 	case err != nil && !reported:
@@ -143,22 +148,32 @@ func (g Git) Push(ctx context.Context, req PushRequest) (PushResult, error) {
 	return "", &PushError{Branch: req.Branch, Class: ErrPushFailed, Reason: fmt.Sprintf("git reported %q for the ref", summary), Err: err}
 }
 
+// Push is Git.Push run from the repository: req's commit is read from it,
+// whatever req.Dir says, by a git with the repository's environment, so
+// that the view of a quarantine pushes a commit that is readable only in
+// the quarantine.
+func (r *Repo) Push(ctx context.Context, req PushRequest) (PushResult, error) {
+	req.Dir = r.dir
+	return r.g.Push(ctx, req)
+}
+
 // rejectReason is origin's reason for refusing the ref: the reason of the
-// ref's status, "[remote rejected] (<reason>)", followed by the text
+// ref's status, "[remote rejected] (<reason>)", followed by said, the text
 // origin's hooks wrote, which git shows on the lines starting with remote:.
-func rejectReason(summary, stderr string) string {
-	reason := strings.TrimPrefix(summary, "[remote rejected]")
+func rejectReason(summary, stderr string) (reason, said string) {
+	reason = strings.TrimPrefix(summary, "[remote rejected]")
 	reason = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(reason), "("), ")")
-	var said []string
+	var lines []string
 	for line := range strings.Lines(stderr) {
 		if text, ok := strings.CutPrefix(line, "remote:"); ok && strings.TrimSpace(text) != "" {
-			said = append(said, strings.TrimSpace(text))
+			lines = append(lines, strings.TrimSpace(text))
 		}
 	}
-	if len(said) == 0 {
-		return reason
+	if len(lines) == 0 {
+		return reason, ""
 	}
-	return reason + ": " + strings.Join(said, "\n")
+	said = strings.Join(lines, "\n")
+	return reason + ": " + said, said
 }
 
 // transportClasses map what git's HTTPS transport (curl) and its SSH

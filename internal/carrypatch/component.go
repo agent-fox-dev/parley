@@ -107,6 +107,10 @@ type Deps struct {
 	// DefaultGitDeadline as the deadline of each git operation of a rebuild
 	// attempt; only tests set it.
 	RebuildGitDeadline time.Duration
+	// ForwardLimit, when positive and shorter, replaces DefaultForwardLimit
+	// as the limit of a forward of a patch branch to origin; only tests set
+	// it.
+	ForwardLimit time.Duration
 	// Scrubber removes credentials from the text of a rebuild's failure and
 	// of its events before they are stored; nil is a scrubber that knows no
 	// secret value of the hub's, which still removes the values given to
@@ -148,6 +152,11 @@ type Component struct {
 	// fetches into one repository lock the same refs and its configuration,
 	// and one of them fails.
 	setups slugLocks
+
+	// triggers are held by the trigger of an accepted request, so that the
+	// triggers of one workspace run one at a time; apart from setups, which
+	// an upstream fetch holds for minutes.
+	triggers slugLocks
 }
 
 // slugLocks is a mutex per workspace slug, which exists only while someone
