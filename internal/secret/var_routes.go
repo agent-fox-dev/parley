@@ -111,8 +111,8 @@ func (c *Component) listVars(w http.ResponseWriter, r *http.Request) error {
 }
 
 // createVars answers POST on a variables collection: it stores every entry
-// of the body or none, in one transaction, and answers the entries in
-// request order. The body is checked first, then the scope's limit, then
+// of the body or none, each with an event, in one transaction, and answers
+// the entries in request order. The body is checked first, then the scope's limit, then
 // whether it holds a key already, so that a request with several faults is
 // always answered with the same one.
 func (c *Component) createVars(w http.ResponseWriter, r *http.Request) error {
@@ -125,11 +125,22 @@ func (c *Component) createVars(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	ctx := r.Context()
+	in, err := varEventInput(ctx, t)
+	if err != nil {
+		return err
+	}
 	var stored []Variable
 	err = c.change(ctx, func(tx *sql.Tx) error {
 		var err error
-		stored, err = c.CreateVars(ctx, tx, t.scope, t.id, entries)
-		return err
+		if stored, err = c.CreateVars(ctx, tx, t.scope, t.id, entries); err != nil {
+			return err
+		}
+		for _, v := range stored {
+			if err := c.emit(ctx, tx, t, in, varEventCreate, v.Key); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return routeError(err)
@@ -142,7 +153,8 @@ func (c *Component) createVars(w http.ResponseWriter, r *http.Request) error {
 
 // updateVar answers PATCH on a variable: it replaces the value of the
 // variable whose key matches the path's ignoring case, which keeps the
-// casing it was first stored with and its creation time. The body is
+// casing it was first stored with and its creation time, with an event in
+// the same transaction. The body is
 // checked before the variable is looked up, so a bad body is answered 400
 // for a key the scope does not hold too. The path's key is not checked
 // against the key rules: one no variable can have is not found.
@@ -157,11 +169,17 @@ func (c *Component) updateVar(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	ctx := r.Context()
+	in, err := varEventInput(ctx, t)
+	if err != nil {
+		return err
+	}
 	var v Variable
 	err = c.change(ctx, func(tx *sql.Tx) error {
 		var err error
-		v, err = c.UpdateVar(ctx, tx, t.scope, t.id, name, value)
-		return err
+		if v, err = c.UpdateVar(ctx, tx, t.scope, t.id, name, value); err != nil {
+			return err
+		}
+		return c.emit(ctx, tx, t, in, varEventUpdate, v.Key)
 	})
 	if err != nil {
 		return routeError(err)
@@ -170,16 +188,24 @@ func (c *Component) updateVar(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// removeVar answers DELETE on a variable with 204 and no body.
+// removeVar answers DELETE on a variable with 204 and no body, and writes
+// its event, naming the key as it was stored, in the same transaction.
 func (c *Component) removeVar(w http.ResponseWriter, r *http.Request) error {
 	t, err := targetOf(r)
 	if err != nil {
 		return err
 	}
 	ctx := r.Context()
-	err = c.change(ctx, func(tx *sql.Tx) error {
-		_, err := c.DeleteVar(ctx, tx, t.scope, t.id, server.Param(r, "key"))
+	in, err := varEventInput(ctx, t)
+	if err != nil {
 		return err
+	}
+	err = c.change(ctx, func(tx *sql.Tx) error {
+		v, err := c.DeleteVar(ctx, tx, t.scope, t.id, server.Param(r, "key"))
+		if err != nil {
+			return err
+		}
+		return c.emit(ctx, tx, t, in, varEventDelete, v.Key)
 	})
 	if err != nil {
 		return routeError(err)

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,6 +248,21 @@ func (w *world) eventsAfter(t *testing.T, seq int64) ([]event.Record, int64) {
 		t.Fatalf("read the events after %d: %v", seq, err)
 	}
 	return recs, last
+}
+
+// varEventsAfter returns the variable events of the log after seq and the
+// log's last seq. It leaves out the events other components write in every
+// hub, such as the overlaps the awareness worker finds on its own time.
+func (w *world) varEventsAfter(t *testing.T, seq int64) ([]event.Record, int64) {
+	t.Helper()
+	recs, last := w.eventsAfter(t, seq)
+	vars := []event.Record{}
+	for _, ev := range recs {
+		if strings.HasPrefix(ev.Type, "parley.variable.") {
+			vars = append(vars, ev)
+		}
+	}
+	return vars, last
 }
 
 // valueOf is the value seed stores under key: text no answer may hold.
