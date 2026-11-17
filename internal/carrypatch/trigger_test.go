@@ -44,8 +44,9 @@ func branchRef(branch string) string {
 // the carry-patch workspace demo with patch/a and patch/b active and
 // patch/old deleted, the carry-patch workspace other with patch/a, the
 // standard workspace std and the task fork fork of demo, a recording
-// rebuild enqueuer, an event writer that counts its calls, and a log that
-// keeps every record.
+// rebuild enqueuer, a mirror that records what it is asked to push in
+// place of the component's, an event writer that counts its calls, and a
+// log that keeps every record.
 type triggerFixture struct {
 	comp     *carrypatch.Component
 	trigger  *carrypatch.Trigger
@@ -53,6 +54,7 @@ type triggerFixture struct {
 	settings *settingsStub
 	patches  *patchStub
 	rebuilds *recordingRebuilds
+	mirrors  *recordingMirror
 	events   *countingEvents
 	log      *hubtest.LogBuffer
 }
@@ -80,6 +82,7 @@ func newTrigger(t *testing.T, settings map[string]any) *triggerFixture {
 			otherPatch,
 		}},
 		rebuilds: &recordingRebuilds{},
+		mirrors:  &recordingMirror{},
 		events:   &countingEvents{},
 		log:      &hubtest.LogBuffer{},
 	}
@@ -91,7 +94,36 @@ func newTrigger(t *testing.T, settings map[string]any) *triggerFixture {
 	f.comp.RegisterRebuildEnqueuer(f.rebuilds)
 	f.trigger = f.comp.Trigger()
 	f.trigger.Records, f.trigger.Settings, f.trigger.Patches = f.records, f.settings, f.patches
+	f.trigger.Mirror = f.mirrors.mirror
 	return f
+}
+
+// recordingMirror records each mirror the trigger runs as the workspace
+// and the branches it is asked to push.
+type recordingMirror struct {
+	mu   sync.Mutex
+	runs []string
+}
+
+func (m *recordingMirror) mirror(_ context.Context, w workspace.Workspace, patches []carrypatch.Patch) {
+	branches := make([]string, len(patches))
+	for i, p := range patches {
+		branches[i] = p.BranchName
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runs = append(m.runs, w.Slug+" "+strings.Join(branches, ","))
+}
+
+// wantMirrors fails the test unless the mirrors run are want, each as
+// "<workspace> <branch>,<branch>...".
+func (m *recordingMirror) wantMirrors(t *testing.T, want ...string) {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if fmt.Sprint(m.runs) != fmt.Sprint(want) {
+		t.Errorf("mirrors run %q, want %q", m.runs, want)
+	}
 }
 
 // hubPatches are the patch settings with the hub as the authority and
@@ -231,6 +263,7 @@ func TestTrigger_SkipsARebuildAlreadyQueuedSilently(t *testing.T) {
 	if n := f.rebuilds.calls(); n != 1 {
 		t.Errorf("the rebuild enqueue was called %d times, want 1", n)
 	}
+	f.mirrors.wantMirrors(t, "demo patch/a")
 	if n := f.events.count.Load(); n != 0 {
 		t.Errorf("the trigger wrote %d events, want none", n)
 	}
@@ -242,18 +275,22 @@ func TestTrigger_SkipsARebuildAlreadyQueuedSilently(t *testing.T) {
 func TestTrigger_LogsOneErrorAndReturnsWhenAStepFails(t *testing.T) {
 	t.Parallel()
 	errRead := errors.New("disk I/O error")
+	// After a failed enqueue the trigger still mirrors; after a failed
+	// read it has nothing to mirror with.
 	for _, tc := range []struct {
-		name      string
-		fault     func(f *triggerFixture)
-		wantCalls int
+		name        string
+		fault       func(f *triggerFixture)
+		wantCalls   int
+		wantMirrors []string
 	}{
-		{"the workspace record cannot be read", func(f *triggerFixture) { f.records.err = errRead }, 0},
-		{"the settings cannot be read", func(f *triggerFixture) { f.settings.err = errRead }, 0},
-		{"the patch list cannot be read", func(f *triggerFixture) { f.patches.err = errRead }, 0},
-		{"the enqueue returns an error", func(f *triggerFixture) { f.rebuilds.answer("demo", carrypatch.RebuildResult{}, errRead) }, 1},
+		{"the workspace record cannot be read", func(f *triggerFixture) { f.records.err = errRead }, 0, nil},
+		{"the settings cannot be read", func(f *triggerFixture) { f.settings.err = errRead }, 0, nil},
+		{"the patch list cannot be read", func(f *triggerFixture) { f.patches.err = errRead }, 0, nil},
+		{"the enqueue returns an error", func(f *triggerFixture) { f.rebuilds.answer("demo", carrypatch.RebuildResult{}, errRead) }, 1,
+			[]string{"demo patch/a"}},
 		{"the enqueue panics", func(f *triggerFixture) {
 			f.comp.RegisterRebuildEnqueuer(panickingRebuilds{f.rebuilds})
-		}, 1},
+		}, 1, []string{"demo patch/a"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -267,6 +304,7 @@ func TestTrigger_LogsOneErrorAndReturnsWhenAStepFails(t *testing.T) {
 			if n := f.rebuilds.calls(); n != tc.wantCalls {
 				t.Errorf("the rebuild enqueue was called %d times, want %d", n, tc.wantCalls)
 			}
+			f.mirrors.wantMirrors(t, tc.wantMirrors...)
 		})
 	}
 }

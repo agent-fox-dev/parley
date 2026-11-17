@@ -25,13 +25,16 @@ const (
 	SourceLand TriggerSource = "land"
 )
 
-// recordForwardedLimit is the deadline of the git that records the origin
-// heads of a forwarded write: two ref reads and a ref write.
-const recordForwardedLimit = 30 * time.Second
+// refLimit is the deadline of a git that reads or writes a few refs of the
+// hub's copy, such as the one that records origin's head of a branch.
+const refLimit = 30 * time.Second
 
 // Trigger runs what the hub owes a carry-patch workspace once it accepted
 // updates of its patch branches: one rebuild of the integration branch for
-// the request, when auto_rebuild_after_push is on. It reads the workspace
+// the request, when auto_rebuild_after_push is on, and then, when the hub
+// is the authority of the patch branches and push_patches_to_origin is on,
+// the mirror of each patch branch the request created or moved to origin,
+// whatever became of the rebuild. It reads the workspace
 // record, the settings and the patch list through the same readers as
 // PushControl, the component's own unless a test replaces them, and queues
 // with the component's registered rebuild enqueuer, read at every run.
@@ -42,6 +45,10 @@ type Trigger struct {
 	Records  RecordReader
 	Settings SettingsReader
 	Patches  PatchReader
+	// Mirror pushes the branches of patches, the patches whose branches
+	// the request created or moved, to the origin of the workspace w: the
+	// component's mirror, which a test may replace or wrap.
+	Mirror func(ctx context.Context, w workspace.Workspace, patches []Patch)
 
 	c *Component
 }
@@ -49,7 +56,7 @@ type Trigger struct {
 // Trigger is the component's trigger, which reads the component's store
 // and settings registry.
 func (c *Component) Trigger() *Trigger {
-	return &Trigger{Records: c, Settings: c, Patches: c, c: c}
+	return &Trigger{Records: c, Settings: c, Patches: c, Mirror: c.mirror, c: c}
 }
 
 // PostPushListener is the trigger as a post-push listener of the ref
@@ -109,9 +116,11 @@ func (t *Trigger) serialized(ctx context.Context, slug string, fn func(log *slog
 	fn(log)
 }
 
-// run is the trigger's work, under the workspace's trigger lock. The
-// record is read first, so that a workspace not in mode carry_patch, a
-// task fork among them, costs no read of the patch list. The patch list is
+// run is the trigger's work, under the workspace's trigger lock, so that
+// the mirrors of two requests never push one workspace's branches at the
+// same time, nor in an order other than the requests'. The record is read
+// first, so that a workspace not in mode carry_patch, a task fork among
+// them, costs no read of the patch list. The patch list is
 // read as it is now: a branch whose patch was deleted since the request
 // triggers nothing.
 func (t *Trigger) run(ctx context.Context, log *slog.Logger, slug string, updates []pushrule.Update, source TriggerSource, sessionID *string) {
@@ -140,6 +149,9 @@ func (t *Trigger) run(ctx context.Context, log *slog.Logger, slug string, update
 		return
 	}
 	t.queueRebuild(ctx, log, slug, settings, source, sessionID)
+	if mirrorOn(settings) && t.Mirror != nil {
+		t.Mirror(ctx, rec, patches)
+	}
 }
 
 // movedPatches are the live patches whose branches updates created or
@@ -216,7 +228,7 @@ func (t *Trigger) recordForwardedHeads(ctx context.Context, log *slog.Logger, sl
 				return
 			}
 		}
-		err := RunGit(ctx, recordForwardedLimit, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		err := RunGit(ctx, refLimit, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
 			head, found, err := repo.ResolveBranch(ctx, branch)
 			if err != nil || !found || head != d.After {
 				return err

@@ -44,11 +44,15 @@ const carryPatchHook = "carry_patch"
 // that the hub's copy holds the commit, and, when the write created or
 // moved the branch of a patch that is not deleted and
 // auto_rebuild_after_push is on, queues one rebuild submitted by
-// system:push with the write's session. It runs on the listener's own
-// goroutine, after the client has its answer, one at a time per workspace,
-// and ignores a land, which reaches it through the after-landing hook. Its
-// context ends when the hub's stop begins (ShuttingDown), since the stop
-// does not wait for it and the stores close after the stop.
+// system:push with the write's session; then, when the hub is the
+// authority of the patch branches and push_patches_to_origin is on, it
+// mirrors each such branch to origin within the component's forward limit,
+// reporting a failed mirror with parley.patch.mirror_failed. It runs on the
+// listener's own goroutine, after the client has its answer, one at a time
+// per workspace, and ignores a land, which reaches it through the
+// after-landing hook. Its context ends when the hub's stop begins
+// (ShuttingDown), since the stop does not wait for it and the stores close
+// after the stop; a mirror cut off so reports nothing.
 // A workspace's delete removes its patches
 // and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues

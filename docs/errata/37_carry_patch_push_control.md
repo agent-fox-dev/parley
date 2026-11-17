@@ -119,4 +119,33 @@ that ends when the stop begins (`Composition.ShuttingDown`): a trigger
 still waiting for its workspace's lock does not run, and an enqueue or git
 cut off by the stop fails instead of using the stores after they close.
 A trigger cut short this way is lost and logged; a rebuild can be queued
-by hand after the restart.
+by hand after the restart. A mirror cut short this way writes no
+`parley.patch.mirror_failed` event and pushes no further branch: the stop is
+not origin's failure. The next accepted update of the branch mirrors it
+again.
+
+## A mirror reports each branch it could not push
+
+The package resolves the origin credential once per mirror run and wants
+one `parley.patch.mirror_failed` event per failed branch, but the check of
+that rule asserts a single event in every row of its table, the row with an
+unreadable credential included, although that request updates patch/a and
+patch/b. The requirement decides: every branch the run would push and could
+not gets its own event. With an unreadable credential each such branch is
+reported with `failed to resolve origin credentials`, each one origin
+cannot be reached for with `origin unreachable`, and the test asserts two
+events in both rows. A branch the hub's copy no longer has is skipped and
+reported by nobody, whatever else failed. A workspace without `git_url`
+reports each branch with `push failed`, as the forward does.
+
+## A mirror reads the heads once, at its start
+
+The package has the mirror read each branch's head "now", just before its
+push. The mirror reads the heads of all the branches it pushes, and the
+origin heads the hub's copy records for them, in one git at its start, not
+two per branch: the mirror runs after every accepted update of a patch
+branch, and each git costs. A branch that moves while an earlier branch of
+the same run is pushed is pushed by the trigger of the request that moved
+it, which runs after this one under the same per-workspace lock, so origin
+still ends at the hub's last head. A successful push whose head is already
+the recorded origin head writes no record.
