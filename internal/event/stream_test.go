@@ -240,9 +240,23 @@ func TestStream_ReplayThenLiveWithoutGap(t *testing.T) {
 	w := newWorld(t)
 	w.emitMany(300)
 
+	// The writer commits while the stream replays, but never more than
+	// maxWaiting events ahead of what the client has read: one more ends the
+	// stream, and on a loaded machine the hub's writer can fall that far
+	// behind its own log reads while the client keeps up.
+	received := make(chan int64, 500)
 	written := make(chan error, 1)
 	go func() {
-		for range 200 {
+		read := int64(100)
+		for seq := int64(301); seq <= 500; seq++ {
+			for seq-read > maxWaiting {
+				select {
+				case read = <-received:
+				case <-t.Context().Done():
+					written <- t.Context().Err()
+					return
+				}
+			}
 			if _, err := w.events.EmitNow(context.Background(), on("parley.change.open", "api")); err != nil {
 				written <- err
 				return
@@ -267,6 +281,7 @@ func TestStream_ReplayThenLiveWithoutGap(t *testing.T) {
 		}
 		got = append(got, f.seq(t))
 		data[f.seq(t)] = f.data
+		received <- f.seq(t)
 	}
 	if err := <-written; err != nil {
 		t.Fatalf("the writer: %v", err)
