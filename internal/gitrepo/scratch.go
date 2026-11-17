@@ -25,12 +25,18 @@ const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 // overrides the repository's. Hooks are off. The attributes are read from
 // the empty tree instead of the files being worked on, so that the content
 // chooses no filter, merge driver or line-ending conversion. No automatic
-// housekeeping runs in the background of a command.
+// housekeeping runs in the background of a command. The hub's identity is
+// the committer: git merge refuses to start without one, even stopping
+// before its commit, and the minimal environment every git process runs in
+// leaves it none to find; the commits themselves are written with the
+// identities their caller gives, not with this one.
 var scratchConfig = []string{
 	"-c", "core.hooksPath=" + os.DevNull,
 	"-c", "attr.tree=" + emptyTree,
 	"-c", "gc.auto=0",
 	"-c", "maintenance.auto=false",
+	"-c", "user.name=" + HubName,
+	"-c", "user.email=" + HubEmail,
 }
 
 // Scratch is a scratch working tree of a bare repository: a detached

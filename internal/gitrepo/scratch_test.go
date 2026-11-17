@@ -291,6 +291,38 @@ func TestScratch_MergeAlwaysMakesAMergeCommit(t *testing.T) {
 	}
 }
 
+func TestScratch_MergeTakesNoIdentityFromTheHost(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newScratchRepo(t, scratchStream)
+	// git merge refuses to start without a committer identity, even
+	// stopping before its commit, and the minimal environment of every git
+	// process leaves it none to read: all it could fall back on is a guess
+	// from the user and the host name, which fails on a host whose name has
+	// no domain. Here that guess is denied, so a merge that ran only by
+	// that guess fails on every host.
+	g := gitrepo.Git{Env: []string{"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=user.useConfigOnly", "GIT_CONFIG_VALUE_0=true"}}
+	repo, err := g.Open(ctx, f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := f.id(t, "main")
+	s, err := repo.AddScratch(ctx, "job", head)
+	if err != nil {
+		t.Fatalf("AddScratch = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Remove(ctx) })
+	who := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0).UTC()}
+	merged, err := s.Merge(ctx, f.id(t, "add"), "Merge branch 'add'", who, who)
+	if err != nil {
+		t.Fatalf("Merge(add) = %v", err)
+	}
+	if merged.Outcome != gitrepo.PickApplied {
+		t.Fatalf("Merge(add) = %+v, want %s", merged, gitrepo.PickApplied)
+	}
+}
+
 func TestScratch_RunsNoHookAndNoAttributeOfTheContent(t *testing.T) {
 	t.Parallel()
 	// Every commit's .gitattributes asks for the union merge driver and the
