@@ -9,6 +9,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 )
 
 // startSyncedFork starts acme-fork from startForkOfUpstream with settings
@@ -99,10 +100,10 @@ func TestCarryPatchSync_MergedPatchIsRebuiltAway(t *testing.T) {
 	}
 }
 
-// An agent syncs a workspace whose patch branches follow origin: one is
-// fast-forwarded, the other replaced with a backup of the hub's tip. Under
-// policy report a developer's sync then leaves a rewritten branch alone
-// and the command fails on the divergence.
+// An agent with a workspaces:write token syncs a workspace whose patch
+// branches follow origin: one is fast-forwarded, the other replaced with a
+// backup of the hub's tip. Under policy report a developer's sync then
+// leaves a rewritten branch alone and the command fails on the divergence.
 func TestCarryPatchSync_OriginRefresh(t *testing.T) {
 	parallel(t)
 	h, _, origin, copyDir, ids := startSyncedFork(t, map[string]any{"patch_branch_source": "origin"})
@@ -111,7 +112,15 @@ func TestCarryPatchSync_OriginRefresh(t *testing.T) {
 	origin.Branch("patch/a", gitrepotest.Commit(t, origin.Dir(), "patch a, more", map[string]string{"a.txt": "a, more\n"}, origin.Head("patch/a")))
 	origin.Branch("patch/b", gitrepotest.Commit(t, origin.Dir(), "patch b, rewritten", map[string]string{"b.txt": "rewritten\n"}, origin.Head("main")))
 
-	answer := h.syncFork(t)
+	agent := h.IssuePAT(t, identity.PATSpec{UserID: h.user, Permissions: []string{"workspaces:write", "patches:read"}})
+	status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/acme-fork/sync", agent, nil)
+	var answer map[string]any
+	if err := json.Unmarshal(raw, &answer); err != nil || status != http.StatusOK {
+		t.Fatalf("the agent's sync = %d %s, want 200", status, raw)
+	}
+	if id, _ := answer["rebuild_job_id"].(string); id != "" {
+		h.waitForkRebuild(t, id, "completed")
+	}
 	actions := map[string]any{}
 	entries, _ := answer["patches_synced"].([]any)
 	for _, e := range entries {
@@ -129,7 +138,10 @@ func TestCarryPatchSync_OriginRefresh(t *testing.T) {
 	if got := gitrepotest.Git(t, copyDir, "rev-parse", carrypatch.ReplacedRefPrefix+"patch/b"); got != old {
 		t.Errorf("%spatch/b = %s, want the hub's former tip %s", carrypatch.ReplacedRefPrefix, got, old)
 	}
-	if _, p := h.forkCall(t, http.MethodGet, "/patches/"+ids["patch/b"], nil); p["origin_sync_state"] != "in_sync" || p["replaced_sha"] != old {
+	_, raw = h.Call(t, http.MethodGet, "/api/v1/workspaces/acme-fork/patches/"+ids["patch/b"], agent, nil)
+	var p map[string]any
+	_ = json.Unmarshal(raw, &p)
+	if p["origin_sync_state"] != "in_sync" || p["replaced_sha"] != old {
 		t.Errorf("GET patch/b = origin_sync_state %v, replaced_sha %v; want in_sync and %s", p["origin_sync_state"], p["replaced_sha"], old)
 	}
 	if n := len(h.patchEvents(t, "acme-fork", carrypatch.EventPatchSync)) - before; n != 2 {
