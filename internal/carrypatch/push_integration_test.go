@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -380,7 +381,12 @@ func TestGitPush_ADeveloperIsPointedToOriginThenForwardsThroughTheHub(t *testing
 func TestLand_APatchBranchLandedOnIsRebuiltWithTheLandingsSessionAndMirrored(t *testing.T) {
 	t.Parallel()
 	const session = "0b8f3d6e-2c4a-4f1e-9d7b-5a6c8e0f1a2b"
-	f := startPushFixtureWith(t, func(c *hub.Composition) { c.Land().RegisterSessionLinker(anyLandSession{}) },
+	held := &heldEnqueue{entered: make(chan struct{}), release: make(chan struct{})}
+	f := startPushFixtureWith(t, func(c *hub.Composition) {
+		c.Land().RegisterSessionLinker(anyLandSession{})
+		held.next = c.CarryPatch()
+		c.CarryPatch().RegisterRebuildEnqueuer(held)
+	},
 		func(w *workspace.Workspace) {
 			w.Settings = map[string]json.RawMessage{
 				"patch_branch_source": json.RawMessage(`"hub"`), "push_patches_to_origin": json.RawMessage(`true`),
@@ -404,7 +410,24 @@ func TestLand_APatchBranchLandedOnIsRebuiltWithTheLandingsSessionAndMirrored(t *
 		t.Fatalf("open the change from fix/tls onto patch/tls = %d %s, want 201", status, raw)
 	}
 
-	status, raw := f.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/changes/1/land", pat, map[string]any{"session_id": session})
+	type answer struct {
+		status int
+		raw    []byte
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		status, raw := f.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/changes/1/land", pat, map[string]any{"session_id": session})
+		answered <- answer{status, raw}
+	}()
+	var status int
+	var raw []byte
+	select {
+	case a := <-answered:
+		status, raw = a.status, a.raw
+	case <-time.After(30 * time.Second):
+		close(held.release)
+		t.Fatal("the land was not answered while the rebuild enqueue was held")
+	}
 	var attempt struct {
 		Status    string `json:"status"`
 		LandedSHA string `json:"landed_sha"`
@@ -415,6 +438,14 @@ func TestLand_APatchBranchLandedOnIsRebuiltWithTheLandingsSessionAndMirrored(t *
 	if got := refIn(f.copy, "refs/heads/patch/tls"); got != attempt.LandedSHA {
 		t.Errorf("hub's patch/tls = %s, want the landed %s", got, attempt.LandedSHA)
 	}
+	hubtest.WaitClosed(t, held.entered, "the after-landing hook held in the rebuild enqueue")
+	if got := f.listRebuilds(t, pat); len(got) != 0 {
+		t.Errorf("rebuilds of %s = %+v while the enqueue is held, want none yet", f.slug, got)
+	}
+	if got := f.origin.Head("patch/tls"); got == attempt.LandedSHA {
+		t.Errorf("origin's patch/tls = %s while the enqueue is held, want the mirror not run yet", got)
+	}
+	close(held.release)
 	waitFor(t, "the rebuild of the land", func() bool { return len(f.listRebuilds(t, pat)) == 1 })
 	if got := f.listRebuilds(t, pat); got[0].SubmittedBy != "system:land" {
 		t.Errorf("rebuilds of %s = %+v, want one submitted by system:land", f.slug, got)
@@ -437,6 +468,26 @@ func (f *pushFixture) listRebuilds(t *testing.T, credential string) []listedRebu
 		t.Fatalf("list the rebuilds of %s = %d %s, want 200", f.slug, status, raw)
 	}
 	return page.Items
+}
+
+// heldEnqueue is a rebuild enqueuer that holds each call, after closing
+// entered, until release is closed or the call's context ends, and then
+// hands it to next.
+type heldEnqueue struct {
+	next    carrypatch.RebuildEnqueuer
+	enter   sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *heldEnqueue) EnqueueRebuild(ctx context.Context, slug string, opts carrypatch.RebuildOptions) (carrypatch.RebuildResult, error) {
+	h.enter.Do(func() { close(h.entered) })
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+		return carrypatch.RebuildResult{}, ctx.Err()
+	}
+	return h.next.EnqueueRebuild(ctx, slug, opts)
 }
 
 // listedRebuild is what the smoke tests read of a listed rebuild.
