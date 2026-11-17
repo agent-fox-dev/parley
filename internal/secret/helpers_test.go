@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"net/http"
@@ -230,6 +231,29 @@ func (w *world) do(t *testing.T, cred, method, path string, body any) answer {
 	t.Helper()
 	status, b := w.Call(t, method, "/api/v1"+path, cred, body)
 	return answer{status: status, body: b}
+}
+
+// post sends body as JSON to path, below /api/v1, with cred as the bearer
+// credential, and returns the answer or the error of sending it, never
+// failing the test, so that a goroutine of the test may call it.
+func (w *world) post(cred, path string, body any) (answer, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return answer{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, w.URL("/api/v1"+path), bytes.NewReader(raw))
+	if err != nil {
+		return answer{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cred)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return answer{}, err
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	return answer{status: res.StatusCode, body: b}, err
 }
 
 // seed stores the secrets keys in one scope through the component, each

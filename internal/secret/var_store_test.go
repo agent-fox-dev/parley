@@ -1,6 +1,7 @@
 package secret_test
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -23,16 +24,20 @@ func TestCreateVars_StoresAKeyOnceAgainstAConcurrentCreate(t *testing.T) {
 			Kind: access.KindRepository, Status: access.StatusReady})
 		path := "/workspaces/" + slug + "/vars"
 		var answers [2]answer
+		var errs [2]error
 		var wg sync.WaitGroup
 		start := make(chan struct{})
 		for i, body := range bodies {
 			wg.Go(func() {
 				<-start
-				answers[i] = w.do(t, w.ownerKey, http.MethodPost, path, body)
+				answers[i], errs[i] = w.post(w.ownerKey, path, body)
 			})
 		}
 		close(start)
 		wg.Wait()
+		if err := errors.Join(errs[:]...); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
 		winner := slices.IndexFunc(answers[:], func(a answer) bool { return a.status == http.StatusCreated })
 		if winner < 0 {
 			t.Errorf("round %d: answers %d %s and %d %s, want one 201", round, answers[0].status, answers[0].body, answers[1].status, answers[1].body)

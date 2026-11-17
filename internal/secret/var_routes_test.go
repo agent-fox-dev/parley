@@ -110,6 +110,10 @@ func TestCreateVars_RefusesABadRequestWhole(t *testing.T) {
 	firstFault := []refusal{
 		{name: "an invalid key, then a value too large", body: entries(key("1A"), key("HUGE", huge)),
 			status: http.StatusBadRequest, typ: "invalid_request", has: "1A", hasNot: "HUGE"},
+		{name: "a value that is not a string, then an invalid key", body: entries(map[string]any{"key": "GOOD", "value": 5}, key("1A")),
+			status: http.StatusBadRequest, typ: "invalid_request", has: "1A", hasNot: "GOOD"},
+		{name: "a value too large, then a key that is not a string", body: entries(key("HUGE", huge), map[string]any{"key": 7}),
+			status: http.StatusBadRequest, typ: "invalid_request", has: "entries[1]", hasNot: "HUGE"},
 		{name: "a value too large, then two keys equal ignoring case", body: entries(key("HUGE", huge), key("Dup"), key("DUP")),
 			status: http.StatusBadRequest, typ: "invalid_request", has: "HUGE", hasNot: "DUP"},
 		{name: "two keys equal ignoring case in a full scope", body: entries(key("Dup"), key("DUP")),

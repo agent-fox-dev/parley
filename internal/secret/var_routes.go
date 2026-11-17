@@ -140,7 +140,7 @@ func (c *Component) createVars(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	entries, err := decodeEntries(r)
+	entries, err := decodeVarEntries(r)
 	if err != nil {
 		return err
 	}

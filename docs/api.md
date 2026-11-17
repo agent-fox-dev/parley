@@ -7715,7 +7715,8 @@ No route reads one variable by key: `GET` on `…/vars/{key}` is `405`
 `method_not_allowed` with `Allow: DELETE, PATCH`. Under
 `/api/v1/workspaces/{slug}/vars/` the segment `resolved` names the resolved
 variables: `PATCH` and `DELETE` on it are `405` `method_not_allowed` with
-`Allow: GET`, before any check, and never reach a variable. A variable stored
+`Allow: GET`, before authentication and every other check but the rate
+limit and the body limit, and never reach a variable. A variable stored
 under the key `resolved` is reached under another casing, such as
 `…/vars/RESOLVED`.
 
@@ -7778,8 +7779,11 @@ absent the empty string.
 ```
 
 The body is checked in this order, and the first fault is answered:
-`entries` is a non-empty array; entry by entry, its key and then its value;
-then no two keys are equal ignoring the case of `A` to `Z`. Then, in one
+`entries` is a non-empty array; every entry's key, in request order; every
+entry's value, in request order; then no two keys are equal ignoring the
+case of `A` to `Z`. So a request whose first entry has a bad value and whose
+second a bad key is answered naming the second's key (a secret create
+checks entry by entry instead). Then, in one
 transaction: when the scope's variables and the entries together would be
 more than 100, `429`, also when a key already exists; otherwise, when the
 scope already holds a key equal to one of the entries ignoring case, `409`
@@ -7866,7 +7870,8 @@ For each key, compared ignoring the case of `A` to `Z`, the variable of the
 first scope that holds it is answered whole, with its key casing, value and
 times and that scope's `origin`; the items are ordered by key as on every
 variable list. Deleting a fork's own variable shows its parent's again at
-the next read. All the scopes are read in one consistent read.
+the next read. The chain is worked out first; the variables of all its
+scopes are then read in one consistent read.
 
 ```json
 {"items":[{"key":"LOG_LEVEL","value":"info","origin":"org","created_at":"2026-11-17T10:30:15Z","updated_at":"2026-11-17T10:30:15Z"},{"key":"REGION","value":"eu","origin":"parent","created_at":"2026-11-17T10:32:00Z","updated_at":"2026-11-17T10:32:00Z"}],"next_cursor":null}

@@ -6070,8 +6070,9 @@ clear, and its times in UnixNano, whole seconds. The part registers
 `secret.MarkScope`, so `ScopeCheck` resolves it, and on a workspace
 `access.MarkNeed` `read` for the list and the resolved variables and `write`
 for a change, so a member reads and the owner and the admin token change. The
-handlers reuse the secret routes' body checks (`decodeEntries`,
-`decodeValue`, `CheckKey`, `CheckValue`), error mapping and event writing
+handlers reuse the secret routes' body checks (`decodeValue`, `CheckKey`,
+`CheckValue`, and `decodeVarEntries`, which checks every entry's key before
+any entry's value where a secret create goes entry by entry), error mapping and event writing
 (`eventInput`, `emit`, with `resource_type` `variable`): `CreateVars` counts,
 checks for a key present and inserts in one `store.Tx` with one
 `parley.variable.create` per entry; `UpdateVar` and `DeleteVar` write

@@ -26,7 +26,7 @@ type varReader func(ctx context.Context, q rowsQuerier, scope Scope, scopeID str
 
 // scopeVars is the store's varReader.
 func scopeVars(ctx context.Context, q rowsQuerier, scope Scope, scopeID string) ([]Variable, error) {
-	return listVars(ctx, q, scope, scopeID, "", -1)
+	return readVarPage(ctx, q, scope, scopeID, "", -1)
 }
 
 // ResolveVars returns the variables the workspace slug runs with, in the

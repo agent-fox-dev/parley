@@ -10,8 +10,9 @@ The package lists files of their own for the key and value rules
 (`var_validate.go`) and for scope access (`var_access.go`). The variable
 rules are the secret rules, and the PRD specifies the variable routes "as
 the secret routes", so the variables are kept by the same
-`secret.Component`: the routes reuse its body checks (`decodeEntries`,
-`decodeValue`, `CheckKey`, `CheckValue`), its scope check (`ScopeCheck`,
+`secret.Component`: the routes reuse its body checks (`decodeValue`,
+`CheckKey`, `CheckValue`, and the create body's decoding, which for
+variables checks every key before any value), its scope check (`ScopeCheck`,
 through the mark `secret.MarkScope`), its error mapping and its event
 writing. Neither file exists; the routes are in `var_routes.go` and the
 store operations in `var_store.go`. The org scope's `404` is the secret

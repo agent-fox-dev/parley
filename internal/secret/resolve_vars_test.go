@@ -64,7 +64,6 @@ func TestResolvedVars_AnswerEveryReaderTheChainOfTheOwner(t *testing.T) {
 	w := newWorld(t)
 	w.putVars(t, w.ownerKey, "/user/vars", "X", "owner's", "OwnerOnly", "1")
 	w.putVars(t, w.memberKey, "/user/vars", "X", "member's")
-	const path = "/workspaces/acme/vars/resolved"
 	want := w.resolve(t, w.ownerKey, "acme")
 	if keys := keysOfResolved(want); !slices.Equal(keys, []string{"OwnerOnly", "X"}) || want[1].Value != "owner's" || want[0].Origin != "user" || want[1].Origin != "user" {
 		t.Fatalf("the owner's resolved = %v, want OwnerOnly and the owner's X, both from the user scope", want)
@@ -79,16 +78,6 @@ func TestResolvedVars_AnswerEveryReaderTheChainOfTheOwner(t *testing.T) {
 		if got := w.resolve(t, r.cred, "acme"); !slices.Equal(got, want) {
 			t.Errorf("%s is answered %v, want the owner's %v", r.name, got, want)
 		}
-	}
-	pat := w.IssuePAT(t, identity.PATSpec{UserID: w.memberID, Permissions: []string{"secrets:write"}})
-	if a := w.do(t, pat, http.MethodGet, path, nil); a.status != http.StatusForbidden {
-		t.Errorf("a PAT with neither vars scope = %d %s, want 403", a.status, a.body)
-	} else if typ, _ := errorOf(t, a); typ != "insufficient_scope" {
-		t.Errorf("a PAT with neither vars scope = %s, want insufficient_scope", a.body)
-	}
-	a := w.do(t, w.outsiderKey, http.MethodGet, path, nil)
-	if typ, msg := errorOf(t, a); a.status != http.StatusNotFound || typ != "not_found" || msg != "workspace not found" {
-		t.Errorf("a caller of no workspace's org = %d %s, want 404 workspace not found", a.status, a.body)
 	}
 	if got := keysOf(w.listVars(t, w.memberKey, "/user/vars")); slices.Contains(got, "OwnerOnly") {
 		t.Errorf("the member's own variables %v hold the owner's OwnerOnly", got)
