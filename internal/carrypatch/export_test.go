@@ -2,8 +2,11 @@ package carrypatch
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"time"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/jobs"
 )
 
@@ -51,3 +54,9 @@ const (
 	SkippedBranchNotFound = skippedBranchNotFound
 	SkippedNothingToApply = skippedNothingToApply
 )
+
+// RecordRerereEntries records, in the transaction tx, an entry of the
+// workspace slug for each of the conflicts that has none, at the time at.
+func RecordRerereEntries(ctx context.Context, tx *sql.Tx, slug string, conflicts []gitrepo.RerereConflict, at time.Time) error {
+	return recordRerereEntries(ctx, tx, slug, conflicts, at, false)
+}

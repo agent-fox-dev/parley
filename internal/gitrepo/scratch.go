@@ -3,7 +3,6 @@ package gitrepo
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -69,6 +68,11 @@ type Picked struct {
 	// Conflicts are the paths that did not merge, in path order, for
 	// PickConflicted; nil otherwise.
 	Conflicts []string
+	// Recorded are, for PickConflicted, the conflicts git's rerere recorded
+	// at the paths left in conflict, which it holds no resolution for, in
+	// path order; nil otherwise. A conflict it held a resolution for was
+	// resolved with it and is not among Conflicts.
+	Recorded []RerereConflict
 }
 
 // AddScratch makes the scratch working tree name of the repository, at
@@ -114,11 +118,15 @@ func (s *Scratch) Head(ctx context.Context) (string, error) {
 // name, e-mail address and time written as given and never taken from the
 // environment or a configuration. HEAD then moves to the new commit.
 //
-// A change that does not apply is PickConflicted with the paths that did
-// not merge; the scratch working tree is left in that state, its files
-// holding git's conflict markers, for the caller to resolve or undo, and
-// HEAD does not move. A change HEAD already holds is PickDropped, with the
-// files as HEAD has them. An error is a failure of git.
+// The replay runs with git's rerere on: a conflict it holds a recorded
+// resolution for is resolved with it, and a replay whose every conflict is
+// resolved so is committed like one that applied. A change that does not
+// apply is PickConflicted with the paths still in conflict and the
+// conflicts rerere recorded; the scratch working tree is left in that
+// state, its files holding git's conflict markers, for the caller to
+// resolve or undo, and HEAD does not move. A change HEAD already holds is
+// PickDropped, with the files as HEAD has them. An error is a failure of
+// git.
 func (s *Scratch) Pick(ctx context.Context, commit string, committer Signature) (Picked, error) {
 	orig, err := s.r.ReadCommits(ctx, []string{commit})
 	if err != nil {
@@ -132,18 +140,19 @@ func (s *Scratch) Pick(ctx context.Context, commit string, committer Signature) 
 	if err != nil {
 		return Picked{}, err
 	}
-	if _, err := s.git(ctx, "cherry-pick", "--no-commit", c.ID); err != nil {
-		if ctx.Err() != nil {
+	stopped, err := s.stopped(ctx, append(slices.Clone(rerereConfig), "cherry-pick", "--no-commit", c.ID)...)
+	if err != nil {
+		return Picked{}, err
+	}
+	if stopped {
+		if picked, err := s.conflicted(ctx); err != nil || picked.Outcome == PickConflicted {
+			return picked, err
+		}
+		// Recorded resolutions resolved every path: the replay goes on as
+		// one that applied, with nothing in progress left behind.
+		if _, err := s.git(ctx, "cherry-pick", "--quit"); err != nil {
 			return Picked{}, err
 		}
-		paths, uerr := s.unmerged(ctx)
-		if uerr != nil {
-			return Picked{}, errors.Join(err, uerr)
-		}
-		if len(paths) == 0 {
-			return Picked{}, err
-		}
-		return Picked{Outcome: PickConflicted, Conflicts: paths}, nil
 	}
 	tree, err := s.git(ctx, "write-tree")
 	if err != nil {
@@ -181,11 +190,12 @@ func (s *Scratch) Pick(ctx context.Context, commit string, committer Signature) 
 // are written as given and never taken from the environment or a
 // configuration. HEAD then moves to it; the result is PickApplied.
 //
-// A commit HEAD already reaches is PickDropped, with nothing made. A merge
-// that does not apply is PickConflicted with the paths that did not merge;
-// the scratch working tree is left in that state, the merge in progress and
-// its files holding git's conflict markers, for the caller to resolve or
-// undo, and HEAD does not move. An error is a failure of git.
+// The merge runs with git's rerere on, as Pick does. A commit HEAD already
+// reaches is PickDropped, with nothing made. A merge that does not apply is
+// PickConflicted with the paths still in conflict and the conflicts rerere
+// recorded; the scratch working tree is left in that state, the merge in
+// progress and its files holding git's conflict markers, for the caller to
+// resolve or undo, and HEAD does not move. An error is a failure of git.
 func (s *Scratch) Merge(ctx context.Context, commit, message string, author, committer Signature) (Picked, error) {
 	if !isHexID(commit, idLen) {
 		return Picked{}, fmt.Errorf("merge %q: %w", commit, ErrNotFound)
@@ -204,20 +214,17 @@ func (s *Scratch) Merge(ctx context.Context, commit, message string, author, com
 	}
 	// The merge stops before its commit, which is written here with the
 	// identities given; the options the repository's configuration could
-	// otherwise change are given on the command line.
-	if _, err := s.git(ctx, "merge", "--no-commit", "--no-ff", "--no-squash", "--no-verify-signatures",
-		"--no-log", "--no-stat", "--no-autostash", "--quiet", commit); err != nil {
-		if ctx.Err() != nil {
-			return Picked{}, err
+	// otherwise change are given on the command line. Where recorded
+	// resolutions resolved every path, the merge goes on as one that
+	// merged.
+	stopped, err := s.mergeNoCommit(ctx, commit)
+	if err != nil {
+		return Picked{}, err
+	}
+	if stopped {
+		if picked, err := s.conflicted(ctx); err != nil || picked.Outcome == PickConflicted {
+			return picked, err
 		}
-		paths, uerr := s.unmerged(ctx)
-		if uerr != nil {
-			return Picked{}, errors.Join(err, uerr)
-		}
-		if len(paths) == 0 {
-			return Picked{}, err
-		}
-		return Picked{Outcome: PickConflicted, Conflicts: paths}, nil
 	}
 	tree, err := s.git(ctx, "write-tree")
 	if err != nil {
@@ -238,6 +245,23 @@ func (s *Scratch) Merge(ctx context.Context, commit, message string, author, com
 		return Picked{}, err
 	}
 	return Picked{Outcome: PickApplied, Commit: id}, nil
+}
+
+// conflicted is the outcome of a replay or a merge that stopped at a
+// conflict: PickConflicted with the paths still in conflict once git's
+// rerere replayed the resolutions it holds, and the conflicts it recorded
+// and holds none for, read before anything undoes the operation; the zero
+// Picked when no path is left in conflict.
+func (s *Scratch) conflicted(ctx context.Context) (Picked, error) {
+	paths, err := s.unmerged(ctx)
+	if err != nil || len(paths) == 0 {
+		return Picked{}, err
+	}
+	recorded, err := s.recorded(ctx)
+	if err != nil {
+		return Picked{}, err
+	}
+	return Picked{Outcome: PickConflicted, Conflicts: paths, Recorded: recorded}, nil
 }
 
 // unmerged are the paths of the scratch working tree's index that did not

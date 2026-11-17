@@ -12,13 +12,15 @@ import (
 const carryPatchHook = "carry_patch"
 
 // composeCarryPatch adds the carry-patch work: the schema of the patch
-// lists, and the component, registered with the workspace service as the
-// post-clone step of the workspaces in mode carry_patch, so that every
-// fresh copy of one is set up (upstream fetched, remembered resolutions on,
-// the integration branch written) before the workspace is ready, and as the
-// patch-branch lookup of the push route, which leaves the patch branches to
-// the patch list, without the workspace package knowing the mode's work. A
-// workspace's delete removes its patches (ADR 07). The component is the
+// lists and of the remembered-resolution entries, and the component,
+// registered with the workspace service as the post-clone step of the
+// workspaces in mode carry_patch, so that every fresh copy of one is set up
+// (its remembered-resolution entries forgotten, upstream fetched,
+// remembered resolutions on, the integration branch written) before the
+// workspace is ready, and as the patch-branch lookup of the push route,
+// which leaves the patch branches to the patch list, without the workspace
+// package knowing the mode's work. A workspace's delete removes its patches
+// and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
 // one as a job of the hub's queue. The component's routes, those of the
 // patch list and of the rebuild jobs, are registered with the hub's router.
@@ -39,9 +41,11 @@ func composeCarryPatch(c *Composition) {
 	comp := &carrypatch.Component{}
 	c.carryPatch = comp
 	c.AddSchemaStep(carrypatch.SchemaStep)
+	c.AddSchemaStep(carrypatch.RerereSchemaStep)
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
+	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveRerereEntries)
 	comp.RegisterRebuildEnqueuer(comp)
 	for _, rt := range comp.Routes() {
 		c.AddRoute(rt)

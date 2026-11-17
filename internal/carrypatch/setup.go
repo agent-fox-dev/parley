@@ -2,6 +2,7 @@ package carrypatch
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -172,11 +173,20 @@ func (e *setupError) Unwrap() []error { return e.failed }
 // PostClone is the post-clone step of the workspaces in mode carry_patch,
 // which the clone work runs on the fresh copy repo of w before w is ready
 // (the hub registers it with workspace.Service.RegisterPostCloneStep): the
-// set-up in its replacing form. Its error, already clean of credentials,
-// is logged by the clone work and does not keep the workspace from
-// becoming ready.
+// set-up in its replacing form. It first removes the workspace's
+// remembered-resolution entries: a fresh copy starts with an empty
+// rr-cache, so the entries no longer describe what git holds. The registry
+// holds one step per mode, so this one step does both. Its error, already
+// clean of credentials, is logged by the clone work and does not keep the
+// workspace from becoming ready.
 func (c *Component) PostClone(ctx context.Context, w workspace.Workspace, repo *gitrepo.Repo) error {
-	return Setup{Record: c.record(), Upstream: c, Copy: repo, Replace: true}.Run(ctx, w)
+	var forget error
+	if c.d.Store == nil {
+		forget = errNotBound
+	} else {
+		forget = c.d.Store.Tx(ctx, func(tx *sql.Tx) error { return RemoveRerereEntries(ctx, tx, w.Slug) })
+	}
+	return errors.Join(forget, Setup{Record: c.record(), Upstream: c, Copy: repo, Replace: true}.Run(ctx, w))
 }
 
 // EnsureSetup repeats the set-up on the ready carry-patch workspace w, for

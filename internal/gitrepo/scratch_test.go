@@ -483,3 +483,206 @@ func TestScratch_DiscardRemovesEveryLeftover(t *testing.T) {
 		}
 	})
 }
+
+// learnStream is scratchStream with two merge commits on c1: learned merges
+// main and resolves f.txt to "resolved", unrelated merges add, which
+// touches another file.
+const learnStream = scratchStream + `commit refs/heads/learned
+author Dev <dev@example.invalid> 1500000500 +0000
+committer Dev <dev@example.invalid> 1500000500 +0000
+data 8
+learned
+from refs/heads/conflict
+merge refs/heads/main
+M 100644 inline f.txt
+data 9
+resolved
+
+commit refs/heads/unrelated
+author Dev <dev@example.invalid> 1500000600 +0000
+committer Dev <dev@example.invalid> 1500000600 +0000
+data 10
+unrelated
+from refs/heads/conflict
+merge refs/heads/add
+M 100644 inline a.txt
+data 2
+a
+
+`
+
+// rrCache are the names of the entries of the rr-cache of the repository
+// dir, the conflicts its rerere recorded.
+func rrCache(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "rr-cache"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// inProgress are the files of the scratch working tree name of the
+// repository dir that say an operation is in progress there.
+func inProgress(t *testing.T, dir, name string) []string {
+	t.Helper()
+	var left []string
+	for _, state := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "MERGE_MSG", "MERGE_RR", "AUTO_MERGE"} {
+		if _, err := os.Stat(filepath.Join(dir, "worktrees", name, state)); err == nil {
+			left = append(left, state)
+		}
+	}
+	return left
+}
+
+func TestScratch_ReplaysARecordedResolution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)}
+	cases := []struct {
+		name string
+		run  func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error)
+	}{
+		{"a replay", func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error) { return s.Pick(ctx, commit, hub) }},
+		{"a merge", func(s *gitrepo.Scratch, commit string) (gitrepo.Picked, error) {
+			return s.Merge(ctx, commit, "Merge branch 'conflict'", hub, hub)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newScratchRepo(t, scratchStream)
+			m2, conflict := f.id(t, "main"), f.id(t, "conflict")
+			s, err := f.repo.AddScratch(ctx, "job-1", m2)
+			if err != nil {
+				t.Fatalf("AddScratch = %v", err)
+			}
+			t.Cleanup(func() { _ = s.Remove(ctx) })
+
+			first, err := tc.run(s, conflict)
+			if err != nil || first.Outcome != gitrepo.PickConflicted {
+				t.Fatalf("%s of conflict = %+v, %v; want conflicted", tc.name, first, err)
+			}
+			ids := rrCache(t, f.dir)
+			if len(ids) != 1 {
+				t.Fatalf("the rr-cache holds %q, want the one conflict", ids)
+			}
+			if want := []gitrepo.RerereConflict{{ID: ids[0], Path: "f.txt"}}; !reflect.DeepEqual(first.Recorded, want) {
+				t.Errorf("the conflicts git recorded = %+v, want %+v", first.Recorded, want)
+			}
+			if ok, err := f.repo.RerereResolved(ids[0]); err != nil || ok {
+				t.Errorf("RerereResolved before a resolution = %v, %v; want false", ok, err)
+			}
+			// The conflict is resolved once by hand, with rerere on.
+			if err := os.WriteFile(filepath.Join(s.Dir(), "f.txt"), []byte("resolved\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := gitrepotest.Run(filepath.Join(f.dir, "worktrees", "job-1"), "", "-C", s.Dir(), "-c", "rerere.enabled=true", "rerere"); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := f.repo.RerereResolved(ids[0]); err != nil || !ok {
+				t.Errorf("RerereResolved after the resolution = %v, %v; want true", ok, err)
+			}
+			if err := s.Reset(ctx, m2); err != nil {
+				t.Fatal(err)
+			}
+
+			again, err := tc.run(s, conflict)
+			if err != nil || again.Outcome != gitrepo.PickApplied || len(again.Conflicts) != 0 {
+				t.Fatalf("%s of conflict with a recorded resolution = %+v, %v; want applied", tc.name, again, err)
+			}
+			if got := gitrepotest.Git(t, f.dir, "show", again.Commit+":f.txt"); got != "resolved" {
+				t.Errorf("f.txt of the new commit = %q, want the recorded resolution", got)
+			}
+			if head, err := s.Head(ctx); err != nil || head != again.Commit {
+				t.Errorf("HEAD = %s, %v; want the new commit %s", head, err, again.Commit)
+			}
+			if left := inProgress(t, f.dir, "job-1"); len(left) != 0 {
+				t.Errorf("the scratch working tree still holds %q, want no operation in progress", left)
+			}
+			if picked, err := s.Pick(ctx, f.id(t, "add"), hub); err != nil || picked.Outcome != gitrepo.PickApplied {
+				t.Errorf("Pick(add) after the replay = %+v, %v; want applied", picked, err)
+			}
+		})
+	}
+}
+
+func TestScratch_LearnsTheResolutionOfAMergeCommit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	hub := gitrepo.Signature{Name: "Hub", Email: "hub@example.org", Time: time.Unix(1760000000, 0)}
+	cases := []struct {
+		merge string
+		// learns says the merge resolved the conflict of conflict onto main.
+		learns bool
+	}{
+		{"learned", true},
+		{"unrelated", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.merge, func(t *testing.T) {
+			t.Parallel()
+			f := newScratchRepo(t, learnStream)
+			m2, conflict := f.id(t, "main"), f.id(t, "conflict")
+			s, err := f.repo.AddScratch(ctx, "job-1", m2)
+			if err != nil {
+				t.Fatalf("AddScratch = %v", err)
+			}
+			t.Cleanup(func() { _ = s.Remove(ctx) })
+			first, err := s.Pick(ctx, conflict, hub)
+			if err != nil || first.Outcome != gitrepo.PickConflicted || len(first.Recorded) != 1 {
+				t.Fatalf("Pick(conflict) = %+v, %v; want conflicted with one recorded conflict", first, err)
+			}
+			id := first.Recorded[0].ID
+			if err := s.Reset(ctx, m2); err != nil {
+				t.Fatal(err)
+			}
+			refs := gitrepotest.Refs(t, f.dir, "")
+
+			learned, err := s.Learn(ctx, f.id(t, tc.merge))
+			if err != nil {
+				t.Fatalf("Learn(%s) = %v", tc.merge, err)
+			}
+			var want []gitrepo.RerereConflict
+			if tc.learns {
+				want = []gitrepo.RerereConflict{{ID: id, Path: "f.txt"}}
+			}
+			if !reflect.DeepEqual(learned, want) {
+				t.Errorf("Learn(%s) learned %+v, want %+v", tc.merge, learned, want)
+			}
+			if ok, err := f.repo.RerereResolved(id); err != nil || ok != tc.learns {
+				t.Errorf("RerereResolved after Learn(%s) = %v, %v; want %v", tc.merge, ok, err, tc.learns)
+			}
+			if got := gitrepotest.Refs(t, f.dir, ""); !maps.Equal(got, refs) {
+				t.Errorf("the refs after Learn = %v, want them as they were, %v", got, refs)
+			}
+			if left := inProgress(t, f.dir, "job-1"); len(left) != 0 {
+				t.Errorf("the scratch working tree still holds %q after Learn, want no operation in progress", left)
+			}
+
+			if err := s.Reset(ctx, m2); err != nil {
+				t.Fatal(err)
+			}
+			again, err := s.Pick(ctx, conflict, hub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.learns {
+				if again.Outcome != gitrepo.PickConflicted {
+					t.Errorf("Pick(conflict) after Learn(%s) = %+v, want conflicted", tc.merge, again)
+				}
+				return
+			}
+			if again.Outcome != gitrepo.PickApplied {
+				t.Fatalf("Pick(conflict) after Learn(%s) = %+v, want applied", tc.merge, again)
+			}
+			if got := gitrepotest.Git(t, f.dir, "show", again.Commit+":f.txt"); got != "resolved" {
+				t.Errorf("f.txt of the replay = %q, want the merge commit's \"resolved\"", got)
+			}
+		})
+	}
+}

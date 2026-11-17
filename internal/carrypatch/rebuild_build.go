@@ -132,18 +132,123 @@ func (r *rebuildRun) build(ctx context.Context) *attemptOutcome {
 // where it conflicted, and leaves the scratch working tree for the caller
 // to undo.
 func (r *rebuildRun) apply(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *conflictAt, *attemptOutcome) {
+	pr := &patchReplay{run: r, scratch: scratch, p: p}
 	if r.payload.Strategy == strategyMerge {
-		return r.merge(ctx, scratch, p)
+		return pr.merge(ctx)
 	}
-	return r.rebase(ctx, scratch, p)
+	return pr.rebase(ctx)
 }
 
-// rebase applies the patch p by replaying, oldest first, onto the head
+// maxLearnMerges is how many merge commits of a patch, the newest, a run
+// redoes to learn the resolutions of a conflict from.
+const maxLearnMerges = 50
+
+// patchReplay is the application of one patch in a run: the run, its
+// scratch working tree, the patch, and whether the run has learned from
+// the patch's merge commits yet, which it does at most once.
+type patchReplay struct {
+	run     *rebuildRun
+	scratch *gitrepo.Scratch
+	p       runPatch
+	learned bool
+}
+
+// resolve runs op, one replay or merge of the patch onto the head under
+// construction, which git does with its rerere on, so that the resolutions
+// the workspace's repository holds are replayed; what names it in an
+// error. Each conflict git recorded gets its entry. When paths are left in
+// conflict and the patch has not been learned from in this attempt, it
+// learns the resolutions of the patch's merge commits and, when one was
+// learned, runs op once more.
+func (pr *patchReplay) resolve(ctx context.Context, what string, op func(ctx context.Context) (gitrepo.Picked, error)) (gitrepo.Picked, *attemptOutcome) {
+	picked, out := pr.once(ctx, what, op)
+	if out != nil || picked.Outcome != gitrepo.PickConflicted || pr.learned {
+		return picked, out
+	}
+	pr.learned = true
+	learned, out := pr.learn(ctx)
+	if out != nil || !learned {
+		return picked, out
+	}
+	return pr.once(ctx, what, op)
+}
+
+// once runs op and records the conflicts git recorded.
+func (pr *patchReplay) once(ctx context.Context, what string, op func(ctx context.Context) (gitrepo.Picked, error)) (gitrepo.Picked, *attemptOutcome) {
+	r := pr.run
+	var picked gitrepo.Picked
+	err := r.git(ctx, func(ctx context.Context) (err error) {
+		picked, err = op(ctx)
+		return err
+	})
+	if err != nil {
+		return picked, r.failed(ctx, fmt.Errorf("rebuild of %s: %s: %w", r.ws.Slug, what, err))
+	}
+	if err := r.recordConflicts(ctx, picked.Recorded, false); err != nil {
+		return picked, r.failed(ctx, fmt.Errorf("rebuild of %s: record the conflicts of %s: %w", r.ws.Slug, pr.p.BranchName, err))
+	}
+	return picked, nil
+}
+
+// learn redoes, in the scratch working tree, the newest merge commits of
+// two parents the patch's source reaches and the upstream base does not,
+// so that git records the resolutions the developer gave there, and
+// returns the tree to the head under construction. It reports whether a
+// resolution was learned; each learned one's entry takes the clock's time.
+func (pr *patchReplay) learn(ctx context.Context) (bool, *attemptOutcome) {
+	r := pr.run
+	var merges []string
+	err := r.git(ctx, func(ctx context.Context) error {
+		ids, err := r.repo.CommitsBetween(ctx, r.base, *pr.p.source, 0)
+		if err != nil {
+			return err
+		}
+		commits, err := r.repo.ReadCommits(ctx, ids)
+		if err != nil {
+			return err
+		}
+		for i := len(commits) - 1; i >= 0 && len(merges) < maxLearnMerges; i-- {
+			if len(commits[i].Parents) == 2 {
+				merges = append(merges, commits[i].ID)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, r.failed(ctx, fmt.Errorf("rebuild of %s: read the merges of %s: %w", r.ws.Slug, pr.p.BranchName, err))
+	}
+	if len(merges) == 0 {
+		return false, nil
+	}
+	var learned []gitrepo.RerereConflict
+	steps := []func(ctx context.Context) error{func(ctx context.Context) error { return pr.scratch.Reset(ctx, r.head) }}
+	for _, m := range merges {
+		steps = append(steps, func(ctx context.Context) error {
+			got, err := pr.scratch.Learn(ctx, m)
+			learned = append(learned, got...)
+			return err
+		})
+	}
+	steps = append(steps, func(ctx context.Context) error { return pr.scratch.Reset(ctx, r.head) })
+	for _, step := range steps {
+		if err := r.git(ctx, step); err != nil {
+			return false, r.failed(ctx, fmt.Errorf("rebuild of %s: learn from the merges of %s: %w", r.ws.Slug, pr.p.BranchName, err))
+		}
+	}
+	if err := r.recordConflicts(ctx, learned, true); err != nil {
+		return false, r.failed(ctx, fmt.Errorf("rebuild of %s: record the resolutions learned from %s: %w", r.ws.Slug, pr.p.BranchName, err))
+	}
+	return len(learned) > 0, nil
+}
+
+// rebase applies the patch by replaying, oldest first, onto the head
 // under construction every commit its source reaches and the upstream base
 // does not, leaving out merge commits; a commit whose change the head
-// already holds is dropped. It reports whether any commit was replayed, or
-// the first commit that does not apply.
-func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *conflictAt, *attemptOutcome) {
+// already holds is dropped, and one that conflicts is resolved as far as
+// resolve can. It reports whether any commit was replayed, or the first
+// commit that does not apply.
+func (pr *patchReplay) rebase(ctx context.Context) (bool, *conflictAt, *attemptOutcome) {
+	r, p := pr.run, pr.p
 	var commits []gitrepo.Commit
 	err := r.git(ctx, func(ctx context.Context) error {
 		ids, err := r.repo.CommitsBetween(ctx, r.base, *p.source, 0)
@@ -162,13 +267,11 @@ func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p run
 		if len(c.Parents) > 1 {
 			continue
 		}
-		var picked gitrepo.Picked
-		err := r.git(ctx, func(ctx context.Context) (err error) {
-			picked, err = scratch.Pick(ctx, c.ID, committer)
-			return err
+		picked, out := pr.resolve(ctx, "replay "+c.ID+" of "+p.BranchName, func(ctx context.Context) (gitrepo.Picked, error) {
+			return pr.scratch.Pick(ctx, c.ID, committer)
 		})
-		if err != nil {
-			return false, nil, r.failed(ctx, fmt.Errorf("rebuild of %s: replay %s of %s: %w", r.ws.Slug, c.ID, p.BranchName, err))
+		if out != nil {
+			return false, nil, out
 		}
 		switch picked.Outcome {
 		case gitrepo.PickApplied:
@@ -180,21 +283,21 @@ func (r *rebuildRun) rebase(ctx context.Context, scratch *gitrepo.Scratch, p run
 	return applied, nil, nil
 }
 
-// merge applies the patch p by merging its source into the head under
+// merge applies the patch by merging its source into the head under
 // construction with a merge commit, even where the head could fast-forward
-// to it. The hub makes that commit itself, so the landing identity is its
-// author as well as its committer. A source the head already reaches
-// leaves nothing to apply. It reports whether the merge commit was made,
-// or that the source does not merge.
-func (r *rebuildRun) merge(ctx context.Context, scratch *gitrepo.Scratch, p runPatch) (bool, *conflictAt, *attemptOutcome) {
+// to it, resolving a conflict as far as resolve can. The hub makes that
+// commit itself, so the landing identity is its author as well as its
+// committer. A source the head already reaches leaves nothing to apply. It
+// reports whether the merge commit was made, or that the source does not
+// merge.
+func (pr *patchReplay) merge(ctx context.Context) (bool, *conflictAt, *attemptOutcome) {
+	r, p := pr.run, pr.p
 	identity := r.c.committer()
-	var merged gitrepo.Picked
-	err := r.git(ctx, func(ctx context.Context) (err error) {
-		merged, err = scratch.Merge(ctx, *p.source, "Merge branch '"+p.BranchName+"'", identity, identity)
-		return err
+	merged, out := pr.resolve(ctx, "merge "+p.BranchName, func(ctx context.Context) (gitrepo.Picked, error) {
+		return pr.scratch.Merge(ctx, *p.source, "Merge branch '"+p.BranchName+"'", identity, identity)
 	})
-	if err != nil {
-		return false, nil, r.failed(ctx, fmt.Errorf("rebuild of %s: merge %s: %w", r.ws.Slug, p.BranchName, err))
+	if out != nil {
+		return false, nil, out
 	}
 	switch merged.Outcome {
 	case gitrepo.PickApplied:
