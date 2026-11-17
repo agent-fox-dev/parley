@@ -3,11 +3,11 @@
   "spec_id": "34",
   "spec_name": "rebuild_execution",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-17T01:37:04Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
