@@ -43,9 +43,9 @@ const (
 // current key is configured. Every maintenance pass runs the re-encryption
 // under the name secret_reencryption, which finishes a key rotation and
 // reports what remains under another key. It registers the removal of a user's and an
-// org's secrets on the identity service, so that the delete of a user or an
-// org removes them in its own transaction and a refused or failed delete
-// keeps them (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
+// org's secrets, and then of their variables, on the identity service, so
+// that the delete of a user or an org removes them in its own transaction
+// and a refused or failed delete keeps them (docs/adr/03-register-removers-of-owned-data-on-the-identity-service.md).
 // The secret routes, and the variable routes, which are a second collection
 // of the same component and need no key, are registered with the
 // component's scope check as an access check: it is added after identity's
@@ -82,6 +82,12 @@ func composeSecrets(c *Composition) {
 	})
 	c.identity.RegisterOrgRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
 		return c.secrets.RemoveScope(ctx, tx, secret.ScopeOrg, id)
+	})
+	c.identity.RegisterUserRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
+		return secret.RemoveVarScope(ctx, tx, secret.ScopeUser, id)
+	})
+	c.identity.RegisterOrgRemover(func(ctx context.Context, tx *sql.Tx, id string) error {
+		return secret.RemoveVarScope(ctx, tx, secret.ScopeOrg, id)
 	})
 	c.AddAccessCheck(c.secrets.ScopeCheck)
 	for _, r := range append(c.secrets.Routes(), c.secrets.VarRoutes()...) {

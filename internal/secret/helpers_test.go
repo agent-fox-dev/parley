@@ -541,6 +541,24 @@ func (w *world) allVars(t *testing.T) []string {
 	return out
 }
 
+// seedVars stores the variables keys in one scope through the component,
+// each with the value "v-" and its key, and writes no event.
+func (w *world) seedVars(t *testing.T, scope secret.Scope, id string, keys ...string) {
+	t.Helper()
+	e := make([]secret.Entry, len(keys))
+	for i, k := range keys {
+		e[i] = secret.Entry{Key: k, Value: "v-" + k}
+	}
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := w.secrets.CreateVars(ctx, tx, scope, id, e)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("seed the variables %v in %s %s: %v", keys, scope, id, err)
+	}
+}
+
 // createVars creates the variables keys, each with no value, through the
 // collection path with cred, and fails the test unless it is answered 201.
 func (w *world) createVars(t *testing.T, cred, path string, keys ...string) {
