@@ -75,7 +75,8 @@ func (c *Component) syncBase(ctx context.Context, w workspace.Workspace) (string
 
 // BeforeCompletion is the second stage of the sync of a carry-patch
 // workspace, which the workspace service runs after its per-branch pass and
-// before it records the completion: it reports what the sync found and did
+// before it records the completion: it refreshes the patch branches from
+// origin when origin is their authority, reports what the sync found and did
 // on the carry-patch side as the answer's carry-patch members, and gives the
 // upstream base as the upstream_head_sha to record when upstream advanced.
 // Its error stops the sync before the completion is recorded, so that the
@@ -86,6 +87,9 @@ func (c *Component) BeforeCompletion(ctx context.Context, run workspace.SyncRun,
 		return workspace.SyncAddition{}, errNotBound
 	}
 	s, err := c.startSyncPass(ctx, run)
+	if err == nil {
+		err = s.refreshFromOrigin(ctx)
+	}
 	if err != nil {
 		return workspace.SyncAddition{}, fmt.Errorf("the sync of workspace %q stopped: %w", run.Workspace.Slug, err)
 	}
@@ -102,6 +106,10 @@ type syncPass struct {
 	// base is the upstream base as of this sync's upstream fetch.
 	base   string
 	report syncReport
+	// moved are the patches whose branch the origin refresh created or
+	// moved, as they were listed before the refresh, with the status they
+	// had then.
+	moved []Patch
 }
 
 // syncReport is what the sync of a carry-patch workspace adds to the

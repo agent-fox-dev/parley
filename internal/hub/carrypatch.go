@@ -24,6 +24,9 @@ const carryPatchHook = "carry_patch"
 // reports the upstream's movement in the sync's answer and its record, and
 // as the provider of the branches such a sync leaves out, the branches of
 // the patches that are not deleted, which the per-branch pass must not move.
+// The workspace service is also what the component tells of each patch
+// branch a sync's origin refresh moved, so that its branch-move observers
+// see those moves as they see the per-branch pass's.
 // A workspace's delete removes its patches
 // and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
@@ -75,6 +78,7 @@ func composeCarryPatch(c *Composition) {
 			ConflictFiles:  carrypatch.GitConflictFiles{},
 			Scrubber:       rt.Scrubber,
 			Events:         c.Events(),
+			BranchMoves:    c.workspaces,
 			Jobs:           c.Jobs(),
 			Now:            rt.Now,
 			Logger:         rt.Logger,

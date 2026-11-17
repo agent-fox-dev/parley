@@ -1518,3 +1518,66 @@ func (a syncAnswer) branches(t *testing.T) map[string]string {
 	}
 	return results
 }
+
+// syncedEntry is one entry of a sync answer's patches_synced.
+type syncedEntry struct {
+	BranchName  string  `json:"branch_name"`
+	Action      string  `json:"action"`
+	State       string  `json:"state"`
+	LocalSHA    *string `json:"local_sha"`
+	OriginSHA   *string `json:"origin_sha"`
+	ReplacedSHA *string `json:"replaced_sha"`
+}
+
+// synced is the answer's patches_synced, in the answer's order.
+func (a syncAnswer) synced(t *testing.T) []syncedEntry {
+	t.Helper()
+	var body struct {
+		Synced *[]syncedEntry `json:"patches_synced"`
+	}
+	if err := json.Unmarshal(a.raw, &body); err != nil || body.Synced == nil {
+		t.Fatalf("the answer %s has no patches_synced list: %v", a.raw, err)
+	}
+	return *body.Synced
+}
+
+// syncedOf is the entry of the answer's patches_synced for branch.
+func (a syncAnswer) syncedOf(t *testing.T, branch string) syncedEntry {
+	t.Helper()
+	for _, e := range a.synced(t) {
+		if e.BranchName == branch {
+			return e
+		}
+	}
+	t.Fatalf("patches_synced of %s has no entry for %s", a.raw, branch)
+	return syncedEntry{}
+}
+
+// moveRecorder is a branch-move observer that records every move it is
+// told of and answers err.
+type moveRecorder struct {
+	err   error
+	mu    sync.Mutex
+	moves []workspace.BranchMove
+}
+
+func (o *moveRecorder) BranchMoved(_ context.Context, m workspace.BranchMove) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.moves = append(o.moves, m)
+	return o.err
+}
+
+// movesUnder are the moves told so far of the branches whose name starts
+// with prefix, in the order told.
+func (o *moveRecorder) movesUnder(prefix string) []workspace.BranchMove {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var moves []workspace.BranchMove
+	for _, m := range o.moves {
+		if strings.HasPrefix(m.Branch, prefix) {
+			moves = append(moves, m)
+		}
+	}
+	return moves
+}
