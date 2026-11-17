@@ -29,7 +29,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// The kinds of an attempt's outcome, as carrypatch.RunRebuildAttempt names
+// The kinds of an attempt's outcome, as carrypatch.RunRebuild names
 // them.
 const (
 	attemptCompleted = "completed"
@@ -134,6 +134,13 @@ func startRebuildFixture(t *testing.T, edit ...func(w *workspace.Workspace)) *re
 // it is stored.
 func startRebuildFixtureWith(t *testing.T, deps func(d *carrypatch.Deps), edit ...func(w *workspace.Workspace)) *rebuildFixture {
 	t.Helper()
+	return startRebuildFixtureOn(t, "", deps, edit...)
+}
+
+// startRebuildFixtureOn is startRebuildFixtureWith with the hub's
+// configuration given toml, after its [server] section.
+func startRebuildFixtureOn(t *testing.T, toml string, deps func(d *carrypatch.Deps), edit ...func(w *workspace.Workspace)) *rebuildFixture {
+	t.Helper()
 	up := gitrepotest.NewOrigin(t)
 	up.Commit("main", "U1")
 	origin := gitrepotest.SmartOrigin(t)
@@ -160,7 +167,8 @@ func startRebuildFixtureWith(t *testing.T, deps func(d *carrypatch.Deps), edit .
 	// The queue's timers never fire: the test does not advance its clock.
 	clock := hubtest.NewJobClock(f.clock)
 	f.Hub = hubtest.StartWith(t, hubtest.Config{
-		Now: f.clock,
+		Now:  f.clock,
+		TOML: toml,
 		Compose: func(c *hub.Composition) {
 			f.comp, f.queue = c.CarryPatch(), c.Jobs()
 			f.runner.comp = f.comp
@@ -305,15 +313,27 @@ func (f *rebuildFixture) attemptWith(t *testing.T, opts carrypatch.RebuildOption
 	if err != nil || !res.Queued {
 		t.Fatalf("queue a rebuild of %s = %+v, %v, want a queued job", f.slug, res, err)
 	}
-	run := f.runner.expect(res.JobID, before)
+	return f.rerun(t, res.JobID, before, nil), res.JobID
+}
+
+// rerun runs one attempt of the job id, queued or due for its next attempt,
+// through the job queue, calling before, when it is not nil, at the start
+// of the attempt and atSettle, when it is not nil, in the settlement's
+// transaction after the rebuild handler's settlement hook; it waits until
+// the attempt's outcome is settled, and returns the outcome.
+func (f *rebuildFixture) rerun(t *testing.T, id string, before func(ctx context.Context, j jobs.Job), atSettle func(j jobs.Job)) carrypatch.AttemptOutcome {
+	t.Helper()
+	ctx := context.Background()
+	run := f.runner.expect(id, before)
+	run.atSettle = atSettle
 	if err := f.queue.Pass(ctx); err != nil {
 		t.Fatalf("pass the job queue: %v", err)
 	}
 	// An attempt runs git against the test origins, which may take longer
 	// than a step of the queue under the load of the whole suite.
-	waitAttempt(t, run.ran, "the attempt of the job "+res.JobID+" to end")
+	waitAttempt(t, run.ran, "the attempt of the job "+id+" to end")
 	if run.out.Kind != attemptEnded {
-		waitAttempt(t, run.settled, "the outcome of the job "+res.JobID+" to be settled")
+		waitAttempt(t, run.settled, "the outcome of the job "+id+" to be settled")
 		// The store runs its write transactions one at a time, in order: an
 		// empty one asked for once the settlement hook ran ends after the
 		// settlement committed.
@@ -321,7 +341,7 @@ func (f *rebuildFixture) attemptWith(t *testing.T, opts carrypatch.RebuildOption
 			t.Fatal(err)
 		}
 	}
-	return run.out, res.JobID
+	return run.out
 }
 
 // waitAttempt waits up to a minute for ch to be closed, and fails the test
@@ -480,8 +500,9 @@ func (s *rebuildSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, n
 }
 
 // attemptRunner is the handler of the fixture's rebuild jobs: an attempt of
-// a job a test expects runs the hub's rebuild attempt and returns its
-// outcome to the queue; an attempt of any other job completes at once.
+// a job a test expects runs as the hub's rebuild handler runs it, which
+// also settles it, and the runner keeps its outcome; an attempt of any
+// other job completes at once, with no event.
 type attemptRunner struct {
 	comp *carrypatch.Component
 	mu   sync.Mutex
@@ -506,10 +527,14 @@ type attemptRun struct {
 	before func(ctx context.Context, j jobs.Job)
 	// out is the attempt's outcome once ran is closed.
 	out carrypatch.AttemptOutcome
-	// ran is closed once the attempt has its outcome, settled once that is
-	// being settled.
+	// ran is closed once the attempt has its outcome, or has panicked,
+	// settled once that is being settled.
 	ran, settled chan struct{}
 	settledOnce  sync.Once
+	// atSettle, when set, is called in the settlement's transaction once the
+	// rebuild handler's settlement hook has run, before the transaction
+	// commits.
+	atSettle func(j jobs.Job)
 }
 
 // expect makes the next attempt of the job id one the test expects, with
@@ -538,25 +563,27 @@ func (r *attemptRunner) Run(ctx context.Context, j jobs.Job) error {
 	r.mu.Lock()
 	r.cancel = cancel
 	r.mu.Unlock()
+	// A panic of the attempt reaches the queue, which settles it.
+	defer close(run.ran)
 	if run.before != nil {
 		run.before(ctx, j)
 	}
-	run.out = carrypatch.RunRebuildAttempt(ctx, r.comp, j)
-	close(run.ran)
-	switch run.out.Kind {
-	case attemptRetryable:
-		return errors.New(run.out.Text)
-	case attemptPermanent:
-		return jobs.Permanent(errors.New(run.out.Text))
-	}
-	return nil
+	var err error
+	run.out, err = carrypatch.RunRebuild(ctx, r.comp, j)
+	return err
 }
 
-func (r *attemptRunner) Settled(_ context.Context, _ *sql.Tx, j jobs.Job, _ bool) error {
-	if run := r.run(j.ID); run != nil {
-		run.settledOnce.Do(func() { close(run.settled) })
+func (r *attemptRunner) Settled(ctx context.Context, tx *sql.Tx, j jobs.Job, willRetry bool) error {
+	run := r.run(j.ID)
+	if run == nil {
+		return nil
 	}
-	return nil
+	defer run.settledOnce.Do(func() { close(run.settled) })
+	err := r.comp.RebuildHandler().Settled(ctx, tx, j, willRetry)
+	if run.atSettle != nil {
+		run.atSettle(j)
+	}
+	return err
 }
 
 func TestRebuild_FetchesUpstreamAndRecordsBase(t *testing.T) {

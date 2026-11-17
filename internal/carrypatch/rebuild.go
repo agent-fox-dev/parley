@@ -50,6 +50,9 @@ type attemptOutcome struct {
 	// conflict is the conflict report of the patch a fail_fast run stopped
 	// at, nil for any other outcome.
 	conflict json.RawMessage
+	// secrets are the values of the credentials the attempt read, which
+	// must not reach the job's error or an event.
+	secrets []string
 }
 
 // attemptFailed is the outcome of an attempt that failed with reason, retryable
@@ -78,6 +81,10 @@ type rebuildRun struct {
 	patches []runPatch
 	head    string
 	removed int
+
+	// secrets are the values of the workspace's upstream and origin
+	// credentials as the attempt read them.
+	secrets []string
 }
 
 // runRebuildAttempt runs one attempt of the rebuild job j, which the queue
@@ -86,18 +93,22 @@ type rebuildRun struct {
 // then empties the job's result, fetches upstream and stores the upstream
 // base it starts from. It lists the patches with the tips of their
 // branches, builds the new head from the base and those tips alone in a
-// scratch working tree, and publishes it as the integration branch.
+// scratch working tree, and publishes it as the integration branch. Last,
+// it stores the counts over what it did with the patches.
 func (c *Component) runRebuildAttempt(ctx context.Context, j jobs.Job) attemptOutcome {
 	r := &rebuildRun{c: c, job: j}
 	// A payload that does not decode leaves the options at their defaults,
 	// as the job's record shows them.
 	_ = json.Unmarshal(j.Payload, &r.payload)
-	for _, step := range []func(context.Context) *attemptOutcome{r.start, r.listPatches, r.build, r.publish} {
-		if out := step(ctx); out != nil {
-			return *out
+	out := attemptOutcome{kind: attemptCompleted}
+	for _, step := range []func(context.Context) *attemptOutcome{r.start, r.listPatches, r.build, r.publish, r.complete} {
+		if stop := step(ctx); stop != nil {
+			out = *stop
+			break
 		}
 	}
-	return attemptOutcome{kind: attemptCompleted}
+	out.secrets = r.secrets
+	return out
 }
 
 // start begins the attempt: it checks the workspace, empties the job's
@@ -111,6 +122,7 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 	if out := r.store(ctx); out != nil {
 		return out
 	}
+	r.readSecrets(ctx)
 	if err := r.c.EnsureSetup(ctx, r.ws); err != nil {
 		if errors.Is(err, ErrUpstreamFetch) {
 			return attemptFailed(attemptRetryable, reasonUpstreamFetchFailed, err)
@@ -128,6 +140,43 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 		return r.failed(ctx, err)
 	}
 	r.base, r.result.UpstreamHeadSHA = base, &base
+	return r.store(ctx)
+}
+
+// readSecrets keeps the values of the workspace's upstream and origin
+// credentials, which the attempt presents to git, so that the text of its
+// failure is cleaned of them whatever git wrote. A credential that cannot
+// be read is not kept: the attempt cannot present it either.
+func (r *rebuildRun) readSecrets(ctx context.Context) {
+	if r.c.d.Secrets == nil {
+		return
+	}
+	upstream, err := ResolveUpstreamCredential(ctx, r.c.d.Secrets, r.ws.Slug)
+	if err == nil && upstream.Password != "" {
+		r.secrets = append(r.secrets, upstream.Password)
+	}
+	origin, err := workspace.ResolveOriginCredential(ctx, r.c.d.Secrets, r.ws.Slug)
+	if err == nil && origin.Password != "" {
+		r.secrets = append(r.secrets, origin.Password)
+	}
+}
+
+// complete stores, on the job's result, the counts over the patch results
+// and the number of patches the publish removed, before the attempt
+// returns its completed outcome to the queue.
+func (r *rebuildRun) complete(ctx context.Context) *attemptOutcome {
+	r.result.PatchesApplied, r.result.PatchesSkipped, r.result.PatchesConflicted = 0, 0, 0
+	for _, res := range r.results {
+		switch res.Status {
+		case resultSuccess:
+			r.result.PatchesApplied++
+		case resultSkipped:
+			r.result.PatchesSkipped++
+		case resultConflict:
+			r.result.PatchesConflicted++
+		}
+	}
+	r.result.PatchesRemoved = r.removed
 	return r.store(ctx)
 }
 

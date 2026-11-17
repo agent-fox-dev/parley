@@ -1,12 +1,14 @@
 package carrypatch
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/jobs"
+	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -24,6 +26,10 @@ type Deps struct {
 	Git gitrepo.Git
 	// RepoPath is the git directory of the copy of the workspace slug.
 	RepoPath func(slug string) string
+	// FetchRemote, when set, replaces the git fetch of FetchUpstream,
+	// gitrepo.Git.FetchRemote, and is called as RunGit calls that; only
+	// tests set it, to make the fetch fail with the text they give.
+	FetchRemote func(ctx context.Context, dir, url, name string, cred gitrepo.Credential, deadline time.Duration) (map[string]string, error)
 	// UpstreamFetchDeadline, when positive and shorter, replaces
 	// DefaultGitDeadline as the one deadline of a whole upstream fetch;
 	// only tests set it.
@@ -77,6 +83,11 @@ type Deps struct {
 	// DefaultGitDeadline as the deadline of each git operation of a rebuild
 	// attempt; only tests set it.
 	RebuildGitDeadline time.Duration
+	// Scrubber removes credentials from the text of a rebuild's failure and
+	// of its events before they are stored; nil is a scrubber that knows no
+	// secret value of the hub's, which still removes the values given to
+	// each call and the user information of URLs.
+	Scrubber *scrub.Scrubber
 	// Events writes the events of the patch list in the transaction of the
 	// change they report.
 	Events Emitter
@@ -101,9 +112,12 @@ const (
 type Component struct {
 	d Deps
 
-	// mu guards rebuilds, the registered rebuild enqueuer.
+	// mu guards rebuilds, the registered rebuild enqueuer, and outcomes,
+	// the outcome of the last attempt of each rebuild job whose settlement
+	// has not yet reported it, by job id.
 	mu       sync.Mutex
 	rebuilds RebuildEnqueuer
+	outcomes map[string]attemptOutcome
 }
 
 // Bind gives the component its Deps, before its first use.

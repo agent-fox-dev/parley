@@ -894,7 +894,7 @@ type rebuildEvent struct {
 }
 
 // rebuildEvents are the stored events of slug of type typ, oldest first.
-func (h *rebuildHub) rebuildEvents(t *testing.T, slug, typ string) []rebuildEvent {
+func (h *readHub) rebuildEvents(t *testing.T, slug, typ string) []rebuildEvent {
 	t.Helper()
 	rows, err := h.Store.Main().Query(`SELECT resource_type, resource_id, actor_type, actor_id, session_id, metadata
 FROM hub_events WHERE workspace = ? AND type = ? ORDER BY seq`, slug, typ)

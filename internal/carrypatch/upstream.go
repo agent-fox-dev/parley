@@ -79,8 +79,12 @@ func (c *Component) FetchUpstream(ctx context.Context, w workspace.Workspace) er
 	if err != nil {
 		return fmt.Errorf("ask the upstream of %s for its branches: %w", w.Slug, err)
 	}
+	fetch := c.d.Git.FetchRemote
+	if c.d.FetchRemote != nil {
+		fetch = c.d.FetchRemote
+	}
 	err = run(cred, func(ctx context.Context, deadline time.Duration) error {
-		_, err := c.d.Git.FetchRemote(ctx, repo.Dir(), url, UpstreamRemote, cred, deadline)
+		_, err := fetch(ctx, repo.Dir(), url, UpstreamRemote, cred, deadline)
 		return err
 	})
 	if err != nil {

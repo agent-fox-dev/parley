@@ -298,9 +298,7 @@ func TestRebuild_CommitterComesFromConfiguration(t *testing.T) {
 	)
 	for _, strategy := range []string{"rebase", "merge"} {
 		t.Run(strategy, func(t *testing.T) {
-			f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
-				d.CommitterName, d.CommitterEmail = "Hub Bot", "bot@hub.example"
-			})
+			f := startRebuildFixtureOn(t, "[land]\ncommitter_name = \"Hub Bot\"\ncommitter_email = \"bot@hub.example\"\n", nil)
 			gitrepotest.Git(t, f.copy, "config", "user.name", "Mallory")
 			gitrepotest.Git(t, f.copy, "config", "user.email", "mallory@example.com")
 			a1 := commitAs(t, f.copy, "a1", author+" 1600000000 +0200", map[string]string{"a1.txt": "a1\n"}, f.base)

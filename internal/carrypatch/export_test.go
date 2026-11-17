@@ -33,11 +33,12 @@ var attemptKindNames = map[attemptKind]string{
 	attemptEnded:     "ended",
 }
 
-// RunRebuildAttempt runs one attempt of the running rebuild job j with the
-// component c and returns its outcome.
-func RunRebuildAttempt(ctx context.Context, c *Component, j jobs.Job) AttemptOutcome {
-	out := c.runRebuildAttempt(ctx, j)
-	return AttemptOutcome{Kind: attemptKindNames[out.kind], Reason: out.reason, Text: out.text, Conflict: out.conflict}
+// RunRebuild runs one attempt of the running rebuild job j as the hub's
+// rebuild handler runs it, and returns its outcome and the error the handler
+// returns to the job queue.
+func RunRebuild(ctx context.Context, c *Component, j jobs.Job) (AttemptOutcome, error) {
+	out, err := rebuildHandler{c}.run(ctx, j)
+	return AttemptOutcome{Kind: attemptKindNames[out.kind], Reason: out.reason, Text: out.text, Conflict: out.conflict}, err
 }
 
 // PatchResult is what a rebuild did with one patch, as the job's
