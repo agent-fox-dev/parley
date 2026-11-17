@@ -314,7 +314,10 @@ func TestLand_RunsTheLandsOfDifferentChangesOnOneTargetSideBySide(t *testing.T) 
 	for _, ch := range changes {
 		wg.Go(func() {
 			<-start
-			status, a := w.landCall(t, w.ownerKey, ch.Number, "", nil)
+			// The six lands take the one target in turn: the last of them
+			// waits for the five before it, which under the load of the
+			// whole suite outlasts the wait a request has by default.
+			status, a := w.landCall(t, w.ownerKey, ch.Number, "wait=60", nil)
 			if status != 200 || a["status"] != land.StatusLanded {
 				t.Errorf("land of %s = %d %v, want 200 landed", ch.Ref, status, a)
 			}

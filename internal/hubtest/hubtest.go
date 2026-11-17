@@ -63,8 +63,16 @@ type Served struct {
 	client *http.Client
 }
 
+// startWait is how long a hub is given to reach its listening line, and
+// how long a stopped one is given to return. A hub that starts takes
+// milliseconds; the wait is long because the whole suite's test binaries
+// run side by side, and a machine they saturate can leave a goroutine
+// waiting seconds for its turn. A hub that never listens fails the test
+// then, and one that gives up on the way fails it at once.
+const startWait = 30 * time.Second
+
 // Serve runs hub.Run with opts, its stderr captured in Log, and waits up to
-// 5 s for its listening line. The hub is stopped when the test ends.
+// startWait for its listening line. The hub is stopped when the test ends.
 func Serve(t testing.TB, opts hub.Options) *Served {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -76,11 +84,11 @@ func Serve(t testing.TB, opts hub.Options) *Served {
 		cancel()
 		select {
 		case <-s.code:
-		case <-time.After(5 * time.Second):
+		case <-time.After(startWait):
 		}
 		s.client.CloseIdleConnections()
 	})
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(startWait)
 	for {
 		for line := range strings.SplitSeq(s.Log.String(), "\n") {
 			var rec map[string]any
@@ -95,7 +103,7 @@ func Serve(t testing.TB, opts hub.Options) *Served {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no listening line within 5 s; stderr = %q", s.Log.String())
+			t.Fatalf("no listening line within %v; stderr = %q", startWait, s.Log.String())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

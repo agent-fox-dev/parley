@@ -313,10 +313,14 @@ func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		limit  time.Duration
-		cancel time.Duration // after which the caller cancels; 0 for never
+		cancel bool // whether the caller gives up while the push is under way
 	}{
-		{"the limit passes", 200 * time.Millisecond, 0},
-		{"the caller cancels", 0, 100 * time.Millisecond},
+		// The limit is far longer than a push needs to start and far
+		// shorter than the 5s the forward must return well within: a limit
+		// of a few hundred milliseconds passes, on a loaded machine,
+		// before git has even started.
+		{"the limit passes", 2 * time.Second, false},
+		{"the caller cancels", 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := f.component(tc.limit)
@@ -324,10 +328,15 @@ func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
 				t.Fatalf("the forward limit is %v, want the default %v", c.ForwardLimit(), carrypatch.DefaultForwardLimit)
 			}
 			ctx := context.Background()
-			if tc.cancel > 0 {
+			if tc.cancel {
 				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, tc.cancel)
+				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
+				// The caller gives up once the push has reached origin,
+				// which holds it. A fixed wait would, on a loaded machine,
+				// end the forward before its git ever started, leaving
+				// nothing for the cancellation to end.
+				go cancelOnRequest(ctx, f.origin, f.origin.Requests(), cancel)
 			}
 			gits.reset(t)
 			start := time.Now()
@@ -348,8 +357,12 @@ func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
 					t.Errorf("processes %v started by the forward's git push (pid %d) still run 2s after the forward returned", left, pid)
 				}
 			}
-			if took := time.Since(start); took >= 5*time.Second {
-				t.Errorf("the forward returned after %v, want well within 5s", took)
+			// The limit or the cancellation ended the push, and not the
+			// default limit of two minutes: how long the push took to
+			// reach origin before that is the machine's business, so the
+			// bound is far from both.
+			if took := time.Since(start); took >= 30*time.Second {
+				t.Errorf("the forward returned after %v, want well before the default limit %v", took, carrypatch.DefaultForwardLimit)
 			}
 			if err == nil || err.Error() != "origin rejected push: timed out" {
 				t.Errorf("the forward returned %v, want origin rejected push: timed out", err)
@@ -364,6 +377,24 @@ func TestForward_EndsThePushWhenItsLimitPassesOrItsCallerCancels(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if got := f.origin.Head("patch/a"); got != f.base {
 		t.Errorf("origin's patch/a = %.7s after the held requests were let through, want %.7s", got, f.base)
+	}
+}
+
+// cancelOnRequest cancels once the origin has received a request beyond
+// before, and gives up when ctx ends; it cancels anyway after a wait no
+// push can need, so that a push that never reaches origin fails the test
+// instead of holding it until the forward's own limit.
+func cancelOnRequest(ctx context.Context, origin *gitrepotest.Origin, before int, cancel context.CancelFunc) {
+	defer cancel()
+	for deadline := time.Now().Add(30 * time.Second); origin.Requests() <= before; {
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 

@@ -252,8 +252,8 @@ func TestFetchUpstream_StopsAtDeadline(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	// The deadline leaves git time to start and reach the upstream also on
-	// a loaded machine, where 200 ms did not.
-	const deadline = time.Second
+	// a loaded machine, where 200 ms and then a second did not.
+	const deadline = 3 * time.Second
 	f := newUpstreamFixture(t, url, env, secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, deadline)
 	rootsAt(t, f.copy, map[string]string{"refs/remotes/upstream/main": "base"})
 	before := gitrepotest.Refs(t, f.copy, "")

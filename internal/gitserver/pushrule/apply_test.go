@@ -371,7 +371,11 @@ func TestApply_RefusesTheWholeRequestWhenAForwardFailsOrOutlastsItsLimit(t *test
 			var log []string
 			st, ev := newStore(t), &emitted{}
 			var w pushrule.Writer
-			w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: ev, ForwardLimit: 50 * time.Millisecond})
+			// The limit is long enough that the forwards which are meant to
+			// run reach their call: under the load of the whole suite, a
+			// few dozen milliseconds can pass before a goroutine runs at
+			// all, and the first forward would end as timed out.
+			w.Bind(pushrule.WriterDeps{Transact: st.Tx, Events: ev, ForwardLimit: 2 * time.Second})
 			w.RegisterRefUpdatedStage((&stage{name: "s", log: &log, dir: r.dir}).run)
 			v := allowed(move("refs/heads/patch/a", r.head, r.side), create("refs/heads/patch/b", r.side), create("refs/heads/patch/c", r.side))
 			v.Decisions[0].Forward = f.of("refs/heads/patch/a", nil, false)

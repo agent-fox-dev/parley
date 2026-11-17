@@ -28,8 +28,10 @@ import (
 )
 
 // limitStage is an options stage that refuses a push with the push option
-// refuse and holds one with the option wait until its context ends, or
-// five seconds have passed on a context that never ends.
+// refuse and holds one with the option wait until its context ends, or a
+// minute has passed on a context that never ends: the wait outlasts the
+// timeout of every hub that registers it, so that the push ends by the
+// timeout and not by the stage.
 type limitStage struct{}
 
 func (limitStage) CheckOptions(ctx context.Context, in gitserver.OptionsInput) (gitserver.OptionsAnswer, error) {
@@ -38,7 +40,7 @@ func (limitStage) CheckOptions(ctx context.Context, in gitserver.OptionsInput) (
 		select {
 		case <-ctx.Done():
 			return gitserver.OptionsAnswer{}, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(time.Minute):
 		}
 	case slices.Contains(in.Options, "refuse"):
 		return gitserver.OptionsAnswer{Refusal: "refused by the options stage"}, nil
@@ -230,11 +232,13 @@ func (w *world) stalled(t *testing.T, body string, sent int) string {
 
 // Every push is counted once, by the git server, with the result the
 // processor returned. The hub's limit is 1KB, which only the big pack
-// exceeds, and its timeout 2s.
+// exceeds, and its timeout 10s: every push here but the held one is meant
+// to reach its end, and under the load of the whole suite a push that runs
+// git takes seconds.
 func TestReceive_CountsEveryPushOnceByHowItEnded(t *testing.T) {
 	t.Parallel()
 	w := newGitWorld(t, hubtest.Config{TOML: "[git]\nmax_push_size = \"1KB\"\n", Compose: func(c *hub.Composition) {
-		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = 2 * time.Second })
+		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = 10 * time.Second })
 		c.Receiver().RegisterOptionsStage(limitStage{})
 	}})
 	caps := append(slices.Clone(fullCaps), "push-options")

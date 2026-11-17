@@ -194,7 +194,10 @@ func startFetchProbeHub(t *testing.T, limit time.Duration, adjust func(d *carryp
 
 func TestRequest_FailsAsInternalWhenAGitOperationOutlastsTheLimit(t *testing.T) {
 	t.Parallel()
-	const limit = 300 * time.Millisecond
+	// The limit is longer than a git needs to start and reach the remote
+	// over TLS, which under the load of the whole suite is not a matter of
+	// milliseconds, and short enough to keep the test short.
+	const limit = 2 * time.Second
 	up := startHangingRemote(t)
 	h := startFetchProbeHub(t, limit, func(d *carrypatch.Deps) { d.Git.Env = up.trustedBy(t, d.Git.Env) })
 	h.add(t, "demo", workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
@@ -222,8 +225,8 @@ func TestRequest_FailsAsInternalWhenAGitOperationOutlastsTheLimit(t *testing.T) 
 		if status != http.StatusInternalServerError || a.Error.ErrorType != "internal" || !strings.Contains(a.Error.Message, "time limit") {
 			t.Errorf("the answer = %d %s, want 500 internal saying the time limit passed", status, body)
 		}
-		if took < limit || took > 3*time.Second {
-			t.Errorf("the answer came after %v, want between %v and 3s", took, limit)
+		if took < limit || took > limit+3*time.Second {
+			t.Errorf("the answer came after %v, want between %v and %v", took, limit, limit+3*time.Second)
 		}
 		if got := gitrepotest.Refs(t, cp, ""); !maps.Equal(got, refs) {
 			t.Errorf("the copy's refs = %v, want %v unchanged", got, refs)
@@ -237,7 +240,9 @@ func TestRequest_FailsAsInternalWhenAGitOperationOutlastsTheLimit(t *testing.T) 
 
 func TestRebuild_EndsAnAttemptWhoseGitOperationOutlastsTheLimitAsRetryable(t *testing.T) {
 	t.Parallel()
-	const limit = 300 * time.Millisecond
+	// Long enough for git to reach the remote under the load of the whole
+	// suite, as in the fetch probe's test.
+	const limit = 2 * time.Second
 	up := startHangingRemote(t)
 	f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
 		d.RebuildGitDeadline = limit

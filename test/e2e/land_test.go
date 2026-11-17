@@ -179,7 +179,11 @@ func TestLand_EightChangesLandOnOneTargetAtTheSameMoment(t *testing.T) {
 	for i, n := range numbers {
 		wg.Go(func() {
 			<-start
-			statuses[i], attempts[i] = h.land(t, h.key, n, "")
+			// The eight lands take the one target in turn, each rebasing
+			// and pushing: they are given the longest wait the API
+			// allows, because under the load of the whole suite the last
+			// of them waits for the seven before it.
+			statuses[i], attempts[i] = h.land(t, h.key, n, "?wait=60")
 		})
 	}
 	close(start)
