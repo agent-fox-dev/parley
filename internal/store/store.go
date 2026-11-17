@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	_ "modernc.org/sqlite" // registers the driver "sqlite"
 )
@@ -250,13 +251,44 @@ func (s *Store) Ping(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Close closes both stores. A second call does nothing and returns nil;
-// every other method returns ErrClosed afterwards.
+// closeWait bounds how long Close waits for the connections in use to be
+// given back before it closes the stores under them.
+const closeWait = 5 * time.Second
+
+// Close closes both stores. It waits, up to closeWait, until no connection
+// is in use, and closes one of its own last, so that it returns with every
+// connection closed and the write-ahead logs and their indexes removed. A
+// second call does nothing and returns nil; every other method returns
+// ErrClosed afterwards.
 func (s *Store) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	return errors.Join(s.main.Close(), s.analytics.Close())
+	ctx, cancel := context.WithTimeout(context.Background(), closeWait)
+	defer cancel()
+	return errors.Join(closeDB(ctx, s.main), closeDB(ctx, s.analytics))
+}
+
+// closeDB closes db once no connection but one of its own is in use, or ctx
+// has ended, and closes its own connection last.
+//
+// database/sql closes a connection that is in use only when it is given
+// back, and a transaction whose context ended is given back by
+// database/sql's own goroutine once it has rolled it back, which can be
+// after its caller has returned: that connection would still write to the
+// data directory after Close. And the engine removes the log only when the
+// connection that closes is the last one open: two that close at the same
+// time, as the pool closes them when they are given back, leave it behind,
+// with an index the next reader writes to.
+func closeDB(ctx context.Context, db *sql.DB) error {
+	last, err := db.Conn(ctx)
+	if err != nil {
+		return db.Close()
+	}
+	for db.Stats().InUse > 1 && ctx.Err() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	return errors.Join(db.Close(), last.Close())
 }
 
 // Main returns the transactional store's handle, for reading. Write through
