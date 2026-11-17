@@ -3,7 +3,7 @@
   "spec_id": "36",
   "spec_name": "carry_patch_sync",
   "schema_version": 3,
-  "updated_at": "2026-11-17T08:33:51Z",
+  "updated_at": "2026-11-17T08:42:34Z",
   "tasks": [
     {
       "id": 1,
@@ -35,7 +35,7 @@
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,

@@ -2,9 +2,11 @@ package carrypatch_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -562,4 +564,167 @@ func TestSync_EnqueueFailure(t *testing.T) {
 		t.Errorf("the next sync's upstream_advanced = %v, want true", r2.body["upstream_advanced"])
 	}
 	f.wantRebuildQueued(t, r2)
+}
+
+// syncMembers are the eight members a sync of a carry-patch workspace adds
+// to the answer of the general sync.
+var syncMembers = []string{"upstream_advanced", "force_push_detected", "origin_fetched", "patches_merged",
+	"patches_synced", "patches_diverged", "rebuild_triggered", "rebuild_job_id"}
+
+// A completed sync answers the workspace object and branches of the
+// general sync with the eight carry-patch members, every list a list also
+// when it names nothing and rebuild_job_id null when no rebuild was queued.
+func TestSync_AnswerShape(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.mustSync(t)
+	r := f.mustSync(t)
+	if r.body["slug"] != f.slug {
+		t.Errorf("slug = %v, want %s", r.body["slug"], f.slug)
+	}
+	if _, ok := r.body["branches"].([]any); !ok {
+		t.Errorf("branches = %v, want a list", r.body["branches"])
+	}
+	for member, want := range map[string]any{"upstream_advanced": false, "force_push_detected": false,
+		"origin_fetched": true, "rebuild_triggered": false} {
+		if got := r.body[member]; got != want {
+			t.Errorf("%s = %v, want %v", member, got, want)
+		}
+	}
+	raw := r.members(t)
+	for member, want := range map[string]string{"patches_merged": "[]", "patches_synced": "[]",
+		"patches_diverged": "[]", "rebuild_job_id": "null"} {
+		if got, ok := raw[member]; !ok || string(got) != want {
+			t.Errorf("%s = %s (present %v), want %s", member, got, ok, want)
+		}
+	}
+}
+
+// Each patches_synced entry has exactly its six members: the hub's tip
+// after the refresh and origin's tip, each null when that side has no such
+// branch, and the saved tip only for a replace, every id in full.
+func TestSync_PatchesSyncedEntries(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("report"))
+	a := f.addPatch(t, "patch/a")
+	f.originBranch(t, a.BranchName, f.commitOn(t, refIn(f.copy, "refs/heads/patch/a"), "A2", map[string]string{"a.txt": "2\n"}))
+	b := f.addPatch(t, "patch/b")
+	f.originBranch(t, b.BranchName, f.commitOn(t, f.base, "B on origin", map[string]string{"b.txt": "origin\n"}))
+	f.addPatch(t, "patch/c")
+	f.put(t, livePatch(f.slug, "patch/d", 4))
+
+	r := f.mustSync(t)
+	var raw struct {
+		Synced []map[string]json.RawMessage `json:"patches_synced"`
+	}
+	if err := json.Unmarshal(r.raw, &raw); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"action", "branch_name", "local_sha", "origin_sha", "replaced_sha", "state"}
+	for _, e := range raw.Synced {
+		if got := slices.Sorted(maps.Keys(e)); !slices.Equal(got, keys) {
+			t.Errorf("entry %s has the members %v, want exactly %v", e["branch_name"], got, keys)
+		}
+	}
+	ea, eb, ec, ed := r.syncedOf(t, "patch/a"), r.syncedOf(t, "patch/b"), r.syncedOf(t, "patch/c"), r.syncedOf(t, "patch/d")
+	if origin := f.origin.Head("patch/a"); str(ea.LocalSHA) != origin || str(ea.OriginSHA) != origin || len(origin) != 40 || ea.ReplacedSHA != nil {
+		t.Errorf("patch/a = %+v, want local_sha and origin_sha origin's %s and replaced_sha null", ea, origin)
+	}
+	if str(eb.LocalSHA) != refIn(f.copy, "refs/heads/patch/b") || str(eb.OriginSHA) != f.origin.Head("patch/b") || str(eb.LocalSHA) == str(eb.OriginSHA) {
+		t.Errorf("patch/b = local %s, origin %s; want the hub's and origin's two tips", str(eb.LocalSHA), str(eb.OriginSHA))
+	}
+	if str(ec.LocalSHA) != refIn(f.copy, "refs/heads/patch/c") || ec.OriginSHA != nil {
+		t.Errorf("patch/c = local %s, origin %s; want the hub's tip and null", str(ec.LocalSHA), str(ec.OriginSHA))
+	}
+	if ed.Action != "none" || ed.State != "missing_on_origin" || ed.LocalSHA != nil || ed.OriginSHA != nil {
+		t.Errorf("patch/d = %+v, want none/missing_on_origin with both tips null", ed)
+	}
+}
+
+// The branches of the patches the refresh leaves diverged are listed in
+// patches_diverged, in position order, and the sync still completes.
+func TestSync_PatchesDiverged(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("report"))
+	for _, branch := range []string{"patch/a", "patch/b", "patch/c"} {
+		f.addPatch(t, branch)
+		f.originBranch(t, branch, refIn(f.copy, "refs/heads/"+branch))
+	}
+	f.mustSync(t)
+	for _, branch := range []string{"patch/b", "patch/c"} {
+		f.originBranch(t, branch, f.commitOn(t, f.base, branch+" on origin", map[string]string{"origin.txt": branch + "\n"}))
+	}
+	f.dropRebuilds(t)
+
+	r := f.mustSync(t)
+	if got := r.diverged(t); !slices.Equal(got, []string{"patch/b", "patch/c"}) {
+		t.Errorf("patches_diverged = %q, want [patch/b patch/c]", got)
+	}
+	wantNoRebuild(t, r)
+
+	f.setSettings(t, originAuthority("replace"))
+	if got := f.mustSync(t).diverged(t); len(got) != 0 {
+		t.Errorf("patches_diverged under replace = %q, want []", got)
+	}
+}
+
+// A sync of a standard workspace answers as the general sync does, with
+// none of the carry-patch members, and contacts no upstream.
+func TestSync_StandardWorkspaceUnchanged(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setColumn(t, "workspace_mode", workspace.ModeStandard)
+	r := f.mustSync(t)
+	for _, member := range syncMembers {
+		if _, ok := r.body[member]; ok {
+			t.Errorf("the answer has %s, want none of the carry-patch members", member)
+		}
+	}
+	if n := f.fetches.count(); n != 0 {
+		t.Errorf("upstream fetches = %d, want none", n)
+	}
+	if js := f.rebuildJobs(t); len(js) != 0 {
+		t.Errorf("rebuild jobs = %v, want none", js)
+	}
+}
+
+// A caller that leaves while the sync runs leaves the carry-patch part to
+// run to its end, as for a caller that waited.
+func TestSync_CompletesAfterDisconnect(t *testing.T) {
+	t.Parallel()
+	f := startSyncFixture(t)
+	f.setSettings(t, originAuthority("replace"))
+	a := f.addPatch(t, "patch/a")
+	theirs := f.commitOn(t, refIn(f.copy, "refs/heads/patch/a"), "A2", map[string]string{"a.txt": "2\n"})
+	f.originBranch(t, a.BranchName, theirs)
+	f.moveUpstream(t, "U2", map[string]string{"u2.txt": "2\n"})
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	f.fetches.before(func() {
+		once.Do(func() { close(started) })
+		<-release
+	})
+
+	f.syncAndLeave(t, started)
+	close(release)
+	f.waitSynced(t)
+
+	if got := refIn(f.copy, "refs/heads/patch/a"); got != theirs {
+		t.Errorf("patch/a = %s, want origin's %s", got, theirs)
+	}
+	if got := str(f.stored(t, a.ID).OriginSyncState); got != "in_sync" {
+		t.Errorf("origin_sync_state of patch/a = %s, want in_sync", got)
+	}
+	w := f.record(t)
+	if str(w.UpstreamHeadSHA) != f.upstream.Head("main") || w.LastSyncAt == nil {
+		t.Errorf("upstream_head_sha, last_sync_at = %s, %v, want upstream's main %s and a time", str(w.UpstreamHeadSHA), w.LastSyncAt, f.upstream.Head("main"))
+	}
+	if n := f.eventCount(t, carrypatch.EventPatchSync); n != 1 {
+		t.Errorf("%d parley.patch.sync events, want 1", n)
+	}
+	if js := f.rebuildJobs(t); len(js) != 1 || js[0].Status != "queued" {
+		t.Errorf("rebuild jobs = %v, want one queued", js)
+	}
 }

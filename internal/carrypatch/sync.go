@@ -284,10 +284,17 @@ func (s *syncPass) queueRebuild(ctx context.Context) error {
 }
 
 // addition is what the pass adds to the completed sync: its report as the
-// answer's members, and the upstream base as the upstream_head_sha to
-// record when upstream advanced, so that a sync that saw no movement
-// leaves the stored head as it was.
+// answer's members, with patches_diverged naming the branches the refresh
+// left diverged, in the position order of patches_synced, so that a caller
+// can fail on them without reading every entry; and the upstream base as
+// the upstream_head_sha to record when upstream advanced, so that a sync
+// that saw no movement leaves the stored head as it was.
 func (s *syncPass) addition() (workspace.SyncAddition, error) {
+	for _, e := range s.report.PatchesSynced {
+		if e.State == originDiverged {
+			s.report.PatchesDiverged = append(s.report.PatchesDiverged, e.BranchName)
+		}
+	}
 	body, err := json.Marshal(s.report)
 	if err != nil {
 		return workspace.SyncAddition{}, err

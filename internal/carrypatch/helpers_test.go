@@ -1751,3 +1751,65 @@ func (m *refMover) swaps(branch string) (int, error) {
 	defer m.mu.Unlock()
 	return m.calls[branch], m.err
 }
+
+// members are the answer's top-level members as the hub wrote them.
+func (a syncAnswer) members(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(a.raw, &members); err != nil {
+		t.Fatalf("the answer %s is not an object: %v", a.raw, err)
+	}
+	return members
+}
+
+// diverged is the answer's patches_diverged, in the answer's order.
+func (a syncAnswer) diverged(t *testing.T) []string {
+	t.Helper()
+	var body struct {
+		Diverged *[]string `json:"patches_diverged"`
+	}
+	if err := json.Unmarshal(a.raw, &body); err != nil || body.Diverged == nil {
+		t.Fatalf("the answer %s has no patches_diverged list: %v", a.raw, err)
+	}
+	return *body.Diverged
+}
+
+// syncAndLeave sends POST /api/v1/workspaces/<slug>/sync as the owner and
+// leaves, cancelling the request, once started is closed.
+func (f *syncFixture) syncAndLeave(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL("/api/v1/workspaces/"+f.slug+"/sync"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.key)
+	sent := make(chan error, 1)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err == nil {
+			res.Body.Close()
+		}
+		sent <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sync did not reach the point to leave at within 10 s")
+	}
+	cancel()
+	if err := <-sent; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the request ended with %v, want it cancelled by the caller", err)
+	}
+}
+
+// waitSynced waits until the workspace records a completed sync.
+func (f *syncFixture) waitSynced(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); f.record(t).LastSyncAt == nil; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the sync recorded no completion within 20 s")
+		}
+	}
+}
