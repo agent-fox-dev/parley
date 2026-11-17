@@ -2165,7 +2165,7 @@ the names the registered `ExcludedBranchProvider` returns
 for any other mode it is empty and the provider is not asked. The provider
 is registered with `(*Service).RegisterExcludedBranchProvider`, one at a
 time, guarded by its own mutex, nil removing it; this package registers
-none, the patch feature does when the hub is composed. A skipped branch is
+none, `composeCarryPatch` registers the `*carrypatch.Component`. A skipped branch is
 not classified, moved, listed in `Branches` or the event, or told to the
 observers; its origin head is still set by the fetch, and `head_sha` and
 `origin_head_sha` are read as usual, also when the default branch is the
@@ -2188,7 +2188,8 @@ carry-patch part of sync: `SyncExtension` with `AfterFetch(ctx, SyncRun)
 error` and `BeforeCompletion(ctx, SyncRun, []BranchResult) (SyncAddition,
 error)`, registered with `(*Service).RegisterSyncExtension`, one at a time,
 guarded by its own mutex, nil removing it; this package imports no
-carry-patch package and registers none. `SyncRun` holds the record as read
+carry-patch package, and the hub registers the `*carrypatch.Component`
+(see [Carry-patch workspaces](#carry-patch-workspaces)). `SyncRun` holds the record as read
 before the fetch, the caller (`Actor`), `ResetToOrigin` and `OriginHeads`,
 a copy of origin's branch heads as fetched. `Sync` takes the extension once,
 after the fetch, and only for a record whose `Mode` is `ModeCarryPatch`;
@@ -5169,6 +5170,11 @@ cannot be imported by (ADR 01, ADR 07):
   (`IsPatchBranch`: a patch of the branch exists that is not deleted);
 - `carrypatch.RemoveWorkspace` as a remover of owned data, so a delete
   removes a workspace's patches in its transaction.
+- the component itself as the sync's `SyncExtension` and its
+  `ExcludedBranchProvider` (`RegisterSyncExtension`,
+  `RegisterExcludedBranchProvider`); the start hook sets
+  `Deps.BranchMoves` to the workspace service, so the sync's patch-branch
+  moves reach its branch-move observers.
 
 Its start hook `carry_patch` binds `carrypatch.Deps`: the store, the secret
 component (`Secrets`, a `workspace.SecretReader`), the hub's git
@@ -5317,6 +5323,37 @@ from the record again then, is on; `SubmittedBy` is the caller's user id
 (the admin token's actor type for the admin token). A result that is not
 `Queued` and an error (logged) leave the reset in place and report no
 job.
+
+**The sync.** The component is package 12's sync extension and its
+excluded-branch provider. `ExcludedBranches` (`excluded.go`) names the
+branch of every patch of `ListLivePatches`, the store's error unchanged.
+`AfterFetch` (`sync.go`) runs `EnsureSetup`, whose upstream fetch failure
+(the step matching `ErrUpstreamFetch`) it returns alone, logging other
+failed steps, then resolves the base with `UpstreamBase`; no base is an
+error. `BeforeCompletion` cannot take state from the first stage, so
+`startSyncPass` resolves the base again and computes `upstream_advanced`
+and `force_push_detected` (`Repo.Missing` before `IsAncestor`, since a
+stored head the copy lacks counts as forced), then runs, each on success
+of the one before: `refreshFromOrigin` (`sync_refresh.go`), `detectMerges`
+(`merge_detect.go`), `clearOriginFields`, `triggerRebuild`, and
+`addition`, which marshals the eight members into `SyncAddition.Members`
+and sets `UpstreamHeadSHA` only when upstream advanced. The refresh reads
+origin's head from `SyncRun.OriginHeads` (this sync's fetch), calls
+`Deps.BeforeRefSwap` before a moving outcome, and records each outcome in
+one `Store.Tx`: the patch read again, the origin fields, the events,
+`WriteBackupRef` for a replace, and the compare-and-swap last, so a lost
+swap rolls back the fields and events and keeps the backup; a commit that
+fails after the swap puts the branch back. A move is told to
+`Deps.BranchMoves` after the commit. A refresh error stops the walk with
+no retry; `rebuildAfterFailedRefresh` queues a rebuild when an `active` or
+`conflict` patch's branch had moved. Detection uses
+`gitrepo.(*Repo).Cherry` and `Subjects` (`internal/gitrepo/cherry.go`,
+full 40-hex ids only, so no revision is read as an option), through
+`RunGit` like every git call of the package, and marks a merged patch in
+one transaction with its `parley.patch.update`. `queueRebuild` goes
+through `Rebuilds().EnqueueRebuild` with nil strategy and fail mode, so
+the settings apply; a result that is not queued (a duplicate) reports no
+job, and another error fails the second stage.
 
 ### Durable jobs
 

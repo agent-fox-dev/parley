@@ -1791,6 +1791,82 @@ before stay moved. When the second succeeds it may set `upstream_head_sha`,
 written in the completion's transaction, and add members to the answer.
 Without an extension a `carry_patch` workspace syncs as described here.
 
+The hub registers the carry-patch part of sync as both the provider and the
+extension, so on a `carry_patch` workspace:
+
+- The provider names the branch of every patch whose status is `active`,
+  `conflict`, `disabled` or `merged_upstream`; the branch of a `deleted`
+  patch is an ordinary branch. Patch branches are left out with or without
+  `reset_to_origin=true`.
+- Right after the origin fetch the hub repeats the workspace's set-up,
+  which fetches upstream (`refs/remotes/upstream/*`, no tags) with the
+  upstream credentials read at that moment, then resolves the upstream
+  base. A failed upstream fetch, or upstream credentials that cannot be
+  read, is the `502` `upstream_error` above, with the fetch step's error as
+  message (it names upstream); an upstream with neither a default branch
+  nor a branch named like the workspace's `default_branch` is the same
+  `502` with `upstream base cannot be resolved for workspace "<slug>":
+  upstream has neither a default branch nor a branch named like the
+  default branch`. Another set-up step that fails is logged and does not
+  fail the sync.
+- After the comparison of every branch, with `patch_branch_source`
+  `origin`, every `active`, `conflict` or `disabled` patch is refreshed in
+  position order against origin's head of its branch as this sync fetched
+  it. The first rule that fits gives `action` and `state`: origin lacks the
+  branch, `none` and `missing_on_origin`; the hub lacks it, `created` and
+  `in_sync`; equal heads, `none` and `in_sync`; the hub's head an ancestor
+  of origin's, `fast_forwarded` and `in_sync`; otherwise, under
+  `patch_divergence_policy` `report`, `none` and `diverged`, and under
+  `replace`, `replaced` and `in_sync`, after the hub's head is saved to
+  `refs/parley/replaced/<branch>`. Every create and move is a
+  compare-and-swap that expects the head compared; protected branches move
+  too. The outcome is stored on the patch (`origin_sync_state`,
+  `origin_sha`, `origin_synced_at`) in one transaction with its events:
+  `parley.patch.sync` (metadata `branch_name`, `action`, `state`,
+  `local_sha`, `origin_sha`) when the branch moved or the state differs
+  from the one stored, and `parley.patch.replace` (metadata
+  `branch_name`, `replaced_sha`, `origin_sha`, `trigger` `sync`) for a
+  replace. Each move is told to the branch-move observers with cause
+  `sync`. With `patch_branch_source` `hub` no patch branch is compared and
+  the three origin fields of every patch become `null`; under `origin`
+  they are `null` on every `merged_upstream` patch.
+- A refresh that fails (a branch moved in the hub between the comparison
+  and the swap, a git or a store failure) stops the sync at that patch:
+  later patches are not refreshed, nothing below runs, and the answer is
+  `500` `internal` naming the branch (`the sync of workspace "<slug>"
+  stopped: refresh the patch branch "<branch>" from origin: it moved in the
+  hub between the comparison and the swap; sync again: …` for a lost
+  swap). The outcomes of the patches before it, their events and a backup
+  ref written stay; `upstream_head_sha`, `last_sync_at` and `sync_error`
+  are not written. When the branch of an `active` or `conflict` patch was
+  moved before the failure and `auto_rebuild_after_sync` is on, a rebuild
+  is queued first.
+- When upstream advanced or the refresh created or moved a patch branch,
+  merge detection examines the `active` and `conflict` patches whose branch
+  the hub has, in position order. `squash_merge_detection` selects the
+  tests: by ancestry (`ancestry_only`, `both`), the patch's head is the
+  upstream base or its ancestor; by content (`content_based`, `both`),
+  `git cherry <base> <head>` lists at least one commit and every one has an
+  equivalent upstream; by pull request number (`content_based`, `both`),
+  `upstream_pr_url` holds `/pull/<n>` and a new upstream commit's subject
+  ends with `(#<n>)`. The new commits are those of the base not reachable
+  from the stored `upstream_head_sha`, or the 50 newest of the base on the
+  first sync and after a force-push. A merged patch becomes
+  `merged_upstream` with `conflict_files` `[]` and its origin fields
+  `null`, and `parley.patch.update` is emitted (metadata `branch_name`,
+  `changed` `["status"]`, `from`, `to` `merged_upstream`, `reason`
+  `merged_upstream`).
+- A rebuild is queued, with the workspace's `rebuild_strategy` and
+  `rebuild_fail_mode` and the caller as `submitted_by`, when
+  `auto_rebuild_after_sync` is on and upstream advanced, the refresh created
+  or moved the branch of an `active` or `conflict` patch, or a patch was
+  found merged; the check `no_active_patches` of the rebuild route does not
+  apply. A rebuild already `queued`, `running` or `failed` skips it; any
+  other failure of the enqueue is `500` `internal` (`… queue the rebuild of
+  the integration branch: …`) and the completion is not written.
+- The completion writes `upstream_head_sha`, the upstream base, when it
+  differs from the one stored, beside `last_sync_at`.
+
 Sync takes no lock on the workspace and never changes its `status`. A
 branch that another writer (a push, a landing, another sync) moves between
 the comparison and the swap keeps that writer's head: the sync compares it
@@ -1881,6 +1957,24 @@ names, an empty list when there is none. `local_sha` is the hub's head of the br
 `origin_sha` origin's head as the fetch found it. The members a sync
 extension adds come after `branches`, in byte order of their names; one
 whose name the workspace object or `branches` has already is left out.
+
+The carry-patch part adds eight members to the answer of a `carry_patch`
+workspace (a `standard` workspace's answer has none of them):
+
+| Member | Value |
+|---|---|
+| `upstream_advanced` | `true` when the upstream base differs from the stored `upstream_head_sha`, or none was stored |
+| `force_push_detected` | `true` when upstream advanced and the stored head is not an ancestor of the new base or is missing from the hub's repository; `false` on the first sync |
+| `origin_fetched` | always `true` |
+| `patches_merged` | the branches found merged upstream in this sync, in position order |
+| `patches_synced` | one object per refreshed patch, in position order: `branch_name`, `action`, `state`, `local_sha` (the hub's head after the refresh, `null` when it has no such branch), `origin_sha` (`null` when origin lacks the branch), `replaced_sha` (the saved head for `replaced`, else `null`); `[]` under `patch_branch_source` `hub` |
+| `patches_diverged` | the branches of the entries whose `state` is `diverged`, in position order |
+| `rebuild_triggered` | `true` when this sync queued a rebuild |
+| `rebuild_job_id` | the queued job's id, else `null` |
+
+```json
+{"slug":"variant","…":"…","branches":[],"force_push_detected":false,"origin_fetched":true,"patches_diverged":["patch/b"],"patches_merged":[],"patches_synced":[{"branch_name":"patch/a","action":"fast_forwarded","state":"in_sync","local_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","replaced_sha":null},{"branch_name":"patch/b","action":"none","state":"diverged","local_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_sha":"e83c5163316f89bfbde7d9ab23ca2e25604af290","replaced_sha":null}],"rebuild_job_id":"7b1e0000-0000-4000-8000-000000000001","rebuild_triggered":true,"upstream_advanced":false}
+```
 
 ```json
 {"slug":"demo","kind":"repository","status":"ready","access":"owner","…":"…","branches":[{"name":"dev","result":"diverged","local_sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","origin_sha":"e83c5163316f89bfbde7d9ab23ca2e25604af290"},{"name":"main","result":"fast_forward","local_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4","origin_sha":"a3f2b1c4d5e6f708192a3b4c5d6e7f8091a2b3c4"}]}
