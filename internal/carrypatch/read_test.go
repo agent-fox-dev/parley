@@ -262,7 +262,7 @@ func TestGet_ReturnsAnyPatch(t *testing.T) {
 	h := startReadHub(t)
 	ps := h.seed(t, "carry")
 	copyDir := h.repoPath("carry")
-	gitrepotest.Git(t, copyDir, "init", "--quiet", "--bare", copyDir)
+	gitrepotest.InitBare(t, copyDir, "")
 
 	p2 := h.get(t, "/workspaces/carry/patches/"+ps["p2"].ID)
 	if p2.status != http.StatusOK || p2.patch["branch_name"] != "p2" || p2.patch["position"] != float64(2) || len(p2.patch) != 14 {

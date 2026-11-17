@@ -38,7 +38,7 @@ func TestBatch_CreatesAllInRequestOrder(t *testing.T) {
 	h := startAddHub(t)
 	dir := h.carry(t, "carry", nil)
 	h.put(t, deletedPatch("carry", "p1", at(10, 0)))
-	gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"p1", commitIn(t, dir, "replaced"))
+	rootsAt(t, dir, map[string]string{carrypatch.ReplacedRefPrefix + "p1": "replaced"})
 
 	a := h.post(t, "carry", []map[string]any{
 		{"branch_name": "p1"}, {"branch_name": "p2", "description": "two"}, {"branch_name": "p3", "skip_branch_check": true},
@@ -207,7 +207,7 @@ BEGIN SELECT RAISE(ABORT, 'the second patch fails'); END`
 	for _, c := range cases {
 		t.Run(c.slug, func(t *testing.T) {
 			dir := h.carry(t, c.slug, c.edit)
-			gitrepotest.Git(t, dir, "update-ref", "refs/remotes/origin/o1", commitIn(t, dir, "o1"))
+			rootsAt(t, dir, map[string]string{"refs/remotes/origin/o1": "o1"})
 			h.put(t, livePatch(c.slug, "p9", 1))
 			if c.slug == "fault" {
 				if _, err := h.Store.Main().Exec(fault); err != nil {

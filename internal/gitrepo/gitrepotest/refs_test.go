@@ -25,7 +25,7 @@ func forEachRef(t *testing.T, dir, prefix string) map[string]string {
 	return refs
 }
 
-func TestRefs_ListsWhatForEachRefLists(t *testing.T) {
+func TestRefs_ReadWhatForEachRefLists(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "r.git")
 	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", "--initial-branch=main", dir)
@@ -55,6 +55,14 @@ func TestRefs_ListsWhatForEachRefLists(t *testing.T) {
 			if got, want := gitrepotest.Refs(t, dir, prefix), forEachRef(t, dir, prefix); !maps.Equal(got, want) {
 				t.Errorf("%s: Refs below %q = %v, want %v", c.name, prefix, got, want)
 			}
+		}
+		for name, want := range forEachRef(t, dir, "") {
+			if got := gitrepotest.Ref(dir, name); got != want {
+				t.Errorf("%s: Ref %s = %q, want %q", c.name, name, got, want)
+			}
+		}
+		if got := gitrepotest.Ref(dir, "refs/heads/none"); got != "" {
+			t.Errorf("%s: Ref of a missing branch = %q, want \"\"", c.name, got)
 		}
 	}
 }

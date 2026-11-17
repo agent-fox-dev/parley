@@ -159,7 +159,7 @@ func TestRollback_ChangesIntegrationBranchOnly(t *testing.T) {
 	t.Parallel()
 	h := startRebuildHub(t)
 	origin := t.TempDir()
-	gitrepotest.Git(t, origin, "init", "--quiet", "--bare", origin)
+	gitrepotest.InitBare(t, origin, "")
 	gitrepotest.Git(t, origin, "update-ref", "refs/heads/deploy", gitrepotest.Commit(t, origin, "origin's deploy", map[string]string{"o.txt": "o\n"}))
 	const slug = "my-fork"
 	h.add(t, slug, workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {

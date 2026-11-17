@@ -227,7 +227,7 @@ func TestSync_NoUpstreamBase(t *testing.T) {
 	// branch nor one named like the workspace's default branch main.
 	f.upstream.Branch("other", "main")
 	gitrepotest.Git(t, f.upstream.Dir(), "update-ref", "-d", "refs/heads/main")
-	gitrepotest.Git(t, f.upstream.Dir(), "update-server-info")
+	f.upstream.Publish()
 
 	before, ws := f.heads(t), f.record(t)
 	r := f.sync(t, "")

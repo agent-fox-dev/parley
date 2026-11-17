@@ -112,7 +112,7 @@ func TestFetchOriginBranch_FetchesTheOneBranch(t *testing.T) {
 
 	// Origin moves dev backwards: the fetch is forced.
 	gitrepotest.Git(t, o.Dir(), "update-ref", "refs/heads/dev", mainHead)
-	gitrepotest.Git(t, o.Dir(), "update-server-info")
+	o.Publish()
 	if tip, err := g.FetchOriginBranch(ctx, dir, o.URL(), "dev", gitrepo.Credential{}, time.Minute); err != nil || tip != mainHead {
 		t.Fatalf("FetchOriginBranch(dev) after origin moved it back = %q, %v; want %s", tip, err, mainHead)
 	}

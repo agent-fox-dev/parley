@@ -84,10 +84,8 @@ func (h *addHub) carry(t *testing.T, slug string, edit func(w *workspace.Workspa
 		t.Fatalf("store workspace %s: %v", slug, err)
 	}
 	dir := h.repoPath(slug)
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
-	for _, b := range []string{"p1", "p2", "p3", "p4"} {
-		gitrepotest.Git(t, dir, "update-ref", "refs/heads/"+b, commitIn(t, dir, b))
-	}
+	gitrepotest.InitBare(t, dir, "")
+	rootsAt(t, dir, map[string]string{"refs/heads/p1": "p1", "refs/heads/p2": "p2", "refs/heads/p3": "p3", "refs/heads/p4": "p4"})
 	return dir
 }
 
@@ -414,7 +412,7 @@ func TestAdd_ReplacesSoftDeletedPatch(t *testing.T) {
 		dir = h.carry(t, slug, nil)
 		old = deletedPatch(slug, "p1", at(10, 0))
 		h.put(t, old)
-		gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"p1", commitIn(t, dir, "replaced"))
+		rootsAt(t, dir, map[string]string{carrypatch.ReplacedRefPrefix + "p1": "replaced"})
 		return dir, old
 	}
 
@@ -456,8 +454,8 @@ func TestAdd_ReplacesSoftDeletedPatch(t *testing.T) {
 func TestDeleteBackupRef_OutlivesTheRequest(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "carry.git")
-	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
-	gitrepotest.Git(t, dir, "update-ref", carrypatch.ReplacedRefPrefix+"p1", commitIn(t, dir, "replaced"))
+	gitrepotest.InitBare(t, dir, "")
+	rootsAt(t, dir, map[string]string{carrypatch.ReplacedRefPrefix + "p1": "replaced"})
 	comp := &carrypatch.Component{}
 	comp.Bind(carrypatch.Deps{RepoPath: func(string) string { return dir }})
 	// The client left right after the add's transaction committed.
@@ -545,7 +543,7 @@ func TestAdd_ResolutionRefusals(t *testing.T) {
 		{"from-origin", map[string]any{"branch_name": "nowhere", "skip_branch_check": true}, http.StatusCreated, "", carrypatch.ResolutionSkipped},
 		{"carry", map[string]any{"branch_name": "o1"}, http.StatusCreated, "", carrypatch.ResolutionOriginTracking},
 	}
-	gitrepotest.Git(t, dir, "update-ref", "refs/remotes/origin/o1", commitIn(t, dir, "o1"))
+	rootsAt(t, dir, map[string]string{"refs/remotes/origin/o1": "o1"})
 	for _, c := range cases {
 		before := h.count(t, c.slug)
 		events, _ := h.events(t, c.slug)

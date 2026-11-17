@@ -43,7 +43,7 @@ type upstreamFixture struct {
 func newUpstreamFixture(t *testing.T, url string, env []string, reader workspace.SecretReader, deadline time.Duration) *upstreamFixture {
 	t.Helper()
 	f := &upstreamFixture{copy: filepath.Join(t.TempDir(), "acme.git")}
-	gitrepotest.Git(t, f.copy, "init", "--quiet", "--bare", f.copy)
+	gitrepotest.InitBare(t, f.copy, "")
 	branch := "main"
 	f.ws = workspace.Workspace{Slug: "acme", Mode: workspace.ModeCarryPatch, UpstreamURL: &url, DefaultBranch: &branch}
 	f.comp = &carrypatch.Component{}
@@ -78,12 +78,11 @@ func (f *upstreamFixture) recordedDefault(t *testing.T) string {
 	return v
 }
 
-// commitIn writes a commit with the message msg and an empty tree into the
-// repository dir and returns its id.
+// commitIn writes a root commit with the message msg and an empty tree into
+// the repository dir and returns its id.
 func commitIn(t *testing.T, dir, msg string) string {
 	t.Helper()
-	tree := gitrepotest.Git(t, dir, "hash-object", "-t", "tree", "-w", "--stdin")
-	return gitrepotest.Git(t, dir, "commit-tree", tree, "-m", msg)
+	return gitrepotest.Commit(t, dir, msg, nil)
 }
 
 func TestFetchUpstream_BringsBranchesWithoutTags(t *testing.T) {
@@ -256,7 +255,7 @@ func TestFetchUpstream_StopsAtDeadline(t *testing.T) {
 	// a loaded machine, where 200 ms did not.
 	const deadline = time.Second
 	f := newUpstreamFixture(t, url, env, secretMap{slug: "acme", values: map[string]string{"UPSTREAM_GIT_PAT": "t"}}, deadline)
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/upstream/main", commitIn(t, f.copy, "base"))
+	rootsAt(t, f.copy, map[string]string{"refs/remotes/upstream/main": "base"})
 	before := gitrepotest.Refs(t, f.copy, "")
 
 	start := time.Now()
@@ -352,10 +351,13 @@ func TestUpstreamBase_Rule(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			f := newUpstreamFixture(t, "https://upstream.invalid/x.git", nil, secretMap{slug: "acme"}, 0)
-			ids := map[string]string{}
+			msgs := map[string]string{}
 			for _, b := range c.refs {
-				ids[b] = commitIn(t, f.copy, b)
-				gitrepotest.Git(t, f.copy, "update-ref", "refs/remotes/upstream/"+b, ids[b])
+				msgs["refs/remotes/upstream/"+b] = b
+			}
+			ids := map[string]string{}
+			for ref, id := range rootsAt(t, f.copy, msgs) {
+				ids[strings.TrimPrefix(ref, "refs/remotes/upstream/")] = id
 			}
 			if c.recorded != "" {
 				gitrepotest.Git(t, f.copy, "config", "--local", "parley.upstreamDefaultBranch", c.recorded)
