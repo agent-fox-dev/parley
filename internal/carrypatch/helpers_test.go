@@ -711,6 +711,8 @@ type rebuildHub struct {
 	queue      *jobs.Queue
 	runner     *rebuildRunner
 	failEvents atomic.Bool
+	// rollbackHooks are the hooks onRollbackSwap gave workspaces, by slug.
+	rollbackHooks sync.Map
 }
 
 // startRebuildHub starts a rebuild hub with an owner who holds an API key
@@ -733,6 +735,7 @@ func startRebuildHub(t *testing.T) *rebuildHub {
 			c.AdjustCarryPatch(func(d *carrypatch.Deps) {
 				h.repoPath = d.RepoPath
 				d.Events = failingEmitter{Emitter: d.Events, fail: &h.failEvents}
+				d.BeforeRollbackSwap = h.beforeRollbackSwap
 			})
 		},
 	})
@@ -776,6 +779,63 @@ func (h *rebuildHub) carryWith(t *testing.T, slug string, settings map[string]st
 		ps = append(ps, p)
 	}
 	h.put(t, ps...)
+}
+
+// onRollbackSwap makes fn run when a rollback of slug has read the head of
+// the integration branch and is about to move it.
+func (h *rebuildHub) onRollbackSwap(slug string, fn func()) { h.rollbackHooks.Store(slug, fn) }
+
+func (h *rebuildHub) beforeRollbackSwap(slug, _ string) {
+	if fn, ok := h.rollbackHooks.Load(slug); ok {
+		fn.(func())()
+	}
+}
+
+// rollbackRepo makes the hub's copy of slug a bare repository made by git
+// init whose integration branch deploy is at the commit H2, whose parent is
+// H1, and returns its directory, H1 and H2.
+func (h *rebuildHub) rollbackRepo(t *testing.T, slug string) (dir, h1, h2 string) {
+	t.Helper()
+	dir = h.repoPath(slug)
+	gitrepotest.Git(t, dir, "init", "--quiet", "--bare", dir)
+	h1 = gitrepotest.Commit(t, dir, "H1", map[string]string{"a.txt": "1\n"})
+	h2 = gitrepotest.Commit(t, dir, "H2", map[string]string{"a.txt": "2\n"}, h1)
+	gitrepotest.Git(t, dir, "update-ref", "refs/heads/deploy", h2)
+	return dir, h1, h2
+}
+
+// rebuiltFrom is the result document of a rebuild that moved the
+// integration branch from previous, "" for null, to head.
+func rebuiltFrom(previous, head string) string {
+	prev := "null"
+	if previous != "" {
+		prev = `"` + previous + `"`
+	}
+	return `{"integration_head_sha":"` + head + `","previous_integration_head_sha":` + prev + `}`
+}
+
+// settledRebuild queues a rebuild of slug whose attempt stores the result
+// document result, none when "", and returns err, and returns the job's id
+// once the outcome is settled: completed for nil, failed for a retryable
+// error, dead_letter for a permanent one.
+func (h *rebuildHub) settledRebuild(t *testing.T, slug, result string, err error) string {
+	t.Helper()
+	id := h.queueRebuild(t, slug)
+	h.drive(t, id, jobs.StatusRunning)
+	if result != "" {
+		if err := h.queue.SetResult(context.Background(), id, json.RawMessage(result)); err != nil {
+			t.Fatalf("store the result of %s: %v", id, err)
+		}
+	}
+	h.finish(t, id, err)
+	return id
+}
+
+// rollback sends POST /workspaces/<slug>/rebuilds/<id>/rollback with
+// credential.
+func (h *rebuildHub) rollback(t *testing.T, credential, slug, id string) answer {
+	t.Helper()
+	return h.call(t, credential, http.MethodPost, "/workspaces/"+slug+"/rebuilds/"+id+"/rollback", nil, nil)
 }
 
 // configure stores settings among the settings of slug through the

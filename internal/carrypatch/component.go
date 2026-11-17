@@ -53,6 +53,12 @@ type Deps struct {
 	// to move the branch or change the patch in between as another writer
 	// would.
 	BeforeRefSwap func(slug, branch string)
+	// BeforeRollbackSwap, when set, is called by a rollback with the
+	// workspace and the full name of its integration branch after the
+	// rollback read the branch's head and before its compare-and-swap,
+	// outside any store transaction; only tests set it, to move the branch
+	// in between as a publishing rebuild would.
+	BeforeRollbackSwap func(slug, ref string)
 	// CommitterName and CommitterEmail are the landing identity, the
 	// committer of every commit a rebuild makes; empty, they are
 	// DefaultCommitterName and DefaultCommitterEmail.

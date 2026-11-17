@@ -24,10 +24,12 @@ const (
 	scopeRebuildsWrite = "rebuilds:write"
 )
 
-// The events of a cancel and of a requeue of a rebuild job.
+// The events of a cancel and of a requeue of a rebuild job, and of a
+// rollback of the integration branch to the head before a rebuild.
 const (
-	EventRebuildCancel  = "parley.rebuild.cancel"
-	EventRebuildRequeue = "parley.rebuild.requeue"
+	EventRebuildCancel   = "parley.rebuild.cancel"
+	EventRebuildRequeue  = "parley.rebuild.requeue"
+	EventRebuildRollback = "parley.rebuild.rollback"
 )
 
 // rebuildRoute declares the rebuild route rt as a carry-patch route of
@@ -47,7 +49,10 @@ func rebuildRoute(kind RouteKind, rt server.Route) server.Route {
 // route that creates, so that the server answers a repeated
 // Idempotency-Key with the first answer; the list and the read of one
 // job, read routes that serve in every state of the workspace; and the
-// cancel and the requeue of one job, write routes that change it.
+// cancel and the requeue of one job, write routes that change it; and the
+// rollback of the integration branch to the head before one completed job,
+// a write route that creates nothing, so that a repeated Idempotency-Key is
+// not answered from the first answer.
 func (c *Component) rebuildRoutes() []server.Route {
 	return []server.Route{
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuild", Handler: c.submitRoute, Create: true}),
@@ -55,6 +60,7 @@ func (c *Component) rebuildRoutes() []server.Route {
 		rebuildRoute(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/rebuilds/:id", Handler: c.readRebuildRoute}),
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodDelete, Pattern: "/workspaces/:slug/rebuilds/:id", Handler: c.cancelRebuildRoute}),
 		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuilds/:id/requeue", Handler: c.requeueRebuildRoute}),
+		rebuildRoute(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/rebuilds/:id/rollback", Handler: c.rollbackRoute}),
 	}
 }
 
