@@ -7,9 +7,10 @@ import (
 
 // TrialMergeResult is what a trial merge of two commits found.
 type TrialMergeResult struct {
-	// Base is the merge base of the two commits the merge started from, ""
-	// when they share no ancestor and the merge started from the empty
-	// tree.
+	// Base is the merge base of the two commits, the one git merge-base
+	// names when they have several (the merge itself starts from all of
+	// them), "" when they share no ancestor and the merge started from the
+	// empty tree.
 	Base string
 	// Tree is the merged tree. With conflicts it holds what git leaves of
 	// each conflicted file, such as its text with conflict markers.
@@ -21,10 +22,10 @@ type TrialMergeResult struct {
 }
 
 // TrialMerge merges the commit of the full id theirs into the commit of the
-// full id ours, three-way from their merge base, and reports the merged
-// tree, or the conflicted files when the merge does not apply cleanly. A
-// conflict is a result, not an error: an error is a failure of another
-// kind, such as an id that names no commit.
+// full id ours, three-way from their merge bases as git merge does, and
+// reports the merged tree, or the conflicted files when the merge does not
+// apply cleanly. A conflict is a result, not an error: an error is a
+// failure of another kind, such as an id that names no commit.
 //
 // The merge happens in the object store alone (git merge-tree): no work
 // tree, no index and no ref is used or changed, and no remembered
@@ -39,8 +40,11 @@ func (r *Repo) TrialMerge(ctx context.Context, ours, theirs string) (TrialMergeR
 	if err != nil {
 		return TrialMergeResult{}, err
 	}
-	from := base
-	if from == "" {
+	// Commits with a merge base merge from every one of them, as git merge
+	// and so a rebuild's merge does: with several (a criss-cross), any one
+	// alone could merge where git merge conflicts, or the other way round.
+	from := ""
+	if base == "" {
 		// Commits that share no ancestor merge from the empty tree, so that
 		// everything each side holds is its addition.
 		empty, err := r.emptyTree(ctx)

@@ -138,6 +138,21 @@ func TestRollback_CreatesMissingIntegrationBranch(t *testing.T) {
 	if got := c.deploy(); got != c.h1 {
 		t.Errorf("deploy is at %q after the rollback, want H1 %s", got, c.h1)
 	}
+
+	// A ref whose name is in the way of the branch's keeps it from being
+	// created: 409 conflict, and nothing changes.
+	blocked := h.rollbackCarry(t, "blocked-fork")
+	gitrepotest.Git(t, blocked.dir, "update-ref", "-d", "refs/heads/deploy")
+	gitrepotest.Git(t, blocked.dir, "update-ref", "refs/heads/deploy/next", blocked.h2)
+	if a := h.rollback(t, h.key, blocked.slug, blocked.j2); a.status != http.StatusConflict || a.Error.ErrorType != "conflict" {
+		t.Errorf("rollback with refs/heads/deploy/next in the way = %d %s, want 409 conflict", a.status, a.raw)
+	}
+	if got := refIn(blocked.dir, "refs/heads/deploy/next"); got != blocked.h2 {
+		t.Errorf("refs/heads/deploy/next is at %q after the refused rollback, want H2 %s", got, blocked.h2)
+	}
+	if got := h.rebuildEvents(t, blocked.slug, carrypatch.EventRebuildRollback); len(got) != 0 {
+		t.Errorf("the refused rollback wrote the events %+v, want none", got)
+	}
 }
 
 func TestRollback_ChangesIntegrationBranchOnly(t *testing.T) {
@@ -252,6 +267,19 @@ func TestRollback_EmitsEvent(t *testing.T) {
 	}
 	if got := h.rebuildEvents(t, unrecorded.slug, carrypatch.EventRebuildRollback); len(got) != 0 {
 		t.Errorf("the unrecorded rollback wrote the events %+v, want none", got)
+	}
+
+	// A branch the unrecorded rollback created is removed again.
+	uncreated := h.rollbackCarry(t, "uncreated-fork")
+	gitrepotest.Git(t, uncreated.dir, "update-ref", "-d", "refs/heads/deploy")
+	h.failEvents.Store(true)
+	a = h.rollback(t, h.key, uncreated.slug, uncreated.j2)
+	h.failEvents.Store(false)
+	if a.status != http.StatusInternalServerError {
+		t.Errorf("rollback of a missing branch with the event log refusing = %d %s, want 500", a.status, a.raw)
+	}
+	if got := uncreated.deploy(); got != "" {
+		t.Errorf("deploy is at %s after the unrecorded rollback created it, want it missing again", got)
 	}
 }
 

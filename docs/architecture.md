@@ -5485,9 +5485,11 @@ itself after the guard, since the guard serves read routes in every state.
 It takes `UpstreamBase` (`ErrNoUpstreamBase` is `409 upstream_unknown`),
 lists the patches with `ListLivePatches`, reads every tip in one
 `RefValues`, and walks them with a predicted state: each tip is merged
-onto it by `(*gitrepo.Repo).TrialMerge` (`merge.go`), the merge base from
-`MergeBase` (an empty-tree commit when there is none) and the merge
-`mergeTree`'s `git merge-tree --write-tree`, which needs no working tree
+onto it by `(*gitrepo.Repo).TrialMerge` (`merge.go`): `mergeTree`'s
+`git merge-tree --write-tree` from every merge base of the two, as the
+rebuild's `git merge` merges (with no `--merge-base`, so that a
+criss-cross history is merged as git merge merges it), or from an
+empty-tree commit when `MergeBase` finds none; it needs no working tree
 and never consults `rr-cache`. A clean merge becomes the state through
 `CreateCommit` (parents the state and the tip, the landing identity of
 `committer()`); a conflict is reported with `BuildConflictReport`

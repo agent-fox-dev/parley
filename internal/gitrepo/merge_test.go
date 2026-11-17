@@ -97,3 +97,28 @@ func TestTrialMerge_ReportsAFailureThatIsNoConflictAsAnError(t *testing.T) {
 		})
 	}
 }
+
+func TestTrialMerge_MergesFromEveryMergeBaseAsGitMergeDoes(t *testing.T) {
+	t.Parallel()
+	f := newCompareFixture(t)
+	ctx := context.Background()
+	// A criss-cross: x and y change the same line, and o and t merge them
+	// both, o keeping x's line and t keeping y's, so that o and t have two
+	// merge bases. Either base alone merges o and t cleanly; git merge,
+	// which merges from every merge base, finds the conflict.
+	base := gitrepotest.Commit(t, f.dir, "base", map[string]string{"cc.txt": "0\n"})
+	x := gitrepotest.Commit(t, f.dir, "x", map[string]string{"cc.txt": "x\n"}, base)
+	y := gitrepotest.Commit(t, f.dir, "y", map[string]string{"cc.txt": "y\n"}, base)
+	o := gitrepotest.Commit(t, f.dir, "o", map[string]string{"cc.txt": "x\n"}, x, y)
+	theirs := gitrepotest.Commit(t, f.dir, "t", map[string]string{"cc.txt": "y\n"}, y, x)
+	if bases := strings.Fields(gitrepotest.Git(t, f.dir, "merge-base", "--all", o, theirs)); len(bases) != 2 {
+		t.Fatalf("the merge bases of o and t = %q, want x and y", bases)
+	}
+	got, err := f.repo.TrialMerge(ctx, o, theirs)
+	if err != nil {
+		t.Fatalf("TrialMerge(o, t) = %v", err)
+	}
+	if len(got.Conflicts) != 1 || got.Conflicts[0].Path != "cc.txt" {
+		t.Errorf("the conflicts = %s, want cc.txt in conflict as git merge finds it", describeFiles(got.Conflicts))
+	}
+}

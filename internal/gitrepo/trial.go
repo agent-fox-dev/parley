@@ -131,14 +131,18 @@ func (r *Repo) trialCommit(ctx context.Context, tree string) (string, error) {
 }
 
 // mergeTree merges the commit theirs into ours with the commit base as the
-// merge base, writing the result's objects, and returns the merged tree,
+// merge base, or, for a base of "", from every merge base of the two, as
+// git merge does, writing the result's objects, and returns the merged tree,
 // and the conflicted files, in byte order of path, when it does not merge
 // cleanly: the tree then holds what git leaves of each conflicted file,
 // such as its text with conflict markers, or a side moved aside to
 // <path>~<commit>.
 func (r *Repo) mergeTree(ctx context.Context, base, ours, theirs string) (string, []ConflictFile, error) {
-	out, _, err := r.g.runOutput(ctx, access{}, nil, "--git-dir="+r.dir, "merge-tree", "--write-tree", "-z",
-		"--messages", "--merge-base="+base, ours, theirs)
+	args := []string{"--git-dir=" + r.dir, "merge-tree", "--write-tree", "-z", "--messages"}
+	if base != "" {
+		args = append(args, "--merge-base="+base)
+	}
+	out, _, err := r.g.runOutput(ctx, access{}, nil, append(args, ours, theirs)...)
 	switch {
 	case err == nil:
 		tree, _, _ := strings.Cut(string(out), "\x00")
