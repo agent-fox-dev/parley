@@ -63,7 +63,8 @@ func attemptFailed(kind attemptKind, reason string, err error) *attemptOutcome {
 // it keeps whole in memory, since every store of it replaces the job's.
 // Once the upstream base is resolved, it also holds the workspace's
 // repository, the base, the patches as the run listed them, what it did
-// with each and the head under construction.
+// with each and the head under construction; once it published, how many
+// patches the publish removed as merged upstream.
 type rebuildRun struct {
 	c       *Component
 	job     jobs.Job
@@ -76,6 +77,7 @@ type rebuildRun struct {
 	base    string
 	patches []runPatch
 	head    string
+	removed int
 }
 
 // runRebuildAttempt runs one attempt of the rebuild job j, which the queue
@@ -144,6 +146,13 @@ func (r *rebuildRun) readWorkspace(ctx context.Context) *attemptOutcome {
 	if err != nil {
 		return attemptFailed(attemptRetryable, reasonGitError, fmt.Errorf("read the workspace %s: %w", r.job.Workspace, err))
 	}
+	return r.admit(ws, found)
+}
+
+// admit keeps ws, the job's workspace as just read, found false when it no
+// longer exists, and ends the attempt unless it is ready, as readWorkspace
+// says.
+func (r *rebuildRun) admit(ws workspace.Workspace, found bool) *attemptOutcome {
 	if !found {
 		return &attemptOutcome{kind: attemptEnded}
 	}

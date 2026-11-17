@@ -62,6 +62,14 @@ type Deps struct {
 	// before the publish reads the integration branch, outside any store
 	// transaction; only tests set it.
 	BeforeRebuildPublish func(job string)
+	// BeforeRebuildSwap, when set, is called by an attempt of the rebuild
+	// job with the job's id after the publish read the integration branch
+	// and prepared the patch list's changes, and before its compare-and-swap.
+	// The publish's store transaction is open then: the hook may read the
+	// store and move refs, but a write through Store.Tx would wait for ever.
+	// Only tests set it, to move the branch as another writer would or to
+	// look at what a reader sees.
+	BeforeRebuildSwap func(job string)
 	// ConflictFiles describes the files of the conflict report of a patch
 	// that did not apply in a rebuild; nil is GitConflictFiles.
 	ConflictFiles ConflictFileDescriber

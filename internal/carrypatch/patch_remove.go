@@ -95,9 +95,8 @@ func (c *Component) softDelete(ctx context.Context, slug, id string, by actor) e
 			return nil
 		}
 		now := c.now().UTC().Truncate(time.Second)
-		if _, err := tx.ExecContext(ctx, `UPDATE patches SET status = ?, position = NULL, conflict_files = '[]', deleted_at = ?, updated_at = ?
-WHERE workspace_slug = ? AND id = ?`, StatusDeleted, now.UnixNano(), now.UnixNano(), slug, id); err != nil {
-			return fmt.Errorf("delete the patch %s of %s: %w", p.BranchName, slug, err)
+		if err := markDeleted(ctx, tx, p, now); err != nil {
+			return err
 		}
 		live, err := ListLivePatches(ctx, tx, slug)
 		if err != nil {
@@ -113,6 +112,17 @@ WHERE workspace_slug = ? AND id = ?`, StatusDeleted, now.UnixNano(), now.UnixNan
 		})
 		return err
 	})
+}
+
+// markDeleted marks the stored patch p deleted at now in tx, without a
+// position and with no conflict files; the caller renumbers the patches
+// after it.
+func markDeleted(ctx context.Context, tx *sql.Tx, p Patch, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE patches SET status = ?, position = NULL, conflict_files = '[]', deleted_at = ?, updated_at = ?
+WHERE workspace_slug = ? AND id = ?`, StatusDeleted, now.UnixNano(), now.UnixNano(), p.Workspace, p.ID); err != nil {
+		return fmt.Errorf("delete the patch %s of %s: %w", p.BranchName, p.Workspace, err)
+	}
+	return nil
 }
 
 // restore brings the deleted patch id of the workspace slug back, active,

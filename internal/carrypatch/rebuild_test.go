@@ -62,11 +62,14 @@ type rebuildFixture struct {
 
 // rebuildHooks are what a test runs at the points of an attempt the
 // carry-patch component calls its test hooks at: before the run takes up
-// its i-th patch, from 0, and before the publish.
+// its i-th patch, from 0, before the publish, and between the publish's
+// read of the integration branch and its swap, while the publish's store
+// transaction is open.
 type rebuildHooks struct {
 	mu        sync.Mutex
 	onPatch   func(i int)
 	onPublish func()
+	onSwap    func()
 }
 
 // beforePatch sets fn to run before the run takes up each patch.
@@ -83,6 +86,14 @@ func (h *rebuildHooks) beforePublish(fn func()) {
 	h.onPublish = fn
 }
 
+// beforeSwap sets fn to run between the publish's read and its swap; fn
+// must not write through the store's Tx.
+func (h *rebuildHooks) beforeSwap(fn func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onSwap = fn
+}
+
 func (h *rebuildHooks) patch(_ string, i int) {
 	h.mu.Lock()
 	fn := h.onPatch
@@ -95,6 +106,15 @@ func (h *rebuildHooks) patch(_ string, i int) {
 func (h *rebuildHooks) publish(string) {
 	h.mu.Lock()
 	fn := h.onPublish
+	h.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+func (h *rebuildHooks) swap(string) {
+	h.mu.Lock()
+	fn := h.onSwap
 	h.mu.Unlock()
 	if fn != nil {
 		fn()
@@ -151,7 +171,7 @@ func startRebuildFixtureWith(t *testing.T, deps func(d *carrypatch.Deps), edit .
 				f.secrets.SecretReader = d.Secrets
 				d.Secrets = f.secrets
 				d.Git.Env = append(slices.Clone(d.Git.Env), "GIT_SSL_CAINFO="+bundle)
-				d.BeforeRebuildPatch, d.BeforeRebuildPublish = f.hooks.patch, f.hooks.publish
+				d.BeforeRebuildPatch, d.BeforeRebuildPublish, d.BeforeRebuildSwap = f.hooks.patch, f.hooks.publish, f.hooks.swap
 				if deps != nil {
 					deps(d)
 				}

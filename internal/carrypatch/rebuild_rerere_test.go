@@ -241,7 +241,7 @@ func TestRebuild_LearnsAResolutionFromAMergeOnThePatchBranch(t *testing.T) {
 	t.Parallel()
 	f := startConflictFixture(t, nil)
 	c := commitFiles(t, f.copy, f.cut, "C", map[string]string{"a.txt": "1\n2\n3 p1\n"})
-	f.putPatch(t, "p1", c)
+	p1 := f.putPatch(t, "p1", c)
 	u2 := f.moveOn(t)
 
 	// The first run meets the conflict and has nothing to learn it from.
@@ -273,6 +273,9 @@ func TestRebuild_LearnsAResolutionFromAMergeOnThePatchBranch(t *testing.T) {
 	}
 	if got := fileIn(t, f.copy, "refs/heads/deploy", "a.txt"); got != resolvedA {
 		t.Errorf("a.txt in deploy = %q, want the merge commit's %q", got, resolvedA)
+	}
+	if got := f.stored(t, p1.ID); got.Status != carrypatch.StatusActive || len(got.ConflictFiles) != 0 {
+		t.Errorf("p1 after the learning has status %s and conflict_files %q, want active with none", got.Status, got.ConflictFiles)
 	}
 	want := []carrypatch.RerereEntry{{ID: entries[0].ID, Path: "a.txt", Resolved: true, RecordedAt: learnedAt}}
 	if got := f.entries(t); !sameEntries(got, want) {
