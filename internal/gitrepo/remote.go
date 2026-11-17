@@ -68,8 +68,9 @@ var ErrNoSuchBranch = errors.New("origin has no such branch")
 //
 // The branch reaches git only in full ref form, and the URL and the
 // refspec only after the end of git's options, so that no value is read as
-// an option; a name git would not take for a branch is refused without
-// running git. When origin has no such branch, the error matches
+// an option; a branch that begins with '-' is ErrInvalidArgument, and a
+// name git would not take for a branch is refused, both without running
+// git. When origin has no such branch, the error matches
 // ErrNoSuchBranch; when another ref of the copy is in the way of the
 // origin head's name (refs/remotes/origin/feat for feat/x), it matches
 // ErrRefNameConflict and origin is not asked. A fetch that fails changes no
@@ -77,6 +78,9 @@ var ErrNoSuchBranch = errors.New("origin has no such branch")
 // started and the error matches ErrDeadline; when ctx ends first, the
 // error wraps ctx's error.
 func (g Git) FetchOriginBranch(ctx context.Context, dir, url, branch string, cred Credential, deadline time.Duration) (string, error) {
+	if err := refuseOption("branch", branch); err != nil {
+		return "", err
+	}
 	src, dst := "refs/heads/"+branch, originPrefix+branch
 	if !ValidRefName(src) {
 		return "", fmt.Errorf("fetch the branch %q: not a branch name", branch)

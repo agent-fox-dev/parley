@@ -28,10 +28,14 @@ var ErrRefNameConflict = errors.New("another ref is in the way of the name")
 // is locked by another writer, nothing changes and the error matches
 // ErrRefMoved; when ref is to be created and another ref's name is in the
 // way of its name, nothing changes and the error matches
-// ErrRefNameConflict; any other error is git's.
+// ErrRefNameConflict; a ref or id that begins with '-' is
+// ErrInvalidArgument, and no git runs; any other error is git's.
 func (r *Repo) CompareAndSwapRef(ctx context.Context, ref, newID, expectedOld string) error {
+	if err := refuseOptions(ref, newID, expectedOld); err != nil {
+		return err
+	}
 	// An empty old value is git's own "must not exist yet".
-	_, err := r.git(ctx, "update-ref", ref, newID, expectedOld)
+	_, err := r.git(ctx, "update-ref", "--end-of-options", ref, newID, expectedOld)
 	if err == nil || ctx.Err() != nil {
 		return err
 	}
@@ -53,18 +57,26 @@ func (r *Repo) CompareAndSwapRef(ctx context.Context, ref, newID, expectedOld st
 // SetRef points ref, a full ref name, at the commit id, whatever it
 // points at now and whether or not it exists: for a ref only the hub
 // writes, such as a change's version ref, where a value left by an earlier
-// write that was undone is to be overwritten.
+// write that was undone is to be overwritten. A ref or id that begins with
+// '-' is ErrInvalidArgument, and no git runs.
 func (r *Repo) SetRef(ctx context.Context, ref, id string) error {
-	_, err := r.git(ctx, "update-ref", "--no-deref", ref, id)
+	if err := refuseOptions(ref, id); err != nil {
+		return err
+	}
+	_, err := r.git(ctx, "update-ref", "--no-deref", "--end-of-options", ref, id)
 	return err
 }
 
 // DeleteRef removes ref, a full ref name, whatever it points at: for a
 // ref only the hub writes, such as a change's version ref, which a write
 // that was then refused must not leave behind. A ref that does not exist
-// is no error.
+// is no error. A ref that begins with '-' is ErrInvalidArgument, and no
+// git runs.
 func (r *Repo) DeleteRef(ctx context.Context, ref string) error {
-	_, err := r.git(ctx, "update-ref", "--no-deref", "-d", ref)
+	if err := refuseOption("ref", ref); err != nil {
+		return err
+	}
+	_, err := r.git(ctx, "update-ref", "--no-deref", "-d", "--end-of-options", ref)
 	return err
 }
 
@@ -115,9 +127,13 @@ func (r *Repo) RefInTheWay(ctx context.Context, ref string) (name string, found 
 }
 
 // IsAncestor reports whether the commit ancestor is reachable from the
-// commit descendant, which a commit is from itself.
+// commit descendant, which a commit is from itself. A revision that begins
+// with '-' is ErrInvalidArgument, and no git runs.
 func (r *Repo) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
-	_, err := r.git(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err := refuseOption("revision", ancestor, descendant); err != nil {
+		return false, err
+	}
+	_, err := r.git(ctx, "merge-base", "--is-ancestor", "--end-of-options", ancestor, descendant)
 	if exitCode(err) == 1 {
 		return false, nil
 	}
@@ -173,4 +189,13 @@ func (r *Repo) deleteUnder(ctx context.Context, prefix string) error {
 	}
 	_, err = r.g.runInput(ctx, access{}, out, "--git-dir="+r.dir, "update-ref", "--stdin")
 	return err
+}
+
+// refuseOptions is refuseOption for a ref name followed by the commit ids
+// of a write of it.
+func refuseOptions(ref string, ids ...string) error {
+	if err := refuseOption("ref", ref); err != nil {
+		return err
+	}
+	return refuseOption("revision", ids...)
 }

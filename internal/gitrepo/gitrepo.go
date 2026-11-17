@@ -207,11 +207,15 @@ func (r *Repo) SetDefaultBranch(ctx context.Context, branch string) error {
 }
 
 // ResolveBranch is the commit id branch points at; found is false, with no
-// error, when there is no such branch or it points at no commit.
+// error, when there is no such branch or it points at no commit. A branch
+// that begins with '-' is ErrInvalidArgument, and no git runs.
 //
 // It reads the branch from git's files ref backend in process, as git
 // does, and asks git only about what it does not read that way.
 func (r *Repo) ResolveBranch(ctx context.Context, branch string) (id string, found bool, err error) {
+	if err := refuseOption("branch", branch); err != nil {
+		return "", false, err
+	}
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
@@ -329,7 +333,7 @@ func Remove(dir string) error {
 // resolve is the commit id ref points at; found is false when there is no
 // such ref or it points at no commit.
 func (r *Repo) resolve(ctx context.Context, ref string) (string, bool, error) {
-	out, err := r.git(ctx, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	out, err := r.git(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
 	if exitCode(err) == 1 {
 		return "", false, nil
 	}

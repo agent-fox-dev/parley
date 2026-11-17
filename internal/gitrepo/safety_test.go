@@ -49,14 +49,121 @@ func TestSanitizeGitText(t *testing.T) {
 			"https://git.example/x.git?token=tok-9", []string{"tok-9"},
 			"https://git.example/x.git?token="},
 		{"text without either is kept", "error: exit status 128", []string{"tok-3"}, "error: exit status 128"},
+		{"a user and password of an access error",
+			"fatal: unable to access https://alice:hunter2@example.com/r.git/", nil,
+			"fatal: unable to access https://***@example.com/r.git/"},
+		{"a token alone and an ssh user",
+			"https://tok123@h/x and ssh://bob@h2/y", nil,
+			"https://***@h/x and ssh://***@h2/y"},
+		{"a URL without user information", "https://example.com/r.git", nil, "https://example.com/r.git"},
+		{"ssh's user@host:path form is no URL", "git@example.com:team/r.git", nil, "git@example.com:team/r.git"},
+		{"a mail address is no URL", "mail bob@example.com", nil, "mail bob@example.com"},
+		{"empty text", "", []string{"hunter2"}, ""},
+		{"a credential outside any URL",
+			"remote: alice:hunter2 is not allowed", []string{"alice", "hunter2"},
+			"remote: : is not allowed"},
+		// The password holds a '/', which ends a URL's user information:
+		// removed first, it leaves the user name, which must not stay.
+		{"a password that cuts the URL's user information short",
+			"fatal: unable to access 'https://alice:pa/ss@example.com/r.git/'", []string{"pa/ss"},
+			"fatal: unable to access 'https://***@example.com/r.git/'"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			if got := gitrepo.SanitizeGitText(c.text, c.secrets...); got != c.want {
+			got := gitrepo.SanitizeGitText(c.text, c.secrets...)
+			if got != c.want {
 				t.Errorf("SanitizeGitText(%q, %q) = %q, want %q", c.text, c.secrets, got, c.want)
 			}
+			if again := gitrepo.SanitizeGitText(got, c.secrets...); again != got {
+				t.Errorf("SanitizeGitText applied twice to %q gives %q, once %q", c.text, again, got)
+			}
 		})
+	}
+}
+
+func TestRefOperations_RefuseAValueThatBeginsWithADash(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "copy.git")
+	gitrepotest.InitBare(t, dir, "main")
+	c := gitrepotest.Commit(t, dir, "c", map[string]string{"a.txt": "a\n"})
+	gitrepotest.SetRef(t, dir, "refs/heads/main", c)
+	o := gitrepotest.NewOrigin(t)
+	o.Commit("feature/x", "x")
+	pwned := filepath.Join(tmp, "pwned")
+
+	var starts atomic.Int64
+	g := gitrepo.Git{Env: o.Env(), Trace: func([]string) { starts.Add(1) }}
+	repo, err := g.Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const deadline = 10 * time.Second
+	// Each operation takes the value v where carry-patch code passes a
+	// value a caller gave: a branch, a ref of a branch, a revision.
+	ops := []struct {
+		name string
+		run  func(v string) error
+	}{
+		{"resolve a branch", func(v string) error { _, _, err := repo.ResolveBranch(ctx, v); return err }},
+		{"ancestry, the revision as the ancestor", func(v string) error { _, err := repo.IsAncestor(ctx, v, c); return err }},
+		{"ancestry, the revision as the descendant", func(v string) error { _, err := repo.IsAncestor(ctx, c, v); return err }},
+		{"read a ref", func(v string) error { _, _, err := repo.LookupRef(ctx, v); return err }},
+		{"create a branch, the value as the ref", func(v string) error { return repo.CompareAndSwapRef(ctx, v, c, "") }},
+		{"create a branch, the value as the commit", func(v string) error { return repo.CompareAndSwapRef(ctx, "refs/heads/made", v, "") }},
+		{"move a branch, the value as the expected commit", func(v string) error { return repo.CompareAndSwapRef(ctx, "refs/heads/main", c, v) }},
+		{"point a ref, the value as the ref", func(v string) error { return repo.SetRef(ctx, v, c) }},
+		{"point a ref, the value as the commit", func(v string) error { return repo.SetRef(ctx, "refs/heads/made", v) }},
+		{"single-branch fetch", func(v string) error {
+			_, err := g.FetchOriginBranch(ctx, dir, o.URL(), v, gitrepo.Credential{}, deadline)
+			return err
+		}},
+		{"delete a ref", func(v string) error { return repo.DeleteRef(ctx, v) }},
+	}
+	refs := gitrepotest.Refs(t, dir, "")
+	for _, v := range []string{"--upload-pack=touch " + pwned, "-c", "--output=" + pwned, "--exec=touch " + pwned, "-"} {
+		for _, op := range ops {
+			starts.Store(0)
+			err := op.run(v)
+			if !errors.Is(err, gitrepo.ErrInvalidArgument) {
+				t.Errorf("%s with %q = %v, want ErrInvalidArgument", op.name, v, err)
+			}
+			if n := starts.Load(); n != 0 {
+				t.Errorf("%s with %q started %d git processes, want none", op.name, v, n)
+			}
+			if _, err := os.Stat(pwned); !os.IsNotExist(err) {
+				t.Fatalf("after %s with %q the injected option wrote %s: %v", op.name, v, pwned, err)
+			}
+		}
+	}
+	if got := gitrepotest.Refs(t, dir, ""); !maps.Equal(got, refs) {
+		t.Errorf("the refusals changed the refs to %v, want %v", got, refs)
+	}
+
+	// A branch name a caller may give passes each of them.
+	const branch, ref = "feature/x", "refs/heads/feature/x"
+	if err := repo.CompareAndSwapRef(ctx, ref, c, ""); err != nil {
+		t.Errorf("create %s = %v", ref, err)
+	}
+	if err := repo.SetRef(ctx, ref, c); err != nil {
+		t.Errorf("point %s = %v", ref, err)
+	}
+	if got, found, err := repo.LookupRef(ctx, ref); err != nil || !found || got.ID != c {
+		t.Errorf("read %s = %v, %v, %v, want it at %s", ref, got, found, err, c)
+	}
+	if id, found, err := repo.ResolveBranch(ctx, branch); err != nil || !found || id != c {
+		t.Errorf("resolve %s = %s, %v, %v, want %s", branch, id, found, err, c)
+	}
+	if ok, err := repo.IsAncestor(ctx, c, ref); err != nil || !ok {
+		t.Errorf("is %s an ancestor of %s = %v, %v, want true", c, ref, ok, err)
+	}
+	if err := repo.DeleteRef(ctx, ref); err != nil {
+		t.Errorf("delete %s = %v", ref, err)
+	}
+	if id, err := g.FetchOriginBranch(ctx, dir, o.URL(), branch, gitrepo.Credential{}, deadline); err != nil || id != o.Head(branch) {
+		t.Errorf("fetch %s = %s, %v, want %s", branch, id, err, o.Head(branch))
 	}
 }
 

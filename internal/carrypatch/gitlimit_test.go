@@ -77,6 +77,14 @@ func (h *hangingRemote) URL() string { return h.srv.URL + "/upstream.git" }
 // remote's own. It fails no test with Fatal, so that a start hook may call
 // it.
 func (h *hangingRemote) trustedBy(t *testing.T, env []string) []string {
+	return trusting(t, env, h.cert)
+}
+
+// trusting is env, the environment of a git, with GIT_SSL_CAINFO naming a
+// bundle of the certificates the bundle it named holds and the PEM
+// certificate cert. It fails no test with Fatal, so that a start hook may
+// call it.
+func trusting(t *testing.T, env []string, cert []byte) []string {
 	var pems []byte
 	for _, kv := range env {
 		if file, ok := strings.CutPrefix(kv, "GIT_SSL_CAINFO="); ok {
@@ -88,10 +96,17 @@ func (h *hangingRemote) trustedBy(t *testing.T, env []string) []string {
 		}
 	}
 	bundle := filepath.Join(t.TempDir(), "ca-bundle.pem")
-	if err := os.WriteFile(bundle, append(slices.Clone(pems), h.cert...), 0o600); err != nil {
+	if err := os.WriteFile(bundle, append(slices.Clone(pems), cert...), 0o600); err != nil {
 		t.Errorf("write the certificates git trusts: %v", err)
 	}
 	return append(slices.Clone(env), "GIT_SSL_CAINFO="+bundle)
+}
+
+// heldCount is the number of requests the remote has held.
+func (h *hangingRemote) heldCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.held)
 }
 
 // checkLeftWithin checks that the remote held at least n requests and that
@@ -192,22 +207,30 @@ func TestRequest_FailsAsInternalWhenAGitOperationOutlastsTheLimit(t *testing.T) 
 	gitrepotest.SetRef(t, cp, "refs/heads/deploy", head)
 	refs := gitrepotest.Refs(t, cp, "")
 
-	start := time.Now()
-	status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/upstream-fetch-probe", h.key, nil)
-	took := time.Since(start)
+	// Under the load of the whole suite git may not reach the remote before
+	// the limit ends it; such a call is checked too, and made again, so
+	// that one call shows the connection it held closed.
+	for try := 1; ; try++ {
+		start := time.Now()
+		status, body := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/upstream-fetch-probe", h.key, nil)
+		took := time.Since(start)
 
-	var a answer
-	if err := json.Unmarshal(body, &a); err != nil {
-		t.Fatalf("the answer %d %s: %v", status, body, err)
-	}
-	if status != http.StatusInternalServerError || a.Error.ErrorType != "internal" || !strings.Contains(a.Error.Message, "time limit") {
-		t.Errorf("the answer = %d %s, want 500 internal saying the time limit passed", status, body)
-	}
-	if took < limit || took > 3*time.Second {
-		t.Errorf("the answer came after %v, want between %v and 3s", took, limit)
-	}
-	if got := gitrepotest.Refs(t, cp, ""); !maps.Equal(got, refs) {
-		t.Errorf("the copy's refs = %v, want %v unchanged", got, refs)
+		var a answer
+		if err := json.Unmarshal(body, &a); err != nil {
+			t.Fatalf("the answer %d %s: %v", status, body, err)
+		}
+		if status != http.StatusInternalServerError || a.Error.ErrorType != "internal" || !strings.Contains(a.Error.Message, "time limit") {
+			t.Errorf("the answer = %d %s, want 500 internal saying the time limit passed", status, body)
+		}
+		if took < limit || took > 3*time.Second {
+			t.Errorf("the answer came after %v, want between %v and 3s", took, limit)
+		}
+		if got := gitrepotest.Refs(t, cp, ""); !maps.Equal(got, refs) {
+			t.Errorf("the copy's refs = %v, want %v unchanged", got, refs)
+		}
+		if up.heldCount() > 0 || try == 3 {
+			break
+		}
 	}
 	up.checkLeftWithin(t, 1, limit+2*time.Second)
 }

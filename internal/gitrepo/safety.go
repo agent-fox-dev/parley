@@ -14,19 +14,45 @@ import (
 var userinfo = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s'"]*@`)
 
 // SanitizeGitText is text, the output or error text of a git command, made
-// fit to show to a client or to log: the user information of every URL in
-// it reads ***@, and every non-empty value of secrets, such as the
-// credential the command presented, is removed. Longer values are removed
-// first, so that one that holds another goes whole.
+// fit to show to a client or to log: every non-empty value of secrets, such
+// as the credential the command presented, is removed, and then the user
+// information of every URL in it reads ***@. Longer values are removed
+// first, so that one that holds another goes whole. The values go first
+// because one may hold a character that ends a URL's user information
+// early, such as a '/' in a password, which would keep the rest of it, the
+// user name, from reading ***@; so cleaned, the text is the same when it
+// is cleaned again. ssh's user@host:path form and a mail address are no
+// URLs and are kept.
 func SanitizeGitText(text string, secrets ...string) string {
-	text = userinfo.ReplaceAllString(text, "${1}***@")
 	sorted := slices.SortedFunc(slices.Values(secrets), func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 	for _, s := range sorted {
 		if s != "" {
 			text = strings.ReplaceAll(text, s, "")
 		}
 	}
-	return text
+	return userinfo.ReplaceAllString(text, "${1}***@")
+}
+
+// ErrInvalidArgument is matched by the error of an operation given a
+// branch name, ref name or revision that begins with '-', which git would
+// read as an option: no git process is started for it. No branch name a
+// caller may create and no commit id begins with '-', so nothing that
+// names one is refused.
+var ErrInvalidArgument = errors.New("invalid argument")
+
+// refuseOption is nil when no value of values begins with '-', and an
+// error matching ErrInvalidArgument that names the first that does, as a
+// value of the kind kind (branch, ref, revision), otherwise. An operation
+// that passes a value a caller gave to git checks it with this before any
+// process starts, and passes it where git reads no option: after
+// --end-of-options, or inside a full ref name.
+func refuseOption(kind string, values ...string) error {
+	for _, v := range values {
+		if strings.HasPrefix(v, "-") {
+			return fmt.Errorf("the %s %q: %w: it begins with '-', which git would read as an option", kind, v, ErrInvalidArgument)
+		}
+	}
+	return nil
 }
 
 // ErrTransportRefused is matched by the error of an operation with a remote
