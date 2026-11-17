@@ -135,7 +135,7 @@ func (r *rebuildRun) start(ctx context.Context) *attemptOutcome {
 		return out
 	}
 	r.readSecrets(ctx)
-	if err := r.c.ensureSetup(ctx, r.ws, true); err != nil {
+	if err := r.c.ensureSetup(ctx, r.ws, true, r.c.d.RebuildGitDeadline); err != nil {
 		// A stop of the hub or a delete of the workspace during the set-up
 		// fails its steps too; it is not the upstream's failure.
 		if ctx.Err() != nil {

@@ -137,7 +137,7 @@ func (g Git) Push(ctx context.Context, req PushRequest) (PushResult, error) {
 	case reported && flag == '!' && strings.HasPrefix(summary, "[remote rejected]"):
 		reason, said := rejectReason(summary, stderr)
 		return "", &PushError{Branch: req.Branch, Class: ErrOriginRejected, Reason: reason, OriginMessage: said, Err: err}
-	case err != nil && ctx.Err() != nil:
+	case err != nil && (ctx.Err() != nil || errors.Is(err, ErrTransportRefused)):
 		return "", err
 	case err != nil && !reported:
 		return "", &PushError{Branch: req.Branch, Class: transportClass(stderr), Reason: transportReason(stderr), Err: err}

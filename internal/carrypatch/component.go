@@ -107,6 +107,11 @@ type Deps struct {
 	// DefaultGitDeadline as the deadline of each git operation of a rebuild
 	// attempt; only tests set it.
 	RebuildGitDeadline time.Duration
+	// BeforeRebuildGit, when set, is called by an attempt of the rebuild
+	// job at the start of each of its git operations, within the
+	// operation's deadline, with the operation's context; only tests set
+	// it, to make every operation take longer.
+	BeforeRebuildGit func(ctx context.Context)
 	// ForwardLimit, when positive and shorter, replaces DefaultForwardLimit
 	// as the limit of a forward of a patch branch to origin; only tests set
 	// it.

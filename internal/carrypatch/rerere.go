@@ -139,7 +139,7 @@ func (c *Component) forgetRerereRoute(w http.ResponseWriter, r *http.Request) er
 	// What has begun is finished when the caller leaves: git's record of
 	// an entry is not left removed while the entry stays.
 	if err := c.forgetRerere(context.WithoutCancel(r.Context()), ws.Slug, selected); err != nil {
-		return err
+		return RequestError(err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil

@@ -2,6 +2,7 @@ package gitrepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -86,7 +87,7 @@ func (g Git) PushBranches(ctx context.Context, req PushBranchesRequest) ([]Branc
 	switch {
 	case err == nil || len(results) == len(branches):
 		return results, nil
-	case ctx.Err() != nil:
+	case ctx.Err() != nil || errors.Is(err, ErrTransportRefused):
 		return results, err
 	}
 	return results, &PushError{Branch: strings.Join(branches, ", "), Class: transportClass(stderr), Reason: transportReason(stderr), Err: err}

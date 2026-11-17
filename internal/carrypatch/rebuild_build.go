@@ -311,9 +311,15 @@ func (pr *patchReplay) merge(ctx context.Context) (bool, *conflictAt, *attemptOu
 
 // git runs op, one git operation of the attempt, through RunGit, under the
 // deadline of every git operation of carry-patch work or the shorter one a
-// test gives.
+// test gives: each operation has the whole deadline to itself, whatever the
+// earlier ones took.
 func (r *rebuildRun) git(ctx context.Context, op func(ctx context.Context) error) error {
-	return RunGit(ctx, r.c.d.RebuildGitDeadline, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error { return op(ctx) })
+	return RunGit(ctx, r.c.d.RebuildGitDeadline, gitrepo.Credential{}, func(ctx context.Context, _ time.Duration) error {
+		if hook := r.c.d.BeforeRebuildGit; hook != nil {
+			hook(ctx)
+		}
+		return op(ctx)
+	})
 }
 
 // committer is the landing identity at the clock's present time: the

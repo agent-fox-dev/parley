@@ -224,18 +224,19 @@ func (c *Component) PostClone(ctx context.Context, w workspace.Workspace, repo *
 // when it does not exist, never moving an existing one. It returns nil
 // when every step succeeded, else the error Setup.Run describes.
 func (c *Component) EnsureSetup(ctx context.Context, w workspace.Workspace) error {
-	return c.ensureSetup(ctx, w, false)
+	return c.ensureSetup(ctx, w, false, 0)
 }
 
 // ensureSetup is EnsureSetup, with the integration branch left alone when
-// leaveBranch is set.
-func (c *Component) ensureSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool) error {
+// leaveBranch is set, and each git operation of the upstream fetch held to
+// opLimit as well when it is positive.
+func (c *Component) ensureSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool, opLimit time.Duration) error {
 	unlock, err := c.lockSetup(ctx, w.Slug)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return c.runSetup(ctx, w, leaveBranch)
+	return c.runSetup(ctx, w, leaveBranch, opLimit)
 }
 
 // lockSetup waits until no other repeated set-up of the workspace slug
@@ -251,7 +252,7 @@ func (c *Component) lockSetup(ctx context.Context, slug string) (unlock func(), 
 
 // runSetup is ensureSetup for a caller that holds the workspace's
 // set-up lock.
-func (c *Component) runSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool) error {
+func (c *Component) runSetup(ctx context.Context, w workspace.Workspace, leaveBranch bool, opLimit time.Duration) error {
 	var cp CopyWriter
 	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(w.Slug))
 	if err != nil {
@@ -259,7 +260,28 @@ func (c *Component) runSetup(ctx context.Context, w workspace.Workspace, leaveBr
 	} else {
 		cp = repo
 	}
-	return Setup{Record: c.record(), Upstream: c, Copy: cp, LeaveBranch: leaveBranch}.Run(ctx, w)
+	var upstream UpstreamFetcher = c
+	if opLimit > 0 {
+		upstream = limitedUpstream{c: c, opLimit: opLimit}
+	}
+	return Setup{Record: c.record(), Upstream: upstream, Copy: cp, LeaveBranch: leaveBranch}.Run(ctx, w)
+}
+
+// limitedUpstream is the component's upstream fetch with each of its git
+// operations held to opLimit as well: the set-up a rebuild attempt repeats
+// is part of the attempt, whose every git operation has the attempt's
+// deadline.
+type limitedUpstream struct {
+	c       *Component
+	opLimit time.Duration
+}
+
+func (u limitedUpstream) FetchUpstream(ctx context.Context, w workspace.Workspace) error {
+	return u.c.fetchUpstream(ctx, w, u.opLimit)
+}
+
+func (u limitedUpstream) UpstreamBase(ctx context.Context, w workspace.Workspace) (string, error) {
+	return u.c.UpstreamBase(ctx, w)
 }
 
 // record is the RecordWriter of the component's store.

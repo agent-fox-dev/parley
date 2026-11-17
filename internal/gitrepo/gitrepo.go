@@ -7,7 +7,10 @@
 // configuration, credential stores and keys of the account that runs the
 // hub, with terminal prompts disabled, and is killed with every process it
 // started when its context ends. A credential reaches git only through the
-// environment of the one process that needs it (see Credential).
+// environment of the one process that needs it (see Credential). An
+// operation with a remote reaches it over https or ssh alone: any other URL
+// is refused before git starts, and git is held to those two transports
+// (see CheckTransport).
 //
 // What a git process would cost many times over to read, a git directory's
 // layout, a branch's head, the refs below a prefix and a key of its own
@@ -398,6 +401,13 @@ func (g Git) runInput(ctx context.Context, a access, stdin []byte, args ...strin
 // such as git push --porcelain that reports what it did there also when it
 // exits with an error.
 func (g Git) runOutput(ctx context.Context, a access, stdin []byte, args ...string) (stdout []byte, stderr string, err error) {
+	if a.url != "" {
+		// Before anything starts: a local path or a file URL must not be
+		// read, and a remote helper must not run.
+		if err := CheckTransport(a.url); err != nil {
+			return nil, "", fmt.Errorf("git %s: %w", subcommand(args), err)
+		}
+	}
 	dir, err := privateDir(!a.cred.IsZero())
 	if err != nil {
 		return nil, "", err
@@ -442,10 +452,22 @@ func (g Git) command(ctx context.Context, dir string, a access, args []string) *
 		// caller's GIT_SSH_COMMAND replaces it.
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
 		"LC_ALL=C",
-	}, g.Env...), credentialEnv(dir, a.cred, a.url)...)
+	}, g.Env...), remoteEnv(dir, a)...)
 	cmd.WaitDelay = waitDelay
 	killGroupOnCancel(cmd)
 	return cmd
+}
+
+// remoteEnv is the environment of a git process that contacts the remote
+// at a's URL, nil for one that contacts none: git may use https and ssh
+// alone, whatever a redirect, a remote helper or Env would have it use,
+// and a's credential is handed to it for that remote. It comes after Env,
+// so that a caller cannot widen the transports.
+func remoteEnv(dir string, a access) []string {
+	if a.url == "" {
+		return nil
+	}
+	return append([]string{"GIT_ALLOW_PROTOCOL=" + allowedProtocols}, credentialEnv(dir, a.cred, a.url)...)
 }
 
 // subcommand is the git command args run, for an error's text.
