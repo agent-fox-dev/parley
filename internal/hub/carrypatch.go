@@ -27,6 +27,16 @@ const carryPatchHook = "carry_patch"
 // The workspace service is also what the component tells of each patch
 // branch a sync's origin refresh moved, so that its branch-move observers
 // see those moves as they see the per-branch pass's.
+// The component's controller (PushControl) is registered with the push
+// rules as their carry-patch controller, which decides every update of a
+// carry_patch workspace that the rules before it let through: it refuses
+// the integration branch, holds the patch branches to the workspace's
+// patch settings, and forwards a patch branch to origin, within the
+// component's forward limit of 120 s, before the hub accepts it when
+// origin is the branches' authority. Without it every such update would be
+// refused as internal. The controller reads the record, the settings and
+// the patch list when it decides, through the component, so it serves once
+// the start hook has bound the component.
 // A workspace's delete removes its patches
 // and its remembered-resolution entries (ADR 07). The component is the
 // hub's rebuild enqueuer, through which every source of a rebuild queues
@@ -57,6 +67,8 @@ func composeCarryPatch(c *Composition) {
 	c.AddSchemaStep(carrypatch.RerereSchemaStep)
 	c.workspaces.RegisterPostCloneStep(workspace.ModeCarryPatch, comp.PostClone)
 	c.workspaces.RegisterPatchBranchLookup(comp)
+	c.pushControl = comp.PushControl()
+	c.PushRules().RegisterController(c.pushControl)
 	c.workspaces.RegisterSyncExtension(comp)
 	c.workspaces.RegisterExcludedBranchProvider(comp)
 	c.workspaces.Teardown().RegisterRemover(carrypatch.RemoveWorkspace)
@@ -94,6 +106,13 @@ func composeCarryPatch(c *Composition) {
 // CarryPatch returns the hub's carry-patch component, which serves once its
 // start hook has run.
 func (c *Composition) CarryPatch() *carrypatch.Component { return c.carryPatch }
+
+// PushControl returns the carry-patch controller the hub registered with
+// its push rules, which reads the carry-patch component's store and
+// settings and forwards with it once its start hook has run. A test that
+// counts the controller's decisions registers a wrapper of it with
+// PushRules().RegisterController, which replaces it.
+func (c *Composition) PushControl() *carrypatch.PushControl { return c.pushControl }
 
 // AdjustCarryPatch adds fn to the functions that change the carry-patch
 // component's dependencies after the start hook has built them and before

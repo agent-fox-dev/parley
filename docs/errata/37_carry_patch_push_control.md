@@ -70,3 +70,27 @@ A carry-patch workspace whose record has no `git_url` cannot be forwarded
 to. The package names no reason for it, so the forward fails with the
 reason for any other failure, `origin rejected push: push failed`, without
 reading the credential or running git.
+
+## A caller without the owner exemption is the owner with a bound PAT
+
+The package's check of a protected patch branch pushes as "an org member
+with write access and a PAT carrying git:write". On a repository workspace
+there is no such member: the access rule gives an org member read-only
+access, and members contribute through task forks (a member's push is
+`403` before any push rule runs). The callers that can write a repository
+workspace and still lack the owner exemption are the owner with a PAT
+bound to the workspace or limited to paths (package 18's exemption covers
+only an unconfined credential of the owner or the admin token), and the
+owner while `protect.owner_push` is false. The test pushes the member rows
+as the owner with a PAT bound to the workspace, which the protected-branch
+rule refuses with the same messages before the controller is asked.
+
+## The hub keeps the controller it registers
+
+`Composition.PushControl()` returns the carry-patch controller the hub
+registered with its push rules. The engine has no getter for its
+controller, and a test that counts the controller's decisions must wrap the
+one the hub registered, not one of its own, or it would pass whether the
+hub registers one or not. A test wraps it from `hubtest.Config.Compose`,
+which runs after the hub's parts, and registers the wrapper with
+`PushRules().RegisterController`, which replaces it.

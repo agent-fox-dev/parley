@@ -260,7 +260,28 @@ func (o *Origin) Reject(message string) {
 		}
 		return
 	}
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' " + shellQuote(message) + " >&2\nexit 1\n"
+	o.writeHook(hook, "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' "+shellQuote(message)+" >&2\nexit 1\n")
+}
+
+// RejectRef makes the origin's server-side hook refuse every push that
+// updates ref, a full ref name such as refs/heads/patch/b, writing message,
+// which the pushing git shows as origin's remote: lines, and take every
+// other push. It replaces what Reject or an earlier RejectRef set; ""
+// makes the origin take every push again.
+func (o *Origin) RejectRef(ref, message string) {
+	o.t.Helper()
+	hook := filepath.Join(o.dir, "hooks", "pre-receive")
+	if message == "" {
+		o.Reject("")
+		return
+	}
+	o.writeHook(hook, "#!/bin/sh\nrefuse=\nwhile read -r old new ref; do\n\t[ \"$ref\" = "+shellQuote(ref)+" ] && refuse=1\ndone\n"+
+		"[ -z \"$refuse\" ] && exit 0\nprintf '%s\\n' "+shellQuote(message)+" >&2\nexit 1\n")
+}
+
+// writeHook writes the executable hook script.
+func (o *Origin) writeHook(hook, script string) {
+	o.t.Helper()
 	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
 		o.t.Fatalf("origin: %v", err)
 	}
