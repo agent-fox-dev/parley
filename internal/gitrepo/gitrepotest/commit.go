@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Tree writes into the repository whose git directory is dir the tree of
@@ -42,11 +43,15 @@ func Tree(t testing.TB, dir, parent string, files map[string]string) string {
 // with the message msg and the parents given, the first parent first (none
 // for a root commit), whose tree is the first parent's with the files, at
 // the top level, holding the content given, and returns its id. It writes
-// no ref. It writes the commit in one run of git fast-import rather than
-// one git process per object: a test process that starts git pays for every
-// process it forks.
+// no ref. A test process pays for every process it forks, so it writes the
+// commit's objects itself, as loose objects, where it can (see
+// writeCommit), and otherwise in one run of git fast-import rather than one
+// git process per object.
 func Commit(t testing.TB, dir, msg string, files map[string]string, parents ...string) string {
 	t.Helper()
+	if id, ok := writeCommit(dir, msg, files, parents, time.Now()); ok {
+		return id
+	}
 	// fast-import commits on a branch; the reset at the end leaves the ref
 	// unwritten, so the name only has to be one no test reads.
 	const scratch = "refs/gitrepotest/commit"
