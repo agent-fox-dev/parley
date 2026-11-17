@@ -291,8 +291,10 @@ func TestOverlaps_LeaveOpeningAChangeOnClaimedPathsUnaffected(t *testing.T) {
 	// index it and, with claimed, has the admin claim api/a.go, then opens
 	// a change from feat, which sets api/a.go. It returns the answer to
 	// that open and feat as a read gives it after the next pass, which
-	// indexes it, each with the author's id, which is the hub's own owner,
-	// as "owner".
+	// indexes it, once the background mergeability check of feat has
+	// decided its mergeable, each with the author's id, which is the hub's
+	// own owner, as "owner". The read waits for that check so that the two
+	// hubs are compared at the same point of it, wherever load has put it.
 	opening := func(otherFile string, claimed bool) (h *changeHub, number int64, opened, read map[string]any) {
 		h = newChangeHubWith(t, (&clock{now: at}).Now, nil)
 		h.open(t, "other", map[string]string{otherFile: "other\n"})
@@ -312,9 +314,18 @@ func TestOverlaps_LeaveOpeningAChangeOnClaimedPathsUnaffected(t *testing.T) {
 		if err := h.comp.Pass(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		status, raw := h.Call(t, http.MethodGet, fmt.Sprintf("/api/v1/workspaces/demo/changes/%d", number), h.key, nil)
-		if status != http.StatusOK || json.Unmarshal(raw, &read) != nil {
-			t.Fatalf("GET change %d = %d %s, want 200 with the change", number, status, raw)
+		for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			read = nil
+			status, raw := h.Call(t, http.MethodGet, fmt.Sprintf("/api/v1/workspaces/demo/changes/%d", number), h.key, nil)
+			if status != http.StatusOK || json.Unmarshal(raw, &read) != nil {
+				t.Fatalf("GET change %d = %d %s, want 200 with the change", number, status, raw)
+			}
+			if read["mergeable"] != "unknown" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("change %d still has mergeable unknown after 30 s, want its check decided", number)
+			}
 		}
 		for _, ch := range []map[string]any{opened, read} {
 			author, _ := ch["author"].(map[string]any)
