@@ -63,7 +63,8 @@ func Route(kind RouteKind, rt server.Route) server.Route {
 // route that creates, so that the server answers a repeated
 // Idempotency-Key with the first answer, and the write routes that
 // maintain the list and reset a patch's branch to origin; then the routes
-// of the rebuild jobs and those of the remembered resolutions.
+// of the rebuild jobs, those of the remembered resolutions and the patch
+// status.
 func (c *Component) Routes() []server.Route {
 	return append([]server.Route{
 		Route(ReadRoute, server.Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/patches", Handler: c.listRoute}),
@@ -76,5 +77,5 @@ func (c *Component) Routes() []server.Route {
 		// The router prefers a literal segment to a parameter, so reorder is
 		// never taken for the id of a patch.
 		Route(WriteRoute, server.Route{Method: http.MethodPost, Pattern: "/workspaces/:slug/patches/reorder", Handler: c.reorderRoute}),
-	}, slices.Concat(c.rebuildRoutes(), c.rerereRoutes())...)
+	}, slices.Concat(c.rebuildRoutes(), c.rerereRoutes(), c.patchStatusRoutes())...)
 }
