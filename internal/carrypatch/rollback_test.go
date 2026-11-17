@@ -125,7 +125,7 @@ func TestRollback_CreatesMissingIntegrationBranch(t *testing.T) {
 	t.Parallel()
 	h := startRebuildHub(t)
 	c := h.rollbackCarry(t, "my-fork")
-	gitrepotest.Git(t, c.dir, "update-ref", "refs/heads/keep", c.h2)
+	gitrepotest.SetRef(t, c.dir, "refs/heads/keep", c.h2)
 	gitrepotest.Git(t, c.dir, "update-ref", "-d", "refs/heads/deploy")
 
 	a := h.rollback(t, h.key, c.slug, c.j2)
@@ -143,7 +143,7 @@ func TestRollback_CreatesMissingIntegrationBranch(t *testing.T) {
 	// created: 409 conflict, and nothing changes.
 	blocked := h.rollbackCarry(t, "blocked-fork")
 	gitrepotest.Git(t, blocked.dir, "update-ref", "-d", "refs/heads/deploy")
-	gitrepotest.Git(t, blocked.dir, "update-ref", "refs/heads/deploy/next", blocked.h2)
+	gitrepotest.SetRef(t, blocked.dir, "refs/heads/deploy/next", blocked.h2)
 	if a := h.rollback(t, h.key, blocked.slug, blocked.j2); a.status != http.StatusConflict || a.Error.ErrorType != "conflict" {
 		t.Errorf("rollback with refs/heads/deploy/next in the way = %d %s, want 409 conflict", a.status, a.raw)
 	}
@@ -160,7 +160,7 @@ func TestRollback_ChangesIntegrationBranchOnly(t *testing.T) {
 	h := startRebuildHub(t)
 	origin := t.TempDir()
 	gitrepotest.InitBare(t, origin, "")
-	gitrepotest.Git(t, origin, "update-ref", "refs/heads/deploy", gitrepotest.Commit(t, origin, "origin's deploy", map[string]string{"o.txt": "o\n"}))
+	gitrepotest.SetRef(t, origin, "refs/heads/deploy", gitrepotest.Commit(t, origin, "origin's deploy", map[string]string{"o.txt": "o\n"}))
 	const slug = "my-fork"
 	h.add(t, slug, workspace.ModeCarryPatch, workspace.StatusReady, workspace.MarkerNone, func(w *workspace.Workspace) {
 		w.IntegrationBranch, w.GitURL = new("deploy"), &origin
@@ -174,9 +174,9 @@ func TestRollback_ChangesIntegrationBranchOnly(t *testing.T) {
 	h.put(t, a, b, deletedPatch(slug, "c", at(10, 0)))
 	c := h.rollbackCase(t, slug)
 	for _, branch := range []string{"a", "b", "c"} {
-		gitrepotest.Git(t, c.dir, "update-ref", "refs/heads/"+branch, gitrepotest.Commit(t, c.dir, branch, map[string]string{branch + ".txt": branch + "\n"}, c.h1))
+		gitrepotest.SetRef(t, c.dir, "refs/heads/"+branch, gitrepotest.Commit(t, c.dir, branch, map[string]string{branch + ".txt": branch + "\n"}, c.h1))
 	}
-	gitrepotest.Git(t, c.dir, "update-ref", carrypatch.ReplacedRefPrefix+"a", gitrepotest.Commit(t, c.dir, "replaced a", nil, c.h1))
+	gitrepotest.SetRef(t, c.dir, carrypatch.ReplacedRefPrefix+"a", gitrepotest.Commit(t, c.dir, "replaced a", nil, c.h1))
 
 	type held struct {
 		Refs, OriginRefs string

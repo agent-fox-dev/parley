@@ -161,7 +161,7 @@ func TestRebuild_LearnsAResolutionFromAMergeOnThePatchBranch(t *testing.T) {
 	// The developer merges the upstream into the patch branch and resolves.
 	m := commitAs(t, f.copy, "Merge upstream", "Dev <dev@example.invalid> 1500000000 +0000",
 		map[string]string{"a.txt": resolvedA, "b.txt": "1\n2\n3 upstream\n"}, c, u2)
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/p1", m)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/p1", m)
 	f.advance(time.Minute)
 	learnedAt := f.clock()
 
@@ -184,7 +184,7 @@ func TestRebuild_LearnsAResolutionFromAMergeOnThePatchBranch(t *testing.T) {
 	}
 
 	// Without the merge commit, the resolution stays learned.
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/p1", c)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/p1", c)
 	f.moveUpstream(t, "U4", map[string]string{"c.txt": "c\n"})
 	out, id = f.attemptWith(t, continueRebase, nil)
 	if out.Kind != attemptCompleted {

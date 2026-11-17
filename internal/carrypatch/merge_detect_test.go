@@ -20,7 +20,7 @@ func TestMergeDetection_Trigger(t *testing.T) {
 	f.mustSync(t)
 	// The hub moves patch/a onto the upstream base, which then holds it;
 	// neither upstream nor a refresh moved anything.
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/patch/a", f.base)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/patch/a", f.base)
 	r1 := f.mustSync(t)
 	wantMerged(t, r1)
 	if got := f.stored(t, a.ID).Status; got != carrypatch.StatusActive {

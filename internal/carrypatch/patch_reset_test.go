@@ -52,7 +52,7 @@ func commitOn(t *testing.T, dir, parent, msg string) string {
 func (rc *resetCase) diverge(t *testing.T) string {
 	t.Helper()
 	hub := commitOn(t, rc.copy, refIn(rc.copy, headA), "on the hub")
-	gitrepotest.Git(t, rc.copy, "update-ref", headA, hub)
+	gitrepotest.SetRef(t, rc.copy, headA, hub)
 	rc.origin.Commit("patch/a", "on origin")
 	return hub
 }
@@ -83,7 +83,7 @@ var resetStates = []resetState{
 	}, "fast_forwarded", ""},
 	{"both sides have a commit the other lacks", func(t *testing.T, rc *resetCase) { rc.diverge(t) }, "replaced", "old"},
 	{"the hub is ahead of origin by 1 commit", func(t *testing.T, rc *resetCase) {
-		gitrepotest.Git(t, rc.copy, "update-ref", headA, commitOn(t, rc.copy, refIn(rc.copy, headA), "on the hub"))
+		gitrepotest.SetRef(t, rc.copy, headA, commitOn(t, rc.copy, refIn(rc.copy, headA), "on the hub"))
 	}, "replaced", "old"},
 	{"diverged with an earlier backup ref", func(t *testing.T, rc *resetCase) {
 		rootsAt(t, rc.copy, map[string]string{backupA: "K"})

@@ -401,7 +401,7 @@ func TestSync_DeletedPatchBranchIsOrdinary(t *testing.T) {
 	t.Parallel()
 	f := startSyncFixture(t)
 	gone := gitrepotest.Commit(t, f.copy, "G1", map[string]string{"gone.txt": "1\n"}, f.base)
-	gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/patch/gone", gone)
+	gitrepotest.SetRef(t, f.copy, "refs/heads/patch/gone", gone)
 	f.put(t, deletedPatch(f.slug, "patch/gone", f.clock()))
 	theirs := f.originAhead(t, "patch/gone", "origin")
 

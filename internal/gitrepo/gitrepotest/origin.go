@@ -168,7 +168,7 @@ func (o *Origin) Commit(branch, msg string) string {
 func (o *Origin) Branch(branch, ref string) string {
 	o.t.Helper()
 	id := o.git("", "rev-parse", "--verify", ref+"^{commit}")
-	o.git("", "update-ref", "refs/heads/"+branch, id)
+	SetRef(o.t, o.dir, "refs/heads/"+branch, id)
 	o.Publish()
 	return id
 }

@@ -66,3 +66,46 @@ func TestRefs_ReadWhatForEachRefLists(t *testing.T) {
 		}
 	}
 }
+
+func TestSetRef_LeavesTheRefsUpdateRefLeaves(t *testing.T) {
+	t.Parallel()
+	// Each case runs SetRef in one repository and git update-ref in a
+	// clone of it made before, and compares what for-each-ref lists.
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+		ref   string
+		to    func(one, two string) string
+	}{
+		{"a new branch", func(*testing.T, string) {}, "refs/heads/new", func(one, _ string) string { return one }},
+		{"a new ref in a new directory", func(*testing.T, string) {}, "refs/parley/replaced/x/y", func(_, two string) string { return two }},
+		{"a loose branch moved", func(*testing.T, string) {}, "refs/heads/main", func(one, _ string) string { return one }},
+		{"a packed branch moved", func(t *testing.T, dir string) { gitrepotest.Git(t, dir, "pack-refs", "--all") },
+			"refs/heads/feature/x", func(_, two string) string { return two }},
+		{"through a symbolic ref", func(t *testing.T, dir string) {
+			gitrepotest.Git(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+		}, "refs/remotes/origin/HEAD", func(_, two string) string { return two }},
+		{"by a ref name", func(*testing.T, string) {}, "refs/heads/copy", func(string, string) string { return "refs/heads/main" }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := filepath.Join(t.TempDir(), "got.git")
+			gitrepotest.InitBare(t, got, "main")
+			one := gitrepotest.Commit(t, got, "one", map[string]string{"a": "1\n"})
+			two := gitrepotest.Commit(t, got, "two", map[string]string{"a": "2\n"}, one)
+			gitrepotest.Git(t, got, "update-ref", "refs/heads/main", two)
+			gitrepotest.Git(t, got, "update-ref", "refs/heads/feature/x", one)
+			gitrepotest.Git(t, got, "update-ref", "refs/remotes/origin/main", one)
+			c.setup(t, got)
+			want := filepath.Join(t.TempDir(), "want.git")
+			gitrepotest.Git(t, got, "clone", "--quiet", "--mirror", got, want)
+			c.setup(t, want)
+
+			gitrepotest.SetRef(t, got, c.ref, c.to(one, two))
+			gitrepotest.Git(t, want, "update-ref", c.ref, c.to(one, two))
+			if g, w := forEachRef(t, got, ""), forEachRef(t, want, ""); !maps.Equal(g, w) {
+				t.Errorf("after SetRef %s the refs are %v, want %v", c.ref, g, w)
+			}
+		})
+	}
+}

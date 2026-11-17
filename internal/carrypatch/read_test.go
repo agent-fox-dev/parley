@@ -282,7 +282,7 @@ func TestGet_ReturnsAnyPatch(t *testing.T) {
 	}
 	for _, b := range []string{"p2", "d1"} {
 		r := gitrepotest.Git(t, copyDir, "commit-tree", tree, "-m", "replaced "+b)
-		gitrepotest.Git(t, copyDir, "update-ref", "refs/parley/replaced/"+b, r)
+		gitrepotest.SetRef(t, copyDir, "refs/parley/replaced/"+b, r)
 		a := h.get(t, "/workspaces/carry/patches/"+ps[b].ID)
 		if got, _ := a.patch["replaced_sha"].(string); a.status != http.StatusOK || got != r || len(got) != 40 {
 			t.Errorf("GET the patch %s with a backup ref at %s = %d %s, want replaced_sha %s", b, r, a.status, a.raw, r)

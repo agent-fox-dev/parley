@@ -862,7 +862,7 @@ func (h *rebuildHub) rollbackRepo(t *testing.T, slug string) (dir, h1, h2 string
 	gitrepotest.InitBare(t, dir, "")
 	h1 = gitrepotest.Commit(t, dir, "H1", map[string]string{"a.txt": "1\n"})
 	h2 = gitrepotest.Commit(t, dir, "H2", map[string]string{"a.txt": "2\n"}, h1)
-	gitrepotest.Git(t, dir, "update-ref", "refs/heads/deploy", h2)
+	gitrepotest.SetRef(t, dir, "refs/heads/deploy", h2)
 	return dir, h1, h2
 }
 
@@ -1541,7 +1541,7 @@ func (f *syncFixture) originAhead(t *testing.T, branch, label string) string {
 	tip := refIn(f.copy, "refs/heads/"+branch)
 	if tip == "" {
 		tip = f.base
-		gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/"+branch, tip)
+		gitrepotest.SetRef(t, f.copy, "refs/heads/"+branch, tip)
 	}
 	file := strings.ReplaceAll(branch, "/", "-") + "-" + label + ".txt"
 	id := f.commitOn(t, tip, branch+" "+label, map[string]string{file: label + "\n"})

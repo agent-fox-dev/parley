@@ -33,7 +33,7 @@ func TestRebuild_PublishMovesOnlyTheIntegrationBranch(t *testing.T) {
 			var previous any
 			if tc.exists {
 				h0 := gitrepotest.Commit(t, f.copy, "H0", map[string]string{"h0.txt": "h0\n"}, f.base)
-				gitrepotest.Git(t, f.copy, "update-ref", "refs/heads/deploy", h0)
+				gitrepotest.SetRef(t, f.copy, "refs/heads/deploy", h0)
 				previous = h0
 			} else {
 				gitrepotest.Git(t, f.copy, "update-ref", "-d", "refs/heads/deploy")
