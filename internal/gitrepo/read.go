@@ -558,12 +558,22 @@ func (r *Repo) ResolveRef(ctx context.Context, name string) (string, error) {
 // LookupRef is the ref of the full name name; found is false when no ref
 // has it, or it is a name git would not take for a ref, for which no git
 // runs. A name that begins with '-' is ErrInvalidArgument, and no git runs.
+//
+// It reads the ref (readRef) and the type of its object (readObjectType)
+// in process, and asks git about what it does not read that way and about
+// an annotated tag, which it would have to peel.
 func (r *Repo) LookupRef(ctx context.Context, name string) (ref Ref, found bool, err error) {
 	if err := refuseOption("ref", name); err != nil {
 		return Ref{}, false, err
 	}
 	if !ValidRefName(name) {
 		return Ref{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return Ref{}, false, err
+	}
+	if ref, found, ok := r.readRef(name); ok {
+		return ref, found, nil
 	}
 	// for-each-ref takes the name as a pattern, which also matches the refs
 	// below it; rev-parse would also try other names that end in it.
@@ -572,6 +582,28 @@ func (r *Repo) LookupRef(ctx context.Context, name string) (ref Ref, found bool,
 		return Ref{}, false, err
 	}
 	return refs[0], true, nil
+}
+
+// readRef is LookupRef of a valid name read in process; ok is false for
+// what it leaves to git.
+func (r *Repo) readRef(name string) (ref Ref, found, ok bool) {
+	// for-each-ref lists the refs below refs/ alone.
+	if !strings.HasPrefix(name, "refs/") {
+		return Ref{}, false, false
+	}
+	id, found, ok := readRef(r.dir, name)
+	if !ok || !found {
+		return Ref{}, false, ok
+	}
+	typ, ok := readObjectType(r.dir, id)
+	if !ok || typ == "tag" {
+		return Ref{}, false, false
+	}
+	ref = Ref{Name: name, ID: id}
+	if typ == ObjectCommit {
+		ref.Commit = id
+	}
+	return ref, true, true
 }
 
 // ResolveCommit is the full id of the one commit whose id begins with hex,

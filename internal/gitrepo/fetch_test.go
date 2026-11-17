@@ -5,6 +5,8 @@ import (
 	"errors"
 	"maps"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +60,45 @@ func TestFetchOrigin_RecordsOriginHeads(t *testing.T) {
 	}
 	heads = map[string]string{"main": newer, "dev/next": next, "release/1.x": release}
 	assertRefs(t, "the copy's refs after origin renamed dev", gitrepotest.Refs(t, dir, ""), withOriginHeads(local, heads))
+}
+
+func TestFetchOrigin_RemovesTheFetchedRefsWithoutListingThemThroughGit(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.NewOrigin(t)
+	o.History()
+	var mu sync.Mutex
+	var ran [][]string
+	g := gitrepo.Git{Env: o.Env(), Trace: func(args []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		ran = append(ran, args)
+	}}
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	if err := g.Clone(ctx, o.URL(), gitrepo.Credential{}, dir); err != nil {
+		t.Fatal(err)
+	}
+	head := o.Commit("main", "fourth")
+	mu.Lock()
+	ran = nil
+	mu.Unlock()
+
+	if _, err := g.FetchOrigin(ctx, dir, o.URL(), gitrepo.Credential{}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if got := gitrepotest.Refs(t, dir, "refs/parley/"); len(got) != 0 {
+		t.Errorf("the refs below refs/parley/ after the fetch = %v, want none", got)
+	}
+	if got := gitrepotest.Refs(t, dir, "refs/remotes/origin/")["main"]; got != head {
+		t.Errorf("the origin head of main = %s, want %s", got, head)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, args := range ran {
+		if slices.Contains(args, "for-each-ref") {
+			t.Errorf("FetchOrigin ran git %v, want no git for-each-ref", args)
+		}
+	}
 }
 
 func TestFetchOrigin_StopsAtDeadline(t *testing.T) {

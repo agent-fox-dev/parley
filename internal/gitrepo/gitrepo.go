@@ -220,8 +220,10 @@ func (r *Repo) ResolveBranch(ctx context.Context, branch string) (id string, fou
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
+	// git writes nothing but a commit to a branch, so the id needs no
+	// peeling.
 	ref := "refs/heads/" + branch
-	if id, found, ok := readBranch(r.dir, ref); ok {
+	if id, found, ok := readRef(r.dir, ref); ok {
 		return id, found, nil
 	}
 	return r.resolve(ctx, ref)
@@ -353,6 +355,7 @@ func (r *Repo) refs(ctx context.Context, prefix string) (map[string]string, erro
 		return nil, err
 	}
 	if refs, ok := readRefs(r.dir, prefix); ok {
+		delete(refs, "HEAD")
 		return refs, nil
 	}
 	out, err := r.git(ctx, "for-each-ref", "--format=%(objectname) %(refname)", prefix)
