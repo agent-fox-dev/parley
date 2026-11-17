@@ -53,6 +53,43 @@ func (r *Repo) RerereResolved(id string) (bool, error) {
 	return false, nil
 }
 
+// ForgetRerere removes the conflict id from the repository's rr-cache, with
+// every variant of it and the resolutions git recorded, so that git's
+// rerere has nothing to replay when it meets the conflict again; it would
+// record it anew. Git keeps the variants of one conflict, numbered, in the
+// conflict's own directory. A conflict that is not there is forgotten
+// already. The path removed is built from id only once id is checked to
+// be a conflict id, so no other value names a path of the repository.
+//
+// The directory is first moved aside under a name git's rerere never
+// reads, in one rename, and then removed: a forget cut short leaves
+// either the whole conflict or nothing git would replay, and of two
+// forgets at once one moves it and the other finds it gone.
+func (r *Repo) ForgetRerere(id string) error {
+	if !isHexID(id, idLen) {
+		return fmt.Errorf("forget the remembered resolution %q: not an id", id)
+	}
+	cache := filepath.Join(r.dir, rerereCache)
+	if _, err := os.Stat(cache); os.IsNotExist(err) {
+		return nil
+	}
+	aside, err := os.MkdirTemp(cache, ".forget-")
+	if err != nil {
+		return fmt.Errorf("forget the remembered resolution %s: %w", id, err)
+	}
+	err = os.Rename(filepath.Join(cache, strings.ToLower(id)), filepath.Join(aside, "conflict"))
+	if os.IsNotExist(err) {
+		err = nil
+	}
+	if err != nil {
+		err = fmt.Errorf("forget the remembered resolution %s: %w", id, err)
+	}
+	if rerr := os.RemoveAll(aside); rerr != nil {
+		err = errors.Join(err, fmt.Errorf("forget the remembered resolution %s: %w", id, rerr))
+	}
+	return err
+}
+
 // Learn redoes, in the scratch working tree, the merge commit of the full
 // id merge, which has two parents, with rerere on, so that git records how
 // the commit resolved what conflicted: it checks out the first parent and

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -58,9 +59,11 @@ type mirrorCase struct {
 
 // caseOptions are what a mirror test changes of its case: whether
 // auto_rebuild_after_push is off, the forward limit of its component (0 for
-// the default), and whether git_url names origin's directory rather than
+// the default), and whether git_url reaches origin's directory through an
+// ssh that runs the remote's command on this machine rather than through
 // its served URL, which spares a case that does not test the transport the
-// TLS and the CGI of every request.
+// TLS and the CGI of every request. A plain path would be refused: the
+// hub contacts a remote over https or ssh only.
 type caseOptions struct {
 	noRebuild bool
 	limit     time.Duration
@@ -97,7 +100,7 @@ func (h *mirrorHub) newCase(t *testing.T, slug string, o caseOptions) *mirrorCas
 	}
 	url := c.origin.URL()
 	if o.local {
-		url = dir
+		url = "git@origin.test:" + dir
 	}
 	settings := map[string]json.RawMessage{"patch_branch_source": json.RawMessage(`"hub"`), "push_patches_to_origin": json.RawMessage(`true`),
 		"auto_rebuild_after_push": json.RawMessage(fmt.Sprint(!o.noRebuild))}
@@ -108,10 +111,27 @@ func (h *mirrorHub) newCase(t *testing.T, slug string, o caseOptions) *mirrorCas
 	h.put(t, c.patches["patch/a"], c.patches["patch/b"])
 	deps := h.deps
 	deps.ForwardLimit = o.limit
+	if o.local {
+		deps.Git.Env = append(slices.Clone(deps.Git.Env), localSSH(t)...)
+	}
 	c.comp = &carrypatch.Component{}
 	c.comp.Bind(deps)
 	c.comp.RegisterRebuildEnqueuer(c.rebuilds)
 	return c
+}
+
+// localSSH is the environment of a git whose ssh runs the remote's
+// command, git-receive-pack or git-upload-pack of a directory, on this
+// machine, as a push to the directory's path would, without the
+// repository variables of the git that started it.
+func localSSH(t *testing.T) []string {
+	t.Helper()
+	ssh := filepath.Join(t.TempDir(), "ssh")
+	script := "#!/bin/sh\nfor cmd; do :; done\nunset $(git rev-parse --local-env-vars)\nexec sh -c \"$cmd\"\n"
+	if err := os.WriteFile(ssh, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return []string{"GIT_SSH_COMMAND=" + ssh, "GIT_SSH_VARIANT=simple"}
 }
 
 // trigger runs the component's trigger for updates, as a push's.

@@ -56,7 +56,10 @@ var RerereSchemaStep = store.Step{
 
 // RerereEntries lists the remembered-resolution entries of the workspace
 // slug, oldest first, each with Resolved read from the workspace's
-// repository.
+// repository. An entry git cannot answer for, because there is no copy or
+// its rr-cache cannot be read, is listed unresolved rather than failing the
+// list: the stored entry is the record, and whether git would replay a
+// resolution is what the copy says.
 func (c *Component) RerereEntries(ctx context.Context, slug string) ([]RerereEntry, error) {
 	if c.d.Store == nil {
 		return nil, errNotBound
@@ -83,14 +86,16 @@ func (c *Component) RerereEntries(ctx context.Context, slug string) ([]RerereEnt
 	if len(entries) == 0 {
 		return entries, nil
 	}
+	if c.d.RepoPath == nil {
+		return entries, nil
+	}
 	repo, err := c.d.Git.Open(ctx, c.d.RepoPath(slug))
 	if err != nil {
-		return nil, fmt.Errorf("list the remembered resolutions of %s: %w", slug, err)
+		return entries, nil
 	}
 	for i := range entries {
-		if entries[i].Resolved, err = repo.RerereResolved(entries[i].ID); err != nil {
-			return nil, fmt.Errorf("list the remembered resolutions of %s: %w", slug, err)
-		}
+		resolved, err := repo.RerereResolved(entries[i].ID)
+		entries[i].Resolved = err == nil && resolved
 	}
 	return entries, nil
 }

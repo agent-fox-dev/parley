@@ -32,6 +32,12 @@ type Route struct {
 	// optionally a last segment *name, a catch-all parameter that takes one
 	// or more remaining segments, such as /refs/*name for refs/heads/main.
 	Pattern string
+	// EmptyCatchAll lets the pattern's catch-all parameter take an empty
+	// remainder too: the path that ends in a slash where the parameter
+	// begins matches, with the parameter "", so that the handler answers
+	// it, as it answers a remainder it refuses. A remainder that is not
+	// empty still takes segments that are not empty.
+	EmptyCatchAll bool
 	// Handler serves the request once every check has passed.
 	Handler HandlerFunc
 
@@ -131,14 +137,18 @@ type apiRoute struct {
 // matches reports whether the route's pattern matches the unescaped path
 // segments: every literal segment equal, every parameter a segment that is
 // not empty, and a catch-all parameter one or more segments that are not
-// empty.
+// empty, or, for a route with EmptyCatchAll, one empty segment.
 func (a *apiRoute) matches(path []string) bool {
 	n := len(a.segments)
 	if catchAll := n > 0 && isCatchAll(a.segments[n-1]); catchAll && len(path) < n || !catchAll && len(path) != n {
 		return false
 	}
+	emptyRest := a.route.EmptyCatchAll && len(path) == n && path[n-1] == ""
 	for i, p := range path {
 		seg := a.segments[min(i, n-1)]
+		if isCatchAll(seg) && emptyRest {
+			continue
+		}
 		if isParam(seg) || isCatchAll(seg) {
 			if p == "" {
 				return false

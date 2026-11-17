@@ -119,9 +119,10 @@ func newWorkspaceCommand() *cobra.Command {
 		Args:        []argSpec{slugArg},
 		Auth:        authUser,
 	})
-	return group("workspace", "Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub",
+	return group("workspace", "Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub, and show a carry-patch workspace's patch status",
 		create, list, get, newWorkspaceUpdateCommand(), newWorkspaceSyncCommand(), newWorkspacePushCommand(),
-		newWorkspaceArchiveCommand(), newWorkspaceReactivateCommand(), newWorkspaceRecloneCommand(), newWorkspaceDeleteCommand())
+		newWorkspaceArchiveCommand(), newWorkspaceReactivateCommand(), newWorkspaceRecloneCommand(), newWorkspaceDeleteCommand(),
+		newWorkspacePatchStatusCommand())
 }
 
 // safetyCopyRequestTimeout bounds the requests of parley workspace archive

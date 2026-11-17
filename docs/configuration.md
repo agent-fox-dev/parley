@@ -350,7 +350,13 @@ certificate a private authority signed needs `GIT_SSL_CAINFO` (or
 needs the proxy variables. They are read once, when `parleyd` starts. The
 `ssh` of a `git@` origin runs in batch mode (`GIT_SSH_COMMAND=ssh -o
 BatchMode=yes`), so a call that would need a password or a host key answer
-fails rather than waits.
+fails rather than waits. A `git` process that contacts a remote (origin or a
+carry-patch workspace's upstream) runs with `GIT_ALLOW_PROTOCOL=https:ssh`,
+set after every variable above so that none widens it: a redirect or a
+remote helper cannot take `git` to another transport. A remote whose URL is
+not `https://`, `ssh://` or `[user@]host:path` (`http://`, `git://`,
+`file://`, a local path, `<helper>::<address>`) is refused before `git`
+starts.
 
 ### Fixed values
 

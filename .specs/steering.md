@@ -110,7 +110,8 @@ grepping for declarations.
   `hubtest.StartWith` does the same with a `hubtest.Config` (`Server`
   inside `[server]`, `TOML` after it, `Files` in the config dir, `Env`
   added to the hub's environment, `Compose` on the composition, `Now` the
-  hub's clock), `hubtest.Serve` runs a hub
+  hub's clock, `MaintenanceInterval` the time between maintenance
+  passes), `hubtest.Serve` runs a hub
   with the options a test gives until the test ends (its `Served` has
   `URL(path)` and `Call(t, method, path, credential, body)`, which sends a
   request with a bearer credential and returns the answer's status and

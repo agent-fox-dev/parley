@@ -44,6 +44,13 @@ var ErrNoUpstreamBase = errors.New("no upstream base: the copy holds no upstream
 // the default branch is asked for first, and the refs and the record
 // change only after both git operations with the upstream succeeded.
 func (c *Component) FetchUpstream(ctx context.Context, w workspace.Workspace) error {
+	return c.fetchUpstream(ctx, w, 0)
+}
+
+// fetchUpstream is FetchUpstream with each of its git operations held to
+// opLimit as well, when it is positive and shorter than what is left of
+// the whole fetch's deadline.
+func (c *Component) fetchUpstream(ctx context.Context, w workspace.Workspace, opLimit time.Duration) error {
 	limit := gitDeadline(c.d.UpstreamFetchDeadline)
 	end := time.Now().Add(limit)
 	run := func(cred gitrepo.Credential, op func(ctx context.Context, deadline time.Duration) error) error {
@@ -51,10 +58,15 @@ func (c *Component) FetchUpstream(ctx context.Context, w workspace.Workspace) er
 		if left <= 0 {
 			return fmt.Errorf("%w (%v)", ErrGitTimeout, limit)
 		}
+		// RunGit names the time that was left; the error names the limit
+		// that cut the operation off.
+		applied := limit
+		if opLimit > 0 && opLimit < left {
+			left, applied = opLimit, opLimit
+		}
 		err := RunGit(ctx, left, cred, op)
 		if errors.Is(err, ErrGitTimeout) {
-			// RunGit names the time that was left; the caller set limit.
-			return fmt.Errorf("%w (%v)", ErrGitTimeout, limit)
+			return fmt.Errorf("%w (%v)", ErrGitTimeout, applied)
 		}
 		return err
 	}

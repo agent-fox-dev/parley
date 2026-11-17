@@ -107,6 +107,28 @@ type Deps struct {
 	// DefaultGitDeadline as the deadline of each git operation of a rebuild
 	// attempt; only tests set it.
 	RebuildGitDeadline time.Duration
+	// BeforeRebuildGit, when set, is called by an attempt of the rebuild
+	// job at the start of each of its git operations, within the
+	// operation's deadline, with the operation's context; only tests set
+	// it, to make every operation take longer.
+	BeforeRebuildGit func(ctx context.Context)
+	// BeforePurgePatch, when set, is called by the purge of deleted patches
+	// with the workspace and the id of each patch it selected as due, before
+	// it removes that patch, outside any store transaction; only tests set
+	// it, to restore the patch in between as a restore would.
+	BeforePurgePatch func(slug, id string)
+	// AfterPurgeRef, when set, is called by the purge of deleted patches
+	// with the workspace and the id of a patch whose backup ref it deleted,
+	// inside the patch's store transaction, which an error it returns
+	// rolls back; only tests set it, to make the transaction fail after the
+	// deletion.
+	AfterPurgeRef func(slug, id string) error
+	// BeforeRerereForgetRecord, when set, is called by a forget of
+	// remembered resolutions with the workspace and the id of each entry
+	// after git's record of the entries is removed and before the store
+	// transaction removes them; only tests set it, to learn the resolution
+	// again in between as a running rebuild would.
+	BeforeRerereForgetRecord func(slug, id string)
 	// ForwardLimit, when positive and shorter, replaces DefaultForwardLimit
 	// as the limit of a forward of a patch branch to origin; only tests set
 	// it.

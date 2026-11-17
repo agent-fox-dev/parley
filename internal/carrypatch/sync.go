@@ -39,7 +39,7 @@ func (c *Component) AfterFetch(ctx context.Context, run workspace.SyncRun) error
 		return err
 	}
 	defer unlock()
-	if err := c.runSetup(ctx, w, true); err != nil {
+	if err := c.runSetup(ctx, w, true, 0); err != nil {
 		if fetchErr := upstreamFetchFailure(err); fetchErr != nil {
 			return fetchErr
 		}

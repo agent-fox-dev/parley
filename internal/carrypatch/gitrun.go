@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // DefaultGitDeadline is the deadline of every git operation of carry-patch
@@ -37,6 +38,9 @@ func (gitTimeout) Is(target error) bool { return target == gitrepo.ErrDeadline }
 //     deadline too, for a gitrepo operation that takes one. The error of an
 //     operation cut off by it matches ErrGitTimeout; one cut off by ctx
 //     wraps ctx's error instead.
+//   - An operation with a remote reaches it over https or ssh alone:
+//     internal/gitrepo refuses any other transport before git starts and
+//     holds git to those two, a redirect included (gitrepo.CheckTransport).
 //   - The text of any other error is cleaned with gitrepo.SanitizeGitText:
 //     a URL's user information reads ***@ and the user name and password of
 //     cred, the credential the operation presents, are removed. The error
@@ -75,3 +79,19 @@ type cleanedError struct {
 func (e *cleanedError) Error() string { return e.text }
 
 func (e *cleanedError) Unwrap() error { return e.err }
+
+// gitTimeoutMessage is the message of the answer to a request whose git
+// operation did not finish within its deadline.
+const gitTimeoutMessage = "a git operation did not finish within its time limit"
+
+// RequestError is what a carry-patch request handler answers for err, the
+// error of git work it ran through RunGit: 500 internal saying the time
+// limit passed for an operation RunGit cut off, err itself otherwise (an
+// API error as it is, anything else 500 internal), so that no text of
+// git's, which may name a credential, reaches the caller. nil is nil.
+func RequestError(err error) error {
+	if err != nil && errors.Is(err, ErrGitTimeout) {
+		return server.Internal(gitTimeoutMessage)
+	}
+	return err
+}

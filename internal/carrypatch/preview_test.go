@@ -399,11 +399,7 @@ func (h *rebuildHub) previewState(t *testing.T, slug string) previewState {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := previewState{Refs: gitrepotest.Git(t, h.repoPath(slug), "for-each-ref"), Patches: append(live, deleted...), Jobs: h.jobsOf(t, slug)}
-	if err := h.Store.Main().QueryRowContext(ctx, `SELECT count(*) FROM hub_events`).Scan(&s.Events); err != nil {
-		t.Fatal(err)
-	}
-	return s
+	return previewState{Refs: gitrepotest.Git(t, h.repoPath(slug), "for-each-ref"), Patches: append(live, deleted...), Jobs: h.jobsOf(t, slug), Events: h.eventCount(t)}
 }
 
 // leftAsItWas fails the test when the preview state of slug differs from

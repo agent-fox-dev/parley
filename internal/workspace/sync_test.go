@@ -539,8 +539,9 @@ func TestSync_FetchFailureChangesNothingButTheScrubbedSyncError(t *testing.T) {
 		name, url, fault, cause string
 		fetchErr                error
 	}{
-		{name: "the origin path does not exist", url: filepath.Join(t.TempDir(), "gone.git"),
-			cause: "does not appear to be a git repository"},
+		// A local path, which no fetch reads: git is not started for it.
+		{name: "origin is a local path", url: filepath.Join(t.TempDir(), "gone.git"),
+			cause: `transport refused: the remote's transport is "file"`},
 		{name: "origin answers 401 to the credential", url: s.origin.URL(), cause: "Authentication failed"},
 		{name: "origin closes the connection", url: "https://" + closing.Addr().String() + "/r.git",
 			cause: closing.Addr().String()},

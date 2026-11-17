@@ -537,11 +537,14 @@ func (r *Repo) ListRefs(ctx context.Context, prefixes ...string) ([]Ref, error) 
 
 // ResolveRef is the commit the ref of the full name name reaches through
 // annotated tags. A name git would not take for a ref, or that no ref has,
-// is ErrNotFound and runs no git for a name of the first kind; a ref that
-// reaches no commit is ErrNotCommit.
+// is ErrNotFound and runs no git for a name of the first kind (one that
+// begins with '-' is ErrInvalidArgument as well); a ref that reaches no
+// commit is ErrNotCommit.
 func (r *Repo) ResolveRef(ctx context.Context, name string) (string, error) {
 	ref, found, err := r.LookupRef(ctx, name)
 	switch {
+	case errors.Is(err, ErrInvalidArgument):
+		return "", fmt.Errorf("ref %q: %w: %w", name, ErrNotFound, err)
 	case err != nil:
 		return "", err
 	case !found:
@@ -554,8 +557,11 @@ func (r *Repo) ResolveRef(ctx context.Context, name string) (string, error) {
 
 // LookupRef is the ref of the full name name; found is false when no ref
 // has it, or it is a name git would not take for a ref, for which no git
-// runs.
+// runs. A name that begins with '-' is ErrInvalidArgument, and no git runs.
 func (r *Repo) LookupRef(ctx context.Context, name string) (ref Ref, found bool, err error) {
+	if err := refuseOption("ref", name); err != nil {
+		return Ref{}, false, err
+	}
 	if !ValidRefName(name) {
 		return Ref{}, false, nil
 	}

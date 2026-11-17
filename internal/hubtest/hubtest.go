@@ -158,6 +158,9 @@ type Config struct {
 	// Env is added to the hub's environment, for the bootstrap and every
 	// run, such as the operator's secret keys; nil for nothing.
 	Env map[string]string
+	// MaintenanceInterval is the time between two maintenance passes of
+	// every run; zero for the hub's hour.
+	MaintenanceInterval time.Duration
 }
 
 // Start bootstraps a hub with an admin token in a fresh data directory,
@@ -204,7 +207,7 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 		t.Fatal(err)
 	}
 	h := &Hub{Token: strings.TrimSpace(string(token)), baseEnv: baseEnv}
-	h.opts = hub.Options{Env: env, WorkDir: dir, Now: cfg.Now, Compose: func(c *hub.Composition) {
+	h.opts = hub.Options{Env: env, WorkDir: dir, Now: cfg.Now, MaintenanceInterval: cfg.MaintenanceInterval, Compose: func(c *hub.Composition) {
 		c.AddStartHook("test-store", func(_ context.Context, rt *hub.Runtime) error {
 			h.Store = rt.Store
 			return nil

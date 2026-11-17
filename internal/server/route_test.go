@@ -162,6 +162,36 @@ func TestRouting_ACatchAllParameterTakesTheRestOfThePath(t *testing.T) {
 	}
 }
 
+func TestRouting_ACatchAllThatMayBeEmptyTakesTheSlashWhereItBegins(t *testing.T) {
+	t.Parallel()
+	var log callLog
+	s := New(Options{})
+	s.SetAuthenticator(log.authenticator(testCaller, nil))
+	s.Register(Route{Method: http.MethodDelete, Pattern: "/w/:slug/notes/*spec", EmptyCatchAll: true, Handler: func(w http.ResponseWriter, r *http.Request) error {
+		WriteJSON(w, http.StatusOK, map[string]any{"spec": Param(r, "spec")})
+		return nil
+	}})
+	h := s.Handler()
+
+	for path, want := range map[string]any{
+		"/api/v1/w/p1/notes/":    "",
+		"/api/v1/w/p1/notes/a/b": "a/b",
+		"/api/v1/w/p1/notes/a/":  nil,
+		"/api/v1/w/p1/notes":     nil,
+	} {
+		rec := do(h, newRequest(http.MethodDelete, path, nil, ""))
+		if want == nil {
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("DELETE %s = %d %s, want 404", path, rec.Code, rec.Body.Bytes())
+			}
+			continue
+		}
+		if rec.Code != http.StatusOK || !reflect.DeepEqual(decodeObject(t, rec.Body.Bytes()), map[string]any{"spec": want}) {
+			t.Errorf("DELETE %s = %d %s, want 200 with the parameter %q", path, rec.Code, rec.Body.Bytes(), want)
+		}
+	}
+}
+
 func TestRouting_AnswersNotFoundForAPathNoRouteMatches(t *testing.T) {
 	t.Parallel()
 	var log callLog
