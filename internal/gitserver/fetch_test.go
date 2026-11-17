@@ -275,6 +275,39 @@ func TestFetch_SendsGitsFirstBytesBeforeGitEnds(t *testing.T) {
 	}
 }
 
+// gitStartedRunner runs upload-pack with the runner it wraps under a
+// context that ends only once the request's context has ended and the
+// fake upload-pack has written its process id to pidFile, so that the
+// test always learns which process the end of the request had to stop,
+// however late git started on a loaded machine. When it ended that
+// context is sent on stopped.
+type gitStartedRunner struct {
+	gitserver.Runner
+	pidFile string
+	stopped chan time.Time
+}
+
+func (g gitStartedRunner) UploadPack(ctx context.Context, req gitrepo.ServeRequest) error {
+	run, stop := context.WithCancel(context.WithoutCancel(ctx))
+	defer stop()
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-run.Done():
+		}
+		for give := time.Now().Add(10 * time.Second); time.Now().Before(give) && run.Err() == nil; time.Sleep(5 * time.Millisecond) {
+			if _, err := os.Stat(g.pidFile); err == nil {
+				break
+			}
+		}
+		if run.Err() == nil {
+			g.stopped <- time.Now()
+			stop()
+		}
+	}()
+	return g.Runner.UploadPack(run, req)
+}
+
 // Not parallel: it puts a fake git first on the PATH of the test process,
 // which sleeps in place of upload-pack, recording its process id, and runs
 // the real git for every other command.
@@ -283,26 +316,35 @@ func TestFetch_EndsARequestThatOutlivesTheTimeoutAndItsGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The timeout leaves room for the want check's git commands, which run
-	// before upload-pack, also on a loaded machine.
 	const timeout = time.Second
-	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
-		c.AdjustGitServer(func(d *gitserver.Deps) { d.Timeout = timeout })
-	}})
 	bin := t.TempDir()
 	pidFile := filepath.Join(bin, "pid")
-	script := "#!/bin/sh\nfor a; do [ \"$a\" = upload-pack ] && { echo $$ > '" + pidFile + "'; exec sleep 30; }; done\nexec '" + realGit + "' \"$@\"\n"
+	stopped := make(chan time.Time, 1)
+	w := newGitWorld(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		c.AdjustGitServer(func(d *gitserver.Deps) {
+			d.Timeout = timeout
+			d.Runner = gitStartedRunner{Runner: d.Runner, pidFile: pidFile, stopped: stopped}
+		})
+	}})
+	// The process id is written whole, by a rename, before the runner can
+	// see the file.
+	script := "#!/bin/sh\nfor a; do [ \"$a\" = upload-pack ] && { echo $$ > '" + pidFile + ".new' && mv '" + pidFile + ".new' '" + pidFile + "'; exec sleep 30; }; done\nexec '" + realGit + "' \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	start := time.Now()
 	a := w.send(t, http.MethodPost, uploadPack, basic("x", w.ownerKey), nil, fetchRequest(w.head))
-	if d := time.Since(start); d > timeout+2*time.Second {
-		t.Errorf("the request ended after %v, want within %v", d, timeout+2*time.Second)
-	}
+	ended := time.Now()
 	if pkts := pktlines(a.body); a.status != http.StatusOK || len(pkts) == 0 || pkts[len(pkts)-1] != "ERR request timed out" {
 		t.Errorf("answer = %d %q, want 200 ending with the pkt-line ERR request timed out", a.status, a.body)
+	}
+	select {
+	case at := <-stopped:
+		if d := ended.Sub(at); d > time.Second {
+			t.Errorf("the request ended %v after its git was told to stop, want within 1s", d)
+		}
+	default:
+		t.Error("the request ended before its git was told to stop")
 	}
 	b, err := os.ReadFile(pidFile)
 	if err != nil {
