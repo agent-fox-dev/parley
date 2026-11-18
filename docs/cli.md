@@ -2737,6 +2737,49 @@ at most 2,147,483,647, is a `usage_error` with exit status `2`, before any
 request. The list commands print the one page the hub answered and take
 `--cursor` to read the next.
 
+The write commands change the forge through the hub's
+[forge writes](api.md#forge-writes), which need a credential with the scope
+`forge:write`. Each sends one request, `<slug>`, `<number>` and a label each
+as one percent-encoded path segment, with a JSON body holding only the
+members whose flags were given and `target` in the query only when
+`--target` was given, and prints the hub's answer. Every write command takes
+`--target <origin|upstream>`. None sends an `Idempotency-Key`.
+
+| Command | Request | Flags |
+|---|---|---|
+| `parley issue create <slug>` | `POST …/issues` | `--title` (required), `--body` or `--body-file`, `--label` (repeatable), `--assignee` (repeatable) |
+| `parley issue update <slug> <number>` | `PATCH …/issues/<number>` | `--title`, `--body` or `--body-file`, `--state`, `--label` (repeatable), `--assignee` (repeatable); at least one |
+| `parley issue close <slug> <number>` | `POST …/issues/<number>/close` | `--comment` |
+| `parley issue comment <slug> <number>` | `POST …/issues/<number>/comments` | `--body` or `--body-file` (one is required) |
+| `parley issue label <slug> <number> <label>...` | `POST …/issues/<number>/labels` | none |
+| `parley issue unlabel <slug> <number> <label>` | `DELETE …/issues/<number>/labels/<label>` | none |
+| `parley label create <slug> <name>` | `POST …/labels` | `--color`, `--description` |
+| `parley pr create <slug>` | `POST …/pulls` | `--title`, `--head`, `--base` (all required), `--body` or `--body-file`, `--draft` |
+| `parley pr comment <slug> <number>` | `POST …/pulls/<number>/comments` | `--body` or `--body-file` (one is required) |
+
+- `--body <text>` gives a text; `--body-file <path>` reads it from the file,
+  or from standard input when the path is `-`. The text is sent exactly as
+  given or read, with nothing trimmed; `--body ""` on `issue update` sends
+  `body` as `""`, which clears the issue's body. A text that is not valid
+  UTF-8 is a usage error, since JSON cannot carry it unchanged.
+- `--label` and `--assignee` are sent as the lists `labels` and `assignees`,
+  one name per flag; on `issue update` each replaces the whole set.
+- `issue close` sends no body without `--comment`, and `{"comment":
+  <text>}` with it. `--state` is sent as given; the hub checks it. `--draft`
+  sends `draft: true` and, when not given, no `draft` member.
+- `issue label` sends its labels, in the order given, as a bare JSON array,
+  and prints `{"status":"labeled","number":<n>,"labels":[…]}` when the hub
+  answers `204`; `issue unlabel` prints
+  `{"status":"unlabeled","number":<n>,"label":"<label>"}`. `number` is a
+  JSON number.
+- `label create` exits `0` both when the label existed (`200`) and when it
+  was created (`201`).
+
+A missing required flag, both `--body` and `--body-file`, a `--body-file`
+that cannot be read, `issue update` without a field flag, `issue label`
+without a label and a `<number>` that breaks the rule above are each a
+`usage_error` with exit status `2`, raised before any request.
+
 ### `parley credential-helper`
 
 ```

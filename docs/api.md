@@ -7048,6 +7048,216 @@ non-system notes as `commented`, oldest first; no page is longer than
 the forge for one note to learn whether any follows, and `next_cursor` is
 `null` when none does.
 
+## Forge writes
+
+Nine routes change the issues, comments, labels and pull requests of a
+workspace's forge repository with the credential the hub stores for the
+workspace, so that no caller holds a forge token. They resolve the forge,
+the target, a task fork's parent and the credential as the
+[forge reads](#forge-reads) do, send with the same outbound rules and answer
+a failed forge call with the same table of forge failures.
+
+| Route | Does | Success |
+|---|---|---|
+| `POST /api/v1/workspaces/{slug}/issues` | create an issue | `201`, the issue |
+| `PATCH /api/v1/workspaces/{slug}/issues/{number}` | update an issue | `200`, the issue |
+| `POST /api/v1/workspaces/{slug}/issues/{number}/close` | close an issue | `200`, the issue |
+| `POST /api/v1/workspaces/{slug}/issues/{number}/comments` | comment on an issue | `201`, `{"url"}` |
+| `POST /api/v1/workspaces/{slug}/issues/{number}/labels` | add labels | `204` |
+| `DELETE /api/v1/workspaces/{slug}/issues/{number}/labels/{name}` | remove a label | `204` |
+| `POST /api/v1/workspaces/{slug}/labels` | ensure a label | `200` or `201`, the label |
+| `POST /api/v1/workspaces/{slug}/pulls` | open a pull request | `201`, the pull request |
+| `POST /api/v1/workspaces/{slug}/pulls/{number}/comments` | comment on a pull request | `201`, `{"url"}` |
+
+Each takes the admin token, an API key or a PAT with the scope
+`forge:write`, and needs write access to the workspace. A PAT without the
+scope is `403` `insufficient_scope`, for an unknown slug too; a caller with
+read access only is `403` `forbidden`, on an archived workspace too; a
+caller with no access is `404` `not_found`. Called with a task fork's slug, a
+write acts on the parent's forge repository with the parent's credential
+and settings, and the caller needs write access on the parent (`403`
+`forbidden` without it).
+
+**Order of checks.** After access, the first failure answers, and a request
+refused at any step sends nothing to the forge and records no event:
+
+1. `target`, as for the reads (`400` `invalid_request` or `400`
+   `workspace_mode_mismatch`).
+2. The path parameters and the body (`400` `invalid_request`, below). A bad
+   `{number}` is `number must be a positive decimal integer`.
+3. The workspace is archived: `409` `workspace_archived` (`workspace "<slug>"
+   is archived`); called through a task fork whose parent is archived: `409`
+   `parent_archived` (`workspace "<fork>" is read-only: its parent workspace
+   "<parent>" is archived`).
+4. The forge configuration: `422` `forge_api_url_invalid` or `422`
+   `forge_unknown`.
+5. The rules of the forge kind: on GitLab an update that sets only
+   `assignees` (`400` `invalid_request`), and the text limits (`413`).
+6. The target's credential kind is `none`: `422` `forge_credential_missing`
+   (`workspace "<slug>" stores no forge credential for the target <target>; a
+   write needs one`). The hub never writes to a forge anonymously.
+7. The write.
+
+So malformed JSON is `400` on a workspace whose forge is unknown, and an
+oversized text on such a workspace is `422` `forge_unknown`. No write route
+uses the hub's copy of the repository.
+
+**Bodies.** A body is a JSON object, except on the add-labels route (a bare
+JSON array) and the close route (which may also be empty). A body of the
+wrong shape is `400` `invalid_request`. A member whose value is `null` is
+treated as absent, and unknown members are ignored. A required string must
+be present and not blank (empty or Unicode white space only): `<field> is
+required`, `<field> must not be blank`. A member of the wrong JSON type is
+`<field> must be a string` (or `must be true or false`, `must be an array of
+names`). A list of names holds at most 100 entries, each a non-blank string
+(`<field> holds <n> names; at most 100 are allowed`, `<field>[<i>] must not
+be blank`). A write route's body may be up to 8 MiB, so that a text at the
+GitLab limit is measured by the hub rather than refused by the platform's
+body limit.
+
+**Text limits.** The `body` of an issue (create and update), of a comment and
+of a pull request, and the `comment` of a close, are counted in Unicode code
+points: more than 65,536 on GitHub or 1,000,000 on GitLab is `413`
+`payload_too_large` (`<field> is <n> characters long; the forge takes at
+most <limit>`). A text of exactly the limit is sent, unchanged.
+
+**What is sent.** A field that is not set is left out of the forge request.
+On GitLab a list of label names is sent as one comma-separated string, and
+`assignees` is never sent (GitLab takes user ids, which the hub does not
+resolve). Paths are below the API URL; `R` is `/repos/<owner>/<name>` on
+GitHub and `/projects/<owner/name, one escaped segment>` on GitLab.
+
+| Write | GitHub | GitLab |
+|---|---|---|
+| create issue | `POST R/issues` `{title, body, labels, assignees}` | `POST R/issues` `{title, description, labels}` |
+| update issue | `PATCH R/issues/<n>` `{title, body, state, labels, assignees}` | `PUT R/issues/<n>` `{title, description, state_event, labels}` |
+| close issue | `PATCH R/issues/<n>` `{state: "closed"}` | `PUT R/issues/<n>` `{state_event: "close"}` |
+| comment on an issue | `POST R/issues/<n>/comments` `{body}` | `POST R/issues/<n>/notes` `{body}` |
+| comment on a pull request | `POST R/issues/<n>/comments` `{body}` | `POST R/merge_requests/<n>/notes` `{body}` |
+| add labels | `POST R/issues/<n>/labels` `{labels}` | `PUT R/issues/<n>` `{add_labels}` |
+| remove a label | `DELETE R/issues/<n>/labels/<name>`, on `404` `GET R/issues/<n>` | `PUT R/issues/<n>` `{remove_labels}` |
+| ensure a label | `GET R/labels/<name>`, then `POST R/labels` `{name, color, description}` | `GET R/labels/<name>`, then `POST R/labels` `{name, color: "#<hex>", description}` |
+| open a pull request | `POST R/pulls` `{title, head, base, body, draft}` | `POST R/merge_requests` `{title, source_branch, target_branch, description}` |
+
+**Disconnects.** A write is not abandoned when the caller disconnects: its
+forge requests, each with its own 30-second deadline, and its event are
+carried out to their end.
+
+**Retries.** The five routes that create something (create issue, the two
+comment routes, ensure a label, open a pull request) accept
+`Idempotency-Key` as [Idempotency](#idempotency) says: a replay answers
+`200` with the first answer's body, sends nothing to the forge and records no
+event; only a `2xx` answer is kept, so a create the forge failed is carried
+out again on retry. The close and add-labels routes ignore the header and
+carry out every request.
+
+**Events.** A write that handed at least one request to the forge, a request
+whose connection failed or whose deadline passed included, records exactly
+one event before it answers, whether it succeeded or failed. The actor is
+the caller; `workspace` is the workspace whose forge was written, for a call
+through a task fork the parent, with the fork's slug in `metadata.fork`.
+Every event's metadata holds `target`, `ok`, `error_type` (when `ok` is
+false, the answer's `error_type`), `number` (the issue or pull request, when
+known) and `url` (the web URL of the resulting issue, pull request or
+comment, when known). No event holds a title, a body, a comment text, a
+label description, a credential or a forge message. An event that cannot be
+recorded makes the answer `500` `internal`; what the forge did is not
+undone.
+
+| Event | `resource_type` | `resource_id` | Extra metadata |
+|---|---|---|---|
+| `parley.forge.issue.create` | `issue` | the new number; `none` on failure | |
+| `parley.forge.issue.update` | `issue` | the number | `fields`, the names of the fields sent, sorted |
+| `parley.forge.issue.close` | `issue` | the number | `comment_url`, when a comment was posted |
+| `parley.forge.comment.create` | `comment` | the issue's number | |
+| `parley.forge.label.add` | `label` | the issue's number | `labels` |
+| `parley.forge.label.remove` | `label` | the issue's number | `label` |
+| `parley.forge.label.create` | `label` | the label's name | `label`, `created` (true only when this call created it); no `number`, no `url` |
+| `parley.forge.pull_request.create` | `pull_request` | the new number; `none` on failure | `head`, `base`, `draft` |
+| `parley.forge.pull_request.comment` | `pull_request` | the number | |
+
+The three label events carry no `url`. The action of each event is the last
+segment of its type (`create`, `update`, `close`, `add`, `remove`,
+`comment`).
+
+## `POST /api/v1/workspaces/{slug}/issues`
+
+Body `{"title": string, "body"?: string, "labels"?: [string], "assignees"?:
+[string]}`; `title` is required. Answers `201` with the issue, in the shape
+of the [issue read](#get-apiv1workspacesslugissuesnumber).
+
+## `PATCH /api/v1/workspaces/{slug}/issues/{number}`
+
+Body with any of `title` (not blank), `body` (`""` clears it), `state`
+(`open` or `closed`, else `state must be open or closed`), `labels` and
+`assignees` (each replaces the whole set; `[]` clears it). Only the fields
+that are set are sent; on GitLab `state` is sent as `state_event` `close` or
+`reopen`. A body that sets none of them is `400` `invalid_request` (`an
+update must set at least one of title, body, state, labels and assignees`),
+and so is a GitLab update that sets only `assignees`. Answers `200` with the
+issue as the forge returns it.
+
+## `POST /api/v1/workspaces/{slug}/issues/{number}/close`
+
+The body may be absent, empty or `{"comment": string}`; `{}`, a `null` and a
+blank `comment` close without a comment, and a `comment` that is not a
+string is `400`. A comment is posted first, and the issue is closed only
+when the forge accepted it: when the comment fails, the answer is its
+failure and the issue is untouched; when the close fails after the comment
+was posted, the answer is the close's failure and the event carries
+`comment_url`. Closing a closed issue succeeds. Answers `200` with the issue.
+
+## `POST /api/v1/workspaces/{slug}/issues/{number}/comments`
+
+Body `{"body": string}`, required and not blank, sent exactly as given.
+Answers `201` with `{"url": "<web URL of the comment>"}` and nothing else.
+
+## `POST /api/v1/workspaces/{slug}/issues/{number}/labels`
+
+The body is a bare JSON array of 1 to 100 non-blank label names (anything
+else is `400`: `the body must be a JSON array of label names`, `labels must
+hold at least one name`). The labels are added and the issue keeps its
+others. Answers `204` with no body.
+
+## `DELETE /api/v1/workspaces/{slug}/issues/{number}/labels/{name}`
+
+The label is the last path segment, percent-decoded once: `type%2Fbug`
+names `type/bug`, `%252F` names `%2F`. A blank name is `400` (`the label
+name must not be blank`). Answers `204` when the issue exists, whether or
+not it carried the label, and `404` `forge_not_found` when it does not.
+
+## `POST /api/v1/workspaces/{slug}/labels`
+
+Body `{"name": string, "color"?: string, "description"?: string}`; `name` is
+required, `color` is six hex digits in either case, with or without a
+leading `#` (`color must be six hex digits, with or without a leading #`),
+default `ededed`. When the repository has a label of that name, the answer
+is `200` with it as the forge holds it, unchanged, even when `color` or
+`description` differ. Otherwise the label is created and the answer is
+`201`. When the forge refuses the create because the label now exists
+(another caller won the race), the hub reads it again and answers `200` with
+it. The label is `{"name", "color", "description"}`, `color` six lower-case
+hex digits without `#`, an absent description `""`.
+
+## `POST /api/v1/workspaces/{slug}/pulls`
+
+Body `{"title": string, "head": string, "base": string, "body"?: string,
+"draft"?: boolean}`; `title`, `head` and `base` are required, `draft`
+defaults to `false`. `head` is sent as given, so `owner:branch` names a
+branch of a forge-side fork. On GitLab a draft is a merge request whose
+title begins with `Draft: `, which the hub adds once. The branches and
+whether a pull request already exists are the forge's to judge: its refusal
+is `422` `forge_rejected` (`the forge answered <status>: <message>`). Answers
+`201` with the pull request, in the shape of the
+[pull request read](#get-apiv1workspacesslugpullsnumber); on GitLab its
+`number` is the merge request's `iid`.
+
+## `POST /api/v1/workspaces/{slug}/pulls/{number}/comments`
+
+Body `{"body": string}`, required and not blank, sent exactly as given, as a
+comment in the pull request's conversation. Answers `201` with `{"url":
+"<web URL of the comment>"}`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must
