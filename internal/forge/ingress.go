@@ -101,16 +101,16 @@ func (c *Component) ingest(r *http.Request) (Outcome, error) {
 	if err != nil {
 		return "", fmt.Errorf("read workspace %s: %w", slug, err)
 	}
-	if !ok || ws.Kind == access.KindFork {
-		return "", errNoIngress
-	}
-	// A secret that cannot be read fails the delivery as the hub's fault:
-	// it is never taken for a workspace without a webhook.
+	// The secret is read for every slug, an unknown one and a fork's
+	// included, so that the refusals cost the same reads and their time
+	// does not tell an unauthenticated caller which workspaces exist. A
+	// secret that cannot be read fails the delivery as the hub's fault: it
+	// is never taken for a workspace without a webhook.
 	key, found, err := c.deps.Secrets.Get(ctx, secret.ScopeWorkspace, slug, SecretWebhook)
 	if err != nil {
 		return "", fmt.Errorf("read the webhook secret of %s: %w", slug, err)
 	}
-	if !found || key == "" {
+	if !ok || ws.Kind == access.KindFork || !found || key == "" {
 		return "", errNoIngress
 	}
 

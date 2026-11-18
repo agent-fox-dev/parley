@@ -5868,7 +5868,9 @@ comp.Ingress())`, `POST /hooks/forge/{slug}` on the server's mux outside
 `/api/v1`: the REST pipeline's authentication, rate limit, body limit and
 content-type check do not apply, and the handler does its own checks in a
 fixed order (`ingest`, `internal/forge/ingress.go`): the workspace record
-(`Deps.Workspaces`) and the secret (`Deps.Secrets.Get`, on every request),
+(`Deps.Workspaces`) and the secret (`Deps.Secrets.Get`, on every request
+and for every slug, an unknown one and a fork's included, so that the
+three `404` refusals cost the same reads),
 the scheme and a GitLab token (`subtle.ConstantTimeCompare` of the SHA-256 digests, so the secret's length does not show), the body read
 through a 1 MiB + 1 `io.LimitReader`, a GitHub signature (`hmac.Equal`), the
 delivery id and event name, then `(*Component).RecordDelivery`. Its errors

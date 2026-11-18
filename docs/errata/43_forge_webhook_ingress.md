@@ -35,6 +35,22 @@ cannot do. `forge.Deps` gains `Store` (the transactional store),
 `Log` (the event component's `Emit` inside a transaction), set by the start
 hook `forge` in `internal/hub/forge.go`.
 
+## The ingress's refusals cost the same reads
+
+The package asks only that an unknown slug, a task fork and a workspace
+without a `FORGE_WEBHOOK_SECRET` get the same `404` bytes. The ingress is
+the hub's one unauthenticated route, so `ingest`
+(`internal/forge/ingress.go`) also gives the three the same reads: the
+workspace record and then the secret of the slug, for every slug, before it
+decides. An unknown slug or a fork no longer answers after one read while a
+workspace pays a second, which let a caller tell existing repository
+workspaces from unknown slugs by the time of many requests. A secret
+reader that fails is `500` for every slug, an unknown one included. What
+still differs is the decryption of a value that is stored, which happens
+only for a workspace whose owner stored an empty secret or a fork holding
+one: a few microseconds against a store read, and of a value the owner
+wrote.
+
 ## The show-once note depends on the answer
 
 `parley forge webhook set` writes its note only when the hub's answer holds

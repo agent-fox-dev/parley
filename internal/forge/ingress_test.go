@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,9 +150,51 @@ func wantRefusal(t *testing.T, what string, status int, body []byte, wantStatus 
 	}
 }
 
+// readLog records the reads of the ingress's workspace and secret
+// readers, in order.
+type readLog struct {
+	mu    sync.Mutex
+	reads []string
+}
+
+func (l *readLog) add(read string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reads = append(l.reads, read)
+}
+
+// take returns the reads recorded since the last take.
+func (l *readLog) take() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	reads := l.reads
+	l.reads = nil
+	return reads
+}
+
+// loggedSecrets is a secret reader that records every read in log.
+type loggedSecrets struct {
+	workspace.SecretReader
+	log *readLog
+}
+
+func (s loggedSecrets) Get(ctx context.Context, scope secret.Scope, scopeID, name string) (string, bool, error) {
+	s.log.add(fmt.Sprintf("secret %s/%s/%s", scope, scopeID, name))
+	return s.SecretReader.Get(ctx, scope, scopeID, name)
+}
+
 func TestIngress_AnswersTheSameNotFoundForAWorkspaceWithoutAWebhook(t *testing.T) {
 	t.Parallel()
-	w := newIngressWorld(t)
+	reads := &readLog{}
+	w := newDeliveryWorld(t, deliveryTime, func(_ *world, d *forge.Deps) {
+		workspaces := d.Workspaces
+		d.Workspaces = func(ctx context.Context, slug string) (workspace.Workspace, bool, error) {
+			reads.add("workspace " + slug)
+			return workspaces(ctx, slug)
+		}
+		d.Secrets = loggedSecrets{SecretReader: d.Secrets, log: reads}
+	})
+	w.putSecret(t, "demo", forge.SecretWebhook, hookSecret)
 	w.addWorkspace(t, workspace.Workspace{Slug: "demo--t1", ParentSlug: new("demo")})
 	w.addWorkspace(t, workspace.Workspace{Slug: "nosecret", GitURL: new("https://github.com/acme/widgets.git")})
 	w.addWorkspace(t, workspace.Workspace{Slug: "emptysecret", GitURL: new("https://github.com/acme/widgets.git")})
@@ -163,9 +207,16 @@ func TestIngress_AnswersTheSameNotFoundForAWorkspaceWithoutAWebhook(t *testing.T
 
 	body := ghIssue("opened", nil)
 	var first []byte
+	reads.take()
 	for i, slug := range []string{"nosuch", "demo--t1", "nosecret", "emptysecret", "unset"} {
 		status, answer := w.deliver(t, slug, ghHeaders(fmt.Sprintf("n%d", i), "issues", hookSecret, body), bytes.NewReader(body))
 		wantRefusal(t, "POST "+slug, status, answer, http.StatusNotFound, "not_found")
+		// Each refusal does the same reads, so that its time does not tell
+		// an unknown slug from a workspace.
+		want := []string{"workspace " + slug, "secret workspace/" + slug + "/" + forge.SecretWebhook}
+		if got := reads.take(); !slices.Equal(got, want) {
+			t.Errorf("POST %s read %q, want %q", slug, got, want)
+		}
 		if e := errorOf(t, answer); e.Message != "not found" {
 			t.Errorf("POST %s: message %q, want \"not found\"", slug, e.Message)
 		}
