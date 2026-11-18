@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -37,9 +38,10 @@ type RuntimeVersion struct {
 // before the first request; after that the service does not change.
 //
 // The service also holds the stored sandboxes: Bind gives it the store, the
-// clock, the event component and the metrics recorder in a start hook, and
-// Transition moves a record from one state to another. The sandbox packages
-// register their hooks on it.
+// clock, the event component, the metrics recorder and the repositories in
+// a start hook, Create stores a new sandbox and Transition moves a record
+// from one state to another. The sandbox packages register their hooks on
+// it, and the session feature its session-linking rule.
 type Service struct {
 	settings    *Settings
 	externalURL string
@@ -54,11 +56,19 @@ type Service struct {
 	// deleteHooks and purgeHooks are the clean-up other sandbox packages
 	// register for the records.
 	deleteHooks, purgeHooks hooks
+	// mu guards linker, the session-linking rule; nil for none.
+	mu     sync.Mutex
+	linker SessionLinker
+	// wakeup holds a token while a created sandbox waits for the
+	// provisioner.
+	wakeup chan struct{}
 }
 
 // NewService returns the service of a hub whose configuration is not loaded
 // yet: sandboxes are off until Configure says otherwise.
-func NewService() *Service { return &Service{settings: &Settings{}} }
+func NewService() *Service {
+	return &Service{settings: &Settings{}, wakeup: make(chan struct{}, 1)}
+}
 
 // Configure checks the [sandbox] section of cfg (see FromConfig) and keeps
 // its settings and [server].external_url. It returns the section's error

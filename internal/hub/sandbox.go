@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/openshell"
@@ -34,8 +35,11 @@ const (
 // The sandbox records are a table of their own, created whether sandboxes
 // are on or not, so that turning them on later finds it. A start hook binds
 // the service to the store, the hub's clock, the event component, through
-// which a transition writes its event, and the metrics recorder; the other
-// sandbox packages register their delete and purge hooks on the service.
+// which a create and a transition write their events, the metrics recorder
+// and the workspaces' repositories, in which a create resolves its
+// checkout; the other sandbox packages register their delete and purge
+// hooks on the service. POST /workspaces/:slug/sandboxes creates a sandbox
+// through the service's create.
 //
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
@@ -51,7 +55,13 @@ func composeSandbox(c *Composition) {
 	}
 	c.AddSchemaStep(sandbox.SchemaStep)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
-		d := sandbox.Deps{Store: rt.Store, Now: rt.Now, Events: c.Events(), Recorder: c.sandboxRecorder}
+		git := gitFor(c.env)
+		d := sandbox.Deps{
+			Store: rt.Store, Now: rt.Now, Events: c.Events(), Recorder: c.sandboxRecorder,
+			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
+				return git.Open(ctx, c.workspaces.RepoPath(slug))
+			},
+		}
 		for _, adjust := range c.sandboxAdjusters {
 			adjust(&d)
 		}
@@ -61,6 +71,7 @@ func composeSandbox(c *Composition) {
 	c.addConfigCheck(svc.Configure)
 	c.AddRoute(svc.ProfilesRoute())
 	c.AddRoute(svc.SandboxesRoute())
+	c.AddRoute(svc.CreateRoute())
 	c.addVersionMember(func() map[string]any {
 		if v, ok := svc.Version(); ok {
 			return map[string]any{"sandbox_runtime": v}

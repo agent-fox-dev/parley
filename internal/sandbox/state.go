@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -46,6 +47,9 @@ type Deps struct {
 	Events *event.Component
 	// Recorder receives the sandbox metrics; nil records nothing.
 	Recorder Recorder
+	// Repos opens the repository of the workspace slug, in which a create
+	// resolves the ref it checks out.
+	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
 }
 
 // Bind sets the dependencies the stored sandboxes are worked with. It is

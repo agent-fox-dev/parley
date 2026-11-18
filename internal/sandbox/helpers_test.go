@@ -17,6 +17,9 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/fork"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -24,6 +27,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // The content of the files every configuration dir of loadSandbox holds. The
@@ -576,4 +580,226 @@ func (r *recordingRecorder) observations(name string) []float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.obs[name])
+}
+
+func TestMain(m *testing.M) {
+	hubtest.LimitParallel(hubtest.HubParallel)
+	os.Exit(m.Run())
+}
+
+// agentProfile is the profile agent of the create tests, marked default.
+const agentProfile = "[[sandbox.profiles]]\nname = \"agent\"\ndefault = true\nimage = \"img:1\"\ncpu = \"2\"\nmemory = \"4Gi\"\n" +
+	"ttl = \"4h\"\nidle_timeout = \"30m\"\nhub_access = \"fork\"\n"
+
+// plainProfile is a profile without hub access that exposes the secret
+// NPM_TOKEN.
+const plainProfile = "[[sandbox.profiles]]\nname = \"plain\"\nttl = \"4h\"\nhub_access = \"none\"\nexpose_secrets = [\"NPM_TOKEN\"]\n"
+
+// t1Session is the session of the fork demo--t1 of a create world.
+const t1Session = "6f1c2f0e-0000-4000-8000-0000000000aa"
+
+// createHub is a hub with sandboxes on over a fake runtime, on a clock
+// fixed at recordStart, with the users dana, who owns every workspace the
+// test adds, in the org acme, and a session linker the test steers.
+type createHub struct {
+	*probeHub
+	svc        *sandbox.Service
+	workspaces *workspace.Service
+	linker     *stubLinker
+	// dana is the user id of dana, key her API key.
+	dana, key, org string
+	// base is the commit main of demo points at in a create world.
+	base string
+}
+
+// startCreateHub starts a create hub whose [sandbox] section holds the
+// profiles given as TOML.
+func startCreateHub(t *testing.T, profiles string) *createHub {
+	t.Helper()
+	h := &createHub{probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}}
+	cfg := hubtest.Config{
+		Server: sandboxesOn.Server,
+		TOML:   "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" + profiles,
+		Files:  sandboxesOn.Files,
+		Now:    func() time.Time { return recordStart },
+	}
+	cfg.Compose = func(c *hub.Composition) {
+		h.svc, h.workspaces = c.Sandbox(), c.Workspaces()
+		h.svc.RegisterSessionLinker(h.linker)
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	h.dana = h.CreateUser(t, "dana")
+	h.key = h.IssueKey(t, h.dana)
+	h.org = h.CreateOrg(t, "acme")
+	return h
+}
+
+// world adds the ready repository demo, whose main has one commit, its
+// fork demo--t1 (name t1, base main, expiring in 7 days, in the session
+// t1Session) and its fork demo--t2 (expiring in an hour, in no session).
+func (h *createHub) world(t *testing.T) {
+	t.Helper()
+	h.base = h.repository(t, "demo", workspace.StatusReady)
+	h.fork(t, "demo--t1", "demo", recordStart.Add(7*24*time.Hour), new(t1Session))
+	h.fork(t, "demo--t2", "demo", recordStart.Add(time.Hour), nil)
+}
+
+// repository adds the repository workspace slug of dana in acme, with the
+// default branch main, in status. A ready one gets a repository whose main
+// points at a commit, whose id it returns.
+func (h *createHub) repository(t *testing.T, slug string, status workspace.Status) string {
+	t.Helper()
+	commit := ""
+	if status == workspace.StatusReady {
+		dir := h.workspaces.RepoPath(slug)
+		gitrepotest.InitBare(t, dir, "main")
+		commit = gitrepotest.Commit(t, dir, "first", map[string]string{"README": "demo\n"})
+		gitrepotest.SetRef(t, dir, "refs/heads/main", commit)
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		return workspace.Insert(ctx, tx, h.record(slug, access.KindRepository, status))
+	})
+	return commit
+}
+
+// fork adds the ready fork slug of parent, of dana, based on and tracking
+// main, expiring at expires, in session (nil for none). It shares the
+// parent's repository when the parent has one.
+func (h *createHub) fork(t *testing.T, slug, parent string, expires time.Time, session *string) {
+	t.Helper()
+	w := h.record(slug, access.KindFork, workspace.StatusReady)
+	w.ParentSlug, w.ExpiresAt, w.SessionID = &parent, &expires, session
+	if _, err := os.Stat(h.workspaces.RepoPath(parent)); err == nil {
+		if err := (gitrepo.Git{}).CreateFork(context.Background(), h.workspaces.RepoPath(parent), h.workspaces.RepoPath(slug)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		return fork.Insert(ctx, tx, fork.Fork{Workspace: w, TrackingBranches: []string{"main"}})
+	})
+}
+
+// record is the workspace record slug of kind of dana in acme, with the
+// default branch main, in status.
+func (h *createHub) record(slug, kind string, status workspace.Status) workspace.Workspace {
+	return workspace.Workspace{
+		Slug: slug, Kind: kind, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
+		OwnerID: h.dana, OrgID: h.org, Status: status, DisplayName: slug,
+		CreatedAt: recordStart, UpdatedAt: recordStart, InstanceID: workspace.NewInstanceID(),
+	}
+}
+
+// insert runs fn in a store transaction.
+func (h *createHub) insert(t *testing.T, fn func(ctx context.Context, tx *sql.Tx) error) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return fn(ctx, tx) }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedIn stores a ready sandbox of the workspace ws with the checkpoint cp
+// (nil for none) and returns its id.
+func (h *createHub) seedIn(t *testing.T, ws string, cp json.RawMessage) string {
+	t.Helper()
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: sandbox.StateReady, Checkpoint: cp,
+		ExpiresAt: recordStart.Add(time.Hour), LastActivityAt: recordStart,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"},
+		CreatedAt: recordStart, UpdatedAt: recordStart, UserID: h.dana, FamilyRoot: "demo",
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) })
+	return rec.ID
+}
+
+// post sends POST /workspaces/slug/sandboxes as dana with body.
+func (h *createHub) post(t *testing.T, slug string, body any) answer {
+	t.Helper()
+	return h.call(t, http.MethodPost, "/workspaces/"+slug+"/sandboxes", h.key, body)
+}
+
+// footprint is what a refused create must leave as it was: the number of
+// sandbox records, tokens and hub events, and of runtime calls.
+type footprint struct{ sandboxes, tokens, events, calls int }
+
+// footprint counts what a create could add.
+func (h *createHub) footprint(t *testing.T) footprint {
+	t.Helper()
+	var f footprint
+	db := h.Store.Main()
+	for _, c := range []struct {
+		table string
+		n     *int
+	}{{"sandboxes", &f.sandboxes}, {"pats", &f.tokens}, {"hub_events", &f.events}} {
+		if err := db.QueryRow(`SELECT count(*) FROM ` + c.table).Scan(c.n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.calls = len(h.rt.Calls())
+	return f
+}
+
+// sandboxObject decodes the sandbox object of a 201 answer.
+func sandboxObject(t *testing.T, a answer) map[string]any {
+	t.Helper()
+	if a.status != http.StatusCreated {
+		t.Fatalf("create = %d %s; want 201", a.status, a.body)
+	}
+	var o map[string]any
+	if err := json.Unmarshal(a.body, &o); err != nil {
+		t.Fatalf("the answer %s: %v", a.body, err)
+	}
+	return o
+}
+
+// stubLinker is a session linker that accepts every session id, in lower
+// case, unless refuse is set, and keeps what it was asked.
+type stubLinker struct {
+	mu       sync.Mutex
+	refuse   bool
+	checks   []string
+	recorded []string
+}
+
+func (l *stubLinker) setRefuse(v bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refuse = v
+}
+
+func (l *stubLinker) Check(_ context.Context, caller identity.Principal, id, ws string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	user := ""
+	if caller.User != nil {
+		user = caller.User.ID
+	}
+	l.checks = append(l.checks, id+" "+user+" "+ws)
+	if l.refuse {
+		return "", sandbox.ErrUnknownSession
+	}
+	return strings.ToLower(id), nil
+}
+
+func (l *stubLinker) Record(_ context.Context, _ *sql.Tx, id, ws, sandboxID string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recorded = append(l.recorded, id+" "+ws+" "+sandboxID)
+	return nil
+}
+
+// last returns the last check and the last record, "" for none.
+func (l *stubLinker) last() (check, record string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n := len(l.checks); n > 0 {
+		check = l.checks[n-1]
+	}
+	if n := len(l.recorded); n > 0 {
+		record = l.recorded[n-1]
+	}
+	return check, record
 }
