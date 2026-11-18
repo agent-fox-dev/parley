@@ -1,9 +1,12 @@
 package forge_test
 
 import (
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/forge/forgetest"
@@ -95,11 +98,13 @@ func TestWriteRoute_AnswersTheFirstFailingCheck(t *testing.T) {
 	w.addWorkspace(t, workspace.Workspace{Slug: "unknown", GitURL: unknown})
 	w.addWorkspace(t, workspace.Workspace{Slug: "archived-unknown", Status: workspace.StatusArchived, GitURL: unknown})
 	w.addWorkspace(t, workspace.Workspace{Slug: "invalid-api", GitURL: gh, Settings: settings(forge.SettingAPIURL, "http://ghe.example.com")})
+	w.addWorkspace(t, workspace.Workspace{Slug: "anon", GitURL: gh, Settings: w.github()})
 	for _, slug := range []string{"demo", "archived"} {
 		w.putSecret(t, slug, workspace.SecretGitPAT, slug+"-token")
 	}
 
 	malformed, valid := `{"title":`, map[string]any{"title": "t"}
+	oversized := map[string]any{"title": "t", "body": strings.Repeat("x", 65537)}
 	cases := []struct {
 		name, slug, path string
 		body             any
@@ -116,6 +121,8 @@ func TestWriteRoute_AnswersTheFirstFailingCheck(t *testing.T) {
 		{"an archived workspace before an unknown forge", "archived-unknown", "/issues", valid, 409, "workspace_archived", ""},
 		{"an unknown forge before a missing credential", "unknown", "/issues", valid, 422, forge.ErrorTypeUnknown, ""},
 		{"an invalid API URL before a missing credential", "invalid-api", "/issues", valid, 422, forge.ErrorTypeAPIURLInvalid, ""},
+		{"an unknown forge before an oversized text", "unknown", "/issues", oversized, 422, forge.ErrorTypeUnknown, ""},
+		{"an oversized text before a missing credential", "anon", "/issues", oversized, 413, "payload_too_large", "body"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -207,4 +214,202 @@ func TestWriteRoute_WritesToTheTargetsRepositoryWithItsCredential(t *testing.T) 
 			}
 		}
 	})
+}
+
+// badBody is a body a write route refuses with 400 invalid_request, and the
+// field its message must name: "" for a body that is not what the route
+// takes at all.
+type badBody struct {
+	name  string
+	body  any
+	field string
+}
+
+// names is a list of n distinct names.
+func names(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "n" + strconv.Itoa(i)
+	}
+	return out
+}
+
+// badBodies are, per write route, the bodies it refuses before anything is
+// sent, and boundBodies the bodies at the bounds of its rules, which it
+// sends.
+var (
+	badBodies = []struct {
+		method, path string
+		bodies       []badBody
+	}{
+		{http.MethodPost, "/issues", []badBody{
+			{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"a number", `5`, ""}, {"none", nil, ""},
+			{"no title", map[string]any{}, "title"},
+			{"a null title", map[string]any{"title": nil}, "title"},
+			{"a blank title", map[string]any{"title": "   "}, "title"},
+			{"a title that is a number", map[string]any{"title": 5}, "title"},
+			{"labels that are a string", map[string]any{"title": "t", "labels": "bug"}, "labels"},
+			{"101 labels", map[string]any{"title": "t", "labels": names(101)}, "labels"},
+			{"a blank label", map[string]any{"title": "t", "labels": []any{"a", ""}}, "labels"},
+			{"a label that is a number", map[string]any{"title": "t", "labels": []any{"a", 5}}, "labels"},
+			{"101 assignees", map[string]any{"title": "t", "assignees": names(101)}, "assignees"},
+			{"a body that is a number", map[string]any{"title": "t", "body": 5}, "body"},
+		}},
+	}
+	boundBodies = []struct {
+		method, path string
+		bodies       []any
+	}{
+		{http.MethodPost, "/issues", []any{map[string]any{"title": "t", "labels": names(100), "assignees": names(100)}}},
+	}
+)
+
+func TestWriteRoute_RefusesABodyThatBreaksItsRules(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo", GitURL: new("https://github.com/acme/widgets.git"), Settings: w.github()})
+	w.putSecret(t, "demo", workspace.SecretGitPAT, "demo-token")
+	w.seedIssue(ghRepo)
+
+	for _, route := range badBodies {
+		for _, b := range route.bodies {
+			t.Run(route.method+" "+route.path+", "+b.name, func(t *testing.T) {
+				status, body, sent := w.send(t, route.method, "demo", route.path, w.ownerKey, b.body)
+				e := errorOf(t, body)
+				if status != http.StatusBadRequest || e.Type != "invalid_request" || !strings.Contains(e.Message, b.field) || sent != 0 {
+					t.Errorf("%s demo%s = %d %s after %d forge requests, want 400 invalid_request naming %q after none",
+						route.method, route.path, status, body, sent, b.field)
+				}
+			})
+		}
+	}
+	if n := w.forgeEvents(t); n != 0 {
+		t.Errorf("the event log holds %d forge events, want none", n)
+	}
+	for _, route := range boundBodies {
+		for i, b := range route.bodies {
+			t.Run(route.method+" "+route.path+", a body at the bounds "+strconv.Itoa(i), func(t *testing.T) {
+				status, body, sent := w.send(t, route.method, "demo", route.path, w.ownerKey, b)
+				if status >= 300 || sent == 0 {
+					t.Errorf("%s demo%s = %d %.300s after %d forge requests, want success", route.method, route.path, status, body, sent)
+				}
+			})
+		}
+	}
+}
+
+// decoratedBodies are, per write route, a body and the same body with null
+// and unknown members added, which the route must send alike.
+var decoratedBodies = []struct {
+	method, path     string
+	plain, decorated map[string]any
+}{
+	{http.MethodPost, "/issues", map[string]any{"title": "t"},
+		map[string]any{"title": "t", "body": nil, "labels": nil, "assignees": nil, "extra": 1}},
+}
+
+func TestWriteRoute_TreatsNullAsAbsentAndIgnoresUnknownMembers(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo", GitURL: new("https://github.com/acme/widgets.git"), Settings: w.github()})
+	w.putSecret(t, "demo", workspace.SecretGitPAT, "demo-token")
+	for _, route := range decoratedBodies {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			var statuses [2]int
+			var sent [2][]byte
+			for i, b := range []map[string]any{route.plain, route.decorated} {
+				w.seedIssue(ghRepo)
+				statuses[i], _, _ = w.send(t, route.method, "demo", route.path, w.ownerKey, b)
+				sent[i] = w.fake.Last(t).Body
+			}
+			if statuses[0] != statuses[1] || statuses[0] >= 300 || !sameJSON(sent[1], string(sent[0])) {
+				t.Errorf("the plain body is answered %d and sent as %s, the decorated one %d and %s; want the same success",
+					statuses[0], sent[0], statuses[1], sent[1])
+			}
+		})
+	}
+}
+
+// measuredTexts are, per write route, the text the forge limits in length:
+// its field, a body of the route holding text as that field, and the member
+// the forge receives it in on GitHub and on GitLab.
+var measuredTexts = []struct {
+	method, path, field string
+	body                func(text string) map[string]any
+	github, gitlab      string
+}{
+	{http.MethodPost, "/issues", "body", func(s string) map[string]any { return map[string]any{"title": "t", "body": s} }, "body", "description"},
+}
+
+func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo", GitURL: new("https://github.com/acme/widgets.git"), Settings: w.github()})
+	w.addWorkspace(t, workspace.Workspace{Slug: "gl", GitURL: new("https://gitlab.com/group/sub/widgets.git"), Settings: w.gitlab()})
+	w.putSecret(t, "demo", workspace.SecretGitPAT, "demo-token")
+	w.putSecret(t, "gl", workspace.SecretGitPAT, "gl-token")
+	w.seedIssue(ghRepo)
+	w.seedIssue(glSubWidgets)
+
+	type length struct {
+		name, slug, text string
+		// limit is the limit a text over it is refused by, and "" for a
+		// text that is sent.
+		limit string
+	}
+	lengths := []length{
+		{"GitHub, 65,536 characters", "demo", strings.Repeat("x", 65536), ""},
+		{"GitHub, 65,537 characters", "demo", strings.Repeat("x", 65537), "65536"},
+		{"GitHub, 65,536 two-byte characters", "demo", strings.Repeat("é", 65536), ""},
+		{"GitLab, 65,537 characters", "gl", strings.Repeat("x", 65537), ""},
+	}
+	type row struct {
+		length
+		// route is the index of the row's route in measuredTexts.
+		route int
+	}
+	var rows []row
+	for i := range measuredTexts {
+		for _, l := range lengths {
+			rows = append(rows, row{l, i})
+		}
+	}
+	// GitLab's own limit is measured on the one route that creates an
+	// issue: the text at the limit is in two-byte characters, so that it is
+	// longer in bytes than the platform's default body limit.
+	rows = append(rows,
+		row{length{"GitLab, 1,000,000 two-byte characters", "gl", strings.Repeat("é", 1_000_000), ""}, 0},
+		row{length{"GitLab, 1,000,001 characters", "gl", strings.Repeat("x", 1_000_001), "1000000"}, 0})
+
+	for _, r := range rows {
+		m := measuredTexts[r.route]
+		t.Run(m.method+" "+m.path+" "+m.field+", "+r.name, func(t *testing.T) {
+			events := w.forgeEvents(t)
+			status, body, sent := w.send(t, m.method, r.slug, m.path, w.ownerKey, m.body(r.text))
+			if r.limit != "" {
+				e := errorOf(t, body)
+				n := strconv.Itoa(utf8.RuneCountInString(r.text))
+				if status != http.StatusRequestEntityTooLarge || e.Type != "payload_too_large" || sent != 0 ||
+					!strings.Contains(e.Message, m.field) || !strings.Contains(e.Message, n) || !strings.Contains(e.Message, r.limit) {
+					t.Errorf("%s %s%s = %d %.300s after %d forge requests, want 413 payload_too_large naming %s, %s and %s after none",
+						m.method, r.slug, m.path, status, body, sent, m.field, n, r.limit)
+				}
+				if got := w.forgeEvents(t); got != events {
+					t.Errorf("the event log holds %d forge events, want %d", got, events)
+				}
+				return
+			}
+			if status >= 300 || sent == 0 {
+				t.Fatalf("%s %s%s = %d %.300s after %d forge requests, want success", m.method, r.slug, m.path, status, body, sent)
+			}
+			member := m.github
+			if r.slug == "gl" {
+				member = m.gitlab
+			}
+			var got map[string]any
+			if err := json.Unmarshal(w.fake.Last(t).Body, &got); err != nil || got[member] != r.text {
+				t.Errorf("the forge did not receive the text unchanged as %s (%v)", member, err)
+			}
+		})
+	}
 }

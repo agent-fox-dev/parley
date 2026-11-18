@@ -1,43 +1,38 @@
 package forge
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"strings"
-	"unicode"
-
-	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 // issueInput is the body of an issue create: each field is nil when it is
 // not set.
 type issueInput struct {
-	Title     *string   `json:"title"`
-	Body      *string   `json:"body"`
-	Labels    *[]string `json:"labels"`
-	Assignees *[]string `json:"assignees"`
+	Title     *string
+	Body      *string
+	Labels    *[]string
+	Assignees *[]string
 }
 
-// readIssueCreate reads the body of an issue create, whose title is
-// required and not blank.
+func (in issueInput) texts() []text { return []text{{"body", in.Body}} }
+
+// readIssueCreate reads the body of an issue create: a title, required and
+// not blank; a body, which is measured; labels and assignees, lists of
+// names.
 func readIssueCreate(r *http.Request, call *Call) error {
-	var in issueInput
-	if err := server.DecodeJSON(r, &in); err != nil {
+	m, err := readObject(r)
+	if err != nil {
 		return err
 	}
-	if in.Title == nil {
-		return server.InvalidRequest("title is required")
-	}
-	if blank(*in.Title) {
-		return server.InvalidRequest("title must not be blank")
+	var in issueInput
+	if err := cmp.Or(m.required("title", &in.Title), m.text("body", &in.Body),
+		m.names("labels", &in.Labels), m.names("assignees", &in.Assignees)); err != nil {
+		return err
 	}
 	call.Params = in
 	return nil
-}
-
-// blank reports whether s is empty or made of white space only.
-func blank(s string) bool {
-	return strings.TrimFunc(s, unicode.IsSpace) == ""
 }
 
 // createIssue creates the issue the request's body describes and answers it
