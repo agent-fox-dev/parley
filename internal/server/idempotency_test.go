@@ -553,6 +553,60 @@ func TestIdempotency_LeavesARequestWhoseClientLeftTheGateUnanswered(t *testing.T
 	}
 }
 
+// contextStore is an in-memory store that refuses a write or a sweep on an
+// ended context, as a store backed by a database does.
+type contextStore struct {
+	*MemoryIdempotencyStore
+}
+
+func (s contextStore) Write(ctx context.Context, rec IdempotencyRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.MemoryIdempotencyStore.Write(ctx, rec)
+}
+
+func (s contextStore) DeleteExpired(ctx context.Context, cutoff time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.MemoryIdempotencyStore.DeleteExpired(ctx, cutoff)
+}
+
+func TestIdempotency_RecordsACreateWhoseClientLeftWhileItRan(t *testing.T) {
+	t.Parallel()
+	f := newCreateFixture()
+	f.s = New(Options{Now: f.clock.Now, IdempotencyStore: contextStore{f.store}, Logger: f.log.logger()})
+	f.s.SetAuthenticator(func(*http.Request) (Caller, error) { return idempotencyCallers["Bearer u1"], nil })
+	ctx, leave := context.WithCancel(context.Background())
+	defer leave()
+	f.s.Register(Route{
+		Method: http.MethodPost, Pattern: "/things", Create: true,
+		Handler: func(w http.ResponseWriter, r *http.Request) error {
+			// The client leaves once the handler has started; the handler
+			// carries its create out to the end, as a forge write does.
+			leave()
+			return f.create(w, r)
+		},
+	})
+	header := http.Header{"Content-Type": {"application/json"}, "Authorization": {"Bearer u1"}, "Idempotency-Key": {"k"}}
+	do(f.s.Handler(), newRequest(http.MethodPost, "/api/v1/things", header, `{"name":"a"}`).WithContext(ctx))
+
+	retry := f.post("/api/v1/things", "Bearer u1", `{"name":"a"}`, "k")
+
+	if retry.Code != http.StatusOK || decodeObject(t, retry.Body.Bytes())["id"] != "1" {
+		t.Errorf("retry = %d %s, want the 200 replay of the first create's id 1", retry.Code, retry.Body.Bytes())
+	}
+	if n := f.calls.Load(); n != 1 {
+		t.Errorf("handler ran %d times, want 1", n)
+	}
+	for _, line := range f.log.lines() {
+		if doc := decodeLine(t, line); doc["level"] == "ERROR" {
+			t.Errorf("logged %s, want no error line", line)
+		}
+	}
+}
+
 func TestIdempotency_TreatsAKeyRecordedElsewhereOrExpiredAsNew(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

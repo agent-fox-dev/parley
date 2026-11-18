@@ -313,6 +313,10 @@ the route (the method, one space and the concrete `r.URL.Path`, such as
    `DeleteExpired` with the cutoff `now - 24h` when no sweep has started in
    the last minute (a sweep of the in-memory store visits every record, so
    it does not run on every write), and then `Write`s the record.
+   The sweep and the write run on the request's context without its
+   cancellation and with a 10 s deadline of their own: a handler may carry
+   its create out after the client left (a forge write does), and a retry
+   must still find the record.
    A body that is not a JSON object while `ShowOnce` names members, or a store
    error, is logged as `idempotency record not written` with the
    `request_id` and the `error`, and nothing is recorded: the caller already
