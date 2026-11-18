@@ -7434,8 +7434,8 @@ the metadata `forge`, `target`, `delivery_id` and `actor` (GitHub
 
 | Event | `resource_type` | `resource_id` | Metadata |
 |---|---|---|---|
-| `parley.forge.issue.opened`, `.edited`, `.closed`, `.reopened` | `issue` | the number | `number`, `title` (cut to 256 bytes), `url`, `labels` (the first 100 names) |
-| `parley.forge.issue.labeled`, `.unlabeled` | `issue` | the number | `number`, `label`, `labels`, `url` |
+| `parley.forge.issue.opened`, `.edited`, `.closed`, `.reopened` | `issue` | the number | `number`, `title` (cut to 256 bytes), `url`, `labels` (the first 100 names, each cut to 1024 bytes) |
+| `parley.forge.issue.labeled`, `.unlabeled` | `issue` | the number | `number`, `label` (cut to 1024 bytes), `labels`, `url` |
 | `parley.forge.comment.created` | `comment` | the issue or pull request number | `number`, `comment_url`, `pull_request` (boolean) |
 | `parley.forge.pull_request.opened`, `.closed`, `.merged`, `.reopened`, `.synchronize` | `pull_request` | the number | `number`, `url`, `head`, `base`, `merged` (true exactly on `.merged`) |
 | `parley.forge.push` | `ref` | the ref | `ref`, `before`, `after` |

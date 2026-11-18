@@ -388,3 +388,82 @@ func TestHookEvent_RecordsTheForgeTheTargetTheDeliveryAndTheActorOfEveryEvent(t 
 		}
 	}
 }
+
+func TestHookEvent_BoundsTheLabelNamesOneDeliveryWrites(t *testing.T) {
+	t.Parallel()
+	// A name of 1024 bytes, the most a forge can create (GitLab's 255
+	// characters of up to 4 bytes), is kept whole; a longer one is cut at a
+	// character boundary.
+	whole := strings.Repeat("é", 512)
+	long := "a" + strings.Repeat("é", 4000)
+	cut := "a" + strings.Repeat("é", 511)
+	bulky := func(prefix string) []string {
+		out := numberedTitles(prefix, 100)
+		for i := range out {
+			out[i] += strings.Repeat("x", 9000)
+		}
+		return out
+	}
+	big := bulky("big")
+	added := numberedTitles("new", 100)
+	update := glPayload("update", "acme/widgets", map[string]any{
+		"object_attributes": map[string]any{"iid": 12},
+		"labels":            labelList("title", big...),
+		"changes":           labelChanges(nil, added),
+	})
+	if len(update) > 1<<20 {
+		t.Fatalf("the update delivery is %d bytes, more than the ingress reads", len(update))
+	}
+	ghLabeled := ghPayload("labeled", "acme/widgets", map[string]any{
+		"issue": map[string]any{"number": 7, "labels": labelList("name", whole, long)},
+		"label": map[string]any{"name": long},
+	})
+	glLabeled := glPayload("update", "acme/widgets", map[string]any{
+		"object_attributes": map[string]any{"iid": 12},
+		"labels":            labelList("title", whole, long),
+		"changes":           labelChanges(nil, []string{long}),
+	})
+	for _, tc := range []struct {
+		name   string
+		kind   forge.ForgeKind
+		event  string
+		body   []byte
+		label  string
+		labels []string
+	}{
+		{"github labeled", forge.KindGitHub, "issues", ghLabeled, cut, []string{whole, cut}},
+		{"gitlab update", forge.KindGitLab, "Issue Hook", glLabeled, cut, []string{whole, cut}},
+	} {
+		red := forge.Reduce(tc.kind, tc.event, tc.body, widgets)
+		if red.Outcome != forge.OutcomeRelayed || len(red.Events) != 1 {
+			t.Fatalf("%s: outcome %q with %d events; want one relayed", tc.name, red.Outcome, len(red.Events))
+		}
+		m := red.Events[0].Metadata
+		if m["label"] != tc.label || !reflect.DeepEqual(m["labels"], tc.labels) {
+			t.Errorf("%s: label of %d bytes and labels %v bytes; want %d and %v",
+				tc.name, len(fmt.Sprint(m["label"])), byteLens(m["labels"]), len(tc.label), byteLens(tc.labels))
+		}
+	}
+	red := forge.Reduce(forge.KindGitLab, "Issue Hook", update, widgets)
+	if red.Outcome != forge.OutcomeRelayed || len(red.Events) != 100 {
+		t.Fatalf("update: outcome %q with %d events; want 100 relayed", red.Outcome, len(red.Events))
+	}
+	// 100 label events, each listing 100 names of at most 1024 bytes.
+	total := 0
+	for _, ev := range red.Events {
+		total += len(jsonOf(ev.Metadata))
+	}
+	if limit := 100 * (100*1030 + 1024); total > limit {
+		t.Errorf("one delivery of %d bytes writes %d bytes of event metadata; want at most %d", len(update), total, limit)
+	}
+}
+
+// byteLens is the length in bytes of each name of a label list.
+func byteLens(labels any) []int {
+	names, _ := labels.([]string)
+	out := make([]int, len(names))
+	for i, n := range names {
+		out[i] = len(n)
+	}
+	return out
+}
