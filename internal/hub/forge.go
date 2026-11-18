@@ -2,13 +2,20 @@ package hub
 
 import (
 	"context"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
-// forgeHook is the name of the start hook that binds the forge component.
-const forgeHook = "forge"
+// forgeHook is the name of the start hook that binds the forge component,
+// and deliveryPruningTask that of the maintenance task that deletes the
+// webhook deliveries past their retention, under which package maintenance
+// orders it.
+const (
+	forgeHook           = "forge"
+	deliveryPruningTask = "forge_delivery_pruning"
+)
 
 // composeForge adds the forge component, the hub's client of the forge
 // that hosts a workspace's remote repository. Its start hook binds it to
@@ -27,6 +34,12 @@ const forgeHook = "forge"
 // the schema step of the delivery table, and mounts the webhook ingress
 // outside the REST API: a forge sends no bearer credential, must not be
 // rate limited as a caller, and is held to the ingress's own body limit.
+// Each maintenance pass deletes the deliveries received more than
+// forge.DeliveryRetention before it; a store error is returned to the loop,
+// which logs it, and the next pass deletes them. A workspace's deliveries
+// are removed in the transaction that deletes it (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md),
+// and the newest one's time is the diagnostic route's webhook
+// last_delivery_at.
 //
 // The component exists from the composition on (Forge), so that the forge
 // routes, which the part registers, are built with it; a later part and tests change its dependencies
@@ -39,6 +52,10 @@ func composeForge(c *Composition) {
 		c.AddRoute(rt)
 	}
 	c.Handle(forge.IngressPattern, comp.Ingress())
+	c.AddMaintenanceTask(deliveryPruningTask, func(ctx context.Context, rt *Runtime) error {
+		return forge.PruneDeliveries(ctx, rt.Store, rt.Now().Add(-forge.DeliveryRetention))
+	})
+	c.workspaces.Teardown().RegisterRemover(forge.RemoveDeliveries)
 	c.AddStartHook(forgeHook, func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
 		d := forge.Deps{
@@ -62,6 +79,9 @@ func composeForge(c *Composition) {
 			adjust(&d)
 		}
 		comp.Bind(d)
+		comp.SetLastDeliveryProvider(func(ctx context.Context, slug string) (time.Time, bool, error) {
+			return forge.LastDeliveryAt(ctx, db, slug)
+		})
 		return nil
 	})
 }

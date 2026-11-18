@@ -468,7 +468,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 				return err
 			}})
 			c.AddMaintenanceTask("sandbox_record_cleanup", insert("sandbox_record_cleanup"))
-			c.AddMaintenanceTask("forge_delivery_pruning", func(context.Context, *hub.Runtime) error {
+			c.AddMaintenanceTask("failing_task", func(context.Context, *hub.Runtime) error {
 				return errors.New("deliveries unreachable at https://u:p@h/x")
 			})
 			c.AddMaintenanceTask("retention", insert("retention"))
@@ -497,8 +497,8 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 
 	for _, rec := range failures() {
 		text, _ := rec["error"].(string)
-		if rec["task"] != "forge_delivery_pruning" || !strings.Contains(text, "https://h/x") || strings.Contains(text, "u:p") {
-			t.Errorf("error line %v, want task forge_delivery_pruning and an error holding https://h/x without u:p", rec)
+		if rec["task"] != "failing_task" || !strings.Contains(text, "https://h/x") || strings.Contains(text, "u:p") {
+			t.Errorf("error line %v, want task failing_task and an error holding https://h/x without u:p", rec)
 		}
 	}
 	var health map[string]any

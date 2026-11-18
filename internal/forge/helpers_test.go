@@ -80,8 +80,11 @@ func newWorld(t *testing.T) *world {
 }
 
 // newWorldWith is newWorld with the server TOML, the TOML and the
-// environment of cfg added to the hub's, the clock of cfg as the hub's, and adjust, when it is not nil, run on the forge
-// component's dependencies after the world's own changes.
+// environment of cfg added to the hub's, the clock and the maintenance
+// interval of cfg as the hub's, the Compose of cfg, when it is not nil, run
+// on the hub's composition after the world's own, and adjust, when it is
+// not nil, run on the forge component's dependencies after the world's own
+// changes.
 func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *forge.Deps)) *world {
 	t.Helper()
 	key := make([]byte, 32)
@@ -92,10 +95,11 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 	env := map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)}
 	maps.Copy(env, cfg.Env)
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		Server: cfg.Server,
-		TOML:   cfg.TOML,
-		Env:    env,
-		Now:    cfg.Now,
+		Server:              cfg.Server,
+		TOML:                cfg.TOML,
+		Env:                 env,
+		Now:                 cfg.Now,
+		MaintenanceInterval: cfg.MaintenanceInterval,
 		Compose: func(c *hub.Composition) {
 			w.secrets, w.forge, w.events = c.Secrets(), c.Forge(), c.Events()
 			for _, pattern := range []string{probeList, probeNumber} {
@@ -117,6 +121,9 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 					adjust(w, d)
 				}
 			})
+			if cfg.Compose != nil {
+				cfg.Compose(c)
+			}
 		},
 	})
 	w.owner, w.member, w.outsider = w.CreateUser(t, "owner"), w.CreateUser(t, "member"), w.CreateUser(t, "outsider")

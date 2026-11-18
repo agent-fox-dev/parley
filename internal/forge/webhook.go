@@ -149,8 +149,8 @@ func (c *Component) unsetWebhook(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// refuseFork refuses a webhook route on a task fork, which has no origin
-// of its own.
+// refuseFork refuses a webhook or delivery log route on a task fork, which
+// has no origin of its own.
 func refuseFork(rec access.Record) error {
 	if rec.Kind != access.KindFork {
 		return nil
