@@ -1,15 +1,20 @@
 package forge_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/forge/forgetest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -182,6 +187,7 @@ func TestWriteRoute_WritesToTheTargetsRepositoryWithItsCredential(t *testing.T) 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			w.fake.SetNext(c.repo, 7)
+			n := w.rec.count()
 			status, body, sent := w.send(t, http.MethodPost, c.slug, "/issues"+c.query, c.credential, map[string]any{"title": "t"})
 			if status != http.StatusCreated || sent != 1 {
 				t.Fatalf("POST %s/issues%s = %d %s after %d forge requests, want 201 after 1", c.slug, c.query, status, body, sent)
@@ -190,6 +196,13 @@ func TestWriteRoute_WritesToTheTargetsRepositoryWithItsCredential(t *testing.T) 
 			if last.Method != http.MethodPost || last.RawPath != c.repo+"/issues" || last.Header.Get("Authorization") != "Bearer "+c.token {
 				t.Errorf("the forge got %s %s with Authorization %q, want POST %s/issues with the token %s",
 					last.Method, last.RawPath, last.Header.Get("Authorization"), c.repo, c.token)
+			}
+			target := string(forge.TargetOrigin)
+			if strings.Contains(c.query, "upstream") {
+				target = string(forge.TargetUpstream)
+			}
+			if events := w.rec.since(n); len(events) != 1 || events[0].meta(t)["target"] != target {
+				t.Errorf("the write recorded %d events, the last %+v, want one with the target %s", len(events), events, target)
 			}
 			if c.like != "" && string(body) != answers[c.like] {
 				t.Errorf("the answer is %s, want the answer for %s, %s", body, c.like, answers[c.like])
@@ -411,5 +424,250 @@ func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
 				t.Errorf("the forge did not receive the text unchanged as %s (%v)", member, err)
 			}
 		})
+	}
+}
+
+// The markers of what no write event may hold: a title, any other text, a
+// label's description, the stored token and the forge's message.
+const (
+	titleMarker = "TITLE-MARKER"
+	textMarker  = "TEXT-MARKER"
+	descMarker  = "DESC-MARKER"
+	tokenMarker = "TOKEN-MARKER"
+	forgeMarker = "FORGE-MARKER"
+)
+
+// writeEvents are, per write route, a body it accepts, whose texts are the
+// markers, and the event the route records for it, against issue 7 of the
+// fake GitHub's acme/widgets: its type and resource type; on a success its
+// resource id and the route's metadata beyond target and ok, the number
+// the forge gives what the route creates being next (0 for nothing); on a
+// failure its resource id and the route's metadata beyond target, ok and
+// error_type.
+var writeEvents = []struct {
+	method, path  string
+	body          any
+	typ, resource string
+	next          int64
+	id            string
+	meta          map[string]any
+	failedID      string
+	failedMeta    map[string]any
+}{
+	{http.MethodPost, "/issues", map[string]any{"title": titleMarker, "body": textMarker, "labels": []string{"bug"}},
+		"parley.forge.issue.create", "issue", 7,
+		"7", map[string]any{"number": 7, "url": "https://github.com/acme/widgets/issues/7"},
+		"none", nil},
+}
+
+// wantEvent checks that got is an event of the type typ about the resource
+// id, recorded on the workspace slug by the owner, with exactly the
+// metadata members of base and extra, and none of the markers.
+func (w *world) wantEvent(t *testing.T, got recorded, slug, typ, resource, id string, base, extra map[string]any) {
+	t.Helper()
+	want := maps.Clone(base)
+	maps.Copy(want, extra)
+	wantMeta, _ := json.Marshal(want)
+	action := typ[strings.LastIndexByte(typ, '.')+1:]
+	if got.Type != typ || got.ResourceType != resource || got.ResourceID != id || got.Action != action {
+		t.Errorf("the event is %s on %s %q, action %s, want %s on %s %q, action %s",
+			got.Type, got.ResourceType, got.ResourceID, got.Action, typ, resource, id, action)
+	}
+	if got.Workspace == nil || *got.Workspace != slug || got.ActorType != "api_key" || got.ActorID == nil || *got.ActorID != w.owner {
+		t.Errorf("the event is on %v by %s %v, want on %s by the owner's key", got.Workspace, got.ActorType, got.ActorID, slug)
+	}
+	if !sameJSON(got.Metadata, string(wantMeta)) {
+		t.Errorf("the event's metadata is %s, want %s", got.Metadata, wantMeta)
+	}
+	line, err := json.Marshal(got.Record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{titleMarker, textMarker, descMarker, tokenMarker, forgeMarker} {
+		if strings.Contains(string(line), marker) {
+			t.Errorf("the event %s holds %s", line, marker)
+		}
+	}
+}
+
+// eventWorld is a world with the GitHub workspace demo, whose stored token
+// is tokenMarker, its task fork demo-fork, and the workspace closed, whose
+// forge nothing listens for; adjust changes the forge component's
+// dependencies, when it is not nil.
+func eventWorld(t *testing.T, adjust func(w *world, d *forge.Deps)) *world {
+	t.Helper()
+	w := newWorldWith(t, hubtest.Config{}, adjust)
+	gh := new("https://github.com/acme/widgets.git")
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo", GitURL: gh, Settings: w.github()})
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo-fork", ParentSlug: new("demo")})
+	w.addWorkspace(t, workspace.Workspace{Slug: "closed", GitURL: gh, Settings: settings(forge.SettingAPIURL, closedURL(t)+"/github")})
+	w.putSecret(t, "demo", workspace.SecretGitPAT, tokenMarker)
+	w.putSecret(t, "closed", workspace.SecretGitPAT, tokenMarker)
+	return w
+}
+
+func TestWriteRoute_RecordsOneEventBeforeItAnswers(t *testing.T) {
+	t.Parallel()
+	w := eventWorld(t, nil)
+	for _, e := range writeEvents {
+		for _, slug := range []string{"demo", "demo-fork"} {
+			t.Run(e.method+" "+e.path+" on "+slug, func(t *testing.T) {
+				w.seedIssue(ghRepo)
+				if e.next != 0 {
+					w.fake.SetNext(ghRepo, e.next)
+				}
+				n := w.rec.count()
+				status, body, sent := w.send(t, e.method, slug, "/watched"+e.path, w.ownerKey, e.body)
+				events := w.rec.since(n)
+				if status >= 300 || sent == 0 || len(events) != 1 {
+					t.Fatalf("%s %s%s = %d %.300s after %d forge requests and %d events, want success and one event",
+						e.method, slug, e.path, status, body, sent, len(events))
+				}
+				if events[0].answered {
+					t.Error("the event was recorded after the answer was written")
+				}
+				base := map[string]any{"target": "origin", "ok": true}
+				if slug != "demo" {
+					base["fork"] = slug
+				}
+				w.wantEvent(t, events[0], "demo", e.typ, e.resource, e.id, base, e.meta)
+			})
+		}
+	}
+}
+
+// forgeFailure is a way a forge call fails, and the answer it gets: the
+// answer scripted for the route's first forge request, or for the
+// workspace closed none, and the hub's status, error type and Retry-After.
+type forgeFailure struct {
+	name, slug      string
+	answer          forgetest.Answer
+	status          int
+	errorType, wait string
+}
+
+// failedWrite sends every route of writeEvents to the forge that fails as f
+// does and checks the answer and the one event it records.
+func (w *world) failedWrite(t *testing.T, f forgeFailure) {
+	t.Helper()
+	for _, e := range writeEvents {
+		t.Run(e.method+" "+e.path+", "+f.name, func(t *testing.T) {
+			w.seedIssue(ghRepo)
+			if f.slug != "closed" {
+				w.fake.Script(f.answer)
+			}
+			n := w.rec.count()
+			status, header, body := w.Exchange(t, e.method, "/api/v1/workspaces/"+f.slug+e.path, w.ownerKey, e.body, nil)
+			if er := errorOf(t, body); status != f.status || er.Type != f.errorType || header.Get("Retry-After") != f.wait {
+				t.Errorf("%s %s%s = %d %.300s with Retry-After %q, want %d %s with %q",
+					e.method, f.slug, e.path, status, body, header.Get("Retry-After"), f.status, f.errorType, f.wait)
+			}
+			if strings.Contains(string(body), tokenMarker) {
+				t.Errorf("the answer %s holds the token", body)
+			}
+			events := w.rec.since(n)
+			if len(events) != 1 {
+				t.Fatalf("%d events were recorded, want one", len(events))
+			}
+			w.wantEvent(t, events[0], f.slug, e.typ, e.resource, e.failedID,
+				map[string]any{"target": "origin", "ok": false, "error_type": f.errorType}, e.failedMeta)
+		})
+	}
+}
+
+func TestWriteRoute_AnswersAFailedForgeCallAsItsMappedError(t *testing.T) {
+	t.Parallel()
+	w := eventWorld(t, nil)
+	refusal := `{"message":"` + forgeMarker + `"}`
+	failures := []forgeFailure{
+		{"404", "demo", forgetest.Answer{Status: 404, Body: refusal}, 404, forge.ErrorTypeNotFound, ""},
+		{"401", "demo", forgetest.Answer{Status: 401, Body: refusal}, 502, forge.ErrorTypeUnauthenticated, ""},
+		{"403", "demo", forgetest.Answer{Status: 403, Body: refusal}, 502, forge.ErrorTypeForbidden, ""},
+		{"410", "demo", forgetest.Answer{Status: 410, Body: refusal}, 422, forge.ErrorTypeRejected, ""},
+		{"422 echoing the token", "demo", forgetest.Answer{Status: 422,
+			Body: `{"message":"` + forgeMarker + ` Authorization: Bearer ` + tokenMarker + `"}`}, 422, forge.ErrorTypeRejected, ""},
+		{"500", "demo", forgetest.Answer{Status: 500, Body: refusal}, 502, forge.ErrorTypeError, ""},
+		{"a 2xx body that is no JSON", "demo", forgetest.Answer{Status: 201, Body: "<html>" + forgeMarker}, 502, forge.ErrorTypeError, ""},
+		{"429 with Retry-After 120", "demo", forgetest.Answer{Status: 429, Header: http.Header{"Retry-After": {"120"}}, Body: refusal},
+			429, forge.ErrorTypeRateLimited, "120"},
+		{"a closed listener", "closed", forgetest.Answer{}, 502, forge.ErrorTypeUnreachable, ""},
+	}
+	for _, f := range failures {
+		w.failedWrite(t, f)
+	}
+	t.Run("the echoed token is redacted", func(t *testing.T) {
+		w.fake.Script(failures[4].answer)
+		e := writeEvents[0]
+		_, body, _ := w.send(t, e.method, "demo", e.path, w.ownerKey, e.body)
+		if strings.Contains(string(body), tokenMarker) || !strings.Contains(string(body), "[redacted]") {
+			t.Errorf("the answer %s holds the token or no [redacted]", body)
+		}
+	})
+}
+
+func TestWriteRoute_AnswersAForgeThatDoesNotAnswerInTimeAsATimeout(t *testing.T) {
+	t.Parallel()
+	w := eventWorld(t, func(_ *world, d *forge.Deps) { d.Client.Deadline = 200 * time.Millisecond })
+	w.failedWrite(t, forgeFailure{"no answer before the deadline", "demo", forgetest.Answer{Hold: true},
+		http.StatusGatewayTimeout, forge.ErrorTypeTimeout, ""})
+}
+
+func TestWriteRoute_RunsToItsEndWhenTheCallerLeaves(t *testing.T) {
+	t.Parallel()
+	w := eventWorld(t, nil)
+	w.fake.SetNext(ghRepo, 7)
+	release := make(chan struct{})
+	w.fake.Script(forgetest.Answer{Release: release, Through: true})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/demo/issues"), strings.NewReader(`{"title":"t"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+w.ownerKey)
+	req.Header.Set("Content-Type", "application/json")
+	left := make(chan error, 1)
+	go func() {
+		resp, err := (&http.Client{}).Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		left <- err
+	}()
+	waitUntil(t, "the forge to receive the create", func() bool { return w.fake.Count() == 1 })
+	cancel()
+	if err := <-left; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the caller did not leave before the answer: %v", err)
+	}
+	close(release)
+
+	waitUntil(t, "the write's event", func() bool { return w.rec.count() == 1 })
+	if _, ok := w.fake.Issue(ghRepo, 7); !ok {
+		t.Error("the forge does not hold the issue")
+	}
+	got := w.rec.since(0)[0]
+	if m := got.meta(t); got.Type != "parley.forge.issue.create" || m["ok"] != true || m["number"] != float64(7) {
+		t.Errorf("the event is %s with %s, want parley.forge.issue.create, ok and number 7", got.Type, got.Metadata)
+	}
+	// The close route's row, a caller who leaves once the comment was
+	// posted, comes with that route.
+}
+
+func TestWriteRoute_AnswersInternalWhenItsEventCannotBeRecorded(t *testing.T) {
+	t.Parallel()
+	w := eventWorld(t, nil)
+	w.rec.failWith(errors.New("the event log cannot be written"))
+	w.fake.SetNext(ghRepo, 7)
+	status, body, sent := w.send(t, http.MethodPost, "demo", "/issues", w.ownerKey, map[string]any{"title": "t"})
+	if e := errorOf(t, body); status != http.StatusInternalServerError || e.Type != "internal" {
+		t.Errorf("POST demo/issues = %d %s, want 500 internal", status, body)
+	}
+	if strings.Contains(string(body), tokenMarker) || strings.Contains(string(body), "acme/widgets") {
+		t.Errorf("the answer %s holds the token or the forge's answer", body)
+	}
+	if _, ok := w.fake.Issue(ghRepo, 7); !ok || sent != 1 || w.fake.Last(t).Method != http.MethodPost {
+		t.Errorf("the forge holds the issue: %v, after %d requests, the last %s; want the issue kept after the one create",
+			ok, sent, w.fake.Last(t).Method)
 	}
 }

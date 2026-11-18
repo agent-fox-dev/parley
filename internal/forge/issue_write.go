@@ -36,13 +36,15 @@ func readIssueCreate(r *http.Request, call *Call) error {
 }
 
 // createIssue creates the issue the request's body describes and answers it
-// as the forge returns it.
+// as the forge returns it; its event has the new number and the issue's
+// web URL.
 func createIssue(ctx context.Context, call *Call) (written, error) {
 	issue, err := writerOf(call.Resolution.Kind).createIssue(ctx, call, call.Params.(issueInput))
 	if err != nil {
 		return written{}, err
 	}
-	return written{status: http.StatusCreated, body: issue}, nil
+	return written{status: http.StatusCreated, body: issue,
+		event: writeEvent{number: issue.Number, url: issue.URL}}, nil
 }
 
 // githubIssueWrite is the body of an issue create on GitHub: the fields

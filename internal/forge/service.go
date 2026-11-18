@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -34,10 +35,17 @@ type SettingsReader interface {
 	EffectiveSettings(stored map[string]json.RawMessage, defaultBranch *string) map[string]any
 }
 
+// EventEmitter records a hub event in a store transaction of its own, as
+// the event component's EmitNow does.
+type EventEmitter interface {
+	EmitNow(ctx context.Context, in event.Input) (event.Record, error)
+}
+
 // Deps are what the forge component reads: the workspace records, their
 // settings and secrets, the access rule it asks about a fork's parent, the
-// options of the client it sends forge requests with, the hub's scrubber,
-// logger and clock, and the hub's external URL.
+// options of the client it sends forge requests with, the event log a write
+// is recorded in, the hub's scrubber, logger and clock, and the hub's
+// external URL.
 type Deps struct {
 	// Workspaces reads the workspace record of a slug.
 	Workspaces func(ctx context.Context, slug string) (workspace.Workspace, bool, error)
@@ -46,7 +54,9 @@ type Deps struct {
 	Access     AccessDecider
 	// Client are the options the client is built with when the component
 	// is bound.
-	Client      ClientOptions
+	Client ClientOptions
+	// Events records the event of every write that reached the forge.
+	Events      EventEmitter
 	Scrubber    *scrub.Scrubber
 	Logger      *slog.Logger
 	Now         func() time.Time

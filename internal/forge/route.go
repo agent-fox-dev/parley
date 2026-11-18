@@ -97,13 +97,15 @@ type Call struct {
 	Client *Client
 	// Params is what the route's Params kept.
 	Params any
+	// sent is how many requests were handed to the forge client, which
+	// decides whether a write is recorded.
+	sent int
 }
 
 // Get sends GET <the API URL><path> to the target's forge with the
 // target's credential.
 func (c *Call) Get(ctx context.Context, path string) (*Response, error) {
-	return c.Client.Do(ctx, Request{Method: http.MethodGet, URL: c.Resolution.APIURL + path,
-		Kind: c.Resolution.Kind, Credential: c.Resolution.Credential})
+	return c.send(ctx, http.MethodGet, path, nil)
 }
 
 // Route builds the server route of rt, whose handler runs the shared checks

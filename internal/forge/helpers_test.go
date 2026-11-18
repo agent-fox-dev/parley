@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,16 +55,19 @@ const (
 	deniedParent = "pd"
 )
 
-// world is a hub with the probe routes, its forge client sending to a fake
+// world is a hub with the probe routes and the watched write routes, its
+// forge component recording its events through a recorder, its forge client sending to a fake
 // GitHub over TLS, an owner and a member of the org acme, and an outsider.
 type world struct {
 	*hubtest.Hub
 	fake    *forgetest.Fake
 	secrets *secret.Component
 	decider *decider
-	// forge is the hub's forge component, and events its event log.
+	// forge is the hub's forge component, events its event log, and rec
+	// the recorder the component records its events through.
 	forge  *forge.Component
 	events *event.Component
+	rec    *recorder
 
 	org                         string
 	owner, member, outsider     string
@@ -95,8 +100,15 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 			for _, pattern := range []string{probeList, probeNumber} {
 				c.AddRoute(c.Forge().Route(probe(pattern)))
 			}
+			for _, rt := range c.Forge().Routes() {
+				if rt.Scope == forge.ScopeWrite {
+					c.AddRoute(watched(rt))
+				}
+			}
 			c.AdjustForge(func(d *forge.Deps) {
 				d.Client.Transport = w.fake.Transport()
+				w.rec = &recorder{next: d.Events}
+				d.Events = w.rec
 				d.Secrets = brokenSecrets{d.Secrets}
 				w.decider.real = d.Access
 				d.Access = w.decider
@@ -172,6 +184,120 @@ func probe(pattern string) forge.Route {
 			server.WriteJSON(w, http.StatusOK, map[string]any{"forge": answer})
 			return nil
 		},
+	}
+}
+
+// watched is the write route rt at /workspaces/:slug/watched/..., in place
+// of /workspaces/:slug/..., whose answer notes whether it has been written,
+// so that the recorder can tell whether an event came before the answer.
+func watched(rt server.Route) server.Route {
+	rt.Pattern = strings.Replace(rt.Pattern, "/:slug/", "/:slug/watched/", 1)
+	serve := rt.Handler
+	rt.Handler = func(w http.ResponseWriter, r *http.Request) error {
+		ww := &watchedWriter{ResponseWriter: w}
+		return serve(ww, r.WithContext(context.WithValue(r.Context(), watchedKey{}, ww)))
+	}
+	return rt
+}
+
+// watchedKey is the context key of a watched route's answer.
+type watchedKey struct{}
+
+// watchedWriter is a watched route's answer, which notes whether anything
+// has been written to it.
+type watchedWriter struct {
+	http.ResponseWriter
+	written atomic.Bool
+}
+
+func (w *watchedWriter) WriteHeader(status int) {
+	w.written.Store(true)
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *watchedWriter) Write(b []byte) (int, error) {
+	w.written.Store(true)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *watchedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// recorder is the forge component's event emitter in the tests: it
+// records each event in the hub's event log and keeps it, or fails every
+// event once failWith has been called.
+type recorder struct {
+	next forge.EventEmitter
+
+	mu     sync.Mutex
+	fail   error
+	events []recorded
+}
+
+// recorded is an event the recorder recorded, and whether the answer to
+// the request had been written then, which only a watched route tells.
+type recorded struct {
+	event.Record
+	answered bool
+}
+
+func (r *recorder) EmitNow(ctx context.Context, in event.Input) (event.Record, error) {
+	ww, _ := ctx.Value(watchedKey{}).(*watchedWriter)
+	answered := ww != nil && ww.written.Load()
+	r.mu.Lock()
+	fail := r.fail
+	r.mu.Unlock()
+	if fail != nil {
+		return event.Record{}, fail
+	}
+	rec, err := r.next.EmitNow(ctx, in)
+	if err != nil {
+		return rec, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, recorded{rec, answered})
+	return rec, nil
+}
+
+// failWith makes every later event fail with err.
+func (r *recorder) failWith(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fail = err
+}
+
+// count is how many events the recorder recorded.
+func (r *recorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.events)
+}
+
+// since are the events recorded after the first n.
+func (r *recorder) since(n int) []recorded {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.events[n:])
+}
+
+// meta is the event's metadata, decoded.
+func (r recorded) meta(t *testing.T) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(r.Metadata, &m); err != nil {
+		t.Fatalf("the metadata %s of %s: %v", r.Metadata, r.Type, err)
+	}
+	return m
+}
+
+// waitUntil waits for done to hold, failing the test when it does not
+// within ten seconds.
+func waitUntil(t *testing.T, what string, done func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !done(); time.Sleep(2 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("gave up waiting for %s", what)
+		}
 	}
 }
 
