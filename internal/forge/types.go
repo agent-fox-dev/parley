@@ -179,6 +179,16 @@ type Comment struct {
 	URL       string        `json:"url"`
 }
 
+// Label is a forge label as the hub answers it, in one shape for both
+// forges.
+type Label struct {
+	Name string `json:"name"`
+	// Color is six lower-case hex digits, without a leading #.
+	Color string `json:"color"`
+	// Description is "" when the forge gives none.
+	Description string `json:"description"`
+}
+
 // IssueThread is an issue with the first page of its comments, oldest
 // first. When the comments could not be read, Comments is empty and
 // CommentsError says why; the issue is answered all the same.

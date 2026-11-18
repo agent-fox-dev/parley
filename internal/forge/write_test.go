@@ -34,13 +34,18 @@ var writeRoutes = []writeRoute{
 	{http.MethodPost, "/issues/7/close", map[string]any{"comment": "c"}},
 	{http.MethodPost, "/issues/7/comments", map[string]any{"body": "b"}},
 	{http.MethodPost, "/pulls/12/comments", map[string]any{"body": "b"}},
+	{http.MethodPost, "/issues/7/labels", []string{"triage"}},
+	{http.MethodDelete, "/issues/7/labels/bug", nil},
+	{http.MethodPost, "/labels", map[string]any{"name": "triage"}},
 }
 
 // seedIssue stores issue 7, open and labelled bug, and pull request 12, open
 // from feature into main, both without comments, in the fake forge's
-// repository repo, so that every write route has an issue and a pull
-// request to work on.
+// repository repo, and leaves the repository without labels, so that every
+// write route has an issue and a pull request to work on and a label to
+// create.
 func (w *world) seedIssue(repo string) {
+	w.fake.SetLabels(repo)
 	w.fake.AddIssue(repo, forgetest.Issue{Number: 7, Title: "Crash", State: "open", Labels: []string{"bug"}})
 	w.fake.AddIssue(repo, forgetest.Issue{Number: 12, Title: "Fix", State: "open", Pull: true, Head: "feature", Base: "main"})
 }
@@ -296,6 +301,23 @@ var (
 		}},
 		{http.MethodPost, "/issues/7/comments", commentBodies},
 		{http.MethodPost, "/pulls/12/comments", commentBodies},
+		{http.MethodPost, "/issues/7/labels", []badBody{
+			{"malformed", `{`, ""}, {"an object", `{}`, ""}, {"a string", `"bug"`, ""}, {"none", nil, ""},
+			{"no names", `[]`, "labels"},
+			{"101 names", names(101), "labels"},
+			{"a blank name", []any{"a", " "}, "labels"},
+			{"a name that is a number", []any{"a", 5}, "labels"},
+		}},
+		{http.MethodPost, "/labels", []badBody{
+			{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"a number", `5`, ""}, {"none", nil, ""},
+			{"no name", map[string]any{}, "name"},
+			{"a blank name", map[string]any{"name": " "}, "name"},
+			{"a colour that is a word", map[string]any{"name": "n", "color": "red"}, "color"},
+			{"a colour of five digits", map[string]any{"name": "n", "color": "#12345"}, "color"},
+			{"a colour of seven digits", map[string]any{"name": "n", "color": "ededed0"}, "color"},
+			{"a colour that is a number", map[string]any{"name": "n", "color": 5}, "color"},
+			{"a description that is a number", map[string]any{"name": "n", "description": 5}, "description"},
+		}},
 	}
 	// commentBodies are the bodies a comment route refuses.
 	commentBodies = []badBody{
@@ -311,6 +333,8 @@ var (
 		bodies       []any
 	}{
 		{http.MethodPost, "/issues", []any{map[string]any{"title": "t", "labels": names(100), "assignees": names(100)}}},
+		{http.MethodPost, "/issues/7/labels", []any{names(100)}},
+		{http.MethodPost, "/labels", []any{map[string]any{"name": "upper", "color": "#EDEDED"}, map[string]any{"name": "lower", "color": "abcdef"}}},
 	}
 )
 
@@ -361,6 +385,7 @@ var decoratedBodies = []struct {
 	{http.MethodPost, "/issues/7/close", map[string]any{}, map[string]any{"comment": nil, "extra": 1}},
 	{http.MethodPost, "/issues/7/comments", map[string]any{"body": "b"}, map[string]any{"body": "b", "extra": 1}},
 	{http.MethodPost, "/pulls/12/comments", map[string]any{"body": "b"}, map[string]any{"body": "b", "extra": 1}},
+	{http.MethodPost, "/labels", map[string]any{"name": "n"}, map[string]any{"name": "n", "color": nil, "description": nil, "x": 1}},
 }
 
 func TestWriteRoute_TreatsNullAsAbsentAndIgnoresUnknownMembers(t *testing.T) {
@@ -524,6 +549,28 @@ var writeEvents = []struct {
 		"parley.forge.pull_request.comment", "pull_request", 0,
 		"12", map[string]any{"number": 12, "url": "https://github.com/acme/widgets/pull/12#issuecomment-12001"},
 		"12", map[string]any{"number": 12}},
+	{http.MethodPost, "/issues/7/labels", []string{"triage", "type/bug"},
+		"parley.forge.label.add", "label", 0,
+		"7", map[string]any{"number": 7, "labels": []string{"triage", "type/bug"}},
+		"7", map[string]any{"number": 7, "labels": []string{"triage", "type/bug"}}},
+	{http.MethodDelete, "/issues/7/labels/bug", nil,
+		"parley.forge.label.remove", "label", 0,
+		"7", map[string]any{"number": 7, "label": "bug"},
+		"7", map[string]any{"number": 7, "label": "bug"}},
+	{http.MethodPost, "/labels", map[string]any{"name": "triage", "color": "#EDEDED", "description": descMarker},
+		"parley.forge.label.create", "label", 0,
+		"triage", map[string]any{"label": "triage", "created": true},
+		"triage", map[string]any{"label": "triage", "created": false}},
+}
+
+// notFoundThen are, per write route of writeEvents that answers a 404 of
+// its first forge request with another request, the decoded path of that
+// request: a failure scripted for the first is scripted for it too, so that
+// the write fails as a whole. The removal of a label reads the issue, and
+// the ensure of a label creates it.
+var notFoundThen = map[string]string{
+	"/issues/7/labels/bug": ghRepo + "/issues/7",
+	"/labels":              ghRepo + "/labels",
 }
 
 // wantEvent checks that got is an event of the type typ about the resource
@@ -621,6 +668,11 @@ func (w *world) failedWrite(t *testing.T, f forgeFailure) {
 			w.seedIssue(ghRepo)
 			if f.slug != "closed" {
 				w.fake.Script(f.answer)
+				if then, ok := notFoundThen[e.path]; ok && f.answer.Status == http.StatusNotFound {
+					a := f.answer
+					a.Path = then
+					w.fake.Script(a)
+				}
 			}
 			n := w.rec.count()
 			status, header, body := w.Exchange(t, e.method, "/api/v1/workspaces/"+f.slug+e.path, w.ownerKey, e.body, nil)

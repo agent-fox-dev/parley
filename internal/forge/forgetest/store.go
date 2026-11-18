@@ -122,6 +122,14 @@ func (f *Fake) AddLabel(repo string, label Label) {
 	r.labels = append(r.labels, label)
 }
 
+// SetLabels makes labels the labels of the repository repo, in place of
+// those it has: none when no label is given.
+func (f *Fake) SetLabels(repo string, labels ...Label) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repository(repo).labels = slices.Clone(labels)
+}
+
 // Labels are the labels of the repository repo.
 func (f *Fake) Labels(repo string) []Label {
 	f.mu.Lock()

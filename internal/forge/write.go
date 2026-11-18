@@ -128,6 +128,12 @@ func (c *Component) writeRoutes() []server.Route {
 			event: eventKind{"parley.forge.comment.create", "comment"}, before: readComment, serve: commentOnIssue}),
 		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls/:number/comments",
 			event: eventKind{"parley.forge.pull_request.comment", "pull_request"}, before: readComment, serve: commentOnPull}),
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/labels",
+			event: eventKind{"parley.forge.label.add", "label"}, before: readLabelsAdd, serve: addLabels}),
+		c.writeRoute(writeRoute{method: http.MethodDelete, pattern: "/workspaces/:slug/issues/:number/labels/:name",
+			event: eventKind{"parley.forge.label.remove", "label"}, before: readLabelRemove, serve: removeLabel}),
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/labels",
+			event: eventKind{"parley.forge.label.create", "label"}, before: readLabelEnsure, serve: ensureLabel}),
 	}
 }
 
@@ -317,6 +323,17 @@ type writer interface {
 	// comment posts body as a comment on the issue number, or in the
 	// conversation of the pull request number when pull is true.
 	comment(ctx context.Context, call *Call, number int64, pull bool, body string) (Comment, error)
+	// addLabels adds the label names to the issue number, leaving the labels
+	// it carries in place.
+	addLabels(ctx context.Context, call *Call, number int64, names []string) error
+	// removeLabel removes the label name from the issue number, which need
+	// not carry it; a missing issue is the forge's 404.
+	removeLabel(ctx context.Context, call *Call, number int64, name string) error
+	// label reads the label name; a label that does not exist is the
+	// forge's 404.
+	label(ctx context.Context, call *Call, name string) (Label, error)
+	// createLabel creates the label in describes.
+	createLabel(ctx context.Context, call *Call, in labelEnsure) (Label, error)
 }
 
 func writerOf(kind ForgeKind) writer {
