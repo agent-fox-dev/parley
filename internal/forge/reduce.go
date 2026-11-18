@@ -76,8 +76,12 @@ var (
 	errMissingField = errors.New("a required field is missing or of the wrong type")
 )
 
-// mappingOf is the mapping of the forge kind.
-func mappingOf(ForgeKind) mapping {
+// mappingOf is the mapping of the forge kind; a kind without one maps
+// nothing.
+func mappingOf(kind ForgeKind) mapping {
+	if kind == KindGitHub {
+		return mapGitHub
+	}
 	return func(string, string, map[string]any) ([]HookEvent, error) { return nil, errNoMapping }
 }
 

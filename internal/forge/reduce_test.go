@@ -1,7 +1,6 @@
 package forge_test
 
 import (
-	"strconv"
 	"strings"
 	"testing"
 
@@ -108,58 +107,37 @@ func TestReduce_ReadsTheActionAndTheTargetOfAnyObject(t *testing.T) {
 	}
 }
 
-// standIn is a mapping of a few rows of the forges' tables, for reducing
-// with a mapping whatever the forges' own map.
-func standIn(event, action string, payload map[string]any) ([]forge.HookEvent, error) {
-	switch {
-	case event == "issues" && action == "opened":
-		n, err := forge.RequiredInt(payload, "issue", "number")
-		if err != nil {
-			return nil, err
-		}
-		return []forge.HookEvent{{Type: "parley.forge.issue.opened", ResourceType: "issue", ResourceID: strconv.FormatInt(n, 10)}}, nil
-	case event == "push":
-		ref, err := forge.RequiredString(payload, "ref")
-		if err != nil {
-			return nil, err
-		}
-		return []forge.HookEvent{{Type: "parley.forge.push", ResourceType: "ref", ResourceID: ref}}, nil
-	case event == "Merge Request Hook" && action == "update":
-		// An update without a new revision relays nothing.
-		return nil, nil
-	}
-	return nil, forge.ErrNoMapping
-}
+// noEvents is a mapping whose every row relays nothing, as a GitLab merge
+// request update without a new revision does.
+func noEvents(string, string, map[string]any) ([]forge.HookEvent, error) { return nil, nil }
 
 func TestReduce_DecidesTheOutcomeByTheFirstMatchingRow(t *testing.T) {
 	t.Parallel()
 	issue := func(number any) map[string]any { return map[string]any{"issue": map[string]any{"number": number}} }
 	cases := []struct {
 		name    string
-		kind    forge.ForgeKind
 		event   string
 		body    []byte
 		outcome forge.Outcome
 		events  []forge.HookEvent
 	}{
-		{"no mapping", forge.KindGitHub, "ping", ghPayload(nil, nil, nil), forge.OutcomeIgnored, nil},
-		{"no mapping for the action", forge.KindGitHub, "issues", ghPayload("assigned", nil, issue(7)), forge.OutcomeIgnored, nil},
-		{"required number missing", forge.KindGitHub, "issues", ghPayload("opened", "other/x", nil), forge.OutcomeMalformed, nil},
-		{"required number a string", forge.KindGitHub, "issues", ghPayload("opened", "acme/widgets", issue("7")), forge.OutcomeMalformed, nil},
-		{"required number 0", forge.KindGitHub, "issues", ghPayload("opened", "acme/widgets", issue(0)), forge.OutcomeMalformed, nil},
-		{"required number not an integer", forge.KindGitHub, "issues", ghPayload("opened", "acme/widgets", issue(1.5)), forge.OutcomeMalformed, nil},
-		{"required string empty", forge.KindGitHub, "push", ghPayload(nil, "acme/widgets", map[string]any{"ref": ""}), forge.OutcomeMalformed, nil},
-		{"required string not a string", forge.KindGitHub, "push", ghPayload(nil, "acme/widgets", map[string]any{"ref": 7}), forge.OutcomeMalformed, nil},
-		{"no events", forge.KindGitLab, "Merge Request Hook", glPayload("update", nil), forge.OutcomeIgnored, nil},
-		{"events without a repository", forge.KindGitHub, "issues", ghPayload("opened", nil, issue(7)), forge.OutcomeMalformed, nil},
-		{"events of another repository", forge.KindGitHub, "issues", ghPayload("opened", "other/x", issue(7)), forge.OutcomeRepositoryMismatch, nil},
-		{"relayed", forge.KindGitHub, "issues", ghPayload("opened", "acme/widgets", issue(7)), forge.OutcomeRelayed,
+		{"no mapping", "ping", ghPayload(nil, nil, nil), forge.OutcomeIgnored, nil},
+		{"no mapping for the action", "issues", ghPayload("assigned", nil, issue(7)), forge.OutcomeIgnored, nil},
+		{"required number missing", "issues", ghPayload("opened", "other/x", nil), forge.OutcomeMalformed, nil},
+		{"required number a string", "issues", ghPayload("opened", "acme/widgets", issue("7")), forge.OutcomeMalformed, nil},
+		{"required number 0", "issues", ghPayload("opened", "acme/widgets", issue(0)), forge.OutcomeMalformed, nil},
+		{"required number not an integer", "issues", ghPayload("opened", "acme/widgets", issue(1.5)), forge.OutcomeMalformed, nil},
+		{"required string empty", "push", ghPayload(nil, "acme/widgets", map[string]any{"ref": ""}), forge.OutcomeMalformed, nil},
+		{"required string not a string", "push", ghPayload(nil, "acme/widgets", map[string]any{"ref": 7}), forge.OutcomeMalformed, nil},
+		{"events without a repository", "issues", ghPayload("opened", nil, issue(7)), forge.OutcomeMalformed, nil},
+		{"events of another repository", "issues", ghPayload("opened", "other/x", issue(7)), forge.OutcomeRepositoryMismatch, nil},
+		{"relayed", "issues", ghPayload("opened", "acme/widgets", issue(7)), forge.OutcomeRelayed,
 			[]forge.HookEvent{{Type: "parley.forge.issue.opened", ResourceType: "issue", ResourceID: "7"}}},
-		{"relayed for the upstream", forge.KindGitHub, "push", ghPayload(nil, "up/widgets", map[string]any{"ref": "refs/heads/main"}), forge.OutcomeRelayed,
+		{"relayed for the upstream", "push", ghPayload(nil, "up/widgets", map[string]any{"ref": "refs/heads/main"}), forge.OutcomeRelayed,
 			[]forge.HookEvent{{Type: "parley.forge.push", ResourceType: "ref", ResourceID: "refs/heads/main"}}},
 	}
 	for _, tc := range cases {
-		red := forge.ReduceWith(standIn, tc.kind, tc.event, tc.body, widgets)
+		red := forge.Reduce(forge.KindGitHub, tc.event, tc.body, widgets)
 		if red.Outcome != tc.outcome || len(red.Events) != len(tc.events) {
 			t.Errorf("%s: outcome %q with %d events; want %q with %d", tc.name, red.Outcome, len(red.Events), tc.outcome, len(tc.events))
 			continue
@@ -171,9 +149,9 @@ func TestReduce_DecidesTheOutcomeByTheFirstMatchingRow(t *testing.T) {
 		}
 	}
 
-	// Until a forge maps an event, the hub relays nothing of it.
-	red := forge.Reduce(forge.KindGitHub, "issues", ghPayload("assigned", "acme/widgets", issue(7)), widgets)
+	// No events, even of no repository, is ignored.
+	red := forge.ReduceWith(noEvents, forge.KindGitLab, "Merge Request Hook", glPayload("update", nil), widgets)
 	if red.Outcome != forge.OutcomeIgnored || len(red.Events) != 0 {
-		t.Errorf("unmapped event: outcome %q with %d events; want ignored with none", red.Outcome, len(red.Events))
+		t.Errorf("no events: outcome %q with %d events; want ignored with none", red.Outcome, len(red.Events))
 	}
 }
