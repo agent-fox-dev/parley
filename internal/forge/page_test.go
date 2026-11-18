@@ -59,6 +59,46 @@ var listRoutes = []listRoute{
 			w.fake.SetList(ghRepo+"/issues/1/comments", comments...)
 		}
 	}, "id"},
+	{"/pulls/1/files", func(w *world, kind forge.ForgeKind, n int) {
+		files := make([]any, n)
+		for i := range files {
+			files[i] = map[string]any{"filename": fmt.Sprintf("f%d", i), "new_path": fmt.Sprintf("f%d", i), "status": "modified"}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/merge_requests/1/diffs", files...)
+		} else {
+			w.fake.SetList(ghRepo+"/pulls/1/files", files...)
+		}
+	}, "filename"},
+	{"/pulls/1/checks", func(w *world, kind forge.ForgeKind, n int) {
+		runs := make([]any, n)
+		for i := range runs {
+			runs[i] = map[string]any{"name": fmt.Sprintf("c%d", i), "status": "queued"}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/merge_requests/1/pipelines", map[string]any{"id": 7})
+			w.fake.SetList(glWidgets+"/pipelines/7/jobs", runs...)
+		} else {
+			w.fake.SetObject(ghRepo+"/pulls/1", githubPull(1, nil))
+			w.fake.SetListIn(ghRepo+"/commits/"+headSHA+"/check-runs", "check_runs", runs...)
+		}
+	}, "name"},
+	{"/pulls/1/reviews", func(w *world, kind forge.ForgeKind, n int) {
+		reviews := make([]any, n)
+		for i := range reviews {
+			if kind == forge.KindGitLab {
+				reviews[i] = gitlabNote(i+1, fmt.Sprintf("r%d", i), false)
+			} else {
+				reviews[i] = map[string]any{"user": map[string]any{"login": "kim"}, "state": "COMMENTED", "body": fmt.Sprintf("r%d", i)}
+			}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetObject(glWidgets+"/merge_requests/1/approvals", map[string]any{"approved_by": []any{}})
+			w.fake.SetList(glWidgets+"/merge_requests/1/notes", reviews...)
+		} else {
+			w.fake.SetList(ghRepo+"/pulls/1/reviews", reviews...)
+		}
+	}, "body"},
 }
 
 func TestForgeList(t *testing.T) {
@@ -147,6 +187,9 @@ func TestForgeList(t *testing.T) {
 			{"another page size", "carry", "/issues?limit=3&state=open&cursor=" + c},
 			{"a page size out of bounds", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"page":2,"size":0}`)},
 			{"no page", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"size":2}`)},
+			{"a phase without its page size", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"page":2,"size":2,"phase":"notes"}`)},
+			{"a phase page size past the page size", "carry", "/issues?state=open&cursor=" +
+				withPosition(t, *first.NextCursor, `{"page":2,"size":2,"phase":"notes","phase_size":3}`)},
 		}
 		for _, c := range cases {
 			status, body, sent := w.get(t, c.slug, c.path, w.Token)

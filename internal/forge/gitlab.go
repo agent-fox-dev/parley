@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -187,4 +188,212 @@ func gitlabWebURL(res Resolution, path string) string {
 		u.Scheme, u.Host = api.Scheme, api.Host
 	}
 	return u.String()
+}
+
+// gitlabMRPath is the API path of the merge request iid of the project r.
+func gitlabMRPath(r Repository, iid int64) string {
+	return gitlabProject(r) + "/merge_requests/" + strconv.FormatInt(iid, 10)
+}
+
+type gitlabMergeRequest struct {
+	IID         int64   `json:"iid"`
+	Title       string  `json:"title"`
+	Description *string `json:"description"`
+	State       string  `json:"state"`
+	WebURL      string  `json:"web_url"`
+	Draft       bool    `json:"draft"`
+	Author      struct {
+		Username string `json:"username"`
+	} `json:"author"`
+	SHA          string     `json:"sha"`
+	SourceBranch string     `json:"source_branch"`
+	TargetBranch string     `json:"target_branch"`
+	CreatedAt    *time.Time `json:"created_at"`
+	UpdatedAt    *time.Time `json:"updated_at"`
+	ClosedAt     *time.Time `json:"closed_at"`
+	MergedAt     *time.Time `json:"merged_at"`
+}
+
+func (gitlab) pull(ctx context.Context, call *Call, iid int64) (PullRequest, error) {
+	var g gitlabMergeRequest
+	if err := getJSON(ctx, call, gitlabMRPath(call.Resolution.Repository, iid), &g); err != nil {
+		return PullRequest{}, err
+	}
+	p := PullRequest{
+		Number: g.IID, Title: g.Title, State: IssueOpen, URL: g.WebURL, Draft: g.Draft,
+		Merged: g.State == PullMerged || g.MergedAt != nil, HeadSHA: g.SHA, HeadBranch: g.SourceBranch,
+		BaseBranch: g.TargetBranch, Author: Author{Login: g.Author.Username}, CreatedAt: stamp(g.CreatedAt),
+		UpdatedAt: stamp(g.UpdatedAt), ClosedAt: stamp(g.ClosedAt), MergedAt: stamp(g.MergedAt),
+	}
+	if g.Description != nil {
+		p.Body = *g.Description
+	}
+	// GitLab's opened and locked merge requests are both open.
+	switch {
+	case p.Merged:
+		p.State = PullMerged
+	case g.State == IssueClosed:
+		p.State = IssueClosed
+	}
+	return p, nil
+}
+
+// files reads the diffs of the merge request iid. GitLab gives no line
+// counts, so they are counted from each file's diff text.
+func (gitlab) files(ctx context.Context, call *Call, iid int64, p Paging) ([]ChangedFile, *Position, error) {
+	q := url.Values{}
+	p.Query(q)
+	var page []struct {
+		NewPath     string `json:"new_path"`
+		NewFile     bool   `json:"new_file"`
+		DeletedFile bool   `json:"deleted_file"`
+		RenamedFile bool   `json:"renamed_file"`
+		Diff        string `json:"diff"`
+	}
+	resp, err := getJSONResponse(ctx, call, gitlabMRPath(call.Resolution.Repository, iid)+"/diffs?"+q.Encode(), &page)
+	if err != nil {
+		return nil, nil, err
+	}
+	files := make([]ChangedFile, 0, len(page))
+	for _, g := range page {
+		f := ChangedFile{Filename: g.NewPath, Status: FileModified}
+		switch {
+		case g.NewFile:
+			f.Status = FileAdded
+		case g.DeletedFile:
+			f.Status = FileDeleted
+		case g.RenamedFile:
+			f.Status = FileRenamed
+		}
+		for line := range strings.SplitSeq(g.Diff, "\n") {
+			switch {
+			case strings.HasPrefix(line, "+"):
+				f.Additions++
+			case strings.HasPrefix(line, "-"):
+				f.Deletions++
+			}
+		}
+		files = append(files, f)
+	}
+	return files, p.Next(resp.Header), nil
+}
+
+// gitlabJobDone maps the statuses of GitLab's finished jobs to the
+// conclusions of a completed check run; every other status but running is
+// queued.
+var gitlabJobDone = map[string]string{
+	"success": CheckSuccess, "failed": CheckFailure, "canceled": CheckCancelled, "skipped": CheckSkipped,
+}
+
+// checks reads the jobs of the merge request's latest pipeline, the first
+// its pipeline list names. The first page finds the pipeline; later pages
+// read the one it found, so a pipeline started meanwhile does not mix two
+// listings.
+func (gitlab) checks(ctx context.Context, call *Call, iid int64, p Paging) ([]CheckRun, *Position, error) {
+	if p.Anchor == "" {
+		var pipelines []struct {
+			ID int64 `json:"id"`
+		}
+		latest := Paging{Position: Position{Page: 1, Size: 1}}
+		q := url.Values{}
+		latest.Query(q)
+		if err := getJSON(ctx, call, gitlabMRPath(call.Resolution.Repository, iid)+"/pipelines?"+q.Encode(), &pipelines); err != nil {
+			return nil, nil, err
+		}
+		if len(pipelines) == 0 {
+			return []CheckRun{}, nil, nil
+		}
+		p.Anchor = strconv.FormatInt(pipelines[0].ID, 10)
+	}
+	q := url.Values{}
+	p.Query(q)
+	var page []struct {
+		Name         string `json:"name"`
+		Status       string `json:"status"`
+		AllowFailure bool   `json:"allow_failure"`
+		WebURL       string `json:"web_url"`
+	}
+	path := gitlabProject(call.Resolution.Repository) + "/pipelines/" + url.PathEscape(p.Anchor) + "/jobs?" + q.Encode()
+	resp, err := getJSONResponse(ctx, call, path, &page)
+	if err != nil {
+		return nil, nil, err
+	}
+	runs := make([]CheckRun, 0, len(page))
+	for _, g := range page {
+		run := CheckRun{Name: g.Name, Status: CheckQueued, URL: g.WebURL}
+		if g.Status == "running" {
+			run.Status = CheckInProgress
+		}
+		if c, ok := gitlabJobDone[g.Status]; ok {
+			if c == CheckFailure && g.AllowFailure {
+				c = CheckNeutral
+			}
+			run.Status, run.Conclusion = CheckCompleted, &c
+		}
+		runs = append(runs, run)
+	}
+	return runs, p.Next(resp.Header), nil
+}
+
+// phaseNotes is the second phase of GitLab's reviews, its notes.
+const phaseNotes = "notes"
+
+// reviews joins the approvals of the merge request iid, which GitLab gives
+// without a time and so come first, in the forge's order, with the notes of
+// people, oldest first. The approvals fill pages first; the page on which
+// they end is filled up with notes, and the notes are then read in pages of
+// the size that page had left, so that no page is longer than the limit.
+// System notes are left out once the forge has paged.
+func (gitlab) reviews(ctx context.Context, call *Call, iid int64, p Paging) ([]Review, *Position, error) {
+	mr := gitlabMRPath(call.Resolution.Repository, iid)
+	reviews := []Review{}
+	notes := Paging{Position: Position{Page: p.Page, Size: p.PhaseSize}}
+	if p.Phase == "" {
+		var approvals struct {
+			ApprovedBy []struct {
+				User struct {
+					Username string `json:"username"`
+				} `json:"user"`
+			} `json:"approved_by"`
+		}
+		if err := getJSON(ctx, call, mr+"/approvals", &approvals); err != nil {
+			return nil, nil, err
+		}
+		all := approvals.ApprovedBy
+		start := min(len(all), (p.Page-1)*p.Size)
+		end := min(len(all), start+p.Size)
+		for _, a := range all[start:end] {
+			reviews = append(reviews, Review{Author: Author{Login: a.User.Username}, State: ReviewApproved})
+		}
+		left := p.Size - len(reviews)
+		switch {
+		case end < len(all):
+			return reviews, &Position{Page: p.Page + 1, Size: p.Size}, nil
+		case left == 0:
+			return reviews, &Position{Page: 1, Size: p.Size, Phase: phaseNotes, PhaseSize: p.Size}, nil
+		}
+		notes.Position = Position{Page: 1, Size: left}
+	}
+	q := url.Values{"sort": {"asc"}, "order_by": {"created_at"}}
+	notes.Query(q)
+	var page []gitlabNote
+	resp, err := getJSONResponse(ctx, call, mr+"/notes?"+q.Encode(), &page)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, g := range page {
+		if g.System {
+			continue
+		}
+		r := Review{Author: Author{Login: g.Author.Username}, State: ReviewCommented, SubmittedAt: stamp(g.CreatedAt)}
+		if g.Body != nil {
+			r.Body = *g.Body
+		}
+		reviews = append(reviews, r)
+	}
+	next := notes.Next(resp.Header)
+	if next != nil {
+		next = &Position{Page: next.Page, Size: p.Size, Phase: phaseNotes, PhaseSize: notes.Size}
+	}
+	return reviews, next, nil
 }

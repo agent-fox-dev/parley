@@ -29,6 +29,11 @@ var readRoutes = []readRoute{
 	{"/issues", []forgetest.Answer{{Body: "[]"}}},
 	{"/issues/1", []forgetest.Answer{{}, {Body: "[]"}}},
 	{"/issues/1/comments", []forgetest.Answer{{Body: "[]"}}},
+	{"/pulls/1", []forgetest.Answer{{}}},
+	{"/pulls/1/state", []forgetest.Answer{{}}},
+	{"/pulls/1/files", []forgetest.Answer{{Body: "[]"}}},
+	{"/pulls/1/checks", []forgetest.Answer{{Body: `{"head":{"sha":"` + headSHA + `"}}`}, {Body: `{"check_runs":[]}`}}},
+	{"/pulls/1/reviews", []forgetest.Answer{{Body: "[]"}}},
 	{"/forge-probe", []forgetest.Answer{{}}},
 	{"/forge-probe/1", []forgetest.Answer{{}}},
 }
@@ -38,6 +43,11 @@ var readRoutes = []readRoute{
 var numberRoutes = []string{
 	"/issues/%s",
 	"/issues/%s/comments",
+	"/pulls/%s",
+	"/pulls/%s/state",
+	"/pulls/%s/files",
+	"/pulls/%s/checks",
+	"/pulls/%s/reviews",
 	"/forge-probe/%s",
 }
 
@@ -275,9 +285,9 @@ func TestForgeRoute_ActsOnAForksParent(t *testing.T) {
 
 	t.Run("decides on the parent by the user behind a token bound to the fork", func(t *testing.T) {
 		bound := w.pat(t, w.owner, "f", forge.ScopeRead)
-		w.fake.Script(forgetest.Answer{}, forgetest.Answer{Body: "[]"})
-		if status, body, _ := w.get(t, "f", "/issues/1", bound); status != http.StatusOK {
-			t.Fatalf("GET f/issues/1 with a token bound to f = %d %s, want 200", status, body)
+		w.fake.Script(forgetest.Answer{})
+		if status, body, _ := w.get(t, "f", "/pulls/1/state", bound); status != http.StatusOK {
+			t.Fatalf("GET f/pulls/1/state with a token bound to f = %d %s, want 200", status, body)
 		}
 		qs := w.decider.questions()
 		if len(qs) == 0 {

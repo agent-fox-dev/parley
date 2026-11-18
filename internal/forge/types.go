@@ -198,6 +198,103 @@ type CommentsError struct {
 	Message string `json:"message"`
 }
 
+// The states of a pull request: an issue's, and merged.
+const PullMerged = "merged"
+
+// PullRequest is a forge pull request, a GitLab merge request, as the hub
+// answers it, in one shape for both forges. A timestamp the forge does not
+// give is nil, written as null.
+type PullRequest struct {
+	// Number is GitHub's number or GitLab's iid.
+	Number int64  `json:"number"`
+	Title  string `json:"title"`
+	// Body is "" when the forge gives none.
+	Body string `json:"body"`
+	// State is IssueOpen, IssueClosed or PullMerged.
+	State  string `json:"state"`
+	URL    string `json:"url"`
+	Draft  bool   `json:"draft"`
+	Merged bool   `json:"merged"`
+	// HeadSHA is the full id of the head commit.
+	HeadSHA    string        `json:"head_sha"`
+	HeadBranch string        `json:"head_branch"`
+	BaseBranch string        `json:"base_branch"`
+	Author     Author        `json:"author"`
+	CreatedAt  *timefmt.Time `json:"created_at"`
+	UpdatedAt  *timefmt.Time `json:"updated_at"`
+	ClosedAt   *timefmt.Time `json:"closed_at"`
+	MergedAt   *timefmt.Time `json:"merged_at"`
+}
+
+// PullRequestState is the part of a pull request that says where it
+// stands.
+type PullRequestState struct {
+	Number  int64  `json:"number"`
+	State   string `json:"state"`
+	Merged  bool   `json:"merged"`
+	HeadSHA string `json:"head_sha"`
+}
+
+// The statuses of a changed file.
+const (
+	FileAdded    = "added"
+	FileModified = "modified"
+	FileDeleted  = "deleted"
+	FileRenamed  = "renamed"
+)
+
+// ChangedFile is a file a pull request changes, with the lines it adds and
+// deletes.
+type ChangedFile struct {
+	Filename  string `json:"filename"`
+	Status    string `json:"status"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+// The statuses and conclusions of a check run.
+const (
+	CheckQueued     = "queued"
+	CheckInProgress = "in_progress"
+	CheckCompleted  = "completed"
+
+	CheckSuccess   = "success"
+	CheckFailure   = "failure"
+	CheckCancelled = "cancelled"
+	CheckSkipped   = "skipped"
+	CheckNeutral   = "neutral"
+)
+
+// CheckRun is a check run of a pull request's head, a job of a GitLab merge
+// request's latest pipeline, as the hub answers it.
+type CheckRun struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	// Conclusion is nil while the run is not completed.
+	Conclusion *string `json:"conclusion"`
+	// Summary is "" when the forge gives none.
+	Summary string `json:"summary"`
+	URL     string `json:"url"`
+}
+
+// The states of a review.
+const (
+	ReviewApproved         = "approved"
+	ReviewChangesRequested = "changes_requested"
+	ReviewCommented        = "commented"
+	ReviewDismissed        = "dismissed"
+)
+
+// Review is a review of a pull request as the hub answers it: on GitLab an
+// approval, which has no time, or a note.
+type Review struct {
+	Author Author `json:"author"`
+	State  string `json:"state"`
+	// Body is "" when the forge gives none.
+	Body        string        `json:"body"`
+	SubmittedAt *timefmt.Time `json:"submitted_at"`
+}
+
 // Author is the forge user who wrote something.
 type Author struct {
 	Login string `json:"login"`
@@ -225,6 +322,17 @@ type api interface {
 	// first, and the position of the forge's next page, nil when it names
 	// none.
 	comments(ctx context.Context, call *Call, number int64, p Paging) ([]Comment, *Position, error)
+	// pull reads the pull request number.
+	pull(ctx context.Context, call *Call, number int64) (PullRequest, error)
+	// files reads the page p of the files the pull request number changes.
+	files(ctx context.Context, call *Call, number int64, p Paging) ([]ChangedFile, *Position, error)
+	// checks reads the page p of the check runs of the pull request
+	// number's head: the head p's anchor names, else the head the forge
+	// names now, which becomes the next position's anchor.
+	checks(ctx context.Context, call *Call, number int64, p Paging) ([]CheckRun, *Position, error)
+	// reviews reads the page p of the reviews of the pull request number,
+	// oldest first.
+	reviews(ctx context.Context, call *Call, number int64, p Paging) ([]Review, *Position, error)
 }
 
 // apiOf is the API of the forge kind, which resolution has found to be

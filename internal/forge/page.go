@@ -18,10 +18,17 @@ const maxPageSize = 200
 // Position is where a forge list continues: the number of the forge's page,
 // from 1, the page size, and the anchor of a list that is read from one
 // thing its first page found, such as a commit, "" for none.
+//
+// A list joined from two forge collections, read one after the other, is in
+// its second phase when Phase is set: Page is then the page of the second
+// collection, read PhaseSize entries at a time, which may be fewer than
+// Size, the page size of the list.
 type Position struct {
-	Page   int    `json:"page"`
-	Size   int    `json:"size"`
-	Anchor string `json:"anchor,omitempty"`
+	Page      int    `json:"page"`
+	Size      int    `json:"size"`
+	Anchor    string `json:"anchor,omitempty"`
+	Phase     string `json:"phase,omitempty"`
+	PhaseSize int    `json:"phase_size,omitempty"`
 }
 
 // Paging is the page of a forge list a request asks for. The forges page by
@@ -54,7 +61,8 @@ func ReadPaging(r *http.Request) (Paging, error) {
 	if err != nil || !continued {
 		return p, err
 	}
-	if pos.Page < 1 || pos.Size < 1 || pos.Size > maxPageSize {
+	if pos.Page < 1 || pos.Size < 1 || pos.Size > maxPageSize || (pos.Phase == "") != (pos.PhaseSize == 0) ||
+		pos.PhaseSize < 0 || pos.PhaseSize > pos.Size {
 		return Paging{}, server.InvalidRequest("cursor is malformed or belongs to another query")
 	}
 	if r.URL.Query().Has("limit") && page.Limit != pos.Size {
@@ -71,8 +79,8 @@ func (p Paging) Query(q url.Values) {
 	q.Set("page", strconv.Itoa(p.Page))
 }
 
-// Next is the position of the forge page after p's, with p's size and
-// anchor, when the forge's answer with header h names a next page in its
+// Next is the position of the forge page after p's, with p's size, anchor
+// and phase, when the forge's answer with header h names a next page in its
 // Link header, else nil.
 func (p Paging) Next(h http.Header) *Position {
 	if !namesNext(h) {

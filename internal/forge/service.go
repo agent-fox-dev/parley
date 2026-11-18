@@ -83,14 +83,14 @@ func (c *Component) Routes() []server.Route {
 	read := func(pattern string, params func(*http.Request, *Call) error, serve func(http.ResponseWriter, *http.Request, *Call) error) server.Route {
 		return c.Route(Route{Method: http.MethodGet, Pattern: pattern, Scope: ScopeRead, Need: access.NeedRead, Params: params, Serve: serve})
 	}
-	return []server.Route{
+	return append([]server.Route{
 		c.Route(Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/forge", Scope: ScopeRead, Need: access.NeedRead,
 			NoTarget: true, Serve: c.serveStatus}),
 		read("/workspaces/:slug/forge/repository", nil, serveRepository),
 		read("/workspaces/:slug/issues", readIssueList, serveIssues),
 		read("/workspaces/:slug/issues/:number", readIssueNumber, c.serveIssueThread),
 		read(commentsPattern, readComments, serveComments),
-	}
+	}, c.pullRoutes()...)
 }
 
 // Client is the client the component sends forge requests with, nil before

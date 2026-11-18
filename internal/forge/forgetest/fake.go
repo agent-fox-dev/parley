@@ -252,11 +252,24 @@ func (f *Fake) SetList(path string, entries ...any) {
 	f.set(path, entity{list: list, isList: true})
 }
 
+// SetListIn is SetList for a list the forge answers inside an object, as
+// the member member, the way GitHub answers check runs.
+func (f *Fake) SetListIn(path, member string, entries ...any) {
+	list := make([]json.RawMessage, len(entries))
+	for i, e := range entries {
+		list[i] = mustJSON(e)
+	}
+	f.set(path, entity{list: list, isList: true, member: member})
+}
+
 // entity is what the fake serves at a path: an object, or a list it pages.
 type entity struct {
 	object json.RawMessage
 	list   []json.RawMessage
 	isList bool
+	// member, when set, is the member of an object the list's page is
+	// answered in, beside total_count.
+	member string
 }
 
 func (f *Fake) set(path string, e entity) {
@@ -293,11 +306,14 @@ func (f *Fake) serveEntity(w http.ResponseWriter, r *http.Request, e entity) {
 	}
 	start := min(len(e.list), (page-1)*size)
 	end := min(len(e.list), start+size)
-	a := Answer{Body: "[]"}
-	if end > start {
-		body, _ := json.Marshal(e.list[start:end])
-		a.Body = string(body)
+	entries := append([]json.RawMessage{}, e.list[start:end]...)
+	var body []byte
+	if e.member != "" {
+		body, _ = json.Marshal(map[string]any{"total_count": len(e.list), e.member: entries})
+	} else {
+		body, _ = json.Marshal(entries)
 	}
+	a := Answer{Body: string(body)}
 	if end < len(e.list) {
 		q.Set("page", strconv.Itoa(page+1))
 		next := f.URL + r.URL.EscapedPath() + "?" + q.Encode()
