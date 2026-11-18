@@ -6767,6 +6767,278 @@ owner of the workspace the claim is stored on and the admin token may
 An id that is not a UUID, is unknown, or names a claim of another workspace
 answers `404` `claim_not_found` on all three routes of one claim.
 
+## Forge reads
+
+A workspace's repository usually lives on GitHub or GitLab. The hub is that
+repository's forge client: the routes below read its issues, comments and
+pull requests with the credential the hub stores for the workspace, so a
+caller never holds a forge token. They answer GitHub and GitLab in one
+shape. They are `GET` routes and behave alike in what follows.
+
+Each takes the admin token, an API key or a PAT, and declares the scope
+`forge:read` for a PAT, which a PAT holding `forge:write` also satisfies. It
+needs read access to the workspace (see [Workspace access](#workspace-access)),
+so an org member reads as the owner does. A PAT with neither scope is
+`403` `insufficient_scope`, for an unknown slug as well, and a caller who
+cannot read the workspace `404` `not_found`, with the same bytes as for an
+unknown slug.
+
+After access, the route checks, in this order, and answers the first
+failure; a request refused at any of them sends nothing to the forge:
+
+1. **Task fork.** A task fork has no forge of its own: called with a fork's
+   slug, the route acts on the fork's parent, with the parent's record,
+   settings and secrets, `target=upstream` included. The caller needs read
+   access on the parent, decided by the user behind the credential (a
+   token bound to the fork is accepted; its binding is not applied to the
+   parent's slug); without it the answer is `403` `forbidden` (`the caller
+   has no read access to the parent of task fork "<slug>"`).
+2. **`target`**, the remote the route works on. Absent or `origin`: the
+   workspace's `git_url`, its origin credential and the setting
+   `forge_api_url`. `upstream`: the `upstream_url`, the upstream credential
+   and the setting `upstream_forge_api_url` (never `forge_api_url`), only on
+   a carry-patch workspace that has an `upstream_url`; elsewhere `400`
+   `workspace_mode_mismatch`. `target` given twice or with another value is
+   `400` `invalid_request` (`target must be given at most once, as origin
+   or upstream`).
+3. **Path and query parameters.** A `:number` is digits only, without sign
+   or leading zero, from 1 to 2,147,483,647; anything else is `400`
+   `invalid_request` (`number must be a positive decimal integer`). Then the
+   route's own parameters and the list parameters (below).
+4. **Forge configuration.** The API URL setting of the target, when set,
+   must be an absolute `https://` URL with a host, without user
+   information, query or fragment: else `422` `forge_api_url_invalid`
+   (`the setting forge_api_url must …`). A remote URL that names no
+   repository is `422` `forge_unknown`, and so is a forge whose kind cannot
+   be told, with a message that names the setting to set (`cannot tell
+   whether <host> is GitHub or GitLab; set forge_api_url to the forge's API
+   URL`, or `upstream_forge_api_url` for upstream). Secrets that cannot be
+   read are `500` `internal`; nothing is sent then, and the hub never falls
+   back to an anonymous request.
+5. **The call.**
+
+Reads work in every workspace state, `pending`, `failed`, archived or busy
+included: they never answer `workspace_archived`, `workspace_not_ready` or
+`workspace_busy`, and they do not use the hub's copy of the repository.
+They record no event, and nothing is cached: every request asks the forge.
+
+**Resolution.** From the remote URL (`https://`, `http://`, `ssh://`,
+`git://` or the scp form `user@host:owner/name`) the hub takes the host in
+lower case, without a leading `www.`, port or user information, and the path
+without one trailing `.git`; it needs at least two segments: `name` is the
+last, `owner` all before it (`group/subgroup` is kept). The forge kind is
+the one of `github` and `gitlab` the API URL setting contains, compared in
+lower case, when it contains exactly one; else the one the host contains,
+when exactly one; else it is unknown. The API URL is the setting with one
+trailing `/` removed, else `https://api.github.com` for `github.com`,
+`https://<host>/api/v3` for another GitHub host and `https://<host>/api/v4`
+for GitLab; a GitLab URL that does not end in `/api/v4` gets it appended.
+
+**Credential.** Read anew from the workspace's secrets on every request, so
+a rotated secret applies to the next one:
+
+| Kind | Origin | Upstream |
+|---|---|---|
+| `pat` | `GIT_PAT`, set and not empty | `UPSTREAM_GIT_PAT`, set and not empty |
+| `basic` | `GIT_USERNAME` and `GIT_PASSWORD`, both set and not empty; the password is the token | `UPSTREAM_GIT_USERNAME` and `UPSTREAM_GIT_PASSWORD`, the same way |
+| `none` | neither | neither, then the origin's credential |
+
+The token is sent as `Authorization: Bearer <token>` to both forges; kind
+`none` sends no authentication. The hub reads no forge token or API URL from
+its environment (`GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`,
+`GITHUB_API_URL`, `GITLAB_API_URL` are never read).
+
+**Outbound requests.** Every request carries `User-Agent:
+parleyd/<version>` and, to GitHub, `Accept: application/vnd.github+json`. It
+goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names, directly for a
+host `NO_PROXY` lists (see [configuration.md](configuration.md)). A redirect
+is followed only to the same scheme, host and port, at most 10 times. Each
+request has a deadline of 30 seconds, its body read included, and a body is
+read up to 8,388,608 bytes. A route that needs several forge requests gives
+each its own deadline. An answer is rate limited when its status is `429`,
+or `403` with `X-RateLimit-Remaining: 0` or a `Retry-After` header; its
+stated wait is `Retry-After` in seconds, else the reset time in
+`X-RateLimit-Reset` or `RateLimit-Reset` minus now. The request is sent once
+more, with a deadline of its own, after the wait, when the wait is at most
+the time left of its deadline.
+
+**Forge failures.** First matching row:
+
+| Condition | Status | `error_type` |
+|---|---|---|
+| a redirect to another scheme, host or port, or an eleventh redirect | `502` | `forge_error` |
+| no complete answer within the deadline | `504` | `forge_timeout` |
+| rate limited, after the retry rule | `429` | `forge_rate_limited` |
+| the forge answers `404` | `404` | `forge_not_found` |
+| the forge answers `401` | `502` | `forge_unauthenticated` |
+| the forge answers `403`, not a rate limit | `502` | `forge_forbidden` |
+| the forge answers another `4xx` | `422` | `forge_rejected` |
+| the forge answers `5xx`, or a body the hub cannot read (over 8,388,608 bytes, not the JSON expected) | `502` | `forge_error` |
+| the connection fails (name resolution, TCP, TLS) | `502` | `forge_unreachable` |
+
+The message is `the forge answered <status>: <the forge's message>`, the
+forge's message being the body's member `message`, else `error`, a value
+that is not a string in its JSON form (`the forge answered 400:
+{"title":["is too long"]}`); `the forge answered <status>` when it gave
+none; a plain description when the forge gave no answer (`the forge did not
+answer within the request's deadline`, `the forge could not be reached: …`).
+A `429` carries `Retry-After` in whole seconds, the wait of the last
+rate-limited answer rounded up, when the forge stated one. Every message is
+scrubbed before it leaves the hub: the token is replaced by `[redacted]`,
+URL user information is removed and the text is cut to 1,024 bytes.
+
+```json
+{"error":{"code":404,"message":"the forge answered 404: 404 Not Found","error_type":"forge_not_found"}}
+```
+
+**Timestamps** are RFC 3339 UTC with whole seconds; an absent one is
+`null`. An absent `body` or `summary` is `""`. `url` is the web URL of the
+object. On GitLab a number is the project-level `iid`, a pull request is a
+merge request, and a project is addressed by its URL-encoded path.
+
+**Lists** answer `{"items":[…],"next_cursor":…}` and take `limit` (1 to
+200, default 50) and `cursor`, as [Lists](#lists) says, with one rule of
+their own: a forge pages by page number and page size, so a request with a
+cursor reads with the cursor's page size, and a `limit` given with a cursor
+must equal it (`400` `invalid_request`, `limit must be left out or equal the
+cursor's page size, <n>`). `next_cursor` is `null` when the forge names no
+next page (`Link` header, `rel="next"`). A page may hold fewer than `limit`
+items when the hub drops entries after the forge paged (GitHub's pull
+requests from the issue list, GitLab's system notes), and is not refilled.
+
+## `GET /api/v1/workspaces/{slug}/forge`
+
+Reports how the hub reaches the workspace's forge, without contacting it.
+It takes no `target`; one that is given is ignored. For a task fork the
+whole document describes the parent, with the parent's slug in
+`webhook.url`.
+
+| Member | Value |
+|---|---|
+| `forge` | `github`, `gitlab` or `unknown` (the remote names no repository, or the kind cannot be told) |
+| `api_url` | the API URL, `null` when `forge` is `unknown` |
+| `repository` | `{host, owner, name}`, `null` when the remote names none |
+| `credential` | the credential kind, `pat`, `basic` or `none`, never the token |
+| `upstream` | the same four members for the upstream of a carry-patch workspace with an `upstream_url`, else `null` |
+| `webhook.configured` | whether the workspace secret `FORGE_WEBHOOK_SECRET` exists and is not empty |
+| `webhook.url` | `[server].external_url` without a trailing `/`, then `/hooks/forge/<slug>`; `null` when `external_url` is empty |
+| `webhook.last_delivery_at` | the time of the newest recorded webhook delivery, `null` when there is none |
+
+| Status | When |
+|---|---|
+| `200 OK` | the document |
+| `422` `forge_api_url_invalid` | `forge_api_url`, or `upstream_forge_api_url` where the upstream applies, is not a valid API URL |
+| `500` `internal` | a secret cannot be read |
+
+```json
+{"forge":"github","api_url":"https://api.github.com","repository":{"host":"github.com","owner":"acme","name":"widgets"},"credential":"pat","upstream":null,"webhook":{"configured":false,"url":"https://hub.example.com/hooks/forge/widgets","last_delivery_at":null}}
+```
+
+## `GET /api/v1/workspaces/{slug}/forge/repository`
+
+The forge's repository: `full_name`, `default_branch`, `private`,
+`archived`, `permissions {pull, push, admin}` and `allow_merge_commit`,
+`allow_squash_merge`, `allow_rebase_merge`, each of the last three `null`
+when the forge does not report it. On GitHub a repository without
+`permissions` reads `{pull: true, push: false, admin: false}`. On GitLab
+`full_name` is `path_with_namespace`, `private` is a `visibility` other than
+`public`, `push` is an access level of 30 or more and `admin` of 40 or more,
+the higher of project and group access; `allow_merge_commit` is
+`merge_method` `merge`, `allow_rebase_merge` `merge_method` `rebase_merge`
+or `ff`, and `allow_squash_merge` a `squash_option` other than `never`.
+
+```json
+{"full_name":"acme/widgets","default_branch":"main","private":true,"archived":false,"permissions":{"pull":true,"push":true,"admin":false},"allow_merge_commit":true,"allow_squash_merge":false,"allow_rebase_merge":true}
+```
+
+## `GET /api/v1/workspaces/{slug}/issues`
+
+A list of issues, never a pull request. Filters, each at most once:
+
+| Parameter | Values | Default |
+|---|---|---|
+| `state` | `open`, `closed`, `all` | `open` |
+| `sort` | `created`, `updated` | `created` |
+| `direction` | `asc`, `desc` | `desc` |
+| `labels` | label names separated by commas; an issue must carry all of them | none |
+| `assignee` | a login | none |
+
+A parameter given twice, a value outside its set, an empty label name
+(`a,,b`, or empty) or an empty assignee is `400` `invalid_request`. An issue
+is `{number, title, body, state, url, author {login}, labels, created_at,
+updated_at, closed_at, is_pr}`; `state` is `open` or `closed` (GitLab's
+`opened` and `locked` read `open`) and `labels` the names.
+
+```json
+{"items":[{"number":7,"title":"Crash","body":"","state":"open","url":"https://github.com/acme/widgets/issues/7","author":{"login":"kim"},"labels":["bug","ui"],"created_at":"2026-10-01T08:00:00Z","updated_at":"2026-10-02T09:30:00Z","closed_at":null,"is_pr":false}],"next_cursor":null}
+```
+
+## `GET /api/v1/workspaces/{slug}/issues/{number}`
+
+The issue thread: `{issue, comments, comments_next_cursor,
+comments_error}`, the issue with its first page of at most 100 comments,
+oldest first. On GitHub the number of a pull request answers the issue with
+`is_pr: true`; on GitLab `is_pr` is always `false`. A failed read of the
+issue is the route's error. `comments_next_cursor` continues on the
+comments route of the same issue and target, without a `limit`, and is
+`null` when the page is complete. When the issue was read and its comments
+were not, the answer is still `200`, with `comments` `[]`,
+`comments_next_cursor` `null` and `comments_error` `{error_type, message}`
+with the values the failure table gives, scrubbed alike; otherwise
+`comments_error` is `null`.
+
+## `GET /api/v1/workspaces/{slug}/issues/{number}/comments`
+
+A list of the issue's comments, oldest first: `{id, body, author {login},
+created_at, updated_at, url}`, `id` being the forge's numeric id. GitLab
+notes are read with `sort=asc&order_by=created_at`, system notes are left
+out, and a note's `url` is the issue's web URL followed by `#note_<id>`.
+
+## `GET /api/v1/workspaces/{slug}/pulls/{number}`
+
+The pull request: `{number, title, body, state, url, draft, merged,
+head_sha, head_branch, base_branch, author {login}, created_at, updated_at,
+closed_at, merged_at}`. `state` is `open`, `closed` or `merged`; it is
+`merged`, with `merged` `true`, when the forge reports it merged. `head_sha`
+is the full commit id.
+
+## `GET /api/v1/workspaces/{slug}/pulls/{number}/state`
+
+`{number, state, merged, head_sha}`, the values the pull request read gives.
+
+```json
+{"number":12,"state":"merged","merged":true,"head_sha":"0123456789abcdef0123456789abcdef01234567"}
+```
+
+## `GET /api/v1/workspaces/{slug}/pulls/{number}/files`
+
+A list of the files the pull request changes: `{filename, status,
+additions, deletions}`, `status` being `added`, `modified`, `deleted` or
+`renamed`. GitHub's `removed` is `deleted`, `copied` is `added`, `changed`
+and `unchanged` are `modified`. On GitLab `additions` and `deletions` count
+the lines of the file's diff that begin with `+` and `-`.
+
+## `GET /api/v1/workspaces/{slug}/pulls/{number}/checks`
+
+A list of the check runs of the pull request's head (on GitLab the jobs of
+the merge request's latest pipeline): `{name, status, conclusion, summary,
+url}`, `status` being `queued`, `in_progress` or `completed`, and
+`conclusion` `success`, `failure`, `cancelled`, `skipped`, `neutral`, or
+`null` while not completed. A head without check runs, or a merge request
+without pipelines, answers `{"items":[],"next_cursor":null}`. Every page of
+one listing reads the head (commit id, or pipeline id) the first page was
+read from, even when the head moved since.
+
+## `GET /api/v1/workspaces/{slug}/pulls/{number}/reviews`
+
+A list of reviews, oldest first: `{author {login}, state, body,
+submitted_at}`, `state` being `approved`, `changes_requested`, `commented`
+or `dismissed`. GitHub's pending reviews are left out. On GitLab the
+approvals come first, in the forge's order, as `approved` with `body` `""`
+and `submitted_at` `null` (the forge reports no time for them), then the
+non-system notes as `commented`, oldest first; no page is longer than
+`limit`.
+
 ## Admin routes
 
 The user and org administration routes are admin routes. Their caller must

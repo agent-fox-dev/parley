@@ -2705,6 +2705,38 @@ empty`) and a `--put` local file that cannot be read (`invalid argument
 no such file or directory`) are refused with a `usage_error` and exit status
 `2` before any setting is read or any request sent.
 
+### `parley forge`, `parley issue` and `parley pr`
+
+These groups read a workspace's forge through the hub's
+[forge reads](api.md#forge-reads); run without a command each prints its
+help and exits `0`. Each command sends one `GET` with the credential as
+`Authorization: Bearer`, `<slug>` and `<number>` each as one
+percent-encoded path segment, and a query parameter only for a flag that
+was given, and prints the hub's JSON answer (see [Output](#output)).
+
+| Command | Request | Flags |
+|---|---|---|
+| `parley forge status <slug>` | `GET …/forge` | none |
+| `parley forge repository <slug>` | `GET …/forge/repository` | `--target` |
+| `parley issue list <slug>` | `GET …/issues` | `--state`, `--label` (repeatable), `--assignee`, `--limit`, `--cursor`, `--target` |
+| `parley issue get <slug> <number>` | `GET …/issues/<number>` | `--target` |
+| `parley issue comments <slug> <number>` | `GET …/issues/<number>/comments` | `--limit`, `--cursor`, `--target` |
+| `parley pr get <slug> <number>` | `GET …/pulls/<number>` | `--target` |
+| `parley pr state <slug> <number>` | `GET …/pulls/<number>/state` | `--target` |
+| `parley pr files <slug> <number>` | `GET …/pulls/<number>/files` | `--limit`, `--cursor`, `--target` |
+| `parley pr checks <slug> <number>` | `GET …/pulls/<number>/checks` | `--limit`, `--cursor`, `--target` |
+| `parley pr reviews <slug> <number>` | `GET …/pulls/<number>/reviews` | `--limit`, `--cursor`, `--target` |
+
+Each flag is sent as the query parameter of its name, and the values of
+every `--label` as one `labels` parameter joined by commas (`parley issue
+list widgets --label bug --label ui` sends the one parameter `labels` with
+the value `bug,ui`). A flag a command
+does not take, a wrong number of arguments, or a `<number>` that is not a
+positive decimal integer of digits only, without sign or leading zero and
+at most 2,147,483,647, is a `usage_error` with exit status `2`, before any
+request. The list commands print the one page the hub answered and take
+`--cursor` to read the next.
+
 ### `parley credential-helper`
 
 ```
