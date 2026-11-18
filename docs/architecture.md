@@ -4998,7 +4998,11 @@ registers, each on the instance it plugs into
   count `retries`, the due time `due_at` of a pending start, NULL for
   none, and `held_by`, the change below that held a start back, and
   `land_auto_land_position`, the position in the event log it has read up
-  to); the start hook `auto-land`, after `land-recover`, which binds it
+  to); its `WorkspaceDeleted(ctx, tx, slug)`, a remover of owned data on
+  the workspace teardown that deletes the workspace's `land_auto_land`
+  rows in the delete's transaction, so that a workspace registered again
+  under the slug, whose changes are numbered from 1 again, inherits no
+  retries, due starts or holds; the start hook `auto-land`, after `land-recover`, which binds it
   (`AutoLandDeps`: the store, the land component as `Starter`, the change
   component, the event component, the users through
   `identity.UserByID`, the access rule, the workspace records, the

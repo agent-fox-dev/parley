@@ -940,6 +940,18 @@ func forgetAutoLand(ctx context.Context, tx *sql.Tx, workspace string, number in
 	return nil
 }
 
+// WorkspaceDeleted deletes, in tx, every row the lander keeps of the
+// changes of the workspace, as the workspace's teardown removes the data
+// kept for it: a workspace registered later under the same slug numbers
+// its changes from 1 again, and must not inherit their retries, due
+// starts or holds (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
+func (l *AutoLander) WorkspaceDeleted(ctx context.Context, tx *sql.Tx, workspace string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM land_auto_land WHERE workspace_slug = ?`, workspace); err != nil {
+		return fmt.Errorf("forget the automatic lands of %s: %w", workspace, err)
+	}
+	return nil
+}
+
 // baseOf is the base of the current version of ch, "" for the empty tree.
 func baseOf(ch change.Change) string {
 	if ch.BaseSHA == nil {
