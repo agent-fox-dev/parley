@@ -7339,8 +7339,10 @@ workspace still relays. The first matching step answers:
 
 1. An unknown slug, a task fork's slug, or a workspace whose
    `FORGE_WEBHOOK_SECRET` is absent or empty: `404` `not_found` with the
-   message `not found`, the same bytes for all three. A secret that is
-   stored but cannot be read or decrypted is `500` `internal`.
+   message `not found`, the same bytes for all three. The hub reads the
+   workspace and its secret for every slug, so the three also take the
+   same reads. A secret that cannot be read, or that is stored but cannot
+   be decrypted, is `500` `internal`.
 2. A request with `X-Hub-Signature-256` is a GitHub delivery (its
    `X-Gitlab-Token` is not looked at); otherwise one with `X-Gitlab-Token`
    is a GitLab delivery; otherwise `401`.
