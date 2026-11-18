@@ -80,8 +80,11 @@ func newWorld(t *testing.T) *world {
 }
 
 // newWorldWith is newWorld with the server TOML, the TOML and the
-// environment of cfg added to the hub's, and adjust, when it is not nil, run on the forge
-// component's dependencies after the world's own changes.
+// environment of cfg added to the hub's, the clock and the maintenance
+// interval of cfg as the hub's, the Compose of cfg, when it is not nil, run
+// on the hub's composition after the world's own, and adjust, when it is
+// not nil, run on the forge component's dependencies after the world's own
+// changes.
 func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *forge.Deps)) *world {
 	t.Helper()
 	key := make([]byte, 32)
@@ -92,9 +95,11 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 	env := map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)}
 	maps.Copy(env, cfg.Env)
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		Server: cfg.Server,
-		TOML:   cfg.TOML,
-		Env:    env,
+		Server:              cfg.Server,
+		TOML:                cfg.TOML,
+		Env:                 env,
+		Now:                 cfg.Now,
+		MaintenanceInterval: cfg.MaintenanceInterval,
 		Compose: func(c *hub.Composition) {
 			w.secrets, w.forge, w.events = c.Secrets(), c.Forge(), c.Events()
 			for _, pattern := range []string{probeList, probeNumber} {
@@ -116,6 +121,9 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 					adjust(w, d)
 				}
 			})
+			if cfg.Compose != nil {
+				cfg.Compose(c)
+			}
 		},
 	})
 	w.owner, w.member, w.outsider = w.CreateUser(t, "owner"), w.CreateUser(t, "member"), w.CreateUser(t, "outsider")
@@ -507,4 +515,21 @@ func errorOf(t *testing.T, body []byte) hubError {
 		t.Fatalf("the answer %s is no error: %v", body, err)
 	}
 	return e.Error
+}
+
+// eventsOf are the events of the hub's log whose type begins with prefix,
+// of slug only unless slug is "".
+func (w *world) eventsOf(t *testing.T, prefix, slug string) []event.Record {
+	t.Helper()
+	records, _, err := w.events.ReadAfter(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("read the event log: %v", err)
+	}
+	var out []event.Record
+	for _, r := range records {
+		if strings.HasPrefix(r.Type, prefix) && (slug == "" || r.Workspace != nil && *r.Workspace == slug) {
+			out = append(out, r)
+		}
+	}
+	return out
 }

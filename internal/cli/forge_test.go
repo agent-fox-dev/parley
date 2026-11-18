@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -93,5 +94,127 @@ func TestForge_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"forge", "repository", "widgets", "7"},
 		{"forge", "status", "widgets", "--target", "origin"},
 		{"forge", "repository", "widgets", "--limit", "5"},
+	})
+}
+
+// webhookPath is the webhook route of the workspace demo, as sent.
+const webhookPath = "/api/v1/workspaces/demo/forge/webhook"
+
+// A generated secret, and the answers to a set that generated it and to one
+// that was given it.
+const (
+	generatedSecret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	generatedAnswer = `{"configured": true, "url": "https://hub.example/hooks/forge/demo", "secret": "` + generatedSecret + `"}`
+	givenAnswer     = `{"configured": true, "url": "https://hub.example/hooks/forge/demo"}`
+)
+
+func TestForgeWebhookSet_SendsNoBodyToGenerateAndNotesTheSecretIsShownOnce(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args    []string
+		rawPath string
+	}{
+		{[]string{"demo"}, webhookPath},
+		{[]string{"demo", "--generate"}, webhookPath},
+		{[]string{"a/b"}, "/api/v1/workspaces/a%2Fb/forge/webhook"},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			t.Parallel()
+			path, err := url.PathUnescape(tc.rawPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hub := newStubHub(t).answer(http.MethodPut, path, http.StatusOK, generatedAnswer)
+
+			code, stdout, stderr, sent := runOnHub(t, hub, append([]string{"forge", "webhook", "set"}, tc.args...)...)
+
+			got := wantOnlyRequest(t, sent, http.MethodPut, tc.rawPath)
+			if got.body != "" || got.contentLength > 0 {
+				t.Errorf("the PUT carried the body %q, want none", got.body)
+			}
+			if want := indented(t, generatedAnswer); code != 0 || stdout != want {
+				t.Errorf("exit status %d, stdout %q; want 0 and %q", code, stdout, want)
+			}
+			if !strings.Contains(stderr, "will not be shown again") || strings.Contains(stderr, generatedSecret) {
+				t.Errorf("stderr = %q, want a note that the secret will not be shown again, without the secret", stderr)
+			}
+		})
+	}
+}
+
+func TestForgeWebhookSet_SendsTheGivenSecretWithoutTheNote(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, stdin string
+		args        []string
+		want        string
+	}{
+		{"flag", "", []string{"--secret", "s3cret-value-0123"}, "s3cret-value-0123"},
+		{"stdin with a newline", "s3cret-value-0123\n", []string{"--from-stdin"}, "s3cret-value-0123"},
+		{"stdin with a carriage return and a newline", "s3cret-value-0123\r\n", []string{"--from-stdin"}, "s3cret-value-0123"},
+		{"stdin without a line break", "s3cret-value-0123", []string{"--from-stdin"}, "s3cret-value-0123"},
+		{"stdin with two newlines", "abc\n\n", []string{"--from-stdin"}, "abc\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).answer(http.MethodPut, webhookPath, http.StatusOK, givenAnswer)
+
+			code, stdout, stderr := runWithStdin(t, tc.stdin, onHub(hub.URL, append([]string{"forge", "webhook", "set", "demo"}, tc.args...)...)...)
+
+			wantResult(t, code, stdout, stderr, givenAnswer)
+			got := wantOnlyRequest(t, hub.recorded(), http.MethodPut, webhookPath)
+			var body map[string]string
+			if err := json.Unmarshal([]byte(got.body), &body); err != nil || len(body) != 1 || body["secret"] != tc.want {
+				t.Errorf("the PUT carried %q, want {\"secret\": %q}", got.body, tc.want)
+			}
+		})
+	}
+}
+
+func TestForgeWebhookSet_RefusesMoreThanOneSourceOrNoSlugBeforeAnyRequest(t *testing.T) {
+	t.Parallel()
+	set := []string{"forge", "webhook", "set"}
+	wantRefused(t, [][]string{
+		append(set, "demo", "--secret", "s3cret-value-0123", "--generate"),
+		append(set, "demo", "--secret", "s3cret-value-0123", "--from-stdin"),
+		append(set, "demo", "--from-stdin", "--generate"),
+		append(set, "demo", "--secret", "s3cret-value-0123", "--from-stdin", "--generate"),
+		set,
+	})
+}
+
+func TestForgeWebhookUnset_SendsTheDeleteAndConfirmsOrPrintsTheHubsError(t *testing.T) {
+	t.Parallel()
+	refusal := `{"error": {"code": 400, "message": "a task fork has no origin", "error_type": "fork_has_no_origin"}}`
+	for _, tc := range []struct {
+		name   string
+		status int
+		answer string
+	}{
+		{"unset", http.StatusNoContent, ""},
+		{"refused", http.StatusBadRequest, refusal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).answer(http.MethodDelete, webhookPath, tc.status, tc.answer)
+
+			code, stdout, stderr, sent := runOnHub(t, hub, "forge", "webhook", "unset", "demo")
+
+			wantOnlyRequest(t, sent, http.MethodDelete, webhookPath)
+			if tc.status == http.StatusNoContent {
+				wantResult(t, code, stdout, stderr, `{"status": "unset", "workspace": "demo"}`)
+			} else {
+				wantHubFailure(t, code, stdout, stderr, refusal)
+			}
+		})
+	}
+}
+
+func TestForgeDeliveries_SendsAQueryParameterForEachFlagGiven(t *testing.T) {
+	t.Parallel()
+	wantReads(t, []sentRead{
+		{[]string{"forge", "deliveries", "demo"}, "demo/forge/deliveries", nil},
+		{[]string{"forge", "deliveries", "demo", "--since", "2026-10-21T09:00:00Z", "--limit", "10", "--cursor", "abc"}, "demo/forge/deliveries",
+			url.Values{"since": {"2026-10-21T09:00:00Z"}, "limit": {"10"}, "cursor": {"abc"}}},
 	})
 }

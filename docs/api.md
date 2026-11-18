@@ -342,9 +342,10 @@ it has ended, the next request starts a new one.
   limit; the address's count decides the answer only on public routes.
 - A git request is counted too, against the same keys, as in
   [Git over HTTP](#git-over-http).
-- `/healthz`, `/readyz` and `/version`, and any request answered `404` or
-  `405` at route matching (`/metrics` included, which the hub does not
-  serve yet), are never counted or refused.
+- `/healthz`, `/readyz` and `/version`, the forge webhook ingress
+  ([`POST /hooks/forge/{slug}`](#post-hooksforgeslug)), and any request
+  answered `404` or `405` at route matching (`/metrics` included, which the
+  hub does not serve yet), are never counted or refused.
 - The counts are kept in memory and start from zero when `parleyd` starts.
 
 ## Request bodies
@@ -7258,6 +7259,233 @@ is `422` `forge_rejected` (`the forge answered <status>: <message>`). Answers
 Body `{"body": string}`, required and not blank, sent exactly as given, as a
 comment in the pull request's conversation. Answers `201` with `{"url":
 "<web URL of the comment>"}`.
+
+## Forge webhooks
+
+A forge can send a workspace's webhook deliveries (an issue opened, a label
+added, a pull request merged, a push) to the hub, which proves each one
+against a secret only that workspace holds, records it once and relays it as
+`parley.forge.*` hub events (see [`GET /api/v1/events/log`](#get-apiv1eventslog)). The hub never registers,
+changes or deletes a webhook on the forge, and no route of this section
+sends a request to the forge: a person enters the URL and the secret in the
+forge's settings.
+
+The **webhook secret** is the workspace secret `FORGE_WEBHOOK_SECRET`, read
+on every delivery, so a rotation applies to the next one. The **webhook
+URL** is `[server].external_url` without a trailing `/`, followed by
+`/hooks/forge/<slug>`; it is `null` when `external_url` is empty. The
+[diagnostic route](#get-apiv1workspacesslugforge) reports both as
+`webhook.configured` and `webhook.url`, and the newest delivery's
+`received_at` as `webhook.last_delivery_at`.
+
+| Route | Does | Success |
+|---|---|---|
+| `PUT /api/v1/workspaces/{slug}/forge/webhook` | set or rotate the secret | `200` |
+| `DELETE /api/v1/workspaces/{slug}/forge/webhook` | remove the secret | `204` |
+| `POST /hooks/forge/{slug}` | receive a delivery | `202` |
+| `GET /api/v1/workspaces/{slug}/forge/deliveries` | list the recorded deliveries | `200`, a list |
+
+## `PUT /api/v1/workspaces/{slug}/forge/webhook`
+
+Takes the admin token, an API key or a PAT with the scope `forge:write`, and
+needs write access to the workspace. The body is empty, or a JSON object
+whose optional member `secret` is `null` or a string of 16 to 255
+characters, each from `!` to `~` (printable ASCII without the space). With
+no body, `{}` or `"secret": null` the hub generates the secret: 32 random
+bytes written as 64 lower-case hex characters. Other members are ignored.
+The value is stored as the workspace secret, replacing an earlier one whose
+key matches ignoring case (the entry keeps its stored casing), and the event
+`parley.forge.webhook.set` is recorded in the same transaction; neither
+holds the value, and no `parley.secret.*` event is written.
+
+```json
+{"configured":true,"url":"https://hub.example.com/hooks/forge/demo","secret":"9f2c…(64 hex characters)"}
+```
+
+`secret` is present only when the hub generated it, and no later answer of
+any route shows it. Failures, in the order they are decided; a refused
+request stores nothing and records no event:
+
+| Condition | Answer |
+|---|---|
+| a PAT without `forge:write` (an unknown slug too) | `403` `insufficient_scope` |
+| no read access to the workspace | `404` `not_found` |
+| read access only (an archived workspace too) | `403` `forbidden` |
+| the slug names a task fork | `400` `fork_has_no_origin` (`workspace "<slug>" is a task fork, which has no origin to receive webhook deliveries for`) |
+| the body breaks the rule above | `400` `invalid_request` (`the body must be empty or a JSON object whose optional member secret is null or a string of 16 to 255 characters, each from ! to ~`); the message never holds the value |
+| the workspace is archived | `409` `workspace_archived` |
+| no secret encryption key is configured | `503` `secrets_unavailable` |
+| the workspace holds 100 secrets and none is `FORGE_WEBHOOK_SECRET` | `429` `secret_limit_reached` (`maximum of 100 entries per scope exceeded`) |
+| the event cannot be recorded | `500` `internal`; the secret is as it was |
+
+## `DELETE /api/v1/workspaces/{slug}/forge/webhook`
+
+Takes the scope `forge:write` and write access, as the `PUT`, and works in
+every workspace state, archived included. It removes the secret, whether or
+not one existed, records `parley.forge.webhook.unset` in the same
+transaction and answers `204` with no body. Recorded deliveries remain, and
+from then on the ingress answers `404` for the workspace. A task fork is
+`400` `fork_has_no_origin`; scope and access are refused as for the `PUT`,
+and an event that cannot be recorded is `500` `internal` with the secret
+kept.
+
+## `POST /hooks/forge/{slug}`
+
+The ingress lies outside `/api/v1` and is public: it takes no bearer
+credential and ignores one that is sent, is not counted by the request rate
+limit, does not check the content type, and holds the body to 1 MiB
+(1,048,576 bytes) of its own. Its errors use the error envelope. An archived
+workspace still relays. The first matching step answers:
+
+1. An unknown slug, a task fork's slug, or a workspace whose
+   `FORGE_WEBHOOK_SECRET` is absent or empty: `404` `not_found` with the
+   message `not found`, the same bytes for all three. A secret that is
+   stored but cannot be read or decrypted is `500` `internal`.
+2. A request with `X-Hub-Signature-256` is a GitHub delivery (its
+   `X-Gitlab-Token` is not looked at); otherwise one with `X-Gitlab-Token`
+   is a GitLab delivery; otherwise `401`.
+3. GitLab: the token header appears exactly once and equals the secret,
+   else `401`.
+4. A body over 1,048,576 bytes, declared or not: `413` `payload_too_large`
+   (`the delivery body is larger than 1048576 bytes`), for GitHub whatever
+   the signature. The body is not read past the limit.
+5. GitHub: the signature header appears exactly once and equals `sha256=`
+   followed by the lower-case hex HMAC-SHA256 of the raw body under the
+   secret, else `401`. A delivery with only the legacy `X-Hub-Signature`
+   has no scheme and is `401`.
+6. The delivery id is `X-GitHub-Delivery`, or on GitLab `Idempotency-Key`
+   and else `X-Gitlab-Event-UUID`; the event name is `X-GitHub-Event` or
+   `X-Gitlab-Event`; of a repeated header the first value is used. A
+   missing or empty id, an id of more than 255 characters or with a
+   character outside space to `~` is `400` `invalid_request` (`the delivery
+   id header is missing, empty, longer than 255 characters or holds a
+   character outside space to ~`); a missing or empty event name is `400`
+   `invalid_request` (`the delivery's event name header is missing or
+   empty`). Nothing is recorded.
+7. The delivery is reduced and recorded. When the workspace already has a
+   delivery with this id, the answer is `202` `{"outcome":"duplicate"}` and
+   nothing else happens.
+8. Outcome `malformed`: `400` `invalid_request` (`the delivery's payload is
+   not a JSON object of the form its event has`); the delivery stays
+   recorded, so its redelivery is a duplicate.
+9. Otherwise `202` with `{"outcome": "relayed"}`, `"ignored"` or
+   `"repository_mismatch"`.
+
+Secrets are compared in constant time. Every `401` has the `error_type`
+`unauthenticated` and the message `delivery signature missing or invalid`,
+and records nothing. A `FORGE_WEBHOOK_SECRET` stored through the
+[secrets routes](#secrets) is not held to the 16-to-255 rule: any non-empty
+value works here. Recording a delivery and appending its events is one
+transaction, completed before the `202` even when the forge closes the
+connection early; a failure stores neither and is `500` `internal`, so the
+forge's redelivery is processed as new. Of concurrent copies of one
+delivery exactly one is recorded and the others are duplicates. The same id
+in two workspaces is two deliveries.
+
+**Reduction.** The body must be one JSON object, else the outcome is
+`malformed` (a form-encoded payload too). The action is GitHub's `action` or
+GitLab's `object_attributes.action` (`""` when it is missing or not a
+string, cut to 64 bytes). The repository is GitHub's `repository.full_name`
+or GitLab's `project.path_with_namespace`, compared ignoring case with the
+origin repository (`owner/name` of `git_url`) and then, on a carry-patch
+workspace with an `upstream_url`, with the upstream repository; the first
+match is the `target`, `origin` or `upstream`. Then the first matching row
+decides the outcome:
+
+| Situation | Outcome |
+|---|---|
+| no mapping for the event and action | `ignored` |
+| a required field is missing or of the wrong type | `malformed` |
+| the mapping yields no events | `ignored` |
+| events, but the payload names no repository | `malformed` |
+| events, but the repository is neither origin nor upstream | `repository_mismatch` |
+| otherwise | `relayed` |
+
+A required number (`issue.number`, `pull_request.number`, an `iid`) is a
+JSON integer of at least 1, a required string (`label.name`, `ref`) a
+non-empty JSON string. Event names and actions match exactly, case
+included; anything not listed is ignored, such as GitHub `ping` and edited
+comments.
+
+| Forge | Event and action | Hub event | Required |
+|---|---|---|---|
+| GitHub | `issues`: `opened`, `edited`, `closed`, `reopened` | `parley.forge.issue.<action>` | `issue.number` |
+| GitHub | `issues`: `labeled`, `unlabeled` | `parley.forge.issue.<action>` | `issue.number`, `label.name` |
+| GitHub | `issue_comment`: `created` | `parley.forge.comment.created` | `issue.number` |
+| GitHub | `pull_request`: `opened`, `reopened`, `synchronize` | `parley.forge.pull_request.<action>` | `pull_request.number` |
+| GitHub | `pull_request`: `closed` | `.merged` when `pull_request.merged` is `true`, else `.closed` | `pull_request.number` |
+| GitHub | `push` | `parley.forge.push` | `ref` |
+| GitLab | `Issue Hook`: `open`, `close`, `reopen` | `parley.forge.issue.opened`, `.closed`, `.reopened` | `object_attributes.iid` |
+| GitLab | `Issue Hook`: `update` | `.edited` when `changes.title` or `changes.description` is present; then one `.unlabeled` per title of `changes.labels.previous` not in `.current`, then one `.labeled` per title the other way round, each group in byte order | `object_attributes.iid` |
+| GitLab | `Note Hook` with `noteable_type` `Issue` or `MergeRequest` | `parley.forge.comment.created` | `issue.iid` or `merge_request.iid` |
+| GitLab | `Merge Request Hook`: `open`, `close`, `reopen`, `merge` | `parley.forge.pull_request.opened`, `.closed`, `.reopened`, `.merged` | `object_attributes.iid` |
+| GitLab | `Merge Request Hook`: `update` | `.synchronize` when `object_attributes.oldrev` is a non-empty string, else no event | `object_attributes.iid` |
+| GitLab | `Push Hook`, `Tag Push Hook` | `parley.forge.push` | `ref` |
+
+One delivery relays at most 100 label events.
+
+**Events.** Every delivery event has `workspace` the slug, `actor_type`
+`forge`, `actor_id` `null` and `action` the last segment of its type, and
+the metadata `forge`, `target`, `delivery_id` and `actor` (GitHub
+`sender.login`, GitLab `user.username` or `user_username` on push hooks,
+`""` when the payload names none), plus:
+
+| Event | `resource_type` | `resource_id` | Metadata |
+|---|---|---|---|
+| `parley.forge.issue.opened`, `.edited`, `.closed`, `.reopened` | `issue` | the number | `number`, `title` (cut to 256 bytes), `url`, `labels` (the first 100 names) |
+| `parley.forge.issue.labeled`, `.unlabeled` | `issue` | the number | `number`, `label`, `labels`, `url` |
+| `parley.forge.comment.created` | `comment` | the issue or pull request number | `number`, `comment_url`, `pull_request` (boolean) |
+| `parley.forge.pull_request.opened`, `.closed`, `.merged`, `.reopened`, `.synchronize` | `pull_request` | the number | `number`, `url`, `head`, `base`, `merged` (true exactly on `.merged`) |
+| `parley.forge.push` | `ref` | the ref | `ref`, `before`, `after` |
+| `parley.forge.webhook.set` | `webhook` | the slug | `generated` (boolean); the caller as actor |
+| `parley.forge.webhook.unset` | `webhook` | the slug | `existed` (boolean); the caller as actor |
+
+GitHub's values are read from `issue.title`, `issue.html_url`,
+`issue.labels[].name`, `comment.html_url`, `pull_request.html_url`,
+`pull_request.head.ref` and `pull_request.base.ref`; GitLab's from
+`object_attributes.title`, `.url`, `.source_branch`, `.target_branch`, the
+top-level `labels[].title` and the note's `object_attributes.url`; `ref`,
+`before` and `after` are the payload's top-level members. A missing value
+or one of the wrong type is `""`, `[]` or `false`. Every URL loses its user
+information, and a value that is not an absolute URL is `""`. No event
+carries a body, a description, a comment's or a note's text, a commit
+message or the secret. `parley.forge.push` reports a push the forge
+received and is unrelated to `parley.git.push`.
+
+## `GET /api/v1/workspaces/{slug}/forge/deliveries`
+
+Takes the scope `forge:read` (a PAT with `forge:write` satisfies it) and
+read access, in every workspace state. It lists the workspace's recorded
+deliveries, newest first (`received_at` descending, and for equal instants
+the later recorded first), by the [list convention](#lists) (`limit` 1 to
+200, default 50, and `cursor`). `since`, an RFC 3339 instant, keeps the
+deliveries received at or after it; an empty or unparseable value is `400`
+`invalid_request` (`since must be an RFC 3339 instant, such as
+2026-10-21T09:00:00Z`). Other query parameters, `target` among them, are
+ignored. A task fork is `400` `fork_has_no_origin`.
+
+```json
+{"items":[{"delivery_id":"d-1","forge":"github","event":"issues","action":"labeled","target":"origin","outcome":"relayed","relayed":["parley.forge.issue.labeled"],"received_at":"2026-10-21T09:12:03Z"}],"next_cursor":null}
+```
+
+| Member | Meaning |
+|---|---|
+| `delivery_id` | the forge's id of the delivery, unique per workspace |
+| `forge` | `github` or `gitlab` |
+| `event` | the forge's event name, cut to 64 bytes |
+| `action` | the payload's action, `""` when it has none |
+| `target` | `origin`, `upstream`, or `null` when no repository matched |
+| `outcome` | `relayed`, `ignored`, `repository_mismatch` or `malformed` (`duplicate` is never recorded) |
+| `relayed` | the event types relayed, in order; `[]` unless `outcome` is `relayed` |
+| `received_at` | when the hub accepted it, in whole seconds |
+
+Payloads and secrets are never stored. Deliveries are kept for 7 days: the
+maintenance task `forge_delivery_pruning` deletes those received more than
+604,800 seconds before its pass, once at start and then every hour, and a
+pass that fails is logged and its work done at the next one; a pruned id
+sent again is a new delivery. The retention is fixed. Deleting a workspace
+deletes its deliveries in the same transaction, so a slug registered again
+starts with an empty log.
 
 ## Admin routes
 

@@ -239,11 +239,17 @@ func entriesOf(c *call) ([]entry, error) {
 	if err != nil {
 		return nil, clientError("cannot read the value from stdin: %v", err)
 	}
+	return []entry{{Key: args[0], Value: withoutLineEnding(data)}}, nil
+}
+
+// withoutLineEnding is data read from standard input without one trailing
+// line ending, \n or \r\n, which is the shell's and not the value's.
+func withoutLineEnding(data []byte) string {
 	value := strings.TrimSuffix(string(data), "\n")
 	if len(value) < len(data) {
 		value = strings.TrimSuffix(value, "\r")
 	}
-	return []entry{{Key: args[0], Value: value}}, nil
+	return value
 }
 
 // createEntries is the run step of the create of collection,

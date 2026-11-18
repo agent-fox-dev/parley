@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -45,7 +47,9 @@ type EventEmitter interface {
 // settings and secrets, the access rule it asks about a fork's parent, the
 // options of the client it sends forge requests with, the event log a write
 // is recorded in, the hub's scrubber, logger and clock, and the hub's
-// external URL.
+// external URL; and what the webhook routes change: the store, in whose
+// transaction a webhook secret and its event are written together, the
+// secret writer and the event log's transactional emitter.
 type Deps struct {
 	// Workspaces reads the workspace record of a slug.
 	Workspaces func(ctx context.Context, slug string) (workspace.Workspace, bool, error)
@@ -61,6 +65,14 @@ type Deps struct {
 	Logger      *slog.Logger
 	Now         func() time.Time
 	ExternalURL string
+	// Store is the transactional store the webhook routes write in.
+	Store *store.Store
+	// SecretWriter stores and removes the webhook secret.
+	SecretWriter SecretWriter
+	// Log records the webhook routes' events in their store transaction,
+	// so that an event commits or rolls back with the change it reports
+	// (docs/adr/05-deliver-events-by-reading-the-log-by-position.md).
+	Log TxEmitter
 }
 
 // Component is the hub's forge client and the shared checks of its routes.
@@ -87,8 +99,9 @@ func (c *Component) Bind(d Deps) {
 	c.client = NewClient(d.Client)
 }
 
-// Routes are the forge component's routes, the reads and the writes, which
-// the hub registers. They may be built before the component is bound.
+// Routes are the forge component's routes, the reads, the writes, the
+// webhook's and the delivery log's, which the hub registers. They may be built before the
+// component is bound.
 func (c *Component) Routes() []server.Route {
 	read := func(pattern string, params func(*http.Request, *Call) error, serve func(http.ResponseWriter, *http.Request, *Call) error) server.Route {
 		return c.Route(Route{Method: http.MethodGet, Pattern: pattern, Scope: ScopeRead, Need: access.NeedRead, Params: params, Serve: serve})
@@ -100,7 +113,7 @@ func (c *Component) Routes() []server.Route {
 		read("/workspaces/:slug/issues", readIssueList, serveIssues),
 		read("/workspaces/:slug/issues/:number", readIssueNumber, c.serveIssueThread),
 		read(commentsPattern, readComments, serveComments),
-	}, append(c.pullRoutes(), c.writeRoutes()...)...)
+	}, slices.Concat(c.pullRoutes(), c.writeRoutes(), c.webhookRoutes(), c.deliveryRoutes())...)
 }
 
 // Client is the client the component sends forge requests with, nil before

@@ -2780,6 +2780,31 @@ that cannot be read, `issue update` without a field flag, `issue label`
 without a label and a `<number>` that breaks the rule above are each a
 `usage_error` with exit status `2`, raised before any request.
 
+The webhook commands manage the secret a forge signs a workspace's webhook
+deliveries with, and read what the hub recorded of them, through the hub's
+[forge webhook routes](api.md#forge-webhooks).
+
+| Command | Request | Flags |
+|---|---|---|
+| `parley forge webhook set <slug>` | `PUT …/forge/webhook` | one of `--secret <string>`, `--from-stdin`, `--generate` (the default) |
+| `parley forge webhook unset <slug>` | `DELETE …/forge/webhook` | none |
+| `parley forge deliveries <slug>` | `GET …/forge/deliveries` | `--since <rfc3339>`, `--limit`, `--cursor` |
+
+- `webhook set` with no flag or `--generate` sends no body, and the hub
+  generates the secret; `--secret <value>` sends `{"secret": <value>}`, and
+  `--from-stdin` sends the same with the value read from standard input
+  without one trailing line ending (`\n` or `\r\n`). The CLI does not check
+  the value; the hub does. It prints the hub's answer, and when the answer
+  holds `secret` it writes the warning `this value is shown once and will
+  not be shown again` on stderr.
+- `webhook unset` prints `{"status":"unset","workspace":"<slug>"}` when the
+  hub answers `204`.
+- `deliveries` sends a query parameter only for a flag that was given and
+  prints the one page the hub answered.
+
+More than one of `--secret`, `--from-stdin` and `--generate`, or a missing
+`<slug>`, is a `usage_error` with exit status `2`, raised before any request.
+
 ### `parley credential-helper`
 
 ```
