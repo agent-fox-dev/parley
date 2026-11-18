@@ -13,15 +13,15 @@ import (
 	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
-// seedOwnedVars stores variables in every kind of scope of the world: three
-// in the workspace acme, two in its fork acme-fork, two in owner's user
-// scope and two in the org acme's.
-func (w *world) seedOwnedVars(t *testing.T) {
+// createOwnedVars creates variables in every kind of scope of the world:
+// three in the workspace acme, two in its fork acme-fork, two in owner's
+// user scope and two in the org acme's.
+func (w *world) createOwnedVars(t *testing.T) {
 	t.Helper()
-	w.seedVars(t, secret.ScopeWorkspace, "acme", "W_ONE", "W_TWO", "SHARED")
-	w.seedVars(t, secret.ScopeWorkspace, "acme-fork", "F_ONE", "SHARED")
-	w.seedVars(t, secret.ScopeUser, w.ownerID, "U_ONE", "U_TWO")
-	w.seedVars(t, secret.ScopeOrg, w.orgID, "O_ONE", "O_TWO")
+	w.create(t, w.ownerKey, "/workspaces/acme/vars", "W_ONE", "W_TWO", "SHARED")
+	w.create(t, w.memberKey, "/workspaces/acme-fork/vars", "F_ONE", "SHARED")
+	w.create(t, w.ownerKey, "/user/vars", "U_ONE", "U_TWO")
+	w.create(t, w.ownerKey, "/orgs/acme/vars", "O_ONE", "O_TWO")
 }
 
 // without is rows, as allVars gives them, less those of the scopes whose
@@ -36,121 +36,81 @@ func without(rows []string, prefixes ...string) []string {
 // returns is called.
 func (w *world) refuseDeletes(t *testing.T, table string) (allow func()) {
 	t.Helper()
-	ctx := context.Background()
-	exec := func(query string) {
-		t.Helper()
-		if err := w.Store.Tx(ctx, func(tx *sql.Tx) error { _, err := tx.ExecContext(ctx, query); return err }); err != nil {
-			t.Fatalf("%s: %v", query, err)
-		}
-	}
-	exec(`CREATE TRIGGER refuse_deletes BEFORE DELETE ON ` + table + ` BEGIN SELECT RAISE(ABORT, 'delete refused'); END`)
-	return func() { exec(`DROP TRIGGER refuse_deletes`) }
+	w.exec(t, `CREATE TRIGGER refuse_deletes BEFORE DELETE ON `+table+` BEGIN SELECT RAISE(ABORT, 'delete refused'); END`)
+	return func() { w.exec(t, `DROP TRIGGER refuse_deletes`) }
 }
 
 func TestRemoveWorkspaceVars_RemovesOneWorkspacesVariablesInTheCallersTransaction(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	w.seedOwnedVars(t)
+	w.createOwnedVars(t)
 	_, seq := w.varEventsAfter(t, 0)
 	ctx := context.Background()
 	errRollback := errors.New("roll back")
-	// in runs fn in a transaction it commits, or rolls back after fn when
-	// commit is false.
-	in := func(commit bool, fn func(tx *sql.Tx) error) error {
+	// remove removes the variables of slug in a transaction that it commits,
+	// or rolls back after the removal when commit is false.
+	remove := func(slug string, commit bool) error {
 		err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-			if err := fn(tx); err != nil {
+			if err := secret.RemoveWorkspaceVars(ctx, tx, slug); err != nil || commit {
 				return err
 			}
-			if !commit {
-				return errRollback
-			}
-			return nil
+			return errRollback
 		})
 		if errors.Is(err, errRollback) {
 			return nil
 		}
 		return err
 	}
-	remove := func(slug string) func(tx *sql.Tx) error {
-		return func(tx *sql.Tx) error { return secret.RemoveWorkspaceVars(ctx, tx, slug) }
+	want := w.allVars(t)
+	check := func(what string, err error) {
+		t.Helper()
+		if got := w.allVars(t); err != nil || !slices.Equal(got, want) {
+			t.Errorf("%s: %v, variables %v; want %v", what, err, got, want)
+		}
 	}
-	before := w.allVars(t)
+	check("a removal rolled back keeps every variable", remove("acme", false))
+	want = without(want, "workspace/acme-fork/")
+	check("a removal committed takes the fork's variables and no other", remove("acme-fork", true))
 
-	for _, s := range []struct {
-		name   string
-		commit bool
-		slug   string
-		gone   []string
-	}{
-		{"a removal rolled back keeps every variable", false, "acme", nil},
-		{"a removal committed takes the fork's variables and no other", true, "acme-fork", []string{"workspace/acme-fork/"}},
-	} {
-		t.Run(s.name, func(t *testing.T) {
-			if err := in(s.commit, remove(s.slug)); err != nil {
-				t.Fatal(err)
-			}
-			if got, want := w.allVars(t), without(before, s.gone...); !slices.Equal(got, want) {
-				t.Errorf("variables = %v, want %v", got, want)
-			}
-		})
+	tx, err := w.Store.Main().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	before = w.allVars(t)
-	for _, c := range []struct {
-		name string
-		call func(t *testing.T) error
-	}{
-		{"a transaction already closed", func(t *testing.T) error {
-			tx, err := w.Store.Main().BeginTx(ctx, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := tx.Rollback(); err != nil {
-				t.Fatal(err)
-			}
-			return errors.Join(secret.RemoveWorkspaceVars(ctx, tx, "acme"),
-				secret.RemoveVarScope(ctx, tx, secret.ScopeWorkspace, "acme"))
-		}},
-		{"a delete the store refuses", func(t *testing.T) error {
-			defer w.refuseDeletes(t, "variables")()
-			return in(true, remove("acme"))
-		}},
-	} {
-		t.Run(c.name+" fails and removes nothing", func(t *testing.T) {
-			if err := c.call(t); err == nil {
-				t.Error("the removal returned no error")
-			}
-			if got := w.allVars(t); !slices.Equal(got, before) {
-				t.Errorf("variables = %v, want %v", got, before)
-			}
-		})
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
 	}
+	if err := errors.Join(secret.RemoveWorkspaceVars(ctx, tx, "acme"), secret.RemoveVarScope(ctx, tx, secret.ScopeWorkspace, "acme")); err == nil {
+		t.Error("a removal in a transaction already closed returned no error")
+	}
+	allow := w.refuseDeletes(t, "variables")
+	if err := remove("acme", true); err == nil {
+		t.Error("a removal whose delete the store refuses returned no error")
+	}
+	allow()
+	check("the failed removals", nil)
 
-	t.Run("a workspace made again under a removed slug starts with no variables", func(t *testing.T) {
-		err := in(true, func(tx *sql.Tx) error {
-			if err := secret.RemoveWorkspaceVars(ctx, tx, "acme"); err != nil {
-				return err
-			}
-			_, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE slug = 'acme'`)
+	// A workspace made again under a removed slug starts with no variables.
+	err = w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if err := secret.RemoveWorkspaceVars(ctx, tx, "acme"); err != nil {
 			return err
-		})
-		if err != nil {
-			t.Fatal(err)
 		}
-		w.AddWorkspace(t, access.Record{Slug: "acme", OwnerID: w.ownerID, OrgID: w.orgID,
-			Kind: access.KindRepository, Status: access.StatusReady})
-		if got := w.listVars(t, w.ownerKey, "/workspaces/acme/vars"); len(got) != 0 {
-			t.Errorf("the variables of the new acme = %v, want none", keysOf(got))
-		}
-		var origins []string
-		for _, r := range w.resolve(t, w.ownerKey, "acme") {
-			origins = append(origins, r.Origin)
-		}
-		if want := []string{"org", "org", "user", "user"}; !slices.Equal(origins, want) {
-			t.Errorf("the origins of the new acme's resolved variables = %v, want %v", origins, want)
-		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE slug = 'acme'`)
+		return err
 	})
-
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.AddWorkspace(t, access.Record{Slug: "acme", OwnerID: w.ownerID, OrgID: w.orgID, Kind: access.KindRepository, Status: access.StatusReady})
+	if got := w.list(t, w.ownerKey, "/workspaces/acme/vars"); len(got) != 0 {
+		t.Errorf("the variables of the new acme = %v, want none", keysOf(got))
+	}
+	var origins []string
+	for _, r := range w.resolve(t, w.ownerKey, "acme") {
+		origins = append(origins, r.Origin)
+	}
+	if want := []string{"org", "org", "user", "user"}; !slices.Equal(origins, want) {
+		t.Errorf("the origins of the new acme's resolved variables = %v, want %v", origins, want)
+	}
 	if recs, _ := w.varEventsAfter(t, seq); len(recs) != 0 {
 		t.Errorf("the removals wrote %d variable events, want none", len(recs))
 	}
@@ -159,33 +119,27 @@ func TestRemoveWorkspaceVars_RemovesOneWorkspacesVariablesInTheCallersTransactio
 func TestWorkspaceDelete_TakesTheVariablesOfTheWorkspaceAndOfItsForks(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	w.AddWorkspace(t, access.Record{Slug: "gone", OwnerID: w.ownerID, OrgID: w.orgID,
-		Kind: access.KindRepository, Status: access.StatusArchived})
+	w.AddWorkspace(t, access.Record{Slug: "gone", OwnerID: w.ownerID, OrgID: w.orgID, Kind: access.KindRepository, Status: access.StatusArchived})
 	w.AddWorkspace(t, access.Record{Slug: "gone-task", OwnerID: w.memberID, OrgID: w.orgID,
 		Kind: access.KindFork, ParentSlug: "gone", Status: access.StatusReady})
-	w.seedOwnedVars(t)
-	w.seedVars(t, secret.ScopeWorkspace, "gone", "G_ONE", "SHARED")
-	w.seedVars(t, secret.ScopeWorkspace, "gone-task", "T_ONE", "SHARED")
+	w.createOwnedVars(t)
+	w.create(t, w.ownerKey, "/workspaces/gone/vars", "G_ONE", "SHARED")
+	w.create(t, w.memberKey, "/workspaces/gone-task/vars", "T_ONE", "SHARED")
 	_, seq := w.varEventsAfter(t, 0)
 	left := w.allVars(t)
-
+	// A task fork's delete, then an archived workspace's, which takes its
+	// fork.
 	for _, s := range []struct {
-		name, cred, slug string
-		gone             []string
+		cred, slug string
+		gone       []string
 	}{
-		{"a task fork's delete", w.memberKey, "acme-fork", []string{"workspace/acme-fork/"}},
-		{"an archived workspace's delete, which takes its fork", w.ownerKey, "gone",
-			[]string{"workspace/gone/", "workspace/gone-task/"}},
+		{w.memberKey, "acme-fork", []string{"workspace/acme-fork/"}},
+		{w.ownerKey, "gone", []string{"workspace/gone/", "workspace/gone-task/"}},
 	} {
-		t.Run(s.name, func(t *testing.T) {
-			if a := w.do(t, s.cred, http.MethodDelete, "/workspaces/"+s.slug, nil); a.status != http.StatusNoContent {
-				t.Fatalf("DELETE /workspaces/%s = %d %.300s, want 204", s.slug, a.status, a.body)
-			}
-			left = without(left, s.gone...)
-			if got := w.allVars(t); !slices.Equal(got, left) {
-				t.Errorf("variables = %v, want %v", got, left)
-			}
-		})
+		w.must(t, s.cred, http.MethodDelete, "/workspaces/"+s.slug, nil, http.StatusNoContent)
+		if left = without(left, s.gone...); !slices.Equal(w.allVars(t), left) {
+			t.Errorf("after the delete of %s the variables are %v, want %v", s.slug, w.allVars(t), left)
+		}
 	}
 	if recs, _ := w.varEventsAfter(t, seq); len(recs) != 0 {
 		t.Errorf("the deletes wrote %d variable events, want none", len(recs))
@@ -197,15 +151,13 @@ func TestOwnerDelete_RemovesTheOwnersVariablesInItsTransaction(t *testing.T) {
 	w := newWorld(t)
 	// owner becomes the hub's only active admin, whom no delete removes.
 	w.admin(t, http.MethodPost, "/users/"+w.ownerID+"/promote")
-	beta := w.CreateOrg(t, "beta")
-	w.seedOwnedVars(t)
-	w.seedVars(t, secret.ScopeUser, w.outsiderID, "X_ONE", "X_TWO")
-	w.seedVars(t, secret.ScopeUser, w.member2ID, "M2_ONE")
-	w.seedVars(t, secret.ScopeOrg, beta, "B_ONE")
+	w.CreateOrg(t, "beta")
+	w.createOwnedVars(t)
+	w.create(t, w.outsiderKey, "/user/vars", "X_ONE", "X_TWO")
+	w.create(t, w.member2Key, "/user/vars", "M2_ONE")
+	w.create(t, w.Token, "/orgs/beta/vars", "B_ONE")
 	_, seq := w.varEventsAfter(t, 0)
 	left := w.allVars(t)
-	orgVars := []string{"O_ONE", "O_TWO"}
-
 	for _, s := range []struct {
 		name   string
 		refuse string // the table whose deletes fail during the step, if any
@@ -219,27 +171,21 @@ func TestOwnerDelete_RemovesTheOwnersVariablesInItsTransaction(t *testing.T) {
 		{"a user's delete", "", "/users/" + w.outsiderID, http.StatusNoContent, []string{"user/" + w.outsiderID + "/"}},
 		{"an org's delete", "", "/orgs/" + w.orgID, http.StatusNoContent, []string{"org/" + w.orgID + "/"}},
 	} {
-		t.Run(s.name, func(t *testing.T) {
-			if s.refuse != "" {
-				defer w.refuseDeletes(t, s.refuse)()
+		allow := func() {}
+		if s.refuse != "" {
+			allow = w.refuseDeletes(t, s.refuse)
+		}
+		a := w.must(t, w.Token, http.MethodDelete, s.path, nil, s.status)
+		allow()
+		if s.status == http.StatusInternalServerError {
+			wantError(t, s.name, a, s.status, "internal", "")
+			if got := keysOf(w.list(t, w.memberKey, "/orgs/acme/vars")); !slices.Equal(got, []string{"O_ONE", "O_TWO"}) {
+				t.Errorf("%s: the org's variables listed to a member = %v, want O_ONE and O_TWO", s.name, got)
 			}
-			a := w.do(t, w.Token, http.MethodDelete, s.path, nil)
-			if a.status != s.status {
-				t.Fatalf("DELETE %s = %d %.300s, want %d", s.path, a.status, a.body, s.status)
-			}
-			if s.status == http.StatusInternalServerError {
-				if typ, _ := errorOf(t, a); typ != "internal" {
-					t.Errorf("DELETE %s answered %s, want internal", s.path, a.body)
-				}
-				if got := keysOf(w.listVars(t, w.memberKey, "/orgs/acme/vars")); !slices.Equal(got, orgVars) {
-					t.Errorf("the org's variables listed to a member = %v, want %v", got, orgVars)
-				}
-			}
-			left = without(left, s.gone...)
-			if got := w.allVars(t); !slices.Equal(got, left) {
-				t.Errorf("variables = %v, want %v", got, left)
-			}
-		})
+		}
+		if left = without(left, s.gone...); !slices.Equal(w.allVars(t), left) {
+			t.Errorf("%s: the variables are %v, want %v", s.name, w.allVars(t), left)
+		}
 	}
 	if recs, _ := w.varEventsAfter(t, seq); len(recs) != 0 {
 		t.Errorf("the deletes wrote %d variable events, want none", len(recs))
