@@ -27,6 +27,11 @@ const idempotencyTTL = 24 * time.Hour
 // never replayed, because serveCreate checks its age.
 const idempotencySweepInterval = time.Minute
 
+// idempotencyWriteTimeout bounds the write of a record, which goes on after
+// the client has left: the create it records has happened, so a retry must
+// find it.
+const idempotencyWriteTimeout = 10 * time.Second
+
 // maxIdempotencyKey is the longest Idempotency-Key accepted, in characters.
 const maxIdempotencyKey = 255
 
@@ -232,10 +237,14 @@ func (s *Server) serveCreate(w http.ResponseWriter, r *http.Request, rt Route) e
 	}
 	stored, err := removeMembers(cw.body.Bytes(), rt.ShowOnce)
 	if err == nil {
-		err = s.writeRecord(r.Context(), IdempotencyRecord{
+		// A handler may carry its create out after the client left, and the
+		// record of it must be written all the same.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), idempotencyWriteTimeout)
+		err = s.writeRecord(ctx, IdempotencyRecord{
 			Key: id.key, Caller: id.caller, Route: id.route,
 			RequestHash: hash, Body: stored, Header: cw.header, WrittenAt: now,
 		})
+		cancel()
 	}
 	if err != nil {
 		// The caller already has the handler's answer; a retry then runs
