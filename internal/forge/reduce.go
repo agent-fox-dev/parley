@@ -44,9 +44,13 @@ type HookEvent struct {
 	ResourceType string
 	// ResourceID is never empty: a mapping reads it from a required field.
 	ResourceID string
-	// Metadata is what the mapping read for the event itself, such as the
-	// label of a label event; nil when nothing.
+	// Metadata holds exactly the keys of the event's kind (see
+	// hook_event.go), read from the payload; never free text such as a
+	// body, a comment or a commit message.
 	Metadata map[string]any
+	// Actor is the forge login of the delivery's author, "" when the
+	// payload names none.
+	Actor string
 }
 
 // Reduction is what a delivery's payload comes to: the action and target

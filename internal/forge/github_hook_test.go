@@ -2,7 +2,6 @@ package forge_test
 
 import (
 	"errors"
-	"reflect"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
@@ -68,7 +67,7 @@ func TestMapGitHub_YieldsOneEventForAListedEventAndAction(t *testing.T) {
 			action = nil
 		}
 		evs, err := forge.MapGitHub(tc.event, tc.action, ghPayload(action, "acme/widgets", tc.extra))
-		if err != nil || len(evs) != 1 || !reflect.DeepEqual(evs[0], tc.want) {
+		if err != nil || len(evs) != 1 || !sameDraft(evs[0], tc.want) {
 			t.Errorf("%s %s %s: events %+v, error %v; want [%+v]", tc.event, tc.action, jsonOf(tc.extra), evs, err, tc.want)
 		}
 	}

@@ -3,7 +3,6 @@ package forge_test
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -81,7 +80,7 @@ func TestMapGitLab_YieldsOneEventForAListedHookAndAction(t *testing.T) {
 	}
 	for _, tc := range cases {
 		evs, err := forge.MapGitLab(tc.event, tc.action, glPayload(tc.action, "acme/widgets", tc.extra))
-		if err != nil || len(evs) != 1 || !reflect.DeepEqual(evs[0], tc.want) {
+		if err != nil || len(evs) != 1 || !sameDraft(evs[0], tc.want) {
 			t.Errorf("%s %s %s: events %+v, error %v; want [%+v]", tc.event, tc.action, jsonOf(tc.extra), evs, err, tc.want)
 		}
 	}
@@ -124,7 +123,7 @@ func TestMapGitLab_RelaysAnIssueUpdateAsEditedThenUnlabeledThenLabeled(t *testin
 	}
 	for _, tc := range cases {
 		evs, err := forge.MapGitLab("Issue Hook", "update", glPayload("update", "acme/widgets", update(tc.changes)))
-		if err != nil || !reflect.DeepEqual(evs, tc.want) {
+		if err != nil || !sameDrafts(evs, tc.want) {
 			t.Errorf("%s: events %v, error %v; want %v", tc.name, described(evs), err, described(tc.want))
 		}
 	}
