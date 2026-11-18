@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/forge"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // sameDraft reports whether got is the event want names: the same type and
@@ -341,5 +343,48 @@ func TestHookEvent_CarriesNoTextOfThePayloadAndNoUserinfo(t *testing.T) {
 		checkMetadata(t, []hookCase{{name: "html_url " + u.raw, kind: forge.KindGitHub, event: "issues", action: "opened",
 			extra: map[string]any{"issue": map[string]any{"number": 7, "html_url": u.raw}},
 			want:  map[string]any{"number": int64(7), "title": "", "url": u.want, "labels": []string{}}}})
+	}
+}
+
+func TestHookEvent_RecordsTheForgeTheTargetTheDeliveryAndTheActorOfEveryEvent(t *testing.T) {
+	t.Parallel()
+	w := newDeliveryWorld(t, deliveryTime, nil)
+	w.addWorkspace(t, workspace.Workspace{Slug: "cp", Mode: workspace.ModeCarryPatch,
+		GitURL: new("https://gitlab.com/acme/cp.git"), UpstreamURL: new("https://gitlab.com/up/widgets.git")})
+	push := map[string]any{"ref": "refs/heads/main", "before": "B", "after": "A"}
+	deliveries := []struct {
+		slug  string
+		kind  forge.ForgeKind
+		id    string
+		event string
+		body  []byte
+		want  map[string]any
+	}{
+		{"demo", forge.KindGitHub, "d1", "issues", ghIssue("opened", map[string]any{"sender": map[string]any{"login": "octo"}}),
+			map[string]any{"forge": "github", "target": "origin", "delivery_id": "d1", "actor": "octo"}},
+		{"cp", forge.KindGitLab, "d2", "Push Hook", glPayload(nil, "up/widgets", overlay(push, map[string]any{"user_username": "gl"})),
+			map[string]any{"forge": "gitlab", "target": "upstream", "delivery_id": "d2", "actor": "gl"}},
+		{"demo", forge.KindGitHub, "d3", "push", ghPayload(nil, "acme/widgets", push),
+			map[string]any{"forge": "github", "target": "origin", "delivery_id": "d3", "actor": ""}},
+	}
+	for _, d := range deliveries {
+		if out := w.record(t, d.slug, d.kind, d.id, d.event, d.body); out != forge.OutcomeRelayed {
+			t.Fatalf("delivery %s: outcome %q, want relayed", d.id, out)
+		}
+		events := w.logged(t, "parley.forge.", d.slug)
+		if len(events) == 0 {
+			t.Fatalf("delivery %s: no event of %s", d.id, d.slug)
+		}
+		r := events[len(events)-1]
+		if r.ActorType != event.ActorForge || r.ActorID != nil || r.Workspace == nil || *r.Workspace != d.slug ||
+			r.Action != r.Type[strings.LastIndex(r.Type, ".")+1:] {
+			t.Errorf("delivery %s: event %s", d.id, jsonOf(r))
+		}
+		meta := recorded{Record: r}.meta(t)
+		for k, v := range d.want {
+			if meta[k] != v {
+				t.Errorf("delivery %s: metadata %s = %v, want %v", d.id, k, meta[k], v)
+			}
+		}
 	}
 }

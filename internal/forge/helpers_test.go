@@ -80,7 +80,7 @@ func newWorld(t *testing.T) *world {
 }
 
 // newWorldWith is newWorld with the server TOML, the TOML and the
-// environment of cfg added to the hub's, and adjust, when it is not nil, run on the forge
+// environment of cfg added to the hub's, the clock of cfg as the hub's, and adjust, when it is not nil, run on the forge
 // component's dependencies after the world's own changes.
 func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *forge.Deps)) *world {
 	t.Helper()
@@ -95,6 +95,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 		Server: cfg.Server,
 		TOML:   cfg.TOML,
 		Env:    env,
+		Now:    cfg.Now,
 		Compose: func(c *hub.Composition) {
 			w.secrets, w.forge, w.events = c.Secrets(), c.Forge(), c.Events()
 			for _, pattern := range []string{probeList, probeNumber} {

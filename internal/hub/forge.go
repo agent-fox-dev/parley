@@ -22,7 +22,9 @@ const forgeHook = "forge"
 // records the forge writes, and the hub's scrubber, logger and external URL
 // too; and the store, the secret component as the writer of the webhook
 // secret, and the event component as the log the webhook routes record
-// their events in, inside the same store transaction.
+// their events in, inside the same store transaction, as the recording of
+// a webhook delivery does with the delivery and its events. The part adds
+// the schema step of the delivery table.
 //
 // The component exists from the composition on (Forge), so that the forge
 // routes, which the part registers, are built with it; a later part and tests change its dependencies
@@ -30,6 +32,7 @@ const forgeHook = "forge"
 func composeForge(c *Composition) {
 	comp := &forge.Component{}
 	c.forge = comp
+	c.AddSchemaStep(forge.DeliverySchemaStep)
 	for _, rt := range comp.Routes() {
 		c.AddRoute(rt)
 	}

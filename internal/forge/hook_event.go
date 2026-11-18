@@ -1,8 +1,11 @@
 package forge
 
 import (
+	"maps"
 	"net/url"
 	"strconv"
+
+	"github.com/agent-fox-dev/parley/internal/event"
 )
 
 // An event travels to every reader of the workspace and to event webhooks,
@@ -55,6 +58,21 @@ func pullEvent(kind string, number int64, link, head, base string) HookEvent {
 func pushEvent(ref string, payload map[string]any) HookEvent {
 	return HookEvent{Type: "parley.forge.push", ResourceType: "ref", ResourceID: ref,
 		Metadata: map[string]any{"ref": ref, "before": optString(payload, "before"), "after": optString(payload, "after")}}
+}
+
+// input is the hub event of the draft, relayed for the workspace slug from
+// the delivery deliveryID of the forge kind for the target repository: the
+// forge is its actor, with no id, and its metadata names the forge, the
+// target, the delivery and the forge login of its author beside the
+// draft's own. The event log sets its action, the last segment of its type.
+func (ev HookEvent) input(slug string, kind ForgeKind, target Target, deliveryID string) event.Input {
+	m := maps.Clone(ev.Metadata)
+	if m == nil {
+		m = map[string]any{}
+	}
+	m["forge"], m["target"], m["delivery_id"], m["actor"] = string(kind), string(target), deliveryID, ev.Actor
+	return event.Input{Type: ev.Type, Workspace: &slug, ActorType: event.ActorForge,
+		ResourceType: ev.ResourceType, ResourceID: ev.ResourceID, Metadata: m}
 }
 
 // withActor gives every event the forge login of the delivery's author.
