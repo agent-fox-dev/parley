@@ -37,6 +37,7 @@ var writeRoutes = []writeRoute{
 	{http.MethodPost, "/issues/7/labels", []string{"triage"}},
 	{http.MethodDelete, "/issues/7/labels/bug", nil},
 	{http.MethodPost, "/labels", map[string]any{"name": "triage"}},
+	{http.MethodPost, "/pulls", map[string]any{"title": "t", "head": "feature", "base": "main"}},
 }
 
 // seedIssue stores issue 7, open and labelled bug, and pull request 12, open
@@ -318,6 +319,14 @@ var (
 			{"a colour that is a number", map[string]any{"name": "n", "color": 5}, "color"},
 			{"a description that is a number", map[string]any{"name": "n", "description": 5}, "description"},
 		}},
+		{http.MethodPost, "/pulls", []badBody{
+			{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"a number", `5`, ""}, {"none", nil, ""},
+			{"no title", map[string]any{"head": "feature", "base": "main"}, "title"},
+			{"no head", map[string]any{"title": "t", "base": "main"}, "head"},
+			{"no base", map[string]any{"title": "t", "head": "feature"}, "base"},
+			{"a blank head", map[string]any{"title": "t", "head": " ", "base": "main"}, "head"},
+			{"a draft that is a word", map[string]any{"title": "t", "head": "feature", "base": "main", "draft": "yes"}, "draft"},
+		}},
 	}
 	// commentBodies are the bodies a comment route refuses.
 	commentBodies = []badBody{
@@ -386,6 +395,8 @@ var decoratedBodies = []struct {
 	{http.MethodPost, "/issues/7/comments", map[string]any{"body": "b"}, map[string]any{"body": "b", "extra": 1}},
 	{http.MethodPost, "/pulls/12/comments", map[string]any{"body": "b"}, map[string]any{"body": "b", "extra": 1}},
 	{http.MethodPost, "/labels", map[string]any{"name": "n"}, map[string]any{"name": "n", "color": nil, "description": nil, "x": 1}},
+	{http.MethodPost, "/pulls", map[string]any{"title": "t", "head": "feature", "base": "main"},
+		map[string]any{"title": "t", "head": "feature", "base": "main", "body": nil, "draft": nil, "extra": map[string]any{}}},
 }
 
 func TestWriteRoute_TreatsNullAsAbsentAndIgnoresUnknownMembers(t *testing.T) {
@@ -423,6 +434,9 @@ var measuredTexts = []struct {
 	{http.MethodPost, "/issues/7/close", "comment", func(s string) map[string]any { return map[string]any{"comment": s} }, "body", "body"},
 	{http.MethodPost, "/issues/7/comments", "body", func(s string) map[string]any { return map[string]any{"body": s} }, "body", "body"},
 	{http.MethodPost, "/pulls/12/comments", "body", func(s string) map[string]any { return map[string]any{"body": s} }, "body", "body"},
+	{http.MethodPost, "/pulls", "body", func(s string) map[string]any {
+		return map[string]any{"title": "t", "head": "feature", "base": "main", "body": s}
+	}, "body", "description"},
 }
 
 func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
@@ -561,6 +575,10 @@ var writeEvents = []struct {
 		"parley.forge.label.create", "label", 0,
 		"triage", map[string]any{"label": "triage", "created": true},
 		"triage", map[string]any{"label": "triage", "created": false}},
+	{http.MethodPost, "/pulls", map[string]any{"title": titleMarker, "head": "feature", "base": "main", "body": textMarker, "draft": true},
+		"parley.forge.pull_request.create", "pull_request", 12,
+		"12", map[string]any{"number": 12, "url": "https://github.com/acme/widgets/pull/12", "head": "feature", "base": "main", "draft": true},
+		"none", map[string]any{"head": "feature", "base": "main", "draft": true}},
 }
 
 // notFoundThen are, per write route of writeEvents that answers a 404 of

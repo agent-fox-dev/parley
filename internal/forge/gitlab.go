@@ -235,6 +235,12 @@ func (gitlab) pull(ctx context.Context, call *Call, iid int64) (PullRequest, err
 	if err := getJSON(ctx, call, gitlabMRPath(call.Resolution.Repository, iid), &g); err != nil {
 		return PullRequest{}, err
 	}
+	return g.pull(), nil
+}
+
+// pull is the merge request g as the hub answers a pull request, numbered
+// by its iid.
+func (g gitlabMergeRequest) pull() PullRequest {
 	p := PullRequest{
 		Number: g.IID, Title: g.Title, State: IssueOpen, URL: g.WebURL, Draft: g.Draft,
 		Merged: g.State == PullMerged || g.MergedAt != nil, HeadSHA: g.SHA, HeadBranch: g.SourceBranch,
@@ -251,7 +257,7 @@ func (gitlab) pull(ctx context.Context, call *Call, iid int64) (PullRequest, err
 	case g.State == IssueClosed:
 		p.State = IssueClosed
 	}
-	return p, nil
+	return p
 }
 
 // files reads the diffs of the merge request iid. GitLab gives no line

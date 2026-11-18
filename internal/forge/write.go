@@ -134,6 +134,8 @@ func (c *Component) writeRoutes() []server.Route {
 			event: eventKind{"parley.forge.label.remove", "label"}, before: readLabelRemove, serve: removeLabel}),
 		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/labels",
 			event: eventKind{"parley.forge.label.create", "label"}, before: readLabelEnsure, serve: ensureLabel}),
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls",
+			event: eventKind{"parley.forge.pull_request.create", "pull_request"}, before: readPullOpen, serve: openPull}),
 	}
 }
 
@@ -334,6 +336,8 @@ type writer interface {
 	label(ctx context.Context, call *Call, name string) (Label, error)
 	// createLabel creates the label in describes.
 	createLabel(ctx context.Context, call *Call, in labelEnsure) (Label, error)
+	// openPull opens the pull request in describes.
+	openPull(ctx context.Context, call *Call, in pullOpen) (PullRequest, error)
 }
 
 func writerOf(kind ForgeKind) writer {
@@ -418,6 +422,20 @@ func (m members) required(name string, dst **string) error {
 		return server.InvalidRequest(name + " is required")
 	}
 	return m.filled(name, dst)
+}
+
+// flag reads the boolean member name.
+func (m members) flag(name string, dst **bool) error {
+	v, ok := m[name]
+	if !ok {
+		return nil
+	}
+	var b bool
+	if (v[0] != 't' && v[0] != 'f') || json.Unmarshal(v, &b) != nil {
+		return server.InvalidRequest(name + " must be true or false")
+	}
+	*dst = &b
+	return nil
 }
 
 // maxNames is how many entries a list of names may have.

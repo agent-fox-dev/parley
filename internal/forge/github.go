@@ -200,6 +200,11 @@ func (github) pull(ctx context.Context, call *Call, number int64) (PullRequest, 
 	if err := getJSON(ctx, call, githubPullPath(call.Resolution.Repository, number), &g); err != nil {
 		return PullRequest{}, err
 	}
+	return g.pull(), nil
+}
+
+// pull is the pull request g as the hub answers it.
+func (g githubPull) pull() PullRequest {
 	p := PullRequest{
 		Number: g.Number, Title: g.Title, State: IssueOpen, URL: g.HTMLURL, Draft: g.Draft,
 		// GitHub leaves merged out of some answers; merged_at is set on a
@@ -217,7 +222,7 @@ func (github) pull(ctx context.Context, call *Call, number int64) (PullRequest, 
 	case g.State == IssueClosed:
 		p.State = IssueClosed
 	}
-	return p, nil
+	return p
 }
 
 // githubFileStatus maps GitHub's file statuses to the hub's; any other is
