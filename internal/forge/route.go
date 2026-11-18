@@ -6,38 +6,23 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/forge/number"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // ErrNumber is the refusal of an issue or pull request number that is not
 // a positive decimal integer of at most 2,147,483,647.
-var ErrNumber = errors.New("number must be a positive decimal integer")
-
-// maxNumber is the largest issue or pull request number: the forges keep
-// them in 32 bits.
-const maxNumber = 1<<31 - 1
+var ErrNumber = number.ErrInvalid
 
 // ParseNumber parses an issue or pull request number: decimal digits only,
 // without a sign or a leading zero, from 1 to 2,147,483,647. Anything else
-// is ErrNumber.
+// is ErrNumber. The rule lives in package number, which the command-line
+// client applies too.
 func ParseNumber(s string) (int64, error) {
-	if s == "" || s[0] == '0' || len(s) > len(strconv.Itoa(maxNumber)) {
-		return 0, ErrNumber
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return 0, ErrNumber
-		}
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n > maxNumber {
-		return 0, ErrNumber
-	}
-	return n, nil
+	return number.Parse(s)
 }
 
 // PathNumber parses the route's :number path parameter with ParseNumber;
