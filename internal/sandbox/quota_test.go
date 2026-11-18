@@ -291,8 +291,12 @@ func TestQuota_ConcurrentCreates(t *testing.T) {
 			t.Errorf("sandbox %s is of %s; want demo", r.ID, r.Workspace)
 		}
 	}
-	// A refused create mints no token: at most one per sandbox stored.
-	if after := h.footprint(t); after.tokens-before.tokens > 5 {
-		t.Errorf("the creates added %d tokens; want at most 5", after.tokens-before.tokens)
+	// Each sandbox stored has its hub credential, and a refused create mints
+	// none.
+	if after := h.footprint(t); after.tokens-before.tokens != 5 {
+		t.Errorf("the creates added %d tokens; want 5", after.tokens-before.tokens)
+	}
+	if n := h.count(t, `SELECT count(*) FROM pats WHERE workspace = 'demo'`); n != 5 {
+		t.Errorf("%d tokens are bound to demo; want 5", n)
 	}
 }

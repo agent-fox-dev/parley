@@ -156,9 +156,17 @@ func (s *Service) object(rec Record) Object {
 // required credentials and exposed secrets (422 credential_missing, both
 // Resolve), the quotas (429 sandbox_capacity, CheckQuota). A refused create
 // writes nothing. The record keeps the names of what was resolved, never a
-// value. A store or event failure is an error that is not a *server.Error,
-// answered 500, and writes nothing either; its text is scrubbed of the
-// resolved values (Scrub).
+// value. A store, minting or event failure is an error that is not a
+// *server.Error, answered 500, and writes nothing either; its text is
+// scrubbed of the resolved values and the hub credential (Scrub).
+//
+// The sandbox's hub credential is minted in the same transaction (see
+// hubAccessOf for when it has one); without one that can read the
+// repository the sandbox has no checkout. Its value is never stored: once the
+// sandbox is created, the service keeps it in memory for the provisioning
+// (HubCredential), with the resolved values, as the values the sandbox's
+// text is scrubbed of. With the caller's transaction it is kept when Create
+// returns, before the caller commits.
 func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Record, error) {
 	if in.Caller.User == nil {
 		return Record{}, server.Forbidden(msgNeedsUser)
@@ -167,58 +175,73 @@ func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Recor
 	if err != nil {
 		return Record{}, err
 	}
-	var rec Record
+	var (
+		rec    Record
+		values Values
+	)
 	run := func(tx *sql.Tx) (err error) {
-		rec, err = s.create(ctx, tx, in, body)
+		rec, values, err = s.create(ctx, tx, in, body)
 		return err
 	}
 	if tx != nil {
-		return rec, run(tx)
+		err = run(tx)
+	} else {
+		err = s.deps.Store.Tx(ctx, run)
 	}
-	if err := s.deps.Store.Tx(ctx, run); err != nil {
+	if err != nil {
 		return Record{}, err
 	}
-	s.wakeProvisioner()
+	s.SetValues(rec.ID, values)
+	if values.HubCredential != "" {
+		s.SetHubCredential(rec.ID, values.HubCredential)
+	}
+	if tx == nil {
+		s.wakeProvisioner()
+	}
 	return rec, nil
 }
 
-// create is Create in tx, the body read.
-func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body map[string]json.RawMessage) (Record, error) {
+// create is Create in tx, the body read. values are the sandbox's resolved
+// values and its hub credential's.
+func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body map[string]json.RawMessage) (rec Record, values Values, err error) {
 	w := in.Workspace
 	req, err := s.judge(ctx, tx, w, body)
 	if err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
 	session, err := s.checkSession(ctx, in, req.sessionID)
 	if err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
 	if err := workspace.RequireReady(w); err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
 	if err := fork.GuardUpdate(ctx, tx, w); err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
 	snapshot, err := s.snapshotOf(req.profile)
 	if err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
 	res, err := s.Resolve(ctx, w.Slug, snapshot)
 	if err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
 	if err := res.Missing(); err != nil {
-		return Record{}, err
+		return Record{}, Values{}, err
 	}
-	// From here on an error's text may hold what was resolved.
-	rec, err := s.store(ctx, tx, in, req, session, snapshot, res)
-	return rec, scrubError(res.Values(), err)
+	// From here on an error's text may hold what was resolved, and the hub
+	// credential once it is minted.
+	values = res.Values()
+	rec, err = s.store(ctx, tx, in, req, session, snapshot, res, &values)
+	return rec, values, scrubError(values, err)
 }
 
 // store is the end of create, once the request passed every check but the
-// quotas: it checks them, then stores the sandbox with the names res
-// resolved, links it to its session and writes its create event, all in tx.
-func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req createRequest, session *string, snapshot Snapshot, res Resolution) (Record, error) {
+// quotas: it checks them, then mints the sandbox's hub credential, whose
+// value it sets in values, stores the sandbox with the names res resolved,
+// links it to its session and writes its create event, all in tx.
+func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req createRequest, session *string, snapshot Snapshot, res Resolution, values *Values) (Record, error) {
 	w := in.Workspace
 	// The quotas come last: their count is atomic with the insert below
 	// only in this transaction.
@@ -230,6 +253,17 @@ func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req cre
 		return Record{}, err
 	}
 	rec.Credentials, rec.ExposedSecrets = res.CredentialNames(), res.SecretNames()
+	rec.HubAccess = hubAccessOf(in.Caller, snapshot.HubAccess, s.deps.ExternalURL, rec.ExpiresAt)
+	if !canClone(rec.HubAccess) {
+		rec.Checkout = nil
+	}
+	if rec.HubAccess != nil {
+		pat, value, err := s.mint(ctx, tx, in.Caller, rec.ID, w.Slug, rec.HubAccess)
+		if err != nil {
+			return Record{}, err
+		}
+		rec.HubTokenID, values.HubCredential = pat.TokenID, value
+	}
 	if err := Insert(ctx, tx, rec); err != nil {
 		return Record{}, err
 	}

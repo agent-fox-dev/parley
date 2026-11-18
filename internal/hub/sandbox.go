@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/openshell"
@@ -37,9 +38,11 @@ const (
 // the service to the store, the hub's clock, the event component, through
 // which a create and a transition write their events, the metrics recorder
 // the workspaces' repositories, in which a create resolves its checkout,
-// and the secret component's resolution, through which a create resolves
-// the profile's credentials and exposed secrets; the other sandbox packages register their delete and purge
-// hooks on the service. POST /workspaces/:slug/sandboxes creates a sandbox
+// the secret component's resolution, through which a create resolves the
+// profile's credentials and exposed secrets, the access component's
+// MintBound and identity.RevokeTokenByID, through which a sandbox's hub
+// credential is minted and revoked, and [server].external_url; the other
+// sandbox packages register their delete and purge hooks on the service. POST /workspaces/:slug/sandboxes creates a sandbox
 // through the service's create.
 //
 // The parts composed after this one reach the feature through
@@ -63,6 +66,7 @@ func composeSandbox(c *Composition) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
 			},
 			ResolveSecrets: c.Secrets().ResolveSecrets,
+			Mint:           c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
 		}
 		for _, adjust := range c.sandboxAdjusters {
 			adjust(&d)

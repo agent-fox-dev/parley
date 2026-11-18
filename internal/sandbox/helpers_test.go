@@ -613,15 +613,18 @@ var secretsKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 // createHub is a hub with sandboxes on over a fake runtime, on a clock
 // fixed at recordStart, with the users dana, who owns every workspace the
 // test adds, in the org acme, a session linker the test steers, a secret
-// store with an encryption key, and a resolver in front of the hub's secret
-// resolution that the test can make fail. The runtime holds the provider
-// profiles anthropic and mirror of credentialTables.
+// store with an encryption key, a resolver in front of the hub's secret
+// resolution that the test can make fail, and a minter in front of the
+// hub's minting component that keeps the values it minted and that the test
+// can make fail. The runtime holds the provider profiles anthropic and
+// mirror of credentialTables.
 type createHub struct {
 	*probeHub
 	svc        *sandbox.Service
 	workspaces *workspace.Service
 	secrets    *secret.Component
 	resolver   *stubResolver
+	minter     *spyMinter
 	linker     *stubLinker
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
@@ -630,10 +633,11 @@ type createHub struct {
 }
 
 // startCreateHub starts a create hub whose [sandbox] section holds the
-// profiles given as TOML.
-func startCreateHub(t *testing.T, profiles string) *createHub {
+// profiles given as TOML, with the dependencies of its stored sandboxes
+// changed by adjust, in order.
+func startCreateHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	h := &createHub{probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}}
+	h := &createHub{probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{}}
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "mirror", Variables: []string{"MIRROR_TOKEN"}})
 	cfg := hubtest.Config{
@@ -648,6 +652,10 @@ func startCreateHub(t *testing.T, profiles string) *createHub {
 		h.svc.RegisterSessionLinker(h.linker)
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
+			h.minter.next, d.Mint = d.Mint, h.minter.mint
+			for _, fn := range adjust {
+				fn(d)
+			}
 		})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
@@ -879,4 +887,92 @@ func (l *stubLinker) last() (check, record string) {
 		record = l.recorded[n-1]
 	}
 	return check, record
+}
+
+// spyMinter stands in front of the hub's minting component: it answers err
+// while one is set and mints through the hub's component otherwise, keeping
+// the value of every token it minted.
+type spyMinter struct {
+	mu     sync.Mutex
+	err    error
+	values []string
+	next   func(ctx context.Context, tx *sql.Tx, in access.MintInput) (identity.PAT, string, error)
+}
+
+func (m *spyMinter) setErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.err = err
+}
+
+// minted returns the values of the tokens minted so far, in order.
+func (m *spyMinter) minted() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.values)
+}
+
+func (m *spyMinter) mint(ctx context.Context, tx *sql.Tx, in access.MintInput) (identity.PAT, string, error) {
+	m.mu.Lock()
+	err, next := m.err, m.next
+	m.mu.Unlock()
+	if err != nil {
+		return identity.PAT{}, "", err
+	}
+	pat, value, err := next(ctx, tx, in)
+	if err == nil {
+		m.mu.Lock()
+		m.values = append(m.values, value)
+		m.mu.Unlock()
+	}
+	return pat, value, err
+}
+
+// tokenIDs returns the ids of every PAT the hub holds.
+func (h *createHub) tokenIDs(t *testing.T) map[string]bool {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT token_id FROM pats`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// newTokens returns the PATs the hub holds whose ids are not in before.
+func (h *createHub) newTokens(t *testing.T, before map[string]bool) []identity.PAT {
+	t.Helper()
+	var out []identity.PAT
+	for id := range h.tokenIDs(t) {
+		if before[id] {
+			continue
+		}
+		pat, err := identity.PATByID(context.Background(), h.Store.Main(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, pat)
+	}
+	return out
+}
+
+// count returns the single number the query with args reads.
+func (h *createHub) count(t *testing.T, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := h.Store.Main().QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

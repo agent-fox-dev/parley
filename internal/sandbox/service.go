@@ -56,11 +56,14 @@ type Service struct {
 	// deleteHooks and purgeHooks are the clean-up other sandbox packages
 	// register for the records.
 	deleteHooks, purgeHooks hooks
-	// mu guards linker, the session-linking rule (nil for none), and
-	// values, the secret values each sandbox's text is scrubbed of.
-	mu     sync.Mutex
-	linker SessionLinker
-	values map[string]Values
+	// mu guards linker, the session-linking rule (nil for none), values,
+	// the secret values each sandbox's text is scrubbed of, and hubValues,
+	// the value of each hub credential this process minted, which is never
+	// stored.
+	mu        sync.Mutex
+	linker    SessionLinker
+	values    map[string]Values
+	hubValues map[string]string
 	// wakeup holds a token while a created sandbox waits for the
 	// provisioner.
 	wakeup chan struct{}

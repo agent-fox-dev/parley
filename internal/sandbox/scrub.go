@@ -65,19 +65,21 @@ func (s *Service) SetValues(id string, v Values) {
 	s.values[id] = v
 }
 
-// ForgetValues drops what the service keeps of the sandbox id's values, for
-// a sandbox that is gone.
+// ForgetValues drops what the service keeps of the sandbox id's values, its
+// hub credential's included, for a sandbox that is gone.
 func (s *Service) ForgetValues(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.values, id)
+	delete(s.hubValues, id)
 }
 
 // ValuesOf returns the values the sandbox id's text is scrubbed of. When
 // the service keeps none for it, as after a restart, it resolves the names
 // of the credentials and exposed secrets on the record again and keeps what
-// it finds; the hub credential's value is then unknown until SetValues is
-// called with it.
+// it finds, with the hub credential this process holds (HubCredential);
+// after a restart the hub credential's value is unknown until a replacement
+// is set (SetHubCredential).
 func (s *Service) ValuesOf(ctx context.Context, id string) (Values, error) {
 	s.mu.Lock()
 	v, ok := s.values[id]
@@ -99,6 +101,7 @@ func (s *Service) ValuesOf(ctx context.Context, id string) (Values, error) {
 	if kept, ok := s.values[id]; ok {
 		return kept, nil
 	}
+	v.HubCredential = s.hubValues[id]
 	if s.values == nil {
 		s.values = map[string]Values{}
 	}

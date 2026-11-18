@@ -8,8 +8,10 @@ import (
 	"slices"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -54,6 +56,16 @@ type Deps struct {
 	// ResolveSecrets resolves secret names along the chain of the workspace
 	// slug, as the secret component's ResolveSecrets does.
 	ResolveSecrets func(ctx context.Context, slug string, names []string) (secret.SecretResolution, error)
+	// Mint mints a PAT bound to a workspace in the caller's transaction, with
+	// its parley.token.bind event, as the access component's MintBound does:
+	// the one way a hub credential is minted.
+	Mint func(ctx context.Context, tx *sql.Tx, in access.MintInput) (identity.PAT, string, error)
+	// Revoke revokes the PAT tokenID at now in the caller's transaction, as
+	// identity.RevokeTokenByID does.
+	Revoke func(ctx context.Context, tx *sql.Tx, tokenID string, now time.Time) error
+	// ExternalURL is [server].external_url, the address a sandbox reaches the
+	// hub at; without one no sandbox gets a hub credential.
+	ExternalURL string
 }
 
 // Bind sets the dependencies the stored sandboxes are worked with. It is
