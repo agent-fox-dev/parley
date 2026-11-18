@@ -3,7 +3,7 @@
   "spec_id": "41",
   "spec_name": "forge_reads",
   "schema_version": 3,
-  "updated_at": "2026-11-18T17:25:45Z",
+  "updated_at": "2026-11-18T17:34:18Z",
   "tasks": [
     {
       "id": 1,
@@ -11,7 +11,7 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
