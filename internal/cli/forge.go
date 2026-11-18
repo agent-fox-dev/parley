@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -12,20 +15,117 @@ import (
 // The flags the forge commands share.
 var (
 	targetFlag = queryFlag{name: "target", param: "target", usage: "the remote the command works on, origin or upstream (default: origin)"}
+	sinceFlag  = queryFlag{name: "since", param: "since", usage: "only what was received at or after this RFC 3339 time"}
 	// pageFlags are the flags of a forge read that answers a list.
 	pageFlags = []queryFlag{limitFlag, cursorFlag}
 )
 
 // newForgeCommand builds parley forge: what the hub derives about a
-// workspace's forge, and the forge's repository.
+// workspace's forge, the forge's repository, and the webhook deliveries the
+// forge sends the hub.
 func newForgeCommand() *cobra.Command {
-	return group("forge", "Show how the hub reaches a workspace's forge, and the forge's repository",
+	return group("forge", "Show how the hub reaches a workspace's forge, the forge's repository and the webhook deliveries it sends",
 		forgeRead(scmRead{command: command{Name: "status", Description: "Show the forge, API URL and credential kind the hub derives for a workspace, without asking the forge", Path: "/workspaces/:slug/forge"}}),
 		forgeRead(scmRead{
 			command: command{Name: "repository", Description: "Show the forge's repository of a workspace: its name, default branch, visibility and the caller's permissions", Path: "/workspaces/:slug/forge/repository"},
 			query:   []queryFlag{targetFlag},
 		}),
+		newWebhookCommand(),
+		forgeRead(scmRead{
+			command: command{Name: "deliveries", Description: "List the webhook deliveries the hub recorded for a workspace, newest first", Path: "/workspaces/:slug/forge/deliveries"},
+			query:   []queryFlag{sinceFlag, limitFlag, cursorFlag},
+		}),
 	)
+}
+
+// The flags of parley forge webhook set that say where the secret comes
+// from; at most one of them is given.
+var webhookSources = []string{"secret", "from-stdin", "generate"}
+
+// newWebhookCommand builds parley forge webhook: the secret the forge signs
+// a workspace's webhook deliveries with, which a person enters in the
+// forge's settings.
+func newWebhookCommand() *cobra.Command {
+	const path = "/workspaces/:slug/forge/webhook"
+	set := declare(command{
+		Name:        "set",
+		Description: "Set or rotate the secret of a workspace's forge webhook: one the hub generates and shows once, or one given",
+		Method:      http.MethodPut,
+		Path:        path,
+		Args:        []argSpec{slugArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("secret", "", "the secret to store, which the hub checks")
+			fs.Bool("from-stdin", false, "read the secret from standard input, without one trailing line ending")
+			fs.Bool("generate", false, "have the hub generate the secret (the default)")
+		},
+		Run: setWebhook,
+	})
+	return group("webhook", "Set or remove the secret of a workspace's forge webhook",
+		checkFlags(set, func(cmd *cobra.Command) error {
+			var given []string
+			for _, name := range webhookSources {
+				if cmd.Flags().Changed(name) {
+					given = append(given, "--"+name)
+				}
+			}
+			if len(given) > 1 {
+				return usageError("%s takes one of --secret, --from-stdin and --generate, got %s", cmd.CommandPath(), strings.Join(given, " and "))
+			}
+			return nil
+		}),
+		declare(command{
+			Name:        "unset",
+			Description: "Remove the secret of a workspace's forge webhook, so that the hub refuses its deliveries",
+			Method:      http.MethodDelete,
+			Path:        path,
+			Args:        []argSpec{slugArg},
+			Auth:        authUser,
+			Confirm: func(c *call) any {
+				return map[string]string{"status": "unset", "workspace": c.args[slugArg.Name]}
+			},
+		}),
+	)
+}
+
+// setWebhook sends the secret given, or no body for the hub to generate
+// one, and prints the hub's answer. It writes the show-once note itself,
+// not through ShowsOnce, because only an answer that holds a generated
+// secret shows one.
+func setWebhook(c *call) error {
+	fs := c.cmd.Flags()
+	var body any
+	switch {
+	case fs.Changed("secret"):
+		value, _ := fs.GetString("secret")
+		body = map[string]string{"secret": value}
+	case fromStdin(c.cmd):
+		data, err := io.ReadAll(c.opts.stdin)
+		if err != nil {
+			return clientError("cannot read the secret from stdin: %v", err)
+		}
+		// One trailing line ending, \n or \r\n, is the shell's, not the
+		// secret's.
+		value := strings.TrimSuffix(string(data), "\n")
+		if len(value) < len(data) {
+			value = strings.TrimSuffix(value, "\r")
+		}
+		body = map[string]string{"secret": value}
+	}
+	resp, err := c.client.request(c.ctx, c.decl.Method, routePath(c.decl.Path, c.args), nil, body)
+	if err != nil {
+		return err
+	}
+	if err := c.printAnswer(resp); err != nil {
+		return err
+	}
+	var answer map[string]json.RawMessage
+	if json.Unmarshal(resp.body, &answer) == nil {
+		if _, shown := answer["secret"]; shown {
+			warn(c.stderr, showOnceWarning)
+		}
+	}
+	return nil
 }
 
 // forgeRead builds r, a read of a workspace's forge: GET of its path with
