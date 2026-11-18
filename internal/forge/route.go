@@ -175,14 +175,20 @@ func (c *Component) failed(w http.ResponseWriter, r *http.Request, call *Call, e
 	if !ok {
 		return err
 	}
-	if c.deps.Logger != nil {
-		c.deps.Logger.LogAttrs(r.Context(), slog.LevelDebug, "forge call failed",
-			slog.String("workspace", call.Slug), slog.String("error_type", e.Type), slog.String("message", e.Message))
-	}
+	c.logFailure(r, call, e)
 	if e.RetryAfter != "" {
 		w.Header().Set("Retry-After", e.RetryAfter)
 	}
 	return e.ServerError()
+}
+
+// logFailure logs the failed forge call e of the request r at debug level,
+// with its scrubbed message.
+func (c *Component) logFailure(r *http.Request, call *Call, e HubError) {
+	if c.deps.Logger != nil {
+		c.deps.Logger.LogAttrs(r.Context(), slog.LevelDebug, "forge call failed",
+			slog.String("workspace", call.Slug), slog.String("error_type", e.Type), slog.String("message", e.Message))
+	}
 }
 
 // begin reads the workspace the request names, and for a task fork

@@ -428,9 +428,9 @@ func TestForgeRoute_ReadsAnonymouslyWithoutSecretsWhateverTheEnvironmentHolds(t 
 	for slug, apiURL := range map[string]string{"gh": w.fake.GitHubURL(), "gl": w.fake.GitLabURL()} {
 		w.addWorkspace(t, workspace.Workspace{Slug: slug, GitURL: new("https://github.com/acme/widgets.git"),
 			Settings: settings(forge.SettingAPIURL, apiURL)})
-		w.fake.Script(forgetest.Answer{Body: `{"number":1}`})
-		if status, body, sent := w.get(t, slug, issuePath, w.Token); status != http.StatusOK || sent != 1 {
-			t.Errorf("%s: %d %s after %d forge requests, want 200 after 1", slug, status, body, sent)
+		w.fake.Script(forgetest.Answer{Body: `{"number":1}`}, forgetest.Answer{Body: "[]"})
+		if status, body, sent := w.get(t, slug, issuePath, w.Token); status != http.StatusOK || sent != 2 {
+			t.Errorf("%s: %d %s after %d forge requests, want 200 after 2, the issue and its comments", slug, status, body, sent)
 		}
 	}
 	for _, r := range w.fake.Requests() {

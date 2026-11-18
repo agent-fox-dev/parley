@@ -112,12 +112,12 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 }
 
 // The routes the forge failure tests read through: a repository, an
-// issue, and an issue's comments, for which the probe stands in until
-// their routes exist.
+// issue thread, which reads the issue and then its comments, and an
+// issue's comments.
 const (
 	repositoryPath = "/forge/repository"
-	issuePath      = "/forge-probe/1"
-	commentsPath   = "/forge-probe/1"
+	issuePath      = "/issues/1"
+	commentsPath   = "/issues/1/comments"
 )
 
 // probe is the probe route of pattern: it reads the issues, or the issue

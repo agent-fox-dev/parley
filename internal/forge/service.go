@@ -88,6 +88,8 @@ func (c *Component) Routes() []server.Route {
 			NoTarget: true, Serve: c.serveStatus}),
 		read("/workspaces/:slug/forge/repository", nil, serveRepository),
 		read("/workspaces/:slug/issues", readIssueList, serveIssues),
+		read("/workspaces/:slug/issues/:number", readIssueNumber, c.serveIssueThread),
+		read(commentsPattern, readComments, serveComments),
 	}
 }
 

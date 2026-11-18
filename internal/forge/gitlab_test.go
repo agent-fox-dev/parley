@@ -2,7 +2,9 @@ package forge_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
@@ -67,5 +69,39 @@ func TestRepository_AnswersGitLabsProjectInTheHubsShape(t *testing.T) {
 		if last := w.fake.Last(t); sent != 1 || last.RawPath != glProject {
 			t.Errorf("%s: the forge received %d requests, the last for %s, want 1 for %s", c.name, sent, last.RawPath, glProject)
 		}
+	}
+}
+
+func TestIssueThread_AnswersGitLabsIssueAndNotes(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, workspace.Workspace{Slug: "w", GitURL: new("https://forge.example.com/group/sub/proj.git"), Settings: w.gitlab()})
+	w.fake.SetObject(glIssues+"/7", gitlabIssue(7, "Crash", nil))
+	w.fake.SetList(glIssues+"/7/notes", gitlabNote(1, "first", false), gitlabNote(2, "added label", true), gitlabNote(3, "second", false))
+
+	before := len(w.fake.Requests())
+	th, _ := w.thread(t, "w", "/issues/7")
+	var paths []string
+	for _, r := range w.fake.Requests()[before:] {
+		paths = append(paths, r.RawPath)
+	}
+	if th.Issue["is_pr"] != false || !slices.Equal(paths, []string{glIssues + "/7", glIssues + "/7/notes"}) {
+		t.Errorf("GET w/issues/7: is_pr %v after requests for %v, want false after the issue and its notes only", th.Issue["is_pr"], paths)
+	}
+
+	l, _ := w.list(t, "w", "/issues/7/comments")
+	q := w.lastQuery(t)
+	for name, items := range map[string][]map[string]any{"the thread's comments": th.Comments, "the comments": l.Items} {
+		if got := ids(items); fmt.Sprint(got) != "[1 3]" {
+			t.Errorf("%s have the ids %v, want [1 3] without the system note", name, got)
+			continue
+		}
+		author, _ := items[0]["author"].(map[string]any)
+		if url := w.fake.URL + "/group/sub/proj/-/issues/7#note_1"; author["login"] != "kim" || items[0]["url"] != url || items[0]["body"] != "first" {
+			t.Errorf("%s: the first is %v, want the body first by kim at %s", name, items[0], url)
+		}
+	}
+	if q.Get("sort") != "asc" || q.Get("order_by") != "created_at" {
+		t.Errorf("the notes were asked for with %s, want sort=asc and order_by=created_at", w.fake.Last(t).RawQuery)
 	}
 }

@@ -27,6 +27,8 @@ var readRoutes = []readRoute{
 	{"/forge", nil},
 	{"/forge/repository", []forgetest.Answer{{}}},
 	{"/issues", []forgetest.Answer{{Body: "[]"}}},
+	{"/issues/1", []forgetest.Answer{{}, {Body: "[]"}}},
+	{"/issues/1/comments", []forgetest.Answer{{Body: "[]"}}},
 	{"/forge-probe", []forgetest.Answer{{}}},
 	{"/forge-probe/1", []forgetest.Answer{{}}},
 }
@@ -34,6 +36,8 @@ var readRoutes = []readRoute{
 // numberRoutes are the forge routes that take :number, with %s where it
 // goes.
 var numberRoutes = []string{
+	"/issues/%s",
+	"/issues/%s/comments",
 	"/forge-probe/%s",
 }
 
@@ -130,12 +134,12 @@ func TestForgeRoute_AnswersTheFirstFailingCheckWithoutCallingTheForge(t *testing
 		message, contains, lacks string
 	}
 	cases := []refusal{
-		{name: "an invalid target first", slug: "w", path: "/forge-probe/abc?target=bad", status: 400, errorType: "invalid_request", lacks: numberMessage},
-		{name: "a mode mismatch before the number", slug: "w", path: "/forge-probe/abc?target=upstream", status: 400, errorType: "workspace_mode_mismatch"},
-		{name: "the number before an unknown forge", slug: "unknown", path: "/forge-probe/abc", status: 400, errorType: "invalid_request", message: numberMessage},
+		{name: "an invalid target first", slug: "w", path: "/issues/abc?target=bad", status: 400, errorType: "invalid_request", lacks: numberMessage},
+		{name: "a mode mismatch before the number", slug: "w", path: "/issues/abc?target=upstream", status: 400, errorType: "workspace_mode_mismatch"},
+		{name: "the number before an unknown forge", slug: "unknown", path: "/issues/abc", status: 400, errorType: "invalid_request", message: numberMessage},
 		{name: "a query parameter before an unknown forge", slug: "unknown", path: "/issues?state=bogus", status: 400, errorType: "invalid_request"},
 		{name: "a query parameter before an invalid API URL", slug: "invalid", path: "/issues?limit=0", status: 400, errorType: "invalid_request"},
-		{name: "an invalid API URL before the repository", slug: "invalid-no-repo", path: "/forge-probe/1", status: 422, errorType: forge.ErrorTypeAPIURLInvalid},
+		{name: "an invalid API URL before the repository", slug: "invalid-no-repo", path: "/issues/1", status: 422, errorType: forge.ErrorTypeAPIURLInvalid},
 		{name: "a remote naming no repository", slug: "one-segment", path: "/forge/repository", status: 422, errorType: forge.ErrorTypeUnknown},
 		{name: "an unknown origin forge names its setting", slug: "unknown", path: "/forge/repository", status: 422, errorType: forge.ErrorTypeUnknown,
 			contains: forge.SettingAPIURL, lacks: forge.SettingUpstreamAPIURL},
@@ -205,35 +209,39 @@ func TestForgeRoute_ServesEveryTargetAndWorkspaceStateItAccepts(t *testing.T) {
 	for _, s := range states {
 		w.addWorkspace(t, workspace.Workspace{Slug: s.slug, Status: s.status, Marker: s.marker, GitURL: gh, Settings: w.github()})
 	}
-	// forge is what the forge answers; a read of the probe's issue
-	// answers the forge's issue 1.
+	// answers are what the forge answers the requests of one read, the
+	// first of which is for forgePath.
 	type read struct {
-		name, slug, path, forgePath, forge string
+		name, slug, path, forgePath string
+		answers                     []forgetest.Answer
 	}
-	issue := `{"number":1}`
+	list, object := []forgetest.Answer{{Body: "[]"}}, []forgetest.Answer{{}}
+	thread := []forgetest.Answer{{Body: `{"number":1}`}, {Body: "[]"}}
 	cases := []read{
-		{"no target", "w", "/issues", "/github/repos/acme/widgets/issues", "[]"},
-		{"target origin", "w", "/issues?target=origin", "/github/repos/acme/widgets/issues", "[]"},
-		{"target upstream of a carry-patch workspace", "carry", "/issues?target=upstream", "/github/repos/up/proj/issues", "[]"},
-		{"origin beside an invalid upstream API URL", "bad-upstream", "/forge/repository", "/github/repos/acme/widgets", "{}"},
+		{"no target", "w", "/issues", "/github/repos/acme/widgets/issues", list},
+		{"target origin", "w", "/issues?target=origin", "/github/repos/acme/widgets/issues", list},
+		{"target upstream of a carry-patch workspace", "carry", "/issues?target=upstream", "/github/repos/up/proj/issues", list},
+		{"origin beside an invalid upstream API URL", "bad-upstream", "/forge/repository", "/github/repos/acme/widgets", object},
 	}
 	for _, s := range states {
-		cases = append(cases, read{s.slug, s.slug, "/forge-probe/1", "/github/repos/acme/widgets/issues/1", issue})
+		cases = append(cases, read{s.slug, s.slug, "/issues/1", "/github/repos/acme/widgets/issues/1", thread})
 	}
 	for _, c := range cases {
-		w.fake.Script(forgetest.Answer{Body: c.forge})
+		w.fake.Script(c.answers...)
 		status, body, sent := w.get(t, c.slug, c.path, w.ownerKey)
 		var got struct {
-			Forge struct {
+			Issue *struct {
 				Number int `json:"number"`
-			} `json:"forge"`
+			} `json:"issue"`
 		}
-		if status != http.StatusOK || c.forge == issue && (json.Unmarshal(body, &got) != nil || got.Forge.Number != 1) {
+		if status != http.StatusOK || c.path == "/issues/1" && (json.Unmarshal(body, &got) != nil || got.Issue == nil || got.Issue.Number != 1) {
 			t.Errorf("%s: %s%s = %d %s, want 200 with the forge's answer", c.name, c.slug, c.path, status, body)
 			continue
 		}
-		if path := w.fake.Last(t).Path; sent != 1 || path != c.forgePath {
-			t.Errorf("%s: the forge received %d requests, the last for %s, want 1 for %s", c.name, sent, path, c.forgePath)
+		requests := w.fake.Requests()
+		if first := requests[len(requests)-max(sent, 1)].Path; sent != len(c.answers) || first != c.forgePath {
+			t.Errorf("%s: the forge received %d requests, the first for %s, want %d, the first for %s",
+				c.name, sent, first, len(c.answers), c.forgePath)
 		}
 	}
 }
@@ -250,23 +258,26 @@ func TestForgeRoute_ActsOnAForksParent(t *testing.T) {
 
 	t.Run("reads the parent's repository with the parent's credential", func(t *testing.T) {
 		for target, path := range map[string]string{"": "/github/repos/acme/widgets/issues/1", "?target=upstream": "/github/repos/up/proj/issues/1"} {
-			w.fake.Script(forgetest.Answer{})
-			if status, body, _ := w.get(t, "f", "/forge-probe/1"+target, w.ownerKey); status != http.StatusOK {
-				t.Fatalf("GET f/forge-probe/1%s = %d %s, want 200", target, status, body)
+			w.fake.Script(forgetest.Answer{}, forgetest.Answer{Body: "[]"})
+			status, body, sent := w.get(t, "f", "/issues/1"+target, w.ownerKey)
+			if status != http.StatusOK || sent != 2 {
+				t.Fatalf("GET f/issues/1%s = %d %s after %d forge requests, want 200 after 2", target, status, body, sent)
 			}
-			last := w.fake.Last(t)
-			if last.Path != path || last.Header.Get("Authorization") != "Bearer parent-token" {
-				t.Errorf("target %q: the forge got %s with Authorization %q, want %s with the parent's token",
-					target, last.Path, last.Header.Get("Authorization"), path)
+			requests := w.fake.Requests()
+			for i, r := range requests[len(requests)-2:] {
+				if want := []string{path, path + "/comments"}[i]; r.Path != want || r.Header.Get("Authorization") != "Bearer parent-token" {
+					t.Errorf("target %q: the forge got %s with Authorization %q, want %s with the parent's token",
+						target, r.Path, r.Header.Get("Authorization"), want)
+				}
 			}
 		}
 	})
 
 	t.Run("decides on the parent by the user behind a token bound to the fork", func(t *testing.T) {
 		bound := w.pat(t, w.owner, "f", forge.ScopeRead)
-		w.fake.Script(forgetest.Answer{})
-		if status, body, _ := w.get(t, "f", "/forge-probe/1", bound); status != http.StatusOK {
-			t.Fatalf("GET f/forge-probe/1 with a token bound to f = %d %s, want 200", status, body)
+		w.fake.Script(forgetest.Answer{}, forgetest.Answer{Body: "[]"})
+		if status, body, _ := w.get(t, "f", "/issues/1", bound); status != http.StatusOK {
+			t.Fatalf("GET f/issues/1 with a token bound to f = %d %s, want 200", status, body)
 		}
 		qs := w.decider.questions()
 		if len(qs) == 0 {

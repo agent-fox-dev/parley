@@ -166,6 +166,38 @@ type Issue struct {
 	IsPR bool `json:"is_pr"`
 }
 
+// Comment is a comment on a forge issue as the hub answers it, in one shape
+// for both forges.
+type Comment struct {
+	// ID is the forge's numeric id of the comment.
+	ID int64 `json:"id"`
+	// Body is "" when the forge gives none.
+	Body      string        `json:"body"`
+	Author    Author        `json:"author"`
+	CreatedAt *timefmt.Time `json:"created_at"`
+	UpdatedAt *timefmt.Time `json:"updated_at"`
+	URL       string        `json:"url"`
+}
+
+// IssueThread is an issue with the first page of its comments, oldest
+// first. When the comments could not be read, Comments is empty and
+// CommentsError says why; the issue is answered all the same.
+type IssueThread struct {
+	Issue    Issue     `json:"issue"`
+	Comments []Comment `json:"comments"`
+	// CommentsNextCursor continues the comments on the issue's comments
+	// route; nil when no comment follows.
+	CommentsNextCursor *string        `json:"comments_next_cursor"`
+	CommentsError      *CommentsError `json:"comments_error"`
+}
+
+// CommentsError is the failure of the comments read of an issue thread,
+// as the hub's error for it (MapError).
+type CommentsError struct {
+	Type    string `json:"error_type"`
+	Message string `json:"message"`
+}
+
 // Author is the forge user who wrote something.
 type Author struct {
 	Login string `json:"login"`
@@ -187,6 +219,12 @@ type api interface {
 	// issues reads the page p of the issues that match f, and the position
 	// of the forge's next page, nil when it names none.
 	issues(ctx context.Context, call *Call, f IssueFilter, p Paging) ([]Issue, *Position, error)
+	// issue reads the issue number.
+	issue(ctx context.Context, call *Call, number int64) (Issue, error)
+	// comments reads the page p of the comments of the issue number, oldest
+	// first, and the position of the forge's next page, nil when it names
+	// none.
+	comments(ctx context.Context, call *Call, number int64, p Paging) ([]Comment, *Position, error)
 }
 
 // apiOf is the API of the forge kind, which resolution has found to be

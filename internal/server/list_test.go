@@ -301,6 +301,33 @@ func TestList_WritesTheNextPositionARouteNames(t *testing.T) {
 	}
 }
 
+func TestList_AcceptsACursorAnotherRouteIssuedForIt(t *testing.T) {
+	t.Parallel()
+	h := listServer(newCollection(5))
+	// cursor and limit are not part of the query a cursor belongs to.
+	query := url.Values{"state": {"open"}, "limit": {"9"}, "cursor": {"x"}}
+	c, err := CursorFor(http.MethodGet, "/owners/:owner/things", map[string]string{"owner": "a"}, query, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := getPage(t, h, withCursor("/api/v1/owners/a/things?state=open&limit=2", c)); !slices.Equal(p.ids, []int{6, 8}) || p.next == nil {
+		t.Errorf("the route's page from the cursor = %v with next_cursor %v, want [6 8] and a cursor", p.ids, p.next)
+	}
+	for _, target := range []string{
+		"/api/v1/owners/b/things?state=open", "/api/v1/owners/a/things", "/api/v1/owners/a/things?state=closed", "/api/v1/things?state=open",
+	} {
+		assertError(t, do(h, newRequest(http.MethodGet, withCursor(target, c), nil, "")), http.StatusBadRequest, "invalid_request")
+	}
+
+	c, err = CursorFor(http.MethodGet, "/things", nil, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := getPage(t, h, withCursor("/api/v1/things?limit=2", c)); !slices.Equal(p.ids, []int{4, 6}) {
+		t.Errorf("a route without parameters: the page from the cursor = %v, want [4 6]", p.ids)
+	}
+}
+
 func TestList_UsesALimitOf50WhenTheRequestStatesNone(t *testing.T) {
 	t.Parallel()
 	p := getPage(t, listServer(newCollection(51)), "/api/v1/things")

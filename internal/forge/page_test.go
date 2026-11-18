@@ -44,6 +44,21 @@ var listRoutes = []listRoute{
 			w.fake.SetList(ghRepo+"/issues", issues...)
 		}
 	}, "number"},
+	{"/issues/1/comments", func(w *world, kind forge.ForgeKind, n int) {
+		comments := make([]any, n)
+		for i := range comments {
+			if kind == forge.KindGitLab {
+				comments[i] = gitlabNote(i+1, "note", false)
+			} else {
+				comments[i] = githubComment(i+1, "comment")
+			}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/issues/1/notes", comments...)
+		} else {
+			w.fake.SetList(ghRepo+"/issues/1/comments", comments...)
+		}
+	}, "id"},
 }
 
 func TestForgeList(t *testing.T) {
@@ -107,10 +122,13 @@ func TestForgeList(t *testing.T) {
 	})
 
 	t.Run("refuses a limit out of bounds or a cursor of another query or page size", func(t *testing.T) {
-		listRoutes[0].seed(w, forge.KindGitHub, 5)
+		for _, route := range listRoutes[:2] {
+			route.seed(w, forge.KindGitHub, 5)
+		}
 		first, _ := w.list(t, "carry", "/issues?limit=2&state=open")
-		if first.NextCursor == nil {
-			t.Fatal("carry/issues?limit=2&state=open has next_cursor null")
+		comments, _ := w.list(t, "carry", "/issues/1/comments?limit=2")
+		if first.NextCursor == nil || comments.NextCursor == nil {
+			t.Fatal("carry/issues?limit=2&state=open or carry/issues/1/comments?limit=2 has next_cursor null")
 		}
 		c := url.QueryEscape(*first.NextCursor)
 		if _, sent := w.list(t, "carry", "/issues?state=open&cursor="+c); sent != 1 {
@@ -121,9 +139,8 @@ func TestForgeList(t *testing.T) {
 			{"limit 201", "carry", "/issues?limit=201"},
 			{"limit x", "carry", "/issues?limit=x"},
 			{"a cursor that does not decode", "carry", "/issues?cursor=not-a-cursor"},
-			// The comments route stands in for another list route once
-			// it exists.
-			{"another route", "carry", "/forge-probe?state=open&cursor=" + c},
+			{"another route", "carry", "/issues/1/comments?cursor=" + c},
+			{"another number", "carry", "/issues/2/comments?cursor=" + url.QueryEscape(*comments.NextCursor)},
 			{"another workspace", "gh", "/issues?state=open&cursor=" + c},
 			{"another filter", "carry", "/issues?state=closed&cursor=" + c},
 			{"another target", "carry", "/issues?state=open&target=upstream&cursor=" + c},

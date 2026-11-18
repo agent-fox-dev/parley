@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -110,4 +111,49 @@ func (github) issues(ctx context.Context, call *Call, f IssueFilter, p Paging) (
 		}
 	}
 	return issues, p.Next(resp.Header), nil
+}
+
+// githubIssuePath is the API path of the issue number of the repository r.
+func githubIssuePath(r Repository, number int64) string {
+	return githubRepo(r) + "/issues/" + strconv.FormatInt(number, 10)
+}
+
+func (github) issue(ctx context.Context, call *Call, number int64) (Issue, error) {
+	var g githubIssue
+	if err := getJSON(ctx, call, githubIssuePath(call.Resolution.Repository, number), &g); err != nil {
+		return Issue{}, err
+	}
+	return g.issue(), nil
+}
+
+type githubComment struct {
+	ID   int64   `json:"id"`
+	Body *string `json:"body"`
+	User struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	CreatedAt *time.Time `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at"`
+	HTMLURL   string     `json:"html_url"`
+}
+
+// comments reads GitHub's issue comments, which it lists oldest first.
+func (github) comments(ctx context.Context, call *Call, number int64, p Paging) ([]Comment, *Position, error) {
+	q := url.Values{}
+	p.Query(q)
+	var page []githubComment
+	resp, err := getJSONResponse(ctx, call, githubIssuePath(call.Resolution.Repository, number)+"/comments?"+q.Encode(), &page)
+	if err != nil {
+		return nil, nil, err
+	}
+	comments := make([]Comment, 0, len(page))
+	for _, g := range page {
+		c := Comment{ID: g.ID, Author: Author{Login: g.User.Login}, CreatedAt: stamp(g.CreatedAt),
+			UpdatedAt: stamp(g.UpdatedAt), URL: g.HTMLURL}
+		if g.Body != nil {
+			c.Body = *g.Body
+		}
+		comments = append(comments, c)
+	}
+	return comments, p.Next(resp.Header), nil
 }

@@ -2,6 +2,7 @@ package forge_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -215,19 +216,30 @@ func TestForgeRoute_LetsNoForgeCredentialOut(t *testing.T) {
 			func(m string) bool { return len(m) <= scrub.MaxLen }},
 	}
 	for _, c := range messages {
-		w.fake.Script(forgetest.Answer{Status: 422, Body: fmt.Sprintf(`{"message":%q}`, c.message)})
+		refusal := forgetest.Answer{Status: 422, Body: fmt.Sprintf(`{"message":%q}`, c.message)}
+		w.fake.Script(refusal)
 		status, body, _ := w.get(t, "w", issuePath, w.Token)
 		if status != http.StatusUnprocessableEntity || strings.Contains(string(body), token) {
 			t.Errorf("%s: %d %.300s, want 422 without the token", c.name, status, body)
-			continue
-		}
-		if m := errorOf(t, body).Message; !c.check(m) {
+		} else if m := errorOf(t, body).Message; !c.check(m) {
 			t.Errorf("%s: message %.300q", c.name, m)
+		}
+
+		// The same message for the comments of an issue thread.
+		w.fake.Script(forgetest.Answer{Body: `{"number":1}`}, refusal)
+		status, body, _ = w.get(t, "w", issuePath, w.Token)
+		var thread struct {
+			CommentsError *hubError `json:"comments_error"`
+		}
+		if status != http.StatusOK || strings.Contains(string(body), token) || json.Unmarshal(body, &thread) != nil || thread.CommentsError == nil {
+			t.Errorf("%s for the comments: %d %.300s, want 200 with comments_error and without the token", c.name, status, body)
+		} else if m := thread.CommentsError.Message; !c.check(m) {
+			t.Errorf("%s for the comments: comments_error.message %.300q", c.name, m)
 		}
 	}
 
 	w.fake.Script(
-		forgetest.Answer{Body: `{"number":1}`},
+		forgetest.Answer{Body: `{"number":1}`}, forgetest.Answer{Body: "[]"},
 		forgetest.Answer{Status: 401, Body: `{"message":"Bad credentials: Authorization: Bearer ` + token + `"}`},
 	)
 	reads := []struct {

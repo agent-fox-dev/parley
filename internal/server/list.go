@@ -151,6 +151,22 @@ func (p Page) Cursor(position any) (string, error) {
 	return encodeCursor(position, p.fingerprint)
 }
 
+// CursorFor is a cursor that continues the list of another route at
+// position: the route method and pattern, as registered, with the path
+// parameter values params and the query parameters query, of which cursor
+// and limit are ignored. ReadPage accepts it on a request of that route with
+// the same values, as a cursor of the route's own pages. A route uses it to
+// answer part of a list another route serves in full, so that the caller
+// continues it there.
+func CursorFor(method, pattern string, params map[string]string, query url.Values, position any) (string, error) {
+	if params == nil {
+		// A matched route's parameters are never nil, and nil encodes
+		// otherwise than an empty map.
+		params = map[string]string{}
+	}
+	return encodeCursor(position, routeFingerprint(method+" "+pattern, params, query))
+}
+
 // WriteList answers 200 with {"items":[…],"next_cursor":…} and the members
 // after them, in their order: next is the cursor of the next page, from
 // Cursor, or nil when none follows, written as null. items is never written
@@ -188,6 +204,12 @@ func fingerprint(r *http.Request, query url.Values) string {
 		route = m.Method + " " + m.Pattern
 		params = m.Params
 	}
+	return routeFingerprint(route, params, query)
+}
+
+// routeFingerprint is the fingerprint of the route "<method> <pattern>"
+// with the path parameter values params and the query parameters query.
+func routeFingerprint(route string, params map[string]string, query url.Values) string {
 	q := make(url.Values, len(query))
 	for k, vs := range query {
 		if k != "cursor" && k != "limit" {

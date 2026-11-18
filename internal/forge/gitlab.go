@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -123,4 +124,67 @@ func (gitlab) issues(ctx context.Context, call *Call, f IssueFilter, p Paging) (
 		issues = append(issues, g.issue())
 	}
 	return issues, p.Next(resp.Header), nil
+}
+
+// gitlabIssuePath is the API path of the issue iid of the project r.
+func gitlabIssuePath(r Repository, iid int64) string {
+	return gitlabProject(r) + "/issues/" + strconv.FormatInt(iid, 10)
+}
+
+// issue reads the issue iid. GitLab's issues are never merge requests.
+func (gitlab) issue(ctx context.Context, call *Call, iid int64) (Issue, error) {
+	var g gitlabIssue
+	if err := getJSON(ctx, call, gitlabIssuePath(call.Resolution.Repository, iid), &g); err != nil {
+		return Issue{}, err
+	}
+	return g.issue(), nil
+}
+
+type gitlabNote struct {
+	ID     int64   `json:"id"`
+	Body   *string `json:"body"`
+	System bool    `json:"system"`
+	Author struct {
+		Username string `json:"username"`
+	} `json:"author"`
+	CreatedAt *time.Time `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at"`
+}
+
+// comments reads the notes of the issue iid, oldest first. The notes
+// GitLab writes itself, such as a label change, are left out once the forge
+// has paged, so a page may hold fewer than its size.
+func (gitlab) comments(ctx context.Context, call *Call, iid int64, p Paging) ([]Comment, *Position, error) {
+	q := url.Values{"sort": {"asc"}, "order_by": {"created_at"}}
+	p.Query(q)
+	var page []gitlabNote
+	resp, err := getJSONResponse(ctx, call, gitlabIssuePath(call.Resolution.Repository, iid)+"/notes?"+q.Encode(), &page)
+	if err != nil {
+		return nil, nil, err
+	}
+	issueURL := gitlabWebURL(call.Resolution, "/-/issues/"+strconv.FormatInt(iid, 10))
+	comments := make([]Comment, 0, len(page))
+	for _, g := range page {
+		if g.System {
+			continue
+		}
+		c := Comment{ID: g.ID, Author: Author{Login: g.Author.Username}, CreatedAt: stamp(g.CreatedAt),
+			UpdatedAt: stamp(g.UpdatedAt), URL: issueURL + "#note_" + strconv.FormatInt(g.ID, 10)}
+		if g.Body != nil {
+			c.Body = *g.Body
+		}
+		comments = append(comments, c)
+	}
+	return comments, p.Next(resp.Header), nil
+}
+
+// gitlabWebURL is the URL of the page path below the project of res on
+// GitLab's web site, which a note does not give: the scheme and host of the
+// API URL, then the project's path.
+func gitlabWebURL(res Resolution, path string) string {
+	u := url.URL{Path: "/" + res.Repository.Owner + "/" + res.Repository.Name + path}
+	if api, err := url.Parse(res.APIURL); err == nil {
+		u.Scheme, u.Host = api.Scheme, api.Host
+	}
+	return u.String()
 }
