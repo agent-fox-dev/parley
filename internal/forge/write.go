@@ -1,10 +1,12 @@
 package forge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"strconv"
@@ -120,6 +122,12 @@ func (c *Component) writeRoutes() []server.Route {
 		c.writeRoute(writeRoute{method: http.MethodPatch, pattern: "/workspaces/:slug/issues/:number",
 			event: eventKind{"parley.forge.issue.update", "issue"}, before: readIssueUpdate, after: refuseAssigneesAlone,
 			serve: updateIssue}),
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/close",
+			event: eventKind{"parley.forge.issue.close", "issue"}, before: readIssueClose, serve: closeIssue}),
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/comments",
+			event: eventKind{"parley.forge.comment.create", "comment"}, before: readComment, serve: commentOnIssue}),
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls/:number/comments",
+			event: eventKind{"parley.forge.pull_request.comment", "pull_request"}, before: readComment, serve: commentOnPull}),
 	}
 }
 
@@ -306,6 +314,9 @@ type writer interface {
 	createIssue(ctx context.Context, call *Call, in issueInput) (Issue, error)
 	// updateIssue updates an issue with the fields of in that are set.
 	updateIssue(ctx context.Context, call *Call, in issueUpdate) (Issue, error)
+	// comment posts body as a comment on the issue number, or in the
+	// conversation of the pull request number when pull is true.
+	comment(ctx context.Context, call *Call, number int64, pull bool, body string) (Comment, error)
 }
 
 func writerOf(kind ForgeKind) writer {
@@ -333,6 +344,23 @@ func readObject(r *http.Request) (members, error) {
 		}
 	}
 	return m, nil
+}
+
+// readObjectOrNone reads the body of r as readObject does, except that a
+// body with no bytes is an object without members.
+func readObjectOrNone(r *http.Request) (members, error) {
+	if r.Body == nil {
+		return members{}, nil
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, server.InvalidRequest("the body cannot be read")
+	}
+	if len(raw) == 0 {
+		return members{}, nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	return readObject(r)
 }
 
 // The rules of the members. Each reads the member name into *dst, which it

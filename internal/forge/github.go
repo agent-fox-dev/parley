@@ -139,6 +139,16 @@ type githubComment struct {
 	HTMLURL   string     `json:"html_url"`
 }
 
+// comment is the comment g as the hub answers it.
+func (g githubComment) comment() Comment {
+	c := Comment{ID: g.ID, Author: Author{Login: g.User.Login}, CreatedAt: stamp(g.CreatedAt),
+		UpdatedAt: stamp(g.UpdatedAt), URL: g.HTMLURL}
+	if g.Body != nil {
+		c.Body = *g.Body
+	}
+	return c
+}
+
 // comments reads GitHub's issue comments, which it lists oldest first.
 func (github) comments(ctx context.Context, call *Call, number int64, p Paging) ([]Comment, *Position, error) {
 	q := url.Values{}
@@ -150,12 +160,7 @@ func (github) comments(ctx context.Context, call *Call, number int64, p Paging) 
 	}
 	comments := make([]Comment, 0, len(page))
 	for _, g := range page {
-		c := Comment{ID: g.ID, Author: Author{Login: g.User.Login}, CreatedAt: stamp(g.CreatedAt),
-			UpdatedAt: stamp(g.UpdatedAt), URL: g.HTMLURL}
-		if g.Body != nil {
-			c.Body = *g.Body
-		}
-		comments = append(comments, c)
+		comments = append(comments, g.comment())
 	}
 	return comments, p.Next(resp.Header), nil
 }

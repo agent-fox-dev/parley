@@ -6,6 +6,7 @@ import (
 	"errors"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,12 +31,18 @@ type writeRoute struct {
 var writeRoutes = []writeRoute{
 	{http.MethodPost, "/issues", map[string]any{"title": "t"}},
 	{http.MethodPatch, "/issues/7", map[string]any{"title": "n"}},
+	{http.MethodPost, "/issues/7/close", map[string]any{"comment": "c"}},
+	{http.MethodPost, "/issues/7/comments", map[string]any{"body": "b"}},
+	{http.MethodPost, "/pulls/12/comments", map[string]any{"body": "b"}},
 }
 
-// seedIssue stores issue 7, open and labelled bug, in the fake forge's
-// repository repo, so that every write route has an issue to work on.
+// seedIssue stores issue 7, open and labelled bug, and pull request 12, open
+// from feature into main, both without comments, in the fake forge's
+// repository repo, so that every write route has an issue and a pull
+// request to work on.
 func (w *world) seedIssue(repo string) {
 	w.fake.AddIssue(repo, forgetest.Issue{Number: 7, Title: "Crash", State: "open", Labels: []string{"bug"}})
+	w.fake.AddIssue(repo, forgetest.Issue{Number: 12, Title: "Fix", State: "open", Pull: true, Head: "feature", Base: "main"})
 }
 
 // The fake GitHub's repository upstream/project, which the carry-patch
@@ -283,6 +290,21 @@ var (
 			{"a state that is a number", map[string]any{"state": 5}, "state"},
 			{"a blank label", map[string]any{"labels": []string{" "}}, "labels"},
 		}},
+		{http.MethodPost, "/issues/7/close", []badBody{
+			{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a number", `5`, ""},
+			{"a comment that is a number", map[string]any{"comment": 5}, "comment"},
+		}},
+		{http.MethodPost, "/issues/7/comments", commentBodies},
+		{http.MethodPost, "/pulls/12/comments", commentBodies},
+	}
+	// commentBodies are the bodies a comment route refuses.
+	commentBodies = []badBody{
+		{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"none", nil, ""},
+		{"no body", map[string]any{}, "body"},
+		{"an empty body", map[string]any{"body": ""}, "body"},
+		{"a blank body", map[string]any{"body": " "}, "body"},
+		{"a null body", map[string]any{"body": nil}, "body"},
+		{"a body that is a number", map[string]any{"body": 5}, "body"},
 	}
 	boundBodies = []struct {
 		method, path string
@@ -336,6 +358,9 @@ var decoratedBodies = []struct {
 		map[string]any{"title": "t", "body": nil, "labels": nil, "assignees": nil, "extra": 1}},
 	{http.MethodPatch, "/issues/7", map[string]any{"title": "t"},
 		map[string]any{"title": "t", "body": nil, "state": nil, "labels": nil, "assignees": nil, "extra": 1}},
+	{http.MethodPost, "/issues/7/close", map[string]any{}, map[string]any{"comment": nil, "extra": 1}},
+	{http.MethodPost, "/issues/7/comments", map[string]any{"body": "b"}, map[string]any{"body": "b", "extra": 1}},
+	{http.MethodPost, "/pulls/12/comments", map[string]any{"body": "b"}, map[string]any{"body": "b", "extra": 1}},
 }
 
 func TestWriteRoute_TreatsNullAsAbsentAndIgnoresUnknownMembers(t *testing.T) {
@@ -362,7 +387,7 @@ func TestWriteRoute_TreatsNullAsAbsentAndIgnoresUnknownMembers(t *testing.T) {
 
 // measuredTexts are, per write route, the text the forge limits in length:
 // its field, a body of the route holding text as that field, and the member
-// the forge receives it in on GitHub and on GitLab.
+// one of the route's forge requests carries it in on GitHub and on GitLab.
 var measuredTexts = []struct {
 	method, path, field string
 	body                func(text string) map[string]any
@@ -370,6 +395,9 @@ var measuredTexts = []struct {
 }{
 	{http.MethodPost, "/issues", "body", func(s string) map[string]any { return map[string]any{"title": "t", "body": s} }, "body", "description"},
 	{http.MethodPatch, "/issues/7", "body", func(s string) map[string]any { return map[string]any{"body": s} }, "body", "description"},
+	{http.MethodPost, "/issues/7/close", "comment", func(s string) map[string]any { return map[string]any{"comment": s} }, "body", "body"},
+	{http.MethodPost, "/issues/7/comments", "body", func(s string) map[string]any { return map[string]any{"body": s} }, "body", "body"},
+	{http.MethodPost, "/pulls/12/comments", "body", func(s string) map[string]any { return map[string]any{"body": s} }, "body", "body"},
 }
 
 func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
@@ -437,9 +465,12 @@ func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
 			if r.slug == "gl" {
 				member = m.gitlab
 			}
-			var got map[string]any
-			if err := json.Unmarshal(w.fake.Last(t).Body, &got); err != nil || got[member] != r.text {
-				t.Errorf("the forge did not receive the text unchanged as %s (%v)", member, err)
+			requests := w.fake.Requests()
+			if !slices.ContainsFunc(requests[len(requests)-sent:], func(req forgetest.Request) bool {
+				var got map[string]any
+				return json.Unmarshal(req.Body, &got) == nil && got[member] == r.text
+			}) {
+				t.Errorf("the forge did not receive the text unchanged as %s", member)
 			}
 		})
 	}
@@ -480,6 +511,19 @@ var writeEvents = []struct {
 		"parley.forge.issue.update", "issue", 0,
 		"7", map[string]any{"number": 7, "url": "https://github.com/acme/widgets/issues/7", "fields": []string{"state", "title"}},
 		"7", map[string]any{"number": 7, "fields": []string{"state", "title"}}},
+	{http.MethodPost, "/issues/7/close", map[string]any{"comment": textMarker},
+		"parley.forge.issue.close", "issue", 0,
+		"7", map[string]any{"number": 7, "url": "https://github.com/acme/widgets/issues/7",
+			"comment_url": "https://github.com/acme/widgets/issues/7#issuecomment-7001"},
+		"7", map[string]any{"number": 7}},
+	{http.MethodPost, "/issues/7/comments", map[string]any{"body": textMarker},
+		"parley.forge.comment.create", "comment", 0,
+		"7", map[string]any{"number": 7, "url": "https://github.com/acme/widgets/issues/7#issuecomment-7001"},
+		"7", map[string]any{"number": 7}},
+	{http.MethodPost, "/pulls/12/comments", map[string]any{"body": textMarker},
+		"parley.forge.pull_request.comment", "pull_request", 0,
+		"12", map[string]any{"number": 12, "url": "https://github.com/acme/widgets/pull/12#issuecomment-12001"},
+		"12", map[string]any{"number": 12}},
 }
 
 // wantEvent checks that got is an event of the type typ about the resource
@@ -637,43 +681,66 @@ func TestWriteRoute_AnswersAForgeThatDoesNotAnswerInTimeAsATimeout(t *testing.T)
 func TestWriteRoute_RunsToItsEndWhenTheCallerLeaves(t *testing.T) {
 	t.Parallel()
 	w := eventWorld(t, nil)
-	w.fake.SetNext(ghRepo, 7)
-	release := make(chan struct{})
-	w.fake.Script(forgetest.Answer{Release: release, Through: true})
+	rows := []struct {
+		name, path, body string
+		// held is the forge request held back until the caller has left.
+		held string
+		// typ is the event's type, and member and want a metadata member it
+		// must have and its value.
+		typ, member string
+		want        any
+		// done reports whether the forge holds what the write did.
+		done func() bool
+	}{
+		{"create an issue", "/issues", `{"title":"t"}`, ghRepo + "/issues",
+			"parley.forge.issue.create", "number", float64(20),
+			func() bool { _, ok := w.fake.Issue(ghRepo, 20); return ok }},
+		{"close an issue with a comment, the caller leaving once the comment was sent", "/issues/7/close", `{"comment":"c"}`,
+			ghRepo + "/issues/7/comments",
+			"parley.forge.issue.close", "comment_url", "https://github.com/acme/widgets/issues/7#issuecomment-7001",
+			func() bool { i, _ := w.fake.Issue(ghRepo, 7); return i.State == "closed" && len(i.Comments) == 1 }},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			w.seedIssue(ghRepo)
+			w.fake.SetNext(ghRepo, 20)
+			release := make(chan struct{})
+			w.fake.Script(forgetest.Answer{Path: row.held, Release: release, Through: true})
+			n, before := w.rec.count(), w.fake.Count()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/demo/issues"), strings.NewReader(`{"title":"t"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+w.ownerKey)
-	req.Header.Set("Content-Type", "application/json")
-	left := make(chan error, 1)
-	go func() {
-		resp, err := (&http.Client{}).Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-		left <- err
-	}()
-	waitUntil(t, "the forge to receive the create", func() bool { return w.fake.Count() == 1 })
-	cancel()
-	if err := <-left; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the caller did not leave before the answer: %v", err)
-	}
-	close(release)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL("/api/v1/workspaces/demo"+row.path), strings.NewReader(row.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+w.ownerKey)
+			req.Header.Set("Content-Type", "application/json")
+			left := make(chan error, 1)
+			go func() {
+				resp, err := (&http.Client{}).Do(req)
+				if err == nil {
+					resp.Body.Close()
+				}
+				left <- err
+			}()
+			waitUntil(t, "the forge to receive "+row.held, func() bool { return w.fake.Count() == before+1 })
+			cancel()
+			if err := <-left; !errors.Is(err, context.Canceled) {
+				t.Fatalf("the caller did not leave before the answer: %v", err)
+			}
+			close(release)
 
-	waitUntil(t, "the write's event", func() bool { return w.rec.count() == 1 })
-	if _, ok := w.fake.Issue(ghRepo, 7); !ok {
-		t.Error("the forge does not hold the issue")
+			waitUntil(t, "the write's event", func() bool { return w.rec.count() == n+1 })
+			if !row.done() {
+				t.Error("the forge does not hold what the write did")
+			}
+			got := w.rec.since(n)[0]
+			if m := got.meta(t); got.Type != row.typ || m["ok"] != true || m[row.member] != row.want {
+				t.Errorf("the event is %s with %s, want %s, ok and %s %v", got.Type, got.Metadata, row.typ, row.member, row.want)
+			}
+		})
 	}
-	got := w.rec.since(0)[0]
-	if m := got.meta(t); got.Type != "parley.forge.issue.create" || m["ok"] != true || m["number"] != float64(7) {
-		t.Errorf("the event is %s with %s, want parley.forge.issue.create, ok and number 7", got.Type, got.Metadata)
-	}
-	// The close route's row, a caller who leaves once the comment was
-	// posted, comes with that route.
 }
 
 func TestWriteRoute_AnswersInternalWhenItsEventCannotBeRecorded(t *testing.T) {

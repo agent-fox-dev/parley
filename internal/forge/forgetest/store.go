@@ -34,7 +34,10 @@ type Issue struct {
 	Comments   []Comment
 }
 
-// Comment is a comment on an issue or a pull request, a note on GitLab.
+// Comment is a comment on an issue or a pull request, a note on GitLab. Its
+// id is its issue's number times 1000 plus its place among the issue's
+// comments, from 1, so that a test knows the id of the comment a write
+// posts.
 type Comment struct {
 	ID   int64
 	Body string
@@ -54,8 +57,6 @@ type repository struct {
 	next   int64
 	issues map[int64]*Issue
 	labels []Label
-	// comments is the id of the latest comment.
-	comments int64
 }
 
 // The in-memory repositories serve the writes a forge route sends, and the
@@ -210,8 +211,7 @@ func (r *repository) serve(method string, path []string, in map[string]json.RawM
 		if r.gitlab && issue.Pull != (path[0] == "merge_requests") {
 			return http.StatusNotFound, notFound
 		}
-		r.comments++
-		c := Comment{ID: r.comments, Body: str(in, "body")}
+		c := Comment{ID: issue.Number*1000 + int64(len(issue.Comments)) + 1, Body: str(in, "body")}
 		issue.Comments = append(issue.Comments, c)
 		return http.StatusCreated, r.commentJSON(issue, c)
 	case "POST issues/n/labels":
@@ -347,8 +347,12 @@ func (r *repository) commentJSON(i *Issue, c Comment) map[string]any {
 		out["author"], out["system"] = map[string]string{"username": Login}, false
 		return out
 	}
+	page := "issues"
+	if i.Pull {
+		page = "pull"
+	}
 	out["user"] = map[string]string{"login": Login}
-	out["html_url"] = fmt.Sprintf("%s/issues/%d#issuecomment-%d", r.web, i.Number, c.ID)
+	out["html_url"] = fmt.Sprintf("%s/%s/%d#issuecomment-%d", r.web, page, i.Number, c.ID)
 	return out
 }
 

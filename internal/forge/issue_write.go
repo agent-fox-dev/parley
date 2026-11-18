@@ -199,3 +199,142 @@ func (gitlab) updateIssue(ctx context.Context, call *Call, in issueUpdate) (Issu
 	}
 	return g.issue(), nil
 }
+
+// issueClose is the number of the issue a close closes, and the comment it
+// posts first, nil for none.
+type issueClose struct {
+	number  int64
+	Comment *string
+}
+
+func (in issueClose) texts() []text { return []text{{"comment", in.Comment}} }
+
+// readIssueClose reads the number and the body of a close, which may be
+// absent or empty: a comment, a string, which is posted when it is not
+// blank and then measured.
+func readIssueClose(r *http.Request, call *Call) error {
+	n, err := PathNumber(r)
+	if err != nil {
+		return err
+	}
+	m, err := readObjectOrNone(r)
+	if err != nil {
+		return err
+	}
+	in := issueClose{number: n}
+	if err := m.text("comment", &in.Comment); err != nil {
+		return err
+	}
+	if in.Comment != nil && blank(*in.Comment) {
+		in.Comment = nil
+	}
+	call.Params = in
+	return nil
+}
+
+// closeIssue posts the close's comment, when it has one, and only once the
+// forge took it closes the issue, so that a reason is never missing from a
+// closed issue; it answers the issue as the forge returns it. Closing a
+// closed issue closes it again. Its event has the number, the comment's web
+// URL as comment_url whenever the comment was posted, also when the close
+// then failed, and the issue's web URL.
+func closeIssue(ctx context.Context, call *Call) (written, error) {
+	in := call.Params.(issueClose)
+	f := writerOf(call.Resolution.Kind)
+	ev := writeEvent{number: in.number}
+	if in.Comment != nil {
+		c, err := f.comment(ctx, call, in.number, false, *in.Comment)
+		if err != nil {
+			return written{event: ev}, err
+		}
+		ev.extra = map[string]any{"comment_url": c.URL}
+	}
+	issue, err := f.updateIssue(ctx, call, issueUpdate{number: in.number, State: new(IssueClosed)})
+	if err != nil {
+		return written{event: ev}, err
+	}
+	ev.url = issue.URL
+	return written{status: http.StatusOK, body: issue, event: ev}, nil
+}
+
+// commentInput is the number of the issue or pull request a comment is
+// posted on, and its body.
+type commentInput struct {
+	number int64
+	Body   *string
+}
+
+func (in commentInput) texts() []text { return []text{{"body", in.Body}} }
+
+// readComment reads the number and the body of a comment: a body, required,
+// not blank and measured, which is posted exactly as given.
+func readComment(r *http.Request, call *Call) error {
+	n, err := PathNumber(r)
+	if err != nil {
+		return err
+	}
+	m, err := readObject(r)
+	if err != nil {
+		return err
+	}
+	in := commentInput{number: n}
+	if err := m.required("body", &in.Body); err != nil {
+		return err
+	}
+	call.Params = in
+	return nil
+}
+
+// commented is the answer to a comment: the comment's web URL.
+type commented struct {
+	URL string `json:"url"`
+}
+
+// postComment posts the comment the request describes on the issue, or in
+// the conversation of the pull request when pull is true, and answers its
+// web URL, which is its event's url too.
+func postComment(ctx context.Context, call *Call, pull bool) (written, error) {
+	in := call.Params.(commentInput)
+	ev := writeEvent{number: in.number}
+	c, err := writerOf(call.Resolution.Kind).comment(ctx, call, in.number, pull, *in.Body)
+	if err != nil {
+		return written{event: ev}, err
+	}
+	ev.url = c.URL
+	return written{status: http.StatusCreated, body: commented{c.URL}, event: ev}, nil
+}
+
+// commentOnIssue posts a comment on an issue.
+func commentOnIssue(ctx context.Context, call *Call) (written, error) {
+	return postComment(ctx, call, false)
+}
+
+// commentBody is the body of a comment on both forges.
+type commentBody struct {
+	Body string `json:"body"`
+}
+
+// comment posts on GitHub's issue comments, which hold a pull request's
+// conversation too.
+func (github) comment(ctx context.Context, call *Call, number int64, _ bool, body string) (Comment, error) {
+	var g githubComment
+	path := githubIssuePath(call.Resolution.Repository, number) + "/comments"
+	if err := call.sendJSON(ctx, http.MethodPost, path, commentBody{body}, &g); err != nil {
+		return Comment{}, err
+	}
+	return g.comment(), nil
+}
+
+// comment posts a note on the issue, or on the merge request when pull is
+// true.
+func (gitlab) comment(ctx context.Context, call *Call, number int64, pull bool, body string) (Comment, error) {
+	path := gitlabIssuePath(call.Resolution.Repository, number)
+	if pull {
+		path = gitlabMRPath(call.Resolution.Repository, number)
+	}
+	var g gitlabNote
+	if err := call.sendJSON(ctx, http.MethodPost, path+"/notes", commentBody{body}, &g); err != nil {
+		return Comment{}, err
+	}
+	return g.comment(gitlabPage(call.Resolution, number, pull)), nil
+}
