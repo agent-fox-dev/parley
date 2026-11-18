@@ -111,7 +111,8 @@ func (h *hangingRemote) heldCount() int {
 
 // checkLeftWithin checks that the remote held at least n requests and that
 // the client of each went away within d of its arrival, waiting up to d
-// for one that has not yet.
+// for one that has not yet. With n 0 it checks only the requests the
+// remote held, if any.
 func (h *hangingRemote) checkLeftWithin(t *testing.T, n int, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -240,8 +241,8 @@ func TestRequest_FailsAsInternalWhenAGitOperationOutlastsTheLimit(t *testing.T) 
 
 func TestRebuild_EndsAnAttemptWhoseGitOperationOutlastsTheLimitAsRetryable(t *testing.T) {
 	t.Parallel()
-	// Long enough for git to reach the remote under the load of the whole
-	// suite, as in the fetch probe's test.
+	// Long enough for git to reach the remote, most of the time, under the
+	// load of the whole suite, as in the fetch probe's test.
 	const limit = 2 * time.Second
 	up := startHangingRemote(t)
 	f := startRebuildFixtureWith(t, func(d *carrypatch.Deps) {
@@ -279,7 +280,12 @@ func TestRebuild_EndsAnAttemptWhoseGitOperationOutlastsTheLimitAsRetryable(t *te
 		if results := f.patchResults(t, id); len(results) != 0 {
 			t.Errorf("patch_results = %v, want none", results)
 		}
-		up.checkLeftWithin(t, attempts, limit+2*time.Second)
+		// Whether an attempt's git reached the remote before the limit ended
+		// it depends on how busy the machine is, and the attempt ends the same
+		// either way: every request the remote did hold must have been let
+		// go, but none is required. That the limit ends a git that holds a
+		// connection open is the fetch probe's test.
+		up.checkLeftWithin(t, 0, limit+2*time.Second)
 	}
 
 	_, id := f.attempt(t, nil)
