@@ -152,7 +152,8 @@ func (s *Service) object(rec Record) Object {
 //
 // The checks run in the order of the refusals: the body's values (400
 // invalid_request), the session link (400 unknown_session), the workspace's
-// state (409). A refused create writes nothing. A store or event failure is
+// state (409), the quotas (429 sandbox_capacity, CheckQuota). A refused
+// create writes nothing. A store or event failure is
 // an error that is not a *server.Error, answered 500, and writes nothing
 // either.
 func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Record, error) {
@@ -193,6 +194,11 @@ func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body m
 		return Record{}, err
 	}
 	if err := fork.GuardUpdate(ctx, tx, w); err != nil {
+		return Record{}, err
+	}
+	// The quotas come last: their count is atomic with the insert below
+	// only in this transaction.
+	if err := s.CheckQuota(ctx, tx, w, in.Caller.User.ID); err != nil {
 		return Record{}, err
 	}
 	rec, err := s.newRecord(ctx, tx, in, req, session)
@@ -268,10 +274,6 @@ func (s *Service) newRecord(ctx context.Context, tx *sql.Tx, in CreateInput, req
 	case in.Purpose != nil:
 		purpose = cutRunes(*in.Purpose, maxPurposeRune)
 	}
-	family := w.Slug
-	if w.Kind == access.KindFork && w.ParentSlug != nil {
-		family = *w.ParentSlug
-	}
 	creator := Creator{ActorType: actorType(in.Caller), ActorID: in.Caller.User.ID, Username: in.Caller.User.Username}
 	return Record{
 		ID: NewID(), Workspace: w.Slug, SessionID: session, Profile: p.Name, Purpose: purpose,
@@ -279,7 +281,7 @@ func (s *Service) newRecord(ctx context.Context, tx *sql.Tx, in CreateInput, req
 		Image: p.Image, CPU: p.CPU, Memory: p.Memory, GPU: p.GPU,
 		ExpiresAt: ExpiresAt(now, req.ttl, w), IdleTimeout: p.IdleTimeout, LastActivityAt: now,
 		RestoredFrom: req.restoreFrom, Labels: req.labels, CreatedBy: creator, CreatedAt: now, UpdatedAt: now,
-		Snapshot: snapshot, UserID: in.Caller.User.ID, OrgID: w.OrgID, FamilyRoot: family, Marker: MarkerCreate,
+		Snapshot: snapshot, UserID: in.Caller.User.ID, OrgID: w.OrgID, FamilyRoot: FamilyRoot(w), Marker: MarkerCreate,
 	}, nil
 }
 
