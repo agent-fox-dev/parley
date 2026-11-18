@@ -24,7 +24,9 @@ const forgeHook = "forge"
 // secret, and the event component as the log the webhook routes record
 // their events in, inside the same store transaction, as the recording of
 // a webhook delivery does with the delivery and its events. The part adds
-// the schema step of the delivery table.
+// the schema step of the delivery table, and mounts the webhook ingress
+// outside the REST API: a forge sends no bearer credential, must not be
+// rate limited as a caller, and is held to the ingress's own body limit.
 //
 // The component exists from the composition on (Forge), so that the forge
 // routes, which the part registers, are built with it; a later part and tests change its dependencies
@@ -36,6 +38,7 @@ func composeForge(c *Composition) {
 	for _, rt := range comp.Routes() {
 		c.AddRoute(rt)
 	}
+	c.Handle(forge.IngressPattern, comp.Ingress())
 	c.AddStartHook(forgeHook, func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
 		d := forge.Deps{
