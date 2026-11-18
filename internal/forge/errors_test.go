@@ -155,7 +155,7 @@ func TestForgeRoute_AnswersAForgeFailureAsItsHubError(t *testing.T) {
 		row{"a body that is no JSON", "gh", repositoryPath, []forgetest.Answer{{Body: "<html>"}}, 502, forge.ErrorTypeError, 1, false},
 		row{"an array for an object", "gh", repositoryPath, []forgetest.Answer{{Body: "[]"}}, 502, forge.ErrorTypeError, 1, false},
 		row{"an object of exactly 8 MiB", "gh", repositoryPath,
-			[]forgetest.Answer{{Body: padded(`{"number":1}`, forge.DefaultMaxBody)}}, 200, "", 1, false},
+			[]forgetest.Answer{{Body: padded(`{"full_name":"acme/widgets"}`, forge.DefaultMaxBody)}}, 200, "", 1, false},
 		row{"a redirect to another port", "gh", issuePath, []forgetest.Answer{{Redirect: other.URL + "/x"}},
 			502, forge.ErrorTypeError, 1, false},
 		row{"a redirect to plain http on the same host", "gh", issuePath,

@@ -4,6 +4,13 @@
 // a caller reads the forge through the hub and never holds a forge token.
 package forge
 
+import (
+	"context"
+	"time"
+
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
+)
+
 // Repository is the forge repository a remote URL names: Host is in lower
 // case, without a leading www. and without a port; Owner is every path
 // segment before the last one joined by "/" (a GitLab group path may have
@@ -108,3 +115,85 @@ type ResolveError struct {
 }
 
 func (e *ResolveError) Error() string { return e.Type + ": " + e.Message }
+
+// RepositoryDetails is a forge repository as the hub answers it, in one
+// shape for both forges.
+type RepositoryDetails struct {
+	FullName      string      `json:"full_name"`
+	DefaultBranch string      `json:"default_branch"`
+	Private       bool        `json:"private"`
+	Archived      bool        `json:"archived"`
+	Permissions   Permissions `json:"permissions"`
+	// The ways of merging the repository allows; nil when the forge does
+	// not say.
+	AllowMergeCommit *bool `json:"allow_merge_commit"`
+	AllowSquashMerge *bool `json:"allow_squash_merge"`
+	AllowRebaseMerge *bool `json:"allow_rebase_merge"`
+}
+
+// Permissions are what the target's credential may do on a repository.
+type Permissions struct {
+	Pull  bool `json:"pull"`
+	Push  bool `json:"push"`
+	Admin bool `json:"admin"`
+}
+
+// The states of an issue.
+const (
+	IssueOpen   = "open"
+	IssueClosed = "closed"
+)
+
+// Issue is a forge issue as the hub answers it, in one shape for both
+// forges. A timestamp the forge does not give is nil, written as null.
+type Issue struct {
+	// Number is GitHub's number or GitLab's iid.
+	Number int64  `json:"number"`
+	Title  string `json:"title"`
+	// Body is "" when the forge gives none.
+	Body string `json:"body"`
+	// State is IssueOpen or IssueClosed.
+	State  string `json:"state"`
+	URL    string `json:"url"`
+	Author Author `json:"author"`
+	// Labels are the label names, never nil.
+	Labels    []string      `json:"labels"`
+	CreatedAt *timefmt.Time `json:"created_at"`
+	UpdatedAt *timefmt.Time `json:"updated_at"`
+	ClosedAt  *timefmt.Time `json:"closed_at"`
+	// IsPR is true when the forge's issue is a pull request, as GitHub's
+	// issues may be.
+	IsPR bool `json:"is_pr"`
+}
+
+// Author is the forge user who wrote something.
+type Author struct {
+	Login string `json:"login"`
+}
+
+// stamp is a forge timestamp as the hub writes it, nil when the forge gave
+// none.
+func stamp(t *time.Time) *timefmt.Time {
+	if t == nil {
+		return nil
+	}
+	return new(timefmt.Time(*t))
+}
+
+// api is one forge's REST API: the reads the forge routes make, each
+// answering in the hub's shape.
+type api interface {
+	repository(ctx context.Context, call *Call) (RepositoryDetails, error)
+	// issues reads the page p of the issues that match f, and the position
+	// of the forge's next page, nil when it names none.
+	issues(ctx context.Context, call *Call, f IssueFilter, p Paging) ([]Issue, *Position, error)
+}
+
+// apiOf is the API of the forge kind, which resolution has found to be
+// GitHub or GitLab.
+func apiOf(kind ForgeKind) api {
+	if kind == KindGitLab {
+		return gitlab{}
+	}
+	return github{}
+}

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/scrub"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -73,6 +75,20 @@ func (c *Component) Bind(d Deps) {
 	}
 	c.deps = d
 	c.client = NewClient(d.Client)
+}
+
+// Routes are the forge component's routes, which the hub registers. They
+// may be built before the component is bound.
+func (c *Component) Routes() []server.Route {
+	read := func(pattern string, params func(*http.Request, *Call) error, serve func(http.ResponseWriter, *http.Request, *Call) error) server.Route {
+		return c.Route(Route{Method: http.MethodGet, Pattern: pattern, Scope: ScopeRead, Need: access.NeedRead, Params: params, Serve: serve})
+	}
+	return []server.Route{
+		c.Route(Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/forge", Scope: ScopeRead, Need: access.NeedRead,
+			NoTarget: true, Serve: c.serveStatus}),
+		read("/workspaces/:slug/forge/repository", nil, serveRepository),
+		read("/workspaces/:slug/issues", readIssueList, serveIssues),
+	}
 }
 
 // Client is the client the component sends forge requests with, nil before

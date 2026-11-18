@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,11 +111,11 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 	return w
 }
 
-// The routes the forge failure tests read through, which the probe stands
-// in for until the read routes exist: a repository, an issue, and an
-// issue's comments.
+// The routes the forge failure tests read through: a repository, an
+// issue, and an issue's comments, for which the probe stands in until
+// their routes exist.
 const (
-	repositoryPath = "/forge-probe/1"
+	repositoryPath = "/forge/repository"
 	issuePath      = "/forge-probe/1"
 	commentsPath   = "/forge-probe/1"
 )
@@ -291,6 +293,55 @@ type hubError struct {
 	Code    int    `json:"code"`
 	Type    string `json:"error_type"`
 	Message string `json:"message"`
+}
+
+// list is a list answer: its items, each as a JSON object, and its
+// next_cursor.
+type list struct {
+	Items      []map[string]any `json:"items"`
+	NextCursor *string          `json:"next_cursor"`
+}
+
+// list sends GET /api/v1/workspaces/<slug><path> with the admin token and
+// returns the list it answers, failing the test unless the answer is 200
+// with exactly the members items, an array, and next_cursor, a string or
+// null. sent is how many requests the forge received meanwhile.
+func (w *world) list(t *testing.T, slug, path string) (l list, sent int) {
+	t.Helper()
+	status, body, sent := w.get(t, slug, path, w.Token)
+	var members map[string]json.RawMessage
+	if status != http.StatusOK || json.Unmarshal(body, &members) != nil || len(members) != 2 ||
+		!strings.HasPrefix(string(members["items"]), "[") || json.Unmarshal(body, &l) != nil {
+		t.Fatalf("GET %s%s = %d %.300s, want 200 with items, an array, and next_cursor", slug, path, status, body)
+	}
+	if l.NextCursor != nil && *l.NextCursor == "" {
+		t.Fatalf("GET %s%s: next_cursor is an empty string", slug, path)
+	}
+	return l, sent
+}
+
+// lastQuery is the query of the latest request the fake forge received.
+func (w *world) lastQuery(t *testing.T) url.Values {
+	t.Helper()
+	q, err := url.ParseQuery(w.fake.Last(t).RawQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+
+// withQuery adds the query parameters q to path.
+func withQuery(path, q string) string {
+	if strings.Contains(path, "?") {
+		return path + "&" + q
+	}
+	return path + "?" + q
+}
+
+// sameJSON reports whether got and want are the same JSON value.
+func sameJSON(got []byte, want string) bool {
+	var g, w any
+	return json.Unmarshal(got, &g) == nil && json.Unmarshal([]byte(want), &w) == nil && reflect.DeepEqual(g, w)
 }
 
 func errorOf(t *testing.T, body []byte) hubError {

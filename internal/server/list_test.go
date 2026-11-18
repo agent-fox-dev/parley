@@ -97,8 +97,9 @@ func (c *collection) handler(bounds ...PageBounds) HandlerFunc {
 // passing authenticator and without a rate limit, since a walk sends many
 // requests: GET /things, /owners/:owner/things and /others with the standard
 // bounds, GET /wide with bounds 1–1000 and default 100, GET /empty, whose
-// handler gives the helper a nil slice, and GET /pinned, whose pages add the
-// members resolved_sha and count.
+// handler gives the helper a nil slice, GET /pinned, whose pages add the
+// members resolved_sha and count, and GET /numbered, which pages by page
+// number as a list read from elsewhere does.
 func listServer(c *collection) http.Handler {
 	s := New(Options{RateLimitDisabled: true})
 	s.SetAuthenticator(func(*http.Request) (Caller, error) { return testCaller, nil })
@@ -126,7 +127,35 @@ func listServer(c *collection) http.Handler {
 		return WritePageWith(w, page, c.read(after, continuing, page.Limit+1), func(t thing) any { return t.ID },
 			Member{"resolved_sha", "4ad62a88"}, Member{"count", 2})
 	}})
+	s.Register(Route{Method: http.MethodGet, Pattern: "/numbered", Handler: c.numbered})
 	return s.Handler()
+}
+
+// numbered answers the page of the collection whose number the cursor
+// holds, the first without one, naming the next page while one follows.
+func (c *collection) numbered(w http.ResponseWriter, r *http.Request) error {
+	page, err := ReadPage(r)
+	if err != nil {
+		return err
+	}
+	number := 1
+	if _, err := page.After(&number); err != nil {
+		return err
+	}
+	all := c.all()
+	var items []thing
+	for _, id := range all[min(len(all), (number-1)*page.Limit):min(len(all), number*page.Limit)] {
+		items = append(items, thing{ID: id})
+	}
+	var next *string
+	if number*page.Limit < len(all) {
+		cursor, err := page.Cursor(number + 1)
+		if err != nil {
+			return err
+		}
+		next = &cursor
+	}
+	return WriteList(w, items, next)
 }
 
 // listPage is one page a list route answered.
@@ -252,6 +281,23 @@ func TestList_WritesTheMembersARouteAddsAfterNextCursor(t *testing.T) {
 	rec = do(h, newRequest(http.MethodGet, withCursor("/api/v1/pinned?limit=2", first.NextCursor), nil, ""))
 	if want := `{"items":[{"id":6}],"next_cursor":null,"resolved_sha":"4ad62a88","count":2}` + "\n"; rec.Body.String() != want {
 		t.Errorf("second page = %d %s, want %s", rec.Code, rec.Body.Bytes(), want)
+	}
+}
+
+func TestList_WritesTheNextPositionARouteNames(t *testing.T) {
+	t.Parallel()
+	h := listServer(newCollection(5))
+	pages := walk(t, h, "/api/v1/numbered?limit=2", nil)
+	if got := concat(pages); len(pages) != 3 || !slices.Equal(got, []int{2, 4, 6, 8, 10}) {
+		t.Errorf("walk of /numbered?limit=2 = %d pages of %v, want 3 pages of [2 4 6 8 10]", len(pages), got)
+	}
+	first := getPage(t, h, "/api/v1/numbered?limit=2")
+	assertError(t, do(h, newRequest(http.MethodGet, withCursor("/api/v1/others", *first.next), nil, "")),
+		http.StatusBadRequest, "invalid_request")
+
+	rec := do(listServer(newCollection(0)), newRequest(http.MethodGet, "/api/v1/numbered", nil, ""))
+	if body := rec.Body.String(); rec.Code != http.StatusOK || body != `{"items":[],"next_cursor":null}`+"\n" {
+		t.Errorf("GET /numbered of nothing = %d %s, want 200 with items [] and next_cursor null", rec.Code, body)
 	}
 }
 

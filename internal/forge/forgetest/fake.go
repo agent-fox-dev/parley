@@ -1,16 +1,19 @@
 // Package forgetest is a fake forge for tests: an HTTP server, over TLS or
 // plain HTTP, that records every request it receives and answers what the
-// test scripts. It serves GitHub's API below the prefix /github and
-// GitLab's below /gitlab/api/v4, so a workspace whose API URL setting
-// points at GitHubURL or GitLabURL has its forge kind detected from the
-// setting. It is imported by test code only.
+// test scripts, or the objects and lists the test sets. It serves GitHub's
+// API below the prefix /github and GitLab's below /gitlab/api/v4, so a
+// workspace whose API URL setting points at GitHubURL or GitLabURL has its
+// forge kind detected from the setting. It is imported by test code only.
 package forgetest
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +72,8 @@ type Fake struct {
 	mu       sync.Mutex
 	requests []Request
 	answers  []Answer
+	// entities are what SetObject and SetList set, by the path as sent.
+	entities map[string]entity
 }
 
 // New starts a fake forge over TLS until the test ends. Transport is the
@@ -107,8 +112,9 @@ func (f *Fake) GitHubURL() string { return f.URL + GitHubPrefix }
 func (f *Fake) GitLabURL() string { return f.URL + GitLabPrefix }
 
 // Script queues answers: each request takes the first queued answer whose
-// Path is empty or equal to its path. A request no queued answer fits is
-// answered 404 with a forge's "Not Found" message.
+// Path is empty or equal to its path. A request no queued answer fits gets
+// the object or list set for its path (SetObject, SetList), else 404 with a
+// forge's "Not Found" message.
 func (f *Fake) Script(answers ...Answer) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -143,8 +149,12 @@ func (f *Fake) Last(t testing.TB) Request {
 
 func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	a, ok := f.record(r, body)
-	if !ok {
+	a, e, ok := f.record(r, body)
+	switch {
+	case e != nil:
+		f.serveEntity(w, r, *e)
+		return
+	case !ok:
 		writeAnswer(w, Answer{Status: http.StatusNotFound, Body: `{"message":"Not Found"}`})
 		return
 	}
@@ -168,8 +178,9 @@ func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // record keeps the request and takes the answer it gets, in one step, so
-// that concurrent requests take the queued answers in their order.
-func (f *Fake) record(r *http.Request, body []byte) (Answer, bool) {
+// that concurrent requests take the queued answers in their order: a
+// queued answer that fits it, else the entity a GET's path names.
+func (f *Fake) record(r *http.Request, body []byte) (Answer, *entity, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, Request{
@@ -184,10 +195,13 @@ func (f *Fake) record(r *http.Request, body []byte) (Answer, bool) {
 	for i, a := range f.answers {
 		if a.Path == "" || a.Path == r.URL.Path {
 			f.answers = slices.Delete(f.answers, i, i+1)
-			return a, true
+			return a, nil, true
 		}
 	}
-	return Answer{}, false
+	if e, ok := f.entities[r.URL.EscapedPath()]; ok && r.Method == http.MethodGet {
+		return Answer{}, &e, true
+	}
+	return Answer{}, nil, false
 }
 
 func writeAnswer(w http.ResponseWriter, a Answer) {
@@ -213,4 +227,81 @@ func writeAnswer(w http.ResponseWriter, a Answer) {
 	}
 	w.WriteHeader(status)
 	w.Write([]byte(body))
+}
+
+// SetObject makes the fake answer GET path with value in JSON, until the
+// path is set again. path is the path as sent, with its escapes, such as
+// GitLabPrefix + "/projects/group%2Fsub%2Fproj": a request that does not
+// escape it is not answered.
+func (f *Fake) SetObject(path string, value any) {
+	f.set(path, entity{object: mustJSON(value)})
+}
+
+// SetList makes the fake answer GET path, the path as sent as for
+// SetObject, with entries as a JSON array, until the path is set again. It
+// pages them as both forges do: the query parameter per_page is the page
+// size (30 when it is absent), page the page's number from 1, and while
+// entries follow the page, the Link header names the next page with
+// rel="next". The fake does not filter: every other query parameter is
+// recorded and ignored.
+func (f *Fake) SetList(path string, entries ...any) {
+	list := make([]json.RawMessage, len(entries))
+	for i, e := range entries {
+		list[i] = mustJSON(e)
+	}
+	f.set(path, entity{list: list, isList: true})
+}
+
+// entity is what the fake serves at a path: an object, or a list it pages.
+type entity struct {
+	object json.RawMessage
+	list   []json.RawMessage
+	isList bool
+}
+
+func (f *Fake) set(path string, e entity) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.entities == nil {
+		f.entities = map[string]entity{}
+	}
+	f.entities[path] = e
+}
+
+func mustJSON(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("forgetest: encode %T: %v", v, err))
+	}
+	return b
+}
+
+// serveEntity answers r with e, a page of it when it is a list.
+func (f *Fake) serveEntity(w http.ResponseWriter, r *http.Request, e entity) {
+	if !e.isList {
+		writeAnswer(w, Answer{Body: string(e.object)})
+		return
+	}
+	q := r.URL.Query()
+	size, err := strconv.Atoi(q.Get("per_page"))
+	if err != nil || size < 1 {
+		size = 30
+	}
+	page, err := strconv.Atoi(q.Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+	start := min(len(e.list), (page-1)*size)
+	end := min(len(e.list), start+size)
+	a := Answer{Body: "[]"}
+	if end > start {
+		body, _ := json.Marshal(e.list[start:end])
+		a.Body = string(body)
+	}
+	if end < len(e.list) {
+		q.Set("page", strconv.Itoa(page+1))
+		next := f.URL + r.URL.EscapedPath() + "?" + q.Encode()
+		a.Header = http.Header{"Link": {fmt.Sprintf(`<%s>; rel="next", <%s>; rel="first"`, next, f.URL+r.URL.EscapedPath())}}
+	}
+	writeAnswer(w, a)
 }

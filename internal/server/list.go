@@ -134,12 +134,28 @@ func WritePageWith[T any](w http.ResponseWriter, p Page, items []T, position fun
 	var next *string
 	if len(items) > p.Limit {
 		items = items[:p.Limit]
-		c, err := encodeCursor(position(items[len(items)-1]), p.fingerprint)
+		c, err := p.Cursor(position(items[len(items)-1]))
 		if err != nil {
 			return err
 		}
 		next = &c
 	}
+	return WriteList(w, items, next, members...)
+}
+
+// Cursor is the next_cursor of a page of p's query that continues at
+// position, for a list that knows where its next page starts without
+// reading past the page, such as one a forge pages by number. position must
+// encode as JSON; After decodes it on the next page.
+func (p Page) Cursor(position any) (string, error) {
+	return encodeCursor(position, p.fingerprint)
+}
+
+// WriteList answers 200 with {"items":[…],"next_cursor":…} and the members
+// after them, in their order: next is the cursor of the next page, from
+// Cursor, or nil when none follows, written as null. items is never written
+// as null.
+func WriteList[T any](w http.ResponseWriter, items []T, next *string, members ...Member) error {
 	if items == nil {
 		items = []T{}
 	}

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -16,15 +15,6 @@ import (
 // SecretWebhook is the workspace secret that holds the forge webhook's
 // signing secret.
 const SecretWebhook = "FORGE_WEBHOOK_SECRET"
-
-// Routes are the forge component's routes, which the hub registers. They
-// may be built before the component is bound.
-func (c *Component) Routes() []server.Route {
-	return []server.Route{
-		c.Route(Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/forge", Scope: ScopeRead, Need: access.NeedRead,
-			NoTarget: true, Serve: c.serveStatus}),
-	}
-}
 
 // remoteStatus is how the hub reaches the forge of one remote target.
 type remoteStatus struct {
