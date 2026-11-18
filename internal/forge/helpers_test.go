@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/forge/forgetest"
 	"github.com/agent-fox-dev/parley/internal/fork"
@@ -59,8 +60,9 @@ type world struct {
 	fake    *forgetest.Fake
 	secrets *secret.Component
 	decider *decider
-	// forge is the hub's forge component.
-	forge *forge.Component
+	// forge is the hub's forge component, and events its event log.
+	forge  *forge.Component
+	events *event.Component
 
 	org                         string
 	owner, member, outsider     string
@@ -89,7 +91,7 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 		TOML:   cfg.TOML,
 		Env:    env,
 		Compose: func(c *hub.Composition) {
-			w.secrets, w.forge = c.Secrets(), c.Forge()
+			w.secrets, w.forge, w.events = c.Secrets(), c.Forge(), c.Events()
 			for _, pattern := range []string{probeList, probeNumber} {
 				c.AddRoute(c.Forge().Route(probe(pattern)))
 			}
@@ -286,6 +288,32 @@ func (w *world) get(t *testing.T, slug, path, credential string) (status int, bo
 	before := w.fake.Count()
 	status, body = w.Call(t, http.MethodGet, "/api/v1/workspaces/"+slug+path, credential, nil)
 	return status, body, w.fake.Count() - before
+}
+
+// send sends method /api/v1/workspaces/<slug><path> with credential and
+// body, as hubtest's Call sends it, and returns the answer and how many
+// requests the forge received meanwhile.
+func (w *world) send(t *testing.T, method, slug, path, credential string, body any) (status int, answer []byte, sent int) {
+	t.Helper()
+	before := w.fake.Count()
+	status, answer = w.Call(t, method, "/api/v1/workspaces/"+slug+path, credential, body)
+	return status, answer, w.fake.Count() - before
+}
+
+// forgeEvents is how many forge events the hub's event log holds.
+func (w *world) forgeEvents(t *testing.T) int {
+	t.Helper()
+	records, _, err := w.events.ReadAfter(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("read the event log: %v", err)
+	}
+	n := 0
+	for _, r := range records {
+		if strings.HasPrefix(r.Type, "parley.forge.") {
+			n++
+		}
+	}
+	return n
 }
 
 // hubError is the error member of an error answer.

@@ -77,8 +77,8 @@ func (c *Component) Bind(d Deps) {
 	c.client = NewClient(d.Client)
 }
 
-// Routes are the forge component's routes, which the hub registers. They
-// may be built before the component is bound.
+// Routes are the forge component's routes, the reads and the writes, which
+// the hub registers. They may be built before the component is bound.
 func (c *Component) Routes() []server.Route {
 	read := func(pattern string, params func(*http.Request, *Call) error, serve func(http.ResponseWriter, *http.Request, *Call) error) server.Route {
 		return c.Route(Route{Method: http.MethodGet, Pattern: pattern, Scope: ScopeRead, Need: access.NeedRead, Params: params, Serve: serve})
@@ -90,7 +90,7 @@ func (c *Component) Routes() []server.Route {
 		read("/workspaces/:slug/issues", readIssueList, serveIssues),
 		read("/workspaces/:slug/issues/:number", readIssueNumber, c.serveIssueThread),
 		read(commentsPattern, readComments, serveComments),
-	}, c.pullRoutes()...)
+	}, append(c.pullRoutes(), c.writeRoutes()...)...)
 }
 
 // Client is the client the component sends forge requests with, nil before

@@ -59,6 +59,14 @@ type Answer struct {
 	// Hold holds the answer back until the test ends or the client leaves;
 	// nothing is written.
 	Hold bool
+	// Release, when it is not nil, holds the answer back until it is
+	// closed, then lets the request go on to Delay and its answer; nothing
+	// is written when the test ends or the client leaves first.
+	Release <-chan struct{}
+	// Through answers, once the answer was held back, what the request
+	// gets when no answer is scripted, in place of the answer's own
+	// status and body: so that a write held back is then carried out.
+	Through bool
 }
 
 // Fake is a fake forge. It is safe for concurrent use.
@@ -74,6 +82,9 @@ type Fake struct {
 	answers  []Answer
 	// entities are what SetObject and SetList set, by the path as sent.
 	entities map[string]entity
+	// repositories are the in-memory repositories, by their API path as
+	// sent (see SetNext).
+	repositories map[string]*repository
 }
 
 // New starts a fake forge over TLS until the test ends. Transport is the
@@ -113,8 +124,9 @@ func (f *Fake) GitLabURL() string { return f.URL + GitLabPrefix }
 
 // Script queues answers: each request takes the first queued answer whose
 // Path is empty or equal to its path. A request no queued answer fits gets
-// the object or list set for its path (SetObject, SetList), else 404 with a
-// forge's "Not Found" message.
+// the object or list set for its path (SetObject, SetList), else the
+// in-memory repository's answer (see SetNext), else 404 with a forge's
+// "Not Found" message.
 func (f *Fake) Script(answers ...Answer) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -155,7 +167,7 @@ func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		f.serveEntity(w, r, *e)
 		return
 	case !ok:
-		writeAnswer(w, Answer{Status: http.StatusNotFound, Body: `{"message":"Not Found"}`})
+		f.serveUnscripted(w, r, body)
 		return
 	}
 	if a.Hold {
@@ -165,16 +177,48 @@ func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if a.Delay > 0 {
+	waits := []<-chan struct{}{after(a.Delay)}
+	if a.Release != nil {
+		waits = []<-chan struct{}{a.Release, waits[0]}
+	}
+	for _, wait := range waits {
 		select {
-		case <-time.After(a.Delay):
+		case <-wait:
 		case <-f.release:
 			return
 		case <-r.Context().Done():
 			return
 		}
 	}
+	if a.Through {
+		f.serveUnscripted(w, r, body)
+		return
+	}
 	writeAnswer(w, a)
+}
+
+// after is a channel closed once d has passed, at once for no wait.
+func after(d time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	if d <= 0 {
+		close(done)
+		return done
+	}
+	time.AfterFunc(d, func() { close(done) })
+	return done
+}
+
+// serveUnscripted answers r as when no answer is scripted for it.
+func (f *Fake) serveUnscripted(w http.ResponseWriter, r *http.Request, body []byte) {
+	f.mu.Lock()
+	e, ok := f.entities[r.URL.EscapedPath()]
+	f.mu.Unlock()
+	switch {
+	case ok && r.Method == http.MethodGet:
+		f.serveEntity(w, r, e)
+	case !f.serveRepository(w, r, body):
+		writeAnswer(w, Answer{Status: http.StatusNotFound, Body: `{"message":"Not Found"}`})
+	}
 }
 
 // record keeps the request and takes the answer it gets, in one step, so

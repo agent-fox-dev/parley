@@ -3,11 +3,11 @@
   "spec_id": "42",
   "spec_name": "forge_writes",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-18T19:26:25Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

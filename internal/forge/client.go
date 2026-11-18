@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -119,6 +120,9 @@ type Request struct {
 	// Credential is sent as Authorization: Bearer <token> when its kind is
 	// pat or basic; a request with CredentialNone is anonymous.
 	Credential Credential
+	// Body, when it is not nil, is sent in JSON with the Content-Type
+	// application/json; nil sends no body.
+	Body any
 }
 
 // Response is a forge's successful answer, its body read in full.
@@ -241,11 +245,22 @@ func Decode(resp *Response, v any) error {
 
 // send sends req once, under its own deadline, and reads the answer.
 func (c *Client) send(ctx context.Context, req Request) (*Response, error) {
+	var payload io.Reader
+	if req.Body != nil {
+		b, err := json.Marshal(req.Body)
+		if err != nil {
+			return nil, fmt.Errorf("forge request body: %w", err)
+		}
+		payload = bytes.NewReader(b)
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.deadline)
 	defer cancel()
-	r, err := http.NewRequestWithContext(ctx, req.Method, req.URL, nil)
+	r, err := http.NewRequestWithContext(ctx, req.Method, req.URL, payload)
 	if err != nil {
 		return nil, fmt.Errorf("forge request: %w", err)
+	}
+	if payload != nil {
+		r.Header.Set("Content-Type", "application/json")
 	}
 	r.Header.Set("User-Agent", c.agent)
 	if req.Kind == KindGitHub {
