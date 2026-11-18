@@ -4,11 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -16,51 +15,26 @@ import (
 	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
-// secretReads records the secret reads the resolutions of a component make,
-// each as scope/scope id/name.
-type secretReads struct {
-	mu   sync.Mutex
-	seen []string
-}
-
-// recordSecretReads starts recording the secret reads of c's resolutions.
-func recordSecretReads(c *secret.Component) *secretReads {
-	r := &secretReads{}
-	c.RecordSecretReads(func(scope secret.Scope, id, name string) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.seen = append(r.seen, fmt.Sprintf("%s/%s/%s", scope, id, name))
-	})
-	return r
-}
-
-// take returns the reads recorded since the last take and forgets them.
-func (r *secretReads) take() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	seen := r.seen
-	r.seen = nil
-	return seen
-}
-
-// of are those of reads made in the scope id.
-func of(reads []string, scope secret.Scope, id string) []string {
-	out := []string{}
-	for _, r := range reads {
-		if strings.HasPrefix(r, string(scope)+"/"+id+"/") {
-			out = append(out, r)
+// countReads starts counting the secret reads in the scope id that c's
+// resolutions make, and returns the count since its last call.
+func countReads(c *secret.Component, scope secret.Scope, id string) func() int64 {
+	var n atomic.Int64
+	c.RecordSecretReads(func(s secret.Scope, sid, _ string) {
+		if s == scope && sid == id {
+			n.Add(1)
 		}
-	}
-	return out
+	})
+	return func() int64 { return n.Swap(0) }
 }
 
-// origins are the origins of steps, in order.
-func origins(steps []secret.Step) []secret.Origin {
-	out := []secret.Origin{}
-	for _, s := range steps {
-		out = append(out, s.Origin)
-	}
-	return out
+// failingRecords is a record reader whose every read fails with err.
+type failingRecords struct {
+	access.RecordReader
+	err error
+}
+
+func (f failingRecords) Record(context.Context, string) (access.Record, bool, error) {
+	return access.Record{}, false, f.err
 }
 
 func found(name, value string, o secret.Origin) secret.ResolvedSecret {
@@ -80,7 +54,6 @@ func TestResolveSecrets_AnswerEachNameFromTheFirstScopeOfTheChainThatHasIt(t *te
 	t.Parallel()
 	w := newWorld(t)
 	w.addOwnFork(t)
-	ctx := context.Background()
 	w.putSecrets(t, secret.ScopeUser, w.ownerID, "TOKEN", "u", "Only_User", "x")
 	w.putSecrets(t, secret.ScopeOrg, w.orgID, "token", "o")
 	w.putSecrets(t, secret.ScopeWorkspace, "acme", "EMPTY", "", "DEPLOY_KEY", "p", "Both", "p")
@@ -88,9 +61,9 @@ func TestResolveSecrets_AnswerEachNameFromTheFirstScopeOfTheChainThatHasIt(t *te
 	own := func(slug string) secret.Step {
 		return secret.Step{Origin: secret.OriginWorkspace, Scope: secret.ScopeWorkspace, ScopeID: slug}
 	}
-	parent := secret.Step{Origin: secret.OriginParent, Scope: secret.ScopeWorkspace, ScopeID: "acme"}
 	org := secret.Step{Origin: secret.OriginOrg, Scope: secret.ScopeOrg, ScopeID: w.orgID}
 	user := secret.Step{Origin: secret.OriginUser, Scope: secret.ScopeUser, ScopeID: w.ownerID}
+	parent := secret.Step{Origin: secret.OriginParent, Scope: secret.ScopeWorkspace, ScopeID: "acme"}
 	for _, c := range []struct {
 		name, slug string
 		names      []string
@@ -107,7 +80,7 @@ func TestResolveSecrets_AnswerEachNameFromTheFirstScopeOfTheChainThatHasIt(t *te
 			[]secret.ResolvedSecret{found("DEPLOY_KEY", "p", secret.OriginParent), found("BOTH", "g", secret.OriginWorkspace)},
 			[]secret.Step{own("acme-own"), parent, org, user}},
 	} {
-		got, err := w.secrets.ResolveSecrets(ctx, c.slug, c.names)
+		got, err := w.secrets.ResolveSecrets(context.Background(), c.slug, c.names)
 		if err != nil || !slices.Equal(got.Secrets, c.want) || !slices.Equal(got.Searched, c.searched) {
 			t.Errorf("%s: resolve(%s, %v) = %+v, %v; want %+v searching %v", c.name, c.slug, c.names, got, err, c.want, c.searched)
 		}
@@ -118,65 +91,41 @@ func TestResolveSecrets_ReadTheParentOnlyForAForkItsOwnerCanWriteAndNeverForRese
 	t.Parallel()
 	w := newWorld(t)
 	w.addOwnFork(t)
-	ctx := context.Background()
-	reads := recordSecretReads(w.secrets)
-	w.putSecrets(t, secret.ScopeWorkspace, "acme", "DEPLOY_KEY", "p")
-	w.putSecrets(t, secret.ScopeOrg, w.orgID, "ORG_KEY", "o")
-	w.putSecrets(t, secret.ScopeWorkspace, "acme-fork", "FORK_KEY", "f")
-	w.putSecrets(t, secret.ScopeUser, w.memberID, "MINE", "m")
-
-	// acme-fork is a member's, who has no write access to acme.
-	got, err := w.secrets.ResolveSecrets(ctx, "acme-fork", []string{"DEPLOY_KEY", "ORG_KEY", "FORK_KEY", "MINE"})
-	want := []secret.ResolvedSecret{missing("DEPLOY_KEY"), found("ORG_KEY", "o", secret.OriginOrg),
-		found("FORK_KEY", "f", secret.OriginWorkspace), found("MINE", "m", secret.OriginUser)}
-	searched := []secret.Origin{secret.OriginWorkspace, secret.OriginOrg, secret.OriginUser}
-	if err != nil || !slices.Equal(got.Secrets, want) || !slices.Equal(origins(got.Searched), searched) {
-		t.Errorf("a member's fork: resolve = %+v, %v; want %+v searching %v", got, err, want, searched)
-	}
-	if parentReads := of(reads.take(), secret.ScopeWorkspace, "acme"); len(parentReads) != 0 {
-		t.Errorf("a member's fork read the parent's secrets %v, want none", parentReads)
-	}
-
-	// The fork of acme's owner reads the parent, for every name but a
-	// reserved one.
-	got, err = w.secrets.ResolveSecrets(ctx, "acme-own", []string{"DEPLOY_KEY"})
-	if want := []secret.ResolvedSecret{found("DEPLOY_KEY", "p", secret.OriginParent)}; err != nil || !slices.Equal(got.Secrets, want) {
-		t.Errorf("the owner's fork: resolve(DEPLOY_KEY) = %+v, %v; want %+v", got, err, want)
-	}
-	if parentReads := of(reads.take(), secret.ScopeWorkspace, "acme"); len(parentReads) != 1 {
-		t.Errorf("the owner's fork read the parent's secrets %v, want one read", parentReads)
-	}
+	parentReads := countReads(w.secrets, secret.ScopeWorkspace, "acme")
 	reserved := []string{"GIT_PAT", "GIT_USERNAME", "GIT_PASSWORD", "UPSTREAM_GIT_PAT", "UPSTREAM_GIT_USERNAME",
 		"UPSTREAM_GIT_PASSWORD", "FORGE_WEBHOOK_SECRET"}
+	w.putSecrets(t, secret.ScopeWorkspace, "acme", "DEPLOY_KEY", "p")
 	for _, name := range reserved {
 		w.putSecrets(t, secret.ScopeWorkspace, "acme", name, "parent's "+name)
 	}
+	w.putSecrets(t, secret.ScopeOrg, w.orgID, "ORG_KEY", "o")
+	w.putSecrets(t, secret.ScopeWorkspace, "acme-fork", "FORK_KEY", "f")
+	w.putSecrets(t, secret.ScopeUser, w.memberID, "MINE", "m")
+	// check resolves names in the fork slug and wants the secrets want, read
+	// with reads reads of the parent's secrets.
+	check := func(slug string, names []string, reads int64, want ...secret.ResolvedSecret) {
+		t.Helper()
+		got, err := w.secrets.ResolveSecrets(context.Background(), slug, names)
+		if n := parentReads(); err != nil || !slices.Equal(got.Secrets, want) || n != reads {
+			t.Errorf("resolve(%s, %v) = %+v, %v with %d reads of the parent's secrets; want %+v with %d", slug, names, got.Secrets, err, n, want, reads)
+		}
+	}
+	// acme-fork is a member's, who has no write access to acme.
+	check("acme-fork", []string{"DEPLOY_KEY", "ORG_KEY", "FORK_KEY", "MINE"}, 0, missing("DEPLOY_KEY"),
+		found("ORG_KEY", "o", secret.OriginOrg), found("FORK_KEY", "f", secret.OriginWorkspace), found("MINE", "m", secret.OriginUser))
+	check("acme-own", []string{"DEPLOY_KEY"}, 1, found("DEPLOY_KEY", "p", secret.OriginParent))
 	for _, name := range reserved {
 		for _, asked := range []string{name, strings.ToLower(name)} {
-			for _, fork := range []string{"acme-own", "acme-fork"} {
-				got, err := w.secrets.ResolveSecrets(ctx, fork, []string{asked})
-				if want := []secret.ResolvedSecret{missing(asked)}; err != nil || !slices.Equal(got.Secrets, want) {
-					t.Errorf("%s: resolve(%s) = %+v, %v; want %+v", fork, asked, got, err, want)
-				}
-				if parentReads := of(reads.take(), secret.ScopeWorkspace, "acme"); len(parentReads) != 0 {
-					t.Errorf("%s: resolve(%s) read the parent's secrets %v, want none", fork, asked, parentReads)
-				}
-			}
+			check("acme-own", []string{asked}, 0, missing(asked))
+			check("acme-fork", []string{asked}, 0, missing(asked))
 		}
 	}
 	// A reserved name is still searched in the fork's other scopes.
 	w.putSecrets(t, secret.ScopeUser, w.ownerID, "GIT_PAT", "owner's pat")
 	w.putSecrets(t, secret.ScopeOrg, w.orgID, "GIT_USERNAME", "org's name")
 	w.putSecrets(t, secret.ScopeWorkspace, "acme-own", "Forge_Webhook_Secret", "fork's hook")
-	got, err = w.secrets.ResolveSecrets(ctx, "acme-own", []string{"git_pat", "GIT_USERNAME", "FORGE_WEBHOOK_SECRET"})
-	want = []secret.ResolvedSecret{found("git_pat", "owner's pat", secret.OriginUser),
-		found("GIT_USERNAME", "org's name", secret.OriginOrg), found("FORGE_WEBHOOK_SECRET", "fork's hook", secret.OriginWorkspace)}
-	if err != nil || !slices.Equal(got.Secrets, want) {
-		t.Errorf("reserved names in the fork's other scopes: resolve = %+v, %v; want %+v", got, err, want)
-	}
-	if parentReads := of(reads.take(), secret.ScopeWorkspace, "acme"); len(parentReads) != 0 {
-		t.Errorf("reserved names read the parent's secrets %v, want none", parentReads)
-	}
+	check("acme-own", []string{"git_pat", "GIT_USERNAME", "FORGE_WEBHOOK_SECRET"}, 0, found("git_pat", "owner's pat", secret.OriginUser),
+		found("GIT_USERNAME", "org's name", secret.OriginOrg), found("FORGE_WEBHOOK_SECRET", "fork's hook", secret.OriginWorkspace))
 }
 
 func TestResolveSecrets_ReadTheChainAndTheValuesAgainOnEveryCall(t *testing.T) {
@@ -184,16 +133,6 @@ func TestResolveSecrets_ReadTheChainAndTheValuesAgainOnEveryCall(t *testing.T) {
 	w := newWorld(t)
 	w.addOwnFork(t)
 	ctx := context.Background()
-	setOwner := func(id string) {
-		t.Helper()
-		err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(ctx, `UPDATE workspaces SET owner_id = ? WHERE slug = 'acme'`, id)
-			return err
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
 	w.putSecrets(t, secret.ScopeWorkspace, "acme", "K", "p")
 	for _, c := range []struct {
 		name   string
@@ -215,8 +154,9 @@ func TestResolveSecrets_ReadTheChainAndTheValuesAgainOnEveryCall(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, found("K", "p2", secret.OriginParent), true},
-		{"the parent passes to another owner", func() { setOwner(w.member2ID) }, missing("K"), false},
-		{"the parent passes back", func() { setOwner(w.ownerID) }, found("K", "p2", secret.OriginParent), true},
+		{"the parent passes to another owner", func() { w.exec(t, `UPDATE workspaces SET owner_id = ? WHERE slug = 'acme'`, w.member2ID) }, missing("K"), false},
+		{"the parent passes back", func() { w.exec(t, `UPDATE workspaces SET owner_id = ? WHERE slug = 'acme'`, w.ownerID) },
+			found("K", "p2", secret.OriginParent), true},
 	} {
 		c.change()
 		got, err := w.secrets.ResolveSecrets(ctx, "acme-own", []string{"K"})
@@ -233,72 +173,64 @@ func TestResolveSecrets_FailWholeWithoutAValue(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	ctx := context.Background()
-	reads := recordSecretReads(w.secrets)
+	lowerReads := countReads(w.secrets, secret.ScopeUser, w.ownerID)
 	w.putSecrets(t, secret.ScopeWorkspace, "acme", "K", "k1", "OTHER", "OTHER-MARKER")
 	w.putSecrets(t, secret.ScopeUser, w.ownerID, "K", "LOWER-MARKER")
 	// The workspace's K is sealed bytes no key opens.
-	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE secrets SET sealed = x'00' WHERE scope = 'workspace' AND scope_id = 'acme' AND key = 'K'`)
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	w.exec(t, `UPDATE secrets SET sealed = x'00' WHERE scope = 'workspace' AND scope_id = 'acme' AND key = 'K'`)
 	db := w.Store.Main()
 	broken := errors.New("the store is broken 7d2a")
-	memberships := access.MembershipsFunc(func(ctx context.Context, id string) ([]string, error) {
-		return identity.ActiveOrgIDs(ctx, db, id)
-	})
-	exists := func(context.Context, string) (bool, error) { return true, nil }
-	nobodyWrites := func(context.Context, string, string) (bool, error) { return false, nil }
+	// with is a component on the hub's store whose readers are the hub's,
+	// but for those deps sets.
+	with := func(deps secret.Deps) *secret.Component {
+		deps.Store = w.Store
+		if deps.Records == nil {
+			deps.Records = access.StoreRecords(db)
+		}
+		if deps.Memberships == nil {
+			deps.Memberships = access.MembershipsFunc(func(ctx context.Context, id string) ([]string, error) { return identity.ActiveOrgIDs(ctx, db, id) })
+		}
+		if deps.UserExists == nil {
+			deps.UserExists = func(context.Context, string) (bool, error) { return true, nil }
+		}
+		if deps.CanWrite == nil {
+			deps.CanWrite = func(context.Context, string, string) (bool, error) { return false, nil }
+		}
+		return secret.New(deps)
+	}
+	if got, err := with(secret.Deps{}).ResolveSecrets(ctx, "acme-fork", []string{"OTHER"}); err != nil || len(got.Searched) != 3 {
+		t.Fatalf("resolve(acme-fork) with every read answered = %+v, %v; want three steps searched", got, err)
+	}
 	for _, c := range []struct {
 		name, slug string
 		c          *secret.Component
-		check      func(err error) string
+		// unreadable: the error is the unreadable one, which names K and
+		// its scope; notFound: it is workspace not found, and says so.
+		unreadable, notFound bool
 	}{
-		{"an unreadable secret in the first scope that has the name", "acme", w.secrets, func(err error) string {
-			switch msg := err.Error(); {
-			case !errors.Is(err, secret.ErrUnreadable) || errors.Is(err, secret.ErrWorkspaceNotFound):
-				return "want an unreadable error, not workspace not found"
-			case !strings.Contains(msg, `"K"`) || !strings.Contains(msg, "workspace"):
-				return "want the key K and the workspace scope named"
-			case strings.Contains(msg, "MARKER"):
-				return "want no value in it"
-			}
-			if lower := of(reads.take(), secret.ScopeUser, w.ownerID); len(lower) != 0 {
-				return fmt.Sprintf("read %v in the user scope below it, want none", lower)
-			}
-			return ""
-		}},
-		{"a slug no workspace has", "nosuch", w.secrets, func(err error) string {
-			if !errors.Is(err, secret.ErrWorkspaceNotFound) {
-				return "want workspace not found"
-			}
-			return ""
-		}},
-		{"a record that cannot be read", "acme", secret.New(secret.Deps{Store: w.Store, Records: failingRecords{err: broken},
-			Memberships: memberships, UserExists: exists, CanWrite: nobodyWrites}), notNotFound},
-		{"a write access that cannot be read", "acme-fork", secret.New(secret.Deps{Store: w.Store, Records: access.StoreRecords(db),
-			Memberships: memberships, UserExists: exists,
-			CanWrite: func(context.Context, string, string) (bool, error) { return false, broken }}), notNotFound},
+		{"an unreadable secret in the first scope that has the name", "acme", w.secrets, true, false},
+		{"a slug no workspace has", "nosuch", w.secrets, false, true},
+		{"a record that cannot be read", "acme", with(secret.Deps{Records: failingRecords{err: broken}}), false, false},
+		{"memberships that cannot be read", "acme", with(secret.Deps{
+			Memberships: access.MembershipsFunc(func(context.Context, string) ([]string, error) { return nil, broken })}), false, false},
+		{"an owner who cannot be read", "acme", with(secret.Deps{UserExists: func(context.Context, string) (bool, error) { return false, broken }}), false, false},
+		{"a write access that cannot be read", "acme-fork", with(secret.Deps{
+			CanWrite: func(context.Context, string, string) (bool, error) { return false, broken }}), false, false},
 	} {
 		got, err := c.c.ResolveSecrets(ctx, c.slug, []string{"OTHER", "K"})
 		if err == nil || got.Secrets != nil || got.Searched != nil {
 			t.Errorf("%s: resolve(%s) = %+v, %v; want no values and an error", c.name, c.slug, got, err)
 			continue
 		}
-		if fault := c.check(err); fault != "" {
-			t.Errorf("%s: resolve(%s) error %q: %s", c.name, c.slug, err, fault)
+		msg := err.Error()
+		if errors.Is(err, secret.ErrUnreadable) != c.unreadable || errors.Is(err, secret.ErrWorkspaceNotFound) != c.notFound || c.notFound && msg != "workspace not found" ||
+			c.unreadable && (!strings.Contains(msg, `"K"`) || !strings.Contains(msg, "workspace")) || strings.Contains(msg, "MARKER") {
+			t.Errorf("%s: resolve(%s) error %q, want unreadable %v naming K and its scope, not found %v, and no value", c.name, c.slug, err, c.unreadable, c.notFound)
 		}
 	}
-}
-
-// notNotFound is the fault of an error that is the not-found error.
-func notNotFound(err error) string {
-	if errors.Is(err, secret.ErrWorkspaceNotFound) {
-		return "want an error other than workspace not found"
+	if n := lowerReads(); n != 0 {
+		t.Errorf("the unreadable secret read %d secrets in the user scope below it, want none", n)
 	}
-	return ""
 }
 
 // An org member's fork runs with its parent's variables, read through the
@@ -308,35 +240,23 @@ func TestResolution_AMembersForkGetsTheParentsVariablesAndNotItsSecrets(t *testi
 	t.Parallel()
 	w := newWorld(t)
 	w.addOwnFork(t)
-	w.putVars(t, w.ownerKey, "/workspaces/acme/vars", "REGION", "eu")
-	if a := w.do(t, w.ownerKey, http.MethodPost, "/workspaces/acme/secrets",
-		entries(map[string]any{"key": "DEPLOY_KEY", "value": "s3"})); a.status != http.StatusCreated {
-		t.Fatalf("store the secret DEPLOY_KEY in acme = %d %s, want 201", a.status, a.body)
-	}
-
+	w.create(t, w.ownerKey, "/workspaces/acme/vars", "REGION=eu")
+	w.must(t, w.ownerKey, http.MethodPost, "/workspaces/acme/secrets", entries(map[string]any{"key": "DEPLOY_KEY", "value": "s3"}), http.StatusCreated)
 	got := w.resolve(t, w.memberKey, "acme-fork")
-	if i := slices.IndexFunc(got, func(r resolved) bool { return r.Key == "REGION" }); i < 0 ||
-		got[i].Value != "eu" || got[i].Origin != string(secret.OriginParent) {
+	if i := slices.IndexFunc(got, func(r variable) bool { return r.Key == "REGION" }); i < 0 || got[i].Value != "eu" || got[i].Origin != string(secret.OriginParent) {
 		t.Errorf("the member's resolved variables of acme-fork = %+v, want REGION = eu from the parent", got)
 	}
-
-	ctx := context.Background()
-	member, err := w.secrets.ResolveSecrets(ctx, "acme-fork", []string{"DEPLOY_KEY"})
-	if err != nil {
-		t.Fatalf("resolve DEPLOY_KEY for acme-fork: %v", err)
-	}
-	if want := []secret.ResolvedSecret{missing("DEPLOY_KEY")}; !slices.Equal(member.Secrets, want) {
-		t.Errorf("DEPLOY_KEY for the member's fork = %+v, want missing", member.Secrets)
-	}
-	if got, want := origins(member.Searched), []secret.Origin{secret.OriginWorkspace, secret.OriginOrg, secret.OriginUser}; !slices.Equal(got, want) {
-		t.Errorf("the member's fork searched %v, want %v", got, want)
-	}
-
-	owners, err := w.secrets.ResolveSecrets(ctx, "acme-own", []string{"DEPLOY_KEY"})
-	if err != nil {
-		t.Fatalf("resolve DEPLOY_KEY for acme-own: %v", err)
-	}
-	if want := []secret.ResolvedSecret{found("DEPLOY_KEY", "s3", secret.OriginParent)}; !slices.Equal(owners.Secrets, want) {
-		t.Errorf("DEPLOY_KEY for the owner's fork = %+v, want s3 from the parent", owners.Secrets)
+	for _, c := range []struct {
+		slug     string
+		want     secret.ResolvedSecret
+		searched []secret.Origin
+	}{
+		{"acme-fork", missing("DEPLOY_KEY"), []secret.Origin{secret.OriginWorkspace, secret.OriginOrg, secret.OriginUser}},
+		{"acme-own", found("DEPLOY_KEY", "s3", secret.OriginParent), []secret.Origin{secret.OriginWorkspace, secret.OriginParent, secret.OriginOrg, secret.OriginUser}},
+	} {
+		res, err := w.secrets.ResolveSecrets(context.Background(), c.slug, []string{"DEPLOY_KEY"})
+		if err != nil || !slices.Equal(res.Secrets, []secret.ResolvedSecret{c.want}) || !slices.Equal(origins(res.Searched), c.searched) {
+			t.Errorf("DEPLOY_KEY for %s = %+v, %v; want %+v searching %v", c.slug, res, err, c.want, c.searched)
+		}
 	}
 }
