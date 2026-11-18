@@ -19,6 +19,13 @@ const maxTitleBytes = 256
 // maxLabels is the most label names an issue event lists.
 const maxLabels = 100
 
+// maxLabelBytes is the most bytes of a label name an event keeps: every
+// event of an issue lists its labels, and a GitLab update relays up to 100
+// label events, so without it one delivery could write a hundred times its
+// size. 1024 bytes keeps whole every name a forge creates (GitLab allows
+// 255 characters, GitHub 50).
+const maxLabelBytes = 1024
+
 // issueFields are what a forge says of an issue beside its number.
 type issueFields struct {
 	title, url string
@@ -31,7 +38,7 @@ type issueFields struct {
 func issueEvent(action string, number int64, f issueFields, label string) HookEvent {
 	m := map[string]any{"number": number, "url": cleanURL(f.url), "labels": f.labels}
 	if action == "labeled" || action == "unlabeled" {
-		m["label"] = label
+		m["label"] = cutUTF8(label, maxLabelBytes)
 	} else {
 		m["title"] = cutUTF8(f.title, maxTitleBytes)
 	}
@@ -90,9 +97,10 @@ func optString(payload map[string]any, path ...string) string {
 	return s
 }
 
-// labelNames are the first maxLabels names of a label list, in its order:
-// the string member key of each entry; an entry that is not an object with
-// a string under key names none. Never nil, so that it is a JSON list.
+// labelNames are the first maxLabels names of a label list, in its order,
+// each cut to maxLabelBytes: the string member key of each entry; an entry
+// that is not an object with a string under key names none. Never nil, so
+// that it is a JSON list.
 func labelNames(list any, key string) []string {
 	entries, _ := list.([]any)
 	names := []string{}
@@ -102,7 +110,7 @@ func labelNames(list any, key string) []string {
 		}
 		if obj, ok := entry.(map[string]any); ok {
 			if name, ok := obj[key].(string); ok {
-				names = append(names, name)
+				names = append(names, cutUTF8(name, maxLabelBytes))
 			}
 		}
 	}

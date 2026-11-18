@@ -81,3 +81,16 @@ the test does not depend on the task's place in the order.
 - The check that no relayed event holds the webhook secret asserts it on the
   stored events of the recording and ingress tests: the reduction is never
   given the secret, so no draft can hold it.
+
+## A label name is cut to 1024 bytes
+
+The package bounds the number of label names an issue event lists (100)
+and the label events of one GitLab update (100), but not the length of a
+name. Every one of those events lists the issue's labels, so a delivery of
+1 MiB holding 100 labels of ~9 KB wrote ~90 MB of events in one
+transaction. `issueEvent` and `labelNames` (`internal/forge/hook_event.go`)
+cut each name, in `labels` and in `label`, to `maxLabelBytes`, 1024 bytes,
+at a character boundary, as a title is cut to 256: a name no forge can
+create (GitLab allows 255 characters, GitHub 50) is the only one cut, and
+one delivery now writes at most about 10 MB of label names. Two names that
+differ only past the bound are relayed as the same name.
