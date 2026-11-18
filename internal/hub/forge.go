@@ -22,11 +22,14 @@ const forgeHook = "forge"
 // and external URL too.
 //
 // The component exists from the composition on (Forge), so that the forge
-// routes are built with it; a later part and tests change its dependencies
+// routes, which the part registers, are built with it; a later part and tests change its dependencies
 // with AdjustForge.
 func composeForge(c *Composition) {
 	comp := &forge.Component{}
 	c.forge = comp
+	for _, rt := range comp.Routes() {
+		c.AddRoute(rt)
+	}
 	c.AddStartHook(forgeHook, func(_ context.Context, rt *Runtime) error {
 		db := rt.Store.Main()
 		d := forge.Deps{

@@ -70,8 +70,8 @@ func newWorld(t *testing.T) *world {
 	return newWorldWith(t, hubtest.Config{}, nil)
 }
 
-// newWorldWith is newWorld with the TOML and the environment of cfg added
-// to the hub's, and adjust, when it is not nil, run on the forge
+// newWorldWith is newWorld with the server TOML, the TOML and the
+// environment of cfg added to the hub's, and adjust, when it is not nil, run on the forge
 // component's dependencies after the world's own changes.
 func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *forge.Deps)) *world {
 	t.Helper()
@@ -83,8 +83,9 @@ func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *for
 	env := map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)}
 	maps.Copy(env, cfg.Env)
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		TOML: cfg.TOML,
-		Env:  env,
+		Server: cfg.Server,
+		TOML:   cfg.TOML,
+		Env:    env,
 		Compose: func(c *hub.Composition) {
 			w.secrets, w.forge = c.Secrets(), c.Forge()
 			for _, pattern := range []string{probeList, probeNumber} {

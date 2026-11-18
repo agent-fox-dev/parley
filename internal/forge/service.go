@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -56,6 +57,9 @@ type Deps struct {
 type Component struct {
 	deps   Deps
 	client *Client
+
+	mu           sync.Mutex
+	lastDelivery LastDeliveryProvider
 }
 
 // Bind gives the component its dependencies and builds its client from
@@ -89,4 +93,24 @@ func (c *Component) settings(w workspace.Workspace) Settings {
 		return ""
 	}
 	return Settings{APIURL: read(SettingAPIURL), UpstreamAPIURL: read(SettingUpstreamAPIURL)}
+}
+
+// LastDeliveryProvider reports the time of the newest webhook delivery
+// recorded for the workspace slug, and whether there is one.
+type LastDeliveryProvider func(ctx context.Context, slug string) (time.Time, bool, error)
+
+// SetLastDeliveryProvider registers p as the source of the diagnostic
+// document's webhook.last_delivery_at, replacing the one registered before;
+// nil registers none. It may be called at any time.
+func (c *Component) SetLastDeliveryProvider(p LastDeliveryProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastDelivery = p
+}
+
+// lastDeliveryProvider is the provider registered, nil for none.
+func (c *Component) lastDeliveryProvider() LastDeliveryProvider {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastDelivery
 }

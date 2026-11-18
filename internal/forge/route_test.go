@@ -24,6 +24,7 @@ type readRoute struct {
 // readRoutes are the forge read routes every caller with read access is
 // served on.
 var readRoutes = []readRoute{
+	{"/forge", nil},
 	{"/forge-probe", []forgetest.Answer{{}}},
 	{"/forge-probe/1", []forgetest.Answer{{}}},
 }

@@ -80,6 +80,11 @@ type Route struct {
 	// Need is the access the caller needs on the workspace and on a
 	// fork's parent.
 	Need access.Need
+	// NoTarget makes a route that works on no one remote target: steps 3
+	// and 5 are left out, so the query parameter target is ignored like
+	// any unknown one, Call.Target and Call.Resolution stay zero, and the
+	// route works from Call.Workspace and Call.Settings itself.
+	NoTarget bool
 	// Params checks the route's path and query parameters, and may keep
 	// what it parsed in call.Params; nil for none.
 	Params func(r *http.Request, call *Call) error
@@ -132,8 +137,10 @@ func (c *Component) serve(w http.ResponseWriter, r *http.Request, rt Route) erro
 	if err != nil {
 		return err
 	}
-	if call.Target, err = target(r, call.Workspace); err != nil {
-		return err
+	if !rt.NoTarget {
+		if call.Target, err = target(r, call.Workspace); err != nil {
+			return err
+		}
 	}
 	if rt.Params != nil {
 		if err := rt.Params(r, call); err != nil {
@@ -141,12 +148,14 @@ func (c *Component) serve(w http.ResponseWriter, r *http.Request, rt Route) erro
 		}
 	}
 	call.Settings = c.settings(call.Workspace)
-	call.Resolution, err = Resolve(r.Context(), c.deps.Secrets, call.Workspace, call.Target, call.Settings)
-	if rerr, ok := errors.AsType[*ResolveError](err); ok {
-		return server.NewError(rerr.Type, http.StatusUnprocessableEntity, rerr.Message)
-	}
-	if err != nil {
-		return fmt.Errorf("resolve the forge of %s: %w", call.Workspace.Slug, err)
+	if !rt.NoTarget {
+		call.Resolution, err = Resolve(r.Context(), c.deps.Secrets, call.Workspace, call.Target, call.Settings)
+		if rerr, ok := errors.AsType[*ResolveError](err); ok {
+			return server.NewError(rerr.Type, http.StatusUnprocessableEntity, rerr.Message)
+		}
+		if err != nil {
+			return fmt.Errorf("resolve the forge of %s: %w", call.Workspace.Slug, err)
+		}
 	}
 	if rt.Check != nil {
 		if err := rt.Check(r, call); err != nil {
@@ -234,10 +243,16 @@ func target(r *http.Request, ws workspace.Workspace) (Target, error) {
 		return "", server.InvalidRequest("target must be given at most once, as origin or upstream")
 	case values[0] == string(TargetOrigin):
 		return TargetOrigin, nil
-	case ws.Mode != workspace.ModeCarryPatch || ws.UpstreamURL == nil || *ws.UpstreamURL == "":
+	case !tracksUpstream(ws):
 		return "", server.NewError("workspace_mode_mismatch", http.StatusBadRequest,
 			fmt.Sprintf("target upstream needs a carry-patch workspace with an upstream_url; %q has none", ws.Slug))
 	default:
 		return TargetUpstream, nil
 	}
+}
+
+// tracksUpstream reports whether ws has an upstream target: it is a
+// carry-patch workspace with an upstream_url.
+func tracksUpstream(ws workspace.Workspace) bool {
+	return ws.Mode == workspace.ModeCarryPatch && ws.UpstreamURL != nil && *ws.UpstreamURL != ""
 }
