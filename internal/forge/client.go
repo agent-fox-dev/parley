@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -157,7 +158,8 @@ const (
 type Failure struct {
 	Kind FailureKind
 	// Status, Header and Body are the forge's answer, for FailureStatus
-	// and FailureRateLimited.
+	// and FailureRateLimited; Status and Header are also those of an
+	// answer whose body is FailureUnreadable.
 	Status int
 	Header http.Header
 	Body   []byte
@@ -225,6 +227,17 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	}
 }
 
+// Decode decodes the JSON body of resp into v. A body that is not the JSON
+// v expects is a *Failure of kind FailureUnreadable, which the hub answers
+// as the forge's error.
+func Decode(resp *Response, v any) error {
+	if err := json.Unmarshal(resp.Body, v); err != nil {
+		return &Failure{Kind: FailureUnreadable, Status: resp.Status, Header: resp.Header,
+			Err: fmt.Errorf("the body is not the JSON expected: %w", err)}
+	}
+	return nil
+}
+
 // send sends req once, under its own deadline, and reads the answer.
 func (c *Client) send(ctx context.Context, req Request) (*Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.deadline)
@@ -250,10 +263,11 @@ func (c *Client) send(ctx context.Context, req Request) (*Response, error) {
 		if isTimeout(err) {
 			return nil, &Failure{Kind: FailureTimeout, Err: err}
 		}
-		return nil, &Failure{Kind: FailureUnreadable, Err: err}
+		return nil, &Failure{Kind: FailureUnreadable, Status: resp.StatusCode, Header: resp.Header, Err: err}
 	}
 	if int64(len(body)) > c.maxBody {
-		return nil, &Failure{Kind: FailureUnreadable, Err: fmt.Errorf("the body is larger than %d bytes", c.maxBody)}
+		return nil, &Failure{Kind: FailureUnreadable, Status: resp.StatusCode, Header: resp.Header,
+			Err: fmt.Errorf("the body is larger than %d bytes", c.maxBody)}
 	}
 	return &Response{Status: resp.StatusCode, Header: resp.Header, Body: body}, nil
 }

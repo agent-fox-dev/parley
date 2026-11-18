@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -55,6 +57,8 @@ type world struct {
 	fake    *forgetest.Fake
 	secrets *secret.Component
 	decider *decider
+	// forge is the hub's forge component.
+	forge *forge.Component
 
 	org                         string
 	owner, member, outsider     string
@@ -63,15 +67,26 @@ type world struct {
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
+	return newWorldWith(t, hubtest.Config{}, nil)
+}
+
+// newWorldWith is newWorld with the TOML and the environment of cfg added
+// to the hub's, and adjust, when it is not nil, run on the forge
+// component's dependencies after the world's own changes.
+func newWorldWith(t *testing.T, cfg hubtest.Config, adjust func(w *world, d *forge.Deps)) *world {
+	t.Helper()
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
 	}
 	w := &world{fake: forgetest.New(t), decider: &decider{refused: deniedParent}}
+	env := map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)}
+	maps.Copy(env, cfg.Env)
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		Env: map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
+		TOML: cfg.TOML,
+		Env:  env,
 		Compose: func(c *hub.Composition) {
-			w.secrets = c.Secrets()
+			w.secrets, w.forge = c.Secrets(), c.Forge()
 			for _, pattern := range []string{probeList, probeNumber} {
 				c.AddRoute(c.Forge().Route(probe(pattern)))
 			}
@@ -80,6 +95,9 @@ func newWorld(t *testing.T) *world {
 				d.Secrets = brokenSecrets{d.Secrets}
 				w.decider.real = d.Access
 				d.Access = w.decider
+				if adjust != nil {
+					adjust(w, d)
+				}
 			})
 		},
 	})
@@ -90,10 +108,20 @@ func newWorld(t *testing.T) *world {
 	return w
 }
 
+// The routes the forge failure tests read through, which the probe stands
+// in for until the read routes exist: a repository, an issue, and an
+// issue's comments.
+const (
+	repositoryPath = "/forge-probe/1"
+	issuePath      = "/forge-probe/1"
+	commentsPath   = "/forge-probe/1"
+)
+
 // probe is the probe route of pattern: it reads the issues, or the issue
-// :number, of the target's repository on GitHub and answers the forge's
-// body as the member forge. Its Check refuses a request with the query
-// parameter refuse, 409 probe_refused.
+// :number, of the target's repository on GitHub or GitLab and answers the
+// forge's body, which must be JSON and for an issue an object, as the
+// member forge. Its Check refuses a request with the query parameter
+// refuse, 409 probe_refused.
 func probe(pattern string) forge.Route {
 	numbered := pattern == probeNumber
 	return forge.Route{
@@ -121,14 +149,22 @@ func probe(pattern string) forge.Route {
 		Serve: func(w http.ResponseWriter, r *http.Request, call *forge.Call) error {
 			repo := call.Resolution.Repository
 			path := "/repos/" + repo.Owner + "/" + repo.Name + "/issues"
+			if call.Resolution.Kind == forge.KindGitLab {
+				path = "/projects/" + url.PathEscape(repo.Owner+"/"+repo.Name) + "/issues"
+			}
+			var answer any = new(any)
 			if n, ok := call.Params.(int64); ok {
 				path += "/" + strconv.FormatInt(n, 10)
+				answer = new(map[string]any)
 			}
 			resp, err := call.Get(r.Context(), path)
 			if err != nil {
 				return err
 			}
-			server.WriteJSON(w, http.StatusOK, map[string]any{"forge": json.RawMessage(resp.Body)})
+			if err := forge.Decode(resp, answer); err != nil {
+				return err
+			}
+			server.WriteJSON(w, http.StatusOK, map[string]any{"forge": answer})
 			return nil
 		},
 	}
@@ -251,6 +287,7 @@ func (w *world) get(t *testing.T, slug, path, credential string) (status int, bo
 
 // hubError is the error member of an error answer.
 type hubError struct {
+	Code    int    `json:"code"`
 	Type    string `json:"error_type"`
 	Message string `json:"message"`
 }

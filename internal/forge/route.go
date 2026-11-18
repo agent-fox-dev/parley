@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -67,7 +68,9 @@ func PathNumber(r *http.Request) (int64, error) {
 //  6. Check, a route's own refusal that needs the resolution;
 //  7. Serve, which calls the forge.
 //
-// A request refused by a step sends nothing to the forge. No step looks at
+// A failed forge call that Check or Serve returns is answered as the hub's
+// error for it (MapError), its message scrubbed of the call's token. A
+// request refused by a step sends nothing to the forge. No step looks at
 // the workspace's status: a read serves a workspace in every state.
 type Route struct {
 	Method  string
@@ -147,10 +150,30 @@ func (c *Component) serve(w http.ResponseWriter, r *http.Request, rt Route) erro
 	}
 	if rt.Check != nil {
 		if err := rt.Check(r, call); err != nil {
-			return err
+			return c.failed(w, r, call, err)
 		}
 	}
-	return rt.Serve(w, r, call)
+	return c.failed(w, r, call, rt.Serve(w, r, call))
+}
+
+// failed answers err, when it is a failed forge call, as the hub's error
+// for it (see MapError), with the forge's wait as Retry-After on a rate
+// limit, and logs it at debug level; any other error is returned as it is.
+// The message is scrubbed of the call's token before it is answered or
+// logged.
+func (c *Component) failed(w http.ResponseWriter, r *http.Request, call *Call, err error) error {
+	e, ok := MapError(err, c.deps.Scrubber, call.Resolution.Credential.Token)
+	if !ok {
+		return err
+	}
+	if c.deps.Logger != nil {
+		c.deps.Logger.LogAttrs(r.Context(), slog.LevelDebug, "forge call failed",
+			slog.String("workspace", call.Slug), slog.String("error_type", e.Type), slog.String("message", e.Message))
+	}
+	if e.RetryAfter != "" {
+		w.Header().Set("Retry-After", e.RetryAfter)
+	}
+	return e.ServerError()
 }
 
 // begin reads the workspace the request names, and for a task fork

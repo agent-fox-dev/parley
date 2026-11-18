@@ -11,12 +11,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/forge/forgetest"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // fakeClock is a clock whose sleep is recorded and returns at once.
@@ -343,7 +346,7 @@ func TestClient_FailsWithWhatWentWrong(t *testing.T) {
 			forge.FailureStatus, 404, `{"message":"Not Found"}`},
 		{"a 403 that is no rate limit", forgetest.Answer{Status: 403, Body: `{"message":"no"}`}, "", 0,
 			forge.FailureStatus, 403, `{"message":"no"}`},
-		{"a body past the size limit", forgetest.Answer{Body: strings.Repeat("x", 33)}, "", 0, forge.FailureUnreadable, 0, ""},
+		{"a body past the size limit", forgetest.Answer{Body: strings.Repeat("x", 33)}, "", 0, forge.FailureUnreadable, 200, ""},
 		{"no answer before the deadline", forgetest.Answer{Hold: true}, "", 50 * time.Millisecond, forge.FailureTimeout, 0, ""},
 		{"nobody listening", forgetest.Answer{}, goneURL, 0, forge.FailureUnreachable, 0, ""},
 	}
@@ -405,5 +408,120 @@ func TestClient_SendsARequestItsCallerHasLeft(t *testing.T) {
 
 	if err != nil || resp.Status != http.StatusOK {
 		t.Fatalf("Do = %v, %v, want the forge's 200", resp, err)
+	}
+}
+
+// The forge tokens and API URLs other tools read from a process's
+// environment, which the hub reads in neither its own nor the process's.
+var forgeEnvironment = map[string]string{
+	"GITHUB_TOKEN": "envtoken", "GH_TOKEN": "envtoken", "GITLAB_TOKEN": "envtoken",
+	"GITHUB_API_URL": "https://elsewhere.invalid", "GITLAB_API_URL": "https://elsewhere.invalid",
+}
+
+// The variables are set in the process environment, so this test does not
+// run in parallel.
+func TestForgeRoute_ReadsAnonymouslyWithoutSecretsWhateverTheEnvironmentHolds(t *testing.T) {
+	for name, value := range forgeEnvironment {
+		t.Setenv(name, value)
+	}
+	w := newWorldWith(t, hubtest.Config{Env: forgeEnvironment}, nil)
+	for slug, apiURL := range map[string]string{"gh": w.fake.GitHubURL(), "gl": w.fake.GitLabURL()} {
+		w.addWorkspace(t, workspace.Workspace{Slug: slug, GitURL: new("https://github.com/acme/widgets.git"),
+			Settings: settings(forge.SettingAPIURL, apiURL)})
+		w.fake.Script(forgetest.Answer{Body: `{"number":1}`})
+		if status, body, sent := w.get(t, slug, issuePath, w.Token); status != http.StatusOK || sent != 1 {
+			t.Errorf("%s: %d %s after %d forge requests, want 200 after 1", slug, status, body, sent)
+		}
+	}
+	for _, r := range w.fake.Requests() {
+		if r.Header.Get("Authorization") != "" || r.Header.Get("Private-Token") != "" {
+			t.Errorf("%s %s carried credentials: %v", r.Method, r.Path, r.Header)
+		}
+		for name, values := range r.Header {
+			if strings.Contains(strings.Join(values, " "), "envtoken") {
+				t.Errorf("%s %s carried the environment's token in %s", r.Method, r.Path, name)
+			}
+		}
+		if strings.Contains(r.RawPath+"?"+r.RawQuery, "envtoken") {
+			t.Errorf("%s %s?%s carried the environment's token", r.Method, r.RawPath, r.RawQuery)
+		}
+	}
+}
+
+func TestForgeRoute_AbandonsAForgeThatDoesNotAnswerInTime(t *testing.T) {
+	t.Parallel()
+	w := newWorldWith(t, hubtest.Config{}, func(_ *world, d *forge.Deps) { d.Client.Deadline = 50 * time.Millisecond })
+	w.addWorkspace(t, workspace.Workspace{Slug: "w", GitURL: new("https://github.com/acme/widgets.git"), Settings: w.github()})
+	w.fake.Script(forgetest.Answer{Hold: true})
+	start := time.Now()
+
+	status, body, _ := w.get(t, "w", issuePath, w.Token)
+
+	if status != http.StatusGatewayTimeout || errorOf(t, body).Type != forge.ErrorTypeTimeout {
+		t.Errorf("a forge that holds its answer: %d %s, want 504 %s", status, body, forge.ErrorTypeTimeout)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("the read took %v", elapsed)
+	}
+}
+
+func TestForgeRoute_FailsARateLimitItCannotWaitFor(t *testing.T) {
+	t.Parallel()
+	clock := newFakeClock()
+	var used atomic.Int64 // the clock's advance while a request is sent
+	w := newWorldWith(t, hubtest.Config{}, func(w *world, d *forge.Deps) {
+		d.Client.Now, d.Client.Sleep = clock.Now, clock.Sleep
+		d.Client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			clock.advance(time.Duration(used.Load()))
+			return w.fake.Transport().RoundTrip(r)
+		})
+	})
+	// The rows' waits are measured against the deadline of the hub's own
+	// client.
+	if d := w.forge.Client().Deadline(); d != 30*time.Second {
+		t.Fatalf("the hub's forge client gives a request %v, want 30s", d)
+	}
+	w.addWorkspace(t, workspace.Workspace{Slug: "w", GitURL: new("https://github.com/acme/widgets.git"), Settings: w.github()})
+	limited := func(h http.Header) forgetest.Answer { return forgetest.Answer{Status: 429, Header: h} }
+	reset := func(after int64) string { return strconv.FormatInt(clock.Now().Unix()+after, 10) }
+	cases := []struct {
+		name           string
+		answers        func() []forgetest.Answer
+		used           time.Duration
+		wantRequests   int
+		wantRetryAfter string
+	}{
+		{"a wait past the deadline", func() []forgetest.Answer { return []forgetest.Answer{limited(header("Retry-After", "31"))} },
+			0, 1, "31"},
+		{"no stated wait", func() []forgetest.Answer { return []forgetest.Answer{limited(nil)} }, 0, 1, ""},
+		{"403 with no requests remaining and no reset", func() []forgetest.Answer {
+			return []forgetest.Answer{{Status: 403, Header: header("X-RateLimit-Remaining", "0")}}
+		}, 0, 1, ""},
+		{"a retry limited too", func() []forgetest.Answer {
+			return []forgetest.Answer{limited(header("Retry-After", "1")), limited(header("Retry-After", "5"))}
+		}, 0, 2, "5"},
+		{"a wait past what the request left of its deadline", func() []forgetest.Answer {
+			return []forgetest.Answer{limited(header("Retry-After", "20"))}
+		}, 15 * time.Second, 1, "20"},
+		{"a reset's wait rounded up to whole seconds", func() []forgetest.Answer {
+			return []forgetest.Answer{limited(header("X-RateLimit-Reset", reset(45)))}
+		}, 500 * time.Millisecond, 1, "45"},
+	}
+	for _, c := range cases {
+		used.Store(int64(c.used))
+		w.fake.Script(c.answers()...)
+		before := w.fake.Count()
+
+		status, h, body := w.Exchange(t, http.MethodGet, "/api/v1/workspaces/w"+issuePath, w.Token, nil, nil)
+
+		if status != http.StatusTooManyRequests || errorOf(t, body).Type != forge.ErrorTypeRateLimited {
+			t.Errorf("%s: %d %s, want 429 %s", c.name, status, body, forge.ErrorTypeRateLimited)
+		}
+		if n := w.fake.Count() - before; n != c.wantRequests {
+			t.Errorf("%s: the forge received %d requests, want %d", c.name, n, c.wantRequests)
+		}
+		if got, ok := h["Retry-After"]; strings.Join(got, ",") != c.wantRetryAfter || ok != (c.wantRetryAfter != "") {
+			t.Errorf("%s: Retry-After %q, want %q", c.name, got, c.wantRetryAfter)
+		}
 	}
 }
