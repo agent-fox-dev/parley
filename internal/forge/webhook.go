@@ -53,11 +53,14 @@ type webhookAnswer struct {
 // task fork to its parent: a fork has no origin to receive deliveries for,
 // and these routes refuse it.
 func (c *Component) webhookRoutes() []server.Route {
-	return []server.Route{{
-		Method: http.MethodPut, Pattern: "/workspaces/:slug/forge/webhook", Scope: ScopeWrite,
-		Marks:   map[string]string{access.MarkNeed: string(access.NeedWrite)},
-		Handler: c.setWebhook,
-	}}
+	route := func(method string, handler func(http.ResponseWriter, *http.Request) error) server.Route {
+		return server.Route{
+			Method: method, Pattern: "/workspaces/:slug/forge/webhook", Scope: ScopeWrite,
+			Marks:   map[string]string{access.MarkNeed: string(access.NeedWrite)},
+			Handler: handler,
+		}
+	}
+	return []server.Route{route(http.MethodPut, c.setWebhook), route(http.MethodDelete, c.unsetWebhook)}
 }
 
 // setWebhook stores the workspace's webhook secret, the one the body gives
@@ -112,6 +115,37 @@ func (c *Component) setWebhook(w http.ResponseWriter, r *http.Request) error {
 		answer.Secret = value
 	}
 	server.WriteJSON(w, http.StatusOK, answer)
+	return nil
+}
+
+// unsetWebhook removes the workspace's webhook secret and records its
+// event, whether or not a secret existed, in the same store transaction.
+// It serves an archived workspace too, so that its ingress can be turned
+// off, and refuses only a task fork after the pipeline's scope and access
+// checks.
+func (c *Component) unsetWebhook(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	d, _ := access.DecisionOf(r)
+	slug := d.Record.Slug
+	if err := refuseFork(d.Record); err != nil {
+		return err
+	}
+	actorType, actorID := actorOf(ctx)
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		existed, err := c.deps.SecretWriter.Delete(ctx, tx, secret.ScopeWorkspace, slug, SecretWebhook)
+		if err != nil {
+			return err
+		}
+		_, err = c.deps.Log.Emit(ctx, tx, event.Input{
+			Type: "parley.forge.webhook.unset", Workspace: &slug, ActorType: actorType, ActorID: actorID,
+			ResourceType: "webhook", ResourceID: slug, Metadata: map[string]any{"existed": existed},
+		})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("remove the webhook secret of %s: %w", slug, err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
 

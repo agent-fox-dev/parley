@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -110,12 +111,17 @@ func (w *world) wantWebhookSet(t *testing.T, slug string, generated bool) {
 	if len(got) != 1 {
 		t.Fatalf("the log holds %d webhook events of %s, want 1: %+v", len(got), slug, got)
 	}
-	e := got[0]
-	if e.Type != "parley.forge.webhook.set" || e.ResourceType != "webhook" || e.ResourceID != slug || e.Action != "set" ||
-		e.ActorType != event.ActorAPIKey || e.ActorID == nil || *e.ActorID != w.owner ||
-		!sameJSON(e.Metadata, fmt.Sprintf(`{"generated":%t}`, generated)) {
-		t.Errorf("the webhook event of %s = %+v (metadata %s), want parley.forge.webhook.set of webhook %s, action set, by the owner's key, generated %t",
-			slug, e, e.Metadata, slug, generated)
+	w.wantWebhookEvent(t, got[0], slug, "set", fmt.Sprintf(`{"generated":%t}`, generated))
+}
+
+// wantWebhookEvent fails the test unless e is the webhook event action of
+// slug, by the owner's API key, with the metadata given.
+func (w *world) wantWebhookEvent(t *testing.T, e event.Record, slug, action, metadata string) {
+	t.Helper()
+	if e.Type != "parley.forge.webhook."+action || e.ResourceType != "webhook" || e.ResourceID != slug || e.Action != action ||
+		e.ActorType != event.ActorAPIKey || e.ActorID == nil || *e.ActorID != w.owner || !sameJSON(e.Metadata, metadata) {
+		t.Errorf("the webhook event of %s = %+v (metadata %s), want parley.forge.webhook.%s of webhook %s, action %s, by the owner's key, metadata %s",
+			slug, e, e.Metadata, action, slug, action, metadata)
 	}
 }
 
@@ -389,5 +395,171 @@ func TestWebhookSet_RefusesWithoutAKeyOrRoomForTheSecret(t *testing.T) {
 		if n := len(w.logged(t, "parley.forge.webhook.", slug)); n != 0 {
 			t.Errorf("the log holds %d webhook events of %s, want none", n, slug)
 		}
+	}
+}
+
+func TestWebhookUnset_RemovesTheSecretInAnyStateAndRecordsWhetherOneExisted(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	cases := []struct {
+		name     string
+		archived bool
+		// put sets the secret over the API first; key, when it is not "",
+		// stores it under that key.
+		put     bool
+		key     string
+		deletes int
+		existed bool
+	}{
+		{"a secret set over the API", false, true, "", 1, true},
+		{"a secret stored under another casing of its key", false, false, "forge_webhook_secret", 1, true},
+		{"an archived workspace", true, false, forge.SecretWebhook, 1, true},
+		{"no secret, twice", false, false, "", 2, false},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			slug := fmt.Sprintf("unset%d", i)
+			ws := workspace.Workspace{Slug: slug}
+			if c.archived {
+				ws.Status = workspace.StatusArchived
+			}
+			w.addWorkspace(t, ws)
+			w.fillSecrets(t, slug, 1)
+			if c.put {
+				if status, body, _ := w.putWebhook(t, slug, w.ownerKey, nil); status != http.StatusOK {
+					t.Fatalf("PUT %s = %d %s, want 200", slug, status, body)
+				}
+			}
+			if c.key != "" {
+				w.putSecret(t, slug, c.key, "the-value-before-0123")
+			}
+			for range c.deletes {
+				if status, body, _ := w.send(t, http.MethodDelete, slug, webhookPath, w.ownerKey, nil); status != http.StatusNoContent || len(body) != 0 {
+					t.Errorf("DELETE %s = %d %q, want 204 with no body", slug, status, body)
+				}
+			}
+			if got, n := w.webhookSecret(t, slug), w.secretCount(t, slug); got != "" || n != 1 {
+				t.Errorf("%s holds the webhook secret %q and %d secrets, want no webhook secret and its other secret", slug, got, n)
+			}
+			got := w.logged(t, "parley.forge.webhook.unset", slug)
+			if len(got) != c.deletes {
+				t.Fatalf("the log holds %d unset events of %s, want %d", len(got), slug, c.deletes)
+			}
+			for _, e := range got {
+				w.wantWebhookEvent(t, e, slug, "unset", fmt.Sprintf(`{"existed":%t}`, c.existed))
+			}
+		})
+	}
+	if n := len(w.logged(t, "parley.secret.", "")); n != 0 {
+		t.Errorf("the log holds %d secret events, want none", n)
+	}
+}
+
+func TestWebhookUnset_RefusesByScopeAccessAndFork(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo"})
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo--t1", ParentSlug: new("demo")})
+	const before = "the-value-before-0123"
+	for _, slug := range []string{"demo", "demo--t1"} {
+		w.putSecret(t, slug, forge.SecretWebhook, before)
+	}
+	readPAT := w.pat(t, w.owner, "", forge.ScopeRead)
+
+	cases := []struct {
+		name, credential, slug string
+		status                 int
+		errorType              string
+	}{
+		{"a PAT with forge:read only", readPAT, "demo", http.StatusForbidden, "insufficient_scope"},
+		{"a user without access", w.outKey, "demo", http.StatusNotFound, "not_found"},
+		{"a member who can only read", w.memberKey, "demo", http.StatusForbidden, "forbidden"},
+		{"a task fork", w.ownerKey, "demo--t1", http.StatusBadRequest, "fork_has_no_origin"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, body, _ := w.send(t, http.MethodDelete, c.slug, webhookPath, c.credential, nil)
+			if e := errorOf(t, body); status != c.status || e.Type != c.errorType {
+				t.Errorf("DELETE %s = %d %s, want %d %s", c.slug, status, body, c.status, c.errorType)
+			}
+			for _, slug := range []string{"demo", "demo--t1"} {
+				if got := w.webhookSecret(t, slug); got != before {
+					t.Errorf("the webhook secret of %s = %q, want %q", slug, got, before)
+				}
+			}
+			if n := len(w.logged(t, "parley.forge.webhook.", "")); n != 0 {
+				t.Errorf("the log holds %d webhook events, want none", n)
+			}
+		})
+	}
+}
+
+func TestWebhook_SendsNoRequestToTheForge(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.addWorkspace(t, workspace.Workspace{Slug: "demo", GitURL: new("https://github.com/acme/widgets.git"), Settings: w.github()})
+	requests := []struct {
+		method string
+		body   any
+		status int
+	}{
+		{http.MethodPut, nil, http.StatusOK},
+		{http.MethodPut, map[string]any{"secret": "0123456789abcdef"}, http.StatusOK},
+		{http.MethodDelete, nil, http.StatusNoContent},
+	}
+	for _, r := range requests {
+		if status, body, sent := w.send(t, r.method, "demo", webhookPath, w.ownerKey, r.body); status != r.status || sent != 0 {
+			t.Errorf("%s demo = %d %s with %d requests to the forge, want %d and none", r.method, status, body, sent, r.status)
+		}
+	}
+}
+
+// errLogBroken is the failure of every event of brokenLog.
+var errLogBroken = errors.New("the event log cannot be written")
+
+// brokenLog is an event log that records no event.
+type brokenLog struct{}
+
+func (brokenLog) Emit(context.Context, *sql.Tx, event.Input) (event.Record, error) {
+	return event.Record{}, errLogBroken
+}
+
+func TestWebhook_KeepsTheSecretAsItWasWhenItsEventCannotBeRecorded(t *testing.T) {
+	t.Parallel()
+	w := newWorldWith(t, hubtest.Config{}, func(_ *world, d *forge.Deps) { d.Log = brokenLog{} })
+	const held, given = "the-secret-held-0123", "the-secret-given-0123"
+	cases := []struct {
+		name, method string
+		// held is the webhook secret stored before the request, "" for none.
+		held string
+		body any
+	}{
+		{"a PUT on a workspace without a secret", http.MethodPut, "", map[string]any{"secret": given}},
+		{"a PUT on a workspace holding a secret", http.MethodPut, held, map[string]any{"secret": given}},
+		{"a DELETE on a workspace holding a secret", http.MethodDelete, held, nil},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			slug := fmt.Sprintf("nolog%d", i)
+			w.addWorkspace(t, workspace.Workspace{Slug: slug})
+			if c.held != "" {
+				w.putSecret(t, slug, forge.SecretWebhook, c.held)
+			}
+			status, body, _ := w.send(t, c.method, slug, webhookPath, w.ownerKey, c.body)
+			if e := errorOf(t, body); status != http.StatusInternalServerError || e.Type != "internal" {
+				t.Errorf("%s %s = %d %s, want 500 internal", c.method, slug, status, body)
+			}
+			for _, leak := range []string{errLogBroken.Error(), held, given} {
+				if strings.Contains(string(body), leak) {
+					t.Errorf("the answer %s holds %q", body, leak)
+				}
+			}
+			if got := w.webhookSecret(t, slug); got != c.held {
+				t.Errorf("the webhook secret of %s = %q, want %q", slug, got, c.held)
+			}
+			if n := len(w.logged(t, "parley.forge.webhook.", slug)); n != 0 {
+				t.Errorf("the log holds %d webhook events of %s, want none", n, slug)
+			}
+		})
 	}
 }
