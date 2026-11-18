@@ -51,6 +51,13 @@ const ErrorTypeCredentialMissing = "forge_credential_missing"
 // answered without its event.
 type writeRoute struct {
 	method, pattern string
+	// create marks a route that creates something on the forge: a request
+	// sent again with its Idempotency-Key is answered with the first
+	// answer once the platform's checks passed, before the frame runs, so
+	// that it neither reaches the forge nor records an event. A route that
+	// creates nothing, such as the close or the addition of labels, leaves
+	// it false and carries out every request.
+	create bool
 	// event is the kind of the event the route records.
 	event eventKind
 	// before checks the path parameters and the body, and keeps what it
@@ -117,24 +124,24 @@ func (e writeEvent) resourceID() string {
 // writeRoutes are the forge write routes.
 func (c *Component) writeRoutes() []server.Route {
 	return []server.Route{
-		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues",
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues", create: true,
 			event: eventKind{"parley.forge.issue.create", "issue"}, before: readIssueCreate, serve: createIssue}),
 		c.writeRoute(writeRoute{method: http.MethodPatch, pattern: "/workspaces/:slug/issues/:number",
 			event: eventKind{"parley.forge.issue.update", "issue"}, before: readIssueUpdate, after: refuseAssigneesAlone,
 			serve: updateIssue}),
 		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/close",
 			event: eventKind{"parley.forge.issue.close", "issue"}, before: readIssueClose, serve: closeIssue}),
-		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/comments",
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/comments", create: true,
 			event: eventKind{"parley.forge.comment.create", "comment"}, before: readComment, serve: commentOnIssue}),
-		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls/:number/comments",
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls/:number/comments", create: true,
 			event: eventKind{"parley.forge.pull_request.comment", "pull_request"}, before: readComment, serve: commentOnPull}),
 		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues/:number/labels",
 			event: eventKind{"parley.forge.label.add", "label"}, before: readLabelsAdd, serve: addLabels}),
 		c.writeRoute(writeRoute{method: http.MethodDelete, pattern: "/workspaces/:slug/issues/:number/labels/:name",
 			event: eventKind{"parley.forge.label.remove", "label"}, before: readLabelRemove, serve: removeLabel}),
-		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/labels",
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/labels", create: true,
 			event: eventKind{"parley.forge.label.create", "label"}, before: readLabelEnsure, serve: ensureLabel}),
-		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls",
+		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/pulls", create: true,
 			event: eventKind{"parley.forge.pull_request.create", "pull_request"}, before: readPullOpen, serve: openPull}),
 	}
 }
@@ -179,7 +186,7 @@ func (c *Component) writeRoute(wr writeRoute) server.Route {
 			return c.serveWrite(w, r, call, wr)
 		},
 	})
-	rt.MaxBodySize = maxWriteBody
+	rt.MaxBodySize, rt.Create = maxWriteBody, wr.create
 	return rt
 }
 

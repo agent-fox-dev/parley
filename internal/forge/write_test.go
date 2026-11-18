@@ -830,3 +830,84 @@ func TestWriteRoute_AnswersInternalWhenItsEventCannotBeRecorded(t *testing.T) {
 			ok, sent, w.fake.Last(t).Method)
 	}
 }
+
+func TestWriteRoute_ReplaysOnlyACreateSentAgainWithItsIdempotencyKey(t *testing.T) {
+	t.Parallel()
+	w := eventWorld(t, nil)
+	w.seedIssue(ghRepo)
+	// keyed sends POST demo<path> as the owner with body and the
+	// Idempotency-Key key, and returns the answer, how many requests the
+	// forge received meanwhile and how many events were recorded.
+	keyed := func(t *testing.T, key, path string, body any) (status int, answer []byte, sent, events int) {
+		t.Helper()
+		before, n := w.fake.Count(), w.rec.count()
+		status, answer = w.CallWith(t, http.MethodPost, "/api/v1/workspaces/demo"+path, w.ownerKey, body,
+			http.Header{"Idempotency-Key": {key}})
+		return status, answer, w.fake.Count() - before, w.rec.count() - n
+	}
+	creates := []struct {
+		path        string
+		body, other any
+	}{
+		{"/issues", map[string]any{"title": "t"}, map[string]any{"title": "u"}},
+		{"/issues/7/comments", map[string]any{"body": "b"}, map[string]any{"body": "c"}},
+		{"/pulls/12/comments", map[string]any{"body": "b"}, map[string]any{"body": "c"}},
+		{"/labels", map[string]any{"name": "triage"}, map[string]any{"name": "triage", "color": "ffffff"}},
+		{"/pulls", map[string]any{"title": "t", "head": "feature", "base": "main"},
+			map[string]any{"title": "u", "head": "feature", "base": "main"}},
+	}
+	for _, c := range creates {
+		t.Run("POST "+c.path+" sent again", func(t *testing.T) {
+			first, answer, sent, events := keyed(t, "k1", c.path, c.body)
+			if (first != http.StatusOK && first != http.StatusCreated) || sent == 0 || events != 1 {
+				t.Fatalf("the first POST demo%s = %d %.300s after %d forge requests and %d events, want success and one event",
+					c.path, first, answer, sent, events)
+			}
+			status, again, sent, events := keyed(t, "k1", c.path, c.body)
+			if status != http.StatusOK || string(again) != string(answer) || sent != 0 || events != 0 {
+				t.Errorf("the replay = %d %.300s after %d forge requests and %d events, want 200 %.300s and nothing sent or recorded",
+					status, again, sent, events, answer)
+			}
+			status, refused, sent, events := keyed(t, "k1", c.path, c.other)
+			if e := errorOf(t, refused); status != http.StatusConflict || e.Type != "conflict" || sent != 0 || events != 0 {
+				t.Errorf("the key with another body = %d %.300s after %d forge requests and %d events, want 409 conflict and nothing sent or recorded",
+					status, refused, sent, events)
+			}
+		})
+	}
+	t.Run("POST /issues sent again after the forge failed it", func(t *testing.T) {
+		w.fake.Script(forgetest.Answer{Status: http.StatusInternalServerError, Body: `{"message":"down"}`})
+		body := map[string]any{"title": "retried"}
+		failed, answer, sent, events := keyed(t, "k-failed", "/issues", body)
+		if failed != http.StatusBadGateway || sent != 1 || events != 1 {
+			t.Fatalf("the first POST demo/issues = %d %.300s after %d forge requests and %d events, want 502 after one of each",
+				failed, answer, sent, events)
+		}
+		status, answer, sent, events := keyed(t, "k-failed", "/issues", body)
+		if status != http.StatusCreated || sent != 1 || events != 1 {
+			t.Errorf("the retry = %d %.300s after %d forge requests and %d events, want 201 after one of each",
+				status, answer, sent, events)
+		}
+	})
+	// The close and the addition of labels create nothing, so they are
+	// carried out every time, whatever their key.
+	for _, rt := range []struct {
+		path   string
+		body   any
+		status int
+		forge  string
+	}{
+		{"/issues/7/close", map[string]any{}, http.StatusOK, ghRepo + "/issues/7"},
+		{"/issues/7/labels", []string{"a"}, http.StatusNoContent, ghRepo + "/issues/7/labels"},
+	} {
+		t.Run("POST "+rt.path+" sent again", func(t *testing.T) {
+			for range 2 {
+				status, answer, sent, events := keyed(t, "k2", rt.path, rt.body)
+				if last := w.fake.Last(t); status != rt.status || sent != 1 || last.Path != rt.forge || events != 1 {
+					t.Errorf("POST demo%s = %d %.300s after %d forge requests, the last to %s, and %d events, want %d after one write to %s and one event",
+						rt.path, status, answer, sent, last.Path, events, rt.status, rt.forge)
+				}
+			}
+		})
+	}
+}
