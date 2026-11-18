@@ -147,7 +147,8 @@ const (
 	// is no rate limit. Status, Header and Body are its answer.
 	FailureStatus FailureKind = "status"
 	// FailureUnreadable: the answer's body could not be read, or is larger
-	// than the client's size limit.
+	// than the client's size limit on an answer below 400. An error
+	// answer past the limit keeps its kind, its body cut at the limit.
 	FailureUnreadable FailureKind = "unreadable"
 	// FailureUnreachable: the forge could not be reached: its name did not
 	// resolve, the connection or the TLS handshake failed.
@@ -266,8 +267,15 @@ func (c *Client) send(ctx context.Context, req Request) (*Response, error) {
 		return nil, &Failure{Kind: FailureUnreadable, Status: resp.StatusCode, Header: resp.Header, Err: err}
 	}
 	if int64(len(body)) > c.maxBody {
-		return nil, &Failure{Kind: FailureUnreadable, Status: resp.StatusCode, Header: resp.Header,
-			Err: fmt.Errorf("the body is larger than %d bytes", c.maxBody)}
+		// An error answer is judged by its status, a rate limit included;
+		// its body only lends the message, which the limit's worth of it
+		// holds.
+		if resp.StatusCode >= http.StatusBadRequest {
+			body = body[:c.maxBody]
+		} else {
+			return nil, &Failure{Kind: FailureUnreadable, Status: resp.StatusCode, Header: resp.Header,
+				Err: fmt.Errorf("the body is larger than %d bytes", c.maxBody)}
+		}
 	}
 	return &Response{Status: resp.StatusCode, Header: resp.Header, Body: body}, nil
 }

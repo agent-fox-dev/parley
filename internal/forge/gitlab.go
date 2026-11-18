@@ -285,6 +285,13 @@ var gitlabJobDone = map[string]string{
 	"success": CheckSuccess, "failed": CheckFailure, "canceled": CheckCancelled, "skipped": CheckSkipped,
 }
 
+// checkAnchor accepts the id of the pipeline the first page read the jobs
+// of: a positive decimal integer, without sign or leading zero.
+func (gitlab) checkAnchor(anchor string) bool {
+	id, err := strconv.ParseInt(anchor, 10, 64)
+	return err == nil && id > 0 && strconv.FormatInt(id, 10) == anchor
+}
+
 // checks reads the jobs of the merge request's latest pipeline, the first
 // its pipeline list names. The first page finds the pipeline; later pages
 // read the one it found, so a pipeline started meanwhile does not mix two
@@ -343,7 +350,9 @@ const phaseNotes = "notes"
 // people, oldest first. The approvals fill pages first; the page on which
 // they end is filled up with notes, and the notes are then read in pages of
 // the size that page had left, so that no page is longer than the limit.
-// System notes are left out once the forge has paged.
+// When the approvals fill that page, the notes are read in pages of the
+// limit, and a next page is named only if a note page of one entry finds a
+// note. System notes are left out once the forge has paged.
 func (gitlab) reviews(ctx context.Context, call *Call, iid int64, p Paging) ([]Review, *Position, error) {
 	mr := gitlabMRPath(call.Resolution.Repository, iid)
 	reviews := []Review{}
@@ -370,14 +379,22 @@ func (gitlab) reviews(ctx context.Context, call *Call, iid int64, p Paging) ([]R
 		case end < len(all):
 			return reviews, &Position{Page: p.Page + 1, Size: p.Size}, nil
 		case left == 0:
+			// The approvals fill the page: the notes follow on the next
+			// one only if there is a note, which the first note page of
+			// one entry tells.
+			first := Paging{Position: Position{Page: 1, Size: 1}}
+			page, resp, err := gitlabNotes(ctx, call, mr, first)
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(page) == 0 && first.Next(resp.Header) == nil {
+				return reviews, nil, nil
+			}
 			return reviews, &Position{Page: 1, Size: p.Size, Phase: phaseNotes, PhaseSize: p.Size}, nil
 		}
 		notes.Position = Position{Page: 1, Size: left}
 	}
-	q := url.Values{"sort": {"asc"}, "order_by": {"created_at"}}
-	notes.Query(q)
-	var page []gitlabNote
-	resp, err := getJSONResponse(ctx, call, mr+"/notes?"+q.Encode(), &page)
+	page, resp, err := gitlabNotes(ctx, call, mr, notes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -396,4 +413,14 @@ func (gitlab) reviews(ctx context.Context, call *Call, iid int64, p Paging) ([]R
 		next = &Position{Page: next.Page, Size: p.Size, Phase: phaseNotes, PhaseSize: notes.Size}
 	}
 	return reviews, next, nil
+}
+
+// gitlabNotes reads the page p of the notes of the merge request at the API
+// path mr, oldest first.
+func gitlabNotes(ctx context.Context, call *Call, mr string, p Paging) ([]gitlabNote, *Response, error) {
+	q := url.Values{"sort": {"asc"}, "order_by": {"created_at"}}
+	p.Query(q)
+	var page []gitlabNote
+	resp, err := getJSONResponse(ctx, call, mr+"/notes?"+q.Encode(), &page)
+	return page, resp, err
 }

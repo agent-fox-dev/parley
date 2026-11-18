@@ -2,12 +2,9 @@ package forge
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
-	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -113,44 +110,7 @@ func APIURL(kind ForgeKind, setting, host string) string {
 // the rule the settings route stores the value by, checked again at use
 // because a stored value is not the forge's to trust.
 func CheckAPIURL(setting string) error {
-	if setting == "" {
-		return nil
-	}
-	if strings.ContainsFunc(setting, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
-		return errors.New("must not hold white space or control characters")
-	}
-	u, err := url.Parse(setting)
-	switch {
-	case err != nil || !strings.HasPrefix(setting, "https://") || u.Hostname() == "":
-		return errors.New(`must be "" or an absolute https:// URL with a host`)
-	case !validPort(u):
-		return errors.New("must have a port from 1 to 65535 if it names one")
-	case u.User != nil:
-		return errors.New("must not hold user information")
-	case u.RawQuery != "" || u.ForceQuery:
-		return errors.New("must not hold a query")
-	case u.Fragment != "" || strings.Contains(setting, "#"):
-		return errors.New("must not hold a fragment")
-	}
-	return nil
-}
-
-// validPort reports whether u names no port, or one from 1 to 65535 in
-// decimal digits; url.Parse lets an empty port and one out of range through.
-func validPort(u *url.URL) bool {
-	host := u.Host
-	if i := strings.LastIndexByte(host, ']'); i >= 0 {
-		host = host[i+1:] // the colons of an IPv6 address are not a port
-	}
-	_, p, found := strings.Cut(host, ":")
-	if !found {
-		return true
-	}
-	if p == "" || strings.Trim(p, "0123456789") != "" {
-		return false
-	}
-	n, err := strconv.Atoi(p)
-	return err == nil && n >= 1 && n <= 65535
+	return workspace.ValidateForgeURL(setting)
 }
 
 // ResolveCredential reads the credential of the target from the secrets of

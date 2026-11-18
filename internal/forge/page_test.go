@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
@@ -165,11 +166,23 @@ func TestForgeList(t *testing.T) {
 		for _, route := range listRoutes[:2] {
 			route.seed(w, forge.KindGitHub, 5)
 		}
+		for _, route := range listRoutes[3:] {
+			for kind := range slugs {
+				route.seed(w, kind, 5)
+			}
+		}
 		first, _ := w.list(t, "carry", "/issues?limit=2&state=open")
 		comments, _ := w.list(t, "carry", "/issues/1/comments?limit=2")
-		if first.NextCursor == nil || comments.NextCursor == nil {
-			t.Fatal("carry/issues?limit=2&state=open or carry/issues/1/comments?limit=2 has next_cursor null")
+		ghChecks, _ := w.list(t, "gh", "/pulls/1/checks?limit=2")
+		glChecks, _ := w.list(t, "gl", "/pulls/1/checks?limit=2")
+		glReviews, _ := w.list(t, "gl", "/pulls/1/reviews?limit=2")
+		if first.NextCursor == nil || comments.NextCursor == nil || ghChecks.NextCursor == nil || glChecks.NextCursor == nil ||
+			glReviews.NextCursor == nil {
+			t.Fatal("a first page of two of a list of five has next_cursor null")
 		}
+		// A page whose first entry lies past what an int can count once
+		// multiplied by the page size.
+		const farPage = `{"page":4611686018427387905,"size":2}`
 		c := url.QueryEscape(*first.NextCursor)
 		if _, sent := w.list(t, "carry", "/issues?state=open&cursor="+c); sent != 1 {
 			t.Fatalf("the cursor's own query sent %d forge requests, want 1", sent)
@@ -190,6 +203,16 @@ func TestForgeList(t *testing.T) {
 			{"a phase without its page size", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"page":2,"size":2,"phase":"notes"}`)},
 			{"a phase page size past the page size", "carry", "/issues?state=open&cursor=" +
 				withPosition(t, *first.NextCursor, `{"page":2,"size":2,"phase":"notes","phase_size":3}`)},
+			{"a page past the forge's reach", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, farPage)},
+			{"GitLab's approvals past the forge's reach", "gl", "/pulls/1/reviews?cursor=" + withPosition(t, *glReviews.NextCursor, farPage)},
+		}
+		for _, anchor := range []string{"", "..", "../../../user", "0123456789abcdef", headSHA + "0", strings.ToUpper(headSHA), "g" + headSHA[1:]} {
+			cases = append(cases, struct{ name, slug, path string }{"a GitHub check run anchor " + anchor, "gh",
+				"/pulls/1/checks?cursor=" + withPosition(t, *ghChecks.NextCursor, fmt.Sprintf(`{"page":2,"size":2,"anchor":%q}`, anchor))})
+		}
+		for _, anchor := range []string{"", "..", "7/../8", "0", "07", "-7", "+7", "7e3", "99999999999999999999", headSHA} {
+			cases = append(cases, struct{ name, slug, path string }{"a GitLab check run anchor " + anchor, "gl",
+				"/pulls/1/checks?cursor=" + withPosition(t, *glChecks.NextCursor, fmt.Sprintf(`{"page":2,"size":2,"anchor":%q}`, anchor))})
 		}
 		for _, c := range cases {
 			status, body, sent := w.get(t, c.slug, c.path, w.Token)

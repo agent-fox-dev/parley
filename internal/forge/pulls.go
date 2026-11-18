@@ -22,7 +22,8 @@ func (c *Component) pullRoutes() []server.Route {
 		read("", readIssueNumber, servePull),
 		read("/state", readIssueNumber, servePullState),
 		read("/files", readComments, servePullList(api.files)),
-		read("/checks", readComments, servePullList(api.checks)),
+		c.Route(Route{Method: http.MethodGet, Pattern: pullPattern + "/checks", Scope: ScopeRead, Need: access.NeedRead,
+			Params: readComments, Check: checkAnchor, Serve: servePullList(api.checks)}),
 		read("/reviews", readReviews, servePullList(api.reviews)),
 	}
 }
@@ -34,6 +35,16 @@ func readReviews(r *http.Request, call *Call) error {
 		return err
 	}
 	if phase := call.Params.(issueRequest).paging.Phase; phase != "" && phase != phaseNotes {
+		return server.InvalidRequest("cursor is malformed or belongs to another query")
+	}
+	return nil
+}
+
+// checkAnchor refuses a check run cursor whose anchor is not what the
+// forge's first page can have found: the anchor goes into the path of the
+// forge request, so a forged one must not steer it elsewhere.
+func checkAnchor(_ *http.Request, call *Call) error {
+	if p := call.Params.(issueRequest).paging; p.Continued && !apiOf(call.Resolution.Kind).checkAnchor(p.Anchor) {
 		return server.InvalidRequest("cursor is malformed or belongs to another query")
 	}
 	return nil

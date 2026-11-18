@@ -6854,7 +6854,9 @@ goes through the proxy `HTTPS_PROXY` or `HTTP_PROXY` names, directly for a
 host `NO_PROXY` lists (see [configuration.md](configuration.md)). A redirect
 is followed only to the same scheme, host and port, at most 10 times. Each
 request has a deadline of 30 seconds, its body read included, and a body is
-read up to 8,388,608 bytes. A route that needs several forge requests gives
+read up to 8,388,608 bytes: a successful answer with a longer body cannot be
+read, while an error answer, a rate limit included, is judged by its status
+and its body cut there. A route that needs several forge requests gives
 each its own deadline. An answer is rate limited when its status is `429`,
 or `403` with `X-RateLimit-Remaining: 0` or a `Retry-After` header; its
 stated wait is `Retry-After` in seconds, else the reset time in
@@ -6873,12 +6875,13 @@ the time left of its deadline.
 | the forge answers `401` | `502` | `forge_unauthenticated` |
 | the forge answers `403`, not a rate limit | `502` | `forge_forbidden` |
 | the forge answers another `4xx` | `422` | `forge_rejected` |
-| the forge answers `5xx`, or a body the hub cannot read (over 8,388,608 bytes, not the JSON expected) | `502` | `forge_error` |
+| the forge answers `5xx`, or a successful answer whose body the hub cannot read (over 8,388,608 bytes, not the JSON expected) | `502` | `forge_error` |
 | the connection fails (name resolution, TCP, TLS) | `502` | `forge_unreachable` |
 
 The message is `the forge answered <status>: <the forge's message>`, the
-forge's message being the body's member `message`, else `error`, a value
-that is not a string in its JSON form (`the forge answered 400:
+forge's message being the body's member `message`, else (when `message` is
+absent, `null` or `""`) `error`, a value that is not a string in its JSON
+form (`the forge answered 400:
 {"title":["is too long"]}`); `the forge answered <status>` when it gave
 none; a plain description when the forge gave no answer (`the forge did not
 answer within the request's deadline`, `the forge could not be reached: …`).
@@ -6901,10 +6904,14 @@ merge request, and a project is addressed by its URL-encoded path.
 their own: a forge pages by page number and page size, so a request with a
 cursor reads with the cursor's page size, and a `limit` given with a cursor
 must equal it (`400` `invalid_request`, `limit must be left out or equal the
-cursor's page size, <n>`). `next_cursor` is `null` when the forge names no
-next page (`Link` header, `rel="next"`). A page may hold fewer than `limit`
-items when the hub drops entries after the forge paged (GitHub's pull
-requests from the issue list, GitLab's system notes), and is not refilled.
+cursor's page size, <n>`). Because the forge pages by number, an entry added
+or removed on the forge between two requests can make the next page repeat
+an entry or skip one: the guarantee of [Lists](#lists) that a page continues
+after the last item written does not hold for these lists. `next_cursor` is
+`null` on the last page, when the forge names no next page (`Link` header,
+`rel="next"`). A page may hold fewer than `limit` items when the hub drops
+entries after the forge paged (GitHub's pull requests from the issue list,
+GitLab's system notes), and is not refilled.
 
 ## `GET /api/v1/workspaces/{slug}/forge`
 
@@ -6928,7 +6935,7 @@ whole document describes the parent, with the parent's slug in
 |---|---|
 | `200 OK` | the document |
 | `422` `forge_api_url_invalid` | `forge_api_url`, or `upstream_forge_api_url` where the upstream applies, is not a valid API URL |
-| `500` `internal` | a secret cannot be read |
+| `500` `internal` | a secret cannot be read, or the webhook delivery provider fails |
 
 ```json
 {"forge":"github","api_url":"https://api.github.com","repository":{"host":"github.com","owner":"acme","name":"widgets"},"credential":"pat","upstream":null,"webhook":{"configured":false,"url":"https://hub.example.com/hooks/forge/widgets","last_delivery_at":null}}
@@ -7037,7 +7044,9 @@ or `dismissed`. GitHub's pending reviews are left out. On GitLab the
 approvals come first, in the forge's order, as `approved` with `body` `""`
 and `submitted_at` `null` (the forge reports no time for them), then the
 non-system notes as `commented`, oldest first; no page is longer than
-`limit`.
+`limit`. When the approvals end exactly at the end of a page, the hub asks
+the forge for one note to learn whether any follows, and `next_cursor` is
+`null` when none does.
 
 ## Admin routes
 

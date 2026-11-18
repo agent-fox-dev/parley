@@ -2,6 +2,7 @@ package forge
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -14,6 +15,11 @@ import (
 // maxPageSize is the largest page a forge list reads, the bound of a list's
 // limit.
 const maxPageSize = 200
+
+// maxPage is the largest forge page a cursor may name: the place of its
+// first entry, (page-1)*size, then fits in an int32 for every page size, so
+// a forged cursor cannot overflow it, and no forge pages that far.
+const maxPage = math.MaxInt32 / maxPageSize
 
 // Position is where a forge list continues: the number of the forge's page,
 // from 1, the page size, and the anchor of a list that is read from one
@@ -61,7 +67,7 @@ func ReadPaging(r *http.Request) (Paging, error) {
 	if err != nil || !continued {
 		return p, err
 	}
-	if pos.Page < 1 || pos.Size < 1 || pos.Size > maxPageSize || (pos.Phase == "") != (pos.PhaseSize == 0) ||
+	if pos.Page < 1 || pos.Page > maxPage || pos.Size < 1 || pos.Size > maxPageSize || (pos.Phase == "") != (pos.PhaseSize == 0) ||
 		pos.PhaseSize < 0 || pos.PhaseSize > pos.Size {
 		return Paging{}, server.InvalidRequest("cursor is malformed or belongs to another query")
 	}

@@ -102,7 +102,9 @@ func TestPullRequest(t *testing.T) {
 				t.Errorf("%s: the pull request has the members %v, want %v", c.name, keys, pullMembers)
 			}
 			var want map[string]any
-			_ = json.Unmarshal([]byte(c.want), &want)
+			if err := json.Unmarshal([]byte(c.want), &want); err != nil {
+				t.Fatalf("%s: the wanted pull request does not decode: %v", c.name, err)
+			}
 			for name, v := range want {
 				if got, _ := json.Marshal(pull[name]); !sameJSON(got, mustMarshal(v)) {
 					t.Errorf("%s: %s = %s, want %s", c.name, name, got, mustMarshal(v))
@@ -295,15 +297,22 @@ func TestPullRequest(t *testing.T) {
 			notes = append(notes, gitlabNote(i, fmt.Sprintf("n%d", i), false))
 		}
 		w.fake.SetList(glProject+"/merge_requests/13/notes", notes...)
+		// The first page reads the notes one at a time: to fill the place
+		// the approvals left, or, when they left none, to learn whether a
+		// note follows.
 		for limit, notesSize := range map[int]string{3: "1", 2: "2"} {
 			var all []string
 			path := fmt.Sprintf("/pulls/13/reviews?limit=%d", limit)
 			for page := 1; ; page++ {
+				want := notesSize
+				if page == 1 {
+					want = "1"
+				}
 				before := len(w.fake.Requests())
 				l, _ := w.list(t, "gl", path)
 				for _, r := range w.fake.Requests()[before:] {
-					if q, _ := url.ParseQuery(r.RawQuery); r.RawPath == glProject+"/merge_requests/13/notes" && q.Get("per_page") != notesSize {
-						t.Errorf("limit %d, page %d: the notes were asked for with per_page=%s, want %s", limit, page, q.Get("per_page"), notesSize)
+					if q, _ := url.ParseQuery(r.RawQuery); r.RawPath == glProject+"/merge_requests/13/notes" && q.Get("per_page") != want {
+						t.Errorf("limit %d, page %d: the notes were asked for with per_page=%s, want %s", limit, page, q.Get("per_page"), want)
 					}
 				}
 				if len(l.Items) > limit || page == 1 && len(l.Items) != limit {
@@ -321,6 +330,14 @@ func TestPullRequest(t *testing.T) {
 			if fmt.Sprint(all) != "[kim: lee: kim:n1 kim:n2 kim:n3 kim:n4 kim:n5]" {
 				t.Errorf("limit %d: the pages hold %v, want the approvals of kim and lee then the notes n1 to n5", limit, all)
 			}
+		}
+
+		w.fake.SetObject(glProject+"/merge_requests/14/approvals", approvals)
+		w.fake.SetList(glProject + "/merge_requests/14/notes")
+		l, sent := w.list(t, "gl", "/pulls/14/reviews?limit=2")
+		if len(l.Items) != 2 || l.NextCursor != nil || sent != 2 {
+			t.Errorf("GET gl/pulls/14/reviews?limit=2 with two approvals and no notes = %d reviews with next_cursor %v after %d forge requests, "+
+				"want the 2 approvals and null after 2", len(l.Items), l.NextCursor, sent)
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -251,6 +252,12 @@ var githubCheckConclusion = map[string]string{
 	"skipped": CheckSkipped, "timed_out": CheckFailure, "action_required": CheckFailure, "startup_failure": CheckFailure,
 	"stale": CheckCancelled,
 }
+
+// commitID is a full commit id, SHA-1 or SHA-256, as GitHub writes it.
+var commitID = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
+// checkAnchor accepts the head commit the first page read the check runs of.
+func (github) checkAnchor(anchor string) bool { return commitID.MatchString(anchor) }
 
 // checks reads the check runs of the pull request's head commit. The first
 // page reads the pull request for it; later pages read the commit the

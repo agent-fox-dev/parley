@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"net/url"
 	"slices"
 	"strings"
@@ -47,7 +48,10 @@ func newIssueCommand() *cobra.Command {
 // hub takes them.
 func listIssues(c *call, query url.Values) error {
 	if fs := c.cmd.Flags(); fs.Changed(labelFlag) {
-		labels, _ := fs.GetStringArray(labelFlag)
+		labels, err := fs.GetStringArray(labelFlag)
+		if err != nil {
+			return fmt.Errorf("read --%s: %w", labelFlag, err)
+		}
 		query.Set("labels", strings.Join(labels, ","))
 	}
 	return sendWith(c, query, nil)

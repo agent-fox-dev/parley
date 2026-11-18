@@ -330,6 +330,10 @@ type api interface {
 	// number's head: the head p's anchor names, else the head the forge
 	// names now, which becomes the next position's anchor.
 	checks(ctx context.Context, call *Call, number int64, p Paging) ([]CheckRun, *Position, error)
+	// checkAnchor reports whether anchor can be the anchor of a later
+	// check run page: what the first page found, which a cursor carries
+	// into a request path.
+	checkAnchor(anchor string) bool
 	// reviews reads the page p of the reviews of the pull request number,
 	// oldest first.
 	reviews(ctx context.Context, call *Call, number int64, p Paging) ([]Review, *Position, error)

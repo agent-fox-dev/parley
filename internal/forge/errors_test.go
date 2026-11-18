@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/forge/forgetest"
@@ -57,32 +56,30 @@ func TestMapError_BuildsTheMessageFromTheForgesAnswer(t *testing.T) {
 	answered := func(status int, body string) *forge.Failure {
 		return &forge.Failure{Kind: forge.FailureStatus, Status: status, Body: []byte(body)}
 	}
-	limited := func(wait time.Duration, stated bool) *forge.Failure {
-		return &forge.Failure{Kind: forge.FailureRateLimited, Status: 429, Wait: wait, WaitStated: stated}
-	}
 	cases := []struct {
 		name           string
 		err            error
 		wantMessage    string // the whole message, or with a trailing * its prefix
 		wantUnanswered bool   // the message describes a missing answer
-		wantRetryAfter string
 	}{
-		{"GitHub's message", answered(404, `{"message":"Not Found"}`), "the forge answered 404: Not Found", false, ""},
+		{"GitHub's message", answered(404, `{"message":"Not Found"}`), "the forge answered 404: Not Found", false},
 		{"GitLab's message", answered(404, `{"message":"404 Project Not Found"}`),
-			"the forge answered 404: 404 Project Not Found", false, ""},
+			"the forge answered 404: 404 Project Not Found", false},
 		{"GitLab's error", answered(400, `{"error":"state does not have a valid value"}`),
-			"the forge answered 400: state does not have a valid value", false, ""},
+			"the forge answered 400: state does not have a valid value", false},
 		{"a message that is no string", answered(400, `{"message": {"title": ["is too long"]}}`),
-			`the forge answered 400: {"title":["is too long"]}`, false, ""},
-		{"a body that is no JSON", answered(500, "oops"), "the forge answered 500*", false, ""},
+			`the forge answered 400: {"title":["is too long"]}`, false},
+		{"an empty message beside an error", answered(400, `{"message":"","error":"invalid scope"}`),
+			"the forge answered 400: invalid scope", false},
+		{"an empty message alone", answered(400, `{"message":""}`), "the forge answered 400", false},
+		{"a body that is no JSON", answered(500, "oops"), "the forge answered 500*", false},
 		{"a wrapped failure", fmt.Errorf("read the issue: %w", answered(410, `{"message":"Gone"}`)),
-			"the forge answered 410: Gone", false, ""},
-		{"no answer before the deadline", &forge.Failure{Kind: forge.FailureTimeout, Err: context.DeadlineExceeded}, "", true, ""},
+			"the forge answered 410: Gone", false},
+		{"no answer before the deadline", &forge.Failure{Kind: forge.FailureTimeout, Err: context.DeadlineExceeded}, "", true},
 		{"a connection refused", &forge.Failure{Kind: forge.FailureUnreachable,
-			Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}}, "", true, ""},
-		{"a stated wait in whole seconds", limited(31*time.Second, true), "the forge answered 429*", false, "31"},
-		{"a stated wait rounded up", limited(44500*time.Millisecond, true), "the forge answered 429*", false, "45"},
-		{"no stated wait", limited(0, false), "the forge answered 429*", false, ""},
+			Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}}, "", true},
+		{"a rate limit", &forge.Failure{Kind: forge.FailureRateLimited, Status: 429, Body: []byte(`{"message":"slow down"}`)},
+			"the forge answered 429: slow down", false},
 	}
 	for _, c := range cases {
 		got, ok := forge.MapError(c.err, scrub.New(), "")
@@ -97,9 +94,6 @@ func TestMapError_BuildsTheMessageFromTheForgesAnswer(t *testing.T) {
 			}
 		case isPrefix && !strings.HasPrefix(got.Message, prefix), !isPrefix && got.Message != c.wantMessage:
 			t.Errorf("%s: message %q, want %q", c.name, got.Message, c.wantMessage)
-		}
-		if got.RetryAfter != c.wantRetryAfter {
-			t.Errorf("%s: Retry-After %q, want %q", c.name, got.RetryAfter, c.wantRetryAfter)
 		}
 	}
 	if _, ok := forge.MapError(errors.New("the hub broke"), scrub.New(), ""); ok {
@@ -155,6 +149,12 @@ func TestForgeRoute_AnswersAForgeFailureAsItsHubError(t *testing.T) {
 			502, forge.ErrorTypeError, 1, false},
 		row{"a body that is no JSON", "gh", repositoryPath, []forgetest.Answer{{Body: "<html>"}}, 502, forge.ErrorTypeError, 1, false},
 		row{"an array for an object", "gh", repositoryPath, []forgetest.Answer{{Body: "[]"}}, 502, forge.ErrorTypeError, 1, false},
+		row{"a 404 past 8 MiB", "gh", repositoryPath, []forgetest.Answer{{Status: 404, Body: padded(`{"message":"no"}`, forge.DefaultMaxBody+1)}},
+			404, forge.ErrorTypeNotFound, 1, false},
+		row{"a rate limit past 8 MiB", "gh", repositoryPath, []forgetest.Answer{{Status: 429, Body: padded("{}", forge.DefaultMaxBody+1)}},
+			429, forge.ErrorTypeRateLimited, 1, false},
+		row{"a rate limit past 8 MiB waited out", "gh", repositoryPath, []forgetest.Answer{
+			{Status: 429, Header: http.Header{"Retry-After": {"0"}}, Body: padded("{}", forge.DefaultMaxBody+1)}, {}}, 200, "", 2, false},
 		row{"an object of exactly 8 MiB", "gh", repositoryPath,
 			[]forgetest.Answer{{Body: padded(`{"full_name":"acme/widgets"}`, forge.DefaultMaxBody)}}, 200, "", 1, false},
 		row{"a redirect to another port", "gh", issuePath, []forgetest.Answer{{Redirect: other.URL + "/x"}},

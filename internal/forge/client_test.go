@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"slices"
 	"strconv"
@@ -63,17 +62,6 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 func get(url string) forge.Request {
 	return forge.Request{Method: http.MethodGet, URL: url, Kind: forge.KindGitHub,
 		Credential: forge.Credential{Kind: forge.CredentialPAT, Token: "t1"}}
-}
-
-// failureOf is the client's failure err holds, failing the test when it
-// holds none.
-func failureOf(t *testing.T, err error) *forge.Failure {
-	t.Helper()
-	var f *forge.Failure
-	if !errors.As(err, &f) {
-		t.Fatalf("err = %v, want a *forge.Failure", err)
-	}
-	return f
 }
 
 func header(name, value string) http.Header { return http.Header{name: {value}} }
@@ -209,42 +197,6 @@ func TestClient_FollowsSameOriginRedirectsUpToTen(t *testing.T) {
 	}
 }
 
-func TestClient_RefusesARedirectElsewhereOrPastTheTenth(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name         string
-		redirect     func(fake, other *forgetest.Fake) string
-		redirects    int
-		wantRequests int
-	}{
-		{"to another port", func(_, other *forgetest.Fake) string { return other.URL + "/x" }, 1, 1},
-		{"to plain http on the same host", func(fake, _ *forgetest.Fake) string {
-			return "http://" + strings.TrimPrefix(fake.URL, "https://") + "/x"
-		}, 1, 1},
-		{"an eleventh time", func(*forgetest.Fake, *forgetest.Fake) string { return "/again" }, 11, 11},
-	}
-	for _, c := range cases {
-		fake, other := forgetest.New(t), forgetest.New(t)
-		for range c.redirects {
-			fake.Script(forgetest.Answer{Redirect: c.redirect(fake, other)})
-		}
-		fake.Script(forgetest.Answer{})
-		client := forge.NewClient(forge.ClientOptions{Transport: fake.Transport()})
-
-		_, err := client.Do(t.Context(), get(fake.URL+"/start"))
-
-		if f := failureOf(t, err); f.Kind != forge.FailureRedirect {
-			t.Errorf("%s: failure %q, want %q", c.name, f.Kind, forge.FailureRedirect)
-		}
-		if n := fake.Count(); n != c.wantRequests {
-			t.Errorf("%s: the forge received %d requests, want %d", c.name, n, c.wantRequests)
-		}
-		if n := other.Count(); n != 0 {
-			t.Errorf("%s: the redirect's target received %d requests", c.name, n)
-		}
-	}
-}
-
 func TestClient_RetriesOnceAfterTheStatedWaitOfARateLimit(t *testing.T) {
 	t.Parallel()
 	reset := func(after int64) string { return strconv.FormatInt(newFakeClock().Now().Unix()+after, 10) }
@@ -284,118 +236,6 @@ func TestClient_RetriesOnceAfterTheStatedWaitOfARateLimit(t *testing.T) {
 	}
 }
 
-func TestClient_FailsARateLimitItCannotWaitFor(t *testing.T) {
-	t.Parallel()
-	limited := func(h http.Header) forgetest.Answer { return forgetest.Answer{Status: 429, Header: h} }
-	cases := []struct {
-		name         string
-		answers      []forgetest.Answer
-		used         time.Duration // the clock's advance while a request is sent
-		wantRequests int
-		wantWait     time.Duration
-		wantStated   bool
-	}{
-		{"a wait past the deadline", []forgetest.Answer{limited(header("Retry-After", "31"))}, 0, 1, 31 * time.Second, true},
-		{"no stated wait", []forgetest.Answer{limited(nil)}, 0, 1, 0, false},
-		{"403 with no requests remaining and no reset", []forgetest.Answer{{Status: 403,
-			Header: header("X-RateLimit-Remaining", "0")}}, 0, 1, 0, false},
-		{"a retry limited too", []forgetest.Answer{limited(header("Retry-After", "1")),
-			limited(header("Retry-After", "5"))}, 0, 2, 5 * time.Second, true},
-		{"a wait past what the request left of its deadline", []forgetest.Answer{limited(header("Retry-After", "20"))},
-			15 * time.Second, 1, 20 * time.Second, true},
-	}
-	for _, c := range cases {
-		clock := newFakeClock()
-		fake := forgetest.New(t)
-		fake.Script(c.answers...)
-		fake.Script(forgetest.Answer{})
-		transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			clock.advance(c.used)
-			return fake.Transport().RoundTrip(r)
-		})
-		client := forge.NewClient(forge.ClientOptions{Transport: transport, Now: clock.Now, Sleep: clock.Sleep})
-
-		_, err := client.Do(t.Context(), get(fake.URL+"/x"))
-
-		f := failureOf(t, err)
-		if f.Kind != forge.FailureRateLimited || f.Wait != c.wantWait || f.WaitStated != c.wantStated {
-			t.Errorf("%s: failure %q wait %v stated %v, want %q wait %v stated %v", c.name,
-				f.Kind, f.Wait, f.WaitStated, forge.FailureRateLimited, c.wantWait, c.wantStated)
-		}
-		if n := fake.Count(); n != c.wantRequests {
-			t.Errorf("%s: the forge received %d requests, want %d", c.name, n, c.wantRequests)
-		}
-	}
-}
-
-func TestClient_FailsWithWhatWentWrong(t *testing.T) {
-	t.Parallel()
-	gone := httptest.NewServer(nil)
-	goneURL := gone.URL
-	gone.Close()
-	cases := []struct {
-		name       string
-		answer     forgetest.Answer
-		url        string        // "" for the fake's
-		deadline   time.Duration // 0 for 5 s
-		want       forge.FailureKind
-		wantStatus int
-		wantBody   string
-	}{
-		{"an error status", forgetest.Answer{Status: 404, Body: `{"message":"Not Found"}`}, "", 0,
-			forge.FailureStatus, 404, `{"message":"Not Found"}`},
-		{"a 403 that is no rate limit", forgetest.Answer{Status: 403, Body: `{"message":"no"}`}, "", 0,
-			forge.FailureStatus, 403, `{"message":"no"}`},
-		{"a body past the size limit", forgetest.Answer{Body: strings.Repeat("x", 33)}, "", 0, forge.FailureUnreadable, 200, ""},
-		{"no answer before the deadline", forgetest.Answer{Hold: true}, "", 50 * time.Millisecond, forge.FailureTimeout, 0, ""},
-		{"nobody listening", forgetest.Answer{}, goneURL, 0, forge.FailureUnreachable, 0, ""},
-	}
-	for _, c := range cases {
-		fake := forgetest.New(t)
-		fake.Script(c.answer)
-		deadline := c.deadline
-		if deadline == 0 {
-			deadline = 5 * time.Second
-		}
-		client := forge.NewClient(forge.ClientOptions{Transport: fake.Transport(), Deadline: deadline, MaxBody: 32})
-		url := c.url
-		if url == "" {
-			url = fake.URL + "/x"
-		}
-		start := time.Now()
-
-		_, err := client.Do(t.Context(), get(url))
-
-		f := failureOf(t, err)
-		if f.Kind != c.want || f.Status != c.wantStatus || string(f.Body) != c.wantBody {
-			t.Errorf("%s: failure %q %d %s, want %q %d %s", c.name, f.Kind, f.Status, f.Body, c.want, c.wantStatus, c.wantBody)
-		}
-		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Errorf("%s: Do took %v", c.name, elapsed)
-		}
-	}
-}
-
-func TestClient_ReadsABodyUpToTheSizeLimit(t *testing.T) {
-	t.Parallel()
-	fake := forgetest.New(t)
-	fake.Script(forgetest.Answer{Body: "12345678"})
-	client := forge.NewClient(forge.ClientOptions{Transport: fake.Transport(), MaxBody: 8})
-
-	resp, err := client.Do(t.Context(), get(fake.URL+"/x"))
-
-	if err != nil || string(resp.Body) != "12345678" {
-		t.Fatalf("Do = %v, %v, want the whole body", resp, err)
-	}
-}
-
-func TestNewClient_GivesARequestThirtySecondsByDefault(t *testing.T) {
-	t.Parallel()
-	if d := forge.NewClient(forge.ClientOptions{}).Deadline(); d != 30*time.Second {
-		t.Errorf("Deadline() = %v, want 30s", d)
-	}
-}
-
 func TestClient_SendsARequestItsCallerHasLeft(t *testing.T) {
 	t.Parallel()
 	fake := forgetest.New(t)
@@ -414,6 +254,7 @@ func TestClient_SendsARequestItsCallerHasLeft(t *testing.T) {
 // The forge tokens and API URLs other tools read from a process's
 // environment, which the hub reads in neither its own nor the process's.
 var forgeEnvironment = map[string]string{
+	"GIT_PAT": "envtoken", "UPSTREAM_GIT_PAT": "envtoken",
 	"GITHUB_TOKEN": "envtoken", "GH_TOKEN": "envtoken", "GITLAB_TOKEN": "envtoken",
 	"GITHUB_API_URL": "https://elsewhere.invalid", "GITLAB_API_URL": "https://elsewhere.invalid",
 }

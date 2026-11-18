@@ -5729,12 +5729,14 @@ replace any of these with `(*Composition).AdjustForge`, the client's
 transport included. The component stores nothing, so it registers no
 remover and no maintenance task.
 
-**Resolution** (`resolve.go`) is pure: `ParseRemote` turns a remote URL into
+**Resolution** (`resolve.go`): the parsing and the kind and URL functions
+are pure: `ParseRemote` turns a remote URL into
 `Repository{Host, Owner, Name}`, `Kind` decides the forge kind from the API
-URL setting and the host, `APIURL` gives the API URL, `CheckAPIURL` checks a
-setting again at use (the stored value may predate the settings route's
-validation), and `ResolveCredential` reads the credential kind and token
-from the workspace's secrets on every call, in the order of the origin
+URL setting and the host, `APIURL` gives the API URL, and `CheckAPIURL`
+checks a setting again at use with the settings route's own rule,
+`workspace.ValidateForgeURL` (the stored value may predate that
+validation). `ResolveCredential` is not pure: it reads the credential kind
+and token from the workspace's secrets on each call, in the order of the origin
 credential of package 10 and the upstream credential of package 31. It
 reads the secrets itself rather than calling
 `workspace.ResolveOriginCredential` or `carrypatch.ResolveUpstreamCredential`,
@@ -5765,7 +5767,10 @@ for a task fork, the route's need on the parent through the access rule's
 `Decide`, which applies no binding, after which the parent's record,
 settings and secrets are used; `target` (left out by `NoTarget`, which the
 diagnostic route sets); the route's `Params`; `Resolve`; the route's
-`Check`, a hook for the checks of writes; and `Serve`, given a `forge.Call`
+`Check`, a hook for refusals that need the resolution (the check run
+list refuses a cursor whose anchor is not a commit id on GitHub, or a
+pipeline id on GitLab, since the anchor goes into the forge request's path,
+and writes will add theirs); and `Serve`, given a `forge.Call`
 with the resolution and the client. No step reads the workspace's status,
 so reads are served in every state. A failure that `Check` or `Serve`
 returns is mapped with `MapError`, with `Retry-After` on a `429`, and logged

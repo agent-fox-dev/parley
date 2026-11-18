@@ -1,6 +1,7 @@
 package forge_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -220,32 +221,40 @@ func TestForgeRoute_ServesEveryTargetAndWorkspaceStateItAccepts(t *testing.T) {
 		w.addWorkspace(t, workspace.Workspace{Slug: s.slug, Status: s.status, Marker: s.marker, GitURL: gh, Settings: w.github()})
 	}
 	// answers are what the forge answers the requests of one read, the
-	// first of which is for forgePath.
+	// first of which is for forgePath; want, when it is set, is the body
+	// the read must answer.
 	type read struct {
 		name, slug, path, forgePath string
 		answers                     []forgetest.Answer
+		want                        []byte
 	}
 	list, object := []forgetest.Answer{{Body: "[]"}}, []forgetest.Answer{{}}
 	thread := []forgetest.Answer{{Body: `{"number":1}`}, {Body: "[]"}}
+	// A workspace in any state answers what the ready one does.
+	w.fake.Script(thread...)
+	status, ready, _ := w.get(t, "w", "/issues/1", w.ownerKey)
+	var got struct {
+		Issue *struct {
+			Number int `json:"number"`
+		} `json:"issue"`
+	}
+	if status != http.StatusOK || json.Unmarshal(ready, &got) != nil || got.Issue == nil || got.Issue.Number != 1 {
+		t.Fatalf("w/issues/1 = %d %s, want 200 with the forge's issue 1", status, ready)
+	}
 	cases := []read{
-		{"no target", "w", "/issues", "/github/repos/acme/widgets/issues", list},
-		{"target origin", "w", "/issues?target=origin", "/github/repos/acme/widgets/issues", list},
-		{"target upstream of a carry-patch workspace", "carry", "/issues?target=upstream", "/github/repos/up/proj/issues", list},
-		{"origin beside an invalid upstream API URL", "bad-upstream", "/forge/repository", "/github/repos/acme/widgets", object},
+		{"no target", "w", "/issues", "/github/repos/acme/widgets/issues", list, nil},
+		{"target origin", "w", "/issues?target=origin", "/github/repos/acme/widgets/issues", list, nil},
+		{"target upstream of a carry-patch workspace", "carry", "/issues?target=upstream", "/github/repos/up/proj/issues", list, nil},
+		{"origin beside an invalid upstream API URL", "bad-upstream", "/forge/repository", "/github/repos/acme/widgets", object, nil},
 	}
 	for _, s := range states {
-		cases = append(cases, read{s.slug, s.slug, "/issues/1", "/github/repos/acme/widgets/issues/1", thread})
+		cases = append(cases, read{s.slug, s.slug, "/issues/1", "/github/repos/acme/widgets/issues/1", thread, ready})
 	}
 	for _, c := range cases {
 		w.fake.Script(c.answers...)
 		status, body, sent := w.get(t, c.slug, c.path, w.ownerKey)
-		var got struct {
-			Issue *struct {
-				Number int `json:"number"`
-			} `json:"issue"`
-		}
-		if status != http.StatusOK || c.path == "/issues/1" && (json.Unmarshal(body, &got) != nil || got.Issue == nil || got.Issue.Number != 1) {
-			t.Errorf("%s: %s%s = %d %s, want 200 with the forge's answer", c.name, c.slug, c.path, status, body)
+		if status != http.StatusOK || c.want != nil && !bytes.Equal(body, c.want) {
+			t.Errorf("%s: %s%s = %d %s, want 200 with %s", c.name, c.slug, c.path, status, body, c.want)
 			continue
 		}
 		requests := w.fake.Requests()

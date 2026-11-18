@@ -128,7 +128,8 @@ func message(f *Failure) string {
 
 // forgeMessage is the forge's own message in an error body: the member
 // message (GitHub, GitLab), else error (GitLab), a value that is no string
-// in its compact JSON form; "" when the body has neither.
+// in its compact JSON form; a member that is null or "" counts as absent.
+// It is "" when the body has neither.
 func forgeMessage(body []byte) string {
 	var members map[string]json.RawMessage
 	if json.Unmarshal(body, &members) != nil {
@@ -141,6 +142,9 @@ func forgeMessage(body []byte) string {
 		}
 		var s string
 		if json.Unmarshal(raw, &s) == nil {
+			if s == "" {
+				continue
+			}
 			return s
 		}
 		var compact bytes.Buffer
