@@ -20,7 +20,9 @@ const forgeHook = "forge"
 // environment never is, docs/adr/06-load-the-secret-keys-before-the-stores-open.md);
 // the client takes the hub's clock. It hands it the event component, which
 // records the forge writes, and the hub's scrubber, logger and external URL
-// too.
+// too; and the store, the secret component as the writer of the webhook
+// secret, and the event component as the log the webhook routes record
+// their events in, inside the same store transaction.
 //
 // The component exists from the composition on (Forge), so that the forge
 // routes, which the part registers, are built with it; a later part and tests change its dependencies
@@ -37,15 +39,18 @@ func composeForge(c *Composition) {
 			Workspaces: func(ctx context.Context, slug string) (workspace.Workspace, bool, error) {
 				return workspace.BySlug(ctx, db, slug)
 			},
-			Settings:    c.workspaces.Settings(),
-			Secrets:     c.secrets,
-			Access:      c.access,
-			Client:      forge.ClientOptions{Env: c.env},
-			Events:      c.Events(),
-			Scrubber:    rt.Scrubber,
-			Logger:      rt.Logger,
-			Now:         rt.Now,
-			ExternalURL: rt.Config.Server.ExternalURL,
+			Settings:     c.workspaces.Settings(),
+			Secrets:      c.secrets,
+			Access:       c.access,
+			Client:       forge.ClientOptions{Env: c.env},
+			Events:       c.Events(),
+			Scrubber:     rt.Scrubber,
+			Logger:       rt.Logger,
+			Now:          rt.Now,
+			ExternalURL:  rt.Config.Server.ExternalURL,
+			Store:        rt.Store,
+			SecretWriter: c.secrets,
+			Log:          c.Events(),
 		}
 		for _, adjust := range c.forgeAdjusters {
 			adjust(&d)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
@@ -116,10 +115,7 @@ func (c *Component) webhook(ctx context.Context, slug string) (webhookStatus, er
 	if err != nil {
 		return webhookStatus{}, fmt.Errorf("read the webhook secret of %s: %w", slug, err)
 	}
-	h := webhookStatus{Configured: value != ""}
-	if c.deps.ExternalURL != "" {
-		h.URL = new(strings.TrimSuffix(c.deps.ExternalURL, "/") + "/hooks/forge/" + slug)
-	}
+	h := webhookStatus{Configured: value != "", URL: c.webhookURL(slug)}
 	if p := c.lastDeliveryProvider(); p != nil {
 		at, found, err := p(ctx, slug)
 		if err != nil {
