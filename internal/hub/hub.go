@@ -32,6 +32,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/forge"
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -85,6 +86,7 @@ var parts = []func(*Composition){
 	composeAwareness,
 	composeJobs,
 	composeCarryPatch,
+	composeForge,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -291,6 +293,12 @@ type Composition struct {
 	// pushControl is the carry-patch controller composeCarryPatch
 	// registers with the push rules (PushControl).
 	pushControl *carrypatch.PushControl
+
+	// forge is the forge component composeForge creates and binds in its
+	// start hook (Forge), after forgeAdjusters have changed its
+	// dependencies (AdjustForge).
+	forge          *forge.Component
+	forgeAdjusters []func(*forge.Deps)
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).

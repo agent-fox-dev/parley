@@ -29,7 +29,8 @@ import (
 	"time"
 )
 
-// repoName is the last element of the origin's URL path.
+// repoName is the origin's URL path, without its leading slash, unless
+// WithRepoPath says otherwise.
 const repoName = "origin.git"
 
 // Origin is a bare repository served over HTTPS. Its zero value is not
@@ -41,6 +42,10 @@ type Origin struct {
 	srv    *httptest.Server
 	caFile string
 	files  http.Handler
+
+	// repoPath is the URL path the repository is served at, without its
+	// leading slash; root is the directory that holds it at that path.
+	repoPath, root string
 
 	// smart serves git's smart HTTP transport instead of the files.
 	smart bool
@@ -68,6 +73,13 @@ type Option func(*Origin)
 // carry Basic authentication with user and password.
 func WithBasicAuth(user, password string) Option {
 	return func(o *Origin) { o.user, o.password = user, password }
+}
+
+// WithRepoPath serves the repository at the URL path /<path> instead of
+// /origin.git, for a test that needs the path to name an owner and a
+// repository, such as "acme/widgets.git".
+func WithRepoPath(path string) Option {
+	return func(o *Origin) { o.repoPath = path }
 }
 
 // WithSmartHTTP makes the origin serve git's smart HTTP transport through
@@ -104,13 +116,14 @@ func SmartOrigin(t testing.TB, opts ...Option) *Origin {
 // ends. A git that should trust it runs with the variables of Env.
 func NewOrigin(t testing.TB, opts ...Option) *Origin {
 	t.Helper()
-	o := &Origin{t: t, dir: filepath.Join(t.TempDir(), repoName)}
+	o := &Origin{t: t, repoPath: repoName, root: t.TempDir()}
 	for _, opt := range opts {
 		opt(o)
 	}
+	o.dir = filepath.Join(o.root, filepath.FromSlash(o.repoPath))
 	InitBare(t, o.dir, "main")
 	o.Publish()
-	o.files = http.StripPrefix("/"+repoName, http.FileServer(http.Dir(o.dir)))
+	o.files = http.StripPrefix("/"+o.repoPath, http.FileServer(http.Dir(o.dir)))
 	if o.smart {
 		o.files = o.backend()
 	}
@@ -127,7 +140,7 @@ func NewOrigin(t testing.TB, opts ...Option) *Origin {
 }
 
 // URL is the origin's https URL, without user information.
-func (o *Origin) URL() string { return o.srv.URL + "/" + repoName }
+func (o *Origin) URL() string { return o.srv.URL + "/" + o.repoPath }
 
 // CAFile is the PEM file of the certificate the origin serves, which git
 // trusts through GIT_SSL_CAINFO.
@@ -409,9 +422,9 @@ func (o *Origin) backend() http.Handler {
 	return &cgi.Handler{
 		Path: git,
 		Args: []string{"http-backend"},
-		Dir:  filepath.Dir(o.dir),
+		Dir:  o.root,
 		Env: []string{
-			"GIT_PROJECT_ROOT=" + filepath.Dir(o.dir),
+			"GIT_PROJECT_ROOT=" + o.root,
 			"GIT_HTTP_EXPORT_ALL=1",
 			"GIT_CONFIG_NOSYSTEM=1",
 			"GIT_CONFIG_GLOBAL=" + os.DevNull,

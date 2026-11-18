@@ -247,7 +247,7 @@ func (spec settingSpec) validate(raw json.RawMessage) error {
 		if !ok {
 			return errors.New("must be a string")
 		}
-		return validateForgeURL(strings.TrimSpace(s))
+		return ValidateForgeURL(strings.TrimSpace(s))
 	case kindGlobs:
 		return validateGlobs(raw)
 	}
@@ -271,11 +271,13 @@ func trimString(raw json.RawMessage) json.RawMessage {
 	return b
 }
 
-// validateForgeURL accepts "" and an absolute https URL with a host and
-// without user information, query or fragment. The value is stored as
-// given, so the scheme must be written in lower case, and white space,
-// which url.Parse lets through in a path, is refused rather than stored.
-func validateForgeURL(s string) error {
+// ValidateForgeURL accepts "" and an absolute https URL with a host and
+// without user information, query or fragment: the rule of the settings
+// forge_api_url and upstream_forge_api_url. The value is stored as given,
+// so the scheme must be written in lower case, and white space, which
+// url.Parse lets through in a path, is refused rather than stored. The
+// error says what the value must be, to follow the setting's name.
+func ValidateForgeURL(s string) error {
 	if s == "" {
 		return nil
 	}

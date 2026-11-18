@@ -1,0 +1,239 @@
+package forge_test
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/agent-fox-dev/parley/internal/forge"
+	"github.com/agent-fox-dev/parley/internal/forge/forgetest"
+	"github.com/agent-fox-dev/parley/internal/workspace"
+)
+
+// The fake GitLab's project acme/widgets, as its path is sent.
+const glWidgets = forgetest.GitLabPrefix + "/projects/acme%2Fwidgets"
+
+// listRoute is a forge list route as the paging tests call it: its path
+// below /api/v1/workspaces/<slug>, what puts n entries in the collection
+// it reads on the fake GitHub's acme/widgets or the fake GitLab's, and the
+// member that tells the items it answers apart.
+type listRoute struct {
+	path string
+	seed func(w *world, kind forge.ForgeKind, n int)
+	id   string
+}
+
+// listRoutes are the forge's list routes. A route that pages a forge
+// collection is a row here.
+var listRoutes = []listRoute{
+	{"/issues", func(w *world, kind forge.ForgeKind, n int) {
+		issues := make([]any, n)
+		for i := range issues {
+			if kind == forge.KindGitLab {
+				issues[i] = gitlabIssue(i+1, "Issue", nil)
+			} else {
+				issues[i] = githubIssue(i+1, "Issue", nil)
+			}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/issues", issues...)
+		} else {
+			w.fake.SetList(ghRepo+"/issues", issues...)
+		}
+	}, "number"},
+	{"/issues/1/comments", func(w *world, kind forge.ForgeKind, n int) {
+		comments := make([]any, n)
+		for i := range comments {
+			if kind == forge.KindGitLab {
+				comments[i] = gitlabNote(i+1, "note", false)
+			} else {
+				comments[i] = githubComment(i+1, "comment")
+			}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/issues/1/notes", comments...)
+		} else {
+			w.fake.SetList(ghRepo+"/issues/1/comments", comments...)
+		}
+	}, "id"},
+	{"/pulls/1/files", func(w *world, kind forge.ForgeKind, n int) {
+		files := make([]any, n)
+		for i := range files {
+			files[i] = map[string]any{"filename": fmt.Sprintf("f%d", i), "new_path": fmt.Sprintf("f%d", i), "status": "modified"}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/merge_requests/1/diffs", files...)
+		} else {
+			w.fake.SetList(ghRepo+"/pulls/1/files", files...)
+		}
+	}, "filename"},
+	{"/pulls/1/checks", func(w *world, kind forge.ForgeKind, n int) {
+		runs := make([]any, n)
+		for i := range runs {
+			runs[i] = map[string]any{"name": fmt.Sprintf("c%d", i), "status": "queued"}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetList(glWidgets+"/merge_requests/1/pipelines", map[string]any{"id": 7})
+			w.fake.SetList(glWidgets+"/pipelines/7/jobs", runs...)
+		} else {
+			w.fake.SetObject(ghRepo+"/pulls/1", githubPull(1, nil))
+			w.fake.SetListIn(ghRepo+"/commits/"+headSHA+"/check-runs", "check_runs", runs...)
+		}
+	}, "name"},
+	{"/pulls/1/reviews", func(w *world, kind forge.ForgeKind, n int) {
+		reviews := make([]any, n)
+		for i := range reviews {
+			if kind == forge.KindGitLab {
+				reviews[i] = gitlabNote(i+1, fmt.Sprintf("r%d", i), false)
+			} else {
+				reviews[i] = map[string]any{"user": map[string]any{"login": "kim"}, "state": "COMMENTED", "body": fmt.Sprintf("r%d", i)}
+			}
+		}
+		if kind == forge.KindGitLab {
+			w.fake.SetObject(glWidgets+"/merge_requests/1/approvals", map[string]any{"approved_by": []any{}})
+			w.fake.SetList(glWidgets+"/merge_requests/1/notes", reviews...)
+		} else {
+			w.fake.SetList(ghRepo+"/pulls/1/reviews", reviews...)
+		}
+	}, "body"},
+}
+
+func TestForgeList(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	widgets := new("https://github.com/acme/widgets.git")
+	w.addWorkspace(t, workspace.Workspace{Slug: "gh", GitURL: widgets, Settings: w.github()})
+	w.addWorkspace(t, workspace.Workspace{Slug: "gl", GitURL: new("https://gitlab.example.com/acme/widgets.git"), Settings: w.gitlab()})
+	w.addWorkspace(t, workspace.Workspace{Slug: "carry", Mode: workspace.ModeCarryPatch, GitURL: widgets,
+		UpstreamURL: new("https://github.com/up/proj.git"), Settings: w.github(forge.SettingUpstreamAPIURL, w.fake.GitHubURL())})
+	slugs := map[forge.ForgeKind]string{forge.KindGitHub: "gh", forge.KindGitLab: "gl"}
+
+	t.Run("pages by the forge's next link with the cursor's page size", func(t *testing.T) {
+		for _, route := range listRoutes {
+			for kind, slug := range slugs {
+				name := slug + route.path
+				asked := func(perPage, page string) {
+					t.Helper()
+					if q := w.lastQuery(t); q.Get("per_page") != perPage || q.Get("page") != page {
+						t.Errorf("%s: the forge was asked for per_page=%s&page=%s, want per_page=%s&page=%s",
+							name, q.Get("per_page"), q.Get("page"), perPage, page)
+					}
+				}
+				route.seed(w, kind, 5)
+				var pages []list
+				for i, query := range []string{"limit=2", "cursor=%s", "limit=2&cursor=%s"} {
+					if i > 0 {
+						if pages[i-1].NextCursor == nil {
+							t.Fatalf("%s: page %d has next_cursor null, want a cursor", name, i)
+						}
+						query = fmt.Sprintf(query, url.QueryEscape(*pages[i-1].NextCursor))
+					}
+					l, _ := w.list(t, slug, withQuery(route.path, query))
+					asked("2", fmt.Sprint(i+1))
+					pages = append(pages, l)
+				}
+				if p := pages[2]; len(pages[0].Items) != 2 || len(pages[1].Items) != 2 || len(p.Items) != 1 || p.NextCursor != nil {
+					t.Errorf("%s: pages of %d, %d and %d items, the last with next_cursor %v, want 2, 2 and 1 and null",
+						name, len(pages[0].Items), len(pages[1].Items), len(p.Items), p.NextCursor)
+				}
+				seen := map[string]bool{}
+				for _, p := range pages {
+					for _, item := range p.Items {
+						seen[fmt.Sprint(item[route.id])] = true
+					}
+				}
+				if len(seen) != 5 {
+					t.Errorf("%s: the pages hold %d different entries, want the 5 of the forge", name, len(seen))
+				}
+
+				w.list(t, slug, route.path)
+				asked("50", "1")
+
+				route.seed(w, kind, 0)
+				l, _ := w.list(t, slug, route.path)
+				if len(l.Items) != 0 || l.NextCursor != nil {
+					t.Errorf("%s of an empty collection = %v with next_cursor %v, want [] and null", name, l.Items, l.NextCursor)
+				}
+			}
+		}
+	})
+
+	t.Run("refuses a limit out of bounds or a cursor of another query or page size", func(t *testing.T) {
+		for _, route := range listRoutes[:2] {
+			route.seed(w, forge.KindGitHub, 5)
+		}
+		for _, route := range listRoutes[3:] {
+			for kind := range slugs {
+				route.seed(w, kind, 5)
+			}
+		}
+		first, _ := w.list(t, "carry", "/issues?limit=2&state=open")
+		comments, _ := w.list(t, "carry", "/issues/1/comments?limit=2")
+		ghChecks, _ := w.list(t, "gh", "/pulls/1/checks?limit=2")
+		glChecks, _ := w.list(t, "gl", "/pulls/1/checks?limit=2")
+		glReviews, _ := w.list(t, "gl", "/pulls/1/reviews?limit=2")
+		if first.NextCursor == nil || comments.NextCursor == nil || ghChecks.NextCursor == nil || glChecks.NextCursor == nil ||
+			glReviews.NextCursor == nil {
+			t.Fatal("a first page of two of a list of five has next_cursor null")
+		}
+		// A page whose first entry lies past what an int can count once
+		// multiplied by the page size.
+		const farPage = `{"page":4611686018427387905,"size":2}`
+		c := url.QueryEscape(*first.NextCursor)
+		if _, sent := w.list(t, "carry", "/issues?state=open&cursor="+c); sent != 1 {
+			t.Fatalf("the cursor's own query sent %d forge requests, want 1", sent)
+		}
+		cases := []struct{ name, slug, path string }{
+			{"limit 0", "carry", "/issues?limit=0"},
+			{"limit 201", "carry", "/issues?limit=201"},
+			{"limit x", "carry", "/issues?limit=x"},
+			{"a cursor that does not decode", "carry", "/issues?cursor=not-a-cursor"},
+			{"another route", "carry", "/issues/1/comments?cursor=" + c},
+			{"another number", "carry", "/issues/2/comments?cursor=" + url.QueryEscape(*comments.NextCursor)},
+			{"another workspace", "gh", "/issues?state=open&cursor=" + c},
+			{"another filter", "carry", "/issues?state=closed&cursor=" + c},
+			{"another target", "carry", "/issues?state=open&target=upstream&cursor=" + c},
+			{"another page size", "carry", "/issues?limit=3&state=open&cursor=" + c},
+			{"a page size out of bounds", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"page":2,"size":0}`)},
+			{"no page", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"size":2}`)},
+			{"a phase without its page size", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, `{"page":2,"size":2,"phase":"notes"}`)},
+			{"a phase page size past the page size", "carry", "/issues?state=open&cursor=" +
+				withPosition(t, *first.NextCursor, `{"page":2,"size":2,"phase":"notes","phase_size":3}`)},
+			{"a page past the forge's reach", "carry", "/issues?state=open&cursor=" + withPosition(t, *first.NextCursor, farPage)},
+			{"GitLab's approvals past the forge's reach", "gl", "/pulls/1/reviews?cursor=" + withPosition(t, *glReviews.NextCursor, farPage)},
+		}
+		for _, anchor := range []string{"", "..", "../../../user", "0123456789abcdef", headSHA + "0", strings.ToUpper(headSHA), "g" + headSHA[1:]} {
+			cases = append(cases, struct{ name, slug, path string }{"a GitHub check run anchor " + anchor, "gh",
+				"/pulls/1/checks?cursor=" + withPosition(t, *ghChecks.NextCursor, fmt.Sprintf(`{"page":2,"size":2,"anchor":%q}`, anchor))})
+		}
+		for _, anchor := range []string{"", "..", "7/../8", "0", "07", "-7", "+7", "7e3", "99999999999999999999", headSHA} {
+			cases = append(cases, struct{ name, slug, path string }{"a GitLab check run anchor " + anchor, "gl",
+				"/pulls/1/checks?cursor=" + withPosition(t, *glChecks.NextCursor, fmt.Sprintf(`{"page":2,"size":2,"anchor":%q}`, anchor))})
+		}
+		for _, c := range cases {
+			status, body, sent := w.get(t, c.slug, c.path, w.Token)
+			if status != http.StatusBadRequest || errorOf(t, body).Type != "invalid_request" || sent != 0 {
+				t.Errorf("%s: GET %s%s = %d %s after %d forge requests, want 400 invalid_request after none",
+					c.name, c.slug, c.path, status, body, sent)
+			}
+		}
+	})
+}
+
+// withPosition is the cursor c holding the position pos in place of its
+// own, escaped for a query.
+func withPosition(t *testing.T, c, pos string) string {
+	t.Helper()
+	doc, err := base64.RawURLEncoding.DecodeString(c)
+	var members map[string]json.RawMessage
+	if err != nil || json.Unmarshal(doc, &members) != nil {
+		t.Fatalf("the cursor %q does not decode", c)
+	}
+	members["p"] = json.RawMessage(pos)
+	doc, _ = json.Marshal(members)
+	return url.QueryEscape(base64.RawURLEncoding.EncodeToString(doc))
+}

@@ -340,6 +340,7 @@ as it is and keeps `remaining` above `0`.
 | `PARLEY_SECRETS_KEY_PREVIOUS` | the previous secret key, during a rotation (see [Secret keys](#secret-keys)) |
 | any variable a `${NAME}` reference names | its value replaces the reference |
 | `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | passed on to every `git` process the hub runs against an origin, for origins behind a private certificate authority or a proxy (see below) |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (or their lower-case names) | also read once, when the hub starts, by its forge client: a forge request goes through the proxy they name, directly for a host `NO_PROXY` lists (see [Forge reads](api.md#forge-reads)). The hub reads no forge token or API URL from its environment: `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GITHUB_API_URL` and `GITLAB_API_URL` are ignored |
 
 `parleyd` runs `git` with a fixed minimal environment, away from the
 configuration and credential stores of the account that runs it: apart from
