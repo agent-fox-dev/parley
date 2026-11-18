@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
@@ -34,10 +35,17 @@ type SettingsReader interface {
 	EffectiveSettings(stored map[string]json.RawMessage, defaultBranch *string) map[string]any
 }
 
+// EventEmitter records a hub event in a store transaction of its own, as
+// the event component's EmitNow does.
+type EventEmitter interface {
+	EmitNow(ctx context.Context, in event.Input) (event.Record, error)
+}
+
 // Deps are what the forge component reads: the workspace records, their
 // settings and secrets, the access rule it asks about a fork's parent, the
-// options of the client it sends forge requests with, the hub's scrubber,
-// logger and clock, and the hub's external URL.
+// options of the client it sends forge requests with, the event log a write
+// is recorded in, the hub's scrubber, logger and clock, and the hub's
+// external URL.
 type Deps struct {
 	// Workspaces reads the workspace record of a slug.
 	Workspaces func(ctx context.Context, slug string) (workspace.Workspace, bool, error)
@@ -46,7 +54,9 @@ type Deps struct {
 	Access     AccessDecider
 	// Client are the options the client is built with when the component
 	// is bound.
-	Client      ClientOptions
+	Client ClientOptions
+	// Events records the event of every write that reached the forge.
+	Events      EventEmitter
 	Scrubber    *scrub.Scrubber
 	Logger      *slog.Logger
 	Now         func() time.Time
@@ -77,8 +87,8 @@ func (c *Component) Bind(d Deps) {
 	c.client = NewClient(d.Client)
 }
 
-// Routes are the forge component's routes, which the hub registers. They
-// may be built before the component is bound.
+// Routes are the forge component's routes, the reads and the writes, which
+// the hub registers. They may be built before the component is bound.
 func (c *Component) Routes() []server.Route {
 	read := func(pattern string, params func(*http.Request, *Call) error, serve func(http.ResponseWriter, *http.Request, *Call) error) server.Route {
 		return c.Route(Route{Method: http.MethodGet, Pattern: pattern, Scope: ScopeRead, Need: access.NeedRead, Params: params, Serve: serve})
@@ -90,7 +100,7 @@ func (c *Component) Routes() []server.Route {
 		read("/workspaces/:slug/issues", readIssueList, serveIssues),
 		read("/workspaces/:slug/issues/:number", readIssueNumber, c.serveIssueThread),
 		read(commentsPattern, readComments, serveComments),
-	}, c.pullRoutes()...)
+	}, append(c.pullRoutes(), c.writeRoutes()...)...)
 }
 
 // Client is the client the component sends forge requests with, nil before

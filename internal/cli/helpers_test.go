@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -844,5 +845,100 @@ func wantJSONBody(t *testing.T, got, want string) {
 	}
 	if !reflect.DeepEqual(gotBody, wantBody) {
 		t.Errorf("body = %s, want %s", got, want)
+	}
+}
+
+// sentWrite is a command line of a forge write, the answer the stub hub
+// gives it and the one request it must send: the path below
+// /api/v1/workspaces/, as sent, the query, and the body, "" for none, else
+// a JSON document compared by value.
+type sentWrite struct {
+	args   []string
+	method string
+	path   string
+	query  url.Values
+	body   string
+	// status and answer are what the stub hub answers, 200 and hubAnswer
+	// when not set; printed is what the command prints, the answer when not
+	// set.
+	status          int
+	answer, printed string
+}
+
+// wantWrites runs each command line of writes against a stub hub of its own
+// and checks that the command sent exactly the request of the row, once and
+// without an Idempotency-Key, exited 0 and printed what the row says.
+func wantWrites(t *testing.T, writes []sentWrite) {
+	t.Helper()
+	for _, w := range writes {
+		t.Run(strings.Join(w.args, " "), func(t *testing.T) {
+			t.Parallel()
+			status, answer := cmp.Or(w.status, http.StatusOK), w.answer
+			if w.status == 0 {
+				answer = hubAnswer
+			}
+			rawPath := "/api/v1/workspaces/" + w.path
+			path, err := url.PathUnescape(rawPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hub := newStubHub(t).answer(w.method, path, status, answer)
+
+			code, stdout, stderr, sent := runOnHub(t, hub, w.args...)
+
+			wantResult(t, code, stdout, stderr, cmp.Or(w.printed, answer))
+			got := wantOnlyRequest(t, sent, w.method, rawPath)
+			wantQuery(t, got.query, w.query)
+			if key, ok := got.header["Idempotency-Key"]; ok {
+				t.Errorf("Idempotency-Key = %q, want none", key)
+			}
+			if w.body == "" {
+				if got.body != "" {
+					t.Errorf("body = %q, want none", got.body)
+				}
+				return
+			}
+			wantJSONBody(t, got.body, w.body)
+		})
+	}
+}
+
+// bodyText is a text that trimming white space or translating line breaks
+// would change.
+const bodyText = "  first\r\nsecond\n\n"
+
+// wantBodyRead runs each command line of writes followed by --body-file,
+// once naming a file that holds bodyText and once - with bodyText on
+// standard input, and checks that the hub received bodyText as the body
+// member byte for byte. The rows' query and body are not used.
+func wantBodyRead(t *testing.T, writes []sentWrite) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "body.txt")
+	writeFile(bodyText)(t, file)
+	for _, w := range writes {
+		for name, from := range map[string]string{"a file": file, "standard input": "-"} {
+			args := append(slices.Clone(w.args), "--body-file", from)
+			t.Run(strings.Join(w.args, " ")+" from "+name, func(t *testing.T) {
+				t.Parallel()
+				rawPath := "/api/v1/workspaces/" + w.path
+				hub := newStubHub(t).answer(w.method, rawPath, cmp.Or(w.status, http.StatusOK), hubAnswer)
+				opts := defaultOptions()
+				opts.stdin = strings.NewReader(bodyText)
+
+				code, stdout, stderr := runCLIWith(t, opts, onHub(hub.URL, args...)...)
+
+				wantResult(t, code, stdout, stderr, hubAnswer)
+				got := wantOnlyRequest(t, hub.recorded(), w.method, rawPath)
+				var sent struct {
+					Body *string `json:"body"`
+				}
+				if err := json.Unmarshal([]byte(got.body), &sent); err != nil || sent.Body == nil {
+					t.Fatalf("body = %q, want a JSON object with a body member (%v)", got.body, err)
+				}
+				if *sent.Body != bodyText {
+					t.Errorf("body member = %q, want %q", *sent.Body, bodyText)
+				}
+			})
+		}
 	}
 }

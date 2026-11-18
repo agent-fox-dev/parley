@@ -18,8 +18,9 @@ const forgeHook = "forge"
 // access to the fork's parent; and to the options of its client: the hub's
 // environment, from which the proxy variables are read (the process
 // environment never is, docs/adr/06-load-the-secret-keys-before-the-stores-open.md);
-// the client takes the hub's clock. It hands it the hub's scrubber, logger
-// and external URL too.
+// the client takes the hub's clock. It hands it the event component, which
+// records the forge writes, and the hub's scrubber, logger and external URL
+// too.
 //
 // The component exists from the composition on (Forge), so that the forge
 // routes, which the part registers, are built with it; a later part and tests change its dependencies
@@ -40,6 +41,7 @@ func composeForge(c *Composition) {
 			Secrets:     c.secrets,
 			Access:      c.access,
 			Client:      forge.ClientOptions{Env: c.env},
+			Events:      c.Events(),
 			Scrubber:    rt.Scrubber,
 			Logger:      rt.Logger,
 			Now:         rt.Now,

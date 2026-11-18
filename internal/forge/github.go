@@ -139,6 +139,16 @@ type githubComment struct {
 	HTMLURL   string     `json:"html_url"`
 }
 
+// comment is the comment g as the hub answers it.
+func (g githubComment) comment() Comment {
+	c := Comment{ID: g.ID, Author: Author{Login: g.User.Login}, CreatedAt: stamp(g.CreatedAt),
+		UpdatedAt: stamp(g.UpdatedAt), URL: g.HTMLURL}
+	if g.Body != nil {
+		c.Body = *g.Body
+	}
+	return c
+}
+
 // comments reads GitHub's issue comments, which it lists oldest first.
 func (github) comments(ctx context.Context, call *Call, number int64, p Paging) ([]Comment, *Position, error) {
 	q := url.Values{}
@@ -150,12 +160,7 @@ func (github) comments(ctx context.Context, call *Call, number int64, p Paging) 
 	}
 	comments := make([]Comment, 0, len(page))
 	for _, g := range page {
-		c := Comment{ID: g.ID, Author: Author{Login: g.User.Login}, CreatedAt: stamp(g.CreatedAt),
-			UpdatedAt: stamp(g.UpdatedAt), URL: g.HTMLURL}
-		if g.Body != nil {
-			c.Body = *g.Body
-		}
-		comments = append(comments, c)
+		comments = append(comments, g.comment())
 	}
 	return comments, p.Next(resp.Header), nil
 }
@@ -195,6 +200,11 @@ func (github) pull(ctx context.Context, call *Call, number int64) (PullRequest, 
 	if err := getJSON(ctx, call, githubPullPath(call.Resolution.Repository, number), &g); err != nil {
 		return PullRequest{}, err
 	}
+	return g.pull(), nil
+}
+
+// pull is the pull request g as the hub answers it.
+func (g githubPull) pull() PullRequest {
 	p := PullRequest{
 		Number: g.Number, Title: g.Title, State: IssueOpen, URL: g.HTMLURL, Draft: g.Draft,
 		// GitHub leaves merged out of some answers; merged_at is set on a
@@ -212,7 +222,7 @@ func (github) pull(ctx context.Context, call *Call, number int64) (PullRequest, 
 	case g.State == IssueClosed:
 		p.State = IssueClosed
 	}
-	return p, nil
+	return p
 }
 
 // githubFileStatus maps GitHub's file statuses to the hub's; any other is

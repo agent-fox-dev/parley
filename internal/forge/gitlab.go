@@ -152,6 +152,28 @@ type gitlabNote struct {
 	UpdatedAt *time.Time `json:"updated_at"`
 }
 
+// comment is the note g as the hub answers it, on the issue or merge request
+// whose web page is at page: GitLab gives a note no web URL, so it is the
+// note's anchor on that page.
+func (g gitlabNote) comment(page string) Comment {
+	c := Comment{ID: g.ID, Author: Author{Login: g.Author.Username}, CreatedAt: stamp(g.CreatedAt),
+		UpdatedAt: stamp(g.UpdatedAt), URL: page + "#note_" + strconv.FormatInt(g.ID, 10)}
+	if g.Body != nil {
+		c.Body = *g.Body
+	}
+	return c
+}
+
+// gitlabPage is the web URL of the issue iid of the project of res, or of
+// its merge request iid when mr is true.
+func gitlabPage(res Resolution, iid int64, mr bool) string {
+	kind := "/-/issues/"
+	if mr {
+		kind = "/-/merge_requests/"
+	}
+	return gitlabWebURL(res, kind+strconv.FormatInt(iid, 10))
+}
+
 // comments reads the notes of the issue iid, oldest first. The notes
 // GitLab writes itself, such as a label change, are left out once the forge
 // has paged, so a page may hold fewer than its size.
@@ -163,18 +185,12 @@ func (gitlab) comments(ctx context.Context, call *Call, iid int64, p Paging) ([]
 	if err != nil {
 		return nil, nil, err
 	}
-	issueURL := gitlabWebURL(call.Resolution, "/-/issues/"+strconv.FormatInt(iid, 10))
+	issueURL := gitlabPage(call.Resolution, iid, false)
 	comments := make([]Comment, 0, len(page))
 	for _, g := range page {
-		if g.System {
-			continue
+		if !g.System {
+			comments = append(comments, g.comment(issueURL))
 		}
-		c := Comment{ID: g.ID, Author: Author{Login: g.Author.Username}, CreatedAt: stamp(g.CreatedAt),
-			UpdatedAt: stamp(g.UpdatedAt), URL: issueURL + "#note_" + strconv.FormatInt(g.ID, 10)}
-		if g.Body != nil {
-			c.Body = *g.Body
-		}
-		comments = append(comments, c)
 	}
 	return comments, p.Next(resp.Header), nil
 }
@@ -219,6 +235,12 @@ func (gitlab) pull(ctx context.Context, call *Call, iid int64) (PullRequest, err
 	if err := getJSON(ctx, call, gitlabMRPath(call.Resolution.Repository, iid), &g); err != nil {
 		return PullRequest{}, err
 	}
+	return g.pull(), nil
+}
+
+// pull is the merge request g as the hub answers a pull request, numbered
+// by its iid.
+func (g gitlabMergeRequest) pull() PullRequest {
 	p := PullRequest{
 		Number: g.IID, Title: g.Title, State: IssueOpen, URL: g.WebURL, Draft: g.Draft,
 		Merged: g.State == PullMerged || g.MergedAt != nil, HeadSHA: g.SHA, HeadBranch: g.SourceBranch,
@@ -235,7 +257,7 @@ func (gitlab) pull(ctx context.Context, call *Call, iid int64) (PullRequest, err
 	case g.State == IssueClosed:
 		p.State = IssueClosed
 	}
-	return p, nil
+	return p
 }
 
 // files reads the diffs of the merge request iid. GitLab gives no line
