@@ -152,10 +152,13 @@ func (s *Service) object(rec Record) Object {
 //
 // The checks run in the order of the refusals: the body's values (400
 // invalid_request), the session link (400 unknown_session), the workspace's
-// state (409), the quotas (429 sandbox_capacity, CheckQuota). A refused
-// create writes nothing. A store or event failure is
-// an error that is not a *server.Error, answered 500, and writes nothing
-// either.
+// state (409), the secret store's (503 secrets_unavailable) and the
+// required credentials and exposed secrets (422 credential_missing, both
+// Resolve), the quotas (429 sandbox_capacity, CheckQuota). A refused create
+// writes nothing. The record keeps the names of what was resolved, never a
+// value. A store or event failure is an error that is not a *server.Error,
+// answered 500, and writes nothing either; its text is scrubbed of the
+// resolved values (Scrub).
 func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Record, error) {
 	if in.Caller.User == nil {
 		return Record{}, server.Forbidden(msgNeedsUser)
@@ -196,15 +199,37 @@ func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body m
 	if err := fork.GuardUpdate(ctx, tx, w); err != nil {
 		return Record{}, err
 	}
+	snapshot, err := s.snapshotOf(req.profile)
+	if err != nil {
+		return Record{}, err
+	}
+	res, err := s.Resolve(ctx, w.Slug, snapshot)
+	if err != nil {
+		return Record{}, err
+	}
+	if err := res.Missing(); err != nil {
+		return Record{}, err
+	}
+	// From here on an error's text may hold what was resolved.
+	rec, err := s.store(ctx, tx, in, req, session, snapshot, res)
+	return rec, scrubError(res.Values(), err)
+}
+
+// store is the end of create, once the request passed every check but the
+// quotas: it checks them, then stores the sandbox with the names res
+// resolved, links it to its session and writes its create event, all in tx.
+func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req createRequest, session *string, snapshot Snapshot, res Resolution) (Record, error) {
+	w := in.Workspace
 	// The quotas come last: their count is atomic with the insert below
 	// only in this transaction.
 	if err := s.CheckQuota(ctx, tx, w, in.Caller.User.ID); err != nil {
 		return Record{}, err
 	}
-	rec, err := s.newRecord(ctx, tx, in, req, session)
+	rec, err := s.newRecord(ctx, tx, in, req, session, snapshot)
 	if err != nil {
 		return Record{}, err
 	}
+	rec.Credentials, rec.ExposedSecrets = res.CredentialNames(), res.SecretNames()
 	if err := Insert(ctx, tx, rec); err != nil {
 		return Record{}, err
 	}
@@ -256,12 +281,8 @@ func isUUID(s string) bool {
 // newRecord is the record of the sandbox req asks the caller for on in's
 // workspace, at the hub's time, in state provisioning and marked for the
 // provisioner.
-func (s *Service) newRecord(ctx context.Context, tx *sql.Tx, in CreateInput, req createRequest, session *string) (Record, error) {
+func (s *Service) newRecord(ctx context.Context, tx *sql.Tx, in CreateInput, req createRequest, session *string, snapshot Snapshot) (Record, error) {
 	w, p := in.Workspace, req.profile
-	snapshot, err := s.snapshotOf(p)
-	if err != nil {
-		return Record{}, err
-	}
 	checkout, err := s.checkoutOf(ctx, tx, w, req.checkout)
 	if err != nil {
 		return Record{}, err

@@ -10,6 +10,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
 
@@ -50,6 +51,9 @@ type Deps struct {
 	// Repos opens the repository of the workspace slug, in which a create
 	// resolves the ref it checks out.
 	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
+	// ResolveSecrets resolves secret names along the chain of the workspace
+	// slug, as the secret component's ResolveSecrets does.
+	ResolveSecrets func(ctx context.Context, slug string, names []string) (secret.SecretResolution, error)
 }
 
 // Bind sets the dependencies the stored sandboxes are worked with. It is

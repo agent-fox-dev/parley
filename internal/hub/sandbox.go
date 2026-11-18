@@ -36,8 +36,9 @@ const (
 // are on or not, so that turning them on later finds it. A start hook binds
 // the service to the store, the hub's clock, the event component, through
 // which a create and a transition write their events, the metrics recorder
-// and the workspaces' repositories, in which a create resolves its
-// checkout; the other sandbox packages register their delete and purge
+// the workspaces' repositories, in which a create resolves its checkout,
+// and the secret component's resolution, through which a create resolves
+// the profile's credentials and exposed secrets; the other sandbox packages register their delete and purge
 // hooks on the service. POST /workspaces/:slug/sandboxes creates a sandbox
 // through the service's create.
 //
@@ -61,6 +62,7 @@ func composeSandbox(c *Composition) {
 			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
 			},
+			ResolveSecrets: c.Secrets().ResolveSecrets,
 		}
 		for _, adjust := range c.sandboxAdjusters {
 			adjust(&d)

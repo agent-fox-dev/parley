@@ -1,8 +1,10 @@
 package sandbox_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -26,6 +28,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -598,13 +601,27 @@ const plainProfile = "[[sandbox.profiles]]\nname = \"plain\"\nttl = \"4h\"\nhub_
 // t1Session is the session of the fork demo--t1 of a create world.
 const t1Session = "6f1c2f0e-0000-4000-8000-0000000000aa"
 
+// credentialTables are the credentials model (provider profile anthropic,
+// secret MODEL_KEY) and mirror (provider profile mirror, secret MIRROR_KEY).
+const credentialTables = "[[sandbox.credentials]]\nname = \"model\"\nprovider_profile = \"anthropic\"\nsecret = \"MODEL_KEY\"\n" +
+	"[[sandbox.credentials]]\nname = \"mirror\"\nprovider_profile = \"mirror\"\nsecret = \"MIRROR_KEY\"\n"
+
+// secretsKey is the encryption key of a create hub's secret store, as the
+// operator configures it.
+var secretsKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+
 // createHub is a hub with sandboxes on over a fake runtime, on a clock
 // fixed at recordStart, with the users dana, who owns every workspace the
-// test adds, in the org acme, and a session linker the test steers.
+// test adds, in the org acme, a session linker the test steers, a secret
+// store with an encryption key, and a resolver in front of the hub's secret
+// resolution that the test can make fail. The runtime holds the provider
+// profiles anthropic and mirror of credentialTables.
 type createHub struct {
 	*probeHub
 	svc        *sandbox.Service
 	workspaces *workspace.Service
+	secrets    *secret.Component
+	resolver   *stubResolver
 	linker     *stubLinker
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
@@ -616,16 +633,22 @@ type createHub struct {
 // profiles given as TOML.
 func startCreateHub(t *testing.T, profiles string) *createHub {
 	t.Helper()
-	h := &createHub{probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}}
+	h := &createHub{probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}}
+	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
+	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "mirror", Variables: []string{"MIRROR_TOKEN"}})
 	cfg := hubtest.Config{
 		Server: sandboxesOn.Server,
 		TOML:   "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" + profiles,
 		Files:  sandboxesOn.Files,
+		Env:    map[string]string{secret.EnvCurrentKey: secretsKey},
 		Now:    func() time.Time { return recordStart },
 	}
 	cfg.Compose = func(c *hub.Composition) {
-		h.svc, h.workspaces = c.Sandbox(), c.Workspaces()
+		h.svc, h.workspaces, h.secrets = c.Sandbox(), c.Workspaces(), c.Secrets()
 		h.svc.RegisterSessionLinker(h.linker)
+		c.AdjustSandbox(func(d *sandbox.Deps) {
+			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
+		})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 		})
@@ -670,8 +693,14 @@ func (h *createHub) repository(t *testing.T, slug string, status workspace.Statu
 // parent's repository when the parent has one.
 func (h *createHub) fork(t *testing.T, slug, parent string, expires time.Time, session *string) {
 	t.Helper()
+	h.forkBy(t, slug, parent, h.dana, expires, session)
+}
+
+// forkBy is fork with the fork owned by the user owner.
+func (h *createHub) forkBy(t *testing.T, slug, parent, owner string, expires time.Time, session *string) {
+	t.Helper()
 	w := h.record(slug, access.KindFork, workspace.StatusReady)
-	w.ParentSlug, w.ExpiresAt, w.SessionID = &parent, &expires, session
+	w.ParentSlug, w.ExpiresAt, w.SessionID, w.OwnerID = &parent, &expires, session, owner
 	if _, err := os.Stat(h.workspaces.RepoPath(parent)); err == nil {
 		if err := (gitrepo.Git{}).CreateFork(context.Background(), h.workspaces.RepoPath(parent), h.workspaces.RepoPath(slug)); err != nil {
 			t.Fatal(err)
@@ -728,6 +757,13 @@ type footprint struct{ sandboxes, tokens, events, calls int }
 // footprint counts what a create could add.
 func (h *createHub) footprint(t *testing.T) footprint {
 	t.Helper()
+	return footprintOf(t, h.Hub, h.rt)
+}
+
+// footprintOf counts what a create could add to h, whose runtime is rt (nil
+// for none).
+func footprintOf(t *testing.T, h *hubtest.Hub, rt *runtimetest.Fake) footprint {
+	t.Helper()
 	var f footprint
 	db := h.Store.Main()
 	for _, c := range []struct {
@@ -738,7 +774,9 @@ func (h *createHub) footprint(t *testing.T) footprint {
 			t.Fatal(err)
 		}
 	}
-	f.calls = len(h.rt.Calls())
+	if rt != nil {
+		f.calls = len(rt.Calls())
+	}
 	return f
 }
 
@@ -756,10 +794,12 @@ func sandboxObject(t *testing.T, a answer) map[string]any {
 }
 
 // stubLinker is a session linker that accepts every session id, in lower
-// case, unless refuse is set, and keeps what it was asked.
+// case, unless refuse is set, and keeps what it was asked. Its record fails
+// with fail when fail is set.
 type stubLinker struct {
 	mu       sync.Mutex
 	refuse   bool
+	fail     error
 	checks   []string
 	recorded []string
 }
@@ -788,7 +828,44 @@ func (l *stubLinker) Record(_ context.Context, _ *sql.Tx, id, ws, sandboxID stri
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.recorded = append(l.recorded, id+" "+ws+" "+sandboxID)
-	return nil
+	return l.fail
+}
+
+func (l *stubLinker) setFail(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fail = err
+}
+
+// stubResolver stands in front of the hub's secret resolution: it answers
+// err while one is set and asks the hub's resolution otherwise.
+type stubResolver struct {
+	mu   sync.Mutex
+	err  error
+	next func(ctx context.Context, slug string, names []string) (secret.SecretResolution, error)
+}
+
+func (r *stubResolver) setErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+func (r *stubResolver) resolve(ctx context.Context, slug string, names []string) (secret.SecretResolution, error) {
+	r.mu.Lock()
+	err, next := r.err, r.next
+	r.mu.Unlock()
+	if err != nil {
+		return secret.SecretResolution{}, err
+	}
+	return next(ctx, slug, names)
+}
+
+// putSecret stores the secret name with value in the scope scope of the
+// owner id: an org id, a workspace slug or a user id.
+func (h *createHub) putSecret(t *testing.T, scope secret.Scope, id, name, value string) {
+	t.Helper()
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return h.secrets.Put(ctx, tx, scope, id, name, value) })
 }
 
 // last returns the last check and the last record, "" for none.

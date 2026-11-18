@@ -2,12 +2,14 @@ package sandbox_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -201,6 +203,65 @@ func TestCreate_RefusesByWorkspaceState(t *testing.T) {
 		t.Run(tc.slug, func(t *testing.T) {
 			before := h.footprint(t)
 			h.wantRefused(t, h.post(t, tc.slug, map[string]any{}), http.StatusConflict, tc.want, before)
+		})
+	}
+}
+
+func TestCreate_AuthorizationAndOrder(t *testing.T) {
+	t.Parallel()
+	off := startProbeHub(t, false)
+	before := footprintOf(t, off.Hub, nil)
+	a := off.call(t, http.MethodPost, "/workspaces/ws/sandboxes", off.IssueKey(t, off.owner), map[string]any{})
+	if a.status != http.StatusNotFound || a.err.ErrorType != "sandboxes_disabled" {
+		t.Errorf("create with sandboxes off = %d %s; want 404 sandboxes_disabled", a.status, a.body)
+	}
+	if after := footprintOf(t, off.Hub, nil); after != before {
+		t.Errorf("a refused create left %+v; want %+v", after, before)
+	}
+
+	h := startCreateHub(t, agentProfile+needsProfile+credentialTables)
+	h.world(t)
+	h.repository(t, "old", workspace.StatusArchived)
+	omar := h.CreateUser(t, "omar")
+	h.AddMember(t, h.org, omar)
+	gitPAT, omarKey := h.pat(t, h.dana, "git:read"), h.IssueKey(t, omar)
+	strangerKey := h.IssueKey(t, h.CreateUser(t, "stranger"))
+	const session = "6f1c2f0e-0000-4000-8000-000000000001"
+	unreadable := fmt.Errorf("secret %q %w", "MODEL_KEY", secret.ErrUnreadable)
+	needs := map[string]any{"profile": "needs"}
+	// Serial subtests: each steers the hub's linker, resolver and limits.
+	for _, tc := range []struct {
+		name, cred, slug string
+		body             any
+		refuseSession    bool
+		resolverErr      error
+		noCapacity       bool
+		status           int
+		errorType        string
+	}{
+		{"a PAT without sandboxes:write", gitPAT, "demo", map[string]any{}, false, nil, false, 403, "insufficient_scope"},
+		{"a caller without access", strangerKey, "demo", map[string]any{}, false, nil, false, 404, "not_found"},
+		{"a member with read access", omarKey, "demo", map[string]any{}, false, nil, false, 403, "forbidden"},
+		{"the admin token", h.Token, "demo", map[string]any{}, false, nil, false, 403, "forbidden"},
+		{"a PAT without sandboxes:write on a slug that does not exist", gitPAT, "nope", map[string]any{}, false, nil, false, 403, "insufficient_scope"},
+		{"a member with read access and a body that is no object", omarKey, "demo", "[]", false, nil, false, 403, "forbidden"},
+		{"the admin token and a body that is no object", h.Token, "demo", "[]", false, nil, false, 403, "forbidden"},
+		{"an invalid ttl and a refused session", h.key, "demo--t1", map[string]any{"ttl": "1s", "session_id": session}, true, nil, false, 400, "invalid_request"},
+		{"a refused session on an archived workspace", h.key, "old", map[string]any{"session_id": session}, true, nil, false, 400, "unknown_session"},
+		{"an archived workspace and an unreadable secret store", h.key, "old", needs, false, unreadable, false, 409, "workspace_archived"},
+		{"an unreadable secret store and a missing secret", h.key, "demo", needs, false, unreadable, false, 503, "secrets_unavailable"},
+		{"a missing secret and max_sandboxes reached", h.key, "demo", needs, false, nil, true, 422, "credential_missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.linker.setRefuse(tc.refuseSession)
+			h.resolver.setErr(tc.resolverErr)
+			l := only("max_sandboxes", 100)
+			if tc.noCapacity {
+				l = only("max_sandboxes", 0)
+			}
+			h.setLimits(l)
+			before := h.footprint(t)
+			h.wantRefused(t, h.call(t, http.MethodPost, "/workspaces/"+tc.slug+"/sandboxes", tc.cred, tc.body), tc.status, tc.errorType, before)
 		})
 	}
 }
