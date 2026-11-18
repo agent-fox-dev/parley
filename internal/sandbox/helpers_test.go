@@ -2,6 +2,7 @@ package sandbox_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -448,4 +450,130 @@ func startListHub(t *testing.T, src sandbox.Source) *probeHub {
 	}
 	h.Hub = hubtest.StartWith(t, cfg)
 	return h
+}
+
+// recordStart is where the clock of a record hub starts: a whole second,
+// since the store keeps whole seconds.
+var recordStart = time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+
+// recordSession is the session of the sandboxes a record hub seeds.
+const recordSession = "0b4e7c1a-5d3f-4a2b-9c8d-7e6f5a4b3c2d"
+
+// recordHub is a hub with sandboxes on over a fake runtime, on a clock the
+// test advances, whose sandbox records the test writes and moves through the
+// service directly.
+type recordHub struct {
+	*hubtest.Hub
+	svc   *sandbox.Service
+	clock *hubtest.JobClock
+	rec   *recordingRecorder
+}
+
+// startRecordHub starts a record hub, its clock at recordStart.
+func startRecordHub(t *testing.T) *recordHub {
+	t.Helper()
+	h := &recordHub{clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}}
+	fake := runtimetest.New(t)
+	cfg := sandboxesOn
+	cfg.Now = h.clock.Now
+	cfg.Compose = func(c *hub.Composition) {
+		h.svc = c.Sandbox()
+		c.SetSandboxRecorder(h.rec)
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return fake.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	return h
+}
+
+// seed stores a sandbox of the workspace ws in state, created an hour before
+// recordStart in the session recordSession, and returns its id. A sandbox
+// seeded in an ended state ended then too.
+func (h *recordHub) seed(t *testing.T, state string) string {
+	t.Helper()
+	before := recordStart.Add(-time.Hour)
+	session := recordSession
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: "ws", SessionID: &session, Profile: "agent", State: state,
+		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: "u1", Username: "owner"},
+		CreatedAt: before, UpdatedAt: before, UserID: "u1", FamilyRoot: "ws",
+	}
+	switch state {
+	case sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted:
+		rec.EndedAt = &before
+	}
+	err := h.Store.Tx(context.Background(), func(tx *sql.Tx) error { return sandbox.Insert(context.Background(), tx, rec) })
+	if err != nil {
+		t.Fatalf("insert a sandbox in %s: %v", state, err)
+	}
+	return rec.ID
+}
+
+// get reads the stored sandbox id.
+func (h *recordHub) get(t *testing.T, id string) sandbox.Record {
+	t.Helper()
+	rec, err := sandbox.Get(context.Background(), h.Store.Main(), id)
+	if err != nil {
+		t.Fatalf("get %s: %v", id, err)
+	}
+	return rec
+}
+
+// storedEvent is what a test checks of a hub event about a sandbox.
+type storedEvent struct {
+	typ, resourceType string
+	workspace         *string
+	session           *string
+}
+
+// events returns the hub events whose resource is the sandbox id, oldest
+// first.
+func (h *recordHub) events(t *testing.T, id string) []storedEvent {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT type, resource_type, workspace, session_id FROM hub_events WHERE resource_id = ? ORDER BY seq`, id)
+	if err != nil {
+		t.Fatalf("read the events of %s: %v", id, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []storedEvent
+	for rows.Next() {
+		var e storedEvent
+		if err := rows.Scan(&e.typ, &e.resourceType, &e.workspace, &e.session); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// recordingRecorder keeps the observations it is given; it ignores Add and
+// Set.
+type recordingRecorder struct {
+	mu  sync.Mutex
+	obs map[string][]float64
+}
+
+func (r *recordingRecorder) Add(string, map[string]string, float64) error { return nil }
+func (r *recordingRecorder) Set(string, map[string]string, float64) error { return nil }
+
+func (r *recordingRecorder) Observe(name string, _ map[string]string, value float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.obs == nil {
+		r.obs = map[string][]float64{}
+	}
+	r.obs[name] = append(r.obs[name], value)
+	return nil
+}
+
+// observations returns the values observed in the metric name, in order.
+func (r *recordingRecorder) observations(name string) []float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.obs[name])
 }

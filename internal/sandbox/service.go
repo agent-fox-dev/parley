@@ -35,6 +35,11 @@ type RuntimeVersion struct {
 // is loaded, so that the parts composed after it can keep it; they read it
 // once the hub serves. Configure and Start are called once, in that order,
 // before the first request; after that the service does not change.
+//
+// The service also holds the stored sandboxes: Bind gives it the store, the
+// clock, the event component and the metrics recorder in a start hook, and
+// Transition moves a record from one state to another. The sandbox packages
+// register their hooks on it.
 type Service struct {
 	settings    *Settings
 	externalURL string
@@ -44,6 +49,11 @@ type Service struct {
 	scrubber    *scrub.Scrubber
 	// source is what the hub-wide list reads; nil until one is registered.
 	source Source
+	// deps are what the stored sandboxes are worked with, set by Bind.
+	deps Deps
+	// deleteHooks and purgeHooks are the clean-up other sandbox packages
+	// register for the records.
+	deleteHooks, purgeHooks hooks
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

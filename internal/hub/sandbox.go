@@ -9,9 +9,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/openshell"
 )
 
-// sandboxCheckHook is the name of the start hook that runs the sandbox
-// runtime's start-up check.
-const sandboxCheckHook = "sandbox_runtime_check"
+const (
+	// sandboxCheckHook is the name of the start hook that runs the sandbox
+	// runtime's start-up check.
+	sandboxCheckHook = "sandbox_runtime_check"
+	// sandboxRecordsHook is the name of the start hook that binds the
+	// stored sandboxes to the store.
+	sandboxRecordsHook = "sandbox_records"
+)
 
 // composeSandbox adds the sandbox feature: it makes the feature the owner of
 // the [sandbox] section, checks the section right after the load (the
@@ -26,9 +31,16 @@ const sandboxCheckHook = "sandbox_runtime_check"
 // declared through the service, scrub the runtime errors they answer with
 // the hub's scrubber.
 //
+// The sandbox records are a table of their own, created whether sandboxes
+// are on or not, so that turning them on later finds it. A start hook binds
+// the service to the store, the hub's clock, the event component, through
+// which a transition writes its event, and the metrics recorder; the other
+// sandbox packages register their delete and purge hooks on the service.
+//
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
-// SetSandboxRuntime and parleyd passes the metrics registry with
+// SetSandboxRuntime, and a dependency of the stored sandboxes with
+// AdjustSandbox, and parleyd passes the metrics registry with
 // SetSandboxRecorder.
 func composeSandbox(c *Composition) {
 	svc := sandbox.NewService()
@@ -37,6 +49,15 @@ func composeSandbox(c *Composition) {
 	if err := sandbox.Register(c.registry); err != nil {
 		c.errs = append(c.errs, err)
 	}
+	c.AddSchemaStep(sandbox.SchemaStep)
+	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
+		d := sandbox.Deps{Store: rt.Store, Now: rt.Now, Events: c.Events(), Recorder: c.sandboxRecorder}
+		for _, adjust := range c.sandboxAdjusters {
+			adjust(&d)
+		}
+		svc.Bind(d)
+		return nil
+	})
 	c.addConfigCheck(svc.Configure)
 	c.AddRoute(svc.ProfilesRoute())
 	c.AddRoute(svc.SandboxesRoute())
@@ -91,6 +112,14 @@ func (c *Composition) SetSandboxRuntime(f sandbox.RuntimeFactory) {
 		f = openShellRuntime
 	}
 	c.sandboxRuntime = f
+}
+
+// AdjustSandbox adds fn to the functions that change the dependencies of
+// the stored sandboxes after the start hook has built them and before it
+// binds them, in the order they were added. Tests replace a collaborator
+// with it.
+func (c *Composition) AdjustSandbox(fn func(*sandbox.Deps)) {
+	c.sandboxAdjusters = append(c.sandboxAdjusters, fn)
 }
 
 // SetSandboxRecorder sets the recorder the sandbox feature and its runtime
