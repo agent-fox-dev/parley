@@ -79,8 +79,11 @@ var (
 // mappingOf is the mapping of the forge kind; a kind without one maps
 // nothing.
 func mappingOf(kind ForgeKind) mapping {
-	if kind == KindGitHub {
+	switch kind {
+	case KindGitHub:
 		return mapGitHub
+	case KindGitLab:
+		return mapGitLab
 	}
 	return func(string, string, map[string]any) ([]HookEvent, error) { return nil, errNoMapping }
 }
@@ -89,11 +92,6 @@ func mappingOf(kind ForgeKind) mapping {
 // kind: event is the delivery's event name, body its raw payload, and repos
 // the workspace's repositories. It does no I/O.
 func Reduce(kind ForgeKind, event string, body []byte, repos Repos) Reduction {
-	return reduce(kind, event, body, repos, mappingOf(kind))
-}
-
-// reduce is Reduce with the mapping m.
-func reduce(kind ForgeKind, event string, body []byte, repos Repos, m mapping) Reduction {
 	payload, ok := decodeObject(body)
 	if !ok {
 		return Reduction{Outcome: OutcomeMalformed}
@@ -106,7 +104,7 @@ func reduce(kind ForgeKind, event string, body []byte, repos Repos, m mapping) R
 	path, _ := member(payload, repoPath...).(string)
 	red := Reduction{Action: cutUTF8(action, maxActionBytes), Target: repos.match(path)}
 
-	events, err := m(event, action, payload)
+	events, err := mappingOf(kind)(event, action, payload)
 	switch {
 	case errors.Is(err, errNoMapping):
 		red.Outcome = OutcomeIgnored

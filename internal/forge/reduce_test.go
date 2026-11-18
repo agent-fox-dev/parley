@@ -28,12 +28,24 @@ func ghPayload(action, fullName any, extra map[string]any) []byte {
 }
 
 // glPayload is a GitLab payload with object_attributes.action and
-// project.path_with_namespace given; a nil value leaves its member out.
-func glPayload(action, path any) []byte {
-	p := map[string]any{"object_attributes": map[string]any{}}
+// project.path_with_namespace given, and the other members of extra, whose
+// object_attributes are added to the action; a nil value leaves its member
+// out.
+func glPayload(action, path any, extra map[string]any) []byte {
+	attrs := map[string]any{}
 	if action != nil {
-		p["object_attributes"] = map[string]any{"action": action}
+		attrs["action"] = action
 	}
+	p := map[string]any{}
+	for k, v := range extra {
+		p[k] = v
+	}
+	if more, ok := extra["object_attributes"].(map[string]any); ok {
+		for k, v := range more {
+			attrs[k] = v
+		}
+	}
+	p["object_attributes"] = attrs
 	if path != nil {
 		p["project"] = map[string]any{"path_with_namespace": path}
 	}
@@ -78,8 +90,8 @@ func TestReduce_ReadsTheActionAndTheTargetOfAnyObject(t *testing.T) {
 		{"github full_name not a string", forge.KindGitHub, "issues", ghPayload("opened", 7, nil), widgets, "opened", "null"},
 		{"github repository not an object", forge.KindGitHub, "issues",
 			[]byte(`{"action":"opened","repository":"acme/widgets"}`), widgets, "opened", "null"},
-		{"gitlab upstream in another case", forge.KindGitLab, "Issue Hook", glPayload("open", "Up/Widgets"), widgets, "open", "upstream"},
-		{"gitlab group path", forge.KindGitLab, "Issue Hook", glPayload("open", "group/sub/widgets"),
+		{"gitlab upstream in another case", forge.KindGitLab, "Issue Hook", glPayload("open", "Up/Widgets", nil), widgets, "open", "upstream"},
+		{"gitlab group path", forge.KindGitLab, "Issue Hook", glPayload("open", "group/sub/widgets", nil),
 			forge.Repos{Origin: "group/sub/widgets"}, "open", "origin"},
 		{"gitlab reads no top-level action", forge.KindGitLab, "Issue Hook",
 			[]byte(`{"action":"open","project":{"path_with_namespace":"acme/widgets"}}`), widgets, "", "origin"},
@@ -106,10 +118,6 @@ func TestReduce_ReadsTheActionAndTheTargetOfAnyObject(t *testing.T) {
 		t.Errorf("ping: outcome %q, target %s, %d events; want ignored, origin, none", red.Outcome, targetName(red.Target), len(red.Events))
 	}
 }
-
-// noEvents is a mapping whose every row relays nothing, as a GitLab merge
-// request update without a new revision does.
-func noEvents(string, string, map[string]any) ([]forge.HookEvent, error) { return nil, nil }
 
 func TestReduce_DecidesTheOutcomeByTheFirstMatchingRow(t *testing.T) {
 	t.Parallel()
@@ -149,8 +157,10 @@ func TestReduce_DecidesTheOutcomeByTheFirstMatchingRow(t *testing.T) {
 		}
 	}
 
-	// No events, even of no repository, is ignored.
-	red := forge.ReduceWith(noEvents, forge.KindGitLab, "Merge Request Hook", glPayload("update", nil), widgets)
+	// A merge request update without a new revision relays nothing, which
+	// is ignored even of no repository.
+	update := map[string]any{"object_attributes": map[string]any{"iid": 9}}
+	red := forge.Reduce(forge.KindGitLab, "Merge Request Hook", glPayload("update", nil, update), widgets)
 	if red.Outcome != forge.OutcomeIgnored || len(red.Events) != 0 {
 		t.Errorf("no events: outcome %q with %d events; want ignored with none", red.Outcome, len(red.Events))
 	}

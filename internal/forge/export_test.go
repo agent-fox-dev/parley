@@ -7,16 +7,16 @@ var (
 	ErrMissingField = errMissingField
 )
 
-// ReduceWith reduces a delivery as Reduce does, with the mapping m in place
-// of the forge's own.
-func ReduceWith(m func(event, action string, payload map[string]any) ([]HookEvent, error),
-	kind ForgeKind, event string, body []byte, repos Repos) Reduction {
-	return reduce(kind, event, body, repos, m)
-}
-
 // MapGitHub maps a GitHub delivery of the event and action whose payload is
 // the JSON object body, as the reduction does.
 func MapGitHub(event, action string, body []byte) ([]HookEvent, error) {
 	payload, _ := decodeObject(body)
 	return mapGitHub(event, action, payload)
+}
+
+// MapGitLab maps a GitLab delivery of the event and action whose payload is
+// the JSON object body, as the reduction does.
+func MapGitLab(event, action string, body []byte) ([]HookEvent, error) {
+	payload, _ := decodeObject(body)
+	return mapGitLab(event, action, payload)
 }
