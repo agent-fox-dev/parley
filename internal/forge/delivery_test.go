@@ -161,7 +161,7 @@ func TestRecordDelivery_StoresItsFieldsWithoutThePayloadOrTheSecret(t *testing.T
 			}
 		}
 	}
-	for _, r := range w.logged(t, "parley.forge.", "demo") {
+	for _, r := range w.eventsOf(t, "parley.forge.", "demo") {
 		if j := jsonOf(r); strings.Contains(j, marker) || strings.Contains(j, secretValue) {
 			t.Errorf("the stored event %s holds the payload or the secret", j)
 		}
@@ -183,7 +183,7 @@ func TestRecordDelivery_AnswersAnIdTheWorkspaceRecordedAsADuplicate(t *testing.T
 	if got := w.delivery(t, "demo", "d1"); got.Action != "opened" {
 		t.Errorf("the first delivery's action is now %q, want opened", got.Action)
 	}
-	if got := types(w.logged(t, "parley.forge.", "demo")); !reflect.DeepEqual(got, []string{"parley.forge.issue.opened"}) {
+	if got := types(w.eventsOf(t, "parley.forge.", "demo")); !reflect.DeepEqual(got, []string{"parley.forge.issue.opened"}) {
 		t.Errorf("the events of demo are %v, want the first delivery's only", got)
 	}
 
@@ -205,7 +205,7 @@ func TestRecordDelivery_StoresTheRecordAndItsEventsTogetherAlsoWhenTheCallerLeft
 	if got := w.delivery(t, "demo", "d1").Relayed; !reflect.DeepEqual(got, labelUpdateTypes) {
 		t.Errorf("relayed %v, want %v", got, labelUpdateTypes)
 	}
-	events := w.logged(t, "parley.forge.", "demo")
+	events := w.eventsOf(t, "parley.forge.", "demo")
 	if got := types(events); !reflect.DeepEqual(got, labelUpdateTypes) {
 		t.Errorf("the events of demo are %v, want %v", got, labelUpdateTypes)
 	}
@@ -224,7 +224,7 @@ func TestRecordDelivery_StoresTheRecordAndItsEventsTogetherAlsoWhenTheCallerLeft
 	if got := w.delivery(t, "demo", "d9"); got.Outcome != forge.OutcomeRelayed {
 		t.Errorf("delivery d9 outcome %q, want relayed", got.Outcome)
 	}
-	if got := types(w.logged(t, "parley.forge.", "demo")); len(got) != 4 || got[3] != "parley.forge.issue.opened" {
+	if got := types(w.eventsOf(t, "parley.forge.", "demo")); len(got) != 4 || got[3] != "parley.forge.issue.opened" {
 		t.Errorf("the events of demo are %v, want the event of d9 last", got)
 	}
 }
@@ -266,7 +266,7 @@ func TestRecordDelivery_KeepsNothingWhenAnEventCannotBeRecorded(t *testing.T) {
 	if n := len(w.deliveryRows(t, "demo")); n != 0 {
 		t.Errorf("demo holds %d deliveries after the failure, want none", n)
 	}
-	if n := len(w.logged(t, "parley.forge.", "demo")); n != 0 {
+	if n := len(w.eventsOf(t, "parley.forge.", "demo")); n != 0 {
 		t.Errorf("demo holds %d events after the failure, want none", n)
 	}
 
@@ -274,7 +274,7 @@ func TestRecordDelivery_KeepsNothingWhenAnEventCannotBeRecorded(t *testing.T) {
 	if out := w.record(t, "demo", forge.KindGitLab, "d1", "Issue Hook", body); out != forge.OutcomeRelayed {
 		t.Errorf("recorded again: outcome %q, want relayed", out)
 	}
-	if got := types(w.logged(t, "parley.forge.", "demo")); !reflect.DeepEqual(got, labelUpdateTypes) {
+	if got := types(w.eventsOf(t, "parley.forge.", "demo")); !reflect.DeepEqual(got, labelUpdateTypes) {
 		t.Errorf("the events of demo are %v, want %v", got, labelUpdateTypes)
 	}
 }
@@ -308,7 +308,7 @@ func TestRecordDelivery_RecordsOneOfConcurrentCopies(t *testing.T) {
 	if n := len(w.deliveryRows(t, "demo")); n != 1 {
 		t.Errorf("demo holds %d deliveries, want 1", n)
 	}
-	if n := len(w.logged(t, "parley.forge.issue.opened", "demo")); n != 1 {
+	if n := len(w.eventsOf(t, "parley.forge.issue.opened", "demo")); n != 1 {
 		t.Errorf("demo holds %d opened events, want 1", n)
 	}
 }

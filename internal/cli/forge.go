@@ -104,13 +104,7 @@ func setWebhook(c *call) error {
 		if err != nil {
 			return clientError("cannot read the secret from stdin: %v", err)
 		}
-		// One trailing line ending, \n or \r\n, is the shell's, not the
-		// secret's.
-		value := strings.TrimSuffix(string(data), "\n")
-		if len(value) < len(data) {
-			value = strings.TrimSuffix(value, "\r")
-		}
-		body = map[string]string{"secret": value}
+		body = map[string]string{"secret": withoutLineEnding(data)}
 	}
 	resp, err := c.client.request(c.ctx, c.decl.Method, routePath(c.decl.Path, c.args), nil, body)
 	if err != nil {

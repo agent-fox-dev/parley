@@ -103,6 +103,15 @@ var DeliverySchemaStep = store.Step{
 	},
 }
 
+// errWorkspaceGone is the error of a delivery to a workspace that is not
+// stored, such as one deleted after the ingress read its record.
+var errWorkspaceGone = errors.New("the workspace does not exist")
+
+// recordTimeout bounds the recording of a delivery, which runs detached
+// from the request, so that a store that never gives its turn does not
+// hold the handler forever.
+const recordTimeout = 30 * time.Second
+
 // RecordDelivery reduces a verified delivery of the workspace slug, of the
 // forge kind, with the forge's delivery id, its event name and raw body,
 // and records it with the events it relays, in one store transaction:
@@ -114,13 +123,14 @@ var DeliverySchemaStep = store.Step{
 // does not undo a delivery it will not send again. An error holds neither
 // the payload nor a secret.
 func (c *Component) RecordDelivery(ctx context.Context, slug string, kind ForgeKind, deliveryID, eventName string, body []byte) (Outcome, error) {
-	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
+	defer cancel()
 	ws, ok, err := c.deps.Workspaces(ctx, slug)
 	if err != nil {
 		return "", fmt.Errorf("read workspace %s: %w", slug, err)
 	}
 	if !ok {
-		return "", fmt.Errorf("workspace %s does not exist", slug)
+		return "", fmt.Errorf("record delivery %q of %s: %w", deliveryID, slug, errWorkspaceGone)
 	}
 	red := Reduce(kind, eventName, body, reposOf(ws))
 	relayed := make([]string, 0, len(red.Events))
@@ -139,6 +149,18 @@ func (c *Component) RecordDelivery(ctx context.Context, slug string, kind ForgeK
 
 	outcome := red.Outcome
 	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		// The record read above may predate a delete that committed while
+		// this transaction waited for its turn; the delivery table has no
+		// foreign key, so the workspace is read again under the one writer,
+		// and a deleted workspace's slug, registered again, starts with an
+		// empty log.
+		var exists int
+		switch err := tx.QueryRowContext(ctx, `SELECT 1 FROM workspaces WHERE slug = ?`, slug).Scan(&exists); {
+		case errors.Is(err, sql.ErrNoRows):
+			return errWorkspaceGone
+		case err != nil:
+			return err
+		}
 		res, err := tx.ExecContext(ctx, `INSERT INTO forge_deliveries
 			(workspace, delivery_id, forge, event, action, target, outcome, relayed, received_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

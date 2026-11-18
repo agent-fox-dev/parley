@@ -105,9 +105,9 @@ func deliveryIDs(items []map[string]any) []string {
 	return out
 }
 
-// logged reports whether the hub's log holds a line each of whose members
+// hasLogLine reports whether the hub's log holds a line each of whose members
 // in want is text holding the value want gives it.
-func (lw *logWorld) logged(want map[string]string) bool {
+func (lw *logWorld) hasLogLine(want map[string]string) bool {
 	for line := range strings.Lines(lw.Log.String()) {
 		var rec map[string]any
 		if json.Unmarshal([]byte(line), &rec) != nil {
@@ -301,7 +301,7 @@ func TestDeliveryPruning_ReportsTheStoresErrorAndPrunesAtTheNextPass(t *testing.
 	lw.clock.set(now)
 
 	waitUntil(t, "the pruning task's failure in the log", func() bool {
-		return lw.logged(map[string]string{"msg": "maintenance task failed", "task": "forge_delivery_pruning", "error": "deliveries are locked"})
+		return lw.hasLogLine(map[string]string{"msg": "maintenance task failed", "task": "forge_delivery_pruning", "error": "deliveries are locked"})
 	})
 	if got := deliveryIDs(lw.deliveries(t, "demo", "", lw.Token).Items); !slices.Equal(got, []string{"recent", "old"}) {
 		t.Fatalf("the log of demo after a failed pass = %v, want [recent old]", got)

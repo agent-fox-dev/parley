@@ -85,29 +85,12 @@ func (w *world) fillSecrets(t *testing.T, slug string, n int) {
 	}
 }
 
-// logged are the events of the hub's log whose type begins with prefix,
-// of slug only unless slug is "".
-func (w *world) logged(t *testing.T, prefix, slug string) []event.Record {
-	t.Helper()
-	records, _, err := w.events.ReadAfter(context.Background(), 0, 0)
-	if err != nil {
-		t.Fatalf("read the event log: %v", err)
-	}
-	var out []event.Record
-	for _, r := range records {
-		if strings.HasPrefix(r.Type, prefix) && (slug == "" || r.Workspace != nil && *r.Workspace == slug) {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
 // wantWebhookSet fails the test unless the log holds exactly one webhook
 // set event of slug, by the owner's API key, whose metadata says whether
 // the secret was generated.
 func (w *world) wantWebhookSet(t *testing.T, slug string, generated bool) {
 	t.Helper()
-	got := w.logged(t, "parley.forge.webhook.", slug)
+	got := w.eventsOf(t, "parley.forge.webhook.", slug)
 	if len(got) != 1 {
 		t.Fatalf("the log holds %d webhook events of %s, want 1: %+v", len(got), slug, got)
 	}
@@ -168,10 +151,10 @@ func TestWebhookSet_GeneratesAndStoresASecret(t *testing.T) {
 		}
 	})
 
-	if n := len(w.logged(t, "parley.secret.", "")); n != 0 {
+	if n := len(w.eventsOf(t, "parley.secret.", "")); n != 0 {
 		t.Errorf("the log holds %d secret events, want none", n)
 	}
-	for _, e := range w.logged(t, "", "") {
+	for _, e := range w.eventsOf(t, "", "") {
 		line, err := json.Marshal(e)
 		if err != nil {
 			t.Fatal(err)
@@ -233,7 +216,7 @@ func TestWebhookSet_RefusesABodyOutsideTheRule(t *testing.T) {
 	w.addWorkspace(t, workspace.Workspace{Slug: "demo"})
 	const before = "the-value-before-0123"
 	w.putSecret(t, "demo", forge.SecretWebhook, before)
-	events := len(w.logged(t, "", ""))
+	events := len(w.eventsOf(t, "", ""))
 
 	cases := []struct {
 		name string
@@ -268,7 +251,7 @@ func TestWebhookSet_RefusesABodyOutsideTheRule(t *testing.T) {
 			if got := w.webhookSecret(t, "demo"); got != before {
 				t.Errorf("the stored secret = %q, want %q", got, before)
 			}
-			if n := len(w.logged(t, "", "")); n != events {
+			if n := len(w.eventsOf(t, "", "")); n != events {
 				t.Errorf("the log holds %d events, want %d", n, events)
 			}
 		})
@@ -347,7 +330,7 @@ func TestWebhookSet_RefusesByScopeAccessForkBodyAndArchivedInOrder(t *testing.T)
 					t.Errorf("%s holds %d secrets, want none", slug, n)
 				}
 			}
-			if n := len(w.logged(t, "parley.forge.webhook.", "")); n != 0 {
+			if n := len(w.eventsOf(t, "parley.forge.webhook.", "")); n != 0 {
 				t.Errorf("the log holds %d webhook events, want none", n)
 			}
 		})
@@ -392,7 +375,7 @@ func TestWebhookSet_RefusesWithoutAKeyOrRoomForTheSecret(t *testing.T) {
 		}
 	}
 	for _, slug := range []string{"demo", "full"} {
-		if n := len(w.logged(t, "parley.forge.webhook.", slug)); n != 0 {
+		if n := len(w.eventsOf(t, "parley.forge.webhook.", slug)); n != 0 {
 			t.Errorf("the log holds %d webhook events of %s, want none", n, slug)
 		}
 	}
@@ -441,7 +424,7 @@ func TestWebhookUnset_RemovesTheSecretInAnyStateAndRecordsWhetherOneExisted(t *t
 			if got, n := w.webhookSecret(t, slug), w.secretCount(t, slug); got != "" || n != 1 {
 				t.Errorf("%s holds the webhook secret %q and %d secrets, want no webhook secret and its other secret", slug, got, n)
 			}
-			got := w.logged(t, "parley.forge.webhook.unset", slug)
+			got := w.eventsOf(t, "parley.forge.webhook.unset", slug)
 			if len(got) != c.deletes {
 				t.Fatalf("the log holds %d unset events of %s, want %d", len(got), slug, c.deletes)
 			}
@@ -450,7 +433,7 @@ func TestWebhookUnset_RemovesTheSecretInAnyStateAndRecordsWhetherOneExisted(t *t
 			}
 		})
 	}
-	if n := len(w.logged(t, "parley.secret.", "")); n != 0 {
+	if n := len(w.eventsOf(t, "parley.secret.", "")); n != 0 {
 		t.Errorf("the log holds %d secret events, want none", n)
 	}
 }
@@ -487,7 +470,7 @@ func TestWebhookUnset_RefusesByScopeAccessAndFork(t *testing.T) {
 					t.Errorf("the webhook secret of %s = %q, want %q", slug, got, before)
 				}
 			}
-			if n := len(w.logged(t, "parley.forge.webhook.", "")); n != 0 {
+			if n := len(w.eventsOf(t, "parley.forge.webhook.", "")); n != 0 {
 				t.Errorf("the log holds %d webhook events, want none", n)
 			}
 		})
@@ -557,7 +540,7 @@ func TestWebhook_KeepsTheSecretAsItWasWhenItsEventCannotBeRecorded(t *testing.T)
 			if got := w.webhookSecret(t, slug); got != c.held {
 				t.Errorf("the webhook secret of %s = %q, want %q", slug, got, c.held)
 			}
-			if n := len(w.logged(t, "parley.forge.webhook.", slug)); n != 0 {
+			if n := len(w.eventsOf(t, "parley.forge.webhook.", slug)); n != 0 {
 				t.Errorf("the log holds %d webhook events of %s, want none", n, slug)
 			}
 		})

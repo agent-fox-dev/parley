@@ -5869,7 +5869,7 @@ comp.Ingress())`, `POST /hooks/forge/{slug}` on the server's mux outside
 content-type check do not apply, and the handler does its own checks in a
 fixed order (`ingest`, `internal/forge/ingress.go`): the workspace record
 (`Deps.Workspaces`) and the secret (`Deps.Secrets.Get`, on every request),
-the scheme and a GitLab token (`subtle.ConstantTimeCompare`), the body read
+the scheme and a GitLab token (`subtle.ConstantTimeCompare` of the SHA-256 digests, so the secret's length does not show), the body read
 through a 1 MiB + 1 `io.LimitReader`, a GitHub signature (`hmac.Equal`), the
 delivery id and event name, then `(*Component).RecordDelivery`. Its errors
 are written with `server.WriteError`.
@@ -5879,7 +5879,10 @@ a carry-patch workspace, the upstream repository with `ParseRemote`, runs
 `Reduce` (`internal/forge/reduce.go`), a pure function of the forge kind,
 the event name, the body and the repositories, and stores the result in one
 `Store.Tx` run on `context.WithoutCancel`, so a forge that leaves early does
-not cancel it: `INSERT … ON CONFLICT (workspace, delivery_id) DO NOTHING`
+not cancel it, bounded by 30 seconds: it reads the workspace's row again
+(a workspace deleted since the ingress read its record is answered `404`,
+so a slug registered again starts with an empty log), then
+`INSERT … ON CONFLICT (workspace, delivery_id) DO NOTHING`
 into `forge_deliveries` (schema step `forge.DeliverySchemaStep`), where no
 inserted row is a duplicate that writes nothing else, then `Emit` of each
 relayed event in order. Concurrent copies of one delivery are settled by the

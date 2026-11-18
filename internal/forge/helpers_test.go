@@ -516,3 +516,20 @@ func errorOf(t *testing.T, body []byte) hubError {
 	}
 	return e.Error
 }
+
+// eventsOf are the events of the hub's log whose type begins with prefix,
+// of slug only unless slug is "".
+func (w *world) eventsOf(t *testing.T, prefix, slug string) []event.Record {
+	t.Helper()
+	records, _, err := w.events.ReadAfter(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("read the event log: %v", err)
+	}
+	var out []event.Record
+	for _, r := range records {
+		if strings.HasPrefix(r.Type, prefix) && (slug == "" || r.Workspace != nil && *r.Workspace == slug) {
+			out = append(out, r)
+		}
+	}
+	return out
+}

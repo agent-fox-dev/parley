@@ -371,7 +371,7 @@ func TestHookEvent_RecordsTheForgeTheTargetTheDeliveryAndTheActorOfEveryEvent(t 
 		if out := w.record(t, d.slug, d.kind, d.id, d.event, d.body); out != forge.OutcomeRelayed {
 			t.Fatalf("delivery %s: outcome %q, want relayed", d.id, out)
 		}
-		events := w.logged(t, "parley.forge.", d.slug)
+		events := w.eventsOf(t, "parley.forge.", d.slug)
 		if len(events) == 0 {
 			t.Fatalf("delivery %s: no event of %s", d.id, d.slug)
 		}

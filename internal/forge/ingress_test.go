@@ -268,7 +268,7 @@ func TestIngress_RecordsAnAuthenticatedDeliveryOfEitherForgeAndAnswersItsOutcome
 	if n := w.deliveryCount(t); n != 6 {
 		t.Errorf("the hub recorded %d deliveries, want 6", n)
 	}
-	events := w.logged(t, "parley.forge.issue.", "demo")
+	events := w.eventsOf(t, "parley.forge.issue.", "demo")
 	if len(events) != 4 {
 		t.Errorf("demo holds %d issue events, want 4", len(events))
 	}
@@ -401,8 +401,31 @@ func TestIngress_RefusesAMalformedDeliveryButKeepsItAndAnswersARepeatAsADuplicat
 	if n := w.deliveryCount(t); n != 2 {
 		t.Errorf("the hub recorded %d deliveries, want 2", n)
 	}
-	if n := len(w.logged(t, "parley.forge.", "demo")); n != 1 {
+	if n := len(w.eventsOf(t, "parley.forge.", "demo")); n != 1 {
 		t.Errorf("demo holds %d forge events, want the one of r1", n)
+	}
+}
+
+func TestIngress_RecordsNothingForAWorkspaceDeletedWhileItsDeliveryWasChecked(t *testing.T) {
+	t.Parallel()
+	// The ingress reads gone's record before the delete commits; by the
+	// time the delivery is recorded the workspace is no longer stored.
+	w := newDeliveryWorld(t, deliveryTime, func(_ *world, d *forge.Deps) {
+		read := d.Workspaces
+		d.Workspaces = func(ctx context.Context, slug string) (workspace.Workspace, bool, error) {
+			if slug == "gone" {
+				return workspace.Workspace{Slug: "gone", Kind: "repository", Status: workspace.StatusReady,
+					Mode: workspace.ModeStandard, GitURL: new("https://github.com/acme/widgets.git")}, true, nil
+			}
+			return read(ctx, slug)
+		}
+	})
+	w.putSecret(t, "gone", forge.SecretWebhook, hookSecret)
+	body := ghIssue("opened", nil)
+	status, answer := w.deliver(t, "gone", ghHeaders("d1", "issues", hookSecret, body), bytes.NewReader(body))
+	wantRefusal(t, "a delivery to a workspace deleted meanwhile", status, answer, http.StatusNotFound, "not_found")
+	if n, events := w.deliveryCount(t), w.forgeEvents(t); n != 0 || events != 0 {
+		t.Errorf("the hub holds %d deliveries and %d forge events, want none", n, events)
 	}
 }
 
@@ -448,13 +471,13 @@ func TestIngress_AnswersAHubFailureAsInternalAndKeepsNothing(t *testing.T) {
 	if n := w.deliveryCount(t); n != 1 {
 		t.Errorf("the hub holds %d deliveries, want only d1", n)
 	}
-	if got := types(w.logged(t, "parley.forge.", "demo")); len(got) != 1 {
+	if got := types(w.eventsOf(t, "parley.forge.", "demo")); len(got) != 1 {
 		t.Errorf("the events of demo are %v, want only the one of d1", got)
 	}
 	log.armed.Store(false)
 	status, answer = w.deliver(t, "demo", glHeaders("u1", "Issue Hook", hookSecret), bytes.NewReader(update))
 	wantOutcome(t, "u1 again", status, answer, forge.OutcomeRelayed)
-	if got := types(w.logged(t, "parley.forge.issue.", "demo")); len(got) != 4 {
+	if got := types(w.eventsOf(t, "parley.forge.issue.", "demo")); len(got) != 4 {
 		t.Errorf("the events of demo are %v, want d1's and the three of u1", got)
 	}
 }
@@ -527,7 +550,7 @@ func TestIngress_TakesADeliveryWithoutACredentialOrRateLimitAgainstTheSecretOfTh
 	w.putSecret(t, "old", forge.SecretWebhook, hookSecret)
 	status, answer = w.deliver(t, "old", ghHeaders("a1", "issues", hookSecret, body), bytes.NewReader(body))
 	wantOutcome(t, "a delivery to the archived workspace", status, answer, forge.OutcomeRelayed)
-	if n := len(w.logged(t, "parley.forge.issue.opened", "old")); n != 1 {
+	if n := len(w.eventsOf(t, "parley.forge.issue.opened", "old")); n != 1 {
 		t.Errorf("the archived workspace holds %d opened events, want 1", n)
 	}
 }

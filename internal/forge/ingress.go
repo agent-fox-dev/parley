@@ -74,6 +74,10 @@ func (c *Component) Ingress() http.Handler {
 			// that the forge's redelivery is answered as a duplicate.
 			e = errMalformed
 		case errors.As(err, &e):
+		case errors.Is(err, errWorkspaceGone):
+			// Deleted after its record was read: answered as every
+			// workspace without a webhook is.
+			e = errNoIngress
 		default:
 			// The cause names the workspace and the step, never the
 			// payload or the secret.
@@ -119,7 +123,7 @@ func (c *Component) ingest(r *http.Request) (Outcome, error) {
 		kind = KindGitLab
 		// A GitLab token is checked before the body is read, so that an
 		// unproven caller cannot make the hub read a megabyte.
-		if len(tokens) != 1 || subtle.ConstantTimeCompare([]byte(tokens[0]), []byte(key)) != 1 {
+		if len(tokens) != 1 || !sameSecret(tokens[0], key) {
 			return "", errUnauthenticated
 		}
 	default:
@@ -191,4 +195,12 @@ func validDeliveryID(id string) bool {
 		}
 	}
 	return true
+}
+
+// sameSecret compares a GitLab token with the secret in constant time,
+// lengths included: their digests, unlike the values, are of one length,
+// which subtle.ConstantTimeCompare would otherwise answer at once.
+func sameSecret(token, key string) bool {
+	a, b := sha256.Sum256([]byte(token)), sha256.Sum256([]byte(key))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
