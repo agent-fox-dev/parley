@@ -103,7 +103,10 @@ const (
 // landed, whoever landed it: the lander, told of the land, has the change
 // announced landable again when it already sits on the landed commit,
 // and otherwise starts it from the announcement of the version the hub's
-// restack records. Tests change its dependencies with AdjustAutoLand.
+// restack records. The teardown of a workspace deletes what the lander
+// keeps of its changes in the delete's transaction
+// (docs/adr/07-register-the-teardown-collaborators-on-the-workspace-service.md).
+// Tests change its dependencies with AdjustAutoLand.
 func composeLandRules(c *Composition) {
 	c.versionFiles = c.Land().VersionFiles()
 	paths := c.Land().PathGuard()
@@ -114,6 +117,7 @@ func composeLandRules(c *Composition) {
 	lander := &land.AutoLander{}
 	c.autoLander = lander
 	c.AddSchemaStep(land.AutoLandStep)
+	c.workspaces.Teardown().RegisterRemover(lander.WorkspaceDeleted)
 	c.Changes().RegisterAutoLandGuard(lander)
 	c.Land().AddFinalObserver(lander.Finished)
 	c.AddStartHook(autoLandHook, func(ctx context.Context, rt *Runtime) error {

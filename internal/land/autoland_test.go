@@ -978,6 +978,36 @@ func (w *world) landerRows(t *testing.T, number int64) (n int) {
 	return n
 }
 
+func TestAutoLand_KeepsNothingOfADeletedWorkspace(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	ctx := context.Background()
+	due := time.Now().Add(time.Hour).UnixNano()
+	if _, err := w.Store.Main().ExecContext(ctx, `INSERT INTO land_auto_land (workspace_slug, number, retries, due_at, held_by)
+VALUES ('api', 1, 3, ?, NULL), ('api', 2, 0, NULL, 1), ('other', 1, 3, ?, NULL)`, due, due); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := w.workspaces.RemoveOwned(ctx, tx, "api", "workspace_deleted")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []struct {
+		workspace string
+		want      int
+	}{{"api", 0}, {"other", 1}} {
+		var n int
+		if err := w.Store.Main().QueryRowContext(ctx, `SELECT COUNT(*) FROM land_auto_land WHERE workspace_slug = ?`,
+			k.workspace).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != k.want {
+			t.Errorf("the lander keeps %d rows of %s after api's data is removed, want %d", n, k.workspace, k.want)
+		}
+	}
+}
+
 func TestAutoLand_StartsALandThatMetAnUnknownMergeableOnceItIsCleanAgain(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
