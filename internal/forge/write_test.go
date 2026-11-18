@@ -29,6 +29,7 @@ type writeRoute struct {
 // tests that run over every write route run over these.
 var writeRoutes = []writeRoute{
 	{http.MethodPost, "/issues", map[string]any{"title": "t"}},
+	{http.MethodPatch, "/issues/7", map[string]any{"title": "n"}},
 }
 
 // seedIssue stores issue 7, open and labelled bug, in the fake forge's
@@ -104,38 +105,45 @@ func TestWriteRoute_AnswersTheFirstFailingCheck(t *testing.T) {
 	w.addWorkspace(t, workspace.Workspace{Slug: "archived-unknown", Status: workspace.StatusArchived, GitURL: unknown})
 	w.addWorkspace(t, workspace.Workspace{Slug: "invalid-api", GitURL: gh, Settings: settings(forge.SettingAPIURL, "http://ghe.example.com")})
 	w.addWorkspace(t, workspace.Workspace{Slug: "anon", GitURL: gh, Settings: w.github()})
+	w.addWorkspace(t, workspace.Workspace{Slug: "gl-anon", GitURL: new("https://gitlab.com/group/sub/widgets.git"), Settings: w.gitlab()})
 	for _, slug := range []string{"demo", "archived"} {
 		w.putSecret(t, slug, workspace.SecretGitPAT, slug+"-token")
 	}
 
 	malformed, valid := `{"title":`, map[string]any{"title": "t"}
 	oversized := map[string]any{"title": "t", "body": strings.Repeat("x", 65537)}
+	post, patch := http.MethodPost, http.MethodPatch
 	cases := []struct {
-		name, slug, path string
-		body             any
-		status           int
-		errorType        string
+		name, slug, method, path string
+		body                     any
+		status                   int
+		errorType                string
 		// contains is what the message must hold, when it is set.
 		contains string
 	}{
-		{"an invalid target before a malformed body", "demo", "/issues?target=bogus", malformed, 400, "invalid_request", "target"},
-		{"upstream on a standard workspace before a malformed body", "demo", "/issues?target=upstream", malformed, 400, "workspace_mode_mismatch", ""},
-		{"target given twice", "demo", "/issues?target=origin&target=origin", valid, 400, "invalid_request", "target"},
-		{"a malformed body before an unknown forge", "unknown", "/issues", malformed, 400, "invalid_request", ""},
-		{"a blank title before an archived workspace", "archived", "/issues", map[string]any{"title": " \t"}, 400, "invalid_request", "title"},
-		{"an archived workspace before an unknown forge", "archived-unknown", "/issues", valid, 409, "workspace_archived", ""},
-		{"an unknown forge before a missing credential", "unknown", "/issues", valid, 422, forge.ErrorTypeUnknown, ""},
-		{"an invalid API URL before a missing credential", "invalid-api", "/issues", valid, 422, forge.ErrorTypeAPIURLInvalid, ""},
-		{"an unknown forge before an oversized text", "unknown", "/issues", oversized, 422, forge.ErrorTypeUnknown, ""},
-		{"an oversized text before a missing credential", "anon", "/issues", oversized, 413, "payload_too_large", "body"},
+		{"an invalid target before a malformed body", "demo", post, "/issues?target=bogus", malformed, 400, "invalid_request", "target"},
+		{"upstream on a standard workspace before a malformed body", "demo", post, "/issues?target=upstream", malformed, 400, "workspace_mode_mismatch", ""},
+		{"upstream on a standard workspace before a bad number", "demo", patch, "/issues/07?target=upstream", valid, 400, "workspace_mode_mismatch", ""},
+		{"target given twice", "demo", post, "/issues?target=origin&target=origin", valid, 400, "invalid_request", "target"},
+		{"a bad number before an archived workspace", "archived", patch, "/issues/0", valid, 400, "invalid_request",
+			"number must be a positive decimal integer"},
+		{"a malformed body before an unknown forge", "unknown", post, "/issues", malformed, 400, "invalid_request", ""},
+		{"a blank title before an archived workspace", "archived", post, "/issues", map[string]any{"title": " \t"}, 400, "invalid_request", "title"},
+		{"an archived workspace before an unknown forge", "archived-unknown", post, "/issues", valid, 409, "workspace_archived", ""},
+		{"an unknown forge before a missing credential", "unknown", post, "/issues", valid, 422, forge.ErrorTypeUnknown, ""},
+		{"an invalid API URL before a missing credential", "invalid-api", post, "/issues", valid, 422, forge.ErrorTypeAPIURLInvalid, ""},
+		{"an unknown forge before an oversized text", "unknown", post, "/issues", oversized, 422, forge.ErrorTypeUnknown, ""},
+		{"GitLab assignees alone before a missing credential", "gl-anon", patch, "/issues/7", map[string]any{"assignees": []string{"ann"}},
+			400, "invalid_request", "assignees"},
+		{"an oversized text before a missing credential", "anon", post, "/issues", oversized, 413, "payload_too_large", "body"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			status, body, sent := w.send(t, http.MethodPost, c.slug, c.path, w.ownerKey, c.body)
+			status, body, sent := w.send(t, c.method, c.slug, c.path, w.ownerKey, c.body)
 			e := errorOf(t, body)
 			if status != c.status || e.Type != c.errorType || !strings.Contains(e.Message, c.contains) || sent != 0 {
-				t.Errorf("POST %s%s = %d %s after %d forge requests, want %d %s naming %q after none",
-					c.slug, c.path, status, body, sent, c.status, c.errorType, c.contains)
+				t.Errorf("%s %s%s = %d %s after %d forge requests, want %d %s naming %q after none",
+					c.method, c.slug, c.path, status, body, sent, c.status, c.errorType, c.contains)
 			}
 			if n := w.forgeEvents(t); n != 0 {
 				t.Errorf("the event log holds %d forge events, want none", n)
@@ -268,6 +276,13 @@ var (
 			{"101 assignees", map[string]any{"title": "t", "assignees": names(101)}, "assignees"},
 			{"a body that is a number", map[string]any{"title": "t", "body": 5}, "body"},
 		}},
+		{http.MethodPatch, "/issues/7", []badBody{
+			{"an empty title", map[string]any{"title": ""}, "title"},
+			{"a blank title", map[string]any{"title": " \t"}, "title"},
+			{"a state that is neither open nor closed", map[string]any{"state": "merged"}, "state"},
+			{"a state that is a number", map[string]any{"state": 5}, "state"},
+			{"a blank label", map[string]any{"labels": []string{" "}}, "labels"},
+		}},
 	}
 	boundBodies = []struct {
 		method, path string
@@ -319,6 +334,8 @@ var decoratedBodies = []struct {
 }{
 	{http.MethodPost, "/issues", map[string]any{"title": "t"},
 		map[string]any{"title": "t", "body": nil, "labels": nil, "assignees": nil, "extra": 1}},
+	{http.MethodPatch, "/issues/7", map[string]any{"title": "t"},
+		map[string]any{"title": "t", "body": nil, "state": nil, "labels": nil, "assignees": nil, "extra": 1}},
 }
 
 func TestWriteRoute_TreatsNullAsAbsentAndIgnoresUnknownMembers(t *testing.T) {
@@ -352,6 +369,7 @@ var measuredTexts = []struct {
 	github, gitlab      string
 }{
 	{http.MethodPost, "/issues", "body", func(s string) map[string]any { return map[string]any{"title": "t", "body": s} }, "body", "description"},
+	{http.MethodPatch, "/issues/7", "body", func(s string) map[string]any { return map[string]any{"body": s} }, "body", "description"},
 }
 
 func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
@@ -458,6 +476,10 @@ var writeEvents = []struct {
 		"parley.forge.issue.create", "issue", 7,
 		"7", map[string]any{"number": 7, "url": "https://github.com/acme/widgets/issues/7"},
 		"none", nil},
+	{http.MethodPatch, "/issues/7", map[string]any{"state": "closed", "title": titleMarker},
+		"parley.forge.issue.update", "issue", 0,
+		"7", map[string]any{"number": 7, "url": "https://github.com/acme/widgets/issues/7", "fields": []string{"state", "title"}},
+		"7", map[string]any{"number": 7, "fields": []string{"state", "title"}}},
 }
 
 // wantEvent checks that got is an event of the type typ about the resource

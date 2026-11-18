@@ -117,6 +117,9 @@ func (c *Component) writeRoutes() []server.Route {
 	return []server.Route{
 		c.writeRoute(writeRoute{method: http.MethodPost, pattern: "/workspaces/:slug/issues",
 			event: eventKind{"parley.forge.issue.create", "issue"}, before: readIssueCreate, serve: createIssue}),
+		c.writeRoute(writeRoute{method: http.MethodPatch, pattern: "/workspaces/:slug/issues/:number",
+			event: eventKind{"parley.forge.issue.update", "issue"}, before: readIssueUpdate, after: refuseAssigneesAlone,
+			serve: updateIssue}),
 	}
 }
 
@@ -301,6 +304,8 @@ func (c *Call) sendJSON(ctx context.Context, method, path string, body, v any) e
 type writer interface {
 	// createIssue creates an issue with the fields of in that are set.
 	createIssue(ctx context.Context, call *Call, in issueInput) (Issue, error)
+	// updateIssue updates an issue with the fields of in that are set.
+	updateIssue(ctx context.Context, call *Call, in issueUpdate) (Issue, error)
 }
 
 func writerOf(kind ForgeKind) writer {
