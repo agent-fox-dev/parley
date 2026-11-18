@@ -19,7 +19,7 @@ command-line client. Both are written in Go, in the module
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, a registry of keys and whole sections that decides what the file may hold, and the keys it owns itself, among them the fork limits of `[forks]` (`Config.Forks`), whose `max_ttl` it refuses when shorter than `default_ttl`, the read bounds of `[scm]` (`Config.SCM{ReadTimeout, MaxFileSize}`), each refused at zero or below, the mergeability debounce of `[changes]` (`Config.Changes{MergeableDebounce}`), refused when it is not a duration, and the landing options of `[land]` (`Config.Land{MaxAttempts, Timeout, Workers, CommitterName, CommitterEmail}`), refused below 1, at a timeout of zero or below, or empty |
 | `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
-| `internal/forge` | the forge component, the hub's client of the GitHub or GitLab repository a workspace's remote lives on: the resolution of a remote target into repository, forge kind, API URL and credential (`Resolve`, `ParseRemote`, `ResolveCredential`), the outbound `Client` and its typed `Failure`s, the mapping of a failure to a hub error (`MapError`), the route helper every forge route is built with (`Component.Route`), forge paging, the two wire mappings, the read routes (see [Forge reads](#forge-reads)) and the write routes with their events (see [Forge writes](#forge-writes)) |
+| `internal/forge` | the forge component, the hub's client of the GitHub or GitLab repository a workspace's remote lives on: the resolution of a remote target into repository, forge kind, API URL and credential (`Resolve`, `ParseRemote`, `ResolveCredential`), the outbound `Client` and its typed `Failure`s, the mapping of a failure to a hub error (`MapError`), the route helper every forge route is built with (`Component.Route`), forge paging, the two wire mappings, the read routes (see [Forge reads](#forge-reads)), the write routes with their events (see [Forge writes](#forge-writes)), and the webhook secret's routes, the public delivery ingress, the reduction of a delivery to hub events, the delivery record and its list (see [Forge webhooks](#forge-webhooks)) |
 | `internal/forge/forgetest` | test support, imported by test code only: `New` and `NewPlain` serve a fake GitHub and GitLab API over TLS or plain HTTP, record every request, serve the entities a test sets (`SetObject`, `SetList`, `SetListIn`, paged by `per_page`/`page` with a `Link` `rel="next"`) and answer what a test scripts (`Script`, an answer that may be held until the test releases it and then passed on); below a repository's API path it keeps in-memory GitHub repositories and GitLab projects for the writes (issues, comments, labels, pull requests: `SetNext`, `AddIssue`, `Issue`, `AddLabel`, `SetLabels`, `Labels`) |
 | `internal/forge/number` | the rule of a pull request or issue number (`Parse`), a leaf package of the standard library alone, shared by the hub's routes and the `parley` client |
 | `internal/fork` | task forks: the lifetime rule `ResolveTTL(ttl, now, limits)`, the one judge of a requested `ttl` (a whole number above zero followed by `m`, `h` or `d`, from `5m` to `[forks].max_ttl`), which returns `expires_at` in whole seconds UTC or a `400 invalid_request` naming `ttl`, and `DefaultExpiry(now, limits)` for a fork created without one; the fork record (`Fork`: the workspace record plus the names of the parent's branches and tags at creation) and its store functions; and the `Component` with a fork's ref view (`Refs`), its computed head (`HeadSHA`, also shown as the `head_sha` of its workspace object) and the check of a write to one of its branches (`CheckBranchWrite`), and the parent-state check of a read or a write of a fork (`CheckParentState`); the handlers of `purpose` and `auto_change` in an update of a fork (`PurposeField`, `AutoChangeField`) and the guard of every update of a fork (`GuardUpdate`); and the routes `POST /workspaces/:slug/forks`, which creates a fork, and `GET /workspaces/:slug/forks`, which lists a workspace's forks in pages cut to the caller's readable set (`Routes`; see [Task forks](#task-forks)), with the collaborators a later feature registers on the component: the session-linking rule (`SessionLinker`), the sandbox component of the create (`SandboxCreator`) and the sandbox lifecycle of a removal (`SandboxLifecycle`); and the removal of a fork, the one place forks are removed: the fork remover of the workspace service's teardown set (`DeleteFork`, `RemoveForksOf`), the table of pending discards (`DiscardStep`) and the number of task forks (`CountTaskForks`); and the sweep that removes the forks whose lifetime has ended and repeats the pending discards (`RunPass`, `RunSweep`); and the early expiry of a fork whose work has landed, with its change reader (`ChangeReader`, `SourceChange`, `RegisterChangeReader`), the fork's last activity (`ActivityStep`) and the activity hook (`RecordActivity`) |
@@ -5845,6 +5845,68 @@ through `forgeWrite` (`internal/cli/forge.go`), which adds `<slug>`,
 `<number>` with the rule of `internal/forge/number`, `--target` and the
 `--body`/`--body-file` input of `internal/cli/textinput.go`; every usage
 error is raised while the command line is checked, before any request.
+
+### Forge webhooks
+
+The webhook secret's routes and the delivery list are plain workspace
+routes of the same component, appended to `(*Component).Routes` by
+`webhookRoutes` (`internal/forge/webhook.go`) and `deliveryRoutes`
+(`internal/forge/delivery_log.go`), with the scope `forge:write` or
+`forge:read` and the access need write or read. They are not built with the
+route helper, which would switch a task fork to its parent: these routes
+refuse a fork (`fork_has_no_origin`), read from `access.DecisionOf`. The
+`PUT` and the `DELETE` change the secret and record their event in one
+`(*store.Store).Tx`, through three dependencies the start hook `forge` adds
+to `forge.Deps`: `Store` (`rt.Store`), `SecretWriter` (the secret
+component's `Put`, `Delete` and `Available`) and `Log` (the event
+component's transactional `Emit`), so that an event that cannot be written
+rolls the secret back. The webhook URL is one helper,
+`(*Component).webhookURL`, which the diagnostic route uses too.
+
+`composeForge` mounts the ingress with `c.Handle(forge.IngressPattern,
+comp.Ingress())`, `POST /hooks/forge/{slug}` on the server's mux outside
+`/api/v1`: the REST pipeline's authentication, rate limit, body limit and
+content-type check do not apply, and the handler does its own checks in a
+fixed order (`ingest`, `internal/forge/ingress.go`): the workspace record
+(`Deps.Workspaces`) and the secret (`Deps.Secrets.Get`, on every request),
+the scheme and a GitLab token (`subtle.ConstantTimeCompare`), the body read
+through a 1 MiB + 1 `io.LimitReader`, a GitHub signature (`hmac.Equal`), the
+delivery id and event name, then `(*Component).RecordDelivery`. Its errors
+are written with `server.WriteError`.
+
+`RecordDelivery` (`internal/forge/delivery.go`) derives the origin and, for
+a carry-patch workspace, the upstream repository with `ParseRemote`, runs
+`Reduce` (`internal/forge/reduce.go`), a pure function of the forge kind,
+the event name, the body and the repositories, and stores the result in one
+`Store.Tx` run on `context.WithoutCancel`, so a forge that leaves early does
+not cancel it: `INSERT … ON CONFLICT (workspace, delivery_id) DO NOTHING`
+into `forge_deliveries` (schema step `forge.DeliverySchemaStep`), where no
+inserted row is a duplicate that writes nothing else, then `Emit` of each
+relayed event in order. Concurrent copies of one delivery are settled by the
+unique key and the store's single writer, not by a lock in the process.
+`Reduce` decodes one JSON object, reads the action and the repository, and
+asks the forge's mapping (`mapGitHub` in `github_hook.go`, `mapGitLab` in
+`gitlab_hook.go`, chosen by `mappingOf`) for the event drafts, which the
+builders of `hook_event.go` fill with the metadata of their kind; nothing
+else of the payload reaches a draft. `HookEvent.input` adds `forge`,
+`target`, `delivery_id` and `actor` and the actor type `forge`.
+
+`forge_deliveries` holds `seq` (the recording order), `workspace`,
+`delivery_id`, `forge`, `event`, `action`, `target` (null when no repository
+matched), `outcome`, `relayed` (a JSON array) and `received_at` (the text
+`timefmt.Format` writes, so its order is time order), unique on
+`(workspace, delivery_id)`, and no payload or secret. `composeForge` also
+adds the maintenance task `forge_delivery_pruning`, which calls
+`forge.PruneDeliveries` with the pass's time minus `forge.DeliveryRetention`
+(7 days) and returns the store's error to the loop; registers
+`forge.RemoveDeliveries` as a remover of a workspace's owned data
+([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md));
+and registers `forge.LastDeliveryAt` as the diagnostic route's
+`LastDeliveryProvider` with `SetLastDeliveryProvider`.
+
+The commands `parley forge webhook set|unset` and `parley forge deliveries`
+are in `internal/cli/forge.go`; `webhook set` has its own run step, which
+writes the show-once warning only when the hub's answer holds `secret`.
 
 ### Hub events
 
