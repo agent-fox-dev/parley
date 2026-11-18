@@ -290,6 +290,7 @@ var (
 			{"a body that is a number", map[string]any{"title": "t", "body": 5}, "body"},
 		}},
 		{http.MethodPatch, "/issues/7", []badBody{
+			{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"a number", `5`, ""}, {"none", nil, ""},
 			{"an empty title", map[string]any{"title": ""}, "title"},
 			{"a blank title", map[string]any{"title": " \t"}, "title"},
 			{"a state that is neither open nor closed", map[string]any{"state": "merged"}, "state"},
@@ -330,7 +331,7 @@ var (
 	}
 	// commentBodies are the bodies a comment route refuses.
 	commentBodies = []badBody{
-		{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"none", nil, ""},
+		{"malformed", `{`, ""}, {"an array", `[]`, ""}, {"a string", `"x"`, ""}, {"a number", `5`, ""}, {"none", nil, ""},
 		{"no body", map[string]any{}, "body"},
 		{"an empty body", map[string]any{"body": ""}, "body"},
 		{"a blank body", map[string]any{"body": " "}, "body"},
@@ -513,6 +514,23 @@ func TestWriteRoute_RefusesATextOverTheForgesLimit(t *testing.T) {
 			}
 		})
 	}
+
+	// A client may escape every character outside ASCII: a character beyond
+	// the Basic Multilingual Plane is then a surrogate pair of twelve bytes,
+	// so a text at GitLab's limit is a body of twelve million bytes, which
+	// the hub must still read and measure.
+	t.Run("POST /issues body, GitLab, 1,000,000 characters escaped as surrogate pairs", func(t *testing.T) {
+		text := strings.Repeat("\U0001F600", 1_000_000)
+		raw := `{"title":"t","body":"` + strings.Repeat(`\ud83d\ude00`, 1_000_000) + `"}`
+		status, body, sent := w.send(t, http.MethodPost, "gl", "/issues", w.ownerKey, raw)
+		if status != http.StatusCreated || sent != 1 {
+			t.Fatalf("POST gl/issues = %d %.300s after %d forge requests, want 201 after one", status, body, sent)
+		}
+		var got map[string]any
+		if json.Unmarshal(w.fake.Last(t).Body, &got) != nil || got["description"] != text {
+			t.Error("the forge did not receive the text unchanged as description")
+		}
+	})
 }
 
 // The markers of what no write event may hold: a title, any other text, a

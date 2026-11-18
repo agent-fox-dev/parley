@@ -219,7 +219,18 @@ func (g forgeLabel) label() Label {
 // at repo: the name is one escaped segment, so that a name holding a slash
 // names one label.
 func labelPath(repo, name string) string {
-	return repo + "/labels/" + url.PathEscape(name)
+	return repo + "/labels/" + labelSegment(name)
+}
+
+// labelSegment is the label name as one escaped path segment. A name of
+// dots is escaped too: as a bare "." or ".." a forge or a proxy that
+// normalises the path would read it as the segment before it, the issue or
+// the repository, and act on that.
+func labelSegment(name string) string {
+	if name == "." || name == ".." {
+		return strings.ReplaceAll(name, ".", "%2E")
+	}
+	return url.PathEscape(name)
 }
 
 // readLabel reads the label name below the repository or project at repo.
@@ -255,7 +266,7 @@ func (github) addLabels(ctx context.Context, call *Call, number int64, names []s
 // already gone.
 func (github) removeLabel(ctx context.Context, call *Call, number int64, name string) error {
 	var labels []forgeLabel
-	path := githubIssuePath(call.Resolution.Repository, number) + "/labels/" + url.PathEscape(name)
+	path := githubIssuePath(call.Resolution.Repository, number) + "/labels/" + labelSegment(name)
 	err := call.sendJSON(ctx, http.MethodDelete, path, nil, &labels)
 	if !forgeAnswered(err, http.StatusNotFound) {
 		return err

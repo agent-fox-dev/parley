@@ -96,6 +96,16 @@ func TestRemoveLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("sends a name of dots as a segment that names the label, not the issue", func(t *testing.T) {
+		w.fake.AddIssue(ghRepo, forgetest.Issue{Number: 7, Title: "Crash", State: "open", Labels: []string{".."}})
+		before := w.fake.Count()
+		status, body, _ := w.send(t, http.MethodDelete, "demo", "/issues/7/labels/%2E%2E", w.ownerKey, nil)
+		if r := w.fake.Requests()[before]; status != http.StatusNoContent || r.Method != http.MethodDelete || r.RawPath != ghRepo+"/issues/7/labels/%2E%2E" {
+			t.Errorf("DELETE demo/issues/7/labels/%%2E%%2E = %d %.300s, the forge got %s %s, want 204 and DELETE %s/issues/7/labels/%%2E%%2E",
+				status, body, r.Method, r.RawPath, ghRepo)
+		}
+	})
+
 	t.Run("answers not found for an issue the forge does not hold", func(t *testing.T) {
 		for _, f := range labelForges {
 			t.Run(f.name, func(t *testing.T) {
@@ -223,32 +233,38 @@ func TestEnsureLabel(t *testing.T) {
 
 	t.Run("creates a label once for two callers at a time", func(t *testing.T) {
 		for _, f := range labelForges {
-			t.Run(f.name, func(t *testing.T) {
-				w.fake.SetLabels(f.repo)
-				release := make(chan struct{})
-				lookup := forgetest.Answer{Path: f.decoded + "/labels/both", Release: release, Through: true}
-				w.fake.Script(lookup, lookup)
-				before := w.fake.Count()
-				var (
-					wg       sync.WaitGroup
-					statuses [2]int
-					bodies   [2]string
-				)
-				for i := range 2 {
-					wg.Go(func() {
-						status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/labels", w.ownerKey, map[string]any{"name": "both"})
-						statuses[i], bodies[i] = status, string(body)
-					})
-				}
-				// Both lookups find no label before either caller creates it.
-				waitUntil(t, "both lookups", func() bool { return w.fake.Count() == before+2 })
-				close(release)
-				wg.Wait()
-				slices.Sort(statuses[:])
-				if statuses != [2]int{http.StatusOK, http.StatusCreated} || bodies[0] != bodies[1] {
-					t.Errorf("the ensures were answered %v, %s and %s, want 200 and 201 with the same label", statuses, bodies[0], bodies[1])
-				}
-			})
+			t.Run(f.name, func(t *testing.T) { w.ensureTwiceAtOnce(t, f) })
 		}
 	})
+}
+
+// ensureTwiceAtOnce sends two ensures of one new label on the forge f at
+// once, both lookups held until both reached the forge, and fails the test
+// unless one is answered 201 and the other 200, with the same label.
+func (w *world) ensureTwiceAtOnce(t *testing.T, f labelForge) {
+	t.Helper()
+	w.fake.SetLabels(f.repo)
+	release := make(chan struct{})
+	lookup := forgetest.Answer{Path: f.decoded + "/labels/both", Release: release, Through: true}
+	w.fake.Script(lookup, lookup)
+	before := w.fake.Count()
+	var (
+		wg       sync.WaitGroup
+		statuses [2]int
+		bodies   [2]string
+	)
+	for i := range 2 {
+		wg.Go(func() {
+			status, body := w.Call(t, http.MethodPost, "/api/v1/workspaces/"+f.slug+"/labels", w.ownerKey, map[string]any{"name": "both"})
+			statuses[i], bodies[i] = status, string(body)
+		})
+	}
+	// Both lookups find no label before either caller creates it.
+	waitUntil(t, "both lookups", func() bool { return w.fake.Count() == before+2 })
+	close(release)
+	wg.Wait()
+	slices.Sort(statuses[:])
+	if statuses != [2]int{http.StatusOK, http.StatusCreated} || bodies[0] != bodies[1] {
+		t.Errorf("the ensures were answered %v, %s and %s, want 200 and 201 with the same label", statuses, bodies[0], bodies[1])
+	}
 }

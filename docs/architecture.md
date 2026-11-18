@@ -5801,7 +5801,7 @@ The nine write routes are part of the same component: `(*Component).Routes`
 appends `writeRoutes` (`internal/forge/write.go`), so `composeForge`
 registers them with the reads. Each is a `writeRoute` built by
 `(*Component).writeRoute` on the route helper, with the scope `forge:write`
-and the need write, a body limit of 8 MiB and, for the five routes that
+and the need write, a body limit of 16 MiB and, for the five routes that
 create something, `server.Route.Create`, so the platform's idempotency stage
 replays a retry before the handler runs. The helper's two hooks carry the
 write order: `Params` runs the route's `before` (path parameters and body

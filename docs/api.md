@@ -7111,9 +7111,10 @@ required`, `<field> must not be blank`. A member of the wrong JSON type is
 `<field> must be a string` (or `must be true or false`, `must be an array of
 names`). A list of names holds at most 100 entries, each a non-blank string
 (`<field> holds <n> names; at most 100 are allowed`, `<field>[<i>] must not
-be blank`). A write route's body may be up to 8 MiB, so that a text at the
+be blank`). A write route's body may be up to 16 MiB, so that a text at the
 GitLab limit is measured by the hub rather than refused by the platform's
-body limit.
+body limit, also when a client escapes every character beyond the Basic
+Multilingual Plane as a JSON surrogate pair (twelve bytes each).
 
 **Text limits.** The `body` of an issue (create and update), of a comment and
 of a pull request, and the `comment` of a close, are counted in Unicode code

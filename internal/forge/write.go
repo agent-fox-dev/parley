@@ -148,9 +148,11 @@ func (c *Component) writeRoutes() []server.Route {
 
 // maxWriteBody is the body limit of a write route. It is far above the
 // platform's default, so that a text at the longest forge limit is measured
-// by the hub, whatever its characters' length in bytes, rather than refused
-// by the platform first.
-const maxWriteBody = 8 << 20
+// by the hub rather than refused by the platform first, however a client
+// encodes it: a character beyond the Basic Multilingual Plane escaped as a
+// JSON surrogate pair takes twelve bytes, and GitLab takes 1,000,000
+// characters.
+const maxWriteBody = 16 << 20
 
 // writeRoute builds the server route of wr (see writeRoute).
 func (c *Component) writeRoute(wr writeRoute) server.Route {
