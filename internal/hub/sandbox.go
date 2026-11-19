@@ -39,6 +39,14 @@ const (
 	// pass returns before its next runtime call once its context ends.
 	sandboxLifecycleWork  = "sandbox_lifecycle"
 	sandboxLifecycleGrace = 15 * time.Second
+	// sandboxReconcileHook is the name of the start hook that runs the
+	// first pass of the reconciliation with the runtime, and
+	// sandboxReconcileWork that of the background work that runs the
+	// others; sandboxReconcileGrace is how long the stop waits for it: a
+	// pass returns before its next runtime call once its context ends.
+	sandboxReconcileHook  = "sandbox_reconcile"
+	sandboxReconcileWork  = "sandbox_reconcile"
+	sandboxReconcileGrace = 15 * time.Second
 	// sandboxLogRetentionTask is the name of the maintenance task that
 	// deletes the stored log lines past their retention.
 	sandboxLogRetentionTask = "sandbox_log_retention"
@@ -127,6 +135,14 @@ const (
 // minute on the hub's clock it stops the sandboxes idle for longer than
 // their idle timeout and deletes those whose expires_at has come, which it
 // also does at a timer set to the earliest expires_at.
+//
+// The records are reconciled with the runtime once at start, in a start
+// hook after the runtime check that never keeps the hub from starting, and
+// then every [sandbox].reconcile_interval on the hub's clock as background
+// work: the end of a ready sandbox's main process is recorded, a sandbox
+// the runtime lost is marked failed, the runtime's pause is followed, what
+// the runtime holds of no live sandbox is deleted, and the idle stops and
+// expiries that came due are done.
 //
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
@@ -242,6 +258,12 @@ func composeSandbox(c *Composition) {
 		}
 		return svc.ResumeProvisioning(ctx)
 	})
+	c.AddStartHook(sandboxReconcileHook, func(ctx context.Context, _ *Runtime) error {
+		if !svc.Enabled() || svc.Client() == nil {
+			return nil
+		}
+		return svc.ReconcileAtStart(ctx)
+	})
 	c.AddBackgroundWork(sandboxProvisionerWork, sandboxProvisionerGrace, func(ctx context.Context, _ *Runtime) {
 		svc.RunProvisioner(ctx)
 	})
@@ -250,6 +272,9 @@ func composeSandbox(c *Composition) {
 	})
 	c.AddBackgroundWork(sandboxLifecycleWork, sandboxLifecycleGrace, func(ctx context.Context, _ *Runtime) {
 		svc.RunLifecycle(ctx)
+	})
+	c.AddBackgroundWork(sandboxReconcileWork, sandboxReconcileGrace, func(ctx context.Context, _ *Runtime) {
+		svc.RunReconcile(ctx)
 	})
 	c.AddMaintenanceTask(sandboxLogRetentionTask, func(ctx context.Context, _ *Runtime) error {
 		return svc.RetainLogs(ctx)

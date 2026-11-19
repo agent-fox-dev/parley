@@ -15,10 +15,11 @@ import (
 // The idle and expiry passes and the loop that runs them share one hub,
 // on a clock that stays at t0 until the loop's rows advance it; each row
 // has a sandbox of its own. The rows that fail the runtime change it for
-// the whole hub, so no row runs in parallel.
+// the whole hub, so no row runs in parallel. The reconciliation, which
+// runs the passes too, waits longer than the rows advance the clock.
 func TestLifecycleTimers(t *testing.T) {
 	t.Parallel()
-	h := startCheckpointHub(t)
+	h := startCheckpointHubWith(t, "reconcile_interval = \"10m\"\n")
 	ctx := context.Background()
 	t0 := h.clock.Now()
 	// demo--gone expires at t0 only once its row needs it, so that the

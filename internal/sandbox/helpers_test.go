@@ -2276,13 +2276,14 @@ func startUseHub(t *testing.T, fail func() error) *useHub {
 
 // seed stores a sandbox of the workspace ws, created by the owner's API
 // key, in state, with the hub credential ha (nil for none), and returns its
-// id.
+// id. It expires hours after the real clock, the use hub's, so that the
+// lifecycle loop does not delete it while the test runs.
 func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) string {
 	t.Helper()
 	before := recordStart.Add(-time.Hour)
 	rec := sandbox.Record{
 		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, HubAccess: ha,
-		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		ExpiresAt: time.Now().Add(3 * time.Hour), LastActivityAt: before,
 		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
 		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: ws,
 	}
@@ -3450,7 +3451,14 @@ var noHostGit = map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_N
 // adjust.
 func startCheckpointHub(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	h := newCreateHub(t, runtimetest.New(t, runtimetest.WithHostDirs()), agentProfile, false, adjust)
+	return startCheckpointHubWith(t, "", adjust...)
+}
+
+// startCheckpointHubWith is startCheckpointHub with the [sandbox] keys
+// settings, as TOML, before the profile.
+func startCheckpointHubWith(t *testing.T, settings string, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	h := newCreateHub(t, runtimetest.New(t, runtimetest.WithHostDirs()), settings+agentProfile, false, adjust)
 	h.rt.SetExec(nil)
 	h.world(t)
 	return h

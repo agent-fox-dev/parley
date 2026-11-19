@@ -658,9 +658,6 @@ func (p *provisioning) hubCredential(ctx context.Context) (string, error) {
 // a deletion what the sandbox had.
 func (s *Service) clearRuntime(ctx context.Context, rec Record) error {
 	id := rec.ID
-	owned := func(name string, labels map[string]string) bool {
-		return labels[LabelSandbox] == id || name == id || strings.HasPrefix(name, id+"-")
-	}
 	var (
 		errs                []error
 		sandboxes, provided []string
@@ -670,7 +667,7 @@ func (s *Service) clearRuntime(ctx context.Context, rec Record) error {
 		sandboxes = []string{id}
 	} else {
 		for _, sb := range list {
-			if owned(sb.Name, sb.Labels) {
+			if ownedBy(id, sb.Name, sb.Labels) {
 				sandboxes = append(sandboxes, sb.Name)
 			}
 		}
@@ -685,17 +682,32 @@ func (s *Service) clearRuntime(ctx context.Context, rec Record) error {
 		}
 	} else {
 		for _, pr := range list {
-			if owned(pr.Name, pr.Labels) {
+			if ownedBy(id, pr.Name, pr.Labels) {
 				provided = append(provided, pr.Name)
 			}
 		}
 	}
+	return errors.Join(append(errs, s.deleteAtRuntime(ctx, sandboxes, provided))...)
+}
+
+// ownedBy reports whether the runtime's sandbox or provider name, with
+// labels, belongs to the sandbox id: it carries the id's label, or is named
+// after it (the sandbox by its id, each provider <id>-<name>).
+func ownedBy(id, name string, labels map[string]string) bool {
+	return labels[LabelSandbox] == id || name == id || strings.HasPrefix(name, id+"-")
+}
+
+// deleteAtRuntime deletes the runtime's sandboxes and providers of the
+// names given; one the runtime no longer holds counts as deleted. It
+// returns the other failures, after trying every name.
+func (s *Service) deleteAtRuntime(ctx context.Context, sandboxes, providers []string) error {
+	var errs []error
 	for _, name := range sandboxes {
 		if err := s.client.DeleteSandbox(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			errs = append(errs, err)
 		}
 	}
-	for _, name := range provided {
+	for _, name := range providers {
 		if err := s.client.DeleteProvider(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			errs = append(errs, err)
 		}
