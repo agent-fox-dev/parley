@@ -42,6 +42,8 @@ type useRequest struct {
 	rec Record
 	// exec is the body of an exec, as its validation read it.
 	exec execRequest
+	// files is the query of a file transfer, as its validation read it.
+	files filesRequest
 }
 
 // useEntry is one route that uses a sandbox, under
@@ -84,11 +86,11 @@ func (s *Service) useTable() []*useEntry {
 		},
 		{
 			name: useUpload, method: http.MethodPut, segment: "files", kind: KindWrite, covers: true,
-			states: []string{StateReady}, streamBody: true, operate: pendingOperation,
+			states: []string{StateReady}, streamBody: true, validate: validateUpload, operate: s.upload,
 		},
 		{
 			name: useDownload, method: http.MethodGet, segment: "files", kind: KindRead,
-			states: []string{StateReady, StateCompleted, StateFailed}, operate: pendingOperation,
+			states: []string{StateReady, StateCompleted, StateFailed}, validate: validateDownload, operate: pendingOperation,
 		},
 		{
 			name: useLogs, method: http.MethodGet, segment: "logs", kind: KindRead,

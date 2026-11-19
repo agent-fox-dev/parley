@@ -1,6 +1,7 @@
 package sandbox_test
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/http"
 	"os"
@@ -2293,6 +2295,13 @@ type execHub struct {
 // is its default, 30m.
 func startExecHub(t *testing.T, maxExecs int) *execHub {
 	t.Helper()
+	return startUseSandboxHub(t, "max_concurrent_execs = "+strconv.Itoa(maxExecs)+"\n")
+}
+
+// startUseSandboxHub starts an exec hub whose [sandbox] section also holds
+// the lines settings.
+func startUseSandboxHub(t *testing.T, settings string) *execHub {
+	t.Helper()
 	h := &execHub{
 		probeHub: &probeHub{rt: runtimetest.New(t)}, clock: hubtest.NewJobClock(func() time.Time { return recordStart }),
 		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}},
@@ -2300,7 +2309,7 @@ func startExecHub(t *testing.T, maxExecs int) *execHub {
 	h.rt.SetExec(h.cmds.run)
 	cfg := sandboxesOn
 	cfg.TOML = "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
-		"max_concurrent_execs = " + strconv.Itoa(maxExecs) + "\n[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n"
+		settings + "[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n"
 	cfg.Now = h.clock.Now
 	cfg.Compose = func(c *hub.Composition) {
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
@@ -2594,4 +2603,152 @@ func (s *frameReader) rest(t *testing.T) []frame {
 		out = append(out, f)
 	}
 	return out
+}
+
+// startFilesHub starts an exec hub whose [sandbox].max_transfer_size is
+// 1 MiB, with a ready sandbox, whose id it returns.
+func startFilesHub(t *testing.T) (*execHub, string) {
+	t.Helper()
+	h := startUseSandboxHub(t, "max_transfer_size = \"1mb\"\n")
+	return h, h.sandbox(t, nil)
+}
+
+// files sends method …/files?query for the sandbox id of ws as the owner,
+// with contentType ("" for none) and body (nil for none), and reads the
+// error envelope of the answer, if it has one. A body that is not a
+// *bytes.Reader, *bytes.Buffer or *strings.Reader is sent without a
+// declared length.
+func (h *execHub) files(t *testing.T, method, id, query, contentType string, body io.Reader) answer {
+	t.Helper()
+	return h.filesWith(t, context.Background(), method, id, query, contentType, body)
+}
+
+// filesWith is files under ctx.
+func (h *execHub) filesWith(t *testing.T, ctx context.Context, method, id, query, contentType string, body io.Reader) answer {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, method, h.URL("/api/v1"+sandboxPath("ws", id)+"/files?"+query), body)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s files?%s: %v", method, query, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var a answer
+	a.status, a.header = resp.StatusCode, resp.Header
+	if a.body, err = io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("%s files?%s: read the answer: %v", method, query, err)
+	}
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
+}
+
+// fileCalls counts the file operations the runtime received.
+func (h *execHub) fileCalls() int {
+	n := 0
+	for _, c := range h.rt.Calls() {
+		switch c.Op {
+		case runtime.OpUpload, runtime.OpMakeDir, runtime.OpStat, runtime.OpDownload, runtime.OpWalk:
+			n++
+		}
+	}
+	return n
+}
+
+// file reads the file at p of the sandbox id from the runtime, and reports
+// false when there is none; it fails on a directory.
+func (h *execHub) file(t *testing.T, id, p string) (data []byte, mode fs.FileMode, ok bool) {
+	t.Helper()
+	ctx, client := context.Background(), h.rt.Client("parley", nil)
+	fi, err := client.Stat(ctx, id, p)
+	if errors.Is(err, runtime.ErrNotFound) {
+		return nil, 0, false
+	}
+	if err != nil {
+		t.Fatalf("stat %s: %v", p, err)
+	}
+	if fi.Dir {
+		t.Fatalf("%s is a directory, want a file", p)
+	}
+	rc, err := client.Download(ctx, id, p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	defer func() { _ = rc.Close() }()
+	if data, err = io.ReadAll(rc); err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	return data, fi.Mode, true
+}
+
+// tarEntry is an entry of an archive tarOf writes: a directory when name
+// ends in a slash, a symbolic link to link, a hard link to hardLink, else a
+// regular file holding body.
+type tarEntry struct {
+	name           string
+	mode           int64
+	body           string
+	link, hardLink string
+}
+
+// tarOf is the tar stream of entries, in order.
+func tarOf(t *testing.T, entries ...tarEntry) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	w := tar.NewWriter(&b)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Mode: e.mode, Typeflag: tar.TypeReg, Size: int64(len(e.body))}
+		switch {
+		case strings.HasSuffix(e.name, "/"):
+			hdr.Typeflag, hdr.Size = tar.TypeDir, 0
+		case e.link != "":
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeSymlink, e.link, 0
+		case e.hardLink != "":
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, e.hardLink, 0
+		}
+		if err := w.WriteHeader(hdr); err != nil {
+			t.Fatalf("write the tar header of %s: %v", e.name, err)
+		}
+		if _, err := io.WriteString(w, e.body); err != nil && hdr.Size > 0 {
+			t.Fatalf("write the tar body of %s: %v", e.name, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close the tar stream: %v", err)
+	}
+	return b.Bytes()
+}
+
+// gatedBody is a body sent without a declared length that gives the bytes
+// of r up to limit of them, then waits until ctx ends and fails: a hub that
+// answers before ctx ends has read at most limit bytes.
+type gatedBody struct {
+	ctx   context.Context
+	r     io.Reader
+	limit int64
+	taken atomic.Int64
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	left := b.limit - b.taken.Load()
+	if left <= 0 {
+		<-b.ctx.Done()
+		return 0, b.ctx.Err()
+	}
+	if int64(len(p)) > left {
+		p = p[:left]
+	}
+	n, err := b.r.Read(p)
+	b.taken.Add(int64(n))
+	return n, err
 }
