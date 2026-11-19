@@ -85,6 +85,8 @@ type Service struct {
 	changes notifier
 	// use is the table of the routes that use a sandbox.
 	use []*useEntry
+	// logs is what the log collector tells the reads of the stored logs.
+	logs logState
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

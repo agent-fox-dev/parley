@@ -2260,7 +2260,7 @@ func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) str
 // nor the runtime was reached; for 200, that the operation was.
 func (h *useHub) useCall(t *testing.T, u useRoute, slug, id, cred string, body any, status int, errorType string) answer {
 	t.Helper()
-	calls, runtimeCalls := h.calls.Load(), len(h.rt.Calls())
+	calls, runtimeCalls := h.calls.Load(), requestCalls(h.rt)
 	a := h.call(t, u.method, u.path(slug, id), cred, body)
 	if a.status != status || a.err.ErrorType != errorType {
 		t.Errorf("%s %s = %d %s, want %d %s", u.method, u.path(slug, id), a.status, a.body, status, errorType)
@@ -2273,11 +2273,24 @@ func (h *useHub) useCall(t *testing.T, u useRoute, slug, id, cred string, body a
 		t.Errorf("the operation ran %d times, want never", reached)
 	}
 	if status != http.StatusOK {
-		if n := len(h.rt.Calls()) - runtimeCalls; n != 0 {
+		if n := requestCalls(h.rt) - runtimeCalls; n != 0 {
 			t.Errorf("the runtime got %d calls, want none", n)
 		}
 	}
 	return a
+}
+
+// requestCalls is the number of calls the runtime rt received but the log
+// collector's: it reads the logs of every ready sandbox in the background,
+// which no request asks for.
+func requestCalls(rt *runtimetest.Fake) int {
+	n := 0
+	for _, c := range rt.Calls() {
+		if c.Op != runtime.OpLogs {
+			n++
+		}
+	}
+	return n
 }
 
 // execHub is a hub with sandboxes on over a fake runtime whose commands
@@ -2285,6 +2298,7 @@ func (h *useHub) useCall(t *testing.T, u useRoute, slug, id, cred string, body a
 // whose API key is key.
 type execHub struct {
 	*probeHub
+	svc   *sandbox.Service
 	clock *hubtest.JobClock
 	cmds  *commands
 	key   string
@@ -2302,8 +2316,17 @@ func startExecHub(t *testing.T, maxExecs int) *execHub {
 // the lines settings.
 func startUseSandboxHub(t *testing.T, settings string) *execHub {
 	t.Helper()
+	return newExecHub(t, settings, nil)
+}
+
+// newExecHub starts an exec hub whose [sandbox] section also holds the lines
+// settings, with its configuration as edit changes it when edit is not nil.
+// The fake runtime stamps log entries with the hub's clock.
+func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *execHub {
+	t.Helper()
+	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
 	h := &execHub{
-		probeHub: &probeHub{rt: runtimetest.New(t)}, clock: hubtest.NewJobClock(func() time.Time { return recordStart }),
+		probeHub: &probeHub{rt: runtimetest.New(t, runtimetest.WithClock(clock.Now))}, clock: clock,
 		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}},
 	}
 	h.rt.SetExec(h.cmds.run)
@@ -2312,6 +2335,7 @@ func startUseSandboxHub(t *testing.T, settings string) *execHub {
 		settings + "[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n"
 	cfg.Now = h.clock.Now
 	cfg.Compose = func(c *hub.Composition) {
+		h.svc = c.Sandbox()
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 		})
@@ -2319,6 +2343,9 @@ func startUseSandboxHub(t *testing.T, settings string) *execHub {
 			d.Now = h.clock.Now
 			d.NewTimer = func(x time.Duration) sandbox.Timer { return h.clock.NewTimer(x) }
 		})
+	}
+	if edit != nil {
+		edit(&cfg)
 	}
 	h.Hub = hubtest.StartWith(t, cfg)
 	h.owner = h.CreateUser(t, "owner")
@@ -2800,4 +2827,107 @@ func (b *gatedBody) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
 	b.taken.Add(int64(n))
 	return n, err
+}
+
+// logHub is an exec hub whose test has the log collector run its rounds on
+// the hub's clock and reads the stored log lines; passes counts the
+// maintenance passes that have ended.
+type logHub struct {
+	*execHub
+	passes atomic.Int64
+}
+
+// startLogHub starts a log hub. With passInterval above zero the hub runs a
+// maintenance pass at that interval, on the real clock.
+func startLogHub(t *testing.T, passInterval time.Duration) *logHub {
+	t.Helper()
+	h := &logHub{}
+	h.execHub = newExecHub(t, "", func(cfg *hubtest.Config) {
+		cfg.MaintenanceInterval = passInterval
+		compose := cfg.Compose
+		cfg.Compose = func(c *hub.Composition) {
+			compose(c)
+			// A task under a name the maintenance order does not know runs
+			// after those it knows.
+			c.AddMaintenanceTask("log_test_pass", func(context.Context, *hub.Runtime) error {
+				h.passes.Add(1)
+				return nil
+			})
+		}
+	})
+	return h
+}
+
+// round has the log collector run a round: it waits until the collector
+// waits for one, then moves the hub's clock on to it. The collector asks
+// for the timer of its next round before it runs one, so a test that saw
+// what a round did may ask for the next.
+func (h *logHub) round(t *testing.T) {
+	t.Helper()
+	hubtest.WaitClosed(t, h.clock.Armed(sandbox.LogCollectInterval), "the log collector to wait for its next round")
+	h.clock.Advance(sandbox.LogCollectInterval)
+}
+
+// follow has the log collector run a round and waits until it reads both
+// logs of the sandbox id.
+func (h *logHub) follow(t *testing.T, id string) {
+	t.Helper()
+	h.round(t)
+	eventually(t, "the collector to read both logs of "+id, func() bool { return h.logStreams(id) == 2 })
+}
+
+// logStreams is the number of open log streams of the sandbox id.
+func (h *logHub) logStreams(id string) int {
+	n := 0
+	for _, s := range h.rt.Streams() {
+		if s.Op == runtime.OpLogs && s.Sandbox == id {
+			n++
+		}
+	}
+	return n
+}
+
+// breakLog breaks the first open log stream of the sandbox id.
+func (h *logHub) breakLog(t *testing.T, id string) {
+	t.Helper()
+	for _, s := range h.rt.Streams() {
+		if s.Op == runtime.OpLogs && s.Sandbox == id {
+			h.rt.BreakStream(s.ID)
+			return
+		}
+	}
+	t.Fatalf("no open log stream of %s", id)
+}
+
+// lines are the stored log lines of the sandbox id of the source ("" for
+// both), in the order they were stored.
+func (h *logHub) lines(t *testing.T, id, source string) []sandbox.LogLine {
+	t.Helper()
+	lines, err := sandbox.LogLines(context.Background(), h.Store.Main(), id, sandbox.LogSelection{Source: source})
+	if err != nil {
+		t.Fatalf("read the log lines of %s: %v", id, err)
+	}
+	return lines
+}
+
+// texts are the line members of the stored log lines of the sandbox id.
+func (h *logHub) texts(t *testing.T, id string) []string {
+	t.Helper()
+	var out []string
+	for _, l := range h.lines(t, id, "") {
+		out = append(out, l.Line)
+	}
+	return out
+}
+
+// emit has the main process of the sandbox id write text to stream.
+func (h *logHub) emit(id string, stream runtime.OutputStream, text string) {
+	h.rt.EmitOutput("parley", id, stream, text)
+}
+
+// pass waits for a maintenance pass that started after the call.
+func (h *logHub) pass(t *testing.T) {
+	t.Helper()
+	from := h.passes.Load()
+	eventually(t, "a maintenance pass", func() bool { return h.passes.Load() >= from+2 })
 }

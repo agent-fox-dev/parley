@@ -25,3 +25,7 @@ func SetUseOperation(s *Service, name string, op func(http.ResponseWriter, *http
 func SetUseValidation(s *Service, name string, v func(*http.Request) error) {
 	useEntryOf(s, name).validate = func(r *http.Request, _ *useRequest) error { return v(r) }
 }
+
+// InsertLogLines stores lines as the log lines of the sandbox sandboxID in
+// tx, as the collector does, so that a test sets up lines of any time.
+var InsertLogLines = insertLogLines
