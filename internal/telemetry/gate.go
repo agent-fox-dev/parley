@@ -9,7 +9,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
-// runPrefix is the pattern every ingestion route starts with.
+// runPrefix is the pattern every ingestion and read route starts with.
 const runPrefix = "/workspaces/:slug/runs/:run_id"
 
 // msgArchived is the refusal of a valid request to an archived workspace.
@@ -23,10 +23,10 @@ const (
 	retryAfter      = "5"
 )
 
-// errNoDecision is a request at an ingestion route without the access
-// decision the pipeline's access check attaches: a wiring fault, which
-// grants nothing.
-var errNoDecision = errors.New("no workspace access decision at an ingestion route")
+// errNoDecision is a request at an ingestion or read route without the
+// access decision the pipeline's access check attaches: a wiring fault,
+// which grants nothing.
+var errNoDecision = errors.New("no workspace access decision at a telemetry route")
 
 // target is the workspace and run an ingestion request names in its path.
 type target struct {
