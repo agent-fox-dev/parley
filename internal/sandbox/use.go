@@ -46,6 +46,8 @@ type useRequest struct {
 	files filesRequest
 	// logs is the query of a log read, as its validation read it.
 	logs logsRequest
+	// attach is the query of an attach, as its validation read it.
+	attach attachRequest
 }
 
 // useEntry is one route that uses a sandbox, under
@@ -100,14 +102,9 @@ func (s *Service) useTable() []*useEntry {
 		},
 		{
 			name: useAttach, method: http.MethodGet, segment: "attach", kind: KindWrite, covers: true,
-			states: []string{StateReady}, operate: pendingOperation,
+			states: []string{StateReady}, validate: validateAttach, operate: s.attach,
 		},
 	}
-}
-
-// pendingOperation stands for an operation that is not served yet.
-func pendingOperation(http.ResponseWriter, *http.Request, useRequest) error {
-	return server.NewError("not_implemented", http.StatusNotImplemented, "this operation is not served yet")
 }
 
 // UseRoutes declares the routes that use a sandbox: POST …/exec, PUT and

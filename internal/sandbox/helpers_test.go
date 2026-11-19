@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/websocket"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
@@ -2303,7 +2306,9 @@ type execHub struct {
 	// timers keeps the timers the sandbox service asked the clock for.
 	timers *timerLog
 	cmds   *commands
-	key    string
+	// terms records the terminals the hub opens.
+	terms *terminals
+	key   string
 }
 
 // startExecHub starts an exec hub that runs at most maxExecs commands at
@@ -2323,13 +2328,14 @@ func startUseSandboxHub(t *testing.T, settings string) *execHub {
 
 // newExecHub starts an exec hub whose [sandbox] section also holds the lines
 // settings, with its configuration as edit changes it when edit is not nil.
-// The fake runtime stamps log entries with the hub's clock.
+// The fake runtime stamps log entries with the hub's clock, and the hub's
+// runtime client records the terminals it opens in terms.
 func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *execHub {
 	t.Helper()
 	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
 	h := &execHub{
 		probeHub: &probeHub{rt: runtimetest.New(t, runtimetest.WithClock(clock.Now))}, clock: clock, timers: &timerLog{},
-		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}},
+		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}}, terms: &terminals{},
 	}
 	h.rt.SetExec(h.cmds.run)
 	cfg := sandboxesOn
@@ -2339,7 +2345,7 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc = c.Sandbox()
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
-			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+			return &terminalClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), terms: h.terms}, nil
 		})
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			d.Now = h.clock.Now
@@ -3024,4 +3030,261 @@ func policyLine(sec int, line string) sandbox.LogLine {
 func (h *execHub) seedLines(t *testing.T, id string) {
 	t.Helper()
 	h.storeLines(t, id, processLine(0, "stdout", "p1"), policyLine(1, "d1"), processLine(2, "stderr", "p2"), processLine(3, "stdout", "p3"))
+}
+
+// terminals keeps the terminals a hub's runtime client opened, in order.
+type terminals struct {
+	mu   sync.Mutex
+	list []*openedTerminal
+}
+
+// of is the terminals opened in the sandbox id, in order.
+func (ts *terminals) of(id string) []*openedTerminal {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	var out []*openedTerminal
+	for _, o := range ts.list {
+		if o.sandbox == id {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// count is the number of terminals opened in any sandbox.
+func (ts *terminals) count() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return len(ts.list)
+}
+
+// last is the terminal opened last in the sandbox id.
+func (ts *terminals) last(t *testing.T, id string) *openedTerminal {
+	t.Helper()
+	list := ts.of(id)
+	if len(list) == 0 {
+		t.Fatalf("no terminal was opened in %s", id)
+	}
+	return list[len(list)-1]
+}
+
+// openedTerminal is a terminal of the fake runtime, which echoes its input,
+// with what the hub asked for when it opened it, the resizes and the close
+// the hub asked for, and the controls a test steers it with: write, exit and
+// fail.
+type openedTerminal struct {
+	runtime.Terminal
+	sandbox string
+	req     runtime.ExecRequest
+	size    runtime.TerminalSize
+
+	mu      sync.Mutex
+	resizes []runtime.TerminalSize
+	closed  bool
+	failure error
+}
+
+func (o *openedTerminal) Resize(size runtime.TerminalSize) error {
+	o.mu.Lock()
+	o.resizes = append(o.resizes, size)
+	o.mu.Unlock()
+	return o.Terminal.Resize(size)
+}
+
+func (o *openedTerminal) Close() error {
+	o.mu.Lock()
+	o.closed = true
+	o.mu.Unlock()
+	return o.Terminal.Close()
+}
+
+// Read is the fake's, except that a terminal fail ended reports its
+// failure after what it had written.
+func (o *openedTerminal) Read(b []byte) (int, error) {
+	n, err := o.Terminal.Read(b)
+	if errors.Is(err, io.EOF) {
+		o.mu.Lock()
+		if o.failure != nil {
+			err = o.failure
+		}
+		o.mu.Unlock()
+	}
+	return n, err
+}
+
+// write makes the terminal write text, as the shell's output: the fake's
+// terminal gives back what it is written.
+func (o *openedTerminal) write(t *testing.T, text string) {
+	t.Helper()
+	if _, err := o.Terminal.Write([]byte(text)); err != nil {
+		t.Fatalf("write %q as the terminal's output: %v", text, err)
+	}
+}
+
+// exit ends the shell, as when it exits.
+func (o *openedTerminal) exit() { _ = o.Terminal.Close() }
+
+// fail breaks the terminal: its output ends with a runtime failure.
+func (o *openedTerminal) fail() {
+	o.mu.Lock()
+	o.failure = runtime.NewError(runtime.ErrUnavailable, runtime.OpExecInteractive, "the terminal broke")
+	o.mu.Unlock()
+	_ = o.Terminal.Close()
+}
+
+// resized is the sizes the hub resized the terminal to, in order.
+func (o *openedTerminal) resized() []runtime.TerminalSize {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.resizes)
+}
+
+// closedByHub reports whether the hub closed the terminal.
+func (o *openedTerminal) closedByHub() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.closed
+}
+
+// terminalClient is a runtime client in front of a fake's that records the
+// terminals it opens in terms.
+type terminalClient struct {
+	runtime.Client
+	terms *terminals
+}
+
+func (c *terminalClient) ExecInteractive(ctx context.Context, name string, req runtime.ExecRequest, size runtime.TerminalSize) (runtime.Terminal, error) {
+	term, err := c.Client.ExecInteractive(ctx, name, req, size)
+	if err != nil {
+		return nil, err
+	}
+	o := &openedTerminal{Terminal: term, sandbox: name, req: req, size: size}
+	c.terms.mu.Lock()
+	c.terms.list = append(c.terms.list, o)
+	c.terms.mu.Unlock()
+	return o, nil
+}
+
+// openTerminals is the number of terminals of the sandbox id the runtime rt
+// has open.
+func openTerminals(rt *runtimetest.Fake, id string) int {
+	n := 0
+	for _, s := range rt.Streams() {
+		if s.Op == runtime.OpExecInteractive && s.Sandbox == id {
+			n++
+		}
+	}
+	return n
+}
+
+// attach opens GET …/attach?query of the sandbox id of ws as a WebSocket,
+// as the owner and without an Origin header, and closes it when the test
+// ends.
+func (h *execHub) attach(t *testing.T, id, query string) *websocket.Conn {
+	t.Helper()
+	target := h.URL("/api/v1" + sandboxPath("ws", id) + "/attach?" + query)
+	cfg, err := websocket.NewConfig("ws"+strings.TrimPrefix(target, "http"), "http://origin.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Header.Set("Authorization", "Bearer "+h.key)
+	conn, err := net.Dial("tcp", cfg.Location.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	ws, err := websocket.NewClient(cfg, &withoutOrigin{Conn: conn})
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("attach to %s: %v", id, err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	t.Cleanup(func() { _ = ws.Close() })
+	return ws
+}
+
+// withoutOrigin is a connection that leaves the Origin header out of the
+// opening handshake it writes first, which the WebSocket client always
+// sends.
+type withoutOrigin struct {
+	net.Conn
+	sent bool
+}
+
+func (c *withoutOrigin) Write(b []byte) (int, error) {
+	if c.sent {
+		return c.Conn.Write(b)
+	}
+	c.sent = true
+	start := bytes.Index(b, []byte("\r\nOrigin: "))
+	if start < 0 {
+		return 0, errors.New("the handshake holds no Origin header to leave out")
+	}
+	end := start + 2 + bytes.Index(b[start+2:], []byte("\r\n"))
+	if _, err := c.Conn.Write(append(slices.Clone(b[:start]), b[end:]...)); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+// wsFrame is a WebSocket message: its payload and whether it came as a
+// binary frame.
+type wsFrame struct {
+	data   []byte
+	binary bool
+}
+
+// frames receives WebSocket messages with their frame type.
+var frames = websocket.Codec{
+	Marshal: websocket.Message.Marshal,
+	Unmarshal: func(data []byte, payloadType byte, v any) error {
+		*v.(*wsFrame) = wsFrame{data: data, binary: payloadType == websocket.BinaryFrame}
+		return nil
+	},
+}
+
+// receiveWithin receives the next message of ws, waiting at most d.
+func receiveWithin(ws *websocket.Conn, d time.Duration) (wsFrame, error) {
+	_ = ws.SetReadDeadline(time.Now().Add(d))
+	var f wsFrame
+	err := frames.Receive(ws, &f)
+	return f, err
+}
+
+// receiveBytes receives binary messages from ws until they hold n bytes,
+// and returns them joined.
+func receiveBytes(t *testing.T, ws *websocket.Conn, n int) []byte {
+	t.Helper()
+	var got []byte
+	for len(got) < n {
+		f, err := receiveWithin(ws, 5*time.Second)
+		if err != nil {
+			t.Fatalf("receive after %q: %v", got, err)
+		}
+		if !f.binary {
+			t.Fatalf("got the text frame %q, want binary frames", f.data)
+		}
+		got = append(got, f.data...)
+	}
+	return got
+}
+
+// sendFrame sends v on ws: a string as a text frame, bytes as a binary one.
+func sendFrame(t *testing.T, ws *websocket.Conn, v any) {
+	t.Helper()
+	if err := websocket.Message.Send(ws, v); err != nil {
+		t.Fatalf("send %q: %v", v, err)
+	}
+}
+
+// within waits up to d, polling, for cond to hold, and fails the test then.
+func within(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %v for %s", d, what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
