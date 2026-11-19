@@ -28,8 +28,10 @@ const telemetryHook = "telemetry"
 //
 // It registers no workspace remover: telemetry outlives its workspace.
 //
-// The component exists from the composition on (Telemetry); tests change
-// its dependencies with AdjustTelemetry.
+// The component exists from the composition on (Telemetry), so that
+// another part, such as the metrics of the audit records, registers its run
+// event observers with Telemetry().OnRunEvent while it composes; tests
+// change its dependencies with AdjustTelemetry.
 func composeTelemetry(c *Composition) {
 	comp := &telemetry.Component{}
 	c.telemetry = comp

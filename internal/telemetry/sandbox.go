@@ -145,7 +145,8 @@ func (d SandboxDownload) payload() any { return transferPayload{d.common(), d.Pa
 // workspace's status. It runs once the operation's answer was written, so
 // it outlives the request's context and is bounded by the write limit
 // alone, lookup and write together. It reports nothing: the operation's
-// outcome is the operation's. A failure is logged in one line naming the
+// outcome is the operation's. The run event observers are told of each
+// run event it stores. A failure is logged in one line naming the
 // workspace, the sandbox and the event type, and nothing else of the
 // payload, which may say more than an operator's log should.
 func (c *Component) RecordSandboxUse(ctx context.Context, op SandboxOperation) {
@@ -189,5 +190,9 @@ func (c *Component) recordSandboxUse(ctx context.Context, u SandboxUse, op Sandb
 		SessionID: &session,
 		Payload:   payload,
 	}
-	return c.write(ctx, func(ctx context.Context, tx Tx) error { return runEvents.insert(ctx, tx, e) })
+	if err := c.write(ctx, func(ctx context.Context, tx Tx) error { return runEvents.insert(ctx, tx, e) }); err != nil {
+		return err
+	}
+	c.stored(e)
+	return nil
 }

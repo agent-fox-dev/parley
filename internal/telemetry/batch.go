@@ -47,8 +47,9 @@ type valid[R record] struct {
 // transaction: an id already stored in this workspace and run, or sent
 // earlier in the batch, is a duplicate and changes nothing; an id of
 // another workspace or run is reported; the rest are stored, all of them or,
-// when the store fails, none. A batch takes no Idempotency-Key: sent again,
-// its items are duplicates.
+// when the store fails, none, and once they are committed the observers are
+// told of each that is a run event. A batch takes no Idempotency-Key: sent
+// again, its items are duplicates.
 func batch[R record](c *Component, k kind[R], read func(fields, target) (R, error)) validator {
 	return func(r *http.Request, t target) (act, error) {
 		items, err := readItems(r)
@@ -70,6 +71,7 @@ func batch[R record](c *Component, k kind[R], read func(fields, target) (R, erro
 			recs = append(recs, valid[R]{index: i, rec: rec})
 		}
 		return func(ctx context.Context, w http.ResponseWriter) error {
+			var accepted []R
 			err := c.write(ctx, func(ctx context.Context, tx Tx) error {
 				for _, v := range recs {
 					stored, created, err := storeOnce(ctx, tx, k, v.rec)
@@ -80,6 +82,7 @@ func batch[R record](c *Component, k kind[R], read func(fields, target) (R, erro
 					switch {
 					case created:
 						ans.Accepted++
+						accepted = append(accepted, stored)
 					case s.Workspace != h.Workspace || s.RunID != h.RunID:
 						ans.Errors = append(ans.Errors, itemError{
 							Index: v.index, ID: &h.ID,
@@ -93,6 +96,9 @@ func batch[R record](c *Component, k kind[R], read func(fields, target) (R, erro
 			})
 			if err != nil {
 				return fmt.Errorf("store a batch of %d %ss of run %s in workspace %s: %w", len(recs), k.name, t.runID, t.workspace, err)
+			}
+			for _, rec := range accepted {
+				c.stored(rec)
 			}
 			slices.SortFunc(ans.Errors, func(a, b itemError) int { return a.Index - b.Index })
 			server.WriteJSON(w, http.StatusOK, ans)

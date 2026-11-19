@@ -124,10 +124,12 @@ var recordTables = []string{"run_events", "session_outcomes", "tool_calls", "too
 // alice owns every workspace of the seed in the org acme, of which bob is a
 // member; carol has nothing.
 // Each user has an API key (the field of the user's name); alicePAT is a
-// PAT of alice's holding audit:write.
+// PAT of alice's holding audit:write. telemetry is the hub's telemetry
+// component.
 type world struct {
 	*hubtest.Hub
 	clock           *clock
+	telemetry       *telemetry.Component
 	failWrites      atomic.Bool
 	failThirdInsert atomic.Bool
 	blockWrites     atomic.Bool
@@ -152,6 +154,7 @@ func newWorldTOML(t *testing.T, toml string, adjust ...func(*telemetry.Deps)) *w
 	t.Helper()
 	w := &world{clock: newClock()}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, TOML: toml, Compose: func(c *hub.Composition) {
+		w.telemetry = c.Telemetry()
 		c.AdjustTelemetry(func(d *telemetry.Deps) {
 			d.DB = faultDB{DB: d.DB, fail: &w.failWrites, failThird: &w.failThirdInsert, block: &w.blockWrites}
 		})

@@ -207,7 +207,8 @@ func (c *Component) readTrace(f fields, t target) (tr trace, err error) {
 // workspace and run is answered 200 with the stored record, whatever its
 // own members hold, and one whose id names a record of another workspace or
 // run is refused 409; neither writes anything. Validation comes before the
-// lookup, so that an invalid body is refused whatever its id names.
+// lookup, so that an invalid body is refused whatever its id names. The
+// observers are told of a new run event once the write has committed.
 func postRecord[R record](c *Component, k kind[R], read func(fields, target) (R, error)) func(fields, target) (act, error) {
 	return func(f fields, t target) (act, error) {
 		rec, err := read(f, t)
@@ -227,6 +228,7 @@ func postRecord[R record](c *Component, k kind[R], read func(fields, target) (R,
 			}
 			switch s := stored.common(); {
 			case created:
+				c.stored(stored)
 				server.WriteJSON(w, http.StatusCreated, stored)
 			case s.Workspace != h.Workspace || s.RunID != h.RunID:
 				return server.Conflict(fmt.Sprintf("id %s names a %s of another workspace or run", h.ID, k.name))

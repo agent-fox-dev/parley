@@ -1,11 +1,14 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/telemetry"
 )
 
@@ -54,9 +58,101 @@ func (h *telemetryHub) openSession(t *testing.T, body map[string]any) string {
 	return s.ID
 }
 
-func TestTelemetry_TheHubRecordsWhatWasRunInASandboxOfARun(t *testing.T) {
+// TestTelemetry runs the flows of agent telemetry on one hub, one after the
+// other: each keeps to its own workspace.
+func TestTelemetry(t *testing.T) {
 	parallel(t)
 	h := startTelemetryHub(t)
+	t.Run("an agent pushes run telemetry and safely sends it twice", func(t *testing.T) { agentPushesTelemetryTwice(t, h) })
+	t.Run("the hub records what was run in a sandbox of a run", func(t *testing.T) { hubRecordsSandboxUse(t, h) })
+}
+
+// agentPushesTelemetryTwice is an agent with a PAT holding audit:write that
+// posts a run event, a batch of five trace records of which one is invalid
+// and the run's postmortem to demo, loses the answers and sends all three
+// again. An observer registered on the hub's telemetry component, as the
+// metrics of the audit records are, is told the run event once.
+func agentPushesTelemetryTwice(t *testing.T, h *telemetryHub) {
+	var mu sync.Mutex
+	var told []string
+	h.comp.Telemetry().OnRunEvent(func(eventType string) {
+		mu.Lock()
+		defer mu.Unlock()
+		told = append(told, eventType)
+	})
+	pat := h.IssuePAT(t, identity.PATSpec{UserID: h.alice, Permissions: []string{"audit:write"}})
+	runPath := "/api/v1/workspaces/demo/runs/" + telemetryRun
+	post := func(path string, body any) (int, []byte) {
+		t.Helper()
+		return h.Call(t, http.MethodPost, runPath+path, pat, body)
+	}
+	event := map[string]any{"id": "0a1b2c3d-0000-4000-8000-000000000001", "event_type": "run.start"}
+	var traces []any
+	for i, typ := range []string{"session.init", "assistant.message", "user.message", "tool.use", "session.result"} {
+		traces = append(traces, map[string]any{"id": fmt.Sprintf("0a1b2c3d-0000-4000-8000-00000000010%d", i), "event_type": typ, "sequence": i})
+	}
+	postmortem := map[string]any{
+		"run_status": "stalled", "started_at": "2026-01-02T03:00:00Z", "completed_at": "2026-01-02T04:00:00Z",
+		"task_summary": map[string]any{"total": 4}, "cost_summary": map[string]any{},
+	}
+	type batchAnswer struct {
+		Accepted   int `json:"accepted"`
+		Duplicates int `json:"duplicates"`
+		Errors     []struct {
+			Index int `json:"index"`
+		} `json:"errors"`
+	}
+
+	evStatus, ev := post("/events", event)
+	if evStatus != http.StatusCreated {
+		t.Fatalf("run event = %d %s, want 201", evStatus, ev)
+	}
+	bStatus, b := post("/traces/batch", traces)
+	var first batchAnswer
+	decodeInto(t, b, &first)
+	if bStatus != http.StatusOK || first.Accepted != 4 || len(first.Errors) != 1 || first.Errors[0].Index != 2 {
+		t.Fatalf("trace batch = %d %s, want 200 with accepted 4 and one error at index 2", bStatus, b)
+	}
+	pmStatus, pm := post("/postmortem", postmortem)
+	if pmStatus != http.StatusCreated {
+		t.Fatalf("postmortem = %d %s, want 201", pmStatus, pm)
+	}
+
+	if status, again := post("/events", event); status != http.StatusOK || !bytes.Equal(again, ev) {
+		t.Errorf("run event again = %d %s, want 200 %s", status, again, ev)
+	}
+	status, b2 := post("/traces/batch", traces)
+	var second batchAnswer
+	decodeInto(t, b2, &second)
+	if status != http.StatusOK || second.Accepted != 0 || second.Duplicates != 4 || len(second.Errors) != 1 || second.Errors[0].Index != 2 {
+		t.Errorf("trace batch again = %d %s, want 200 with accepted 0, duplicates 4 and one error at index 2", status, b2)
+	}
+	if status, again := post("/postmortem", postmortem); status != http.StatusOK || !bytes.Equal(again, pm) {
+		t.Errorf("postmortem again = %d %s, want 200 %s", status, again, pm)
+	}
+
+	for table, want := range map[string]int{"run_events": 1, "traces": 4, "postmortems": 1} {
+		var n int
+		err := h.Store.Analytics().QueryRowContext(context.Background(),
+			`SELECT COUNT(*) FROM `+table+` WHERE workspace = ? AND run_id = ?`, "demo", telemetryRun).Scan(&n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Errorf("%s of demo and the run = %d, want %d", table, n, want)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(told, []string{"run.start"}) {
+		t.Errorf("the run event observer was told %v, want [run.start]", told)
+	}
+}
+
+// hubRecordsSandboxUse is the hub recording an exec in the sandbox of a
+// session of a run as a run event of demo--task1, and nothing for one of a
+// session without a run, without a hub event.
+func hubRecordsSandboxUse(t *testing.T, h *telemetryHub) {
 	withRun := h.openSession(t, map[string]any{"workspace_slug": "demo--task1", "run_id": telemetryRun})
 	withoutRun := h.openSession(t, map[string]any{"workspace_slug": "demo--task1"})
 	hubEvents := func() int {
@@ -119,11 +215,11 @@ func TestTelemetry_TheHubRecordsWhatWasRunInASandboxOfARun(t *testing.T) {
 	h.comp.Telemetry().RecordSandboxUse(context.Background(), execIn(withoutRun))
 
 	var all int
-	if err := h.Store.Analytics().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM run_events`).Scan(&all); err != nil {
+	if err := h.Store.Analytics().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM run_events WHERE workspace = ?`, "demo--task1").Scan(&all); err != nil {
 		t.Fatal(err)
 	}
 	if all != 1 {
-		t.Errorf("run events = %d after an exec of a session without a run, want 1", all)
+		t.Errorf("run events of demo--task1 = %d after an exec of a session without a run, want 1", all)
 	}
 	if after := hubEvents(); after != before {
 		t.Errorf("hub events = %d after the two reports, want %d as before", after, before)

@@ -34,9 +34,10 @@ type Deps struct {
 
 // Component is the telemetry feature. The hub creates its zero value while
 // it composes, registers its schema steps and routes, and binds it in a
-// start hook.
+// start hook. Run event observers may be registered on it from then on.
 type Component struct {
-	deps Deps
+	deps      Deps
+	observers runEventObservers
 }
 
 // Bind gives the component its dependencies, filling the defaults of the
