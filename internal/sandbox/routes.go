@@ -172,6 +172,19 @@ func (s *Service) CheckpointRoute() server.Route {
 	})
 }
 
+// StopRoute declares POST /workspaces/:slug/sandboxes/:id/stop: it stops
+// the sandbox id for the caller, keeping its working directory, and
+// answers with the sandbox in every state (see serveStop). It needs the
+// scope sandboxes:write of a PAT and write access to the workspace; the
+// admin token acts as an owner.
+func (s *Service) StopRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/stop",
+		Handler: s.serveStop,
+	})
+}
+
 // ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
 // of the workspace, newest first, paged, filtered by the query (see
 // listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and

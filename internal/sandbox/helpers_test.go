@@ -3583,3 +3583,43 @@ func metricDelta(before, after map[string]float64) map[string]float64 {
 	}
 	return out
 }
+
+// hubCredential mints a live hub credential for the stored sandbox id,
+// which has hub access, through the hub's minting, as a create or a start
+// does: it stores the token's id on the record, gives the service its
+// value, and returns the value.
+func (h *createHub) hubCredential(t *testing.T, id string) string {
+	t.Helper()
+	rec := storedRecord(t, h.Hub, id)
+	var value string
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		pat, v, err := h.svc.MintHubCredential(ctx, tx, rec, rec.ExpiresAt)
+		if err != nil {
+			return err
+		}
+		value = v
+		return sandbox.Update(ctx, tx, id, sandbox.SetHubTokenID(pat.TokenID))
+	})
+	h.svc.SetHubCredential(id, value)
+	return value
+}
+
+// credentialAnswer is the answer to a read of demo--t1 that a hub
+// credential of a sandbox of it may make, with cred as the bearer
+// credential: 200 while cred authenticates.
+func (h *createHub) credentialAnswer(t *testing.T, cred string) answer {
+	t.Helper()
+	return h.call(t, http.MethodGet, "/workspaces/demo--t1/claims", cred, nil)
+}
+
+// sandboxCalls are the operations the runtime was asked for on the sandbox
+// id or a provider of it, from the n-th call of the runtime on, in order.
+func (h *createHub) sandboxCalls(id string, n int) []string {
+	var ops []string
+	for _, c := range h.rt.Calls()[n:] {
+		if strings.HasPrefix(c.Target, id) {
+			ops = append(ops, c.Op)
+		}
+	}
+	return ops
+}

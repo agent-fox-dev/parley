@@ -79,7 +79,9 @@ const (
 // under /workspaces/:slug/sandboxes/:id, exist only through the service's
 // gate (Service.UseRoutes). POST
 // /workspaces/:slug/sandboxes/:id/checkpoint saves a ready sandbox's
-// working directory to its workspace through the service's checkpoint.
+// working directory to its workspace through the service's checkpoint, and
+// POST /workspaces/:slug/sandboxes/:id/stop stops a ready sandbox through
+// the service's stop.
 //
 // The output of each ready sandbox's main process and its policy log are
 // stored in a table of their own: with sandboxes on, the log collector runs
@@ -151,6 +153,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.GetRoute())
 	c.AddRoute(svc.ListRoute())
 	c.AddRoute(svc.CheckpointRoute())
+	c.AddRoute(svc.StopRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
