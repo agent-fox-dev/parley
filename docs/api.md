@@ -9851,6 +9851,176 @@ a `since` or `until` that is not RFC 3339, a `since` that is not before
 `until`, a `limit` outside 1 to 200 and a cursor of another query are `400`
 `invalid_request`; no access is `404` `not_found` (`workspace not found`).
 
+## Agent telemetry
+
+Agents push records about their runs to the hub, so that a run can be
+audited later: run events, session outcomes, tool calls, tool errors, trace
+records and one postmortem per run. They are stored in the analytical store
+(`analytics.db`) and never in the event log: ingestion writes no hub event.
+Reading them back is not built yet.
+
+Every ingestion route is a `POST` under
+`/api/v1/workspaces/{slug}/runs/{run_id}`:
+
+| Route | Stores |
+|---|---|
+| `POST …/events` | one run event |
+| `POST …/events/batch` | 1 to 1000 run events |
+| `POST …/sessions/outcomes` | one session outcome |
+| `POST …/tools/calls` | one tool call |
+| `POST …/tools/errors` | one tool error |
+| `POST …/traces` | one trace record |
+| `POST …/traces/batch` | 1 to 1000 trace records |
+| `POST …/postmortem` | the postmortem of the run |
+
+**Order of checks.** Every route declares the scope `audit:write` for a PAT
+and needs write access to the workspace, and decides in this order, the
+first failure answering:
+
+| Status | When |
+|---|---|
+| `403` `insufficient_scope` | a PAT without `audit:write`, whether or not the workspace exists |
+| `404` `not_found` | no such workspace, or one the caller has no access to (`workspace not found`, the same bytes in both cases, for every caller, the admin token included) |
+| `403` `forbidden` | a member of the workspace's org who is not its owner, also on an archived workspace |
+| `400` `invalid_request` | the path's `run_id` is not of the run id form (`run_id must have the form YYYYMMDD_HHMMSS_ and six lower-case hexadecimal digits`); the body breaks a rule of its members, the message naming the member; a `run_id` member of the body differs from the path's |
+| `409` `workspace_archived` | the workspace is archived (`the workspace is archived and accepts no telemetry`); a workspace in any other status, a task fork included, accepts ingestion |
+| `503` `unavailable` | the write did not finish within `[audit].write_timeout` (default `2s`, see [configuration.md](configuration.md#keys)): it is rolled back, nothing of the request is stored, and the answer carries `Retry-After: 5`; a retry with the same ids stores the records as new |
+| `500` `internal` | the store failed; nothing of the request is stored |
+
+A refused request stores nothing. The six single-record routes are creating
+`POST`s and take an `Idempotency-Key` (see [Idempotency](#idempotency)); the
+two batch routes do not.
+
+**Members and their rules.** Every record has `id`, `workspace` (the slug
+of the path), `run_id` (the path's), `timestamp` and `ingested_at`, and
+every member of its kind is present in every answer, an optional member
+that was not sent being `null`.
+
+- `id`: a UUID in the 8-4-4-4-12 hexadecimal form in any letter case,
+  stored and returned in lower case; a version 4 UUID when absent.
+- `timestamp`: RFC 3339 with any offset, returned in UTC with `Z`, its
+  fraction cut to microseconds and without trailing zeros
+  (`2026-01-02T05:04:05.1234567+02:00` is returned as
+  `2026-01-02T03:04:05.123456Z`); the hub's time when absent.
+- `ingested_at`: the hub's time, in whole seconds.
+- `session_id`: a UUID, returned in lower case; it is not checked against
+  the stored sessions.
+- `node_id` and `tool_name`: strings of at most 255 characters.
+- `duration_ms` and `sequence`: whole numbers of at least `0`; a fraction
+  or a string is refused.
+- `payload`, `token_usage`, `input`, `output` and `data`: stored and
+  returned as JSON, never as a string holding JSON; `payload` must be an
+  object, the others may be any JSON value.
+- A required string may not be empty. A JSON `null` member counts as
+  absent; members the kind does not define are ignored.
+
+| Kind | Route | Members beyond the common ones |
+|---|---|---|
+| run event | `…/events` | `event_type` (required, free-form), `severity` (`info`, `warning`, `error`, `critical`), `node_id`, `session_id`, `payload` |
+| session outcome | `…/sessions/outcomes` | `session_id` (required), `status` (required, free-form), `node_id`, `duration_ms`, `token_usage` |
+| tool call | `…/tools/calls` | `tool_name` (required), `node_id`, `session_id`, `duration_ms`, `input`, `output` |
+| tool error | `…/tools/errors` | `tool_name` (required), `error_msg` (required), `error_code` (a string), `node_id`, `session_id` |
+| trace record | `…/traces` | `event_type` (required: `session.init`, `assistant.message`, `tool.use`, `tool.error` or `session.result`), `node_id`, `session_id`, `sequence`, `data` |
+
+A run event sent without `severity` gets `error` for the type
+`session.fail`, `warning` for `run.limit_reached`, `git.conflict`,
+`harvest.empty` and `review.parse_failure`, and `info` for every other
+type.
+
+```json
+{"id":"0a1b2c3d-0000-4000-8000-000000000001","workspace":"demo","run_id":"20260102_030405_a1b2c3","timestamp":"2026-01-02T03:00:00Z","ingested_at":"2026-01-02T03:04:05Z","event_type":"run.start","severity":"info","node_id":null,"session_id":null,"payload":{"a":{"b":1}}}
+```
+
+**Once per id.** A new record answers `201` with the stored record. A
+request whose `id` names a stored record of the same kind in the same
+workspace and run answers `200` with the **stored** record, also when the
+body differs, and changes nothing; the body is still validated first, so
+an invalid replay is `400`. An `id` that names a record of the same kind in
+another workspace or run answers `409` `conflict` (`id <id> names a
+<kind> of another workspace or run`). Ids are compared without regard to
+letter case, and each kind has its own ids: one UUID may name a run event
+and a tool call. Of several requests with one new `id` at once, exactly
+one stores the record and answers `201`; the others answer `200` with it.
+
+## `POST /api/v1/workspaces/{slug}/runs/{run_id}/events/batch` and `…/traces/batch`
+
+Take a JSON array of 1 to 1000 run events or trace records, each judged
+like the single record of its kind. A body that is not a JSON array, or an
+empty array, is `400` `invalid_request`; more than 1000 items are `413`
+`payload_too_large` (`a batch holds at most 1000 items, not <n>`), whether
+or not they are valid. Otherwise the answer is always `200`:
+
+```json
+{"accepted":2,"duplicates":1,"errors":[{"index":3,"id":null,"message":"event_type is required and must be a non-empty string"}]}
+```
+
+- An invalid item, an item that is not a JSON object included, is skipped
+  and reported in `errors` with its zero-based `index`, its `id` (lower
+  case when the item carries a valid UUID, else `null`) and a `message`
+  naming the member.
+- An item whose `id` names a record of another workspace or run is
+  reported in `errors` with its `id`.
+- An item whose `id` is stored in this workspace and run, and an item that
+  repeats the `id` of an earlier item of the batch, count in `duplicates`
+  and change nothing.
+- Every other item is stored and counted in `accepted`. The accepted items
+  are stored in one transaction, all or none: a store failure is `500`
+  `internal` and a timeout `503`, with nothing stored.
+- `errors` is in index order, `[]` when there are none.
+
+## `POST /api/v1/workspaces/{slug}/runs/{run_id}/postmortem`
+
+Stores the one postmortem of a run in a workspace. The body:
+
+| Member | Value |
+|---|---|
+| `run_status` | required: `stalled`, `block_limit`, `cost_limit` or `session_limit` |
+| `started_at`, `completed_at` | required, RFC 3339, returned like `timestamp`; their order is not checked |
+| `task_summary` | required, a JSON object whose key `total` is present and not `null` |
+| `cost_summary` | required, a JSON object |
+| `blocked_tasks`, `session_history` | JSON arrays, `[]` when absent |
+| `schema_version` | the number `1`; `1` when absent or `null` |
+
+The hub generates the `id` and sets `timestamp` and `ingested_at` to its
+own time; an `id` or `timestamp` member of the body is ignored. The first
+postmortem of the run in the workspace answers `201`:
+
+```json
+{"id":"…","workspace":"demo","run_id":"20260102_030405_a1b2c3","timestamp":"2026-01-02T03:04:05Z","ingested_at":"2026-01-02T03:04:05Z","schema_version":1,"run_status":"stalled","started_at":"2026-01-02T02:00:00Z","completed_at":"2026-01-02T02:30:00Z","task_summary":{"total":4,"done":3},"cost_summary":{},"blocked_tasks":[],"session_history":[]}
+```
+
+A later valid postmortem of the run in the workspace, also several at
+once, answers `200` with the stored one and changes nothing; the same run
+id in another workspace has its own. A `schema_version` other than the
+number `1` is `400` `unknown_schema_version` (`schema_version must be the
+number 1, the one version of a postmortem the hub reads`); every other
+violation is `400` `invalid_request` naming the member, also when the run
+has a postmortem already.
+
+## Sandbox use as run events
+
+The hub records what is done in a sandbox that belongs to a run. When an
+exec, an attach, an upload or a download that passed every check ends in a
+sandbox whose session is stored and has a `run_id`, the hub stores one run
+event of the sandbox's workspace under that `run_id` and `session_id`, with
+a generated `id`, `severity` `info` and the time the operation started as
+its `timestamp`:
+
+| Operation | `event_type` | `payload` members |
+|---|---|---|
+| exec | `sandbox.exec` | `sandbox_id`, `actor_type`, `actor_id`, `command` (the argument list), `exit_code`, `timed_out`, `duration_ms` |
+| attach | `sandbox.attach` | `sandbox_id`, `actor_type`, `actor_id`, `duration_ms` |
+| upload | `sandbox.upload` | `sandbox_id`, `actor_type`, `actor_id`, `path`, `bytes` |
+| download | `sandbox.download` | `sandbox_id`, `actor_type`, `actor_id`, `path`, `bytes` |
+
+`actor_id` is `null` for the admin token and `exit_code` `null` for an
+exec that gave none. The payload never holds standard input, output,
+terminal content, file content or environment values. A sandbox without a
+session, or whose session has no `run_id` or is not stored, leaves no
+record. The record checks neither access nor the workspace's status, is
+held to `[audit].write_timeout`, and writes no hub event; a failure to
+write it is logged and changes nothing about the operation.
+
 ## `GET /api/v1/events`
 
 Streams the hub events the caller may see as Server-Sent Events: first the
