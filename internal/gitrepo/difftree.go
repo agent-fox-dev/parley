@@ -52,12 +52,33 @@ var nullID = strings.Repeat("0", idLen)
 // DiffChanges are the file changes from the tree of from to that of to,
 // each a full id of a commit or a tree, from "" being the empty tree, in
 // byte order of path, the order git writes them in. Renamed and copied
-// files are found.
+// files are found. A recent answer is given again without asking git
+// while the repository still holds both sides (see diffcache.go).
 func (r *Repo) DiffChanges(ctx context.Context, from, to string) ([]FileChange, error) {
 	from, to, err := r.diffSides(ctx, from, to)
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key, cacheable := r.diffKey(from, to)
+	if cacheable {
+		if changes, ok := diffs.get(key); ok && r.historyUnchanged(from, to) {
+			return changes, nil
+		}
+	}
+	// Kept only when git read the history as stored before and after.
+	cacheable = cacheable && historyAsStored(r.dir)
+	changes, err := r.diffChanges(ctx, from, to)
+	if err == nil && cacheable && r.historyUnchanged(from, to) {
+		diffs.put(key, changes)
+	}
+	return changes, err
+}
+
+// diffChanges is DiffChanges of the sides diffSides gives, as git answers.
+func (r *Repo) diffChanges(ctx context.Context, from, to string) ([]FileChange, error) {
 	args := append(append([]string{"diff-tree", "-r", "-z"}, findRenames...), "--raw", "--numstat", from, to)
 	out, err := r.git(ctx, args...)
 	if err != nil {

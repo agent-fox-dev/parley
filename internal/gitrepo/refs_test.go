@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -179,5 +180,36 @@ func TestSetRefFrom_BringsACommitOfAnotherRepositoryUnderTheRef(t *testing.T) {
 	}
 	if !readable(parent, own) {
 		t.Error("the parent cannot read the fork's commit after the copy")
+	}
+}
+
+// The copy SetRefFrom makes into a repository leaves no automatic
+// maintenance running in it: a detached one outlives the call and writes
+// into the repository after its caller is done with it.
+func TestSetRefFrom_StartsNoAutomaticMaintenance(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	parent, _, _, _ := forkParent(t, 1)
+	fork := newFork(t, parent)
+	own := gitrepotest.PushCommit(t, parent, fork, "work", "only in the fork\n")
+	trace := filepath.Join(t.TempDir(), "trace")
+	repo, err := gitrepo.Git{Env: []string{"GIT_TRACE=" + trace}}.Open(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetRefFrom(ctx, fork, "refs/parley/changes/1/1", own); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "receive-pack") {
+		t.Fatalf("the trace of SetRefFrom shows no receive-pack:\n%s", got)
+	}
+	for _, started := range []string{"maintenance run", "gc --auto"} {
+		if strings.Contains(string(got), started) {
+			t.Errorf("SetRefFrom started git %s in the repository:\n%s", started, got)
+		}
 	}
 }

@@ -988,7 +988,7 @@ VALUES ('api', 1, 3, ?, NULL), ('api', 2, 0, NULL, 1), ('other', 1, 3, ?, NULL)`
 		t.Fatal(err)
 	}
 	if err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := w.workspaces.RemoveOwned(ctx, tx, "api", "workspace_deleted")
+		_, err := w.workspaces.RemoveOwned(ctx, tx, "api", "workspace deleted")
 		return err
 	}); err != nil {
 		t.Fatal(err)

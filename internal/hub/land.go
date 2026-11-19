@@ -49,9 +49,8 @@ const (
 // binds, hands them to the pool again, which runs them while requests are
 // served. A test starts the hub with the pool paused by setting
 // land.Deps.Paused through AdjustLand: the attempts it is handed stay
-// running until a start without it. No
-// session linker is registered: until the session feature registers one,
-// every session_id a land names is refused.
+// running until a start without it. The
+// session feature registers the session linker (composeSessions).
 //
 // Two after-landing hooks are registered here for the features built
 // before the landing: the change feature's entry point for a landed change

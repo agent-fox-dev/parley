@@ -39,8 +39,9 @@ const (
 // rule (RegisterSessionLinker) and the sandbox feature its sandbox component
 // (RegisterSandbox), each from its own file of this package, as ADR 07 has
 // the teardown collaborators registered on the workspace service. None is
-// registered here: without them every session_id is refused 400
-// unknown_session and every sandbox 404 sandboxes_disabled.
+// registered here: the session feature registers its rule
+// (composeSessions); without a sandbox component every sandbox is refused
+// 404 sandboxes_disabled.
 //
 // The component is also the one place forks are removed: it is the fork
 // remover of the workspace service's teardown set, so that DELETE

@@ -243,9 +243,8 @@ func (c *Composition) Receiver() *gitserver.Receiver { return c.receiver }
 
 // PushOptions returns the hub's options stage, the push processor's from
 // the composition on, which judges a push's options before its pack is
-// read. The part that owns the session-linking rule registers its session
-// linker on it when it is composed; until one does, every parley.session
-// is refused.
+// read. The session feature registers its session linker on it when it is
+// composed (composeSessions).
 func (c *Composition) PushOptions() *gitserver.PushOptionsStage { return c.pushOptions }
 
 // GitServer returns the hub's git server, which serves the three git routes

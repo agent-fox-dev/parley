@@ -46,6 +46,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
+	"github.com/agent-fox-dev/parley/internal/session"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -87,6 +88,7 @@ var parts = []func(*Composition){
 	composeJobs,
 	composeCarryPatch,
 	composeForge,
+	composeSessions,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -309,6 +311,12 @@ type Composition struct {
 	// dependencies (AdjustForge).
 	forge          *forge.Component
 	forgeAdjusters []func(*forge.Deps)
+
+	// sessions is the session component composeSessions creates and binds
+	// in its start hook (Sessions), after sessionAdjusters have changed its
+	// dependencies (AdjustSessions).
+	sessions         *session.Component
+	sessionAdjusters []func(*session.Deps)
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).

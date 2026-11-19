@@ -30,8 +30,11 @@ Git hands over the object of a tag only for a ref it writes, over every
 transport (the file-based HTTP transport cannot fetch an object by its id).
 So the one atomic fetch writes origin's branches and tags into a namespace
 of its own, `refs/parley/fetch/<16 random hex digits>/` (`heads/` and
-`tags/`), reads them from there and deletes the namespace right after
-the fetch, after a failure too, before any origin head is set. The copy's `refs/tags/` is never written by
+`tags/`), reads them from there and deletes the namespace: after a failed
+fetch right away, after one that succeeded in the transaction that sets the
+origin heads, or, when git refuses that one or no origin head changes,
+alone before any origin head is set, so that a deletion that fails leaves
+every origin head as it was. The copy's `refs/tags/` is never written by
 the fetch; the sync then creates the tags the copy lacks from the values the
 fetch returned. The tag objects stay in the copy's object store until a ref
 names them or git prunes them as unreachable.

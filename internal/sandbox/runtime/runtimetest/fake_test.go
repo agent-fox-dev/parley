@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -481,6 +483,33 @@ func TestFake_BacksASandboxWithAHostDirectory(t *testing.T) {
 	r, err := c.Exec(ctx, "sb-1", runtime.ExecRequest{Command: []string{"cat", "b"}})
 	if err != nil || string(r.Stdout) != "host" {
 		t.Fatalf("Exec of cat b in the working directory = %+v, %v; want host", r, err)
+	}
+}
+
+func TestFake_ExecAnswersWithACommandsOwnEndWhileAChildItLeftHoldsItsOutput(t *testing.T) {
+	t.Parallel()
+	f := runtimetest.New(t, runtimetest.WithHostDirs())
+	c := f.Client("parley", nil)
+	if _, err := c.CreateSandbox(t.Context(), runtime.SandboxSpec{Name: "sb-1", WorkDir: "/w"}); err != nil {
+		t.Fatal(err)
+	}
+	pidFile := filepath.Join(f.HostDir("parley", "sb-1"), "w", "pid")
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	// The child holds the command's output open long after the command ended,
+	// as a command's output may also go undrained for a while on a loaded
+	// machine: neither changes what the command printed or how it ended.
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	r, err := c.Exec(ctx, "sb-1", runtime.ExecRequest{Command: []string{"sh", "-c",
+		"sleep 60 & echo $! >pid; printf out; printf err >&2"}})
+	if err != nil || r.ExitCode != 0 || string(r.Stdout) != "out" || string(r.Stderr) != "err" {
+		t.Fatalf("Exec = %+v (stdout %q, stderr %q), %v; want exit 0 with out and err", r, r.Stdout, r.Stderr, err)
 	}
 }
 

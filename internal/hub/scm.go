@@ -40,8 +40,8 @@ const scmHook = "scm"
 //
 // The change part (composeChanges) sets the change and commit-change
 // lookups through AdjustSCM and registers the change linker; the land part
-// (composeLand) sets the session lookup. Nothing registers a session
-// linker yet, so every session_id is refused 400 unknown_session.
+// (composeLand) sets the session lookup; the session feature registers the
+// session linker (composeSessions).
 // The hub registers no request recorder; the default discards the
 // observations.
 //
