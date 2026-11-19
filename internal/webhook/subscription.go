@@ -296,7 +296,8 @@ func boolOf(raw json.RawMessage) (bool, bool) {
 }
 
 // create answers POST /workspaces/:slug/webhooks: once the body passes the
-// field rules, 409 workspace_archived on an archived workspace, 429
+// field rules, 400 webhook_destination_refused when checkDestination
+// refuses the url, 409 workspace_archived on an archived workspace, 429
 // webhook_limit_reached when the workspace holds [webhooks].max_per_workspace
 // subscriptions in any state, and 503 secrets_unavailable without a key.
 // Otherwise it stores the subscription with a new signing secret, sealed,
@@ -310,6 +311,9 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) er
 	}
 	in, err := parseCreate(body, c.deps.Settings)
 	if err != nil {
+		return err
+	}
+	if err := c.checkDestination(r.Context(), in.url); err != nil {
 		return err
 	}
 	slug := q.slug()
@@ -369,10 +373,11 @@ var updateFields = []string{"url", "types", "include_forks", "description", "act
 
 // updateRequest is a change body that has passed the field rules: fields
 // are the names it gives, in the order of updateFields, and each member it
-// gives is set.
+// gives is set, the url as given and parsed.
 type updateRequest struct {
 	fields       []string
 	rawURL       *string
+	url          *url.URL
 	types        []string
 	includeForks *bool
 	description  *string
@@ -408,7 +413,7 @@ func parseUpdate(body map[string]json.RawMessage, s Settings) (updateRequest, er
 		switch name {
 		case "url":
 			var text string
-			if text, _, err = urlField(raw, s); err == nil {
+			if text, req.url, err = urlField(raw, s); err == nil {
 				req.rawURL = &text
 			}
 		case "types":
@@ -460,7 +465,9 @@ func (req updateRequest) apply(s *Subscription) {
 }
 
 // update answers PATCH /workspaces/:slug/webhooks/:id: once the body
-// passes parseUpdate, 409 workspace_archived on an archived workspace.
+// passes parseUpdate, 400 webhook_destination_refused when it gives a url
+// checkDestination refuses, then 409 workspace_archived on an archived
+// workspace.
 // Otherwise it changes exactly the fields given, sets updated_at, writes
 // parley.webhook.update with the names of the fields given and the state
 // after the change in the same transaction, and answers 200 with the
@@ -473,6 +480,11 @@ func (c *Component) update(w http.ResponseWriter, r *http.Request, q request) er
 	in, err := parseUpdate(body, c.deps.Settings)
 	if err != nil {
 		return err
+	}
+	if in.url != nil {
+		if err := c.checkDestination(r.Context(), in.url); err != nil {
+			return err
+		}
 	}
 	if err := refuseArchived(q); err != nil {
 		return err

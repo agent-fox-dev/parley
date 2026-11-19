@@ -16,6 +16,7 @@ package webhook
 
 import (
 	"log/slog"
+	"net"
 
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/secret"
@@ -25,9 +26,10 @@ import (
 // Deps are what the component works with: the transactional store, the
 // event log it writes its events to, the operator's keys and whether secrets
 // can be stored, its clock (nil for the system clock), its log (nil discards
-// it) and the loaded [webhooks] settings. Keys is a function so that the
-// component reads the keys as they are when it needs them; nil is no key.
-// Available nil means a current key is among Keys.
+// it), the loaded [webhooks] settings and the resolver that looks up the
+// host of a destination (nil for the system's). Keys is a function so that
+// the component reads the keys as they are when it needs them; nil is no
+// key. Available nil means a current key is among Keys.
 type Deps struct {
 	Store     *store.Store
 	Events    *event.Component
@@ -36,6 +38,7 @@ type Deps struct {
 	Clock     event.Clock
 	Logger    *slog.Logger
 	Settings  Settings
+	Resolver  Resolver
 }
 
 // Component is the event webhook feature. The hub creates its zero value
@@ -52,6 +55,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.Resolver == nil {
+		d.Resolver = net.DefaultResolver
 	}
 	if d.Keys == nil {
 		d.Keys = func() secret.Keys { return secret.Keys{} }

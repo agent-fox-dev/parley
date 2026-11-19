@@ -322,6 +322,91 @@ func TestUpdate_RefusesABodyThatBreaksAFieldRule(t *testing.T) {
 	}
 }
 
+func TestSetURL_RefusesADestinationInTheHubsNetworks(t *testing.T) {
+	t.Parallel()
+	const (
+		refused = "webhook_destination_refused"
+		invalid = "invalid_request"
+	)
+	// row is a url and the error_type its create and change are refused
+	// with, "" for a url they accept.
+	type row struct{ url, want string }
+	https := func(want string, hosts ...string) []row {
+		out := make([]row, len(hosts))
+		for i, h := range hosts {
+			out[i] = row{"https://" + h + "/h", want}
+		}
+		return out
+	}
+	byDefault := append(https(refused,
+		"127.0.0.1", "127.8.9.10", "localhost", "169.254.1.1", "169.254.169.254", "10.0.0.1", "172.16.0.1",
+		"172.31.255.255", "192.168.1.1", "0.0.0.0", "224.0.0.1", "[::1]", "[fe80::1]", "[fc00::1]",
+		"[fd00:ec2::254]", "[::]", "[ff02::1]", "[::ffff:10.0.0.1]", "inside.example", "mixed.example"),
+		https("", "203.0.113.10", "172.32.0.1", "[2001:db8::1]", "ci.example", "nowhere.example")...)
+	withPrivate := append(https("", "127.0.0.1", "10.0.0.1", "169.254.169.254", "[::1]", "[fc00::1]", "inside.example"),
+		row{"http://10.0.0.1/x", invalid})
+	withInsecure := []row{
+		{"http://127.0.0.1:8080/h", ""},
+		{"http://[::1]:8080/h", ""},
+		{"http://localhost:8080/h", ""},
+		{"http://ci.example/h", invalid},
+		{"http://10.0.0.1/h", invalid},
+		{"https://127.0.0.1/h", refused},
+	}
+
+	for _, tc := range []struct {
+		name string
+		toml string
+		rows []row
+	}{
+		{"by default", "", byDefault},
+		{"with allow_private", "[webhooks]\nallow_private = true\n", withPrivate},
+		{"with allow_insecure", "[webhooks]\nallow_insecure = true\n", withInsecure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t, options{toml: tc.toml})
+			id, _ := w.mustCreate(t, demo, "https://ci.example/keep")["id"].(string)
+			for _, r := range tc.rows {
+				t.Run(r.url, func(t *testing.T) {
+					for _, op := range []struct {
+						name   string
+						send   func() (int, []byte)
+						status int
+					}{
+						{"create", func() (int, []byte) { return w.create(t, w.ownerKey, demo, map[string]any{"url": r.url}) }, http.StatusCreated},
+						{"PATCH url", func() (int, []byte) {
+							return w.Call(t, http.MethodPatch, hookPath(demo, id), w.ownerKey, map[string]any{"url": r.url})
+						}, http.StatusOK},
+					} {
+						rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+						status, raw := op.send()
+						if r.want == "" {
+							if status != op.status {
+								t.Errorf("%s = %d %s, want %d", op.name, status, raw, op.status)
+							}
+							continue
+						}
+						if status != http.StatusBadRequest {
+							t.Errorf("%s = %d %s, want 400", op.name, status, raw)
+							continue
+						}
+						if e := errorOf(t, raw); e["error_type"] != r.want {
+							t.Errorf("%s error_type = %v, want %s", op.name, e["error_type"], r.want)
+						}
+						if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+							t.Errorf("%s changed the subscriptions:\n%v\nwant\n%v", op.name, got, rows)
+						}
+						if got := w.lastSeq(t); got != seq {
+							t.Errorf("%s moved the newest seq from %d to %d", op.name, seq, got)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestChange_RefusesAnArchivedWorkspace(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, options{})

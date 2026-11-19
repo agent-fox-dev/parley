@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"sync"
 	"testing"
@@ -92,6 +94,7 @@ func newWorld(t *testing.T, opts options) *world {
 		Env:  map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
 		Compose: func(c *hub.Composition) {
 			w.log = c.Events()
+			c.AdjustWebhooks(func(d *webhook.Deps) { d.Resolver = names })
 			for _, a := range opts.adjust {
 				c.AdjustWebhooks(a)
 			}
@@ -104,6 +107,26 @@ func newWorld(t *testing.T, opts options) *world {
 		w.AddWorkspace(t, access.Record{Slug: slug, OwnerID: w.owner, OrgID: org, Kind: access.KindRepository, Status: access.StatusReady})
 	}
 	return w
+}
+
+// resolver answers host names as a DNS server would, from a fixed list, so
+// that no test asks the network; a name it does not list does not resolve.
+type resolver map[string][]netip.Addr
+
+func (r resolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	if addrs, ok := r[host]; ok {
+		return addrs, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+// names are the host names every world's webhook component resolves:
+// ci.example is outside the hub's networks, inside.example inside them, and
+// mixed.example has one address of each.
+var names = resolver{
+	"ci.example":     {netip.MustParseAddr("203.0.113.10")},
+	"inside.example": {netip.MustParseAddr("10.0.0.5")},
+	"mixed.example":  {netip.MustParseAddr("203.0.113.10"), netip.MustParseAddr("10.0.0.5")},
 }
 
 // hooksPath is the path of the webhook collection of the workspace slug.
