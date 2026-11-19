@@ -51,6 +51,15 @@ func TestMetrics_CreatesAndStates(t *testing.T) {
 	provision(sandbox.StateFailed)
 	h.rt.FailOperation(runtime.OpCreateSandbox, nil, "")
 
+	// A provisioning is counted once its ending transaction has committed,
+	// so the record can show the state before the count is made.
+	eventually(t, "the three provisionings to be counted", func() bool {
+		var n float64
+		for _, v := range h.rec.values(sandbox.CreatesMetric) {
+			n += v
+		}
+		return n >= 3
+	})
 	if got, want := h.rec.values(sandbox.CreatesMetric), map[string]float64{"result=ready": 2, "result=failed": 1}; !maps.Equal(got, want) {
 		t.Errorf("parley_sandbox_creates_total = %v; want %v", got, want)
 	}
