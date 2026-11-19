@@ -1232,9 +1232,89 @@ stderr as received, with exit status `1`; on a hub without sandboxes:
 | Command | Request |
 |---|---|
 | `parley sandbox profiles` | `GET /api/v1/sandbox-profiles` |
+| `parley sandbox create <workspace-slug> [flags] [-- command...]` | `POST /api/v1/workspaces/<slug>/sandboxes` |
+| `parley sandbox list <workspace-slug> [flags]` | `GET /api/v1/workspaces/<slug>/sandboxes` |
+| `parley sandbox get <workspace-slug> <id>` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>` |
 
 `parley sandbox` run without a command prints its help and exits `0`; it
-reads no credential and sends no request.
+reads no credential and sends no request. The slug and the id are sent as
+one path segment each, percent-encoded (`a/b` becomes `a%2Fb`).
+
+#### `parley sandbox create`
+
+```
+parley sandbox create <workspace-slug> [--profile <name>] [--env key=value]... [--label key=value]...
+                      [--no-checkout | [--ref <ref>] [--branch <branch>]] [--restore-from <id>]
+                      [--ttl <duration>] [--purpose <text>] [--session <id>]
+                      [--wait | --wait-exit] [--timeout <duration>] [--poll-interval <duration>]
+                      [-- command...]
+```
+
+Sends [`POST /api/v1/workspaces/<slug>/sandboxes`](api.md#post-apiv1workspacesslugsandboxes)
+with a JSON body that holds exactly the members its flags name, and prints
+the hub's answer, the sandbox object. Without a flag the body is `{}`, and
+the hub's defaults apply.
+
+| Flag | Body member | Value |
+|---|---|---|
+| `--profile <name>` | `profile` | the string as given |
+| `--env key=value` | `env` | repeatable; an object of every pair, each split at its first `=` (`--env A=b=c` sends `{"A":"b=c"}`) |
+| `--label key=value` | `labels` | repeatable; as `--env` |
+| `--no-checkout` | `checkout` | `false` |
+| `--ref <ref>`, `--branch <branch>` | `checkout` | `{"ref": …, "branch": …}` with the members given |
+| `--restore-from <id>` | `restore_from` | the string as given |
+| `--ttl <duration>` | `ttl` | the string as given, such as `1h` |
+| `--purpose <text>` | `purpose` | the string as given |
+| `--session <id>` | `session_id` | the string as given |
+| `-- command...` | `command` | the list of the words after `--` |
+
+`parley sandbox create demo--t1 --profile agent --env CI=1 --label team=core -- make test` sends
+
+```json
+{"command":["make","test"],"env":{"CI":"1"},"labels":{"team":"core"},"profile":"agent"}
+```
+
+These are usage errors (`usage_error`, exit status `2`), before any
+setting is read or request sent: no slug, or more than one word before
+`--`; an `--env` or `--label` value without `=` or with an empty key;
+`--no-checkout` with `--ref` or `--branch`; `--wait-exit` without a
+command; and a `--timeout` or `--poll-interval` the CLI cannot read (see
+[Waiting](#waiting)).
+
+**`--wait`.** After the hub answers the create with `201`, the command
+polls [`GET /api/v1/workspaces/<slug>/sandboxes/<id>`](api.md#get-apiv1workspacesslugsandboxesid)
+every `--poll-interval` until the state is no longer `provisioning`, within
+`--timeout`. A sandbox that ends `ready` or `completed` is printed on
+stdout, the only document there, with exit status `0`. One that ends
+`failed`, `stopped` or `deleted` is printed on stdout too, `wait_failed` is
+written to stderr, and the exit status is `1`. Running out of time is
+`wait_timeout` with nothing on stdout and exit status `1`.
+
+**`--wait-exit`.** Waits as `--wait` does (it turns `--wait` on), but
+until the main process has ended: it keeps polling while the state is
+`provisioning` or `ready`, and succeeds only for `completed`; `failed`,
+`stopped` and `deleted` print the sandbox and end with `wait_failed`, exit
+status `1`.
+
+#### `parley sandbox list`
+
+```
+parley sandbox list <workspace-slug> [--state <state>]... [--session <id>] [--label key=value]...
+                    [--include-forks] [--limit <n>] [--cursor <cursor>]
+```
+
+Sends [`GET /api/v1/workspaces/<slug>/sandboxes`](api.md#get-apiv1workspacesslugsandboxes)
+with one `state` and one `label` query parameter per flag given, and
+`session_id`, `include_forks=true`, `limit` and `cursor` for the flags
+given, and prints the list document. A flag that is not given adds no
+parameter, so the hub's defaults apply (every state but `deleted`).
+
+#### `parley sandbox get`
+
+`parley sandbox get <workspace-slug> <id>` sends
+[`GET /api/v1/workspaces/<slug>/sandboxes/<id>`](api.md#get-apiv1workspacesslugsandboxesid)
+and prints the sandbox object. Any other number of arguments is a usage
+error.
 
 ### `parley events`
 

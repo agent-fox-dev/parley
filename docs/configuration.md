@@ -187,6 +187,13 @@ ttl = "4h"
 | `[[sandbox.profiles]]` | tables | required | the sandbox profiles, at least one |
 | `[[sandbox.credentials]]` | tables | none | the credentials profiles may attach |
 
+The four `max_…` counts are the quotas of sandbox creation: a create is
+refused with `429 sandbox_capacity` when the sandboxes in state
+`provisioning` or `ready` would exceed `max_sandboxes` on the hub,
+`max_per_org` in the workspace's org, `max_per_workspace` in the workspace
+and its task forks, or `max_per_user` for the creating user, checked in
+that order (see [api.md](api.md#post-apiv1workspacesslugsandboxes)).
+
 A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
 hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
 `tls_ca`, `token_file`, `oidc_client_secret_file` and a profile's `policy`
