@@ -66,7 +66,8 @@ type Deps struct {
 // Component is the session feature. The hub creates its zero value while
 // it composes, registers its routes, and binds it in a start hook.
 type Component struct {
-	deps Deps
+	deps      Deps
+	observers usageObservers
 }
 
 // Bind gives the component its dependencies, filling the defaults of the

@@ -5,10 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,6 +70,8 @@ const (
 type world struct {
 	*hubtest.Hub
 	clock *clock
+	// sessions is the hub's session component.
+	sessions *session.Component
 
 	alice, bob, carol, dave, erin       string
 	aliceKey, bobKey, carolKey, daveKey string
@@ -83,6 +87,7 @@ func newWorld(t *testing.T, adjust ...func(*session.Deps)) *world {
 	t.Helper()
 	w := &world{clock: newClock()}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, Compose: func(c *hub.Composition) {
+		w.sessions = c.Sessions()
 		for _, a := range adjust {
 			c.AdjustSessions(a)
 		}
@@ -170,6 +175,26 @@ func (w *world) count(t *testing.T, table string) int {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	return n
+}
+
+// usageCount is the number of usage records of the session id.
+func (w *world) usageCount(t *testing.T, id string) int {
+	t.Helper()
+	var n int
+	err := w.Store.Main().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM session_usage WHERE session_id = ?`, id).Scan(&n)
+	if err != nil {
+		t.Fatalf("count the usage records of session %s: %v", id, err)
+	}
+	return n
+}
+
+// freshIDs counts the ids freshID has returned.
+var freshIDs atomic.Int64
+
+// freshID is a UUID, in lower case, that no other call returns.
+func freshID() string {
+	n := freshIDs.Add(1)
+	return fmt.Sprintf("%08x-f00d-4000-8000-%012x", n, n)
 }
 
 // terminate sets the session id to terminated, ended at the clock's time,

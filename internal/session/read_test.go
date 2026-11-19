@@ -34,6 +34,35 @@ func wantSession(t *testing.T, status int, raw []byte, id string) {
 	}
 }
 
+// readRoute is a route that reads a session under the session's read rule:
+// the session itself, or its usage records.
+type readRoute struct{ name, suffix string }
+
+// readRoutes are the routes the read rule holds for.
+var readRoutes = []readRoute{{"session", ""}, {"usage", "/usage"}}
+
+// read sends GET of the read route r for the session id as credential.
+func (w *world) read(t *testing.T, r readRoute, credential, id string) (int, []byte) {
+	t.Helper()
+	return w.Call(t, http.MethodGet, "/api/v1/sessions/"+id+r.suffix, credential, nil)
+}
+
+// wantReadable fails the test unless a GET of the read route r answered
+// 200 for the session id.
+func wantReadable(t *testing.T, r readRoute, status int, raw []byte, id string) {
+	t.Helper()
+	if r.suffix == "" {
+		wantSession(t, status, raw, id)
+		return
+	}
+	if status != http.StatusOK {
+		t.Fatalf("GET %s = %d %s, want 200", r.name, status, raw)
+	}
+	if got := decode(t, raw)["session_id"]; got != id {
+		t.Errorf("session_id = %v, want %s", got, id)
+	}
+}
+
 func TestRead_AnswersTheSessionToEveryCallerWhoMayReadIt(t *testing.T) {
 	w := newWorld(t)
 	w.AddWorkspace(t, access.Record{
@@ -120,25 +149,30 @@ func TestRead_HidesWhetherAnUnreadableSessionExists(t *testing.T) {
 		{"alice with a token bound elsewhere on an unknown id", boundElsewhere, unknownID},
 	}
 	var bodies [][]byte
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			status, raw := w.get(t, c.credential, c.id)
-			errorType, message := errorOf(t, raw)
-			if status != http.StatusNotFound || errorType != "not_found" || message != "session not found" {
-				t.Fatalf("GET /sessions/:id = %d %s, want 404 not_found with message %q", status, raw, "session not found")
-			}
-			bodies = append(bodies, raw)
-		})
+	for _, r := range readRoutes {
+		for _, c := range cases {
+			t.Run(r.name+"/"+c.name, func(t *testing.T) {
+				status, raw := w.read(t, r, c.credential, c.id)
+				errorType, message := errorOf(t, raw)
+				if status != http.StatusNotFound || errorType != "not_found" || message != "session not found" {
+					t.Fatalf("GET %s = %d %s, want 404 not_found with message %q", r.name, status, raw, "session not found")
+				}
+				bodies = append(bodies, raw)
+			})
+		}
 	}
 	for i := 1; i < len(bodies); i++ {
 		if string(bodies[i]) != string(bodies[0]) {
 			t.Errorf("404 bodies differ: %s and %s", bodies[0], bodies[i])
 		}
 	}
-	t.Run("alice with a token bound to demo reads X", func(t *testing.T) {
-		status, raw := w.get(t, w.pat(t, w.alice, demo, "sessions:read"), x)
-		wantSession(t, status, raw, x)
-	})
+	boundToDemo := w.pat(t, w.alice, demo, "sessions:read")
+	for _, r := range readRoutes {
+		t.Run(r.name+"/alice with a token bound to demo reads X", func(t *testing.T) {
+			status, raw := w.read(t, r, boundToDemo, x)
+			wantReadable(t, r, status, raw, x)
+		})
+	}
 }
 
 func TestRead_RefusesAMalformedIdAndAMissingScope(t *testing.T) {
@@ -157,16 +191,18 @@ func TestRead_RefusesAMalformedIdAndAMissingScope(t *testing.T) {
 		{"the id of X in upper case", w.aliceKey, strings.ToUpper(x), http.StatusOK, ""},
 		{"a PAT with only sessions:read on X", w.pat(t, w.alice, "", "sessions:read"), x, http.StatusOK, ""},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			status, raw := w.get(t, c.credential, c.id)
-			if c.status == http.StatusOK {
-				wantSession(t, status, raw, x)
-				return
-			}
-			if errorType, _ := errorOf(t, raw); status != c.status || errorType != c.errorType {
-				t.Errorf("GET /sessions/:id = %d %s, want %d %s", status, raw, c.status, c.errorType)
-			}
-		})
+	for _, r := range readRoutes {
+		for _, c := range cases {
+			t.Run(r.name+"/"+c.name, func(t *testing.T) {
+				status, raw := w.read(t, r, c.credential, c.id)
+				if c.status == http.StatusOK {
+					wantReadable(t, r, status, raw, x)
+					return
+				}
+				if errorType, _ := errorOf(t, raw); status != c.status || errorType != c.errorType {
+					t.Errorf("GET %s = %d %s, want %d %s", r.name, status, raw, c.status, c.errorType)
+				}
+			})
+		}
 	}
 }

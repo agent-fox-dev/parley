@@ -28,6 +28,7 @@ type changeRoute struct {
 // for.
 var changeRoutes = []changeRoute{
 	{"complete", "/complete", func() any { return map[string]any{"status": "completed"} }},
+	{"usage", "/usage", func() any { return map[string]any{"id": freshID(), "model": "m1", "input_tokens": 1} }},
 }
 
 // wantUnchanged fails the test unless the session id is still active, not
@@ -41,7 +42,7 @@ func (w *world) wantUnchanged(t *testing.T, id string) {
 	if s := decode(t, raw); s["status"] != "active" || s["ended_at"] != nil {
 		t.Errorf("session after the refusal: status %v, ended_at %v; want active and null", s["status"], s["ended_at"])
 	}
-	if n := w.count(t, "session_usage"); n != 0 {
+	if n := w.usageCount(t, id); n != 0 {
 		t.Errorf("usage records = %d, want 0", n)
 	}
 }
@@ -171,6 +172,7 @@ func TestComplete_RefusesAMalformedRequest(t *testing.T) {
 		body       any
 	}{
 		{"path id abc on complete", "/api/v1/sessions/abc/complete", map[string]any{"status": "completed"}},
+		{"path id abc on usage", "/api/v1/sessions/abc/usage", map[string]any{"model": "m1", "input_tokens": 1}},
 		{"an empty body", completeX, map[string]any{}},
 		{"status terminated", completeX, map[string]any{"status": "terminated"}},
 		{"status active", completeX, map[string]any{"status": "active"}},

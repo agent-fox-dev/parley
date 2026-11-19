@@ -15,5 +15,7 @@ func (c *Component) Routes() []server.Route {
 		{Method: http.MethodPost, Pattern: "/sessions", Scope: "sessions:write", Create: true, Handler: c.createRoute},
 		{Method: http.MethodGet, Pattern: "/sessions/:id", Scope: "sessions:read", Handler: c.readRoute},
 		{Method: http.MethodPost, Pattern: "/sessions/:id/complete", Scope: "sessions:write", Handler: c.completeRoute},
+		{Method: http.MethodPost, Pattern: "/sessions/:id/usage", Scope: "sessions:write", Create: true, Handler: c.reportRoute},
+		{Method: http.MethodGet, Pattern: "/sessions/:id/usage", Scope: "sessions:read", Handler: c.usageRoute},
 	}
 }
