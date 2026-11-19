@@ -1,6 +1,8 @@
 package sandbox
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"slices"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -84,4 +87,88 @@ func readProposalState(q url.Values) (string, error) {
 		return "", server.InvalidRequest("state must be one of " + strings.Join(proposalStates, ", "))
 	}
 	return given[0], nil
+}
+
+// ApproveRoute declares POST
+// /workspaces/:slug/sandboxes/:id/proposals/:proposal_id/approve: it
+// approves the open proposal proposal_id of the sandbox id for the caller,
+// adding its rule to the sandbox's policy, and answers with the proposal
+// (see serveApprove). It needs the scope sandboxes:write of a PAT and
+// write access to the workspace, and refuses every workspace-bound token,
+// so that a sandbox's own hub credential cannot approve what its workload
+// asked for: the binding guard answers 403 token_bound before the scope
+// check.
+func (s *Service) ApproveRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/proposals/:proposal_id/approve",
+		Marks:   map[string]string{access.MarkRefusesBound: ""},
+		Handler: s.serveApprove,
+	})
+}
+
+// serveApprove answers the approval of a proposal: the body is read
+// before anything else (see readDecision), then the decision runs (see
+// decide) and the answer is the proposal as stored.
+func (s *Service) serveApprove(w http.ResponseWriter, r *http.Request) error {
+	return s.serveDecision(w, r, ProposalApproved)
+}
+
+// serveDecision answers a decision of the state, approved or rejected, of
+// a proposal.
+func (s *Service) serveDecision(w http.ResponseWriter, r *http.Request, state string) error {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return server.InvalidRequest("request body could not be read")
+	}
+	d, err := readDecision(raw, state)
+	if err != nil {
+		return err
+	}
+	ad, ok := access.DecisionOf(r)
+	if !ok {
+		return server.Internal("the proposal decision found no access decision")
+	}
+	ctx := r.Context()
+	caller, _ := identity.PrincipalOf(ctx)
+	p, err := s.decide(ctx, caller, ad.Record.Slug, server.Param(r, "id"), server.Param(r, "proposal_id"), d)
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, proposalObject(p))
+	return nil
+}
+
+// readDecision reads the body of a decision of the state: a JSON object,
+// none being the empty one, whose member comment, when given, is a string,
+// and, for an approval, whose acknowledge_findings is a boolean and whose
+// scope is sandbox or workspace, sandbox when absent. A member that is
+// null counts as absent. It answers the first member it refuses with 400
+// invalid_request.
+func readDecision(raw []byte, state string) (decision, error) {
+	body, err := readBody(raw)
+	if err != nil {
+		return decision{}, err
+	}
+	d := decision{State: state}
+	if c, ok := body["comment"]; ok {
+		var comment string
+		if json.Unmarshal(c, &comment) != nil {
+			return decision{}, server.InvalidRequest("comment: must be a string")
+		}
+		d.Comment = &comment
+	}
+	if state != ProposalApproved {
+		return d, nil
+	}
+	if a, ok := body["acknowledge_findings"]; ok && json.Unmarshal(a, &d.Acknowledge) != nil {
+		return decision{}, server.InvalidRequest("acknowledge_findings: must be a boolean")
+	}
+	d.Scope = ScopeSandbox
+	if sc, ok := body["scope"]; ok {
+		if json.Unmarshal(sc, &d.Scope) != nil || (d.Scope != ScopeSandbox && d.Scope != ScopeWorkspace) {
+			return decision{}, server.InvalidRequest("scope: must be sandbox or workspace")
+		}
+	}
+	return d, nil
 }

@@ -4144,3 +4144,64 @@ func listItems(t *testing.T, a answer) (items []any, next string) {
 	}
 	return items, next
 }
+
+// liveSandbox stores a sandbox of demo in state and creates it at the
+// runtime, which can then take rules into its policy, and returns its id.
+func (h *createHub) liveSandbox(t *testing.T, state string) string {
+	t.Helper()
+	id := h.seedRecord(t, "demo", state, nil)
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), runtime.SandboxSpec{Name: id, WorkDir: sandbox.WorkDir}); err != nil {
+		t.Fatalf("create the sandbox at the runtime: %v", err)
+	}
+	return id
+}
+
+// addedRules returns the rules the runtime was asked to add to the policy
+// of the sandbox id, as the policy it holds lists them, and how many
+// add-rule calls named the sandbox, successful or not.
+func (h *createHub) addedRules(t *testing.T, id string) (rules []runtime.Rule, calls int) {
+	t.Helper()
+	for _, c := range h.rt.Calls() {
+		if c.Op == runtime.OpAddPolicyRule && c.Target == id {
+			calls++
+		}
+	}
+	if _, ok := h.rt.Spec("parley", id); !ok {
+		return nil, calls
+	}
+	p, err := h.rt.Client("parley", nil).GetPolicy(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Policy.Added, calls
+}
+
+// undecided checks that nothing was decided of the proposal p: it is
+// stored open, its sandbox's policy_revision is 0, the runtime was asked
+// to add no rule to the sandbox's policy, and no decision event, workspace
+// sandbox rule or rule_add event exists.
+func (h *createHub) undecided(t *testing.T, p sandbox.Proposal) {
+	t.Helper()
+	got, err := sandbox.GetProposal(context.Background(), h.Store.Main(), p.SandboxID, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != sandbox.ProposalOpen {
+		t.Errorf("proposal state = %s; want open", got.State)
+	}
+	if n := storedRecord(t, h.Hub, p.SandboxID).PolicyRevision; n != 0 {
+		t.Errorf("policy_revision = %d; want 0", n)
+	}
+	if rules, _ := h.addedRules(t, p.SandboxID); len(rules) != 0 {
+		t.Errorf("the runtime added %v; want none", rules)
+	}
+	if e := h.sandboxEvents(t, sandbox.EventProposalDecided, p.SandboxID); len(e) != 0 {
+		t.Errorf("decision events %v; want none", e)
+	}
+	if n := h.count(t, `SELECT COUNT(*) FROM sandbox_rules`); n != 0 {
+		t.Errorf("workspace sandbox rules = %d; want 0", n)
+	}
+	if n := h.count(t, `SELECT COUNT(*) FROM hub_events WHERE type = 'parley.sandbox.rule_add'`); n != 0 {
+		t.Errorf("rule_add events = %d; want 0", n)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -162,6 +163,7 @@ func (r policyRoute) String() string { return r.method + " " + r.path }
 // workspace ws, naming ids no sandbox, proposal or rule has.
 var policyRoutes = []policyRoute{
 	{http.MethodGet, proposalsPath("ws", unknownID), nil},
+	{http.MethodPost, approvePath("ws", unknownID, unknownProposal), map[string]any{}},
 }
 
 func TestPolicyRoutes_AnswerDisabledWhileSandboxesAreOffBeforeAnyOtherCheck(t *testing.T) {
@@ -189,5 +191,183 @@ func TestPolicyRoutes_AnswerDisabledWhileSandboxesAreOffBeforeAnyOtherCheck(t *t
 				t.Errorf("= %d %s; want 401 unauthenticated", a.status, a.body)
 			}
 		})
+	}
+}
+
+// unknownProposal is a well-formed proposal id no proposal has.
+const unknownProposal = "sbp_00000000000000000000000000000000"
+
+// approvePath is the path of the approval of the proposal pid of the
+// sandbox id of the workspace slug.
+func approvePath(slug, id, pid string) string {
+	return proposalsPath(slug, id) + "/" + pid + "/approve"
+}
+
+// proposedBefore is when the proposals of the decision tests were made: a
+// minute before the hub's clock, which decides them at recordStart.
+var proposedBefore = recordStart.Add(-time.Minute)
+
+func TestApprove_AddsTheRuleToTheSandboxAndRecordsTheDecision(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	high := []runtime.Finding{{Severity: "high", Message: "reaches any host"}}
+	medium := []runtime.Finding{{Severity: "medium", Message: "plain HTTP"}}
+	for _, tc := range []struct {
+		name        string
+		body        map[string]any
+		findings    []runtime.Finding
+		comment     *string
+		acknowledge bool
+	}{
+		{name: "an empty body", body: map[string]any{}},
+		{name: "scope sandbox with a comment", body: map[string]any{"scope": "sandbox", "comment": "ok"}, comment: new("ok")},
+		{name: "a high finding acknowledged", body: map[string]any{"acknowledge_findings": true}, findings: high, acknowledge: true},
+		{name: "a medium finding", body: map[string]any{}, findings: medium},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			id := h.liveSandbox(t, sandbox.StateReady)
+			p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, func(p *sandbox.Proposal) { p.Findings = tc.findings })
+			a := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, tc.body)
+
+			want := p
+			want.State, want.Scope, want.Comment = sandbox.ProposalApproved, new("sandbox"), tc.comment
+			want.DecidedBy = &sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"}
+			want.DecidedAt = new(recordStart)
+			if got := decoded(t, a, http.StatusOK); !reflect.DeepEqual(got, proposalMap(t, want)) {
+				t.Errorf("answer\n%v\nwant\n%v", got, proposalMap(t, want))
+			}
+			stored, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(proposalMap(t, stored), proposalMap(t, want)) {
+				t.Errorf("stored %+v; want %+v", stored, want)
+			}
+			rules, calls := h.addedRules(t, id)
+			if wantRules := []runtime.Rule{{Name: p.ID, Body: p.Rule}}; calls != 1 || !reflect.DeepEqual(decodedRules(t, rules), decodedRules(t, wantRules)) {
+				t.Errorf("the runtime added %v in %d calls; want %v in 1", rules, calls, wantRules)
+			}
+			if n := storedRecord(t, h.Hub, id).PolicyRevision; n != 1 {
+				t.Errorf("policy_revision = %d; want 1", n)
+			}
+			events := h.sandboxEvents(t, sandbox.EventProposalDecided, id)
+			wantMeta := map[string]any{"proposal_id": p.ID, "decision": "approved", "acknowledged_findings": tc.acknowledge, "scope": "sandbox", "rule_id": nil}
+			if len(events) != 1 {
+				t.Fatalf("decision events %v; want 1", events)
+			}
+			if e := events[0]; e.actorType != "api_key" || e.actorID == nil || *e.actorID != h.dana || e.resourceType != "sandbox" ||
+				e.workspace == nil || *e.workspace != "demo" || e.session != nil || !reflect.DeepEqual(e.metadata, wantMeta) {
+				t.Errorf("decision event %+v (metadata %v); want actor api_key %s on sandbox %s of demo in no session, metadata %v", e, e.metadata, h.dana, id, wantMeta)
+			}
+			if n := h.count(t, `SELECT COUNT(*) FROM sandbox_rules`); n != 0 {
+				t.Errorf("workspace sandbox rules = %d; want 0", n)
+			}
+		})
+	}
+}
+
+func TestApprove_StoresTheRuleOfAnEndedSandboxForItsNextStartWithoutTheRuntime(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	for _, state := range []string{sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed} {
+		t.Run(state, func(t *testing.T) {
+			t.Parallel()
+			id := h.seedRecord(t, "demo", state, nil)
+			p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+			if o := decoded(t, h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, nil), http.StatusOK); o["state"] != sandbox.ProposalApproved {
+				t.Errorf("answer state = %v; want approved", o["state"])
+			}
+			if _, calls := h.addedRules(t, id); calls != 0 {
+				t.Errorf("add-rule calls = %d; want 0", calls)
+			}
+			rec := storedRecord(t, h.Hub, id)
+			if rec.PolicyRevision != 1 {
+				t.Errorf("policy_revision = %d; want 1", rec.PolicyRevision)
+			}
+			policy, err := h.svc.ComposePolicy(context.Background(), rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := len(policy.Added); n == 0 || !reflect.DeepEqual(decodedRules(t, policy.Added[n-1:]), decodedRules(t, []runtime.Rule{{Name: p.ID, Body: p.Rule}})) {
+				t.Errorf("the next start's added rules %v; want them to end with %s", decodedRules(t, policy.Added), p.Rule)
+			}
+		})
+	}
+}
+
+func TestApprove_RefusesAHighFindingThatIsNotAcknowledged(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	for _, scope := range []string{"sandbox", "workspace"} {
+		for _, ack := range []struct {
+			name string
+			body map[string]any
+		}{
+			{"absent", map[string]any{"scope": scope}},
+			{"false", map[string]any{"scope": scope, "acknowledge_findings": false}},
+		} {
+			t.Run("scope "+scope+"/acknowledge_findings "+ack.name, func(t *testing.T) {
+				t.Parallel()
+				id := h.liveSandbox(t, sandbox.StateReady)
+				p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, func(p *sandbox.Proposal) {
+					p.Findings = []runtime.Finding{{Severity: "low", Message: "plain HTTP"}, {Severity: "high", Message: "reaches any host"}}
+				})
+				a := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, ack.body)
+				if a.status != http.StatusConflict || a.err.ErrorType != "findings_not_acknowledged" {
+					t.Errorf("= %d %s; want 409 findings_not_acknowledged", a.status, a.body)
+				}
+				h.undecided(t, p)
+			})
+		}
+	}
+}
+
+func TestApprove_RefusesWhatTheRuntimeRejectsOrCannotBeAskedAndDecidesNothing(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	long := strings.Repeat("x", 5000)
+	for _, tc := range []struct {
+		name      string
+		fail      func(p sandbox.Proposal)
+		status    int
+		errorType string
+		// says is in the message, which the runtime's reason makes.
+		says string
+	}{
+		{"a rejection", func(p sandbox.Proposal) { h.rt.RejectPolicies(adds(p.ID), "destination denied by base policy") },
+			http.StatusConflict, "conflict", "destination denied by base policy"},
+		{"a rejection with a reason of 5,000 bytes", func(p sandbox.Proposal) { h.rt.RejectPolicies(adds(p.ID), long) },
+			http.StatusConflict, "conflict", "xxxxxxxx"},
+		{"a runtime that cannot be reached", func(sandbox.Proposal) {
+			h.rt.FailOperation(runtime.OpAddPolicyRule, runtime.ErrUnavailable, "connection refused")
+		}, http.StatusBadGateway, "sandbox_runtime_error", "connection refused"},
+	} {
+		// In turn: the runtime's failure is the fake's, shared by the rows.
+		t.Run(tc.name, func(t *testing.T) {
+			id := h.liveSandbox(t, sandbox.StateReady)
+			p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+			tc.fail(p)
+			a := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, map[string]any{"scope": "sandbox"})
+			h.rt.RejectPolicies(nil, "")
+			h.rt.FailOperation(runtime.OpAddPolicyRule, nil, "")
+			if a.status != tc.status || a.err.ErrorType != tc.errorType {
+				t.Fatalf("= %d %s; want %d %s", a.status, a.body, tc.status, tc.errorType)
+			}
+			if !strings.Contains(a.err.Message, tc.says) || len(a.err.Message) > 1024 {
+				t.Errorf("message %q (%d bytes); want one of at most 1,024 bytes that says %q", a.err.Message, len(a.err.Message), tc.says)
+			}
+			h.undecided(t, p)
+			if again := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, map[string]any{"scope": "sandbox"}); again.status != http.StatusOK {
+				t.Errorf("the approval again = %d %s; want 200", again.status, again.body)
+			}
+		})
+	}
+}
+
+// adds matches a policy value that adds the rule named name.
+func adds(name string) func(runtime.Policy) bool {
+	return func(p runtime.Policy) bool {
+		return slices.ContainsFunc(p.Added, func(r runtime.Rule) bool { return r.Name == name })
 	}
 }

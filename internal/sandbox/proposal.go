@@ -8,10 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
@@ -27,12 +32,35 @@ const (
 // EventProposal is written when the hub stores a new proposal of a sandbox.
 const EventProposal = "parley.sandbox.proposal"
 
+// EventProposalDecided is written when a decision approves or rejects a
+// proposal, in the transaction that stores the decision.
+const EventProposalDecided = "parley.sandbox.proposal_decided"
+
 // proposalIDPrefix begins every proposal id; 32 lowercase hexadecimal
 // characters follow it.
 const proposalIDPrefix = "sbp_"
 
 // ErrProposalNotFound is returned when a sandbox has no proposal of the id.
 var ErrProposalNotFound = errors.New("sandbox: no such proposal")
+
+// The scopes of an approval: the rule is approved for the proposal's
+// sandbox only, or also saved as a workspace sandbox rule.
+const (
+	ScopeSandbox   = "sandbox"
+	ScopeWorkspace = "workspace"
+)
+
+// The refusals of a decision of a proposal.
+var (
+	errProposalDecided         = server.NewError("proposal_decided", http.StatusConflict, "the proposal is decided already")
+	errFindingsNotAcknowledged = server.NewError("findings_not_acknowledged", http.StatusConflict,
+		"the proposal has a finding of severity high: approve it with acknowledge_findings true")
+	// errPromotionUnsupported refuses an approval for the workspace, which
+	// this hub cannot save as a workspace sandbox rule yet; it is answered
+	// before anything is decided.
+	errPromotionUnsupported = server.NewError("not_implemented", http.StatusNotImplemented,
+		"approving a proposal with scope workspace is not supported yet")
+)
 
 // Proposal is a rule the runtime proposed adding to the policy of a
 // sandbox, as the hub stores it: open, or decided, or withdrawn with its
@@ -222,6 +250,159 @@ WHERE sandbox_id = ? AND id = ? AND state = ?`,
 		return false, fmt.Errorf("decide proposal %s of sandbox %s: %w", id, sandboxID, err)
 	}
 	return n > 0, nil
+}
+
+// decision is a decision of an open proposal, as a request asks for it.
+type decision struct {
+	// State is ProposalApproved or ProposalRejected.
+	State string
+	// Scope is ScopeSandbox or ScopeWorkspace for an approval, "" for a
+	// rejection.
+	Scope string
+	// Comment is the decider's comment; nil for none.
+	Comment *string
+	// Acknowledge is the request's acknowledge_findings: an approval of a
+	// proposal with a finding of severity high needs it.
+	Acknowledge bool
+}
+
+// decide decides, for the caller, the proposal proposalID of the sandbox
+// sandboxID of the workspace slug as d says, and returns the proposal as
+// stored then. It is the one way a proposal is decided, for both decisions
+// and both scopes; the request's body is read before it is called.
+//
+// Decisions of one sandbox run one at a time: the sandbox's turn is held
+// from before the first read of the proposal to the commit, since the
+// runtime is asked before the commit and a decision that lost a race must
+// not leave its rule there. The checks run in this order, each refusing
+// with nothing decided: the sandbox is the workspace's (404
+// sandbox_not_found); the proposal is the sandbox's (404 not_found); it is
+// open (409 proposal_decided); an approval of a proposal with a finding of
+// severity high acknowledges it (409 findings_not_acknowledged). An
+// approval for the workspace is then refused, since this hub cannot save
+// workspace sandbox rules yet. Then an approval of a sandbox that is
+// provisioning or ready adds the rule to its policy at the runtime (see
+// addRule); a sandbox in another state takes the rule with its next start.
+// Last, one transaction stores the decision, conditional on the proposal
+// still being open (see storeDecision).
+func (s *Service) decide(ctx context.Context, caller identity.Principal, slug, sandboxID, proposalID string, d decision) (Proposal, error) {
+	unlock := s.deciding.lock(sandboxID)
+	defer unlock()
+	rec, err := s.readSandbox(ctx, slug, sandboxID)
+	if err != nil {
+		return Proposal{}, err
+	}
+	p, err := GetProposal(ctx, s.deps.Store.Main(), rec.ID, proposalID)
+	switch {
+	case errors.Is(err, ErrProposalNotFound):
+		return Proposal{}, server.NotFound("the sandbox has no proposal " + proposalID)
+	case err != nil:
+		return Proposal{}, err
+	case p.State != ProposalOpen:
+		return Proposal{}, errProposalDecided
+	}
+	approve := d.State == ProposalApproved
+	if approve && !d.Acknowledge && slices.ContainsFunc(p.Findings, func(f runtime.Finding) bool { return f.Severity == "high" }) {
+		return Proposal{}, errFindingsNotAcknowledged
+	}
+	if approve && d.Scope == ScopeWorkspace {
+		return Proposal{}, errPromotionUnsupported
+	}
+	if approve && (rec.State == StateProvisioning || rec.State == StateReady) {
+		if err := s.addRule(ctx, rec, p); err != nil {
+			return Proposal{}, err
+		}
+	}
+	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		p, err = s.storeDecision(ctx, tx, caller, rec.ID, p, d)
+		return err
+	})
+	if err != nil {
+		return Proposal{}, err
+	}
+	return p, nil
+}
+
+// addRule adds the rule of the proposal p to the policy of the sandbox
+// rec at the runtime, under the proposal's id. The runtime's rejection is
+// 409 conflict with its reason; any other failure, an unreachable runtime
+// or one that no longer holds the sandbox, is 502 sandbox_runtime_error.
+// Both texts are scrubbed of the hub's credentials and of the sandbox's
+// values, and cut to 1,024 bytes.
+func (s *Service) addRule(ctx context.Context, rec Record, p Proposal) error {
+	client := s.Client()
+	if client == nil {
+		return RuntimeError("sandboxes are off")
+	}
+	err := client.AddPolicyRule(ctx, rec.ID, runtime.Rule{Name: p.ID, Body: p.Rule})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, runtime.ErrInvalid) {
+		reason := err.Error()
+		var re *runtime.Error
+		if errors.As(err, &re) && re.Reason != "" {
+			reason = re.Reason
+		}
+		return server.Conflict(s.ScrubSandbox(ctx, rec.ID, s.scrub("the runtime rejected the rule: "+reason)))
+	}
+	return RuntimeError(s.ScrubSandbox(ctx, rec.ID, s.scrub(err.Error())))
+}
+
+// storeDecision writes, in tx, the decision d of the open proposal p of
+// the sandbox id for the caller, and returns the proposal as stored then.
+// A proposal that is no longer open is refused with 409 proposal_decided,
+// and the caller rolls tx back.
+func (s *Service) storeDecision(ctx context.Context, tx *sql.Tx, caller identity.Principal, id string, p Proposal, d decision) (Proposal, error) {
+	rec, err := Get(ctx, tx, id)
+	if err != nil {
+		return Proposal{}, err
+	}
+	now := s.deps.Now().UTC().Truncate(time.Second)
+	pd := ProposalDecision{State: d.State, DecidedBy: deciderOf(caller), DecidedAt: now, Comment: d.Comment}
+	var scope any
+	if d.State == ProposalApproved {
+		pd.Scope, scope = &d.Scope, d.Scope
+	}
+	decided, err := DecideProposal(ctx, tx, id, p.ID, pd)
+	switch {
+	case err != nil:
+		return Proposal{}, err
+	case !decided:
+		return Proposal{}, errProposalDecided
+	}
+	if d.State == ProposalApproved {
+		if err := SaveApprovedRule(ctx, tx, ApprovedRule{SandboxID: id, ProposalID: p.ID, Rule: p.Rule, DecidedAt: now}); err != nil {
+			return Proposal{}, err
+		}
+		if err := Update(ctx, tx, id, SetPolicyRevision(rec.PolicyRevision+1)); err != nil {
+			return Proposal{}, err
+		}
+	}
+	actor := actorFor(caller)
+	_, err = s.deps.Events.Emit(ctx, tx, event.Input{
+		Type: EventProposalDecided, ActorType: actor.Type, ActorID: actor.ID,
+		ResourceType: "sandbox", ResourceID: id, Workspace: &rec.Workspace, SessionID: rec.SessionID,
+		Metadata: map[string]any{
+			"proposal_id": p.ID, "decision": d.State, "acknowledged_findings": d.Acknowledge,
+			"scope": scope, "rule_id": pd.WorkspaceRuleID,
+		},
+	})
+	if err != nil {
+		return Proposal{}, fmt.Errorf("event of sandbox %s: %w", id, err)
+	}
+	return GetProposal(ctx, tx, id, p.ID)
+}
+
+// deciderOf is the decided_by of a decision by the caller p: its
+// credential's actor type and the user it acts for, empty for the admin
+// token, which acts for none.
+func deciderOf(p identity.Principal) Creator {
+	c := Creator{ActorType: actorOf(p)}
+	if p.User != nil {
+		c.ActorID, c.Username = p.User.ID, p.User.Username
+	}
+	return c
 }
 
 // WithdrawProposals is the delete hook of the proposals: in the transaction

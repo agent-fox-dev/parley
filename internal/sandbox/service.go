@@ -99,6 +99,9 @@ type Service struct {
 	// turns; it is not lifecycle, which a stop or a deletion holds while it
 	// takes its checkpoint.
 	checkpointing sandboxLocks
+	// deciding gives the decisions of the proposals of one sandbox their
+	// turns, from the first read of the proposal to the commit.
+	deciding sandboxLocks
 }
 
 // NewService returns the service of a hub whose configuration is not loaded
