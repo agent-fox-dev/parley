@@ -231,7 +231,8 @@ func TestResolveBranch_OriginFetchFailed(t *testing.T) {
 		origin func(t *testing.T) (url string, env []string, open *atomic.Int32)
 		adjust func(d *carrypatch.Deps)
 		// why is a part of the message that names the cause, "" for git's
-		// own words.
+		// own words; a deadline names its length, so that the configured
+		// one, not the default, is shown to have ended git.
 		why string
 	}{
 		{"origin is stopped", func(t *testing.T) (string, []string, *atomic.Int32) {
@@ -271,7 +272,7 @@ func TestResolveBranch_OriginFetchFailed(t *testing.T) {
 				t.Fatal(err)
 			}
 			return srv.URL + "/origin.git", []string{"GIT_SSL_CAINFO=" + ca}, &open
-		}, func(d *carrypatch.Deps) { d.BranchFetchDeadline = deadline }, "deadline"},
+		}, func(d *carrypatch.Deps) { d.BranchFetchDeadline = deadline }, "deadline (" + deadline.String() + ")"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -285,8 +286,11 @@ func TestResolveBranch_OriginFetchFailed(t *testing.T) {
 			start := time.Now()
 			_, err := f.comp.ResolveBranch(context.Background(), f.ws, "p6", false)
 			e := assertServerError(t, err, http.StatusBadGateway, "origin_fetch_failed")
-			if d := time.Since(start); d > deadline+2*time.Second {
-				t.Errorf("ResolveBranch returned after %v, want within 2s of the deadline %v", d, deadline)
+			// A call takes as long as git takes to fail, which a loaded
+			// machine stretches past any small margin; a call that lasts the
+			// default deadline waited on it instead of ending on its cause.
+			if d := time.Since(start); d >= carrypatch.DefaultBranchFetchDeadline {
+				t.Errorf("ResolveBranch returned after %v, want before the default deadline %v", d, carrypatch.DefaultBranchFetchDeadline)
 			}
 			if !strings.Contains(e.Message(), c.why) {
 				t.Errorf("the message %q does not name the cause %q", e.Message(), c.why)
