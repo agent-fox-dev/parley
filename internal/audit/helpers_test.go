@@ -3,12 +3,14 @@ package audit_test
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -17,6 +19,9 @@ import (
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/session"
+	"github.com/agent-fox-dev/parley/internal/store"
+	"github.com/agent-fox-dev/parley/internal/telemetry"
 )
 
 // TestMain runs the package's tests at most hubtest.HubParallel at a time:
@@ -276,4 +281,178 @@ func jsonEqual(a, b json.RawMessage) bool {
 	ax, _ := json.Marshal(x)
 	by, _ := json.Marshal(y)
 	return string(ax) == string(by)
+}
+
+// retentionNow is the time the retention steps run at in the store-level
+// tests.
+var retentionNow = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+// stores are the hub's two stores, opened in a temporary directory with
+// the schemas of the sessions, the run telemetry and the hub events, and
+// the components the retention steps act through, bound to them on a
+// clock fixed at retentionNow. The session component writes its events to
+// events, so that an event a step should not write shows in its bounds.
+type stores struct {
+	st        *store.Store
+	events    *event.Component
+	sessions  *session.Component
+	telemetry *telemetry.Component
+}
+
+func openStores(t *testing.T) *stores {
+	t.Helper()
+	dir := t.TempDir()
+	steps := append([]store.Step{event.SchemaStep, session.SchemaStep}, telemetry.SchemaSteps...)
+	st, err := store.Open(context.Background(), store.Options{
+		DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces"),
+	}, steps)
+	if err != nil {
+		t.Fatalf("open stores: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ev, err := event.New(event.Deps{Store: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := func() time.Time { return retentionNow }
+	s := &stores{st: st, events: ev, sessions: &session.Component{}, telemetry: &telemetry.Component{}}
+	s.sessions.Bind(session.Deps{Store: st, Now: now, Events: ev})
+	s.telemetry.Bind(telemetry.Deps{DB: telemetry.SQL(st.Analytics()), Now: now})
+	return s
+}
+
+// clock is the fixed clock the steps read.
+func (s *stores) clock() time.Time { return retentionNow }
+
+// exec runs query on db, failing the test on an error.
+func exec(t *testing.T, db *sql.DB, query string, args ...any) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), query, args...); err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+}
+
+// session stores a session of the workspace slug with the status, started
+// at started.
+func (s *stores) session(t *testing.T, id, slug, status string, started time.Time) {
+	t.Helper()
+	exec(t, s.st.Main(), `
+INSERT INTO sessions (id, workspace_slug, status, credential_type, started_at) VALUES (?, ?, ?, 'admin_token', ?)`,
+		id, slug, status, started.UTC().Format(time.RFC3339))
+}
+
+// usage stores a usage record of the session sessionID, reported at
+// reported.
+func (s *stores) usage(t *testing.T, id, sessionID, slug string, reported time.Time) {
+	t.Helper()
+	exec(t, s.st.Main(), `
+INSERT INTO session_usage (id, session_id, workspace_slug, model, reported_at) VALUES (?, ?, ?, 'm', ?)`,
+		id, sessionID, slug, reported.UTC().Format(time.RFC3339))
+}
+
+// runKinds are the tables of the run telemetry kinds other than the
+// postmortems, each with the columns a record needs beyond the head.
+var runKinds = []struct{ table, columns, values string }{
+	{"run_events", "event_type, severity", "'run.start', 'info'"},
+	{"session_outcomes", "session_id, status", "'s', 'completed'"},
+	{"tool_calls", "tool_name", "'read'"},
+	{"tool_errors", "tool_name, error_msg", "'read', 'no such file'"},
+	{"traces", "event_type", "'tool.use'"},
+}
+
+// telemetryLayout is the form the telemetry store keeps a timestamp in.
+const telemetryLayout = "2006-01-02T15:04:05.000000Z"
+
+// record stores a record of the run kind table (one of runKinds) for the
+// run runID of the workspace slug, with the timestamp at.
+func (s *stores) record(t *testing.T, table, id, slug, runID string, at time.Time) {
+	t.Helper()
+	for _, k := range runKinds {
+		if k.table == table {
+			exec(t, s.st.Analytics(), `INSERT INTO `+table+` (id, workspace, run_id, timestamp, ingested_at, `+k.columns+`)
+VALUES (?, ?, ?, ?, ?, `+k.values+`)`, id, slug, runID, at.UTC().Format(telemetryLayout), at.UTC().Format(time.RFC3339))
+			return
+		}
+	}
+	t.Fatalf("no run kind %s", table)
+}
+
+// postmortem stores the postmortem of the run runID of the workspace slug,
+// with the timestamp at, ingested at ingested.
+func (s *stores) postmortem(t *testing.T, id, slug, runID string, at, ingested time.Time) {
+	t.Helper()
+	stamp := at.UTC().Format(telemetryLayout)
+	exec(t, s.st.Analytics(), `
+INSERT INTO postmortems (id, workspace, run_id, timestamp, ingested_at, schema_version, run_status, started_at, completed_at,
+	task_summary, cost_summary, blocked_tasks, session_history)
+VALUES (?, ?, ?, ?, ?, 1, 'stalled', ?, ?, '{}', '{}', '[]', '[]')`,
+		id, slug, runID, stamp, ingested.UTC().Format(time.RFC3339), stamp, stamp)
+}
+
+// ids are the ids of table in db, ascending.
+func ids(t *testing.T, db *sql.DB, table string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `SELECT id FROM `+table+` ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// dump is every row query reads from db with args, each as the text of its columns,
+// so that two dumps compare equal only when the rows are the same.
+func dump(t *testing.T, db *sql.DB, query string, args ...any) []string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		dest := make([]any, len(cols))
+		for i := range vals {
+			dest[i] = &vals[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%q", vals))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// snapshot is every row of the sessions, their usage and the run
+// telemetry, by table.
+func (s *stores) snapshot(t *testing.T) map[string][]string {
+	t.Helper()
+	snap := map[string][]string{}
+	for _, table := range []string{"sessions", "session_usage"} {
+		snap[table] = dump(t, s.st.Main(), `SELECT * FROM `+table+` ORDER BY id`)
+	}
+	for _, k := range runKinds {
+		snap[k.table] = dump(t, s.st.Analytics(), `SELECT * FROM `+k.table+` ORDER BY id`)
+	}
+	snap["postmortems"] = dump(t, s.st.Analytics(), `SELECT * FROM postmortems ORDER BY id`)
+	return snap
 }

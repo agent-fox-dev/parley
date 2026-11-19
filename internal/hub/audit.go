@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"maps"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/audit"
@@ -73,12 +74,15 @@ func composeAudit(c *Composition) {
 var errNoRetention = errors.New("the retention run is not built")
 
 // retentionSteps binds every retention step to the function that does its
-// clean-up with the loaded settings. A step whose clean-up the hub does not
-// have yet does nothing and succeeds.
-func retentionSteps(_ *Composition, _ *Runtime, _ audit.Settings) map[string]audit.Step {
+// clean-up with the loaded settings on the hub's clock: the session steps
+// to the session store, the telemetry steps to the telemetry store. A step
+// whose clean-up the hub does not have yet does nothing and succeeds.
+func retentionSteps(c *Composition, rt *Runtime, s audit.Settings) map[string]audit.Step {
 	steps := make(map[string]audit.Step, len(audit.StepNames()))
 	for _, name := range audit.StepNames() {
 		steps[name] = func(context.Context) error { return nil }
 	}
+	maps.Copy(steps, audit.SessionSteps(c.sessions, s, rt.Now))
+	maps.Copy(steps, audit.TelemetrySteps(c.telemetry, s, rt.Now))
 	return steps
 }
