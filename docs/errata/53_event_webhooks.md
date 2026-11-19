@@ -88,7 +88,16 @@ The other IPv6 forms that carry an IPv4 address are judged by it too:
 IPv4-compatible (`::a.b.c.d`, other than `::` and `::1`), the NAT64
 well-known prefix `64:ff9b::/96` and 6to4 `2002::/16` (the IPv4 address in
 bits 16 to 47), so that no spelling of an address of the hub's networks
-escapes the ranges. No IPv4 range is added.
+escapes the ranges.
+
+## The shared address space and "this network" are refused too
+
+Design decision 10 lists the unspecified address `0.0.0.0` and no shared
+address space. The destination rule refuses the whole of `0.0.0.0/8`
+("this network"), and `100.64.0.0/10`, the shared address space of
+carrier-grade NAT that some cloud and container networks use inside, since
+both can lead into the hub's own network. `[webhooks].allow_private` lifts
+the refusal for them as for the other ranges.
 
 ## The OnCommit callback is registered by the first loop
 

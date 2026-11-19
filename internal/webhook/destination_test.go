@@ -11,12 +11,14 @@ import (
 func TestDestinationAllowed_JudgesTheAddressForTheSchemeAndSettings(t *testing.T) {
 	t.Parallel()
 	// inside are addresses of the hub's own networks: loopback,
-	// link-local with the metadata address, private, unspecified,
-	// multicast and unique-local, over IPv4, IPv6 and the IPv6 forms that
-	// carry an IPv4 address: IPv4-mapped, IPv4-compatible, NAT64 and 6to4.
+	// link-local with the metadata address, private, the shared address
+	// space, this network, unspecified, multicast and unique-local, over
+	// IPv4, IPv6 and the IPv6 forms that carry an IPv4 address:
+	// IPv4-mapped, IPv4-compatible, NAT64 and 6to4.
 	inside := []string{
 		"127.0.0.1", "127.8.9.10", "127.255.255.255", "169.254.1.1", "169.254.169.254", "10.0.0.1", "10.255.255.255",
 		"172.16.0.1", "172.31.255.255", "192.168.1.1", "0.0.0.0", "224.0.0.1", "239.255.255.255",
+		"0.1.2.3", "0.255.255.255", "100.64.0.1", "100.127.255.255", "::ffff:100.64.0.1", "64:ff9b::6440:1",
 		"::1", "fe80::1", "fe80::1%en0", "febf::1", "fc00::1", "fd00:ec2::254", "::", "ff02::1",
 		"::ffff:10.0.0.1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
 		"::10.0.0.1", "::169.254.169.254", "::192.168.1.1",
@@ -25,11 +27,12 @@ func TestDestinationAllowed_JudgesTheAddressForTheSchemeAndSettings(t *testing.T
 	}
 	outside := []string{
 		"203.0.113.10", "172.32.0.1", "172.15.255.255", "9.255.255.255", "11.0.0.1", "126.255.255.255", "128.0.0.1",
-		"169.255.0.1", "192.169.0.1", "223.255.255.255", "2001:db8::1", "fec0::1", "::ffff:203.0.113.10",
+		"169.255.0.1", "192.169.0.1", "223.255.255.255", "1.0.0.1", "100.63.255.255", "100.128.0.0",
+		"2001:db8::1", "fec0::1", "::ffff:203.0.113.10",
 		"::203.0.113.10", "64:ff9b::cb00:710a", "2002:cb00:710a::1",
 	}
 	loopback := []string{"127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"}
-	otherInside := []string{"10.0.0.1", "169.254.169.254", "192.168.1.1", "0.0.0.0", "fc00::1", "fe80::1", "ff02::1"}
+	otherInside := []string{"10.0.0.1", "169.254.169.254", "192.168.1.1", "0.0.0.0", "0.1.2.3", "100.64.0.1", "fc00::1", "fe80::1", "ff02::1"}
 
 	for _, tc := range []struct {
 		name     string

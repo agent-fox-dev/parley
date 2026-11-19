@@ -10605,7 +10605,8 @@ and ping and redeliver are answered `503` `secrets_unavailable`.
 The hub refuses a URL whose host is, or resolves to, an address in
 `127.0.0.0/8`, `169.254.0.0/16` (with the metadata address
 `169.254.169.254`), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
-`0.0.0.0`, `224.0.0.0/4`, `::1`, `fe80::/10`, `fc00::/7` (with
+`100.64.0.0/10` (shared address space), `0.0.0.0/8` (this network, with
+`0.0.0.0`), `224.0.0.0/4`, `::1`, `fe80::/10`, `fc00::/7` (with
 `fd00:ec2::254`), `::` or `ff00::/8`; an IPv6 address that carries an IPv4
 address is judged by that IPv4 address: IPv4-mapped (`::ffff:a.b.c.d`),
 IPv4-compatible (`::a.b.c.d`, other than `::` and `::1`), NAT64
