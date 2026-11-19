@@ -94,7 +94,10 @@ const (
 // create and every second on the hub's clock, and a start hook after the
 // runtime check reports the stored sandboxes' states and wakes it, so that
 // it takes up what a stopped process left. The stop cancels it without
-// changing a record.
+// changing a record. The service's restore is the restorer of the
+// provisionings: it seeds the working directory of a sandbox created from a
+// checkpoint, and that of a started sandbox whose working directory the
+// runtime lost.
 //
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
@@ -111,6 +114,7 @@ func composeSandbox(c *Composition) {
 	c.AddSchemaStep(sandbox.SchemaStep)
 	c.AddSchemaStep(sandbox.LogSchemaStep)
 	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
+	svc.RegisterRestorer(svc)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := sandbox.Deps{

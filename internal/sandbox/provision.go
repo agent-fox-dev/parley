@@ -520,12 +520,13 @@ func (p *provisioning) steps(ctx context.Context) error {
 
 // startSteps runs the steps of the provisioning of a start in order and
 // returns the first that failed, as a *stepError. The runtime holds the
-// stopped sandbox with its working directory, so nothing is deleted first
-// and nothing is checked out: the secrets are resolved again and their
-// providers registered again, so that a value rotated while the sandbox
-// was stopped is the one it gets, then the runtime starts the sandbox with
-// the policy value of the composer and the environment, and the main
-// process is started again when the sandbox has a command.
+// stopped sandbox with its working directory, so nothing is deleted first:
+// the secrets are resolved again and their providers registered again, so
+// that a value rotated while the sandbox was stopped is the one it gets,
+// then the runtime starts the sandbox with the policy value of the composer
+// and the environment. A working directory the runtime kept is used as it
+// is; one it lost is rebuilt (rebuild). Then the main process is started
+// again when the sandbox has a command.
 func (p *provisioning) startSteps(ctx context.Context) error {
 	id := p.rec.ID
 	env, policy, err := p.configure(ctx)
@@ -543,6 +544,15 @@ func (p *provisioning) startSteps(ctx context.Context) error {
 	}
 	if _, err := p.client.WaitReady(ctx, id); err != nil {
 		return failed(ReasonProvisionFailed, "wait for the runtime sandbox", err)
+	}
+	st, err := p.client.GetSandbox(ctx, id)
+	if err != nil {
+		return failed(ReasonProvisionFailed, "read the runtime sandbox", err)
+	}
+	if !st.WorkDirPresent {
+		if err := p.rebuild(ctx); err != nil {
+			return err
+		}
 	}
 	if len(p.rec.Command) > 0 {
 		if err := p.client.RunMain(ctx, id, p.rec.Command); err != nil {

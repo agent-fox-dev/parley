@@ -96,3 +96,58 @@ func TestFetchBundle_FailsWithoutSettingARef(t *testing.T) {
 		})
 	}
 }
+
+// The bundle of two refs, fetched into an empty repository, sets both at
+// their commits there: it holds their whole history and needs nothing.
+func TestCreateBundle_HoldsTheRefsWithTheirWholeHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	src, head, release, _ := forkParent(t, 3)
+	repo, err := (gitrepo.Git{}).Open(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "x.bundle")
+	if err := repo.CreateBundle(ctx, path, []string{"refs/heads/main", "refs/heads/release"}); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	dst, dir := openBare(t)
+	want := map[string]string{"refs/parley/sandboxes/s/main": head, "refs/parley/sandboxes/s/release": release}
+	if err := dst.FetchBundle(ctx, path, want); err != nil {
+		t.Fatalf("FetchBundle of the created bundle: %v", err)
+	}
+	if refs := gitrepotest.Refs(t, dir, ""); !maps.Equal(refs, want) {
+		t.Errorf("refs after the fetch = %v, want %v", refs, want)
+	}
+}
+
+func TestCreateBundle_RefusesWhatItCannotBundle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	src, _, _, _ := forkParent(t, 1)
+	repo, err := (gitrepo.Git{}).Open(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+		refs []string
+	}{
+		{"no ref", "", nil},
+		{"a ref the repository lacks", "", []string{"refs/heads/main", "refs/heads/gone"}},
+		{"an invalid ref name", "", []string{"refs/heads/a..b"}},
+		{"a ref that begins with a dash", "", []string{"-refs/heads/main"}},
+		{"a path that begins with a dash", "-x.bundle", []string{"refs/heads/main"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tc.path
+			if path == "" {
+				path = filepath.Join(t.TempDir(), "x.bundle")
+			}
+			if err := repo.CreateBundle(ctx, path, tc.refs); err == nil {
+				t.Error("CreateBundle = nil, want an error")
+			}
+		})
+	}
+}

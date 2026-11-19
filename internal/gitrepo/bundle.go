@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 )
@@ -77,4 +78,34 @@ func (r *Repo) fetchBundle(ctx context.Context, path, ns string) (map[string]boo
 		tips[id] = true
 	}
 	return tips, nil
+}
+
+// CreateBundle writes a git bundle of refs, full ref names, with their
+// whole history, to the file at path, which it replaces: the bundle needs
+// no commit of the repository it is fetched into. A ref the repository
+// lacks fails it.
+func (r *Repo) CreateBundle(ctx context.Context, path string, refs []string) error {
+	if len(refs) == 0 {
+		return errors.New("create a bundle: no ref to bundle")
+	}
+	if err := refuseOption("bundle path", path); err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		if err := refuseOption("ref", ref); err != nil {
+			return err
+		}
+		if !ValidRefName(ref) {
+			return fmt.Errorf("create a bundle: %q is not a ref name", ref)
+		}
+	}
+	// Git runs in a directory of its own, where a relative path would land.
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("create a bundle: %w", err)
+	}
+	if _, err := r.git(ctx, append([]string{"bundle", "create", "--quiet", abs}, refs...)...); err != nil {
+		return fmt.Errorf("create a bundle: %w", err)
+	}
+	return nil
 }

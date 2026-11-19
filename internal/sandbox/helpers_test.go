@@ -3476,7 +3476,13 @@ func (h *createHub) workSandbox(t *testing.T, edit func(*sandbox.Record)) (id, d
 	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), spec); err != nil {
 		t.Fatalf("create the sandbox at the runtime: %v", err)
 	}
-	return id, filepath.Join(h.rt.HostDir("parley", id), strings.TrimPrefix(sandbox.WorkDir, "/"))
+	return id, h.workDir(id)
+}
+
+// workDir is the host directory that holds the working directory of the
+// sandbox id.
+func (h *createHub) workDir(id string) string {
+	return filepath.Join(h.rt.HostDir("parley", id), strings.TrimPrefix(sandbox.WorkDir, "/"))
 }
 
 // cloneWork clones demo into the empty directory dir and checks out the
@@ -3491,6 +3497,21 @@ func (h *createHub) cloneWork(t *testing.T, dir string) {
 // configuration, with a fixed identity, and returns its output, trimmed.
 func workGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	return strings.TrimSpace(workOutput(t, dir, args...))
+}
+
+// workStatus is what git status --porcelain lists in the working directory
+// dir, sorted.
+func workStatus(t *testing.T, dir string) []string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(workOutput(t, dir, "status", "--porcelain"), "\n"), "\n")
+	slices.Sort(lines)
+	return slices.DeleteFunc(lines, func(l string) bool { return l == "" })
+}
+
+// workOutput is workGit's output as git wrote it.
+func workOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Dana", "GIT_AUTHOR_EMAIL=dana@example.invalid",
@@ -3502,7 +3523,7 @@ func workGit(t *testing.T, dir string, args ...string) string {
 	if err != nil {
 		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
 	}
-	return strings.TrimSpace(string(out))
+	return string(out)
 }
 
 // commitWork writes the files of files into the working directory dir and
@@ -3622,4 +3643,78 @@ func (h *createHub) sandboxCalls(id string, n int) []string {
 		}
 	}
 	return ops
+}
+
+// startRestoreHub starts a create hub with the profiles given as TOML and
+// the create world, with dana a member of acme and no sandbox limit that a
+// test reaches, whose provisioner runs and whose fake runtime keeps each
+// sandbox's files in a directory of the host (hostGit).
+func startRestoreHub(t *testing.T, profiles string) *createHub {
+	t.Helper()
+	h := newCreateHub(t, runtimetest.New(t, runtimetest.WithHostDirs()), profiles, true, nil)
+	h.rt.SetExec(h.hostGit)
+	h.world(t)
+	h.AddMember(t, h.org, h.dana)
+	h.setLimits(limits{100, 100, 100, 100})
+	return h
+}
+
+// hostGit runs the commands of a restore hub's sandboxes in their host
+// directories, with the real git and without the host's git configuration,
+// but for what the checkout cannot do there: its git config --global does
+// nothing, and its clone of the hub's git URL makes the working directory
+// and clones the repository of demo on disk into it.
+func (h *createHub) hostGit(ctx context.Context, name string, req runtime.ExecRequest, stdout, stderr io.Writer) int {
+	dir := filepath.Join(h.rt.HostDir("parley", name), strings.TrimPrefix(req.WorkDir, "/"))
+	argv := req.Command
+	switch {
+	case len(argv) > 2 && argv[0] == "git" && argv[1] == "config" && argv[2] == "--global":
+		return 0
+	case isClone(argv):
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		argv = []string{"git", "clone", "--quiet", "--no-checkout", h.workspaces.RepoPath("demo"), "."}
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	for _, env := range []map[string]string{req.Env, noHostGit} {
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+	cmd.Stdin = bytes.NewReader(req.Stdin)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	var exit *exec.ExitError
+	switch err := cmd.Run(); {
+	case errors.As(err, &exit):
+		return exit.ExitCode()
+	case err != nil:
+		_, _ = fmt.Fprintln(stderr, err)
+		return 127
+	}
+	return 0
+}
+
+// dirtySource stores a deleted sandbox of demo--t1 whose checkpoint holds
+// the dirty ref t1 at a commit on main, and returns its id; with stored, the
+// ref is in the repository of demo--t1.
+func (h *createHub) dirtySource(t *testing.T, stored bool) string {
+	t.Helper()
+	dirty := gitrepotest.Commit(t, h.workspaces.RepoPath("demo"), "parley checkpoint", map[string]string{"README": "dirty\n"}, h.base)
+	id := h.seedRecord(t, "demo--t1", sandbox.StateDeleted, func(r *sandbox.Record) {
+		r.Checkpoint = json.RawMessage(`{"ok":true,"error":null,"refs":[{"branch":"t1","sha":"` + dirty + `","dirty":true}]}`)
+	})
+	if stored {
+		gitrepotest.SetRef(t, h.workspaces.RepoPath("demo--t1"), sandbox.CheckpointRefPrefix+id+"/t1", dirty)
+	}
+	return id
+}
+
+// uploads is the number of files the runtime was asked to write into the
+// sandbox id, from its n-th call on.
+func (h *createHub) uploads(id string, n int) int {
+	return len(slices.DeleteFunc(h.sandboxCalls(id, n), func(op string) bool { return op != runtime.OpUpload }))
 }

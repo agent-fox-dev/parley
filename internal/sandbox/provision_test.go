@@ -238,7 +238,7 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			})
 			return func() { h.hooks.setExec(nil) }
 		}},
-		{name: "the restorer fails", reason: "provision_failed", fault: func(t *testing.T) func() {
+		{name: "the restorer fails", reason: "checkout_failed", fault: func(t *testing.T) func() {
 			h.svc.RegisterRestorer(&stubRestorer{hooks: h.hooks, err: errors.New("no checkpoint data")})
 			return func() { h.svc.RegisterRestorer(nil) }
 		}, create: func(t *testing.T) string {

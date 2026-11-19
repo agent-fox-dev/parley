@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -12,6 +13,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
 func TestScrub(t *testing.T) {
@@ -107,5 +109,34 @@ func TestScrub_TheRuntimeErrorOfACheckpoint(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The fetch of a restore fails with a text that holds the new sandbox's
+// credential secret and its hub credential and runs past 1,024 bytes; the
+// error of the fail event that ends the sandbox carries it scrubbed of both.
+func TestScrub_TheErrorOfAFailedRestore(t *testing.T) {
+	t.Parallel()
+	h := startRestoreHub(t, agentProfile+"credentials = [\"model\"]\n"+credentialTables)
+	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
+	src := h.dirtySource(t, true)
+	var hubValue string
+	h.hooks.setExec(func(argv []string) (int, string, error) {
+		if !slices.Contains(argv, "fetch") {
+			return 0, "", nil
+		}
+		minted := h.minter.minted()
+		hubValue = minted[len(minted)-1]
+		return 1, "auth failed for " + modelSecret + " with " + hubValue + " " + strings.Repeat("x", 3000), nil
+	})
+
+	_, rec := h.provisioned(t, "demo--t1", "", map[string]any{"restore_from": src})
+	ev := h.sandboxEvents(t, sandbox.EventFail, rec.ID)
+	if len(ev) != 1 || hubValue == "" {
+		t.Fatalf("fail events %+v after a fetch with the hub credential %q; want one after the fetch", ev, hubValue)
+	}
+	text, _ := ev[0].metadata["error"].(string)
+	if strings.Contains(text, modelSecret) || strings.Contains(text, hubValue) || len(text) > 1024 || !strings.Contains(text, "[redacted]") {
+		t.Errorf("the fail event's error = %q (%d bytes); want neither value, [redacted] where one stood and at most 1,024 bytes", text, len(text))
 	}
 }
