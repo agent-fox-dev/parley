@@ -153,13 +153,39 @@ type RunEventPlace struct {
 
 // RunEventQuery is a read of the run events of every run of the
 // workspaces Scope covers, newest first: those whose timestamp is at or
-// after Since and before Until, when given, and that come after Before in
-// the order, when given, at most Limit of them.
+// after Since and before Until, when given, that come after Before in the
+// order, when given, and that match every filter given, at most Limit of
+// them.
 type RunEventQuery struct {
 	Scope        Scope
 	Before       *RunEventPlace
 	Since, Until *time.Time
-	Limit        int
+	// Types are the entries a run event's event_type must match one of: an
+	// exact type, or a prefix ending in * that matches every type beginning
+	// with the text before the *; nil for any type.
+	Types []string
+	// The other filters each give the value the run event's field of the
+	// same name must equal; nil for any. A field the run event does not
+	// have (null) equals no value. SessionID is compared as it is, so it is
+	// given in lower case, as ids are stored.
+	Workspace, SessionID, RunID, NodeID, Severity *string
+	Limit                                         int
+}
+
+// matches are the filters of q that compare a column with a value.
+func (q RunEventQuery) matches() []match {
+	var ms []match
+	add := func(column string, value *string) {
+		if value != nil {
+			ms = append(ms, match{column: column, value: *value})
+		}
+	}
+	add("workspace", q.Workspace)
+	add("session_id", q.SessionID)
+	add("run_id", q.RunID)
+	add("node_id", q.NodeID)
+	add("severity", q.Severity)
+	return ms
 }
 
 // RunEventRecord is a stored run event as a read across runs returns it.
@@ -184,6 +210,12 @@ func (c *Component) NewestRunEvents(ctx context.Context, q RunEventQuery) ([]Run
 	}
 	scope, args := q.Scope.sql()
 	conds := []string{scope}
+	for _, m := range q.matches() {
+		conds, args = append(conds, m.column+" = ?"), append(args, m.value)
+	}
+	if cond, targs := typesCondition("event_type", q.Types); cond != "" {
+		conds, args = append(conds, cond), append(args, targs...)
+	}
 	if q.Since != nil {
 		conds, args = append(conds, "timestamp >= ?"), append(args, q.Since.UTC().Format(storedLayout))
 	}
@@ -211,6 +243,29 @@ func (c *Component) NewestRunEvents(ctx context.Context, q RunEventQuery) ([]Run
 		}
 	}
 	return out, nil
+}
+
+// typesCondition is the condition that column matches one of the entries
+// of types, and its arguments; "" when every value matches. A prefix is
+// compared as text, not with LIKE, whose _ and % a type may hold.
+func typesCondition(column string, types []string) (string, []any) {
+	var ors []string
+	var args []any
+	for _, entry := range types {
+		prefix, ok := strings.CutSuffix(entry, "*")
+		switch {
+		case !ok:
+			ors, args = append(ors, column+" = ?"), append(args, entry)
+		case prefix == "":
+			return "", nil
+		default:
+			ors, args = append(ors, "substr("+column+", 1, length(?)) = ?"), append(args, prefix, prefix)
+		}
+	}
+	if len(ors) == 0 {
+		return "", nil
+	}
+	return "(" + strings.Join(ors, " OR ") + ")", args
 }
 
 // marks are n comma-separated placeholders.

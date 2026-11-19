@@ -25,12 +25,36 @@ type Place struct {
 }
 
 // NewestQuery is a read of the stored hub events, newest first: those
-// whose time is at or after Since and before Until, when given, and that
-// come after Before in the order, when given, at most Limit of them.
+// whose time is at or after Since and before Until, when given, that come
+// after Before in the order, when given, and that match every filter given,
+// at most Limit of them.
 type NewestQuery struct {
 	Before       *Place
 	Since, Until *time.Time
-	Limit        int
+	// Types are the entries an event's type must match one of: an exact
+	// type, or a prefix ending in * (ParseTypes); nil for any type.
+	Types []string
+	// The other filters each give the value the event's field of the same
+	// name must equal; nil for any. A field the event does not have
+	// (null) equals no value. SessionID is compared as it is, so it is
+	// given in lower case, as session ids are stored.
+	Workspace, SessionID                                 *string
+	ActorType, ActorID, ResourceType, ResourceID, Action *string
+	Limit                                                int
+}
+
+// equal is a filter that a column holds a value: none when value is nil.
+type equal struct {
+	column string
+	value  *string
+}
+
+// equals are the filters of q that compare a column with a value.
+func (q NewestQuery) equals() []equal {
+	return []equal{
+		{"workspace", q.Workspace}, {"session_id", q.SessionID}, {"actor_type", q.ActorType}, {"actor_id", q.ActorID},
+		{"resource_type", q.ResourceType}, {"resource_id", q.ResourceID}, {"action", q.Action},
+	}
 }
 
 // ReadNewest reads the stored hub events q asks for that caller may see
@@ -79,6 +103,14 @@ func (c *Component) ReadNewest(ctx context.Context, caller Caller, q NewestQuery
 // newest first, whoever may see them.
 func readNewest(ctx context.Context, db Querier, q NewestQuery, limit int) ([]Record, error) {
 	conds, args := []string{"type <> ?"}, []any{pingType}
+	for _, f := range q.equals() {
+		if f.value != nil {
+			conds, args = append(conds, f.column+" = ?"), append(args, *f.value)
+		}
+	}
+	if cond, targs := typesCondition(q.Types); cond != "" {
+		conds, args = append(conds, cond), append(args, targs...)
+	}
 	// Event times are whole seconds, so an event is at or after an instant,
 	// or before it, exactly when it is so of the instant rounded up to the
 	// second.
@@ -102,6 +134,29 @@ ORDER BY time DESC, id DESC LIMIT ?`, append(args, limit)...)
 		return nil, err
 	}
 	return scanRecords(rows)
+}
+
+// typesCondition is the condition that an event's type matches one of the
+// entries of types, and its arguments; "" when every type matches. A
+// prefix is compared as text, not with LIKE, whose _ and % a type may hold.
+func typesCondition(types []string) (string, []any) {
+	var ors []string
+	var args []any
+	for _, entry := range types {
+		prefix, ok := strings.CutSuffix(entry, "*")
+		switch {
+		case !ok:
+			ors, args = append(ors, "type = ?"), append(args, entry)
+		case prefix == "":
+			return "", nil
+		default:
+			ors, args = append(ors, "substr(type, 1, length(?)) = ?"), append(args, prefix, prefix)
+		}
+	}
+	if len(ors) == 0 {
+		return "", nil
+	}
+	return "(" + strings.Join(ors, " OR ") + ")", args
 }
 
 // ceilSecond is t in UTC rounded up to the whole second.

@@ -17,6 +17,7 @@ import (
 // under the visibility rule for the caller: the event component.
 type HubEvents interface {
 	ReadNewest(ctx context.Context, caller event.Caller, q event.NewestQuery) ([]event.Record, error)
+	CheckWorkspace(ctx context.Context, caller event.Caller, slug string) error
 }
 
 // RunEvents are the stored run events the query reads, newest first and

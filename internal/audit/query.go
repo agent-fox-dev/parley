@@ -53,8 +53,9 @@ var errBadCursor = server.InvalidRequest("cursor is malformed or belongs to anot
 // serveQuery answers GET /audit: the hub events the visibility rule lets
 // the caller see and the run events of the workspaces the caller may see,
 // in one list ordered by time, then id, both descending, then a hub event
-// before a run event, whose time is at or after since and before until,
-// a page at a time. Every parameter is checked before anything is read.
+// before a run event, that match every filter given, a page at a time.
+// Every parameter is checked before anything is read, and the filters are
+// applied by the stores, so that a page is never cut short by a filter.
 // The query applies no age limit of its own: it answers what is stored.
 func (c *Component) serveQuery(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
@@ -62,9 +63,8 @@ func (c *Component) serveQuery(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return errNoCaller
 	}
-	q := telemetry.ReadQuery(r)
-	since, until := q.Range()
-	if err := q.Err(); err != nil {
+	f, err := readFilters(r)
+	if err != nil {
 		return err
 	}
 	page, err := server.ReadPage(r)
@@ -80,8 +80,7 @@ func (c *Component) serveQuery(w http.ResponseWriter, r *http.Request) error {
 	// first limit+1 of the merge are the list's, and the helper tells from
 	// the one past the page whether another page follows.
 	fetch := page.Limit + 1
-	hubQ := event.NewestQuery{Since: since, Until: until, Limit: fetch}
-	agentQ := telemetry.RunEventQuery{Since: since, Until: until, Limit: fetch}
+	hubQ, agentQ := f.hubQuery(fetch), f.agentQuery(fetch)
 	if after {
 		at, err := time.Parse(time.RFC3339Nano, pos.Time)
 		if err != nil || (pos.Source != sourceHub && pos.Source != sourceAgent) {
@@ -92,23 +91,31 @@ func (c *Component) serveQuery(w http.ResponseWriter, r *http.Request) error {
 		hubQ.Before = &event.Place{Time: at, ID: pos.ID}
 		agentQ.Before = &telemetry.RunEventPlace{Timestamp: at, ID: pos.ID, Inclusive: pos.Source == sourceHub}
 	}
-	if agentQ.Scope, err = c.runScope(ctx, sc); err != nil {
+	caller := event.CallerOf(r)
+	if err := c.checkWorkspace(ctx, caller, f.workspace); err != nil {
 		return err
 	}
-	hubRecs, err := c.deps.Hub.ReadNewest(ctx, event.CallerOf(r), hubQ)
-	if err != nil {
-		return fmt.Errorf("read the hub events of the audit query: %w", err)
+	items := []item{}
+	if f.readsHub() {
+		recs, err := c.deps.Hub.ReadNewest(ctx, caller, hubQ)
+		if err != nil {
+			return fmt.Errorf("read the hub events of the audit query: %w", err)
+		}
+		for _, rec := range recs {
+			items = append(items, hubItem(rec))
+		}
 	}
-	runRecs, err := c.deps.Agent.NewestRunEvents(ctx, agentQ)
-	if err != nil {
-		return fmt.Errorf("read the run events of the audit query: %w", err)
-	}
-	items := make([]item, 0, len(hubRecs)+len(runRecs))
-	for _, rec := range hubRecs {
-		items = append(items, hubItem(rec))
-	}
-	for _, rec := range runRecs {
-		items = append(items, agentItem(rec))
+	if f.readsAgent() {
+		if agentQ.Scope, err = c.runScope(ctx, sc); err != nil {
+			return err
+		}
+		recs, err := c.deps.Agent.NewestRunEvents(ctx, agentQ)
+		if err != nil {
+			return fmt.Errorf("read the run events of the audit query: %w", err)
+		}
+		for _, rec := range recs {
+			items = append(items, agentItem(rec))
+		}
 	}
 	slices.SortFunc(items, compareItems)
 	return server.WritePage(w, page, items[:min(len(items), fetch)], positionOf)
