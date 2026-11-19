@@ -80,7 +80,7 @@ func (s *Service) useTable() []*useEntry {
 	return []*useEntry{
 		{
 			name: useExec, method: http.MethodPost, segment: "exec", kind: KindWrite, covers: true,
-			states: []string{StateReady}, maxBody: execBodyLimit, validate: exec.validate, operate: exec.collect,
+			states: []string{StateReady}, maxBody: execBodyLimit, validate: exec.validate, operate: exec.serve,
 		},
 		{
 			name: useUpload, method: http.MethodPut, segment: "files", kind: KindWrite, covers: true,

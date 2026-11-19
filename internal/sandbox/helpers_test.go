@@ -1,6 +1,7 @@
 package sandbox_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -2368,8 +2369,14 @@ func (h *execHub) mainRunning(t *testing.T, id string) bool {
 // its error envelope, if it has one.
 func (h *execHub) exec(t *testing.T, id string, body any, header http.Header) answer {
 	t.Helper()
+	return h.execAs(t, h.key, id, body, header)
+}
+
+// execAs sends what exec sends with cred as the bearer credential.
+func (h *execHub) execAs(t *testing.T, cred, id string, body any, header http.Header) answer {
+	t.Helper()
 	var a answer
-	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+sandboxPath("ws", id)+"/exec", h.key, body, header)
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+sandboxPath("ws", id)+"/exec", cred, body, header)
 	var env struct {
 		Error *json.RawMessage `json:"error"`
 	}
@@ -2489,4 +2496,102 @@ func (c *commands) last(t *testing.T) runtime.ExecRequest {
 		t.Fatal("no command ran")
 	}
 	return c.ran[len(c.ran)-1]
+}
+
+// frame is one server-sent event of a stream: its name and its data.
+type frame struct {
+	event string
+	data  map[string]any
+}
+
+// output is the bytes of output a stdout or stderr frame carries: its data
+// as text, or its data_base64 decoded.
+func (f frame) output(t *testing.T) []byte {
+	t.Helper()
+	if encoded, ok := f.data["data_base64"].(string); ok {
+		b, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatalf("the %s frame's data_base64 is not base64: %v", f.event, err)
+		}
+		return b
+	}
+	text, ok := f.data["data"].(string)
+	if !ok {
+		t.Fatalf("the %s frame %v has neither data nor data_base64", f.event, f.data)
+	}
+	return []byte(text)
+}
+
+// frameReader reads the server-sent events of an answer one frame at a
+// time.
+type frameReader struct {
+	resp  *http.Response
+	lines *bufio.Scanner
+}
+
+// streaming sends POST …/exec for the sandbox id of ws as the owner with
+// body and Accept: text/event-stream, under ctx and at most 10 s, and
+// returns the answer's stream once its headers arrived; the test closes it.
+func (h *execHub) streaming(t *testing.T, ctx context.Context, id string, body any) *frameReader {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	t.Cleanup(cancel)
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL("/api/v1"+sandboxPath("ws", id)+"/exec"), bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("send the request: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("exec = %d %.300s (Content-Type %q), want 200 and an event stream", resp.StatusCode, b, resp.Header.Get("Content-Type"))
+	}
+	lines := bufio.NewScanner(resp.Body)
+	lines.Buffer(nil, 1<<20)
+	return &frameReader{resp: resp, lines: lines}
+}
+
+// next reads the next frame, and reports false once the stream ended.
+func (s *frameReader) next(t *testing.T) (frame, bool) {
+	t.Helper()
+	var f frame
+	for s.lines.Scan() {
+		line := s.lines.Text()
+		switch {
+		case line == "":
+			if f.event != "" {
+				return f, true
+			}
+		case strings.HasPrefix(line, "event: "):
+			f.event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &f.data); err != nil {
+				t.Fatalf("the data of a %s frame is not a JSON object: %v", f.event, err)
+			}
+		}
+	}
+	if err := s.lines.Err(); err != nil {
+		t.Fatalf("read the stream: %v", err)
+	}
+	if f.event != "" {
+		t.Fatalf("the stream ended inside a %s frame", f.event)
+	}
+	return frame{}, false
+}
+
+// rest reads the frames up to the end of the stream.
+func (s *frameReader) rest(t *testing.T) []frame {
+	t.Helper()
+	var out []frame
+	for f, ok := s.next(t); ok; f, ok = s.next(t) {
+		out = append(out, f)
+	}
+	return out
 }

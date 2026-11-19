@@ -3,9 +3,12 @@ package sandbox_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"io"
 	"net/http"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -435,5 +438,265 @@ func receive(t *testing.T, answered <-chan answer) answer {
 	case <-time.After(5 * time.Second):
 		t.Fatal("waited 5 s for the answer")
 		return answer{}
+	}
+}
+
+func TestExec_StreamsTheOutputWhileTheCommandRuns(t *testing.T) {
+	t.Parallel()
+	h := startExecHub(t, 8)
+	goOn := make(chan struct{})
+	h.cmds.set("talk", func(ctx context.Context, _ string, _ runtime.ExecRequest, stdout, stderr io.Writer) int {
+		_, _ = io.WriteString(stdout, "a")
+		select {
+		case <-goOn:
+		case <-ctx.Done():
+			return 137
+		}
+		_, _ = io.WriteString(stderr, "b")
+		_, _ = stdout.Write(bytes.Repeat([]byte{'c'}, 100000))
+		return 4
+	})
+	id := h.sandbox(t, nil)
+	s := h.streaming(t, context.Background(), id, map[string]any{"command": []string{"talk"}})
+	if got := s.resp.Header.Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", got)
+	}
+	first, ok := s.next(t)
+	if !ok || first.event != "stdout" || !reflect.DeepEqual(first.data, map[string]any{"data": "a"}) {
+		t.Fatalf("the first frame = %+v (%v), want stdout {data: a}", first, ok)
+	}
+	if _, running, _, _ := h.cmds.counts(); running != 1 {
+		t.Fatalf("%d commands run after the first frame, want the command still running", running)
+	}
+	close(goOn)
+	frames := append([]frame{first}, s.rest(t)...)
+	last := frames[len(frames)-1]
+	if last.event != "exit" {
+		t.Fatalf("the last frame is %q, want exit", last.event)
+	}
+	wantMembers(t, last.data, map[string]any{"exit_code": 4.0, "timed_out": false})
+	if _, ok := last.data["duration_ms"].(float64); !ok {
+		t.Errorf("the exit frame %v has no duration_ms", last.data)
+	}
+	var stdout, stderr []byte
+	var order []string
+	for _, f := range frames[:len(frames)-1] {
+		b := f.output(t)
+		if len(b) > 32768 {
+			t.Errorf("a %s frame carries %d bytes, want at most 32768", f.event, len(b))
+		}
+		switch f.event {
+		case "stdout":
+			stdout = append(stdout, b...)
+		case "stderr":
+			stderr = append(stderr, b...)
+		default:
+			t.Errorf("a frame before the last is %q, want stdout or stderr", f.event)
+		}
+		if len(order) == 0 || order[len(order)-1] != f.event {
+			order = append(order, f.event)
+		}
+	}
+	if want := "a" + strings.Repeat("c", 100000); string(stdout) != want {
+		t.Errorf("the stdout frames carry %d bytes, want the %d the command wrote", len(stdout), len(want))
+	}
+	if string(stderr) != "b" {
+		t.Errorf("the stderr frames carry %q, want b", stderr)
+	}
+	if !slices.Equal(order, []string{"stdout", "stderr", "stdout"}) {
+		t.Errorf("the frames came as %v, want stdout, stderr, stdout, in the order of the output", order)
+	}
+}
+
+func TestExec_StreamsEveryByteOfTheOutput(t *testing.T) {
+	t.Parallel()
+	h := startExecHub(t, 8)
+	id := h.sandbox(t, nil)
+	pattern := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = "0123456789abcdefghijklmnopqrstuvwxyz\n"[i%37]
+		}
+		return b
+	}
+	rows := []struct {
+		name string
+		// stdout and stderr are the chunks the command writes.
+		stdout, stderr [][]byte
+		// encoded is the index of the stdout frame that must carry
+		// data_base64; -1 for none.
+		encoded int
+	}{
+		{"3 MiB of stdout and 2 MiB of stderr", [][]byte{pattern(3 << 20)}, [][]byte{pattern(2 << 20)}, -1},
+		{"a chunk that is not UTF-8", [][]byte{[]byte("ok"), {0xff, 0x00, 0xfe}, []byte("done")}, nil, 1},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			h.cmds.set("emit", func(_ context.Context, _ string, _ runtime.ExecRequest, stdout, stderr io.Writer) int {
+				for _, c := range row.stdout {
+					_, _ = stdout.Write(c)
+				}
+				for _, c := range row.stderr {
+					_, _ = stderr.Write(c)
+				}
+				return 0
+			})
+			frames := h.streaming(t, context.Background(), id, map[string]any{"command": []string{"emit"}}).rest(t)
+			if len(frames) == 0 || frames[len(frames)-1].event != "exit" {
+				t.Fatalf("the stream ended without an exit frame")
+			}
+			if _, ok := frames[len(frames)-1].data["truncated"]; ok {
+				t.Error("the exit frame has a truncated member, want none")
+			}
+			got := map[string][]byte{}
+			n := 0
+			for _, f := range frames[:len(frames)-1] {
+				got[f.event] = append(got[f.event], f.output(t)...)
+				if f.event != "stdout" {
+					continue
+				}
+				_, text := f.data["data"]
+				_, encoded := f.data["data_base64"]
+				if want := n == row.encoded; encoded != want || text == want {
+					t.Errorf("stdout frame %d = %v, want data_base64 %v and data %v", n, f.data, want, !want)
+				}
+				n++
+			}
+			for name, chunks := range map[string][][]byte{"stdout": row.stdout, "stderr": row.stderr} {
+				if want := bytes.Join(chunks, nil); sha256.Sum256(got[name]) != sha256.Sum256(want) {
+					t.Errorf("the %s frames carry %d bytes that differ from the %d the command wrote", name, len(got[name]), len(want))
+				}
+			}
+		})
+	}
+}
+
+func TestExec_StreamKillsACommandThatOutlastsItsTimeout(t *testing.T) {
+	t.Parallel()
+	h := startExecHub(t, 8)
+	h.cmds.set("block", h.cmds.blocking("partial", ""))
+	id := h.sandbox(t, nil)
+	s := h.streaming(t, context.Background(), id, map[string]any{"command": []string{"block"}, "timeout": "2s"})
+	if f, ok := s.next(t); !ok || f.event != "stdout" || string(f.output(t)) != "partial" {
+		t.Fatalf("the first frame = %+v (%v), want stdout partial", f, ok)
+	}
+	h.clock.Advance(2 * time.Second)
+	frames := s.rest(t)
+	if len(frames) != 1 || frames[0].event != "exit" {
+		t.Fatalf("after the timeout the stream sent %+v, want one exit frame", frames)
+	}
+	wantMembers(t, frames[0].data, map[string]any{"exit_code": nil, "timed_out": true, "duration_ms": 2000.0})
+	if _, _, _, kills := h.cmds.counts(); kills != 1 {
+		t.Errorf("the runtime killed %d commands, want 1", kills)
+	}
+}
+
+func TestExec_StreamKillsTheCommandWhenTheCallerLeavesOrTheHubStops(t *testing.T) {
+	t.Parallel()
+	h := startExecHub(t, 1)
+	h.cmds.set("block", h.cmds.blocking("x", ""))
+	id := h.sandbox(t, nil)
+	h.startMain(t, id)
+	block := map[string]any{"command": []string{"block"}}
+	// open opens a stream of block and reads its first frame.
+	open := func(t *testing.T) *frameReader {
+		t.Helper()
+		s := h.streaming(t, context.Background(), id, block)
+		if f, ok := s.next(t); !ok || f.event != "stdout" {
+			t.Fatalf("the first frame = %+v (%v), want stdout", f, ok)
+		}
+		return s
+	}
+
+	_ = open(t).resp.Body.Close()
+	left := time.Now()
+	for _, _, _, kills := h.cmds.counts(); kills != 1; _, _, _, kills = h.cmds.counts() {
+		if time.Since(left) > time.Second {
+			t.Fatalf("the runtime killed %d commands 1 s after the caller left, want 1", kills)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The one place of the sandbox is free again once the hub saw the
+	// caller leave.
+	eventually(t, "an exec to be accepted", func() bool {
+		return h.exec(t, id, map[string]any{"command": []string{"true"}}, nil).status == http.StatusOK
+	})
+
+	s := open(t)
+	h.Stop()
+	if code := h.ExitCode(t, 10*time.Second); code != 0 {
+		t.Fatalf("the hub stopped with %d, want 0", code)
+	}
+	for _, f := range s.rest(t) {
+		if f.event == "exit" {
+			t.Errorf("the stream sent an exit frame %v while the hub stopped, want none", f.data)
+		}
+	}
+	if _, _, _, kills := h.cmds.counts(); kills != 2 {
+		t.Errorf("the runtime killed %d commands, want 2", kills)
+	}
+	if !h.mainRunning(t, id) {
+		t.Error("the main process ended, want it running")
+	}
+}
+
+func TestExec_StreamRefusesARequestAsTheCollectedFormDoes(t *testing.T) {
+	t.Parallel()
+	h := startExecHub(t, 8)
+	ha := &sandbox.HubAccess{Scopes: []string{"git:write"}}
+	ready := h.sandbox(t, func(rec *sandbox.Record) { rec.HubAccess = ha })
+	stopped := h.sandbox(t, func(rec *sandbox.Record) { rec.State = sandbox.StateStopped })
+	narrow := h.pat(t, h.owner, "sandboxes:write", "sandboxes:read")
+	cmd := []string{"true"}
+	rows := []struct {
+		name, cred, id string
+		body           map[string]any
+		status         int
+		errorType      string
+	}{
+		{"a body without a command", h.key, ready, map[string]any{}, 400, "invalid_request"},
+		{"a timeout over the maximum", h.key, ready, map[string]any{"command": cmd, "timeout": "31m"}, 400, "invalid_request"},
+		{"a stopped sandbox", h.key, stopped, map[string]any{"command": cmd}, 409, "sandbox_not_ready"},
+		{"a PAT that does not cover the sandbox's credential", narrow, ready, map[string]any{"command": cmd}, 403, "insufficient_scope"},
+		{"an unknown sandbox", h.key, sandbox.NewID(), map[string]any{"command": cmd}, 404, "sandbox_not_found"},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			for _, form := range []struct {
+				name   string
+				header http.Header
+			}{{"collected", nil}, {"streamed", eventStream}} {
+				a := h.execAs(t, row.cred, row.id, row.body, form.header)
+				if a.status != row.status || a.err.ErrorType != row.errorType || !strings.HasPrefix(a.header.Get("Content-Type"), "application/json") {
+					t.Errorf("the %s form = %d %s (Content-Type %q), want %d %s as JSON", form.name, a.status, a.body, a.header.Get("Content-Type"), row.status, row.errorType)
+				}
+			}
+			if ran, _, _, _ := h.cmds.counts(); ran != 0 {
+				t.Errorf("the runtime ran %d commands, want none", ran)
+			}
+		})
+	}
+}
+
+func TestExec_StreamEndsWithoutAnExitFrameWhenTheRuntimeFails(t *testing.T) {
+	t.Parallel()
+	h := startExecHub(t, 1)
+	h.cmds.set("block", h.cmds.blocking("x", ""))
+	id := h.sandbox(t, nil)
+	s := h.streaming(t, context.Background(), id, map[string]any{"command": []string{"block"}})
+	first, ok := s.next(t)
+	if !ok || first.event != "stdout" || string(first.output(t)) != "x" {
+		t.Fatalf("the first frame = %+v (%v), want stdout x", first, ok)
+	}
+	for _, st := range h.rt.Streams() {
+		if st.Op == runtime.OpExecStream && st.Sandbox == id {
+			h.rt.BreakStream(st.ID)
+		}
+	}
+	if rest := s.rest(t); len(rest) != 0 {
+		t.Errorf("after the runtime failed the stream sent %+v, want it to end", rest)
+	}
+	if a := h.exec(t, id, map[string]any{"command": []string{"true"}}, nil); a.status != http.StatusOK {
+		t.Errorf("the next exec = %d %s, want 200", a.status, a.body)
 	}
 }
