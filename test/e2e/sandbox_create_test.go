@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
@@ -30,22 +32,31 @@ import (
 const sandboxHead = "89abcdef0123456789abcdef0123456789abcdef"
 
 // sandboxCreateHub is a hub with sandboxes on over the fake runtime, which
-// runs every git command of a checkout with success, and the ready
-// repository demo of the user whose API key is key.
+// runs every command with success, and the ready repository demo, in the
+// org acme, of the user whose API key is key.
 type sandboxCreateHub struct {
 	*hubtest.Hub
-	fake *runtimetest.Fake
-	key  string
+	fake    *runtimetest.Fake
+	key     string
+	org     string
+	secrets *secret.Component
+
+	mu sync.Mutex
+	// commands are the commands the fake ran, by sandbox.
+	commands map[string][][]string
 }
 
-// startSandboxCreateHub starts a sandbox create hub with the profile agent,
-// marked default, without credentials, and the profile needs, whose
-// credential model's secret MODEL_KEY is set nowhere.
-func startSandboxCreateHub(t *testing.T) *sandboxCreateHub {
+// startSandboxCreateHub starts a sandbox create hub with the credential
+// model, whose secret is MODEL_KEY, and profiles, the TOML of the
+// [[sandbox.profiles]].
+func startSandboxCreateHub(t *testing.T, profiles string) *sandboxCreateHub {
 	t.Helper()
-	h := &sandboxCreateHub{fake: runtimetest.New(t)}
+	h := &sandboxCreateHub{fake: runtimetest.New(t), commands: map[string][][]string{}}
 	h.fake.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
-	h.fake.SetExec(func(ctx context.Context, _ string, req runtime.ExecRequest, stdout, _ io.Writer) int {
+	h.fake.SetExec(func(ctx context.Context, name string, req runtime.ExecRequest, stdout, _ io.Writer) int {
+		h.mu.Lock()
+		h.commands[name] = append(h.commands[name], req.Command)
+		h.mu.Unlock()
 		if slices.Equal(req.Command, []string{"git", "rev-parse", "HEAD"}) {
 			_, _ = io.WriteString(stdout, sandboxHead+"\n")
 		}
@@ -55,13 +66,11 @@ func startSandboxCreateHub(t *testing.T) *sandboxCreateHub {
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Server: "external_url = \"https://hub.test\"\n",
 		TOML: "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
-			"[[sandbox.credentials]]\nname = \"model\"\nprovider_profile = \"anthropic\"\nsecret = \"MODEL_KEY\"\n" +
-			"[[sandbox.profiles]]\nname = \"agent\"\ndefault = true\nimage = \"img:1\"\nttl = \"4h\"\nhub_access = \"fork\"\n" +
-			"[[sandbox.profiles]]\nname = \"needs\"\nttl = \"4h\"\ncredentials = [\"model\"]\n",
+			"[[sandbox.credentials]]\nname = \"model\"\nprovider_profile = \"anthropic\"\nsecret = \"MODEL_KEY\"\n" + profiles,
 		Files: map[string]string{"gateway-token": "gw-tok-SECRET\n"},
 		Env:   map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))},
 		Compose: func(c *hub.Composition) {
-			workspaces = c.Workspaces()
+			workspaces, h.secrets = c.Workspaces(), c.Secrets()
 			c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 				return h.fake.Client(s.OpenShellWorkspace, deps.Recorder), nil
 			})
@@ -69,8 +78,8 @@ func startSandboxCreateHub(t *testing.T) *sandboxCreateHub {
 	})
 	user := h.CreateUser(t, "agent")
 	h.key = h.IssueKey(t, user)
-	org := h.CreateOrg(t, "acme")
-	h.AddMember(t, org, user)
+	h.org = h.CreateOrg(t, "acme")
+	h.AddMember(t, h.org, user)
 	dir := workspaces.RepoPath("demo")
 	gitrepotest.InitBare(t, dir, "main")
 	gitrepotest.SetRef(t, dir, "refs/heads/main", gitrepotest.Commit(t, dir, "first", map[string]string{"README": "demo\n"}))
@@ -78,7 +87,7 @@ func startSandboxCreateHub(t *testing.T) *sandboxCreateHub {
 	err := h.Store.Tx(context.Background(), func(tx *sql.Tx) error {
 		return workspace.Insert(context.Background(), tx, workspace.Workspace{
 			Slug: "demo", Kind: access.KindRepository, Mode: workspace.ModeStandard, DefaultBranch: new("main"),
-			OwnerID: user, OrgID: org, Status: workspace.StatusReady, DisplayName: "demo",
+			OwnerID: user, OrgID: h.org, Status: workspace.StatusReady, DisplayName: "demo",
 			CreatedAt: now, UpdatedAt: now, InstanceID: workspace.NewInstanceID(),
 		})
 	})
@@ -103,9 +112,106 @@ func (h *sandboxCreateHub) object(t *testing.T, method, path string, body any, s
 	return o
 }
 
+// putSecret stores the secret name with value in scope of the owner id.
+func (h *sandboxCreateHub) putSecret(t *testing.T, scope secret.Scope, id, name, value string) {
+	t.Helper()
+	err := h.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		return h.secrets.Put(context.Background(), tx, scope, id, name, value)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// parley runs the CLI in-process against the hub with the hub's key.
+func (h *sandboxCreateHub) parley(t *testing.T, args ...string) ran {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := cli.Run(context.Background(), append([]string{"--endpoint-url", h.URL(""), "--api-key", h.key}, args...), &stdout, &stderr)
+	return ran{code, stdout.String(), stderr.String()}
+}
+
+// ran is the commands the fake ran in the sandbox name.
+func (h *sandboxCreateHub) ran(name string) [][]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.commands[name])
+}
+
+func TestSandboxCreateAndWait(t *testing.T) {
+	parallel(t)
+	h := startSandboxCreateHub(t, "[[sandbox.profiles]]\nname = \"full\"\ndefault = true\nttl = \"4h\"\nhub_access = \"fork\"\n"+
+		"credentials = [\"model\"]\nexpose_secrets = [\"NPM_TOKEN\"]\n")
+	h.object(t, http.MethodPost, "/api/v1/workspaces/demo/forks", map[string]any{"name": "t1"}, http.StatusCreated)
+	const npmValue = "npm-SECRET"
+	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", "model-SECRET")
+	h.putSecret(t, secret.ScopeWorkspace, "demo--t1", "NPM_TOKEN", npmValue)
+
+	// 1s is the shortest --poll-interval the duration form allows.
+	r := h.parley(t, "sandbox", "create", "demo--t1", "--wait", "--poll-interval", "1s", "--", "make", "test")
+
+	if r.code != 0 {
+		t.Fatalf("parley sandbox create --wait = %d, stdout %q, stderr %q; want 0", r.code, r.stdout, r.stderr)
+	}
+	s := r.json(t)
+	id, _ := s["id"].(string)
+	checkout, _ := s["checkout"].(map[string]any)
+	if s["state"] != sandbox.StateReady || !reflect.DeepEqual(s["credentials"], []any{"model"}) ||
+		!reflect.DeepEqual(s["exposed_secrets"], []any{"NPM_TOKEN"}) || checkout["branch"] != "t1" {
+		t.Errorf("printed %v; want a ready sandbox with credentials [model], exposed_secrets [NPM_TOKEN] on the branch t1", s)
+	}
+	rows, err := h.Store.Main().Query(`SELECT type FROM hub_events
+		WHERE resource_id = ? OR resource_id IN (SELECT token_id FROM pats WHERE workspace = ?) ORDER BY seq`, id, "demo--t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, typ)
+	}
+	rows.Close()
+	if !reflect.DeepEqual(slices.Sorted(slices.Values(events)), []string{"parley.sandbox.create", "parley.sandbox.ready", "parley.token.bind"}) ||
+		events[len(events)-1] != "parley.sandbox.ready" {
+		t.Errorf("events of the sandbox and its hub credential %v; want create, ready and token.bind, ready last", events)
+	}
+	spec, held := h.fake.Spec("parley", id)
+	if !held || spec.Env["PARLEY_WORKSPACE"] != "demo--t1" || spec.Env["NPM_TOKEN"] != npmValue {
+		t.Errorf("the runtime holds %s (%t) with PARLEY_WORKSPACE %q and NPM_TOKEN's value: %t; want demo--t1 and the secret's value",
+			id, held, spec.Env["PARLEY_WORKSPACE"], spec.Env["NPM_TOKEN"] == npmValue)
+	}
+	if ran := h.ran(id); len(ran) == 0 || !slices.Equal(ran[len(ran)-1], []string{"make", "test"}) {
+		t.Errorf("the sandbox ran %v; want make test last, as its main process", ran)
+	}
+	var mains int
+	for _, c := range h.fake.Calls() {
+		if c.Op == runtime.OpRunMain && c.Target == id {
+			mains++
+		}
+	}
+	if mains != 1 {
+		t.Errorf("the runtime started %d main processes in %s; want 1", mains, id)
+	}
+
+	list := h.parley(t, "sandbox", "list", "demo", "--include-forks")
+	items, _ := list.json(t)["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["id"] != id {
+		t.Errorf("parley sandbox list demo --include-forks = %d %s; want the sandbox %s alone", list.code, list.stdout, id)
+	}
+	if got := h.parley(t, "sandbox", "get", "demo--t1", id); got.code != 0 || got.json(t)["id"] != id {
+		t.Errorf("parley sandbox get demo--t1 %s = %d %s; want the sandbox", id, got.code, got.stdout)
+	}
+}
+
 func TestForkAndSandboxInOneCall(t *testing.T) {
 	parallel(t)
-	h := startSandboxCreateHub(t)
+	// The profile needs lists the credential model, whose secret MODEL_KEY
+	// is set nowhere.
+	h := startSandboxCreateHub(t, "[[sandbox.profiles]]\nname = \"agent\"\ndefault = true\nimage = \"img:1\"\nttl = \"4h\"\nhub_access = \"fork\"\n"+
+		"[[sandbox.profiles]]\nname = \"needs\"\nttl = \"4h\"\ncredentials = [\"model\"]\n")
 
 	r := h.object(t, http.MethodPost, "/api/v1/workspaces/demo/forks", map[string]any{"name": "task2", "sandbox": map[string]any{}}, http.StatusCreated)
 	created, _ := r["sandbox"].(map[string]any)
