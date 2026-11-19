@@ -53,7 +53,7 @@ func (r *Repo) trial(ctx context.Context, from, head, onto string) (*ConflictRep
 		}
 		commitRange = from + ".." + head
 	}
-	commits, err := r.replayed(ctx, commitRange)
+	commits, err := r.replayed(ctx, from, head, commitRange)
 	if err != nil || len(commits) == 0 {
 		return nil, err
 	}
@@ -70,10 +70,18 @@ func (r *Repo) trial(ctx context.Context, from, head, onto string) (*ConflictRep
 	return report, err
 }
 
-// replayed lists the commits of the rev-list range commitRange, such as
-// onto..head, oldest first, each with its tree and parents alone: their
-// messages are not read. A merge commit among them is ErrMergeCommit.
-func (r *Repo) replayed(ctx context.Context, commitRange string) ([]Commit, error) {
+// replayed lists the commits of the rev-list range commitRange, from..head
+// or head alone for a from of "", oldest first, each with its tree and
+// parents alone: their messages are not kept. A merge commit among them is
+// ErrMergeCommit.
+func (r *Repo) replayed(ctx context.Context, from, head, commitRange string) ([]Commit, error) {
+	if read, ok := r.commitsBetween(ctx, from, head); ok {
+		var commits []Commit
+		for _, c := range read {
+			commits = append(commits, Commit{ID: c.ID, Tree: c.Tree, Parents: c.Parents})
+		}
+		return commits, nil
+	}
 	out, err := r.git(ctx, "rev-list", "--reverse", "--no-commit-header", "--format=%H %T %P", commitRange)
 	if err != nil {
 		return nil, err
@@ -96,13 +104,17 @@ func (r *Repo) replayed(ctx context.Context, commitRange string) ([]Commit, erro
 // first with its tree: for a root commit, a commit of the empty tree, the
 // side a three-way merge starts from for everything first adds.
 func (r *Repo) trialStart(ctx context.Context, onto string, first Commit) (ontoTree, parent, parentTree string, err error) {
-	names := []string{onto + "^{tree}"}
+	names, ids := []string{onto + "^{tree}"}, []string{onto}
 	if len(first.Parents) > 0 {
 		parent = first.Parents[0]
-		names = append(names, parent+"^{tree}")
+		names, ids = append(names, parent+"^{tree}"), append(ids, parent)
 	}
-	trees, err := r.batchCheck(ctx, "%(objectname)", names)
-	if err != nil {
+	var trees []string
+	if commits, ok := r.readCommits(ctx, ids); ok {
+		for _, c := range commits {
+			trees = append(trees, c.Tree)
+		}
+	} else if trees, err = r.batchCheck(ctx, "%(objectname)", names); err != nil {
 		return "", "", "", err
 	}
 	if len(trees) != len(names) || slices.ContainsFunc(trees, func(l string) bool { return strings.HasSuffix(l, " missing") }) {

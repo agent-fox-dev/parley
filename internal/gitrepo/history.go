@@ -171,6 +171,13 @@ func (r *Repo) ReadCommits(ctx context.Context, ids []string) ([]Commit, error) 
 			return nil, fmt.Errorf("commit %q: %w", id, ErrNotFound)
 		}
 	}
+	lower := make([]string, len(ids))
+	for i, id := range ids {
+		lower[i] = strings.ToLower(id)
+	}
+	if commits, ok := r.readCommits(ctx, lower); ok {
+		return commits, nil
+	}
 	// cat-file reads the ids from its standard input and answers each with
 	// a header line and the object as it is stored, whose length the
 	// header gives, so a message may hold any byte.
@@ -388,6 +395,19 @@ func (r *Repo) CommitsBetween(ctx context.Context, base, head string, limit int)
 	from, head, err := rangeEnds(from, head)
 	if err != nil {
 		return nil, err
+	}
+	if base == "" {
+		from = ""
+	}
+	if commits, ok := r.commitsBetween(ctx, from, head); ok {
+		var ids []string
+		for _, c := range commits {
+			if limit > 0 && len(ids) == limit {
+				break
+			}
+			ids = append(ids, c.ID)
+		}
+		return ids, nil
 	}
 	revs := from + ".." + head
 	if base == "" {

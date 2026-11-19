@@ -161,6 +161,13 @@ func (r *Repo) MergeBase(ctx context.Context, a, b string) (string, error) {
 			return "", fmt.Errorf("merge base of %q: %w", id, ErrNotFound)
 		}
 	}
+	if cr, ok := r.commitReader(ctx); ok {
+		base, ok := cr.mergeBase(strings.ToLower(a), strings.ToLower(b))
+		cr.close()
+		if ok {
+			return base, nil
+		}
+	}
 	out, err := r.git(ctx, "merge-base", strings.ToLower(a), strings.ToLower(b))
 	if err != nil {
 		// merge-base exits with 1, saying nothing, when the commits share no

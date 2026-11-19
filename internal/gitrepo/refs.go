@@ -134,6 +134,15 @@ func (r *Repo) IsAncestor(ctx context.Context, ancestor, descendant string) (boo
 	if err := refuseOption("revision", ancestor, descendant); err != nil {
 		return false, err
 	}
+	if isHexID(ancestor, idLen) && isHexID(descendant, idLen) {
+		if cr, ok := r.commitReader(ctx); ok {
+			yes, ok := cr.isAncestor(strings.ToLower(ancestor), strings.ToLower(descendant))
+			cr.close()
+			if ok {
+				return yes, nil
+			}
+		}
+	}
 	_, err := r.git(ctx, "merge-base", "--is-ancestor", "--end-of-options", ancestor, descendant)
 	if exitCode(err) == 1 {
 		return false, nil
