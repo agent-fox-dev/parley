@@ -528,18 +528,75 @@ func runCommand(ctx context.Context, script ExecFunc, name, host string, req run
 	case host == "":
 		return 0
 	}
+	cmd := hostCommand(ctx, host, req)
+	cmd.Stdin = bytes.NewReader(req.Stdin)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	// A child the command leaves behind may hold its output open; the
+	// command's end does not wait for it.
+	cmd.WaitDelay = 100 * time.Millisecond
+	return exitCode(cmd.Run(), stderr)
+}
+
+// runCommandOutput runs a command as runCommand does and returns its exit
+// code and its whole output. A command run for real reads and writes files,
+// not pipes, so that its end waits for nothing: neither a child it leaves
+// behind holding its output open, nor the copying of its output on a loaded
+// machine, can cut its output short or change how it ended.
+func runCommandOutput(ctx context.Context, script ExecFunc, name, host string, req runtime.ExecRequest) (int, []byte, []byte) {
+	if script != nil || host == "" {
+		var stdout, stderr bytes.Buffer
+		code := runCommand(ctx, script, name, host, req, &stdout, &stderr)
+		return code, stdout.Bytes(), stderr.Bytes()
+	}
+	dir, err := os.MkdirTemp("", "runtimetest-exec-")
+	if err != nil {
+		return 127, nil, []byte(err.Error() + "\n")
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	files := make([]*os.File, 3)
+	for i, n := range []string{"stdin", "stdout", "stderr"} {
+		if files[i], err = os.Create(filepath.Join(dir, n)); err != nil {
+			return 127, nil, []byte(err.Error() + "\n")
+		}
+		defer func() { _ = files[i].Close() }()
+	}
+	if _, err := files[0].Write(req.Stdin); err != nil {
+		return 127, nil, []byte(err.Error() + "\n")
+	}
+	if _, err := files[0].Seek(0, io.SeekStart); err != nil {
+		return 127, nil, []byte(err.Error() + "\n")
+	}
+	cmd := hostCommand(ctx, host, req)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = files[0], files[1], files[2]
+	runErr := cmd.Run()
+	stdout, err := os.ReadFile(files[1].Name())
+	if err != nil {
+		return 127, nil, []byte(err.Error() + "\n")
+	}
+	stderr, err := os.ReadFile(files[2].Name())
+	if err != nil {
+		return 127, nil, []byte(err.Error() + "\n")
+	}
+	var more bytes.Buffer
+	code := exitCode(runErr, &more)
+	return code, stdout, append(stderr, more.Bytes()...)
+}
+
+// hostCommand is a command that runs in the host directory with the
+// request's environment.
+func hostCommand(ctx context.Context, host string, req runtime.ExecRequest) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
 	cmd.Dir = hostPath(host, req.WorkDir)
 	cmd.Env = os.Environ()
 	for _, k := range slices.Sorted(maps.Keys(req.Env)) {
 		cmd.Env = append(cmd.Env, k+"="+req.Env[k])
 	}
-	cmd.Stdin = bytes.NewReader(req.Stdin)
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	// A child the command leaves behind may hold its output open; the
-	// command's end does not wait for it.
-	cmd.WaitDelay = 100 * time.Millisecond
-	err := cmd.Run()
+	return cmd
+}
+
+// exitCode is the exit code of a command that ended with err: its own, or
+// 127, with err written to stderr, when it could not run.
+func exitCode(err error, stderr io.Writer) int {
 	var exit *exec.ExitError
 	switch {
 	case errors.As(err, &exit):
