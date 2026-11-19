@@ -25,23 +25,27 @@ import (
 // use hub exposes.
 const npmToken = "npm_LONGSECRET1"
 
-// sandboxUseHub is a sandbox create hub with the fork fork of demo and the
-// ready sandbox id in it, whose main process runs until the test ends and
-// whose finished operations observed records. Once the sandbox is ready,
-// every command the runtime runs is a real process in the sandbox's
-// directory on the host.
+// sandboxUseRun is the run of the session of a sandbox use hub.
+const sandboxUseRun = "20260102_030405_5a4d0e"
+
+// sandboxUseHub is a sandbox create hub with the fork fork of demo, created
+// in the session of the run sandboxUseRun, and the ready sandbox id in it,
+// whose main process runs until the test ends and whose finished operations
+// observed records. Once the sandbox is ready, every command the runtime
+// runs is a real process in the sandbox's directory on the host.
 type sandboxUseHub struct {
 	*sandboxCreateHub
-	fork, id string
-	observed *operations
-	terms    *terminalSizes
+	fork, id, session string
+	observed          *operations
+	terms             *terminalSizes
 }
 
 // startSandboxUseHub starts a sandbox use hub: its profile agent exposes
 // the secret NPM_TOKEN and gives a sandbox a hub credential bound to its
 // fork, at most one exec runs at once in a sandbox, and its sandbox is
 // created with the fork demo--t1, with the main process agent, and waited
-// for until it is ready.
+// for until it is ready. The fork is created in a session of the run
+// sandboxUseRun, whose sandbox the sandbox is.
 func startSandboxUseHub(t *testing.T) *sandboxUseHub {
 	t.Helper()
 	ops, terms := &operations{}, &terminalSizes{}
@@ -68,8 +72,11 @@ func startSandboxUseHub(t *testing.T) *sandboxUseHub {
 		}
 		return 0
 	})
+	h.session, _ = h.object(t, http.MethodPost, "/api/v1/sessions",
+		map[string]any{"workspace_slug": "demo", "run_id": sandboxUseRun}, http.StatusCreated)["id"].(string)
 	created, _ := h.object(t, http.MethodPost, "/api/v1/workspaces/demo/forks",
-		map[string]any{"name": "t1", "sandbox": map[string]any{"command": []string{"agent"}}}, http.StatusCreated)["sandbox"].(map[string]any)
+		map[string]any{"name": "t1", "session_id": h.session, "sandbox": map[string]any{"command": []string{"agent"}}},
+		http.StatusCreated)["sandbox"].(map[string]any)
 	h.id, _ = created["id"].(string)
 	if s := h.object(t, http.MethodGet, h.sandboxPath("?wait_for=ready&wait=30"), nil, http.StatusOK); s["state"] != sandbox.StateReady {
 		t.Fatalf("the sandbox of %s = %v; want it ready", h.fork, s)
@@ -243,6 +250,28 @@ func TestSandboxUse_AnAgentUploadsAScriptRunsItAndDownloadsItsResult(t *testing.
 	}
 	if ops[1].Result != sandbox.ExecResultOK {
 		t.Errorf("the exec's record has the result %q; want %q", ops[1].Result, sandbox.ExecResultOK)
+	}
+	// The hub's own observer, the recorder of sandbox use, was told of each
+	// before the test's, and stored it as a run event of the session's run.
+	rows, err := h.Store.Analytics().QueryContext(context.Background(),
+		`SELECT event_type, session_id FROM run_events WHERE workspace = ? AND run_id = ? ORDER BY event_type`, h.fork, sandboxUseRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded []string
+	for rows.Next() {
+		var eventType, session string
+		if err := rows.Scan(&eventType, &session); err != nil {
+			t.Fatal(err)
+		}
+		recorded = append(recorded, eventType+" of "+session)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	of := " of " + h.session
+	if want := []string{"sandbox.download" + of, "sandbox.exec" + of, "sandbox.upload" + of}; !slices.Equal(recorded, want) {
+		t.Errorf("run events of %s and the run = %v; want %v", h.fork, recorded, want)
 	}
 	at := h.lastActivity(t)
 	if at.Before(before) || at.Before(downloadStart) || at.After(downloadEnd) {

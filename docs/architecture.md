@@ -42,7 +42,8 @@ command-line client. Both are written in Go, in the module
 | `internal/scm` | the source control API: the write gate every write route is built with (`writeRoute`, see [Source control writes](#source-control-writes)), the shared ref update step every write moves a ref through (`refupdate.go`: the push rule engine and the ref writer, reached as the interfaces `Rules` and `RefWriter` in `Deps`), the refs write routes (`refs_write.go`: `POST /refs`, `PATCH` and `DELETE /refs/*name`), the commit route (`commit.go`: `POST /commits`, one commit from file operations through `gitrepo.ApplyOperations` and `CreateCommit`, its own body limit `DefaultMaxCommitSize`, 32 MiB, which `LimitCommitBody` replaces, and the commits' times from `Deps.Now`), the rebase route (`rebase.go`: `POST /rebase`, the branch replayed onto a revision through `gitrepo.Rebase`), the interface `ChangeLinker` (`linker.go`; `FindOpen`, `CheckOpening`, `Open`, registered with `(*Component).RegisterChangeLinker`), the interface `SessionLinker` (`session.go`; `Check`, registered with `(*Component).RegisterSessionLinker`, a refusal matching `scm.ErrUnknownSession`), the `parley.scm.commit` event (`scm.EventCommit`) handed to the ref writer as `ApplyRequest.Events`, and the read half: the `GET` routes under `/workspaces/:slug/scm` (`refs`, `refs/*name`, `commits`, `commits/:sha`, `tree`, `file`, `diff`, `compare`, `blame` and `search`), served by an `scm.Component` (zero value, `Bind(scm.Deps)`, `Routes()`), with the state check, the request recorder and the lookups every read shares (see [Source control reads](#source-control-reads)); and the one revision resolver every read (and every later write that takes a revision) goes through: `NewResolver(repo, view, defaultBranch)` over a workspace's repository (the interface `Repository`, which `*gitrepo.Repo` satisfies) and its ref view (the interface `RefView`, whose `Refs` lists `Ref{Name, SHA, Commit, Tracking}` and is read at most once per request; `RepoRefs(repo)` is the view of a workspace that is what its repository holds, every ref of it), `Resolve(ctx, rev)` and `ResolveOptional(ctx, rev)` (an empty `rev` is the head of the default branch), returning `Resolved{SHA, Full}`, `Full` set when the caller wrote the full 40-character id; a `rev` starting with `refs/` is that full ref name only, otherwise the branch or the tag of that name (both existing is ambiguous), otherwise 4 to 40 hexadecimal characters are a commit id; every failure to name exactly one commit, an expression such as `main~2`, `HEAD` or `--all` included, is the API error `ref_not_found` (404); `cache.go` gives every successful read its `ETag` and `Cache-Control` and answers `304` to a matching `If-None-Match` before the read's costly part; `commitObjects` builds the commit object of every route that answers commits, the change (`CommitChange{WorkspaceSlug, Number, Version}`) and session from the lookups and `stats` only where asked, and `params.go` holds the strict query readers (`true`/`false` booleans, RFC 3339 times, and `pathParam`, the one check of a repository path every route that takes `path` makes) the routes share; `tree.go` maps git's entries to the tree route's four types by mode (`120000` symlink, `160000` commit, a tree, any other blob); `file.go` serves a file raw (one byte range of `Range` honoured) or as JSON, refusing one over `Deps.MaxFileSize` (`DefaultMaxFileSize`, 32 MiB, when zero) before reading it; the handler wrapper bounds every read by `Deps.ReadTimeout` (`DefaultReadTimeout`, 30 s, when zero), answering `503 scm_timeout` or cutting the answer off; `diff.go` builds the file change object of every route that answers file changes (`FileChanges`, the commit route's `files=true` and the diff route) and serves the diff route: the merge base or `base` against `head`, then `ComputeDiff`, the diff computation the change diff of `internal/change` also calls: the `path` globs applied with `identity.MatchAny`, at most `MaxDiffFiles` (5,000) files and `MaxPatchBytes` (8 MiB) of patch text read through `DiffPatches` file by file, the patch form answered by `WritePatchText`; `compare.go` serves the compare route: `AheadBehind`, the first 200 commits of `CommitsBetween` as commit objects without `stats`, the first 5,000 file changes from the merge base to `head`, and `TrialRebase`, whose `gitrepo.ErrMergeCommit` is `400 merge_commits_unsupported` and whose `*gitrepo.ConflictReport` is the answer's `conflict`; `blame.go` serves the blame route: the file looked up with `LookupFile`, refused over 2 MiB or with a NUL byte in its first 8,000 bytes, its lines counted to check and cut the span, then `Blame`, each distinct commit of the ranges read once and built by `commitObjects` without `stats`; `search.go` serves the search route: `q` checked (1 to 500 characters, no NUL) with the strict booleans `regex` and `case_sensitive`, then `Grep` from the resolved commit, the `path` globs applied by `glob.go`, each line cut to its first 500 characters (runes, not bytes), git stopped once one match past the page is read, and `gitrepo.ErrInvalidPattern` answered `400 invalid_request` |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/secret` | the hub's secrets, whose values leave the hub through no response, log line or error: `LoadKeys` reads the operator's current key (`PARLEY_SECRETS_KEY`, or the file `[secrets].key_file` names) and previous key (`PARLEY_SECRETS_KEY_PREVIOUS`), each standard padded base64 of 32 bytes, into `Keys`, whose keys print, log and encode as JSON as `[key]` (an absent key encodes as `null`); `Seal` and `Open` seal a value with AES-256-GCM under the current key, a fresh 12-byte nonce and a binding of its owner as additional data, and open it with the current or the previous key by the `KeyID` (the first 8 bytes of the key's SHA-256 in hex) it carries; `SealValue`, `OpenValue` and `NeedsReseal` do the same for values that are not named secrets, with the key id in front of the sealed bytes; `Component` (the hub uses its zero value, bound once at start by `Bind(Deps)` to the store, the keys, the clock, the scrubber and the event log; `New(Deps)` builds a bound one; table `secrets`, created by `SchemaStep`, unique on scope, scope id and the key with A to Z lowered) is the one place secrets are read, stored and removed, in the scopes `ScopeUser`, `ScopeOrg` and `ScopeWorkspace`: `Get` reads one secret of exactly one scope on every call, matching the key ignoring ASCII case, registers the value with the scrubber and fails a value no key opens with `ErrUnreadable`, never as absent; `Put`, `Delete`, `RemoveScope` and the package function `RemoveWorkspace` change secrets inside the caller's transaction and write no event; `CreateEntries` (all or nothing, the limit of 100 checked before a conflict), `ListPage`, `UpdateEntry`, `DeleteEntry` and `Count` serve the secret routes; `Routes` are the secret routes and `ScopeCheck` the access check that resolves a route's scope from its `MarkScope` mark; `Available` reports whether a current key is configured; `StartReport` counts the stored values whose key id is neither configured key's and `(StartReport).Log` writes the start lines; `Reencrypt` is the maintenance task that re-seals the values under the previous key with the current one and runs the `Converter`s other parts add with `RegisterConverter`; `ErrUnavailable` (no current key), `ErrUnreadable` (no configured key opens the value), `ErrInvalid`, `ErrLimitReached`, `ErrConflict` and `ErrNotFound` are the errors to match, and `UnavailableError` is the `503 secrets_unavailable` the REST API answers for `ErrUnavailable`; the same component keeps variables, readable values in the same three scopes (table `variables`, `VarSchemaStep`): `CreateVars`, `ListVars`, `UpdateVar`, `DeleteVar` and `VarRoutes` serve the variable routes, `RemoveVarScope` and `RemoveWorkspaceVars` remove a scope's variables inside the caller's transaction, `Chain` is a workspace's resolution chain (`Step`, `Origin`, `ErrWorkspaceNotFound`), `ResolveVars` the variables it runs with and `ResolveSecrets` the secrets of a list of names along it, `ResolveSecretsIn` the same with the chain's records read through the caller's transaction |
-| `internal/session` | the agent sessions: the session record, its token usage and its links to forks, change versions, pushes, commits, claims, lands and sandboxes (`SchemaStep`), the routes `POST /sessions`, `GET /sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, `POST` and `GET /sessions/:id/usage` and `GET /workspaces/:slug/cost`, the session-linking rule (`Check`, `ErrUnknownSession`), the recording operation (`Record`, `Link` and its constructors), the forced close (`CloseActive`), and the usage observers and active-session counts for the metrics (`OnUsage`, `ActiveCounts`); see [Agent sessions](#agent-sessions) |
+| `internal/session` | the agent sessions: the session record, its token usage and its links to forks, change versions, pushes, commits, claims, lands and sandboxes (`SchemaStep`), the routes `POST /sessions`, `GET /sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, `POST` and `GET /sessions/:id/usage` and `GET /workspaces/:slug/cost`, the session-linking rule (`Check`, `ErrUnknownSession`), the recording operation (`Record`, `Link` and its constructors), the forced close (`CloseActive`), the usage observers and active-session counts for the metrics (`OnUsage`, `ActiveCounts`), and the run id of a session for the record of sandbox use (`RunOf`); see [Agent sessions](#agent-sessions) |
+| `internal/telemetry` | agent telemetry: run events, session outcomes, tool calls, tool errors and trace records stored once per id, and one postmortem per workspace and run, in the analytical store (`SchemaSteps`); the eight ingestion routes under `/workspaces/:slug/runs/:run_id`, single and in batches; the key `[audit].write_timeout` (`ConfigKey`, `WriteTimeoutFrom`); the recorder of sandbox use (`RecordSandboxUse`, `SandboxExec`, `SandboxAttach`, `SandboxUpload`, `SandboxDownload`); and the run event observers (`OnRunEvent`); see [Agent telemetry](#agent-telemetry) |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
@@ -5197,8 +5198,8 @@ reach it after the fork is gone. Usage and links go with their session
 package that takes a session id; it declares what it needs in
 `session.go` and the hub part adapts the hub's components to it.
 
-`composeSessions` (`internal/hub/session.go`) is the last of the parts,
-since it registers with components the earlier parts create. It adds the
+`composeSessions` (`internal/hub/session.go`) comes after every part whose
+component it registers with. It adds the
 schema step and the routes, and binds the component in its start hook
 `sessions` with `session.Deps`: the store and the hub's clock, `Access`
 (the access rule's `Decide` and `Readable`), `Workspaces` (the minimal
@@ -5259,6 +5260,84 @@ teardown set (ADR 07): an archive calls it, under its savepoint, for the
 workspace and its forks, and `RemoveOwned` calls it for every workspace or
 fork it removes, with the reason as text. It registers no remover of
 session records.
+
+### Agent telemetry
+
+`internal/telemetry` keeps what agents report about their runs, in six
+tables of the analytical store, one schema step each (`SchemaSteps`:
+`telemetry_run_events`, `telemetry_session_outcomes`,
+`telemetry_tool_calls`, `telemetry_tool_errors`, `telemetry_traces`,
+`telemetry_postmortems`; tables `run_events`, `session_outcomes`,
+`tool_calls`, `tool_errors`, `traces`, `postmortems`). Each kind is keyed by
+its own `id`, so one UUID may name records of two kinds; each table has an
+index on `(workspace, run_id, timestamp, id)` for the reads of a run in time
+order, and `postmortems` a unique index on `(workspace, run_id)`. A client
+timestamp is stored in a fixed-width form (`2006-01-02T15:04:05.000000Z`) so
+that the column sorts as time does, and answered in RFC 3339 without
+trailing zeros; JSON members are stored as JSON text and answered as raw
+JSON. Nothing is written to the event log, and no workspace remover is
+registered: telemetry outlives its workspace.
+
+`composeTelemetry` (`internal/hub/telemetry.go`) is the last of the parts,
+since it reads the session component. It registers the key
+`[audit].write_timeout` (`ConfigKey`, read with `WriteTimeoutFrom`), the
+schema steps and the routes, and binds the component in its start hook
+`telemetry` with `telemetry.Deps`: `DB` (`telemetry.SQL` over
+`Store.Analytics()`), the hub's clock and logger, `WriteTimeout`, and
+`Sessions` (the session component, through `RunOf`). Tests change the
+dependencies with `AdjustTelemetry`; the component is `Telemetry()`.
+
+- **One gate.** Every ingestion route is built by `ingest` (`gate.go`):
+  `Scope` `audit:write` and the access need `write`, so the pipeline's
+  scope and access checks answer first; the handler then checks the path's
+  `run_id`, runs the route's validator, refuses an archived workspace with
+  `409 workspace_archived`, and acts. A write the write limit ends is
+  answered `503 unavailable` with `Retry-After: 5`. The six single-record
+  routes are creating `POST`s (`single`); the two batch routes are not.
+- **One reader per kind.** `fields` (`validate.go`) reads a body member by
+  member, a violation being `400 invalid_request` whose message starts with
+  the member's name; `readHead` gives every kind but the postmortem its
+  `id` and `timestamp` defaults (the postmortem's reader builds its own
+  head, with a generated id and the hub's time, whatever the body sends),
+  and the readers of run events and traces serve the single routes and the
+  batches alike.
+- **One write.** `(*Component).write` (`store.go`) runs one transaction of
+  the analytical store under `context.WithTimeout` of the write limit and
+  rolls it back on any failure; a failure whose limit's context has ended
+  counts as a timeout whatever its text. SQLite waits for another
+  connection's write lock in its busy handler without looking at the
+  context, so `SQL`, the adapter over `*sql.DB`, begins each transaction
+  on a connection of its own whose `busy_timeout` it cuts to the time left
+  and restores before the connection goes back to the pool (a connection
+  it cannot restore is discarded): the wait for the lock ends with the
+  limit too. The analytical store's `BEGIN`
+  takes the write lock (`IMMEDIATE`), so `storeOnce`, which reads an id and
+  inserts the record only when it is new, stores each id once however
+  many requests race: the others read what it stored. A replay is answered
+  from the stored row, an id of another workspace or run is `409
+  conflict`. The postmortem does the same keyed on `(workspace, run_id)`.
+  `DB` and `Tx` are narrow interfaces, so that tests inject store faults.
+- **Batches.** `batch.go` reads the array, judges each item with its
+  kind's reader, and classifies and stores the valid ones in one `write`:
+  accepted, duplicate (stored in this run, or earlier in the batch), or an
+  error (stored in another workspace or run).
+- **Sandbox use.** `composeTelemetry` registers an observer with
+  `c.Sandbox().RegisterObserver` that turns a `sandbox.Operation` into one
+  of `SandboxExec`, `SandboxAttach`, `SandboxUpload` and `SandboxDownload`
+  (`sandboxUseOf`; an exec's `Result` is dropped) and calls
+  `(*Component).RecordSandboxUse`. It reads the session's run id with
+  `RunOf`, stores nothing without one, and otherwise writes one run event
+  under `context.WithoutCancel` and the write limit, without an access or
+  status check; a failure is one log line naming the workspace, the
+  sandbox and the event type. The operation values have no field for what
+  an operation carried.
+- **Run event observers.** `OnRunEvent(RunEventObserver)` registers a
+  function told the `event_type` of every run event newly stored, by a
+  single route, a batch or the recorder, after the write has committed
+  (`observer.go`); nothing else is reported. An observer that panics is
+  logged with the event type and the next one is called, so the answer
+  does not depend on it. No part registers one yet:
+  the metrics of the audit records will.
 
 ### Carry-patch workspaces
 
@@ -6947,8 +7026,8 @@ from the caller once a minute, and the collector on each stored process line.
 The end adds one to `ExecMetric` (`parley_sandbox_exec_total{result}`) for an
 exec, and then calls each `Observer` registered with `RegisterObserver` with
 an `Operation`, in registration order, each under `recover`; a failure is
-logged and changes nothing. This package registers no observer: the telemetry
-recorder of a later package does.
+logged and changes nothing. The telemetry part registers the recorder of
+sandbox use as one (see [Agent telemetry](#agent-telemetry)).
 
 ## The life of a sandbox
 
