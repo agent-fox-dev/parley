@@ -78,10 +78,16 @@ func (r ingestionRoute) stored() int {
 // each with a valid body; the gate's tables run over all of them.
 var ingestionRoutes = []ingestionRoute{
 	{path: "/events", valid: func() any { return map[string]any{"event_type": "run.start"} }},
+	{path: "/sessions/outcomes", valid: func() any {
+		return map[string]any{"session_id": "0a1b2c3d-0000-4000-8000-0000000000aa", "status": "completed"}
+	}},
+	{path: "/tools/calls", valid: func() any { return map[string]any{"tool_name": "bash"} }},
+	{path: "/tools/errors", valid: func() any { return map[string]any{"tool_name": "bash", "error_msg": "exit 1"} }},
+	{path: "/traces", valid: func() any { return map[string]any{"event_type": "tool.use"} }},
 }
 
 // recordTables are the analytical store's tables of telemetry records.
-var recordTables = []string{"run_events"}
+var recordTables = []string{"run_events", "session_outcomes", "tool_calls", "tool_errors", "traces"}
 
 // world is a hub on a settable clock whose analytical store fails every
 // write while failWrites is set, with the seed: alice owns every workspace

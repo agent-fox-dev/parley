@@ -72,6 +72,46 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	return err
 }
 
+// insertOutcome stores the session outcome o.
+func insertOutcome(ctx context.Context, tx Tx, o outcome) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO session_outcomes (id, workspace, run_id, timestamp, ingested_at, session_id, status, node_id, duration_ms, token_usage)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.ID, o.Workspace, o.RunID, o.Timestamp.stored(), timefmt.Format(time.Time(o.IngestedAt)), o.SessionID, o.Status,
+		o.NodeID, o.DurationMS, nullableJSON(o.TokenUsage))
+	return err
+}
+
+// insertToolCall stores the tool call tc.
+func insertToolCall(ctx context.Context, tx Tx, tc toolCall) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO tool_calls (id, workspace, run_id, timestamp, ingested_at, tool_name, node_id, session_id, duration_ms, input, output)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		tc.ID, tc.Workspace, tc.RunID, tc.Timestamp.stored(), timefmt.Format(time.Time(tc.IngestedAt)), tc.ToolName,
+		tc.NodeID, tc.SessionID, tc.DurationMS, nullableJSON(tc.Input), nullableJSON(tc.Output))
+	return err
+}
+
+// insertToolError stores the tool error te.
+func insertToolError(ctx context.Context, tx Tx, te toolError) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO tool_errors (id, workspace, run_id, timestamp, ingested_at, tool_name, error_msg, error_code, node_id, session_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		te.ID, te.Workspace, te.RunID, te.Timestamp.stored(), timefmt.Format(time.Time(te.IngestedAt)), te.ToolName,
+		te.ErrorMsg, te.ErrorCode, te.NodeID, te.SessionID)
+	return err
+}
+
+// insertTrace stores the trace record tr.
+func insertTrace(ctx context.Context, tx Tx, tr trace) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO traces (id, workspace, run_id, timestamp, ingested_at, event_type, node_id, session_id, sequence, data)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		tr.ID, tr.Workspace, tr.RunID, tr.Timestamp.stored(), timefmt.Format(time.Time(tr.IngestedAt)), tr.EventType,
+		tr.NodeID, tr.SessionID, tr.Sequence, nullableJSON(tr.Data))
+	return err
+}
+
 // nullableJSON is the JSON text raw as a column value: NULL when raw is nil.
 func nullableJSON(raw []byte) any {
 	if raw == nil {

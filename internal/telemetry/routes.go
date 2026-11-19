@@ -1,6 +1,7 @@
 // Package telemetry stores what agents report about their runs: run
-// events, validated and stored once under their id in the analytical store,
-// so that a run can be audited later.
+// events, session outcomes, tool calls, tool errors and trace records,
+// validated and stored once under their id in the analytical store, so
+// that a run can be audited later.
 //
 // Every ingestion route is a POST under
 // /workspaces/:slug/runs/:run_id/, built by one gate (ingest) that needs the
@@ -48,5 +49,9 @@ func (c *Component) Bind(d Deps) {
 func (c *Component) Routes() []server.Route {
 	return []server.Route{
 		c.ingest("/events", true, single(c.postRunEvent)),
+		c.ingest("/sessions/outcomes", true, single(postRecord(c, "session outcome", c.readOutcome, insertOutcome))),
+		c.ingest("/tools/calls", true, single(postRecord(c, "tool call", c.readToolCall, insertToolCall))),
+		c.ingest("/tools/errors", true, single(postRecord(c, "tool error", c.readToolError, insertToolError))),
+		c.ingest("/traces", true, single(postRecord(c, "trace record", c.readTrace, insertTrace))),
 	}
 }
