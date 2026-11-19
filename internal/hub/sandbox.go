@@ -35,6 +35,12 @@ const (
 	// each follower returns once its runtime stream ends with its context.
 	sandboxLogCollectorWork  = "sandbox_log_collector"
 	sandboxLogCollectorGrace = 5 * time.Second
+	// sandboxPolicyCollectorWork is the name of the policy collector's
+	// background work, and sandboxPolicyCollectorGrace how long the stop
+	// waits for it: each follower returns once its runtime stream ends with
+	// its context.
+	sandboxPolicyCollectorWork  = "sandbox_policy_collector"
+	sandboxPolicyCollectorGrace = 5 * time.Second
 	// sandboxLifecycleWork is the name of the lifecycle loop's background
 	// work, and sandboxLifecycleGrace how long the stop waits for it: a
 	// pass returns before its next runtime call once its context ends.
@@ -102,7 +108,13 @@ const (
 // the service's stop, DELETE /workspaces/:slug/sandboxes/:id deletes a
 // sandbox through the service's delete, which runs the delete hooks, and
 // PATCH /workspaces/:slug/sandboxes/:id sets a sandbox's ttl, purpose and
-// labels through the service's extend.
+// labels through the service's extend. GET
+// /workspaces/:slug/sandboxes/:id/proposals lists a sandbox's network
+// proposals in one state, open by default, and POST
+// …/proposals/:proposal_id/approve and …/reject decide one. GET
+// /workspaces/:slug/sandbox-rules lists the workspace sandbox rules of the
+// workspace, or of the parent of a task fork, and DELETE
+// /workspaces/:slug/sandbox-rules/:rule_id deletes one.
 //
 // A workspace's deletion has the service delete the sandboxes of the
 // workspace and its forks first, by the system, with reason
@@ -208,6 +220,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.StartRoute())
 	c.AddRoute(svc.DeleteRoute())
 	c.AddRoute(svc.ExtendRoute())
+	composeNetworkPolicy(c, svc)
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
@@ -247,28 +260,58 @@ func composeSandbox(c *Composition) {
 	composeSandboxWork(c, svc)
 }
 
+// composeNetworkPolicy adds the tables and the routes of the network policy
+// of sandboxes: the workspace sandbox rules, the rules approved for a
+// sandbox, the destinations each sandbox was reported denied, its
+// proposals and how far its policy log was taken, created whether
+// sandboxes are on or not, and the routes that list a sandbox's proposals,
+// approve and reject one, and list and delete a workspace's sandbox rules.
+func composeNetworkPolicy(c *Composition, svc *sandbox.Service) {
+	c.AddSchemaStep(sandbox.RuleSchemaStep)
+	c.AddSchemaStep(sandbox.ApprovedRuleSchemaStep)
+	c.AddSchemaStep(sandbox.DenialSchemaStep)
+	c.AddSchemaStep(sandbox.ProposalSchemaStep)
+	c.AddSchemaStep(sandbox.PolicyLogSchemaStep)
+	c.AddRoute(svc.ProposalsRoute())
+	c.AddRoute(svc.ApproveRoute())
+	c.AddRoute(svc.RejectRoute())
+	c.AddRoute(svc.RulesRoute())
+	c.AddRoute(svc.RuleDeleteRoute())
+}
+
 // registerSandboxCollaborators registers what the sandbox service takes
 // part in while the hub composes: the purge hook of the stored logs, the
-// service as its own restorer of checkpoints, and the service on the
+// delete hook that withdraws a deleted sandbox's open proposals, the purge
+// hook that removes a sandbox's proposals, reported denials and approved
+// rules with its record, the service as its own restorer of checkpoints, the network-policy feature's
+// workspace rule provider and policy composer (RegisterNetworkPolicy),
+// through which a create records the workspace sandbox rules and every
+// provisioning composes the policy value, and the service on the
 // workspaces' collaborator set (ADR 07), through which a workspace's
 // archive and deletion reach its sandboxes whether sandboxes are on or not:
 // with them off the records are still deleted and removed, and no runtime
-// is called.
+// is called. The removal of a workspace also removes the workspace sandbox
+// rules it holds (RemoveWorkspaceRules), in its transaction.
 func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
 	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
+	svc.RegisterDeleteHook(sandbox.WithdrawProposals)
+	svc.RegisterPurgeHook(sandbox.PurgeNetworkPolicy)
 	svc.RegisterRestorer(svc)
+	svc.RegisterNetworkPolicy()
 	td := c.workspaces.Teardown()
 	td.RegisterSandboxRemover(svc)
 	td.RegisterArchiveObserver(svc)
 	td.RegisterRemover(svc.RemoveWorkspaceRecords)
+	td.RegisterRemover(sandbox.RemoveWorkspaceRules)
 }
 
 // composeSandboxWork adds the sandbox feature's work besides the requests,
 // after the runtime check's start hook: the start hooks that resume the
 // provisionings an earlier process left and run the first reconcile pass,
-// the background work of the provisioner, the log collector, the idle and
-// expiry passes and the reconciliation, and the maintenance tasks of log
-// retention and record cleanup. With sandboxes off each returns at once.
+// the background work of the provisioner, the log collector, the policy
+// collector, the idle and expiry passes and the reconciliation, and the
+// maintenance tasks of log retention and record cleanup. With sandboxes off
+// each returns at once.
 func composeSandboxWork(c *Composition, svc *sandbox.Service) {
 	c.AddStartHook(sandboxProvisionerHook, func(ctx context.Context, _ *Runtime) error {
 		if !svc.Enabled() {
@@ -287,6 +330,9 @@ func composeSandboxWork(c *Composition, svc *sandbox.Service) {
 	})
 	c.AddBackgroundWork(sandboxLogCollectorWork, sandboxLogCollectorGrace, func(ctx context.Context, _ *Runtime) {
 		svc.CollectLogs(ctx)
+	})
+	c.AddBackgroundWork(sandboxPolicyCollectorWork, sandboxPolicyCollectorGrace, func(ctx context.Context, _ *Runtime) {
+		svc.CollectPolicy(ctx, c.sandboxPolicyCollector)
 	})
 	c.AddBackgroundWork(sandboxLifecycleWork, sandboxLifecycleGrace, func(ctx context.Context, _ *Runtime) {
 		svc.RunLifecycle(ctx)
@@ -329,6 +375,14 @@ func (c *Composition) SetSandboxRuntime(f sandbox.RuntimeFactory) {
 // with it.
 func (c *Composition) AdjustSandbox(fn func(*sandbox.Deps)) {
 	c.sandboxAdjusters = append(c.sandboxAdjusters, fn)
+}
+
+// SetSandboxPolicyCollector sets the options of the policy collector the
+// hub runs with sandboxes on: shorter intervals for a run that cannot wait
+// for the defaults, or Hold for a test that drives a collector's passes
+// itself.
+func (c *Composition) SetSandboxPolicyCollector(o sandbox.PolicyCollectorOptions) {
+	c.sandboxPolicyCollector = o
 }
 
 // SetSandboxRecorder sets the recorder the sandbox feature and its runtime

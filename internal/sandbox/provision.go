@@ -485,15 +485,21 @@ func (p *provisioning) steps(ctx context.Context) error {
 		}
 		p.rec.RuntimeCreated = false
 	}
-	env, policy, err := p.configure(ctx)
+	env, err := p.configure(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = p.client.CreateSandbox(ctx, runtime.SandboxSpec{
-		Name: id, Image: p.rec.Image, CPU: p.rec.CPU, Memory: p.rec.Memory, GPU: p.rec.GPU, WorkDir: WorkDir,
-		Env: env, Policy: policy, Providers: slices.Clone(p.providers), Labels: map[string]string{LabelSandbox: id},
+	err = p.withPolicy(ctx, func(policy runtime.Policy) error {
+		_, err := p.client.CreateSandbox(ctx, runtime.SandboxSpec{
+			Name: id, Image: p.rec.Image, CPU: p.rec.CPU, Memory: p.rec.Memory, GPU: p.rec.GPU, WorkDir: WorkDir,
+			Env: env, Policy: policy, Providers: slices.Clone(p.providers), Labels: map[string]string{LabelSandbox: id},
+		})
+		return err
 	})
+	var composeErr *stepError
 	switch {
+	case errors.As(err, &composeErr):
+		return err
 	case errors.Is(err, runtime.ErrInvalid):
 		// The runtime refused the sandbox or its policy value: the composer
 		// knows what in its value that refers to.
@@ -529,12 +535,17 @@ func (p *provisioning) steps(ctx context.Context) error {
 // again when the sandbox has a command.
 func (p *provisioning) startSteps(ctx context.Context) error {
 	id := p.rec.ID
-	env, policy, err := p.configure(ctx)
+	env, err := p.configure(ctx)
 	if err != nil {
 		return err
 	}
-	err = p.client.StartSandbox(ctx, id, runtime.StartSpec{Policy: policy, Env: env})
+	err = p.withPolicy(ctx, func(policy runtime.Policy) error {
+		return p.client.StartSandbox(ctx, id, runtime.StartSpec{Policy: policy, Env: env})
+	})
+	var composeErr *stepError
 	switch {
+	case errors.As(err, &composeErr):
+		return err
 	case errors.Is(err, runtime.ErrInvalid):
 		return &stepError{reason: ReasonProvisionFailed, err: errors.New(p.composer.Explain(p.rec, err))}
 	case err != nil:
@@ -562,39 +573,55 @@ func (p *provisioning) startSteps(ctx context.Context) error {
 	return nil
 }
 
-// configure readies what the runtime's sandbox is created or started with:
-// it resolves the sandbox's credentials and exposed secrets, takes its hub
-// credential (hubCredential), keeps both as the values its text is
-// scrubbed of, registers their providers, and returns the environment and
-// the policy value of the composer.
-func (p *provisioning) configure(ctx context.Context) (map[string]string, runtime.Policy, error) {
+// configure readies what the runtime's sandbox is created or started with
+// besides its policy value: it resolves the sandbox's credentials and
+// exposed secrets, takes its hub credential (hubCredential), keeps both as
+// the values its text is scrubbed of, registers their providers, and
+// returns the environment.
+func (p *provisioning) configure(ctx context.Context) (map[string]string, error) {
 	s, id := p.s, p.rec.ID
 	res, err := s.Resolve(ctx, p.rec.Workspace, attachedSnapshot(p.rec))
 	if err != nil {
-		return nil, runtime.Policy{}, failed(ReasonProvisionFailed, "resolve the secrets", err)
+		return nil, failed(ReasonProvisionFailed, "resolve the secrets", err)
 	}
 	if err := res.Missing(); err != nil {
-		return nil, runtime.Policy{}, &stepError{reason: ReasonCredentialMissing, err: err}
+		return nil, &stepError{reason: ReasonCredentialMissing, err: err}
 	}
 	p.values = res.Values()
 	hub, err := p.hubCredential(ctx)
 	if err != nil {
-		return nil, runtime.Policy{}, err
+		return nil, err
 	}
 	p.values.HubCredential = hub
 	s.SetValues(id, p.values)
 	if err := p.registerProviders(ctx, res, hub); err != nil {
-		return nil, runtime.Policy{}, err
+		return nil, err
 	}
 	env, err := s.environment(ctx, p.client, p.rec, res)
 	if err != nil {
-		return nil, runtime.Policy{}, failed(ReasonProvisionFailed, "build the environment", err)
+		return nil, failed(ReasonProvisionFailed, "build the environment", err)
 	}
+	return env, nil
+}
+
+// withPolicy composes the sandbox's policy value and hands it to give,
+// which creates or starts the runtime's sandbox with it, and returns give's
+// error, or a *stepError when the composition fails. Both run in the
+// sandbox's decision turn, which the decisions of its proposals hold from
+// their first read to their commit (see decide), so that an approval is
+// either stored before the composition reads the approved rules or adds
+// its rule after the runtime took the composed value, which would
+// otherwise replace a rule added meanwhile. The provisioning holds no
+// other turn of the service while it holds this one; a decision takes the
+// holding workspace's promotion turn only inside it, so the order of the
+// two is always decision, then promotion.
+func (p *provisioning) withPolicy(ctx context.Context, give func(runtime.Policy) error) error {
+	defer p.s.deciding.lock(p.rec.ID)()
 	policy, err := p.composer.Compose(ctx, p.rec)
 	if err != nil {
-		return nil, runtime.Policy{}, failed(ReasonProvisionFailed, "compose the policy", err)
+		return failed(ReasonProvisionFailed, "compose the policy", err)
 	}
-	return env, policy, nil
+	return give(policy)
 }
 
 // attachedSnapshot is the part of rec's snapshot a provisioning resolves:

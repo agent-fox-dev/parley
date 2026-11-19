@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
 
 // useEntryOf is the entry of the route that uses a sandbox named name
@@ -52,4 +54,35 @@ func CheckpointTurns(s *Service, id string) int {
 		return e.users
 	}
 	return 0
+}
+
+// DecisionTurns is how many decisions and provisionings of the sandbox id
+// hold or wait for its decision turn.
+func DecisionTurns(s *Service, id string) int {
+	l := &s.deciding
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.held[id]; e != nil {
+		return e.users
+	}
+	return 0
+}
+
+// PolicyFollowers returns the ids of the sandboxes whose policy log the
+// collector c follows: those of its followers that have not stopped.
+func PolicyFollowers(c *PolicyCollector) []string { return c.following() }
+
+// ReportDenial stores the denial e of the sandbox rec, with its log taken
+// up to e, and writes its event when it is the sandbox's first of its
+// destination, as the policy collector does; e's time is the hub's clock's
+// when it has none.
+func ReportDenial(s *Service, ctx context.Context, rec Record, e runtime.LogEntry) error {
+	v, err := s.ValuesOf(ctx, rec.ID)
+	if err != nil {
+		return err
+	}
+	if e.Time.IsZero() {
+		e.Time = s.deps.Now()
+	}
+	return s.reportDenial(ctx, rec, v, e, logPoint{at: e.Time, n: 1})
 }

@@ -1245,6 +1245,11 @@ stderr as received, with exit status `1`; on a hub without sandboxes:
 | `parley sandbox start <workspace-slug> <id> [--wait]` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/start` |
 | `parley sandbox extend <workspace-slug> <id> --ttl <duration>` | `PATCH /api/v1/workspaces/<slug>/sandboxes/<id>` |
 | `parley sandbox delete <workspace-slug> <id> [--no-checkpoint]` | `DELETE /api/v1/workspaces/<slug>/sandboxes/<id>` |
+| `parley sandbox proposals <workspace-slug> <id> [--state <state>]` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>/proposals` |
+| `parley sandbox approve <workspace-slug> <id> <proposal-id> [flags]` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/proposals/<proposal-id>/approve` |
+| `parley sandbox reject <workspace-slug> <id> <proposal-id> [--comment <text>]` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/proposals/<proposal-id>/reject` |
+| `parley sandbox rules <workspace-slug> [--limit <n>] [--cursor <cursor>]` | `GET /api/v1/workspaces/<slug>/sandbox-rules` |
+| `parley sandbox rule-delete <workspace-slug> <rule-id>` | `DELETE /api/v1/workspaces/<slug>/sandbox-rules/<rule-id>` |
 
 `parley sandbox` run without a command prints its help and exits `0`; it
 reads no credential and sends no request. The slug and the id are sent as
@@ -1359,6 +1364,40 @@ nothing.
 An error the hub answers, such as `409 sandbox_deleted` for a start of a
 deleted sandbox, is written to stderr as received, with nothing on stdout
 and exit status `1`.
+
+#### `parley sandbox proposals`, `approve`, `reject`, `rules` and `rule-delete`
+
+```
+parley sandbox proposals <workspace-slug> <id> [--state <state>]
+parley sandbox approve <workspace-slug> <id> <proposal-id> [--comment <text>] [--acknowledge-findings] [--scope sandbox|workspace]
+parley sandbox reject <workspace-slug> <id> <proposal-id> [--comment <text>]
+parley sandbox rules <workspace-slug> [--limit <n>] [--cursor <cursor>]
+parley sandbox rule-delete <workspace-slug> <rule-id>
+```
+
+They read and decide a sandbox's network-access proposals and the
+workspace sandbox rules (see
+[api.md](api.md#the-network-policy-of-a-sandbox)). Each sends one request
+and prints the hub's answer on stdout:
+
+- `proposals` sends `GET …/sandboxes/<id>/proposals`, with `state` only
+  when `--state` is given (the hub then lists the open ones).
+- `approve` sends `POST …/proposals/<proposal-id>/approve` with a JSON
+  object holding `comment` for `--comment`, `acknowledge_findings: true` for
+  `--acknowledge-findings` and `scope` for `--scope`, each only when its
+  flag is given, and `{}` when none is; it prints the proposal.
+- `reject` sends `POST …/proposals/<proposal-id>/reject` with `comment` for
+  `--comment`, else `{}`, and prints the proposal.
+- `rules` sends `GET /api/v1/workspaces/<slug>/sandbox-rules`, with `limit`
+  and `cursor` only for the flags given.
+- `rule-delete` sends `DELETE /api/v1/workspaces/<slug>/sandbox-rules/<rule-id>`
+  and on the hub's `204` prints `{"id":"<rule-id>","status":"deleted"}`.
+
+A wrong number of arguments, and a `--scope` other than `sandbox` or
+`workspace`, is a usage error (exit status `2`) and sends nothing. An error
+the hub answers, such as `409 findings_not_acknowledged`, `429
+sandbox_rule_limit_reached` or `404 sandbox_rule_not_found`, is written to
+stderr as received, with nothing on stdout and exit status `1`.
 
 #### `parley sandbox exec`
 

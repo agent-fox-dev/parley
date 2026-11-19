@@ -237,7 +237,9 @@ const probeBodyLimit = 1024
 // probeHub is a real hub with the sandbox probe routes, each declared with
 // the sandbox service's declarations, and the workspace ws owned by owner in
 // the org team, of which member is a member and outsider is not. A probe
-// answers 200 and counts its calls.
+// answers 200 and counts its calls. The probe hubs, the profiles hub, the
+// list hub and the use hub run no policy collector: its listing of the
+// runtime's proposals would stand beside the calls their tests count.
 type probeHub struct {
 	*hubtest.Hub
 	// rt is the runtime of a hub with sandboxes on; nil with sandboxes off.
@@ -273,6 +275,7 @@ func startProbeHub(t *testing.T, on bool) *probeHub {
 	cfg.Compose = func(c *hub.Composition) {
 		svc := c.Sandbox()
 		if on {
+			c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 			c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 				return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 			})
@@ -394,6 +397,7 @@ func startProfilesHub(t *testing.T) (*probeHub, string) {
 	cfg := profilesFile
 	cfg.Compose = func(c *hub.Composition) {
 		svc = c.Sandbox()
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 		})
@@ -463,6 +467,7 @@ func startListHub(t *testing.T, src sandbox.Source) *probeHub {
 	h := &probeHub{rt: runtimetest.New(t)}
 	cfg := sandboxesOn
 	cfg.Compose = func(c *hub.Composition) {
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 		})
@@ -674,7 +679,8 @@ var secretsKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 // resolution that the test can make fail, and a minter in front of the
 // hub's minting component that keeps the values it minted and that the test
 // can make fail. The runtime holds the provider profiles anthropic and
-// mirror of credentialTables.
+// mirror of credentialTables. The hub runs no policy collector, whose calls
+// would stand beside those its tests check.
 type createHub struct {
 	*probeHub
 	svc        *sandbox.Service
@@ -698,6 +704,8 @@ type createHub struct {
 	timers *timerLog
 	// limits are the sandbox limits its creates are held to.
 	limits *quotaLimits
+	// proposalSeeds counts the proposals seedProposal stored.
+	proposalSeeds atomic.Int64
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
 	// base is the commit main of demo points at in a create world.
@@ -747,6 +755,7 @@ func newCreateHub(t *testing.T, rt *runtimetest.Fake, profiles string, provision
 		h.svc.RegisterSessionLinker(h.linker)
 		c.Forks().RegisterSessionLinker(h.forkLinker)
 		c.SetSandboxRecorder(h.rec)
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
 			h.minter.next, d.Mint = d.Mint, h.minter.mint
@@ -917,11 +926,16 @@ func (h *createHub) seedRecord(t *testing.T, ws, state string, edit func(*sandbo
 // credential, under ctx, and delivers the answer on the channel it returns:
 // with status 0 when the request got none, as when ctx ended first.
 func (h *createHub) getting(ctx context.Context, path, cred string) <-chan answer {
+	return h.sending(ctx, http.MethodGet, path, cred)
+}
+
+// sending is getting for a request of any method, with no body.
+func (h *createHub) sending(ctx context.Context, method, path, cred string) <-chan answer {
 	out := make(chan answer, 1)
 	go func() {
 		var a answer
 		defer func() { out <- a }()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.URL("/api/v1"+path), nil)
+		req, err := http.NewRequestWithContext(ctx, method, h.URL("/api/v1"+path), nil)
 		if err != nil {
 			return
 		}
@@ -1249,10 +1263,11 @@ func (h *createHub) count(t *testing.T, query string, args ...any) int {
 const defaultHead = "0123456789abcdef0123456789abcdef01234567"
 
 // runtimeHooks steer the provisioning's runtime calls of a create hub: hook,
-// when set, is called before each EnsureProvider, CreateSandbox, WaitReady
-// and RunMain with the operation and the provider's or sandbox's name, and
-// an error it returns is the call's; it is called after each StopSandbox
-// the runtime carried out, while its caller still waits for the answer. exec, when set, is asked before each
+// when set, is called before each EnsureProvider, CreateSandbox,
+// StartSandbox, WaitReady and RunMain with the operation and the provider's
+// or sandbox's name, and an error it returns is the call's; it is called
+// after each StopSandbox and AddPolicyRule the runtime carried out, while
+// its caller still waits for the answer. exec, when set, is asked before each
 // Exec: an error it returns is the call's, and a non-zero code ends the
 // command with that code and stderr. They keep the command of each RunMain
 // and, in one log, every command run in a sandbox, every main-process start
@@ -1380,6 +1395,20 @@ func (c *hookedClient) CreateSandbox(ctx context.Context, spec runtime.SandboxSp
 		return runtime.SandboxStatus{}, err
 	}
 	return c.Client.CreateSandbox(ctx, spec)
+}
+
+func (c *hookedClient) StartSandbox(ctx context.Context, name string, spec runtime.StartSpec) error {
+	if err := c.hooks.before(ctx, runtime.OpStartSandbox, name); err != nil {
+		return err
+	}
+	return c.Client.StartSandbox(ctx, name, spec)
+}
+
+func (c *hookedClient) AddPolicyRule(ctx context.Context, name string, rule runtime.Rule) error {
+	if err := c.Client.AddPolicyRule(ctx, name, rule); err != nil {
+		return err
+	}
+	return c.hooks.before(ctx, runtime.OpAddPolicyRule, name)
 }
 
 func (c *hookedClient) WaitReady(ctx context.Context, name string) (runtime.SandboxStatus, error) {
@@ -1541,7 +1570,7 @@ type hubEvent struct {
 
 // sandboxEvents returns the hub events of type typ about the sandbox id,
 // oldest first.
-func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
+func (h *probeHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 	t.Helper()
 	rows, err := h.Store.Main().Query(`SELECT actor_type, actor_id, metadata, resource_type, workspace, session_id FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
 	if err != nil {
@@ -1857,6 +1886,172 @@ func startProvisionWorld(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub
 	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
 	h.putSecret(t, secret.ScopeOrg, h.org, "NPM_TOKEN", npmSecret)
 	return h
+}
+
+// leakyProfile has the policy file of full, without credentials; nohubProfile
+// has no policy file and no hub access, and the credential model.
+const (
+	leakyProfile = "[[sandbox.profiles]]\nname = \"leaky\"\nttl = \"4h\"\npolicy = \"policy.yaml\"\n"
+	nohubProfile = "[[sandbox.profiles]]\nname = \"nohub\"\nttl = \"4h\"\nhub_access = \"none\"\ncredentials = [\"model\"]\n"
+)
+
+// startPolicyWorld is startProvisionWorld with the [sandbox] settings given
+// as TOML, the profiles leaky and nohub besides agent, full and plain, and
+// no sandbox limit a test reaches.
+func startPolicyWorld(t *testing.T, settings string) *createHub {
+	t.Helper()
+	h := startProvisionHub(t, settings+agentProfile+provisionProfile+plainProfile+leakyProfile+nohubProfile+credentialTables)
+	h.world(t)
+	h.AddMember(t, h.org, h.dana)
+	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
+	h.putSecret(t, secret.ScopeOrg, h.org, "NPM_TOKEN", npmSecret)
+	h.setLimits(limits{100, 100, 100, 100})
+	return h
+}
+
+// saveRule stores the workspace sandbox rule body on the workspace ws, with
+// the id id (a new one when ""), saved by dana at at, and returns it.
+func (h *createHub) saveRule(t *testing.T, ws, id, body string, at time.Time) sandbox.SandboxRule {
+	t.Helper()
+	if id == "" {
+		id = sandbox.NewRuleID()
+	}
+	r := sandbox.SandboxRule{
+		ID: id, Workspace: ws, Rule: json.RawMessage(body), Summary: "allow " + body,
+		Findings:  []runtime.Finding{{Severity: "low", Message: "a finding"}},
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"}, CreatedAt: at,
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.SaveRule(ctx, tx, r) })
+	return r
+}
+
+// fillRules stores n workspace sandbox rules on the workspace ws in one
+// transaction, each with its own rule {"host": "fill-<i>.<ws>.test"}, saved
+// by dana an hour before recordStart.
+func (h *createHub) fillRules(t *testing.T, ws string, n int) {
+	t.Helper()
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		for i := range n {
+			r := sandbox.SandboxRule{
+				ID: sandbox.NewRuleID(), Workspace: ws, Rule: json.RawMessage(fmt.Sprintf(`{"host":"fill-%d.%s.test"}`, i, ws)),
+				CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"}, CreatedAt: recordStart.Add(-time.Hour),
+			}
+			if err := sandbox.SaveRule(ctx, tx, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ruleCount is how many workspace sandbox rules the workspace ws holds.
+func (h *createHub) ruleCount(t *testing.T, ws string) int {
+	t.Helper()
+	n, err := sandbox.CountRules(context.Background(), h.Store.Main(), ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// ruleMap is the workspace sandbox rule object of r as a decoded answer
+// holds it: its seven members, findings [] without findings, from_proposal
+// null for a rule promoted from no proposal and created_at in RFC 3339,
+// UTC, whole seconds.
+func ruleMap(t *testing.T, r sandbox.SandboxRule) map[string]any {
+	t.Helper()
+	var rule any
+	if err := json.Unmarshal(r.Rule, &rule); err != nil {
+		t.Fatal(err)
+	}
+	findings := []any{}
+	for _, f := range r.Findings {
+		findings = append(findings, map[string]any{"severity": f.Severity, "message": f.Message})
+	}
+	var from any
+	if o := r.FromProposal; o != nil {
+		from = map[string]any{"sandbox_id": o.SandboxID, "proposal_id": o.ProposalID, "workspace": o.Workspace}
+	}
+	by := r.CreatedBy
+	return map[string]any{
+		"id": r.ID, "rule": rule, "summary": r.Summary, "findings": findings, "from_proposal": from,
+		"created_by": map[string]any{"actor_type": by.ActorType, "actor_id": by.ActorID, "username": by.Username},
+		"created_at": stamp(r.CreatedAt),
+	}
+}
+
+// readyIn creates a sandbox on slug with body, waits until it is ready and
+// returns its id.
+func (h *createHub) readyIn(t *testing.T, slug string, body map[string]any) string {
+	t.Helper()
+	_, rec := h.provisioned(t, slug, "", body)
+	if rec.State != sandbox.StateReady {
+		t.Fatalf("sandbox = %s %q; want ready", rec.State, rec.StateReason)
+	}
+	return rec.ID
+}
+
+// stopIn stops the ready sandbox id through the service, by the API.
+func (h *createHub) stopIn(t *testing.T, id string) {
+	t.Helper()
+	if _, err := h.svc.Stop(context.Background(), storedRecord(t, h.Hub, id), sandbox.StopAPI, sandbox.SystemActor); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// startAgain starts the sandbox id of the workspace slug with POST start,
+// waits until it leaves provisioning and returns its record then.
+func (h *createHub) startAgain(t *testing.T, slug, id string) sandbox.Record {
+	t.Helper()
+	if a := h.call(t, http.MethodPost, sandboxPath(slug, id)+"/start", h.key, nil); a.status != http.StatusOK {
+		t.Fatalf("POST start = %d %s; want 200", a.status, a.body)
+	}
+	return h.settled(t, id)
+}
+
+// composed is the policy value the hub composes for the sandbox id as
+// stored.
+func (h *createHub) composed(t *testing.T, id string) runtime.Policy {
+	t.Helper()
+	p, err := h.svc.ComposePolicy(context.Background(), storedRecord(t, h.Hub, id))
+	if err != nil {
+		t.Fatalf("ComposePolicy: %v", err)
+	}
+	return p
+}
+
+// provisionFailure checks that the sandbox rec failed provision_failed with
+// one fail event, and returns the event's error text.
+func (h *createHub) provisionFailure(t *testing.T, rec sandbox.Record) string {
+	t.Helper()
+	if rec.State != sandbox.StateFailed || rec.StateReason != sandbox.ReasonProvisionFailed {
+		t.Fatalf("sandbox = %s %q; want failed %s", rec.State, rec.StateReason, sandbox.ReasonProvisionFailed)
+	}
+	ev := h.sandboxEvents(t, sandbox.EventFail, rec.ID)
+	if len(ev) != 1 {
+		t.Fatalf("fail events %+v; want one", ev)
+	}
+	text, _ := ev[0].metadata["error"].(string)
+	return text
+}
+
+// copyOf is the added rule of a recorded copy of the workspace sandbox rule
+// r: the rule under its id.
+func copyOf(r sandbox.SandboxRule) runtime.Rule { return runtime.Rule{Name: r.ID, Body: r.Rule} }
+
+// approvedOf is the added rule of the approved rule a: the rule under its
+// proposal's id.
+func approvedOf(a sandbox.ApprovedRule) runtime.Rule {
+	return runtime.Rule{Name: a.ProposalID, Body: a.Rule}
+}
+
+// saveApproved stores body as a rule approved for the sandbox id at at, by a
+// proposal of a new id, and returns it.
+func (h *createHub) saveApproved(t *testing.T, id, body string, at time.Time) sandbox.ApprovedRule {
+	t.Helper()
+	a := sandbox.ApprovedRule{SandboxID: id, ProposalID: "sbp_" + strings.TrimPrefix(sandbox.NewID(), "sbx_"), Rule: json.RawMessage(body), DecidedAt: at}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.SaveApprovedRule(ctx, tx, a) })
+	return a
 }
 
 // objectMap is the sandbox object of rec as a decoded answer holds it.
@@ -2250,6 +2445,7 @@ func startUseHub(t *testing.T, fail func() error) *useHub {
 	cfg := sandboxesOn
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc = c.Sandbox()
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
 		})
@@ -2381,7 +2577,8 @@ func startUseSandboxHub(t *testing.T, settings string) *execHub {
 // newExecHub starts an exec hub whose [sandbox] section also holds the lines
 // settings, with its configuration as edit changes it when edit is not nil.
 // The fake runtime stamps log entries with the hub's clock, and the hub's
-// runtime client records the terminals it opens in terms.
+// runtime client records the terminals it opens in terms. The hub runs no
+// policy collector, whose streams would stand beside those its tests count.
 func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *execHub {
 	t.Helper()
 	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
@@ -2396,6 +2593,7 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	cfg.Now = h.clock.Now
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc = c.Sandbox()
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			terms := &terminalClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), terms: h.terms}
 			return &quirkClient{Client: terms, quirks: h.quirks}, nil
@@ -2946,7 +3144,7 @@ func (h *logHub) follow(t *testing.T, id string) {
 }
 
 // logStreams is the number of open log streams of the sandbox id.
-func (h *logHub) logStreams(id string) int {
+func (h *execHub) logStreams(id string) int {
 	n := 0
 	for _, s := range h.rt.Streams() {
 		if s.Op == runtime.OpLogs && s.Sandbox == id {
@@ -2957,7 +3155,7 @@ func (h *logHub) logStreams(id string) int {
 }
 
 // breakLog breaks the first open log stream of the sandbox id.
-func (h *logHub) breakLog(t *testing.T, id string) {
+func (h *execHub) breakLog(t *testing.T, id string) {
 	t.Helper()
 	for _, s := range h.rt.Streams() {
 		if s.Op == runtime.OpLogs && s.Sandbox == id {
@@ -3805,4 +4003,468 @@ func (l *idLog) snapshot() map[string]int {
 		out[id] = n
 	}
 	return out
+}
+
+// denialRetry is the retry delay of the policy collectors of a collector
+// hub, and collectorInterval the poll interval of their proposal listing.
+const (
+	denialRetry       = 5 * time.Second
+	collectorInterval = 5 * time.Second
+)
+
+// closedProfile is a profile that does not allow proposals.
+const closedProfile = "[[sandbox.profiles]]\nname = \"closed\"\nttl = \"4h\"\nallow_proposals = false\n"
+
+// collectorHub is an exec hub, which runs no policy collector of its own,
+// so that its test drives the passes of the collectors it builds, with a
+// metrics recorder and a clock of its own for the collectors' retry delay
+// and poll interval. Its log collector is held after its first round,
+// which runs before the hub is handed to the test and so follows no
+// sandbox: every log stream the runtime has open is a policy collector's.
+// Besides agent, it has the profile closed (closedProfile).
+type collectorHub struct {
+	*execHub
+	rec *recordingRecorder
+	// resolver resolves the secrets of the hub's sandboxes.
+	resolver *stubResolver
+	// logs holds the hub's log collector.
+	logs *logCollectorHold
+	// retryClock is the clock the collectors count their retry delay and
+	// their poll interval on.
+	retryClock *hubtest.JobClock
+}
+
+// startCollectorHub starts a collector hub.
+func startCollectorHub(t *testing.T) *collectorHub {
+	t.Helper()
+	h := &collectorHub{
+		rec: &recordingRecorder{}, resolver: &stubResolver{}, logs: newLogCollectorHold(),
+		retryClock: hubtest.NewJobClock(func() time.Time { return recordStart }),
+	}
+	h.execHub = newExecHub(t, closedProfile, func(cfg *hubtest.Config) {
+		compose := cfg.Compose
+		cfg.Compose = func(c *hub.Composition) {
+			compose(c)
+			c.SetSandboxRecorder(h.rec)
+			c.AdjustSandbox(func(d *sandbox.Deps) {
+				h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
+				d.NewTimer = h.logs.wrap(d.NewTimer)
+			})
+		}
+	})
+	// Registered after the hub's start, so run before its stop, which then
+	// does not wait for the held collector.
+	t.Cleanup(h.logs.release)
+	hubtestWait(t, h.logs.held, "the log collector to end its first round")
+	return h
+}
+
+// logCollectorHold holds a hub's log collector after its first round. The
+// collector asks for the timer of each round's wait before it runs the
+// round: the hold makes the first timer fire at once and keeps the call
+// that asks for the second, which comes after the first round, until it is
+// released. The policy collector, the one other user of timers of
+// LogCollectInterval, is held by the hub and run by the test only after
+// the hold took effect.
+type logCollectorHold struct {
+	mu       sync.Mutex
+	asked    int
+	held     chan struct{}
+	released chan struct{}
+	once     sync.Once
+}
+
+func newLogCollectorHold() *logCollectorHold {
+	return &logCollectorHold{held: make(chan struct{}), released: make(chan struct{})}
+}
+
+// wrap returns next, the hub's timers, with the log collector's first two
+// timers as the hold makes them.
+func (l *logCollectorHold) wrap(next func(time.Duration) sandbox.Timer) func(time.Duration) sandbox.Timer {
+	return func(d time.Duration) sandbox.Timer {
+		if d != sandbox.LogCollectInterval {
+			return next(d)
+		}
+		l.mu.Lock()
+		l.asked++
+		asked := l.asked
+		l.mu.Unlock()
+		switch asked {
+		case 1:
+			fired := make(chan time.Time, 1)
+			fired <- recordStart
+			return firedTimer(fired)
+		case 2:
+			close(l.held)
+			<-l.released
+		}
+		return next(d)
+	}
+}
+
+// release lets the held log collector go on.
+func (l *logCollectorHold) release() { l.once.Do(func() { close(l.released) }) }
+
+// firedTimer is a timer that has fired.
+type firedTimer chan time.Time
+
+func (t firedTimer) C() <-chan time.Time { return t }
+func (t firedTimer) Stop() bool          { return false }
+
+// collector returns a policy collector of the hub with the retry delay
+// denialRetry and the poll interval collectorInterval on the hub's retry
+// clock, stopped when the test ends.
+func (h *collectorHub) collector(t *testing.T) *sandbox.PolicyCollector {
+	t.Helper()
+	c := h.svc.NewPolicyCollector(sandbox.PolicyCollectorOptions{Interval: collectorInterval, RetryDelay: denialRetry, Now: h.retryClock.Now})
+	t.Cleanup(c.Stop)
+	return c
+}
+
+// readySandbox is execHub.sandbox for one row of a table that shares the
+// hub: the sandbox, edited by edit when it is not nil, is stopped in the
+// store when the row ends, so that the collectors of later rows do not
+// follow it.
+func (h *collectorHub) readySandbox(t *testing.T, edit func(*sandbox.Record)) string {
+	t.Helper()
+	id := h.sandbox(t, edit)
+	t.Cleanup(func() {
+		if _, err := h.svc.Transition(context.Background(), nil, id, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil {
+			t.Errorf("stop %s: %v", id, err)
+		}
+	})
+	return id
+}
+
+// deny has the runtime write a denial of program to host:port to the
+// policy log of the sandbox id, with method and path ("" for a blocked
+// connection).
+func (h *collectorHub) deny(id, program, host string, port int, method, path string) {
+	h.rt.EmitPolicyLog("parley", id, runtime.LogEntry{Action: "deny", Program: program, Host: host, Port: port, Method: method, Path: path})
+}
+
+// counted is the value of the denials metric.
+func (h *collectorHub) counted() float64 { return h.rec.values(sandbox.DenialsMetric)[""] }
+
+// denials are the parley.sandbox.deny events of the sandbox id, oldest
+// first.
+func (h *collectorHub) denials(t *testing.T, id string) []hubEvent {
+	t.Helper()
+	return h.sandboxEvents(t, sandbox.EventDeny, id)
+}
+
+// reported waits until the sandbox id has n parley.sandbox.deny events.
+func (h *collectorHub) reported(t *testing.T, id string, n int) {
+	t.Helper()
+	eventually(t, fmt.Sprintf("%d denial events of %s", n, id), func() bool { return len(h.denials(t, id)) >= n })
+}
+
+// followed are the ids of the sandboxes with an open log stream, sorted, a
+// sandbox once per stream: in a collector hub, the streams of the policy
+// collectors the test runs.
+func (h *execHub) followed() []string {
+	var out []string
+	for _, s := range h.rt.Streams() {
+		if s.Op == runtime.OpLogs {
+			out = append(out, s.Sandbox)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// allowProposals records a sandbox as created from a profile that allows
+// proposals.
+func allowProposals(r *sandbox.Record) { r.Snapshot.AllowProposals = true }
+
+// propose adds a pending proposal of the rule body, with the summary
+// "allow " and body and the findings, to the sandbox id at the runtime, and
+// returns it with the runtime's id.
+func (h *collectorHub) propose(id, body string, findings ...runtime.Finding) runtime.Proposal {
+	p := runtime.Proposal{Sandbox: id, Rule: runtime.Rule{Name: "proposed", Body: json.RawMessage(body)}, Summary: "allow " + body, Findings: findings}
+	p.ID = h.rt.AddProposal("parley", p)
+	return p
+}
+
+// proposals are the stored proposals of the sandbox id in the state, by
+// created_at and id.
+func (h *collectorHub) proposals(t *testing.T, id, state string) []sandbox.Proposal {
+	t.Helper()
+	ps, err := sandbox.ListProposals(context.Background(), h.Store.Main(), id, state, nil, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ps
+}
+
+// runtimeCalls is how many calls of the operation op naming target the
+// runtime received; "" counts those of every target.
+func (h *collectorHub) runtimeCalls(op, target string) int {
+	n := 0
+	for _, c := range h.rt.Calls() {
+		if c.Op == op && (target == "" || c.Target == target) {
+			n++
+		}
+	}
+	return n
+}
+
+// unheldSandbox creates a sandbox at the runtime of which the hub has no
+// record, and returns its id.
+func (h *collectorHub) unheldSandbox(t *testing.T) string {
+	t.Helper()
+	id := sandbox.NewID()
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), runtime.SandboxSpec{Name: id, WorkDir: sandbox.WorkDir}); err != nil {
+		t.Fatalf("create a sandbox at the runtime: %v", err)
+	}
+	return id
+}
+
+// seedPolicyRows stores, for the sandbox id, one open proposal, one
+// reported denial, with how far its policy log was taken, and one approved
+// rule.
+func (h *collectorHub) seedPolicyRows(t *testing.T, id string) {
+	t.Helper()
+	ctx := context.Background()
+	rec, err := sandbox.Get(ctx, h.Store.Main(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sandbox.ReportDenial(h.svc, ctx, rec, runtime.LogEntry{Action: "deny", Program: "curl", Host: "example.org", Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	p := sandbox.Proposal{
+		ID: sandbox.NewProposalID(), SandboxID: id, RuntimeID: "1", Rule: json.RawMessage(`{"host":"example.org"}`),
+		Summary: "allow example.org", State: sandbox.ProposalOpen, CreatedAt: recordStart,
+	}
+	a := sandbox.ApprovedRule{SandboxID: id, ProposalID: sandbox.NewProposalID(), Rule: json.RawMessage(`{"host":"example.com"}`), DecidedAt: recordStart}
+	err = h.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := sandbox.InsertProposal(ctx, tx, p); err != nil {
+			return err
+		}
+		return sandbox.SaveApprovedRule(ctx, tx, a)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// policyRows counts the stored proposals, reported denials, approved rules
+// and policy log positions of the sandbox id.
+func (h *collectorHub) policyRows(t *testing.T, id string) [4]int {
+	t.Helper()
+	var n [4]int
+	err := h.Store.Main().QueryRow(`SELECT
+	(SELECT COUNT(*) FROM sandbox_proposals WHERE sandbox_id = ?),
+	(SELECT COUNT(*) FROM sandbox_denials WHERE sandbox_id = ?),
+	(SELECT COUNT(*) FROM sandbox_approved_rules WHERE sandbox_id = ?),
+	(SELECT COUNT(*) FROM sandbox_policy_log WHERE sandbox_id = ?)`, id, id, id, id).Scan(&n[0], &n[1], &n[2], &n[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// startProposalHub starts a create hub whose dana owns the ready
+// repositories demo and other, stored without a git repository, for the
+// tests of the proposal and rule routes, with the dependencies of its
+// stored sandboxes changed by adjust, in order.
+func startProposalHub(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	h := startCreateHub(t, agentProfile, adjust...)
+	h.storedRepositories(t, "demo", "other")
+	return h
+}
+
+// storedRepositories adds the ready repositories slugs of dana in acme,
+// stored without a git repository.
+func (h *createHub) storedRepositories(t *testing.T, slugs ...string) {
+	t.Helper()
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		for _, slug := range slugs {
+			if err := workspace.Insert(ctx, tx, h.record(slug, access.KindRepository, workspace.StatusReady)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// seedProposal stores a proposal of the sandbox id in state, created at
+// at, with the rule {"host": "<n>.test"}, the summary "allow <n>.test" and
+// no findings, n being a counter of the hub's seeds, as edit changes it
+// when edit is not nil, and returns it as stored.
+func (h *createHub) seedProposal(t *testing.T, id, state string, at time.Time, edit func(*sandbox.Proposal)) sandbox.Proposal {
+	t.Helper()
+	n := h.proposalSeeds.Add(1)
+	host := fmt.Sprintf("p%d.test", n)
+	p := sandbox.Proposal{
+		ID: sandbox.NewProposalID(), SandboxID: id, RuntimeID: strconv.FormatInt(n, 10),
+		Rule: json.RawMessage(`{"host":"` + host + `"}`), Summary: "allow " + host, State: state, CreatedAt: at,
+	}
+	if edit != nil {
+		edit(&p)
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := sandbox.InsertProposal(ctx, tx, p)
+		return err
+	})
+	return p
+}
+
+// proposalMap is the proposal object of p as a decoded answer holds it:
+// its twelve members, null where p leaves them unset, findings [] without
+// findings and the timestamps in RFC 3339, UTC, whole seconds.
+func proposalMap(t *testing.T, p sandbox.Proposal) map[string]any {
+	t.Helper()
+	var rule any
+	if err := json.Unmarshal(p.Rule, &rule); err != nil {
+		t.Fatal(err)
+	}
+	findings := []any{}
+	for _, f := range p.Findings {
+		findings = append(findings, map[string]any{"severity": f.Severity, "message": f.Message})
+	}
+	o := map[string]any{
+		"id": p.ID, "sandbox_id": p.SandboxID, "rule": rule, "summary": p.Summary, "findings": findings,
+		"state": p.State, "scope": nil, "workspace_rule_id": nil, "decided_by": nil, "decided_at": nil,
+		"comment": nil, "created_at": stamp(p.CreatedAt),
+	}
+	if p.Scope != nil {
+		o["scope"] = *p.Scope
+	}
+	if p.WorkspaceRuleID != nil {
+		o["workspace_rule_id"] = *p.WorkspaceRuleID
+	}
+	if by := p.DecidedBy; by != nil {
+		o["decided_by"] = map[string]any{"actor_type": by.ActorType, "actor_id": by.ActorID, "username": by.Username}
+	}
+	if p.DecidedAt != nil {
+		o["decided_at"] = stamp(*p.DecidedAt)
+	}
+	if p.Comment != nil {
+		o["comment"] = *p.Comment
+	}
+	return o
+}
+
+// listItems returns the items of a 200 list answer, decoded, and its
+// next_cursor ("" for null).
+func listItems(t *testing.T, a answer) (items []any, next string) {
+	t.Helper()
+	o := decoded(t, a, http.StatusOK)
+	items, ok := o["items"].([]any)
+	if !ok {
+		t.Fatalf("the list %s has no items list", a.body)
+	}
+	if o["next_cursor"] != nil {
+		next, ok = o["next_cursor"].(string)
+		if !ok || next == "" {
+			t.Fatalf("the list %s has a next_cursor that is neither null nor a cursor", a.body)
+		}
+	}
+	return items, next
+}
+
+// liveSandbox stores a sandbox of demo in state and creates it at the
+// runtime, which can then take rules into its policy, and returns its id.
+func (h *createHub) liveSandbox(t *testing.T, state string) string {
+	t.Helper()
+	return h.liveSandboxIn(t, "demo", state, nil)
+}
+
+// liveSandboxIn is liveSandbox with the sandbox stored on the workspace ws
+// as edit changes it when edit is not nil.
+func (h *createHub) liveSandboxIn(t *testing.T, ws, state string, edit func(*sandbox.Record)) string {
+	t.Helper()
+	id := h.seedRecord(t, ws, state, edit)
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), runtime.SandboxSpec{Name: id, WorkDir: sandbox.WorkDir}); err != nil {
+		t.Fatalf("create the sandbox at the runtime: %v", err)
+	}
+	return id
+}
+
+// addedRules returns the rules the runtime was asked to add to the policy
+// of the sandbox id, as the policy it holds lists them, and how many
+// add-rule calls named the sandbox, successful or not.
+func (h *createHub) addedRules(t *testing.T, id string) (rules []runtime.Rule, calls int) {
+	t.Helper()
+	for _, c := range h.rt.Calls() {
+		if c.Op == runtime.OpAddPolicyRule && c.Target == id {
+			calls++
+		}
+	}
+	if _, ok := h.rt.Spec("parley", id); !ok {
+		return nil, calls
+	}
+	p, err := h.rt.Client("parley", nil).GetPolicy(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Policy.Added, calls
+}
+
+// undecided checks that nothing was decided of the proposal p: it is
+// stored open, its sandbox's policy_revision is 0, the runtime was asked
+// to add no rule to the sandbox's policy, and no decision event, workspace
+// sandbox rule or rule_add event exists.
+func (h *createHub) undecided(t *testing.T, p sandbox.Proposal) {
+	t.Helper()
+	got, err := sandbox.GetProposal(context.Background(), h.Store.Main(), p.SandboxID, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != sandbox.ProposalOpen {
+		t.Errorf("proposal state = %s; want open", got.State)
+	}
+	if n := storedRecord(t, h.Hub, p.SandboxID).PolicyRevision; n != 0 {
+		t.Errorf("policy_revision = %d; want 0", n)
+	}
+	if rules, _ := h.addedRules(t, p.SandboxID); len(rules) != 0 {
+		t.Errorf("the runtime added %v; want none", rules)
+	}
+	if e := h.sandboxEvents(t, sandbox.EventProposalDecided, p.SandboxID); len(e) != 0 {
+		t.Errorf("decision events %v; want none", e)
+	}
+	if n := h.count(t, `SELECT COUNT(*) FROM sandbox_rules`); n != 0 {
+		t.Errorf("workspace sandbox rules = %d; want 0", n)
+	}
+	if n := h.count(t, `SELECT COUNT(*) FROM hub_events WHERE type = 'parley.sandbox.rule_add'`); n != 0 {
+		t.Errorf("rule_add events = %d; want 0", n)
+	}
+}
+
+// pendingProposal adds a pending proposal to the sandbox id at the runtime,
+// which must hold the sandbox, and stores it open as seedProposal does,
+// made a minute before the hub's clock, under the runtime's id of it.
+func (h *createHub) pendingProposal(t *testing.T, id string, edit func(*sandbox.Proposal)) sandbox.Proposal {
+	t.Helper()
+	return h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, func(p *sandbox.Proposal) {
+		if edit != nil {
+			edit(p)
+		}
+		p.RuntimeID = h.rt.AddProposal("parley", runtime.Proposal{Sandbox: id, Rule: runtime.Rule{Name: "proposed", Body: p.Rule}, Summary: p.Summary})
+	})
+}
+
+// rejected returns how many reject calls named the sandbox id at the
+// runtime, successful or not, and the runtime ids of the sandbox's
+// proposals the runtime no longer lists as pending among those of ps.
+func (h *createHub) rejected(t *testing.T, id string, ps ...sandbox.Proposal) (calls int, gone []string) {
+	t.Helper()
+	for _, c := range h.rt.Calls() {
+		if c.Op == runtime.OpRejectProposal && c.Target == id {
+			calls++
+		}
+	}
+	pending, err := h.rt.Client("parley", nil).ListProposals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range ps {
+		if !slices.ContainsFunc(pending, func(r runtime.Proposal) bool { return r.Sandbox == id && r.ID == p.RuntimeID }) {
+			gone = append(gone, p.RuntimeID)
+		}
+	}
+	return calls, gone
 }
