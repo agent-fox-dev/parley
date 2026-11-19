@@ -185,6 +185,19 @@ func (s *Service) StopRoute() server.Route {
 	})
 }
 
+// StartRoute declares POST /workspaces/:slug/sandboxes/:id/start: it
+// starts the stopped, completed or failed sandbox id again for the caller
+// and answers with the sandbox (see serveStart). It needs the scope
+// sandboxes:write of a PAT and write access to the workspace; the admin
+// token acts as an owner.
+func (s *Service) StartRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/start",
+		Handler: s.serveStart,
+	})
+}
+
 // ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
 // of the workspace, newest first, paged, filtered by the query (see
 // listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and

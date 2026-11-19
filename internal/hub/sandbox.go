@@ -154,6 +154,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.ListRoute())
 	c.AddRoute(svc.CheckpointRoute())
 	c.AddRoute(svc.StopRoute())
+	c.AddRoute(svc.StartRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
