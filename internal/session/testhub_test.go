@@ -172,14 +172,33 @@ func (w *world) count(t *testing.T, table string) int {
 	return n
 }
 
+// terminate sets the session id to terminated, ended at the clock's time,
+// directly in the store, as a forced close leaves it.
+func (w *world) terminate(t *testing.T, id string) {
+	t.Helper()
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE sessions SET status = 'terminated', ended_at = ? WHERE id = ?`, w.clock.stamp(), id)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // rawPost sends POST /sessions with body as credential without the test's
 // helpers, for a goroutine, which must not end the test.
 func (w *world) rawPost(credential string, body any) (int, []byte, error) {
+	return w.rawPostTo("/api/v1/sessions", credential, body)
+}
+
+// rawPostTo is rawPost to the path path.
+func (w *world) rawPostTo(path, credential string, body any) (int, []byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return 0, nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, w.URL("/api/v1/sessions"), bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, w.URL(path), bytes.NewReader(data))
 	if err != nil {
 		return 0, nil, err
 	}
