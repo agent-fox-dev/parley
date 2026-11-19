@@ -1,18 +1,26 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/net/websocket"
 )
 
 // profilesAnswer is a profile list as a hub with sandboxes answers it.
@@ -297,6 +305,10 @@ func TestSandbox_UsageErrors(t *testing.T) {
 		{[]string{"exec", "demo", "sbx_1", "make"}, `"make"`},
 		{[]string{"exec", "demo", "--", "make"}, "<id>"},
 		{[]string{"exec", "demo", "sbx_1", "--env", "NOEQ", "--", "make"}, `"NOEQ"`},
+		{[]string{"shell", "demo"}, "<id>"},
+		{[]string{"logs", "demo"}, "<id>"},
+		{[]string{"logs", "demo", "sbx_1", "--source", "x"}, `"x"`},
+		{[]string{"logs", "demo", "sbx_1", "--tail", "0"}, "--tail"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -619,4 +631,369 @@ func TestSandboxExec_ReportsAFailureAsAnErrorEnvelope(t *testing.T) {
 			}
 		})
 	}
+}
+
+// logsPath is the route parley sandbox logs demo sbx_1 reads.
+const logsPath = sandboxesPath + "/sbx_1/logs"
+
+// logLine is the n-th stored line of sbx_1 as the hub serves it in a page,
+// with spaces that parley does not print.
+func logLine(n int) string {
+	return fmt.Sprintf(`{"time": "2026-11-19T10:00:00Z", "source": "process", "stream": "stdout", "line": "line %d"}`, n)
+}
+
+// logLines are the lines 1 to n.
+func logLines(n int) []string {
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = logLine(i + 1)
+	}
+	return lines
+}
+
+// logPages is a handler that serves lines in pages of 50, the cursor being
+// the index of the page's first line.
+func logPages(lines []string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start, _ := strconv.Atoi(r.URL.Query().Get("cursor"))
+		end := min(start+50, len(lines))
+		next := "null"
+		if end < len(lines) {
+			next = strconv.Quote(strconv.Itoa(end))
+		}
+		answerWith(http.StatusOK, `{"items": [`+strings.Join(lines[start:end], ", ")+`], "next_cursor": `+next+`}`)(w, r)
+	}
+}
+
+// compactLine is the JSON document line compacted.
+func compactLine(t *testing.T, line string) string {
+	t.Helper()
+	var out bytes.Buffer
+	if err := json.Compact(&out, []byte(line)); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
+}
+
+// compactLines is lines as parley prints them: each compacted, on a line of
+// its own.
+func compactLines(t *testing.T, lines []string) string {
+	t.Helper()
+	var out strings.Builder
+	for _, line := range lines {
+		out.WriteString(compactLine(t, line) + "\n")
+	}
+	return out.String()
+}
+
+// eventually fails the test unless cond holds within 5 seconds.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited 5 s for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// background runs parley with args and opts in a goroutine; the channel
+// gives its exit status.
+func background(opts options, stdout, stderr io.Writer, args ...string) <-chan int {
+	done := make(chan int, 1)
+	go func() { done <- run(context.Background(), args, stdout, stderr, opts) }()
+	return done
+}
+
+// exitOf is the exit status done gives within 5 seconds.
+func exitOf(t *testing.T, done <-chan int) int {
+	t.Helper()
+	select {
+	case code := <-done:
+		return code
+	case <-time.After(5 * time.Second):
+		t.Fatal("parley did not end within 5 s")
+		return -1
+	}
+}
+
+func TestSandboxLogs_PrintsEachLineAsOneCompactJSONObject(t *testing.T) {
+	t.Parallel()
+	t.Run("every page, in the order the hub returned them", func(t *testing.T) {
+		t.Parallel()
+		lines := logLines(120)
+		hub := newStubHub(t).handle(http.MethodGet, logsPath, logPages(lines))
+
+		code, stdout, stderr, sent := runOnHub(t, hub, "sandbox", "logs", "demo", "sbx_1")
+
+		if code != 0 || stderr != "" {
+			t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr)
+		}
+		if want := compactLines(t, lines); stdout != want {
+			t.Errorf("stdout = %q, want the 120 lines compacted, one per line", stdout)
+		}
+		for _, line := range nonEmptyLines(stdout) {
+			var item map[string]any
+			if err := json.Unmarshal([]byte(line), &item); err != nil || !reflect.DeepEqual(sortedKeys(item), []string{"line", "source", "stream", "time"}) {
+				t.Errorf("line %q is not an object with time, source, stream and line (%v)", line, err)
+			}
+		}
+		if len(sent) != 3 {
+			t.Fatalf("the hub got %d requests, want 3", len(sent))
+		}
+		for i, cursor := range []string{"", "50", "100"} {
+			want := url.Values{}
+			if cursor != "" {
+				want.Set("cursor", cursor)
+			}
+			wantQuery(t, sent[i].query, want)
+		}
+	})
+	t.Run("with the filters given on every page", func(t *testing.T) {
+		t.Parallel()
+		hub := newStubHub(t).handle(http.MethodGet, logsPath, logPages(logLines(60)))
+
+		code, stdout, stderr, sent := runOnHub(t, hub, "sandbox", "logs", "demo", "sbx_1",
+			"--source", "policy", "--since", "2026-01-02T03:04:05Z", "--tail", "5")
+
+		if code != 0 || stderr != "" || len(nonEmptyLines(stdout)) != 60 {
+			t.Errorf("exit status %d, stderr %q, %d lines; want 0, nothing and 60", code, stderr, len(nonEmptyLines(stdout)))
+		}
+		filters := url.Values{"source": {"policy"}, "since": {"2026-01-02T03:04:05Z"}, "tail": {"5"}}
+		if len(sent) != 2 {
+			t.Fatalf("the hub got %d requests, want 2", len(sent))
+		}
+		wantQuery(t, sent[0].query, filters)
+		filters.Set("cursor", "50")
+		wantQuery(t, sent[1].query, filters)
+	})
+	t.Run("followed until the hub ends the stream", func(t *testing.T) {
+		t.Parallel()
+		stored := make(chan struct{})
+		first, second := compactLine(t, logLine(1)), compactLine(t, logLine(2))
+		hub := newStubHub(t).handle(http.MethodGet, logsPath, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "event: log\ndata: %s\n\n", first)
+			http.NewResponseController(w).Flush()
+			select {
+			case <-stored:
+			case <-r.Context().Done():
+				return
+			}
+			// Returning ends the stream, as the hub does once the sandbox
+			// is deleted.
+			fmt.Fprintf(w, ": heartbeat\n\nevent: log\ndata: %s\n\n", second)
+		})
+		opts := defaultOptions()
+		var deadlines atomic.Int32
+		opts.transport = func(next http.RoundTripper) http.RoundTripper {
+			return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if _, ok := r.Context().Deadline(); ok {
+					deadlines.Add(1)
+				}
+				return next.RoundTrip(r)
+			})
+		}
+		var stdout, stderr syncBuffer
+
+		done := background(opts, &stdout, &stderr, onHub(hub.URL, "sandbox", "logs", "demo", "sbx_1", "--follow", "--tail", "1")...)
+		eventually(t, "the first line", func() bool { return len(nonEmptyLines(stdout.String())) == 1 })
+		close(stored)
+		code := exitOf(t, done)
+
+		if code != 0 || stderr.String() != "" {
+			t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr.String())
+		}
+		if want := compactLines(t, logLines(2)); stdout.String() != want {
+			t.Errorf("stdout = %q, want %q", stdout.String(), want)
+		}
+		got := wantOnlyRequest(t, hub.recorded(), http.MethodGet, logsPath)
+		wantQuery(t, got.query, url.Values{"follow": {"true"}, "tail": {"1"}})
+		if accept := got.header.Get("Accept"); accept != "text/event-stream" {
+			t.Errorf("Accept = %q, want text/event-stream", accept)
+		}
+		if n := deadlines.Load(); n != 0 {
+			t.Errorf("the stream was opened under a deadline")
+		}
+	})
+	t.Run("a refusal of the hub, printed as received", func(t *testing.T) {
+		t.Parallel()
+		const refusal = `{"error":{"code":400,"message":"since is not a time","error_type":"invalid_request"}}`
+		for _, follow := range []bool{false, true} {
+			hub := newStubHub(t).answer(http.MethodGet, logsPath, http.StatusBadRequest, refusal)
+			args := []string{"sandbox", "logs", "demo", "sbx_1", "--since", "soon"}
+			if follow {
+				args = append(args, "--follow")
+			}
+
+			code, stdout, stderr, sent := runOnHub(t, hub, args...)
+
+			if code != 1 || stdout != "" || stderr != indented(t, refusal) {
+				t.Errorf("follow %v: exit status %d, stdout %q, stderr %q; want 1, nothing and the hub's envelope", follow, code, stdout, stderr)
+			}
+			if len(sent) != 1 {
+				t.Errorf("follow %v: the hub got %d requests, want 1", follow, len(sent))
+			}
+		}
+	})
+}
+
+// attachPath is the route parley sandbox shell demo sbx_1 opens.
+const attachPath = sandboxesPath + "/sbx_1/attach"
+
+// wsFrame is a WebSocket frame a stub terminal received: its type and its
+// payload.
+type wsFrame struct {
+	kind byte
+	data string
+}
+
+// receiveFrames receives one frame into a *wsFrame, keeping its type.
+var receiveFrames = websocket.Codec{Unmarshal: func(data []byte, kind byte, v any) error {
+	*v.(*wsFrame) = wsFrame{kind, string(data)}
+	return nil
+}}
+
+// echoTerminal is the attach of a stub hub: a WebSocket on which every
+// binary frame is sent back, as a terminal echoes what is typed, and every
+// text frame is passed to texts. Closing exit closes the connection, as the
+// hub does when the shell exits.
+type echoTerminal struct {
+	opened, exit chan struct{}
+	texts        chan string
+}
+
+func newEchoTerminal() *echoTerminal {
+	return &echoTerminal{opened: make(chan struct{}), exit: make(chan struct{}), texts: make(chan string, 8)}
+}
+
+func (e *echoTerminal) serve(w http.ResponseWriter, r *http.Request) {
+	websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			close(e.opened)
+			go func() {
+				<-e.exit
+				ws.Close()
+			}()
+			for {
+				var f wsFrame
+				if err := receiveFrames.Receive(ws, &f); err != nil {
+					return
+				}
+				if f.kind == websocket.TextFrame {
+					e.texts <- f.data
+					continue
+				}
+				if err := websocket.Message.Send(ws, []byte(f.data)); err != nil {
+					return
+				}
+			}
+		},
+	}.ServeHTTP(w, r)
+}
+
+// wait fails the test unless ch is closed within 5 seconds.
+func wait(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("waited 5 s for %s", what)
+	}
+}
+
+func TestSandboxShell_RelaysATerminalOverAWebSocket(t *testing.T) {
+	t.Parallel()
+	t.Run("copies standard input to the terminal and its output to stdout", func(t *testing.T) {
+		t.Parallel()
+		term := newEchoTerminal()
+		hub := newStubHub(t).handle(http.MethodGet, attachPath, term.serve)
+		stdin, typed := io.Pipe()
+		t.Cleanup(func() { typed.Close() })
+		opts := defaultOptions()
+		opts.stdin = stdin
+		var stdout, stderr syncBuffer
+
+		done := background(opts, &stdout, &stderr, onHub(hub.URL, "sandbox", "shell", "demo", "sbx_1")...)
+		wait(t, term.opened, "the WebSocket")
+		got := wantOnlyRequest(t, hub.recorded(), http.MethodGet, attachPath)
+		wantQuery(t, got.query, url.Values{"cols": {"80"}, "rows": {"24"}})
+		if auth := got.header.Get("Authorization"); auth != "Bearer k" {
+			t.Errorf("Authorization = %q, want Bearer k", auth)
+		}
+		if _, err := typed.Write([]byte("ls\n")); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, "the echo on stdout", func() bool { return stdout.String() == "ls\n" })
+		close(term.exit)
+
+		if code := exitOf(t, done); code != 0 || stderr.String() != "" {
+			t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr.String())
+		}
+	})
+	t.Run("prints the hub's refusal before the upgrade", func(t *testing.T) {
+		t.Parallel()
+		const refusal = `{"error":{"code":409,"message":"the sandbox is stopped","error_type":"sandbox_not_ready"}}`
+		hub := newStubHub(t).handle(http.MethodGet, attachPath, func(w http.ResponseWriter, r *http.Request) {
+			// As the hub does, a request that asks for no upgrade is
+			// refused before the sandbox's state is judged.
+			if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") ||
+				r.Header.Get("Sec-WebSocket-Key") == "" || r.Header.Get("Sec-WebSocket-Version") != "13" {
+				answerWith(http.StatusBadRequest, `{"error":{"code":400,"message":"not a WebSocket upgrade","error_type":"invalid_request"}}`)(w, r)
+				return
+			}
+			answerWith(http.StatusConflict, refusal)(w, r)
+		})
+
+		code, stdout, stderr, sent := runOnHub(t, hub, "sandbox", "shell", "demo", "sbx_1")
+
+		if code != 1 || stdout != "" || stderr != indented(t, refusal) {
+			t.Errorf("exit status %d, stdout %q, stderr %q; want 1, nothing and the hub's envelope", code, stdout, stderr)
+		}
+		if len(sent) != 2 {
+			t.Errorf("the hub got %d requests, want the upgrade and its repetition", len(sent))
+		}
+		for _, r := range sent {
+			if r.path != attachPath || r.header.Get("Authorization") != "Bearer k" {
+				t.Errorf("sent %s %s with Authorization %q, want the attach route with Bearer k", r.method, r.path, r.header.Get("Authorization"))
+			}
+		}
+	})
+	t.Run("a hub it cannot reach", func(t *testing.T) {
+		t.Parallel()
+		code, stdout, stderr := runCLI(t, "--endpoint-url", closedPortURL(t), "--api-key", "k", "sandbox", "shell", "demo", "sbx_1")
+
+		wantClientFailure(t, code, stdout, stderr, "client_error")
+	})
+	t.Run("sends a resize frame", func(t *testing.T) {
+		t.Parallel()
+		term := newEchoTerminal()
+		srv := httptest.NewServer(http.HandlerFunc(term.serve))
+		t.Cleanup(srv.Close)
+		config, err := websocket.NewConfig("ws"+strings.TrimPrefix(srv.URL, "http"), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ws, err := config.DialContext(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ws.Close() })
+
+		if err := sendResize(ws, 100, 30); err != nil {
+			t.Fatal(err)
+		}
+
+		select {
+		case text := <-term.texts:
+			if text != `{"resize":{"cols":100,"rows":30}}` {
+				t.Errorf("text frame = %q, want the resize to 100x30", text)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("waited 5 s for a text frame")
+		}
+	})
 }

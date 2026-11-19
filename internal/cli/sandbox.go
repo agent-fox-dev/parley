@@ -1,15 +1,25 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/net/websocket"
 )
 
 // The positional arguments of the sandbox commands.
@@ -73,6 +83,16 @@ func newSandboxCommand() *cobra.Command {
 			Auth:        authUser,
 		}),
 		newSandboxExecCommand(),
+		declare(command{
+			Name:        "shell",
+			Description: "Open an interactive shell in a sandbox on the local terminal; the sandbox keeps running when it ends",
+			Method:      http.MethodGet,
+			Path:        sandboxesRoute + "/:id/attach",
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+			Auth:        authUser,
+			Run:         shellInSandbox,
+		}),
+		newSandboxLogsCommand(),
 	)
 }
 
@@ -445,4 +465,252 @@ func execCollected(c *call, r apiRequest) error {
 		return err
 	}
 	return end.outcome()
+}
+
+// logSources are the values parley sandbox logs --source takes.
+var logSources = []string{"process", "policy"}
+
+// newSandboxLogsCommand builds parley sandbox logs.
+func newSandboxLogsCommand() *cobra.Command {
+	logs := declare(command{
+		Name:        "logs",
+		Description: "Print the stored lines of a sandbox's main process and network policy, one JSON object per line; with --follow, go on printing new lines as they are stored",
+		Method:      http.MethodGet,
+		Path:        sandboxesRoute + "/:id/logs",
+		Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("source", "", "print only the lines of this source, process or policy")
+			fs.String("since", "", "print only the lines stored at or after this time, such as 2026-01-02T03:04:05Z")
+			fs.Int("tail", 0, "print only the last n lines, at least 1")
+			fs.Bool("follow", false, "go on printing new lines as they are stored, until the sandbox is deleted or the hub stops")
+		},
+		Run: printSandboxLogs,
+	})
+	checkLine := logs.Args
+	// The query is built here too, so that a value parley can judge fails
+	// with the other usage errors, before any request is sent (ADR 02).
+	logs.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, args); err != nil {
+			return err
+		}
+		_, err := sandboxLogsQuery(cmd)
+		return err
+	}
+	return logs
+}
+
+// sandboxLogsQuery is the query of GET /workspaces/:slug/sandboxes/:id/logs
+// for cmd's filter flags, a parameter only for each flag given. --since is
+// sent as given, for the hub to judge.
+func sandboxLogsQuery(cmd *cobra.Command) (url.Values, error) {
+	fs := cmd.Flags()
+	query := url.Values{}
+	if fs.Changed("source") {
+		source, _ := fs.GetString("source")
+		if !slices.Contains(logSources, source) {
+			return nil, usageError("%s --source takes process or policy, got %q", cmd.CommandPath(), source)
+		}
+		query.Set("source", source)
+	}
+	if fs.Changed("since") {
+		since, _ := fs.GetString("since")
+		query.Set("since", since)
+	}
+	if fs.Changed("tail") {
+		tail, _ := fs.GetInt("tail")
+		if tail < 1 {
+			return nil, usageError("%s --tail takes a number of lines of at least 1, got %d", cmd.CommandPath(), tail)
+		}
+		query.Set("tail", strconv.Itoa(tail))
+	}
+	return query, nil
+}
+
+// printSandboxLogs is the run step of parley sandbox logs: every page of the
+// selected lines, following next_cursor until there is none, or with
+// --follow the hub's stream of them. The filters are sent on every page,
+// since a cursor holds only the position.
+func printSandboxLogs(c *call) error {
+	query, err := sandboxLogsQuery(c.cmd)
+	if err != nil {
+		return err
+	}
+	r := apiRequest{method: c.decl.Method, path: routePath(c.decl.Path, c.args), query: query}
+	if follow, _ := c.cmd.Flags().GetBool("follow"); follow {
+		return followSandboxLogs(c, r)
+	}
+	for {
+		resp, err := c.client.send(c.ctx, r)
+		if err != nil {
+			return err
+		}
+		var page struct {
+			Items      []json.RawMessage `json:"items"`
+			NextCursor *string           `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(resp.body, &page); err != nil {
+			return clientError("the hub answered %d with a body that is not a page of log lines", resp.status)
+		}
+		for _, item := range page.Items {
+			if err := printLogLine(c, item); err != nil {
+				return err
+			}
+		}
+		if page.NextCursor == nil || *page.NextCursor == "" {
+			return nil
+		}
+		r.query.Set("cursor", *page.NextCursor)
+	}
+}
+
+// followSandboxLogs opens the stream of r's lines without a request timeout
+// and prints the data of each log frame as it arrives. The hub ends the
+// stream once the sandbox is deleted or the hub stops, which ends the
+// command with success; so does an interrupt, since the user follows the
+// lines until they stop.
+func followSandboxLogs(c *call, r apiRequest) error {
+	ctx, stop := signal.NotifyContext(c.ctx, os.Interrupt)
+	defer stop()
+	r.query.Set("follow", "true")
+	r.accept = "text/event-stream"
+	resp, err := c.client.open(ctx, r)
+	if err != nil {
+		if ctx.Err() != nil && c.ctx.Err() == nil {
+			return nil
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	frames := newFrameScanner(resp.Body)
+	for f, ok := frames.next(); ok; f, ok = frames.next() {
+		if f.event != "log" {
+			continue
+		}
+		if err := printLogLine(c, []byte(f.data)); err != nil {
+			return err
+		}
+	}
+	if err := frames.err(); err != nil && ctx.Err() == nil {
+		return clientError("the log stream of the hub at %s broke: %v", c.client.hubURL, err)
+	}
+	return nil
+}
+
+// printLogLine prints the log line line, a JSON object, compacted on a line
+// of its own.
+func printLogLine(c *call, line []byte) error {
+	var out bytes.Buffer
+	if err := json.Compact(&out, line); err != nil {
+		return clientError("the hub sent a log line that is not JSON: %v", err)
+	}
+	out.WriteByte('\n')
+	if _, err := c.stdout.Write(out.Bytes()); err != nil {
+		return clientError("cannot print a log line: %v", err)
+	}
+	return nil
+}
+
+// shellInSandbox is the run step of parley sandbox shell: it opens the
+// sandbox's terminal at the size of the local one and relays it until the
+// hub closes the connection, which ends the command with success. An
+// interrupt or a termination closes the connection too, so that the local
+// terminal is restored on the way out.
+func shellInSandbox(c *call) error {
+	ctx, stop := signal.NotifyContext(c.ctx, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	local := localTerminalOf(c.opts.stdin)
+	cols, rows := local.size()
+	query := url.Values{"cols": {strconv.Itoa(cols)}, "rows": {strconv.Itoa(rows)}}
+	ws, err := c.client.dialTerminal(ctx, apiRequest{method: c.decl.Method, path: routePath(c.decl.Path, c.args), query: query})
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+	return local.relay(ctx, ws, c.stdout, cols, rows)
+}
+
+// dialTerminal opens r, a GET of a terminal route, as a WebSocket with the
+// client's credential, the connection bounded by the client's timeout and
+// the session by ctx alone. The hub refuses a terminal with an error
+// envelope before the upgrade, which the WebSocket handshake does not keep,
+// so a refusal is asked for again through refusalOf.
+func (c *client) dialTerminal(ctx context.Context, r apiRequest) (*websocket.Conn, error) {
+	target, err := url.Parse(c.hubURL + apiPrefix + r.path + "?" + r.query.Encode())
+	if err != nil {
+		return nil, clientError("cannot build a request to the hub at %s: %v", c.hubURL, err)
+	}
+	switch target.Scheme {
+	case "http":
+		target.Scheme = "ws"
+	case "https":
+		target.Scheme = "wss"
+	default:
+		return nil, clientError("the hub URL %s is neither http nor https", c.hubURL)
+	}
+	config, err := websocket.NewConfig(target.String(), c.hubURL)
+	if err != nil {
+		return nil, clientError("cannot build a request to the hub at %s: %v", c.hubURL, err)
+	}
+	if c.credential != "" {
+		config.Header.Set("Authorization", "Bearer "+c.credential)
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	ws, err := config.DialContext(dialCtx)
+	if err == nil {
+		return ws, nil
+	}
+	var dial *websocket.DialError
+	if errors.As(err, &dial) {
+		if dial.Err == websocket.ErrBadStatus {
+			return nil, c.refusalOf(ctx, r)
+		}
+		err = dial.Err
+	}
+	if ctx.Err() == nil && errors.Is(dialCtx.Err(), context.DeadlineExceeded) {
+		return nil, clientError("the hub at %s did not open a terminal within %v", c.hubURL, c.timeout)
+	}
+	return nil, clientError("cannot open a terminal on the hub at %s: %v", c.hubURL, err)
+}
+
+// refusalOf sends r again as an upgrade request through the client, to read
+// the hub's error envelope, and returns it as the error. The request asks
+// for the upgrade, since the hub judges a request that does not ask for one
+// before the state of the sandbox. An upgrade granted this time is closed
+// unused, and is a client_error, as is an answer that is no error envelope.
+func (c *client) refusalOf(ctx context.Context, r apiRequest) error {
+	key := make([]byte, 16)
+	rand.Read(key)
+	r.header = http.Header{
+		"Upgrade":               {"websocket"},
+		"Connection":            {"Upgrade"},
+		"Sec-WebSocket-Key":     {base64.StdEncoding.EncodeToString(key)},
+		"Sec-WebSocket-Version": {"13"},
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	req, err := c.newRequest(reqCtx, r)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return c.failure(ctx, reqCtx, c.timeout, "cannot reach", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		return clientError("the hub at %s refused the terminal, then opened it when asked again", c.hubURL)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerSize+1))
+	if err != nil {
+		return c.failure(ctx, reqCtx, c.timeout, "cannot read the answer of", err)
+	}
+	if len(body) > maxAnswerSize {
+		return clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, maxAnswerSize)
+	}
+	if err := failureOf(&response{status: resp.StatusCode, body: body}); err != nil {
+		return err
+	}
+	return clientError("the hub at %s answered %d instead of opening the terminal", c.hubURL, resp.StatusCode)
 }
