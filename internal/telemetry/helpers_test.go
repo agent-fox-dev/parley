@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -98,6 +99,8 @@ var ingestionRoutes = []ingestionRoute{
 	{path: "/tools/errors", table: "tool_errors", valid: func() any { return map[string]any{"tool_name": "bash", "error_msg": "exit 1"} }},
 	{path: "/traces", table: "traces", valid: func() any { return map[string]any{"event_type": "tool.use"} }},
 	{path: "/postmortem", table: "postmortems", perRun: true, valid: func() any { return validPostmortem() }},
+	{path: "/events/batch", table: "run_events", batch: true, valid: func() any { return []any{map[string]any{"event_type": "run.start"}} }},
+	{path: "/traces/batch", table: "traces", batch: true, valid: func() any { return []any{map[string]any{"event_type": "tool.use"}} }},
 }
 
 // validPostmortem is a valid postmortem body with only its required members.
@@ -112,14 +115,17 @@ func validPostmortem() map[string]any {
 var recordTables = []string{"run_events", "session_outcomes", "tool_calls", "tool_errors", "traces", "postmortems"}
 
 // world is a hub on a settable clock whose analytical store fails every
-// write while failWrites is set, with the seed: alice owns every workspace
-// of the seed in the org acme, of which bob is a member; carol has nothing.
+// write while failWrites is set, and the third insert of the next
+// transaction that makes three once failThirdInsert is set, with the seed:
+// alice owns every workspace of the seed in the org acme, of which bob is a
+// member; carol has nothing.
 // Each user has an API key (the field of the user's name); alicePAT is a
 // PAT of alice's holding audit:write.
 type world struct {
 	*hubtest.Hub
-	clock      *clock
-	failWrites atomic.Bool
+	clock           *clock
+	failWrites      atomic.Bool
+	failThirdInsert atomic.Bool
 
 	alice, bob, carol          string
 	aliceKey, bobKey, carolKey string
@@ -134,7 +140,7 @@ func newWorld(t *testing.T, adjust ...func(*telemetry.Deps)) *world {
 	t.Helper()
 	w := &world{clock: newClock()}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, Compose: func(c *hub.Composition) {
-		c.AdjustTelemetry(func(d *telemetry.Deps) { d.DB = faultDB{DB: d.DB, fail: &w.failWrites} })
+		c.AdjustTelemetry(func(d *telemetry.Deps) { d.DB = faultDB{DB: d.DB, fail: &w.failWrites, failThird: &w.failThirdInsert} })
 		for _, a := range adjust {
 			c.AdjustTelemetry(a)
 		}
@@ -329,11 +335,13 @@ func errorOf(t *testing.T, raw []byte) (errorType, message string) {
 // errInjected is the failure faultDB injects.
 var errInjected = errors.New("injected store failure")
 
-// faultDB is the analytical store with a fault a test switches on: while
-// fail is set, every statement of a write transaction fails.
+// faultDB is the analytical store with faults a test switches on: while
+// fail is set, every statement of a write transaction fails; once
+// failThird is set, the third insert of the next transaction that makes
+// three fails, and failThird is cleared.
 type faultDB struct {
 	telemetry.DB
-	fail *atomic.Bool
+	fail, failThird *atomic.Bool
 }
 
 func (f faultDB) BeginTx(ctx context.Context) (telemetry.Tx, error) {
@@ -341,18 +349,25 @@ func (f faultDB) BeginTx(ctx context.Context) (telemetry.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return faultTx{Tx: tx, fail: f.fail}, nil
+	return &faultTx{Tx: tx, fail: f.fail, failThird: f.failThird}, nil
 }
 
-// faultTx is a transaction of faultDB.
+// faultTx is a transaction of faultDB, used by one goroutine.
 type faultTx struct {
 	telemetry.Tx
-	fail *atomic.Bool
+	fail, failThird *atomic.Bool
+	inserts         int
 }
 
-func (f faultTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+func (f *faultTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if f.fail.Load() {
 		return nil, errInjected
+	}
+	if strings.HasPrefix(strings.TrimSpace(query), "INSERT") {
+		f.inserts++
+		if f.inserts == 3 && f.failThird.CompareAndSwap(true, false) {
+			return nil, errInjected
+		}
 	}
 	return f.Tx.ExecContext(ctx, query, args...)
 }

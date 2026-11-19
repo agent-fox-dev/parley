@@ -2,7 +2,7 @@
 // events, session outcomes, tool calls, tool errors and trace records,
 // validated and stored once under their id in the analytical store, and
 // the one postmortem of a workspace and run, so that a run can be audited
-// later.
+// later. Run events and trace records are also taken in batches.
 //
 // Every ingestion route is a POST under
 // /workspaces/:slug/runs/:run_id/, built by one gate (ingest) that needs the
@@ -55,5 +55,7 @@ func (c *Component) Routes() []server.Route {
 		c.ingest("/tools/errors", true, single(postRecord(c, toolErrors, c.readToolError))),
 		c.ingest("/traces", true, single(postRecord(c, traces, c.readTrace))),
 		c.ingest("/postmortem", true, single(c.postPostmortem)),
+		c.ingest("/events/batch", false, batch(c, runEvents, c.readRunEvent)),
+		c.ingest("/traces/batch", false, batch(c, traces, c.readTrace)),
 	}
 }
