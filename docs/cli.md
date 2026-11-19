@@ -392,6 +392,7 @@ Available Commands:
   sandbox           Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles
   scm               Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
+  session           Start, report the token usage of, complete and read agent sessions
   tokens            Create, read, change and revoke your personal access tokens
   user              Read and update your own profile
   vars              Create, list, update, delete and resolve variables
@@ -3083,6 +3084,35 @@ deliveries with, and read what the hub recorded of them, through the hub's
 
 More than one of `--secret`, `--from-stdin` and `--generate`, or a missing
 `<slug>`, is a `usage_error` with exit status `2`, raised before any request.
+
+### `parley session`
+
+These commands drive the [session routes](api.md#sessions): an agent opens
+a session on a workspace, reports the tokens it spends and completes it
+with its outcome. Each sends one request with the credential as
+`Authorization: Bearer` and the session id as one percent-encoded path
+segment, and prints the hub's answer on stdout with exit status `0`, for a
+`201` and a `200` alike; a refusal of the hub's is written to stderr as
+received, with nothing on stdout and exit status `1`. `parley session` run
+without a command prints its help and exits `0`.
+
+| Command | Request | Flags sent as |
+|---|---|---|
+| `parley session start <workspace-slug> [--id <uuid>] [--run-id <id>] [--node-id <id>] [--archetype <name>] [--model <name>] [--metadata <json>]` | `POST /api/v1/sessions` | the body `{"workspace_slug":…}` with `id`, `run_id`, `node_id`, `archetype`, `model` and `metadata` when given; `metadata` is the JSON value, not a string holding it |
+| `parley session usage <session-id> --model <name> [--input <n>] [--output <n>] [--cache-read <n>] [--id <uuid>]` | `POST /api/v1/sessions/<session-id>/usage` | the body `{"model":…}` with `input_tokens`, `output_tokens`, `cache_read_tokens` and `id` when given |
+| `parley session complete <session-id> [--status completed\|failed\|timeout] [--error <text>] [--duration-ms <n>]` | `POST /api/v1/sessions/<session-id>/complete` | the body `{"status":…}`, `completed` without `--status`, with `error_message` and `duration_ms` when given |
+| `parley session get <session-id>` | `GET /api/v1/sessions/<session-id>` | no body |
+| `parley session list [--workspace <slug>] [--include-forks] [--run-id <id>] [--status <s>] [--since <time>] [--limit <n>] [--cursor <c>]` | `GET /api/v1/sessions` | `workspace`, `include_forks=true` for `--include-forks`, `run_id`, `status`, `since`, `limit`, `cursor` |
+
+A flag not given sends no member or parameter, so that the hub's default
+applies; the commands check nothing else, and a value the hub refuses is
+its `400` as received.
+
+A command without its argument, `parley session usage` without `--model`,
+a `--metadata` that is not JSON (`parley session start takes --metadata as
+a JSON document, got "{oops"`), and an `--input`, `--output`,
+`--cache-read`, `--duration-ms` or `--limit` that is not an integer are a
+`usage_error` with exit status `2`, before any request is sent.
 
 ### `parley credential-helper`
 

@@ -2504,7 +2504,7 @@ absent, so a client may send back what it read:
 | `auto_change` | `true` or `false`; absent, `true` |
 | `token` | an object `{name, permissions, paths, expires}` of the token to mint with the fork, bound to it and owned by the caller: `name` a string, absent `fork:<fork slug>`; `permissions` and `paths` lists of strings, judged by the minting component as for [`POST /api/v1/workspaces/{slug}/tokens`](#post-apiv1workspacesslugtokens); `expires` a string, a whole number above zero followed by `m`, `h` or `d`, and the token's `expires_at` is the fork's creation time plus `expires`. Absent `expires`, the token never expires (`expires_at` `null`). A PAT caller must hold `tokens:manage` and is held to the subset rule |
 | `purpose` | a string of at most 1024 characters (Unicode code points); absent, `null` |
-| `session_id` | a UUID in its hyphenated form, the session the fork is created in, judged by the session-linking rule for the caller and the parent; the fork stores it, and its event carries it, as the rule gives it back, in lower case, and the link of the fork to the session is recorded in the fork's transaction. No session component is part of the hub yet, so no session exists and every `session_id` is refused with `400` `unknown_session` |
+| `session_id` | a UUID in its hyphenated form, the session the fork is created in, judged by the session-linking rule for the caller and the parent; the fork stores it, and its event carries it, as the rule gives it back, in lower case, and the link of the fork to the session is recorded in the fork's transaction. The rule is that of [Sessions](#sessions): the session exists, the caller created it (or is the admin token), and it is on the parent or on a fork of it |
 | `sandbox` | an object, the sandbox to create with the fork, handed as received, unread, to the sandbox component with the fork's `session_id` and `purpose` as defaults; the component judges it as the body of [`POST /api/v1/workspaces/{slug}/sandboxes`](#post-apiv1workspacesslugsandboxes) on the new fork (a PAT's `sandboxes:write` first, then the body, the session, the secrets and the quotas; a `purpose` taken from the fork is cut to 200 characters) and answers the sandbox object, stored in the fork's transaction with its hub credential and its `parley.sandbox.create` event, or its refusal, on which no fork is created. The sandbox is provisioned once the fork's transaction has committed, within about a second. On a hub without sandboxes every `sandbox` is refused with `404` `sandboxes_disabled` and no fork is created |
 
 ```json
@@ -2564,7 +2564,7 @@ object as it gave it:
 | `201 Created` | the fork was created; the body is `{workspace, remote}`, and `token` and `sandbox` when asked for |
 | `200 OK` | a replay of a recorded `Idempotency-Key` with the same body: the first answer without `token.token`; nothing is created |
 | `400` `invalid_request` | the body is not an object (the messages of [Request bodies](#request-bodies)), or a member is refused, the message naming it: `name: must be a string`, `name: must be 1 to 32 characters long`, `name: may hold only the letters a to z, digits and hyphens`, `name: must start with a letter or digit`, `name: must end with a letter or digit`, `name: must not contain two hyphens in a row`; `ref: must be a string`, `ref: must not be empty`; `ttl: must be a string`, `ttl: must end in one unit: m, h or d` and the other duration rules, `ttl: must be at least 5m`, `ttl: must be at most 30d, the hub's [forks].max_ttl`; `auto_change: must be true or false`; `token: must be an object whose name and expires are strings and whose permissions and paths are lists of strings`, `token: expires: must end in one unit: m, h or d` and the other duration rules (`token: expires: must be above zero` for `0h`); `purpose: must be a string`, `purpose: must be at most 1024 characters long`; `session_id: must be a string`, `session_id: must be a UUID`; `sandbox: must be an object`; or the minting component refuses the token, with the messages of `POST /api/v1/user/tokens` |
-| `400` `unknown_session` | the body has a `session_id` the session-linking rule refuses, or the hub has no session component (`session_id: no session "<id>"`) |
+| `400` `unknown_session` | the body has a `session_id` the session-linking rule refuses (`session_id: no session "<id>"`) |
 | `400` `not_supported_on_fork` | the workspace is itself a task fork (`workspace "demo--task1" is a task fork, which cannot be forked; fork its parent instead`) |
 | `400` `fork_ref_not_found` | the base branch is not a branch of the parent: a tag, a commit id or a full ref name is not one (`ref: "nope" is not a branch of "demo"`) |
 | `403` `insufficient_scope` | a PAT without `workspaces:write`; a PAT without `tokens:manage` whose body has `token` (`token: minting a token needs the scope tokens:manage`); or a token beyond what the calling PAT holds, with the subset rule's messages |
@@ -3871,7 +3871,7 @@ A commit object, as every route that answers commits writes it:
 | `author`, `committer` | `{"name": …, "email": …, "time": …}`, `time` an RFC 3339 timestamp in UTC, such as `2026-01-02T03:04:05Z` |
 | `message` | the whole message, as written, its last newline included when it has one |
 | `change` | `{"workspace_slug": …, "number": …, "version": …}` for the change whose version head the commit is or that landed it (a change that landed it first, then the lowest number); `version` is the highest version with the commit as its head or, for a landed commit, the version whose head it was landed from, `null` when there is none; on a task fork's slug, only the parent's changes whose source is the fork; `null` for a commit of no change |
-| `session_id` | the agent session that introduced the commit: for the head of a change's version, the session of the first version with that head (the push, API commit or rebase that recorded it); for a commit a land wrote in place of a version's commit, the session the land was asked in; `null` for a write in no session and for any other commit, such as one below a version's head or on a branch that is no change's source. No session feature is registered yet, so every session is refused and every `session_id` here is `null` |
+| `session_id` | the agent session that introduced the commit: for the head of a change's version, the session of the first version with that head (the push, API commit or rebase that recorded it); for a commit a land wrote in place of a version's commit, the session the land was asked in; `null` for a write in no session and for any other commit, such as one below a version's head or on a branch that is no change's source |
 | `stats` | only where the route says: `{"files_changed": …, "insertions": …, "deletions": …}`, the commit against its first parent, or against the empty tree for a root commit; renamed and copied files are found, and a binary file counts as changed with no lines |
 
 A file change, as every route that answers file changes writes it (the
@@ -4395,8 +4395,7 @@ The commit and the rebase route take a `session_id`, the agent session the
 write belongs to. It is checked after the body and before the branch is
 read: a session the hub does not know for the caller and the workspace is
 `400` `unknown_session` (`session_id: no session "…"`), and nothing moves.
-No session feature is registered yet, so every `session_id` is refused
-that way. An accepted session goes, in lower case, onto the write's
+An accepted session goes, in lower case, onto the write's
 events, the version the write records and, for a commit, the commit
 object's `session_id`.
 
@@ -5943,8 +5942,7 @@ nothing:
 6. the state of `{slug}`: `409` `workspace_archived`, `workspace_busy` or
    `workspace_not_ready`;
 7. `session_id` must pass the session-linking rule: `400`
-   `unknown_session` otherwise. Until the session feature is installed,
-   every `session_id` is refused;
+   `unknown_session` otherwise (see [Sessions](#sessions));
 8. the request guards a feature installed on the hub registers, each asked
    with the caller, `{slug}`, the changes the land would cover (bottom
    first, each at its current version) and the `override`: the first that
@@ -7790,7 +7788,7 @@ runtime nothing:
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug |
 | `403` `forbidden` | read access only; or the admin token (`the admin token cannot create a sandbox`) |
 | `400` `invalid_request` | the body is not an object, or a member breaks its rule, the message naming the member: `profile: no profile "nope"; name one of agent, plain`, `profile: no profile is marked default; name one of …`, `ttl: must be from 1m to 4h`, `command: must have 1 to 256 arguments`, `env: key "PARLEY_X" must not start with PARLEY_ or OPENSHELL_`, `checkout: branch is taken on a task fork only`, `checkout: ref "nope" names no commit of workspace "demo"`, `restore_from: the sandbox "…" has no checkpoint to restore`, … |
-| `400` `unknown_session` | the session-linking rule refuses `session_id`, or the hub has no session component (`session_id: no session "<id>"`) |
+| `400` `unknown_session` | the session-linking rule refuses `session_id` (`session_id: no session "<id>"`) |
 | `409` `workspace_archived` | the workspace is archived |
 | `409` `parent_archived` | the workspace is a fork whose parent is archived |
 | `409` `workspace_busy` | the workspace's clone has not finished, or a maintenance operation runs on it |
@@ -9614,6 +9612,242 @@ scopes are then read in one consistent read.
 | `404` `not_found` | a workspace the caller has no level on or that does not exist (`workspace not found`) |
 | `405` `method_not_allowed` | `PATCH` or `DELETE` on this path (`Allow: GET`) |
 | `500` `internal` | a scope could not be read (`internal error`); no items are answered |
+
+## Sessions
+
+An agent session ties together an agent's work on a workspace (forks,
+pushes, commits, change versions, claims, lands and sandboxes) and the
+tokens it spent. An agent opens a session for a workspace, reports token
+usage while it works and completes the session with an outcome. The other
+surfaces that take a `session_id` (a fork, a push option
+`parley.session`, an API commit or rebase, a change, a land, a claim, a
+sandbox) ask the session-linking rule below, and those that create
+something record a link to the session in their own transaction.
+
+Session ids and usage ids are UUIDs in the 8-4-4-4-12 hexadecimal form, in
+any letter case in a body, a path or a query, stored and returned in lower
+case; a create without an `id` gets a version 4 UUID. A `run_id` has the
+form `YYYYMMDD_HHMMSS_` followed by six lower-case hexadecimal digits.
+`node_id`, `archetype` and `model` are labels of at most 255 characters.
+
+**The session object.** Every session route answers this object, built when
+the answer is built, so a usage report or a recorded link shows in the next
+read:
+
+```json
+{"id":"0b7e1c52-3f4a-4d8e-9b21-5c6d7e8f9a01","workspace_slug":"demo","run_id":null,"node_id":null,"archetype":null,"model":"m1","status":"completed","user_id":"…","credential_type":"api_key","started_at":"2026-11-19T10:00:00Z","ended_at":"2026-11-19T10:01:30Z","duration_ms":90000,"error_message":null,"cache_creation_input_tokens":0,"metadata":null,"token_summary":{"total_input_tokens":10,"total_output_tokens":5,"total_cache_read_tokens":0,"models_used":["m1"]},"forks":["demo--t1"],"changes":[{"workspace":"demo","number":1}],"sandboxes":[],"counts":{"forks":1,"changes":1,"sandboxes":0,"versions":1,"pushes":0,"commits":0,"claims":0,"lands":0}}
+```
+
+| Member | Value |
+|---|---|
+| `id` | the session id |
+| `workspace_slug` | the workspace the session works in, a repository or a task fork |
+| `run_id`, `node_id`, `archetype`, `model` | as sent at creation, `null` when not sent |
+| `status` | `active`, `completed`, `failed`, `timeout` or `terminated` |
+| `user_id` | the user who created the session; `null` for the admin token |
+| `credential_type` | `admin_token`, `api_key` or `pat`, the credential that created it |
+| `started_at`, `ended_at` | [timestamps](#timestamps-and-durations); `ended_at` is `null` while `active` |
+| `duration_ms` | an integer, `null` until a complete sets it; a forced close leaves it `null` |
+| `error_message` | a string or `null` |
+| `cache_creation_input_tokens` | an integer, `0` until a complete sets it |
+| `metadata` | the JSON value sent at creation, as JSON, `null` when none |
+| `token_summary` | the sums of the session's usage records: `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, and `models_used`, the distinct models in ascending order |
+| `forks` | the slugs of the task forks created in the session, oldest first |
+| `changes` | `{workspace, number}` of each change with a version recorded in the session, in the order each was first linked |
+| `sandboxes` | `{workspace, id}` of each sandbox created in the session, oldest first |
+| `counts` | the numbers of links per kind: `forks`, `changes` (distinct changes), `sandboxes`, `versions`, `pushes`, `commits`, `claims`, `lands` |
+
+`forks`, `changes` and `sandboxes` hold at most their first 500 entries;
+`counts` always holds the true totals. A link stays when the fork, sandbox,
+change or workspace it names is removed.
+
+A session is `active` from its creation; a complete moves it to
+`completed`, `failed` or `timeout`, and a forced close to `terminated`. The
+four end states are final.
+
+**Who may read a session.** Its creator, with any credential of that user;
+any caller who may read its workspace; for a session on a task fork, any
+caller who may read the fork's parent, also after the fork is gone; and the
+admin token. The workspace's status plays no part, and a session whose
+workspace no longer exists stays readable by its creator, the admin token
+and, for a fork, the readers of its parent. A PAT bound to a workspace
+reads only sessions whose workspace its binding covers, also those its
+user created. A caller who may not read a session gets `404` `not_found`
+with the message `session not found`, the same answer as for an id that
+names no session; a path id that is not a UUID is `400` `invalid_request`.
+A PAT needs `sessions:read` or `sessions:write` to read and
+`sessions:write` to write (`403` `insufficient_scope`).
+
+**Who may change a session.** A complete and a usage report are accepted
+from the creator, with any credential of that user, and from the admin
+token; a session the admin token opened is changed only by the admin
+token. Anyone else who may read the session gets `403` `forbidden`.
+
+**The session-linking rule.** A `session_id` named for an operation on a
+workspace is accepted when the session exists, the caller created it or is
+the admin token, and the session's workspace is the operation's workspace,
+or one of the two is a task fork of the other; the session's own parent
+is remembered, so a session on a fork that is gone still links to the
+parent. Two forks of one parent do not link to each other. The session's
+status is not read, so work may be linked to an ended session. Anything
+else is `400` `unknown_session` on the surface that asked, with one
+answer whatever the reason.
+
+**A forced close.** Archiving a workspace ends the `active` sessions of the
+workspace and of its forks, and deleting a workspace or removing or
+expiring a task fork ends those of the workspace removed, in the same store
+transaction: `status` `terminated`, `ended_at` the time of the operation,
+`error_message` `workspace archived`, `workspace deleted` or `fork
+expired`. Each closed session gets one `parley.session.force_closed` event
+(`resource_type` `session`, `resource_id` and `session_id` the session id,
+actor `system`, metadata `{"reason": …}`). After it a usage report is `409`
+`session_not_active` and a complete answers `200` with the `terminated`
+session.
+
+## `POST /api/v1/sessions`
+
+Opens a session. The body:
+
+| Member | Value |
+|---|---|
+| `workspace_slug` | required, the workspace (a repository or a task fork) the caller may write to |
+| `id` | a UUID; a new version 4 UUID when absent |
+| `run_id`, `node_id`, `archetype`, `model` | optional labels, as above |
+| `metadata` | any JSON value, kept as sent |
+
+A JSON `null` member counts as absent. The answer is `201` with the session
+object, `status` `active`, `started_at` the current time.
+
+Sending an `id` that exists, created by the same user (or by the admin
+token, both times) for the same workspace, answers `200` with the stored
+session and changes nothing, also when the other members differ and when
+the workspace has been archived since. Of several creates with one `id` at
+once, exactly one stores the session and answers `201`; the others answer
+`200`.
+
+| Status | When, in this order |
+|---|---|
+| `403` `insufficient_scope` | a PAT without `sessions:write` |
+| `400` `invalid_request` | `workspace_slug` missing or not a non-empty string (`workspace_slug is required and must be a non-empty string`) |
+| `404` `not_found` | a PAT bound to a workspace whose binding does not cover `workspace_slug`; no such workspace; the caller's level on it is none (`workspace not found`, the same bytes in each case) |
+| `403` `forbidden` | an org member, who may only read the workspace |
+| `400` `invalid_request` | `id` not a UUID, `run_id` not of the run id form, a label not a string or longer than 255 characters, the message naming the member |
+| `409` `conflict` | the `id` exists for another creator or another workspace |
+| `409` `workspace_archived` | the workspace is archived and the `id` is not one this caller may replay; a workspace in another status accepts sessions |
+
+## `POST /api/v1/sessions/{id}/complete`
+
+Ends an `active` session. The body: `status` (required: `completed`,
+`failed` or `timeout`), `error_message` (a string), `duration_ms` and
+`cache_creation_input_tokens` (integers of at least 0). The status, the
+end, the message, the duration (the milliseconds between `started_at` and
+`ended_at` when absent) and the cache tokens (`0` when absent) are set in
+one step, and the answer is `200` with the session. A session that has
+ended already, `terminated` included, is answered `200` as it is, and
+nothing changes; of two completes at once exactly one takes effect.
+
+| Status | When, in this order |
+|---|---|
+| `400` `invalid_request` | the path id is not a UUID |
+| `404` `not_found` | the caller may not read the session, or no such session (`session not found`) |
+| `403` `forbidden` | the caller may read it and may not change it |
+| `400` `invalid_request` | `status` missing or not one of the three (`terminated` and `active` included); `duration_ms` or `cache_creation_input_tokens` negative or not an integer; `error_message` not a string |
+
+## `POST /api/v1/sessions/{id}/usage`
+
+Reports one token usage increment of an `active` session. The body:
+`model` (required, a non-blank string of at most 255 characters), `id` (a
+UUID; a new one when absent) and `input_tokens`, `output_tokens`,
+`cache_read_tokens` (integers of at least 0, `0` when absent). The answer
+is `201` with the usage record:
+
+```json
+{"id":"…","session_id":"…","workspace_slug":"demo","model":"m1","input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"reported_at":"2026-11-19T10:00:30Z"}
+```
+
+`workspace_slug` is the session's, and `reported_at` the hub's time.
+Sending the `id` of a record of the same session answers `200` with the
+stored record and stores nothing, also when the body differs and when the
+session has ended since.
+
+| Status | When, in this order |
+|---|---|
+| `400`, `404`, `403` | as for a complete |
+| `400` `invalid_request` | `model` missing, blank, not a string or too long; `id` not a UUID; a count negative or not an integer; the message naming the member |
+| `409` `conflict` | the `id` is a record of another session |
+| `409` `session_not_active` | the session has ended |
+
+## `GET /api/v1/sessions/{id}`
+
+Answers `200` with the session object to a caller who may read it (see
+[Sessions](#sessions)).
+
+## `GET /api/v1/sessions/{id}/usage`
+
+Lists the session's usage records, readable as the session is, in the
+[list envelope](#lists), ordered by `reported_at` and then `id`, newest
+first, or oldest first with `order=asc` (`order` other than `asc` and
+`desc` is `400` `invalid_request`), with `limit` and `cursor`. The answer
+adds `session_id` and `totals`, which has the shape of `token_summary` and
+covers every record of the session, whatever the page:
+
+```json
+{"items":[{"id":"…","session_id":"…","workspace_slug":"demo","model":"m1","input_tokens":10,"output_tokens":5,"cache_read_tokens":0,"reported_at":"2026-11-19T10:00:30Z"}],"next_cursor":null,"session_id":"…","totals":{"total_input_tokens":10,"total_output_tokens":5,"total_cache_read_tokens":0,"models_used":["m1"]}}
+```
+
+## `GET /api/v1/sessions`
+
+Lists, in the [list envelope](#lists), the session objects the caller may
+read: every session for the admin token; otherwise the sessions the caller
+created, those of every workspace the caller may read, and those on the
+task forks, removed ones included, of a workspace the caller may read. A
+PAT bound to a workspace lists only sessions whose workspace its binding
+covers. The order is `started_at` and then `id`, newest first.
+
+| Parameter | Effect |
+|---|---|
+| `workspace` | only the sessions of this workspace |
+| `include_forks` | `true` adds the sessions on the task forks of `workspace`, forks that no longer exist included; `false` (the default) does not; it needs `workspace` |
+| `run_id`, `status`, `credential_type` | only the sessions with this value |
+| `since`, `until` | only the sessions with `since` ≤ `started_at` < `until`; RFC 3339 with any offset |
+| `order` | `desc` (the default) or `asc` |
+| `limit`, `cursor` | [paging](#lists) |
+
+Filters combine. A `status`, `credential_type`, `order` or `include_forks`
+outside its values, `include_forks` without `workspace`, a `run_id` that is
+not of the run id form, a `since` or `until` that is not RFC 3339, and a
+parameter given twice are `400` `invalid_request` naming the parameter. A
+`workspace` the caller may not read, one that does not exist, or one a
+bound PAT's binding does not cover is `404` `not_found` (`workspace not
+found`).
+
+## `GET /api/v1/workspaces/{slug}/cost`
+
+Sums the token usage reported for the workspace over a window, in token
+counts: no price is applied. Any reader of the workspace may call it,
+whatever its status; a PAT needs `sessions:read` or `sessions:write`.
+
+| Parameter | Effect |
+|---|---|
+| `group_by` | `day` (the default; the key is the UTC date `YYYY-MM-DD`), `session` (the session id) or `model` |
+| `since` | the start of the window, included; 24 hours before now when absent |
+| `until` | the end of the window, excluded; now, rounded up to a whole second, when absent |
+| `limit`, `cursor` | paging of the groups |
+
+`since` and `until` take any offset and are moved to UTC and cut to whole
+seconds. Only the workspace's own records count: those of sessions on its
+task forks belong to the forks.
+
+```json
+{"workspace":"demo","period":{"since":"2026-09-01T00:00:00Z","until":"2026-09-02T00:00:00Z"},"group_by":"day","totals":{"input_tokens":10,"output_tokens":0,"cache_read_tokens":0,"sessions":1},"items":[{"key":"2026-09-01","input_tokens":10,"output_tokens":0,"cache_read_tokens":0,"sessions":1}],"next_cursor":null}
+```
+
+`period` holds the window used; `totals` covers the whole window on every
+page; `sessions` is the number of distinct sessions; `items` are ordered by
+`key`, `[]` for a window without records. A `group_by` outside the three,
+a `since` or `until` that is not RFC 3339, a `since` that is not before
+`until`, a `limit` outside 1 to 200 and a cursor of another query are `400`
+`invalid_request`; no access is `404` `not_found` (`workspace not found`).
 
 ## `GET /api/v1/events`
 
