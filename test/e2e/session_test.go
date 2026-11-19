@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"slices"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,13 +21,11 @@ import (
 
 // sessionHub is a hub holding the ready workspace demo and its task fork
 // demo--t1, both owned by alice in the organization acme, of which bob is a
-// member. Each of them has an API key. Its clock runs ahead of the wall
-// clock by ahead.
+// member. Each of them has an API key.
 type sessionHub struct {
 	*hubtest.Hub
 	comp                         *hub.Composition
 	alice, bob, aliceKey, bobKey string
-	ahead                        atomic.Int64
 }
 
 // startSessionHub starts the hub and stores its users and workspaces.
@@ -36,7 +33,6 @@ func startSessionHub(t *testing.T) *sessionHub {
 	t.Helper()
 	h := &sessionHub{}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
-		Now:     func() time.Time { return time.Now().Add(time.Duration(h.ahead.Load())) },
 		Compose: func(c *hub.Composition) { h.comp = c },
 	})
 	acme := h.CreateOrg(t, "acme")
@@ -179,10 +175,6 @@ func TestSession_ADeveloperFollowsTheWorkLinkedToASessionAndItsCost(t *testing.T
 	if err != nil {
 		t.Fatalf("record the fork and version links: %v", err)
 	}
-	// The cost report's window ends, exclusive, at the clock's whole
-	// second, which must be past the one the usage was reported in.
-	h.ahead.Store(int64(2 * time.Second))
-
 	s, body := h.read(t, id)
 	if !slices.Equal(s.Forks, []string{"demo--t1"}) || !slices.Equal(s.Changes, []session.ChangeRef{{Workspace: "demo", Number: 1}}) ||
 		s.Counts.Forks != 1 || s.Counts.Changes != 1 || s.Counts.Versions != 1 {

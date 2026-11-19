@@ -110,14 +110,22 @@ func (c *Component) costRoute(w http.ResponseWriter, r *http.Request) error {
 // costPeriodOf reads the window of a cost report from its query q: since,
 // 24 hours before the clock's time when absent, and until, the clock's
 // time when absent, both RFC 3339 with any offset, in UTC truncated to
-// whole seconds, as stored timestamps are. since must be before until.
+// whole seconds, as stored timestamps are. An absent until is the clock's
+// time rounded up to a whole second instead: a record is stored with the
+// whole second it was reported in, so a window that ended at the clock's
+// time truncated would leave out what was reported in the current second.
+// since must be before until.
 func (c *Component) costPeriodOf(q url.Values) (costPeriod, error) {
-	now := c.deps.Now().UTC().Truncate(time.Second)
-	since, err := costBound(q, "since", now.Add(-costWindow))
+	now := c.deps.Now().UTC()
+	since, err := costBound(q, "since", now.Truncate(time.Second).Add(-costWindow))
 	if err != nil {
 		return costPeriod{}, err
 	}
-	until, err := costBound(q, "until", now)
+	end := now.Truncate(time.Second)
+	if end.Before(now) {
+		end = end.Add(time.Second)
+	}
+	until, err := costBound(q, "until", end)
 	if err != nil {
 		return costPeriod{}, err
 	}

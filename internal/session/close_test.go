@@ -348,7 +348,9 @@ func TestCloseActive_RacesWithACompleteAndOneWins(t *testing.T) {
 			closeErr     error
 			completePath = "/api/v1/sessions/" + id + "/complete"
 		)
-		wg.Go(func() { status, answer, postErr = w.rawPostTo(completePath, w.aliceKey, map[string]any{"status": "completed"}) })
+		wg.Go(func() {
+			status, answer, postErr = w.rawPostTo(completePath, w.aliceKey, map[string]any{"status": "completed"})
+		})
 		wg.Go(func() { n, closeErr = w.closeActive(demo, reason, w.clock.Now()) })
 		wg.Wait()
 		if postErr != nil || closeErr != nil {

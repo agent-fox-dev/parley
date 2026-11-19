@@ -270,8 +270,8 @@ func TestCost_DefaultsTheWindowToTheLastDayAndNormalisesItToUTC(t *testing.T) {
 		name, query, wantSince, wantUntil string
 		wantInput                         float64
 	}{
-		{"no bounds: the 24 hours before the clock", "", "2026-09-01T12:00:00Z", "2026-09-02T12:00:00Z", 10},
-		{"no until: up to the clock", "since=2026-09-01T11:59:59Z", "2026-09-01T11:59:59Z", "2026-09-02T12:00:00Z", 11},
+		{"no bounds: the 24 hours before the clock, up to its next whole second", "", "2026-09-01T12:00:00Z", "2026-09-02T12:00:01Z", 110},
+		{"no until: up to the clock's next whole second", "since=2026-09-01T11:59:59Z", "2026-09-01T11:59:59Z", "2026-09-02T12:00:01Z", 111},
 		{"no since: 24 hours before the clock", "until=2026-09-02T12:00:01Z", "2026-09-01T12:00:00Z", "2026-09-02T12:00:01Z", 110},
 		{"offsets are moved to UTC and fractions cut", "since=2026-09-01T02:00:00%2B02:00&until=2026-09-01T03:00:00.9%2B02:00", "2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z", 0},
 	}
