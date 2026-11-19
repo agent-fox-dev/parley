@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -193,7 +194,25 @@ func TestBoundTokens_AnAgentLeavesItsBindingRepeatedlyAndTheOwnerGetsOneEventAMi
 
 func TestBoundTokens_AMaintenancePassRevokesATokenWhoseWorkspaceIsGone(t *testing.T) {
 	parallel(t)
-	h := startBoundTokensHub(t, hubtest.Config{})
+	// passed hears of each maintenance pass once the tasks of known names,
+	// token_binding_sweep among them, have run. The first pass runs in the
+	// background right after the start; the token bound to gone is issued
+	// only after it, so that no pass sweeps it before the test expects one.
+	passed := make(chan struct{}, 1)
+	h := startBoundTokensHub(t, hubtest.Config{Compose: func(c *hub.Composition) {
+		c.AddMaintenanceTask("bound_tokens_test_pass", func(context.Context, *hub.Runtime) error {
+			select {
+			case passed <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+	}})
+	select {
+	case <-passed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no maintenance pass within 10 s of the start")
+	}
 	alice := h.CreateUser(t, "alice")
 	h.AddWorkspace(t, access.Record{Slug: "w1", OwnerID: alice, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository, Status: access.StatusReady})
 	live := h.IssuePAT(t, identity.PATSpec{UserID: alice, Permissions: []string{"git:read"}, Workspace: "w1"})
