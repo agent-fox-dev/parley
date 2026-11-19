@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -47,8 +48,9 @@ func TestScrub(t *testing.T) {
 }
 
 // The runtime fails every command of the sandbox with the text of a row; the
-// checkpoint's error, its event's and the line the hub logs carry the text
-// scrubbed of the sandbox's credential secret and its hub credential.
+// checkpoint's error, its event's, the line the hub logs and the message of
+// the checkpoint route's answer carry the text scrubbed of the sandbox's
+// credential secret and its hub credential.
 func TestScrub_TheRuntimeErrorOfACheckpoint(t *testing.T) {
 	t.Parallel()
 	const secretValue, hubValue = "sk-secret-value-1234", "hub-credential-5678"
@@ -85,8 +87,14 @@ func TestScrub_TheRuntimeErrorOfACheckpoint(t *testing.T) {
 			if err := json.Unmarshal([]byte(strings.TrimSpace(logs.String()[logged:])), &line); err != nil {
 				t.Fatalf("the hub logged %q: %v", logs.String()[logged:], err)
 			}
+			// The route asks for one more checkpoint, which fails the same.
+			a := h.call(t, http.MethodPost, "/workspaces/demo--t1/sandboxes/"+id+"/checkpoint", h.key, nil)
+			if a.status != http.StatusBadGateway {
+				t.Errorf("POST checkpoint = %d %s; want 502", a.status, a.body)
+			}
 			for _, sink := range []struct{ name, text string }{
 				{"checkpoint.error", *cp.Error}, {"the event's error", evText}, {"the logged error", line.Error}, {"the returned error", err.Error()},
+				{"the route's answer", a.err.Message},
 			} {
 				if strings.Contains(sink.text, secretValue) || strings.Contains(sink.text, hubValue) || len(sink.text) > 1024 {
 					t.Errorf("%s = %q (%d bytes); want neither value and at most 1,024 bytes", sink.name, sink.text, len(sink.text))

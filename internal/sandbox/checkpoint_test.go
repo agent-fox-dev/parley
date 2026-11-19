@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -429,4 +430,132 @@ func TestCheckpoint_RecordsAFailureAndKeepsTheLastRefs(t *testing.T) {
 			})
 		}
 	}
+}
+
+// The checkpoint route's behaviours share one hub: each row has a sandbox of
+// its own.
+func TestCheckpointRoute(t *testing.T) {
+	t.Parallel()
+	h := startCheckpointHub(t)
+	path := func(id string) string { return "/workspaces/demo--t1/sandboxes/" + id + "/checkpoint" }
+	// The request comes a minute after the sandbox was made, so that the
+	// checkpoint's time is the request's.
+	h.clock.Advance(time.Minute)
+
+	t.Run("saves a ready sandbox for the caller and answers with it", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			edit func(*sandbox.Record)
+			none bool
+		}{
+			{name: "uncommitted work on t1"},
+			{name: "a sandbox without hub access", none: true, edit: func(r *sandbox.Record) {
+				r.HubAccess, r.Snapshot.HubAccess = nil, "none"
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				id, dir := h.workSandbox(t, tc.edit)
+				h.cloneWork(t, dir)
+				writeWork(t, dir, map[string]string{"notes.txt": "unsaved\n"})
+
+				a := h.call(t, http.MethodPost, path(id), h.key, nil)
+				var got struct {
+					ID         string                   `json:"id"`
+					State      string                   `json:"state"`
+					Checkpoint *sandbox.CheckpointState `json:"checkpoint"`
+				}
+				if a.status != http.StatusOK || json.Unmarshal(a.body, &got) != nil || got.ID != id || got.State != sandbox.StateReady {
+					t.Fatalf("POST checkpoint = %d %s; want 200 with the ready sandbox", a.status, a.body)
+				}
+				evs := h.sandboxEvents(t, sandbox.EventCheckpoint, id)
+				if tc.none {
+					if got.Checkpoint != nil || len(evs) != 0 {
+						t.Errorf("checkpoint = %+v with %d events; want null and none", got.Checkpoint, len(evs))
+					}
+					return
+				}
+				cp := got.Checkpoint
+				if cp == nil || !cp.OK || !cp.At.Equal(h.clock.Now()) || len(cp.Refs) != 1 || !cp.Refs[0].Dirty {
+					t.Fatalf("checkpoint = %+v; want ok at %v with one dirty ref", cp, h.clock.Now())
+				}
+				if stored := h.storedCheckpoint(t, id); !reflect.DeepEqual(stored, cp) {
+					t.Errorf("the stored checkpoint = %+v; want the answer's %+v", stored, cp)
+				}
+				if len(evs) != 1 || evs[0].actorType != "api_key" || evs[0].actorID == nil || *evs[0].actorID != h.dana {
+					t.Errorf("the checkpoint events = %+v; want one by dana's API key", evs)
+				}
+			})
+		}
+	})
+
+	t.Run("refuses a sandbox that is not ready without calling the runtime", func(t *testing.T) {
+		prior, err := json.Marshal(sandbox.CheckpointState{At: recordStart, OK: true, Refs: []sandbox.CheckpointRef{{Branch: "t1", SHA: h.base}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, state := range []string{sandbox.StateProvisioning, sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted} {
+			t.Run(state, func(t *testing.T) {
+				id := h.seedRecord(t, "demo--t1", state, func(r *sandbox.Record) {
+					r.Checkout = &sandbox.Checkout{Path: sandbox.WorkDir, Ref: "main", SHA: h.base, Branch: new("t1")}
+					r.HubAccess = &sandbox.HubAccess{Scopes: allHubScopes, ExpiresAt: r.ExpiresAt}
+					r.Checkpoint = prior
+				})
+				calls := len(h.rt.Calls())
+
+				a := h.call(t, http.MethodPost, path(id), h.key, nil)
+				if a.status != http.StatusConflict || a.err.ErrorType != "sandbox_not_ready" {
+					t.Errorf("POST checkpoint = %d %s; want 409 sandbox_not_ready", a.status, a.body)
+				}
+				if stored := storedRecord(t, h.Hub, id).Checkpoint; string(stored) != string(prior) {
+					t.Errorf("the stored checkpoint = %s; want it unchanged, %s", stored, prior)
+				}
+				for _, c := range h.rt.Calls()[calls:] {
+					if strings.HasPrefix(c.Target, id) {
+						t.Errorf("the runtime was called: %+v", c)
+					}
+				}
+				if n := h.count(t, `SELECT count(*) FROM hub_events WHERE resource_id = ?`, id); n != 0 {
+					t.Errorf("%d events about the sandbox; want none", n)
+				}
+			})
+		}
+	})
+
+	t.Run("records a failure and answers it as a runtime error", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			set  func() func()
+			// text is what the answer and the stored error hold besides.
+			text string
+		}{
+			{name: "the runtime cannot be reached", set: func() func() {
+				h.rt.SetUnreachable(true)
+				return func() { h.rt.SetUnreachable(false) }
+			}},
+			{name: "git exits with 128 in the sandbox", text: "fatal: bad object", set: func() func() {
+				h.hooks.setExec(func([]string) (int, string, error) { return 128, "fatal: bad object", nil })
+				return func() { h.hooks.setExec(nil) }
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				id, dir := h.workSandbox(t, nil)
+				h.cloneWork(t, dir)
+				t.Cleanup(tc.set())
+
+				a := h.call(t, http.MethodPost, path(id), h.key, nil)
+				if a.status != http.StatusBadGateway || a.err.ErrorType != "sandbox_runtime_error" {
+					t.Fatalf("POST checkpoint = %d %s; want 502 sandbox_runtime_error", a.status, a.body)
+				}
+				rec := storedRecord(t, h.Hub, id)
+				cp := h.storedCheckpoint(t, id)
+				if cp == nil || cp.OK || cp.Error == nil || rec.State != sandbox.StateReady {
+					t.Fatalf("the sandbox is %s with the checkpoint %+v; want it ready with a failed checkpoint", rec.State, cp)
+				}
+				if !strings.Contains(a.err.Message, *cp.Error) || !strings.Contains(*cp.Error, tc.text) {
+					t.Errorf("the answer's message %q, the stored error %q; want the message to hold the error, which holds %q",
+						a.err.Message, *cp.Error, tc.text)
+				}
+			})
+		}
+	})
 }

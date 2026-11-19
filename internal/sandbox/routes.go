@@ -159,6 +159,19 @@ func (s *Service) GetRoute() server.Route {
 	})
 }
 
+// CheckpointRoute declares POST /workspaces/:slug/sandboxes/:id/checkpoint:
+// it saves the working directory of the ready sandbox id as a checkpoint
+// for the caller and answers with the sandbox (see serveCheckpoint). It
+// needs the scope sandboxes:write of a PAT and write access to the
+// workspace; the admin token acts as an owner.
+func (s *Service) CheckpointRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/checkpoint",
+		Handler: s.serveCheckpoint,
+	})
+}
+
 // ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
 // of the workspace, newest first, paged, filtered by the query (see
 // listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and

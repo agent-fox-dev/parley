@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"slices"
@@ -16,9 +17,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
 
 const (
@@ -170,6 +174,52 @@ func (s *Service) Checkpoint(ctx context.Context, rec Record, actor Actor) (*Che
 		return st, &scrubbedError{text: text, err: err}
 	}
 	return st, nil
+}
+
+// serveCheckpoint answers POST /workspaces/:slug/sandboxes/:id/checkpoint.
+// A sandbox in any state but ready has no compute to save, and is refused
+// before the runtime is called. A ready one gets a checkpoint by the caller
+// and is answered as it is stored then; one without a hub credential gets
+// none, and is answered with its checkpoint as it was. A failed checkpoint,
+// already recorded on the sandbox, is answered with the runtime error and
+// its reason, scrubbed of the sandbox's values and then of the hub's.
+func (s *Service) serveCheckpoint(w http.ResponseWriter, r *http.Request) error {
+	d, ok := access.DecisionOf(r)
+	if !ok {
+		return server.Internal("the checkpoint route found no access decision")
+	}
+	ctx, slug := r.Context(), d.Record.Slug
+	rec, err := s.readSandbox(ctx, slug, server.Param(r, "id"))
+	if err != nil {
+		return err
+	}
+	if rec.State != StateReady {
+		return notReady(rec.State)
+	}
+	caller, _ := identity.PrincipalOf(ctx)
+	if _, err := s.Checkpoint(ctx, rec, actorFor(caller)); err != nil {
+		var failed *scrubbedError
+		if errors.As(err, &failed) {
+			return RuntimeError(s.scrub(failed.text))
+		}
+		return err
+	}
+	if rec, err = s.readSandbox(ctx, slug, rec.ID); err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, s.object(rec))
+	return nil
+}
+
+// actorFor is the actor of the caller p: its credential's type, and the
+// user it acts for unless it is the admin token.
+func actorFor(p identity.Principal) Actor {
+	a := Actor{Type: actorOf(p)}
+	if p.User != nil {
+		id := p.User.ID
+		a.ID = &id
+	}
+	return a
 }
 
 // storeCheckpoint stores st on the sandbox id with EventCheckpoint by actor,

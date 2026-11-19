@@ -1523,7 +1523,9 @@ func (h *createHub) settledObject(t *testing.T, slug, id string) map[string]any 
 
 // hubEvent is what a test checks of a stored hub event.
 type hubEvent struct {
-	actorType          string
+	actorType string
+	// actorID is nil for an actor that is no user.
+	actorID            *string
 	metadata           map[string]any
 	resourceType       string
 	workspace, session *string
@@ -1533,7 +1535,7 @@ type hubEvent struct {
 // oldest first.
 func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 	t.Helper()
-	rows, err := h.Store.Main().Query(`SELECT actor_type, metadata, resource_type, workspace, session_id FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
+	rows, err := h.Store.Main().Query(`SELECT actor_type, actor_id, metadata, resource_type, workspace, session_id FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1544,7 +1546,7 @@ func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 			e    hubEvent
 			meta string
 		)
-		if err := rows.Scan(&e.actorType, &meta, &e.resourceType, &e.workspace, &e.session); err != nil {
+		if err := rows.Scan(&e.actorType, &e.actorID, &meta, &e.resourceType, &e.workspace, &e.session); err != nil {
 			t.Fatal(err)
 		}
 		if err := json.Unmarshal([]byte(meta), &e.metadata); err != nil {
