@@ -152,16 +152,14 @@ type Hub struct {
 }
 
 // runListener is one run's hold on the hub's socket. A stop closes it, as
-// the hub closes its listener; when a restart is on its way, the close only
-// ends the run's accepting, and the socket stays bound for the next run, so
-// that no other listener can take the port in between.
+// the hub closes its listener; when the hub's Stop or a restart stopped the
+// run, the close only ends the run's accepting, and the socket stays bound
+// for a later run, so that no other listener can take the port in between.
 type runListener struct {
 	*net.TCPListener
-	// detach is set by a restart before it stops the run.
+	// detach is set by Stop and by a restart before they stop the run.
 	detach atomic.Bool
 	closed atomic.Bool
-	// released is set when the close closed the socket itself.
-	released atomic.Bool
 }
 
 func (l *runListener) Accept() (net.Conn, error) {
@@ -184,7 +182,6 @@ func (l *runListener) Close() error {
 		// reports the listener closed.
 		return l.TCPListener.SetDeadline(time.Now())
 	}
-	l.released.Store(true)
 	return l.TCPListener.Close()
 }
 
@@ -313,24 +310,21 @@ func (h *Hub) RestartEnv(t testing.TB, env map[string]string) {
 	h.restart(t, withEnv(h.baseEnv, env))
 }
 
+// Stop asks the hub to stop, as a cancelled context does. The port stays
+// bound until the test ends, so that a later Restart serves the hub on it
+// and no other listener can take it while the test waits.
+func (h *Hub) Stop() {
+	h.run.detach.Store(true)
+	h.Served.Stop()
+}
+
 func (h *Hub) restart(t testing.TB, env config.Env) {
 	t.Helper()
-	h.run.detach.Store(true)
 	h.Stop()
 	if code := h.ExitCode(t, 10*time.Second); code != 0 {
 		t.Fatalf("the hub stopped with %d, want 0; stderr = %q", code, h.Log.String())
 	}
 	h.client.CloseIdleConnections()
-	if h.run.released.Load() {
-		// The test stopped the hub itself before, which let the port go:
-		// bind it again.
-		ln, err := net.Listen("tcp", h.socket.Addr().String())
-		if err != nil {
-			t.Fatalf("bind the hub's port again: %v", err)
-		}
-		t.Cleanup(func() { _ = ln.Close() })
-		h.socket = ln.(*net.TCPListener)
-	}
 	h.opts.Env = env
 	h.serve(t, h.opts)
 }
