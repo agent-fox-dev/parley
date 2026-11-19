@@ -52,7 +52,25 @@ type sandboxCreateHub struct {
 // composition.
 func startSandboxCreateHub(t *testing.T, profiles string, compose ...func(*hub.Composition)) *sandboxCreateHub {
 	t.Helper()
-	h := &sandboxCreateHub{fake: runtimetest.New(t), commands: map[string][][]string{}}
+	return startSandboxCreateHubWith(t, sandboxHubConfig{profiles: profiles, compose: compose})
+}
+
+// sandboxHubConfig is what a sandbox create hub is started with besides
+// what every one has: the TOML of its [[sandbox.profiles]], keys of its
+// [sandbox] table, the options of its fake runtime, what wraps the hub's
+// client of the fake (nil for nothing) and functions run on its
+// composition.
+type sandboxHubConfig struct {
+	profiles, sandboxKeys string
+	fake                  []runtimetest.Option
+	wrap                  func(runtime.Client) runtime.Client
+	compose               []func(*hub.Composition)
+}
+
+// startSandboxCreateHubWith starts a sandbox create hub as cfg says.
+func startSandboxCreateHubWith(t *testing.T, cfg sandboxHubConfig) *sandboxCreateHub {
+	t.Helper()
+	h := &sandboxCreateHub{fake: runtimetest.New(t, cfg.fake...), commands: map[string][][]string{}}
 	h.fake.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
 	h.fake.SetExec(func(ctx context.Context, name string, req runtime.ExecRequest, stdout, _ io.Writer) int {
 		h.mu.Lock()
@@ -66,16 +84,20 @@ func startSandboxCreateHub(t *testing.T, profiles string, compose ...func(*hub.C
 	var workspaces *workspace.Service
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
 		Server: "external_url = \"https://hub.test\"\n",
-		TOML: "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
-			"[[sandbox.credentials]]\nname = \"model\"\nprovider_profile = \"anthropic\"\nsecret = \"MODEL_KEY\"\n" + profiles,
+		TOML: "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" + cfg.sandboxKeys +
+			"[[sandbox.credentials]]\nname = \"model\"\nprovider_profile = \"anthropic\"\nsecret = \"MODEL_KEY\"\n" + cfg.profiles,
 		Files: map[string]string{"gateway-token": "gw-tok-SECRET\n"},
 		Env:   map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))},
 		Compose: func(c *hub.Composition) {
 			workspaces, h.secrets = c.Workspaces(), c.Secrets()
 			c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
-				return h.fake.Client(s.OpenShellWorkspace, deps.Recorder), nil
+				client := h.fake.Client(s.OpenShellWorkspace, deps.Recorder)
+				if cfg.wrap != nil {
+					client = cfg.wrap(client)
+				}
+				return client, nil
 			})
-			for _, fn := range compose {
+			for _, fn := range cfg.compose {
 				fn(c)
 			}
 		},
