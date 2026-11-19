@@ -76,3 +76,35 @@ CREATE TABLE sandbox_denials (
 		return err
 	},
 }
+
+// ProposalSchemaStep creates the proposals of the sandboxes: one row per
+// proposal the runtime made for a sandbox and the hub stored, with the
+// runtime's id, unique per sandbox, by which a proposal listed again is
+// recognised, and the decision once there is one. Findings and the decider
+// are JSON; times are Unix seconds. A row names its sandbox without a
+// foreign key: the purge hook removes the rows with the record.
+var ProposalSchemaStep = store.Step{
+	Name:   "sandbox_proposals",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+CREATE TABLE sandbox_proposals (
+	id                TEXT NOT NULL PRIMARY KEY,
+	sandbox_id        TEXT NOT NULL,
+	runtime_id        TEXT NOT NULL,
+	rule              TEXT NOT NULL,
+	summary           TEXT NOT NULL,
+	findings          TEXT NOT NULL,
+	state             TEXT NOT NULL,
+	scope             TEXT,
+	workspace_rule_id TEXT,
+	decided_by        TEXT,
+	decided_at        INTEGER,
+	comment           TEXT,
+	created_at        INTEGER NOT NULL,
+	UNIQUE (sandbox_id, runtime_id)
+);
+CREATE INDEX sandbox_proposals_sandbox ON sandbox_proposals (sandbox_id, state, created_at, id);`)
+		return err
+	},
+}

@@ -18,6 +18,7 @@ const (
 	// PolicyCollectInterval is the default time between two passes of the
 	// policy collector on the hub's clock: a sandbox that became ready is
 	// followed from within it, and one that left ready no later than it.
+	// It is also the poll interval of the runtime's pending proposals.
 	PolicyCollectInterval = 5 * time.Second
 	// PolicyRetryDelay is the default time the policy collector waits,
 	// after the runtime could not be reached or a sandbox's policy log
@@ -34,16 +35,22 @@ const (
 // actionDeny is the action of a policy log entry the runtime blocked.
 const actionDeny = "deny"
 
+// proposalsNotAllowed is the reason the runtime is given for a proposal of
+// a sandbox whose profile did not allow proposals when it was created.
+const proposalsNotAllowed = "the sandbox's profile does not allow proposals"
+
 // PolicyCollectorOptions configure a policy collector; a zero value takes
 // the defaults.
 type PolicyCollectorOptions struct {
-	// Interval is the time between two passes of Run on the hub's clock;
-	// 0 for PolicyCollectInterval.
+	// Interval is the time between two passes of Run on the hub's clock,
+	// and the least time between two listings of the runtime's pending
+	// proposals on the collector's clock; 0 for PolicyCollectInterval.
 	Interval time.Duration
 	// RetryDelay is the time after a runtime failure before a sandbox's
 	// policy log is opened again; 0 for PolicyRetryDelay.
 	RetryDelay time.Duration
-	// Now is the clock RetryDelay is counted on; nil for the hub's clock.
+	// Now is the clock RetryDelay and the poll interval of Pass are counted
+	// on; nil for the hub's clock.
 	Now func() time.Time
 	// Hold keeps CollectPolicy from running a collector, for a test that
 	// drives the passes of a collector of its own.
@@ -57,6 +64,13 @@ type PolicyCollectorOptions struct {
 // its parley.sandbox.deny event. The destinations stored are what makes a
 // denial a first one, so a collector built on the same store, as after a
 // restart, reports none of them again.
+//
+// It also lists the runtime's pending proposals, at most once per poll
+// interval, and stores each new proposal of a sandbox whose profile
+// allowed proposals when it was created as open, with its
+// parley.sandbox.proposal event; a proposal of a sandbox whose profile did
+// not is rejected at the runtime. The stored runtime ids are what makes a
+// proposal new, so a collector built on the same store stores none twice.
 //
 // A pass (Pass) is driven by Run on the hub's clock, or by a test. Its
 // followers read their streams on goroutines of their own, until the
@@ -72,6 +86,9 @@ type PolicyCollector struct {
 	// follower of each followed sandbox by id.
 	pass      sync.Mutex
 	followers map[string]*policyFollower
+	// polled is when the pending proposals were last listed, on the
+	// collector's clock; guarded by pass.
+	polled time.Time
 
 	// mu guards what the followers write: how far each sandbox's log has
 	// been taken (resume), when a log that failed may be opened again
@@ -136,14 +153,18 @@ func (s *Service) CollectPolicy(ctx context.Context, o PolicyCollectorOptions) {
 
 // Run runs a pass right away and then one every interval on the hub's
 // clock until ctx ends, and returns once every follower has stopped. A
-// runtime failure never ends it.
+// runtime failure never ends it. Every pass but the first lists the
+// pending proposals: the first listing comes one interval after the start,
+// so that a hub's start calls the runtime for nothing besides its check.
 func (c *PolicyCollector) Run(ctx context.Context) {
 	defer c.Stop()
-	for {
+	for poll := false; ; poll = true {
 		// The timer of the next pass is asked for before this one runs, so
 		// that a pass that takes long does not push the next one back.
 		t := c.s.newTimer(c.interval)
-		c.Pass(ctx)
+		c.pass.Lock()
+		c.passLocked(ctx, poll)
+		c.pass.Unlock()
 		select {
 		case <-ctx.Done():
 			t.Stop()
@@ -157,15 +178,107 @@ func (c *PolicyCollector) Run(ctx context.Context) {
 // Pass is one pass of the collector. It reads the sandboxes in state ready,
 // stops the followers of the others and starts one for each ready sandbox
 // that has none, under ctx; a sandbox whose log failed is not followed
-// again before the retry delay has passed on the collector's clock. A
-// failure is logged and never returned. With sandboxes off it does nothing.
+// again before the retry delay has passed on the collector's clock. Then,
+// unless they were listed less than the poll interval before on the
+// collector's clock, it takes the runtime's pending proposals. A failure is
+// logged and never returned. With sandboxes off it does nothing.
 func (c *PolicyCollector) Pass(ctx context.Context) {
 	c.pass.Lock()
 	defer c.pass.Unlock()
+	c.passLocked(ctx, c.polled.IsZero() || !c.now().Before(c.polled.Add(c.interval)))
+}
+
+// passLocked is a pass that lists the pending proposals when poll is true.
+// The caller holds c.pass.
+func (c *PolicyCollector) passLocked(ctx context.Context, poll bool) {
 	if ctx.Err() != nil || c.s.client == nil || c.s.deps.Store == nil {
 		return
 	}
 	c.followDenials(ctx)
+	if poll {
+		c.polled = c.now()
+		c.takeProposals(ctx)
+	}
+}
+
+// takeProposals lists the runtime's pending proposals and takes each one
+// (takeProposal). A listing that fails is logged and ends the part of the
+// pass, with no record changed: the next listing comes a poll interval
+// later.
+func (c *PolicyCollector) takeProposals(ctx context.Context) {
+	list, err := c.s.client.ListProposals(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.s.logger().Warn("the policy collector cannot list the pending proposals", "retry_in", c.interval.String(), "error", c.s.scrub(err.Error()))
+		}
+		return
+	}
+	for _, p := range list {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := c.s.takeProposal(ctx, p); err != nil && ctx.Err() == nil {
+			text := c.s.scrub(c.s.ScrubSandbox(context.WithoutCancel(ctx), p.Sandbox, err.Error()))
+			c.s.logger().Warn("the policy collector cannot take a proposal", "sandbox_id", p.Sandbox, "proposal", p.ID, "error", text)
+		}
+	}
+}
+
+// takeProposal takes the pending proposal p of the runtime. A proposal of a
+// sandbox the hub holds no live record of is left alone, for the runtime to
+// drop with its sandbox. One of a sandbox whose profile did not allow
+// proposals when it was created is rejected at the runtime, and nothing is
+// stored. Otherwise a proposal not stored yet for its sandbox is stored as
+// open, and its parley.sandbox.proposal event written, in one transaction,
+// which reads the record again so that a sandbox deleted meanwhile, whose
+// open proposals the delete hook withdrew, gets no open one.
+func (s *Service) takeProposal(ctx context.Context, p runtime.Proposal) error {
+	rec, err := Get(ctx, s.deps.Store.Main(), p.Sandbox)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return nil
+	case err != nil:
+		return err
+	case rec.State == StateDeleted:
+		return nil
+	case !rec.Snapshot.AllowProposals:
+		if err := s.client.RejectProposal(ctx, p.Sandbox, p.ID, proposalsNotAllowed); err != nil {
+			return fmt.Errorf("reject the proposal: %w", err)
+		}
+		return nil
+	}
+	if stored, err := proposalStored(ctx, s.deps.Store.Main(), p.Sandbox, p.ID); err != nil || stored {
+		return err
+	}
+	now := time.Now()
+	if s.deps.Now != nil {
+		now = s.deps.Now()
+	}
+	stored := Proposal{
+		ID: NewProposalID(), SandboxID: p.Sandbox, RuntimeID: p.ID, Rule: p.Rule.Body, Summary: p.Summary,
+		Findings: p.Findings, State: ProposalOpen, CreatedAt: now,
+	}
+	return s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		rec, err := Get(ctx, tx, p.Sandbox)
+		if errors.Is(err, ErrNotFound) || (err == nil && rec.State == StateDeleted) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if inserted, err := InsertProposal(ctx, tx, stored); err != nil || !inserted {
+			return err
+		}
+		_, err = s.deps.Events.Emit(ctx, tx, event.Input{
+			Type: EventProposal, ActorType: event.ActorSystem,
+			ResourceType: "sandbox", ResourceID: rec.ID, Workspace: &rec.Workspace, SessionID: rec.SessionID,
+			Metadata: map[string]any{"proposal_id": stored.ID, "summary": stored.Summary, "max_severity": MaxSeverity(stored.Findings)},
+		})
+		if err != nil {
+			return fmt.Errorf("event of sandbox %s: %w", rec.ID, err)
+		}
+		return nil
+	})
 }
 
 // Stop stops every follower and returns once they have stopped.
