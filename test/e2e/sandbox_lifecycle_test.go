@@ -1,13 +1,22 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/cli"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
@@ -136,5 +145,207 @@ func TestSandboxLifecycle_AHubRestartLeavesSandboxesRunningAndRecordsWhatEndedMe
 		if sb.Name == orphan {
 			t.Errorf("the runtime still holds the orphan %s", orphan)
 		}
+	}
+}
+
+// realGit makes every command of a sandbox of h a real process in the
+// sandbox's directory on the host, git without the host's configuration,
+// with two stand-ins for what needs the hub's git service, which the fake
+// runtime cannot reach: the checkout's credential helper, a global setting,
+// is left out, and its clone clones demo's repository from its directory.
+// A main process agent runs until the runtime ends it.
+func realGit(h *sandboxCreateHub) runtimetest.ExecFunc {
+	demo := h.workspaces.RepoPath("demo")
+	return func(ctx context.Context, name string, req runtime.ExecRequest, stdout, stderr io.Writer) int {
+		argv := req.Command
+		switch {
+		case slices.Equal(argv, []string{"agent"}):
+			<-ctx.Done()
+			return 0
+		case len(argv) > 2 && argv[0] == "git" && argv[1] == "config" && argv[2] == "--global":
+			return 0
+		case len(argv) > 1 && argv[0] == "git" && argv[1] == "clone":
+			argv = []string{"git", "clone", "--quiet", "--no-checkout", demo, "."}
+		}
+		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+		cmd.Dir = filepath.Join(h.fake.HostDir("parley", name), filepath.FromSlash(req.WorkDir))
+		cmd.Env = append(hostGitEnv(), "GIT_TERMINAL_PROMPT=0")
+		for k, v := range req.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = bytes.NewReader(req.Stdin), stdout, stderr
+		var exit *exec.ExitError
+		switch err := cmd.Run(); {
+		case errors.As(err, &exit):
+			return exit.ExitCode()
+		case err != nil:
+			_, _ = io.WriteString(stderr, err.Error())
+			return 127
+		}
+		return 0
+	}
+}
+
+// hostGitEnv is the environment git runs in on the host: the test's, without
+// the host's global and system configuration.
+func hostGitEnv() []string {
+	return append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+}
+
+// inSandbox runs git with args in the working directory of the sandbox id
+// of h and returns what it printed, trimmed.
+func inSandbox(t *testing.T, h *sandboxCreateHub, id string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = workDirOf(h, id)
+	cmd.Env = hostGitEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in the sandbox %s: %v: %s", strings.Join(args, " "), id, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// workDirOf is the host directory that holds the working directory of the
+// sandbox id of h.
+func workDirOf(h *sandboxCreateHub, id string) string {
+	return filepath.Join(h.fake.HostDir("parley", id), filepath.FromSlash(sandbox.WorkDir))
+}
+
+// sandboxOf reads the sandbox id of demo--t1 and decodes it.
+func sandboxOf(t *testing.T, h *sandboxCreateHub, id string) map[string]any {
+	t.Helper()
+	return h.object(t, http.MethodGet, "/api/v1/workspaces/demo--t1/sandboxes/"+id, nil, http.StatusOK)
+}
+
+// parleyAs runs the CLI in-process against the hub with the credential
+// cred and decodes what it printed on stdout, which must be a JSON object.
+func parleyAs(t *testing.T, h *sandboxCreateHub, cred string, args ...string) map[string]any {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := cli.Run(context.Background(), append([]string{"--endpoint-url", h.URL(""), "--api-key", cred}, args...), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("parley %s exited %d: %s%s", strings.Join(args, " "), code, stdout.String(), stderr.String())
+	}
+	var o map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &o); err != nil {
+		t.Fatalf("parley %s printed %q: %v", strings.Join(args, " "), stdout.String(), err)
+	}
+	return o
+}
+
+// startRealGitLifecycleHub starts a sandbox lifecycle hub, on clock when it
+// is not nil, whose sandboxes run real git (realGit) once their checkout is
+// done, and returns it with a token bound to demo--t1 that carries
+// sandboxes:read, sandboxes:write, git:read and git:write, which the hub
+// credential of a sandbox it creates takes over.
+func startRealGitLifecycleHub(t *testing.T, clock *hubtest.JobClock) (*sandboxCreateHub, string) {
+	t.Helper()
+	h := startSandboxCreateHubWith(t, sandboxHubConfig{profiles: lifecycleProfile, fake: []runtimetest.Option{runtimetest.WithHostDirs()}, clock: clock})
+	h.object(t, http.MethodPost, "/api/v1/workspaces/demo/forks", map[string]any{"name": "t1"}, http.StatusCreated)
+	h.fake.SetExec(realGit(h))
+	created := parleyAs(t, h, h.key, "tokens", "create", "--name", "agent", "--workspace", "demo--t1",
+		"--permissions", "sandboxes:read,sandboxes:write,git:read,git:write")
+	token, _ := created["token"].(string)
+	if token == "" {
+		t.Fatalf("tokens create printed %v; want a token", created)
+	}
+	return h, token
+}
+
+// inOrder reports whether want appear in got in their order, others between
+// them allowed.
+func inOrder(got, want []string) bool {
+	for _, g := range got {
+		if len(want) > 0 && g == want[0] {
+			want = want[1:]
+		}
+	}
+	return len(want) == 0
+}
+
+func TestSandboxLifecycle_AnAgentStopsItsSandboxWithUnsavedWorkAndStartsItAgain(t *testing.T) {
+	parallel(t)
+	h, token := startRealGitLifecycleHub(t, nil)
+	id, _ := parleyAs(t, h, token, "sandbox", "create", "demo--t1", "--wait", "--poll-interval", "1s")["id"].(string)
+	if err := os.WriteFile(filepath.Join(workDirOf(h, id), "notes.txt"), []byte("not saved anywhere yet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hub, ok := h.fake.Provider("parley", id+"-hub")
+	if !ok {
+		t.Fatalf("the runtime holds no hub credential of %s", id)
+	}
+	probe := "/api/v1/workspaces/demo--t1/sandboxes/" + id
+	if status, body := h.Call(t, http.MethodGet, probe, hub.Value, nil); status == http.StatusUnauthorized {
+		t.Fatalf("the hub credential before the stop = %d %s; want it to authenticate", status, body)
+	}
+
+	stopped := parleyAs(t, h, token, "sandbox", "stop", "demo--t1", id)
+	checkpoint, _ := stopped["checkpoint"].(map[string]any)
+	refs, _ := checkpoint["refs"].([]any)
+	if stopped["state"] != sandbox.StateStopped || stopped["state_reason"] != sandbox.StopAPI || len(refs) != 1 {
+		t.Fatalf("sandbox stop printed %v; want it stopped for api with one checkpoint ref", stopped)
+	}
+	if ref, _ := refs[0].(map[string]any); ref["branch"] != "t1" || ref["dirty"] != true {
+		t.Errorf("the checkpoint's ref = %v; want t1, dirty", ref)
+	}
+	show := exec.Command("git", "--git-dir", h.workspaces.RepoPath("demo--t1"), "cat-file", "-e", "refs/parley/sandboxes/"+id+"/t1:notes.txt")
+	show.Env = hostGitEnv()
+	if out, err := show.CombinedOutput(); err != nil {
+		t.Errorf("the fork's checkpoint ref holds no notes.txt: %v: %s", err, out)
+	}
+
+	started := parleyAs(t, h, token, "sandbox", "start", "demo--t1", id, "--wait", "--poll-interval", "1s")
+	if started["state"] != sandbox.StateReady {
+		t.Fatalf("sandbox start --wait printed %v; want it ready", started)
+	}
+	if _, err := os.Stat(filepath.Join(workDirOf(h, id), "notes.txt")); err != nil {
+		t.Errorf("notes.txt after the start: %v", err)
+	}
+	if types := sandboxEventTypes(t, h, id); !inOrder(types, []string{sandbox.EventCheckpoint, sandbox.EventStop, sandbox.EventStart}) {
+		t.Errorf("the sandbox's events = %v; want %s, %s and %s in that order", types, sandbox.EventCheckpoint, sandbox.EventStop, sandbox.EventStart)
+	}
+	if status, body := h.Call(t, http.MethodGet, probe, hub.Value, nil); status != http.StatusUnauthorized || errorType(body) != "unauthenticated" {
+		t.Errorf("the hub credential of before the stop = %d %s; want 401 unauthenticated", status, body)
+	}
+}
+
+func TestSandboxLifecycle_AnExpiredSandboxIsCheckpointedAndItsWorkRestoredIntoANewOne(t *testing.T) {
+	parallel(t)
+	start := time.Now().UTC().Truncate(time.Second)
+	clock := hubtest.NewJobClock(func() time.Time { return start })
+	h, token := startRealGitLifecycleHub(t, clock)
+	first, _ := parleyAs(t, h, token, "sandbox", "create", "demo--t1", "--ttl", "1m", "--wait", "--poll-interval", "1s")["id"].(string)
+	inSandbox(t, h, first, "-c", "user.email=agent@example.test", "-c", "user.name=agent", "commit", "--allow-empty", "--quiet", "-m", "c1")
+	c1 := inSandbox(t, h, first, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(workDirOf(h, first), "notes.txt"), []byte("not saved anywhere yet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	clock.Advance(61 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	old := sandboxOf(t, h, first)
+	for old["state"] != sandbox.StateDeleted && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		old = sandboxOf(t, h, first)
+	}
+	checkpoint, _ := old["checkpoint"].(map[string]any)
+	if old["state"] != sandbox.StateDeleted || old["state_reason"] != sandbox.DeleteExpired || checkpoint["ok"] != true {
+		t.Fatalf("the first sandbox after its expiry = %v; want deleted for expired with a checkpoint that succeeded", old)
+	}
+	if types := sandboxEventTypes(t, h, first); !inOrder(types, []string{sandbox.EventCheckpoint, sandbox.EventDelete}) {
+		t.Errorf("the first sandbox's events = %v; want %s then %s", types, sandbox.EventCheckpoint, sandbox.EventDelete)
+	}
+
+	restored := parleyAs(t, h, token, "sandbox", "create", "demo--t1", "--restore-from", first, "--wait", "--poll-interval", "1s")
+	second, _ := restored["id"].(string)
+	if restored["state"] != sandbox.StateReady || restored["restored_from"] != first {
+		t.Fatalf("sandbox create --restore-from printed %v; want it ready, restored from %s", restored, first)
+	}
+	if got := inSandbox(t, h, second, "rev-parse", "t1"); got != c1 {
+		t.Errorf("t1 in the new sandbox = %s; want c1 %s", got, c1)
+	}
+	if got := inSandbox(t, h, second, "status", "--porcelain"); got != "?? notes.txt" {
+		t.Errorf("git status in the new sandbox = %q; want %q", got, "?? notes.txt")
 	}
 }

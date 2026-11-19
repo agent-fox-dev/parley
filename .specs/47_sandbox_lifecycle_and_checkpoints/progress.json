@@ -3,7 +3,7 @@
   "spec_id": "47",
   "spec_name": "sandbox_lifecycle_and_checkpoints",
   "schema_version": 3,
-  "updated_at": "2026-11-19T07:47:49Z",
+  "updated_at": "2026-11-19T07:54:06Z",
   "tasks": [
     {
       "id": 1,
@@ -51,7 +51,7 @@
     },
     {
       "id": 12,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }
