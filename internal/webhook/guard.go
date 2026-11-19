@@ -8,9 +8,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// scopeWrite is the scope a PAT needs on a webhook route that changes
-// something.
-const scopeWrite = "workspaces:write"
+// The scopes a PAT needs on a webhook route: scopeRead on one that reads,
+// scopeWrite, which grants scopeRead too, on one that changes something.
+const (
+	scopeRead  = "workspaces:read"
+	scopeWrite = "workspaces:write"
+)
 
 // The refusals of the guard.
 const (

@@ -284,3 +284,178 @@ func TestCreate_ReplaysTheFirstAnswerWithoutTheSecret(t *testing.T) {
 		t.Errorf("create events = %d, want 1", n)
 	}
 }
+
+func TestUpdate_RefusesABodyThatBreaksAFieldRule(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{})
+	id, _ := w.mustCreate(t, demo, "https://ci.example/x")["id"].(string)
+	for _, tc := range []struct {
+		name string
+		body any
+	}{
+		{"an empty body", map[string]any{}},
+		{"an unknown member", map[string]any{"color": "red"}},
+		{"a valid field and an unknown member", map[string]any{"description": "x", "color": "red"}},
+		{"active that is not a bool", map[string]any{"active": "yes"}},
+		{"an http url", map[string]any{"url": "http://ci.example/x"}},
+		{"an empty types list", map[string]any{"types": []string{}}},
+		{"include_forks that is not a bool", map[string]any{"include_forks": 1}},
+		{"a description of 1,025 characters", map[string]any{"description": strings.Repeat("d", 1025)}},
+		{"a body that is not an object", []string{"description"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+			status, raw := w.Call(t, http.MethodPatch, hookPath(demo, id), w.ownerKey, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("PATCH = %d %s, want 400", status, raw)
+			}
+			if e := errorOf(t, raw); e["error_type"] != "invalid_request" {
+				t.Errorf("error_type = %v, want invalid_request", e["error_type"])
+			}
+			if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+				t.Errorf("rows = %v\nwant   %v", got, rows)
+			}
+			if got := w.lastSeq(t); got != seq {
+				t.Errorf("the newest seq moved from %d to %d", seq, got)
+			}
+		})
+	}
+}
+
+func TestChange_RefusesAnArchivedWorkspace(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{})
+	id, _ := w.mustCreate(t, demo, "https://ci.example/x")["id"].(string)
+	w.archive(t, demo)
+	for _, tc := range []struct {
+		name, method, path string
+		body               any
+	}{
+		{"a create", http.MethodPost, hooksPath(demo), map[string]any{"url": "https://ci.example/y"}},
+		{"a change of the description", http.MethodPatch, hookPath(demo, id), map[string]any{"description": "x"}},
+		{"a switch off", http.MethodPatch, hookPath(demo, id), map[string]any{"active": false}},
+		{"a rotation of the secret", http.MethodPost, hookPath(demo, id) + "/rotate-secret", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+			status, raw := w.Call(t, tc.method, tc.path, w.ownerKey, tc.body)
+			if status != http.StatusConflict {
+				t.Fatalf("%s %s = %d %s, want 409", tc.method, tc.path, status, raw)
+			}
+			if e := errorOf(t, raw); e["error_type"] != "workspace_archived" {
+				t.Errorf("error_type = %v, want workspace_archived", e["error_type"])
+			}
+			if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+				t.Errorf("rows = %v\nwant   %v", got, rows)
+			}
+			if got := w.lastSeq(t); got != seq {
+				t.Errorf("the newest seq moved from %d to %d", seq, got)
+			}
+		})
+	}
+}
+
+func TestSecretUse_RefusesWithoutAKey(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{})
+	id, _ := w.mustCreate(t, demo, "https://ci.example/x")["id"].(string)
+	// The hub starts again without the operator's key.
+	w.RestartEnv(t, nil)
+	for _, tc := range []struct {
+		name, path string
+		body       any
+	}{
+		{"a create", hooksPath(demo), map[string]any{"url": "https://ci.example/y"}},
+		{"a rotation of a secret stored with a key", hookPath(demo, id) + "/rotate-secret", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+			status, raw := w.Call(t, http.MethodPost, tc.path, w.ownerKey, tc.body)
+			if status != http.StatusServiceUnavailable {
+				t.Fatalf("POST %s = %d %s, want 503", tc.path, status, raw)
+			}
+			if e := errorOf(t, raw); e["error_type"] != "secrets_unavailable" {
+				t.Errorf("error_type = %v, want secrets_unavailable", e["error_type"])
+			}
+			if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+				t.Errorf("rows = %v\nwant   %v", got, rows)
+			}
+			if got := w.lastSeq(t); got != seq {
+				t.Errorf("the newest seq moved from %d to %d", seq, got)
+			}
+		})
+	}
+}
+
+func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{})
+	for _, tc := range []struct {
+		status string
+		slug   string
+	}{
+		{"ready", demo},
+		{"archived", other},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			id, _ := w.mustCreate(t, tc.slug, "https://ci.example/hooks/parley?t=1")["id"].(string)
+			keep, _ := w.mustCreate(t, tc.slug, "https://ci.example/keep")["id"].(string)
+			// One delivery that succeeded and one pending, as the delivery
+			// loop leaves them, and one of the subscription that stays.
+			now := w.clock.Now().UnixNano()
+			for i, d := range []struct{ sub, status string }{{id, "succeeded"}, {id, "pending"}, {keep, "succeeded"}} {
+				if _, err := w.Store.Main().Exec(`INSERT INTO webhook_deliveries
+					(id, subscription_id, seq, type, status, attempts, created_at) VALUES (?, ?, ?, 'parley.change.open', ?, 1, ?)`,
+					fmt.Sprintf("00000000-0000-4000-8000-%s%012d", tc.status[:1], i), d.sub, i+1, d.status, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var sealed []byte
+			if err := w.Store.Main().QueryRow(`SELECT secret_sealed FROM webhook_subscriptions WHERE id = ?`, id).Scan(&sealed); err != nil {
+				t.Fatal(err)
+			}
+			if tc.status == "archived" {
+				w.archive(t, tc.slug)
+			}
+			deletes := len(w.events(t, "parley.webhook.delete"))
+
+			status, raw := w.Call(t, http.MethodDelete, hookPath(tc.slug, id), w.ownerKey, nil)
+			if status != http.StatusNoContent || len(raw) != 0 {
+				t.Fatalf("DELETE = %d %q, want 204 and no body", status, raw)
+			}
+			status, raw = w.Call(t, http.MethodGet, hookPath(tc.slug, id), w.ownerKey, nil)
+			if status != http.StatusNotFound || errorOf(t, raw)["error_type"] != "webhook_not_found" {
+				t.Errorf("GET after the delete = %d %s, want 404 webhook_not_found", status, raw)
+			}
+			var deliveries, holding, kept int
+			db := w.Store.Main()
+			if err := db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE subscription_id = ?`, id).Scan(&deliveries); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT count(*) FROM webhook_subscriptions WHERE secret_sealed = ?`, sealed).Scan(&holding); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE subscription_id = ?`, keep).Scan(&kept); err != nil {
+				t.Fatal(err)
+			}
+			if deliveries != 0 || holding != 0 {
+				t.Errorf("after the delete %d deliveries and %d rows with its ciphertext remain, want none", deliveries, holding)
+			}
+			if kept != 1 || w.count(t, tc.slug) != 1 {
+				t.Errorf("the other subscription kept %d deliveries and the workspace %d subscriptions, want 1 and 1", kept, w.count(t, tc.slug))
+			}
+			got := w.events(t, "parley.webhook.delete")
+			if len(got) != deletes+1 {
+				t.Fatalf("the log holds %d delete events, want %d", len(got), deletes+1)
+			}
+			e := got[len(got)-1]
+			if e.Workspace.String != tc.slug || e.ActorType != "api_key" || e.ActorID.String != w.owner ||
+				e.ResourceType != "event_webhook" || e.ResourceID != id {
+				t.Errorf("event = %+v, want workspace %s, the owner's api_key, resource event_webhook %s", e, tc.slug, id)
+			}
+			if want := map[string]any{"webhook_id": id, "host": "ci.example"}; !reflect.DeepEqual(e.Metadata, want) {
+				t.Errorf("event metadata = %v, want %v", e.Metadata, want)
+			}
+		})
+	}
+}

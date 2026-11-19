@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/secret"
@@ -47,15 +49,24 @@ func (c *clock) Now() time.Time {
 	return c.now
 }
 
+// advance moves the clock d forward.
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
 // stamp is the clock's time as the hub writes a timestamp.
 func (c *clock) stamp() string { return c.Now().UTC().Truncate(time.Second).Format(time.RFC3339) }
 
 // world is a hub with a secret key configured, on a settable clock, and the
 // seed: the user owner, with the API key ownerKey, owns the repositories
-// demo and other in the org acme.
+// demo and other in the org acme. log is the hub's event component, which
+// the tests write events of other packages with.
 type world struct {
 	*hubtest.Hub
 	clock    *clock
+	log      *event.Component
 	owner    string
 	ownerKey string
 }
@@ -80,6 +91,7 @@ func newWorld(t *testing.T, opts options) *world {
 		Now:  w.clock.Now,
 		Env:  map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
 		Compose: func(c *hub.Composition) {
+			w.log = c.Events()
 			for _, a := range opts.adjust {
 				c.AdjustWebhooks(a)
 			}
@@ -96,6 +108,9 @@ func newWorld(t *testing.T, opts options) *world {
 
 // hooksPath is the path of the webhook collection of the workspace slug.
 func hooksPath(slug string) string { return "/api/v1/workspaces/" + slug + "/webhooks" }
+
+// hookPath is the path of the subscription id of the workspace slug.
+func hookPath(slug, id string) string { return hooksPath(slug) + "/" + id }
 
 // create sends a create of body on the workspace slug as credential.
 func (w *world) create(t *testing.T, credential, slug string, body any) (int, []byte) {
@@ -173,6 +188,65 @@ func (w *world) lastSeq(t *testing.T) int64 {
 		t.Fatalf("read the newest seq: %v", err)
 	}
 	return seq
+}
+
+// emit writes an event of the type typ on the workspace slug, as another
+// package of the hub does, and returns its seq; parent is the slug of the
+// fork's parent when slug is a task fork, else "".
+func (w *world) emit(t *testing.T, slug, typ, parent string) int64 {
+	t.Helper()
+	var seq int64
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		rec, err := w.log.Emit(context.Background(), tx, event.Input{
+			Type: typ, Workspace: &slug, ActorType: event.ActorSystem,
+			ResourceType: "test", ResourceID: "r1", Parent: parent,
+		})
+		seq = rec.Seq
+		return err
+	})
+	if err != nil {
+		t.Fatalf("emit %s on %s: %v", typ, slug, err)
+	}
+	return seq
+}
+
+// archive sets the status of the workspace slug to archived.
+func (w *world) archive(t *testing.T, slug string) {
+	t.Helper()
+	if _, err := w.Store.Main().Exec(`UPDATE workspaces SET status = 'archived' WHERE slug = ?`, slug); err != nil {
+		t.Fatalf("archive %s: %v", slug, err)
+	}
+}
+
+// table is every row of the table name, every column as text, ordered by
+// id, so that two snapshots compare equal only when nothing changed.
+func (w *world) table(t *testing.T, name string) []string {
+	t.Helper()
+	rows, err := w.Store.Main().Query(`SELECT * FROM ` + name + ` ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprint(vals...))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 // decode decodes a JSON object.

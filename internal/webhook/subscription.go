@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -24,8 +25,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// EventCreate is the type of the event a create writes.
-const EventCreate = "parley.webhook.create"
+// The types of the events the changes of a subscription write.
+const (
+	EventCreate = "parley.webhook.create"
+	EventUpdate = "parley.webhook.update"
+	EventDelete = "parley.webhook.delete"
+)
 
 // resourceType is the resource_type of every parley.webhook.* event.
 const resourceType = "event_webhook"
@@ -138,34 +143,61 @@ func parseCreate(body map[string]json.RawMessage, s Settings) (createRequest, er
 	if !ok {
 		return req, server.InvalidRequest("url is required")
 	}
-	text, ok := stringOf(raw)
-	if !ok {
-		return req, server.InvalidRequest("url must be a string")
-	}
-	u, err := parseURL(text, s.AllowInsecure)
-	if err != nil {
+	var err error
+	if req.rawURL, req.url, err = urlField(raw, s); err != nil {
 		return req, err
 	}
-	req.rawURL, req.url = text, u
 	if raw, ok := body["types"]; ok {
 		if req.types, err = parseTypes(raw); err != nil {
 			return req, err
 		}
 	}
 	if raw, ok := body["include_forks"]; ok {
-		if req.includeForks, ok = boolOf(raw); !ok {
-			return req, server.InvalidRequest("include_forks must be true or false")
+		if req.includeForks, err = boolField("include_forks", raw); err != nil {
+			return req, err
 		}
 	}
 	if raw, ok := body["description"]; ok {
-		if req.description, ok = stringOf(raw); !ok {
-			return req, server.InvalidRequest("description must be a string")
-		}
-		if utf8.RuneCountInString(req.description) > maxDescriptionLen {
-			return req, server.InvalidRequest(fmt.Sprintf("description is longer than %d characters", maxDescriptionLen))
+		if req.description, err = descriptionField(raw); err != nil {
+			return req, err
 		}
 	}
 	return req, nil
+}
+
+// urlField checks a url member: a JSON string that parseURL accepts.
+func urlField(raw json.RawMessage, s Settings) (string, *url.URL, error) {
+	text, ok := stringOf(raw)
+	if !ok {
+		return "", nil, server.InvalidRequest("url must be a string")
+	}
+	u, err := parseURL(text, s.AllowInsecure)
+	if err != nil {
+		return "", nil, err
+	}
+	return text, u, nil
+}
+
+// boolField checks the member name, which must be a JSON bool.
+func boolField(name string, raw json.RawMessage) (bool, error) {
+	v, ok := boolOf(raw)
+	if !ok {
+		return false, server.InvalidRequest(name + " must be true or false")
+	}
+	return v, nil
+}
+
+// descriptionField checks a description member: a JSON string of at most
+// 1,024 characters.
+func descriptionField(raw json.RawMessage) (string, error) {
+	text, ok := stringOf(raw)
+	if !ok {
+		return "", server.InvalidRequest("description must be a string")
+	}
+	if utf8.RuneCountInString(text) > maxDescriptionLen {
+		return "", server.InvalidRequest(fmt.Sprintf("description is longer than %d characters", maxDescriptionLen))
+	}
+	return text, nil
 }
 
 // parseURL checks the shape of a destination URL: at most 2,048
@@ -281,8 +313,8 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) er
 		return err
 	}
 	slug := q.slug()
-	if q.decision.Record.Status == access.StatusArchived {
-		return server.WorkspaceArchived("workspace " + slug + " is archived; its event webhooks cannot be created or changed")
+	if err := refuseArchived(q); err != nil {
+		return err
 	}
 	caller, ok := identity.PrincipalOf(r.Context())
 	if !ok {
@@ -310,23 +342,14 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) er
 		if !c.deps.Available() {
 			return secret.UnavailableError
 		}
-		if sub.Sealed, err = secret.SealValue(c.deps.Keys(), binding(sub.ID), plain); err != nil {
-			if errors.Is(err, secret.ErrUnavailable) {
-				return secret.UnavailableError
-			}
+		if sub.Sealed, err = c.seal(sub.ID, plain); err != nil {
 			return err
 		}
 		if err := insert(ctx, tx, sub); err != nil {
 			return err
 		}
-		actorType, actorID := actorOf(caller)
-		rec, err := c.deps.Events.Emit(ctx, tx, event.Input{
-			Type: EventCreate, Workspace: &slug, ActorType: actorType, ActorID: actorID,
-			ResourceType: resourceType, ResourceID: sub.ID,
-			// The host alone: a URL's path or query may carry a token of the
-			// receiver's.
-			Metadata: map[string]any{"webhook_id": sub.ID, "host": in.url.Hostname(), "types": sub.Types, "include_forks": sub.IncludeForks},
-		})
+		rec, err := c.emit(ctx, tx, EventCreate, sub, caller,
+			map[string]any{"webhook_id": sub.ID, "host": in.url.Hostname(), "types": sub.Types, "include_forks": sub.IncludeForks})
 		if err != nil {
 			return err
 		}
@@ -338,6 +361,276 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) er
 	}
 	server.WriteJSON(w, http.StatusCreated, withSecret{objectOf(sub), plain})
 	return nil
+}
+
+// updateFields are the members a change may give, in the order the
+// parley.webhook.update event names them.
+var updateFields = []string{"url", "types", "include_forks", "description", "active"}
+
+// updateRequest is a change body that has passed the field rules: fields
+// are the names it gives, in the order of updateFields, and each member it
+// gives is set.
+type updateRequest struct {
+	fields       []string
+	rawURL       *string
+	types        []string
+	includeForks *bool
+	description  *string
+	active       *bool
+}
+
+// parseUpdate checks a change body: it must give at least one of the
+// fields, nothing else, and each with a value its rule accepts, the rules of
+// the create for url, types, include_forks and description and a bool for
+// active. A body that breaks one is answered 400 invalid_request.
+func parseUpdate(body map[string]json.RawMessage, s Settings) (updateRequest, error) {
+	var req updateRequest
+	if len(body) == 0 {
+		return req, server.InvalidRequest("the body must give at least one of url, types, include_forks, description and active")
+	}
+	var unknown []string
+	for name := range body {
+		if !slices.Contains(updateFields, name) {
+			unknown = append(unknown, name)
+		}
+	}
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		return req, server.InvalidRequest(fmt.Sprintf("%s is not a field of an event webhook; a change gives url, types, include_forks, description or active", unknown[0]))
+	}
+	for _, name := range updateFields {
+		raw, ok := body[name]
+		if !ok {
+			continue
+		}
+		req.fields = append(req.fields, name)
+		var err error
+		switch name {
+		case "url":
+			var text string
+			if text, _, err = urlField(raw, s); err == nil {
+				req.rawURL = &text
+			}
+		case "types":
+			req.types, err = parseTypes(raw)
+		case "include_forks":
+			var v bool
+			if v, err = boolField(name, raw); err == nil {
+				req.includeForks = &v
+			}
+		case "description":
+			var text string
+			if text, err = descriptionField(raw); err == nil {
+				req.description = &text
+			}
+		case "active":
+			var v bool
+			if v, err = boolField(name, raw); err == nil {
+				req.active = &v
+			}
+		}
+		if err != nil {
+			return req, err
+		}
+	}
+	return req, nil
+}
+
+// apply changes s as req asks. active sets the state: false switches the
+// subscription off, true on.
+func (req updateRequest) apply(s *Subscription) {
+	if req.rawURL != nil {
+		s.URL = *req.rawURL
+	}
+	if req.types != nil {
+		s.Types = req.types
+	}
+	if req.includeForks != nil {
+		s.IncludeForks = *req.includeForks
+	}
+	if req.description != nil {
+		s.Description = *req.description
+	}
+	if req.active != nil {
+		s.State = StateActive
+		if !*req.active {
+			s.State = StateDisabled
+		}
+	}
+}
+
+// update answers PATCH /workspaces/:slug/webhooks/:id: once the body
+// passes parseUpdate, 409 workspace_archived on an archived workspace.
+// Otherwise it changes exactly the fields given, sets updated_at, writes
+// parley.webhook.update with the names of the fields given and the state
+// after the change in the same transaction, and answers 200 with the
+// object.
+func (c *Component) update(w http.ResponseWriter, r *http.Request, q request) error {
+	var body map[string]json.RawMessage
+	if err := server.DecodeJSON(r, &body); err != nil {
+		return err
+	}
+	in, err := parseUpdate(body, c.deps.Settings)
+	if err != nil {
+		return err
+	}
+	if err := refuseArchived(q); err != nil {
+		return err
+	}
+	caller, ok := identity.PrincipalOf(r.Context())
+	if !ok {
+		return server.Internal("the webhook update found no caller")
+	}
+	now := c.deps.Clock.Now().UTC().Truncate(time.Second)
+	ctx := r.Context()
+	var sub Subscription
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if sub, err = c.reread(ctx, tx, q); err != nil {
+			return err
+		}
+		in.apply(&sub)
+		sub.UpdatedAt = now
+		if err := save(ctx, tx, sub); err != nil {
+			return err
+		}
+		_, err = c.emit(ctx, tx, EventUpdate, sub, caller,
+			map[string]any{"webhook_id": sub.ID, "fields": in.fields, "state": sub.State})
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, objectOf(sub))
+	return nil
+}
+
+// remove answers DELETE /workspaces/:slug/webhooks/:id in every status of
+// the workspace: it deletes the subscription with its deliveries and its
+// sealed signing secret, writes parley.webhook.delete in the same
+// transaction, and answers 204.
+func (c *Component) remove(w http.ResponseWriter, r *http.Request, q request) error {
+	caller, ok := identity.PrincipalOf(r.Context())
+	if !ok {
+		return server.Internal("the webhook delete found no caller")
+	}
+	ctx := r.Context()
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		sub, err := c.reread(ctx, tx, q)
+		if err != nil {
+			return err
+		}
+		if err := deleteSubscription(ctx, tx, sub.ID); err != nil {
+			return err
+		}
+		_, err = c.emit(ctx, tx, EventDelete, sub, caller, map[string]any{"webhook_id": sub.ID, "host": hostOf(sub.URL)})
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+// rotate answers POST /workspaces/:slug/webhooks/:id/rotate-secret: 409
+// workspace_archived on an archived workspace and 503 secrets_unavailable
+// without a key. Otherwise it replaces the sealed signing secret with a new
+// one's, writes parley.webhook.update with the field secret in the same
+// transaction, and answers 200 with the object and the new secret.
+func (c *Component) rotate(w http.ResponseWriter, r *http.Request, q request) error {
+	if err := refuseArchived(q); err != nil {
+		return err
+	}
+	if !c.deps.Available() {
+		return secret.UnavailableError
+	}
+	caller, ok := identity.PrincipalOf(r.Context())
+	if !ok {
+		return server.Internal("the webhook rotation found no caller")
+	}
+	plain, err := newSecret()
+	if err != nil {
+		return err
+	}
+	now := c.deps.Clock.Now().UTC().Truncate(time.Second)
+	ctx := r.Context()
+	var sub Subscription
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if sub, err = c.reread(ctx, tx, q); err != nil {
+			return err
+		}
+		if sub.Sealed, err = c.seal(sub.ID, plain); err != nil {
+			return err
+		}
+		sub.UpdatedAt = now
+		if err := save(ctx, tx, sub); err != nil {
+			return err
+		}
+		_, err = c.emit(ctx, tx, EventUpdate, sub, caller,
+			map[string]any{"webhook_id": sub.ID, "fields": []string{"secret"}, "state": sub.State})
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	server.WriteJSON(w, http.StatusOK, withSecret{objectOf(sub), plain})
+	return nil
+}
+
+// refuseArchived answers a change of a subscription of an archived
+// workspace 409 workspace_archived.
+func refuseArchived(q request) error {
+	if q.decision.Record.Status == access.StatusArchived {
+		return server.WorkspaceArchived("workspace " + q.slug() + " is archived; its event webhooks cannot be created or changed")
+	}
+	return nil
+}
+
+// reread reads the subscription the guard found again inside tx, so that a
+// change starts from what the transaction sees; one deleted in between is
+// answered 404 webhook_not_found.
+func (c *Component) reread(ctx context.Context, tx *sql.Tx, q request) (Subscription, error) {
+	sub, found, err := subscriptionIn(ctx, tx, q.slug(), q.subscription.ID)
+	if err != nil {
+		return Subscription{}, err
+	}
+	if !found {
+		return Subscription{}, server.NewError(errorTypeWebhookNotFound, http.StatusNotFound, msgWebhookNotFound)
+	}
+	return sub, nil
+}
+
+// seal seals the signing secret plain of the subscription id under the
+// current key; without one it answers 503 secrets_unavailable.
+func (c *Component) seal(id, plain string) ([]byte, error) {
+	sealed, err := secret.SealValue(c.deps.Keys(), binding(id), plain)
+	if errors.Is(err, secret.ErrUnavailable) {
+		return nil, secret.UnavailableError
+	}
+	return sealed, err
+}
+
+// emit writes the event typ of the subscription s, caused by caller, with
+// metadata, inside tx, and returns the stored record. The metadata names the
+// destination by its host alone (hostOf).
+func (c *Component) emit(ctx context.Context, tx *sql.Tx, typ string, s Subscription, caller identity.Principal, metadata map[string]any) (event.Record, error) {
+	actorType, actorID := actorOf(caller)
+	return c.deps.Events.Emit(ctx, tx, event.Input{
+		Type: typ, Workspace: &s.Workspace, ActorType: actorType, ActorID: actorID,
+		ResourceType: resourceType, ResourceID: s.ID, Metadata: metadata,
+	})
+}
+
+// hostOf is the host of a stored destination URL, the one part of it an
+// event names: a URL's path or query may carry a token of the receiver's.
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // newSecret returns a new signing secret: whsec_ and 64 lower-case
@@ -400,6 +693,36 @@ func insert(ctx context.Context, q querier, s Subscription) error {
 		nanosOrNil(s.FailingSince), s.Sealed, s.Position)
 	if err != nil {
 		return fmt.Errorf("store event webhook %s: %w", s.ID, err)
+	}
+	return nil
+}
+
+// save writes the members of the subscription s a change may alter: url,
+// types, include_forks, description, state, updated_at and the sealed
+// signing secret.
+func save(ctx context.Context, q querier, s Subscription) error {
+	types, err := json.Marshal(s.Types)
+	if err != nil {
+		return err
+	}
+	_, err = q.ExecContext(ctx, `UPDATE webhook_subscriptions
+		SET url = ?, types = ?, include_forks = ?, description = ?, state = ?, updated_at = ?, secret_sealed = ?
+		WHERE id = ?`,
+		s.URL, string(types), s.IncludeForks, s.Description, s.State, s.UpdatedAt.UnixNano(), s.Sealed, s.ID)
+	if err != nil {
+		return fmt.Errorf("change event webhook %s: %w", s.ID, err)
+	}
+	return nil
+}
+
+// deleteSubscription deletes the subscription id, its sealed signing secret
+// with it, and its deliveries.
+func deleteSubscription(ctx context.Context, q querier, id string) error {
+	if _, err := q.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE subscription_id = ?`, id); err != nil {
+		return fmt.Errorf("delete the deliveries of event webhook %s: %w", id, err)
+	}
+	if _, err := q.ExecContext(ctx, `DELETE FROM webhook_subscriptions WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete event webhook %s: %w", id, err)
 	}
 	return nil
 }
