@@ -32,7 +32,6 @@ func TestAuditFilters(t *testing.T) {
 
 	alice, bob, carol, dave := w.CreateUser(t, "alice"), w.CreateUser(t, "bob"), w.CreateUser(t, "carol"), w.CreateUser(t, "dave")
 	aliceKey, carolKey := w.IssueKey(t, alice), w.IssueKey(t, carol)
-	bound := w.IssuePAT(t, identity.PATSpec{UserID: alice, Permissions: []string{"audit:read"}, Workspace: "ws1"})
 	acme := w.CreateOrg(t, "acme")
 	repo := func(slug, owner string) access.Record {
 		return access.Record{Slug: slug, OwnerID: owner, OrgID: acme, Kind: access.KindRepository, Status: access.StatusReady}
@@ -43,6 +42,9 @@ func TestAuditFilters(t *testing.T) {
 	for _, rec := range []access.Record{repo("ws1", alice), repo("ws2", dave), repo("own2", alice), repo("ws3", alice), fork("ws1--f1"), fork("ws1--gone")} {
 		w.AddWorkspace(t, rec)
 	}
+	// Bound once ws1 exists, so that the token binding sweep of the hub's
+	// first maintenance pass, whenever it runs, finds the binding alive.
+	bound := w.IssuePAT(t, identity.PATSpec{UserID: alice, Permissions: []string{"audit:read"}, Workspace: "ws1"})
 
 	// The hub events the hub wrote while it was set up are in every list
 	// that selects all hub events.

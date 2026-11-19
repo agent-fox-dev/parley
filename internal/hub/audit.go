@@ -75,14 +75,38 @@ var errNoRetention = errors.New("the retention run is not built")
 
 // retentionSteps binds every retention step to the function that does its
 // clean-up with the loaded settings on the hub's clock: the session steps
-// to the session store, the telemetry steps to the telemetry store. A step
-// whose clean-up the hub does not have yet does nothing and succeeds.
+// to the session store, the telemetry steps to the telemetry store, the
+// event steps to the event component, webhook_deliveries to the delivery
+// pruner registered with RegisterDeliveryPruner (none: the step does
+// nothing), orphans to the three stores that keep records of a workspace
+// after it is gone, asking the workspace records whether it is, and gauges
+// to the stores it counts and the hub's metrics registry.
 func retentionSteps(c *Composition, rt *Runtime, s audit.Settings) map[string]audit.Step {
 	steps := make(map[string]audit.Step, len(audit.StepNames()))
-	for _, name := range audit.StepNames() {
-		steps[name] = func(context.Context) error { return nil }
-	}
 	maps.Copy(steps, audit.SessionSteps(c.sessions, s, rt.Now))
 	maps.Copy(steps, audit.TelemetrySteps(c.telemetry, s, rt.Now))
+	maps.Copy(steps, audit.EventSteps(c.events, s, rt.Now))
+	maps.Copy(steps, audit.DeliverySteps(c.deliveryPruner, rt.Now))
+	maps.Copy(steps, audit.OrphanSteps(access.StoreRecords(rt.Store.Main()),
+		[]audit.OrphanStore{c.sessions, c.telemetry, c.events}, s, rt.Now))
+	maps.Copy(steps, audit.GaugeSteps([]audit.RecordCounter{c.events, c.telemetry, c.sessions}, c.sessions, c.metrics))
 	return steps
 }
+
+// RegisterDeliveryPruner makes p the store the retention step
+// webhook_deliveries prunes. The webhook part registers its delivery store
+// with it while the hub is composed; the pruner is kept on the
+// composition, not in a package-level registry, so that hubs in one
+// process never share it (ADR 03). A second registration is refused and
+// stops the start.
+func (c *Composition) RegisterDeliveryPruner(p audit.DeliveryPruner) {
+	if c.deliveryPruner != nil {
+		c.errs = append(c.errs, errSecondPruner)
+		return
+	}
+	c.deliveryPruner = p
+}
+
+// errSecondPruner refuses a second delivery pruner: the step prunes one
+// delivery store.
+var errSecondPruner = errors.New("a delivery pruner is registered already")

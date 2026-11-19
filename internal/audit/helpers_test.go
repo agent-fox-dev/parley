@@ -16,9 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/metrics"
 	"github.com/agent-fox-dev/parley/internal/session"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/telemetry"
@@ -70,6 +72,7 @@ type world struct {
 	*hubtest.Hub
 	clock   *clock
 	events  *event.Component
+	metrics *metrics.Registry
 	records map[string]seeded
 	ids     int
 }
@@ -79,9 +82,26 @@ func newWorld(t *testing.T, start time.Time) *world {
 	t.Helper()
 	w := &world{clock: &clock{now: start}, records: map[string]seeded{}}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, Compose: func(c *hub.Composition) {
-		w.events = c.Events()
+		w.events, w.metrics = c.Events(), c.Metrics()
 	}})
 	return w
+}
+
+// waitForRetention waits up to 5 s for the hub's first retention run to
+// end, which the hub starts right after it listens, so that it prunes
+// nothing a test seeds after it.
+func (w *world) waitForRetention(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, f := range w.metrics.Gather(context.Background()) {
+			if f.Name == metrics.RetentionLastRunTimestamp && len(f.Series) == 1 && f.Series[0].Value != 0 {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the hub's first retention run did not end within 5 s")
 }
 
 // hubEvent writes the hub event in at the time at as the record name.
@@ -288,21 +308,25 @@ func jsonEqual(a, b json.RawMessage) bool {
 var retentionNow = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 
 // stores are the hub's two stores, opened in a temporary directory with
-// the schemas of the sessions, the run telemetry and the hub events, and
-// the components the retention steps act through, bound to them on a
-// clock fixed at retentionNow. The session component writes its events to
-// events, so that an event a step should not write shows in its bounds.
+// the schemas of the workspace records, the sessions, the run telemetry and
+// the hub events, and the components the retention steps act through,
+// bound to them on a clock fixed at retentionNow; the event component
+// stamps the events on eventClock instead, which hubEvent sets. The session
+// component writes its events to events, so that an event a step should
+// not write shows in its bounds.
 type stores struct {
-	st        *store.Store
-	events    *event.Component
-	sessions  *session.Component
-	telemetry *telemetry.Component
+	st         *store.Store
+	events     *event.Component
+	eventClock *clock
+	sessions   *session.Component
+	telemetry  *telemetry.Component
 }
 
 func openStores(t *testing.T) *stores {
 	t.Helper()
 	dir := t.TempDir()
-	steps := append([]store.Step{event.SchemaStep, session.SchemaStep}, telemetry.SchemaSteps...)
+	steps := append([]store.Step{access.SchemaStep, access.CreatingTokenStep, event.SchemaStep, session.SchemaStep},
+		telemetry.SchemaSteps...)
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces"),
 	}, steps)
@@ -310,12 +334,13 @@ func openStores(t *testing.T) *stores {
 		t.Fatalf("open stores: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	ev, err := event.New(event.Deps{Store: st})
+	eventClock := &clock{now: retentionNow}
+	ev, err := event.New(event.Deps{Store: st, Clock: event.SystemClock(eventClock.Now)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := func() time.Time { return retentionNow }
-	s := &stores{st: st, events: ev, sessions: &session.Component{}, telemetry: &telemetry.Component{}}
+	s := &stores{st: st, events: ev, eventClock: eventClock, sessions: &session.Component{}, telemetry: &telemetry.Component{}}
 	s.sessions.Bind(session.Deps{Store: st, Now: now, Events: ev})
 	s.telemetry.Bind(telemetry.Deps{DB: telemetry.SQL(st.Analytics()), Now: now})
 	return s
@@ -323,6 +348,36 @@ func openStores(t *testing.T) *stores {
 
 // clock is the fixed clock the steps read.
 func (s *stores) clock() time.Time { return retentionNow }
+
+// workspace stores the record of the workspace slug, a repository, or a
+// task fork of parent when parent is not "".
+func (s *stores) workspace(t *testing.T, slug, parent string) {
+	t.Helper()
+	rec := access.Record{Slug: slug, OwnerID: "u1", OrgID: "o1", Kind: access.KindRepository, Status: access.StatusReady}
+	if parent != "" {
+		rec.Kind, rec.ParentSlug = access.KindFork, parent
+	}
+	ctx := context.Background()
+	if err := s.st.Tx(ctx, func(tx *sql.Tx) error { return access.InsertRecord(ctx, tx, rec) }); err != nil {
+		t.Fatalf("store the workspace record %s: %v", slug, err)
+	}
+}
+
+// hubEvent writes a hub event of the workspace slug ("" for none) at the
+// time at and returns its record.
+func (s *stores) hubEvent(t *testing.T, slug string, at time.Time) event.Record {
+	t.Helper()
+	s.eventClock.set(at)
+	in := event.Input{Type: "parley.test.event", ActorType: event.ActorSystem, ResourceType: "workspace", ResourceID: "x"}
+	if slug != "" {
+		in.Workspace = &slug
+	}
+	rec, err := s.events.EmitNow(context.Background(), in)
+	if err != nil {
+		t.Fatalf("emit an event of %q: %v", slug, err)
+	}
+	return rec
+}
 
 // exec runs query on db, failing the test on an error.
 func exec(t *testing.T, db *sql.DB, query string, args ...any) {

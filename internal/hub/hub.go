@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/audit"
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -203,6 +204,11 @@ type Composition struct {
 	// when set, wraps the server's whole handler (server.Options.Wrap).
 	metrics     *metrics.Registry
 	wrapHandler func(http.Handler) http.Handler
+
+	// deliveryPruner is the store of event webhook deliveries the retention
+	// step webhook_deliveries prunes (RegisterDeliveryPruner); nil while
+	// none is registered.
+	deliveryPruner audit.DeliveryPruner
 
 	// identity is the identity service composeIdentity creates. A part
 	// that runs after it and keeps data for a user or an org registers its

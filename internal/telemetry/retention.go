@@ -2,8 +2,10 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -132,4 +134,101 @@ func (c *Component) KeepNewestRuns(ctx context.Context, n int) (int64, error) {
 		return 0, fmt.Errorf("keep the newest %d runs of each workspace: %w", n, err)
 	}
 	return deleted, nil
+}
+
+// kindTables are the tables of the six record kinds, by the record kind
+// CountRecords reports each under.
+var kindTables = []struct{ kind, table string }{
+	{"run_event", runEvents.table},
+	{"outcome", outcomes.table},
+	{"tool_call", toolCalls.table},
+	{"tool_error", toolErrors.table},
+	{"trace", traces.table},
+	{"postmortem", postmortemsTable},
+}
+
+// WorkspaceSlugs returns every workspace slug a stored record of the six
+// kinds carries.
+func (c *Component) WorkspaceSlugs(ctx context.Context) ([]string, error) {
+	selects := make([]string, len(kindTables))
+	for i, k := range kindTables {
+		selects[i] = `SELECT workspace FROM ` + k.table
+	}
+	rows, err := c.deps.DB.QueryContext(ctx, strings.Join(selects, " UNION ")+` ORDER BY 1`)
+	if err != nil {
+		return nil, fmt.Errorf("read the workspaces of the run telemetry: %w", err)
+	}
+	defer rows.Close()
+	var slugs []string
+	for rows.Next() {
+		var slug string
+		if err := rows.Scan(&slug); err != nil {
+			return nil, fmt.Errorf("read the workspaces of the run telemetry: %w", err)
+		}
+		slugs = append(slugs, slug)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the workspaces of the run telemetry: %w", err)
+	}
+	return slugs, nil
+}
+
+// DeleteWorkspaceRecordsBefore deletes, in one transaction, the records of
+// the six kinds of the workspaces slugs that are older than cutoff, each
+// by the time its own limit uses: the timestamp, and for a postmortem the
+// time it was ingested. It returns the number it deleted.
+func (c *Component) DeleteWorkspaceRecordsBefore(ctx context.Context, slugs []string, cutoff time.Time) (int64, error) {
+	list, err := json.Marshal(slugs)
+	if err != nil {
+		return 0, err
+	}
+	stamp := ceil(cutoff, time.Microsecond).Format(storedLayout)
+	ingested := timefmt.Format(ceil(cutoff, time.Second))
+	var n int64
+	err = c.writeTx(ctx, func(ctx context.Context, tx Tx) error {
+		for _, k := range kindTables {
+			column, at := "timestamp", stamp
+			if k.table == postmortemsTable {
+				column, at = "ingested_at", ingested
+			}
+			res, err := tx.ExecContext(ctx, `DELETE FROM `+k.table+`
+WHERE workspace IN (SELECT value FROM json_each(?)) AND `+column+` < ?`, string(list), at)
+			if err != nil {
+				return fmt.Errorf("delete from %s: %w", k.table, err)
+			}
+			d, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("delete from %s: %w", k.table, err)
+			}
+			n += d
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("delete the run telemetry of %d workspaces before %s: %w", len(slugs), stamp, err)
+	}
+	return n, nil
+}
+
+// CountRecords returns the number of stored records of each of the six
+// kinds, under the record kinds run_event, outcome, tool_call, tool_error,
+// trace and postmortem.
+func (c *Component) CountRecords(ctx context.Context) (map[string]int64, error) {
+	counts := make([]string, len(kindTables))
+	for i, k := range kindTables {
+		counts[i] = `(SELECT count(*) FROM ` + k.table + `)`
+	}
+	n := make([]int64, len(kindTables))
+	dest := make([]any, len(n))
+	for i := range n {
+		dest[i] = &n[i]
+	}
+	if err := c.deps.DB.QueryRowContext(ctx, `SELECT `+strings.Join(counts, ", ")).Scan(dest...); err != nil {
+		return nil, fmt.Errorf("count the run telemetry: %w", err)
+	}
+	out := make(map[string]int64, len(kindTables))
+	for i, k := range kindTables {
+		out[k.kind] = n[i]
+	}
+	return out, nil
 }

@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -106,4 +107,73 @@ func (c *Component) DeleteTerminalBefore(ctx context.Context, cutoff time.Time) 
 		return 0, fmt.Errorf("delete the ended sessions started before %s: %w", timefmt.Format(cutoff), err)
 	}
 	return n, nil
+}
+
+// WorkspaceSlugs returns every workspace slug a stored session or usage
+// record carries.
+func (c *Component) WorkspaceSlugs(ctx context.Context) ([]string, error) {
+	var slugs []string
+	err := eachRow(ctx, c.deps.Store.Main(), func(scan func(...any) error) error {
+		var slug string
+		if err := scan(&slug); err != nil {
+			return err
+		}
+		slugs = append(slugs, slug)
+		return nil
+	}, `SELECT workspace_slug FROM sessions UNION SELECT workspace_slug FROM session_usage ORDER BY 1`)
+	if err != nil {
+		return nil, fmt.Errorf("read the workspaces of the sessions: %w", err)
+	}
+	return slugs, nil
+}
+
+// DeleteWorkspaceRecordsBefore deletes, in one transaction, the sessions of
+// the workspaces slugs started before cutoff, whatever their status, with
+// their usage records and links, and the usage records of those workspaces
+// reported before cutoff, and returns the number of records it deleted.
+func (c *Component) DeleteWorkspaceRecordsBefore(ctx context.Context, slugs []string, cutoff time.Time) (int64, error) {
+	list, err := json.Marshal(slugs)
+	if err != nil {
+		return 0, err
+	}
+	const of = `workspace_slug IN (SELECT value FROM json_each(?1)) AND `
+	const gone = `SELECT id FROM sessions WHERE ` + of + `started_at < ?2`
+	at := storedCutoff(cutoff)
+	var n int64
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		// As in DeleteTerminalBefore, the usage and the links go explicitly,
+		// not through the cascade.
+		for _, del := range []string{
+			`DELETE FROM session_usage WHERE session_id IN (` + gone + `) OR (` + of + `reported_at < ?2)`,
+			`DELETE FROM session_links WHERE session_id IN (` + gone + `)`,
+			`DELETE FROM sessions WHERE id IN (` + gone + `)`,
+		} {
+			res, err := tx.ExecContext(ctx, del, string(list), at)
+			if err != nil {
+				return err
+			}
+			d, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			n += d
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("delete the sessions of %d workspaces before %s: %w", len(slugs), at, err)
+	}
+	return n, nil
+}
+
+// CountRecords returns the number of stored sessions and usage records
+// under the record kinds session and usage.
+func (c *Component) CountRecords(ctx context.Context) (map[string]int64, error) {
+	var sessions, usage int64
+	err := c.deps.Store.Main().QueryRowContext(ctx,
+		`SELECT (SELECT count(*) FROM sessions), (SELECT count(*) FROM session_usage)`).Scan(&sessions, &usage)
+	if err != nil {
+		return nil, fmt.Errorf("count the sessions: %w", err)
+	}
+	return map[string]int64{"session": sessions, "usage": usage}, nil
 }
