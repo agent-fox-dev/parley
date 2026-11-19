@@ -343,9 +343,9 @@ it has ended, the next request starts a new one.
 - A git request is counted too, against the same keys, as in
   [Git over HTTP](#git-over-http).
 - `/healthz`, `/readyz` and `/version`, the forge webhook ingress
-  ([`POST /hooks/forge/{slug}`](#post-hooksforgeslug)), and any request
-  `GET /metrics` and any request answered `404` or `405` at route matching
-  are never counted or refused.
+  ([`POST /hooks/forge/{slug}`](#post-hooksforgeslug)), `GET /metrics`, and
+  any request answered `404` or `405` at route matching are never counted
+  or refused.
 - The counts are kept in memory and start from zero when `parleyd` starts.
 
 ## Request bodies
@@ -991,7 +991,7 @@ name; a page is never refused for it.
 
 | Metric | Type | Labels | Counts |
 |---|---|---|---|
-| `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, REST, git, the forge webhook ingress, `/healthz`, `/readyz`, `/version` and `/metrics` itself included. `path` is the route that matched, as a template (`/api/v1/workspaces/{slug}/sync`, `/git/{org}/{repo}/info/refs`, `/healthz`), never the request's own path, and `unmatched` when no route matched (an unknown path, a method no route of the path has); `status` the three digits sent |
+| `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, REST, git, the forge webhook ingress, `/healthz`, `/readyz`, `/version` and `/metrics` itself included. `method` is the request's method in upper case, `OTHER` for any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT` and `TRACE`; `path` is the route that matched, as a template (`/api/v1/workspaces/{slug}/sync`, `/git/{org}/{repo}/info/refs`, `/healthz`), never the request's own path, and `unmatched` when no route matched (an unknown path, a method no route of the path has); `status` the three digits sent, `101` for a request whose connection the hub took over (a sandbox's attach) |
 | `parley_http_request_duration_seconds` | histogram | `method`, `path` | the time to answer, by the same `method` and `path`. Buckets `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10` |
 | `parley_git_requests_total` | counter | `service` (`info-refs`, `upload-pack`, `receive-pack`), `result` (`ok`, `refused`, `error`) | git protocol requests, as in [Git over HTTP](#git-over-http) |
 | `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |

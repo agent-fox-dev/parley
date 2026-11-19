@@ -425,9 +425,14 @@ hour, in eleven steps that always run in this order:
 | `gauges` | sets the metrics `parley_audit_records` and `parley_agent_sessions_active` from the stored records (see [api.md](api.md#get-metrics)) |
 
 A record is deleted only when it is strictly older than its limit: one
-whose time equals now minus the limit is kept. The event with the highest
-`seq` is never deleted and never leaves the event log, whatever its age,
-and a hub event without a workspace is never an orphan.
+whose time equals now minus the limit is kept. A hub event is deleted, by
+`hub_events` or by `orphans`, only once it has left the event log, so that
+the log never has a hole: an event still in the log stays until a later run
+after `event_log` has moved past it (an `[audit].orphan_retention` shorter
+than `[events].retention` keeps an orphan's events for `[events].retention`).
+The event with the highest `seq` is never deleted and never leaves the event
+log, whatever its age, and a hub event without a workspace is never an
+orphan.
 
 A step that fails or panics is logged as `retention step failed` with its
 `step`, counted in `parley_retention_errors_total{step}`, and the next step

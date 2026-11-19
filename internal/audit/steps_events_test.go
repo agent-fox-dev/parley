@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/audit"
 	"github.com/agent-fox-dev/parley/internal/event"
 )
@@ -93,6 +94,57 @@ func TestEventSteps_MoveTheLogStartAndDeleteOldEventsButKeepTheNewest(t *testing
 			t.Errorf("last_seq after hub_events = %d, want %d", b.LastSeq, s4)
 		}
 	})
+}
+
+func TestEventDeletes_KeepTheEventsStillInTheEventLog(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		step func(*stores) audit.Step
+	}{
+		{"hub_events", func(s *stores) audit.Step { return audit.EventSteps(s.events, defaults, s.clock)["hub_events"] }},
+		{"orphans", func(s *stores) audit.Step {
+			return audit.OrphanSteps(access.StoreRecords(s.st.Main()), []audit.OrphanStore{s.events}, defaults, s.clock)["orphans"]
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := openStores(t)
+			// Both events are of a workspace that is gone; the old one is
+			// older than every limit, the new one the newest.
+			old := s.hubEvent(t, "gone", retentionNow.Add(-100*day))
+			newest := s.hubEvent(t, "gone", retentionNow.Add(-day))
+			step := tc.step(s)
+
+			if err := step(ctx); err != nil {
+				t.Fatalf("%s = %v", tc.name, err)
+			}
+			if got, want := ids(t, s.st.Main(), "hub_events"), sortedIDs(old, newest); !slices.Equal(got, want) {
+				t.Errorf("events after %s with the old one still in the log = %v, want %v", tc.name, got, want)
+			}
+
+			if err := audit.EventSteps(s.events, defaults, s.clock)["event_log"](ctx); err != nil {
+				t.Fatalf("event_log = %v", err)
+			}
+			if err := step(ctx); err != nil {
+				t.Fatalf("%s = %v", tc.name, err)
+			}
+			if got, want := ids(t, s.st.Main(), "hub_events"), sortedIDs(newest); !slices.Equal(got, want) {
+				t.Errorf("events after %s with the old one out of the log = %v, want %v", tc.name, got, want)
+			}
+		})
+	}
+}
+
+// sortedIDs are the ids of recs, ascending.
+func sortedIDs(recs ...event.Record) []string {
+	out := make([]string, len(recs))
+	for i, r := range recs {
+		out[i] = r.ID
+	}
+	slices.Sort(out)
+	return out
 }
 
 // delivery is a webhook delivery record the fake pruner holds.

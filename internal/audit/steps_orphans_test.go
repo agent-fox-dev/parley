@@ -64,6 +64,11 @@ func TestOrphans_DeletesTheOldRecordsOfWorkspacesThatAreGone(t *testing.T) {
 	for _, kept := range want {
 		slices.Sort(kept)
 	}
+	// The events leave the event log before orphans runs, as the event_log
+	// step does in a retention run: every one of them but the newest.
+	if _, err := s.events.Expire(ctx, retentionNow); err != nil {
+		t.Fatalf("expire = %v", err)
+	}
 
 	steps := audit.OrphanSteps(access.StoreRecords(s.st.Main()), []audit.OrphanStore{s.sessions, s.telemetry, s.events},
 		defaults, s.clock)

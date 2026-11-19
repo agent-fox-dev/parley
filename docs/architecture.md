@@ -5283,7 +5283,9 @@ tables of the analytical store, one schema step each (`SchemaSteps`:
 `tool_calls`, `tool_errors`, `traces`, `postmortems`). Each kind is keyed by
 its own `id`, so one UUID may name records of two kinds; each table has an
 index on `(workspace, run_id, timestamp, id)` for the reads of a run in time
-order, and `postmortems` a unique index on `(workspace, run_id)`. A client
+order, and `postmortems` a unique index on `(workspace, run_id)`; a seventh
+step, `telemetry_run_events_time`, indexes `run_events` on `(timestamp, id)`
+for the audit query's newest-first read across workspaces. A client
 timestamp is stored in a fixed-width form (`2006-01-02T15:04:05.000000Z`) so
 that the column sorts as time does, and answered in RFC 3339 without
 trailing zeros; JSON members are stored as JSON text and answered as raw
@@ -5408,8 +5410,9 @@ event and telemetry parts, whose components it reads.
   `CountRecords` and `ActiveCounts`. Each store operation runs in a
   transaction of its own and compares the stored text against a cutoff
   rounded up to the column's precision, so that "older than" is strict; no
-  delete of hub events removes the one with the highest `seq` or an event
-  without a workspace.
+  delete of hub events removes one still in the event log (its `seq` not
+  below `oldest_seq`), the one with the highest `seq`, or, as an orphan, an
+  event without a workspace.
 
 ### Metrics
 
@@ -5441,7 +5444,9 @@ own.
 - **Requests.** `Instrument(rec, now, pattern, next)` counts every request
   in `parley_http_requests_total{method,path,status}` and times it in
   `parley_http_request_duration_seconds`, `path` being the pattern
-  `server.MatchedPattern` names without its method, or `unmatched`. Its
+  `server.MatchedPattern` names without its method, or `unmatched`, and
+  `method` `OTHER` for a method outside the nine standard ones; a request
+  whose handler hijacks the connection is counted `101`. Its
   writer unwraps to the original, so flushing and hijacking still work.
 
 The registry is created with the composition (`Metrics()`), one per hub.

@@ -61,6 +61,9 @@ func TestInstrument_CountsEveryRequestByMethodPatternAndStatus(t *testing.T) {
 		{http.MethodGet, "/healthz", http.StatusOK},
 		{http.MethodGet, "/no/such/path", http.StatusNotFound},
 		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed},
+		{"get", "/healthz", http.StatusMethodNotAllowed},
+		{"FOO1", "/healthz", http.StatusMethodNotAllowed},
+		{"foo2", "/healthz", http.StatusMethodNotAllowed},
 	} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(req.method, req.target, nil))
@@ -77,17 +80,22 @@ func TestInstrument_CountsEveryRequestByMethodPatternAndStatus(t *testing.T) {
 		"method=GET,path=/healthz,status=200":                       1,
 		"method=GET,path=unmatched,status=404":                      1,
 		"method=POST,path=unmatched,status=405":                     1,
+		"method=GET,path=unmatched,status=405":                      1,
+		"method=OTHER,path=unmatched,status=405":                    2,
 	} {
 		if counts[key] != want {
 			t.Errorf("requests{%s} = %v, want %v (all: %v)", key, counts[key], want, counts)
 		}
 	}
-	if len(counts) != 5 {
-		t.Errorf("requests has %d series, want 5: %v", len(counts), counts)
+	if len(counts) != 7 {
+		t.Errorf("requests has %d series, want 7: %v", len(counts), counts)
 	}
 	for key := range counts {
 		if strings.Contains(key, "/a/") || strings.Contains(key, "no/such") {
 			t.Errorf("series %s carries a concrete path", key)
+		}
+		if strings.Contains(strings.ToUpper(key), "FOO") {
+			t.Errorf("series %s carries a method outside the standard set", key)
 		}
 	}
 	durations := samples(family(t, families, metrics.HTTPRequestDurationSeconds))
@@ -96,6 +104,9 @@ func TestInstrument_CountsEveryRequestByMethodPatternAndStatus(t *testing.T) {
 		if got := durations[route+suffix]; got != want {
 			t.Errorf("duration{%s}%s = %v, want %v", route, suffix, got, want)
 		}
+	}
+	if got := durations["method=OTHER,path=unmatched|count"]; got != 2 {
+		t.Errorf("duration{method=OTHER,path=unmatched}|count = %v, want 2", got)
 	}
 }
 
@@ -116,23 +127,31 @@ func TestInstrument_KeepsStreamingAvailable(t *testing.T) {
 		name   string
 		use    func(*http.ResponseController) error
 		worked func(*hijackable) bool
+		// counted is the series the request is counted on: a handler that
+		// takes the connection over switches protocols and writes no status.
+		counted string
 	}{
-		{"flush", (*http.ResponseController).Flush, func(w *hijackable) bool { return w.Flushed }},
+		{"flush", (*http.ResponseController).Flush, func(w *hijackable) bool { return w.Flushed }, "method=GET,path=unmatched,status=200"},
 		{"hijack", func(rc *http.ResponseController) error {
 			_, _, err := rc.Hijack()
 			return err
-		}, func(w *hijackable) bool { return w.hijacked }},
+		}, func(w *hijackable) bool { return w.hijacked }, "method=GET,path=unmatched,status=101"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var err error
-			h := metrics.Instrument(metrics.New(nil), time.Now, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			reg := metrics.New(nil)
+			h := metrics.Instrument(reg, time.Now, nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				err = tc.use(http.NewResponseController(w))
 			}))
 			w := &hijackable{ResponseRecorder: httptest.NewRecorder()}
 			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/events", nil))
 			if err != nil || !tc.worked(w) {
 				t.Errorf("%s through the instrumentation: err = %v, reached the connection's writer = %v", tc.name, err, tc.worked(w))
+			}
+			counts := samples(family(t, reg.Gather(context.Background()), metrics.HTTPRequestsTotal))
+			if counts[tc.counted] != 1 || len(counts) != 1 {
+				t.Errorf("%s: requests = %v, want 1 on %s", tc.name, counts, tc.counted)
 			}
 		})
 	}

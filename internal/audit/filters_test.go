@@ -20,11 +20,23 @@ import (
 	"github.com/agent-fox-dev/parley/internal/telemetry"
 )
 
-// TestAuditFilters runs the filters of the audit query over one hub that
-// holds hub events and run events of a workspace, its fork, a deleted fork
-// and a deleted workspace.
-func TestAuditFilters(t *testing.T) {
-	t.Parallel()
+// filterWorld is the hub of TestAuditFilters and what it seeded: hub
+// events and run events of ws1, its fork ws1--f1, the deleted fork
+// ws1--gone and the deleted workspace ws3, by name.
+type filterWorld struct {
+	*world
+	alice, aliceKey, carolKey string
+	// bound is a PAT of alice holding audit:read, bound to ws1.
+	bound string
+	// setup are the hub events the hub wrote while it was set up.
+	setup         []seeded
+	runA, session string
+	hubs, agents  []string
+}
+
+// newFilterWorld starts the hub of TestAuditFilters and seeds it.
+func newFilterWorld(t *testing.T) *filterWorld {
+	t.Helper()
 	t0 := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	sec := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Second) }
 	stamp := func(n int) string { return sec(n).Format(time.RFC3339) }
@@ -73,126 +85,159 @@ func TestAuditFilters(t *testing.T) {
 	hubs := []string{"hl", "ho", "hs", "hf", "hgone", "h3"}
 	agents := []string{"at", "af", "ab", "aff", "agone", "a3"}
 
-	// check asserts that the audit list for each row's query, as the admin
-	// token sees it, holds the row's records, plus the setup's hub events
-	// where the row says so.
-	type row struct {
-		query      string
-		want       []string
-		withSetup  bool
-		sourceOnly string
+	return &filterWorld{
+		world: w, alice: alice, aliceKey: aliceKey, carolKey: carolKey, bound: bound, setup: setup,
+		runA: runA, session: session, hubs: hubs, agents: agents,
 	}
-	check := func(t *testing.T, rows []row) {
-		t.Helper()
-		for _, r := range rows {
-			query, err := url.ParseQuery(r.query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got := keysOf(t, w.follow(t, w.Token, query, 0)...)
-			var extra []seeded
-			if r.withSetup {
-				extra = setup
-			}
-			if want := w.orderedWith(t, extra, r.want...); !slices.Equal(got, want) {
-				t.Errorf("%s: %v,\nwant %v", r.query, got, want)
-			}
-			for _, k := range got {
-				if r.sourceOnly != "" && k.source != r.sourceOnly {
-					t.Errorf("%s: an item of source %s, want %s only", r.query, k.source, r.sourceOnly)
-					break
-				}
+}
+
+// filterRow is a query of the audit list and the records it lists.
+type filterRow struct {
+	query      string
+	want       []string
+	withSetup  bool
+	sourceOnly string
+}
+
+// check asserts that the audit list for each row's query, as the admin
+// token sees it, holds the row's records, plus the setup's hub events
+// where the row says so.
+func (f *filterWorld) check(t *testing.T, rows []filterRow) {
+	t.Helper()
+	w, setup := f.world, f.setup
+	for _, r := range rows {
+		query, err := url.ParseQuery(r.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := keysOf(t, w.follow(t, w.Token, query, 0)...)
+		var extra []seeded
+		if r.withSetup {
+			extra = setup
+		}
+		if want := w.orderedWith(t, extra, r.want...); !slices.Equal(got, want) {
+			t.Errorf("%s: %v,\nwant %v", r.query, got, want)
+		}
+		for _, k := range got {
+			if r.sourceOnly != "" && k.source != r.sourceOnly {
+				t.Errorf("%s: an item of source %s, want %s only", r.query, k.source, r.sourceOnly)
+				break
 			}
 		}
 	}
+}
 
-	t.Run("source, workspace, types and session_id narrow both sources", func(t *testing.T) {
-		check(t, []row{
-			{query: "source=hub", want: hubs, withSetup: true},
-			{query: "source=agent", want: agents},
-			{query: "workspace=ws1", want: []string{"hl", "ho", "hs", "at", "af", "ab"}},
-			{query: "types=parley.change.land", want: []string{"hl", "hf"}},
-			{query: "types=parley.change.*", want: []string{"hl", "ho", "hf", "hgone"}},
-			{query: "types=parley.change.*,tool.started", want: []string{"hl", "ho", "hf", "hgone", "at", "ab", "aff"}},
-			{query: "types=*", want: append(slices.Clone(hubs), agents...), withSetup: true},
-			{query: "types=parley.nothing.here"},
-			{query: "session_id=" + strings.ToUpper(session), want: []string{"hl", "at"}},
-			{query: "workspace=ws1&source=agent&types=tool.*", want: []string{"at", "ab"}},
-		})
+// TestAuditFilters runs the filters of the audit query over one hub that
+// holds hub events and run events of a workspace, its fork, a deleted fork
+// and a deleted workspace.
+func TestAuditFilters(t *testing.T) {
+	t.Parallel()
+	f := newFilterWorld(t)
+
+	t.Run("source, workspace, types and session_id narrow both sources", func(t *testing.T) { filtersNarrowBothSources(t, f) })
+	t.Run("a hub-only filter selects hub events and no run event", func(t *testing.T) { filtersOfHubEventsOnly(t, f) })
+	t.Run("an agent-only filter selects run events and no hub event", func(t *testing.T) { filtersOfRunEventsOnly(t, f) })
+	t.Run("a workspace filter the caller may not read is refused as not found", func(t *testing.T) { filtersRefuseAWorkspaceNotRead(t, f) })
+}
+
+// filtersNarrowBothSources lists the records through the filters both
+// sources have.
+func filtersNarrowBothSources(t *testing.T, f *filterWorld) {
+	check, session, hubs, agents := f.check, f.session, f.hubs, f.agents
+	check(t, []filterRow{
+		{query: "source=hub", want: hubs, withSetup: true},
+		{query: "source=agent", want: agents},
+		{query: "workspace=ws1", want: []string{"hl", "ho", "hs", "at", "af", "ab"}},
+		{query: "types=parley.change.land", want: []string{"hl", "hf"}},
+		{query: "types=parley.change.*", want: []string{"hl", "ho", "hf", "hgone"}},
+		{query: "types=parley.change.*,tool.started", want: []string{"hl", "ho", "hf", "hgone", "at", "ab", "aff"}},
+		{query: "types=*", want: append(slices.Clone(hubs), agents...), withSetup: true},
+		{query: "types=parley.nothing.here"},
+		{query: "session_id=" + strings.ToUpper(session), want: []string{"hl", "at"}},
+		{query: "workspace=ws1&source=agent&types=tool.*", want: []string{"at", "ab"}},
 	})
+}
 
-	t.Run("a hub-only filter selects hub events and no run event", func(t *testing.T) {
-		rows := []row{
-			{query: "actor_id=" + alice, want: []string{"ho"}},
-			{query: "actor_type=system", want: []string{"hl", "hgone", "h3"}},
-			{query: "resource_type=workspace", want: []string{"hs", "h3"}},
-			{query: "resource_id=c2", want: []string{"ho"}},
-			{query: "action=land", want: []string{"hl", "hf"}},
-			{query: "actor_type=system&action=land", want: []string{"hl"}},
-		}
-		for _, r := range slices.Clone(rows) {
-			r.query += "&source=hub"
-			rows = append(rows, r)
-		}
-		for i := range rows {
-			rows[i].sourceOnly = "hub"
-		}
-		check(t, rows)
-	})
+// filtersOfHubEventsOnly lists the records through the filters only hub
+// events have, with and without source=hub.
+func filtersOfHubEventsOnly(t *testing.T, f *filterWorld) {
+	check, alice := f.check, f.alice
+	rows := []filterRow{
+		{query: "actor_id=" + alice, want: []string{"ho"}},
+		{query: "actor_type=system", want: []string{"hl", "hgone", "h3"}},
+		{query: "resource_type=workspace", want: []string{"hs", "h3"}},
+		{query: "resource_id=c2", want: []string{"ho"}},
+		{query: "action=land", want: []string{"hl", "hf"}},
+		{query: "actor_type=system&action=land", want: []string{"hl"}},
+	}
+	for _, r := range slices.Clone(rows) {
+		r.query += "&source=hub"
+		rows = append(rows, r)
+	}
+	for i := range rows {
+		rows[i].sourceOnly = "hub"
+	}
+	check(t, rows)
+}
 
-	t.Run("an agent-only filter selects run events and no hub event", func(t *testing.T) {
-		rows := []row{
-			{query: "run_id=" + runA, want: []string{"at", "af", "aff"}},
-			{query: "node_id=n1", want: []string{"at", "ab"}},
-			{query: "severity=error", want: []string{"af"}},
-			{query: "severity=critical&source=agent", want: []string{"aff"}},
-		}
-		for i := range rows {
-			rows[i].sourceOnly = "agent"
-		}
-		check(t, rows)
-		status, body := w.Call(t, http.MethodGet, "/api/v1/audit?run_id="+runA+"&action=land", w.Token, nil)
-		if status != http.StatusOK || !jsonEqual(body, json.RawMessage(`{"items": [], "next_cursor": null}`)) {
-			t.Errorf("an agent-only and a hub-only filter: %d %s, want 200 {\"items\": [], \"next_cursor\": null}", status, body)
-		}
-	})
+// filtersOfRunEventsOnly lists the records through the filters only run
+// events have, and through one of each kind.
+func filtersOfRunEventsOnly(t *testing.T, f *filterWorld) {
+	w, check, runA := f.world, f.check, f.runA
+	rows := []filterRow{
+		{query: "run_id=" + runA, want: []string{"at", "af", "aff"}},
+		{query: "node_id=n1", want: []string{"at", "ab"}},
+		{query: "severity=error", want: []string{"af"}},
+		{query: "severity=critical&source=agent", want: []string{"aff"}},
+	}
+	for i := range rows {
+		rows[i].sourceOnly = "agent"
+	}
+	check(t, rows)
+	status, body := w.Call(t, http.MethodGet, "/api/v1/audit?run_id="+runA+"&action=land", w.Token, nil)
+	if status != http.StatusOK || !jsonEqual(body, json.RawMessage(`{"items": [], "next_cursor": null}`)) {
+		t.Errorf("an agent-only and a hub-only filter: %d %s, want 200 {\"items\": [], \"next_cursor\": null}", status, body)
+	}
+}
 
-	t.Run("a workspace filter the caller may not read is refused as not found", func(t *testing.T) {
-		cases := []struct {
-			caller, credential, slug string
-			want                     []string // nil: refused
-		}{
-			{"outsider", carolKey, "ws1", nil},
-			{"outsider", carolKey, "nope", nil},
-			{"owner of ws1", aliceKey, "ws2", nil},
-			{"token bound to ws1", bound, "own2", nil},
-			{"owner of ws1", aliceKey, "ws1", []string{"hl", "ho", "hs", "at", "af", "ab"}},
-			{"owner of ws1", aliceKey, "ws1--gone", []string{"hgone", "agone"}},
-			{"admin", w.Token, "ws3", []string{"h3", "a3"}},
-			{"admin", w.Token, "nope", []string{}},
-		}
-		var refusal []byte
-		for _, c := range cases {
-			status, body := w.Call(t, http.MethodGet, "/api/v1/audit?workspace="+c.slug, c.credential, nil)
-			if c.want == nil {
-				if status != http.StatusNotFound || errorOf(t, body) != "not_found" || !strings.Contains(string(body), `"workspace not found"`) {
-					t.Errorf("%s, %s: %d %s, want 404 not_found workspace not found", c.caller, c.slug, status, body)
-				}
-				if refusal != nil && string(body) != string(refusal) {
-					t.Errorf("%s, %s: body %s differs from %s", c.caller, c.slug, body, refusal)
-				}
-				refusal = body
-				continue
+// filtersRefuseAWorkspaceNotRead lists the records of a workspace as
+// callers who may and who may not read it.
+func filtersRefuseAWorkspaceNotRead(t *testing.T, f *filterWorld) {
+	w, aliceKey, carolKey, bound := f.world, f.aliceKey, f.carolKey, f.bound
+	cases := []struct {
+		caller, credential, slug string
+		want                     []string // nil: refused
+	}{
+		{"outsider", carolKey, "ws1", nil},
+		{"outsider", carolKey, "nope", nil},
+		{"owner of ws1", aliceKey, "ws2", nil},
+		{"token bound to ws1", bound, "own2", nil},
+		{"owner of ws1", aliceKey, "ws1", []string{"hl", "ho", "hs", "at", "af", "ab"}},
+		{"owner of ws1", aliceKey, "ws1--gone", []string{"hgone", "agone"}},
+		{"admin", w.Token, "ws3", []string{"h3", "a3"}},
+		{"admin", w.Token, "nope", []string{}},
+	}
+	var refusal []byte
+	for _, c := range cases {
+		status, body := w.Call(t, http.MethodGet, "/api/v1/audit?workspace="+c.slug, c.credential, nil)
+		if c.want == nil {
+			if status != http.StatusNotFound || errorOf(t, body) != "not_found" || !strings.Contains(string(body), `"workspace not found"`) {
+				t.Errorf("%s, %s: %d %s, want 404 not_found workspace not found", c.caller, c.slug, status, body)
 			}
-			if status != http.StatusOK {
-				t.Errorf("%s, %s: %d %s, want 200", c.caller, c.slug, status, body)
-				continue
+			if refusal != nil && string(body) != string(refusal) {
+				t.Errorf("%s, %s: body %s differs from %s", c.caller, c.slug, body, refusal)
 			}
-			if got, want := keysOf(t, w.audit(t, c.credential, url.Values{"workspace": {c.slug}})), w.ordered(t, c.want...); !slices.Equal(got, want) {
-				t.Errorf("%s, %s: %v, want %v", c.caller, c.slug, got, want)
-			}
+			refusal = body
+			continue
 		}
-	})
+		if status != http.StatusOK {
+			t.Errorf("%s, %s: %d %s, want 200", c.caller, c.slug, status, body)
+			continue
+		}
+		if got, want := keysOf(t, w.audit(t, c.credential, url.Values{"workspace": {c.slug}})), w.ordered(t, c.want...); !slices.Equal(got, want) {
+			t.Errorf("%s, %s: %v, want %v", c.caller, c.slug, got, want)
+		}
+	}
 }
 
 // TestAuditQuery_RefusesAnInvalidParameterBeforeAnyRead serves the audit

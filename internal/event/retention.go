@@ -10,19 +10,22 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
-// notNewest restricts a delete of hub events to those below the highest
-// stored seq: the newest event always stays stored, as it stays in the
-// event log, whatever its age (ADR 05).
-const notNewest = `seq < (SELECT max(seq) FROM hub_events)`
+// outOfLog restricts a delete of hub events to those that have left the
+// event log, below oldest_seq as the delete's own transaction reads it, and
+// below the highest stored seq: every read of the log is a prefix without
+// gaps, so an event still in it stays stored whatever its age, and the
+// newest event always stays (ADR 05).
+const outOfLog = `seq < (SELECT oldest_seq FROM hub_event_log_bound WHERE only = 1)
+AND seq < (SELECT max(seq) FROM hub_events)`
 
 // DeleteBefore deletes, in one transaction, the stored hub events whose
-// time is before cutoff, but never the one with the highest seq, and
-// returns the number it deleted. last_seq and oldest_seq do not move:
-// deleting events never lowers the counter, and the retention run moves the
-// log's start with Expire before it deletes.
+// time is before cutoff and that have left the event log, but never the one
+// with the highest seq, and returns the number it deleted. last_seq and
+// oldest_seq do not move: deleting events never lowers the counter, and the
+// retention run moves the log's start with Expire before it deletes.
 func (c *Component) DeleteBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	at := timefmt.Format(ceilSecond(cutoff))
-	n, err := c.deleteEvents(ctx, `DELETE FROM hub_events WHERE time < ? AND `+notNewest, at)
+	n, err := c.deleteEvents(ctx, `DELETE FROM hub_events WHERE time < ? AND `+outOfLog, at)
 	if err != nil {
 		return 0, fmt.Errorf("delete the hub events before %s: %w", at, err)
 	}
@@ -56,9 +59,9 @@ func (c *Component) WorkspaceSlugs(ctx context.Context) ([]string, error) {
 }
 
 // DeleteWorkspaceRecordsBefore deletes, in one transaction, the stored hub
-// events of the workspaces slugs whose time is before cutoff, but never
-// the one with the highest seq, and returns the number it deleted. An
-// event of no workspace is never deleted by it.
+// events of the workspaces slugs whose time is before cutoff and that have
+// left the event log, but never the one with the highest seq, and returns
+// the number it deleted. An event of no workspace is never deleted by it.
 func (c *Component) DeleteWorkspaceRecordsBefore(ctx context.Context, slugs []string, cutoff time.Time) (int64, error) {
 	list, err := json.Marshal(slugs)
 	if err != nil {
@@ -66,7 +69,7 @@ func (c *Component) DeleteWorkspaceRecordsBefore(ctx context.Context, slugs []st
 	}
 	at := timefmt.Format(ceilSecond(cutoff))
 	n, err := c.deleteEvents(ctx, `DELETE FROM hub_events
-WHERE workspace IN (SELECT value FROM json_each(?)) AND time < ? AND `+notNewest, string(list), at)
+WHERE workspace IN (SELECT value FROM json_each(?)) AND time < ? AND `+outOfLog, string(list), at)
 	if err != nil {
 		return 0, fmt.Errorf("delete the hub events of %d workspaces before %s: %w", len(slugs), at, err)
 	}

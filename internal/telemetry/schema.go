@@ -24,6 +24,7 @@ var SchemaSteps = []store.Step{
 	{Name: "telemetry_tool_errors", Target: store.Analytics, Apply: createToolErrors},
 	{Name: "telemetry_traces", Target: store.Analytics, Apply: createTraces},
 	{Name: "telemetry_postmortems", Target: store.Analytics, Apply: createPostmortems},
+	{Name: "telemetry_run_events_time", Target: store.Analytics, Apply: indexRunEventsByTime},
 }
 
 // createRunEvents creates the run events, indexed for the reads of a run in
@@ -149,5 +150,13 @@ CREATE TABLE postmortems (
 	session_history TEXT NOT NULL
 );
 CREATE UNIQUE INDEX postmortems_run ON postmortems (workspace, run_id);`)
+	return err
+}
+
+// indexRunEventsByTime indexes the run events by time across workspaces, for
+// the audit list's read of the newest run events, which would otherwise sort
+// the whole table on every page.
+func indexRunEventsByTime(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `CREATE INDEX run_events_time ON run_events (timestamp, id);`)
 	return err
 }

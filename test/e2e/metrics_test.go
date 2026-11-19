@@ -24,9 +24,14 @@ import (
 // every metric of the catalogue, the run's time and the recounted records.
 func TestMetrics_RetentionPrunesOldRecordsAtStartAndTheOperatorWatchesIt(t *testing.T) {
 	parallel(t)
-	// The event log may not keep an event longer than the audit record
-	// does, so its retention comes down with the audit's maximum age.
-	h := hubtest.StartWith(t, hubtest.Config{TOML: "[audit]\nmax_age = \"1d\"\n[events]\nretention = \"1d\"\n"})
+	// The first run keeps the old run event, so that only the restart's
+	// retention pass, with the shorter maximum age, can delete it. The event
+	// log may not keep an event longer than the audit record does, so its
+	// retention stays at the shorter one in both runs.
+	h := hubtest.StartWith(t, hubtest.Config{
+		TOML: "[audit]\nmax_age = \"${AUDIT_MAX_AGE}\"\n[events]\nretention = \"1d\"\n",
+		Env:  map[string]string{"AUDIT_MAX_AGE": "90d"},
+	})
 	owner := h.CreateUser(t, "olive")
 	ownerKey := h.IssueKey(t, owner)
 	h.AddWorkspace(t, access.Record{Slug: "demo", OwnerID: owner, OrgID: h.CreateOrg(t, "acme"), Kind: access.KindRepository, Status: access.StatusReady})
@@ -41,7 +46,27 @@ func TestMetrics_RetentionPrunesOldRecordsAtStartAndTheOperatorWatchesIt(t *test
 		}
 	}
 
-	h.Restart(t)
+	waitUntil(10*time.Second, func() bool {
+		resp, err := http.Get(h.URL("/metrics"))
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		_, first := parseExposition(t, resp.Body)
+		return resp.StatusCode == http.StatusOK && first["parley_retention_last_run_timestamp_seconds"] > 0
+	})
+	var list struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	status, raw := h.Call(t, http.MethodGet, events, ownerKey, nil)
+	decodeInto(t, raw, &list)
+	if status != http.StatusOK || len(list.Items) != 2 {
+		t.Fatalf("GET run events before the restart = %d %s, want both run events", status, raw)
+	}
+
+	h.RestartEnv(t, map[string]string{"AUDIT_MAX_AGE": "1d"})
 	var families map[string]bool
 	var samples map[string]float64
 	var mediaType, version string
@@ -79,12 +104,8 @@ func TestMetrics_RetentionPrunesOldRecordsAtStartAndTheOperatorWatchesIt(t *test
 		t.Errorf(`parley_audit_records{kind="run_event"} = %v, want 1`, got)
 	}
 
-	status, raw := h.Call(t, http.MethodGet, events, ownerKey, nil)
-	var list struct {
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
-	}
+	status, raw = h.Call(t, http.MethodGet, events, ownerKey, nil)
+	list.Items = nil
 	decodeInto(t, raw, &list)
 	if status != http.StatusOK || len(list.Items) != 1 || list.Items[0].ID != ids["new"] {
 		t.Errorf("GET run events = %d %s, want the new run event alone", status, raw)
