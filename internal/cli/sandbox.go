@@ -40,6 +40,11 @@ const sandboxesRoute = "/workspaces/:workspace-slug/sandboxes"
 // to be up.
 const waitExitFlag = "wait-exit"
 
+// sandboxCameUp classifies a sandbox a command waits on until it is up:
+// every state but provisioning means the sandbox is up or will not come
+// up.
+var sandboxCameUp = byState("state", []string{"ready", "completed"}, []string{"failed", "stopped", "deleted"})
+
 // sandboxStringFlags are the string flags of parley sandbox create and the
 // body member each one sets.
 var sandboxStringFlags = []struct{ flag, member, usage string }{
@@ -53,7 +58,7 @@ var sandboxStringFlags = []struct{ flag, member, usage string }{
 // newSandboxCommand builds parley sandbox: the hub's sandboxes and the
 // profiles they are created from.
 func newSandboxCommand() *cobra.Command {
-	return group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, and list their profiles",
+	return group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles",
 		declare(command{
 			Name:        "profiles",
 			Description: "List the sandbox profiles the hub offers, in name order",
@@ -116,7 +121,83 @@ func newSandboxCommand() *cobra.Command {
 			Auth:        authUser,
 			Run:         downloadFromSandbox,
 		}),
+		declare(command{
+			Name:        "checkpoint",
+			Description: "Save a running sandbox's working directory as its checkpoint and print the sandbox",
+			Method:      http.MethodPost,
+			Path:        sandboxesRoute + "/:id/checkpoint",
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+			Auth:        authUser,
+		}),
+		declare(command{
+			Name:        "stop",
+			Description: "Stop a running sandbox, keeping its working directory, and print the sandbox",
+			Method:      http.MethodPost,
+			Path:        sandboxesRoute + "/:id/stop",
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+			Auth:        authUser,
+		}),
+		declare(command{
+			Name:        "start",
+			Description: "Start a stopped or ended sandbox again and print the sandbox; with --wait, wait until it is up",
+			Method:      http.MethodPost,
+			Path:        sandboxesRoute + "/:id/start",
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+			Auth:        authUser,
+			Wait: &waitFor{
+				Poll: func(c *call, _ []byte) (apiRequest, error) {
+					return apiRequest{method: http.MethodGet, path: routePath(sandboxesRoute+"/:id", c.args)}, nil
+				},
+				Classify: sandboxCameUp,
+			},
+		}),
+		declare(command{
+			Name:        "extend",
+			Description: "Give a sandbox a new time limit, counted from now, and print the sandbox",
+			Method:      http.MethodPatch,
+			Path:        sandboxesRoute + "/:id",
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+			Auth:        authUser,
+			Flags: func(fs *pflag.FlagSet) {
+				fs.String("ttl", "", "the sandbox's new time limit from now, such as 2h, within its profile's maximum")
+				_ = cobra.MarkFlagRequired(fs, "ttl")
+			},
+			Run: func(c *call) error {
+				ttl, _ := c.cmd.Flags().GetString("ttl")
+				return sendWith(c, nil, map[string]any{"ttl": ttl})
+			},
+		}),
+		declare(command{
+			Name:        "delete",
+			Description: "Delete a sandbox, saving its working directory as a checkpoint first unless --no-checkpoint is given",
+			Method:      http.MethodDelete,
+			Path:        sandboxesRoute + "/:id",
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+			Auth:        authUser,
+			Flags: func(fs *pflag.FlagSet) {
+				fs.Bool("no-checkpoint", false, "delete the sandbox without saving its working directory first")
+			},
+			Run: deleteSandbox,
+			// The hub answers a delete with no body.
+			Confirm: func(c *call) any {
+				return struct {
+					ID     string `json:"id"`
+					Status string `json:"status"`
+				}{c.args[sandboxIDArg.Name], "deleted"}
+			},
+		}),
 	)
+}
+
+// deleteSandbox is the run step of parley sandbox delete: it sends
+// checkpoint=false only with --no-checkpoint, so that otherwise the hub's
+// default, a checkpoint before the delete, applies.
+func deleteSandbox(c *call) error {
+	var query url.Values
+	if skip, _ := c.cmd.Flags().GetBool("no-checkpoint"); skip {
+		query = url.Values{"checkpoint": {"false"}}
+	}
+	return sendWith(c, query, nil)
 }
 
 // newSandboxCreateCommand builds parley sandbox create. The words after --
@@ -158,9 +239,7 @@ func newSandboxCreateCommand() *cobra.Command {
 				}
 				return apiRequest{method: http.MethodGet, path: routePath(c.decl.Path, c.args) + "/" + pathSegment(s.ID)}, nil
 			},
-			// Every state but provisioning means the sandbox is up or
-			// will not come up.
-			Classify: byState("state", []string{"ready", "completed"}, []string{"failed", "stopped", "deleted"}),
+			Classify: sandboxCameUp,
 		},
 		Run: createSandbox,
 	})
