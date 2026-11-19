@@ -1,17 +1,22 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -93,6 +98,24 @@ func newSandboxCommand() *cobra.Command {
 			Run:         shellInSandbox,
 		}),
 		newSandboxLogsCommand(),
+		declare(command{
+			Name:        "upload",
+			Description: "Copy a local file, with its mode, or a local directory into a sandbox's working directory and print what the hub wrote",
+			Method:      http.MethodPut,
+			Path:        sandboxFilesRoute,
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg, {Name: "local-path", Required: true}, {Name: "sandbox-path", Required: true}},
+			Auth:        authUser,
+			Run:         uploadToSandbox,
+		}),
+		declare(command{
+			Name:        "download",
+			Description: "Copy a file or a directory of a sandbox to a local path, or a file to stdout with -, and print the path and the bytes written",
+			Method:      http.MethodGet,
+			Path:        sandboxFilesRoute,
+			Args:        []argSpec{workspaceSlugArg, sandboxIDArg, {Name: "sandbox-path", Required: true}, {Name: "local-path", Required: true}},
+			Auth:        authUser,
+			Run:         downloadFromSandbox,
+		}),
 	)
 }
 
@@ -713,4 +736,401 @@ func (c *client) refusalOf(ctx context.Context, r apiRequest) error {
 		return err
 	}
 	return clientError("the hub at %s answered %d instead of opening the terminal", c.hubURL, resp.StatusCode)
+}
+
+// sandboxFilesRoute is the route that moves files in and out of a sandbox.
+const sandboxFilesRoute = sandboxesRoute + "/:id/files"
+
+// The media types of a transfer's body: one file's bytes, or a tar stream.
+const (
+	mediaOctets = "application/octet-stream"
+	mediaTar    = "application/x-tar"
+)
+
+// uploadToSandbox is the run step of parley sandbox upload: a regular file
+// is sent as it is, with its permission bits as mode; a directory as a tar
+// stream of its regular files and directories, written while it is sent.
+// The local path is read before anything is sent, so one that cannot be
+// read sends no request. The upload has no request timeout: it takes as
+// long as its bytes take.
+func uploadToSandbox(c *call) error {
+	local := c.args["local-path"]
+	r := apiRequest{
+		method: c.decl.Method,
+		path:   routePath(c.decl.Path, c.args),
+		query:  url.Values{"path": {c.args["sandbox-path"]}},
+	}
+	info, err := os.Stat(local)
+	if err != nil {
+		return clientError("cannot read %s: %v", local, err)
+	}
+	switch {
+	case info.Mode().IsRegular():
+		f, err := os.Open(local)
+		if err != nil {
+			return clientError("cannot read %s: %v", local, err)
+		}
+		// The client closes the file once it is sent; this closes it when
+		// the request is never sent.
+		defer f.Close()
+		r.query.Set("mode", fmt.Sprintf("%04o", info.Mode().Perm()))
+		r.payload, r.payloadType, r.payloadLength = f, mediaOctets, info.Size()
+	case info.IsDir():
+		entries, err := localTree(c, local)
+		if err != nil {
+			return err
+		}
+		return uploadTree(c, r, entries)
+	default:
+		return clientError("%s is neither a regular file nor a directory", local)
+	}
+	resp, err := c.client.open(c.ctx, r)
+	if err != nil {
+		return err
+	}
+	return printUploaded(c, resp)
+}
+
+// uploadTree sends r with the tar stream of entries as its body, written
+// while it is sent, and prints the hub's answer.
+func uploadTree(c *call, r apiRequest, entries []localEntry) error {
+	pr, pw := io.Pipe()
+	written := make(chan error, 1)
+	go func() {
+		err := writeTar(pw, entries)
+		pw.CloseWithError(err)
+		written <- err
+	}()
+	r.query.Set("archive", "tar")
+	r.payload, r.payloadType, r.payloadLength = pr, mediaTar, -1
+	resp, err := c.client.open(c.ctx, r)
+	// Closing the reader ends the writer when the hub answered or the
+	// request failed before the stream was read to its end.
+	_ = pr.Close()
+	werr := <-written
+	if err != nil {
+		// A stream that failed on the local side says why the request
+		// failed better than the broken request does.
+		var local *cliError
+		if errors.As(werr, &local) {
+			return werr
+		}
+		return err
+	}
+	return printUploaded(c, resp)
+}
+
+// printUploaded prints the hub's answer to an upload, the document of
+// what it wrote.
+func printUploaded(c *call, resp *http.Response) error {
+	defer resp.Body.Close()
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerSize+1))
+	if err != nil {
+		return clientError("cannot read the answer of the hub at %s: %v", c.client.hubURL, err)
+	}
+	if len(answer) > maxAnswerSize || !json.Valid(answer) {
+		return clientError("the hub answered %d with a body that is not one JSON document", resp.StatusCode)
+	}
+	return c.printResult(answer)
+}
+
+// localEntry is a regular file or a directory below the directory an
+// upload sends, with its name in the tar stream.
+type localEntry struct {
+	path, name string
+	dir        bool
+}
+
+// localTree is every regular file and directory below dir, in lexical
+// order, read before the upload is sent so that a directory that cannot be
+// read sends no request. A symbolic link is not followed but left out with
+// a warning, as is anything else that is neither a file nor a directory.
+func localTree(c *call, dir string) ([]localEntry, error) {
+	root := dir
+	// A directory named through a link is the directory it points to; any
+	// other link below it is left out.
+	if info, err := os.Lstat(dir); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+		if root, err = filepath.EvalSymlinks(dir); err != nil {
+			return nil, clientError("cannot read %s: %v", dir, err)
+		}
+	}
+	var entries []localEntry
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		shown := filepath.Join(dir, strings.TrimPrefix(p, root))
+		if err != nil {
+			return clientError("cannot read %s: %v", shown, err)
+		}
+		if p == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return clientError("cannot read %s: %v", shown, err)
+		}
+		name := filepath.ToSlash(rel)
+		switch {
+		case d.IsDir():
+			entries = append(entries, localEntry{path: p, name: name + "/", dir: true})
+		case d.Type().IsRegular():
+			entries = append(entries, localEntry{path: p, name: name})
+		case d.Type()&fs.ModeSymlink != 0:
+			warn(c.stderr, "the symbolic link %s is not uploaded", shown)
+		default:
+			warn(c.stderr, "%s is neither a regular file nor a directory and is not uploaded", shown)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// writeTar writes the tar stream of entries to w, each with its permission
+// bits and modification time; the hub keeps the modes. A local path it
+// cannot read is a client_error; a failure to write to w is returned as it
+// is, since the request reports it.
+func writeTar(w io.Writer, entries []localEntry) error {
+	tw := tar.NewWriter(w)
+	for _, e := range entries {
+		if err := writeTarEntry(tw, e); err != nil {
+			return err
+		}
+	}
+	return tw.Close()
+}
+
+// writeTarEntry writes the entry e: a directory's header, or a file's
+// header and bytes, sized as the file is when it is opened.
+func writeTarEntry(tw *tar.Writer, e localEntry) error {
+	if e.dir {
+		info, err := os.Stat(e.path)
+		if err != nil {
+			return clientError("cannot read %s: %v", e.path, err)
+		}
+		hdr := &tar.Header{Typeflag: tar.TypeDir, Name: e.name, Mode: int64(info.Mode().Perm()), ModTime: info.ModTime()}
+		return tw.WriteHeader(hdr)
+	}
+	f, err := os.Open(e.path)
+	if err != nil {
+		return clientError("cannot read %s: %v", e.path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return clientError("cannot read %s: %v", e.path, err)
+	}
+	hdr := &tar.Header{Typeflag: tar.TypeReg, Name: e.name, Mode: int64(info.Mode().Perm()), Size: info.Size(), ModTime: info.ModTime()}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	if _, err := io.CopyN(tw, localReader{f, e.path}, info.Size()); err != nil {
+		if errors.Is(err, io.EOF) {
+			return clientError("%s became shorter while it was sent", e.path)
+		}
+		return err
+	}
+	return nil
+}
+
+// localReader reads a local file of an upload, its failures client_errors,
+// so that they are told apart from a failure to send its bytes.
+type localReader struct {
+	r    io.Reader
+	path string
+}
+
+func (l localReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = clientError("cannot read %s: %v", l.path, err)
+	}
+	return n, err
+}
+
+// errorTypePathIsDirectory is the hub's answer to a download of a
+// directory asked for as a file.
+const errorTypePathIsDirectory = "path_is_directory"
+
+// downloadFromSandbox is the run step of parley sandbox download: the file
+// at the sandbox path, or, when the hub answers that it is a directory, a
+// tar stream of the directory, asked for again. Neither request has a
+// timeout: a transfer takes as long as its bytes take. Nothing is written
+// at the local path before the hub has answered with the bytes.
+func downloadFromSandbox(c *call) error {
+	local := c.args["local-path"]
+	r := apiRequest{
+		method: c.decl.Method,
+		path:   routePath(c.decl.Path, c.args),
+		query:  url.Values{"path": {c.args["sandbox-path"]}},
+		accept: mediaOctets,
+	}
+	resp, err := c.client.open(c.ctx, r)
+	tarred := false
+	if he := (*hubError)(nil); errors.As(err, &he) && errorTypeOf(he.body) == errorTypePathIsDirectory {
+		tarred = true
+		r.query.Set("archive", "tar")
+		r.accept = mediaTar
+		resp, err = c.client.open(c.ctx, r)
+	}
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var n int64
+	switch {
+	case local == "-":
+		// A directory goes to stdout as the tar stream itself.
+		if _, err := io.Copy(c.stdout, resp.Body); err != nil {
+			return clientError("cannot copy the download from the hub at %s to stdout: %v", c.client.hubURL, err)
+		}
+		return nil
+	case tarred:
+		n, err = unpackTar(resp.Body, local)
+	default:
+		n, err = writeLocalFile(resp.Body, local)
+	}
+	if err != nil {
+		return err
+	}
+	result, err := json.Marshal(struct {
+		Path  string `json:"path"`
+		Bytes int64  `json:"bytes"`
+	}{local, n})
+	if err != nil {
+		return clientError("cannot encode the result: %v", err)
+	}
+	return c.printResult(result)
+}
+
+// downloadedFileMode is the mode of a downloaded file: the hub sends none.
+const downloadedFileMode = 0o644
+
+// writeLocalFile writes body to the file at path through a temporary file
+// in the same directory, renamed onto path once the whole body is written,
+// so that path holds either all of it or what it held before. It returns
+// the bytes written.
+func writeLocalFile(body io.Reader, path string) (int64, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".parley-*")
+	if err != nil {
+		return 0, clientError("cannot write %s: %v", path, err)
+	}
+	renamed := false
+	defer func() {
+		if !renamed {
+			tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	n, err := io.Copy(tmp, body)
+	if err != nil {
+		return 0, clientError("the download of %s broke: %v", path, err)
+	}
+	if err := tmp.Chmod(downloadedFileMode); err != nil {
+		return 0, clientError("cannot write %s: %v", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, clientError("cannot write %s: %v", path, err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return 0, clientError("cannot write %s: %v", path, err)
+	}
+	renamed = true
+	return n, nil
+}
+
+// unpackTar unpacks the tar stream r into the directory dir, creating it,
+// with the modes of its entries, and returns the sum of the sizes of the
+// files it wrote. An entry whose name is absolute or leaves dir is refused,
+// and so is one that is neither a regular file nor a directory; every
+// write goes through an os.Root of dir, so nothing is written outside it,
+// through a link either. When unpacking fails, a dir it created is removed
+// again.
+func unpackTar(r io.Reader, dir string) (int64, error) {
+	_, statErr := os.Stat(dir)
+	created := errors.Is(statErr, fs.ErrNotExist)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, clientError("cannot create %s: %v", dir, err)
+	}
+	n, err := unpackInto(r, dir)
+	if err != nil && created {
+		os.RemoveAll(dir)
+	}
+	return n, err
+}
+
+// unpackInto is unpackTar's work, in a dir that exists. Directory modes are
+// set last, so that a directory without write permission is still filled.
+func unpackInto(r io.Reader, dir string) (int64, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return 0, clientError("cannot open %s: %v", dir, err)
+	}
+	defer root.Close()
+	type dirMode struct {
+		name string
+		mode fs.FileMode
+	}
+	var dirs []dirMode
+	var n int64
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, clientError("the tar stream of the download broke: %v", err)
+		}
+		name := hdr.Name
+		if path.IsAbs(name) || filepath.IsAbs(name) || !filepath.IsLocal(filepath.FromSlash(name)) {
+			return 0, clientError("the tar stream holds the entry %q, which lies outside %s", name, dir)
+		}
+		name = filepath.FromSlash(path.Clean(name))
+		mode := fs.FileMode(hdr.Mode).Perm()
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := root.MkdirAll(name, 0o755); err != nil {
+				return 0, clientError("cannot create %s: %v", filepath.Join(dir, name), err)
+			}
+			dirs = append(dirs, dirMode{name, mode})
+		case tar.TypeReg:
+			written, err := unpackFile(root, name, mode, tr)
+			if err != nil {
+				return 0, clientError("cannot write %s: %v", filepath.Join(dir, name), err)
+			}
+			n += written
+		default:
+			return 0, clientError("the tar stream holds the entry %q, which is neither a regular file nor a directory", hdr.Name)
+		}
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := root.Chmod(dirs[i].name, dirs[i].mode); err != nil {
+			return 0, clientError("cannot set the mode of %s: %v", filepath.Join(dir, dirs[i].name), err)
+		}
+	}
+	return n, nil
+}
+
+// unpackFile writes the file name below root from r, creating its parent
+// directories, with mode, and returns its size.
+func unpackFile(root *os.Root, name string, mode fs.FileMode, r io.Reader) (int64, error) {
+	if parent := filepath.Dir(name); parent != "." {
+		if err := root.MkdirAll(parent, 0o755); err != nil {
+			return 0, err
+		}
+	}
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(f, r)
+	if err != nil {
+		f.Close()
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	return n, root.Chmod(name, mode)
 }

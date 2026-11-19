@@ -86,6 +86,13 @@ type apiRequest struct {
 	query url.Values
 	// body is sent encoded as JSON when it is not nil.
 	body any
+	// payload, when not nil, is sent as the body in place of body, as it is
+	// read, with payloadType as its Content-Type and payloadLength as its
+	// length, or in chunks when that is -1: a file, or a stream written
+	// while it is sent.
+	payload       io.Reader
+	payloadType   string
+	payloadLength int64
 	// timeout, when not zero, replaces the client's for this request.
 	timeout time.Duration
 	// maxAnswer, when not zero, bounds the answer's body in bytes: a larger
@@ -219,7 +226,8 @@ func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
 }
 
 // newRequest is the HTTP request of r under ctx, with the client's
-// credential, r's body encoded as JSON and the Accept header r asks for.
+// credential, r's payload or its body encoded as JSON, and the Accept
+// header r asks for.
 func (c *client) newRequest(ctx context.Context, r apiRequest) (*http.Request, error) {
 	target := c.hubURL + r.path
 	if !r.outsideAPI {
@@ -228,8 +236,8 @@ func (c *client) newRequest(ctx context.Context, r apiRequest) (*http.Request, e
 	if len(r.query) > 0 {
 		target += "?" + r.query.Encode()
 	}
-	var payload io.Reader
-	if r.body != nil {
+	payload := r.payload
+	if r.body != nil && payload == nil {
 		encoded, err := json.Marshal(r.body)
 		if err != nil {
 			return nil, clientError("cannot encode the request body: %v", err)
@@ -246,7 +254,11 @@ func (c *client) newRequest(ctx context.Context, r apiRequest) (*http.Request, e
 	if c.credential != "" {
 		req.Header.Set("Authorization", "Bearer "+c.credential)
 	}
-	if r.body != nil {
+	switch {
+	case r.payload != nil:
+		req.ContentLength = r.payloadLength
+		req.Header.Set("Content-Type", r.payloadType)
+	case r.body != nil:
 		req.Header.Set("Content-Type", "application/json")
 	}
 	accept := "application/json"

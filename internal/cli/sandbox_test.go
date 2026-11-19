@@ -1,15 +1,20 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -309,6 +314,8 @@ func TestSandbox_UsageErrors(t *testing.T) {
 		{[]string{"logs", "demo"}, "<id>"},
 		{[]string{"logs", "demo", "sbx_1", "--source", "x"}, `"x"`},
 		{[]string{"logs", "demo", "sbx_1", "--tail", "0"}, "--tail"},
+		{[]string{"upload", "demo", "sbx_1", "f"}, "<sandbox-path>"},
+		{[]string{"download", "demo", "sbx_1", "out.txt"}, "<local-path>"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -996,4 +1003,349 @@ func TestSandboxShell_RelaysATerminalOverAWebSocket(t *testing.T) {
 			t.Fatal("waited 5 s for a text frame")
 		}
 	})
+}
+
+// filesPath is the route parley sandbox upload and download demo sbx_1 send
+// to.
+const filesPath = sandboxesPath + "/sbx_1/files"
+
+// runFiles runs parley with args against hub and returns the exit status,
+// stdout, stderr, the requests the hub got and how many of them were sent
+// under a deadline.
+func runFiles(t *testing.T, hub *stubHub, args ...string) (code int, stdout, stderr string, sent []stubRequest, deadlines int32) {
+	t.Helper()
+	opts := defaultOptions()
+	var n atomic.Int32
+	opts.transport = func(next http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if _, ok := r.Context().Deadline(); ok {
+				n.Add(1)
+			}
+			return next.RoundTrip(r)
+		})
+	}
+	code, stdout, stderr = runCLIWith(t, opts, onHub(hub.URL, args...)...)
+	return code, stdout, stderr, hub.recorded(), n.Load()
+}
+
+// tarEntry is one entry of a tar stream a test builds or reads: a name
+// ending in / is a directory.
+type tarEntry struct {
+	name    string
+	mode    int64
+	content string
+}
+
+// tarOf is the tar stream of entries.
+func tarOf(t *testing.T, entries ...tarEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Mode: e.mode, Typeflag: tar.TypeReg, Size: int64(len(e.content))}
+		if strings.HasSuffix(e.name, "/") {
+			hdr.Typeflag, hdr.Size = tar.TypeDir, 0
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(e.content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// tarEntriesOf reads the tar stream b.
+func tarEntriesOf(t *testing.T, b string) []tarEntry {
+	t.Helper()
+	var entries []tarEntry
+	tr := tar.NewReader(strings.NewReader(b))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return entries
+		}
+		if err != nil {
+			t.Fatalf("the body is not a tar stream: %v", err)
+		}
+		content, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, tarEntry{hdr.Name, hdr.Mode, string(content)})
+	}
+}
+
+// writeLocal writes content to path with mode, whatever the umask.
+func writeLocal(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSandboxUpload_SendsAFileOrADirectoryAndPrintsTheHubsAnswer(t *testing.T) {
+	t.Parallel()
+	t.Run("a file, with its mode", func(t *testing.T) {
+		t.Parallel()
+		const answer = `{"path":"/workspace/bin/f.sh","bytes":4,"entries":1}`
+		hub := newStubHub(t).answer(http.MethodPut, filesPath, http.StatusOK, answer)
+		local := filepath.Join(t.TempDir(), "f.sh")
+		writeLocal(t, local, "echo", 0o750)
+
+		code, stdout, stderr, sent, deadlines := runFiles(t, hub, "sandbox", "upload", "demo", "sbx_1", local, "bin/f.sh")
+
+		if code != 0 || stdout != indented(t, answer) || stderr != "" {
+			t.Errorf("exit status %d, stdout %q, stderr %q; want 0, the hub's answer and nothing", code, stdout, stderr)
+		}
+		got := wantOnlyRequest(t, sent, http.MethodPut, filesPath)
+		wantQuery(t, got.query, url.Values{"path": {"bin/f.sh"}, "mode": {"0750"}})
+		if got.body != "echo" || got.contentLength != 4 || got.header.Get("Content-Type") != "application/octet-stream" {
+			t.Errorf("sent body %q with length %d and Content-Type %q, want echo, 4 and application/octet-stream", got.body, got.contentLength, got.header.Get("Content-Type"))
+		}
+		if deadlines != 0 {
+			t.Errorf("the upload was sent under a deadline")
+		}
+	})
+	t.Run("a directory, as a tar stream without its links", func(t *testing.T) {
+		t.Parallel()
+		const answer = `{"path":"/workspace/proj","bytes":2,"entries":2}`
+		hub := newStubHub(t).answer(http.MethodPut, filesPath, http.StatusOK, answer)
+		dir := filepath.Join(t.TempDir(), "d")
+		writeLocal(t, filepath.Join(dir, "a", "b.txt"), "hi", 0o640)
+		if err := os.Symlink(filepath.Join("a", "b.txt"), filepath.Join(dir, "l")); err != nil {
+			t.Fatal(err)
+		}
+
+		code, stdout, stderr, sent, deadlines := runFiles(t, hub, "sandbox", "upload", "demo", "sbx_1", dir, "proj")
+
+		if code != 0 || stdout != indented(t, answer) {
+			t.Errorf("exit status %d, stdout %q; want 0 and the hub's answer (stderr %q)", code, stdout, stderr)
+		}
+		if !strings.HasPrefix(stderr, "warning: ") || !strings.Contains(stderr, filepath.Join(dir, "l")) || len(nonEmptyLines(stderr)) != 1 {
+			t.Errorf("stderr = %q, want one warning line naming the link", stderr)
+		}
+		got := wantOnlyRequest(t, sent, http.MethodPut, filesPath)
+		wantQuery(t, got.query, url.Values{"path": {"proj"}, "archive": {"tar"}})
+		if ct := got.header.Get("Content-Type"); ct != "application/x-tar" || got.contentLength != -1 {
+			t.Errorf("Content-Type %q, length %d; want application/x-tar streamed without a length", ct, got.contentLength)
+		}
+		dirMode := int64(0o755)
+		if info, err := os.Stat(filepath.Join(dir, "a")); err == nil {
+			dirMode = int64(info.Mode().Perm())
+		}
+		want := []tarEntry{{"a/", dirMode, ""}, {"a/b.txt", 0o640, "hi"}}
+		if entries := tarEntriesOf(t, got.body); !reflect.DeepEqual(entries, want) {
+			t.Errorf("tar entries = %v, want %v", entries, want)
+		}
+		if deadlines != 0 {
+			t.Errorf("the upload was sent under a deadline")
+		}
+	})
+	t.Run("a refusal of the hub, printed as received", func(t *testing.T) {
+		t.Parallel()
+		const refusal = `{"error":{"code":409,"message":"the sandbox is stopped","error_type":"sandbox_not_ready"}}`
+		dir := t.TempDir()
+		writeLocal(t, filepath.Join(dir, "f"), "x", 0o644)
+		for _, local := range []string{filepath.Join(dir, "f"), dir} {
+			hub := newStubHub(t).answer(http.MethodPut, filesPath, http.StatusConflict, refusal)
+
+			code, stdout, stderr, sent, _ := runFiles(t, hub, "sandbox", "upload", "demo", "sbx_1", local, "x")
+
+			if code != 1 || stdout != "" || stderr != indented(t, refusal) || len(sent) != 1 {
+				t.Errorf("%s: exit status %d, stdout %q, stderr %q, %d requests; want 1, nothing, the hub's envelope and 1", local, code, stdout, stderr, len(sent))
+			}
+		}
+	})
+	t.Run("a local path that does not exist", func(t *testing.T) {
+		t.Parallel()
+		hub := newStubHub(t)
+
+		code, stdout, stderr, sent, _ := runFiles(t, hub, "sandbox", "upload", "demo", "sbx_1", filepath.Join(t.TempDir(), "no", "such"), "x")
+
+		wantClientFailure(t, code, stdout, stderr, "client_error")
+		if len(sent) != 0 {
+			t.Errorf("the hub got %d requests, want none", len(sent))
+		}
+	})
+}
+
+// projTar is the tar stream a hub sends for the directory proj.
+var projTar = []tarEntry{{"src/", 0o755, ""}, {"src/main.go", 0o644, "package main"}, {"run.sh", 0o755, "#!/bin/sh\n"}}
+
+// filesHub is a stub hub whose sandbox sbx_1 holds the file out.txt and
+// the directory proj, and whose tar stream of the directory cut is cut
+// off by a dropped connection.
+func filesHub(t *testing.T) *stubHub {
+	t.Helper()
+	proj := tarOf(t, projTar...)
+	return newStubHub(t).handle(http.MethodGet, filesPath, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch p, tarred := q.Get("path"), q.Get("archive") == "tar"; {
+		case p == "out.txt" && !tarred:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", "6")
+			w.Write([]byte("result"))
+		case (p == "proj" || p == "cut") && !tarred:
+			answerWith(http.StatusBadRequest, `{"error":{"code":400,"message":"path is a directory","error_type":"path_is_directory"}}`)(w, r)
+		case p == "proj":
+			w.Header().Set("Content-Type", "application/x-tar")
+			w.Write(proj)
+		case p == "cut":
+			w.Header().Set("Content-Type", "application/x-tar")
+			w.Write(proj[:len(proj)/2])
+			http.NewResponseController(w).Flush()
+			panic(http.ErrAbortHandler)
+		default:
+			answerWith(http.StatusNotFound, `{"error":{"code":404,"message":"the sandbox has no such path","error_type":"path_not_found"}}`)(w, r)
+		}
+	})
+}
+
+// transferResult is the document parley sandbox download prints.
+func transferResult(t *testing.T, path string, n int) string {
+	t.Helper()
+	b, err := json.Marshal(struct {
+		Path  string `json:"path"`
+		Bytes int    `json:"bytes"`
+	}{path, n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return indented(t, string(b))
+}
+
+// wantNothingAt fails the test unless path does not exist.
+func wantNothingAt(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s exists (%v), want nothing there", path, err)
+	}
+}
+
+func TestSandboxDownload_WritesAFileOrUnpacksADirectory(t *testing.T) {
+	t.Parallel()
+	t.Run("a file, through a temporary file beside it", func(t *testing.T) {
+		t.Parallel()
+		hub := filesHub(t)
+		tmp := t.TempDir()
+		local := filepath.Join(tmp, "o.txt")
+
+		code, stdout, stderr, sent, deadlines := runFiles(t, hub, "sandbox", "download", "demo", "sbx_1", "out.txt", local)
+
+		if code != 0 || stdout != transferResult(t, local, 6) || stderr != "" {
+			t.Errorf("exit status %d, stdout %q, stderr %q; want 0, the path and 6 bytes, and nothing", code, stdout, stderr)
+		}
+		if b, err := os.ReadFile(local); err != nil || string(b) != "result" {
+			t.Errorf("%s holds %q (%v), want result", local, b, err)
+		}
+		if names, _ := os.ReadDir(tmp); len(names) != 1 {
+			t.Errorf("the directory holds %v, want o.txt alone", names)
+		}
+		got := wantOnlyRequest(t, sent, http.MethodGet, filesPath)
+		wantQuery(t, got.query, url.Values{"path": {"out.txt"}})
+		if deadlines != 0 {
+			t.Errorf("the download was sent under a deadline")
+		}
+	})
+	t.Run("a file to stdout", func(t *testing.T) {
+		t.Parallel()
+		code, stdout, stderr, _, _ := runFiles(t, filesHub(t), "sandbox", "download", "demo", "sbx_1", "out.txt", "-")
+
+		if code != 0 || stdout != "result" || stderr != "" {
+			t.Errorf("exit status %d, stdout %q, stderr %q; want 0, result and nothing", code, stdout, stderr)
+		}
+	})
+	t.Run("a directory, unpacked with its modes", func(t *testing.T) {
+		t.Parallel()
+		local := filepath.Join(t.TempDir(), "p")
+
+		code, stdout, stderr, sent, deadlines := runFiles(t, filesHub(t), "sandbox", "download", "demo", "sbx_1", "proj", local)
+
+		if code != 0 || stdout != transferResult(t, local, len("package main")+len("#!/bin/sh\n")) || stderr != "" {
+			t.Errorf("exit status %d, stdout %q, stderr %q; want 0, the path and the sum of the file sizes, and nothing", code, stdout, stderr)
+		}
+		for _, e := range projTar {
+			info, err := os.Stat(filepath.Join(local, e.name))
+			if err != nil {
+				t.Errorf("%s: %v", e.name, err)
+				continue
+			}
+			if perm := int64(info.Mode().Perm()); perm != e.mode {
+				t.Errorf("%s has mode %04o, want %04o", e.name, perm, e.mode)
+			}
+			if !info.IsDir() {
+				if b, _ := os.ReadFile(filepath.Join(local, e.name)); string(b) != e.content {
+					t.Errorf("%s holds %q, want %q", e.name, b, e.content)
+				}
+			}
+		}
+		if len(sent) != 2 {
+			t.Fatalf("the hub got %d requests, want 2", len(sent))
+		}
+		wantQuery(t, sent[0].query, url.Values{"path": {"proj"}})
+		wantQuery(t, sent[1].query, url.Values{"path": {"proj"}, "archive": {"tar"}})
+		if deadlines != 0 {
+			t.Errorf("the download was sent under a deadline")
+		}
+	})
+	t.Run("a refusal of the hub, leaving nothing", func(t *testing.T) {
+		t.Parallel()
+		local := filepath.Join(t.TempDir(), "m")
+
+		code, stdout, stderr, sent, _ := runFiles(t, filesHub(t), "sandbox", "download", "demo", "sbx_1", "missing", local)
+
+		if code != 1 || stdout != "" {
+			t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
+		}
+		if _, _, errorType := clientEnvelope(t, stderr); errorType != "path_not_found" {
+			t.Errorf("error_type = %q, want path_not_found", errorType)
+		}
+		if len(sent) != 1 {
+			t.Errorf("the hub got %d requests, want 1", len(sent))
+		}
+		wantNothingAt(t, local)
+	})
+	t.Run("a tar stream cut off", func(t *testing.T) {
+		t.Parallel()
+		local := filepath.Join(t.TempDir(), "c")
+
+		code, stdout, stderr, _, _ := runFiles(t, filesHub(t), "sandbox", "download", "demo", "sbx_1", "cut", local)
+
+		wantClientFailure(t, code, stdout, stderr, "client_error")
+		wantNothingAt(t, local)
+	})
+}
+
+func TestUnpackTar_RefusesAnEntryOutsideItsTarget(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"../x", "/x", "a/../../x"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			tmp := t.TempDir()
+			target := filepath.Join(tmp, "t")
+			stream := tarOf(t, tarEntry{"ok.txt", 0o644, "ok"}, tarEntry{name, 0o644, "out"})
+
+			_, err := unpackTar(bytes.NewReader(stream), target)
+
+			var ce *cliError
+			if !errors.As(err, &ce) || ce.errorType != clientErrorType {
+				t.Errorf("err = %v, want a client_error", err)
+			}
+			wantNothingAt(t, filepath.Join(tmp, "x"))
+			if names, _ := os.ReadDir(tmp); len(names) > 1 || (len(names) == 1 && names[0].Name() != "t") {
+				t.Errorf("the target's parent holds %v, want at most the target", names)
+			}
+		})
+	}
 }
