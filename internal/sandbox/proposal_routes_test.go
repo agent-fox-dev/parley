@@ -169,6 +169,8 @@ var policyRoutes = []policyRoute{
 	{http.MethodGet, proposalsPath("ws", unknownID), nil},
 	{http.MethodPost, approvePath("ws", unknownID, unknownProposal), map[string]any{}},
 	{http.MethodPost, rejectPath("ws", unknownID, unknownProposal), map[string]any{}},
+	{http.MethodGet, rulesPath("ws"), nil},
+	{http.MethodDelete, rulePath("ws", unknownRule), nil},
 }
 
 func TestPolicyRoutes_AnswerDisabledWhileSandboxesAreOffBeforeAnyOtherCheck(t *testing.T) {

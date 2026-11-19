@@ -142,7 +142,23 @@ const ruleColumns = `id, workspace, rule, summary, findings, from_proposal, crea
 // ListRules reads the rules the workspace holds through q, oldest first,
 // rules saved in the same second in the order of their ids.
 func ListRules(ctx context.Context, q access.Querier, workspace string) ([]SandboxRule, error) {
-	rows, err := q.QueryContext(ctx, `SELECT `+ruleColumns+` FROM sandbox_rules WHERE workspace = ? ORDER BY created_at, id`, workspace)
+	// SQLite reads a negative limit as none.
+	return rulesAfter(ctx, q, workspace, nil, -1)
+}
+
+// rulesAfter reads, through q, up to limit rules the workspace holds in the
+// order of ListRules, those after the position after when it is not nil.
+func rulesAfter(ctx context.Context, q access.Querier, workspace string, after *Position, limit int) ([]SandboxRule, error) {
+	query := `SELECT ` + ruleColumns + ` FROM sandbox_rules WHERE workspace = ?`
+	args := []any{workspace}
+	if after != nil {
+		at := after.CreatedAt.Unix()
+		query += ` AND (created_at > ? OR (created_at = ? AND id > ?))`
+		args = append(args, at, at, after.ID)
+	}
+	query += ` ORDER BY created_at, id LIMIT ?`
+	args = append(args, limit)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list the workspace sandbox rules of %s: %w", workspace, err)
 	}
@@ -243,10 +259,18 @@ func HoldingWorkspace(ctx context.Context, q access.Querier, slug string) (strin
 		return "", err
 	case !ok:
 		return "", fmt.Errorf("workspace %s has no record", slug)
-	case rec.Kind == access.KindFork && rec.ParentSlug != "":
-		return rec.ParentSlug, nil
 	}
-	return rec.Slug, nil
+	return holdingSlug(rec), nil
+}
+
+// holdingSlug is the slug of the workspace that holds the workspace
+// sandbox rules of the workspace rec: its parent when it is a task fork,
+// itself otherwise.
+func holdingSlug(rec access.Record) string {
+	if rec.Kind == access.KindFork && rec.ParentSlug != "" {
+		return rec.ParentSlug
+	}
+	return rec.Slug
 }
 
 // SaveApprovedRule stores a in tx.
@@ -286,4 +310,16 @@ func ApprovedRules(ctx context.Context, q access.Querier, id string) ([]Approved
 		return nil, fmt.Errorf("list the rules approved for sandbox %s: %w", id, err)
 	}
 	return out, nil
+}
+
+// RemoveWorkspaceRules deletes every workspace sandbox rule the workspace
+// slug holds, through tx, and writes no event. It is a remover of owned data
+// of the workspace teardown (ADR 07): it runs in the transaction that
+// removes the workspace, so the rules go with it or not at all, and it
+// revokes no token.
+func RemoveWorkspaceRules(ctx context.Context, tx *sql.Tx, slug string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox_rules WHERE workspace = ?`, slug); err != nil {
+		return fmt.Errorf("remove the workspace sandbox rules of %s: %w", slug, err)
+	}
+	return nil
 }

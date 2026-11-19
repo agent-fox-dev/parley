@@ -1905,6 +1905,32 @@ func (h *createHub) saveRule(t *testing.T, ws, id, body string, at time.Time) sa
 	return r
 }
 
+// ruleMap is the workspace sandbox rule object of r as a decoded answer
+// holds it: its seven members, findings [] without findings, from_proposal
+// null for a rule promoted from no proposal and created_at in RFC 3339,
+// UTC, whole seconds.
+func ruleMap(t *testing.T, r sandbox.SandboxRule) map[string]any {
+	t.Helper()
+	var rule any
+	if err := json.Unmarshal(r.Rule, &rule); err != nil {
+		t.Fatal(err)
+	}
+	findings := []any{}
+	for _, f := range r.Findings {
+		findings = append(findings, map[string]any{"severity": f.Severity, "message": f.Message})
+	}
+	var from any
+	if o := r.FromProposal; o != nil {
+		from = map[string]any{"sandbox_id": o.SandboxID, "proposal_id": o.ProposalID, "workspace": o.Workspace}
+	}
+	by := r.CreatedBy
+	return map[string]any{
+		"id": r.ID, "rule": rule, "summary": r.Summary, "findings": findings, "from_proposal": from,
+		"created_by": map[string]any{"actor_type": by.ActorType, "actor_id": by.ActorID, "username": by.Username},
+		"created_at": stamp(r.CreatedAt),
+	}
+}
+
 // saveApproved stores body as a rule approved for the sandbox id at at, by a
 // proposal of a new id, and returns it.
 func (h *createHub) saveApproved(t *testing.T, id, body string, at time.Time) sandbox.ApprovedRule {

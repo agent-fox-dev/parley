@@ -110,7 +110,11 @@ const (
 // PATCH /workspaces/:slug/sandboxes/:id sets a sandbox's ttl, purpose and
 // labels through the service's extend. GET
 // /workspaces/:slug/sandboxes/:id/proposals lists a sandbox's network
-// proposals in one state, open by default.
+// proposals in one state, open by default, and POST
+// …/proposals/:proposal_id/approve and …/reject decide one. GET
+// /workspaces/:slug/sandbox-rules lists the workspace sandbox rules of the
+// workspace, or of the parent of a task fork, and DELETE
+// /workspaces/:slug/sandbox-rules/:rule_id deletes one.
 //
 // A workspace's deletion has the service delete the sandboxes of the
 // workspace and its forks first, by the system, with reason
@@ -223,6 +227,8 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.ProposalsRoute())
 	c.AddRoute(svc.ApproveRoute())
 	c.AddRoute(svc.RejectRoute())
+	c.AddRoute(svc.RulesRoute())
+	c.AddRoute(svc.RuleDeleteRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
@@ -273,7 +279,8 @@ func composeSandbox(c *Composition) {
 // workspaces' collaborator set (ADR 07), through which a workspace's
 // archive and deletion reach its sandboxes whether sandboxes are on or not:
 // with them off the records are still deleted and removed, and no runtime
-// is called.
+// is called. The removal of a workspace also removes the workspace sandbox
+// rules it holds (RemoveWorkspaceRules), in its transaction.
 func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
 	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
 	svc.RegisterDeleteHook(sandbox.WithdrawProposals)
@@ -284,6 +291,7 @@ func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
 	td.RegisterSandboxRemover(svc)
 	td.RegisterArchiveObserver(svc)
 	td.RegisterRemover(svc.RemoveWorkspaceRecords)
+	td.RegisterRemover(sandbox.RemoveWorkspaceRules)
 }
 
 // composeSandboxWork adds the sandbox feature's work besides the requests,
