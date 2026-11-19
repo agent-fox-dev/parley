@@ -130,14 +130,16 @@ func (s *Server) Register(rt Route) {
 			panic(fmt.Sprintf("server.Register: %s %s is already registered", rt.Method, rt.Pattern))
 		}
 	}
-	s.routes = append(s.routes, apiRoute{route: rt, segments: segments})
+	s.routes = append(s.routes, apiRoute{route: rt, segments: segments, muxPattern: muxPattern(rt.Method, segments)})
 }
 
-// apiRoute is a registered REST API route and its pattern split into
-// segments, a parameter as :name.
+// apiRoute is a registered REST API route, its pattern split into segments,
+// a parameter as :name, and its pattern in the syntax of http.ServeMux
+// (MatchedPattern).
 type apiRoute struct {
-	route    Route
-	segments []string
+	route      Route
+	segments   []string
+	muxPattern string
 }
 
 // matches reports whether the route's pattern matches the unescaped path
@@ -309,6 +311,7 @@ func (s *Server) serveRoute(w http.ResponseWriter, r *http.Request, a *apiRoute,
 		}
 	}
 	m := Matched{Method: a.route.Method, Pattern: a.route.Pattern, Route: a.route, Params: params}
+	notePattern(r, a.muxPattern)
 	ctx := context.WithValue(r.Context(), matchedKey{}, m)
 	ctx = context.WithValue(ctx, attachedKey{}, &attachments{})
 	s.runPipeline(w, r.WithContext(ctx), a.route)
@@ -358,6 +361,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	h, pattern := s.mux.Handler(r)
 	if pattern != "" && !redirects(p, pattern) {
+		notePattern(r, pattern)
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -482,4 +486,59 @@ func Attached(r *http.Request, key any) (any, bool) {
 	defer a.mu.Unlock()
 	v, ok := a.values[key]
 	return v, ok
+}
+
+type patternKey struct{}
+
+// patternSlot is where dispatch leaves the pattern it matched. The layers
+// inside the server serve copies of the request, so a wrapper outside them
+// reads it from a slot that its own request carries too.
+type patternSlot struct{ pattern string }
+
+// withPatternSlot gives every request an empty pattern slot before next
+// serves it.
+func withPatternSlot(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), patternKey{}, &patternSlot{})))
+	})
+}
+
+// notePattern records pattern as the one that matched r.
+func notePattern(r *http.Request, pattern string) {
+	if slot, ok := r.Context().Value(patternKey{}).(*patternSlot); ok {
+		slot.pattern = pattern
+	}
+}
+
+// MatchedPattern returns the pattern of the route that served r, a request
+// the server's handler was given, in the syntax of http.ServeMux, as
+// Request.Pattern holds it: the method and a path. A REST API route's path
+// is /api/v1 and its pattern, each :name segment written {name} and a
+// catch-all *name written {name...}; a surface mounted with Handle has the
+// pattern it was mounted with. It is "" when no route matched: an unknown
+// path, a wrong method, or a path that is not clean. A wrapper set with
+// Options.Wrap reads it once the request has been served.
+func MatchedPattern(r *http.Request) string {
+	slot, _ := r.Context().Value(patternKey{}).(*patternSlot)
+	if slot == nil {
+		return ""
+	}
+	return slot.pattern
+}
+
+// muxPattern writes a REST API route's method and pattern segments in the
+// syntax of http.ServeMux.
+func muxPattern(method string, segments []string) string {
+	var b strings.Builder
+	b.WriteString(method + " " + apiMount)
+	for _, seg := range segments {
+		switch {
+		case isParam(seg):
+			seg = "{" + seg[1:] + "}"
+		case isCatchAll(seg):
+			seg = "{" + seg[1:] + "...}"
+		}
+		b.WriteString("/" + seg)
+	}
+	return b.String()
 }

@@ -59,6 +59,12 @@ type Options struct {
 	// members are added to the document after the build's; a member named
 	// like one of the build's is left out.
 	VersionMembers func() map[string]any
+	// Wrap, when set, wraps the handler that serves every route, outside the
+	// request id, the headers and the access log, so that what it measures
+	// covers the whole answer. Once the wrapped handler has served a
+	// request, MatchedPattern on that request names the route that served
+	// it.
+	Wrap func(http.Handler) http.Handler
 }
 
 // Server is the hub's HTTP server.
@@ -107,7 +113,11 @@ func New(opts Options) *Server {
 // response it sends carries X-Request-ID and the security headers, and every
 // request it answers gets an access-log line.
 func (s *Server) Handler() http.Handler {
-	return s.stamp(http.HandlerFunc(s.dispatch))
+	h := s.stamp(http.HandlerFunc(s.dispatch))
+	if s.opts.Wrap != nil {
+		h = s.opts.Wrap(h)
+	}
+	return withPatternSlot(h)
 }
 
 // Handle registers h for pattern on the server's router, with the pattern

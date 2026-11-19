@@ -308,3 +308,38 @@ func TestRegister_PanicsOnAnInvalidOrDuplicateRoute(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchedPattern_NamesTheRouteThatServedTheRequest(t *testing.T) {
+	t.Parallel()
+	var got string
+	s := New(Options{Wrap: func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
+			got = MatchedPattern(r)
+		})
+	}})
+	ok := func(w http.ResponseWriter, _ *http.Request) error {
+		WriteJSON(w, http.StatusOK, map[string]string{})
+		return nil
+	}
+	s.Register(Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/sync", Public: true, Handler: ok})
+	s.Register(Route{Method: http.MethodGet, Pattern: "/workspaces/:slug/refs/*name", Public: true, Handler: ok})
+	s.Handle("POST /git/{org}/{repo}/git-upload-pack", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	h := s.Handler()
+	for _, tc := range []struct{ method, target, want string }{
+		{http.MethodGet, "/api/v1/workspaces/a/sync", "GET /api/v1/workspaces/{slug}/sync"},
+		{http.MethodGet, "/api/v1/workspaces/a/refs/heads/main", "GET /api/v1/workspaces/{slug}/refs/{name...}"},
+		{http.MethodPost, "/git/o/r.git/git-upload-pack", "POST /git/{org}/{repo}/git-upload-pack"},
+		{http.MethodGet, "/healthz", "GET /healthz"},
+		{http.MethodDelete, "/api/v1/workspaces/a/sync", ""},
+		{http.MethodPost, "/healthz", ""},
+		{http.MethodGet, "/no/such/path", ""},
+		{http.MethodGet, "/api/v1/workspaces//sync", ""},
+	} {
+		got = "unset"
+		do(h, newRequest(tc.method, tc.target, nil, ""))
+		if got != tc.want {
+			t.Errorf("%s %s: MatchedPattern = %q, want %q", tc.method, tc.target, got, tc.want)
+		}
+	}
+}
