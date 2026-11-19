@@ -86,6 +86,13 @@ type apiRequest struct {
 	query url.Values
 	// body is sent encoded as JSON when it is not nil.
 	body any
+	// payload, when not nil, is sent as the body in place of body, as it is
+	// read, with payloadType as its Content-Type and payloadLength as its
+	// length, or in chunks when that is -1: a file, or a stream written
+	// while it is sent.
+	payload       io.Reader
+	payloadType   string
+	payloadLength int64
 	// timeout, when not zero, replaces the client's for this request.
 	timeout time.Duration
 	// maxAnswer, when not zero, bounds the answer's body in bytes: a larger
@@ -125,18 +132,57 @@ func (c *client) send(ctx context.Context, r apiRequest) (*response, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case resp.status >= 400:
-		if isHubEnvelope(resp.body) {
-			return nil, &hubError{status: resp.status, body: resp.body}
-		}
-		return nil, clientError("the hub answered %d without an error envelope", resp.status)
-	case resp.status < 200 || resp.status >= 300:
-		return nil, clientError("the hub answered %d, which is neither a success nor an error", resp.status)
-	case len(bytes.TrimSpace(resp.body)) > 0 && !json.Valid(resp.body):
+	if err := failureOf(resp); err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(resp.body)) > 0 && !json.Valid(resp.body) {
 		return nil, clientError("the hub answered %d with a body that is not JSON", resp.status)
 	}
 	return resp, nil
+}
+
+// failureOf is the error of an answer whose status is not a success: the
+// hub's error envelope as a hubError, anything else a client_error naming
+// the status. It is nil for a 2xx answer.
+func failureOf(resp *response) error {
+	switch {
+	case resp.status >= 400:
+		if isHubEnvelope(resp.body) {
+			return &hubError{status: resp.status, body: resp.body}
+		}
+		return clientError("the hub answered %d without an error envelope", resp.status)
+	case resp.status < 200 || resp.status >= 300:
+		return clientError("the hub answered %d, which is neither a success nor an error", resp.status)
+	}
+	return nil
+}
+
+// open sends r once without a request timeout and returns a 2xx answer with
+// its body unread, for a command that reads a stream as it arrives, or waits
+// for an operation that may outlast the timeout; the caller closes the body
+// and ends ctx to give up. Any other answer is the error send makes of it,
+// and a failure to connect a client_error naming the hub URL.
+func (c *client) open(ctx context.Context, r apiRequest) (*http.Response, error) {
+	req, err := c.newRequest(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, c.failure(ctx, ctx, 0, "cannot reach", err)
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerSize+1))
+	if err != nil {
+		return nil, c.failure(ctx, ctx, 0, "cannot read the answer of", err)
+	}
+	if len(body) > maxAnswerSize {
+		return nil, clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, maxAnswerSize)
+	}
+	return nil, failureOf(&response{status: resp.StatusCode, body: body})
 }
 
 // raw sends r once and returns the hub's answer whatever its status and
@@ -147,46 +193,16 @@ func (c *client) send(ctx context.Context, r apiRequest) (*response, error) {
 // a bound the answer is read whole, as large as it is: a command whose
 // output is not one JSON document, a download say, decides its own.
 func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
-	target := c.hubURL + r.path
-	if !r.outsideAPI {
-		target = c.hubURL + apiPrefix + r.path
-	}
-	if len(r.query) > 0 {
-		target += "?" + r.query.Encode()
-	}
-	var payload io.Reader
-	if r.body != nil {
-		encoded, err := json.Marshal(r.body)
-		if err != nil {
-			return nil, clientError("cannot encode the request body: %v", err)
-		}
-		payload = bytes.NewReader(encoded)
-	}
-
 	timeout := c.timeout
 	if r.timeout > 0 {
 		timeout = r.timeout
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, r.method, target, payload)
+	req, err := c.newRequest(reqCtx, r)
 	if err != nil {
-		return nil, clientError("cannot build a request to the hub at %s: %v", c.hubURL, err)
+		return nil, err
 	}
-	for name, values := range r.header {
-		req.Header[http.CanonicalHeaderKey(name)] = values
-	}
-	if c.credential != "" {
-		req.Header.Set("Authorization", "Bearer "+c.credential)
-	}
-	if r.body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	accept := "application/json"
-	if r.accept != "" {
-		accept = r.accept
-	}
-	req.Header.Set("Accept", accept)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -207,6 +223,50 @@ func (c *client) raw(ctx context.Context, r apiRequest) (*response, error) {
 		return nil, clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, r.maxAnswer)
 	}
 	return &response{status: resp.StatusCode, body: answer}, nil
+}
+
+// newRequest is the HTTP request of r under ctx, with the client's
+// credential, r's payload or its body encoded as JSON, and the Accept
+// header r asks for.
+func (c *client) newRequest(ctx context.Context, r apiRequest) (*http.Request, error) {
+	target := c.hubURL + r.path
+	if !r.outsideAPI {
+		target = c.hubURL + apiPrefix + r.path
+	}
+	if len(r.query) > 0 {
+		target += "?" + r.query.Encode()
+	}
+	payload := r.payload
+	if r.body != nil && payload == nil {
+		encoded, err := json.Marshal(r.body)
+		if err != nil {
+			return nil, clientError("cannot encode the request body: %v", err)
+		}
+		payload = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, r.method, target, payload)
+	if err != nil {
+		return nil, clientError("cannot build a request to the hub at %s: %v", c.hubURL, err)
+	}
+	for name, values := range r.header {
+		req.Header[http.CanonicalHeaderKey(name)] = values
+	}
+	if c.credential != "" {
+		req.Header.Set("Authorization", "Bearer "+c.credential)
+	}
+	switch {
+	case r.payload != nil:
+		req.ContentLength = r.payloadLength
+		req.Header.Set("Content-Type", r.payloadType)
+	case r.body != nil:
+		req.Header.Set("Content-Type", "application/json")
+	}
+	accept := "application/json"
+	if r.accept != "" {
+		accept = r.accept
+	}
+	req.Header.Set("Accept", accept)
+	return req, nil
 }
 
 // failure is the client_error of a request to the hub that failed with err:

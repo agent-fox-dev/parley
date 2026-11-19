@@ -83,12 +83,20 @@ type Service struct {
 	// changes is notified by the report of every applied transition, for
 	// the reads that wait for a sandbox.
 	changes notifier
+	// use is the table of the routes that use a sandbox.
+	use []*useEntry
+	// logs is what the log collector tells the reads of the stored logs.
+	logs logState
+	// observers are told of each operation on a sandbox once it ended.
+	observers observers
 }
 
 // NewService returns the service of a hub whose configuration is not loaded
 // yet: sandboxes are off until Configure says otherwise.
 func NewService() *Service {
-	return &Service{settings: &Settings{}, wakeup: make(chan struct{}, 1)}
+	s := &Service{settings: &Settings{}, wakeup: make(chan struct{}, 1)}
+	s.use = s.useTable()
+	return s
 }
 
 // Configure checks the [sandbox] section of cfg (see FromConfig) and keeps

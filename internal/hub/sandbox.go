@@ -29,6 +29,14 @@ const (
 	// sandboxProvisionerGrace is how long the stop waits for the
 	// provisionings it cancels: each returns once its runtime call does.
 	sandboxProvisionerGrace = 5 * time.Second
+	// sandboxLogCollectorWork is the name of the log collector's background
+	// work, and sandboxLogCollectorGrace how long the stop waits for it:
+	// each follower returns once its runtime stream ends with its context.
+	sandboxLogCollectorWork  = "sandbox_log_collector"
+	sandboxLogCollectorGrace = 5 * time.Second
+	// sandboxLogRetentionTask is the name of the maintenance task that
+	// deletes the stored log lines past their retention.
+	sandboxLogRetentionTask = "sandbox_log_retention"
 )
 
 // composeSandbox adds the sandbox feature: it makes the feature the owner of
@@ -66,7 +74,16 @@ const (
 // the latest, and GET
 // /workspaces/:slug/sandboxes lists a workspace's, with its forks' that the
 // access component's readable set holds; GET /sandboxes lists the stored
-// sandboxes of every workspace through the service's source.
+// sandboxes of every workspace through the service's source. The routes
+// that use a sandbox, POST exec, PUT and GET files, GET logs and GET attach
+// under /workspaces/:slug/sandboxes/:id, exist only through the service's
+// gate (Service.UseRoutes).
+//
+// The output of each ready sandbox's main process and its policy log are
+// stored in a table of their own: with sandboxes on, the log collector runs
+// as background work, the maintenance task sandbox_log_retention deletes
+// the lines past [sandbox].log_retention and those of removed records, and
+// a purge hook deletes a sandbox's lines with its record.
 //
 // With sandboxes on, the provisioner runs as background work: it brings each
 // created sandbox up at the runtime until it is ready or failed, woken by a
@@ -88,6 +105,8 @@ func composeSandbox(c *Composition) {
 		c.errs = append(c.errs, err)
 	}
 	c.AddSchemaStep(sandbox.SchemaStep)
+	c.AddSchemaStep(sandbox.LogSchemaStep)
+	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := sandbox.Deps{
@@ -129,6 +148,9 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.CreateRoute())
 	c.AddRoute(svc.GetRoute())
 	c.AddRoute(svc.ListRoute())
+	for _, rt := range svc.UseRoutes() {
+		c.AddRoute(rt)
+	}
 	// Registered while the hub composes, so that a test's source, registered
 	// after, replaces it; the list is refused while sandboxes are off.
 	svc.RegisterSource(svc.StoredSource())
@@ -170,6 +192,12 @@ func composeSandbox(c *Composition) {
 	})
 	c.AddBackgroundWork(sandboxProvisionerWork, sandboxProvisionerGrace, func(ctx context.Context, _ *Runtime) {
 		svc.RunProvisioner(ctx)
+	})
+	c.AddBackgroundWork(sandboxLogCollectorWork, sandboxLogCollectorGrace, func(ctx context.Context, _ *Runtime) {
+		svc.CollectLogs(ctx)
+	})
+	c.AddMaintenanceTask(sandboxLogRetentionTask, func(ctx context.Context, _ *Runtime) error {
+		return svc.RetainLogs(ctx)
 	})
 }
 

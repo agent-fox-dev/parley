@@ -389,7 +389,7 @@ Available Commands:
   keys              List, refresh and revoke your API keys
   login             Sign in to the hub and save the hub URL and the credential
   orgs              List and read the organizations you belong to
-  sandbox           Work with the hub's sandboxes and their profiles
+  sandbox           Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, and list their profiles
   scm               Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   tokens            Create, read, change and revoke your personal access tokens
@@ -1235,6 +1235,11 @@ stderr as received, with exit status `1`; on a hub without sandboxes:
 | `parley sandbox create <workspace-slug> [flags] [-- command...]` | `POST /api/v1/workspaces/<slug>/sandboxes` |
 | `parley sandbox list <workspace-slug> [flags]` | `GET /api/v1/workspaces/<slug>/sandboxes` |
 | `parley sandbox get <workspace-slug> <id>` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>` |
+| `parley sandbox exec <workspace-slug> <id> [flags] -- <command...>` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/exec` |
+| `parley sandbox shell <workspace-slug> <id>` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>/attach` (WebSocket) |
+| `parley sandbox logs <workspace-slug> <id> [flags]` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>/logs` |
+| `parley sandbox upload <workspace-slug> <id> <local-path> <sandbox-path>` | `PUT /api/v1/workspaces/<slug>/sandboxes/<id>/files` |
+| `parley sandbox download <workspace-slug> <id> <sandbox-path> <local-path>` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>/files` |
 
 `parley sandbox` run without a command prints its help and exits `0`; it
 reads no credential and sends no request. The slug and the id are sent as
@@ -1315,6 +1320,122 @@ parameter, so the hub's defaults apply (every state but `deleted`).
 [`GET /api/v1/workspaces/<slug>/sandboxes/<id>`](api.md#get-apiv1workspacesslugsandboxesid)
 and prints the sandbox object. Any other number of arguments is a usage
 error.
+
+#### `parley sandbox exec`
+
+```
+parley sandbox exec <workspace-slug> <id> [--workdir <dir>] [--env key=value]... [--timeout <duration>] [--stdin] [--json] -- <command...>
+```
+
+Runs the words after `--` as a command in the sandbox through
+[`POST /api/v1/workspaces/<slug>/sandboxes/<id>/exec`](api.md#post-apiv1workspacesslugsandboxesidexec),
+without the 30-second request timeout: the request lasts until the hub ends
+it. The body is `{"command": [...]}` with `workdir`, `env` (from the repeated
+`--env`; a value keeps everything after the first `=`) and `timeout` (as
+given) only for the flags given; `--stdin` reads standard input to its end and
+sends it as `stdin_base64`.
+
+By default it asks for the event stream and writes the command's stdout to
+stdout and its stderr to stderr, byte for byte, as the frames arrive; stdout
+is not JSON. With `--json` it asks for the collected answer and prints it as
+under [Output](#output), read up to 16 MiB (16,777,216 bytes) instead of
+8 MiB: the hub keeps up to 1 MiB of each stream and JSON escapes a control
+byte to six bytes.
+
+| Exit status | When |
+|---|---|
+| the command's exit code | the command ran; a code above 125 is `125` |
+| `1` | the hub refused the request (its envelope on stderr, as received), or the command timed out: `wait_timeout` on stderr after the output received (with `--json`, after the answer, which holds that output) |
+| `2` | a `usage_error`: no command after `--` (`parley sandbox exec needs a command after --`), an `--env` value without `=`; or a `client_error`: standard input over 4,194,304 bytes with `--stdin`, sent nowhere, or a stream that ends without its `exit` frame |
+
+```
+$ parley sandbox exec demo--t1 sbx_0123456789abcdef0123456789abcdef -- sh -c 'echo out; echo err >&2; exit 3'
+out
+err
+$ echo $?
+3
+```
+
+#### `parley sandbox shell`
+
+```
+parley sandbox shell <workspace-slug> <id>
+```
+
+Opens [`GET /api/v1/workspaces/<slug>/sandboxes/<id>/attach`](api.md#get-apiv1workspacesslugsandboxesidattach)
+as a WebSocket (`ws://` or `wss://` from the hub's URL) with the credential as
+`Authorization: Bearer` and `cols` and `rows` of the local terminal (80 and 24
+when standard input is not a terminal; each at most 1,000). When standard
+input is a terminal it is put in raw mode, and restored when the connection
+ends, also on an interrupt. Standard input goes to the sandbox's shell in
+binary frames, the shell's output comes to stdout, and a change of the local
+terminal's size (`SIGWINCH`) sends a resize frame. Exiting the shell ends that
+shell only; the sandbox keeps running.
+
+| Exit status | When |
+|---|---|
+| `0` | the hub closed the connection |
+| `1` | the hub refused the upgrade: the request is sent again to read the hub's envelope, which is printed on stderr as received |
+| `2` | the hub could not be reached (`client_error`) |
+
+#### `parley sandbox logs`
+
+```
+parley sandbox logs <workspace-slug> <id> [--source process|policy] [--since <time>] [--tail <n>] [--follow]
+```
+
+Calls [`GET /api/v1/workspaces/<slug>/sandboxes/<id>/logs`](api.md#get-apiv1workspacesslugsandboxesidlogs)
+with `source`, `since` and `tail` for the flags given and prints one compact
+JSON object per stored line, in the hub's order, with no enclosing document.
+Without `--follow` it reads every page, following `next_cursor` until it is
+null. With `--follow` it opens the event stream without the 30-second request
+timeout, prints each line as it is stored, and exits `0` when the hub ends the
+stream (the sandbox was deleted, or the hub stopped) or on an interrupt.
+
+```
+{"time":"2026-01-02T03:04:05Z","source":"process","stream":"stdout","line":"token=[redacted]"}
+{"time":"2026-01-02T03:04:06Z","source":"policy","stream":null,"line":"deny example.com:443 /usr/bin/curl","action":"deny","program":"/usr/bin/curl","host":"example.com","port":443}
+```
+
+A `--source` other than `process` or `policy` and a `--tail` below 1 are
+`usage_error`s, exit status `2`, and nothing is sent; a hub error is printed
+as received with exit status `1`; a followed stream that breaks is a
+`client_error`.
+
+#### `parley sandbox upload`
+
+```
+parley sandbox upload <workspace-slug> <id> <local-path> <sandbox-path>
+```
+
+Sends [`PUT /api/v1/workspaces/<slug>/sandboxes/<id>/files`](api.md#put-apiv1workspacesslugsandboxesidfiles)
+without the 30-second request timeout and prints the hub's answer,
+`{path, bytes, entries}`. A local file is the body, with `path=<sandbox-path>`
+and its permission bits as `mode` (such as `0750`). A local directory is sent
+with `archive=tar` as a tar stream of its directories and regular files,
+named relative to it, written while it is sent; a symbolic link (or anything
+else) in it is left out with a `warning: ` line on stderr naming it. A local
+path that does not exist or cannot be read, or a file in the directory that
+cannot be read, is a `client_error`, exit status `2`, and nothing is sent.
+
+#### `parley sandbox download`
+
+```
+parley sandbox download <workspace-slug> <id> <sandbox-path> <local-path>
+```
+
+Calls [`GET /api/v1/workspaces/<slug>/sandboxes/<id>/files`](api.md#get-apiv1workspacesslugsandboxesidfiles)
+with `path=<sandbox-path>`, without the 30-second request timeout. A file is
+written to `<local-path>` through a temporary file in the same directory,
+renamed once complete (mode `0644`), or to stdout when `<local-path>` is `-`.
+When the hub answers `path_is_directory` it asks again with `archive=tar` and
+unpacks the stream into the directory `<local-path>`, which it creates, with
+the entries' modes. It prints `{"path": "<local-path>", "bytes": <n>}`, the
+sum of the file sizes for a directory, unless the bytes went to stdout. A tar
+entry whose name is absolute or would land outside `<local-path>`, and a tar
+stream that is cut off, are `client_error`s with exit status `2`; any other
+hub error is printed as received with exit status `1`, and nothing is left at
+`<local-path>`.
 
 ### `parley events`
 

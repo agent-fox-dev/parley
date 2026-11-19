@@ -194,6 +194,15 @@ refused with `429 sandbox_capacity` when the sandboxes in state
 and its task forks, or `max_per_user` for the creating user, checked in
 that order (see [api.md](api.md#post-apiv1workspacesslugsandboxes)).
 
+The next four bound the use of a sandbox (see [api.md](api.md#using-a-sandbox)):
+`max_exec_timeout` is the longest `timeout` an exec may ask for (a longer one
+is refused, not lowered; an exec without one gets 60 seconds, or this value
+when it is smaller); `max_concurrent_execs` is how many execs may run at once
+in one sandbox, another being refused with `429 rate_limited`;
+`max_transfer_size` bounds the body of an upload and the bytes sent of a
+download; and `log_retention` is how long the stored lines of a sandbox's
+main process and policy log are kept.
+
 A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
 hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
 `tls_ca`, `token_file`, `oidc_client_secret_file` and a profile's `policy`

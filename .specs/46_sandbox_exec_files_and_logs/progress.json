@@ -3,59 +3,59 @@
   "spec_id": "46",
   "spec_name": "sandbox_exec_files_and_logs",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-19T04:51:51Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 7,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 10,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 11,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 12,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 13,
-      "state": "pending"
+      "state": "done"
     }
   ]
 }

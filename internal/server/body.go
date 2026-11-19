@@ -34,9 +34,13 @@ func (s *Server) bodyLimit(rt Route) int64 {
 // the limit, so that a body sent without a declared length is refused before
 // any later check runs too, then checks the content type. The request it
 // returns carries the buffered bytes as its body and in its context, where
-// later stages read them without consuming the body.
+// later stages read them without consuming the body. A route that streams
+// its body (Route.StreamBody) passes it untouched.
 func (s *Server) readBody(r *http.Request) (*http.Request, error) {
 	m, _ := MatchedRoute(r)
+	if m.Route.StreamBody {
+		return r, nil
+	}
 	limit := s.bodyLimit(m.Route)
 	if r.ContentLength > limit {
 		return nil, PayloadTooLarge(fmt.Sprintf("request body exceeds %d bytes", limit))

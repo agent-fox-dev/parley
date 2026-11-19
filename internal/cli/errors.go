@@ -79,11 +79,25 @@ func conditionNotMet(format string, args ...any) error {
 	return newCLIError(conditionNotMetType, format, args)
 }
 
+// commandExit ends parley with the exit status of a command it ran
+// elsewhere, parley sandbox exec's, whose own output says what happened:
+// no envelope is printed for it.
+type commandExit struct{ status int }
+
+func (e *commandExit) Error() string {
+	return fmt.Sprintf("the command exited with status %d", e.status)
+}
+
 // exitCode is the exit status err ends parley with. An error of no named
-// kind counts as a client error, because the status must be one of 0 to 3.
+// kind counts as a client error, because the status must be one of 0 to 3
+// unless it is a command's own (commandExit).
 func exitCode(err error) int {
 	if err == nil {
 		return 0
+	}
+	var exit *commandExit
+	if errors.As(err, &exit) {
+		return exit.status
 	}
 	var he *hubError
 	if errors.As(err, &he) {
@@ -124,8 +138,13 @@ type cliEnvelope struct {
 
 // printError writes err to w as one error envelope: the hub's as received, or
 // the CLI's own, indented by 2 spaces and followed by a newline. An error of
-// no named kind is written as a client_error with its text as the message.
+// no named kind is written as a client_error with its text as the message,
+// and a commandExit is not written at all.
 func printError(w io.Writer, err error) {
+	var exit *commandExit
+	if errors.As(err, &exit) {
+		return
+	}
 	var he *hubError
 	if errors.As(err, &he) {
 		// Re-indented, not decoded and encoded again, so that the member

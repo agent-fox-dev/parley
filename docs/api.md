@@ -7622,8 +7622,9 @@ access is decided first.
 When the sandbox runtime cannot be reached, or has no operation for what a
 sandbox route asks of it, the route answers `502` with `error_type`
 `sandbox_runtime_error`. Its message is the runtime's error with the
-gateway's credentials and any user information of a URL removed; do not
-branch on it. The hub keeps serving: routes that read only the hub's own
+gateway's credentials and any user information of a URL removed (on the
+routes that [use a sandbox](#using-a-sandbox), also the sandbox's own secret
+values); do not branch on it. The hub keeps serving: routes that read only the hub's own
 state keep answering.
 
 ```json
@@ -7926,6 +7927,281 @@ completed, failed, deleted`), a `label` without `=` or with an empty key
 (`label must be key=value`) and an `include_forks` that is neither `true`
 nor `false` are `400 invalid_request`. A workspace without sandboxes
 answers `{"items":[],"next_cursor":null}`.
+
+## Using a sandbox
+
+Five routes use a sandbox, all under
+`/api/v1/workspaces/{slug}/sandboxes/{id}`: `POST …/exec`, `PUT …/files`,
+`GET …/files`, `GET …/logs` and `GET …/attach`. `GET …/files` and
+`GET …/logs` are read routes of the [sandbox routes](#sandbox-routes), the
+other three write routes. After the pipeline's checks (authentication, the
+rate limit, the body checks, the sandbox feature check, the binding guard,
+the PAT scope and workspace access), each runs, in this order, and answers
+with the first that fails:
+
+1. the sandbox: an id that is not `sbx_` and 32 lowercase hexadecimal
+   characters, that no sandbox has, or that names a sandbox of another
+   workspace is `404 sandbox_not_found` (`the workspace has no such
+   sandbox`);
+2. for exec, `PUT …/files` and attach, the no-widening rule of the
+   [sandbox routes](#sandbox-routes) against the sandbox's `hub_access`
+   (`403 insufficient_scope`); a download and the logs are not subject to
+   it;
+3. the validation of the request (`400`, `413`, `415`, below);
+4. the sandbox's state, `409 sandbox_not_ready` (`the sandbox is <state>,
+   which this operation does not allow`) in every state the route does not
+   take:
+
+| Route | States |
+|---|---|
+| exec, `PUT …/files`, attach | `ready` |
+| `GET …/files` | `ready`, `completed`, `failed` |
+| `GET …/logs` | every state, `deleted` included, while the record exists |
+
+When the runtime cannot be reached or fails while it serves exec, a file
+transfer or attach, the answer is `502 sandbox_runtime_error`, its message
+the runtime's text with the sandbox's secret values (the values of its
+credentials, its exposed secrets of at least 8 bytes and its hub credential)
+replaced by `[redacted]`, then cleared as on every sandbox route, and cut to
+1,024 bytes. The logs are served from the hub's own store and do not need the
+runtime. None of the five routes emits a hub event.
+
+**Activity.** `last_activity_at` of the sandbox is set to the hub's time when
+an exec starts and when it ends, in both forms; when a file transfer starts
+and when it ends; when an attach opens, when it closes, and for a frame from
+the caller once at least 60 seconds have passed since the connection last set
+it; and when a line of the main process's output is stored. It never moves
+backwards. A request refused by any check, the exec limit included, a log
+read, a policy line and a main process that prints nothing do not set it.
+
+**Operation observers.** When an exec, an attach, an upload or a download
+that passed every check ends, the hub tells each observer registered with
+`(*sandbox.Service).RegisterObserver` once, after the answer: the kind
+(`exec`, `attach`, `upload`, `download`), `sandbox_id`, `workspace`,
+`session_id`, `actor_type`, `actor_id`, `started_at` and `duration_ms`; for
+an exec also `command`, `exit_code`, `timed_out` and `result` (`ok` for exit
+code 0, `nonzero`, `timeout`, or `error` for a runtime failure or a command
+killed because its caller left or the hub stopped); for a transfer `path` and
+`bytes`. The record holds no stdin, output, terminal bytes, file content or
+environment value. An observer that fails or panics is logged (`a sandbox
+operation observer failed`) and changes nothing for the caller. An exec that
+passed every check also adds 1 to `parley_sandbox_exec_total{result}`.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/exec`
+
+Runs a command in a `ready` sandbox, as the workload user, whether or not its
+main process runs, and answers once it has ended. Body (JSON, at most
+8,388,608 bytes):
+
+| Member | Value |
+|---|---|
+| `command` | required, a list of 1 to 256 strings, none empty |
+| `workdir` | the directory the command runs in; the sandbox's working directory `/workspace` when absent. It is not confined to the working directory: the runtime's policy confines the command |
+| `env` | an object of strings laid over the sandbox's environment, the request's value winning: at most 64 entries, each name a variable name that does not start with `PARLEY_` or `OPENSHELL_` and is not a name of the sandbox's `exposed_secrets`, name and value together at most 8,192 bytes |
+| `stdin` | text written to the command's standard input, which is then closed |
+| `stdin_base64` | the same as standard base64; not together with `stdin`. At most 4,194,304 bytes after decoding |
+| `timeout` | a whole number followed by `s`, `m`, `h` or `d`, above `0s` and at most `[sandbox].max_exec_timeout`; `60s` (or that maximum when it is smaller) when absent |
+
+```json
+{"command":["sh","-c","echo hi; exit 3"],"env":{"CI":"1"},"timeout":"90s"}
+```
+
+The answer is `200`, also for a non-zero exit code:
+
+```json
+{"exit_code":3,"stdout":"hi\n","stderr":"","truncated":false,"timed_out":false,"duration_ms":12}
+```
+
+- At most 1,048,576 bytes of each stream are returned; more is read and
+  dropped, `truncated` is `true`, and the stream is cut back to its last
+  complete UTF-8 character.
+- A stream whose returned bytes are not valid UTF-8 is returned in
+  `stdout_base64` or `stderr_base64`, with its text member `""`; the
+  `_base64` member is absent otherwise.
+- A command still running when its timeout has passed is killed, and the
+  answer has `timed_out: true`, `exit_code: null` and the output collected
+  until then. `exit_code` is null only then.
+- When the caller leaves or the hub begins to stop, the command is killed
+  and no answer is written.
+
+With an `Accept` header that names `text/event-stream` the answer is `200`
+with `Content-Type: text/event-stream` and `Cache-Control: no-cache`, sent
+once the runtime has started the command: frames `event: stdout` and
+`event: stderr`, in the order the output arrives, each with data
+`{"data":"…"}`, or `{"data_base64":"…"}` for a chunk that is not valid
+UTF-8, and at most 32,768 bytes of output, then one frame `event: exit` with
+data `{"exit_code","timed_out","duration_ms"}`, after which the stream ends.
+Every byte of output is sent; there is no cap and no `truncated`. A timeout
+kills the command and ends with `exit_code: null, timed_out: true`. Closing
+the stream kills the command. A runtime failure after the stream began, the
+caller leaving or the hub stopping ends it without an `exit` frame.
+
+```
+event: stdout
+data: {"data":"hi\n"}
+
+event: exit
+data: {"exit_code":3,"timed_out":false,"duration_ms":12}
+```
+
+At most `[sandbox].max_concurrent_execs` commands run at once in one sandbox
+through exec, collected and streamed together; a command that ended in any
+way no longer counts, and neither the main process nor an attach terminal
+counts.
+
+| Status | When |
+|---|---|
+| `400` `invalid_request` | a member is refused, the message naming it (`command: is required`, `command: must be a list of strings`, `command: must have 1 to 256 arguments`, `env: must have at most 64 entries`, `stdin: must not be sent with stdin_base64`, `stdin_base64: must be base64`, `stdin: must have at most 4194304 bytes`, `timeout: must be a whole number followed by s, m, h or d, such as 60s`, `timeout: must be above 0s and at most 30m`, and the other `env` rules of the create request) |
+| `413` `payload_too_large` | the body is over 8,388,608 bytes |
+| `429` `rate_limited` | `[sandbox].max_concurrent_execs` commands already run in the sandbox (`the sandbox runs as many commands as it may at once; try again once one has ended`), without `Retry-After` |
+| `502` `sandbox_runtime_error` | the runtime could not run the command |
+
+Every refusal is the JSON envelope, also with `Accept: text/event-stream`:
+it is decided before the command starts.
+
+## `PUT /api/v1/workspaces/{slug}/sandboxes/{id}/files`
+
+Writes into a `ready` sandbox's working directory.
+
+| Query parameter | Value |
+|---|---|
+| `path` | required: absolute, or relative to the working directory `/workspace` |
+| `archive` | `tar`, or absent |
+| `mode` | the file's mode, an octal number from `0000` to `0777`; `0644` when absent; not with `archive=tar` |
+
+Without `archive` the body (`Content-Type: application/octet-stream`)
+becomes the content of the file at `path`: missing parent directories are
+created and an existing file is replaced. With `archive=tar` the body
+(`application/x-tar` or `application/octet-stream`) is a tar stream unpacked
+under the directory `path`, which is created when missing; its directories
+and regular files are written with the modes of their entries. The body is
+streamed to the runtime as it arrives. The answer is `200`:
+
+```json
+{"path":"/workspace/proj","bytes":21,"entries":3}
+```
+
+`path` is the absolute path, `bytes` the file bytes written and `entries` the
+number of files and directories written (`1` for a single file).
+
+`path` is cleaned of `.` and `..` without following links in the sandbox, and
+must be `/workspace` or below it; a tar entry's name must stay below `path`.
+Unpacking stops at the first refused entry, and what was written before it
+stays, as does what was written before the size limit was passed.
+
+| Status | When |
+|---|---|
+| `400` `invalid_request` | `path: is required`; `archive: must be tar`; `mode: must be an octal number from 0000 to 0777`; `mode: must not be sent with archive=tar, whose entries carry their modes`; `request body is not a readable tar stream`; `tar entry "<name>" is neither a regular file nor a directory` (a link or a device) |
+| `400` `path_outside_workdir` | `path must be inside the working directory /workspace`; `tar entry "<name>" is outside the upload's path` |
+| `413` `payload_too_large` | a `Content-Length` above `[sandbox].max_transfer_size` (nothing is written), or a body without one that passes it (`the transfer exceeds [sandbox].max_transfer_size`); the connection is closed |
+| `415` `unsupported_media_type` | another `Content-Type` (`request body must be application/octet-stream`, or `… or application/x-tar` with `archive=tar`) |
+| `502` `sandbox_runtime_error` | the runtime failed |
+
+## `GET /api/v1/workspaces/{slug}/sandboxes/{id}/files`
+
+Reads from a sandbox in state `ready`, `completed` or `failed`, with the
+`path` and `archive` of the upload. A file is answered `200` with its bytes,
+`Content-Type: application/octet-stream` and its `Content-Length`. With
+`archive=tar` the answer is `200` with `Content-Type: application/x-tar`: for
+a directory a tar stream of its directories and regular files, named
+relative to it, with their modes; for a file a tar stream of one entry named
+by its base name. Entry names come from the requested path: an entry the
+runtime reports outside the requested directory is left out, so no name is
+absolute or leads out of the directory it is unpacked in.
+
+| Status | When |
+|---|---|
+| `400` `invalid_request` | `path: is required`; `archive: must be tar` |
+| `400` `path_outside_workdir` | as for the upload |
+| `400` `path_is_directory` | a directory without `archive=tar` (`path is a directory; ask for it with archive=tar`) |
+| `404` `path_not_found` | the path does not exist, or the runtime no longer has the working directory (`the sandbox has no such path`) |
+| `413` `payload_too_large` | a file larger than `[sandbox].max_transfer_size`; no byte is sent |
+| `502` `sandbox_runtime_error` | the runtime failed before the answer began |
+
+A tar stream that passes `[sandbox].max_transfer_size`, or that the runtime
+fails after the answer began, is cut off: the hub aborts the connection, so
+the caller's read ends with an error instead of a clean end of the body.
+
+## `GET /api/v1/workspaces/{slug}/sandboxes/{id}/logs`
+
+The stored lines of a sandbox, in every state, `deleted` included, from the
+hub's own store; the runtime is never asked. While a sandbox is `ready` the
+hub reads its main process's output and the runtime's policy log for it
+(looking for ready sandboxes every 5 seconds, and opening a broken stream
+again within 5 seconds, from the second of the last stored line, without
+storing a line twice) and stores each line, oldest first:
+
+| Member | Value |
+|---|---|
+| `time` | when the runtime produced the line, in whole seconds |
+| `source` | `process` or `policy` |
+| `stream` | `stdout` or `stderr` for a process line; `null` for a policy line |
+| `line` | the text without its line end; a line longer than 16,384 bytes is stored as consecutive lines of at most 16,384 bytes. A policy entry without text gets `<action> <host>:<port> <program>` |
+| `action`, `program`, `host`, `port` | policy lines only: `allow` or `deny` and what was decided on |
+| `credential` | policy lines of a credentialed request only: the provider name |
+
+Each exact match of a value of the sandbox's exposed secrets of at least 8
+characters is replaced by `[redacted]` before a line is stored. Lines older
+than `[sandbox].log_retention`, and those of a sandbox whose record is gone,
+are removed by the hourly maintenance task `sandbox_log_retention`; the lines
+of a sandbox also go in the transaction that removes its record.
+
+```json
+{"items":[{"time":"2026-01-02T03:04:05Z","source":"process","stream":"stdout","line":"token=[redacted]"},{"time":"2026-01-02T03:04:06Z","source":"policy","stream":null,"line":"deny example.com:443 /usr/bin/curl","action":"deny","program":"/usr/bin/curl","host":"example.com","port":443}],"next_cursor":null}
+```
+
+| Query parameter | Value |
+|---|---|
+| `source` | `process` or `policy`; both when absent |
+| `since` | an RFC 3339 timestamp; only lines at or after it |
+| `tail` | an integer of at least 1; only the last that many matching lines, still paged |
+| `follow` | `true` or `false` |
+| `limit`, `cursor` | as for every [list](#lists); not with `follow=true` |
+
+With `follow=true` the answer is `200` with `Content-Type: text/event-stream`
+and `Cache-Control: no-cache`: one frame `event: log` per line, its data the
+line's object, first the stored lines the other parameters select, then each
+matching line within a second of its storage. It ends when the caller closes
+it, when the hub stops, or when the sandbox becomes `deleted`, after the
+lines stored until then; it stays open while the sandbox is `stopped`,
+`completed` or `failed`.
+
+`400 invalid_request`, before any stream: `source: must be process or
+policy`, `since: must be an RFC 3339 timestamp`, `tail: must be an integer
+of at least 1`, `follow: must be true or false`, `cursor and limit: must not
+be sent with follow=true, which sends every selected line`, and a `limit` or
+`cursor` a list refuses.
+
+## `GET /api/v1/workspaces/{slug}/sandboxes/{id}/attach`
+
+A WebSocket upgrade (version 13) that opens a new shell, `/bin/sh`, in a
+`ready` sandbox, as the workload user, in the working directory, with the
+sandbox's environment, on a terminal of `cols` by `rows` (query parameters,
+each an integer from 1 to 1,000; 80 by 24 when absent). The credential is the
+`Authorization` header, as on every route; a request without an `Origin`
+header is accepted.
+
+- Binary frames carry terminal bytes in both directions. A frame from the
+  caller larger than 1 MiB (1,048,576 bytes) ends the connection and the
+  shell.
+- A text frame `{"resize":{"cols":…,"rows":…}}` with both values from 1 to
+  1,000 resizes the terminal; any other text frame is ignored.
+- When the caller closes the connection, or the hub begins to stop, the hub
+  ends that shell and nothing else: the main process, running execs and
+  other terminals go on, and the sandbox stays `ready`.
+- When the shell ends or the runtime's terminal fails, the hub sends the
+  output it received and closes the connection.
+
+The terminal is opened before the upgrade, so every refusal is an HTTP error
+envelope and no `101`: the checks of [Using a sandbox](#using-a-sandbox),
+`400 invalid_request` for a request that is not a WebSocket upgrade (`this
+route takes a WebSocket upgrade (version 13)`: judged on the first value of
+each header, so `Upgrade` must be `websocket` and the first `Connection`
+header must hold `upgrade`; `Sec-WebSocket-Key` must be present,
+`Sec-WebSocket-Version` must be `13`, and `Sec-WebSocket-Protocol` may offer
+at most one protocol) or a `cols` or `rows` outside
+1 to 1,000 (`cols: must be an integer from 1 to 1000`), and `502
+sandbox_runtime_error` when the runtime cannot open the terminal.
 
 ## `GET /api/v1/sandbox-profiles`
 

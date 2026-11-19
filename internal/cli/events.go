@@ -277,23 +277,26 @@ type frame struct {
 	hasID, hasData  bool
 }
 
-// read reads frames from the stream body until it ends, handling each
-// complete one, and reports whether it received one.
-func (t *tail) read(body io.Reader) (bool, error) {
+// frameScanner reads the frames of a Server-Sent Events stream.
+type frameScanner struct{ sc *bufio.Scanner }
+
+func newFrameScanner(body io.Reader) *frameScanner {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64<<10), maxFrameLine)
-	received := false
+	return &frameScanner{sc}
+}
+
+// next reads the next complete frame, and reports false once the stream
+// ended or broke (err says which); a frame the stream ends in the middle of
+// is not returned.
+func (s *frameScanner) next() (frame, bool) {
 	var f frame
-	for sc.Scan() {
-		line := sc.Text()
+	for s.sc.Scan() {
+		line := s.sc.Text()
 		if line == "" {
 			if f.hasID || f.hasData || f.event != "" {
-				received = true
-				if err := t.handle(f); err != nil {
-					return received, err
-				}
+				return f, true
 			}
-			f = frame{}
 			continue
 		}
 		// A line that begins with a colon is a comment, whose field is
@@ -312,7 +315,25 @@ func (t *tail) read(body io.Reader) (bool, error) {
 			f.data, f.hasData = f.data+value, true
 		}
 	}
-	if err := sc.Err(); err != nil {
+	return frame{}, false
+}
+
+// err is why next reported false: nil at the end of the stream,
+// bufio.ErrTooLong for a line longer than maxFrameLine, else the read error.
+func (s *frameScanner) err() error { return s.sc.Err() }
+
+// read reads frames from the stream body until it ends, handling each
+// complete one, and reports whether it received one.
+func (t *tail) read(body io.Reader) (bool, error) {
+	frames := newFrameScanner(body)
+	received := false
+	for f, ok := frames.next(); ok; f, ok = frames.next() {
+		received = true
+		if err := t.handle(f); err != nil {
+			return received, err
+		}
+	}
+	if err := frames.err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
 			// The same line would come again on every reconnect.
 			return received, clientError("the hub sent a line longer than %d bytes in the event stream", maxFrameLine)

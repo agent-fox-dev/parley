@@ -1,6 +1,8 @@
 package sandbox_test
 
 import (
+	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -9,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/websocket"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/config"
@@ -333,6 +339,8 @@ func (h *probeHub) pat(t *testing.T, userID string, permissions ...string) strin
 type answer struct {
 	status int
 	body   []byte
+	// header is set by the helpers that read the answer's headers.
+	header http.Header
 	err    struct {
 		Code      int    `json:"code"`
 		Message   string `json:"message"`
@@ -2141,4 +2149,1251 @@ func jsonList(list []string) any {
 func (h *createHub) bindEvents(t *testing.T, id string) int {
 	t.Helper()
 	return h.count(t, `SELECT count(*) FROM hub_events WHERE type = 'parley.token.bind' AND (? = '' OR resource_id = ?)`, id, id)
+}
+
+// useRoute is one of the routes that use a sandbox: the name the test hooks
+// know it by, its method, the last segment of its path, and whether it is
+// of kind write.
+type useRoute struct {
+	name, method, segment string
+	write                 bool
+}
+
+// useRoutes are the five routes that use a sandbox.
+var useRoutes = []useRoute{
+	{"exec", http.MethodPost, "exec", true},
+	{"upload", http.MethodPut, "files", true},
+	{"download", http.MethodGet, "files", false},
+	{"logs", http.MethodGet, "logs", false},
+	{"attach", http.MethodGet, "attach", true},
+}
+
+func (u useRoute) String() string { return u.method + " " + u.segment }
+
+// path is the route's path for the sandbox id of the workspace slug.
+func (u useRoute) path(slug, id string) string { return sandboxPath(slug, id) + "/" + u.segment }
+
+// body is a body the probe validations of a use hub accept: a command for
+// exec, none for the others.
+func (u useRoute) body() any {
+	if u.name == "exec" {
+		return map[string]any{"command": []string{"true"}}
+	}
+	return nil
+}
+
+// useHub is a probe hub with sandboxes on whose routes that use a sandbox
+// run probes in place of their validations and operations, and whose owner
+// has a second workspace, ws2.
+type useHub struct {
+	*probeHub
+	svc *sandbox.Service
+	// key is the owner's API key.
+	key string
+}
+
+// startUseHub starts a use hub. Its operations count their calls in calls
+// and answer 200, or return the error of fail when fail is not nil and
+// returns one; exec's validation refuses an empty body 400 invalid_request,
+// and the other routes validate nothing.
+func startUseHub(t *testing.T, fail func() error) *useHub {
+	t.Helper()
+	h := &useHub{probeHub: &probeHub{rt: runtimetest.New(t)}}
+	cfg := sandboxesOn
+	cfg.Compose = func(c *hub.Composition) {
+		h.svc = c.Sandbox()
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+		for _, u := range useRoutes {
+			sandbox.SetUseOperation(h.svc, u.name, func(w http.ResponseWriter, r *http.Request) error {
+				if fail != nil {
+					if err := fail(); err != nil {
+						h.calls.Add(1)
+						return err
+					}
+				}
+				return h.probe(w, r)
+			})
+			sandbox.SetUseValidation(h.svc, u.name, func(*http.Request) error { return nil })
+		}
+		sandbox.SetUseValidation(h.svc, "exec", func(r *http.Request) error {
+			if b, _ := io.ReadAll(r.Body); len(b) == 0 {
+				return server.InvalidRequest("request body is empty; want a JSON object")
+			}
+			return nil
+		})
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	h.owner, h.member, h.outsider = h.CreateUser(t, "owner"), h.CreateUser(t, "member"), h.CreateUser(t, "outsider")
+	org := h.CreateOrg(t, "team")
+	h.AddMember(t, org, h.member)
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: org, Kind: access.KindRepository, Status: access.StatusReady})
+	h.AddWorkspace(t, access.Record{Slug: "ws2", OwnerID: h.owner, OrgID: org, Kind: access.KindRepository, Status: access.StatusReady})
+	h.key = h.IssueKey(t, h.owner)
+	return h
+}
+
+// seed stores a sandbox of the workspace ws, created by the owner's API
+// key, in state, with the hub credential ha (nil for none), and returns its
+// id.
+func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) string {
+	t.Helper()
+	before := recordStart.Add(-time.Hour)
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, HubAccess: ha,
+		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
+		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: ws,
+	}
+	switch state {
+	case sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted:
+		rec.EndedAt = &before
+	}
+	err := h.Store.Tx(context.Background(), func(tx *sql.Tx) error { return sandbox.Insert(context.Background(), tx, rec) })
+	if err != nil {
+		t.Fatalf("insert a sandbox in %s: %v", state, err)
+	}
+	return rec.ID
+}
+
+// useCall sends a request to the use route u for the sandbox id of the
+// workspace slug with cred and body, and checks its answer: status and
+// errorType, and, for a status other than 200, that neither the operation
+// nor the runtime was reached; for 200, that the operation was.
+func (h *useHub) useCall(t *testing.T, u useRoute, slug, id, cred string, body any, status int, errorType string) answer {
+	t.Helper()
+	calls, runtimeCalls := h.calls.Load(), requestCalls(h.rt)
+	a := h.call(t, u.method, u.path(slug, id), cred, body)
+	if a.status != status || a.err.ErrorType != errorType {
+		t.Errorf("%s %s = %d %s, want %d %s", u.method, u.path(slug, id), a.status, a.body, status, errorType)
+	}
+	reached := h.calls.Load() - calls
+	switch {
+	case status == http.StatusOK && reached != 1:
+		t.Errorf("the operation ran %d times, want once", reached)
+	case status != http.StatusOK && reached != 0:
+		t.Errorf("the operation ran %d times, want never", reached)
+	}
+	if status != http.StatusOK {
+		if n := requestCalls(h.rt) - runtimeCalls; n != 0 {
+			t.Errorf("the runtime got %d calls, want none", n)
+		}
+	}
+	return a
+}
+
+// requestCalls is the number of calls the runtime rt received but the log
+// collector's: it reads the logs of every ready sandbox in the background,
+// which no request asks for.
+func requestCalls(rt *runtimetest.Fake) int {
+	n := 0
+	for _, c := range rt.Calls() {
+		if c.Op != runtime.OpLogs {
+			n++
+		}
+	}
+	return n
+}
+
+// execHub is a hub with sandboxes on over a fake runtime whose commands
+// cmds runs, on a clock the test advances, with the repository ws of owner,
+// whose API key is key.
+type execHub struct {
+	*probeHub
+	svc   *sandbox.Service
+	clock *hubtest.JobClock
+	// timers keeps the timers the sandbox service asked the clock for.
+	timers *timerLog
+	cmds   *commands
+	// terms records the terminals the hub opens.
+	terms *terminals
+	// quirks makes the hub's runtime client answer as a runtime other
+	// than the fake may.
+	quirks *runtimeQuirks
+	key    string
+}
+
+// startExecHub starts an exec hub that runs at most maxExecs commands at
+// once in a sandbox, its clock at recordStart; [sandbox].max_exec_timeout
+// is its default, 30m.
+func startExecHub(t *testing.T, maxExecs int) *execHub {
+	t.Helper()
+	return startUseSandboxHub(t, "max_concurrent_execs = "+strconv.Itoa(maxExecs)+"\n")
+}
+
+// startUseSandboxHub starts an exec hub whose [sandbox] section also holds
+// the lines settings.
+func startUseSandboxHub(t *testing.T, settings string) *execHub {
+	t.Helper()
+	return newExecHub(t, settings, nil)
+}
+
+// newExecHub starts an exec hub whose [sandbox] section also holds the lines
+// settings, with its configuration as edit changes it when edit is not nil.
+// The fake runtime stamps log entries with the hub's clock, and the hub's
+// runtime client records the terminals it opens in terms.
+func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *execHub {
+	t.Helper()
+	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
+	h := &execHub{
+		probeHub: &probeHub{rt: runtimetest.New(t, runtimetest.WithClock(clock.Now))}, clock: clock, timers: &timerLog{},
+		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}}, terms: &terminals{}, quirks: &runtimeQuirks{},
+	}
+	h.rt.SetExec(h.cmds.run)
+	cfg := sandboxesOn
+	cfg.TOML = "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
+		settings + "[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n"
+	cfg.Now = h.clock.Now
+	cfg.Compose = func(c *hub.Composition) {
+		h.svc = c.Sandbox()
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			terms := &terminalClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), terms: h.terms}
+			return &quirkClient{Client: terms, quirks: h.quirks}, nil
+		})
+		c.AdjustSandbox(func(d *sandbox.Deps) {
+			d.Now = h.clock.Now
+			d.NewTimer = func(x time.Duration) sandbox.Timer { return h.timers.track(x, h.clock.NewTimer(x)) }
+		})
+	}
+	if edit != nil {
+		edit(&cfg)
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	h.owner = h.CreateUser(t, "owner")
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: h.CreateOrg(t, "team"), Kind: access.KindRepository, Status: access.StatusReady})
+	h.key = h.IssueKey(t, h.owner)
+	return h
+}
+
+// sandbox stores a ready sandbox of ws created by the owner's API key, as
+// edit changes it when edit is not nil, creates it in the runtime with the
+// working directory /workspace and the environment PARLEY_SANDBOX_ID and
+// MODE=profile, and returns its id.
+func (h *execHub) sandbox(t *testing.T, edit func(*sandbox.Record)) string {
+	t.Helper()
+	before := recordStart.Add(-time.Hour)
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: "ws", Profile: "agent", State: sandbox.StateReady,
+		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
+		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: "ws",
+	}
+	if edit != nil {
+		edit(&rec)
+	}
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) }); err != nil {
+		t.Fatalf("insert a sandbox: %v", err)
+	}
+	spec := runtime.SandboxSpec{Name: rec.ID, WorkDir: sandbox.WorkDir, Env: map[string]string{"PARLEY_SANDBOX_ID": rec.ID, "MODE": "profile"}}
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(ctx, spec); err != nil {
+		t.Fatalf("create the sandbox in the runtime: %v", err)
+	}
+	return rec.ID
+}
+
+// startMain starts the main process of the sandbox id, which runs until it
+// is stopped.
+func (h *execHub) startMain(t *testing.T, id string) {
+	t.Helper()
+	if err := h.rt.Client("parley", nil).RunMain(context.Background(), id, []string{"main"}); err != nil {
+		t.Fatalf("start the main process of %s: %v", id, err)
+	}
+}
+
+// mainRunning reports whether the main process of the sandbox id runs.
+func (h *execHub) mainRunning(t *testing.T, id string) bool {
+	t.Helper()
+	st, err := h.rt.Client("parley", nil).GetSandbox(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get %s from the runtime: %v", id, err)
+	}
+	return !st.MainExited
+}
+
+// exec sends POST …/exec for the sandbox id of ws as the owner with body
+// and the headers of header, and reads the answer with its headers and
+// its error envelope, if it has one.
+func (h *execHub) exec(t *testing.T, id string, body any, header http.Header) answer {
+	t.Helper()
+	return h.execAs(t, h.key, id, body, header)
+}
+
+// execAs sends what exec sends with cred as the bearer credential.
+func (h *execHub) execAs(t *testing.T, cred, id string, body any, header http.Header) answer {
+	t.Helper()
+	var a answer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+sandboxPath("ws", id)+"/exec", cred, body, header)
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
+}
+
+// execing sends what exec sends under ctx, from another goroutine, and
+// delivers the answer on the channel it returns: with status 0 when the
+// request got none, as when ctx ended first or the hub dropped the
+// connection.
+func (h *execHub) execing(ctx context.Context, id string, body any, header http.Header) <-chan answer {
+	out := make(chan answer, 1)
+	raw, _ := json.Marshal(body)
+	go func() {
+		var a answer
+		defer func() { out <- a }()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL("/api/v1"+sandboxPath("ws", id)+"/exec"), bytes.NewReader(raw))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+h.key)
+		req.Header.Set("Content-Type", "application/json")
+		for k, vs := range header {
+			req.Header[k] = vs
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
+	}()
+	return out
+}
+
+// commands run the commands of an exec hub's runtime. main, a main process,
+// runs until it is stopped; any other command runs the script set for its
+// first argument, or exits 0 with no output when none is set. They keep the
+// request of every command but main, in order, and count the commands
+// running, those waiting in a blocking script and those killed: ended by
+// their context before they returned.
+type commands struct {
+	mu                      sync.Mutex
+	scripts                 map[string]runtimetest.ExecFunc
+	ran                     []runtime.ExecRequest
+	running, waiting, kills int
+}
+
+// set makes fn the script of the commands named name.
+func (c *commands) set(name string, fn runtimetest.ExecFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.scripts[name] = fn
+}
+
+// blocking is a script that writes stdout and stderr and then waits until
+// it is killed, counted as waiting meanwhile.
+func (c *commands) blocking(stdout, stderr string) runtimetest.ExecFunc {
+	return func(ctx context.Context, _ string, _ runtime.ExecRequest, out, errOut io.Writer) int {
+		_, _ = io.WriteString(out, stdout)
+		_, _ = io.WriteString(errOut, stderr)
+		c.mu.Lock()
+		c.waiting++
+		c.mu.Unlock()
+		<-ctx.Done()
+		c.mu.Lock()
+		c.waiting--
+		c.mu.Unlock()
+		return 137
+	}
+}
+
+func (c *commands) run(ctx context.Context, name string, req runtime.ExecRequest, stdout, stderr io.Writer) int {
+	if req.Command[0] == "main" {
+		<-ctx.Done()
+		return 0
+	}
+	c.mu.Lock()
+	c.ran = append(c.ran, req)
+	c.running++
+	fn := c.scripts[req.Command[0]]
+	c.mu.Unlock()
+	code := 0
+	if fn != nil {
+		code = fn(ctx, name, req, stdout, stderr)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.running--
+	if ctx.Err() != nil {
+		c.kills++
+	}
+	return code
+}
+
+// counts are the number of commands run so far, of those running, of
+// those waiting in a blocking script and of those killed.
+func (c *commands) counts() (ran, running, waiting, kills int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.ran), c.running, c.waiting, c.kills
+}
+
+// last is the request of the last command run.
+func (c *commands) last(t *testing.T) runtime.ExecRequest {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.ran) == 0 {
+		t.Fatal("no command ran")
+	}
+	return c.ran[len(c.ran)-1]
+}
+
+// frame is one server-sent event of a stream: its name and its data.
+type frame struct {
+	event string
+	data  map[string]any
+}
+
+// output is the bytes of output a stdout or stderr frame carries: its data
+// as text, or its data_base64 decoded.
+func (f frame) output(t *testing.T) []byte {
+	t.Helper()
+	if encoded, ok := f.data["data_base64"].(string); ok {
+		b, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatalf("the %s frame's data_base64 is not base64: %v", f.event, err)
+		}
+		return b
+	}
+	text, ok := f.data["data"].(string)
+	if !ok {
+		t.Fatalf("the %s frame %v has neither data nor data_base64", f.event, f.data)
+	}
+	return []byte(text)
+}
+
+// frameReader reads the server-sent events of an answer one frame at a
+// time.
+type frameReader struct {
+	resp  *http.Response
+	lines *bufio.Scanner
+}
+
+// streaming sends POST …/exec for the sandbox id of ws as the owner with
+// body and Accept: text/event-stream, under ctx and at most 10 s, and
+// returns the answer's stream once its headers arrived; the test closes it.
+func (h *execHub) streaming(t *testing.T, ctx context.Context, id string, body any) *frameReader {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	t.Cleanup(cancel)
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL("/api/v1"+sandboxPath("ws", id)+"/exec"), bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	return h.eventStream(t, req, "exec")
+}
+
+// eventStream sends req as the owner and returns the answer's stream once
+// its headers arrived, failing unless it is 200 and an event stream; what
+// names the request in a failure.
+func (h *execHub) eventStream(t *testing.T, req *http.Request, what string) *frameReader {
+	t.Helper()
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("send the request: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("%s = %d %.300s (Content-Type %q), want 200 and an event stream", what, resp.StatusCode, b, resp.Header.Get("Content-Type"))
+	}
+	lines := bufio.NewScanner(resp.Body)
+	lines.Buffer(nil, 1<<20)
+	return &frameReader{resp: resp, lines: lines}
+}
+
+// next reads the next frame, and reports false once the stream ended.
+func (s *frameReader) next(t *testing.T) (frame, bool) {
+	t.Helper()
+	var f frame
+	for s.lines.Scan() {
+		line := s.lines.Text()
+		switch {
+		case line == "":
+			if f.event != "" {
+				return f, true
+			}
+		case strings.HasPrefix(line, "event: "):
+			f.event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &f.data); err != nil {
+				t.Fatalf("the data of a %s frame is not a JSON object: %v", f.event, err)
+			}
+		}
+	}
+	if err := s.lines.Err(); err != nil {
+		t.Fatalf("read the stream: %v", err)
+	}
+	if f.event != "" {
+		t.Fatalf("the stream ended inside a %s frame", f.event)
+	}
+	return frame{}, false
+}
+
+// rest reads the frames up to the end of the stream.
+func (s *frameReader) rest(t *testing.T) []frame {
+	t.Helper()
+	var out []frame
+	for f, ok := s.next(t); ok; f, ok = s.next(t) {
+		out = append(out, f)
+	}
+	return out
+}
+
+// startFilesHub starts an exec hub whose [sandbox].max_transfer_size is
+// 1 MiB, with a ready sandbox, whose id it returns.
+func startFilesHub(t *testing.T) (*execHub, string) {
+	t.Helper()
+	h := startUseSandboxHub(t, "max_transfer_size = \"1mb\"\n")
+	return h, h.sandbox(t, nil)
+}
+
+// files sends method …/files?query for the sandbox id of ws as the owner,
+// with contentType ("" for none) and body (nil for none), and reads the
+// error envelope of the answer, if it has one. A body that is not a
+// *bytes.Reader, *bytes.Buffer or *strings.Reader is sent without a
+// declared length.
+func (h *execHub) files(t *testing.T, method, id, query, contentType string, body io.Reader) answer {
+	t.Helper()
+	return h.filesWith(t, context.Background(), method, id, query, contentType, body)
+}
+
+// filesWith is files under ctx.
+func (h *execHub) filesWith(t *testing.T, ctx context.Context, method, id, query, contentType string, body io.Reader) answer {
+	t.Helper()
+	a, err := h.exchangeFiles(t, ctx, method, id, query, contentType, body)
+	if err != nil {
+		t.Fatalf("%s files?%s: read the answer: %v", method, query, err)
+	}
+	return a
+}
+
+// download sends GET …/files?query for the sandbox id of ws as the owner
+// and returns the answer with what of its body arrived, and the error that
+// ended the read of the body, nil for a clean end.
+func (h *execHub) download(t *testing.T, id, query string) (answer, error) {
+	t.Helper()
+	return h.exchangeFiles(t, context.Background(), http.MethodGet, id, query, "", nil)
+}
+
+// mustDownload is download for an answer whose body must end cleanly.
+func (h *execHub) mustDownload(t *testing.T, id, query string) answer {
+	t.Helper()
+	return h.files(t, http.MethodGet, id, query, "", nil)
+}
+
+// exchangeFiles is filesWith, which returns the error that ended the read
+// of the answer's body instead of failing on it.
+func (h *execHub) exchangeFiles(t *testing.T, ctx context.Context, method, id, query, contentType string, body io.Reader) (answer, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, method, h.URL("/api/v1"+sandboxPath("ws", id)+"/files?"+query), body)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s files?%s: %v", method, query, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var a answer
+	a.status, a.header = resp.StatusCode, resp.Header
+	a.body, err = io.ReadAll(resp.Body)
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a, err
+}
+
+// put writes entries into the sandbox id through the runtime, each name an
+// absolute path: a directory when it ends in a slash, else a file holding
+// its body with its mode, 0644 when it has none.
+func (h *execHub) put(t *testing.T, id string, entries ...tarEntry) {
+	t.Helper()
+	ctx, client := context.Background(), h.rt.Client("parley", nil)
+	for _, e := range entries {
+		mode := fs.FileMode(e.mode)
+		var err error
+		if strings.HasSuffix(e.name, "/") {
+			if mode == 0 {
+				mode = 0o755
+			}
+			err = client.MakeDir(ctx, id, strings.TrimSuffix(e.name, "/"), mode)
+		} else {
+			if mode == 0 {
+				mode = 0o644
+			}
+			err = client.Upload(ctx, id, e.name, mode, strings.NewReader(e.body))
+		}
+		if err != nil {
+			t.Fatalf("put %s into the sandbox: %v", e.name, err)
+		}
+	}
+}
+
+// fileCalls counts the file operations the runtime received.
+func (h *execHub) fileCalls() int {
+	n := 0
+	for _, c := range h.rt.Calls() {
+		switch c.Op {
+		case runtime.OpUpload, runtime.OpMakeDir, runtime.OpStat, runtime.OpDownload, runtime.OpWalk:
+			n++
+		}
+	}
+	return n
+}
+
+// file reads the file at p of the sandbox id from the runtime, and reports
+// false when there is none; it fails on a directory.
+func (h *execHub) file(t *testing.T, id, p string) (data []byte, mode fs.FileMode, ok bool) {
+	t.Helper()
+	ctx, client := context.Background(), h.rt.Client("parley", nil)
+	fi, err := client.Stat(ctx, id, p)
+	if errors.Is(err, runtime.ErrNotFound) {
+		return nil, 0, false
+	}
+	if err != nil {
+		t.Fatalf("stat %s: %v", p, err)
+	}
+	if fi.Dir {
+		t.Fatalf("%s is a directory, want a file", p)
+	}
+	rc, err := client.Download(ctx, id, p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	defer func() { _ = rc.Close() }()
+	if data, err = io.ReadAll(rc); err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	return data, fi.Mode, true
+}
+
+// tarEntry is an entry of an archive tarOf writes: a directory when name
+// ends in a slash, a symbolic link to link, a hard link to hardLink, else a
+// regular file holding body.
+type tarEntry struct {
+	name           string
+	mode           int64
+	body           string
+	link, hardLink string
+}
+
+// tarOf is the tar stream of entries, in order.
+func tarOf(t *testing.T, entries ...tarEntry) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	w := tar.NewWriter(&b)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Mode: e.mode, Typeflag: tar.TypeReg, Size: int64(len(e.body))}
+		switch {
+		case strings.HasSuffix(e.name, "/"):
+			hdr.Typeflag, hdr.Size = tar.TypeDir, 0
+		case e.link != "":
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeSymlink, e.link, 0
+		case e.hardLink != "":
+			hdr.Typeflag, hdr.Linkname, hdr.Size = tar.TypeLink, e.hardLink, 0
+		}
+		if err := w.WriteHeader(hdr); err != nil {
+			t.Fatalf("write the tar header of %s: %v", e.name, err)
+		}
+		if _, err := io.WriteString(w, e.body); err != nil && hdr.Size > 0 {
+			t.Fatalf("write the tar body of %s: %v", e.name, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close the tar stream: %v", err)
+	}
+	return b.Bytes()
+}
+
+// gatedBody is a body sent without a declared length that gives the bytes
+// of r up to limit of them, then waits until ctx ends and fails: a hub that
+// answers before ctx ends has read at most limit bytes.
+type gatedBody struct {
+	ctx   context.Context
+	r     io.Reader
+	limit int64
+	taken atomic.Int64
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	left := b.limit - b.taken.Load()
+	if left <= 0 {
+		<-b.ctx.Done()
+		return 0, b.ctx.Err()
+	}
+	if int64(len(p)) > left {
+		p = p[:left]
+	}
+	n, err := b.r.Read(p)
+	b.taken.Add(int64(n))
+	return n, err
+}
+
+// logHub is an exec hub whose test has the log collector run its rounds on
+// the hub's clock and reads the stored log lines; passes counts the
+// maintenance passes that have ended.
+type logHub struct {
+	*execHub
+	passes atomic.Int64
+}
+
+// startLogHub starts a log hub. With passInterval above zero the hub runs a
+// maintenance pass at that interval, on the real clock.
+func startLogHub(t *testing.T, passInterval time.Duration) *logHub {
+	t.Helper()
+	h := &logHub{}
+	h.execHub = newExecHub(t, "", func(cfg *hubtest.Config) {
+		cfg.MaintenanceInterval = passInterval
+		compose := cfg.Compose
+		cfg.Compose = func(c *hub.Composition) {
+			compose(c)
+			// A task under a name the maintenance order does not know runs
+			// after those it knows.
+			c.AddMaintenanceTask("log_test_pass", func(context.Context, *hub.Runtime) error {
+				h.passes.Add(1)
+				return nil
+			})
+		}
+	})
+	return h
+}
+
+// round has the log collector run a round: it waits until the collector
+// waits for one, then moves the hub's clock on to it. The collector asks
+// for the timer of its next round before it runs one, so a test that saw
+// what a round did may ask for the next.
+func (h *logHub) round(t *testing.T) {
+	t.Helper()
+	hubtest.WaitClosed(t, h.clock.Armed(sandbox.LogCollectInterval), "the log collector to wait for its next round")
+	h.clock.Advance(sandbox.LogCollectInterval)
+}
+
+// follow has the log collector run a round and waits until it reads both
+// logs of the sandbox id.
+func (h *logHub) follow(t *testing.T, id string) {
+	t.Helper()
+	h.round(t)
+	eventually(t, "the collector to read both logs of "+id, func() bool { return h.logStreams(id) == 2 })
+}
+
+// logStreams is the number of open log streams of the sandbox id.
+func (h *logHub) logStreams(id string) int {
+	n := 0
+	for _, s := range h.rt.Streams() {
+		if s.Op == runtime.OpLogs && s.Sandbox == id {
+			n++
+		}
+	}
+	return n
+}
+
+// breakLog breaks the first open log stream of the sandbox id.
+func (h *logHub) breakLog(t *testing.T, id string) {
+	t.Helper()
+	for _, s := range h.rt.Streams() {
+		if s.Op == runtime.OpLogs && s.Sandbox == id {
+			h.rt.BreakStream(s.ID)
+			return
+		}
+	}
+	t.Fatalf("no open log stream of %s", id)
+}
+
+// lines are the stored log lines of the sandbox id of the source ("" for
+// both), in the order they were stored.
+func (h *logHub) lines(t *testing.T, id, source string) []sandbox.LogLine {
+	t.Helper()
+	lines, err := sandbox.LogLines(context.Background(), h.Store.Main(), id, sandbox.LogSelection{Source: source})
+	if err != nil {
+		t.Fatalf("read the log lines of %s: %v", id, err)
+	}
+	return lines
+}
+
+// texts are the line members of the stored log lines of the sandbox id.
+func (h *logHub) texts(t *testing.T, id string) []string {
+	t.Helper()
+	var out []string
+	for _, l := range h.lines(t, id, "") {
+		out = append(out, l.Line)
+	}
+	return out
+}
+
+// emit has the main process of the sandbox id write text to stream.
+func (h *logHub) emit(id string, stream runtime.OutputStream, text string) {
+	h.rt.EmitOutput("parley", id, stream, text)
+}
+
+// pass waits for a maintenance pass that started after the call.
+func (h *logHub) pass(t *testing.T) {
+	t.Helper()
+	from := h.passes.Load()
+	eventually(t, "a maintenance pass", func() bool { return h.passes.Load() >= from+2 })
+}
+
+// logsAs sends GET …/logs?query for the sandbox id of ws with cred as the
+// bearer credential, and reads the answer with its headers and its error
+// envelope, if it has one.
+func (h *execHub) logsAs(t *testing.T, cred, id, query string) answer {
+	t.Helper()
+	var a answer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodGet, "/api/v1"+sandboxPath("ws", id)+"/logs?"+query, cred, nil, nil)
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
+}
+
+// logPage reads the page of log lines the answer a holds, which must be
+// 200 with an items array: the line member of each item, in order, and
+// next_cursor, "" for null.
+func logPage(t *testing.T, a answer) (lines []string, next string) {
+	t.Helper()
+	var page struct {
+		Items      *[]struct{ Line string } `json:"items"`
+		NextCursor *string                  `json:"next_cursor"`
+	}
+	if a.status != http.StatusOK || json.Unmarshal(a.body, &page) != nil || page.Items == nil {
+		t.Fatalf("logs = %d %.300s, want 200 with an items array", a.status, a.body)
+	}
+	for _, item := range *page.Items {
+		lines = append(lines, item.Line)
+	}
+	if page.NextCursor != nil {
+		next = *page.NextCursor
+	}
+	return lines, next
+}
+
+// followLogs sends GET …/logs?query for the sandbox id of ws as the owner,
+// under ctx and at most 10 s, and returns the answer's event stream once
+// its headers arrived; the test closes it.
+func (h *execHub) followLogs(t *testing.T, ctx context.Context, id, query string) *frameReader {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.URL("/api/v1"+sandboxPath("ws", id)+"/logs?"+query), nil)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	return h.eventStream(t, req, "logs")
+}
+
+// storeLines stores lines as log lines of the sandbox id, as the collector
+// does, but without telling the followed streams.
+func (h *execHub) storeLines(t *testing.T, id string, lines ...sandbox.LogLine) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.InsertLogLines(ctx, tx, id, lines) }); err != nil {
+		t.Fatalf("store log lines of %s: %v", id, err)
+	}
+}
+
+// processLine is a line of the main process's stream at the second sec
+// after recordStart.
+func processLine(sec int, stream, line string) sandbox.LogLine {
+	return sandbox.LogLine{Time: recordStart.Add(time.Duration(sec) * time.Second), Source: sandbox.LogSourceProcess, Stream: stream, Line: line}
+}
+
+// policyLine is a policy entry that denies a connection to example.com:443
+// at the second sec after recordStart.
+func policyLine(sec int, line string) sandbox.LogLine {
+	return sandbox.LogLine{
+		Time: recordStart.Add(time.Duration(sec) * time.Second), Source: sandbox.LogSourcePolicy, Line: line,
+		Action: "deny", Program: "/usr/bin/curl", Host: "example.com", Port: 443,
+	}
+}
+
+// seedLines stores the lines p1 (stdout), d1 (a policy entry), p2 (stderr)
+// and p3 (stdout) of the sandbox id, in this order, a second apart from
+// recordStart.
+func (h *execHub) seedLines(t *testing.T, id string) {
+	t.Helper()
+	h.storeLines(t, id, processLine(0, "stdout", "p1"), policyLine(1, "d1"), processLine(2, "stderr", "p2"), processLine(3, "stdout", "p3"))
+}
+
+// terminals keeps the terminals a hub's runtime client opened, in order.
+type terminals struct {
+	mu   sync.Mutex
+	list []*openedTerminal
+}
+
+// of is the terminals opened in the sandbox id, in order.
+func (ts *terminals) of(id string) []*openedTerminal {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	var out []*openedTerminal
+	for _, o := range ts.list {
+		if o.sandbox == id {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// count is the number of terminals opened in any sandbox.
+func (ts *terminals) count() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return len(ts.list)
+}
+
+// last is the terminal opened last in the sandbox id.
+func (ts *terminals) last(t *testing.T, id string) *openedTerminal {
+	t.Helper()
+	list := ts.of(id)
+	if len(list) == 0 {
+		t.Fatalf("no terminal was opened in %s", id)
+	}
+	return list[len(list)-1]
+}
+
+// openedTerminal is a terminal of the fake runtime, which echoes its input,
+// with what the hub asked for when it opened it, the resizes and the close
+// the hub asked for, and the controls a test steers it with: write, exit and
+// fail.
+type openedTerminal struct {
+	runtime.Terminal
+	sandbox string
+	req     runtime.ExecRequest
+	size    runtime.TerminalSize
+
+	mu      sync.Mutex
+	resizes []runtime.TerminalSize
+	closed  bool
+	failure error
+}
+
+func (o *openedTerminal) Resize(size runtime.TerminalSize) error {
+	o.mu.Lock()
+	o.resizes = append(o.resizes, size)
+	o.mu.Unlock()
+	return o.Terminal.Resize(size)
+}
+
+func (o *openedTerminal) Close() error {
+	o.mu.Lock()
+	o.closed = true
+	o.mu.Unlock()
+	return o.Terminal.Close()
+}
+
+// Read is the fake's, except that a terminal fail ended reports its
+// failure after what it had written.
+func (o *openedTerminal) Read(b []byte) (int, error) {
+	n, err := o.Terminal.Read(b)
+	if errors.Is(err, io.EOF) {
+		o.mu.Lock()
+		if o.failure != nil {
+			err = o.failure
+		}
+		o.mu.Unlock()
+	}
+	return n, err
+}
+
+// write makes the terminal write text, as the shell's output: the fake's
+// terminal gives back what it is written.
+func (o *openedTerminal) write(t *testing.T, text string) {
+	t.Helper()
+	if _, err := o.Terminal.Write([]byte(text)); err != nil {
+		t.Fatalf("write %q as the terminal's output: %v", text, err)
+	}
+}
+
+// exit ends the shell, as when it exits.
+func (o *openedTerminal) exit() { _ = o.Terminal.Close() }
+
+// fail breaks the terminal: its output ends with a runtime failure.
+func (o *openedTerminal) fail() {
+	o.mu.Lock()
+	o.failure = runtime.NewError(runtime.ErrUnavailable, runtime.OpExecInteractive, "the terminal broke")
+	o.mu.Unlock()
+	_ = o.Terminal.Close()
+}
+
+// resized is the sizes the hub resized the terminal to, in order.
+func (o *openedTerminal) resized() []runtime.TerminalSize {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.resizes)
+}
+
+// closedByHub reports whether the hub closed the terminal.
+func (o *openedTerminal) closedByHub() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.closed
+}
+
+// terminalClient is a runtime client in front of a fake's that records the
+// terminals it opens in terms.
+type terminalClient struct {
+	runtime.Client
+	terms *terminals
+}
+
+func (c *terminalClient) ExecInteractive(ctx context.Context, name string, req runtime.ExecRequest, size runtime.TerminalSize) (runtime.Terminal, error) {
+	term, err := c.Client.ExecInteractive(ctx, name, req, size)
+	if err != nil {
+		return nil, err
+	}
+	o := &openedTerminal{Terminal: term, sandbox: name, req: req, size: size}
+	c.terms.mu.Lock()
+	c.terms.list = append(c.terms.list, o)
+	c.terms.mu.Unlock()
+	return o, nil
+}
+
+// runtimeQuirks are answers a runtime may give that the fake does not.
+type runtimeQuirks struct {
+	// killedCode reports the exit code of a killed command as 137 without
+	// an error.
+	killedCode atomic.Bool
+	// canonical has Stat report a path under /srv/sandbox, and Walk add
+	// directories outside the directory it was asked for.
+	canonical atomic.Bool
+}
+
+// quirkClient is a runtime client that answers with the quirks set.
+type quirkClient struct {
+	runtime.Client
+	quirks *runtimeQuirks
+}
+
+func (c *quirkClient) ExecStream(ctx context.Context, name string, req runtime.ExecRequest) (runtime.ExecStream, error) {
+	s, err := c.Client.ExecStream(ctx, name, req)
+	if err != nil || !c.quirks.killedCode.Load() {
+		return s, err
+	}
+	return &killedCodeStream{ExecStream: s, ctx: ctx}, nil
+}
+
+// killedCodeStream is an exec stream whose command, once killed through
+// ctx, reports exit code 137 without an error.
+type killedCodeStream struct {
+	runtime.ExecStream
+	ctx context.Context
+}
+
+func (s *killedCodeStream) ExitCode() (int, error) {
+	code, err := s.ExecStream.ExitCode()
+	if err != nil && s.ctx.Err() != nil {
+		return 137, nil
+	}
+	return code, err
+}
+
+func (c *quirkClient) Stat(ctx context.Context, name, p string) (runtime.FileInfo, error) {
+	fi, err := c.Client.Stat(ctx, name, p)
+	if err == nil && c.quirks.canonical.Load() {
+		fi.Path = "/srv/sandbox" + fi.Path
+	}
+	return fi, err
+}
+
+func (c *quirkClient) Walk(ctx context.Context, name, dir string) ([]runtime.FileInfo, error) {
+	out, err := c.Client.Walk(ctx, name, dir)
+	if err == nil && c.quirks.canonical.Load() {
+		for _, p := range []string{"/srv/sandbox" + dir + "/canonical", dir + "-sibling", "/etc", dir} {
+			out = append(out, runtime.FileInfo{Path: p, Dir: true, Mode: fs.ModeDir | 0o755})
+		}
+	}
+	return out, err
+}
+
+// openTerminals is the number of terminals of the sandbox id the runtime rt
+// has open.
+func openTerminals(rt *runtimetest.Fake, id string) int {
+	n := 0
+	for _, s := range rt.Streams() {
+		if s.Op == runtime.OpExecInteractive && s.Sandbox == id {
+			n++
+		}
+	}
+	return n
+}
+
+// attach opens GET …/attach?query of the sandbox id of ws as a WebSocket,
+// as the owner and without an Origin header, and closes it when the test
+// ends.
+func (h *execHub) attach(t *testing.T, id, query string) *websocket.Conn {
+	t.Helper()
+	target := h.URL("/api/v1" + sandboxPath("ws", id) + "/attach?" + query)
+	cfg, err := websocket.NewConfig("ws"+strings.TrimPrefix(target, "http"), "http://origin.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Header.Set("Authorization", "Bearer "+h.key)
+	conn, err := net.Dial("tcp", cfg.Location.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	ws, err := websocket.NewClient(cfg, &withoutOrigin{Conn: conn})
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("attach to %s: %v", id, err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	t.Cleanup(func() { _ = ws.Close() })
+	return ws
+}
+
+// withoutOrigin is a connection that leaves the Origin header out of the
+// opening handshake it writes first, which the WebSocket client always
+// sends.
+type withoutOrigin struct {
+	net.Conn
+	sent bool
+}
+
+func (c *withoutOrigin) Write(b []byte) (int, error) {
+	if c.sent {
+		return c.Conn.Write(b)
+	}
+	c.sent = true
+	start := bytes.Index(b, []byte("\r\nOrigin: "))
+	if start < 0 {
+		return 0, errors.New("the handshake holds no Origin header to leave out")
+	}
+	end := start + 2 + bytes.Index(b[start+2:], []byte("\r\n"))
+	if _, err := c.Conn.Write(append(slices.Clone(b[:start]), b[end:]...)); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+// wsFrame is a WebSocket message: its payload and whether it came as a
+// binary frame.
+type wsFrame struct {
+	data   []byte
+	binary bool
+}
+
+// frames receives WebSocket messages with their frame type.
+var frames = websocket.Codec{
+	Marshal: websocket.Message.Marshal,
+	Unmarshal: func(data []byte, payloadType byte, v any) error {
+		*v.(*wsFrame) = wsFrame{data: data, binary: payloadType == websocket.BinaryFrame}
+		return nil
+	},
+}
+
+// receiveWithin receives the next message of ws, waiting at most d.
+func receiveWithin(ws *websocket.Conn, d time.Duration) (wsFrame, error) {
+	_ = ws.SetReadDeadline(time.Now().Add(d))
+	var f wsFrame
+	err := frames.Receive(ws, &f)
+	return f, err
+}
+
+// receiveBytes receives binary messages from ws until they hold n bytes,
+// and returns them joined.
+func receiveBytes(t *testing.T, ws *websocket.Conn, n int) []byte {
+	t.Helper()
+	var got []byte
+	for len(got) < n {
+		f, err := receiveWithin(ws, 5*time.Second)
+		if err != nil {
+			t.Fatalf("receive after %q: %v", got, err)
+		}
+		if !f.binary {
+			t.Fatalf("got the text frame %q, want binary frames", f.data)
+		}
+		got = append(got, f.data...)
+	}
+	return got
+}
+
+// sendFrame sends v on ws: a string as a text frame, bytes as a binary one.
+func sendFrame(t *testing.T, ws *websocket.Conn, v any) {
+	t.Helper()
+	if err := websocket.Message.Send(ws, v); err != nil {
+		t.Fatalf("send %q: %v", v, err)
+	}
+}
+
+// within waits up to d, polling, for cond to hold, and fails the test then.
+func within(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %v for %s", d, what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// observed keeps the operation records an observer is given, in order.
+type observed struct {
+	mu   sync.Mutex
+	list []sandbox.Operation
+}
+
+func (o *observed) observe(_ context.Context, op sandbox.Operation) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.list = append(o.list, op)
+	return nil
+}
+
+// records is the records given so far.
+func (o *observed) records() []sandbox.Operation {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.list)
+}
+
+// lastActivity is the stored last_activity_at of the sandbox id.
+func (h *execHub) lastActivity(t *testing.T, id string) time.Time {
+	t.Helper()
+	return storedRecord(t, h.Hub, id).LastActivityAt
+}
+
+// setLastActivity stores at as the last_activity_at of the sandbox id.
+func (h *execHub) setLastActivity(t *testing.T, id string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.Update(ctx, tx, id, sandbox.SetLastActivityAt(at)) }); err != nil {
+		t.Fatalf("set the last activity of %s: %v", id, err)
+	}
+}
+
+// activityAt waits for the stored last_activity_at of the sandbox id to be
+// want, and fails the test with the value it holds then.
+func (h *execHub) activityAt(t *testing.T, id string, want time.Time, when string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for got := h.lastActivity(t, id); !got.Equal(want); got = h.lastActivity(t, id) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s last_activity_at = %v, want %v", when, got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
