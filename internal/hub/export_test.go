@@ -39,3 +39,7 @@ func SessionLinkersOf(c *Composition) SessionLinkers {
 		Sandbox: sandboxSessions{c.sessions},
 	}
 }
+
+// SandboxUseOf is sandboxUseOf: the operation of the sandbox component as
+// the telemetry part hands it to the recorder of sandbox use.
+var SandboxUseOf = sandboxUseOf

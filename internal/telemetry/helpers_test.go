@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/telemetry"
 )
 
@@ -401,4 +404,71 @@ func (f *faultTx) ExecContext(ctx context.Context, query string, args ...any) (s
 		}
 	}
 	return f.Tx.ExecContext(ctx, query, args...)
+}
+
+// recorder is the telemetry component bound, without a hub, to an
+// analytical store of its own on SQLite, on a clock fixed at
+// 2026-01-02T03:04:05Z, with a session lookup, a log that keeps every line
+// it writes, and the faults of faultDB, switched by fail and block.
+type recorder struct {
+	comp        *telemetry.Component
+	db          *sql.DB
+	log         *hubtest.LogBuffer
+	fail, block atomic.Bool
+	// failThird is never set; faultDB needs it.
+	failThird atomic.Bool
+}
+
+// newRecorder binds the recorder to sessions, with writeTimeout as the
+// write limit (zero for the default).
+func newRecorder(t *testing.T, sessions telemetry.SessionRuns, writeTimeout time.Duration) *recorder {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), store.Options{
+		DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces"),
+	}, telemetry.SchemaSteps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	r := &recorder{comp: &telemetry.Component{}, db: st.Analytics(), log: &hubtest.LogBuffer{}}
+	r.comp.Bind(telemetry.Deps{
+		DB:           faultDB{DB: telemetry.SQL(st.Analytics()), fail: &r.fail, failThird: &r.failThird, block: &r.block},
+		Now:          newClock().Now,
+		Logger:       slog.New(slog.NewTextHandler(r.log, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		WriteTimeout: writeTimeout,
+		Sessions:     sessions,
+	})
+	return r
+}
+
+// runEvents is the number of stored run events.
+func (r *recorder) runEvents(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := r.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM run_events`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// logLines are the lines the recorder's log holds.
+func (r *recorder) logLines() []string {
+	return strings.Split(strings.TrimRight(r.log.String(), "\n"), "\n")
+}
+
+// sessionRuns is a session lookup over a fixed set: the run id of each
+// session ("" for one without), and err, when set, as every lookup's
+// failure.
+type sessionRuns struct {
+	runs map[string]string
+	err  error
+}
+
+func (s sessionRuns) RunOf(_ context.Context, id string) (string, bool, error) {
+	if s.err != nil {
+		return "", false, s.err
+	}
+	run, found := s.runs[id]
+	return run, found, nil
 }

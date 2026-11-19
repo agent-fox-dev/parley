@@ -20,13 +20,16 @@ import (
 )
 
 // Deps are what the component works with: the analytical store, the clock
-// (nil for time.Now), the log (nil discards it) and the time one write may
-// take ([audit].write_timeout; zero for DefaultWriteTimeout).
+// (nil for time.Now), the log (nil discards it), the time one write may
+// take ([audit].write_timeout; zero for DefaultWriteTimeout) and the run
+// ids of the sessions, which the recorder of sandbox use reads (nil: no
+// session is found, so nothing is recorded).
 type Deps struct {
 	DB           DB
 	Now          func() time.Time
 	Logger       *slog.Logger
 	WriteTimeout time.Duration
+	Sessions     SessionRuns
 }
 
 // Component is the telemetry feature. The hub creates its zero value while
