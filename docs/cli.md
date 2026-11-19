@@ -389,7 +389,7 @@ Available Commands:
   keys              List, refresh and revoke your API keys
   login             Sign in to the hub and save the hub URL and the credential
   orgs              List and read the organizations you belong to
-  sandbox           Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, and list their profiles
+  sandbox           Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles
   scm               Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   tokens            Create, read, change and revoke your personal access tokens
@@ -1240,6 +1240,11 @@ stderr as received, with exit status `1`; on a hub without sandboxes:
 | `parley sandbox logs <workspace-slug> <id> [flags]` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>/logs` |
 | `parley sandbox upload <workspace-slug> <id> <local-path> <sandbox-path>` | `PUT /api/v1/workspaces/<slug>/sandboxes/<id>/files` |
 | `parley sandbox download <workspace-slug> <id> <sandbox-path> <local-path>` | `GET /api/v1/workspaces/<slug>/sandboxes/<id>/files` |
+| `parley sandbox checkpoint <workspace-slug> <id>` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/checkpoint` |
+| `parley sandbox stop <workspace-slug> <id>` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/stop` |
+| `parley sandbox start <workspace-slug> <id> [--wait]` | `POST /api/v1/workspaces/<slug>/sandboxes/<id>/start` |
+| `parley sandbox extend <workspace-slug> <id> --ttl <duration>` | `PATCH /api/v1/workspaces/<slug>/sandboxes/<id>` |
+| `parley sandbox delete <workspace-slug> <id> [--no-checkpoint]` | `DELETE /api/v1/workspaces/<slug>/sandboxes/<id>` |
 
 `parley sandbox` run without a command prints its help and exits `0`; it
 reads no credential and sends no request. The slug and the id are sent as
@@ -1320,6 +1325,40 @@ parameter, so the hub's defaults apply (every state but `deleted`).
 [`GET /api/v1/workspaces/<slug>/sandboxes/<id>`](api.md#get-apiv1workspacesslugsandboxesid)
 and prints the sandbox object. Any other number of arguments is a usage
 error.
+
+#### `parley sandbox checkpoint`, `stop`, `start`, `extend` and `delete`
+
+```
+parley sandbox checkpoint <workspace-slug> <id>
+parley sandbox stop <workspace-slug> <id>
+parley sandbox start <workspace-slug> <id> [--wait [--timeout <duration>] [--poll-interval <duration>]]
+parley sandbox extend <workspace-slug> <id> --ttl <duration>
+parley sandbox delete <workspace-slug> <id> [--no-checkpoint]
+```
+
+Each takes exactly the two arguments and sends one request (see
+[api.md](api.md#the-life-of-a-sandbox)); any other number of arguments, and
+`extend` without `--ttl`, is a usage error (exit status `2`) and sends
+nothing.
+
+- `checkpoint` sends `POST …/sandboxes/<id>/checkpoint` and prints the
+  sandbox with its new `checkpoint`.
+- `stop` sends `POST …/sandboxes/<id>/stop` and prints the sandbox.
+- `start` sends `POST …/sandboxes/<id>/start` and prints the sandbox. With
+  `--wait` it then polls `GET …/sandboxes/<id>` through the
+  [shared wait](#waiting) until the sandbox is `ready` or `completed` (the
+  final sandbox on stdout, exit status `0`) or `failed`, `stopped` or
+  `deleted` (the final sandbox on stdout, `wait_failed` on stderr, exit
+  status `1`).
+- `extend` sends `PATCH …/sandboxes/<id>` with the body `{"ttl":"<duration>"}`
+  and prints the sandbox.
+- `delete` sends `DELETE …/sandboxes/<id>`, with the query
+  `checkpoint=false` when `--no-checkpoint` is given and none otherwise, and
+  on the hub's `204` prints `{"id":"<id>","status":"deleted"}`.
+
+An error the hub answers, such as `409 sandbox_deleted` for a start of a
+deleted sandbox, is written to stderr as received, with nothing on stdout
+and exit status `1`.
 
 #### `parley sandbox exec`
 

@@ -7669,7 +7669,7 @@ answer that shows a sandbox shows this object, with exactly these members:
 | `profile` | the name of the profile it was created from |
 | `purpose` | a string of at most 200 characters, `""` when none was given |
 | `state` | `provisioning`, `ready`, `stopped`, `completed`, `failed` or `deleted` |
-| `state_reason` | why it is in its state, or `null`; after a failed provisioning `provision_failed`, `checkout_failed` or `credential_missing` |
+| `state_reason` | why it is in its state, or `null`; after a failed provisioning `provision_failed`, `checkout_failed` or `credential_missing`; after a stop `api`, `idle` or `archived`; after a deletion `api`, `expired` or `workspace_deleted`; `exit` for a main process that ended with another code than 0 and `runtime_error` for a sandbox the runtime lost (see [the life of a sandbox](#the-life-of-a-sandbox)) |
 | `command` | the main process's command, a list of strings, or `null` for a sandbox driven by exec |
 | `env` | the `env` the creator gave, `{}` when none |
 | `exit_code` | the main process's exit code once it ended, else `null` |
@@ -7683,7 +7683,7 @@ answer that shows a sandbox shows this object, with exactly these members:
 | `expires_at` | when it expires |
 | `idle_timeout_seconds` | the profile's idle timeout in seconds, `0` when the idle stop is off |
 | `last_activity_at` | the time of its last activity; at creation its creation time |
-| `checkpoint` | its latest checkpoint, or `null` |
+| `checkpoint` | its latest checkpoint, `{at, ok, error, refs}` (see [the life of a sandbox](#the-life-of-a-sandbox)), or `null` |
 | `restored_from` | the id of the sandbox whose checkpoint it was restored from, or `null` |
 | `runtime_reachable` | `false` while the sandbox runtime cannot be reached; the other members then show what the hub stored |
 | `labels` | the creator's labels, `{}` when none |
@@ -7838,7 +7838,14 @@ secret values.
    credential naming its provider — and the rules a registered policy
    composer adds.
 4. It checks the repository out (below) and, with `restore_from`, has the
-   working directory restored from the source sandbox's checkpoint.
+   working directory restored from the source sandbox's checkpoint: each
+   checkpointed branch is set to its commit (a dirty one to the commit
+   under the extra one), and the uncommitted changes of the checked-out
+   branch are put back in the working tree, uncommitted, when that branch
+   is the checkpoint's dirty one. A checkpoint without refs leaves the
+   plain checkout. A checkpoint ref that no longer exists (a reclone
+   discards them) or a git command of the restore that fails ends the
+   sandbox `failed` with `checkout_failed`.
 5. It starts `command` when there is one.
 6. It moves the sandbox to `ready` and writes `parley.sandbox.ready` (actor
    `system`, metadata `checkout`) with that change.
@@ -7927,6 +7934,188 @@ completed, failed, deleted`), a `label` without `=` or with an empty key
 (`label must be key=value`) and an `include_forks` that is neither `true`
 nor `false` are `400 invalid_request`. A workspace without sandboxes
 answers `{"items":[],"next_cursor":null}`.
+
+## The life of a sandbox
+
+Besides being created and used, a sandbox is stopped and started again,
+extended, deleted and checkpointed: on request, through the five routes
+below, and by the hub on its own. Every one of them changes the sandbox
+only by a move that is conditional on the state the sandbox has, so racing
+requests and the hub's own work make one move and write one event.
+
+**Checkpoints.** A checkpoint saves the git state of the working directory
+to the sandbox's workspace on the hub: for every local branch whose head
+commit the workspace's repository does not have, and for the checked-out
+branch when the working tree has uncommitted changes, a ref
+`refs/parley/sandboxes/<sandbox id>/<branch>`. The uncommitted changes, new
+files that git does not ignore included, are saved as one extra commit on
+top of the branch head, by `parley <parley@localhost>`; with no branch
+checked out the ref's branch is `HEAD`. The branches, the index and the
+working tree in the sandbox stay as they were. Files that git ignores are
+not saved, nor is an untracked file larger than 100 MiB, whose path is then
+listed in `error` (`skipped: <path>, <path>`) of a checkpoint that is still
+`ok`. The refs are written to the workspace's repository directly: they
+are no version of a change and trigger nothing, and they live as long as
+the workspace (a fork's go with the fork). A checkpoint is limited to 5
+minutes and stores its refs all at once or not at all. The sandbox's
+`checkpoint` member then holds the latest attempt:
+
+```json
+{"at":"2026-11-18T12:30:00Z","ok":true,"error":null,"refs":[{"branch":"t1","sha":"4c1f0e9b7a2d3c5e6f8091a2b3c4d5e6f7081920","dirty":true}]}
+```
+
+`refs` are sorted by branch; `dirty` is true for a ref that ends in the
+extra commit. A failed attempt has `ok` false, its reason in `error`
+(scrubbed as every sandbox text is, at most 1,024 bytes) and the `refs` of
+the last checkpoint that succeeded, which still exist. A sandbox without a
+checkout, or whose working directory is not a git repository, gets `ok`
+true and no refs; one without a hub credential (its profile's
+`hub_access` is `none`) gets no checkpoint at all. Each attempt writes one
+`parley.sandbox.checkpoint` event with metadata `{ok, refs, error}` and adds
+one to `parley_sandbox_checkpoints_total{result}` (`ok` with refs, `empty`
+without, `failed`). The hub takes a checkpoint, when the profile's
+`checkpoint` is true and the sandbox is `ready`, before a stop, before a
+deletion (the `checkpoint` query of `DELETE` decides for that one) and
+when the main process has ended; a failed one never keeps the stop or the
+deletion from happening. A deletion with the workspace takes none.
+
+**What the hub does on its own** (actor `system`):
+
+- Every minute it stops each `ready` sandbox whose `last_activity_at` is
+  more than `idle_timeout_seconds` before the hub's time (`0` disables
+  this), with `state_reason` `idle`; a stop the runtime refuses is tried
+  again a minute later.
+- At `expires_at`, whatever the state, it deletes the sandbox with
+  `state_reason` `expired`, after a checkpoint of a `ready` one; it checks
+  every minute and at a timer set to the earliest `expires_at`. A sandbox
+  on a fork whose own `expires_at` has passed too goes with the fork:
+  `workspace_deleted`, no checkpoint.
+- Archiving a workspace stops the `ready` sandboxes of the workspace and
+  of its forks, with `state_reason` `archived`, and a start is refused
+  while it stays archived. Deleting a workspace or a fork, by request or by
+  expiry, first deletes its sandboxes with `state_reason`
+  `workspace_deleted` and no checkpoint, and then removes their records and
+  the fork's checkpoint refs with it. A fork with a `provisioning` or
+  `ready` sandbox is not removed early after its changes landed.
+- At start, before it listens, and every `[sandbox].reconcile_interval` it
+  compares its records with the runtime: a `ready` sandbox whose main
+  process has exited is checkpointed, its compute released (the working
+  directory stays) and recorded `completed` (exit code 0) or `failed` with
+  `state_reason` `exit`, with `exit_code` and `parley.sandbox.exit`
+  (metadata `{exit_code}`); a `ready` sandbox the runtime restarts reads
+  `provisioning` until the runtime runs it again, with no event; a
+  `ready` sandbox, or a `provisioning` one already created at the runtime,
+  that the runtime no longer has is recorded `failed` with `state_reason`
+  `runtime_error` and `parley.sandbox.fail` (metadata `reason` and
+  `error`); what the runtime holds labelled `parley.sandbox=<id>` of no
+  live sandbox is deleted there; the idle stops and expiries that came due
+  meanwhile are done. While the runtime cannot be reached a pass changes
+  nothing but by expiry.
+- Every hour it removes the records of sandboxes deleted more than 24 hours
+  before, with their stored logs; their ids then answer `404
+  sandbox_not_found`.
+- Stopping or restarting the hub stops and deletes nothing at the runtime:
+  a `ready` sandbox is still `ready` after a restart.
+
+The hub credential is revoked whenever a sandbox loses its compute: at a
+stop, a deletion, the end of the main process and a failure the
+reconciliation records. A start mints a new one.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/checkpoint`
+
+Takes a checkpoint of a `ready` sandbox now, with the caller as the event's
+actor, whatever the profile's `checkpoint` says. It is a write route of the
+[sandbox routes](#sandbox-routes), with no body. The answer is `200` with
+the sandbox object, whose `checkpoint` is the new one (`at` the time of the
+request) and whose `state` is still `ready`; for a sandbox without a hub
+credential, `200` with `checkpoint` `null`. A sandbox in any other state,
+`deleted` included, is refused before the runtime is asked:
+
+```json
+{"error":{"code":409,"message":"the sandbox is stopped, which this operation does not allow","error_type":"sandbox_not_ready"}}
+```
+
+A checkpoint that fails is recorded on the sandbox and answered `502
+sandbox_runtime_error`, its message holding the reason.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/stop`
+
+Stops a `ready` sandbox: a checkpoint when the profile's `checkpoint` is
+true, the release of its compute at the runtime (the runtime keeps the
+working directory), the revocation of the hub credential, and the move to
+`stopped` with `state_reason` `api` and `parley.sandbox.stop` (metadata
+`{reason}`). A write route with no body; the admin token may stop any
+sandbox. The answer is `200` with the sandbox object. A sandbox in any
+other state is answered `200` as it is, and nothing changes. When the
+runtime cannot be reached or refuses the stop, the answer is `502
+sandbox_runtime_error` and the sandbox stays `ready` with its credential.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/start`
+
+Starts a `stopped`, `completed` or `failed` sandbox again. A write route
+with no body. In one transaction it checks the workspace as a create does
+(an archived workspace is `409 workspace_archived`, a fork of an archived
+parent `409 parent_archived`), resolves the credentials and exposed secrets
+of the sandbox's snapshot again (`422 credential_missing`, `503
+secrets_unavailable`), applies the quotas (`429 sandbox_capacity` with
+`limit`, `maximum` and `current`), mints a new hub credential with the
+scopes and paths of `hub_access`, owned by the sandbox's creator and
+expiring at `expires_at`, and moves the sandbox to `provisioning` with
+`exit_code`, `state_reason` and `ended_at` cleared and
+`parley.sandbox.start` (actor the caller). An optional credential or secret
+that no longer resolves is dropped from `credentials` or
+`exposed_secrets`. The answer is `200` with the sandbox in `provisioning`;
+a refusal changes nothing, mints nothing and calls no runtime. The profile
+is not consulted: a sandbox whose profile was removed from the
+configuration starts from what it recorded at creation.
+
+The sandbox is then provisioned as a start: the hub registers its
+providers again with the values resolved now (a secret rotated while the
+sandbox was stopped reaches it), starts the runtime's sandbox with the
+composed policy and the environment, rebuilds the working directory from
+the checkout and the sandbox's latest checkpoint when the runtime no
+longer has it, starts `command` again when there is one, and moves the
+sandbox to `ready` with `parley.sandbox.ready`. A failure ends it `failed`
+as a create's does, but keeps the runtime's sandbox and its working
+directory.
+
+A `provisioning` or `ready` sandbox is answered `200` as it is; a `deleted`
+one
+
+```json
+{"error":{"code":409,"message":"the sandbox is deleted and cannot be started","error_type":"sandbox_deleted"}}
+```
+
+## `PATCH /api/v1/workspaces/{slug}/sandboxes/{id}`
+
+Changes a sandbox's `ttl`, `purpose` or `labels`. A write route; every
+member is optional and an absent one leaves its value as it is.
+
+| Member | Value |
+|---|---|
+| `ttl` | a [duration](#timestamps-and-durations) string from `1m` to the profile's `ttl` as recorded at creation, counted from now: `expires_at` becomes now plus `ttl`, cut to the fork's `expires_at` on a task fork, and the hub credential's expiry (`hub_access.expires_at`) moves with it. It may make `expires_at` earlier |
+| `purpose` | a string of at most 200 characters |
+| `labels` | the labels, replacing the old ones, by the rules of a create |
+
+Every member is checked before anything changes; a violation is `400
+invalid_request` naming the member (`ttl: must be a string`). The answer is
+`200` with the sandbox object; no event is written. A deleted sandbox is
+`409 sandbox_deleted` (`the sandbox is deleted and cannot be changed`).
+
+## `DELETE /api/v1/workspaces/{slug}/sandboxes/{id}`
+
+Deletes a sandbox in any state: a checkpoint of a `ready` one when the
+query parameter `checkpoint` is `true`, or is absent and the profile's
+`checkpoint` is true; the removal of the runtime's sandbox and its
+providers; the revocation of the hub credential; and the move to `deleted`
+with `state_reason` `api`, `ended_at` and `parley.sandbox.delete` (metadata
+`{reason}`). A write route; the admin token may delete any sandbox. The
+answer is `204` with no body, also for a sandbox already deleted, for which
+nothing is done. A `checkpoint` other than `true` or `false` is `400
+invalid_request` (`checkpoint must be true or false`). When the runtime
+cannot be reached or fails, the sandbox is recorded `deleted` all the same
+and the reconciliation removes what the runtime still holds. The record
+stays readable for 24 hours.
 
 ## Using a sandbox
 
