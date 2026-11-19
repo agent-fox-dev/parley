@@ -153,15 +153,44 @@ func (r *commitReader) commit(id string) (*Commit, bool) {
 		return nil, false
 	}
 	kind, data, ok := r.read(id)
-	if !ok || kind != packCommit {
+	if !ok || kind != packCommit || !gitLayout(data) {
 		return nil, false
 	}
 	c, err := parseCommit(id, data)
-	if err != nil || !isHexID(c.Tree, idLen) || slices.ContainsFunc(c.Parents, func(p string) bool { return !isHexID(p, idLen) }) {
+	if err != nil {
 		return nil, false
 	}
 	r.commits[id] = &c
 	return &c, true
+}
+
+// gitLayout reports whether the commit object raw is laid out as git reads
+// a commit's tree and parents: its tree line first, then its parent lines,
+// and no tree or parent line among the headers after them, each id a full
+// lower-case one. git takes a parent line elsewhere for another header,
+// which parseCommit does not, and refuses a commit whose first line is not
+// its tree.
+func gitLayout(raw []byte) bool {
+	headers, _, _ := bytes.Cut(raw, []byte("\n\n"))
+	lines := strings.Split(string(headers), "\n")
+	if !lowerIDLine(lines[0], "tree ") {
+		return false
+	}
+	i := 1
+	for ; i < len(lines) && strings.HasPrefix(lines[i], "parent "); i++ {
+		if !lowerIDLine(lines[i], "parent ") {
+			return false
+		}
+	}
+	return !slices.ContainsFunc(lines[i:], func(l string) bool {
+		return strings.HasPrefix(l, "tree ") || strings.HasPrefix(l, "parent ")
+	})
+}
+
+// lowerIDLine reports whether line is key followed by a full lower-case id.
+func lowerIDLine(line, key string) bool {
+	id, ok := strings.CutPrefix(line, key)
+	return ok && len(id) == idLen && strings.Trim(id, "0123456789abcdef") == ""
 }
 
 // read is the kind, as a pack entry gives it, and the content of the object

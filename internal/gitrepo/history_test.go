@@ -418,6 +418,29 @@ func TestCommitWalks_LeaveToGitWhatOnlyGitSettles(t *testing.T) {
 			_, err := gitrepotest.Run(dir, "", "merge-base", "--is-ancestor", ids[0], ids[1])
 			return fmt.Sprint(err == nil, nil)
 		}},
+		// git reads parents only from the lines right after the tree, so a
+		// commit whose parent line follows its author line is a root to it.
+		{"a parent line where git reads none", func(t *testing.T, dir string) {
+			ids := strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main^{tree}", "main"))
+			obj := "tree " + ids[0] + "\nauthor T <t@example.invalid> 1700009000 +0000\nparent " + ids[1] +
+				"\ncommitter T <t@example.invalid> 1700009000 +0000\n\nodd\n"
+			odd, err := gitrepotest.Run(dir, obj, "hash-object", "-t", "commit", "--literally", "-w", "--stdin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gitrepotest.Git(t, dir, "update-ref", "refs/heads/odd", odd)
+		}, func(t *testing.T, repo *gitrepo.Repo, dir string) string {
+			ids := strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main", "odd"))
+			yes, err := repo.IsAncestor(context.Background(), ids[0], ids[1])
+			base, berr := repo.MergeBase(context.Background(), ids[0], ids[1])
+			between, lerr := repo.CommitsBetween(context.Background(), "", ids[1], 0)
+			return fmt.Sprint(yes, err, base, berr, between, lerr)
+		}, func(t *testing.T, dir string) string {
+			ids := strings.Fields(gitrepotest.Git(t, dir, "rev-parse", "main", "odd"))
+			_, err := gitrepotest.Run(dir, "", "merge-base", "--is-ancestor", ids[0], ids[1])
+			base, _ := gitrepotest.Run(dir, "", "merge-base", ids[0], ids[1])
+			return fmt.Sprint(err == nil, nil, base, nil, strings.Fields(gitrepotest.Git(t, dir, "rev-list", "--reverse", "--topo-order", ids[1])), nil)
+		}},
 		{"a shallow repository", func(t *testing.T, dir string) {
 			if err := os.WriteFile(filepath.Join(dir, "shallow"), []byte(gitrepotest.Git(t, dir, "rev-parse", "main~2")+"\n"), 0o644); err != nil {
 				t.Fatal(err)
