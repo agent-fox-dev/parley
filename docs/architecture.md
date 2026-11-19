@@ -3350,9 +3350,9 @@ trial, outside any transaction, and a restack on the report of its replay,
 before its transaction; `internal/change` and `internal/scm` cannot import
 `internal/land`, so they take the attribution as a function value, and nil
 names no landed change.
-`Recorder` keeps its default, which records nothing, and no
-`SessionLinker` is registered: the session feature and the metric export
-are not in the hub yet.
+`Recorder` keeps its default, which records nothing, since the metric
+export is not in the hub yet; the sessions part registers the
+`SessionLinker` (see [Agent sessions](#agent-sessions)).
 
 Every read route is `GET /workspaces/:slug/scm/…`, declared with the scope
 `git:read` and the access need `read`, so the pipeline answers `401`,

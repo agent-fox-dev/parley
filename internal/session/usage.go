@@ -130,10 +130,17 @@ func (c *Component) reportRoute(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// maxTokens is the most tokens one count of a usage report may carry. The
+// counts are summed by the store (SUM over a session's or a workspace's
+// records), which fails on a sum past 64 bits and would leave every reader
+// of the session or the workspace with an error; at this bound it takes
+// millions of records to get there.
+const maxTokens = 1 << 40
+
 // usageInput reads the body of a usage report: model, a non-blank string
 // of at most maxLabel characters; id, a UUID (a new version 4 UUID when
-// none is sent); and the three token counts, integers of at least 0, 0
-// when absent.
+// none is sent); and the three token counts, integers from 0 to maxTokens,
+// 0 when absent.
 func usageInput(body map[string]json.RawMessage) (Usage, error) {
 	var u Usage
 	model, err := optionalString(body, "model")
@@ -161,6 +168,9 @@ func usageInput(body map[string]json.RawMessage) (Usage, error) {
 		v, err := optionalCount(body, n.name)
 		if err != nil {
 			return Usage{}, err
+		}
+		if v != nil && *v > maxTokens {
+			return Usage{}, server.InvalidRequest(fmt.Sprintf("%s must be at most %d", n.name, int64(maxTokens)))
 		}
 		if v != nil {
 			*n.dst = *v
@@ -284,12 +294,18 @@ func (c *Component) usageRoute(w http.ResponseWriter, r *http.Request) error {
 	if continuing && (after.ReportedAt == "" || after.ID == "") {
 		return server.InvalidRequest("cursor is malformed or belongs to another query")
 	}
-	db := c.deps.Store.Main()
-	items, err := listUsage(ctx, db, s.ID, ascending, continuing, after, page.Limit+1)
-	if err != nil {
+	// The page and the totals are read in one snapshot, so that they agree
+	// while reports arrive.
+	var items []Usage
+	var totals TokenSummary
+	err = snapshot(ctx, c.deps.Store.Main(), func(tx *sql.Tx) error {
+		var err error
+		if items, err = listUsage(ctx, tx, s.ID, ascending, continuing, after, page.Limit+1); err != nil {
+			return err
+		}
+		totals, err = tokenSummary(ctx, tx, s.ID)
 		return err
-	}
-	totals, err := tokenSummary(ctx, db, s.ID)
+	})
 	if err != nil {
 		return err
 	}

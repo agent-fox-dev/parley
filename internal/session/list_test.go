@@ -330,13 +330,16 @@ func TestList_HidesWhetherTheWorkspaceFilterNamesAWorkspace(t *testing.T) {
 }
 
 func TestList_ConfinesABoundTokenToTheWorkspacesItsBindingCovers(t *testing.T) {
+	// want are the workspaces whose sessions a token bound to demo--t1
+	// lists, and elsewhere those a token bound to a workspace with no
+	// session lists.
 	cases := []struct {
-		name     string
-		coverage session.Coverage
-		want     []string
+		name            string
+		coverage        session.Coverage
+		want, elsewhere []string
 	}{
-		{"with a coverage that covers demo--t1 alone", boundCoverage{}, []string{fork1}},
-		{"with no coverage installed", nil, []string{fork2, fork1, demo}},
+		{"with a coverage that covers demo--t1 alone", boundCoverage{}, []string{fork1}, nil},
+		{"with no coverage installed", nil, []string{fork2, fork1, demo}, []string{fork2, fork1, demo}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -361,6 +364,12 @@ func TestList_ConfinesABoundTokenToTheWorkspacesItsBindingCovers(t *testing.T) {
 					t.Errorf("GET /sessions/%s = %d %s, want 200", id, status, raw)
 				}
 			}
+			got, _ = w.listed(t, w.pat(t, w.alice, "demo--t3", "sessions:read"), "")
+			want = nil
+			for _, ws := range c.elsewhere {
+				want = append(want, bySlug[ws])
+			}
+			wantIDs(t, got, want)
 		})
 	}
 }

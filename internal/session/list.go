@@ -286,13 +286,18 @@ func (c *Component) readableSessions(ctx context.Context, caller access.Caller, 
 	if f.until != "" {
 		conds, args = append(conds, `started_at < ?`), append(args, f.until)
 	}
-	if c.deps.Coverage == nil {
+	// Only a token bound to a workspace is bound, and with no coverage none
+	// is (see Deps), so no other caller costs a read of the coverage.
+	if c.deps.Coverage == nil || caller.Workspace == "" {
 		return conds, args, nil
 	}
-	covered, bound, err := c.coveredWorkspaces(ctx, caller, conds, args)
-	if err != nil || !bound {
-		return conds, args, err
+	covered, err := c.coveredWorkspaces(ctx, caller, conds, args)
+	if err != nil {
+		return nil, nil, err
 	}
+	// The condition is added even when nothing is covered (json_each of an
+	// empty array selects no slug), so that a session stored after the
+	// covered workspaces were read is not listed without it.
 	slugs, err := jsonArray(covered)
 	if err != nil {
 		return nil, nil, err
@@ -301,12 +306,13 @@ func (c *Component) readableSessions(ctx context.Context, caller access.Caller, 
 }
 
 // coveredWorkspaces asks the coverage, for each workspace of the sessions
-// conds selects, whether caller is bound and whether its binding covers
-// it, and returns the covered ones. bound is false, and covered nil, for a
-// caller that is not bound, and for one that conds selects no session for.
-func (c *Component) coveredWorkspaces(ctx context.Context, caller access.Caller, conds []string, args []any) (covered []string, bound bool, err error) {
+// conds selects, whether the binding of the bound caller covers it, and
+// returns the covered ones: none, not nil, when it covers none of them or
+// conds selects no session. A workspace the coverage does not report as
+// bound and covered is not covered.
+func (c *Component) coveredWorkspaces(ctx context.Context, caller access.Caller, conds []string, args []any) ([]string, error) {
 	var slugs []string
-	err = eachRow(ctx, c.deps.Store.Main(), func(scan func(...any) error) error {
+	err := eachRow(ctx, c.deps.Store.Main(), func(scan func(...any) error) error {
 		var slug string
 		if err := scan(&slug); err != nil {
 			return err
@@ -315,22 +321,19 @@ func (c *Component) coveredWorkspaces(ctx context.Context, caller access.Caller,
 		return nil
 	}, `SELECT DISTINCT workspace_slug FROM sessions`+where(conds), args...)
 	if err != nil {
-		return nil, false, fmt.Errorf("read the workspaces of the listed sessions: %w", err)
+		return nil, fmt.Errorf("read the workspaces of the listed sessions: %w", err)
 	}
-	covered = []string{}
+	covered := []string{}
 	for _, slug := range slugs {
-		b, cov, err := c.deps.Coverage.Covers(ctx, caller, slug)
+		bound, cov, err := c.deps.Coverage.Covers(ctx, caller, slug)
 		if err != nil {
-			return nil, false, fmt.Errorf("ask the coverage of workspace %s: %w", slug, err)
+			return nil, fmt.Errorf("ask the coverage of workspace %s: %w", slug, err)
 		}
-		if !b {
-			return nil, false, nil
-		}
-		if cov {
+		if bound && cov {
 			covered = append(covered, slug)
 		}
 	}
-	return covered, len(slugs) > 0, nil
+	return covered, nil
 }
 
 // listPositions reads up to limit positions of the sessions conds selects,

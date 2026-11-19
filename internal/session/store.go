@@ -222,9 +222,11 @@ func formatOptional(t *time.Time) any {
 const maxListed = 500
 
 // object builds the session object of r, reading its usage records and its
-// links through q when it is called, so that a usage report or a recorded
-// link shows in the next answer. Every route answers a session with it.
-func object(ctx context.Context, q Querier, r row) (Object, error) {
+// links from db when it is called, so that a usage report or a recorded
+// link shows in the next answer. They are read in one snapshot, so that
+// the token summary, the lists and the counts agree with each other while
+// links and reports arrive. Every route answers a session with it.
+func object(ctx context.Context, db *sql.DB, r row) (Object, error) {
 	o := Object{
 		ID: r.ID, WorkspaceSlug: r.WorkspaceSlug, RunID: r.RunID, NodeID: r.NodeID, Archetype: r.Archetype, Model: r.Model,
 		Status: r.Status, CredentialType: r.CredentialType, StartedAt: timefmt.Time(r.StartedAt),
@@ -238,14 +240,30 @@ func object(ctx context.Context, q Querier, r row) (Object, error) {
 		ended := timefmt.Time(*r.EndedAt)
 		o.EndedAt = &ended
 	}
-	var err error
-	if o.TokenSummary, err = tokenSummary(ctx, q, r.ID); err != nil {
-		return Object{}, err
-	}
-	if err := readLinks(ctx, q, r.ID, &o); err != nil {
+	err := snapshot(ctx, db, func(tx *sql.Tx) error {
+		var err error
+		if o.TokenSummary, err = tokenSummary(ctx, tx, r.ID); err != nil {
+			return err
+		}
+		return readLinks(ctx, tx, r.ID, &o)
+	})
+	if err != nil {
 		return Object{}, err
 	}
 	return o, nil
+}
+
+// snapshot runs fn in a read-only transaction of db, which sees one
+// snapshot of the store. A read-only transaction begins deferred, not with
+// the write lock the store's other transactions take (_txlock=immediate),
+// so that it neither waits for a writer nor holds one up.
+func snapshot(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin a read: %w", err)
+	}
+	defer tx.Rollback()
+	return fn(tx)
 }
 
 // tokenSummary sums the usage records of the session id.

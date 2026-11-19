@@ -211,3 +211,36 @@ func TestSessionLinkers_AnswerEachConsumerInItsOwnTerms(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionLinkers_AreRegisteredWithTheConsumers(t *testing.T) {
+	h := hubtest.Start(t, nil)
+	alice := h.CreateUser(t, "alice")
+	aliceKey, acme := h.IssueKey(t, alice), h.CreateOrg(t, "acme")
+	h.AddMember(t, acme, alice)
+	h.AddWorkspace(t, access.Record{Slug: "demo", OwnerID: alice, OrgID: acme, Kind: access.KindRepository, Status: access.StatusReady})
+	status, raw := h.Call(t, http.MethodPost, "/api/v1/sessions", aliceKey, map[string]any{"workspace_slug": "demo"})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /sessions = %d %s, want 201", status, raw)
+	}
+	var opened struct{ ID string }
+	if err := json.Unmarshal(raw, &opened); err != nil {
+		t.Fatal(err)
+	}
+
+	// A claim names a target branch, so that it needs no repository.
+	claim := map[string]any{"paths": []string{"docs/**"}, "intent": "edit the docs", "target_branch": "main", "session_id": opened.ID}
+	if status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo/claims", aliceKey, claim); status != http.StatusCreated {
+		t.Fatalf("POST /workspaces/demo/claims = %d %s, want 201", status, raw)
+	}
+	status, raw = h.Call(t, http.MethodGet, "/api/v1/sessions/"+opened.ID, aliceKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET /sessions/%s = %d %s, want 200", opened.ID, status, raw)
+	}
+	var s struct{ Counts map[string]int }
+	if err := json.Unmarshal(raw, &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Counts["claims"] != 1 {
+		t.Errorf("counts.claims = %d, want 1", s.Counts["claims"])
+	}
+}

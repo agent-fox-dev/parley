@@ -58,6 +58,9 @@ up to a whole second (`costPeriodOf` in `internal/session/cost.go`); a given
 
 ## Where the package is silent
 
+- A token count of a usage report is at most 2^40 (1099511627776), so that
+  the sums the session object, the usage list and the cost report compute
+  cannot overflow SQLite's integers and fail every later read with `500`.
 - A JSON `null` member of `POST /sessions` counts as absent. Labels are
   counted in characters (runes).
 - `GET /sessions` refuses a parameter given twice, an empty `workspace`,

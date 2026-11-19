@@ -181,6 +181,55 @@ func TestObject_CountsTheLinksOfEachKind(t *testing.T) {
 	}))
 }
 
+func TestObject_AgreesWithItsCountsWhileLinksArrive(t *testing.T) {
+	w := newWorld(t)
+	id := w.newSession(t)
+	const links = 200
+	done := make(chan error, 1)
+	go func() {
+		ctx := context.Background()
+		for i := range links {
+			err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+				if err := w.sessions.Record(ctx, tx, session.ForkLink(id, demo, fmt.Sprintf("demo--c%d", i))); err != nil {
+					return err
+				}
+				return w.sessions.Record(ctx, tx, session.VersionLink(id, demo, int64(i+1), 1))
+			})
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	// The object is read until the links are all recorded, or until it
+	// disagrees with its counts once; the writer is waited for either way.
+	agrees := true
+	for agrees {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+		o := w.object(t, id)
+		c := o["counts"].(map[string]any)
+		if forks := len(o["forks"].([]any)); c["forks"] != float64(forks) {
+			t.Errorf("counts.forks = %v with %d forks listed", c["forks"], forks)
+			agrees = false
+		}
+		if changes := len(o["changes"].([]any)); c["changes"] != float64(changes) {
+			t.Errorf("counts.changes = %v with %d changes listed", c["changes"], changes)
+			agrees = false
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestObject_ListsTheFirst500EntriesAndCountsThemAll(t *testing.T) {
 	w := newWorld(t)
 	// The keys fall as the links are recorded, so that a list in the order

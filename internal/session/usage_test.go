@@ -2,7 +2,10 @@ package session_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"reflect"
 	"slices"
@@ -280,6 +283,9 @@ func TestUsage_RefusesAnInvalidBody(t *testing.T) {
 		{"input_tokens -1", "input_tokens", map[string]any{"model": "m1", "input_tokens": -1}},
 		{"output_tokens 1.5", "output_tokens", map[string]any{"model": "m1", "output_tokens": 1.5}},
 		{"cache_read_tokens '2'", "cache_read_tokens", map[string]any{"model": "m1", "cache_read_tokens": "2"}},
+		{"input_tokens past the bound", "input_tokens", map[string]any{"model": "m1", "input_tokens": maxTokens + 1}},
+		{"output_tokens past the bound", "output_tokens", map[string]any{"model": "m1", "output_tokens": maxTokens + 1}},
+		{"cache_read_tokens of 64 bits", "cache_read_tokens", map[string]any{"model": "m1", "cache_read_tokens": int64(math.MaxInt64)}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -299,6 +305,31 @@ func TestUsage_RefusesAnInvalidBody(t *testing.T) {
 			t.Errorf("model = %v, want the 255 characters sent", r["model"])
 		}
 	})
+}
+
+// maxTokens is the largest token count a usage report may carry.
+const maxTokens = 1 << 40
+
+func TestUsage_SumsReportsAtTheBoundForEveryReader(t *testing.T) {
+	w := newWorld(t)
+	id := w.open(t, w.aliceKey, map[string]any{"workspace_slug": demo})["id"].(string)
+	at := map[string]any{"model": "m1", "input_tokens": maxTokens, "output_tokens": maxTokens, "cache_read_tokens": maxTokens}
+	w.reported(t, w.aliceKey, id, at)
+	w.reported(t, w.aliceKey, id, at)
+	twice := float64(2 * maxTokens)
+	if got, want := w.tokenSummary(t, w.aliceKey, id), summary(twice, twice, twice, "m1"); !reflect.DeepEqual(got, want) {
+		t.Errorf("token_summary = %v, want %v", got, want)
+	}
+	if pages := w.usagePages(t, w.aliceKey, id, ""); !reflect.DeepEqual(pages[0].Totals, summary(twice, twice, twice, "m1")) {
+		t.Errorf("usage totals = %v, want %v", pages[0].Totals, summary(twice, twice, twice, "m1"))
+	}
+	if got, _ := w.listed(t, w.aliceKey, ""); !slices.Equal(got, []string{id}) {
+		t.Errorf("listed sessions = %v, want [%s]", got, id)
+	}
+	w.clock.Advance(time.Second)
+	if got := w.costOf(t, w.aliceKey, "").Totals; !reflect.DeepEqual(got, sums(twice, twice, twice, 1)) {
+		t.Errorf("cost totals = %v, want %v", got, sums(twice, twice, twice, 1))
+	}
 }
 
 func TestUsage_NotifiesEveryObserverOnceAfterTheRecordIsStored(t *testing.T) {
@@ -474,5 +505,60 @@ func TestActiveCounts_CountsActiveSessionsPerWorkspace(t *testing.T) {
 	got, err := w.sessions.ActiveCounts(ctx)
 	if want := map[string]int64{demo: 2, fork1: 1, other: 1}; err != nil || !reflect.DeepEqual(got, want) {
 		t.Errorf("ActiveCounts = %v, %v; want %v", got, err, want)
+	}
+}
+
+func TestUsage_ListAgreesWithItsTotalsWhileReportsArrive(t *testing.T) {
+	w := newWorld(t)
+	id := w.newSession(t)
+	const records = 150
+	done := make(chan error, 1)
+	go func() {
+		ctx := context.Background()
+		for i := range records {
+			err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `
+INSERT INTO session_usage (id, session_id, workspace_slug, model, input_tokens, output_tokens, cache_read_tokens, reported_at)
+VALUES (?, ?, ?, 'm1', 1, 0, 0, ?)`, freshID(), id, demo, fmt.Sprintf("2026-01-01T00:%02d:%02dZ", i/60, i%60))
+				return err
+			})
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	// Every record fits on one page, so the page's records add up to its
+	// totals whenever the two are read together.
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+		status, raw := w.listUsage(t, w.aliceKey, id, "limit=200")
+		if status != http.StatusOK {
+			t.Fatalf("GET usage = %d %s, want 200", status, raw)
+		}
+		var page struct {
+			Items  []map[string]any `json:"items"`
+			Totals struct {
+				Input float64 `json:"total_input_tokens"`
+			} `json:"totals"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			t.Fatal(err)
+		}
+		if float64(len(page.Items)) != page.Totals.Input {
+			t.Errorf("the page lists %d records of 1 input token and totals %v", len(page.Items), page.Totals.Input)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
 	}
 }

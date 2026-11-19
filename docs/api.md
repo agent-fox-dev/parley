@@ -4821,9 +4821,8 @@ evaluated against the current revision of the policy of `{slug}` (see
 [The landing of a change](#the-landing-of-a-change)): a draft is
 `blocked` for `draft`, with its requirements listed. Under the revision-0
 document, whose default requires nothing, every other change is `ready`,
-its files listed under the `default` requirement. Until the
-hub has a session feature, every `session_id` is refused and a defaulted
-one dropped.
+its files listed under the `default` requirement. A `session_id` is
+judged by the session-linking rule of [Sessions](#sessions).
 
 The open writes `parley.change.version` for version 1, with `number`,
 `ref`, `version`, `head_sha`, `kind`, `base_sha`, `patch_equivalent_to`
@@ -6736,8 +6735,8 @@ for the claim's paths and target, without the claim itself>}` and writes
 metadata `paths`, `intent`, `target_branch`, `expires_at`). Refusals, which
 store nothing and write nothing: `400` `invalid_request` for a member that
 is missing, of the wrong type or out of bounds; `400` `unknown_session` for
-a `session_id` the session-linking rule refuses — the hub has no session
-store yet, so every `session_id` is refused this way for now; `429`
+a `session_id` the session-linking rule of [Sessions](#sessions) refuses;
+`429`
 `claim_limit_reached` when the workspace the claim would be stored on
 already has `[awareness].max_claims_per_workspace` active claims, or the
 session already has 50.
@@ -9630,7 +9629,8 @@ case; a create without an `id` gets a version 4 UUID. A `run_id` has the
 form `YYYYMMDD_HHMMSS_` followed by six lower-case hexadecimal digits.
 `node_id`, `archetype` and `model` are labels of at most 255 characters.
 
-**The session object.** Every session route answers this object, built when
+**The session object.** Every session route but the usage routes, which
+answer usage records, answers this object, built when
 the answer is built, so a usage report or a recorded link shows in the next
 read:
 
@@ -9758,7 +9758,8 @@ nothing changes; of two completes at once exactly one takes effect.
 Reports one token usage increment of an `active` session. The body:
 `model` (required, a non-blank string of at most 255 characters), `id` (a
 UUID; a new one when absent) and `input_tokens`, `output_tokens`,
-`cache_read_tokens` (integers of at least 0, `0` when absent). The answer
+`cache_read_tokens` (integers from 0 to 1099511627776, 2^40, `0` when
+absent). The answer
 is `201` with the usage record:
 
 ```json
@@ -9773,7 +9774,7 @@ session has ended since.
 | Status | When, in this order |
 |---|---|
 | `400`, `404`, `403` | as for a complete |
-| `400` `invalid_request` | `model` missing, blank, not a string or too long; `id` not a UUID; a count negative or not an integer; the message naming the member |
+| `400` `invalid_request` | `model` missing, blank, not a string or too long; `id` not a UUID; a count negative, above 2^40 or not an integer; the message naming the member |
 | `409` `conflict` | the `id` is a record of another session |
 | `409` `session_not_active` | the session has ended |
 
@@ -9816,7 +9817,8 @@ covers. The order is `started_at` and then `id`, newest first.
 Filters combine. A `status`, `credential_type`, `order` or `include_forks`
 outside its values, `include_forks` without `workspace`, a `run_id` that is
 not of the run id form, a `since` or `until` that is not RFC 3339, and a
-parameter given twice are `400` `invalid_request` naming the parameter. A
+filter parameter given twice are `400` `invalid_request` naming the
+parameter. A
 `workspace` the caller may not read, one that does not exist, or one a
 bound PAT's binding does not cover is `404` `not_found` (`workspace not
 found`).
