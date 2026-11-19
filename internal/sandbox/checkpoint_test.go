@@ -205,6 +205,49 @@ func TestCheckpoint_WritesNoChangeVersionOrOtherEventAndMovesItsRef(t *testing.T
 	}
 }
 
+// Git keeps no ref "a/b" beside a ref "a", so a branch of a later
+// checkpoint can clash with the ref of a branch an earlier one saved.
+func TestCheckpoint_ReplacesTheEarlierRefItsBranchClashesWith(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, earlier, later string }{
+		{"a branch below an earlier one", "feature", "feature/a"},
+		{"a branch above an earlier one", "feature/a", "feature"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := startCheckpointHub(t)
+			id, dir := h.workSandbox(t, nil)
+			h.cloneWork(t, dir)
+			branch := func(name string) string {
+				workGit(t, dir, "checkout", "--quiet", "-b", name, "t1")
+				head := commitWork(t, dir, name, map[string]string{"f": name + "\n"})
+				workGit(t, dir, "checkout", "--quiet", "t1")
+				return head
+			}
+			kept, earlier := branch("kept"), branch(tc.earlier)
+			if _, err := h.svc.Checkpoint(context.Background(), storedRecord(t, h.Hub, id), sandbox.SystemActor); err != nil {
+				t.Fatalf("the first Checkpoint: %v", err)
+			}
+			if refs := h.checkpointRefs(t, id); !maps.Equal(refs, map[string]string{"kept": kept, tc.earlier: earlier}) {
+				t.Fatalf("after the first checkpoint the refs are %v", refs)
+			}
+
+			workGit(t, dir, "branch", "--quiet", "-D", "kept", tc.earlier)
+			later := branch(tc.later)
+			cp, err := h.svc.Checkpoint(context.Background(), storedRecord(t, h.Hub, id), sandbox.SystemActor)
+			if err != nil {
+				t.Fatalf("the second Checkpoint: %v", err)
+			}
+			if want := []sandbox.CheckpointRef{{Branch: tc.later, SHA: later}}; !cp.OK || !slices.Equal(cp.Refs, want) {
+				t.Errorf("the second checkpoint is ok %v with refs %+v; want ok with %+v", cp.OK, cp.Refs, want)
+			}
+			if refs, want := h.checkpointRefs(t, id), map[string]string{"kept": kept, tc.later: later}; !maps.Equal(refs, want) {
+				t.Errorf("after the second checkpoint the refs are %v; want %v", refs, want)
+			}
+		})
+	}
+}
+
 func TestCheckpoint_WithoutARepositoryStoresNoRef(t *testing.T) {
 	t.Parallel()
 	h := startCheckpointHub(t)

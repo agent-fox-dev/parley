@@ -7960,7 +7960,12 @@ push: a bundle larger than it fails the checkpoint, `ok` false with
 `error` naming the maximum push size, and stores no ref (no limit when the
 key is `"0"`, its default). The refs are written to the workspace's repository directly: they
 are no version of a change and trigger nothing, and they live as long as
-the workspace (a fork's go with the fork). A checkpoint is limited to 5
+the workspace (a fork's go with the fork). Git keeps no ref `a/b` beside a
+ref `a`: when a branch of a later checkpoint clashes so with the ref of a
+branch an earlier checkpoint of the same sandbox saved (`feature/a` after
+`feature`, or the reverse), the earlier ref is deleted and the later one
+stored, and when the later refs cannot be stored the earlier ref is put
+back. A checkpoint is limited to 5
 minutes and stores its refs all at once or not at all. The sandbox's
 `checkpoint` member then holds the latest attempt:
 

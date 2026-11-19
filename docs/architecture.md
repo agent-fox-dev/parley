@@ -6918,7 +6918,10 @@ one byte more the download stops and the attempt fails, as a pack over
 the limit fails a push, so that a bundle never fills the hub's disk. It is fetched with
 `gitrepo.Repo.FetchBundle`, which sets the attempt's refs under
 `refs/parley/sandboxes/<id>/` in one ref transaction; earlier refs of
-other branches stay. The attempts of one sandbox take turns from the fetch
+other branches stay, but for one whose name clashes with a ref of the
+attempt as a directory and a file, which `FetchBundle` deletes in a
+transaction before (git refuses both in one) and puts back when the
+attempt's refs cannot be set. The attempts of one sandbox take turns from the fetch
 to the record (`Service.checkpointing`, a lock set apart from
 `Service.lifecycle`, which a stop or a deletion holds while it
 checkpoints), so the refs and the stored checkpoint are one attempt's. The files an attempt

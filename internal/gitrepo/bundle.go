@@ -15,13 +15,19 @@ import (
 // refs maps it to, all of them in one transaction of git's: they are set
 // together or not at all, and a ref that exists is moved.
 //
+// Git keeps no ref "a/b" beside a ref "a". A ref below the prefix replace
+// whose name clashes so with one of refs is deleted first, in a
+// transaction of its own, since git refuses both in one; when refs cannot
+// then be set, it is put back as it was. An empty replace deletes nothing,
+// and such a clash fails the fetch.
+//
 // Every id must be the tip of a ref of the bundle, so that git's fetch has
 // checked that the repository then holds all of its history; a bundle
 // whose prerequisite commits the repository lacks fails. The bundle's own
 // refs are written below a fresh namespace of the fetch's own, read and
 // removed, as FetchOrigin does with origin's (see fetchNamespace), so that
 // none of them outlives the fetch.
-func (r *Repo) FetchBundle(ctx context.Context, path string, refs map[string]string) error {
+func (r *Repo) FetchBundle(ctx context.Context, path string, refs map[string]string, replace string) error {
 	if len(refs) == 0 {
 		return errors.New("fetch a bundle: no ref to set")
 	}
@@ -55,10 +61,54 @@ func (r *Repo) FetchBundle(ctx context.Context, path string, refs map[string]str
 		}
 		fmt.Fprintf(&script, "update %s %s\n", ref, id)
 	}
+	clashing, err := r.clashing(ctx, replace, refs)
+	if err != nil {
+		return fmt.Errorf("read the refs below %s: %w", replace, err)
+	}
+	var removal, restore strings.Builder
+	for _, ref := range slices.Sorted(maps.Keys(clashing)) {
+		fmt.Fprintf(&removal, "delete %s %s\n", ref, clashing[ref])
+		fmt.Fprintf(&restore, "create %s %s\n", ref, clashing[ref])
+	}
+	if err := r.updateRefs(ctx, removal.String()); err != nil {
+		return fmt.Errorf("delete the refs that clash with the bundle's: %w", err)
+	}
 	if err := r.updateRefs(ctx, script.String()); err != nil {
-		return fmt.Errorf("set the refs of the bundle: %w", err)
+		err = fmt.Errorf("set the refs of the bundle: %w", err)
+		// The refs are put back also after ctx ended, as the namespace is
+		// removed then.
+		back, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		if rerr := r.updateRefs(back, restore.String()); rerr != nil {
+			err = fmt.Errorf("%w; put back the refs that clashed: %v", err, rerr)
+		}
+		return err
 	}
 	return nil
+}
+
+// clashing maps each ref below prefix whose name clashes with a ref of refs,
+// one naming a directory the other is in, to its object id; none for an
+// empty prefix.
+func (r *Repo) clashing(ctx context.Context, prefix string, refs map[string]string) (map[string]string, error) {
+	if prefix == "" {
+		return nil, nil
+	}
+	have, err := r.refs(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	clashing := map[string]string{}
+	for name, id := range have {
+		name = prefix + name
+		for ref := range refs {
+			if strings.HasPrefix(ref, name+"/") || strings.HasPrefix(name, ref+"/") {
+				clashing[name] = id
+				break
+			}
+		}
+	}
+	return clashing, nil
 }
 
 // fetchBundle fetches every ref of the bundle at path below ns, in one
