@@ -3,11 +3,11 @@
   "spec_id": "53",
   "spec_name": "event_webhooks",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-19T20:39:07Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

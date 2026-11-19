@@ -51,6 +51,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/session"
 	"github.com/agent-fox-dev/parley/internal/store"
 	"github.com/agent-fox-dev/parley/internal/telemetry"
+	"github.com/agent-fox-dev/parley/internal/webhook"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -94,6 +95,7 @@ var parts = []func(*Composition){
 	composeSessions,
 	composeTelemetry,
 	composeAudit,
+	composeWebhooks,
 	composeMetrics,
 }
 
@@ -228,6 +230,11 @@ type Composition struct {
 	// secrets is the secret component composeSecrets creates and binds in
 	// its start hook; the parts read and store secrets through it (Secrets).
 	secrets *secret.Component
+	// secretKeys are the operator's keys composeSecrets loads in its
+	// configuration check. The secret component does not hand them out, and
+	// the parts that seal a value of their own with secret.SealValue, such
+	// as the event webhooks' signing secrets, need them.
+	secretKeys secret.Keys
 
 	// workspaces is the workspace service composeWorkspaces creates and
 	// binds in its start hook, after workspaceAdjusters have changed its
@@ -339,6 +346,12 @@ type Composition struct {
 	// changed its dependencies (AdjustTelemetry).
 	telemetry          *telemetry.Component
 	telemetryAdjusters []func(*telemetry.Deps)
+
+	// webhooks is the event webhook component composeWebhooks creates and
+	// binds in its start hook (Webhooks), after webhookAdjusters have
+	// changed its dependencies (AdjustWebhooks).
+	webhooks         *webhook.Component
+	webhookAdjusters []func(*webhook.Deps)
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).
