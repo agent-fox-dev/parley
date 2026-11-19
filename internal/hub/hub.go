@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/audit"
 	"github.com/agent-fox-dev/parley/internal/awareness"
 	"github.com/agent-fox-dev/parley/internal/carrypatch"
 	"github.com/agent-fox-dev/parley/internal/change"
@@ -40,6 +41,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/jobs"
 	"github.com/agent-fox-dev/parley/internal/land"
 	"github.com/agent-fox-dev/parley/internal/maintenance"
+	"github.com/agent-fox-dev/parley/internal/metrics"
 	"github.com/agent-fox-dev/parley/internal/policy"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/scm"
@@ -91,6 +93,8 @@ var parts = []func(*Composition){
 	composeForge,
 	composeSessions,
 	composeTelemetry,
+	composeAudit,
+	composeMetrics,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -195,6 +199,16 @@ type Composition struct {
 	sandboxRecorder        sandbox.Recorder
 	sandboxAdjusters       []func(*sandbox.Deps)
 	sandboxPolicyCollector sandbox.PolicyCollectorOptions
+
+	// metrics is the hub's metrics registry (Metrics), and wrapHandler,
+	// when set, wraps the server's whole handler (server.Options.Wrap).
+	metrics     *metrics.Registry
+	wrapHandler func(http.Handler) http.Handler
+
+	// deliveryPruner is the store of event webhook deliveries the retention
+	// step webhook_deliveries prunes (RegisterDeliveryPruner); nil while
+	// none is registered.
+	deliveryPruner audit.DeliveryPruner
 
 	// identity is the identity service composeIdentity creates. A part
 	// that runs after it and keeps data for a user or an org registers its
@@ -337,10 +351,10 @@ type Composition struct {
 	env config.Env
 }
 
-func newComposition() *Composition {
+func newComposition(logger *slog.Logger) *Composition {
 	return &Composition{registry: config.NewRegistry(), tasks: maintenance.NewRegistry(), runtime: &Runtime{}, shutdown: make(chan struct{}),
 		refWriter: &pushrule.Writer{}, pushRules: &pushrule.Engine{}, receiver: &gitserver.Receiver{},
-		pushOptions: &gitserver.PushOptionsStage{}}
+		pushOptions: &gitserver.PushOptionsStage{}, metrics: metrics.New(logger)}
 }
 
 // Runtime returns the runtime the hub fills once the stores are open, before
@@ -698,7 +712,7 @@ func (r *run) fail(err error) int {
 // checks on it, then sets the logger's level and hands the scrubber the
 // configured secrets.
 func (r *run) configure() (*Composition, *config.Config, error) {
-	c := newComposition()
+	c := newComposition(r.logger)
 	c.env = r.opts.Env
 	if c.env == nil {
 		c.env = config.MapEnv(nil)
@@ -806,6 +820,7 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 	opts.Now = now
 	opts.Logger = r.logger
 	opts.VersionMembers = c.versionDocument
+	opts.Wrap = c.wrapHandler
 	opts.OnListen = func(bound net.Addr) {
 		for _, report := range c.startReports {
 			report(r.logger)

@@ -10,6 +10,13 @@
 // the path, validates the body and refuses an archived workspace, in that
 // order. Ingestion writes no hub event: telemetry is never part of the
 // event log.
+//
+// The records of a run are read back by GET routes under the same prefix,
+// which need the scope audit:read and read access to the workspace, in any
+// status. Five list one kind of record of the path's workspace and run,
+// filtered and paged; one answers the run's postmortem, and one the
+// transcript of a node, rebuilt from its trace records. Every query
+// parameter is checked before the store is read.
 package telemetry
 
 import (
@@ -55,9 +62,9 @@ func (c *Component) Bind(d Deps) {
 	c.deps = d
 }
 
-// Routes are the ingestion routes, for the server's router.
+// Routes are the ingestion and the read routes, for the server's router.
 func (c *Component) Routes() []server.Route {
-	return []server.Route{
+	return append([]server.Route{
 		c.ingest("/events", true, single(postRecord(c, runEvents, c.readRunEvent))),
 		c.ingest("/sessions/outcomes", true, single(postRecord(c, outcomes, c.readOutcome))),
 		c.ingest("/tools/calls", true, single(postRecord(c, toolCalls, c.readToolCall))),
@@ -66,5 +73,5 @@ func (c *Component) Routes() []server.Route {
 		c.ingest("/postmortem", true, single(c.postPostmortem)),
 		c.ingest("/events/batch", false, batch(c, runEvents, c.readRunEvent)),
 		c.ingest("/traces/batch", false, batch(c, traces, c.readTrace)),
-	}
+	}, c.readRoutes()...)
 }

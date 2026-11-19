@@ -43,7 +43,7 @@ func TestRun_RunsTheStartStagesInOrderAndListensLast(t *testing.T) {
 			<-releaseHook
 			return nil
 		})
-		c.AddMaintenanceTask("retention", func(ctx context.Context, _ *hub.Runtime) error {
+		c.AddMaintenanceTask("blocking_pass", func(ctx context.Context, _ *hub.Runtime) error {
 			log.add("pass")
 			select {
 			case <-releaseTask:
@@ -471,7 +471,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 			c.AddMaintenanceTask("failing_task", func(context.Context, *hub.Runtime) error {
 				return errors.New("deliveries unreachable at https://u:p@h/x")
 			})
-			c.AddMaintenanceTask("retention", insert("retention"))
+			c.AddMaintenanceTask("later_pass", insert("later_pass"))
 		},
 	})
 
@@ -492,7 +492,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 		return errs
 	}
 	eventually(t, "three passes with a failing task", func() bool {
-		return rows("retention") >= 3 && rows("recorded_pass") >= 3 && len(failures()) >= 3
+		return rows("later_pass") >= 3 && rows("recorded_pass") >= 3 && len(failures()) >= 3
 	})
 
 	for _, rec := range failures() {

@@ -12,12 +12,14 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
-// DB is the analytical store as the package's writes reach it: a
-// transaction, and a read outside one. SQL adapts the store's *sql.DB; a
-// test puts its own in Deps to make a write fail or block.
+// DB is the analytical store as the package reaches it: a transaction for
+// a write, and a read outside one, of one row or of a list of records. SQL
+// adapts the store's *sql.DB; a test puts its own in Deps to make a write
+// fail or block, or to watch the reads.
 type DB interface {
 	BeginTx(ctx context.Context) (Tx, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // Tx is a write transaction of DB; *sql.Tx satisfies it.
@@ -112,6 +114,10 @@ func (s sqlDB) QueryRowContext(ctx context.Context, query string, args ...any) *
 	return s.db.QueryRowContext(ctx, query, args...)
 }
 
+func (s sqlDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, query, args...)
+}
+
 // errWriteTimeout is a write that did not finish within the write limit:
 // the caller is told to send it again later.
 var errWriteTimeout = errors.New("the write did not finish within [audit].write_timeout")
@@ -160,22 +166,57 @@ func rollback(tx Tx) error {
 
 // kind is how the records of one kind are stored, each kind in a table of
 // its own keyed by the id in lower case, so that one id may name records of
-// two kinds: its name, for messages, the insert of a new record and the
-// read of the stored one by its id.
+// two kinds: its name, for messages, its table, the columns it holds after
+// the head, the destinations a record of the kind scans those columns
+// into, in their order, and the insert of a new record.
 type kind[R record] struct {
-	name   string
-	insert func(ctx context.Context, tx Tx, rec R) error
-	get    func(ctx context.Context, tx Tx, id string) (rec R, found bool, err error)
+	name    string
+	table   string
+	columns string
+	dest    func(rec *R) (h *head, dest []any)
+	insert  func(ctx context.Context, tx Tx, rec R) error
 }
 
 // The kinds of single records.
 var (
-	runEvents  = kind[runEvent]{name: "run event", insert: insertRunEvent, get: getRunEvent}
-	outcomes   = kind[outcome]{name: "session outcome", insert: insertOutcome, get: getOutcome}
-	toolCalls  = kind[toolCall]{name: "tool call", insert: insertToolCall, get: getToolCall}
-	toolErrors = kind[toolError]{name: "tool error", insert: insertToolError, get: getToolError}
-	traces     = kind[trace]{name: "trace record", insert: insertTrace, get: getTrace}
+	runEvents = kind[runEvent]{name: "run event", table: "run_events",
+		columns: "event_type, severity, node_id, session_id, payload",
+		dest: func(e *runEvent) (*head, []any) {
+			return &e.head, []any{&e.EventType, &e.Severity, &e.NodeID, &e.SessionID, jsonColumn{&e.Payload}}
+		},
+		insert: insertRunEvent}
+	outcomes = kind[outcome]{name: "session outcome", table: "session_outcomes",
+		columns: "session_id, status, node_id, duration_ms, token_usage",
+		dest: func(o *outcome) (*head, []any) {
+			return &o.head, []any{&o.SessionID, &o.Status, &o.NodeID, &o.DurationMS, jsonColumn{&o.TokenUsage}}
+		},
+		insert: insertOutcome}
+	toolCalls = kind[toolCall]{name: "tool call", table: "tool_calls",
+		columns: "tool_name, node_id, session_id, duration_ms, input, output",
+		dest: func(tc *toolCall) (*head, []any) {
+			return &tc.head, []any{&tc.ToolName, &tc.NodeID, &tc.SessionID, &tc.DurationMS, jsonColumn{&tc.Input}, jsonColumn{&tc.Output}}
+		},
+		insert: insertToolCall}
+	toolErrors = kind[toolError]{name: "tool error", table: "tool_errors",
+		columns: "tool_name, error_msg, error_code, node_id, session_id",
+		dest: func(te *toolError) (*head, []any) {
+			return &te.head, []any{&te.ToolName, &te.ErrorMsg, &te.ErrorCode, &te.NodeID, &te.SessionID}
+		},
+		insert: insertToolError}
+	traces = kind[trace]{name: "trace record", table: "traces",
+		columns: "event_type, node_id, session_id, sequence, data",
+		dest: func(tr *trace) (*head, []any) {
+			return &tr.head, []any{&tr.EventType, &tr.NodeID, &tr.SessionID, &tr.Sequence, jsonColumn{&tr.Data}}
+		},
+		insert: insertTrace}
 )
+
+// get reads the record id of the kind.
+func (k kind[R]) get(ctx context.Context, tx Tx, id string) (rec R, found bool, err error) {
+	h, dest := k.dest(&rec)
+	found, err = getRecord(ctx, tx, k.table, k.columns, id, h, dest...)
+	return rec, found, err
+}
 
 // storeOnce stores rec in tx unless its id names a stored record of the
 // kind k, and returns the record the id names: rec when it is new, which
@@ -201,63 +242,41 @@ func getRecord(ctx context.Context, tx Tx, table, columns, id string, h *head, d
 	return getRecordWhere(ctx, tx, table, columns, "id = ?", []any{id}, h, dest...)
 }
 
+// rowReader reads one row: a write transaction (Tx) or the store outside
+// one (DB).
+type rowReader interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // getRecordWhere is getRecord for the record of table that where, with the
-// arguments key, selects.
-func getRecordWhere(ctx context.Context, tx Tx, table, columns, where string, key []any, h *head, dest ...any) (found bool, err error) {
-	var ts, ingested string
-	err = tx.QueryRowContext(ctx, `SELECT id, workspace, run_id, timestamp, ingested_at, `+columns+` FROM `+table+` WHERE `+where, key...).
-		Scan(append([]any{&h.ID, &h.Workspace, &h.RunID, &ts, &ingested}, dest...)...)
+// arguments key, selects, read through q.
+func getRecordWhere(ctx context.Context, q rowReader, table, columns, where string, key []any, h *head, dest ...any) (found bool, err error) {
+	err = scanRecord(q.QueryRowContext(ctx, selectRecords(table, columns)+` WHERE `+where, key...).Scan, table, h, dest...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
-	}
-	t, err := time.Parse(storedLayout, ts)
-	if err != nil {
-		return false, fmt.Errorf("%s %s: timestamp %q: %w", table, h.ID, ts, err)
+	return err == nil, err
+}
+
+// selectRecords is the SELECT of the head and the columns named by columns
+// of the records of table, which scanRecord scans.
+func selectRecords(table, columns string) string {
+	return `SELECT id, workspace, run_id, timestamp, ingested_at, ` + columns + ` FROM ` + table
+}
+
+// scanRecord scans a row of selectRecords from table with scan: its head
+// into h and the columns after it into dest, in their order.
+func scanRecord(scan func(dest ...any) error, table string, h *head, dest ...any) error {
+	var ingested string
+	if err := scan(append([]any{&h.ID, &h.Workspace, &h.RunID, timeColumn{&h.Timestamp}, &ingested}, dest...)...); err != nil {
+		return err
 	}
 	at, err := time.Parse(time.RFC3339, ingested)
 	if err != nil {
-		return false, fmt.Errorf("%s %s: ingested_at %q: %w", table, h.ID, ingested, err)
+		return fmt.Errorf("%s %s: ingested_at %q: %w", table, h.ID, ingested, err)
 	}
-	h.Timestamp, h.IngestedAt = clientTime(t), timefmt.Time(at)
-	return true, nil
-}
-
-// getRunEvent reads the run event id.
-func getRunEvent(ctx context.Context, tx Tx, id string) (e runEvent, found bool, err error) {
-	found, err = getRecord(ctx, tx, "run_events", "event_type, severity, node_id, session_id, payload", id, &e.head,
-		&e.EventType, &e.Severity, &e.NodeID, &e.SessionID, jsonColumn{&e.Payload})
-	return e, found, err
-}
-
-// getOutcome reads the session outcome id.
-func getOutcome(ctx context.Context, tx Tx, id string) (o outcome, found bool, err error) {
-	found, err = getRecord(ctx, tx, "session_outcomes", "session_id, status, node_id, duration_ms, token_usage", id, &o.head,
-		&o.SessionID, &o.Status, &o.NodeID, &o.DurationMS, jsonColumn{&o.TokenUsage})
-	return o, found, err
-}
-
-// getToolCall reads the tool call id.
-func getToolCall(ctx context.Context, tx Tx, id string) (tc toolCall, found bool, err error) {
-	found, err = getRecord(ctx, tx, "tool_calls", "tool_name, node_id, session_id, duration_ms, input, output", id, &tc.head,
-		&tc.ToolName, &tc.NodeID, &tc.SessionID, &tc.DurationMS, jsonColumn{&tc.Input}, jsonColumn{&tc.Output})
-	return tc, found, err
-}
-
-// getToolError reads the tool error id.
-func getToolError(ctx context.Context, tx Tx, id string) (te toolError, found bool, err error) {
-	found, err = getRecord(ctx, tx, "tool_errors", "tool_name, error_msg, error_code, node_id, session_id", id, &te.head,
-		&te.ToolName, &te.ErrorMsg, &te.ErrorCode, &te.NodeID, &te.SessionID)
-	return te, found, err
-}
-
-// getTrace reads the trace record id.
-func getTrace(ctx context.Context, tx Tx, id string) (tr trace, found bool, err error) {
-	found, err = getRecord(ctx, tx, "traces", "event_type, node_id, session_id, sequence, data", id, &tr.head,
-		&tr.EventType, &tr.NodeID, &tr.SessionID, &tr.Sequence, jsonColumn{&tr.Data})
-	return tr, found, err
+	h.IngestedAt = timefmt.Time(at)
+	return nil
 }
 
 // storePostmortemOnce stores p in tx unless the workspace and run of p have
@@ -276,9 +295,10 @@ func storePostmortemOnce(ctx context.Context, tx Tx, p postmortem) (stored postm
 	return p, true, nil
 }
 
-// getPostmortem reads the postmortem of the run runID of workspace.
-func getPostmortem(ctx context.Context, tx Tx, workspace, runID string) (p postmortem, found bool, err error) {
-	found, err = getRecordWhere(ctx, tx, "postmortems",
+// getPostmortem reads the postmortem of the run runID of workspace through
+// q.
+func getPostmortem(ctx context.Context, q rowReader, workspace, runID string) (p postmortem, found bool, err error) {
+	found, err = getRecordWhere(ctx, q, "postmortems",
 		"schema_version, run_status, started_at, completed_at, task_summary, cost_summary, blocked_tasks, session_history",
 		"workspace = ? AND run_id = ?", []any{workspace, runID}, &p.head,
 		&p.SchemaVersion, &p.RunStatus, timeColumn{&p.StartedAt}, timeColumn{&p.CompletedAt},

@@ -123,10 +123,7 @@ func (c *Component) Expire(ctx context.Context, cutoff time.Time) (int64, error)
 	}
 	// Event times are whole seconds, so an event is not older than cutoff
 	// exactly when it is not older than cutoff rounded up to the second.
-	at := cutoff.UTC()
-	if whole := at.Truncate(time.Second); !whole.Equal(at) {
-		at = whole.Add(time.Second)
-	}
+	at := ceilSecond(cutoff)
 	var oldest int64
 	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		b, err := readBounds(ctx, tx)
@@ -173,13 +170,17 @@ func queryRecords(ctx context.Context, q Querier, after, upTo int64, limit int) 
 	if limit <= 0 {
 		limit = -1
 	}
-	rows, err := q.QueryContext(ctx, `
-SELECT seq, id, type, time, workspace, actor_type, actor_id, resource_type, resource_id, action, session_id,
-	metadata, parent_slug
+	rows, err := q.QueryContext(ctx, `SELECT `+recordColumns+`
 FROM hub_events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?`, after, upTo, limit)
 	if err != nil {
 		return nil, err
 	}
+	return scanRecords(rows)
+}
+
+// scanRecords reads every row of rows, selected as recordColumns, and
+// closes it.
+func scanRecords(rows *sql.Rows) ([]Record, error) {
 	defer rows.Close()
 	var recs []Record
 	for rows.Next() {
@@ -192,8 +193,12 @@ FROM hub_events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?`, after, upTo, l
 	return recs, rows.Err()
 }
 
-// scanRecord reads one row of hub_events in the column order of
-// queryRecords.
+// recordColumns are the columns of hub_events a read selects, in the order
+// scanRecord reads them.
+const recordColumns = `seq, id, type, time, workspace, actor_type, actor_id, resource_type, resource_id, action,
+	session_id, metadata, parent_slug`
+
+// scanRecord reads one row of hub_events in the order of recordColumns.
 func scanRecord(scan func(dest ...any) error) (Record, error) {
 	var rec Record
 	var stamp, meta string

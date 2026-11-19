@@ -6,6 +6,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/land"
+	"github.com/agent-fox-dev/parley/internal/metrics"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/scm"
 )
@@ -43,3 +44,18 @@ func SessionLinkersOf(c *Composition) SessionLinkers {
 // SandboxUseOf is sandboxUseOf: the operation of the sandbox component as
 // the telemetry part hands it to the recorder of sandbox use.
 var SandboxUseOf = sandboxUseOf
+
+// The sources and reporters connectProducers connects to the registry,
+// each built over the read or the recorder a test gives.
+var (
+	GitRequestsSource   = gitRequests
+	ChangesOpenSource   = changesOpen
+	ForksActiveSource   = forksActive
+	JobqueueDepthSource = jobqueueDepth
+	TokenReporter       = tokenReporter
+	LandReporter        = landReporter
+)
+
+// SCMRecorder is the request recorder of the source control API that
+// counts each request in rec.
+func SCMRecorder(rec metrics.Recorder) scm.Recorder { return scmRecorder{rec} }

@@ -82,7 +82,7 @@ It never quotes a variable's value.
 | `[forks].max_ttl` | string | `"30d"` | the longest `ttl` a task fork may ask for: a whole number followed by `s`, `m`, `h` or `d`, not shorter than `[forks].default_ttl` (equal is accepted). A requested `ttl` is judged by a stricter form than these two keys: a whole number above zero followed by `m`, `h` or `d`, from `5m` to `max_ttl` inclusive; the fork's `expires_at` is the instant of the request plus the `ttl`, in whole seconds UTC |
 | `[forks].max_per_workspace` | integer | `200` | how many task forks one workspace may have; at least `1` |
 | `[forks].expire_on_land` | boolean | `true` | let the sweep remove a task fork before its lifetime ends, once all its changes have landed or been abandoned, every own branch of it is the source of one of them, its last activity is at least 24 hours old and it has no sandbox `provisioning` or `ready` (see [api.md](api.md#expiry-of-a-task-fork)); `false` keeps every fork until its `expires_at`, and the sweep then asks nothing about a fork's changes. |
-| `[events].retention` | string | `"30d"` | how long an event stays in the event log, which `GET /api/v1/events` and `GET /api/v1/events/log` read from: a whole number followed by `s`, `m`, `h` or `d`, at least `1h` (see [api.md](api.md#get-apiv1events)). The hub's retention run applies it; that run is not built yet, and until it runs no event leaves the log |
+| `[events].retention` | string | `"30d"` | how long an event stays in the event log, which `GET /api/v1/events` and `GET /api/v1/events/log` read from: a whole number followed by `s`, `m`, `h` or `d`, at least `1h` (see [api.md](api.md#get-apiv1events)), and not longer than `[audit].max_age`: a longer value stops `parleyd` before it listens, with `events.retention (<value>) must not be longer than audit.max_age (<value>)`; equal values are accepted. The retention run's `event_log` step applies it, at start and every hour (see [Retention](#retention)) |
 | `[events].max_sse_connections` | integer | `500` | how many event streams (`GET /api/v1/events`) may be open at once; at least `1`. A stream beyond it is answered `503` with `Retry-After: 5`; held long-polls of `GET /api/v1/events/log` do not count (see [api.md](api.md#get-apiv1events)) |
 | `[git].timeout` | string | `"30m"` | how long one git request may take, from its arrival: on ref discovery or the fetch exchange, a task fork's copy of its parent's refs, waiting for another request's copy into the same fork included, and the run of `git upload-pack` share it; on the push exchange, the fork's copy and the push's work up to its ref transaction share it. A whole number followed by `s`, `m`, `h` or `d`, above zero. When it runs out during the copy, the request is answered `500 internal error`; during the run of `git upload-pack`, `git` is killed with every process it started, and the answer, if no pack data was sent yet, ends with the in-band error `ERR request timed out`; during a push before its ref transaction, the push's `git` processes are killed, its objects discarded, no ref moves and every ref is reported `unpack push timed out` with `ng <ref> unpacker error`; a push whose ref transaction has started is finished (see [api.md](api.md#git-over-http)) |
 | `[git].max_push_size` | string | `"0"` | the largest pack one push may send, counted after its commands and push options (after gzip decoding): `"0"` for no limit, a whole number of bytes such as `"104857600"`, or a whole number followed by `KB`, `MB` or `GB` (powers of 1024, any letter case) such as `"100MB"`. A pack of exactly the limit is accepted; at one byte more the hub stops reading, nothing changes, and every ref is reported `unpack pack exceeds the maximum push size` with `ng <ref> unpacker error`. `[server].max_body_size` does not apply to the git routes. The same limit holds the git bundle of a sandbox's checkpoint: a bundle larger than it fails the checkpoint, which stores no ref (see [api.md](api.md)) |
@@ -100,6 +100,13 @@ It never quotes a variable's value.
 | `[awareness].max_claim_ttl` | string | `"24h"` | the longest `ttl` a claim may ask for, at creation and at renewal: a whole number followed by `s`, `m`, `h` or `d`, above zero (`"0s"` is refused with `awareness.max_claim_ttl: must be longer than 0s`, a value that is not a duration with an error naming `awareness.max_claim_ttl`) |
 | `[awareness].max_claims_per_workspace` | integer | `1000` | how many active claims one workspace may hold (for a task fork, its parent, where its claims are stored); a further claim is answered `429` `claim_limit_reached`. At least `1`, else `awareness.max_claims_per_workspace: must be at least 1` stops `parleyd` before it listens. One session may hold at most 50 active claims, which no key changes |
 | `[audit].write_timeout` | string | `"2s"` | how long one write of agent telemetry may take, its wait for the analytical store's write lock included: the lookup and the insert of a single record, or the whole transaction of a batch. A whole number followed by `ms`, `s`, `m`, `h` or `d`, at least `100ms`; a smaller value stops `parleyd` before it listens, with `audit.write_timeout: must be at least 100ms`, and a value that is not such a duration with an error naming `audit.write_timeout`. A write that runs out is rolled back and answered `503` `unavailable` with `Retry-After: 5`, and nothing of the request is stored (see [api.md](api.md#agent-telemetry)); the hub's own record of sandbox use is held to it too |
+| `[audit].max_age` | string | `"90d"` | how long hub events, run events, session outcomes, tool calls and tool errors are kept: a whole number followed by `s`, `m`, `h` or `d`, at least `1d` (see [Retention](#retention)) |
+| `[audit].max_runs` | integer | `50` | how many runs with telemetry each workspace keeps: the run events, outcomes, tool calls, tool errors and traces of its older runs are deleted, its postmortems and sessions kept; at least `1` |
+| `[audit].trace_max_age` | string | `"30d"` | how long trace records are kept; a duration as for `max_age`, at least `1d` |
+| `[audit].postmortem_max_age` | string | `"180d"` | how long a postmortem is kept, counted from its `ingested_at`; at least `1d` |
+| `[audit].orphan_retention` | string | `"30d"` | how long the sessions, usage records, telemetry and hub events of a workspace that no longer exists are kept, each counted from its own time; at least `1d` |
+| `[sessions].max_age` | string | `"90d"` | how long an ended session and its usage records are kept, counted from its `started_at`; at least `1d`. An `active` session is never deleted by it |
+| `[sessions].max_active_age` | string | `"7d"` | how long a session may stay `active`, counted from its `started_at`: an older one is ended as `timeout` with `error_message` `session exceeded maximum active age`; at least `1h` |
 | `[secrets].key_file` | string | `""` | a file holding the current secret key, read only when `PARLEY_SECRETS_KEY` is unset or empty; a relative path is taken from the directory of `config.toml` (see [Secret keys](#secret-keys)) |
 
 `[database].path` and `[workspace].path`, set or not, are resolved to
@@ -395,6 +402,49 @@ remote helper cannot take `git` to another transport. A remote whose URL is
 not `https://`, `ssh://` or `[user@]host:path` (`http://`, `git://`,
 `file://`, a local path, `<helper>::<address>`) is refused before `git`
 starts.
+
+### Retention
+
+The keys of `[audit]` (other than `write_timeout`) and of `[sessions]` set
+how long the audit and session records are kept. The maintenance task
+`retention` applies them once right after the hub starts and then every
+hour, in eleven steps that always run in this order:
+
+| Step | What it does |
+|---|---|
+| `stale_sessions` | ends every `active` session started before now minus `[sessions].max_active_age` as `timeout`, with `ended_at` now, `error_message` `session exceeded maximum active age` and `duration_ms` from `started_at`; it writes no hub event |
+| `run_records` | deletes the run events, session outcomes, tool calls and tool errors whose `timestamp` is older than `[audit].max_age` |
+| `max_runs` | for each workspace with telemetry of more than `[audit].max_runs` runs, deletes the run events, outcomes, tool calls, tool errors and traces of its oldest runs; a run's age is its earliest such record, and of two runs equally old the lower `run_id` is the older. Postmortems and sessions are kept |
+| `traces` | deletes the trace records older than `[audit].trace_max_age` |
+| `postmortems` | deletes the postmortems ingested before now minus `[audit].postmortem_max_age` |
+| `sessions` | deletes the ended sessions started before now minus `[sessions].max_age`, with their usage records and links |
+| `event_log` | moves the start of the event log past the events older than `[events].retention`; they stay stored for `GET /api/v1/audit`, and a resume position before the new start is answered `410` `cursor_expired` |
+| `webhook_deliveries` | asks the event webhooks to delete their delivery records that are not `pending` and whose last attempt is more than 7 days old; nothing while no event webhook store is registered |
+| `hub_events` | deletes the hub events older than `[audit].max_age` |
+| `orphans` | deletes the sessions (whatever their status), usage records, telemetry of all six kinds and hub events of a workspace slug no workspace has (for a task fork's slug `<parent>--<name>`, only when the parent is gone too), once each is older than `[audit].orphan_retention` by its own time |
+| `gauges` | sets the metrics `parley_audit_records` and `parley_agent_sessions_active` from the stored records (see [api.md](api.md#get-metrics)) |
+
+A record is deleted only when it is strictly older than its limit: one
+whose time equals now minus the limit is kept. A hub event is deleted, by
+`hub_events` or by `orphans`, only once it has left the event log, so that
+the log never has a hole: an event still in the log stays until a later run
+after `event_log` has moved past it (an `[audit].orphan_retention` shorter
+than `[events].retention` keeps an orphan's events for `[events].retention`).
+The event with the highest `seq` is never deleted and never leaves the event
+log, whatever its age, and a hub event without a workspace is never an
+orphan.
+
+A step that fails or panics is logged as `retention step failed` with its
+`step`, counted in `parley_retention_errors_total{step}`, and the next step
+runs; the task then fails, naming the failed steps. Only a run in which
+every step succeeded sets `parley_retention_last_run_timestamp_seconds` to
+the time it ended. A stop of the hub ends the run before its next step.
+
+A retention value that is not such a duration stops `parleyd` before it
+listens, with an error naming the key as `section.key` (`audit.max_age:
+must be a duration with a unit of s, m, h or d, such as 90d: …`); one below
+its minimum with `audit.max_age: must be at least 1d` (`at least 1h` for
+`sessions.max_active_age`, `at least 1` for `audit.max_runs`).
 
 ### Fixed values
 

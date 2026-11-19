@@ -66,25 +66,17 @@ const maxTypes = 20
 
 // parseFilter reads the filters workspace, types and session_id from q, and
 // refuses a malformed one with 400 invalid_request before any event is
-// read: a types value that is empty, has an empty entry, has more than
-// maxTypes entries or has an entry with * anywhere but last, and a
-// session_id that is not a UUID.
+// read: a types value ParseTypes refuses, and a session_id that is not a
+// UUID.
 func parseFilter(q url.Values) (filter, error) {
 	var f filter
 	f.Workspace = q.Get("workspace")
 	if q.Has("types") {
-		f.Types = strings.Split(q.Get("types"), ",")
-		if len(f.Types) > maxTypes {
-			return filter{}, server.InvalidRequest(fmt.Sprintf("types has more than %d entries", maxTypes))
+		types, err := ParseTypes(q.Get("types"))
+		if err != nil {
+			return filter{}, err
 		}
-		for _, entry := range f.Types {
-			if entry == "" {
-				return filter{}, server.InvalidRequest("types has an empty entry")
-			}
-			if i := strings.IndexByte(entry, '*'); i >= 0 && i != len(entry)-1 {
-				return filter{}, server.InvalidRequest(fmt.Sprintf("types entry %q has a * that is not its last character", entry))
-			}
-		}
+		f.Types = types
 	}
 	if q.Has("session_id") {
 		id := q.Get("session_id")
@@ -94,6 +86,26 @@ func parseFilter(q url.Values) (filter, error) {
 		f.SessionID = strings.ToLower(id)
 	}
 	return f, nil
+}
+
+// ParseTypes reads the value of a types filter: comma-separated entries,
+// each an exact type or a prefix ending in *. It refuses with 400
+// invalid_request a value that is empty, has an empty entry, has more than
+// maxTypes entries or has an entry with * anywhere but last.
+func ParseTypes(value string) ([]string, error) {
+	types := strings.Split(value, ",")
+	if len(types) > maxTypes {
+		return nil, server.InvalidRequest(fmt.Sprintf("types has more than %d entries", maxTypes))
+	}
+	for _, entry := range types {
+		if entry == "" {
+			return nil, server.InvalidRequest("types has an empty entry")
+		}
+		if i := strings.IndexByte(entry, '*'); i >= 0 && i != len(entry)-1 {
+			return nil, server.InvalidRequest(fmt.Sprintf("types entry %q has a * that is not its last character", entry))
+		}
+	}
+	return types, nil
 }
 
 // parsePosition reads a resume position given as name: a non-negative
@@ -156,11 +168,11 @@ func (c *Component) coverage() Coverage {
 	return c.injected.coverage
 }
 
-// errWorkspaceNotFound refuses a workspace filter the caller may not read.
+// ErrWorkspaceNotFound refuses a workspace filter the caller may not read.
 // It is the access rule's answer for a workspace route, so that an existing
 // workspace the caller cannot read and a slug with no workspace answer the
-// same bytes.
-var errWorkspaceNotFound = server.NotFound("workspace not found")
+// same bytes. It is one value, which errors.Is recognises.
+var ErrWorkspaceNotFound = server.NotFound("workspace not found")
 
 // checkWorkspace refuses the workspace filter slug unless caller may read
 // the workspace: the admin token may read every slug, a deleted
@@ -175,25 +187,33 @@ func (c *Component) checkWorkspace(ctx context.Context, caller Caller, slug stri
 	if caller.Bound() {
 		cov := c.coverage()
 		if cov == nil {
-			return errWorkspaceNotFound
+			return ErrWorkspaceNotFound
 		}
 		ok, err := cov.Covers(ctx, caller, slug)
 		if err != nil {
 			return fmt.Errorf("check the workspace filter %s: read the token's covered set: %w", slug, err)
 		}
 		if !ok {
-			return errWorkspaceNotFound
+			return ErrWorkspaceNotFound
 		}
 	}
 	if c.deps.Access == nil {
-		return errWorkspaceNotFound
+		return ErrWorkspaceNotFound
 	}
 	level, _, found, err := c.deps.Access.Level(ctx, caller.accessCaller(), slug)
 	if err != nil {
 		return fmt.Errorf("check the workspace filter %s: %w", slug, err)
 	}
 	if !found || level == access.LevelNone {
-		return errWorkspaceNotFound
+		return ErrWorkspaceNotFound
 	}
 	return nil
+}
+
+// CheckWorkspace is the workspace filter rule of GET /events and GET
+// /events/log, for another query that filters hub events by workspace: nil
+// when caller may read slug, ErrWorkspaceNotFound when it may not, and any
+// other error when the rule could not be read.
+func (c *Component) CheckWorkspace(ctx context.Context, caller Caller, slug string) error {
+	return c.checkWorkspace(ctx, caller, slug)
 }

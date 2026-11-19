@@ -139,6 +139,8 @@ type world struct {
 	alicePAT                   string
 
 	runs, ids atomic.Int64
+	// reads counts the reads of records from the analytical store.
+	reads atomic.Int64
 }
 
 // newWorld starts the world's hub; each adjust changes the telemetry
@@ -156,7 +158,7 @@ func newWorldTOML(t *testing.T, toml string, adjust ...func(*telemetry.Deps)) *w
 	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, TOML: toml, Compose: func(c *hub.Composition) {
 		w.telemetry = c.Telemetry()
 		c.AdjustTelemetry(func(d *telemetry.Deps) {
-			d.DB = faultDB{DB: d.DB, fail: &w.failWrites, failThird: &w.failThirdInsert, block: &w.blockWrites}
+			d.DB = faultDB{DB: d.DB, fail: &w.failWrites, failThird: &w.failThirdInsert, block: &w.blockWrites, reads: &w.reads}
 		})
 		for _, a := range adjust {
 			c.AdjustTelemetry(a)
@@ -367,10 +369,19 @@ const blockLimit = 5 * time.Second
 // failThird is set, the third insert of the next transaction that makes
 // three fails, and failThird is cleared; while block is set, every
 // statement of a write transaction waits until its context ends (at most
-// blockLimit) and then fails.
+// blockLimit) and then fails. reads, when set, counts the reads of
+// records.
 type faultDB struct {
 	telemetry.DB
 	fail, failThird, block *atomic.Bool
+	reads                  *atomic.Int64
+}
+
+func (f faultDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if f.reads != nil {
+		f.reads.Add(1)
+	}
+	return f.DB.QueryContext(ctx, query, args...)
 }
 
 func (f faultDB) BeginTx(ctx context.Context) (telemetry.Tx, error) {
