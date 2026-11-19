@@ -285,8 +285,6 @@ func TestDeliveryPruning_ReportsTheStoresErrorAndPrunesAtTheNextPass(t *testing.
 	t.Parallel()
 	lw := newLogWorld(t, hubtest.Config{MaintenanceInterval: passInterval})
 	now := deliveryTime.Add(8 * day)
-	lw.recordAt(t, deliveryTime, "demo", "old", "ping", []byte(`{}`))
-	lw.recordAt(t, now.Add(-time.Hour), "demo", "recent", "ping", []byte(`{}`))
 	exec := func(stmt string) {
 		t.Helper()
 		if err := lw.Store.Tx(context.Background(), func(tx *sql.Tx) error {
@@ -296,8 +294,12 @@ func TestDeliveryPruning_ReportsTheStoresErrorAndPrunesAtTheNextPass(t *testing.
 			t.Fatalf("%s: %v", stmt, err)
 		}
 	}
-	// The trigger makes every delete of a delivery fail.
+	// The trigger makes every delete of a delivery fail. It comes before the
+	// deliveries: once the clock reads the time of recent, old is past the
+	// retention, and a pass that ran before the trigger would delete it.
 	exec(`CREATE TRIGGER deliveries_locked BEFORE DELETE ON forge_deliveries BEGIN SELECT RAISE(ABORT, 'deliveries are locked'); END`)
+	lw.recordAt(t, deliveryTime, "demo", "old", "ping", []byte(`{}`))
+	lw.recordAt(t, now.Add(-time.Hour), "demo", "recent", "ping", []byte(`{}`))
 	lw.clock.set(now)
 
 	waitUntil(t, "the pruning task's failure in the log", func() bool {
