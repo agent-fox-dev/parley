@@ -32,13 +32,21 @@ func TestNormaliseTimestamp_AnyOffsetBecomesUTCCutToMicroseconds(t *testing.T) {
 		{"2026-01-02T03:04:05Z", "2026-01-02T03:04:05Z"},
 		{"2026-01-01T22:04:05-05:00", "2026-01-02T03:04:05Z"},
 		{"2026-01-02T03:04:05.0000009Z", "2026-01-02T03:04:05Z"},
+		{"9999-12-31T23:59:59.999999Z", "9999-12-31T23:59:59.999999Z"},
+		{"0000-01-01T00:30:00-01:00", "0000-01-01T01:30:00Z"},
 	}
 	for _, c := range cases {
 		if got, ok := telemetry.NormaliseTimestamp(c.in); !ok || got != c.want {
 			t.Errorf("NormaliseTimestamp(%q) = %q, %v, want %q", c.in, got, ok, c.want)
 		}
 	}
-	for _, bad := range []string{"", "2026-01-02 03:04:05", "2026-01-02", "yesterday", "2026-01-02T03:04:05"} {
+	for _, bad := range []string{
+		"", "2026-01-02 03:04:05", "2026-01-02", "yesterday", "2026-01-02T03:04:05",
+		// In UTC, these fall after the year 9999 and before the year 0000.
+		"9999-12-31T23:59:59-01:00", "0000-01-01T00:30:00+01:00",
+		// RFC 3339 separates the fraction of a second with a full stop only.
+		"2026-01-02T03:04:05,5Z",
+	} {
 		if got, ok := telemetry.NormaliseTimestamp(bad); ok {
 			t.Errorf("NormaliseTimestamp(%q) = %q, want refused", bad, got)
 		}
@@ -55,7 +63,7 @@ func TestCount_TakesWholeNumbersOfAtLeastZero(t *testing.T) {
 	if got, err := telemetry.Count("null"); err != nil || got != nil {
 		t.Errorf("Count(null) = %v, %v, want absent", got, err)
 	}
-	for _, raw := range []string{"-1", "1.5", `"3"`, "true", "{}"} {
+	for _, raw := range []string{"-1", "-0", "1.5", `"3"`, "true", "{}"} {
 		if _, err := telemetry.Count(raw); err == nil || !strings.Contains(err.Error(), "duration_ms") {
 			t.Errorf("Count(%s) = %v, want an error naming the member", raw, err)
 		}

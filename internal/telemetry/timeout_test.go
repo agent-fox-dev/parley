@@ -1,6 +1,8 @@
 package telemetry_test
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -70,6 +72,65 @@ func TestWriteTimeout(t *testing.T) {
 		}
 		if ans.Accepted != 3 || ans.Duplicates != 0 || ans.Errors == nil || len(ans.Errors) != 0 {
 			t.Errorf("batch after recovery = %s, want {accepted: 3, duplicates: 0, errors: []}", body)
+		}
+	})
+
+	t.Run("a write that waits past the limit for another writer's lock is refused as unavailable and stores nothing", func(t *testing.T) {
+		w.blockWrites.Store(false)
+		ctx := context.Background()
+		db := w.Store.Analytics()
+		holder, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		release := func() {
+			_, _ = holder.ExecContext(ctx, "ROLLBACK")
+			_ = holder.Close()
+		}
+		defer release()
+		if _, err := holder.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			t.Fatalf("take the write lock: %v", err)
+		}
+
+		run := w.freshRun()
+		start := time.Now()
+		status, header, body := w.Exchange(t, http.MethodPost, "/api/v1/workspaces/"+demo+"/runs/"+run+"/events",
+			w.aliceKey, map[string]any{"event_type": "e"}, nil)
+		elapsed := time.Since(start)
+		release()
+
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("status = %d %s, want 503", status, body)
+		} else if typ, _ := errorOf(t, body); typ != "unavailable" {
+			t.Errorf("error_type = %q, want unavailable", typ)
+		}
+		if got := header.Get("Retry-After"); got != "5" {
+			t.Errorf("Retry-After = %q, want 5", got)
+		}
+		if elapsed >= 2*time.Second {
+			t.Errorf("answered after %s, want within 2s", elapsed)
+		}
+		if n := w.count(t, `SELECT COUNT(*) FROM run_events WHERE run_id = ?`, run); n != 0 {
+			t.Errorf("%d run events of the run stored, want none", n)
+		}
+
+		// Every connection of the store's pool still waits as long as it
+		// did for a lock.
+		conns := make([]*sql.Conn, db.Stats().OpenConnections+1)
+		for i := range conns {
+			if conns[i], err = db.Conn(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer conns[i].Close()
+		}
+		for i, c := range conns {
+			var ms int
+			if err := c.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&ms); err != nil {
+				t.Fatal(err)
+			}
+			if ms != 10000 {
+				t.Errorf("connection %d of the pool has a busy timeout of %d ms, want 10000", i, ms)
+			}
 		}
 	})
 }

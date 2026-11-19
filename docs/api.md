@@ -9901,13 +9901,16 @@ that was not sent being `null`.
 - `timestamp`: RFC 3339 with any offset, returned in UTC with `Z`, its
   fraction cut to microseconds and without trailing zeros
   (`2026-01-02T05:04:05.1234567+02:00` is returned as
-  `2026-01-02T03:04:05.123456Z`); the hub's time when absent.
+  `2026-01-02T03:04:05.123456Z`); the hub's time when absent. Its year in
+  UTC must be `0000` to `9999` (`9999-12-31T23:59:59-01:00` is refused),
+  and a fraction of a second takes a full stop, not a comma
+  (`2026-01-02T03:04:05,5Z` is refused).
 - `ingested_at`: the hub's time, in whole seconds.
 - `session_id`: a UUID, returned in lower case; it is not checked against
   the stored sessions.
 - `node_id` and `tool_name`: strings of at most 255 characters.
-- `duration_ms` and `sequence`: whole numbers of at least `0`; a fraction
-  or a string is refused.
+- `duration_ms` and `sequence`: whole numbers of at least `0`; a fraction,
+  a string or a minus sign (also `-0`) is refused.
 - `payload`, `token_usage`, `input`, `output` and `data`: stored and
   returned as JSON, never as a string holding JSON; `payload` must be an
   object, the others may be any JSON value.
@@ -9975,7 +9978,7 @@ Stores the one postmortem of a run in a workspace. The body:
 | Member | Value |
 |---|---|
 | `run_status` | required: `stalled`, `block_limit`, `cost_limit` or `session_limit` |
-| `started_at`, `completed_at` | required, RFC 3339, returned like `timestamp`; their order is not checked |
+| `started_at`, `completed_at` | required, RFC 3339 under the rules of `timestamp`, returned like it; their order is not checked |
 | `task_summary` | required, a JSON object whose key `total` is present and not `null` |
 | `cost_summary` | required, a JSON object |
 | `blocked_tasks`, `session_history` | JSON arrays, `[]` when absent |

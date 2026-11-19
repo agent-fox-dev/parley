@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,12 +28,85 @@ type Tx interface {
 	Rollback() error
 }
 
-// SQL is db as a DB.
+// SQL is db as a DB. A transaction it begins under a context with a
+// deadline waits for the store's write lock until that deadline at most.
+// Beginning one takes the lock, and while another connection holds it
+// SQLite waits in its busy handler, up to the connection's busy timeout,
+// without looking at the context: so the transaction gets a connection of
+// its own whose busy timeout is cut to the time left, for as long as the
+// transaction lasts, and the connection goes back to the pool with the
+// busy timeout it had.
 func SQL(db *sql.DB) DB { return sqlDB{db} }
 
 type sqlDB struct{ db *sql.DB }
 
-func (s sqlDB) BeginTx(ctx context.Context) (Tx, error) { return s.db.BeginTx(ctx, nil) }
+func (s sqlDB) BeginTx(ctx context.Context) (Tx, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return s.db.BeginTx(ctx, nil)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var was int64
+	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&was); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
+	// Rounded up, so that a wait the busy timeout ends ends at the deadline
+	// or after it, and is then told from other failures as one the limit
+	// ended.
+	left := int64((time.Until(deadline) + time.Millisecond - 1) / time.Millisecond)
+	t := &connTx{conn: conn}
+	if left < was {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, max(left, 1))); err != nil {
+			return nil, errors.Join(err, discard(conn))
+		}
+		t.restore = fmt.Sprintf(`PRAGMA busy_timeout = %d`, was)
+	}
+	if t.Tx, err = conn.BeginTx(ctx, nil); err != nil {
+		return nil, errors.Join(err, t.release())
+	}
+	return t, nil
+}
+
+// connTx is a transaction of SQL on a connection of its own, which it gives
+// back to the pool when it ends, with the busy timeout restore sets, when
+// it is not empty.
+type connTx struct {
+	*sql.Tx
+	conn    *sql.Conn
+	restore string
+}
+
+func (t *connTx) Commit() error   { return errors.Join(t.Tx.Commit(), t.release()) }
+func (t *connTx) Rollback() error { return errors.Join(t.Tx.Rollback(), t.release()) }
+
+// release gives the connection back to the pool once; a connection whose
+// busy timeout cannot be restored is discarded instead, so that no other
+// user of the pool waits for a lock less than it expects.
+func (t *connTx) release() error {
+	conn := t.conn
+	if conn == nil {
+		return nil
+	}
+	t.conn = nil
+	if t.restore != "" {
+		if _, err := conn.ExecContext(context.Background(), t.restore); err != nil {
+			return errors.Join(err, discard(conn))
+		}
+	}
+	return conn.Close()
+}
+
+// discard closes conn without giving it back to the pool.
+func discard(conn *sql.Conn) error {
+	err := conn.Raw(func(any) error { return driver.ErrBadConn })
+	if errors.Is(err, driver.ErrBadConn) {
+		return nil
+	}
+	return err
+}
 
 func (s sqlDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	return s.db.QueryRowContext(ctx, query, args...)

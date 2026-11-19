@@ -5296,13 +5296,21 @@ dependencies with `AdjustTelemetry`; the component is `Telemetry()`.
   routes are creating `POST`s (`single`); the two batch routes are not.
 - **One reader per kind.** `fields` (`validate.go`) reads a body member by
   member, a violation being `400 invalid_request` whose message starts with
-  the member's name; `readHead` gives every kind its `id` and `timestamp`
-  defaults, and the readers of run events and traces serve the single
-  routes and the batches alike.
+  the member's name; `readHead` gives every kind but the postmortem its
+  `id` and `timestamp` defaults (the postmortem's reader builds its own
+  head, with a generated id and the hub's time, whatever the body sends),
+  and the readers of run events and traces serve the single routes and the
+  batches alike.
 - **One write.** `(*Component).write` (`store.go`) runs one transaction of
   the analytical store under `context.WithTimeout` of the write limit and
   rolls it back on any failure; a failure whose limit's context has ended
-  counts as a timeout whatever its text. The analytical store's `BEGIN`
+  counts as a timeout whatever its text. SQLite waits for another
+  connection's write lock in its busy handler without looking at the
+  context, so `SQL`, the adapter over `*sql.DB`, begins each transaction
+  on a connection of its own whose `busy_timeout` it cuts to the time left
+  and restores before the connection goes back to the pool (a connection
+  it cannot restore is discarded): the wait for the lock ends with the
+  limit too. The analytical store's `BEGIN`
   takes the write lock (`IMMEDIATE`), so `storeOnce`, which reads an id and
   inserts the record only when it is new, stores each id once however
   many requests race: the others read what it stored. A replay is answered
@@ -5326,7 +5334,9 @@ dependencies with `AdjustTelemetry`; the component is `Telemetry()`.
 - **Run event observers.** `OnRunEvent(RunEventObserver)` registers a
   function told the `event_type` of every run event newly stored, by a
   single route, a batch or the recorder, after the write has committed
-  (`observer.go`); nothing else is reported. No part registers one yet:
+  (`observer.go`); nothing else is reported. An observer that panics is
+  logged with the event type and the next one is called, so the answer
+  does not depend on it. No part registers one yet:
   the metrics of the audit records will.
 
 ### Carry-patch workspaces

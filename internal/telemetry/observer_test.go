@@ -3,13 +3,16 @@ package telemetry_test
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/telemetry"
 )
 
@@ -66,12 +69,14 @@ func (o *observer) early() (unstored []string, readFails []error) {
 // TestRunEventObservers registers two observers on the hub's telemetry
 // component, whose session lookup knows s1 (a session of someRunID) and s2
 // (a session of no run), with a write limit short enough for a blocked write
-// to end quickly.
+// to end quickly, and whose log the test reads.
 func TestRunEventObservers(t *testing.T) {
 	t.Parallel()
+	log := &hubtest.LogBuffer{}
 	w := newWorld(t, func(d *telemetry.Deps) {
 		d.Sessions = knownSessions
 		d.WriteTimeout = 250 * time.Millisecond
+		d.Logger = slog.New(slog.NewTextHandler(log, nil))
 	})
 	first, second := &observer{db: w.Store.Analytics()}, &observer{db: w.Store.Analytics()}
 	w.telemetry.OnRunEvent(first.observe)
@@ -163,5 +168,46 @@ func TestRunEventObservers(t *testing.T) {
 				t.Errorf("observer was told %v, want nothing", got)
 			}
 		})
+	})
+
+	// Registered last: the observer that panics stays registered.
+	t.Run("an observer that panics is logged, and the request and the observers after it go on", func(t *testing.T) {
+		w.telemetry.OnRunEvent(func(eventType string) { panic("the observer broke on " + eventType) })
+		after := &observer{db: w.Store.Analytics()}
+		w.telemetry.OnRunEvent(after.observe)
+		run := w.freshRun()
+		cases := []struct {
+			name  string
+			path  string
+			body  any
+			want  int
+			types []string
+		}{
+			{"a run event", "/events", map[string]any{"event_type": "panicked.single"}, http.StatusCreated, []string{"panicked.single"}},
+			{"a batch of run events", "/events/batch",
+				[]any{map[string]any{"event_type": "panicked.a"}, map[string]any{"event_type": "panicked.b"}}, http.StatusOK,
+				[]string{"panicked.a", "panicked.b"}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				n := after.told()
+				if status, body := w.post(t, w.alicePAT, demo, run, tc.path, tc.body); status != tc.want {
+					t.Fatalf("status = %d %s, want %d", status, body, tc.want)
+				}
+				if got := after.since(n); !reflect.DeepEqual(got, tc.types) {
+					t.Errorf("the observer after the one that panics was told %v, want %v", got, tc.types)
+				}
+				for _, typ := range tc.types {
+					if n := w.count(t, `SELECT COUNT(*) FROM run_events WHERE run_id = ? AND event_type = ?`, run, typ); n != 1 {
+						t.Errorf("%d run events %s stored, want 1", n, typ)
+					}
+					if !slices.ContainsFunc(strings.Split(log.String(), "\n"), func(line string) bool {
+						return strings.Contains(line, "level=ERROR") && strings.Contains(line, "event_type="+typ)
+					}) {
+						t.Errorf("no error logged naming event_type %s; log:\n%s", typ, log.String())
+					}
+				}
+			})
+		}
 	})
 }

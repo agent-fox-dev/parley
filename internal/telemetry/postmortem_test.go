@@ -165,6 +165,8 @@ func TestPostmortem(t *testing.T) {
 			{"started_at removed", map[string]any{"started_at": nil}, "started_at"},
 			{"completed_at removed", map[string]any{"completed_at": nil}, "completed_at"},
 			{"completed_at now", map[string]any{"completed_at": "now"}, "completed_at"},
+			{"started_at after the year 9999 in UTC", map[string]any{"started_at": "9999-12-31T23:59:59-01:00"}, "started_at"},
+			{"completed_at before the year 0000 in UTC", map[string]any{"completed_at": "0000-01-01T00:30:00+01:00"}, "completed_at"},
 			{"task_summary removed", map[string]any{"task_summary": nil}, "task_summary"},
 			{"task_summary an array", map[string]any{"task_summary": []any{}}, "task_summary"},
 			{"task_summary without total", map[string]any{"task_summary": map[string]any{}}, "task_summary"},

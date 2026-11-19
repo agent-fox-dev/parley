@@ -1,6 +1,9 @@
 package telemetry
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // RunEventObserver is told the event_type of a run event once it is stored.
 type RunEventObserver func(eventType string)
@@ -16,8 +19,9 @@ type runEventObservers struct {
 // sandbox use, after the write has committed. It is never called for a
 // replay, a duplicate, an invalid item, a refused request, a write that
 // failed or ran out of time, or a record of another kind, so that what it
-// counts is what the store holds. It is safe to call at any time, also
-// while requests are served.
+// counts is what the store holds. A panic of obs is logged and changes
+// nothing else. It is safe to call at any time, also while requests are
+// served.
 func (c *Component) OnRunEvent(obs RunEventObserver) {
 	c.observers.mu.Lock()
 	defer c.observers.mu.Unlock()
@@ -33,12 +37,26 @@ func (c *Component) stored(rec record) {
 	}
 }
 
-// notifyRunEvent calls every registered observer with eventType.
+// notifyRunEvent calls every registered observer with eventType. An
+// observer that panics is logged and the next is called all the same: the
+// record is stored by then, so its answer, and what the other observers
+// count, must not depend on one observer.
 func (c *Component) notifyRunEvent(eventType string) {
 	c.observers.mu.Lock()
 	list := c.observers.list
 	c.observers.mu.Unlock()
 	for _, obs := range list {
-		obs(eventType)
+		c.observe(obs, eventType)
 	}
+}
+
+// observe calls obs with eventType and logs its panic, with the event type
+// and nothing else of the record.
+func (c *Component) observe(obs RunEventObserver, eventType string) {
+	defer func() {
+		if p := recover(); p != nil {
+			c.deps.Logger.Error("a run event observer panicked", "event_type", eventType, "panic", fmt.Sprint(p))
+		}
+	}()
+	obs(eventType)
 }

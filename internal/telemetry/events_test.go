@@ -137,6 +137,8 @@ func TestRunEvents(t *testing.T) {
 			{map[string]any{"event_type": "x", "session_id": "abc"}, "session_id"},
 			{map[string]any{"event_type": "x", "timestamp": "2026-01-02 03:04:05"}, "timestamp"},
 			{map[string]any{"event_type": "x", "timestamp": 1767323045}, "timestamp"},
+			{map[string]any{"event_type": "x", "timestamp": "9999-12-31T23:59:59-01:00"}, "timestamp"},
+			{map[string]any{"event_type": "x", "timestamp": "2026-01-02T03:04:05,5Z"}, "timestamp"},
 			{map[string]any{"event_type": "x", "node_id": strings.Repeat("n", 256)}, "node_id"},
 			{map[string]any{"event_type": "x", "payload": []int{1}}, "payload"},
 			{map[string]any{"event_type": "x", "payload": "text"}, "payload"},

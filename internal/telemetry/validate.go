@@ -118,19 +118,21 @@ func (f fields) timestamp(name string) (*time.Time, error) {
 	}
 	t, ok := parseTimestamp(*s)
 	if !ok {
-		return nil, invalid(name, "must be an RFC 3339 timestamp")
+		return nil, invalid(name, "must be an RFC 3339 timestamp whose year in UTC is 0000 to 9999")
 	}
 	return &t, nil
 }
 
 // count reads the member name as a whole number of at least 0, nil when
-// absent. A fraction, an exponent and a number in a string are refused.
+// absent. A fraction, an exponent, a number in a string and a minus sign,
+// also before 0, are refused.
 func (f fields) count(name string) (*int64, error) {
 	if f.absent(name) {
 		return nil, nil
 	}
-	n, err := strconv.ParseInt(string(f[name]), 10, 64)
-	if err != nil || n < 0 {
+	raw := string(f[name])
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || strings.HasPrefix(raw, "-") {
 		return nil, invalid(name, "must be a whole number of at least 0")
 	}
 	return &n, nil
@@ -200,13 +202,23 @@ func newID() string {
 
 // parseTimestamp reads the client timestamp s, RFC 3339 with any offset,
 // as an instant in UTC, cut to the microsecond: the precision a stored
-// timestamp keeps.
+// timestamp keeps. It refuses a fraction of a second after a comma, which
+// time.Parse takes and RFC 3339 does not, and an instant whose year in UTC
+// is not 0000 to 9999, which storedLayout cannot hold in its four digits
+// and so could not be read back.
 func parseTimestamp(s string) (time.Time, bool) {
+	if strings.Contains(s, ",") {
+		return time.Time{}, false
+	}
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
 		return time.Time{}, false
 	}
-	return t.UTC().Truncate(time.Microsecond), true
+	t = t.UTC().Truncate(time.Microsecond)
+	if y := t.Year(); y < 0 || y > 9999 {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // storedLayout is the form a timestamp is stored in: fixed width, so that
