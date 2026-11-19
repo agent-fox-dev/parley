@@ -58,7 +58,7 @@ var sandboxStringFlags = []struct{ flag, member, usage string }{
 // newSandboxCommand builds parley sandbox: the hub's sandboxes and the
 // profiles they are created from.
 func newSandboxCommand() *cobra.Command {
-	sandbox := group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles",
+	sandbox := group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, list their profiles, decide their proposals for network access, and list and delete the sandbox rules of a workspace",
 		declare(command{
 			Name:        "profiles",
 			Description: "List the sandbox profiles the hub offers, in name order",
@@ -123,6 +123,7 @@ func newSandboxCommand() *cobra.Command {
 		}),
 	)
 	sandbox.AddCommand(sandboxLifecycleCommands()...)
+	sandbox.AddCommand(sandboxPolicyCommands()...)
 	return sandbox
 }
 
