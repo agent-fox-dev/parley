@@ -92,6 +92,7 @@ var parts = []func(*Composition){
 	composeForge,
 	composeSessions,
 	composeTelemetry,
+	composeAudit,
 	composeMetrics,
 }
 
