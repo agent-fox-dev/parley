@@ -114,10 +114,12 @@ func recordAttempt(ctx context.Context, q querier, d delivery, at time.Time, out
 
 // recordSuccess sets what a successful attempt at at changes on the
 // subscription id: the position past the event seq, last_status succeeded,
-// last_delivery_at, and no failing_since.
+// last_delivery_at, no failing_since, and active again when it was failing,
+// since the receiver is back. That return writes no event.
 func recordSuccess(ctx context.Context, q querier, id string, seq int64, at time.Time) error {
 	_, err := q.ExecContext(ctx, `UPDATE webhook_subscriptions
-		SET position = max(position, ?), last_status = 'succeeded', last_delivery_at = ?, failing_since = NULL
+		SET position = max(position, ?), last_status = 'succeeded', last_delivery_at = ?, failing_since = NULL,
+			state = CASE WHEN state = 'failing' THEN 'active' ELSE state END
 		WHERE id = ?`, seq, at.UnixNano(), id)
 	if err != nil {
 		return fmt.Errorf("record the success of event webhook %s: %w", id, err)

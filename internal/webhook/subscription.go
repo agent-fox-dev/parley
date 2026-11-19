@@ -443,8 +443,8 @@ func parseUpdate(body map[string]json.RawMessage, s Settings) (updateRequest, er
 	return req, nil
 }
 
-// apply changes s as req asks. active sets the state: false switches the
-// subscription off, true on.
+// apply changes the configuration of s as req asks; active, which switches
+// the subscription, is switchTo's.
 func (req updateRequest) apply(s *Subscription) {
 	if req.rawURL != nil {
 		s.URL = *req.rawURL
@@ -458,22 +458,18 @@ func (req updateRequest) apply(s *Subscription) {
 	if req.description != nil {
 		s.Description = *req.description
 	}
-	if req.active != nil {
-		s.State = StateActive
-		if !*req.active {
-			s.State = StateDisabled
-		}
-	}
 }
 
 // update answers PATCH /workspaces/:slug/webhooks/:id: once the body
 // passes parseUpdate, 400 webhook_destination_refused when it gives a url
 // checkDestination refuses, then 409 workspace_archived on an archived
 // workspace.
-// Otherwise it changes exactly the fields given, sets updated_at, writes
-// parley.webhook.update with the names of the fields given and the state
-// after the change in the same transaction, and answers 200 with the
-// object.
+// Otherwise it changes exactly the fields given, active through switchTo,
+// sets updated_at, writes parley.webhook.update with the names of the fields
+// given and the state after the change in the same transaction, and answers
+// 200 with the object. A subscription switched back on from disabled takes
+// that event's seq as its position. Its loop, started or woken after the
+// commit, applies the change from its next step; a disabled one ends.
 func (c *Component) update(w http.ResponseWriter, r *http.Request, q request) error {
 	var body map[string]json.RawMessage
 	if err := server.DecodeJSON(r, &body); err != nil {
@@ -505,18 +501,31 @@ func (c *Component) update(w http.ResponseWriter, r *http.Request, q request) er
 		}
 		in.apply(&sub)
 		sub.UpdatedAt = now
+		var reenabled bool
+		if in.active != nil {
+			if reenabled, err = switchTo(ctx, tx, &sub, *in.active); err != nil {
+				return err
+			}
+		}
 		if err := save(ctx, tx, sub); err != nil {
 			return err
 		}
-		_, err = c.emit(ctx, tx, EventUpdate, sub, caller,
+		rec, err := c.emit(ctx, tx, EventUpdate, sub, caller,
 			map[string]any{"webhook_id": sub.ID, "fields": in.fields, "state": sub.State})
-		return err
+		if err != nil || !reenabled {
+			return err
+		}
+		sub.Position = rec.Seq
+		return setPosition(ctx, tx, sub.ID, rec.Seq)
 	})
 	if err != nil {
 		return err
 	}
-	// The loop reads the subscription again: a disabled one ends.
-	c.wakeLoop(sub.ID)
+	if sub.State == StateDisabled {
+		c.wakeLoop(sub.ID)
+	} else {
+		c.startLoop(sub.ID)
+	}
 	server.WriteJSON(w, http.StatusOK, objectOf(sub))
 	return nil
 }

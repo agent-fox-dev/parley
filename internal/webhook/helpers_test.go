@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -591,5 +592,53 @@ func (w *world) drive(t *testing.T, what string, step time.Duration, cond func()
 		}
 		w.clock.advance(step)
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// maxDriveSteps bounds the attempts retryWhile moves the clock through.
+const maxDriveSteps = 300
+
+// answering is a receiver's answer that the test changes as it goes.
+type answering struct{ status atomic.Int64 }
+
+func answeringWith(status int) *answering {
+	a := &answering{}
+	a.status.Store(int64(status))
+	return a
+}
+
+func (a *answering) answer(delivered, <-chan struct{}) int { return int(a.status.Load()) }
+
+func (a *answering) set(status int) { a.status.Store(int64(status)) }
+
+// retryWhile moves the clock from one scheduled attempt of the subscription
+// id to the next, each time once the last attempt is recorded, while more
+// holds for the time the next one is due. It returns that time, or false
+// when the subscription has nothing left to send. It fails the test after
+// maxDriveSteps attempts, more than three days of retries take.
+func (w *world) retryWhile(t *testing.T, id string, more func(next time.Time) bool) (time.Time, bool) {
+	t.Helper()
+	for step := 0; ; step++ {
+		if step == maxDriveSteps {
+			t.Fatalf("moved the clock through %d attempts and the subscription still has one scheduled", step)
+		}
+		var next time.Time
+		var scheduled bool
+		waitFor(t, "the next attempt to be scheduled", func() bool {
+			now := w.clock.Now().UnixNano()
+			for _, d := range w.deliveries(t, id) {
+				if d.status == "pending" {
+					scheduled = d.nextAttemptAt.Valid && d.nextAttemptAt.Int64 > now
+					next = time.Unix(0, d.nextAttemptAt.Int64).UTC()
+					return scheduled
+				}
+			}
+			r := w.row(t, id)
+			return r.state == "disabled" || r.position == w.lastSeq(t)
+		})
+		if !scheduled || !more(next) {
+			return next, scheduled
+		}
+		w.clock.advance(next.Sub(w.clock.Now()))
 	}
 }

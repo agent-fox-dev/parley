@@ -118,9 +118,10 @@ func (c *Component) spawnLocked(l *loop) {
 	go c.run(c.loops.ctx, l)
 }
 
-// Run runs the delivery loops until ctx ends, then waits for them: each
-// returns as soon as ctx ends, abandoning an attempt in flight. The hub runs
-// it as background work.
+// Run runs the delivery loops and the check that disables a subscription
+// failing for too long until ctx ends, then waits for them: each returns as
+// soon as ctx ends, abandoning an attempt in flight. The hub runs it as
+// background work.
 func (c *Component) Run(ctx context.Context) {
 	ls := &c.loops
 	ls.mu.Lock()
@@ -130,7 +131,12 @@ func (c *Component) Run(ctx context.Context) {
 			c.spawnLocked(l)
 		}
 	}
+	ls.wg.Add(1)
 	ls.mu.Unlock()
+	go func() {
+		defer ls.wg.Done()
+		c.watchFailing(ctx)
+	}()
 	<-ctx.Done()
 	ls.mu.Lock()
 	ls.stopped = true
@@ -390,8 +396,9 @@ func (c *Component) succeeded(ctx context.Context, sub Subscription, d delivery,
 	return again, time.Time{}, nil
 }
 
-// failed records the failed attempt at at of the delivery d of sub, in one
-// transaction: the delivery stays pending with its next attempt scheduled
+// failed records the failed attempt at at of the delivery d of sub. One
+// made at the end of its event's retry window or later gives the event up
+// (giveUp). Any other is recorded in one transaction: the delivery stays pending with its next attempt scheduled
 // (nextAttempt), and the subscription gets last_status failed,
 // last_delivery_at and, when it has none, failing_since. The loop then waits
 // for that time and sends nothing else for sub meanwhile, so that no later
@@ -401,6 +408,9 @@ func (c *Component) failed(ctx context.Context, sub Subscription, d delivery, at
 	first := at
 	if d.FirstAttemptAt != nil {
 		first = *d.FirstAttemptAt
+	}
+	if !at.Before(first.Add(retryWindow)) {
+		return c.giveUp(ctx, sub, d, at, out)
 	}
 	due := nextAttempt(first, at, d.Attempts+1)
 	var recorded bool
