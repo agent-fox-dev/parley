@@ -231,6 +231,7 @@ type uploaded struct {
 // entry or before the limit stays in the sandbox.
 func (s *Service) upload(w http.ResponseWriter, r *http.Request, u useRequest) error {
 	res, err := s.uploadBody(r, u)
+	u.act.op.Path, u.act.op.Bytes = u.files.path, res.Bytes
 	if err != nil {
 		// The rest of a refused body is not wanted: the server would
 		// otherwise read up to 256 KiB of it before answering.
@@ -246,6 +247,7 @@ func (s *Service) uploadBody(r *http.Request, u useRequest) (uploaded, error) {
 	if r.ContentLength > limit {
 		return uploaded{}, tooLarge()
 	}
+	u.act.start(OperationUpload)
 	body := &limitedBody{r: r.Body, left: limit}
 	if u.files.tar {
 		return s.unpack(r, u, body)
@@ -384,6 +386,10 @@ func (s *Service) sendFile(w http.ResponseWriter, r *http.Request, u useRequest,
 	if fi.Size > s.settings.MaxTransferSize {
 		return tooLarge()
 	}
+	out := s.startDownload(w, u, fi.Size)
+	// Deferred: a download that fails after its first byte drops the
+	// connection (see abortDownload).
+	defer func() { u.act.op.Bytes = out.sent }()
 	ctx := r.Context()
 	rc, err := s.client.Download(ctx, u.rec.ID, u.files.path)
 	if err != nil {
@@ -394,7 +400,6 @@ func (s *Service) sendFile(w http.ResponseWriter, r *http.Request, u useRequest,
 	h.Set("Content-Type", mediaOctets)
 	h.Set("Content-Length", strconv.FormatInt(fi.Size, 10))
 	w.WriteHeader(http.StatusOK)
-	out := &sentBody{w: w, left: fi.Size}
 	if _, err := io.CopyN(out, rc, fi.Size); err != nil {
 		s.abortDownload(ctx, u.rec.ID, out, err)
 	}
@@ -416,9 +421,10 @@ func (s *Service) sendTar(w http.ResponseWriter, r *http.Request, u useRequest, 
 		}
 		entries, base = below, u.files.path
 	}
+	out := s.startDownload(w, u, s.settings.MaxTransferSize)
+	defer func() { u.act.op.Bytes = out.sent }()
 	w.Header().Set("Content-Type", mediaTar)
 	w.WriteHeader(http.StatusOK)
-	out := &sentBody{w: w, left: s.settings.MaxTransferSize}
 	tw := tar.NewWriter(out)
 	// The runtime reports no modification time; the time of the download
 	// stands for it, in whole seconds so that every format can hold it.
@@ -454,14 +460,23 @@ func (s *Service) addEntry(ctx context.Context, id string, tw *tar.Writer, base 
 	return err
 }
 
+// startDownload starts the activity of the download of u, which every
+// check has passed, and returns the body it sends through w, at most limit
+// bytes.
+func (s *Service) startDownload(w http.ResponseWriter, u useRequest, limit int64) *sentBody {
+	u.act.start(OperationDownload)
+	u.act.op.Path = u.files.path
+	return &sentBody{w: w, left: limit}
+}
+
 // sentBody is the body of a download as it is written to the caller: it
 // refuses a write that would pass what may still be sent, and keeps the
 // first failure of a write, so that the caller's failures are told apart
-// from the runtime's.
+// from the runtime's. sent counts what was written.
 type sentBody struct {
-	w    io.Writer
-	left int64
-	err  error
+	w          io.Writer
+	left, sent int64
+	err        error
 }
 
 func (b *sentBody) Write(p []byte) (int, error) {
@@ -474,6 +489,7 @@ func (b *sentBody) Write(p []byte) (int, error) {
 	}
 	n, err := b.w.Write(p)
 	b.left -= int64(n)
+	b.sent += int64(n)
 	if err != nil {
 		b.err = err
 	}

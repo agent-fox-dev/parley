@@ -48,6 +48,9 @@ type useRequest struct {
 	logs logsRequest
 	// attach is the query of an attach, as its validation read it.
 	attach attachRequest
+	// act is the request's use of the sandbox, which the operation starts
+	// and fills in and the gate ends.
+	act *activity
 }
 
 // useEntry is one route that uses a sandbox, under
@@ -131,7 +134,9 @@ func (s *Service) UseRoutes() []server.Route {
 // the sandbox, validates the request, checks the sandbox's state, and only
 // then runs e's operation, whose runtime failures it answers (see
 // answerUse). The order is fixed so that an authorization answer never
-// depends on the body, and a body error never on the state.
+// depends on the body, and a body error never on the state. An operation
+// that started records the end of its activity and is told to the
+// observers once its answer is written (see activity).
 func (s *Service) gate(e *useEntry) server.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		d, ok := access.DecisionOf(r)
@@ -158,7 +163,12 @@ func (s *Service) gate(e *useEntry) server.HandlerFunc {
 		if e.states != nil && !slices.Contains(e.states, rec.State) {
 			return notReady(rec.State)
 		}
-		return s.answerUse(ctx, rec.ID, e.operate(w, r, u))
+		aw := &answerWriter{ResponseWriter: w}
+		u.act = s.newActivity(ctx, aw, u)
+		// Deferred, so that an operation that drops its connection is
+		// recorded too; it runs once the answer below is written.
+		defer u.act.end()
+		return u.act.answer(s.answerUse(ctx, rec.ID, e.operate(aw, r, u)))
 	}
 }
 

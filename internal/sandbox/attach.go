@@ -105,12 +105,13 @@ func (s *Service) attach(w http.ResponseWriter, r *http.Request, u useRequest) e
 		return err
 	}
 	defer func() { _ = term.Close() }()
+	opened := u.act.start(OperationAttach)
 	ws := websocket.Server{
 		// A terminal client is no browser and sends no Origin; the caller
 		// is authenticated by its Authorization header, as on every route.
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(conn *websocket.Conn) {
-			s.relay(ctx, conn, term, u.rec.ID)
+			s.relay(ctx, conn, term, u.rec.ID, s.inputActivity(ctx, u.rec.ID, opened))
 		},
 	}
 	ws.ServeHTTP(hijacker{w}, r)
@@ -128,17 +129,31 @@ func (h hijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return http.NewResponseController(h.ResponseWriter).Hijack()
 }
 
+// inputActivity returns what an attach to the sandbox id, whose activity
+// was last written at last, calls for each frame its caller sends: it
+// writes the frame's time as activity once attachTouchInterval has passed
+// since the last write. It is called from one goroutine.
+func (s *Service) inputActivity(ctx context.Context, id string, last time.Time) func() {
+	return func() {
+		if now := s.deps.Now(); now.Sub(last) >= attachTouchInterval {
+			last = now
+			s.touch(ctx, id, now)
+		}
+	}
+}
+
 // relay copies the caller's binary frames on conn to the terminal's input
 // and each chunk of the terminal's output to the caller as one binary
-// frame, and applies the caller's resize frames, until one side ends. When
-// the caller leaves, ctx ends or the hub begins to stop, the terminal is
-// closed and nothing else. When the terminal ends or fails, the output it
-// gave is sent and then the connection is closed.
-func (s *Service) relay(ctx context.Context, conn *websocket.Conn, term runtime.Terminal, id string) {
+// frame, and applies the caller's resize frames, until one side ends; it
+// calls input for each frame the caller sends. When the caller leaves, ctx
+// ends or the hub begins to stop, the terminal is closed and nothing else.
+// When the terminal ends or fails, the output it gave is sent and then the
+// connection is closed.
+func (s *Service) relay(ctx context.Context, conn *websocket.Conn, term runtime.Terminal, id string, input func()) {
 	callerLeft := make(chan struct{})
 	go func() {
 		defer close(callerLeft)
-		s.readCaller(ctx, conn, term, id)
+		s.readCaller(ctx, conn, term, id, input)
 	}()
 	outputEnded := make(chan struct{})
 	go func() {
@@ -188,13 +203,15 @@ type resizeFrame struct {
 
 // readCaller writes the payload of every binary frame the caller sends to
 // the terminal and applies every resize frame, ignoring any other text
-// frame, until the caller closes the connection or a write fails.
-func (s *Service) readCaller(ctx context.Context, conn *websocket.Conn, term runtime.Terminal, id string) {
+// frame, until the caller closes the connection or a write fails. It calls
+// input for every frame.
+func (s *Service) readCaller(ctx context.Context, conn *websocket.Conn, term runtime.Terminal, id string, input func()) {
 	for {
 		var f terminalFrame
 		if err := terminalFrames.Receive(conn, &f); err != nil {
 			return
 		}
+		input()
 		if !f.text {
 			if _, err := term.Write(f.data); err != nil {
 				return

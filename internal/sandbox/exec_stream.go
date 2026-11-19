@@ -106,8 +106,10 @@ func (x *executor) stream(w http.ResponseWriter, r *http.Request, u useRequest) 
 		return nil
 	case err == nil:
 		exit.ExitCode = &code
+		u.act.exited(&code)
 	case e.timedOut.Load():
 		exit.TimedOut = true
+		u.act.exited(nil)
 	default:
 		return err
 	}

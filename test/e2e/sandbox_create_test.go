@@ -48,8 +48,9 @@ type sandboxCreateHub struct {
 
 // startSandboxCreateHub starts a sandbox create hub with the credential
 // model, whose secret is MODEL_KEY, and profiles, the TOML of the
-// [[sandbox.profiles]].
-func startSandboxCreateHub(t *testing.T, profiles string) *sandboxCreateHub {
+// [[sandbox.profiles]]; each of compose is also run on the hub's
+// composition.
+func startSandboxCreateHub(t *testing.T, profiles string, compose ...func(*hub.Composition)) *sandboxCreateHub {
 	t.Helper()
 	h := &sandboxCreateHub{fake: runtimetest.New(t), commands: map[string][][]string{}}
 	h.fake.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
@@ -74,6 +75,9 @@ func startSandboxCreateHub(t *testing.T, profiles string) *sandboxCreateHub {
 			c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 				return h.fake.Client(s.OpenShellWorkspace, deps.Recorder), nil
 			})
+			for _, fn := range compose {
+				fn(c)
+			}
 		},
 	})
 	user := h.CreateUser(t, "agent")

@@ -208,9 +208,11 @@ func (x *executor) start(r *http.Request, u useRequest) (*execution, error) {
 	if !x.take(id) {
 		return nil, server.RateLimited("the sandbox runs as many commands as it may at once; try again once one has ended")
 	}
+	started := u.act.start(OperationExec)
+	u.act.op.Command = u.exec.command
 	ctx, cancel := context.WithCancel(r.Context())
 	e := &execution{
-		started: x.s.deps.Now(), caller: r.Context(), cancel: cancel,
+		started: started, caller: r.Context(), cancel: cancel,
 		timer: x.s.newTimer(u.exec.timeout), ended: make(chan struct{}),
 		release: func() { x.release(id) },
 	}
@@ -313,8 +315,10 @@ func (x *executor) collect(w http.ResponseWriter, r *http.Request, u useRequest)
 		panic(http.ErrAbortHandler)
 	case err == nil:
 		answer.ExitCode = &code
+		u.act.exited(&code)
 	case e.timedOut.Load():
 		answer.TimedOut = true
+		u.act.exited(nil)
 	default:
 		e.end()
 		return err

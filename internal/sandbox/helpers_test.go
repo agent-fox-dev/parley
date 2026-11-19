@@ -3288,3 +3288,51 @@ func within(t *testing.T, d time.Duration, what string, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// observed keeps the operation records an observer is given, in order.
+type observed struct {
+	mu   sync.Mutex
+	list []sandbox.Operation
+}
+
+func (o *observed) observe(_ context.Context, op sandbox.Operation) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.list = append(o.list, op)
+	return nil
+}
+
+// records is the records given so far.
+func (o *observed) records() []sandbox.Operation {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.list)
+}
+
+// lastActivity is the stored last_activity_at of the sandbox id.
+func (h *execHub) lastActivity(t *testing.T, id string) time.Time {
+	t.Helper()
+	return storedRecord(t, h.Hub, id).LastActivityAt
+}
+
+// setLastActivity stores at as the last_activity_at of the sandbox id.
+func (h *execHub) setLastActivity(t *testing.T, id string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.Update(ctx, tx, id, sandbox.SetLastActivityAt(at)) }); err != nil {
+		t.Fatalf("set the last activity of %s: %v", id, err)
+	}
+}
+
+// activityAt waits for the stored last_activity_at of the sandbox id to be
+// want, and fails the test with the value it holds then.
+func (h *execHub) activityAt(t *testing.T, id string, want time.Time, when string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for got := h.lastActivity(t, id); !got.Equal(want); got = h.lastActivity(t, id) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s last_activity_at = %v, want %v", when, got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}

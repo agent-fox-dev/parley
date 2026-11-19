@@ -1,6 +1,10 @@
 package sandbox
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+	"time"
+)
 
 // useEntryOf is the entry of the route that uses a sandbox named name
 // (exec, upload, download, logs or attach).
@@ -29,3 +33,7 @@ func SetUseValidation(s *Service, name string, v func(*http.Request) error) {
 // InsertLogLines stores lines as the log lines of the sandbox sandboxID in
 // tx, as the collector does, so that a test sets up lines of any time.
 var InsertLogLines = insertLogLines
+
+// Touch records at as the last activity of the sandbox id, as an operation
+// on it does.
+func Touch(s *Service, ctx context.Context, id string, at time.Time) { s.touch(ctx, id, at) }

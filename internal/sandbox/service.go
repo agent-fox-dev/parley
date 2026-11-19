@@ -87,6 +87,8 @@ type Service struct {
 	use []*useEntry
 	// logs is what the log collector tells the reads of the stored logs.
 	logs logState
+	// observers are told of each operation on a sandbox once it ended.
+	observers observers
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

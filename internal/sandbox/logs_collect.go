@@ -24,9 +24,6 @@ const LogCollectInterval = 5 * time.Second
 type logState struct {
 	// stored is notified each time the collector stored lines.
 	stored notifier
-	// touch, when set, is told the time of each line of a main process's
-	// output the collector stored, as activity of its sandbox.
-	touch func(ctx context.Context, sandboxID string, at time.Time)
 }
 
 // LogLinesStored returns a channel closed the next time the collector
@@ -201,8 +198,10 @@ func (s *Service) followLog(ctx context.Context, id, source string) error {
 			return err
 		}
 		s.logs.stored.notify()
-		if source == LogSourceProcess && s.logs.touch != nil {
-			s.logs.touch(ctx, id, at)
+		// The main process's output is use of its sandbox; the policy log
+		// is not.
+		if source == LogSourceProcess {
+			s.touch(ctx, id, s.deps.Now())
 		}
 	}
 }
