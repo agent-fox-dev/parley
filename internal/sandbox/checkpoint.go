@@ -104,7 +104,10 @@ type CheckpointState struct {
 // id and the branch. The extra commit holds what git does not ignore, but
 // untracked files larger than the size limit, which the checkpoint's error
 // names. A bundle larger than Deps.MaxCheckpointSize fails the checkpoint,
-// as a pack of that size fails a push. The sandbox's branches, index and working tree stay as they were:
+// as a pack of that size fails a push. An earlier checkpoint ref of the
+// sandbox whose name clashes with one of these as a directory and a file
+// is replaced, since git keeps no ref "a/b" beside "a". The sandbox's
+// branches, index and working tree stay as they were:
 // the commit is built in a temporary index, and the refs travel as one git
 // bundle through the runtime's file download, never through a push, so no
 // change or version results.
@@ -539,7 +542,7 @@ func (r *checkpointRun) transfer(ctx context.Context, hub *gitrepo.Repo, refs []
 	if err != nil {
 		return err
 	}
-	return hub.FetchBundle(ctx, local.Name(), targets)
+	return hub.FetchBundle(ctx, local.Name(), targets, CheckpointRefPrefix+r.rec.ID+"/")
 }
 
 // download copies the sandbox's file p into w, reading at most max bytes

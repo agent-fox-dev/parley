@@ -93,6 +93,27 @@ there is none for a push the sandbox's hub credential could make. Code:
 set in `internal/hub/sandbox.go`; test:
 `TestCheckpoint_IsHeldToTheMaximumPushSize`.
 
+## A later checkpoint replaces an earlier ref its branch clashes with
+
+The package keeps every ref a checkpoint stored for as long as the
+workspace exists, under `refs/parley/sandboxes/<sandbox id>/<branch>`. Git
+keeps no ref `a/b` beside a ref `a`, so a later checkpoint with a branch
+`feature/a` could not store its refs beside the ref of a branch `feature`
+an earlier checkpoint of the same sandbox saved (or the reverse), and every
+later checkpoint of that sandbox failed. A later checkpoint therefore
+deletes the earlier ref of the same sandbox whose name clashes with one of
+its own, in a ref transaction just before it sets its own, since git
+refuses both in one; when its refs cannot then be set, the earlier ref is
+put back as it was, so a failed checkpoint still keeps the refs of the
+last successful one. The ref layout stays as the package fixes it. The
+deleted ref is never one the latest checkpoint names: two local branches
+cannot clash either, so the earlier branch was deleted or pushed. Refs of
+other branches, and of other sandboxes, stay. Code:
+`internal/gitrepo/bundle.go` (`FetchBundle`, its `replace` prefix),
+`internal/sandbox/checkpoint.go` (`transfer`); tests:
+`TestCheckpoint_ReplacesTheEarlierRefItsBranchClashesWith`,
+`TestFetchBundle_ReplacesARefBelowThePrefixThatClashes`.
+
 ## Smaller choices
 
 - The extra commit of a checkpoint is authored and committed by the hub's

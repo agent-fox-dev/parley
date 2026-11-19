@@ -43,14 +43,14 @@ func TestFetchBundle_SetsTheRefsAtTheBundlesTipsAndKeepsNothingElse(t *testing.T
 	repo, dst := openBare(t)
 
 	first := map[string]string{"refs/parley/sandboxes/s/main": prev, "refs/parley/sandboxes/s/release": release}
-	if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/prev", "refs/heads/release"), first); err != nil {
+	if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/prev", "refs/heads/release"), first, ""); err != nil {
 		t.Fatalf("FetchBundle of the whole history: %v", err)
 	}
 	if refs := gitrepotest.Refs(t, dst, ""); !maps.Equal(refs, first) {
 		t.Fatalf("refs after the first bundle = %v, want %v", refs, first)
 	}
 	second := map[string]string{"refs/parley/sandboxes/s/main": head}
-	if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/main", "--not", "refs/heads/prev"), second); err != nil {
+	if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/main", "--not", "refs/heads/prev"), second, ""); err != nil {
 		t.Fatalf("FetchBundle of a thin bundle: %v", err)
 	}
 	want := map[string]string{"refs/parley/sandboxes/s/main": head, "refs/parley/sandboxes/s/release": release}
@@ -87,7 +87,7 @@ func TestFetchBundle_FailsWithoutSettingARef(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			repo, dst := openBare(t)
-			if err := repo.FetchBundle(ctx, tc.path, tc.refs); err == nil {
+			if err := repo.FetchBundle(ctx, tc.path, tc.refs, ""); err == nil {
 				t.Error("FetchBundle = nil, want an error")
 			}
 			if refs := gitrepotest.Refs(t, dst, ""); len(refs) != 0 {
@@ -113,7 +113,7 @@ func TestCreateBundle_HoldsTheRefsWithTheirWholeHistory(t *testing.T) {
 	}
 	dst, dir := openBare(t)
 	want := map[string]string{"refs/parley/sandboxes/s/main": head, "refs/parley/sandboxes/s/release": release}
-	if err := dst.FetchBundle(ctx, path, want); err != nil {
+	if err := dst.FetchBundle(ctx, path, want, ""); err != nil {
 		t.Fatalf("FetchBundle of the created bundle: %v", err)
 	}
 	if refs := gitrepotest.Refs(t, dir, ""); !maps.Equal(refs, want) {
@@ -150,4 +150,60 @@ func TestCreateBundle_RefusesWhatItCannotBundle(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFetchBundle_ReplacesARefBelowThePrefixThatClashes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	src, head, release, _ := forkParent(t, 2)
+	prev := gitrepotest.Git(t, src, "rev-parse", "main~1")
+	gitrepotest.Git(t, src, "update-ref", "refs/heads/prev", prev)
+	earlier := map[string]string{"refs/parley/sandboxes/s/feature": prev, "refs/parley/sandboxes/s2/feature": prev}
+	later := map[string]string{"refs/parley/sandboxes/s/feature/a": head, "refs/parley/sandboxes/s/other": release}
+	t.Run("deletes the clashing ref and sets the refs", func(t *testing.T) {
+		t.Parallel()
+		repo, dst := openBare(t)
+		if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/prev"), earlier, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/main", "refs/heads/release"), later, "refs/parley/sandboxes/s/"); err != nil {
+			t.Fatalf("FetchBundle of a clashing ref: %v", err)
+		}
+		want := maps.Clone(later)
+		want["refs/parley/sandboxes/s2/feature"] = prev
+		if refs := gitrepotest.Refs(t, dst, ""); !maps.Equal(refs, want) {
+			t.Errorf("refs = %v, want %v", refs, want)
+		}
+	})
+	t.Run("puts the clashing ref back when the refs cannot be set", func(t *testing.T) {
+		t.Parallel()
+		repo, dst := openBare(t)
+		if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/prev"), earlier, ""); err != nil {
+			t.Fatal(err)
+		}
+		// A lock git holds on one of the refs fails their transaction.
+		lock := filepath.Join(dst, "refs", "parley", "sandboxes", "s", "other.lock")
+		if err := os.WriteFile(lock, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/main", "refs/heads/release"), later, "refs/parley/sandboxes/s/"); err == nil {
+			t.Fatal("FetchBundle with a locked ref = nil, want an error")
+		}
+		if refs := gitrepotest.Refs(t, dst, ""); !maps.Equal(refs, earlier) {
+			t.Errorf("refs after the failed fetch = %v, want %v", refs, earlier)
+		}
+	})
+	t.Run("fails on a clash outside the prefix", func(t *testing.T) {
+		t.Parallel()
+		repo, dst := openBare(t)
+		if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/prev"), earlier, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.FetchBundle(ctx, bundleOf(t, src, "refs/heads/main", "refs/heads/release"), later, "refs/parley/sandboxes/s2/"); err == nil {
+			t.Fatal("FetchBundle of a ref clashing outside the prefix = nil, want an error")
+		}
+		if refs := gitrepotest.Refs(t, dst, ""); !maps.Equal(refs, earlier) {
+			t.Errorf("refs after the failed fetch = %v, want %v", refs, earlier)
+		}
+	})
 }
