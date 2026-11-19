@@ -96,8 +96,13 @@ func (r *Repo) SetRefFrom(ctx context.Context, src, ref, id string) error {
 	}
 	// A push from src sends exactly what this repository lacks and sets
 	// the ref in one step; a fetch by id would need src to allow wants of
-	// unadvertised objects.
-	_, err = r.g.run(ctx, access{}, "--git-dir="+src, "push", "--quiet", "--no-verify", "--", r.dir, "+"+id+":"+ref)
+	// unadvertised objects. The receive-pack it starts in this repository
+	// would end in a detached automatic maintenance that outlives the call
+	// and writes into the repository after it; push drops its own -c
+	// options before starting receive-pack, so the option that stops it
+	// is on receive-pack's command line.
+	_, err = r.g.run(ctx, access{}, "--git-dir="+src, "push", "--quiet", "--no-verify",
+		"--receive-pack=git -c receive.autogc=false receive-pack", "--", r.dir, "+"+id+":"+ref)
 	return err
 }
 
