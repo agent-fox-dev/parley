@@ -48,6 +48,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/session"
 	"github.com/agent-fox-dev/parley/internal/store"
+	"github.com/agent-fox-dev/parley/internal/telemetry"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
@@ -89,6 +90,7 @@ var parts = []func(*Composition){
 	composeCarryPatch,
 	composeForge,
 	composeSessions,
+	composeTelemetry,
 }
 
 // Options are the inputs of Run. The process gives Args, Env, WorkDir,
@@ -317,6 +319,12 @@ type Composition struct {
 	// dependencies (AdjustSessions).
 	sessions         *session.Component
 	sessionAdjusters []func(*session.Deps)
+
+	// telemetry is the telemetry component composeTelemetry creates and
+	// binds in its start hook (Telemetry), after telemetryAdjusters have
+	// changed its dependencies (AdjustTelemetry).
+	telemetry          *telemetry.Component
+	telemetryAdjusters []func(*telemetry.Deps)
 
 	// serverHooks receive the HTTP server once install has registered the
 	// routes, mounts and checks on it (addServerHook).

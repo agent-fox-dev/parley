@@ -47,7 +47,8 @@ const sessionHook = "sessions"
 // RemoveOwned; and no archive observer, since the close belongs inside the
 // archive's transaction.
 //
-// It is composed last, so that the components it registers with all exist.
+// It is composed after every component it registers with, so that they all
+// exist.
 //
 // The component exists from the composition on (Sessions); tests change its
 // dependencies with AdjustSessions.
