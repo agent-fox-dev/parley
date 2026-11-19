@@ -1859,6 +1859,52 @@ func startProvisionWorld(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub
 	return h
 }
 
+// leakyProfile has the policy file of full, without credentials; nohubProfile
+// has no policy file and no hub access, and the credential model.
+const (
+	leakyProfile = "[[sandbox.profiles]]\nname = \"leaky\"\nttl = \"4h\"\npolicy = \"policy.yaml\"\n"
+	nohubProfile = "[[sandbox.profiles]]\nname = \"nohub\"\nttl = \"4h\"\nhub_access = \"none\"\ncredentials = [\"model\"]\n"
+)
+
+// startPolicyWorld is startProvisionWorld with the [sandbox] settings given
+// as TOML, the profiles leaky and nohub besides agent, full and plain, and
+// no sandbox limit a test reaches.
+func startPolicyWorld(t *testing.T, settings string) *createHub {
+	t.Helper()
+	h := startProvisionHub(t, settings+agentProfile+provisionProfile+plainProfile+leakyProfile+nohubProfile+credentialTables)
+	h.world(t)
+	h.AddMember(t, h.org, h.dana)
+	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
+	h.putSecret(t, secret.ScopeOrg, h.org, "NPM_TOKEN", npmSecret)
+	h.setLimits(limits{100, 100, 100, 100})
+	return h
+}
+
+// saveRule stores the workspace sandbox rule body on the workspace ws, with
+// the id id (a new one when ""), saved by dana at at, and returns it.
+func (h *createHub) saveRule(t *testing.T, ws, id, body string, at time.Time) sandbox.SandboxRule {
+	t.Helper()
+	if id == "" {
+		id = sandbox.NewRuleID()
+	}
+	r := sandbox.SandboxRule{
+		ID: id, Workspace: ws, Rule: json.RawMessage(body), Summary: "allow " + body,
+		Findings:  []runtime.Finding{{Severity: "low", Message: "a finding"}},
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"}, CreatedAt: at,
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.SaveRule(ctx, tx, r) })
+	return r
+}
+
+// saveApproved stores body as a rule approved for the sandbox id at at, by a
+// proposal of a new id, and returns it.
+func (h *createHub) saveApproved(t *testing.T, id, body string, at time.Time) sandbox.ApprovedRule {
+	t.Helper()
+	a := sandbox.ApprovedRule{SandboxID: id, ProposalID: "sbp_" + strings.TrimPrefix(sandbox.NewID(), "sbx_"), Rule: json.RawMessage(body), DecidedAt: at}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.SaveApprovedRule(ctx, tx, a) })
+	return a
+}
+
 // objectMap is the sandbox object of rec as a decoded answer holds it.
 func objectMap(t *testing.T, rec sandbox.Record) map[string]any {
 	t.Helper()

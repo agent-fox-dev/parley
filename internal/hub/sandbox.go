@@ -159,6 +159,8 @@ func composeSandbox(c *Composition) {
 	}
 	c.AddSchemaStep(sandbox.SchemaStep)
 	c.AddSchemaStep(sandbox.LogSchemaStep)
+	c.AddSchemaStep(sandbox.RuleSchemaStep)
+	c.AddSchemaStep(sandbox.ApprovedRuleSchemaStep)
 	registerSandboxCollaborators(c, svc)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
@@ -249,7 +251,10 @@ func composeSandbox(c *Composition) {
 
 // registerSandboxCollaborators registers what the sandbox service takes
 // part in while the hub composes: the purge hook of the stored logs, the
-// service as its own restorer of checkpoints, and the service on the
+// service as its own restorer of checkpoints, the network-policy feature's
+// workspace rule provider and policy composer (RegisterNetworkPolicy),
+// through which a create records the workspace sandbox rules and every
+// provisioning composes the policy value, and the service on the
 // workspaces' collaborator set (ADR 07), through which a workspace's
 // archive and deletion reach its sandboxes whether sandboxes are on or not:
 // with them off the records are still deleted and removed, and no runtime
@@ -257,6 +262,7 @@ func composeSandbox(c *Composition) {
 func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
 	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
 	svc.RegisterRestorer(svc)
+	svc.RegisterNetworkPolicy()
 	td := c.workspaces.Teardown()
 	td.RegisterSandboxRemover(svc)
 	td.RegisterArchiveObserver(svc)

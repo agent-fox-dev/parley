@@ -3,11 +3,11 @@
   "spec_id": "48",
   "spec_name": "sandbox_network_policy",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-19T09:09:33Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
