@@ -55,8 +55,8 @@ const (
 //
 // It registers the keys of [awareness] and checks, before any store is
 // opened, the rule that spans two of them: a default claim lifetime longer
-// than the maximum stops the start. No session interface is registered:
-// without the session feature every claim that names a session is refused.
+// than the maximum stops the start. The session feature registers its
+// session interface (composeSessions).
 //
 // The component exists from the composition on (Awareness); tests change
 // its dependencies with AdjustAwareness.

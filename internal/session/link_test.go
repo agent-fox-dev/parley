@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/session"
 )
 
@@ -314,4 +316,194 @@ func TestRecord_RefusesAMalformedLinkAndLeavesTheTransactionUsable(t *testing.T)
 			}
 		})
 	}
+}
+
+// apiKey is the principal of an API key of the user userID.
+func apiKey(userID string) identity.Principal {
+	return identity.Principal{Type: identity.TypeAPIKey, CredentialID: "key-" + userID, User: &identity.User{ID: userID}}
+}
+
+// adminToken is the principal of the admin token.
+var adminToken = identity.Principal{Type: identity.TypeAdmin, CredentialID: "admin"}
+
+// linkedSessions are the sessions the linking check is asked about: x of
+// alice on demo, f of alice on its fork demo--t1, a of the admin token on
+// demo and d of dave on other.
+type linkedSessions struct{ x, f, a, d string }
+
+func (w *world) linkedSessions(t *testing.T) linkedSessions {
+	t.Helper()
+	open := func(credential, slug string) string {
+		return w.open(t, credential, map[string]any{"workspace_slug": slug})["id"].(string)
+	}
+	return linkedSessions{x: open(w.aliceKey, demo), f: open(w.aliceKey, fork1), a: open(w.Token, demo), d: open(w.daveKey, other)}
+}
+
+// linkCheck is one question to the linking check: may caller name the
+// session id for an operation on the workspace slug.
+type linkCheck struct {
+	name   string
+	caller identity.Principal
+	id     string
+	slug   string
+}
+
+// acceptedChecks are the questions the linking check accepts, about the
+// sessions s and a session of alice on demo ended in each status.
+func (w *world) acceptedChecks(t *testing.T, s linkedSessions) []linkCheck {
+	t.Helper()
+	alice := apiKey(w.alice)
+	alicePAT := alice
+	alicePAT.Type = identity.TypePAT
+	boundElsewhere := alicePAT
+	boundElsewhere.Workspace = new(other)
+	checks := []linkCheck{
+		{"alice, her session on demo, for demo", alice, s.x, demo},
+		{"alice, her session on demo, for its fork", alice, s.x, fork1},
+		{"alice, her session on a fork, for its parent", alice, s.f, demo},
+		{"alice, her session on a fork, for the fork", alice, s.f, fork1},
+		{"alice with a PAT", alicePAT, s.x, demo},
+		{"alice with a PAT bound to another workspace", boundElsewhere, s.x, demo},
+		{"the admin token, alice's session", adminToken, s.x, demo},
+		{"the admin token, its session on demo, for its fork", adminToken, s.a, fork1},
+		{"alice, her session's id in upper case", alice, strings.ToUpper(s.x), demo},
+	}
+	for _, status := range []string{"completed", "failed", "timeout", "terminated"} {
+		id := w.newSession(t)
+		if status == "terminated" {
+			w.terminate(t, id)
+		} else if code, raw := w.complete(t, w.aliceKey, id, map[string]any{"status": status}); code != http.StatusOK {
+			t.Fatalf("complete %s = %d %s, want 200", status, code, raw)
+		}
+		checks = append(checks, linkCheck{"alice, her session " + status, alice, id, demo})
+	}
+	return checks
+}
+
+// refusedChecks are the questions the linking check refuses, about the
+// sessions s.
+func (w *world) refusedChecks(s linkedSessions) []linkCheck {
+	alice := apiKey(w.alice)
+	return []linkCheck{
+		{"an id that is not a UUID", alice, "abc", demo},
+		{"a UUID that names no session", alice, freshID(), demo},
+		{"bob, alice's session", apiKey(w.bob), s.x, demo},
+		{"a user's credential without its user", identity.Principal{Type: identity.TypeAPIKey}, s.x, demo},
+		{"alice, the admin token's session", alice, s.a, demo},
+		{"alice, dave's session", alice, s.d, demo},
+		{"alice, her session on demo, for an unrelated workspace", alice, s.x, other},
+		{"alice, her session on a fork, for a sibling fork", alice, s.f, fork2},
+		{"dave, his session on other, for demo", apiKey(w.dave), s.d, demo},
+	}
+}
+
+func TestCheck_AcceptsTheCreatorAndTheAdminTokenOnALinkedWorkspace(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	for _, c := range w.acceptedChecks(t, w.linkedSessions(t)) {
+		t.Run(c.name, func(t *testing.T) {
+			id, err := w.sessions.Check(ctx, c.caller, c.id, c.slug)
+			if err != nil || id != strings.ToLower(c.id) {
+				t.Errorf("Check(%s, %s) = %q, %v; want %q, nil", c.id, c.slug, id, err, strings.ToLower(c.id))
+			}
+		})
+	}
+}
+
+func TestCheck_RefusesEveryOtherReferenceWithOneAnswer(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	texts := map[string][]string{}
+	for _, c := range w.refusedChecks(w.linkedSessions(t)) {
+		t.Run(c.name, func(t *testing.T) {
+			id, err := w.sessions.Check(ctx, c.caller, c.id, c.slug)
+			if !errors.Is(err, session.ErrUnknownSession) || id != "" {
+				t.Fatalf("Check(%s, %s) = %q, %v; want \"\", ErrUnknownSession", c.id, c.slug, id, err)
+			}
+			texts[err.Error()] = append(texts[err.Error()], c.name)
+		})
+	}
+	if len(texts) != 1 {
+		t.Errorf("the refusals have %d texts, want one: %v", len(texts), texts)
+	}
+}
+
+func TestCheck_KeepsAcceptingASessionOfARemovedForkForItsParent(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	f := w.open(t, w.aliceKey, map[string]any{"workspace_slug": fork1})["id"].(string)
+	w.removeWorkspace(t, fork1)
+	for _, caller := range []identity.Principal{apiKey(w.alice), adminToken} {
+		if id, err := w.sessions.Check(ctx, caller, f, demo); err != nil || id != f {
+			t.Errorf("Check(%s, %s, demo) = %q, %v; want %q, nil", caller.Type, f, id, err, f)
+		}
+	}
+	for _, c := range []linkCheck{
+		{"alice for an unrelated workspace", apiKey(w.alice), f, other},
+		{"alice for a sibling fork", apiKey(w.alice), f, fork2},
+		{"bob for the parent", apiKey(w.bob), f, demo},
+	} {
+		if _, err := w.sessions.Check(ctx, c.caller, c.id, c.slug); !errors.Is(err, session.ErrUnknownSession) {
+			t.Errorf("%s: Check = %v, want ErrUnknownSession", c.name, err)
+		}
+	}
+}
+
+// failingWorkspaces is a workspace reader that cannot read the record of
+// the workspace broken and reads every other through next.
+type failingWorkspaces struct {
+	next   session.WorkspaceReader
+	broken string
+}
+
+func (r failingWorkspaces) Workspace(ctx context.Context, slug string) (session.Workspace, bool, error) {
+	if slug == r.broken {
+		return session.Workspace{}, false, errors.New("the workspace record cannot be read")
+	}
+	return r.next.Workspace(ctx, slug)
+}
+
+func TestCheck_ReportsAFailedReadAsAFailure(t *testing.T) {
+	w := newWorld(t, func(d *session.Deps) { d.Workspaces = failingWorkspaces{next: d.Workspaces, broken: fork1} })
+	ctx := context.Background()
+	x := w.newSession(t)
+	wantFailure := func(t *testing.T, what string, id string, err error) {
+		t.Helper()
+		if err == nil || errors.Is(err, session.ErrUnknownSession) || id != "" {
+			t.Errorf("%s: Check = %q, %v; want \"\" and an error that is not ErrUnknownSession", what, id, err)
+		}
+	}
+	id, err := w.sessions.Check(ctx, apiKey(w.alice), x, fork1)
+	wantFailure(t, "the fork's record cannot be read", id, err)
+
+	if err := w.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	id, err = w.sessions.Check(ctx, apiKey(w.alice), x, demo)
+	wantFailure(t, "the store is closed", id, err)
+}
+
+func TestCheck_WritesNothing(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	s := w.linkedSessions(t)
+	checks := append(w.acceptedChecks(t, s), w.refusedChecks(s)...)
+	tables := []string{"sessions", "session_usage", "session_links"}
+	before := map[string]int{}
+	for _, table := range tables {
+		before[table] = w.count(t, table)
+	}
+	x := w.object(t, s.x)
+	for _, c := range checks {
+		_, _ = w.sessions.Check(ctx, c.caller, c.id, c.slug)
+	}
+	for _, table := range tables {
+		if n := w.count(t, table); n != before[table] {
+			t.Errorf("%s: %d rows after the checks, want %d", table, n, before[table])
+		}
+	}
+	if after := w.object(t, s.x); !reflect.DeepEqual(after, x) {
+		t.Errorf("session x after the checks = %v, want %v", after, x)
+	}
+	w.wantCounts(t, s.x, counts(nil))
 }
