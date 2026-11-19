@@ -8,9 +8,12 @@ import (
 	"net/http"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
 // secretShape is the form of a signing secret as a create shows it.
@@ -645,5 +648,137 @@ func TestRotate_SignsTheNextAttemptOfAPendingDeliveryWithTheNewSecret(t *testing
 	updates := w.events(t, "parley.webhook.update")
 	if len(updates) != 1 || !reflect.DeepEqual(updates[0].Metadata["fields"], []any{"secret"}) {
 		t.Errorf("update events = %+v, want one with fields [secret]", updates)
+	}
+}
+
+// cellsOf is every cell of every row query returns, as text, a BLOB as its
+// bytes.
+func (w *world) cellsOf(t *testing.T, query string) []string {
+	t.Helper()
+	rows, err := w.Store.Main().Query(query)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vals {
+			if b, ok := v.([]byte); ok {
+				out = append(out, string(b))
+			} else {
+				out = append(out, fmt.Sprint(v))
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestSecret_IsShownOnlyByCreateAndRotateAndStoredSealed(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	in := newInbox(t, answerOK)
+	body := map[string]any{"url": in.url(), "types": testTypes}
+	header := http.Header{"Idempotency-Key": {"k1"}}
+	status, raw := w.CallWith(t, http.MethodPost, hooksPath(demo), w.ownerKey, body, header)
+	if status != http.StatusCreated {
+		t.Fatalf("create = %d %s, want 201", status, raw)
+	}
+	s0, _ := decode(t, raw)["secret"].(string)
+	status, replay := w.CallWith(t, http.MethodPost, hooksPath(demo), w.ownerKey, body, header)
+	if status != http.StatusOK {
+		t.Fatalf("the replay of the create = %d %s, want 200", status, replay)
+	}
+	created := w.mustCreateWith(t, demo, body)
+	id, _ := created["id"].(string)
+	s1, _ := created["secret"].(string)
+	status, raw = w.Call(t, http.MethodPost, hookPath(demo, id)+"/rotate-secret", w.ownerKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("rotate = %d %s, want 200", status, raw)
+	}
+	s2, _ := decode(t, raw)["secret"].(string)
+	secrets := []string{s0, s1, s2}
+	for _, s := range secrets {
+		if !secretShape.MatchString(s) {
+			t.Fatalf("the secrets shown are %q, want three signing secrets", secrets)
+		}
+	}
+	w.emit(t, demo, "parley.test.one", "")
+	waitFor(t, "the event to be delivered", func() bool { return w.settled(t, id) })
+	delivery := w.deliveries(t, id)[0].id
+
+	answers := map[string][]byte{"replay": replay}
+	for _, call := range []struct {
+		name, method, path string
+		body               any
+	}{
+		{"list", http.MethodGet, hooksPath(demo), nil},
+		{"get", http.MethodGet, hookPath(demo, id), nil},
+		{"update", http.MethodPatch, hookPath(demo, id), map[string]any{"description": "x"}},
+		{"ping", http.MethodPost, hookPath(demo, id) + "/ping", nil},
+		{"deliveries", http.MethodGet, hookPath(demo, id) + "/deliveries", nil},
+		{"redeliver", http.MethodPost, redeliverPath(id, delivery), nil},
+	} {
+		status, raw := w.Call(t, call.method, call.path, w.ownerKey, call.body)
+		if status != http.StatusOK {
+			t.Fatalf("%s = %d %s, want 200", call.name, status, raw)
+		}
+		answers[call.name] = raw
+	}
+	holds := func(text string) bool {
+		return slices.ContainsFunc(secrets, func(s string) bool { return strings.Contains(text, s) })
+	}
+	for name, raw := range answers {
+		if holds(string(raw)) || strings.Contains(string(raw), `"secret":`) {
+			t.Errorf("the answer of %s holds a secret: %s", name, raw)
+		}
+	}
+	for _, cell := range w.cellsOf(t, `SELECT * FROM hub_events`) {
+		if holds(cell) {
+			t.Errorf("an event holds a secret: %s", cell)
+		}
+	}
+	for _, table := range []string{"webhook_subscriptions", "webhook_deliveries"} {
+		for _, cell := range w.cellsOf(t, `SELECT * FROM `+table) {
+			if holds(cell) {
+				t.Errorf("a column of %s holds a secret as text", table)
+			}
+		}
+	}
+	var sealed []byte
+	if err := w.Store.Main().QueryRow(`SELECT secret_sealed FROM webhook_subscriptions WHERE id = ?`, id).Scan(&sealed); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := secret.OpenValue(secret.Keys{Current: w.key}, "webhook:"+id, sealed); err != nil || got != s2 {
+		t.Errorf("the stored ciphertext opens to %q, %v, want the rotated secret", got, err)
+	}
+
+	// The hub's log scrubs a secret from a line that would hold it, from
+	// the create on and, after a restart, once the secret has been opened.
+	w.logger.Warn("webhook secrecy probe", "value", "a line holding "+s2+" and "+s0)
+	if text := w.Log.String(); !strings.Contains(text, "webhook secrecy probe") || holds(text) {
+		t.Errorf("the hub's log holds a secret or lacks the probe line:\n%s", text)
+	}
+	w.Restart(t)
+	if status, raw := w.Call(t, http.MethodPost, hookPath(demo, id)+"/ping", w.ownerKey, nil); status != http.StatusOK {
+		t.Fatalf("ping after the restart = %d %s, want 200", status, raw)
+	}
+	w.logger.Warn("webhook secrecy probe after the restart", "value", "a line holding "+s2)
+	if text := w.Log.String(); !strings.Contains(text, "webhook secrecy probe after the restart") || holds(text) {
+		t.Errorf("after the restart the hub's log holds a secret or lacks the probe line:\n%s", text)
 	}
 }

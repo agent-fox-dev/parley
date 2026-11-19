@@ -364,6 +364,7 @@ func (c *Component) attempt(ctx context.Context, sub Subscription, d delivery, r
 			"webhook_id", sub.ID, "error", err.Error())
 		return idle, c.deps.Clock.Now().Add(secretWait), nil
 	}
+	c.learn(plain)
 	body, err := rec.MarshalJSON()
 	if err != nil {
 		return idle, time.Time{}, err

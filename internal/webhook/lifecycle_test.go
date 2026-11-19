@@ -222,3 +222,42 @@ func (w *world) webhookRows(t *testing.T) map[string]string {
 	}
 	return out
 }
+
+func TestArchived_KeepsDeliveringAndServingTheSubscriptions(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	in := newInbox(t, answerOK)
+	id := w.subscribe(t, demo, map[string]any{"url": in.url(), "types": []string{"parley.workspace.*"}})
+	w.archive(t, demo)
+
+	seq := w.emit(t, demo, "parley.workspace.reactivate", "")
+	waitFor(t, "the event of the archived workspace to be delivered", func() bool { return slices.Contains(in.seqs(), seq) })
+	waitFor(t, "the delivery to be recorded", func() bool { return w.settled(t, id) })
+	delivery := w.deliveries(t, id)[0].id
+
+	for _, call := range []struct {
+		name, method, path string
+		status             int
+	}{
+		{"list", http.MethodGet, hooksPath(demo), http.StatusOK},
+		{"get", http.MethodGet, hookPath(demo, id), http.StatusOK},
+		{"deliveries", http.MethodGet, hookPath(demo, id) + "/deliveries", http.StatusOK},
+		{"ping", http.MethodPost, hookPath(demo, id) + "/ping", http.StatusOK},
+		{"redeliver", http.MethodPost, redeliverPath(id, delivery), http.StatusOK},
+		{"delete", http.MethodDelete, hookPath(demo, id), http.StatusNoContent},
+	} {
+		status, raw := w.Call(t, call.method, call.path, w.ownerKey, nil)
+		if status != call.status {
+			t.Errorf("%s = %d %s, want %d", call.name, status, raw, call.status)
+			continue
+		}
+		if call.name == "ping" || call.name == "redeliver" {
+			if got := decode(t, raw)["status"]; got != "succeeded" {
+				t.Errorf("%s answered status %v, want succeeded", call.name, got)
+			}
+		}
+	}
+	if n := w.count(t, demo); n != 0 {
+		t.Errorf("demo has %d subscriptions after the delete, want none", n)
+	}
+}

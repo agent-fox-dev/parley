@@ -630,8 +630,10 @@ func (c *Component) reread(ctx context.Context, tx *sql.Tx, q request) (Subscrip
 }
 
 // seal seals the signing secret plain of the subscription id under the
-// current key; without one it answers 503 secrets_unavailable.
+// current key, after handing it to the hub's scrubber; without a key it
+// answers 503 secrets_unavailable.
 func (c *Component) seal(id, plain string) ([]byte, error) {
+	c.learn(plain)
 	sealed, err := secret.SealValue(c.deps.Keys(), binding(id), plain)
 	if errors.Is(err, secret.ErrUnavailable) {
 		return nil, secret.UnavailableError

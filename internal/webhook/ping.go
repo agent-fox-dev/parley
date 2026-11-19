@@ -70,12 +70,15 @@ func (c *Component) ping(w http.ResponseWriter, r *http.Request, q request) erro
 }
 
 // open opens the signing secret of sub with the operator's keys as they are
-// now. A secret no key opens, because there is none or the one that sealed
+// now and hands it to the hub's scrubber, which a restart left without it. A secret no key opens, because there is none or the one that sealed
 // it is gone, is 503 secrets_unavailable: nothing leaves the hub unsigned.
 func (c *Component) open(sub Subscription) (string, error) {
 	plain, err := secret.OpenValue(c.deps.Keys(), binding(sub.ID), sub.Sealed)
 	if errors.Is(err, secret.ErrUnavailable) || errors.Is(err, secret.ErrUnreadable) {
 		return "", secret.UnavailableError
+	}
+	if err == nil {
+		c.learn(plain)
 	}
 	return plain, err
 }

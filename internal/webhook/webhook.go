@@ -26,6 +26,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/metrics"
+	"github.com/agent-fox-dev/parley/internal/scrub"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -37,11 +38,13 @@ import (
 // host of a destination (nil for the system's), the dialer that opens the
 // connection of an attempt (nil for a *net.Dialer), the roots a
 // receiver's certificate is verified against (nil for the system's; there is
-// no setting that turns the verification off) and the recorder every
-// delivery attempt is counted with (nil discards the counts). Keys is a
-// function so that
-// the component reads the keys as they are when it needs them; nil is no
-// key. Available nil means a current key is among Keys.
+// no setting that turns the verification off), the recorder every
+// delivery attempt is counted with (nil discards the counts) and the hub's
+// scrubber, which learns every signing secret the component generates or
+// opens, so that no log line or event metadata can hold one (nil for none).
+// Keys is a function so that the component reads the keys as they are when
+// it needs them; nil is no key. Available nil means a current key is among
+// Keys.
 type Deps struct {
 	Store     *store.Store
 	Events    *event.Component
@@ -54,6 +57,7 @@ type Deps struct {
 	Dialer    Dialer
 	RootCAs   *x509.CertPool
 	Recorder  metrics.Recorder
+	Scrubber  *scrub.Scrubber
 }
 
 // Component is the event webhook feature. The hub creates its zero value
@@ -91,4 +95,12 @@ func (c *Component) Bind(d Deps) {
 	}
 	c.deps = d
 	c.sender = newSender(d, buildinfo.Get().Version)
+}
+
+// learn hands the signing secret plain to the hub's scrubber, which then
+// removes it from every later log line and event metadata.
+func (c *Component) learn(plain string) {
+	if c.deps.Scrubber != nil {
+		c.deps.Scrubber.Add(plain)
+	}
 }

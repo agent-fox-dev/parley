@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -126,12 +128,16 @@ func (c *clock) stamp() string { return c.Now().UTC().Truncate(time.Second).Form
 // component; a restart replaces both with those of the new run.
 // The webhook component runs on the world's clock, reports to its metrics
 // and connects through a dialer that reaches loopback receivers alone.
+// key is the secret key the hub starts with, and logger the hub's log of the
+// current run.
 type world struct {
 	*hubtest.Hub
 	clock    *clock
 	log      *event.Component
 	hooks    *webhook.Component
 	metrics  *recorder
+	key      secret.Key
+	logger   *slog.Logger
 	owner    string
 	ownerKey string
 	org      string
@@ -144,6 +150,15 @@ type options struct {
 	// adjust change the webhook component's dependencies before they are
 	// bound.
 	adjust []func(*webhook.Deps)
+	// env is added to the hub's environment after the world's own secret
+	// key, such as other keys.
+	env map[string]string
+	// hubMetrics leaves the webhook component reporting to the hub's
+	// metrics registry instead of the world's recorder.
+	hubMetrics bool
+	// maintenance is the time between two maintenance passes; zero for the
+	// hub's hour.
+	maintenance time.Duration
 }
 
 // newWorld starts a world's hub with opts.
@@ -151,15 +166,25 @@ func newWorld(t *testing.T, opts options) *world {
 	t.Helper()
 	key := make([]byte, 32)
 	_, _ = rand.Read(key)
-	w := &world{clock: newClock(), metrics: &recorder{Recorder: metrics.Discard}}
+	w := &world{clock: newClock(), metrics: &recorder{Recorder: metrics.Discard}, key: key}
+	env := map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)}
+	maps.Copy(env, opts.env)
 	w.Hub = hubtest.StartWith(t, hubtest.Config{
-		TOML: opts.toml,
-		Now:  w.clock.Now,
-		Env:  map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
+		TOML:                opts.toml,
+		Now:                 w.clock.Now,
+		Env:                 env,
+		MaintenanceInterval: opts.maintenance,
 		Compose: func(c *hub.Composition) {
 			w.log, w.hooks = c.Events(), c.Webhooks()
+			c.AddStartHook("webhook-test-logger", func(_ context.Context, rt *hub.Runtime) error {
+				w.logger = rt.Logger
+				return nil
+			})
 			c.AdjustWebhooks(func(d *webhook.Deps) {
-				d.Resolver, d.Clock, d.Recorder, d.Dialer = names, w.clock, w.metrics, &loopbackDialer{}
+				d.Resolver, d.Clock, d.Dialer = names, w.clock, &loopbackDialer{}
+				if !opts.hubMetrics {
+					d.Recorder = w.metrics
+				}
 			})
 			for _, a := range opts.adjust {
 				c.AdjustWebhooks(a)

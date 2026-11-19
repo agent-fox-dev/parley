@@ -1,13 +1,26 @@
 package webhook_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/identity"
+	"github.com/google/uuid"
+)
+
+// The scopes of a PAT the webhook routes ask for.
+const (
+	scopeReadName  = "workspaces:read"
+	scopeWriteName = "workspaces:write"
 )
 
 // listPage is one page of the webhook list.
@@ -230,4 +243,196 @@ func TestGet_AnswersTheSubscriptionWithItsPendingEvents(t *testing.T) {
 			}
 		})
 	}
+}
+
+// routeCall is one of the webhook routes as a test sends it, with the status
+// its handler answers when it succeeds and whether it changes something.
+type routeCall struct {
+	name, method, path string
+	body               any
+	ok                 int
+	writes             bool
+}
+
+// routeCalls are the nine webhook routes of the workspace slug: those with
+// :id on the subscription id, the redelivery on the delivery delivery, the
+// create with body. The delete comes last.
+func routeCalls(slug, id, delivery string, body any) []routeCall {
+	item := hookPath(slug, id)
+	return []routeCall{
+		{"create", http.MethodPost, hooksPath(slug), body, http.StatusCreated, true},
+		{"list", http.MethodGet, hooksPath(slug), nil, http.StatusOK, false},
+		{"get", http.MethodGet, item, nil, http.StatusOK, false},
+		{"update", http.MethodPatch, item, map[string]any{"description": "x"}, http.StatusOK, true},
+		{"rotate-secret", http.MethodPost, item + "/rotate-secret", nil, http.StatusOK, true},
+		{"ping", http.MethodPost, item + "/ping", nil, http.StatusOK, true},
+		{"deliveries", http.MethodGet, item + "/deliveries", nil, http.StatusOK, false},
+		{"redeliver", http.MethodPost, item + "/deliveries/" + delivery + "/redeliver", nil, http.StatusOK, true},
+		{"delete", http.MethodDelete, item, nil, http.StatusNoContent, true},
+	}
+}
+
+// deliveryRows are the delivery records of rows, the webhook rows.
+func deliveryRows(rows map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range rows {
+		if strings.HasPrefix(k, "delivery ") {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func TestAccess_LetsOnlyTheOwnerAndTheAdminTokenUseTheRoutes(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	in := newInbox(t, answerOK)
+	body := map[string]any{"url": in.url(), "types": testTypes}
+	// One subscription of demo with one succeeded delivery, which every
+	// route can address.
+	sub := w.subscribe(t, demo, body)
+	w.emit(t, demo, "parley.test.one", "")
+	waitFor(t, "the subscription to deliver its event", func() bool { return w.settled(t, sub) })
+	delivery := w.deliveries(t, sub)[0].id
+
+	pat := func(permissions ...string) string {
+		return w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: permissions})
+	}
+	member := w.CreateUser(t, "member")
+	w.AddMember(t, w.org, member)
+	memberKey := w.IssueKey(t, member)
+	outsiderKey := w.IssueKey(t, w.CreateUser(t, "outsider"))
+
+	t.Run("the owner and the admin token reach every handler", func(t *testing.T) {
+		for _, caller := range []struct {
+			name, credential string
+			readsOnly        bool
+		}{
+			{"owner API key", w.ownerKey, false},
+			{"admin token", w.Token, false},
+			{"owner PAT with workspaces:write", pat(scopeWriteName), false},
+			{"owner PAT with workspaces:read", pat(scopeReadName), true},
+		} {
+			// Each caller deletes the subscription its create made.
+			created := ""
+			for _, r := range routeCalls(demo, sub, delivery, body) {
+				if caller.readsOnly && r.writes {
+					continue
+				}
+				path := r.path
+				if r.name == "delete" {
+					path = hookPath(demo, created)
+				}
+				status, raw := w.Call(t, r.method, path, caller.credential, r.body)
+				if status != r.ok {
+					t.Errorf("%s: %s = %d %s, want %d", caller.name, r.name, status, raw, r.ok)
+				}
+				if r.name == "create" && status == http.StatusCreated {
+					created, _ = decode(t, raw)["id"].(string)
+				}
+			}
+		}
+	})
+
+	t.Run("everyone else is refused before the handler", func(t *testing.T) {
+		readOnly, unrelated := pat(scopeReadName), pat("changes:read")
+		bound := w.IssuePAT(t, identity.PATSpec{UserID: w.owner, Permissions: []string{scopeWriteName}, Workspace: demo})
+		waitFor(t, "the subscription to examine every event", func() bool { return w.settled(t, sub) })
+		configured, deliveries := w.configured(t), deliveryRows(w.webhookRows(t))
+		seq, sent := w.lastSeq(t), len(in.requests())
+		for _, caller := range []struct {
+			name, credential string
+			status           int
+			errorType        string
+			writesOnly       bool
+		}{
+			{"org member", memberKey, http.StatusForbidden, "forbidden", false},
+			{"user without access", outsiderKey, http.StatusNotFound, "not_found", false},
+			{"owner PAT bound to demo", bound, http.StatusForbidden, "token_bound", false},
+			{"owner PAT with workspaces:read alone", readOnly, http.StatusForbidden, "insufficient_scope", true},
+			{"owner PAT with changes:read alone", unrelated, http.StatusForbidden, "insufficient_scope", false},
+		} {
+			for _, r := range routeCalls(demo, sub, delivery, body) {
+				if caller.writesOnly && !r.writes {
+					continue
+				}
+				status, raw := w.Call(t, r.method, r.path, caller.credential, r.body)
+				if status != caller.status || errorOf(t, raw)["error_type"] != caller.errorType {
+					t.Errorf("%s: %s = %d %s, want %d %s", caller.name, r.name, status, raw, caller.status, caller.errorType)
+				}
+			}
+		}
+		if after := w.configured(t); !reflect.DeepEqual(after, configured) {
+			t.Errorf("after the refusals the subscriptions are\n%v\nwant\n%v", after, configured)
+		}
+		if after := deliveryRows(w.webhookRows(t)); !reflect.DeepEqual(after, deliveries) {
+			t.Errorf("after the refusals the delivery records are\n%v\nwant\n%v", after, deliveries)
+		}
+		// The binding guard records each refusal of a bound token in the
+		// log; nothing else is written.
+		for _, typ := range w.cellsOf(t, fmt.Sprintf(`SELECT type FROM hub_events WHERE seq > %d`, seq)) {
+			if typ != "parley.token.bound_refused" {
+				t.Errorf("the refusals wrote the event %s", typ)
+			}
+		}
+		if n := len(in.requests()); n != sent {
+			t.Errorf("the receiver got %d requests during the refusals, want none", n-sent)
+		}
+	})
+
+	t.Run("a task fork is refused whatever the body", func(t *testing.T) {
+		const fork = "demo--t1"
+		// The org member owns the fork, and has a level on its parent.
+		w.AddWorkspace(t, access.Record{Slug: fork, Kind: access.KindFork, ParentSlug: demo, OwnerID: member, OrgID: w.org, Status: access.StatusReady})
+		for _, caller := range []struct{ name, credential string }{
+			{"the fork's owner", memberKey},
+			{"admin token", w.Token},
+		} {
+			for _, r := range routeCalls(fork, "abc", "abc", map[string]any{"url": "ftp://x"}) {
+				status, raw := w.Call(t, r.method, r.path, caller.credential, r.body)
+				if status != http.StatusBadRequest || errorOf(t, raw)["error_type"] != "not_supported_on_fork" {
+					t.Errorf("%s: %s = %d %s, want 400 not_supported_on_fork", caller.name, r.name, status, raw)
+				}
+			}
+		}
+		if n := w.count(t, fork); n != 0 {
+			t.Errorf("the fork has %d subscriptions, want none", n)
+		}
+	})
+
+	t.Run("an id that names no subscription of the workspace", func(t *testing.T) {
+		elsewhere := w.subscribe(t, other, body)
+		waitFor(t, "the subscription of other to examine every event", func() bool { return w.settled(t, elsewhere) })
+		ofOther := func(rows map[string]string) map[string]string {
+			out := map[string]string{}
+			for k, v := range rows {
+				if strings.Contains(k, elsewhere) {
+					out[k] = v
+				}
+			}
+			return out
+		}
+		before := ofOther(w.webhookRows(t))
+		for _, r := range routeCalls(demo, "abc", delivery, nil)[2:] {
+			status, raw := w.Call(t, r.method, r.path, w.ownerKey, r.body)
+			if status != http.StatusBadRequest || errorOf(t, raw)["error_type"] != "invalid_request" {
+				t.Errorf("%s with id abc = %d %s, want 400 invalid_request", r.name, status, raw)
+			}
+		}
+		unknown := routeCalls(demo, uuid.NewString(), delivery, nil)[2:]
+		foreign := routeCalls(demo, elsewhere, delivery, nil)[2:]
+		for i := range unknown {
+			s1, b1 := w.Call(t, unknown[i].method, unknown[i].path, w.ownerKey, unknown[i].body)
+			s2, b2 := w.Call(t, foreign[i].method, foreign[i].path, w.ownerKey, foreign[i].body)
+			if s1 != http.StatusNotFound || errorOf(t, b1)["error_type"] != "webhook_not_found" {
+				t.Errorf("%s with an unknown id = %d %s, want 404 webhook_not_found", unknown[i].name, s1, b1)
+			}
+			if s2 != http.StatusNotFound || !bytes.Equal(b1, b2) {
+				t.Errorf("%s with the id of other's subscription = %d %s, want the unknown id's answer %s", foreign[i].name, s2, b2, b1)
+			}
+		}
+		if after := ofOther(w.webhookRows(t)); len(after) == 0 || !reflect.DeepEqual(after, before) {
+			t.Errorf("the subscription of other is\n%v\nwant it unchanged\n%v", after, before)
+		}
+	})
 }
