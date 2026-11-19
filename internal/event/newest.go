@@ -2,10 +2,14 @@ package event
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
@@ -60,22 +64,36 @@ func (q NewestQuery) equals() []equal {
 // ReadNewest reads the stored hub events q asks for that caller may see
 // (Visible), ordered by time, then id, both descending, at most q.Limit of
 // them. It reads every stored event, also those that have left the event
-// log, and never one of type parley.webhook.ping. It reads in batches until
-// it holds q.Limit events or has read the last one, and decides the
-// visibility of all of them with one viewer, so access is read once per
-// call.
+// log, and never one of type parley.webhook.ping. It reads only the events
+// of the workspaces and scopes the caller may see, through the indexes of
+// ReadIndexStep, so that a page for a caller who sees few events does not
+// read the whole table. It reads in batches until it holds q.Limit events
+// or has read the last one, and decides the visibility of all of them with
+// one viewer, so access is read once per call.
 func (c *Component) ReadNewest(ctx context.Context, caller Caller, q NewestQuery) ([]Record, error) {
 	if c.deps.Store == nil {
 		return nil, errNotBound
 	}
+	return c.readVisible(ctx, c.deps.Store.Main(), caller, q)
+}
+
+// readVisible is ReadNewest reading the stored events from db.
+func (c *Component) readVisible(ctx context.Context, db Querier, caller Caller, q NewestQuery) ([]Record, error) {
 	if q.Limit <= 0 {
 		return nil, nil
 	}
 	v := c.newViewer(caller)
+	sees, err := v.candidates(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the newest events: %w", err)
+	}
+	if sees.none {
+		return nil, nil
+	}
 	batch := max(q.Limit, newestBatch)
 	var found []Record
 	for {
-		recs, err := readNewest(ctx, c.deps.Store.Main(), q, batch)
+		recs, err := readNewest(ctx, db, q, sees, batch)
 		if err != nil {
 			return nil, fmt.Errorf("read the newest events: %w", err)
 		}
@@ -99,10 +117,13 @@ func (c *Component) ReadNewest(ctx context.Context, caller Caller, q NewestQuery
 	}
 }
 
-// readNewest reads at most limit of the stored events q asks for in db,
-// newest first, whoever may see them.
-func readNewest(ctx context.Context, db Querier, q NewestQuery, limit int) ([]Record, error) {
+// readNewest reads at most limit of the stored events q asks for in db
+// that meet sees, newest first.
+func readNewest(ctx context.Context, db Querier, q NewestQuery, sees candidates, limit int) ([]Record, error) {
 	conds, args := []string{"type <> ?"}, []any{pingType}
+	if len(sees.ors) > 0 {
+		conds, args = append(conds, "("+strings.Join(sees.ors, " OR ")+")"), append(args, sees.args...)
+	}
 	for _, f := range q.equals() {
 		if f.value != nil {
 			conds, args = append(conds, f.column+" = ?"), append(args, *f.value)
@@ -134,6 +155,134 @@ ORDER BY time DESC, id DESC LIMIT ?`, append(args, limit)...)
 		return nil, err
 	}
 	return scanRecords(rows)
+}
+
+// candidates is a condition on a stored event that every event a caller
+// may see meets: one of its terms, ors, with their arguments; every event
+// when there is none, and no event when none is set. It only narrows what
+// a read reads, so that the read uses the indexes of ReadIndexStep instead
+// of walking the table: Visible still decides every event read.
+type candidates struct {
+	none bool
+	ors  []string
+	args []any
+}
+
+// add adds the term cond with its arguments.
+func (c *candidates) add(cond string, args ...any) {
+	c.ors, c.args = append(c.ors, cond), append(c.args, args...)
+}
+
+// in adds the term that column holds one of slugs, given as one JSON array
+// so that a set of any size is one argument, and, when members is set, that
+// the event's type is not one only owners see. No slug adds no term.
+func (c *candidates) in(column string, slugs []string, members bool) {
+	if len(slugs) == 0 {
+		return
+	}
+	list, _ := json.Marshal(slugs)
+	cond := column + " IN (SELECT value FROM json_each(?))"
+	if members {
+		cond = "(" + cond + " AND NOT " + ownerOnlyCondition + ")"
+	}
+	c.add(cond, string(list))
+}
+
+// ownerOnlyCondition is the condition that an event's type is one of
+// ownerOnly. The prefixes are constants without quotes, so they are
+// written into the text.
+var ownerOnlyCondition = func() string {
+	ors := make([]string, len(ownerOnly))
+	for i, p := range ownerOnly {
+		ors[i] = fmt.Sprintf("substr(type, 1, %d) = '%s'", len(p), p)
+	}
+	return "(" + strings.Join(ors, " OR ") + ")"
+}()
+
+// scopeCondition is the condition that an event of no workspace has the
+// metadata.scope and metadata.scope_id given as its arguments, written as
+// ReadIndexStep indexes it. It compares with = and not IN, which the
+// planner cannot look up in an index of an expression.
+const scopeCondition = `(workspace IS NULL AND json_extract(metadata, '$.scope') = ?
+	AND json_extract(metadata, '$.scope_id') = ?)`
+
+// candidates is the condition every event the viewer's caller may see
+// meets, from the rule Visible applies: an event of a workspace needs a
+// level on the workspace or on the fork parent stored with it, owner or
+// above for a type of ownerOnly; an event of no workspace needs the user's
+// own scope or one of their active orgs; a bound token sees only the
+// workspaces its binding covers, which are the bound workspace and forks
+// of it, and the change events of the parent of the fork it is bound to.
+func (v *viewer) candidates(ctx context.Context) (candidates, error) {
+	var c candidates
+	switch {
+	case v.caller.Admin:
+		return c, nil
+	case v.caller.UserID == "", v.caller.Bound() && v.coverage == nil:
+		return candidates{none: true}, nil
+	}
+	readable, err := v.readableSet(ctx)
+	if err != nil {
+		return c, fmt.Errorf("read the readable set of the caller: %w", err)
+	}
+	if readable.All {
+		return c, nil
+	}
+	slugs := slices.Sorted(maps.Keys(readable.Entries))
+	if v.caller.Bound() {
+		covered := []string{v.caller.Workspace}
+		for _, slug := range slugs {
+			if slug == v.caller.Workspace {
+				continue
+			}
+			ok, err := v.covers(ctx, slug)
+			if err != nil {
+				return c, err
+			}
+			if ok {
+				covered = append(covered, slug)
+			}
+		}
+		c.in("workspace", covered, false)
+		// The forks a binding covers are forks of the bound workspace, so
+		// their events are stored with it as their parent.
+		c.in("parent_slug", []string{v.caller.Workspace}, false)
+		if v.sources != nil {
+			parent, err := v.boundParent(ctx)
+			if err != nil {
+				return c, err
+			}
+			if parent != "" {
+				c.add("(workspace = ? AND resource_type = 'change')", parent)
+			}
+		}
+	} else {
+		var owners, members []string
+		for _, slug := range slugs {
+			switch readable.Level(slug) {
+			case access.LevelAdmin, access.LevelOwner:
+				owners = append(owners, slug)
+			case access.LevelMember:
+				members = append(members, slug)
+			}
+		}
+		c.in("workspace", owners, false)
+		c.in("parent_slug", owners, false)
+		c.in("workspace", members, true)
+		c.in("parent_slug", members, true)
+		c.add(scopeCondition, "user", v.caller.UserID)
+		orgs, err := v.activeOrgs(ctx)
+		if err != nil {
+			return c, err
+		}
+		for _, org := range orgs {
+			c.add(scopeCondition, "org", org)
+		}
+	}
+	if len(c.ors) == 0 {
+		return candidates{none: true}, nil
+	}
+	return c, nil
 }
 
 // typesCondition is the condition that an event's type matches one of the

@@ -325,7 +325,7 @@ type stores struct {
 func openStores(t *testing.T) *stores {
 	t.Helper()
 	dir := t.TempDir()
-	steps := append([]store.Step{access.SchemaStep, access.CreatingTokenStep, event.SchemaStep, session.SchemaStep},
+	steps := append([]store.Step{access.SchemaStep, access.CreatingTokenStep, event.SchemaStep, event.ReadIndexStep, session.SchemaStep},
 		telemetry.SchemaSteps...)
 	st, err := store.Open(context.Background(), store.Options{
 		DatabasePath: filepath.Join(dir, "parley.db"), WorkspaceRoot: filepath.Join(dir, "workspaces"),

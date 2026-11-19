@@ -210,15 +210,9 @@ func (v *viewer) visible(ctx context.Context, rec Record) (bool, error) {
 // byLevel decides an event of a workspace by the user's level on the
 // workspace and on its stored fork parent.
 func (v *viewer) byLevel(ctx context.Context, rec Record) (bool, error) {
-	if v.readable == nil {
-		var set access.ReadableSet
-		if a := v.c.deps.Access; a != nil {
-			var err error
-			if set, err = a.Readable(ctx, v.caller.accessCaller()); err != nil {
-				return false, fmt.Errorf("decide the visibility of event %d: %w", rec.Seq, err)
-			}
-		}
-		v.readable = &set
+	readable, err := v.readableSet(ctx)
+	if err != nil {
+		return false, fmt.Errorf("decide the visibility of event %d: %w", rec.Seq, err)
 	}
 	slugs := []string{*rec.Workspace}
 	if rec.parent != "" {
@@ -226,7 +220,7 @@ func (v *viewer) byLevel(ctx context.Context, rec Record) (bool, error) {
 	}
 	owners := isOwnerOnly(rec.Type)
 	for _, slug := range slugs {
-		switch v.readable.Level(slug) {
+		switch readable.Level(slug) {
 		case access.LevelAdmin, access.LevelOwner:
 			return true, nil
 		case access.LevelMember:
@@ -236,6 +230,54 @@ func (v *viewer) byLevel(ctx context.Context, rec Record) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// readableSet is the user's readable set, read on first use; empty without
+// an access rule.
+func (v *viewer) readableSet(ctx context.Context) (access.ReadableSet, error) {
+	if v.readable == nil {
+		var set access.ReadableSet
+		if a := v.c.deps.Access; a != nil {
+			var err error
+			if set, err = a.Readable(ctx, v.caller.accessCaller()); err != nil {
+				return access.ReadableSet{}, err
+			}
+		}
+		v.readable = &set
+	}
+	return *v.readable, nil
+}
+
+// activeOrgs are the ids of the active orgs of the user, read on first use;
+// none without a membership source.
+func (v *viewer) activeOrgs(ctx context.Context) ([]string, error) {
+	if !v.orgsRead {
+		if m := v.c.deps.Memberships; m != nil {
+			orgs, err := m.ActiveOrgIDs(ctx, v.caller.UserID)
+			if err != nil {
+				return nil, fmt.Errorf("read the active orgs of the caller: %w", err)
+			}
+			v.orgs = orgs
+		}
+		v.orgsRead = true
+	}
+	return v.orgs, nil
+}
+
+// boundParent is the parent of the task fork the caller is bound to, read
+// on first use; "" when the binding is not a task fork.
+func (v *viewer) boundParent(ctx context.Context) (string, error) {
+	if !v.parentRead {
+		if p, d := v.c.deps.Parents, v.c.deps.Store; p != nil && d != nil {
+			parent, err := p.ForkParent(ctx, d.Main(), v.caller.Workspace)
+			if err != nil {
+				return "", fmt.Errorf("read the workspace record: %w", err)
+			}
+			v.parent = parent
+		}
+		v.parentRead = true
+	}
+	return v.parent, nil
 }
 
 // scoped decides an event of no workspace by its metadata.scope.
@@ -248,15 +290,11 @@ func (v *viewer) scoped(ctx context.Context, rec Record) (bool, error) {
 	case "user":
 		return id == v.caller.UserID, nil
 	case "org":
-		if !v.orgsRead {
-			if m := v.c.deps.Memberships; m != nil {
-				if v.orgs, err = m.ActiveOrgIDs(ctx, v.caller.UserID); err != nil {
-					return false, fmt.Errorf("decide the visibility of event %d: read the active orgs of the caller: %w", rec.Seq, err)
-				}
-			}
-			v.orgsRead = true
+		orgs, err := v.activeOrgs(ctx)
+		if err != nil {
+			return false, fmt.Errorf("decide the visibility of event %d: %w", rec.Seq, err)
 		}
-		return id != "" && slices.Contains(v.orgs, id), nil
+		return id != "" && slices.Contains(orgs, id), nil
 	default:
 		return false, nil
 	}
@@ -309,21 +347,17 @@ func (v *viewer) forkChange(ctx context.Context, rec Record) (bool, error) {
 	if err != nil || number <= 0 {
 		return false, nil
 	}
-	if !v.parentRead {
-		if p, d := v.c.deps.Parents, v.c.deps.Store; p != nil && d != nil {
-			if v.parent, err = p.ForkParent(ctx, d.Main(), v.caller.Workspace); err != nil {
-				return false, fmt.Errorf("decide the visibility of event %d: read the workspace record: %w", rec.Seq, err)
-			}
-		}
-		v.parentRead = true
+	parent, err := v.boundParent(ctx)
+	if err != nil {
+		return false, fmt.Errorf("decide the visibility of event %d: %w", rec.Seq, err)
 	}
-	if v.parent == "" || *rec.Workspace != v.parent {
+	if parent == "" || *rec.Workspace != parent {
 		return false, nil
 	}
 	key := rec.ResourceID
 	source, seen := v.changeSource[key]
 	if !seen {
-		if source, err = v.sources.ChangeSource(ctx, v.parent, number); err != nil {
+		if source, err = v.sources.ChangeSource(ctx, parent, number); err != nil {
 			return false, fmt.Errorf("decide the visibility of event %d: read the change's source: %w", rec.Seq, err)
 		}
 		if v.changeSource == nil {

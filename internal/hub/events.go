@@ -38,6 +38,7 @@ func composeEvents(c *Composition) {
 		c.errs = append(c.errs, err)
 	}
 	c.AddSchemaStep(event.SchemaStep)
+	c.AddSchemaStep(event.ReadIndexStep)
 	c.AddStartHook(eventsHook, func(_ context.Context, rt *Runtime) error {
 		settings := event.SettingsFrom(rt.Config)
 		return c.events.Bind(event.Deps{
