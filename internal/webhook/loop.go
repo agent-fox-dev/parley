@@ -368,7 +368,7 @@ func (c *Component) attempt(ctx context.Context, sub Subscription, d delivery, r
 	if out.success {
 		return c.succeeded(ctx, sub, d, at, out)
 	}
-	return c.failed(ctx, d, at, out)
+	return c.failed(ctx, sub, d, at, out)
 }
 
 // succeeded records the successful attempt at at of the delivery d of sub,
@@ -390,12 +390,34 @@ func (c *Component) succeeded(ctx context.Context, sub Subscription, d delivery,
 	return again, time.Time{}, nil
 }
 
-// failed records the failed attempt at at of the delivery d, which stays
-// pending for the next attempt.
-func (c *Component) failed(ctx context.Context, d delivery, at time.Time, out outcome) (next, time.Time, error) {
-	if _, err := recordAttempt(ctx, c.deps.Store.Main(), d, at, out, deliveryPending, nil); err != nil {
+// failed records the failed attempt at at of the delivery d of sub, in one
+// transaction: the delivery stays pending with its next attempt scheduled
+// (nextAttempt), and the subscription gets last_status failed,
+// last_delivery_at and, when it has none, failing_since. The loop then waits
+// for that time and sends nothing else for sub meanwhile, so that no later
+// event overtakes the pending one; a wake-up before it changes nothing, since
+// resume waits again.
+func (c *Component) failed(ctx context.Context, sub Subscription, d delivery, at time.Time, out outcome) (next, time.Time, error) {
+	first := at
+	if d.FirstAttemptAt != nil {
+		first = *d.FirstAttemptAt
+	}
+	due := nextAttempt(first, at, d.Attempts+1)
+	var recorded bool
+	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if recorded, err = recordAttempt(ctx, tx, d, at, out, deliveryPending, &due); err != nil || !recorded {
+			return err
+		}
+		return recordFailure(ctx, tx, sub.ID, at)
+	})
+	if err != nil {
 		return idle, time.Time{}, err
 	}
+	if !recorded {
+		// Something ended the delivery while the attempt was in flight.
+		return again, time.Time{}, nil
+	}
 	c.report(resultRetry)
-	return idle, time.Time{}, nil
+	return idle, due, nil
 }

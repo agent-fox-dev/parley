@@ -1,12 +1,16 @@
 package webhook_test
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // secretShape is the form of a signing secret as a create shows it.
@@ -545,5 +549,101 @@ func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T)
 				t.Errorf("event metadata = %v, want %v", e.Metadata, want)
 			}
 		})
+	}
+}
+
+func TestUpdate_AppliesTheChangeFromTheNextAttemptAndKeepsThePendingDelivery(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	failing := newInbox(t, func(delivered, <-chan struct{}) int { return http.StatusInternalServerError })
+	healthy := newInbox(t, answerOK)
+	id := w.subscribe(t, demo, map[string]any{"url": failing.url(), "types": []string{"*"}})
+	e1 := w.emit(t, demo, "parley.change.open", "")
+	pending := w.retrying(t, id, 1)
+	e2 := w.emit(t, demo, "parley.git.push", "")
+	e3 := w.emit(t, demo, "parley.change.open", "")
+
+	status, raw := w.Call(t, http.MethodPatch, hookPath(demo, id), w.ownerKey,
+		map[string]any{"url": healthy.url(), "types": []string{"parley.change.*"}, "description": "d"})
+	if status != http.StatusOK {
+		t.Fatalf("PATCH = %d %s, want 200", status, raw)
+	}
+	before := len(failing.requests())
+	obj := decode(t, raw)
+	if obj["url"] != healthy.url() || obj["description"] != "d" || obj["include_forks"] != true ||
+		!reflect.DeepEqual(obj["types"], []any{"parley.change.*"}) || obj["updated_at"] != w.clock.stamp() {
+		t.Errorf("PATCH answered %v, want the new url, types and description, include_forks true as before, updated_at %s", obj, w.clock.stamp())
+	}
+	updates := w.events(t, "parley.webhook.update")
+	if len(updates) != 1 {
+		t.Fatalf("the log holds %d update events, want 1", len(updates))
+	}
+	if m := updates[0].Metadata; !reflect.DeepEqual(m["fields"], []any{"url", "types", "description"}) || m["state"] != "active" {
+		t.Errorf("update event metadata = %v, want fields [url types description] and state active", m)
+	}
+	if n := len(healthy.requests()); n != 0 {
+		t.Errorf("the new url got %d requests before the next attempt was due, want 0", n)
+	}
+
+	w.clock.advance(10 * time.Second)
+	waitFor(t, "the loop to settle at the new url", func() bool { return w.settled(t, id) })
+	got := healthy.requests()
+	if seqs := healthy.seqs(); !reflect.DeepEqual(seqs, []int64{e1, e3}) {
+		t.Errorf("the new url got seqs %v, want e1 %d then e3 %d (never e2 %d)", seqs, e1, e3, e2)
+	}
+	if len(got) > 0 && got[0].delivery != pending.id {
+		t.Errorf("the new url got e1 under delivery %s, want the pending delivery's %s", got[0].delivery, pending.id)
+	}
+	if n := len(failing.requests()); n != before {
+		t.Errorf("the old url got %d requests after the PATCH, want none", n-before)
+	}
+}
+
+// signedWith reports whether the request d carries the signature of its
+// timestamp and body under the signing secret key.
+func signedWith(d delivered, key string) bool {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(d.timestamp + "." + string(d.body)))
+	return hmac.Equal([]byte(d.signature), []byte("sha256="+hex.EncodeToString(mac.Sum(nil))))
+}
+
+func TestRotate_SignsTheNextAttemptOfAPendingDeliveryWithTheNewSecret(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	in := newInbox(t, func(delivered, <-chan struct{}) int { return http.StatusInternalServerError })
+	created := w.mustCreate(t, demo, in.url())
+	id, _ := created["id"].(string)
+	s1, _ := created["secret"].(string)
+	w.emit(t, demo, "parley.change.open", "")
+	w.retrying(t, id, 1)
+
+	status, raw := w.Call(t, http.MethodPost, hookPath(demo, id)+"/rotate-secret", w.ownerKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("rotate = %d %s, want 200", status, raw)
+	}
+	s2, _ := decode(t, raw)["secret"].(string)
+	if !secretShape.MatchString(s2) || s2 == s1 {
+		t.Errorf("rotated secret = %q, want a new whsec_ secret other than %q", s2, s1)
+	}
+	if n := len(in.requests()); n != 1 {
+		t.Errorf("the receiver got %d requests before the next attempt was due, want 1", n)
+	}
+
+	w.clock.advance(10 * time.Second)
+	w.retrying(t, id, 2)
+	got := in.requests()
+	if len(got) != 2 {
+		t.Fatalf("the receiver got %d requests, want 2", len(got))
+	}
+	if !signedWith(got[0], s1) || signedWith(got[1], s1) || !signedWith(got[1], s2) {
+		t.Errorf("signatures: request 1 under s1 %t; request 2 under s1 %t, under s2 %t; want true, false, true",
+			signedWith(got[0], s1), signedWith(got[1], s1), signedWith(got[1], s2))
+	}
+	if got[0].delivery != got[1].delivery {
+		t.Errorf("the attempts carry deliveries %s and %s, want one", got[0].delivery, got[1].delivery)
+	}
+	updates := w.events(t, "parley.webhook.update")
+	if len(updates) != 1 || !reflect.DeepEqual(updates[0].Metadata["fields"], []any{"secret"}) {
+		t.Errorf("update events = %+v, want one with fields [secret]", updates)
 	}
 }

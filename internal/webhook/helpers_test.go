@@ -400,13 +400,16 @@ func errorOf(t *testing.T, raw []byte) map[string]any {
 // 127.0.0.1.
 const insecure = "[webhooks]\nallow_insecure = true\n"
 
-// delivered is a request a receiver got: the event's seq and type and the
-// delivery's id from its headers, and its body.
+// delivered is a request a receiver got: the event's seq and type, the
+// delivery's id, the timestamp and the signature from its headers, and its
+// body.
 type delivered struct {
-	seq      int64
-	typ      string
-	delivery string
-	body     []byte
+	seq       int64
+	typ       string
+	delivery  string
+	timestamp string
+	signature string
+	body      []byte
 }
 
 // inbox is a webhook receiver on 127.0.0.1 that records every request and
@@ -426,7 +429,10 @@ func newInbox(t *testing.T, answer func(d delivered, stop <-chan struct{}) int) 
 	in.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		seq, _ := strconv.ParseInt(r.Header.Get("Parley-Seq"), 10, 64)
-		d := delivered{seq: seq, typ: r.Header.Get("Parley-Event"), delivery: r.Header.Get("Parley-Delivery"), body: body}
+		d := delivered{
+			seq: seq, typ: r.Header.Get("Parley-Event"), delivery: r.Header.Get("Parley-Delivery"),
+			timestamp: r.Header.Get("Parley-Timestamp"), signature: r.Header.Get("Parley-Signature"), body: body,
+		}
 		in.mu.Lock()
 		in.got = append(in.got, d)
 		in.mu.Unlock()
@@ -555,4 +561,35 @@ func (w *world) settled(t *testing.T, id string) bool {
 		}
 	}
 	return true
+}
+
+// retrying waits until the pending delivery of the subscription id has had
+// attempts attempts and has its next one scheduled, and returns it.
+func (w *world) retrying(t *testing.T, id string, attempts int) deliveryRow {
+	t.Helper()
+	var d deliveryRow
+	waitFor(t, fmt.Sprintf("attempt %d to fail and the next to be scheduled", attempts), func() bool {
+		for _, r := range w.deliveries(t, id) {
+			if r.status == "pending" && r.attempts == attempts && r.nextAttemptAt.Valid {
+				d = r
+				return true
+			}
+		}
+		return false
+	})
+	return d
+}
+
+// drive moves the clock step at a time, as time passing would, until cond
+// holds, and fails the test when it does not within 10 s of real time.
+func (w *world) drive(t *testing.T, what string, step time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("drove the clock for 10 s waiting for %s", what)
+		}
+		w.clock.advance(step)
+		time.Sleep(5 * time.Millisecond)
+	}
 }

@@ -2,6 +2,7 @@ package webhook_test
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"reflect"
 	"slices"
@@ -269,13 +270,16 @@ func TestDelivery_SkipsEventsThatLeftTheLog(t *testing.T) {
 			if got, err := w.log.Expire(context.Background(), w.clock.Now()); err != nil || got != oldest {
 				t.Fatalf("Expire = %d, %v, want oldest seq %d", got, err, oldest)
 			}
+			// Read before the held attempt ends: a failed attempt sets
+			// failing_since and the success of the oldest event clears it, so
+			// only the run as a whole is free of what the skip would change.
+			before := w.row(t, id)
 			release <- tc.answer
 
 			waitFor(t, "the first attempt to be recorded", func() bool {
 				ds := w.deliveries(t, id)
 				return len(ds) > 0 && ds[0].attempts > 0
 			})
-			before := w.row(t, id)
 			// A retry waits on the clock: move it past any wait.
 			w.clock.advance(time.Hour)
 			waitFor(t, "the receiver to get the oldest event", func() bool { return slices.Contains(in.seqs(), oldest) })
@@ -303,5 +307,73 @@ func TestDelivery_SkipsEventsThatLeftTheLog(t *testing.T) {
 				t.Errorf("the log holds parley.webhook.failing events %+v, want none", got)
 			}
 		})
+	}
+}
+
+func TestDelivery_SendsInSeqOrderOneAttemptAtATimeAndRepeatsAnEventUnderItsDeliveryID(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	var inFlight, most atomic.Int32
+	var e3 atomic.Int64
+	var e3Failures atomic.Int32
+	in := newInbox(t, func(d delivered, _ <-chan struct{}) int {
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+		}
+		// Hold each request a moment, so that a second one sent meanwhile
+		// would overlap it.
+		time.Sleep(time.Millisecond)
+		if d.seq == e3.Load() && e3Failures.Add(1) <= 2 {
+			return http.StatusInternalServerError
+		}
+		return http.StatusOK
+	})
+	id := w.subscribe(t, demo, map[string]any{"url": in.url(), "types": []string{"parley.test.*"}})
+
+	// Twenty events in one commit, so that the loop has them all at once.
+	var seqs []int64
+	err := w.Store.Tx(context.Background(), func(tx *sql.Tx) error {
+		slug := demo
+		for range 20 {
+			rec, err := w.log.Emit(context.Background(), tx, event.Input{
+				Type: "parley.test.event", Workspace: &slug, ActorType: event.ActorSystem, ResourceType: "test", ResourceID: "r1",
+			})
+			if err != nil {
+				return err
+			}
+			seqs = append(seqs, rec.Seq)
+		}
+		e3.Store(seqs[2])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("write the events: %v", err)
+	}
+	w.drive(t, "every event to be delivered", 10*time.Second, func() bool { return w.settled(t, id) })
+
+	got := in.requests()
+	if distinct := slices.Compact(in.seqs()); !reflect.DeepEqual(distinct, seqs) {
+		t.Errorf("distinct seqs in arrival order = %v, want %v", distinct, seqs)
+	}
+	var e3Requests []int
+	for i, d := range got {
+		if d.seq == seqs[2] {
+			e3Requests = append(e3Requests, i)
+		}
+	}
+	if len(e3Requests) != 3 {
+		t.Fatalf("the receiver got %d requests for e3, want 3", len(e3Requests))
+	}
+	for i := e3Requests[0]; i <= e3Requests[2]; i++ {
+		if got[i].seq != seqs[2] {
+			t.Errorf("request %d between the first and the last request for e3 carries seq %d", i, got[i].seq)
+		}
+		if got[i].delivery != got[e3Requests[0]].delivery {
+			t.Errorf("request %d for e3 carries delivery %s, want the first attempt's %s", i, got[i].delivery, got[e3Requests[0]].delivery)
+		}
+	}
+	if m := most.Load(); m != 1 {
+		t.Errorf("the receiver had at most %d requests at once, want 1", m)
 	}
 }
