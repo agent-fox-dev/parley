@@ -9,9 +9,13 @@
 // package secret's SealValue. Every change of a subscription writes its
 // parley.webhook.* event in the transaction of the change.
 //
+// Each active or failing subscription has a delivery loop of its own, which
+// reads the event log by position (ADR 05) and is woken by the event
+// component's notification of a commit.
+//
 // The hub composes the component in internal/hub/webhook.go: it creates the
-// zero value while it composes, registers its keys, schema and routes, and
-// binds it in a start hook.
+// zero value while it composes, registers its keys, schema and routes, binds
+// it in a start hook and runs its loops as background work.
 package webhook
 
 import (
@@ -21,6 +25,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/buildinfo"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/metrics"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -30,9 +35,11 @@ import (
 // can be stored, its clock (nil for the system clock), its log (nil discards
 // it), the loaded [webhooks] settings, the resolver that looks up the
 // host of a destination (nil for the system's), the dialer that opens the
-// connection of an attempt (nil for a *net.Dialer) and the roots a
+// connection of an attempt (nil for a *net.Dialer), the roots a
 // receiver's certificate is verified against (nil for the system's; there is
-// no setting that turns the verification off). Keys is a function so that
+// no setting that turns the verification off) and the recorder every
+// delivery attempt is counted with (nil discards the counts). Keys is a
+// function so that
 // the component reads the keys as they are when it needs them; nil is no
 // key. Available nil means a current key is among Keys.
 type Deps struct {
@@ -46,6 +53,7 @@ type Deps struct {
 	Resolver  Resolver
 	Dialer    Dialer
 	RootCAs   *x509.CertPool
+	Recorder  metrics.Recorder
 }
 
 // Component is the event webhook feature. The hub creates its zero value
@@ -53,6 +61,7 @@ type Deps struct {
 type Component struct {
 	deps   Deps
 	sender *sender
+	loops  loops
 }
 
 // Bind gives the component its dependencies, filling the defaults of the
@@ -69,6 +78,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Dialer == nil {
 		d.Dialer = &net.Dialer{}
+	}
+	if d.Recorder == nil {
+		d.Recorder = metrics.Discard
 	}
 	if d.Keys == nil {
 		d.Keys = func() secret.Keys { return secret.Keys{} }

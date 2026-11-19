@@ -304,7 +304,7 @@ func TestUpdate_RefusesABodyThatBreaksAFieldRule(t *testing.T) {
 		{"a body that is not an object", []string{"description"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+			rows, seq := w.configured(t), w.lastSeq(t)
 			status, raw := w.Call(t, http.MethodPatch, hookPath(demo, id), w.ownerKey, tc.body)
 			if status != http.StatusBadRequest {
 				t.Fatalf("PATCH = %d %s, want 400", status, raw)
@@ -312,7 +312,7 @@ func TestUpdate_RefusesABodyThatBreaksAFieldRule(t *testing.T) {
 			if e := errorOf(t, raw); e["error_type"] != "invalid_request" {
 				t.Errorf("error_type = %v, want invalid_request", e["error_type"])
 			}
-			if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+			if got := w.configured(t); !reflect.DeepEqual(got, rows) {
 				t.Errorf("rows = %v\nwant   %v", got, rows)
 			}
 			if got := w.lastSeq(t); got != seq {
@@ -379,7 +379,7 @@ func TestSetURL_RefusesADestinationInTheHubsNetworks(t *testing.T) {
 							return w.Call(t, http.MethodPatch, hookPath(demo, id), w.ownerKey, map[string]any{"url": r.url})
 						}, http.StatusOK},
 					} {
-						rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+						rows, seq := w.configured(t), w.lastSeq(t)
 						status, raw := op.send()
 						if r.want == "" {
 							if status != op.status {
@@ -394,7 +394,7 @@ func TestSetURL_RefusesADestinationInTheHubsNetworks(t *testing.T) {
 						if e := errorOf(t, raw); e["error_type"] != r.want {
 							t.Errorf("%s error_type = %v, want %s", op.name, e["error_type"], r.want)
 						}
-						if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+						if got := w.configured(t); !reflect.DeepEqual(got, rows) {
 							t.Errorf("%s changed the subscriptions:\n%v\nwant\n%v", op.name, got, rows)
 						}
 						if got := w.lastSeq(t); got != seq {
@@ -422,7 +422,7 @@ func TestChange_RefusesAnArchivedWorkspace(t *testing.T) {
 		{"a rotation of the secret", http.MethodPost, hookPath(demo, id) + "/rotate-secret", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+			rows, seq := w.configured(t), w.lastSeq(t)
 			status, raw := w.Call(t, tc.method, tc.path, w.ownerKey, tc.body)
 			if status != http.StatusConflict {
 				t.Fatalf("%s %s = %d %s, want 409", tc.method, tc.path, status, raw)
@@ -430,7 +430,7 @@ func TestChange_RefusesAnArchivedWorkspace(t *testing.T) {
 			if e := errorOf(t, raw); e["error_type"] != "workspace_archived" {
 				t.Errorf("error_type = %v, want workspace_archived", e["error_type"])
 			}
-			if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+			if got := w.configured(t); !reflect.DeepEqual(got, rows) {
 				t.Errorf("rows = %v\nwant   %v", got, rows)
 			}
 			if got := w.lastSeq(t); got != seq {
@@ -454,7 +454,7 @@ func TestSecretUse_RefusesWithoutAKey(t *testing.T) {
 		{"a rotation of a secret stored with a key", hookPath(demo, id) + "/rotate-secret", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows, seq := w.table(t, "webhook_subscriptions"), w.lastSeq(t)
+			rows, seq := w.configured(t), w.lastSeq(t)
 			status, raw := w.Call(t, http.MethodPost, tc.path, w.ownerKey, tc.body)
 			if status != http.StatusServiceUnavailable {
 				t.Fatalf("POST %s = %d %s, want 503", tc.path, status, raw)
@@ -462,7 +462,7 @@ func TestSecretUse_RefusesWithoutAKey(t *testing.T) {
 			if e := errorOf(t, raw); e["error_type"] != "secrets_unavailable" {
 				t.Errorf("error_type = %v, want secrets_unavailable", e["error_type"])
 			}
-			if got := w.table(t, "webhook_subscriptions"); !reflect.DeepEqual(got, rows) {
+			if got := w.configured(t); !reflect.DeepEqual(got, rows) {
 				t.Errorf("rows = %v\nwant   %v", got, rows)
 			}
 			if got := w.lastSeq(t); got != seq {
@@ -488,10 +488,11 @@ func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T)
 			// One delivery that succeeded and one pending, as the delivery
 			// loop leaves them, and one of the subscription that stays.
 			now := w.clock.Now().UnixNano()
+			deliveryID := func(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%s%012d", tc.status[:1], i) }
 			for i, d := range []struct{ sub, status string }{{id, "succeeded"}, {id, "pending"}, {keep, "succeeded"}} {
 				if _, err := w.Store.Main().Exec(`INSERT INTO webhook_deliveries
 					(id, subscription_id, seq, type, status, attempts, created_at) VALUES (?, ?, ?, 'parley.change.open', ?, 1, ?)`,
-					fmt.Sprintf("00000000-0000-4000-8000-%s%012d", tc.status[:1], i), d.sub, i+1, d.status, now); err != nil {
+					deliveryID(i), d.sub, i+1, d.status, now); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -520,7 +521,9 @@ func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T)
 			if err := db.QueryRow(`SELECT count(*) FROM webhook_subscriptions WHERE secret_sealed = ?`, sealed).Scan(&holding); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE subscription_id = ?`, keep).Scan(&kept); err != nil {
+			// The other subscription's loop may record deliveries of its own
+			// meanwhile; the one stored above must stay.
+			if err := db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE subscription_id = ? AND id = ?`, keep, deliveryID(2)).Scan(&kept); err != nil {
 				t.Fatal(err)
 			}
 			if deliveries != 0 || holding != 0 {

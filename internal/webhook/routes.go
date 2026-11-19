@@ -106,9 +106,10 @@ func (c *Component) get(w http.ResponseWriter, r *http.Request, q request) error
 const pendingBatch = 500
 
 // pending is the number of events after the position of s that s receives,
-// the event of its pending delivery included; 0 when s is disabled, which
-// receives nothing. A position whose events have left the log counts from
-// the oldest event the log holds.
+// the event of its pending delivery included, once, whether or not a changed
+// filter still matches it; 0 when s is disabled, which receives nothing. A
+// position whose events have left the log counts from the oldest event the
+// log holds.
 func (c *Component) pending(ctx context.Context, s Subscription) (int, error) {
 	if s.State == StateDisabled {
 		return 0, nil
@@ -118,7 +119,7 @@ func (c *Component) pending(ctx context.Context, s Subscription) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if found && seq <= s.Position {
+	if found {
 		n++
 	}
 	after := s.Position
@@ -133,6 +134,9 @@ func (c *Component) pending(ctx context.Context, s Subscription) (int, error) {
 			return 0, err
 		}
 		for _, rec := range recs {
+			if found && rec.Seq == seq {
+				continue
+			}
 			if ok, err := c.receives(ctx, s, rec); err != nil {
 				return 0, err
 			} else if ok {

@@ -303,7 +303,8 @@ func boolOf(raw json.RawMessage) (bool, bool) {
 // Otherwise it stores the subscription with a new signing secret, sealed,
 // writes parley.webhook.create in the same transaction, sets the position
 // to that event's seq, so that the first event the subscription can receive
-// is the next one written, and answers 201 with the object and the secret.
+// is the next one written, starts its delivery loop once the transaction has
+// committed, and answers 201 with the object and the secret.
 func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) error {
 	var body map[string]json.RawMessage
 	if err := server.DecodeJSON(r, &body); err != nil {
@@ -363,6 +364,7 @@ func (c *Component) create(w http.ResponseWriter, r *http.Request, q request) er
 	if err != nil {
 		return err
 	}
+	c.startLoop(sub.ID)
 	server.WriteJSON(w, http.StatusCreated, withSecret{objectOf(sub), plain})
 	return nil
 }
@@ -513,6 +515,8 @@ func (c *Component) update(w http.ResponseWriter, r *http.Request, q request) er
 	if err != nil {
 		return err
 	}
+	// The loop reads the subscription again: a disabled one ends.
+	c.wakeLoop(sub.ID)
 	server.WriteJSON(w, http.StatusOK, objectOf(sub))
 	return nil
 }
@@ -541,6 +545,8 @@ func (c *Component) remove(w http.ResponseWriter, r *http.Request, q request) er
 	if err != nil {
 		return err
 	}
+	// The loop finds the subscription gone and ends.
+	c.wakeLoop(q.subscription.ID)
 	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
