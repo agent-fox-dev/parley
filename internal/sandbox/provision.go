@@ -476,7 +476,7 @@ type provisioning struct {
 // values, whether or not it had marked the sandbox created.
 func (p *provisioning) steps(ctx context.Context) error {
 	s, id := p.s, p.rec.ID
-	if err := p.clearRuntime(ctx); err != nil {
+	if err := s.clearRuntime(ctx, p.rec); err != nil {
 		return failed(ReasonProvisionFailed, "delete what an earlier provisioning left at the runtime", err)
 	}
 	if p.rec.RuntimeCreated {
@@ -649,13 +649,15 @@ func (p *provisioning) hubCredential(ctx context.Context) (string, error) {
 	return value, nil
 }
 
-// clearRuntime deletes what the runtime holds of the sandbox: the sandboxes
-// and providers labelled with its id or named after it (the sandbox by its
-// id, each provider <id>-<name>). When the runtime cannot list them it
-// deletes by name the sandbox and the providers of its attached credentials
-// and its hub credential, and returns the listing's error with any other.
-func (p *provisioning) clearRuntime(ctx context.Context) error {
-	id := p.rec.ID
+// clearRuntime deletes what the runtime holds of the sandbox rec: the
+// sandboxes and providers labelled with its id or named after it (the
+// sandbox by its id, each provider <id>-<name>). When the runtime cannot
+// list them it deletes by name the sandbox and the providers of its
+// attached credentials and its hub credential, and returns the listing's
+// error with any other. A provisioning clears what an earlier one left, and
+// a deletion what the sandbox had.
+func (s *Service) clearRuntime(ctx context.Context, rec Record) error {
+	id := rec.ID
 	owned := func(name string, labels map[string]string) bool {
 		return labels[LabelSandbox] == id || name == id || strings.HasPrefix(name, id+"-")
 	}
@@ -663,7 +665,7 @@ func (p *provisioning) clearRuntime(ctx context.Context) error {
 		errs                []error
 		sandboxes, provided []string
 	)
-	if list, err := p.client.ListSandboxes(ctx); err != nil {
+	if list, err := s.client.ListSandboxes(ctx); err != nil {
 		errs = append(errs, err)
 		sandboxes = []string{id}
 	} else {
@@ -673,12 +675,12 @@ func (p *provisioning) clearRuntime(ctx context.Context) error {
 			}
 		}
 	}
-	if list, err := p.client.ListProviders(ctx); err != nil {
+	if list, err := s.client.ListProviders(ctx); err != nil {
 		errs = append(errs, err)
-		for _, name := range p.rec.Credentials {
+		for _, name := range rec.Credentials {
 			provided = append(provided, providerName(id, name))
 		}
-		if p.rec.HubAccess != nil {
+		if rec.HubAccess != nil {
 			provided = append(provided, providerName(id, hubProvider))
 		}
 	} else {
@@ -689,12 +691,12 @@ func (p *provisioning) clearRuntime(ctx context.Context) error {
 		}
 	}
 	for _, name := range sandboxes {
-		if err := p.client.DeleteSandbox(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
+		if err := s.client.DeleteSandbox(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			errs = append(errs, err)
 		}
 	}
 	for _, name := range provided {
-		if err := p.client.DeleteProvider(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
+		if err := s.client.DeleteProvider(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
 			errs = append(errs, err)
 		}
 	}
@@ -857,7 +859,7 @@ func (p *provisioning) abandon(ctx context.Context) {
 // deleted is logged and left to the runtime's reconciliation. It reports
 // whether the runtime no longer holds the sandbox.
 func (p *provisioning) clear(ctx context.Context) bool {
-	if err := p.clearRuntime(ctx); err != nil {
+	if err := p.s.clearRuntime(ctx, p.rec); err != nil {
 		p.s.logger().Warn("the sandbox provisioner could not delete what the runtime holds of a sandbox", "sandbox", p.rec.ID, "error", p.scrub(err.Error()))
 		return false
 	}

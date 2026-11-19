@@ -193,6 +193,13 @@ func TestCheckpoint_WritesNoChangeVersionOrOtherEventAndMovesItsRef(t *testing.T
 	if refs := h.checkpointRefs(t, id); !maps.Equal(refs, map[string]string{"t1": head}) {
 		t.Errorf("the checkpoint refs are %v; want t1 at %s", refs, head)
 	}
+
+	if err := h.svc.Delete(context.Background(), storedRecord(t, h.Hub, id), sandbox.DeleteAPI, sandbox.SystemActor, false); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if refs := h.checkpointRefs(t, id); !maps.Equal(refs, map[string]string{"t1": head}) {
+		t.Errorf("after the sandbox was deleted the checkpoint refs are %v; want t1 at %s", refs, head)
+	}
 }
 
 func TestCheckpoint_WithoutARepositoryStoresNoRef(t *testing.T) {
@@ -430,6 +437,27 @@ func TestCheckpoint_RecordsAFailureAndKeepsTheLastRefs(t *testing.T) {
 			})
 		}
 	}
+
+	t.Run("a deletion with the fault in place ends deleted", func(t *testing.T) {
+		h.hooks.setExec(func(argv []string) (int, string, error) {
+			if slices.Contains(argv, "bundle") {
+				return 128, "fatal: cannot create the bundle", nil
+			}
+			return 0, "", nil
+		})
+		t.Cleanup(func() { h.hooks.setExec(nil) })
+		h.clock.Advance(time.Second)
+		if err := h.svc.Delete(context.Background(), storedRecord(t, h.Hub, id), sandbox.DeleteAPI, sandbox.SystemActor, true); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		rec := storedRecord(t, h.Hub, id)
+		if rec.State != sandbox.StateDeleted || rec.StateReason != sandbox.DeleteAPI {
+			t.Errorf("the sandbox is %s (%q); want it deleted for api", rec.State, rec.StateReason)
+		}
+		if cp := h.storedCheckpoint(t, id); cp == nil || cp.OK || !cp.At.Equal(h.clock.Now()) {
+			t.Errorf("the stored checkpoint = %+v; want the failed attempt of the deletion", cp)
+		}
+	})
 }
 
 // The checkpoint route's behaviours share one hub: each row has a sandbox of

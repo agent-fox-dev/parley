@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -41,10 +42,24 @@ const (
 // sandbox moves from ready to stopped with reason as its state_reason, its
 // hub credential is revoked and EventStop is written, in one transaction.
 // When another action moved the sandbox meanwhile, nothing is written, and
-// the sandbox is returned as that action left it.
+// the sandbox is returned as that action left it. A stop waits for the
+// stop or deletion of the same sandbox in progress, and then works from
+// the stored record.
 func (s *Service) Stop(ctx context.Context, rec Record, reason string, actor Actor) (Record, error) {
 	if rec.State != StateReady {
 		return rec, nil
+	}
+	defer s.lifecycle.lock(rec.ID)()
+	// The sandbox as the action before this one left it.
+	switch cur, err := Get(ctx, s.deps.Store.Main(), rec.ID); {
+	case errors.Is(err, ErrNotFound):
+		return rec, nil
+	case err != nil:
+		return rec, err
+	case cur.State != StateReady:
+		return cur, nil
+	default:
+		rec = cur
 	}
 	if rec.Snapshot.Checkpoint {
 		_, _ = s.Checkpoint(ctx, rec, actor)

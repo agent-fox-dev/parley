@@ -3718,3 +3718,49 @@ func (h *createHub) dirtySource(t *testing.T, stored bool) string {
 func (h *createHub) uploads(id string, n int) int {
 	return len(slices.DeleteFunc(h.sandboxCalls(id, n), func(op string) bool { return op != runtime.OpUpload }))
 }
+
+// eventTypes are the types of the hub events about the sandbox id, oldest
+// first.
+func (h *createHub) eventTypes(t *testing.T, id string) []string {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT type FROM hub_events WHERE resource_id = ? ORDER BY seq`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, typ)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// runtimeSandbox stores a sandbox of demo--t1 in state, created by dana
+// with the profile agent's hub credential and its checkpoint flag, as edit
+// changes it when edit is not nil, creates it at the runtime with the
+// provider id-model, both labelled with its id, mints its hub credential,
+// and returns its id and the credential's value.
+func (h *createHub) runtimeSandbox(t *testing.T, state string, edit func(*sandbox.Record)) (id, cred string) {
+	t.Helper()
+	id, dir := h.workSandbox(t, func(r *sandbox.Record) {
+		r.State = state
+		if edit != nil {
+			edit(r)
+		}
+	})
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := runtime.Provider{Name: id + "-model", Profile: "anthropic", Value: "v", Labels: map[string]string{sandbox.LabelSandbox: id}}
+	if err := h.rt.Client("parley", nil).EnsureProvider(context.Background(), p); err != nil {
+		t.Fatalf("create the provider at the runtime: %v", err)
+	}
+	return id, h.hubCredential(t, id)
+}

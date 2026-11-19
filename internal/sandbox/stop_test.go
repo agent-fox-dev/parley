@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,7 +66,9 @@ func TestStopRoute(t *testing.T) {
 					got.State != sandbox.StateStopped || got.StateReason == nil || *got.StateReason != "api" {
 					t.Fatalf("POST stop = %d %s; want 200 with the sandbox stopped for api", a.status, a.body)
 				}
-				ops := h.sandboxCalls(id, calls)
+				// The log collector follows a ready sandbox's logs on its own
+				// time, which the stop's order does not include.
+				ops := slices.DeleteFunc(h.sandboxCalls(id, calls), func(op string) bool { return op == runtime.OpLogs })
 				if n := len(ops); n == 0 || ops[n-1] != runtime.OpStopSandbox || slices.Contains(ops, runtime.OpDeleteSandbox) ||
 					strings.Count(strings.Join(ops, " "), runtime.OpStopSandbox) != 1 {
 					t.Errorf("the runtime calls of the sandbox = %v; want them to end in its one stop, with no delete", ops)
@@ -171,5 +174,62 @@ func TestStopRoute(t *testing.T) {
 				}
 			})
 		}
+	})
+
+	t.Run("applies each transition once when requests race", func(t *testing.T) {
+		noCheckpoint := func(r *sandbox.Record) { r.Snapshot.Checkpoint = false }
+		// racing sends the requests at once and returns their statuses.
+		racing := func(t *testing.T, reqs ...[2]string) []int {
+			statuses := make([]int, len(reqs))
+			var wg sync.WaitGroup
+			for i, req := range reqs {
+				wg.Go(func() { statuses[i] = h.call(t, req[0], req[1], h.key, nil).status })
+			}
+			wg.Wait()
+			return statuses
+		}
+
+		t.Run("eight stops of one ready sandbox", func(t *testing.T) {
+			id, _ := h.runtimeSandbox(t, sandbox.StateReady, noCheckpoint)
+			calls := len(h.rt.Calls())
+			reqs := make([][2]string, 8)
+			for i := range reqs {
+				reqs[i] = [2]string{http.MethodPost, path(id)}
+			}
+			for i, status := range racing(t, reqs...) {
+				if status != http.StatusOK {
+					t.Errorf("stop %d answered %d; want 200", i, status)
+				}
+			}
+			if n := len(h.sandboxEvents(t, sandbox.EventStop, id)); n != 1 {
+				t.Errorf("%d stop events; want 1", n)
+			}
+			ops := h.sandboxCalls(id, calls)
+			if n := len(slices.DeleteFunc(ops, func(op string) bool { return op != runtime.OpStopSandbox })); n != 1 {
+				t.Errorf("the runtime was asked to stop the sandbox %d times; want once", n)
+			}
+		})
+
+		t.Run("a stop and a delete of one ready sandbox, twenty times", func(t *testing.T) {
+			for range 20 {
+				id, _ := h.runtimeSandbox(t, sandbox.StateReady, noCheckpoint)
+				statuses := racing(t, [2]string{http.MethodPost, path(id)}, [2]string{http.MethodDelete, "/workspaces/demo--t1/sandboxes/" + id})
+				if statuses[0] != http.StatusOK || statuses[1] != http.StatusNoContent {
+					t.Errorf("stop and delete answered %v; want 200 and 204", statuses)
+				}
+				if state := storedRecord(t, h.Hub, id).State; state != sandbox.StateDeleted {
+					t.Errorf("the sandbox is %s; want it deleted", state)
+				}
+				if n := len(h.sandboxEvents(t, sandbox.EventDelete, id)); n != 1 {
+					t.Errorf("%d delete events; want 1", n)
+				}
+				if n := len(h.sandboxEvents(t, sandbox.EventStop, id)); n > 1 {
+					t.Errorf("%d stop events; want at most 1", n)
+				}
+				if t.Failed() {
+					return
+				}
+			}
+		})
 	})
 }

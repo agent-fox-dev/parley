@@ -198,6 +198,19 @@ func (s *Service) StartRoute() server.Route {
 	})
 }
 
+// DeleteRoute declares DELETE /workspaces/:slug/sandboxes/:id: it deletes
+// the sandbox id for the caller, with a checkpoint first as the query
+// checkpoint or the profile asks, and answers 204, also for a sandbox
+// already deleted (see serveDelete). It needs the scope sandboxes:write of a
+// PAT and write access to the workspace; the admin token acts as an owner.
+func (s *Service) DeleteRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodDelete,
+		Pattern: "/workspaces/:slug/sandboxes/:id",
+		Handler: s.serveDelete,
+	})
+}
+
 // ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
 // of the workspace, newest first, paged, filtered by the query (see
 // listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and

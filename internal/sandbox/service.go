@@ -93,6 +93,8 @@ type Service struct {
 	// checkpointLimit is the size in bytes above which a checkpoint leaves
 	// an untracked file out; 0 for CheckpointFileLimit.
 	checkpointLimit atomic.Int64
+	// lifecycle gives the stops and deletions of one sandbox their turns.
+	lifecycle sandboxLocks
 }
 
 // NewService returns the service of a hub whose configuration is not loaded
