@@ -513,12 +513,6 @@ func (p *provisioning) steps(ctx context.Context) error {
 	return nil
 }
 
-// prepare readies the working directory before the main process starts:
-// the checkout of the workspace and the restore of a checkpoint. A sandbox
-// without a checkout has nothing to prepare; until the checkout is built a
-// sandbox with one gets an empty working directory.
-func (p *provisioning) prepare(context.Context) error { return nil }
-
 // attachedSnapshot is the part of rec's snapshot a provisioning resolves:
 // the credentials and exposed secrets the create attached, required as the
 // profile required them, so that a required one that no longer resolves
@@ -634,15 +628,19 @@ func (p *provisioning) registerProviders(ctx context.Context, res Resolution, hu
 }
 
 // ready ends a provisioning whose steps all succeeded: in one transaction
-// it moves the sandbox to ready with EventReady, by the system, and clears
-// the marker. A sandbox another component moved meanwhile is left as it
-// is, and what the provisioning created is deleted.
+// it moves the sandbox to ready with EventReady, by the system, stores the
+// checkout with the sha the sandbox reported and clears the marker. A
+// sandbox another component moved meanwhile is left as it is, and what the
+// provisioning created is deleted.
 func (p *provisioning) ready(ctx context.Context) {
 	s, id := p.s, p.rec.ID
 	ev := &event.Input{Type: EventReady, ActorType: event.ActorSystem, Metadata: map[string]any{"checkout": p.rec.Checkout}}
 	var applied bool
 	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
 		if applied, err = s.Transition(ctx, tx, id, StateProvisioning, StateReady, "", ev); err != nil || !applied {
+			return err
+		}
+		if err := storeCheckout(ctx, tx, p.rec); err != nil {
 			return err
 		}
 		if err := Update(ctx, tx, id, SetMarker("")); err != nil {

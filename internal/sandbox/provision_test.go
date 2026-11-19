@@ -99,13 +99,15 @@ func credentialRule(id, name string) any {
 }
 
 // sandboxOps are the operations of calls that name the sandbox id or one of
-// its providers, in order.
+// its providers, in order, each run of commands executed in the sandbox
+// counted as one exec.
 func sandboxOps(calls []runtimetest.Call, id string) []string {
 	var out []string
 	for _, c := range calls {
-		if strings.HasPrefix(c.Target, id) {
-			out = append(out, c.Op)
+		if !strings.HasPrefix(c.Target, id) || (c.Op == runtime.OpExec && len(out) > 0 && out[len(out)-1] == runtime.OpExec) {
+			continue
 		}
+		out = append(out, c.Op)
 	}
 	return out
 }
@@ -129,8 +131,8 @@ func TestProvision_ReachesReady(t *testing.T) {
 		command []string
 		wantOps []string
 	}{
-		{"with a command", []string{"make", "test"}, []string{runtime.OpEnsureProvider, runtime.OpEnsureProvider, runtime.OpCreateSandbox, runtime.OpWaitReady, runtime.OpRunMain}},
-		{"without a command", nil, []string{runtime.OpEnsureProvider, runtime.OpEnsureProvider, runtime.OpCreateSandbox, runtime.OpWaitReady}},
+		{"with a command", []string{"make", "test"}, []string{runtime.OpEnsureProvider, runtime.OpEnsureProvider, runtime.OpCreateSandbox, runtime.OpWaitReady, runtime.OpExec, runtime.OpRunMain}},
+		{"without a command", nil, []string{runtime.OpEnsureProvider, runtime.OpEnsureProvider, runtime.OpCreateSandbox, runtime.OpWaitReady, runtime.OpExec}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := map[string]any{"profile": "full"}
@@ -303,6 +305,8 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 		body    map[string]any
 		reason  string
 		wantErr string
+		// errHas is a text the event's error holds.
+		errHas string
 		// noCreate says the runtime received no create call.
 		noCreate bool
 	}{
@@ -342,6 +346,31 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			h.svc.RegisterPolicyComposer(&stubComposer{err: errors.New("no policy for you")})
 			return func() { h.svc.RegisterPolicyComposer(nil) }
 		}},
+		{name: "the git clone exits 128", reason: "checkout_failed", errHas: "fatal: repository not found", fault: func(*testing.T) func() {
+			h.hooks.setExec(func(argv []string) (int, string, error) {
+				if len(argv) > 1 && argv[1] == "clone" {
+					return 128, "fatal: repository not found", nil
+				}
+				return 0, "", nil
+			})
+			return func() { h.hooks.setExec(nil) }
+		}},
+		{name: "the git checkout cannot be run", reason: "checkout_failed", body: map[string]any{"profile": "full", "command": []string{"make"}}, fault: func(*testing.T) func() {
+			h.hooks.setExec(func(argv []string) (int, string, error) {
+				if len(argv) > 1 && argv[1] == "checkout" {
+					return 0, "", runtime.NewError(runtime.ErrUnavailable, runtime.OpExec, "exec refused")
+				}
+				return 0, "", nil
+			})
+			return func() { h.hooks.setExec(nil) }
+		}},
+		{name: "the restorer fails", reason: "provision_failed", fault: func(t *testing.T) func() {
+			h.svc.RegisterRestorer(&stubRestorer{hooks: h.hooks, err: errors.New("no checkpoint data")})
+			return func() { h.svc.RegisterRestorer(nil) }
+		}, create: func(t *testing.T) string {
+			old := h.seedIn(t, "demo--t1", json.RawMessage(`{"ok":true,"refs":[]}`))
+			return sandboxObject(t, h.post(t, "demo--t1", map[string]any{"profile": "full", "restore_from": old}))["id"].(string)
+		}},
 		{name: "the main process cannot be started", reason: "provision_failed", body: map[string]any{"profile": "full", "command": []string{"make"}}, fault: func(*testing.T) func() {
 			h.rt.FailOperation(runtime.OpRunMain, runtime.ErrUnavailable, "cannot start")
 			return func() { h.rt.FailOperation(runtime.OpRunMain, nil, "") }
@@ -376,6 +405,12 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			}
 			if tc.wantErr != "" && text != tc.wantErr {
 				t.Errorf("fail event error %q; want %q", text, tc.wantErr)
+			}
+			if !strings.Contains(text, tc.errHas) {
+				t.Errorf("fail event error %q; want it to hold %q", text, tc.errHas)
+			}
+			if main, started := h.hooks.main(id); started && tc.reason == "checkout_failed" {
+				t.Errorf("the main process %v was started", main)
 			}
 			if n := len(h.sandboxEvents(t, sandbox.EventReady, id)); n != 0 {
 				t.Errorf("%d ready events; want none", n)

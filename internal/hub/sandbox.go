@@ -51,7 +51,8 @@ const (
 // profile's credentials and exposed secrets, the access component's
 // MintBound and identity.RevokeTokenByID, through which a sandbox's hub
 // credential is minted and revoked, [server].external_url, the org lookup
-// that names a workspace's git remote and the hub's logger; the other
+// that names a workspace's git remote, the user lookup that gives a
+// checkout its commit identity and the hub's logger; the other
 // sandbox packages register their delete and purge hooks on the service.
 // POST /workspaces/:slug/sandboxes creates a sandbox through the service's
 // create.
@@ -88,6 +89,9 @@ func composeSandbox(c *Composition) {
 			OrgSlug: func(ctx context.Context, id string) (string, error) {
 				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
 				return org.Slug, err
+			},
+			User: func(ctx context.Context, id string) (identity.User, error) {
+				return identity.UserByID(ctx, rt.Store.Main(), id)
 			},
 			Logger: rt.Logger,
 		}

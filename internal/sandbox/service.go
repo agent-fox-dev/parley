@@ -69,6 +69,9 @@ type Service struct {
 	// default; both guarded by mu.
 	ruleProvider WorkspaceRuleProvider
 	composer     PolicyComposer
+	// restorer restores a checkpoint into a sandbox created from one, nil
+	// for none; guarded by mu.
+	restorer Restorer
 	// wakeup holds a token while a created sandbox waits for the
 	// provisioner.
 	wakeup chan struct{}

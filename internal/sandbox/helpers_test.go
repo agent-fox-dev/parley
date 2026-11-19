@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -703,8 +704,9 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 	t.Helper()
 	h := &createHub{
 		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
-		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{},
+		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{head: defaultHead},
 	}
+	h.rt.SetExec(h.hooks.script)
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "mirror", Variables: []string{"MIRROR_TOKEN"}})
 	cfg := hubtest.Config{
@@ -766,9 +768,10 @@ func (h *createHub) repository(t *testing.T, slug string, status workspace.Statu
 	return commit
 }
 
-// fork adds the ready fork slug of parent, of dana, based on and tracking
-// main, expiring at expires, in session (nil for none). It shares the
-// parent's repository when the parent has one.
+// fork adds the ready fork slug of parent, of dana, based on main,
+// expiring at expires, in session (nil for none). It shares the parent's
+// repository when the parent has one, and tracks the parent's branches, as
+// a fork create does, or main when the parent has no repository.
 func (h *createHub) fork(t *testing.T, slug, parent string, expires time.Time, session *string) {
 	t.Helper()
 	h.forkBy(t, slug, parent, h.dana, expires, session)
@@ -779,13 +782,24 @@ func (h *createHub) forkBy(t *testing.T, slug, parent, owner string, expires tim
 	t.Helper()
 	w := h.record(slug, access.KindFork, workspace.StatusReady)
 	w.ParentSlug, w.ExpiresAt, w.SessionID, w.OwnerID = &parent, &expires, session, owner
+	tracking := []string{"main"}
 	if _, err := os.Stat(h.workspaces.RepoPath(parent)); err == nil {
-		if err := (gitrepo.Git{}).CreateFork(context.Background(), h.workspaces.RepoPath(parent), h.workspaces.RepoPath(slug)); err != nil {
+		ctx := context.Background()
+		if err := (gitrepo.Git{}).CreateFork(ctx, h.workspaces.RepoPath(parent), h.workspaces.RepoPath(slug)); err != nil {
 			t.Fatal(err)
 		}
+		repo, err := (gitrepo.Git{}).Open(ctx, h.workspaces.RepoPath(parent))
+		if err != nil {
+			t.Fatal(err)
+		}
+		branches, err := repo.Branches(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracking = slices.Sorted(maps.Keys(branches))
 	}
 	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
-		return fork.Insert(ctx, tx, fork.Fork{Workspace: w, TrackingBranches: []string{"main"}})
+		return fork.Insert(ctx, tx, fork.Fork{Workspace: w, TrackingBranches: tracking})
 	})
 }
 
@@ -1047,14 +1061,85 @@ func (h *createHub) count(t *testing.T, query string, args ...any) int {
 	return n
 }
 
+// defaultHead is the commit a create hub's runtime answers git rev-parse
+// HEAD with until the test sets another.
+const defaultHead = "0123456789abcdef0123456789abcdef01234567"
+
 // runtimeHooks steer the provisioning's runtime calls of a create hub: hook,
 // when set, is called before each EnsureProvider, CreateSandbox, WaitReady
 // and RunMain with the operation and the provider's or sandbox's name, and
-// an error it returns is the call's. They keep the command of each RunMain.
+// an error it returns is the call's. exec, when set, is asked before each
+// Exec: an error it returns is the call's, and a non-zero code ends the
+// command with that code and stderr. They keep the command of each RunMain
+// and, in one log, every command run in a sandbox, every main-process start
+// and every restore, in the order they happened.
 type runtimeHooks struct {
 	mu    sync.Mutex
 	hook  func(ctx context.Context, op, name string) error
+	exec  func(argv []string) (code int, stderr string, err error)
+	head  string
 	mains map[string][]string
+	log   []runCall
+}
+
+// runCall is an entry of the hooks' log: a command run in the sandbox
+// (exec), with its working directory, a main-process start (main) with its
+// command, or a restore (restore) with the new and the source sandbox's ids.
+type runCall struct {
+	sandbox, kind string
+	argv          []string
+	dir           string
+}
+
+// setExec makes fn the exec hook; nil removes it.
+func (r *runtimeHooks) setExec(fn func(argv []string) (code int, stderr string, err error)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.exec = fn
+}
+
+// setHead makes id the commit git rev-parse HEAD answers.
+func (r *runtimeHooks) setHead(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.head = id
+}
+
+// record adds c to the log.
+func (r *runtimeHooks) record(c runCall) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.log = append(r.log, c)
+}
+
+// runs returns the log's entries about the sandbox id, in order.
+func (r *runtimeHooks) runs(id string) []runCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []runCall
+	for _, c := range r.log {
+		if c.sandbox == id {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// script runs the commands of the hub's fake runtime: git rev-parse HEAD
+// prints the head the test set, every other git command exits 0 with no
+// output, and any other command, a main process, runs until it is ended.
+func (r *runtimeHooks) script(ctx context.Context, _ string, req runtime.ExecRequest, stdout, _ io.Writer) int {
+	if len(req.Command) == 0 || req.Command[0] != "git" {
+		<-ctx.Done()
+		return 0
+	}
+	if slices.Equal(req.Command, []string{"git", "rev-parse", "HEAD"}) {
+		r.mu.Lock()
+		head := r.head
+		r.mu.Unlock()
+		_, _ = io.WriteString(stdout, head+"\n")
+	}
+	return 0
 }
 
 // set makes fn the hook; nil removes it.
@@ -1123,7 +1208,40 @@ func (c *hookedClient) RunMain(ctx context.Context, name string, command []strin
 		c.hooks.mains = map[string][]string{}
 	}
 	c.hooks.mains[name] = slices.Clone(command)
+	c.hooks.log = append(c.hooks.log, runCall{sandbox: name, kind: "main", argv: slices.Clone(command)})
 	return nil
+}
+
+func (c *hookedClient) Exec(ctx context.Context, name string, req runtime.ExecRequest) (runtime.ExecResult, error) {
+	c.hooks.record(runCall{sandbox: name, kind: "exec", argv: slices.Clone(req.Command), dir: req.WorkDir})
+	c.hooks.mu.Lock()
+	fn := c.hooks.exec
+	c.hooks.mu.Unlock()
+	if fn != nil {
+		code, stderr, err := fn(req.Command)
+		if err != nil {
+			return runtime.ExecResult{}, err
+		}
+		if code != 0 {
+			return runtime.ExecResult{ExitCode: code, Stderr: []byte(stderr)}, nil
+		}
+	}
+	return c.Client.Exec(ctx, name, req)
+}
+
+// stubRestorer is a restorer that logs each restore in the hooks' log and
+// answers err while one is set.
+type stubRestorer struct {
+	hooks *runtimeHooks
+	mu    sync.Mutex
+	err   error
+}
+
+func (r *stubRestorer) Restore(_ context.Context, rec, source sandbox.Record) error {
+	r.hooks.record(runCall{sandbox: rec.ID, kind: "restore", argv: []string{rec.ID, source.ID}})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
 }
 
 // pause holds the calls that wait on it until it is released or their

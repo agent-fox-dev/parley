@@ -70,6 +70,9 @@ type Deps struct {
 	// OrgSlug returns the slug of the organization orgID, which the hub's
 	// git URL of a workspace names.
 	OrgSlug func(ctx context.Context, orgID string) (string, error)
+	// User returns the user record of the user id, whose name and e-mail a
+	// checkout commits with.
+	User func(ctx context.Context, id string) (identity.User, error)
 	// Logger receives what the provisioner cannot report otherwise; nil
 	// logs nothing.
 	Logger *slog.Logger
