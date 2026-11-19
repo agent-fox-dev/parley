@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -709,7 +711,7 @@ type createHub struct {
 // called for them.
 func startCreateHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	return newCreateHub(t, profiles, false, adjust)
+	return newCreateHub(t, runtimetest.New(t), profiles, false, adjust)
 }
 
 // startProvisionHub is startCreateHub with the provisioner running: it
@@ -717,13 +719,15 @@ func startCreateHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)
 // hooks, on the hub's clock.
 func startProvisionHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	return newCreateHub(t, profiles, true, adjust)
+	return newCreateHub(t, runtimetest.New(t), profiles, true, adjust)
 }
 
-func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*sandbox.Deps)) *createHub {
+// newCreateHub starts a create hub over the fake runtime rt, whose
+// commands the hooks' script runs.
+func newCreateHub(t *testing.T, rt *runtimetest.Fake, profiles string, provision bool, adjust []func(*sandbox.Deps)) *createHub {
 	t.Helper()
 	h := &createHub{
-		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, forkLinker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
+		probeHub: &probeHub{rt: rt}, linker: &stubLinker{}, forkLinker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
 		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{head: defaultHead},
 		timers: &timerLog{}, limits: &quotaLimits{},
 	}
@@ -1259,6 +1263,8 @@ type runtimeHooks struct {
 	head  string
 	mains map[string][]string
 	log   []runCall
+	// downloadErr, when set, ends every download after half its bytes.
+	downloadErr error
 }
 
 // runCall is an entry of the hooks' log: a command run in the sandbox
@@ -1275,6 +1281,14 @@ func (r *runtimeHooks) setExec(fn func(argv []string) (code int, stderr string, 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.exec = fn
+}
+
+// setDownloadErr makes every later download deliver half of the file's
+// bytes and then fail with err; nil ends that.
+func (r *runtimeHooks) setDownloadErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.downloadErr = err
 }
 
 // setHead makes id the commit git rev-parse HEAD answers.
@@ -1393,6 +1407,9 @@ func (c *hookedClient) RunMain(ctx context.Context, name string, command []strin
 
 func (c *hookedClient) Exec(ctx context.Context, name string, req runtime.ExecRequest) (runtime.ExecResult, error) {
 	c.hooks.record(runCall{sandbox: name, kind: "exec", argv: slices.Clone(req.Command), dir: req.WorkDir})
+	if err := c.hooks.before(ctx, runtime.OpExec, name); err != nil {
+		return runtime.ExecResult{}, err
+	}
 	c.hooks.mu.Lock()
 	fn := c.hooks.exec
 	c.hooks.mu.Unlock()
@@ -1406,6 +1423,25 @@ func (c *hookedClient) Exec(ctx context.Context, name string, req runtime.ExecRe
 		}
 	}
 	return c.Client.Exec(ctx, name, req)
+}
+
+func (c *hookedClient) Download(ctx context.Context, name, p string) (io.ReadCloser, error) {
+	if err := c.hooks.before(ctx, runtime.OpDownload, name); err != nil {
+		return nil, err
+	}
+	rc, err := c.Client.Download(ctx, name, p)
+	c.hooks.mu.Lock()
+	cut := c.hooks.downloadErr
+	c.hooks.mu.Unlock()
+	if err != nil || cut == nil {
+		return rc, err
+	}
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(io.MultiReader(bytes.NewReader(data[:len(data)/2]), iotest.ErrReader(cut))), nil
 }
 
 // stubRestorer is a restorer that logs each restore in the hooks' log and
@@ -1487,15 +1523,17 @@ func (h *createHub) settledObject(t *testing.T, slug, id string) map[string]any 
 
 // hubEvent is what a test checks of a stored hub event.
 type hubEvent struct {
-	actorType string
-	metadata  map[string]any
+	actorType          string
+	metadata           map[string]any
+	resourceType       string
+	workspace, session *string
 }
 
 // sandboxEvents returns the hub events of type typ about the sandbox id,
 // oldest first.
 func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 	t.Helper()
-	rows, err := h.Store.Main().Query(`SELECT actor_type, metadata FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
+	rows, err := h.Store.Main().Query(`SELECT actor_type, metadata, resource_type, workspace, session_id FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1506,7 +1544,7 @@ func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 			e    hubEvent
 			meta string
 		)
-		if err := rows.Scan(&e.actorType, &meta); err != nil {
+		if err := rows.Scan(&e.actorType, &meta, &e.resourceType, &e.workspace, &e.session); err != nil {
 			t.Fatal(err)
 		}
 		if err := json.Unmarshal([]byte(meta), &e.metadata); err != nil {
@@ -3396,4 +3434,150 @@ func (h *execHub) activityAt(t *testing.T, id string, want time.Time, when strin
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// noHostGit is the environment that keeps the host's git configuration out
+// of a git command: the commands of a checkpoint hub's sandboxes and those
+// a test runs in a working directory.
+var noHostGit = map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+// startCheckpointHub starts a create hub with the profile agent and the
+// create world, whose fake runtime keeps each sandbox's files in a
+// directory of the host and runs the commands of its sandboxes there with
+// the real git, with the dependencies of its stored sandboxes changed by
+// adjust.
+func startCheckpointHub(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	h := newCreateHub(t, runtimetest.New(t, runtimetest.WithHostDirs()), agentProfile, false, adjust)
+	h.rt.SetExec(nil)
+	h.world(t)
+	return h
+}
+
+// workSandbox stores a ready sandbox of demo--t1 created by dana with the
+// profile agent's hub credential and checkpoint flag and the checkout of
+// the work branch t1, as edit changes it when edit is not nil, creates it
+// at the runtime, and returns its id and the host directory that holds its
+// working directory, which is empty.
+func (h *createHub) workSandbox(t *testing.T, edit func(*sandbox.Record)) (id, dir string) {
+	t.Helper()
+	id = h.seedRecord(t, "demo--t1", sandbox.StateReady, func(r *sandbox.Record) {
+		r.SessionID = new(t1Session)
+		r.Checkout = &sandbox.Checkout{Path: sandbox.WorkDir, Ref: "main", SHA: h.base, Branch: new("t1")}
+		r.HubAccess = &sandbox.HubAccess{Scopes: allHubScopes, ExpiresAt: r.ExpiresAt}
+		r.Snapshot = sandbox.Snapshot{TTL: 4 * time.Hour, IdleTimeout: 30 * time.Minute, Checkpoint: true, HubAccess: "fork"}
+		if edit != nil {
+			edit(r)
+		}
+	})
+	spec := runtime.SandboxSpec{Name: id, WorkDir: sandbox.WorkDir, Env: noHostGit, Labels: map[string]string{sandbox.LabelSandbox: id}}
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), spec); err != nil {
+		t.Fatalf("create the sandbox at the runtime: %v", err)
+	}
+	return id, filepath.Join(h.rt.HostDir("parley", id), strings.TrimPrefix(sandbox.WorkDir, "/"))
+}
+
+// cloneWork clones demo into the empty directory dir and checks out the
+// new branch t1 at main, as the checkout of a sandbox of demo--t1 does.
+func (h *createHub) cloneWork(t *testing.T, dir string) {
+	t.Helper()
+	workGit(t, dir, "clone", "--quiet", h.workspaces.RepoPath("demo"), ".")
+	workGit(t, dir, "checkout", "--quiet", "-b", "t1")
+}
+
+// workGit runs git in the working directory dir without the host's
+// configuration, with a fixed identity, and returns its output, trimmed.
+func workGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Dana", "GIT_AUTHOR_EMAIL=dana@example.invalid",
+		"GIT_COMMITTER_NAME=Dana", "GIT_COMMITTER_EMAIL=dana@example.invalid")
+	for k, v := range noHostGit {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// commitWork writes the files of files into the working directory dir and
+// commits them on its current branch, returning the new head.
+func commitWork(t *testing.T, dir, msg string, files map[string]string) string {
+	t.Helper()
+	writeWork(t, dir, files)
+	workGit(t, dir, "add", "--all")
+	workGit(t, dir, "commit", "--quiet", "-m", msg)
+	return workGit(t, dir, "rev-parse", "HEAD")
+}
+
+// writeWork writes the files of files, by path, into the working directory
+// dir.
+func writeWork(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// workState is what a checkpoint must leave as it was in the working
+// directory dir: every ref with its value, the status and the index's
+// entries.
+func workState(t *testing.T, dir string) string {
+	t.Helper()
+	return workGit(t, dir, "for-each-ref") + "\n--\n" + workGit(t, dir, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all") +
+		"\n--\n" + workGit(t, dir, "ls-files", "--stage")
+}
+
+// checkpointRefs maps the branch of each checkpoint ref of the sandbox id in
+// the repository of demo--t1 to its value.
+func (h *createHub) checkpointRefs(t *testing.T, id string) map[string]string {
+	t.Helper()
+	return gitrepotest.Refs(t, h.workspaces.RepoPath("demo--t1"), sandbox.CheckpointRefPrefix+id+"/")
+}
+
+// storedCheckpoint is the checkpoint stored on the sandbox id; nil for
+// none.
+func (h *createHub) storedCheckpoint(t *testing.T, id string) *sandbox.CheckpointState {
+	t.Helper()
+	raw := storedRecord(t, h.Hub, id).Checkpoint
+	if raw == nil {
+		return nil
+	}
+	var cp sandbox.CheckpointState
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		t.Fatalf("the stored checkpoint %s: %v", raw, err)
+	}
+	return &cp
+}
+
+// checkpointMeta is the metadata of the checkpoint event the checkpoint cp
+// is written with, as a decoded event holds it.
+func checkpointMeta(t *testing.T, cp *sandbox.CheckpointState) map[string]any {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"ok": cp.OK, "refs": cp.Refs, "error": cp.Error})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// metricDelta is what was added to each series between the values before
+// and after of one metric.
+func metricDelta(before, after map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range after {
+		if d := v - before[k]; d != 0 {
+			out[k] = d
+		}
+	}
+	return out
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
@@ -89,6 +90,9 @@ type Service struct {
 	logs logState
 	// observers are told of each operation on a sandbox once it ended.
 	observers observers
+	// checkpointLimit is the size in bytes above which a checkpoint leaves
+	// an untracked file out; 0 for CheckpointFileLimit.
+	checkpointLimit atomic.Int64
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

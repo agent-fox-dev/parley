@@ -37,3 +37,7 @@ var InsertLogLines = insertLogLines
 // Touch records at as the last activity of the sandbox id, as an operation
 // on it does.
 func Touch(s *Service, ctx context.Context, id string, at time.Time) { s.touch(ctx, id, at) }
+
+// SetCheckpointFileLimit makes n bytes the size above which a checkpoint
+// leaves an untracked file out; 0 restores CheckpointFileLimit.
+func SetCheckpointFileLimit(s *Service, n int64) { s.checkpointLimit.Store(n) }

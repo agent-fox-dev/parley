@@ -1,11 +1,16 @@
 package sandbox_test
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
+	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
 
 func TestScrub(t *testing.T) {
@@ -36,6 +41,62 @@ func TestScrub(t *testing.T) {
 			}
 			if len(got) > 1024 || !utf8.ValidString(got) {
 				t.Errorf("Scrub returned %d bytes, valid UTF-8 %t; want at most 1024 bytes of valid UTF-8", len(got), utf8.ValidString(got))
+			}
+		})
+	}
+}
+
+// The runtime fails every command of the sandbox with the text of a row; the
+// checkpoint's error, its event's and the line the hub logs carry the text
+// scrubbed of the sandbox's credential secret and its hub credential.
+func TestScrub_TheRuntimeErrorOfACheckpoint(t *testing.T) {
+	t.Parallel()
+	const secretValue, hubValue = "sk-secret-value-1234", "hub-credential-5678"
+	logs := &hubtest.LogBuffer{}
+	h := startCheckpointHub(t, func(d *sandbox.Deps) { d.Logger = slog.New(slog.NewJSONHandler(logs, nil)) })
+	id, dir := h.workSandbox(t, nil)
+	h.cloneWork(t, dir)
+	h.svc.SetValues(id, sandbox.Values{Credentials: []string{secretValue}, HubCredential: hubValue})
+	for _, tc := range []struct {
+		name, text string
+		// redacted is true when a value stands within the text's first
+		// 1,024 bytes.
+		redacted bool
+	}{
+		{"a credential's secret", "auth failed for " + secretValue, true},
+		{"the hub credential", "bearer " + hubValue + " refused", true},
+		{"both", secretValue + " and " + hubValue, true},
+		{"5,000 bytes ending in the secret", strings.Repeat("x", 5000-len(secretValue)) + secretValue, false},
+		{"no secret", "the gateway is restarting", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.rt.FailOperation(runtime.OpExec, runtime.ErrUnavailable, tc.text)
+			t.Cleanup(func() { h.rt.FailOperation(runtime.OpExec, nil, "") })
+			logged := len(logs.String())
+			cp, err := h.svc.Checkpoint(context.Background(), storedRecord(t, h.Hub, id), sandbox.SystemActor)
+			if err == nil || cp == nil || cp.Error == nil {
+				t.Fatalf("Checkpoint = %+v, %v; want a failure", cp, err)
+			}
+			evs := h.sandboxEvents(t, sandbox.EventCheckpoint, id)
+			evText, _ := evs[len(evs)-1].metadata["error"].(string)
+			var line struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(logs.String()[logged:])), &line); err != nil {
+				t.Fatalf("the hub logged %q: %v", logs.String()[logged:], err)
+			}
+			for _, sink := range []struct{ name, text string }{
+				{"checkpoint.error", *cp.Error}, {"the event's error", evText}, {"the logged error", line.Error}, {"the returned error", err.Error()},
+			} {
+				if strings.Contains(sink.text, secretValue) || strings.Contains(sink.text, hubValue) || len(sink.text) > 1024 {
+					t.Errorf("%s = %q (%d bytes); want neither value and at most 1,024 bytes", sink.name, sink.text, len(sink.text))
+				}
+				if tc.redacted && !strings.Contains(sink.text, "[redacted]") {
+					t.Errorf("%s = %q; want [redacted] where a value stood", sink.name, sink.text)
+				}
+				if !tc.redacted && len(tc.text) < 1024 && !strings.Contains(sink.text, tc.text) {
+					t.Errorf("%s = %q; want the text %q unchanged", sink.name, sink.text, tc.text)
+				}
 			}
 		})
 	}
