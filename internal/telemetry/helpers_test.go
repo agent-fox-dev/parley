@@ -43,11 +43,19 @@ func (c *clock) Now() time.Time {
 	return c.now
 }
 
-// The workspaces of the seed. alice owns them all, in the org acme: demo,
-// ready; old, archived; one repository in each of the other statuses; and
+// advance moves the clock d forward.
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// The workspaces of the seed. alice owns them all, in the org acme: demo
+// and other, ready; old, archived; one repository in each of the other statuses; and
 // the task fork demo--task1 of demo. nowhere names no workspace.
 const (
 	demo      = "demo"
+	other     = "other"
 	old       = "old"
 	pending   = "ws-pending"
 	cloning   = "ws-cloning"
@@ -58,10 +66,11 @@ const (
 )
 
 // ingestionRoute is one route of the ingestion gate: its path after
-// /workspaces/:slug/runs/:run_id, whether it takes a batch, and a valid body
-// for it, new on every call.
+// /workspaces/:slug/runs/:run_id, the table it stores its records in,
+// whether it takes a batch, and a valid body for it, new on every call.
 type ingestionRoute struct {
 	path  string
+	table string
 	batch bool
 	valid func() any
 }
@@ -77,13 +86,13 @@ func (r ingestionRoute) stored() int {
 // ingestionRoutes are every route registered through the ingestion gate,
 // each with a valid body; the gate's tables run over all of them.
 var ingestionRoutes = []ingestionRoute{
-	{path: "/events", valid: func() any { return map[string]any{"event_type": "run.start"} }},
-	{path: "/sessions/outcomes", valid: func() any {
+	{path: "/events", table: "run_events", valid: func() any { return map[string]any{"event_type": "run.start"} }},
+	{path: "/sessions/outcomes", table: "session_outcomes", valid: func() any {
 		return map[string]any{"session_id": "0a1b2c3d-0000-4000-8000-0000000000aa", "status": "completed"}
 	}},
-	{path: "/tools/calls", valid: func() any { return map[string]any{"tool_name": "bash"} }},
-	{path: "/tools/errors", valid: func() any { return map[string]any{"tool_name": "bash", "error_msg": "exit 1"} }},
-	{path: "/traces", valid: func() any { return map[string]any{"event_type": "tool.use"} }},
+	{path: "/tools/calls", table: "tool_calls", valid: func() any { return map[string]any{"tool_name": "bash"} }},
+	{path: "/tools/errors", table: "tool_errors", valid: func() any { return map[string]any{"tool_name": "bash", "error_msg": "exit 1"} }},
+	{path: "/traces", table: "traces", valid: func() any { return map[string]any{"event_type": "tool.use"} }},
 }
 
 // recordTables are the analytical store's tables of telemetry records.
@@ -103,7 +112,7 @@ type world struct {
 	aliceKey, bobKey, carolKey string
 	alicePAT                   string
 
-	runs atomic.Int64
+	runs, ids atomic.Int64
 }
 
 // newWorld starts the world's hub; each adjust changes the telemetry
@@ -124,7 +133,7 @@ func newWorld(t *testing.T, adjust ...func(*telemetry.Deps)) *world {
 	w.AddMember(t, acme, w.alice)
 	w.AddMember(t, acme, w.bob)
 	repos := map[string]string{
-		demo: access.StatusReady, old: access.StatusArchived, pending: access.StatusPending,
+		demo: access.StatusReady, other: access.StatusReady, old: access.StatusArchived, pending: access.StatusPending,
 		cloning: access.StatusCloning, failed: access.StatusFailed,
 	}
 	for slug, status := range repos {
@@ -144,6 +153,11 @@ func (w *world) pat(t *testing.T, userID string, permissions ...string) string {
 // records are its own.
 func (w *world) freshRun() string {
 	return fmt.Sprintf("20260102_030405_%06x", w.runs.Add(1))
+}
+
+// freshID is a record id that no other call returns.
+func (w *world) freshID() string {
+	return fmt.Sprintf("0a1b2c3d-0000-4000-8000-%012x", w.ids.Add(1))
 }
 
 // post sends body to the ingestion route path of the workspace slug and the
@@ -171,6 +185,36 @@ func (w *world) count(t *testing.T, query string, args ...any) int {
 		t.Fatalf("%s: %v", query, err)
 	}
 	return n
+}
+
+// storedRow is every column of the record id in table, by name.
+func (w *world) storedRow(t *testing.T, table, id string) map[string]any {
+	t.Helper()
+	rows, err := w.Store.Analytics().QueryContext(context.Background(), `SELECT * FROM `+table+` WHERE id = ?`, id)
+	if err != nil {
+		t.Fatalf("read %s %s: %v", table, id, err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatalf("%s holds no record %s (%v)", table, id, rows.Err())
+	}
+	values := make([]any, len(columns))
+	dest := make([]any, len(columns))
+	for i := range values {
+		dest[i] = &values[i]
+	}
+	if err := rows.Scan(dest...); err != nil {
+		t.Fatalf("read %s %s: %v", table, id, err)
+	}
+	row := make(map[string]any, len(columns))
+	for i, c := range columns {
+		row[c] = values[i]
+	}
+	return row
 }
 
 // decode decodes a JSON object answer.

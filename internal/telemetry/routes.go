@@ -48,10 +48,10 @@ func (c *Component) Bind(d Deps) {
 // Routes are the ingestion routes, for the server's router.
 func (c *Component) Routes() []server.Route {
 	return []server.Route{
-		c.ingest("/events", true, single(c.postRunEvent)),
-		c.ingest("/sessions/outcomes", true, single(postRecord(c, "session outcome", c.readOutcome, insertOutcome))),
-		c.ingest("/tools/calls", true, single(postRecord(c, "tool call", c.readToolCall, insertToolCall))),
-		c.ingest("/tools/errors", true, single(postRecord(c, "tool error", c.readToolError, insertToolError))),
-		c.ingest("/traces", true, single(postRecord(c, "trace record", c.readTrace, insertTrace))),
+		c.ingest("/events", true, single(postRecord(c, runEvents, c.readRunEvent))),
+		c.ingest("/sessions/outcomes", true, single(postRecord(c, outcomes, c.readOutcome))),
+		c.ingest("/tools/calls", true, single(postRecord(c, toolCalls, c.readToolCall))),
+		c.ingest("/tools/errors", true, single(postRecord(c, toolErrors, c.readToolError))),
+		c.ingest("/traces", true, single(postRecord(c, traces, c.readTrace))),
 	}
 }

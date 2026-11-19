@@ -201,21 +201,38 @@ func (c *Component) readTrace(f fields, t target) (tr trace, err error) {
 	return tr, nil
 }
 
-// postRecord is the reader of a single-record route of the kind R named
-// kind: it reads the record with read, stores it with insert and answers
-// it 201.
-func postRecord[R record](c *Component, kind string, read func(fields, target) (R, error), insert func(context.Context, Tx, R) error) func(fields, target) (act, error) {
+// postRecord is the reader of a single-record route of the kind k: it
+// reads the record with read and stores it once under its id. A new record
+// is answered 201. A record whose id names a stored record of the same
+// workspace and run is answered 200 with the stored record, whatever its
+// own members hold, and one whose id names a record of another workspace or
+// run is refused 409; neither writes anything. Validation comes before the
+// lookup, so that an invalid body is refused whatever its id names.
+func postRecord[R record](c *Component, k kind[R], read func(fields, target) (R, error)) func(fields, target) (act, error) {
 	return func(f fields, t target) (act, error) {
 		rec, err := read(f, t)
 		if err != nil {
 			return nil, err
 		}
 		return func(ctx context.Context, w http.ResponseWriter) error {
-			if err := c.write(ctx, func(tx Tx) error { return insert(ctx, tx, rec) }); err != nil {
-				h := rec.common()
-				return fmt.Errorf("store %s %s of run %s in workspace %s: %w", kind, h.ID, h.RunID, h.Workspace, err)
+			var stored R
+			var created bool
+			err := c.write(ctx, func(tx Tx) (err error) {
+				stored, created, err = storeOnce(ctx, tx, k, rec)
+				return err
+			})
+			h := rec.common()
+			if err != nil {
+				return fmt.Errorf("store %s %s of run %s in workspace %s: %w", k.name, h.ID, h.RunID, h.Workspace, err)
 			}
-			server.WriteJSON(w, http.StatusCreated, rec)
+			switch s := stored.common(); {
+			case created:
+				server.WriteJSON(w, http.StatusCreated, stored)
+			case s.Workspace != h.Workspace || s.RunID != h.RunID:
+				return server.Conflict(fmt.Sprintf("id %s names a %s of another workspace or run", h.ID, k.name))
+			default:
+				server.WriteJSON(w, http.StatusOK, stored)
+			}
 			return nil
 		}, nil
 	}

@@ -3,7 +3,9 @@ package telemetry
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -58,6 +60,121 @@ func (c *Component) write(ctx context.Context, fn func(tx Tx) error) error {
 func rollback(tx Tx) error {
 	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 		return err
+	}
+	return nil
+}
+
+// kind is how the records of one kind are stored, each kind in a table of
+// its own keyed by the id in lower case, so that one id may name records of
+// two kinds: its name, for messages, the insert of a new record and the
+// read of the stored one by its id.
+type kind[R record] struct {
+	name   string
+	insert func(ctx context.Context, tx Tx, rec R) error
+	get    func(ctx context.Context, tx Tx, id string) (rec R, found bool, err error)
+}
+
+// The kinds of single records.
+var (
+	runEvents  = kind[runEvent]{name: "run event", insert: insertRunEvent, get: getRunEvent}
+	outcomes   = kind[outcome]{name: "session outcome", insert: insertOutcome, get: getOutcome}
+	toolCalls  = kind[toolCall]{name: "tool call", insert: insertToolCall, get: getToolCall}
+	toolErrors = kind[toolError]{name: "tool error", insert: insertToolError, get: getToolError}
+	traces     = kind[trace]{name: "trace record", insert: insertTrace, get: getTrace}
+)
+
+// storeOnce stores rec in tx unless its id names a stored record of the
+// kind k, and returns the record the id names: rec when it is new, which
+// created reports, and otherwise the stored record, whatever rec holds. The
+// read and the insert share tx, and a transaction of the analytical store
+// takes its write lock when it begins, so that of concurrent requests with
+// one new id exactly one inserts it and the others read what it stored.
+func storeOnce[R record](ctx context.Context, tx Tx, k kind[R], rec R) (stored R, created bool, err error) {
+	stored, found, err := k.get(ctx, tx, rec.common().ID)
+	if err != nil || found {
+		return stored, false, err
+	}
+	if err := k.insert(ctx, tx, rec); err != nil {
+		return stored, false, err
+	}
+	return rec, true, nil
+}
+
+// getRecord reads the record id of table: its head into h and the columns
+// named by columns into dest, in their order. found is false when table
+// holds no record id.
+func getRecord(ctx context.Context, tx Tx, table, columns, id string, h *head, dest ...any) (found bool, err error) {
+	var ts, ingested string
+	err = tx.QueryRowContext(ctx, `SELECT id, workspace, run_id, timestamp, ingested_at, `+columns+` FROM `+table+` WHERE id = ?`, id).
+		Scan(append([]any{&h.ID, &h.Workspace, &h.RunID, &ts, &ingested}, dest...)...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	t, err := time.Parse(storedLayout, ts)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: timestamp %q: %w", table, id, ts, err)
+	}
+	at, err := time.Parse(time.RFC3339, ingested)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: ingested_at %q: %w", table, id, ingested, err)
+	}
+	h.Timestamp, h.IngestedAt = clientTime(t), timefmt.Time(at)
+	return true, nil
+}
+
+// getRunEvent reads the run event id.
+func getRunEvent(ctx context.Context, tx Tx, id string) (e runEvent, found bool, err error) {
+	found, err = getRecord(ctx, tx, "run_events", "event_type, severity, node_id, session_id, payload", id, &e.head,
+		&e.EventType, &e.Severity, &e.NodeID, &e.SessionID, jsonColumn{&e.Payload})
+	return e, found, err
+}
+
+// getOutcome reads the session outcome id.
+func getOutcome(ctx context.Context, tx Tx, id string) (o outcome, found bool, err error) {
+	found, err = getRecord(ctx, tx, "session_outcomes", "session_id, status, node_id, duration_ms, token_usage", id, &o.head,
+		&o.SessionID, &o.Status, &o.NodeID, &o.DurationMS, jsonColumn{&o.TokenUsage})
+	return o, found, err
+}
+
+// getToolCall reads the tool call id.
+func getToolCall(ctx context.Context, tx Tx, id string) (tc toolCall, found bool, err error) {
+	found, err = getRecord(ctx, tx, "tool_calls", "tool_name, node_id, session_id, duration_ms, input, output", id, &tc.head,
+		&tc.ToolName, &tc.NodeID, &tc.SessionID, &tc.DurationMS, jsonColumn{&tc.Input}, jsonColumn{&tc.Output})
+	return tc, found, err
+}
+
+// getToolError reads the tool error id.
+func getToolError(ctx context.Context, tx Tx, id string) (te toolError, found bool, err error) {
+	found, err = getRecord(ctx, tx, "tool_errors", "tool_name, error_msg, error_code, node_id, session_id", id, &te.head,
+		&te.ToolName, &te.ErrorMsg, &te.ErrorCode, &te.NodeID, &te.SessionID)
+	return te, found, err
+}
+
+// getTrace reads the trace record id.
+func getTrace(ctx context.Context, tx Tx, id string) (tr trace, found bool, err error) {
+	found, err = getRecord(ctx, tx, "traces", "event_type, node_id, session_id, sequence, data", id, &tr.head,
+		&tr.EventType, &tr.NodeID, &tr.SessionID, &tr.Sequence, jsonColumn{&tr.Data})
+	return tr, found, err
+}
+
+// jsonColumn scans a column of JSON text into the raw JSON it holds, nil
+// for NULL, so that a stored member is answered as it was sent.
+type jsonColumn struct{ dst *json.RawMessage }
+
+// Scan implements sql.Scanner.
+func (j jsonColumn) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		*j.dst = nil
+	case string:
+		*j.dst = json.RawMessage(v)
+	case []byte:
+		*j.dst = append(json.RawMessage(nil), v...)
+	default:
+		return fmt.Errorf("a JSON column holds a %T", src)
 	}
 	return nil
 }
