@@ -3,11 +3,11 @@
   "spec_id": "46",
   "spec_name": "sandbox_exec_files_and_logs",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-19T02:31:51Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,

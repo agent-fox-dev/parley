@@ -244,6 +244,61 @@ func TestBodyStage_AcceptsTheContentTypeTheRouteStates(t *testing.T) {
 	assertError(t, rec, http.StatusRequestEntityTooLarge, "payload_too_large")
 }
 
+// loggedReader records "body read" in log at its first read.
+type loggedReader struct {
+	io.Reader
+	log  *callLog
+	read bool
+}
+
+func (r *loggedReader) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		r.log.add("body read")
+	}
+	return r.Reader.Read(p)
+}
+
+func TestBodyStage_LeavesTheBodyOfAStreamingRouteToItsHandler(t *testing.T) {
+	t.Parallel()
+	size := defaultLimit + 1
+	cases := []struct {
+		name    string
+		header  http.Header
+		chunked bool
+	}{
+		{"a declared length over the limit as text/plain", http.Header{"Content-Type": {"text/plain"}}, false},
+		{"no declared length and no content type", nil, true},
+		{"a tar stream", http.Header{"Content-Type": {"application/x-tar"}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var log callLog
+			h := bodyServer(Options{}, &log, Route{Method: http.MethodPut, Pattern: "/files", StreamBody: true, Handler: echoLength(&log)})
+			r := newRequest(http.MethodPut, "/api/v1/files", tc.header, "")
+			r.Body = io.NopCloser(&loggedReader{Reader: strings.NewReader(strings.Repeat("a", size)), log: &log})
+			r.ContentLength = int64(size)
+			if tc.chunked {
+				r.ContentLength = -1
+			}
+
+			rec := do(h, r)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %.200s)", rec.Code, rec.Body.Bytes())
+			}
+			if read, _ := echoed(t, rec.Body.Bytes()); read != size {
+				t.Errorf("handler read %d bytes, want %d", read, size)
+			}
+			want := []string{"binding guard", "scope check", "access check", "handler", "body read"}
+			if calls := log.calls(); !slices.Equal(calls, want) {
+				t.Errorf("ran %v, want %v", calls, want)
+			}
+		})
+	}
+}
+
 func TestDecodeJSON_RefusesABodyThatIsNotOneJSONObject(t *testing.T) {
 	t.Parallel()
 	bodies := []string{

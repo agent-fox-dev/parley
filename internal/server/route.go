@@ -57,6 +57,12 @@ type Route struct {
 	// ContentType is the route's own request media type; empty means
 	// application/json.
 	ContentType string
+	// StreamBody leaves the request body to the handler: the body stage
+	// reads none of it and checks neither its size nor its content type, so
+	// that the handler can stream a body larger than any limit known when
+	// the route is declared and enforce its own limit and media types.
+	// MaxBodySize and ContentType are then not read.
+	StreamBody bool
 	// CacheControl is the route's own Cache-Control value; empty means
 	// no-store.
 	CacheControl string

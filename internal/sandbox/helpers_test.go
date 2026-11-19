@@ -2142,3 +2142,135 @@ func (h *createHub) bindEvents(t *testing.T, id string) int {
 	t.Helper()
 	return h.count(t, `SELECT count(*) FROM hub_events WHERE type = 'parley.token.bind' AND (? = '' OR resource_id = ?)`, id, id)
 }
+
+// useRoute is one of the routes that use a sandbox: the name the test hooks
+// know it by, its method, the last segment of its path, and whether it is
+// of kind write.
+type useRoute struct {
+	name, method, segment string
+	write                 bool
+}
+
+// useRoutes are the five routes that use a sandbox.
+var useRoutes = []useRoute{
+	{"exec", http.MethodPost, "exec", true},
+	{"upload", http.MethodPut, "files", true},
+	{"download", http.MethodGet, "files", false},
+	{"logs", http.MethodGet, "logs", false},
+	{"attach", http.MethodGet, "attach", true},
+}
+
+func (u useRoute) String() string { return u.method + " " + u.segment }
+
+// path is the route's path for the sandbox id of the workspace slug.
+func (u useRoute) path(slug, id string) string { return sandboxPath(slug, id) + "/" + u.segment }
+
+// body is a body the probe validations of a use hub accept: a command for
+// exec, none for the others.
+func (u useRoute) body() any {
+	if u.name == "exec" {
+		return map[string]any{"command": []string{"true"}}
+	}
+	return nil
+}
+
+// useHub is a probe hub with sandboxes on whose routes that use a sandbox
+// run probes in place of their validations and operations, and whose owner
+// has a second workspace, ws2.
+type useHub struct {
+	*probeHub
+	svc *sandbox.Service
+	// key is the owner's API key.
+	key string
+}
+
+// startUseHub starts a use hub. Its operations count their calls in calls
+// and answer 200, or return the error of fail when fail is not nil and
+// returns one; exec's validation refuses an empty body 400 invalid_request,
+// and the other routes validate nothing.
+func startUseHub(t *testing.T, fail func() error) *useHub {
+	t.Helper()
+	h := &useHub{probeHub: &probeHub{rt: runtimetest.New(t)}}
+	cfg := sandboxesOn
+	cfg.Compose = func(c *hub.Composition) {
+		h.svc = c.Sandbox()
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+		for _, u := range useRoutes {
+			sandbox.SetUseOperation(h.svc, u.name, func(w http.ResponseWriter, r *http.Request) error {
+				if fail != nil {
+					if err := fail(); err != nil {
+						h.calls.Add(1)
+						return err
+					}
+				}
+				return h.probe(w, r)
+			})
+			sandbox.SetUseValidation(h.svc, u.name, func(*http.Request) error { return nil })
+		}
+		sandbox.SetUseValidation(h.svc, "exec", func(r *http.Request) error {
+			if b, _ := io.ReadAll(r.Body); len(b) == 0 {
+				return server.InvalidRequest("request body is empty; want a JSON object")
+			}
+			return nil
+		})
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	h.owner, h.member, h.outsider = h.CreateUser(t, "owner"), h.CreateUser(t, "member"), h.CreateUser(t, "outsider")
+	org := h.CreateOrg(t, "team")
+	h.AddMember(t, org, h.member)
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: org, Kind: access.KindRepository, Status: access.StatusReady})
+	h.AddWorkspace(t, access.Record{Slug: "ws2", OwnerID: h.owner, OrgID: org, Kind: access.KindRepository, Status: access.StatusReady})
+	h.key = h.IssueKey(t, h.owner)
+	return h
+}
+
+// seed stores a sandbox of the workspace ws, created by the owner's API
+// key, in state, with the hub credential ha (nil for none), and returns its
+// id.
+func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) string {
+	t.Helper()
+	before := recordStart.Add(-time.Hour)
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, HubAccess: ha,
+		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
+		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: ws,
+	}
+	switch state {
+	case sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted:
+		rec.EndedAt = &before
+	}
+	err := h.Store.Tx(context.Background(), func(tx *sql.Tx) error { return sandbox.Insert(context.Background(), tx, rec) })
+	if err != nil {
+		t.Fatalf("insert a sandbox in %s: %v", state, err)
+	}
+	return rec.ID
+}
+
+// useCall sends a request to the use route u for the sandbox id of the
+// workspace slug with cred and body, and checks its answer: status and
+// errorType, and, for a status other than 200, that neither the operation
+// nor the runtime was reached; for 200, that the operation was.
+func (h *useHub) useCall(t *testing.T, u useRoute, slug, id, cred string, body any, status int, errorType string) answer {
+	t.Helper()
+	calls, runtimeCalls := h.calls.Load(), len(h.rt.Calls())
+	a := h.call(t, u.method, u.path(slug, id), cred, body)
+	if a.status != status || a.err.ErrorType != errorType {
+		t.Errorf("%s %s = %d %s, want %d %s", u.method, u.path(slug, id), a.status, a.body, status, errorType)
+	}
+	reached := h.calls.Load() - calls
+	switch {
+	case status == http.StatusOK && reached != 1:
+		t.Errorf("the operation ran %d times, want once", reached)
+	case status != http.StatusOK && reached != 0:
+		t.Errorf("the operation ran %d times, want never", reached)
+	}
+	if status != http.StatusOK {
+		if n := len(h.rt.Calls()) - runtimeCalls; n != 0 {
+			t.Errorf("the runtime got %d calls, want none", n)
+		}
+	}
+	return a
+}

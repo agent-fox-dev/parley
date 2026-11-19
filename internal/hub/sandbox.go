@@ -66,7 +66,10 @@ const (
 // the latest, and GET
 // /workspaces/:slug/sandboxes lists a workspace's, with its forks' that the
 // access component's readable set holds; GET /sandboxes lists the stored
-// sandboxes of every workspace through the service's source.
+// sandboxes of every workspace through the service's source. The routes
+// that use a sandbox, POST exec, PUT and GET files, GET logs and GET attach
+// under /workspaces/:slug/sandboxes/:id, exist only through the service's
+// gate (Service.UseRoutes).
 //
 // With sandboxes on, the provisioner runs as background work: it brings each
 // created sandbox up at the runtime until it is ready or failed, woken by a
@@ -129,6 +132,9 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.CreateRoute())
 	c.AddRoute(svc.GetRoute())
 	c.AddRoute(svc.ListRoute())
+	for _, rt := range svc.UseRoutes() {
+		c.AddRoute(rt)
+	}
 	// Registered while the hub composes, so that a test's source, registered
 	// after, replaces it; the list is refused while sandboxes are off.
 	svc.RegisterSource(svc.StoredSource())
