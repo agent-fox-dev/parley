@@ -145,6 +145,32 @@ func formatDuration(d time.Duration) string {
 	return strconv.FormatInt(int64(d/time.Second), 10) + "s"
 }
 
+// GetRoute declares GET /workspaces/:slug/sandboxes/:id: the sandbox id of
+// the workspace, from its stored record, in every state, deleted included.
+// With wait_for and wait it holds the request until the sandbox is in the
+// state asked for or the wait has passed (see getSandbox). It needs the
+// scope sandboxes:read of a PAT and read access to the workspace, and reads
+// the store only, so it keeps answering while the runtime is unreachable.
+func (s *Service) GetRoute() server.Route {
+	return s.WorkspaceRoute(KindRead, server.Route{
+		Method:  http.MethodGet,
+		Pattern: "/workspaces/:slug/sandboxes/:id",
+		Handler: s.getSandbox,
+	})
+}
+
+// ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
+// of the workspace, newest first, paged, filtered by the query (see
+// listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and
+// read access to the workspace, and reads the store only.
+func (s *Service) ListRoute() server.Route {
+	return s.WorkspaceRoute(KindRead, server.Route{
+		Method:  http.MethodGet,
+		Pattern: "/workspaces/:slug/sandboxes",
+		Handler: s.listWorkspaceSandboxes,
+	})
+}
+
 // states are the values the state filter of GET /sandboxes takes, written
 // exactly so.
 var states = []string{"provisioning", "ready", "stopped", "completed", "failed", "deleted"}

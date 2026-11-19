@@ -140,11 +140,13 @@ func TestProvision_ReachesReady(t *testing.T) {
 				body["command"] = tc.command
 			}
 			id := sandboxObject(t, h.post(t, "demo--t1", body))["id"].(string)
-			rec := h.settled(t, id)
-			if rec.State != sandbox.StateReady || !rec.UpdatedAt.Equal(h.clock.Now()) || rec.Marker != "" {
-				t.Fatalf("sandbox = %s %q, updated %v, marker %q; want ready, updated now, no marker", rec.State, rec.StateReason, rec.UpdatedAt, rec.Marker)
+			o := h.settledObject(t, "demo--t1", id)
+			if o["state"] != sandbox.StateReady || o["updated_at"] != stamp(h.clock.Now()) {
+				t.Fatalf("sandbox = %v %v, updated %v; want ready, updated now", o["state"], o["state_reason"], o["updated_at"])
 			}
-			o := objectMap(t, rec)
+			if rec, err := sandbox.Get(context.Background(), h.Store.Main(), id); err != nil || rec.Marker != "" {
+				t.Errorf("stored marker %q (%v); want none", rec.Marker, err)
+			}
 			ev := h.sandboxEvents(t, sandbox.EventReady, id)
 			if len(ev) != 1 || ev[0].actorType != event.ActorSystem || o["checkout"] == nil || !reflect.DeepEqual(ev[0].metadata["checkout"], o["checkout"]) {
 				t.Errorf("ready events %+v; want one by the system with checkout %v", ev, o["checkout"])

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -79,6 +80,14 @@ type Deps struct {
 	// NewTimer returns a timer of the hub's clock, on which the provisioner
 	// passes and bounds a provisioning; nil uses the real clock.
 	NewTimer func(time.Duration) Timer
+	// Readable returns the workspaces the caller can read, cut down to those
+	// its binding covers, as the access component's Readable does: the list
+	// of a repository's sandboxes with include_forks shows the forks' of
+	// that set.
+	Readable func(ctx context.Context, c access.Caller) (access.ReadableSet, error)
+	// Shutdown is closed when the hub begins to stop: a read waiting for a
+	// sandbox answers then.
+	Shutdown <-chan struct{}
 	// HoldProvisioning keeps the provisioner from running: the sandboxes a
 	// create stores stay in provisioning with their marker, and the runtime
 	// is not called for them. A test of what precedes the provisioning sets
@@ -121,6 +130,12 @@ func (s *Service) Bind(d Deps) {
 // hold is an error matching ErrInvalidTransition, and an id no sandbox has
 // one matching ErrNotFound; nothing is written either.
 //
+// An applied transition notifies the reads that wait for a sandbox: after
+// the commit of its own transaction, and with the caller's transaction when
+// the update applied, before the caller commits; a notified read takes the
+// store's turn of writes before it reads, so it sees what the caller
+// commits.
+//
 // An applied transition reports SandboxesMetric from the counts in its
 // transaction (ReportStates). Every package leaves ready through here, so
 // Transition also reports SecondsMetric: an applied transition from ready to an ended state observes
@@ -148,7 +163,40 @@ func (s *Service) Transition(ctx context.Context, tx *sql.Tx, id, from, to, reas
 	if seconds != nil {
 		_ = s.deps.Recorder.Observe(SecondsMetric, nil, *seconds)
 	}
+	if applied {
+		s.changes.notify()
+	}
 	return applied, nil
+}
+
+// notifier tells the reads that wait for a sandbox that a transition
+// applied. Each waiter takes the channel of the next notification before it
+// reads the record, so that a transition after its read is not missed; a
+// notification closes that channel and starts the next one. The zero value
+// is ready to use.
+type notifier struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+// next returns the channel the next notification closes.
+func (n *notifier) next() <-chan struct{} {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ch == nil {
+		n.ch = make(chan struct{})
+	}
+	return n.ch
+}
+
+// notify closes the channel of the waiters that took it.
+func (n *notifier) notify() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ch != nil {
+		close(n.ch)
+		n.ch = nil
+	}
 }
 
 // transition is Transition in tx. seconds is what to observe in

@@ -46,6 +46,9 @@ func TestCreate_StoresProvisioningSandbox(t *testing.T) {
 			t.Errorf("%s = %#v; want %#v", k, s[k], v)
 		}
 	}
+	if got := decoded(t, h.call(t, http.MethodGet, "/workspaces/demo--t1/sandboxes/"+id, h.key, nil), http.StatusOK); !reflect.DeepEqual(got, s) {
+		t.Errorf("get of the new sandbox = %v; want the created object %v", got, s)
+	}
 	rec, err := sandbox.GetIn(context.Background(), h.Store.Main(), "demo--t1", id)
 	if err != nil {
 		t.Fatalf("read the stored sandbox: %v", err)

@@ -228,6 +228,10 @@ func TestNoValueLeavesTheHub(t *testing.T) {
 	if rec := h.settled(t, id); rec.State != sandbox.StateReady {
 		t.Fatalf("sandbox = %s %q; want ready", rec.State, rec.StateReason)
 	}
+	got := h.call(t, http.MethodGet, "/workspaces/demo--t1/sandboxes/"+id, h.key, nil)
+	listed := h.call(t, http.MethodGet, "/workspaces/demo--t1/sandboxes?state=ready&state=failed", h.key, nil)
+	decoded(t, got, http.StatusOK)
+	decoded(t, listed, http.StatusOK)
 
 	// A second sandbox fails at the runtime with a text that holds both
 	// secret values and its hub credential's: its fail event carries none.
@@ -281,7 +285,7 @@ func TestNoValueLeavesTheHub(t *testing.T) {
 	}
 
 	all := strings.Join([]string{
-		string(created.body), string(failed.body),
+		string(created.body), string(failed.body), string(got.body), string(listed.body),
 		dump(t, h.Store.Main(), "hub_events"), dump(t, h.Store.Main(), "sandboxes"), h.Log.String(),
 	}, "\n")
 	for _, v := range []string{modelValue, npmValue} {

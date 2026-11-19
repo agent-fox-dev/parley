@@ -676,6 +676,9 @@ type createHub struct {
 	rec *recordingRecorder
 	// hooks steer the runtime client the hub is given, in front of rt's.
 	hooks *runtimeHooks
+	// timers are the timers of the hub's clock the stored sandboxes asked
+	// for.
+	timers *timerLog
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
 	// base is the commit main of demo points at in a create world.
@@ -705,6 +708,7 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 	h := &createHub{
 		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
 		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{head: defaultHead},
+		timers: &timerLog{},
 	}
 	h.rt.SetExec(h.hooks.script)
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
@@ -723,7 +727,7 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
 			h.minter.next, d.Mint = d.Mint, h.minter.mint
-			d.NewTimer = func(d time.Duration) sandbox.Timer { return h.clock.NewTimer(d) }
+			d.NewTimer = func(d time.Duration) sandbox.Timer { return h.timers.track(d, h.clock.NewTimer(d)) }
 			d.HoldProvisioning = !provision
 			for _, fn := range adjust {
 				fn(d)
@@ -834,6 +838,123 @@ func (h *createHub) seedIn(t *testing.T, ws string, cp json.RawMessage) string {
 	}
 	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) })
 	return rec.ID
+}
+
+// seedRecord stores a sandbox of the workspace ws in state, created by dana
+// at recordStart, as edit changes it when edit is not nil, and returns its
+// id. One seeded in an ended state ended at its creation.
+func (h *createHub) seedRecord(t *testing.T, ws, state string, edit func(*sandbox.Record)) string {
+	t.Helper()
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, Image: "img:1", CPU: "2", Memory: "4Gi",
+		ExpiresAt: recordStart.Add(time.Hour), LastActivityAt: recordStart,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"},
+		CreatedAt: recordStart, UpdatedAt: recordStart, UserID: h.dana, FamilyRoot: "demo",
+	}
+	if edit != nil {
+		edit(&rec)
+	}
+	switch rec.State {
+	case sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted:
+		ended := rec.CreatedAt
+		rec.EndedAt = &ended
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) })
+	return rec.ID
+}
+
+// getting sends GET path, under /api/v1, with cred as the bearer
+// credential, under ctx, and delivers the answer on the channel it returns:
+// with status 0 when the request got none, as when ctx ended first.
+func (h *createHub) getting(ctx context.Context, path, cred string) <-chan answer {
+	out := make(chan answer, 1)
+	go func() {
+		var a answer
+		defer func() { out <- a }()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.URL("/api/v1"+path), nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		a.status, a.body = resp.StatusCode, body
+	}()
+	return out
+}
+
+// decoded decodes the JSON object of an answer that must have status.
+func decoded(t *testing.T, a answer, status int) map[string]any {
+	t.Helper()
+	if a.status != status {
+		t.Fatalf("answer = %d %s; want %d", a.status, a.body, status)
+	}
+	var o map[string]any
+	if err := json.Unmarshal(a.body, &o); err != nil {
+		t.Fatalf("the answer %s: %v", a.body, err)
+	}
+	return o
+}
+
+// timerLog keeps every timer of the hub's clock it tracks, with its
+// duration and whether it was stopped.
+type timerLog struct {
+	mu     sync.Mutex
+	timers []*trackedTimer
+}
+
+// trackedTimer is a timer of the hub's clock that a timerLog keeps.
+type trackedTimer struct {
+	sandbox.Timer
+	d       time.Duration
+	stopped atomic.Bool
+}
+
+func (t *trackedTimer) Stop() bool {
+	t.stopped.Store(true)
+	return t.Timer.Stop()
+}
+
+// track keeps the timer tm of d and returns it.
+func (l *timerLog) track(d time.Duration, tm sandbox.Timer) sandbox.Timer {
+	tt := &trackedTimer{Timer: tm, d: d}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.timers = append(l.timers, tt)
+	return tt
+}
+
+// created is the number of timers of d asked for so far.
+func (l *timerLog) created(d time.Duration) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, tm := range l.timers {
+		if tm.d == d {
+			n++
+		}
+	}
+	return n
+}
+
+// live is the number of timers of d not stopped.
+func (l *timerLog) live(d time.Duration) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, tm := range l.timers {
+		if tm.d == d && !tm.stopped.Load() {
+			n++
+		}
+	}
+	return n
 }
 
 // post sends POST /workspaces/slug/sandboxes as dana with body.
@@ -1292,6 +1413,18 @@ func (h *createHub) settled(t *testing.T, id string) sandbox.Record {
 		return rec.State != sandbox.StateProvisioning
 	})
 	return rec
+}
+
+// settledObject waits until a get of the sandbox id of the workspace slug
+// shows it no longer provisioning and returns that object.
+func (h *createHub) settledObject(t *testing.T, slug, id string) map[string]any {
+	t.Helper()
+	var o map[string]any
+	eventually(t, "sandbox "+id+" to leave provisioning", func() bool {
+		o = decoded(t, h.call(t, http.MethodGet, "/workspaces/"+slug+"/sandboxes/"+id, h.key, nil), http.StatusOK)
+		return o["state"] != sandbox.StateProvisioning
+	})
+	return o
 }
 
 // hubEvent is what a test checks of a stored hub event.

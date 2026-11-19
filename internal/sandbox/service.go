@@ -75,6 +75,9 @@ type Service struct {
 	// wakeup holds a token while a created sandbox waits for the
 	// provisioner.
 	wakeup chan struct{}
+	// changes is notified after every applied transition, for the reads
+	// that wait for a sandbox.
+	changes notifier
 }
 
 // NewService returns the service of a hub whose configuration is not loaded

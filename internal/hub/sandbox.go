@@ -55,7 +55,11 @@ const (
 // checkout its commit identity and the hub's logger; the other
 // sandbox packages register their delete and purge hooks on the service.
 // POST /workspaces/:slug/sandboxes creates a sandbox through the service's
-// create.
+// create; GET /workspaces/:slug/sandboxes/:id reads one, waiting on the
+// service's transitions until the hub begins to stop at the latest, and GET
+// /workspaces/:slug/sandboxes lists a workspace's, with its forks' that the
+// access component's readable set holds; GET /sandboxes lists the stored
+// sandboxes of every workspace through the service's source.
 //
 // With sandboxes on, the provisioner runs as background work: it brings each
 // created sandbox up at the runtime until it is ready or failed, woken by a
@@ -93,7 +97,8 @@ func composeSandbox(c *Composition) {
 			User: func(ctx context.Context, id string) (identity.User, error) {
 				return identity.UserByID(ctx, rt.Store.Main(), id)
 			},
-			Logger: rt.Logger,
+			Logger:   rt.Logger,
+			Readable: c.access.Readable, Shutdown: c.ShuttingDown(),
 		}
 		for _, adjust := range c.sandboxAdjusters {
 			adjust(&d)
@@ -105,6 +110,11 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.ProfilesRoute())
 	c.AddRoute(svc.SandboxesRoute())
 	c.AddRoute(svc.CreateRoute())
+	c.AddRoute(svc.GetRoute())
+	c.AddRoute(svc.ListRoute())
+	// Registered while the hub composes, so that a test's source, registered
+	// after, replaces it; the list is refused while sandboxes are off.
+	svc.RegisterSource(svc.StoredSource())
 	c.addVersionMember(func() map[string]any {
 		if v, ok := svc.Version(); ok {
 			return map[string]any{"sandbox_runtime": v}
