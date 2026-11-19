@@ -168,6 +168,39 @@ func insertRow(ctx context.Context, tx *sql.Tx, r row) error {
 	return nil
 }
 
+// sessionExists reports whether the session id (in lower case) is stored,
+// reading through q.
+func sessionExists(ctx context.Context, q Querier, id string) (bool, error) {
+	var one int
+	err := q.QueryRowContext(ctx, `SELECT 1 FROM sessions WHERE id = ?`, id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read session %s: %w", id, err)
+	}
+	return true, nil
+}
+
+// insertLink stores the link l, recorded at, in tx, unless a link of the
+// same session, kind, workspace and key is stored already. Only a version
+// link stores its change and version numbers.
+func insertLink(ctx context.Context, tx *sql.Tx, l Link, at time.Time) error {
+	var number, version any
+	if l.Kind == KindVersion {
+		number, version = l.Number, l.Version
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO session_links (session_id, kind, workspace, link_key, number, version, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (session_id, kind, workspace, link_key) DO NOTHING`,
+		l.SessionID, string(l.Kind), l.Workspace, l.Key, number, version, timefmt.Format(at))
+	if err != nil {
+		return fmt.Errorf("store the %s link %s of session %s: %w", l.Kind, l.Key, l.SessionID, err)
+	}
+	return nil
+}
+
 // nullable is s, or NULL for "".
 func nullable(s string) any {
 	if s == "" {
@@ -248,7 +281,7 @@ func readLinks(ctx context.Context, q Querier, id string, o *Object) error {
 		if err := scan(&kind, &n); err != nil {
 			return err
 		}
-		o.Counts.set(kind, n)
+		o.Counts.set(Kind(kind), n)
 		return nil
 	}, `SELECT kind, COUNT(*) FROM session_links WHERE session_id = ? GROUP BY kind`, id)
 	if err != nil {

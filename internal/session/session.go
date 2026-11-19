@@ -144,21 +144,21 @@ type Counts struct {
 }
 
 // set sets the count of the links of kind to n; changes are counted apart.
-func (c *Counts) set(kind string, n int64) {
+func (c *Counts) set(kind Kind, n int64) {
 	switch kind {
-	case "fork":
+	case KindFork:
 		c.Forks = n
-	case "sandbox":
+	case KindSandbox:
 		c.Sandboxes = n
-	case "version":
+	case KindVersion:
 		c.Versions = n
-	case "push":
+	case KindPush:
 		c.Pushes = n
-	case "commit":
+	case KindCommit:
 		c.Commits = n
-	case "claim":
+	case KindClaim:
 		c.Claims = n
-	case "land":
+	case KindLand:
 		c.Lands = n
 	}
 }

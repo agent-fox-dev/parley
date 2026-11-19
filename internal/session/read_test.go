@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -204,5 +205,33 @@ func TestRead_RefusesAMalformedIdAndAMissingScope(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRead_BuildsTheSessionFromWhatIsStoredWhenItAnswers(t *testing.T) {
+	w := newWorld(t)
+	id := w.newSession(t)
+	a := w.object(t, id)
+	w.reported(t, w.aliceKey, id, map[string]any{"id": freshID(), "model": "m1", "input_tokens": 4})
+	w.record(t, session.ForkLink(id, demo, fork1))
+	b := w.object(t, id)
+	for _, c := range []struct {
+		name      string
+		s         map[string]any
+		in, forks float64
+	}{{"before the usage and the link", a, 0, 0}, {"after them", b, 4, 1}} {
+		if got := c.s["token_summary"].(map[string]any)["total_input_tokens"]; got != c.in {
+			t.Errorf("%s: token_summary.total_input_tokens = %v, want %v", c.name, got, c.in)
+		}
+		if got := c.s["counts"].(map[string]any)["forks"]; got != c.forks {
+			t.Errorf("%s: counts.forks = %v, want %v", c.name, got, c.forks)
+		}
+	}
+	status, raw := w.complete(t, w.aliceKey, id, map[string]any{"status": "completed"})
+	if status != http.StatusOK {
+		t.Fatalf("complete = %d %s, want 200", status, raw)
+	}
+	if completed, read := decode(t, raw), w.object(t, id); !reflect.DeepEqual(completed, read) {
+		t.Errorf("the session complete answered = %v, a following GET = %v", completed, read)
 	}
 }
