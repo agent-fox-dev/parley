@@ -283,8 +283,10 @@ type decision struct {
 // workspace sandbox rules yet. Then an approval of a sandbox that is
 // provisioning or ready adds the rule to its policy at the runtime (see
 // addRule); a sandbox in another state takes the rule with its next start.
-// Last, one transaction stores the decision, conditional on the proposal
-// still being open (see storeDecision).
+// Then one transaction stores the decision, conditional on the proposal
+// still being open (see storeDecision). Last, the runtime is told of a
+// rejection, which is stored whether the runtime hears of it or not (see
+// tellRejected).
 func (s *Service) decide(ctx context.Context, caller identity.Principal, slug, sandboxID, proposalID string, d decision) (Proposal, error) {
 	unlock := s.deciding.lock(sandboxID)
 	defer unlock()
@@ -320,7 +322,37 @@ func (s *Service) decide(ctx context.Context, caller identity.Principal, slug, s
 	if err != nil {
 		return Proposal{}, err
 	}
+	if !approve {
+		s.tellRejected(ctx, rec, p)
+	}
 	return p, nil
+}
+
+// rejectTimeout bounds the call that tells the runtime of a rejection,
+// which the caller's answer waits for.
+const rejectTimeout = 10 * time.Second
+
+// tellRejected tells the runtime that the stored proposal p of the
+// sandbox rec is rejected, with the decision's comment as the reason, even
+// when the caller has left meanwhile. The decision is the hub's and stands
+// as stored: a runtime that cannot be told, or that answers an error, is
+// logged, with the error's text scrubbed of the hub's credentials and of
+// the sandbox's values.
+func (s *Service) tellRejected(ctx context.Context, rec Record, p Proposal) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rejectTimeout)
+	defer cancel()
+	var err error = RuntimeError("sandboxes are off")
+	if client := s.Client(); client != nil {
+		var reason string
+		if p.Comment != nil {
+			reason = *p.Comment
+		}
+		err = client.RejectProposal(ctx, rec.ID, p.RuntimeID, reason)
+	}
+	if err != nil {
+		s.logger().Warn("the runtime could not be told of a proposal's rejection", "sandbox_id", rec.ID, "proposal_id", p.ID,
+			"runtime_proposal_id", p.RuntimeID, "error", s.scrub(s.ScrubSandbox(ctx, rec.ID, err.Error())))
+	}
 }
 
 // addRule adds the rule of the proposal p to the policy of the sandbox

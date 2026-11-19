@@ -1,17 +1,21 @@
 package sandbox_test
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -164,6 +168,7 @@ func (r policyRoute) String() string { return r.method + " " + r.path }
 var policyRoutes = []policyRoute{
 	{http.MethodGet, proposalsPath("ws", unknownID), nil},
 	{http.MethodPost, approvePath("ws", unknownID, unknownProposal), map[string]any{}},
+	{http.MethodPost, rejectPath("ws", unknownID, unknownProposal), map[string]any{}},
 }
 
 func TestPolicyRoutes_AnswerDisabledWhileSandboxesAreOffBeforeAnyOtherCheck(t *testing.T) {
@@ -202,6 +207,19 @@ const unknownProposal = "sbp_00000000000000000000000000000000"
 func approvePath(slug, id, pid string) string {
 	return proposalsPath(slug, id) + "/" + pid + "/approve"
 }
+
+// rejectPath is the path of the rejection of the proposal pid of the
+// sandbox id of the workspace slug.
+func rejectPath(slug, id, pid string) string {
+	return proposalsPath(slug, id) + "/" + pid + "/reject"
+}
+
+// decisionPaths are the paths of the two decisions of a proposal, by the
+// decision's name.
+var decisionPaths = []struct {
+	name string
+	path func(slug, id, pid string) string
+}{{"approve", approvePath}, {"reject", rejectPath}}
 
 // proposedBefore is when the proposals of the decision tests were made: a
 // minute before the hub's clock, which decides them at recordStart.
@@ -369,5 +387,270 @@ func TestApprove_RefusesWhatTheRuntimeRejectsOrCannotBeAskedAndDecidesNothing(t 
 func adds(name string) func(runtime.Policy) bool {
 	return func(p runtime.Policy) bool {
 		return slices.ContainsFunc(p.Added, func(r runtime.Rule) bool { return r.Name == name })
+	}
+}
+
+func TestReject_RecordsTheDecisionAndThenTellsTheRuntime(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	for _, tc := range []struct {
+		name     string
+		state    string
+		body     map[string]any
+		findings []runtime.Finding
+		comment  *string
+	}{
+		{name: "an empty body", state: sandbox.StateReady, body: map[string]any{}},
+		{name: "a comment", state: sandbox.StateReady, body: map[string]any{"comment": "not this host"}, comment: new("not this host")},
+		{name: "a high finding", state: sandbox.StateReady, body: map[string]any{},
+			findings: []runtime.Finding{{Severity: "high", Message: "reaches any host"}}},
+		{name: "a stopped sandbox", state: sandbox.StateStopped, body: map[string]any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			id := h.liveSandbox(t, tc.state)
+			p := h.pendingProposal(t, id, func(p *sandbox.Proposal) { p.Findings = tc.findings })
+			a := h.call(t, http.MethodPost, rejectPath("demo", id, p.ID), h.key, tc.body)
+
+			want := p
+			want.State, want.Comment = sandbox.ProposalRejected, tc.comment
+			want.DecidedBy = &sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"}
+			want.DecidedAt = new(recordStart)
+			if got := decoded(t, a, http.StatusOK); !reflect.DeepEqual(got, proposalMap(t, want)) {
+				t.Errorf("answer\n%v\nwant\n%v", got, proposalMap(t, want))
+			}
+			stored, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(proposalMap(t, stored), proposalMap(t, want)) {
+				t.Errorf("stored %+v; want %+v", stored, want)
+			}
+			if calls, gone := h.rejected(t, id, p); calls != 1 || !slices.Equal(gone, []string{p.RuntimeID}) {
+				t.Errorf("the runtime got %d reject calls and no longer lists %v; want 1 call that rejected %s", calls, gone, p.RuntimeID)
+			}
+			if _, calls := h.addedRules(t, id); calls != 0 {
+				t.Errorf("add-rule calls = %d; want 0", calls)
+			}
+			if n := storedRecord(t, h.Hub, id).PolicyRevision; n != 0 {
+				t.Errorf("policy_revision = %d; want 0", n)
+			}
+			events := h.sandboxEvents(t, sandbox.EventProposalDecided, id)
+			wantMeta := map[string]any{"proposal_id": p.ID, "decision": "rejected", "acknowledged_findings": false, "scope": nil, "rule_id": nil}
+			if len(events) != 1 {
+				t.Fatalf("decision events %v; want 1", events)
+			}
+			if e := events[0]; e.actorType != "api_key" || e.actorID == nil || *e.actorID != h.dana || e.resourceType != "sandbox" ||
+				e.workspace == nil || *e.workspace != "demo" || !reflect.DeepEqual(e.metadata, wantMeta) {
+				t.Errorf("decision event %+v (metadata %v); want actor api_key %s on sandbox %s of demo, metadata %v", e, e.metadata, h.dana, id, wantMeta)
+			}
+		})
+	}
+}
+
+func TestReject_KeepsTheDecisionAndLogsWhenTheRuntimeCannotBeTold(t *testing.T) {
+	t.Parallel()
+	const exposed = "supersecretvalue"
+	logs := &hubtest.LogBuffer{}
+	h := startProposalHub(t, func(d *sandbox.Deps) { d.Logger = slog.New(slog.NewJSONHandler(logs, nil)) })
+	for _, tc := range []struct {
+		name string
+		kind error
+	}{
+		{"a runtime that cannot be reached", runtime.ErrUnavailable},
+		{"a runtime that answers an error", runtime.ErrInvalid},
+	} {
+		// In turn: the runtime's failure is the fake's, shared by the rows.
+		t.Run(tc.name, func(t *testing.T) {
+			id := h.liveSandbox(t, sandbox.StateReady)
+			h.svc.SetValues(id, sandbox.Values{Exposed: []string{exposed}})
+			p := h.pendingProposal(t, id, nil)
+			h.rt.FailOperation(runtime.OpRejectProposal, tc.kind, "the gateway refused token "+exposed)
+			a := h.call(t, http.MethodPost, rejectPath("demo", id, p.ID), h.key, nil)
+			h.rt.FailOperation(runtime.OpRejectProposal, nil, "")
+			if o := decoded(t, a, http.StatusOK); o["state"] != sandbox.ProposalRejected {
+				t.Errorf("answer state = %v; want rejected", o["state"])
+			}
+			if stored, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID); err != nil || stored.State != sandbox.ProposalRejected {
+				t.Errorf("stored %+v, %v; want it rejected", stored, err)
+			}
+			if events := h.sandboxEvents(t, sandbox.EventProposalDecided, id); len(events) != 1 {
+				t.Errorf("decision events %v; want 1", events)
+			}
+			var lines []string
+			for line := range strings.Lines(logs.String()) {
+				if strings.Contains(line, id) {
+					lines = append(lines, line)
+				}
+			}
+			if len(lines) != 1 || !strings.Contains(lines[0], p.ID) || strings.Contains(lines[0], exposed) {
+				t.Errorf("the log lines of the sandbox %q; want one that names the proposal %s and not the exposed value", lines, p.ID)
+			}
+		})
+	}
+}
+
+func TestDecisions_RefuseAProposalThatIsDecidedAndChangeNothing(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	for _, d := range decisionPaths {
+		for _, state := range []string{sandbox.ProposalApproved, sandbox.ProposalRejected, sandbox.ProposalWithdrawn} {
+			t.Run(d.name+"/"+state, func(t *testing.T) {
+				t.Parallel()
+				id := h.liveSandbox(t, sandbox.StateReady)
+				p := h.seedProposal(t, id, state, proposedBefore, func(p *sandbox.Proposal) {
+					if state == sandbox.ProposalWithdrawn {
+						return
+					}
+					p.DecidedBy = &sandbox.Creator{ActorType: "pat", ActorID: h.dana, Username: "dana"}
+					p.DecidedAt, p.Comment = new(proposedBefore), new("decided before")
+					if state == sandbox.ProposalApproved {
+						p.Scope = new(sandbox.ScopeSandbox)
+					}
+				})
+				before, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				a := h.call(t, http.MethodPost, d.path("demo", id, p.ID), h.key, map[string]any{"comment": "again"})
+				if a.status != http.StatusConflict || a.err.ErrorType != "proposal_decided" {
+					t.Errorf("= %d %s; want 409 proposal_decided", a.status, a.body)
+				}
+				after, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(after, before) {
+					t.Errorf("the proposal became %+v; want %+v", after, before)
+				}
+				if n := h.count(t, `SELECT COUNT(*) FROM hub_events WHERE resource_id = ?`, id); n != 0 {
+					t.Errorf("events of the sandbox = %d; want none", n)
+				}
+				if calls, _ := h.rejected(t, id); calls != 0 {
+					t.Errorf("reject calls = %d; want 0", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestDecisions_RefuseAtTheFirstFailingCheckAndDecideNothing(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	s := h.seedRecord(t, "demo", sandbox.StateReady, func(r *sandbox.Record) {
+		r.HubAccess = &sandbox.HubAccess{Scopes: []string{"git:read", "git:write"}, ExpiresAt: r.ExpiresAt}
+	})
+	ownCredential := h.hubCredential(t, s)
+	other := h.seedProposal(t, h.seedRecord(t, "demo", sandbox.StateReady, nil), sandbox.ProposalOpen, proposedBefore, nil)
+	bound := h.IssuePAT(t, identity.PATSpec{UserID: h.dana, Permissions: []string{"sandboxes:write"}, Workspace: "demo"})
+	readOnly := h.pat(t, h.dana, "sandboxes:read")
+	omar := h.CreateUser(t, "omar")
+	h.AddMember(t, h.org, omar)
+	member := h.IssueKey(t, omar)
+	type row struct {
+		name, cred string
+		body       any
+		// pid is the proposal id the request names; "" for the row's own.
+		pid       string
+		status    int
+		errorType string
+	}
+	rows := []row{
+		{name: "a PAT bound to the workspace with sandboxes:write", cred: bound, body: map[string]any{}, status: 403, errorType: "token_bound"},
+		{name: "a bound PAT with a body that is not an object", cred: bound, body: []any{}, status: 403, errorType: "token_bound"},
+		{name: "the hub credential of the sandbox", cred: ownCredential, body: map[string]any{}, status: 403, errorType: "token_bound"},
+		{name: "a PAT with sandboxes:read only", cred: readOnly, body: map[string]any{}, status: 403, errorType: "insufficient_scope"},
+		{name: "an organization member with read access", cred: member, body: map[string]any{}, status: 403, errorType: "forbidden"},
+		{name: "a body that is not an object", cred: h.key, body: []any{}, status: 400, errorType: "invalid_request"},
+		{name: "a comment that is not a string", cred: h.key, body: map[string]any{"comment": 5}, status: 400, errorType: "invalid_request"},
+		{name: "an unknown proposal id", cred: h.key, body: map[string]any{}, pid: unknownProposal, status: 404, errorType: "not_found"},
+		{name: "a proposal id of another sandbox", cred: h.key, body: map[string]any{}, pid: other.ID, status: 404, errorType: "not_found"},
+	}
+	approveOnly := []row{
+		{name: "a scope other than sandbox or workspace", cred: h.key, body: map[string]any{"scope": "org"}, status: 400, errorType: "invalid_request"},
+		{name: "an acknowledge_findings that is not a boolean", cred: h.key, body: map[string]any{"acknowledge_findings": "yes"}, status: 400, errorType: "invalid_request"},
+	}
+	for _, d := range decisionPaths {
+		table := rows
+		if d.name == "approve" {
+			table = append(slices.Clone(rows), approveOnly...)
+		}
+		for _, tc := range table {
+			t.Run(d.name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				p := h.seedProposal(t, s, sandbox.ProposalOpen, proposedBefore, nil)
+				pid := cmp.Or(tc.pid, p.ID)
+				a := h.call(t, http.MethodPost, d.path("demo", s, pid), tc.cred, tc.body)
+				if a.status != tc.status || a.err.ErrorType != tc.errorType {
+					t.Errorf("= %d %s; want %d %s", a.status, a.body, tc.status, tc.errorType)
+				}
+				// The proposal's own 404, not a route's.
+				if tc.status == http.StatusNotFound && !strings.Contains(a.err.Message, pid) {
+					t.Errorf("message %q; want one that names the proposal %s", a.err.Message, pid)
+				}
+				h.undecided(t, p)
+				h.undecided(t, other)
+				if calls, _ := h.rejected(t, s); calls != 0 {
+					t.Errorf("reject calls = %d; want 0", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestDecisions_ApplyExactlyOneOfTwoReleasedTogether(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	const rounds = 20
+	for _, pair := range [][2]int{{0, 0}, {0, 1}, {1, 1}} {
+		first, second := decisionPaths[pair[0]], decisionPaths[pair[1]]
+		t.Run(first.name+" and "+second.name, func(t *testing.T) {
+			t.Parallel()
+			id := h.liveSandbox(t, sandbox.StateReady)
+			for range rounds {
+				p := h.pendingProposal(t, id, nil)
+				revision := storedRecord(t, h.Hub, id).PolicyRevision
+				var (
+					wg      sync.WaitGroup
+					release = make(chan struct{})
+					answers [2]answer
+				)
+				for i, d := range []func(slug, id, pid string) string{first.path, second.path} {
+					wg.Go(func() {
+						<-release
+						answers[i] = h.call(t, http.MethodPost, d("demo", id, p.ID), h.key, nil)
+					})
+				}
+				close(release)
+				wg.Wait()
+				statuses := []int{answers[0].status, answers[1].status}
+				slices.Sort(statuses)
+				if !slices.Equal(statuses, []int{http.StatusOK, http.StatusConflict}) {
+					t.Fatalf("answers %d %s and %d %s; want one 200 and one 409", answers[0].status, answers[0].body, answers[1].status, answers[1].body)
+				}
+				for _, a := range answers {
+					if a.status == http.StatusConflict && a.err.ErrorType != "proposal_decided" {
+						t.Errorf("the refusal %s; want proposal_decided", a.body)
+					}
+				}
+				stored, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var decisions []any
+				for _, e := range h.sandboxEvents(t, sandbox.EventProposalDecided, id) {
+					if e.metadata["proposal_id"] == p.ID {
+						decisions = append(decisions, e.metadata["decision"])
+					}
+				}
+				if !slices.Equal(decisions, []any{stored.State}) {
+					t.Errorf("decision events %v of a proposal stored %s; want one that says so", decisions, stored.State)
+				}
+				rose := storedRecord(t, h.Hub, id).PolicyRevision - revision
+				if want := map[string]int{sandbox.ProposalApproved: 1, sandbox.ProposalRejected: 0}[stored.State]; rose != want {
+					t.Errorf("policy_revision rose by %d for a proposal stored %s; want %d", rose, stored.State, want)
+				}
+			}
+		})
 	}
 }

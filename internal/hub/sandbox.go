@@ -222,6 +222,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.ExtendRoute())
 	c.AddRoute(svc.ProposalsRoute())
 	c.AddRoute(svc.ApproveRoute())
+	c.AddRoute(svc.RejectRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}

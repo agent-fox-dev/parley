@@ -114,6 +114,30 @@ func (s *Service) serveApprove(w http.ResponseWriter, r *http.Request) error {
 	return s.serveDecision(w, r, ProposalApproved)
 }
 
+// RejectRoute declares POST
+// /workspaces/:slug/sandboxes/:id/proposals/:proposal_id/reject: it
+// rejects the open proposal proposal_id of the sandbox id for the caller
+// and answers with the proposal (see serveReject). It is held to the
+// checks of ApproveRoute: the scope sandboxes:write of a PAT, write access
+// to the workspace, and no workspace-bound token, the sandbox's own hub
+// credential included.
+func (s *Service) RejectRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/proposals/:proposal_id/reject",
+		Marks:   map[string]string{access.MarkRefusesBound: ""},
+		Handler: s.serveReject,
+	})
+}
+
+// serveReject answers the rejection of a proposal: the body, which takes a
+// comment only, is read before anything else (see readDecision), then the
+// decision runs (see decide) and the answer is the proposal as stored,
+// whether the runtime could be told of the rejection or not.
+func (s *Service) serveReject(w http.ResponseWriter, r *http.Request) error {
+	return s.serveDecision(w, r, ProposalRejected)
+}
+
 // serveDecision answers a decision of the state, approved or rejected, of
 // a proposal.
 func (s *Service) serveDecision(w http.ResponseWriter, r *http.Request, state string) error {

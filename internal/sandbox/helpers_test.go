@@ -4054,10 +4054,11 @@ func (h *collectorHub) policyRows(t *testing.T, id string) [3]int {
 
 // startProposalHub starts a create hub whose dana owns the ready
 // repositories demo and other, stored without a git repository, for the
-// tests of the proposal and rule routes.
-func startProposalHub(t *testing.T) *createHub {
+// tests of the proposal and rule routes, with the dependencies of its
+// stored sandboxes changed by adjust, in order.
+func startProposalHub(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	h := startCreateHub(t, agentProfile)
+	h := startCreateHub(t, agentProfile, adjust...)
 	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
 		for _, slug := range []string{"demo", "other"} {
 			if err := workspace.Insert(ctx, tx, h.record(slug, access.KindRepository, workspace.StatusReady)); err != nil {
@@ -4204,4 +4205,39 @@ func (h *createHub) undecided(t *testing.T, p sandbox.Proposal) {
 	if n := h.count(t, `SELECT COUNT(*) FROM hub_events WHERE type = 'parley.sandbox.rule_add'`); n != 0 {
 		t.Errorf("rule_add events = %d; want 0", n)
 	}
+}
+
+// pendingProposal adds a pending proposal to the sandbox id at the runtime,
+// which must hold the sandbox, and stores it open as seedProposal does,
+// made a minute before the hub's clock, under the runtime's id of it.
+func (h *createHub) pendingProposal(t *testing.T, id string, edit func(*sandbox.Proposal)) sandbox.Proposal {
+	t.Helper()
+	return h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, func(p *sandbox.Proposal) {
+		if edit != nil {
+			edit(p)
+		}
+		p.RuntimeID = h.rt.AddProposal("parley", runtime.Proposal{Sandbox: id, Rule: runtime.Rule{Name: "proposed", Body: p.Rule}, Summary: p.Summary})
+	})
+}
+
+// rejected returns how many reject calls named the sandbox id at the
+// runtime, successful or not, and the runtime ids of the sandbox's
+// proposals the runtime no longer lists as pending among those of ps.
+func (h *createHub) rejected(t *testing.T, id string, ps ...sandbox.Proposal) (calls int, gone []string) {
+	t.Helper()
+	for _, c := range h.rt.Calls() {
+		if c.Op == runtime.OpRejectProposal && c.Target == id {
+			calls++
+		}
+	}
+	pending, err := h.rt.Client("parley", nil).ListProposals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range ps {
+		if !slices.ContainsFunc(pending, func(r runtime.Proposal) bool { return r.Sandbox == id && r.ID == p.RuntimeID }) {
+			gone = append(gone, p.RuntimeID)
+		}
+	}
+	return calls, gone
 }
