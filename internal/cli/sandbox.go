@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -70,6 +72,7 @@ func newSandboxCommand() *cobra.Command {
 			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
 			Auth:        authUser,
 		}),
+		newSandboxExecCommand(),
 	)
 }
 
@@ -234,4 +237,212 @@ func listSandboxes(c *call) error {
 		}
 	}
 	return sendWith(c, query, nil)
+}
+
+// maxExecStdin is the most bytes parley sandbox exec --stdin sends, the
+// hub's limit on a command's standard input.
+const maxExecStdin = 4 << 20
+
+// maxExitCode is the highest exit status parley sandbox exec passes on from
+// the command; higher ones are the shell's own statuses (126 and above), so
+// they are reported as 125.
+const maxExitCode = 125
+
+// newSandboxExecCommand builds parley sandbox exec. The words after -- are
+// the command, which is required, so the command takes exactly two
+// arguments before them.
+func newSandboxExecCommand() *cobra.Command {
+	exec := declare(command{
+		Name:        "exec",
+		Description: "Run a command in a sandbox, write its output as it arrives, and exit with its exit code; with --json, print the collected answer",
+		Method:      http.MethodPost,
+		Path:        sandboxesRoute + "/:id/exec",
+		Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+		Auth:        authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("workdir", "", "the directory the command runs in; the sandbox's working directory when not given")
+			fs.StringArray("env", nil, "set the variable key=value for the command; repeat it for several")
+			fs.String("timeout", "", "how long the command may run before it is killed, such as 90s; the hub's default when not given")
+			fs.Bool("stdin", false, "send the whole of standard input to the command, at most 4 MiB")
+			fs.Bool("json", false, "print the hub's answer, the collected output and exit code, as one JSON document")
+		},
+		Run: execInSandbox,
+	})
+	exec.Use += " -- <command...>"
+	checkLine := exec.Args
+	// The body is built here too, so that a missing command or a malformed
+	// flag fails with the other usage errors, before any setting is
+	// resolved or any request sent (ADR 02).
+	exec.Args = func(cmd *cobra.Command, args []string) error {
+		if err := checkLine(cmd, beforeDash(cmd, args)); err != nil {
+			return err
+		}
+		_, err := sandboxExecBody(cmd)
+		return err
+	}
+	return exec
+}
+
+// sandboxExecBody is the body of POST /workspaces/:slug/sandboxes/:id/exec
+// for cmd's flags, without the standard input: the words after -- as
+// command, and workdir, env and timeout only for the flags given, so that
+// the hub's default applies to the others. Values are sent as given, for
+// the hub to judge.
+func sandboxExecBody(cmd *cobra.Command) (map[string]any, error) {
+	command := afterDash(cmd)
+	if command == nil {
+		return nil, usageError("%s needs a command after --", cmd.CommandPath())
+	}
+	fs := cmd.Flags()
+	body := map[string]any{"command": command}
+	for _, flag := range []string{"workdir", "timeout"} {
+		if fs.Changed(flag) {
+			body[flag], _ = fs.GetString(flag)
+		}
+	}
+	if fs.Changed("env") {
+		values, _ := fs.GetStringArray("env")
+		env, err := keyValues(cmd, "env", values)
+		if err != nil {
+			return nil, err
+		}
+		body["env"] = env
+	}
+	return body, nil
+}
+
+// execInSandbox is the run step of parley sandbox exec. The request has no
+// timeout of its own: the command runs as long as the hub lets it.
+func execInSandbox(c *call) error {
+	body, err := sandboxExecBody(c.cmd)
+	if err != nil {
+		return err
+	}
+	if withStdin, _ := c.cmd.Flags().GetBool("stdin"); withStdin {
+		stdin, err := io.ReadAll(io.LimitReader(c.opts.stdin, maxExecStdin+1))
+		if err != nil {
+			return clientError("cannot read standard input: %v", err)
+		}
+		if len(stdin) > maxExecStdin {
+			return clientError("standard input holds more than %d bytes, the most --stdin sends", maxExecStdin)
+		}
+		body["stdin_base64"] = base64.StdEncoding.EncodeToString(stdin)
+	}
+	r := apiRequest{method: c.decl.Method, path: routePath(c.decl.Path, c.args), body: body}
+	if collected, _ := c.cmd.Flags().GetBool("json"); collected {
+		return execCollected(c, r)
+	}
+	r.accept = "text/event-stream"
+	return execStreamed(c, r)
+}
+
+// execEnd is how a command ended, as the hub reports it in the exit frame
+// and in the collected answer.
+type execEnd struct {
+	ExitCode *int `json:"exit_code"`
+	TimedOut bool `json:"timed_out"`
+}
+
+// outcome is the error parley ends with for the command's end: none for
+// exit code 0, the exit code itself (above 125 as 125) for another, and
+// wait_timeout for a command killed at its timeout.
+func (e execEnd) outcome() error {
+	switch {
+	case e.TimedOut:
+		return waitTimeout("the command did not end within its timeout and was killed")
+	case e.ExitCode == nil:
+		return clientError("the hub reported neither an exit code nor a timeout")
+	case *e.ExitCode == 0:
+		return nil
+	case *e.ExitCode < 0 || *e.ExitCode > maxExitCode:
+		return &commandExit{maxExitCode}
+	}
+	return &commandExit{*e.ExitCode}
+}
+
+// execStreamed sends r and writes the output frames of the event stream to
+// stdout and stderr as they arrive, then ends as the exit frame says. A
+// stream that ends or breaks before the exit frame is a client_error, since
+// the command's end is unknown.
+func execStreamed(c *call, r apiRequest) error {
+	resp, err := c.client.open(c.ctx, r)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	frames := newFrameScanner(resp.Body)
+	for f, ok := frames.next(); ok; f, ok = frames.next() {
+		switch f.event {
+		case "stdout", "stderr":
+			if err := writeOutputFrame(c, f); err != nil {
+				return err
+			}
+		case "exit":
+			var end execEnd
+			if err := json.Unmarshal([]byte(f.data), &end); err != nil {
+				return clientError("the hub sent an exit frame that is not JSON: %v", err)
+			}
+			return end.outcome()
+		}
+	}
+	if err := frames.err(); err != nil {
+		return clientError("the stream of the hub at %s broke before the command's exit: %v", c.client.hubURL, err)
+	}
+	return clientError("the stream of the hub at %s ended before the command's exit", c.client.hubURL)
+}
+
+// writeOutputFrame writes the bytes of an output frame, data as text or
+// data_base64 decoded, to the stream it is named for.
+func writeOutputFrame(c *call, f frame) error {
+	var out struct {
+		Data       *string `json:"data"`
+		DataBase64 *string `json:"data_base64"`
+	}
+	if err := json.Unmarshal([]byte(f.data), &out); err != nil {
+		return clientError("the hub sent a %s frame that is not JSON: %v", f.event, err)
+	}
+	var b []byte
+	switch {
+	case out.Data != nil:
+		b = []byte(*out.Data)
+	case out.DataBase64 != nil:
+		decoded, err := base64.StdEncoding.DecodeString(*out.DataBase64)
+		if err != nil {
+			return clientError("the hub sent a %s frame whose data_base64 is not base64: %v", f.event, err)
+		}
+		b = decoded
+	}
+	w := c.stdout
+	if f.event == "stderr" {
+		w = c.stderr
+	}
+	if _, err := w.Write(b); err != nil {
+		return clientError("cannot write the command's %s: %v", f.event, err)
+	}
+	return nil
+}
+
+// execCollected sends r for the collected answer, prints it as the result
+// and ends as its exit_code and timed_out say.
+func execCollected(c *call, r apiRequest) error {
+	resp, err := c.client.open(c.ctx, r)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerSize+1))
+	if err != nil {
+		return clientError("cannot read the answer of the hub at %s: %v", c.client.hubURL, err)
+	}
+	if len(answer) > maxAnswerSize {
+		return clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, maxAnswerSize)
+	}
+	var end execEnd
+	if err := json.Unmarshal(answer, &end); err != nil {
+		return clientError("the hub answered %d with a body that is not a JSON object", resp.StatusCode)
+	}
+	if err := c.printResult(answer); err != nil {
+		return err
+	}
+	return end.outcome()
 }

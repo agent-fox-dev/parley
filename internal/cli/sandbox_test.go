@@ -1,15 +1,18 @@
 package cli
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // profilesAnswer is a profile list as a hub with sandboxes answers it.
@@ -289,6 +292,11 @@ func TestSandbox_UsageErrors(t *testing.T) {
 		{[]string{"list", "a", "b"}, `"b"`},
 		{[]string{"get", "demo"}, "<id>"},
 		{[]string{"get", "demo", "id", "x"}, `"x"`},
+		{[]string{"exec", "demo", "sbx_1"}, "after --"},
+		{[]string{"exec", "demo", "sbx_1", "--"}, "after --"},
+		{[]string{"exec", "demo", "sbx_1", "make"}, `"make"`},
+		{[]string{"exec", "demo", "--", "make"}, "<id>"},
+		{[]string{"exec", "demo", "sbx_1", "--env", "NOEQ", "--", "make"}, `"NOEQ"`},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -343,4 +351,272 @@ func TestSandboxListAndGet(t *testing.T) {
 			}
 		}
 	})
+}
+
+// execPath is the route parley sandbox exec demo sbx_1 posts to.
+const execPath = sandboxesPath + "/sbx_1/exec"
+
+// sseFrame is one frame of an exec's event stream: its event name and data.
+type sseFrame struct{ event, data string }
+
+// outputFrame is the frame of output b on stream, stdout or stderr, as the
+// hub sends it: the bytes as data when they are UTF-8, else as data_base64.
+func outputFrame(stream string, b []byte) sseFrame {
+	member, value := "data", string(b)
+	if !utf8.Valid(b) {
+		member, value = "data_base64", base64.StdEncoding.EncodeToString(b)
+	}
+	data, _ := json.Marshal(map[string]string{member: value})
+	return sseFrame{stream, string(data)}
+}
+
+// exitFrame is the frame that ends the stream of a command that exited with
+// code.
+func exitFrame(code int) sseFrame {
+	return sseFrame{"exit", fmt.Sprintf(`{"exit_code":%d,"timed_out":false,"duration_ms":12}`, code)}
+}
+
+// timedOutFrame is the frame that ends the stream of a command that was
+// killed at its timeout.
+var timedOutFrame = sseFrame{"exit", `{"exit_code":null,"timed_out":true,"duration_ms":1000}`}
+
+// execStream is a handler that answers an exec with an event stream of
+// frames, after delay, flushing after each frame.
+func execStream(delay time.Duration, frames ...sseFrame) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, f := range frames {
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", f.event, f.data)
+			http.NewResponseController(w).Flush()
+		}
+	}
+}
+
+// runExec runs parley sandbox exec demo sbx_1 args against hub with opts,
+// the global flags first so that the words after a -- stay the command's.
+func runExec(t *testing.T, hub *stubHub, opts options, args ...string) (int, string, string) {
+	t.Helper()
+	return runCLIWith(t, opts, slices.Concat([]string{"--endpoint-url", hub.URL, "--api-key", "k", "sandbox", "exec", "demo", "sbx_1"}, args)...)
+}
+
+// wantOneExec fails the test unless hub got exactly one exec request, and
+// returns it.
+func wantOneExec(t *testing.T, hub *stubHub) stubRequest {
+	t.Helper()
+	return wantOnlyRequest(t, hub.recorded(), http.MethodPost, execPath)
+}
+
+func TestSandboxExec_WritesTheStreamedOutputAndExitsWithTheCommandsCode(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		stdout, stderr []byte
+		exit, want     int
+	}{
+		{"output on both streams", []byte("out\n"), []byte("err\n"), 0, 0},
+		{"no output", nil, nil, 3, 3},
+		{"the highest code kept", []byte("x"), nil, 125, 125},
+		{"126 as 125", nil, nil, 126, 125},
+		{"255 as 125", nil, nil, 255, 125},
+		{"bytes that are not text", []byte{0xff, 0x00}, nil, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var frames []sseFrame
+			if tt.stdout != nil {
+				frames = append(frames, outputFrame("stdout", tt.stdout))
+			}
+			if tt.stderr != nil {
+				frames = append(frames, outputFrame("stderr", tt.stderr))
+			}
+			hub := newStubHub(t).handle(http.MethodPost, execPath, execStream(0, append(frames, exitFrame(tt.exit))...))
+
+			code, stdout, stderr := runExec(t, hub, defaultOptions(), "--", "prog", "arg")
+
+			if code != tt.want {
+				t.Errorf("exit status = %d, want %d (stderr %q)", code, tt.want, stderr)
+			}
+			if stdout != string(tt.stdout) || stderr != string(tt.stderr) {
+				t.Errorf("stdout %q, stderr %q; want %q and %q", stdout, stderr, tt.stdout, tt.stderr)
+			}
+			got := wantOneExec(t, hub)
+			if accept := got.header.Get("Accept"); accept != "text/event-stream" {
+				t.Errorf("Accept = %q, want text/event-stream", accept)
+			}
+			wantJSONBody(t, got.body, `{"command":["prog","arg"]}`)
+		})
+	}
+	t.Run("a command that outlasts the request timeout", func(t *testing.T) {
+		t.Parallel()
+		hub := newStubHub(t).handle(http.MethodPost, execPath, execStream(200*time.Millisecond, outputFrame("stdout", []byte("late")), exitFrame(0)))
+		opts := defaultOptions()
+		opts.requestTimeout = 50 * time.Millisecond
+
+		code, stdout, stderr := runExec(t, hub, opts, "--", "sleep")
+
+		if code != 0 || stdout != "late" || stderr != "" {
+			t.Errorf("exit status %d, stdout %q, stderr %q; want 0, %q and nothing", code, stdout, stderr, "late")
+		}
+	})
+}
+
+func TestSandboxExec_SendsOnlyTheMembersOfTheFlagsGiven(t *testing.T) {
+	t.Parallel()
+	hub := newStubHub(t).handle(http.MethodPost, execPath, execStream(0, exitFrame(0)))
+	opts := defaultOptions()
+	opts.stdin = strings.NewReader("in\x00\xff")
+
+	code, _, stderr := runExec(t, hub, opts, "--workdir", "/tmp", "--env", "A=1", "--env", "B=x=y", "--timeout", "90s", "--stdin", "--", "cat")
+
+	if code != 0 {
+		t.Fatalf("exit status = %d, want 0 (stderr %q)", code, stderr)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(wantOneExec(t, hub).body), &body); err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := base64.StdEncoding.DecodeString(fmt.Sprint(body["stdin_base64"]))
+	if err != nil || string(stdin) != "in\x00\xff" {
+		t.Errorf("stdin_base64 decodes to %q (%v), want %q", stdin, err, "in\x00\xff")
+	}
+	delete(body, "stdin_base64")
+	want := map[string]any{"command": []any{"cat"}, "workdir": "/tmp", "env": map[string]any{"A": "1", "B": "x=y"}, "timeout": "90s"}
+	if !reflect.DeepEqual(body, want) {
+		t.Errorf("body without stdin_base64 = %v, want %v", body, want)
+	}
+
+	t.Run("without flags", func(t *testing.T) {
+		t.Parallel()
+		hub := newStubHub(t).handle(http.MethodPost, execPath, execStream(0, exitFrame(0)))
+
+		code, _, stderr := runExec(t, hub, defaultOptions(), "--", "cat")
+
+		if code != 0 {
+			t.Fatalf("exit status = %d, want 0 (stderr %q)", code, stderr)
+		}
+		wantJSONBody(t, wantOneExec(t, hub).body, `{"command":["cat"]}`)
+	})
+}
+
+func TestSandboxExec_JSONPrintsTheCollectedAnswer(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, answer string
+		want         int
+	}{
+		{"exits 0", `{"exit_code":0,"stdout":"hi\n","stderr":"","truncated":false,"timed_out":false,"duration_ms":4}`, 0},
+		{"exits 7", `{"exit_code":7,"stdout":"","stderr":"bad","truncated":false,"timed_out":false,"duration_ms":4}`, 7},
+		{"exits 200", `{"exit_code":200,"stdout":"","stderr":"","truncated":false,"timed_out":false,"duration_ms":4}`, 125},
+		{"times out", `{"exit_code":null,"stdout":"part","stderr":"","truncated":false,"timed_out":true,"duration_ms":1000}`, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t).answer(http.MethodPost, execPath, http.StatusOK, tt.answer)
+
+			code, stdout, stderr := runExec(t, hub, defaultOptions(), "--json", "--", "prog")
+
+			if code != tt.want {
+				t.Errorf("exit status = %d, want %d (stderr %q)", code, tt.want, stderr)
+			}
+			if want := indented(t, tt.answer); stdout != want {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			var doc map[string]any
+			if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+				t.Fatal(err)
+			}
+			for _, member := range []string{"exit_code", "stdout", "stderr", "truncated", "timed_out", "duration_ms"} {
+				if _, ok := doc[member]; !ok {
+					t.Errorf("stdout lacks %s: %q", member, stdout)
+				}
+			}
+			if tt.want == 1 {
+				if _, _, errorType := clientEnvelope(t, stderr); errorType != "wait_timeout" {
+					t.Errorf("error_type = %q, want wait_timeout", errorType)
+				}
+			} else if stderr != "" {
+				t.Errorf("stderr = %q, want it empty", stderr)
+			}
+			got := wantOneExec(t, hub)
+			if accept := got.header.Get("Accept"); strings.Contains(accept, "text/event-stream") {
+				t.Errorf("Accept = %q, want one that does not name text/event-stream", accept)
+			}
+			wantJSONBody(t, got.body, `{"command":["prog"]}`)
+		})
+	}
+}
+
+func TestSandboxExec_ReportsAFailureAsAnErrorEnvelope(t *testing.T) {
+	t.Parallel()
+	const refusal = `{"error":{"code":409,"message":"the sandbox is stopped","error_type":"sandbox_not_ready"}}`
+	tests := []struct {
+		name      string
+		stdin     string
+		handler   http.HandlerFunc
+		code      int
+		errorType string
+		stdout    string
+		requests  int
+	}{
+		{name: "standard input over 4 MiB", stdin: strings.Repeat("x", 4194305), code: 2, errorType: "client_error"},
+		{name: "a refusal of the hub", handler: answerWith(http.StatusConflict, refusal), code: 1, errorType: "sandbox_not_ready", requests: 1},
+		{
+			name: "a command that times out", handler: execStream(0, outputFrame("stdout", []byte("part")), timedOutFrame),
+			code: 1, errorType: "wait_timeout", stdout: "part", requests: 1,
+		},
+		{
+			name: "a stream that ends without an exit frame", handler: execStream(0, outputFrame("stdout", []byte("part"))),
+			code: 2, errorType: "client_error", stdout: "part", requests: 1,
+		},
+		{
+			name: "a stream that breaks", handler: func(w http.ResponseWriter, r *http.Request) {
+				execStream(0, outputFrame("stdout", []byte("part")))(w, r)
+				panic(http.ErrAbortHandler)
+			},
+			code: 2, errorType: "client_error", stdout: "part", requests: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t)
+			if tt.handler != nil {
+				hub.handle(http.MethodPost, execPath, tt.handler)
+			}
+			opts := defaultOptions()
+			args := []string{"--", "prog"}
+			if tt.stdin != "" {
+				opts.stdin = strings.NewReader(tt.stdin)
+				args = append([]string{"--stdin"}, args...)
+			}
+
+			code, stdout, stderr := runExec(t, hub, opts, args...)
+
+			if code != tt.code || stdout != tt.stdout {
+				t.Errorf("exit status %d, stdout %q; want %d and %q (stderr %q)", code, stdout, tt.code, tt.stdout, stderr)
+			}
+			envelopeCode, _, errorType := clientEnvelope(t, stderr)
+			if errorType != tt.errorType {
+				t.Errorf("error_type = %q, want %q", errorType, tt.errorType)
+			}
+			if tt.errorType == "sandbox_not_ready" {
+				if envelopeCode != 409 || stderr != indented(t, refusal) {
+					t.Errorf("stderr = %q, want the hub's envelope unchanged", stderr)
+				}
+			} else if envelopeCode != 0 {
+				t.Errorf("envelope code = %v, want 0", envelopeCode)
+			}
+			if n := len(hub.recorded()); n != tt.requests {
+				t.Errorf("the hub got %d requests, want %d", n, tt.requests)
+			}
+		})
+	}
 }
