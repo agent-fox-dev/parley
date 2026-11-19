@@ -129,15 +129,25 @@ var errWriteTimeout = errors.New("the write did not finish within [audit].write_
 // agent never waits on a slow store for its telemetry; a write the limit
 // ends fails with errWriteTimeout. That is decided by the limit's context
 // and not by the error, since the store's driver reports a statement the
-// context ends as interrupted, without the context's error.
+// context ends as interrupted, without the context's error. A write that
+// fails once the deadline has passed is one the limit ended too, though
+// the context is not cancelled yet: the timer that cancels it may run after
+// a wait for the write lock, cut by SQL to end at the deadline, has
+// returned busy.
 func (c *Component) write(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
 	ctx, cancel := context.WithTimeout(ctx, c.deps.WriteTimeout)
 	defer cancel()
 	err := c.writeTx(ctx, fn)
-	if err != nil && ctx.Err() != nil {
+	if err != nil && (ctx.Err() != nil || pastDeadline(ctx)) {
 		return errors.Join(errWriteTimeout, err)
 	}
 	return err
+}
+
+// pastDeadline reports whether ctx has a deadline and it has passed.
+func pastDeadline(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 // writeTx is write without the limit.
