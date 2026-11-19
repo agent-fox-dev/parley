@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/metrics"
@@ -51,6 +52,24 @@ func withoutHTTP(families []parsed) []parsed {
 	return out
 }
 
+// waitForRetention waits until the hub's first retention run has set its
+// last-run timestamp.
+func waitForRetention(t *testing.T, h *hubtest.Hub) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, f := range scrape(t, h, "") {
+			if f.name == metrics.RetentionLastRunTimestamp && len(f.samples) == 1 && f.samples[0].value > 0 {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the first retention run did not set %s within 10 s", metrics.RetentionLastRunTimestamp)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestMetricsEndpoint_AnswersAnyClientWithTheWholeCatalogue(t *testing.T) {
 	t.Parallel()
 	h := hubtest.Start(t, nil)
@@ -87,6 +106,10 @@ func TestMetricsEndpoint_AnswersAnyClientWithTheWholeCatalogue(t *testing.T) {
 		})
 	}
 
+	// The first maintenance pass, which runs in the background right after
+	// the start, sets the retention metrics; once it has ended, nothing
+	// reports between two scrapes.
+	waitForRetention(t, h)
 	first, second := scrape(t, h, ""), scrape(t, h, "")
 	if !reflect.DeepEqual(withoutHTTP(first), withoutHTTP(second)) {
 		t.Errorf("two scrapes with no report between them differ outside the HTTP request metrics")

@@ -3,7 +3,7 @@
   "spec_id": "51",
   "spec_name": "audit_query_and_retention",
   "schema_version": 3,
-  "updated_at": "2026-11-19T18:16:55Z",
+  "updated_at": "2026-11-19T18:28:01Z",
   "tasks": [
     {
       "id": 1,
@@ -35,7 +35,7 @@
     },
     {
       "id": 8,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 9,
