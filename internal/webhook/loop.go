@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -46,10 +47,26 @@ type loops struct {
 // loop is the delivery loop of one subscription. wake holds at most one
 // wake-up: a loop busy with an attempt is woken once when it is done,
 // however many events were committed meanwhile.
+//
+// unopened is the sealed signing secret that last failed to open, and
+// retryAt the time it is tried again: the loop's own goroutine alone uses
+// them, so that the wake-ups before then, one per event committed anywhere
+// in the hub, neither try it nor log the failure again. A new secret, from a
+// rotation, is tried at once.
 type loop struct {
 	id      string
 	wake    chan struct{}
 	started bool
+
+	unopened []byte
+	retryAt  time.Time
+}
+
+// waitsForSecret reports whether l waits until retryAt to try the sealed
+// signing secret sealed again, which it failed to open less than a
+// secretWait ago.
+func (l *loop) waitsForSecret(sealed []byte, now time.Time) bool {
+	return l.unopened != nil && bytes.Equal(l.unopened, sealed) && now.Before(l.retryAt)
 }
 
 // startLoop makes sure the subscription id has a running loop, and wakes it
@@ -182,7 +199,7 @@ const (
 func (c *Component) run(ctx context.Context, l *loop) {
 	defer c.loops.wg.Done()
 	for {
-		what, until, err := c.step(ctx, l.id)
+		what, until, err := c.step(ctx, l)
 		if ctx.Err() != nil {
 			return
 		}
@@ -223,12 +240,13 @@ func (c *Component) sleep(ctx context.Context, l *loop, until time.Time) bool {
 	return true
 }
 
-// step does the next piece of work of the subscription id: it reads the
+// step does the next piece of work of the subscription of l: it reads the
 // subscription from the store, so that a change applies from here on, then
 // goes on with its pending delivery or, without one, with the events after
 // its position.
-func (c *Component) step(ctx context.Context, id string) (next, time.Time, error) {
+func (c *Component) step(ctx context.Context, l *loop) (next, time.Time, error) {
 	db := c.deps.Store.Main()
+	id := l.id
 	sub, found, err := subscriptionByID(ctx, db, id)
 	if err != nil {
 		return idle, time.Time{}, err
@@ -241,9 +259,9 @@ func (c *Component) step(ctx context.Context, id string) (next, time.Time, error
 		return idle, time.Time{}, err
 	}
 	if pending {
-		return c.resume(ctx, sub, d)
+		return c.resume(ctx, l, sub, d)
 	}
-	return c.examine(ctx, sub)
+	return c.examine(ctx, l, sub)
 }
 
 // examine reads the events after the position of sub and moves the position
@@ -256,7 +274,7 @@ func (c *Component) step(ctx context.Context, id string) (next, time.Time, error
 // moves to just before the oldest event the log holds, and the events
 // skipped count as one failed delivery. The subscription's state does not
 // change, since the hub cannot tell which of them it would have received.
-func (c *Component) examine(ctx context.Context, sub Subscription) (next, time.Time, error) {
+func (c *Component) examine(ctx context.Context, l *loop, sub Subscription) (next, time.Time, error) {
 	recs, examined, err := c.deps.Events.ReadAfter(ctx, sub.Position, readBatch)
 	var expired *event.PositionExpiredError
 	if errors.As(err, &expired) {
@@ -299,7 +317,7 @@ func (c *Component) examine(ctx context.Context, sub Subscription) (next, time.T
 		if err != nil || !opened {
 			return again, time.Time{}, err
 		}
-		return c.attempt(ctx, sub, d, rec)
+		return c.attempt(ctx, l, sub, d, rec)
 	}
 	if examined > sub.Position {
 		if _, err := movePosition(ctx, c.deps.Store.Main(), sub.ID, sub.Position, examined); err != nil {
@@ -317,10 +335,14 @@ func (c *Component) examine(ctx context.Context, sub Subscription) (next, time.T
 // An event that has left the log meanwhile cannot be sent: the delivery
 // ends failed, counted, the position moves past it, or to just before the
 // oldest event when that is further, and the subscription's state does not
-// change.
-func (c *Component) resume(ctx context.Context, sub Subscription, d delivery) (next, time.Time, error) {
-	if d.NextAttemptAt != nil && d.NextAttemptAt.After(c.deps.Clock.Now()) {
+// change. While its secret waits to be tried again, it waits too.
+func (c *Component) resume(ctx context.Context, l *loop, sub Subscription, d delivery) (next, time.Time, error) {
+	now := c.deps.Clock.Now()
+	if d.NextAttemptAt != nil && d.NextAttemptAt.After(now) {
 		return idle, *d.NextAttemptAt, nil
+	}
+	if l.waitsForSecret(sub.Sealed, now) {
+		return idle, l.retryAt, nil
 	}
 	recs, _, err := c.deps.Events.ReadAfter(ctx, d.Seq-1, 1)
 	var expired *event.PositionExpiredError
@@ -332,7 +354,7 @@ func (c *Component) resume(ctx context.Context, sub Subscription, d delivery) (n
 		gone = true
 	}
 	if !gone {
-		return c.attempt(ctx, sub, d, recs[0])
+		return c.attempt(ctx, l, sub, d, recs[0])
 	}
 	past := d.Seq
 	if expired != nil {
@@ -353,17 +375,24 @@ func (c *Component) resume(ctx context.Context, sub Subscription, d delivery) (n
 	return again, time.Time{}, nil
 }
 
-// attempt sends rec to sub as an attempt of the delivery d, signed with the
-// secret as it is stored now, and records the outcome. A secret no key opens
-// sends nothing and tries again later. An attempt whose ctx ended is
-// abandoned: its outcome is not recorded and the delivery stays pending.
-func (c *Component) attempt(ctx context.Context, sub Subscription, d delivery, rec event.Record) (next, time.Time, error) {
+// attempt sends rec to sub as an attempt of the delivery d of l, signed
+// with the secret as it is stored now, and records the outcome. A secret no
+// key opens sends nothing, is logged once, and is tried again a secretWait
+// later. An attempt whose ctx ended is abandoned: its outcome is not
+// recorded and the delivery stays pending.
+func (c *Component) attempt(ctx context.Context, l *loop, sub Subscription, d delivery, rec event.Record) (next, time.Time, error) {
+	now := c.deps.Clock.Now()
+	if l.waitsForSecret(sub.Sealed, now) {
+		return idle, l.retryAt, nil
+	}
 	plain, err := secret.OpenValue(c.deps.Keys(), binding(sub.ID), sub.Sealed)
 	if err != nil {
+		l.unopened, l.retryAt = sub.Sealed, now.Add(secretWait)
 		c.deps.Logger.Warn("cannot open the signing secret of an event webhook; no attempt is made",
 			"webhook_id", sub.ID, "error", err.Error())
-		return idle, c.deps.Clock.Now().Add(secretWait), nil
+		return idle, l.retryAt, nil
 	}
+	l.unopened = nil
 	c.learn(plain)
 	body, err := rec.MarshalJSON()
 	if err != nil {
@@ -430,7 +459,10 @@ func (c *Component) failed(ctx context.Context, sub Subscription, d delivery, at
 		return idle, time.Time{}, err
 	}
 	if !recorded {
-		// Something ended the delivery while the attempt was in flight.
+		// Something ended the delivery while the attempt was in flight: no
+		// retry follows, and the attempt made still counts once, as a
+		// successful one does.
+		c.report(resultFailed)
 		return again, time.Time{}, nil
 	}
 	c.report(resultRetry)

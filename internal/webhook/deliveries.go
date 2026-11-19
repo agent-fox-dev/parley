@@ -122,9 +122,11 @@ func (c *Component) deliveries(w http.ResponseWriter, r *http.Request, q request
 // It refuses, sending nothing and changing no record, in this order: 404
 // delivery_not_found for an id that is not one of the subscription's
 // deliveries, 400 invalid_request for a ping, which has no event to send,
-// 409 delivery_pending for a delivery the loop still has, 410 event_expired
-// when the event has left the log, and 503 secrets_unavailable when no key
-// opens the signing secret.
+// 503 secrets_unavailable when no key opens the signing secret, 409
+// delivery_pending for a delivery the loop still has, and 410 event_expired
+// when the event has left the log. A record that goes while the attempt is
+// in flight is 404 after it: webhook_not_found when its subscription was
+// deleted, delivery_not_found when the record was pruned.
 func (c *Component) redeliver(w http.ResponseWriter, r *http.Request, q request) error {
 	ctx := r.Context()
 	db := c.deps.Store.Main()
@@ -139,6 +141,10 @@ func (c *Component) redeliver(w http.ResponseWriter, r *http.Request, q request)
 	if d.Type == EventPing {
 		return server.InvalidRequest("a ping cannot be redelivered; send a new ping")
 	}
+	plain, err := c.open(sub)
+	if err != nil {
+		return err
+	}
 	if d.Status == deliveryPending {
 		return server.NewError(errorTypeDeliveryPending, http.StatusConflict,
 			"the delivery is still pending; the hub keeps trying it")
@@ -151,26 +157,41 @@ func (c *Component) redeliver(w http.ResponseWriter, r *http.Request, q request)
 		return server.NewError(errorTypeEventExpired, http.StatusGone,
 			"the event of the delivery has left the event log")
 	}
-	plain, err := c.open(sub)
-	if err != nil {
-		return err
-	}
 	body, err := rec.MarshalJSON()
 	if err != nil {
 		return err
 	}
 	at := c.deps.Clock.Now().UTC().Truncate(time.Second)
+	// A caller that leaves does not end the attempt, bounded by
+	// [webhooks].timeout on its own, so that the record holds what the
+	// receiver answered rather than a failure the receiver never caused.
+	ctx = context.WithoutCancel(ctx)
 	out := c.sender.send(ctx, attempt{
 		url: sub.URL, body: body, eventType: rec.Type, seq: rec.Seq, delivery: d.ID, secret: plain,
 	})
-	// The request's context may have ended with the attempt; the record is
-	// still the outcome the receiver saw.
-	ctx = context.WithoutCancel(ctx)
-	if err := recordRedelivery(ctx, db, d.ID, at, out); err != nil {
-		return err
-	}
 	c.reportOutcome(out)
-	d, _, err = deliveryOf(ctx, db, sub.ID, d.ID)
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		recorded, err := recordRedelivery(ctx, tx, d.ID, at, out)
+		if err != nil {
+			return err
+		}
+		if recorded {
+			d, recorded, err = deliveryOf(ctx, tx, sub.ID, d.ID)
+			if err != nil || recorded {
+				return err
+			}
+		}
+		// The record went while the attempt was in flight: with its
+		// subscription, deleted, or pruned on its own.
+		_, found, err := subscriptionByID(ctx, tx, sub.ID)
+		switch {
+		case err != nil:
+			return err
+		case !found:
+			return webhookNotFound()
+		}
+		return server.NewError(errorTypeDeliveryNotFound, http.StatusNotFound, msgDeliveryNotFound)
+	})
 	if err != nil {
 		return err
 	}
@@ -195,14 +216,17 @@ func (c *Component) eventAt(ctx context.Context, seq int64) (event.Record, bool,
 	return recs[0], true, nil
 }
 
-// PruneDeliveries deletes the delivery records whose last attempt was before
-// before and that have ended, succeeded or failed, and returns how many it
-// deleted. A pending record stays whatever its age: the loop still has it.
-// It has the shape of audit.DeliveryPruner, which the hub's retention step
-// webhook_deliveries calls with a time seven days back.
+// PruneDeliveries deletes the delivery records that have ended, succeeded
+// or failed, and whose last attempt was before before, and returns how many
+// it deleted. A record that ended without an attempt (switched off or
+// disabled while its first was in flight or not yet possible, or its event
+// gone from the log first) is judged by its creation, so that it does not
+// stay for ever. A pending record stays whatever its age: the loop still
+// has it. It has the shape of audit.DeliveryPruner, which the hub's
+// retention step webhook_deliveries calls with a time seven days back.
 func (c *Component) PruneDeliveries(ctx context.Context, before time.Time) (int64, error) {
 	res, err := c.deps.Store.Main().ExecContext(ctx, `DELETE FROM webhook_deliveries
-		WHERE status IN ('succeeded', 'failed') AND last_attempt_at < ?`, before.UnixNano())
+		WHERE status IN ('succeeded', 'failed') AND coalesce(last_attempt_at, created_at) < ?`, before.UnixNano())
 	if err != nil {
 		return 0, fmt.Errorf("prune the event webhook deliveries: %w", err)
 	}
@@ -283,18 +307,23 @@ func insertPing(ctx context.Context, q querier, sub string, d delivery, at time.
 // recordRedelivery records the redelivery of the ended delivery id made at
 // at with outcome out: one more attempt, its status, code, error and
 // duration, at as the last attempt, and no next one. A delivery that is
-// pending again is the loop's, which a redelivery never touches.
-func recordRedelivery(ctx context.Context, q querier, id string, at time.Time, out outcome) error {
-	_, err := q.ExecContext(ctx, `UPDATE webhook_deliveries
+// pending again is the loop's, which a redelivery never touches. recorded is
+// false when no ended delivery id is left to record it on.
+func recordRedelivery(ctx context.Context, q querier, id string, at time.Time, out outcome) (bool, error) {
+	res, err := q.ExecContext(ctx, `UPDATE webhook_deliveries
 		SET status = ?, attempts = attempts + 1, response_code = ?, error = ?, duration_ms = ?,
 			last_attempt_at = ?, next_attempt_at = NULL
 		WHERE id = ? AND status != 'pending'`,
 		statusOf(out), nullIfZero(int64(out.responseCode)), nullIfEmpty(out.failure), out.durationMS,
 		at.UnixNano(), id)
 	if err != nil {
-		return fmt.Errorf("record a redelivery of delivery %s: %w", id, err)
+		return false, fmt.Errorf("record a redelivery of delivery %s: %w", id, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("record a redelivery of delivery %s: %w", id, err)
+	}
+	return n == 1, nil
 }
 
 // statusOf is the status of a delivery whose last attempt, never retried,

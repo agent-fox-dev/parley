@@ -136,3 +136,58 @@ func TestMetrics_CountEveryAttemptAndTheEventsQueued(t *testing.T) {
 			metrics.WebhookQueueDepth, got)
 	}
 }
+
+func TestMetrics_CountAnAttemptOnceWhenItsDeliveryEndedMeanwhile(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	for i, tc := range []struct {
+		name   string
+		answer int
+		result string
+	}{
+		{"an attempt that succeeds", http.StatusOK, "ok"},
+		{"an attempt that fails", http.StatusInternalServerError, "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			arrived, release := make(chan struct{}, 1), make(chan struct{})
+			in := newInbox(t, func(_ delivered, stop <-chan struct{}) int {
+				arrived <- struct{}{}
+				select {
+				case <-release:
+				case <-stop:
+				}
+				return tc.answer
+			})
+			typ := "parley.test.ended" + strconv.Itoa(i)
+			id := w.subscribe(t, demo, map[string]any{"url": in.url(), "types": []string{typ}})
+			w.emit(t, demo, typ, "")
+			<-arrived
+			before := map[string]float64{}
+			for _, r := range []string{"ok", "retry", "failed"} {
+				before[r] = w.metrics.deliveries(r)
+			}
+
+			// Switched off while the receiver holds the attempt: the
+			// delivery ends, and no retry follows whatever the receiver says.
+			w.switchOff(t, id)
+			close(release)
+			total := func() float64 {
+				return w.metrics.deliveries("ok") + w.metrics.deliveries("retry") + w.metrics.deliveries("failed")
+			}
+			waitFor(t, "the attempt to be counted", func() bool { return total() > before["ok"]+before["retry"]+before["failed"] })
+			time.Sleep(20 * time.Millisecond)
+			for _, r := range []string{"ok", "retry", "failed"} {
+				want := before[r]
+				if r == tc.result {
+					want++
+				}
+				if got := w.metrics.deliveries(r); got != want {
+					t.Errorf("deliveries reported %s = %v, want %v", r, got, want)
+				}
+			}
+			if ds := w.deliveries(t, id); len(ds) != 1 || ds[0].status != "failed" || ds[0].attempts != 0 {
+				t.Errorf("delivery records = %+v, want the one ended by the switch-off, its attempt unrecorded", ds)
+			}
+		})
+	}
+}

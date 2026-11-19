@@ -106,10 +106,9 @@ func (c *Component) giveUp(ctx context.Context, sub Subscription, d delivery, at
 	if err != nil {
 		return idle, time.Time{}, err
 	}
-	if !recorded {
-		// Something ended the delivery while the attempt was in flight.
-		return again, time.Time{}, nil
-	}
+	// Counted also when something ended the delivery while the attempt was
+	// in flight, which leaves recorded false: the attempt was made, and
+	// failed for good either way.
 	c.report(resultFailed)
 	return again, time.Time{}, nil
 }

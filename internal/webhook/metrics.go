@@ -15,8 +15,9 @@ const (
 	// resultRetry is an attempt that failed and leaves its delivery pending
 	// for another one.
 	resultRetry = "retry"
-	// resultFailed is a delivery that ended without success: given up, or
-	// its event left the log before it could be sent.
+	// resultFailed is a delivery that ended without success: given up, its
+	// event left the log before it could be sent, or a failed attempt whose
+	// delivery something ended while it was in flight.
 	resultFailed = "failed"
 )
 

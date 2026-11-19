@@ -252,7 +252,18 @@ func TestRedeliver_SendsTheEventOnceMoreUnderItsDeliveryID(t *testing.T) {
 
 func TestRedeliver_RefusesWhatCannotBeSentAgain(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, options{toml: insecure})
+	// keyless takes the operator's keys away from the webhook component, so
+	// that no signing secret opens.
+	var keyless atomic.Bool
+	w := newWorld(t, options{toml: insecure, adjust: []func(*webhook.Deps){func(d *webhook.Deps) {
+		keys := d.Keys
+		d.Keys = func() secret.Keys {
+			if keyless.Load() {
+				return secret.Keys{}
+			}
+			return keys()
+		}
+	}}})
 	a := answeringWith(http.StatusOK)
 	in := newInbox(t, a.answer)
 	id := w.subscribe(t, demo, map[string]any{"url": in.url(), "types": []string{"parley.test.*"}})
@@ -284,17 +295,25 @@ func TestRedeliver_RefusesWhatCannotBeSentAgain(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, delivery string
-		status         int
-		errorType      string
+		// keyless is true when no key opens the signing secret.
+		keyless   bool
+		status    int
+		errorType string
 	}{
-		{"not a UUID", "abc", http.StatusBadRequest, "invalid_request"},
-		{"an unknown id", uuid.NewString(), http.StatusNotFound, "delivery_not_found"},
-		{"a delivery of another subscription", otherDelivery, http.StatusNotFound, "delivery_not_found"},
-		{"a pending delivery", pending.id, http.StatusConflict, "delivery_pending"},
-		{"a ping", pingID, http.StatusBadRequest, "invalid_request"},
-		{"an event that left the log", goneDelivery, http.StatusGone, "event_expired"},
+		{"not a UUID", "abc", false, http.StatusBadRequest, "invalid_request"},
+		{"an unknown id", uuid.NewString(), false, http.StatusNotFound, "delivery_not_found"},
+		{"a delivery of another subscription", otherDelivery, false, http.StatusNotFound, "delivery_not_found"},
+		{"a pending delivery", pending.id, false, http.StatusConflict, "delivery_pending"},
+		{"a ping", pingID, false, http.StatusBadRequest, "invalid_request"},
+		{"an event that left the log", goneDelivery, false, http.StatusGone, "event_expired"},
+		{"an unknown id without a key", uuid.NewString(), true, http.StatusNotFound, "delivery_not_found"},
+		{"a ping without a key", pingID, true, http.StatusBadRequest, "invalid_request"},
+		{"a pending delivery without a key", pending.id, true, http.StatusServiceUnavailable, "secrets_unavailable"},
+		{"an event that left the log without a key", goneDelivery, true, http.StatusServiceUnavailable, "secrets_unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			keyless.Store(tc.keyless)
+			defer keyless.Store(false)
 			mine, others, sent := w.deliveries(t, id), w.deliveries(t, otherID), len(in.requests())
 			status, raw := w.Call(t, http.MethodPost, redeliverPath(id, tc.delivery), w.ownerKey, nil)
 			if status != tc.status {
@@ -316,7 +335,7 @@ func TestRedeliver_RefusesWhatCannotBeSentAgain(t *testing.T) {
 	}
 }
 
-func TestPruneDeliveries_DeletesEndedRecordsLastAttemptedBeforeTheTime(t *testing.T) {
+func TestPruneDeliveries_DeletesEndedRecordsLastAttemptedOrCreatedBeforeTheTime(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, options{})
 	id := w.subscribe(t, demo, map[string]any{"url": "https://ci.example/x", "types": []string{"parley.none"}})
@@ -337,6 +356,9 @@ func TestPruneDeliveries_DeletesEndedRecordsLastAttemptedBeforeTheTime(t *testin
 		{"parley.test.a", "failed", ago(time.Hour), ago(time.Hour), true},
 		{"parley.test.a", "pending", ago(9 * day), ago(9 * day), true},
 		{"parley.test.a", "succeeded", ago(10 * day), ago(day), true},
+		// Ended without an attempt: judged by when it was created.
+		{"parley.test.a", "failed", ago(8 * day), time.Time{}, false},
+		{"parley.test.a", "failed", ago(day), time.Time{}, true},
 	} {
 		did := uuid.NewString()
 		w.seed(t, id, seeded{id: did, typ: tc.typ, status: tc.status, seq: 1, attempts: 1, createdAt: tc.created, lastAttemptAt: tc.last})
@@ -346,8 +368,8 @@ func TestPruneDeliveries_DeletesEndedRecordsLastAttemptedBeforeTheTime(t *testin
 	}
 
 	n, err := w.hooks.PruneDeliveries(context.Background(), now.Add(-168*time.Hour))
-	if err != nil || n != 3 {
-		t.Errorf("PruneDeliveries = %d, %v, want 3, nil", n, err)
+	if err != nil || n != 4 {
+		t.Errorf("PruneDeliveries = %d, %v, want 4, nil", n, err)
 	}
 	var left []string
 	for _, d := range w.deliveries(t, id) {

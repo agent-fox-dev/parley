@@ -71,7 +71,24 @@ one for the delivery and one more for the expired position.
 A switch-off (`active: false`) and the 72-hour disabling end the `pending`
 delivery as `failed` without an attempt, so neither adds to
 `parley_webhook_deliveries_total`; only an attempt, a give-up, a ping, a
-redelivery and an event skipped because it left the log are counted.
+redelivery and an event skipped because it left the log are counted. An
+attempt in flight when its delivery is ended this way still counts once:
+`ok` when it succeeded, `failed` when not, since no retry follows.
+
+## A delivery ended without an attempt is pruned by its creation
+
+Design decision 14 prunes the ended records whose last attempt is older
+than 7 days. A record that ended without an attempt has none, so it is
+pruned 7 days after its creation.
+
+## IPv6 forms that carry an IPv4 address are judged by it
+
+Design decision 10 judges an IPv4-mapped IPv6 address by its IPv4 address.
+The other IPv6 forms that carry an IPv4 address are judged by it too:
+IPv4-compatible (`::a.b.c.d`, other than `::` and `::1`), the NAT64
+well-known prefix `64:ff9b::/96` and 6to4 `2002::/16` (the IPv4 address in
+bits 16 to 47), so that no spelling of an address of the hub's networks
+escapes the ranges. No IPv4 range is added.
 
 ## The OnCommit callback is registered by the first loop
 

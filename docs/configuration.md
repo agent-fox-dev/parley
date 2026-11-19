@@ -423,7 +423,7 @@ hour, in eleven steps that always run in this order:
 | `postmortems` | deletes the postmortems ingested before now minus `[audit].postmortem_max_age` |
 | `sessions` | deletes the ended sessions started before now minus `[sessions].max_age`, with their usage records and links |
 | `event_log` | moves the start of the event log past the events older than `[events].retention`; they stay stored for `GET /api/v1/audit`, and a resume position before the new start is answered `410` `cursor_expired` |
-| `webhook_deliveries` | deletes the event webhook delivery records, pings included, that are not `pending` and whose last attempt is more than 7 days old; a `pending` record is never deleted (see [api.md](api.md#event-webhooks)) |
+| `webhook_deliveries` | deletes the event webhook delivery records, pings included, that are not `pending` and whose last attempt, or without an attempt their creation, is more than 7 days old; a `pending` record is never deleted (see [api.md](api.md#event-webhooks)) |
 | `hub_events` | deletes the hub events older than `[audit].max_age` |
 | `orphans` | deletes the sessions (whatever their status), usage records, telemetry of all six kinds and hub events of a workspace slug no workspace has (for a task fork's slug `<parent>--<name>`, only when the parent is gone too), once each is older than `[audit].orphan_retention` by its own time |
 | `gauges` | sets the metrics `parley_audit_records` and `parley_agent_sessions_active` from the stored records (see [api.md](api.md#get-metrics)) |

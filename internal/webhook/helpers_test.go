@@ -684,3 +684,54 @@ func (w *world) retryWhile(t *testing.T, id string, more func(next time.Time) bo
 		w.clock.advance(next.Sub(w.clock.Now()))
 	}
 }
+
+// holder is a webhook receiver on 127.0.0.1 that answers 200 at once until
+// hold is set, and then holds each request until release is called: arrived
+// gets a value when a held request has come in, and aborted one when the
+// hub ended a held request before its release.
+type holder struct {
+	*httptest.Server
+	hold     atomic.Bool
+	arrived  chan struct{}
+	aborted  chan struct{}
+	released chan struct{}
+	once     sync.Once
+}
+
+func newHolder(t *testing.T) *holder {
+	t.Helper()
+	h := &holder{arrived: make(chan struct{}, 1), aborted: make(chan struct{}, 1), released: make(chan struct{})}
+	h.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if h.hold.Load() {
+			h.arrived <- struct{}{}
+			select {
+			case <-h.released:
+			case <-r.Context().Done():
+				h.aborted <- struct{}{}
+				<-h.released
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(h.Close)
+	t.Cleanup(h.release)
+	return h
+}
+
+// release lets the held requests be answered 200.
+func (h *holder) release() { h.once.Do(func() { close(h.released) }) }
+
+// url is the receiver's webhook URL.
+func (h *holder) url() string { return h.URL + "/hook" }
+
+// waitArrived waits for a held request, and fails the test when none comes
+// within 10 s.
+func (h *holder) waitArrived(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("waited 10 s for a request to the receiver")
+	}
+}

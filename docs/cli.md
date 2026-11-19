@@ -3163,7 +3163,9 @@ answers without the secret and writes no warning.
 `update` with no flag, `update` with both `--forks` and `--no-forks` or both
 `--enable` and `--disable`, and `create` without `--url` are a
 `usage_error` (exit status `2`) before any request, as are a wrong number of
-arguments and an unknown flag.
+arguments and an unknown flag. A flag of a pair, and `create`'s
+`--no-forks`, counts only when it is true: `--enable=false` is no flag, so
+`update` with it alone is a `usage_error` and nothing is switched on.
 
 `ping` and `redeliver` print the delivery record on stdout. When its
 `status` is `succeeded` they exit `0` with nothing on stderr; when it is

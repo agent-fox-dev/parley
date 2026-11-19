@@ -10606,8 +10606,12 @@ The hub refuses a URL whose host is, or resolves to, an address in
 `127.0.0.0/8`, `169.254.0.0/16` (with the metadata address
 `169.254.169.254`), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
 `0.0.0.0`, `224.0.0.0/4`, `::1`, `fe80::/10`, `fc00::/7` (with
-`fd00:ec2::254`), `::` or `ff00::/8`; an IPv4-mapped IPv6 address is judged
-by its IPv4 address and `localhost` as `127.0.0.1`.
+`fd00:ec2::254`), `::` or `ff00::/8`; an IPv6 address that carries an IPv4
+address is judged by that IPv4 address: IPv4-mapped (`::ffff:a.b.c.d`),
+IPv4-compatible (`::a.b.c.d`, other than `::` and `::1`), NAT64
+(`64:ff9b::/96`, the last 32 bits) and 6to4 (`2002::/16`, bits 16 to 47),
+so `64:ff9b::a00:1` is refused as `10.0.0.1`. `localhost` is judged as
+`127.0.0.1`.
 `[webhooks].allow_private = true` lifts the refusal for all of them;
 `[webhooks].allow_insecure = true` accepts `http://` URLs whose host is a
 loopback address and lifts the refusal for exactly those. At the create and
@@ -10750,7 +10754,11 @@ subscription, in any subscription state and workspace status, and answers
 It is signed like any delivery, written to no event log, never retried, and
 changes nothing on the subscription: not its `state`, `last_status`,
 `last_delivery_at`, `failing_since` or position. `503` `secrets_unavailable`
-answers a secret that cannot be decrypted, recording nothing.
+answers a secret that cannot be decrypted, recording nothing. A caller that
+disconnects does not end the attempt, which is bounded by
+`[webhooks].timeout`, and its record holds the receiver's answer. A
+subscription deleted while the attempt is in flight is answered `404`
+`webhook_not_found` after it, recording nothing.
 
 ### The delivery record
 
@@ -10777,7 +10785,8 @@ Lists the subscription's delivery records, pings included, a
 descending. `status` (`pending`, `succeeded` or `failed`) keeps only the
 records with that status; another value is `400` `invalid_request`
 (`status must be one of pending, succeeded, failed`). Records are kept for 7
-days after their last attempt, by the retention step `webhook_deliveries`
+days after their last attempt or, without an attempt, its creation, by the
+retention step `webhook_deliveries`
 (see [configuration.md](configuration.md#retention)); a `pending` record is
 never deleted.
 
@@ -10789,15 +10798,25 @@ subscription's current `url` with its current secret, in any subscription
 state, without a retry; answers `200` with the record: `status` the outcome,
 `attempts` one higher, `response_code`, `error`, `duration_ms` and
 `last_attempt_at` of this attempt, `next_attempt_at` `null`. It changes
-nothing on the subscription.
+nothing on the subscription. A caller that disconnects does not end the
+attempt, which is bounded by `[webhooks].timeout`, and the record holds the
+receiver's answer.
+
+The refusals are checked in the order of the table: the delivery, then
+whether it is a ping, then the signing secret, then its status, then its
+event.
 
 | Status | When |
 |---|---|
 | `200 OK` | the record, whether the attempt succeeded or failed |
-| `400` `invalid_request` | `delivery_id` is not a UUID; the delivery is a ping (`a ping cannot be redelivered; send a new ping`) |
 | `404` `delivery_not_found` | the id names no delivery of the subscription |
+| `400` `invalid_request` | `delivery_id` is not a UUID (checked before the lookup); the delivery is a ping (`a ping cannot be redelivered; send a new ping`) |
+| `503` `secrets_unavailable` | the signing secret cannot be decrypted |
 | `409` `delivery_pending` | the delivery is `pending` (`the delivery is still pending; the hub keeps trying it`) |
 | `410` `event_expired` | the event has left the event log (`the event of the delivery has left the event log`) |
-| `503` `secrets_unavailable` | the signing secret cannot be decrypted |
+
+A record that goes while the attempt is in flight is answered `404` after
+it: `webhook_not_found` when the subscription was deleted,
+`delivery_not_found` when the record was pruned.
 
 A refused redelivery sends nothing and leaves the record as it was.

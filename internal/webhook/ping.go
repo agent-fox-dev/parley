@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -29,7 +30,8 @@ const actionPing = "ping"
 // with the record whether the attempt succeeded or failed; the subscription
 // does not change, since a test says nothing about the events it is due.
 // A signing secret no key opens is 503 secrets_unavailable, and nothing is
-// sent or recorded.
+// sent or recorded. A subscription deleted while the attempt is in flight is
+// 404 webhook_not_found after it, with nothing recorded.
 func (c *Component) ping(w http.ResponseWriter, r *http.Request, q request) error {
 	caller, ok := identity.PrincipalOf(r.Context())
 	if !ok {
@@ -51,17 +53,30 @@ func (c *Component) ping(w http.ResponseWriter, r *http.Request, q request) erro
 		return err
 	}
 	d := delivery{ID: uuid.NewString(), Type: EventPing}
-	out := c.sender.send(r.Context(), attempt{
+	// A caller that leaves does not end the attempt, bounded by
+	// [webhooks].timeout on its own, so that the record holds what the
+	// receiver answered rather than a failure the receiver never caused.
+	ctx := context.WithoutCancel(r.Context())
+	out := c.sender.send(ctx, attempt{
 		url: sub.URL, body: body, eventType: EventPing, delivery: d.ID, secret: plain,
 	})
-	// The request's context may have ended with the attempt; the record is
-	// still the outcome the receiver saw.
-	ctx := context.WithoutCancel(r.Context())
-	if err := insertPing(ctx, c.deps.Store.Main(), sub.ID, d, at, out); err != nil {
-		return err
-	}
 	c.reportOutcome(out)
-	rec, _, err := deliveryOf(ctx, c.deps.Store.Main(), sub.ID, d.ID)
+	var rec record
+	err = c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		// The subscription may have been deleted while the attempt was in
+		// flight; its ping then has nowhere to be recorded.
+		if _, found, err := subscriptionByID(ctx, tx, sub.ID); err != nil || !found {
+			if err == nil {
+				err = webhookNotFound()
+			}
+			return err
+		}
+		if err := insertPing(ctx, tx, sub.ID, d, at, out); err != nil {
+			return err
+		}
+		rec, _, err = deliveryOf(ctx, tx, sub.ID, d.ID)
+		return err
+	})
 	if err != nil {
 		return err
 	}

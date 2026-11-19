@@ -66,8 +66,32 @@ func (c *Component) RemoveWorkspace(ctx context.Context, tx *sql.Tx, slug string
 	if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_subscriptions WHERE workspace = ?`, slug); err != nil {
 		return fmt.Errorf("delete the event webhooks of %s: %w", slug, err)
 	}
-	go c.wakeRemoved(context.WithoutCancel(ctx), ids)
+	c.afterRemoval(ctx, ids)
 	return nil
+}
+
+// afterRemoval runs wakeRemoved in a goroutine that Run waits for, under the
+// loops' context once Run has started, so that it never outlives the
+// component and reads a store the hub has closed. A component that has
+// stopped has no loop left to wake.
+func (c *Component) afterRemoval(ctx context.Context, ids []string) {
+	ls := &c.loops
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.stopped {
+		return
+	}
+	// The removal transaction's context ends with it; the wake-up must run
+	// after.
+	run := context.WithoutCancel(ctx)
+	if ls.ctx != nil {
+		run = ls.ctx
+	}
+	ls.wg.Add(1)
+	go func() {
+		defer ls.wg.Done()
+		c.wakeRemoved(run, ids)
+	}()
 }
 
 // wakeRemoved wakes the loops of those of ids that are gone, once the
@@ -88,6 +112,10 @@ func (c *Component) wakeRemoved(ctx context.Context, ids []string) {
 		return nil
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			// The component stopped, and its loops with it.
+			return
+		}
 		// Each loop still ends when the next event wakes it.
 		c.deps.Logger.Warn("cannot wake the loops of removed event webhooks", "webhook_ids", ids, "error", err.Error())
 		return

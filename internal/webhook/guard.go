@@ -81,7 +81,7 @@ func (c *Component) guard(h handler) server.HandlerFunc {
 				return err
 			}
 			if !found {
-				return server.NewError(errorTypeWebhookNotFound, http.StatusNotFound, msgWebhookNotFound)
+				return webhookNotFound()
 			}
 			q.subscription = &sub
 		}
@@ -94,4 +94,10 @@ func (c *Component) guard(h handler) server.HandlerFunc {
 func isUUID(s string) bool {
 	_, err := uuid.Parse(s)
 	return len(s) == 36 && err == nil
+}
+
+// webhookNotFound is the answer for a subscription id the workspace does not
+// hold, also when it was deleted while a request was under way.
+func webhookNotFound() error {
+	return server.NewError(errorTypeWebhookNotFound, http.StatusNotFound, msgWebhookNotFound)
 }

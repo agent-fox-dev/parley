@@ -1,11 +1,13 @@
 package webhook_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -158,5 +160,119 @@ func TestPing_SendsOneSignedTestDeliveryAndChangesNothingElse(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestPingAndRedeliver_RecordTheReceiversAnswerWhenTheCallerLeaves(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	for i, call := range []string{"ping", "redeliver"} {
+		t.Run(call, func(t *testing.T) {
+			h := newHolder(t)
+			typ := "parley.test.leave" + strconv.Itoa(i)
+			id := w.subscribe(t, demo, map[string]any{"url": h.url(), "types": []string{typ}})
+			path := hookPath(demo, id) + "/ping"
+			if call == "redeliver" {
+				w.emit(t, demo, typ, "")
+				waitFor(t, "the event to be delivered", func() bool { return w.settled(t, id) })
+				path = redeliverPath(id, w.deliveries(t, id)[0].id)
+			}
+			before := len(w.deliveries(t, id))
+			h.hold.Store(true)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL(path), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+w.ownerKey)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if resp, err := http.DefaultClient.Do(req); err == nil {
+					resp.Body.Close()
+				}
+			}()
+			h.waitArrived(t)
+			cancel()
+			<-done
+			// The hub would end the attempt soon after the caller left; give
+			// it the time to, then let the receiver answer.
+			select {
+			case <-h.aborted:
+			case <-time.After(500 * time.Millisecond):
+			}
+			h.release()
+
+			var got deliveryRow
+			waitFor(t, "the attempt to be recorded", func() bool {
+				for _, d := range w.deliveries(t, id) {
+					if (call == "ping" && d.typ == "parley.webhook.ping" && len(w.deliveries(t, id)) > before) ||
+						(call == "redeliver" && d.attempts == 2) {
+						got = d
+						return true
+					}
+				}
+				return false
+			})
+			if got.status != "succeeded" || got.responseCode.Int64 != http.StatusOK || got.err.Valid {
+				t.Errorf("the %s's record = %+v, want succeeded with the receiver's 200", call, got)
+			}
+		})
+	}
+}
+
+func TestPingAndRedeliver_AnswerNotFoundWhenTheSubscriptionGoesMeanwhile(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	for i, tc := range []struct {
+		name, call string
+		// meanwhile is what happens while the receiver holds the attempt:
+		// the subscription is deleted, or its ended records are pruned.
+		meanwhile string
+		errorType string
+	}{
+		{"a ping of a subscription deleted meanwhile", "ping", "delete", "webhook_not_found"},
+		{"a redelivery of a subscription deleted meanwhile", "redeliver", "delete", "webhook_not_found"},
+		{"a redelivery of a record pruned meanwhile", "redeliver", "prune", "delivery_not_found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHolder(t)
+			typ := "parley.test.gone" + strconv.Itoa(i)
+			id := w.subscribe(t, demo, map[string]any{"url": h.url(), "types": []string{typ}})
+			path := hookPath(demo, id) + "/ping"
+			if tc.call == "redeliver" {
+				w.emit(t, demo, typ, "")
+				waitFor(t, "the event to be delivered", func() bool { return w.settled(t, id) })
+				path = redeliverPath(id, w.deliveries(t, id)[0].id)
+			}
+			h.hold.Store(true)
+			type answer struct {
+				status int
+				raw    []byte
+			}
+			answered := make(chan answer, 1)
+			go func() {
+				status, raw := w.Call(t, http.MethodPost, path, w.ownerKey, nil)
+				answered <- answer{status, raw}
+			}()
+			h.waitArrived(t)
+			switch tc.meanwhile {
+			case "delete":
+				if status, raw := w.Call(t, http.MethodDelete, hookPath(demo, id), w.ownerKey, nil); status != http.StatusNoContent && status != http.StatusOK {
+					t.Fatalf("delete = %d %s", status, raw)
+				}
+			case "prune":
+				if _, err := w.hooks.PruneDeliveries(context.Background(), w.clock.Now().Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.release()
+			got := <-answered
+			if got.status != http.StatusNotFound || errorOf(t, got.raw)["error_type"] != tc.errorType {
+				t.Errorf("%s = %d %s, want 404 %s", tc.call, got.status, got.raw, tc.errorType)
+			}
+		})
 	}
 }

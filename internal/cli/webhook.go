@@ -22,7 +22,8 @@ var (
 )
 
 // The flag pairs of parley webhook update that each set one member; at most
-// one flag of a pair is given.
+// one flag of a pair is given. A flag of a pair counts only when it is true:
+// --enable=false asks for nothing, and must not switch the subscription on.
 var (
 	forksPair  = [2]string{"forks", "no-forks"}
 	activePair = [2]string{"enable", "disable"}
@@ -160,13 +161,19 @@ func updateBody(fs *pflag.FlagSet) map[string]any {
 	}
 	for member, pair := range map[string][2]string{"include_forks": forksPair, "active": activePair} {
 		switch {
-		case fs.Changed(pair[0]):
+		case flagSet(fs, pair[0]):
 			body[member] = true
-		case fs.Changed(pair[1]):
+		case flagSet(fs, pair[1]):
 			body[member] = false
 		}
 	}
 	return body
+}
+
+// flagSet reports whether the bool flag name was given as true.
+func flagSet(fs *pflag.FlagSet, name string) bool {
+	on, _ := fs.GetBool(name)
+	return on
 }
 
 // typesOf is --types split at its commas: the hub takes the types as a
@@ -181,7 +188,7 @@ func typesOf(fs *pflag.FlagSet) []string {
 func checkUpdateFlags(cmd *cobra.Command) error {
 	fs := cmd.Flags()
 	for _, pair := range [][2]string{forksPair, activePair} {
-		if fs.Changed(pair[0]) && fs.Changed(pair[1]) {
+		if flagSet(fs, pair[0]) && flagSet(fs, pair[1]) {
 			return usageError("%s takes one of --%s and --%s, not both", cmd.CommandPath(), pair[0], pair[1])
 		}
 	}

@@ -3,15 +3,20 @@ package webhook_test
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/secret"
+	"github.com/agent-fox-dev/parley/internal/webhook"
 )
 
 // get reads the subscription id of slug through the route, pending
@@ -376,4 +381,49 @@ func TestDelivery_SendsInSeqOrderOneAttemptAtATimeAndRepeatsAnEventUnderItsDeliv
 	if m := most.Load(); m != 1 {
 		t.Errorf("the receiver had at most %d requests at once, want 1", m)
 	}
+}
+
+func TestDelivery_WaitsOutTheSecretRetryWithoutTryingAtEachEvent(t *testing.T) {
+	t.Parallel()
+	var keyless atomic.Bool
+	var logged hubtest.LogBuffer
+	w := newWorld(t, options{toml: insecure, adjust: []func(*webhook.Deps){func(d *webhook.Deps) {
+		keys := d.Keys
+		d.Keys = func() secret.Keys {
+			if keyless.Load() {
+				return secret.Keys{}
+			}
+			return keys()
+		}
+		d.Logger = slog.New(slog.NewTextHandler(&logged, nil))
+	}}})
+	in := newInbox(t, answerOK)
+	id := w.subscribe(t, demo, map[string]any{"url": in.url(), "types": []string{"parley.test.*"}})
+	warnings := func() int { return strings.Count(logged.String(), "cannot open the signing secret") }
+
+	keyless.Store(true)
+	w.emit(t, demo, "parley.test.event", "")
+	waitFor(t, "the loop to wait for the secret", func() bool {
+		return warnings() == 1 && w.clock.armed(w.clock.Now().Add(time.Minute))
+	})
+	for minute := 1; minute <= 2; minute++ {
+		// Every commit wakes the loop; within the minute none of them
+		// tries the secret again.
+		for range 5 {
+			w.emit(t, demo, "parley.test.event", "")
+		}
+		time.Sleep(300 * time.Millisecond)
+		if n := warnings(); n != minute {
+			t.Fatalf("after %d minute(s) of clock and 5 more events the log holds %d warnings, want %d", minute-1, n, minute)
+		}
+		w.clock.advance(time.Minute)
+		waitFor(t, "the retry a minute later", func() bool { return warnings() == minute+1 })
+	}
+	if n := len(in.requests()); n != 0 {
+		t.Errorf("the receiver got %d requests, want none while the secret cannot be opened", n)
+	}
+
+	keyless.Store(false)
+	w.clock.advance(time.Minute)
+	waitFor(t, "every event to be delivered once the key is back", func() bool { return w.settled(t, id) })
 }

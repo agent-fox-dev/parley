@@ -6258,14 +6258,25 @@ reads its subscription again (and ends when the row is gone or
 `ReadAfter` from the stored position, deciding each event with
 `VisibleToOwnerOf`, `include_forks` and the `types` matcher. Recording a
 `pending` delivery moves the position to just before its event; success
-and give-up move it to the event. Position writes compare the position the
-step read, so a concurrent change of the subscription wins. A failed
+and give-up move it to the event. The moves past events the subscription
+does not receive, to just before a recorded delivery and past events that
+left the log compare the position the step read and are not made on a
+`disabled` subscription, so a concurrent change of the subscription (a
+re-enable that sets a new position, a switch-off) wins; success, give-up
+and a pending event gone from the log only move the position forward
+(`max`), and only while the delivery is still `pending`, so an attempt
+whose delivery was ended meanwhile moves nothing. A failed
 attempt schedules the next with `nextAttempt` (10 s doubled per failure, at
 most 1 h, never past the first attempt plus 24 h) and the loop sleeps on
 the component's clock; a failure at or after 24 h gives the event up. The
 72-hour check (`watchFailing`) runs from `Run` on the same clock at least
 once a minute. An attempt runs under `Run`'s context, so the stop abandons
-it and records nothing.
+it and records nothing. A signing secret that no key opens is logged once
+and tried again a minute later; the loop keeps the sealed value that failed
+and lets the wake-ups before then pass without trying it, while a rotated
+secret is tried at once. A ping and a redelivery run their attempt on the
+request's context without its cancellation, bounded by `[webhooks].timeout`,
+so a caller that leaves does not change the recorded outcome.
 
 The sender (`sender.go`) builds one `http.Transport` per attempt, without a
 proxy, compression or redirects, whose dial resolves the host through the
@@ -6274,7 +6285,8 @@ before it connects; https uses the trust roots of `Deps.RootCAs` (the system
 roots in production), and nothing turns verification off. `RemoveWorkspace`
 deletes in the caller's transaction and then, from a store transaction of
 its own that starts after the caller's has ended, wakes the loops whose rows
-are gone, so a rolled-back delete changes nothing
+are gone, in a goroutine `Run` waits for, so a rolled-back delete changes
+nothing
 ([ADR 09](adr/09-run-durable-jobs-on-a-queue-the-hub-composes.md)'s
 pattern).
 
