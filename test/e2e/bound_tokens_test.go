@@ -228,11 +228,16 @@ BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`); err != nil {
 		t.Fatalf("drop the failing trigger: %v", err)
 	}
 	h.Restart(t)
-	waitUntil(10*time.Second, revoked)
+	// The sweep logs its count after its transaction commits, so the line
+	// is waited for as well as the revocation.
+	swept := func() bool {
+		return logRecord(h, "revoked the tokens bound to workspaces that no longer exist", map[string]any{"level": "INFO", "count": 1.0}) != nil
+	}
+	waitUntil(10*time.Second, func() bool { return revoked() && swept() })
 	if !revoked() {
 		t.Fatalf("after a pass the token bound to gone is not revoked; log %q", h.Log.String())
 	}
-	if logRecord(h, "revoked the tokens bound to workspaces that no longer exist", map[string]any{"level": "INFO", "count": 1.0}) == nil {
+	if !swept() {
 		t.Errorf("log %q, want one INFO line with count 1", h.Log.String())
 	}
 	if status, body := h.Call(t, http.MethodGet, "/api/v1/workspaces/gone/probe", orphan, nil); status != http.StatusUnauthorized || errorType(body) != "unauthenticated" {

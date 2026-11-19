@@ -109,6 +109,11 @@ type Options struct {
 	Compose func(*Composition)
 	// Port, when set, replaces [server].port.
 	Port *int
+	// Listener, when set, is the bound listener the hub serves on in place
+	// of binding [server].bind and the port; the hub closes it when it
+	// stops. A test that restarts a hub passes one, so that the port is
+	// never free between two runs.
+	Listener net.Listener
 	// Now is the hub's clock; nil means time.Now.
 	Now func() time.Time
 	// RequestGrace replaces DefaultRequestGrace when it is not zero.
@@ -762,10 +767,15 @@ func (r *run) start(ctx context.Context, c *Composition, cfg *config.Config, st 
 	addr := net.JoinHostPort(cfg.Server.Bind, strconv.Itoa(port))
 	// The listener is bound before the maintenance loop starts, so that a
 	// bind failure stops the start before any background work has run.
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		r.logger.Error("cannot listen", "addr", addr, "error", err.Error())
-		return 1
+	ln := r.opts.Listener
+	if ln != nil {
+		addr = ln.Addr().String()
+	} else {
+		var err error
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			r.logger.Error("cannot listen", "addr", addr, "error", err.Error())
+			return 1
+		}
 	}
 
 	opts := ServerOptions(cfg, st)
