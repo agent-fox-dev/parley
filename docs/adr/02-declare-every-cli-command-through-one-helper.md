@@ -66,9 +66,13 @@ and every command group through `group`; the root command is a group too.
 - There are two kinds of error. `hubError` is the hub's error envelope, kept
   as received and printed indented again by two spaces, never decoded, so its
   members and their order reach stderr unchanged; it maps to exit status `1`. `cliError` is an error the CLI
-  raises itself, of one of five types, each with its constructor:
-  `usage_error` and `client_error` map to `2`, `wait_failed` and
-  `wait_timeout` to `1`, `condition_not_met` to `3`. It is printed as
+  raises itself, of one of six types, each with its constructor:
+  `usage_error` and `client_error` map to `2`, `wait_failed`,
+  `wait_timeout` and `delivery_failed` to `1`, `condition_not_met` to `3`.
+  `delivery_failed` ends `parley webhook ping` and `parley webhook
+  redeliver` when the hub answered `200` with a delivery record whose
+  attempt failed: the record is the result, printed on stdout, and the
+  failure must still reach a script through the exit status. It is printed as
   `{"error":{"code":0,"message":…,"error_type":…}}`, indented by two
   spaces and followed by a newline. Any other error, which only a failure
   inside the CLI produces, is printed and counted as a `client_error`,

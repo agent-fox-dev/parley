@@ -49,6 +49,7 @@ command-line client. Both are written in Go, in the module
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
+| `internal/webhook` | event webhooks, the subscriptions that push a workspace's hub events to a URL as signed `POST`s: the keys of `[webhooks]` (`config.go`: `Register`, `SettingsFrom`, `Settings`), the tables `webhook_subscriptions` and `webhook_deliveries` (`SchemaStep`), the nine routes under `/workspaces/:slug/webhooks` behind one guard (`guard.go`), the subscription's create, change, delete and rotation (`subscription.go`), the destination rule (`destination.go`), the sender of one signed attempt (`sender.go`), one delivery loop per `active` or `failing` subscription and the 72-hour check (`loop.go`, `state.go`, `lifecycle.go`), ping, the delivery list and redelivery (`ping.go`, `deliveries.go`), the queue depth (`QueueDepth`), the delivery pruner (`PruneDeliveries`), the converter of the signing secrets after a key rotation (`ConvertSecrets`) and the workspace remover (`RemoveWorkspace`); `Component` is bound once at start by `Bind(Deps)` and runs its loops in `Run` |
 | `internal/workspace` | the place for workspace records, their validation rules, the state guard, and the create and clone work; so far the whole workspace record with its store functions, the state guard `RequireReady`, the resolution of a workspace's origin credential from its secrets `ResolveOriginCredential`, the workspace service with `POST /api/v1/workspaces`, `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:slug`, `PATCH /api/v1/workspaces/:slug`, `POST /api/v1/workspaces/:slug/sync`, `POST /api/v1/workspaces/:slug/branches/:name/push`, `POST /api/v1/workspaces/:slug/archive` (see Archive), `POST /api/v1/workspaces/:slug/reactivate` (see Reactivate) and `POST /api/v1/workspaces/:slug/reclone` (see Reclone) and `DELETE /api/v1/workspaces/:slug` (see Delete) and the clone work `Clone` with the copy's place `RepoPath` and the post-clone steps, the sync of a workspace with its origin `(*Service).Sync` (see Sync), the safety copy that offers every branch to origin before an archive or a reclone (see Safety copy), the maintenance marker an archive, a reclone and a delete hold with `ClearMarkers`, which releases every marker at start, and the teardown set `Teardown` with `RemoveOwned`, through which an archive and a delete reach the data other packages keep for a workspace (see Archive), the clone workers `Workers` and `(*Service).Enqueue`, which hands a workspace put back to `pending` to them (see Clone work), the one encoder of the workspace object `RenderWorkspace` and the settings registry with the settings table of the 21 setting keys and `RegisterSettingKeys` (see Workspace records), the one branch-glob matcher `MatchBranchGlob`, `MatchAnyBranchGlob` and `ValidateBranchGlob`, and the rules every workspace route judges its values by, each deciding on the text alone and returning an error that says which rule broke: `ValidateSlug` (3 to 64 characters of a to z, digits and hyphens, starting with a letter), `ValidateGitURL` (`https://<host>/<path>` without user information, or `git@<host>:<path>`, with no lookup or connection), `ValidateBranchName` (git's branch-name rule), `ValidateForkName` (1 to 32 characters of a to z, digits and hyphens) and `ParseDuration` (a whole number above zero followed by `m`, `h` or `d`, unlike `timefmt.ParseDuration`, which also takes seconds) |
 | `test/e2e` | tests that build the binaries and run them |
 
@@ -6213,6 +6214,70 @@ The commands `parley forge webhook set|unset` and `parley forge deliveries`
 are in `internal/cli/forge.go`; `webhook set` has its own run step, which
 writes the show-once warning only when the hub's answer holds `secret`.
 
+### Event webhooks
+
+`internal/hub/webhook.go` adds the part `composeWebhooks`, after
+`composeAudit` and before `composeMetrics` in `parts`. It creates a zero
+`webhook.Component` (`Webhooks()`), registers the keys of `[webhooks]` with
+`webhook.Register`, adds `webhook.SchemaStep` (the tables
+`webhook_subscriptions` and `webhook_deliveries`, the deliveries removed
+with their subscription by a foreign key) and the nine routes, and connects
+the component to the other parts while the hub is composed: it is the
+delivery pruner of the retention step `webhook_deliveries`
+(`RegisterDeliveryPruner`), its `ConvertSecrets` is a converter of the
+secret re-encryption (`(*secret.Component).RegisterConverter`), its
+`QueueDepth` is the source of `parley_webhook_queue_depth`
+(`(*metrics.Registry).RegisterSource`), and its `RemoveWorkspace` is a
+remover of the workspaces' teardown set, registered unconditionally
+([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)).
+The start hook `webhooks` binds it to `webhook.Deps`: the store, the event
+component, the operator's keys as `composeSecrets` loaded them (kept on the
+composition, since the secret component does not export them), the secret
+component's `Available`, `event.SystemClock(rt.Now)`, the logger, the
+loaded settings, the metrics registry as its recorder and the hub's
+scrubber, which learns every signing secret the component seals or opens.
+Tests change these with `AdjustWebhooks`, a controlled clock, a resolver,
+a dialer or trust roots among them. The component's `Run` is background
+work `webhook deliveries` with a grace of one second.
+
+Each route is declared by one helper (`guard.go`) with the mark
+`access.MarkRefusesBound`, the need `owner` and the scope `workspaces:read`
+or `workspaces:write`, and its handler first refuses a task fork, then an
+`{id}` or `{delivery_id}` that is not a UUID, then an `{id}` that names no
+subscription of the workspace. A signing secret is sealed with
+`secret.SealValue` under the binding `webhook:<id>` and stored in the
+subscription's row; `secret.OpenValue` opens it for each attempt.
+
+`Run` loads the `active` and `failing` subscriptions and starts one loop
+per subscription, a goroutine with a one-slot wake channel; the first loop
+registers one `OnCommit` callback that only wakes the loops
+([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)), so a hub
+without subscriptions keeps the event component idle. Each step of a loop
+reads its subscription again (and ends when the row is gone or
+`disabled`), goes on with its `pending` delivery first, and otherwise reads
+`ReadAfter` from the stored position, deciding each event with
+`VisibleToOwnerOf`, `include_forks` and the `types` matcher. Recording a
+`pending` delivery moves the position to just before its event; success
+and give-up move it to the event. Position writes compare the position the
+step read, so a concurrent change of the subscription wins. A failed
+attempt schedules the next with `nextAttempt` (10 s doubled per failure, at
+most 1 h, never past the first attempt plus 24 h) and the loop sleeps on
+the component's clock; a failure at or after 24 h gives the event up. The
+72-hour check (`watchFailing`) runs from `Run` on the same clock at least
+once a minute. An attempt runs under `Run`'s context, so the stop abandons
+it and records nothing.
+
+The sender (`sender.go`) builds one `http.Transport` per attempt, without a
+proxy, compression or redirects, whose dial resolves the host through the
+component's resolver and judges every address with `destinationAllowed`
+before it connects; https uses the trust roots of `Deps.RootCAs` (the system
+roots in production), and nothing turns verification off. `RemoveWorkspace`
+deletes in the caller's transaction and then, from a store transaction of
+its own that starts after the caller's has ended, wakes the loops whose rows
+are gone, so a rolled-back delete changes nothing
+([ADR 09](adr/09-run-durable-jobs-on-a-queue-the-hub-composes.md)'s
+pattern).
+
 ### Hub events
 
 `internal/hub/events.go` adds the part `composeEvents`, after `composeAccess`
@@ -6485,7 +6550,10 @@ it received is refused `410` `cursor_expired`.
 `cannot start` line, before any store is opened, also for the bootstrap, and
 stops `backup`, which loads the configuration the same way, as its one
 `backup failed` line
-([ADR 06](adr/06-load-the-secret-keys-before-the-stores-open.md)). The start
+([ADR 06](adr/06-load-the-secret-keys-before-the-stores-open.md)). The
+loaded keys are kept on the composition too (the unexported field
+`secretKeys`), where the event webhook part reads them to seal and open the
+signing secrets (see [Event webhooks](#event-webhooks)). The start
 hook `secrets` binds the component to `secret.Deps{Store: rt.Store, Keys:
 <the loaded keys>, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events}`
 and reads `(*secret.Component).StartReport`: whether a current and a

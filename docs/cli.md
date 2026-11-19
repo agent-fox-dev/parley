@@ -408,6 +408,7 @@ Available Commands:
   user              Read and update your own profile
   vars              Create, list, update, delete and resolve variables
   version           Print the client's build and, given a hub URL, the hub's build
+  webhook           Subscribe a URL to a workspace's events, and see and resend what the hub delivered to it
   workspace         Register, list, read, change, sync, push, archive, reactivate, reclone and delete the workspaces of the hub
 
 Flags:
@@ -3130,6 +3131,57 @@ deliveries with, and read what the hub recorded of them, through the hub's
 More than one of `--secret`, `--from-stdin` and `--generate`, or a missing
 `<slug>`, is a `usage_error` with exit status `2`, raised before any request.
 
+### `parley webhook`
+
+These commands call the [event webhook routes](api.md#event-webhooks) of
+the hub with the credential as `Authorization: Bearer`, and print the hub's
+answer, indented by two spaces. `parley webhook` run without a command
+prints its help and exits `0`; it reads no credential and sends no request.
+
+| Command | Request | Flags |
+|---|---|---|
+| `parley webhook create <workspace-slug>` | `POST /api/v1/workspaces/<slug>/webhooks` | `--url <url>` (required) as `url`; `--types <list>` as `types`, split at commas; `--no-forks` as `include_forks` `false`; `--description <text>` as `description`. A member is sent only for a flag given |
+| `parley webhook list <workspace-slug>` | `GET …/webhooks` | `--state`, `--limit`, `--cursor`, each sent only when given |
+| `parley webhook get <workspace-slug> <id>` | `GET …/webhooks/<id>` | |
+| `parley webhook update <workspace-slug> <id>` | `PATCH …/webhooks/<id>` | `--url`, `--types`, `--forks` or `--no-forks` (`include_forks` `true` or `false`), `--description`, `--enable` or `--disable` (`active` `true` or `false`); at least one flag |
+| `parley webhook delete <workspace-slug> <id>` | `DELETE …/webhooks/<id>` | prints `{"status":"deleted","id":"<id>"}` |
+| `parley webhook rotate-secret <workspace-slug> <id>` | `POST …/webhooks/<id>/rotate-secret` | |
+| `parley webhook ping <workspace-slug> <id>` | `POST …/webhooks/<id>/ping` | |
+| `parley webhook deliveries <workspace-slug> <id>` | `GET …/webhooks/<id>/deliveries` | `--status`, `--limit`, `--cursor`, each sent only when given |
+| `parley webhook redeliver <workspace-slug> <id> <delivery-id>` | `POST …/webhooks/<id>/deliveries/<delivery-id>/redeliver` | |
+
+`create` and `rotate-secret` print the answer with its `secret`, then, when
+the answer carries one, the line
+
+```
+warning: this value is shown once and will not be shown again
+```
+
+on stderr, which never repeats the secret; an `Idempotency-Key` replay
+answers without the secret and writes no warning.
+
+`update` with no flag, `update` with both `--forks` and `--no-forks` or both
+`--enable` and `--disable`, and `create` without `--url` are a
+`usage_error` (exit status `2`) before any request, as are a wrong number of
+arguments and an unknown flag.
+
+`ping` and `redeliver` print the delivery record on stdout. When its
+`status` is `succeeded` they exit `0` with nothing on stderr; when it is
+`failed` they write a `delivery_failed` envelope on stderr and exit `1`:
+
+```json
+{
+  "error": {
+    "code": 0,
+    "message": "…",
+    "error_type": "delivery_failed"
+  }
+}
+```
+
+A hub error, such as `404` `webhook_not_found`, is written to stderr as
+received, with nothing on stdout and exit status `1`.
+
 ### `parley session`
 
 These commands drive the [session routes](api.md#sessions): an agent opens
@@ -3372,8 +3424,10 @@ stdout carries the result, and nothing on a failure, except the result a
 `--fail-on-…` condition held in and the final record of a wait that ended
 in a state that is not a success (`wait_failed`, see [Waiting](#waiting)),
 the events `parley events tail` printed before an error ended it (see
-[`parley events`](#parley-events)), and the results of the scopes in which
-`parley secrets create` succeeded (see [`parley secrets`](#parley-secrets)).
+[`parley events`](#parley-events)), the results of the scopes in which
+`parley secrets create` succeeded (see [`parley secrets`](#parley-secrets)),
+and the delivery record of a failed `parley webhook ping` or
+`parley webhook redeliver` (see [`parley webhook`](#parley-webhook)).
 Every error goes to stderr as one error envelope (`parley secrets create`
 writes one per scope that failed), a JSON document indented by two spaces
 and followed by a newline, and nothing else: no usage text follows it. The only other lines on stderr
@@ -3385,7 +3439,7 @@ answered (a status of `400` or above whose body is a JSON object with an
 again by two spaces without being decoded: its `code` is the HTTP status,
 and members such as `error.details` or `error.oldest_seq` are kept with
 their values and in their order. An error `parley` raises itself has `code`
-`0`, a message and one of five `error_type`s:
+`0`, a message and one of six `error_type`s:
 
 ```json
 {
@@ -3404,12 +3458,13 @@ their values and in their order. An error `parley` raises itself has `code`
 | `wait_failed` | a wait for a long operation ended in a state that is not a success (see [Waiting](#waiting)), or `parley change wait` read a change that ends its wait without meeting it (see [`parley change`](#parley-change)) |
 | `wait_timeout` | a wait for a long operation, or `parley change wait`, ran out of time (see [Waiting](#waiting)) |
 | `condition_not_met` | a `--fail-on-…` condition held in the result |
+| `delivery_failed` | the test delivery of `parley webhook ping`, or the attempt of `parley webhook redeliver`, failed; the delivery record is on stdout (see [`parley webhook`](#parley-webhook)) |
 
 The exit status follows from the error alone, on every command:
 
 | Status | When |
 |---|---|
 | `0` | success, including help and `parley version` whether or not the hub answered |
-| `1` | the hub answered with an error envelope (written to stderr as received), or `wait_failed` or `wait_timeout` |
+| `1` | the hub answered with an error envelope (written to stderr as received), or `wait_failed`, `wait_timeout` or `delivery_failed` |
 | `2` | `usage_error` or `client_error` |
 | `3` | `condition_not_met` |
