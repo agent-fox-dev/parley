@@ -254,7 +254,14 @@ func (w *world) create(t *testing.T, credential, slug string, body any) (int, []
 // test unless it is answered 201, and returns the answer.
 func (w *world) mustCreate(t *testing.T, slug, url string) map[string]any {
 	t.Helper()
-	status, raw := w.create(t, w.ownerKey, slug, map[string]any{"url": url})
+	return w.mustCreateWith(t, slug, map[string]any{"url": url})
+}
+
+// mustCreateWith creates a subscription of body on slug as the owner, fails
+// the test unless it is answered 201, and returns the answer.
+func (w *world) mustCreateWith(t *testing.T, slug string, body map[string]any) map[string]any {
+	t.Helper()
+	status, raw := w.create(t, w.ownerKey, slug, body)
 	if status != http.StatusCreated {
 		t.Fatalf("create on %s = %d %s, want 201", slug, status, raw)
 	}
@@ -497,11 +504,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // test unless it is answered 201, and returns its id.
 func (w *world) subscribe(t *testing.T, slug string, body map[string]any) string {
 	t.Helper()
-	status, raw := w.create(t, w.ownerKey, slug, body)
-	if status != http.StatusCreated {
-		t.Fatalf("create on %s = %d %s, want 201", slug, status, raw)
-	}
-	id, _ := decode(t, raw)["id"].(string)
+	id, _ := w.mustCreateWith(t, slug, body)["id"].(string)
 	return id
 }
 

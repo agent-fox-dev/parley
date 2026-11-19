@@ -35,6 +35,9 @@ func (c *Component) Routes() []server.Route {
 		c.route(http.MethodPatch, item, scopeWrite, c.update),
 		c.route(http.MethodDelete, item, scopeWrite, c.remove),
 		c.route(http.MethodPost, item+"/rotate-secret", scopeWrite, c.rotate),
+		c.route(http.MethodPost, item+"/ping", scopeWrite, c.ping),
+		c.route(http.MethodGet, item+"/deliveries", scopeRead, c.deliveries),
+		c.route(http.MethodPost, item+"/deliveries/:delivery_id/redeliver", scopeWrite, c.redeliver),
 	}
 }
 
