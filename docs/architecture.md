@@ -5368,9 +5368,17 @@ event and telemetry parts, whose components it reads.
   parent is, and then reads its two sources through narrow interfaces
   (`sources.go`): `HubEvents`, which `(*event.Component).ReadNewest`
   satisfies (the stored events newest first from a place `(time, id)`,
-  filtered in SQL, `parley.webhook.ping` left out, visibility decided by
-  `Visible` with one viewer per read, reading in batches until it holds the
-  page), and `RunEvents`, which `(*telemetry.Component).NewestRunEvents`
+  filtered in SQL, `parley.webhook.ping` left out, confined in SQL, for
+  every caller but the admin token, to the events the visibility rule could
+  grant: those of the caller's readable workspaces, as their workspace or
+  their stored fork parent, a type only owners see only where the caller is
+  owner or admin, those of no workspace scoped to the caller or to one of
+  their active orgs, and for a bound token those of the workspaces its
+  binding covers, of forks of the bound workspace and the change events of
+  its fork's parent, each term looked up in an index of
+  `event.ReadIndexStep`, so that a page reads the caller's events and not
+  the table; visibility is still decided by `Visible` with one viewer per
+  read, reading in batches until it holds the page), and `RunEvents`, which `(*telemetry.Component).NewestRunEvents`
   satisfies (the run events newest first, confined in SQL to a scope: every
   workspace for the admin token; otherwise the caller's readable set, and
   for a caller that is not bound the deleted forks of readable
@@ -6208,8 +6216,9 @@ writes the show-once warning only when the hub's answer holds `secret`.
 ### Hub events
 
 `internal/hub/events.go` adds the part `composeEvents`, after `composeAccess`
-in `parts`. It creates a zero `event.Component`, adds the schema step
-`event.SchemaStep` (`hub_events`) and binds the component in the start hook
+in `parts`. It creates a zero `event.Component`, adds the schema steps
+`event.SchemaStep` (`hub_events`) and `event.ReadIndexStep`
+(`hub_events_read_indexes`) and binds the component in the start hook
 `events` to `event.Deps{Store: rt.Store, Clock: event.SystemClock(rt.Now),
 Scrubber: rt.Scrubber, Parents: ..., Access: c.access, Memberships: ...,
 Shutdown: c.ShuttingDown(), Authenticate: c.identity.Authenticate,
@@ -6248,6 +6257,13 @@ The step creates three tables in the transactional store:
   at 0;
 - `hub_event_log_bound`, one row with `oldest_seq`, the lowest `seq` the log
   addresses, starting at 1.
+
+The second step indexes `hub_events` for the newest-first read of a caller
+who sees few events (`ReadNewest`): on `(workspace, time, id)`, on
+`(parent_slug, time, id)`, and, for the events of no workspace, on
+`metadata.scope` and `metadata.scope_id` (`json_extract`), then `time` and
+`id`. `Emit` stores only JSON objects as metadata, so that index never
+refuses a write.
 
 `(*Component).Emit(ctx, tx, in)` stores one event inside `tx`, the caller's
 transaction of `(*store.Store).Tx`, so the event commits or rolls back with

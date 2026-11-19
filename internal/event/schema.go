@@ -56,3 +56,21 @@ INSERT INTO hub_event_log_bound (only, oldest_seq) VALUES (1, 1);`)
 		return err
 	},
 }
+
+// ReadIndexStep indexes the hub events for the newest-first reads of a
+// caller who sees few of them (ReadNewest): by workspace, by the parent of
+// a task fork, and the events of no workspace by metadata.scope and
+// metadata.scope_id, each then by time and id. Emit stores only JSON
+// objects as metadata, so the scope index never refuses a write.
+var ReadIndexStep = store.Step{
+	Name:   "hub_events_read_indexes",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+CREATE INDEX hub_events_workspace_time ON hub_events (workspace, time, id);
+CREATE INDEX hub_events_parent_time ON hub_events (parent_slug, time, id);
+CREATE INDEX hub_events_scope_time ON hub_events
+	(json_extract(metadata, '$.scope'), json_extract(metadata, '$.scope_id'), time, id) WHERE workspace IS NULL;`)
+		return err
+	},
+}
