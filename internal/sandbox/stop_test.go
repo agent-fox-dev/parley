@@ -19,10 +19,12 @@ import (
 
 // The stop route's behaviours share one hub: each row has a sandbox of its
 // own. The rows that fail the runtime change it for the whole hub, so no
-// row runs in parallel.
+// row runs in parallel. The reconciliation waits longer than the clock is
+// advanced: a pass that ran late would read a row's record, stored ready
+// before its sandbox is created at the runtime, and fail it as lost.
 func TestStopRoute(t *testing.T) {
 	t.Parallel()
-	h := startCheckpointHub(t)
+	h := startCheckpointHubWith(t, "reconcile_interval = \"10m\"\n")
 	path := func(id string) string { return "/workspaces/demo--t1/sandboxes/" + id + "/stop" }
 	// The request comes a minute after the sandbox was made, so that the
 	// stop's times are the request's.
