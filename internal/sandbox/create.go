@@ -160,6 +160,10 @@ func (s *Service) object(rec Record) Object {
 // *server.Error, answered 500, and writes nothing either; its text is
 // scrubbed of the resolved values and the hub credential (Scrub).
 //
+// The registered workspace rule provider is asked in the same transaction
+// for the rules of the workspace's repository (the parent of a fork), whose
+// ids and bodies the record keeps for every later provisioning.
+//
 // The sandbox's hub credential is minted in the same transaction (see
 // hubAccessOf for when it has one); without one that can read the
 // repository the sandbox has no checkout. Its value is never stored: once the
@@ -196,7 +200,7 @@ func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Recor
 		s.SetHubCredential(rec.ID, values.HubCredential)
 	}
 	if tx == nil {
-		s.wakeProvisioner()
+		s.WakeProvisioner()
 	}
 	return rec, nil
 }
@@ -264,9 +268,13 @@ func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req cre
 		}
 		rec.HubTokenID, values.HubCredential = pat.TokenID, value
 	}
+	if rec.WorkspaceRules, err = s.workspaceRules(ctx, tx, rec.FamilyRoot); err != nil {
+		return Record{}, err
+	}
 	if err := Insert(ctx, tx, rec); err != nil {
 		return Record{}, err
 	}
+	s.reportStates(ctx, tx)
 	if rec.SessionID != nil {
 		if l := s.sessionLinker(); l != nil {
 			if err := l.Record(ctx, tx, *rec.SessionID, w.Slug, rec.ID); err != nil {
@@ -471,13 +479,4 @@ func (s *Service) emitCreate(ctx context.Context, tx *sql.Tx, in CreateInput, re
 		return fmt.Errorf("event of sandbox %s: %w", rec.ID, err)
 	}
 	return nil
-}
-
-// wakeProvisioner tells the provisioner that a sandbox waits for it,
-// without waiting for it to listen.
-func (s *Service) wakeProvisioner() {
-	select {
-	case s.wakeup <- struct{}{}:
-	default:
-	}
 }

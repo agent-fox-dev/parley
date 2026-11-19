@@ -64,6 +64,11 @@ type Service struct {
 	linker    SessionLinker
 	values    map[string]Values
 	hubValues map[string]string
+	// ruleProvider is the workspace rule provider a create asks, nil for
+	// none, and composer the policy composer of a provisioning, nil for the
+	// default; both guarded by mu.
+	ruleProvider WorkspaceRuleProvider
+	composer     PolicyComposer
 	// wakeup holds a token while a created sandbox waits for the
 	// provisioner.
 	wakeup chan struct{}

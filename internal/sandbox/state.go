@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -66,6 +67,28 @@ type Deps struct {
 	// ExternalURL is [server].external_url, the address a sandbox reaches the
 	// hub at; without one no sandbox gets a hub credential.
 	ExternalURL string
+	// OrgSlug returns the slug of the organization orgID, which the hub's
+	// git URL of a workspace names.
+	OrgSlug func(ctx context.Context, orgID string) (string, error)
+	// Logger receives what the provisioner cannot report otherwise; nil
+	// logs nothing.
+	Logger *slog.Logger
+	// NewTimer returns a timer of the hub's clock, on which the provisioner
+	// passes and bounds a provisioning; nil uses the real clock.
+	NewTimer func(time.Duration) Timer
+	// HoldProvisioning keeps the provisioner from running: the sandboxes a
+	// create stores stay in provisioning with their marker, and the runtime
+	// is not called for them. A test of what precedes the provisioning sets
+	// it.
+	HoldProvisioning bool
+}
+
+// logger is Deps.Logger, or a logger that writes nothing.
+func (s *Service) logger() *slog.Logger {
+	if s.deps.Logger == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return s.deps.Logger
 }
 
 // Bind sets the dependencies the stored sandboxes are worked with. It is
@@ -95,8 +118,9 @@ func (s *Service) Bind(d Deps) {
 // hold is an error matching ErrInvalidTransition, and an id no sandbox has
 // one matching ErrNotFound; nothing is written either.
 //
-// Every package leaves ready through here, so Transition reports
-// SecondsMetric: an applied transition from ready to an ended state observes
+// An applied transition reports SandboxesMetric from the counts in its
+// transaction (ReportStates). Every package leaves ready through here, so
+// Transition also reports SecondsMetric: an applied transition from ready to an ended state observes
 // the seconds since the sandbox became ready. The runtime's pause (ready to
 // provisioning and back) keeps the time it first became ready. With the
 // caller's transaction the observation is made when the update applies,
@@ -165,6 +189,7 @@ func (s *Service) transition(ctx context.Context, tx *sql.Tx, id, from, to, reas
 	if n, err := res.RowsAffected(); err != nil || n == 0 {
 		return false, nil, err
 	}
+	s.reportStates(ctx, tx)
 	if ev != nil {
 		in := *ev
 		in.ResourceType, in.ResourceID, in.Workspace, in.SessionID = "sandbox", id, &workspace, session

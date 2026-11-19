@@ -558,15 +558,57 @@ func (h *recordHub) events(t *testing.T, id string) []storedEvent {
 	return out
 }
 
-// recordingRecorder keeps the observations it is given; it ignores Add and
-// Set.
+// recordingRecorder keeps the observations it is given, the sum of what is
+// added to each series and the last value set in each.
 type recordingRecorder struct {
 	mu  sync.Mutex
 	obs map[string][]float64
+	// series maps a metric's name to its series, each under its labels
+	// written as k=v pairs in key order, joined by commas.
+	series map[string]map[string]float64
 }
 
-func (r *recordingRecorder) Add(string, map[string]string, float64) error { return nil }
-func (r *recordingRecorder) Set(string, map[string]string, float64) error { return nil }
+func (r *recordingRecorder) Add(name string, labels map[string]string, value float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seriesOf(name)[labelKey(labels)] += value
+	return nil
+}
+
+func (r *recordingRecorder) Set(name string, labels map[string]string, value float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seriesOf(name)[labelKey(labels)] = value
+	return nil
+}
+
+// seriesOf returns the series of the metric name. The caller holds r.mu.
+func (r *recordingRecorder) seriesOf(name string) map[string]float64 {
+	if r.series == nil {
+		r.series = map[string]map[string]float64{}
+	}
+	if r.series[name] == nil {
+		r.series[name] = map[string]float64{}
+	}
+	return r.series[name]
+}
+
+// labelKey writes labels as k=v pairs in key order, joined by commas.
+func labelKey(labels map[string]string) string {
+	parts := make([]string, 0, len(labels))
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+// values returns the series of the metric name: the value under each label
+// key (labelKey).
+func (r *recordingRecorder) values(name string) map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return maps.Clone(r.series[name])
+}
 
 func (r *recordingRecorder) Observe(name string, _ map[string]string, value float64) error {
 	r.mu.Lock()
@@ -626,6 +668,13 @@ type createHub struct {
 	resolver   *stubResolver
 	minter     *spyMinter
 	linker     *stubLinker
+	// clock is the hub's clock, at recordStart until the test advances it;
+	// the provisioner's pass and bound count on it.
+	clock *hubtest.JobClock
+	// rec is the hub's metrics recorder.
+	rec *recordingRecorder
+	// hooks steer the runtime client the hub is given, in front of rt's.
+	hooks *runtimeHooks
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
 	// base is the commit main of demo points at in a create world.
@@ -634,31 +683,52 @@ type createHub struct {
 
 // startCreateHub starts a create hub whose [sandbox] section holds the
 // profiles given as TOML, with the dependencies of its stored sandboxes
-// changed by adjust, in order.
+// changed by adjust, in order. Its provisioner is held: the sandboxes it
+// creates stay provisioning, with their marker, and the runtime is not
+// called for them.
 func startCreateHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	h := &createHub{probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{}}
+	return newCreateHub(t, profiles, false, adjust)
+}
+
+// startProvisionHub is startCreateHub with the provisioner running: it
+// brings every sandbox the hub creates to ready or failed, through the
+// hooks, on the hub's clock.
+func startProvisionHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	return newCreateHub(t, profiles, true, adjust)
+}
+
+func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	h := &createHub{
+		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
+		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{},
+	}
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "mirror", Variables: []string{"MIRROR_TOKEN"}})
 	cfg := hubtest.Config{
 		Server: sandboxesOn.Server,
 		TOML:   "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" + profiles,
-		Files:  sandboxesOn.Files,
+		Files:  map[string]string{"gateway-token": gatewayToken + "\n", "policy.yaml": policyContent},
 		Env:    map[string]string{secret.EnvCurrentKey: secretsKey},
-		Now:    func() time.Time { return recordStart },
+		Now:    h.clock.Now,
 	}
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc, h.workspaces, h.secrets = c.Sandbox(), c.Workspaces(), c.Secrets()
 		h.svc.RegisterSessionLinker(h.linker)
+		c.SetSandboxRecorder(h.rec)
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
 			h.minter.next, d.Mint = d.Mint, h.minter.mint
+			d.NewTimer = func(d time.Duration) sandbox.Timer { return h.clock.NewTimer(d) }
+			d.HoldProvisioning = !provision
 			for _, fn := range adjust {
 				fn(d)
 			}
 		})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
-			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+			return &hookedClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), hooks: h.hooks}, nil
 		})
 	}
 	h.Hub = hubtest.StartWith(t, cfg)
@@ -975,4 +1045,184 @@ func (h *createHub) count(t *testing.T, query string, args ...any) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// runtimeHooks steer the provisioning's runtime calls of a create hub: hook,
+// when set, is called before each EnsureProvider, CreateSandbox, WaitReady
+// and RunMain with the operation and the provider's or sandbox's name, and
+// an error it returns is the call's. They keep the command of each RunMain.
+type runtimeHooks struct {
+	mu    sync.Mutex
+	hook  func(ctx context.Context, op, name string) error
+	mains map[string][]string
+}
+
+// set makes fn the hook; nil removes it.
+func (r *runtimeHooks) set(fn func(ctx context.Context, op, name string) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hook = fn
+}
+
+// main returns the command the main process of the sandbox id was started
+// with; ok is false when none was started.
+func (r *runtimeHooks) main(id string) (command []string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	command, ok = r.mains[id]
+	return command, ok
+}
+
+func (r *runtimeHooks) before(ctx context.Context, op, name string) error {
+	r.mu.Lock()
+	fn := r.hook
+	r.mu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(ctx, op, name)
+}
+
+// hookedClient is a runtime client in front of a fake's, steered by hooks.
+type hookedClient struct {
+	runtime.Client
+	hooks *runtimeHooks
+}
+
+func (c *hookedClient) EnsureProvider(ctx context.Context, p runtime.Provider) error {
+	if err := c.hooks.before(ctx, runtime.OpEnsureProvider, p.Name); err != nil {
+		return err
+	}
+	return c.Client.EnsureProvider(ctx, p)
+}
+
+func (c *hookedClient) CreateSandbox(ctx context.Context, spec runtime.SandboxSpec) (runtime.SandboxStatus, error) {
+	if err := c.hooks.before(ctx, runtime.OpCreateSandbox, spec.Name); err != nil {
+		return runtime.SandboxStatus{}, err
+	}
+	return c.Client.CreateSandbox(ctx, spec)
+}
+
+func (c *hookedClient) WaitReady(ctx context.Context, name string) (runtime.SandboxStatus, error) {
+	if err := c.hooks.before(ctx, runtime.OpWaitReady, name); err != nil {
+		return runtime.SandboxStatus{}, err
+	}
+	return c.Client.WaitReady(ctx, name)
+}
+
+func (c *hookedClient) RunMain(ctx context.Context, name string, command []string) error {
+	if err := c.hooks.before(ctx, runtime.OpRunMain, name); err != nil {
+		return err
+	}
+	if err := c.Client.RunMain(ctx, name, command); err != nil {
+		return err
+	}
+	c.hooks.mu.Lock()
+	defer c.hooks.mu.Unlock()
+	if c.hooks.mains == nil {
+		c.hooks.mains = map[string][]string{}
+	}
+	c.hooks.mains[name] = slices.Clone(command)
+	return nil
+}
+
+// pause holds the calls that wait on it until it is released or their
+// context ends; entered is closed when the first call waits.
+type pause struct {
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func newPause() *pause { return &pause{entered: make(chan struct{}), release: make(chan struct{})} }
+
+// wait holds the caller until the pause is released (nil) or ctx ends (an
+// error of kind unavailable, as the runtime client answers then).
+func (p *pause) wait(ctx context.Context, op string) error {
+	p.once.Do(func() { close(p.entered) })
+	select {
+	case <-p.release:
+		return nil
+	case <-ctx.Done():
+		return runtime.NewError(runtime.ErrUnavailable, op, ctx.Err().Error())
+	}
+}
+
+// eventually waits up to 5 s, polling, for cond to hold, and fails the
+// test then.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited 5 s for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// settled waits until the sandbox id is no longer provisioning and returns
+// its record.
+func (h *createHub) settled(t *testing.T, id string) sandbox.Record {
+	t.Helper()
+	var rec sandbox.Record
+	eventually(t, "sandbox "+id+" to leave provisioning", func() bool {
+		var err error
+		rec, err = sandbox.Get(context.Background(), h.Store.Main(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec.State != sandbox.StateProvisioning
+	})
+	return rec
+}
+
+// hubEvent is what a test checks of a stored hub event.
+type hubEvent struct {
+	actorType string
+	metadata  map[string]any
+}
+
+// sandboxEvents returns the hub events of type typ about the sandbox id,
+// oldest first.
+func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT actor_type, metadata FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []hubEvent
+	for rows.Next() {
+		var (
+			e    hubEvent
+			meta string
+		)
+		if err := rows.Scan(&e.actorType, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(meta), &e.metadata); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// runtimeLeft returns the names of the sandboxes and providers the runtime
+// holds for the sandbox id, under the names the hub gives them.
+func (h *createHub) runtimeLeft(t *testing.T, id string) []string {
+	t.Helper()
+	var out []string
+	if _, ok := h.rt.Spec("parley", id); ok {
+		out = append(out, id)
+	}
+	for _, name := range []string{"hub", "model", "mirror"} {
+		if _, ok := h.rt.Provider("parley", id+"-"+name); ok {
+			out = append(out, id+"-"+name)
+		}
+	}
+	return out
 }

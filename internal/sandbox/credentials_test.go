@@ -13,6 +13,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
+	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
@@ -213,7 +214,7 @@ func TestNoValueLeavesTheHub(t *testing.T) {
 		hubValue   = "parley-hub-value-0001"
 		session    = "6f1c2f0e-0000-4000-8000-000000000002"
 	)
-	h := startCreateHub(t, agentProfile+fullProfile+credentialTables)
+	h := startProvisionHub(t, agentProfile+fullProfile+credentialTables)
 	h.world(t)
 	h.AddMember(t, h.org, h.dana)
 	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelValue)
@@ -224,6 +225,32 @@ func TestNoValueLeavesTheHub(t *testing.T) {
 	s := sandboxObject(t, created)
 	wantMembers(t, s, map[string]any{"credentials": nameList("model"), "exposed_secrets": nameList("NPM_TOKEN")})
 	id := s["id"].(string)
+	if rec := h.settled(t, id); rec.State != sandbox.StateReady {
+		t.Fatalf("sandbox = %s %q; want ready", rec.State, rec.StateReason)
+	}
+
+	// A second sandbox fails at the runtime with a text that holds both
+	// secret values and its hub credential's: its fail event carries none.
+	h.hooks.set(func(_ context.Context, op, name string) error {
+		if op != runtime.OpCreateSandbox {
+			return nil
+		}
+		hubValue, _ := h.rt.Provider("parley", name+"-hub")
+		return runtime.NewError(runtime.ErrInvalid, op, "refused "+modelValue+" "+npmValue+" "+hubValue.Value)
+	})
+	second := sandboxObject(t, h.post(t, "demo--t1", map[string]any{"profile": "full"}))["id"].(string)
+	if rec := h.settled(t, second); rec.State != sandbox.StateFailed {
+		t.Fatalf("second sandbox = %s; want failed", rec.State)
+	}
+	h.hooks.set(nil)
+	ev := h.sandboxEvents(t, sandbox.EventFail, second)
+	text := ""
+	if len(ev) == 1 {
+		text, _ = ev[0].metadata["error"].(string)
+	}
+	if strings.Count(text, "[redacted]") != 3 {
+		t.Errorf("fail events %+v; want one whose error has the three values redacted", ev)
+	}
 
 	// A failure after the secrets were resolved, whose text holds them: the
 	// error the create returns carries neither value.
@@ -260,6 +287,11 @@ func TestNoValueLeavesTheHub(t *testing.T) {
 	for _, v := range []string{modelValue, npmValue} {
 		if strings.Contains(all, v) {
 			t.Errorf("the value %q left the hub in a body, an event, a record or the log", v)
+		}
+	}
+	for _, v := range h.minter.minted() {
+		if strings.Contains(all, v) {
+			t.Error("a hub credential's value left the hub in a body, an event, a record or the log")
 		}
 	}
 }

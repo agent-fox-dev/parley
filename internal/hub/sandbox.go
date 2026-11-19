@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -18,6 +19,14 @@ const (
 	// sandboxRecordsHook is the name of the start hook that binds the
 	// stored sandboxes to the store.
 	sandboxRecordsHook = "sandbox_records"
+	// sandboxProvisionerHook is the name of the start hook that has the
+	// provisioner take up the provisionings an earlier process left, and
+	// sandboxProvisionerWork that of the provisioner's background work.
+	sandboxProvisionerHook = "sandbox_provisioner"
+	sandboxProvisionerWork = "sandbox_provisioner"
+	// sandboxProvisionerGrace is how long the stop waits for the
+	// provisionings it cancels: each returns once its runtime call does.
+	sandboxProvisionerGrace = 5 * time.Second
 )
 
 // composeSandbox adds the sandbox feature: it makes the feature the owner of
@@ -41,9 +50,18 @@ const (
 // the secret component's resolution, through which a create resolves the
 // profile's credentials and exposed secrets, the access component's
 // MintBound and identity.RevokeTokenByID, through which a sandbox's hub
-// credential is minted and revoked, and [server].external_url; the other
-// sandbox packages register their delete and purge hooks on the service. POST /workspaces/:slug/sandboxes creates a sandbox
-// through the service's create.
+// credential is minted and revoked, [server].external_url, the org lookup
+// that names a workspace's git remote and the hub's logger; the other
+// sandbox packages register their delete and purge hooks on the service.
+// POST /workspaces/:slug/sandboxes creates a sandbox through the service's
+// create.
+//
+// With sandboxes on, the provisioner runs as background work: it brings each
+// created sandbox up at the runtime until it is ready or failed, woken by a
+// create and every second on the hub's clock, and a start hook after the
+// runtime check reports the stored sandboxes' states and wakes it, so that
+// it takes up what a stopped process left. The stop cancels it without
+// changing a record.
 //
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
@@ -67,6 +85,11 @@ func composeSandbox(c *Composition) {
 			},
 			ResolveSecrets: c.Secrets().ResolveSecrets,
 			Mint:           c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
+			OrgSlug: func(ctx context.Context, id string) (string, error) {
+				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
+				return org.Slug, err
+			},
+			Logger: rt.Logger,
 		}
 		for _, adjust := range c.sandboxAdjusters {
 			adjust(&d)
@@ -107,6 +130,15 @@ func composeSandbox(c *Composition) {
 		// The budget is counted on the real clock: the check's deadline is a
 		// context's, whatever clock the hub was given.
 		return svc.Start(ctx, client, sandbox.CheckOptions{Recorder: rec})
+	})
+	c.AddStartHook(sandboxProvisionerHook, func(ctx context.Context, _ *Runtime) error {
+		if !svc.Enabled() {
+			return nil
+		}
+		return svc.ResumeProvisioning(ctx)
+	})
+	c.AddBackgroundWork(sandboxProvisionerWork, sandboxProvisionerGrace, func(ctx context.Context, _ *Runtime) {
+		svc.RunProvisioner(ctx)
 	})
 }
 

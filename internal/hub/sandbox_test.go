@@ -136,15 +136,27 @@ func TestRun_ChecksTheRuntimeOnceBeforeListening(t *testing.T) {
 	if svc.Client() == nil || !svc.Client().Reachable() {
 		t.Fatal("the composition's sandbox service has no reachable runtime client after the start")
 	}
-	if got, want := metrics.Calls(), []runtimetest.Metric{{Method: "set", Name: runtime.MetricUp, Value: 1}}; !reflect.DeepEqual(got, want) {
-		t.Errorf("metrics after the start = %+v, want %+v", got, want)
+	if got, want := upCalls(metrics), []runtimetest.Metric{{Method: "set", Name: runtime.MetricUp, Value: 1}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("%s after the start = %+v, want %+v", runtime.MetricUp, got, want)
 	}
 	// The recorder is the client's too: losing the gateway reports 0.
 	rt.SetUnreachable(true)
 	_, _ = svc.Client().Release(context.Background())
-	if got := metrics.Calls(); len(got) != 2 || got[1].Value != 0 {
-		t.Errorf("metrics after losing the gateway = %+v, want %s set to 0", got, runtime.MetricUp)
+	if got := upCalls(metrics); len(got) != 2 || got[1].Value != 0 {
+		t.Errorf("%s after losing the gateway = %+v, want it set to 0", runtime.MetricUp, got)
 	}
+}
+
+// upCalls are the calls of metrics that report the runtime's reachability;
+// the stored sandboxes report their own metrics to the same recorder.
+func upCalls(metrics *runtimetest.Metrics) []runtimetest.Metric {
+	var out []runtimetest.Metric
+	for _, m := range metrics.Calls() {
+		if m.Name == runtime.MetricUp {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func TestRun_ReportsTheConnectedRuntimeInTheVersionDocument(t *testing.T) {
