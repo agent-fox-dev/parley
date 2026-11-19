@@ -21,15 +21,19 @@ type Resolver interface {
 
 // insideRanges are the addresses of the hub's own networks, which a
 // subscription must not be able to reach: loopback, link-local (holding the
-// cloud metadata address 169.254.169.254), private, unspecified, multicast
-// and unique-local (holding fd00:ec2::254).
+// cloud metadata address 169.254.169.254), private, the shared address space
+// 100.64.0.0/10 that carrier-grade NAT and some cloud and container
+// networks use inside, "this network" 0.0.0.0/8 (holding the unspecified
+// address, which some systems connect to as the host itself), multicast,
+// and IPv6's unspecified address and unique-local (holding fd00:ec2::254).
 var insideRanges = []netip.Prefix{
 	netip.MustParsePrefix("127.0.0.0/8"),
 	netip.MustParsePrefix("169.254.0.0/16"),
 	netip.MustParsePrefix("10.0.0.0/8"),
 	netip.MustParsePrefix("172.16.0.0/12"),
 	netip.MustParsePrefix("192.168.0.0/16"),
-	netip.MustParsePrefix("0.0.0.0/32"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("224.0.0.0/4"),
 	netip.MustParsePrefix("::1/128"),
 	netip.MustParsePrefix("fe80::/10"),
