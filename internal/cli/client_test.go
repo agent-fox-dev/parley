@@ -156,6 +156,21 @@ func slowProbe() *cobra.Command {
 	})
 }
 
+// patientProbe builds "probe patient <name>", "probe get" that states a
+// request timeout of 10 s: far beyond any answer a test makes it wait for, so
+// that the answer lands in time however the test process is scheduled.
+func patientProbe() *cobra.Command {
+	return declare(command{
+		Name:        "patient",
+		Description: "Get a thing within 10 s",
+		Method:      http.MethodGet,
+		Path:        "/things/:name",
+		Args:        []argSpec{{Name: "name", Required: true}},
+		Auth:        authUser,
+		Timeout:     10 * time.Second,
+	})
+}
+
 // halfBodyThenStall is a handler that announces a body of 20 bytes, sends
 // 10 of them and then stalls until the client gives up, or 2 s.
 func halfBodyThenStall(w http.ResponseWriter, r *http.Request) {
@@ -184,7 +199,9 @@ func TestClient_AbandonsARequestWithoutACompleteAnswerInTime(t *testing.T) {
 		timeout time.Duration
 	}{
 		{name: "the default, shortened, before a late answer", shortened: 100 * time.Millisecond, command: "get", handler: answerAfter(2 * time.Second), timeout: 100 * time.Millisecond},
-		{name: "a command's own timeout, answered in time", command: "slow", handler: answerAfter(200 * time.Millisecond)},
+		// The answer comes after the shortened default, never before it, so it
+		// lands only under the command's own timeout.
+		{name: "a command's own timeout, answered in time", shortened: 100 * time.Millisecond, command: "patient", handler: answerAfter(300 * time.Millisecond)},
 		{name: "a command's own timeout, before a late answer", command: "slow", handler: answerAfter(2 * time.Second), timeout: 300 * time.Millisecond},
 		{name: "half a body, then nothing", shortened: 100 * time.Millisecond, command: "get", handler: halfBodyThenStall, timeout: 100 * time.Millisecond},
 	}
@@ -192,7 +209,7 @@ func TestClient_AbandonsARequestWithoutACompleteAnswerInTime(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			hub := newStubHub(t).handle(http.MethodGet, "/api/v1/things/x", tt.handler)
-			opts := withProbes(defaultOptions(), slowProbe)
+			opts := withProbes(defaultOptions(), slowProbe, patientProbe)
 			if tt.shortened != 0 {
 				opts.requestTimeout = tt.shortened
 			}
