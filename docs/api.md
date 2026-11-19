@@ -2505,7 +2505,7 @@ absent, so a client may send back what it read:
 | `token` | an object `{name, permissions, paths, expires}` of the token to mint with the fork, bound to it and owned by the caller: `name` a string, absent `fork:<fork slug>`; `permissions` and `paths` lists of strings, judged by the minting component as for [`POST /api/v1/workspaces/{slug}/tokens`](#post-apiv1workspacesslugtokens); `expires` a string, a whole number above zero followed by `m`, `h` or `d`, and the token's `expires_at` is the fork's creation time plus `expires`. Absent `expires`, the token never expires (`expires_at` `null`). A PAT caller must hold `tokens:manage` and is held to the subset rule |
 | `purpose` | a string of at most 1024 characters (Unicode code points); absent, `null` |
 | `session_id` | a UUID in its hyphenated form, the session the fork is created in, judged by the session-linking rule for the caller and the parent; the fork stores it, and its event carries it, as the rule gives it back, in lower case, and the link of the fork to the session is recorded in the fork's transaction. No session component is part of the hub yet, so no session exists and every `session_id` is refused with `400` `unknown_session` |
-| `sandbox` | an object, the sandbox to create with the fork, handed as received, unread, to the sandbox component with the fork's `session_id` and `purpose` as defaults; the component judges it and answers the sandbox object or its refusal, on which no fork is created. No sandbox component is part of the hub yet, so every `sandbox` is refused with `404` `sandboxes_disabled` and no fork is created |
+| `sandbox` | an object, the sandbox to create with the fork, handed as received, unread, to the sandbox component with the fork's `session_id` and `purpose` as defaults; the component judges it as the body of [`POST /api/v1/workspaces/{slug}/sandboxes`](#post-apiv1workspacesslugsandboxes) on the new fork (a PAT's `sandboxes:write` first, then the body, the session, the secrets and the quotas; a `purpose` taken from the fork is cut to 200 characters) and answers the sandbox object, stored in the fork's transaction with its hub credential and its `parley.sandbox.create` event, or its refusal, on which no fork is created. The sandbox is provisioned once the fork's transaction has committed, within about a second. On a hub without sandboxes every `sandbox` is refused with `404` `sandboxes_disabled` and no fork is created |
 
 ```json
 {"name":"task1","ref":"release","ttl":"24h","purpose":"fix loader"}
@@ -2570,7 +2570,7 @@ object as it gave it:
 | `403` `insufficient_scope` | a PAT without `workspaces:write`; a PAT without `tokens:manage` whose body has `token` (`token: minting a token needs the scope tokens:manage`); or a token beyond what the calling PAT holds, with the subset rule's messages |
 | `403` `forbidden` | the admin token, whatever the body (`a fork needs a user as owner; the admin token cannot create one`) |
 | `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug (`workspace not found`) |
-| `404` `sandboxes_disabled` | the body has a `sandbox`: no sandbox component is part of the hub (`sandboxes are not enabled on this hub`); no fork is created |
+| `404` `sandboxes_disabled` | the body has a `sandbox` and the hub has no `[sandbox]` section, so no sandbox component is part of it (`sandbox: no sandbox component is available on this hub to create one`); no fork is created |
 | the sandbox component's | the body has a `sandbox` the sandbox component refuses: its status, `error_type`, message and extra members unchanged (such as `429` `sandbox_capacity` with `limit`, `maximum` and `current`); no fork is created, also when a token was asked for |
 | `409` `workspace_busy` | the parent's clone has not finished, or a reclone, archive or delete runs on it |
 | `409` `workspace_archived` | the parent is archived |
@@ -7650,6 +7650,283 @@ The message names the first scope the token lacks, or the first of the
 hub credential's globs no glob of the token covers, or says that the token
 is limited to paths and the hub credential is not; do not branch on it.
 
+## The sandbox object
+
+A sandbox is an isolated environment, run by the sandbox runtime, attached
+to a workspace (usually a task fork) and started with it checked out. Every
+answer that shows a sandbox shows this object, with exactly these members:
+
+```json
+{"id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","workspace":"demo--t1","session_id":null,"profile":"agent","purpose":"run tests","state":"ready","state_reason":null,"command":["make","test"],"env":{"CI":"1"},"exit_code":null,"checkout":{"path":"/workspace","ref":"main","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","branch":"t1"},"image":"img:1","cpu":"2","memory":"4Gi","gpu":0,"credentials":["model"],"exposed_secrets":["NPM_TOKEN"],"workspace_rules":[],"hub_access":{"scopes":["audit:write","changes:read","changes:write","git:read","git:write","sessions:write"],"paths":null,"expires_at":"2026-11-18T13:00:00Z"},"policy_revision":0,"expires_at":"2026-11-18T13:00:00Z","idle_timeout_seconds":1800,"last_activity_at":"2026-11-18T12:00:00Z","checkpoint":null,"restored_from":null,"runtime_reachable":true,"labels":{"team":"core"},"created_by":{"actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"dana"},"created_at":"2026-11-18T12:00:00Z","updated_at":"2026-11-18T12:00:04Z","ended_at":null}
+```
+
+| Member | Value |
+|---|---|
+| `id` | `sbx_` and 32 lowercase hexadecimal characters |
+| `workspace` | the slug of the workspace the sandbox is attached to |
+| `session_id` | the agent session it belongs to, or `null` |
+| `profile` | the name of the profile it was created from |
+| `purpose` | a string of at most 200 characters, `""` when none was given |
+| `state` | `provisioning`, `ready`, `stopped`, `completed`, `failed` or `deleted` |
+| `state_reason` | why it is in its state, or `null`; after a failed provisioning `provision_failed`, `checkout_failed` or `credential_missing` |
+| `command` | the main process's command, a list of strings, or `null` for a sandbox driven by exec |
+| `env` | the `env` the creator gave, `{}` when none |
+| `exit_code` | the main process's exit code once it ended, else `null` |
+| `checkout` | `{path, ref, sha, branch}`: the working directory (`/workspace`), the starting ref, the commit checked out and the work branch (`null` on a workspace that is not a fork); `null` when no checkout is made |
+| `image`, `cpu`, `memory`, `gpu` | the profile's values when the sandbox was created |
+| `credentials` | the names of the credentials attached to it, sorted |
+| `exposed_secrets` | the names of the secrets whose values its environment holds, sorted; never a value |
+| `workspace_rules` | the ids of the workspace sandbox rules recorded at its creation |
+| `hub_access` | `{scopes, paths, expires_at}` of its hub credential (`scopes` sorted, `paths` `null` without a limit), or `null` when it has none; never the credential's value |
+| `policy_revision` | `0` at creation |
+| `expires_at` | when it expires |
+| `idle_timeout_seconds` | the profile's idle timeout in seconds, `0` when the idle stop is off |
+| `last_activity_at` | the time of its last activity; at creation its creation time |
+| `checkpoint` | its latest checkpoint, or `null` |
+| `restored_from` | the id of the sandbox whose checkpoint it was restored from, or `null` |
+| `runtime_reachable` | `false` while the sandbox runtime cannot be reached; the other members then show what the hub stored |
+| `labels` | the creator's labels, `{}` when none |
+| `created_by` | `{actor_type, actor_id, username}` of the creating credential's user |
+| `created_at`, `updated_at` | [timestamps](#timestamps-and-durations) in UTC, whole seconds |
+| `ended_at` | when it stopped, completed, failed or was deleted; `null` until then, and again after a start |
+
+The states move only so: a new sandbox is `provisioning`; `provisioning`
+becomes `ready` or `failed`; `ready` becomes `completed`, `failed`,
+`stopped` or `provisioning`; `stopped`, `completed` and `failed` become
+`provisioning` again (a start); every state but `deleted` becomes
+`deleted`, which is final. Each move is conditional on the state the
+sandbox has, so two paths racing for one sandbox make one move and write
+one event.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes`
+
+Creates a sandbox on the workspace. It is a write route of the
+[sandbox routes](#sandbox-routes) that acts for a user: it needs a PAT's
+`sandboxes:write`, write access to the workspace, and a caller that is not
+the admin token. It takes an `Idempotency-Key`.
+
+Every body member is optional; a member that is `null` counts as absent, an
+absent body is `{}`, and members the route does not define are ignored.
+
+| Member | Value |
+|---|---|
+| `profile` | the name of a configured profile; absent, the profile marked `default` |
+| `command` | a list of 1 to 256 non-empty strings, the main process; absent, `null`, an idle sandbox driven by exec |
+| `env` | an object of at most 64 strings; each key matches `^[A-Za-z_][A-Za-z0-9_]*$`, does not start with `PARLEY_` or `OPENSHELL_` and is not a secret the profile exposes, and key and value together have at most 8,192 bytes |
+| `checkout` | `false` for no checkout, or an object `{ref, branch}` of strings: `ref` a branch, tag or commit id of the workspace's repository (absent, the fork's base branch, or the default branch of a workspace that is not a fork); `branch` a valid branch name, the work branch, on a task fork only (absent, the fork's name) |
+| `restore_from` | the id of a sandbox of the same workspace whose latest checkpoint has `ok` true; not with `checkout: false` or a profile whose `hub_access` is `none` |
+| `ttl` | a [duration](#timestamps-and-durations) from `1m` to the profile's `ttl`; absent, the profile's `ttl` |
+| `purpose` | a string of at most 200 characters; absent, `""` |
+| `labels` | an object of at most 16 strings; a key is 1 to 63 letters, digits, `.`, `_` and `-`, begins and ends with a letter or digit and does not start with `parley.` or `openshell.`; a value has at most 256 bytes and no control character |
+| `session_id` | a session the session-linking rule accepts for the caller and the workspace; absent, the fork's session when the workspace is a fork that has one, else `null` |
+
+```json
+{"profile":"agent","command":["make","test"],"env":{"CI":"1"},"ttl":"1h","purpose":"run tests","labels":{"team":"core"}}
+```
+
+`expires_at` is the creation time plus `ttl`, and never later than a task
+fork's `expires_at`. The answer is `201 Created` with the sandbox object in
+state `provisioning`; the hub then provisions it in the background (see
+[Provisioning a sandbox](#provisioning-a-sandbox)), and the sandbox becomes
+`ready` or `failed` without a further request. The sandbox and a
+`parley.sandbox.create` event are written in one store transaction:
+
+```json
+{"seq":42,"id":"…","type":"parley.sandbox.create","time":"2026-11-18T12:00:00Z","workspace":"demo--t1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"sandbox","resource_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","action":"create","session_id":null,"metadata":{"command":"make","credentials":["model"],"expires_at":"2026-11-18T13:00:00Z","exposed_secrets":["NPM_TOKEN"],"hub_access":{"scopes":["audit:write","changes:read","changes:write","git:read","git:write","sessions:write"],"paths":null,"expires_at":"2026-11-18T13:00:00Z"},"profile":"agent","purpose":"run tests","restored_from":null,"workspace_rules":[]}}
+```
+
+`metadata.command` is the command's first argument, or `null`.
+
+**Credentials and exposed secrets.** Before anything is created the hub
+resolves, along the workspace's resolution chain (workspace, then the
+parent for a fork whose owner can write to it, then the org, then the
+owner; the secret half of [`GET /api/v1/workspaces/{slug}/vars/resolved`](#get-apiv1workspacesslugvarsresolved)), the secret of
+every credential of the profile's `credentials` and `optional_credentials`
+and every name of its `expose_secrets` and `optional_expose_secrets`. An
+optional name that resolves nowhere is skipped. `credentials` then names
+the attached credentials and `exposed_secrets` the placed secrets. Only the
+profile decides which secrets a sandbox can read: no request member, label
+or `env` exposes one. Values are read again when the sandbox is
+provisioned.
+
+**The hub credential.** With a profile whose `hub_access` is `fork`, a
+creating credential that holds at least one of `git:read`, `git:write`,
+`changes:read`, `changes:write`, `sessions:write` and `audit:write` (an API
+key holds all six), and `[server].external_url` set, the hub mints in the
+same transaction a PAT bound to the sandbox's workspace, owned by the
+creating user and named `sandbox:<id>`, with exactly those of the six scopes
+the creating credential holds by name, the creating PAT's `paths`, and the
+sandbox's `expires_at` as its expiry; its `parley.token.bind` event is
+written with it (see [Workspace-bound tokens](#workspace-bound-tokens)).
+Otherwise `hub_access` is `null` and nothing is minted. The checkout is
+made only for a sandbox whose hub credential can read git (`checkout` is
+`null` otherwise). The credential's value is never stored and appears in no
+answer, event or log line.
+
+**Quotas.** The hub counts the sandboxes in state `provisioning` or `ready`
+against four limits of the `[sandbox]` section (see
+[configuration.md](configuration.md#sandboxes)), in this order:
+`max_sandboxes` (the hub), `max_per_org` (the workspaces of the
+workspace's org and their forks), `max_per_workspace` (the workspace and
+its forks; a fork counts toward its parent's) and `max_per_user` (the
+sandboxes the creating user created). The count and the insert are one
+step, so concurrent requests never pass a limit. A request at a limit is
+answered with the first limit reached:
+
+```json
+{"error":{"code":429,"message":"sandbox limit reached: max_per_workspace","error_type":"sandbox_capacity","limit":"max_per_workspace","maximum":50,"current":50}}
+```
+
+The checks run in this order, the first that fails answering, and a refused
+request stores no sandbox, mints no token, writes no event and asks the
+runtime nothing:
+
+| Status | When |
+|---|---|
+| `201 Created` | the sandbox was created; the body is the sandbox object |
+| `404` `sandboxes_disabled` | the hub has no `[sandbox]` section |
+| `403` `insufficient_scope` | a PAT without `sandboxes:write` |
+| `404` `not_found` | the caller cannot read the workspace, or no workspace has the slug |
+| `403` `forbidden` | read access only; or the admin token (`the admin token cannot create a sandbox`) |
+| `400` `invalid_request` | the body is not an object, or a member breaks its rule, the message naming the member: `profile: no profile "nope"; name one of agent, plain`, `profile: no profile is marked default; name one of …`, `ttl: must be from 1m to 4h`, `command: must have 1 to 256 arguments`, `env: key "PARLEY_X" must not start with PARLEY_ or OPENSHELL_`, `checkout: branch is taken on a task fork only`, `checkout: ref "nope" names no commit of workspace "demo"`, `restore_from: the sandbox "…" has no checkpoint to restore`, … |
+| `400` `unknown_session` | the session-linking rule refuses `session_id`, or the hub has no session component (`session_id: no session "<id>"`) |
+| `409` `workspace_archived` | the workspace is archived |
+| `409` `parent_archived` | the workspace is a fork whose parent is archived |
+| `409` `workspace_busy` | the workspace's clone has not finished, or a maintenance operation runs on it |
+| `409` `workspace_not_ready` | the workspace's clone failed |
+| `503` `secrets_unavailable` | the secret store cannot be read: no encryption key, or a value it cannot decrypt |
+| `422` `credential_missing` | a required credential's secret or a required exposed secret resolves nowhere: `credentials` and `secrets` name the missing ones, sorted, and `scopes_searched` the scopes of the chain searched, in order |
+| `429` `sandbox_capacity` | a quota would be exceeded: `limit`, `maximum`, `current` |
+| `500` `internal` | minting the hub credential, writing the sandbox or its event, or the commit failed; nothing is stored |
+
+```json
+{"error":{"code":422,"message":"missing credentials model; searched workspace, parent, org, user","error_type":"credential_missing","credentials":["model"],"secrets":[],"scopes_searched":["workspace","parent","org","user"]}}
+```
+
+The route never answers `502`: it does not wait for the runtime, and an
+unreachable runtime shows as a sandbox that ends `failed` with
+`provision_failed`.
+
+## Provisioning a sandbox
+
+Once the creating transaction has committed, the hub provisions the sandbox
+in the background, at most 8 at once, each one at most once at a time. It
+looks for sandboxes to provision when a create wakes it, every second, and
+at every start, so a sandbox that was being provisioned when the hub
+stopped is provisioned again from the first step at the next start, and
+ends `ready` or `failed` with exactly one event. Before the first step the
+hub removes whatever the runtime holds of the sandbox (the sandbox and the
+providers labelled `parley.sandbox=<id>` or named after it), which a
+provisioning the hub stopped in may have left, with the providers'
+secret values.
+
+1. It resolves the credentials and exposed secrets again; a required one
+   that is gone ends the sandbox `failed` with `credential_missing`.
+2. It registers at the runtime one provider per attached credential, named
+   `<id>-<credential>`, and one for the hub credential, `<id>-hub`, each
+   labelled `parley.sandbox=<id>`. After a restart, the hub credential
+   minted earlier is revoked and replaced by one with the same scopes,
+   paths and expiry.
+3. It creates the sandbox at the runtime, named by its id, with the
+   profile's `image`, `cpu`, `memory` and `gpu`, the working directory
+   `/workspace`, the providers, the environment below and the policy: the
+   profile's base policy with the protected rules — the hub rule (the hub
+   credential's provider on the scheme, host and port of
+   `[server].external_url`, for the API and git paths of the sandbox's
+   workspace) when it has a hub credential, then one rule per attached
+   credential naming its provider — and the rules a registered policy
+   composer adds.
+4. It checks the repository out (below) and, with `restore_from`, has the
+   working directory restored from the source sandbox's checkpoint.
+5. It starts `command` when there is one.
+6. It moves the sandbox to `ready` and writes `parley.sandbox.ready` (actor
+   `system`, metadata `checkout`) with that change.
+
+The environment of the sandbox is, later entries winning: the creator's
+`env`; the profile's `env`; each placed exposed secret under its own name
+with its real value; `PARLEY_WORKSPACE` (the slug), `PARLEY_SANDBOX_ID`,
+`PARLEY_SESSION_ID` (only with a session) and, with a hub credential,
+`PARLEY_ENDPOINT_URL` (`[server].external_url`) and `PARLEY_REMOTE` (the
+workspace's git URL on the hub). The variables an attached credential's
+provider profile declares, and `PARLEY_API_KEY` for the hub credential, are
+left to the runtime, which puts the credential's placeholder there; the
+real value of a credential never enters the sandbox.
+
+The checkout, when the sandbox has one, runs these git commands in the
+sandbox: a credential helper for the hub's scheme and host that answers
+with the username `x-token-auth` and the content of `PARLEY_API_KEY`; `git
+clone --filter=blob:none --no-checkout` of `PARLEY_REMOTE` into
+`/workspace`; on a fork, a checkout of the fork's own branch named
+`checkout.branch` when it has one, else the creation of that branch at
+`checkout.ref` and its checkout; on a workspace that is not a fork, a
+detached checkout of `checkout.ref`; `user.name` and `user.email` set to
+the creating user's; and `git rev-parse HEAD`, which becomes
+`checkout.sha`.
+
+A failure at any step, or a provisioning that has not ended after 10
+minutes, moves the sandbox to `failed` with `state_reason`
+`credential_missing` (step 1), `checkout_failed` (a git command that fails)
+or `provision_failed` (every other step, an unreachable runtime included),
+sets `ended_at`, removes whatever the runtime holds of the sandbox (by its
+label and its names, also what an earlier run left), revokes the hub
+credential and writes `parley.sandbox.fail` (actor `system`, metadata
+`reason` and `error`). Any text the hub writes about a sandbox into an
+event, an error or its log has every resolved value of that sandbox (its
+credentials' secrets, its exposed secrets of at least 8 characters and its
+hub credential) replaced by `[redacted]`, and is cut to 1,024 bytes. When
+the sandbox was moved meanwhile (deleted), the provisioning changes nothing
+in it, writes no event and removes what it created.
+
+## `GET /api/v1/workspaces/{slug}/sandboxes/{id}`
+
+Reads one sandbox of the workspace. It is a read route of the
+[sandbox routes](#sandbox-routes): a PAT needs `sandboxes:read` (or
+`sandboxes:write`, which the scope check counts for it), and the caller
+read access to the workspace. The answer is `200` with the sandbox object
+as stored, in every state, `deleted` included, with `runtime_reachable`
+from the runtime client.
+
+An id that is not `sbx_` and 32 lowercase hexadecimal characters, that no
+sandbox has, or that names a sandbox of another workspace is answered with
+the same body:
+
+```json
+{"error":{"code":404,"message":"the workspace has no such sandbox","error_type":"sandbox_not_found"}}
+```
+
+| Query parameter | Value |
+|---|---|
+| `wait_for` | `ready`, held until the state is anything but `provisioning`, or `ended`, held until it is `stopped`, `completed`, `failed` or `deleted` |
+| `wait` | the most seconds to hold the request, a whole number from 1 to 60 |
+
+The two are given together. The request is answered at once when the
+condition holds, within a second of the change that makes it hold, or when
+`wait` seconds have passed, always `200` with the sandbox as it is then. A
+client that leaves ends the wait. One without the other, another
+`wait_for`, or a `wait` outside 1 to 60 is `400 invalid_request` (`wait_for
+and wait are given together`, `wait_for must be ready or ended`, `wait
+must be a whole number of seconds from 1 to 60`), answered at once.
+
+## `GET /api/v1/workspaces/{slug}/sandboxes`
+
+Lists the workspace's sandboxes, a read route as above, as a
+[list](#lists), newest first by `created_at` and then by `id`, both
+descending.
+
+| Query parameter | Value |
+|---|---|
+| `state` | repeatable; the sandboxes in any of the given states. Absent, every state but `deleted` |
+| `session_id` | only the sandboxes of this session |
+| `label` | repeatable, `key=value`; only the sandboxes that have every given label |
+| `include_forks` | `true` or `false`; with `true` on a workspace that is not a fork, also the sandboxes of those of its forks the caller can read (and a bound PAT's binding covers); ignored on a fork |
+| `limit`, `cursor` | as for every [list](#lists) |
+
+An unknown `state` (`state must be one of provisioning, ready, stopped,
+completed, failed, deleted`), a `label` without `=` or with an empty key
+(`label must be key=value`) and an `include_forks` that is neither `true`
+nor `false` are `400 invalid_request`. A workspace without sandboxes
+answers `{"items":[],"next_cursor":null}`.
+
 ## `GET /api/v1/sandbox-profiles`
 
 Lists the sandbox profiles of the hub's configuration (see
@@ -7714,12 +7991,9 @@ without sandboxes the admin token gets `404 sandboxes_disabled` (see
 The answer is `200` with a [list](#lists): the sandbox objects as the hub
 stores them, newest first by `created_at` and then by `id`, both
 descending. It is read from the hub's own records and asks the sandbox
-runtime nothing, so it answers the same while the runtime is unreachable.
-Until the hub stores sandboxes the list is empty:
-
-```json
-{"items":[],"next_cursor":null}
-```
+runtime nothing, so it answers the same while the runtime is unreachable;
+each object's `runtime_reachable` is the runtime client's flag (see
+[The sandbox object](#the-sandbox-object)).
 
 | Query parameter | Value |
 |---|---|

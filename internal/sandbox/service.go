@@ -3,6 +3,8 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"sync"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -35,6 +37,12 @@ type RuntimeVersion struct {
 // is loaded, so that the parts composed after it can keep it; they read it
 // once the hub serves. Configure and Start are called once, in that order,
 // before the first request; after that the service does not change.
+//
+// The service also holds the stored sandboxes: Bind gives it the store, the
+// clock, the event component, the metrics recorder and the repositories in
+// a start hook, Create stores a new sandbox and Transition moves a record
+// from one state to another. The sandbox packages register their hooks on
+// it, and the session feature its session-linking rule.
 type Service struct {
 	settings    *Settings
 	externalURL string
@@ -44,11 +52,44 @@ type Service struct {
 	scrubber    *scrub.Scrubber
 	// source is what the hub-wide list reads; nil until one is registered.
 	source Source
+	// deps are what the stored sandboxes are worked with, set by Bind.
+	deps Deps
+	// deleteHooks and purgeHooks are the clean-up other sandbox packages
+	// register for the records.
+	deleteHooks, purgeHooks hooks
+	// mu guards linker, the session-linking rule (nil for none), values,
+	// the secret values each sandbox's text is scrubbed of, and hubValues,
+	// the value of each hub credential this process minted, which is never
+	// stored.
+	mu        sync.Mutex
+	linker    SessionLinker
+	values    map[string]Values
+	hubValues map[string]string
+	// ruleProvider is the workspace rule provider a create asks, nil for
+	// none, and composer the policy composer of a provisioning, nil for the
+	// default; both guarded by mu.
+	ruleProvider WorkspaceRuleProvider
+	composer     PolicyComposer
+	// restorer restores a checkpoint into a sandbox created from one, nil
+	// for none; guarded by mu.
+	restorer Restorer
+	// unstored maps each sandbox created in a caller's transaction, whose
+	// record may not be committed, to when the provisioner checks that it
+	// is; guarded by mu.
+	unstored map[string]time.Time
+	// wakeup holds a token while a created sandbox waits for the
+	// provisioner.
+	wakeup chan struct{}
+	// changes is notified by the report of every applied transition, for
+	// the reads that wait for a sandbox.
+	changes notifier
 }
 
 // NewService returns the service of a hub whose configuration is not loaded
 // yet: sandboxes are off until Configure says otherwise.
-func NewService() *Service { return &Service{settings: &Settings{}} }
+func NewService() *Service {
+	return &Service{settings: &Settings{}, wakeup: make(chan struct{}, 1)}
+}
 
 // Configure checks the [sandbox] section of cfg (see FromConfig) and keeps
 // its settings and [server].external_url. It returns the section's error

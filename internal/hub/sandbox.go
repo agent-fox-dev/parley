@@ -3,15 +3,33 @@ package hub
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/openshell"
+	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
-// sandboxCheckHook is the name of the start hook that runs the sandbox
-// runtime's start-up check.
-const sandboxCheckHook = "sandbox_runtime_check"
+const (
+	// sandboxCheckHook is the name of the start hook that runs the sandbox
+	// runtime's start-up check.
+	sandboxCheckHook = "sandbox_runtime_check"
+	// sandboxRecordsHook is the name of the start hook that binds the
+	// stored sandboxes to the store.
+	sandboxRecordsHook = "sandbox_records"
+	// sandboxProvisionerHook is the name of the start hook that has the
+	// provisioner take up the provisionings an earlier process left, and
+	// sandboxProvisionerWork that of the provisioner's background work.
+	sandboxProvisionerHook = "sandbox_provisioner"
+	sandboxProvisionerWork = "sandbox_provisioner"
+	// sandboxProvisionerGrace is how long the stop waits for the
+	// provisionings it cancels: each returns once its runtime call does.
+	sandboxProvisionerGrace = 5 * time.Second
+)
 
 // composeSandbox adds the sandbox feature: it makes the feature the owner of
 // the [sandbox] section, checks the section right after the load (the
@@ -26,9 +44,41 @@ const sandboxCheckHook = "sandbox_runtime_check"
 // declared through the service, scrub the runtime errors they answer with
 // the hub's scrubber.
 //
+// The sandbox records are a table of their own, created whether sandboxes
+// are on or not, so that turning them on later finds it. A start hook binds
+// the service to the store, the hub's clock, the event component, through
+// which a create and a transition write their events, the metrics recorder
+// the workspaces' repositories, in which a create resolves its checkout,
+// the secret component's resolution, through which a create resolves the
+// profile's credentials and exposed secrets, the access component's
+// MintBound and identity.RevokeTokenByID, through which a sandbox's hub
+// credential is minted and revoked, [server].external_url, the org lookup
+// that names a workspace's git remote, the user lookup that gives a
+// checkout its commit identity and the hub's logger; the other
+// sandbox packages register their delete and purge hooks on the service.
+// POST /workspaces/:slug/sandboxes creates a sandbox through the service's
+// create, and so does POST /workspaces/:slug/forks with a sandbox member,
+// in the fork's transaction: with sandboxes on, the same start hook
+// registers the service as the fork component's sandbox component, and
+// with sandboxes off it registers nothing, so that such a fork create is
+// refused 404 sandboxes_disabled; GET /workspaces/:slug/sandboxes/:id reads
+// one, waiting on the service's transitions until the hub begins to stop at
+// the latest, and GET
+// /workspaces/:slug/sandboxes lists a workspace's, with its forks' that the
+// access component's readable set holds; GET /sandboxes lists the stored
+// sandboxes of every workspace through the service's source.
+//
+// With sandboxes on, the provisioner runs as background work: it brings each
+// created sandbox up at the runtime until it is ready or failed, woken by a
+// create and every second on the hub's clock, and a start hook after the
+// runtime check reports the stored sandboxes' states and wakes it, so that
+// it takes up what a stopped process left. The stop cancels it without
+// changing a record.
+//
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
-// SetSandboxRuntime and parleyd passes the metrics registry with
+// SetSandboxRuntime, and a dependency of the stored sandboxes with
+// AdjustSandbox, and parleyd passes the metrics registry with
 // SetSandboxRecorder.
 func composeSandbox(c *Composition) {
 	svc := sandbox.NewService()
@@ -37,9 +87,51 @@ func composeSandbox(c *Composition) {
 	if err := sandbox.Register(c.registry); err != nil {
 		c.errs = append(c.errs, err)
 	}
+	c.AddSchemaStep(sandbox.SchemaStep)
+	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
+		git := gitFor(c.env)
+		d := sandbox.Deps{
+			Store: rt.Store, Now: rt.Now, Events: c.Events(), Recorder: c.sandboxRecorder,
+			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
+				return git.Open(ctx, c.workspaces.RepoPath(slug))
+			},
+			ResolveSecrets: func(ctx context.Context, q access.Querier, slug string, names []string) (secret.SecretResolution, error) {
+				if q == nil {
+					return c.Secrets().ResolveSecrets(ctx, slug, names)
+				}
+				return c.Secrets().ResolveSecretsIn(ctx, q, slug, names)
+			},
+			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
+			OrgSlug: func(ctx context.Context, id string) (string, error) {
+				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
+				return org.Slug, err
+			},
+			User: func(ctx context.Context, id string) (identity.User, error) {
+				return identity.UserByID(ctx, rt.Store.Main(), id)
+			},
+			Logger:   rt.Logger,
+			Readable: c.access.Readable, Shutdown: c.ShuttingDown(),
+		}
+		for _, adjust := range c.sandboxAdjusters {
+			adjust(&d)
+		}
+		svc.Bind(d)
+		// Without the component the fork create refuses a sandbox 404
+		// sandboxes_disabled, as a hub with sandboxes off must.
+		if svc.Enabled() {
+			c.Forks().RegisterSandbox(svc)
+		}
+		return nil
+	})
 	c.addConfigCheck(svc.Configure)
 	c.AddRoute(svc.ProfilesRoute())
 	c.AddRoute(svc.SandboxesRoute())
+	c.AddRoute(svc.CreateRoute())
+	c.AddRoute(svc.GetRoute())
+	c.AddRoute(svc.ListRoute())
+	// Registered while the hub composes, so that a test's source, registered
+	// after, replaces it; the list is refused while sandboxes are off.
+	svc.RegisterSource(svc.StoredSource())
 	c.addVersionMember(func() map[string]any {
 		if v, ok := svc.Version(); ok {
 			return map[string]any{"sandbox_runtime": v}
@@ -70,6 +162,15 @@ func composeSandbox(c *Composition) {
 		// context's, whatever clock the hub was given.
 		return svc.Start(ctx, client, sandbox.CheckOptions{Recorder: rec})
 	})
+	c.AddStartHook(sandboxProvisionerHook, func(ctx context.Context, _ *Runtime) error {
+		if !svc.Enabled() {
+			return nil
+		}
+		return svc.ResumeProvisioning(ctx)
+	})
+	c.AddBackgroundWork(sandboxProvisionerWork, sandboxProvisionerGrace, func(ctx context.Context, _ *Runtime) {
+		svc.RunProvisioner(ctx)
+	})
 }
 
 // openShellRuntime is the default runtime factory: the client over the
@@ -91,6 +192,14 @@ func (c *Composition) SetSandboxRuntime(f sandbox.RuntimeFactory) {
 		f = openShellRuntime
 	}
 	c.sandboxRuntime = f
+}
+
+// AdjustSandbox adds fn to the functions that change the dependencies of
+// the stored sandboxes after the start hook has built them and before it
+// binds them, in the order they were added. Tests replace a collaborator
+// with it.
+func (c *Composition) AdjustSandbox(fn func(*sandbox.Deps)) {
+	c.sandboxAdjusters = append(c.sandboxAdjusters, fn)
 }
 
 // SetSandboxRecorder sets the recorder the sandbox feature and its runtime

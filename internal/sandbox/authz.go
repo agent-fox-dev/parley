@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/identity"
@@ -172,11 +173,12 @@ func (s *Service) scrub(text string) string {
 }
 
 // HubAccess is what a sandbox's hub credential, the PAT the hub minted for
-// it, may do: its scopes and its paths limit, nil for none. A sandbox
-// without a hub credential has no HubAccess (nil).
+// it, may do: its scopes and its paths limit, nil for none, and until when.
+// A sandbox without a hub credential has no HubAccess (nil).
 type HubAccess struct {
-	Scopes []string `json:"scopes"`
-	Paths  []string `json:"paths"`
+	Scopes    []string  `json:"scopes"`
+	Paths     []string  `json:"paths"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // Covers reports whether the caller p may act through a sandbox whose hub
