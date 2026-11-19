@@ -2613,10 +2613,10 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	return h
 }
 
-// sandbox stores a ready sandbox of ws created by the owner's API key, as
-// edit changes it when edit is not nil, creates it in the runtime with the
-// working directory /workspace and the environment PARLEY_SANDBOX_ID and
-// MODE=profile, and returns its id.
+// sandbox creates a sandbox in the runtime with the working directory
+// /workspace and the environment PARLEY_SANDBOX_ID and MODE=profile, then
+// stores it as a ready sandbox of ws created by the owner's API key, as
+// edit changes it when edit is not nil, and returns its id.
 func (h *execHub) sandbox(t *testing.T, edit func(*sandbox.Record)) string {
 	t.Helper()
 	before := recordStart.Add(-time.Hour)
@@ -2629,13 +2629,16 @@ func (h *execHub) sandbox(t *testing.T, edit func(*sandbox.Record)) string {
 	if edit != nil {
 		edit(&rec)
 	}
+	// The runtime holds the sandbox before its record is stored, as it does
+	// when the hub creates one: a reconciliation pass that read a ready
+	// record the runtime does not hold yet would mark it failed.
 	ctx := context.Background()
-	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) }); err != nil {
-		t.Fatalf("insert a sandbox: %v", err)
-	}
 	spec := runtime.SandboxSpec{Name: rec.ID, WorkDir: sandbox.WorkDir, Env: map[string]string{"PARLEY_SANDBOX_ID": rec.ID, "MODE": "profile"}}
 	if _, err := h.rt.Client("parley", nil).CreateSandbox(ctx, spec); err != nil {
 		t.Fatalf("create the sandbox in the runtime: %v", err)
+	}
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) }); err != nil {
+		t.Fatalf("insert a sandbox: %v", err)
 	}
 	return rec.ID
 }
