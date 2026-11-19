@@ -36,6 +36,8 @@ func (c *Component) readRoutes() []server.Route {
 		readRoute("/tools/calls", listOf(c, toolCalls, byNodeID, bySessionID, byToolName)),
 		readRoute("/tools/errors", listOf(c, toolErrors, byNodeID, bySessionID, byToolName)),
 		readRoute("/traces", listOf(c, traces, byTraceType, byNodeID, bySessionID)),
+		readRoute("/postmortem", c.servePostmortem),
+		readRoute("/transcript", c.serveTranscript),
 	}
 }
 

@@ -242,10 +242,16 @@ func getRecord(ctx context.Context, tx Tx, table, columns, id string, h *head, d
 	return getRecordWhere(ctx, tx, table, columns, "id = ?", []any{id}, h, dest...)
 }
 
+// rowReader reads one row: a write transaction (Tx) or the store outside
+// one (DB).
+type rowReader interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // getRecordWhere is getRecord for the record of table that where, with the
-// arguments key, selects.
-func getRecordWhere(ctx context.Context, tx Tx, table, columns, where string, key []any, h *head, dest ...any) (found bool, err error) {
-	err = scanRecord(tx.QueryRowContext(ctx, selectRecords(table, columns)+` WHERE `+where, key...).Scan, table, h, dest...)
+// arguments key, selects, read through q.
+func getRecordWhere(ctx context.Context, q rowReader, table, columns, where string, key []any, h *head, dest ...any) (found bool, err error) {
+	err = scanRecord(q.QueryRowContext(ctx, selectRecords(table, columns)+` WHERE `+where, key...).Scan, table, h, dest...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -289,9 +295,10 @@ func storePostmortemOnce(ctx context.Context, tx Tx, p postmortem) (stored postm
 	return p, true, nil
 }
 
-// getPostmortem reads the postmortem of the run runID of workspace.
-func getPostmortem(ctx context.Context, tx Tx, workspace, runID string) (p postmortem, found bool, err error) {
-	found, err = getRecordWhere(ctx, tx, "postmortems",
+// getPostmortem reads the postmortem of the run runID of workspace through
+// q.
+func getPostmortem(ctx context.Context, q rowReader, workspace, runID string) (p postmortem, found bool, err error) {
+	found, err = getRecordWhere(ctx, q, "postmortems",
 		"schema_version, run_status, started_at, completed_at, task_summary, cost_summary, blocked_tasks, session_history",
 		"workspace = ? AND run_id = ?", []any{workspace, runID}, &p.head,
 		&p.SchemaVersion, &p.RunStatus, timeColumn{&p.StartedAt}, timeColumn{&p.CompletedAt},

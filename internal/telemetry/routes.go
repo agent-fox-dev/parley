@@ -13,9 +13,10 @@
 //
 // The records of a run are read back by GET routes under the same prefix,
 // which need the scope audit:read and read access to the workspace, in any
-// status. Each lists one kind of record of the path's workspace and run,
-// filtered and paged, every query parameter checked before the store is
-// read.
+// status. Five list one kind of record of the path's workspace and run,
+// filtered and paged; one answers the run's postmortem, and one the
+// transcript of a node, rebuilt from its trace records. Every query
+// parameter is checked before the store is read.
 package telemetry
 
 import (

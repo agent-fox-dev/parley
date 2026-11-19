@@ -16,7 +16,7 @@ import (
 var listRoutes = []string{"/events", "/sessions/outcomes", "/tools/calls", "/tools/errors", "/traces"}
 
 // readRoutes are every per-run read route.
-var readRoutes = listRoutes
+var readRoutes = append(slices.Clone(listRoutes), "/postmortem", "/transcript")
 
 // Three instants of the records the lists are read from, a second apart.
 const (
