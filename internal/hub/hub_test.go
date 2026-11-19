@@ -467,7 +467,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 				_, err := tx.ExecContext(ctx, "CREATE TABLE passes (task TEXT NOT NULL)")
 				return err
 			}})
-			c.AddMaintenanceTask("sandbox_record_cleanup", insert("sandbox_record_cleanup"))
+			c.AddMaintenanceTask("recorded_pass", insert("recorded_pass"))
 			c.AddMaintenanceTask("failing_task", func(context.Context, *hub.Runtime) error {
 				return errors.New("deliveries unreachable at https://u:p@h/x")
 			})
@@ -492,7 +492,7 @@ func TestRun_LogsAFailingMaintenanceTaskAtEveryPassAndKeepsServing(t *testing.T)
 		return errs
 	}
 	eventually(t, "three passes with a failing task", func() bool {
-		return rows("retention") >= 3 && rows("sandbox_record_cleanup") >= 3 && len(failures()) >= 3
+		return rows("retention") >= 3 && rows("recorded_pass") >= 3 && len(failures()) >= 3
 	})
 
 	for _, rec := range failures() {

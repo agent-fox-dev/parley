@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -709,7 +711,7 @@ type createHub struct {
 // called for them.
 func startCreateHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	return newCreateHub(t, profiles, false, adjust)
+	return newCreateHub(t, runtimetest.New(t), profiles, false, adjust)
 }
 
 // startProvisionHub is startCreateHub with the provisioner running: it
@@ -717,13 +719,15 @@ func startCreateHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)
 // hooks, on the hub's clock.
 func startProvisionHub(t *testing.T, profiles string, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
-	return newCreateHub(t, profiles, true, adjust)
+	return newCreateHub(t, runtimetest.New(t), profiles, true, adjust)
 }
 
-func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*sandbox.Deps)) *createHub {
+// newCreateHub starts a create hub over the fake runtime rt, whose
+// commands the hooks' script runs.
+func newCreateHub(t *testing.T, rt *runtimetest.Fake, profiles string, provision bool, adjust []func(*sandbox.Deps)) *createHub {
 	t.Helper()
 	h := &createHub{
-		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, forkLinker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
+		probeHub: &probeHub{rt: rt}, linker: &stubLinker{}, forkLinker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
 		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{head: defaultHead},
 		timers: &timerLog{}, limits: &quotaLimits{},
 	}
@@ -1247,7 +1251,8 @@ const defaultHead = "0123456789abcdef0123456789abcdef01234567"
 // runtimeHooks steer the provisioning's runtime calls of a create hub: hook,
 // when set, is called before each EnsureProvider, CreateSandbox, WaitReady
 // and RunMain with the operation and the provider's or sandbox's name, and
-// an error it returns is the call's. exec, when set, is asked before each
+// an error it returns is the call's; it is called after each StopSandbox
+// the runtime carried out, while its caller still waits for the answer. exec, when set, is asked before each
 // Exec: an error it returns is the call's, and a non-zero code ends the
 // command with that code and stderr. They keep the command of each RunMain
 // and, in one log, every command run in a sandbox, every main-process start
@@ -1259,6 +1264,8 @@ type runtimeHooks struct {
 	head  string
 	mains map[string][]string
 	log   []runCall
+	// downloadErr, when set, ends every download after half its bytes.
+	downloadErr error
 }
 
 // runCall is an entry of the hooks' log: a command run in the sandbox
@@ -1275,6 +1282,14 @@ func (r *runtimeHooks) setExec(fn func(argv []string) (code int, stderr string, 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.exec = fn
+}
+
+// setDownloadErr makes every later download deliver half of the file's
+// bytes and then fail with err; nil ends that.
+func (r *runtimeHooks) setDownloadErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.downloadErr = err
 }
 
 // setHead makes id the commit git rev-parse HEAD answers.
@@ -1391,8 +1406,18 @@ func (c *hookedClient) RunMain(ctx context.Context, name string, command []strin
 	return nil
 }
 
+func (c *hookedClient) StopSandbox(ctx context.Context, name string) error {
+	if err := c.Client.StopSandbox(ctx, name); err != nil {
+		return err
+	}
+	return c.hooks.before(ctx, runtime.OpStopSandbox, name)
+}
+
 func (c *hookedClient) Exec(ctx context.Context, name string, req runtime.ExecRequest) (runtime.ExecResult, error) {
 	c.hooks.record(runCall{sandbox: name, kind: "exec", argv: slices.Clone(req.Command), dir: req.WorkDir})
+	if err := c.hooks.before(ctx, runtime.OpExec, name); err != nil {
+		return runtime.ExecResult{}, err
+	}
 	c.hooks.mu.Lock()
 	fn := c.hooks.exec
 	c.hooks.mu.Unlock()
@@ -1406,6 +1431,25 @@ func (c *hookedClient) Exec(ctx context.Context, name string, req runtime.ExecRe
 		}
 	}
 	return c.Client.Exec(ctx, name, req)
+}
+
+func (c *hookedClient) Download(ctx context.Context, name, p string) (io.ReadCloser, error) {
+	if err := c.hooks.before(ctx, runtime.OpDownload, name); err != nil {
+		return nil, err
+	}
+	rc, err := c.Client.Download(ctx, name, p)
+	c.hooks.mu.Lock()
+	cut := c.hooks.downloadErr
+	c.hooks.mu.Unlock()
+	if err != nil || cut == nil {
+		return rc, err
+	}
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(io.MultiReader(bytes.NewReader(data[:len(data)/2]), iotest.ErrReader(cut))), nil
 }
 
 // stubRestorer is a restorer that logs each restore in the hooks' log and
@@ -1488,14 +1532,18 @@ func (h *createHub) settledObject(t *testing.T, slug, id string) map[string]any 
 // hubEvent is what a test checks of a stored hub event.
 type hubEvent struct {
 	actorType string
-	metadata  map[string]any
+	// actorID is nil for an actor that is no user.
+	actorID            *string
+	metadata           map[string]any
+	resourceType       string
+	workspace, session *string
 }
 
 // sandboxEvents returns the hub events of type typ about the sandbox id,
 // oldest first.
 func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 	t.Helper()
-	rows, err := h.Store.Main().Query(`SELECT actor_type, metadata FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
+	rows, err := h.Store.Main().Query(`SELECT actor_type, actor_id, metadata, resource_type, workspace, session_id FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1506,7 +1554,7 @@ func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 			e    hubEvent
 			meta string
 		)
-		if err := rows.Scan(&e.actorType, &meta); err != nil {
+		if err := rows.Scan(&e.actorType, &e.actorID, &meta, &e.resourceType, &e.workspace, &e.session); err != nil {
 			t.Fatal(err)
 		}
 		if err := json.Unmarshal([]byte(meta), &e.metadata); err != nil {
@@ -2236,13 +2284,14 @@ func startUseHub(t *testing.T, fail func() error) *useHub {
 
 // seed stores a sandbox of the workspace ws, created by the owner's API
 // key, in state, with the hub credential ha (nil for none), and returns its
-// id.
+// id. It expires hours after the real clock, the use hub's, so that the
+// lifecycle loop does not delete it while the test runs.
 func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) string {
 	t.Helper()
 	before := recordStart.Add(-time.Hour)
 	rec := sandbox.Record{
 		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, HubAccess: ha,
-		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		ExpiresAt: time.Now().Add(3 * time.Hour), LastActivityAt: before,
 		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
 		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: ws,
 	}
@@ -3396,4 +3445,364 @@ func (h *execHub) activityAt(t *testing.T, id string, want time.Time, when strin
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// noHostGit is the environment that keeps the host's git configuration out
+// of a git command: the commands of a checkpoint hub's sandboxes and those
+// a test runs in a working directory.
+var noHostGit = map[string]string{"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+// startCheckpointHub starts a create hub with the profile agent and the
+// create world, whose fake runtime keeps each sandbox's files in a
+// directory of the host and runs the commands of its sandboxes there with
+// the real git, with the dependencies of its stored sandboxes changed by
+// adjust.
+func startCheckpointHub(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	return startCheckpointHubWith(t, "", adjust...)
+}
+
+// startCheckpointHubWith is startCheckpointHub with the [sandbox] keys
+// settings, as TOML, before the profile.
+func startCheckpointHubWith(t *testing.T, settings string, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	h := newCreateHub(t, runtimetest.New(t, runtimetest.WithHostDirs()), settings+agentProfile, false, adjust)
+	h.rt.SetExec(nil)
+	h.world(t)
+	return h
+}
+
+// workSandbox stores a ready sandbox of demo--t1 created by dana with the
+// profile agent's hub credential and checkpoint flag and the checkout of
+// the work branch t1, as edit changes it when edit is not nil, creates it
+// at the runtime, and returns its id and the host directory that holds its
+// working directory, which is empty.
+func (h *createHub) workSandbox(t *testing.T, edit func(*sandbox.Record)) (id, dir string) {
+	t.Helper()
+	id = h.seedRecord(t, "demo--t1", sandbox.StateReady, func(r *sandbox.Record) {
+		r.SessionID = new(t1Session)
+		r.Checkout = &sandbox.Checkout{Path: sandbox.WorkDir, Ref: "main", SHA: h.base, Branch: new("t1")}
+		r.HubAccess = &sandbox.HubAccess{Scopes: allHubScopes, ExpiresAt: r.ExpiresAt}
+		r.Snapshot = sandbox.Snapshot{TTL: 4 * time.Hour, IdleTimeout: 30 * time.Minute, Checkpoint: true, HubAccess: "fork"}
+		if edit != nil {
+			edit(r)
+		}
+	})
+	spec := runtime.SandboxSpec{Name: id, WorkDir: sandbox.WorkDir, Env: noHostGit, Labels: map[string]string{sandbox.LabelSandbox: id}}
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), spec); err != nil {
+		t.Fatalf("create the sandbox at the runtime: %v", err)
+	}
+	return id, h.workDir(id)
+}
+
+// workDir is the host directory that holds the working directory of the
+// sandbox id.
+func (h *createHub) workDir(id string) string {
+	return filepath.Join(h.rt.HostDir("parley", id), strings.TrimPrefix(sandbox.WorkDir, "/"))
+}
+
+// cloneWork clones demo into the empty directory dir and checks out the
+// new branch t1 at main, as the checkout of a sandbox of demo--t1 does.
+func (h *createHub) cloneWork(t *testing.T, dir string) {
+	t.Helper()
+	workGit(t, dir, "clone", "--quiet", h.workspaces.RepoPath("demo"), ".")
+	workGit(t, dir, "checkout", "--quiet", "-b", "t1")
+}
+
+// workGit runs git in the working directory dir without the host's
+// configuration, with a fixed identity, and returns its output, trimmed.
+func workGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	return strings.TrimSpace(workOutput(t, dir, args...))
+}
+
+// workStatus is what git status --porcelain lists in the working directory
+// dir, sorted.
+func workStatus(t *testing.T, dir string) []string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(workOutput(t, dir, "status", "--porcelain"), "\n"), "\n")
+	slices.Sort(lines)
+	return slices.DeleteFunc(lines, func(l string) bool { return l == "" })
+}
+
+// workOutput is workGit's output as git wrote it.
+func workOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Dana", "GIT_AUTHOR_EMAIL=dana@example.invalid",
+		"GIT_COMMITTER_NAME=Dana", "GIT_COMMITTER_EMAIL=dana@example.invalid")
+	for k, v := range noHostGit {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return string(out)
+}
+
+// commitWork writes the files of files into the working directory dir and
+// commits them on its current branch, returning the new head.
+func commitWork(t *testing.T, dir, msg string, files map[string]string) string {
+	t.Helper()
+	writeWork(t, dir, files)
+	workGit(t, dir, "add", "--all")
+	workGit(t, dir, "commit", "--quiet", "-m", msg)
+	return workGit(t, dir, "rev-parse", "HEAD")
+}
+
+// writeWork writes the files of files, by path, into the working directory
+// dir.
+func writeWork(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// workState is what a checkpoint must leave as it was in the working
+// directory dir: every ref with its value, the status and the index's
+// entries.
+func workState(t *testing.T, dir string) string {
+	t.Helper()
+	return workGit(t, dir, "for-each-ref") + "\n--\n" + workGit(t, dir, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all") +
+		"\n--\n" + workGit(t, dir, "ls-files", "--stage")
+}
+
+// checkpointRefs maps the branch of each checkpoint ref of the sandbox id in
+// the repository of demo--t1 to its value.
+func (h *createHub) checkpointRefs(t *testing.T, id string) map[string]string {
+	t.Helper()
+	return gitrepotest.Refs(t, h.workspaces.RepoPath("demo--t1"), sandbox.CheckpointRefPrefix+id+"/")
+}
+
+// storedCheckpoint is the checkpoint stored on the sandbox id; nil for
+// none.
+func (h *createHub) storedCheckpoint(t *testing.T, id string) *sandbox.CheckpointState {
+	t.Helper()
+	raw := storedRecord(t, h.Hub, id).Checkpoint
+	if raw == nil {
+		return nil
+	}
+	var cp sandbox.CheckpointState
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		t.Fatalf("the stored checkpoint %s: %v", raw, err)
+	}
+	return &cp
+}
+
+// checkpointMeta is the metadata of the checkpoint event the checkpoint cp
+// is written with, as a decoded event holds it.
+func checkpointMeta(t *testing.T, cp *sandbox.CheckpointState) map[string]any {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"ok": cp.OK, "refs": cp.Refs, "error": cp.Error})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// metricDelta is what was added to each series between the values before
+// and after of one metric.
+func metricDelta(before, after map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range after {
+		if d := v - before[k]; d != 0 {
+			out[k] = d
+		}
+	}
+	return out
+}
+
+// hubCredential mints a live hub credential for the stored sandbox id,
+// which has hub access, through the hub's minting, as a create or a start
+// does: it stores the token's id on the record, gives the service its
+// value, and returns the value.
+func (h *createHub) hubCredential(t *testing.T, id string) string {
+	t.Helper()
+	rec := storedRecord(t, h.Hub, id)
+	var value string
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		pat, v, err := h.svc.MintHubCredential(ctx, tx, rec, rec.ExpiresAt)
+		if err != nil {
+			return err
+		}
+		value = v
+		return sandbox.Update(ctx, tx, id, sandbox.SetHubTokenID(pat.TokenID))
+	})
+	h.svc.SetHubCredential(id, value)
+	return value
+}
+
+// credentialAnswer is the answer to a read of demo--t1 that a hub
+// credential of a sandbox of it may make, with cred as the bearer
+// credential: 200 while cred authenticates.
+func (h *createHub) credentialAnswer(t *testing.T, cred string) answer {
+	t.Helper()
+	return h.call(t, http.MethodGet, "/workspaces/demo--t1/claims", cred, nil)
+}
+
+// sandboxCalls are the operations the runtime was asked for on the sandbox
+// id or a provider of it, from the n-th call of the runtime on, in order.
+func (h *createHub) sandboxCalls(id string, n int) []string {
+	var ops []string
+	for _, c := range h.rt.Calls()[n:] {
+		if strings.HasPrefix(c.Target, id) {
+			ops = append(ops, c.Op)
+		}
+	}
+	return ops
+}
+
+// startRestoreHub starts a create hub with the profiles given as TOML and
+// the create world, with dana a member of acme and no sandbox limit that a
+// test reaches, whose provisioner runs and whose fake runtime keeps each
+// sandbox's files in a directory of the host (hostGit).
+func startRestoreHub(t *testing.T, profiles string) *createHub {
+	t.Helper()
+	h := newCreateHub(t, runtimetest.New(t, runtimetest.WithHostDirs()), profiles, true, nil)
+	h.rt.SetExec(h.hostGit)
+	h.world(t)
+	h.AddMember(t, h.org, h.dana)
+	h.setLimits(limits{100, 100, 100, 100})
+	return h
+}
+
+// hostGit runs the commands of a restore hub's sandboxes in their host
+// directories, with the real git and without the host's git configuration,
+// but for what the checkout cannot do there: its git config --global does
+// nothing, and its clone of the hub's git URL makes the working directory
+// and clones the repository of demo on disk into it.
+func (h *createHub) hostGit(ctx context.Context, name string, req runtime.ExecRequest, stdout, stderr io.Writer) int {
+	dir := filepath.Join(h.rt.HostDir("parley", name), strings.TrimPrefix(req.WorkDir, "/"))
+	argv := req.Command
+	switch {
+	case len(argv) > 2 && argv[0] == "git" && argv[1] == "config" && argv[2] == "--global":
+		return 0
+	case isClone(argv):
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		argv = []string{"git", "clone", "--quiet", "--no-checkout", h.workspaces.RepoPath("demo"), "."}
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	for _, env := range []map[string]string{req.Env, noHostGit} {
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+	cmd.Stdin = bytes.NewReader(req.Stdin)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	var exit *exec.ExitError
+	switch err := cmd.Run(); {
+	case errors.As(err, &exit):
+		return exit.ExitCode()
+	case err != nil:
+		_, _ = fmt.Fprintln(stderr, err)
+		return 127
+	}
+	return 0
+}
+
+// dirtySource stores a deleted sandbox of demo--t1 whose checkpoint holds
+// the dirty ref t1 at a commit on main, and returns its id; with stored, the
+// ref is in the repository of demo--t1.
+func (h *createHub) dirtySource(t *testing.T, stored bool) string {
+	t.Helper()
+	dirty := gitrepotest.Commit(t, h.workspaces.RepoPath("demo"), "parley checkpoint", map[string]string{"README": "dirty\n"}, h.base)
+	id := h.seedRecord(t, "demo--t1", sandbox.StateDeleted, func(r *sandbox.Record) {
+		r.Checkpoint = json.RawMessage(`{"ok":true,"error":null,"refs":[{"branch":"t1","sha":"` + dirty + `","dirty":true}]}`)
+	})
+	if stored {
+		gitrepotest.SetRef(t, h.workspaces.RepoPath("demo--t1"), sandbox.CheckpointRefPrefix+id+"/t1", dirty)
+	}
+	return id
+}
+
+// uploads is the number of files the runtime was asked to write into the
+// sandbox id, from its n-th call on.
+func (h *createHub) uploads(id string, n int) int {
+	return len(slices.DeleteFunc(h.sandboxCalls(id, n), func(op string) bool { return op != runtime.OpUpload }))
+}
+
+// eventTypes are the types of the hub events about the sandbox id, oldest
+// first.
+func (h *createHub) eventTypes(t *testing.T, id string) []string {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT type FROM hub_events WHERE resource_id = ? ORDER BY seq`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, typ)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// runtimeSandbox stores a sandbox of demo--t1 in state, created by dana
+// with the profile agent's hub credential and its checkpoint flag, as edit
+// changes it when edit is not nil, creates it at the runtime with the
+// provider id-model, both labelled with its id, mints its hub credential,
+// and returns its id and the credential's value.
+func (h *createHub) runtimeSandbox(t *testing.T, state string, edit func(*sandbox.Record)) (id, cred string) {
+	t.Helper()
+	id, dir := h.workSandbox(t, func(r *sandbox.Record) {
+		r.State = state
+		if edit != nil {
+			edit(r)
+		}
+	})
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := runtime.Provider{Name: id + "-model", Profile: "anthropic", Value: "v", Labels: map[string]string{sandbox.LabelSandbox: id}}
+	if err := h.rt.Client("parley", nil).EnsureProvider(context.Background(), p); err != nil {
+		t.Fatalf("create the provider at the runtime: %v", err)
+	}
+	return id, h.hubCredential(t, id)
+}
+
+// idLog counts the ids it is given.
+type idLog struct {
+	mu  sync.Mutex
+	ids map[string]int
+}
+
+func (l *idLog) add(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ids == nil {
+		l.ids = map[string]int{}
+	}
+	l.ids[id]++
+}
+
+// snapshot returns a copy of the counts.
+func (l *idLog) snapshot() map[string]int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]int, len(l.ids))
+	for id, n := range l.ids {
+		out[id] = n
+	}
+	return out
 }

@@ -238,7 +238,7 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			})
 			return func() { h.hooks.setExec(nil) }
 		}},
-		{name: "the restorer fails", reason: "provision_failed", fault: func(t *testing.T) func() {
+		{name: "the restorer fails", reason: "checkout_failed", fault: func(t *testing.T) func() {
 			h.svc.RegisterRestorer(&stubRestorer{hooks: h.hooks, err: errors.New("no checkpoint data")})
 			return func() { h.svc.RegisterRestorer(nil) }
 		}, create: func(t *testing.T) string {
@@ -299,12 +299,16 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			if err != nil || tok.RevokedAt == nil {
 				t.Errorf("hub credential %+v, %v; want it revoked", tok, err)
 			}
+			// The count and the forgetting of the values follow the commit
+			// of the failed record, which settled waited for.
+			eventually(t, "the failed provisioning to be counted once", func() bool { return creates("failed") >= before+1 })
 			if got := creates("failed"); got != before+1 {
 				t.Errorf("creates_total{failed} = %v; want %v", got, before+1)
 			}
-			if _, kept := h.svc.HubCredential(id); kept {
-				t.Error("the hub credential's value is still held after the sandbox failed")
-			}
+			eventually(t, "the hub credential's value to be forgotten", func() bool {
+				_, kept := h.svc.HubCredential(id)
+				return !kept
+			})
 		})
 	}
 }

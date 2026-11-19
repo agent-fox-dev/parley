@@ -203,6 +203,16 @@ in one sandbox, another being refused with `429 rate_limited`;
 download; and `log_retention` is how long the stored lines of a sandbox's
 main process and policy log are kept.
 
+`reconcile_interval` is the time between two passes in which the hub
+brings its sandbox records back in line with the runtime (exits, lost
+sandboxes, the runtime's leftovers, overdue idle stops and expiries); one
+pass also runs at start, before the hub listens. The idle stop and the
+expiry are checked every minute besides (see
+[api.md](api.md#the-life-of-a-sandbox)). A profile's `idle_timeout` is how
+long a `ready` sandbox may go without activity before the hub stops it,
+and its `checkpoint` whether the hub checkpoints a sandbox before it stops
+or deletes it and when its main process ends.
+
 A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
 hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
 `tls_ca`, `token_file`, `oidc_client_secret_file` and a profile's `policy`

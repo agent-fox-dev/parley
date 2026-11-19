@@ -1,11 +1,19 @@
 package sandbox_test
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
+	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
 func TestScrub(t *testing.T) {
@@ -38,5 +46,97 @@ func TestScrub(t *testing.T) {
 				t.Errorf("Scrub returned %d bytes, valid UTF-8 %t; want at most 1024 bytes of valid UTF-8", len(got), utf8.ValidString(got))
 			}
 		})
+	}
+}
+
+// The runtime fails every command of the sandbox with the text of a row; the
+// checkpoint's error, its event's, the line the hub logs and the message of
+// the checkpoint route's answer carry the text scrubbed of the sandbox's
+// credential secret and its hub credential.
+func TestScrub_TheRuntimeErrorOfACheckpoint(t *testing.T) {
+	t.Parallel()
+	const secretValue, hubValue = "sk-secret-value-1234", "hub-credential-5678"
+	logs := &hubtest.LogBuffer{}
+	h := startCheckpointHub(t, func(d *sandbox.Deps) { d.Logger = slog.New(slog.NewJSONHandler(logs, nil)) })
+	id, dir := h.workSandbox(t, nil)
+	h.cloneWork(t, dir)
+	h.svc.SetValues(id, sandbox.Values{Credentials: []string{secretValue}, HubCredential: hubValue})
+	for _, tc := range []struct {
+		name, text string
+		// redacted is true when a value stands within the text's first
+		// 1,024 bytes.
+		redacted bool
+	}{
+		{"a credential's secret", "auth failed for " + secretValue, true},
+		{"the hub credential", "bearer " + hubValue + " refused", true},
+		{"both", secretValue + " and " + hubValue, true},
+		{"5,000 bytes ending in the secret", strings.Repeat("x", 5000-len(secretValue)) + secretValue, false},
+		{"no secret", "the gateway is restarting", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.rt.FailOperation(runtime.OpExec, runtime.ErrUnavailable, tc.text)
+			t.Cleanup(func() { h.rt.FailOperation(runtime.OpExec, nil, "") })
+			logged := len(logs.String())
+			cp, err := h.svc.Checkpoint(context.Background(), storedRecord(t, h.Hub, id), sandbox.SystemActor)
+			if err == nil || cp == nil || cp.Error == nil {
+				t.Fatalf("Checkpoint = %+v, %v; want a failure", cp, err)
+			}
+			evs := h.sandboxEvents(t, sandbox.EventCheckpoint, id)
+			evText, _ := evs[len(evs)-1].metadata["error"].(string)
+			var line struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(logs.String()[logged:])), &line); err != nil {
+				t.Fatalf("the hub logged %q: %v", logs.String()[logged:], err)
+			}
+			// The route asks for one more checkpoint, which fails the same.
+			a := h.call(t, http.MethodPost, "/workspaces/demo--t1/sandboxes/"+id+"/checkpoint", h.key, nil)
+			if a.status != http.StatusBadGateway {
+				t.Errorf("POST checkpoint = %d %s; want 502", a.status, a.body)
+			}
+			for _, sink := range []struct{ name, text string }{
+				{"checkpoint.error", *cp.Error}, {"the event's error", evText}, {"the logged error", line.Error}, {"the returned error", err.Error()},
+				{"the route's answer", a.err.Message},
+			} {
+				if strings.Contains(sink.text, secretValue) || strings.Contains(sink.text, hubValue) || len(sink.text) > 1024 {
+					t.Errorf("%s = %q (%d bytes); want neither value and at most 1,024 bytes", sink.name, sink.text, len(sink.text))
+				}
+				if tc.redacted && !strings.Contains(sink.text, "[redacted]") {
+					t.Errorf("%s = %q; want [redacted] where a value stood", sink.name, sink.text)
+				}
+				if !tc.redacted && len(tc.text) < 1024 && !strings.Contains(sink.text, tc.text) {
+					t.Errorf("%s = %q; want the text %q unchanged", sink.name, sink.text, tc.text)
+				}
+			}
+		})
+	}
+}
+
+// The fetch of a restore fails with a text that holds the new sandbox's
+// credential secret and its hub credential and runs past 1,024 bytes; the
+// error of the fail event that ends the sandbox carries it scrubbed of both.
+func TestScrub_TheErrorOfAFailedRestore(t *testing.T) {
+	t.Parallel()
+	h := startRestoreHub(t, agentProfile+"credentials = [\"model\"]\n"+credentialTables)
+	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
+	src := h.dirtySource(t, true)
+	var hubValue string
+	h.hooks.setExec(func(argv []string) (int, string, error) {
+		if !slices.Contains(argv, "fetch") {
+			return 0, "", nil
+		}
+		minted := h.minter.minted()
+		hubValue = minted[len(minted)-1]
+		return 1, "auth failed for " + modelSecret + " with " + hubValue + " " + strings.Repeat("x", 3000), nil
+	})
+
+	_, rec := h.provisioned(t, "demo--t1", "", map[string]any{"restore_from": src})
+	ev := h.sandboxEvents(t, sandbox.EventFail, rec.ID)
+	if len(ev) != 1 || hubValue == "" {
+		t.Fatalf("fail events %+v after a fetch with the hub credential %q; want one after the fetch", ev, hubValue)
+	}
+	text, _ := ev[0].metadata["error"].(string)
+	if strings.Contains(text, modelSecret) || strings.Contains(text, hubValue) || len(text) > 1024 || !strings.Contains(text, "[redacted]") {
+		t.Errorf("the fail event's error = %q (%d bytes); want neither value, [redacted] where one stood and at most 1,024 bytes", text, len(text))
 	}
 }

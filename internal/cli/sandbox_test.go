@@ -144,16 +144,16 @@ func runSandboxWait(t *testing.T, hub *stubHub, args ...string) (int, string, st
 	return runCLIWith(t, opts, slices.Concat([]string{"--endpoint-url", hub.URL, "--api-key", "k", "sandbox"}, args)...)
 }
 
-// wantWaitEnd checks the end of a wait over polls: the create came first,
-// the polls went to sbx_1,
+// wantWaitEnd checks the end of a wait over polls: a POST to start, the
+// raw path the operation starts at, came first, the polls went to sbx_1,
 // and either exit 0 with the last record alone on stdout, or exit 1 with
 // the last record on stdout and errorType on stderr; for wait_timeout
 // stdout is empty.
-func wantWaitEnd(t *testing.T, hub *stubHub, code int, stdout, stderr string, polls []string, errorType string) {
+func wantWaitEnd(t *testing.T, hub *stubHub, start string, code int, stdout, stderr string, polls []string, errorType string) {
 	t.Helper()
 	sent := hub.recorded()
-	if len(sent) == 0 || sent[0].method != http.MethodPost || sent[0].rawPath != sandboxesPath {
-		t.Fatalf("the hub got %v (exit status %d, stderr %q); want a POST %s first", sent, code, stderr, sandboxesPath)
+	if len(sent) == 0 || sent[0].method != http.MethodPost || sent[0].rawPath != start {
+		t.Fatalf("the hub got %v (exit status %d, stderr %q); want a POST %s first", sent, code, stderr, start)
 	}
 	for _, r := range sent[1:] {
 		if r.method != http.MethodGet || r.rawPath != sandboxesPath+"/sbx_1" {
@@ -234,7 +234,7 @@ func TestSandboxCreate_Wait(t *testing.T) {
 
 			code, stdout, stderr := runSandboxWait(t, hub, "create", "demo", "--wait")
 
-			wantWaitEnd(t, hub, code, stdout, stderr, tt.polls, tt.errorType)
+			wantWaitEnd(t, hub, sandboxesPath, code, stdout, stderr, tt.polls, tt.errorType)
 			if got := hub.count(http.MethodGet); got != len(tt.polls) {
 				t.Errorf("the hub got %d polls, want %d", got, len(tt.polls))
 			}
@@ -247,7 +247,7 @@ func TestSandboxCreate_Wait(t *testing.T) {
 		// 1s is the shortest --timeout the duration form allows.
 		code, stdout, stderr := runSandboxWait(t, hub, "create", "demo", "--wait", "--timeout", "1s")
 
-		wantWaitEnd(t, hub, code, stdout, stderr, nil, "wait_timeout")
+		wantWaitEnd(t, hub, sandboxesPath, code, stdout, stderr, nil, "wait_timeout")
 	})
 }
 
@@ -276,7 +276,7 @@ func TestSandboxCreate_WaitExit(t *testing.T) {
 
 			code, stdout, stderr := runSandboxWait(t, hub, args...)
 
-			wantWaitEnd(t, hub, code, stdout, stderr, tt.polls, tt.errorType)
+			wantWaitEnd(t, hub, sandboxesPath, code, stdout, stderr, tt.polls, tt.errorType)
 			if got := hub.count(http.MethodGet); got != len(tt.polls) {
 				t.Errorf("the hub got %d polls, want %d", got, len(tt.polls))
 			}
@@ -316,6 +316,14 @@ func TestSandbox_UsageErrors(t *testing.T) {
 		{[]string{"logs", "demo", "sbx_1", "--tail", "0"}, "--tail"},
 		{[]string{"upload", "demo", "sbx_1", "f"}, "<sandbox-path>"},
 		{[]string{"download", "demo", "sbx_1", "out.txt"}, "<local-path>"},
+		{[]string{"stop", "demo--t1"}, "<id>"},
+		{[]string{"stop"}, "<workspace-slug>"},
+		{[]string{"start", "demo--t1", "sbx_1", "extra"}, `"extra"`},
+		{[]string{"start", "demo--t1", "sbx_1", "--wait", "--timeout", "0"}, `"0" for "--timeout" flag`},
+		{[]string{"start", "demo--t1", "sbx_1", "--wait", "--poll-interval", "-1s"}, `"-1s" for "--poll-interval" flag`},
+		{[]string{"extend", "demo--t1", "sbx_1"}, "--ttl"},
+		{[]string{"delete", "demo--t1"}, "<id>"},
+		{[]string{"checkpoint"}, "<workspace-slug>"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -332,6 +340,85 @@ func TestSandbox_UsageErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSandboxLifecycle_SendsTheRequestAndPrintsTheAnswer(t *testing.T) {
+	t.Parallel()
+	doc := sandboxRecord("ready", 0)
+	wantWrites(t, []sentWrite{
+		{args: []string{"sandbox", "checkpoint", "demo--t1", "sbx_1"}, method: http.MethodPost, path: "demo--t1/sandboxes/sbx_1/checkpoint", status: http.StatusOK, answer: doc},
+		{args: []string{"sandbox", "stop", "demo--t1", "sbx_1"}, method: http.MethodPost, path: "demo--t1/sandboxes/sbx_1/stop", status: http.StatusOK, answer: doc},
+		{args: []string{"sandbox", "stop", "a/b", "x/y"}, method: http.MethodPost, path: "a%2Fb/sandboxes/x%2Fy/stop", status: http.StatusOK, answer: doc},
+		{args: []string{"sandbox", "start", "demo--t1", "sbx_1"}, method: http.MethodPost, path: "demo--t1/sandboxes/sbx_1/start", status: http.StatusOK, answer: doc},
+		{
+			args:   []string{"sandbox", "extend", "demo--t1", "sbx_1", "--ttl", "2h"},
+			method: http.MethodPatch, path: "demo--t1/sandboxes/sbx_1", body: `{"ttl":"2h"}`, status: http.StatusOK, answer: doc,
+		},
+		{
+			args:   []string{"sandbox", "delete", "demo--t1", "sbx_1"},
+			method: http.MethodDelete, path: "demo--t1/sandboxes/sbx_1", status: http.StatusNoContent, printed: `{"id":"sbx_1","status":"deleted"}`,
+		},
+		{
+			args:   []string{"sandbox", "delete", "demo--t1", "sbx_1", "--no-checkpoint"},
+			method: http.MethodDelete, path: "demo--t1/sandboxes/sbx_1", query: url.Values{"checkpoint": {"false"}},
+			status: http.StatusNoContent, printed: `{"id":"sbx_1","status":"deleted"}`,
+		},
+	})
+
+	t.Run("a refusal of the hub", func(t *testing.T) {
+		t.Parallel()
+		const refusal = `{"error":{"code":409,"message":"the sandbox is deleted","error_type":"sandbox_deleted"}}`
+		hub := newStubHub(t).answer(http.MethodPost, "/api/v1/workspaces/demo--t1/sandboxes/sbx_1/start", http.StatusConflict, refusal)
+
+		code, stdout, stderr, sent := runOnHub(t, hub, "sandbox", "start", "demo--t1", "sbx_1")
+
+		if code != 1 || stdout != "" {
+			t.Errorf("exit status %d, stdout %q; want 1 and nothing", code, stdout)
+		}
+		if stderr != indented(t, refusal) {
+			t.Errorf("stderr = %q, want the hub's envelope unchanged", stderr)
+		}
+		wantOnlyRequest(t, sent, http.MethodPost, "/api/v1/workspaces/demo--t1/sandboxes/sbx_1/start")
+	})
+}
+
+// startPath is the route parley sandbox start demo sbx_1 posts to.
+const startPath = sandboxesPath + "/sbx_1/start"
+
+func TestSandboxStart_Wait(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		polls     []string
+		errorType string
+	}{
+		{[]string{"provisioning", "ready"}, ""},
+		{[]string{"completed"}, ""},
+		{[]string{"failed"}, "wait_failed"},
+		{[]string{"stopped"}, "wait_failed"},
+		{[]string{"deleted"}, "wait_failed"},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.polls, ","), func(t *testing.T) {
+			t.Parallel()
+			hub := sandboxHub(t, tt.polls...).answer(http.MethodPost, startPath, http.StatusOK, sandboxRecord("provisioning", 0))
+
+			code, stdout, stderr := runSandboxWait(t, hub, "start", "demo", "sbx_1", "--wait")
+
+			wantWaitEnd(t, hub, startPath, code, stdout, stderr, tt.polls, tt.errorType)
+			if got := hub.count(http.MethodGet); got != len(tt.polls) {
+				t.Errorf("the hub got %d polls, want %d", got, len(tt.polls))
+			}
+		})
+	}
+	t.Run("provisioning past the timeout", func(t *testing.T) {
+		t.Parallel()
+		hub := sandboxHub(t, "provisioning").answer(http.MethodPost, startPath, http.StatusOK, sandboxRecord("provisioning", 0))
+
+		// 1s is the shortest --timeout the duration form allows.
+		code, stdout, stderr := runSandboxWait(t, hub, "start", "demo", "sbx_1", "--wait", "--timeout", "1s")
+
+		wantWaitEnd(t, hub, startPath, code, stdout, stderr, nil, "wait_timeout")
+	})
 }
 
 func TestSandboxListAndGet(t *testing.T) {

@@ -234,22 +234,46 @@ func (s *Service) commitIdentity(ctx context.Context, rec Record) ([][]string, e
 }
 
 // restore has the registered restorer restore the checkpoint of the sandbox
-// rec was created from. Without a restorer, or when the restorer or the
-// source's record fails, the step fails with ReasonProvisionFailed.
+// rec was created from.
 func (p *provisioning) restore(ctx context.Context) error {
-	s, rec := p.s, p.rec
-	s.mu.Lock()
-	r := s.restorer
-	s.mu.Unlock()
+	id := *p.rec.RestoredFrom
+	return p.restoreFrom(ctx, id, func() (Record, error) { return Get(ctx, p.s.deps.Store.Main(), id) })
+}
+
+// rebuild makes the working directory of a started sandbox again, which the
+// runtime lost while the sandbox was stopped: the checkout, then the restore
+// of the sandbox's own latest checkpoint, by the restorer that restores a
+// sandbox created from one. A sandbox without a checkout has nothing to
+// rebuild.
+func (p *provisioning) rebuild(ctx context.Context) error {
+	if p.rec.Checkout == nil {
+		return nil
+	}
+	if err := p.checkout(ctx); err != nil {
+		return err
+	}
+	return p.restoreFrom(ctx, p.rec.ID, func() (Record, error) { return p.rec, nil })
+}
+
+// restoreFrom has the registered restorer restore the checkpoint of the
+// sandbox id, whose record source reads, into the working directory.
+// Without a restorer, or when the record cannot be read, the step fails
+// with ReasonProvisionFailed; when the restorer fails, with
+// ReasonCheckoutFailed, as a failed checkout does.
+func (p *provisioning) restoreFrom(ctx context.Context, id string, source func() (Record, error)) error {
+	what := "restore the checkpoint of " + id
+	p.s.mu.Lock()
+	r := p.s.restorer
+	p.s.mu.Unlock()
 	if r == nil {
-		return failed(ReasonProvisionFailed, "restore the checkpoint of "+*rec.RestoredFrom, errNoRestorer)
+		return failed(ReasonProvisionFailed, what, errNoRestorer)
 	}
-	source, err := Get(ctx, s.deps.Store.Main(), *rec.RestoredFrom)
+	src, err := source()
 	if err != nil {
-		return failed(ReasonProvisionFailed, "restore the checkpoint of "+*rec.RestoredFrom, err)
+		return failed(ReasonProvisionFailed, what, err)
 	}
-	if err := r.Restore(ctx, rec, source); err != nil {
-		return failed(ReasonProvisionFailed, "restore the checkpoint of "+*rec.RestoredFrom, err)
+	if err := r.Restore(ctx, p.rec, src); err != nil {
+		return failed(ReasonCheckoutFailed, what, err)
 	}
 	return nil
 }

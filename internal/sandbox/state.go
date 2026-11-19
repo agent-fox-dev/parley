@@ -67,6 +67,10 @@ type Deps struct {
 	// Revoke revokes the PAT tokenID at now in the caller's transaction, as
 	// identity.RevokeTokenByID does.
 	Revoke func(ctx context.Context, tx *sql.Tx, tokenID string, now time.Time) error
+	// SetTokenExpiry sets the expiry of the PAT tokenID to at in the
+	// caller's transaction, as identity.SetTokenExpiryByID does: a change of
+	// a sandbox's ttl moves its hub credential's expiry with it.
+	SetTokenExpiry func(ctx context.Context, tx *sql.Tx, tokenID string, at time.Time) error
 	// ExternalURL is [server].external_url, the address a sandbox reaches the
 	// hub at; without one no sandbox gets a hub credential.
 	ExternalURL string

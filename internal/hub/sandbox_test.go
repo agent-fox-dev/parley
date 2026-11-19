@@ -115,7 +115,10 @@ func TestRun_ChecksTheRuntimeOnceBeforeListening(t *testing.T) {
 	if n := calls.Load(); n != 1 {
 		t.Errorf("the runtime factory was called %d times, want once", n)
 	}
-	want := []string{runtime.OpRelease, runtime.OpEnsureWorkspace, runtime.OpInstallProviderProfile, runtime.OpGetProviderProfile, runtime.OpValidatePolicy}
+	// The check's calls, then the listing of the first reconciliation pass,
+	// which runs before the hub listens too.
+	want := []string{runtime.OpRelease, runtime.OpEnsureWorkspace, runtime.OpInstallProviderProfile, runtime.OpGetProviderProfile, runtime.OpValidatePolicy,
+		runtime.OpListSandboxes, runtime.OpListProviders}
 	var got []string
 	for _, c := range rt.Calls() {
 		got = append(got, c.Op)

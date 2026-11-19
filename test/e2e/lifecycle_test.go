@@ -72,7 +72,7 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 				hooks.Add(1)
 				return nil
 			})
-			c.AddMaintenanceTask("sandbox_record_cleanup", func(context.Context, *hub.Runtime) error {
+			c.AddMaintenanceTask("lifecycle_task", func(context.Context, *hub.Runtime) error {
 				tasks.Add(1)
 				return nil
 			})

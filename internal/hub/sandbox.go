@@ -34,9 +34,25 @@ const (
 	// each follower returns once its runtime stream ends with its context.
 	sandboxLogCollectorWork  = "sandbox_log_collector"
 	sandboxLogCollectorGrace = 5 * time.Second
+	// sandboxLifecycleWork is the name of the lifecycle loop's background
+	// work, and sandboxLifecycleGrace how long the stop waits for it: a
+	// pass returns before its next runtime call once its context ends.
+	sandboxLifecycleWork  = "sandbox_lifecycle"
+	sandboxLifecycleGrace = 15 * time.Second
+	// sandboxReconcileHook is the name of the start hook that runs the
+	// first pass of the reconciliation with the runtime, and
+	// sandboxReconcileWork that of the background work that runs the
+	// others; sandboxReconcileGrace is how long the stop waits for it: a
+	// pass returns before its next runtime call once its context ends.
+	sandboxReconcileHook  = "sandbox_reconcile"
+	sandboxReconcileWork  = "sandbox_reconcile"
+	sandboxReconcileGrace = 15 * time.Second
 	// sandboxLogRetentionTask is the name of the maintenance task that
 	// deletes the stored log lines past their retention.
 	sandboxLogRetentionTask = "sandbox_log_retention"
+	// sandboxRecordCleanupTask is the name of the maintenance task that
+	// removes the records of sandboxes deleted more than a day ago.
+	sandboxRecordCleanupTask = "sandbox_record_cleanup"
 )
 
 // composeSandbox adds the sandbox feature: it makes the feature the owner of
@@ -59,8 +75,9 @@ const (
 // the workspaces' repositories, in which a create resolves its checkout,
 // the secret component's resolution, through which a create resolves the
 // profile's credentials and exposed secrets, the access component's
-// MintBound and identity.RevokeTokenByID, through which a sandbox's hub
-// credential is minted and revoked, [server].external_url, the org lookup
+// MintBound, identity.RevokeTokenByID and identity.SetTokenExpiryByID,
+// through which a sandbox's hub credential is minted, revoked and given a
+// new expiry, [server].external_url, the org lookup
 // that names a workspace's git remote, the user lookup that gives a
 // checkout its commit identity and the hub's logger; the other
 // sandbox packages register their delete and purge hooks on the service.
@@ -77,7 +94,28 @@ const (
 // sandboxes of every workspace through the service's source. The routes
 // that use a sandbox, POST exec, PUT and GET files, GET logs and GET attach
 // under /workspaces/:slug/sandboxes/:id, exist only through the service's
-// gate (Service.UseRoutes).
+// gate (Service.UseRoutes). POST
+// /workspaces/:slug/sandboxes/:id/checkpoint saves a ready sandbox's
+// working directory to its workspace through the service's checkpoint,
+// POST /workspaces/:slug/sandboxes/:id/stop stops a ready sandbox through
+// the service's stop, DELETE /workspaces/:slug/sandboxes/:id deletes a
+// sandbox through the service's delete, which runs the delete hooks, and
+// PATCH /workspaces/:slug/sandboxes/:id sets a sandbox's ttl, purpose and
+// labels through the service's extend.
+//
+// A workspace's deletion has the service delete the sandboxes of the
+// workspace and its forks first, by the system, with reason
+// workspace_deleted and no checkpoint, and its removal transaction, and that
+// of a fork, remove their sandbox records, running the purge hooks, and a
+// fork's checkpoint refs; an archive has the service stop the ready
+// sandboxes of the workspace and its forks with reason archived. These are
+// registered on the workspaces' collaborator set while the hub composes,
+// whether sandboxes are on or not. With sandboxes on, the start hook also
+// registers the service as the fork component's sandbox lifecycle, through
+// which a fork's removal deletes its sandboxes and its early expiry waits
+// while one is provisioning or ready. The maintenance task
+// sandbox_record_cleanup removes the records of sandboxes deleted more than
+// 24 hours ago, running the purge hooks.
 //
 // The output of each ready sandbox's main process and its policy log are
 // stored in a table of their own: with sandboxes on, the log collector runs
@@ -90,7 +128,21 @@ const (
 // create and every second on the hub's clock, and a start hook after the
 // runtime check reports the stored sandboxes' states and wakes it, so that
 // it takes up what a stopped process left. The stop cancels it without
-// changing a record.
+// changing a record. The service's restore is the restorer of the
+// provisionings: it seeds the working directory of a sandbox created from a
+// checkpoint, and that of a started sandbox whose working directory the
+// runtime lost. The lifecycle loop runs as background work too: every
+// minute on the hub's clock it stops the sandboxes idle for longer than
+// their idle timeout and deletes those whose expires_at has come, which it
+// also does at a timer set to the earliest expires_at.
+//
+// The records are reconciled with the runtime once at start, in a start
+// hook after the runtime check that never keeps the hub from starting, and
+// then every [sandbox].reconcile_interval on the hub's clock as background
+// work: the end of a ready sandbox's main process is recorded, a sandbox
+// the runtime lost is marked failed, the runtime's pause is followed, what
+// the runtime holds of no live sandbox is deleted, and the idle stops and
+// expiries that came due are done.
 //
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
@@ -106,7 +158,7 @@ func composeSandbox(c *Composition) {
 	}
 	c.AddSchemaStep(sandbox.SchemaStep)
 	c.AddSchemaStep(sandbox.LogSchemaStep)
-	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
+	registerSandboxCollaborators(c, svc)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := sandbox.Deps{
@@ -120,7 +172,8 @@ func composeSandbox(c *Composition) {
 				}
 				return c.Secrets().ResolveSecretsIn(ctx, q, slug, names)
 			},
-			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
+			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, SetTokenExpiry: identity.SetTokenExpiryByID,
+			ExternalURL: svc.ExternalURL(),
 			OrgSlug: func(ctx context.Context, id string) (string, error) {
 				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
 				return org.Slug, err
@@ -139,6 +192,7 @@ func composeSandbox(c *Composition) {
 		// sandboxes_disabled, as a hub with sandboxes off must.
 		if svc.Enabled() {
 			c.Forks().RegisterSandbox(svc)
+			c.Forks().RegisterSandboxes(svc)
 		}
 		return nil
 	})
@@ -148,6 +202,11 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.CreateRoute())
 	c.AddRoute(svc.GetRoute())
 	c.AddRoute(svc.ListRoute())
+	c.AddRoute(svc.CheckpointRoute())
+	c.AddRoute(svc.StopRoute())
+	c.AddRoute(svc.StartRoute())
+	c.AddRoute(svc.DeleteRoute())
+	c.AddRoute(svc.ExtendRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
@@ -184,11 +243,43 @@ func composeSandbox(c *Composition) {
 		// context's, whatever clock the hub was given.
 		return svc.Start(ctx, client, sandbox.CheckOptions{Recorder: rec})
 	})
+	composeSandboxWork(c, svc)
+}
+
+// registerSandboxCollaborators registers what the sandbox service takes
+// part in while the hub composes: the purge hook of the stored logs, the
+// service as its own restorer of checkpoints, and the service on the
+// workspaces' collaborator set (ADR 07), through which a workspace's
+// archive and deletion reach its sandboxes whether sandboxes are on or not:
+// with them off the records are still deleted and removed, and no runtime
+// is called.
+func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
+	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
+	svc.RegisterRestorer(svc)
+	td := c.workspaces.Teardown()
+	td.RegisterSandboxRemover(svc)
+	td.RegisterArchiveObserver(svc)
+	td.RegisterRemover(svc.RemoveWorkspaceRecords)
+}
+
+// composeSandboxWork adds the sandbox feature's work besides the requests,
+// after the runtime check's start hook: the start hooks that resume the
+// provisionings an earlier process left and run the first reconcile pass,
+// the background work of the provisioner, the log collector, the idle and
+// expiry passes and the reconciliation, and the maintenance tasks of log
+// retention and record cleanup. With sandboxes off each returns at once.
+func composeSandboxWork(c *Composition, svc *sandbox.Service) {
 	c.AddStartHook(sandboxProvisionerHook, func(ctx context.Context, _ *Runtime) error {
 		if !svc.Enabled() {
 			return nil
 		}
 		return svc.ResumeProvisioning(ctx)
+	})
+	c.AddStartHook(sandboxReconcileHook, func(ctx context.Context, _ *Runtime) error {
+		if !svc.Enabled() || svc.Client() == nil {
+			return nil
+		}
+		return svc.ReconcileAtStart(ctx)
 	})
 	c.AddBackgroundWork(sandboxProvisionerWork, sandboxProvisionerGrace, func(ctx context.Context, _ *Runtime) {
 		svc.RunProvisioner(ctx)
@@ -196,8 +287,17 @@ func composeSandbox(c *Composition) {
 	c.AddBackgroundWork(sandboxLogCollectorWork, sandboxLogCollectorGrace, func(ctx context.Context, _ *Runtime) {
 		svc.CollectLogs(ctx)
 	})
+	c.AddBackgroundWork(sandboxLifecycleWork, sandboxLifecycleGrace, func(ctx context.Context, _ *Runtime) {
+		svc.RunLifecycle(ctx)
+	})
+	c.AddBackgroundWork(sandboxReconcileWork, sandboxReconcileGrace, func(ctx context.Context, _ *Runtime) {
+		svc.RunReconcile(ctx)
+	})
 	c.AddMaintenanceTask(sandboxLogRetentionTask, func(ctx context.Context, _ *Runtime) error {
 		return svc.RetainLogs(ctx)
+	})
+	c.AddMaintenanceTask(sandboxRecordCleanupTask, func(ctx context.Context, _ *Runtime) error {
+		return svc.CleanupRecords(ctx)
 	})
 }
 

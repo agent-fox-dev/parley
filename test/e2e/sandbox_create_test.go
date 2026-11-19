@@ -40,6 +40,9 @@ type sandboxCreateHub struct {
 	key     string
 	org     string
 	secrets *secret.Component
+	// workspaces is the hub's workspace service, which knows where each
+	// workspace's repository lives.
+	workspaces *workspace.Service
 
 	mu sync.Mutex
 	// commands are the commands the fake ran, by sandbox.
@@ -58,13 +61,15 @@ func startSandboxCreateHub(t *testing.T, profiles string, compose ...func(*hub.C
 // sandboxHubConfig is what a sandbox create hub is started with besides
 // what every one has: the TOML of its [[sandbox.profiles]], keys of its
 // [sandbox] table, the options of its fake runtime, what wraps the hub's
-// client of the fake (nil for nothing) and functions run on its
-// composition.
+// client of the fake (nil for nothing), functions run on its composition
+// and the clock the test moves (nil for the real clock), which is the hub's
+// clock and the one the sandbox feature's timers run on.
 type sandboxHubConfig struct {
 	profiles, sandboxKeys string
 	fake                  []runtimetest.Option
 	wrap                  func(runtime.Client) runtime.Client
 	compose               []func(*hub.Composition)
+	clock                 *hubtest.JobClock
 }
 
 // startSandboxCreateHubWith starts a sandbox create hub as cfg says.
@@ -81,8 +86,15 @@ func startSandboxCreateHubWith(t *testing.T, cfg sandboxHubConfig) *sandboxCreat
 		}
 		return 0
 	})
-	var workspaces *workspace.Service
+	var (
+		workspaces *workspace.Service
+		hubNow     func() time.Time
+	)
+	if cfg.clock != nil {
+		hubNow = cfg.clock.Now
+	}
 	h.Hub = hubtest.StartWith(t, hubtest.Config{
+		Now:    hubNow,
 		Server: "external_url = \"https://hub.test\"\n",
 		TOML: "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" + cfg.sandboxKeys +
 			"[[sandbox.credentials]]\nname = \"model\"\nprovider_profile = \"anthropic\"\nsecret = \"MODEL_KEY\"\n" + cfg.profiles,
@@ -90,6 +102,12 @@ func startSandboxCreateHubWith(t *testing.T, cfg sandboxHubConfig) *sandboxCreat
 		Env:   map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))},
 		Compose: func(c *hub.Composition) {
 			workspaces, h.secrets = c.Workspaces(), c.Secrets()
+			h.workspaces = workspaces
+			if cfg.clock != nil {
+				c.AdjustSandbox(func(d *sandbox.Deps) {
+					d.NewTimer = func(d time.Duration) sandbox.Timer { return cfg.clock.NewTimer(d) }
+				})
+			}
 			c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 				client := h.fake.Client(s.OpenShellWorkspace, deps.Recorder)
 				if cfg.wrap != nil {

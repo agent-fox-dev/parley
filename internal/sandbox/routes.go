@@ -159,6 +159,71 @@ func (s *Service) GetRoute() server.Route {
 	})
 }
 
+// CheckpointRoute declares POST /workspaces/:slug/sandboxes/:id/checkpoint:
+// it saves the working directory of the ready sandbox id as a checkpoint
+// for the caller and answers with the sandbox (see serveCheckpoint). It
+// needs the scope sandboxes:write of a PAT and write access to the
+// workspace; the admin token acts as an owner.
+func (s *Service) CheckpointRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/checkpoint",
+		Handler: s.serveCheckpoint,
+	})
+}
+
+// StopRoute declares POST /workspaces/:slug/sandboxes/:id/stop: it stops
+// the sandbox id for the caller, keeping its working directory, and
+// answers with the sandbox in every state (see serveStop). It needs the
+// scope sandboxes:write of a PAT and write access to the workspace; the
+// admin token acts as an owner.
+func (s *Service) StopRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/stop",
+		Handler: s.serveStop,
+	})
+}
+
+// StartRoute declares POST /workspaces/:slug/sandboxes/:id/start: it
+// starts the stopped, completed or failed sandbox id again for the caller
+// and answers with the sandbox (see serveStart). It needs the scope
+// sandboxes:write of a PAT and write access to the workspace; the admin
+// token acts as an owner.
+func (s *Service) StartRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPost,
+		Pattern: "/workspaces/:slug/sandboxes/:id/start",
+		Handler: s.serveStart,
+	})
+}
+
+// DeleteRoute declares DELETE /workspaces/:slug/sandboxes/:id: it deletes
+// the sandbox id for the caller, with a checkpoint first as the query
+// checkpoint or the profile asks, and answers 204, also for a sandbox
+// already deleted (see serveDelete). It needs the scope sandboxes:write of a
+// PAT and write access to the workspace; the admin token acts as an owner.
+func (s *Service) DeleteRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodDelete,
+		Pattern: "/workspaces/:slug/sandboxes/:id",
+		Handler: s.serveDelete,
+	})
+}
+
+// ExtendRoute declares PATCH /workspaces/:slug/sandboxes/:id: it sets the
+// ttl, purpose and labels the body gives on the sandbox id, which is not
+// deleted, and answers with the sandbox (see serveExtend). It needs the
+// scope sandboxes:write of a PAT and write access to the workspace; the
+// admin token acts as an owner.
+func (s *Service) ExtendRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPatch,
+		Pattern: "/workspaces/:slug/sandboxes/:id",
+		Handler: s.serveExtend,
+	})
+}
+
 // ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
 // of the workspace, newest first, paged, filtered by the query (see
 // listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and
