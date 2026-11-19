@@ -3,9 +3,13 @@ package gitrepo_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -208,5 +212,237 @@ func TestCommitsBetween_ListsEveryCommitOfTheHeadForNoBase(t *testing.T) {
 	got, err := f.repo.CommitsBetween(context.Background(), "", f.id(t, "feature"), 0)
 	if err != nil || len(got) < 2 || !slices.Equal(got, want) {
 		t.Errorf("CommitsBetween(\"\", feature, 0) = %v, %v; want %v", got, err, want)
+	}
+}
+
+// walkStream is main with c1 to c5, side made on c2 with s1 and s2, merged,
+// the merge of side into c4, topic on c5 with t1 and t2, whose committer
+// time is older than its parent's, and orphan, a root of its own. Every
+// message shares a long body, so that a repack stores commits as deltas.
+func walkStream() string {
+	body := strings.Repeat("A body every commit of the fixture shares, so that git deltifies them.\n", 40)
+	var b strings.Builder
+	at := 1700000000
+	commit := func(ref, mark, msg string, from ...string) {
+		at += 60
+		fmt.Fprintf(&b, "commit refs/heads/%s\nmark :%s\ncommitter T <t@example.invalid> %d +0100\ndata %d\n%s\n", ref, mark, at, len(msg+body), msg+body)
+		for i, f := range from {
+			if i == 0 {
+				fmt.Fprintf(&b, "from :%s\n", f)
+			} else {
+				fmt.Fprintf(&b, "merge :%s\n", f)
+			}
+		}
+		fmt.Fprintf(&b, "M 100644 inline %s.txt\ndata %d\n%s\n\n", mark, len(mark), mark)
+	}
+	commit("main", "1", "c1\n")
+	commit("main", "2", "c2\n", "1")
+	commit("main", "3", "c3\n", "2")
+	commit("main", "4", "c4\n", "3")
+	commit("main", "5", "c5\n", "4")
+	commit("side", "11", "s1\n", "2")
+	commit("side", "12", "s2\n", "11")
+	commit("merged", "13", "merge side\n", "4", "12")
+	commit("topic", "21", "t1\n", "5")
+	at -= 3600
+	commit("topic", "22", "t2\n", "21")
+	commit("orphan", "31", "orphan\n")
+	return b.String()
+}
+
+// walkQuery is a question the walks answer, asked of the repository and of
+// git itself, each answer written as one comparable string.
+type walkQuery struct {
+	name string
+	ours func(ctx context.Context, repo *gitrepo.Repo, id map[string]string) string
+	git  func(t *testing.T, dir string, id map[string]string) string
+}
+
+// walkQueries ask IsAncestor, MergeBase, CommitsBetween and ReadCommits
+// about walkStream's commits.
+func walkQueries() []walkQuery {
+	var qs []walkQuery
+	for _, q := range [][2]string{{"c1", "c5"}, {"c5", "c2"}, {"s1", "m"}, {"s2", "c5"}, {"c3", "c3"}, {"orphan", "t2"}} {
+		qs = append(qs, walkQuery{"IsAncestor(" + q[0] + ", " + q[1] + ")",
+			func(ctx context.Context, repo *gitrepo.Repo, id map[string]string) string {
+				return fmt.Sprint(repo.IsAncestor(ctx, id[q[0]], id[q[1]]))
+			},
+			func(t *testing.T, dir string, id map[string]string) string {
+				_, err := gitrepotest.Run(dir, "", "merge-base", "--is-ancestor", id[q[0]], id[q[1]])
+				return fmt.Sprint(err == nil, nil)
+			}})
+	}
+	for _, q := range [][2]string{{"c5", "s2"}, {"t2", "m"}, {"s1", "s2"}, {"c3", "c3"}, {"c5", "orphan"}} {
+		qs = append(qs, walkQuery{"MergeBase(" + q[0] + ", " + q[1] + ")",
+			func(ctx context.Context, repo *gitrepo.Repo, id map[string]string) string {
+				return fmt.Sprint(repo.MergeBase(ctx, id[q[0]], id[q[1]]))
+			},
+			func(t *testing.T, dir string, id map[string]string) string {
+				base, _ := gitrepotest.Run(dir, "", "merge-base", id[q[0]], id[q[1]])
+				return fmt.Sprint(base, nil)
+			}})
+	}
+	for _, q := range [][2]string{{"c2", "c5"}, {"", "t2"}, {"s2", "t2"}, {"t2", "c3"}, {"m", "t2"}, {"orphan", "s2"}} {
+		qs = append(qs, walkQuery{"CommitsBetween(" + q[0] + ", " + q[1] + ")",
+			func(ctx context.Context, repo *gitrepo.Repo, id map[string]string) string {
+				return fmt.Sprint(repo.CommitsBetween(ctx, id[q[0]], id[q[1]], 0))
+			},
+			func(t *testing.T, dir string, id map[string]string) string {
+				revs := id[q[1]]
+				if q[0] != "" {
+					revs = id[q[0]] + ".." + revs
+				}
+				var ids []string
+				ids = append(ids, strings.Fields(gitrepotest.Git(t, dir, "rev-list", "--reverse", "--topo-order", revs))...)
+				return fmt.Sprint(ids, nil)
+			}})
+	}
+	read := []string{"t2", "c1", "m"}
+	qs = append(qs, walkQuery{"ReadCommits(t2, c1, m)",
+		func(ctx context.Context, repo *gitrepo.Repo, id map[string]string) string {
+			commits, err := repo.ReadCommits(ctx, []string{id[read[0]], id[read[1]], id[read[2]]})
+			var b strings.Builder
+			for _, c := range commits {
+				fmt.Fprintf(&b, "%s %s %v %s %s %d %q\n", c.ID, c.Tree, c.Parents, c.Committer.Name, c.Committer.Email,
+					c.Committer.Time.Unix(), strings.TrimSpace(c.Message))
+			}
+			return fmt.Sprint(b.String(), err)
+		},
+		func(t *testing.T, dir string, id map[string]string) string {
+			var b strings.Builder
+			for _, name := range read {
+				f := strings.Split(gitrepotest.Git(t, dir, "show", "-s", "--format=%H%n%T%n%P%n%cn%n%ce%n%ct", id[name]), "\n")
+				_, msg, _ := strings.Cut(gitrepotest.Git(t, dir, "cat-file", "commit", id[name]), "\n\n")
+				fmt.Fprintf(&b, "%s %s %v %s %s %s %q\n", f[0], f[1], strings.Fields(f[2]), f[3], f[4], f[5], strings.TrimSpace(msg))
+			}
+			return fmt.Sprint(b.String(), nil)
+		}})
+	return qs
+}
+
+func TestCommitWalks_AnswerAsGitDoesWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir := filepath.Join(root, "repo.git")
+	gitrepotest.InitBare(t, dir, "main")
+	if _, err := gitrepotest.Run(dir, walkStream(), "fast-import", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	id := map[string]string{}
+	names := []string{"c1", "c2", "c3", "c4", "c5", "s1", "s2", "m", "t1", "t2", "orphan"}
+	revs := []string{"main~4", "main~3", "main~2", "main~1", "main", "side~1", "side", "merged", "topic~1", "topic", "orphan"}
+	for i, v := range strings.Fields(gitrepotest.Git(t, dir, append([]string{"rev-parse"}, revs...)...)) {
+		id[names[i]] = v
+	}
+	// The fork reads every object through its alternates.
+	fork := filepath.Join(root, "fork.git")
+	gitrepotest.InitBare(t, fork, "main")
+	if err := os.WriteFile(filepath.Join(fork, "objects", "info", "alternates"), []byte(filepath.Join(dir, "objects")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []struct {
+		name, dir string
+		prepare   func() bool
+	}{
+		// fast-import writes a small import as loose objects.
+		{"loose objects", dir, func() bool {
+			return strings.Contains(gitrepotest.Git(t, dir, "count-objects", "-v"), "\nin-pack: 0\n")
+		}},
+		{"a pack holding commits as deltas", dir, func() bool {
+			gitrepotest.Git(t, dir, "repack", "-a", "-d", "-f", "-q", "--window=50", "--depth=50")
+			gitrepotest.Git(t, dir, "prune-packed")
+			packs, _ := filepath.Glob(filepath.Join(dir, "objects", "pack", "*.idx"))
+			return len(packs) == 1 && slices.ContainsFunc(strings.Split(gitrepotest.Git(t, dir, "verify-pack", "-v", packs[0]), "\n"),
+				func(l string) bool { f := strings.Fields(l); return len(f) == 7 && f[1] == "commit" })
+		}},
+		{"a fork reading through its alternates", fork, func() bool { return true }},
+	} {
+		if !stage.prepare() {
+			t.Fatalf("%s: the fixture does not hold its objects so", stage.name)
+		}
+		var calls atomic.Int32
+		repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), stage.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range walkQueries() {
+			want := q.git(t, stage.dir, id)
+			calls.Store(0)
+			if got := q.ours(context.Background(), repo, id); got != want {
+				t.Errorf("%s: %s = %s; git answers %s", stage.name, q.name, got, want)
+			}
+			if n := calls.Load(); n != 0 {
+				t.Errorf("%s: %s ran %d git processes, want none", stage.name, q.name, n)
+			}
+		}
+	}
+}
+
+func TestCommitWalks_LeaveToGitWhatOnlyGitSettles(t *testing.T) {
+	t.Parallel()
+	who := func(at int) string { return fmt.Sprintf("committer T <t@example.invalid> %d +0000\n", at) }
+	// x and y each merge the other's first commit: their merge bases are
+	// x1 and y1, and git picks one of them.
+	crisscross := "commit refs/heads/x\nmark :1\n" + who(1700000000) + "data 4\nbase\n\n" +
+		"commit refs/heads/x\nmark :2\n" + who(1700000060) + "data 2\nx1\nfrom :1\n\n" +
+		"commit refs/heads/y\nmark :3\n" + who(1700000120) + "data 2\ny1\nfrom :1\n\n" +
+		"commit refs/heads/x\nmark :4\n" + who(1700000180) + "data 2\nx2\nfrom :2\nmerge :3\n\n" +
+		"commit refs/heads/y\nmark :5\n" + who(1700000240) + "data 2\ny2\nfrom :3\nmerge :2\n\n"
+	for _, c := range []struct {
+		name    string
+		prepare func(t *testing.T, dir string)
+		ours    func(t *testing.T, repo *gitrepo.Repo, dir string) string
+		git     func(t *testing.T, dir string) string
+	}{
+		{"two merge bases", func(t *testing.T, dir string) {
+			if _, err := gitrepotest.Run(dir, crisscross, "fast-import", "--quiet"); err != nil {
+				t.Fatal(err)
+			}
+		}, func(t *testing.T, repo *gitrepo.Repo, dir string) string {
+			return fmt.Sprint(repo.MergeBase(context.Background(), gitrepotest.Git(t, dir, "rev-parse", "x"), gitrepotest.Git(t, dir, "rev-parse", "y")))
+		}, func(t *testing.T, dir string) string {
+			return fmt.Sprint(gitrepotest.Git(t, dir, "merge-base", "x", "y"), nil)
+		}},
+		{"a range with merge commits", func(t *testing.T, dir string) {}, func(t *testing.T, repo *gitrepo.Repo, dir string) string {
+			return fmt.Sprint(repo.CommitsBetween(context.Background(), gitrepotest.Git(t, dir, "rev-parse", "main~4"), gitrepotest.Git(t, dir, "rev-parse", "merged"), 0))
+		}, func(t *testing.T, dir string) string {
+			return fmt.Sprint(strings.Fields(gitrepotest.Git(t, dir, "rev-list", "--reverse", "--topo-order", "main~4..merged")), nil)
+		}},
+		{"a replace ref", func(t *testing.T, dir string) {
+			gitrepotest.Git(t, dir, "replace", gitrepotest.Git(t, dir, "rev-parse", "main~1"), gitrepotest.Git(t, dir, "rev-parse", "orphan"))
+		}, func(t *testing.T, repo *gitrepo.Repo, dir string) string {
+			ids := strings.Fields(gitrepotest.Git(t, dir, "--no-replace-objects", "rev-parse", "main~4", "main"))
+			return fmt.Sprint(repo.IsAncestor(context.Background(), ids[0], ids[1]))
+		}, func(t *testing.T, dir string) string {
+			ids := strings.Fields(gitrepotest.Git(t, dir, "--no-replace-objects", "rev-parse", "main~4", "main"))
+			_, err := gitrepotest.Run(dir, "", "merge-base", "--is-ancestor", ids[0], ids[1])
+			return fmt.Sprint(err == nil, nil)
+		}},
+		{"a shallow repository", func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "shallow"), []byte(gitrepotest.Git(t, dir, "rev-parse", "main~2")+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, func(t *testing.T, repo *gitrepo.Repo, dir string) string {
+			return fmt.Sprint(repo.CommitsBetween(context.Background(), "", gitrepotest.Git(t, dir, "rev-parse", "main"), 0))
+		}, func(t *testing.T, dir string) string {
+			return fmt.Sprint(strings.Fields(gitrepotest.Git(t, dir, "rev-list", "--reverse", "--topo-order", "main")), nil)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			dir := filepath.Join(t.TempDir(), "repo.git")
+			gitrepotest.InitBare(t, dir, "main")
+			if _, err := gitrepotest.Run(dir, walkStream(), "fast-import", "--quiet"); err != nil {
+				t.Fatal(err)
+			}
+			c.prepare(t, dir)
+			repo, err := gitrepo.Git{}.Open(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := c.ours(t, repo, dir), c.git(t, dir); got != want {
+				t.Errorf("got %s; git answers %s", got, want)
+			}
+		})
 	}
 }

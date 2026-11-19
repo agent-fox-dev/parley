@@ -198,45 +198,67 @@ func packOffset(index io.ReaderAt, id []byte) (offset int64, found, ok bool) {
 // for a delta the offset of its base in the same pack or its base's raw
 // id.
 func packEntry(pack io.ReaderAt, offset int64) (kind int, base int64, baseID []byte, ok bool) {
+	h, ok := readPackHeader(pack, offset)
+	return h.kind, h.base, h.baseID, ok
+}
+
+// packHeader is the header of a pack entry: its kind; the size of its
+// content, a delta's own for a delta; for a delta the offset of its base in
+// the same pack or its base's raw id; and the offset of its compressed
+// content.
+type packHeader struct {
+	kind   int
+	size   int64
+	base   int64
+	baseID []byte
+	data   int64
+}
+
+// readPackHeader reads the header of the pack entry at offset.
+func readPackHeader(pack io.ReaderAt, offset int64) (h packHeader, ok bool) {
 	// The type and size take at most 10 bytes for a 64-bit size, an offset
 	// delta's base as many, a reference delta's 20.
 	var buf [32]byte
 	n, err := pack.ReadAt(buf[:], offset)
 	if err != nil && n == 0 {
-		return 0, 0, nil, false
+		return packHeader{}, false
 	}
 	b := buf[:n]
 	i := 0
-	kind = int(b[0]>>4) & 7
-	for b[i]&0x80 != 0 {
-		if i++; i >= len(b) {
-			return 0, 0, nil, false
+	h.kind = int(b[0]>>4) & 7
+	h.size = int64(b[0] & 0x0f)
+	for shift := 4; b[i]&0x80 != 0; shift += 7 {
+		if i++; i >= len(b) || shift > 56 {
+			return packHeader{}, false
 		}
+		h.size |= int64(b[i]&0x7f) << shift
 	}
 	i++
-	switch kind {
+	switch h.kind {
 	case packOfsDelta:
 		if i >= len(b) {
-			return 0, 0, nil, false
+			return packHeader{}, false
 		}
 		c := b[i]
 		back := int64(c & 0x7f)
 		for c&0x80 != 0 {
 			if i++; i >= len(b) || back > 1<<55 {
-				return 0, 0, nil, false
+				return packHeader{}, false
 			}
 			c = b[i]
 			back = (back+1)<<7 | int64(c&0x7f)
 		}
 		if back <= 0 || back > offset {
-			return 0, 0, nil, false
+			return packHeader{}, false
 		}
-		return kind, offset - back, nil, true
+		h.base, h.data = offset-back, offset+int64(i)+1
 	case packRefDelta:
 		if i+20 > len(b) {
-			return 0, 0, nil, false
+			return packHeader{}, false
 		}
-		return kind, 0, bytes.Clone(b[i : i+20]), true
+		h.baseID, h.data = bytes.Clone(b[i:i+20]), offset+int64(i)+20
+	default:
+		h.data = offset + int64(i)
 	}
-	return kind, 0, nil, true
+	return h, h.size >= 0
 }

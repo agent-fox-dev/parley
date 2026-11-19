@@ -59,7 +59,7 @@ func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Si
 		}
 		commitRange = from + ".." + head
 	}
-	commits, err := r.replayed(ctx, commitRange)
+	commits, err := r.replayed(ctx, from, head, commitRange)
 	switch {
 	case err != nil:
 		return "", nil, nil, err
