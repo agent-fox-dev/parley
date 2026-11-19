@@ -34,7 +34,7 @@ command-line client. Both are written in Go, in the module
 | `internal/jobs` | the durable job queue: jobs of a type and workspace with an opaque payload and result, stored in the transactional store (`SchemaStep`), enqueued with one pending job per type and workspace (`Enqueue`, `EnqueueFollowUp`, `DuplicateError`), claimed by a dispatcher (`Run`, `Pass`) that runs at most 4 attempts at once and one per type and workspace on the handler registered for the type (`Handler`, `Register`), settled as `completed`, `failed` with backoff or `dead_letter` (`Permanent`, `WithDetail`), recovered at start (`Recover`), stopped with a 30-second grace, counted (`Depth`), cancelled, requeued and removed with their workspace (see [Durable jobs](#durable-jobs)) |
 | `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the run again at a start of the attempts a stop left running (`recover.go`, `Recover`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, the read routes of the attempts per change, per workspace and by id, and the reads of a change's current conflict report and of a `content` file of it as text with conflict markers (`current_conflict.go`, `conflict_handlers.go`); and the rules around landing (see [Land rules](#land-rules)): the path limit of a path-scoped token (`pathlimit.go`: `CheckPaths`, the version-files lookup `VersionFiles()` of the push rule engine, and `PathGuard()`, the restack's version guard and a request guard), the override (`override.go`: `OverrideGuard()`, a request guard, and `PendingOverride`, the override rule), the automatic lander (`autoland.go`: `AutoLander`, `AutoLandStep`) and the revert route (`revert.go`) (see [Landing](#landing)) |
 | `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause; both select the rules of one evaluation through one selector, which decides the rules' `targets` once and compiles their globs once, and stop with the context's error when it ends, looked at before each file; `MatchPath` matches one element of a glob against 64 positions of the path at a time and stops when no position is left, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the verdicts and check results on a change's versions (`ReviewStep`, the tables `change_approvals` and `change_checks`), the evidence source over them (`Facts`), the version observer that carries verdicts to a patch-equivalent version (`VersionObserver`), and the include expanders of the change (`ExpandApprovals`, `ExpandChecks`), the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, the event writer, `EventWriter`, the change records, `Changes`, which the change component is, and the repository opener, `Repos`), which serves `GET` and `PUT /workspaces/:slug/policy` and `POST /workspaces/:slug/policy/evaluate`, the dry evaluation of paths or a change that writes nothing, and the five routes of verdicts and check results (`Routes`), deletes a deleted workspace's revisions, verdicts and check results (`WorkspaceDeleted`), reads the files of a change (`Files`, its `ChangeFiles`: those between the change's `base_sha` and `head_sha` in its target workspace's repository, both paths of a rename or copy, no cap), is the change component's landing evaluator (`EvaluateLanding`), re-evaluates and stores a change's landing (`Reevaluate`, in a transaction of its own, and `ReevaluateIn`, in the caller's; `ErrChangeNotFound`, `ErrChangeClosed`), and every draft and open change of the workspace in the transaction of a `PUT`, and judges the version a land lands (`JudgeVersion`: the change read and the version judged in one transaction, the landing stored for the current version only); see [Landing policy](#landing-policy) |
-| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages; the stored sandboxes (see [Stored sandboxes](#stored-sandboxes)): the record (`Record`, table `sandboxes` created by `SchemaStep`, `NewID`, `WorkDir` `/workspace`) and its store functions (`Insert`, `Get`, `GetIn`, `ListByState`, `Update` with the `Set…` fields, `Remove`), `(*Service).Transition` and `TransitionTx`, the one conditional move of a sandbox's state with its event, the object (`Object`, `ObjectOf`), the delete and purge hooks (`RegisterDeleteHook`, `RegisterPurgeHook`, `RunDeleteHooks`, `RunPurgeHooks`), the create (`Create`, `CreateRoute`, `ParseTTL`, `ExpiresAt`, `CheckQuota` with the `Limits`, `FamilyRoot`, `Resolve`, the session linker `RegisterSessionLinker`), the hub credential (`MintHubCredential`, `RevokeHubCredential`, `HubCredential`), the scrubbing of sandbox text (`Scrub`, `SetValues`, `ValuesOf`, `ScrubSandbox`, `ForgetValues`), the provisioner (`RunProvisioner`, `WakeProvisioner`, `ResumeProvisioning`, `ProtectedRules`, `RegisterWorkspaceRuleProvider`, `RegisterPolicyComposer`, `RegisterRestorer`), the metrics (`ReportStates`, `CreatesMetric`, `SandboxesMetric`, `SecondsMetric`), the reads (`GetRoute`, `ListRoute`, `StoredSource`) and the fork component (`CreateSandbox`), bound once at start by `Bind(Deps)` |
+| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages; the stored sandboxes (see [Stored sandboxes](#stored-sandboxes)): the record (`Record`, table `sandboxes` created by `SchemaStep`, `NewID`, `WorkDir` `/workspace`) and its store functions (`Insert`, `Get`, `GetIn`, `ListByState`, `Update` with the `Set…` fields, `Remove`), `(*Service).Transition` and `TransitionTx`, the one conditional move of a sandbox's state with its event, the object (`Object`, `ObjectOf`), the delete and purge hooks (`RegisterDeleteHook`, `RegisterPurgeHook`, `RunDeleteHooks`, `RunPurgeHooks`), the create (`Create`, `CreateRoute`, `ParseTTL`, `ExpiresAt`, `CheckQuota` with the `Limits`, `FamilyRoot`, `Resolve`, the session linker `RegisterSessionLinker`), the hub credential (`MintHubCredential`, `RevokeHubCredential`, `HubCredential`), the scrubbing of sandbox text (`Scrub`, `SetValues`, `ValuesOf`, `ScrubSandbox`, `ForgetValues`), the provisioner (`RunProvisioner`, `WakeProvisioner`, `ResumeProvisioning`, `ProtectedRules`, `RegisterWorkspaceRuleProvider`, `RegisterPolicyComposer`, `RegisterRestorer`), the metrics (`ReportStates`, `CreatesMetric`, `SandboxesMetric`, `SecondsMetric`), the reads (`GetRoute`, `ListRoute`, `StoredSource`) and the fork component (`CreateSandbox`), bound once at start by `Bind(Deps)`; and the routes that use a sandbox (see [Using a sandbox](#using-a-sandbox)): `UseRoutes` (exec, file transfer, logs, attach behind one gate), the stored log lines (`LogLine`, table `sandbox_logs` created by `LogSchemaStep`, `LogLines` with `LogSelection`, `LogSourceProcess`, `LogSourcePolicy`, `MaxLogLine`, `PurgeLogLines`), their collector and retention (`CollectLogs`, `LogCollectInterval`, `LogLinesStored`, `RetainLogs`, `LogFollowInterval`), and the operation observers (`RegisterObserver`, `Observer`, `Operation`, the `Operation…` kinds and `ExecResult…` results, `ExecMetric`) |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
@@ -146,7 +146,7 @@ handler answers an empty pathspec `400`), and
 `func(http.ResponseWriter, *http.Request) error`: it writes its own response
 on success, and an error it returns is written as the envelope. The route's
 declarations are `Public`, `Create` with its `ShowOnce` members, its own
-`MaxBodySize`, `ContentType` and `CacheControl`, its `Feature` check, the one
+`MaxBodySize`, `ContentType` and `CacheControl`, `StreamBody` (the handler reads the body itself), its `Feature` check, the one
 `Scope` a personal access token needs (a name the server does not interpret)
 and `Marks`, named values whose meaning the installed checks define.
 `Register` adds the route to the server's route table and panics on a
@@ -186,7 +186,10 @@ in a fixed order and stops at the first error:
    unsupported_media_type` unless the `Content-Type` media type is the
    route's `ContentType` or, when it states none, `application/json`. The
    buffered bytes replace the request's body and stay in its context, so a
-   later stage can read them without consuming the body the handler reads;
+   later stage can read them without consuming the body the handler reads.
+   For a route that sets `StreamBody` the stage reads nothing and checks
+   neither the size nor the content type: the handler streams the body and
+   enforces its own limit and media types;
 4. the route's `Feature` check, the binding guard (`SetBindingGuard`), the
    scope check (`SetScopeCheck`) and the access checks (`AddAccessCheck`), in
    that order; each is a `server.Check`, `func(*http.Request) error`, and an
@@ -6770,6 +6773,97 @@ whose fork transaction rolled back); a caller that removes a record calls
 `ReportStates`. And `parley_sandbox_seconds`, the seconds a sandbox was
 `ready` when it leaves `ready` for an ended state, observed by the
 transition's report.
+
+## Using a sandbox
+
+`(*sandbox.Service).UseRoutes` declares the five routes that use a sandbox
+(`internal/sandbox/use.go`), which `composeSandbox` adds: `POST …/exec`,
+`PUT …/files`, `GET …/files`, `GET …/logs` and `GET …/attach` under
+`/workspaces/:slug/sandboxes/:id`. They come from one table, `useTable`, each
+entry with its kind (read or write, through `WorkspaceRoute`), whether the
+no-widening rule applies, the states it serves, its body limit (exec: 8 MiB of
+JSON) or `StreamBody` (the upload), its validation and its operation. So the
+pipeline runs the feature check, the binding guard, the PAT scope and
+workspace access, and then the entry's handler, the gate, runs in a fixed
+order: the sandbox (`readSandbox`, `404 sandbox_not_found`), `RequireCovers`
+with the record's `hub_access` (exec, upload, attach), the validation, the
+state (`409 sandbox_not_ready`), and only then the operation, which gets the
+caller, the slug and the record and looks none of them up again. An error the
+operation returns that is a runtime error becomes `502
+sandbox_runtime_error`, its text passed through `ScrubSandbox` and then the
+hub's scrubber; any other error keeps its kind with its text scrubbed the same
+way for the log. An operation that answers what it can act on (a path the
+runtime does not find) returns a `*server.Error` itself. The runtime's
+sandbox is named by the sandbox id.
+
+**Exec** (`exec.go`, `exec_stream.go`). One `executor` per service holds the
+count of running execs per sandbox in memory: a slot is taken after the gate,
+`429 rate_limited` without `Retry-After` when `[sandbox].max_concurrent_execs`
+are taken, and released when the exec ends in any way. A command runs through
+`ExecStream` with the request's `env` alone (the runtime lays it over the
+sandbox's environment), under a context that ends at the timeout (a timer of
+the hub's clock, `Deps.NewTimer`), when the caller leaves and when
+`Deps.Shutdown` closes; ending it kills the command. The collected form keeps
+1 MiB per stream and drains the rest; the streamed form, chosen by an
+`Accept` that names `text/event-stream`, writes its headers once the runtime
+has started the command, so every refusal before is the JSON envelope, and
+flushes each frame of at most 32 KiB.
+
+**Files** (`files.go`). `resolvePath` joins a relative path with `WorkDir` and
+cleans it lexically; nothing outside `/workspace` passes. The upload reads
+the body itself (the route's `StreamBody`), counted against
+`[sandbox].max_transfer_size`, and writes a file with `Upload` or unpacks a
+tar stream entry by entry with `MakeDir` and `Upload`. The download asks
+`Stat`, then sends a file from `Download` with its `Content-Length` or a tar
+stream built from `Walk`; a failure after the headers, the size limit
+included, aborts the connection (`http.ErrAbortHandler`).
+
+**Logs** (`logs_store.go`, `logs_collect.go`, `logs_read.go`). The lines live
+in the table `sandbox_logs` (`LogSchemaStep`): `seq`, the order of storage,
+the sandbox id, `time` (Unix seconds), `source`, `stream` and `line`, and
+`action`, `program`, `host`, `port` and `credential` for policy lines; it has
+no foreign key to `sandboxes`. `CollectLogs`, the background work
+`sandbox_log_collector` (grace 5 seconds, only with sandboxes on), makes a
+round at start and every `LogCollectInterval` (5 seconds) on the hub's clock:
+it reads the `ready` sandboxes, starts a follower for each that has none and
+stops the others'. A follower follows `Logs` twice, for the sources `process`
+and `policy`, from the second of the sandbox's last stored line of that
+source, skipping the lines of that second already stored; a broken stream
+ends the follower and the next round opens it again. Lines are split at line
+ends and at `MaxLogLine` (16,384 bytes), redacted with the sandbox's values
+(`ValuesOf`) without the 1,024-byte cut, stored, and announced on
+`LogLinesStored`. `LogLines` reads them by `LogSelection` (source, since,
+tail, after a `seq`, limit). The read answers pages through the list helpers;
+the follow reads past the last `seq` it sent when the collector announces
+lines, when a sandbox changes state, or every `LogFollowInterval` (1 second)
+on the hub's clock, and ends at `deleted`, at the stop or when the caller
+leaves. `RetainLogs`, the maintenance task `sandbox_log_retention`, deletes
+lines older than `[sandbox].log_retention` and those of a sandbox whose record
+is gone; `PurgeLogLines`, a purge hook `composeSandbox` registers, deletes a
+sandbox's lines in the transaction that removes its record.
+
+**Attach** (`attach.go`). The validation requires a WebSocket upgrade
+(version 13) and reads `cols` and `rows`; the operation opens the terminal
+with `ExecInteractive` (`/bin/sh` in `/workspace`) before the upgrade, so a
+runtime failure is still the envelope, then upgrades with a
+`golang.org/x/net/websocket` server that accepts any origin, through a writer
+that hijacks with `http.ResponseController`. Two goroutines relay: frames from
+the caller (binary to the terminal, a resize text frame to `Resize`, any
+other text frame ignored) and the terminal's output in binary frames. The
+caller leaving, the request's end or the stop close that terminal only.
+
+**Activity and observers** (`activity.go`). The gate gives each request an
+activity; the operation starts it once it acts (after the exec slot, the
+upload's length check, the download's `Stat`, the terminal's opening), and
+the gate ends it from a `defer`, so an aborted download ends it too. Start and
+end set `last_activity_at` with one conditional statement that only raises it
+(`UPDATE … WHERE id = ? AND last_activity_at < ?`); an attach also on a frame
+from the caller once a minute, and the collector on each stored process line.
+The end adds one to `ExecMetric` (`parley_sandbox_exec_total{result}`) for an
+exec, and then calls each `Observer` registered with `RegisterObserver` with
+an `Operation`, in registration order, each under `recover`; a failure is
+logged and changes nothing. This package registers no observer: the telemetry
+recorder of a later package does.
 
 ## parley
 
