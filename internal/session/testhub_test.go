@@ -72,6 +72,9 @@ type world struct {
 	alice, bob, carol, dave, erin       string
 	aliceKey, bobKey, carolKey, daveKey string
 	erinKey, alicePAT                   string
+
+	// acme is the id of the org of demo and its forks.
+	acme string
 }
 
 // newWorld starts the world's hub; each adjust changes the session
@@ -89,13 +92,14 @@ func newWorld(t *testing.T, adjust ...func(*session.Deps)) *world {
 	w.aliceKey, w.bobKey, w.carolKey = w.IssueKey(t, w.alice), w.IssueKey(t, w.bob), w.IssueKey(t, w.carol)
 	w.daveKey, w.erinKey = w.IssueKey(t, w.dave), w.IssueKey(t, w.erin)
 	w.alicePAT = w.pat(t, w.alice, "", "sessions:write")
-	acme, zeta := w.CreateOrg(t, "acme"), w.CreateOrg(t, "zeta")
+	w.acme = w.CreateOrg(t, "acme")
+	zeta := w.CreateOrg(t, "zeta")
 	for _, u := range []string{w.alice, w.bob, w.erin} {
-		w.AddMember(t, acme, u)
+		w.AddMember(t, w.acme, u)
 	}
-	w.AddWorkspace(t, access.Record{Slug: demo, OwnerID: w.alice, OrgID: acme, Kind: access.KindRepository, Status: access.StatusReady})
+	w.AddWorkspace(t, access.Record{Slug: demo, OwnerID: w.alice, OrgID: w.acme, Kind: access.KindRepository, Status: access.StatusReady})
 	for _, f := range []string{fork1, fork2} {
-		w.AddWorkspace(t, access.Record{Slug: f, OwnerID: w.alice, OrgID: acme, Kind: access.KindFork, ParentSlug: demo, Status: access.StatusReady})
+		w.AddWorkspace(t, access.Record{Slug: f, OwnerID: w.alice, OrgID: w.acme, Kind: access.KindFork, ParentSlug: demo, Status: access.StatusReady})
 	}
 	w.AddWorkspace(t, access.Record{Slug: other, OwnerID: w.dave, OrgID: zeta, Kind: access.KindRepository, Status: access.StatusReady})
 	return w
@@ -123,6 +127,26 @@ func (w *world) open(t *testing.T, credential string, body any) map[string]any {
 		t.Fatalf("POST /sessions %v = %d %s, want 201", body, status, raw)
 	}
 	return decode(t, raw)
+}
+
+// get sends GET /sessions/:id as credential.
+func (w *world) get(t *testing.T, credential, id string) (int, []byte) {
+	t.Helper()
+	return w.Call(t, http.MethodGet, "/api/v1/sessions/"+id, credential, nil)
+}
+
+// removeWorkspace deletes the record of the workspace slug, as a removal
+// leaves it.
+func (w *world) removeWorkspace(t *testing.T, slug string) {
+	t.Helper()
+	ctx := context.Background()
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM workspaces WHERE slug = ?`, slug)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // setStatus sets the status of the workspace slug's record.
