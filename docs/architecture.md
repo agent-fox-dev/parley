@@ -34,7 +34,7 @@ command-line client. Both are written in Go, in the module
 | `internal/jobs` | the durable job queue: jobs of a type and workspace with an opaque payload and result, stored in the transactional store (`SchemaStep`), enqueued with one pending job per type and workspace (`Enqueue`, `EnqueueFollowUp`, `DuplicateError`), claimed by a dispatcher (`Run`, `Pass`) that runs at most 4 attempts at once and one per type and workspace on the handler registered for the type (`Handler`, `Register`), settled as `completed`, `failed` with backoff or `dead_letter` (`Permanent`, `WithDetail`), recovered at start (`Recover`), stopped with a 30-second grace, counted (`Depth`), cancelled, requeued and removed with their workspace (see [Durable jobs](#durable-jobs)) |
 | `internal/land` | the landing: the land attempt record (`Attempt`, `SchemaStep`), one row per request to land a change or a stack, created running and finished once in a final status, the engine that lands an attempt by rebase onto the target head and records it with the move of the target, trying again on a target that moved, through the land journal (`JournalStep`, `Reconcile`) that completes or drops at the next start a land a stop interrupted (`engine.go`, `replay.go`, `commit.go`), the run again at a start of the attempts a stop left running (`recover.go`, `Recover`), the pool that runs at most `[land].workers` attempts at once, each under the deadline `[land].timeout` (`pool.go`, `RunPool`), the policy gate and override rule registration points (`gate.go`), the request guards, target guards, after-landing hooks and final observers (`hooks.go`), the follow-up of a recorded land: the delete of its source branches, the mergeability checks of the other changes into its target and the after-landing hooks (`after.go`), the land route, which admits its caller (`authz.go`), creates the running attempt (`Start`, also for a land no request asks for) and waits for it, the session linker registration point, the read routes of the attempts per change, per workspace and by id, and the reads of a change's current conflict report and of a `content` file of it as text with conflict markers (`current_conflict.go`, `conflict_handlers.go`); and the rules around landing (see [Land rules](#land-rules)): the path limit of a path-scoped token (`pathlimit.go`: `CheckPaths`, the version-files lookup `VersionFiles()` of the push rule engine, and `PathGuard()`, the restack's version guard and a request guard), the override (`override.go`: `OverrideGuard()`, a request guard, and `PendingOverride`, the override rule), the automatic lander (`autoland.go`: `AutoLander`, `AutoLandStep`) and the revert route (`revert.go`) (see [Landing](#landing)) |
 | `internal/policy` | the landing policy, what each part of a workspace's repository needs before a change touching it may land: the policy document and its normal form (`Document`, `Rule`, `Require`), `Validate`, which checks a document's JSON text against the format and refuses it with an `*InvalidPolicyError` naming the first violation (`APIError` answers it as `400 invalid_policy` with `details` `{rule, index, field}`), the narrow user lookup it asks (`Users`), `MatchPath`, the matcher of a rule's `paths` and `exclude` globs (`*` any run without `/`, `**` any run, `?` one character other than `/`, every other character itself, on the whole path; distinct from `identity.MatchPath`, in which `?` is literal), `Select`, which names the rule governing one file on a change into one target branch (the first rule in document order whose `targets` match the branch through `workspace.MatchAnyBranchGlob`, absent `targets` matching every branch, whose `paths` match the file and whose `exclude` does not, else `default`), `NeverSet`, the document of revision 0 that a workspace without a policy and every task fork has, `Evaluate`, which turns a change into its landing (`Result{status, reason, requirements}`: one `Requirement{rule, paths, approvals{required, counted, approvers}, checks[{name, status}], block, satisfied}` per selected rule in document order, `default` last, `paths` in ascending byte order cut to the first 50; `blocked` with reason `draft` for a draft, else with the change's structural cause, else `blocked` when a requirement blocks, `pending` when one is unsatisfied, `ready` otherwise; `Result.Landing` converts it to `change.Landing`) from the change's facts (`ChangeFacts`, its structural cause included), its files (`ChangeFiles`) and the evidence source (`Evidence`, asked once per requirement through the caller's `Querier`; a failure of either read fails the evaluation), `Preview`, the same over a list of files with no evidence and no cause; both select the rules of one evaluation through one selector, which decides the rules' `targets` once and compiles their globs once, and stop with the context's error when it ends, looked at before each file; `MatchPath` matches one element of a glob against 64 positions of the path at a time and stops when no position is left, `EvidenceSlot`, the installed evidence source, `NoEvidence` (nothing counted, every check pending) until `RegisterEvidence` replaces it, the verdicts and check results on a change's versions (`ReviewStep`, the tables `change_approvals` and `change_checks`), the evidence source over them (`Facts`), the version observer that carries verdicts to a patch-equivalent version (`VersionObserver`), and the include expanders of the change (`ExpandApprovals`, `ExpandChecks`), the revisions of a workspace's policy (`Revision`, `Writer`, `SchemaStep`, `CurrentRevision`, `RevisionAt`, `InsertRevision`, `Replace`, which writes the next revision under an optional expected revision, `ErrRevisionMismatch` otherwise, and keeps the 50 highest), and `Component`, bound with `Deps` (the store, the workspace records, `WorkspaceReader`, the user lookup, `Users`, the event writer, `EventWriter`, the change records, `Changes`, which the change component is, and the repository opener, `Repos`), which serves `GET` and `PUT /workspaces/:slug/policy` and `POST /workspaces/:slug/policy/evaluate`, the dry evaluation of paths or a change that writes nothing, and the five routes of verdicts and check results (`Routes`), deletes a deleted workspace's revisions, verdicts and check results (`WorkspaceDeleted`), reads the files of a change (`Files`, its `ChangeFiles`: those between the change's `base_sha` and `head_sha` in its target workspace's repository, both paths of a rename or copy, no cap), is the change component's landing evaluator (`EvaluateLanding`), re-evaluates and stores a change's landing (`Reevaluate`, in a transaction of its own, and `ReevaluateIn`, in the caller's; `ErrChangeNotFound`, `ErrChangeClosed`), and every draft and open change of the workspace in the transaction of a `PUT`, and judges the version a land lands (`JudgeVersion`: the change read and the version judged in one transaction, the landing stored for the current version only); see [Landing policy](#landing-policy) |
-| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages; the stored sandboxes (see [Stored sandboxes](#stored-sandboxes)): the record (`Record`, table `sandboxes` created by `SchemaStep`, `NewID`, `WorkDir` `/workspace`) and its store functions (`Insert`, `Get`, `GetIn`, `ListByState`, `Update` with the `Set…` fields, `Remove`), `(*Service).Transition`, the one conditional move of a sandbox's state with its event, the object (`Object`, `ObjectOf`), the delete and purge hooks (`RegisterDeleteHook`, `RegisterPurgeHook`, `RunDeleteHooks`, `RunPurgeHooks`), the create (`Create`, `CreateRoute`, `ParseTTL`, `ExpiresAt`, `CheckQuota`, `FamilyRoot`, `Resolve`, the session linker `RegisterSessionLinker`), the hub credential (`MintHubCredential`, `RevokeHubCredential`, `HubCredential`), the scrubbing of sandbox text (`Scrub`, `SetValues`, `ValuesOf`, `ScrubSandbox`, `ForgetValues`), the provisioner (`RunProvisioner`, `WakeProvisioner`, `ResumeProvisioning`, `ProtectedRules`, `RegisterWorkspaceRuleProvider`, `RegisterPolicyComposer`, `RegisterRestorer`), the metrics (`ReportStates`, `CreatesMetric`, `SandboxesMetric`, `SecondsMetric`), the reads (`GetRoute`, `ListRoute`, `StoredSource`) and the fork component (`CreateSandbox`), bound once at start by `Bind(Deps)` |
+| `internal/sandbox` | the hub's side of the sandbox feature: `Register` makes it the owner of the whole `[sandbox]` section of the configuration, and `FromConfig` checks that section after the load, with the config dir and `[server].external_url` in view, and returns its `Settings` with every default filled in, or one error listing every failure; the `Settings` give the profiles and the configured credentials by name (`Profile`, `DefaultProfile`, `Credential`) and in name order (`Profiles`, `Credentials`), as copies, so that they do not change after the load; `RunStartCheck` checks the runtime once at start (see [The start-up check](#the-start-up-check)), `ReleaseRange` and `SupportedReleases` hold and compare the supported OpenShell releases, `Service` is the feature of one hub (settings, runtime client, connected release) and declares the sandbox routes (see [Sandbox route declarations](#sandbox-route-declarations)), `ProfilesRoute` is the route `GET /sandbox-profiles`, `SandboxesRoute` the route `GET /sandboxes`, which lists for the admin token the sandboxes of the `Source` a later package registers with `(*Service).RegisterSource`, `RuntimeError` is the `502 sandbox_runtime_error` answer, `Covers` and `RequireCovers` are the no-widening decision over a sandbox's `HubAccess`, and `Recorder` is the metrics recorder of the sandbox packages; the stored sandboxes (see [Stored sandboxes](#stored-sandboxes)): the record (`Record`, table `sandboxes` created by `SchemaStep`, `NewID`, `WorkDir` `/workspace`) and its store functions (`Insert`, `Get`, `GetIn`, `ListByState`, `Update` with the `Set…` fields, `Remove`), `(*Service).Transition` and `TransitionTx`, the one conditional move of a sandbox's state with its event, the object (`Object`, `ObjectOf`), the delete and purge hooks (`RegisterDeleteHook`, `RegisterPurgeHook`, `RunDeleteHooks`, `RunPurgeHooks`), the create (`Create`, `CreateRoute`, `ParseTTL`, `ExpiresAt`, `CheckQuota` with the `Limits`, `FamilyRoot`, `Resolve`, the session linker `RegisterSessionLinker`), the hub credential (`MintHubCredential`, `RevokeHubCredential`, `HubCredential`), the scrubbing of sandbox text (`Scrub`, `SetValues`, `ValuesOf`, `ScrubSandbox`, `ForgetValues`), the provisioner (`RunProvisioner`, `WakeProvisioner`, `ResumeProvisioning`, `ProtectedRules`, `RegisterWorkspaceRuleProvider`, `RegisterPolicyComposer`, `RegisterRestorer`), the metrics (`ReportStates`, `CreatesMetric`, `SandboxesMetric`, `SecondsMetric`), the reads (`GetRoute`, `ListRoute`, `StoredSource`) and the fork component (`CreateSandbox`), bound once at start by `Bind(Deps)` |
 | `internal/sandbox/runtime` | the hub's one boundary to the sandbox runtime: the `Client` interface with every operation the sandbox packages call, the plain data it exchanges, the four error kinds (`ErrNotFound`, `ErrInvalid`, `ErrUnsupported`, `ErrUnavailable`), the reachability flag (`Reachability`) and the metrics recorder (`Recorder`, `NopRecorder`) it reports to; it imports nothing of the project |
 | `internal/sandbox/runtime/openshell` | the runtime client over the OpenShell Go SDK (`github.com/ai-openshell/sdk-go`, package `openshell/v1`), the only production package that imports the SDK (`openshelltest` and tests import it too): `BuildConfig` turns the checked `[sandbox]` section into the SDK's configuration, `New` builds the client of a section and `NewWithClient` the client over a given SDK client, such as the SDK's in-memory one |
 | `internal/sandbox/runtime/openshell/openshelltest` | test support, imported by test code only: `Gateway`, which stands in for the OpenShell gateway: the SDK's in-memory client with provider profiles kept per workspace and a switch that makes it unreachable and reachable again |
@@ -514,7 +514,7 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AdjustLand(func(*land.Deps))` | a change to the land component's dependencies, applied after the start hook `land` builds them and before it binds them, in the order added |
 | `AdjustAutoLand(func(*land.AutoLandDeps))` | a change to the automatic lander's dependencies, applied after the start hook `auto-land` builds them and before it binds them, in the order added; tests set its clock and interval with it |
 | `AdjustPolicy(func(*policy.Deps))` | a change to the policy component's dependencies, applied after the start hook `policy` builds them and before it binds them, in the order added |
-| `AdjustSandbox(func(*sandbox.Deps))` | a change to the stored sandboxes' dependencies, applied after the start hook `sandbox_records` builds them and before it binds them, in the order added; tests replace the minting component, the secret resolution or the readable set, set the clock's timers, or hold the provisioner (`HoldProvisioning`) with it |
+| `AdjustSandbox(func(*sandbox.Deps))` | a change to the stored sandboxes' dependencies, applied after the start hook `sandbox_records` builds them and before it binds them, in the order added; tests replace the minting component, the secret resolution or the readable set, set the clock's timers, change the sandbox limits while the hub serves (`Limits`), or hold the provisioner (`HoldProvisioning`) with it |
 | `AdjustForks(func(*fork.Deps))` | a change to the fork component's dependencies, applied after the start hook `forks` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the name generator, the repository creator, the transaction or the event writer |
 | `AdjustAwareness(func(*awareness.Deps))` | a change to the awareness component's dependencies, applied after the start hook `awareness` builds them and before it binds them, in the order added; tests set the index and expiry intervals or replace the event source, the change reader or the repositories with it |
 | `AdjustCarryPatch(func(*carrypatch.Deps))` | a change to the carry-patch component's dependencies, applied after the start hook `carry_patch` builds them and before it binds them, in the order added; tests replace the secret reader or the git, or set the fetch deadlines, the branch-create hook and the reset's swap hook (`BeforeRefSwap`) with it |
@@ -6680,24 +6680,34 @@ ended target (cleared for the others), and the event, completed with the
 sandbox as resource, its workspace and session, in the same transaction
 (the caller's, or one of its own). Since the store admits one write
 transaction at a time, two racing moves that expect the same state apply
-once. An applied move notifies the reads that wait for a sandbox, observes
-`parley_sandbox_seconds` when it leaves `ready` for an ended state, and
-reports `parley_sandboxes`. The delete hooks and purge hooks are lists on
+once. An applied move reports `parley_sandboxes` from its transaction's
+counts and has a report for once it holds: it observes
+`parley_sandbox_seconds` when it leaves `ready` for an ended state and
+notifies the reads that wait for a sandbox. `Transition` makes that report
+after its own commit, or at once with the caller's transaction;
+`(*Service).TransitionTx(ctx, tx, …)` returns it for the caller to call
+once its transaction has committed, as the provisioner's ends do, so that a
+move that rolls back reports nothing. A waiting read reads the record on a
+read connection, never in the store's turn of writes; a notification made
+before a caller's commit is caught by its re-read every second. The delete hooks and purge hooks are lists on
 the service, run in order in the transaction that marks a record `deleted`
 or removes it, stopping at the first error.
 
 **Create.** `(*Service).Create(ctx, tx, CreateInput)` is the one create the
 route and the fork component share: with a nil `tx` it runs in a store
 transaction of its own and wakes the provisioner after the commit; with the
-caller's transaction it reads and writes in it and wakes nothing. In order:
-the body (`validate.go`), the session link (the registered
+caller's transaction it reads and writes in it and wakes nothing. It reads
+the workspace's record again in that transaction and judges that one, not
+the record the caller read. In order: the body (`validate.go`), the session link (the registered
 `SessionLinker`; without one every `session_id` is refused), the
 workspace's state (`workspace.RequireReady`, and `fork.GuardUpdate` for a
 fork's parent), the resolution of the profile's credentials and exposed
 secrets (`Resolve`, once per create), the quotas (`CheckQuota`, counted in
 the inserting transaction), the hub credential (minted through
-`MintBound` in the same transaction, its value kept in memory for the
-provisioner and never stored), the workspace sandbox rules of the
+`MintBound` in the same transaction, its value never stored and kept in
+memory for the provisioner, with the resolved values, from the mint on,
+before the commit, since the provisioner may find the sandbox as soon as
+it commits; a create that fails or does not commit drops them), the workspace sandbox rules of the
 registered `WorkspaceRuleProvider`, the insert and `parley.sandbox.create`.
 Errors after the resolution are scrubbed of the resolved values.
 
@@ -6707,11 +6717,13 @@ it, every second on the hub's clock, and after the start hook
 `sandbox_provisioner` (`ResumeProvisioning`); a pass reads the sandboxes in
 `provisioning` with the `create` marker and works each at most once at a
 time, at most 8 at once, each under a bound of 10 minutes on the hub's
-clock. A provisioning resolves the secrets again; takes the hub credential
-from memory, or, after a restart or when the runtime already holds the
-sandbox, deletes what the runtime holds under the label
-`parley.sandbox=<id>`, revokes the stored token and mints a replacement
-(`MintHubCredential`); registers the providers (`<id>-<credential>`,
+clock. A provisioning first deletes what the runtime holds of the sandbox
+(the sandboxes and providers labelled `parley.sandbox=<id>` or named after
+it, by name when the runtime cannot list them), which a provisioning the
+hub stopped in may have left whether or not it marked the sandbox created,
+and clears that mark; resolves the secrets again; takes the hub credential
+from memory, or, after a restart, revokes the stored token and mints a
+replacement (`MintHubCredential`); registers the providers (`<id>-<credential>`,
 `<id>-hub`); builds the environment (`environment.go`), leaving out the
 variables of the attached providers' profiles and `PARLEY_API_KEY`, whose
 placeholders the runtime sets; asks the registered `PolicyComposer` for the
@@ -6720,10 +6732,17 @@ creates the sandbox, named by its id, in `/workspace`; waits until it is
 ready; checks the repository out over `Exec` (`checkout.go`) and calls the
 registered `Restorer` for `restore_from`; starts the main process; and moves
 the sandbox to `ready` with `parley.sandbox.ready`, storing the checked-out
-commit in the same transaction. A failure deletes what this run created at
-the runtime (with a context of its own, 30 seconds), and one transaction
-moves the sandbox to `failed` with `parley.sandbox.fail`, clears the marker
-and revokes the hub credential; a sandbox moved meanwhile is not touched.
+commit in the same transaction. A failure deletes what the runtime holds of
+the sandbox, by label and name as at the start (with a context of its own,
+30 seconds), and one transaction moves the sandbox to `failed` with
+`parley.sandbox.fail`, clears the marker, clears the mark that the
+runtime's sandbox was created once the runtime no longer holds it, and
+revokes the hub credential; once it has committed the sandbox's values are
+forgotten (`ForgetValues`). A sandbox moved or removed meanwhile is not
+touched beyond that mark: its runtime leftovers are deleted, its hub
+credential revoked and its values forgotten. The transition's report and
+`parley_sandbox_creates_total` follow the commit of the transaction that
+ends the provisioning.
 At the stop the provisioner's context ends and it writes nothing, so the
 marker makes the next start take the sandbox up again. A sandbox created
 in a fork transaction that rolled back leaves its hub credential value in
@@ -6735,13 +6754,21 @@ its hub credential by `[redacted]`, longer values first, and cuts the text
 to 1,024 bytes on a UTF-8 boundary; `ScrubSandbox` does it with the values
 the service keeps per sandbox (`SetValues`), refilled by resolving the
 record's names again when the list is empty, as after a restart.
+`ForgetValues` drops them: this package calls it for a create that does
+not commit, a provisioning that ends `failed` or finds its sandbox moved or
+removed, and a fork-transaction sandbox that was rolled back; the packages
+that stop and delete sandboxes call it when they end one.
 
 **Metrics.** Through the recorder `SetSandboxRecorder` gives (none by
 default): `parley_sandbox_creates_total{result}` for each provisioning that
-ended `ready` or `failed`, `parley_sandboxes{state}` for the five states
-other than `deleted`, set from the store's counts after every insert,
-applied transition and removal, and `parley_sandbox_seconds`, the seconds a
-sandbox was `ready` when it leaves `ready` for an ended state.
+ended `ready` or `failed`, counted once the ending transaction has
+committed, `parley_sandboxes{state}` for the five states other than
+`deleted`, set from the store's counts after every insert, every applied
+transition and the removals this package makes (the drop of a sandbox
+whose fork transaction rolled back); a caller that removes a record calls
+`ReportStates`. And `parley_sandbox_seconds`, the seconds a sandbox was
+`ready` when it leaves `ready` for an ended state, observed by the
+transition's report.
 
 ## parley
 

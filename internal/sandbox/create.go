@@ -74,7 +74,10 @@ func (s *Service) sessionLinker() SessionLinker {
 type CreateInput struct {
 	// Caller is the authenticated user the sandbox is created for.
 	Caller identity.Principal
-	// Workspace is the record of the workspace the sandbox is attached to.
+	// Workspace is the workspace the sandbox is attached to. Create reads
+	// its record again in the creating transaction and works from that one,
+	// so that a change committed since the caller read it, such as an
+	// archive, is judged.
 	Workspace workspace.Workspace
 	// Body is the request's JSON object as received; empty is {}.
 	Body []byte
@@ -166,11 +169,15 @@ func (s *Service) object(rec Record) Object {
 //
 // The sandbox's hub credential is minted in the same transaction (see
 // hubAccessOf for when it has one); without one that can read the
-// repository the sandbox has no checkout. Its value is never stored: once the
-// sandbox is created, the service keeps it in memory for the provisioning
-// (HubCredential), with the resolved values, as the values the sandbox's
-// text is scrubbed of. With the caller's transaction it is kept when Create
-// returns, before the caller commits.
+// repository the sandbox has no checkout. Its value is never stored: the
+// service keeps it in memory for the provisioning (HubCredential), with the
+// resolved values, as the values the sandbox's text is scrubbed of. They
+// are kept from the mint on, before the transaction commits, since the
+// provisioner may find the sandbox as soon as it has; a create that fails,
+// or whose own transaction does not commit, drops them. With the caller's
+// transaction they are kept when Create returns, and a caller that rolls
+// back leaves them to the provisioner's clean-up of unstored sandboxes
+// (see CreateSandbox).
 func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Record, error) {
 	if in.Caller.User == nil {
 		return Record{}, server.Forbidden(msgNeedsUser)
@@ -179,12 +186,9 @@ func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Recor
 	if err != nil {
 		return Record{}, err
 	}
-	var (
-		rec    Record
-		values Values
-	)
+	var rec Record
 	run := func(tx *sql.Tx) (err error) {
-		rec, values, err = s.create(ctx, tx, in, body)
+		rec, err = s.create(ctx, tx, in, body)
 		return err
 	}
 	if tx != nil {
@@ -193,11 +197,10 @@ func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Recor
 		err = s.deps.Store.Tx(ctx, run)
 	}
 	if err != nil {
+		if rec.ID != "" {
+			s.ForgetValues(rec.ID)
+		}
 		return Record{}, err
-	}
-	s.SetValues(rec.ID, values)
-	if values.HubCredential != "" {
-		s.SetHubCredential(rec.ID, values.HubCredential)
 	}
 	if tx == nil {
 		s.WakeProvisioner()
@@ -205,46 +208,56 @@ func (s *Service) Create(ctx context.Context, tx *sql.Tx, in CreateInput) (Recor
 	return rec, nil
 }
 
-// create is Create in tx, the body read. values are the sandbox's resolved
-// values and its hub credential's.
-func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body map[string]json.RawMessage) (rec Record, values Values, err error) {
-	w := in.Workspace
+// create is Create in tx, the body read, from the workspace's record as tx
+// reads it. rec has the sandbox's id, also with an error, once the service
+// keeps the sandbox's values.
+func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body map[string]json.RawMessage) (Record, error) {
+	w, found, err := workspace.BySlug(ctx, tx, in.Workspace.Slug)
+	switch {
+	case err != nil:
+		return Record{}, fmt.Errorf("read workspace %s: %w", in.Workspace.Slug, err)
+	case !found:
+		return Record{}, server.NotFound(workspace.ErrNotFound.Error())
+	}
+	in.Workspace = w
 	req, err := s.judge(ctx, tx, w, body)
 	if err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	session, err := s.checkSession(ctx, in, req.sessionID)
 	if err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	if err := workspace.RequireReady(w); err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	if err := fork.GuardUpdate(ctx, tx, w); err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	snapshot, err := s.snapshotOf(req.profile)
 	if err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	res, err := s.resolveIn(ctx, tx, w.Slug, snapshot)
 	if err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	if err := res.Missing(); err != nil {
-		return Record{}, Values{}, err
+		return Record{}, err
 	}
 	// From here on an error's text may hold what was resolved, and the hub
 	// credential once it is minted.
-	values = res.Values()
-	rec, err = s.store(ctx, tx, in, req, session, snapshot, res, &values)
-	return rec, values, scrubError(values, err)
+	values := res.Values()
+	rec, err := s.store(ctx, tx, in, req, session, snapshot, res, &values)
+	return rec, scrubError(values, err)
 }
 
 // store is the end of create, once the request passed every check but the
 // quotas: it checks them, then mints the sandbox's hub credential, whose
-// value it sets in values, stores the sandbox with the names res resolved,
-// links it to its session and writes its create event, all in tx.
+// value it sets in values, has the service keep values, and stores the
+// sandbox with the names res resolved, links it to its session and writes
+// its create event, all in tx. An error after the service keeps the values
+// comes with the record, for its id.
 func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req createRequest, session *string, snapshot Snapshot, res Resolution, values *Values) (Record, error) {
 	w := in.Workspace
 	// The quotas come last: their count is atomic with the insert below
@@ -268,22 +281,26 @@ func (s *Service) store(ctx context.Context, tx *sql.Tx, in CreateInput, req cre
 		}
 		rec.HubTokenID, values.HubCredential = pat.TokenID, value
 	}
+	s.SetValues(rec.ID, *values)
+	if values.HubCredential != "" {
+		s.SetHubCredential(rec.ID, values.HubCredential)
+	}
 	if rec.WorkspaceRules, err = s.workspaceRules(ctx, tx, rec.FamilyRoot); err != nil {
-		return Record{}, err
+		return rec, err
 	}
 	if err := Insert(ctx, tx, rec); err != nil {
-		return Record{}, err
+		return rec, err
 	}
 	s.reportStates(ctx, tx)
 	if rec.SessionID != nil {
 		if l := s.sessionLinker(); l != nil {
 			if err := l.Record(ctx, tx, *rec.SessionID, w.Slug, rec.ID); err != nil {
-				return Record{}, fmt.Errorf("link sandbox %s to session %s: %w", rec.ID, *rec.SessionID, err)
+				return rec, fmt.Errorf("link sandbox %s to session %s: %w", rec.ID, *rec.SessionID, err)
 			}
 		}
 	}
 	if err := s.emitCreate(ctx, tx, in, rec); err != nil {
-		return Record{}, err
+		return rec, err
 	}
 	return rec, nil
 }

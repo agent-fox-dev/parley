@@ -8,106 +8,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// limits are the four sandbox limits of a hub, in the order they are
-// checked.
-type limits struct{ sandboxes, perOrg, perWorkspace, perUser int }
-
-// only is limits with the limit name at n and the others at 100.
-func only(name string, n int) limits {
-	l := limits{100, 100, 100, 100}
-	l.set(name, n)
-	return l
-}
-
-// set sets the limit name to n.
-func (l *limits) set(name string, n int) {
-	switch name {
-	case "max_sandboxes":
-		l.sandboxes = n
-	case "max_per_org":
-		l.perOrg = n
-	case "max_per_workspace":
-		l.perWorkspace = n
-	case "max_per_user":
-		l.perUser = n
-	}
-}
-
-// setLimits makes l the limits of the hub's next creates: the limits are
-// the loaded settings, which a create reads each time.
-func (h *createHub) setLimits(l limits) {
-	s := h.svc.Settings()
-	s.MaxSandboxes, s.MaxPerOrg, s.MaxPerWorkspace, s.MaxPerUser = l.sandboxes, l.perOrg, l.perWorkspace, l.perUser
-}
-
-// quotaHub is a create hub with a create world, the user omar, who creates
-// no sandbox through the hub, and the org other.
-type quotaHub struct {
-	*createHub
-	omar, other string
-}
-
-func startQuotaHub(t *testing.T) *quotaHub {
-	t.Helper()
-	h := &quotaHub{createHub: startCreateHub(t, agentProfile)}
-	h.world(t)
-	h.omar, h.other = h.CreateUser(t, "omar"), h.CreateOrg(t, "other")
-	return h
-}
-
-// stored describes a sandbox a quota test stores directly: its workspace,
-// the root of the workspace's family, the org (none for ""), the user who
-// created it and its state.
-type stored struct{ ws, family, org, user, state string }
-
-// store stores s and returns its id.
-func (h *createHub) store(t *testing.T, s stored) string {
-	t.Helper()
-	rec := sandbox.Record{
-		ID: sandbox.NewID(), Workspace: s.ws, Profile: "agent", State: s.state,
-		ExpiresAt: recordStart.Add(time.Hour), LastActivityAt: recordStart,
-		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: s.user, Username: "someone"},
-		CreatedAt: recordStart, UpdatedAt: recordStart, UserID: s.user, OrgID: s.org, FamilyRoot: s.family,
-	}
-	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) })
-	return rec.ID
-}
-
-// exec runs the statement query with args in a store transaction.
-func (h *createHub) exec(t *testing.T, query string, args ...any) {
-	t.Helper()
-	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, query, args...)
-		return err
-	})
-}
-
-// capacity is the error object of a sandbox_capacity answer.
-type capacity struct {
-	ErrorType string `json:"error_type"`
-	Message   string `json:"message"`
-	Limit     string `json:"limit"`
-	Maximum   int    `json:"maximum"`
-	Current   int    `json:"current"`
-}
-
-// wantCapacity fails the test unless a is 429 sandbox_capacity naming the
-// limit at maximum with the count current.
-func wantCapacity(t *testing.T, a answer, limit string, maximum, current int) {
-	t.Helper()
-	var env struct{ Error capacity }
-	_ = json.Unmarshal(a.body, &env)
-	want := capacity{"sandbox_capacity", "sandbox limit reached: " + limit, limit, maximum, current}
-	if a.status != http.StatusTooManyRequests || env.Error != want {
-		t.Errorf("create = %d %s; want 429 with %+v", a.status, a.body, want)
-	}
-}
 
 func TestQuota_RefusesAtEachLimit(t *testing.T) {
 	t.Parallel()

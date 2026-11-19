@@ -90,6 +90,10 @@ type Deps struct {
 	// Shutdown is closed when the hub begins to stop: a read waiting for a
 	// sandbox answers then.
 	Shutdown <-chan struct{}
+	// Limits returns the four sandbox limits a create is held to; nil uses
+	// those of the loaded settings. A test that changes the limits while
+	// the hub serves sets it.
+	Limits func() Limits
 	// HoldProvisioning keeps the provisioner from running: the sandboxes a
 	// create stores stay in provisioning with their marker, and the runtime
 	// is not called for them. A test of what precedes the provisioning sets
@@ -132,43 +136,54 @@ func (s *Service) Bind(d Deps) {
 // hold is an error matching ErrInvalidTransition, and an id no sandbox has
 // one matching ErrNotFound; nothing is written either.
 //
-// An applied transition notifies the reads that wait for a sandbox: after
-// the commit of its own transaction, and with the caller's transaction when
-// the update applied, before the caller commits; a notified read takes the
-// store's turn of writes before it reads, so it sees what the caller
-// commits.
-//
 // An applied transition reports SandboxesMetric from the counts in its
-// transaction (ReportStates). Every package leaves ready through here, so
-// Transition also reports SecondsMetric: an applied transition from ready to an ended state observes
-// the seconds since the sandbox became ready. The runtime's pause (ready to
-// provisioning and back) keeps the time it first became ready. With the
-// caller's transaction the observation is made when the update applies,
-// before the caller commits.
+// transaction (ReportStates). It also has a report for once it holds (see
+// TransitionTx): it observes SecondsMetric for a move from ready to an
+// ended state and notifies the reads that wait for a sandbox. In its own
+// transaction Transition makes that report after the commit; with the
+// caller's transaction it makes it at once, before the caller commits, so a
+// caller that can act after its commit calls TransitionTx instead.
 func (s *Service) Transition(ctx context.Context, tx *sql.Tx, id, from, to, reason string, ev *event.Input) (applied bool, err error) {
-	if !slices.Contains(transitions[from], to) {
-		return false, fmt.Errorf("%w: %s to %s", ErrInvalidTransition, from, to)
-	}
-	var seconds *float64
-	run := func(tx *sql.Tx) error {
-		applied, seconds, err = s.transition(ctx, tx, id, from, to, reason, ev)
-		return err
-	}
+	var report func()
 	if tx != nil {
-		err = run(tx)
+		applied, report, err = s.TransitionTx(ctx, tx, id, from, to, reason, ev)
 	} else {
-		err = s.deps.Store.Tx(ctx, run)
+		err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+			applied, report, err = s.TransitionTx(ctx, tx, id, from, to, reason, ev)
+			return err
+		})
 	}
 	if err != nil {
 		return false, err
 	}
-	if seconds != nil {
-		_ = s.deps.Recorder.Observe(SecondsMetric, nil, *seconds)
-	}
-	if applied {
-		s.changes.notify()
-	}
+	report()
 	return applied, nil
+}
+
+// TransitionTx is Transition in tx, the caller's open transaction, which the
+// caller commits. It returns, with applied, the report of the transition,
+// which the caller calls once tx has committed and drops when tx rolls back,
+// so that nothing is reported of a transition that did not hold: an applied
+// transition from ready to an ended state observes the seconds since the
+// sandbox became ready in SecondsMetric, and every applied transition
+// notifies the reads that wait for a sandbox. Every package leaves ready
+// through Transition or TransitionTx; the runtime's pause (ready to
+// provisioning and back) keeps the time it first became ready. report is
+// never nil; it does nothing for a transition that did not apply.
+func (s *Service) TransitionTx(ctx context.Context, tx *sql.Tx, id, from, to, reason string, ev *event.Input) (applied bool, report func(), err error) {
+	if !slices.Contains(transitions[from], to) {
+		return false, func() {}, fmt.Errorf("%w: %s to %s", ErrInvalidTransition, from, to)
+	}
+	applied, seconds, err := s.transition(ctx, tx, id, from, to, reason, ev)
+	if err != nil || !applied {
+		return false, func() {}, err
+	}
+	return true, func() {
+		if seconds != nil {
+			_ = s.deps.Recorder.Observe(SecondsMetric, nil, *seconds)
+		}
+		s.changes.notify()
+	}, nil
 }
 
 // notifier tells the reads that wait for a sandbox that a transition

@@ -125,7 +125,9 @@ func (s *Service) HubCredential(id string) (value string, ok bool) {
 
 // SetHubCredential keeps value, in memory only, as the hub credential of
 // the sandbox id, and adds it to the values the sandbox's text is scrubbed
-// of. Call it once the transaction that minted it has committed.
+// of. The create calls it before its transaction commits, and drops the
+// value when that does not commit (see Create); a caller that mints a
+// replacement calls it once the transaction that minted it has committed.
 func (s *Service) SetHubCredential(id, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

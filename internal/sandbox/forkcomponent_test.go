@@ -3,7 +3,6 @@ package sandbox_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,30 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-fox-dev/parley/internal/fork"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/secret"
 )
-
-// errRollback ends a test's transaction, which the store then rolls back.
-var errRollback = errors.New("roll back")
-
-// postFork sends POST /workspaces/demo/forks with cred and body.
-func (h *createHub) postFork(t *testing.T, cred string, body map[string]any) answer {
-	t.Helper()
-	return h.call(t, http.MethodPost, "/workspaces/demo/forks", cred, body)
-}
-
-// timeMember parses the RFC 3339 time of the member name of o.
-func timeMember(t *testing.T, o map[string]any, name string) time.Time {
-	t.Helper()
-	s, _ := o[name].(string)
-	at, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		t.Fatalf("%s %v: %v", name, o[name], err)
-	}
-	return at
-}
 
 func TestForkWithSandbox_CreatesBoth(t *testing.T) {
 	t.Parallel()
@@ -139,25 +117,6 @@ func TestForkWithSandbox_RefusalCreatesNeither(t *testing.T) {
 			}
 		})
 	}
-}
-
-// createInFork creates in tx, through the fork create's sandbox component,
-// a sandbox with an empty body on the fork f, which tx stores first, for
-// dana and with no defaults, and returns its object.
-func (h *createHub) createInFork(t *testing.T, ctx context.Context, tx *sql.Tx, f fork.Fork) map[string]any {
-	t.Helper()
-	if err := fork.Insert(ctx, tx, f); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := h.svc.CreateSandbox(ctx, tx, fork.SandboxRequest{Caller: h.principal(t), Fork: f, Sandbox: json.RawMessage(`{}`)})
-	if err != nil {
-		t.Fatalf("CreateSandbox = %v", err)
-	}
-	var o map[string]any
-	if err := json.Unmarshal(raw, &o); err != nil {
-		t.Fatalf("the sandbox object %s: %v", raw, err)
-	}
-	return o
 }
 
 func TestComponent_RollbackLeavesNothing(t *testing.T) {

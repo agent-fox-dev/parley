@@ -6,12 +6,16 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -519,8 +523,8 @@ func (h *recordHub) seed(t *testing.T, state string) string {
 	return rec.ID
 }
 
-// get reads the stored sandbox id.
-func (h *recordHub) get(t *testing.T, id string) sandbox.Record {
+// storedRecord reads the stored sandbox id of the hub h.
+func storedRecord(t *testing.T, h *hubtest.Hub, id string) sandbox.Record {
 	t.Helper()
 	rec, err := sandbox.Get(context.Background(), h.Store.Main(), id)
 	if err != nil {
@@ -682,6 +686,8 @@ type createHub struct {
 	// timers are the timers of the hub's clock the stored sandboxes asked
 	// for.
 	timers *timerLog
+	// limits are the sandbox limits its creates are held to.
+	limits *quotaLimits
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
 	// base is the commit main of demo points at in a create world.
@@ -711,7 +717,7 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 	h := &createHub{
 		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, forkLinker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
 		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{head: defaultHead},
-		timers: &timerLog{},
+		timers: &timerLog{}, limits: &quotaLimits{},
 	}
 	h.rt.SetExec(h.hooks.script)
 	h.rt.AddProviderProfile("parley", runtime.ProviderProfile{ID: "anthropic", Variables: []string{"ANTHROPIC_API_KEY"}})
@@ -724,7 +730,8 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 		Now:    h.clock.Now,
 	}
 	cfg.Compose = func(c *hub.Composition) {
-		h.svc, h.workspaces, h.secrets = c.Sandbox(), c.Workspaces(), c.Secrets()
+		svc := c.Sandbox()
+		h.svc, h.workspaces, h.secrets = svc, c.Workspaces(), c.Secrets()
 		h.svc.RegisterSessionLinker(h.linker)
 		c.Forks().RegisterSessionLinker(h.forkLinker)
 		c.SetSandboxRecorder(h.rec)
@@ -733,6 +740,7 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 			h.minter.next, d.Mint = d.Mint, h.minter.mint
 			d.NewTimer = func(d time.Duration) sandbox.Timer { return h.timers.track(d, h.clock.NewTimer(d)) }
 			d.HoldProvisioning = !provision
+			d.Limits = func() sandbox.Limits { return h.limits.get(svc.Settings()) }
 			for _, fn := range adjust {
 				fn(d)
 			}
@@ -1037,12 +1045,14 @@ func sandboxObject(t *testing.T, a answer) map[string]any {
 }
 
 // stubLinker is a session linker that accepts every session id, in lower
-// case, unless refuse is set, and keeps what it was asked. Its record fails
-// with fail when fail is set.
+// case, unless refuse is set, and keeps what it was asked. Its record calls
+// onRecord, when set, with the sandbox id, and fails with fail when fail is
+// set.
 type stubLinker struct {
 	mu       sync.Mutex
 	refuse   bool
 	fail     error
+	onRecord func(sandboxID string)
 	checks   []string
 	recorded []string
 }
@@ -1071,7 +1081,17 @@ func (l *stubLinker) Record(_ context.Context, _ *sql.Tx, id, ws, sandboxID stri
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.recorded = append(l.recorded, id+" "+ws+" "+sandboxID)
+	if l.onRecord != nil {
+		l.onRecord(sandboxID)
+	}
 	return l.fail
+}
+
+// setOnRecord makes fn the function a record calls; nil removes it.
+func (l *stubLinker) setOnRecord(fn func(sandboxID string)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onRecord = fn
 }
 
 func (l *stubLinker) setFail(err error) {
@@ -1506,4 +1526,619 @@ func (h *createHub) runtimeLeft(t *testing.T, id string) []string {
 		}
 	}
 	return out
+}
+
+// stamp is how a sandbox object writes t.
+func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+
+// createEvent is a parley.sandbox.create event as the event log holds it.
+type createEvent struct {
+	resourceType, workspace, actorType, actorID string
+	session                                     *string
+	metadata                                    map[string]any
+}
+
+// createEvents returns the parley.sandbox.create events of the sandbox id.
+func (h *createHub) createEvents(t *testing.T, id string) []createEvent {
+	t.Helper()
+	rows, err := h.Store.Main().Query(`SELECT resource_type, workspace, actor_type, actor_id, session_id, metadata
+		FROM hub_events WHERE type = 'parley.sandbox.create' AND resource_id = ? ORDER BY seq`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []createEvent
+	for rows.Next() {
+		var (
+			e    createEvent
+			meta string
+		)
+		if err := rows.Scan(&e.resourceType, &e.workspace, &e.actorType, &e.actorID, &e.session, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(meta), &e.metadata); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// strs returns n strings "a0", "a1", ….
+func strs(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "a" + strconv.Itoa(i)
+	}
+	return out
+}
+
+// entries returns a map of n entries "K0": "v", "K1": "v", ….
+func entries(n int) map[string]string {
+	out := make(map[string]string, n)
+	for i := range n {
+		out["K"+strconv.Itoa(i)] = "v"
+	}
+	return out
+}
+
+// wantRefused fails the test unless a is status with error type typ and
+// the hub's footprint is still before.
+func (h *createHub) wantRefused(t *testing.T, a answer, status int, typ string, before footprint) {
+	t.Helper()
+	if a.status != status || a.err.ErrorType != typ {
+		t.Errorf("create = %d %s; want %d %s", a.status, a.body, status, typ)
+	}
+	if after := h.footprint(t); after != before {
+		t.Errorf("a refused create left %+v; want %+v", after, before)
+	}
+}
+
+// limits are the four sandbox limits of a hub, in the order they are
+// checked.
+type limits struct{ sandboxes, perOrg, perWorkspace, perUser int }
+
+// only is limits with the limit name at n and the others at 100.
+func only(name string, n int) limits {
+	l := limits{100, 100, 100, 100}
+	l.set(name, n)
+	return l
+}
+
+// set sets the limit name to n.
+func (l *limits) set(name string, n int) {
+	switch name {
+	case "max_sandboxes":
+		l.sandboxes = n
+	case "max_per_org":
+		l.perOrg = n
+	case "max_per_workspace":
+		l.perWorkspace = n
+	case "max_per_user":
+		l.perUser = n
+	}
+}
+
+// setLimits makes l the limits of the hub's next creates.
+func (h *createHub) setLimits(l limits) {
+	h.limits.set(sandbox.Limits{MaxSandboxes: l.sandboxes, MaxPerOrg: l.perOrg, MaxPerWorkspace: l.perWorkspace, MaxPerUser: l.perUser})
+}
+
+// quotaLimits are the sandbox limits of a create hub: those of its
+// settings until the test sets others, which the requests then read.
+type quotaLimits struct {
+	mu    sync.Mutex
+	given *sandbox.Limits
+}
+
+// set makes l the limits from now on.
+func (q *quotaLimits) set(l sandbox.Limits) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.given = &l
+}
+
+// get returns the limits the test set, or those of settings.
+func (q *quotaLimits) get(settings *sandbox.Settings) sandbox.Limits {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.given != nil {
+		return *q.given
+	}
+	return sandbox.Limits{MaxSandboxes: settings.MaxSandboxes, MaxPerOrg: settings.MaxPerOrg, MaxPerWorkspace: settings.MaxPerWorkspace, MaxPerUser: settings.MaxPerUser}
+}
+
+// quotaHub is a create hub with a create world, the user omar, who creates
+// no sandbox through the hub, and the org other.
+type quotaHub struct {
+	*createHub
+	omar, other string
+}
+
+func startQuotaHub(t *testing.T) *quotaHub {
+	t.Helper()
+	h := &quotaHub{createHub: startCreateHub(t, agentProfile)}
+	h.world(t)
+	h.omar, h.other = h.CreateUser(t, "omar"), h.CreateOrg(t, "other")
+	return h
+}
+
+// stored describes a sandbox a quota test stores directly: its workspace,
+// the root of the workspace's family, the org (none for ""), the user who
+// created it and its state.
+type stored struct{ ws, family, org, user, state string }
+
+// store stores s and returns its id.
+func (h *createHub) store(t *testing.T, s stored) string {
+	t.Helper()
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: s.ws, Profile: "agent", State: s.state,
+		ExpiresAt: recordStart.Add(time.Hour), LastActivityAt: recordStart,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: s.user, Username: "someone"},
+		CreatedAt: recordStart, UpdatedAt: recordStart, UserID: s.user, OrgID: s.org, FamilyRoot: s.family,
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) })
+	return rec.ID
+}
+
+// exec runs the statement query with args in a store transaction.
+func (h *createHub) exec(t *testing.T, query string, args ...any) {
+	t.Helper()
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	})
+}
+
+// capacity is the error object of a sandbox_capacity answer.
+type capacity struct {
+	ErrorType string `json:"error_type"`
+	Message   string `json:"message"`
+	Limit     string `json:"limit"`
+	Maximum   int    `json:"maximum"`
+	Current   int    `json:"current"`
+}
+
+// wantCapacity fails the test unless a is 429 sandbox_capacity naming the
+// limit at maximum with the count current.
+func wantCapacity(t *testing.T, a answer, limit string, maximum, current int) {
+	t.Helper()
+	var env struct{ Error capacity }
+	_ = json.Unmarshal(a.body, &env)
+	want := capacity{"sandbox_capacity", "sandbox limit reached: " + limit, limit, maximum, current}
+	if a.status != http.StatusTooManyRequests || env.Error != want {
+		t.Errorf("create = %d %s; want 429 with %+v", a.status, a.body, want)
+	}
+}
+
+// nameList is a JSON list of names as a decoded answer holds it; never nil.
+func nameList(n ...string) []any {
+	out := make([]any, len(n))
+	for i, v := range n {
+		out[i] = v
+	}
+	return out
+}
+
+// errorObject decodes the error object of a, with its extra members.
+func errorObject(t *testing.T, a answer) map[string]any {
+	t.Helper()
+	var env struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(a.body, &env); err != nil || env.Error == nil {
+		t.Fatalf("the answer %d %s has no error object", a.status, a.body)
+	}
+	return env.Error
+}
+
+// wantMembers fails the test unless o has each member of want, compared as
+// decoded JSON, so that [] and null differ.
+func wantMembers(t *testing.T, o map[string]any, want map[string]any) {
+	t.Helper()
+	for k, v := range want {
+		if !reflect.DeepEqual(o[k], v) {
+			t.Errorf("%s = %#v; want %#v", k, o[k], v)
+		}
+	}
+}
+
+// dump is every row of the table, as text.
+func dump(t *testing.T, db *sql.DB, table string) string {
+	t.Helper()
+	rows, err := db.Query(`SELECT * FROM ` + table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	vals, ptrs := make([]any, len(cols)), make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vals {
+			fmt.Fprintf(&b, "%s\t", v)
+		}
+		b.WriteString("\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+// The values of the secrets of a provisioning world.
+const (
+	modelSecret = "sk-model-0123456789"
+	npmSecret   = "npm_SECRETVALUE42"
+)
+
+// provisionProfile is the profile full of the provisioning tests: image
+// img:1 with 2 CPUs and 4Gi of memory, the policy file policy.yaml, the
+// credential model, the exposed secret NPM_TOKEN and the variable TIER.
+const provisionProfile = "[[sandbox.profiles]]\nname = \"full\"\nimage = \"img:1\"\ncpu = \"2\"\nmemory = \"4Gi\"\nttl = \"4h\"\n" +
+	"policy = \"policy.yaml\"\ncredentials = [\"model\"]\nexpose_secrets = [\"NPM_TOKEN\"]\nenv = { TIER = \"profile\" }\n"
+
+// startProvisionWorld starts a provision hub with the profiles agent, full
+// and plain and the credentials model and mirror, adds the create world,
+// makes dana a member of acme and sets MODEL_KEY and NPM_TOKEN on acme.
+func startProvisionWorld(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
+	t.Helper()
+	h := startProvisionHub(t, agentProfile+provisionProfile+plainProfile+credentialTables, adjust...)
+	h.world(t)
+	h.AddMember(t, h.org, h.dana)
+	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
+	h.putSecret(t, secret.ScopeOrg, h.org, "NPM_TOKEN", npmSecret)
+	return h
+}
+
+// objectMap is the sandbox object of rec as a decoded answer holds it.
+func objectMap(t *testing.T, rec sandbox.Record) map[string]any {
+	t.Helper()
+	b, err := json.Marshal(sandbox.ObjectOf(rec, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var o map[string]any
+	if err := json.Unmarshal(b, &o); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
+// decodedRules are rules as names and decoded bodies, for comparison.
+func decodedRules(t *testing.T, rules []runtime.Rule) []any {
+	t.Helper()
+	out := []any{}
+	for _, r := range rules {
+		var body any
+		if err := json.Unmarshal(r.Body, &body); err != nil {
+			t.Fatalf("rule %s: %v", r.Name, err)
+		}
+		out = append(out, map[string]any{"name": r.Name, "body": body})
+	}
+	return out
+}
+
+// hubRule is the protected rule of the hub credential of the sandbox id of
+// the workspace slug in acme, decoded: its provider, on the scheme, host
+// and port of https://hub.test, for the API and git routes of the workspace
+// only.
+func hubRule(id, slug string) any {
+	return map[string]any{"name": "parley-hub", "body": map[string]any{
+		"providers": []any{id + "-hub"},
+		"endpoints": []any{map[string]any{
+			"scheme": "https", "host": "hub.test", "port": float64(443),
+			"paths": []any{
+				"/api/v1/workspaces/" + slug, "/api/v1/workspaces/" + slug + "/**",
+				"/git/acme/" + slug + ".git", "/git/acme/" + slug + ".git/**",
+			},
+		}},
+	}}
+}
+
+// credentialRule is the protected rule of the credential name of the
+// sandbox id, decoded: it names the credential's provider.
+func credentialRule(id, name string) any {
+	return map[string]any{"name": "credential-" + name, "body": map[string]any{"providers": []any{id + "-" + name}}}
+}
+
+// sandboxOps are the operations of calls that name the sandbox id or one of
+// its providers, in order, each run of commands executed in the sandbox
+// counted as one exec.
+func sandboxOps(calls []runtimetest.Call, id string) []string {
+	var out []string
+	for _, c := range calls {
+		if !strings.HasPrefix(c.Target, id) || (c.Op == runtime.OpExec && len(out) > 0 && out[len(out)-1] == runtime.OpExec) {
+			continue
+		}
+		out = append(out, c.Op)
+	}
+	return out
+}
+
+// providerNames are the provider names of a sandbox spec without the
+// sandbox id they start with, sorted.
+func providerNames(spec runtime.SandboxSpec) []string {
+	out := []string{}
+	for _, p := range spec.Providers {
+		out = append(out, strings.TrimPrefix(p, spec.Name+"-"))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// stubComposer is a policy composer whose Compose answers policy or err and
+// whose Explain prefixes the refusal; it keeps the workspace rules it read.
+type stubComposer struct {
+	mu     sync.Mutex
+	policy runtime.Policy
+	err    error
+	read   [][]sandbox.WorkspaceRule
+}
+
+func (c *stubComposer) Compose(_ context.Context, rec sandbox.Record) (runtime.Policy, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.read = append(c.read, rec.WorkspaceRules)
+	return c.policy, c.err
+}
+
+func (c *stubComposer) Explain(_ sandbox.Record, refusal error) string {
+	return "the composer explains: " + refusal.Error()
+}
+
+func (c *stubComposer) rulesRead() [][]sandbox.WorkspaceRule {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.read)
+}
+
+// hubtestWait waits for ch to be closed.
+func hubtestWait(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("waited 5 s for %s", what)
+	}
+}
+
+// stubRules is a workspace rule provider that answers rules and keeps the
+// workspaces it was asked for.
+type stubRules struct {
+	mu    sync.Mutex
+	rules []sandbox.WorkspaceRule
+	calls []string
+}
+
+func (r *stubRules) WorkspaceRules(_ context.Context, tx *sql.Tx, workspace string) ([]sandbox.WorkspaceRule, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if tx == nil {
+		return nil, errors.New("asked outside the creating transaction")
+	}
+	r.calls = append(r.calls, workspace)
+	return slices.Clone(r.rules), nil
+}
+
+func (r *stubRules) set(rules []sandbox.WorkspaceRule) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rules = rules
+}
+
+func (r *stubRules) asked() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+// sandboxPath is the path of the sandbox id of the workspace slug.
+func sandboxPath(slug, id string) string { return "/workspaces/" + slug + "/sandboxes/" + id }
+
+// listIDs returns the ids of the items of a 200 list answer, in order, and
+// its next_cursor ("" for null).
+func listIDs(t *testing.T, a answer) (ids []string, next string) {
+	t.Helper()
+	o := decoded(t, a, http.StatusOK)
+	items, ok := o["items"].([]any)
+	if !ok {
+		t.Fatalf("the list %s has no items list", a.body)
+	}
+	ids = []string{}
+	for _, it := range items {
+		ids = append(ids, it.(map[string]any)["id"].(string))
+	}
+	next, _ = o["next_cursor"].(string)
+	return ids, next
+}
+
+// newestFirst returns ids sorted by id descending, the order of sandboxes
+// created at the same instant.
+func newestFirst(ids ...string) []string {
+	out := slices.Clone(ids)
+	slices.Sort(out)
+	slices.Reverse(out)
+	return out
+}
+
+// checkoutHead is the commit the runtime of a checkout world reports as
+// HEAD in every sandbox.
+const checkoutHead = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+// startCheckoutWorld starts a provision hub with the profiles agent and
+// plain, the ready repository demo of dana in acme, whose main has one
+// commit and whose release has another on top of it, and the fork demo--t1
+// of it (name t1, base main, tracking both, expiring in 7 days, in the
+// session t1Session). NPM_TOKEN is set on acme, and the runtime reports
+// checkoutHead as HEAD. It returns the hub and the commit of release.
+func startCheckoutWorld(t *testing.T) (*createHub, string) {
+	t.Helper()
+	h := startProvisionHub(t, agentProfile+plainProfile)
+	h.base = h.repository(t, "demo", workspace.StatusReady)
+	dir := h.workspaces.RepoPath("demo")
+	release := gitrepotest.Commit(t, dir, "release", map[string]string{"NOTES": "release\n"}, h.base)
+	gitrepotest.SetRef(t, dir, "refs/heads/release", release)
+	h.fork(t, "demo--t1", "demo", recordStart.Add(7*24*time.Hour), new(t1Session))
+	h.AddMember(t, h.org, h.dana)
+	h.putSecret(t, secret.ScopeOrg, h.org, "NPM_TOKEN", npmSecret)
+	h.hooks.setHead(checkoutHead)
+	return h, release
+}
+
+// provisioned creates a sandbox on slug with body, with the credential cred
+// (dana's key when ""), waits until it leaves provisioning and returns the
+// 201 answer's object and the record then.
+func (h *createHub) provisioned(t *testing.T, slug, cred string, body map[string]any) (map[string]any, sandbox.Record) {
+	t.Helper()
+	if cred == "" {
+		cred = h.key
+	}
+	o := sandboxObject(t, h.call(t, "POST", "/workspaces/"+slug+"/sandboxes", cred, body))
+	return o, h.settled(t, o["id"].(string))
+}
+
+// gitRuns are the commands of runs that run git, each with its index in
+// runs.
+func gitRuns(runs []runCall) map[int][]string {
+	out := map[int][]string{}
+	for i, r := range runs {
+		if r.kind == "exec" && len(r.argv) > 0 && r.argv[0] == "git" {
+			out[i] = r.argv
+		}
+	}
+	return out
+}
+
+// firstRun is the index of the first of runs whose command matches, -1 for
+// none.
+func firstRun(runs []runCall, match func(argv []string) bool) int {
+	return slices.IndexFunc(runs, func(r runCall) bool { return r.kind == "exec" && match(r.argv) })
+}
+
+// isClone reports whether argv is a git clone.
+func isClone(argv []string) bool { return len(argv) > 1 && argv[0] == "git" && argv[1] == "clone" }
+
+// isCheckout reports whether argv is a git checkout.
+func isCheckout(argv []string) bool {
+	return len(argv) > 1 && argv[0] == "git" && argv[1] == "checkout"
+}
+
+// createsBranch reports whether argv creates a branch.
+func createsBranch(argv []string) bool {
+	if len(argv) < 2 || argv[0] != "git" {
+		return false
+	}
+	switch argv[1] {
+	case "branch":
+		return true
+	case "checkout":
+		return slices.Contains(argv, "-b") || slices.Contains(argv, "-B")
+	case "switch":
+		return slices.Contains(argv, "-c") || slices.Contains(argv, "-C")
+	}
+	return false
+}
+
+// checkCloneAndOrder checks that the commands run in the sandbox id all ran
+// in the working directory, that they hold exactly one clone of remote
+// into it as a partial clone without blobs, and that every git command ran
+// before the main process started, when one did.
+func checkCloneAndOrder(t *testing.T, runs []runCall, remote string) {
+	t.Helper()
+	clones := 0
+	for _, r := range runs {
+		if r.kind == "exec" && r.dir != sandbox.WorkDir {
+			t.Errorf("%v ran in %q; want %s", r.argv, r.dir, sandbox.WorkDir)
+		}
+		if r.kind == "exec" && isClone(r.argv) {
+			clones++
+			if !slices.Contains(r.argv, "--filter=blob:none") || !slices.Contains(r.argv, remote) || !slices.Contains(r.argv, sandbox.WorkDir) {
+				t.Errorf("clone %v; want a partial clone with --filter=blob:none of %s into %s", r.argv, remote, sandbox.WorkDir)
+			}
+		}
+	}
+	if clones != 1 {
+		t.Errorf("%d clones in %v; want one", clones, runs)
+	}
+	if main := slices.IndexFunc(runs, func(r runCall) bool { return r.kind == "main" }); main >= 0 {
+		for i, argv := range gitRuns(runs) {
+			if i > main {
+				t.Errorf("%v ran after the main process started", argv)
+			}
+		}
+	}
+}
+
+// errRollback ends a test's transaction, which the store then rolls back.
+var errRollback = errors.New("roll back")
+
+// postFork sends POST /workspaces/demo/forks with cred and body.
+func (h *createHub) postFork(t *testing.T, cred string, body map[string]any) answer {
+	t.Helper()
+	return h.call(t, http.MethodPost, "/workspaces/demo/forks", cred, body)
+}
+
+// timeMember parses the RFC 3339 time of the member name of o.
+func timeMember(t *testing.T, o map[string]any, name string) time.Time {
+	t.Helper()
+	s, _ := o[name].(string)
+	at, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("%s %v: %v", name, o[name], err)
+	}
+	return at
+}
+
+// createInFork creates in tx, through the fork create's sandbox component,
+// a sandbox with an empty body on the fork f, which tx stores first, for
+// dana and with no defaults, and returns its object.
+func (h *createHub) createInFork(t *testing.T, ctx context.Context, tx *sql.Tx, f fork.Fork) map[string]any {
+	t.Helper()
+	if err := fork.Insert(ctx, tx, f); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := h.svc.CreateSandbox(ctx, tx, fork.SandboxRequest{Caller: h.principal(t), Fork: f, Sandbox: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("CreateSandbox = %v", err)
+	}
+	var o map[string]any
+	if err := json.Unmarshal(raw, &o); err != nil {
+		t.Fatalf("the sandbox object %s: %v", raw, err)
+	}
+	return o
+}
+
+// allHubScopes are the six scopes a hub credential can carry, sorted.
+var allHubScopes = []string{"audit:write", "changes:read", "changes:write", "git:read", "git:write", "sessions:write"}
+
+// jsonList is list as a decoded answer holds it: nil for nil.
+func jsonList(list []string) any {
+	if list == nil {
+		return nil
+	}
+	out := make([]any, len(list))
+	for i, v := range list {
+		out[i] = v
+	}
+	return out
+}
+
+// bindEvents counts the parley.token.bind events of the token id, or of
+// every token for "".
+func (h *createHub) bindEvents(t *testing.T, id string) int {
+	t.Helper()
+	return h.count(t, `SELECT count(*) FROM hub_events WHERE type = 'parley.token.bind' AND (? = '' OR resource_id = ?)`, id, id)
 }

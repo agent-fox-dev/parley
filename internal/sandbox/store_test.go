@@ -92,7 +92,7 @@ func TestStore_KeepsWhatItIsGiven(t *testing.T) {
 		want.Credentials, want.ExposedSecrets, want.PolicyRevision = []string{}, []string{}, 3
 		want.LastActivityAt, want.HubTokenID, want.Marker = later, "", ""
 		want.RuntimeCreated, want.RuntimeProvisioning, want.UpdatedAt = false, false, later
-		if got := h.get(t, full.ID); !reflect.DeepEqual(got, want) {
+		if got := storedRecord(t, h.Hub, full.ID); !reflect.DeepEqual(got, want) {
 			t.Errorf("after the update\n %+v\nwant\n %+v", got, want)
 		}
 		err = tx(func(tx *sql.Tx) error { return sandbox.Update(ctx, tx, "sbx_none", sandbox.SetPurpose("x")) })

@@ -54,8 +54,8 @@ func Scrub(v Values, text string) string {
 }
 
 // SetValues makes v the values the sandbox id's text is scrubbed of, as
-// the provisioning that resolved them and minted the hub credential knows
-// them. They are kept in memory only.
+// the create or the provisioning that resolved them and minted the hub
+// credential knows them. They are kept in memory only, until ForgetValues.
 func (s *Service) SetValues(id string, v Values) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,7 +66,11 @@ func (s *Service) SetValues(id string, v Values) {
 }
 
 // ForgetValues drops what the service keeps of the sandbox id's values, its
-// hub credential's included, for a sandbox that is gone.
+// hub credential's included, for a sandbox that is gone or has ended. This
+// package calls it for a create that does not commit, a provisioning that
+// ends failed or finds its sandbox moved or removed meanwhile, and a
+// sandbox created in a caller's transaction that rolled back; the packages
+// that stop and delete sandboxes call it when they end one.
 func (s *Service) ForgetValues(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

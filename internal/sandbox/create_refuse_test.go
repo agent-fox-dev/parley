@@ -1,47 +1,21 @@
 package sandbox_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/secret"
+	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// strs returns n strings "a0", "a1", ….
-func strs(n int) []string {
-	out := make([]string, n)
-	for i := range out {
-		out[i] = "a" + strconv.Itoa(i)
-	}
-	return out
-}
-
-// entries returns a map of n entries "K0": "v", "K1": "v", ….
-func entries(n int) map[string]string {
-	out := make(map[string]string, n)
-	for i := range n {
-		out["K"+strconv.Itoa(i)] = "v"
-	}
-	return out
-}
-
-// wantRefused fails the test unless a is status with error type typ and
-// the hub's footprint is still before.
-func (h *createHub) wantRefused(t *testing.T, a answer, status int, typ string, before footprint) {
-	t.Helper()
-	if a.status != status || a.err.ErrorType != typ {
-		t.Errorf("create = %d %s; want %d %s", a.status, a.body, status, typ)
-	}
-	if after := h.footprint(t); after != before {
-		t.Errorf("a refused create left %+v; want %+v", after, before)
-	}
-}
 
 func TestCreate_RefusesInvalidBody(t *testing.T) {
 	t.Parallel()
@@ -205,6 +179,21 @@ func TestCreate_RefusesByWorkspaceState(t *testing.T) {
 			h.wantRefused(t, h.post(t, tc.slug, map[string]any{}), http.StatusConflict, tc.want, before)
 		})
 	}
+
+	// A record read before an archive committed is judged as the creating
+	// transaction reads it.
+	t.Run("archived after the caller read it", func(t *testing.T) {
+		stale := h.record("old", access.KindRepository, workspace.StatusReady)
+		before := h.footprint(t)
+		_, err := h.svc.Create(context.Background(), nil, sandbox.CreateInput{Caller: h.principal(t), Workspace: stale, Body: []byte(`{}`)})
+		var se *server.Error
+		if !errors.As(err, &se) || se.Status() != http.StatusConflict || se.Type() != "workspace_archived" {
+			t.Errorf("Create on a stale ready record of an archived workspace = %v; want 409 workspace_archived", err)
+		}
+		if after := h.footprint(t); after != before {
+			t.Errorf("a refused create left %+v; want %+v", after, before)
+		}
+	})
 }
 
 func TestCreate_AuthorizationAndOrder(t *testing.T) {

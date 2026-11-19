@@ -7814,7 +7814,11 @@ in the background, at most 8 at once, each one at most once at a time. It
 looks for sandboxes to provision when a create wakes it, every second, and
 at every start, so a sandbox that was being provisioned when the hub
 stopped is provisioned again from the first step at the next start, and
-ends `ready` or `failed` with exactly one event.
+ends `ready` or `failed` with exactly one event. Before the first step the
+hub removes whatever the runtime holds of the sandbox (the sandbox and the
+providers labelled `parley.sandbox=<id>` or named after it), which a
+provisioning the hub stopped in may have left, with the providers'
+secret values.
 
 1. It resolves the credentials and exposed secrets again; a required one
    that is gone ends the sandbox `failed` with `credential_missing`.
@@ -7822,8 +7826,7 @@ ends `ready` or `failed` with exactly one event.
    `<id>-<credential>`, and one for the hub credential, `<id>-hub`, each
    labelled `parley.sandbox=<id>`. After a restart, the hub credential
    minted earlier is revoked and replaced by one with the same scopes,
-   paths and expiry, and what the earlier run left at the runtime is
-   removed first.
+   paths and expiry.
 3. It creates the sandbox at the runtime, named by its id, with the
    profile's `image`, `cpu`, `memory` and `gpu`, the working directory
    `/workspace`, the providers, the environment below and the policy: the
@@ -7864,7 +7867,8 @@ A failure at any step, or a provisioning that has not ended after 10
 minutes, moves the sandbox to `failed` with `state_reason`
 `credential_missing` (step 1), `checkout_failed` (a git command that fails)
 or `provision_failed` (every other step, an unreachable runtime included),
-sets `ended_at`, removes what was created at the runtime, revokes the hub
+sets `ended_at`, removes whatever the runtime holds of the sandbox (by its
+label and its names, also what an earlier run left), revokes the hub
 credential and writes `parley.sandbox.fail` (actor `system`, metadata
 `reason` and `error`). Any text the hub writes about a sandbox into an
 event, an error or its log has every resolved value of that sandbox (its

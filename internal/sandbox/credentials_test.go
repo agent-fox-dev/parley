@@ -2,8 +2,6 @@ package sandbox_test
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -26,38 +24,6 @@ const fullProfile = "[[sandbox.profiles]]\nname = \"full\"\nttl = \"4h\"\ncreden
 
 // needsProfile requires the credential model.
 const needsProfile = "[[sandbox.profiles]]\nname = \"needs\"\nttl = \"4h\"\ncredentials = [\"model\"]\n"
-
-// nameList is a JSON list of names as a decoded answer holds it; never nil.
-func nameList(n ...string) []any {
-	out := make([]any, len(n))
-	for i, v := range n {
-		out[i] = v
-	}
-	return out
-}
-
-// errorObject decodes the error object of a, with its extra members.
-func errorObject(t *testing.T, a answer) map[string]any {
-	t.Helper()
-	var env struct {
-		Error map[string]any `json:"error"`
-	}
-	if err := json.Unmarshal(a.body, &env); err != nil || env.Error == nil {
-		t.Fatalf("the answer %d %s has no error object", a.status, a.body)
-	}
-	return env.Error
-}
-
-// wantMembers fails the test unless o has each member of want, compared as
-// decoded JSON, so that [] and null differ.
-func wantMembers(t *testing.T, o map[string]any, want map[string]any) {
-	t.Helper()
-	for k, v := range want {
-		if !reflect.DeepEqual(o[k], v) {
-			t.Errorf("%s = %#v; want %#v", k, o[k], v)
-		}
-	}
-}
 
 func TestCreate_ResolvesCredentialsAndExposedSecrets(t *testing.T) {
 	t.Parallel()
@@ -138,19 +104,29 @@ func TestCreate_ReadOnlyForkOwnerGetsNoParentSecret(t *testing.T) {
 	omarKey := h.IssueKey(t, omar)
 	h.putSecret(t, secret.ScopeWorkspace, "demo", "NPM_TOKEN", "npm-value")
 
-	before := h.footprint(t)
-	a := h.call(t, http.MethodPost, "/workspaces/demo--m1/sandboxes", omarKey, map[string]any{"profile": "needs-npm"})
-	h.wantRefused(t, a, http.StatusUnprocessableEntity, "credential_missing", before)
-	wantMembers(t, errorObject(t, a), map[string]any{
-		"credentials": nameList(), "secrets": nameList("NPM_TOKEN"), "scopes_searched": nameList("workspace", "org", "user"),
-	})
-	s := sandboxObject(t, h.call(t, http.MethodPost, "/workspaces/demo--m1/sandboxes", omarKey, map[string]any{"profile": "maybe-npm"}))
-	wantMembers(t, s, map[string]any{"exposed_secrets": nameList()})
-
 	// The owner of the parent gets the parent's secret on her fork.
-	for _, profile := range []string{"needs-npm", "maybe-npm"} {
-		s := sandboxObject(t, h.post(t, "demo--t1", map[string]any{"profile": profile}))
-		wantMembers(t, s, map[string]any{"exposed_secrets": nameList("NPM_TOKEN")})
+	for _, tc := range []struct {
+		name, slug, cred, profile string
+		// exposed is what the sandbox exposes; nil for a refused create.
+		exposed []any
+	}{
+		{"a read-only owner, required", "demo--m1", omarKey, "needs-npm", nil},
+		{"a read-only owner, optional", "demo--m1", omarKey, "maybe-npm", nameList()},
+		{"the parent's owner, required", "demo--t1", h.key, "needs-npm", nameList("NPM_TOKEN")},
+		{"the parent's owner, optional", "demo--t1", h.key, "maybe-npm", nameList("NPM_TOKEN")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := h.footprint(t)
+			a := h.call(t, http.MethodPost, "/workspaces/"+tc.slug+"/sandboxes", tc.cred, map[string]any{"profile": tc.profile})
+			if tc.exposed == nil {
+				h.wantRefused(t, a, http.StatusUnprocessableEntity, "credential_missing", before)
+				wantMembers(t, errorObject(t, a), map[string]any{
+					"credentials": nameList(), "secrets": nameList("NPM_TOKEN"), "scopes_searched": nameList("workspace", "org", "user"),
+				})
+				return
+			}
+			wantMembers(t, sandboxObject(t, a), map[string]any{"exposed_secrets": tc.exposed})
+		})
 	}
 }
 
@@ -174,44 +150,11 @@ func TestCreate_SecretStoreUnreadable(t *testing.T) {
 	}
 }
 
-// dump is every row of the table, as text.
-func dump(t *testing.T, db *sql.DB, table string) string {
-	t.Helper()
-	rows, err := db.Query(`SELECT * FROM ` + table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = rows.Close() }()
-	cols, err := rows.Columns()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var b strings.Builder
-	vals, ptrs := make([]any, len(cols)), make([]any, len(cols))
-	for i := range vals {
-		ptrs[i] = &vals[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
-			t.Fatal(err)
-		}
-		for _, v := range vals {
-			fmt.Fprintf(&b, "%s\t", v)
-		}
-		b.WriteString("\n")
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return b.String()
-}
-
 func TestNoValueLeavesTheHub(t *testing.T) {
 	t.Parallel()
 	const (
 		modelValue = "sk-model-0123456789"
 		npmValue   = "npm_SECRETVALUE42"
-		hubValue   = "parley-hub-value-0001"
 		session    = "6f1c2f0e-0000-4000-8000-000000000002"
 	)
 	h := startProvisionHub(t, agentProfile+fullProfile+credentialTables)
@@ -275,12 +218,8 @@ func TestNoValueLeavesTheHub(t *testing.T) {
 	h.linker.setFail(nil)
 
 	// The sandbox's own scrubbing knows its values without being told, as
-	// after a restart, and those it is given.
+	// after a restart.
 	if got, want := h.svc.ScrubSandbox(ctx, id, "a "+modelValue+" b "+npmValue), "a [redacted] b [redacted]"; got != want {
-		t.Errorf("ScrubSandbox = %q; want %q", got, want)
-	}
-	h.svc.SetValues(id, sandbox.Values{Credentials: []string{modelValue}, Exposed: []string{npmValue}, HubCredential: hubValue})
-	if got, want := h.svc.ScrubSandbox(ctx, id, modelValue+" "+npmValue+" Bearer "+hubValue), "[redacted] [redacted] Bearer [redacted]"; got != want {
 		t.Errorf("ScrubSandbox = %q; want %q", got, want)
 	}
 

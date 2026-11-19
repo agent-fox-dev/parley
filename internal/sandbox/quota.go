@@ -20,8 +20,25 @@ const (
 	LimitPerUser      = "max_per_user"
 )
 
+// Limits are the four sandbox limits a create is held to, as the [sandbox]
+// section sets them.
+type Limits struct {
+	MaxSandboxes, MaxPerOrg, MaxPerWorkspace, MaxPerUser int
+}
+
+// limits returns the limits CheckQuota holds a create to: those of
+// Deps.Limits when it is set, the loaded settings' otherwise.
+func (s *Service) limits() Limits {
+	if s.deps.Limits != nil {
+		return s.deps.Limits()
+	}
+	set := s.settings
+	return Limits{MaxSandboxes: set.MaxSandboxes, MaxPerOrg: set.MaxPerOrg, MaxPerWorkspace: set.MaxPerWorkspace, MaxPerUser: set.MaxPerUser}
+}
+
 // CheckQuota refuses one more running sandbox on the workspace w for the
-// user userID when it would pass one of the four limits of the settings:
+// user userID when it would pass one of the four limits (Deps.Limits, or
+// the settings' without it):
 // it counts, through tx, the sandboxes in state provisioning or ready of
 // the whole hub, of w's org, of w's family (a fork counts toward its
 // parent's) and of the sandboxes userID created on any workspace, and
@@ -46,7 +63,7 @@ func (s *Service) CheckQuota(ctx context.Context, tx *sql.Tx, w workspace.Worksp
 	if err != nil {
 		return fmt.Errorf("count the running sandboxes: %w", err)
 	}
-	set := s.settings
+	set := s.limits()
 	checks := []struct {
 		limit          string
 		maximum, count int

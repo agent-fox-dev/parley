@@ -385,11 +385,16 @@ func markedSandboxes(ctx context.Context, q access.Querier) ([]string, error) {
 // the hub's clock, and ends it: ready when every step succeeded, failed
 // otherwise. When parent ends first, as when the hub stops, it changes
 // nothing, so that the next start provisions the sandbox again from the
-// first step.
+// first step. A sandbox whose record is gone has its values forgotten.
 func (s *Service) provisionOne(parent context.Context, id string) {
 	rec, err := Get(parent, s.deps.Store.Main(), id)
-	if err != nil {
-		if parent.Err() == nil && !errors.Is(err, ErrNotFound) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		// Removed meanwhile: nothing is left to provision or scrub.
+		s.ForgetValues(id)
+		return
+	case err != nil:
+		if parent.Err() == nil {
 			s.logger().Warn("the sandbox provisioner could not read a sandbox", "sandbox", id, "error", err)
 		}
 		return
@@ -449,16 +454,26 @@ type provisioning struct {
 	// values are the sandbox's secret values, once resolved.
 	values Values
 	// providers are the names of the providers registered for the sandbox,
-	// and created reports that the runtime was asked to create it: what the
-	// clean-up of a failure deletes.
+	// which the runtime's sandbox is created with.
 	providers []string
-	created   bool
 }
 
 // steps runs the steps of the provisioning in order and returns the first
-// that failed, as a *stepError.
+// that failed, as a *stepError. Before the first it deletes what the runtime
+// holds of the sandbox: an earlier provisioning that the hub stopped in may
+// have left the runtime's sandbox and its providers, which hold the secret
+// values, whether or not it had marked the sandbox created.
 func (p *provisioning) steps(ctx context.Context) error {
 	s, id := p.s, p.rec.ID
+	if err := p.clearRuntime(ctx); err != nil {
+		return failed(ReasonProvisionFailed, "delete what an earlier provisioning left at the runtime", err)
+	}
+	if p.rec.RuntimeCreated {
+		if err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return Update(ctx, tx, id, SetRuntimeCreated(false)) }); err != nil {
+			return failed(ReasonProvisionFailed, "clear the mark of the runtime sandbox", err)
+		}
+		p.rec.RuntimeCreated = false
+	}
 	res, err := s.Resolve(ctx, p.rec.Workspace, attachedSnapshot(p.rec))
 	if err != nil {
 		return failed(ReasonProvisionFailed, "resolve the secrets", err)
@@ -484,7 +499,6 @@ func (p *provisioning) steps(ctx context.Context) error {
 	if err != nil {
 		return failed(ReasonProvisionFailed, "compose the policy", err)
 	}
-	p.created = true
 	_, err = p.client.CreateSandbox(ctx, runtime.SandboxSpec{
 		Name: id, Image: p.rec.Image, CPU: p.rec.CPU, Memory: p.rec.Memory, GPU: p.rec.GPU, WorkDir: WorkDir,
 		Env: env, Policy: policy, Providers: slices.Clone(p.providers), Labels: map[string]string{LabelSandbox: id},
@@ -540,18 +554,11 @@ func attachedSnapshot(rec Record) Snapshot {
 // hubCredential returns the value of the sandbox's hub credential, "" for a
 // sandbox without one. A provisioning this process did not start from the
 // create, as after a restart, finds the value gone, since it is never
-// stored, or the runtime holding what an earlier run created: it deletes
-// what the runtime holds under the sandbox's label, revokes the stored
-// token and mints a replacement with the stored scopes, paths and expiry.
+// stored: it revokes the stored token and mints a replacement with the
+// stored scopes, paths and expiry.
 func (p *provisioning) hubCredential(ctx context.Context) (string, error) {
 	s, rec := p.s, p.rec
 	value, ok := s.HubCredential(rec.ID)
-	if !rec.RuntimeCreated && (ok || rec.HubAccess == nil) {
-		return value, nil
-	}
-	if err := p.clearRuntime(ctx); err != nil {
-		return "", failed(ReasonProvisionFailed, "delete what an earlier provisioning left at the runtime", err)
-	}
 	if ok || rec.HubAccess == nil {
 		return value, nil
 	}
@@ -573,33 +580,56 @@ func (p *provisioning) hubCredential(ctx context.Context) (string, error) {
 	return value, nil
 }
 
-// clearRuntime deletes the runtime's sandboxes and providers labelled with
-// the sandbox's id.
+// clearRuntime deletes what the runtime holds of the sandbox: the sandboxes
+// and providers labelled with its id or named after it (the sandbox by its
+// id, each provider <id>-<name>). When the runtime cannot list them it
+// deletes by name the sandbox and the providers of its attached credentials
+// and its hub credential, and returns the listing's error with any other.
 func (p *provisioning) clearRuntime(ctx context.Context) error {
 	id := p.rec.ID
-	sandboxes, err := p.client.ListSandboxes(ctx)
-	if err != nil {
-		return err
+	owned := func(name string, labels map[string]string) bool {
+		return labels[LabelSandbox] == id || name == id || strings.HasPrefix(name, id+"-")
 	}
-	for _, sb := range sandboxes {
-		if sb.Labels[LabelSandbox] == id {
-			if err := p.client.DeleteSandbox(ctx, sb.Name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
-				return err
+	var (
+		errs                []error
+		sandboxes, provided []string
+	)
+	if list, err := p.client.ListSandboxes(ctx); err != nil {
+		errs = append(errs, err)
+		sandboxes = []string{id}
+	} else {
+		for _, sb := range list {
+			if owned(sb.Name, sb.Labels) {
+				sandboxes = append(sandboxes, sb.Name)
 			}
 		}
 	}
-	providers, err := p.client.ListProviders(ctx)
-	if err != nil {
-		return err
-	}
-	for _, pr := range providers {
-		if pr.Labels[LabelSandbox] == id {
-			if err := p.client.DeleteProvider(ctx, pr.Name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
-				return err
+	if list, err := p.client.ListProviders(ctx); err != nil {
+		errs = append(errs, err)
+		for _, name := range p.rec.Credentials {
+			provided = append(provided, providerName(id, name))
+		}
+		if p.rec.HubAccess != nil {
+			provided = append(provided, providerName(id, hubProvider))
+		}
+	} else {
+		for _, pr := range list {
+			if owned(pr.Name, pr.Labels) {
+				provided = append(provided, pr.Name)
 			}
 		}
 	}
-	return nil
+	for _, name := range sandboxes {
+		if err := p.client.DeleteSandbox(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
+			errs = append(errs, err)
+		}
+	}
+	for _, name := range provided {
+		if err := p.client.DeleteProvider(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // registerProviders registers one provider for each attached credential,
@@ -630,40 +660,51 @@ func (p *provisioning) registerProviders(ctx context.Context, res Resolution, hu
 
 // ready ends a provisioning whose steps all succeeded: in one transaction
 // it moves the sandbox to ready with EventReady, by the system, stores the
-// checkout with the sha the sandbox reported and clears the marker. A
-// sandbox another component moved meanwhile is left as it is, and what the
-// provisioning created is deleted.
+// checkout with the sha the sandbox reported and clears the marker, and
+// once that has committed it reports the transition and counts the create.
+// A sandbox another component moved or removed meanwhile is left as it is
+// (abandon).
 func (p *provisioning) ready(ctx context.Context) {
 	s, id := p.s, p.rec.ID
 	ev := &event.Input{Type: EventReady, ActorType: event.ActorSystem, Metadata: map[string]any{"checkout": p.rec.Checkout}}
-	var applied bool
+	var (
+		applied bool
+		report  func()
+	)
 	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
-		if applied, err = s.Transition(ctx, tx, id, StateProvisioning, StateReady, "", ev); err != nil || !applied {
+		applied, report, err = s.TransitionTx(ctx, tx, id, StateProvisioning, StateReady, "", ev)
+		if errors.Is(err, ErrNotFound) {
+			applied, err = false, nil
+		}
+		if err != nil || !applied {
 			return err
 		}
 		if err := storeCheckout(ctx, tx, p.rec); err != nil {
 			return err
 		}
-		if err := Update(ctx, tx, id, SetMarker("")); err != nil {
-			return err
-		}
-		s.countCreate(StateReady)
-		return nil
+		return Update(ctx, tx, id, SetMarker(""))
 	})
 	switch {
 	case err != nil:
 		s.logger().Warn("the sandbox provisioner could not record a ready sandbox", "sandbox", id, "error", p.scrub(err.Error()))
 	case !applied:
 		p.abandon(ctx)
+	default:
+		report()
+		s.countCreate(StateReady)
 	}
 }
 
 // fail ends a provisioning whose step err failed: it deletes what the
-// provisioning created at the runtime, then in one transaction moves the
-// sandbox to failed with the step's reason and EventFail, by the system,
-// with the reason and the scrubbed error, clears the marker and revokes the
-// hub credential. A sandbox another component moved meanwhile is left as
-// it is, and its hub credential is revoked all the same.
+// runtime holds of the sandbox (clearRuntime), then in one transaction
+// moves the sandbox to failed with the step's reason and EventFail, by the
+// system, with the reason and the scrubbed error, clears the marker, and
+// the mark that the runtime's sandbox was created once the runtime no
+// longer holds it, and revokes the hub credential. Once that has committed
+// it reports the transition, counts the create and forgets the sandbox's
+// values; a transaction that fails leaves the sandbox to the next pass. A
+// sandbox another component moved or removed meanwhile is left as it is,
+// and its hub credential is revoked all the same.
 func (p *provisioning) fail(ctx context.Context, err error) {
 	s, id := p.s, p.rec.ID
 	reason := ReasonProvisionFailed
@@ -672,56 +713,76 @@ func (p *provisioning) fail(ctx context.Context, err error) {
 		reason = step.reason
 	}
 	text := p.scrub(err.Error())
-	p.deleteCreated(ctx)
+	cleared := p.clear(ctx)
 	ev := &event.Input{Type: EventFail, ActorType: event.ActorSystem, Metadata: map[string]any{"reason": reason, "error": text}}
-	terr := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		applied, err := s.Transition(ctx, tx, id, StateProvisioning, StateFailed, reason, ev)
-		if err != nil {
+	var (
+		applied bool
+		report  func()
+	)
+	terr := s.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		applied, report, err = s.TransitionTx(ctx, tx, id, StateProvisioning, StateFailed, reason, ev)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			applied = false
+		case err != nil:
 			return err
-		}
-		if applied {
-			if err := Update(ctx, tx, id, SetMarker("")); err != nil {
+		default:
+			var fields []Field
+			if applied {
+				fields = append(fields, SetMarker(""))
+			}
+			if cleared {
+				fields = append(fields, SetRuntimeCreated(false))
+			}
+			if err := Update(ctx, tx, id, fields...); err != nil {
 				return err
 			}
-			s.countCreate(StateFailed)
 		}
 		return s.RevokeHubCredential(ctx, tx, p.rec)
 	})
 	if terr != nil {
 		s.logger().Warn("the sandbox provisioner could not record a failed sandbox", "sandbox", id, "error", p.scrub(terr.Error()))
+		return
 	}
+	report()
+	if applied {
+		s.countCreate(StateFailed)
+	}
+	s.ForgetValues(id)
 }
 
 // abandon is the end of a provisioning whose sandbox another component
-// moved out of provisioning meanwhile: the record stays as it is, what the
-// provisioning created at the runtime is deleted and the hub credential it
-// used is revoked.
+// moved out of provisioning, or removed, meanwhile: the record stays as it
+// is but for the mark that the runtime's sandbox was created, which is
+// cleared once the runtime no longer holds it; what the runtime holds of
+// the sandbox is deleted, the hub credential it used is revoked and the
+// sandbox's values are forgotten.
 func (p *provisioning) abandon(ctx context.Context) {
-	p.deleteCreated(ctx)
-	err := p.s.deps.Store.Tx(ctx, func(tx *sql.Tx) error { return p.s.RevokeHubCredential(ctx, tx, p.rec) })
+	s, id := p.s, p.rec.ID
+	cleared := p.clear(ctx)
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if cleared {
+			if err := Update(ctx, tx, id, SetRuntimeCreated(false)); err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+		}
+		return s.RevokeHubCredential(ctx, tx, p.rec)
+	})
 	if err != nil {
-		p.s.logger().Warn("the sandbox provisioner could not revoke a hub credential", "sandbox", p.rec.ID, "error", p.scrub(err.Error()))
+		s.logger().Warn("the sandbox provisioner could not revoke a hub credential", "sandbox", id, "error", p.scrub(err.Error()))
 	}
+	s.ForgetValues(id)
 }
 
-// deleteCreated deletes at the runtime the sandbox and the providers the
-// provisioning created. What cannot be deleted is logged and left to the
-// runtime's reconciliation.
-func (p *provisioning) deleteCreated(ctx context.Context) {
-	var errs []error
-	if p.created {
-		if err := p.client.DeleteSandbox(ctx, p.rec.ID); err != nil && !errors.Is(err, runtime.ErrNotFound) {
-			errs = append(errs, err)
-		}
+// clear is clearRuntime at the end of a provisioning: what cannot be
+// deleted is logged and left to the runtime's reconciliation. It reports
+// whether the runtime no longer holds the sandbox.
+func (p *provisioning) clear(ctx context.Context) bool {
+	if err := p.clearRuntime(ctx); err != nil {
+		p.s.logger().Warn("the sandbox provisioner could not delete what the runtime holds of a sandbox", "sandbox", p.rec.ID, "error", p.scrub(err.Error()))
+		return false
 	}
-	for _, name := range p.providers {
-		if err := p.client.DeleteProvider(ctx, name); err != nil && !errors.Is(err, runtime.ErrNotFound) {
-			errs = append(errs, err)
-		}
-	}
-	if err := errors.Join(errs...); err != nil {
-		p.s.logger().Warn("the sandbox provisioner could not delete what it created at the runtime", "sandbox", p.rec.ID, "error", p.scrub(err.Error()))
-	}
+	return true
 }
 
 // scrub is Scrub with the sandbox's values as the provisioning knows them.

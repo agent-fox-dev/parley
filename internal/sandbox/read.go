@@ -2,7 +2,6 @@ package sandbox
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,7 +36,9 @@ const (
 )
 
 // waitPoll is how often a waiting read reads the record again although no
-// transition was notified: a fallback, should a notification be missed.
+// transition was notified: a notification made before a caller's commit
+// (Transition with the caller's transaction) may come before the change can
+// be read, and the next read, within a second, finds it.
 const waitPoll = time.Second
 
 func sandboxNotFound() *server.Error {
@@ -88,7 +89,9 @@ func readWait(q url.Values) (waitCond, error) {
 // it does, the wait has passed on the hub's clock or the hub begins to stop,
 // and is then answered as it is; a request whose client goes away ends
 // without an answer. The read learns of a change from the notification of
-// every applied transition, and reads the record every second besides.
+// every applied transition, and reads the record every second besides; it
+// reads what is committed, on a read connection, so that a woken read never
+// waits for the store's turn of writes.
 func (s *Service) getSandbox(w http.ResponseWriter, r *http.Request) error {
 	cond, err := readWait(r.URL.Query())
 	if err != nil {
@@ -104,7 +107,7 @@ func (s *Service) getSandbox(w http.ResponseWriter, r *http.Request) error {
 	if cond.wait > 0 {
 		changed = s.changes.next()
 	}
-	rec, err := s.readSandbox(ctx, slug, id, false)
+	rec, err := s.readSandbox(ctx, slug, id)
 	if err != nil {
 		return err
 	}
@@ -136,51 +139,37 @@ func (s *Service) await(ctx context.Context, slug, id string, cond waitCond, cha
 		// A stop releases a held request before anything else that is ready.
 		select {
 		case <-s.deps.Shutdown:
-			rec, err = s.readSandbox(ctx, slug, id, false)
+			rec, err = s.readSandbox(ctx, slug, id)
 			return rec, true, err
 		default:
 		}
-		notified := false
 		select {
 		case <-s.deps.Shutdown:
-			rec, err = s.readSandbox(ctx, slug, id, false)
+			rec, err = s.readSandbox(ctx, slug, id)
 			return rec, true, err
 		case <-ctx.Done():
 			return Record{}, false, nil
 		case <-deadline.C():
-			rec, err = s.readSandbox(ctx, slug, id, false)
+			rec, err = s.readSandbox(ctx, slug, id)
 			return rec, true, err
 		case <-changed:
-			notified = true
 		case <-poll.C:
 		}
 		changed = s.changes.next()
-		if rec, err = s.readSandbox(ctx, slug, id, notified); err != nil || cond.holds(rec.State) {
+		if rec, err = s.readSandbox(ctx, slug, id); err != nil || cond.holds(rec.State) {
 			return rec, err == nil, err
 		}
 	}
 }
 
-// readSandbox reads the sandbox id of the workspace slug; a malformed id, or
-// one the workspace has no sandbox of, is sandbox_not_found. afterChange
-// reads in the store's turn of writes: a transition notifies its waiters
-// before the caller's transaction commits, and the turn comes once it has.
-func (s *Service) readSandbox(ctx context.Context, slug, id string, afterChange bool) (Record, error) {
+// readSandbox reads the sandbox id of the workspace slug as committed; a
+// malformed id, or one the workspace has no sandbox of, is
+// sandbox_not_found.
+func (s *Service) readSandbox(ctx context.Context, slug, id string) (Record, error) {
 	if !idPattern.MatchString(id) {
 		return Record{}, sandboxNotFound()
 	}
-	var (
-		rec Record
-		err error
-	)
-	if afterChange {
-		err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
-			rec, err = GetIn(ctx, tx, slug, id)
-			return err
-		})
-	} else {
-		rec, err = GetIn(ctx, s.deps.Store.Main(), slug, id)
-	}
+	rec, err := GetIn(ctx, s.deps.Store.Main(), slug, id)
 	if errors.Is(err, ErrNotFound) {
 		return Record{}, sandboxNotFound()
 	}

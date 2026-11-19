@@ -2,7 +2,9 @@ package sandbox_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"sync"
@@ -52,7 +54,7 @@ func TestTransition_AppliesAllowed(t *testing.T) {
 			if !applied || err != nil {
 				t.Fatalf("Transition = %v, %v; want applied", applied, err)
 			}
-			rec := h.get(t, id)
+			rec := storedRecord(t, h.Hub, id)
 			if rec.State != tc.to || rec.StateReason != "because" || !rec.UpdatedAt.Equal(recordStart) {
 				t.Errorf("stored state %q, reason %q, updated_at %v; want %q, %q, %v",
 					rec.State, rec.StateReason, rec.UpdatedAt, tc.to, "because", recordStart)
@@ -87,13 +89,13 @@ func TestTransition_SkipsOnStateMismatch(t *testing.T) {
 	for _, stored := range []string{sandbox.StateDeleted, sandbox.StateFailed} {
 		t.Run(stored, func(t *testing.T) {
 			id := h.seed(t, stored)
-			before := h.get(t, id)
+			before := storedRecord(t, h.Hub, id)
 			h.clock.Advance(time.Minute)
 			applied, err := h.svc.Transition(context.Background(), nil, id, sandbox.StateProvisioning, sandbox.StateReady, "", transitionEvent(sandbox.StateReady))
 			if applied || err != nil {
 				t.Fatalf("Transition = %v, %v; want not applied and no error", applied, err)
 			}
-			if after := h.get(t, id); !reflect.DeepEqual(after, before) {
+			if after := storedRecord(t, h.Hub, id); !reflect.DeepEqual(after, before) {
 				t.Errorf("record changed:\n got %+v\nwant %+v", after, before)
 			}
 			if events := h.events(t, id); len(events) != 0 {
@@ -118,12 +120,12 @@ func TestTransition_RefusesUnknownPairs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.from+" to "+tc.to, func(t *testing.T) {
 			id := h.seed(t, tc.from)
-			before := h.get(t, id)
+			before := storedRecord(t, h.Hub, id)
 			applied, err := h.svc.Transition(context.Background(), nil, id, tc.from, tc.to, "", transitionEvent(tc.to))
 			if applied || !errors.Is(err, sandbox.ErrInvalidTransition) {
 				t.Fatalf("Transition = %v, %v; want not applied and the invalid-transition error", applied, err)
 			}
-			if after := h.get(t, id); !reflect.DeepEqual(after, before) {
+			if after := storedRecord(t, h.Hub, id); !reflect.DeepEqual(after, before) {
 				t.Errorf("record changed:\n got %+v\nwant %+v", after, before)
 			}
 			if events := h.events(t, id); len(events) != 0 {
@@ -169,7 +171,7 @@ func TestTransition_RaceYieldsOne(t *testing.T) {
 		if len(events) != 1 || events[0].typ != transitionEvent(won).Type {
 			t.Fatalf("round %d: events %+v; want one of the transition to %s", round, events, won)
 		}
-		if got := h.get(t, id).State; got != won {
+		if got := storedRecord(t, h.Hub, id).State; got != won {
 			t.Fatalf("round %d: stored state %s; want %s", round, got, won)
 		}
 	}
@@ -232,6 +234,45 @@ func TestTransition_ObservesSeconds(t *testing.T) {
 			}
 			if got := h.rec.observations(metric)[seen:]; !slices.Equal(got, tc.want) {
 				t.Errorf("observations = %v; want %v", got, tc.want)
+			}
+		})
+	}
+
+	// In the caller's transaction the observation is the caller's to make
+	// once it has committed: one that rolls back observes nothing.
+	for _, commit := range []bool{true, false} {
+		t.Run(fmt.Sprintf("in the caller's transaction, committed %t", commit), func(t *testing.T) {
+			id := h.seed(t, sandbox.StateProvisioning)
+			if applied, err := h.svc.Transition(ctx, nil, id, sandbox.StateProvisioning, sandbox.StateReady, "", nil); !applied || err != nil {
+				t.Fatalf("Transition to ready = %v, %v", applied, err)
+			}
+			seen := len(h.rec.observations(metric))
+			h.clock.Advance(90 * time.Second)
+			var report func()
+			err := h.Store.Tx(ctx, func(tx *sql.Tx) error {
+				applied, r, err := h.svc.TransitionTx(ctx, tx, id, sandbox.StateReady, sandbox.StateStopped, "", nil)
+				if !applied || err != nil {
+					t.Fatalf("TransitionTx to stopped = %v, %v", applied, err)
+				}
+				report = r
+				if got := h.rec.observations(metric)[seen:]; len(got) != 0 {
+					t.Errorf("observations %v before the commit; want none", got)
+				}
+				if !commit {
+					return errRollback
+				}
+				return nil
+			})
+			want := []float64{}
+			if commit {
+				if err != nil {
+					t.Fatal(err)
+				}
+				report()
+				want = []float64{90}
+			}
+			if got := h.rec.observations(metric)[seen:]; !slices.Equal(got, want) {
+				t.Errorf("observations = %v; want %v", got, want)
 			}
 		})
 	}

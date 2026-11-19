@@ -2,6 +2,8 @@ package sandbox_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"reflect"
 	"slices"
@@ -12,35 +14,6 @@ import (
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 )
-
-// sandboxPath is the path of the sandbox id of the workspace slug.
-func sandboxPath(slug, id string) string { return "/workspaces/" + slug + "/sandboxes/" + id }
-
-// listIDs returns the ids of the items of a 200 list answer, in order, and
-// its next_cursor ("" for null).
-func listIDs(t *testing.T, a answer) (ids []string, next string) {
-	t.Helper()
-	o := decoded(t, a, http.StatusOK)
-	items, ok := o["items"].([]any)
-	if !ok {
-		t.Fatalf("the list %s has no items list", a.body)
-	}
-	ids = []string{}
-	for _, it := range items {
-		ids = append(ids, it.(map[string]any)["id"].(string))
-	}
-	next, _ = o["next_cursor"].(string)
-	return ids, next
-}
-
-// newestFirst returns ids sorted by id descending, the order of sandboxes
-// created at the same instant.
-func newestFirst(ids ...string) []string {
-	out := slices.Clone(ids)
-	slices.Sort(out)
-	slices.Reverse(out)
-	return out
-}
 
 func TestGet_AnswersObject(t *testing.T) {
 	t.Parallel()
@@ -159,6 +132,52 @@ func TestGet_WaitFor(t *testing.T) {
 		})
 	}
 
+	// A woken read reads the record as committed, without waiting for the
+	// store's turn of writes, which a caller's open transaction holds.
+	t.Run("a held turn of writes does not hold the answer", func(t *testing.T) {
+		id := h.seedRecord(t, "demo", sandbox.StateProvisioning, nil)
+		other := h.seedRecord(t, "demo", sandbox.StateReady, nil)
+		before := h.timers.created(30 * time.Second)
+		answered := h.getting(ctx, sandboxPath("demo", id)+"?wait_for=ready&wait=30", h.key)
+		eventually(t, "the request to wait", func() bool { return h.timers.created(30*time.Second) > before })
+		// A change that notified no read: the move of the other sandbox
+		// notifies them.
+		if _, err := h.Store.Main().Exec(`UPDATE sandboxes SET state = ? WHERE id = ?`, sandbox.StateReady, id); err != nil {
+			t.Fatal(err)
+		}
+		moved, release := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- h.Store.Tx(ctx, func(tx *sql.Tx) error {
+				applied, err := h.svc.Transition(ctx, tx, other, sandbox.StateReady, sandbox.StateStopped, "", nil)
+				if err == nil && !applied {
+					err = errors.New("the move of the other sandbox did not apply")
+				}
+				close(moved)
+				<-release
+				return err
+			})
+		}()
+		hubtestWait(t, moved, "the other sandbox's move")
+		inTime := false
+		select {
+		case a := <-answered:
+			inTime = true
+			if o := decoded(t, a, http.StatusOK); o["state"] != sandbox.StateReady {
+				t.Errorf("state = %v; want ready", o["state"])
+			}
+		case <-time.After(time.Second):
+			t.Error("no answer within 1 s while a transaction held the turn of writes")
+		}
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if !inTime {
+			<-answered
+		}
+	})
+
 	t.Run("a cancelled request leaves nothing behind", func(t *testing.T) {
 		id := h.seedRecord(t, "demo", sandbox.StateProvisioning, nil)
 		const wait = 45 * time.Second
@@ -169,13 +188,7 @@ func TestGet_WaitFor(t *testing.T) {
 		if a := <-answered; a.status != 0 {
 			t.Errorf("a cancelled request got %d %s", a.status, a.body)
 		}
-		deadline := time.Now().Add(time.Second)
-		for h.timers.live(wait) != 0 {
-			if time.Now().After(deadline) {
-				t.Fatal("the handler still waits 1 s after its request was cancelled")
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
+		eventually(t, "the handler to stop waiting once its request was cancelled", func() bool { return h.timers.live(wait) == 0 })
 	})
 }
 

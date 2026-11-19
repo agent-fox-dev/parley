@@ -17,111 +17,9 @@ import (
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
-	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/workspace"
 )
-
-// The values of the secrets of a provisioning world.
-const (
-	modelSecret = "sk-model-0123456789"
-	npmSecret   = "npm_SECRETVALUE42"
-)
-
-// provisionProfile is the profile full of the provisioning tests: image
-// img:1 with 2 CPUs and 4Gi of memory, the policy file policy.yaml, the
-// credential model, the exposed secret NPM_TOKEN and the variable TIER.
-const provisionProfile = "[[sandbox.profiles]]\nname = \"full\"\nimage = \"img:1\"\ncpu = \"2\"\nmemory = \"4Gi\"\nttl = \"4h\"\n" +
-	"policy = \"policy.yaml\"\ncredentials = [\"model\"]\nexpose_secrets = [\"NPM_TOKEN\"]\nenv = { TIER = \"profile\" }\n"
-
-// startProvisionWorld starts a provision hub with the profiles agent, full
-// and plain and the credentials model and mirror, adds the create world,
-// makes dana a member of acme and sets MODEL_KEY and NPM_TOKEN on acme.
-func startProvisionWorld(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
-	t.Helper()
-	h := startProvisionHub(t, agentProfile+provisionProfile+plainProfile+credentialTables, adjust...)
-	h.world(t)
-	h.AddMember(t, h.org, h.dana)
-	h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret)
-	h.putSecret(t, secret.ScopeOrg, h.org, "NPM_TOKEN", npmSecret)
-	return h
-}
-
-// objectMap is the sandbox object of rec as a decoded answer holds it.
-func objectMap(t *testing.T, rec sandbox.Record) map[string]any {
-	t.Helper()
-	b, err := json.Marshal(sandbox.ObjectOf(rec, false))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var o map[string]any
-	if err := json.Unmarshal(b, &o); err != nil {
-		t.Fatal(err)
-	}
-	return o
-}
-
-// decodedRules are rules as names and decoded bodies, for comparison.
-func decodedRules(t *testing.T, rules []runtime.Rule) []any {
-	t.Helper()
-	out := []any{}
-	for _, r := range rules {
-		var body any
-		if err := json.Unmarshal(r.Body, &body); err != nil {
-			t.Fatalf("rule %s: %v", r.Name, err)
-		}
-		out = append(out, map[string]any{"name": r.Name, "body": body})
-	}
-	return out
-}
-
-// hubRule is the protected rule of the hub credential of the sandbox id of
-// the workspace slug in acme, decoded: its provider, on the scheme, host
-// and port of https://hub.test, for the API and git routes of the workspace
-// only.
-func hubRule(id, slug string) any {
-	return map[string]any{"name": "parley-hub", "body": map[string]any{
-		"providers": []any{id + "-hub"},
-		"endpoints": []any{map[string]any{
-			"scheme": "https", "host": "hub.test", "port": float64(443),
-			"paths": []any{
-				"/api/v1/workspaces/" + slug, "/api/v1/workspaces/" + slug + "/**",
-				"/git/acme/" + slug + ".git", "/git/acme/" + slug + ".git/**",
-			},
-		}},
-	}}
-}
-
-// credentialRule is the protected rule of the credential name of the
-// sandbox id, decoded: it names the credential's provider.
-func credentialRule(id, name string) any {
-	return map[string]any{"name": "credential-" + name, "body": map[string]any{"providers": []any{id + "-" + name}}}
-}
-
-// sandboxOps are the operations of calls that name the sandbox id or one of
-// its providers, in order, each run of commands executed in the sandbox
-// counted as one exec.
-func sandboxOps(calls []runtimetest.Call, id string) []string {
-	var out []string
-	for _, c := range calls {
-		if !strings.HasPrefix(c.Target, id) || (c.Op == runtime.OpExec && len(out) > 0 && out[len(out)-1] == runtime.OpExec) {
-			continue
-		}
-		out = append(out, c.Op)
-	}
-	return out
-}
-
-// providerNames are the provider names of a sandbox spec without the
-// sandbox id they start with, sorted.
-func providerNames(spec runtime.SandboxSpec) []string {
-	out := []string{}
-	for _, p := range spec.Providers {
-		out = append(out, strings.TrimPrefix(p, spec.Name+"-"))
-	}
-	slices.Sort(out)
-	return out
-}
 
 func TestProvision_ReachesReady(t *testing.T) {
 	t.Parallel()
@@ -257,32 +155,6 @@ func TestProvision_Environment(t *testing.T) {
 			}
 		})
 	}
-}
-
-// stubComposer is a policy composer whose Compose answers policy or err and
-// whose Explain prefixes the refusal; it keeps the workspace rules it read.
-type stubComposer struct {
-	mu     sync.Mutex
-	policy runtime.Policy
-	err    error
-	read   [][]sandbox.WorkspaceRule
-}
-
-func (c *stubComposer) Compose(_ context.Context, rec sandbox.Record) (runtime.Policy, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.read = append(c.read, rec.WorkspaceRules)
-	return c.policy, c.err
-}
-
-func (c *stubComposer) Explain(_ sandbox.Record, refusal error) string {
-	return "the composer explains: " + refusal.Error()
-}
-
-func (c *stubComposer) rulesRead() [][]sandbox.WorkspaceRule {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return slices.Clone(c.read)
 }
 
 func TestProvision_FailureAtEachStep(t *testing.T) {
@@ -430,8 +302,64 @@ func TestProvision_FailureAtEachStep(t *testing.T) {
 			if got := creates("failed"); got != before+1 {
 				t.Errorf("creates_total{failed} = %v; want %v", got, before+1)
 			}
+			if _, kept := h.svc.HubCredential(id); kept {
+				t.Error("the hub credential's value is still held after the sandbox failed")
+			}
 		})
 	}
+}
+
+// The metrics of a provisioning's end are reported once the transaction
+// that records the end has committed.
+func TestProvision_ReportsTheEndAfterItsCommit(t *testing.T) {
+	t.Parallel()
+	var (
+		mu      sync.Mutex
+		refuse  = true
+		revokes int
+	)
+	h := startProvisionWorld(t, func(d *sandbox.Deps) {
+		next := d.Revoke
+		d.Revoke = func(ctx context.Context, tx *sql.Tx, tokenID string, now time.Time) error {
+			mu.Lock()
+			defer mu.Unlock()
+			revokes++
+			if refuse {
+				return errors.New("the token store refuses")
+			}
+			return next(ctx, tx, tokenID, now)
+		}
+	})
+	h.hooks.set(func(_ context.Context, op, _ string) error {
+		if op == runtime.OpCreateSandbox {
+			return runtime.NewError(runtime.ErrUnavailable, op, "no room")
+		}
+		return nil
+	})
+	id := sandboxObject(t, h.post(t, "demo--t1", map[string]any{"profile": "full"}))["id"].(string)
+	eventually(t, "the failed provisioning to revoke its hub credential", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return revokes > 0
+	})
+	eventually(t, "the provisioning to end", func() bool { return h.timers.live(sandbox.ProvisionBound) == 0 })
+	if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateProvisioning || rec.Marker != sandbox.MarkerCreate {
+		t.Fatalf("sandbox = %s, marker %q; want it still provisioning with its marker, the end rolled back", rec.State, rec.Marker)
+	}
+	if got := h.rec.values(sandbox.CreatesMetric)["result=failed"]; got != 0 {
+		t.Errorf("creates_total{failed} = %v after the end rolled back; want 0", got)
+	}
+
+	mu.Lock()
+	refuse = false
+	mu.Unlock()
+	h.pass(t, sandbox.ProvisionInterval)
+	if rec := h.settled(t, id); rec.State != sandbox.StateFailed {
+		t.Fatalf("sandbox = %s; want failed", rec.State)
+	}
+	eventually(t, "creates_total{failed} to count the end", func() bool {
+		return h.rec.values(sandbox.CreatesMetric)["result=failed"] == 1
+	})
 }
 
 func TestProvision_TimesOutAfterTenMinutes(t *testing.T) {
@@ -458,7 +386,7 @@ func TestProvision_TimesOutAfterTenMinutes(t *testing.T) {
 	hubtestWait(t, blocked, "the create call")
 
 	h.clock.Advance(sandbox.ProvisionBound - time.Second)
-	if rec := h.get(t, id); rec.State != sandbox.StateProvisioning {
+	if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateProvisioning {
 		t.Fatalf("after 9m59s the sandbox is %s; want provisioning", rec.State)
 	}
 	h.clock.Advance(time.Second)
@@ -477,26 +405,6 @@ func TestProvision_TimesOutAfterTenMinutes(t *testing.T) {
 	if left := h.runtimeLeft(t, id); len(left) != 0 {
 		t.Errorf("the runtime still holds %v", left)
 	}
-}
-
-// hubtestWait waits for ch to be closed.
-func hubtestWait(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("waited 5 s for %s", what)
-	}
-}
-
-// get reads the stored sandbox id.
-func (h *createHub) get(t *testing.T, id string) sandbox.Record {
-	t.Helper()
-	rec, err := sandbox.Get(context.Background(), h.Store.Main(), id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return rec
 }
 
 func TestProvision_RecordDeletedMeanwhile(t *testing.T) {
@@ -518,14 +426,14 @@ func TestProvision_RecordDeletedMeanwhile(t *testing.T) {
 	if !applied || err != nil {
 		t.Fatalf("delete = %t, %v", applied, err)
 	}
-	rec := h.get(t, id)
+	rec := storedRecord(t, h.Hub, id)
 	close(p.release)
 
 	eventually(t, "the provisioning's clean-up", func() bool {
 		tok, err := identity.PATByID(ctx, h.Store.Main(), rec.HubTokenID)
 		return err == nil && tok.RevokedAt != nil && len(h.runtimeLeft(t, id)) == 0
 	})
-	if got := h.get(t, id); got.State != sandbox.StateDeleted || got.StateReason != "api" || !got.UpdatedAt.Equal(rec.UpdatedAt) {
+	if got := storedRecord(t, h.Hub, id); got.State != sandbox.StateDeleted || got.StateReason != "api" || !got.UpdatedAt.Equal(rec.UpdatedAt) {
 		t.Errorf("sandbox = %s %q; want it deleted as the delete left it", got.State, got.StateReason)
 	}
 	for _, typ := range []string{sandbox.EventReady, sandbox.EventFail} {
@@ -535,6 +443,10 @@ func TestProvision_RecordDeletedMeanwhile(t *testing.T) {
 	}
 	if got := h.rec.values(sandbox.CreatesMetric); !maps.Equal(got, creates) {
 		t.Errorf("creates_total = %v; want it unchanged from %v", got, creates)
+	}
+	eventually(t, "the provisioning to end", func() bool { return h.timers.live(sandbox.ProvisionBound) == 0 })
+	if _, kept := h.svc.HubCredential(id); kept {
+		t.Error("the hub credential's value is still held after the provisioning found its sandbox deleted")
 	}
 }
 
@@ -559,7 +471,7 @@ func TestProvision_ResumesAfterRestart(t *testing.T) {
 	s := sandboxObject(t, a)
 	id := s["id"].(string)
 	hubAccess := s["hub_access"]
-	t1 := h.get(t, id).HubTokenID
+	t1 := storedRecord(t, h.Hub, id).HubTokenID
 	hubtestWait(t, p.entered, "the provisioning to reach the runtime's sandbox")
 
 	h.Restart(t)
@@ -604,6 +516,83 @@ func TestProvision_ResumesAfterRestart(t *testing.T) {
 	}
 }
 
+// A provisioning the hub stopped in leaves the runtime holding the sandbox
+// and its providers, marked created or not: the provisioning after the
+// restart removes them, whatever it then fails at, and with or without hub
+// access.
+func TestProvision_ResumeClearsWhatAnEarlierRunLeft(t *testing.T) {
+	t.Parallel()
+	h := startProvisionWorld(t)
+	// The restarted hub serves until the test ends, not its row.
+	outer := t
+	for _, tc := range []struct {
+		name, profile string
+		// pauseAt is the call the first provisioning is held in: a create
+		// call whose sandbox the runtime made but whose answer never came,
+		// or the wait once the sandbox is marked created.
+		pauseAt string
+		// change is what changes while the hub restarts; nil for nothing.
+		change      func(t *testing.T)
+		state       string
+		reason      string
+		wantLeft    func(id string) []string
+		wantCreated bool
+	}{
+		{"a required secret gone, after the mark", "full", runtime.OpWaitReady, func(t *testing.T) {
+			h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+				_, err := h.secrets.Delete(ctx, tx, secret.ScopeOrg, h.org, "MODEL_KEY")
+				return err
+			})
+			t.Cleanup(func() { h.putSecret(t, secret.ScopeOrg, h.org, "MODEL_KEY", modelSecret) })
+		}, sandbox.StateFailed, sandbox.ReasonCredentialMissing, func(string) []string { return nil }, false},
+		{"no hub access, before the mark", "plain", runtime.OpCreateSandbox, nil,
+			sandbox.StateReady, "", func(id string) []string { return []string{id} }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPause()
+			var first sync.Once
+			direct := h.rt.Client("parley", runtime.NopRecorder{})
+			h.hooks.set(func(ctx context.Context, op, name string) error {
+				held := false
+				if op == tc.pauseAt {
+					first.Do(func() { held = true })
+				}
+				if !held {
+					return nil
+				}
+				if op == runtime.OpCreateSandbox {
+					spec := runtime.SandboxSpec{Name: name, Image: "img:1", WorkDir: sandbox.WorkDir, Labels: map[string]string{sandbox.LabelSandbox: name}}
+					if _, err := direct.CreateSandbox(ctx, spec); err != nil {
+						return err
+					}
+				}
+				return p.wait(ctx, op)
+			})
+			t.Cleanup(func() { h.hooks.set(nil) })
+			id := sandboxObject(t, h.post(t, "demo--t1", map[string]any{"profile": tc.profile}))["id"].(string)
+			hubtestWait(t, p.entered, "the provisioning to be held")
+			if left := h.runtimeLeft(t, id); !slices.Contains(left, id) {
+				t.Fatalf("the runtime holds %v before the restart; want the sandbox", left)
+			}
+			if tc.change != nil {
+				tc.change(t)
+			}
+
+			h.Restart(outer)
+			rec := h.settled(t, id)
+			if rec.State != tc.state || rec.StateReason != tc.reason {
+				t.Errorf("sandbox = %s %q; want %s %q", rec.State, rec.StateReason, tc.state, tc.reason)
+			}
+			if left, want := h.runtimeLeft(t, id), tc.wantLeft(id); !slices.Equal(left, want) {
+				t.Errorf("the runtime holds %v; want %v", left, want)
+			}
+			if rec.RuntimeCreated != tc.wantCreated {
+				t.Errorf("runtime created = %t; want %t", rec.RuntimeCreated, tc.wantCreated)
+			}
+		})
+	}
+}
+
 func TestCreate_RecordsWorkspaceRules(t *testing.T) {
 	t.Parallel()
 	h := startProvisionWorld(t)
@@ -631,7 +620,7 @@ func TestCreate_RecordsWorkspaceRules(t *testing.T) {
 	if spec, _ := h.rt.Spec("parley", id); !reflect.DeepEqual(spec.Policy, composed) {
 		t.Errorf("runtime policy %+v; want the composer's %+v", spec.Policy, composed)
 	}
-	if got := objectMap(t, h.get(t, id))["workspace_rules"]; !reflect.DeepEqual(got, ids) {
+	if got := objectMap(t, storedRecord(t, h.Hub, id))["workspace_rules"]; !reflect.DeepEqual(got, ids) {
 		t.Errorf("workspace_rules read later = %v; want %v", got, ids)
 	}
 	if ev := h.sandboxEvents(t, sandbox.EventCreate, id); len(ev) != 1 || !reflect.DeepEqual(ev[0].metadata["workspace_rules"], ids) {
@@ -646,40 +635,10 @@ func TestCreate_RecordsWorkspaceRules(t *testing.T) {
 		t.Errorf("workspace_rules without a provider = %v; want []", s["workspace_rules"])
 	}
 	h.settled(t, id)
-	if rec := h.get(t, id); len(rec.WorkspaceRules) != 0 {
+	if rec := storedRecord(t, h.Hub, id); len(rec.WorkspaceRules) != 0 {
 		t.Errorf("stored rules %v; want none", rec.WorkspaceRules)
 	}
 	if spec, _ := h.rt.Spec("parley", id); len(spec.Policy.Added) != 0 {
 		t.Errorf("added rules %v; want none", spec.Policy.Added)
 	}
-}
-
-// stubRules is a workspace rule provider that answers rules and keeps the
-// workspaces it was asked for.
-type stubRules struct {
-	mu    sync.Mutex
-	rules []sandbox.WorkspaceRule
-	calls []string
-}
-
-func (r *stubRules) WorkspaceRules(_ context.Context, tx *sql.Tx, workspace string) ([]sandbox.WorkspaceRule, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if tx == nil {
-		return nil, errors.New("asked outside the creating transaction")
-	}
-	r.calls = append(r.calls, workspace)
-	return slices.Clone(r.rules), nil
-}
-
-func (r *stubRules) set(rules []sandbox.WorkspaceRule) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.rules = rules
-}
-
-func (r *stubRules) asked() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return slices.Clone(r.calls)
 }

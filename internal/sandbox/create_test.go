@@ -2,7 +2,6 @@ package sandbox_test
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 	"reflect"
@@ -13,9 +12,6 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 )
-
-// stamp is how a sandbox object writes t.
-func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 func TestCreate_StoresProvisioningSandbox(t *testing.T) {
 	t.Parallel()
@@ -102,42 +98,6 @@ func TestCreate_Defaults(t *testing.T) {
 			})
 		}
 	}
-}
-
-// createEvent is a parley.sandbox.create event as the event log holds it.
-type createEvent struct {
-	resourceType, workspace, actorType, actorID string
-	session                                     *string
-	metadata                                    map[string]any
-}
-
-// createEvents returns the parley.sandbox.create events of the sandbox id.
-func (h *createHub) createEvents(t *testing.T, id string) []createEvent {
-	t.Helper()
-	rows, err := h.Store.Main().Query(`SELECT resource_type, workspace, actor_type, actor_id, session_id, metadata
-		FROM hub_events WHERE type = 'parley.sandbox.create' AND resource_id = ? ORDER BY seq`, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []createEvent
-	for rows.Next() {
-		var (
-			e    createEvent
-			meta string
-		)
-		if err := rows.Scan(&e.resourceType, &e.workspace, &e.actorType, &e.actorID, &e.session, &meta); err != nil {
-			t.Fatal(err)
-		}
-		if err := json.Unmarshal([]byte(meta), &e.metadata); err != nil {
-			t.Fatal(err)
-		}
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return out
 }
 
 func TestCreate_WritesCreateEvent(t *testing.T) {
