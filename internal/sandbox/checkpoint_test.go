@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
+	mathrand "math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -319,6 +321,52 @@ func TestCheckpoint_LeavesOutUntrackedFilesOverTheSizeLimit(t *testing.T) {
 			files := strings.Fields(gitrepotest.Git(t, fork, "ls-tree", "-r", "--name-only", cp.Refs[0].SHA))
 			if !slices.Contains(files, "a.txt") || slices.Contains(files, "big.bin") != tc.saved {
 				t.Errorf("the dirty commit holds %v; want a.txt, and big.bin %t", files, tc.saved)
+			}
+		})
+	}
+}
+
+func TestCheckpoint_IsHeldToTheMaximumPushSize(t *testing.T) {
+	t.Parallel()
+	const limit = 64 << 10
+	h := startCheckpointHubWith(t, fmt.Sprintf("[git]\nmax_push_size = \"%d\"\n", limit))
+	for _, tc := range []struct {
+		name string
+		// size is the number of incompressible bytes committed on t1.
+		size  int
+		saved bool
+	}{
+		{"a commit whose bundle is under the limit", 1 << 10, true},
+		{"a commit whose bundle is over the limit", 4 * limit, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, dir := h.workSandbox(t, nil)
+			h.cloneWork(t, dir)
+			content := make([]byte, tc.size)
+			for i := range content {
+				content[i] = byte(mathrand.IntN(256))
+			}
+			head := commitWork(t, dir, "big", map[string]string{"big.bin": string(content)})
+			metric := h.rec.values(sandbox.CheckpointsMetric)
+
+			cp, err := h.svc.Checkpoint(context.Background(), storedRecord(t, h.Hub, id), sandbox.SystemActor)
+			if tc.saved {
+				if err != nil || !cp.OK || !slices.Equal(cp.Refs, []sandbox.CheckpointRef{{Branch: "t1", SHA: head}}) {
+					t.Fatalf("Checkpoint = %+v, %v; want ok with t1 at %s", cp, err, head)
+				}
+				return
+			}
+			if err == nil || cp == nil || cp.OK || cp.Error == nil || !strings.Contains(*cp.Error, fmt.Sprintf("maximum push size (%d bytes)", limit)) {
+				t.Fatalf("Checkpoint = %+v, %v; want a failure naming the maximum push size of %d bytes", cp, err, limit)
+			}
+			if len(cp.Refs) != 0 {
+				t.Errorf("the failed checkpoint has refs %+v; want none", cp.Refs)
+			}
+			if refs := h.checkpointRefs(t, id); len(refs) != 0 {
+				t.Errorf("the checkpoint refs are %v; want none stored", refs)
+			}
+			if d := metricDelta(metric, h.rec.values(sandbox.CheckpointsMetric)); !maps.Equal(d, map[string]float64{"result=failed": 1}) {
+				t.Errorf("%s added %v; want result=failed 1", sandbox.CheckpointsMetric, d)
 			}
 		})
 	}

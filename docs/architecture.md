@@ -6911,7 +6911,11 @@ sandbox's index, branches and working tree are not touched; untracked
 files over `CheckpointFileLimit` (100 MiB), which one `find` in the
 sandbox names, are left out with an `:(exclude,literal)` pathspec. One `git bundle` of the kept heads, without
 what the clone's `origin` already holds, is read with the runtime's
-`Download` into a temporary file on the hub and fetched with
+`Download` into a temporary file on the hub, at most
+`Deps.MaxCheckpointSize` bytes (`[git].max_push_size`, which the hub's
+composition reads with `gitserver.MaxPushSizeFrom`; 0 for no limit): at
+one byte more the download stops and the attempt fails, as a pack over
+the limit fails a push, so that a bundle never fills the hub's disk. It is fetched with
 `gitrepo.Repo.FetchBundle`, which sets the attempt's refs under
 `refs/parley/sandboxes/<id>/` in one ref transaction; earlier refs of
 other branches stay. The attempts of one sandbox take turns from the fetch

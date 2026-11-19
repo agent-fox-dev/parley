@@ -103,7 +103,8 @@ type CheckpointState struct {
 // one extra commit on its head, each under CheckpointRefPrefix, the sandbox
 // id and the branch. The extra commit holds what git does not ignore, but
 // untracked files larger than the size limit, which the checkpoint's error
-// names. The sandbox's branches, index and working tree stay as they were:
+// names. A bundle larger than Deps.MaxCheckpointSize fails the checkpoint,
+// as a pack of that size fails a push. The sandbox's branches, index and working tree stay as they were:
 // the commit is built in a temporary index, and the refs travel as one git
 // bundle through the runtime's file download, never through a push, so no
 // change or version results.
@@ -531,7 +532,7 @@ func (r *checkpointRun) transfer(ctx context.Context, hub *gitrepo.Repo, refs []
 		return err
 	}
 	defer func() { _ = os.Remove(local.Name()) }()
-	err = r.download(ctx, path.Join(WorkDir, bundle), local)
+	err = r.download(ctx, path.Join(WorkDir, bundle), local, r.s.deps.MaxCheckpointSize)
 	if cerr := local.Close(); err == nil {
 		err = cerr
 	}
@@ -541,15 +542,25 @@ func (r *checkpointRun) transfer(ctx context.Context, hub *gitrepo.Repo, refs []
 	return hub.FetchBundle(ctx, local.Name(), targets)
 }
 
-// download copies the sandbox's file p into w.
-func (r *checkpointRun) download(ctx context.Context, p string, w io.Writer) error {
+// download copies the sandbox's file p into w, reading at most max bytes
+// (0 for no limit): at one byte more it stops reading and fails, so that a
+// bundle over the limit never fills the hub's disk.
+func (r *checkpointRun) download(ctx context.Context, p string, w io.Writer, max int64) error {
 	rc, err := r.client.Download(ctx, r.rec.ID, p)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = rc.Close() }()
-	if _, err := io.Copy(w, rc); err != nil {
+	var src io.Reader = rc
+	if max > 0 {
+		src = io.LimitReader(rc, max+1)
+	}
+	n, err := io.Copy(w, src)
+	if err != nil {
 		return fmt.Errorf("read the checkpoint bundle: %w", err)
+	}
+	if max > 0 && n > max {
+		return fmt.Errorf("the checkpoint bundle exceeds the maximum push size (%d bytes)", max)
 	}
 	return nil
 }

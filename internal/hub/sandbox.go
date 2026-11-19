@@ -7,6 +7,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
+	"github.com/agent-fox-dev/parley/internal/gitserver"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -173,7 +174,7 @@ func composeSandbox(c *Composition) {
 				return c.Secrets().ResolveSecretsIn(ctx, q, slug, names)
 			},
 			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, SetTokenExpiry: identity.SetTokenExpiryByID,
-			ExternalURL: svc.ExternalURL(),
+			ExternalURL: svc.ExternalURL(), MaxCheckpointSize: gitserver.MaxPushSizeFrom(rt.Config),
 			OrgSlug: func(ctx context.Context, id string) (string, error) {
 				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
 				return org.Slug, err

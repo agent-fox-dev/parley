@@ -7954,7 +7954,11 @@ checked out the ref's branch is `HEAD`. The branches, the index and the
 working tree in the sandbox stay as they were. Files that git ignores are
 not saved, nor is an untracked file larger than 100 MiB, whose path is then
 listed in `error` (`skipped: <path>, <path>`) of a checkpoint that is still
-`ok`. The refs are written to the workspace's repository directly: they
+`ok`. The commits a checkpoint carries to the hub travel as one git bundle,
+which is held to [`[git].max_push_size`](configuration.md), the limit of a
+push: a bundle larger than it fails the checkpoint, `ok` false with
+`error` naming the maximum push size, and stores no ref (no limit when the
+key is `"0"`, its default). The refs are written to the workspace's repository directly: they
 are no version of a change and trigger nothing, and they live as long as
 the workspace (a fork's go with the fork). A checkpoint is limited to 5
 minutes and stores its refs all at once or not at all. The sandbox's
