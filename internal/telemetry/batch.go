@@ -70,7 +70,7 @@ func batch[R record](c *Component, k kind[R], read func(fields, target) (R, erro
 			recs = append(recs, valid[R]{index: i, rec: rec})
 		}
 		return func(ctx context.Context, w http.ResponseWriter) error {
-			err := c.write(ctx, func(tx Tx) error {
+			err := c.write(ctx, func(ctx context.Context, tx Tx) error {
 				for _, v := range recs {
 					stored, created, err := storeOnce(ctx, tx, k, v.rec)
 					if err != nil {

@@ -15,6 +15,14 @@ const runPrefix = "/workspaces/:slug/runs/:run_id"
 // msgArchived is the refusal of a valid request to an archived workspace.
 const msgArchived = "the workspace is archived and accepts no telemetry"
 
+// msgWriteTimeout is the refusal of a write that did not finish within the
+// write limit, and retryAfter the seconds after which the caller may send
+// it again.
+const (
+	msgWriteTimeout = "the telemetry store did not finish the write in time; nothing was stored, send it again"
+	retryAfter      = "5"
+)
+
 // errNoDecision is a request at an ingestion route without the access
 // decision the pipeline's access check attaches: a wiring fault, which
 // grants nothing.
@@ -37,7 +45,8 @@ type validator func(r *http.Request, t target) (act, error)
 // built here, so that all of them decide in one order. The pipeline checks
 // the scope audit:write of a PAT, then write access to the workspace; the
 // handler then checks the run id of the path, runs validate, refuses an
-// archived workspace and acts. A workspace in any other status, a task fork
+// archived workspace and acts: a write the write limit ends is answered 503
+// unavailable with Retry-After. A workspace in any other status, a task fork
 // included, accepts ingestion: it needs no repository.
 func (c *Component) ingest(suffix string, create bool, validate validator) server.Route {
 	return server.Route{
@@ -62,7 +71,12 @@ func (c *Component) ingest(suffix string, create bool, validate validator) serve
 			if d.Record.Status == access.StatusArchived {
 				return server.WorkspaceArchived(msgArchived)
 			}
-			return act(r.Context(), w)
+			err = act(r.Context(), w)
+			if errors.Is(err, errWriteTimeout) {
+				w.Header().Set("Retry-After", retryAfter)
+				return server.Unavailable(msgWriteTimeout)
+			}
+			return err
 		},
 	}
 }

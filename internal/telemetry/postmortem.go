@@ -97,7 +97,7 @@ func (c *Component) postPostmortem(f fields, t target) (act, error) {
 	return func(ctx context.Context, w http.ResponseWriter) error {
 		var stored postmortem
 		var created bool
-		err := c.write(ctx, func(tx Tx) (err error) {
+		err := c.write(ctx, func(ctx context.Context, tx Tx) (err error) {
 			stored, created, err = storePostmortemOnce(ctx, tx, p)
 			return err
 		})

@@ -20,11 +20,13 @@ import (
 )
 
 // Deps are what the component works with: the analytical store, the clock
-// (nil for time.Now) and the log (nil discards it).
+// (nil for time.Now), the log (nil discards it) and the time one write may
+// take ([audit].write_timeout; zero for DefaultWriteTimeout).
 type Deps struct {
-	DB     DB
-	Now    func() time.Time
-	Logger *slog.Logger
+	DB           DB
+	Now          func() time.Time
+	Logger       *slog.Logger
+	WriteTimeout time.Duration
 }
 
 // Component is the telemetry feature. The hub creates its zero value while
@@ -42,6 +44,9 @@ func (c *Component) Bind(d Deps) {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	if d.WriteTimeout <= 0 {
+		d.WriteTimeout = DefaultWriteTimeout
 	}
 	c.deps = d
 }

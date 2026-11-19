@@ -217,7 +217,7 @@ func postRecord[R record](c *Component, k kind[R], read func(fields, target) (R,
 		return func(ctx context.Context, w http.ResponseWriter) error {
 			var stored R
 			var created bool
-			err := c.write(ctx, func(tx Tx) (err error) {
+			err := c.write(ctx, func(ctx context.Context, tx Tx) (err error) {
 				stored, created, err = storeOnce(ctx, tx, k, rec)
 				return err
 			})

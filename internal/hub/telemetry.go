@@ -12,8 +12,9 @@ const telemetryHook = "telemetry"
 
 // composeTelemetry adds the ingestion of agent telemetry: the schema of the
 // telemetry records in the analytical store, the ingestion routes, and the
-// component, bound in a start hook to the analytical store and the hub's
-// clock and log. The routes rely on the pipeline's scope check and
+// component, bound in a start hook to the analytical store, the hub's
+// clock and log, and the write limit [audit].write_timeout, whose key it
+// registers. The routes rely on the pipeline's scope check and
 // workspace access check, which attach the access decision they read.
 //
 // It registers no workspace remover: telemetry outlives its workspace.
@@ -23,6 +24,7 @@ const telemetryHook = "telemetry"
 func composeTelemetry(c *Composition) {
 	comp := &telemetry.Component{}
 	c.telemetry = comp
+	c.RegisterKey(telemetry.ConfigKey())
 	for _, step := range telemetry.SchemaSteps {
 		c.AddSchemaStep(step)
 	}
@@ -31,9 +33,10 @@ func composeTelemetry(c *Composition) {
 	}
 	c.AddStartHook(telemetryHook, func(_ context.Context, rt *Runtime) error {
 		d := telemetry.Deps{
-			DB:     telemetry.SQL(rt.Store.Analytics()),
-			Now:    rt.Now,
-			Logger: rt.Logger,
+			DB:           telemetry.SQL(rt.Store.Analytics()),
+			Now:          rt.Now,
+			Logger:       rt.Logger,
+			WriteTimeout: telemetry.WriteTimeoutFrom(rt.Config),
 		}
 		for _, adjust := range c.telemetryAdjusters {
 			adjust(&d)

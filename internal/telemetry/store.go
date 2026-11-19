@@ -38,15 +38,35 @@ func (s sqlDB) QueryRowContext(ctx context.Context, query string, args ...any) *
 	return s.db.QueryRowContext(ctx, query, args...)
 }
 
+// errWriteTimeout is a write that did not finish within the write limit:
+// the caller is told to send it again later.
+var errWriteTimeout = errors.New("the write did not finish within [audit].write_timeout")
+
 // write runs fn in one transaction of the analytical store and commits
 // what it did, or rolls all of it back when fn or the commit fails, so that
-// a failed write stores nothing.
-func (c *Component) write(ctx context.Context, fn func(tx Tx) error) error {
+// a failed write stores nothing. The transaction, and every statement fn
+// runs with the context it is given, end at the write limit, so that an
+// agent never waits on a slow store for its telemetry; a write the limit
+// ends fails with errWriteTimeout. That is decided by the limit's context
+// and not by the error, since the store's driver reports a statement the
+// context ends as interrupted, without the context's error.
+func (c *Component) write(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
+	ctx, cancel := context.WithTimeout(ctx, c.deps.WriteTimeout)
+	defer cancel()
+	err := c.writeTx(ctx, fn)
+	if err != nil && ctx.Err() != nil {
+		return errors.Join(errWriteTimeout, err)
+	}
+	return err
+}
+
+// writeTx is write without the limit.
+func (c *Component) writeTx(ctx context.Context, fn func(ctx context.Context, tx Tx) error) error {
 	tx, err := c.deps.DB.BeginTx(ctx)
 	if err != nil {
 		return err
 	}
-	if err := fn(tx); err != nil {
+	if err := fn(ctx, tx); err != nil {
 		return errors.Join(err, rollback(tx))
 	}
 	if err := tx.Commit(); err != nil {

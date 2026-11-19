@@ -115,8 +115,9 @@ func validPostmortem() map[string]any {
 var recordTables = []string{"run_events", "session_outcomes", "tool_calls", "tool_errors", "traces", "postmortems"}
 
 // world is a hub on a settable clock whose analytical store fails every
-// write while failWrites is set, and the third insert of the next
-// transaction that makes three once failThirdInsert is set, with the seed:
+// write while failWrites is set, the third insert of the next
+// transaction that makes three once failThirdInsert is set, and blocks
+// every write until its context ends while blockWrites is set, with the seed:
 // alice owns every workspace of the seed in the org acme, of which bob is a
 // member; carol has nothing.
 // Each user has an API key (the field of the user's name); alicePAT is a
@@ -126,6 +127,7 @@ type world struct {
 	clock           *clock
 	failWrites      atomic.Bool
 	failThirdInsert atomic.Bool
+	blockWrites     atomic.Bool
 
 	alice, bob, carol          string
 	aliceKey, bobKey, carolKey string
@@ -138,9 +140,18 @@ type world struct {
 // component's dependencies before they are bound.
 func newWorld(t *testing.T, adjust ...func(*telemetry.Deps)) *world {
 	t.Helper()
+	return newWorldTOML(t, "", adjust...)
+}
+
+// newWorldTOML is newWorld with toml added to the hub's configuration file,
+// after its [server] table.
+func newWorldTOML(t *testing.T, toml string, adjust ...func(*telemetry.Deps)) *world {
+	t.Helper()
 	w := &world{clock: newClock()}
-	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, Compose: func(c *hub.Composition) {
-		c.AdjustTelemetry(func(d *telemetry.Deps) { d.DB = faultDB{DB: d.DB, fail: &w.failWrites, failThird: &w.failThirdInsert} })
+	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, TOML: toml, Compose: func(c *hub.Composition) {
+		c.AdjustTelemetry(func(d *telemetry.Deps) {
+			d.DB = faultDB{DB: d.DB, fail: &w.failWrites, failThird: &w.failThirdInsert, block: &w.blockWrites}
+		})
 		for _, a := range adjust {
 			c.AdjustTelemetry(a)
 		}
@@ -335,13 +346,25 @@ func errorOf(t *testing.T, raw []byte) (errorType, message string) {
 // errInjected is the failure faultDB injects.
 var errInjected = errors.New("injected store failure")
 
+// errInterrupted is what a blocked write of faultDB fails with when its
+// context ends: like the store's driver, an error that does not wrap the
+// context's.
+var errInterrupted = errors.New("interrupted (9)")
+
+// blockLimit is the longest a blocked write of faultDB waits for its
+// context to end, so that a write without a limit fails the test instead
+// of hanging it.
+const blockLimit = 5 * time.Second
+
 // faultDB is the analytical store with faults a test switches on: while
 // fail is set, every statement of a write transaction fails; once
 // failThird is set, the third insert of the next transaction that makes
-// three fails, and failThird is cleared.
+// three fails, and failThird is cleared; while block is set, every
+// statement of a write transaction waits until its context ends (at most
+// blockLimit) and then fails.
 type faultDB struct {
 	telemetry.DB
-	fail, failThird *atomic.Bool
+	fail, failThird, block *atomic.Bool
 }
 
 func (f faultDB) BeginTx(ctx context.Context) (telemetry.Tx, error) {
@@ -349,17 +372,25 @@ func (f faultDB) BeginTx(ctx context.Context) (telemetry.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &faultTx{Tx: tx, fail: f.fail, failThird: f.failThird}, nil
+	return &faultTx{Tx: tx, fail: f.fail, failThird: f.failThird, block: f.block}, nil
 }
 
 // faultTx is a transaction of faultDB, used by one goroutine.
 type faultTx struct {
 	telemetry.Tx
-	fail, failThird *atomic.Bool
-	inserts         int
+	fail, failThird, block *atomic.Bool
+	inserts                int
 }
 
 func (f *faultTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if f.block.Load() {
+		select {
+		case <-ctx.Done():
+			return nil, errInterrupted
+		case <-time.After(blockLimit):
+			return nil, fmt.Errorf("a blocked write waited %s and its context did not end", blockLimit)
+		}
+	}
 	if f.fail.Load() {
 		return nil, errInjected
 	}
