@@ -347,6 +347,11 @@ func TestApprove_RefusesWhatTheRuntimeRejectsOrCannotBeAskedAndDecidesNothing(t 
 	t.Parallel()
 	h := startProposalHub(t)
 	long := strings.Repeat("x", 5000)
+	type approval struct {
+		p     sandbox.Proposal
+		scope string
+	}
+	var refused []approval
 	for _, tc := range []struct {
 		name      string
 		fail      func(p sandbox.Proposal)
@@ -363,25 +368,33 @@ func TestApprove_RefusesWhatTheRuntimeRejectsOrCannotBeAskedAndDecidesNothing(t 
 			h.rt.FailOperation(runtime.OpAddPolicyRule, runtime.ErrUnavailable, "connection refused")
 		}, http.StatusBadGateway, "sandbox_runtime_error", "connection refused"},
 	} {
-		// In turn: the runtime's failure is the fake's, shared by the rows.
-		t.Run(tc.name, func(t *testing.T) {
-			id := h.liveSandbox(t, sandbox.StateReady)
-			p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
-			tc.fail(p)
-			a := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, map[string]any{"scope": "sandbox"})
-			h.rt.RejectPolicies(nil, "")
-			h.rt.FailOperation(runtime.OpAddPolicyRule, nil, "")
-			if a.status != tc.status || a.err.ErrorType != tc.errorType {
-				t.Fatalf("= %d %s; want %d %s", a.status, a.body, tc.status, tc.errorType)
-			}
-			if !strings.Contains(a.err.Message, tc.says) || len(a.err.Message) > 1024 {
-				t.Errorf("message %q (%d bytes); want one of at most 1,024 bytes that says %q", a.err.Message, len(a.err.Message), tc.says)
-			}
-			h.undecided(t, p)
-			if again := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, map[string]any{"scope": "sandbox"}); again.status != http.StatusOK {
-				t.Errorf("the approval again = %d %s; want 200", again.status, again.body)
-			}
-		})
+		for _, scope := range []string{"sandbox", "workspace"} {
+			// In turn: the runtime's failure is the fake's, shared by the
+			// rows.
+			t.Run(tc.name+"/scope "+scope, func(t *testing.T) {
+				id := h.liveSandbox(t, sandbox.StateReady)
+				p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+				tc.fail(p)
+				a := h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, map[string]any{"scope": scope})
+				h.rt.RejectPolicies(nil, "")
+				h.rt.FailOperation(runtime.OpAddPolicyRule, nil, "")
+				if a.status != tc.status || a.err.ErrorType != tc.errorType {
+					t.Fatalf("= %d %s; want %d %s", a.status, a.body, tc.status, tc.errorType)
+				}
+				if !strings.Contains(a.err.Message, tc.says) || len(a.err.Message) > 1024 {
+					t.Errorf("message %q (%d bytes); want one of at most 1,024 bytes that says %q", a.err.Message, len(a.err.Message), tc.says)
+				}
+				h.undecided(t, p)
+				refused = append(refused, approval{p, scope})
+			})
+		}
+	}
+	// After every row: an approval for the workspace saves a rule, which
+	// the later rows' checks would count.
+	for _, r := range refused {
+		if again := h.call(t, http.MethodPost, approvePath("demo", r.p.SandboxID, r.p.ID), h.key, map[string]any{"scope": r.scope}); again.status != http.StatusOK {
+			t.Errorf("the approval of %s with scope %s again = %d %s; want 200", r.p.ID, r.scope, again.status, again.body)
+		}
 	}
 }
 

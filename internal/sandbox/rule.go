@@ -9,11 +9,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/server"
 )
+
+// EventRuleAdd is written when an approval for the workspace saves a new
+// workspace sandbox rule, in the transaction that stores the decision.
+const EventRuleAdd = "parley.sandbox.rule_add"
 
 // ruleIDPrefix begins every workspace sandbox rule id; 32 lowercase
 // hexadecimal characters follow it.
@@ -320,6 +328,111 @@ func ApprovedRules(ctx context.Context, q access.Querier, id string) ([]Approved
 func RemoveWorkspaceRules(ctx context.Context, tx *sql.Tx, slug string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox_rules WHERE workspace = ?`, slug); err != nil {
 		return fmt.Errorf("remove the workspace sandbox rules of %s: %w", slug, err)
+	}
+	return nil
+}
+
+// ruleLimit is the most workspace sandbox rules one workspace holds.
+const ruleLimit = 50
+
+// The refusals of an approval for the workspace.
+var (
+	errWorkspaceRulesDisabled = server.NewError("workspace_rules_disabled", http.StatusForbidden,
+		"workspace sandbox rules are turned off on this hub: approve the proposal with scope sandbox")
+	errRuleLimitReached = server.NewError("sandbox_rule_limit_reached", http.StatusTooManyRequests,
+		fmt.Sprintf("the workspace holds %d sandbox rules, the most it may: delete one first", ruleLimit))
+)
+
+// promotionHolder runs the checks of an approval for the workspace that
+// come before the proposal is read, for the caller of ctx on the workspace
+// ws, and returns the slug of the workspace that will hold the rule: ws
+// itself, or its parent when ws is a task fork. The checks, in order:
+// workspace sandbox rules are on (403 workspace_rules_disabled); the caller
+// has write access to the holding workspace (403 forbidden), which the
+// route already decided when that is ws; a parent is not archived (409
+// parent_archived).
+func (s *Service) promotionHolder(ctx context.Context, ws access.Record) (string, error) {
+	if !s.Settings().AllowWorkspaceRules {
+		return "", errWorkspaceRulesDisabled
+	}
+	holding := holdingSlug(ws)
+	if holding == ws.Slug {
+		return holding, nil
+	}
+	forbidden := server.Forbidden("an approval with scope workspace saves the rule on " + holding + ", which the caller cannot write to")
+	if s.deps.Readable == nil {
+		return "", forbidden
+	}
+	c, _ := server.CallerOf(ctx)
+	set, err := s.deps.Readable(ctx, access.CallerFrom(c))
+	if err != nil {
+		return "", fmt.Errorf("read the workspaces the caller can read: %w", err)
+	}
+	if level := set.Level(holding); level != access.LevelOwner && level != access.LevelAdmin {
+		return "", forbidden
+	}
+	parent, ok, err := access.RecordBySlug(ctx, s.deps.Store.Main(), holding)
+	switch {
+	case err != nil:
+		return "", err
+	case !ok:
+		return "", forbidden
+	case parent.Status == access.StatusArchived:
+		return "", server.NewError("parent_archived", http.StatusConflict, "the parent workspace "+holding+" is archived")
+	}
+	return holding, nil
+}
+
+// heldRule reads, through q, the rule of the workspace holding that is
+// identical to body and returns its id; with none it returns "" when the
+// workspace has room for one more rule, and 429
+// sandbox_rule_limit_reached when it holds ruleLimit rules. An identical
+// rule is named whatever the count, since naming it saves nothing.
+func heldRule(ctx context.Context, q access.Querier, holding string, body json.RawMessage) (string, error) {
+	r, ok, err := RuleByCanonical(ctx, q, holding, body)
+	switch {
+	case err != nil:
+		return "", err
+	case ok:
+		return r.ID, nil
+	}
+	n, err := CountRules(ctx, q, holding)
+	if err != nil {
+		return "", err
+	}
+	if n >= ruleLimit {
+		return "", errRuleLimitReached
+	}
+	return "", nil
+}
+
+// promotedRule is the workspace sandbox rule an approval for the workspace
+// by the caller at now saves on the workspace holding from the proposal p
+// of the sandbox rec, with a new id and the proposal as its origin.
+func promotedRule(caller identity.Principal, rec Record, holding string, p Proposal, now time.Time) SandboxRule {
+	return SandboxRule{
+		ID: NewRuleID(), Workspace: holding, Rule: p.Rule, Summary: p.Summary, Findings: p.Findings,
+		FromProposal: &RuleOrigin{SandboxID: rec.ID, ProposalID: p.ID, Workspace: rec.Workspace},
+		CreatedBy:    deciderOf(caller), CreatedAt: now,
+	}
+}
+
+// addRuleOf saves the promoted rule r in tx and writes EventRuleAdd for the
+// caller, in the session of the sandbox rec the rule was promoted from.
+func (s *Service) addRuleOf(ctx context.Context, tx *sql.Tx, caller identity.Principal, rec Record, r SandboxRule) error {
+	if err := SaveRule(ctx, tx, r); err != nil {
+		return err
+	}
+	actor := actorFor(caller)
+	_, err := s.deps.Events.Emit(ctx, tx, event.Input{
+		Type: EventRuleAdd, ActorType: actor.Type, ActorID: actor.ID,
+		ResourceType: "sandbox_rule", ResourceID: r.ID, Workspace: &r.Workspace, SessionID: rec.SessionID,
+		Metadata: map[string]any{
+			"rule_id": r.ID, "summary": r.Summary, "max_severity": MaxSeverity(r.Findings), "from_proposal": r.FromProposal,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("event of workspace sandbox rule %s: %w", r.ID, err)
 	}
 	return nil
 }

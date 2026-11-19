@@ -1905,6 +1905,25 @@ func (h *createHub) saveRule(t *testing.T, ws, id, body string, at time.Time) sa
 	return r
 }
 
+// fillRules stores n workspace sandbox rules on the workspace ws in one
+// transaction, each with its own rule {"host": "fill-<i>.<ws>.test"}, saved
+// by dana an hour before recordStart.
+func (h *createHub) fillRules(t *testing.T, ws string, n int) {
+	t.Helper()
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		for i := range n {
+			r := sandbox.SandboxRule{
+				ID: sandbox.NewRuleID(), Workspace: ws, Rule: json.RawMessage(fmt.Sprintf(`{"host":"fill-%d.%s.test"}`, i, ws)),
+				CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.dana, Username: "dana"}, CreatedAt: recordStart.Add(-time.Hour),
+			}
+			if err := sandbox.SaveRule(ctx, tx, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // ruleMap is the workspace sandbox rule object of r as a decoded answer
 // holds it: its seven members, findings [] without findings, from_proposal
 // null for a rule promoted from no proposal and created_at in RFC 3339,
@@ -4085,15 +4104,22 @@ func (h *collectorHub) policyRows(t *testing.T, id string) [3]int {
 func startProposalHub(t *testing.T, adjust ...func(*sandbox.Deps)) *createHub {
 	t.Helper()
 	h := startCreateHub(t, agentProfile, adjust...)
+	h.storedRepositories(t, "demo", "other")
+	return h
+}
+
+// storedRepositories adds the ready repositories slugs of dana in acme,
+// stored without a git repository.
+func (h *createHub) storedRepositories(t *testing.T, slugs ...string) {
+	t.Helper()
 	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
-		for _, slug := range []string{"demo", "other"} {
+		for _, slug := range slugs {
 			if err := workspace.Insert(ctx, tx, h.record(slug, access.KindRepository, workspace.StatusReady)); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-	return h
 }
 
 // seedProposal stores a proposal of the sandbox id in state, created at
@@ -4176,7 +4202,14 @@ func listItems(t *testing.T, a answer) (items []any, next string) {
 // runtime, which can then take rules into its policy, and returns its id.
 func (h *createHub) liveSandbox(t *testing.T, state string) string {
 	t.Helper()
-	id := h.seedRecord(t, "demo", state, nil)
+	return h.liveSandboxIn(t, "demo", state, nil)
+}
+
+// liveSandboxIn is liveSandbox with the sandbox stored on the workspace ws
+// as edit changes it when edit is not nil.
+func (h *createHub) liveSandboxIn(t *testing.T, ws, state string, edit func(*sandbox.Record)) string {
+	t.Helper()
+	id := h.seedRecord(t, ws, state, edit)
 	if _, err := h.rt.Client("parley", nil).CreateSandbox(context.Background(), runtime.SandboxSpec{Name: id, WorkDir: sandbox.WorkDir}); err != nil {
 		t.Fatalf("create the sandbox at the runtime: %v", err)
 	}

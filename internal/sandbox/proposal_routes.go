@@ -155,7 +155,7 @@ func (s *Service) serveDecision(w http.ResponseWriter, r *http.Request, state st
 	}
 	ctx := r.Context()
 	caller, _ := identity.PrincipalOf(ctx)
-	p, err := s.decide(ctx, caller, ad.Record.Slug, server.Param(r, "id"), server.Param(r, "proposal_id"), d)
+	p, err := s.decide(ctx, caller, ad.Record, server.Param(r, "id"), server.Param(r, "proposal_id"), d)
 	if err != nil {
 		return err
 	}

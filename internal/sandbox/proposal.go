@@ -55,11 +55,6 @@ var (
 	errProposalDecided         = server.NewError("proposal_decided", http.StatusConflict, "the proposal is decided already")
 	errFindingsNotAcknowledged = server.NewError("findings_not_acknowledged", http.StatusConflict,
 		"the proposal has a finding of severity high: approve it with acknowledge_findings true")
-	// errPromotionUnsupported refuses an approval for the workspace, which
-	// this hub cannot save as a workspace sandbox rule yet; it is answered
-	// before anything is decided.
-	errPromotionUnsupported = server.NewError("not_implemented", http.StatusNotImplemented,
-		"approving a proposal with scope workspace is not supported yet")
 )
 
 // Proposal is a rule the runtime proposed adding to the policy of a
@@ -267,30 +262,42 @@ type decision struct {
 }
 
 // decide decides, for the caller, the proposal proposalID of the sandbox
-// sandboxID of the workspace slug as d says, and returns the proposal as
+// sandboxID of the workspace ws as d says, and returns the proposal as
 // stored then. It is the one way a proposal is decided, for both decisions
 // and both scopes; the request's body is read before it is called.
 //
-// Decisions of one sandbox run one at a time: the sandbox's turn is held
-// from before the first read of the proposal to the commit, since the
-// runtime is asked before the commit and a decision that lost a race must
-// not leave its rule there. The checks run in this order, each refusing
-// with nothing decided: the sandbox is the workspace's (404
-// sandbox_not_found); the proposal is the sandbox's (404 not_found); it is
-// open (409 proposal_decided); an approval of a proposal with a finding of
-// severity high acknowledges it (409 findings_not_acknowledged). An
-// approval for the workspace is then refused, since this hub cannot save
-// workspace sandbox rules yet. Then an approval of a sandbox that is
-// provisioning or ready adds the rule to its policy at the runtime (see
-// addRule); a sandbox in another state takes the rule with its next start.
-// Then one transaction stores the decision, conditional on the proposal
-// still being open (see storeDecision). Last, the runtime is told of a
-// rejection, which is stored whether the runtime hears of it or not (see
-// tellRejected).
-func (s *Service) decide(ctx context.Context, caller identity.Principal, slug, sandboxID, proposalID string, d decision) (Proposal, error) {
+// An approval for the workspace first runs the checks of the workspace
+// that will hold the rule (see promotionHolder). Decisions of one sandbox
+// then run one at a time: the sandbox's turn is held from before the first
+// read of the proposal to the commit, since the runtime is asked before the
+// commit and a decision that lost a race must not leave its rule there. The
+// checks run in this order, each refusing with nothing decided: the
+// sandbox is the workspace's (404 sandbox_not_found); the proposal is the
+// sandbox's (404 not_found); it is open (409 proposal_decided); an approval
+// of a proposal with a finding of severity high acknowledges it (409
+// findings_not_acknowledged). An approval for the workspace then takes the
+// holding workspace's turn, held to the commit so that two promotions
+// cannot pass the limit together, and is refused when the workspace holds
+// no identical rule and no room for another (429
+// sandbox_rule_limit_reached; see heldRule). Then an approval of a sandbox
+// that is provisioning or ready adds the rule to its policy at the runtime
+// (see addRule); a sandbox in another state takes the rule with its next
+// start. Then one transaction stores the decision, conditional on the
+// proposal still being open (see storeDecision). Last, the runtime is told
+// of a rejection, which is stored whether the runtime hears of it or not
+// (see tellRejected).
+func (s *Service) decide(ctx context.Context, caller identity.Principal, ws access.Record, sandboxID, proposalID string, d decision) (Proposal, error) {
+	approve := d.State == ProposalApproved
+	var holding string
+	if approve && d.Scope == ScopeWorkspace {
+		var err error
+		if holding, err = s.promotionHolder(ctx, ws); err != nil {
+			return Proposal{}, err
+		}
+	}
 	unlock := s.deciding.lock(sandboxID)
 	defer unlock()
-	rec, err := s.readSandbox(ctx, slug, sandboxID)
+	rec, err := s.readSandbox(ctx, ws.Slug, sandboxID)
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -303,12 +310,15 @@ func (s *Service) decide(ctx context.Context, caller identity.Principal, slug, s
 	case p.State != ProposalOpen:
 		return Proposal{}, errProposalDecided
 	}
-	approve := d.State == ProposalApproved
 	if approve && !d.Acknowledge && slices.ContainsFunc(p.Findings, func(f runtime.Finding) bool { return f.Severity == "high" }) {
 		return Proposal{}, errFindingsNotAcknowledged
 	}
-	if approve && d.Scope == ScopeWorkspace {
-		return Proposal{}, errPromotionUnsupported
+	if holding != "" {
+		unlockHolding := s.promoting.lock(holding)
+		defer unlockHolding()
+		if _, err := heldRule(ctx, s.deps.Store.Main(), holding, p.Rule); err != nil {
+			return Proposal{}, err
+		}
 	}
 	if approve && (rec.State == StateProvisioning || rec.State == StateReady) {
 		if err := s.addRule(ctx, rec, p); err != nil {
@@ -316,7 +326,7 @@ func (s *Service) decide(ctx context.Context, caller identity.Principal, slug, s
 		}
 	}
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
-		p, err = s.storeDecision(ctx, tx, caller, rec.ID, p, d)
+		p, err = s.storeDecision(ctx, tx, caller, rec.ID, holding, p, d)
 		return err
 	})
 	if err != nil {
@@ -383,9 +393,13 @@ func (s *Service) addRule(ctx context.Context, rec Record, p Proposal) error {
 
 // storeDecision writes, in tx, the decision d of the open proposal p of
 // the sandbox id for the caller, and returns the proposal as stored then.
-// A proposal that is no longer open is refused with 409 proposal_decided,
-// and the caller rolls tx back.
-func (s *Service) storeDecision(ctx context.Context, tx *sql.Tx, caller identity.Principal, id string, p Proposal, d decision) (Proposal, error) {
+// An approval for the workspace names the rule of the workspace holding
+// identical to the proposal's, or saves the proposal's rule there as a new
+// one (see promotedRule); the count and the save are in this transaction,
+// under the holding workspace's turn (see decide), and the new rule's
+// EventRuleAdd follows the decision's event. A proposal that is no longer
+// open is refused with 409 proposal_decided, and the caller rolls tx back.
+func (s *Service) storeDecision(ctx context.Context, tx *sql.Tx, caller identity.Principal, id, holding string, p Proposal, d decision) (Proposal, error) {
 	rec, err := Get(ctx, tx, id)
 	if err != nil {
 		return Proposal{}, err
@@ -395,6 +409,18 @@ func (s *Service) storeDecision(ctx context.Context, tx *sql.Tx, caller identity
 	var scope any
 	if d.State == ProposalApproved {
 		pd.Scope, scope = &d.Scope, d.Scope
+	}
+	var added *SandboxRule
+	if holding != "" {
+		ruleID, err := heldRule(ctx, tx, holding, p.Rule)
+		if err != nil {
+			return Proposal{}, err
+		}
+		if ruleID == "" {
+			r := promotedRule(caller, rec, holding, p, now)
+			added, ruleID = &r, r.ID
+		}
+		pd.WorkspaceRuleID = &ruleID
 	}
 	decided, err := DecideProposal(ctx, tx, id, p.ID, pd)
 	switch {
@@ -422,6 +448,11 @@ func (s *Service) storeDecision(ctx context.Context, tx *sql.Tx, caller identity
 	})
 	if err != nil {
 		return Proposal{}, fmt.Errorf("event of sandbox %s: %w", id, err)
+	}
+	if added != nil {
+		if err := s.addRuleOf(ctx, tx, caller, rec, *added); err != nil {
+			return Proposal{}, err
+		}
 	}
 	return GetProposal(ctx, tx, id, p.ID)
 }
