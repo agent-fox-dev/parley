@@ -40,6 +40,8 @@ type useRequest struct {
 	slug string
 	// rec is the sandbox as the gate read it.
 	rec Record
+	// exec is the body of an exec, as its validation read it.
+	exec execRequest
 }
 
 // useEntry is one route that uses a sandbox, under
@@ -74,10 +76,11 @@ type useEntry struct {
 
 // useTable is the table of the routes that use a sandbox.
 func (s *Service) useTable() []*useEntry {
+	exec := newExecutor(s)
 	return []*useEntry{
 		{
 			name: useExec, method: http.MethodPost, segment: "exec", kind: KindWrite, covers: true,
-			states: []string{StateReady}, maxBody: execBodyLimit, operate: pendingOperation,
+			states: []string{StateReady}, maxBody: execBodyLimit, validate: exec.validate, operate: exec.collect,
 		},
 		{
 			name: useUpload, method: http.MethodPut, segment: "files", kind: KindWrite, covers: true,

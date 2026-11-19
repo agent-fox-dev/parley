@@ -333,6 +333,8 @@ func (h *probeHub) pat(t *testing.T, userID string, permissions ...string) strin
 type answer struct {
 	status int
 	body   []byte
+	// header is set by the helpers that read the answer's headers.
+	header http.Header
 	err    struct {
 		Code      int    `json:"code"`
 		Message   string `json:"message"`
@@ -2273,4 +2275,218 @@ func (h *useHub) useCall(t *testing.T, u useRoute, slug, id, cred string, body a
 		}
 	}
 	return a
+}
+
+// execHub is a hub with sandboxes on over a fake runtime whose commands
+// cmds runs, on a clock the test advances, with the repository ws of owner,
+// whose API key is key.
+type execHub struct {
+	*probeHub
+	clock *hubtest.JobClock
+	cmds  *commands
+	key   string
+}
+
+// startExecHub starts an exec hub that runs at most maxExecs commands at
+// once in a sandbox, its clock at recordStart; [sandbox].max_exec_timeout
+// is its default, 30m.
+func startExecHub(t *testing.T, maxExecs int) *execHub {
+	t.Helper()
+	h := &execHub{
+		probeHub: &probeHub{rt: runtimetest.New(t)}, clock: hubtest.NewJobClock(func() time.Time { return recordStart }),
+		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}},
+	}
+	h.rt.SetExec(h.cmds.run)
+	cfg := sandboxesOn
+	cfg.TOML = "[sandbox]\ngateway_url = \"https://gw.test:8443\"\ntoken_file = \"gateway-token\"\n" +
+		"max_concurrent_execs = " + strconv.Itoa(maxExecs) + "\n[[sandbox.profiles]]\nname = \"agent\"\nttl = \"4h\"\n"
+	cfg.Now = h.clock.Now
+	cfg.Compose = func(c *hub.Composition) {
+		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
+			return h.rt.Client(s.OpenShellWorkspace, deps.Recorder), nil
+		})
+		c.AdjustSandbox(func(d *sandbox.Deps) {
+			d.Now = h.clock.Now
+			d.NewTimer = func(x time.Duration) sandbox.Timer { return h.clock.NewTimer(x) }
+		})
+	}
+	h.Hub = hubtest.StartWith(t, cfg)
+	h.owner = h.CreateUser(t, "owner")
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: h.CreateOrg(t, "team"), Kind: access.KindRepository, Status: access.StatusReady})
+	h.key = h.IssueKey(t, h.owner)
+	return h
+}
+
+// sandbox stores a ready sandbox of ws created by the owner's API key, as
+// edit changes it when edit is not nil, creates it in the runtime with the
+// working directory /workspace and the environment PARLEY_SANDBOX_ID and
+// MODE=profile, and returns its id.
+func (h *execHub) sandbox(t *testing.T, edit func(*sandbox.Record)) string {
+	t.Helper()
+	before := recordStart.Add(-time.Hour)
+	rec := sandbox.Record{
+		ID: sandbox.NewID(), Workspace: "ws", Profile: "agent", State: sandbox.StateReady,
+		ExpiresAt: recordStart.Add(3 * time.Hour), LastActivityAt: before,
+		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
+		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: "ws",
+	}
+	if edit != nil {
+		edit(&rec)
+	}
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.Insert(ctx, tx, rec) }); err != nil {
+		t.Fatalf("insert a sandbox: %v", err)
+	}
+	spec := runtime.SandboxSpec{Name: rec.ID, WorkDir: sandbox.WorkDir, Env: map[string]string{"PARLEY_SANDBOX_ID": rec.ID, "MODE": "profile"}}
+	if _, err := h.rt.Client("parley", nil).CreateSandbox(ctx, spec); err != nil {
+		t.Fatalf("create the sandbox in the runtime: %v", err)
+	}
+	return rec.ID
+}
+
+// startMain starts the main process of the sandbox id, which runs until it
+// is stopped.
+func (h *execHub) startMain(t *testing.T, id string) {
+	t.Helper()
+	if err := h.rt.Client("parley", nil).RunMain(context.Background(), id, []string{"main"}); err != nil {
+		t.Fatalf("start the main process of %s: %v", id, err)
+	}
+}
+
+// mainRunning reports whether the main process of the sandbox id runs.
+func (h *execHub) mainRunning(t *testing.T, id string) bool {
+	t.Helper()
+	st, err := h.rt.Client("parley", nil).GetSandbox(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get %s from the runtime: %v", id, err)
+	}
+	return !st.MainExited
+}
+
+// exec sends POST …/exec for the sandbox id of ws as the owner with body
+// and the headers of header, and reads the answer with its headers and
+// its error envelope, if it has one.
+func (h *execHub) exec(t *testing.T, id string, body any, header http.Header) answer {
+	t.Helper()
+	var a answer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+sandboxPath("ws", id)+"/exec", h.key, body, header)
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
+}
+
+// execing sends what exec sends under ctx, from another goroutine, and
+// delivers the answer on the channel it returns: with status 0 when the
+// request got none, as when ctx ended first or the hub dropped the
+// connection.
+func (h *execHub) execing(ctx context.Context, id string, body any, header http.Header) <-chan answer {
+	out := make(chan answer, 1)
+	raw, _ := json.Marshal(body)
+	go func() {
+		var a answer
+		defer func() { out <- a }()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL("/api/v1"+sandboxPath("ws", id)+"/exec"), bytes.NewReader(raw))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+h.key)
+		req.Header.Set("Content-Type", "application/json")
+		for k, vs := range header {
+			req.Header[k] = vs
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
+	}()
+	return out
+}
+
+// commands run the commands of an exec hub's runtime. main, a main process,
+// runs until it is stopped; any other command runs the script set for its
+// first argument, or exits 0 with no output when none is set. They keep the
+// request of every command but main, in order, and count the commands
+// running, those waiting in a blocking script and those killed: ended by
+// their context before they returned.
+type commands struct {
+	mu                      sync.Mutex
+	scripts                 map[string]runtimetest.ExecFunc
+	ran                     []runtime.ExecRequest
+	running, waiting, kills int
+}
+
+// set makes fn the script of the commands named name.
+func (c *commands) set(name string, fn runtimetest.ExecFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.scripts[name] = fn
+}
+
+// blocking is a script that writes stdout and stderr and then waits until
+// it is killed, counted as waiting meanwhile.
+func (c *commands) blocking(stdout, stderr string) runtimetest.ExecFunc {
+	return func(ctx context.Context, _ string, _ runtime.ExecRequest, out, errOut io.Writer) int {
+		_, _ = io.WriteString(out, stdout)
+		_, _ = io.WriteString(errOut, stderr)
+		c.mu.Lock()
+		c.waiting++
+		c.mu.Unlock()
+		<-ctx.Done()
+		c.mu.Lock()
+		c.waiting--
+		c.mu.Unlock()
+		return 137
+	}
+}
+
+func (c *commands) run(ctx context.Context, name string, req runtime.ExecRequest, stdout, stderr io.Writer) int {
+	if req.Command[0] == "main" {
+		<-ctx.Done()
+		return 0
+	}
+	c.mu.Lock()
+	c.ran = append(c.ran, req)
+	c.running++
+	fn := c.scripts[req.Command[0]]
+	c.mu.Unlock()
+	code := 0
+	if fn != nil {
+		code = fn(ctx, name, req, stdout, stderr)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.running--
+	if ctx.Err() != nil {
+		c.kills++
+	}
+	return code
+}
+
+// counts are the number of commands run so far, of those running, of
+// those waiting in a blocking script and of those killed.
+func (c *commands) counts() (ran, running, waiting, kills int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.ran), c.running, c.waiting, c.kills
+}
+
+// last is the request of the last command run.
+func (c *commands) last(t *testing.T) runtime.ExecRequest {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.ran) == 0 {
+		t.Fatal("no command ran")
+	}
+	return c.ran[len(c.ran)-1]
 }
