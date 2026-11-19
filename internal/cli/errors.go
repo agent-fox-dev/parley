@@ -10,7 +10,8 @@ import (
 
 // The exit statuses of parley, one meaning each on every command.
 const (
-	// exitHubError: the hub answered an error, or a wait failed or timed out.
+	// exitHubError: the hub answered an error, a wait failed or timed out, or
+	// a webhook delivery the command made failed.
 	exitHubError = 1
 	// exitClientError: a usage error, or a failure on the client's side.
 	exitClientError = 2
@@ -25,6 +26,7 @@ const (
 	waitFailedType      = "wait_failed"
 	waitTimeoutType     = "wait_timeout"
 	conditionNotMetType = "condition_not_met"
+	deliveryFailedType  = "delivery_failed"
 )
 
 // hubError is an error envelope the hub answered, kept as received so that
@@ -38,7 +40,7 @@ func (e *hubError) Error() string {
 	return fmt.Sprintf("the hub answered %d: %s", e.status, bytes.TrimSpace(e.body))
 }
 
-// cliError is an error the CLI raises itself, of one of the five CLI error
+// cliError is an error the CLI raises itself, of one of the CLI error
 // types.
 type cliError struct {
 	errorType string
@@ -79,6 +81,13 @@ func conditionNotMet(format string, args ...any) error {
 	return newCLIError(conditionNotMetType, format, args)
 }
 
+// deliveryFailed is a test delivery or a redelivery of an event webhook that
+// the hub made and the receiver did not accept: the hub answered, so the
+// record is printed, and the exit status still tells a script it failed.
+func deliveryFailed(format string, args ...any) error {
+	return newCLIError(deliveryFailedType, format, args)
+}
+
 // commandExit ends parley with the exit status of a command it ran
 // elsewhere, parley sandbox exec's, whose own output says what happened:
 // no envelope is printed for it.
@@ -106,7 +115,7 @@ func exitCode(err error) int {
 	var ce *cliError
 	if errors.As(err, &ce) {
 		switch ce.errorType {
-		case waitFailedType, waitTimeoutType:
+		case waitFailedType, waitTimeoutType, deliveryFailedType:
 			return exitHubError
 		case conditionNotMetType:
 			return exitConditionNotMet
