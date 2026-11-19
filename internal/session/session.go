@@ -9,17 +9,19 @@
 //
 // The package needs things of others, which it declares as narrow
 // interfaces the hub fills: the access rule (Access), the minimal record of
-// a workspace (WorkspaceReader) and the coverage of a bound token
-// (Coverage).
+// a workspace (WorkspaceReader), the coverage of a bound token (Coverage)
+// and the in-transaction write of the event log (Emitter).
 package session
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 	"github.com/agent-fox-dev/parley/internal/store"
 )
@@ -50,10 +52,19 @@ type Coverage interface {
 	Covers(ctx context.Context, c access.Caller, slug string) (bound, covered bool, err error)
 }
 
+// Emitter writes one hub event in the caller's transaction tx, so that it
+// commits or rolls back with what the transaction changes;
+// *event.Component satisfies it.
+type Emitter interface {
+	Emit(ctx context.Context, tx *sql.Tx, in event.Input) (event.Record, error)
+}
+
 // Deps are what the component works with: the transactional store, the
 // clock (nil for time.Now), the log (nil discards it), the access rule, the
-// workspace records and the coverage of bound tokens. With no Coverage no
-// caller counts as bound, because bound tokens do not exist without it.
+// workspace records, the coverage of bound tokens and the event log. With
+// no Coverage no caller counts as bound, because bound tokens do not exist
+// without it. With no Events a forced close refuses to close anything,
+// since it would leave no event.
 type Deps struct {
 	Store      *store.Store
 	Now        func() time.Time
@@ -61,6 +72,7 @@ type Deps struct {
 	Access     Access
 	Workspaces WorkspaceReader
 	Coverage   Coverage
+	Events     Emitter
 }
 
 // Component is the session feature. The hub creates its zero value while

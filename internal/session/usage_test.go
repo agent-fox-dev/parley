@@ -241,7 +241,9 @@ func TestUsage_RefusesASessionThatIsNotActive(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				id := w.open(t, w.aliceKey, map[string]any{"workspace_slug": demo})["id"].(string)
 				if ended == session.StatusTerminated {
-					w.terminate(t, id)
+					if n := w.forceClose(t, demo, "workspace archived"); n != 1 {
+						t.Fatalf("CloseActive = %d, want 1", n)
+					}
 				} else if status, raw := w.complete(t, w.aliceKey, id, map[string]any{"status": ended}); status != http.StatusOK {
 					t.Fatalf("POST complete = %d %s, want 200", status, raw)
 				}
@@ -464,7 +466,10 @@ func TestActiveCounts_CountsActiveSessionsPerWorkspace(t *testing.T) {
 	if status, raw := w.complete(t, w.aliceKey, done, map[string]any{"status": "completed"}); status != http.StatusOK {
 		t.Fatalf("POST complete = %d %s, want 200", status, raw)
 	}
-	w.terminate(t, w.open(t, w.aliceKey, map[string]any{"workspace_slug": fork2})["id"].(string))
+	w.open(t, w.aliceKey, map[string]any{"workspace_slug": fork2})
+	if n := w.forceClose(t, fork2, "fork expired"); n != 1 {
+		t.Fatalf("CloseActive = %d, want 1", n)
+	}
 
 	got, err := w.sessions.ActiveCounts(ctx)
 	if want := map[string]int64{demo: 2, fork1: 1, other: 1}; err != nil || !reflect.DeepEqual(got, want) {

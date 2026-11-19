@@ -102,7 +102,9 @@ func TestComplete_AnswersAnEndedSessionUnchanged(t *testing.T) {
 			id := w.open(t, w.aliceKey, map[string]any{"workspace_slug": demo})["id"].(string)
 			w.clock.Advance(time.Minute)
 			if stored == session.StatusTerminated {
-				w.terminate(t, id)
+				if n := w.forceClose(t, demo, "workspace deleted"); n != 1 {
+					t.Fatalf("CloseActive = %d, want 1", n)
+				}
 			} else if status, raw := w.complete(t, w.aliceKey, id, map[string]any{"status": stored}); status != http.StatusOK {
 				t.Fatalf("POST complete = %d %s, want 200", status, raw)
 			}

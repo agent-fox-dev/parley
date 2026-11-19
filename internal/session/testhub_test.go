@@ -15,10 +15,12 @@ import (
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
+	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/session"
+	"github.com/agent-fox-dev/parley/internal/workspace"
 )
 
 // TestMain runs the package's tests at most hubtest.HubParallel at a time:
@@ -70,8 +72,11 @@ const (
 type world struct {
 	*hubtest.Hub
 	clock *clock
-	// sessions is the hub's session component.
-	sessions *session.Component
+	// sessions is the hub's session component, events its event log and
+	// workspaces its workspace service.
+	sessions   *session.Component
+	events     *event.Component
+	workspaces *workspace.Service
 
 	alice, bob, carol, dave, erin       string
 	aliceKey, bobKey, carolKey, daveKey string
@@ -87,7 +92,7 @@ func newWorld(t *testing.T, adjust ...func(*session.Deps)) *world {
 	t.Helper()
 	w := &world{clock: newClock()}
 	w.Hub = hubtest.StartWith(t, hubtest.Config{Now: w.clock.Now, Compose: func(c *hub.Composition) {
-		w.sessions = c.Sessions()
+		w.sessions, w.events, w.workspaces = c.Sessions(), c.Events(), c.Workspaces()
 		for _, a := range adjust {
 			c.AdjustSessions(a)
 		}

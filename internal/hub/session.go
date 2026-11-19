@@ -29,11 +29,23 @@ const sessionHook = "sessions"
 // component, bound in a start hook to the store, the hub's clock, the access
 // rule, which decides a caller's access to a session's workspace, the
 // minimal workspace records, read from the store, and the coverage of a
-// bound token, answered by the access rule's covered set. It registers the
-// session-linking rule (Check) and the session record (Record) with every
-// part that takes a session id: the fork create, the push options stage,
-// the source control API, the change feature, the landing, the awareness
-// feature and the sandbox create (registerSessionLinkers).
+// bound token, answered by the access rule's covered set, and the event
+// log. It registers the session-linking rule (Check) and the session record
+// (Record) with every part that takes a session id: the fork create, the
+// push options stage, the source control API, the change feature, the
+// landing, the awareness feature and the sandbox create
+// (registerSessionLinkers).
+//
+// It registers the forced close (CloseActive) as the session closer of the
+// workspaces' teardown set (sessionCloser), which an archive calls in its
+// transaction for the workspace and its forks, and RemoveOwned calls in
+// every removal, a workspace's delete and a fork's removal or expiry alike,
+// with the reason as text. It registers nothing else for a removal: no
+// remover of session records, since a session, its usage and its links
+// outlive their workspace, and their retention is not this part's; nothing
+// with the fork feature, whose removals reach the closer through
+// RemoveOwned; and no archive observer, since the close belongs inside the
+// archive's transaction.
 //
 // It is composed last, so that the components it registers with all exist.
 //
@@ -47,6 +59,7 @@ func composeSessions(c *Composition) {
 		c.AddRoute(r)
 	}
 	registerSessionLinkers(c, comp)
+	c.workspaces.Teardown().RegisterSessionCloser(sessionCloser{comp, c.runtime})
 	c.AddStartHook(sessionHook, func(_ context.Context, rt *Runtime) error {
 		d := session.Deps{
 			Store:      rt.Store,
@@ -55,6 +68,7 @@ func composeSessions(c *Composition) {
 			Access:     c.access,
 			Workspaces: sessionWorkspaces{rt.Store},
 			Coverage:   sessionCoverage{c.access},
+			Events:     c.events,
 		}
 		for _, adjust := range c.sessionAdjusters {
 			adjust(&d)
@@ -62,6 +76,25 @@ func composeSessions(c *Composition) {
 		comp.Bind(d)
 		return nil
 	})
+}
+
+// sessionCloser is the workspaces' session closer: it ends the active
+// sessions of each slug with the forced close, giving the reason it
+// receives and the hub clock's time when it is called. It serves once the
+// session start hook has bound the component, before any request.
+type sessionCloser struct {
+	sessions *session.Component
+	rt       *Runtime
+}
+
+func (s sessionCloser) CloseSessions(ctx context.Context, tx *sql.Tx, slugs []string, reason string) error {
+	at := s.rt.Now()
+	for _, slug := range slugs {
+		if _, err := s.sessions.CloseActive(ctx, tx, slug, reason, at); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sessionWorkspaces is the session component's workspace reader: the
