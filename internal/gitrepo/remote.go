@@ -40,16 +40,11 @@ func (g Git) FetchRemote(ctx context.Context, dir, url, name string, cred Creden
 	// dev/next) does not fail the fetch.
 	ns := fetchNamespace + randomName() + "/"
 	fetched, err := repo.fetch(ctx, url, cred, deadline, ns, false)
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	defer cancel()
-	cleanErr := repo.deleteUnder(cleanup, ns)
 	if err != nil {
+		_ = repo.dropFetched(ctx, ns)
 		return nil, err
 	}
-	if cleanErr != nil {
-		return nil, fmt.Errorf("remove the fetched refs: %w", cleanErr)
-	}
-	if err := repo.setHeads(ctx, remotesPrefix+name+"/", fetched.Branches); err != nil {
+	if err := repo.setFetchedHeads(ctx, ns, remotesPrefix+name+"/", fetched.Branches); err != nil {
 		return nil, err
 	}
 	return fetched.Branches, nil

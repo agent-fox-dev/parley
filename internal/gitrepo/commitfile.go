@@ -62,15 +62,7 @@ type packFiles struct{ index, pack *os.File }
 // a git process with the environment entries env reads them; ok is false
 // when it would not read them the way git does.
 func newCommitReader(dir string, env []string) (*commitReader, bool) {
-	if !filesBackend(dir) {
-		return nil, false
-	}
-	for _, name := range []string{"shallow", filepath.Join("info", "grafts"), filepath.Join("refs", "replace")} {
-		if _, err := os.Lstat(filepath.Join(dir, name)); !errors.Is(err, fs.ErrNotExist) {
-			return nil, false
-		}
-	}
-	if replace, ok := readPackedRefs(dir, "refs/replace/"); !ok || len(replace) > 0 {
+	if !historyAsStored(dir) {
 		return nil, false
 	}
 	primary := filepath.Join(dir, "objects")
@@ -97,6 +89,22 @@ func newCommitReader(dir string, env []string) (*commitReader, bool) {
 		}
 	}
 	return r, true
+}
+
+// historyAsStored is whether git reads the history of the git directory dir
+// as its objects store it: a files backend, and no shallow file, grafts or
+// replace refs.
+func historyAsStored(dir string) bool {
+	if !filesBackend(dir) {
+		return false
+	}
+	for _, name := range []string{"shallow", filepath.Join("info", "grafts"), filepath.Join("refs", "replace")} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); !errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+	}
+	replace, ok := readPackedRefs(dir, "refs/replace/")
+	return ok && len(replace) == 0
 }
 
 // addObjects adds the object directory objects and, depth levels deep at
