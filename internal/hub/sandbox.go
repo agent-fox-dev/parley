@@ -35,6 +35,12 @@ const (
 	// each follower returns once its runtime stream ends with its context.
 	sandboxLogCollectorWork  = "sandbox_log_collector"
 	sandboxLogCollectorGrace = 5 * time.Second
+	// sandboxPolicyCollectorWork is the name of the policy collector's
+	// background work, and sandboxPolicyCollectorGrace how long the stop
+	// waits for it: each follower returns once its runtime stream ends with
+	// its context.
+	sandboxPolicyCollectorWork  = "sandbox_policy_collector"
+	sandboxPolicyCollectorGrace = 5 * time.Second
 	// sandboxLifecycleWork is the name of the lifecycle loop's background
 	// work, and sandboxLifecycleGrace how long the stop waits for it: a
 	// pass returns before its next runtime call once its context ends.
@@ -161,6 +167,7 @@ func composeSandbox(c *Composition) {
 	c.AddSchemaStep(sandbox.LogSchemaStep)
 	c.AddSchemaStep(sandbox.RuleSchemaStep)
 	c.AddSchemaStep(sandbox.ApprovedRuleSchemaStep)
+	c.AddSchemaStep(sandbox.DenialSchemaStep)
 	registerSandboxCollaborators(c, svc)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
@@ -272,9 +279,10 @@ func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
 // composeSandboxWork adds the sandbox feature's work besides the requests,
 // after the runtime check's start hook: the start hooks that resume the
 // provisionings an earlier process left and run the first reconcile pass,
-// the background work of the provisioner, the log collector, the idle and
-// expiry passes and the reconciliation, and the maintenance tasks of log
-// retention and record cleanup. With sandboxes off each returns at once.
+// the background work of the provisioner, the log collector, the policy
+// collector, the idle and expiry passes and the reconciliation, and the
+// maintenance tasks of log retention and record cleanup. With sandboxes off
+// each returns at once.
 func composeSandboxWork(c *Composition, svc *sandbox.Service) {
 	c.AddStartHook(sandboxProvisionerHook, func(ctx context.Context, _ *Runtime) error {
 		if !svc.Enabled() {
@@ -293,6 +301,9 @@ func composeSandboxWork(c *Composition, svc *sandbox.Service) {
 	})
 	c.AddBackgroundWork(sandboxLogCollectorWork, sandboxLogCollectorGrace, func(ctx context.Context, _ *Runtime) {
 		svc.CollectLogs(ctx)
+	})
+	c.AddBackgroundWork(sandboxPolicyCollectorWork, sandboxPolicyCollectorGrace, func(ctx context.Context, _ *Runtime) {
+		svc.CollectPolicy(ctx, c.sandboxPolicyCollector)
 	})
 	c.AddBackgroundWork(sandboxLifecycleWork, sandboxLifecycleGrace, func(ctx context.Context, _ *Runtime) {
 		svc.RunLifecycle(ctx)
@@ -335,6 +346,14 @@ func (c *Composition) SetSandboxRuntime(f sandbox.RuntimeFactory) {
 // with it.
 func (c *Composition) AdjustSandbox(fn func(*sandbox.Deps)) {
 	c.sandboxAdjusters = append(c.sandboxAdjusters, fn)
+}
+
+// SetSandboxPolicyCollector sets the options of the policy collector the
+// hub runs with sandboxes on: shorter intervals for a run that cannot wait
+// for the defaults, or Hold for a test that drives a collector's passes
+// itself.
+func (c *Composition) SetSandboxPolicyCollector(o sandbox.PolicyCollectorOptions) {
+	c.sandboxPolicyCollector = o
 }
 
 // SetSandboxRecorder sets the recorder the sandbox feature and its runtime

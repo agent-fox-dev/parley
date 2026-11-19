@@ -53,3 +53,7 @@ func CheckpointTurns(s *Service, id string) int {
 	}
 	return 0
 }
+
+// PolicyFollowers returns the ids of the sandboxes whose policy log the
+// collector c follows: those of its followers that have not stopped.
+func PolicyFollowers(c *PolicyCollector) []string { return c.following() }

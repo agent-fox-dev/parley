@@ -182,13 +182,15 @@ type Composition struct {
 	startReports []func(*slog.Logger)
 
 	// sandbox is the sandbox feature composeSandbox creates, with the
-	// factory of its runtime client, the recorder of its metrics and the
+	// factory of its runtime client, the recorder of its metrics, the
 	// functions that change its dependencies before they are bound
-	// (AdjustSandbox).
-	sandbox          *sandbox.Service
-	sandboxRuntime   sandbox.RuntimeFactory
-	sandboxRecorder  sandbox.Recorder
-	sandboxAdjusters []func(*sandbox.Deps)
+	// (AdjustSandbox) and the options of its policy collector
+	// (SetSandboxPolicyCollector).
+	sandbox                *sandbox.Service
+	sandboxRuntime         sandbox.RuntimeFactory
+	sandboxRecorder        sandbox.Recorder
+	sandboxAdjusters       []func(*sandbox.Deps)
+	sandboxPolicyCollector sandbox.PolicyCollectorOptions
 
 	// identity is the identity service composeIdentity creates. A part
 	// that runs after it and keeps data for a user or an org registers its

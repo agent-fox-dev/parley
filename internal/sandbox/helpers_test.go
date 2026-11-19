@@ -674,7 +674,8 @@ var secretsKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 // resolution that the test can make fail, and a minter in front of the
 // hub's minting component that keeps the values it minted and that the test
 // can make fail. The runtime holds the provider profiles anthropic and
-// mirror of credentialTables.
+// mirror of credentialTables. The hub runs no policy collector, whose calls
+// would stand beside those its tests check.
 type createHub struct {
 	*probeHub
 	svc        *sandbox.Service
@@ -747,6 +748,7 @@ func newCreateHub(t *testing.T, rt *runtimetest.Fake, profiles string, provision
 		h.svc.RegisterSessionLinker(h.linker)
 		c.Forks().RegisterSessionLinker(h.forkLinker)
 		c.SetSandboxRecorder(h.rec)
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
 			h.minter.next, d.Mint = d.Mint, h.minter.mint
@@ -1541,7 +1543,7 @@ type hubEvent struct {
 
 // sandboxEvents returns the hub events of type typ about the sandbox id,
 // oldest first.
-func (h *createHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
+func (h *probeHub) sandboxEvents(t *testing.T, typ, id string) []hubEvent {
 	t.Helper()
 	rows, err := h.Store.Main().Query(`SELECT actor_type, actor_id, metadata, resource_type, workspace, session_id FROM hub_events WHERE type = ? AND resource_id = ? ORDER BY seq`, typ, id)
 	if err != nil {
@@ -2427,7 +2429,8 @@ func startUseSandboxHub(t *testing.T, settings string) *execHub {
 // newExecHub starts an exec hub whose [sandbox] section also holds the lines
 // settings, with its configuration as edit changes it when edit is not nil.
 // The fake runtime stamps log entries with the hub's clock, and the hub's
-// runtime client records the terminals it opens in terms.
+// runtime client records the terminals it opens in terms. The hub runs no
+// policy collector, whose streams would stand beside those its tests count.
 func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *execHub {
 	t.Helper()
 	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
@@ -2442,6 +2445,7 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	cfg.Now = h.clock.Now
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc = c.Sandbox()
+		c.SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions{Hold: true})
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
 			terms := &terminalClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), terms: h.terms}
 			return &quirkClient{Client: terms, quirks: h.quirks}, nil
@@ -2992,7 +2996,7 @@ func (h *logHub) follow(t *testing.T, id string) {
 }
 
 // logStreams is the number of open log streams of the sandbox id.
-func (h *logHub) logStreams(id string) int {
+func (h *execHub) logStreams(id string) int {
 	n := 0
 	for _, s := range h.rt.Streams() {
 		if s.Op == runtime.OpLogs && s.Sandbox == id {
@@ -3003,7 +3007,7 @@ func (h *logHub) logStreams(id string) int {
 }
 
 // breakLog breaks the first open log stream of the sandbox id.
-func (h *logHub) breakLog(t *testing.T, id string) {
+func (h *execHub) breakLog(t *testing.T, id string) {
 	t.Helper()
 	for _, s := range h.rt.Streams() {
 		if s.Op == runtime.OpLogs && s.Sandbox == id {
@@ -3850,5 +3854,91 @@ func (l *idLog) snapshot() map[string]int {
 	for id, n := range l.ids {
 		out[id] = n
 	}
+	return out
+}
+
+// denialRetry is the retry delay of the policy collectors of a denial hub.
+const denialRetry = 5 * time.Second
+
+// denialHub is an exec hub, which runs no policy collector of its own, so
+// that its test drives the passes of the collectors it builds, with a
+// metrics recorder and a clock of its own for the collectors' retry delay.
+type denialHub struct {
+	*execHub
+	rec *recordingRecorder
+	// retryClock is the clock the collectors count their retry delay on.
+	retryClock *hubtest.JobClock
+}
+
+// startDenialHub starts a denial hub.
+func startDenialHub(t *testing.T) *denialHub {
+	t.Helper()
+	h := &denialHub{rec: &recordingRecorder{}, retryClock: hubtest.NewJobClock(func() time.Time { return recordStart })}
+	h.execHub = newExecHub(t, "", func(cfg *hubtest.Config) {
+		compose := cfg.Compose
+		cfg.Compose = func(c *hub.Composition) {
+			compose(c)
+			c.SetSandboxRecorder(h.rec)
+		}
+	})
+	return h
+}
+
+// collector returns a policy collector of the hub with the retry delay
+// denialRetry on the hub's retry clock, stopped when the test ends.
+func (h *denialHub) collector(t *testing.T) *sandbox.PolicyCollector {
+	t.Helper()
+	c := h.svc.NewPolicyCollector(sandbox.PolicyCollectorOptions{RetryDelay: denialRetry, Now: h.retryClock.Now})
+	t.Cleanup(c.Stop)
+	return c
+}
+
+// readySandbox is execHub.sandbox for one row of a table that shares the
+// hub: the sandbox, edited by edit when it is not nil, is stopped in the
+// store when the row ends, so that the collectors of later rows do not
+// follow it.
+func (h *denialHub) readySandbox(t *testing.T, edit func(*sandbox.Record)) string {
+	t.Helper()
+	id := h.sandbox(t, edit)
+	t.Cleanup(func() {
+		if _, err := h.svc.Transition(context.Background(), nil, id, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil {
+			t.Errorf("stop %s: %v", id, err)
+		}
+	})
+	return id
+}
+
+// deny has the runtime write a denial of program to host:port to the
+// policy log of the sandbox id, with method and path ("" for a blocked
+// connection).
+func (h *denialHub) deny(id, program, host string, port int, method, path string) {
+	h.rt.EmitPolicyLog("parley", id, runtime.LogEntry{Action: "deny", Program: program, Host: host, Port: port, Method: method, Path: path})
+}
+
+// counted is the value of the denials metric.
+func (h *denialHub) counted() float64 { return h.rec.values(sandbox.DenialsMetric)[""] }
+
+// denials are the parley.sandbox.deny events of the sandbox id, oldest
+// first.
+func (h *denialHub) denials(t *testing.T, id string) []hubEvent {
+	t.Helper()
+	return h.sandboxEvents(t, sandbox.EventDeny, id)
+}
+
+// reported waits until the sandbox id has n parley.sandbox.deny events.
+func (h *denialHub) reported(t *testing.T, id string, n int) {
+	t.Helper()
+	eventually(t, fmt.Sprintf("%d denial events of %s", n, id), func() bool { return len(h.denials(t, id)) >= n })
+}
+
+// followed are the ids of the sandboxes with an open log stream, sorted.
+func (h *execHub) followed() []string {
+	var out []string
+	for _, s := range h.rt.Streams() {
+		if s.Op == runtime.OpLogs {
+			out = append(out, s.Sandbox)
+		}
+	}
+	slices.Sort(out)
 	return out
 }

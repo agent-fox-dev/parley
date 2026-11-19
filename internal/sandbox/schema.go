@@ -56,3 +56,23 @@ CREATE INDEX sandbox_approved_rules_sandbox ON sandbox_approved_rules (sandbox_i
 		return err
 	},
 }
+
+// DenialSchemaStep creates the destinations each sandbox has been reported
+// denied: one row per (program, host, port) of a sandbox, whose first
+// denial wrote a parley.sandbox.deny event. A row names its sandbox without
+// a foreign key: the purge hook removes the rows with the record.
+var DenialSchemaStep = store.Step{
+	Name:   "sandbox_denials",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+CREATE TABLE sandbox_denials (
+	sandbox_id TEXT NOT NULL,
+	program    TEXT NOT NULL,
+	host       TEXT NOT NULL,
+	port       INTEGER NOT NULL,
+	PRIMARY KEY (sandbox_id, program, host, port)
+);`)
+		return err
+	},
+}
