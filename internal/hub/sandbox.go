@@ -34,6 +34,11 @@ const (
 	// each follower returns once its runtime stream ends with its context.
 	sandboxLogCollectorWork  = "sandbox_log_collector"
 	sandboxLogCollectorGrace = 5 * time.Second
+	// sandboxLifecycleWork is the name of the lifecycle loop's background
+	// work, and sandboxLifecycleGrace how long the stop waits for it: a
+	// pass returns before its next runtime call once its context ends.
+	sandboxLifecycleWork  = "sandbox_lifecycle"
+	sandboxLifecycleGrace = 15 * time.Second
 	// sandboxLogRetentionTask is the name of the maintenance task that
 	// deletes the stored log lines past their retention.
 	sandboxLogRetentionTask = "sandbox_log_retention"
@@ -59,8 +64,9 @@ const (
 // the workspaces' repositories, in which a create resolves its checkout,
 // the secret component's resolution, through which a create resolves the
 // profile's credentials and exposed secrets, the access component's
-// MintBound and identity.RevokeTokenByID, through which a sandbox's hub
-// credential is minted and revoked, [server].external_url, the org lookup
+// MintBound, identity.RevokeTokenByID and identity.SetTokenExpiryByID,
+// through which a sandbox's hub credential is minted, revoked and given a
+// new expiry, [server].external_url, the org lookup
 // that names a workspace's git remote, the user lookup that gives a
 // checkout its commit identity and the hub's logger; the other
 // sandbox packages register their delete and purge hooks on the service.
@@ -81,8 +87,10 @@ const (
 // /workspaces/:slug/sandboxes/:id/checkpoint saves a ready sandbox's
 // working directory to its workspace through the service's checkpoint,
 // POST /workspaces/:slug/sandboxes/:id/stop stops a ready sandbox through
-// the service's stop, and DELETE /workspaces/:slug/sandboxes/:id deletes a
-// sandbox through the service's delete, which runs the delete hooks.
+// the service's stop, DELETE /workspaces/:slug/sandboxes/:id deletes a
+// sandbox through the service's delete, which runs the delete hooks, and
+// PATCH /workspaces/:slug/sandboxes/:id sets a sandbox's ttl, purpose and
+// labels through the service's extend.
 //
 // The output of each ready sandbox's main process and its policy log are
 // stored in a table of their own: with sandboxes on, the log collector runs
@@ -98,7 +106,10 @@ const (
 // changing a record. The service's restore is the restorer of the
 // provisionings: it seeds the working directory of a sandbox created from a
 // checkpoint, and that of a started sandbox whose working directory the
-// runtime lost.
+// runtime lost. The lifecycle loop runs as background work too: every
+// minute on the hub's clock it stops the sandboxes idle for longer than
+// their idle timeout and deletes those whose expires_at has come, which it
+// also does at a timer set to the earliest expires_at.
 //
 // The parts composed after this one reach the feature through
 // Composition.Sandbox; a test replaces the runtime client with
@@ -129,7 +140,8 @@ func composeSandbox(c *Composition) {
 				}
 				return c.Secrets().ResolveSecretsIn(ctx, q, slug, names)
 			},
-			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
+			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, SetTokenExpiry: identity.SetTokenExpiryByID,
+			ExternalURL: svc.ExternalURL(),
 			OrgSlug: func(ctx context.Context, id string) (string, error) {
 				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
 				return org.Slug, err
@@ -161,6 +173,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.StopRoute())
 	c.AddRoute(svc.StartRoute())
 	c.AddRoute(svc.DeleteRoute())
+	c.AddRoute(svc.ExtendRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
@@ -208,6 +221,9 @@ func composeSandbox(c *Composition) {
 	})
 	c.AddBackgroundWork(sandboxLogCollectorWork, sandboxLogCollectorGrace, func(ctx context.Context, _ *Runtime) {
 		svc.CollectLogs(ctx)
+	})
+	c.AddBackgroundWork(sandboxLifecycleWork, sandboxLifecycleGrace, func(ctx context.Context, _ *Runtime) {
+		svc.RunLifecycle(ctx)
 	})
 	c.AddMaintenanceTask(sandboxLogRetentionTask, func(ctx context.Context, _ *Runtime) error {
 		return svc.RetainLogs(ctx)

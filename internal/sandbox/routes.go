@@ -211,6 +211,19 @@ func (s *Service) DeleteRoute() server.Route {
 	})
 }
 
+// ExtendRoute declares PATCH /workspaces/:slug/sandboxes/:id: it sets the
+// ttl, purpose and labels the body gives on the sandbox id, which is not
+// deleted, and answers with the sandbox (see serveExtend). It needs the
+// scope sandboxes:write of a PAT and write access to the workspace; the
+// admin token acts as an owner.
+func (s *Service) ExtendRoute() server.Route {
+	return s.WorkspaceRoute(KindWrite, server.Route{
+		Method:  http.MethodPatch,
+		Pattern: "/workspaces/:slug/sandboxes/:id",
+		Handler: s.serveExtend,
+	})
+}
+
 // ListRoute declares GET /workspaces/:slug/sandboxes: the stored sandboxes
 // of the workspace, newest first, paged, filtered by the query (see
 // listWorkspaceSandboxes). It needs the scope sandboxes:read of a PAT and
