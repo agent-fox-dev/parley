@@ -44,6 +44,8 @@ type useRequest struct {
 	exec execRequest
 	// files is the query of a file transfer, as its validation read it.
 	files filesRequest
+	// logs is the query of a log read, as its validation read it.
+	logs logsRequest
 }
 
 // useEntry is one route that uses a sandbox, under
@@ -94,7 +96,7 @@ func (s *Service) useTable() []*useEntry {
 		},
 		{
 			name: useLogs, method: http.MethodGet, segment: "logs", kind: KindRead,
-			operate: pendingOperation,
+			validate: validateLogs, operate: s.serveLogs,
 		},
 		{
 			name: useAttach, method: http.MethodGet, segment: "attach", kind: KindWrite, covers: true,

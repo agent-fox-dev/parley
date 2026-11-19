@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"io"
 	"maps"
+	"net/http"
+	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -295,4 +299,249 @@ func TestLogRetention_DeletesOldLinesAndLinesWithoutARecord(t *testing.T) {
 	if got := h.lines(t, id, ""); len(got) != 0 {
 		t.Errorf("after the purge the sandbox has the lines %+v, want none", got)
 	}
+}
+
+func TestLogs_ReadsTheStoredLines(t *testing.T) {
+	t.Parallel()
+	h := startUseSandboxHub(t, "")
+	id := h.sandbox(t, nil)
+	h.seedLines(t, id)
+	all := []string{"p1", "d1", "p2", "p3"}
+
+	t.Run("in pages, oldest first", func(t *testing.T) {
+		a := h.logsAs(t, h.key, id, "")
+		if lines, next := logPage(t, a); !slices.Equal(lines, all) || next != "" {
+			t.Fatalf("logs = %q with next_cursor %q, want %q and null", lines, next, all)
+		}
+		var page struct{ Items []map[string]any }
+		if err := json.Unmarshal(a.body, &page); err != nil {
+			t.Fatalf("decode %s: %v", a.body, err)
+		}
+		p1, d1 := page.Items[0], page.Items[1]
+		if p1["time"] != "2026-11-18T10:00:00Z" || p1["source"] != "process" || p1["stream"] != "stdout" {
+			t.Errorf("the first item is %v, want a stdout process line at 10:00:00", p1)
+		}
+		if d1["source"] != "policy" || d1["stream"] != nil || d1["action"] != "deny" || d1["host"] != "example.com" {
+			t.Errorf("the second item is %v, want the policy entry", d1)
+		}
+
+		lines, next := logPage(t, h.logsAs(t, h.key, id, "limit=3"))
+		if !slices.Equal(lines, all[:3]) || next == "" {
+			t.Fatalf("limit=3 = %q with next_cursor %q, want %q and a cursor", lines, next, all[:3])
+		}
+		if lines, next = logPage(t, h.logsAs(t, h.key, id, "limit=3&cursor="+url.QueryEscape(next))); !slices.Equal(lines, all[3:]) || next != "" {
+			t.Errorf("the next page = %q with next_cursor %q, want [p3] and null", lines, next)
+		}
+
+		if a := h.logsAs(t, h.key, h.sandbox(t, nil), ""); a.status != http.StatusOK || !strings.Contains(string(a.body), `"items":[]`) {
+			t.Errorf("the logs of a sandbox without lines = %d %s, want 200 with items []", a.status, a.body)
+		}
+		for _, q := range []string{"limit=0", "limit=201"} {
+			if a := h.logsAs(t, h.key, id, q); a.status != http.StatusBadRequest {
+				t.Errorf("%s = %d %s, want 400", q, a.status, a.body)
+			}
+		}
+	})
+
+	t.Run("selected by source, since and tail", func(t *testing.T) {
+		for _, tc := range []struct {
+			query string
+			pages [][]string
+		}{
+			{"source=process", [][]string{{"p1", "p2", "p3"}}},
+			{"source=policy", [][]string{{"d1"}}},
+			{"since=2026-11-18T10:00:02Z", [][]string{{"p2", "p3"}}},
+			{"since=2026-11-18T11:00:02%2B01:00", [][]string{{"p2", "p3"}}},
+			{"since=2026-11-18T10:00:01.5Z", [][]string{{"p2", "p3"}}},
+			{"since=2026-11-18T10:00:04Z", [][]string{nil}},
+			{"tail=2", [][]string{{"p2", "p3"}}},
+			{"tail=99", [][]string{all}},
+			{"source=process&tail=2", [][]string{{"p2", "p3"}}},
+			{"source=process&since=2026-11-18T10:00:01Z&tail=1", [][]string{{"p3"}}},
+			{"tail=3&limit=2", [][]string{{"d1", "p2"}, {"p3"}}},
+		} {
+			t.Run(tc.query, func(t *testing.T) {
+				var got [][]string
+				lines, next := logPage(t, h.logsAs(t, h.key, id, tc.query))
+				got = append(got, lines)
+				for next != "" && len(got) <= len(tc.pages) {
+					lines, next = logPage(t, h.logsAs(t, h.key, id, tc.query+"&cursor="+url.QueryEscape(next)))
+					got = append(got, lines)
+				}
+				if !reflect.DeepEqual(got, tc.pages) {
+					t.Errorf("the pages are %q, want %q", got, tc.pages)
+				}
+			})
+		}
+	})
+
+	t.Run("refuses an invalid query and opens no stream", func(t *testing.T) {
+		for _, q := range []string{
+			"source=runtime", "since=yesterday", "tail=0", "tail=-1", "tail=x", "follow=yes",
+			"follow=true&cursor=abc", "follow=true&limit=10",
+		} {
+			a := h.logsAs(t, h.key, id, q)
+			if a.status != http.StatusBadRequest || a.err.ErrorType != "invalid_request" ||
+				!strings.HasPrefix(a.header.Get("Content-Type"), "application/json") {
+				t.Errorf("%s = %d %s (Content-Type %q), want 400 invalid_request as JSON", q, a.status, a.body, a.header.Get("Content-Type"))
+			}
+		}
+	})
+
+	t.Run("from the hub's store in every state, without the runtime", func(t *testing.T) {
+		ha := &sandbox.HubAccess{Scopes: []string{"git:write"}}
+		// The credential holds both sandbox scopes but not the sandbox's
+		// hub credential: it may read the logs and act in no sandbox.
+		narrow := h.pat(t, h.owner, "sandboxes:read", "sandboxes:write")
+		for _, state := range []string{
+			sandbox.StateProvisioning, sandbox.StateReady, sandbox.StateStopped,
+			sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted,
+		} {
+			sid := h.sandbox(t, func(r *sandbox.Record) {
+				r.State, r.HubAccess = state, ha
+				if state != sandbox.StateProvisioning && state != sandbox.StateReady {
+					r.EndedAt = &r.CreatedAt
+				}
+			})
+			h.seedLines(t, sid)
+			if state == sandbox.StateReady {
+				if a := h.execAs(t, narrow, sid, map[string]any{"command": []string{"true"}}, nil); a.status != http.StatusForbidden {
+					t.Fatalf("an exec with the narrow credential = %d %s, want 403", a.status, a.body)
+				}
+			}
+			for _, reachable := range []bool{true, false} {
+				t.Run(state+", runtime reachable "+strconv.FormatBool(reachable), func(t *testing.T) {
+					h.rt.SetUnreachable(!reachable)
+					defer h.rt.SetUnreachable(false)
+					before := requestCalls(h.rt)
+					if lines, _ := logPage(t, h.logsAs(t, narrow, sid, "")); !slices.Equal(lines, all) {
+						t.Errorf("logs = %q, want %q", lines, all)
+					}
+					if n := requestCalls(h.rt) - before; n != 0 {
+						t.Errorf("the read made %d runtime calls, want none", n)
+					}
+				})
+			}
+		}
+	})
+}
+
+// startFollowHub starts a log hub without the provisioner, whose timers of
+// a second would otherwise share the clock with those of the followed log
+// streams.
+func startFollowHub(t *testing.T) *logHub {
+	t.Helper()
+	h := &logHub{}
+	h.execHub = newExecHub(t, "", func(cfg *hubtest.Config) {
+		compose := cfg.Compose
+		cfg.Compose = func(c *hub.Composition) {
+			compose(c)
+			c.AdjustSandbox(func(d *sandbox.Deps) { d.HoldProvisioning = true })
+		}
+	})
+	return h
+}
+
+func TestLogs_FollowsTheStoredLines(t *testing.T) {
+	t.Parallel()
+	h := startFollowHub(t)
+	ctx := context.Background()
+	// waits is the number of times the followed streams have waited for
+	// new lines; poll has the stream that waits the n-th time read the
+	// store, as its timer does.
+	waits := func() int { return h.timers.created(sandbox.LogFollowInterval) }
+	poll := func(n int) {
+		t.Helper()
+		eventually(t, "the stream to wait for new lines", func() bool { return waits() >= n })
+		h.clock.Advance(sandbox.LogFollowInterval)
+	}
+	wantFrame := func(t *testing.T, s *frameReader, line string) frame {
+		t.Helper()
+		f, ok := s.next(t)
+		if !ok || f.event != "log" || f.data["line"] != line {
+			t.Fatalf("the next frame is %+v (stream open %t), want a log frame of %s", f, ok, line)
+		}
+		return f
+	}
+	wantEnd := func(t *testing.T, s *frameReader) {
+		t.Helper()
+		start := time.Now()
+		if rest := s.rest(t); len(rest) != 0 {
+			t.Errorf("the stream sent %+v more, want it to end", rest)
+		}
+		if took := time.Since(start); took > 2*time.Second {
+			t.Errorf("the stream took %v to end, want at most 2 s", took)
+		}
+	}
+
+	t.Run("sends the selected lines, then each new one", func(t *testing.T) {
+		id := h.sandbox(t, nil)
+		h.seedLines(t, id)
+		base := waits()
+		s := h.followLogs(t, ctx, id, "follow=true&source=process&tail=1")
+		if cc := s.resp.Header.Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("Cache-Control = %q, want no-cache", cc)
+		}
+		wantFrame(t, s, "p3")
+
+		// The tail placed only the first lines: both new lines are sent.
+		h.storeLines(t, id, policyLine(4, "d2"), processLine(4, "stdout", "p4"), processLine(4, "stderr", "p5"))
+		poll(base + 1)
+		f := wantFrame(t, s, "p4")
+		if got := members(t, f.data); !slices.Equal(got, []string{"line", "source", "stream", "time"}) {
+			t.Errorf("the frame's data has the members %v, want line, source, stream and time", got)
+		}
+		wantFrame(t, s, "p5")
+
+		// A line the collector stores reaches the stream without its timer.
+		eventually(t, "the stream to wait for new lines", func() bool { return waits() >= base+2 })
+		h.follow(t, id)
+		h.emit(id, runtime.Stdout, "p6\n")
+		wantFrame(t, s, "p6")
+
+		if applied, err := h.svc.Transition(ctx, nil, id, sandbox.StateReady, sandbox.StateDeleted, "", nil); err != nil || !applied {
+			t.Fatalf("Transition to deleted = %t, %v", applied, err)
+		}
+		wantEnd(t, s)
+	})
+
+	t.Run("ends once the sandbox is deleted or the hub stops", func(t *testing.T) {
+		id := h.sandbox(t, nil)
+		h.seedLines(t, id)
+		base := waits()
+		s := h.followLogs(t, ctx, id, "follow=true")
+		for _, line := range []string{"p1", "d1", "p2", "p3"} {
+			wantFrame(t, s, line)
+		}
+
+		eventually(t, "the stream to wait for new lines", func() bool { return waits() >= base+1 })
+		if applied, err := h.svc.Transition(ctx, nil, id, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil || !applied {
+			t.Fatalf("Transition to stopped = %t, %v", applied, err)
+		}
+		// The transition wakes the stream, which waits again once it read
+		// the record.
+		eventually(t, "the stream to wait again", func() bool { return waits() >= base+2 })
+		h.storeLines(t, id, processLine(5, "stdout", "p5"))
+		poll(base + 2)
+		wantFrame(t, s, "p5")
+
+		h.storeLines(t, id, processLine(6, "stdout", "p6"))
+		if applied, err := h.svc.Transition(ctx, nil, id, sandbox.StateStopped, sandbox.StateDeleted, "", nil); err != nil || !applied {
+			t.Fatalf("Transition to deleted = %t, %v", applied, err)
+		}
+		wantFrame(t, s, "p6")
+		wantEnd(t, s)
+
+		other := h.sandbox(t, nil)
+		h.seedLines(t, other)
+		s = h.followLogs(t, ctx, other, "follow=true&tail=1")
+		wantFrame(t, s, "p3")
+		h.storeLines(t, other, processLine(7, "stdout", "last"))
+		h.Stop()
+		wantFrame(t, s, "last")
+		wantEnd(t, s)
+		if code := h.ExitCode(t, 10*time.Second); code != 0 {
+			t.Fatalf("the hub stopped with %d, want 0", code)
+		}
+	})
 }

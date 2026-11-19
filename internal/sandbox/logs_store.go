@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/access"
@@ -104,7 +105,13 @@ func (l LogLine) MarshalJSON() ([]byte, error) {
 type LogSelection struct {
 	// Source keeps the lines of one source; "" keeps both.
 	Source string
-	// After keeps the lines stored after the line of that Seq; 0 keeps all.
+	// Since, when not zero, keeps the lines whose time is at or after it.
+	Since time.Time
+	// Tail, when above 0, keeps the last Tail lines that Source and Since
+	// keep.
+	Tail int
+	// After keeps, of those, the lines stored after the line of that Seq; 0
+	// keeps all.
 	After int64
 	// Limit, when above 0, keeps the first Limit lines.
 	Limit int
@@ -117,11 +124,29 @@ const logColumns = `seq, time, source, stream, line, action, program, host, port
 // LogLines reads the stored lines of the sandbox sandboxID that sel
 // selects through q, in the order of storage.
 func LogLines(ctx context.Context, q access.Querier, sandboxID string, sel LogSelection) ([]LogLine, error) {
-	query := `SELECT ` + logColumns + ` FROM sandbox_logs WHERE sandbox_id = ? AND seq > ?`
-	args := []any{sandboxID, sel.After}
+	where := `sandbox_id = ?`
+	selArgs := []any{sandboxID}
 	if sel.Source != "" {
-		query += ` AND source = ?`
-		args = append(args, sel.Source)
+		where += ` AND source = ?`
+		selArgs = append(selArgs, sel.Source)
+	}
+	if !sel.Since.IsZero() {
+		// Times are whole seconds: a line at or after a time inside a
+		// second is a line of a later second.
+		since := sel.Since.Unix()
+		if sel.Since.After(time.Unix(since, 0)) {
+			since++
+		}
+		where += ` AND time >= ?`
+		selArgs = append(selArgs, since)
+	}
+	query := `SELECT ` + logColumns + ` FROM sandbox_logs WHERE ` + where + ` AND seq > ?`
+	args := append(slices.Clone(selArgs), sel.After)
+	if sel.Tail > 0 {
+		// The last Tail lines are those after the line Tail places before
+		// the end, or all of them when there are not that many.
+		query += ` AND seq > coalesce((SELECT seq FROM sandbox_logs WHERE ` + where + ` ORDER BY seq DESC LIMIT 1 OFFSET ?), 0)`
+		args = append(append(args, selArgs...), sel.Tail)
 	}
 	query += ` ORDER BY seq`
 	if sel.Limit > 0 {

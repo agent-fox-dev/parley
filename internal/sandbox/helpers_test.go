@@ -2300,8 +2300,10 @@ type execHub struct {
 	*probeHub
 	svc   *sandbox.Service
 	clock *hubtest.JobClock
-	cmds  *commands
-	key   string
+	// timers keeps the timers the sandbox service asked the clock for.
+	timers *timerLog
+	cmds   *commands
+	key    string
 }
 
 // startExecHub starts an exec hub that runs at most maxExecs commands at
@@ -2326,7 +2328,7 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	t.Helper()
 	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
 	h := &execHub{
-		probeHub: &probeHub{rt: runtimetest.New(t, runtimetest.WithClock(clock.Now))}, clock: clock,
+		probeHub: &probeHub{rt: runtimetest.New(t, runtimetest.WithClock(clock.Now))}, clock: clock, timers: &timerLog{},
 		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}},
 	}
 	h.rt.SetExec(h.cmds.run)
@@ -2341,7 +2343,7 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 		})
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			d.Now = h.clock.Now
-			d.NewTimer = func(x time.Duration) sandbox.Timer { return h.clock.NewTimer(x) }
+			d.NewTimer = func(x time.Duration) sandbox.Timer { return h.timers.track(x, h.clock.NewTimer(x)) }
 		})
 	}
 	if edit != nil {
@@ -2577,9 +2579,17 @@ func (h *execHub) streaming(t *testing.T, ctx context.Context, id string, body a
 	if err != nil {
 		t.Fatalf("build the request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+h.key)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	return h.eventStream(t, req, "exec")
+}
+
+// eventStream sends req as the owner and returns the answer's stream once
+// its headers arrived, failing unless it is 200 and an event stream; what
+// names the request in a failure.
+func (h *execHub) eventStream(t *testing.T, req *http.Request, what string) *frameReader {
+	t.Helper()
+	req.Header.Set("Authorization", "Bearer "+h.key)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("send the request: %v", err)
@@ -2587,7 +2597,7 @@ func (h *execHub) streaming(t *testing.T, ctx context.Context, id string, body a
 	t.Cleanup(func() { _ = resp.Body.Close() })
 	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("exec = %d %.300s (Content-Type %q), want 200 and an event stream", resp.StatusCode, b, resp.Header.Get("Content-Type"))
+		t.Fatalf("%s = %d %.300s (Content-Type %q), want 200 and an event stream", what, resp.StatusCode, b, resp.Header.Get("Content-Type"))
 	}
 	lines := bufio.NewScanner(resp.Body)
 	lines.Buffer(nil, 1<<20)
@@ -2930,4 +2940,88 @@ func (h *logHub) pass(t *testing.T) {
 	t.Helper()
 	from := h.passes.Load()
 	eventually(t, "a maintenance pass", func() bool { return h.passes.Load() >= from+2 })
+}
+
+// logsAs sends GET …/logs?query for the sandbox id of ws with cred as the
+// bearer credential, and reads the answer with its headers and its error
+// envelope, if it has one.
+func (h *execHub) logsAs(t *testing.T, cred, id, query string) answer {
+	t.Helper()
+	var a answer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodGet, "/api/v1"+sandboxPath("ws", id)+"/logs?"+query, cred, nil, nil)
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
+}
+
+// logPage reads the page of log lines the answer a holds, which must be
+// 200 with an items array: the line member of each item, in order, and
+// next_cursor, "" for null.
+func logPage(t *testing.T, a answer) (lines []string, next string) {
+	t.Helper()
+	var page struct {
+		Items      *[]struct{ Line string } `json:"items"`
+		NextCursor *string                  `json:"next_cursor"`
+	}
+	if a.status != http.StatusOK || json.Unmarshal(a.body, &page) != nil || page.Items == nil {
+		t.Fatalf("logs = %d %.300s, want 200 with an items array", a.status, a.body)
+	}
+	for _, item := range *page.Items {
+		lines = append(lines, item.Line)
+	}
+	if page.NextCursor != nil {
+		next = *page.NextCursor
+	}
+	return lines, next
+}
+
+// followLogs sends GET …/logs?query for the sandbox id of ws as the owner,
+// under ctx and at most 10 s, and returns the answer's event stream once
+// its headers arrived; the test closes it.
+func (h *execHub) followLogs(t *testing.T, ctx context.Context, id, query string) *frameReader {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.URL("/api/v1"+sandboxPath("ws", id)+"/logs?"+query), nil)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	return h.eventStream(t, req, "logs")
+}
+
+// storeLines stores lines as log lines of the sandbox id, as the collector
+// does, but without telling the followed streams.
+func (h *execHub) storeLines(t *testing.T, id string, lines ...sandbox.LogLine) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Store.Tx(ctx, func(tx *sql.Tx) error { return sandbox.InsertLogLines(ctx, tx, id, lines) }); err != nil {
+		t.Fatalf("store log lines of %s: %v", id, err)
+	}
+}
+
+// processLine is a line of the main process's stream at the second sec
+// after recordStart.
+func processLine(sec int, stream, line string) sandbox.LogLine {
+	return sandbox.LogLine{Time: recordStart.Add(time.Duration(sec) * time.Second), Source: sandbox.LogSourceProcess, Stream: stream, Line: line}
+}
+
+// policyLine is a policy entry that denies a connection to example.com:443
+// at the second sec after recordStart.
+func policyLine(sec int, line string) sandbox.LogLine {
+	return sandbox.LogLine{
+		Time: recordStart.Add(time.Duration(sec) * time.Second), Source: sandbox.LogSourcePolicy, Line: line,
+		Action: "deny", Program: "/usr/bin/curl", Host: "example.com", Port: 443,
+	}
+}
+
+// seedLines stores the lines p1 (stdout), d1 (a policy entry), p2 (stderr)
+// and p3 (stdout) of the sandbox id, in this order, a second apart from
+// recordStart.
+func (h *execHub) seedLines(t *testing.T, id string) {
+	t.Helper()
+	h.storeLines(t, id, processLine(0, "stdout", "p1"), policyLine(1, "d1"), processLine(2, "stderr", "p2"), processLine(3, "stdout", "p3"))
 }
