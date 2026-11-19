@@ -309,16 +309,18 @@ func (x *executor) collect(w http.ResponseWriter, r *http.Request, u useRequest)
 		}
 	}
 	answer := execAnswer{Truncated: stdout.lost || stderr.lost}
+	// The timeout is asked first: a runtime may report the code of the
+	// process it killed as an exit, and the caller is told it timed out.
 	switch code, err := e.stream.ExitCode(); {
 	case e.abandoned():
 		e.end()
 		panic(http.ErrAbortHandler)
-	case err == nil:
-		answer.ExitCode = &code
-		u.act.exited(&code)
 	case e.timedOut.Load():
 		answer.TimedOut = true
 		u.act.exited(nil)
+	case err == nil:
+		answer.ExitCode = &code
+		u.act.exited(&code)
 	default:
 		e.end()
 		return err

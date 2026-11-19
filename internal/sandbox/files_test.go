@@ -336,6 +336,26 @@ func TestDownload_SendsADirectoryOrAFileAsATarStream(t *testing.T) {
 			t.Errorf("entries = %+v, want %+v", got, want)
 		}
 	})
+	t.Run("named from the requested path when the runtime reports others", func(t *testing.T) {
+		h.quirks.canonical.Store(true)
+		defer h.quirks.canonical.Store(false)
+		for _, tc := range []struct {
+			query string
+			want  map[string]untarred
+		}{
+			{"path=proj&archive=tar", map[string]untarred{
+				"src/":        {dir: true, mode: 0o755},
+				"src/main.go": {mode: 0o644, body: "package main"},
+				"run.sh":      {mode: 0o755, body: "#!/bin/sh"},
+			}},
+			{"path=out.txt&archive=tar", map[string]untarred{"out.txt": {mode: 0o644, body: "result"}}},
+		} {
+			got := untar(t, h.mustDownload(t, id, tc.query))
+			if !maps.Equal(got, tc.want) {
+				t.Errorf("%s: entries = %+v, want %+v", tc.query, got, tc.want)
+			}
+		}
+	})
 	t.Run("an empty directory", func(t *testing.T) {
 		for name, e := range untar(t, h.mustDownload(t, id, "path=emptydir&archive=tar")) {
 			if !e.dir {

@@ -2308,7 +2308,10 @@ type execHub struct {
 	cmds   *commands
 	// terms records the terminals the hub opens.
 	terms *terminals
-	key   string
+	// quirks makes the hub's runtime client answer as a runtime other
+	// than the fake may.
+	quirks *runtimeQuirks
+	key    string
 }
 
 // startExecHub starts an exec hub that runs at most maxExecs commands at
@@ -2335,7 +2338,7 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	clock := hubtest.NewJobClock(func() time.Time { return recordStart })
 	h := &execHub{
 		probeHub: &probeHub{rt: runtimetest.New(t, runtimetest.WithClock(clock.Now))}, clock: clock, timers: &timerLog{},
-		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}}, terms: &terminals{},
+		cmds: &commands{scripts: map[string]runtimetest.ExecFunc{}}, terms: &terminals{}, quirks: &runtimeQuirks{},
 	}
 	h.rt.SetExec(h.cmds.run)
 	cfg := sandboxesOn
@@ -2345,7 +2348,8 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc = c.Sandbox()
 		c.SetSandboxRuntime(func(s *sandbox.Settings, deps sandbox.RuntimeDeps) (runtime.Client, error) {
-			return &terminalClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), terms: h.terms}, nil
+			terms := &terminalClient{Client: h.rt.Client(s.OpenShellWorkspace, deps.Recorder), terms: h.terms}
+			return &quirkClient{Client: terms, quirks: h.quirks}, nil
 		})
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			d.Now = h.clock.Now
@@ -3163,6 +3167,63 @@ func (c *terminalClient) ExecInteractive(ctx context.Context, name string, req r
 	c.terms.list = append(c.terms.list, o)
 	c.terms.mu.Unlock()
 	return o, nil
+}
+
+// runtimeQuirks are answers a runtime may give that the fake does not.
+type runtimeQuirks struct {
+	// killedCode reports the exit code of a killed command as 137 without
+	// an error.
+	killedCode atomic.Bool
+	// canonical has Stat report a path under /srv/sandbox, and Walk add
+	// directories outside the directory it was asked for.
+	canonical atomic.Bool
+}
+
+// quirkClient is a runtime client that answers with the quirks set.
+type quirkClient struct {
+	runtime.Client
+	quirks *runtimeQuirks
+}
+
+func (c *quirkClient) ExecStream(ctx context.Context, name string, req runtime.ExecRequest) (runtime.ExecStream, error) {
+	s, err := c.Client.ExecStream(ctx, name, req)
+	if err != nil || !c.quirks.killedCode.Load() {
+		return s, err
+	}
+	return &killedCodeStream{ExecStream: s, ctx: ctx}, nil
+}
+
+// killedCodeStream is an exec stream whose command, once killed through
+// ctx, reports exit code 137 without an error.
+type killedCodeStream struct {
+	runtime.ExecStream
+	ctx context.Context
+}
+
+func (s *killedCodeStream) ExitCode() (int, error) {
+	code, err := s.ExecStream.ExitCode()
+	if err != nil && s.ctx.Err() != nil {
+		return 137, nil
+	}
+	return code, err
+}
+
+func (c *quirkClient) Stat(ctx context.Context, name, p string) (runtime.FileInfo, error) {
+	fi, err := c.Client.Stat(ctx, name, p)
+	if err == nil && c.quirks.canonical.Load() {
+		fi.Path = "/srv/sandbox" + fi.Path
+	}
+	return fi, err
+}
+
+func (c *quirkClient) Walk(ctx context.Context, name, dir string) ([]runtime.FileInfo, error) {
+	out, err := c.Client.Walk(ctx, name, dir)
+	if err == nil && c.quirks.canonical.Load() {
+		for _, p := range []string{"/srv/sandbox" + dir + "/canonical", dir + "-sibling", "/etc", dir} {
+			out = append(out, runtime.FileInfo{Path: p, Dir: true, Mode: fs.ModeDir | 0o755})
+		}
+	}
+	return out, err
 }
 
 // openTerminals is the number of terminals of the sandbox id the runtime rt

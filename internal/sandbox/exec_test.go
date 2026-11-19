@@ -172,14 +172,17 @@ func TestExec_KillsACommandThatOutlastsItsTimeout(t *testing.T) {
 	h.cmds.set("block", h.cmds.blocking("partial", "late"))
 	id := h.sandbox(t, nil)
 	for _, row := range []struct {
-		name    string
-		timeout string
-		limit   time.Duration
+		name       string
+		timeout    string
+		limit      time.Duration
+		killedCode bool
 	}{
-		{"the default timeout", "", time.Minute},
-		{"the body's timeout", "2s", 2 * time.Second},
+		{"the default timeout", "", time.Minute, false},
+		{"the body's timeout", "2s", 2 * time.Second, false},
+		{"a runtime that reports the killed command's code", "2s", 2 * time.Second, true},
 	} {
 		t.Run(row.name, func(t *testing.T) {
+			h.quirks.killedCode.Store(row.killedCode)
 			body := map[string]any{"command": []string{"block"}}
 			if row.timeout != "" {
 				body["timeout"] = row.timeout
@@ -576,18 +579,30 @@ func TestExec_StreamKillsACommandThatOutlastsItsTimeout(t *testing.T) {
 	h := startExecHub(t, 8)
 	h.cmds.set("block", h.cmds.blocking("partial", ""))
 	id := h.sandbox(t, nil)
-	s := h.streaming(t, context.Background(), id, map[string]any{"command": []string{"block"}, "timeout": "2s"})
-	if f, ok := s.next(t); !ok || f.event != "stdout" || string(f.output(t)) != "partial" {
-		t.Fatalf("the first frame = %+v (%v), want stdout partial", f, ok)
-	}
-	h.clock.Advance(2 * time.Second)
-	frames := s.rest(t)
-	if len(frames) != 1 || frames[0].event != "exit" {
-		t.Fatalf("after the timeout the stream sent %+v, want one exit frame", frames)
-	}
-	wantMembers(t, frames[0].data, map[string]any{"exit_code": nil, "timed_out": true, "duration_ms": 2000.0})
-	if _, _, _, kills := h.cmds.counts(); kills != 1 {
-		t.Errorf("the runtime killed %d commands, want 1", kills)
+	for _, row := range []struct {
+		name       string
+		killedCode bool
+	}{
+		{"a runtime that reports a killed command without a code", false},
+		{"a runtime that reports the killed command's code", true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h.quirks.killedCode.Store(row.killedCode)
+			_, _, _, before := h.cmds.counts()
+			s := h.streaming(t, context.Background(), id, map[string]any{"command": []string{"block"}, "timeout": "2s"})
+			if f, ok := s.next(t); !ok || f.event != "stdout" || string(f.output(t)) != "partial" {
+				t.Fatalf("the first frame = %+v (%v), want stdout partial", f, ok)
+			}
+			h.clock.Advance(2 * time.Second)
+			frames := s.rest(t)
+			if len(frames) != 1 || frames[0].event != "exit" {
+				t.Fatalf("after the timeout the stream sent %+v, want one exit frame", frames)
+			}
+			wantMembers(t, frames[0].data, map[string]any{"exit_code": nil, "timed_out": true, "duration_ms": 2000.0})
+			if _, _, _, kills := h.cmds.counts(); kills-before != 1 {
+				t.Errorf("the runtime killed %d commands, want 1", kills-before)
+			}
+		})
 	}
 }
 

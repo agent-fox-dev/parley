@@ -3,11 +3,14 @@ package sandbox_test
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"slices"
 	"testing"
 	"time"
+
+	"golang.org/x/net/websocket"
 
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -33,9 +36,13 @@ func TestAttach_ServesAShellOverAWebSocket(t *testing.T) {
 				t.Errorf("attach?%s opened %v in %q on %v, want [/bin/sh] in %s on %v", c.query, term.req.Command, term.req.WorkDir, term.size, sandbox.WorkDir, c.size)
 			}
 			// The runtime holds the sandbox's environment and lays the
-			// request's over it; the hub adds nothing to it.
+			// request's over it; the hub adds nothing to it, so the shell
+			// gets the sandbox's.
 			if len(term.req.Env) != 0 {
 				t.Errorf("attach?%s sent the environment %v, want the sandbox's alone", c.query, term.req.Env)
+			}
+			if spec, ok := h.rt.Spec("parley", id); !ok || spec.Env["PARLEY_SANDBOX_ID"] != id {
+				t.Errorf("the runtime holds the environment %v for the sandbox (%v), want PARLEY_SANDBOX_ID=%s", spec.Env, ok, id)
 			}
 			_ = ws.Close()
 		}
@@ -73,6 +80,19 @@ func TestAttach_ServesAShellOverAWebSocket(t *testing.T) {
 			if got := term.resized(); !slices.Equal(got, want) {
 				t.Errorf("after %s the resizes are %v, want %v", text, got, want)
 			}
+		}
+	})
+
+	t.Run("ends the connection and closes the terminal on a frame over 1 MiB", func(t *testing.T) {
+		ws := h.attach(t, id, "")
+		term := h.terms.last(t, id)
+		// The hub may close before the whole frame is written.
+		go func() { _ = websocket.Message.Send(ws, make([]byte, 1<<20+1)) }()
+		within(t, time.Second, "the terminal to close", func() bool { return term.closedByHub() && openTerminals(h.rt, id) == 0 })
+		f, err := receiveWithin(ws, time.Second)
+		var netErr net.Error
+		if err == nil || (errors.As(err, &netErr) && netErr.Timeout()) {
+			t.Errorf("the receive after the frame = %d bytes, %v; want the end of the connection within 1 s", len(f.data), err)
 		}
 	})
 
@@ -158,6 +178,9 @@ func TestAttach_RefusesARequestBeforeTheUpgrade(t *testing.T) {
 		"Connection": {"Upgrade"}, "Upgrade": {"websocket"},
 		"Sec-Websocket-Key": {"dGhlIHNhbXBsZSBub25jZQ=="}, "Sec-Websocket-Version": {"13"},
 	}
+	// x/net's handshake reads only the first Connection header.
+	secondConnection := maps.Clone(upgrade)
+	secondConnection["Connection"] = []string{"keep-alive", "Upgrade"}
 	// Serial subtests: each counts the terminals opened around its request.
 	for _, c := range []struct {
 		name, id, cred, query string
@@ -167,6 +190,7 @@ func TestAttach_RefusesARequestBeforeTheUpgrade(t *testing.T) {
 		errorType             string
 	}{
 		{"a plain GET", ready, h.key, "", nil, false, 400, "invalid_request"},
+		{"Upgrade only in a second Connection header", ready, h.key, "", secondConnection, false, 400, "invalid_request"},
 		{"cols 0", ready, h.key, "cols=0", upgrade, false, 400, "invalid_request"},
 		{"rows 1001", ready, h.key, "rows=1001", upgrade, false, 400, "invalid_request"},
 		{"cols abc", ready, h.key, "cols=abc", upgrade, false, 400, "invalid_request"},

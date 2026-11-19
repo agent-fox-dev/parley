@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,11 @@ const (
 	maxTerminalSide = 1000
 	// terminalChunk is the most terminal output one binary frame carries.
 	terminalChunk = 32 << 10
+	// maxCallerFrame is the largest frame a caller may send, in bytes; a
+	// larger one ends the connection. Keystrokes, pasted text and resize
+	// frames are far smaller, and the library's default of 32 MiB would let
+	// a caller make the hub hold that much for every frame.
+	maxCallerFrame = 1 << 20
 )
 
 // attachShell is the command an attach runs: a new shell, never the main
@@ -40,14 +46,12 @@ type attachRequest struct {
 }
 
 // validateAttach checks that r is a WebSocket upgrade and reads the size of
-// its terminal into u, answering 400 invalid_request otherwise. It checks
-// every header the upgrade needs, so that once the terminal is open the
-// upgrade does not fail for a reason a client could have been told.
+// its terminal into u, answering 400 invalid_request otherwise. It judges
+// the upgrade as the WebSocket library does (see upgradeAccepted), so that
+// once the terminal is open the upgrade does not fail for a reason a client
+// could have been told.
 func validateAttach(r *http.Request, u *useRequest) error {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") ||
-		!headerHasToken(r.Header, "Connection", "upgrade") ||
-		r.Header.Get("Sec-WebSocket-Key") == "" ||
-		r.Header.Get("Sec-WebSocket-Version") != "13" {
+	if !upgradeAccepted(r) {
 		return server.InvalidRequest("this route takes a WebSocket upgrade (version 13)")
 	}
 	query := r.URL.Query()
@@ -63,17 +67,25 @@ func validateAttach(r *http.Request, u *useRequest) error {
 	return nil
 }
 
-// headerHasToken reports whether one of the comma-separated values of the
-// header name is token, in any case.
-func headerHasToken(h http.Header, name, token string) bool {
-	for _, v := range h.Values(name) {
-		for t := range strings.SplitSeq(v, ",") {
-			if strings.EqualFold(strings.TrimSpace(t), token) {
-				return true
-			}
-		}
+// upgradeAccepted reports whether golang.org/x/net/websocket's server
+// handshake accepts r, checking what it checks and nothing looser: it reads
+// only the first value of each header, finds "upgrade" anywhere in the
+// first Connection value, and refuses more than one offered protocol when
+// the server picks none. The terminal is opened before the upgrade, so an
+// upgrade the library refused would open and record a terminal for
+// nothing.
+func upgradeAccepted(r *http.Request) bool {
+	h := r.Header
+	if r.Method != http.MethodGet ||
+		strings.ToLower(h.Get("Upgrade")) != "websocket" ||
+		!strings.Contains(strings.ToLower(h.Get("Connection")), "upgrade") ||
+		h.Get("Sec-Websocket-Key") == "" ||
+		h.Get("Sec-Websocket-Version") != "13" ||
+		strings.Contains(h.Get("Sec-Websocket-Protocol"), ",") {
+		return false
 	}
-	return false
+	_, err := url.ParseRequestURI("ws://" + r.Host + r.URL.RequestURI())
+	return err == nil
 }
 
 // readTerminalSide reads the query parameter name as a number of columns or
@@ -111,6 +123,7 @@ func (s *Service) attach(w http.ResponseWriter, r *http.Request, u useRequest) e
 		// is authenticated by its Authorization header, as on every route.
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },
 		Handler: func(conn *websocket.Conn) {
+			conn.MaxPayloadBytes = maxCallerFrame
 			s.relay(ctx, conn, term, u.rec.ID, s.inputActivity(ctx, u.rec.ID, opened))
 		},
 	}

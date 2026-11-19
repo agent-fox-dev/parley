@@ -101,15 +101,17 @@ func (x *executor) stream(w http.ResponseWriter, r *http.Request, u useRequest) 
 		}
 	}
 	var exit exitFrame
+	// The timeout is asked first: a runtime may report the code of the
+	// process it killed as an exit, and the caller is told it timed out.
 	switch code, err := e.stream.ExitCode(); {
 	case e.abandoned():
 		return nil
-	case err == nil:
-		exit.ExitCode = &code
-		u.act.exited(&code)
 	case e.timedOut.Load():
 		exit.TimedOut = true
 		u.act.exited(nil)
+	case err == nil:
+		exit.ExitCode = &code
+		u.act.exited(&code)
 	default:
 		return err
 	}

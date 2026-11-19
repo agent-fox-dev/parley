@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -24,6 +25,10 @@ const LogCollectInterval = 5 * time.Second
 type logState struct {
 	// stored is notified each time the collector stored lines.
 	stored notifier
+	// unsupported holds the ids of the sandboxes whose runtime answered
+	// that it keeps no logs. That answer does not change, and the collector
+	// asks again every round, so it is logged once per sandbox.
+	unsupported sync.Map
 }
 
 // LogLinesStored returns a channel closed the next time the collector
@@ -140,6 +145,11 @@ func (s *Service) followLogs(ctx context.Context, id string) {
 		err := <-errs
 		if err == nil || errors.Is(err, context.Canceled) {
 			continue
+		}
+		if errors.Is(err, runtime.ErrUnsupported) {
+			if _, logged := s.logs.unsupported.LoadOrStore(id, true); logged {
+				continue
+			}
 		}
 		text := s.scrub(s.ScrubSandbox(context.WithoutCancel(ctx), id, err.Error()))
 		s.logger().Warn("stopped reading a sandbox's log", "sandbox_id", id, "error", text)

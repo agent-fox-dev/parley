@@ -526,6 +526,10 @@ func TestSandboxExec_SendsOnlyTheMembersOfTheFlagsGiven(t *testing.T) {
 
 func TestSandboxExec_JSONPrintsTheCollectedAnswer(t *testing.T) {
 	t.Parallel()
+	// A NUL byte is escaped to six, so a full stdout and part of a stderr
+	// make an answer past 8 MiB.
+	nuls := func(n int) string { return strings.Repeat(`\u0000`, n) }
+	escaped := fmt.Sprintf(`{"exit_code":0,"stdout":"%s","stderr":"%s","truncated":true,"timed_out":false,"duration_ms":4}`, nuls(1<<20), nuls(400<<10))
 	tests := []struct {
 		name, answer string
 		want         int
@@ -534,6 +538,7 @@ func TestSandboxExec_JSONPrintsTheCollectedAnswer(t *testing.T) {
 		{"exits 7", `{"exit_code":7,"stdout":"","stderr":"bad","truncated":false,"timed_out":false,"duration_ms":4}`, 7},
 		{"exits 200", `{"exit_code":200,"stdout":"","stderr":"","truncated":false,"timed_out":false,"duration_ms":4}`, 125},
 		{"times out", `{"exit_code":null,"stdout":"part","stderr":"","truncated":false,"timed_out":true,"duration_ms":1000}`, 1},
+		{"output escaped past 8 MiB", escaped, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1167,17 +1172,35 @@ func TestSandboxUpload_SendsAFileOrADirectoryAndPrintsTheHubsAnswer(t *testing.T
 			}
 		}
 	})
-	t.Run("a local path that does not exist", func(t *testing.T) {
-		t.Parallel()
-		hub := newStubHub(t)
+	for _, tt := range []struct {
+		name  string
+		local func(t *testing.T) string
+	}{
+		{"a local path that does not exist", func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "no", "such")
+		}},
+		{"a directory holding a file it cannot read", func(t *testing.T) string {
+			if os.Geteuid() == 0 {
+				t.Skip("root reads a file of mode 000")
+			}
+			dir := t.TempDir()
+			writeLocal(t, filepath.Join(dir, "a"), "x", 0o644)
+			writeLocal(t, filepath.Join(dir, "sub", "locked"), "x", 0o000)
+			return dir
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hub := newStubHub(t)
 
-		code, stdout, stderr, sent, _ := runFiles(t, hub, "sandbox", "upload", "demo", "sbx_1", filepath.Join(t.TempDir(), "no", "such"), "x")
+			code, stdout, stderr, sent, _ := runFiles(t, hub, "sandbox", "upload", "demo", "sbx_1", tt.local(t), "x")
 
-		wantClientFailure(t, code, stdout, stderr, "client_error")
-		if len(sent) != 0 {
-			t.Errorf("the hub got %d requests, want none", len(sent))
-		}
-	})
+			wantClientFailure(t, code, stdout, stderr, "client_error")
+			if len(sent) != 0 {
+				t.Errorf("the hub got %d requests, want none", len(sent))
+			}
+		})
+	}
 }
 
 // projTar is the tar stream a hub sends for the directory proj.

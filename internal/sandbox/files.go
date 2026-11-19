@@ -411,15 +411,26 @@ func (s *Service) sendFile(w http.ResponseWriter, r *http.Request, u useRequest,
 // by its base name; each entry has the mode the runtime reports. The
 // stream is cut, by dropping the connection, once it would pass
 // [sandbox].max_transfer_size: its length is not known before it is sent.
+//
+// Names are made from the requested path, not from the path the runtime
+// reports, and an entry the runtime reports outside the requested
+// directory is left out: a runtime may report canonical paths, and a name
+// must never be absolute or lead out of the directory it is unpacked in.
 func (s *Service) sendTar(w http.ResponseWriter, r *http.Request, u useRequest, fi runtime.FileInfo) error {
 	ctx, id := r.Context(), u.rec.ID
-	entries, base := []runtime.FileInfo{fi}, path.Dir(u.files.path)
+	fi.Path = u.files.path
+	entries := []tarItem{{info: fi, name: path.Base(u.files.path)}}
 	if fi.Dir {
 		below, err := s.client.Walk(ctx, id, u.files.path)
 		if err != nil {
 			return pathError(err)
 		}
-		entries, base = below, u.files.path
+		entries = entries[:0]
+		for _, e := range below {
+			if name, ok := nameBelow(u.files.path, e.Path); ok {
+				entries = append(entries, tarItem{info: e, name: name})
+			}
+		}
 	}
 	out := s.startDownload(w, u, s.settings.MaxTransferSize)
 	defer func() { u.act.op.Bytes = out.sent }()
@@ -430,7 +441,7 @@ func (s *Service) sendTar(w http.ResponseWriter, r *http.Request, u useRequest, 
 	// stands for it, in whole seconds so that every format can hold it.
 	modTime := s.deps.Now().UTC().Truncate(time.Second)
 	for _, e := range entries {
-		if err := s.addEntry(ctx, id, tw, base, e, modTime); err != nil {
+		if err := s.addEntry(ctx, id, tw, e, modTime); err != nil {
 			s.abortDownload(ctx, id, out, err)
 		}
 	}
@@ -440,15 +451,31 @@ func (s *Service) sendTar(w http.ResponseWriter, r *http.Request, u useRequest, 
 	return nil
 }
 
-// addEntry writes e, a file or directory below base, to tw.
-func (s *Service) addEntry(ctx context.Context, id string, tw *tar.Writer, base string, e runtime.FileInfo, modTime time.Time) error {
-	name := strings.TrimPrefix(strings.TrimPrefix(e.Path, base), "/")
-	hdr := &tar.Header{Name: name, Mode: int64(e.Mode.Perm()), ModTime: modTime, Typeflag: tar.TypeReg, Size: e.Size}
-	if e.Dir {
-		hdr.Name, hdr.Typeflag, hdr.Size = name+"/", tar.TypeDir, 0
+// tarItem is a file or directory of a tar download and its entry name.
+type tarItem struct {
+	info runtime.FileInfo
+	name string
+}
+
+// nameBelow is the name of p relative to the directory dir, and false when
+// p is not below dir.
+func nameBelow(dir, p string) (string, bool) {
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	p = path.Clean(p)
+	if !strings.HasPrefix(p, prefix) || len(p) == len(prefix) {
+		return "", false
+	}
+	return p[len(prefix):], true
+}
+
+// addEntry writes e to tw.
+func (s *Service) addEntry(ctx context.Context, id string, tw *tar.Writer, e tarItem, modTime time.Time) error {
+	hdr := &tar.Header{Name: e.name, Mode: int64(e.info.Mode.Perm()), ModTime: modTime, Typeflag: tar.TypeReg, Size: e.info.Size}
+	if e.info.Dir {
+		hdr.Name, hdr.Typeflag, hdr.Size = e.name+"/", tar.TypeDir, 0
 		return tw.WriteHeader(hdr)
 	}
-	rc, err := s.client.Download(ctx, id, e.Path)
+	rc, err := s.client.Download(ctx, id, e.info.Path)
 	if err != nil {
 		return err
 	}
@@ -456,7 +483,7 @@ func (s *Service) addEntry(ctx context.Context, id string, tw *tar.Writer, base 
 	if err := tw.WriteHeader(hdr); err != nil {
 		return err
 	}
-	_, err = io.CopyN(tw, rc, e.Size)
+	_, err = io.CopyN(tw, rc, e.info.Size)
 	return err
 }
 

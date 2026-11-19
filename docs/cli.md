@@ -389,7 +389,7 @@ Available Commands:
   keys              List, refresh and revoke your API keys
   login             Sign in to the hub and save the hub URL and the credential
   orgs              List and read the organizations you belong to
-  sandbox           Work with the hub's sandboxes and their profiles
+  sandbox           Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, and list their profiles
   scm               Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   tokens            Create, read, change and revoke your personal access tokens
@@ -1338,7 +1338,9 @@ sends it as `stdin_base64`.
 By default it asks for the event stream and writes the command's stdout to
 stdout and its stderr to stderr, byte for byte, as the frames arrive; stdout
 is not JSON. With `--json` it asks for the collected answer and prints it as
-under [Output](#output).
+under [Output](#output), read up to 16 MiB (16,777,216 bytes) instead of
+8 MiB: the hub keeps up to 1 MiB of each stream and JSON escapes a control
+byte to six bytes.
 
 | Exit status | When |
 |---|---|
@@ -1413,8 +1415,8 @@ and its permission bits as `mode` (such as `0750`). A local directory is sent
 with `archive=tar` as a tar stream of its directories and regular files,
 named relative to it, written while it is sent; a symbolic link (or anything
 else) in it is left out with a `warning: ` line on stderr naming it. A local
-path that does not exist or cannot be read is a `client_error`, exit status
-`2`, and nothing is sent.
+path that does not exist or cannot be read, or a file in the directory that
+cannot be read, is a `client_error`, exit status `2`, and nothing is sent.
 
 #### `parley sandbox download`
 

@@ -241,6 +241,39 @@ func TestLogCollector_StopsReadingASandboxThatLeavesReady(t *testing.T) {
 	}
 }
 
+func TestLogCollector_LogsARuntimeWithoutLogsOncePerSandbox(t *testing.T) {
+	t.Parallel()
+	const text = "this runtime keeps no logs"
+	h := startLogHub(t, 0)
+	h.rt.FailOperation(runtime.OpLogs, runtime.ErrUnsupported, text)
+	id := h.sandbox(t, nil)
+	asked := func() int {
+		n := 0
+		for _, c := range h.rt.Calls() {
+			if c.Op == runtime.OpLogs && c.Target == id {
+				n++
+			}
+		}
+		return n
+	}
+	// A round starts a follower only once the last one has stopped and
+	// logged, so four followers mean three have logged.
+	eventually(t, "four rounds to ask for the logs", func() bool {
+		h.clock.Advance(sandbox.LogCollectInterval)
+		return asked() >= 8
+	})
+
+	n := 0
+	for line := range strings.Lines(h.Log.String()) {
+		if strings.Contains(line, id) && strings.Contains(line, text) {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("the hub's log holds %d lines about the runtime without logs, want 1:\n%s", n, h.Log.String())
+	}
+}
+
 func TestLogRetention_DeletesOldLinesAndLinesWithoutARecord(t *testing.T) {
 	t.Parallel()
 	h := startLogHub(t, 20*time.Millisecond)

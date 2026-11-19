@@ -8105,7 +8105,9 @@ Reads from a sandbox in state `ready`, `completed` or `failed`, with the
 `archive=tar` the answer is `200` with `Content-Type: application/x-tar`: for
 a directory a tar stream of its directories and regular files, named
 relative to it, with their modes; for a file a tar stream of one entry named
-by its base name.
+by its base name. Entry names come from the requested path: an entry the
+runtime reports outside the requested directory is left out, so no name is
+absolute or leads out of the directory it is unpacked in.
 
 | Status | When |
 |---|---|
@@ -8179,7 +8181,9 @@ each an integer from 1 to 1,000; 80 by 24 when absent). The credential is the
 `Authorization` header, as on every route; a request without an `Origin`
 header is accepted.
 
-- Binary frames carry terminal bytes in both directions.
+- Binary frames carry terminal bytes in both directions. A frame from the
+  caller larger than 1 MiB (1,048,576 bytes) ends the connection and the
+  shell.
 - A text frame `{"resize":{"cols":…,"rows":…}}` with both values from 1 to
   1,000 resizes the terminal; any other text frame is ignored.
 - When the caller closes the connection, or the hub begins to stop, the hub
@@ -8191,7 +8195,11 @@ header is accepted.
 The terminal is opened before the upgrade, so every refusal is an HTTP error
 envelope and no `101`: the checks of [Using a sandbox](#using-a-sandbox),
 `400 invalid_request` for a request that is not a WebSocket upgrade (`this
-route takes a WebSocket upgrade (version 13)`) or a `cols` or `rows` outside
+route takes a WebSocket upgrade (version 13)`: judged on the first value of
+each header, so `Upgrade` must be `websocket` and the first `Connection`
+header must hold `upgrade`; `Sec-WebSocket-Key` must be present,
+`Sec-WebSocket-Version` must be `13`, and `Sec-WebSocket-Protocol` may offer
+at most one protocol) or a `cols` or `rows` outside
 1 to 1,000 (`cols: must be an integer from 1 to 1000`), and `502
 sandbox_runtime_error` when the runtime cannot open the terminal.
 

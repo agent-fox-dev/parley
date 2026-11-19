@@ -53,7 +53,7 @@ var sandboxStringFlags = []struct{ flag, member, usage string }{
 // newSandboxCommand builds parley sandbox: the hub's sandboxes and the
 // profiles they are created from.
 func newSandboxCommand() *cobra.Command {
-	return group("sandbox", "Create, list and read the sandboxes of a workspace, and list their profiles",
+	return group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, and list their profiles",
 		declare(command{
 			Name:        "profiles",
 			Description: "List the sandbox profiles the hub offers, in name order",
@@ -465,6 +465,12 @@ func writeOutputFrame(c *call, f frame) error {
 	return nil
 }
 
+// maxExecAnswerSize bounds the collected answer of an exec, in bytes. The
+// hub keeps up to 1 MiB of each of stdout and stderr and escapes a control
+// or HTML byte to six bytes in JSON, so a valid answer can reach 12 MiB and
+// some members; the answer of any other route stays under maxAnswerSize.
+const maxExecAnswerSize = 2*6*(1<<20) + 4<<20
+
 // execCollected sends r for the collected answer, prints it as the result
 // and ends as its exit_code and timed_out say.
 func execCollected(c *call, r apiRequest) error {
@@ -473,12 +479,12 @@ func execCollected(c *call, r apiRequest) error {
 		return err
 	}
 	defer resp.Body.Close()
-	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerSize+1))
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxExecAnswerSize+1))
 	if err != nil {
 		return clientError("cannot read the answer of the hub at %s: %v", c.client.hubURL, err)
 	}
-	if len(answer) > maxAnswerSize {
-		return clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, maxAnswerSize)
+	if len(answer) > maxExecAnswerSize {
+		return clientError("the hub answered %d with a body larger than %d bytes", resp.StatusCode, maxExecAnswerSize)
 	}
 	var end execEnd
 	if err := json.Unmarshal(answer, &end); err != nil {
@@ -842,8 +848,8 @@ type localEntry struct {
 }
 
 // localTree is every regular file and directory below dir, in lexical
-// order, read before the upload is sent so that a directory that cannot be
-// read sends no request. A symbolic link is not followed but left out with
+// order, read before the upload is sent so that a directory or a file that
+// cannot be read sends no request. A symbolic link is not followed but left out with
 // a warning, as is anything else that is neither a file nor a directory.
 func localTree(c *call, dir string) ([]localEntry, error) {
 	root := dir
@@ -872,6 +878,13 @@ func localTree(c *call, dir string) ([]localEntry, error) {
 		case d.IsDir():
 			entries = append(entries, localEntry{path: p, name: name + "/", dir: true})
 		case d.Type().IsRegular():
+			// The file is read only while the body streams; opening it
+			// now makes a file that cannot be read send no request.
+			f, err := os.Open(p)
+			if err != nil {
+				return clientError("cannot read %s: %v", shown, err)
+			}
+			_ = f.Close()
 			entries = append(entries, localEntry{path: p, name: name})
 		case d.Type()&fs.ModeSymlink != 0:
 			warn(c.stderr, "the symbolic link %s is not uploaded", shown)
