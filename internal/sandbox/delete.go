@@ -40,8 +40,10 @@ const (
 // sandbox. Then, in one transaction, the sandbox moves from the state it
 // is in to deleted with reason as its state_reason, its hub credential is
 // revoked, the delete hooks run and EventDelete is written. When another
-// action deleted the sandbox meanwhile, nothing is written. The error is
-// that of the transaction alone.
+// action deleted the sandbox meanwhile, nothing is written. When ctx ends
+// before the runtime is asked to delete the sandbox, as when the hub stops,
+// nothing is called or written and the context's error is returned. Any
+// other error is that of the transaction alone.
 func (s *Service) Delete(ctx context.Context, rec Record, reason string, actor Actor, checkpoint bool) error {
 	if rec.State == StateDeleted {
 		return nil
@@ -59,6 +61,12 @@ func (s *Service) Delete(ctx context.Context, rec Record, reason string, actor A
 	if s.client != nil {
 		if checkpoint && reason != DeleteWorkspaceDeleted && cur.State == StateReady {
 			_, _ = s.Checkpoint(ctx, cur, actor)
+		}
+		if err := ctx.Err(); err != nil {
+			// The hub stops, or the caller left, before the runtime was
+			// asked: the sandbox is left as it is, for the next expiry pass
+			// or request.
+			return err
 		}
 		if err := s.clearRuntime(ctx, cur); err != nil {
 			s.logger().Warn("the runtime still holds part of a deleted sandbox; the reconciliation deletes it", "sandbox", cur.ID,

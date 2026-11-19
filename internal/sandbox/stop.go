@@ -42,7 +42,9 @@ const (
 // sandbox moves from ready to stopped with reason as its state_reason, its
 // hub credential is revoked and EventStop is written, in one transaction.
 // When another action moved the sandbox meanwhile, nothing is written, and
-// the sandbox is returned as that action left it. A stop waits for the
+// the sandbox is returned as that action left it. When ctx ends before the
+// runtime is asked to stop the sandbox, as when the hub stops, nothing is
+// called or written and the context's error is returned. A stop waits for the
 // stop or deletion of the same sandbox in progress, and then works from
 // the stored record.
 func (s *Service) Stop(ctx context.Context, rec Record, reason string, actor Actor) (Record, error) {
@@ -63,6 +65,11 @@ func (s *Service) Stop(ctx context.Context, rec Record, reason string, actor Act
 	}
 	if rec.Snapshot.Checkpoint {
 		_, _ = s.Checkpoint(ctx, rec, actor)
+	}
+	if err := ctx.Err(); err != nil {
+		// The hub stops, or the caller left, before the runtime was asked:
+		// the sandbox stays ready, and the next idle pass tries again.
+		return rec, err
 	}
 	if err := s.client.StopSandbox(ctx, rec.ID); err != nil {
 		return rec, &scrubbedError{text: s.ScrubSandbox(context.WithoutCancel(ctx), rec.ID, err.Error()), err: err}

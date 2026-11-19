@@ -150,11 +150,17 @@ func (s *Service) reconcileOne(ctx context.Context, rec Record, held map[string]
 // recordExit ends the ready sandbox rec whose main process ended with code:
 // a checkpoint when its profile asked for one, the compute released at the
 // runtime, then completed or failed with ReasonExit, the exit code, the hub
-// credential revoked and EventExit, in one transaction.
+// credential revoked and EventExit, in one transaction. When ctx ends
+// before the runtime is asked to release the compute, it calls and writes
+// nothing more.
 func (s *Service) recordExit(ctx context.Context, rec Record, code int) error {
 	if rec.Snapshot.Checkpoint {
 		// A failure is recorded on the sandbox by Checkpoint.
 		_, _ = s.Checkpoint(ctx, rec, SystemActor)
+	}
+	if ctx.Err() != nil {
+		// The hub stops: the exit is recorded by the pass of its next start.
+		return nil
 	}
 	if err := s.client.StopSandbox(ctx, rec.ID); err != nil && !errors.Is(err, runtime.ErrNotFound) && ctx.Err() == nil {
 		// The main process has ended all the same; what the runtime still
