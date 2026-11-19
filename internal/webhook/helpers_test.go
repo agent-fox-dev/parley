@@ -88,6 +88,18 @@ func (c *clock) advance(d time.Duration) {
 	}
 }
 
+// armed reports whether a timer waits for the clock to reach at.
+func (c *clock) armed(at time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for t := range c.timers {
+		if t.at.Equal(at) {
+			return true
+		}
+	}
+	return false
+}
+
 type clockTimer struct {
 	clock *clock
 	at    time.Time
@@ -110,13 +122,15 @@ func (c *clock) stamp() string { return c.Now().UTC().Truncate(time.Second).Form
 // world is a hub with a secret key configured, on a settable clock, and the
 // seed: the user owner, with the API key ownerKey, owns the repositories
 // demo and other in the org acme. log is the hub's event component, which
-// the tests write events of other packages with.
+// the tests write events of other packages with, and hooks its webhook
+// component; a restart replaces both with those of the new run.
 // The webhook component runs on the world's clock, reports to its metrics
 // and connects through a dialer that reaches loopback receivers alone.
 type world struct {
 	*hubtest.Hub
 	clock    *clock
 	log      *event.Component
+	hooks    *webhook.Component
 	metrics  *recorder
 	owner    string
 	ownerKey string
@@ -143,7 +157,7 @@ func newWorld(t *testing.T, opts options) *world {
 		Now:  w.clock.Now,
 		Env:  map[string]string{secret.EnvCurrentKey: base64.StdEncoding.EncodeToString(key)},
 		Compose: func(c *hub.Composition) {
-			w.log = c.Events()
+			w.log, w.hooks = c.Events(), c.Webhooks()
 			c.AdjustWebhooks(func(d *webhook.Deps) {
 				d.Resolver, d.Clock, d.Recorder, d.Dialer = names, w.clock, w.metrics, &loopbackDialer{}
 			})

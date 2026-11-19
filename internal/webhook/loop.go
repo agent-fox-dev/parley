@@ -118,10 +118,13 @@ func (c *Component) spawnLocked(l *loop) {
 	go c.run(c.loops.ctx, l)
 }
 
-// Run runs the delivery loops and the check that disables a subscription
-// failing for too long until ctx ends, then waits for them: each returns as
-// soon as ctx ends, abandoning an attempt in flight. The hub runs it as
-// background work.
+// Run starts the loop of every active and failing subscription the store
+// holds, then runs the delivery loops and the check that disables a
+// subscription failing for too long until ctx ends, and waits for them: each
+// returns as soon as ctx ends, abandoning an attempt in flight, whose
+// request ends with ctx and of which nothing is recorded, so that its
+// delivery stays pending for the next start. The hub runs it as background
+// work.
 func (c *Component) Run(ctx context.Context) {
 	ls := &c.loops
 	ls.mu.Lock()
@@ -137,6 +140,7 @@ func (c *Component) Run(ctx context.Context) {
 		defer ls.wg.Done()
 		c.watchFailing(ctx)
 	}()
+	c.resumeLoops(ctx)
 	<-ctx.Done()
 	ls.mu.Lock()
 	ls.stopped = true

@@ -250,6 +250,12 @@ func TestDisable_SwitchesOffASubscriptionFailingForThreeDays(t *testing.T) {
 			if r := w.row(t, id); r.state != "failing" {
 				t.Fatalf("a second before three days of failing the subscription is %+v, want failing", r)
 			}
+			// The attempts due before the check that disables, the one that
+			// gives an event up at the end of the third day included, are made
+			// and recorded first, so that none is in flight when the
+			// subscription is disabled.
+			check := end.Add(61 * time.Second)
+			w.retryWhile(t, id, func(next time.Time) bool { return next.Before(check) })
 			var pending string
 			for _, d := range w.deliveries(t, id) {
 				if d.status == "pending" {
@@ -257,7 +263,7 @@ func TestDisable_SwitchesOffASubscriptionFailingForThreeDays(t *testing.T) {
 				}
 			}
 
-			w.clock.advance(61 * time.Second)
+			w.clock.advance(check.Sub(w.clock.Now()))
 			waitFor(t, "the subscription to be disabled", func() bool { return w.row(t, id).state == "disabled" })
 			for _, d := range w.deliveries(t, id) {
 				if d.status == "pending" || d.nextAttemptAt.Valid || d.id == pending && d.status != "failed" {
