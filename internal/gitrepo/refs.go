@@ -209,25 +209,28 @@ func (r *Repo) peek(ctx context.Context, ref string) (string, bool, error) {
 // "/", all in one transaction of git's. It lists them in process
 // (readRefs), and asks git only when it does not read them that way.
 func (r *Repo) deleteUnder(ctx context.Context, prefix string) error {
-	if err := ctx.Err(); err != nil {
+	out, err := r.deletions(ctx, prefix)
+	if err != nil || len(out) == 0 {
 		return err
 	}
-	var out []byte
+	_, err = r.g.runInput(ctx, access{}, out, "--git-dir="+r.dir, "update-ref", "--stdin")
+	return err
+}
+
+// deletions are the update-ref --stdin instructions that remove every ref
+// below prefix, listed as deleteUnder lists them.
+func (r *Repo) deletions(ctx context.Context, prefix string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if refs, ok := readRefs(r.dir, prefix); ok {
+		var out []byte
 		for _, name := range slices.Sorted(maps.Keys(refs)) {
 			out = fmt.Appendf(out, "delete %s%s\n", prefix, name)
 		}
-	} else {
-		var err error
-		if out, err = r.git(ctx, "for-each-ref", "--format=delete %(refname)", prefix); err != nil {
-			return err
-		}
+		return out, nil
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	_, err := r.g.runInput(ctx, access{}, out, "--git-dir="+r.dir, "update-ref", "--stdin")
-	return err
+	return r.git(ctx, "for-each-ref", "--format=delete %(refname)", prefix)
 }
 
 // refuseOptions is refuseOption for a ref name followed by the commit ids

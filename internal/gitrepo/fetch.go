@@ -17,8 +17,9 @@ import (
 // dev/next) in the transaction of a fetch. So each fetch writes origin's
 // refs below a fresh namespace of its own, which no other fetch shares and
 // in which no name is in the way, reads it and removes it, so that no such
-// ref outlives the fetch, and only then sets the origin heads from what it
-// read.
+// ref outlives the fetch: in the transaction that sets the origin heads
+// from what it read, or, when git refuses that one, before any of them is
+// set.
 const fetchNamespace = "refs/parley/fetch/"
 
 // cleanupTimeout bounds the removal of a fetch's namespace, which runs also
@@ -58,22 +59,48 @@ func (g Git) FetchOrigin(ctx context.Context, dir, url string, cred Credential, 
 	}
 	ns := fetchNamespace + randomName() + "/"
 	fetched, err := repo.fetch(ctx, url, cred, deadline, ns, true)
-	// The namespace goes whatever the fetch did, even one cut off after its
-	// refs were written, and before any origin head is set, so that a
-	// removal that fails leaves the origin heads as they were.
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	defer cancel()
-	cleanErr := repo.deleteUnder(cleanup, ns)
 	if err != nil {
+		// The namespace goes whatever the fetch did, even one cut off after
+		// its refs were written.
+		_ = repo.dropFetched(ctx, ns)
 		return Fetched{}, err
 	}
-	if cleanErr != nil {
-		return Fetched{}, fmt.Errorf("remove the fetched refs: %w", cleanErr)
-	}
-	if err := repo.setHeads(ctx, originPrefix, fetched.Branches); err != nil {
+	if err := repo.setFetchedHeads(ctx, ns, originPrefix, fetched.Branches); err != nil {
 		return Fetched{}, err
 	}
 	return fetched, nil
+}
+
+// setFetchedHeads removes the refs a fetch wrote below its namespace ns and
+// makes the heads below prefix exactly heads, in one transaction of git's
+// when any head changes. When git refuses it, or no head changes, the
+// namespace is removed alone first, so that a removal that fails leaves
+// every head as it was and is the error, and the heads are set after it by
+// setHeads.
+func (r *Repo) setFetchedHeads(ctx context.Context, ns, prefix string, heads map[string]string) error {
+	current, err := r.refs(ctx, prefix)
+	if err == nil {
+		if removals, writes := headChanges(prefix, current, heads); removals+writes != "" {
+			if drop, err := r.deletions(ctx, ns); err == nil && r.updateRefs(ctx, string(drop)+removals+writes) == nil {
+				return nil
+			}
+		}
+	}
+	if err := r.dropFetched(ctx, ns); err != nil {
+		return err
+	}
+	return r.setHeads(ctx, prefix, heads)
+}
+
+// dropFetched removes the refs a fetch wrote below its namespace ns, also
+// after ctx ended.
+func (r *Repo) dropFetched(ctx context.Context, ns string) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := r.deleteUnder(cleanup, ns); err != nil {
+		return fmt.Errorf("remove the fetched refs: %w", err)
+	}
+	return nil
 }
 
 // fetch runs the git fetch of FetchOrigin and FetchRemote, the remote's
@@ -123,30 +150,38 @@ func (r *Repo) setHeads(ctx context.Context, prefix string, heads map[string]str
 	if err != nil {
 		return err
 	}
-	var removals, writes strings.Builder
+	removals, writes := headChanges(prefix, current, heads)
+	if removals+writes == "" {
+		return nil
+	}
+	if r.updateRefs(ctx, removals+writes) == nil {
+		return nil
+	}
+	if err := r.updateRefs(ctx, removals); err != nil {
+		return fmt.Errorf("remove the heads of branches the remote no longer has: %w", err)
+	}
+	if err := r.updateRefs(ctx, writes); err != nil {
+		return fmt.Errorf("record the remote's heads: %w", err)
+	}
+	return nil
+}
+
+// headChanges are the update-ref --stdin instructions that make the refs
+// below prefix, current without prefix, exactly heads: the removals of
+// those heads lacks, and the writes of the others that differ.
+func headChanges(prefix string, current, heads map[string]string) (removals, writes string) {
+	var rm, wr strings.Builder
 	for name := range current {
 		if _, kept := heads[name]; !kept {
-			fmt.Fprintf(&removals, "delete %s%s\n", prefix, name)
+			fmt.Fprintf(&rm, "delete %s%s\n", prefix, name)
 		}
 	}
 	for name, id := range heads {
 		if current[name] != id {
-			fmt.Fprintf(&writes, "update %s%s %s\n", prefix, name, id)
+			fmt.Fprintf(&wr, "update %s%s %s\n", prefix, name, id)
 		}
 	}
-	if removals.Len()+writes.Len() == 0 {
-		return nil
-	}
-	if r.updateRefs(ctx, removals.String()+writes.String()) == nil {
-		return nil
-	}
-	if err := r.updateRefs(ctx, removals.String()); err != nil {
-		return fmt.Errorf("remove the heads of branches the remote no longer has: %w", err)
-	}
-	if err := r.updateRefs(ctx, writes.String()); err != nil {
-		return fmt.Errorf("record the remote's heads: %w", err)
-	}
-	return nil
+	return rm.String(), wr.String()
 }
 
 // updateRefs runs the update-ref --stdin instructions of script, one

@@ -3,9 +3,12 @@ package gitrepo_test
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
@@ -20,6 +23,7 @@ import (
 // to their ids.
 type diffFixture struct {
 	repo *gitrepo.Repo
+	dir  string
 	id   map[string]string
 }
 
@@ -40,7 +44,7 @@ func newDiffFixture(t *testing.T) diffFixture {
 	if _, err := gitrepotest.Run(dir, stream, "fast-import", "--quiet"); err != nil {
 		t.Fatal(err)
 	}
-	f := diffFixture{id: map[string]string{}}
+	f := diffFixture{dir: dir, id: map[string]string{}}
 	names := []string{"c1", "c2", "side", "orphan", "c1:src.txt", "c2:src.txt", "c1:kind.txt", "c2:kind.txt", "c1:bin.dat", "c2:bin.dat"}
 	revs := []string{"main~1", "main", "side", "orphan", "main~1:src.txt", "main:src.txt", "main~1:kind.txt", "main:kind.txt", "main~1:bin.dat", "main:bin.dat"}
 	for i, id := range strings.Fields(gitrepotest.Git(t, dir, append([]string{"rev-parse"}, revs...)...)) {
@@ -105,6 +109,79 @@ func TestDiffChanges_ListsTheFilesThatDifferWithTheirNumbers(t *testing.T) {
 		if err != nil || len(got) != len(c.want) || (len(got) > 0 && !reflect.DeepEqual(got, c.want)) {
 			t.Errorf("DiffChanges(%s, %s) = %+v, %v; want %+v", c.from, c.to, got, err, c.want)
 		}
+	}
+}
+
+func TestDiffChanges_AnswersTheSameSidesAgainWithoutRunningGit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newDiffFixture(t)
+	var calls atomic.Int64
+	repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(ctx, f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := repo.DiffChanges(ctx, f.id["c1"], f.id["c2"])
+	if err != nil || len(first) != 4 {
+		t.Fatalf("DiffChanges(c1, c2) = %+v, %v; want its 4 changes", first, err)
+	}
+	want := slices.Clone(first)
+	first[0].Path = "changed by the caller"
+	calls.Store(0)
+	again, err := repo.DiffChanges(ctx, strings.ToUpper(f.id["c1"]), f.id["c2"])
+	if err != nil || !reflect.DeepEqual(again, want) {
+		t.Errorf("DiffChanges(c1, c2) asked again = %+v, %v; want %+v", again, err, want)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("DiffChanges(c1, c2) asked again ran %d git processes, want none", n)
+	}
+}
+
+func TestDiffChanges_AsksGitWhatAnEarlierAnswerDoesNotSettle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, c := range []struct {
+		name string
+		// change alters the repository of the fixture after it answered
+		// DiffChanges(c1, c2) once; want is then the answer, nil for an
+		// error.
+		change func(t *testing.T, f diffFixture) (want []string)
+	}{
+		{"a repository made anew where the one that answered was", func(t *testing.T, f diffFixture) []string {
+			if err := os.RemoveAll(f.dir); err != nil {
+				t.Fatal(err)
+			}
+			gitrepotest.InitBare(t, f.dir, "main")
+			return nil
+		}},
+		{"a replace ref git now reads c2 through", func(t *testing.T, f diffFixture) []string {
+			gitrepotest.Git(t, f.dir, "update-ref", "refs/replace/"+f.id["c2"], f.id["side"])
+			return []string{"s.txt"}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			f := newDiffFixture(t)
+			if _, err := f.repo.DiffChanges(ctx, f.id["c1"], f.id["c2"]); err != nil {
+				t.Fatal(err)
+			}
+			want := c.change(t, f)
+			repo, err := gitrepo.Git{}.Open(ctx, f.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := repo.DiffChanges(ctx, f.id["c1"], f.id["c2"])
+			var paths []string
+			for _, ch := range got {
+				paths = append(paths, ch.Path)
+			}
+			switch {
+			case want == nil && err == nil:
+				t.Errorf("DiffChanges(c1, c2) = %v, want an error: the repository holds neither", paths)
+			case want != nil && (err != nil || !slices.Equal(paths, want)):
+				t.Errorf("DiffChanges(c1, c2) = %v, %v; want the files %v, git's answer", paths, err, want)
+			}
+		})
 	}
 }
 

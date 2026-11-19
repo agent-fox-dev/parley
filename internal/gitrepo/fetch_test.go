@@ -62,7 +62,7 @@ func TestFetchOrigin_RecordsOriginHeads(t *testing.T) {
 	assertRefs(t, "the copy's refs after origin renamed dev", gitrepotest.Refs(t, dir, ""), withOriginHeads(local, heads))
 }
 
-func TestFetchOrigin_RemovesTheFetchedRefsWithoutListingThemThroughGit(t *testing.T) {
+func TestFetchOrigin_RemovesTheFetchedRefsWithTheHeadsItMovesWithoutListingThem(t *testing.T) {
 	t.Parallel()
 	o := gitrepotest.NewOrigin(t)
 	o.History()
@@ -94,10 +94,18 @@ func TestFetchOrigin_RemovesTheFetchedRefsWithoutListingThemThroughGit(t *testin
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	writes := 0
 	for _, args := range ran {
 		if slices.Contains(args, "for-each-ref") {
 			t.Errorf("FetchOrigin ran git %v, want no git for-each-ref", args)
 		}
+		if slices.Contains(args, "update-ref") {
+			writes++
+		}
+	}
+	// The fetched refs go in the transaction that moves the origin head.
+	if writes != 1 {
+		t.Errorf("FetchOrigin ran git update-ref %d times, want once", writes)
 	}
 }
 
