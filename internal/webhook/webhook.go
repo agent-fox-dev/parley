@@ -15,9 +15,11 @@
 package webhook
 
 import (
+	"crypto/x509"
 	"log/slog"
 	"net"
 
+	"github.com/agent-fox-dev/parley/internal/buildinfo"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/store"
@@ -26,8 +28,11 @@ import (
 // Deps are what the component works with: the transactional store, the
 // event log it writes its events to, the operator's keys and whether secrets
 // can be stored, its clock (nil for the system clock), its log (nil discards
-// it), the loaded [webhooks] settings and the resolver that looks up the
-// host of a destination (nil for the system's). Keys is a function so that
+// it), the loaded [webhooks] settings, the resolver that looks up the
+// host of a destination (nil for the system's), the dialer that opens the
+// connection of an attempt (nil for a *net.Dialer) and the roots a
+// receiver's certificate is verified against (nil for the system's; there is
+// no setting that turns the verification off). Keys is a function so that
 // the component reads the keys as they are when it needs them; nil is no
 // key. Available nil means a current key is among Keys.
 type Deps struct {
@@ -39,12 +44,15 @@ type Deps struct {
 	Logger    *slog.Logger
 	Settings  Settings
 	Resolver  Resolver
+	Dialer    Dialer
+	RootCAs   *x509.CertPool
 }
 
 // Component is the event webhook feature. The hub creates its zero value
 // while it composes, registers its routes, and binds it in a start hook.
 type Component struct {
-	deps Deps
+	deps   Deps
+	sender *sender
 }
 
 // Bind gives the component its dependencies, filling the defaults of the
@@ -59,6 +67,9 @@ func (c *Component) Bind(d Deps) {
 	if d.Resolver == nil {
 		d.Resolver = net.DefaultResolver
 	}
+	if d.Dialer == nil {
+		d.Dialer = &net.Dialer{}
+	}
 	if d.Keys == nil {
 		d.Keys = func() secret.Keys { return secret.Keys{} }
 	}
@@ -67,4 +78,5 @@ func (c *Component) Bind(d Deps) {
 		d.Available = func() bool { return keys().Current != nil }
 	}
 	c.deps = d
+	c.sender = newSender(d, buildinfo.Get().Version)
 }

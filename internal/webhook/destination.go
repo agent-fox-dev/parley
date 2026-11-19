@@ -69,6 +69,19 @@ func inside(addr netip.Addr) bool {
 	return false
 }
 
+// addressesOf is the addresses host stands for: a literal address itself,
+// the name localhost the loopback address 127.0.0.1, and any other name the
+// addresses r resolves it to.
+func addressesOf(ctx context.Context, r Resolver, host string) ([]netip.Addr, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{addr}, nil
+	}
+	if loopbackHost(host) {
+		return []netip.Addr{netip.AddrFrom4([4]byte{127, 0, 0, 1})}, nil
+	}
+	return r.LookupNetIP(ctx, "ip", host)
+}
+
 // checkDestination answers 400 webhook_destination_refused when the host of
 // u is an address destinationAllowed refuses, or is a name of which any
 // resolved address is refused; the name localhost is judged as the loopback
@@ -77,18 +90,9 @@ func inside(addr netip.Addr) bool {
 // connection_failed, and every connection is judged again.
 func (c *Component) checkDestination(ctx context.Context, u *url.URL) error {
 	host := u.Hostname()
-	var addrs []netip.Addr
-	switch addr, err := netip.ParseAddr(host); {
-	case err == nil:
-		addrs = []netip.Addr{addr}
-	case loopbackHost(host):
-		addrs = []netip.Addr{netip.AddrFrom4([4]byte{127, 0, 0, 1})}
-	default:
-		resolved, err := c.deps.Resolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			return nil
-		}
-		addrs = resolved
+	addrs, err := addressesOf(ctx, c.deps.Resolver, host)
+	if err != nil {
+		return nil
 	}
 	for _, addr := range addrs {
 		if !destinationAllowed(addr, u.Scheme, c.deps.Settings) {
