@@ -27,9 +27,11 @@ import (
 )
 
 // Access is the access rule the routes decide a caller's access to a
-// workspace with; *access.Service satisfies it.
+// workspace with, and the session list reads the caller's readable set
+// from; *access.Service satisfies it.
 type Access interface {
 	Decide(ctx context.Context, c access.Caller, slug string, need access.Need) (access.Decision, error)
+	Readable(ctx context.Context, c access.Caller) (access.ReadableSet, error)
 }
 
 // Workspace is the minimal record of a workspace the package reads: its
