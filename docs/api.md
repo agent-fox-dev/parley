@@ -344,8 +344,8 @@ it has ended, the next request starts a new one.
   [Git over HTTP](#git-over-http).
 - `/healthz`, `/readyz` and `/version`, the forge webhook ingress
   ([`POST /hooks/forge/{slug}`](#post-hooksforgeslug)), and any request
-  answered `404` or `405` at route matching (`/metrics` included, which the
-  hub does not serve yet), are never counted or refused.
+  `GET /metrics` and any request answered `404` or `405` at route matching
+  are never counted or refused.
 - The counts are kept in memory and start from zero when `parleyd` starts.
 
 ## Request bodies
@@ -871,8 +871,7 @@ without commands, `refused` for a push refused by a rule, by the options
 stage or because a ref moved meanwhile, `error` for a pack that cannot be
 read or is over `[git].max_push_size`, a push that timed out, one refused
 with `internal error; try again` and a command list that cannot be read
-(`400`). The hub does not export the counter at
-`/metrics` yet.
+(`400`). The counter is exported at [`GET /metrics`](#get-metrics).
 
 When the workspace's setting `audit_fetches` is `true` (for a task fork,
 its parent's: a fork has no settings of its own), each
@@ -957,6 +956,80 @@ With sandboxes on:
 ```
 
 How the build values are set is in [architecture.md](architecture.md#build-information).
+
+## `GET /metrics`
+
+The hub's metrics in the Prometheus text exposition format, version 0.0.4.
+It is outside `/api/v1` and needs no credential: an `Authorization` header,
+valid or not, changes nothing. Label values include workspace slugs, so it
+should not be reachable from untrusted networks.
+
+| Status | When |
+|---|---|
+| `200 OK` | `GET` or `HEAD`, with `Content-Type: text/plain; version=0.0.4; charset=utf-8` |
+| `405` `method_not_allowed` | any other method, with `Allow: GET, HEAD`; nothing is exposed |
+
+`/api/v1/metrics` is `404`. The route is not rate-limited.
+
+Every metric of the table below is exported from the moment the hub
+serves, in the order of the table, each with one `# HELP` and one `# TYPE`
+line, and at least one sample: every combination of the values of its
+closed labels (those listed with their values) is present, at `0` until
+something is counted. A metric with an open label (`method`, `path`,
+`status`, `workspace`, `model`, `type`) is exported with that label empty
+and the value `0` until its first series exists, and without that
+placeholder from then on. Samples are sorted by their label values in the
+order of the labels; in a label value a backslash, a double quote and a
+line feed are written `\\`, `\"` and `\n`; a whole number is written
+without an exponent. A
+histogram has one `_bucket` sample per bound plus `le="+Inf"`, cumulative,
+then `_sum` and `_count`. A metric whose value is read from its owner when
+the page is served (the git requests, the open changes, the active forks,
+the event counters, the audit events, the job queue) is exported at `0` for
+that read when the read fails, and the failure is logged with the metric's
+name; a page is never refused for it.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, REST, git, the forge webhook ingress, `/healthz`, `/readyz`, `/version` and `/metrics` itself included. `path` is the route that matched, as a template (`/api/v1/workspaces/{slug}/sync`, `/git/{org}/{repo}/info/refs`, `/healthz`), never the request's own path, and `unmatched` when no route matched (an unknown path, a method no route of the path has); `status` the three digits sent |
+| `parley_http_request_duration_seconds` | histogram | `method`, `path` | the time to answer, by the same `method` and `path`. Buckets `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10` |
+| `parley_git_requests_total` | counter | `service` (`info-refs`, `upload-pack`, `receive-pack`), `result` (`ok`, `refused`, `error`) | git protocol requests, as in [Git over HTTP](#git-over-http) |
+| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
+| `parley_changes_open` | gauge | `workspace` | changes in state `draft` or `open` |
+| `parley_lands_total` | counter | `result` (`landed`, `conflict`, `blocked`, `failed`) | land attempts by final status |
+| `parley_land_attempts` | histogram | none | compare-and-swap tries per land attempt. Buckets `1`, `2`, `3`, `5`, `8`, `13` |
+| `parley_land_duration_seconds` | histogram | none | time from a land request to its final status. Buckets `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60` |
+| `parley_forks_active` | gauge | none | task forks that exist |
+| `parley_events_seq` | gauge | none | the last `seq` written to the event log |
+| `parley_sse_connections` | gauge | none | open event streams |
+| `parley_webhook_deliveries_total` | counter | `result` (`ok`, `retry`, `failed`) | event webhook delivery attempts; `0` until event webhooks exist |
+| `parley_webhook_queue_depth` | gauge | none | events written and not yet delivered or given up; `0` until event webhooks exist |
+| `parley_audit_events_total` | counter | `source` (`hub`, `agent`), `type` | hub events written and run events ingested since the hub started, by type |
+| `parley_agent_sessions_active` | gauge | `workspace` | sessions in state `active`, set by the retention run; a workspace without one has no series |
+| `parley_agent_tokens_total` | counter | `workspace`, `model`, `direction` (`input`, `output`, `cache_read`) | tokens reported in usage records since the hub started |
+| `parley_audit_records` | gauge | `kind` (`hub_event`, `run_event`, `outcome`, `tool_call`, `tool_error`, `trace`, `postmortem`, `session`, `usage`) | stored records, counted by the retention run |
+| `parley_jobqueue_depth` | gauge | `type` (`rebuild`), `status` (`queued`, `running`, `failed`, `completed`, `dead_letter`, `cancelled`) | durable jobs |
+| `parley_retention_errors_total` | counter | `step` (the eleven step names of [the retention run](configuration.md#retention)) | failed retention steps |
+| `parley_retention_last_run_timestamp_seconds` | gauge | none | Unix time of the last retention run in which every step succeeded |
+| `parley_sandboxes` | gauge | `state` (`provisioning`, `ready`, `stopped`, `completed`, `failed`) | sandboxes by state |
+| `parley_sandbox_creates_total` | counter | `result` (`ready`, `failed`) | sandbox creations by outcome |
+| `parley_sandbox_seconds` | histogram | none | time from a sandbox's `ready` to its stop, exit or deletion. Buckets `60`, `300`, `600`, `1200`, `1800`, `3600`, `7200`, `14400`, `28800`, `86400` |
+| `parley_sandbox_exec_total` | counter | `result` (`ok`, `nonzero`, `timeout`, `error`) | commands run through sandbox exec |
+| `parley_sandbox_denials_total` | counter | none | connections and requests the sandbox runtime blocked |
+| `parley_sandbox_checkpoints_total` | counter | `result` (`ok`, `empty`, `failed`) | checkpoints attempted |
+| `parley_sandbox_runtime_up` | gauge | none | `1` while the sandbox runtime is reachable |
+
+The sandbox metrics stay at `0` while sandboxes are off. Counters start
+from zero when `parleyd` starts.
+
+```text
+# HELP parley_lands_total Land requests by final result.
+# TYPE parley_lands_total counter
+parley_lands_total{result="blocked"} 0
+parley_lands_total{result="conflict"} 0
+parley_lands_total{result="failed"} 0
+parley_lands_total{result="landed"} 2
+```
 
 ## `GET /api/v1/auth/providers`
 
@@ -9663,7 +9736,11 @@ change or workspace it names is removed.
 
 A session is `active` from its creation; a complete moves it to
 `completed`, `failed` or `timeout`, and a forced close to `terminated`. The
-four end states are final.
+retention run ends a session still `active` after `[sessions].max_active_age`
+(default `7d`) as `timeout`, with `error_message` `session exceeded maximum
+active age`, and deletes ended sessions after `[sessions].max_age` (see
+[configuration.md](configuration.md#retention)). The four end states are
+final.
 
 **Who may read a session.** Its creator, with any credential of that user;
 any caller who may read its workspace; for a session on a task fork, any
@@ -9857,7 +9934,8 @@ Agents push records about their runs to the hub, so that a run can be
 audited later: run events, session outcomes, tool calls, tool errors, trace
 records and one postmortem per run. They are stored in the analytical store
 (`analytics.db`) and never in the event log: ingestion writes no hub event.
-Reading them back is not built yet.
+They are read back with the [run reads](#reading-a-run) and, for run
+events, with [`GET /api/v1/audit`](#get-apiv1audit).
 
 Every ingestion route is a `POST` under
 `/api/v1/workspaces/{slug}/runs/{run_id}`:
@@ -10024,6 +10102,160 @@ record. The record checks neither access nor the workspace's status, is
 held to `[audit].write_timeout`, and writes no hub event; a failure to
 write it is logged and changes nothing about the operation.
 
+## Reading a run
+
+Seven `GET` routes under `/api/v1/workspaces/{slug}/runs/{run_id}` read
+what agents pushed about one run:
+
+| Route | Answers |
+|---|---|
+| `GET …/events` | the run's run events, a list |
+| `GET …/sessions/outcomes` | its session outcomes, a list |
+| `GET …/tools/calls` | its tool calls, a list |
+| `GET …/tools/errors` | its tool errors, a list |
+| `GET …/traces` | its trace records, a list |
+| `GET …/postmortem` | its postmortem |
+| `GET …/transcript?node_id=…` | the conversation of one node, a list |
+
+**Order of checks.** Every route declares the scope `audit:read` for a PAT,
+which `audit:write` satisfies, and needs read access to the workspace,
+whatever its status: an archived workspace is read like any other.
+
+| Status | When |
+|---|---|
+| `401` `unauthenticated` | no valid credential |
+| `403` `insufficient_scope` | a PAT with neither `audit:read` nor `audit:write` (`this route needs the scope audit:read`), whether or not the workspace exists |
+| `404` `not_found` | no such workspace, or one the caller cannot read (`workspace not found`, the same bytes in both cases) |
+| `400` `invalid_request` | a parameter below breaks its rule, before any record is read; the message names the parameter |
+
+**The lists.** Each list holds the records of its kind stored for the
+path's workspace and run, never one of another run or of the same run id in
+another workspace, each with every member of its record as
+[ingestion](#agent-telemetry) returns it. They are ordered by `timestamp`,
+then `id`, both ascending, or both descending with `order=desc`, and paged
+as in [Lists](#lists). A run without records answers
+`{"items":[],"next_cursor":null}`. The filters match a member's value
+exactly and combine with AND; a parameter a route does not take is ignored:
+
+| Route | Filters |
+|---|---|
+| `…/events` | `event_type`, `severity`, `node_id`, `session_id` |
+| `…/sessions/outcomes` | `node_id`, `session_id`, `status` |
+| `…/tools/calls` | `node_id`, `session_id`, `tool_name` |
+| `…/tools/errors` | `node_id`, `session_id`, `tool_name` |
+| `…/traces` | `event_type`, `node_id`, `session_id` |
+
+All five also take `since` (at or after) and `until` (before) on
+`timestamp`, `order`, `limit` and `cursor`. These are refused `400`
+`invalid_request`:
+
+- a path `run_id` that is not `YYYYMMDD_HHMMSS_` and six lower-case
+  hexadecimal digits (`run_id must have the form YYYYMMDD_HHMMSS_ and six
+  lower-case hexadecimal digits`);
+- `severity` outside `info`, `warning`, `error`, `critical`, `order` outside
+  `asc`, `desc`, and on `…/traces` an `event_type` outside the five trace
+  types (`<name> must be one of …`);
+- a `session_id` that is not a UUID (`session_id must be a UUID in the
+  8-4-4-4-12 hexadecimal form`); it matches in any letter case;
+- a `since` or `until` that is not RFC 3339 (`<name> must be an RFC 3339
+  timestamp whose year in UTC is 0000 to 9999`), and a `since` not before
+  `until` (`since must be before until`); any offset is accepted;
+- a `limit` or `cursor` as in [Lists](#lists): a cursor belongs to its
+  route, the workspace, the run and every other parameter, `order`
+  included.
+
+**`GET …/postmortem`** answers `200` with the run's postmortem in this
+workspace, every member as [ingestion](#post-apiv1workspacesslugrunsrun_idpostmortem)
+returns it. A run with no postmortem in this workspace, also one whose
+postmortem is in another workspace, is `404` with `error_type`
+`postmortem_not_found` (`run <run_id> has no postmortem in workspace
+<slug>`).
+
+**`GET …/transcript?node_id=…`** rebuilds the conversation of one node
+from the run's trace records of that node, ordered by `timestamp`, then
+`sequence` (an absent one counting as `0`), then `id`. A `session.result`
+is left out; every other trace becomes one item:
+
+| Member | Value |
+|---|---|
+| `role` | `system` for `session.init`, `assistant` for `assistant.message`, `tool_use` for `tool.use`, `tool_error` for `tool.error` |
+| `content` | the trace's `data.content` when it is a JSON string, else `""` |
+| `tool_name` | the trace's `data.tool_name` when it is a JSON string, else `null` |
+| `timestamp` | the trace's `timestamp` |
+
+The answer is a list with two members after `next_cursor`, the path's
+`run_id` and the `node_id`, paged with `limit` and `cursor`; every page but
+the last holds `limit` items. A run or node with no traces answers an empty
+list. A missing or empty `node_id` is `400` (`node_id is required and must
+not be empty`), as are a malformed `run_id`, `limit` or `cursor`.
+
+```json
+{"items":[{"role":"system","content":"","tool_name":null,"timestamp":"2026-06-01T12:00:00Z"},{"role":"assistant","content":"hello","tool_name":null,"timestamp":"2026-06-01T12:00:01Z"},{"role":"tool_use","content":"","tool_name":"bash","timestamp":"2026-06-01T12:00:02Z"}],"next_cursor":null,"run_id":"20260601_120000_c0ffee","node_id":"coder"}
+```
+
+## `GET /api/v1/audit`
+
+One list of the hub events and the agents' run events the caller may see,
+newest first. It names no workspace, so a workspace-bound PAT may call it.
+The route declares the scope `audit:read` for a PAT, which `audit:write`
+satisfies: without a valid credential it is `401` `unauthenticated`, a PAT
+with neither scope `403` `insufficient_scope`.
+
+**What a caller sees.** The admin token sees every stored record, those of
+workspaces that no longer exist included. Any other caller sees the hub
+events the [visibility rule](#get-apiv1events) of the event stream lets
+them see, and the run events of the workspaces they can read, plus those
+of a deleted task fork (`<parent>--<name>`) whose parent they can read. A
+workspace-bound PAT sees only the records of the workspaces its binding
+covers, no deleted fork's and no hub event without a workspace. A
+`parley.webhook.ping` is never in the list. The list holds what is stored:
+records leave it when [retention](configuration.md#retention) deletes them.
+
+**Order.** By time, then `id`, both descending, then a hub event before a
+run event; a hub event's time is its `time`, a run event's its
+`timestamp`. Paged as in [Lists](#lists); every item that exists
+throughout the walk comes once, across both sources.
+
+**Items.** Every item has the same seventeen members; those of the other
+source are `null`:
+
+| Member | Hub event | Run event |
+|---|---|---|
+| `source` | `hub` | `agent` |
+| `id`, `workspace`, `session_id` | the event's | the run event's |
+| `type` | the event's `type` | the run event's `event_type` |
+| `time` | the event's `time`, whole seconds | the run event's `timestamp`, with its fraction of a second |
+| `seq`, `actor_type`, `actor_id`, `resource_type`, `resource_id`, `action`, `metadata` | the event's | `null` |
+| `run_id`, `node_id`, `severity`, `payload` | `null` | the run event's |
+
+`metadata` and `payload` are JSON objects or `null`, never strings.
+
+```json
+{"items":[{"source":"agent","id":"0a1b2c3d-0000-4000-8000-000000000001","type":"tool.started","time":"2026-06-01T11:59:58.123456Z","workspace":"demo","session_id":null,"seq":null,"actor_type":null,"actor_id":null,"resource_type":null,"resource_id":null,"action":null,"metadata":null,"run_id":"20260601_120000_c0ffee","node_id":null,"severity":"info","payload":{"k":"v"}},{"source":"hub","id":"…","type":"parley.workspace.create","time":"2026-06-01T11:59:00Z","workspace":"demo","session_id":null,"seq":7,"actor_type":"api_key","actor_id":"…","resource_type":"workspace","resource_id":"demo","action":"create","metadata":{},"run_id":null,"node_id":null,"severity":null,"payload":null}],"next_cursor":null}
+```
+
+**Filters.** They combine with AND; a parameter the route does not know is
+ignored.
+
+| Parameter | Applies to | Meaning |
+|---|---|---|
+| `source` | both | `hub` or `agent`; both when absent |
+| `workspace` | both | the exact slug |
+| `types` | both | a comma-separated list of at most 20 entries, which combine with OR: an exact type, or a prefix ending in `*`; `*` alone matches every type. A run event's type is its `event_type` |
+| `session_id` | both | a UUID, in any letter case |
+| `since`, `until` | both | RFC 3339: at or after `since`, before `until` |
+| `actor_id`, `actor_type`, `resource_type`, `resource_id`, `action` | hub events | exact match; giving one leaves the run events out |
+| `run_id`, `node_id`, `severity` | run events | exact match; giving one leaves the hub events out |
+| `limit`, `cursor` | both | as in [Lists](#lists) |
+
+A type no record has gives an empty list, not an error, and so does a hub
+event filter given with a run event filter.
+
+| Status | When |
+|---|---|
+| `400` `invalid_request` | before any record is read, naming the parameter: `source` outside `hub`, `agent`; `actor_type` outside `admin_token`, `api_key`, `pat`, `forge`, `system`; `severity` outside `info`, `warning`, `error`, `critical` (`<name> must be one of …`); a `session_id` that is not a UUID; a `run_id` that is not a run id; a `since` or `until` that is not RFC 3339, or a `since` not before `until`; a `types` list with more than 20 entries (`types has more than 20 entries`), an empty entry (`types has an empty entry`) or a `*` before its end (`types entry "<entry>" has a * that is not its last character`); a bad `limit` or `cursor`; a hub event filter with `source=agent` (`<name> filters hub events and cannot be given with source=agent`) or a run event filter with `source=hub` (`<name> filters run events and cannot be given with source=hub`) |
+| `404` `not_found` | `workspace` names a workspace the caller cannot read, one outside a bound token's binding, or one that does not exist (`workspace not found`, the same bytes in every case). The admin token is never refused, and any caller may name a task fork's slug whose parent they can read, so a deleted fork's records stay reachable |
+
 ## `GET /api/v1/events`
 
 Streams the hub events the caller may see as Server-Sent Events: first the
@@ -10133,7 +10365,11 @@ PAT, the parameters, the resume position against the bounds of the log,
 then the `workspace` filter against the caller's access. A position below
 `oldest_seq` minus 1 means at least one event after it has left the log,
 and is refused with `410` whether or not the caller could have seen the
-events that left:
+events that left. Events leave the log once they are older than
+`[events].retention` (default `30d`), when the hourly retention run's
+`event_log` step runs; the newest event never leaves it, and the events
+that left stay stored for [`GET /api/v1/audit`](#get-apiv1audit) (see
+[configuration.md](configuration.md#retention)):
 
 ```json
 {"error":{"code":410,"message":"event cursor expired","error_type":"cursor_expired","oldest_seq":6}}

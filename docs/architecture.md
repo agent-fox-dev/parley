@@ -12,13 +12,14 @@ command-line client. Both are written in Go, in the module
 | `cmd/parley` | the `parley` program: it calls `cli.Run` and exits with its status |
 | `cmd/parleyd` | the `parleyd` program: `main` calls `hub.Run` with the process's arguments, environment and working directory and exits with its status |
 | `internal/access` | the workspace access rule, the one place that decides what a caller may do on a workspace; the minimal workspace record (slug, owner, org, kind, parent, status, the creating token of a fork) in the transactional store, the caller's level on a workspace, the decision for a declared need and the REST access check, the readable set for reads across workspaces, what the binding of a workspace-bound PAT covers, and the binding guard that confines such a PAT on every REST route and, for the git server, on git, and the minting, listing and revoking of bound tokens (`MintBound`, `POST` and `GET /workspaces/:slug/tokens`, `RevokeBoundTo`, and the maintenance task `token_binding_sweep`, `SweepBindings`) |
+| `internal/audit` | the audit query `GET /audit` over hub events and run events (`query.go`, `item.go`, `sources.go`, `filters.go`, `types.go`), the retention keys of `[audit]` and `[sessions]` (`config.go`: `Register`, `SettingsFrom`, `NewSettings`), and the retention run (`retention.go`: `NewRetention`, `StepNames`) with its eleven steps (`steps_*.go`) over narrow interfaces the stores satisfy; see [Audit query and retention](#audit-query-and-retention) |
 | `internal/awareness` | awareness of other work: the index of the files each draft and open change touches, kept from the event log by a background worker, the overlaps between changes and their `parley.change.overlap` events, the activity query, and claims with their expiry, links to changes and cleanup (see [Awareness](#awareness)) |
 | `internal/buildinfo` | the version, commit and build time the binary was built with, shared by both programs |
 | `internal/carrypatch` | carry-patch workspaces: the upstream credential, the upstream fetch and base, the set-up after a fresh clone and its repetition, the patch list in the transactional store, the guard and the routes under `/workspaces/:slug/patches`, the git runner every carry-patch operation uses, push control of the integration and patch branches (the push rules' controller, the forward to origin, the trigger after an accepted write with its mirror, and the landing guard), the rebuild trigger interface, the rebuild jobs' routes and enqueue, the rebuild handler that recomputes the integration branch, with its remembered-resolution entries, and the rollback of the integration branch and the rebuild preview (see [Carry-patch workspaces](#carry-patch-workspaces) and [Durable jobs](#durable-jobs)) |
 | `internal/change` | the changes: the change record and its versions (`SchemaStep`), opening (`Open`, `CheckOpen`, `Authorize`), recording versions (`RecordVersion`, and `RefUpdated`, the ref writer's ref-updated stage), retention (`SourceDeleted`, `ForkDeleted`, `WorkspaceDeleted`), the lookups and setters other features call in their own store transaction, the collaborators registered on the instance, and the routes under `/workspaces/:slug/changes` (see [Changes](#changes)) |
 | `internal/cli` | the `parley` client: its root command and its subcommands, built with `github.com/spf13/cobra`, each declared through one helper ([ADR 02](adr/02-declare-every-cli-command-through-one-helper.md)), the client configuration file, the resolution of the hub URL and the credential, the one HTTP client the commands send their requests with, the printing of a command's result on stdout and of its warnings on stderr, the shared wait for a long operation (`--wait`, `--timeout`, `--poll-interval`), and the error envelopes and exit statuses every command ends with |
 | `internal/config` | the configuration loader: `config.toml` from `$XDG_CONFIG_HOME` or the working directory, `${NAME}` references, a registry of keys and whole sections that decides what the file may hold, and the keys it owns itself, among them the fork limits of `[forks]` (`Config.Forks`), whose `max_ttl` it refuses when shorter than `default_ttl`, the read bounds of `[scm]` (`Config.SCM{ReadTimeout, MaxFileSize}`), each refused at zero or below, the mergeability debounce of `[changes]` (`Config.Changes{MergeableDebounce}`), refused when it is not a duration, and the landing options of `[land]` (`Config.Land{MaxAttempts, Timeout, Workers, CommitterName, CommitterEmail}`), refused below 1, at a timeout of zero or below, or empty |
-| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)) |
+| `internal/event` | the hub events: every significant state change as one event, written in the caller's store transaction with a hub-wide `seq` that is never reused; the event record and its JSON form, the emit calls `Emit` and `EmitNow`, the log's bounds, the read by position and the expiry of old positions, the following of commits for waiters and `OnCommit` callbacks, the counters, the keys of `[events]`, the route `GET /api/v1/events/log` with its long-poll and the Server-Sent Events stream `GET /api/v1/events` with its limits ([ADR 05](adr/05-deliver-events-by-reading-the-log-by-position.md)); the newest-first visible read the audit query takes (`ReadNewest`, `newest.go`), and the deletes and counts of retention (`retention.go`) |
 | `internal/forge` | the forge component, the hub's client of the GitHub or GitLab repository a workspace's remote lives on: the resolution of a remote target into repository, forge kind, API URL and credential (`Resolve`, `ParseRemote`, `ResolveCredential`), the outbound `Client` and its typed `Failure`s, the mapping of a failure to a hub error (`MapError`), the route helper every forge route is built with (`Component.Route`), forge paging, the two wire mappings, the read routes (see [Forge reads](#forge-reads)), the write routes with their events (see [Forge writes](#forge-writes)), and the webhook secret's routes, the public delivery ingress, the reduction of a delivery to hub events, the delivery record and its list (see [Forge webhooks](#forge-webhooks)) |
 | `internal/forge/forgetest` | test support, imported by test code only: `New` and `NewPlain` serve a fake GitHub and GitLab API over TLS or plain HTTP, record every request, serve the entities a test sets (`SetObject`, `SetList`, `SetListIn`, paged by `per_page`/`page` with a `Link` `rel="next"`) and answer what a test scripts (`Script`, an answer that may be held until the test releases it and then passed on); below a repository's API path it keeps in-memory GitHub repositories and GitLab projects for the writes (issues, comments, labels, pull requests: `SetNext`, `AddIssue`, `Issue`, `AddLabel`, `SetLabels`, `Labels`) |
 | `internal/forge/number` | the rule of a pull request or issue number (`Parse`), a leaf package of the standard library alone, shared by the hub's routes and the `parley` client |
@@ -29,6 +30,7 @@ command-line client. Both are written in Go, in the module
 | `internal/gitserver/pushrule` | the push rule engine, which decides every ref update of a write to a workspace by one ordered set of rules, whatever the surface: `Engine.Evaluate` takes a `Request` of plain facts (the `Workspace`: slug, kind, parent, default branch, mode; the `Caller`: level, credential type `admin_token`, `api_key` or `pat`, credential id, user, bound, paths; the `Update`s `{Ref, Before, After, OpensChange}` in request order, `ZeroID` for a create's before and a delete's after; a `View` of the repository that answers `IsAncestor`, `NewCommits`, `ChangedPaths` and `ObjectPaths`, which `*gitrepo.Repo` satisfies; and `ParentRepo`, a fork's parent's git directory) and answers a `Verdict` with one `Decision` per update, in request order: allowed with `Created`, `Deleted`, `Forced` (neither a create nor a delete, and before not an ancestor of after) and `Direct`, or refused with the `Message` and `ErrorType` of the first rule that refuses (`Verdict.Refused` reports any refusal); it writes nothing while it evaluates. The rules run in the order hub-owned refs (any ref under `refs/parley/`, for every caller: `hub_owned_ref`), protected branches (a branch under `refs/heads/` that a glob of the workspace's effective `protected_branches` matches, by `Protected(branch, globs)`, which asks the branch-glob matcher of `internal/workspace` for each glob: a forced update or a delete is refused for every caller with `<branch> is protected and cannot be force-pushed or deleted`, a create for every caller and a fast-forward outside the owner exemption with `<branch> is protected; push another branch and open a change (git push -o parley.change)`, both `protected_branch`; the exemption, while `protect.owner_push` is true, is a caller of level `owner` or `admin` writing with an API key, the admin token or a PAT neither bound nor carrying paths, and lets the fast-forward pass this rule only, as an update the decision marks `Direct`), default branch deletion (the delete of `refs/heads/<default branch>`: `default_branch`), tracking branches (on a fork, a branch the `Tracking` lookup names, created, updated or deleted: `tracking_branch`; the lookup is not asked for a repository and a nil one names none), carry-patch push control (on a workspace in mode `carry_patch`, the one `Controller` registered with `Engine.RegisterController` is asked once per update that passed the earlier rules and answers allow, refuse with its message and `integration_branch` or `patch_branch`, or allow after a forward to origin, which the decision carries as `Forward` and evaluation never runs; without a controller, or when it fails, the update is refused as `internal`), path-scoped tokens (for a PAT with paths only, and once every update of the request passed the earlier rules: every commit the request adds, reachable from an after value and from no ref of the repository nor of a fork's parent, is compared with its first parent, oldest first, and the first changed path, in byte order, that `identity.MatchAny` finds outside the token's globs refuses the first update in command order that reaches the commit with `path <path> is outside this token's allowed paths`, `path_not_allowed` and the path; an update that adds no commit is held by what its after value reaches through any tags: a commit on a branch the same way to the files the `VersionFiles` lookup reports for the version it makes, allowed when it reports none (a commit on any other ref makes no version and passes), a tree to every path in it, and a blob, which has no path to check, is refused with the ref's name as the path; deletes pass, and any other caller is not checked and its commits not read), the first refusal deciding; an update no rule refuses is allowed in every namespace outside `refs/parley/`, and an update whose settings, ancestry, tracking, new-commits, changed-paths, object or version-files question fails is refused with `internal error; try again` (`internal`). `Engine.Bind` hands it its lookups (`EngineDeps`: the `SettingsReader` of a workspace's effective `protected_branches` and `protect.owner_push`, read once per request and only for a branch update, a nil one giving the settings' defaults, which protect the default branch and allow direct pushes; `Tracking`; and `VersionFiles`, asked with the slug, the branch, the after value and the opens-change flag, a nil one reporting no version). The ref writer, `Writer.Apply`, is the one way the surfaces move refs: it takes an `ApplyRequest` (the `Verdict`, the `*gitrepo.Repo`, opened over a push's quarantine when it has one, the workspace and caller facts, the session id, `Via` `git`, `api` or `land`, the version kind `push`, `commit`, `ref`, `rebase` or none, an optional `BeforeCommit` hook, an optional `AfterAbort` hook, which runs when the request stops with no ref moved after `BeforeCommit` ran, and `Events`, the events the request owes beside its push events) and returns a `Result` with an `Outcome` (`accepted`, `refused`, `ref_moved`, `internal`) and one `UpdateResult` per update, its decision and the `Version` `{WorkspaceSlug, Number, Version}` a stage recorded for it. A verdict with a refused update writes nothing and runs no forward, and every allowed update is answered `not updated: another ref in this push was refused`; otherwise the decisions' pending `Forward`s to origin run first, in command order, each given the request's `*gitrepo.Repo` (so a forward reads a push's quarantined objects) and a context that ends after `WriterDeps.ForwardLimit` (zero means `DefaultForwardLimit`, 120 s): the first that returns an error, or has not returned when its limit passes, refuses the request (outcome `refused`) with the error's text, or `origin rejected push: timed out`, and error type `patch_branch` on its update and the not-updated message on the others, before any ref is written, runs no later forward and leaves the earlier ones as origin has them (a request whose own context ends meanwhile is refused as `internal`); then every ref moves in one `PrepareRefs` transaction against its before value: a ref not at it refuses the request as `ref_moved` (`ref changed since it was read; fetch and try again`, error type `ref_moved`, a name in the way of another ref's counting the same), then `BeforeCommit` runs, then the stages registered with `RegisterRefUpdatedStage` (`RefUpdatedStage`, given the store transaction and a `StageInput`) run in order in one store transaction (`WriterDeps.Transact`), at whose end the refs move; a hook or stage error aborts the refs, rolls the stages back, runs `AfterAbort`, refuses every update as `internal` and is returned unchanged, and a store commit that fails after the refs moved is logged with the request still accepted. After an accepted request the `HeadSetter` records the new head of a repository's moved default branch, and the `ForkActivity` recorder registered with `RegisterForkActivity` is told of a write through `git` or `api` to a fork; their failures are logged. `Apply` refuses a `Via` other than `git`, `api` and `land` with an error before anything is done. With an event log bound (`WriterDeps.Events`, an `EventWriter`, which `*event.Component` is), a request is entered in the push journal (`journal.go`: the table `push_journal` of `JournalStep`, one `JournalEntry` per request with the workspace and a fork's parent, the actor type and id, the credential id, the session id, `Via`, the `JournalUpdate`s with their flags and the request's own `Events`, in the column `JournalEventsStep` adds, written by `InsertJournalEntry` and read by `JournalEntries`, the metadata of an event read back being a `json.RawMessage`) in a store transaction of its own, after the forwards and before `PrepareRefs`, marked `Committed` in the stages' store transaction, the one the refs move in, and removed when the refs do not move. The event step, `Writer.Finish(ctx, result)`, which the caller runs once it is done with an accepted result (the git processor after its mapping stage), writes in one store transaction one `EventPush` (`parley.git.push`) event per update, in command order, with `resource_type` `ref`, the ref as `resource_id`, the credential type as `actor_type`, the user as `actor_id` (none for the admin token), the session id and the metadata `{ref, before, after, created, deleted, forced, direct, via}` (`before` null for a create, `after` for a delete), then the request's own `Events` in their order, and removes the journal entry; a failure of that transaction is logged, the entry kept and the request still accepted. It then calls each `PostPushListener` registered with `RegisterPostPushListener` on a goroutine of its own with a `PostPush` (the slug, the accepted updates in command order, `Via`, the session id), recovering a panic and logging an error, for every surface alike; a refused result writes and tells nothing. `Writer.Reconcile`, run as the hub starts, writes the events (its push events, then its own) of every journal entry marked committed, whatever its refs hold now, and of every other entry whose refs all hold their after values (absent for a delete), removing the entry in the same transaction, and removes without events an entry whose refs do not; an entry whose repository cannot be read or whose transaction fails is logged and kept for the next start; it opens the repositories with `WriterDeps.Repos` and reads the refs with `(*gitrepo.Repo).RefValues`. No lock spans a request. `AllowedVerdict(ctx, view, updates)` allows every update without the rules, with `Created`, `Deleted` and `Forced` computed as `Evaluate` computes them, for landing |
 | `internal/hub` | the composition of the `parleyd` process: argument parsing, the scrubbing logger, the fixed start order, the bootstrap of the admin token, the HTTP server's options, the idempotency records in the transactional store, signals and the stop, and the `backup` command; the one place later packages plug their parts in ([ADR 01](adr/01-compose-the-hub-in-one-package.md)) |
 | `internal/maintenance` | the maintenance loop: a registry of named tasks, and `Loop`, which runs one pass at once and one at each tick of an hourly timer, the tasks of a pass one after the other in a fixed order, and logs a failing task without stopping the others |
+| `internal/metrics` | the metrics: the catalogue of the 27 metrics (`catalogue.go`), the registry with its recorder (`Add`, `Set`, `Observe`, `SetFamily`) and sources (`RegisterSource`), the Prometheus text exposition (`WriteText`), the `/metrics` handler and the HTTP request instrumentation (`Instrument`); it imports nothing of the project; see [Metrics](#metrics) |
 | `internal/hubtest` | test support, imported by test code only: `Start` bootstraps a hub with an admin token and serves it in-process on a free loopback port, `StartWith` does the same with more in `config.toml` (`Config.Server` inside `[server]`, `Config.TOML` after it), files in the config dir (`Config.Files`), variables added to the hub's environment (`Config.Env`) and a function run on the composition (`Config.Compose`), `(*Hub).Restart` serves the hub again on the same data directory and port, which stays bound while the hub is down, and `RestartEnv` does so with other added variables, `(*Hub).IssuePAT` stores a PAT, `CreateOrg` and `AddMember` make an org and a membership through the admin routes and `AddWorkspace` stores a workspace record, `Serve` runs a hub with given options until the test ends, `(*Served).Call` sends a request with a bearer credential and a body and returns the answer's status and body, `CallWith` does so with added request headers and `Exchange` also returns the answer's headers, `LogBuffer` holds a running hub's log for the test to read, `JobClock` (`NewJobClock`) is a job queue clock whose timers fire only when the test calls `Advance` and whose `Armed(d)` says a timer of `d` was asked for, and `WaitClosed` waits up to 10 s for a channel to close |
 | `internal/identity` | who may use the hub: the admin settings in the transactional store (the bootstrap e-mail and the admin token's hash), the generation and hashing of admin tokens, and `VerifyAdminToken`, which compares a presented token's hash with the stored one in constant time; the identity records (users, orgs, memberships, API keys, PATs), the generation of API keys and PATs, and `Service`, the pipeline's authenticator |
 | `internal/jobs` | the durable job queue: jobs of a type and workspace with an opaque payload and result, stored in the transactional store (`SchemaStep`), enqueued with one pending job per type and workspace (`Enqueue`, `EnqueueFollowUp`, `DuplicateError`), claimed by a dispatcher (`Run`, `Pass`) that runs at most 4 attempts at once and one per type and workspace on the handler registered for the type (`Handler`, `Register`), settled as `completed`, `failed` with backoff or `dead_letter` (`Permanent`, `WithDetail`), recovered at start (`Recover`), stopped with a 30-second grace, counted (`Depth`), cancelled, requeued and removed with their workspace (see [Durable jobs](#durable-jobs)) |
@@ -42,8 +44,8 @@ command-line client. Both are written in Go, in the module
 | `internal/scm` | the source control API: the write gate every write route is built with (`writeRoute`, see [Source control writes](#source-control-writes)), the shared ref update step every write moves a ref through (`refupdate.go`: the push rule engine and the ref writer, reached as the interfaces `Rules` and `RefWriter` in `Deps`), the refs write routes (`refs_write.go`: `POST /refs`, `PATCH` and `DELETE /refs/*name`), the commit route (`commit.go`: `POST /commits`, one commit from file operations through `gitrepo.ApplyOperations` and `CreateCommit`, its own body limit `DefaultMaxCommitSize`, 32 MiB, which `LimitCommitBody` replaces, and the commits' times from `Deps.Now`), the rebase route (`rebase.go`: `POST /rebase`, the branch replayed onto a revision through `gitrepo.Rebase`), the interface `ChangeLinker` (`linker.go`; `FindOpen`, `CheckOpening`, `Open`, registered with `(*Component).RegisterChangeLinker`), the interface `SessionLinker` (`session.go`; `Check`, registered with `(*Component).RegisterSessionLinker`, a refusal matching `scm.ErrUnknownSession`), the `parley.scm.commit` event (`scm.EventCommit`) handed to the ref writer as `ApplyRequest.Events`, and the read half: the `GET` routes under `/workspaces/:slug/scm` (`refs`, `refs/*name`, `commits`, `commits/:sha`, `tree`, `file`, `diff`, `compare`, `blame` and `search`), served by an `scm.Component` (zero value, `Bind(scm.Deps)`, `Routes()`), with the state check, the request recorder and the lookups every read shares (see [Source control reads](#source-control-reads)); and the one revision resolver every read (and every later write that takes a revision) goes through: `NewResolver(repo, view, defaultBranch)` over a workspace's repository (the interface `Repository`, which `*gitrepo.Repo` satisfies) and its ref view (the interface `RefView`, whose `Refs` lists `Ref{Name, SHA, Commit, Tracking}` and is read at most once per request; `RepoRefs(repo)` is the view of a workspace that is what its repository holds, every ref of it), `Resolve(ctx, rev)` and `ResolveOptional(ctx, rev)` (an empty `rev` is the head of the default branch), returning `Resolved{SHA, Full}`, `Full` set when the caller wrote the full 40-character id; a `rev` starting with `refs/` is that full ref name only, otherwise the branch or the tag of that name (both existing is ambiguous), otherwise 4 to 40 hexadecimal characters are a commit id; every failure to name exactly one commit, an expression such as `main~2`, `HEAD` or `--all` included, is the API error `ref_not_found` (404); `cache.go` gives every successful read its `ETag` and `Cache-Control` and answers `304` to a matching `If-None-Match` before the read's costly part; `commitObjects` builds the commit object of every route that answers commits, the change (`CommitChange{WorkspaceSlug, Number, Version}`) and session from the lookups and `stats` only where asked, and `params.go` holds the strict query readers (`true`/`false` booleans, RFC 3339 times, and `pathParam`, the one check of a repository path every route that takes `path` makes) the routes share; `tree.go` maps git's entries to the tree route's four types by mode (`120000` symlink, `160000` commit, a tree, any other blob); `file.go` serves a file raw (one byte range of `Range` honoured) or as JSON, refusing one over `Deps.MaxFileSize` (`DefaultMaxFileSize`, 32 MiB, when zero) before reading it; the handler wrapper bounds every read by `Deps.ReadTimeout` (`DefaultReadTimeout`, 30 s, when zero), answering `503 scm_timeout` or cutting the answer off; `diff.go` builds the file change object of every route that answers file changes (`FileChanges`, the commit route's `files=true` and the diff route) and serves the diff route: the merge base or `base` against `head`, then `ComputeDiff`, the diff computation the change diff of `internal/change` also calls: the `path` globs applied with `identity.MatchAny`, at most `MaxDiffFiles` (5,000) files and `MaxPatchBytes` (8 MiB) of patch text read through `DiffPatches` file by file, the patch form answered by `WritePatchText`; `compare.go` serves the compare route: `AheadBehind`, the first 200 commits of `CommitsBetween` as commit objects without `stats`, the first 5,000 file changes from the merge base to `head`, and `TrialRebase`, whose `gitrepo.ErrMergeCommit` is `400 merge_commits_unsupported` and whose `*gitrepo.ConflictReport` is the answer's `conflict`; `blame.go` serves the blame route: the file looked up with `LookupFile`, refused over 2 MiB or with a NUL byte in its first 8,000 bytes, its lines counted to check and cut the span, then `Blame`, each distinct commit of the ranges read once and built by `commitObjects` without `stats`; `search.go` serves the search route: `q` checked (1 to 500 characters, no NUL) with the strict booleans `regex` and `case_sensitive`, then `Grep` from the resolved commit, the `path` globs applied by `glob.go`, each line cut to its first 500 characters (runes, not bytes), git stopped once one match past the page is read, and `gitrepo.ErrInvalidPattern` answered `400 invalid_request` |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/secret` | the hub's secrets, whose values leave the hub through no response, log line or error: `LoadKeys` reads the operator's current key (`PARLEY_SECRETS_KEY`, or the file `[secrets].key_file` names) and previous key (`PARLEY_SECRETS_KEY_PREVIOUS`), each standard padded base64 of 32 bytes, into `Keys`, whose keys print, log and encode as JSON as `[key]` (an absent key encodes as `null`); `Seal` and `Open` seal a value with AES-256-GCM under the current key, a fresh 12-byte nonce and a binding of its owner as additional data, and open it with the current or the previous key by the `KeyID` (the first 8 bytes of the key's SHA-256 in hex) it carries; `SealValue`, `OpenValue` and `NeedsReseal` do the same for values that are not named secrets, with the key id in front of the sealed bytes; `Component` (the hub uses its zero value, bound once at start by `Bind(Deps)` to the store, the keys, the clock, the scrubber and the event log; `New(Deps)` builds a bound one; table `secrets`, created by `SchemaStep`, unique on scope, scope id and the key with A to Z lowered) is the one place secrets are read, stored and removed, in the scopes `ScopeUser`, `ScopeOrg` and `ScopeWorkspace`: `Get` reads one secret of exactly one scope on every call, matching the key ignoring ASCII case, registers the value with the scrubber and fails a value no key opens with `ErrUnreadable`, never as absent; `Put`, `Delete`, `RemoveScope` and the package function `RemoveWorkspace` change secrets inside the caller's transaction and write no event; `CreateEntries` (all or nothing, the limit of 100 checked before a conflict), `ListPage`, `UpdateEntry`, `DeleteEntry` and `Count` serve the secret routes; `Routes` are the secret routes and `ScopeCheck` the access check that resolves a route's scope from its `MarkScope` mark; `Available` reports whether a current key is configured; `StartReport` counts the stored values whose key id is neither configured key's and `(StartReport).Log` writes the start lines; `Reencrypt` is the maintenance task that re-seals the values under the previous key with the current one and runs the `Converter`s other parts add with `RegisterConverter`; `ErrUnavailable` (no current key), `ErrUnreadable` (no configured key opens the value), `ErrInvalid`, `ErrLimitReached`, `ErrConflict` and `ErrNotFound` are the errors to match, and `UnavailableError` is the `503 secrets_unavailable` the REST API answers for `ErrUnavailable`; the same component keeps variables, readable values in the same three scopes (table `variables`, `VarSchemaStep`): `CreateVars`, `ListVars`, `UpdateVar`, `DeleteVar` and `VarRoutes` serve the variable routes, `RemoveVarScope` and `RemoveWorkspaceVars` remove a scope's variables inside the caller's transaction, `Chain` is a workspace's resolution chain (`Step`, `Origin`, `ErrWorkspaceNotFound`), `ResolveVars` the variables it runs with and `ResolveSecrets` the secrets of a list of names along it, `ResolveSecretsIn` the same with the chain's records read through the caller's transaction |
-| `internal/session` | the agent sessions: the session record, its token usage and its links to forks, change versions, pushes, commits, claims, lands and sandboxes (`SchemaStep`), the routes `POST /sessions`, `GET /sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, `POST` and `GET /sessions/:id/usage` and `GET /workspaces/:slug/cost`, the session-linking rule (`Check`, `ErrUnknownSession`), the recording operation (`Record`, `Link` and its constructors), the forced close (`CloseActive`), the usage observers and active-session counts for the metrics (`OnUsage`, `ActiveCounts`), and the run id of a session for the record of sandbox use (`RunOf`); see [Agent sessions](#agent-sessions) |
-| `internal/telemetry` | agent telemetry: run events, session outcomes, tool calls, tool errors and trace records stored once per id, and one postmortem per workspace and run, in the analytical store (`SchemaSteps`); the eight ingestion routes under `/workspaces/:slug/runs/:run_id`, single and in batches; the key `[audit].write_timeout` (`ConfigKey`, `WriteTimeoutFrom`); the recorder of sandbox use (`RecordSandboxUse`, `SandboxExec`, `SandboxAttach`, `SandboxUpload`, `SandboxDownload`); and the run event observers (`OnRunEvent`); see [Agent telemetry](#agent-telemetry) |
+| `internal/session` | the agent sessions: the session record, its token usage and its links to forks, change versions, pushes, commits, claims, lands and sandboxes (`SchemaStep`), the routes `POST /sessions`, `GET /sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, `POST` and `GET /sessions/:id/usage` and `GET /workspaces/:slug/cost`, the session-linking rule (`Check`, `ErrUnknownSession`), the recording operation (`Record`, `Link` and its constructors), the forced close (`CloseActive`), the usage observers and active-session counts for the metrics (`OnUsage`, `ActiveCounts`), the run id of a session for the record of sandbox use (`RunOf`), and the store operations of retention (`TimeOutActiveBefore`, `DeleteTerminalBefore`, and the orphan deletes and counts in `retention.go`); see [Agent sessions](#agent-sessions) |
+| `internal/telemetry` | agent telemetry: run events, session outcomes, tool calls, tool errors and trace records stored once per id, and one postmortem per workspace and run, in the analytical store (`SchemaSteps`); the eight ingestion routes under `/workspaces/:slug/runs/:run_id`, single and in batches; the key `[audit].write_timeout` (`ConfigKey`, `WriteTimeoutFrom`); the recorder of sandbox use (`RecordSandboxUse`, `SandboxExec`, `SandboxAttach`, `SandboxUpload`, `SandboxDownload`); the run event observers (`OnRunEvent`); the seven read routes of a run (`read.go`, `postmortem_read.go`, `transcript.go`) with the shared query validator (`Query`, `ReadQuery`, `ValidRunID`), the newest-first read of run events for the audit query (`NewestRunEvents`), and the store operations of retention (`retention.go`); see [Agent telemetry](#agent-telemetry) |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
@@ -60,8 +62,14 @@ the address it bound (with port `0` in `Addr`, the port the system chose),
 the REST body limit (`MaxBodySize`), the rate limit (`RequestsPerMinute`,
 `RateLimitDisabled`, and `Now`, the clock it and the idempotency records
 read, which tests replace), the `Logger` (a `*slog.Logger`; nil means
-`slog.Default()`), `LogHealthProbes` and the `IdempotencyStore` (nil means
-an in-memory store).
+`slog.Default()`), `LogHealthProbes`, the `IdempotencyStore` (nil means
+an in-memory store) and `Wrap`, a function that wraps the whole handler,
+outside the request ids and the access log, which the hub uses for the
+HTTP request metrics. `server.MatchedPattern(r)` names the route that
+served a request, for such a wrapper: the REST route's method and pattern
+written as a mux pattern (`GET /api/v1/workspaces/{slug}/sync`, a catch-all
+as `{name...}`), a mounted surface's mux pattern, or `""` when nothing
+matched.
 `Serve` serves `Handler()`, so the running hub and in-process tests answer
 the same way.
 
@@ -512,7 +520,9 @@ appends it there ([ADR 01](adr/01-compose-the-hub-in-one-package.md)).
 | `AddBackgroundWork(name, grace, func(ctx, *hub.Runtime))` | work that runs while the hub serves, until its context is cancelled at the stop (see [The stop](#the-stop)) |
 | `AddRoute(server.Route)`, `Handle(pattern, handler)` | REST routes and surfaces outside the REST API |
 | `SetAuthenticator`, `SetBindingGuard`, `SetScopeCheck`, `AddAccessCheck` | the checks of the pipeline's positions |
-| `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: none) |
+| `SetSandboxRuntime(sandbox.RuntimeFactory)`, `SetSandboxRecorder(sandbox.Recorder)` | the factory of the sandbox runtime client (default: the OpenShell implementation) and the recorder of the sandbox metrics (default: the hub's metrics registry, which the metrics part sets) |
+| `Metrics()` | the hub's metrics registry (`*metrics.Registry`), created with the composition, on which a part reports or registers a source (see [Metrics](#metrics)) |
+| `RegisterDeliveryPruner(audit.DeliveryPruner)` | the store the retention step `webhook_deliveries` prunes; one, a second is refused ([erratum 51](errata/51_audit_query_and_retention.md)) |
 | `SetSandboxPolicyCollector(sandbox.PolicyCollectorOptions)` | the policy collector's interval, retry delay and clock (default: 5 s, 5 s, the hub's clock), or `Hold`, which keeps the hub's collector from running so that a test drives its own |
 | `AdjustWorkspace(func(*workspace.Deps))` | a change to the workspace service's dependencies, applied after the start hook `workspaces` builds them and before it binds them, in the order added; tests replace a collaborator with it |
 | `AdjustGitServer(func(*gitserver.Deps))` | a change to the git server's dependencies, applied after the start hook `gitserver` builds them and before it binds them, in the order added; tests replace a collaborator with it, such as the git runner, the timeout or a service in place of the exchange |
@@ -1522,8 +1532,8 @@ that is not among them is one the user has no level on. A workspace is
 therefore in a user's set exactly when `Level` resolves a level other than
 `LevelNone` for it, with that level. The visibility decision of the hub
 events calls `Readable` (see [Hub events](#hub-events)), and so does the
-workspace list (`GET /workspaces`, see Workspace records); the audit query
-will.
+workspace list (`GET /workspaces`, see Workspace records) and the audit
+query (see [Audit query and retention](#audit-query-and-retention)).
 
 #### Workspace-bound tokens
 
@@ -3286,7 +3296,8 @@ invalid gzip, request too large), a failed git, a timeout or a client that went 
 reports the processor's `Result`. Every other answer, a refusal of a check or
 the answer of a `Service`, is judged by its status: `refused` for `401`,
 `403` and `404`, `ok` below `300`, `error` otherwise. `Component.Requests`
-returns a copy of the counts; nothing exports them at `/metrics` yet.
+returns a copy of the counts, which the metrics part exports at `/metrics`
+as `parley_git_requests_total`.
 
 The fetch exchange passes git's request through a `requestScanner`
 (`pktline.go`) as git reads it, under either protocol version and whether
@@ -3351,8 +3362,8 @@ trial, outside any transaction, and a restack on the report of its replay,
 before its transaction; `internal/change` and `internal/scm` cannot import
 `internal/land`, so they take the attribution as a function value, and nil
 names no landed change.
-`Recorder` keeps its default, which records nothing, since the metric
-export is not in the hub yet; the sessions part registers the
+`Recorder` is the metrics part's adapter, which adds each observation to
+`parley_scm_requests_total`; the sessions part registers the
 `SessionLinker` (see [Agent sessions](#agent-sessions)).
 
 Every read route is `GET /workspaces/:slug/scm/…`, declared with the scope
@@ -5241,8 +5252,9 @@ dependencies with `AdjustSessions`; the component is `Sessions()`.
   record may already be gone when a removal calls it.
 - **The hand-off to the metrics.** `OnUsage` registers usage observers,
   called once per new usage record after its transaction has committed,
-  and `ActiveCounts` counts the active sessions per workspace. No part
-  registers an observer or reads the counts yet.
+  and `ActiveCounts` counts the active sessions per workspace. The metrics
+  part registers an observer for `parley_agent_tokens_total`, and the
+  retention step `gauges` reads the counts.
 
 The part registers, through one adapter per consumer (`registerSessionLinkers`),
 the linking rule and, where the consumer records links, the recording
@@ -5278,8 +5290,8 @@ trailing zeros; JSON members are stored as JSON text and answered as raw
 JSON. Nothing is written to the event log, and no workspace remover is
 registered: telemetry outlives its workspace.
 
-`composeTelemetry` (`internal/hub/telemetry.go`) is the last of the parts,
-since it reads the session component. It registers the key
+`composeTelemetry` (`internal/hub/telemetry.go`) comes after the session
+part, since it reads the session component. It registers the key
 `[audit].write_timeout` (`ConfigKey`, read with `WriteTimeoutFrom`), the
 schema steps and the routes, and binds the component in its start hook
 `telemetry` with `telemetry.Deps`: `DB` (`telemetry.SQL` over
@@ -5336,8 +5348,116 @@ dependencies with `AdjustTelemetry`; the component is `Telemetry()`.
   single route, a batch or the recorder, after the write has committed
   (`observer.go`); nothing else is reported. An observer that panics is
   logged with the event type and the next one is called, so the answer
-  does not depend on it. No part registers one yet:
-  the metrics of the audit records will.
+  does not depend on it. The metrics part registers one, which counts
+  the run events by type for `parley_audit_events_total`.
+
+### Audit query and retention
+
+`internal/audit` holds the audit query and the retention of the audit and
+session records. `composeAudit` (`internal/hub/audit.go`) comes after the
+event and telemetry parts, whose components it reads.
+
+- **The query.** `GET /audit` (`query.go`) declares the scope `audit:read`
+  and no workspace, so a workspace-bound PAT reaches it through the
+  allowlist. It reads its filters into one value before anything is read
+  (`filters.go`, through `telemetry.ReadQuery` and `event.ParseTypes`),
+  checks the `workspace` filter against the event component's rule
+  (`event.CheckWorkspace`), with a task fork's slug also accepted when its
+  parent is, and then reads its two sources through narrow interfaces
+  (`sources.go`): `HubEvents`, which `(*event.Component).ReadNewest`
+  satisfies (the stored events newest first from a place `(time, id)`,
+  filtered in SQL, `parley.webhook.ping` left out, visibility decided by
+  `Visible` with one viewer per read, reading in batches until it holds the
+  page), and `RunEvents`, which `(*telemetry.Component).NewestRunEvents`
+  satisfies (the run events newest first, confined in SQL to a scope: every
+  workspace for the admin token; otherwise the caller's readable set, and
+  for a caller that is not bound the deleted forks of readable
+  repositories). Each source returns `limit+1` items after the cursor's
+  position `(time, id, source)`, and the two are merged by time, then id,
+  descending, a hub event before a run event (`item.go`), into items of
+  seventeen members.
+- **The keys.** `Register` (`config.go`) registers the five retention keys
+  of `[audit]` (the section also holds telemetry's `write_timeout`) and the
+  two of `[sessions]`; `SettingsFrom` reads them. `NewSettings` also refuses
+  an `[events].retention` longer than `[audit].max_age`: the audit part runs
+  it as a configuration check on the loaded `[events]` section, since the
+  event component is bound only in its start hook, and again when its start
+  hook builds the run with `(*event.Component).Retention()`.
+- **The run.** `NewRetention(steps, recorder, logger, clock)`
+  (`retention.go`) takes one function for each of the eleven names of
+  `StepNames()` and refuses an unknown or a missing one. `Run` calls them in
+  that order; a step that fails or panics is logged (`retention step
+  failed`, with `step`), counted in `parley_retention_errors_total{step}`,
+  and the next runs; only a run without a failure sets
+  `parley_retention_last_run_timestamp_seconds`. A cancelled context stops
+  it before the next step and counts nothing. The audit part registers it
+  as the maintenance task `retention`, the first of every pass, with the
+  steps `retentionSteps` binds and the hub's metrics registry as its
+  recorder.
+- **The steps** are built over interfaces the stores satisfy:
+  `SessionSteps` (`stale_sessions`, `sessions`) over
+  `(*session.Component).TimeOutActiveBefore` and `DeleteTerminalBefore`;
+  `TelemetrySteps` (`run_records`, `max_runs`, `traces`, `postmortems`)
+  over the deletes of `internal/telemetry/retention.go`; `EventSteps`
+  (`event_log`, `hub_events`) over `Expire` and `DeleteBefore`;
+  `DeliverySteps` (`webhook_deliveries`) over the `DeliveryPruner`
+  registered with `RegisterDeliveryPruner`, or nothing; `OrphanSteps`
+  (`orphans`) over the workspace records (`access.StoreRecords`) and the
+  `WorkspaceSlugs`/`DeleteWorkspaceRecordsBefore` of the session, telemetry
+  and event components; and `GaugeSteps` (`gauges`) over their
+  `CountRecords` and `ActiveCounts`. Each store operation runs in a
+  transaction of its own and compares the stored text against a cutoff
+  rounded up to the column's precision, so that "older than" is strict; no
+  delete of hub events removes the one with the highest `seq` or an event
+  without a workspace.
+
+### Metrics
+
+`internal/metrics` holds the hub's metrics on the standard library alone
+and imports nothing of the project. The catalogue (`catalogue.go`) is one
+table of the 27 metrics with their help text, type, labels in order, the
+values of each closed label and the bounds of each histogram.
+`metrics.New(logger)` returns a registry that holds, from the start, a zero
+series for every combination of closed label values, and an empty-label
+placeholder for a family with an open label until it has a series of its
+own.
+
+- **Reports.** The registry is a `Recorder`: `Add` (counter), `Set` (gauge)
+  and `Observe` (histogram), each with a name, a label map (nil for none)
+  and a value, and `SetFamily`, which replaces every series of a gauge. A
+  report that names a metric outside the catalogue, other labels, a value
+  outside a closed set, the wrong call for the type or a negative counter
+  amount returns an error naming the metric and changes nothing. The
+  method set without `SetFamily` is the sandbox recorder's, so the
+  registry is that recorder as it is. `metrics.Discard` records nothing.
+- **Sources.** `RegisterSource(name, src)` gives a counter or gauge one
+  function the registry calls at every `Gather`, outside its lock; a source
+  that fails or panics exports its zero series for that read and is logged
+  with the metric's name, and a sample with a label value outside a closed
+  set is dropped.
+- **Exposition.** `Gather` returns the families in catalogue order, series
+  sorted by their label values; `WriteText` writes them in the text format
+  0.0.4, and `Handler(reg)` serves them with `ContentType`.
+- **Requests.** `Instrument(rec, now, pattern, next)` counts every request
+  in `parley_http_requests_total{method,path,status}` and times it in
+  `parley_http_request_duration_seconds`, `path` being the pattern
+  `server.MatchedPattern` names without its method, or `unmatched`. Its
+  writer unwraps to the original, so flushing and hijacking still work.
+
+The registry is created with the composition (`Metrics()`), one per hub.
+`composeMetrics` (`internal/hub/metrics.go`), the last part, mounts
+`GET /metrics`, installs the instrumentation as `server.Options.Wrap` with
+the hub's clock, sets the registry as the sandbox recorder, and connects the
+values the other packages export, one reporter per metric
+(`connectProducers`): sources over `(*gitserver.Component).Requests`,
+`(*change.Component).OpenCounts`, `(*fork.Component).CountTaskForks`,
+`(*jobs.Queue).Depth` and the event component's `Counters` (`LastSeq`,
+`OpenStreams`, and `WrittenByType` merged with a tally of the run events
+`OnRunEvent` reports, for `parley_audit_events_total`); an observer on
+`OnUsage` for the tokens; a final observer on the land component for the
+three land metrics; and an `scm.Recorder` adapter set with `AdjustSCM`. The
+retention run sets `parley_audit_records` and
+`parley_agent_sessions_active` in its `gauges` step.
 
 ### Carry-patch workspaces
 
@@ -6192,7 +6312,8 @@ leave the log: in a write transaction it sets `oldest_seq` to the lowest
 `seq` whose `time` is not older than `cutoff`, or to `last_seq` when every
 event is older, so the newest event stays. It never lowers the bound, deletes
 no row, does nothing on an empty log (returning 0), and returns the new
-`oldest_seq`. Its schedule is the retention run's.
+`oldest_seq`. The retention step `event_log` calls it with now minus
+`Retention()`.
 
 `(*Component).Run(ctx)` follows the commits. The store has no after-commit
 hook, so while anything waits it reads `last_seq` every 100 ms of real time,
@@ -6927,8 +7048,8 @@ not commit, a provisioning that ends `failed` or finds its sandbox moved or
 removed, and a fork-transaction sandbox that was rolled back; the packages
 that stop and delete sandboxes call it when they end one.
 
-**Metrics.** Through the recorder `SetSandboxRecorder` gives (none by
-default): `parley_sandbox_creates_total{result}` for each provisioning that
+**Metrics.** Through the recorder `SetSandboxRecorder` gives (the hub's
+metrics registry by default): `parley_sandbox_creates_total{result}` for each provisioning that
 ended `ready` or `failed`, counted once the ending transaction has
 committed, `parley_sandboxes{state}` for the five states other than
 `deleted`, set from the store's counts after every insert, every applied

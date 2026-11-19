@@ -274,6 +274,16 @@ workspace that no longer exists:
 {"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"revoked the tokens bound to workspaces that no longer exist","count":2}
 ```
 
+The maintenance task `retention` writes one line for each of its steps
+that fails or panics, naming the step, and goes on with the next; the task
+then fails too, with the `maintenance task failed` line naming the failed
+steps (see [configuration.md](configuration.md#retention)):
+
+```json
+{"time":"2026-11-14T10:13:00.000000+01:00","level":"ERROR","msg":"retention step failed","step":"run_records","error":"delete the records with timestamp before …: database is locked"}
+{"time":"2026-11-14T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"retention","error":"retention steps failed: run_records"}
+```
+
 The maintenance task `secret_reencryption` writes one info line in every
 pass that ends without a store error: `converted` is the number of values it
 sealed again under the current key, `remaining` the number of stored values
@@ -381,6 +391,7 @@ Usage:
 
 Available Commands:
   admin             Administer the hub's users, organizations, API keys and access tokens
+  audit             Query who did what on the hub and in the agents' runs
   change            Open, list and read the changes of a workspace, their versions and their diffs
   credential-helper Give git the hub credential for the hub's own URL (git's credential helper protocol)
   events            Follow the hub's events, or read them a page at a time
@@ -1653,6 +1664,40 @@ exit status is `1` (see [Errors and exit statuses](#errors-and-exit-statuses)).
 |---|---|
 | `parley events tail [--workspace <slug>] [--types <types>] [--session <id>] [--after <seq>]` | `GET /api/v1/events` with the query parameters of the flags given |
 | `parley events list [--workspace <slug>] [--types <types>] [--session <id>] [--after <seq>] [--limit <n>] [--wait <seconds>]` | `GET /api/v1/events/log` with the query parameters of the flags given |
+
+### `parley audit`
+
+`parley audit query` reads one page of the audit query, `GET
+/api/v1/audit` (see [api.md](api.md#get-apiv1audit)): the hub events and
+the agents' run events the credential may see, newest first. It sends one
+request with the credential as `Authorization: Bearer` and a query
+parameter for each flag given, and prints the hub's page on stdout with
+exit status `0`. `parley audit` run without a command prints its help and
+exits `0`.
+
+| Flag | Parameter |
+|---|---|
+| `--source <hub\|agent>` | `source` |
+| `--workspace <slug>` | `workspace` |
+| `--types <list>` | `types`, comma-separated; an entry ending in `*` matches every type beginning with the text before it |
+| `--session <id>` | `session_id` |
+| `--run-id <id>` | `run_id` |
+| `--actor-id <id>` | `actor_id` |
+| `--resource-type <type>` | `resource_type` |
+| `--resource-id <id>` | `resource_id` |
+| `--action <action>` | `action` |
+| `--since <time>`, `--until <time>` | `since`, `until`, RFC 3339 |
+| `--limit <n>` | `limit` |
+| `--cursor <c>` | `cursor`, the `next_cursor` of the previous page |
+
+A flag not given sends no parameter; a value is sent as given, and one the
+hub refuses is its `400` or `404` on stderr as received, with nothing on
+stdout and exit status `1`. A positional argument, and a `--limit` that is
+not an integer, are usage errors (exit status `2`) before any request.
+
+```sh
+parley audit query --workspace demo --types 'parley.change.*,tool.started' --limit 20
+```
 
 ### `parley secrets`
 
