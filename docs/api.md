@@ -7835,8 +7835,13 @@ secret values.
    credential's provider on the scheme, host and port of
    `[server].external_url`, for the API and git paths of the sandbox's
    workspace) when it has a hub credential, then one rule per attached
-   credential naming its provider — and the rules a registered policy
-   composer adds.
+   credential naming its provider — and the added rules (see
+   [The network policy of a sandbox](#the-network-policy-of-a-sandbox)).
+   A base policy that refers to the provider of the sandbox's hub
+   credential ends the sandbox `failed` with `provision_failed` before
+   anything is created, and so does a policy the runtime rejects, with an
+   error that names the first workspace sandbox rule the runtime rejects it
+   with, or the profile when it rejects the policy without any.
 4. It checks the repository out (below) and, with `restore_from`, has the
    working directory restored from the source sandbox's checkpoint: each
    checkpointed branch is set to its commit (a dirty one to the commit
@@ -8479,6 +8484,246 @@ each object's `runtime_reachable` is the runtime client's flag (see
 `state`, `limit` or `cursor`, and a cursor of a page with other filters, is
 answered `400 invalid_request`. A failure to read the records is `500
 internal` with the message `internal error`, and no items.
+
+## The network policy of a sandbox
+
+A sandbox reaches the hub, the endpoints of its credentials and what its
+operator allowed, and nothing else. The runtime gets its policy in three
+parts, for a create and again for every start:
+
+1. the base policy of the sandbox's profile (its `policy` file, or the
+   built-in policy);
+2. the protected rules: the hub rule when the sandbox has a hub credential,
+   then one rule per attached credential, in the order of `credentials`.
+   No base policy, workspace rule or approved rule removes or narrows them;
+3. the added rules: the workspace sandbox rules recorded when the sandbox
+   was created, in the order of `workspace_rules`, then the rules approved
+   for the sandbox itself, in the order they were approved. An approved
+   rule equal, as a JSON value, to a recorded workspace rule is added once.
+
+A rule is an object in OpenShell's policy schema that the hub stores and
+passes on without reading it. At the runtime a workspace rule is named by
+its id (`sbr_…`) and an approved rule by its proposal's id (`sbp_…`).
+
+When a sandbox is stored, the hub records, in the same transaction, the
+workspace sandbox rules its workspace holds at that moment (for a task
+fork, its parent's), oldest first: their ids are the sandbox's
+`workspace_rules` and the `workspace_rules` of its `parley.sandbox.create`,
+and a copy of each body is kept with the sandbox. The set never changes: a
+rule saved later never reaches the sandbox, and a rule deleted later stays
+in its policy, across stop and start. This holds whatever the profile and
+`[sandbox].allow_workspace_rules`. A sandbox created with `restore_from` is
+a new sandbox: it gets the workspace rules that exist at its own creation
+and none of the rules approved for its source alone.
+
+### Denials
+
+While a sandbox is `ready`, the hub follows its policy log at the runtime
+and takes each entry whose action is `deny`. Every denial adds 1 to
+`parley_sandbox_denials_total`. The first denial of each (program, host,
+port) of a sandbox writes one event, and later denials of the same three
+write none, whatever their method and path; which ones were reported is
+stored, so a restart reports none twice:
+
+```json
+{"seq":51,"id":"…","type":"parley.sandbox.deny","time":"2026-11-18T12:01:00Z","workspace":"demo--t1","actor_type":"system","actor_id":null,"resource_type":"sandbox","resource_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","action":"deny","session_id":null,"metadata":{"program":"npm","host":"registry.example.org","port":443,"method":null,"path":null}}
+```
+
+`method` and `path` are `null` for a blocked connection. The sandbox's
+secret values in the texts read `[redacted]`. A policy log that breaks, or a
+runtime that cannot be reached, is logged and read again 5 seconds later;
+the hub keeps serving. A sandbox's log stops being followed once it leaves
+`ready`. Its denials stay visible in its logs (see
+[`GET …/logs`](#get-apiv1workspacesslugsandboxesidlogs)).
+
+### Proposals
+
+When a workload is blocked, it can ask, with the runtime's own mechanism,
+for one more rule. Every 5 seconds the hub lists the runtime's pending
+proposals. A proposal of a sandbox whose profile had `allow_proposals` when
+the sandbox was created is stored as `open`, once, with this event:
+
+```json
+{"seq":52,"id":"…","type":"parley.sandbox.proposal","time":"2026-11-18T12:01:05Z","workspace":"demo--t1","actor_type":"system","actor_id":null,"resource_type":"sandbox","resource_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","action":"proposal","session_id":null,"metadata":{"proposal_id":"sbp_0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f","summary":"npm → registry.example.org:443","max_severity":"high"}}
+```
+
+`max_severity` is the highest severity of the findings in the order `low`,
+`medium`, `high` (a severity the runtime names otherwise ranks below
+`low`), `null` without findings. A proposal of a sandbox whose profile did
+not allow proposals is rejected at the runtime, and nothing is stored or
+written; one of a sandbox the hub does not hold, or holds as `deleted`, is
+left alone. When the sandbox is deleted, its `open` proposals become
+`withdrawn` in the same transaction, with no event; they are removed with
+its record.
+
+A proposal has exactly these members:
+
+```json
+{"id":"sbp_0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f","sandbox_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","rule":{"host":"registry.example.org","port":443},"summary":"npm → registry.example.org:443","findings":[{"severity":"high","message":"a package registry can serve arbitrary code"}],"state":"approved","scope":"workspace","workspace_rule_id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b","decided_by":{"actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"dana"},"decided_at":"2026-11-18T12:03:00Z","comment":"npm registry","created_at":"2026-11-18T12:01:05Z"}
+```
+
+| Member | Value |
+|---|---|
+| `id` | `sbp_` and 32 lowercase hexadecimal characters |
+| `sandbox_id` | the sandbox that asked |
+| `rule` | the proposed rule, as the runtime gave it |
+| `summary` | the runtime's one line about it |
+| `findings` | the runtime's findings, `{severity, message}` each, `[]` when none |
+| `state` | `open`, `approved`, `rejected` or `withdrawn` |
+| `scope` | `sandbox` or `workspace` once approved, else `null` |
+| `workspace_rule_id` | with `scope` `workspace`, the workspace sandbox rule the approval saved or found identical; else `null` |
+| `decided_by` | `{actor_type, actor_id, username}` of the decider, or `null`; for the admin token `actor_id` and `username` are `""` |
+| `decided_at`, `comment` | set by a decision, else `null` |
+| `created_at` | when the hub stored it |
+
+### Workspace sandbox rules
+
+A workspace sandbox rule is an approved rule saved on a repository
+workspace, which every sandbox created later on the workspace or on any of
+its forks gets. A task fork holds none of its own: its slug stands for its
+parent's rules. A workspace holds at most 50. Deleting a workspace deletes
+its rules, with no event. A rule has exactly these members:
+
+```json
+{"id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b","rule":{"host":"registry.example.org","port":443},"summary":"npm → registry.example.org:443","findings":[{"severity":"high","message":"a package registry can serve arbitrary code"}],"from_proposal":{"sandbox_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","proposal_id":"sbp_0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f","workspace":"demo--t1"},"created_by":{"actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"dana"},"created_at":"2026-11-18T12:03:00Z"}
+```
+
+| Member | Value |
+|---|---|
+| `id` | `sbr_` and 32 lowercase hexadecimal characters |
+| `rule` | the rule as it was approved |
+| `summary`, `findings` | the proposal's, as they were acknowledged |
+| `from_proposal` | `{sandbox_id, proposal_id, workspace}`: the proposal it came from and the workspace of its sandbox, which may be a fork |
+| `created_by` | `{actor_type, actor_id, username}` of the approver |
+| `created_at` | when it was saved |
+
+## `GET /api/v1/workspaces/{slug}/sandboxes/{id}/proposals`
+
+Lists a sandbox's proposals. A read route of the [sandbox
+routes](#sandbox-routes): a PAT needs `sandboxes:read`, and a token bound to
+the workspace may call it. The sandbox is looked up in the workspace: an
+unknown id, the id of another workspace's sandbox and a removed record are
+`404 sandbox_not_found`; a `deleted` sandbox is served.
+
+| Query parameter | Value |
+|---|---|
+| `state` | `open` (the default), `approved`, `rejected` or `withdrawn`, written exactly so and given once |
+| `limit`, `cursor` | as for every [list](#lists) |
+
+The answer is `200` with a [list](#lists) of [proposals](#proposals) in that
+state, oldest first by `created_at` and then by `id`. It asks the runtime
+nothing. Any other `state` is `400 invalid_request`.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/proposals/{proposal_id}/approve`
+
+Approves an open proposal. A write route of the [sandbox
+routes](#sandbox-routes) that refuses every workspace-bound token: the
+binding guard answers such a token, the sandbox's own hub credential
+included, `403 token_bound` before anything else is checked. The body is a
+JSON object, all members optional (no body counts as `{}`, a `null` member
+as absent):
+
+| Member | Value |
+|---|---|
+| `comment` | a string |
+| `acknowledge_findings` | a boolean; `true` is needed to approve a proposal with a finding of severity `high` |
+| `scope` | `sandbox` (the default) or `workspace` |
+
+Approving adds the rule to the sandbox's policy at the runtime when the
+sandbox is `provisioning` or `ready`; in `stopped`, `completed` and
+`failed` the runtime is not asked and the rule is in the policy of the next
+start. Then, in one transaction, the proposal becomes `approved` with
+`scope`, `decided_by`, `decided_at` and `comment`, the rule is kept for the
+sandbox for its life, its `policy_revision` grows by one, and this event is
+written with the caller as actor:
+
+```json
+{"seq":53,"id":"…","type":"parley.sandbox.proposal_decided","time":"2026-11-18T12:03:00Z","workspace":"demo--t1","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"sandbox","resource_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","action":"proposal_decided","session_id":null,"metadata":{"proposal_id":"sbp_0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f","decision":"approved","acknowledged_findings":true,"scope":"workspace","rule_id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b"}}
+```
+
+With `scope` `workspace` the approval also saves the rule on the sandbox's
+workspace, or on its parent when that is a task fork, in the same
+transaction, and records its id as the proposal's `workspace_rule_id` and
+the event's `rule_id` (`null` for scope `sandbox`). After the decision it
+writes, in the same transaction:
+
+```json
+{"seq":54,"id":"…","type":"parley.sandbox.rule_add","time":"2026-11-18T12:03:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"sandbox_rule","resource_id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b","action":"rule_add","session_id":null,"metadata":{"rule_id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b","summary":"npm → registry.example.org:443","max_severity":"high","from_proposal":{"sandbox_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","proposal_id":"sbp_0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f","workspace":"demo--t1"}}}
+```
+
+`workspace` is the workspace that holds the rule and `session_id` the
+sandbox's. A rule equal, as a JSON value (key order and whitespace aside),
+to one the workspace holds is not saved twice: the approval names that rule
+and writes no `parley.sandbox.rule_add`, also when the workspace holds 50.
+
+The answer is `200` with the proposal as stored. The checks come in this
+order, and a refused approval changes nothing:
+
+| Case | Answer |
+|---|---|
+| a workspace-bound token | `403 token_bound` |
+| a PAT without `sandboxes:write` | `403 insufficient_scope` |
+| read-only access to the sandbox's workspace | `403 forbidden` |
+| a body that is not an object, a `comment` that is not a string, an `acknowledge_findings` that is not a boolean, a `scope` other than `sandbox` or `workspace` | `400 invalid_request` |
+| `scope` `workspace` while `[sandbox].allow_workspace_rules` is false | `403 workspace_rules_disabled` |
+| `scope` `workspace` without write access to the workspace that would hold the rule (a fork owner who can only read the parent) | `403 forbidden` |
+| `scope` `workspace` on a fork whose parent is archived | `409 parent_archived` |
+| an unknown sandbox id | `404 sandbox_not_found` |
+| an unknown proposal id, or one of another sandbox | `404 not_found` |
+| a proposal that is not `open` | `409 proposal_decided` |
+| a finding of severity `high` without `acknowledge_findings` `true` | `409 findings_not_acknowledged` |
+| `scope` `workspace`, 50 rules and none identical | `429 sandbox_rule_limit_reached` |
+| the runtime rejects the rule | `409 conflict`, the runtime's reason in `message` (secret values `[redacted]`, at most 1,024 bytes) |
+| the runtime cannot be reached | `502 sandbox_runtime_error` |
+
+Decisions of one sandbox are made one at a time, and approvals that save
+on one workspace one at a time: of two decisions of one proposal sent
+together, one is applied and the other answered `409 proposal_decided`,
+and of two promotions racing for a workspace's last place, one saves its
+rule and the other is answered `429`.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/proposals/{proposal_id}/reject`
+
+Rejects an open proposal. Declared like the approve route; the body is a
+JSON object with an optional `comment` (a string), and its other members
+are ignored. In one transaction the proposal becomes `rejected` with
+`decided_by`, `decided_at` and `comment`, and `parley.sandbox.proposal_decided`
+is written with `decision` `rejected`, `acknowledged_findings` `false`,
+`scope` `null` and `rule_id` `null`. A finding of severity `high` needs no
+acknowledgement, and `policy_revision` does not change. Then the runtime is
+told, in any state of the sandbox; when it cannot be told, the hub logs a
+line with the sandbox's and the proposal's ids and still answers `200` with
+the proposal. The refusals are the approve route's for a bound token, the
+scope, read-only access, the body, an unknown sandbox or proposal and a
+proposal that is not `open`.
+
+## `GET /api/v1/workspaces/{slug}/sandbox-rules`
+
+Lists the [workspace sandbox rules](#workspace-sandbox-rules) of a
+workspace; with a task fork's slug, its parent's. A read route of the
+[sandbox routes](#sandbox-routes): a PAT needs `sandboxes:read`, and a
+token bound to the fork may call it under the fork's slug. `limit` and
+`cursor` are those of every [list](#lists). The answer is `200` with the
+rules, oldest first by `created_at` and then by `id`; `items` is `[]` for a
+workspace without rules.
+
+## `DELETE /api/v1/workspaces/{slug}/sandbox-rules/{rule_id}`
+
+Deletes a workspace sandbox rule. A write route of the [sandbox
+routes](#sandbox-routes) that refuses every workspace-bound token (`403
+token_bound`), and works in any state of the workspace, archived included.
+It deletes the rule and writes, in one transaction, with the caller as
+actor:
+
+```json
+{"seq":60,"id":"…","type":"parley.sandbox.rule_remove","time":"2026-11-18T13:00:00Z","workspace":"demo","actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","resource_type":"sandbox_rule","resource_id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b","action":"rule_remove","session_id":null,"metadata":{"rule_id":"sbr_5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b","summary":"npm → registry.example.org:443"}}
+```
+
+and answers `204` with no body. No sandbox changes: the ones that have the
+rule keep it. After the scope and access checks, a task fork's slug is
+`400 not_supported_on_fork` (delete the rule on the parent), and an
+unknown rule id, a rule of another workspace or one already deleted is
+`404 sandbox_rule_not_found`.
 
 ## User selectors
 

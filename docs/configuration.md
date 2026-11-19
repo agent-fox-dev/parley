@@ -213,6 +213,16 @@ long a `ready` sandbox may go without activity before the hub stops it,
 and its `checkpoint` whether the hub checkpoints a sandbox before it stops
 or deletes it and when its main process ends.
 
+`allow_workspace_rules` says whether an approval of a sandbox's network
+proposal may save its rule on the workspace (`scope` `workspace`, see
+[api.md](api.md#the-network-policy-of-a-sandbox)). With `false` such an
+approval is refused with `403 workspace_rules_disabled`; the rules saved
+earlier stay listed, are still recorded with every new sandbox, and can be
+deleted. A profile's `allow_proposals` says whether the proposals of its
+sandboxes reach a person: the value a sandbox was created with counts, and
+a proposal of a sandbox created without it is rejected at the runtime and
+not stored.
+
 A duration is a whole number followed by one of `s`, `m`, `h` or `d` (24
 hours), such as `30m` or `7d`. Relative paths in `tls_cert`, `tls_key`,
 `tls_ca`, `token_file`, `oidc_client_secret_file` and a profile's `policy`
