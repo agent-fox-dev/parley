@@ -315,7 +315,17 @@ func TestSandboxLifecycle_AnExpiredSandboxIsCheckpointedAndItsWorkRestoredIntoAN
 	start := time.Now().UTC().Truncate(time.Second)
 	clock := hubtest.NewJobClock(func() time.Time { return start })
 	h, token := startRealGitLifecycleHub(t, clock)
-	first, _ := parleyAs(t, h, token, "sandbox", "create", "demo--t1", "--ttl", "1m", "--wait", "--poll-interval", "1s")["id"].(string)
+	// The sandbox is set up through the API, whose wait wakes on the
+	// sandbox's change; the CLI's wait polls once a second at the most.
+	status, raw := h.Call(t, http.MethodPost, "/api/v1/workspaces/demo--t1/sandboxes", token, map[string]any{"ttl": "1m"})
+	var created map[string]any
+	if status != http.StatusCreated || json.Unmarshal(raw, &created) != nil {
+		t.Fatalf("create a sandbox of demo--t1 = %d %s; want 201", status, raw)
+	}
+	first, _ := created["id"].(string)
+	if s := h.object(t, http.MethodGet, "/api/v1/workspaces/demo--t1/sandboxes/"+first+"?wait_for=ready&wait=30", nil, http.StatusOK); s["state"] != sandbox.StateReady {
+		t.Fatalf("the sandbox %s = %v; want it ready", first, s)
+	}
 	inSandbox(t, h, first, "-c", "user.email=agent@example.test", "-c", "user.name=agent", "commit", "--allow-empty", "--quiet", "-m", "c1")
 	c1 := inSandbox(t, h, first, "rev-parse", "HEAD")
 	if err := os.WriteFile(filepath.Join(workDirOf(h, first), "notes.txt"), []byte("not saved anywhere yet\n"), 0o644); err != nil {

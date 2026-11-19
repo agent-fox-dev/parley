@@ -44,7 +44,8 @@ const (
 // When another action moved the sandbox meanwhile, nothing is written, and
 // the sandbox is returned as that action left it. When ctx ends before the
 // runtime is asked to stop the sandbox, as when the hub stops, nothing is
-// called or written and the context's error is returned. A stop waits for the
+// called or written and the context's error is returned; once the runtime
+// has stopped it, the stop is recorded even when ctx has ended. A stop waits for the
 // stop or deletion of the same sandbox in progress, and then works from
 // the stored record.
 func (s *Service) Stop(ctx context.Context, rec Record, reason string, actor Actor) (Record, error) {
@@ -74,6 +75,11 @@ func (s *Service) Stop(ctx context.Context, rec Record, reason string, actor Act
 	if err := s.client.StopSandbox(ctx, rec.ID); err != nil {
 		return rec, &scrubbedError{text: s.ScrubSandbox(context.WithoutCancel(ctx), rec.ID, err.Error()), err: err}
 	}
+	// The runtime has released the compute by now, so the stop is recorded
+	// even when the caller has left: a record left ready would keep a live
+	// hub credential for a stopped sandbox, which nothing repairs.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+	defer cancel()
 	var (
 		applied bool
 		report  func()

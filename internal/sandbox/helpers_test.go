@@ -1251,7 +1251,8 @@ const defaultHead = "0123456789abcdef0123456789abcdef01234567"
 // runtimeHooks steer the provisioning's runtime calls of a create hub: hook,
 // when set, is called before each EnsureProvider, CreateSandbox, WaitReady
 // and RunMain with the operation and the provider's or sandbox's name, and
-// an error it returns is the call's. exec, when set, is asked before each
+// an error it returns is the call's; it is called after each StopSandbox
+// the runtime carried out, while its caller still waits for the answer. exec, when set, is asked before each
 // Exec: an error it returns is the call's, and a non-zero code ends the
 // command with that code and stderr. They keep the command of each RunMain
 // and, in one log, every command run in a sandbox, every main-process start
@@ -1403,6 +1404,13 @@ func (c *hookedClient) RunMain(ctx context.Context, name string, command []strin
 	c.hooks.mains[name] = slices.Clone(command)
 	c.hooks.log = append(c.hooks.log, runCall{sandbox: name, kind: "main", argv: slices.Clone(command)})
 	return nil
+}
+
+func (c *hookedClient) StopSandbox(ctx context.Context, name string) error {
+	if err := c.Client.StopSandbox(ctx, name); err != nil {
+		return err
+	}
+	return c.hooks.before(ctx, runtime.OpStopSandbox, name)
 }
 
 func (c *hookedClient) Exec(ctx context.Context, name string, req runtime.ExecRequest) (runtime.ExecResult, error) {

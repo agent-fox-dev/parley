@@ -41,3 +41,15 @@ func Touch(s *Service, ctx context.Context, id string, at time.Time) { s.touch(c
 // SetCheckpointFileLimit makes n bytes the size above which a checkpoint
 // leaves an untracked file out; 0 restores CheckpointFileLimit.
 func SetCheckpointFileLimit(s *Service, n int64) { s.checkpointLimit.Store(n) }
+
+// CheckpointTurns is how many checkpoint attempts of the sandbox id hold
+// or wait for its turn.
+func CheckpointTurns(s *Service, id string) int {
+	l := &s.checkpointing
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.held[id]; e != nil {
+		return e.users
+	}
+	return 0
+}

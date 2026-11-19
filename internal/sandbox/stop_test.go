@@ -176,6 +176,33 @@ func TestStopRoute(t *testing.T) {
 		}
 	})
 
+	t.Run("records the stop when the caller leaves while the runtime stops the sandbox", func(t *testing.T) {
+		id, _ := h.workSandbox(t, func(r *sandbox.Record) { r.Snapshot.Checkpoint = false })
+		cred := h.hubCredential(t, id)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		h.hooks.set(func(_ context.Context, op, name string) error {
+			if op == runtime.OpStopSandbox && name == id {
+				cancel()
+			}
+			return nil
+		})
+		t.Cleanup(func() { h.hooks.set(nil) })
+
+		if _, err := h.svc.Stop(ctx, storedRecord(t, h.Hub, id), sandbox.StopAPI, sandbox.SystemActor); err != nil {
+			t.Errorf("Stop: %v; want the stop recorded", err)
+		}
+		if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateStopped || rec.StateReason != sandbox.StopAPI {
+			t.Errorf("the sandbox is %s (%q); want it stopped for api", rec.State, rec.StateReason)
+		}
+		if c := h.credentialAnswer(t, cred); c.status != http.StatusUnauthorized {
+			t.Errorf("a request with the hub credential = %d %s; want 401", c.status, c.body)
+		}
+		if evs := h.sandboxEvents(t, sandbox.EventStop, id); len(evs) != 1 {
+			t.Errorf("the stop events = %+v; want one", evs)
+		}
+	})
+
 	t.Run("applies each transition once when requests race", func(t *testing.T) {
 		noCheckpoint := func(r *sandbox.Record) { r.Snapshot.Checkpoint = false }
 		// racing sends the requests at once and returns their statuses.

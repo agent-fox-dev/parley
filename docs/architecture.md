@@ -6878,7 +6878,9 @@ that racing requests and the hub's own work apply one transition and write
 one event (an operation whose transition did not apply writes nothing
 else). Stop and delete also take turns per sandbox (`Service.lifecycle`, an
 in-process lock per id), so racing stops make one runtime call; each
-re-reads the record once its turn comes.
+re-reads the record once its turn comes. Once the runtime was asked to
+stop a sandbox, the stop records its move on a context of its own, even
+when the caller has left.
 
 | File | Operation |
 |---|---|
@@ -6906,12 +6908,16 @@ changes become one commit built in a temporary index copied from the real
 one (`git add --all`, which honours `.gitignore`, `write-tree`,
 `commit-tree` with `gitrepo.HubSignature` and no hooks or signing), so the
 sandbox's index, branches and working tree are not touched; untracked
-files over `CheckpointFileLimit` (100 MiB) are left out with an
-`:(exclude,literal)` pathspec. One `git bundle` of the kept heads, without
+files over `CheckpointFileLimit` (100 MiB), which one `find` in the
+sandbox names, are left out with an `:(exclude,literal)` pathspec. One `git bundle` of the kept heads, without
 what the clone's `origin` already holds, is read with the runtime's
 `Download` into a temporary file on the hub and fetched with
-`gitrepo.Repo.FetchBundle`, which sets every ref under
-`refs/parley/sandboxes/<id>/` in one ref transaction. The files an attempt
+`gitrepo.Repo.FetchBundle`, which sets the attempt's refs under
+`refs/parley/sandboxes/<id>/` in one ref transaction; earlier refs of
+other branches stay. The attempts of one sandbox take turns from the fetch
+to the record (`Service.checkpointing`, a lock set apart from
+`Service.lifecycle`, which a stop or a deletion holds while it
+checkpoints), so the refs and the stored checkpoint are one attempt's. The files an attempt
 makes in the sandbox are named relative to the working directory, under its
 git directory, and removed afterwards. The attempt is bounded by
 `CheckpointBound` (5 minutes) on the hub's clock; the stored
@@ -6924,7 +6930,8 @@ the push path (`pushrule`), so no change, version or push event results.
 of a create's refusals (`workspace.RequireReady`, `fork.GuardUpdate`, the
 resolution of the record's snapshot, `CheckQuota`), mints the replacement
 hub credential (`MintHubCredential`, its value kept in memory before the
-commit as a create's is), revokes the old one, moves the record to
+commit as a create's is), revokes the old one, records the hub's clock as
+the last activity, so that the next idle pass leaves it, moves the record to
 `provisioning` with the `start` marker and `parley.sandbox.start`, and wakes
 the provisioner. A start's provisioning (`startSteps` in `provision.go`)
 clears nothing at the runtime first, registers the providers again with

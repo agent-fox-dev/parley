@@ -38,8 +38,8 @@ var errSandboxDeleted = server.NewError("sandbox_deleted", http.StatusConflict, 
 //
 // An accepted start, in one transaction, moves the sandbox to provisioning
 // with EventStart by actor, clearing state_reason, ended_at and exit_code,
-// drops an optional name that no longer resolves from its credentials or
-// exposed secrets, mints a new hub credential with the stored scopes and
+// records the hub's clock as its last activity, drops an optional name
+// that no longer resolves from its credentials or exposed secrets, mints a new hub credential with the stored scopes and
 // paths, expiring at the sandbox's expires_at, in place of the old one,
 // which it revokes, and marks the sandbox for the provisioner, which starts
 // it at the runtime (see provisionOne). When another action moved the
@@ -75,7 +75,10 @@ func (s *Service) StartSandbox(ctx context.Context, rec Record, actor Actor) (Re
 			cur, err = Get(ctx, tx, rec.ID)
 			return err
 		}
-		fields := []Field{SetExitCode(nil), SetMarker(MarkerStart)}
+		// A start is an activity: without it an idle stop's old
+		// last_activity_at would have the next idle pass stop the sandbox
+		// again as soon as it is ready.
+		fields := []Field{SetExitCode(nil), SetMarker(MarkerStart), SetLastActivityAt(s.deps.Now())}
 		if names := res.CredentialNames(); !slices.Equal(names, rec.Credentials) {
 			fields = append(fields, SetCredentials(names))
 		}

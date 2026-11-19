@@ -58,7 +58,7 @@ var sandboxStringFlags = []struct{ flag, member, usage string }{
 // newSandboxCommand builds parley sandbox: the hub's sandboxes and the
 // profiles they are created from.
 func newSandboxCommand() *cobra.Command {
-	return group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles",
+	sandbox := group("sandbox", "Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles",
 		declare(command{
 			Name:        "profiles",
 			Description: "List the sandbox profiles the hub offers, in name order",
@@ -121,6 +121,16 @@ func newSandboxCommand() *cobra.Command {
 			Auth:        authUser,
 			Run:         downloadFromSandbox,
 		}),
+	)
+	sandbox.AddCommand(sandboxLifecycleCommands()...)
+	return sandbox
+}
+
+// sandboxLifecycleCommands builds the commands that change a sandbox's
+// life: parley sandbox checkpoint, stop, start, extend and delete, each on
+// <workspace-slug> <id>.
+func sandboxLifecycleCommands() []*cobra.Command {
+	return []*cobra.Command{
 		declare(command{
 			Name:        "checkpoint",
 			Description: "Save a running sandbox's working directory as its checkpoint and print the sandbox",
@@ -186,7 +196,7 @@ func newSandboxCommand() *cobra.Command {
 				}{c.args[sandboxIDArg.Name], "deleted"}
 			},
 		}),
-	)
+	}
 }
 
 // deleteSandbox is the run step of parley sandbox delete: it sends

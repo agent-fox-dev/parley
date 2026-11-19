@@ -120,11 +120,16 @@ type CheckpointState struct {
 // successful checkpoint, and returns the stored checkpoint with the
 // scrubbed error; the sandbox's state is left as it is. When ctx ends
 // first, as when the hub stops, the attempt is abandoned and nothing is
-// recorded.
+// recorded. The attempts of one sandbox take turns: one waits for the one
+// in progress to be recorded before it begins.
 func (s *Service) Checkpoint(ctx context.Context, rec Record, actor Actor) (*CheckpointState, error) {
 	if rec.HubAccess == nil {
 		return nil, nil
 	}
+	// The attempts of one sandbox take turns from the fetch of their refs
+	// to the write of their record: two that overlap could store the refs
+	// of one and the record of the other, which a restore then refuses.
+	defer s.checkpointing.lock(rec.ID)()
 	attempt, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	bound := s.newTimer(CheckpointBound)
@@ -460,25 +465,35 @@ func (r *checkpointRun) dirtyCommit(ctx context.Context, heads map[string]string
 }
 
 // largeUntracked lists the untracked files git does not ignore that are
-// larger than the limit, in git's order, reading their sizes through the
-// runtime.
+// larger than the limit, in git's order. One find in the sandbox names the
+// files over the limit, so that the cost does not grow with the number of
+// untracked files, as a runtime call per file would.
 func (r *checkpointRun) largeUntracked(ctx context.Context) ([]string, error) {
 	out, err := r.git(ctx, gitCall{args: []string{"ls-files", "--others", "--exclude-standard", "-z"}})
 	if err != nil {
 		return nil, err
 	}
+	res, err := r.client.Exec(ctx, r.rec.ID, runtime.ExecRequest{WorkDir: WorkDir, Command: []string{
+		"find", ".", "-path", "./" + path.Clean(r.gitDir), "-prune", "-o",
+		"-type", "f", "-size", "+" + strconv.FormatInt(r.limit, 10) + "c", "-print0",
+	}})
+	switch {
+	case err != nil:
+		return nil, err
+	case res.ExitCode > 1:
+		// find exits with 1 when it could not visit a directory, which git
+		// cannot read either; what it found elsewhere still holds.
+		return nil, exitError("find", res)
+	}
+	over := map[string]bool{}
+	for p := range strings.SplitSeq(string(res.Stdout), "\x00") {
+		if p != "" {
+			over[strings.TrimPrefix(p, "./")] = true
+		}
+	}
 	var large []string
 	for p := range strings.SplitSeq(out, "\x00") {
-		if p == "" {
-			continue
-		}
-		fi, err := r.client.Stat(ctx, r.rec.ID, path.Join(WorkDir, p))
-		switch {
-		case errors.Is(err, runtime.ErrNotFound):
-			// Gone meanwhile: git adds nothing of it either.
-		case err != nil:
-			return nil, err
-		case !fi.Dir && fi.Size > r.limit:
+		if p != "" && over[p] {
 			large = append(large, p)
 		}
 	}

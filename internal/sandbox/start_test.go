@@ -243,6 +243,17 @@ func TestStartRoute(t *testing.T) {
 					t.Fatalf("POST stop = %d %s", a.status, a.body)
 				}
 			}},
+			{name: "stopped by the idle pass", end: func(t *testing.T, id string) {
+				h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+					return sandbox.Update(ctx, tx, id, sandbox.SetLastActivityAt(h.clock.Now().Add(-31*time.Minute)))
+				})
+				if err := h.svc.IdlePass(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateStopped || rec.StateReason != sandbox.StopIdle {
+					t.Fatalf("after the idle pass the sandbox is %s (%q); want stopped for idle", rec.State, rec.StateReason)
+				}
+			}},
 			{name: "completed with exit code 0", end: func(t *testing.T, id string) { endMain(t, h, id, sandbox.StateCompleted, "", 0) }},
 			{name: "failed with exit code 3", end: func(t *testing.T, id string) { endMain(t, h, id, sandbox.StateFailed, "exit", 3) }},
 			{name: "whose profile is gone from the configuration", end: func(t *testing.T, id string) {
@@ -273,6 +284,14 @@ func TestStartRoute(t *testing.T) {
 				got := h.settled(t, id)
 				if got.State != sandbox.StateReady || got.Marker != "" {
 					t.Fatalf("the started sandbox is %s (%q), marker %q; want ready, unmarked", got.State, got.StateReason, got.Marker)
+				}
+				// A start is an activity: an idle pass right after it leaves
+				// the sandbox running.
+				if err := h.svc.IdlePass(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if rec := storedRecord(t, h.Hub, id); rec.State != sandbox.StateReady {
+					t.Errorf("after the start an idle pass left the sandbox %s (%q); want it ready", rec.State, rec.StateReason)
 				}
 				if p, _ := h.rt.Provider("parley", id+"-model"); p.Value != rotated {
 					t.Errorf("the runtime's provider of model holds %q; want the rotated value %q", p.Value, rotated)

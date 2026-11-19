@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,10 +294,16 @@ func TestCheckpoint_LeavesOutUntrackedFilesOverTheSizeLimit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			calls := len(h.rt.Calls())
 
 			cp, err := h.svc.Checkpoint(context.Background(), storedRecord(t, h.Hub, id), sandbox.SystemActor)
 			if err != nil {
 				t.Fatalf("Checkpoint: %v", err)
+			}
+			// The sizes come from one command in the sandbox, not a runtime
+			// call per untracked file, of which there may be many.
+			if ops := h.sandboxCalls(id, calls); slices.Contains(ops, runtime.OpStat) {
+				t.Errorf("the runtime calls of the checkpoint = %v; want no stat", ops)
 			}
 			wantErr := "skipped: big.bin"
 			if tc.saved {
@@ -513,6 +520,55 @@ func TestCheckpointRoute(t *testing.T) {
 					t.Errorf("the checkpoint events = %+v; want one by dana's API key", evs)
 				}
 			})
+		}
+	})
+
+	t.Run("checkpoints of one sandbox store the refs the workspace holds", func(t *testing.T) {
+		id, dir := h.workSandbox(t, nil)
+		h.cloneWork(t, dir)
+		first := commitWork(t, dir, "first", map[string]string{"f": "1\n"})
+		// The first attempt is held after its refs were stored and before
+		// its checkpoint is, in its clean-up of the sandbox.
+		var holding atomic.Bool
+		held, release := make(chan struct{}), make(chan struct{})
+		h.hooks.setExec(func(argv []string) (int, string, error) {
+			if argv[0] == "rm" && holding.CompareAndSwap(false, true) {
+				close(held)
+				<-release
+			}
+			return 0, "", nil
+		})
+		t.Cleanup(func() { h.hooks.setExec(nil) })
+		statuses := make([]int, 2)
+		var wg sync.WaitGroup
+		wg.Go(func() { statuses[0] = h.call(t, http.MethodPost, path(id), h.key, nil).status })
+		hubtestWait(t, held, "the first checkpoint to be held")
+		second := commitWork(t, dir, "second", map[string]string{"f": "2\n"})
+		done := make(chan struct{})
+		wg.Go(func() {
+			defer close(done)
+			statuses[1] = h.call(t, http.MethodPost, path(id), h.key, nil).status
+		})
+		eventually(t, "the second checkpoint to end or wait for its turn", func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return sandbox.CheckpointTurns(h.svc, id) == 2
+			}
+		})
+		close(release)
+		wg.Wait()
+
+		if statuses[0] != http.StatusOK || statuses[1] != http.StatusOK {
+			t.Fatalf("the checkpoints answered %v; want 200 twice", statuses)
+		}
+		refs, cp := h.checkpointRefs(t, id), h.storedCheckpoint(t, id)
+		if cp == nil || len(cp.Refs) != 1 || refs["t1"] != cp.Refs[0].SHA || len(refs) != 1 {
+			t.Errorf("the workspace holds the checkpoint refs %v and the stored checkpoint is %+v; want both the same", refs, cp)
+		}
+		if refs["t1"] != second {
+			t.Errorf("the checkpoint ref of t1 is %s; want the later attempt's %s, not the first's %s", refs["t1"], second, first)
 		}
 	})
 

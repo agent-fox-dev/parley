@@ -158,16 +158,7 @@ func composeSandbox(c *Composition) {
 	}
 	c.AddSchemaStep(sandbox.SchemaStep)
 	c.AddSchemaStep(sandbox.LogSchemaStep)
-	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
-	svc.RegisterRestorer(svc)
-	// A workspace's archive and deletion reach its sandboxes through the
-	// workspaces' collaborator set (ADR 07), whether sandboxes are on or
-	// not: with them off the records are still deleted and removed, and no
-	// runtime is called.
-	td := c.workspaces.Teardown()
-	td.RegisterSandboxRemover(svc)
-	td.RegisterArchiveObserver(svc)
-	td.RegisterRemover(svc.RemoveWorkspaceRecords)
+	registerSandboxCollaborators(c, svc)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := sandbox.Deps{
@@ -252,6 +243,32 @@ func composeSandbox(c *Composition) {
 		// context's, whatever clock the hub was given.
 		return svc.Start(ctx, client, sandbox.CheckOptions{Recorder: rec})
 	})
+	composeSandboxWork(c, svc)
+}
+
+// registerSandboxCollaborators registers what the sandbox service takes
+// part in while the hub composes: the purge hook of the stored logs, the
+// service as its own restorer of checkpoints, and the service on the
+// workspaces' collaborator set (ADR 07), through which a workspace's
+// archive and deletion reach its sandboxes whether sandboxes are on or not:
+// with them off the records are still deleted and removed, and no runtime
+// is called.
+func registerSandboxCollaborators(c *Composition, svc *sandbox.Service) {
+	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
+	svc.RegisterRestorer(svc)
+	td := c.workspaces.Teardown()
+	td.RegisterSandboxRemover(svc)
+	td.RegisterArchiveObserver(svc)
+	td.RegisterRemover(svc.RemoveWorkspaceRecords)
+}
+
+// composeSandboxWork adds the sandbox feature's work besides the requests,
+// after the runtime check's start hook: the start hooks that resume the
+// provisionings an earlier process left and run the first reconcile pass,
+// the background work of the provisioner, the log collector, the idle and
+// expiry passes and the reconciliation, and the maintenance tasks of log
+// retention and record cleanup. With sandboxes off each returns at once.
+func composeSandboxWork(c *Composition, svc *sandbox.Service) {
 	c.AddStartHook(sandboxProvisionerHook, func(ctx context.Context, _ *Runtime) error {
 		if !svc.Enabled() {
 			return nil

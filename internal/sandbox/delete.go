@@ -153,7 +153,8 @@ func (s *Service) serveDelete(w http.ResponseWriter, r *http.Request) error {
 // stop and delete, take their turns: an action that waited finds the
 // sandbox as the one before it left it, so that racing requests make one
 // runtime call where one is due. The conditional transition still decides
-// what is recorded, for whatever does not take a turn here.
+// what is recorded, for whatever does not take a turn here. The checkpoint
+// attempts of a sandbox take their turns in a set of their own.
 type sandboxLocks struct {
 	mu   sync.Mutex
 	held map[string]*sandboxLock
