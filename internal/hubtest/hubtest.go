@@ -16,9 +16,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,6 +145,47 @@ type Hub struct {
 	// baseEnv is the environment every run of the hub has, before what
 	// Config.Env or RestartEnv adds.
 	baseEnv map[string]string
+	// socket is the hub's listening socket, which outlives a restart, and
+	// run is the current run's hold on it.
+	socket *net.TCPListener
+	run    *runListener
+}
+
+// runListener is one run's hold on the hub's socket. A stop closes it, as
+// the hub closes its listener; when a restart is on its way, the close only
+// ends the run's accepting, and the socket stays bound for the next run, so
+// that no other listener can take the port in between.
+type runListener struct {
+	*net.TCPListener
+	// detach is set by a restart before it stops the run.
+	detach atomic.Bool
+	closed atomic.Bool
+	// released is set when the close closed the socket itself.
+	released atomic.Bool
+}
+
+func (l *runListener) Accept() (net.Conn, error) {
+	if l.closed.Load() {
+		return nil, net.ErrClosed
+	}
+	conn, err := l.TCPListener.Accept()
+	if err != nil && l.closed.Load() {
+		return nil, net.ErrClosed
+	}
+	return conn, err
+}
+
+func (l *runListener) Close() error {
+	if l.closed.Swap(true) {
+		return nil
+	}
+	if l.detach.Load() {
+		// A deadline in the past wakes the run's pending Accept, which then
+		// reports the listener closed.
+		return l.TCPListener.SetDeadline(time.Now())
+	}
+	l.released.Store(true)
+	return l.TCPListener.Close()
 }
 
 // Config is what StartWith starts a hub with besides its defaults.
@@ -214,7 +255,13 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 	if err := os.Remove(tokenFile); err != nil {
 		t.Fatal(err)
 	}
-	h := &Hub{Token: strings.TrimSpace(string(token)), baseEnv: baseEnv}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind a loopback port for the hub: %v", err)
+	}
+	// Registered before Serve's cleanup, so it runs after the hub stopped.
+	t.Cleanup(func() { _ = ln.Close() })
+	h := &Hub{Token: strings.TrimSpace(string(token)), baseEnv: baseEnv, socket: ln.(*net.TCPListener)}
 	h.opts = hub.Options{Env: env, WorkDir: dir, Now: cfg.Now, MaintenanceInterval: cfg.MaintenanceInterval, Compose: func(c *hub.Composition) {
 		c.AddStartHook("test-store", func(_ context.Context, rt *hub.Runtime) error {
 			h.Store = rt.Store
@@ -224,8 +271,19 @@ func StartWith(t testing.TB, cfg Config) *Hub {
 			cfg.Compose(c)
 		}
 	}}
-	h.Served = Serve(t, h.opts)
+	h.serve(t, h.opts)
 	return h
+}
+
+// serve runs the hub with opts on its socket.
+func (h *Hub) serve(t testing.TB, opts hub.Options) {
+	t.Helper()
+	if err := h.socket.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("hand the hub's socket to a new run: %v", err)
+	}
+	h.run = &runListener{TCPListener: h.socket}
+	opts.Listener = h.run
+	h.Served = Serve(t, opts)
 }
 
 // withEnv is base with extra added, as an environment.
@@ -238,7 +296,9 @@ func withEnv(base, extra map[string]string) config.Env {
 // Restart stops the hub, waits up to 10 s for it to return with status 0,
 // and serves it again with the same data directory, configuration,
 // environment and composition on the same port, as a restart of parleyd
-// does. Served, URL and Store are those of the new run afterwards.
+// does. The port stays bound while the hub is down, so that no other
+// listener can take it. Served, URL and Store are those of the new run
+// afterwards.
 func (h *Hub) Restart(t testing.TB) {
 	t.Helper()
 	h.restart(t, h.opts.Env)
@@ -255,24 +315,24 @@ func (h *Hub) RestartEnv(t testing.TB, env map[string]string) {
 
 func (h *Hub) restart(t testing.TB, env config.Env) {
 	t.Helper()
-	addr, _ := h.Listening["addr"].(string)
-	_, portText, err := net.SplitHostPort(addr)
-	if err != nil {
-		t.Fatalf("the listening address %q: %v", addr, err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		t.Fatalf("the listening port %q: %v", portText, err)
-	}
+	h.run.detach.Store(true)
 	h.Stop()
 	if code := h.ExitCode(t, 10*time.Second); code != 0 {
 		t.Fatalf("the hub stopped with %d, want 0; stderr = %q", code, h.Log.String())
 	}
 	h.client.CloseIdleConnections()
+	if h.run.released.Load() {
+		// The test stopped the hub itself before, which let the port go:
+		// bind it again.
+		ln, err := net.Listen("tcp", h.socket.Addr().String())
+		if err != nil {
+			t.Fatalf("bind the hub's port again: %v", err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		h.socket = ln.(*net.TCPListener)
+	}
 	h.opts.Env = env
-	opts := h.opts
-	opts.Port = &port
-	h.Served = Serve(t, opts)
+	h.serve(t, h.opts)
 }
 
 // CreateUser stores the user username with role user and a personal org,
