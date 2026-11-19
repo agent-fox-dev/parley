@@ -704,6 +704,8 @@ type createHub struct {
 	timers *timerLog
 	// limits are the sandbox limits its creates are held to.
 	limits *quotaLimits
+	// proposalSeeds counts the proposals seedProposal stored.
+	proposalSeeds atomic.Int64
 	// dana is the user id of dana, key her API key.
 	dana, key, org string
 	// base is the commit main of demo points at in a create world.
@@ -4048,4 +4050,97 @@ func (h *collectorHub) policyRows(t *testing.T, id string) [3]int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// startProposalHub starts a create hub whose dana owns the ready
+// repositories demo and other, stored without a git repository, for the
+// tests of the proposal and rule routes.
+func startProposalHub(t *testing.T) *createHub {
+	t.Helper()
+	h := startCreateHub(t, agentProfile)
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		for _, slug := range []string{"demo", "other"} {
+			if err := workspace.Insert(ctx, tx, h.record(slug, access.KindRepository, workspace.StatusReady)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return h
+}
+
+// seedProposal stores a proposal of the sandbox id in state, created at
+// at, with the rule {"host": "<n>.test"}, the summary "allow <n>.test" and
+// no findings, n being a counter of the hub's seeds, as edit changes it
+// when edit is not nil, and returns it as stored.
+func (h *createHub) seedProposal(t *testing.T, id, state string, at time.Time, edit func(*sandbox.Proposal)) sandbox.Proposal {
+	t.Helper()
+	n := h.proposalSeeds.Add(1)
+	host := fmt.Sprintf("p%d.test", n)
+	p := sandbox.Proposal{
+		ID: sandbox.NewProposalID(), SandboxID: id, RuntimeID: strconv.FormatInt(n, 10),
+		Rule: json.RawMessage(`{"host":"` + host + `"}`), Summary: "allow " + host, State: state, CreatedAt: at,
+	}
+	if edit != nil {
+		edit(&p)
+	}
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := sandbox.InsertProposal(ctx, tx, p)
+		return err
+	})
+	return p
+}
+
+// proposalMap is the proposal object of p as a decoded answer holds it:
+// its twelve members, null where p leaves them unset, findings [] without
+// findings and the timestamps in RFC 3339, UTC, whole seconds.
+func proposalMap(t *testing.T, p sandbox.Proposal) map[string]any {
+	t.Helper()
+	var rule any
+	if err := json.Unmarshal(p.Rule, &rule); err != nil {
+		t.Fatal(err)
+	}
+	findings := []any{}
+	for _, f := range p.Findings {
+		findings = append(findings, map[string]any{"severity": f.Severity, "message": f.Message})
+	}
+	o := map[string]any{
+		"id": p.ID, "sandbox_id": p.SandboxID, "rule": rule, "summary": p.Summary, "findings": findings,
+		"state": p.State, "scope": nil, "workspace_rule_id": nil, "decided_by": nil, "decided_at": nil,
+		"comment": nil, "created_at": stamp(p.CreatedAt),
+	}
+	if p.Scope != nil {
+		o["scope"] = *p.Scope
+	}
+	if p.WorkspaceRuleID != nil {
+		o["workspace_rule_id"] = *p.WorkspaceRuleID
+	}
+	if by := p.DecidedBy; by != nil {
+		o["decided_by"] = map[string]any{"actor_type": by.ActorType, "actor_id": by.ActorID, "username": by.Username}
+	}
+	if p.DecidedAt != nil {
+		o["decided_at"] = stamp(*p.DecidedAt)
+	}
+	if p.Comment != nil {
+		o["comment"] = *p.Comment
+	}
+	return o
+}
+
+// listItems returns the items of a 200 list answer, decoded, and its
+// next_cursor ("" for null).
+func listItems(t *testing.T, a answer) (items []any, next string) {
+	t.Helper()
+	o := decoded(t, a, http.StatusOK)
+	items, ok := o["items"].([]any)
+	if !ok {
+		t.Fatalf("the list %s has no items list", a.body)
+	}
+	if o["next_cursor"] != nil {
+		next, ok = o["next_cursor"].(string)
+		if !ok || next == "" {
+			t.Fatalf("the list %s has a next_cursor that is neither null nor a cursor", a.body)
+		}
+	}
+	return items, next
 }

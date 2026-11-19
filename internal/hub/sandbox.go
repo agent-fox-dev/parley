@@ -108,7 +108,9 @@ const (
 // the service's stop, DELETE /workspaces/:slug/sandboxes/:id deletes a
 // sandbox through the service's delete, which runs the delete hooks, and
 // PATCH /workspaces/:slug/sandboxes/:id sets a sandbox's ttl, purpose and
-// labels through the service's extend.
+// labels through the service's extend. GET
+// /workspaces/:slug/sandboxes/:id/proposals lists a sandbox's network
+// proposals in one state, open by default.
 //
 // A workspace's deletion has the service delete the sandboxes of the
 // workspace and its forks first, by the system, with reason
@@ -218,6 +220,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.StartRoute())
 	c.AddRoute(svc.DeleteRoute())
 	c.AddRoute(svc.ExtendRoute())
+	c.AddRoute(svc.ProposalsRoute())
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}

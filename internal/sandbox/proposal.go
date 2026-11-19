@@ -12,6 +12,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
 // The states of a proposal: open until a decision approves or rejects it,
@@ -244,6 +245,43 @@ func PurgeNetworkPolicy(ctx context.Context, tx *sql.Tx, sandboxID string) error
 		}
 	}
 	return nil
+}
+
+// proposalJSON is the proposal object every answer shows: its twelve
+// members, each always present and null where the proposal leaves it
+// unset, findings [] without findings, and the timestamps in RFC 3339, UTC,
+// with whole seconds, as in the sandbox object.
+type proposalJSON struct {
+	ID              string          `json:"id"`
+	SandboxID       string          `json:"sandbox_id"`
+	Rule            json.RawMessage `json:"rule"`
+	Summary         string          `json:"summary"`
+	Findings        []findingJSON   `json:"findings"`
+	State           string          `json:"state"`
+	Scope           *string         `json:"scope"`
+	WorkspaceRuleID *string         `json:"workspace_rule_id"`
+	DecidedBy       *Creator        `json:"decided_by"`
+	DecidedAt       *timefmt.Time   `json:"decided_at"`
+	Comment         *string         `json:"comment"`
+	CreatedAt       timefmt.Time    `json:"created_at"`
+}
+
+// proposalObject returns the proposal object of p.
+func proposalObject(p Proposal) proposalJSON {
+	o := proposalJSON{
+		ID: p.ID, SandboxID: p.SandboxID, Rule: p.Rule, Summary: p.Summary,
+		Findings: make([]findingJSON, len(p.Findings)), State: p.State, Scope: p.Scope,
+		WorkspaceRuleID: p.WorkspaceRuleID, DecidedBy: p.DecidedBy, Comment: p.Comment,
+		CreatedAt: timefmt.Time(p.CreatedAt),
+	}
+	for i, f := range p.Findings {
+		o.Findings[i] = findingJSON(f)
+	}
+	if p.DecidedAt != nil {
+		at := timefmt.Time(*p.DecidedAt)
+		o.DecidedAt = &at
+	}
+	return o
 }
 
 // scanProposal reads the proposalColumns of a row with scan.
