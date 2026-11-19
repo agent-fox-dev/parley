@@ -75,6 +75,24 @@ an environment `unsupported`
 release, every start therefore ends `failed` with `provision_failed`. The
 behaviour is tested against the in-memory runtime.
 
+## A checkpoint is held to the maximum push size
+
+The package bounds only the untracked files of the extra commit (100 MiB
+each); it sets no bound on the commits of unpushed branches, which a
+checkpoint carries into the workspace's repository as a push would, but
+outside the git server and its `[git].max_push_size`. A workload could
+fill the hub's disk with one large commit on a branch it never pushed.
+A checkpoint's bundle is therefore held to the push's limit: the hub reads
+at most `[git].max_push_size` bytes of it from the runtime, and at one
+byte more stops reading, fails the checkpoint (`ok` false, `error`
+`the checkpoint bundle exceeds the maximum push size (<n> bytes)`, the
+refs of the last successful checkpoint kept, none stored) and removes the
+temporary file. With the key at `"0"`, its default, there is no limit, as
+there is none for a push the sandbox's hub credential could make. Code:
+`internal/sandbox/checkpoint.go` (`download`), `Deps.MaxCheckpointSize`
+set in `internal/hub/sandbox.go`; test:
+`TestCheckpoint_IsHeldToTheMaximumPushSize`.
+
 ## Smaller choices
 
 - The extra commit of a checkpoint is authored and committed by the hub's

@@ -71,6 +71,11 @@ type Deps struct {
 	// caller's transaction, as identity.SetTokenExpiryByID does: a change of
 	// a sandbox's ttl moves its hub credential's expiry with it.
 	SetTokenExpiry func(ctx context.Context, tx *sql.Tx, tokenID string, at time.Time) error
+	// MaxCheckpointSize is the largest git bundle in bytes a checkpoint may
+	// bring to the hub, [git].max_push_size, 0 for no limit: a checkpoint
+	// carries the commits of unpushed branches into the workspace's
+	// repository as a push would, so it is held to the push's limit.
+	MaxCheckpointSize int64
 	// ExternalURL is [server].external_url, the address a sandbox reaches the
 	// hub at; without one no sandbox gets a hub credential.
 	ExternalURL string
