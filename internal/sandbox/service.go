@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/agent-fox-dev/parley/internal/config"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
@@ -72,6 +73,10 @@ type Service struct {
 	// restorer restores a checkpoint into a sandbox created from one, nil
 	// for none; guarded by mu.
 	restorer Restorer
+	// unstored maps each sandbox created in a caller's transaction, whose
+	// record may not be committed, to when the provisioner checks that it
+	// is; guarded by mu.
+	unstored map[string]time.Time
 	// wakeup holds a token while a created sandbox waits for the
 	// provisioner.
 	wakeup chan struct{}

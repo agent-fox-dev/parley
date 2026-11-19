@@ -323,6 +323,7 @@ func (p *provisioner) pass(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	p.s.dropUnstored(ctx)
 	ids, err := markedSandboxes(ctx, p.s.deps.Store.Main())
 	if err != nil {
 		if ctx.Err() == nil {

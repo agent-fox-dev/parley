@@ -227,7 +227,7 @@ func (s *Service) create(ctx context.Context, tx *sql.Tx, in CreateInput, body m
 	if err != nil {
 		return Record{}, Values{}, err
 	}
-	res, err := s.Resolve(ctx, w.Slug, snapshot)
+	res, err := s.resolveIn(ctx, tx, w.Slug, snapshot)
 	if err != nil {
 		return Record{}, Values{}, err
 	}

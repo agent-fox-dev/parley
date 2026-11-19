@@ -53,17 +53,18 @@ var errChainNotBound = errors.New("the secret component is not bound to the work
 // calls. A slug with no record is ErrWorkspaceNotFound; a read that fails is
 // another error.
 func (c *Component) Chain(ctx context.Context, slug string) ([]Step, error) {
-	_, steps, err := c.chain(ctx, slug)
+	_, steps, err := c.chain(ctx, c.deps.Records, slug)
 	return steps, err
 }
 
-// chain is Chain, which also returns the workspace's record.
-func (c *Component) chain(ctx context.Context, slug string) (access.Record, []Step, error) {
+// chain is Chain with the workspace records read from records, which also
+// returns the workspace's record.
+func (c *Component) chain(ctx context.Context, records access.RecordReader, slug string) (access.Record, []Step, error) {
 	d := c.deps
-	if d.Records == nil || d.Memberships == nil || d.UserExists == nil {
+	if records == nil || d.Memberships == nil || d.UserExists == nil {
 		return access.Record{}, nil, errChainNotBound
 	}
-	rec, found, err := d.Records.Record(ctx, slug)
+	rec, found, err := records.Record(ctx, slug)
 	if err != nil {
 		return access.Record{}, nil, fmt.Errorf("read the chain of %s: %w", slug, err)
 	}
@@ -75,7 +76,7 @@ func (c *Component) chain(ctx context.Context, slug string) (access.Record, []St
 	// it, which stands when the parent's record is gone.
 	orgID := rec.OrgID
 	if rec.Kind == access.KindFork {
-		parent, found, err := d.Records.Record(ctx, rec.ParentSlug)
+		parent, found, err := records.Record(ctx, rec.ParentSlug)
 		if err != nil {
 			return access.Record{}, nil, fmt.Errorf("read the chain of %s: %w", slug, err)
 		}

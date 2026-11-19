@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/openshell"
+	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
 const (
@@ -55,8 +57,13 @@ const (
 // checkout its commit identity and the hub's logger; the other
 // sandbox packages register their delete and purge hooks on the service.
 // POST /workspaces/:slug/sandboxes creates a sandbox through the service's
-// create; GET /workspaces/:slug/sandboxes/:id reads one, waiting on the
-// service's transitions until the hub begins to stop at the latest, and GET
+// create, and so does POST /workspaces/:slug/forks with a sandbox member,
+// in the fork's transaction: with sandboxes on, the same start hook
+// registers the service as the fork component's sandbox component, and
+// with sandboxes off it registers nothing, so that such a fork create is
+// refused 404 sandboxes_disabled; GET /workspaces/:slug/sandboxes/:id reads
+// one, waiting on the service's transitions until the hub begins to stop at
+// the latest, and GET
 // /workspaces/:slug/sandboxes lists a workspace's, with its forks' that the
 // access component's readable set holds; GET /sandboxes lists the stored
 // sandboxes of every workspace through the service's source.
@@ -88,8 +95,13 @@ func composeSandbox(c *Composition) {
 			Repos: func(ctx context.Context, slug string) (*gitrepo.Repo, error) {
 				return git.Open(ctx, c.workspaces.RepoPath(slug))
 			},
-			ResolveSecrets: c.Secrets().ResolveSecrets,
-			Mint:           c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
+			ResolveSecrets: func(ctx context.Context, q access.Querier, slug string, names []string) (secret.SecretResolution, error) {
+				if q == nil {
+					return c.Secrets().ResolveSecrets(ctx, slug, names)
+				}
+				return c.Secrets().ResolveSecretsIn(ctx, q, slug, names)
+			},
+			Mint: c.access.MintBound, Revoke: identity.RevokeTokenByID, ExternalURL: svc.ExternalURL(),
 			OrgSlug: func(ctx context.Context, id string) (string, error) {
 				org, err := identity.OrgByID(ctx, rt.Store.Main(), id)
 				return org.Slug, err
@@ -104,6 +116,11 @@ func composeSandbox(c *Composition) {
 			adjust(&d)
 		}
 		svc.Bind(d)
+		// Without the component the fork create refuses a sandbox 404
+		// sandboxes_disabled, as a hub with sandboxes off must.
+		if svc.Enabled() {
+			c.Forks().RegisterSandbox(svc)
+		}
 		return nil
 	})
 	c.addConfigCheck(svc.Configure)

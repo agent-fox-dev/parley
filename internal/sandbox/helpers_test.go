@@ -669,6 +669,9 @@ type createHub struct {
 	resolver   *stubResolver
 	minter     *spyMinter
 	linker     *stubLinker
+	// forkLinker is the fork create's session linker, which accepts every
+	// session id.
+	forkLinker *stubLinker
 	// clock is the hub's clock, at recordStart until the test advances it;
 	// the provisioner's pass and bound count on it.
 	clock *hubtest.JobClock
@@ -706,7 +709,7 @@ func startProvisionHub(t *testing.T, profiles string, adjust ...func(*sandbox.De
 func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*sandbox.Deps)) *createHub {
 	t.Helper()
 	h := &createHub{
-		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
+		probeHub: &probeHub{rt: runtimetest.New(t)}, linker: &stubLinker{}, forkLinker: &stubLinker{}, resolver: &stubResolver{}, minter: &spyMinter{},
 		clock: hubtest.NewJobClock(func() time.Time { return recordStart }), rec: &recordingRecorder{}, hooks: &runtimeHooks{head: defaultHead},
 		timers: &timerLog{},
 	}
@@ -723,6 +726,7 @@ func newCreateHub(t *testing.T, profiles string, provision bool, adjust []func(*
 	cfg.Compose = func(c *hub.Composition) {
 		h.svc, h.workspaces, h.secrets = c.Sandbox(), c.Workspaces(), c.Secrets()
 		h.svc.RegisterSessionLinker(h.linker)
+		c.Forks().RegisterSessionLinker(h.forkLinker)
 		c.SetSandboxRecorder(h.rec)
 		c.AdjustSandbox(func(d *sandbox.Deps) {
 			h.resolver.next, d.ResolveSecrets = d.ResolveSecrets, h.resolver.resolve
@@ -784,6 +788,14 @@ func (h *createHub) fork(t *testing.T, slug, parent string, expires time.Time, s
 // forkBy is fork with the fork owned by the user owner.
 func (h *createHub) forkBy(t *testing.T, slug, parent, owner string, expires time.Time, session *string) {
 	t.Helper()
+	f := h.forkRecord(t, slug, parent, owner, expires, session)
+	h.insert(t, func(ctx context.Context, tx *sql.Tx) error { return fork.Insert(ctx, tx, f) })
+}
+
+// forkRecord is the record of the fork forkBy adds, whose repository it
+// makes, as a fork create does before it stores the record.
+func (h *createHub) forkRecord(t *testing.T, slug, parent, owner string, expires time.Time, session *string) fork.Fork {
+	t.Helper()
 	w := h.record(slug, access.KindFork, workspace.StatusReady)
 	w.ParentSlug, w.ExpiresAt, w.SessionID, w.OwnerID = &parent, &expires, session, owner
 	tracking := []string{"main"}
@@ -802,9 +814,27 @@ func (h *createHub) forkBy(t *testing.T, slug, parent, owner string, expires tim
 		}
 		tracking = slices.Sorted(maps.Keys(branches))
 	}
-	h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
-		return fork.Insert(ctx, tx, fork.Fork{Workspace: w, TrackingBranches: tracking})
-	})
+	return fork.Fork{Workspace: w, TrackingBranches: tracking}
+}
+
+// principal is dana as her API key authenticates her.
+func (h *createHub) principal(t *testing.T) identity.Principal {
+	t.Helper()
+	u, err := identity.UserByID(context.Background(), h.Store.Main(), h.dana)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity.Principal{Type: identity.TypeAPIKey, CredentialID: "key", User: &u}
+}
+
+// pass advances the hub's clock by d once the provisioner waits for its
+// next pass, and waits until that pass has run.
+func (h *createHub) pass(t *testing.T, d time.Duration) {
+	t.Helper()
+	eventually(t, "the provisioner to wait", func() bool { return h.timers.live(sandbox.ProvisionInterval) > 0 })
+	before := h.timers.created(sandbox.ProvisionInterval)
+	h.clock.Advance(d)
+	eventually(t, "the provisioner's pass", func() bool { return h.timers.created(sandbox.ProvisionInterval) > before })
 }
 
 // record is the workspace record slug of kind of dana in acme, with the
@@ -1055,7 +1085,7 @@ func (l *stubLinker) setFail(err error) {
 type stubResolver struct {
 	mu   sync.Mutex
 	err  error
-	next func(ctx context.Context, slug string, names []string) (secret.SecretResolution, error)
+	next func(ctx context.Context, q access.Querier, slug string, names []string) (secret.SecretResolution, error)
 }
 
 func (r *stubResolver) setErr(err error) {
@@ -1064,14 +1094,14 @@ func (r *stubResolver) setErr(err error) {
 	r.err = err
 }
 
-func (r *stubResolver) resolve(ctx context.Context, slug string, names []string) (secret.SecretResolution, error) {
+func (r *stubResolver) resolve(ctx context.Context, q access.Querier, slug string, names []string) (secret.SecretResolution, error) {
 	r.mu.Lock()
 	err, next := r.err, r.next
 	r.mu.Unlock()
 	if err != nil {
 		return secret.SecretResolution{}, err
 	}
-	return next(ctx, slug, names)
+	return next(ctx, q, slug, names)
 }
 
 // putSecret stores the secret name with value in the scope scope of the

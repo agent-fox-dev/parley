@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+
+	"github.com/agent-fox-dev/parley/internal/access"
 )
 
 // ResolvedSecret is the answer for one name a resolution was asked: the
@@ -66,7 +68,23 @@ var errWriteAccessNotBound = errors.New("the secret component is not bound to th
 // and never a value. A slug with no record is ErrWorkspaceNotFound; any
 // other failure is another error. An error returns no value.
 func (c *Component) ResolveSecrets(ctx context.Context, slug string, names []string) (SecretResolution, error) {
-	rec, steps, err := c.chain(ctx, slug)
+	return c.resolveSecrets(ctx, c.deps.Records, slug, names)
+}
+
+// ResolveSecretsIn is ResolveSecrets with the workspace records of the
+// chain read through q, so that a record written in a transaction that has
+// not committed yet is seen in that transaction: the fork create asks for
+// the sandbox of a fork it has not committed. The memberships, the users,
+// the write access to the parent and the secrets are read as ResolveSecrets
+// reads them; the fork create writes none of them.
+func (c *Component) ResolveSecretsIn(ctx context.Context, q access.Querier, slug string, names []string) (SecretResolution, error) {
+	return c.resolveSecrets(ctx, access.StoreRecords(q), slug, names)
+}
+
+// resolveSecrets is ResolveSecrets with the chain's records read from
+// records.
+func (c *Component) resolveSecrets(ctx context.Context, records access.RecordReader, slug string, names []string) (SecretResolution, error) {
+	rec, steps, err := c.chain(ctx, records, slug)
 	if err != nil {
 		return SecretResolution{}, err
 	}

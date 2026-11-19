@@ -87,6 +87,34 @@ func TestResolveSecrets_AnswerEachNameFromTheFirstScopeOfTheChainThatHasIt(t *te
 	}
 }
 
+// A fork created in a transaction that has not committed yet, as the fork
+// create asks for its sandbox, resolves along its chain when the records
+// are read through that transaction.
+func TestResolveSecretsIn_SeesTheRecordsOfTheCallersTransaction(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.putSecrets(t, secret.ScopeWorkspace, "acme", "DEPLOY_KEY", "p")
+	w.putSecrets(t, secret.ScopeOrg, w.orgID, "ORG_KEY", "o")
+	ctx := context.Background()
+	errRollback := errors.New("roll back")
+	err := w.Store.Tx(ctx, func(tx *sql.Tx) error {
+		if err := access.InsertRecord(ctx, tx, access.Record{Slug: "acme-new", OwnerID: w.ownerID, OrgID: w.orgID,
+			Kind: access.KindFork, ParentSlug: "acme", Status: access.StatusReady}); err != nil {
+			return err
+		}
+		got, err := w.secrets.ResolveSecretsIn(ctx, tx, "acme-new", []string{"DEPLOY_KEY", "ORG_KEY", "NOPE"})
+		want := []secret.ResolvedSecret{found("DEPLOY_KEY", "p", secret.OriginParent), found("ORG_KEY", "o", secret.OriginOrg), missing("NOPE")}
+		searched := []secret.Origin{secret.OriginWorkspace, secret.OriginParent, secret.OriginOrg, secret.OriginUser}
+		if err != nil || !slices.Equal(got.Secrets, want) || !slices.Equal(origins(got.Searched), searched) {
+			t.Errorf("resolve in the transaction = %+v, %v; want %+v searching %v", got, err, want, searched)
+		}
+		return errRollback
+	})
+	if !errors.Is(err, errRollback) {
+		t.Fatal(err)
+	}
+}
+
 func TestResolveSecrets_ReadTheParentOnlyForAForkItsOwnerCanWriteAndNeverForReservedNames(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)

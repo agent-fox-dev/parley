@@ -56,8 +56,10 @@ type Deps struct {
 	// resolves the ref it checks out.
 	Repos func(ctx context.Context, slug string) (*gitrepo.Repo, error)
 	// ResolveSecrets resolves secret names along the chain of the workspace
-	// slug, as the secret component's ResolveSecrets does.
-	ResolveSecrets func(ctx context.Context, slug string, names []string) (secret.SecretResolution, error)
+	// slug, as the secret component's ResolveSecrets does, with the chain's
+	// workspace records read through q when it is not nil, as its
+	// ResolveSecretsIn does.
+	ResolveSecrets func(ctx context.Context, q access.Querier, slug string, names []string) (secret.SecretResolution, error)
 	// Mint mints a PAT bound to a workspace in the caller's transaction, with
 	// its parley.token.bind event, as the access component's MintBound does:
 	// the one way a hub credential is minted.

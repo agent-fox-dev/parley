@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/secret"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
@@ -81,6 +82,14 @@ var errSecretsUnreadable = server.NewError("secrets_unavailable", http.StatusSer
 // that cannot be read is 503 secrets_unavailable (a *server.Error); any
 // other failure is an error that names no value.
 func (s *Service) Resolve(ctx context.Context, slug string, snap Snapshot) (Resolution, error) {
+	return s.resolveIn(ctx, nil, slug, snap)
+}
+
+// resolveIn is Resolve with the workspace records of slug's chain read
+// through q, nil for the secret component's own reads: a create reads them
+// in its transaction, in which the fork create has stored the fork it asks
+// a sandbox for and not committed it.
+func (s *Service) resolveIn(ctx context.Context, q access.Querier, slug string, snap Snapshot) (Resolution, error) {
 	out := Resolution{Credentials: map[string]string{}, Exposed: map[string]string{}, Searched: []string{}}
 	credentials := slices.Concat(snap.Credentials, snap.OptionalCredentials)
 	exposed := slices.Concat(snap.ExposeSecrets, snap.OptionalExposeSecrets)
@@ -97,7 +106,7 @@ func (s *Service) Resolve(ctx context.Context, slug string, snap Snapshot) (Reso
 	if s.deps.ResolveSecrets == nil {
 		return Resolution{}, errors.New("the sandbox service has no secret resolution")
 	}
-	res, err := s.deps.ResolveSecrets(ctx, slug, asked)
+	res, err := s.deps.ResolveSecrets(ctx, q, slug, asked)
 	switch {
 	case errors.Is(err, secret.ErrUnavailable), errors.Is(err, secret.ErrUnreadable):
 		return Resolution{}, errSecretsUnreadable
