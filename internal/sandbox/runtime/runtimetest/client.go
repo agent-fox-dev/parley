@@ -486,12 +486,11 @@ func (c *client) Exec(ctx context.Context, sandbox string, req runtime.ExecReque
 	if err != nil {
 		return runtime.ExecResult{}, c.end(op, err)
 	}
-	var stdout, stderr bytes.Buffer
-	code := runCommand(ctx, script, sandbox, host, req, &stdout, &stderr)
+	code, stdout, stderr := runCommandOutput(ctx, script, sandbox, host, req)
 	if ctx.Err() != nil {
 		return runtime.ExecResult{}, c.end(op, runtime.NewError(runtime.ErrUnavailable, op, ctx.Err().Error()))
 	}
-	return runtime.ExecResult{ExitCode: code, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, c.end(op, nil)
+	return runtime.ExecResult{ExitCode: code, Stdout: stdout, Stderr: stderr}, c.end(op, nil)
 }
 
 func (c *client) ExecStream(ctx context.Context, sandbox string, req runtime.ExecRequest) (runtime.ExecStream, error) {
