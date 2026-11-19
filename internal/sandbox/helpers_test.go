@@ -3764,3 +3764,29 @@ func (h *createHub) runtimeSandbox(t *testing.T, state string, edit func(*sandbo
 	}
 	return id, h.hubCredential(t, id)
 }
+
+// idLog counts the ids it is given.
+type idLog struct {
+	mu  sync.Mutex
+	ids map[string]int
+}
+
+func (l *idLog) add(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ids == nil {
+		l.ids = map[string]int{}
+	}
+	l.ids[id]++
+}
+
+// snapshot returns a copy of the counts.
+func (l *idLog) snapshot() map[string]int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]int, len(l.ids))
+	for id, n := range l.ids {
+		out[id] = n
+	}
+	return out
+}

@@ -42,6 +42,9 @@ const (
 	// sandboxLogRetentionTask is the name of the maintenance task that
 	// deletes the stored log lines past their retention.
 	sandboxLogRetentionTask = "sandbox_log_retention"
+	// sandboxRecordCleanupTask is the name of the maintenance task that
+	// removes the records of sandboxes deleted more than a day ago.
+	sandboxRecordCleanupTask = "sandbox_record_cleanup"
 )
 
 // composeSandbox adds the sandbox feature: it makes the feature the owner of
@@ -92,6 +95,20 @@ const (
 // PATCH /workspaces/:slug/sandboxes/:id sets a sandbox's ttl, purpose and
 // labels through the service's extend.
 //
+// A workspace's deletion has the service delete the sandboxes of the
+// workspace and its forks first, by the system, with reason
+// workspace_deleted and no checkpoint, and its removal transaction, and that
+// of a fork, remove their sandbox records, running the purge hooks, and a
+// fork's checkpoint refs; an archive has the service stop the ready
+// sandboxes of the workspace and its forks with reason archived. These are
+// registered on the workspaces' collaborator set while the hub composes,
+// whether sandboxes are on or not. With sandboxes on, the start hook also
+// registers the service as the fork component's sandbox lifecycle, through
+// which a fork's removal deletes its sandboxes and its early expiry waits
+// while one is provisioning or ready. The maintenance task
+// sandbox_record_cleanup removes the records of sandboxes deleted more than
+// 24 hours ago, running the purge hooks.
+//
 // The output of each ready sandbox's main process and its policy log are
 // stored in a table of their own: with sandboxes on, the log collector runs
 // as background work, the maintenance task sandbox_log_retention deletes
@@ -127,6 +144,14 @@ func composeSandbox(c *Composition) {
 	c.AddSchemaStep(sandbox.LogSchemaStep)
 	svc.RegisterPurgeHook(sandbox.PurgeLogLines)
 	svc.RegisterRestorer(svc)
+	// A workspace's archive and deletion reach its sandboxes through the
+	// workspaces' collaborator set (ADR 07), whether sandboxes are on or
+	// not: with them off the records are still deleted and removed, and no
+	// runtime is called.
+	td := c.workspaces.Teardown()
+	td.RegisterSandboxRemover(svc)
+	td.RegisterArchiveObserver(svc)
+	td.RegisterRemover(svc.RemoveWorkspaceRecords)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
 		d := sandbox.Deps{
@@ -160,6 +185,7 @@ func composeSandbox(c *Composition) {
 		// sandboxes_disabled, as a hub with sandboxes off must.
 		if svc.Enabled() {
 			c.Forks().RegisterSandbox(svc)
+			c.Forks().RegisterSandboxes(svc)
 		}
 		return nil
 	})
@@ -227,6 +253,9 @@ func composeSandbox(c *Composition) {
 	})
 	c.AddMaintenanceTask(sandboxLogRetentionTask, func(ctx context.Context, _ *Runtime) error {
 		return svc.RetainLogs(ctx)
+	})
+	c.AddMaintenanceTask(sandboxRecordCleanupTask, func(ctx context.Context, _ *Runtime) error {
+		return svc.CleanupRecords(ctx)
 	})
 }
 

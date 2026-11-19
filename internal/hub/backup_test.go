@@ -560,7 +560,7 @@ func TestRun_BacksUpWithoutStartingAnythingOrWritingToTheDataOrConfigDirectory(t
 			log.add("start hook")
 			return nil
 		})
-		c.AddMaintenanceTask("sandbox_record_cleanup", func(context.Context, *hub.Runtime) error {
+		c.AddMaintenanceTask("later_task", func(context.Context, *hub.Runtime) error {
 			log.add("maintenance task")
 			return nil
 		})
