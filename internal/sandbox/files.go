@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"archive/tar"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +13,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -72,9 +75,30 @@ func readFilePath(r *http.Request) (string, error) {
 }
 
 // validateDownload reads the query of a download into u.
-func validateDownload(r *http.Request, u *useRequest) (err error) {
-	u.files.path, err = readFilePath(r)
-	return err
+func validateDownload(r *http.Request, u *useRequest) error {
+	p, err := readFilePath(r)
+	if err != nil {
+		return err
+	}
+	tar, err := readArchive(r)
+	if err != nil {
+		return err
+	}
+	u.files = filesRequest{path: p, tar: tar}
+	return nil
+}
+
+// readArchive reads the archive parameter of a transfer's query: absent,
+// or tar.
+func readArchive(r *http.Request) (bool, error) {
+	q := r.URL.Query()
+	if !q.Has("archive") {
+		return false, nil
+	}
+	if q.Get("archive") != "tar" {
+		return false, server.InvalidRequest("archive: must be tar")
+	}
+	return true, nil
 }
 
 // validateUpload reads the query and the content type of an upload into u.
@@ -85,13 +109,10 @@ func validateUpload(r *http.Request, u *useRequest) error {
 		return err
 	}
 	req := filesRequest{path: p, mode: defaultFileMode}
-	q := r.URL.Query()
-	if q.Has("archive") {
-		if q.Get("archive") != "tar" {
-			return server.InvalidRequest("archive: must be tar")
-		}
-		req.tar = true
+	if req.tar, err = readArchive(r); err != nil {
+		return err
 	}
+	q := r.URL.Query()
 	if q.Has("mode") {
 		if req.tar {
 			return server.InvalidRequest("mode: must not be sent with archive=tar, whose entries carry their modes")
@@ -318,4 +339,156 @@ func cut(name string) string {
 		return name
 	}
 	return name[:most] + "…"
+}
+
+// The error types of a download the sandbox cannot serve: a path it does
+// not have (404), and a directory asked for without archive=tar (400),
+// which tells a client that does not know what the path is to ask again
+// for a tar stream.
+const (
+	errorTypePathNotFound    = "path_not_found"
+	errorTypePathIsDirectory = "path_is_directory"
+)
+
+// download sends the caller the file at the request's path, or, with
+// archive=tar, a tar stream of the directory or the file there. The bytes
+// are sent as the runtime gives them, so a failure after the first of them
+// can only drop the connection (see abortDownload).
+func (s *Service) download(w http.ResponseWriter, r *http.Request, u useRequest) error {
+	fi, err := s.client.Stat(r.Context(), u.rec.ID, u.files.path)
+	if err != nil {
+		return pathError(err)
+	}
+	switch {
+	case u.files.tar:
+		return s.sendTar(w, r, u, fi)
+	case fi.Dir:
+		return server.NewError(errorTypePathIsDirectory, http.StatusBadRequest, "path is a directory; ask for it with archive=tar")
+	}
+	return s.sendFile(w, r, u, fi)
+}
+
+// pathError answers a runtime error about a path. Not found, whether for
+// the path or for the sandbox's working directory, is the missing path;
+// any other error is a runtime failure.
+func pathError(err error) error {
+	if errors.Is(err, runtime.ErrNotFound) {
+		return server.NewError(errorTypePathNotFound, http.StatusNotFound, "the sandbox has no such path")
+	}
+	return err
+}
+
+// sendFile sends the file fi with its length, refused before any byte when
+// it is larger than [sandbox].max_transfer_size.
+func (s *Service) sendFile(w http.ResponseWriter, r *http.Request, u useRequest, fi runtime.FileInfo) error {
+	if fi.Size > s.settings.MaxTransferSize {
+		return tooLarge()
+	}
+	ctx := r.Context()
+	rc, err := s.client.Download(ctx, u.rec.ID, u.files.path)
+	if err != nil {
+		return pathError(err)
+	}
+	defer func() { _ = rc.Close() }()
+	h := w.Header()
+	h.Set("Content-Type", mediaOctets)
+	h.Set("Content-Length", strconv.FormatInt(fi.Size, 10))
+	w.WriteHeader(http.StatusOK)
+	out := &sentBody{w: w, left: fi.Size}
+	if _, err := io.CopyN(out, rc, fi.Size); err != nil {
+		s.abortDownload(ctx, u.rec.ID, out, err)
+	}
+	return nil
+}
+
+// sendTar sends a tar stream: of every directory and regular file below
+// the directory fi, named relative to it, or of the file fi alone, named
+// by its base name; each entry has the mode the runtime reports. The
+// stream is cut, by dropping the connection, once it would pass
+// [sandbox].max_transfer_size: its length is not known before it is sent.
+func (s *Service) sendTar(w http.ResponseWriter, r *http.Request, u useRequest, fi runtime.FileInfo) error {
+	ctx, id := r.Context(), u.rec.ID
+	entries, base := []runtime.FileInfo{fi}, path.Dir(u.files.path)
+	if fi.Dir {
+		below, err := s.client.Walk(ctx, id, u.files.path)
+		if err != nil {
+			return pathError(err)
+		}
+		entries, base = below, u.files.path
+	}
+	w.Header().Set("Content-Type", mediaTar)
+	w.WriteHeader(http.StatusOK)
+	out := &sentBody{w: w, left: s.settings.MaxTransferSize}
+	tw := tar.NewWriter(out)
+	// The runtime reports no modification time; the time of the download
+	// stands for it, in whole seconds so that every format can hold it.
+	modTime := s.deps.Now().UTC().Truncate(time.Second)
+	for _, e := range entries {
+		if err := s.addEntry(ctx, id, tw, base, e, modTime); err != nil {
+			s.abortDownload(ctx, id, out, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		s.abortDownload(ctx, id, out, err)
+	}
+	return nil
+}
+
+// addEntry writes e, a file or directory below base, to tw.
+func (s *Service) addEntry(ctx context.Context, id string, tw *tar.Writer, base string, e runtime.FileInfo, modTime time.Time) error {
+	name := strings.TrimPrefix(strings.TrimPrefix(e.Path, base), "/")
+	hdr := &tar.Header{Name: name, Mode: int64(e.Mode.Perm()), ModTime: modTime, Typeflag: tar.TypeReg, Size: e.Size}
+	if e.Dir {
+		hdr.Name, hdr.Typeflag, hdr.Size = name+"/", tar.TypeDir, 0
+		return tw.WriteHeader(hdr)
+	}
+	rc, err := s.client.Download(ctx, id, e.Path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rc.Close() }()
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err = io.CopyN(tw, rc, e.Size)
+	return err
+}
+
+// sentBody is the body of a download as it is written to the caller: it
+// refuses a write that would pass what may still be sent, and keeps the
+// first failure of a write, so that the caller's failures are told apart
+// from the runtime's.
+type sentBody struct {
+	w    io.Writer
+	left int64
+	err  error
+}
+
+func (b *sentBody) Write(p []byte) (int, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+	if int64(len(p)) > b.left {
+		b.err = errTransferTooLarge
+		return 0, b.err
+	}
+	n, err := b.w.Write(p)
+	b.left -= int64(n)
+	if err != nil {
+		b.err = err
+	}
+	return n, err
+}
+
+// abortDownload ends a download whose answer has begun and that failed
+// with err: it drops the connection, so that the caller's read ends with
+// an error rather than with what looks like a whole body. A failure of the
+// runtime, rather than of writing to the caller or of the limit, is logged
+// with its text scrubbed first.
+func (s *Service) abortDownload(ctx context.Context, id string, out *sentBody, err error) {
+	if out.err == nil {
+		text := s.scrub(s.ScrubSandbox(context.WithoutCancel(ctx), id, err.Error()))
+		s.logger().Warn("a sandbox download failed after its answer began", "sandbox", id, "error", text)
+	}
+	panic(http.ErrAbortHandler)
 }

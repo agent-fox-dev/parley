@@ -1,15 +1,21 @@
 package sandbox_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/parley/internal/sandbox"
 )
 
 // uploaded is the body of an upload's answer.
@@ -233,6 +239,176 @@ func TestUpload_RefusesABodyOverTheTransferLimit(t *testing.T) {
 		got := uploadOf(t, h.files(t, http.MethodPut, id, "path=ok", "application/octet-stream", bytes.NewReader(make([]byte, limit))))
 		if got.Bytes != limit {
 			t.Errorf("upload wrote %d bytes, want %d", got.Bytes, limit)
+		}
+	})
+}
+
+// untarred is an entry of a downloaded tar stream.
+type untarred struct {
+	dir  bool
+	mode fs.FileMode
+	body string
+}
+
+// untar reads the tar stream a by entry name.
+func untar(t *testing.T, a answer) map[string]untarred {
+	t.Helper()
+	if a.status != http.StatusOK || a.header.Get("Content-Type") != "application/x-tar" {
+		t.Fatalf("download = %d %q %s, want 200 application/x-tar", a.status, a.header.Get("Content-Type"), a.body)
+	}
+	out := map[string]untarred{}
+	tr := tar.NewReader(bytes.NewReader(a.body))
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("read the tar stream: %v", err)
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read the tar entry %s: %v", hdr.Name, err)
+		}
+		out[hdr.Name] = untarred{dir: hdr.Typeflag == tar.TypeDir, mode: hdr.FileInfo().Mode().Perm(), body: string(body)}
+	}
+}
+
+func TestDownload_SendsTheBytesOfAFile(t *testing.T) {
+	h, ready := startFilesHub(t)
+	ids := map[string]string{sandbox.StateReady: ready}
+	for _, state := range []string{sandbox.StateCompleted, sandbox.StateFailed} {
+		ids[state] = h.sandbox(t, func(r *sandbox.Record) { r.State = state })
+	}
+	for state, id := range ids {
+		h.put(t, id,
+			tarEntry{name: "/workspace/out.txt", body: "result"},
+			tarEntry{name: "/workspace/bin/data", body: "\x00\xff\x10"},
+			tarEntry{name: "/workspace/empty"},
+		)
+		for _, tc := range []struct{ path, body string }{
+			{"out.txt", "result"},
+			{"/workspace/bin/data", "\x00\xff\x10"},
+			{"empty", ""},
+		} {
+			t.Run(state+" "+tc.path, func(t *testing.T) {
+				a, err := h.download(t, id, "path="+tc.path)
+				if err != nil {
+					t.Fatalf("read the answer: %v", err)
+				}
+				if a.status != http.StatusOK || a.header.Get("Content-Type") != "application/octet-stream" {
+					t.Fatalf("download = %d %q %s, want 200 application/octet-stream", a.status, a.header.Get("Content-Type"), a.body)
+				}
+				if got, want := a.header.Get("Content-Length"), strconv.Itoa(len(tc.body)); got != want {
+					t.Errorf("Content-Length = %q, want %q", got, want)
+				}
+				if string(a.body) != tc.body {
+					t.Errorf("body = %q, want %q", a.body, tc.body)
+				}
+			})
+		}
+	}
+}
+
+func TestDownload_SendsADirectoryOrAFileAsATarStream(t *testing.T) {
+	h, id := startFilesHub(t)
+	h.put(t, id,
+		tarEntry{name: "/workspace/proj/src/main.go", body: "package main"},
+		tarEntry{name: "/workspace/proj/run.sh", mode: 0o755, body: "#!/bin/sh"},
+		tarEntry{name: "/workspace/out.txt", body: "result"},
+		tarEntry{name: "/workspace/emptydir/"},
+	)
+	t.Run("a directory", func(t *testing.T) {
+		got := untar(t, h.mustDownload(t, id, "path=proj&archive=tar"))
+		delete(got, "./")
+		want := map[string]untarred{
+			"src/":        {dir: true, mode: 0o755},
+			"src/main.go": {mode: 0o644, body: "package main"},
+			"run.sh":      {mode: 0o755, body: "#!/bin/sh"},
+		}
+		if !maps.Equal(got, want) {
+			t.Errorf("entries = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("a file", func(t *testing.T) {
+		got := untar(t, h.mustDownload(t, id, "path=out.txt&archive=tar"))
+		if want := map[string]untarred{"out.txt": {mode: 0o644, body: "result"}}; !maps.Equal(got, want) {
+			t.Errorf("entries = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("an empty directory", func(t *testing.T) {
+		for name, e := range untar(t, h.mustDownload(t, id, "path=emptydir&archive=tar")) {
+			if !e.dir {
+				t.Errorf("entry %s is a file, want no file in the archive of an empty directory", name)
+			}
+		}
+	})
+}
+
+func TestDownload_RefusesARequestItCannotServe(t *testing.T) {
+	h, id := startFilesHub(t)
+	h.put(t, id, tarEntry{name: "/workspace/proj/"}, tarEntry{name: "/workspace/out.txt", body: "result"})
+	gone := h.sandbox(t, func(r *sandbox.Record) { r.State = sandbox.StateFailed })
+	h.put(t, gone, tarEntry{name: "/workspace/out.txt", body: "result"})
+	h.rt.DropWorkDir("parley", gone)
+	for _, tc := range []struct {
+		name, sandbox, query string
+		status               int
+		errorType            string
+	}{
+		{"no path", id, "", 400, "invalid_request"},
+		{"an empty path", id, "path=", 400, "invalid_request"},
+		{"an archive other than tar", id, "path=out.txt&archive=zip", 400, "invalid_request"},
+		{"a directory without an archive", id, "path=proj", 400, "path_is_directory"},
+		{"the working directory without an archive", id, "path=.", 400, "path_is_directory"},
+		{"a missing file", id, "path=missing.txt", 404, "path_not_found"},
+		{"a missing directory as a tar stream", id, "path=missing&archive=tar", 404, "path_not_found"},
+		{"a sandbox whose working directory is gone", gone, "path=out.txt", 404, "path_not_found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := h.mustDownload(t, tc.sandbox, tc.query)
+			if a.status != tc.status || a.err.ErrorType != tc.errorType {
+				t.Errorf("download = %d %s, want %d %s", a.status, a.body, tc.status, tc.errorType)
+			}
+			if ct := a.header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+				t.Errorf("Content-Type = %q, want the JSON error envelope", ct)
+			}
+		})
+	}
+}
+
+func TestDownload_RefusesMoreThanTheTransferLimit(t *testing.T) {
+	h, id := startFilesHub(t)
+	const limit = 1 << 20
+	h.put(t, id,
+		tarEntry{name: "/workspace/big.bin", body: strings.Repeat("b", limit+1)},
+		tarEntry{name: "/workspace/exact.bin", body: strings.Repeat("e", limit)},
+		tarEntry{name: "/workspace/bigdir/1", body: strings.Repeat("1", 600000)},
+		tarEntry{name: "/workspace/bigdir/2", body: strings.Repeat("2", 600000)},
+		tarEntry{name: "/workspace/bigdir/3", body: strings.Repeat("3", 600000)},
+	)
+	t.Run("a file over the limit", func(t *testing.T) {
+		a := h.mustDownload(t, id, "path=big.bin")
+		if a.status != http.StatusRequestEntityTooLarge || a.err.ErrorType != "payload_too_large" {
+			t.Errorf("download = %d %s, want 413 payload_too_large", a.status, a.body)
+		}
+	})
+	t.Run("a file of exactly the limit", func(t *testing.T) {
+		a := h.mustDownload(t, id, "path=exact.bin")
+		if a.status != http.StatusOK || len(a.body) != limit {
+			t.Errorf("download = %d with %d bytes, want 200 with %d", a.status, len(a.body), limit)
+		}
+	})
+	t.Run("a tar stream that passes the limit", func(t *testing.T) {
+		a, err := h.download(t, id, "path=bigdir&archive=tar")
+		if a.status != http.StatusOK {
+			t.Fatalf("download = %d %s, want 200", a.status, a.body)
+		}
+		if err == nil {
+			t.Error("the body ended cleanly, want the read to end with an error")
+		}
+		if len(a.body) > limit {
+			t.Errorf("received %d bytes, want at most %d", len(a.body), limit)
 		}
 	})
 }

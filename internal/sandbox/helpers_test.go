@@ -2626,6 +2626,31 @@ func (h *execHub) files(t *testing.T, method, id, query, contentType string, bod
 // filesWith is files under ctx.
 func (h *execHub) filesWith(t *testing.T, ctx context.Context, method, id, query, contentType string, body io.Reader) answer {
 	t.Helper()
+	a, err := h.exchangeFiles(t, ctx, method, id, query, contentType, body)
+	if err != nil {
+		t.Fatalf("%s files?%s: read the answer: %v", method, query, err)
+	}
+	return a
+}
+
+// download sends GET …/files?query for the sandbox id of ws as the owner
+// and returns the answer with what of its body arrived, and the error that
+// ended the read of the body, nil for a clean end.
+func (h *execHub) download(t *testing.T, id, query string) (answer, error) {
+	t.Helper()
+	return h.exchangeFiles(t, context.Background(), http.MethodGet, id, query, "", nil)
+}
+
+// mustDownload is download for an answer whose body must end cleanly.
+func (h *execHub) mustDownload(t *testing.T, id, query string) answer {
+	t.Helper()
+	return h.files(t, http.MethodGet, id, query, "", nil)
+}
+
+// exchangeFiles is filesWith, which returns the error that ended the read
+// of the answer's body instead of failing on it.
+func (h *execHub) exchangeFiles(t *testing.T, ctx context.Context, method, id, query, contentType string, body io.Reader) (answer, error) {
+	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, method, h.URL("/api/v1"+sandboxPath("ws", id)+"/files?"+query), body)
 	if err != nil {
 		t.Fatalf("build the request: %v", err)
@@ -2641,16 +2666,40 @@ func (h *execHub) filesWith(t *testing.T, ctx context.Context, method, id, query
 	defer func() { _ = resp.Body.Close() }()
 	var a answer
 	a.status, a.header = resp.StatusCode, resp.Header
-	if a.body, err = io.ReadAll(resp.Body); err != nil {
-		t.Fatalf("%s files?%s: read the answer: %v", method, query, err)
-	}
+	a.body, err = io.ReadAll(resp.Body)
 	var env struct {
 		Error *json.RawMessage `json:"error"`
 	}
 	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
 		_ = json.Unmarshal(*env.Error, &a.err)
 	}
-	return a
+	return a, err
+}
+
+// put writes entries into the sandbox id through the runtime, each name an
+// absolute path: a directory when it ends in a slash, else a file holding
+// its body with its mode, 0644 when it has none.
+func (h *execHub) put(t *testing.T, id string, entries ...tarEntry) {
+	t.Helper()
+	ctx, client := context.Background(), h.rt.Client("parley", nil)
+	for _, e := range entries {
+		mode := fs.FileMode(e.mode)
+		var err error
+		if strings.HasSuffix(e.name, "/") {
+			if mode == 0 {
+				mode = 0o755
+			}
+			err = client.MakeDir(ctx, id, strings.TrimSuffix(e.name, "/"), mode)
+		} else {
+			if mode == 0 {
+				mode = 0o644
+			}
+			err = client.Upload(ctx, id, e.name, mode, strings.NewReader(e.body))
+		}
+		if err != nil {
+			t.Fatalf("put %s into the sandbox: %v", e.name, err)
+		}
+	}
 }
 
 // fileCalls counts the file operations the runtime received.

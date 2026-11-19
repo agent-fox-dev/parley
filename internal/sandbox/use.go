@@ -90,7 +90,7 @@ func (s *Service) useTable() []*useEntry {
 		},
 		{
 			name: useDownload, method: http.MethodGet, segment: "files", kind: KindRead,
-			states: []string{StateReady, StateCompleted, StateFailed}, validate: validateDownload, operate: pendingOperation,
+			states: []string{StateReady, StateCompleted, StateFailed}, validate: validateDownload, operate: s.download,
 		},
 		{
 			name: useLogs, method: http.MethodGet, segment: "logs", kind: KindRead,
