@@ -1,11 +1,13 @@
 package telemetry_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -67,12 +69,14 @@ const (
 
 // ingestionRoute is one route of the ingestion gate: its path after
 // /workspaces/:slug/runs/:run_id, the table it stores its records in,
-// whether it takes a batch, and a valid body for it, new on every call.
+// whether it takes a batch, whether it keeps one record per workspace and
+// run rather than one per id, and a valid body for it, new on every call.
 type ingestionRoute struct {
-	path  string
-	table string
-	batch bool
-	valid func() any
+	path   string
+	table  string
+	batch  bool
+	perRun bool
+	valid  func() any
 }
 
 // stored is the status a valid request to the route is answered with.
@@ -93,10 +97,19 @@ var ingestionRoutes = []ingestionRoute{
 	{path: "/tools/calls", table: "tool_calls", valid: func() any { return map[string]any{"tool_name": "bash"} }},
 	{path: "/tools/errors", table: "tool_errors", valid: func() any { return map[string]any{"tool_name": "bash", "error_msg": "exit 1"} }},
 	{path: "/traces", table: "traces", valid: func() any { return map[string]any{"event_type": "tool.use"} }},
+	{path: "/postmortem", table: "postmortems", perRun: true, valid: func() any { return validPostmortem() }},
+}
+
+// validPostmortem is a valid postmortem body with only its required members.
+func validPostmortem() map[string]any {
+	return map[string]any{
+		"run_status": "stalled", "started_at": "2026-01-02T03:00:00+01:00", "completed_at": "2026-01-02T02:30:00Z",
+		"task_summary": map[string]any{"total": 4, "done": 3}, "cost_summary": map[string]any{},
+	}
 }
 
 // recordTables are the analytical store's tables of telemetry records.
-var recordTables = []string{"run_events", "session_outcomes", "tool_calls", "tool_errors", "traces"}
+var recordTables = []string{"run_events", "session_outcomes", "tool_calls", "tool_errors", "traces", "postmortems"}
 
 // world is a hub on a settable clock whose analytical store fails every
 // write while failWrites is set, with the seed: alice owns every workspace
@@ -165,6 +178,77 @@ func (w *world) freshID() string {
 func (w *world) post(t *testing.T, credential, slug, runID, path string, body any) (int, []byte) {
 	t.Helper()
 	return w.Call(t, http.MethodPost, "/api/v1/workspaces/"+slug+"/runs/"+runID+path, credential, body)
+}
+
+// answer is the status and body of an answer to one of several requests
+// sent at once.
+type answer struct {
+	status int
+	body   []byte
+}
+
+// postAll sends every body of bodies at once to the ingestion route path of
+// the workspace slug and the run runID as credential, and returns the
+// answers in the order of bodies.
+func (w *world) postAll(t *testing.T, credential, slug, runID, path string, bodies []any) []answer {
+	t.Helper()
+	url := w.URL("/api/v1/workspaces/" + slug + "/runs/" + runID + path)
+	answers := make([]answer, len(bodies))
+	errs := make([]error, len(bodies))
+	var wg sync.WaitGroup
+	for i, body := range bodies {
+		wg.Go(func() { answers[i], errs[i] = postOnce(url, credential, body) })
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	return answers
+}
+
+// postOnce sends body as JSON to url with the bearer credential, from any
+// goroutine.
+func postOnce(url, credential string, body any) (answer, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return answer{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return answer{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+credential)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return answer{}, err
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	return answer{status: res.StatusCode, body: b}, err
+}
+
+// createdOnce checks that exactly one of answers is 201 and every other
+// 200, all with the same body, and returns that body.
+func createdOnce(t *testing.T, answers []answer) []byte {
+	t.Helper()
+	var created []byte
+	statuses := map[int]int{}
+	for _, a := range answers {
+		statuses[a.status]++
+		if a.status == http.StatusCreated {
+			created = a.body
+		}
+	}
+	if statuses[http.StatusCreated] != 1 || statuses[http.StatusOK] != len(answers)-1 {
+		t.Fatalf("answers by status = %v, want one 201 and %d 200", statuses, len(answers)-1)
+	}
+	for _, a := range answers {
+		if !bytes.Equal(a.body, created) {
+			t.Errorf("answer %d %s, want the body of the 201: %s", a.status, a.body, created)
+		}
+	}
+	return created
 }
 
 // countAllRecords is the number of telemetry records of every kind.

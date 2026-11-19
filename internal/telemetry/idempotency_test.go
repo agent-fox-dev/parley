@@ -2,13 +2,10 @@ package telemetry_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -21,7 +18,7 @@ func TestIdempotency(t *testing.T) {
 	w := newWorld(t)
 	var singles []ingestionRoute
 	for _, r := range ingestionRoutes {
-		if !r.batch {
+		if !r.batch && !r.perRun {
 			singles = append(singles, r)
 		}
 	}
@@ -112,54 +109,12 @@ func TestIdempotency(t *testing.T) {
 
 	t.Run("concurrent posts of one new id store it once and answer it to all", func(t *testing.T) {
 		id, run := w.freshID(), w.freshRun()
-		url := w.URL("/api/v1/workspaces/" + demo + "/runs/" + run + "/events")
-		type answer struct {
-			status int
-			body   []byte
-			err    error
+		bodies := make([]any, 8)
+		for i := range bodies {
+			bodies[i] = map[string]any{"id": id, "event_type": "x", "node_id": fmt.Sprintf("n%d", i)}
 		}
-		answers := make([]answer, 8)
-		var wg sync.WaitGroup
-		for i := range answers {
-			wg.Go(func() {
-				body, _ := json.Marshal(map[string]any{"id": id, "event_type": "x", "node_id": fmt.Sprintf("n%d", i)})
-				req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-				if err != nil {
-					answers[i].err = err
-					return
-				}
-				req.Header.Set("Authorization", "Bearer "+w.aliceKey)
-				req.Header.Set("Content-Type", "application/json")
-				res, err := http.DefaultClient.Do(req)
-				if err != nil {
-					answers[i].err = err
-					return
-				}
-				defer res.Body.Close()
-				answers[i].status = res.StatusCode
-				answers[i].body, answers[i].err = io.ReadAll(res.Body)
-			})
-		}
-		wg.Wait()
-		var createdBody []byte
-		statuses := map[int]int{}
-		for _, a := range answers {
-			if a.err != nil {
-				t.Fatalf("POST /events: %v", a.err)
-			}
-			statuses[a.status]++
-			if a.status == http.StatusCreated {
-				createdBody = a.body
-			}
-		}
-		if statuses[http.StatusCreated] != 1 || statuses[http.StatusOK] != 7 {
-			t.Fatalf("answers by status = %v, want one 201 and seven 200", statuses)
-		}
-		for _, a := range answers {
-			if !bytes.Equal(a.body, createdBody) {
-				t.Errorf("answer %d %s, want the body of the 201: %s", a.status, a.body, createdBody)
-			}
-		}
+		answers := w.postAll(t, w.aliceKey, demo, run, "/events", bodies)
+		createdOnce(t, answers)
 		if n := countOf(t, "run_events", id); n != 1 {
 			t.Errorf("run_events holds %d records %s, want 1", n, id)
 		}

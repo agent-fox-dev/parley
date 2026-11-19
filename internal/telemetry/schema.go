@@ -23,6 +23,7 @@ var SchemaSteps = []store.Step{
 	{Name: "telemetry_tool_calls", Target: store.Analytics, Apply: createToolCalls},
 	{Name: "telemetry_tool_errors", Target: store.Analytics, Apply: createToolErrors},
 	{Name: "telemetry_traces", Target: store.Analytics, Apply: createTraces},
+	{Name: "telemetry_postmortems", Target: store.Analytics, Apply: createPostmortems},
 }
 
 // createRunEvents creates the run events, indexed for the reads of a run in
@@ -123,5 +124,30 @@ CREATE TABLE traces (
 	data        TEXT
 );
 CREATE INDEX traces_run ON traces (workspace, run_id, timestamp, id);`)
+	return err
+}
+
+// createPostmortems creates the postmortems: one per workspace and run,
+// which the unique index enforces whatever reaches the table. started_at
+// and completed_at are client timestamps in the form of timestamp; the
+// summaries and lists are JSON text.
+func createPostmortems(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `
+CREATE TABLE postmortems (
+	id              TEXT NOT NULL PRIMARY KEY,
+	workspace       TEXT NOT NULL,
+	run_id          TEXT NOT NULL,
+	timestamp       TEXT NOT NULL,
+	ingested_at     TEXT NOT NULL,
+	schema_version  INTEGER NOT NULL,
+	run_status      TEXT NOT NULL CHECK (run_status IN ('stalled', 'block_limit', 'cost_limit', 'session_limit')),
+	started_at      TEXT NOT NULL,
+	completed_at    TEXT NOT NULL,
+	task_summary    TEXT NOT NULL,
+	cost_summary    TEXT NOT NULL,
+	blocked_tasks   TEXT NOT NULL,
+	session_history TEXT NOT NULL
+);
+CREATE UNIQUE INDEX postmortems_run ON postmortems (workspace, run_id);`)
 	return err
 }

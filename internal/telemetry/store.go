@@ -104,8 +104,14 @@ func storeOnce[R record](ctx context.Context, tx Tx, k kind[R], rec R) (stored R
 // named by columns into dest, in their order. found is false when table
 // holds no record id.
 func getRecord(ctx context.Context, tx Tx, table, columns, id string, h *head, dest ...any) (found bool, err error) {
+	return getRecordWhere(ctx, tx, table, columns, "id = ?", []any{id}, h, dest...)
+}
+
+// getRecordWhere is getRecord for the record of table that where, with the
+// arguments key, selects.
+func getRecordWhere(ctx context.Context, tx Tx, table, columns, where string, key []any, h *head, dest ...any) (found bool, err error) {
 	var ts, ingested string
-	err = tx.QueryRowContext(ctx, `SELECT id, workspace, run_id, timestamp, ingested_at, `+columns+` FROM `+table+` WHERE id = ?`, id).
+	err = tx.QueryRowContext(ctx, `SELECT id, workspace, run_id, timestamp, ingested_at, `+columns+` FROM `+table+` WHERE `+where, key...).
 		Scan(append([]any{&h.ID, &h.Workspace, &h.RunID, &ts, &ingested}, dest...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -115,11 +121,11 @@ func getRecord(ctx context.Context, tx Tx, table, columns, id string, h *head, d
 	}
 	t, err := time.Parse(storedLayout, ts)
 	if err != nil {
-		return false, fmt.Errorf("%s %s: timestamp %q: %w", table, id, ts, err)
+		return false, fmt.Errorf("%s %s: timestamp %q: %w", table, h.ID, ts, err)
 	}
 	at, err := time.Parse(time.RFC3339, ingested)
 	if err != nil {
-		return false, fmt.Errorf("%s %s: ingested_at %q: %w", table, id, ingested, err)
+		return false, fmt.Errorf("%s %s: ingested_at %q: %w", table, h.ID, ingested, err)
 	}
 	h.Timestamp, h.IngestedAt = clientTime(t), timefmt.Time(at)
 	return true, nil
@@ -158,6 +164,66 @@ func getTrace(ctx context.Context, tx Tx, id string) (tr trace, found bool, err 
 	found, err = getRecord(ctx, tx, "traces", "event_type, node_id, session_id, sequence, data", id, &tr.head,
 		&tr.EventType, &tr.NodeID, &tr.SessionID, &tr.Sequence, jsonColumn{&tr.Data})
 	return tr, found, err
+}
+
+// storePostmortemOnce stores p in tx unless the workspace and run of p have
+// a postmortem, and returns the postmortem they have: p when it is new,
+// which created reports, and otherwise the stored one, whatever p holds.
+// Like storeOnce, the read and the insert share tx, whose write lock makes
+// one of concurrent first postmortems of a run the one stored.
+func storePostmortemOnce(ctx context.Context, tx Tx, p postmortem) (stored postmortem, created bool, err error) {
+	stored, found, err := getPostmortem(ctx, tx, p.Workspace, p.RunID)
+	if err != nil || found {
+		return stored, false, err
+	}
+	if err := insertPostmortem(ctx, tx, p); err != nil {
+		return stored, false, err
+	}
+	return p, true, nil
+}
+
+// getPostmortem reads the postmortem of the run runID of workspace.
+func getPostmortem(ctx context.Context, tx Tx, workspace, runID string) (p postmortem, found bool, err error) {
+	found, err = getRecordWhere(ctx, tx, "postmortems",
+		"schema_version, run_status, started_at, completed_at, task_summary, cost_summary, blocked_tasks, session_history",
+		"workspace = ? AND run_id = ?", []any{workspace, runID}, &p.head,
+		&p.SchemaVersion, &p.RunStatus, timeColumn{&p.StartedAt}, timeColumn{&p.CompletedAt},
+		jsonColumn{&p.TaskSummary}, jsonColumn{&p.CostSummary}, jsonColumn{&p.BlockedTasks}, jsonColumn{&p.SessionHistory})
+	return p, found, err
+}
+
+// insertPostmortem stores the postmortem p.
+func insertPostmortem(ctx context.Context, tx Tx, p postmortem) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO postmortems (id, workspace, run_id, timestamp, ingested_at, schema_version, run_status, started_at, completed_at,
+	task_summary, cost_summary, blocked_tasks, session_history)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Workspace, p.RunID, p.Timestamp.stored(), timefmt.Format(time.Time(p.IngestedAt)), p.SchemaVersion, p.RunStatus,
+		p.StartedAt.stored(), p.CompletedAt.stored(), string(p.TaskSummary), string(p.CostSummary), string(p.BlockedTasks),
+		string(p.SessionHistory))
+	return err
+}
+
+// timeColumn scans a client timestamp stored in the form of storedLayout.
+type timeColumn struct{ dst *clientTime }
+
+// Scan implements sql.Scanner.
+func (c timeColumn) Scan(src any) error {
+	var s string
+	switch v := src.(type) {
+	case string:
+		s = v
+	case []byte:
+		s = string(v)
+	default:
+		return fmt.Errorf("a timestamp column holds a %T", src)
+	}
+	t, err := time.Parse(storedLayout, s)
+	if err != nil {
+		return fmt.Errorf("timestamp %q: %w", s, err)
+	}
+	*c.dst = clientTime(t)
+	return nil
 }
 
 // jsonColumn scans a column of JSON text into the raw JSON it holds, nil
