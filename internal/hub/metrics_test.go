@@ -3,11 +3,11 @@ package hub_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -106,24 +106,27 @@ func TestMetricSources_ExportWhatTheirProducersReport(t *testing.T) {
 	}
 }
 
-// recordingPruner is a delivery pruner that records the cutoffs it is
-// called with.
-type recordingPruner struct {
-	mu    sync.Mutex
-	calls []time.Time
-}
-
-func (p *recordingPruner) PruneDeliveries(_ context.Context, before time.Time) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.calls = append(p.calls, before)
-	return 0, nil
-}
-
-func (p *recordingPruner) cutoffs() []time.Time {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return slices.Clone(p.calls)
+// seedDeliveries stores a switched-off event webhook subscription with an
+// ended delivery record last attempted at each of times, and returns their
+// ids in that order.
+func seedDeliveries(t *testing.T, h *hubtest.Hub, times ...time.Time) []string {
+	t.Helper()
+	db := h.Store.Main()
+	if _, err := db.Exec(`INSERT INTO webhook_subscriptions (id, workspace, url, types, include_forks, description, state,
+		created_at, updated_at, secret_sealed, position) VALUES ('s1', 'demo', 'https://ci.example/x', '["*"]', 1, '',
+		'disabled', 0, 0, x'00', 0)`); err != nil {
+		t.Fatalf("store a subscription: %v", err)
+	}
+	ids := make([]string, len(times))
+	for i, at := range times {
+		ids[i] = fmt.Sprintf("d%d", i)
+		if _, err := db.Exec(`INSERT INTO webhook_deliveries (id, subscription_id, seq, type, status, attempts, created_at,
+			first_attempt_at, last_attempt_at) VALUES (?, 's1', 1, 'parley.test', 'succeeded', 1, ?, ?, ?)`,
+			ids[i], at.UnixNano(), at.UnixNano(), at.UnixNano()); err != nil {
+			t.Fatalf("store a delivery record: %v", err)
+		}
+	}
+	return ids
 }
 
 func TestMetrics_ConnectWhatTheHubsPackagesReportAndRunRetentionAtTheStart(t *testing.T) {
@@ -132,14 +135,18 @@ func TestMetrics_ConnectWhatTheHubsPackagesReportAndRunRetentionAtTheStart(t *te
 	at := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	var reg *metrics.Registry
 	var events *event.Component
-	pruner := &recordingPruner{}
 	h := hubtest.StartWith(t, hubtest.Config{Now: func() time.Time { return at }, Compose: func(c *hub.Composition) {
 		reg, events = c.Metrics(), c.Events()
-		c.RegisterDeliveryPruner(pruner)
 	}})
 
 	// The hub runs the retention run once it listens; its end sets the
-	// last-run time.
+	// last-run time. Its webhook_deliveries step prunes the event webhooks'
+	// ended delivery records last attempted more than 7 days before the
+	// hub's time, so the restart's run deletes the first seeded record and
+	// keeps the one attempted exactly 7 days before.
+	cutoff := at.Add(-7 * 24 * time.Hour)
+	seeded := seedDeliveries(t, h, cutoff.Add(-time.Second), cutoff)
+	h.Restart(t)
 	deadline := time.Now().Add(5 * time.Second)
 	for series(reg, metrics.RetentionLastRunTimestamp)[""] == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -147,8 +154,23 @@ func TestMetrics_ConnectWhatTheHubsPackagesReportAndRunRetentionAtTheStart(t *te
 	if got := series(reg, metrics.RetentionLastRunTimestamp)[""]; got != float64(at.Unix()) {
 		t.Fatalf("last retention run = %v, want %d", got, at.Unix())
 	}
-	if got, want := pruner.cutoffs(), []time.Time{at.Add(-7 * 24 * time.Hour)}; !slices.Equal(got, want) {
-		t.Errorf("delivery pruner calls = %v, want %v", got, want)
+	var left []string
+	rows, err := h.Store.Main().Query(`SELECT id FROM webhook_deliveries ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		left = append(left, id)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(left, seeded[1:]) {
+		t.Errorf("delivery records after the retention run = %v, want %v", left, seeded[1:])
 	}
 
 	alice, acme := h.CreateUser(t, "alice"), h.CreateOrg(t, "acme")

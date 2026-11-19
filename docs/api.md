@@ -1002,8 +1002,8 @@ name; a page is never refused for it.
 | `parley_forks_active` | gauge | none | task forks that exist |
 | `parley_events_seq` | gauge | none | the last `seq` written to the event log |
 | `parley_sse_connections` | gauge | none | open event streams |
-| `parley_webhook_deliveries_total` | counter | `result` (`ok`, `retry`, `failed`) | event webhook delivery attempts; `0` until event webhooks exist |
-| `parley_webhook_queue_depth` | gauge | none | events written and not yet delivered or given up; `0` until event webhooks exist |
+| `parley_webhook_deliveries_total` | counter | `result` (`ok`, `retry`, `failed`) | event webhook delivery attempts since the hub started: `ok` a successful attempt, ping or redelivery; `retry` a failed attempt of the delivery loop that will be tried again; `failed` an attempt after which the event was given up, a failed ping or redelivery, and an event skipped because it left the event log (see [Event webhooks](#event-webhooks)) |
+| `parley_webhook_queue_depth` | gauge | none | events written and not yet delivered or given up, summed over the `active` and `failing` event webhooks: the sum of their `pending` (see [`GET /api/v1/workspaces/{slug}/webhooks/{id}`](#get-apiv1workspacesslugwebhooksid)) |
 | `parley_audit_events_total` | counter | `source` (`hub`, `agent`), `type` | hub events written and run events ingested since the hub started, by type |
 | `parley_agent_sessions_active` | gauge | `workspace` | sessions in state `active`, set by the retention run; a workspace without one has no series |
 | `parley_agent_tokens_total` | counter | `workspace`, `model`, `direction` (`input`, `output`, `cache_read`) | tokens reported in usage records since the hub started |
@@ -10424,3 +10424,399 @@ read.
 | `404` `not_found` | a `workspace` the caller may not read (`workspace not found`): the same answer for an existing workspace and for a slug with no workspace |
 | `410` `cursor_expired` | the resume position is below `oldest_seq` minus 1 (`event cursor expired`), with the member `oldest_seq`, a number; also when it falls below while the request is held or its page is read |
 | `500` `internal` | the log or the caller's access could not be read (`internal error`); no item is sent |
+
+## Event webhooks
+
+An event webhook makes the hub push the [events](#get-apiv1events) of one
+workspace, and of its task forks, to a URL as signed HTTP `POST`s, in `seq`
+order, one at a time, at least once, and keep trying until the receiver
+accepts each one or a fixed time has passed. Nine routes manage them, all
+under `/api/v1/workspaces/{slug}/webhooks`:
+
+| Route | Scope of a PAT | Answers |
+|---|---|---|
+| [`POST …/webhooks`](#post-apiv1workspacesslugwebhooks) | `workspaces:write` | `201` the subscription with its `secret` |
+| [`GET …/webhooks`](#get-apiv1workspacesslugwebhooks) | `workspaces:read` | `200` a list of subscriptions |
+| [`GET …/webhooks/{id}`](#get-apiv1workspacesslugwebhooksid) | `workspaces:read` | `200` the subscription with `pending` |
+| [`PATCH …/webhooks/{id}`](#patch-apiv1workspacesslugwebhooksid) | `workspaces:write` | `200` the subscription |
+| [`DELETE …/webhooks/{id}`](#delete-apiv1workspacesslugwebhooksid) | `workspaces:write` | `204` |
+| [`POST …/webhooks/{id}/rotate-secret`](#post-apiv1workspacesslugwebhooksidrotate-secret) | `workspaces:write` | `200` the subscription with its new `secret` |
+| [`POST …/webhooks/{id}/ping`](#post-apiv1workspacesslugwebhooksidping) | `workspaces:write` | `200` a delivery record |
+| [`GET …/webhooks/{id}/deliveries`](#get-apiv1workspacesslugwebhooksiddeliveries) | `workspaces:read` | `200` a list of delivery records |
+| [`POST …/webhooks/{id}/deliveries/{delivery_id}/redeliver`](#post-apiv1workspacesslugwebhooksiddeliveriesdelivery_idredeliver) | `workspaces:write` | `200` the delivery record |
+
+`workspaces:write` satisfies `workspaces:read`. Every route needs `owner`
+(see [Workspace access](#workspace-access)): the workspace's owner and the
+admin token reach them; a member of the workspace's org is answered `403`
+`forbidden` (`org members have read-only access to this workspace`), anyone
+else the `404` `not_found` of a slug with no workspace. A workspace-bound PAT
+is refused `403` `token_bound` on every route, whoever its user is (see
+[Workspace-bound tokens](#workspace-bound-tokens)). The checks run in this
+order, after those of the [order of checks](#order-of-checks):
+
+1. A task fork has no event webhooks of its own: every route called with a
+   fork's slug is answered `400` `not_supported_on_fork` (`a task fork has
+   no event webhooks; subscribe on its parent <parent> with include_forks`),
+   whatever its body. A subscription of the parent with `include_forks`
+   covers the fork.
+2. An `{id}` or `{delivery_id}` that is not a UUID is `400`
+   `invalid_request` (`id must be a UUID`, `delivery_id must be a UUID`).
+3. An `{id}` that names no subscription of the workspace, also one of
+   another workspace, is `404` `webhook_not_found` with the same bytes:
+
+   ```json
+   {"error":{"code":404,"message":"webhook not found","error_type":"webhook_not_found"}}
+   ```
+
+4. The body, then the state of the workspace or the record.
+
+### The subscription
+
+| Member | Value |
+|---|---|
+| `id` | UUID |
+| `workspace` | the slug, never a task fork |
+| `url` | the URL the hub posts to |
+| `types` | the event types sent, each an exact type or a prefix ending in `*`; `["*"]` for every type |
+| `include_forks` | whether the events of the workspace's task forks are sent too |
+| `description` | free text, `""` by default |
+| `state` | `active`, `failing` (an event was given up) or `disabled` (no delivery) |
+| `created_by` | the creator's user id; `null` for the admin token |
+| `created_at`, `updated_at` | RFC 3339 in UTC with whole seconds |
+| `last_delivery_at` | the time of the last attempt of the delivery loop, `null` before the first |
+| `last_status` | `succeeded` or `failed`, the outcome of that attempt; `null` before the first |
+| `failing_since` | the time of the first failed attempt since the last success; `null` while attempts succeed |
+
+```json
+{"id":"0b6a4bd1-0a3c-4d55-9b1e-2a5e1f0f6c11","workspace":"demo","url":"https://ci.example/hooks/parley","types":["*"],"include_forks":true,"description":"","state":"active","created_by":"u_1","created_at":"2026-11-19T10:00:00Z","updated_at":"2026-11-19T10:00:00Z","last_delivery_at":null,"last_status":null,"failing_since":null}
+```
+
+The signing secret is not a member. It is `whsec_` followed by 64
+lower-case hexadecimal characters, made from 32 random bytes, and appears in
+the answers of the create and of [rotate-secret](#post-apiv1workspacesslugwebhooksidrotate-secret)
+alone: in no other answer, no event and no log line (the hub's scrubber
+replaces it). It is stored sealed with the key that seals
+[secrets](#secrets), bound to the subscription, and is opened for each
+attempt.
+
+### What a subscription receives
+
+A subscription receives the events an owner of its workspace may see that
+match `types`: every event of the workspace, the owner-only types
+`parley.secret.*`, `parley.token.*` and `parley.webhook.*` included, and with
+`include_forks` every event of a task fork of the workspace, also after the
+fork is gone; never an event of no workspace and never one of another
+workspace. Its own `parley.webhook.*` events are sent to it like any other.
+It starts with the first event written after its `parley.webhook.create`
+and never sends older events.
+
+The hub keeps, per subscription, a position in the event log. A delivery
+loop runs for every `active` and `failing` subscription, woken by each new
+event and by its own timer. It reads the next events after the position;
+an event the subscription does not receive moves the position on without a
+delivery. For the next event it does receive, it records a `pending`
+delivery and makes the first attempt at once. The next event is sent only
+when the current one has succeeded or been given up, so a receiver never
+gets event B before event A when A has the lower `seq` (except through a
+[redelivery](#post-apiv1workspacesslugwebhooksiddeliveriesdelivery_idredeliver)),
+may get an event more than once, and has at most one request of the
+subscription at a time. A slow or dead receiver delays only its own
+subscription. An event that left the event log before its turn came is
+skipped and counted `failed` in `parley_webhook_deliveries_total`, without
+making the subscription `failing`.
+
+**Retries.** After a failed attempt the hub waits 10 s, then twice as long
+after each further failure, up to 1 hour, but never past 24 hours after the
+event's first attempt, so the waits are 10, 20, 40, 80, 160, 320, 640, 1280,
+2560, 3600, 3600, … seconds. Every attempt reads the subscription's current
+`url`, `types` and secret. A failed attempt sets `last_status` `failed` and
+`last_delivery_at`, and `failing_since` when it is `null`. An attempt that
+fails 24 hours or more after the event's first attempt gives the event up:
+its delivery becomes `failed`, the position moves past it, an `active`
+subscription becomes `failing` and writes `parley.webhook.failing` (actor
+`system`), and the loop goes on with the next event, which gets its own 24
+hours. A successful attempt sets `last_status` `succeeded` and
+`last_delivery_at`, clears `failing_since` and makes a `failing`
+subscription `active` again, without an event.
+
+**Disabling.** At least once a minute the hub disables every `active` or
+`failing` subscription whose `failing_since` is 72 hours or more in the
+past: its `pending` delivery becomes `failed` and it writes
+`parley.webhook.disabled` (actor `system`). A `disabled` subscription gets no
+delivery, and the events written while it is disabled are not kept for it.
+
+**Restarts.** The position and the `pending` delivery are stored: at start
+the hub resumes every `active` and `failing` subscription from its position,
+an attempt that was in flight at the stop is made again under its delivery
+id, and a scheduled retry keeps its time. At the stop the attempts in flight
+are abandoned without waiting.
+
+**The workspace's life.** While the workspace is archived its subscriptions
+keep delivering; they cannot be created, changed or have their secret
+rotated (`409` `workspace_archived`) and can be read, pinged, redelivered and
+deleted. When the workspace is deleted, its subscriptions, their deliveries
+and secrets go in the transaction of the delete, without an event of their
+own.
+
+### The delivery request
+
+Each attempt is one `POST` to `url`, without following a redirect, and
+without a credential of the hub's or any header that identifies a user. Its
+body is the event exactly as [`GET /api/v1/events/log`](#get-apiv1eventslog)
+returns it, one JSON object. Its headers:
+
+| Header | Value |
+|---|---|
+| `Content-Type` | `application/json` |
+| `Parley-Event` | the event's `type` |
+| `Parley-Delivery` | the delivery id; the same on every retry and on a redelivery |
+| `Parley-Seq` | the event's `seq`; `0` for a ping |
+| `Parley-Timestamp` | the Unix time in seconds at which this attempt is sent |
+| `Parley-Signature` | `sha256=` followed by the lower-case hexadecimal HMAC-SHA256 of `<Parley-Timestamp>.<body>`, keyed with the secret exactly as shown, `whsec_…` included |
+| `User-Agent` | `parley-webhook/<hub version>` |
+
+A receiver verifies a delivery by computing the HMAC over the timestamp it
+received, a dot and the raw body, and comparing it with the header; each
+attempt carries a new timestamp and so a new signature. The hub resolves the
+URL's host at every attempt and checks the address it connects to (see
+[Destinations](#destinations)); TLS certificates are always verified.
+
+An attempt **succeeds** when a `2xx` status arrives within
+`[webhooks].timeout` (`10s` by default; see
+[configuration.md](configuration.md#keys)); the response body is not read
+and never stored. Everything else **fails**, recorded on the delivery as:
+
+| Outcome | `response_code` | `error` |
+|---|---|---|
+| a `3xx` status | the status | `redirect` |
+| any other status | the status | `null` |
+| no status within the timeout | `null` | `timeout` |
+| the host does not resolve, or the connection cannot be opened | `null` | `connection_failed` |
+| the TLS handshake fails, an untrusted certificate included | `null` | `tls_error` |
+| the address is refused (see [Destinations](#destinations)) | `null` | `destination_refused` |
+
+A signing secret that cannot be decrypted (no key is configured, or the
+stored value opens under neither key) sends nothing unsigned: the loop makes
+no attempt, leaves the delivery as it is and tries again within a minute,
+and ping and redeliver are answered `503` `secrets_unavailable`.
+
+### Destinations
+
+The hub refuses a URL whose host is, or resolves to, an address in
+`127.0.0.0/8`, `169.254.0.0/16` (with the metadata address
+`169.254.169.254`), `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+`0.0.0.0`, `224.0.0.0/4`, `::1`, `fe80::/10`, `fc00::/7` (with
+`fd00:ec2::254`), `::` or `ff00::/8`; an IPv6 address that carries an IPv4
+address is judged by that IPv4 address: IPv4-mapped (`::ffff:a.b.c.d`),
+IPv4-compatible (`::a.b.c.d`, other than `::` and `::1`), NAT64
+(`64:ff9b::/96`, the last 32 bits) and 6to4 (`2002::/16`, bits 16 to 47),
+so `64:ff9b::a00:1` is refused as `10.0.0.1`. `localhost` is judged as
+`127.0.0.1`.
+`[webhooks].allow_private = true` lifts the refusal for all of them;
+`[webhooks].allow_insecure = true` accepts `http://` URLs whose host is a
+loopback address and lifts the refusal for exactly those. At the create and
+at a `PATCH` that gives `url`, after the shape of the URL is accepted, the
+host is resolved and the URL is refused when any address it resolves to is
+refused; a name that does not resolve is accepted, and its attempts fail
+with `connection_failed`. The refusal is:
+
+```json
+{"error":{"code":400,"message":"url is refused: its host inside.example is, or resolves to, an address of the hub's own networks, which [webhooks].allow_private allows","error_type":"webhook_destination_refused"}}
+```
+
+At every attempt, ping and redelivery the addresses are checked again just
+before the connection: one refused address fails the attempt with
+`destination_refused` before any connection is opened, and the attempt is
+retried like any failure.
+
+### Events
+
+| Type | Written when | Actor | `metadata` |
+|---|---|---|---|
+| `parley.webhook.create` | a subscription is created | the caller | `webhook_id`, `host`, `types`, `include_forks` |
+| `parley.webhook.update` | a `PATCH`, or a rotation (`fields` `["secret"]`) | the caller | `webhook_id`, `fields` (the names given, in the order `url`, `types`, `include_forks`, `description`, `active`), `state` (after the change) |
+| `parley.webhook.delete` | a subscription is deleted | the caller | `webhook_id`, `host` |
+| `parley.webhook.failing` | a subscription becomes `failing` | `system` | `webhook_id`, `host`, `seq` (the event given up), `failing_since`, `response_code`, `error` |
+| `parley.webhook.disabled` | the 72-hour check disables a subscription | `system` | `webhook_id`, `host`, `failing_since` |
+
+Each has `resource_type` `event_webhook`, `resource_id` the subscription id
+and `workspace` its workspace, and is written in the transaction of its
+change. Metadata holds the URL's host, never the URL, and never the secret.
+The ping's type, `parley.webhook.ping`, is never written to the event log.
+
+## `POST /api/v1/workspaces/{slug}/webhooks`
+
+Creates a subscription and answers `201` with it and its `secret`. It is a
+create route (see [Idempotency](#idempotency)): a replay answers `200` with
+the first answer without `secret` and creates nothing. The body:
+
+| Member | Required | Value |
+|---|---|---|
+| `url` | yes | an absolute `https://` URL with a host, without userinfo or fragment, at most 2,048 characters; `http://` only with `[webhooks].allow_insecure` and a loopback host |
+| `types` | no | a list of 1 to 20 strings, each non-empty, an exact type or a prefix ending in `*` (`*` only last), without a comma; default `["*"]` |
+| `include_forks` | no | a boolean; default `true` |
+| `description` | no | a string of at most 1,024 characters; default `""` |
+
+Other members are ignored; a member given as `null` is a bad value. The new
+subscription is `active`, and its position is the `seq` of its own
+`parley.webhook.create`, so the first event it can receive is the next one
+written.
+
+```json
+{"id":"0b6a4bd1-0a3c-4d55-9b1e-2a5e1f0f6c11","workspace":"demo","url":"https://ci.example/hooks/parley","types":["*"],"include_forks":true,"description":"","state":"active","created_by":"u_1","created_at":"2026-11-19T10:00:00Z","updated_at":"2026-11-19T10:00:00Z","last_delivery_at":null,"last_status":null,"failing_since":null,"secret":"whsec_9f2c…"}
+```
+
+| Status | When |
+|---|---|
+| `201 Created` | the subscription with `secret` |
+| `200 OK` | a replay of the same `Idempotency-Key`, caller and body: the first answer without `secret` |
+| `400` `invalid_request` | a field breaks its rule; the message names the field, such as `url must use https`, `url is longer than 2048 characters`, `types must not be empty`, `types has more than 20 entries`, `include_forks must be true or false`, `description is longer than 1024 characters` |
+| `400` `webhook_destination_refused` | the host is, or resolves to, a refused address (see [Destinations](#destinations)) |
+| `409` `workspace_archived` | the workspace is archived |
+| `429` `webhook_limit_reached` | the workspace holds `[webhooks].max_per_workspace` subscriptions in whatever state (`workspace demo holds 20 event webhooks, the most [webhooks].max_per_workspace allows`) |
+| `503` `secrets_unavailable` | no encryption key is configured (see [Secrets](#secrets)) |
+
+A refused create stores nothing and writes no event.
+
+## `GET /api/v1/workspaces/{slug}/webhooks`
+
+Lists the workspace's subscriptions, a [list](#lists) in the standard pages,
+ordered by `created_at`, then `id`, ascending. `state` (`active`, `failing`
+or `disabled`) keeps only the subscriptions in that state; another value is
+`400` `invalid_request` (`state must be one of active, failing, disabled`).
+No item carries `secret`.
+
+## `GET /api/v1/workspaces/{slug}/webhooks/{id}`
+
+Answers the subscription with `pending`: the number of events after its
+position that it receives, the one of its `pending` delivery included
+(counted once whatever the filter now says); `0` for a `disabled`
+subscription.
+
+## `PATCH /api/v1/workspaces/{slug}/webhooks/{id}`
+
+Changes the fields given and answers `200` with the subscription, its
+`updated_at` set to now; fields not given keep their value. The body has at
+least one of `url`, `types`, `include_forks`, `description` (each held to the
+rules of the create) and `active` (a boolean). A changed `url`, `types` or
+`include_forks` applies from the next attempt, and to every event not yet
+examined; the `pending` delivery is kept and still sent, under its id. It
+writes `parley.webhook.update`.
+
+- `active: true` sets a `disabled` or `failing` subscription `active` and
+  clears `failing_since`. A `disabled` one resumes with the first event
+  written after this request's `parley.webhook.update`; events written while
+  it was disabled are not sent. A `failing` one keeps its position and its
+  `pending` delivery.
+- `active: false` sets the subscription `disabled` and marks its `pending`
+  delivery `failed` with `next_attempt_at` `null`; `failing_since` is kept
+  until a re-enable clears it.
+- Asking for the state the subscription is already in changes nothing else
+  and still answers `200` with the event.
+
+| Status | When |
+|---|---|
+| `200 OK` | the subscription |
+| `400` `invalid_request` | no field (`the body must give at least one of url, types, include_forks, description and active`), an unknown member (`color is not a field of an event webhook; a change gives url, types, include_forks, description or active`), or a bad value |
+| `400` `webhook_destination_refused` | a given `url` names a refused destination |
+| `409` `workspace_archived` | the workspace is archived |
+
+A refused change keeps every field and writes no event.
+
+## `DELETE /api/v1/workspaces/{slug}/webhooks/{id}`
+
+Deletes the subscription with its `pending` delivery, its delivery records
+and its signing secret, in any workspace status, writes
+`parley.webhook.delete` and answers `204` without a body. Its deliveries
+stop.
+
+## `POST /api/v1/workspaces/{slug}/webhooks/{id}/rotate-secret`
+
+Takes no body. Replaces the signing secret with a new one and answers `200`
+with the subscription and the new `secret`; the old secret is no longer used
+from the next attempt, also for a delivery being retried. It writes
+`parley.webhook.update` with `fields` `["secret"]`. It is answered `409`
+`workspace_archived` for an archived workspace and `503`
+`secrets_unavailable` when no encryption key is configured, changing
+nothing.
+
+## `POST /api/v1/workspaces/{slug}/webhooks/{id}/ping`
+
+Takes no body. Sends one test delivery at once, outside the order of the
+subscription, in any subscription state and workspace status, and answers
+`200` with its delivery record once the attempt has ended, whether it
+`succeeded` or `failed`. Its body has the shape of an event:
+
+```json
+{"seq":0,"id":"…","type":"parley.webhook.ping","time":"2026-11-19T10:05:00Z","workspace":"demo","actor_type":"api_key","actor_id":"u_1","resource_type":"event_webhook","resource_id":"0b6a4bd1-0a3c-4d55-9b1e-2a5e1f0f6c11","action":"ping","session_id":null,"metadata":{}}
+```
+
+It is signed like any delivery, written to no event log, never retried, and
+changes nothing on the subscription: not its `state`, `last_status`,
+`last_delivery_at`, `failing_since` or position. `503` `secrets_unavailable`
+answers a secret that cannot be decrypted, recording nothing. A caller that
+disconnects does not end the attempt, which is bounded by
+`[webhooks].timeout`, and its record holds the receiver's answer. A
+subscription deleted while the attempt is in flight is answered `404`
+`webhook_not_found` after it, recording nothing.
+
+### The delivery record
+
+| Member | Value |
+|---|---|
+| `id` | UUID, sent as `Parley-Delivery` |
+| `seq` | the event's `seq`; `0` for a ping |
+| `type` | the event's type, `parley.webhook.ping` for a ping |
+| `status` | `pending`, `succeeded` or `failed` |
+| `attempts` | the attempts made |
+| `response_code` | the status of the last attempt's response; `null` when none arrived |
+| `error` | `timeout`, `connection_failed`, `tls_error`, `destination_refused`, `redirect` or `null` |
+| `duration_ms` | the last attempt's duration; `null` before the first |
+| `created_at` | when the delivery was recorded |
+| `last_attempt_at` | the last attempt's time; `null` before the first |
+| `next_attempt_at` | when the next attempt is due; `null` unless `pending` |
+
+It holds no payload and no response body.
+
+## `GET /api/v1/workspaces/{slug}/webhooks/{id}/deliveries`
+
+Lists the subscription's delivery records, pings included, a
+[list](#lists) in the standard pages, newest first: `created_at`, then `id`,
+descending. `status` (`pending`, `succeeded` or `failed`) keeps only the
+records with that status; another value is `400` `invalid_request`
+(`status must be one of pending, succeeded, failed`). Records are kept for 7
+days after their last attempt or, without an attempt, its creation, by the
+retention step `webhook_deliveries`
+(see [configuration.md](configuration.md#retention)); a `pending` record is
+never deleted.
+
+## `POST /api/v1/workspaces/{slug}/webhooks/{id}/deliveries/{delivery_id}/redeliver`
+
+Takes no body. Sends the event of a `succeeded` or `failed` delivery once
+more, at once and outside the order, under the same delivery id, to the
+subscription's current `url` with its current secret, in any subscription
+state, without a retry; answers `200` with the record: `status` the outcome,
+`attempts` one higher, `response_code`, `error`, `duration_ms` and
+`last_attempt_at` of this attempt, `next_attempt_at` `null`. It changes
+nothing on the subscription. A caller that disconnects does not end the
+attempt, which is bounded by `[webhooks].timeout`, and the record holds the
+receiver's answer.
+
+The refusals are checked in the order of the table: the delivery, then
+whether it is a ping, then the signing secret, then its status, then its
+event.
+
+| Status | When |
+|---|---|
+| `200 OK` | the record, whether the attempt succeeded or failed |
+| `404` `delivery_not_found` | the id names no delivery of the subscription |
+| `400` `invalid_request` | `delivery_id` is not a UUID (checked before the lookup); the delivery is a ping (`a ping cannot be redelivered; send a new ping`) |
+| `503` `secrets_unavailable` | the signing secret cannot be decrypted |
+| `409` `delivery_pending` | the delivery is `pending` (`the delivery is still pending; the hub keeps trying it`) |
+| `410` `event_expired` | the event has left the event log (`the event of the delivery has left the event log`) |
+
+A record that goes while the attempt is in flight is answered `404` after
+it: `webhook_not_found` when the subscription was deleted,
+`delivery_not_found` when the record was pruned.
+
+A refused redelivery sends nothing and leaves the record as it was.

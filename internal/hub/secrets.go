@@ -32,9 +32,11 @@ const (
 // transactional store and loads the operator's keys in a configuration check,
 // from the hub's environment and the key file, so that a key that cannot be
 // loaded stops the start as its one error line before any store is opened
-// (docs/adr/06-load-the-secret-keys-before-the-stores-open.md). Its start
-// hook binds the secret component to the stores, the loaded keys, the hub's
-// clock and scrubber, the event component, and the workspace records, the
+// (docs/adr/06-load-the-secret-keys-before-the-stores-open.md), and keeps
+// them on the composition for the parts that seal values of their own with
+// secret.SealValue, composed after it. Its start hook binds the secret
+// component to the stores, the loaded keys, the hub's clock and scrubber,
+// the event component, and the workspace records, the
 // memberships and the users a workspace's chain is built from, and the
 // access service's write-access question, which decides whether a fork's
 // secrets are resolved from its parent, and reads the start report, which
@@ -59,15 +61,14 @@ func composeSecrets(c *Composition) {
 	c.RegisterKey(config.Key{Section: secretsSection, Name: keyFileName, Type: config.String, Default: ""})
 	c.AddSchemaStep(secret.SchemaStep)
 	c.AddSchemaStep(secret.VarSchemaStep)
-	var keys secret.Keys
 	c.addConfigCheck(func(cfg *config.Config) (err error) {
-		keys, err = secret.LoadKeys(c.env, keyFilePath(cfg))
+		c.secretKeys, err = secret.LoadKeys(c.env, keyFilePath(cfg))
 		return err
 	})
 	var report secret.StartReport
 	c.AddStartHook(secretsHook, func(ctx context.Context, rt *Runtime) (err error) {
 		db := rt.Store.Main()
-		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: keys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events,
+		c.secrets.Bind(secret.Deps{Store: rt.Store, Keys: c.secretKeys, Now: rt.Now, Scrubber: rt.Scrubber, Events: c.events,
 			Records: access.StoreRecords(db), Memberships: activeOrgs(db), UserExists: userExists(db),
 			CanWrite: c.access.CanWrite})
 		report, err = c.secrets.StartReport(ctx)

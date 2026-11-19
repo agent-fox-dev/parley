@@ -107,6 +107,10 @@ It never quotes a variable's value.
 | `[audit].orphan_retention` | string | `"30d"` | how long the sessions, usage records, telemetry and hub events of a workspace that no longer exists are kept, each counted from its own time; at least `1d` |
 | `[sessions].max_age` | string | `"90d"` | how long an ended session and its usage records are kept, counted from its `started_at`; at least `1d`. An `active` session is never deleted by it |
 | `[sessions].max_active_age` | string | `"7d"` | how long a session may stay `active`, counted from its `started_at`: an older one is ended as `timeout` with `error_message` `session exceeded maximum active age`; at least `1h` |
+| `[webhooks].max_per_workspace` | integer | `20` | how many event webhooks one workspace may have, in any state; at least `0`, and `0` refuses every create. A create beyond it is answered `429` `webhook_limit_reached` (see [api.md](api.md#event-webhooks)) |
+| `[webhooks].timeout` | string | `"10s"` | how long one delivery attempt, ping or redelivery may take, from resolving the receiver's host to its response status: a whole number followed by `s`, `m`, `h` or `d`, from `1s` to `60s`. An attempt without a status by then fails with `error` `timeout`; the response body is never waited for |
+| `[webhooks].allow_private` | boolean | `false` | let an event webhook's URL name, or resolve to, a loopback, link-local (the cloud metadata address included), private, unique-local, unspecified or multicast address, at create, at a change of the URL and at every attempt |
+| `[webhooks].allow_insecure` | boolean | `false` | accept `http://` URLs whose host is a loopback address (a literal address in `127.0.0.0/8`, `::1`, or the name `localhost`), and lift the refusal of the destination for exactly those; every other URL still needs `https` |
 | `[secrets].key_file` | string | `""` | a file holding the current secret key, read only when `PARLEY_SECRETS_KEY` is unset or empty; a relative path is taken from the directory of `config.toml` (see [Secret keys](#secret-keys)) |
 
 `[database].path` and `[workspace].path`, set or not, are resolved to
@@ -419,7 +423,7 @@ hour, in eleven steps that always run in this order:
 | `postmortems` | deletes the postmortems ingested before now minus `[audit].postmortem_max_age` |
 | `sessions` | deletes the ended sessions started before now minus `[sessions].max_age`, with their usage records and links |
 | `event_log` | moves the start of the event log past the events older than `[events].retention`; they stay stored for `GET /api/v1/audit`, and a resume position before the new start is answered `410` `cursor_expired` |
-| `webhook_deliveries` | asks the event webhooks to delete their delivery records that are not `pending` and whose last attempt is more than 7 days old; nothing while no event webhook store is registered |
+| `webhook_deliveries` | deletes the event webhook delivery records, pings included, that are not `pending` and whose last attempt, or without an attempt their creation, is more than 7 days old; a `pending` record is never deleted (see [api.md](api.md#event-webhooks)) |
 | `hub_events` | deletes the hub events older than `[audit].max_age` |
 | `orphans` | deletes the sessions (whatever their status), usage records, telemetry of all six kinds and hub events of a workspace slug no workspace has (for a task fork's slug `<parent>--<name>`, only when the parent is gone too), once each is older than `[audit].orphan_retention` by its own time |
 | `gauges` | sets the metrics `parley_audit_records` and `parley_agent_sessions_active` from the stored records (see [api.md](api.md#get-metrics)) |
