@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -395,6 +396,98 @@ func TestApprove_RefusesWhatTheRuntimeRejectsOrCannotBeAskedAndDecidesNothing(t 
 		if again := h.call(t, http.MethodPost, approvePath("demo", r.p.SandboxID, r.p.ID), h.key, map[string]any{"scope": r.scope}); again.status != http.StatusOK {
 			t.Errorf("the approval of %s with scope %s again = %d %s; want 200", r.p.ID, r.scope, again.status, again.body)
 		}
+	}
+}
+
+func TestApprove_StoresTheDecisionOnceTheRuntimeHasTheRuleThoughTheCallerLeft(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	id := h.liveSandbox(t, sandbox.StateReady)
+	p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+	added := make(chan struct{})
+	h.hooks.set(func(ctx context.Context, op, name string) error {
+		if op != runtime.OpAddPolicyRule || name != id {
+			return nil
+		}
+		// The runtime has the rule; the caller leaves before the decision
+		// is stored.
+		close(added)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(5 * time.Second):
+			return errors.New("the request's context did not end once the caller left")
+		}
+	})
+	ctx, leave := context.WithCancel(context.Background())
+	defer leave()
+	answered := h.sending(ctx, http.MethodPost, approvePath("demo", id, p.ID), h.key)
+	hubtestWait(t, added, "the runtime to add the rule")
+	leave()
+	if a := <-answered; a.status != 0 {
+		t.Fatalf("the caller got %d %s; want it gone before the answer", a.status, a.body)
+	}
+	eventually(t, "the approval to be stored", func() bool {
+		stored, err := sandbox.GetProposal(context.Background(), h.Store.Main(), id, p.ID)
+		return err == nil && stored.State == sandbox.ProposalApproved
+	})
+	if n := storedRecord(t, h.Hub, id).PolicyRevision; n != 1 {
+		t.Errorf("policy_revision = %d; want 1", n)
+	}
+	if events := h.sandboxEvents(t, sandbox.EventProposalDecided, id); len(events) != 1 {
+		t.Errorf("decision events %v; want 1", events)
+	}
+}
+
+func TestApprove_DuringAStartReachesThePolicyTheSandboxStartsWith(t *testing.T) {
+	t.Parallel()
+	h := startProvisionHub(t, agentProfile)
+	h.storedRepositories(t, "demo")
+	id := h.liveSandboxIn(t, "demo", sandbox.StateStopped, nil)
+	if err := h.rt.Client("parley", nil).StopSandbox(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+	// The start has composed the sandbox's policy and waits in the runtime's
+	// start of the sandbox.
+	starting := newPause()
+	h.hooks.set(func(ctx context.Context, op, name string) error {
+		if op == runtime.OpStartSandbox && name == id {
+			return starting.wait(ctx, op)
+		}
+		return nil
+	})
+	if a := h.call(t, http.MethodPost, sandboxPath("demo", id)+"/start", h.key, nil); a.status != http.StatusOK {
+		t.Fatalf("POST start = %d %s; want 200", a.status, a.body)
+	}
+	hubtestWait(t, starting.entered, "the start to call the runtime")
+	answered := make(chan answer, 1)
+	go func() { answered <- h.call(t, http.MethodPost, approvePath("demo", id, p.ID), h.key, nil) }()
+	// The approval waits for the start's turn, or, were the two not
+	// ordered, answers while the start waits.
+	var a answer
+	got := false
+	eventually(t, "the approval to answer or to wait for the start", func() bool {
+		select {
+		case a = <-answered:
+			got = true
+			return true
+		default:
+			return sandbox.DecisionTurns(h.svc, id) == 2
+		}
+	})
+	close(starting.release)
+	if !got {
+		a = <-answered
+	}
+	if o := decoded(t, a, http.StatusOK); o["state"] != sandbox.ProposalApproved {
+		t.Errorf("answer state = %v; want approved", o["state"])
+	}
+	if rec := h.settled(t, id); rec.State != sandbox.StateReady {
+		t.Fatalf("started sandbox = %s %q; want ready", rec.State, rec.StateReason)
+	}
+	if rules, _ := h.addedRules(t, id); !slices.ContainsFunc(rules, func(r runtime.Rule) bool { return r.Name == p.ID }) {
+		t.Errorf("the started sandbox's policy adds %v; want it to hold the rule approved by %s", decodedRules(t, rules), p.ID)
 	}
 }
 

@@ -282,10 +282,15 @@ type decision struct {
 // sandbox_rule_limit_reached; see heldRule). Then an approval of a sandbox
 // that is provisioning or ready adds the rule to its policy at the runtime
 // (see addRule); a sandbox in another state takes the rule with its next
-// start. Then one transaction stores the decision, conditional on the
-// proposal still being open (see storeDecision). Last, the runtime is told
-// of a rejection, which is stored whether the runtime hears of it or not
-// (see tellRejected).
+// start. A provisioning holds the sandbox's decision turn from before it
+// composes the policy until the runtime has created or started the sandbox
+// with it, so that an approval either is stored before the composition
+// reads the approved rules or adds its rule after the runtime took the
+// composed policy. Then one transaction stores the decision, conditional
+// on the proposal still being open (see storeDecision); once the runtime
+// has the rule, that transaction no longer depends on the caller staying
+// (see storeApproval). Last, the runtime is told of a rejection, which is
+// stored whether the runtime hears of it or not (see tellRejected).
 func (s *Service) decide(ctx context.Context, caller identity.Principal, ws access.Record, sandboxID, proposalID string, d decision) (Proposal, error) {
 	approve := d.State == ProposalApproved
 	var holding string
@@ -324,6 +329,7 @@ func (s *Service) decide(ctx context.Context, caller identity.Principal, ws acce
 		if err := s.addRule(ctx, rec, p); err != nil {
 			return Proposal{}, err
 		}
+		return s.storeApproval(ctx, caller, rec, holding, p, d)
 	}
 	err = s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		p, err = s.storeDecision(ctx, tx, caller, rec.ID, holding, p, d)
@@ -341,6 +347,33 @@ func (s *Service) decide(ctx context.Context, caller identity.Principal, ws acce
 // rejectTimeout bounds the call that tells the runtime of a rejection,
 // which the caller's answer waits for.
 const rejectTimeout = 10 * time.Second
+
+// storeTimeout bounds the transaction that stores an approval whose rule
+// the runtime has already taken.
+const storeTimeout = 10 * time.Second
+
+// storeApproval stores the approval d of the proposal p of the sandbox rec,
+// whose rule the runtime has taken into the sandbox's policy, even when the
+// caller has left meanwhile: the runtime has no operation that takes a rule
+// out again, so the decision must be recorded once the rule is in force.
+// A transaction that fails all the same is logged, with the sandbox's and
+// the proposal's ids and the error's text scrubbed of the hub's credentials
+// and of the sandbox's values, and returned.
+func (s *Service) storeApproval(ctx context.Context, caller identity.Principal, rec Record, holding string, p Proposal, d decision) (Proposal, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
+	defer cancel()
+	stored := p
+	err := s.deps.Store.Tx(ctx, func(tx *sql.Tx) (err error) {
+		stored, err = s.storeDecision(ctx, tx, caller, rec.ID, holding, p, d)
+		return err
+	})
+	if err != nil {
+		s.logger().Error("the runtime took an approved rule whose approval could not be stored", "sandbox_id", rec.ID, "proposal_id", p.ID,
+			"error", s.scrub(s.ScrubSandbox(ctx, rec.ID, err.Error())))
+		return Proposal{}, err
+	}
+	return stored, nil
+}
 
 // tellRejected tells the runtime that the stored proposal p of the
 // sandbox rec is rejected, with the decision's comment as the reason, even
@@ -481,9 +514,10 @@ func WithdrawProposals(ctx context.Context, tx *sql.Tx, sandboxID string) error 
 
 // PurgeNetworkPolicy is the purge hook of the network-policy feature: in
 // the transaction that removes the sandbox's record, it deletes the
-// sandbox's proposals, its reported denials and the rules approved for it.
+// sandbox's proposals, its reported denials, how far its policy log was
+// taken and the rules approved for it.
 func PurgeNetworkPolicy(ctx context.Context, tx *sql.Tx, sandboxID string) error {
-	for _, table := range []string{"sandbox_proposals", "sandbox_denials", "sandbox_approved_rules"} {
+	for _, table := range []string{"sandbox_proposals", "sandbox_denials", "sandbox_policy_log", "sandbox_approved_rules"} {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE sandbox_id = ?`, sandboxID); err != nil {
 			return fmt.Errorf("delete the %s rows of sandbox %s: %w", table, sandboxID, err)
 		}

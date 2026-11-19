@@ -2,6 +2,7 @@ package sandbox_test
 
 import (
 	"context"
+	"net/http"
 	"reflect"
 	"regexp"
 	"slices"
@@ -10,9 +11,11 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
+	"github.com/agent-fox-dev/parley/internal/secret"
 )
 
 func TestPolicyCollector_ReportsTheFirstDenialOfADestinationAsOneEvent(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	rows := []struct {
 		name  string
@@ -66,6 +69,7 @@ func TestPolicyCollector_ReportsTheFirstDenialOfADestinationAsOneEvent(t *testin
 }
 
 func TestPolicyCollector_CountsARepeatedDestinationWithoutAnotherEvent(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	s, u := h.sandbox(t, nil), h.sandbox(t, nil)
 	h.deny(s, "curl", "example.org", 443, "GET", "/a")
@@ -98,6 +102,7 @@ func TestPolicyCollector_CountsARepeatedDestinationWithoutAnotherEvent(t *testin
 }
 
 func TestPolicyCollector_FollowsThePolicyLogOfEachReadySandboxOnly(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	a := h.sandbox(t, nil)
 	h.sandbox(t, func(r *sandbox.Record) { r.State = sandbox.StateStopped })
@@ -106,7 +111,7 @@ func TestPolicyCollector_FollowsThePolicyLogOfEachReadySandboxOnly(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	col.Pass(ctx)
-	eventually(t, "the collector to follow "+a, func() bool { return slices.Equal(h.followed(), []string{a}) })
+	eventually(t, "the collector to follow "+a, func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{a}) })
 
 	bg := context.Background()
 	if _, err := h.svc.Transition(bg, nil, c, sandbox.StateProvisioning, sandbox.StateReady, "", nil); err != nil {
@@ -116,10 +121,10 @@ func TestPolicyCollector_FollowsThePolicyLogOfEachReadySandboxOnly(t *testing.T)
 		t.Fatal(err)
 	}
 	col.Pass(ctx)
-	eventually(t, "the collector to follow "+c+" alone", func() bool { return slices.Equal(h.followed(), []string{c}) })
-	if got := sandbox.PolicyFollowers(col); !slices.Equal(got, []string{c}) {
-		t.Errorf("followers = %v; want [%s]", got, c)
-	}
+	eventually(t, "the collector to follow "+c+" alone", func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{c}) })
+	// The streams the runtime has open are the collector's alone: the
+	// hub's log collector is held.
+	eventually(t, "the log of "+c+" alone to be open", func() bool { return slices.Equal(h.followed(), []string{c}) })
 
 	returned := make(chan struct{})
 	go func() {
@@ -138,6 +143,7 @@ func TestPolicyCollector_FollowsThePolicyLogOfEachReadySandboxOnly(t *testing.T)
 }
 
 func TestPolicyCollector_OpensAFailedPolicyLogAgainAfterTheRetryDelay(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	rows := []struct {
 		name string
@@ -186,7 +192,7 @@ func TestPolicyCollector_OpensAFailedPolicyLogAgainAfterTheRetryDelay(t *testing
 				h.retryClock.Advance(denialRetry)
 			}
 			col.Pass(ctx)
-			eventually(t, "the collector to follow "+id+" again", func() bool { return slices.Equal(h.followed(), []string{id}) })
+			eventually(t, "the collector to follow "+id+" again", func() bool { return slices.Equal(sandbox.PolicyFollowers(col), []string{id}) })
 
 			h.deny(id, "curl", "y.example", 443, "GET", "/y")
 			h.reported(t, id, 2)
@@ -197,7 +203,8 @@ func TestPolicyCollector_OpensAFailedPolicyLogAgainAfterTheRetryDelay(t *testing
 			// A second collector on the same store, as after a restart,
 			// reads the log from its start and reports what is new alone.
 			col.Stop()
-			h.collector(t).Pass(ctx)
+			restarted := h.collector(t)
+			restarted.Pass(ctx)
 			h.deny(id, "curl", "z.example", 443, "GET", "/z")
 			h.reported(t, id, 3)
 			var hosts []any
@@ -207,11 +214,74 @@ func TestPolicyCollector_OpensAFailedPolicyLogAgainAfterTheRetryDelay(t *testing
 			if want := []any{"x.example", "y.example", "z.example"}; !reflect.DeepEqual(hosts, want) {
 				t.Errorf("denial events = %v; want %v", hosts, want)
 			}
+			if got := h.counted() - before; got != 3 {
+				t.Errorf("denials counted after a second collector = %v; want 3 (none replayed counted again)", got)
+			}
+
+			// The sandbox leaves ready and comes back: its log is opened
+			// again from where it was taken.
+			bg := context.Background()
+			if _, err := h.svc.Transition(bg, nil, id, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil {
+				t.Fatal(err)
+			}
+			restarted.Pass(ctx)
+			if got := sandbox.PolicyFollowers(restarted); len(got) != 0 {
+				t.Fatalf("followers after the sandbox left ready = %v; want none", got)
+			}
+			for _, step := range [][2]string{{sandbox.StateStopped, sandbox.StateProvisioning}, {sandbox.StateProvisioning, sandbox.StateReady}} {
+				if _, err := h.svc.Transition(bg, nil, id, step[0], step[1], "", nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restarted.Pass(ctx)
+			h.deny(id, "curl", "w.example", 443, "GET", "/w")
+			h.reported(t, id, 4)
+			if got := h.counted() - before; got != 4 {
+				t.Errorf("denials counted after the sandbox was ready again = %v; want 4 (none replayed counted again)", got)
+			}
 		})
 	}
 }
 
+func TestPolicyCollector_TakesADenialAgainLaterWhenTheSandboxsValuesCannotBeKnown(t *testing.T) {
+	t.Parallel()
+	h := startCollectorHub(t)
+	// Its values are not kept, and the secret store cannot be read.
+	h.resolver.setErr(secret.ErrUnavailable)
+	id := h.readySandbox(t, func(r *sandbox.Record) { r.ExposedSecrets = []string{"NPM_TOKEN"} })
+	if _, err := h.svc.ValuesOf(context.Background(), id); err == nil {
+		t.Fatal("the sandbox's values are known; want them unknown")
+	}
+	ctx := context.Background()
+	col := h.collector(t)
+	h.deny(id, "curl", "a.example", 443, "GET", "/a")
+	h.deny(id, "curl", "b.example", 443, "GET", "/b")
+	col.Pass(ctx)
+	eventually(t, "the follower of "+id+" to stop or report", func() bool {
+		return len(sandbox.PolicyFollowers(col)) == 0 || len(h.denials(t, id)) > 0
+	})
+	if evs := h.denials(t, id); len(evs) != 0 {
+		t.Fatalf("denial events while the values are unknown = %v; want none", evs)
+	}
+
+	h.svc.SetValues(id, sandbox.Values{})
+	h.retryClock.Advance(denialRetry)
+	col.Pass(ctx)
+	h.reported(t, id, 2)
+	var hosts []any
+	for _, e := range h.denials(t, id) {
+		hosts = append(hosts, e.metadata["host"])
+	}
+	if want := []any{"a.example", "b.example"}; !reflect.DeepEqual(hosts, want) {
+		t.Errorf("denial events = %v; want %v", hosts, want)
+	}
+	if got := h.counted(); got != 2 {
+		t.Errorf("denials counted = %v; want 2", got)
+	}
+}
+
 func TestPolicyCollector_StoresANewProposalAsOpenWithOneEvent(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	rows := []struct {
 		name     string
@@ -267,7 +337,35 @@ func TestPolicyCollector_StoresANewProposalAsOpenWithOneEvent(t *testing.T) {
 	}
 }
 
+func TestPolicyCollector_StoresAProposalsSummaryScrubbedOfTheSandboxsValues(t *testing.T) {
+	t.Parallel()
+	h := startCollectorHub(t)
+	const exposed = "supersecretvalue"
+	id := h.readySandbox(t, allowProposals)
+	h.svc.SetValues(id, sandbox.Values{Exposed: []string{exposed}})
+	body := `{"host": "` + exposed + `.example"}`
+	h.propose(id, body)
+	h.collector(t).Pass(context.Background())
+	const want = `allow {"host": "[redacted].example"}`
+	got := h.proposals(t, id, sandbox.ProposalOpen)
+	if len(got) != 1 {
+		t.Fatalf("open proposals = %+v; want 1", got)
+	}
+	// The rule goes to the runtime as the runtime gave it.
+	if got[0].Summary != want || string(got[0].Rule) != body {
+		t.Errorf("stored summary %q, rule %s; want %q, %s", got[0].Summary, got[0].Rule, want, body)
+	}
+	if evs := h.sandboxEvents(t, sandbox.EventProposal, id); len(evs) != 1 || evs[0].metadata["summary"] != want {
+		t.Errorf("proposal events %+v; want one with the summary %q", evs, want)
+	}
+	items, _ := listItems(t, h.call(t, http.MethodGet, proposalsPath("ws", id), h.key, nil))
+	if len(items) != 1 || items[0].(map[string]any)["summary"] != want {
+		t.Errorf("listed proposals %v; want one with the summary %q", items, want)
+	}
+}
+
 func TestPolicyCollector_StoresAProposalSeenBeforeOnce(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	id := h.sandbox(t, allowProposals)
 	h.propose(id, `{"host": "example.org"}`)
@@ -291,6 +389,7 @@ func TestPolicyCollector_StoresAProposalSeenBeforeOnce(t *testing.T) {
 }
 
 func TestPolicyCollector_RejectsAProposalOfASandboxWhoseProfileDidNotAllowThem(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	rows := []struct {
 		name    string
@@ -328,6 +427,7 @@ func TestPolicyCollector_RejectsAProposalOfASandboxWhoseProfileDidNotAllowThem(t
 }
 
 func TestPolicyCollector_ListsProposalsAgainAtTheNextPollAfterAFailure(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	id := h.sandbox(t, allowProposals)
 	ctx := context.Background()
@@ -359,6 +459,7 @@ func TestPolicyCollector_ListsProposalsAgainAtTheNextPollAfterAFailure(t *testin
 }
 
 func TestPolicyCollector_ListsProposalsFirstOneIntervalAfterItStarts(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	id := h.sandbox(t, allowProposals)
 	h.propose(id, `{"host": "example.org"}`)

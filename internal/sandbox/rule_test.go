@@ -260,114 +260,104 @@ func TestPromote_RefusesWithoutAuthorityOnTheParentOrWithTheParentArchivedAndDec
 	}
 }
 
-func TestPromote_RefusesARuleBeyondFiftyAndLetsOneOfTwoTakeTheLastPlace(t *testing.T) {
+func TestPromote_RefusesARuleBeyondFifty(t *testing.T) {
 	t.Parallel()
 	h := startProposalHub(t)
 	ctx := context.Background()
-	count := func(t *testing.T, ws string) int {
-		t.Helper()
-		n, err := sandbox.CountRules(ctx, h.Store.Main(), ws)
+	h.fillRules(t, "other", 50)
+	id := h.liveSandboxIn(t, "other", sandbox.StateReady, nil)
+	p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+	a := h.call(t, http.MethodPost, approvePath("other", id, p.ID), h.key, promote)
+	if a.status != http.StatusTooManyRequests || a.err.ErrorType != "sandbox_rule_limit_reached" {
+		t.Errorf("= %d %s; want 429 sandbox_rule_limit_reached", a.status, a.body)
+	}
+	if stored, err := sandbox.GetProposal(ctx, h.Store.Main(), id, p.ID); err != nil || stored.State != sandbox.ProposalOpen {
+		t.Errorf("stored %+v, %v; want it open", stored, err)
+	}
+	if n := h.ruleCount(t, "other"); n != 50 {
+		t.Errorf("rules = %d; want 50", n)
+	}
+	if _, calls := h.addedRules(t, id); calls != 0 {
+		t.Errorf("add-rule calls = %d; want 0", calls)
+	}
+	if n := h.count(t, `SELECT COUNT(*) FROM hub_events WHERE resource_id = ? OR (type = ? AND workspace = ?)`, id, sandbox.EventRuleAdd, "other"); n != 0 {
+		t.Errorf("events = %d; want none", n)
+	}
+}
+
+func TestPromote_LetsOneOfTwoReleasedTogetherTakeTheLastPlace(t *testing.T) {
+	t.Parallel()
+	h := startProposalHub(t)
+	ctx := context.Background()
+	const rounds = 20
+	h.fork(t, "demo--a", "demo", recordStart.Add(24*time.Hour), nil)
+	h.fillRules(t, "demo", 49)
+	slugs := [2]string{"demo", "demo--a"}
+	ids := [2]string{h.liveSandboxIn(t, slugs[0], sandbox.StateReady, nil), h.liveSandboxIn(t, slugs[1], sandbox.StateReady, nil)}
+	for round := range rounds {
+		var ps [2]sandbox.Proposal
+		for i, id := range ids {
+			ps[i] = h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
+		}
+		var (
+			wg      sync.WaitGroup
+			release = make(chan struct{})
+			answers [2]answer
+		)
+		for i := range ps {
+			wg.Go(func() {
+				<-release
+				answers[i] = h.call(t, http.MethodPost, approvePath(slugs[i], ids[i], ps[i].ID), h.key, promote)
+			})
+		}
+		close(release)
+		wg.Wait()
+		statuses := []int{answers[0].status, answers[1].status}
+		slices.Sort(statuses)
+		if !slices.Equal(statuses, []int{http.StatusOK, http.StatusTooManyRequests}) {
+			t.Fatalf("round %d: answers %d %s and %d %s; want one 200 and one 429", round, answers[0].status, answers[0].body, answers[1].status, answers[1].body)
+		}
+		won, lost := 0, 1
+		if answers[0].status != http.StatusOK {
+			won, lost = 1, 0
+		}
+		if answers[lost].err.ErrorType != "sandbox_rule_limit_reached" {
+			t.Errorf("the refusal %s; want sandbox_rule_limit_reached", answers[lost].body)
+		}
+		if n := h.ruleCount(t, "demo"); n != 50 {
+			t.Errorf("round %d: rules = %d; want 50", round, n)
+		}
+		for i, want := range map[int]string{won: sandbox.ProposalApproved, lost: sandbox.ProposalOpen} {
+			if stored, err := sandbox.GetProposal(ctx, h.Store.Main(), ids[i], ps[i].ID); err != nil || stored.State != want {
+				t.Errorf("round %d: proposal %s stored %+v, %v; want %s", round, ps[i].ID, stored, err, want)
+			}
+		}
+		approved, err := sandbox.ApprovedRules(ctx, h.Store.Main(), ids[lost])
 		if err != nil {
 			t.Fatal(err)
 		}
-		return n
+		rules, _ := h.addedRules(t, ids[lost])
+		if slices.ContainsFunc(approved, func(a sandbox.ApprovedRule) bool { return a.ProposalID == ps[lost].ID }) ||
+			slices.ContainsFunc(rules, func(r runtime.Rule) bool { return r.Name == ps[lost].ID }) {
+			t.Errorf("round %d: the refused rule %s is among the sandbox's approved rules or the runtime's", round, ps[lost].ID)
+		}
+		// Room for the next round, and in the last for the refused
+		// approval again.
+		var winner map[string]any
+		if err := json.Unmarshal(answers[won].body, &winner); err != nil {
+			t.Fatal(err)
+		}
+		h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
+			_, err := sandbox.DeleteRule(ctx, tx, "demo", winner["workspace_rule_id"].(string))
+			return err
+		})
+		if round == rounds-1 {
+			again := h.call(t, http.MethodPost, approvePath(slugs[lost], ids[lost], ps[lost].ID), h.key, promote)
+			if again.status != http.StatusOK {
+				t.Errorf("the refused approval again = %d %s; want 200", again.status, again.body)
+			}
+		}
 	}
-
-	t.Run("a workspace with 50 rules", func(t *testing.T) {
-		t.Parallel()
-		h.fillRules(t, "other", 50)
-		id := h.liveSandboxIn(t, "other", sandbox.StateReady, nil)
-		p := h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
-		a := h.call(t, http.MethodPost, approvePath("other", id, p.ID), h.key, promote)
-		if a.status != http.StatusTooManyRequests || a.err.ErrorType != "sandbox_rule_limit_reached" {
-			t.Errorf("= %d %s; want 429 sandbox_rule_limit_reached", a.status, a.body)
-		}
-		if stored, err := sandbox.GetProposal(ctx, h.Store.Main(), id, p.ID); err != nil || stored.State != sandbox.ProposalOpen {
-			t.Errorf("stored %+v, %v; want it open", stored, err)
-		}
-		if n := count(t, "other"); n != 50 {
-			t.Errorf("rules = %d; want 50", n)
-		}
-		if _, calls := h.addedRules(t, id); calls != 0 {
-			t.Errorf("add-rule calls = %d; want 0", calls)
-		}
-		if n := h.count(t, `SELECT COUNT(*) FROM hub_events WHERE resource_id = ? OR (type = ? AND workspace = ?)`, id, sandbox.EventRuleAdd, "other"); n != 0 {
-			t.Errorf("events = %d; want none", n)
-		}
-	})
-
-	t.Run("two promotions released together at 49 rules", func(t *testing.T) {
-		t.Parallel()
-		const rounds = 20
-		h.fork(t, "demo--a", "demo", recordStart.Add(24*time.Hour), nil)
-		h.fillRules(t, "demo", 49)
-		slugs := [2]string{"demo", "demo--a"}
-		ids := [2]string{h.liveSandboxIn(t, slugs[0], sandbox.StateReady, nil), h.liveSandboxIn(t, slugs[1], sandbox.StateReady, nil)}
-		for round := range rounds {
-			var ps [2]sandbox.Proposal
-			for i, id := range ids {
-				ps[i] = h.seedProposal(t, id, sandbox.ProposalOpen, proposedBefore, nil)
-			}
-			var (
-				wg      sync.WaitGroup
-				release = make(chan struct{})
-				answers [2]answer
-			)
-			for i := range ps {
-				wg.Go(func() {
-					<-release
-					answers[i] = h.call(t, http.MethodPost, approvePath(slugs[i], ids[i], ps[i].ID), h.key, promote)
-				})
-			}
-			close(release)
-			wg.Wait()
-			statuses := []int{answers[0].status, answers[1].status}
-			slices.Sort(statuses)
-			if !slices.Equal(statuses, []int{http.StatusOK, http.StatusTooManyRequests}) {
-				t.Fatalf("round %d: answers %d %s and %d %s; want one 200 and one 429", round, answers[0].status, answers[0].body, answers[1].status, answers[1].body)
-			}
-			won, lost := 0, 1
-			if answers[0].status != http.StatusOK {
-				won, lost = 1, 0
-			}
-			if answers[lost].err.ErrorType != "sandbox_rule_limit_reached" {
-				t.Errorf("the refusal %s; want sandbox_rule_limit_reached", answers[lost].body)
-			}
-			if n := count(t, "demo"); n != 50 {
-				t.Errorf("round %d: rules = %d; want 50", round, n)
-			}
-			for i, want := range map[int]string{won: sandbox.ProposalApproved, lost: sandbox.ProposalOpen} {
-				if stored, err := sandbox.GetProposal(ctx, h.Store.Main(), ids[i], ps[i].ID); err != nil || stored.State != want {
-					t.Errorf("round %d: proposal %s stored %+v, %v; want %s", round, ps[i].ID, stored, err, want)
-				}
-			}
-			approved, err := sandbox.ApprovedRules(ctx, h.Store.Main(), ids[lost])
-			if err != nil {
-				t.Fatal(err)
-			}
-			rules, _ := h.addedRules(t, ids[lost])
-			if slices.ContainsFunc(approved, func(a sandbox.ApprovedRule) bool { return a.ProposalID == ps[lost].ID }) ||
-				slices.ContainsFunc(rules, func(r runtime.Rule) bool { return r.Name == ps[lost].ID }) {
-				t.Errorf("round %d: the refused rule %s is among the sandbox's approved rules or the runtime's", round, ps[lost].ID)
-			}
-			// Room for the next round, and in the last for the refused
-			// approval again.
-			var winner map[string]any
-			if err := json.Unmarshal(answers[won].body, &winner); err != nil {
-				t.Fatal(err)
-			}
-			h.insert(t, func(ctx context.Context, tx *sql.Tx) error {
-				_, err := sandbox.DeleteRule(ctx, tx, "demo", winner["workspace_rule_id"].(string))
-				return err
-			})
-			if round == rounds-1 {
-				again := h.call(t, http.MethodPost, approvePath(slugs[lost], ids[lost], ps[lost].ID), h.key, promote)
-				if again.status != http.StatusOK {
-					t.Errorf("the refused approval again = %d %s; want 200", again.status, again.body)
-				}
-			}
-		}
-	})
 }
 
 func TestPromote_RefusedWhileWorkspaceRulesAreOffLeavesEarlierRulesInForce(t *testing.T) {

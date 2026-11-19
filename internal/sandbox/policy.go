@@ -125,11 +125,13 @@ func (s *Service) checkBasePolicy(ctx context.Context, rec Record) error {
 }
 
 // Explain names what the runtime rejected in the policy value of rec: the
-// first workspace sandbox rule with which the policy is rejected, found by
-// adding the recorded copies one at a time, in their order, to the policy
-// without them, or the profile when the runtime rejects the policy without
-// any. The text keeps the runtime's reason, scrubbed of the sandbox's
-// values and cut to 1,024 bytes.
+// profile, when the runtime rejects its base policy with the protected
+// rules alone; else the first workspace sandbox rule with which the policy
+// is rejected, found by adding the recorded copies one at a time, in their
+// order; else the first rule approved for the sandbox with which it is
+// rejected, found by adding those one at a time, in their order, after
+// every copy. The text keeps the runtime's reason, scrubbed of the
+// sandbox's values and cut to 1,024 bytes.
 func (c networkComposer) Explain(rec Record, refusal error) string {
 	ctx, cancel := context.WithTimeout(context.Background(), explainTimeout)
 	defer cancel()
@@ -145,18 +147,24 @@ func (s *Service) explain(ctx context.Context, rec Record, refusal error) string
 	if err != nil {
 		return refusal.Error()
 	}
-	rejects := func(p runtime.Policy) bool {
+	approved := without.Added
+	rejects := func(added []runtime.Rule) bool {
+		p := without
+		p.Added = added
 		_, err := client.ValidatePolicy(ctx, p)
 		return errors.Is(err, runtime.ErrInvalid)
 	}
-	if rejects(without) {
-		return fmt.Sprintf("the runtime rejects the policy of profile %q without any workspace sandbox rule: %s", rec.Profile, refusal)
+	if rejects(nil) {
+		return fmt.Sprintf("the runtime rejects the policy of profile %q with the protected rules alone: %s", rec.Profile, refusal)
 	}
 	for i, r := range copies {
-		p := without
-		p.Added = append(slices.Clone(copies[:i+1]), without.Added...)
-		if rejects(p) {
+		if rejects(slices.Clone(copies[:i+1])) {
 			return fmt.Sprintf("the runtime rejects the policy with workspace sandbox rule %s: %s", r.Name, refusal)
+		}
+	}
+	for i, r := range approved {
+		if rejects(append(slices.Clone(copies), approved[:i+1]...)) {
+			return fmt.Sprintf("the runtime rejects the policy with the rule approved by proposal %s: %s", r.Name, refusal)
 		}
 	}
 	return refusal.Error()

@@ -11,7 +11,8 @@ import (
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 )
 
-func TestPurgeHooks_RemoveTheProposalsDenialsAndApprovedRulesOfTheRemovedSandbox(t *testing.T) {
+func TestPurgeHooks_RemoveTheNetworkPolicyRowsOfTheRemovedSandbox(t *testing.T) {
+	t.Parallel()
 	h := startCollectorHub(t)
 	deleted := func(r *sandbox.Record) { r.State = sandbox.StateDeleted }
 	s, d := h.sandbox(t, deleted), h.sandbox(t, deleted)
@@ -33,11 +34,11 @@ func TestPurgeHooks_RemoveTheProposalsDenialsAndApprovedRulesOfTheRemovedSandbox
 			t.Fatal(err)
 		}
 	}
-	all := [3]int{1, 1, 1}
+	all := [4]int{1, 1, 1, 1}
 
 	purge(s, true)
-	if got := h.policyRows(t, s); got != [3]int{} {
-		t.Errorf("rows of the removed sandbox (proposals, denials, approved rules) = %v; want none", got)
+	if got := h.policyRows(t, s); got != [4]int{} {
+		t.Errorf("rows of the removed sandbox (proposals, denials, approved rules, log position) = %v; want none", got)
 	}
 	if got := h.policyRows(t, d); got != all {
 		t.Errorf("rows of the other sandbox = %v; want %v", got, all)

@@ -108,3 +108,24 @@ CREATE INDEX sandbox_proposals_sandbox ON sandbox_proposals (sandbox_id, state, 
 		return err
 	},
 }
+
+// PolicyLogSchemaStep creates how far the policy collector has taken the
+// policy log of each sandbox: the time of the last entry taken, in Unix
+// nanoseconds as the runtime stamps its entries, and how many entries at
+// that time were taken. A log opened again, by the same process after the
+// sandbox was ready again or by another after a restart, leaves out what
+// was taken, so that no denial is counted twice. A row names its sandbox
+// without a foreign key: the purge hook removes it with the record.
+var PolicyLogSchemaStep = store.Step{
+	Name:   "sandbox_policy_log",
+	Target: store.Main,
+	Apply: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+CREATE TABLE sandbox_policy_log (
+	sandbox_id TEXT NOT NULL PRIMARY KEY,
+	taken_at   INTEGER NOT NULL,
+	taken      INTEGER NOT NULL
+);`)
+		return err
+	},
+}

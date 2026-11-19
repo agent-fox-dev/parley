@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/event"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 )
@@ -28,7 +29,8 @@ const (
 	// port) of a sandbox.
 	EventDeny = "parley.sandbox.deny"
 	// DenialsMetric counts every denial the runtime reports for a sandbox
-	// the hub holds, first or repeated.
+	// the hub holds, first or repeated, once, though the runtime replays
+	// the entries of a log opened again.
 	DenialsMetric = "parley_sandbox_denials_total"
 )
 
@@ -62,8 +64,10 @@ type PolicyCollectorOptions struct {
 // sandbox and reports each denial: every one is counted in DenialsMetric,
 // and the first of each (program, host, port) of a sandbox is stored with
 // its parley.sandbox.deny event. The destinations stored are what makes a
-// denial a first one, so a collector built on the same store, as after a
-// restart, reports none of them again.
+// denial a first one, and the position stored with each denial is how far
+// the sandbox's log was taken, so a collector built on the same store, as
+// after a restart, or one whose sandbox is ready again, reports and counts
+// none of them again.
 //
 // It also lists the runtime's pending proposals, at most once per poll
 // interval, and stores each new proposal of a sandbox whose profile
@@ -90,10 +94,12 @@ type PolicyCollector struct {
 	// collector's clock; guarded by pass.
 	polled time.Time
 
-	// mu guards what the followers write: how far each sandbox's log has
-	// been taken (resume), when a log that failed may be opened again
-	// (retryAt), and the sandboxes whose runtime answered that it keeps no
-	// policy log, which is logged once per sandbox (unsupported).
+	// mu guards what the followers write: how far each followed sandbox's
+	// log has been taken, the entries of other actions than deny included,
+	// which the store does not keep (resume), when a log that failed may be
+	// opened again (retryAt), and the sandboxes whose runtime answered that
+	// it keeps no policy log, which is logged once per sandbox
+	// (unsupported).
 	mu          sync.Mutex
 	resume      map[string]logPoint
 	retryAt     map[string]time.Time
@@ -110,10 +116,48 @@ type policyFollower struct {
 // logPoint is how far a policy log has been taken: every entry before at,
 // and the first n entries at at. A followed log that is opened again
 // replays the entries from at, which are left out up to that point, so
-// that no denial is counted twice by one collector.
+// that no denial is counted twice.
 type logPoint struct {
 	at time.Time
 	n  int
+}
+
+// after is the point once the entry at at that follows p was taken.
+func (p logPoint) after(at time.Time) logPoint {
+	switch {
+	case at.After(p.at):
+		return logPoint{at: at, n: 1}
+	case at.Equal(p.at):
+		p.n++
+	}
+	return p
+}
+
+// storedPoint reads, through q, how far the policy log of the sandbox id
+// was taken when its last denial was reported; the zero point, the log's
+// start, when none was.
+func storedPoint(ctx context.Context, q access.Querier, id string) (logPoint, error) {
+	var at, n int64
+	err := q.QueryRowContext(ctx, `SELECT taken_at, taken FROM sandbox_policy_log WHERE sandbox_id = ?`, id).Scan(&at, &n)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return logPoint{}, nil
+	case err != nil:
+		return logPoint{}, fmt.Errorf("read how far the policy log of sandbox %s was taken: %w", id, err)
+	}
+	return logPoint{at: time.Unix(0, at), n: int(n)}, nil
+}
+
+// storePoint stores p in tx as how far the policy log of the sandbox id
+// was taken.
+func storePoint(ctx context.Context, tx *sql.Tx, id string, p logPoint) error {
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO sandbox_policy_log (sandbox_id, taken_at, taken) VALUES (?, ?, ?)
+ON CONFLICT (sandbox_id) DO UPDATE SET taken_at = excluded.taken_at, taken = excluded.taken`, id, p.at.UnixNano(), p.n)
+	if err != nil {
+		return fmt.Errorf("store how far the policy log of sandbox %s was taken: %w", id, err)
+	}
+	return nil
 }
 
 // NewPolicyCollector returns a policy collector of the service with the
@@ -254,8 +298,13 @@ func (s *Service) takeProposal(ctx context.Context, p runtime.Proposal) error {
 	if s.deps.Now != nil {
 		now = s.deps.Now()
 	}
+	// The summary is the runtime's text about what the sandbox did, which
+	// may quote one of its values: it is stored scrubbed, so that the
+	// event, the proposal objects and a workspace rule promoted from it
+	// show it scrubbed. The rule is stored as the runtime gave it, since
+	// the hub hands it back to the runtime unchanged.
 	stored := Proposal{
-		ID: NewProposalID(), SandboxID: p.Sandbox, RuntimeID: p.ID, Rule: p.Rule.Body, Summary: p.Summary,
+		ID: NewProposalID(), SandboxID: p.Sandbox, RuntimeID: p.ID, Rule: p.Rule.Body, Summary: s.ScrubSandbox(ctx, p.Sandbox, p.Summary),
 		Findings: p.Findings, State: ProposalOpen, CreatedAt: now,
 	}
 	return s.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
@@ -341,7 +390,8 @@ func (c *PolicyCollector) followDenials(ctx context.Context) {
 		}
 	}
 	// What is kept of a sandbox that left ready is dropped with its
-	// follower, so that the collector keeps nothing of the sandboxes gone.
+	// follower, so that the collector keeps nothing of the sandboxes gone;
+	// the store keeps how far its log was taken.
 	now := c.now()
 	waiting := map[string]bool{}
 	c.mu.Lock()
@@ -379,18 +429,25 @@ func (c *PolicyCollector) followDenials(ctx context.Context) {
 }
 
 // follow reports the denials of the policy log of the sandbox rec until the
-// stream ends: it opens the log from where this collector took it up to
-// and leaves out the entries it took before.
+// stream ends: it opens the log from where it was taken up to, as this
+// collector followed it or else as the store says, and leaves out the
+// entries taken before.
 func (c *PolicyCollector) follow(ctx context.Context, rec Record) error {
 	c.mu.Lock()
-	from := c.resume[rec.ID]
+	from, ok := c.resume[rec.ID]
 	c.mu.Unlock()
+	if !ok {
+		var err error
+		if from, err = storedPoint(ctx, c.s.deps.Store.Main(), rec.ID); err != nil {
+			return err
+		}
+	}
 	stream, err := c.s.client.Logs(ctx, rec.ID, runtime.LogQuery{Source: runtime.SourcePolicy, Since: from.at, Follow: true})
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
-	skip := from.n
+	skip, point := from.n, from
 	for {
 		e, err := stream.Next()
 		if errors.Is(err, io.EOF) {
@@ -409,30 +466,27 @@ func (c *PolicyCollector) follow(ctx context.Context, rec Record) error {
 			skip--
 			continue
 		}
+		point = point.after(e.Time)
 		if e.Action == actionDeny {
+			// A denial whose texts cannot be scrubbed is not taken: it is
+			// taken again after the retry delay, once the values may be
+			// known, rather than stored as a destination that would stand
+			// for every other one.
+			v, err := c.s.ValuesOf(ctx, rec.ID)
+			if err != nil {
+				return fmt.Errorf("the values the denials of the sandbox are scrubbed of: %w", err)
+			}
 			// Counted before it is stored: an entry whose storing fails is
 			// taken again after the retry delay, and an event is never
 			// lost, at the price of counting that entry twice.
 			_ = c.s.deps.Recorder.Add(DenialsMetric, nil, 1)
-			if err := c.s.reportDenial(ctx, rec, e); err != nil {
+			if err := c.s.reportDenial(ctx, rec, v, e, point); err != nil {
 				return err
 			}
 		}
-		c.taken(rec.ID, e.Time)
-	}
-}
-
-// taken records that the entry at at of the sandbox id's log was taken.
-func (c *PolicyCollector) taken(id string, at time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	p := c.resume[id]
-	switch {
-	case at.After(p.at):
-		c.resume[id] = logPoint{at: at, n: 1}
-	case at.Equal(p.at):
-		p.n++
-		c.resume[id] = p
+		c.mu.Lock()
+		c.resume[rec.ID] = point
+		c.mu.Unlock()
 	}
 }
 
@@ -460,12 +514,13 @@ func (c *PolicyCollector) ended(ctx context.Context, id string, err error) {
 
 // reportDenial stores the destination of the denial e of the sandbox rec
 // and, when the sandbox had not been reported denied it, writes its
-// parley.sandbox.deny event in the same transaction. Its texts pass
-// through the sandbox's scrubbing, the stored destination's too, so that
-// no exposed value is stored; a method and a path the entry does not have,
-// as for a blocked connection, are null.
-func (s *Service) reportDenial(ctx context.Context, rec Record, e runtime.LogEntry) error {
-	clean := func(text string) string { return s.ScrubSandbox(ctx, rec.ID, text) }
+// parley.sandbox.deny event, and stores taken as how far the sandbox's log
+// was taken, all in one transaction. Its texts pass through Scrub with the
+// sandbox's values v, the stored destination's too, so that no exposed
+// value is stored; a method and a path the entry does not have, as for a
+// blocked connection, are null.
+func (s *Service) reportDenial(ctx context.Context, rec Record, v Values, e runtime.LogEntry, taken logPoint) error {
+	clean := func(text string) string { return Scrub(v, text) }
 	program, host := clean(e.Program), clean(e.Host)
 	meta := map[string]any{"program": program, "host": host, "port": e.Port, "method": nil, "path": nil}
 	if e.Method != "" {
@@ -479,6 +534,9 @@ func (s *Service) reportDenial(ctx context.Context, rec Record, e runtime.LogEnt
 			rec.ID, program, host, e.Port)
 		if err != nil {
 			return fmt.Errorf("store a denial of sandbox %s: %w", rec.ID, err)
+		}
+		if err := storePoint(ctx, tx, rec.ID, taken); err != nil {
+			return err
 		}
 		if n, err := res.RowsAffected(); err != nil || n == 0 {
 			return err

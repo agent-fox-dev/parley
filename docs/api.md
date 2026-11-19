@@ -8520,19 +8520,22 @@ and none of the rules approved for its source alone.
 
 While a sandbox is `ready`, the hub follows its policy log at the runtime
 and takes each entry whose action is `deny`. Every denial adds 1 to
-`parley_sandbox_denials_total`. The first denial of each (program, host,
-port) of a sandbox writes one event, and later denials of the same three
-write none, whatever their method and path; which ones were reported is
-stored, so a restart reports none twice:
+`parley_sandbox_denials_total`, once: how far each sandbox's log was taken
+is stored with each denial, so a log read again, after a restart or once
+the sandbox is `ready` again, counts none of it twice. The first denial of
+each (program, host, port) of a sandbox writes one event, and later
+denials of the same three write none, whatever their method and path;
+which ones were reported is stored, so a restart reports none twice:
 
 ```json
 {"seq":51,"id":"…","type":"parley.sandbox.deny","time":"2026-11-18T12:01:00Z","workspace":"demo--t1","actor_type":"system","actor_id":null,"resource_type":"sandbox","resource_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","action":"deny","session_id":null,"metadata":{"program":"npm","host":"registry.example.org","port":443,"method":null,"path":null}}
 ```
 
 `method` and `path` are `null` for a blocked connection. The sandbox's
-secret values in the texts read `[redacted]`. A policy log that breaks, or a
-runtime that cannot be reached, is logged and read again 5 seconds later;
-the hub keeps serving. A sandbox's log stops being followed once it leaves
+secret values in the texts read `[redacted]`; while they cannot be known,
+a denial is not taken, and its log is read again 5 seconds later. A policy
+log that breaks, or a runtime that cannot be reached, is logged and read
+again 5 seconds later; the hub keeps serving. A sandbox's log stops being followed once it leaves
 `ready`. Its denials stay visible in its logs (see
 [`GET …/logs`](#get-apiv1workspacesslugsandboxesidlogs)).
 
@@ -8541,7 +8544,11 @@ the hub keeps serving. A sandbox's log stops being followed once it leaves
 When a workload is blocked, it can ask, with the runtime's own mechanism,
 for one more rule. Every 5 seconds the hub lists the runtime's pending
 proposals. A proposal of a sandbox whose profile had `allow_proposals` when
-the sandbox was created is stored as `open`, once, with this event:
+the sandbox was created is stored as `open`, once, with this event. Its
+`summary` is stored with the sandbox's secret values `[redacted]` (at most
+1,024 bytes), in the event, the proposal and a workspace sandbox rule saved
+from it; its `rule` is stored as the runtime gave it, since the hub hands
+it back to the runtime unchanged:
 
 ```json
 {"seq":52,"id":"…","type":"parley.sandbox.proposal","time":"2026-11-18T12:01:05Z","workspace":"demo--t1","actor_type":"system","actor_id":null,"resource_type":"sandbox","resource_id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","action":"proposal","session_id":null,"metadata":{"proposal_id":"sbp_0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f","summary":"npm → registry.example.org:443","max_severity":"high"}}
@@ -8567,7 +8574,7 @@ A proposal has exactly these members:
 | `id` | `sbp_` and 32 lowercase hexadecimal characters |
 | `sandbox_id` | the sandbox that asked |
 | `rule` | the proposed rule, as the runtime gave it |
-| `summary` | the runtime's one line about it |
+| `summary` | the runtime's one line about it, the sandbox's secret values `[redacted]` |
 | `findings` | the runtime's findings, `{severity, message}` each, `[]` when none |
 | `state` | `open`, `approved`, `rejected` or `withdrawn` |
 | `scope` | `sandbox` or `workspace` once approved, else `null` |
@@ -8632,7 +8639,10 @@ as absent):
 Approving adds the rule to the sandbox's policy at the runtime when the
 sandbox is `provisioning` or `ready`; in `stopped`, `completed` and
 `failed` the runtime is not asked and the rule is in the policy of the next
-start. Then, in one transaction, the proposal becomes `approved` with
+start. A start and the decisions of the sandbox take turns from the start's
+composition of the policy until the runtime has started the sandbox with
+it, so an approval made while the sandbox starts is either in the policy
+it starts with or added to it after. Then, in one transaction, the proposal becomes `approved` with
 `scope`, `decided_by`, `decided_at` and `comment`, the rule is kept for the
 sandbox for its life, its `policy_revision` grows by one, and this event is
 written with the caller as actor:
@@ -8656,8 +8666,12 @@ sandbox's. A rule equal, as a JSON value (key order and whitespace aside),
 to one the workspace holds is not saved twice: the approval names that rule
 and writes no `parley.sandbox.rule_add`, also when the workspace holds 50.
 
-The answer is `200` with the proposal as stored. The checks come in this
-order, and a refused approval changes nothing:
+The answer is `200` with the proposal as stored. Once the runtime has
+taken the rule, the decision is stored even when the caller leaves before
+the answer, since the runtime cannot remove the rule again; a transaction
+that fails all the same is logged with the sandbox's and the proposal's
+ids. The checks come in this order, and a refused approval changes
+nothing:
 
 | Case | Answer |
 |---|---|

@@ -171,10 +171,6 @@ func composeSandbox(c *Composition) {
 	}
 	c.AddSchemaStep(sandbox.SchemaStep)
 	c.AddSchemaStep(sandbox.LogSchemaStep)
-	c.AddSchemaStep(sandbox.RuleSchemaStep)
-	c.AddSchemaStep(sandbox.ApprovedRuleSchemaStep)
-	c.AddSchemaStep(sandbox.DenialSchemaStep)
-	c.AddSchemaStep(sandbox.ProposalSchemaStep)
 	registerSandboxCollaborators(c, svc)
 	c.AddStartHook(sandboxRecordsHook, func(_ context.Context, rt *Runtime) error {
 		git := gitFor(c.env)
@@ -224,11 +220,7 @@ func composeSandbox(c *Composition) {
 	c.AddRoute(svc.StartRoute())
 	c.AddRoute(svc.DeleteRoute())
 	c.AddRoute(svc.ExtendRoute())
-	c.AddRoute(svc.ProposalsRoute())
-	c.AddRoute(svc.ApproveRoute())
-	c.AddRoute(svc.RejectRoute())
-	c.AddRoute(svc.RulesRoute())
-	c.AddRoute(svc.RuleDeleteRoute())
+	composeNetworkPolicy(c, svc)
 	for _, rt := range svc.UseRoutes() {
 		c.AddRoute(rt)
 	}
@@ -266,6 +258,25 @@ func composeSandbox(c *Composition) {
 		return svc.Start(ctx, client, sandbox.CheckOptions{Recorder: rec})
 	})
 	composeSandboxWork(c, svc)
+}
+
+// composeNetworkPolicy adds the tables and the routes of the network policy
+// of sandboxes: the workspace sandbox rules, the rules approved for a
+// sandbox, the destinations each sandbox was reported denied, its
+// proposals and how far its policy log was taken, created whether
+// sandboxes are on or not, and the routes that list a sandbox's proposals,
+// approve and reject one, and list and delete a workspace's sandbox rules.
+func composeNetworkPolicy(c *Composition, svc *sandbox.Service) {
+	c.AddSchemaStep(sandbox.RuleSchemaStep)
+	c.AddSchemaStep(sandbox.ApprovedRuleSchemaStep)
+	c.AddSchemaStep(sandbox.DenialSchemaStep)
+	c.AddSchemaStep(sandbox.ProposalSchemaStep)
+	c.AddSchemaStep(sandbox.PolicyLogSchemaStep)
+	c.AddRoute(svc.ProposalsRoute())
+	c.AddRoute(svc.ApproveRoute())
+	c.AddRoute(svc.RejectRoute())
+	c.AddRoute(svc.RulesRoute())
+	c.AddRoute(svc.RuleDeleteRoute())
 }
 
 // registerSandboxCollaborators registers what the sandbox service takes

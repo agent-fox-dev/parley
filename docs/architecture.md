@@ -7010,20 +7010,23 @@ credential's expiry.
 ## The network policy of sandboxes
 
 The network policy of a sandbox is in `internal/sandbox` too, beside the
-records it extends, and plugs into package 45's seams on the same
+records it extends, and plugs into the provisioning's rule provider,
+policy composer, delete hooks and purge hooks on the same
 `*sandbox.Service` from `registerSandboxCollaborators`
-(`internal/hub/sandbox.go`), whether sandboxes are on or off.
+(`internal/hub/sandbox.go`), whether sandboxes are on or off;
+`composeNetworkPolicy` adds its tables and routes.
 
-**Stores.** Four tables, each its own schema step added after the log
-lines': `sandbox_rules` (`RuleSchemaStep`: a workspace sandbox rule by id,
+**Stores.** Five tables, each its own schema step: `sandbox_rules` (`RuleSchemaStep`: a workspace sandbox rule by id,
 its workspace, the rule as given and its canonical form, summary,
 findings, origin, creator and time; unique per workspace and canonical
 form), `sandbox_approved_rules` (`ApprovedRuleSchemaStep`: the rule each
 approval adds to its sandbox, ordered by decision time and an
 autoincrement column), `sandbox_denials` (`DenialSchemaStep`: the
-(program, host, port) triples reported per sandbox) and
+(program, host, port) triples reported per sandbox),
 `sandbox_proposals` (`ProposalSchemaStep`: unique per sandbox and the
-runtime's proposal id). The canonical form of a rule (`CanonicalRule`) is
+runtime's proposal id) and `sandbox_policy_log` (`PolicyLogSchemaStep`:
+per sandbox, the time of the last policy log entry taken, in Unix
+nanoseconds, and how many entries at that time were taken). The canonical form of a rule (`CanonicalRule`) is
 its JSON re-encoded with sorted keys and no white space; two rules are
 identical when their forms are equal. Rules of a workspace are never
 read by the hub beyond that.
@@ -7037,25 +7040,37 @@ the sandbox's approved rules (named by proposal id), leaving out an
 approval identical to a copy. With a policy file it first asks the
 runtime's `ValidatePolicy` which providers the base document refers to,
 and refuses one that names the sandbox's hub provider. Its `Explain`, after
-the runtime rejected the composed policy, validates the policy without the
-copies and then with them added one at a time, and names the profile or
-the first rule. Provisioning calls both for a create and for a start, so
-package 47's start gets the same policy without depending on this code.
+the runtime rejected the composed policy, validates the base policy with
+the protected rules alone, then with the copies added one at a time, then
+with the approved rules added one at a time after them, and names the
+profile, the first copy's rule id or the first approved rule's proposal
+id. Provisioning calls both for a create and for a start, so a stopped
+sandbox's start gets the same policy without depending on this code. It
+composes and creates or starts the runtime's sandbox in the sandbox's
+decision turn (`Service.deciding`, see Decisions), so an approval never
+falls between the composition and the runtime's call.
 
 **Collector.** One background work, `sandbox_policy_collector`, runs
 `CollectPolicy`: a pass right away and then every interval (5 s) on the
 hub's clock. Each pass follows the policy log (`Logs`, source policy,
 follow) of every `ready` sandbox on a follower goroutine and stops the
 followers of the others; a follower counts each deny entry on
-`DenialsMetric` and, in one transaction, inserts its triple and writes
-`parley.sandbox.deny` only when the insert was new. A broken stream is
-reopened after the retry delay, from the time of the last entry taken
-(`Since`), skipping entries already taken, so one process counts an entry
-once. Every pass but the first lists the runtime's proposals
+`DenialsMetric` and, in one transaction, inserts its triple, writes
+`parley.sandbox.deny` only when the insert was new, and stores how far
+the log was taken in `sandbox_policy_log`. A deny entry whose sandbox's
+values cannot be known (`ValuesOf` fails) is not taken: the follower ends
+and the entry is taken again after the retry delay, so no triple is
+stored with its texts withheld. A broken stream is reopened after the
+retry delay, from the time of the last entry taken (`Since`), skipping
+entries already taken; the follower of a sandbox that is ready again, or
+of a process after a restart, starts from the stored position, so an
+entry is counted once, but for one taken again after its transaction
+failed. Every pass but the first lists the runtime's proposals
 (`ListProposals`), so a hub's start makes no runtime call beside its
 check: a new one of a sandbox whose snapshot allows proposals is stored
-`open` with `parley.sandbox.proposal`, one whose snapshot does not is
-rejected at the runtime. The collector never returns an error and ends
+`open` with `parley.sandbox.proposal`, its summary scrubbed of the
+sandbox's values (`ScrubSandbox`) and its rule as the runtime gave it,
+one whose snapshot does not is rejected at the runtime. The collector never returns an error and ends
 with its context.
 
 **Decisions.** Approve and reject run one function, `decide`. The checks
@@ -7064,16 +7079,24 @@ switch, write access to the holding workspace through `Deps.Readable`, an
 archived parent) come first; then a per-sandbox lock (`Service.deciding`)
 is held from the sandbox read to the commit, and a promotion also takes a
 per-holding-workspace lock (`Service.promoting`), always after the
-sandbox's, before its identical-rule lookup and the limit of 50. The
-runtime's `AddPolicyRule` is called before the commit and only for a
-`provisioning` or `ready` sandbox, so a refused decision has changed
-nothing; the commit is conditional on the proposal still being `open`.
-A rejection tells the runtime after its commit, on a context the caller's
-departure does not end, and only logs a failure.
+sandbox's, before its identical-rule lookup and the limit of 50. A
+provisioning takes the sandbox's lock alone, from before it composes the
+policy until the runtime's create or start returned, so lock order is
+always decision, then promotion. The runtime's `AddPolicyRule` is called
+before the commit and only for a `provisioning` or `ready` sandbox, so a
+decision refused by a check or by the runtime has changed nothing; the
+commit is conditional on the proposal still being `open`. Once the
+runtime has the rule, the commit runs on a context the caller's departure
+does not end, with its own deadline; since the runtime has no operation
+that removes a rule, a commit that fails all the same is logged with the
+sandbox's and the proposal's ids. A rejection tells the runtime after its
+commit, on a context the caller's departure does not end, and only logs a
+failure.
 
 **Clean-up.** The delete hook `WithdrawProposals` marks a deleted
 sandbox's open proposals `withdrawn`; the purge hook `PurgeNetworkPolicy`
-deletes its proposals, triples and approved rules with its record; and
+deletes its proposals, triples, log position and approved rules with its
+record; and
 `RemoveWorkspaceRules` is a `Remover` of owned data on the workspace
 service's `Teardown` set ([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)),
 which deletes a removed workspace's rules in the removal's transaction.

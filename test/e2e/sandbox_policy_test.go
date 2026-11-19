@@ -93,6 +93,83 @@ func sameRule(t *testing.T, a, b json.RawMessage) bool {
 	return ca == cb
 }
 
+// deniedAndProposed has the runtime deny the sandbox id a destination,
+// waits for the denial's event, has the runtime propose rule for it with a
+// high finding, and returns the proposal's id once parley sandbox
+// proposals prints it, with that finding.
+func deniedAndProposed(t *testing.T, h *sandboxCreateHub, id string, rule json.RawMessage) string {
+	t.Helper()
+	h.fake.EmitPolicyLog("parley", id, runtime.LogEntry{Action: "deny", Program: "npm", Host: "registry.example.org", Port: 443})
+	eventually(t, 10*time.Second, "the denial's event", func() bool {
+		return len(policyEvents(t, h, sandbox.EventDeny)) == 1
+	})
+	h.fake.AddProposal("parley", runtime.Proposal{
+		Sandbox: id, Rule: runtime.Rule{Name: "npm", Body: rule}, Summary: "let npm reach registry.example.org:443",
+		Findings: []runtime.Finding{{Severity: "high", Message: "a public package registry"}},
+	})
+	var items []any
+	eventually(t, 10*time.Second, "parley sandbox proposals to print one proposal", func() bool {
+		listed := h.parley(t, "sandbox", "proposals", "demo--a", id)
+		if listed.code != 0 {
+			t.Fatalf("parley sandbox proposals demo--a %s = %d %s %s; want 0", id, listed.code, listed.stdout, listed.stderr)
+		}
+		items, _ = listed.json(t)["items"].([]any)
+		return len(items) == 1
+	})
+	proposal, _ := items[0].(map[string]any)
+	if findings, _ := proposal["findings"].([]any); len(findings) != 1 || findings[0].(map[string]any)["severity"] != "high" {
+		t.Errorf("the listed proposal = %v; want it with the runtime's high finding", proposal)
+	}
+	proposalID, _ := proposal["id"].(string)
+	return proposalID
+}
+
+// promotedFrom checks that demo holds the one workspace sandbox rule
+// ruleID, promoted from a proposal on the workspace from, and that the
+// hub's log holds the denial, the proposal, the decision and the rule_add
+// on demo, in that order.
+func promotedFrom(t *testing.T, h *sandboxCreateHub, ruleID, from string) {
+	t.Helper()
+	listed := h.parley(t, "sandbox", "rules", "demo")
+	rules, _ := listed.json(t)["items"].([]any)
+	if len(rules) != 1 {
+		t.Fatalf("parley sandbox rules demo = %d %s; want one rule", listed.code, listed.stdout)
+	}
+	saved, _ := rules[0].(map[string]any)
+	origin, _ := saved["from_proposal"].(map[string]any)
+	if saved["id"] != ruleID || origin["workspace"] != from {
+		t.Errorf("the rule of demo = %v; want %s from a proposal on %s", saved, ruleID, from)
+	}
+	events := policyEvents(t, h, sandbox.EventDeny, sandbox.EventProposal, sandbox.EventProposalDecided, sandbox.EventRuleAdd)
+	var types []string
+	for _, e := range events {
+		types = append(types, e.Type)
+	}
+	if want := []string{sandbox.EventDeny, sandbox.EventProposal, sandbox.EventProposalDecided, sandbox.EventRuleAdd}; !reflect.DeepEqual(types, want) {
+		t.Errorf("the hub's log holds %v; want %v", types, want)
+	} else if ws := events[3].Workspace; ws == nil || *ws != "demo" {
+		t.Errorf("the rule_add event's workspace = %v; want demo", ws)
+	}
+}
+
+// createdWith checks that the sandbox s recorded the workspace sandbox rule
+// ruleID alone and that the runtime created it with the hub rule and the
+// credential rule as its protected rules and rule, under ruleID, as its one
+// added rule.
+func createdWith(t *testing.T, h *sandboxCreateHub, s map[string]any, ruleID string, rule json.RawMessage) {
+	t.Helper()
+	if got := s["workspace_rules"]; !reflect.DeepEqual(got, []any{ruleID}) {
+		t.Errorf("the second sandbox's workspace_rules = %v; want [%s]", got, ruleID)
+	}
+	policy := createdPolicy(t, h, s["id"].(string))
+	if got := ruleNames(policy.Protected); !reflect.DeepEqual(got, []string{"parley-hub", "credential-model"}) {
+		t.Errorf("the second sandbox's protected rules = %v; want the hub rule and the credential rule", got)
+	}
+	if len(policy.Added) != 1 || policy.Added[0].Name != ruleID || !sameRule(t, policy.Added[0].Body, rule) {
+		t.Errorf("the second sandbox's added rules = %v; want the rule %s", policy.Added, ruleID)
+	}
+}
+
 // An agent's sandbox on the fork demo--a is denied a destination and
 // proposes a rule for it; the owner of demo approves it for the workspace,
 // so that a sandbox created later on another fork of demo has it from the
@@ -112,28 +189,7 @@ func TestSandboxPolicy_AnApprovedRuleReachesLaterSandboxesUntilItIsDeleted(t *te
 	var ruleID, s2 string
 
 	if !t.Run("a developer approves the agent's proposal for the workspace", func(t *testing.T) {
-		h.fake.EmitPolicyLog("parley", s1, runtime.LogEntry{Action: "deny", Program: "npm", Host: "registry.example.org", Port: 443})
-		eventually(t, 10*time.Second, "the denial's event", func() bool {
-			return len(policyEvents(t, h, sandbox.EventDeny)) == 1
-		})
-		h.fake.AddProposal("parley", runtime.Proposal{
-			Sandbox: s1, Rule: runtime.Rule{Name: "npm", Body: rule}, Summary: "let npm reach registry.example.org:443",
-			Findings: []runtime.Finding{{Severity: "high", Message: "a public package registry"}},
-		})
-		var items []any
-		eventually(t, 10*time.Second, "parley sandbox proposals to print one proposal", func() bool {
-			listed := h.parley(t, "sandbox", "proposals", "demo--a", s1)
-			if listed.code != 0 {
-				t.Fatalf("parley sandbox proposals demo--a %s = %d %s %s; want 0", s1, listed.code, listed.stdout, listed.stderr)
-			}
-			items, _ = listed.json(t)["items"].([]any)
-			return len(items) == 1
-		})
-		proposal, _ := items[0].(map[string]any)
-		proposalID, _ := proposal["id"].(string)
-		if findings, _ := proposal["findings"].([]any); len(findings) != 1 || findings[0].(map[string]any)["severity"] != "high" {
-			t.Errorf("the listed proposal = %v; want it with the runtime's high finding", proposal)
-		}
+		proposalID := deniedAndProposed(t, h, s1, rule)
 
 		approved := h.parley(t, "sandbox", "approve", "demo--a", s1, proposalID, "--scope", "workspace", "--acknowledge-findings")
 
@@ -148,40 +204,12 @@ func TestSandboxPolicy_AnApprovedRuleReachesLaterSandboxesUntilItIsDeleted(t *te
 		if got := h.parley(t, "sandbox", "get", "demo--a", s1).json(t); got["policy_revision"] != 1.0 {
 			t.Errorf("the first sandbox's policy_revision = %v; want 1", got["policy_revision"])
 		}
-		listed := h.parley(t, "sandbox", "rules", "demo")
-		rules, _ := listed.json(t)["items"].([]any)
-		if len(rules) != 1 {
-			t.Fatalf("parley sandbox rules demo = %d %s; want one rule", listed.code, listed.stdout)
-		}
-		saved, _ := rules[0].(map[string]any)
-		from, _ := saved["from_proposal"].(map[string]any)
-		if saved["id"] != ruleID || from["workspace"] != "demo--a" {
-			t.Errorf("the rule of demo = %v; want %s from a proposal on demo--a", saved, ruleID)
-		}
-		events := policyEvents(t, h, sandbox.EventDeny, sandbox.EventProposal, sandbox.EventProposalDecided, sandbox.EventRuleAdd)
-		var types []string
-		for _, e := range events {
-			types = append(types, e.Type)
-		}
-		if want := []string{sandbox.EventDeny, sandbox.EventProposal, sandbox.EventProposalDecided, sandbox.EventRuleAdd}; !reflect.DeepEqual(types, want) {
-			t.Errorf("the hub's log holds %v; want %v", types, want)
-		} else if ws := events[3].Workspace; ws == nil || *ws != "demo" {
-			t.Errorf("the rule_add event's workspace = %v; want demo", ws)
-		}
+		promotedFrom(t, h, ruleID, "demo--a")
 
 		second := policySandbox(t, h, "demo--b")
 		s2, _ = second["id"].(string)
 
-		if got := second["workspace_rules"]; !reflect.DeepEqual(got, []any{ruleID}) {
-			t.Errorf("the second sandbox's workspace_rules = %v; want [%s]", got, ruleID)
-		}
-		policy := createdPolicy(t, h, s2)
-		if got := ruleNames(policy.Protected); !reflect.DeepEqual(got, []string{"parley-hub", "credential-model"}) {
-			t.Errorf("the second sandbox's protected rules = %v; want the hub rule and the credential rule", got)
-		}
-		if len(policy.Added) != 1 || policy.Added[0].Name != ruleID || !sameRule(t, policy.Added[0].Body, rule) {
-			t.Errorf("the second sandbox's added rules = %v; want the rule %s", policy.Added, ruleID)
-		}
+		createdWith(t, h, second, ruleID, rule)
 	}) {
 		return
 	}

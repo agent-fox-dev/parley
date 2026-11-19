@@ -256,21 +256,6 @@ func scanRule(scan func(dest ...any) error) (SandboxRule, error) {
 	return r, nil
 }
 
-// HoldingWorkspace is the slug of the workspace that holds the workspace
-// sandbox rules of the workspace slug, read through q: the parent of a task
-// fork, the workspace itself otherwise. It returns an error when no
-// workspace has the slug.
-func HoldingWorkspace(ctx context.Context, q access.Querier, slug string) (string, error) {
-	rec, ok, err := access.RecordBySlug(ctx, q, slug)
-	switch {
-	case err != nil:
-		return "", err
-	case !ok:
-		return "", fmt.Errorf("workspace %s has no record", slug)
-	}
-	return holdingSlug(rec), nil
-}
-
 // holdingSlug is the slug of the workspace that holds the workspace
 // sandbox rules of the workspace rec: its parent when it is a task fork,
 // itself otherwise.
