@@ -42,6 +42,7 @@ command-line client. Both are written in Go, in the module
 | `internal/scm` | the source control API: the write gate every write route is built with (`writeRoute`, see [Source control writes](#source-control-writes)), the shared ref update step every write moves a ref through (`refupdate.go`: the push rule engine and the ref writer, reached as the interfaces `Rules` and `RefWriter` in `Deps`), the refs write routes (`refs_write.go`: `POST /refs`, `PATCH` and `DELETE /refs/*name`), the commit route (`commit.go`: `POST /commits`, one commit from file operations through `gitrepo.ApplyOperations` and `CreateCommit`, its own body limit `DefaultMaxCommitSize`, 32 MiB, which `LimitCommitBody` replaces, and the commits' times from `Deps.Now`), the rebase route (`rebase.go`: `POST /rebase`, the branch replayed onto a revision through `gitrepo.Rebase`), the interface `ChangeLinker` (`linker.go`; `FindOpen`, `CheckOpening`, `Open`, registered with `(*Component).RegisterChangeLinker`), the interface `SessionLinker` (`session.go`; `Check`, registered with `(*Component).RegisterSessionLinker`, a refusal matching `scm.ErrUnknownSession`), the `parley.scm.commit` event (`scm.EventCommit`) handed to the ref writer as `ApplyRequest.Events`, and the read half: the `GET` routes under `/workspaces/:slug/scm` (`refs`, `refs/*name`, `commits`, `commits/:sha`, `tree`, `file`, `diff`, `compare`, `blame` and `search`), served by an `scm.Component` (zero value, `Bind(scm.Deps)`, `Routes()`), with the state check, the request recorder and the lookups every read shares (see [Source control reads](#source-control-reads)); and the one revision resolver every read (and every later write that takes a revision) goes through: `NewResolver(repo, view, defaultBranch)` over a workspace's repository (the interface `Repository`, which `*gitrepo.Repo` satisfies) and its ref view (the interface `RefView`, whose `Refs` lists `Ref{Name, SHA, Commit, Tracking}` and is read at most once per request; `RepoRefs(repo)` is the view of a workspace that is what its repository holds, every ref of it), `Resolve(ctx, rev)` and `ResolveOptional(ctx, rev)` (an empty `rev` is the head of the default branch), returning `Resolved{SHA, Full}`, `Full` set when the caller wrote the full 40-character id; a `rev` starting with `refs/` is that full ref name only, otherwise the branch or the tag of that name (both existing is ambiguous), otherwise 4 to 40 hexadecimal characters are a commit id; every failure to name exactly one commit, an expression such as `main~2`, `HEAD` or `--all` included, is the API error `ref_not_found` (404); `cache.go` gives every successful read its `ETag` and `Cache-Control` and answers `304` to a matching `If-None-Match` before the read's costly part; `commitObjects` builds the commit object of every route that answers commits, the change (`CommitChange{WorkspaceSlug, Number, Version}`) and session from the lookups and `stats` only where asked, and `params.go` holds the strict query readers (`true`/`false` booleans, RFC 3339 times, and `pathParam`, the one check of a repository path every route that takes `path` makes) the routes share; `tree.go` maps git's entries to the tree route's four types by mode (`120000` symlink, `160000` commit, a tree, any other blob); `file.go` serves a file raw (one byte range of `Range` honoured) or as JSON, refusing one over `Deps.MaxFileSize` (`DefaultMaxFileSize`, 32 MiB, when zero) before reading it; the handler wrapper bounds every read by `Deps.ReadTimeout` (`DefaultReadTimeout`, 30 s, when zero), answering `503 scm_timeout` or cutting the answer off; `diff.go` builds the file change object of every route that answers file changes (`FileChanges`, the commit route's `files=true` and the diff route) and serves the diff route: the merge base or `base` against `head`, then `ComputeDiff`, the diff computation the change diff of `internal/change` also calls: the `path` globs applied with `identity.MatchAny`, at most `MaxDiffFiles` (5,000) files and `MaxPatchBytes` (8 MiB) of patch text read through `DiffPatches` file by file, the patch form answered by `WritePatchText`; `compare.go` serves the compare route: `AheadBehind`, the first 200 commits of `CommitsBetween` as commit objects without `stats`, the first 5,000 file changes from the merge base to `head`, and `TrialRebase`, whose `gitrepo.ErrMergeCommit` is `400 merge_commits_unsupported` and whose `*gitrepo.ConflictReport` is the answer's `conflict`; `blame.go` serves the blame route: the file looked up with `LookupFile`, refused over 2 MiB or with a NUL byte in its first 8,000 bytes, its lines counted to check and cut the span, then `Blame`, each distinct commit of the ranges read once and built by `commitObjects` without `stats`; `search.go` serves the search route: `q` checked (1 to 500 characters, no NUL) with the strict booleans `regex` and `case_sensitive`, then `Grep` from the resolved commit, the `path` globs applied by `glob.go`, each line cut to its first 500 characters (runes, not bytes), git stopped once one match past the page is read, and `gitrepo.ErrInvalidPattern` answered `400 invalid_request` |
 | `internal/scrub` | the one scrubbing function for text that leaves the hub: `Scrubber.Scrub` replaces registered secret values and the hub's own credential formats by `[redacted]`, removes user information from URLs and cuts the text to 1024 bytes; a leaf package that imports nothing of the project |
 | `internal/secret` | the hub's secrets, whose values leave the hub through no response, log line or error: `LoadKeys` reads the operator's current key (`PARLEY_SECRETS_KEY`, or the file `[secrets].key_file` names) and previous key (`PARLEY_SECRETS_KEY_PREVIOUS`), each standard padded base64 of 32 bytes, into `Keys`, whose keys print, log and encode as JSON as `[key]` (an absent key encodes as `null`); `Seal` and `Open` seal a value with AES-256-GCM under the current key, a fresh 12-byte nonce and a binding of its owner as additional data, and open it with the current or the previous key by the `KeyID` (the first 8 bytes of the key's SHA-256 in hex) it carries; `SealValue`, `OpenValue` and `NeedsReseal` do the same for values that are not named secrets, with the key id in front of the sealed bytes; `Component` (the hub uses its zero value, bound once at start by `Bind(Deps)` to the store, the keys, the clock, the scrubber and the event log; `New(Deps)` builds a bound one; table `secrets`, created by `SchemaStep`, unique on scope, scope id and the key with A to Z lowered) is the one place secrets are read, stored and removed, in the scopes `ScopeUser`, `ScopeOrg` and `ScopeWorkspace`: `Get` reads one secret of exactly one scope on every call, matching the key ignoring ASCII case, registers the value with the scrubber and fails a value no key opens with `ErrUnreadable`, never as absent; `Put`, `Delete`, `RemoveScope` and the package function `RemoveWorkspace` change secrets inside the caller's transaction and write no event; `CreateEntries` (all or nothing, the limit of 100 checked before a conflict), `ListPage`, `UpdateEntry`, `DeleteEntry` and `Count` serve the secret routes; `Routes` are the secret routes and `ScopeCheck` the access check that resolves a route's scope from its `MarkScope` mark; `Available` reports whether a current key is configured; `StartReport` counts the stored values whose key id is neither configured key's and `(StartReport).Log` writes the start lines; `Reencrypt` is the maintenance task that re-seals the values under the previous key with the current one and runs the `Converter`s other parts add with `RegisterConverter`; `ErrUnavailable` (no current key), `ErrUnreadable` (no configured key opens the value), `ErrInvalid`, `ErrLimitReached`, `ErrConflict` and `ErrNotFound` are the errors to match, and `UnavailableError` is the `503 secrets_unavailable` the REST API answers for `ErrUnavailable`; the same component keeps variables, readable values in the same three scopes (table `variables`, `VarSchemaStep`): `CreateVars`, `ListVars`, `UpdateVar`, `DeleteVar` and `VarRoutes` serve the variable routes, `RemoveVarScope` and `RemoveWorkspaceVars` remove a scope's variables inside the caller's transaction, `Chain` is a workspace's resolution chain (`Step`, `Origin`, `ErrWorkspaceNotFound`), `ResolveVars` the variables it runs with and `ResolveSecrets` the secrets of a list of names along it, `ResolveSecretsIn` the same with the chain's records read through the caller's transaction |
+| `internal/session` | the agent sessions: the session record, its token usage and its links to forks, change versions, pushes, commits, claims, lands and sandboxes (`SchemaStep`), the routes `POST /sessions`, `GET /sessions`, `GET /sessions/:id`, `POST /sessions/:id/complete`, `POST` and `GET /sessions/:id/usage` and `GET /workspaces/:slug/cost`, the session-linking rule (`Check`, `ErrUnknownSession`), the recording operation (`Record`, `Link` and its constructors), the forced close (`CloseActive`), and the usage observers and active-session counts for the metrics (`OnUsage`, `ActiveCounts`); see [Agent sessions](#agent-sessions) |
 | `internal/store` | the hub's two embedded SQLite stores (`modernc.org/sqlite`, no cgo): `Open` creates the data directory and the workspace root, opens the transactional store and the analytical store (`analytics.db` beside it) and applies the registered schema steps; `Tx` runs a transaction of the transactional store; `Snapshot` writes a consistent copy of one store file without changing it |
 | `internal/server` | the hub's HTTP server: its built-in routes, the REST API's route registration and check pipeline, the error envelope, request ids, response headers and the access log, list paging, idempotency keys, and the readiness probes |
 | `internal/server/timefmt` | the one timestamp format (`Format`, and the response member type `Time`) and the one duration grammar (`ParseDuration`); a leaf package that imports nothing of the project, so that the configuration loader can use it as well as the REST API |
@@ -578,8 +579,9 @@ file of `internal/hub`, as the teardown collaborators are registered on the
 workspace service
 ([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)).
 With sandboxes on, the sandbox part's start hook `sandbox_records` registers
-the sandbox service as the sandbox component, after it binds it; no part
-registers a session-linking rule yet.
+the sandbox service as the sandbox component, after it binds it; the
+sessions part registers the session-linking rule on it (see
+[Agent sessions](#agent-sessions)).
 
 The composition also keeps the identity service in its unexported field
 `identity`, which `composeIdentity` sets. A part listed after it that keeps
@@ -2951,8 +2953,9 @@ controller, its mapping stage or its session linker while it is composed,
 whichever part comes first. The part registers the options stage with
 `RegisterOptionsStage`; on it the part that owns the session-linking rule
 registers its
-`gitserver.SessionLinker` (`RegisterSessionLinker`; none is registered yet,
-so every `parley.session` is refused); the start hook binds it to the hub's
+`gitserver.SessionLinker` (`RegisterSessionLinker`; the sessions part
+registers the session-linking rule, see [Agent sessions](#agent-sessions));
+the start hook binds it to the hub's
 logger. The start hook binds the engine to
 the settings reader `pushSettings`, which reads the effective
 `protected_branches` and `protect.owner_push` of the workspace's record,
@@ -3347,9 +3350,9 @@ trial, outside any transaction, and a restack on the report of its replay,
 before its transaction; `internal/change` and `internal/scm` cannot import
 `internal/land`, so they take the attribution as a function value, and nil
 names no landed change.
-`Recorder` keeps its default, which records nothing, and no
-`SessionLinker` is registered: the session feature and the metric export
-are not in the hub yet.
+`Recorder` keeps its default, which records nothing, since the metric
+export is not in the hub yet; the sessions part registers the
+`SessionLinker` (see [Agent sessions](#agent-sessions)).
 
 Every read route is `GET /workspaces/:slug/scm/…`, declared with the scope
 `git:read` and the access need `read`, so the pipeline answers `401`,
@@ -5100,9 +5103,9 @@ workspace service the earlier parts create. The package imports neither
   returns the component.
 - The session interface, `Sessions` (`Check`, the session-linking rule, and
   `Record`, the claim link of a session), is registered on the instance with
-  `RegisterSessions`. The hub registers none: until the agent sessions
-  feature does, every claim that names a `session_id` is refused `400`
-  `unknown_session`.
+  `RegisterSessions`. The sessions part registers it (see
+  [Agent sessions](#agent-sessions)); without one every claim that names a
+  `session_id` is refused `400` `unknown_session`.
 
 The store schema is two steps. `SchemaStep` (`awareness_index`) creates
 `awareness_changes` (per workspace and number: target branch, `phase`
@@ -5179,6 +5182,83 @@ abandoned change (`claim_link.go`). The maintenance task `claim_cleanup`
 or earlier, and `RemoveWorkspace`, registered on the workspace teardown
 ([ADR 07](adr/07-register-the-teardown-collaborators-on-the-workspace-service.md)),
 deletes a workspace's claims and index rows in the delete's transaction.
+
+### Agent sessions
+
+`internal/session` keeps the agent sessions: the session record, its token
+usage records and its links to the work done in it, in three tables of the
+transactional store (`SchemaStep`, step `agent_sessions`: `sessions`,
+`session_usage`, `session_links`). No table has a foreign key to
+`workspaces`: a session, its usage and its links outlive their workspace,
+and the session keeps the parent's slug of a fork it was opened on
+(`parent_slug`), so that readers of the parent and the linking rule still
+reach it after the fork is gone. Usage and links go with their session
+(`ON DELETE CASCADE`). The package imports neither `internal/hub` nor any
+package that takes a session id; it declares what it needs in
+`session.go` and the hub part adapts the hub's components to it.
+
+`composeSessions` (`internal/hub/session.go`) is the last of the parts,
+since it registers with components the earlier parts create. It adds the
+schema step and the routes, and binds the component in its start hook
+`sessions` with `session.Deps`: the store and the hub's clock, `Access`
+(the access rule's `Decide` and `Readable`), `Workspaces` (the minimal
+workspace record of a slug, `sessionWorkspaces`, read with
+`access.RecordBySlug`), `Coverage` (whether a bound PAT's binding covers a
+slug, `sessionCoverage`, from `(*access.Service).CoveredSet`; nil makes
+nobody bound) and `Events` (the hub's event component). Tests change the
+dependencies with `AdjustSessions`; the component is `Sessions()`.
+
+- **One builder.** Every route answers the session object built by one
+  function (`object`), which reads the usage records and the links when
+  the answer is built: `token_summary` from `session_usage`, `forks`,
+  `sandboxes` and `changes` from `session_links` in link order, each cut to
+  500 entries, and `counts` as the true totals per kind.
+- **One read rule.** `canRead` decides who reads a session (a bound PAT's
+  binding must cover the session's workspace first; then the admin token,
+  the creator, a reader of the workspace, a reader of the stored parent);
+  `readableSession` checks the path id, reads it in lower case and answers
+  the one `404 session not found`. `canChange` decides who may complete or
+  report usage: the creator and the admin token.
+- **One transition.** `endActive` is the conditional update `… WHERE status
+  = 'active'` that both a complete and a forced close make, so that of the
+  two only one takes effect. A usage report re-reads the status in the
+  transaction that stores it.
+- **The linking rule.** `(*Component).Check(ctx, caller identity.Principal,
+  sessionID, slug)` returns the lower-case id or `ErrUnknownSession`, one
+  value for every refusal, and any other error for a failed read; it never
+  reads the session's status or the coverage, and writes nothing.
+- **The links.** `(*Component).Record(ctx, tx, link)` stores one `Link`
+  (built by `ForkLink`, `SandboxLink`, `VersionLink`, `PushLink`,
+  `CommitLink`, `ClaimLink` or `LandLink`) in the caller's transaction; a
+  repeated link is kept once, and a session that does not exist is
+  `ErrUnknownSession`.
+- **The forced close.** `(*Component).CloseActive(ctx, tx, slug, reason,
+  at)` ends the active sessions of exactly that slug, in the caller's
+  transaction, for the reasons `workspace archived`, `workspace deleted`
+  and `fork expired`, and emits one `parley.session.force_closed` per
+  session, with the stored parent as the event's `Parent`, since a fork's
+  record may already be gone when a removal calls it.
+- **The hand-off to the metrics.** `OnUsage` registers usage observers,
+  called once per new usage record after its transaction has committed,
+  and `ActiveCounts` counts the active sessions per workspace. No part
+  registers an observer or reads the counts yet.
+
+The part registers, through one adapter per consumer (`registerSessionLinkers`),
+the linking rule and, where the consumer records links, the recording
+operation, each written to the interface that consumer declares:
+`forkSessions` on `c.Forks()` (fork links), `pushSessions` on
+`c.PushOptions()` (check only), `scmSessions` on `c.SCM()` (check only),
+`changeSessions` on `c.Changes()` (version links), `landSessions` on
+`c.Land()` (land links, refusing with `change.ErrUnknownSession`),
+`awarenessSessions` on `c.Awareness()` (claim links) and `sandboxSessions`
+on `c.Sandbox()` (sandbox links). Each maps `session.ErrUnknownSession` to
+its consumer's own refusal and every other error to a failure. A push and
+an API commit become links through the change version they record. The
+part registers `sessionCloser` as the session closer of the workspaces'
+teardown set (ADR 07): an archive calls it, under its savepoint, for the
+workspace and its forks, and `RemoveOwned` calls it for every workspace or
+fork it removes, with the reason as text. It registers no remover of
+session records.
 
 ### Carry-patch workspaces
 

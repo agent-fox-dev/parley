@@ -343,7 +343,7 @@ func TestRemoveOwned_DeletesTheWorkspacesDeliveriesWithItsTransaction(t *testing
 		{"committed", nil, 0, 1},
 	} {
 		err := lw.Store.Tx(ctx, func(tx *sql.Tx) error {
-			if _, err := lw.workspaces.RemoveOwned(ctx, tx, "demo", "workspace_deleted"); err != nil {
+			if _, err := lw.workspaces.RemoveOwned(ctx, tx, "demo", "workspace deleted"); err != nil {
 				return err
 			}
 			return c.end
