@@ -175,7 +175,7 @@ func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-f.release:
 		case <-r.Context().Done():
 		}
-		return
+		abandon()
 	}
 	waits := []<-chan struct{}{after(a.Delay)}
 	if a.Release != nil {
@@ -185,9 +185,9 @@ func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-wait:
 		case <-f.release:
-			return
+			abandon()
 		case <-r.Context().Done():
-			return
+			abandon()
 		}
 	}
 	if a.Through {
@@ -195,6 +195,15 @@ func (f *Fake) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAnswer(w, a)
+}
+
+// abandon ends the request without an answer: the connection is closed
+// and nothing is written on it. A handler that merely returned would have
+// the server write an empty 200, which a client that gave up on the
+// request reads as its answer when it arrives between the client's TLS
+// close_notify and the closing of its socket.
+func abandon() {
+	panic(http.ErrAbortHandler)
 }
 
 // after is a channel closed once d has passed, at once for no wait.
