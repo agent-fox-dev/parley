@@ -390,6 +390,7 @@ func (s *Service) snapshotOf(p Profile) (Snapshot, error) {
 		HubAccess: p.HubAccess, Env: maps.Clone(p.Env), Credentials: slices.Clone(p.Credentials),
 		OptionalCredentials: slices.Clone(p.OptionalCredentials), ExposeSecrets: slices.Clone(p.ExposeSecrets),
 		OptionalExposeSecrets: slices.Clone(p.OptionalExposeSecrets), ProviderProfiles: map[string]string{},
+		ToolServer: p.ToolServer,
 	}
 	for _, name := range slices.Concat(p.Credentials, p.OptionalCredentials) {
 		if c, ok := s.settings.Credential(name); ok {

@@ -381,7 +381,7 @@ var profilesFile = hubtest.Config{
 		"[[sandbox.profiles]]\nname = \"agent\"\ndefault = true\ndescription = \"an agent\"\nimage = \"agent:1\"\ncpu = \"2\"\nmemory = \"4Gi\"\ngpu = 1\n" +
 		"ttl = \"4h\"\npolicy = \"policy.yaml\"\ncredentials = [\"model\"]\noptional_credentials = [\"search\"]\n" +
 		"expose_secrets = [\"Z_TOKEN\"]\noptional_expose_secrets = [\"A_TOKEN\"]\nhub_access = \"none\"\ncheckpoint = false\nallow_proposals = false\n" +
-		"env = { B = \"vb\", A = \"va\" }\n" +
+		"env = { B = \"vb\", A = \"va\" }\ntool_server = \"/opt/tools/agentkit-tools\"\n" +
 		credentialTable("model") + credentialTable("search"),
 	Files: map[string]string{"gateway-token": gatewayToken + "\n", "policy.yaml": policyContent},
 }

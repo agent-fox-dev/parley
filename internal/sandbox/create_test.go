@@ -1,6 +1,7 @@
 package sandbox_test
 
 import (
+	"bytes"
 	"context"
 	"maps"
 	"net/http"
@@ -15,7 +16,8 @@ import (
 
 func TestCreate_StoresProvisioningSandbox(t *testing.T) {
 	t.Parallel()
-	h := startCreateHub(t, agentProfile)
+	const toolServer = "/opt/tools/agentkit-tools"
+	h := startCreateHub(t, agentProfile+"[[sandbox.profiles]]\nname = \"tooled\"\nttl = \"4h\"\nhub_access = \"none\"\ntool_server = \""+toolServer+"\"\n")
 	h.world(t)
 	s := sandboxObject(t, h.post(t, "demo--t1", map[string]any{
 		"profile": "agent", "command": []string{"make", "test"}, "env": map[string]string{"CI": "1"},
@@ -36,6 +38,7 @@ func TestCreate_StoresProvisioningSandbox(t *testing.T) {
 		"created_at":           stamp(recordStart), "updated_at": stamp(recordStart),
 		"last_activity_at": stamp(recordStart), "expires_at": stamp(recordStart.Add(time.Hour)),
 		"checkout": map[string]any{"path": "/workspace", "ref": "main", "sha": h.base, "branch": "t1"},
+		"tools":    false,
 	}
 	for k, v := range want {
 		if !reflect.DeepEqual(s[k], v) {
@@ -53,6 +56,22 @@ func TestCreate_StoresProvisioningSandbox(t *testing.T) {
 		rec.Snapshot.TTL != 4*time.Hour || rec.Snapshot.HubAccess != "fork" || rec.UserID != h.dana ||
 		rec.OrgID != h.org || rec.FamilyRoot != "demo" {
 		t.Errorf("stored %+v; want sandbox %s in provisioning, marked create, with agent's snapshot, of dana in acme, in demo's family", rec, id)
+	}
+	if rec.Snapshot.ToolServer != "" {
+		t.Errorf("the snapshot of a sandbox of agent names the tool server %q; want none", rec.Snapshot.ToolServer)
+	}
+
+	a := h.post(t, "demo--t1", map[string]any{"profile": "tooled"})
+	tooled := sandboxObject(t, a)
+	if tooled["tools"] != true {
+		t.Errorf("tools of a sandbox of a profile with a tool server = %v; want true", tooled["tools"])
+	}
+	if bytes.Contains(a.body, []byte("agentkit-tools")) {
+		t.Errorf("the created object %s holds the tool server's path", a.body)
+	}
+	tooledID, _ := tooled["id"].(string)
+	if rec, err := sandbox.GetIn(context.Background(), h.Store.Main(), "demo--t1", tooledID); err != nil || rec.Snapshot.ToolServer != toolServer {
+		t.Errorf("the stored snapshot names the tool server %q (%v); want %q", rec.Snapshot.ToolServer, err, toolServer)
 	}
 }
 

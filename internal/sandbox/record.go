@@ -157,4 +157,8 @@ type Snapshot struct {
 	// ProviderProfiles maps the name of each credential of the lists above to
 	// its provider profile.
 	ProviderProfiles map[string]string `json:"provider_profiles"`
+	// ToolServer is the absolute path of the tool server in the sandbox's
+	// image; "" for a sandbox without tools, one stored before the profiles
+	// could name a tool server included.
+	ToolServer string `json:"tool_server,omitempty"`
 }
