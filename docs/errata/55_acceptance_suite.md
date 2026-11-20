@@ -115,10 +115,6 @@ row, and the paging scenario allows that end page there only.
 
 ## Gaps tracked as issues
 
-- A push from a `--depth 1` clone is refused with HTTP 400: the hub's
-  receive-pack reads the `shallow` lines git sends before the commands as
-  commands (`internal/gitserver/receive.go`). The shallow rows of the git
-  compatibility scenario prove the clone and the fetch and do not push.
 - A webhook's retry is scheduled 10 s after the first attempt's time cut to
   the whole second (`internal/webhook/loop.go`), so it can reach the
   receiver after 9 s. The scenario asserts at least 9 s.

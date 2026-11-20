@@ -100,12 +100,6 @@ func TestGit_CloneFetchPushWithPATAndCredentialHelper(t *testing.T) {
 					t.Errorf("origin/%s is %s after the fetch, want the pushed %s", side, got, want)
 				}
 
-				// The hub's receive-pack answers 400 to the shallow lines a
-				// push from a shallow clone sends before its commands
-				// (internal/gitserver/receive.go): no push from those rows.
-				if kind.name == "shallow" {
-					return
-				}
 				auth.git(dir, "checkout", "-q", "-b", row, "origin/main").Must(t)
 				hub.CommitFiles(dir, "Push "+row, map[string]string{row + ".txt": row + "\n"})
 				auth.git(dir, "push", "-q", "origin", row).Must(t)

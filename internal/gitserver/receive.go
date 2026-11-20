@@ -185,6 +185,9 @@ type push struct {
 	caps     capabilities
 	updates  []pushrule.Update
 	pushOpts []string
+	// shallow are the boundary commits of the client's shallow history,
+	// from the shallow lines before its commands.
+	shallow []string
 }
 
 // process runs the stages of a push with at least one command, its
@@ -232,6 +235,13 @@ func (run *push) process(ctx context.Context, body *packReader) (report, Result)
 				return run.timedOut()
 			}
 			return failAll(run.updates, unpackInvalid, msgUnpackerErr), ResultError
+		}
+		grafted, err := run.newShallowRoots(ctx, repo, q.View())
+		switch {
+		case err != nil:
+			return run.failed(ctx, "check the shallow commits", err)
+		case grafted:
+			return refuseAll(run.updates, msgShallowUpdate), ResultRefused
 		}
 		// A push stopped once its objects moved in takes them out again,
 		// so a refused push leaves none in the repository.
@@ -287,6 +297,27 @@ func (run *push) unpack(ctx context.Context, q *gitrepo.Quarantine, body io.Read
 	}
 	missing, err := q.View().Missing(ctx, afters)
 	return err == nil && len(missing) == 0
+}
+
+// msgShallowUpdate refuses a push from a shallow clone that would leave a
+// ref on a history the repository does not hold whole, in git's words.
+const msgShallowUpdate = "shallow update not allowed"
+
+// newShallowRoots reports whether one of the client's shallow commits is
+// new to repo and came in the pack, which then holds a commit whose parents
+// neither the pack nor repo has. A shallow commit repo already holds is the
+// tip of a history it holds whole, since a hub's repositories are never
+// shallow; one neither holds is reached by no pushed ref.
+func (run *push) newShallowRoots(ctx context.Context, repo, view *gitrepo.Repo) (bool, error) {
+	if len(run.shallow) == 0 {
+		return false, nil
+	}
+	absent, err := repo.Missing(ctx, run.shallow)
+	if err != nil || len(absent) == 0 {
+		return false, err
+	}
+	stillAbsent, err := view.Missing(ctx, absent)
+	return err == nil && len(stillAbsent) < len(absent), err
 }
 
 // afters are the new values of the push's commands that are not deletes,
@@ -430,9 +461,10 @@ func pushBody(r *http.Request) (*bufio.Reader, error) {
 var errBadCommand = errors.New("bad command")
 
 // readCommands reads the command list of a push from body up to its flush
-// packet, the capabilities on its first command, and the push options
-// that follow when the client announced them. An empty list, a body of
-// only a flush packet, has no options.
+// packet: the shallow lines of a push from a shallow clone, which come
+// before the commands, the commands, the capabilities on the first, and the
+// push options that follow when the client announced them. An empty list,
+// a body of only a flush packet, has no options.
 func (run *push) readCommands(body *bufio.Reader) error {
 	for {
 		line, flush, err := readPkt(body)
@@ -441,6 +473,13 @@ func (run *push) readCommands(body *bufio.Reader) error {
 		}
 		if flush {
 			break
+		}
+		if id, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "shallow "); ok {
+			if len(run.updates) > 0 || !isObjectID(id) {
+				return fmt.Errorf("%w: %q", errBadCommand, line)
+			}
+			run.shallow = append(run.shallow, id)
+			continue
 		}
 		if len(run.updates) == 0 {
 			var list string
