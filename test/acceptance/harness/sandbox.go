@@ -1,11 +1,14 @@
 package harness
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,14 +17,17 @@ import (
 
 // The variables that describe the OpenShell gateway beyond its URL, which
 // Gateway's variable gives. TokenFileVar names a file holding the bearer
-// token the hub sends the gateway, and ImageVar the image every profile
-// runs. HubHostVar is the host name the gateway's sandboxes reach this
+// token the hub sends the gateway; TLSDirVar instead names a directory
+// holding ca.crt, tls.crt and tls.key, the gateway's CA and the client
+// certificate and key the hub authenticates with by mutual TLS, as the
+// openshell CLI keeps them. ImageVar names the image every profile runs. HubHostVar is the host name the gateway's sandboxes reach this
 // machine at, for the hub and for Page; without it both are on the
 // loopback address, which only a gateway on this machine shares.
 // ProviderProfileVar names a provider profile the gateway holds, which the
 // credential of the profile cred uses; anthropic without it.
 const (
 	TokenFileVar       = "PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE"
+	TLSDirVar          = "PARLEY_ACCEPTANCE_OPENSHELL_TLS_DIR"
 	ImageVar           = "PARLEY_ACCEPTANCE_SANDBOX_IMAGE"
 	HubHostVar         = "PARLEY_ACCEPTANCE_SANDBOX_HUB_HOST"
 	ProviderProfileVar = "PARLEY_ACCEPTANCE_OPENSHELL_PROVIDER_PROFILE"
@@ -49,13 +55,17 @@ var sandboxProfiles = map[string]string{
 // image ImageVar names. tb is skipped unless Gateway's variable is set.
 // The gateway variable alone gates, so that a gateway set up halfway fails
 // the scenario rather than skipping it: without ImageVar the scenario
-// fails at once, and without TokenFileVar the hub sends a token the
-// gateway refuses.
+// fails at once, and without TokenFileVar or TLSDirVar the hub sends a
+// token the gateway refuses.
 func SandboxOptions(tb testing.TB, settings string, profiles ...string) Options {
 	tb.Helper()
 	gateway := Require(tb, Gateway)
 	token := "no-token-file-was-given"
-	if file := os.Getenv(TokenFileVar); file != "" {
+	auth := "token_file = \"gateway-token\""
+	if dir := os.Getenv(TLSDirVar); dir != "" {
+		auth = fmt.Sprintf("tls_ca = %q\ntls_cert = %q\ntls_key = %q",
+			filepath.Join(dir, "ca.crt"), filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"))
+	} else if file := os.Getenv(TokenFileVar); file != "" {
 		raw, err := os.ReadFile(file)
 		if err != nil {
 			tb.Fatalf("read %s: %v", TokenFileVar, err)
@@ -67,7 +77,7 @@ func SandboxOptions(tb testing.TB, settings string, profiles ...string) Options 
 		tb.Fatalf("%s is set, %s is not: set it to the image the sandboxes run", Gateway.Var, ImageVar)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "[sandbox]\ngateway_url = %q\ntoken_file = \"gateway-token\"\n%s\n", gateway, settings)
+	fmt.Fprintf(&b, "[sandbox]\ngateway_url = %q\nopenshell_workspace = %q\n%s\n%s\n", gateway, gatewayWorkspace(tb), auth, settings)
 	for _, name := range profiles {
 		keys, ok := sandboxProfiles[name]
 		if !ok {
@@ -85,6 +95,16 @@ func SandboxOptions(tb testing.TB, settings string, profiles ...string) Options 
 	return Options{
 		TOML: b.String(), Files: map[string]string{"gateway-token": token}, PublicHost: os.Getenv(HubHostVar),
 	}
+}
+
+// gatewayWorkspace is the OpenShell workspace of the test's hub. A hub owns
+// its workspace: it installs its own provider profile for the hub
+// credential there, which names its port, so hubs that run at once each
+// need one. It is named after the test, so that a run uses the
+// workspaces of the run before.
+func gatewayWorkspace(tb testing.TB) string {
+	sum := sha256.Sum256([]byte(tb.Name()))
+	return "pat-" + hex.EncodeToString(sum[:6])
 }
 
 // Page serves a page that the gateway's sandboxes can ask for, on the host
@@ -209,10 +229,29 @@ func (s *Sandbox) WaitReady() map[string]any {
 		case "provisioning":
 			return false
 		}
-		h.t.Fatalf("sandbox %s is %v (%v), want ready: %v", s.ID, obj["state"], obj["state_reason"], obj)
+		h.t.Fatalf("sandbox %s is %v (%v: %s), want ready: %v", s.ID, obj["state"], obj["state_reason"], s.failure(), obj)
 		return false
 	})
 	return obj
+}
+
+// failure is the error the parley.sandbox.fail event of the sandbox
+// reports, which the sandbox object does not carry, or a note that no such
+// event arrived within a few seconds.
+func (s *Sandbox) failure() string {
+	stream := s.hub.Events(s.hub.AdminToken, "types=parley.sandbox.fail&after=0")
+	defer stream.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range stream.All() {
+			if e.Record["resource_id"] == s.ID {
+				meta, _ := e.Record["metadata"].(map[string]any)
+				return str(meta["error"])
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return "no parley.sandbox.fail event of it arrived"
 }
 
 // WaitState polls the sandbox until it is in state and returns its object,
