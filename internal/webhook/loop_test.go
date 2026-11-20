@@ -231,7 +231,13 @@ func TestDelivery_KeepsDeliveringToOtherSubscriptionsWhileOneReceiverHangs(t *te
 		}
 	})
 	hanging := newInbox(t, func(_ delivered, stop <-chan struct{}) int {
-		arrived <- struct{}{}
+		// Only the first request is awaited: once the test releases A, the
+		// loop goes on to e2 and e3, whose signals nobody reads, and a send
+		// that blocks would hold the receiver's Close for ever.
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
 		select {
 		case <-release:
 		case <-stop:
