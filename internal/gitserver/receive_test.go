@@ -323,6 +323,78 @@ func TestReceive_AnswersAPushWithoutCommandsWithAnEmptyBody(t *testing.T) {
 	}
 }
 
+// A push from a shallow clone sends a shallow line for each of its
+// boundary commits before its commands. A boundary the repository holds,
+// with all its history, is accepted. A boundary the pack itself brings
+// would leave the ref on a commit whose parents the repository lacks, so
+// the whole push is refused.
+func TestReceive_TakesTheShallowLinesOfAPushFromAShallowClone(t *testing.T) {
+	t.Parallel()
+	w := newGitWorld(t, hubtest.Config{})
+	// The client's own history: base, then boundary, then tip, where the
+	// client keeps boundary as shallow and so sends no base.
+	base := w.commit(t, w.head, "base")
+	boundary := w.commit(t, base, "boundary")
+	tip := w.commit(t, boundary, "tip")
+	onHead := w.commit(t, w.head, "on head")
+	shallow := func(ids ...string) string {
+		var b strings.Builder
+		for _, id := range ids {
+			b.WriteString(pkt("shallow " + id + "\n"))
+		}
+		return b.String()
+	}
+	for _, c := range []struct {
+		name     string
+		shallow  []string
+		cmd      command
+		pack     string
+		want     []string
+		accepted bool
+	}{
+		{"boundary the repository holds", []string{w.head}, command{zero, onHead, "refs/heads/on-head"},
+			gitrepotest.Pack(t, w.client, onHead, "^"+w.head),
+			[]string{"unpack ok", "ok refs/heads/on-head"}, true},
+		{"boundary the pack brings without its parents", []string{boundary}, command{zero, tip, "refs/heads/tip"},
+			gitrepotest.Pack(t, w.client, tip, "^"+base),
+			[]string{"unpack ok", "ng refs/heads/tip shallow update not allowed"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			refs, seq := gitrepotest.Git(t, w.repo, "for-each-ref"), w.lastSeq(t)
+			a := w.receive(t, "acme/demo.git", w.ownerKey, shallow(c.shallow...)+receiveRequest(fullCaps, []command{c.cmd}, nil, c.pack))
+			got := parseReport(a.body)
+			if a.status != http.StatusOK || !slices.Equal(got.lines, c.want) {
+				t.Fatalf("answer = %d %q, want 200 %q", a.status, got.lines, c.want)
+			}
+			at := gitrepotest.Refs(t, w.repo, "")[c.cmd.ref]
+			if c.accepted && (at != c.cmd.new || !readable(w.repo, c.cmd.new)) {
+				t.Errorf("%s is at %q, want %s, readable", c.cmd.ref, at, c.cmd.new)
+			}
+			if !c.accepted {
+				if got.text != "error: shallow update not allowed\n" {
+					t.Errorf("side band = %q, want the one line error: shallow update not allowed", got.text)
+				}
+				if gitrepotest.Git(t, w.repo, "for-each-ref") != refs || readable(w.repo, c.cmd.new) || w.lastSeq(t) != seq {
+					t.Error("a refused shallow push moved a ref, stored an object or wrote an event")
+				}
+			}
+			if q := gitrepotest.Quarantines(w.repo); len(q) != 0 {
+				t.Errorf("objects/ holds %v, want no quarantine left", q)
+			}
+		})
+	}
+	for _, c := range []struct{ name, body string }{
+		{"shallow line with no object id", pkt("shallow nope\n") + receiveRequest(fullCaps, []command{{zero, onHead, "refs/heads/bad"}}, nil, "")},
+		{"shallow line after a command", pkt(zero+" "+onHead+" refs/heads/bad\x00report-status\n") + shallow(w.head) + "0000"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if a := w.receive(t, "acme/demo.git", w.ownerKey, c.body); a.status != http.StatusBadRequest {
+				t.Errorf("answer = %d %q, want 400", a.status, a.body)
+			}
+		})
+	}
+}
+
 // head_sha follows a repository's default branch, and is on the record by
 // the time the client has read the answer.
 func TestReceive_RecordsTheNewHeadOfTheDefaultBranchBeforeAnswering(t *testing.T) {

@@ -748,9 +748,10 @@ A push that passed every check gets its ref advertisement from
 - `POST …/git-receive-pack` is handed, with its body unread and whatever
   its size, to the hub's push processor, which writes the whole answer;
   `git receive-pack` does not run. A push moves all of its refs or none:
-  - The body (gzip-decoded when `Content-Encoding` says so) holds the
-    commands `<old> <new> <ref>`, the client's capabilities after a NUL on
-    the first, a flush packet, then the push options and a flush packet
+  - The body (gzip-decoded when `Content-Encoding` says so) holds, from a
+    shallow clone, a `shallow <id>` line for each boundary commit of the
+    client's history, then the commands `<old> <new> <ref>`, the client's
+    capabilities after a NUL on the first, a flush packet, then the push options and a flush packet
     when the client asked for `push-options`, then the pack, which a push
     of deletes only leaves out. A body whose command list cannot be read is
     answered `400` with `invalid receive-pack request`; a body holding only
@@ -764,6 +765,13 @@ A push that passed every check gets its ref advertisement from
     `unpack pack exceeds the maximum push size` with
     `ng <ref> unpacker error` for every ref; a pack of exactly the limit is
     accepted.
+  - A push from a shallow clone is accepted when each boundary commit it
+    names is one the repository already holds, or one its refs do not
+    reach. When the pack itself brings a boundary commit, a ref would end
+    on a history whose older commits the repository lacks: the whole push
+    is refused, every ref reported `ng <ref> shallow update not allowed`,
+    with `error: shallow update not allowed` on the side band. Fetch the
+    missing history (`git fetch --unshallow`) and push again.
   - A push is bounded by `[git].timeout` from its arrival up to its ref
     transaction: when it runs out before, the push's `git` processes are
     killed, nothing changes, and every ref is reported
