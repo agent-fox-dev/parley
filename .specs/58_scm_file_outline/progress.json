@@ -3,7 +3,7 @@
   "spec_id": "58",
   "spec_name": "scm_file_outline",
   "schema_version": 3,
-  "updated_at": "2026-11-20T21:57:37Z",
+  "updated_at": "2026-11-20T22:00:50Z",
   "tasks": [
     {
       "id": 1,
@@ -371,7 +371,21 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSCMRead_AnAgentOutlinesAFileBeforeItForks",
+              "passed": {
+                "at": "2026-11-20T22:00:48Z",
+                "tree": "3a95cedfe7a83b99d5e22bb3f4b73c3279ac4fab"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }
