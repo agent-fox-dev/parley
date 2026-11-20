@@ -62,6 +62,26 @@ func (o *Origin) CommitFiles(branch, msg string, files map[string]string) string
 	return id
 }
 
+// Downstream returns an origin whose main is up's main, the origin of a
+// carry-patch workspace whose upstream is up.
+func (h *Hub) Downstream(up *Origin) *Origin {
+	h.t.Helper()
+	o := gitrepotest.NewOrigin(h.t)
+	gitrepotest.Git(h.t, up.Dir(), "push", "--quiet", o.Dir(), "refs/heads/main:refs/heads/main")
+	o.Publish()
+	return &Origin{Origin: o, t: h.t, Main: up.Main}
+}
+
+// PatchBranch creates the branch name on main with one commit, Patch
+// <name>, adding the files at the top level, and returns its id: a patch
+// branch of a carry-patch workspace, which must be on the origin before
+// the workspace is registered.
+func (o *Origin) PatchBranch(name string, files map[string]string) string {
+	o.t.Helper()
+	o.Branch(name, o.Main)
+	return o.CommitFiles(name, "Patch "+name, files)
+}
+
 // Workspace is a workspace registered on a hub.
 type Workspace struct {
 	Slug string

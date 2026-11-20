@@ -102,8 +102,7 @@ func (s *seeded) carryPatch(slug string, patches map[string]map[string]string) *
 	s.t.Helper()
 	o := s.hub.Origin()
 	for name, files := range patches {
-		o.Branch(name, o.Main)
-		o.CommitFiles(name, "Patch "+name, files)
+		o.PatchBranch(name, files)
 	}
 	s.hub.Register(s.alice, slug, o, map[string]any{"workspace_mode": "carry_patch", "upstream_url": o.URL()})
 	return o
