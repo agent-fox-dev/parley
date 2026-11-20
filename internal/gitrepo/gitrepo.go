@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -456,7 +457,7 @@ func (g Git) command(ctx context.Context, dir string, a access, args []string) *
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = homePath(dir)
-	cmd.Env = append(append([]string{
+	cmd.Env = append(append(append([]string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + homePath(dir),
 		"GIT_CONFIG_NOSYSTEM=1",
@@ -476,10 +477,25 @@ func (g Git) command(ctx context.Context, dir string, a access, args []string) *
 		// git passes the setting on to the commands it starts, and a -c of
 		// the caller's adds to it.
 		"GIT_CONFIG_PARAMETERS='maintenance.autoDetach=false' 'gc.autoDetach=false'",
-	}, g.Env...), remoteEnv(dir, a)...)
+	}, textEncodingEnv()...), g.Env...), remoteEnv(dir, a)...)
 	cmd.WaitDelay = waitDelay
 	killGroupOnCancel(cmd)
 	return cmd
+}
+
+// textEncodingEnv is, on macOS, the text encoding CoreFoundation would
+// otherwise find for itself in every git process, which links it there:
+// without the variable, or with another account's in it, each one looks the
+// account up in the directory service and reads the encoding file of its
+// real home directory, outside the private one, which costs a few
+// milliseconds of the machine's CPU per process. The encoding is
+// CoreFoundation's default, which nothing git does under LC_ALL=C depends
+// on. Elsewhere it is none.
+func textEncodingEnv() []string {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	return []string{fmt.Sprintf("__CF_USER_TEXT_ENCODING=0x%X:0x0:0x0", os.Getuid())}
 }
 
 // remoteEnv is the environment of a git process that contacts the remote

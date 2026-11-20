@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -152,6 +154,51 @@ func TestRun_BuildsAgainOnATargetThatMovedBeforeTheSwap(t *testing.T) {
 				t.Errorf("the other change's attempt took %d tries, want 1", first.Attempts)
 			}
 		})
+	}
+}
+
+// A swap that meets the lock of another writer of the target, which has
+// not moved it yet, loses as to a move; building again at once on the head
+// it still reads would lose again, as many times as the writer holds the
+// lock, so the land waits for the move and builds once on it.
+func TestRun_WaitsForTheWriterHoldingTheTargetsLockToMoveIt(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	ch := w.open(t, "feature")
+	moved := commit(t, w.api, "direct", w.base, "direct", map[string]string{"d.txt": "d\n"})
+	lock := filepath.Join(w.api, "refs", "heads", "main.lock")
+	writerDone := make(chan error, 1)
+	land.SetSeams(w.land, land.Seams{BeforeSwap: func(_ context.Context, _ string, try int) {
+		if try != 1 {
+			return
+		}
+		if err := os.WriteFile(lock, nil, 0o644); err != nil {
+			writerDone <- err
+			return
+		}
+		go func() {
+			// The writer holds the lock a while, then moves main.
+			time.Sleep(300 * time.Millisecond)
+			if err := os.Remove(lock); err != nil {
+				writerDone <- err
+				return
+			}
+			_, err := gitrepotest.Run(w.api, "", "update-ref", "refs/heads/main", moved, w.base)
+			writerDone <- err
+		}()
+	}})
+
+	a := w.landNow(t, ch, w.caller(), nil)
+
+	if err := <-writerDone; err != nil {
+		t.Fatalf("the other writer: %v", err)
+	}
+	if a.Status != land.StatusLanded || a.Attempts != 2 || a.OntoSHA == nil || *a.OntoSHA != moved {
+		t.Fatalf("attempt = %s (%v) after %d tries onto %v; want landed after 2 onto the writer's %s",
+			a.Status, a.Error, a.Attempts, a.OntoSHA, moved)
+	}
+	if parent := gitrepotest.Git(t, w.api, "rev-parse", *a.LandedSHA+"^"); parent != moved {
+		t.Errorf("the landed commit's parent is %s, want the writer's %s", parent, moved)
 	}
 }
 

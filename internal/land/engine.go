@@ -13,6 +13,7 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/change"
 	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/server"
 )
 
@@ -103,10 +104,46 @@ func (c *Component) run(ctx context.Context, a Attempt) error {
 				a.Status, a.Error = StatusFailed, new(ErrorContention)
 				return c.end(ctx, a)
 			}
+			awaitMove(ctx, repo, a.TargetBranch, b.onto)
 		case err != nil && !moved:
 			return c.fail(ctx, a, err)
 		default:
 			return err
+		}
+	}
+}
+
+// moveWait bounds how long a land whose swap lost waits for the target to
+// leave the head it was built on, and movePoll is how often it reads the
+// target meanwhile.
+const (
+	moveWait = 2 * time.Second
+	movePoll = 5 * time.Millisecond
+)
+
+// awaitMove returns once the branch of repo no longer reads onto, the head
+// a swap that lost was built on, after moveWait at the latest, or when ctx
+// ends. A swap also loses to another writer that holds the target's lock
+// and has not moved it yet: a build at once on the head the target still
+// reads would lose again for as long as the writer holds the lock, a try
+// spent on nothing each time, so the next build waits for the writer's
+// move. A writer that lets the lock go without moving the target costs
+// the wait; one that moved it before the swap costs nothing.
+func awaitMove(ctx context.Context, repo *gitrepo.Repo, branch, onto string) {
+	deadline := time.NewTimer(moveWait)
+	defer deadline.Stop()
+	poll := time.NewTicker(movePoll)
+	defer poll.Stop()
+	for {
+		if head, found, err := repo.ResolveBranch(ctx, branch); err != nil || !found || head != onto {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-poll.C:
 		}
 	}
 }

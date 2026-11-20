@@ -508,9 +508,11 @@ func (r *Repo) CreateCommit(ctx context.Context, spec CommitSpec) (string, error
 			return "", fmt.Errorf("object %q: %w", id, ErrNotFound)
 		}
 	}
-	types, err := r.batchCheck(ctx, "%(objecttype)", names)
-	if err != nil {
-		return "", err
+	types, ok := readObjectTypes(r.dir, names)
+	if !ok {
+		if types, err = r.batchCheck(ctx, "%(objecttype)", names); err != nil {
+			return "", err
+		}
 	}
 	if len(types) != len(names) {
 		return "", fmt.Errorf("cat-file answered %q", types)
@@ -534,7 +536,19 @@ func (r *Repo) CreateCommit(ctx context.Context, spec CommitSpec) (string, error
 	if spec.Message != "" && !strings.HasSuffix(spec.Message, "\n") {
 		obj.WriteString("\n")
 	}
-	out, err := r.g.runInput(ctx, access{}, []byte(obj.String()), "--git-dir="+r.dir, "hash-object", "-t", "commit", "-w", "--stdin")
+	return r.writeCommitObject(ctx, obj.String())
+}
+
+// writeCommitObject writes the commit object obj and returns its id: in
+// process where writeLooseObject writes it as git would, else with git
+// hash-object.
+func (r *Repo) writeCommitObject(ctx context.Context, obj string) (string, error) {
+	if ctx.Err() == nil {
+		if id, ok := writeLooseObject(r.dir, r.g.Env, ObjectCommit, []byte(obj)); ok {
+			return id, nil
+		}
+	}
+	out, err := r.g.runInput(ctx, access{}, []byte(obj), "--git-dir="+r.dir, "hash-object", "-t", "commit", "-w", "--stdin")
 	if err != nil {
 		return "", err
 	}

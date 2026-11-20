@@ -92,11 +92,18 @@ func raceToLand(t *testing.T, hub *harness.Hub, p int, credP string, q int, cred
 	return r
 }
 
+// spacedMergeability gives a hub the default spacing of the mergeability
+// checks of one change, for a scenario that lands many changes at once and
+// reads no mergeability: without it every land checks every other open
+// change again at once, work the suite pays for in CPU and the scenario
+// does not look at.
+const spacedMergeability = "[changes]\nmergeable_debounce = \"5s\"\n"
+
 func TestLand_TwentyDisjointChangesLandConcurrently(t *testing.T) {
 	t.Parallel()
 	// Twenty lands racing for one ref need more compare-and-swap tries
 	// than the default allows.
-	hub := harness.Start(t, harness.Options{TOML: "[land]\nmax_attempts = 20\n"})
+	hub := harness.Start(t, harness.Options{TOML: "[land]\nmax_attempts = 20\n\n" + spacedMergeability})
 	demo := hub.Workspace(hub.User("alice"), "demo")
 	key := demo.Owner.Key
 	const n = 20
@@ -200,7 +207,8 @@ func branchOf(number, p int) string {
 
 func TestLand_KilledHubLeavesNoHalfLandedChange(t *testing.T) {
 	t.Parallel()
-	hub, demo := demoHub(t)
+	hub := harness.Start(t, harness.Options{TOML: spacedMergeability})
+	demo := hub.Workspace(hub.User("alice"), "demo")
 	key := demo.Owner.Key
 	landed, leftOpen := 0, 0
 	for _, delay := range []time.Duration{0, 20 * time.Millisecond, 60 * time.Millisecond, 150 * time.Millisecond} {

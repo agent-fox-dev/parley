@@ -223,9 +223,13 @@ func walkStream() string {
 	body := strings.Repeat("A body every commit of the fixture shares, so that git deltifies them.\n", 40)
 	var b strings.Builder
 	at := 1700000000
+	// The commits' zones take turns, so that a zone read from the wrong
+	// commit shows.
+	zones := []string{"+0100", "-0530", "+1245"}
 	commit := func(ref, mark, msg string, from ...string) {
 		at += 60
-		fmt.Fprintf(&b, "commit refs/heads/%s\nmark :%s\ncommitter T <t@example.invalid> %d +0100\ndata %d\n%s\n", ref, mark, at, len(msg+body), msg+body)
+		zone := zones[at/60%len(zones)]
+		fmt.Fprintf(&b, "commit refs/heads/%s\nmark :%s\ncommitter T <t@example.invalid> %d %s\ndata %d\n%s\n", ref, mark, at, zone, len(msg+body), msg+body)
 		for i, f := range from {
 			if i == 0 {
 				fmt.Fprintf(&b, "from :%s\n", f)
@@ -258,8 +262,8 @@ type walkQuery struct {
 	git  func(t *testing.T, dir string, id map[string]string) string
 }
 
-// walkQueries ask IsAncestor, MergeBase, CommitsBetween and ReadCommits
-// about walkStream's commits.
+// walkQueries ask IsAncestor, MergeBase, CommitsBetween, AuthorZone and
+// ReadCommits about walkStream's commits.
 func walkQueries() []walkQuery {
 	var qs []walkQuery
 	for _, q := range [][2]string{{"c1", "c5"}, {"c5", "c2"}, {"s1", "m"}, {"s2", "c5"}, {"c3", "c3"}, {"orphan", "t2"}} {
@@ -295,6 +299,20 @@ func walkQueries() []walkQuery {
 				var ids []string
 				ids = append(ids, strings.Fields(gitrepotest.Git(t, dir, "rev-list", "--reverse", "--topo-order", revs))...)
 				return fmt.Sprint(ids, nil)
+			}})
+	}
+	for _, name := range []string{"c1", "c2", "t2", "m", "orphan"} {
+		qs = append(qs, walkQuery{"AuthorZone(" + name + ")",
+			func(ctx context.Context, repo *gitrepo.Repo, id map[string]string) string {
+				zone, err := repo.AuthorZone(ctx, id[name])
+				if err != nil {
+					return fmt.Sprint("", err)
+				}
+				return fmt.Sprint(time.Unix(0, 0).In(zone).Format("-0700"), nil)
+			},
+			func(t *testing.T, dir string, id map[string]string) string {
+				f := strings.Fields(gitrepotest.Git(t, dir, "log", "-1", "--date=raw", "--format=%ad", id[name]))
+				return fmt.Sprint(f[1], nil)
 			}})
 	}
 	read := []string{"t2", "c1", "m"}

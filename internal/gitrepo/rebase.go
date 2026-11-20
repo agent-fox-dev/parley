@@ -74,9 +74,11 @@ func (r *Repo) rebase(ctx context.Context, from, head, onto string, committer Si
 	if err != nil {
 		return "", nil, nil, err
 	}
-	zones, err := r.authorZones(ctx, commitRange)
-	if err != nil {
-		return "", nil, nil, err
+	zones, ok := r.readAuthorZones(ctx, ids)
+	if !ok {
+		if zones, err = r.authorZones(ctx, commitRange); err != nil {
+			return "", nil, nil, err
+		}
 	}
 	var resolve resolveFunc
 	if len(resolutions) > 0 {
@@ -115,6 +117,9 @@ func (r *Repo) AuthorZone(ctx context.Context, id string) (*time.Location, error
 	if !isHexID(id, idLen) {
 		return nil, fmt.Errorf("commit %q: %w", id, ErrNotFound)
 	}
+	if zones, ok := r.readAuthorZones(ctx, []string{strings.ToLower(id)}); ok {
+		return zones[strings.ToLower(id)], nil
+	}
 	zones, err := r.authorZones(ctx, "--no-walk", id)
 	if err != nil {
 		return nil, err
@@ -136,21 +141,80 @@ func (r *Repo) authorZones(ctx context.Context, revs ...string) (map[string]*tim
 	zones := map[string]*time.Location{}
 	for line := range strings.Lines(string(out)) {
 		f := strings.Fields(line)
-		if len(f) != 3 || len(f[2]) != 5 || (f[2][0] != '+' && f[2][0] != '-') {
+		if len(f) != 3 {
 			return nil, fmt.Errorf("rev-list answered %q", line)
 		}
-		hours, herr := strconv.Atoi(f[2][1:3])
-		minutes, merr := strconv.Atoi(f[2][3:])
-		if herr != nil || merr != nil {
+		zone, ok := parseZone(f[2])
+		if !ok {
 			return nil, fmt.Errorf("rev-list answered %q", line)
 		}
-		offset := (hours*60 + minutes) * 60
-		if f[2][0] == '-' {
-			offset = -offset
-		}
-		zones[f[0]] = time.FixedZone("", offset)
+		zones[f[0]] = zone
 	}
 	return zones, nil
+}
+
+// readAuthorZones is authorZones of the commits of the full lower-case ids
+// ids, read from the commits in process; ok is false for what it leaves to
+// git: a commit it does not read (see commitfile.go), and an author line
+// whose time and zone are not a number and a sign followed by four digits,
+// as git writes them, which git may read otherwise.
+func (r *Repo) readAuthorZones(ctx context.Context, ids []string) (map[string]*time.Location, bool) {
+	cr, ok := r.commitReader(ctx)
+	if !ok {
+		return nil, false
+	}
+	defer cr.close()
+	zones := make(map[string]*time.Location, len(ids))
+	for _, id := range ids {
+		kind, raw, ok := cr.read(id)
+		if !ok || kind != packCommit || !gitLayout(raw) {
+			return nil, false
+		}
+		zone, ok := authorZone(raw)
+		if !ok {
+			return nil, false
+		}
+		zones[id] = zone
+	}
+	return zones, true
+}
+
+// authorZone is the zone of the first author line of the commit object
+// raw, the one git reads; ok is false when there is none, or its time and
+// zone are not as git writes them.
+func authorZone(raw []byte) (*time.Location, bool) {
+	headers, _, _ := strings.Cut(string(raw), "\n\n")
+	for line := range strings.SplitSeq(headers, "\n") {
+		value, found := strings.CutPrefix(line, "author ")
+		if !found {
+			continue
+		}
+		end := strings.LastIndexByte(value, '>')
+		if end < 0 {
+			return nil, false
+		}
+		f := strings.Split(value[end+1:], " ")
+		if len(f) != 3 || f[0] != "" || f[1] == "" || strings.Trim(f[1], "0123456789") != "" {
+			return nil, false
+		}
+		return parseZone(f[2])
+	}
+	return nil, false
+}
+
+// parseZone is the zone a commit writes as a sign and four digits, hours
+// and minutes; ok is false for anything else.
+func parseZone(s string) (*time.Location, bool) {
+	if len(s) != 5 || (s[0] != '+' && s[0] != '-') || strings.Trim(s[1:], "0123456789") != "" {
+		return nil, false
+	}
+	hours, _ := strconv.Atoi(s[1:3])
+	minutes, _ := strconv.Atoi(s[3:])
+	offset := (hours*60 + minutes) * 60
+	if s[0] == '-' {
+		offset = -offset
+	}
+	return time.FixedZone("", offset), true
 }
 
 // replay is the replay the rebases and the trial share: it replays

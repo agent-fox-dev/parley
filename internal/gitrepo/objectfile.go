@@ -65,6 +65,20 @@ func readObjectType(dir, id string) (typ string, ok bool) {
 	return "", false
 }
 
+// readObjectTypes is readObjectType of each of ids, in their order; ok is
+// false when it leaves the type of any of them to git.
+func readObjectTypes(dir string, ids []string) ([]string, bool) {
+	types := make([]string, len(ids))
+	for i, id := range ids {
+		typ, ok := readObjectType(dir, id)
+		if !ok {
+			return nil, false
+		}
+		types[i] = typ
+	}
+	return types, true
+}
+
 // looseObjectType is the type of the loose object id below objects; found
 // is false when there is no such file.
 func looseObjectType(objects, id string) (typ string, found, ok bool) {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,7 +46,16 @@ func TestRebase_ReplaysEachCommitKeepingItsAuthorAndMessage(t *testing.T) {
 	f := newRebaseFixture(t)
 	refs := gitrepotest.Git(t, f.dir, "for-each-ref")
 	head := f.id(t, "authored")
-	got, report, err := f.repo.Rebase(context.Background(), f.id(t, "main"), head, rebaseAt)
+	var zoneReads atomic.Int32
+	repo, err := gitrepo.Git{Trace: func(args []string) {
+		if slices.Contains(args, "rev-list") && slices.Contains(args, "--date=raw") {
+			zoneReads.Add(1)
+		}
+	}}.Open(context.Background(), f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, report, err := repo.Rebase(context.Background(), f.id(t, "main"), head, rebaseAt)
 	if err != nil || report != nil || len(got) != 40 {
 		t.Fatalf("Rebase(main, authored) = %q, %+v, %v; want a new head", got, report, err)
 	}
@@ -69,6 +79,9 @@ func TestRebase_ReplaysEachCommitKeepingItsAuthorAndMessage(t *testing.T) {
 	}
 	if after := gitrepotest.Git(t, f.dir, "for-each-ref"); after != refs {
 		t.Errorf("the refs changed from\n%s\nto\n%s", refs, after)
+	}
+	if n := zoneReads.Load(); n != 0 {
+		t.Errorf("the rebase asked git rev-list for the authors' zones %d times, want none: it reads them from the commits", n)
 	}
 }
 

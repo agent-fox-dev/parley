@@ -33,6 +33,10 @@ throttles the suite, and git's unauthenticated first requests count against
 the loopback address) and `[changes] mergeable_debounce = "0s"` (otherwise
 mergeability is reported up to 5 s late). A scenario adds only what it
 needs: `[land] max_attempts = 20` for twenty concurrent lands,
+`[changes] mergeable_debounce = "5s"`, the default, for the two scenarios
+that land many changes at once and read no mergeability (with `"0s"`
+every land checks every other open change again at once, CPU the suite
+pays for and neither scenario looks at),
 `[awareness] max_claims_per_workspace = 1000000` for the writers killed
 under load and those writing while a backup runs (they pass the default
 1,000 within seconds), `[webhooks] allow_insecure = true` for the loopback

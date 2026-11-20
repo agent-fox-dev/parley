@@ -3,6 +3,7 @@ package gitrepo_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -897,6 +899,31 @@ func TestGit_RemovesItsPrivateDirectoryOnceGitHasRun(t *testing.T) {
 				t.Errorf("%s: %s, which git ran with, is still there after the call (stat: %v)", c.name, path, err)
 			}
 		}
+	}
+}
+
+// Not parallel: it puts a fake git first on the PATH of the test process,
+// which records the text encoding it is given.
+func TestGit_GivesGitTheTextEncodingOfTheAccountOnMacOS(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("only macOS's CoreFoundation, which git links there, reads the variable")
+	}
+	bin := t.TempDir()
+	seen := filepath.Join(bin, "seen")
+	script := "#!/bin/sh\nprintf '%s' \"$__CF_USER_TEXT_ENCODING\" > '" + seen + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, err := (gitrepo.Git{}).ListRemote(context.Background(), "https://example.invalid/a.git", gitrepo.Credential{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("git never ran: %v", err)
+	}
+	if want := fmt.Sprintf("0x%X:0x0:0x0", os.Getuid()); string(got) != want {
+		t.Errorf("git ran with __CF_USER_TEXT_ENCODING=%q, want %q, so that it does not look up the account in the directory service", got, want)
 	}
 }
 
