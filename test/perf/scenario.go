@@ -3,22 +3,11 @@ package perf
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
-	"sync"
 	"time"
 )
-
-// The number of requests of a request-duration scenario.
-const (
-	forkCreateSamples = 50
-	fileReadSamples   = 200
-)
-
-// cleanupWait bounds each clean-up request, which runs after the
-// scenario's own deadline.
-const cleanupWait = 30 * time.Second
 
 // scenario is one target of the table and the way it is measured.
 type scenario struct {
@@ -72,41 +61,6 @@ func p95Outcome(samples []float64) outcome {
 // ms is d in milliseconds.
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
-// created records what a scenario created on the hub: the API paths whose
-// DELETE removes a fork or a sandbox.
-type created struct {
-	mu      sync.Mutex
-	deletes []string
-}
-
-// remove records that path, below the REST API's mount, is deleted when
-// the scenario ends.
-func (c *created) remove(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.deletes = append(c.deletes, path)
-}
-
-// cleanUp deletes what was created, the last first, each request bounded
-// by cleanupWait and outliving ctx's cancellation. It returns a line for
-// each deletion that failed.
-func (c *created) cleanUp(ctx context.Context, cl *client) []string {
-	c.mu.Lock()
-	deletes := c.deletes
-	c.deletes = nil
-	c.mu.Unlock()
-	var failed []string
-	for _, path := range slices.Backward(deletes) {
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
-		_, err := cl.do(rctx, http.MethodDelete, path, nil)
-		cancel()
-		if err != nil {
-			failed = append(failed, cl.detail(err.Error()))
-		}
-	}
-	return failed
-}
-
 // scenarios are the fourteen scenarios in the order of the report.
 func scenarios() []scenario {
 	capacity := []string{EnvCapacity}
@@ -114,79 +68,120 @@ func scenarios() []scenario {
 	return []scenario{
 		{name: "fork_create", target: Target{LT, 1000, "ms"}, body: forkCreate},
 		{name: "file_read", target: Target{LT, 100, "ms"}, body: fileRead},
-		{name: "commit_create", target: Target{LT, 500, "ms"}},
-		{name: "land", target: Target{LT, 2000, "ms"}},
-		{name: "land_throughput", target: Target{GE, 60, "per_minute"}},
-		{name: "land_concurrency", target: Target{LE, 0, "count"}},
-		{name: "mergeability", target: Target{LE, 60, "s"}},
-		{name: "event_latency", target: Target{LE, 1000, "ms"}},
+		{name: "commit_create", target: Target{LT, 500, "ms"}, body: commitCreate},
+		{name: "land", target: Target{LT, 2000, "ms"}, body: land},
+		{name: "land_throughput", target: Target{GE, 60, "per_minute"}, body: landThroughput},
+		{name: "land_concurrency", target: Target{LE, 0, "count"}, body: landConcurrency},
+		{name: "mergeability", target: Target{LE, 60, "s"}, body: mergeability},
+		{name: "event_latency", target: Target{LE, 1000, "ms"}, body: eventLatency},
 		{name: "active_forks", target: Target{GE, 5000, "count"}, needs: capacity, capacity: true},
 		{name: "open_changes", target: Target{GE, 2000, "count"}, needs: capacity, capacity: true},
 		{name: "event_streams", target: Target{GE, 500, "count"}, needs: capacity, capacity: true},
 		{name: "sandboxes_running", target: Target{GE, 200, "count"}, needs: []string{EnvCapacity, EnvSandboxProfile}, capacity: true},
 		{name: "sandbox_ready", target: Target{LE, 60, "s"}, needs: sandbox},
-		{name: "sandbox_exec", target: Target{LT, 200, "ms"}, needs: sandbox},
+		{name: "sandbox_exec", target: Target{LT, 200, "ms"}, needs: sandbox, body: sandboxExec},
 	}
 }
 
 // workspacePath is the API path of the workspace slug, followed by rest.
 func workspacePath(slug, rest string) string { return "/workspaces/" + url.PathEscape(slug) + rest }
 
-// forkCreate creates forks of the first workspace one after the other and
-// measures each request.
-func forkCreate(ctx context.Context, e *env) (outcome, error) {
-	path := workspacePath(e.cfg.Workspaces[0], "/forks")
-	body := map[string]string{"purpose": "parley performance run " + e.runID}
-	samples := make([]float64, 0, forkCreateSamples)
-	for range forkCreateSamples {
-		var ans struct {
-			Workspace struct {
-				Slug string `json:"slug"`
-			} `json:"workspace"`
-		}
-		resp, err := e.client.json(ctx, http.MethodPost, path, body, &ans)
-		if ans.Workspace.Slug != "" {
-			e.created.remove(workspacePath(ans.Workspace.Slug, ""))
-		}
-		if err != nil {
-			return outcome{}, err
-		}
-		samples = append(samples, ms(resp.duration))
+// targetBranch is the branch every change of the run targets: perf/<run
+// id> in the first workspace, made at the head of its default branch by the
+// first scenario that needs it. The default branch itself is never written.
+func (e *env) targetBranch(ctx context.Context) (string, error) {
+	slug := e.cfg.Workspaces[0]
+	var ws struct {
+		DefaultBranch *string `json:"default_branch"`
 	}
-	return p95Outcome(samples), nil
+	if _, err := e.client.json(ctx, http.MethodGet, workspacePath(slug, ""), nil, &ws); err != nil {
+		return "", err
+	}
+	if ws.DefaultBranch == nil || *ws.DefaultBranch == "" {
+		return "", errors.New("workspace " + slug + " has no default branch to start the run's target branch from")
+	}
+	name := "perf/" + e.runID
+	_, err := e.client.do(ctx, http.MethodPost, workspacePath(slug, "/scm/refs"), map[string]string{"name": name, "ref": *ws.DefaultBranch})
+	// An earlier scenario of the run made it.
+	if re, ok := errors.AsType[*requestError](err); ok && re.status == http.StatusConflict && re.errorType == "ref_exists" {
+		err = nil
+	}
+	return name, err
 }
 
-// fileRead reads, alternately, one file of the first workspace's root tree
-// and that tree, and measures each request.
-func fileRead(ctx context.Context, e *env) (outcome, error) {
-	scm := workspacePath(e.cfg.Workspaces[0], "/scm")
-	var tree struct {
-		Items []struct {
-			Path string `json:"path"`
-			Type string `json:"type"`
-		} `json:"items"`
+// sourceBranch is the n-th branch the scenario commits to. Its prefix is
+// not perf/<run id>, which a branch below the target's name would clash
+// with.
+func (e *env) sourceBranch(scenario string, n int) string {
+	return fmt.Sprintf("perf-%s/%s/%d", e.runID, scenario, n)
+}
+
+// fileOp is a file operation of a commit request.
+type fileOp struct {
+	Op      string `json:"op"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// put is the operation that writes content to path.
+func put(path, content string) fileOp { return fileOp{Op: "put", Path: path, Content: content} }
+
+// branchHead is a branch of a workspace the harness commits to, and the
+// commit it is at: empty before the first commit, which creates the branch
+// at base.
+type branchHead struct {
+	slug, branch, base string
+	head               string
+}
+
+// commit makes one commit of ops on b and moves b's head to it. It returns
+// the commit's id and the answer, whose duration is the request's.
+func (e *env) commit(ctx context.Context, b *branchHead, message string, ops []fileOp) (string, response, error) {
+	body := map[string]any{"branch": b.branch, "message": message, "operations": ops}
+	if b.head == "" {
+		body["base_ref"] = b.base
+	} else {
+		body["expected_head_sha"] = b.head
 	}
-	if _, err := e.client.json(ctx, http.MethodGet, scm+"/tree", nil, &tree); err != nil {
-		return outcome{}, err
+	var ans struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
 	}
-	file := ""
-	for _, it := range tree.Items {
-		if it.Type == "blob" {
-			file = it.Path
-			break
+	resp, err := e.client.json(ctx, http.MethodPost, workspacePath(b.slug, "/scm/commits"), body, &ans)
+	if err != nil {
+		return "", resp, err
+	}
+	if ans.Commit.SHA == "" {
+		return "", resp, errors.New("POST " + apiMount + workspacePath(b.slug, "/scm/commits") + ": the answer names no commit")
+	}
+	b.head = ans.Commit.SHA
+	return b.head, resp, nil
+}
+
+// openChange makes a change of commits commits, each writing one file of
+// its own, on the n-th source branch of the scenario, and opens it against
+// target. It returns the change's number.
+func (e *env) openChange(ctx context.Context, target, scenario string, n, commits int) (int64, error) {
+	slug := e.cfg.Workspaces[0]
+	b := &branchHead{slug: slug, branch: e.sourceBranch(scenario, n), base: target}
+	for i := range commits {
+		path := fmt.Sprintf("perf/%s/%s/%d/%d.txt", e.runID, scenario, n, i)
+		msg := fmt.Sprintf("perf %s: change %d, commit %d", scenario, n, i)
+		if _, _, err := e.commit(ctx, b, msg, []fileOp{put(path, msg+"\n")}); err != nil {
+			return 0, err
 		}
 	}
-	if file == "" {
-		return outcome{}, errors.New("the root tree of workspace " + e.cfg.Workspaces[0] + " holds no file to read")
+	body := map[string]any{"source": map[string]string{"branch": b.branch}, "target_branch": target,
+		"title": fmt.Sprintf("perf %s %d (run %s)", scenario, n, e.runID)}
+	var ch struct {
+		Number int64 `json:"number"`
 	}
-	reads := [2]string{scm + "/file?path=" + url.QueryEscape(file), scm + "/tree"}
-	samples := make([]float64, 0, fileReadSamples)
-	for i := range fileReadSamples {
-		resp, err := e.client.do(ctx, http.MethodGet, reads[i%2], nil)
-		if err != nil {
-			return outcome{}, err
-		}
-		samples = append(samples, ms(resp.duration))
+	if _, err := e.client.json(ctx, http.MethodPost, workspacePath(slug, "/changes"), body, &ch); err != nil {
+		return 0, err
 	}
-	return p95Outcome(samples), nil
+	if ch.Number <= 0 {
+		return 0, errors.New("POST " + apiMount + workspacePath(slug, "/changes") + ": the answer names no change number")
+	}
+	return ch.Number, nil
 }
