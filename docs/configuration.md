@@ -302,6 +302,7 @@ no other:
 | `env` | table of strings | `{}` | the sandbox's environment: each key matches `^[A-Za-z_][A-Za-z0-9_]*$` and does not start with `PARLEY_` or `OPENSHELL_` |
 | `checkpoint` | boolean | `true` | |
 | `allow_proposals` | boolean | `true` | |
+| `tool_server` | string | `""` | the absolute path of the tool server (`agentkit-tools`) in the profile's image, at most 256 bytes; `""` gives the profile's sandboxes no tools. `parleyd` does not check at start that the image holds the file: one that lacks it answers `502 tool_server_failed` on first use |
 
 A name in `expose_secrets` or `optional_expose_secrets` matches
 `^[A-Za-z_][A-Za-z0-9_]*$`, does not start with `PARLEY_` or `OPENSHELL_`, is
