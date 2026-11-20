@@ -468,6 +468,14 @@ func (g Git) command(ctx context.Context, dir string, a access, args []string) *
 		// caller's GIT_SSH_COMMAND replaces it.
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
 		"LC_ALL=C",
+		// The housekeeping a command starts (a fetch's auto maintenance, a
+		// commit's gc --auto) runs as part of it instead of detached: a
+		// detached one outlives the call, outside the process group killed
+		// with it, and becomes a zombie where parleyd is PID 1
+		// (docs/adr/10-keep-git-housekeeping-inside-the-command-that-starts-it.md).
+		// git passes the setting on to the commands it starts, and a -c of
+		// the caller's adds to it.
+		"GIT_CONFIG_PARAMETERS='maintenance.autoDetach=false' 'gc.autoDetach=false'",
 	}, g.Env...), remoteEnv(dir, a)...)
 	cmd.WaitDelay = waitDelay
 	killGroupOnCancel(cmd)
