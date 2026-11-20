@@ -45,6 +45,8 @@ func TestSCM_ReadsSendOneGetAndPrintTheAnswer(t *testing.T) {
 		{scmCommand("compare", "demo", "main", "feature"), scmPath("compare"), "base=main&head=feature"},
 		{scmCommand("blame", "demo", "a.go"), scmPath("blame"), "path=a.go"},
 		{scmCommand("blame", "demo", "a.go", "--ref", "v1", "--lines", "3:9"), scmPath("blame"), "end_line=9&path=a.go&ref=v1&start_line=3"},
+		{scmCommand("outline", "demo", "internal/api/router.go"), scmPath("outline"), "path=internal%2Fapi%2Frouter.go"},
+		{scmCommand("outline", "demo", "internal/api/router.go", "--ref", "v1"), scmPath("outline"), "path=internal%2Fapi%2Frouter.go&ref=v1"},
 		{scmCommand("search", "demo", "TODO"), scmPath("search"), "q=TODO"},
 		{
 			scmCommand("search", "demo", "to do", "--ref", "v1", "--path", "src/**", "--path", "*.go", "--regex", "--ignore-case"),
@@ -224,6 +226,9 @@ func TestSCM_RefusesABadCommandLineBeforeAnyRequest(t *testing.T) {
 		{"scm", "blame", "demo", "f", "--lines", "3"},
 		{"scm", "blame", "demo", "f", "--lines", "a:b"},
 		{"scm", "blame", "demo", "f", "--lines", "0:2"},
+		{"scm", "outline"},
+		{"scm", "outline", "demo"},
+		{"scm", "outline", "demo", "a.go", "b.go"},
 		{"scm", "refs", "demo", "--limit", "many"},
 	}
 	for _, args := range tests {
@@ -246,7 +251,7 @@ func TestSCM_WithoutACommandPrintsItsHelp(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Errorf("exit status %d, stderr %q; want 0 and nothing", code, stderr)
 	}
-	for _, sub := range []string{"refs", "log", "show", "ls", "cat", "diff", "compare", "blame", "search", "commit", "rebase"} {
+	for _, sub := range []string{"refs", "log", "show", "ls", "cat", "diff", "compare", "blame", "outline", "search", "commit", "rebase"} {
 		if !slices.ContainsFunc(nonEmptyLines(stdout), func(l string) bool { return strings.HasPrefix(strings.TrimSpace(l), sub+" ") }) {
 			t.Errorf("stdout does not list %s:\n%s", sub, stdout)
 		}

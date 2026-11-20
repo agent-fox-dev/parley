@@ -78,7 +78,7 @@ type scmRead struct {
 // without a clone, and the commit and the rebase that write to it.
 func newSCMCommand() *cobra.Command {
 	slugOnly := []argSpec{slugArg}
-	return group("scm", "Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone",
+	return group("scm", "Read the refs, commits, files, diffs, blame and outlines of a workspace, and commit and rebase, without a clone",
 		scmRead{
 			command: command{Name: "refs", Description: "List the branches, tags and hub-owned refs of a workspace", Path: "/workspaces/:slug/scm/refs", Args: slugOnly},
 			query: []queryFlag{
@@ -154,6 +154,11 @@ func newSCMCommand() *cobra.Command {
 				refFlag("file is blamed"),
 				{name: "lines", kind: linesFlag, usage: "only the lines <start>:<end>, 1-based and inclusive"},
 			},
+		}.build(),
+		scmRead{
+			command: command{Name: "outline", Description: "Show the declarations of a source file: kinds, names, signatures and lines", Path: "/workspaces/:slug/scm/outline", Args: []argSpec{slugArg, {Name: "path", Required: true}}},
+			params:  map[string]string{"path": "path"},
+			query:   []queryFlag{refFlag("file is outlined")},
 		}.build(),
 		scmRead{
 			command: command{Name: "search", Description: "Search the file contents of a revision", Path: "/workspaces/:slug/scm/search", Args: []argSpec{slugArg, {Name: "query", Required: true}}},

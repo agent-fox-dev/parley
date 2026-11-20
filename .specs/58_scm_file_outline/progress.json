@@ -3,7 +3,7 @@
   "spec_id": "58",
   "spec_name": "scm_file_outline",
   "schema_version": 3,
-  "updated_at": "2026-11-20T21:42:21Z",
+  "updated_at": "2026-11-20T21:45:22Z",
   "tasks": [
     {
       "id": 1,
@@ -298,7 +298,54 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-20T21:43:02Z",
+                "tree": "f3be302242bc4b0c384a8788b1066529f73d2f8f"
+              },
+              "passed": {
+                "at": "2026-11-20T21:45:21Z",
+                "tree": "8b161ff4c5e584eaad180011ee35a6918f4f5a8d"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "no_red": "before the command exists the group refuses the unknown word outline with the same usage_error and no request, so the rows cannot fail first; they fail once the command is declared with other arguments",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_RefusesABadCommandLineBeforeAnyRequest",
+              "passed": {
+                "at": "2026-11-20T21:45:21Z",
+                "tree": "8b161ff4c5e584eaad180011ee35a6918f4f5a8d"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ServesTheOutlineOfAFileAsAReadingTool",
+              "failed": {
+                "at": "2026-11-20T21:43:02Z",
+                "tree": "f3be302242bc4b0c384a8788b1066529f73d2f8f"
+              },
+              "passed": {
+                "at": "2026-11-20T21:45:21Z",
+                "tree": "8b161ff4c5e584eaad180011ee35a6918f4f5a8d"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,
