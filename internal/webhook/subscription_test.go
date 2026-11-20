@@ -604,8 +604,11 @@ func TestUpdate_AppliesTheChangeFromTheNextAttemptAndKeepsThePendingDelivery(t *
 		t.Errorf("the new url got %d requests before the next attempt was due, want 0", n)
 	}
 
-	w.clock.advance(10 * time.Second)
-	waitFor(t, "the loop to settle at the new url", func() bool { return w.settled(t, id) })
+	// The clock moves on until the loop settles, not once: the PATCH and its
+	// event wake the loop, and one that reads the clock just before a single
+	// move arms its timer a whole wait past the move, with no wake-up left
+	// to come.
+	w.drive(t, "the loop to settle at the new url", 10*time.Second, func() bool { return w.settled(t, id) })
 	got := healthy.requests()
 	if seqs := healthy.seqs(); !reflect.DeepEqual(seqs, []int64{e1, e3}) {
 		t.Errorf("the new url got seqs %v, want e1 %d then e3 %d (never e2 %d)", seqs, e1, e3, e2)
