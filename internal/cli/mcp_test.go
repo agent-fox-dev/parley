@@ -3,10 +3,15 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -463,5 +468,378 @@ func TestMCPList_LeavesOutTheFlagsNoToolCanUse(t *testing.T) {
 	}
 	if !has("scm_log", "follow") || !has("change_land", "wait") || !has("change_land", "timeout") || !has("sandbox_logs", "tail") {
 		t.Error("follow of scm_log, wait and timeout of change_land or tail of sandbox_logs is missing")
+	}
+}
+
+// mcpDefaults are the settings of parley mcp given no flag but
+// --no-code-mode.
+func mcpDefaults() mcpSettings { return mcpSettings{groups: mcpDefaultGroups, noCodeMode: true} }
+
+// toolSessionOn is the tool session parley mcp builds for s over the tree
+// of opts, with the hub at hubURL and the credential k.
+func toolSessionOn(t *testing.T, opts options, hubURL string, s mcpSettings) *toolSession {
+	t.Helper()
+	// No setting of the process's own environment is in reach of a call.
+	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
+	unsetEnv(t, "PARLEY_ENDPOINT_URL")
+	unsetEnv(t, "PARLEY_API_KEY")
+	session, err := newToolSession(opts, settings{hubURL: hubURL, credential: "k"}, s)
+	if err != nil {
+		t.Fatalf("build the tools of %+v: %v", s, err)
+	}
+	return session
+}
+
+// callTool calls the tool name of session with the parameters input.
+func callTool(t *testing.T, session *toolSession, name string, input any) toolResult {
+	t.Helper()
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session.call(t.Context(), name, raw)
+}
+
+// last is the last request the stub hub got; it fails the test when there
+// is none.
+func (h *stubHub) last(t *testing.T) stubRequest {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.requests) == 0 {
+		t.Fatal("the hub got no request")
+	}
+	return h.requests[len(h.requests)-1]
+}
+
+// requestCount is how many requests the stub hub got.
+func (h *stubHub) requestCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.requests)
+}
+
+// wantFailed checks that r is a failed result with the error code.
+func wantFailed(t *testing.T, r toolResult, code string) {
+	t.Helper()
+	if r.OK || r.Error != code || r.Detail == "" {
+		t.Fatalf("the result is %+v; want a failed one with the error %s and a detail", r, code)
+	}
+}
+
+const changeThree = `{"number":3,"state":"open","title":"One"}`
+
+func TestToolCall_RunsTheCommandAndGivesWhatItPrints(t *testing.T) {
+	hub := newStubHub(t).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, changeThree).
+		answer(http.MethodPost, "/api/v1/workspaces/demo/claims", http.StatusCreated, `{"id":"c1"}`).
+		answer(http.MethodGet, "/api/v1/things", http.StatusOK, `[1,2]`).
+		answer(http.MethodPost, "/api/v1/typed", http.StatusNoContent, "")
+	opts := withProbes(defaultOptions(), probeTyped)
+	s := mcpDefaults()
+	s.groups += ",probe"
+	session := toolSessionOn(t, opts, hub.URL, s)
+
+	t.Run("an object is the data", func(t *testing.T) {
+		r := callTool(t, session, "change_show", map[string]any{"slug": "demo", "number": "3", "include": "stack"})
+		if !r.OK || r.Data["title"] != "One" || r.Data["number"] != 3.0 || r.Error != "" {
+			t.Fatalf("the result is %+v; want the hub's object as data", r)
+		}
+		byTool := hub.last(t)
+		if code, _, stderr := runCLIWith(t, opts, onHub(hub.URL, "change", "show", "demo", "3", "--include", "stack")...); code != 0 {
+			t.Fatalf("the shell command: exit status %d, %s", code, stderr)
+		}
+		byShell := hub.last(t)
+		if byTool.method != byShell.method || byTool.rawPath != byShell.rawPath || byTool.query != byShell.query ||
+			byTool.header.Get("Authorization") != byShell.header.Get("Authorization") || byTool.header.Get("Authorization") == "" {
+			t.Errorf("the tool sent %s %s?%s with %q; the shell command sends %s %s?%s with %q", byTool.method, byTool.rawPath, byTool.query,
+				byTool.header.Get("Authorization"), byShell.method, byShell.rawPath, byShell.query, byShell.header.Get("Authorization"))
+		}
+	})
+	t.Run("a body is the one the shell command sends", func(t *testing.T) {
+		r := callTool(t, session, "claim_create", map[string]any{"slug": "demo", "intent": "fix it; quickly", "paths": "a/**,b.txt", "ttl": "2h"})
+		if !r.OK || r.Data["id"] != "c1" {
+			t.Fatalf("the result is %+v; want the claim", r)
+		}
+		byTool := hub.last(t)
+		runCLIWith(t, opts, onHub(hub.URL, "claim", "create", "demo", "--intent", "fix it; quickly", "--paths", "a/**,b.txt", "--ttl", "2h")...)
+		if byShell := hub.last(t); byTool.body != byShell.body || byTool.body == "" {
+			t.Errorf("the tool sent the body %s; the shell command sends %s", byTool.body, byShell.body)
+		}
+	})
+	t.Run("a value that is not an object is the member result", func(t *testing.T) {
+		r := callTool(t, session, "probe_count", map[string]any{"limit": 2})
+		if want := map[string]any{"result": []any{1.0, 2.0}}; !r.OK || !reflect.DeepEqual(r.Data, want) {
+			t.Errorf("the result is %+v; want the data %v", r, want)
+		}
+		if q := hub.last(t).query; q != "" && !strings.Contains(q, "limit=2") {
+			t.Errorf("the query is %q", q)
+		}
+	})
+	t.Run("nothing printed is the empty object", func(t *testing.T) {
+		r := callTool(t, session, "probe_typed", map[string]any{
+			"key_value": "A=1", "reason": "because", "put": []string{"a=1", "b=2"}, "dry_run": true, "limit": 3, "max_bytes": 1 << 40, "ttl": "90s",
+		})
+		if !r.OK || r.Data == nil || len(r.Data) != 0 {
+			t.Errorf("the result is %+v; want the data {}", r)
+		}
+	})
+	t.Run("an argument that begins with a dash is an argument", func(t *testing.T) {
+		hub.answer(http.MethodGet, "/api/v1/things/-x", http.StatusOK, `{"name":"-x"}`)
+		if r := callTool(t, session, "probe_get", map[string]any{"name": "-x"}); !r.OK || r.Data["name"] != "-x" {
+			t.Errorf("the result is %+v; want the thing -x", r)
+		}
+	})
+}
+
+func TestToolCall_GivesTheWorkspaceOfTheSessionToACallThatNamesNone(t *testing.T) {
+	hub := newStubHub(t).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, changeThree).
+		answer(http.MethodGet, "/api/v1/workspaces/demo--t1/changes/3", http.StatusOK, `{"number":3,"title":"Fork's"}`)
+	requiredOf := func(s mcpSettings, tool string) []string {
+		for _, ct := range toolSessionOn(t, defaultOptions(), hub.URL, s).tools {
+			if ct.name == tool {
+				var schema struct{ Required []string }
+				if err := json.Unmarshal(ct.schema(), &schema); err != nil {
+					t.Fatal(err)
+				}
+				return schema.Required
+			}
+		}
+		t.Fatalf("no tool %s", tool)
+		return nil
+	}
+	fixed := mcpDefaults()
+	fixed.workspace = "demo"
+	for tool, param := range map[string]string{"change_show": "slug", "sandbox_get": "workspace_slug", "fork_create": "parent"} {
+		if slices.Contains(requiredOf(fixed, tool), param) {
+			t.Errorf("with --workspace, %s still requires %s", tool, param)
+		}
+		if !slices.Contains(requiredOf(mcpDefaults(), tool), param) {
+			t.Errorf("without --workspace, %s does not require %s", tool, param)
+		}
+	}
+	session := toolSessionOn(t, defaultOptions(), hub.URL, fixed)
+	if r := callTool(t, session, "change_show", map[string]any{"number": "3"}); !r.OK || hub.last(t).path != "/api/v1/workspaces/demo/changes/3" {
+		t.Errorf("a call without slug: %+v, sent to %s; want the workspace demo", r, hub.last(t).path)
+	}
+	if r := callTool(t, session, "change_show", map[string]any{"slug": "demo--t1", "number": "3"}); !r.OK || r.Data["title"] != "Fork's" {
+		t.Errorf("a call with another slug: %+v; want the fork's change", r)
+	}
+}
+
+func TestToolCall_GivesAnErrorOfTheHubAsAFailedResult(t *testing.T) {
+	hub := newStubHub(t)
+	session := toolSessionOn(t, defaultOptions(), hub.URL, mcpDefaults())
+	const path = "/api/v1/workspaces/demo/changes/3"
+	for _, row := range []struct {
+		name         string
+		status       int
+		body         string
+		code, detail string
+	}{
+		{"an envelope", 404, `{"error":{"code":404,"message":"no such change","error_type":"change_not_found"}}`, "change_not_found", "no such change"},
+		{"a refused credential", 401, `{"error":{"code":401,"message":"unknown credential","error_type":"unauthenticated"}}`, "unauthenticated", "unknown credential"},
+		{"an answer that is no envelope", 502, `<html>bad gateway</html>`, "http_502", ""},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			hub.answer(http.MethodGet, path, row.status, row.body)
+			r := callTool(t, session, "change_show", map[string]any{"slug": "demo", "number": "3"})
+			wantFailed(t, r, row.code)
+			if row.detail != "" && r.Detail != row.detail {
+				t.Errorf("the detail is %q, want the envelope's message %q", r.Detail, row.detail)
+			}
+		})
+	}
+	hub.answer(http.MethodGet, path, http.StatusOK, changeThree)
+	if r := callTool(t, session, "change_show", map[string]any{"slug": "demo", "number": "3"}); !r.OK {
+		t.Errorf("the next call is %+v; want it to succeed", r)
+	}
+}
+
+// probeFailing builds "probe failing": GET /things, with --fail-on-any,
+// whose condition always holds.
+func probeFailing() *cobra.Command {
+	return declare(command{
+		Name: "failing", Description: "Fail on anything", Method: http.MethodGet, Path: "/things", Auth: authUser,
+		FailOn: []failOn{{Name: "any", Description: "exit 3 whatever the answer", Check: func([]byte) (bool, string) { return true, "the condition holds" }}},
+	})
+}
+
+func TestToolCall_GivesAnErrorOfTheCLIAsAFailedResult(t *testing.T) {
+	hub := newStubHub(t).
+		answer(http.MethodDelete, "/api/v1/workspaces/demo", http.StatusNoContent, "").
+		answer(http.MethodGet, "/api/v1/things", http.StatusOK, `{"things":2}`)
+	opts := withProbeGroup(defaultOptions(), probeFailing)
+	s := mcpSettings{groups: "workspace,probe", noCodeMode: true}
+	session := toolSessionOn(t, opts, hub.URL, s)
+
+	t.Run("a command that destroys data, without confirm", func(t *testing.T) {
+		wantFailed(t, callTool(t, session, "workspace_delete", map[string]any{"slug": "demo"}), usageErrorType)
+		wantFailed(t, callTool(t, session, "workspace_delete", map[string]any{"slug": "demo", "confirm": false}), usageErrorType)
+		if n := hub.requestCount(); n != 0 {
+			t.Errorf("%d requests were sent, want none", n)
+		}
+	})
+	t.Run("the same with confirm", func(t *testing.T) {
+		if r := callTool(t, session, "workspace_delete", map[string]any{"slug": "demo", "confirm": true}); !r.OK || hub.last(t).method != http.MethodDelete {
+			t.Errorf("the result is %+v after %s; want the DELETE sent", r, hub.last(t).method)
+		}
+	})
+	t.Run("a condition that holds", func(t *testing.T) {
+		r := callTool(t, session, "probe_failing", map[string]any{"fail_on_any": true})
+		wantFailed(t, r, conditionNotMetType)
+		if r.Data["things"] != 2.0 {
+			t.Errorf("the data is %v; want the document the command printed", r.Data)
+		}
+	})
+	t.Run("a hub that cannot be reached", func(t *testing.T) {
+		gone := newStubHub(t)
+		gone.Close()
+		unreachable := toolSessionOn(t, opts, gone.URL, s)
+		wantFailed(t, callTool(t, unreachable, "workspace_get", map[string]any{"slug": "demo"}), clientErrorType)
+	})
+}
+
+func TestToolCall_RefusesParametersTheToolDoesNotTake(t *testing.T) {
+	hub := newStubHub(t)
+	session := toolSessionOn(t, defaultOptions(), hub.URL, mcpDefaults())
+	for _, row := range []struct {
+		name  string
+		input string
+		names string
+	}{
+		{"a parameter the schema lacks", `{"slug":"demo","number":"3","nope":1}`, "nope"},
+		{"a flag left out of every tool", `{"slug":"demo","number":"3","api_key":"x"}`, "api_key"},
+		{"a boolean given as a string", `{"slug":"demo","number":"3","wait":"yes"}`, "wait"},
+		{"a missing required parameter", `{"slug":"demo"}`, "number"},
+		{"a string given as a number", `{"slug":"demo","number":3}`, "number"},
+		{"an array given as a string", `{"slug":"demo","number":"3","override":["x"]}`, "override"},
+		{"parameters that are not an object", `[1]`, "object"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			r := session.call(t.Context(), "change_land", json.RawMessage(row.input))
+			wantFailed(t, r, usageErrorType)
+			if !strings.Contains(r.Detail, row.names) {
+				t.Errorf("the detail %q does not name %s", r.Detail, row.names)
+			}
+		})
+	}
+	wantFailed(t, session.call(t.Context(), "no_such_tool", json.RawMessage(`{}`)), usageErrorType)
+	if n := hub.requestCount(); n != 0 {
+		t.Errorf("%d requests were sent, want none", n)
+	}
+}
+
+// untouchable is a standard input that fails the test when it is read.
+type untouchable struct{ t *testing.T }
+
+func (u untouchable) Read([]byte) (int, error) {
+	u.t.Error("a tool call read the process's standard input")
+	return 0, io.EOF
+}
+
+func TestToolCall_RefusesAValueThatWouldReadStandardInput(t *testing.T) {
+	hub := newStubHub(t)
+	opts := defaultOptions()
+	opts.stdin = untouchable{t}
+	session := toolSessionOn(t, opts, hub.URL, mcpSettings{groups: "policy,change,issue", noCodeMode: true})
+	for _, row := range []struct {
+		tool  string
+		input map[string]any
+	}{
+		{"policy_set", map[string]any{"slug": "demo", "file": "-"}},
+		{"change_open", map[string]any{"slug": "demo", "source": "feat", "title": "One", "intent": "-"}},
+		{"issue_comment", map[string]any{"slug": "demo", "number": "1", "body_file": "-"}},
+	} {
+		t.Run(row.tool, func(t *testing.T) {
+			wantFailed(t, callTool(t, session, row.tool, row.input), usageErrorType)
+		})
+	}
+	if n := hub.requestCount(); n != 0 {
+		t.Errorf("%d requests were sent, want none", n)
+	}
+}
+
+func TestToolCall_WaitsInsideTheCallForACommandThatCanWait(t *testing.T) {
+	opts := withProbeGroup(defaultOptions(), probeRun)
+	opts.pollInterval = time.Millisecond
+	s := mcpSettings{groups: "probe", noCodeMode: true}
+	t.Run("until the operation ends", func(t *testing.T) {
+		hub := jobHub(t, "queued", jobStates("queued", "running", "done")...)
+		r := callTool(t, toolSessionOn(t, opts, hub.URL, s), "probe_run", map[string]any{"wait": true})
+		if !r.OK || r.Data["state"] != "done" || hub.count(http.MethodGet) != 3 {
+			t.Errorf("the result is %+v after %d polls; want the finished job after three", r, hub.count(http.MethodGet))
+		}
+	})
+	t.Run("without wait, the answer to the start", func(t *testing.T) {
+		hub := jobHub(t, "queued", jobStates("done")...)
+		r := callTool(t, toolSessionOn(t, opts, hub.URL, s), "probe_run", map[string]any{})
+		if !r.OK || r.Data["state"] != "queued" || hub.count(http.MethodGet) != 0 {
+			t.Errorf("the result is %+v after %d polls; want the queued job and no poll", r, hub.count(http.MethodGet))
+		}
+	})
+	t.Run("at most for its timeout", func(t *testing.T) {
+		hub := jobHub(t, "queued", jobStates("running")...)
+		r := callTool(t, toolSessionOn(t, opts, hub.URL, s), "probe_run", map[string]any{"wait": true, "timeout": "1s"})
+		wantFailed(t, r, waitTimeoutType)
+	})
+	t.Run("an operation that fails", func(t *testing.T) {
+		hub := jobHub(t, "queued", jobStates("running", "dead")...)
+		r := callTool(t, toolSessionOn(t, opts, hub.URL, s), "probe_run", map[string]any{"wait": true})
+		wantFailed(t, r, waitFailedType)
+		if r.Data["state"] != "dead" {
+			t.Errorf("the data is %v; want the job's last record", r.Data)
+		}
+	})
+}
+
+func TestToolCall_ReadsAndWritesLocalPathsFromTheWorkingDirectory(t *testing.T) {
+	const files = "/api/v1/workspaces/demo/sandboxes/sbx_1/files"
+	hub := newStubHub(t).
+		answer(http.MethodPut, files, http.StatusOK, `{"path":"/workspace/in.txt","bytes":6}`).
+		handle(http.MethodGet, files, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write([]byte("from the sandbox\n"))
+		})
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("in.txt", []byte("local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := toolSessionOn(t, defaultOptions(), hub.URL, mcpDefaults())
+
+	up := callTool(t, session, "sandbox_upload", map[string]any{"workspace_slug": "demo", "id": "sbx_1", "local_path": "in.txt", "sandbox_path": "in.txt"})
+	if !up.OK || hub.last(t).body != "local\n" {
+		t.Errorf("the upload is %+v and sent %q; want the file's bytes", up, hub.last(t).body)
+	}
+	down := callTool(t, session, "sandbox_download", map[string]any{"workspace_slug": "demo", "id": "sbx_1", "sandbox_path": "out.txt", "local_path": "out.txt"})
+	got, err := os.ReadFile(filepath.Join(dir, "out.txt"))
+	if !down.OK || err != nil || string(got) != "from the sandbox\n" {
+		t.Errorf("the download is %+v and wrote %q (%v); want the sandbox's bytes in the working directory", down, got, err)
+	}
+}
+
+func TestToolCall_EndsACallThatOutlastsItsBound(t *testing.T) {
+	if got := defaultOptions().toolCallBound; got != 30*time.Minute {
+		t.Errorf("a tool call is bounded at %s, want 30m", got)
+	}
+	cancelled := make(chan struct{})
+	hub := newStubHub(t).handle(http.MethodGet, "/api/v1/workspaces/demo", func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		close(cancelled)
+	})
+	opts := defaultOptions()
+	opts.toolCallBound = 50 * time.Millisecond
+	session := toolSessionOn(t, opts, hub.URL, mcpDefaults())
+	start := time.Now()
+	r := callTool(t, session, "workspace_get", map[string]any{"slug": "demo"})
+	if r.OK || r.Error != "timeout" || time.Since(start) > 5*time.Second {
+		t.Errorf("the result is %+v after %s; want a failed one with the error timeout at the bound", r, time.Since(start))
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Error("the hub did not see the request's context end")
 	}
 }

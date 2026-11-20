@@ -85,17 +85,16 @@ func runMCPCommand(c *call) error {
 	s.noCodeMode, _ = fs.GetBool("no-code-mode")
 	s.scriptTimeout, _ = fs.GetString("script-timeout")
 
-	tools, err := commandTools(c.cmd.Root(), s)
+	// The selection is judged first, so that a usage error does not wait
+	// for a hub URL or a credential.
+	session, err := newToolSession(c.opts, settings{}, s)
 	if err != nil {
 		return err
 	}
-	if len(tools) > maxMCPTools {
-		return usageError("the selection has %d tools, more than the %d one session serves; narrow --groups", len(tools), maxMCPTools)
-	}
 	if s.list {
-		return printTools(c, tools)
+		return printTools(c, session.tools)
 	}
-	if _, err := resolveSettings(c.cmd); err != nil {
+	if session.st, err = resolveSettings(c.cmd); err != nil {
 		return err
 	}
 	return clientError("parley mcp serves no session yet; use --list")

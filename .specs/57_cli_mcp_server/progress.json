@@ -3,7 +3,7 @@
   "spec_id": "57",
   "spec_name": "cli_mcp_server",
   "schema_version": 3,
-  "updated_at": "2026-11-20T19:23:28Z",
+  "updated_at": "2026-11-20T19:28:43Z",
   "tasks": [
     {
       "id": 1,
@@ -189,7 +189,153 @@
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_GivesTheWorkspaceOfTheSessionToACallThatNamesNone",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_RunsTheCommandAndGivesWhatItPrints",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_GivesAnErrorOfTheHubAsAFailedResult",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_GivesAnErrorOfTheCLIAsAFailedResult",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_RefusesParametersTheToolDoesNotTake",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.5",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_RefusesAValueThatWouldReadStandardInput",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_WaitsInsideTheCallForACommandThatCanWait",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.7",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_ReadsAndWritesLocalPathsFromTheWorkingDirectory",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.8",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_EndsACallThatOutlastsItsBound",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,

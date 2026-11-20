@@ -150,7 +150,13 @@ func failureOf(resp *response) error {
 		if isHubEnvelope(resp.body) {
 			return &hubError{status: resp.status, body: resp.body}
 		}
-		return clientError("the hub answered %d without an error envelope", resp.status)
+		err := clientError("the hub answered %d without an error envelope", resp.status)
+		// The status goes with the error: a tool call names its error by it.
+		var ce *cliError
+		if errors.As(err, &ce) {
+			ce.status = resp.status
+		}
+		return err
 	case resp.status < 200 || resp.status >= 300:
 		return clientError("the hub answered %d, which is neither a success nor an error", resp.status)
 	}

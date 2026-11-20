@@ -1,0 +1,266 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"strconv"
+	"strings"
+)
+
+// The errors of a tool call that are not a command's own.
+const (
+	// toolTimeoutError is the error of a call that outlasted the bound of
+	// every tool call.
+	toolTimeoutError = "timeout"
+	// toolExitError is the error of a command that ended with an exit status
+	// of its own and no envelope, as parley sandbox exec does for the
+	// command it ran.
+	toolExitError = "command_exit"
+)
+
+// toolResult is what a tool call gives: the tool's data, or why it failed.
+// A failed call is a result too, never a protocol error, so that an agent
+// reads why and goes on.
+type toolResult struct {
+	OK bool
+	// Data is the tool's structured result; never nil.
+	Data map[string]any
+	// Error is the error's type and Detail its message; both "" for a
+	// success.
+	Error, Detail string
+	// Text is the text the tool means for a model, when it gave one.
+	Text string
+}
+
+// failedResult is a failed result with the error code and its detail.
+func failedResult(code, format string, args ...any) toolResult {
+	return toolResult{Data: map[string]any{}, Error: code, Detail: fmt.Sprintf(format, args...)}
+}
+
+// toolSession is the tools of one run of parley mcp and what a call of one
+// runs with: the hub and the credential, read once when the session starts.
+type toolSession struct {
+	opts  options
+	st    settings
+	tools []commandTool
+}
+
+// newToolSession builds the session of the settings s over the command tree
+// of opts, for the hub and the credential of st.
+func newToolSession(opts options, st settings, s mcpSettings) (*toolSession, error) {
+	tools, err := commandTools(newRootCommand(opts), s)
+	if err != nil {
+		return nil, err
+	}
+	if len(tools) > maxMCPTools {
+		return nil, usageError("the selection has %d tools, more than the %d one session serves; narrow --groups", len(tools), maxMCPTools)
+	}
+	return &toolSession{opts: opts, st: st, tools: tools}, nil
+}
+
+// call calls the tool name with the JSON parameters input.
+func (s *toolSession) call(ctx context.Context, name string, input json.RawMessage) toolResult {
+	for _, t := range s.tools {
+		if t.name == name {
+			return s.callCommand(ctx, t, input)
+		}
+	}
+	return failedResult(usageErrorType, "there is no tool %q", name)
+}
+
+// noStdin is the standard input of a command a tool call runs. The
+// process's own carries the session, so a command that would read it is
+// refused: read notes that it tried.
+type noStdin struct{ read bool }
+
+var errNoStdin = errors.New("a tool has no standard input")
+
+func (n *noStdin) Read([]byte) (int, error) {
+	n.read = true
+	return 0, errNoStdin
+}
+
+// callCommand runs the command of t in this process, as the shell runs it:
+// its own run step, with the call's parameters as its arguments and flags,
+// under a context that ends after the bound of a tool call. What the
+// command prints is the result's data, and the error it ends with a failed
+// result.
+func (s *toolSession) callCommand(ctx context.Context, t commandTool, input json.RawMessage) toolResult {
+	args, err := t.commandLine(input)
+	if err != nil {
+		return failedResult(usageErrorType, "%v", err)
+	}
+	args = append([]string{"--endpoint-url=" + s.st.hubURL, "--api-key=" + s.st.credential}, args...)
+
+	opts := s.opts
+	stdin := &noStdin{}
+	opts.stdin = stdin
+	ctx, cancel := context.WithTimeout(ctx, s.opts.toolCallBound)
+	defer cancel()
+	// The command's progress lines and warnings are not part of a result.
+	var stdout bytes.Buffer
+	runErr := execute(ctx, args, &stdout, io.Discard, opts)
+
+	res := toolResult{Data: printedData(stdout.Bytes())}
+	switch {
+	case stdin.read:
+		return failedResult(usageErrorType, "a parameter of %s has the value -, which would read standard input; a tool has none, so give the value itself", t.name)
+	case runErr == nil:
+		res.OK = true
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return failedResult(toolTimeoutError, "the call did not end within %s", s.opts.toolCallBound)
+	default:
+		res.Error, res.Detail = errorOf(runErr)
+	}
+	return res
+}
+
+// printedData is the data of what a command printed: a JSON object as it
+// is, any other JSON value as the member result, and nothing as {}. Output
+// that is not one JSON document, such as the lines of a log, is the member
+// result as text.
+func printedData(out []byte) map[string]any {
+	out = bytes.TrimSpace(out)
+	if len(out) == 0 {
+		return map[string]any{}
+	}
+	var value any
+	if err := json.Unmarshal(out, &value); err != nil {
+		return map[string]any{"result": string(out)}
+	}
+	if object, isObject := value.(map[string]any); isObject {
+		return object
+	}
+	return map[string]any{"result": value}
+}
+
+// errorOf is the error type and the message of the error a command ended
+// with: the hub's envelope's, http_<status> for an answer of the hub
+// without one, or the CLI's own.
+func errorOf(err error) (code, detail string) {
+	var exit *commandExit
+	if errors.As(err, &exit) {
+		return toolExitError, exit.Error()
+	}
+	var he *hubError
+	if errors.As(err, &he) {
+		var env cliEnvelope
+		if json.Unmarshal(he.body, &env) == nil && env.Error.ErrorType != "" {
+			return env.Error.ErrorType, env.Error.Message
+		}
+		return "http_" + strconv.Itoa(he.status), he.Error()
+	}
+	var ce *cliError
+	if errors.As(err, &ce) {
+		if ce.status != 0 {
+			return "http_" + strconv.Itoa(ce.status), ce.message
+		}
+		return ce.errorType, ce.message
+	}
+	return clientErrorType, err.Error()
+}
+
+// commandLine is the command's line for the JSON parameters input: its
+// words, each flag given as the shell takes it, and after -- the arguments
+// in their declared order, so that a value that begins with a dash stays a
+// value. A parameter the tool does not have, one of the wrong type and a
+// missing required one are errors that name it.
+func (t commandTool) commandLine(input json.RawMessage) ([]string, error) {
+	given := map[string]json.RawMessage{}
+	if trimmed := bytes.TrimSpace(input); len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+		if trimmed[0] != '{' || json.Unmarshal(trimmed, &given) != nil {
+			return nil, fmt.Errorf("the parameters of %s must be a JSON object", t.name)
+		}
+	}
+	known := map[string]bool{}
+	line := append([]string{}, t.words...)
+	var positional []string
+	skipped := ""
+	for _, p := range t.params {
+		known[p.name] = true
+		raw, has := given[p.name]
+		if has && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			has = false
+		}
+		if !has {
+			switch {
+			case p.fallback != "":
+				positional = append(positional, p.fallback)
+			case p.required:
+				return nil, fmt.Errorf("%s needs the parameter %s", t.name, p.name)
+			case p.isArg:
+				skipped = p.name
+			}
+			continue
+		}
+		values, err := p.values(raw)
+		if err != nil {
+			return nil, fmt.Errorf("the parameter %s of %s %v", p.name, t.name, err)
+		}
+		if !p.isArg {
+			for _, v := range values {
+				line = append(line, "--"+p.source+"="+v)
+			}
+			continue
+		}
+		if skipped != "" {
+			// The arguments are positional: one cannot be given after one
+			// that was left out.
+			return nil, fmt.Errorf("%s takes the parameter %s only together with %s", t.name, p.name, skipped)
+		}
+		positional = append(positional, values[0])
+	}
+	for name := range given {
+		if !known[name] {
+			return nil, fmt.Errorf("%s has no parameter %s", t.name, name)
+		}
+	}
+	return append(append(line, "--"), positional...), nil
+}
+
+// values are the words the JSON value raw of the parameter gives its flag
+// or argument: one, or one per element of an array.
+func (p toolParam) values(raw json.RawMessage) ([]string, error) {
+	switch p.kind {
+	case "boolean":
+		var v bool
+		if json.Unmarshal(raw, &v) != nil {
+			return nil, errors.New("must be true or false")
+		}
+		return []string{strconv.FormatBool(v)}, nil
+	case "integer":
+		var v json.Number
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if dec.Decode(&v) != nil {
+			return nil, errors.New("must be an integer")
+		}
+		if n, err := v.Int64(); err == nil {
+			return []string{strconv.FormatInt(n, 10)}, nil
+		}
+		// 3.0 is an integer too, as some clients write one.
+		if f, err := v.Float64(); err == nil && f == math.Trunc(f) && math.Abs(f) < 1<<53 {
+			return []string{strconv.FormatInt(int64(f), 10)}, nil
+		}
+		return nil, errors.New("must be an integer")
+	case "array":
+		var v []string
+		if json.Unmarshal(raw, &v) != nil || bytes.TrimSpace(raw)[0] != '[' {
+			return nil, errors.New("must be an array of strings")
+		}
+		return v, nil
+	}
+	var v string
+	if json.Unmarshal(raw, &v) != nil {
+		return nil, errors.New("must be a string")
+	}
+	if strings.ContainsRune(v, 0) {
+		return nil, errors.New("must not hold a NUL character")
+	}
+	return []string{v}, nil
+}

@@ -45,6 +45,10 @@ func (e *hubError) Error() string {
 type cliError struct {
 	errorType string
 	message   string
+	// status is the HTTP status of an answer the error is about, when the
+	// hub answered an error without an envelope; 0 otherwise. The envelope
+	// the shell prints does not show it; a tool call names its error by it.
+	status int
 }
 
 func (e *cliError) Error() string { return e.message }
