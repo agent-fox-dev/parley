@@ -7971,6 +7971,28 @@ is a warning. `internal/cli` imports `internal/buildinfo` and nothing from
 `internal/server`, so the client carries no server code. The commands, output
 and exit statuses are described in [cli.md](cli.md).
 
+`parley mcp` (`mcp.go`, `mcp_call.go`, `mcp_serve.go`, `mcp_sandbox.go`)
+serves the commands as tools. `commandTools` walks the command tree and
+makes a `commandTool` of each selected command from its declaration, so the
+tools cannot drift from the commands: the declaration keeps what a tool
+needs beside what the help shows (`ShowsOnce`, `Interactive`, `Trailing`,
+the annotations of a repeating argument and of a flag that runs until
+interrupted). A call turns its parameters into the command's line
+(`commandLine`) and runs it with `execute`, the part of `run` that returns
+the command's error unprinted, on a tree built for the call, with a
+standard input that refuses to be read; `printedData` and `errorOf` make
+the result. The session (`toolSession`) holds the hub URL and the
+credential read at start. MCP and code mode are agentkit-go's
+(`github.com/agent-fox-dev/agentkit-go`): the tools become `core.Tool`s, a
+`runner.Runner` runs them, `codemode.New` binds `code_mode` to them, and
+the module `mcpserve` serves the runner on standard input and output. Of
+agentkit-go, `internal/cli` imports `runner`, `codemode`, `core`, `schema`
+and `guard`, and `mcpserve`, none of which needs cgo or links a model
+provider, so `parley` still builds with `CGO_ENABLED=0`. A sandbox's tools
+are read from the hub's sandbox tool routes and relayed to them
+(`mcp_sandbox.go`). See the [errata](errata/57_cli_mcp_server.md) for where
+the session follows agentkit-go instead of the package.
+
 ## Build information
 
 `internal/buildinfo` has three package-level string variables, `Version`,

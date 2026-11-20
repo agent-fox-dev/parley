@@ -3271,6 +3271,145 @@ a JSON document, got "{oops"`), and an `--input`, `--output`,
 `--cache-read`, `--duration-ms` or `--limit` that is not an integer are a
 `usage_error` with exit status `2`, before any request is sent.
 
+### `parley mcp`
+
+```
+parley mcp [--list] [--groups <groups>] [--read-only] [--workspace <slug>]
+           [--sandbox <id>] [--no-code-mode] [--script-timeout <duration>]
+```
+
+Serves the commands of `parley` as tools to a harness that speaks MCP, in
+one session on standard input and output, until the harness closes its end;
+the exit status is then `0`. A harness starts it with the endpoint and the
+credential every command takes ([Settings](#settings-the-hub-url-and-the-credential)),
+which are read once, at start: a call the hub later answers `401` is that
+call's failed result. Without one of the two it ends like any command, with
+a `client_error` and exit status `2`. Only the protocol is written to
+stdout. SIGINT and SIGTERM end the session and cancel the calls that run.
+The server names itself `parley`, with the CLI's version, and its
+instructions say in at most three sentences what the tools are, which
+workspace and sandbox the session is fixed on, and that `code_mode` chains
+them.
+
+`--list` prints the tools that would be served as one JSON array of
+`{name, description, input_schema}`, in the order they are served, and
+exits `0` without a session; it needs a hub and a credential only with
+`--sandbox`.
+
+**Which commands are tools.** `--groups` names command groups (the first
+word of a command), separated by commas. A name alone serves the group's
+commands; `name:read` only those whose route is a `GET`. The default is
+`activity,change,claim,fork,land,sandbox,scm,workspace:read`, 68 tools
+today. `--read-only` narrows whatever is selected to `GET` commands.
+
+- Never served, whatever is selected: a command whose `auth` is `admin` or
+  `none`, one that shows a secret once, and one that needs a terminal or
+  runs until interrupted (`sandbox shell`, `events tail`). The groups
+  `admin`, `keys`, `tokens`, `secrets`, `login`, `credential-helper`,
+  `help`, `version` and `mcp` cannot be named: `--groups` with one of them
+  is a `usage_error` naming it.
+- A name that is no group, an empty element and a suffix other than `:read`
+  are a `usage_error` listing the groups.
+- More than 150 tools is a `usage_error` that says how many.
+- A command added to a served group is a tool with nothing else done.
+
+**A command as a tool.** The tool's name is the command's words joined by
+`_`, with `-` replaced by `_` (`change land` is `change_land`), and its
+description the command's. Its parameters are the command's arguments and
+flags, named in lower case with every character that is not a letter or a
+digit replaced by `_` (`sandbox-path` is `sandbox_path`, `KEY=VALUE` is
+`key_value`), and no other parameter is allowed:
+
+| Of the command | Parameter |
+|---|---|
+| an argument | a string, required as the command requires it |
+| an argument that takes every remaining word | an array of strings, one word each |
+| the words after `--` (`sandbox exec`, `sandbox create`, `fork create`) | the array of strings `command`; `sandbox_exec` requires it |
+| a `bool` flag | a boolean |
+| a `string` or `duration` flag | a string (`90s`) |
+| a `stringArray` flag | an array of strings |
+| an `int`, `int64` or `integer` flag | an integer |
+
+The flags `--api-key`, `--endpoint-url`, `--json` and `--poll-interval` are
+no parameters, nor is a flag that makes its command run until interrupted
+(`--follow` of `sandbox logs`). With `--workspace <slug>`, the workspace
+argument of every tool (`slug`, `workspace_slug`, `workspace` or `parent`)
+is optional and is that workspace when a call leaves it out; a call may
+still name another, such as a fork.
+
+**A call** runs the command's own run step in the `parley mcp` process,
+with `--json`, and is bounded at 30 minutes (`timeout` past that).
+
+| The command | The tool's result |
+|---|---|
+| prints a JSON object | that object as the data |
+| prints another JSON value | `{"result": value}` |
+| prints nothing | `{}` |
+| prints what is not one JSON document (the lines of `sandbox logs`) | `{"result": "<text>"}` |
+| ends with the hub's error envelope | failed: `error` is the envelope's `error_type`, `detail` its message |
+| gets an error answer without an envelope | failed: `error` is `http_<status>` |
+| ends with one of the CLI's own errors | failed: `error` is `usage_error`, `client_error`, `wait_failed`, `wait_timeout` or `condition_not_met`; the document printed, if any, is still the data |
+| exits with a status of its own (`sandbox exec`) | failed: `error` is `command_exit`, with the collected answer as the data |
+
+A failed result is a result, not a protocol error. A tool never reads
+standard input or a terminal: a value of `-` where the command would read
+standard input, and a flag such as `--stdin`, are a `usage_error`. A command
+that destroys data needs its `confirm` parameter, as from the shell. A
+command with `--wait` waits inside the call, bounded by its `timeout`
+parameter. A local path (`sandbox_upload`, `sandbox_download`, `--put` of
+`scm_commit`) is one of the machine `parley mcp` runs on, relative to its
+working directory. A command that takes words after `--` takes its
+arguments before it, so there an argument that begins with a dash is a
+`usage_error`.
+
+The calls go through agentkit-go's runner, which checks a call's parameters
+against the tool's schema before the tool runs: a parameter the tool does
+not have, one of the wrong type and a missing required one are a failed
+result with the error `invalid_arguments`, whose detail names each, and
+nothing is sent. A number given for a string parameter is taken as its text.
+
+**Code mode.** `code_mode` is served after the other tools and is bound to
+all of them: one call runs a Starlark script that calls tools as functions,
+some concurrently, and returns only what the script prints and returns. Its
+rules and limits are agentkit-go's, except a script's wall time: 10 minutes,
+or `--script-timeout`, from `1s` to `30m` (a `usage_error` outside that).
+A script's calls are calls like direct ones. `--no-code-mode` leaves it out.
+
+**A sandbox's tools.** `--sandbox <id>` names a sandbox of the workspace of
+`--workspace`, which it needs (`usage_error` without). Its tools are read
+once at start (`GET …/sandboxes/{id}/tools`, see
+[api.md](api.md#the-tools-of-a-sandbox)) and served under their own names,
+descriptions and input schemas after the command tools and before
+`code_mode`, to which they are bound, so one script can search and edit in
+the sandbox and read a change on the hub. If the hub refuses the listing
+(`tools_unavailable`, `sandbox_not_ready`, `sandbox_not_found`, no access),
+`parley mcp` ends with the hub's envelope and exit status `1`. A call is
+one `POST …/tools/{name}`; the hub's result is the tool's as it is, and an
+error the hub answers instead (the sandbox stopped, a limit) a failed
+result with its `error_type`. The hub bounds such a call at 60 seconds.
+
+- The set is the one the hub gives the credential. With `--read-only`,
+  `write_file`, `edit_file`, `execute` and `run_command` are not served.
+- The sandbox's own `code_mode` is not served while the session serves
+  its own; with `--no-code-mode` it is a sandbox tool like the others.
+- A sandbox tool with the name of a command tool is a `client_error`
+  naming both, exit status `2`.
+
+**Stderr.** Before it serves, a session writes one line,
+`{"tools": 69, "code_mode_description_bytes": 35201}`: the number of tools
+and the size of the `code_mode` description, `0` without it. Every tool
+call that ends, a direct one and one a script makes, writes one line with
+the tool, the outcome and the duration, never the arguments or the result:
+
+```json
+{"tool":"change_show","ok":true,"duration_ms":41}
+{"tool":"change_land","ok":false,"error":"wait_timeout","duration_ms":60012}
+```
+
+`error` is the failed result's error, or `not_run` for a call refused
+before its tool ran. In a session, `tools/list` lists the tools by name;
+`--list` prints them in the order they are served.
+
 ### `parley credential-helper`
 
 ```
