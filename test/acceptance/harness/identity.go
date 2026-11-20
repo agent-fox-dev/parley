@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -155,4 +157,21 @@ var AgentScopes = []string{"git:read", "git:write", "changes:read", "changes:wri
 func str(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// SetPolicy replaces the landing policy of workspace with document, a JSON
+// policy, through parley policy set run with credential, and returns the
+// policy's new revision.
+func (h *Hub) SetPolicy(credential, workspace, document string) int {
+	h.t.Helper()
+	file := filepath.Join(h.t.TempDir(), "policy.json")
+	if err := os.WriteFile(file, []byte(document), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+	set := h.CLI(credential, "policy", "set", workspace, "--file", file).Must(h.t)
+	rev := Num(set.JSON()["revision"])
+	if rev < 1 {
+		h.t.Fatalf("parley policy set printed no revision:\n%s", set.Stdout)
+	}
+	return rev
 }
