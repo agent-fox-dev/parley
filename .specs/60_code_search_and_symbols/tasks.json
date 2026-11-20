@@ -1,0 +1,158 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "60",
+  "spec_name": "code_search_and_symbols",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/codeindex/... ./internal/cli/... ./internal/metrics/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "59",
+      "reason": "answers from the index it keeps, reads its record of the indexed commit, queues its builds and waits for them"
+    },
+    {
+      "spec": "20",
+      "reason": "serves two routes under …/scm with the access rule, the read timeout, the caching and the request metric of the source control reads"
+    },
+    {
+      "spec": "15",
+      "reason": "a fork is answered from its parent's index"
+    },
+    {
+      "spec": "58",
+      "reason": "the first flow ends with scm outline, and language names are the outline's"
+    },
+    {
+      "spec": "09",
+      "reason": "declares the two commands through the command helper"
+    },
+    {
+      "spec": "57",
+      "reason": "parley mcp serves the two commands as tools, which a test of its listing asserts"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Serve GET …/scm/code-search from an index at its head",
+      "criteria": [
+        "REQ-1",
+        "REQ-4.2"
+      ],
+      "steps": [
+        "Write the tests of the search's answer, its limits, its refusals, the partial index and the feature off in internal/codeindex, and confirm they fail",
+        "Serve GET /workspaces/:slug/scm/code-search and GET /workspaces/:slug/scm/symbols with the scope and read mark of the source control reads, bounded by [scm].read_timeout and reported under the ops code_search and symbols, which the catalogue's documented values gain; until task 2 the symbols handler answers the checks the two routes share and nothing else",
+        "Write the checks the two routes share once, in the PRD's order: the feature (404 code_index_disabled), the parameters (400), the setting (409 code_index_off), the head (the tree route's error for a workspace without one); at this task a request whose index is not at the head is answered 503 code_index_not_ready with state building, which task 3 replaces with the wait",
+        "Read q (1 to 500 characters, at most 1,024 bytes, not blank) and limit (1 to 25, default 20)",
+        "Ask the index through its code_search tool (Index.Tools, Execute) with query, max_files the limit and context_lines 0, under the request's context; map invalid_arguments with a parse error to 400 invalid_query with the parser's message, search_failed for its timeout and aborted to 503 scm_timeout, and any other error to the hub's internal error",
+        "Build the answer from the tool's data: files in its order, language from outline.LangFor of the path, matches the lines marked as matches in line order, at most 20, text cut to 500 characters; truncated and partial as the tool reports them; workspace and indexed_sha from the component's record",
+        "Describe the route and its errors in docs/api.md"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/hub/codeindex.go",
+        "internal/metrics/catalogue.go",
+        "internal/metrics/catalogue_test.go",
+        "docs/api.md"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Serve GET …/scm/symbols",
+      "criteria": [
+        "REQ-2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5"
+      ],
+      "steps": [
+        "Write the tests of the lookup, its narrowing and its refusals, and the tables over both routes of the setting off, the access rule and the workspace without a head, in internal/codeindex, and confirm they fail",
+        "Read name (1 to 200 characters), exact (a boolean), kind (one of the declaration kinds, lower-cased), path (checked as the source control reads check a path, optional) and limit (1 to 50, default 20)",
+        "Ask the index with Index.Symbols; where path names a file, ask for its directory and keep the matches of that file, unless the index takes a file itself",
+        "When the index does not answer: 409 code_index_partial with indexed_sha for a partial index, 422 too_many_matches otherwise for a built index",
+        "Answer the matches in the index's order cut to limit, each without the index's backend member, with truncated, workspace, indexed_sha and partial false",
+        "Describe the route in docs/api.md"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "docs/api.md"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Wait for the index of the arrival head",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Write the tests of the wait, the queued build, the timeout, the failed build, the race of searches against commits and the metric in internal/codeindex, and confirm they fail",
+        "Read the head of the default branch when the request arrives; when the record is at it, answer; otherwise make sure a build is pending with the component's enqueue function of package 59 and wait for the record to change, woken by the build's settlement and not by polling the store",
+        "Accept an index at the arrival head or at a head the default branch reached after it: after each build compare the record with the arrival head and with the branch's current head",
+        "When the request's context ends at the read timeout while it waits, answer 503 code_index_not_ready with Retry-After: 5, state building, head_sha and indexed_sha; the read wrapper's own 503 scm_timeout must not replace it",
+        "When the last build of the head failed and no attempt is running, answer 503 code_index_not_ready at once with state failed and Retry-After the seconds until the job's next attempt, at least 1",
+        "Hold the index open for the length of the query, so that a build that replaces it meanwhile closes the old one only after the query ended",
+        "Add parley_code_index_wait_seconds, a histogram with the label outcome, to the catalogue and to the counts its tests and test/e2e/metrics_test.go assert, and observe it once per request that reached the rule"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/metrics/catalogue.go",
+        "internal/metrics/catalogue_test.go",
+        "test/e2e/metrics_test.go",
+        "docs/api.md"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Search a fork through its parent, and tag the answers",
+      "criteria": [
+        "REQ-4.1",
+        "REQ-5"
+      ],
+      "steps": [
+        "Write the tests of the fork and of the entity tags in internal/codeindex, and confirm they fail",
+        "For a fork, after the access check on the fork itself, take the parent's setting, head, record and index for every later step, and answer workspace as the parent's slug",
+        "Once the waiting rule is satisfied, give the answer its ETag from the indexed commit, the route and the query's parameters, and the caching headers of a read to revalidate, with the helpers of internal/scm where they can be used from here; answer 304 before the index is asked",
+        "Leave every refusal without ETag and with the caching headers the source control reads give an error",
+        "Describe the fork rule and the caching in docs/api.md and the two routes in the code index part of docs/architecture.md"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/scm/",
+        "docs/api.md",
+        "docs/architecture.md"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Add parley scm code-search and parley scm symbols",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the commands' rows to the tables of internal/cli/scm_test.go and the tools' check to internal/cli/mcp_test.go, and confirm they fail",
+        "Declare code-search among the scm reads of internal/cli/scm.go: the arguments slug and query, the query sent as q, and --limit",
+        "Declare symbols: the arguments slug and name, the switch --exact sending exact=true, and --kind, --path and --limit",
+        "Nothing is done for parley mcp: both are GETs of the group scm",
+        "Describe the two commands in docs/cli.md"
+      ],
+      "touches": [
+        "internal/cli/scm.go",
+        "internal/cli/scm_test.go",
+        "internal/cli/mcp_test.go",
+        "docs/cli.md"
+      ]
+    }
+  ]
+}

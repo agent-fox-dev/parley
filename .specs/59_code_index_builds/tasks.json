@@ -1,0 +1,197 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "59",
+  "spec_name": "code_index_builds",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/codeindex/... ./internal/config/... ./internal/workspace/... ./internal/cli/... ./internal/metrics/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "20",
+      "reason": "serves the status route under …/scm with the access rule, the scope and the request metric of the source control reads"
+    },
+    {
+      "spec": "11",
+      "reason": "registers the setting code_index with the workspace settings registry"
+    },
+    {
+      "spec": "33",
+      "reason": "runs builds as jobs of the queue, one pending per workspace"
+    },
+    {
+      "spec": "03",
+      "reason": "adds a configuration section, its static validation and a start check"
+    },
+    {
+      "spec": "12",
+      "reason": "a sync moves the head of the default branch and must queue a build"
+    },
+    {
+      "spec": "14",
+      "reason": "an archive keeps the index, a delete removes it, a reclone moves the head"
+    },
+    {
+      "spec": "25",
+      "reason": "a land moves the head of the default branch and must queue a build"
+    },
+    {
+      "spec": "34",
+      "reason": "a rebuild of a carry-patch workspace moves the head and must queue a build"
+    },
+    {
+      "spec": "09",
+      "reason": "declares parley scm code-index through the command helper"
+    },
+    {
+      "spec": "58",
+      "reason": "parleyd is built with cgo, which the outlines an index collects need; the command is added beside scm outline"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Read [code_index] and register the workspace setting",
+      "criteria": [
+        "REQ-1",
+        "REQ-2.1"
+      ],
+      "steps": [
+        "Write the tests of the section in a new internal/config/codeindex_test.go, of the setting in internal/workspace/settings_test.go and the fork's settings test, and of the start check and the feature-off hub in a new package internal/codeindex, and confirm they fail",
+        "Register the section code_index with the configuration registry as [scm] is registered in internal/config/scm.go: the four keys with their defaults, an unknown key refused, max_files at least 1, workers 1 to 16, max_size read with config.ParseSize, build_timeout a positive duration, each refusal naming code_index.<key>; a section that is absent leaves the feature off",
+        "Create internal/codeindex with its Component and compose it as a hub part in internal/hub (ADR 01); with the feature off the part registers the setting and the status route and nothing else",
+        "Add github.com/agent-fox-dev/agentkit-go/codesearch to go.mod, at the commit of agentkit-go's main that has Options.IndexDir until a release of the module holds it; confirm cmd/parley still builds with CGO_ENABLED=0 and that none of its dependencies is zoekt or codesearch",
+        "In a start stage, when the feature is on, construct an index on an empty directory and fail the start when the constructor answers codesearch.ErrUnsupported, with one message that names [code_index] and the platform",
+        "Register the setting code_index with the workspace settings registry: default true, a boolean and nothing else, registered whether or not the feature is on",
+        "Describe the section and the setting in docs/configuration.md"
+      ],
+      "touches": [
+        "internal/config/codeindex.go",
+        "internal/config/codeindex_test.go",
+        "internal/codeindex/",
+        "internal/hub/codeindex.go",
+        "internal/hub/hub.go",
+        "internal/workspace/settings_test.go",
+        "internal/fork/",
+        "go.mod",
+        "go.sum",
+        "docs/configuration.md"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Build the tree and the index of a workspace",
+      "criteria": [
+        "REQ-3"
+      ],
+      "steps": [
+        "Write the tests of the tree, of a complete, a partial and a failed build, of the retry and of the workers in internal/codeindex, with a seam in the component that holds or fails a build, and confirm they fail",
+        "Keep one record per workspace in a table the component owns, created by its schema function: the indexed commit, whether the index is partial, the files indexed, the time it was built, and the commit, text and time of the last failure",
+        "Write the tree under <data dir>/code-index/<workspace>/tree from the commit's git objects (git archive of the commit unpacked, or the equivalent in internal/gitrepo), never with a checkout: no .git, no hooks, no filters or attribute conversions, a gitlink left out, a symbolic link written as a link. Write it beside the old tree and swap, so that a failed write leaves the old tree",
+        "Build the index with codesearch.New over workspace.Open of the tree with workspace.NoGlobalExcludes, with MaxFiles, MaxBytes and MaxBuildTime from the section and IndexDir <data dir>/code-index/<workspace>/index, which lies outside the tree; read whether the build is partial and how many files it holds, and close the index that the new one replaces",
+        "Register a handler for the job type code_index with the hub's queue (ADR 09): an attempt reads the head of the default branch as it is then, writes the tree, builds, and writes the record in Settled's transaction; a bound that stops the build is a completed job with partial true, any other error fails the attempt and keeps the previous record and index",
+        "Bound the builds that run at once by [code_index].workers, whatever the queue's own limit: a build that finds no free worker leaves its job queued without counting an attempt",
+        "When the head moves while a failed build waits for its delay, make that job due at once (jobs.Requeue or a follow-up), so the new head is built without the wait",
+        "Count every ended build in parley_code_index_builds_total and observe parley_code_index_build_duration_seconds; add the three metrics of this package to the catalogue and to the counts its tests and test/e2e/metrics_test.go assert"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/gitrepo/",
+        "internal/jobs/",
+        "internal/metrics/catalogue.go",
+        "internal/metrics/catalogue_test.go",
+        "test/e2e/metrics_test.go"
+      ],
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Queue a build whenever the head moves",
+      "criteria": [
+        "REQ-4",
+        "REQ-2.3",
+        "REQ-5.4"
+      ],
+      "steps": [
+        "Write the tests of the create, of one pending build, of the start and of the maintenance pass in internal/codeindex, and the table over the routes that move a head in test/e2e, and confirm they fail",
+        "Give the component one function that queues a build of a repository workspace when it is enabled: jobs.Enqueue, or EnqueueFollowUp beside a running build, a duplicate being success; a fork and a workspace that is not enabled queue nothing",
+        "Call it from a post-push listener registered on the ref writer (ADR 08) for every accepted write that moves the workspace's default branch, which covers a land, a push and the source control API",
+        "Call it where a head is written outside the ref writer: the end of the first clone, a sync, a reclone and a rebuild of a carry-patch workspace, through the hooks or listeners those packages already offer; where one offers none, add the smallest notice to it and record the decision in the ADR of that area",
+        "Call it when the setting code_index of a workspace changes from false to true, from the workspace update's own hook",
+        "At hub start, after the queue has recovered, and in a task registered with the maintenance loop, compare every enabled workspace's record with its head and queue a build where they differ and none is pending",
+        "After a build, compare the head with the commit it built and queue the next build when they differ"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/hub/codeindex.go",
+        "internal/workspace/",
+        "internal/carrypatch/",
+        "test/e2e/code_index_test.go"
+      ],
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Keep the index across restarts and remove it with its workspace",
+      "criteria": [
+        "REQ-5.1",
+        "REQ-5.2",
+        "REQ-5.3",
+        "REQ-2.2",
+        "REQ-4.5"
+      ],
+      "steps": [
+        "Write the tests of the restart, the archive, the delete, the setting turned off and the stray directory in internal/codeindex, and confirm they fail",
+        "At start, open the stored index of every workspace whose record is at its head instead of building it; a stored index that cannot be opened is treated as no index and its build queued",
+        "Register a remover with the workspace service's teardown (ADR 07) that deletes the workspace's record in the delete's transaction; the queue's own remover already deletes its jobs and cancels a running attempt",
+        "Remove the directory of a workspace from the disk after the delete, and in the maintenance task for every directory under the code index directory whose workspace does not exist or is not enabled, closing its index first; a workspace created again under an old slug never sees the old tree",
+        "When the setting code_index turns false, cancel the workspace's pending build and end a running one; the maintenance task removes the record, the tree and the index",
+        "Measure the bytes of the code index directory into parley_code_index_bytes at the end of every build and removal and at start",
+        "Describe the component, its directory layout, its job type and its maintenance task in docs/architecture.md, and write the ADR of the decisions this package made about where a head's move is noticed"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/hub/codeindex.go",
+        "docs/architecture.md",
+        "docs/adr/"
+      ],
+      "depends_on": [
+        3
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve the status route and parley scm code-index",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Write the tests of the status in internal/codeindex, the rows of the command in internal/cli/scm_test.go and internal/cli/mcp_test.go, and confirm they fail",
+        "Serve GET /workspaces/:slug/scm/code-index with the scope and the read mark of the source control reads, reported to parley_scm_requests_total under the op code_index; add the op to the catalogue's documented values",
+        "Answer from the record, the queue and the head: enabled, state as the PRD's decision 9 defines it, head_sha, indexed_sha, partial, files_indexed, built_at and error; for a fork answer for its parent with the parent's slug as workspace; with the feature or the setting off answer enabled false and state off",
+        "Pass the failure text through internal/scrub and cut it to 1,024 bytes on a rune boundary before it is stored",
+        "Declare parley scm code-index among the scm reads of internal/cli/scm.go with the one argument slug",
+        "Describe the route in docs/api.md, the command in docs/cli.md and the three metrics where the metrics are documented"
+      ],
+      "touches": [
+        "internal/codeindex/",
+        "internal/scm/",
+        "internal/cli/scm.go",
+        "internal/cli/scm_test.go",
+        "internal/cli/mcp_test.go",
+        "internal/metrics/catalogue.go",
+        "docs/api.md",
+        "docs/cli.md"
+      ],
+      "depends_on": [
+        2
+      ]
+    }
+  ]
+}
