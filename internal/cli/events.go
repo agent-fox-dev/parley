@@ -56,6 +56,7 @@ func newEventsCommand() *cobra.Command {
 			Method:      http.MethodGet,
 			Path:        "/events",
 			Auth:        authUser,
+			Interactive: true,
 			Flags:       addEventFilterFlags,
 			Run:         tailEvents,
 		}),

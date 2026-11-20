@@ -56,12 +56,19 @@ type command struct {
 	Confirm func(c *call) any `json:"-"`
 	// ShowsOnce marks a command whose result carries a secret the hub
 	// shows only this once.
-	ShowsOnce bool `json:"-"`
+	ShowsOnce bool `json:"shows_once,omitempty"`
+	// Interactive marks a command that needs a terminal or runs until it
+	// is interrupted, which nothing but a person at a shell can use.
+	Interactive bool `json:"interactive,omitempty"`
 	// FailOn are the command's --fail-on-… conditions.
 	FailOn []failOn `json:"-"`
 	// Timeout, when not zero, bounds each of the command's requests in
 	// place of the default of 30 seconds.
 	Timeout time.Duration `json:"-"`
+	// OwnSettings leaves the hub URL and the credential to the command's
+	// run step, which then resolves them itself, for a command that needs
+	// them only in some of its forms.
+	OwnSettings bool `json:"-"`
 	// Wait makes the command one that can wait for the operation it
 	// starts: declare gives it --wait, --timeout and --poll-interval, and
 	// its run step, unless it declares Run, is the shared wait.
@@ -152,7 +159,7 @@ func declare(decl command) *cobra.Command {
 			}
 			// Both settings are resolved before the run step, so a command
 			// that lacks one fails before it sends anything.
-			if decl.Auth != authNone {
+			if decl.Auth != authNone && !decl.OwnSettings {
 				s, err := resolveSettings(cmd)
 				if err != nil {
 					return err
@@ -307,4 +314,14 @@ func optionsFrom(ctx context.Context) options {
 func globalFlag(cmd *cobra.Command, name string) string {
 	value, _ := cmd.Flags().GetString(name)
 	return value
+}
+
+// untilInterruptedAnnotation marks a flag that makes its command run until
+// it is interrupted.
+const untilInterruptedAnnotation = "parley.until_interrupted"
+
+// markUntilInterrupted marks the flag name of fs as one that makes its
+// command run until it is interrupted, such as --follow of a log.
+func markUntilInterrupted(fs *pflag.FlagSet, name string) {
+	_ = fs.SetAnnotation(name, untilInterruptedAnnotation, []string{"true"})
 }

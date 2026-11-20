@@ -100,6 +100,7 @@ func newSandboxCommand() *cobra.Command {
 			Path:        sandboxesRoute + "/:id/attach",
 			Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
 			Auth:        authUser,
+			Interactive: true,
 			Run:         shellInSandbox,
 		}),
 		newSandboxLogsCommand(),
@@ -603,6 +604,7 @@ func newSandboxLogsCommand() *cobra.Command {
 			fs.String("since", "", "print only the lines stored at or after this time, such as 2026-01-02T03:04:05Z")
 			fs.Int("tail", 0, "print only the last n lines, at least 1")
 			fs.Bool("follow", false, "go on printing new lines as they are stored, until the sandbox is deleted or the hub stops")
+			markUntilInterrupted(fs, "follow")
 		},
 		Run: printSandboxLogs,
 	})
