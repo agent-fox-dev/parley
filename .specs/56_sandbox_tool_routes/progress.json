@@ -3,7 +3,7 @@
   "spec_id": "56",
   "spec_name": "sandbox_tool_routes",
   "schema_version": 3,
-  "updated_at": "2026-11-20T14:51:15Z",
+  "updated_at": "2026-11-20T15:01:21Z",
   "tasks": [
     {
       "id": 1,
@@ -874,7 +874,105 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_LeavesOneEventForEveryCallThatStarted",
+              "failed": {
+                "at": "2026-11-20T14:52:58Z",
+                "tree": "9fe814db50000bb36beff3f727908cf8ea111127"
+              },
+              "passed": {
+                "at": "2026-11-20T15:01:20Z",
+                "tree": "17cdd3759468a2cced827a378188f2abdd219cf7"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_KeepsArgumentsAndResultsOutOfItsEvent",
+              "failed": {
+                "at": "2026-11-20T14:52:58Z",
+                "tree": "9fe814db50000bb36beff3f727908cf8ea111127"
+              },
+              "passed": {
+                "at": "2026-11-20T15:01:20Z",
+                "tree": "17cdd3759468a2cced827a378188f2abdd219cf7"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RecordsNothingForARequestThatNeverRan",
+              "failed": {
+                "at": "2026-11-20T14:52:58Z",
+                "tree": "9fe814db50000bb36beff3f727908cf8ea111127"
+              },
+              "passed": {
+                "at": "2026-11-20T15:01:20Z",
+                "tree": "17cdd3759468a2cced827a378188f2abdd219cf7"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.4",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_LeavesOneEventForEveryCallThatStarted",
+              "failed": {
+                "at": "2026-11-20T14:52:58Z",
+                "tree": "9fe814db50000bb36beff3f727908cf8ea111127"
+              },
+              "passed": {
+                "at": "2026-11-20T15:01:20Z",
+                "tree": "17cdd3759468a2cced827a378188f2abdd219cf7"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.5",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMetrics_CountsToolCallsByToolAndOutcome",
+              "failed": {
+                "at": "2026-11-20T14:52:58Z",
+                "tree": "9fe814db50000bb36beff3f727908cf8ea111127"
+              },
+              "passed": {
+                "at": "2026-11-20T15:01:20Z",
+                "tree": "17cdd3759468a2cced827a378188f2abdd219cf7"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.8",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed",
+              "failed": {
+                "at": "2026-11-20T14:52:58Z",
+                "tree": "9fe814db50000bb36beff3f727908cf8ea111127"
+              },
+              "passed": {
+                "at": "2026-11-20T15:01:20Z",
+                "tree": "17cdd3759468a2cced827a378188f2abdd219cf7"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,

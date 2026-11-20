@@ -437,3 +437,294 @@ func TestToolCall_AnswersTheFirstCheckARequestFails(t *testing.T) {
 	default:
 	}
 }
+
+// toolEvents are the tool call events of the sandbox id, oldest first.
+func (h *toolsHub) toolEvents(t *testing.T, id string) []hubEvent {
+	t.Helper()
+	return h.sandboxEvents(t, "parley.sandbox.tool_call", id)
+}
+
+func TestToolCall_LeavesOneEventForEveryCallThatStarted(t *testing.T) {
+	t.Parallel()
+	h := startToolsHub(t, "")
+	session := recordSession
+	id := h.tooled(t, func(rec *sandbox.Record) { rec.SessionID = &session })
+	h.listed(t, id, h.key, nil)
+	h.listed(t, id, h.memberKey, nil)
+	rest := func(cred, tool string, body any) func(t *testing.T) {
+		return func(t *testing.T) { h.tool(t, id, cred, tool, body) }
+	}
+	for _, row := range []struct {
+		name  string
+		setup func(t *testing.T)
+		call  func(t *testing.T)
+		// actor is the user id of the caller.
+		actor string
+		want  map[string]any
+	}{
+		{"a call over REST with the full set that succeeds", nil, rest(h.key, "read_file", nil), h.owner,
+			map[string]any{"tool": "read_file", "ok": true, "via": "rest", "set": "full"}},
+		{"a call over MCP with the read-only set", nil, func(t *testing.T) { toolResultOf(t, h.mcpCall(t, id, h.memberKey, "search_files", nil)) }, h.member,
+			map[string]any{"tool": "search_files", "ok": true, "via": "mcp", "set": "read_only"}},
+		{"a tool that fails", func(*testing.T) {
+			h.tools.SetCall(printing(`{"ok":false,"error":"not_found","detail":"no such file"}`, "", 0))
+		},
+			rest(h.key, "read_file", nil), h.owner,
+			map[string]any{"tool": "read_file", "ok": false, "error": "not_found", "via": "rest", "set": "full"}},
+		{"a tool server that exits 1", func(*testing.T) { h.tools.SetCall(printing("", "boom", 1)) }, rest(h.key, "edit_file", nil), h.owner,
+			map[string]any{"tool": "edit_file", "ok": false, "error": "tool_server_failed", "via": "rest", "set": "full"}},
+		{"a tool server that exits 1 over MCP", func(*testing.T) { h.tools.SetCall(printing("", "boom", 1)) },
+			func(t *testing.T) { wantRPCError(t, h.mcpCall(t, id, h.key, "edit_file", nil), -32603) }, h.owner,
+			map[string]any{"tool": "edit_file", "ok": false, "error": "tool_server_failed", "via": "mcp", "set": "full"}},
+		{"a runtime that cannot run the tool server", func(t *testing.T) {
+			h.rt.FailOperation(runtime.OpExecStream, runtime.ErrUnavailable, "gateway gone")
+			t.Cleanup(func() { h.rt.FailOperation(runtime.OpExecStream, nil, "") })
+		}, rest(h.key, "execute", nil), h.owner,
+			map[string]any{"tool": "execute", "ok": false, "error": "sandbox_runtime_error", "via": "rest", "set": "full"}},
+		{"a script that calls other tools", nil, rest(h.key, "code_mode", map[string]any{"input": map[string]any{"script": "read_file(); search_files()"}}), h.owner,
+			map[string]any{"tool": "code_mode", "ok": true, "via": "rest", "set": "full"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h.tools.SetCall(nil)
+			if row.setup != nil {
+				row.setup(t)
+			}
+			before := len(h.toolEvents(t, id))
+			row.call(t)
+			evs := h.toolEvents(t, id)
+			if len(evs)-before != 1 {
+				t.Fatalf("the call left %d events; want one", len(evs)-before)
+			}
+			e := evs[len(evs)-1]
+			if ms, isNumber := e.metadata["duration_ms"].(float64); !isNumber || ms < 0 {
+				t.Errorf("duration_ms = %v; want a number of at least 0", e.metadata["duration_ms"])
+			}
+			delete(e.metadata, "duration_ms")
+			if !reflect.DeepEqual(e.metadata, row.want) {
+				t.Errorf("the event's metadata is %v; want %v and duration_ms", e.metadata, row.want)
+			}
+			if e.actorType != "api_key" || e.actorID == nil || *e.actorID != row.actor {
+				t.Errorf("the event's actor is %s %v; want the caller's API key", e.actorType, e.actorID)
+			}
+			if e.resourceType != "sandbox" || e.workspace == nil || *e.workspace != "ws" || e.session == nil || *e.session != session {
+				t.Errorf("the event is about %s in %v of the session %v; want the sandbox in ws of %s", e.resourceType, e.workspace, e.session, session)
+			}
+		})
+	}
+	t.Run("a call that outlasts its bound", func(t *testing.T) {
+		_, waiting, _ := h.held()
+		before := len(h.toolEvents(t, id))
+		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"})
+		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		h.clock.Advance(10 * time.Second)
+		receive(t, answered)
+		evs := h.toolEvents(t, id)
+		if len(evs)-before != 1 {
+			t.Fatalf("the call left %d events; want one", len(evs)-before)
+		}
+		want := map[string]any{"tool": "execute", "ok": false, "error": "timeout", "duration_ms": 10000.0, "via": "rest", "set": "full"}
+		if got := evs[len(evs)-1].metadata; !reflect.DeepEqual(got, want) {
+			t.Errorf("the event's metadata is %v; want %v", got, want)
+		}
+	})
+	t.Run("only who may see the workspace reads the events", func(t *testing.T) {
+		outsiderKey := h.IssueKey(t, h.outsider)
+		for _, row := range []struct {
+			name, cred string
+			sees       bool
+		}{{"a member of the org", h.memberKey, true}, {"a user outside the org", outsiderKey, false}} {
+			a := h.call(t, http.MethodGet, "/events/log?limit=200", row.cred, nil)
+			if a.status != http.StatusOK {
+				t.Fatalf("GET /events/log as %s = %d %s; want 200", row.name, a.status, a.body)
+			}
+			if sees := strings.Contains(string(a.body), `"parley.sandbox.tool_call"`); sees != row.sees {
+				t.Errorf("%s sees the tool call events: %v; want %v", row.name, sees, row.sees)
+			}
+		}
+	})
+}
+
+func TestToolCall_KeepsArgumentsAndResultsOutOfItsEvent(t *testing.T) {
+	t.Parallel()
+	const in, out = "IN-7f3a", "OUT-9c1e"
+	h := startToolsHub(t, "")
+	id := h.tooled(t, nil)
+	for _, prints := range []string{
+		`{"ok":true,"data":{"content":"` + out + `"},"text":"` + out + `"}`,
+		`{"ok":false,"error":"not_found","detail":"` + out + `","data":{"path":"` + out + `"}}`,
+	} {
+		h.tools.SetCall(printing(prints, out, 0))
+		decoded(t, h.tool(t, id, h.key, "read_file", map[string]any{"input": map[string]any{"path": in}}), http.StatusOK)
+		toolResultOf(t, h.mcpCall(t, id, h.key, "read_file", map[string]any{"path": in}))
+	}
+	rows, err := h.Store.Main().Query(`SELECT metadata FROM hub_events WHERE type = 'parley.sandbox.tool_call' AND resource_id = ?`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if strings.Contains(raw, in) || strings.Contains(raw, out) {
+			t.Errorf("the event's metadata %s holds an argument or a part of the result", raw)
+		}
+		var meta map[string]any
+		if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+			t.Fatal(err)
+		}
+		for k := range meta {
+			if !slices.Contains([]string{"tool", "ok", "error", "duration_ms", "via", "set"}, k) {
+				t.Errorf("the event's metadata %s has the member %s", raw, k)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil || n != 4 {
+		t.Errorf("read %d events (%v); want the four calls'", n, err)
+	}
+	if log := h.Log.String(); strings.Contains(log, in) || strings.Contains(log, out) {
+		t.Error("the hub's log holds an argument or a part of a result")
+	}
+}
+
+// toolCallSamples are the samples of the tool call counter in the hub's
+// metrics that are above 0, as their label sets.
+func (h *toolsHub) toolCallSamples(t *testing.T) []string {
+	t.Helper()
+	_, body := h.Call(t, http.MethodGet, "/metrics", h.Token, nil)
+	var out []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if labels, value, ok := strings.Cut(line, "} "); ok && strings.HasPrefix(labels, "parley_sandbox_tool_calls_total{") && value != "0" {
+			out = append(out, strings.TrimPrefix(labels, "parley_sandbox_tool_calls_total{")+" "+value)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func TestToolCall_RecordsNothingForARequestThatNeverRan(t *testing.T) {
+	t.Parallel()
+	h := startToolsHub(t, "max_concurrent_execs = 1\n")
+	h.cmds.set("block", h.cmds.blocking("", ""))
+	id := h.tooled(t, nil)
+	stopped := h.tooled(t, func(rec *sandbox.Record) { rec.State = sandbox.StateStopped })
+	for _, row := range []struct {
+		name string
+		call func(t *testing.T) int
+		want int
+	}{
+		{"a listing over REST", func(t *testing.T) int { a, _ := h.list(t, id, h.key); return a.status }, 200},
+		{"a listing over MCP", func(t *testing.T) int { return h.mcp(t, id, h.memberKey, "tools/list", nil, nil).status }, 200},
+		{"a tool outside the caller's set", func(t *testing.T) int { return h.tool(t, id, h.memberKey, "execute", nil).status }, 403},
+		{"a tool no set holds", func(t *testing.T) int { return h.tool(t, id, h.key, "no_such_tool", nil).status }, 404},
+		{"a body that is not a call", func(t *testing.T) int { return h.tool(t, id, h.key, "read_file", json.RawMessage(`[]`)).status }, 400},
+		{"an input over 4 MiB", func(t *testing.T) int {
+			return h.tool(t, id, h.key, "read_file", map[string]any{"input": map[string]any{"p": strings.Repeat("x", 4<<20)}}).status
+		}, 413},
+		{"a stopped sandbox", func(t *testing.T) int { return h.tool(t, stopped, h.key, "read_file", nil).status }, 409},
+		{"a tool outside the set over MCP", func(t *testing.T) int {
+			a := h.mcpCall(t, id, h.memberKey, "execute", nil)
+			wantRPCError(t, a, -32602)
+			return a.status
+		}, 200},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			if got := row.call(t); got != row.want {
+				t.Errorf("answered %d; want %d", got, row.want)
+			}
+		})
+	}
+	t.Run("a call over the sandbox's limit", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		running := h.execing(ctx, id, map[string]any{"command": []string{"block"}}, nil)
+		eventually(t, "the command to wait", func() bool { _, _, w, _ := h.cmds.counts(); return w == 1 })
+		if a := h.tool(t, id, h.key, "read_file", nil); a.status != http.StatusTooManyRequests {
+			t.Errorf("a call over REST = %d %s; want 429", a.status, a.body)
+		}
+		wantRPCError(t, h.mcpCall(t, id, h.key, "read_file", nil), -32000)
+		cancel()
+		<-running
+	})
+	for _, sb := range []string{id, stopped} {
+		if evs := h.toolEvents(t, sb); len(evs) != 0 {
+			t.Errorf("the refused requests left %d tool call events for %s; want none", len(evs), sb)
+		}
+	}
+	if got := h.toolCallSamples(t); len(got) != 0 {
+		t.Errorf("the refused requests were counted as tool calls: %v", got)
+	}
+	// The counter is there to count the next call.
+	eventually(t, "a call to be accepted", func() bool { return h.tool(t, id, h.key, "read_file", nil).status == http.StatusOK })
+	if got := h.toolCallSamples(t); len(got) != 1 {
+		t.Errorf("after one call the counter has the samples %v; want one", got)
+	}
+}
+
+func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
+	t.Parallel()
+	h := startToolsHub(t, "max_concurrent_execs = 1\n")
+	id := h.tooled(t, nil)
+	h.listed(t, id, h.key, nil)
+	_, waiting, killed := h.held()
+	failed := map[string]any{"tool": "execute", "ok": false, "error": "tool_server_failed", "set": "full"}
+	wantEvents := func(t *testing.T, vias ...string) {
+		t.Helper()
+		evs := h.toolEvents(t, id)
+		if len(evs) != len(vias) {
+			t.Fatalf("the sandbox has %d tool call events; want %d", len(evs), len(vias))
+		}
+		for i, via := range vias {
+			delete(evs[i].metadata, "duration_ms")
+			failed["via"] = via
+			if !reflect.DeepEqual(evs[i].metadata, failed) {
+				t.Errorf("event %d has the metadata %v; want %v", i, evs[i].metadata, failed)
+			}
+		}
+	}
+
+	t.Run("when its caller leaves", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		answered := h.sending(ctx, http.MethodPost, toolPath(id, "execute"), h.key, nil)
+		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		cancel()
+		if a := <-answered; a.status != 0 {
+			t.Errorf("the caller got %d %s; want no answer", a.status, a.body)
+		}
+		eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 1 })
+		eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 1 })
+		wantEvents(t, "rest")
+		if left := h.requestFiles(id); len(left) != 0 {
+			t.Errorf("the sandbox still holds the request files %v", left)
+		}
+	})
+	t.Run("when its caller leaves an MCP call", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		answered := h.sending(ctx, http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
+			map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}})
+		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		cancel()
+		<-answered
+		eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 2 })
+		eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 2 })
+		wantEvents(t, "rest", "mcp")
+	})
+	t.Run("when the hub begins to stop", func(t *testing.T) {
+		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil)
+		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		h.Stop()
+		if code := h.ExitCode(t, 10*time.Second); code != 0 {
+			t.Fatalf("the hub stopped with %d; want 0", code)
+		}
+		if a := receive(t, answered); a.status != 0 {
+			t.Errorf("the caller got %d %s; want no answer", a.status, a.body)
+		}
+		if killed.Load() != 3 {
+			t.Errorf("the runtime killed %d tool servers; want 3", killed.Load())
+		}
+		h.Restart(t)
+		wantEvents(t, "rest", "mcp", "rest")
+	})
+}

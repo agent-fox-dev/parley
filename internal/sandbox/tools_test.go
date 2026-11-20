@@ -267,8 +267,8 @@ func TestToolList_ChangesNothingAndNeedsNoPlaceAmongTheCommands(t *testing.T) {
 	if evs := h.sandboxEvents(t, "parley.sandbox.tool_call", id); len(evs) != 0 {
 		t.Errorf("the listings left %d tool call events; want none", len(evs))
 	}
-	if _, body := h.Call(t, http.MethodGet, "/metrics", h.Token, nil); bytes.Contains(body, []byte("parley_sandbox_tool_calls_total{")) {
-		t.Errorf("the listings were counted as tool calls:\n%s", body)
+	if got := h.toolCallSamples(t); len(got) != 0 {
+		t.Errorf("the listings were counted as tool calls: %v", got)
 	}
 	select {
 	case a := <-running:

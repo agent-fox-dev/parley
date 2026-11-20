@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/agent-fox-dev/parley/internal/event"
+	"github.com/agent-fox-dev/parley/internal/identity"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/server"
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
@@ -87,9 +89,47 @@ type toolResult struct {
 	Text *string `json:"text,omitempty"`
 }
 
+// EventToolCall is written when a tool call that started in a sandbox ends.
+// It names the tool, how the call ended and how long it took, never the
+// call's arguments or its result, which may hold file contents and secrets.
+const EventToolCall = "parley.sandbox.tool_call"
+
+// The metrics of the tool calls.
+const (
+	// ToolCallsMetric counts the tool calls that started in a sandbox,
+	// under the labels tool and outcome (a toolOutcome… value).
+	ToolCallsMetric = "parley_sandbox_tool_calls_total"
+	// ToolCallSecondsMetric observes how long each of them took, in
+	// seconds, under the label tool.
+	ToolCallSecondsMetric = "parley_sandbox_tool_call_duration_seconds"
+)
+
+// The outcomes of a tool call: the tool gave a result with ok true, one
+// with ok false, the call outlasted its bound, or it gave no result.
+const (
+	toolOutcomeOK      = "ok"
+	toolOutcomeError   = "tool_error"
+	toolOutcomeTimeout = "timeout"
+	toolOutcomeFailed  = "failed"
+)
+
+// The routes a tool call comes through, as its event names them.
+const (
+	viaREST = "rest"
+	viaMCP  = "mcp"
+)
+
+// eventTimeout bounds the write of a call's event, which runs after the
+// caller may have left.
+const eventTimeout = 5 * time.Second
+
 // toolCall is one call of one tool, through either route.
 type toolCall struct {
-	rec Record
+	// via is viaREST or viaMCP, slug the workspace the request names and
+	// caller who sent it.
+	via, slug string
+	caller    identity.Principal
+	rec       Record
 	// set is the caller's tool set and tool the tool's name.
 	set, tool string
 	// input is the tool's input, a JSON object.
@@ -199,7 +239,10 @@ func (c *toolCaller) serve(w http.ResponseWriter, r *http.Request, u useRequest)
 	if _, err := c.lookup(r.Context(), u.rec, u.set, name); err != nil {
 		return err
 	}
-	res, ms, err := c.call(r, toolCall{rec: u.rec, set: u.set, tool: name, input: u.tool.input, bound: c.bound(u.tool.timeout)})
+	res, ms, err := c.call(r, toolCall{
+		via: viaREST, slug: u.slug, caller: u.caller, rec: u.rec, set: u.set, tool: name,
+		input: u.tool.input, bound: c.bound(u.tool.timeout),
+	})
 	switch {
 	case errors.Is(err, errToolBusy):
 		// No Retry-After: the limit is a number of commands, not a rate.
@@ -239,6 +282,7 @@ func (c *toolCaller) call(r *http.Request, tc toolCall) (res toolResult, ms int6
 		now := s.deps.Now()
 		ms = now.Sub(started).Milliseconds()
 		s.touch(r.Context(), id, now)
+		c.record(r.Context(), tc, res, err, e.timedOut.Load(), now.Sub(started))
 	}()
 
 	file, err := newToolRequestFile()
@@ -314,6 +358,47 @@ func (c *toolCaller) call(r *http.Request, tc toolCall) (res toolResult, ms int6
 		return toolResult{}, 0, s.toolServerFailed(r.Context(), id, "the tool server did not answer the call of "+tc.tool+": "+problem)
 	}
 	return res, 0, nil
+}
+
+// record writes the event of a call that started and has ended, and counts
+// it in the two metrics. res and err are what the call returned, timedOut
+// whether its bound passed, and took how long it ran. The event's metadata
+// is built from six values the hub decides, so that nothing of the call's
+// arguments or result can reach it. A failure to write the event is logged
+// and changes nothing about the call.
+func (c *toolCaller) record(ctx context.Context, tc toolCall, res toolResult, err error, timedOut bool, took time.Duration) {
+	s := c.s
+	meta := map[string]any{"tool": tc.tool, "ok": false, "duration_ms": took.Milliseconds(), "via": tc.via, "set": tc.set}
+	outcome := toolOutcomeFailed
+	var answer *server.Error
+	switch {
+	case err == nil && res.OK:
+		meta["ok"], outcome = true, toolOutcomeOK
+	case err == nil && timedOut:
+		meta["error"], outcome = toolErrorTimeout, toolOutcomeTimeout
+	case err == nil:
+		meta["error"], outcome = res.Error, toolOutcomeError
+	case errors.As(err, &answer) || errors.Is(err, errToolAbandoned):
+		// A call nobody waits for any more gave no result either.
+		meta["error"] = errorTypeToolServerFailed
+	default:
+		meta["error"] = errorTypeRuntime
+	}
+	_ = s.deps.Recorder.Add(ToolCallsMetric, map[string]string{"tool": tc.tool, "outcome": outcome}, 1)
+	_ = s.deps.Recorder.Observe(ToolCallSecondsMetric, map[string]string{"tool": tc.tool}, took.Seconds())
+
+	in := event.Input{
+		Type: EventToolCall, Workspace: &tc.rec.Workspace, ActorType: actorOf(tc.caller),
+		ResourceType: "sandbox", ResourceID: tc.rec.ID, SessionID: tc.rec.SessionID, Metadata: meta,
+	}
+	if tc.caller.User != nil {
+		in.ActorID = &tc.caller.User.ID
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventTimeout)
+	defer cancel()
+	if _, err := s.deps.Events.EmitNow(ctx, in); err != nil {
+		s.logger().Error("cannot write a tool call's event", "sandbox_id", tc.rec.ID, "tool", tc.tool, "error", s.scrub(err.Error()))
+	}
 }
 
 // remove removes the request file of a call from the sandbox id. The

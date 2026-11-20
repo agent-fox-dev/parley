@@ -150,7 +150,10 @@ func (c *toolCaller) mcpHandler(r *http.Request, u useRequest, d toolDefinition)
 		}
 		// The request's context, not the handler's, says whether the caller
 		// is still there: the SDK does not tie the two for every client.
-		res, _, err := c.call(r, toolCall{rec: u.rec, set: u.set, tool: d.Name, input: input, bound: c.bound(mcpToolTimeout)})
+		res, _, err := c.call(r, toolCall{
+			via: viaMCP, slug: u.slug, caller: u.caller, rec: u.rec, set: u.set, tool: d.Name,
+			input: input, bound: c.bound(mcpToolTimeout),
+		})
 		switch {
 		case errors.Is(err, errToolBusy):
 			return nil, &jsonrpc.Error{Code: codeSandboxBusy, Message: "sandbox busy"}
