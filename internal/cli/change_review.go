@@ -76,6 +76,7 @@ func newChangeApprovalsCommand() *cobra.Command {
 		Flags: func(fs *pflag.FlagSet) {
 			fs.String("version", "", versionUsage)
 			fs.String("withdraw", "", "withdraw the verdict with this id instead of listing")
+			markWrites(fs, "withdraw")
 		},
 		Run: func(c *call) error {
 			fs := c.cmd.Flags()

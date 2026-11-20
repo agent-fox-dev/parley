@@ -3,31 +3,738 @@
   "spec_id": "57",
   "spec_name": "cli_mcp_server",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-20T19:54:58Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_PrintsTheDefaultSelectionAsTools",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ServesTheGroupsNamed",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_NeverServesWhatAdministersTheHubShowsASecretOrNeedsATerminal",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesAGroupItNeverServes",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.5",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesAGroupItDoesNotKnow",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_NarrowsTheSelectionToReadingCommandsWithReadOnly",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.7",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesMoreThan150Tools",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.8",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ServesACommandOfAGroupWithNothingSaidAboutIt",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_NamesAndDescribesEachToolAfterItsCommand",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_GivesEachToolItsCommandsArgumentsAndFlagsAsParameters",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_LeavesOutTheFlagsNoToolCanUse",
+              "failed": {
+                "at": "2026-11-20T19:19:58Z",
+                "tree": "dc354d8ba4846e5da695573ad36c62f04734bd15"
+              },
+              "passed": {
+                "at": "2026-11-20T19:23:28Z",
+                "tree": "f136a85ee00360b9e250e9d91128824696e4c6e6"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_GivesTheWorkspaceOfTheSessionToACallThatNamesNone",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_RunsTheCommandAndGivesWhatItPrints",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_GivesAnErrorOfTheHubAsAFailedResult",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_GivesAnErrorOfTheCLIAsAFailedResult",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_RefusesParametersTheToolDoesNotTake",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.5",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_RefusesAValueThatWouldReadStandardInput",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_WaitsInsideTheCallForACommandThatCanWait",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.7",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_ReadsAndWritesLocalPathsFromTheWorkingDirectory",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.8",
+          "tests": [
+            {
+              "test": "./internal/cli:TestToolCall_EndsACallThatOutlastsItsBound",
+              "failed": {
+                "at": "2026-11-20T19:25:22Z",
+                "tree": "19d464a539f5209db5ee3a5aa4c218f9f00f0467"
+              },
+              "passed": {
+                "at": "2026-11-20T19:28:41Z",
+                "tree": "d8c14f38b7bbcf5933e2ed007e5ac6fdb93899d5"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_ServesACommandToolThroughTheRunnerAsTheSessionCallsIt",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            },
+            {
+              "test": "./test/e2e:TestMCP_ServesTheCommandsAsToolsToAHarnessOnStandardInputAndOutput",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_InstructsTheHarnessInAtMostThreeSentences",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            },
+            {
+              "test": "./test/e2e:TestMCP_ServesTheCommandsAsToolsToAHarnessOnStandardInputAndOutput",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "no_red": "parley mcp resolves its settings as every command does since the task that declared it, before it serves; the test pins that this stays so once it serves",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_EndsWithoutAnEndpointOrACredentialBeforeItServes",
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_WritesOneLineToStderrForEveryToolCall",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_EndsItsSessionAndItsCallsOnASignal",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_KeepsTheCredentialItReadAtStart",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ListsCodeModeAfterTheOtherTools",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestCodeMode_ChainsToolCallsInOneScript",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestCodeMode_MakesAScriptsCallAsADirectCallIsMade",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestCodeMode_BoundsAScriptByTheScriptTimeout",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesAScriptTimeoutOutOfRange",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.5",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ListsCodeModeAfterTheOtherTools",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.6",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_SaysAtStartHowManyToolsItServesAndWhatCodeModeCosts",
+              "failed": {
+                "at": "2026-11-20T19:36:48Z",
+                "tree": "b4120e3655d46124dc5c1652d50f0765796fbac9"
+              },
+              "passed": {
+                "at": "2026-11-20T19:41:54Z",
+                "tree": "90607ae89dd91f74fb31133e890c5bdeccad76f0"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_AreServedBesideTheCommandToolsAndBoundToCodeMode",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_RelayACallToTheHubAndGiveItsResultAsItIs",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_GiveAnErrorOfTheHubAsAFailedResult",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesASandboxWithoutAWorkspace",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.5",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_EndsWithTheHubsRefusalWhenItCannotReadTheSandboxsTools",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesASandboxToolNamedLikeAnotherTool",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.7",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_AreOnlyTheOnesThatChangeNothingWithReadOnly",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_AnAgentLandsAChangeThroughToolCalls",
+              "passed": {
+                "at": "2026-11-20T19:54:56Z",
+                "tree": "f1c10cf42429c5bcf6f4bc61cb6a90a9b614f2e4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSandboxUse_OneScriptWorksInASandboxAndOnTheHub",
+              "passed": {
+                "at": "2026-11-20T19:54:56Z",
+                "tree": "f1c10cf42429c5bcf6f4bc61cb6a90a9b614f2e4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-3",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_AReadOnlyAssistantReadsAChangeAndAnAdminSelectionIsRefused",
+              "passed": {
+                "at": "2026-11-20T19:54:56Z",
+                "tree": "f1c10cf42429c5bcf6f4bc61cb6a90a9b614f2e4"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

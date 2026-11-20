@@ -30,6 +30,16 @@ type argSpec struct {
 	Repeats bool `json:"-"`
 }
 
+// trailingWords are the words a command takes after -- on its line, such as
+// the command parley sandbox exec runs. They are no argument of the
+// declaration, since they are not counted with the arguments; the
+// declaration names them so that a tool can give them.
+type trailingWords struct {
+	// Name names the words, "command" for a command and its arguments.
+	Name     string `json:"name"`
+	Required bool   `json:"required"`
+}
+
 // command is the declaration of one parley command: everything that differs
 // from one command to the next. Every command is declared through declare,
 // so that each behaves alike on what this declaration does not say (ADR 02).
@@ -56,12 +66,26 @@ type command struct {
 	Confirm func(c *call) any `json:"-"`
 	// ShowsOnce marks a command whose result carries a secret the hub
 	// shows only this once.
-	ShowsOnce bool `json:"-"`
+	ShowsOnce bool `json:"shows_once,omitempty"`
+	// PrintsSecret marks a command whose result carries a secret the hub
+	// shows only once and that says so itself, without ShowsOnce's warning:
+	// one that prints the secret only in some of its forms.
+	PrintsSecret bool `json:"prints_secret,omitempty"`
+	// Interactive marks a command that needs a terminal or runs until it
+	// is interrupted, which nothing but a person at a shell can use.
+	Interactive bool `json:"interactive,omitempty"`
 	// FailOn are the command's --fail-on-… conditions.
 	FailOn []failOn `json:"-"`
 	// Timeout, when not zero, bounds each of the command's requests in
 	// place of the default of 30 seconds.
 	Timeout time.Duration `json:"-"`
+	// Trailing names the words the command takes after --, if it takes
+	// any; the command reads them itself.
+	Trailing *trailingWords `json:"trailing,omitempty"`
+	// OwnSettings leaves the hub URL and the credential to the command's
+	// run step, which then resolves them itself, for a command that needs
+	// them only in some of its forms.
+	OwnSettings bool `json:"-"`
 	// Wait makes the command one that can wait for the operation it
 	// starts: declare gives it --wait, --timeout and --poll-interval, and
 	// its run step, unless it declares Run, is the shared wait.
@@ -116,6 +140,10 @@ const (
 	declarationAnnotation = "parley.declaration"
 	// groupAnnotation marks a command group.
 	groupAnnotation = "parley.group"
+	// repeatsAnnotation marks a command whose last argument takes every
+	// remaining word. The JSON help does not show it, so the declaration
+	// kept as JSON does not hold it.
+	repeatsAnnotation = "parley.repeats"
 )
 
 // declare builds the cobra command of decl. It keeps decl in the command's
@@ -152,7 +180,7 @@ func declare(decl command) *cobra.Command {
 			}
 			// Both settings are resolved before the run step, so a command
 			// that lacks one fails before it sends anything.
-			if decl.Auth != authNone {
+			if decl.Auth != authNone && !decl.OwnSettings {
 				s, err := resolveSettings(cmd)
 				if err != nil {
 					return err
@@ -167,6 +195,9 @@ func declare(decl command) *cobra.Command {
 			}
 			return sendAndPrint(c)
 		},
+	}
+	if n := len(decl.Args); n > 0 && decl.Args[n-1].Repeats {
+		cmd.Annotations[repeatsAnnotation] = "true"
 	}
 	if decl.Flags != nil {
 		decl.Flags(cmd.Flags())
@@ -187,6 +218,9 @@ func declarationOf(cmd *cobra.Command) command {
 	if encoded, ok := cmd.Annotations[declarationAnnotation]; ok {
 		// declare wrote it, so it decodes.
 		_ = json.Unmarshal([]byte(encoded), &decl)
+	}
+	if n := len(decl.Args); n > 0 && cmd.Annotations[repeatsAnnotation] == "true" {
+		decl.Args[n-1].Repeats = true
 	}
 	return decl
 }
@@ -307,4 +341,25 @@ func optionsFrom(ctx context.Context) options {
 func globalFlag(cmd *cobra.Command, name string) string {
 	value, _ := cmd.Flags().GetString(name)
 	return value
+}
+
+// untilInterruptedAnnotation marks a flag that makes its command run until
+// it is interrupted.
+const untilInterruptedAnnotation = "parley.until_interrupted"
+
+// markUntilInterrupted marks the flag name of fs as one that makes its
+// command run until it is interrupted, such as --follow of a log.
+func markUntilInterrupted(fs *pflag.FlagSet, name string) {
+	_ = fs.SetAnnotation(name, untilInterruptedAnnotation, []string{"true"})
+}
+
+// writesAnnotation marks a flag that makes a command of a GET route send a
+// request that changes the hub.
+const writesAnnotation = "parley.writes"
+
+// markWrites marks the flag name of fs as one that makes its command write
+// to the hub although the command's route is a GET, such as --withdraw of a
+// command that lists verdicts.
+func markWrites(fs *pflag.FlagSet, name string) {
+	_ = fs.SetAnnotation(name, writesAnnotation, []string{"true"})
 }

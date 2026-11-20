@@ -37,12 +37,13 @@ func newEventWebhookCommand() *cobra.Command {
 	itemArgs := []argSpec{slugArg, webhookIDArg}
 	return group("webhook", "Subscribe a URL to a workspace's events, and see and resend what the hub delivered to it",
 		declare(command{
-			Name:        "create",
-			Description: "Subscribe a URL to the events of a workspace and its task forks; prints the signing secret, shown once",
-			Method:      http.MethodPost,
-			Path:        eventWebhooks,
-			Args:        []argSpec{slugArg},
-			Auth:        authUser,
+			Name:         "create",
+			Description:  "Subscribe a URL to the events of a workspace and its task forks; prints the signing secret, shown once",
+			Method:       http.MethodPost,
+			Path:         eventWebhooks,
+			Args:         []argSpec{slugArg},
+			Auth:         authUser,
+			PrintsSecret: true,
 			Flags: func(fs *pflag.FlagSet) {
 				fs.String("url", "", "the URL the hub posts each event to")
 				_ = cobra.MarkFlagRequired(fs, "url")
@@ -100,13 +101,14 @@ func newEventWebhookCommand() *cobra.Command {
 			},
 		}),
 		declare(command{
-			Name:        "rotate-secret",
-			Description: "Replace an event webhook's signing secret; prints the new one, shown once",
-			Method:      http.MethodPost,
-			Path:        eventWebhook + "/rotate-secret",
-			Args:        itemArgs,
-			Auth:        authUser,
-			Run:         sendShowingSecret(func(*pflag.FlagSet) any { return nil }),
+			Name:         "rotate-secret",
+			Description:  "Replace an event webhook's signing secret; prints the new one, shown once",
+			Method:       http.MethodPost,
+			Path:         eventWebhook + "/rotate-secret",
+			Args:         itemArgs,
+			Auth:         authUser,
+			PrintsSecret: true,
+			Run:          sendShowingSecret(func(*pflag.FlagSet) any { return nil }),
 		}),
 		declare(command{
 			Name:        "ping",

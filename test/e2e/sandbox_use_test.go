@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -702,5 +703,71 @@ func TestSandboxUse_AScriptSearchesOverRESTAndASandboxWithoutToolsRefusesIt(t *t
 	}
 	if r := h.object(t, http.MethodPost, plainPath+"/exec", map[string]any{"command": []string{"true"}}, http.StatusOK); r["exit_code"] != 0.0 {
 		t.Errorf("exec in the sandbox without tools = %v; want exit_code 0", r)
+	}
+}
+
+// A harness started parley mcp for a fork and its sandbox: one script
+// searches and edits in the sandbox, runs a command there, and reads a
+// change on the hub.
+func TestSandboxUse_OneScriptWorksInASandboxAndOnTheHub(t *testing.T) {
+	parallel(t)
+	h := startSandboxToolsHub(t)
+	h.write(t, h.id, "main.go", "package main // TODO\n")
+	local := filepath.Join(t.TempDir(), "x.txt")
+	if err := os.WriteFile(local, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r := h.parley(t, "scm", "commit", h.fork, "--branch", "feat", "--base", "main", "--message", "Add x", "--put", "x.txt="+local); r.code != 0 {
+		t.Fatalf("scm commit: %s", r.stderr)
+	}
+	opened := h.parley(t, "change", "open", "demo", "--source", "feat", "--source-workspace", h.fork, "--intent", "why")
+	var change struct {
+		Number int `json:"number"`
+	}
+	if opened.code != 0 || json.Unmarshal([]byte(opened.stdout), &change) != nil || change.Number == 0 {
+		t.Fatalf("change open: %s %s", opened.stdout, opened.stderr)
+	}
+
+	p := startMCP(t, h.URL(""), h.key, "--workspace", h.fork, "--sandbox", h.id)
+	names := p.toolNames(t)
+	sandboxTools := 0
+	for _, d := range runtimetest.ToolDefinitions(false) {
+		if d.Name != "code_mode" && slices.Contains(names, d.Name) {
+			sandboxTools++
+		}
+	}
+	// The sandbox's own code_mode has the name of the session's, which the
+	// stand-in lists too; the hub's twelve others are served beside the
+	// commands.
+	if sandboxTools != 12 || !slices.Contains(names, "change_show") || !slices.Contains(names, "code_mode") {
+		t.Fatalf("the session serves %d of the sandbox's tools among %v; want the twelve, the commands and code_mode", sandboxTools, names)
+	}
+	out := p.script(t, fmt.Sprintf(`
+def main():
+    found = search_files(pattern="TODO")
+    edited = edit_file(path="main.go", old="// TODO", new="// done")
+    ran = execute(command="go test ./...")
+    change = change_show(slug="demo", number="%d")
+    for r in [found, edited, ran, change]:
+        if is_error(r):
+            return "failed: " + r.error + " " + r.detail
+    return "matches=" + ",".join(found["matches"]) + " state=" + change["state"]
+`, change.Number))
+	if !strings.Contains(out, "matches=main.go state=open") {
+		t.Fatalf("the script returned %q; want the match and the change's state", out)
+	}
+	if status, body := h.send(t, http.MethodGet, h.sandboxPath("/files?path=main.go"), "", nil); status != http.StatusOK || string(body) != "package main // done\n" {
+		t.Errorf("main.go = %d %q; want the edit", status, body)
+	}
+	events := h.toolCallEvents(t, h.key, h.id)
+	var called []string
+	for _, e := range events {
+		called = append(called, e["tool"].(string))
+		if e["via"] != "rest" || e["set"] != "full" {
+			t.Errorf("the event %v; want a call over REST with the full set", e)
+		}
+	}
+	if want := []string{"search_files", "edit_file", "execute"}; !slices.Equal(called, want) {
+		t.Errorf("the hub recorded the sandbox tool calls %v, want %v", called, want)
 	}
 }

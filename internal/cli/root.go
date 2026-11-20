@@ -42,6 +42,8 @@ type options struct {
 	// sends its requests through; tests read there the deadline each
 	// request runs under, which no test can wait out.
 	transport func(http.RoundTripper) http.RoundTripper
+	// toolCallBound bounds one tool call of parley mcp (30 minutes).
+	toolCallBound time.Duration
 }
 
 func defaultOptions() options {
@@ -52,6 +54,7 @@ func defaultOptions() options {
 		loginWait:      120 * time.Second,
 		requestTimeout: defaultRequestTimeout,
 		reconnectWait:  sleepUnlessDone,
+		toolCallBound:  30 * time.Minute,
 	}
 }
 
@@ -94,6 +97,18 @@ func RunWith(ctx context.Context, args []string, stdout, stderr io.Writer, h Hoo
 // ended with, if any, as one error envelope on stderr, and returns the exit
 // status that error maps to.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer, opts options) int {
+	err := execute(ctx, args, stdout, stderr, opts)
+	if err != nil {
+		printError(stderr, err)
+	}
+	return exitCode(err)
+}
+
+// execute runs the command args name on a command tree built for this run
+// and returns the error the command ended with, unprinted: the shell's run
+// prints it as an envelope, and a tool call of parley mcp makes a result
+// of it.
+func execute(ctx context.Context, args []string, stdout, stderr io.Writer, opts options) error {
 	root := newRootCommand(opts)
 	if args == nil {
 		// cobra would read the process's own arguments instead.
@@ -102,11 +117,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, opts opti
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
-	err := root.ExecuteContext(withOptions(ctx, opts))
-	if err != nil {
-		printError(stderr, err)
-	}
-	return exitCode(err)
+	return root.ExecuteContext(withOptions(ctx, opts))
 }
 
 // newRootCommand builds the command tree afresh, so no flag value survives
@@ -130,7 +141,7 @@ func newRootCommand(opts options) *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError("%v", err) })
 
 	installHelp(root)
-	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newKeysCommand(), newTokensCommand(), newSandboxCommand(), newEventsCommand(), newSecretsCommand(), newVarsCommand(), newWorkspaceCommand(), newForkCommand(), newChangeCommand(), newActivityCommand(), newClaimCommand(), newPatchCommand(), newRebuildCommand(), newRerereCommand(), newLandCommand(), newPolicyCommand(), newSCMCommand(), newForgeCommand(), newEventWebhookCommand(), newIssueCommand(), newLabelCommand(), newPRCommand(), newSessionCommand(), newAuditCommand(), newCredentialHelperCommand(), newAdminCommand())
+	root.AddCommand(newVersionCommand(), newLoginCommand(), newUserCommand(), newOrgsCommand(), newKeysCommand(), newTokensCommand(), newSandboxCommand(), newEventsCommand(), newSecretsCommand(), newVarsCommand(), newWorkspaceCommand(), newForkCommand(), newChangeCommand(), newActivityCommand(), newClaimCommand(), newPatchCommand(), newRebuildCommand(), newRerereCommand(), newLandCommand(), newPolicyCommand(), newSCMCommand(), newForgeCommand(), newEventWebhookCommand(), newIssueCommand(), newLabelCommand(), newPRCommand(), newSessionCommand(), newAuditCommand(), newCredentialHelperCommand(), newAdminCommand(), newMCPCommand())
 	for _, build := range opts.extra {
 		root.AddCommand(build())
 	}

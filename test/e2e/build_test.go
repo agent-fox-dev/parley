@@ -80,6 +80,23 @@ func TestBuild_RunsTheBuiltBinaries(t *testing.T) {
 		}
 	})
 
+	t.Run("parley builds without a C toolchain and lists its tools", func(t *testing.T) {
+		bin := filepath.Join(dir, "parley-nocgo")
+		cmd := exec.Command("go", "build", "-o", bin, "./cmd/parley")
+		cmd.Dir = moduleRoot
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build ./cmd/parley with CGO_ENABLED=0: %v\n%s", err, out)
+		}
+		list := exec.Command(bin, "mcp", "--list")
+		list.Env = env
+		out, err := list.Output()
+		var tools []map[string]any
+		if err != nil || json.Unmarshal(out, &tools) != nil || len(tools) == 0 {
+			t.Fatalf("parley mcp --list of that binary: %v\n%.300s", err, out)
+		}
+	})
+
 	t.Run("parley refuses an unknown command with exit status 2 and a usage error", func(t *testing.T) {
 		var stdout, stderr strings.Builder
 		cmd := exec.Command(parley, "nosuch")
