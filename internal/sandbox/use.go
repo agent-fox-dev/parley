@@ -25,6 +25,7 @@ const (
 	useDownload = "download"
 	useLogs     = "logs"
 	useAttach   = "attach"
+	useTools    = "tools"
 )
 
 // execBodyLimit is the body limit of exec: 4 MiB of stdin fits in it as
@@ -48,6 +49,9 @@ type useRequest struct {
 	logs logsRequest
 	// attach is the query of an attach, as its validation read it.
 	attach attachRequest
+	// set is the caller's tool set, on a route that serves the sandbox's
+	// tools.
+	set string
 	// act is the request's use of the sandbox, which the operation starts
 	// and fills in and the gate ends.
 	act *activity
@@ -67,6 +71,12 @@ type useEntry struct {
 	// covers applies the no-widening rule: the caller must cover the
 	// sandbox's hub credential, since the route acts in the sandbox.
 	covers bool
+	// tools marks a route that serves the sandbox's tools: a sandbox
+	// without a tool server is answered 404 tools_unavailable, and the
+	// caller's tool set is decided for the request. Such a route is of the
+	// read kind and does not apply the no-widening rule, which decides the
+	// set instead.
+	tools bool
 	// states are the states in which the route serves the sandbox; nil
 	// for every state.
 	states []string
@@ -107,11 +117,15 @@ func (s *Service) useTable() []*useEntry {
 			name: useAttach, method: http.MethodGet, segment: "attach", kind: KindWrite, covers: true,
 			states: []string{StateReady}, validate: validateAttach, operate: s.attach,
 		},
+		{
+			name: useTools, method: http.MethodGet, segment: "tools", kind: KindRead, tools: true,
+			states: []string{StateReady}, operate: s.listTools,
+		},
 	}
 }
 
 // UseRoutes declares the routes that use a sandbox: POST …/exec, PUT and
-// GET …/files, GET …/logs and GET …/attach under
+// GET …/files, GET …/logs, GET …/attach and GET …/tools under
 // /workspaces/:slug/sandboxes/:id. Each is a workspace route of its kind,
 // so that the pipeline runs the feature check, the binding guard, the PAT
 // scope and the workspace access before its handler, the gate (see gate).
@@ -131,7 +145,8 @@ func (s *Service) UseRoutes() []server.Route {
 
 // gate serves a request to the route of e once the pipeline's checks have
 // passed: it finds the sandbox, applies the no-widening rule when e acts in
-// the sandbox, validates the request, checks the sandbox's state, and only
+// the sandbox, refuses a tool route of a sandbox without a tool server and
+// decides the caller's tool set, validates the request, checks the sandbox's state, and only
 // then runs e's operation, whose runtime failures it answers (see
 // answerUse). The order is fixed so that an authorization answer never
 // depends on the body, and a body error never on the state. An operation
@@ -155,6 +170,12 @@ func (s *Service) gate(e *useEntry) server.HandlerFunc {
 		}
 		caller, _ := identity.PrincipalOf(ctx)
 		u := useRequest{caller: caller, slug: d.Record.Slug, rec: rec}
+		if e.tools {
+			if rec.Snapshot.ToolServer == "" {
+				return toolsUnavailable()
+			}
+			u.set = toolSetOf(r, d.Level, rec)
+		}
 		if e.validate != nil {
 			if err := e.validate(r, &u); err != nil {
 				return err

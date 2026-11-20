@@ -19,6 +19,7 @@ func TestUseRoutes_AnswerDisabledWhileSandboxesAreOff(t *testing.T) {
 	t.Parallel()
 	h := startProbeHub(t, false)
 	key := h.IssueKey(t, h.owner)
+	// The routes a later part adds to the gate are disabled like the rest.
 	for _, u := range useRoutes {
 		for _, slug := range []string{"ws", "nope"} {
 			t.Run(u.String()+" on "+slug, func(t *testing.T) {
@@ -135,6 +136,9 @@ func TestUseRoutes_RefuseASandboxInAStateTheRouteDoesNotAllow(t *testing.T) {
 		"download": {sandbox.StateReady, sandbox.StateCompleted, sandbox.StateFailed},
 		"logs":     {sandbox.StateProvisioning, sandbox.StateReady, sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted},
 	}
+	for _, u := range toolRoutes() {
+		allowed[u.name] = []string{sandbox.StateReady}
+	}
 	// Serial subtests: each counts the operation's calls around its request.
 	for _, state := range []string{sandbox.StateProvisioning, sandbox.StateReady, sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted} {
 		id := h.seed(t, "ws", state, nil)
@@ -225,5 +229,27 @@ func TestUseRoutes_AnswerTheFirstCheckARequestFails(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			h.useCall(t, exec, "ws", c.id, c.cred, c.body, c.status, c.errorType)
 		})
+	}
+
+	noTools := func(rec *sandbox.Record) { rec.Snapshot.ToolServer = "" }
+	plain, plainStopped := h.seedWith(t, "ws", sandbox.StateReady, nil, noTools), h.seedWith(t, "ws", sandbox.StateStopped, nil, noTools)
+	noScope := h.pat(t, h.owner, "git:read")
+	for _, u := range toolRoutes() {
+		for _, c := range []struct {
+			name, cred, id string
+			status         int
+			errorType      string
+		}{
+			{"no credential on a sandbox without tools", "", plain, 401, "unauthenticated"},
+			{"a PAT without a sandboxes scope and an unknown sandbox", noScope, unknownID, 403, "insufficient_scope"},
+			{"a PAT without a sandboxes scope on a sandbox without tools", noScope, plain, 403, "insufficient_scope"},
+			{"a user who is no member on a sandbox without tools", outsiderKey, plain, 404, "not_found"},
+			{"a stopped sandbox without tools", h.key, plainStopped, 404, "tools_unavailable"},
+			{"a stopped sandbox with tools", h.key, stopped, 409, "sandbox_not_ready"},
+		} {
+			t.Run(u.String()+" with "+c.name, func(t *testing.T) {
+				h.useCall(t, u, "ws", c.id, c.cred, u.body(), c.status, c.errorType)
+			})
+		}
 	}
 }

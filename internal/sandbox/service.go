@@ -86,6 +86,9 @@ type Service struct {
 	changes notifier
 	// use is the table of the routes that use a sandbox.
 	use []*useEntry
+	// toolDefs keeps the tool definitions read from the sandboxes' tool
+	// servers while the sandboxes stay ready.
+	toolDefs toolDefs
 	// logs is what the log collector tells the reads of the stored logs.
 	logs logState
 	// observers are told of each operation on a sandbox once it ended.

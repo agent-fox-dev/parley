@@ -2402,14 +2402,30 @@ type useRoute struct {
 	write                 bool
 }
 
-// useRoutes are the five routes that use a sandbox.
+// useRoutes are the routes that use a sandbox.
 var useRoutes = []useRoute{
 	{"exec", http.MethodPost, "exec", true},
 	{"upload", http.MethodPut, "files", true},
 	{"download", http.MethodGet, "files", false},
 	{"logs", http.MethodGet, "logs", false},
 	{"attach", http.MethodGet, "attach", true},
+	{"tools", http.MethodGet, "tools", false},
 }
+
+// toolRoutes are the routes of useRoutes that serve a sandbox's tools.
+func toolRoutes() []useRoute {
+	var out []useRoute
+	for _, u := range useRoutes {
+		if strings.HasPrefix(u.name, "tool") || u.name == "mcp" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// toolServerPath is where the test profiles and sandboxes have their tool
+// server.
+const toolServerPath = "/opt/tools/agentkit-tools"
 
 func (u useRoute) String() string { return u.method + " " + u.segment }
 
@@ -2484,12 +2500,23 @@ func startUseHub(t *testing.T, fail func() error) *useHub {
 // lifecycle loop does not delete it while the test runs.
 func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) string {
 	t.Helper()
+	return h.seedWith(t, ws, state, ha, nil)
+}
+
+// seedWith is seed for a sandbox as edit changes it; every sandbox it stores
+// has a tool server unless edit takes it away.
+func (h *useHub) seedWith(t *testing.T, ws, state string, ha *sandbox.HubAccess, edit func(*sandbox.Record)) string {
+	t.Helper()
 	before := recordStart.Add(-time.Hour)
 	rec := sandbox.Record{
 		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, HubAccess: ha,
 		ExpiresAt: time.Now().Add(3 * time.Hour), LastActivityAt: before,
 		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
 		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: ws,
+		Snapshot: sandbox.Snapshot{ToolServer: toolServerPath},
+	}
+	if edit != nil {
+		edit(&rec)
 	}
 	switch state {
 	case sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted:
@@ -2557,6 +2584,8 @@ type execHub struct {
 	// than the fake may.
 	quirks *runtimeQuirks
 	key    string
+	// org is the org of ws.
+	org string
 }
 
 // startExecHub starts an exec hub that runs at most maxExecs commands at
@@ -2608,9 +2637,91 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	}
 	h.Hub = hubtest.StartWith(t, cfg)
 	h.owner = h.CreateUser(t, "owner")
-	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: h.CreateOrg(t, "team"), Kind: access.KindRepository, Status: access.StatusReady})
+	h.org = h.CreateOrg(t, "team")
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: h.org, Kind: access.KindRepository, Status: access.StatusReady})
 	h.key = h.IssueKey(t, h.owner)
 	return h
+}
+
+// toolsHub is an exec hub whose runtime answers the tool server's commands
+// with the stand-in tools, with a second workspace ws2 of the owner, and
+// with member, a member of the org who may read ws, and outsider, who is
+// not in the org.
+type toolsHub struct {
+	*execHub
+	tools *runtimetest.ToolServer
+	// memberKey is the API key of member.
+	memberKey string
+}
+
+// startToolsHub starts a tools hub whose [sandbox] section also holds the
+// lines settings.
+func startToolsHub(t *testing.T, settings string) *toolsHub {
+	t.Helper()
+	h := &toolsHub{execHub: startUseSandboxHub(t, settings)}
+	h.tools = runtimetest.NewToolServer(h.rt, toolServerPath)
+	h.cmds.set(toolServerPath, h.tools.Run)
+	h.cmds.set("rm", h.tools.Run)
+	h.member, h.outsider = h.CreateUser(t, "member"), h.CreateUser(t, "outsider")
+	h.AddMember(t, h.org, h.member)
+	h.AddWorkspace(t, access.Record{Slug: "ws2", OwnerID: h.owner, OrgID: h.org, Kind: access.KindRepository, Status: access.StatusReady})
+	h.memberKey = h.IssueKey(t, h.member)
+	return h
+}
+
+// tooled creates a ready sandbox of ws with a tool server, as edit changes
+// it when edit is not nil, and returns its id.
+func (h *toolsHub) tooled(t *testing.T, edit func(*sandbox.Record)) string {
+	t.Helper()
+	return h.sandbox(t, func(rec *sandbox.Record) {
+		rec.Snapshot.ToolServer = toolServerPath
+		if edit != nil {
+			edit(rec)
+		}
+	})
+}
+
+// toolList is the answer of GET …/tools.
+type toolList struct {
+	Set   string `json:"set"`
+	Tools []struct {
+		Name         string          `json:"name"`
+		Description  string          `json:"description"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		OutputSchema json.RawMessage `json:"output_schema"`
+	} `json:"tools"`
+}
+
+// names are the names of the listed tools, in order.
+func (l toolList) names() []string {
+	out := make([]string, 0, len(l.Tools))
+	for _, tool := range l.Tools {
+		out = append(out, tool.Name)
+	}
+	return out
+}
+
+// list sends GET …/tools for the sandbox id of ws with cred and returns the
+// answer and, for a 200, the list it holds.
+func (h *toolsHub) list(t *testing.T, id, cred string) (answer, toolList) {
+	t.Helper()
+	a := h.call(t, http.MethodGet, sandboxPath("ws", id)+"/tools", cred, nil)
+	var l toolList
+	if a.status == http.StatusOK {
+		if err := json.Unmarshal(a.body, &l); err != nil {
+			t.Fatalf("the tool list %s: %v", a.body, err)
+		}
+	}
+	return a, l
+}
+
+// definitionNames are the names of the stand-in's tools, in its order.
+func definitionNames(readOnly bool) []string {
+	var out []string
+	for _, d := range runtimetest.ToolDefinitions(readOnly) {
+		out = append(out, d.Name)
+	}
+	return out
 }
 
 // sandbox creates a sandbox in the runtime with the working directory
