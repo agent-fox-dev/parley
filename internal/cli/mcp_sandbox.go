@@ -20,6 +20,10 @@ const codeModeName = "code_mode"
 // --read-only a caller of the full set leaves these out by name.
 var sandboxChangingTools = []string{"write_file", "edit_file", "execute", "run_command"}
 
+// sandboxReadOnlySet is the name of the set the hub gives a credential that
+// may only read the sandbox.
+const sandboxReadOnlySet = "read_only"
+
 // sandboxTool is one tool of the session's sandbox, as the hub lists it.
 type sandboxTool struct {
 	Name        string          `json:"name"`
@@ -58,13 +62,18 @@ func (s *toolSession) loadSandboxTools(ctx context.Context) error {
 		return err
 	}
 	var listed struct {
+		Set   string        `json:"set"`
 		Tools []sandboxTool `json:"tools"`
 	}
 	if err := json.Unmarshal(resp.body, &listed); err != nil {
 		return clientError("the hub's list of the sandbox's tools is not the list expected: %v", err)
 	}
+	// The hub's read-only set changes nothing, its code_mode included. Of
+	// the full set a read-only session leaves out what changes the sandbox,
+	// and the code_mode whose scripts could call it.
+	narrowing := s.settings.readOnly && listed.Set != sandboxReadOnlySet
 	for _, t := range listed.Tools {
-		if s.settings.readOnly && slices.Contains(sandboxChangingTools, t.Name) {
+		if narrowing && (slices.Contains(sandboxChangingTools, t.Name) || t.Name == codeModeName) {
 			continue
 		}
 		if t.Name == codeModeName && s.codeMode {

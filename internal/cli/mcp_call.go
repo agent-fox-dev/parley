@@ -18,6 +18,9 @@ const (
 	// toolTimeoutError is the error of a call that outlasted the bound of
 	// every tool call.
 	toolTimeoutError = "timeout"
+	// toolCancelledError is the error of a call that was cancelled from
+	// outside before it ended.
+	toolCancelledError = "cancelled"
 	// toolExitError is the error of a command that ended with an exit status
 	// of its own and no envelope, as parley sandbox exec does for the
 	// command it ran.
@@ -82,8 +85,9 @@ func readScriptTimeout(value string) (time.Duration, error) {
 }
 
 // newToolSession builds the session of the settings s over the command tree
-// of opts, for the hub and the credential of st.
-func newToolSession(opts options, st settings, s mcpSettings) (*toolSession, error) {
+// of opts. The hub and the credential are set once they are resolved, which
+// listing the tools does not need.
+func newToolSession(opts options, s mcpSettings) (*toolSession, error) {
 	if s.sandbox != "" && s.workspace == "" {
 		return nil, usageError("--sandbox names a sandbox of a workspace: give the workspace with --workspace")
 	}
@@ -98,17 +102,7 @@ func newToolSession(opts options, st settings, s mcpSettings) (*toolSession, err
 	if err != nil {
 		return nil, err
 	}
-	return &toolSession{opts: opts, st: st, settings: s, tools: tools, codeMode: !s.noCodeMode, scriptTimeout: scriptTimeout}, nil
-}
-
-// call calls the tool name with the JSON parameters input.
-func (s *toolSession) call(ctx context.Context, name string, input json.RawMessage) toolResult {
-	for _, t := range s.tools {
-		if t.name == name {
-			return s.callCommand(ctx, t, input)
-		}
-	}
-	return failedResult(usageErrorType, "there is no tool %q", name)
+	return &toolSession{opts: opts, settings: s, tools: tools, codeMode: !s.noCodeMode, scriptTimeout: scriptTimeout}, nil
 }
 
 // noStdin is the standard input of a command a tool call runs. The
@@ -138,6 +132,7 @@ func (s *toolSession) callCommand(ctx context.Context, t commandTool, input json
 	opts := s.opts
 	stdin := &noStdin{}
 	opts.stdin = stdin
+	outer := ctx
 	ctx, cancel := context.WithTimeout(ctx, s.opts.toolCallBound)
 	defer cancel()
 	// The command's progress lines and warnings are not part of a result.
@@ -150,6 +145,10 @@ func (s *toolSession) callCommand(ctx context.Context, t commandTool, input json
 		return failedResult(usageErrorType, "%s was asked to read standard input, with a value of - or a flag that says so; a tool has none, so give the value itself", t.name)
 	case runErr == nil:
 		res.OK = true
+	case outer.Err() != nil:
+		// Not the call's own bound: the session ended, or the script the
+		// call was made from ran out of time.
+		return failedResult(toolCancelledError, "the call was cancelled before it ended")
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return failedResult(toolTimeoutError, "the call did not end within %s", s.opts.toolCallBound)
 	default:
@@ -249,6 +248,10 @@ func (t commandTool) commandLine(input json.RawMessage) ([]string, error) {
 			return nil, fmt.Errorf("the parameter %s of %s needs at least one element", p.name, t.name)
 		case p.trailing:
 			trailing = values
+		case !p.isArg && p.kind == "boolean" && values[0] == "false":
+			// As on a shell's command line, where a flag that is not
+			// wanted is not written: some commands tell a flag given as
+			// false from one not given.
 		case !p.isArg:
 			for _, v := range values {
 				line = append(line, "--"+p.source+"="+v)

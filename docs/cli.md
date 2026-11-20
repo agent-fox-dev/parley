@@ -3300,11 +3300,19 @@ exits `0` without a session; it needs a hub and a credential only with
 word of a command), separated by commas. A name alone serves the group's
 commands; `name:read` only those whose route is a `GET`. The default is
 `activity,change,claim,fork,land,sandbox,scm,workspace:read`, 68 tools
-today. `--read-only` narrows whatever is selected to `GET` commands.
+today. A group named twice is a `usage_error`. `--read-only` narrows
+whatever is selected to `GET` commands, and leaves out of those the flags
+that make one write to the hub (`withdraw` of `change_approvals`), as
+`name:read` does for its group: a read-only session sends the hub nothing
+but `GET`s. It does not concern the machine `parley mcp` runs on, where a
+reading tool can still write a file (below).
 
 - Never served, whatever is selected: a command whose `auth` is `admin` or
-  `none`, one that shows a secret once, and one that needs a terminal or
-  runs until interrupted (`sandbox shell`, `events tail`). The groups
+  `none`, one that prints a secret the hub shows once (`webhook create`,
+  `webhook rotate-secret`, `forge webhook set`), and one that needs a
+  terminal or runs until interrupted (`sandbox shell`, `events tail`).
+  `fork create` is served, though with `token_permissions` its result
+  holds the fork's token: an agent that forks needs it. The groups
   `admin`, `keys`, `tokens`, `secrets`, `login`, `credential-helper`,
   `help`, `version` and `mcp` cannot be named: `--groups` with one of them
   is a `usage_error` naming it.
@@ -3338,7 +3346,14 @@ is optional and is that workspace when a call leaves it out; a call may
 still name another, such as a fork.
 
 **A call** runs the command's own run step in the `parley mcp` process,
-with `--json`, and is bounded at 30 minutes (`timeout` past that).
+with `--json`, and is bounded at 30 minutes (`timeout` past that; a call
+cancelled from outside, by the end of the session or of the script that
+made it, is `cancelled`). A boolean parameter given as `false` is left out
+of the command's line, as a flag that is not wanted is not written.
+
+A result reaches the harness as one text content holding the JSON object
+`{"ok", "data", "error", "detail"}`, with `isError` set for a failed one;
+there is no structured content.
 
 | The command | The tool's result |
 |---|---|
@@ -3356,9 +3371,18 @@ standard input or a terminal: a value of `-` where the command would read
 standard input, and a flag such as `--stdin`, are a `usage_error`. A command
 that destroys data needs its `confirm` parameter, as from the shell. A
 command with `--wait` waits inside the call, bounded by its `timeout`
-parameter. A local path (`sandbox_upload`, `sandbox_download`, `--put` of
-`scm_commit`) is one of the machine `parley mcp` runs on, relative to its
-working directory. A command that takes words after `--` takes its
+parameter.
+
+A local path is one of the machine `parley mcp` runs on, relative to its
+working directory, and a tool takes one wherever its command does: files
+are read by `sandbox_upload`, `put` of `scm_commit`, `file` of
+`change_resolve` and `policy_set`, `policy_file` of `policy_evaluate`,
+`body_file` of the `issue` and `pr` tools, and an `intent` of `change_open`
+and `change_edit` that begins with `@`; files are written by
+`sandbox_download` and `output` of `scm_cat`. So an agent with these tools
+can read and write what the user who started `parley mcp` can, the CLI's
+own configuration included: start it in a directory, and as a user, that
+may be read. A command that takes words after `--` takes its
 arguments before it, so there an argument that begins with a dash is a
 `usage_error`.
 
@@ -3374,6 +3398,8 @@ some concurrently, and returns only what the script prints and returns. Its
 rules and limits are agentkit-go's, except a script's wall time: 10 minutes,
 or `--script-timeout`, from `1s` to `30m` (a `usage_error` outside that).
 A script's calls are calls like direct ones. `--no-code-mode` leaves it out.
+As agentkit-go does, it writes the whole output of a script whose output
+was cut to a file under `agentkit-codemode` in the temporary directory.
 
 **A sandbox's tools.** `--sandbox <id>` names a sandbox of the workspace of
 `--workspace`, which it needs (`usage_error` without). Its tools are read
@@ -3389,7 +3415,8 @@ error the hub answers instead (the sandbox stopped, a limit) a failed
 result with its `error_type`. The hub bounds such a call at 60 seconds.
 
 - The set is the one the hub gives the credential. With `--read-only`,
-  `write_file`, `edit_file`, `execute` and `run_command` are not served.
+  `write_file`, `edit_file`, `execute` and `run_command` of the full set
+  are not served, nor is its `code_mode`, whose scripts could call them.
 - The sandbox's own `code_mode` is not served while the session serves
   its own; with `--no-code-mode` it is a sandbox tool like the others.
 - A sandbox tool with the name of a command tool is a `client_error`
@@ -3406,8 +3433,10 @@ the tool, the outcome and the duration, never the arguments or the result:
 {"tool":"change_land","ok":false,"error":"wait_timeout","duration_ms":60012}
 ```
 
-`error` is the failed result's error, or `not_run` for a call refused
-before its tool ran. In a session, `tools/list` lists the tools by name;
+`error` is the failed result's error when it is a code (lower-case letters,
+digits and `_ . : -`, at most 64 characters) and `other` when it is anything
+else, which a sandbox's tool may give; `not_run` is a call refused before
+its tool ran. In a session, `tools/list` lists the tools by name;
 `--list` prints them in the order they are served.
 
 ### `parley credential-helper`

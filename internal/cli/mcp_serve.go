@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"sync"
 	"syscall"
@@ -151,7 +152,7 @@ func (l *callLog) event(e core.Event) {
 	if end.IsError {
 		line.Error = notRunError
 		if code, ran := l.errors[end.ToolUseID]; ran {
-			line.Error = code
+			line.Error = loggedError(code)
 		}
 	}
 	delete(l.errors, end.ToolUseID)
@@ -160,14 +161,25 @@ func (l *callLog) event(e core.Event) {
 	_, _ = l.stderr.Write(append(out, '\n'))
 }
 
-// runner is the runner of the session's tools, which logs every call it
-// runs to stderr (see callLog).
-func (s *toolSession) runner(stderr io.Writer) (*runner.Runner, error) {
-	r, _, err := s.build(stderr)
-	return r, err
+// errorCode is the shape of an error a line on stderr names: the CLI's
+// types, the hub's error types and http_<status> have it.
+var errorCode = regexp.MustCompile(`^[a-z0-9_.:-]{1,64}$`)
+
+// otherError stands on stderr for an error that is not a code.
+const otherError = "other"
+
+// loggedError is the error of a failed result as a line on stderr names it.
+// A sandbox tool's error is what a program in the sandbox printed, and
+// nothing holds it to printing a code, so anything else is not written.
+func loggedError(code string) string {
+	if errorCode.MatchString(code) {
+		return code
+	}
+	return otherError
 }
 
-// build is runner, with the size of code_mode's description.
+// build is the runner of the session's tools, which logs every call it runs
+// to stderr (see callLog), with the size of code_mode's description.
 func (s *toolSession) build(stderr io.Writer) (*runner.Runner, int, error) {
 	tools, descriptionBytes, err := s.served()
 	if err != nil {
@@ -232,6 +244,12 @@ func (s *toolSession) serve(ctx context.Context, stderr io.Writer, settings mcpS
 	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Once the session is ending, a second signal ends the process as it
+	// would any other.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	if err := server.ServeStdio(ctx); err != nil && ctx.Err() == nil {
 		return clientError("the MCP session ended: %v", err)
 	}

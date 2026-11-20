@@ -196,28 +196,9 @@ type mcpProcess struct {
 	dir     string
 	cmd     *exec.Cmd
 	session *mcp.ClientSession
-	stderr  *lockedBuffer
+	stderr  *hubtest.LogBuffer
 	// initialized is what the server answered to initialize.
 	initialized *mcp.InitializeResult
-}
-
-// lockedBuffer is a buffer the process's stderr is copied to while the test
-// reads it.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }
 
 // startMCP starts the built parley binary as `parley mcp args` against the
@@ -225,7 +206,7 @@ func (b *lockedBuffer) String() string {
 // The session and the process end with the test.
 func startMCP(t *testing.T, hubURL, key string, args ...string) *mcpProcess {
 	t.Helper()
-	p := &mcpProcess{stderr: &lockedBuffer{}}
+	p := &mcpProcess{stderr: &hubtest.LogBuffer{}}
 	p.cmd = exec.Command(credentialHelper(t), append([]string{"mcp", "--endpoint-url", hubURL, "--api-key", key}, args...)...)
 	p.cmd.Stderr = p.stderr
 	p.dir = t.TempDir()

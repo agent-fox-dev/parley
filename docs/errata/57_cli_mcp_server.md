@@ -78,7 +78,46 @@ result with the error `command_exit` and the collected answer (exit code,
 output) as its data; an output that is not one JSON document, such as the
 lines of `sandbox_logs`, is `{"result": "<text>"}`.
 
+## More than `ShowsOnce` keeps a command from being a tool
+
+The package's decision 16 takes "shows a secret once" as the declaration's
+`ShowsOnce`, which only commands of `keys` and `tokens` set. Three more
+commands print a secret the hub shows once and write the warning
+themselves, because they print it only in some of their forms: `webhook
+create`, `webhook rotate-secret` and `forge webhook set`. The declaration
+has a second mark, `PrintsSecret`, which they set, and neither kind is
+served. `fork create` stays a tool, as decision 16 says.
+
+## A read-only selection sends the hub nothing but `GET`s
+
+The package narrows a read-only selection by the method of a command's
+route. `change approvals` is a `GET` command whose `--withdraw` sends a
+`DELETE`. A flag can be marked as one that makes its command write
+(`markWrites`), and a tool selected for reading, by `--read-only` or by
+`name:read`, lacks such a flag. With `--read-only`, of a sandbox's full set
+its `code_mode` is left out too, with the four tools that change the
+sandbox, since its scripts could call them; the hub's own read-only set is
+served whole. Test:
+`TestMCP_ServesNothingThatWritesToTheHubInAReadOnlySession`.
+
+`--read-only` is about the hub. A reading tool can still write a local file
+(`sandbox_download`, `output` of `scm_cat`), and several tools read local
+files, as their commands do; `docs/cli.md` lists them.
+
 ## Smaller choices
+
+- A boolean parameter given as `false` is left out of the command's line:
+  some commands tell a flag given as false from one not given.
+- A group named twice in `--groups` is a `usage_error`.
+- A line on stderr names a failed result's error only when it is a code,
+  and `other` otherwise: a sandbox tool's error is what a program in the
+  sandbox printed.
+- A call cancelled from outside, by the end of the session or of the
+  script that made it, is the failed result `cancelled`, not `timeout`.
+- A result reaches the harness as agentkit-go's `mcpserve` sends it: one
+  text content with the JSON object `{ok, data, error, detail}`, without
+  structured content.
+- After the first SIGINT or SIGTERM a second one ends the process at once.
 
 - The default selection is 68 command tools: the package counts 69, with
   `sandbox shell`, which is never served.

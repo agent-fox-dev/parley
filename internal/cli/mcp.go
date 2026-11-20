@@ -87,7 +87,7 @@ func runMCPCommand(c *call) error {
 
 	// The selection is judged first, so that a usage error does not wait
 	// for a hub URL or a credential.
-	session, err := newToolSession(c.opts, settings{}, s)
+	session, err := newToolSession(c.opts, s)
 	if err != nil {
 		return err
 	}
@@ -241,6 +241,9 @@ func readSelection(groups string, leaves []*cobra.Command) ([]groupSelection, er
 			return nil, usageError("--groups: parley mcp never serves the group %q", name)
 		case !slices.Contains(nameable, name), hasSuffix && ":"+suffix != readSuffix:
 			return nil, unknown(element)
+		case slices.ContainsFunc(selection, func(g groupSelection) bool { return g.name == name }):
+			// Which of the two would hold is not for the order to decide.
+			return nil, usageError("--groups names the group %q twice", name)
 		}
 		selection = append(selection, groupSelection{name: name, readOnly: hasSuffix})
 	}
@@ -249,8 +252,8 @@ func readSelection(groups string, leaves []*cobra.Command) ([]groupSelection, er
 
 // commandTools are the tools of the commands under root that s selects,
 // ordered by name. Whatever is selected, a command is a tool only when a
-// user's credential runs it, it shows no secret once, and it neither needs
-// a terminal nor runs until interrupted: the rule holds for commands added
+// user's credential runs it, it prints no secret the hub shows once, and it
+// neither needs a terminal nor runs until interrupted: the rule holds for commands added
 // later, without a list to keep.
 func commandTools(root *cobra.Command, s mcpSettings) ([]commandTool, error) {
 	leaves := leafCommands(root)
@@ -264,12 +267,14 @@ func commandTools(root *cobra.Command, s mcpSettings) ([]commandTool, error) {
 		words := wordsOf(cmd)
 		i := slices.IndexFunc(selection, func(g groupSelection) bool { return g.name == words[0] })
 		switch {
-		case i < 0, decl.Auth != authUser, decl.ShowsOnce, decl.Interactive:
-			continue
-		case (s.readOnly || selection[i].readOnly) && decl.Method != http.MethodGet:
+		case i < 0, decl.Auth != authUser, decl.ShowsOnce, decl.PrintsSecret, decl.Interactive:
 			continue
 		}
-		tools = append(tools, newCommandTool(cmd, decl, words, s.workspace))
+		reading := s.readOnly || selection[i].readOnly
+		if reading && decl.Method != http.MethodGet {
+			continue
+		}
+		tools = append(tools, newCommandTool(cmd, decl, words, s.workspace, reading))
 	}
 	slices.SortFunc(tools, func(a, b commandTool) int { return strings.Compare(a.name, b.name) })
 	return tools, nil
@@ -277,8 +282,10 @@ func commandTools(root *cobra.Command, s mcpSettings) ([]commandTool, error) {
 
 // newCommandTool is the tool of the command cmd, declared by decl. With a
 // workspace, the command's workspace argument is optional and takes it when
-// a call leaves it out; a call may still name another, such as a fork.
-func newCommandTool(cmd *cobra.Command, decl command, words []string, workspace string) commandTool {
+// a call leaves it out; a call may still name another, such as a fork. A
+// tool selected for reading lacks the flags that make a command of a GET
+// route write to the hub.
+func newCommandTool(cmd *cobra.Command, decl command, words []string, workspace string, reading bool) commandTool {
 	t := commandTool{
 		name:        strings.ReplaceAll(strings.Join(words, "_"), "-", "_"),
 		description: decl.Description,
@@ -303,7 +310,8 @@ func newCommandTool(cmd *cobra.Command, decl command, words []string, workspace 
 	add := func(f *pflag.Flag) {
 		_, cobras := f.Annotations[cobra.FlagSetByCobraAnnotation]
 		_, untilInterrupted := f.Annotations[untilInterruptedAnnotation]
-		if cobras || untilInterrupted || slices.Contains(mcpOmittedFlags, f.Name) {
+		_, writes := f.Annotations[writesAnnotation]
+		if cobras || untilInterrupted || writes && reading || slices.Contains(mcpOmittedFlags, f.Name) {
 			return
 		}
 		t.params = append(t.params, toolParam{

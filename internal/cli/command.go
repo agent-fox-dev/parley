@@ -67,6 +67,10 @@ type command struct {
 	// ShowsOnce marks a command whose result carries a secret the hub
 	// shows only this once.
 	ShowsOnce bool `json:"shows_once,omitempty"`
+	// PrintsSecret marks a command whose result carries a secret the hub
+	// shows only once and that says so itself, without ShowsOnce's warning:
+	// one that prints the secret only in some of its forms.
+	PrintsSecret bool `json:"prints_secret,omitempty"`
 	// Interactive marks a command that needs a terminal or runs until it
 	// is interrupted, which nothing but a person at a shell can use.
 	Interactive bool `json:"interactive,omitempty"`
@@ -347,4 +351,15 @@ const untilInterruptedAnnotation = "parley.until_interrupted"
 // command run until it is interrupted, such as --follow of a log.
 func markUntilInterrupted(fs *pflag.FlagSet, name string) {
 	_ = fs.SetAnnotation(name, untilInterruptedAnnotation, []string{"true"})
+}
+
+// writesAnnotation marks a flag that makes a command of a GET route send a
+// request that changes the hub.
+const writesAnnotation = "parley.writes"
+
+// markWrites marks the flag name of fs as one that makes its command write
+// to the hub although the command's route is a GET, such as --withdraw of a
+// command that lists verdicts.
+func markWrites(fs *pflag.FlagSet, name string) {
+	_ = fs.SetAnnotation(name, writesAnnotation, []string{"true"})
 }

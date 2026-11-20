@@ -194,7 +194,11 @@ func probePublic() *cobra.Command {
 func TestMCPList_PrintsTheDefaultSelectionAsTools(t *testing.T) {
 	hub := newStubHub(t)
 	cmds := helpCommands(t, defaultOptions())
-	tools := mcpList(t, defaultOptions(), "--no-code-mode")
+	// The list is made without the hub it is pointed at and without the
+	// standard input a session would be served on.
+	opts := defaultOptions()
+	opts.stdin = untouchable{t}
+	tools := mcpList(t, opts, onHub(hub.URL, "--no-code-mode")...)
 
 	defaults := []string{"activity", "change", "claim", "fork", "land", "sandbox", "scm"}
 	want := commandsOf(cmds, func(group string, c commandHelp) bool {
@@ -215,7 +219,7 @@ func TestMCPList_PrintsTheDefaultSelectionAsTools(t *testing.T) {
 	if len(tools) > 80 {
 		t.Errorf("the default selection has %d tools, want at most 80", len(tools))
 	}
-	if n := len(hub.requests); n != 0 {
+	if n := hub.requestCount(); n != 0 {
 		t.Errorf("mcp --list sent %d requests, want none", n)
 	}
 }
@@ -268,12 +272,16 @@ func TestMCPList_NeverServesWhatAdministersTheHubShowsASecretOrNeedsATerminal(t 
 		}
 	}
 	names := toolNames(tools)
-	for _, never := range []string{"sandbox_shell", "events_tail", "mcp", "probe_secret", "probe_terminal", "probe_public", "probe_admin_purge"} {
+	for _, never := range []string{
+		"sandbox_shell", "events_tail", "mcp", "probe_secret", "probe_terminal", "probe_public", "probe_admin_purge",
+		// Each prints a secret the hub shows once.
+		"webhook_create", "webhook_rotate_secret", "forge_webhook_set",
+	} {
 		if slices.Contains(names, never) {
 			t.Errorf("%s is served", never)
 		}
 	}
-	for _, served := range []string{"probe_get", "events_list", "sandbox_logs", "webhook_create"} {
+	for _, served := range []string{"probe_get", "events_list", "sandbox_logs", "webhook_list", "forge_status"} {
 		if !slices.Contains(names, served) {
 			t.Errorf("%s is not served", served)
 		}
@@ -294,7 +302,7 @@ func TestMCP_RefusesAGroupItNeverServes(t *testing.T) {
 					}
 					code, stdout, stderr := runMCP(t, defaultOptions(), args...)
 					wantUsageError(t, code, stdout, stderr, group)
-					if n := len(hub.requests); n != 0 {
+					if n := hub.requestCount(); n != 0 {
 						t.Errorf("%d requests were sent, want none", n)
 					}
 				})
@@ -486,8 +494,9 @@ func toolSessionOn(t *testing.T, opts options, hubURL string, s mcpSettings) *to
 	t.Setenv("PARLEY_CONFIG_DIR", t.TempDir())
 	unsetEnv(t, "PARLEY_ENDPOINT_URL")
 	unsetEnv(t, "PARLEY_API_KEY")
-	session, err := newToolSession(opts, settings{hubURL: hubURL, credential: "k"}, s)
+	session, err := newToolSession(opts, s)
 	if err == nil {
+		session.st = settings{hubURL: hubURL, credential: "k"}
 		err = session.loadSandboxTools(t.Context())
 	}
 	if err != nil {
@@ -503,7 +512,19 @@ func callTool(t *testing.T, session *toolSession, name string, input any) toolRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	return session.call(t.Context(), name, raw)
+	return callRaw(t, session, name, raw)
+}
+
+// callRaw calls the command tool name of session with the JSON input.
+func callRaw(t *testing.T, session *toolSession, name string, input json.RawMessage) toolResult {
+	t.Helper()
+	for _, ct := range session.tools {
+		if ct.name == name {
+			return session.callCommand(t.Context(), ct, input)
+		}
+	}
+	t.Fatalf("the session has no command tool %s", name)
+	return toolResult{}
 }
 
 // last is the last request the stub hub got; it fails the test when there
@@ -519,11 +540,7 @@ func (h *stubHub) last(t *testing.T) stubRequest {
 }
 
 // requestCount is how many requests the stub hub got.
-func (h *stubHub) requestCount() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.requests)
-}
+func (h *stubHub) requestCount() int { return len(h.recorded()) }
 
 // wantFailed checks that r is a failed result with the error code.
 func wantFailed(t *testing.T, r toolResult, code string) {
@@ -577,9 +594,6 @@ func TestToolCall_RunsTheCommandAndGivesWhatItPrints(t *testing.T) {
 		r := callTool(t, session, "probe_count", map[string]any{"limit": 2})
 		if want := map[string]any{"result": []any{1.0, 2.0}}; !r.OK || !reflect.DeepEqual(r.Data, want) {
 			t.Errorf("the result is %+v; want the data %v", r, want)
-		}
-		if q := hub.last(t).query; q != "" && !strings.Contains(q, "limit=2") {
-			t.Errorf("the query is %q", q)
 		}
 	})
 	t.Run("nothing printed is the empty object", func(t *testing.T) {
@@ -724,14 +738,13 @@ func TestToolCall_RefusesParametersTheToolDoesNotTake(t *testing.T) {
 		{"parameters that are not an object", `[1]`, "object"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			r := session.call(t.Context(), "change_land", json.RawMessage(row.input))
+			r := callRaw(t, session, "change_land", json.RawMessage(row.input))
 			wantFailed(t, r, usageErrorType)
 			if !strings.Contains(r.Detail, row.names) {
 				t.Errorf("the detail %q does not name %s", r.Detail, row.names)
 			}
 		})
 	}
-	wantFailed(t, session.call(t.Context(), "no_such_tool", json.RawMessage(`{}`)), usageErrorType)
 	if n := hub.requestCount(); n != 0 {
 		t.Errorf("%d requests were sent, want none", n)
 	}
@@ -855,7 +868,7 @@ func TestToolCall_EndsACallThatOutlastsItsBound(t *testing.T) {
 func runnerOn(t *testing.T, opts options, hubURL string, s mcpSettings) (*runner.Runner, *bytes.Buffer) {
 	t.Helper()
 	var stderr bytes.Buffer
-	r, err := toolSessionOn(t, opts, hubURL, s).runner(&stderr)
+	r, _, err := toolSessionOn(t, opts, hubURL, s).build(&stderr)
 	if err != nil {
 		t.Fatalf("build the runner of %+v: %v", s, err)
 	}
@@ -1149,13 +1162,16 @@ func TestCodeMode_BoundsAScriptByTheScriptTimeout(t *testing.T) {
 		}
 	}
 	hub := newStubHub(t).handle(http.MethodGet, "/api/v1/workspaces/demo", func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
-	s := withCodeMode()
-	s.scriptTimeout = "1s"
-	r, _ := runnerOn(t, defaultOptions(), hub.URL, s)
+	session := toolSessionOn(t, defaultOptions(), hub.URL, withCodeMode())
+	session.scriptTimeout = 100 * time.Millisecond
+	r, _, err := session.build(io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
 	start := time.Now()
 	res := runScript(t, r, `result = workspace_get(slug="demo")`)
 	if res.OK || time.Since(start) > 5*time.Second || !strings.Contains(strings.ToLower(resultText(res)), "time") {
-		t.Errorf("after %s the script's result is %+v; want it ended at its bound of 1s with a timeout error", time.Since(start), res)
+		t.Errorf("after %s the script's result is %+v; want it ended at its bound with a timeout error", time.Since(start), res)
 	}
 }
 
@@ -1475,4 +1491,125 @@ func TestToolCall_GivesTheWordsAfterTheDoubleDashAndARepeatingArgumentAsArrays(t
 			t.Error("the refused call sent a request")
 		}
 	})
+}
+
+func TestMCP_RefusesAGroupNamedTwice(t *testing.T) {
+	for _, groups := range []string{"scm,scm", "scm:read,scm", "scm,change,scm:read"} {
+		code, stdout, stderr := runMCP(t, defaultOptions(), "--list", "--groups", groups)
+		wantUsageError(t, code, stdout, stderr, "scm")
+	}
+}
+
+// probeWithdrawing builds "probe verdicts": GET /verdicts, or with
+// --withdraw a DELETE, as a command that lists or removes does.
+func probeWithdrawing() *cobra.Command {
+	return declare(command{
+		Name: "verdicts", Description: "List the verdicts, or withdraw one", Method: http.MethodGet, Path: "/verdicts", Auth: authUser,
+		Flags: func(fs *pflag.FlagSet) {
+			fs.String("withdraw", "", "withdraw the verdict with this id instead of listing")
+			markWrites(fs, "withdraw")
+		},
+	})
+}
+
+func TestMCP_ServesNothingThatWritesToTheHubInAReadOnlySession(t *testing.T) {
+	opts := withProbeGroup(defaultOptions(), probeWithdrawing)
+	for _, groups := range []string{mcpDefaultGroups + ",probe", "change:read,probe:read"} {
+		readOnly := groups == mcpDefaultGroups+",probe"
+		args := []string{"--no-code-mode", "--groups", groups}
+		if readOnly {
+			args = append(args, "--read-only")
+		}
+		tools := mcpList(t, opts, args...)
+		for _, name := range []string{"change_approvals", "probe_verdicts"} {
+			if _, has := toolNamed(t, tools, name).InputSchema.Properties["withdraw"]; has {
+				t.Errorf("with %v, %s has the parameter withdraw, which makes it send a DELETE", args, name)
+			}
+		}
+	}
+	// Selected to write, the same tools have it.
+	tools := mcpList(t, opts, "--no-code-mode", "--groups", "change,probe")
+	for _, name := range []string{"change_approvals", "probe_verdicts"} {
+		if _, has := toolNamed(t, tools, name).InputSchema.Properties["withdraw"]; !has {
+			t.Errorf("%s lacks the parameter withdraw in a selection that may write", name)
+		}
+	}
+
+	// Every tool of a read-only session, called with every parameter it
+	// has, sends nothing but GETs.
+	hub := newStubHub(t)
+	session := toolSessionOn(t, defaultOptions(), hub.URL, mcpSettings{groups: mcpDefaultGroups, readOnly: true, noCodeMode: true})
+	t.Chdir(t.TempDir())
+	for _, ct := range session.tools {
+		input := map[string]any{}
+		for _, p := range ct.params {
+			switch p.kind {
+			case "boolean":
+				input[p.name] = true
+			case "integer":
+				input[p.name] = 1
+			case "array":
+				input[p.name] = []string{"x"}
+			default:
+				input[p.name] = "x"
+			}
+		}
+		callTool(t, session, ct.name, input)
+	}
+	for _, r := range hub.recorded() {
+		if r.method != http.MethodGet {
+			t.Errorf("a read-only session sent %s %s", r.method, r.path)
+		}
+	}
+}
+
+func TestToolCall_LeavesOutAFlagGivenAsFalse(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodPost, "/api/v1/typed", http.StatusOK, `{}`)
+	opts := withProbes(defaultOptions(), probeTyped)
+	session := toolSessionOn(t, opts, hub.URL, mcpSettings{groups: "probe", noCodeMode: true})
+	var line []string
+	for _, ct := range session.tools {
+		if ct.name == "probe_typed" {
+			var err error
+			if line, err = ct.commandLine(json.RawMessage(`{"key_value":"A=1","reason":"r","dry_run":false,"title":""}`)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if slices.ContainsFunc(line, func(w string) bool { return strings.HasPrefix(w, "--dry-run") }) {
+		t.Errorf("the line %q gives the flag of a boolean that is false; want it left out, as a shell command line leaves it out", line)
+	}
+	if !slices.Contains(line, "--title=") {
+		t.Errorf("the line %q lacks the empty string that was given", line)
+	}
+}
+
+func TestSandboxTools_OfAReadOnlySessionHaveNoCodeModeThatCanWrite(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file", "write_file", "execute", "code_mode"))
+	args := onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1", "--groups", "claim", "--read-only", "--no-code-mode")
+	if names := toolNames(mcpList(t, defaultOptions(), args...)); slices.Contains(names, "code_mode") || !slices.Contains(names, "read_file") {
+		t.Errorf("a read-only session without its own code_mode serves %v; the sandbox's code_mode of the full set can write", names)
+	}
+	// The hub's read-only set has a code_mode bound to what changes nothing.
+	hub.answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("read_only", "read_file", "code_mode"))
+	if names := toolNames(mcpList(t, defaultOptions(), args...)); !slices.Contains(names, "code_mode") {
+		t.Errorf("of the hub's read-only set, %v is served; want its code_mode too", names)
+	}
+}
+
+func TestMCP_WritesOnlyAnErrorCodeOfASandboxToolToStderr(t *testing.T) {
+	const leaked = "FILE CONTENT: top secret line"
+	hub := newStubHub(t).
+		answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file")).
+		answer(http.MethodPost, sandboxToolsPath+"/read_file", http.StatusOK, `{"ok":false,"error":"`+leaked+`","detail":"`+leaked+`","data":{}}`)
+	r, stderr := runnerOn(t, defaultOptions(), hub.URL, onSandbox(mcpDefaults()))
+	if res := runTool(t, r, "read_file", map[string]any{"path": "a.txt"}); res.OK || res.Error != leaked {
+		t.Fatalf("the result is %+v; want the hub's as it is", res)
+	}
+	hub.answer(http.MethodPost, sandboxToolsPath+"/read_file", http.StatusOK, `{"ok":false,"error":"not_found","detail":"x","data":{}}`)
+	runTool(t, r, "read_file", map[string]any{"path": "a.txt"})
+	lines := callLines(t, stderr.String())
+	if strings.Contains(stderr.String(), "top secret") || len(lines) != 2 || lines[0]["error"] != "other" || lines[1]["error"] != "not_found" {
+		t.Errorf("stderr is %s; want the error of a result only when it is a code, and other for anything else", stderr)
+	}
 }

@@ -48,12 +48,13 @@ var webhookSources = []string{"secret", "from-stdin", "generate"}
 func newWebhookCommand() *cobra.Command {
 	const path = "/workspaces/:slug/forge/webhook"
 	set := declare(command{
-		Name:        "set",
-		Description: "Set or rotate the secret of a workspace's forge webhook: one the hub generates and shows once, or one given",
-		Method:      http.MethodPut,
-		Path:        path,
-		Args:        []argSpec{slugArg},
-		Auth:        authUser,
+		Name:         "set",
+		Description:  "Set or rotate the secret of a workspace's forge webhook: one the hub generates and shows once, or one given",
+		Method:       http.MethodPut,
+		Path:         path,
+		Args:         []argSpec{slugArg},
+		Auth:         authUser,
+		PrintsSecret: true,
 		Flags: func(fs *pflag.FlagSet) {
 			fs.String("secret", "", "the secret to store, which the hub checks")
 			fs.Bool("from-stdin", false, "read the secret from standard input, without one trailing line ending")
