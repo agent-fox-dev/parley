@@ -29,7 +29,10 @@ what an agent did is scattered across terminals.
 ## Run it
 
 Parley is two programs: `parleyd`, the hub, and `parley`, its client. Build
-them with Go 1.27 (`go build ./cmd/...`). The hub needs `git` 2.38 or later
+them with Go 1.27 (`go build ./cmd/...`). `parleyd` needs a C toolchain
+(cgo) to outline files in languages other than Go; built without one it
+still runs and outlines Go alone. `parley` needs none and builds with
+`CGO_ENABLED=0`. The hub needs `git` 2.38 or later
 on its `PATH` and refuses to start without it; it keeps its data in two
 embedded SQLite stores and a directory of git repositories.
 
