@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/agent-fox-dev/agentkit-go v0.9.2-0.20261120191049-20c16c905540
+	github.com/agent-fox-dev/agentkit-go v0.10.0
 	github.com/agent-fox-dev/agentkit-go/mcpserve v0.0.0-20261120191049-20c16c905540
 	github.com/ai-openshell/sdk-go v0.1.9
 	github.com/google/uuid v1.6.0
