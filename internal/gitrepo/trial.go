@@ -135,11 +135,7 @@ func (r *Repo) trialStart(ctx context.Context, onto string, first Commit) (ontoT
 // takes no tree.
 func (r *Repo) trialCommit(ctx context.Context, tree string) (string, error) {
 	obj := "tree " + tree + "\nauthor " + HubName + " <" + HubEmail + "> 0 +0000\ncommitter " + HubName + " <" + HubEmail + "> 0 +0000\n\ntrial rebase\n"
-	out, err := r.g.runInput(ctx, access{}, []byte(obj), "--git-dir="+r.dir, "hash-object", "-t", "commit", "-w", "--stdin")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	return r.writeCommitObject(ctx, obj)
 }
 
 // mergeTree merges the commit theirs into ours with the commit base as the

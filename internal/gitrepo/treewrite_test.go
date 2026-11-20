@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -343,12 +342,8 @@ func TestCreateCommit_WritesTheCommitAsGiven(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			var checks atomic.Int32
-			repo, err := gitrepo.Git{Trace: func(args []string) {
-				if slices.Contains(args, "cat-file") {
-					checks.Add(1)
-				}
-			}}.Open(context.Background(), f.dir)
+			var calls atomic.Int32
+			repo, err := gitrepo.Git{Trace: func([]string) { calls.Add(1) }}.Open(context.Background(), f.dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -359,11 +354,33 @@ func TestCreateCommit_WritesTheCommitAsGiven(t *testing.T) {
 			if got := gitrepotest.Git(t, f.dir, "cat-file", "commit", id) + "\n"; got != c.want {
 				t.Errorf("commit %s is\n%s\nwant\n%s", id, got, c.want)
 			}
-			if n := checks.Load(); n != 0 {
-				t.Errorf("CreateCommit ran git cat-file %d times, want none: it reads the types of its tree and parents itself", n)
+			if n := calls.Load(); n != 0 {
+				t.Errorf("CreateCommit ran %d git processes, want none: it reads the types of its tree and parents and writes the commit itself", n)
 			}
+			gitrepotest.Git(t, f.dir, "fsck", "--strict", "--no-dangling")
 		})
 	}
+	t.Run("into the object store a Git's environment names", func(t *testing.T) {
+		t.Parallel()
+		// As a quarantine has git write the new objects of a push.
+		objects := t.TempDir()
+		repo, err := gitrepo.Git{Env: []string{"GIT_OBJECT_DIRECTORY=" + objects,
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES=" + filepath.Join(f.dir, "objects")}}.Open(context.Background(), f.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := repo.CreateCommit(context.Background(), gitrepo.CommitSpec{Tree: f.tree, Parents: []string{f.parent},
+			Message: "quarantined\n", Author: author, Committer: committer})
+		if err != nil {
+			t.Fatalf("CreateCommit: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(objects, id[:2], id[2:])); err != nil {
+			t.Errorf("the commit is not in the object store the environment names: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(f.dir, "objects", id[:2], id[2:])); err == nil {
+			t.Errorf("the commit %s is in the repository's own object store, want it only in the one the environment names", id)
+		}
+	})
 	for _, c := range []struct {
 		name string
 		spec gitrepo.CommitSpec
