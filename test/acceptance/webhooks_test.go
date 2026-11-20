@@ -118,11 +118,8 @@ func TestWebhook_FailingReceiverHoldsOrderAndLosesNothing(t *testing.T) {
 		t.Errorf("the two first attempts carry the deliveries %q and %q with the seqs %d and %d, want one delivery of the seq %d",
 			a[0].Header.Get("Parley-Delivery"), a[1].Header.Get("Parley-Delivery"), a[0].Seq(), a[1].Seq(), held[0])
 	}
-	// The hub schedules the retry 10 s after the first attempt's time cut
-	// to the whole second (internal/webhook/loop.go), so it may arrive up
-	// to a second sooner than 10 s after the first.
-	if gap := a[1].At.Sub(a[0].At); gap < 9*time.Second {
-		t.Errorf("the retry came %v after the first attempt, want at least 9 s", gap)
+	if gap := a[1].At.Sub(a[0].At); gap < 10*time.Second {
+		t.Errorf("the retry came %v after the first attempt, want at least 10 s", gap)
 	}
 	for _, r := range receiver.Deliveries()[mark:] {
 		if r.Seq() != held[0] {

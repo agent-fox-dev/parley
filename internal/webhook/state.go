@@ -48,12 +48,14 @@ func retryWait(n int) time.Duration {
 }
 
 // nextAttempt is when the next attempt of a delivery is due after its
-// failed attempt number n, made at at, whose first attempt was made at
-// first: after the wait, and never later than the end of the event's retry
-// window while it is still ahead.
-func nextAttempt(first, at time.Time, n int) time.Time {
-	next := at.Add(retryWait(n))
-	if end := first.Add(retryWindow); end.After(at) && end.Before(next) {
+// failed attempt number n, which ended at ended and was made inside the
+// retry window of the first attempt, made at first: the wait after ended,
+// and never later than the end of the window. An attempt that ended past
+// the window's end is followed at once by the last one, which gives the
+// event up.
+func nextAttempt(first, ended time.Time, n int) time.Time {
+	next := ended.Add(retryWait(n))
+	if end := first.Add(retryWindow); end.Before(next) {
 		return end
 	}
 	return next

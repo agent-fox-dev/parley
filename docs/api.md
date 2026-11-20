@@ -10537,7 +10537,11 @@ making the subscription `failing`.
 **Retries.** After a failed attempt the hub waits 10 s, then twice as long
 after each further failure, up to 1 hour, but never past 24 hours after the
 event's first attempt, so the waits are 10, 20, 40, 80, 160, 320, 640, 1280,
-2560, 3600, 3600, … seconds. Every attempt reads the subscription's current
+2560, 3600, 3600, … seconds. A wait is counted from the moment the failed
+attempt ended, so the receiver never gets a retry sooner than the wait
+after the request it failed; `next_attempt_at`, written in whole seconds
+like every timestamp, can read up to a second earlier than the retry.
+Every attempt reads the subscription's current
 `url`, `types` and secret. A failed attempt sets `last_status` `failed` and
 `last_delivery_at`, and `failing_since` when it is `null`. An attempt that
 fails 24 hours or more after the event's first attempt gives the event up:

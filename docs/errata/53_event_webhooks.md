@@ -51,6 +51,19 @@ status. The sender bounds the whole attempt with it: resolving the host,
 the dial and the TLS handshake included, so that no attempt outlasts the
 timeout. `duration_ms` is measured in wall time.
 
+## The wait before a retry is counted from the end of the failed attempt
+
+The package schedules the next attempt 10 s, and then the doubled waits,
+after a failure. The loop counts the wait from the moment the failed
+attempt ended, read untruncated from the clock, while the attempt's
+recorded time (`last_attempt_at`, `last_delivery_at`, `failing_since`)
+stays cut to the whole second like every timestamp of the hub. So a
+receiver never gets the retry sooner than the wait after the request it
+failed, however long that request took. The 24-hour window still ends
+24 hours after the first attempt's recorded time: an attempt that began
+inside it and ended past its end is followed at once by the last attempt,
+which gives the event up.
+
 ## A recorded delivery moves the position to just before its event
 
 The package moves the position past an event when its delivery succeeds or
