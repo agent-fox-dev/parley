@@ -793,6 +793,41 @@ func TestGit_EndsWithTheContextAndLeavesNoGitProcess(t *testing.T) {
 	}
 }
 
+// A fetch ends in git's automatic housekeeping. Detached, it would outlive
+// the call as an orphan of no process of the hub's, and a zombie in a
+// container whose PID 1 is parleyd; run as part of the command, it has
+// repacked the copy by the time the call returns.
+func TestGit_FinishesTheHousekeepingACommandStartsBeforeItReturns(t *testing.T) {
+	t.Parallel()
+	o := gitrepotest.SmartOrigin(t)
+	o.History()
+	g := gitrepo.Git{Env: o.Env()}
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "copy.git")
+	if err := g.Clone(ctx, o.URL(), gitrepo.Credential{}, dir); err != nil {
+		t.Fatal(err)
+	}
+	// The fetch keeps what it receives as a second pack, and two packs are
+	// more than the copy allows before git's gc repacks it on its own (gc,
+	// not the geometric repack later gits run by default, so that one
+	// fetch is enough).
+	gitrepotest.Git(t, dir, "config", "fetch.unpackLimit", "1")
+	gitrepotest.Git(t, dir, "config", "gc.autoPackLimit", "1")
+	gitrepotest.Git(t, dir, "config", "maintenance.strategy", "gc")
+	o.Commit("main", "fourth")
+
+	if _, err := g.FetchOrigin(ctx, dir, o.URL(), gitrepo.Credential{}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	packs, err := filepath.Glob(filepath.Join(dir, "objects", "pack", "*.pack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packs) != 1 {
+		t.Errorf("the copy holds %d packs when FetchOrigin returns, want 1: the housekeeping the fetch started still runs", len(packs))
+	}
+}
+
 // Not parallel: it puts a fake ssh first on the PATH of the test process,
 // which git finds through the PATH it is given.
 func TestGit_RunsSSHInBatchModeUnlessTheCallerGivesItsOwnCommand(t *testing.T) {
