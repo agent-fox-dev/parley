@@ -1,0 +1,161 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "57",
+  "spec_name": "cli_mcp_server",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/cli/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "09",
+      "reason": "declares parley mcp through the command helper and reads every command's declaration, flags and JSON help, the settings resolution, the error envelopes and the exit codes"
+    },
+    {
+      "spec": "56",
+      "reason": "calls GET …/sandboxes/:id/tools and POST …/sandboxes/:id/tools/:name for --sandbox, and uses its stand-in tool server in the end-to-end test"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Select the commands and print them as tools with parley mcp --list",
+      "criteria": [
+        "REQ-1",
+        "REQ-2.1",
+        "REQ-2.2",
+        "REQ-2.3"
+      ],
+      "steps": [
+        "Add the selection's and the definitions' behaviours to a new internal/cli/mcp_test.go, with probe commands added through options.extra where a rule needs a command the real tree lacks, and confirm they fail",
+        "Declare parley mcp with declare, auth user, with the flags --list, --groups (default activity,change,claim,fork,land,sandbox,scm,workspace:read), --read-only, --workspace, --sandbox, --no-code-mode and --script-timeout, and add it to the root. With --list it needs neither an endpoint nor a credential unless --sandbox is given",
+        "Keep with each command what its tool needs and the JSON help does not show: whether it shows a secret once (the declaration's ShowsOnce), and a new mark of the declaration for a command that needs a terminal or runs until interrupted, set on sandbox shell and events tail, and one for a flag that makes its command run until interrupted, set on the follow flag of sandbox logs",
+        "Read --groups: each element is a group name or name:read; a never-served group (admin, keys, tokens, secrets, login, credential-helper, help, version, mcp) is a usage_error naming it; an unknown name, an empty element or another suffix is a usage_error listing the names that may be given",
+        "Select the commands of the named groups, those of a :read group and all of them under --read-only only when their method is GET, and drop by rule every command whose auth is admin or none, that shows a secret once or that carries the terminal mark, whatever group it is in",
+        "Make each selected command a tool definition: the name from its words, the description, and an input schema that is an object without additional properties, with one string per argument and one typed parameter per flag, named as the PRD's decision 14 says, without api-key, endpoint-url, json, poll-interval and the flags marked as running until interrupted; required as the command requires them",
+        "With --workspace, make the parameters of the arguments slug, workspace-slug, WORKSPACE and parent optional and remember the workspace as their default",
+        "Refuse more than 150 tools with a usage_error that says how many and to narrow --groups",
+        "Print the definitions with --list as one JSON array of {name, description, input_schema}, ordered by name, and exit 0",
+        "Describe parley mcp, its flags and the selection rules in docs/cli.md"
+      ],
+      "touches": [
+        "internal/cli/mcp.go",
+        "internal/cli/mcp_test.go",
+        "internal/cli/command.go",
+        "internal/cli/root.go",
+        "internal/cli/sandbox.go",
+        "internal/cli/events.go",
+        "internal/cli/help_test.go",
+        "docs/cli.md"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Run the command when its tool is called",
+      "criteria": [
+        "REQ-2.4",
+        "REQ-3"
+      ],
+      "steps": [
+        "Add the call's behaviours to internal/cli/mcp_test.go against the stub hub, calling each tool's handler, and confirm they fail",
+        "Give each tool definition a handler that takes the call's JSON parameters and returns a result of ok, data, error, detail and text. It needs nothing of agentkit-go yet; task 3 hands the handlers to its runner",
+        "Check the parameters against the tool's schema first: an unknown one, one of the wrong type or a missing required one is a usage_error result naming it, and nothing runs",
+        "Turn the parameters into the command's line: the arguments in their declared order, with the workspace of --workspace for a workspace argument left out, and each flag as the shell takes it, a boolean only when true and an array once per element; add the endpoint and the credential resolved at start",
+        "Run the command through its own cobra command in this process, as run does for the shell, with stdout and stderr captured and under a context that ends after the call bound, a setting of options whose default is 30 minutes; a call that reaches it is the result timeout",
+        "Give the run a standard input whose read fails, so that a parameter of - where the command reads standard input ends as a usage_error and the session's input is never touched",
+        "Make the result of what the command printed: a JSON object is data, another JSON value v is {\"result\": v}, nothing is {}",
+        "Make a failed result of the error the command ended with: the hub's envelope gives its error_type, or http_<code> without one, and its message; one of the CLI's own gives its type and message. A condition_not_met keeps the printed document as data",
+        "Leave waiting, confirm and local paths to the command: wait and timeout are its own flags, confirm its own flag, and a relative path is taken from the process's working directory",
+        "Describe in docs/cli.md how a command's arguments, flags, result and errors appear in its tool"
+      ],
+      "touches": [
+        "internal/cli/mcp.go",
+        "internal/cli/mcp_call.go",
+        "internal/cli/mcp_test.go",
+        "internal/cli/root.go",
+        "docs/cli.md"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Serve the tools in one MCP session on standard input and output",
+      "criteria": [
+        "REQ-4"
+      ],
+      "steps": [
+        "Before anything else, confirm that agentkit-go's PRD 16 is released: its package runner exists and runner, codemode, core, schema, guard and the module mcpserve build with CGO_ENABLED=0 and bring in no tree-sitter module and no provider SDK. If it is not, stop and report it: this task and the two after it cannot be done without it, and nothing of agentkit-go may be linked into parley before",
+        "Add github.com/agent-fox-dev/agentkit-go and its module mcpserve to go.mod at that release, and confirm against it the signatures the package lists, the unverified ones first",
+        "Add the session's behaviours to internal/cli/mcp_test.go, through the runner's Call, and to test/e2e/cli_test.go, through the built binary and an MCP client of the SDK over mcp.CommandTransport, and confirm they fail",
+        "Make a core.Tool of each tool definition: its name, its description, its input schema through schema.Parse, and its handler as Execute, mapping the result's ok, data, error, detail and text",
+        "Build the runner over the tools with a Toolset whose After writes the line of each finished call to stderr, {tool, ok, error for a failed one, duration_ms}, from the call's name, result and times alone",
+        "Resolve the endpoint and the credential once, as every command does, before the tools are built; without one the command ends with the usual client_error and exit status 2",
+        "Serve the runner with mcpserve.New and ServeStdio, with the name parley, the CLI's version from internal/buildinfo and instructions of at most three sentences built from --workspace, --sandbox and whether code_mode is served; nothing but the SDK writes to stdout",
+        "End the session when the client closes its end, exit 0, and on SIGINT or SIGTERM by ending the context ServeStdio and every running call run under",
+        "Add a test to test/e2e/build_test.go, or extend the one that builds the binaries, that builds cmd/parley with CGO_ENABLED=0",
+        "Describe the session, the stderr lines and the signals in docs/cli.md, and the tools' place in docs/architecture.md"
+      ],
+      "touches": [
+        "internal/cli/mcp.go",
+        "internal/cli/mcp_serve.go",
+        "internal/cli/mcp_test.go",
+        "test/e2e/cli_test.go",
+        "test/e2e/build_test.go",
+        "go.mod",
+        "go.sum",
+        "docs/cli.md",
+        "docs/architecture.md"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Add code_mode over the served tools",
+      "criteria": [
+        "REQ-5",
+        "REQ-1.1"
+      ],
+      "steps": [
+        "Add code mode's behaviours to internal/cli/mcp_test.go and the start line to the session test of test/e2e/cli_test.go, and confirm they fail",
+        "Build the code mode tool with codemode.New over every other served tool, with agentkit-go's default options and MaxTimeout from --script-timeout, 10 minutes by default; register it after the others, and leave it out with --no-code-mode",
+        "Refuse a --script-timeout below 1 second, above 30 minutes or that is not a duration with a usage_error naming the flag, also with --list",
+        "Give the Toolset the guard guard.AllowAll when a tool named execute or run_command is reachable: the hub decides who may call a sandbox's shell tools, and the CLI adds no guard of its own",
+        "A script's calls go through the runner, so each is checked, run, bounded and written to stderr as a direct call is; add nothing for them",
+        "Write the start line to stderr before the session is served: {tools, code_mode_description_bytes}, the second from the BuildInfo and 0 without code mode",
+        "List code_mode last in --list, with its generated description and its input schema",
+        "Describe code_mode, --script-timeout and --no-code-mode in docs/cli.md"
+      ],
+      "touches": [
+        "internal/cli/mcp.go",
+        "internal/cli/mcp_serve.go",
+        "internal/cli/mcp_test.go",
+        "test/e2e/cli_test.go",
+        "docs/cli.md"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Serve a sandbox's tools with --sandbox",
+      "criteria": [
+        "REQ-6"
+      ],
+      "steps": [
+        "Add the sandbox tools' behaviours to internal/cli/mcp_test.go against the stub hub and confirm they fail",
+        "Refuse --sandbox without --workspace with a usage_error naming --workspace, before any request",
+        "At start, also for --list, GET /workspaces/:slug/sandboxes/:id/tools with the command's client; an error ends the command with the hub's envelope on stderr and exit status 1, as a command that prints the hub's refusal does",
+        "Make a tool of each listed definition: its name, its description and its input_schema as the hub gave it; with --read-only leave out write_file, edit_file, execute and run_command",
+        "Refuse to start with a client_error, exit status 2, when a sandbox tool has the name of a command tool or of code_mode, naming the tool and the command",
+        "Serve the sandbox tools after the command tools and before code_mode, and bind them to code_mode with the others",
+        "A call sends POST …/tools/:name with the body {\"input\": parameters} and no timeout member, under the call bound, and gives the hub's ok, data, error, detail and text as the result; an error envelope is a failed result with its error_type, or http_<code> without one",
+        "Describe --sandbox and what --read-only does to a sandbox's tools in docs/cli.md"
+      ],
+      "touches": [
+        "internal/cli/mcp.go",
+        "internal/cli/mcp_sandbox.go",
+        "internal/cli/mcp_test.go",
+        "test/e2e/sandbox_use_test.go",
+        "docs/cli.md"
+      ]
+    }
+  ]
+}
