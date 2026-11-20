@@ -307,8 +307,9 @@ type restoredHub struct {
 	// names.
 	dir, addr string
 	rt        *hub.Runtime
-	// calls counts the runs of the start hook, bound says whether the hook
-	// reached a listener on addr, rows is the count of a it read.
+	// calls counts the runs of the start hook, bound says whether a
+	// connection the hook made to addr reached another listener than the
+	// test's reservation, rows is the count of a it read.
 	calls, rows atomic.Int64
 	bound       atomic.Bool
 }
@@ -318,12 +319,16 @@ type restoredHub struct {
 // parts of compose and a start hook that reads table a and dials the
 // address.
 //
-// The test holds the port until the hook runs: the hub binds the address
+// The test holds the port until the hook ends: the hub binds the address
 // of its config.toml itself, which a listener handed to it would bypass,
-// so the port is reserved by a listener of the test that the hook closes
-// before it dials. Another process can then take the port only in the
-// moment between the hook and the bind; and a hub that bound before its
-// hooks ran finds the port taken and does not start.
+// so the port is reserved by a listener of the test, and the hook dials the
+// address while the reservation still holds it and closes the reservation
+// last. A connection that arrives at the reservation shows that no other
+// listener, the hub's included, had the address; released before the dial,
+// the port could be taken by any listener of the tests running beside this
+// one, which the dial would then reach. Another process can take the port
+// only in the moment between the hook and the bind; and a hub that bound
+// before its hooks ran finds the port taken and does not start.
 func startRestored(t *testing.T, snapshot string, env config.Env, compose func(*hub.Composition)) *restoredHub {
 	t.Helper()
 	reserved, err := net.Listen("tcp", "127.0.0.1:0")
@@ -338,12 +343,9 @@ func startRestored(t *testing.T, snapshot string, env config.Env, compose func(*
 		compose(c)
 		c.AddStartHook("read_restored", func(ctx context.Context, rt *hub.Runtime) error {
 			r.calls.Add(1)
+			r.bound.Store(!reaches(reserved, r.addr))
 			if err := reserved.Close(); err != nil {
 				return err
-			}
-			if conn, err := net.DialTimeout("tcp", r.addr, time.Second); err == nil {
-				conn.Close()
-				r.bound.Store(true)
 			}
 			var n int64
 			if err := rt.Store.Main().QueryRowContext(ctx, "SELECT count(*) FROM a").Scan(&n); err != nil {
@@ -354,6 +356,24 @@ func startRestored(t *testing.T, snapshot string, env config.Env, compose func(*
 		})
 	}})
 	return r
+}
+
+// reaches says whether a connection made to addr is the one ln accepts.
+func reaches(ln net.Listener, addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	if err := ln.(*net.TCPListener).SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return false
+	}
+	in, err := ln.Accept()
+	if err != nil {
+		return false
+	}
+	defer in.Close()
+	return in.RemoteAddr().String() == conn.LocalAddr().String()
 }
 
 // pushNewCommit pushes one new commit onto main of the bare repository
