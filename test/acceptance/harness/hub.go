@@ -185,6 +185,11 @@ type Options struct {
 	// OwnBinary runs a link to parleyd placed alone in the working
 	// directory, instead of the shared build.
 	OwnBinary bool
+	// PublicHost, when set, is the host name other machines reach this
+	// one at, such as the sandboxes of an OpenShell gateway: the hub then
+	// listens on every address and its external URL names that host. The
+	// harness itself still calls it on the loopback address.
+	PublicHost string
 }
 
 // Hub is a parleyd process the harness started, with its directories.
@@ -312,8 +317,12 @@ func freePort(tb testing.TB) int {
 // writeConfig writes config.toml and the files of the options.
 func (h *Hub) writeConfig() {
 	h.t.Helper()
+	bind, external := "127.0.0.1", h.URL("")
+	if host := h.opts.PublicHost; host != "" {
+		bind, external = "0.0.0.0", "http://"+net.JoinHostPort(host, strconv.Itoa(h.Port))
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "[server]\nbind = \"127.0.0.1\"\nport = %d\nexternal_url = %q\n%s\n", h.Port, h.URL(""), h.opts.Server)
+	fmt.Fprintf(&b, "[server]\nbind = %q\nport = %d\nexternal_url = %q\n%s\n", bind, h.Port, external, h.opts.Server)
 	// The default rate limit throttles a scenario's own traffic, git's
 	// unauthenticated probes included, and mergeability otherwise lags 5 s.
 	if !hasTable(h.opts.TOML, "limits") {
