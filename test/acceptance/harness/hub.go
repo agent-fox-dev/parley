@@ -539,3 +539,26 @@ func EventuallyWithin(tb testing.TB, limit time.Duration, what string, cond func
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// Release runs fn(0) to fn(n-1), each in a goroutine of its own, held at a
+// start gate until all n are ready and then let go at the same moment, so
+// that their requests reach the hub together. It returns once they are let
+// go; wait returns once every fn has returned. fn must not fail the test
+// itself: it records what it saw for the test goroutine to judge.
+func Release(n int, fn func(i int)) (wait func()) {
+	var ready, done sync.WaitGroup
+	gate := make(chan struct{})
+	ready.Add(n)
+	done.Add(n)
+	for i := range n {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-gate
+			fn(i)
+		}()
+	}
+	ready.Wait()
+	close(gate)
+	return done.Wait
+}
