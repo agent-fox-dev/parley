@@ -1035,3 +1035,137 @@ func TestMCP_KeepsTheCredentialItReadAtStart(t *testing.T) {
 		t.Error("after a 401 the next call was not sent with the credential read at start")
 	}
 }
+
+// withCodeMode are the settings of parley mcp given no flag.
+func withCodeMode() mcpSettings { return mcpSettings{groups: mcpDefaultGroups} }
+
+// script calls code_mode of r with the script src.
+func runScript(t *testing.T, r *runner.Runner, src string) core.ToolResult {
+	t.Helper()
+	return runTool(t, r, "code_mode", map[string]any{"script": src})
+}
+
+// resultText is everything a result carries, as one text to search.
+func resultText(res core.ToolResult) string {
+	data, _ := json.Marshal(res.Data)
+	return res.Text + "\n" + string(data) + "\n" + res.Error + "\n" + res.Detail
+}
+
+func TestMCPList_ListsCodeModeAfterTheOtherTools(t *testing.T) {
+	tools := mcpList(t, defaultOptions())
+	without := mcpList(t, defaultOptions(), "--no-code-mode")
+	last := tools[len(tools)-1]
+	if last.Name != "code_mode" || len(tools) != len(without)+1 || !slices.Equal(toolNames(tools[:len(tools)-1]), toolNames(without)) {
+		t.Fatalf("the tools end with %s and are %d; want the %d tools of --no-code-mode and then code_mode", last.Name, len(tools), len(without))
+	}
+	if last.InputSchema.Properties["script"]["type"] != "string" || !strings.Contains(last.Description, "change_land") {
+		t.Errorf("code_mode takes %v and is described in %d bytes; want a script, and the bound tools declared in its description", last.InputSchema.Properties, len(last.Description))
+	}
+	if slices.Contains(toolNames(without), "code_mode") {
+		t.Error("--no-code-mode lists code_mode")
+	}
+	if len(tools) > 81 {
+		t.Errorf("the default selection has %d tools, want at most 80 and code_mode", len(tools))
+	}
+}
+
+func TestCodeMode_ChainsToolCallsInOneScript(t *testing.T) {
+	hub := newStubHub(t).
+		answer(http.MethodGet, "/api/v1/workspaces/demo", http.StatusOK, `{"slug":"demo","default_branch":"main"}`).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, changeThree).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/4", http.StatusOK, `{"number":4,"state":"landed","title":"Two"}`)
+	r, stderr := runnerOn(t, defaultOptions(), hub.URL, withCodeMode())
+	tools := r.Tools()
+	if last := tools[len(tools)-1]; last.Name != "code_mode" {
+		t.Fatalf("the last tool is %s, want code_mode", last.Name)
+	}
+	res := runScript(t, r, `
+def main():
+    ws = workspace_get(slug="demo")
+    changes = parallel([call(change_show, slug="demo", number="3"), call(change_show, slug="demo", number="4")])
+    return ws["default_branch"] + ":" + ",".join([c["title"] for c in changes])
+`)
+	if !res.OK || !strings.Contains(resultText(res), "main:One,Two") {
+		t.Fatalf("the script's result is %+v; want what it returned, main:One,Two", res)
+	}
+	if n := hub.requestCount(); n != 3 {
+		t.Errorf("the hub got %d requests, want the three the script made", n)
+	}
+	lines := callLines(t, stderr.String())
+	var called []string
+	for _, l := range lines {
+		called = append(called, l["tool"].(string))
+	}
+	slices.Sort(called)
+	if want := []string{"change_show", "change_show", "code_mode", "workspace_get"}; !slices.Equal(called, want) {
+		t.Errorf("stderr has lines for %v, want one for each call and one for the script: %v", called, want)
+	}
+}
+
+func TestCodeMode_MakesAScriptsCallAsADirectCallIsMade(t *testing.T) {
+	hub := newStubHub(t).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, changeThree).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/9", http.StatusNotFound, `{"error":{"code":404,"message":"no such change","error_type":"change_not_found"}}`)
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, withCodeMode())
+
+	runTool(t, r, "change_show", map[string]any{"slug": "demo", "number": "3", "include": "stack"})
+	direct := hub.last(t)
+	if res := runScript(t, r, `result = change_show(slug="demo", number="3", include="stack")["title"]`); !res.OK || !strings.Contains(resultText(res), "One") {
+		t.Fatalf("the script's result is %+v; want the change's title", res)
+	}
+	if byScript := hub.last(t); byScript.rawPath != direct.rawPath || byScript.query != direct.query || byScript.header.Get("Authorization") != direct.header.Get("Authorization") {
+		t.Errorf("the script's call sent %s?%s; a direct call sends %s?%s", byScript.rawPath, byScript.query, direct.rawPath, direct.query)
+	}
+
+	sent := hub.requestCount()
+	res := runScript(t, r, `
+def main():
+    missing = change_show(slug="demo", number="9")
+    refused = change_show(slug="demo", number="3", nope="x")
+    if is_error(missing) and is_error(refused):
+        return "missing=" + missing.error + " refused=" + refused.error
+    return "no error"
+`)
+	if !res.OK || !strings.Contains(resultText(res), "missing=change_not_found refused=invalid_arguments") {
+		t.Errorf("the script's result is %+v; want the errors a direct call gets, for the script to branch on", res)
+	}
+	if n := hub.requestCount() - sent; n != 1 {
+		t.Errorf("the script's two calls sent %d requests, want one: the refused call sends none", n)
+	}
+}
+
+func TestCodeMode_BoundsAScriptByTheScriptTimeout(t *testing.T) {
+	for _, row := range []struct {
+		flag string
+		want time.Duration
+	}{{"", 10 * time.Minute}, {"1s", time.Second}, {"90s", 90 * time.Second}, {"30m", 30 * time.Minute}} {
+		s := withCodeMode()
+		s.scriptTimeout = row.flag
+		if got := toolSessionOn(t, defaultOptions(), "http://hub.invalid", s).scriptTimeout; got != row.want {
+			t.Errorf("--script-timeout %q bounds a script at %s, want %s", row.flag, got, row.want)
+		}
+	}
+	hub := newStubHub(t).handle(http.MethodGet, "/api/v1/workspaces/demo", func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	s := withCodeMode()
+	s.scriptTimeout = "1s"
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, s)
+	start := time.Now()
+	res := runScript(t, r, `result = workspace_get(slug="demo")`)
+	if res.OK || time.Since(start) > 5*time.Second || !strings.Contains(strings.ToLower(resultText(res)), "time") {
+		t.Errorf("after %s the script's result is %+v; want it ended at its bound of 1s with a timeout error", time.Since(start), res)
+	}
+}
+
+func TestMCP_RefusesAScriptTimeoutOutOfRange(t *testing.T) {
+	for _, value := range []string{"0s", "999ms", "31m", "soon", "1d"} {
+		t.Run(value, func(t *testing.T) {
+			code, stdout, stderr := runMCP(t, defaultOptions(), "--list", "--script-timeout", value)
+			wantUsageError(t, code, stdout, stderr, "script-timeout")
+		})
+	}
+	for _, value := range []string{"1s", "30m"} {
+		if code, _, stderr := runMCP(t, defaultOptions(), "--list", "--script-timeout", value); code != 0 {
+			t.Errorf("--script-timeout %s: exit status %d, %s; want it accepted", value, code, stderr)
+		}
+	}
+}

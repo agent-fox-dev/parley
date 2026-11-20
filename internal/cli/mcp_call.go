@@ -10,6 +10,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The errors of a tool call that are not a command's own.
@@ -48,6 +49,31 @@ type toolSession struct {
 	opts  options
 	st    settings
 	tools []commandTool
+	// codeMode says whether code_mode is served, and scriptTimeout bounds
+	// one of its scripts' wall time.
+	codeMode      bool
+	scriptTimeout time.Duration
+}
+
+// The bounds of --script-timeout, and its default: longer than code mode's
+// own 30 seconds, because one change_land with wait can take minutes.
+const (
+	defaultScriptTimeout = 10 * time.Minute
+	minScriptTimeout     = time.Second
+	maxScriptTimeout     = 30 * time.Minute
+)
+
+// readScriptTimeout reads --script-timeout: a duration from 1 second to 30
+// minutes, 10 minutes when it is not given.
+func readScriptTimeout(value string) (time.Duration, error) {
+	if value == "" {
+		return defaultScriptTimeout, nil
+	}
+	d, err := parseDuration(value)
+	if err != nil || d < minScriptTimeout || d > maxScriptTimeout {
+		return 0, usageError("--script-timeout must be a duration from 1s to 30m, such as 90s; got %q", value)
+	}
+	return d, nil
 }
 
 // newToolSession builds the session of the settings s over the command tree
@@ -60,7 +86,11 @@ func newToolSession(opts options, st settings, s mcpSettings) (*toolSession, err
 	if len(tools) > maxMCPTools {
 		return nil, usageError("the selection has %d tools, more than the %d one session serves; narrow --groups", len(tools), maxMCPTools)
 	}
-	return &toolSession{opts: opts, st: st, tools: tools}, nil
+	scriptTimeout, err := readScriptTimeout(s.scriptTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &toolSession{opts: opts, st: st, tools: tools, codeMode: !s.noCodeMode, scriptTimeout: scriptTimeout}, nil
 }
 
 // call calls the tool name with the JSON parameters input.

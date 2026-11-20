@@ -25,3 +25,13 @@ A call the runner refuses before the tool ran is written to stderr with
 failed. Code: `internal/cli/mcp_serve.go` (`callLog`); tests:
 `TestMCP_ServesACommandToolThroughTheRunnerAsTheSessionCallsIt`,
 `TestMCP_WritesOneLineToStderrForEveryToolCall`.
+
+## A session lists its tools by name
+
+The package serves `code_mode` after the other tools, and a sandbox's tools
+after the command tools. `parley mcp --list` prints them in that order. In a
+session, `tools/list` is answered by the MCP SDK behind agentkit-go's
+`mcpserve`, which lists a server's tools by name, so `code_mode` and a
+sandbox's tools stand among the command tools there. Which tools are served
+and what `code_mode` is bound to are the same in both. Test:
+`TestMCP_SaysAtStartHowManyToolsItServesAndWhatCodeModeCosts`.

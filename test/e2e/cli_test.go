@@ -386,3 +386,43 @@ func TestMCP_EndsItsSessionAndItsCallsOnASignal(t *testing.T) {
 		})
 	}
 }
+
+func TestMCP_SaysAtStartHowManyToolsItServesAndWhatCodeModeCosts(t *testing.T) {
+	parallel(t)
+	h := hubtest.Start(t, nil)
+	key := h.IssueKey(t, h.CreateUser(t, "dana"))
+	for _, row := range []struct {
+		name string
+		args []string
+	}{{"with code mode", []string{"--groups", "workspace:read"}}, {"without", []string{"--groups", "workspace:read", "--no-code-mode"}}} {
+		t.Run(row.name, func(t *testing.T) {
+			p := startMCP(t, h.URL(""), key, row.args...)
+			list, err := p.session.ListTools(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The session lists its tools by name, as the MCP server does;
+			// --list prints them in the order they are served.
+			wantBytes, hasCodeMode := 0, false
+			for _, tool := range list.Tools {
+				if tool.Name == "code_mode" {
+					wantBytes, hasCodeMode = len(tool.Description), true
+				}
+			}
+			if hasCodeMode != (row.name == "with code mode") {
+				t.Errorf("the session serves code_mode: %v", hasCodeMode)
+			}
+			first, _, _ := strings.Cut(p.stderr.String(), "\n")
+			var line struct {
+				Tools *int `json:"tools"`
+				Bytes *int `json:"code_mode_description_bytes"`
+			}
+			if err := json.Unmarshal([]byte(first), &line); err != nil || line.Tools == nil || line.Bytes == nil {
+				t.Fatalf("the first line of stderr is %q; want one JSON object with tools and code_mode_description_bytes", first)
+			}
+			if *line.Tools != len(list.Tools) || *line.Bytes != wantBytes {
+				t.Errorf("the start line says %d tools and %d bytes; the session lists %d tools and a code_mode description of %d bytes", *line.Tools, *line.Bytes, len(list.Tools), wantBytes)
+			}
+		})
+	}
+}

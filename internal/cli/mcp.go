@@ -92,7 +92,7 @@ func runMCPCommand(c *call) error {
 		return err
 	}
 	if s.list {
-		return printTools(c, session.tools)
+		return printTools(c, session)
 	}
 	if session.st, err = resolveSettings(c.cmd); err != nil {
 		return err
@@ -100,18 +100,18 @@ func runMCPCommand(c *call) error {
 	return session.serve(c.ctx, c.stderr, s)
 }
 
-// listedTool is a tool as --list prints it.
+// toolListing is a tool as --list prints it.
 type toolListing struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
-// printTools prints tools as one JSON array.
-func printTools(c *call, tools []commandTool) error {
-	list := make([]toolListing, 0, len(tools))
-	for _, t := range tools {
-		list = append(list, toolListing{Name: t.name, Description: t.description, InputSchema: t.schema()})
+// printTools prints the tools session serves as one JSON array.
+func printTools(c *call, session *toolSession) error {
+	list, err := session.listing()
+	if err != nil {
+		return err
 	}
 	out, err := json.Marshal(list)
 	if err != nil {

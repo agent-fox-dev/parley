@@ -7,10 +7,13 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"sync"
 	"syscall"
 
+	"github.com/agent-fox-dev/agentkit-go/codemode"
 	"github.com/agent-fox-dev/agentkit-go/core"
+	"github.com/agent-fox-dev/agentkit-go/guard"
 	"github.com/agent-fox-dev/agentkit-go/mcpserve"
 	"github.com/agent-fox-dev/agentkit-go/runner"
 	"github.com/agent-fox-dev/agentkit-go/schema"
@@ -37,6 +40,26 @@ func mcpInstructions(s mcpSettings) string {
 		text += " Use code_mode to chain several tool calls in one script."
 	}
 	return text
+}
+
+// shellTools are the tools agentkit-go lets a runner reach only with a
+// guard.
+var shellTools = []string{"execute", "run_command"}
+
+// served are the tools the session serves, in the order it serves them: the
+// command tools and then code_mode, agentkit-go's tool that runs a script
+// over all the others, unless the session leaves it out. descriptionBytes
+// is the size of code_mode's description, which declares every tool it is
+// bound to; 0 without it.
+func (s *toolSession) served() (tools []core.Tool, descriptionBytes int, err error) {
+	if tools, err = s.coreTools(); err != nil || !s.codeMode {
+		return tools, 0, err
+	}
+	codeMode, info, err := codemode.New(tools, codemode.Options{MaxTimeout: s.scriptTimeout})
+	if err != nil {
+		return nil, 0, clientError("cannot bind code_mode to the tools: %v", err)
+	}
+	return append(tools, codeMode), info.DescriptionBytes, nil
 }
 
 // coreTools are the session's tools as agentkit-go runs them: each with its
@@ -133,16 +156,46 @@ func (l *callLog) event(e core.Event) {
 // runner is the runner of the session's tools, which logs every call it
 // runs to stderr (see callLog).
 func (s *toolSession) runner(stderr io.Writer) (*runner.Runner, error) {
-	tools, err := s.coreTools()
+	r, _, err := s.build(stderr)
+	return r, err
+}
+
+// build is runner, with the size of code_mode's description.
+func (s *toolSession) build(stderr io.Writer) (*runner.Runner, int, error) {
+	tools, descriptionBytes, err := s.served()
+	if err != nil {
+		return nil, 0, err
+	}
+	log := &callLog{stderr: stderr, errors: map[string]string{}}
+	set := runner.Toolset{Tools: tools, After: log.after, Events: log.event}
+	// A shell tool is a sandbox's: it runs in the sandbox, and the hub
+	// decides who may call it. The CLI adds no guard of its own, and says
+	// so, which agentkit-go asks of a runner that reaches one.
+	if slices.ContainsFunc(tools, func(t core.Tool) bool { return slices.Contains(shellTools, t.Name) }) {
+		set.Guard = guard.AllowAll
+	}
+	r, err := runner.New(set)
+	if err != nil {
+		return nil, 0, clientError("cannot serve the tools: %v", err)
+	}
+	return r, descriptionBytes, nil
+}
+
+// listing is the tools the session serves, as --list prints them.
+func (s *toolSession) listing() ([]toolListing, error) {
+	tools, _, err := s.served()
 	if err != nil {
 		return nil, err
 	}
-	log := &callLog{stderr: stderr, errors: map[string]string{}}
-	r, err := runner.New(runner.Toolset{Tools: tools, After: log.after, Events: log.event})
-	if err != nil {
-		return nil, clientError("cannot serve the tools: %v", err)
+	list := make([]toolListing, 0, len(tools))
+	for _, t := range tools {
+		input, err := json.Marshal(t.InputSchema)
+		if err != nil {
+			return nil, clientError("the input schema of the tool %s: %v", t.Name, err)
+		}
+		list = append(list, toolListing{Name: t.Name, Description: t.Description, InputSchema: input})
 	}
-	return r, nil
+	return list, nil
 }
 
 // serve serves the session's tools in one MCP session on the process's
@@ -151,10 +204,17 @@ func (s *toolSession) runner(stderr io.Writer) (*runner.Runner, error) {
 // context every call runs under, the calls that run. Only the protocol is
 // written to standard output.
 func (s *toolSession) serve(ctx context.Context, stderr io.Writer, settings mcpSettings) error {
-	r, err := s.runner(stderr)
+	r, descriptionBytes, err := s.build(stderr)
 	if err != nil {
 		return err
 	}
+	// What the session costs a model before its first call: every tool is
+	// declared to it, and code_mode declares each again.
+	start, _ := json.Marshal(struct {
+		Tools int `json:"tools"`
+		Bytes int `json:"code_mode_description_bytes"`
+	}{len(r.Tools()), descriptionBytes})
+	_, _ = stderr.Write(append(start, '\n'))
 	server, err := mcpserve.New(r, mcpserve.Options{
 		Name:         mcpServerName,
 		Version:      buildinfo.Get().Version,
