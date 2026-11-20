@@ -85,11 +85,11 @@
         "REQ-4"
       ],
       "steps": [
-        "Before anything else, confirm that agentkit-go's PRD 16 is released: its package runner exists and runner, codemode, core, schema, guard and the module mcpserve build with CGO_ENABLED=0 and bring in no tree-sitter module and no provider SDK. If it is not, stop and report it: this task and the two after it cannot be done without it, and nothing of agentkit-go may be linked into parley before",
-        "Add github.com/agent-fox-dev/agentkit-go and its module mcpserve to go.mod at that release, and confirm against it the signatures the package lists, the unverified ones first",
+        "Add github.com/agent-fox-dev/agentkit-go and its module github.com/agent-fox-dev/agentkit-go/mcpserve to go.mod at the newest release that holds the package runner, or, while none is tagged, at a pseudo-version of the commit 20c16c9 of its main branch or a later one, and confirm against it the signatures the package lists",
+        "Import only runner, codemode, core, schema, guard and mcpserve of it, and confirm that parley then builds with CGO_ENABLED=0 and that go list -deps of cmd/parley names no tree-sitter module and no provider SDK",
         "Add the session's behaviours to internal/cli/mcp_test.go, through the runner's Call, and to test/e2e/cli_test.go, through the built binary and an MCP client of the SDK over mcp.CommandTransport, and confirm they fail",
         "Make a core.Tool of each tool definition: its name, its description, its input schema through schema.Parse, and its handler as Execute, mapping the result's ok, data, error, detail and text",
-        "Build the runner over the tools with a Toolset whose After writes the line of each finished call to stderr, {tool, ok, error for a failed one, duration_ms}, from the call's name, result and times alone",
+        "Build the runner with runner.New over the tools, with a Toolset whose After writes the line of each finished call to stderr, {tool, ok, error for a failed one, duration_ms}, from the call's name, result and times alone",
         "Resolve the endpoint and the credential once, as every command does, before the tools are built; without one the command ends with the usual client_error and exit status 2",
         "Serve the runner with mcpserve.New and ServeStdio, with the name parley, the CLI's version from internal/buildinfo and instructions of at most three sentences built from --workspace, --sandbox and whether code_mode is served; nothing but the SDK writes to stdout",
         "End the session when the client closes its end, exit 0, and on SIGINT or SIGTERM by ending the context ServeStdio and every running call run under",

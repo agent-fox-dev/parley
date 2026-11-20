@@ -4,11 +4,11 @@
 
 - **Spec:** `57_cli_mcp_server` (id `57`, name `cli_mcp_server`)
 - **Title:** Serve the CLI's commands as tools over MCP, with code mode
-- **Status:** draft
+- **Status:** active
 - **Schema version:** 3
 - **Created:** 2026-11-20T15:38:04Z
 - **Source:** docs/prd/19_cli_mcp_server.md
-- **Intent hash:** none (the spec has not been activated)
+- **Intent hash:** `069d46bfa18c21c019e09c62ee49c197b88a7ba3975b74e1d4dc51c9f5ae88c7`
 
 
 # Serve the CLI's commands as tools over MCP, with code mode
@@ -235,7 +235,8 @@ route's method is `GET`. The default is
    that forks has to name the fork, which a removed parameter would
    prevent.
 5. **`parley` stays pure Go; agentkit-go is slimmed first** (owner's
-   decision). This PRD waits for agentkit-go's PRD 16.
+   decision). This PRD waited for agentkit-go's PRD 16, which is built
+   (see Verified External API).
 6. **`group:read` instead of a special case for `workspace`**: the default
    wants the workspace reads without archive and delete, and the same
    suffix is useful for every group.
@@ -299,7 +300,7 @@ route's method is `GET`. The default is
 - PRD 18, package 56 `sandbox_tool_routes` (active, every task done): the
   two REST routes `--sandbox` uses. Everything but `--sandbox` works
   without it.
-- agentkit-go PRD 16 (in pull request 185 of that repository, not built):
+- agentkit-go PRD 16 (built, on that repository's `main` at `20c16c9`):
   the runner, code mode and MCP serving without cgo and providers. Hard
   dependency.
 - Package 49 `agent_sessions_and_usage` (active, every task done): its
@@ -349,13 +350,23 @@ Read the same way when the package was written, in the checkout at
   `github.com/modelcontextprotocol/go-sdk` v1.8.0, which `go.mod` holds
   since package 56, is the client transport the session's tests use.
 
-**Not built**: package `runner` and `runner.New` (agentkit-go PRD 16); the
-signatures above are today's, under the root package. Today `codemode`
-depends on 15 tree-sitter and provider packages and `mcpserve` on 62, so
-linking them needs cgo: **this package cannot meet goal 6, and tasks 3 to 5
-cannot be implemented, until agentkit-go PRD 16 is built and released.**
-**Unverified**: whether `mcpserve` serves a `core.Tool` with only `Execute`
-set (the runner's contract says it runs one).
+agentkit-go's PRD 16 has since been built (its `main` at `20c16c9`, 47
+commits after `v0.9.1`, not yet tagged), and read there:
+
+- `runner.New(ts runner.Toolset) (*runner.Runner, error)` in
+  `github.com/agent-fox-dev/agentkit-go/runner`; `Toolset` has `Tools`,
+  `Policy`, `Guard`, `After` and `Events`; the runner has `Call`, `Batch`,
+  `Reachable` and `Tools`. It refuses a tool with neither or both of
+  `Handler` and `Execute`, so a tool with only `Execute` is run.
+- `mcpserve.New(r *runner.Runner, opts mcpserve.Options) (*mcpserve.Server, error)`
+  serves `r.Tools()` and refuses a tool whose input schema is not an
+  object with `"type": "object"`.
+- `runner`, `codemode`, `core`, `schema`, `guard` and the module `mcpserve`
+  build with `CGO_ENABLED=0` and depend on no tree-sitter module and no
+  provider SDK.
+
+Until agentkit-go tags a release, `go.mod` takes both modules at a
+pseudo-version of that commit or a later one.
 
 ## Glossary
 
@@ -723,7 +734,7 @@ a new test in test/e2e/cli_test.go: session over `parley mcp --read-only`; ListT
 
 ## External APIs
 
-### `github.com/agent-fox-dev/agentkit-go` (v0.9.1) — verified
+### `github.com/agent-fox-dev/agentkit-go` (main at 20c16c9, 47 commits after v0.9.1) — verified
 
 | Symbol | Import Path | Signature | Notes |
 |--------|-------------|-----------|-------|
@@ -736,15 +747,10 @@ a new test in test/e2e/cli_test.go: session over `parley mcp --read-only`; ListT
 | `Options (fields)` | `github.com/agent-fox-dev/agentkit-go/codemode` | `Name string; MaxTimeout time.Duration; MaxSteps uint64; MaxCalls int; MaxConcurrentCalls int; MaxOutputBytes int; SpillDir string; DisableSpill bool` |  |
 | `BuildInfo (fields)` | `github.com/agent-fox-dev/agentkit-go/codemode` | `DescriptionBytes int; DescriptionChars int; BoundToolsCount int` |  |
 | `AllowAll` | `github.com/agent-fox-dev/agentkit-go/guard` | `func AllowAll(context.Context, core.BeforeToolCallContext) core.BeforeToolCallDecision` |  |
-| `Runner.Call, Runner.Reachable` | `github.com/agent-fox-dev/agentkit-go` | `func (r *Runner) Call(ctx context.Context, name string, input json.RawMessage) core.ToolResult; func (r *Runner) Reachable() []core.Tool` |  |
-| `New, Server.ServeStdio, Options (fields)` | `github.com/agent-fox-dev/agentkit-go/mcpserve` | `func New(r *agentkit.Runner, opts Options) (*Server, error); func (s *Server) ServeStdio(ctx context.Context) error; Name string; Version string; Instructions string; Logger *slog.Logger` |  |
-
-### `github.com/agent-fox-dev/agentkit-go` (v0.9.1) — UNVERIFIED — confirm these signatures before use
-
-| Symbol | Import Path | Signature | Notes |
-|--------|-------------|-----------|-------|
 | `New` | `github.com/agent-fox-dev/agentkit-go/runner` | `func New(ts Toolset) (*Runner, error)` |  |
 | `Toolset (fields)` | `github.com/agent-fox-dev/agentkit-go/runner` | `Tools []core.Tool; Policy core.ToolPolicy; Guard core.BeforeToolCall; After core.AfterToolCall; Events func(core.Event)` |  |
+| `Runner.Call, Runner.Reachable, Runner.Tools` | `github.com/agent-fox-dev/agentkit-go/runner` | `func (r *Runner) Call(ctx context.Context, name string, input json.RawMessage) core.ToolResult; func (r *Runner) Reachable() []core.Tool; func (r *Runner) Tools() []core.Tool` |  |
+| `New, Server.ServeStdio, Options (fields)` | `github.com/agent-fox-dev/agentkit-go/mcpserve` | `func New(r *runner.Runner, opts Options) (*Server, error); func (s *Server) ServeStdio(ctx context.Context) error; Name string; Version string; Instructions string; Logger *slog.Logger` |  |
 
 ### `github.com/modelcontextprotocol/go-sdk` (v1.8.0) — verified
 
@@ -839,11 +845,11 @@ a new test in test/e2e/cli_test.go: session over `parley mcp --read-only`; ListT
 
 **Steps:**
 
-- 3.1 Before anything else, confirm that agentkit-go's PRD 16 is released: its package runner exists and runner, codemode, core, schema, guard and the module mcpserve build with CGO_ENABLED=0 and bring in no tree-sitter module and no provider SDK. If it is not, stop and report it: this task and the two after it cannot be done without it, and nothing of agentkit-go may be linked into parley before
-- 3.2 Add github.com/agent-fox-dev/agentkit-go and its module mcpserve to go.mod at that release, and confirm against it the signatures the package lists, the unverified ones first
+- 3.1 Add github.com/agent-fox-dev/agentkit-go and its module github.com/agent-fox-dev/agentkit-go/mcpserve to go.mod at the newest release that holds the package runner, or, while none is tagged, at a pseudo-version of the commit 20c16c9 of its main branch or a later one, and confirm against it the signatures the package lists
+- 3.2 Import only runner, codemode, core, schema, guard and mcpserve of it, and confirm that parley then builds with CGO_ENABLED=0 and that go list -deps of cmd/parley names no tree-sitter module and no provider SDK
 - 3.3 Add the session's behaviours to internal/cli/mcp_test.go, through the runner's Call, and to test/e2e/cli_test.go, through the built binary and an MCP client of the SDK over mcp.CommandTransport, and confirm they fail
 - 3.4 Make a core.Tool of each tool definition: its name, its description, its input schema through schema.Parse, and its handler as Execute, mapping the result's ok, data, error, detail and text
-- 3.5 Build the runner over the tools with a Toolset whose After writes the line of each finished call to stderr, {tool, ok, error for a failed one, duration_ms}, from the call's name, result and times alone
+- 3.5 Build the runner with runner.New over the tools, with a Toolset whose After writes the line of each finished call to stderr, {tool, ok, error for a failed one, duration_ms}, from the call's name, result and times alone
 - 3.6 Resolve the endpoint and the credential once, as every command does, before the tools are built; without one the command ends with the usual client_error and exit status 2
 - 3.7 Serve the runner with mcpserve.New and ServeStdio, with the name parley, the CLI's version from internal/buildinfo and instructions of at most three sentences built from --workspace, --sandbox and whether code_mode is served; nothing but the SDK writes to stdout
 - 3.8 End the session when the client closes its end, exit 0, and on SIGINT or SIGTERM by ending the context ServeStdio and every running call run under
