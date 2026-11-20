@@ -128,6 +128,6 @@ files, as their commands do; `docs/cli.md` lists them.
   tool's result.
 - The first path's stderr has six lines, not five: the five commands and
   `code_mode` itself.
-- `go.mod` takes agentkit-go and its module `mcpserve` at pseudo-versions
-  of the commit `20c16c9`, since no release holds the `runner` package
-  yet.
+- `go.mod` takes agentkit-go at `v0.10.0`, the first release with the
+  `runner` package. Its module `mcpserve` has no tag of its own, so it is
+  taken at a pseudo-version of the same commit, `20c16c9`.
