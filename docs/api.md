@@ -1003,7 +1003,7 @@ name; a page is never refused for it.
 | `parley_http_requests_total` | counter | `method`, `path`, `status` | every HTTP request the hub answered, REST, git, the forge webhook ingress, `/healthz`, `/readyz`, `/version` and `/metrics` itself included. `method` is the request's method in upper case, `OTHER` for any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT` and `TRACE`; `path` is the route that matched, as a template (`/api/v1/workspaces/{slug}/sync`, `/git/{org}/{repo}/info/refs`, `/healthz`), never the request's own path, and `unmatched` when no route matched (an unknown path, a method no route of the path has); `status` the three digits sent, `101` for a request whose connection the hub took over (a sandbox's attach) |
 | `parley_http_request_duration_seconds` | histogram | `method`, `path` | the time to answer, by the same `method` and `path`. Buckets `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10` |
 | `parley_git_requests_total` | counter | `service` (`info-refs`, `upload-pack`, `receive-pack`), `result` (`ok`, `refused`, `error`) | git protocol requests, as in [Git over HTTP](#git-over-http) |
-| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
+| `parley_scm_requests_total` | counter | `op` (`refs`, `commits`, `tree`, `file`, `diff`, `compare`, `blame`, `search`, `outline`, `commit`, `ref_create`, `ref_move`, `ref_delete`, `rebase`), `result` (`ok`, `ref_moved`, `refused`, `error`) | source control API requests, reads and writes |
 | `parley_changes_open` | gauge | `workspace` | changes in state `draft` or `open` |
 | `parley_lands_total` | counter | `result` (`landed`, `conflict`, `blocked`, `failed`) | land attempts by final status |
 | `parley_land_attempts` | histogram | none | compare-and-swap tries per land attempt. Buckets `1`, `2`, `3`, `5`, `8`, `13` |
@@ -3833,7 +3833,7 @@ of the patch's entry in the `patch_results` of the newest rebuild job, by
 The routes under `/api/v1/workspaces/{slug}/scm` read a workspace's
 repository without a clone. They are `GET` routes; so far they are the two
 refs routes, the two commits routes, the tree route, the file route, the
-diff route, the compare route, the blame route and the search route below. Every one of them behaves
+diff route, the compare route, the blame route, the search route and the outline route below. Every one of them behaves
 alike in what follows.
 
 It takes the admin token, an API key or a PAT, and declares the scope
@@ -3876,7 +3876,7 @@ moves. A fork shows no `refs/parley/` ref.
 No read emits an event. Each request a route handles, refused by the route
 itself or answered, is reported once to the hub's request recorder with the
 route's op (`refs` for both refs routes, `commits` for both commits routes,
-`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route, `search` for the search route) and `ok` for a status
+`tree` for the tree route, `file` for the file route, `diff` for the diff route, `compare` for the compare route, `blame` for the blame route, `search` for the search route, `outline` for the outline route) and `ok` for a status
 below 400 (a `206` or a `304` included),
 `error` otherwise, an answer cut off at the read timeout included; a request the checks before the route refuse is not
 reported. The hub has no metric export yet, so the recorder discards what
@@ -3897,7 +3897,7 @@ Refs in any other namespace, such as `refs/notes/`, have no kind and are
 never listed, nor is a ref that reaches no commit.
 
 A revision parameter (`ref` of `…/scm/commits`, `…/scm/tree`,
-`…/scm/file`, `…/scm/blame` and `…/scm/search`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
+`…/scm/file`, `…/scm/blame`, `…/scm/search` and `…/scm/outline`, `{sha}` of `…/scm/commits/{sha}`, `base` and `head` of
 `…/scm/diff` and `…/scm/compare`) is a branch name, a tag name, a full ref name or a
 full or abbreviated commit id (4 to 40 hexadecimal characters). A string
 that begins with `refs/` is that full ref name only; otherwise the branch or
@@ -3934,8 +3934,8 @@ or in a comma-separated list (a `W/` prefix is ignored), is answered `304
 Not Modified` with no body and the same `ETag` and `Cache-Control` (and on
 the file route `Vary`); `*` is not taken as a match. This is decided once the
 revisions are resolved and before the rest of the read, so a current copy
-costs no history walk, tree listing, file read, diff, trial rebase, blame
-or search; a tag that does not match gets the full answer. An error answer
+costs no history walk, tree listing, file read, diff, trial rebase, blame,
+search or outline; a tag that does not match gets the full answer. An error answer
 has no `ETag` and keeps `Cache-Control: no-store`.
 
 A `path` parameter of a read that names a path of the repository is
@@ -4404,6 +4404,76 @@ between pages; a cursor used with other query parameters is refused (see
 
 ```json
 {"items":[{"path":"api/greeting.go","line":3,"text":"func Greeting() string {"},{"path":"docs/a.md","line":1,"text":"# Greeting"}],"next_cursor":null,"resolved_sha":"2ecc9343e95b57b9f37e0e94ee6bae610a47b8bd"}
+```
+
+
+## `GET /api/v1/workspaces/{slug}/scm/outline`
+
+Answers what the source file `path` of the commit `ref` names declares: its
+functions, types and other declarations, in line order. It needs no index
+and reads one file, so it works at any ref the file route serves, a fork's
+own refs included. Its query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `ref` | the revision whose file is outlined; default the workspace's default branch, a fork's base branch |
+| `path` | the file outlined, required (see [Source control reads](#source-control-reads) for the paths taken) |
+
+The answer:
+
+| Member | Value |
+|---|---|
+| `path` | the file's path, as asked |
+| `resolved_sha` | the full id of the commit `ref` resolved to |
+| `language` | the name of the file's language, from its extension (a `.h` file that holds C++ is `C++`): `Go`, `Python`, `JavaScript`, `TypeScript`, `Rust`, `Java`, `Kotlin`, `C#`, `Ruby`, `C`, `C++`, `PHP`, `Scala`, `Lua` or `Shell`; `""` for a file of no known language and for a symbolic link |
+| `supported` | whether this hub outlined the file; `false` for a file of no known language, for a symbolic link, for a language this build of the hub has no backend for, and for a file its backend could not take at all (one whose first NUL byte lies between byte 8,000 and byte 8,192 among them) |
+| `declarations` | the file's declarations in line order; `[]` when it declares nothing and whenever `supported` is `false` |
+
+A declaration:
+
+| Member | Value |
+|---|---|
+| `kind` | one of `func`, `method`, `type`, `class`, `interface`, `enum`, `trait`, `const`, `var`, `module`, `macro` |
+| `name` | the declared name |
+| `container` | the type, class or module the declaration belongs to, such as a method's type; `""` for none |
+| `signature` | the declaration's header as the source writes it, without its body |
+| `exported` | whether the declaration is visible outside its file or package, by the language's own rule |
+| `start_line`, `end_line` | the declaration's first and last line, 1-based and inclusive; `end_line` is `0` when it is not known |
+
+The fifteen languages are outlined by a hub built with cgo, which the hub
+image holds. A `parleyd` built without cgo outlines Go alone and answers
+every other language with its name and `supported: false`. A file that does
+not parse in its language is outlined as far as its syntax tree goes, and a
+symbolic link is not followed: its content is the path it points at.
+
+Only a text file of at most 1 MiB (1,048,576 bytes) is outlined; its size
+is checked before any of it is read. A file is binary, as for blame, when a
+NUL byte is among its first 8,000 bytes. The checks run in this order:
+`path`, `ref`, the caching answer, the path at the commit, the size, the
+bytes, and then the parse. A read whose parse has not ended at the read
+timeout is answered `503 scm_timeout` then, like every read; the hub parses
+at most four files at once, a parse left behind by such a read included, and
+a read that finds no place among them within its time is answered the same.
+
+The answer's entity tag and `Cache-Control` are those of every read, from
+the commit and the request alone. `supported` also depends on how the hub
+was built, so an answer kept from a hub built without cgo, one marked
+immutable among them, does not change when the hub is replaced by one built
+with cgo.
+
+| Status | When |
+|---|---|
+| `200 OK` | the outline, also when `supported` is `false` |
+| `400` `invalid_request` | no `path` (`path is required`); an illegal `path`, with the file route's message for it; a `path` that names a directory or a submodule entry (`path "internal" is a directory or a submodule at <sha>, not a file`) |
+| `404` `ref_not_found` | `ref` names no one commit |
+| `404` `path_not_found` | `path` does not exist at the commit (`path "nope.go" does not exist at <sha>`) |
+| `409` `workspace_busy`, `workspace_not_ready` | the workspace's state (see [Source control reads](#source-control-reads)) |
+| `413` `payload_too_large` | the file is over 1 MiB (`file "big.go" is 1048577 bytes, over the outline limit of 1048576`), with the member `size`, the file's size in bytes, inside `error` |
+| `422` `binary_file` | the file is binary (`file "logo.png" is binary at <sha>, and a binary file has no declarations to outline`) |
+| `503` `scm_timeout` | the read ran out of the read timeout before its answer began (see [Source control reads](#source-control-reads)) |
+
+```json
+{"path":"router.go","resolved_sha":"3d0c5a1f0b6e2d5c8a7f4e9b1c2d3e4f5a6b7c8d","language":"Go","supported":true,"declarations":[{"kind":"const","name":"MaxRoutes","container":"","signature":"const MaxRoutes","exported":true,"start_line":4,"end_line":4},{"kind":"type","name":"Router","container":"","signature":"type Router struct","exported":true,"start_line":6,"end_line":8},{"kind":"method","name":"Handle","container":"Router","signature":"func (r *Router) Handle(pattern string)","exported":true,"start_line":10,"end_line":12},{"kind":"func","name":"NewRouter","container":"","signature":"func NewRouter() *Router","exported":true,"start_line":14,"end_line":16},{"kind":"func","name":"match","container":"","signature":"func match(pattern, path string) bool","exported":false,"start_line":18,"end_line":20}]}
 ```
 
 ## Source control writes

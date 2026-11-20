@@ -28,7 +28,7 @@ func TestRead_MarksAnAnswerAddressedByFullIdsImmutable(t *testing.T) {
 	for _, path := range []string{
 		"/commits?ref=" + c, "/commits/" + c, "/tree?ref=" + c, "/file?ref=" + c + "&path=f.txt",
 		"/diff?base=" + c1 + "&head=" + c, "/compare?base=" + c1 + "&head=" + c,
-		"/blame?ref=" + c + "&path=f.txt", "/search?ref=" + c + "&q=c",
+		"/blame?ref=" + c + "&path=f.txt", "/search?ref=" + c + "&q=c", "/outline?ref=" + c + "&path=f.txt",
 	} {
 		t.Run(path, func(t *testing.T) {
 			r := w.get(t, scmPath("demo", path), w.ownerKey)
@@ -61,6 +61,13 @@ func TestRead_AnswersAnyOtherReadWithATagToRevalidate(t *testing.T) {
 		})
 	}
 
+	outline := func(query string) string {
+		return w.get(t, scmPath("demo", "/outline?"+query), w.ownerKey).header.Get("ETag")
+	}
+	outlined := outline("path=f.txt")
+	if a, b := outline("ref=feature/x&path=f.txt"), outline("ref=feature/x&path=x.txt"); a == b {
+		t.Errorf("the outlines of f.txt and x.txt at one commit: ETag %q for both, want two tags", a)
+	}
 	file := scmPath("demo", "/file?ref=main&path=f.txt")
 	raw := w.get(t, file, w.ownerKey)
 	asJSON := w.get(t, file, w.ownerKey, "Accept", "application/json")
@@ -79,6 +86,9 @@ func TestRead_AnswersAnyOtherReadWithATagToRevalidate(t *testing.T) {
 	if moved := w.get(t, file, w.ownerKey); moved.header.Get("ETag") == raw.header.Get("ETag") {
 		t.Errorf("after main moved: ETag %q, want another than %q", moved.header.Get("ETag"), raw.header.Get("ETag"))
 	}
+	if moved := outline("path=f.txt"); moved == outlined {
+		t.Errorf("the outline of f.txt after main moved: ETag %q, want another than before", moved)
+	}
 	refs := w.get(t, scmPath("demo", "/refs"), w.ownerKey).header.Get("ETag")
 	gitrepotest.Git(t, w.repo, "update-ref", "refs/heads/x", w.id["c1"])
 	if after := w.get(t, scmPath("demo", "/refs"), w.ownerKey).header.Get("ETag"); after == refs {
@@ -94,6 +104,7 @@ func TestRead_AnswersNotModifiedToAnIfNoneMatchHoldingItsTag(t *testing.T) {
 		{"file by full id", "/file?ref=" + w.id["c2"] + "&path=f.txt"},
 		{"refs list", "/refs"},
 		{"diff by names", "/diff?base=main&head=feature/x"},
+		{"outline by name", "/outline?path=f.txt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := scmPath("demo", tc.path)

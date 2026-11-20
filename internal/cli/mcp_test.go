@@ -224,6 +224,22 @@ func TestMCPList_PrintsTheDefaultSelectionAsTools(t *testing.T) {
 	}
 }
 
+func TestMCPList_ServesTheOutlineOfAFileAsAReadingTool(t *testing.T) {
+	for _, args := range [][]string{{"--no-code-mode"}, {"--no-code-mode", "--read-only"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			in := toolNamed(t, mcpList(t, defaultOptions(), args...), "scm_outline").InputSchema
+			if required := slices.Sorted(slices.Values(in.Required)); !slices.Equal(required, []string{"path", "slug"}) {
+				t.Errorf("required = %v, want path and slug", in.Required)
+			}
+			for _, param := range []string{"slug", "path", "ref"} {
+				if in.Properties[param]["type"] != "string" {
+					t.Errorf("the parameter %s is %v, want a string", param, in.Properties[param])
+				}
+			}
+		})
+	}
+}
+
 func TestMCPList_ServesTheGroupsNamed(t *testing.T) {
 	cmds := helpCommands(t, defaultOptions())
 	in := func(groups ...string) func(string, commandHelp) bool {

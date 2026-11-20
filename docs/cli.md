@@ -459,7 +459,7 @@ Available Commands:
   login             Sign in to the hub and save the hub URL and the credential
   orgs              List and read the organizations you belong to
   sandbox           Create, list and read the sandboxes of a workspace, run commands and shells in them, copy files in and out, read their logs, checkpoint, stop, start, extend and delete them, and list their profiles
-  scm               Read the refs, commits, files, diffs and blame of a workspace, and commit and rebase, without a clone
+  scm               Read the refs, commits, files, diffs, blame and outlines of a workspace, and commit and rebase, without a clone
   secrets           Create, list, update and delete secrets, whose values the hub never shows
   session           Start, report the token usage of, complete and read agent sessions
   tokens            Create, read, change and revoke your personal access tokens
@@ -3001,6 +3001,7 @@ the hub to judge; a boolean flag sends its value below when given.
 | `parley scm diff <slug> <base> <head> [--mode merge_base\|direct] [--path <glob>]... [--patch \| --name-only]` | `GET …/scm/diff` | `base`, `head`, `mode`, one `path` per `--path`, `--patch` `format=patch`, `--name-only` `patches=false` |
 | `parley scm compare <slug> <base> <head> [--fail-on-conflict]` | `GET …/scm/compare` | `base`, `head` |
 | `parley scm blame <slug> <path> [--ref <rev>] [--lines <start>:<end>]` | `GET …/scm/blame` | `path`, `ref`, `--lines` `start_line` and `end_line` |
+| `parley scm outline <slug> <path> [--ref <rev>]` | `GET …/scm/outline` | `path`, `ref` |
 | `parley scm search <slug> <query> [--ref <rev>] [--path <glob>]... [--regex] [--ignore-case]` | `GET …/scm/search` | `q`, `ref`, one `path` per `--path`, `regex=true`, `--ignore-case` `case_sensitive=false` |
 
 `parley scm search demo 'to do' --ref v1 --path 'src/**' --path '*.go'
@@ -3299,7 +3300,7 @@ exits `0` without a session; it needs a hub and a credential only with
 **Which commands are tools.** `--groups` names command groups (the first
 word of a command), separated by commas. A name alone serves the group's
 commands; `name:read` only those whose route is a `GET`. The default is
-`activity,change,claim,fork,land,sandbox,scm,workspace:read`, 68 tools
+`activity,change,claim,fork,land,sandbox,scm,workspace:read`, 69 tools
 today. A group named twice is a `usage_error`. `--read-only` narrows
 whatever is selected to `GET` commands, and leaves out of those the flags
 that make one write to the hub (`withdraw` of `change_approvals`), as

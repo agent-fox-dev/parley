@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	outlinepkg "github.com/agent-fox-dev/agentkit-go/outline"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
@@ -183,5 +187,98 @@ func TestSCMRead_AReviewAgentGetsTheConflictOfABranchFromTheShell(t *testing.T) 
 	}
 	if after := gitrepotest.Git(t, repo, "for-each-ref"); after != before {
 		t.Errorf("the compare moved refs:\n%s\nwant\n%s", after, before)
+	}
+}
+
+// An agent reads from the shell what a file of demo declares, and on which
+// lines, before it forks: on main, on a branch that changed the file, and
+// for a file in another language than Go. The commands read the hub's URL
+// and the key from the environment, which the test sets, so it does not run
+// in parallel.
+func TestSCMRead_AnAgentOutlinesAFileBeforeItForks(t *testing.T) {
+	const router = "package api\n\ntype Router struct{}\n\nfunc NewRouter() *Router {\n\treturn &Router{}\n}\n"
+	const onFeat = router + "\nfunc (r *Router) Mount(prefix string) {}\n"
+	const app = "def serve(port):\n    return port\n"
+	file := func(path, content string) string {
+		return "M 100644 inline " + path + "\ndata " + strconv.Itoa(len(content)) + "\n" + content + "\n"
+	}
+	h, repo := startSCMHub(t, ""+
+		"commit refs/heads/main\nmark :1\ncommitter A <a@example.com> 1700000000 +0000\ndata 5\nmain\n\n"+
+		file("internal/api/router.go", router)+file("app.py", app)+
+		"\ncommit refs/heads/feat\ncommitter B <b@example.com> 1700000100 +0000\ndata 5\nfeat\n\nfrom :1\n"+
+		file("internal/api/router.go", onFeat)+"\n")
+	t.Setenv("PARLEY_ENDPOINT_URL", h.URL(""))
+	t.Setenv("PARLEY_API_KEY", h.key)
+	type outlined struct {
+		ResolvedSHA  string `json:"resolved_sha"`
+		Language     string `json:"language"`
+		Supported    bool   `json:"supported"`
+		Declarations []struct {
+			Kind      string `json:"kind"`
+			Name      string `json:"name"`
+			Container string `json:"container"`
+			StartLine int    `json:"start_line"`
+		} `json:"declarations"`
+	}
+	outline := func(args ...string) outlined {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := cli.Run(context.Background(), append([]string{"scm", "outline", "demo"}, args...), &stdout, &stderr)
+		var o outlined
+		if err := json.Unmarshal(stdout.Bytes(), &o); code != 0 || err != nil {
+			t.Fatalf("parley scm outline demo %v exited %d (stderr %s) and printed %q (%v); want 0 and one JSON document", args, code, stderr.String(), stdout.String(), err)
+		}
+		return o
+	}
+	lineOf := func(o outlined, kind, name string) int {
+		for _, d := range o.Declarations {
+			if d.Kind == kind && d.Name == name {
+				return d.StartLine
+			}
+		}
+		return 0
+	}
+	head := func(branch string) string { return gitrepotest.Refs(t, repo, "refs/heads/")[branch] }
+
+	main := outline("internal/api/router.go")
+	if main.ResolvedSHA != head("main") || !main.Supported || lineOf(main, "func", "NewRouter") != 5 || lineOf(main, "type", "Router") != 3 ||
+		lineOf(main, "method", "Mount") != 0 {
+		t.Errorf("the outline of router.go on main = %+v; want resolved_sha %s, Router on line 3, NewRouter on line 5 and no Mount", main, head("main"))
+	}
+	feat := outline("internal/api/router.go", "--ref", "feat")
+	if feat.ResolvedSHA != head("feat") || lineOf(feat, "func", "NewRouter") != 5 || lineOf(feat, "method", "Mount") != 9 {
+		t.Errorf("the outline of router.go on feat = %+v; want resolved_sha %s and the method Mount, which feat added, on line 9", feat, head("feat"))
+	}
+	// Python has a backend only in a hub built with cgo, as the hub of this
+	// test binary is when the outline package says so.
+	probe, err := outlinepkg.Outline(context.Background(), "probe.py", []byte(app), outlinepkg.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	py := outline("app.py")
+	if py.Language != "Python" || py.Supported != (probe.Backend != outlinepkg.BackendNone) {
+		t.Errorf("the outline of app.py = %+v; want the language Python, supported as this build outlines it (%s)", py, probe.Backend)
+	}
+	if py.Supported && lineOf(py, "func", "serve") != 1 {
+		t.Errorf("the outline of app.py = %+v; want the function serve on line 1", py)
+	}
+
+	resp, err := http.Get(h.URL("/metrics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, samples := parseExposition(t, resp.Body)
+	var counted float64
+	for series, v := range samples {
+		if strings.HasPrefix(series, "parley_scm_requests_total{") && strings.Contains(series, `op="outline"`) {
+			if !strings.Contains(series, `result="ok"`) && v != 0 {
+				t.Errorf("%s = %v, want 0", series, v)
+			}
+			counted += v
+		}
+	}
+	if counted != 3 {
+		t.Errorf("the hub's metrics count %v requests under the op outline, want 3", counted)
 	}
 }

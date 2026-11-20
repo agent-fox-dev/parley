@@ -3,23 +3,389 @@
   "spec_id": "58",
   "spec_name": "scm_file_outline",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-20T22:00:50Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-1.1",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_AnswersTheDeclarationsOfAFileInLineOrder",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.2",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_ReadsTheCommitItsRefNames",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.3",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_AnswersAFileItHasNoBackendForAsNotSupported",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.4",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_AnswersAFileItHasNoBackendForAsNotSupported/link.go",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-1.5",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_OutlinesEveryLanguageOfTheList",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_RefusesWhatItCannotOutline",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_RefusesWhatItCannotOutline",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_RefusesWhatItCannotOutline",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.4",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_RefusesWhatItCannotOutline",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.5",
+          "tests": [
+            {
+              "test": "./internal/scm:TestOutline_RefusesWhatItCannotOutline",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.6",
+          "tests": [
+            {
+              "test": "./internal/scm:TestRead_EndsAReadThatOutlastsTheReadTimeout",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.7",
+          "tests": [
+            {
+              "test": "./internal/scm:TestRead_MarksAnAnswerAddressedByFullIdsImmutable",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_AnswersAnyOtherReadWithATagToRevalidate",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_AnswersNotModifiedToAnIfNoneMatchHoldingItsTag",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_AnswersNotModifiedWithoutTheReadsCostlyPart",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.8",
+          "tests": [
+            {
+              "test": "./internal/scm:TestRead_ServesEveryReaderOnEveryReadableWorkspace",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_RefusesACallerWhoMayNotReadWithoutOpeningTheRepository",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_RefusesAWorkspaceThatIsNotReadableWithoutOpeningTheRepository",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/scm:TestRead_ReportsEachRequestOnceToTheRecorder",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            },
+            {
+              "test": "./internal/metrics:TestNew_ExportsEveryCatalogueMetricAtZero",
+              "failed": {
+                "at": "2026-11-20T21:38:57Z",
+                "tree": "dc7adf8497dc08227532f95e8e57fafd472587da"
+              },
+              "passed": {
+                "at": "2026-11-20T21:42:16Z",
+                "tree": "b369ce9bd6fbbc7fb6ab53c33d53634dda1b0076"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 2,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_ReadsSendOneGetAndPrintTheAnswer",
+              "failed": {
+                "at": "2026-11-20T21:43:02Z",
+                "tree": "f3be302242bc4b0c384a8788b1066529f73d2f8f"
+              },
+              "passed": {
+                "at": "2026-11-20T21:45:21Z",
+                "tree": "8b161ff4c5e584eaad180011ee35a6918f4f5a8d"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.2",
+          "no_red": "before the command exists the group refuses the unknown word outline with the same usage_error and no request, so the rows cannot fail first; they fail once the command is declared with other arguments",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSCM_RefusesABadCommandLineBeforeAnyRequest",
+              "passed": {
+                "at": "2026-11-20T21:45:21Z",
+                "tree": "8b161ff4c5e584eaad180011ee35a6918f4f5a8d"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCPList_ServesTheOutlineOfAFileAsAReadingTool",
+              "failed": {
+                "at": "2026-11-20T21:43:02Z",
+                "tree": "f3be302242bc4b0c384a8788b1066529f73d2f8f"
+              },
+              "passed": {
+                "at": "2026-11-20T21:45:21Z",
+                "tree": "8b161ff4c5e584eaad180011ee35a6918f4f5a8d"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./test/image:TestHubImage_RunsTheHubOnOneVolume",
+              "failed": {
+                "at": "2026-11-20T21:46:58Z",
+                "tree": "68cef9eeff1004ef9a4e612cec0f396681a2190e"
+              },
+              "passed": {
+                "at": "2026-11-20T21:57:29Z",
+                "tree": "68985856b46207fbd68867de533355493b3cf005"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSCMRead_AnAgentOutlinesAFileBeforeItForks",
+              "passed": {
+                "at": "2026-11-20T22:00:48Z",
+                "tree": "3a95cedfe7a83b99d5e22bb3f4b73c3279ac4fab"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }
