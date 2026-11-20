@@ -1,0 +1,27 @@
+# The hub's configuration file. The Deployment mounts its key config.toml as
+# the single file /var/lib/parley/config/config.toml, inside the config dir
+# the image keeps on the data volume. ${NAME} is read from the container's
+# environment, which holds the keys of the Secret parley-secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: parley
+  labels:
+    app.kubernetes.io/name: parley
+data:
+  config.toml: |
+    [server]
+    bind = "0.0.0.0"
+    port = 8080
+    # The URL clients and the OAuth provider reach the hub at.
+    external_url = "https://parley.example.com"
+
+    [logging]
+    level = "info"
+
+    # The client id of the GitHub OAuth app is not a secret; its client
+    # secret comes from the Secret parley-secrets.
+    [[oauth.providers]]
+    name = "github"
+    client_id = "replace-me"
+    client_secret = "${GITHUB_CLIENT_SECRET}"

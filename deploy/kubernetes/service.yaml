@@ -1,0 +1,16 @@
+# The hub's port inside the cluster; expose it outside with the ingress or
+# load balancer of your cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: parley
+  labels:
+    app.kubernetes.io/name: parley
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: parley
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
