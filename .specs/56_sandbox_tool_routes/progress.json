@@ -3,7 +3,7 @@
   "spec_id": "56",
   "spec_name": "sandbox_tool_routes",
   "schema_version": 3,
-  "updated_at": "2026-11-20T15:01:21Z",
+  "updated_at": "2026-11-20T15:05:32Z",
   "tasks": [
     {
       "id": 1,
@@ -976,7 +976,45 @@
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSandboxUse_AHarnessOutsideTheSandboxWorksInItOverMCP",
+              "passed": {
+                "at": "2026-11-20T15:05:30Z",
+                "tree": "fc59dfda20ca70e15c59ee90c47d7eea32696d37"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSandboxUse_AReviewerReadsAColleaguesSandboxOverRESTAndCannotChangeIt",
+              "passed": {
+                "at": "2026-11-20T15:05:30Z",
+                "tree": "fc59dfda20ca70e15c59ee90c47d7eea32696d37"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-3",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSandboxUse_AScriptSearchesOverRESTAndASandboxWithoutToolsRefusesIt",
+              "passed": {
+                "at": "2026-11-20T15:05:30Z",
+                "tree": "fc59dfda20ca70e15c59ee90c47d7eea32696d37"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }
