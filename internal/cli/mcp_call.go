@@ -147,7 +147,7 @@ func (s *toolSession) callCommand(ctx context.Context, t commandTool, input json
 	res := toolResult{Data: printedData(stdout.Bytes())}
 	switch {
 	case stdin.read:
-		return failedResult(usageErrorType, "a parameter of %s has the value -, which would read standard input; a tool has none, so give the value itself", t.name)
+		return failedResult(usageErrorType, "%s was asked to read standard input, with a value of - or a flag that says so; a tool has none, so give the value itself", t.name)
 	case runErr == nil:
 		res.OK = true
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
@@ -204,10 +204,12 @@ func errorOf(err error) (code, detail string) {
 }
 
 // commandLine is the command's line for the JSON parameters input: its
-// words, each flag given as the shell takes it, and after -- the arguments
-// in their declared order, so that a value that begins with a dash stays a
-// value. A parameter the tool does not have, one of the wrong type and a
-// missing required one are errors that name it.
+// words, --json, each flag given as the shell takes it, and the arguments in
+// their declared order. A command that takes words after -- gets them
+// there, and its arguments before; any other command gets its arguments
+// after --, so that one that begins with a dash stays an argument. A
+// parameter the tool does not have, one of the wrong type and a missing
+// required one are errors that name it.
 func (t commandTool) commandLine(input json.RawMessage) ([]string, error) {
 	given := map[string]json.RawMessage{}
 	if trimmed := bytes.TrimSpace(input); len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
@@ -216,11 +218,14 @@ func (t commandTool) commandLine(input json.RawMessage) ([]string, error) {
 		}
 	}
 	known := map[string]bool{}
-	line := append([]string{}, t.words...)
-	var positional []string
-	skipped := ""
+	// A tool's result is the command's JSON document: a command that prints
+	// something else without --json, as sandbox exec does, prints it with.
+	line := append(append([]string{}, t.words...), "--json")
+	var positional, trailing []string
+	takesTrailing, skipped := false, ""
 	for _, p := range t.params {
 		known[p.name] = true
+		takesTrailing = takesTrailing || p.trailing
 		raw, has := given[p.name]
 		if has && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			has = false
@@ -231,34 +236,51 @@ func (t commandTool) commandLine(input json.RawMessage) ([]string, error) {
 				positional = append(positional, p.fallback)
 			case p.required:
 				return nil, fmt.Errorf("%s needs the parameter %s", t.name, p.name)
-			case p.isArg:
+			case p.isArg && !p.trailing:
 				skipped = p.name
 			}
 			continue
 		}
 		values, err := p.values(raw)
-		if err != nil {
+		switch {
+		case err != nil:
 			return nil, fmt.Errorf("the parameter %s of %s %v", p.name, t.name, err)
-		}
-		if !p.isArg {
+		case p.isArg && p.required && len(values) == 0:
+			return nil, fmt.Errorf("the parameter %s of %s needs at least one element", p.name, t.name)
+		case p.trailing:
+			trailing = values
+		case !p.isArg:
 			for _, v := range values {
 				line = append(line, "--"+p.source+"="+v)
 			}
-			continue
-		}
-		if skipped != "" {
+		case skipped != "":
 			// The arguments are positional: one cannot be given after one
 			// that was left out.
 			return nil, fmt.Errorf("%s takes the parameter %s only together with %s", t.name, p.name, skipped)
+		default:
+			positional = append(positional, values...)
 		}
-		positional = append(positional, values[0])
 	}
 	for name := range given {
 		if !known[name] {
 			return nil, fmt.Errorf("%s has no parameter %s", t.name, name)
 		}
 	}
-	return append(append(line, "--"), positional...), nil
+	if !takesTrailing {
+		return append(append(line, "--"), positional...), nil
+	}
+	// Here -- belongs to the command, so an argument before it cannot be
+	// kept from being read as a flag.
+	for _, v := range positional {
+		if strings.HasPrefix(v, "-") {
+			return nil, fmt.Errorf("an argument of %s cannot begin with a dash: %q", t.name, v)
+		}
+	}
+	line = append(line, positional...)
+	if trailing != nil {
+		line = append(append(line, "--"), trailing...)
+	}
+	return line, nil
 }
 
 // values are the words the JSON value raw of the parameter gives its flag

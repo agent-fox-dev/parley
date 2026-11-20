@@ -152,6 +152,8 @@ type toolParam struct {
 	description string
 	// fallback is the value of an argument a call leaves out; "" for none.
 	fallback string
+	// trailing marks the words the command takes after --.
+	trailing bool
 }
 
 // notNameCharacter is what a parameter's name replaces by _.
@@ -287,6 +289,11 @@ func newCommandTool(cmd *cobra.Command, decl command, words []string, workspace 
 			name: parameterName(a.Name), source: a.Name, isArg: true, kind: "string", required: a.Required,
 			description: fmt.Sprintf("the argument %s of parley %s", a.Name, strings.Join(words, " ")),
 		}
+		if a.Repeats {
+			// The argument takes every remaining word: one per element.
+			p.kind = "array"
+			p.description = fmt.Sprintf("the arguments %s of parley %s, one or more", a.Name, strings.Join(words, " "))
+		}
 		if workspace != "" && slices.Contains(workspaceArgs, a.Name) {
 			p.required, p.fallback = false, workspace
 			p.description += fmt.Sprintf("; %s when left out", workspace)
@@ -305,6 +312,13 @@ func newCommandTool(cmd *cobra.Command, decl command, words []string, workspace 
 	}
 	cmd.LocalFlags().VisitAll(add)
 	cmd.InheritedFlags().VisitAll(add)
+	if decl.Trailing != nil {
+		t.params = append(t.params, toolParam{
+			name: parameterName(decl.Trailing.Name), source: decl.Trailing.Name, isArg: true, trailing: true, kind: "array",
+			required:    decl.Trailing.Required,
+			description: fmt.Sprintf("the words after -- of parley %s: the %s and its arguments, one per element", strings.Join(words, " "), decl.Trailing.Name),
+		})
+	}
 	return t
 }
 

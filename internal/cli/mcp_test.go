@@ -1318,8 +1318,26 @@ func TestMCP_EndsWithTheHubsRefusalWhenItCannotReadTheSandboxsTools(t *testing.T
 	}
 }
 
-func TestMCP_RefusesASandboxToolNamedLikeAnotherTool(t *testing.T) {
-	for _, row := range []struct{ tool, clashesWith string }{{"change_show", "change show"}, {"code_mode", "code_mode"}} {
+func TestSandboxTools_LeaveTheSandboxsOwnCodeModeToTheSessions(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file", "code_mode", "execute"))
+	args := onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1", "--groups", "claim")
+	names := toolNames(mcpList(t, defaultOptions(), args...))
+	if tail := names[len(names)-3:]; !slices.Equal(tail, []string{"read_file", "execute", "code_mode"}) {
+		t.Errorf("the tools end with %v; want the sandbox's tools without its code_mode, and then the session's", tail)
+	}
+	tools := mcpList(t, defaultOptions(), args...)
+	if d := tools[len(tools)-1].Description; !strings.Contains(d, "claim_create") || !strings.Contains(d, "read_file") {
+		t.Error("the code_mode served is not the session's, bound to the commands and the sandbox's tools")
+	}
+	// Without the session's own, the sandbox's is a tool like its others.
+	names = toolNames(mcpList(t, defaultOptions(), append(args, "--no-code-mode")...))
+	if tail := names[len(names)-3:]; !slices.Equal(tail, []string{"read_file", "code_mode", "execute"}) {
+		t.Errorf("with --no-code-mode the tools end with %v; want the sandbox's three as the hub lists them", tail)
+	}
+}
+
+func TestMCP_RefusesASandboxToolNamedLikeACommandTool(t *testing.T) {
+	for _, row := range []struct{ tool, clashesWith string }{{"change_show", "change show"}, {"activity", "activity"}} {
 		t.Run(row.tool, func(t *testing.T) {
 			hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file", row.tool))
 			code, stdout, stderr := runMCP(t, defaultOptions(), onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1", "--list")...)
@@ -1348,4 +1366,113 @@ func TestSandboxTools_AreOnlyTheOnesThatChangeNothingWithReadOnly(t *testing.T) 
 	if tail := names[len(names)-3:]; !slices.Equal(tail, []string{"read_file", "search_files", "code_search"}) {
 		t.Errorf("of a set the hub gives as read-only, %v is served; want every tool of it", tail)
 	}
+}
+
+// probeRepeating builds "probe tag <thing> <label>...": POST /tags, whose
+// last argument takes every remaining word, and whose body is the words it
+// was given.
+func probeRepeating() *cobra.Command {
+	return declare(command{
+		Name: "tag", Description: "Tag a thing", Method: http.MethodPost, Path: "/tags", Auth: authUser,
+		Args: []argSpec{{Name: "thing", Required: true}, {Name: "label", Required: true, Repeats: true}},
+		Run: func(c *call) error {
+			return sendWith(c, nil, map[string]any{"thing": c.args["thing"], "words": c.cmd.Flags().Args()[1:]})
+		},
+	})
+}
+
+func TestToolCall_GivesTheWordsAfterTheDoubleDashAndARepeatingArgumentAsArrays(t *testing.T) {
+	const exec = "/api/v1/workspaces/demo/sandboxes/sbx_1/exec"
+	hub := newStubHub(t).
+		answer(http.MethodPost, exec, http.StatusOK, `{"exit_code":0,"stdout":"ok\n","stderr":"","truncated":false,"timed_out":false,"duration_ms":4}`).
+		answer(http.MethodPost, "/api/v1/workspaces/demo/forks", http.StatusCreated, `{"workspace":{"slug":"demo--m1"}}`).
+		answer(http.MethodPost, "/api/v1/tags", http.StatusOK, `{}`)
+	opts := withProbeGroup(defaultOptions(), probeRepeating)
+	s := mcpSettings{groups: mcpDefaultGroups + ",probe", noCodeMode: true, workspace: "demo"}
+	session := toolSessionOn(t, opts, hub.URL, s)
+	sentBody := func(t *testing.T) map[string]any {
+		t.Helper()
+		var body map[string]any
+		if err := json.Unmarshal([]byte(hub.last(t).body), &body); err != nil {
+			t.Fatalf("the request's body %q: %v", hub.last(t).body, err)
+		}
+		return body
+	}
+	schemaOf := func(name string) listedTool {
+		for _, ct := range session.tools {
+			if ct.name == name {
+				var tool listedTool
+				if err := json.Unmarshal(ct.schema(), &tool.InputSchema); err != nil {
+					t.Fatal(err)
+				}
+				return tool
+			}
+		}
+		t.Fatalf("no tool %s", name)
+		return listedTool{}
+	}
+
+	t.Run("a command that needs words after the double dash", func(t *testing.T) {
+		in := schemaOf("sandbox_exec").InputSchema
+		if in.Properties["command"]["type"] != "array" || !slices.Contains(in.Required, "command") {
+			t.Fatalf("sandbox_exec takes %v and requires %v; want the required array command", in.Properties["command"], in.Required)
+		}
+		r := callTool(t, session, "sandbox_exec", map[string]any{"id": "sbx_1", "command": []string{"go", "test", "-run", "X", "./..."}, "workdir": "/workspace/sub"})
+		if !r.OK || r.Data["stdout"] != "ok\n" || r.Data["exit_code"] != 0.0 {
+			t.Fatalf("the result is %+v; want the collected answer as data", r)
+		}
+		if body := sentBody(t); !reflect.DeepEqual(body["command"], []any{"go", "test", "-run", "X", "./..."}) || body["workdir"] != "/workspace/sub" {
+			t.Errorf("the hub got the body %v; want the command's words as given", body)
+		}
+		wantFailed(t, callTool(t, session, "sandbox_exec", map[string]any{"id": "sbx_1"}), usageErrorType)
+	})
+	t.Run("a command that fails in the sandbox", func(t *testing.T) {
+		hub.answer(http.MethodPost, exec, http.StatusOK, `{"exit_code":3,"stdout":"","stderr":"boom","truncated":false,"timed_out":false,"duration_ms":4}`)
+		r := callTool(t, session, "sandbox_exec", map[string]any{"id": "sbx_1", "command": []string{"false"}})
+		if r.OK || r.Error != toolExitError || r.Data["exit_code"] != 3.0 || r.Data["stderr"] != "boom" {
+			t.Errorf("the result is %+v; want a failed one with the collected answer as data", r)
+		}
+	})
+	t.Run("a command that would read standard input", func(t *testing.T) {
+		wantFailed(t, callTool(t, session, "sandbox_exec", map[string]any{"id": "sbx_1", "command": []string{"cat"}, "stdin": true}), usageErrorType)
+	})
+	t.Run("a command that may take words after the double dash", func(t *testing.T) {
+		if in := schemaOf("fork_create").InputSchema; in.Properties["command"]["type"] != "array" || slices.Contains(in.Required, "command") {
+			t.Fatalf("fork_create takes %v and requires %v; want the optional array command", in.Properties["command"], in.Required)
+		}
+		if r := callTool(t, session, "fork_create", map[string]any{"name": "m1"}); !r.OK || hub.last(t).path != "/api/v1/workspaces/demo/forks" {
+			t.Fatalf("without a command the result is %+v, sent to %s; want the fork of the session's workspace", r, hub.last(t).path)
+		}
+		if _, has := sentBody(t)["sandbox"]; has {
+			t.Errorf("without a command the body is %v; want no sandbox", sentBody(t))
+		}
+		// As from the shell, a command goes with the profile of its sandbox.
+		wantFailed(t, callTool(t, session, "fork_create", map[string]any{"name": "m2", "command": []string{"agent"}}), usageErrorType)
+		if r := callTool(t, session, "fork_create", map[string]any{"name": "m2", "sandbox_profile": "agent", "command": []string{"agent", "--fast"}}); !r.OK {
+			t.Fatalf("with a command and a profile the result is %+v", r)
+		}
+		sandbox, _ := sentBody(t)["sandbox"].(map[string]any)
+		if !reflect.DeepEqual(sandbox["command"], []any{"agent", "--fast"}) {
+			t.Errorf("with a command the body is %v; want a sandbox with the command's words", sentBody(t))
+		}
+	})
+	t.Run("an argument that repeats", func(t *testing.T) {
+		if in := schemaOf("probe_tag").InputSchema; in.Properties["label"]["type"] != "array" || in.Properties["thing"]["type"] != "string" {
+			t.Fatalf("probe_tag takes %v; want the string thing and the array label", in.Properties)
+		}
+		if r := callTool(t, session, "probe_tag", map[string]any{"thing": "-x", "label": []string{"a b", "-c"}}); !r.OK {
+			t.Fatalf("the result is %+v", r)
+		}
+		if body := sentBody(t); body["thing"] != "-x" || !reflect.DeepEqual(body["words"], []any{"a b", "-c"}) {
+			t.Errorf("the command got %v; want each element as one word", body)
+		}
+		wantFailed(t, callTool(t, session, "probe_tag", map[string]any{"thing": "x", "label": []string{}}), usageErrorType)
+	})
+	t.Run("an argument that begins with a dash before words after the double dash", func(t *testing.T) {
+		before := hub.requestCount()
+		wantFailed(t, callTool(t, session, "sandbox_exec", map[string]any{"id": "--json", "command": []string{"true"}}), usageErrorType)
+		if hub.requestCount() != before {
+			t.Error("the refused call sent a request")
+		}
+	})
 }

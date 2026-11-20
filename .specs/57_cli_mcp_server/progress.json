@@ -3,7 +3,7 @@
   "spec_id": "57",
   "spec_name": "cli_mcp_server",
   "schema_version": 3,
-  "updated_at": "2026-11-20T19:47:46Z",
+  "updated_at": "2026-11-20T19:54:58Z",
   "tasks": [
     {
       "id": 1,
@@ -696,7 +696,45 @@
     },
     {
       "id": 6,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "PATH-1",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_AnAgentLandsAChangeThroughToolCalls",
+              "passed": {
+                "at": "2026-11-20T19:54:56Z",
+                "tree": "f1c10cf42429c5bcf6f4bc61cb6a90a9b614f2e4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-2",
+          "tests": [
+            {
+              "test": "./test/e2e:TestSandboxUse_OneScriptWorksInASandboxAndOnTheHub",
+              "passed": {
+                "at": "2026-11-20T19:54:56Z",
+                "tree": "f1c10cf42429c5bcf6f4bc61cb6a90a9b614f2e4"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "PATH-3",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_AReadOnlyAssistantReadsAChangeAndAnAdminSelectionIsRefused",
+              "passed": {
+                "at": "2026-11-20T19:54:56Z",
+                "tree": "f1c10cf42429c5bcf6f4bc61cb6a90a9b614f2e4"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

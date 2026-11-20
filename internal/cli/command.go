@@ -30,6 +30,16 @@ type argSpec struct {
 	Repeats bool `json:"-"`
 }
 
+// trailingWords are the words a command takes after -- on its line, such as
+// the command parley sandbox exec runs. They are no argument of the
+// declaration, since they are not counted with the arguments; the
+// declaration names them so that a tool can give them.
+type trailingWords struct {
+	// Name names the words, "command" for a command and its arguments.
+	Name     string `json:"name"`
+	Required bool   `json:"required"`
+}
+
 // command is the declaration of one parley command: everything that differs
 // from one command to the next. Every command is declared through declare,
 // so that each behaves alike on what this declaration does not say (ADR 02).
@@ -65,6 +75,9 @@ type command struct {
 	// Timeout, when not zero, bounds each of the command's requests in
 	// place of the default of 30 seconds.
 	Timeout time.Duration `json:"-"`
+	// Trailing names the words the command takes after --, if it takes
+	// any; the command reads them itself.
+	Trailing *trailingWords `json:"trailing,omitempty"`
 	// OwnSettings leaves the hub URL and the credential to the command's
 	// run step, which then resolves them itself, for a command that needs
 	// them only in some of its forms.
@@ -123,6 +136,10 @@ const (
 	declarationAnnotation = "parley.declaration"
 	// groupAnnotation marks a command group.
 	groupAnnotation = "parley.group"
+	// repeatsAnnotation marks a command whose last argument takes every
+	// remaining word. The JSON help does not show it, so the declaration
+	// kept as JSON does not hold it.
+	repeatsAnnotation = "parley.repeats"
 )
 
 // declare builds the cobra command of decl. It keeps decl in the command's
@@ -175,6 +192,9 @@ func declare(decl command) *cobra.Command {
 			return sendAndPrint(c)
 		},
 	}
+	if n := len(decl.Args); n > 0 && decl.Args[n-1].Repeats {
+		cmd.Annotations[repeatsAnnotation] = "true"
+	}
 	if decl.Flags != nil {
 		decl.Flags(cmd.Flags())
 	}
@@ -194,6 +214,9 @@ func declarationOf(cmd *cobra.Command) command {
 	if encoded, ok := cmd.Annotations[declarationAnnotation]; ok {
 		// declare wrote it, so it decodes.
 		_ = json.Unmarshal([]byte(encoded), &decl)
+	}
+	if n := len(decl.Args); n > 0 && cmd.Annotations[repeatsAnnotation] == "true" {
+		decl.Args[n-1].Repeats = true
 	}
 	return decl
 }

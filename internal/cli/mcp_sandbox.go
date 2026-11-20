@@ -48,7 +48,7 @@ func (s *toolSession) hubClient(timeout time.Duration) *client {
 // the sandbox when the session is read-only. Without a sandbox it does
 // nothing. The hub's refusal (a sandbox without tools, not ready, unknown or
 // not accessible) is returned as it is, and a tool with the name of a
-// command tool or of code_mode is an error naming both.
+// command tool is an error naming both.
 func (s *toolSession) loadSandboxTools(ctx context.Context) error {
 	if s.settings.sandbox == "" {
 		return nil
@@ -67,8 +67,11 @@ func (s *toolSession) loadSandboxTools(ctx context.Context) error {
 		if s.settings.readOnly && slices.Contains(sandboxChangingTools, t.Name) {
 			continue
 		}
-		if t.Name == codeModeName {
-			return clientError("the sandbox's tool %s has the name of %s, the tool that runs scripts", t.Name, codeModeName)
+		if t.Name == codeModeName && s.codeMode {
+			// The tool server has a code mode of its own, bound to its
+			// tools alone. The session's is bound to those and to the
+			// commands, so it takes the name and the other is left out.
+			continue
 		}
 		if i := slices.IndexFunc(s.tools, func(ct commandTool) bool { return ct.name == t.Name }); i >= 0 {
 			return clientError("the sandbox's tool %s has the name of the tool of the command %q", t.Name, strings.Join(s.tools[i].words, " "))

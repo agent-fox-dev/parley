@@ -26,8 +26,10 @@ import (
 
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/config"
+	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
 	"github.com/agent-fox-dev/parley/internal/hub"
 	"github.com/agent-fox-dev/parley/internal/hubtest"
+	"github.com/agent-fox-dev/parley/internal/land"
 )
 
 // serveHub serves a hub with no identity provider on a free loopback port
@@ -190,6 +192,8 @@ func TestCLI_LoginPrintsTheHubsRefusalOfAnUnknownKeyAsReceived(t *testing.T) {
 // mcpProcess is parley mcp started as a harness starts it, with the MCP
 // session of the SDK's client on its standard input and output.
 type mcpProcess struct {
+	// dir is the process's working directory.
+	dir     string
 	cmd     *exec.Cmd
 	session *mcp.ClientSession
 	stderr  *lockedBuffer
@@ -224,7 +228,8 @@ func startMCP(t *testing.T, hubURL, key string, args ...string) *mcpProcess {
 	p := &mcpProcess{stderr: &lockedBuffer{}}
 	p.cmd = exec.Command(credentialHelper(t), append([]string{"mcp", "--endpoint-url", hubURL, "--api-key", key}, args...)...)
 	p.cmd.Stderr = p.stderr
-	p.cmd.Dir = t.TempDir()
+	p.dir = t.TempDir()
+	p.cmd.Dir = p.dir
 	client := mcp.NewClient(&mcp.Implementation{Name: "harness", Version: "1"}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -424,5 +429,168 @@ func TestMCP_SaysAtStartHowManyToolsItServesAndWhatCodeModeCosts(t *testing.T) {
 				t.Errorf("the start line says %d tools and %d bytes; the session lists %d tools and a code_mode description of %d bytes", *line.Tools, *line.Bytes, len(list.Tools), wantBytes)
 			}
 		})
+	}
+}
+
+// toolLines are the lines the process wrote to stderr for its tool calls,
+// as the tools' names, in order.
+func (p *mcpProcess) toolLines(t *testing.T) []string {
+	t.Helper()
+	var tools []string
+	for _, line := range strings.Split(strings.TrimSpace(p.stderr.String()), "\n") {
+		var l struct {
+			Tool string `json:"tool"`
+		}
+		if err := json.Unmarshal([]byte(line), &l); err != nil {
+			t.Errorf("the stderr line %q is not one JSON object", line)
+		}
+		if l.Tool != "" {
+			tools = append(tools, l.Tool)
+		}
+	}
+	return tools
+}
+
+// script calls code_mode with the script src and returns the text of its
+// result; it fails the test when the script failed.
+func (p *mcpProcess) script(t *testing.T, src string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	res, err := p.session.CallTool(ctx, &mcp.CallToolParams{Name: "code_mode", Arguments: map[string]any{"script": src}})
+	if err != nil {
+		t.Fatalf("call code_mode: %v\nstderr: %s", err, p.stderr)
+	}
+	var text strings.Builder
+	for _, c := range res.Content {
+		if tc, isText := c.(*mcp.TextContent); isText {
+			text.WriteString(tc.Text)
+		}
+	}
+	if res.IsError {
+		t.Fatalf("the script failed: %s\nstderr: %s", text.String(), p.stderr)
+	}
+	return text.String()
+}
+
+// An agent whose harness started parley mcp for demo sees who else works
+// there, forks, and in one script commits two files to the fork, opens the
+// change and lands it, as the shell commands would.
+func TestMCP_AnAgentLandsAChangeThroughToolCalls(t *testing.T) {
+	parallel(t)
+	h := startLifecycleHub(t)
+	p := startMCP(t, h.URL(""), h.key, "--workspace", "demo")
+	for name, content := range map[string]string{"one.txt": "one\n", "two.txt": "two\n"} {
+		if err := os.WriteFile(filepath.Join(p.dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	since := time.Now().UTC().Add(-time.Second).Format(time.RFC3339)
+
+	if _, isError := p.call(t, "activity", map[string]any{"paths": "**"}); isError {
+		t.Fatalf("activity failed\nstderr: %s", p.stderr)
+	}
+	fork, isError := p.call(t, "fork_create", map[string]any{"name": "m1", "no_auto_change": true})
+	slug := str(fork, "workspace", "slug")
+	if isError || slug != "demo--m1" {
+		t.Fatalf("fork_create answered %v (error %v); want the fork demo--m1", fork, isError)
+	}
+	out := p.script(t, `
+def main():
+    commit = scm_commit(slug="demo--m1", branch="feat", base="main", message="Add one and two", put=["one.txt=one.txt", "two.txt=two.txt"])
+    if is_error(commit):
+        return "commit: " + commit.error + " " + commit.detail
+    change = change_open(source="feat", source_workspace="demo--m1", intent="add the two files")
+    if is_error(change):
+        return "open: " + change.error + " " + change.detail
+    landed = change_land(number=str(change["number"]), wait=True)
+    if is_error(landed):
+        return "land: " + landed.error + " " + landed.detail
+    return "landed " + landed["landed_sha"] + " as change " + str(change["number"])
+`)
+	head := gitrepotest.Refs(t, h.repo("demo"), "refs/heads/")["main"]
+	if !strings.Contains(out, "landed "+head) || head == "" {
+		t.Fatalf("the script returned %q; want the sha main is at now, %s", out, head)
+	}
+	_, number, _ := strings.Cut(strings.TrimSpace(out[strings.Index(out, "landed "):]), " as change ")
+	number = strings.Trim(strings.Fields(number)[0], `"'.,`)
+	if c := h.read(t, h.key, number); c["state"] != "landed" {
+		t.Errorf("demo#%s is %v, want landed", number, c["state"])
+	}
+	files := gitrepotest.Git(t, h.repo("demo"), "ls-tree", "-r", "--name-only", "main")
+	if !strings.Contains(files, "one.txt") || !strings.Contains(files, "two.txt") {
+		t.Errorf("main holds\n%s\nwant the two files the script committed", files)
+	}
+
+	calls := p.toolLines(t)
+	slices.Sort(calls)
+	if want := []string{"activity", "change_land", "change_open", "code_mode", "fork_create", "scm_commit"}; !slices.Equal(calls, want) {
+		t.Errorf("stderr has lines for %v, want one for each call: %v", calls, want)
+	}
+	if err := strings.Contains(p.stderr.String(), "add the two files"); err {
+		t.Error("stderr holds an argument of a call")
+	}
+	// The hub recorded what the shell commands would have it record, for
+	// the developer whose credential the session has.
+	status, body := h.Call(t, http.MethodGet, "/api/v1/audit?source=hub&limit=100&since="+since, h.key, nil)
+	var audit struct {
+		Items []struct {
+			Type string `json:"type"`
+		} `json:"items"`
+	}
+	if status != http.StatusOK || json.Unmarshal(body, &audit) != nil {
+		t.Fatalf("GET /audit = %d %s", status, body)
+	}
+	var types []string
+	for _, item := range audit.Items {
+		types = append(types, item.Type)
+	}
+	for _, want := range []string{"parley.workspace.fork", "parley.change.open", land.EventLand} {
+		if !slices.Contains(types, want) {
+			t.Errorf("the audit holds %v; want an event %s", types, want)
+		}
+	}
+}
+
+// A read-only assistant sees only commands that read, and a selection that
+// names an administrative group is refused before anything is served.
+func TestMCP_AReadOnlyAssistantReadsAChangeAndAnAdminSelectionIsRefused(t *testing.T) {
+	parallel(t)
+	h := startLifecycleHub(t)
+	agent := cloneAs(t, h.forkHub, h.agent, "demo--t1")
+	agent("checkout", "--quiet", "-b", "feat")
+	commitFile(t, agent, "b.txt", "b\n", "Add b")
+	agent("push", "--quiet", "origin", "feat")
+	n := h.open(t, h.agent, "demo--t1", "feat", map[string]any{"intent": "why"})
+
+	p := startMCP(t, h.URL(""), h.key, "--read-only", "--workspace", "demo")
+	names := p.toolNames(t)
+	for _, name := range []string{"change_land", "scm_commit", "fork_create", "sandbox_exec"} {
+		if slices.Contains(names, name) {
+			t.Errorf("the read-only session serves %s", name)
+		}
+	}
+	if !slices.Contains(names, "change_show") || !slices.Contains(names, "activity") {
+		t.Errorf("the read-only session serves %v; want change_show and activity among them", names)
+	}
+	change, isError := p.call(t, "change_show", map[string]any{"number": n})
+	if isError || change["state"] != "open" || change["intent"] != "why" {
+		t.Errorf("change_show answered %v (error %v); want the open change", change, isError)
+	}
+
+	var stdout, stderr bytes.Buffer
+	refused := exec.Command(credentialHelper(t), "mcp", "--endpoint-url", h.URL(""), "--api-key", h.key, "--groups", "admin")
+	refused.Stdout, refused.Stderr = &stdout, &stderr
+	err := refused.Run()
+	var exit *exec.ExitError
+	var envelope struct {
+		Error struct {
+			Message   string `json:"message"`
+			ErrorType string `json:"error_type"`
+		} `json:"error"`
+	}
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 || stdout.Len() != 0 || json.Unmarshal(stderr.Bytes(), &envelope) != nil ||
+		envelope.Error.ErrorType != "usage_error" || !strings.Contains(envelope.Error.Message, "admin") {
+		t.Errorf("parley mcp --groups admin: %v, stdout %q, stderr %q; want exit status 2, nothing, and one usage_error naming admin", err, stdout.String(), stderr.String())
 	}
 }

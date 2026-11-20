@@ -253,7 +253,8 @@ func newSandboxCreateCommand() *cobra.Command {
 			},
 			Classify: sandboxCameUp,
 		},
-		Run: createSandbox,
+		Trailing: &trailingWords{Name: "command"},
+		Run:      createSandbox,
 	})
 	create.Use += " [-- command...]"
 	checkLine := create.Args
@@ -392,6 +393,7 @@ func newSandboxExecCommand() *cobra.Command {
 		Method:      http.MethodPost,
 		Path:        sandboxesRoute + "/:id/exec",
 		Args:        []argSpec{workspaceSlugArg, sandboxIDArg},
+		Trailing:    &trailingWords{Name: "command", Required: true},
 		Auth:        authUser,
 		Flags: func(fs *pflag.FlagSet) {
 			fs.String("workdir", "", "the directory the command runs in; the sandbox's working directory when not given")

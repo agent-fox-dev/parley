@@ -136,6 +136,7 @@ func newForkCreateCommand() *cobra.Command {
 		Method:      http.MethodPost,
 		Path:        "/workspaces/:parent/forks",
 		Args:        []argSpec{parentArg},
+		Trailing:    &trailingWords{Name: "command"},
 		Auth:        authUser,
 		Flags: func(fs *pflag.FlagSet) {
 			for _, f := range forkStringFlags {
