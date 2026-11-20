@@ -260,9 +260,20 @@ func TestJourney_ConsumerResumesTheEventStream(t *testing.T) {
 		t.Errorf("the resumed stream replayed the seqs %v, want the log's after %d: %v", gotSeqs, s0, wantSeqs)
 	}
 	claim("after the replay")
-	live := r2.Next(1, 10*time.Second)[0]
-	if live.Seq <= gotSeqs[len(gotSeqs)-1] || live.Type != "parley.claim.create" {
-		t.Errorf("the live event after the replay is %s with seq %d, want parley.claim.create above %d", live.Type, live.Seq, gotSeqs[len(gotSeqs)-1])
+	// The hub keeps writing events of its own (a change turning ready, an
+	// overlap), so the live claim may come after some of them: each event
+	// read on must still be newer than the last one replayed.
+	last := gotSeqs[len(gotSeqs)-1]
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		live := r2.Next(1, time.Until(deadline))[0]
+		if live.Seq <= last {
+			t.Errorf("the live event %s has seq %d, want above %d", live.Type, live.Seq, last)
+		}
+		last = live.Seq
+		if live.Type == "parley.claim.create" {
+			break
+		}
 	}
 	seen := map[int64]bool{}
 	for _, e := range r2.All() {
