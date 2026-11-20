@@ -43,8 +43,13 @@ under load and those writing while a backup runs (they pass the default
 receiver, `[events] retention = "1h"` for the expired cursor (the shortest
 retention the hub takes), the variable `SSL_CERT_FILE` naming the fake
 forge's certificate for the hubs that reach it, and, against a gateway, a
-`[sandbox]` section with the gateway's URL, a token file and the profiles a
-scenario names.
+`[sandbox]` section with the gateway's URL, a token file or the mutual TLS
+files, an `openshell_workspace` of its own and the profiles a scenario
+names. A hub owns its OpenShell workspace and installs its `parley-hub`
+provider profile there, naming its own port, so hubs that run at once
+would replace each other's: each gets `pat-` and 12 hex digits of the
+SHA-256 of its test's name, short enough for the gateway's 19 characters
+and the same from one run to the next, so that runs reuse the workspaces.
 
 ## Rows left out of the paging and idempotency sweeps
 
@@ -119,12 +124,29 @@ row, and the paging scenario allows that end page there only.
 
 ## Gaps tracked as issues
 
-- The sandbox scenarios were not run against an OpenShell gateway, and with
-  the pinned SDK (create in a working directory, the main command, logs and
-  policy validation answer `unsupported`) they are expected to fail against
-  one. Two optional variables help a remote gateway reach the hub:
-  `PARLEY_ACCEPTANCE_SANDBOX_HUB_HOST` and
-  `PARLEY_ACCEPTANCE_OPENSHELL_PROVIDER_PROFILE`; only the gateway URL gates,
-  so a gateway set up halfway fails the scenarios instead of skipping them,
-  and without `PARLEY_ACCEPTANCE_SANDBOX_IMAGE` they fail at once.
+- The sandbox scenarios run against an OpenShell gateway (issue #278). Run
+  against a local gateway of release 0.1.9 (podman, mutual TLS), the
+  scenarios of a fork with a sandbox, placeholders only, the refusals and
+  the capacity limits pass; those of an exposed secret, a denied host, a
+  workspace rule and checkpoints fail, because the client answers
+  `unsupported` for what they need: a main process (`RunMain`), the policy
+  log's denials and the main process's output (`Logs`) and an exec with
+  input on stdin, which a checkpoint sends (erratum 44). The variables:
+  the gateway URL alone gates, so a gateway set up halfway fails the
+  scenarios instead of skipping them;
+  `PARLEY_ACCEPTANCE_SANDBOX_IMAGE` names an image with `git`, `curl` and a
+  `/workspace` its user may write (without it the scenarios fail at once);
+  `PARLEY_ACCEPTANCE_OPENSHELL_TLS_DIR` names a directory with `ca.crt`,
+  `tls.crt` and `tls.key`, as the openshell CLI keeps them, for a gateway
+  that authenticates by mutual TLS, and `PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE`
+  a bearer token otherwise; `PARLEY_ACCEPTANCE_OPENSHELL_PROVIDER_PROFILE`
+  names a provider profile with one credential that the gateway holds in
+  its platform scope (a fresh gateway holds no `anthropic`); and
+  `PARLEY_ACCEPTANCE_SANDBOX_HUB_HOST` the host the sandboxes reach this
+  machine at. On a podman machine that host is the address of
+  `host.containers.internal` (192.168.127.254), not the name: podman
+  writes the name into the sandbox's `/etc/hosts`, so a connection to it
+  reaches the gateway's policy as an address no rule names. The harness's
+  own git calls the hub on the loopback address, since this machine may not
+  reach that host.
 - The 1 GiB repository and reference-host scenarios were not run here.

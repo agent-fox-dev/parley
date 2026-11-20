@@ -7011,9 +7011,9 @@ a provider with its value. Its processes and streams end with the test.
 `runtimetest.Backend` that `newBackend` returns for every test: a function
 that returns a client of the backend for a workspace and a recorder, a
 switch that makes the backend unreachable, where the backend can, a way to
-reject policy values and to add a proposal, and `EndpointsWithoutPaths`,
-which a backend sets when its provider profiles keep no endpoint paths (get
-is then expected to return the profile without them). The assertions about
+reject policy values and to add a proposal, and `EndpointsWithoutScheme`,
+which a backend sets when its provider profiles keep no endpoint scheme (get
+is then expected to return the profile with every scheme empty). The assertions about
 an operation that returns `ErrUnsupported` are skipped, so the contract
 holds for a runtime that lacks the operation. Only the policy value test
 creates its sandbox in a working directory with a base document; every other
@@ -7056,26 +7056,41 @@ refused connection, an unauthenticated or refused credential, a server error
 and a call that did not end in time included, is `ErrUnavailable`. Every
 error's text is scrubbed.
 
-The SDK in `go.mod` (v0.1.8) has no call for `ValidatePolicy`, `GetPolicy`,
+The SDK in `go.mod` (v0.1.9) has no call for `ValidatePolicy`, `GetPolicy`,
 `WatchSandboxes` (it watches one named sandbox), `RunMain`, `MakeDir`,
 `Stat`, `Walk` and `Logs` (its logs are the gateway's and the supervisor's
 log lines), nor for `Exec` and `ExecStream` with input on stdin; they answer
 `ErrUnsupported` without calling it. Where it has a call but cannot carry a
 part of the request, a request with that part is `ErrUnsupported` too and
-does not reach the SDK, so that no sandbox runs without the policy or
-outside the directory it was asked for: `CreateSandbox` with a working
-directory or a base document (the SDK takes typed policy rules: the
-protected and added rules go as named network rules, and a rule its network
-rule cannot hold is `ErrUnsupported`), and `StartSandbox` with a policy
-value or an environment. With SDK v0.1.8 no sandbox can therefore be created
-with a base policy or in a working directory; the caller answers
-`ErrUnsupported` as its own package says.
+does not reach the SDK, so that no sandbox runs without the policy it was
+asked for: `CreateSandbox` with a base document (the SDK takes typed policy
+rules) and `StartSandbox` with a policy value or an environment. The SDK has
+no working directory at creation: `CreateSandbox` creates the sandbox
+without one, and every command runs in the working directory its request
+names, which the image holds (an exec without one runs in the image's).
+
+What the client sends is what a gateway of release 0.1.9 takes. Every
+policy holds the filesystem part of the gateway's built-in policy, which a
+typed policy replaces whole, with the working directory added to its
+read-write paths. A rule's body is OpenShell's network rule with the hub's
+additions (`providers`, an endpoint's `scheme` and `paths`): an endpoint
+with a scheme becomes a `rest` endpoint with the access preset `full` per
+path glob, the providers are not sent, a rule without binaries gets `/**`
+(every program), a rule left with neither endpoints nor binaries is not
+sent, and a member the SDK's rule has no field for is `ErrUnsupported`.
 `InstallProviderProfile` installs a profile with one credential named after
-the profile; the SDK's profile endpoint is a host, a port and a protocol,
-which takes the endpoint's scheme, and has no path, so an endpoint's paths
-are not sent and the credential is authorized on every path of its host. `EnsureProvider` stores the value under the one credential
-of the provider's profile. `AttachProvider` first reads the provider in the
-workspace, so a provider of another workspace is not found.
+the profile and each endpoint as a `rest` endpoint with the access preset
+`full`, one per path prefix with the glob `<prefix>/**`; the scheme is not
+sent, so `GetProviderProfile` reports each host and port once with its
+prefixes and an empty scheme. `EnsureProvider` stores the value under each
+variable of the one credential of the provider's profile, and names the
+client's workspace as the profile's when the gateway reports the profile in
+scope `workspace`. `AttachProvider` first reads the provider in the
+workspace, so a provider of another workspace is not found. A sandbox whose
+name the gateway does not take (at most 19 lowercase letters, digits and
+hyphens; a sandbox id is not one) is created as `p-` and 17 hex digits of
+the SHA-256 of its name, with its name in the annotation `parley.name`,
+which the client reports wherever it names a sandbox.
 `ListProposals` reads the pending draft chunks of every sandbox of the
 workspace; `AddPolicyRule` uses the SDK's merge operation that adds a named
 network rule. `Upload` and `Download` go through a temporary file, because
@@ -7090,17 +7105,19 @@ The contract tests run against this implementation over the test gateway
 with what the SDK's in-memory client does not implement added in the
 package's tests: commands run as processes of the host, files and policy
 drafts kept in memory, and the provider profile `anthropic` the contract's
-providers name. The backend sets `EndpointsWithoutPaths`. The assertions
+providers name. The backend sets `EndpointsWithoutScheme`. The assertions
 about the operations this implementation answers `ErrUnsupported` are
-skipped, and so is the policy value test, whose sandbox has a working
-directory and a base document.
+skipped, and so is the policy value test, whose sandbox has a base
+document.
 
 `openshelltest.New(opts...)` (`internal/sandbox/runtime/openshell/openshelltest`,
 test support) returns a `Gateway`: a `v1.ClientInterface` that stands in for
 the gateway in the tests of this implementation, of the hub and end to end.
 It runs over `fake.NewClient(opts...)` (`Fake()` returns it), keeps provider
-profiles per workspace (`AddProfile` preloads one, `Profile` reads back what
-was installed) and can be made unreachable and reachable again
+profiles per workspace (`AddProfile` preloads one with the scope it is
+given, `Profile` reads back what was installed, which is reported in scope
+`openshelltest.WorkspaceScope` as the gateway reports it) and can be made
+unreachable and reachable again
 (`SetUnreachable`), every call then failing as unavailable; `Close` closes
 the in-memory client for good. `runtimetest.Fake` stays the double of the
 runtime that the other sandbox packages test against.
@@ -7972,9 +7989,11 @@ while the file exists.
 `containers/sandbox/Dockerfile` builds the reference sandbox image: `git`,
 `/bin/sh`, the base image's CA certificates and `parley` in `/usr/local/bin`,
 no `parleyd`, no agent and no entry point, as user 1000 with a writable home
-directory. It satisfies the sandbox image contract: as the image's default
-user, in a writable directory, `git init`, a commit and `git rev-parse HEAD`
-succeed. `image.CheckContract(engine, ref)` checks that for any image;
+directory and the working directory `/workspace`, which that user owns. It
+satisfies the sandbox image contract: as the image's default user, in
+`/workspace`, `git init`, a commit and `git rev-parse HEAD` succeed. The
+image holds the directory because OpenShell creates a sandbox without a
+working directory and its user cannot create one in `/`. `image.CheckContract(engine, ref)` checks that for any image;
 `PARLEY_SANDBOX_IMAGE` adds an operator's image to the image tests.
 
 The image tests (`test/image`) run only with `PARLEY_IMAGE_TESTS=1`, with

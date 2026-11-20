@@ -92,7 +92,8 @@ to the kinds is tested with that implementation.
 ## The OpenShell SDK as it is in go.mod
 
 The package records the SDK's surface as unverified. Read in
-`github.com/ai-openshell/sdk-go` v0.1.8, it differs as follows, and the
+`github.com/ai-openshell/sdk-go` v0.1.9, the release of the gateway it was
+run against (OpenShell 0.1.9), it differs as follows, and the
 implementation in `internal/sandbox/runtime/openshell` follows the SDK:
 
 - The configuration is `v1.Config{Address, TLS, Auth, …}`, where `TLS` is a
@@ -117,7 +118,8 @@ implementation in `internal/sandbox/runtime/openshell` follows the SDK:
   one named sandbox, not a workspace), `RunMain`, `MakeDir`, `Stat`, `Walk`
   and `Logs` (the SDK's logs are the gateway's and the supervisor's log
   lines, which carry neither the main process's output by stream nor the
-  policy log's decisions, and cannot be followed), and none for `Exec` and
+  policy log's decisions; v0.1.9 adds `SandboxLogsWatch`, which follows
+  them, and the client does not use it yet), and none for `Exec` and
   `ExecStream` with input on stdin. They answer `unsupported` without
   calling the SDK. Closing the SDK client makes the operations that call it
   fail as `unavailable`; these keep answering `unsupported`.
@@ -127,49 +129,93 @@ implementation in `internal/sandbox/runtime/openshell` follows the SDK:
   too. Its default gateway release is `fake`, which is not a semantic
   version; `fake.WithGatewayInfo` sets another.
 
-## What the SDK cannot carry of a request
+## What the gateway takes, and how the client meets it
 
-Where the SDK has a call for an operation but no field for a part of its
-request, the operation answers `unsupported` without calling the SDK when
-the request holds that part, as for an operation the SDK lacks (design
-decision 19), so that no part is silently dropped and a sandbox never runs
-without the policy, or outside the working directory, it was asked for:
+Run against a gateway of release 0.1.9 (issue #278), the gateway refuses
+several things the package's design took for granted. The client adapts
+what it sends, so that the hub's own values stay as they are:
 
-- `CreateSandbox` with a base document (`Policy.Base`, the SDK takes typed
-  policy rules, not a document) or a working directory (the SDK has none at
-  creation) is `unsupported`. Without them the sandbox is created with its
-  image, resources, GPU, environment, providers, labels and its protected
-  and added rules, sent as named network rules decoded from their JSON
-  bodies; a body with a member the SDK's network rule has no field for is
-  `unsupported`, and an added rule named like an earlier rule, which would
-  replace it, is `invalid`.
-- `StartSandbox` with a policy value (a base document, a protected or an
-  added rule) or an environment is `unsupported`: the SDK's start takes
-  neither. Without them the sandbox is started and keeps what the gateway
-  holds for it.
+- **A provider profile's endpoint is an L7 endpoint.** The gateway refuses
+  the scheme as an endpoint's protocol, refuses a credentialed endpoint
+  without L7 inspection, and refuses the `rest` protocol without an access
+  preset or rules. `InstallProviderProfile` therefore sends each endpoint
+  as protocol `rest` with the access preset `full`, which inspects HTTP
+  with or without TLS, so the scheme is not sent. Its path prefixes are
+  sent: one endpoint per prefix, with the path glob `<prefix>/**`, which
+  v0.1.9's profile endpoint (the full policy endpoint) carries.
+  `GetProviderProfile` therefore reports each host and port once with its
+  prefixes and an empty scheme; the contract's backend sets
+  `EndpointsWithoutScheme` for it. For `parley-hub` this authorizes the
+  credential on the hub's `/api/v1/` and `/git/` paths only.
+- **A provider's credential is keyed by its variables, and a workspace
+  profile is named.** The gateway refuses a provider whose credential is
+  keyed by the profile credential's name: `EnsureProvider` stores the value
+  under each variable the profile's one credential declares. It looks a
+  provider's profile up in the global scope unless the provider names the
+  workspace that holds it, so a provider of a profile the gateway reports
+  in scope `workspace`, such as `parley-hub`, names the client's workspace.
+- **Names are short.** The gateway takes sandbox and workspace names of at
+  most 19 lowercase letters, digits and hyphens. A sandbox id (`sbx_` and
+  32 hex digits) is neither, so a sandbox whose name the gateway does not
+  take is created as `p-` and 17 hex digits of the SHA-256 of its name (68
+  bits), with its own name in the annotation `parley.name`, which the
+  client reports wherever it names a sandbox (`GetSandbox`,
+  `ListSandboxes`, `ListProposals`). A workspace name is the operator's:
+  an `openshell_workspace` the gateway refuses stops the start, naming the
+  key.
+- **A typed policy replaces the built-in one whole.** A policy that holds
+  network rules only leaves the sandbox without a filesystem policy, and
+  its first process exits at once. Every policy the client sends holds the
+  filesystem part of the gateway's built-in policy (`include_workdir`,
+  read-only `/bin`, `/usr`, `/lib`, `/proc`, `/dev/urandom`, `/etc`,
+  `/var/log`, read-write `/tmp` and `/dev/null`, Landlock `best_effort`),
+  with the sandbox's working directory added to the read-write paths.
+- **A network rule needs binaries, and names no providers.** The gateway
+  lets no program through a rule that names none: a rule with endpoints and
+  without binaries, as the hub writes its own, gets the glob `/**`, every
+  program. The hub's rule body (`ruleBody` in `internal/sandbox`) is
+  OpenShell's rule with `providers` and an endpoint's `scheme` and `paths`
+  added: an endpoint with a scheme becomes a `rest` endpoint with the
+  access preset `full` per path glob, an endpoint with paths and no scheme,
+  or with a scheme and a protocol, path, access or rules of its own, is
+  `unsupported`, and the providers are not sent, since the gateway lets an
+  attached provider's credential reach only the endpoints of its profile.
+  A rule left with neither endpoints nor binaries, such as a credential's,
+  which names its provider only, allows nothing and is not sent.
 
-The consequence with SDK v0.1.8: no sandbox can be created with a base
-policy or in a working directory, and none started again with its policy
-and environment. A caller (package 45 for creation, 47 for start) gets
-`unsupported` and gives its own answer, `502 sandbox_runtime_error` or a
-failed sandbox, as design decision 19 says. A profile that names a `policy`
-file cannot start against this implementation anyway (`ValidatePolicy` is
-unsupported).
+## The working directory (design decision 19 amended)
 
-One part is still not sent, and the operation is carried out without it:
+Design decision 19 had the client refuse a request with a part the SDK
+cannot carry, a working directory at creation included, so that no sandbox
+ran outside the directory it was asked for. The SDK has no working
+directory at creation, so with that refusal every provisioning ended
+`failed` with `provision_failed`. The decision is amended for the working
+directory: `CreateSandbox` creates the sandbox without one, with the
+directory writable in its filesystem policy (see the previous entry), and
+every command runs with the working directory its request names. The hub
+names `/workspace` in every exec it runs, the checkout, checkpoints, the
+terminal and an exec request without `workdir` included; an exec without
+one would run in the image's working directory.
 
-- `InstallProviderProfile` installs one credential named after the profile,
-  whose placeholder goes into each of the profile's variables, and
-  `EnsureProvider` stores a provider's value under the one credential of its
-  profile (a profile with another count is `invalid`). The SDK's profile
-  endpoint is a host, a port and a protocol, and has no path: the endpoint's
-  scheme goes into the protocol, and its paths are not sent.
-  `GetProviderProfile` therefore reports the endpoint without paths. For the
-  hub credential's profile (`parley-hub`, meant for `/api/v1/` and `/git/`)
-  this authorizes the credential for every path of the hub's own host. The
-  paths outside those two are the same hub's, so the credential still
-  reaches no other party, and narrowing it per workspace belongs to the
-  sandbox's policy (design decision 15).
+The gateway does not create the directory, and a sandbox's user cannot
+create it in the read-only `/`. The image therefore holds `/workspace`,
+writable by its default user: the reference sandbox image creates it, and
+the image contract's check (`image.CheckContract`) runs its `git init` in
+it. This goes beyond the image contract of PRD §13.9, which asks for `git`
+only.
+
+The rest of design decision 19 stands: `CreateSandbox` with a base document
+(the SDK takes typed policy rules, not a document) and `StartSandbox` with
+a policy value or an environment are `unsupported` without an SDK call,
+and a rule body with a member the SDK's network rule has no field for is
+`unsupported`. With SDK v0.1.9 no sandbox can be created with a base
+policy, none started again with its policy and environment, and none given
+a main process (`RunMain`), its output or its policy log's denials
+(`Logs`), or a checkpoint (its exec sends input on stdin). A caller
+(package 45 for creation, 47 for start) gets `unsupported` and gives its
+own answer, `502 sandbox_runtime_error` or a failed sandbox. A profile that
+names a `policy` file cannot start against this implementation anyway
+(`ValidatePolicy` is unsupported).
 
 The SDK reports nothing of a sandbox's working directory, which counts as
 present while the sandbox exists.
@@ -182,18 +228,17 @@ implement (exec, file transfer, policy drafts) added in the package's tests:
 commands run as processes of the host, and files and draft chunks are kept
 in memory. The gateway holds the provider profile `anthropic`, with one
 credential, which the contract's providers name, as a gateway that ships it
-does. Only the policy value test creates its sandbox in `/w` with a base
-document (`contractSpec`); this implementation refuses that as
-`unsupported`, so the test is skipped, as is the start of the stop and start
-test, which carries a policy value, and every assertion about an operation
-the SDK lacks. Every other test creates its sandbox without either
-(`plainSpec`) and runs here: exec, the exec stream, the terminal, upload and
-download, providers, provider profiles and proposals included. The backend
-sets `EndpointsWithoutPaths`, so the contract expects an installed provider
-profile back from get without its endpoints' paths, which are not sent (see
-the previous entry), and with the rest of it unchanged. Creation and start
-with only what the SDK can carry, and their refusal otherwise without an SDK
-call, are tested with the implementation.
+does; a profile the client installs is reported in scope `workspace`, as
+the gateway reports it. Only the policy value test creates its sandbox in
+`/w` with a base document (`contractSpec`); this implementation refuses
+that as `unsupported`, so the test is skipped, as is the start of the stop
+and start test, which carries a policy value, and every assertion about an
+operation the SDK lacks. Every other test creates its sandbox without
+either (`plainSpec`) and runs here: exec, the exec stream, the terminal,
+upload and download, providers, provider profiles and proposals included.
+The backend sets `EndpointsWithoutScheme` (see above). What the client
+sends of a profile, a provider, a sandbox's policy and name, and its
+refusals without an SDK call, are tested with the implementation.
 The error-kind rows that need a gateway (an image the gateway
 refuses, an unauthenticated answer, a server error, a refused connection)
 are checked with SDK errors given to the client and, for the refused
@@ -201,6 +246,8 @@ connection, a real SDK client to a closed loopback port. The validation of
 a rejected policy is checked through `CreateSandbox`, and the missing path
 of `Stat` as an operation the SDK lacks. A stream's freedom from the
 30-second bound is checked with `ExecStream`, because `Logs` is unsupported.
+What the gateway itself takes is checked by the acceptance suite's sandbox
+scenarios against a real gateway (errata 55).
 
 ## How the hub runs the section's check and the start-up check
 
