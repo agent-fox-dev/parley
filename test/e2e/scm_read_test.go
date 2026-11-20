@@ -192,7 +192,9 @@ func TestSCMRead_AReviewAgentGetsTheConflictOfABranchFromTheShell(t *testing.T) 
 
 // An agent reads from the shell what a file of demo declares, and on which
 // lines, before it forks: on main, on a branch that changed the file, and
-// for a file in another language than Go.
+// for a file in another language than Go. The commands read the hub's URL
+// and the key from the environment, which the test sets, so it does not run
+// in parallel.
 func TestSCMRead_AnAgentOutlinesAFileBeforeItForks(t *testing.T) {
 	const router = "package api\n\ntype Router struct{}\n\nfunc NewRouter() *Router {\n\treturn &Router{}\n}\n"
 	const onFeat = router + "\nfunc (r *Router) Mount(prefix string) {}\n"

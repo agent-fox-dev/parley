@@ -33,8 +33,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w \
       -o /out/ ./cmd/parley
 
 # Alpine packages git 2.38 or later, which the hub refuses to start without.
-# The stage is alpine like the build stage, so parleyd finds the C library
-# it was linked against (musl) and needs no package of its own.
+# The stage is alpine like the build stage, so parleyd, linked against musl
+# there, finds musl here and needs no package of its own. Keep both stages
+# on alpine when either base image changes.
 FROM docker.io/library/alpine:3.22
 RUN apk add --no-cache git ca-certificates \
  && addgroup -S -g 10001 parley \

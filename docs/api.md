@@ -4425,8 +4425,8 @@ The answer:
 |---|---|
 | `path` | the file's path, as asked |
 | `resolved_sha` | the full id of the commit `ref` resolved to |
-| `language` | the name of the file's language, from its extension: `Go`, `Python`, `JavaScript`, `TypeScript`, `Rust`, `Java`, `Kotlin`, `C#`, `Ruby`, `C`, `C++`, `PHP`, `Scala`, `Lua` or `Shell`; `""` for a file of no known language and for a symbolic link |
-| `supported` | whether this hub outlined the file; `false` for a file of no known language, for a symbolic link, and for a language this build of the hub has no backend for |
+| `language` | the name of the file's language, from its extension (a `.h` file that holds C++ is `C++`): `Go`, `Python`, `JavaScript`, `TypeScript`, `Rust`, `Java`, `Kotlin`, `C#`, `Ruby`, `C`, `C++`, `PHP`, `Scala`, `Lua` or `Shell`; `""` for a file of no known language and for a symbolic link |
+| `supported` | whether this hub outlined the file; `false` for a file of no known language, for a symbolic link, for a language this build of the hub has no backend for, and for a file its backend could not take at all (one whose first NUL byte lies between byte 8,000 and byte 8,192 among them) |
 | `declarations` | the file's declarations in line order; `[]` when it declares nothing and whenever `supported` is `false` |
 
 A declaration:
@@ -4450,8 +4450,16 @@ Only a text file of at most 1 MiB (1,048,576 bytes) is outlined; its size
 is checked before any of it is read. A file is binary, as for blame, when a
 NUL byte is among its first 8,000 bytes. The checks run in this order:
 `path`, `ref`, the caching answer, the path at the commit, the size, the
-bytes, and then the parse, which ends at the read timeout like the rest of
-the read.
+bytes, and then the parse. A read whose parse has not ended at the read
+timeout is answered `503 scm_timeout` then, like every read; the hub parses
+at most four files at once, a parse left behind by such a read included, and
+a read that finds no place among them within its time is answered the same.
+
+The answer's entity tag and `Cache-Control` are those of every read, from
+the commit and the request alone. `supported` also depends on how the hub
+was built, so an answer kept from a hub built without cgo, one marked
+immutable among them, does not change when the hub is replaced by one built
+with cgo.
 
 | Status | When |
 |---|---|

@@ -44,6 +44,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent-fox-dev/agentkit-go/outline"
+
 	"github.com/agent-fox-dev/parley/internal/access"
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/gitserver/pushrule"
@@ -78,6 +80,10 @@ const (
 // DefaultReadTimeout is how long a read may run when Deps sets no read
 // timeout.
 const DefaultReadTimeout = 30 * time.Second
+
+// DefaultMaxOutlines is how many files the outline route parses at once
+// when Deps sets no limit.
+const DefaultMaxOutlines = 4
 
 // errReadTimeout is the cause of the end of a read's context at its
 // deadline, which tells it from a client that went away.
@@ -143,6 +149,12 @@ type Deps struct {
 	// ReadTimeout is how long a read may run, from the moment its route
 	// begins handling it; zero or less is DefaultReadTimeout.
 	ReadTimeout time.Duration
+	// Outline outlines the source file path, whose content is src; nil is
+	// the outline package's Outline.
+	Outline func(ctx context.Context, path string, src []byte) (outline.File, error)
+	// MaxOutlines is how many files may be parsed at once; zero or less is
+	// DefaultMaxOutlines.
+	MaxOutlines int
 	// Now is the clock the commits a write makes take their times from;
 	// nil is time.Now.
 	Now func() time.Time
@@ -162,6 +174,9 @@ type Component struct {
 	linker ChangeLinker
 	// sessions is the registered session linker, nil for none.
 	sessions SessionLinker
+	// parsing holds one value for every file being parsed for an outline,
+	// a parse whose request has ended included.
+	parsing chan struct{}
 	// replayed, when not nil, runs once a rebase has replayed its
 	// commits and before it moves the branch: a test's way to move the
 	// branch meanwhile.
@@ -198,6 +213,15 @@ func (c *Component) Bind(d Deps) {
 	if d.ReadTimeout <= 0 {
 		d.ReadTimeout = DefaultReadTimeout
 	}
+	if d.Outline == nil {
+		d.Outline = func(ctx context.Context, path string, src []byte) (outline.File, error) {
+			return outline.Outline(ctx, path, src, outline.Options{MaxFileBytes: maxOutlineSize})
+		}
+	}
+	if d.MaxOutlines <= 0 {
+		d.MaxOutlines = DefaultMaxOutlines
+	}
+	c.parsing = make(chan struct{}, d.MaxOutlines)
 	if d.Now == nil {
 		d.Now = time.Now
 	}

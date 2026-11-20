@@ -2,6 +2,7 @@ package scm
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -86,9 +87,7 @@ func (c *Component) getOutline(w http.ResponseWriter, r *http.Request) error {
 		return server.NewError("binary_file", http.StatusUnprocessableEntity,
 			fmt.Sprintf("file %q is binary at %s, and a binary file has no declarations to outline", path, res.SHA))
 	}
-	// The parse ends with the request's context, at the read timeout; the
-	// route's wrapper answers that end.
-	out, err := outline.Outline(ctx, "/"+path, content.Bytes(), outline.Options{MaxFileBytes: maxOutlineSize})
+	out, err := c.parse(ctx, "/"+path, content.Bytes())
 	if err != nil {
 		return fmt.Errorf("outline %q at %s: %w", path, res.SHA, err)
 	}
@@ -100,4 +99,48 @@ func (c *Component) getOutline(w http.ResponseWriter, r *http.Request) error {
 	}
 	server.WriteJSON(w, http.StatusOK, answer)
 	return nil
+}
+
+// parse outlines src, the content of the file path, and returns when ctx
+// ends even if the parse has not: only a part of a parse looks at its
+// context, so one may outlast the read timeout, and the route's wrapper
+// answers that end on time. A parse left behind keeps its place among the
+// MaxOutlines that run at once until it ends, so that what is left behind
+// cannot pile up; a read that finds no place within its time ends like one
+// whose parse did.
+//
+// The outline package reads the file path from disk when it is handed a
+// nil src, so an empty file's content is passed as empty, never as nil.
+func (c *Component) parse(ctx context.Context, path string, src []byte) (outline.File, error) {
+	if src == nil {
+		src = []byte{}
+	}
+	select {
+	case c.parsing <- struct{}{}:
+	case <-ctx.Done():
+		return outline.File{}, context.Cause(ctx)
+	}
+	type result struct {
+		file outline.File
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-c.parsing }()
+		// A panic here is outside the request's goroutine, where the server
+		// would answer it, and would end the hub.
+		defer func() {
+			if p := recover(); p != nil {
+				done <- result{err: fmt.Errorf("the parse panicked: %v", p)}
+			}
+		}()
+		file, err := c.deps.Outline(ctx, path, src)
+		done <- result{file, err}
+	}()
+	select {
+	case r := <-done:
+		return r.file, r.err
+	case <-ctx.Done():
+		return outline.File{}, context.Cause(ctx)
+	}
 }

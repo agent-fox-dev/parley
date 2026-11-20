@@ -102,10 +102,9 @@ func TestHubImage_RunsTheHubOnOneVolume(t *testing.T) {
 			}
 			return cgo, grammars
 		}
-		// The grammars of the fourteen languages other than Go come in
-		// thirteen modules: TypeScript's holds TSX too, and Shell's is bash.
-		if cgo, grammars := settings("parleyd"); cgo != "1" || grammars < 13 {
-			t.Errorf("parleyd: CGO_ENABLED=%s with %d grammar modules; want 1 and the outline's grammars", cgo, grammars)
+		// One grammar module for each of the fourteen languages other than Go.
+		if cgo, grammars := settings("parleyd"); cgo != "1" || grammars != 14 {
+			t.Errorf("parleyd: CGO_ENABLED=%s with %d grammar modules; want 1 and the 14 grammars of the outline", cgo, grammars)
 		}
 		if cgo, grammars := settings("parley"); cgo != "0" || grammars != 0 {
 			t.Errorf("parley: CGO_ENABLED=%s with %d grammar modules; want 0 and none", cgo, grammars)

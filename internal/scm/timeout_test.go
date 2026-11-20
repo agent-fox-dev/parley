@@ -8,9 +8,12 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/agent-fox-dev/agentkit-go/outline"
 
 	"github.com/agent-fox-dev/parley/internal/gitrepo"
 	"github.com/agent-fox-dev/parley/internal/scm"
@@ -130,3 +133,57 @@ func TestRead_AnswersATimeoutReachedAfterTheGitWorkUnlessTheBodyHasBegun(t *test
 		}
 	})
 }
+
+// A parse cannot always be ended: only part of it looks at its context. The
+// read is answered at the read timeout all the same, and no more parses run
+// at once than the limit, the ones left behind included.
+func TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout(t *testing.T) {
+	var parses atomic.Int32
+	release := make(chan struct{})
+	w := newWorld(t, func(d *scm.Deps) {
+		d.ReadTimeout = 200 * time.Millisecond
+		d.MaxOutlines = 1
+		d.Outline = func(ctx context.Context, path string, src []byte) (outline.File, error) {
+			parses.Add(1)
+			<-release
+			return outline.Outline(ctx, path, src, outline.Options{})
+		}
+	})
+	free := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(free)
+	x := commit(t, w.repo, w.id["c2"], "x.go", "package x\n\nfunc X() {}\n")
+	path := scmPath("demo", "/outline?path=x.go&ref="+x)
+
+	for _, name := range []string{"the parse that stalls", "the next one, which waits for it"} {
+		start := time.Now()
+		r, err := w.fetch(path)
+		if err != nil || r.status != http.StatusServiceUnavailable || r.errorType() != "scm_timeout" || r.header.Get("ETag") != "" {
+			t.Fatalf("%s: %d %s (%v), ETag %q; want 503 scm_timeout without a tag", name, r.status, r.body, err, r.header.Get("ETag"))
+		}
+		if d := time.Since(start); d >= 2*time.Second {
+			t.Errorf("%s: answered after %v, want within 2s", name, d)
+		}
+	}
+	if n := parses.Load(); n != 1 {
+		t.Errorf("%d parses ran while the first had not ended, want 1", n)
+	}
+
+	free()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r, err := w.fetch(path)
+		if err == nil && r.status == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("once the stalled parse ended: %d %s (%v), want 200", r.status, r.body, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// emptyBlobs is a workspace repository that writes nothing for a blob, as
+// for an empty file.
+type emptyBlobs struct{ scm.Repository }
+
+func (emptyBlobs) WriteBlob(context.Context, string, io.Writer) error { return nil }

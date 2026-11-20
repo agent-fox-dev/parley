@@ -35,6 +35,28 @@ at the first 8,192 bytes and outlines no file with a NUL byte there, so a
 file whose first NUL byte lies in the 192 bytes between the two is answered
 `200` with `supported: false` and no declarations.
 
+## A parse is left behind at the read timeout, and four run at once
+
+The package ends a read that outlasts `[scm].read_timeout` and leaves the
+end of the parse to the request's context. agentkit-go's `outline` looks
+at the context only while tree-sitter parses: its Go backend and its walk
+over the declarations it found do not, so a parse can outlast the timeout.
+The route answers `503 scm_timeout` at the timeout all the same and leaves
+the parse to end by itself; so that such parses cannot pile up, at most
+four files are parsed at once (`scm.DefaultMaxOutlines`), a parse left
+behind included, and a read that finds no place within its time is
+answered `503 scm_timeout` too. Test:
+`TestOutline_AnswersATimeoutWhenTheParseOutlastsTheReadTimeout`.
+
+## An answer is cached as every read is, whatever the build
+
+The answer's entity tag comes from the commit and the request, and a read
+by a full commit id is marked immutable, as the package asks. `supported`
+also depends on whether the hub was built with cgo, so an answer a client
+kept from a hub built without it stays `supported: false` for that client
+after the hub is replaced by one built with cgo. The hub image is built
+with cgo, so this concerns only an operator who ran a build without it.
+
 ## Smaller choices
 
 - A file that does not parse in its language is outlined as far as its

@@ -1,15 +1,20 @@
 package scm_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/agent-fox-dev/agentkit-go/outline"
+
 	"github.com/agent-fox-dev/parley/internal/gitrepo/gitrepotest"
+	"github.com/agent-fox-dev/parley/internal/scm"
 )
 
 // outlineRouter is router.go on the main of the outline workspace.
@@ -152,9 +157,6 @@ func TestOutline_AnswersTheDeclarationsOfAFileInLineOrder(t *testing.T) {
 	if !slices.Equal(a.Declarations, want) {
 		t.Errorf("declarations =\n%+v\nwant\n%+v", a.Declarations, want)
 	}
-	if !slices.IsSortedFunc(a.Declarations, func(x, y declaration) int { return x.StartLine - y.StartLine }) {
-		t.Errorf("declarations are not in line order: %+v", a.Declarations)
-	}
 
 	r, a = outlineOf(t, w.world, "outline", "path=empty.go")
 	if r.status != http.StatusOK || !a.is(true, "Go") || len(a.Declarations) != 0 || !strings.Contains(string(r.body), `"declarations":[]`) {
@@ -200,6 +202,9 @@ func TestOutline_ReadsTheCommitItsRefNames(t *testing.T) {
 
 		if r, a := outlineOf(t, w, "demo--t1", "path=a.go"); r.status != http.StatusOK || a.ResolvedSHA != base || !slices.Equal(a.names(), []string{"Parent"}) {
 			t.Errorf("without a ref: %d %s, want the file of the fork's base branch at %s, declaring Parent", r.status, r.body, base)
+		}
+		if r := w.get(t, scmPath("demo--t1", "/outline?path=a.go"), w.memberKey); r.status != http.StatusOK {
+			t.Errorf("the fork's owner, a member of the parent's org: %d %s, want 200", r.status, r.body)
 		}
 		if r, a := outlineOf(t, w, "demo--t1", "path=a.go&ref=work"); r.status != http.StatusOK || a.ResolvedSHA != own || !slices.Equal(a.names(), []string{"Own"}) {
 			t.Errorf("ref=work: %d %s, want the file of the fork's own branch at %s, declaring Own", r.status, r.body, own)
@@ -255,10 +260,14 @@ func TestOutline_RefusesWhatItCannotOutline(t *testing.T) {
 				path = q
 			}
 			switch {
-			case c.status == http.StatusBadRequest && path.Get("ref") == "":
+			case c.status == http.StatusBadRequest && !strings.Contains(c.query, "internal") && !strings.Contains(c.query, "vendor"):
 				// The file route's own words for the same path.
 				if f := w.get(t, scmPath("outline", "/file?"+c.query), w.ownerKey); f.status != http.StatusBadRequest || f.message() != r.message() {
 					t.Errorf("message %q, want the file route's for the same path, %q", r.message(), f.message())
+				}
+			case c.query == "path=internal" || c.query == "path=vendor/sub":
+				if !strings.Contains(r.message(), "not a file") {
+					t.Errorf("message %q does not say that the path is not a file", r.message())
 				}
 			case c.want == "payload_too_large":
 				if e["size"] != float64(1<<20+1) {
@@ -280,5 +289,36 @@ func TestOutline_RefusesWhatItCannotOutline(t *testing.T) {
 	}
 	if r, _ := outlineOf(t, w.world, "outline", "path=late.go"); r.status != http.StatusOK {
 		t.Errorf("late.go, whose only NUL is byte 9,000: %d %.200s, want 200", r.status, r.body)
+	}
+}
+
+// The outline package reads a file from disk when it is handed no content
+// at all, so an empty file's content must still be content.
+func TestOutline_OutlinesAnEmptyFileFromItsContentAlone(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var got [][]byte
+	w := newWorld(t, func(d *scm.Deps) {
+		open := d.Open
+		d.Open = func(ctx context.Context, slug string) (scm.Repository, error) {
+			repo, err := open(ctx, slug)
+			return emptyBlobs{repo}, err
+		}
+		d.Outline = func(ctx context.Context, path string, src []byte) (outline.File, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, src)
+			return outline.Outline(ctx, path, src, outline.Options{})
+		}
+	})
+	x := commit(t, w.repo, w.id["c2"], "etc/hosts.sh", "")
+	r, a := outlineOf(t, w, "demo", "path=etc/hosts.sh&ref="+x)
+	if r.status != http.StatusOK || a.Language == nil || *a.Language != "Shell" || len(a.Declarations) != 0 {
+		t.Errorf("%d %s, want 200 with the language Shell and no declarations", r.status, r.body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] == nil {
+		t.Errorf("the outline was handed %v, want the file's content once, empty and not nil", got)
 	}
 }
