@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,6 +32,15 @@ func (r Result) Must(tb testing.TB) Result {
 		tb.Fatalf("exit status %d\nstdout:\n%s\nstderr:\n%s", r.Code, r.Stdout, r.Stderr)
 	}
 	return r
+}
+
+// Lines are the lines of the standard output, without their ends; none
+// when it is empty.
+func (r Result) Lines() []string {
+	if r.Stdout == "" {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(r.Stdout, "\n"), "\n")
 }
 
 // JSON is the standard output decoded as a JSON object, nil when it is not
@@ -96,17 +106,29 @@ func (h *Hub) CLIContext(ctx context.Context, credential string, args ...string)
 // answers with it; without one, a credential can still come in the remote
 // URL (AuthURL).
 func (h *Hub) Git(dir, credential string, args ...string) Result {
-	env := []string{
-		"PATH=" + os.Getenv("PATH"), "HOME=" + h.gitHome, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0",
-		"GIT_SSL_CAINFO=" + built.caFile,
-		"GIT_AUTHOR_NAME=Acceptance", "GIT_AUTHOR_EMAIL=acceptance@example.test",
-		"GIT_COMMITTER_NAME=Acceptance", "GIT_COMMITTER_EMAIL=acceptance@example.test",
-	}
+	env := h.gitEnv()
 	if credential != "" {
 		env = append(env, "PARLEY_ENDPOINT_URL="+h.URL(""), "PARLEY_API_KEY="+credential)
 		args = append([]string{"-c", "credential." + h.URL("") + ".helper=!" + built.parley + " credential-helper"}, args...)
 	}
 	return run(context.Background(), dir, env, "git", args...)
+}
+
+// gitEnv is the whole environment of the scenario's git.
+func (h *Hub) gitEnv() []string {
+	return []string{
+		"PATH=" + os.Getenv("PATH"), "HOME=" + h.gitHome, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0",
+		"GIT_SSL_CAINFO=" + built.caFile,
+		"GIT_AUTHOR_NAME=Acceptance", "GIT_AUTHOR_EMAIL=acceptance@example.test",
+		"GIT_COMMITTER_NAME=Acceptance", "GIT_COMMITTER_EMAIL=acceptance@example.test",
+	}
+}
+
+// GitEnv runs stock git as Git does without a credential, with the
+// NAME=value variables env added to its environment, such as those a
+// credential helper the scenario configures itself reads.
+func (h *Hub) GitEnv(dir string, env []string, args ...string) Result {
+	return run(context.Background(), dir, append(h.gitEnv(), env...), "git", args...)
 }
 
 // AuthURL is remote with credential as the password of its user info.
