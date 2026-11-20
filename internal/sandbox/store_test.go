@@ -7,6 +7,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ func TestStore_KeepsWhatItIsGiven(t *testing.T) {
 			Credentials: []string{"model"}, OptionalCredentials: []string{"search"},
 			ExposeSecrets: []string{"Z_TOKEN"}, OptionalExposeSecrets: []string{"A_TOKEN"},
 			ProviderProfiles: map[string]string{"model": "anthropic", "search": "brave"},
+			ToolServer:       "/opt/tools/agentkit-tools",
 		},
 		HubTokenID: "tok1", UserID: "u1", OrgID: "org1", FamilyRoot: "ws", Marker: sandbox.MarkerStart,
 		RuntimeCreated: true, RuntimeProvisioning: true, ReadyAt: &at,
@@ -57,6 +59,41 @@ func TestStore_KeepsWhatItIsGiven(t *testing.T) {
 		}
 		if _, err := sandbox.GetIn(ctx, h.Store.Main(), "ws", full.ID); !errors.Is(err, sandbox.ErrNotFound) {
 			t.Errorf("read from another workspace: %v; want the not-found error", err)
+		}
+	})
+	t.Run("a snapshot stored before profiles named a tool server has none", func(t *testing.T) {
+		old := full
+		old.ID = sandbox.NewID()
+		if err := tx(func(tx *sql.Tx) error { return sandbox.Insert(ctx, tx, old) }); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		err := tx(func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(ctx, `UPDATE sandboxes SET snapshot = replace(snapshot, ',"tool_server":"/opt/tools/agentkit-tools"', '') WHERE id = ?`, old.ID)
+			if err != nil {
+				return err
+			}
+			var stored string
+			if err := tx.QueryRowContext(ctx, `SELECT snapshot FROM sandboxes WHERE id = ?`, old.ID).Scan(&stored); err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n != 1 || strings.Contains(stored, "tool_server") {
+				t.Errorf("the stored snapshot %s still has the member tool_server", stored)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := sandbox.GetIn(ctx, h.Store.Main(), "ws--t1", old.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Snapshot.ToolServer != "" {
+			t.Errorf("the snapshot read back names the tool server %q; want none", got.Snapshot.ToolServer)
+		}
+		body, err := json.Marshal(sandbox.ObjectOf(got, true))
+		if err != nil || !strings.Contains(string(body), `"tools":false`) {
+			t.Errorf("its object is %s (%v); want tools false", body, err)
 		}
 	})
 	t.Run("list by state", func(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ var objectMembers = []string{
 	"checkout", "checkpoint", "command", "cpu", "created_at", "created_by", "credentials", "ended_at", "env",
 	"exit_code", "expires_at", "exposed_secrets", "gpu", "hub_access", "id", "idle_timeout_seconds", "image",
 	"labels", "last_activity_at", "memory", "policy_revision", "profile", "purpose", "restored_from",
-	"runtime_reachable", "session_id", "state", "state_reason", "updated_at", "workspace", "workspace_rules",
+	"runtime_reachable", "session_id", "state", "state_reason", "tools", "updated_at", "workspace", "workspace_rules",
 }
 
 var wholeSecondUTC = regexp.MustCompile(`^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$`)
@@ -45,7 +46,7 @@ func TestObject_HasEveryMember(t *testing.T) {
 	full.PolicyRevision, full.IdleTimeout = 2, 30*time.Minute
 	full.Checkpoint = json.RawMessage(`{"ok":true}`)
 	full.RestoredFrom, full.EndedAt = &source, &ended
-	full.Snapshot = sandbox.Snapshot{Env: map[string]string{"K": "env-SECRET"}, BasePolicy: []byte("policy-SECRET")}
+	full.Snapshot = sandbox.Snapshot{Env: map[string]string{"K": "env-SECRET"}, BasePolicy: []byte("policy-SECRET"), ToolServer: "/opt/SECRET/agentkit-tools"}
 	full.HubTokenID = "tok-SECRET"
 
 	cases := []struct {
@@ -91,6 +92,9 @@ func TestObject_HasEveryMember(t *testing.T) {
 			}
 			if got := slices.Sorted(maps.Keys(creator)); !slices.Equal(got, []string{"actor_id", "actor_type", "username"}) {
 				t.Errorf("created_by members %v; want actor_id, actor_type, username", got)
+			}
+			if want := strconv.FormatBool(tc.rec.Snapshot.ToolServer != ""); string(o["tools"]) != want {
+				t.Errorf("tools = %s; want %s, whether the sandbox's snapshot names a tool server", o["tools"], want)
 			}
 			if strings.Contains(string(body), "SECRET") {
 				t.Errorf("object %s holds a value the record keeps hidden", body)

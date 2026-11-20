@@ -137,6 +137,47 @@ func TestActivity_RecordsWhenASandboxWasLastUsed(t *testing.T) {
 	})
 }
 
+func TestActivity_RecordsAToolCallWhenItStartsAndWhenItEnds(t *testing.T) {
+	t.Parallel()
+	h := startToolsHub(t, "max_concurrent_execs = 1\n")
+	id := h.tooled(t, nil)
+	if a, _ := h.list(t, id, h.key); a.status != http.StatusOK {
+		t.Fatalf("GET tools = %d %s; want 200", a.status, a.body)
+	}
+	before := h.lastActivity(t, id)
+
+	release, waiting, _ := h.held()
+	start := h.clock.Now()
+	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "30m"}, nil)
+	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+	if got := h.lastActivity(t, id); !got.Equal(start) || !got.After(before) {
+		t.Errorf("while the call runs last_activity_at = %v; want its start %v", got, start)
+	}
+	h.clock.Advance(3 * time.Second)
+	for _, row := range []struct {
+		name, cred, tool string
+		status           int
+	}{
+		{"a call over the limit", h.key, "read_file", http.StatusTooManyRequests},
+		{"a call of an unknown tool", h.key, "no_such_tool", http.StatusNotFound},
+		{"a call of a tool outside the set", h.memberKey, "execute", http.StatusForbidden},
+	} {
+		if a := h.tool(t, id, row.cred, row.tool, nil); a.status != row.status {
+			t.Errorf("%s = %d %s; want %d", row.name, a.status, a.body, row.status)
+		}
+		if got := h.lastActivity(t, id); !got.Equal(start) {
+			t.Errorf("after %s last_activity_at = %v; want it left at %v", row.name, got, start)
+		}
+	}
+	release()
+	if a := receive(t, answered); a.status != http.StatusOK {
+		t.Fatalf("the call = %d %s; want 200", a.status, a.body)
+	}
+	if got, want := h.lastActivity(t, id), start.Add(3*time.Second); !got.Equal(want) {
+		t.Errorf("after the call last_activity_at = %v; want its end %v", got, want)
+	}
+}
+
 func TestActivity_LeavesTheTimeAloneWhenNothingUsesTheSandbox(t *testing.T) {
 	t.Parallel()
 	h := &logHub{execHub: startExecHub(t, 1)}

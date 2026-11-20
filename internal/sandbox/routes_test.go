@@ -134,6 +134,7 @@ func TestProfileList_ShowsWhatAProfileOffersWithoutItsPolicyPathEnvValuesOrSecre
 			"env_keys":        []any{"A", "B"},
 			"checkpoint":      false,
 			"allow_proposals": false,
+			"tools":           true,
 		},
 		"plain": {
 			"name":                 "plain",
@@ -154,6 +155,7 @@ func TestProfileList_ShowsWhatAProfileOffersWithoutItsPolicyPathEnvValuesOrSecre
 			"env_keys":             []any{},
 			"checkpoint":           true,
 			"allow_proposals":      true,
+			"tools":                false,
 		},
 	}
 	for name, w := range want {
@@ -161,14 +163,14 @@ func TestProfileList_ShowsWhatAProfileOffersWithoutItsPolicyPathEnvValuesOrSecre
 			t.Parallel()
 			got := item(t, list.Items, name)
 			// Comparing the whole object also proves that it has exactly the
-			// eighteen members and none of policy, env, expose_secrets and
+			// nineteen members and none of policy, env, expose_secrets and
 			// optional_expose_secrets.
 			if !reflect.DeepEqual(got, w) {
 				t.Errorf("item %s =\n%v\nwant\n%v", name, got, w)
 			}
 		})
 	}
-	for _, hidden := range []string{`"va"`, `"vb"`, policyPath, "policy.yaml"} {
+	for _, hidden := range []string{`"va"`, `"vb"`, policyPath, "policy.yaml", "/opt/tools", "agentkit-tools"} {
 		if bytes.Contains(a.body, []byte(hidden)) {
 			t.Errorf("the answer %s holds %s", a.body, hidden)
 		}

@@ -381,7 +381,7 @@ var profilesFile = hubtest.Config{
 		"[[sandbox.profiles]]\nname = \"agent\"\ndefault = true\ndescription = \"an agent\"\nimage = \"agent:1\"\ncpu = \"2\"\nmemory = \"4Gi\"\ngpu = 1\n" +
 		"ttl = \"4h\"\npolicy = \"policy.yaml\"\ncredentials = [\"model\"]\noptional_credentials = [\"search\"]\n" +
 		"expose_secrets = [\"Z_TOKEN\"]\noptional_expose_secrets = [\"A_TOKEN\"]\nhub_access = \"none\"\ncheckpoint = false\nallow_proposals = false\n" +
-		"env = { B = \"vb\", A = \"va\" }\n" +
+		"env = { B = \"vb\", A = \"va\" }\ntool_server = \"/opt/tools/agentkit-tools\"\n" +
 		credentialTable("model") + credentialTable("search"),
 	Files: map[string]string{"gateway-token": gatewayToken + "\n", "policy.yaml": policyContent},
 }
@@ -2402,14 +2402,32 @@ type useRoute struct {
 	write                 bool
 }
 
-// useRoutes are the five routes that use a sandbox.
+// useRoutes are the routes that use a sandbox.
 var useRoutes = []useRoute{
 	{"exec", http.MethodPost, "exec", true},
 	{"upload", http.MethodPut, "files", true},
 	{"download", http.MethodGet, "files", false},
 	{"logs", http.MethodGet, "logs", false},
 	{"attach", http.MethodGet, "attach", true},
+	{"tools", http.MethodGet, "tools", false},
+	{"tool", http.MethodPost, "tools/read_file", false},
+	{"mcp", http.MethodPost, "mcp", false},
 }
+
+// toolRoutes are the routes of useRoutes that serve a sandbox's tools.
+func toolRoutes() []useRoute {
+	var out []useRoute
+	for _, u := range useRoutes {
+		if strings.HasPrefix(u.name, "tool") || u.name == "mcp" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// toolServerPath is where the test profiles and sandboxes have their tool
+// server.
+const toolServerPath = "/opt/tools/agentkit-tools"
 
 func (u useRoute) String() string { return u.method + " " + u.segment }
 
@@ -2484,12 +2502,23 @@ func startUseHub(t *testing.T, fail func() error) *useHub {
 // lifecycle loop does not delete it while the test runs.
 func (h *useHub) seed(t *testing.T, ws, state string, ha *sandbox.HubAccess) string {
 	t.Helper()
+	return h.seedWith(t, ws, state, ha, nil)
+}
+
+// seedWith is seed for a sandbox as edit changes it; every sandbox it stores
+// has a tool server unless edit takes it away.
+func (h *useHub) seedWith(t *testing.T, ws, state string, ha *sandbox.HubAccess, edit func(*sandbox.Record)) string {
+	t.Helper()
 	before := recordStart.Add(-time.Hour)
 	rec := sandbox.Record{
 		ID: sandbox.NewID(), Workspace: ws, Profile: "agent", State: state, HubAccess: ha,
 		ExpiresAt: time.Now().Add(3 * time.Hour), LastActivityAt: before,
 		CreatedBy: sandbox.Creator{ActorType: "api_key", ActorID: h.owner, Username: "owner"},
 		CreatedAt: before, UpdatedAt: before, UserID: h.owner, FamilyRoot: ws,
+		Snapshot: sandbox.Snapshot{ToolServer: toolServerPath},
+	}
+	if edit != nil {
+		edit(&rec)
 	}
 	switch state {
 	case sandbox.StateStopped, sandbox.StateCompleted, sandbox.StateFailed, sandbox.StateDeleted:
@@ -2557,6 +2586,8 @@ type execHub struct {
 	// than the fake may.
 	quirks *runtimeQuirks
 	key    string
+	// org is the org of ws.
+	org string
 }
 
 // startExecHub starts an exec hub that runs at most maxExecs commands at
@@ -2608,9 +2639,314 @@ func newExecHub(t *testing.T, settings string, edit func(*hubtest.Config)) *exec
 	}
 	h.Hub = hubtest.StartWith(t, cfg)
 	h.owner = h.CreateUser(t, "owner")
-	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: h.CreateOrg(t, "team"), Kind: access.KindRepository, Status: access.StatusReady})
+	h.org = h.CreateOrg(t, "team")
+	h.AddWorkspace(t, access.Record{Slug: "ws", OwnerID: h.owner, OrgID: h.org, Kind: access.KindRepository, Status: access.StatusReady})
 	h.key = h.IssueKey(t, h.owner)
 	return h
+}
+
+// toolsHub is an exec hub whose runtime answers the tool server's commands
+// with the stand-in tools, with a second workspace ws2 of the owner, and
+// with member, a member of the org who may read ws, and outsider, who is
+// not in the org.
+type toolsHub struct {
+	*execHub
+	tools *runtimetest.ToolServer
+	// memberKey is the API key of member.
+	memberKey string
+}
+
+// startToolsHub starts a tools hub whose [sandbox] section also holds the
+// lines settings.
+func startToolsHub(t *testing.T, settings string) *toolsHub {
+	t.Helper()
+	return startToolsHubWith(t, settings, nil)
+}
+
+// startToolsHubWith is startToolsHub with the hub's configuration as edit
+// changes it when edit is not nil.
+func startToolsHubWith(t *testing.T, settings string, edit func(*hubtest.Config)) *toolsHub {
+	t.Helper()
+	h := &toolsHub{execHub: newExecHub(t, settings, edit)}
+	h.tools = runtimetest.NewToolServer(h.rt, toolServerPath)
+	h.cmds.set(toolServerPath, h.tools.Run)
+	h.cmds.set("rm", h.tools.Run)
+	h.member, h.outsider = h.CreateUser(t, "member"), h.CreateUser(t, "outsider")
+	h.AddMember(t, h.org, h.member)
+	h.AddWorkspace(t, access.Record{Slug: "ws2", OwnerID: h.owner, OrgID: h.org, Kind: access.KindRepository, Status: access.StatusReady})
+	h.memberKey = h.IssueKey(t, h.member)
+	return h
+}
+
+// tooled creates a ready sandbox of ws with a tool server, as edit changes
+// it when edit is not nil, and returns its id.
+func (h *toolsHub) tooled(t *testing.T, edit func(*sandbox.Record)) string {
+	t.Helper()
+	return h.sandbox(t, func(rec *sandbox.Record) {
+		rec.Snapshot.ToolServer = toolServerPath
+		if edit != nil {
+			edit(rec)
+		}
+	})
+}
+
+// toolList is the answer of GET …/tools.
+type toolList struct {
+	Set   string `json:"set"`
+	Tools []struct {
+		Name         string          `json:"name"`
+		Description  string          `json:"description"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		OutputSchema json.RawMessage `json:"output_schema"`
+	} `json:"tools"`
+}
+
+// names are the names of the listed tools, in order.
+func (l toolList) names() []string {
+	out := make([]string, 0, len(l.Tools))
+	for _, tool := range l.Tools {
+		out = append(out, tool.Name)
+	}
+	return out
+}
+
+// list sends GET …/tools for the sandbox id of ws with cred and returns the
+// answer and, for a 200, the list it holds.
+func (h *toolsHub) list(t *testing.T, id, cred string) (answer, toolList) {
+	t.Helper()
+	a := h.call(t, http.MethodGet, sandboxPath("ws", id)+"/tools", cred, nil)
+	var l toolList
+	if a.status == http.StatusOK {
+		if err := json.Unmarshal(a.body, &l); err != nil {
+			t.Fatalf("the tool list %s: %v", a.body, err)
+		}
+	}
+	return a, l
+}
+
+// toolPath is the path of the call route of the tool name of the sandbox id
+// of ws.
+func toolPath(id, name string) string { return sandboxPath("ws", id) + "/tools/" + name }
+
+// tool sends POST …/tools/<name> for the sandbox id of ws with cred and
+// body, and reads the answer with its headers.
+func (h *toolsHub) tool(t *testing.T, id, cred, name string, body any) answer {
+	t.Helper()
+	var a answer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+toolPath(id, name), cred, body, nil)
+	a.readError()
+	return a
+}
+
+// sending sends method path, under /api/v1, with cred, the JSON body and
+// the headers of header under ctx, from another goroutine, and delivers the
+// answer on the channel it returns: with status 0 when the request got
+// none, as when ctx ended first or the hub dropped the connection. A nil
+// body sends none, as hubtest's Call does.
+func (h *execHub) sending(ctx context.Context, method, path, cred string, body any, header http.Header) <-chan answer {
+	out := make(chan answer, 1)
+	var raw []byte
+	if body != nil {
+		raw, _ = json.Marshal(body)
+	}
+	go func() {
+		var a answer
+		defer func() { out <- a }()
+		req, err := http.NewRequestWithContext(ctx, method, h.URL("/api/v1"+path), bytes.NewReader(raw))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		req.Header.Set("Content-Type", "application/json")
+		for k, vs := range header {
+			req.Header[k] = vs
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
+		a.readError()
+	}()
+	return out
+}
+
+// readError reads the members of the error envelope of a's body, if it has
+// one.
+func (a *answer) readError() {
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+}
+
+// rpcAnswer is the answer to an MCP message: the HTTP answer and, when its
+// body is a JSON-RPC response, the result or the error it holds.
+type rpcAnswer struct {
+	answer
+	// isRPC reports whether the body has the member jsonrpc.
+	isRPC  bool
+	result json.RawMessage
+	rpcErr *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+}
+
+// mcpHeader is what an MCP client sends with every message.
+var mcpHeader = http.Header{"Accept": {"application/json, text/event-stream"}}
+
+// mcp sends the MCP request method with params (nil for none) to the MCP
+// route of the sandbox id of ws with cred and the headers of extra.
+func (h *toolsHub) mcp(t *testing.T, id, cred, method string, params any, extra http.Header) rpcAnswer {
+	t.Helper()
+	msg := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method}
+	if params != nil {
+		msg["params"] = params
+	}
+	return h.mcpRaw(t, id, cred, msg, extra)
+}
+
+// mcpRaw sends body to the MCP route as mcp does.
+func (h *toolsHub) mcpRaw(t *testing.T, id, cred string, body any, extra http.Header) rpcAnswer {
+	t.Helper()
+	header := mcpHeader.Clone()
+	for k, vs := range extra {
+		header[k] = vs
+	}
+	var a rpcAnswer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+sandboxPath("ws", id)+"/mcp", cred, body, header)
+	readRPC(&a)
+	return a
+}
+
+// readRPC reads the hub's error envelope or the JSON-RPC response of a's
+// body.
+func readRPC(a *rpcAnswer) {
+	var env struct {
+		JSONRPC string           `json:"jsonrpc"`
+		Result  json.RawMessage  `json:"result"`
+		Error   *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) != nil {
+		return
+	}
+	a.isRPC, a.result = env.JSONRPC != "", env.Result
+	if env.Error == nil {
+		return
+	}
+	if a.isRPC {
+		_ = json.Unmarshal(*env.Error, &a.rpcErr)
+	} else {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+}
+
+// mcpTool is the result of a tools/call.
+type mcpTool struct {
+	IsError bool `json:"isError"`
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	StructuredContent json.RawMessage `json:"structuredContent"`
+}
+
+// mcpCall sends a tools/call of the tool name with arguments (nil for
+// none).
+func (h *toolsHub) mcpCall(t *testing.T, id, cred, name string, arguments any) rpcAnswer {
+	t.Helper()
+	params := map[string]any{"name": name}
+	if arguments != nil {
+		params["arguments"] = arguments
+	}
+	return h.mcp(t, id, cred, "tools/call", params, nil)
+}
+
+// toolResultOf is the tool result of a, which must be a JSON-RPC result.
+func toolResultOf(t *testing.T, a rpcAnswer) mcpTool {
+	t.Helper()
+	if a.status != http.StatusOK || a.rpcErr != nil || len(a.result) == 0 {
+		t.Fatalf("tools/call = %d %.400s; want a result", a.status, a.body)
+	}
+	var r mcpTool
+	if err := json.Unmarshal(a.result, &r); err != nil {
+		t.Fatalf("the tool result %s: %v", a.result, err)
+	}
+	return r
+}
+
+// wantRPCError checks that a is a JSON-RPC error with code, answered 200.
+func wantRPCError(t *testing.T, a rpcAnswer, code int) {
+	t.Helper()
+	if a.status != http.StatusOK || a.rpcErr == nil || a.rpcErr.Code != code {
+		t.Fatalf("= %d %.400s; want a JSON-RPC error with code %d", a.status, a.body, code)
+	}
+}
+
+// held makes the stand-in's calls wait until release is called or they are
+// killed, and returns release, a count of the calls waiting and a count of
+// those whose context ended while they waited.
+func (h *toolsHub) held() (release func(), waiting, killed *atomic.Int64) {
+	gate := make(chan struct{})
+	var once sync.Once
+	waiting, killed = &atomic.Int64{}, &atomic.Int64{}
+	h.tools.SetCall(func(ctx context.Context, _ runtimetest.ToolCall, stdout, _ io.Writer) int {
+		waiting.Add(1)
+		defer waiting.Add(-1)
+		select {
+		case <-gate:
+			_, _ = io.WriteString(stdout, `{"ok":true,"data":{}}`)
+			return 0
+		case <-ctx.Done():
+			killed.Add(1)
+			return 137
+		}
+	})
+	return func() { once.Do(func() { close(gate) }) }, waiting, killed
+}
+
+// printing is an answer of the stand-in's call form that prints stdout and
+// stderr and exits with code.
+func printing(stdout, stderr string, code int) func(context.Context, runtimetest.ToolCall, io.Writer, io.Writer) int {
+	return func(_ context.Context, _ runtimetest.ToolCall, out, errOut io.Writer) int {
+		_, _ = io.WriteString(out, stdout)
+		_, _ = io.WriteString(errOut, stderr)
+		return code
+	}
+}
+
+// requestFiles are the request files left in the sandbox id.
+func (h *toolsHub) requestFiles(id string) []string {
+	return h.rt.SandboxFiles(id, "/tmp/parley-tools/requests")
+}
+
+// opsOf counts the calls of the operation op the runtime got for the
+// sandbox id.
+func (h *toolsHub) opsOf(op, id string) int {
+	n := 0
+	for _, c := range h.rt.Calls() {
+		if c.Op == op && c.Target == id {
+			n++
+		}
+	}
+	return n
+}
+
+// definitionNames are the names of the stand-in's tools, in its order.
+func definitionNames(readOnly bool) []string {
+	var out []string
+	for _, d := range runtimetest.ToolDefinitions(readOnly) {
+		out = append(out, d.Name)
+	}
+	return out
 }
 
 // sandbox creates a sandbox in the runtime with the working directory
@@ -2689,32 +3025,7 @@ func (h *execHub) execAs(t *testing.T, cred, id string, body any, header http.He
 // request got none, as when ctx ended first or the hub dropped the
 // connection.
 func (h *execHub) execing(ctx context.Context, id string, body any, header http.Header) <-chan answer {
-	out := make(chan answer, 1)
-	raw, _ := json.Marshal(body)
-	go func() {
-		var a answer
-		defer func() { out <- a }()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL("/api/v1"+sandboxPath("ws", id)+"/exec"), bytes.NewReader(raw))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Authorization", "Bearer "+h.key)
-		req.Header.Set("Content-Type", "application/json")
-		for k, vs := range header {
-			req.Header[k] = vs
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return
-		}
-		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
-	}()
-	return out
+	return h.sending(ctx, http.MethodPost, sandboxPath("ws", id)+"/exec", h.key, body, header)
 }
 
 // commands run the commands of an exec hub's runtime. main, a main process,

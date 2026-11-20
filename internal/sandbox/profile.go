@@ -52,6 +52,9 @@ type Profile struct {
 	Env            map[string]string
 	Checkpoint     bool
 	AllowProposals bool
+	// ToolServer is the absolute path of the tool server in the profile's
+	// image; "" for a profile whose sandboxes have no tools.
+	ToolServer string
 
 	// PolicyHosts are the hosts the base policy allows, as the runtime
 	// reported them when it validated PolicyPath. The start-up check sets
@@ -137,7 +140,7 @@ var (
 	profileKeys = []string{
 		"name", "default", "description", "image", "cpu", "memory", "gpu", "ttl", "idle_timeout",
 		"policy", "credentials", "optional_credentials", "expose_secrets", "optional_expose_secrets",
-		"hub_access", "env", "checkpoint", "allow_proposals",
+		"hub_access", "env", "checkpoint", "allow_proposals", "tool_server",
 	}
 	credentialKeys = []string{"name", "provider_profile", "secret"}
 )
@@ -251,6 +254,7 @@ func (c *decoder) profile(s *Settings, maxTTLOK bool, names map[string]bool, has
 	p.Env = c.env("env")
 	p.Checkpoint = c.boolean("checkpoint", true)
 	p.AllowProposals = c.boolean("allow_proposals", true)
+	p.ToolServer = c.toolServer("tool_server")
 
 	p.ExposeSecrets = c.strings("expose_secrets")
 	p.OptionalExposeSecrets = c.strings("optional_expose_secrets")
@@ -262,6 +266,28 @@ func (c *decoder) profile(s *Settings, maxTTLOK bool, names map[string]bool, has
 		}
 	}
 	return p
+}
+
+// maxToolServer is the most bytes the path of a tool server has.
+const maxToolServer = 256
+
+// toolServer reads the path of a profile's tool server: an absolute path of
+// at most maxToolServer bytes, or "" for a profile that names none. Whether
+// the image holds the file is not checked: the hub would have to create a
+// sandbox of the profile to look.
+func (c *decoder) toolServer(key string) string {
+	p, ok := c.str(key, "")
+	switch {
+	case !ok || p == "":
+		return ""
+	case !strings.HasPrefix(p, "/"):
+		c.fail(key, "must be an absolute path")
+	case len(p) > maxToolServer:
+		c.fail(key, fmt.Sprintf("must have at most %d bytes", maxToolServer))
+	default:
+		return p
+	}
+	return ""
 }
 
 // name reads the name of a profile or a credential (what) and checks that it

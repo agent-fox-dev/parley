@@ -1024,6 +1024,8 @@ name; a page is never refused for it.
 | `parley_sandbox_creates_total` | counter | `result` (`ready`, `failed`) | sandbox creations by outcome |
 | `parley_sandbox_seconds` | histogram | none | time from a sandbox's `ready` to its stop, exit or deletion. Buckets `60`, `300`, `600`, `1200`, `1800`, `3600`, `7200`, `14400`, `28800`, `86400` |
 | `parley_sandbox_exec_total` | counter | `result` (`ok`, `nonzero`, `timeout`, `error`) | commands run through sandbox exec |
+| `parley_sandbox_tool_calls_total` | counter | `tool`, `outcome` (`ok`, `tool_error`, `timeout`, `failed`) | [tool calls](#the-tools-of-a-sandbox) that started in a sandbox, by the tool's name and how the call ended |
+| `parley_sandbox_tool_call_duration_seconds` | histogram | `tool` | the time such a call ran. Buckets `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `300`, `600` |
 | `parley_sandbox_denials_total` | counter | none | connections and requests the sandbox runtime blocked |
 | `parley_sandbox_checkpoints_total` | counter | `result` (`ok`, `empty`, `failed`) | checkpoints attempted |
 | `parley_sandbox_runtime_up` | gauge | none | `1` while the sandbox runtime is reachable |
@@ -7680,7 +7682,7 @@ is of one of two kinds:
 
 | Kind | Scope of a PAT | Workspace access | Routes |
 |---|---|---|---|
-| read | `sandboxes:read` | `read` | getting a sandbox, listing a workspace's sandboxes, its logs, downloading a file, listing policy proposals |
+| read | `sandboxes:read` | `read` | getting a sandbox, listing a workspace's sandboxes, its logs, downloading a file, listing policy proposals, and the three routes of [the tools of a sandbox](#the-tools-of-a-sandbox), which decide per caller which tools they serve |
 | write | `sandboxes:write` | `write` | every other, creating, exec, attach, uploading, stop, start, delete, checkpoints, approving and rejecting a proposal included |
 
 The scope is checked before workspace access, so a PAT without the scope is
@@ -7737,7 +7739,7 @@ to a workspace (usually a task fork) and started with it checked out. Every
 answer that shows a sandbox shows this object, with exactly these members:
 
 ```json
-{"id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","workspace":"demo--t1","session_id":null,"profile":"agent","purpose":"run tests","state":"ready","state_reason":null,"command":["make","test"],"env":{"CI":"1"},"exit_code":null,"checkout":{"path":"/workspace","ref":"main","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","branch":"t1"},"image":"img:1","cpu":"2","memory":"4Gi","gpu":0,"credentials":["model"],"exposed_secrets":["NPM_TOKEN"],"workspace_rules":[],"hub_access":{"scopes":["audit:write","changes:read","changes:write","git:read","git:write","sessions:write"],"paths":null,"expires_at":"2026-11-18T13:00:00Z"},"policy_revision":0,"expires_at":"2026-11-18T13:00:00Z","idle_timeout_seconds":1800,"last_activity_at":"2026-11-18T12:00:00Z","checkpoint":null,"restored_from":null,"runtime_reachable":true,"labels":{"team":"core"},"created_by":{"actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"dana"},"created_at":"2026-11-18T12:00:00Z","updated_at":"2026-11-18T12:00:04Z","ended_at":null}
+{"id":"sbx_3f2a9c0e7b1d4a5e8f6c2b9a0d1e4f7a","workspace":"demo--t1","session_id":null,"profile":"agent","purpose":"run tests","state":"ready","state_reason":null,"command":["make","test"],"env":{"CI":"1"},"exit_code":null,"checkout":{"path":"/workspace","ref":"main","sha":"9fceb02d0ae598e95dc970b74767f19372d61af8","branch":"t1"},"image":"img:1","cpu":"2","memory":"4Gi","gpu":0,"credentials":["model"],"exposed_secrets":["NPM_TOKEN"],"workspace_rules":[],"hub_access":{"scopes":["audit:write","changes:read","changes:write","git:read","git:write","sessions:write"],"paths":null,"expires_at":"2026-11-18T13:00:00Z"},"policy_revision":0,"expires_at":"2026-11-18T13:00:00Z","idle_timeout_seconds":1800,"last_activity_at":"2026-11-18T12:00:00Z","checkpoint":null,"restored_from":null,"runtime_reachable":true,"labels":{"team":"core"},"created_by":{"actor_type":"api_key","actor_id":"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","username":"dana"},"created_at":"2026-11-18T12:00:00Z","updated_at":"2026-11-18T12:00:04Z","ended_at":null,"tools":false}
 ```
 
 | Member | Value |
@@ -7769,6 +7771,7 @@ answer that shows a sandbox shows this object, with exactly these members:
 | `created_by` | `{actor_type, actor_id, username}` of the creating credential's user |
 | `created_at`, `updated_at` | [timestamps](#timestamps-and-durations) in UTC, whole seconds |
 | `ended_at` | when it stopped, completed, failed or was deleted; `null` until then, and again after a start |
+| `tools` | `true` when the sandbox's profile named a tool server when the sandbox was created, so that [the tools of a sandbox](#the-tools-of-a-sandbox) are served for it; the path is never shown. `false` for a sandbox created before profiles could name one |
 
 The states move only so: a new sandbox is `provisioning`; `provisioning`
 becomes `ready` or `failed`; `ready` becomes `completed`, `failed`,
@@ -8248,6 +8251,10 @@ replaced by `[redacted]`, then cleared as on every sandbox route, and cut to
 1,024 bytes. The logs are served from the hub's own store and do not need the
 runtime. None of the five routes emits a hub event.
 
+Three more routes pass the same checks and serve [the tools of a
+sandbox](#the-tools-of-a-sandbox): `GET …/tools`, `POST …/tools/{name}` and
+`POST …/mcp`.
+
 **Activity.** `last_activity_at` of the sandbox is set to the hub's time when
 an exec starts and when it ends, in both forms; when a file transfer starts
 and when it ends; when an attach opens, when it closes, and for a frame from
@@ -8485,6 +8492,193 @@ at most one protocol) or a `cols` or `rows` outside
 1 to 1,000 (`cols: must be an integer from 1 to 1000`), and `502
 sandbox_runtime_error` when the runtime cannot open the terminal.
 
+## The tools of a sandbox
+
+A sandbox whose profile names a tool server (`tool_server`, see
+[configuration.md](configuration.md#sandboxes)) serves that program's tools
+to callers outside it: reading, searching and editing files and running
+commands in its working directory. The tools run inside the sandbox, so what
+they can read, write and reach is what the sandbox allows. The sandbox
+object's `tools` says whether it has them. Three routes under
+`/api/v1/workspaces/{slug}/sandboxes/{id}` serve them: `GET …/tools`,
+`POST …/tools/{name}` and `POST …/mcp`.
+
+All three are read routes of the [sandbox routes](#sandbox-routes): a PAT
+needs `sandboxes:read` (which `sandboxes:write` satisfies) and the caller
+read access to the workspace, and a workspace-bound token may use them on
+its workspace. After the pipeline's checks each runs, in this order, and
+answers with the first that fails:
+
+1. the sandbox, `404 sandbox_not_found`, as for [using a
+   sandbox](#using-a-sandbox);
+2. its tools: a sandbox with `tools: false` is `404 tools_unavailable` (`the
+   sandbox's profile names no tool server`);
+3. the validation of the body (`400`, `413`);
+4. the sandbox's state: only `ready` is served, any other is `409
+   sandbox_not_ready`;
+5. for a call, the tool's name, and then the place among the sandbox's
+   commands.
+
+**Tool sets.** What a caller may list and call is decided for each request:
+
+| Set | Who | Tools |
+|---|---|---|
+| `full` | a caller who would be allowed to exec in the sandbox: a PAT holds `sandboxes:write`, the caller has write access to the workspace, and its credential covers the sandbox's `hub_access` by the no-widening rule of the [sandbox routes](#sandbox-routes). The admin token and an API key hold every scope | every tool the tool server lists |
+| `read_only` | every other caller the route lets through, a caller with write access whose credential does not cover the hub credential included | the tools the tool server lists under `--read-only`: the full set without `write_file`, `edit_file`, `execute` and `run_command` |
+
+**Definitions.** The hub reads a set's tool definitions from the sandbox by
+running `<tool_server> tools`, with `--read-only` for the read-only set, in
+`/workspace`. It keeps them in memory per sandbox and set until the sandbox
+leaves `ready` or the hub restarts, and then reads them again on the next
+request. A listing does not set `last_activity_at`, takes no place among the
+sandbox's commands and emits nothing.
+
+**A call.** For one call the hub takes a place among the sandbox's commands,
+shared with exec (`[sandbox].max_concurrent_execs`), writes `{"name",
+"input"}` to the file `/tmp/parley-tools/requests/<32 hex characters>.json`
+of the sandbox with mode `0600`, runs
+
+```
+<tool_server> call --request <file> --dir /workspace --index-dir /tmp/parley-tools/index --timeout <seconds>s
+```
+
+in `/workspace` with the sandbox's environment and no input, with
+`--read-only` added for the read-only set, and removes the file with `rm -f`
+when the command has ended, however it ended; a removal that fails is logged
+(`cannot remove a tool call's request file`) and changes nothing else. Both
+directories are outside the working directory, so neither is part of a
+checkpoint. The time bound is the route's (below), cut to
+`[sandbox].max_exec_timeout` when it is longer. `last_activity_at` is set
+when the call starts and when it ends.
+
+The one JSON object the tool server prints, with a boolean `ok`, is the
+tool's result, whatever `ok` says: a tool that fails (a file not found, an
+edit that is not unique) is a result with `ok: false` and the tool's `error`
+and `detail`. A call still running when its bound passes is killed and gives
+the result `{"ok": false, "error": "timeout", "detail": "the call did not
+end within <bound>", "data": {}}`. Anything else is a **failed call**: a
+tool server that cannot be started, exits with a status other than 0, prints
+something that is not one such object or prints more than 4 MiB is
+`tool_server_failed`, and a runtime that cannot be reached
+`sandbox_runtime_error`, each with a message cleared of the sandbox's secret
+values and the hub's and cut to 1,024 bytes. The same holds for a listing
+whose output is not one JSON array of definitions, each with a name no
+other has and an input schema that is an object. A result is not redacted: like the output of
+an exec it may hold whatever the sandbox holds.
+
+A call whose caller leaves, or that runs when the hub begins to stop, is
+killed and gets no answer.
+
+**The event.** Every call that took its place emits one
+`parley.sandbox.tool_call` event when it ends: resource type `sandbox`, the
+sandbox's id, workspace and `session_id`, the caller as actor, and the
+metadata
+
+```json
+{"tool":"read_file","ok":true,"duration_ms":41,"via":"rest","set":"full"}
+```
+
+`via` is `rest` or `mcp` and `set` the caller's set. A call with `ok: false`
+adds `error`: the tool's error code, cut to 64 characters, `timeout`, `tool_server_failed` (also
+for a call nobody waited for any more) or `sandbox_runtime_error`. The
+arguments and the result never appear. A `code_mode` call is one event,
+whatever its script called. The call also adds 1 to
+`parley_sandbox_tool_calls_total{tool, outcome}`, where `outcome` is `ok`,
+`tool_error` for a result with `ok: false`, `timeout`, or `failed`, and its
+duration is observed in `parley_sandbox_tool_call_duration_seconds{tool}`.
+A request refused before it took its place, and a listing, emits and counts
+nothing. Tool calls are not told to the operation observers of [using a
+sandbox](#using-a-sandbox) and do not count in `parley_sandbox_exec_total`.
+
+## `GET /api/v1/workspaces/{slug}/sandboxes/{id}/tools`
+
+Lists the caller's tool set, in the tool server's order: `200`
+
+```json
+{"set":"read_only","tools":[{"name":"read_file","description":"…","input_schema":{"type":"object","properties":{"path":{"type":"string"}}},"output_schema":null}]}
+```
+
+`set` is `full` or `read_only`. `input_schema` and `output_schema` are the
+tool server's, member for member; `output_schema` is `null` for a tool
+without one.
+
+Errors beside those of the checks above: `502 tool_server_failed` and `502
+sandbox_runtime_error`.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/tools/{name}`
+
+Calls the tool `name`. The body is empty or a JSON object of at most 8 MiB:
+
+| Member | Value |
+|---|---|
+| `input` | the tool's input, a JSON object of at most 4 MiB as JSON; `{}` when absent or `null` |
+| `timeout` | the call's time bound, a [duration](#timestamps-and-durations) above `0s`; `60s` when absent; one above `[sandbox].max_exec_timeout` is cut to it |
+
+It answers `200` with the tool's result and how long the call took, also
+when the tool failed or the call timed out:
+
+```json
+{"ok":false,"data":{},"error":"not_found","detail":"no such file","duration_ms":38}
+```
+
+`data` is a JSON object, `{}` when the tool gave none. `error` and `detail`
+are absent for a result without them, and `text`, the text the tool means
+for a model, when the tool server gave none.
+
+| Status | When |
+|---|---|
+| `400` `invalid_request` | a body that is not a JSON object, an `input` that is not an object (`input: must be a JSON object`), a `timeout` that is not a string or not a duration above `0s` |
+| `403` `insufficient_scope` | a tool the full set holds, called by a caller with the read-only set (`the tool "execute" changes the sandbox, which this credential may only read`) |
+| `404` `tool_not_found` | a name no set holds (`the sandbox has no tool "<name>"`) |
+| `413` `payload_too_large` | an `input` over 4 MiB as JSON, or a body over 8 MiB |
+| `429` `rate_limited` | `[sandbox].max_concurrent_execs` commands already run in the sandbox, without `Retry-After` |
+| `502` `tool_server_failed`, `sandbox_runtime_error` | a failed call |
+
+A refused call writes nothing to the sandbox and runs nothing in it for the
+call; finding the tool may read the definitions once.
+
+## `POST /api/v1/workspaces/{slug}/sandboxes/{id}/mcp`
+
+An MCP server over Streamable HTTP for the one sandbox, for a harness that
+speaks MCP: the URL and a bearer credential are all it needs. The credential
+is any the two routes above accept. The route is stateless: it sets and
+reads no `Mcp-Session-Id`, every request is answered on its own, as
+`application/json`, with or without an `initialize` before it, and a restart
+of the hub between two requests is not visible. `GET` and `DELETE` are `405
+method_not_allowed`. As an MCP client does, a request sends `Content-Type:
+application/json` and an `Accept` that names both `application/json` and
+`text/event-stream`. A body may have 8 MiB.
+
+| Method | Answer |
+|---|---|
+| `initialize` | the server name `parley`, the hub's version as `GET /version` reports it, the capability `tools` alone, and `instructions` of one sentence naming the sandbox and the workspace |
+| `ping` | an empty result |
+| `tools/list` | the caller's tool set, in the tool server's order and on one page: each tool's `name`, `description`, `inputSchema` and, where it has one, `outputSchema`, as the tool server gave them |
+| `tools/call` | the call, with `arguments` as the input (`{}` when absent) under a bound of 10 minutes |
+| a notification | accepted |
+| any other | the JSON-RPC error `-32601` |
+| a batch (a JSON array) | the JSON-RPC error `-32600` (`batches are not served`) |
+
+The result of `tools/call` has `isError` the negation of `ok`; one text
+content, the tool server's `text` when it gave one, otherwise the JSON of
+`data` for a success and `<error>: <detail>` for a failure, a timeout
+included; and `structuredContent`, `data`, when the tool has an output
+schema.
+
+| JSON-RPC error | When |
+|---|---|
+| `-32602` | a tool outside the caller's set or one no set holds (`unknown tool "<name>"`); `arguments` that are not an object or over 4 MiB as JSON |
+| `-32603` | a failed call, with the message of `tool_server_failed` or `sandbox_runtime_error` |
+| `-32000` `sandbox busy` | `[sandbox].max_concurrent_execs` commands already run in the sandbox |
+
+What is decided before the MCP message is read is answered as plain HTTP
+with the hub's error object, not as JSON-RPC: `401`, `403`, `404`
+(`sandbox_not_found`, `tools_unavailable`, `sandboxes_disabled`), `409
+sandbox_not_ready`, `413` for a body over 8 MiB, `429` for the [rate
+limit](#rate-limit), and `502 tool_server_failed` or `sandbox_runtime_error`
+while the tool definitions cannot be read. The route offers no resources,
+prompts, completions or logging and no MCP authorization flow.
+
 ## `GET /api/v1/sandbox-profiles`
 
 Lists the sandbox profiles of the hub's configuration (see
@@ -8500,7 +8694,7 @@ alone and asks the sandbox runtime nothing, so it answers the same while the
 runtime is unreachable.
 
 ```json
-{"items":[{"name":"agent","default":true,"description":"an agent","image":"agent:1","cpu":"2","memory":"4Gi","gpu":1,"ttl":"4h","ttl_seconds":14400,"idle_timeout":"30m","policy_summary":["a.test","b.test"],"credentials":["model"],"optional_credentials":["search"],"exposed_secrets":[{"name":"A_TOKEN","optional":true},{"name":"Z_TOKEN","optional":false}],"hub_access":"none","env_keys":["A","B"],"checkpoint":false,"allow_proposals":false}],"next_cursor":null}
+{"items":[{"name":"agent","default":true,"description":"an agent","image":"agent:1","cpu":"2","memory":"4Gi","gpu":1,"ttl":"4h","ttl_seconds":14400,"idle_timeout":"30m","policy_summary":["a.test","b.test"],"credentials":["model"],"optional_credentials":["search"],"exposed_secrets":[{"name":"A_TOKEN","optional":true},{"name":"Z_TOKEN","optional":false}],"hub_access":"none","env_keys":["A","B"],"checkpoint":false,"allow_proposals":false,"tools":true}],"next_cursor":null}
 ```
 
 Each item has exactly these members:
@@ -8521,8 +8715,9 @@ Each item has exactly these members:
 | `hub_access` | `fork` or `none` |
 | `env_keys` | the names of the profile's `env` variables, sorted; `[]` when none |
 | `checkpoint`, `allow_proposals` | as configured |
+| `tools` | `true` when the profile sets `tool_server` |
 
-The path of a policy file, the values of `env`, and the lists
+The path of a policy file, the path of the tool server, the values of `env`, and the lists
 `expose_secrets` and `optional_expose_secrets` are never shown, and no
 member holds a secret's value.
 

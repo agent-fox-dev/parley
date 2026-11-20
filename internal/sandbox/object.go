@@ -9,7 +9,7 @@ import (
 	"github.com/agent-fox-dev/parley/internal/server/timefmt"
 )
 
-// Object is the sandbox object every response shows: the 31
+// Object is the sandbox object every response shows: the 32
 // members, each always present. Lists are [] and maps {} when empty;
 // timestamps are RFC 3339 in UTC with whole seconds. It holds no token value
 // and no secret value.
@@ -45,6 +45,9 @@ type Object struct {
 	CreatedAt          timefmt.Time      `json:"created_at"`
 	UpdatedAt          timefmt.Time      `json:"updated_at"`
 	EndedAt            *timefmt.Time     `json:"ended_at"`
+	// Tools reports whether the sandbox has a tool server, as its profile
+	// said at creation; the path is not shown.
+	Tools bool `json:"tools"`
 }
 
 // HubAccessObject is the hub_access member of an Object: the hub
@@ -70,6 +73,7 @@ func ObjectOf(rec Record, runtimeReachable bool) Object {
 		LastActivityAt: timefmt.Time(rec.LastActivityAt), Checkpoint: rec.Checkpoint,
 		RestoredFrom: rec.RestoredFrom, RuntimeReachable: runtimeReachable, Labels: cloneMap(rec.Labels),
 		CreatedBy: rec.CreatedBy, CreatedAt: timefmt.Time(rec.CreatedAt), UpdatedAt: timefmt.Time(rec.UpdatedAt),
+		Tools: rec.Snapshot.ToolServer != "",
 	}
 	if rec.StateReason != "" {
 		reason := rec.StateReason

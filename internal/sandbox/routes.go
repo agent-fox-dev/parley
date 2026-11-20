@@ -56,6 +56,9 @@ type profileItem struct {
 	EnvKeys             []string        `json:"env_keys"`
 	Checkpoint          bool            `json:"checkpoint"`
 	AllowProposals      bool            `json:"allow_proposals"`
+	// Tools reports whether the profile names a tool server; its path is
+	// not shown.
+	Tools bool `json:"tools"`
 }
 
 // exposedSecret is the name of a secret a profile exposes, and whether a
@@ -105,6 +108,7 @@ func newProfileItem(p Profile) profileItem {
 		EnvKeys:             orEmpty(slices.Sorted(maps.Keys(p.Env))),
 		Checkpoint:          p.Checkpoint,
 		AllowProposals:      p.AllowProposals,
+		Tools:               p.ToolServer != "",
 	}
 }
 

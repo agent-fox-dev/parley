@@ -62,6 +62,8 @@ const (
 	SandboxCreatesTotal        = "parley_sandbox_creates_total"
 	SandboxSeconds             = "parley_sandbox_seconds"
 	SandboxExecTotal           = "parley_sandbox_exec_total"
+	SandboxToolCallsTotal      = "parley_sandbox_tool_calls_total"
+	SandboxToolCallDuration    = "parley_sandbox_tool_call_duration_seconds"
 	SandboxDenialsTotal        = "parley_sandbox_denials_total"
 	SandboxCheckpointsTotal    = "parley_sandbox_checkpoints_total"
 	SandboxRuntimeUp           = "parley_sandbox_runtime_up"
@@ -142,6 +144,13 @@ var catalogue = []Metric{
 	{Name: SandboxExecTotal, Type: Counter,
 		Help:   "Commands run through sandbox exec.",
 		Labels: []Label{closed("result", "ok", "nonzero", "timeout", "error")}},
+	{Name: SandboxToolCallsTotal, Type: Counter,
+		Help:   "Tool calls run in sandboxes, by tool and outcome.",
+		Labels: []Label{open("tool"), closed("outcome", "ok", "tool_error", "timeout", "failed")}},
+	{Name: SandboxToolCallDuration, Type: Histogram,
+		Help:    "Time a tool call ran in its sandbox, in seconds.",
+		Labels:  []Label{open("tool")},
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 600}},
 	{Name: SandboxDenialsTotal, Type: Counter, Help: "Connections and requests the sandbox runtime blocked."},
 	{Name: SandboxCheckpointsTotal, Type: Counter,
 		Help:   "Sandbox checkpoints attempted.",

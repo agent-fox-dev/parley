@@ -68,6 +68,10 @@ var documented = []struct {
 	{"parley_sandbox_creates_total", metrics.Counter, []label{closed("result", "ready", "failed")}, nil},
 	{"parley_sandbox_seconds", metrics.Histogram, nil, sandboxBuckets},
 	{"parley_sandbox_exec_total", metrics.Counter, []label{closed("result", "ok", "nonzero", "timeout", "error")}, nil},
+	{"parley_sandbox_tool_calls_total", metrics.Counter, []label{
+		open("tool"), closed("outcome", "ok", "tool_error", "timeout", "failed")}, nil},
+	{"parley_sandbox_tool_call_duration_seconds", metrics.Histogram, []label{open("tool")},
+		[]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 600}},
 	{"parley_sandbox_denials_total", metrics.Counter, nil, nil},
 	{"parley_sandbox_checkpoints_total", metrics.Counter, []label{closed("result", "ok", "empty", "failed")}, nil},
 	{"parley_sandbox_runtime_up", metrics.Gauge, nil, nil},

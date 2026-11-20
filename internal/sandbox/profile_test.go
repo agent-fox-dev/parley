@@ -116,6 +116,7 @@ hub_access = "none"
 env = { LANG = "C.UTF-8", _X = "y" }
 checkpoint = false
 allow_proposals = false
+tool_server = "/usr/local/bin/agentkit-tools"
 `
 	s, err := loadSandbox(t, sandboxFile{profile: body, tail: credentialTable("model") + credentialTable("other")}, nil)
 	if err != nil {
@@ -132,6 +133,7 @@ allow_proposals = false
 		Credentials: []string{"model"}, OptionalCredentials: []string{"other"},
 		ExposeSecrets: []string{"NPM_TOKEN"}, OptionalExposeSecrets: []string{"PIP_TOKEN"},
 		HubAccess: "none", Env: map[string]string{"LANG": "C.UTF-8", "_X": "y"},
+		ToolServer: "/usr/local/bin/agentkit-tools",
 	}
 	if !reflect.DeepEqual(p, want) {
 		t.Errorf("Profile(agent) = %+v\nwant %+v", p, want)
@@ -172,6 +174,11 @@ func TestFromConfig_RefusesAnInvalidProfileNamingItsKey(t *testing.T) {
 		{"credentials not a list of strings", sandboxFile{profile: "credentials = \"model\"\n"}, []string{"sandbox.profiles[agent].credentials"}, ""},
 		{"env not a table", sandboxFile{profile: "env = \"A=1\"\n"}, []string{"sandbox.profiles[agent].env"}, ""},
 		{"checkpoint of the wrong type", sandboxFile{profile: "checkpoint = 1\n"}, []string{"sandbox.profiles[agent].checkpoint"}, ""},
+		{"a tool_server that is relative", sandboxFile{profile: "tool_server = \"bin/agentkit-tools\"\n"}, []string{"sandbox.profiles[agent].tool_server"}, "unknown key"},
+		{"a tool_server that is a bare name", sandboxFile{profile: "tool_server = \"agentkit-tools\"\n"}, []string{"sandbox.profiles[agent].tool_server"}, "unknown key"},
+		{"a tool_server relative to the working directory", sandboxFile{profile: "tool_server = \"./x\"\n"}, []string{"sandbox.profiles[agent].tool_server"}, "unknown key"},
+		{"a tool_server of 257 bytes", sandboxFile{profile: "tool_server = \"/" + strings.Repeat("t", 256) + "\"\n"}, []string{"sandbox.profiles[agent].tool_server"}, "unknown key"},
+		{"a tool_server of the wrong type", sandboxFile{profile: "tool_server = true\n"}, []string{"sandbox.profiles[agent].tool_server"}, "unknown key"},
 		{"two profiles each with a failure", only(profileTable("a", "ttl = \"0s\"\n") + profileTable("b", "ttl = \"1h\"\nhub_access = \"all\"\n")),
 			[]string{"sandbox.profiles[a].ttl", "sandbox.profiles[b].hub_access"}, ""},
 		{"together with a failure of the section", sandboxFile{set: map[string]string{"reconcile_interval": `"1s"`}, profile: "gpu = -1\n"},
@@ -181,6 +188,8 @@ func TestFromConfig_RefusesAnInvalidProfileNamingItsKey(t *testing.T) {
 		{"a ttl equal to max_ttl", only(profileTable("agent", "ttl = \"24h\"\n")), nil, ""},
 		{"an idle_timeout and a gpu of 0", sandboxFile{profile: "idle_timeout = \"0s\"\ngpu = 0\n"}, nil, ""},
 		{"hub_access none", sandboxFile{profile: "hub_access = \"none\"\n"}, nil, ""},
+		{"a tool_server of 256 bytes", sandboxFile{profile: "tool_server = \"/" + strings.Repeat("t", 255) + "\"\n"}, nil, ""},
+		{"an empty tool_server", sandboxFile{profile: "tool_server = \"\"\n"}, nil, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

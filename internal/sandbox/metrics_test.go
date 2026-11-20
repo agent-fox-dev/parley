@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"maps"
+	"net/http"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,5 +68,51 @@ func TestMetrics_CreatesAndStates(t *testing.T) {
 	}
 	if got := h.rec.values(sandbox.SandboxesMetric); !maps.Equal(got, stateSeries(0, 2, 1, 0, 1)) {
 		t.Errorf("parley_sandboxes = %v; want %v, and no series for deleted", got, stateSeries(0, 2, 1, 0, 1))
+	}
+}
+
+func TestMetrics_CountsToolCallsByToolAndOutcome(t *testing.T) {
+	t.Parallel()
+	h := startToolsHub(t, "")
+	id := h.tooled(t, nil)
+	if got := h.toolCallSamples(t); len(got) != 0 {
+		t.Fatalf("before any call the counter has the samples %v; want none", got)
+	}
+	decoded(t, h.tool(t, id, h.key, "read_file", nil), http.StatusOK)
+	decoded(t, h.tool(t, id, h.key, "read_file", nil), http.StatusOK)
+	h.tools.SetCall(printing(`{"ok":false,"error":"not_found","detail":"no such file"}`, "", 0))
+	decoded(t, h.tool(t, id, h.key, "read_file", nil), http.StatusOK)
+	toolResultOf(t, h.mcpCall(t, id, h.memberKey, "search_files", nil))
+	h.tools.SetCall(printing("", "boom", 1))
+	if a := h.tool(t, id, h.key, "read_file", nil); a.status != http.StatusBadGateway {
+		t.Fatalf("the call of a tool server that exits 1 = %d %s; want 502", a.status, a.body)
+	}
+	_, waiting, _ := h.held()
+	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "read_file"), h.key, map[string]any{"timeout": "10s"}, nil)
+	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+	h.clock.Advance(10 * time.Second)
+	receive(t, answered)
+
+	want := []string{
+		`tool="read_file",outcome="failed" 1`, `tool="read_file",outcome="ok" 2`, `tool="read_file",outcome="timeout" 1`,
+		`tool="read_file",outcome="tool_error" 1`, `tool="search_files",outcome="tool_error" 1`,
+	}
+	if got := h.toolCallSamples(t); !slices.Equal(got, want) {
+		t.Errorf("parley_sandbox_tool_calls_total has the samples\n%v\nwant\n%v", got, want)
+	}
+	_, body := h.Call(t, http.MethodGet, "/metrics", h.Token, nil)
+	for _, line := range []string{
+		`parley_sandbox_tool_call_duration_seconds_count{tool="read_file"} 5`,
+		`parley_sandbox_tool_call_duration_seconds_count{tool="search_files"} 1`,
+		`parley_sandbox_tool_call_duration_seconds_sum{tool="read_file"} 10`,
+	} {
+		if !strings.Contains(string(body), line+"\n") {
+			t.Errorf("the hub's metrics lack the line %s", line)
+		}
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "parley_sandbox_exec_total{") && !strings.HasSuffix(line, " 0") {
+			t.Errorf("the tool calls were counted as execs: %s", line)
+		}
 	}
 }
