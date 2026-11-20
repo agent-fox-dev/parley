@@ -3,7 +3,7 @@
   "spec_id": "56",
   "spec_name": "sandbox_tool_routes",
   "schema_version": 3,
-  "updated_at": "2026-11-20T14:44:39Z",
+  "updated_at": "2026-11-20T14:51:15Z",
   "tasks": [
     {
       "id": 1,
@@ -610,7 +610,267 @@
     },
     {
       "id": 4,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_ListsTheCallersSetAsTheToolServerDefinesIt",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_ListsTheCallersSetAsTheToolServerDefinesIt",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "no_red": "the gate answers this for every entry of its table, so the route's entry alone, which the gate's tests need declared to run, already delivers it",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestTools_RefuseACallerTheLogsRouteRefusesTheSameWay",
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.4",
+          "no_red": "the gate answers this for every entry of its table, so the route's entry alone, which the gate's tests need declared to run, already delivers it",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestTools_AnswerASandboxTheWorkspaceDoesNotHaveNotFound",
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.5",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestTools_AreUnavailableOnASandboxWithoutAToolServer",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.6",
+          "no_red": "the gate answers this for every entry of its table, so the route's entry alone, which the gate's tests need declared to run, already delivers it",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestUseRoutes_AnswerDisabledWhileSandboxesAreOff",
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.7",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestUseRoutes_RefuseASandboxInAStateTheRouteDoesNotAllow",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.8",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_AnswersWhatIsDecidedBeforeTheMessageAsPlainHTTP",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.1",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_InitializeNamesTheHubAndPingAnswers",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.2",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_ServesEveryRequestOnItsOwn",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.3",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_ListsTheCallersSetAsTheToolServerDefinesIt",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.4",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_CallsAToolAndAnswersItsResult",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            },
+            {
+              "test": "./internal/sandbox:TestMCP_GivesACallThatOutlastsItsBoundAsAResult",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.5",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_RefusesAToolOutsideTheSetAndArgumentsOverFourMebibytes",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.6",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_AnswersAFailedCallAndABusySandboxAsErrors",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.7",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_AnswersWhatIsDecidedBeforeTheMessageAsPlainHTTP",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-5.8",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestMCP_AnswersAnyOtherMethodNotFound",
+              "failed": {
+                "at": "2026-11-20T14:47:03Z",
+                "tree": "2c90b0977685141a363cea9e8731ae6cf078671c"
+              },
+              "passed": {
+                "at": "2026-11-20T14:51:13Z",
+                "tree": "a20ab2c79dabbf8a49eadecf0a917274807bd124"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 5,

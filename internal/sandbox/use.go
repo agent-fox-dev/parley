@@ -27,6 +27,7 @@ const (
 	useAttach   = "attach"
 	useTools    = "tools"
 	useToolCall = "tool"
+	useMCP      = "mcp"
 )
 
 // execBodyLimit is the body limit of exec: 4 MiB of stdin fits in it as
@@ -130,12 +131,16 @@ func (s *Service) useTable() []*useEntry {
 			name: useToolCall, method: http.MethodPost, segment: "tools/:name", kind: KindRead, tools: true,
 			states: []string{StateReady}, maxBody: toolBodyLimit, validate: tools.validate, operate: tools.serve,
 		},
+		{
+			name: useMCP, method: http.MethodPost, segment: "mcp", kind: KindRead, tools: true,
+			states: []string{StateReady}, maxBody: toolBodyLimit, operate: tools.serveMCP,
+		},
 	}
 }
 
 // UseRoutes declares the routes that use a sandbox: POST …/exec, PUT and
-// GET …/files, GET …/logs, GET …/attach, GET …/tools and POST …/tools/:name
-// under
+// GET …/files, GET …/logs, GET …/attach, GET …/tools, POST …/tools/:name and
+// POST …/mcp under
 // /workspaces/:slug/sandboxes/:id. Each is a workspace route of its kind,
 // so that the pipeline runs the feature check, the binding guard, the PAT
 // scope and the workspace access before its handler, the gate (see gate).

@@ -2411,6 +2411,7 @@ var useRoutes = []useRoute{
 	{"attach", http.MethodGet, "attach", true},
 	{"tools", http.MethodGet, "tools", false},
 	{"tool", http.MethodPost, "tools/read_file", false},
+	{"mcp", http.MethodPost, "mcp", false},
 }
 
 // toolRoutes are the routes of useRoutes that serve a sandbox's tools.
@@ -2754,6 +2755,7 @@ func (h *toolsHub) sending(ctx context.Context, method, path, cred string, body 
 		}
 		req.Header.Set("Authorization", "Bearer "+cred)
 		req.Header.Set("Content-Type", "application/json")
+		req.Header["Accept"] = mcpHeader["Accept"]
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return
@@ -2772,6 +2774,110 @@ func (h *toolsHub) sending(ctx context.Context, method, path, cred string, body 
 		}
 	}()
 	return out
+}
+
+// rpcAnswer is the answer to an MCP message: the HTTP answer and, when its
+// body is a JSON-RPC response, the result or the error it holds.
+type rpcAnswer struct {
+	answer
+	// isRPC reports whether the body has the member jsonrpc.
+	isRPC  bool
+	result json.RawMessage
+	rpcErr *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+}
+
+// mcpHeader is what an MCP client sends with every message.
+var mcpHeader = http.Header{"Accept": {"application/json, text/event-stream"}}
+
+// mcp sends the MCP request method with params (nil for none) to the MCP
+// route of the sandbox id of ws with cred and the headers of extra.
+func (h *toolsHub) mcp(t *testing.T, id, cred, method string, params any, extra http.Header) rpcAnswer {
+	t.Helper()
+	msg := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method}
+	if params != nil {
+		msg["params"] = params
+	}
+	return h.mcpRaw(t, id, cred, msg, extra)
+}
+
+// mcpRaw sends body to the MCP route as mcp does.
+func (h *toolsHub) mcpRaw(t *testing.T, id, cred string, body any, extra http.Header) rpcAnswer {
+	t.Helper()
+	header := mcpHeader.Clone()
+	for k, vs := range extra {
+		header[k] = vs
+	}
+	var a rpcAnswer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+sandboxPath("ws", id)+"/mcp", cred, body, header)
+	readRPC(&a)
+	return a
+}
+
+// readRPC reads the hub's error envelope or the JSON-RPC response of a's
+// body.
+func readRPC(a *rpcAnswer) {
+	var env struct {
+		JSONRPC string           `json:"jsonrpc"`
+		Result  json.RawMessage  `json:"result"`
+		Error   *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) != nil {
+		return
+	}
+	a.isRPC, a.result = env.JSONRPC != "", env.Result
+	if env.Error == nil {
+		return
+	}
+	if a.isRPC {
+		_ = json.Unmarshal(*env.Error, &a.rpcErr)
+	} else {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+}
+
+// mcpTool is the result of a tools/call.
+type mcpTool struct {
+	IsError bool `json:"isError"`
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	StructuredContent json.RawMessage `json:"structuredContent"`
+}
+
+// mcpCall sends a tools/call of the tool name with arguments (nil for
+// none).
+func (h *toolsHub) mcpCall(t *testing.T, id, cred, name string, arguments any) rpcAnswer {
+	t.Helper()
+	params := map[string]any{"name": name}
+	if arguments != nil {
+		params["arguments"] = arguments
+	}
+	return h.mcp(t, id, cred, "tools/call", params, nil)
+}
+
+// toolResultOf is the tool result of a, which must be a JSON-RPC result.
+func toolResultOf(t *testing.T, a rpcAnswer) mcpTool {
+	t.Helper()
+	if a.status != http.StatusOK || a.rpcErr != nil || len(a.result) == 0 {
+		t.Fatalf("tools/call = %d %.400s; want a result", a.status, a.body)
+	}
+	var r mcpTool
+	if err := json.Unmarshal(a.result, &r); err != nil {
+		t.Fatalf("the tool result %s: %v", a.result, err)
+	}
+	return r
+}
+
+// wantRPCError checks that a is a JSON-RPC error with code, answered 200.
+func wantRPCError(t *testing.T, a rpcAnswer, code int) {
+	t.Helper()
+	if a.status != http.StatusOK || a.rpcErr == nil || a.rpcErr.Code != code {
+		t.Fatalf("= %d %.400s; want a JSON-RPC error with code %d", a.status, a.body, code)
+	}
 }
 
 // held makes the stand-in's calls wait until release is called or they are
