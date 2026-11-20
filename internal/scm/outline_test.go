@@ -322,3 +322,19 @@ func TestOutline_OutlinesAnEmptyFileFromItsContentAlone(t *testing.T) {
 		t.Errorf("the outline was handed %v, want the file's content once, empty and not nil", got)
 	}
 }
+
+// A hub built without cgo has no backend for Python: the answer still names
+// the language, and says that the file is not supported.
+func TestOutline_NamesTheLanguageOfAFileThisBuildHasNoBackendFor(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, func(d *scm.Deps) {
+		d.Outline = func(context.Context, string, []byte) (outline.File, error) {
+			return outline.File{Lang: outline.LangPython, Backend: outline.BackendNone, Decls: []outline.Decl{}}, nil
+		}
+	})
+	x := commit(t, w.repo, w.id["c2"], "app.py", "def serve():\n    pass\n")
+	r, a := outlineOf(t, w, "demo", "path=app.py&ref="+x)
+	if r.status != http.StatusOK || !a.is(false, "Python") || len(a.Declarations) != 0 {
+		t.Errorf("%d %s, want 200 with the language Python, supported false and declarations []", r.status, r.body)
+	}
+}
