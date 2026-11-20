@@ -481,7 +481,7 @@ func TestSecretUse_RefusesWithoutAKey(t *testing.T) {
 
 func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, options{})
+	w := newWorld(t, options{toml: insecure})
 	for _, tc := range []struct {
 		status string
 		slug   string
@@ -490,19 +490,23 @@ func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T)
 		{"archived", other},
 	} {
 		t.Run(tc.status, func(t *testing.T) {
-			id, _ := w.mustCreate(t, tc.slug, "https://ci.example/hooks/parley?t=1")["id"].(string)
-			keep, _ := w.mustCreate(t, tc.slug, "https://ci.example/keep")["id"].(string)
-			// One delivery that succeeded and one pending, as the delivery
-			// loop leaves them, and one of the subscription that stays.
+			failing, healthy := failingInbox(t), newInbox(t, answerOK)
+			id := w.subscribe(t, tc.slug, map[string]any{"url": failing.URL + "/hooks/parley?t=1", "types": testTypes})
+			keep := w.subscribe(t, tc.slug, map[string]any{"url": healthy.url(), "types": testTypes})
+			// A delivery that succeeded of each, as the delivery loop leaves
+			// them, and a pending one of the subscription to delete, whose
+			// retry the loop has scheduled.
 			now := w.clock.Now().UnixNano()
 			deliveryID := func(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%s%012d", tc.status[:1], i) }
-			for i, d := range []struct{ sub, status string }{{id, "succeeded"}, {id, "pending"}, {keep, "succeeded"}} {
+			for i, sub := range []string{id, keep} {
 				if _, err := w.Store.Main().Exec(`INSERT INTO webhook_deliveries
-					(id, subscription_id, seq, type, status, attempts, created_at) VALUES (?, ?, ?, 'parley.change.open', ?, 1, ?)`,
-					deliveryID(i), d.sub, i+1, d.status, now); err != nil {
+					(id, subscription_id, seq, type, status, attempts, created_at) VALUES (?, ?, ?, 'parley.change.open', 'succeeded', 1, ?)`,
+					deliveryID(i), sub, i+1, now); err != nil {
 					t.Fatal(err)
 				}
 			}
+			w.emit(t, tc.slug, "parley.test.one", "")
+			w.retrying(t, id, 1)
 			var sealed []byte
 			if err := w.Store.Main().QueryRow(`SELECT secret_sealed FROM webhook_subscriptions WHERE id = ?`, id).Scan(&sealed); err != nil {
 				t.Fatal(err)
@@ -530,7 +534,7 @@ func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T)
 			}
 			// The other subscription's loop may record deliveries of its own
 			// meanwhile; the one stored above must stay.
-			if err := db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE subscription_id = ? AND id = ?`, keep, deliveryID(2)).Scan(&kept); err != nil {
+			if err := db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE subscription_id = ? AND id = ?`, keep, deliveryID(1)).Scan(&kept); err != nil {
 				t.Fatal(err)
 			}
 			if deliveries != 0 || holding != 0 {
@@ -548,8 +552,20 @@ func TestDelete_RemovesTheSubscriptionWithItsDeliveriesInAnyStatus(t *testing.T)
 				e.ResourceType != "event_webhook" || e.ResourceID != id {
 				t.Errorf("event = %+v, want workspace %s, the owner's api_key, resource event_webhook %s", e, tc.slug, id)
 			}
-			if want := map[string]any{"webhook_id": id, "host": "ci.example"}; !reflect.DeepEqual(e.Metadata, want) {
+			if want := map[string]any{"webhook_id": id, "host": "127.0.0.1"}; !reflect.DeepEqual(e.Metadata, want) {
 				t.Errorf("event metadata = %v, want %v", e.Metadata, want)
+			}
+
+			// Its deliveries stop: an hour on, past the scheduled retry, the
+			// receiver has had no request since the delete, while the other
+			// subscription delivers the next event.
+			sent := len(failing.requests())
+			w.clock.advance(time.Hour)
+			seq := w.emit(t, tc.slug, "parley.test.two", "")
+			waitFor(t, "the other subscription to deliver the next event", func() bool { return slices.Contains(healthy.seqs(), seq) })
+			time.Sleep(20 * time.Millisecond)
+			if n := len(failing.requests()); n != sent {
+				t.Errorf("the receiver of the deleted subscription got %d requests after the delete, want none", n-sent)
 			}
 		})
 	}
