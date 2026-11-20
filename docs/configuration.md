@@ -183,7 +183,7 @@ ttl = "4h"
 | `tls_ca` | string | `""` | a readable file of CA certificates the gateway's certificate is checked against |
 | `token_file` | string | `""` | a readable file holding the bearer token; its content without surrounding white space must not be empty. It is read once, when `parleyd` starts |
 | `oidc_issuer`, `oidc_client_id`, `oidc_client_secret_file` | string | `""` | OIDC client credentials, all three or none: the issuer by the rule of `gateway_url` except that it may have a path, and a readable, non-empty file holding the client secret |
-| `openshell_workspace` | string | `"parley"` | the OpenShell workspace the hub owns: 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit |
+| `openshell_workspace` | string | `"parley"` | the OpenShell workspace the hub owns: 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit. A gateway of release 0.1.9 takes at most 19 lower-case letters, digits and `-`, and refuses another name at the start-up check. Two hubs must not share one: each installs its own `parley-hub` there |
 | `max_ttl` | duration | `"24h"` | more than `0` |
 | `idle_timeout` | duration | `"30m"` | `0` or more; `0` disables the idle stop |
 | `max_sandboxes` | integer | `200` | at least `1` |
@@ -265,9 +265,9 @@ error line): it reads the gateway's health and release and refuses an
 unhealthy gateway or a release outside the range; it makes sure the
 `openshell_workspace` exists, creating it when it does not; it installs the
 provider profile `parley-hub` of the hub credential a sandbox reaches the hub
-with, its placeholder in `PARLEY_API_KEY`, for the scheme, host and port of
+with, its placeholder in `PARLEY_API_KEY`, for the host and port of
 `[server].external_url` (443 for `https` and 80 for `http` when the URL gives
-none) and any program; it reads, once each, the provider profiles the
+none), its `/api/v1/` and `/git/` paths and any program, inspected as HTTP; it reads, once each, the provider profiles the
 `[[sandbox.credentials]]` name, and refuses one the gateway does not know;
 it refuses a name in a profile's `expose_secrets` or
 `optional_expose_secrets` that is a variable declared by the provider
@@ -288,7 +288,7 @@ no other:
 | `name` | string | required | 1 to 63 lower-case letters, digits, `_` or `-`, starting with a letter or a digit; unique among the profiles |
 | `default` | boolean | `false` | the profile a sandbox gets when its creator names none; at most one profile sets it |
 | `description` | string | `""` | |
-| `image` | string | `""` | the sandbox image; `""` leaves it to the runtime |
+| `image` | string | `""` | the sandbox image; `""` leaves it to the runtime. It holds `git` and the working directory `/workspace`, writable by its default user: OpenShell creates a sandbox without a working directory, and the hub runs its commands there (see `containers/sandbox/Dockerfile`) |
 | `cpu`, `memory` | string | `""` | the sandbox's resources; `""` leaves them to the runtime |
 | `gpu` | integer | `0` | `0` or more |
 | `ttl` | duration | required | more than `0` and at most `max_ttl` |

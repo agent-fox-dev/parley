@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/ai-openshell/sdk-go v0.1.8
+	github.com/ai-openshell/sdk-go v0.1.9
 	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.9
@@ -21,7 +21,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260817212433-ac3dfec99bb1 // indirect

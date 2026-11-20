@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +119,20 @@ func (h *Hub) Git(dir, credential string, args ...string) Result {
 	if credential != "" {
 		env = append(env, "PARLEY_ENDPOINT_URL="+h.URL(""), "PARLEY_API_KEY="+credential)
 		args = append([]string{"-c", "credential." + h.URL("") + ".helper=!" + built.parley + " credential-helper"}, args...)
+	}
+	if host := h.opts.PublicHost; host != "" {
+		// The hub's URLs name the host its sandboxes reach it at, which
+		// this machine may not reach: git calls it on the loopback address,
+		// for the URLs given here, credentials included, and those a clone
+		// keeps.
+		public, local := net.JoinHostPort(host, strconv.Itoa(h.Port)), "127.0.0.1:"+strconv.Itoa(h.Port)
+		args = slices.Clone(args)
+		for i, arg := range args {
+			if strings.HasPrefix(arg, "http://") {
+				args[i] = strings.Replace(arg, "@"+public+"/", "@"+local+"/", 1)
+			}
+		}
+		args = append([]string{"-c", "url." + h.URL("/") + ".insteadOf=http://" + public + "/"}, args...)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), callLimit)
 	defer cancel()

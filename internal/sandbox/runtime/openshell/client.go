@@ -8,14 +8,20 @@
 // ValidatePolicy, GetPolicy, WatchSandboxes, RunMain, MakeDir, Stat, Walk and
 // Logs, and Exec and ExecStream with input on stdin. A request with a part
 // the SDK cannot carry is unsupported too, so that no part is silently
-// dropped (CreateSandbox with a base document or a working directory,
-// StartSandbox with a policy value or an environment); the exception is the
-// paths of a provider profile's endpoints, see InstallProviderProfile.
+// dropped (CreateSandbox with a base document, StartSandbox with a policy
+// value or an environment).
+//
+// The SDK has no working directory at creation: a sandbox is created with
+// its working directory writable in its filesystem policy, and every
+// command runs in the working directory its request names (an exec without
+// one runs in the image's).
 package openshell
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +29,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -184,10 +191,9 @@ func (c *client) GetProviderProfile(ctx context.Context, id string) (runtime.Pro
 }
 
 // InstallProviderProfile installs a profile with one credential, named
-// after the profile, whose placeholder goes into each of its variables. The
-// SDK's profile endpoint is a host, a port and a protocol, which takes the
-// endpoint's scheme; it has no path, so an endpoint's paths are not sent and
-// the credential is authorized on every path of the endpoint's host.
+// after the profile, whose placeholder goes into each of its variables, and
+// its endpoints as the gateway's HTTP endpoints (httpEndpoints), one per
+// path prefix.
 func (c *client) InstallProviderProfile(ctx context.Context, p runtime.ProviderProfile) error {
 	return c.do(ctx, runtime.OpInstallProviderProfile, func(ctx context.Context) error {
 		item := profileItem(p)
@@ -217,7 +223,11 @@ func profileItem(p runtime.ProviderProfile) v1.ProfileImportItem {
 		pp.Credentials = []v1.ProfileCredential{{Name: p.ID, EnvVars: slices.Clone(p.Variables), Required: true}}
 	}
 	for _, ep := range p.Endpoints {
-		pp.Endpoints = append(pp.Endpoints, v1.NetworkEndpoint{Host: ep.Host, Port: uint32(ep.Port), Protocol: ep.Scheme})
+		globs := make([]string, len(ep.Paths))
+		for i, prefix := range ep.Paths {
+			globs[i] = prefixGlob(prefix)
+		}
+		pp.Endpoints = append(pp.Endpoints, httpEndpoints(ep.Host, uint32(ep.Port), globs)...)
 	}
 	for _, prog := range p.Programs {
 		pp.Binaries = append(pp.Binaries, v1.NetworkBinary{Path: prog})
@@ -225,13 +235,49 @@ func profileItem(p runtime.ProviderProfile) v1.ProfileImportItem {
 	return v1.ProfileImportItem{Profile: pp, Source: "parley"}
 }
 
+// httpEndpoints are the gateway's endpoints for HTTP on host and port: one
+// per path glob, or one for every path when globs is empty. The gateway
+// takes an L7 protocol, not a scheme: "rest" with every method allowed,
+// which inspects HTTP with or without TLS. That inspection is what lets the
+// gateway put a credential into a request, and it refuses a credentialed
+// endpoint without it.
+func httpEndpoints(host string, port uint32, globs []string) []v1.PolicyNetworkEndpoint {
+	if len(globs) == 0 {
+		globs = []string{""}
+	}
+	out := make([]v1.PolicyNetworkEndpoint, len(globs))
+	for i, glob := range globs {
+		out[i] = v1.PolicyNetworkEndpoint{Host: host, Port: port, Protocol: "rest", Access: v1.NetworkAccessPresetFull, Path: glob}
+	}
+	return out
+}
+
+// prefixGlob is the gateway's path glob of a path prefix: every path below
+// it.
+func prefixGlob(prefix string) string {
+	return strings.TrimSuffix(prefix, "/") + "/**"
+}
+
+// providerProfile is a profile as the gateway holds it. The endpoints of one
+// host and port, in the order installed, are one endpoint with their path
+// prefixes; the gateway keeps no scheme, so Scheme is empty.
 func providerProfile(pp *v1.ProviderProfile) runtime.ProviderProfile {
 	p := runtime.ProviderProfile{ID: pp.ID}
 	for _, cred := range pp.Credentials {
 		p.Variables = append(p.Variables, cred.EnvVars...)
 	}
+	at := map[string]int{}
 	for _, ep := range pp.Endpoints {
-		p.Endpoints = append(p.Endpoints, runtime.Endpoint{Scheme: ep.Protocol, Host: ep.Host, Port: int(ep.Port)})
+		key := fmt.Sprintf("%s:%d", ep.Host, ep.Port)
+		i, seen := at[key]
+		if !seen {
+			i = len(p.Endpoints)
+			at[key] = i
+			p.Endpoints = append(p.Endpoints, runtime.Endpoint{Host: ep.Host, Port: int(ep.Port)})
+		}
+		if ep.Path != "" {
+			p.Endpoints[i].Paths = append(p.Endpoints[i].Paths, strings.TrimSuffix(ep.Path, "**"))
+		}
 	}
 	for _, b := range pp.Binaries {
 		p.Programs = append(p.Programs, b.Path)
@@ -252,6 +298,10 @@ func diagnostics(ds []v1.ProfileDiagnostic) string {
 
 // Providers.
 
+// profileScopeWorkspace is the scope the gateway reports for a provider
+// profile held in a workspace, such as the ones the client installs.
+const profileScopeWorkspace = "workspace"
+
 // EnsureProvider creates or replaces a provider of the profile p.Profile,
 // holding p.Value as the profile's one credential. A profile that does not
 // declare exactly one credential is refused as invalid.
@@ -264,11 +314,22 @@ func (c *client) EnsureProvider(ctx context.Context, p runtime.Provider) error {
 		if len(pp.Credentials) != 1 {
 			return invalid(runtime.OpEnsureProvider, fmt.Sprintf("provider profile %s declares %d credentials, a provider holds one", p.Profile, len(pp.Credentials)))
 		}
+		// The gateway keys a provider's credential by the variables its
+		// profile declares for it, not by the credential's name.
+		spec := v1.ProviderSpec{Credentials: map[string]string{}}
+		for _, name := range pp.Credentials[0].EnvVars {
+			spec.Credentials[name] = p.Value
+		}
+		if pp.Scope == profileScopeWorkspace {
+			// The gateway looks a provider's profile up in the global scope
+			// unless the provider names the workspace that holds it.
+			spec.ProfileWorkspace = c.ws
+		}
 		_, err = c.sdk.Providers().Ensure(ctx, c.ws, &v1.Provider{
 			Name:   p.Name,
 			Type:   p.Profile,
 			Labels: cloneMap(p.Labels),
-			Spec:   v1.ProviderSpec{Credentials: map[string]string{pp.Credentials[0].Name: p.Value}},
+			Spec:   spec,
 		})
 		return err
 	})
@@ -288,21 +349,21 @@ func (c *client) AttachProvider(ctx context.Context, sandbox, provider string) e
 		if _, err := c.sdk.Providers().Get(ctx, c.ws, provider); err != nil {
 			return err
 		}
-		_, err := c.sdk.Sandboxes().AttachProvider(ctx, c.ws, sandbox, provider, 0)
+		_, err := c.sdk.Sandboxes().AttachProvider(ctx, c.ws, runtimeName(sandbox), provider, 0)
 		return err
 	})
 }
 
 func (c *client) DetachProvider(ctx context.Context, sandbox, provider string) error {
 	return c.do(ctx, runtime.OpDetachProvider, func(ctx context.Context) error {
-		_, err := c.sdk.Sandboxes().DetachProvider(ctx, c.ws, sandbox, provider, 0)
+		_, err := c.sdk.Sandboxes().DetachProvider(ctx, c.ws, runtimeName(sandbox), provider, 0)
 		return err
 	})
 }
 
 func (c *client) SandboxProviders(ctx context.Context, sandbox string) ([]string, error) {
 	return call(c, ctx, runtime.OpSandboxProviders, func(ctx context.Context) ([]string, error) {
-		list, err := c.sdk.Sandboxes().ListAllProviders(ctx, c.ws, sandbox)
+		list, err := c.sdk.Sandboxes().ListAllProviders(ctx, c.ws, runtimeName(sandbox))
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +415,7 @@ func (c *client) AddPolicyRule(ctx context.Context, sandbox string, rule runtime
 			return err
 		}
 		_, err = c.sdk.Config().Update(ctx, c.ws, &v1.ConfigUpdate{
-			Name:            sandbox,
+			Name:            runtimeName(sandbox),
 			MergeOperations: []v1.PolicyMergeOperation{{AddRule: &v1.AddNetworkRule{RuleName: rule.Name, Rule: r}}},
 		})
 		return err
@@ -369,7 +430,7 @@ func (c *client) ListProposals(ctx context.Context) ([]runtime.Proposal, error) 
 		if err != nil {
 			return nil, err
 		}
-		slices.SortFunc(sandboxes, func(a, b *v1.Sandbox) int { return strings.Compare(a.Name, b.Name) })
+		slices.SortFunc(sandboxes, func(a, b *v1.Sandbox) int { return strings.Compare(sandboxName(a), sandboxName(b)) })
 		var out []runtime.Proposal
 		for _, sb := range sandboxes {
 			draft, err := c.sdk.Policy().GetDraft(ctx, c.ws, sb.Name, v1.WithStatusFilter("pending"))
@@ -381,7 +442,7 @@ func (c *client) ListProposals(ctx context.Context) ([]runtime.Proposal, error) 
 			}
 			for _, ch := range draft.Chunks {
 				if ch.Status == "pending" {
-					out = append(out, proposal(sb.Name, ch))
+					out = append(out, proposal(sandboxName(sb), ch))
 				}
 			}
 		}
@@ -406,7 +467,7 @@ func proposal(sandbox string, ch v1.PolicyChunk) runtime.Proposal {
 // pendingChunk returns the pending draft chunk id of a sandbox; one that is
 // not pending, decided already included, is not found.
 func (c *client) pendingChunk(ctx context.Context, op, sandbox, id string) (v1.PolicyChunk, error) {
-	draft, err := c.sdk.Policy().GetDraft(ctx, c.ws, sandbox)
+	draft, err := c.sdk.Policy().GetDraft(ctx, c.ws, runtimeName(sandbox))
 	if err != nil {
 		return v1.PolicyChunk{}, err
 	}
@@ -424,7 +485,7 @@ func (c *client) ApproveProposal(ctx context.Context, sandbox, id string) error 
 		if err != nil {
 			return err
 		}
-		_, err = c.sdk.Policy().ApproveDraftChunk(ctx, c.ws, sandbox, id, ch.ReviewToken)
+		_, err = c.sdk.Policy().ApproveDraftChunk(ctx, c.ws, runtimeName(sandbox), id, ch.ReviewToken)
 		return err
 	})
 }
@@ -434,67 +495,146 @@ func (c *client) RejectProposal(ctx context.Context, sandbox, id, reason string)
 		if _, err := c.pendingChunk(ctx, runtime.OpRejectProposal, sandbox, id); err != nil {
 			return err
 		}
-		return c.sdk.Policy().RejectDraftChunk(ctx, c.ws, sandbox, id, reason)
+		return c.sdk.Policy().RejectDraftChunk(ctx, c.ws, runtimeName(sandbox), id, reason)
 	})
 }
 
-// sdkPolicy is the SDK policy of a policy value: its protected and added
-// rules as named network rules, nil when it has none. The SDK takes a typed
-// policy, not a document, so the caller refuses a base document before; a
-// rule the SDK's network rule cannot hold is unsupported, and an added rule
-// named like an earlier rule, which would replace it, is invalid.
-func sdkPolicy(op string, p runtime.Policy) (*v1.SandboxPolicy, error) {
+// defaultReadOnly and defaultReadWrite are the filesystem part of the
+// gateway's built-in policy. A typed policy replaces that policy whole, and
+// a sandbox whose policy has no filesystem part cannot start its first
+// process, so every policy the client sends has this part.
+var (
+	defaultReadOnly  = []string{"/bin", "/usr", "/lib", "/proc", "/dev/urandom", "/etc", "/var/log"}
+	defaultReadWrite = []string{"/tmp", "/dev/null"}
+)
+
+// sdkPolicy is the SDK policy of a sandbox in workDir under a policy value:
+// the filesystem part of the gateway's built-in policy with workDir
+// writable, and the value's protected and added rules as named network
+// rules. It is nil, the gateway's built-in policy, without a working
+// directory and without rules. The SDK takes a typed policy, not a
+// document, so the caller refuses a base document before; a rule the SDK's
+// network rule cannot hold is unsupported, and an added rule named like an
+// earlier rule, which would replace it, is invalid. A rule with neither
+// endpoints nor binaries allows nothing and is left out.
+func sdkPolicy(op, workDir string, p runtime.Policy) (*v1.SandboxPolicy, error) {
 	rules := slices.Concat(p.Protected, p.Added)
-	if len(rules) == 0 {
+	if len(rules) == 0 && workDir == "" {
 		return nil, nil
 	}
-	out := &v1.SandboxPolicy{NetworkPolicies: make(map[string]v1.NetworkPolicyRule, len(rules))}
+	readWrite := slices.Clone(defaultReadWrite)
+	if workDir != "" {
+		readWrite = append(readWrite, workDir)
+	}
+	out := &v1.SandboxPolicy{
+		Version:    1,
+		Filesystem: &v1.FilesystemPolicy{IncludeWorkdir: true, ReadOnly: slices.Clone(defaultReadOnly), ReadWrite: readWrite},
+		Landlock:   &v1.LandlockPolicy{Compatibility: "best_effort"},
+	}
+	names := map[string]bool{}
 	for _, rule := range rules {
-		if _, dup := out.NetworkPolicies[rule.Name]; dup {
+		if names[rule.Name] {
 			return nil, invalid(op, "policy rule "+rule.Name+" is given twice")
 		}
+		names[rule.Name] = true
 		r, err := networkRule(op, rule)
 		if err != nil {
 			return nil, err
+		}
+		if len(r.Endpoints) == 0 && len(r.Binaries) == 0 {
+			continue
+		}
+		if out.NetworkPolicies == nil {
+			out.NetworkPolicies = map[string]v1.NetworkPolicyRule{}
 		}
 		out.NetworkPolicies[rule.Name] = r
 	}
 	return out, nil
 }
 
+// ruleDoc is a rule's body: a network rule in OpenShell's schema, with what
+// the hub adds to it (ruleBody in internal/sandbox): the providers whose
+// credentials the rule lets through, and an endpoint's scheme and path
+// globs (endpointDoc).
+type ruleDoc struct {
+	Name      string                   `json:"name"`
+	Providers []string                 `json:"providers"`
+	Endpoints []json.RawMessage        `json:"endpoints"`
+	Binaries  []v1.PolicyNetworkBinary `json:"binaries"`
+}
+
+// anyBinary is the gateway's binary glob that matches every program.
+const anyBinary = "/**"
+
+type endpointDoc struct {
+	v1.PolicyNetworkEndpoint
+	Scheme string   `json:"scheme"`
+	Paths  []string `json:"paths"`
+}
+
 // networkRule decodes a rule's body into the SDK's network rule, refusing
-// any member the SDK's rule has no field for.
+// any member it has no field for. An endpoint with a scheme is an HTTP
+// endpoint (httpEndpoints) for each path glob it lists. The providers are
+// not sent: the SDK's rule has no field for them, and the gateway lets an
+// attached provider's credential reach only the endpoints of its profile.
 func networkRule(op string, rule runtime.Rule) (v1.NetworkPolicyRule, error) {
-	var r v1.NetworkPolicyRule
+	refuse := func(err error) (v1.NetworkPolicyRule, error) {
+		return v1.NetworkPolicyRule{}, unsupported(op, "policy rule "+rule.Name+" is not a network rule the SDK can carry: "+err.Error())
+	}
 	body := rule.Body
 	if len(body) == 0 {
 		body = json.RawMessage(`{}`)
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&r); err != nil {
-		return v1.NetworkPolicyRule{}, unsupported(op, "policy rule "+rule.Name+" is not a network rule the SDK can carry: "+err.Error())
+	var doc ruleDoc
+	if err := strictDecode(body, &doc); err != nil {
+		return refuse(err)
 	}
-	r.Name = rule.Name
+	r := v1.NetworkPolicyRule{Name: rule.Name, Binaries: doc.Binaries}
+	if len(r.Binaries) == 0 && len(doc.Endpoints) > 0 {
+		// The gateway lets no program through a rule that names none; a
+		// rule without binaries is meant for every program.
+		r.Binaries = []v1.PolicyNetworkBinary{{Path: anyBinary}}
+	}
+	for _, raw := range doc.Endpoints {
+		var ep endpointDoc
+		if err := strictDecode(raw, &ep); err != nil {
+			return refuse(err)
+		}
+		switch {
+		case ep.Scheme == "" && len(ep.Paths) == 0:
+			r.Endpoints = append(r.Endpoints, ep.PolicyNetworkEndpoint)
+		case ep.Scheme != "http" && ep.Scheme != "https":
+			return refuse(fmt.Errorf("an endpoint with paths needs the scheme http or https, not %q", ep.Scheme))
+		case ep.Protocol != "" || ep.Path != "" || ep.Access != v1.NetworkAccessPresetUnspecified || len(ep.Rules) > 0:
+			return refuse(errors.New("an endpoint with a scheme takes no protocol, path, access or rules"))
+		default:
+			r.Endpoints = append(r.Endpoints, httpEndpoints(ep.Host, ep.Port, ep.Paths)...)
+		}
+	}
 	return r, nil
+}
+
+func strictDecode(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }
 
 // Sandboxes.
 
 // CreateSandbox creates the sandbox with its image, resources, environment,
-// providers, labels and the rules of its policy value. The SDK has no
-// working directory at creation and takes no policy document, so a request
-// with either is unsupported and does not reach the SDK: a sandbox must not
-// run without the policy or outside the directory it was asked for.
+// providers, labels and a policy (sdkPolicy) in which its working directory
+// is writable and which holds the rules of its policy value. The SDK has no
+// working directory at creation: the image holds the directory, and the
+// commands run in it name it (see the package comment). The SDK takes no
+// policy document, so a request with one is unsupported and does not reach
+// the SDK: a sandbox must not run without the policy it was asked for.
 func (c *client) CreateSandbox(ctx context.Context, spec runtime.SandboxSpec) (runtime.SandboxStatus, error) {
 	if len(spec.Policy.Base) > 0 {
 		return runtime.SandboxStatus{}, c.reach.Observe(unsupported(runtime.OpCreateSandbox, "the SDK takes no base policy document at creation"))
 	}
-	if spec.WorkDir != "" {
-		return runtime.SandboxStatus{}, c.reach.Observe(unsupported(runtime.OpCreateSandbox, "the SDK has no working directory at creation"))
-	}
 	return call(c, ctx, runtime.OpCreateSandbox, func(ctx context.Context) (runtime.SandboxStatus, error) {
-		policy, err := sdkPolicy(runtime.OpCreateSandbox, spec.Policy)
+		policy, err := sdkPolicy(runtime.OpCreateSandbox, spec.WorkDir, spec.Policy)
 		if err != nil {
 			return runtime.SandboxStatus{}, err
 		}
@@ -520,7 +660,10 @@ func (c *client) CreateSandbox(ctx context.Context, spec runtime.SandboxSpec) (r
 		if len(spec.Labels) > 0 {
 			opts = append(opts, v1.WithLabels(spec.Labels))
 		}
-		sb, err := c.sdk.Sandboxes().Create(ctx, c.ws, spec.Name, sp, opts...)
+		if runtimeName(spec.Name) != spec.Name {
+			opts = append(opts, v1.WithAnnotations(map[string]string{nameAnnotation: spec.Name}))
+		}
+		sb, err := c.sdk.Sandboxes().Create(ctx, c.ws, runtimeName(spec.Name), sp, opts...)
 		if err != nil {
 			return runtime.SandboxStatus{}, err
 		}
@@ -530,7 +673,7 @@ func (c *client) CreateSandbox(ctx context.Context, spec runtime.SandboxSpec) (r
 
 func (c *client) GetSandbox(ctx context.Context, name string) (runtime.SandboxStatus, error) {
 	return call(c, ctx, runtime.OpGetSandbox, func(ctx context.Context) (runtime.SandboxStatus, error) {
-		sb, err := c.sdk.Sandboxes().Get(ctx, c.ws, name)
+		sb, err := c.sdk.Sandboxes().Get(ctx, c.ws, runtimeName(name))
 		if err != nil {
 			return runtime.SandboxStatus{}, err
 		}
@@ -555,14 +698,14 @@ func (c *client) ListSandboxes(ctx context.Context) ([]runtime.SandboxStatus, er
 
 func (c *client) DeleteSandbox(ctx context.Context, name string) error {
 	return c.do(ctx, runtime.OpDeleteSandbox, func(ctx context.Context) error {
-		_, err := c.sdk.Sandboxes().Delete(ctx, c.ws, name)
+		_, err := c.sdk.Sandboxes().Delete(ctx, c.ws, runtimeName(name))
 		return err
 	})
 }
 
 func (c *client) StopSandbox(ctx context.Context, name string) error {
 	return c.do(ctx, runtime.OpStopSandbox, func(ctx context.Context) error {
-		_, err := c.sdk.Sandboxes().Stop(ctx, c.ws, name)
+		_, err := c.sdk.Sandboxes().Stop(ctx, c.ws, runtimeName(name))
 		return err
 	})
 }
@@ -579,14 +722,14 @@ func (c *client) StartSandbox(ctx context.Context, name string, spec runtime.Sta
 		return c.reach.Observe(unsupported(runtime.OpStartSandbox, "the SDK's start takes no environment"))
 	}
 	return c.do(ctx, runtime.OpStartSandbox, func(ctx context.Context) error {
-		_, err := c.sdk.Sandboxes().Start(ctx, c.ws, name)
+		_, err := c.sdk.Sandboxes().Start(ctx, c.ws, runtimeName(name))
 		return err
 	})
 }
 
 func (c *client) WaitReady(ctx context.Context, name string) (runtime.SandboxStatus, error) {
 	return call(c, ctx, runtime.OpWaitReady, func(ctx context.Context) (runtime.SandboxStatus, error) {
-		sb, err := c.sdk.Sandboxes().WaitReady(ctx, c.ws, name)
+		sb, err := c.sdk.Sandboxes().WaitReady(ctx, c.ws, runtimeName(name))
 		if err != nil {
 			return runtime.SandboxStatus{}, err
 		}
@@ -606,11 +749,40 @@ func (c *client) RunMain(context.Context, string, []string) error {
 	return c.reach.Observe(unsupported(runtime.OpRunMain, "the SDK has no call that starts a main process after creation"))
 }
 
+// gatewayName is a sandbox name the gateway takes: lowercase letters,
+// digits and hyphens, at most 19 of them.
+var gatewayName = regexp.MustCompile(`^[a-z0-9-]{1,19}$`)
+
+// nameAnnotation is the annotation of a sandbox whose name the gateway does
+// not take, holding that name.
+const nameAnnotation = "parley.name"
+
+// runtimeName is the gateway's name of the sandbox name: name itself when
+// the gateway takes it, otherwise "p-" and 17 hex digits of its SHA-256
+// (68 bits, so that the names of a workspace do not collide in practice).
+// The hub names a sandbox by its id, which the gateway does not take.
+func runtimeName(name string) string {
+	if gatewayName.MatchString(name) {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "p-" + hex.EncodeToString(sum[:])[:17]
+}
+
+// sandboxName is the name the sandbox sb was created with: the one its
+// annotation holds, or the gateway's.
+func sandboxName(sb *v1.Sandbox) string {
+	if name := sb.Annotations[nameAnnotation]; name != "" {
+		return name
+	}
+	return sb.Name
+}
+
 // sandboxStatus is a sandbox as the SDK reports it. The SDK reports nothing
 // of the working directory, which is taken as present while the sandbox
 // exists.
 func sandboxStatus(sb *v1.Sandbox) runtime.SandboxStatus {
-	st := runtime.SandboxStatus{Name: sb.Name, Labels: cloneMap(sb.Labels), State: state(sb.Status), WorkDirPresent: true}
+	st := runtime.SandboxStatus{Name: sandboxName(sb), Labels: cloneMap(sb.Labels), State: state(sb.Status), WorkDirPresent: true}
 	if sb.Status.ExitCode != nil {
 		st.MainExited, st.ExitCode = true, int(*sb.Status.ExitCode)
 	}
@@ -640,7 +812,7 @@ func (c *client) Exec(ctx context.Context, sandbox string, req runtime.ExecReque
 		return runtime.ExecResult{}, c.reach.Observe(unsupported(runtime.OpExec, "the SDK's run takes no input"))
 	}
 	return call(c, ctx, runtime.OpExec, func(ctx context.Context) (runtime.ExecResult, error) {
-		r, err := c.sdk.Exec().Run(ctx, c.ws, sandbox, req.Command, execOptions(req))
+		r, err := c.sdk.Exec().Run(ctx, c.ws, runtimeName(sandbox), req.Command, execOptions(req))
 		if err != nil {
 			return runtime.ExecResult{}, err
 		}
@@ -655,7 +827,7 @@ func (c *client) ExecStream(ctx context.Context, sandbox string, req runtime.Exe
 	if len(req.Stdin) > 0 {
 		return nil, c.reach.Observe(unsupported(runtime.OpExecStream, "the SDK's stream takes no input"))
 	}
-	s, err := c.sdk.Exec().Stream(ctx, c.ws, sandbox, req.Command, execOptions(req))
+	s, err := c.sdk.Exec().Stream(ctx, c.ws, runtimeName(sandbox), req.Command, execOptions(req))
 	if err := c.result(ctx, runtime.OpExecStream, err); err != nil {
 		return nil, err
 	}
@@ -663,7 +835,7 @@ func (c *client) ExecStream(ctx context.Context, sandbox string, req runtime.Exe
 }
 
 func (c *client) ExecInteractive(ctx context.Context, sandbox string, req runtime.ExecRequest, size runtime.TerminalSize) (runtime.Terminal, error) {
-	s, err := c.sdk.Exec().Interactive(ctx, c.ws, sandbox, req.Command, size.Cols, size.Rows, execOptions(req))
+	s, err := c.sdk.Exec().Interactive(ctx, c.ws, runtimeName(sandbox), req.Command, size.Cols, size.Rows, execOptions(req))
 	if err := c.result(ctx, runtime.OpExecInteractive, err); err != nil {
 		return nil, err
 	}
@@ -775,7 +947,7 @@ func (c *client) Upload(ctx context.Context, sandbox, path string, mode fs.FileM
 	if err != nil {
 		return c.result(ctx, runtime.OpUpload, err)
 	}
-	return c.result(ctx, runtime.OpUpload, c.sdk.Files().Upload(ctx, c.ws, sandbox, local, path))
+	return c.result(ctx, runtime.OpUpload, c.sdk.Files().Upload(ctx, c.ws, runtimeName(sandbox), local, path))
 }
 
 // Download downloads a file to a temporary file, because the SDK downloads
@@ -786,7 +958,7 @@ func (c *client) Download(ctx context.Context, sandbox, path string) (io.ReadClo
 		return nil, c.result(ctx, runtime.OpDownload, err)
 	}
 	local := filepath.Join(dir, "file")
-	if err := c.sdk.Files().Download(ctx, c.ws, sandbox, path, local); err != nil {
+	if err := c.sdk.Files().Download(ctx, c.ws, runtimeName(sandbox), path, local); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, c.result(ctx, runtime.OpDownload, err)
 	}

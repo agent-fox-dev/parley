@@ -33,12 +33,13 @@ type Backend struct {
 	// AddProposal, when not nil, adds a pending proposal to a sandbox of
 	// workspace and returns its id.
 	AddProposal func(workspace string, p runtime.Proposal) string
-	// EndpointsWithoutPaths says that the backend keeps a provider profile's
-	// endpoints without their paths, as the OpenShell implementation does
-	// because its SDK's endpoint has no path (a declared deviation). Get is
-	// then expected to return the installed profile with every endpoint's
-	// paths left out, and the rest of it unchanged.
-	EndpointsWithoutPaths bool
+	// EndpointsWithoutScheme says that the backend keeps a provider
+	// profile's endpoints without their scheme, as the OpenShell
+	// implementation does because its gateway takes an L7 protocol, which
+	// covers both schemes. Get is then expected to return the installed
+	// profile with every endpoint's scheme empty, and the rest of it
+	// unchanged.
+	EndpointsWithoutScheme bool
 }
 
 // The workspaces the contract's clients act in.
@@ -441,10 +442,10 @@ func contractProviderProfile(t *testing.T, b Backend) {
 	skipIfUnsupported(t, err, "GetProviderProfile")
 	require(t, err, "GetProviderProfile")
 	want := p
-	if b.EndpointsWithoutPaths {
+	if b.EndpointsWithoutScheme {
 		want.Endpoints = slices.Clone(p.Endpoints)
 		for i := range want.Endpoints {
-			want.Endpoints[i].Paths = nil
+			want.Endpoints[i].Scheme = ""
 		}
 	}
 	if !reflect.DeepEqual(got, want) {

@@ -119,12 +119,15 @@ number of `s`, `m`, `h` or `d`, so those values are usage errors; the tests
 poll through the CLI's own test seam and use `1s`. The behaviour of the
 waiting is the one the package specifies.
 
-## OpenShell SDK v0.1.8 cannot create a sandbox in a working directory
+## Against a real gateway, a sandbox runs without its main process
 
-The provisioning creates the runtime's sandbox in the working directory
+The provisioning creates the runtime's sandbox for the working directory
 `/workspace` with the profile's base document, and starts the main process
-with `RunMain`. The OpenShell implementation answers each of these
-`unsupported` with SDK v0.1.8 ([the errata of package
-44](44_sandbox_runtime_and_profiles.md)), so against a real gateway of that
-release every provisioning ends `failed` with `provision_failed`; the
-behaviour is tested against the in-memory runtime.
+with `RunMain`. The OpenShell implementation creates the sandbox with the
+directory writable and runs every command in it, which the image must hold
+([erratum 44](44_sandbox_runtime_and_profiles.md), design decision 19
+amended), but answers a base document and `RunMain` `unsupported` with SDK
+v0.1.9. Against a real gateway, a sandbox of a profile without a `policy`
+file and without a `command` is provisioned and becomes ready; one with
+either ends `failed` with `provision_failed`. The behaviour is tested
+against the in-memory runtime.

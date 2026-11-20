@@ -50,8 +50,11 @@ embedded SQLite stores and a directory of git repositories.
   `PARLEY_ACCEPTANCE_LARGE_REPO=1` (a 1 GiB repository),
   `PARLEY_ACCEPTANCE_REFERENCE_HOST=1` (the latency targets) and
   `PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL` with
-  `PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE` and
-  `PARLEY_ACCEPTANCE_SANDBOX_IMAGE` (the sandbox scenarios).
+  `PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE` or
+  `PARLEY_ACCEPTANCE_OPENSHELL_TLS_DIR` (mutual TLS) and
+  `PARLEY_ACCEPTANCE_SANDBOX_IMAGE` (the sandbox scenarios; see
+  [errata 55](docs/errata/55_acceptance_suite.md#gaps-tracked-as-issues) for
+  the image and a local gateway).
 - `go test ./test/perf/` with `PARLEY_PERF_URL` set measures the
   performance targets against a running hub (see
   [Performance](docs/performance.md)).

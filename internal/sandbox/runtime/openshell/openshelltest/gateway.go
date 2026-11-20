@@ -102,6 +102,10 @@ func (g *Gateway) SandboxSuspendResume() v1.SandboxSuspendResumeInterface {
 	return g.client().SandboxSuspendResume()
 }
 
+func (g *Gateway) SandboxLogsWatch() v1.SandboxLogsWatchInterface {
+	return g.client().SandboxLogsWatch()
+}
+
 // Providers is the in-memory client's providers, with the gateway's
 // provider profiles.
 func (g *Gateway) Providers() v1.ProviderInterface {
@@ -143,6 +147,11 @@ type profiles struct {
 }
 
 var _ v1.ProfileInterface = (*profiles)(nil)
+
+// WorkspaceScope is the scope the gateway reports for a profile imported
+// into a workspace; a profile added with AddProfile keeps the scope it is
+// given, empty or "platform" for one the gateway ships.
+const WorkspaceScope = "workspace"
 
 func (p *profiles) put(workspace string, pp v1.ProviderProfile) {
 	p.mu.Lock()
@@ -196,8 +205,9 @@ func (p *profiles) Get(_ context.Context, workspace, id string) (*v1.ProviderPro
 	return &pp, nil
 }
 
-// Import adds the profiles; one whose id the workspace holds already fails
-// the whole import as already existing.
+// Import adds the profiles, in the workspace's scope as the gateway does;
+// one whose id the workspace holds already fails the whole import as
+// already existing.
 func (p *profiles) Import(_ context.Context, workspace string, items []v1.ProfileImportItem) (*v1.ImportResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -210,6 +220,7 @@ func (p *profiles) Import(_ context.Context, workspace string, items []v1.Profil
 	for _, it := range items {
 		pp := copyProfile(it.Profile)
 		pp.ResourceVersion = 1
+		pp.Scope = WorkspaceScope
 		p.items[workspace+"/"+pp.ID] = pp
 		res.Profiles = append(res.Profiles, copyProfile(pp))
 	}
@@ -230,6 +241,7 @@ func (p *profiles) Update(_ context.Context, workspace, id string, version uint6
 	pp := copyProfile(item.Profile)
 	pp.ID = id
 	pp.ResourceVersion = version + 1
+	pp.Scope = WorkspaceScope
 	p.items[workspace+"/"+id] = pp
 	return &v1.UpdateResult{}, nil
 }

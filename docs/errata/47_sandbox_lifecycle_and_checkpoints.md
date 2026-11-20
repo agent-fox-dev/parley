@@ -67,12 +67,14 @@ The package returns a sandbox to `provisioning` while the runtime is
 `running`, `restarting` and `stopped`, and no reconnecting state, so the
 reconcile pass treats `restarting` as the pause and `running` as its end.
 
-## OpenShell SDK v0.1.8 cannot start a sandbox with a policy
+## The OpenShell SDK cannot start a sandbox with a policy
 
 The OpenShell implementation answers `StartSandbox` with a policy value or
 an environment `unsupported`
-([erratum 44](44_sandbox_runtime_and_profiles.md)). Against a gateway of that
-release, every start therefore ends `failed` with `provision_failed`. The
+([erratum 44](44_sandbox_runtime_and_profiles.md)); SDK v0.1.9 still has no
+start that takes either. Against a real gateway, every start therefore ends
+`failed` with `provision_failed`, and no checkpoint is written, because a
+checkpoint's exec sends input on stdin, which the SDK cannot carry. The
 behaviour is tested against the in-memory runtime.
 
 ## A checkpoint is held to the maximum push size

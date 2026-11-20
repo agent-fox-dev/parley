@@ -208,10 +208,6 @@ func TestClient_AnswersWhatTheSDKCannotDoAsUnsupportedWithoutCallingIt(t *testin
 			_, err := c.CreateSandbox(ctx, runtime.SandboxSpec{Name: "sb-1", Policy: runtime.Policy{Base: []byte("version: 1\n")}})
 			return err
 		},
-		runtime.OpCreateSandbox + " in a working directory": func() error {
-			_, err := c.CreateSandbox(ctx, runtime.SandboxSpec{Name: "sb-1", WorkDir: "/w"})
-			return err
-		},
 		runtime.OpStartSandbox + " with a policy value": func() error {
 			return c.StartSandbox(ctx, "sb-1", runtime.StartSpec{Policy: runtime.Policy{Added: []runtime.Rule{{Name: "r", Body: json.RawMessage(`{}`)}}}})
 		},
