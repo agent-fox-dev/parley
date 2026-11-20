@@ -26,6 +26,27 @@ environment files, branches are merged by whoever notices, and the trail of
 what an agent did is scattered across terminals.
 
 
+## Run it
+
+Parley is two programs: `parleyd`, the hub, and `parley`, its client. Build
+them with Go 1.27 (`go build ./cmd/...`). The hub needs `git` 2.38 or later
+on its `PATH` and refuses to start without it; it keeps its data in two
+embedded SQLite stores and a directory of git repositories.
+
+- `parleyd --admin-email you@example.com` bootstraps a new hub and writes an
+  admin token file; `parleyd` then serves on `0.0.0.0:8080` (see
+  [CLI](docs/cli.md#parleyd)).
+- `parleyd backup <directory>` writes a snapshot while the hub runs;
+  restoring is copying the snapshot into place.
+- `containers/hub/Dockerfile` builds the hub image (user 10001, its config
+  and data on the volume `/var/lib/parley`, port 8080),
+  `containers/sandbox/Dockerfile` a reference sandbox image, and
+  `deploy/kubernetes/` runs one hub on a persistent volume (see
+  [Architecture](docs/architecture.md#images-and-manifests)).
+- `go test ./test/perf/` with `PARLEY_PERF_URL` set measures the
+  performance targets against a running hub (see
+  [Performance](docs/performance.md)).
+
 ## Read more
 
 - [API reference](docs/api.md) — every route, what it answers and how it fails
