@@ -202,40 +202,44 @@ func TestHeaders_SetCacheControlByRoute(t *testing.T) {
 
 func TestAccessLog_WritesOneLinePerRequestWithoutTheQuery(t *testing.T) {
 	t.Parallel()
-	var logs logBuffer
-	h := headersServer(Options{Logger: logs.logger()})
+	for _, tc := range []struct {
+		target, path string
+		status       int
+	}{
+		{"/api/v1/nope", "/api/v1/nope", http.StatusNotFound},
+		{"/api/v1/none?a=b", "/api/v1/none", http.StatusNotFound},
+		{"/version", "/version", http.StatusOK},
+		{"/version?token=s3cr3t&x=1", "/version", http.StatusOK},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			t.Parallel()
+			var logs logBuffer
+			h := headersServer(Options{Logger: logs.logger()})
 
-	rec := do(h, newRequest(http.MethodGet, "/api/v1/nope", nil, ""))
-	lines := logs.lines()
-	if len(lines) != 1 {
-		t.Fatalf("logged %d lines, want 1: %q", len(lines), lines)
-	}
-	line := decodeLine(t, lines[0])
-	want := map[string]any{
-		"method":     "GET",
-		"path":       "/api/v1/nope",
-		"status":     float64(http.StatusNotFound),
-		"request_id": rec.Header().Get("X-Request-ID"),
-	}
-	for name, v := range want {
-		if line[name] != v {
-			t.Errorf("%s = %v, want %v (line %s)", name, line[name], v, lines[0])
-		}
-	}
-	if d, ok := line["duration_ms"].(float64); !ok || d < 0 {
-		t.Errorf("duration_ms = %v, want a non-negative number", line["duration_ms"])
-	}
-
-	do(h, newRequest(http.MethodGet, "/api/v1/nope?token=s3cr3t&x=1", nil, ""))
-	lines = logs.lines()
-	if len(lines) != 2 {
-		t.Fatalf("logged %d lines after the second request, want 2: %q", len(lines), lines)
-	}
-	if got := decodeLine(t, lines[1])["path"]; got != "/api/v1/nope" {
-		t.Errorf("path = %v, want /api/v1/nope", got)
-	}
-	if strings.ContainsAny(lines[1], "?") || strings.Contains(lines[1], "s3cr3t") {
-		t.Errorf("line %s holds the query string", lines[1])
+			rec := do(h, newRequest(http.MethodGet, tc.target, nil, ""))
+			lines := logs.lines()
+			if len(lines) != 1 {
+				t.Fatalf("logged %d lines, want 1: %q", len(lines), lines)
+			}
+			line := decodeLine(t, lines[0])
+			want := map[string]any{
+				"method":     "GET",
+				"path":       tc.path,
+				"status":     float64(tc.status),
+				"request_id": rec.Header().Get("X-Request-ID"),
+			}
+			for name, v := range want {
+				if line[name] != v {
+					t.Errorf("%s = %v, want %v (line %s)", name, line[name], v, lines[0])
+				}
+			}
+			if d, ok := line["duration_ms"].(float64); !ok || d < 0 {
+				t.Errorf("duration_ms = %v, want a non-negative number", line["duration_ms"])
+			}
+			if strings.Contains(lines[0], "?") || strings.Contains(lines[0], "s3cr3t") {
+				t.Errorf("line %s holds the query string", lines[0])
+			}
+		})
 	}
 }
 
