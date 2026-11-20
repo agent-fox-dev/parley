@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -46,15 +47,26 @@ func status(t *testing.T, url string) int {
 // trimmed output.
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	out, err := runGit(dir, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// runGit runs git in dir as git does and returns its trimmed output, or an
+// error that holds the output; it is git for a goroutine, which cannot fail
+// the test itself.
+func runGit(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = append(os.Environ(),
 		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1",
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@x", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@x")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		return "", fmt.Errorf("git %v in %s: %w\n%s", args, dir, err, out)
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(string(out)), nil
 }
 
 // The test sends SIGTERM to its own process, which would stop every hub of
