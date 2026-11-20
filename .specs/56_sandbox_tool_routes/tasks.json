@@ -1,0 +1,202 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "56",
+  "spec_name": "sandbox_tool_routes",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/sandbox/... ./internal/hub/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "44",
+      "reason": "uses the profiles and their validation, the profile list, the runtime client with Exec, ExecStream and Upload and its fake, the [sandbox] limits, the route declaration with the feature check, the no-widening decision and the runtime-error answer"
+    },
+    {
+      "spec": "45",
+      "reason": "uses the sandbox record with the snapshot of its profile, the sandbox object and the function that scrubs a text of a sandbox's secret values"
+    },
+    {
+      "spec": "46",
+      "reason": "adds its routes to the gate of the routes that use a sandbox, shares the count of concurrent execs with exec, runs a call as the collected exec runs a command, and records activity as it does"
+    },
+    {
+      "spec": "47",
+      "reason": "relies on the transitions out of and back into ready, after which the tool definitions are read again, and on the checkpoint of the working directory, which the scratch directory stays out of"
+    },
+    {
+      "spec": "52",
+      "reason": "emits parley.sandbox.tool_call through the event component, with the workspace's visibility"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Let a profile name its tool server and show tools on profiles and sandboxes",
+      "criteria": [
+        "REQ-1"
+      ],
+      "steps": [
+        "Add the task's behaviours to the profile, profile list, create, object and store tests named in the checks and confirm they fail",
+        "Add the key tool_server to the keys a [[sandbox.profiles]] table may hold and to Profile: a string, empty by default, which names no tool server",
+        "Refuse a value that is not an absolute path or is longer than 256 bytes with a failure naming the profile and the key, as the other profile keys are refused",
+        "Show the boolean tools on each item of GET /sandbox-profiles, true exactly when the profile names a tool server; the path itself is never shown",
+        "Keep the path in the snapshot of the profile a create stores, under a JSON member an older snapshot does not have, so that a sandbox stored before reads back without a tool server",
+        "Show the boolean tools on the sandbox object, from the snapshot, in every response that shows a sandbox",
+        "Describe tool_server in docs/configuration.md and the member tools of the profile item and the sandbox object in docs/api.md"
+      ],
+      "touches": [
+        "internal/sandbox/profile.go",
+        "internal/sandbox/profile_test.go",
+        "internal/sandbox/routes.go",
+        "internal/sandbox/routes_test.go",
+        "internal/sandbox/record.go",
+        "internal/sandbox/create.go",
+        "internal/sandbox/create_test.go",
+        "internal/sandbox/object.go",
+        "internal/sandbox/object_test.go",
+        "internal/sandbox/store_test.go",
+        "docs/configuration.md",
+        "docs/api.md"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Gate the tool routes, decide the caller's set and list its tools",
+      "criteria": [
+        "REQ-2",
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3",
+        "REQ-4.6"
+      ],
+      "steps": [
+        "Add a stand-in tool server to internal/sandbox/runtime/runtimetest: an ExecFunc for Fake.SetExec that answers `<path> tools [--read-only]` and `<path> call --request <file> …` with what agentkit-tools prints (thirteen definitions, nine under --read-only, one of them without an output schema), reads the request file the hub uploaded, and lets a test replace its answer, its exit code and how long it runs; commands that are not the tool server's fall through to the function a test had set",
+        "Add the listing's behaviours to internal/sandbox/tools_test.go and its rows to the tables of internal/sandbox/use_test.go, for GET …/tools, and confirm they fail",
+        "Declare GET /workspaces/:slug/sandboxes/:id/tools as an entry of the table of the routes that use a sandbox: of the read kind, served in state ready only, without the no-widening refusal",
+        "Give the gate one more check, used by the tool entries, after the sandbox is found and before the body is read: a sandbox whose snapshot names no tool server is answered 404 tools_unavailable",
+        "Decide the caller's set per request: full when a PAT holds sandboxes:write by the hub's scope check, the access decision's level allows writing, and Covers reports that the caller covers the sandbox's hub credential; read_only otherwise. The admin token and an API key pass the scope part",
+        "Read a set's definitions by running `<tool_server> tools`, with --read-only for the read-only set, through the runtime's Exec in /workspace with no standard input, and parse its standard output as one JSON array of {name, description, input_schema, output_schema}, each with a non-empty name and an input_schema that is an object",
+        "Keep the definitions in memory per sandbox id and set while the sandbox stays ready, and drop them when a transition takes it out of ready; nothing is kept from a failed read",
+        "Answer the listing 200 with the set and the definitions in the tool server's order, output_schema null where the tool has none",
+        "Answer a tool server that cannot be started, exits with a status other than 0, prints anything else or prints more than 4 MiB with 502 tool_server_failed, its message passed through the sandbox's scrubbing function, which cuts it to 1,024 bytes, and then the hub's scrubber; a runtime failure is the runtime-error answer the gate already gives. This task covers the listing's rows of that table",
+        "A listing starts no activity: it does not touch last_activity_at, takes no place among the concurrent execs, and is not told to the observers",
+        "Describe the route, the two sets and the error types tools_unavailable and tool_server_failed in docs/api.md"
+      ],
+      "touches": [
+        "internal/sandbox/tools.go",
+        "internal/sandbox/tools_test.go",
+        "internal/sandbox/use.go",
+        "internal/sandbox/use_test.go",
+        "internal/sandbox/helpers_test.go",
+        "internal/sandbox/runtime/runtimetest/",
+        "docs/api.md"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Run a tool call in the sandbox and serve it over REST",
+      "criteria": [
+        "REQ-2",
+        "REQ-3.4",
+        "REQ-3.5",
+        "REQ-3.6",
+        "REQ-3.7",
+        "REQ-3.8",
+        "REQ-4.1",
+        "REQ-4.2",
+        "REQ-4.3",
+        "REQ-4.4",
+        "REQ-4.5",
+        "REQ-4.6",
+        "REQ-4.7"
+      ],
+      "steps": [
+        "Add the call's behaviours to internal/sandbox/tools_call_test.go and internal/sandbox/activity_test.go, and the rows of POST …/tools/:name to the tables of internal/sandbox/tools_test.go and internal/sandbox/use_test.go, and confirm they fail",
+        "Declare POST /workspaces/:slug/sandboxes/:id/tools/:name as a tool entry of the gate, of the read kind, in state ready only, with a body limit of 8 MiB",
+        "Validate the body before the state check: absent or a JSON object whose input, when present, is a JSON object and whose timeout, when present, is a positive duration of the hub's duration grammar; 400 invalid_request naming the member otherwise. An input over 4 MiB as JSON is 413 payload_too_large",
+        "After the state check, look the name up in the caller's definitions: a name of the full set that the caller's set lacks is 403 insufficient_scope, a name of neither is 404 tool_not_found naming it. Reading the full set's definitions for a caller with the read-only set runs `<tool_server> tools` once, as a listing would",
+        "Write one function that makes a call for both routes, given the sandbox, the set, the tool, the input and the bound, and returns either the tool's result or a failed call. The bound is the route's default or the request's timeout, cut to [sandbox].max_exec_timeout",
+        "In it, take a place in the counter the exec route counts in, and refuse with the limit's refusal when none is left; give the place back when the call ends, however it ends",
+        "Upload {\"name\", \"input\"} to /tmp/parley-tools/requests/<32 hex characters from crypto/rand>.json with mode 0600, then run the tool server's call command through ExecStream in /workspace with no standard input and no environment, collecting standard output up to 4 MiB and one more byte, under a timer of the bound on the hub's timers, as the collected exec does",
+        "Take a standard output that is one JSON object with a boolean ok as the tool's result, whatever ok says. Exit status other than 0, any other output, more than 4 MiB, or a command that could not be started is a failed call, tool_server_failed, with the scrubbed message of the listing; a runtime failure is sandbox_runtime_error",
+        "When the timer fires, end the command's context and return the result {ok: false, error: \"timeout\", data: {}}",
+        "After the command ended, remove the request file with the runtime's Exec of rm -f on it, under a context the caller's leaving does not end; log a failed removal as a warning with the sandbox id and change nothing else",
+        "Record the call's start and its end as activity of the sandbox with the touch the exec route uses; a call is not an exec operation, so the observers are not told and parley_sandbox_exec_total does not count it",
+        "Answer the REST call 200 with ok, data, error, detail, text where the tool server gave them, and duration_ms on the hub's clock; describe the route and tool_not_found in docs/api.md"
+      ],
+      "touches": [
+        "internal/sandbox/tools_call.go",
+        "internal/sandbox/tools_call_test.go",
+        "internal/sandbox/tools.go",
+        "internal/sandbox/tools_test.go",
+        "internal/sandbox/exec.go",
+        "internal/sandbox/activity.go",
+        "internal/sandbox/activity_test.go",
+        "internal/sandbox/use.go",
+        "internal/sandbox/use_test.go",
+        "docs/api.md"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Serve the tools as a stateless MCP server on the sandbox's mcp route",
+      "criteria": [
+        "REQ-2",
+        "REQ-5"
+      ],
+      "steps": [
+        "Add github.com/modelcontextprotocol/go-sdk v1.8.0 to go.mod as a direct requirement, and confirm the signatures the package lists against the module before using them",
+        "Add the MCP behaviours to internal/sandbox/tools_mcp_test.go and the rows of POST …/mcp to the tables of internal/sandbox/tools_test.go and internal/sandbox/use_test.go, sending JSON-RPC messages as plain HTTP requests, and confirm they fail",
+        "Declare POST, GET and DELETE /workspaces/:slug/sandboxes/:id/mcp as tool entries of the gate, of the read kind, in state ready only, with a body limit of 8 MiB whose refusal is the hub's 413; GET and DELETE answer 405 once the gate's checks passed",
+        "Behind the gate, hand the request to the SDK's streamable HTTP handler in stateless mode with JSON responses and a body limit that does not refuse before the hub's does. Its server is built for this request: name parley, the hub's version as GET /version reports it, instructions of one sentence naming the workspace slug and the sandbox id, and a tools capability without list-changed",
+        "Add to that server each definition of the caller's set with Server.AddTool: name, description, the input schema and, where the tool has one, the output schema, as the raw JSON the tool server gave",
+        "Each tool's handler makes the call through the function of the REST route with via mcp and a bound of 10 minutes, with absent arguments as {}, and returns a result whose IsError is the negation of ok, whose one text content is the tool server's text, or else the JSON of data for a success and `<error>: <detail>` for a failure, and whose StructuredContent is data when the tool has an output schema",
+        "Return a JSON-RPC error from the handler for what is not a tool result: code -32603 with the scrubbed message for a failed call, code -32000 with the message \"sandbox busy\" for the limit, code -32602 naming the limit for arguments over 4 MiB as JSON. A tool outside the caller's set is not on the request's server, so the SDK answers -32602 naming it; make the message name the tool for an unknown one too",
+        "Make every method other than initialize, ping, tools/list, tools/call and the client's notifications answer -32601, with receiving middleware on the server where the SDK would answer one of them otherwise",
+        "Describe the MCP route, what it serves and its errors in docs/api.md, and how the hub relays a tool call into the sandbox in docs/architecture.md"
+      ],
+      "touches": [
+        "internal/sandbox/tools_mcp.go",
+        "internal/sandbox/tools_mcp_test.go",
+        "internal/sandbox/tools.go",
+        "internal/sandbox/tools_test.go",
+        "internal/sandbox/use.go",
+        "internal/sandbox/use_test.go",
+        "go.mod",
+        "go.sum",
+        "docs/api.md",
+        "docs/architecture.md"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Record every started tool call as one event and in two metrics",
+      "criteria": [
+        "REQ-6",
+        "REQ-4.8"
+      ],
+      "steps": [
+        "Add the event and metric behaviours to internal/sandbox/tools_call_test.go and internal/sandbox/metrics_test.go and confirm they fail",
+        "When a call that took its place and began its upload ends, emit parley.sandbox.tool_call through the event component in a transaction of its own, under a context the caller's leaving does not end: resource sandbox with the sandbox id, the workspace, the caller as actor as the other sandbox events name it, the sandbox's session_id, and the metadata tool, ok, error when ok is false, duration_ms, via and set",
+        "Set error to the tool's error code for a result with ok false, timeout for a call that outlasted its bound, and tool_server_failed or sandbox_runtime_error for a failed call. Build the metadata from those six values only, so that no argument and no part of a result can reach it",
+        "A failure to write the event is logged and changes nothing about the call's answer",
+        "Count the call in parley_sandbox_tool_calls_total under tool and outcome (ok, tool_error, timeout, failed) and observe its duration in seconds in parley_sandbox_tool_call_duration_seconds under tool, through the service's recorder; add both to the catalogue of the hub's metrics beside parley_sandbox_exec_total, so that GET /metrics shows them",
+        "When the caller of a running call leaves or the hub begins to stop, kill the tool server as the exec route kills a command, drop the connection without an answer, still remove the request file and give the place back, and record the call with ok false, error tool_server_failed and the outcome failed",
+        "A request refused before the upload, and a listing over either route, emits nothing and counts nothing",
+        "Describe the event type and the two metrics in docs/api.md beside the other sandbox events and metrics"
+      ],
+      "touches": [
+        "internal/sandbox/tools_call.go",
+        "internal/sandbox/tools_call_test.go",
+        "internal/sandbox/tools_mcp.go",
+        "internal/sandbox/metrics.go",
+        "internal/sandbox/metrics_test.go",
+        "internal/metrics/catalogue.go",
+        "test/e2e/sandbox_use_test.go",
+        "docs/api.md"
+      ]
+    }
+  ]
+}
