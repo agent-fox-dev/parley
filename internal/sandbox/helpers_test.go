@@ -2410,6 +2410,7 @@ var useRoutes = []useRoute{
 	{"logs", http.MethodGet, "logs", false},
 	{"attach", http.MethodGet, "attach", true},
 	{"tools", http.MethodGet, "tools", false},
+	{"tool", http.MethodPost, "tools/read_file", false},
 }
 
 // toolRoutes are the routes of useRoutes that serve a sandbox's tools.
@@ -2713,6 +2714,113 @@ func (h *toolsHub) list(t *testing.T, id, cred string) (answer, toolList) {
 		}
 	}
 	return a, l
+}
+
+// toolPath is the path of the call route of the tool name of the sandbox id
+// of ws.
+func toolPath(id, name string) string { return sandboxPath("ws", id) + "/tools/" + name }
+
+// tool sends POST …/tools/<name> for the sandbox id of ws with cred and
+// body, and reads the answer with its headers.
+func (h *toolsHub) tool(t *testing.T, id, cred, name string, body any) answer {
+	t.Helper()
+	var a answer
+	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+toolPath(id, name), cred, body, nil)
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
+	return a
+}
+
+// sending sends method path, under /api/v1, with cred and the JSON body
+// under ctx, from another goroutine, and delivers the answer on the channel
+// it returns: with status 0 when the request got none.
+func (h *toolsHub) sending(ctx context.Context, method, path, cred string, body any) <-chan answer {
+	out := make(chan answer, 1)
+	// A nil body sends none, as hubtest's Call does.
+	var raw []byte
+	if body != nil {
+		raw, _ = json.Marshal(body)
+	}
+	go func() {
+		var a answer
+		defer func() { out <- a }()
+		req, err := http.NewRequestWithContext(ctx, method, h.URL("/api/v1"+path), bytes.NewReader(raw))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
+		var env struct {
+			Error *json.RawMessage `json:"error"`
+		}
+		if json.Unmarshal(b, &env) == nil && env.Error != nil {
+			_ = json.Unmarshal(*env.Error, &a.err)
+		}
+	}()
+	return out
+}
+
+// held makes the stand-in's calls wait until release is called or they are
+// killed, and returns release, a count of the calls waiting and a count of
+// those whose context ended while they waited.
+func (h *toolsHub) held() (release func(), waiting, killed *atomic.Int64) {
+	gate := make(chan struct{})
+	var once sync.Once
+	waiting, killed = &atomic.Int64{}, &atomic.Int64{}
+	h.tools.SetCall(func(ctx context.Context, _ runtimetest.ToolCall, stdout, _ io.Writer) int {
+		waiting.Add(1)
+		defer waiting.Add(-1)
+		select {
+		case <-gate:
+			_, _ = io.WriteString(stdout, `{"ok":true,"data":{}}`)
+			return 0
+		case <-ctx.Done():
+			killed.Add(1)
+			return 137
+		}
+	})
+	return func() { once.Do(func() { close(gate) }) }, waiting, killed
+}
+
+// printing is an answer of the stand-in's call form that prints stdout and
+// stderr and exits with code.
+func printing(stdout, stderr string, code int) func(context.Context, runtimetest.ToolCall, io.Writer, io.Writer) int {
+	return func(_ context.Context, _ runtimetest.ToolCall, out, errOut io.Writer) int {
+		_, _ = io.WriteString(out, stdout)
+		_, _ = io.WriteString(errOut, stderr)
+		return code
+	}
+}
+
+// requestFiles are the request files left in the sandbox id.
+func (h *toolsHub) requestFiles(id string) []string {
+	return h.rt.SandboxFiles(id, "/tmp/parley-tools/requests")
+}
+
+// opsOf counts the calls of the operation op the runtime got for the
+// sandbox id.
+func (h *toolsHub) opsOf(op, id string) int {
+	n := 0
+	for _, c := range h.rt.Calls() {
+		if c.Op == op && c.Target == id {
+			n++
+		}
+	}
+	return n
 }
 
 // definitionNames are the names of the stand-in's tools, in its order.

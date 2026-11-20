@@ -26,6 +26,7 @@ const (
 	useLogs     = "logs"
 	useAttach   = "attach"
 	useTools    = "tools"
+	useToolCall = "tool"
 )
 
 // execBodyLimit is the body limit of exec: 4 MiB of stdin fits in it as
@@ -49,6 +50,9 @@ type useRequest struct {
 	logs logsRequest
 	// attach is the query of an attach, as its validation read it.
 	attach attachRequest
+	// tool is the body of a tool call over REST, as its validation read
+	// it.
+	tool toolRequest
 	// set is the caller's tool set, on a route that serves the sandbox's
 	// tools.
 	set string
@@ -96,6 +100,7 @@ type useEntry struct {
 // useTable is the table of the routes that use a sandbox.
 func (s *Service) useTable() []*useEntry {
 	exec := newExecutor(s)
+	tools := &toolCaller{s: s, x: exec}
 	return []*useEntry{
 		{
 			name: useExec, method: http.MethodPost, segment: "exec", kind: KindWrite, covers: true,
@@ -121,11 +126,16 @@ func (s *Service) useTable() []*useEntry {
 			name: useTools, method: http.MethodGet, segment: "tools", kind: KindRead, tools: true,
 			states: []string{StateReady}, operate: s.listTools,
 		},
+		{
+			name: useToolCall, method: http.MethodPost, segment: "tools/:name", kind: KindRead, tools: true,
+			states: []string{StateReady}, maxBody: toolBodyLimit, validate: tools.validate, operate: tools.serve,
+		},
 	}
 }
 
 // UseRoutes declares the routes that use a sandbox: POST …/exec, PUT and
-// GET …/files, GET …/logs, GET …/attach and GET …/tools under
+// GET …/files, GET …/logs, GET …/attach, GET …/tools and POST …/tools/:name
+// under
 // /workspaces/:slug/sandboxes/:id. Each is a workspace route of its kind,
 // so that the pipeline runs the feature check, the binding guard, the PAT
 // scope and the workspace access before its handler, the gate (see gate).

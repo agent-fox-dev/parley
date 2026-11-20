@@ -3,7 +3,7 @@
   "spec_id": "56",
   "spec_name": "sandbox_tool_routes",
   "schema_version": 3,
-  "updated_at": "2026-11-20T14:30:58Z",
+  "updated_at": "2026-11-20T14:44:39Z",
   "tasks": [
     {
       "id": 1,
@@ -293,7 +293,320 @@
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-2.1",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RefusesAToolOutsideTheCallersSet",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.2",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RefusesAToolOutsideTheCallersSet",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.3",
+          "no_red": "the gate answers this for every entry of its table, so the route's entry alone, which the gate's tests need declared to run, already delivers it",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestTools_RefuseACallerTheLogsRouteRefusesTheSameWay",
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.4",
+          "no_red": "the gate answers this for every entry of its table, so the route's entry alone, which the gate's tests need declared to run, already delivers it",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestTools_AnswerASandboxTheWorkspaceDoesNotHaveNotFound",
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.5",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestTools_AreUnavailableOnASandboxWithoutAToolServer",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.6",
+          "no_red": "the gate answers this for every entry of its table, so the route's entry alone, which the gate's tests need declared to run, already delivers it",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestUseRoutes_AnswerDisabledWhileSandboxesAreOff",
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.7",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestUseRoutes_RefuseASandboxInAStateTheRouteDoesNotAllow",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-2.8",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_AnswersTheFirstCheckARequestFails",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RunsTheToolServerOnAnUploadedRequestAndAnswersItsResult",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.5",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RefusesABodyThatIsNotACall",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.6",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RefusesAToolOutsideTheCallersSet",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.7",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RefusesAToolOutsideTheCallersSet",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-3.8",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RefusesAnInputOverFourMebibytes",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.1",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RunsTheToolServerOnAnUploadedRequestAndAnswersItsResult",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_RemovesItsRequestFileHoweverItEnds",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_GivesAToolsFailureAsItsResult",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_EndsACallThatOutlastsItsBound",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_CountsAmongTheSandboxesCommands",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.6",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestToolCall_FailsWhenTheToolServerOrTheRuntimeDoes",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.7",
+          "tests": [
+            {
+              "test": "./internal/sandbox:TestActivity_RecordsAToolCallWhenItStartsAndWhenItEnds",
+              "failed": {
+                "at": "2026-11-20T14:33:40Z",
+                "tree": "3b3aca38a2db5f5d990465a1c67cc76191de4f98"
+              },
+              "passed": {
+                "at": "2026-11-20T14:44:37Z",
+                "tree": "6e155d75e08e3d896dc95f12c58157bbb42213c0"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,
