@@ -12,20 +12,30 @@ import (
 // scenario's own deadline.
 const cleanupWait = 30 * time.Second
 
-// created records what a scenario created on the hub: the API paths whose
-// DELETE removes a fork or a sandbox, and the connections it holds open.
+// created records what a scenario created on the hub: the requests that
+// undo it (the DELETE of a fork or a sandbox, the abandon of a change),
+// and the connections it holds open.
 type created struct {
 	mu      sync.Mutex
-	deletes []string
+	undos   []undo
 	closers []func()
 }
 
+// undo is a request, without a body, to a path below the REST API's mount.
+type undo struct{ method, path string }
+
 // remove records that path, below the REST API's mount, is deleted when
 // the scenario ends.
-func (c *created) remove(path string) {
+func (c *created) remove(path string) { c.add(undo{http.MethodDelete, path}) }
+
+// post records that path, below the REST API's mount, is sent a POST
+// without a body when the scenario ends.
+func (c *created) post(path string) { c.add(undo{http.MethodPost, path}) }
+
+func (c *created) add(u undo) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.deletes = append(c.deletes, path)
+	c.undos = append(c.undos, u)
 }
 
 // close records that fn, which closes a connection the scenario opened, is
@@ -36,22 +46,22 @@ func (c *created) close(fn func()) {
 	c.closers = append(c.closers, fn)
 }
 
-// cleanUp closes the connections, then deletes what was created, the last
+// cleanUp closes the connections, then undoes what was created, the last
 // first, each request bounded by cleanupWait and outliving ctx's
-// cancellation. It returns a line for each deletion that failed, naming
+// cancellation. It returns a line for each request that failed, naming
 // its method, path and status.
 func (c *created) cleanUp(ctx context.Context, cl *client) []string {
 	c.mu.Lock()
-	deletes, closers := c.deletes, c.closers
-	c.deletes, c.closers = nil, nil
+	undos, closers := c.undos, c.closers
+	c.undos, c.closers = nil, nil
 	c.mu.Unlock()
 	for _, fn := range slices.Backward(closers) {
 		fn()
 	}
 	var failed []string
-	for _, path := range slices.Backward(deletes) {
+	for _, u := range slices.Backward(undos) {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
-		_, err := cl.do(rctx, http.MethodDelete, path, nil)
+		_, err := cl.do(rctx, u.method, u.path, nil)
 		cancel()
 		if err != nil {
 			failed = append(failed, cl.detail(err.Error()))

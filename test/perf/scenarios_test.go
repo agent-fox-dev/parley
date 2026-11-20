@@ -71,8 +71,9 @@ func TestRun_TimesEachRequestOfTheRequestDurationScenarios(t *testing.T) {
 				t.Errorf("commit %d of commit_create holds %d operations in %s, want 100 in the scenario's fork", i, len(c.paths), c.workspace)
 			}
 		}
-		if got := s.sandboxProfiles(); !slices.Equal(got, []string{"agent"}) {
-			t.Errorf("sandbox creations named %q, want one naming agent", got)
+		// sandbox_ready creates five, sandbox_exec one.
+		if got := s.sandboxProfiles(); !slices.Equal(got, slices.Repeat([]string{"agent"}, 6)) {
+			t.Errorf("sandbox creations named %q, want six naming agent", got)
 		}
 		if u := s.unauthorizedRequests(); len(u) > 0 {
 			t.Errorf("requests without the bearer token: %q", u)
@@ -186,37 +187,38 @@ func TestRun_MeasuresMergeabilityAndEventLatency(t *testing.T) {
 	})
 }
 
-func TestRun_RemovesWhatItCreatedAndKeepsToItsOwnTargetBranch(t *testing.T) {
-	t.Parallel()
-	// check asserts what holds after any run: nothing the run created is
-	// left, and every change and branch it made is its own.
-	check := func(t *testing.T, s *stub, rep perf.Report) {
-		t.Helper()
-		// A stream the harness closed ends on the stub when it reads the
-		// closed connection, a moment later.
-		for deadline := time.Now().Add(2 * time.Second); s.openStreams() > 0 && time.Now().Before(deadline); {
-			time.Sleep(5 * time.Millisecond)
-		}
-		if f, sb, st := s.liveForks(), s.liveSandboxes(), s.openStreams(); f != 0 || sb != 0 || st != 0 {
-			t.Errorf("after the run %d forks, %d sandboxes and %d streams are left, want none", f, sb, st)
-		}
-		target := "perf/" + rep.RunID
-		for _, got := range s.changeTargets() {
-			if got != target {
-				t.Errorf("a change targets %q, want %q", got, target)
-			}
-		}
-		for _, got := range s.createdRefs() {
-			if got != target {
-				t.Errorf("the run created the branch %q, want only %q", got, target)
-			}
-		}
-		for _, c := range s.allCommits() {
-			if c.branch == stubDefaultBranch || c.branch == target {
-				t.Errorf("a commit was sent to %s of %s", c.branch, c.workspace)
-			}
+// check asserts what holds after any run: nothing the run created is
+// left, and every change and branch it made is its own.
+func check(t *testing.T, s *stub, rep perf.Report) {
+	t.Helper()
+	// A stream the harness closed ends on the stub when it reads the
+	// closed connection, a moment later.
+	for deadline := time.Now().Add(2 * time.Second); s.openStreams() > 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if f, sb, st := s.liveForks(), s.liveSandboxes(), s.openStreams(); f != 0 || sb != 0 || st != 0 {
+		t.Errorf("after the run %d forks, %d sandboxes and %d streams are left, want none", f, sb, st)
+	}
+	target := "perf/" + rep.RunID
+	for _, got := range s.changeTargets() {
+		if got != target {
+			t.Errorf("a change targets %q, want %q", got, target)
 		}
 	}
+	for _, got := range s.createdRefs() {
+		if got != target {
+			t.Errorf("the run created the branch %q, want only %q", got, target)
+		}
+	}
+	for _, c := range s.allCommits() {
+		if c.branch == stubDefaultBranch || c.branch == target {
+			t.Errorf("a commit was sent to %s of %s", c.branch, c.workspace)
+		}
+	}
+}
+
+func TestRun_RemovesWhatItCreatedAndKeepsToItsOwnTargetBranch(t *testing.T) {
+	t.Parallel()
 	t.Run("every request succeeds", func(t *testing.T) {
 		t.Parallel()
 		s := newStub(t, nil)
@@ -259,5 +261,90 @@ func TestRun_RemovesWhatItCreatedAndKeepsToItsOwnTargetBranch(t *testing.T) {
 		if r := result(t, rep, "fork_create"); r.Status != perf.Met {
 			t.Errorf("fork_create = %+v, want met", r)
 		}
+	})
+}
+
+func TestRun_CountsWhatExistsAtOnceUntilTheCountOrTheHubsRefusal(t *testing.T) {
+	t.Parallel()
+	s := newStubWith(t, stubOptions{forkLimit: 200, sandboxLimit: 20}, nil)
+	cfg := s.config(t)
+	cfg.Capacity, cfg.SandboxProfile, cfg.Workspaces = true, "agent", []string{"w1", "w2"}
+	rep := run(t, cfg)
+
+	count := func(v float64) perf.Target { return perf.Target{Comparison: perf.GE, Value: v, Unit: "count"} }
+	f := result(t, rep, "active_forks")
+	if f.Measured == nil || *f.Measured != 400 || f.Status != perf.Missed || f.Target != count(5000) ||
+		!strings.Contains(f.Detail, stubForkLimit) {
+		t.Errorf("active_forks = %+v, want 400 missed against 5000, its detail naming %s", f, stubForkLimit)
+	}
+	// Each workspace was asked once more than it accepted, after the
+	// forks of the latency scenarios were deleted.
+	for _, slug := range []string{"w1", "w2"} {
+		if n := s.count("POST /api/v1/workspaces/" + slug + "/forks"); n < 201 {
+			t.Errorf("%d fork creations in %s, want the 200 it accepts and its refusal", n, slug)
+		}
+	}
+
+	if m := checkResult(t, rep, "open_changes", 2000, count(2000), perf.Met); m != 2000 {
+		t.Errorf("open_changes measured %v, want 2000", m)
+	}
+	if opened, open := s.changesOf("open_changes"); opened != 2000 || open != 0 {
+		t.Errorf("open_changes opened %d changes and left %d open, want 2000 and none", opened, open)
+	}
+
+	if m := checkResult(t, rep, "event_streams", 500, count(500), perf.Met); m != 500 {
+		t.Errorf("event_streams measured %v, want 500", m)
+	}
+	if n := s.mostStreams(); n != 500 {
+		t.Errorf("at most %d event streams were open at once, want 500", n)
+	}
+
+	sb := result(t, rep, "sandboxes_running")
+	if sb.Measured == nil || *sb.Measured != 20 || sb.Status != perf.Missed || sb.Target != count(200) ||
+		!strings.Contains(sb.Detail, "sandbox_capacity") {
+		t.Errorf("sandboxes_running = %+v, want 20 missed against 200, its detail naming sandbox_capacity", sb)
+	}
+
+	check(t, s, rep)
+	if len(rep.CleanupErrors) != 0 {
+		t.Errorf("cleanup_errors = %q, want none", rep.CleanupErrors)
+	}
+	if u := s.unauthorizedRequests(); len(u) > 0 {
+		t.Errorf("requests without the bearer token: %q", u)
+	}
+}
+
+func TestRun_MeasuresHowLongASandboxTakesToBeReady(t *testing.T) {
+	t.Parallel()
+	ready := perf.Target{Comparison: perf.LE, Value: 60, Unit: "s"}
+	t.Run("every sandbox gets ready", func(t *testing.T) {
+		t.Parallel()
+		s := newStubWith(t, stubOptions{provisioning: 300 * time.Millisecond}, nil)
+		cfg := s.config(t)
+		cfg.SandboxProfile = "agent"
+		rep := run(t, cfg)
+		if m := checkResult(t, rep, "sandbox_ready", 5, ready, perf.Met); m < 0.3 || m >= 5 {
+			t.Errorf("sandbox_ready measured %v s, want from 0.3 to 5", m)
+		}
+		for i, p := range s.sandboxProfiles() {
+			if p != "agent" {
+				t.Errorf("sandbox creation %d named profile %q, want agent", i+1, p)
+			}
+		}
+		check(t, s, rep)
+	})
+	t.Run("the third sandbox fails", func(t *testing.T) {
+		t.Parallel()
+		s := newStubWith(t, stubOptions{failSandbox: 3}, nil)
+		cfg := s.config(t)
+		cfg.SandboxProfile = "agent"
+		rep := run(t, cfg)
+		if r := result(t, rep, "sandbox_ready"); r.Status != perf.Error || r.Measured != nil || !strings.Contains(r.Detail, "image_pull") {
+			t.Errorf("sandbox_ready = %+v, want error naming the state_reason image_pull", r)
+		}
+		if n := s.createdSandboxes(); n != 4 {
+			t.Errorf("%d sandboxes were created, want three of sandbox_ready and one of sandbox_exec", n)
+		}
+		check(t, s, rep)
 	})
 }

@@ -74,11 +74,12 @@ func scenarios() []scenario {
 		{name: "land_concurrency", target: Target{LE, 0, "count"}, body: landConcurrency},
 		{name: "mergeability", target: Target{LE, 60, "s"}, body: mergeability},
 		{name: "event_latency", target: Target{LE, 1000, "ms"}, body: eventLatency},
-		{name: "active_forks", target: Target{GE, 5000, "count"}, needs: capacity, capacity: true},
-		{name: "open_changes", target: Target{GE, 2000, "count"}, needs: capacity, capacity: true},
-		{name: "event_streams", target: Target{GE, 500, "count"}, needs: capacity, capacity: true},
-		{name: "sandboxes_running", target: Target{GE, 200, "count"}, needs: []string{EnvCapacity, EnvSandboxProfile}, capacity: true},
-		{name: "sandbox_ready", target: Target{LE, 60, "s"}, needs: sandbox},
+		{name: "active_forks", target: Target{GE, activeForksCount, "count"}, needs: capacity, capacity: true, body: activeForks},
+		{name: "open_changes", target: Target{GE, openChangesCount, "count"}, needs: capacity, capacity: true, body: openChanges},
+		{name: "event_streams", target: Target{GE, eventStreamsCount, "count"}, needs: capacity, capacity: true, body: eventStreams},
+		{name: "sandboxes_running", target: Target{GE, sandboxesRunningCount, "count"}, needs: []string{EnvCapacity, EnvSandboxProfile},
+			capacity: true, body: sandboxesRunning},
+		{name: "sandbox_ready", target: Target{LE, 60, "s"}, needs: sandbox, body: sandboxReady},
 		{name: "sandbox_exec", target: Target{LT, 200, "ms"}, needs: sandbox, body: sandboxExec},
 	}
 }

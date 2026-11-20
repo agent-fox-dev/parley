@@ -58,7 +58,23 @@ type stubOptions struct {
 	// withholdEvent is the commit of event_latency, counting from 1, whose
 	// event is never sent, 0 for none.
 	withholdEvent int
+	// forkLimit is how many forks of one workspace may exist at once: the
+	// next creation is answered with 409 and stubForkLimit. 0 is no limit.
+	forkLimit int
+	// sandboxLimit is how many sandboxes may exist at once: the next
+	// creation is answered with 429 sandbox_capacity. 0 is no limit.
+	sandboxLimit int
+	// provisioning is how long a sandbox shows state provisioning after it
+	// was created, before it shows ready.
+	provisioning time.Duration
+	// failSandbox is the sandbox creation, counting from 1, whose sandbox
+	// shows state failed with state_reason image_pull, 0 for none.
+	failSandbox int
 }
+
+// stubForkLimit is the error_type of the stub's refusal of a fork beyond
+// forkLimit, one the hub does not use.
+const stubForkLimit = "stub_fork_limit"
 
 // stub stands in for a hub: it answers GET /version and the routes the
 // scenarios call, each with a success unless the test overrides it, and
@@ -73,8 +89,9 @@ type stub struct {
 	// the bearer token.
 	unauthorized []string
 	workspaces   map[string]*stubWorkspace
-	// forks are the forks the stub created and nobody deleted yet.
-	forks        map[string]bool
+	// forks are the forks the stub created and nobody deleted yet, each
+	// with the workspace it was forked from.
+	forks        map[string]string
 	nextFork     int
 	forkRequests int
 	forkDeletes  int
@@ -91,9 +108,11 @@ type stub struct {
 	// landed, and mergePolls when each list of its unknown changes came.
 	mergeLandedAt time.Time
 	mergePolls    []time.Time
-	// streams are the open event streams; streamsOpened counts every one.
+	// streams are the open event streams; streamsOpened counts every one
+	// and streamsMax is the most that were open at once.
 	streams       map[chan string]bool
 	streamsOpened int
+	streamsMax    int
 	nextSeq       int
 	sandboxes     map[string]*stubSandbox
 	nextSandbox   int
@@ -127,6 +146,9 @@ type landStats struct {
 
 type stubSandbox struct {
 	id, workspace, profile string
+	created                time.Time
+	// failed shows the sandbox as failed from its creation on.
+	failed bool
 }
 
 // newStub serves a stub until the test ends. override replaces the
@@ -139,7 +161,7 @@ func newStub(t *testing.T, override map[string]http.HandlerFunc) *stub {
 // newStubWith is newStub answering as opts say.
 func newStubWith(t *testing.T, opts stubOptions, override map[string]http.HandlerFunc) *stub {
 	t.Helper()
-	s := &stub{opts: opts, workspaces: map[string]*stubWorkspace{}, forks: map[string]bool{},
+	s := &stub{opts: opts, workspaces: map[string]*stubWorkspace{}, forks: map[string]string{},
 		changes: map[int64]*stubChange{}, lands: map[string]*landStats{}, streams: map[chan string]bool{},
 		sandboxes: map[string]*stubSandbox{}}
 	routes := map[string]http.HandlerFunc{
@@ -159,16 +181,17 @@ func newStubWith(t *testing.T, opts stubOptions, override map[string]http.Handle
 		"GET /api/v1/workspaces/{slug}/scm/file": func(w http.ResponseWriter, _ *http.Request) {
 			fmt.Fprint(w, "hello\n")
 		},
-		"POST /api/v1/workspaces/{slug}/scm/refs":              s.createRef,
-		"POST /api/v1/workspaces/{slug}/scm/commits":           s.createCommit,
-		"POST /api/v1/workspaces/{slug}/changes":               s.openChange,
-		"GET /api/v1/workspaces/{slug}/changes":                s.listChanges,
-		"POST /api/v1/workspaces/{slug}/changes/{number}/land": s.land,
-		"GET /api/v1/events":                                   s.events,
-		"POST /api/v1/workspaces/{slug}/sandboxes":             s.createSandbox,
-		"GET /api/v1/workspaces/{slug}/sandboxes/{id}":         s.getSandbox,
-		"DELETE /api/v1/workspaces/{slug}/sandboxes/{id}":      s.deleteSandbox,
-		"POST /api/v1/workspaces/{slug}/sandboxes/{id}/exec":   s.exec,
+		"POST /api/v1/workspaces/{slug}/scm/refs":                 s.createRef,
+		"POST /api/v1/workspaces/{slug}/scm/commits":              s.createCommit,
+		"POST /api/v1/workspaces/{slug}/changes":                  s.openChange,
+		"GET /api/v1/workspaces/{slug}/changes":                   s.listChanges,
+		"POST /api/v1/workspaces/{slug}/changes/{number}/land":    s.land,
+		"POST /api/v1/workspaces/{slug}/changes/{number}/abandon": s.abandon,
+		"GET /api/v1/events":                                      s.events,
+		"POST /api/v1/workspaces/{slug}/sandboxes":                s.createSandbox,
+		"GET /api/v1/workspaces/{slug}/sandboxes/{id}":            s.getSandbox,
+		"DELETE /api/v1/workspaces/{slug}/sandboxes/{id}":         s.deleteSandbox,
+		"POST /api/v1/workspaces/{slug}/sandboxes/{id}/exec":      s.exec,
 	}
 	for pattern, h := range override {
 		if _, ok := routes[pattern]; !ok {
@@ -233,11 +256,24 @@ func (s *stub) createFork(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	parent := r.PathValue("slug")
+	if s.opts.forkLimit > 0 {
+		live := 0
+		for _, p := range s.forks {
+			if p == parent {
+				live++
+			}
+		}
+		if live >= s.opts.forkLimit {
+			writeError(w, http.StatusConflict, stubForkLimit, fmt.Sprintf("%s has %d forks", parent, live))
+			return
+		}
+	}
 	s.nextFork++
-	slug := fmt.Sprintf("%s-f%d", r.PathValue("slug"), s.nextFork)
-	head := s.workspace(r.PathValue("slug")).branches[stubDefaultBranch]
+	slug := fmt.Sprintf("%s-f%d", parent, s.nextFork)
+	head := s.workspace(parent).branches[stubDefaultBranch]
 	s.workspaces[slug] = &stubWorkspace{branches: map[string]string{stubDefaultBranch: head}}
-	s.forks[slug] = true
+	s.forks[slug] = parent
 	writeJSON(w, http.StatusCreated, map[string]any{"workspace": map[string]any{"slug": slug, "kind": "fork",
 		"default_branch": stubDefaultBranch, "head_sha": head}, "remote": nil})
 }
@@ -246,7 +282,7 @@ func (s *stub) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	slug := r.PathValue("slug")
-	if !s.forks[slug] {
+	if _, ok := s.forks[slug]; !ok {
 		writeError(w, http.StatusNotFound, "not_found", "no such workspace")
 		return
 	}
@@ -371,6 +407,7 @@ func (s *stub) events(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.streams[ch] = true
 	s.streamsOpened++
+	s.streamsMax = max(s.streamsMax, len(s.streams))
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -464,6 +501,23 @@ func (s *stub) listChanges(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
 }
 
+// abandon abandons an open change.
+func (s *stub) abandon(w http.ResponseWriter, r *http.Request) {
+	number, _ := strconv.ParseInt(r.PathValue("number"), 10, 64)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.changes[number]
+	switch {
+	case !ok || ch.workspace != r.PathValue("slug"):
+		writeError(w, http.StatusNotFound, "change_not_found", "no such change")
+	case ch.state != "open":
+		writeError(w, http.StatusConflict, "change_closed", "the change is "+ch.state)
+	default:
+		ch.state = "abandoned"
+		writeJSON(w, http.StatusOK, s.changeObject(ch, time.Now()))
+	}
+}
+
 // land answers after landDelay with the attempt, landed unless landFails
 // says otherwise. The attempts of land_concurrency are also held until all
 // sixteen are in flight, or two seconds have passed, so that whether they
@@ -527,14 +581,36 @@ func (s *stub) createSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.profiles = append(s.profiles, body.Profile)
+	if s.opts.sandboxLimit > 0 && len(s.sandboxes) >= s.opts.sandboxLimit {
+		writeError(w, http.StatusTooManyRequests, "sandbox_capacity", "sandbox limit reached: max_per_user")
+		return
+	}
 	s.nextSandbox++
-	sb := &stubSandbox{id: fmt.Sprintf("sbx-%d", s.nextSandbox), workspace: r.PathValue("slug"), profile: body.Profile}
+	sb := &stubSandbox{id: fmt.Sprintf("sbx-%d", s.nextSandbox), workspace: r.PathValue("slug"), profile: body.Profile,
+		created: time.Now(), failed: s.nextSandbox == s.opts.failSandbox}
 	s.sandboxes[sb.id] = sb
 	writeJSON(w, http.StatusCreated, sandboxObject(sb, "provisioning"))
 }
 
+// sandboxObject is sb as the hub shows it in state.
 func sandboxObject(sb *stubSandbox, state string) map[string]any {
-	return map[string]any{"id": sb.id, "workspace": sb.workspace, "profile": sb.profile, "state": state, "state_reason": nil}
+	var reason any
+	if state == "failed" {
+		reason = "image_pull"
+	}
+	return map[string]any{"id": sb.id, "workspace": sb.workspace, "profile": sb.profile, "state": state, "state_reason": reason}
+}
+
+// state is the state sb shows at now: failed when it fails, provisioning
+// until the stub's provisioning time has passed, then ready.
+func (s *stub) state(sb *stubSandbox, now time.Time) string {
+	switch {
+	case sb.failed:
+		return "failed"
+	case now.Before(sb.created.Add(s.opts.provisioning)):
+		return "provisioning"
+	}
+	return "ready"
 }
 
 // sandbox is the sandbox of the request, or nil after answering 404. The
@@ -552,7 +628,7 @@ func (s *stub) getSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if sb := s.sandbox(w, r); sb != nil {
-		writeJSON(w, http.StatusOK, sandboxObject(sb, "ready"))
+		writeJSON(w, http.StatusOK, sandboxObject(sb, s.state(sb, time.Now())))
 	}
 }
 
@@ -707,6 +783,29 @@ func (s *stub) openedStreams() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.streamsOpened
+}
+
+// mostStreams is the most event streams that were open at once.
+func (s *stub) mostStreams() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamsMax
+}
+
+// changesOf counts the changes the scenario opened, and those of them
+// that are still open.
+func (s *stub) changesOf(scenario string) (opened, open int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ch := range s.changes {
+		if ch.scenario == scenario {
+			opened++
+			if ch.state == "open" {
+				open++
+			}
+		}
+	}
+	return opened, open
 }
 
 // sandboxProfiles are the profiles the sandbox creations named.

@@ -56,7 +56,12 @@ type fork struct {
 
 // fork creates a fork of the first workspace.
 func (e *env) fork(ctx context.Context) (fork, response, error) {
-	path := workspacePath(e.cfg.Workspaces[0], "/forks")
+	return e.forkOf(ctx, e.cfg.Workspaces[0])
+}
+
+// forkOf creates a fork of the workspace slug, recorded for deletion.
+func (e *env) forkOf(ctx context.Context, slug string) (fork, response, error) {
+	path := workspacePath(slug, "/forks")
 	body := map[string]string{"purpose": "parley performance run " + e.runID}
 	var ans struct {
 		Workspace fork `json:"workspace"`
@@ -189,22 +194,17 @@ func (e *env) sandbox(ctx context.Context) (string, error) {
 // when that read was answered; a sandbox that fails is an error naming
 // its state_reason.
 func (e *env) waitReady(ctx context.Context, id string) (time.Time, error) {
-	path := workspacePath(e.cfg.Workspaces[0], "/sandboxes/"+url.PathEscape(id))
 	for {
-		var sb struct {
-			State       string  `json:"state"`
-			StateReason *string `json:"state_reason"`
-		}
-		if _, err := e.client.json(ctx, http.MethodGet, path, nil, &sb); err != nil {
+		state, reason, err := e.sandboxState(ctx, id)
+		if err != nil {
 			return time.Time{}, err
 		}
-		switch sb.State {
+		switch state {
 		case "ready":
 			return time.Now(), nil
 		case "failed":
-			reason := "no state_reason"
-			if sb.StateReason != nil {
-				reason = *sb.StateReason
+			if reason == "" {
+				reason = "no state_reason"
 			}
 			return time.Time{}, fmt.Errorf("sandbox %s failed: %s", id, reason)
 		}
