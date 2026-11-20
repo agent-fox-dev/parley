@@ -1,0 +1,709 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "57",
+  "spec_name": "cli_mcp_server",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Choose which commands are tools",
+      "rationale": "The operator of a harness decides with one flag what its agent may do, and commands that administer the hub or handle credentials are never among it.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "parley mcp --list is run",
+          "action": "print the tools it would serve as one JSON array of {name, description, input_schema}, the command tools in the order of their names and code_mode last, and exit 0 without starting a session, sending a request or reading standard input",
+          "contract": "exit status 0; stdout is one JSON array; with the default selection it holds the 69 command tools of the groups activity, change, claim, fork, land, sandbox and scm and of the GET commands of workspace, at most 80, and then code_mode",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, with a stubHub and probeEnv: code, out, _ = runCLI(t, \"mcp\", \"--list\"); code == 0; names(out) hold change_land, scm_commit, fork_create, activity, sandbox_exec and workspace_get, and not workspace_delete; every name but the last is a command of the default groups in help --json; the last is code_mode; len(names) <= 81; hub.requests is empty"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "optional",
+          "condition": "--groups names command groups, separated by commas, each as name or as name:read",
+          "action": "serve all commands of a group named alone and only the commands whose route's method is GET of a group named with :read, in place of the default selection activity,change,claim,fork,land,sandbox,scm,workspace:read",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over --groups with --list: {\"scm\": every scm command; \"scm:read\": the scm commands whose method is GET, not scm_commit; \"issue,pr:read\": every issue command and the GET commands of pr; \"workspace\": workspace_delete among them; none given: the default}; each compared with the commands help --json lists for the group"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "ubiquitous",
+          "action": "for any selection, never serve the command mcp, a command of the groups admin, keys, tokens, secrets, login, credential-helper, help and version, a command whose auth is admin or none, a command whose declaration says it shows a secret once, or a command whose declaration says it needs a terminal or runs until interrupted (sandbox shell, events tail)",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: with --groups naming every group that may be named (from help --json), --list holds no sandbox_shell, no events_tail, no mcp, and no tool whose command has auth admin or none; with probe commands added through options.extra in a probe group, one with ShowsOnce and one marked as needing a terminal are not listed and their plain sibling is"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "--groups names one of the never-served groups admin, keys, tokens, secrets, login, credential-helper, help, version or mcp",
+          "action": "refuse to start and name the group",
+          "contract": "one usage_error envelope on stderr whose message names the group; exit status 2; nothing on stdout; no request sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over the nine groups, each alone, with :read, and after a served group (\"scm,admin\"): code == 2; stderr is one envelope with error_type usage_error naming the group; stdout is empty; with and without --list"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "--groups names a group no command has, has an empty element, or has a suffix other than :read",
+          "action": "refuse to start and list the group names",
+          "contract": "one usage_error envelope on stderr whose message lists the names of the groups that may be named; exit status 2; nothing on stdout",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over --groups {\"nope\", \"scm,,change\", \"scm:write\", \"\"}: code == 2; error_type usage_error; the message holds scm and change and not admin"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "optional",
+          "condition": "--read-only is given",
+          "action": "narrow whatever is selected to the commands whose route's method is GET",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: --read-only --list holds change_show and scm_log and none of change_land, scm_commit, fork_create, sandbox_exec; --read-only --groups scm --list equals --groups scm:read --list"
+          }
+        },
+        {
+          "id": "REQ-1.7",
+          "pattern": "unwanted",
+          "condition": "the selection holds more than 150 tools",
+          "action": "refuse to start, say how many there are and to narrow --groups",
+          "contract": "one usage_error envelope on stderr whose message holds the number of tools and --groups; exit status 2; a selection of exactly 150 is served",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, with a probe group of n generated commands (options.extra) and --no-code-mode: n == 150 lists 150 tools; n == 151 is code 2, usage_error, the message holds 151 and --groups"
+          }
+        },
+        {
+          "id": "REQ-1.8",
+          "pattern": "ubiquitous",
+          "action": "for any command declared in a served group, serve it as a tool with no change to parley mcp",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: a probe command added to the group scm through options.extra, declared with declare, is listed as scm_<name> by mcp --list with its arguments and flags as parameters"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Make a tool definition of a command's declaration",
+      "rationale": "The tools are the commands themselves, so the CLI and the tools cannot drift apart.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "ubiquitous",
+          "action": "for any served command, name its tool with the command's words joined by _ with every - replaced by _, and describe it with the command's description",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, for every tool of mcp --list with every nameable group: its name and description equal those of one command of help --json under the mapping (change land → change_land, a word with - → _), and no two tools share a name"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "ubiquitous",
+          "action": "for any served command, give its tool an input schema that is an object with one string parameter per named argument, required as the command requires it, and one parameter per flag, typed by the flag's type (bool a boolean; string and duration a string; stringArray an array of strings; int, int64 and integer an integer), required when the flag is required, described by the flag's description, each named in lower case with every character that is not a letter or a digit replaced by _, and with no other parameter allowed",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table of tools from mcp --list: {change_land: slug and number required strings, wait boolean, stack boolean, timeout string, expected_version string; scm_commit: put, delete and move arrays of strings, message string; sandbox_upload: workspace_slug, id, local_path, sandbox_path required; a probe command with flags of every type, an int64 and a required one among them, and the argument KEY=VALUE: key_value}; each schema has additionalProperties false and the flag's description"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "ubiquitous",
+          "action": "for any served command, leave out of its tool the flags api-key, endpoint-url, json and poll-interval, and any flag its declaration marks as making the command run until interrupted",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: no tool of mcp --list has a parameter api_key, endpoint_url, json or poll_interval; sandbox_logs has no follow; scm_log has follow; change_land has wait and timeout"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "optional",
+          "condition": "--workspace <slug> is given",
+          "action": "make the workspace parameter of every tool (slug, workspace_slug, workspace or parent) optional, with that workspace as its value when a call leaves it out, while a call may still pass another slug",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, with the tools built for --workspace demo over a stubHub: slug of change_show, workspace_slug of sandbox_get and parent of fork_create are not required, and are required without --workspace; a call of change_show {number: \"3\"} requests /workspaces/demo/changes/3; a call with slug demo--t1 requests /workspaces/demo--t1/changes/3"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Run the command when its tool is called",
+      "rationale": "Calling a tool does what running the command does, so an agent that knows the CLI knows the tools.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a command tool is called with parameters its schema allows",
+          "action": "run the command's own run step in the parley mcp process with the endpoint and credential resolved at start, the parameters as its arguments and flags, and JSON output, and give what the command prints as the tool's result",
+          "contract": "the hub receives the request the command sends from the shell with the same arguments; a JSON object printed is the result's data, any other JSON value v is {\"result\": v}, nothing printed is {}; ok is true; nothing is written to the session's stdout by the command",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stubHub and the tools built with its URL and a credential"
+            ],
+            "pseudocode": "in internal/cli/mcp_test.go, calling tools through the runner's Call: {change_show {slug, number}: the stub's object is data, and the recorded request equals the one runCLI(\"change\", \"show\", …) records, method, path, query and Authorization; scm_commit with put [\"a=1\", \"b=2\"] and message: the body equals the shell's; a command that answers a JSON array: data == {\"result\": [...]}; a command whose answer has no body and no confirm document: data == {}}"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "the hub answers a command's request with an error",
+          "action": "give a failed tool result and not a protocol error",
+          "contract": "ok false; error is the envelope's error_type, or http_<code> when the hub gave none; detail is the envelope's message; the session goes on",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over the stub's answer to change_show: {404 with the envelope change_not_found: error change_not_found and its message; 401 unauthenticated: error unauthenticated; 502 with a body that is not an envelope: error http_502}; ok == false in each; a later call succeeds"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "unwanted",
+          "condition": "the command ends with one of the CLI's own errors: usage_error, client_error, wait_failed, wait_timeout or condition_not_met",
+          "action": "give a failed tool result with that type, as from the shell, a command that destroys data and is called without its confirm parameter included",
+          "contract": "ok false; error is the CLI's error type; detail its message; for workspace_delete without confirm, error usage_error and no request sent",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, a table: {workspace_delete {slug} without confirm (--groups workspace): usage_error, no request; with confirm true: the DELETE is sent; activity with fail_on_overlap and an overlapping answer: condition_not_met with the answer as data; a hub that cannot be reached: client_error}"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "a call carries a parameter that is not in the tool's schema, one of the wrong type, or lacks a required one",
+          "action": "refuse the call and send nothing",
+          "contract": "a failed tool result with error usage_error whose detail names the parameter; no request sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over calls of change_land: {{slug, number, nope: 1}, {slug, number, wait: \"yes\"}, {slug}, {slug, number: 3}}: ok false, error usage_error, the detail names the parameter, hub.requests is empty"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "a parameter has the value - where the command would read standard input",
+          "action": "refuse the call without reading standard input or a terminal",
+          "contract": "a failed tool result with error usage_error; nothing is read from the process's standard input, which carries the session",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, with a standard input that fails the test when read: a table over the commands of the nameable groups that take - (policy set with its file -, change open with intent -): error usage_error, no request"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "event_driven",
+          "condition": "a tool of a command with --wait is called with wait true",
+          "action": "wait inside the call for the operation to end, bounded by the call's timeout parameter as from the shell",
+          "contract": "the result is the finished operation's document; a wait that outlasts timeout is a failed result with error wait_timeout; one whose operation fails, wait_failed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a jobHub whose polls answer queued, running, then the final state, and options.pollInterval of a millisecond"
+            ],
+            "pseudocode": "in internal/cli/mcp_test.go, beside the wait tests of the commands: a waiting tool call returns the final document after three polls; with timeout \"1s\" and polls that never finish, error wait_timeout; with a failed final state, wait_failed"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "event_driven",
+          "condition": "a tool of a command that reads or writes a local path is called (sandbox_upload, sandbox_download)",
+          "action": "read or write the path on the machine where parley mcp runs, a relative one from its working directory",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, with t.Chdir to a temporary directory holding in.txt: sandbox_upload {workspace_slug, id, local_path: \"in.txt\", sandbox_path: \"in.txt\"} sends the file's bytes; sandbox_download with local_path \"out.txt\" writes the stub's bytes to out.txt in that directory"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "unwanted",
+          "condition": "a tool call is still running after 30 minutes",
+          "action": "cancel the call's requests and fail the call",
+          "contract": "a failed tool result with error timeout; the command's request context has ended",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the call bound is a setting of options, 50 ms in the test",
+              "a stub route that answers only when its request's context ends"
+            ],
+            "pseudocode": "in internal/cli/mcp_test.go: the call returns ok false with error timeout within a second, and the stub saw its request cancelled; the bound's default is 30 minutes"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Serve one MCP session on standard input and output",
+      "rationale": "A harness that speaks MCP starts parley mcp on the agent's machine and needs nothing but the CLI's endpoint and credential.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "parley mcp is started with an endpoint and a credential",
+          "action": "serve one MCP session on standard input and output, writing only protocol frames to stdout, until the client closes its end, and then exit 0",
+          "contract": "tools/list answers the tools --list prints; tools/call of a command tool answers its result; every line of stdout is a JSON-RPC message; exit status 0 after standard input closes",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the parley binary built once, as test/e2e/build_test.go builds it, and a hub of hubtest"
+            ],
+            "pseudocode": "in test/e2e/cli_test.go: session = an MCP client of the SDK over mcp.CommandTransport{Command: exec.Command(parley, \"mcp\", \"--groups\", \"workspace:read\")} with PARLEY_ENDPOINT_URL and PARLEY_API_KEY set; names(session.ListTools()) == the names of parley mcp --groups workspace:read --list; session.CallTool(workspace_list) is not an error and its structured content holds the hub's items; session.Close(); the process exited 0"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "an MCP client sends initialize",
+          "action": "answer with the server name parley, the CLI's version and instructions of at most three sentences that say what the tools are, name the fixed workspace and sandbox when they are given, and say that code_mode chains them",
+          "contract": "serverInfo.name == \"parley\"; serverInfo.version is the version parley version prints; instructions has at most three sentences, holds the value of --workspace and of --sandbox when given, and names code_mode unless --no-code-mode",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, the instructions built for a table of settings {none, --workspace demo, --workspace demo--fix --sandbox sbx_…, --no-code-mode}: sentences <= 3 and the names present or absent as the contract says. In test/e2e/cli_test.go, in the session test: the initialize result's serverInfo is parley with the built version"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "parley mcp is started without an endpoint or without a credential",
+          "action": "end as any command does, before it serves anything",
+          "contract": "one client_error envelope on stderr; exit status 2; nothing on stdout",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table {no endpoint, no credential, neither}, with unsetEnv and an empty config dir: runCLI(\"mcp\") is code 2, stdout empty, stderr one envelope of error_type client_error; mcp --list in the same state is code 0"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "event_driven",
+          "condition": "a tool call ends, a direct one or one a code_mode script made",
+          "action": "write one line to stderr with the tool, the outcome and the duration, and never the arguments or the result",
+          "contract": "one JSON object per line: {\"tool\", \"ok\", \"error\"? (the result's error for ok false), \"duration_ms\"}; no other member",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, through the runner with stderr captured: a call whose argument holds IN-7f3a and whose result holds OUT-9c1e writes one line that decodes to exactly the members tool, ok and duration_ms and holds neither marker; a failed call adds error; a script that calls two tools writes three lines"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "event_driven",
+          "condition": "parley mcp receives SIGINT or SIGTERM while it serves",
+          "action": "end the session and cancel the calls that run",
+          "contract": "the process exits within 5 seconds; the request of a running call is cancelled at the hub",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in test/e2e/cli_test.go, with the built binary and a hub route that holds its request: start a call, send SIGTERM to the process, the process exits within 5 s and the hub saw the request's context end; the same for SIGINT"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "ubiquitous",
+          "action": "for any session, read the endpoint and the credential once, at start, and give a later 401 of the hub as the tool error of the call that got it",
+          "contract": "every request of the session carries the credential read at start; a call the hub answers 401 is a failed tool result with error unauthenticated, and the session goes on",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go: the tools are built with a credential; the environment variable and the config file are then changed; a call still sends the first credential; when the stub answers 401 unauthenticated the call's result is ok false with error unauthenticated and the next call is sent again"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Chain tool calls in one code_mode script",
+      "rationale": "An agent does a whole sequence of operations in one call and gets back only what its script prints and returns.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "action": "serve code_mode, agentkit-go's code mode tool, after the other tools and bound to all of them, under agentkit-go's rules and limits except the script's wall time",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, through the runner over a stubHub: code_mode is the last tool of Reachable; a script that calls workspace_get and change_show, two of them inside parallel(...), and returns one field of each returns that value, and the stub got the three requests"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a code_mode script calls a tool",
+          "action": "make the call as a direct call of that tool is made: the same parameters, the same result, the same refusals",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go: a script's call of change_show records the request a direct call records; a script's call with an unknown parameter gets the usage_error result a direct call gets and the script can read its error; a hub 404 inside a script is a failed result the script can branch on"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "optional",
+          "condition": "--script-timeout <duration> is given, from 1 second to 30 minutes",
+          "action": "bound a script's wall time by it, in place of the default of 10 minutes",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go: with --script-timeout 1s and a stub route that holds its request, a script that calls it fails within 3 s with code mode's timeout error; the code-mode options built without the flag have MaxTimeout 10 minutes, and 30 minutes with --script-timeout 30m"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "unwanted",
+          "condition": "--script-timeout is below 1 second, above 30 minutes or not a duration",
+          "action": "refuse to start",
+          "contract": "one usage_error envelope on stderr naming --script-timeout; exit status 2; nothing on stdout",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over {\"0s\", \"999ms\", \"31m\", \"soon\"} with --list: code 2, usage_error naming script-timeout; \"1s\" and \"30m\" are accepted"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "optional",
+          "condition": "--no-code-mode is given",
+          "action": "leave code_mode out of the tools",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: mcp --no-code-mode --list holds no code_mode and every other tool of mcp --list"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "event_driven",
+          "condition": "parley mcp starts a session",
+          "action": "write one line to stderr with the number of tools and the size of the code_mode description in bytes",
+          "contract": "the first line of stderr is the JSON object {\"tools\": n, \"code_mode_description_bytes\": m}, with n the number of tools served and m 0 with --no-code-mode",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in test/e2e/cli_test.go, in the session test: the first line of the process's stderr decodes to tools == len(ListTools) and code_mode_description_bytes == the byte length of the listed code_mode description"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Serve one sandbox's tools beside the hub tools",
+      "rationale": "With a sandbox named, one script mixes hub operations with file, search and shell work in that sandbox.",
+      "system": "parley CLI",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "parley mcp is started with --workspace <slug> and --sandbox <id>",
+          "action": "read the sandbox's tools from the hub once, with GET /workspaces/:slug/sandboxes/:id/tools, and serve each under its own name, description and input schema, after the command tools and before code_mode, bound to code_mode",
+          "contract": "the tool list is the command tools, then the hub's tools in the hub's order with their input_schema as the hub gave it, then code_mode; --list prints the same",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a stubHub whose GET …/sandboxes/sbx_1/tools answers the set full with read_file, edit_file and execute and their schemas"
+            ],
+            "pseudocode": "in internal/cli/mcp_test.go: the tools of mcp --workspace demo --sandbox sbx_1 --list end with read_file, edit_file, execute, code_mode, each sandbox tool with the stub's description and input_schema; the stub got one GET of the route; a script calls read_file and change_show in one run"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "a sandbox tool is called",
+          "action": "make one POST /workspaces/:slug/sandboxes/:id/tools/:name with the parameters as input, and give the hub's {ok, data, error, detail, text} as the tool's result as it is",
+          "contract": "the request's body is {\"input\": <the parameters>}; a hub result with ok false is a failed result with the hub's error and detail; text, when the hub gave one, is the result's model-facing text",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over the stub's answer to POST …/tools/read_file: {{ok: true, data: {content: \"x\"}, text: \"x\"}: OK, Data and Text as given; {ok: false, error: \"not_found\", detail: \"no such file\", data: {}}: a failed result with them}; the recorded body is {\"input\": {\"path\": \"a.txt\"}}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "the hub answers a sandbox tool's call with an error: the sandbox stopped, a limit, a tool outside the credential's set",
+          "action": "give a failed tool result with the hub's error type",
+          "contract": "ok false; error is the envelope's error_type (sandbox_not_ready, rate_limited, insufficient_scope, tool_server_failed), or http_<code> without one; detail its message",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over the stub's answer {409 sandbox_not_ready, 429 rate_limited, 403 insufficient_scope, 502 tool_server_failed}: the result's error is the error_type and the session goes on"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "unwanted",
+          "condition": "--sandbox is given without --workspace",
+          "action": "refuse to start",
+          "contract": "one usage_error envelope on stderr naming --workspace; exit status 2; no request sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: mcp --sandbox sbx_1, with and without --list, is code 2, usage_error naming --workspace, hub.requests empty"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "unwanted",
+          "condition": "reading the sandbox's tools at start fails: a sandbox without tools, not ready, unknown or not accessible",
+          "action": "end with the hub's error envelope before serving anything",
+          "contract": "the hub's envelope on stderr as received (tools_unavailable, sandbox_not_ready, sandbox_not_found, not_found, insufficient_scope); exit status 1; nothing on stdout",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go, a table over the stub's answer to the GET {404 tools_unavailable, 409 sandbox_not_ready, 404 sandbox_not_found, 403 insufficient_scope}: runCLI(\"mcp\", \"--workspace\", \"demo\", \"--sandbox\", \"sbx_1\") is code 1, stdout empty, stderr the envelope"
+          }
+        },
+        {
+          "id": "REQ-6.6",
+          "pattern": "unwanted",
+          "condition": "a sandbox tool has the name of a command tool or of code_mode",
+          "action": "refuse to start and name both",
+          "contract": "one client_error envelope on stderr naming the tool and the command it clashes with; exit status 2",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go: with the stub listing a sandbox tool named change_show, code 2 and the message holds change_show and \"change show\"; with one named code_mode, code 2"
+          }
+        },
+        {
+          "id": "REQ-6.7",
+          "pattern": "optional",
+          "condition": "--read-only is given with --sandbox",
+          "action": "serve of the sandbox's tools nothing more than the read-only set: the tools the hub lists without write_file, edit_file, execute and run_command",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/cli/mcp_test.go: with the stub listing the set full with read_file, write_file, edit_file, execute, run_command and search_files, mcp --read-only --workspace demo --sandbox sbx_1 --list holds read_file and search_files and none of the four; with the stub listing the set read_only, every listed tool is served"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent lands a change through tool calls",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "configures a harness to start parley mcp --workspace demo with the CLI's endpoint and credential"
+        },
+        {
+          "actor": "agent",
+          "action": "lists the tools, calls activity and then fork_create"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs each command's own run step in its process and answers with what the command prints"
+        },
+        {
+          "actor": "agent",
+          "action": "calls code_mode with one script that commits two files with scm_commit on the fork, opens the change with change_open and lands it with change_land with wait set, and returns the landed sha"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "runs the script, makes its three tool calls, writes one line per call to stderr and answers with what the script returned"
+        },
+        {
+          "actor": "parleyd",
+          "action": "serves the same requests the shell commands make and lands the change"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the built parley binary",
+          "agentkit-go's runner, code mode and MCP server",
+          "a hub of hubtest with its repositories",
+          "the command tree of internal/cli"
+        ],
+        "setup": [
+          "a hub with the repository demo, as the land tests of test/e2e start it, and the parley binary built without cgo"
+        ],
+        "end_state": [
+          "the script's result holds the sha of demo's main, which holds the two files",
+          "the change is landed",
+          "the process's stderr holds one line per tool call, five in all, and none holds a file's content",
+          "the hub's audit holds, for this credential, the requests the shell commands activity, fork create, scm commit, change open and change land make, in that order"
+        ],
+        "pseudocode": "a new test in test/e2e/cli_test.go: session over mcp.CommandTransport of `parley mcp --workspace demo`; CallTool(activity); CallTool(fork_create {name: \"t1\"}); CallTool(code_mode {script}); assert the end state through the hub's API"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "One script works in a sandbox and on the hub",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "starts parley mcp --workspace demo--fix --sandbox <id> for a fork whose sandbox has tools"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "reads the sandbox's tools from the hub and serves them beside the command tools and code_mode"
+        },
+        {
+          "actor": "agent",
+          "action": "calls code_mode with a script that runs search_files and edit_file in the sandbox, execute to run the tests, then change_show on the hub, and returns the change's state"
+        },
+        {
+          "actor": "parleyd",
+          "action": "relays each sandbox tool call into the sandbox and answers the hub command"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "runs the tool server once per sandbox tool call"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the built parley binary",
+          "agentkit-go's runner, code mode and MCP server",
+          "a hub of hubtest with the sandbox tool routes",
+          "the fake runtime with host directories and the stand-in tool server"
+        ],
+        "setup": [
+          "the hub of the sandbox tools tests of test/e2e/sandbox_use_test.go (startSandboxToolsHub), with a change open on the fork"
+        ],
+        "end_state": [
+          "the tool list holds the hub's thirteen sandbox tools between the command tools and code_mode",
+          "the script returned the change's state",
+          "the file edit_file changed holds the edit",
+          "the hub holds three parley.sandbox.tool_call events for the sandbox, with via rest"
+        ],
+        "pseudocode": "a new test in test/e2e/sandbox_use_test.go: session over mcp.CommandTransport of `parley mcp --workspace <fork> --sandbox <id>` with the fork's token; CallTool(code_mode {script}); assert the end state as the sandbox tools tests do"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A read-only assistant, and a refused selection",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "starts parley mcp --read-only"
+        },
+        {
+          "actor": "agent",
+          "action": "lists the tools and reads a change with change_show"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "serves only the commands whose route is a GET, change_land not among them"
+        },
+        {
+          "actor": "developer",
+          "action": "starts parley mcp --groups admin"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints a usage_error naming admin and exits 2"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the built parley binary",
+          "agentkit-go's runner and MCP server",
+          "a hub of hubtest"
+        ],
+        "setup": [
+          "a hub with the repository demo and one change"
+        ],
+        "end_state": [
+          "the read-only session listed change_show and no change_land, scm_commit or fork_create",
+          "change_show answered the change",
+          "parley mcp --groups admin exited 2 with one usage_error envelope on stderr and nothing on stdout"
+        ],
+        "pseudocode": "a new test in test/e2e/cli_test.go: session over `parley mcp --read-only`; ListTools; CallTool(change_show); then run `parley mcp --groups admin` and read its exit status and streams"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/agent-fox-dev/agentkit-go",
+      "version": "v0.9.1",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Tool (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/core",
+          "signature": "Name string; Description string; InputSchema *schema.Schema; OutputSchema *schema.Schema; ReachableTools []Tool; Handler ToolHandler; Execute ResultHandler"
+        },
+        {
+          "name": "ResultHandler",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/core",
+          "signature": "type ResultHandler func(ctx context.Context, input json.RawMessage) ToolResult"
+        },
+        {
+          "name": "ToolResult (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/core",
+          "signature": "OK bool; Data map[string]any; Error string; Detail string; Text string"
+        },
+        {
+          "name": "OKResult, ErrResult",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/core",
+          "signature": "func OKResult(data map[string]any) ToolResult; func ErrResult(code, detail string) ToolResult"
+        },
+        {
+          "name": "Parse",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/schema",
+          "signature": "func Parse(data []byte) (*Schema, error)"
+        },
+        {
+          "name": "New",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/codemode",
+          "signature": "func New(tools []core.Tool, opts Options) (core.Tool, BuildInfo, error)"
+        },
+        {
+          "name": "Options (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/codemode",
+          "signature": "Name string; MaxTimeout time.Duration; MaxSteps uint64; MaxCalls int; MaxConcurrentCalls int; MaxOutputBytes int; SpillDir string; DisableSpill bool"
+        },
+        {
+          "name": "BuildInfo (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/codemode",
+          "signature": "DescriptionBytes int; DescriptionChars int; BoundToolsCount int"
+        },
+        {
+          "name": "AllowAll",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/guard",
+          "signature": "func AllowAll(context.Context, core.BeforeToolCallContext) core.BeforeToolCallDecision"
+        },
+        {
+          "name": "Runner.Call, Runner.Reachable",
+          "import_path": "github.com/agent-fox-dev/agentkit-go",
+          "signature": "func (r *Runner) Call(ctx context.Context, name string, input json.RawMessage) core.ToolResult; func (r *Runner) Reachable() []core.Tool"
+        },
+        {
+          "name": "New, Server.ServeStdio, Options (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/mcpserve",
+          "signature": "func New(r *agentkit.Runner, opts Options) (*Server, error); func (s *Server) ServeStdio(ctx context.Context) error; Name string; Version string; Instructions string; Logger *slog.Logger"
+        }
+      ]
+    },
+    {
+      "package": "github.com/agent-fox-dev/agentkit-go",
+      "version": "v0.9.1",
+      "verified": false,
+      "symbols": [
+        {
+          "name": "New",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/runner",
+          "signature": "func New(ts Toolset) (*Runner, error)"
+        },
+        {
+          "name": "Toolset (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/runner",
+          "signature": "Tools []core.Tool; Policy core.ToolPolicy; Guard core.BeforeToolCall; After core.AfterToolCall; Events func(core.Event)"
+        }
+      ]
+    },
+    {
+      "package": "github.com/modelcontextprotocol/go-sdk",
+      "version": "v1.8.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "CommandTransport",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "type CommandTransport struct { Command *exec.Cmd; TerminateDuration time.Duration }"
+        }
+      ]
+    }
+  ]
+}
