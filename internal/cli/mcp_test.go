@@ -1352,7 +1352,7 @@ func TestSandboxTools_LeaveTheSandboxsOwnCodeModeToTheSessions(t *testing.T) {
 	}
 }
 
-func TestMCP_RefusesASandboxToolNamedLikeACommandTool(t *testing.T) {
+func TestMCP_RefusesASandboxToolNamedLikeAnotherTool(t *testing.T) {
 	for _, row := range []struct{ tool, clashesWith string }{{"change_show", "change show"}, {"activity", "activity"}} {
 		t.Run(row.tool, func(t *testing.T) {
 			hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file", row.tool))

@@ -49,7 +49,7 @@ sandbox tool like the others: its scripts run in the sandbox, over the
 sandbox's tools alone. A sandbox tool with the name of a command tool is
 still refused. Tests:
 `TestSandboxTools_LeaveTheSandboxsOwnCodeModeToTheSessions`,
-`TestMCP_RefusesASandboxToolNamedLikeACommandTool`.
+`TestMCP_RefusesASandboxToolNamedLikeAnotherTool`.
 
 ## Words after `--` and repeating arguments are array parameters
 
