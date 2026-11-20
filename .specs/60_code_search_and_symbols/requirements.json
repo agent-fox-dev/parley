@@ -1,0 +1,518 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "60",
+  "spec_name": "code_search_and_symbols",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Search the code of the default branch",
+      "rationale": "A ranked answer grouped by file is what tells an agent where to look, where an exact search tells it only where a string occurs.",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/scm/code-search with a query in zoekt's syntax and the index is at the head of the default branch",
+          "system": "parleyd",
+          "action": "answer with the files that match, best first, each with its language and its matching lines, and with the commit the index holds",
+          "contract": "HTTP 200 with {\"workspace\", \"indexed_sha\", \"partial\", \"truncated\", \"files\": [{\"path\", \"language\", \"matches\": [{\"line\", \"text\"}]}]}; files in rank order; a query that matches nothing answers files: []; matches is never empty",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: main holds router.go with func NewRouter, handler.go with two lines that name NewRouter and notes.md without it; GET …/scm/code-search?q=NewRouter answers 200 with workspace \"demo\", indexed_sha the head, partial false, truncated false, and files holding router.go and handler.go and not notes.md, each with language \"Go\" and matches whose line numbers and text are the file's lines that hold NewRouter, in line order; q=sym:NewRouter ranks router.go first; q=lang:go+NewRouter+file:handler answers handler.go alone"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "for any answer, hold at most limit files (default 20), say truncated: true exactly when more files matched, hold at most 20 matches a file, and cut a match's text to 500 characters",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: main holds 30 files that each name the word needle, one of them on 40 lines and one on a line of 2,000 characters: without limit the answer has 20 files and truncated true; limit=25 answers 25 and truncated true; limit=3 answers 3; a query that matches two files answers truncated false; the file with 40 matching lines has at most 20 matches; the long line's text is 500 characters"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "unwanted",
+          "condition": "q is absent, empty or blank, longer than 500 characters or 1,024 bytes, or limit is not a number from 1 to 25",
+          "system": "parleyd",
+          "action": "refuse the request before the index is asked",
+          "contract": "HTTP 400 with error_type invalid_request and a message naming the parameter and what is accepted",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head, a table {q absent; q empty; q of blanks alone; q of 501 characters; q of 400 three-byte characters; limit=0; limit=26; limit=x}: 400 invalid_request with a message that names the parameter"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "unwanted",
+          "condition": "the index cannot parse the query",
+          "system": "parleyd",
+          "action": "refuse the request with the parser's message",
+          "contract": "HTTP 400 with error_type invalid_query; the message is the query parser's",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head, a table {q=(unclosed; q=file:[; q=lang:}: 400 invalid_query and a message that holds the parser's own text"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "unwanted",
+          "condition": "the index does not finish the search within its own time limit, or the read outlasts [scm].read_timeout",
+          "system": "parleyd",
+          "action": "end the search and answer as a read that timed out",
+          "contract": "HTTP 503 with error_type scm_timeout and none of the caching headers",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head and the component's seam that makes the index's search report its timeout: 503 scm_timeout with a message that says to narrow the query; no ETag"
+          }
+        },
+        {
+          "id": "REQ-1.6",
+          "pattern": "optional",
+          "condition": "the index is partial",
+          "system": "parleyd",
+          "action": "answer from it and say so",
+          "contract": "HTTP 200 with partial: true; the files are those the index holds",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with [code_index] max_files = 3 and ten files that hold needle: the search answers 200 with partial true and at most 3 files"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Find declarations by name",
+      "rationale": "Knowing where a function or type is declared, without knowing the file, is the commonest first question about a repository.",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/scm/symbols with a name and the index is complete and at the head",
+          "system": "parleyd",
+          "action": "answer with the declarations whose name starts with the given name, ignoring case unless the name has an upper-case letter, each with its file, kind, name, container, signature, whether it is exported and its lines",
+          "contract": "HTTP 200 with {\"workspace\", \"indexed_sha\", \"partial\": false, \"truncated\", \"symbols\": [{\"path\", \"kind\", \"name\", \"container\", \"signature\", \"exported\", \"start_line\", \"end_line\"}]}; symbols is [] when nothing matches",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: main declares func NewRouter and type newRouterOptions in router.go and a method Router.New in route.go; a table {name=newrouter → NewRouter and newRouterOptions; name=NewRouter → NewRouter alone; name=New → NewRouter and the method New with container Router; name=zzz → symbols: []}: 200 with workspace, indexed_sha the head, partial false, and each symbol's members equal to the declaration's"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "optional",
+          "condition": "the request gives exact, kind, path or limit",
+          "system": "parleyd",
+          "action": "narrow the lookup: exact matches the whole name, kind keeps the declarations of that kind, and path those in the file or under the directory it names",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head, a table {name=New&exact=true → the method New alone; name=new&kind=type → newRouterOptions; name=New&path=internal/api → the declarations under it; name=New&path=router.go → those of that file; name=New&limit=1 → one symbol and truncated true; no limit and 30 matches → 20 and truncated true}"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "name is absent, empty or longer than 200 characters, exact is not a boolean, kind is not one of the declaration kinds, path is one the source control reads refuse, or limit is not a number from 1 to 50",
+          "system": "parleyd",
+          "action": "refuse the request before the index is asked",
+          "contract": "HTTP 400 with error_type invalid_request and a message naming the parameter; the kinds accepted are func, method, type, class, interface, enum, trait, const, var, module, macro, in any letter case",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head, a table {name absent; name empty; name of 201 characters; exact=maybe; kind=gadget; path=/abs; path=../x; path=.git/x; limit=0; limit=51}: 400 invalid_request naming the parameter; kind=FUNC is accepted as func"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the index is partial",
+          "system": "parleyd",
+          "action": "refuse the request and name the commit of the partial index",
+          "contract": "HTTP 409 with error_type code_index_partial, indexed_sha in the error object, and a message that says symbols need a complete index and that code search answers",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with [code_index] max_files = 3 and ten files: GET …/scm/symbols?name=a answers 409 code_index_partial with indexed_sha the head; the code search of the same workspace answers 200"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "more than 1,000 declarations match the name",
+          "system": "parleyd",
+          "action": "refuse the request",
+          "contract": "HTTP 422 with error_type too_many_matches and a message that says to give a longer name, a kind or a path",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: main declares 1,001 functions whose names start with gen; name=gen answers 422 too_many_matches; name=gen1000 answers 200"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Never answer from a commit older than the head",
+      "rationale": "An agent that searches right after a land must find what landed; a stale answer that looks current is worse than a wait.",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a search or symbols request arrives and the index is not at the head of the default branch as it is then",
+          "system": "parleyd",
+          "action": "wait for the build of that head, for at most [scm].read_timeout, and answer from the index once it is at that head or at a later one",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head and builds held through the component's seam: a commit moves main to B and adds a file that holds freshword; GET …/scm/code-search?q=freshword is sent and does not answer while the build is held; released, it answers 200 with indexed_sha B and the new file; the same for GET …/scm/symbols with a function the commit added; a second commit C during the wait whose build ends first answers with indexed_sha C"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "for any request, never answer 200 from an index of a commit older than the head of the default branch at the time the request arrived",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: 20 commits are written to main one after another, each adding a word of its own, while 8 goroutines search for the newest word they saw written before they sent: every 200 holds that word's file, and every 200's indexed_sha is the commit that added the word or a later one"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "event_driven",
+          "condition": "a request finds the index behind the head and no build of the workspace pending or running",
+          "system": "parleyd",
+          "action": "queue it, and wait as for any other build",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: the component's record of demo is set back to an older commit and the queue holds no build of demo; a search answers 200 with indexed_sha the head without a maintenance pass"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "unwanted",
+          "condition": "the build does not finish within [scm].read_timeout",
+          "system": "parleyd",
+          "action": "stop waiting and refuse the request",
+          "contract": "HTTP 503 with error_type code_index_not_ready, the header Retry-After: 5, and in the error object state \"building\", head_sha and indexed_sha (null when there is no index); no ETag",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with [scm] read_timeout = \"1s\" and a build held: the search answers after about 1 s with 503 code_index_not_ready, Retry-After: 5, state \"building\", head_sha the new head and indexed_sha the commit indexed before; on a workspace that never had an index indexed_sha is null"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the last build of the head failed and its retry is not running",
+          "system": "parleyd",
+          "action": "refuse the request at once, without waiting",
+          "contract": "HTTP 503 with error_type code_index_not_ready, state \"failed\", head_sha, indexed_sha, and Retry-After the seconds until the build's next attempt, at least 1",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head and a job clock: the build of the new head B fails through the component's seam: a search answers within 1 s with 503 code_index_not_ready, state \"failed\", head_sha B, indexed_sha the commit before, and a Retry-After of the seconds until the queue's next attempt; once the clock is advanced and the build succeeds, the search answers 200"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "for any request that reached the waiting rule, observe how long it waited in parley_code_index_wait_seconds under its outcome: ready, timeout or failed",
+          "contract": "a histogram in seconds with the label outcome; one observation per request that reached the waiting rule, 0 for one that did not wait; a request refused before the rule observes nothing",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: after one search answered at once, one that waited for a held build and one that timed out, GET /metrics shows a count of 2 under outcome ready and 1 under timeout, and a sum above the time the second waited; in internal/metrics/catalogue_test.go and test/e2e/metrics_test.go the catalogue holds the metric"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Search a fork through its parent, and refuse what is off",
+      "rationale": "A fork starts as its parent's default branch, so the parent's index is what an agent wants before it has written anything; it must not mistake it for the fork's own state.",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "optional",
+          "condition": "the request is addressed to a fork",
+          "system": "parleyd",
+          "action": "answer from the index of the fork's parent, under the waiting rule applied to the parent's default branch, and say so",
+          "contract": "workspace is the parent's slug and indexed_sha the parent's indexed commit; read access to the fork is what is needed",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head and a fork demo--x whose own branch adds a file that holds forkword: a caller who may read the fork and not the parent gets 200 from GET /workspaces/demo--x/scm/code-search?q=NewRouter with workspace \"demo\" and indexed_sha demo's head; q=forkword answers files: []; GET …/demo--x/scm/symbols?name=NewRouter answers workspace \"demo\"; after a commit to demo's main the fork's search waits for demo's build"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "unwanted",
+          "condition": "a search or symbols request arrives at a hub without [code_index]",
+          "system": "parleyd",
+          "action": "refuse the request",
+          "contract": "HTTP 404 with error_type code_index_disabled and a message that says the hub keeps no code index",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.Start (no [code_index]): GET …/scm/code-search?q=a and GET …/scm/symbols?name=a answer 404 code_index_disabled; GET …/scm/outline and GET …/scm/search answer as before"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "unwanted",
+          "condition": "the workspace's setting code_index is off, or for a fork its parent's",
+          "system": "parleyd",
+          "action": "refuse the request",
+          "contract": "HTTP 409 with error_type code_index_off and a message that names the setting",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: demo's code_index is set to false: both routes answer 409 code_index_off for demo and for its fork demo--x; set to true again they answer 200 once the build ran"
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "for any request to either route, apply the access rule of the source control reads (a PAT needs git:read, the caller read access to the workspace, without which the answer does not reveal that the workspace exists) and report it to parley_scm_requests_total under the op code_search or symbols",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head, a table over the two routes {no credential → 401; a PAT without git:read → 403 insufficient_scope; a caller who may not read demo → 404 not_found; a reader → 200}; in internal/metrics/catalogue_test.go the documented values of the label op gain code_search and symbols"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "optional",
+          "condition": "the workspace has no head: its repository is not there yet or holds no commit",
+          "system": "parleyd",
+          "action": "answer as the tree route answers for it without a ref",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: a workspace whose repository is empty: both routes answer with the status and error_type GET …/scm/tree answers for it"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Let a client keep an answer",
+      "rationale": "An agent repeats its orientation queries; while the index did not move, the answer did not change.",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "for any 200 of either route, carry an ETag derived from the indexed commit and the request's query, and the caching headers of a source control read that is to be revalidated",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: the same search twice carries the same ETag; another q, another limit and the symbols route carry others; after a commit and its build the ETag of the same search differs; Cache-Control equals the one GET …/scm/tree?ref=main carries"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "event_driven",
+          "condition": "a request's If-None-Match holds the tag the answer would carry, once the waiting rule is satisfied",
+          "system": "parleyd",
+          "action": "answer 304 without a body and without asking the index",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head: a search with If-None-Match of its ETag answers 304 with the same ETag and, through the component's seam, no query reached the index; after a commit the same request waits for the build and answers 200"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "ubiquitous",
+          "system": "parleyd",
+          "action": "for any refusal of either route, carry no ETag and no caching header",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in a new test file of internal/codeindex, with a hub of hubtest.StartWith whose Config.TOML holds [code_index] and a workspace demo whose index is at its head, a table {400 invalid_query; 409 code_index_off; 503 code_index_not_ready}: no ETag and Cache-Control as the errors of the source control reads carry it"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Search from the shell and as a tool",
+      "rationale": "The operations reach an agent as commands and, through parley mcp, as tools.",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "parley scm code-search <slug> <query> is run",
+          "system": "parley CLI",
+          "action": "send one GET to the code search route with q and, when given, limit, and print the hub's answer",
+          "contract": "one request GET /api/v1/workspaces/<slug>/scm/code-search?q=…[&limit=…]; stdout is the answer as one JSON document; exit status 0; the hub's error envelope on stderr and exit status 1 for a refusal; a bad command line is a usage_error with exit status 2 and no request",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, rows added to the table of TestSCM_ReadsSendOneGetAndPrintTheAnswer {scm code-search demo 'sym:Handler lang:go' → scm/code-search?q=sym%3AHandler+lang%3Ago; with --limit 5 → limit=5&q=…} and of TestSCM_RefusesABadCommandLineBeforeAnyRequest {scm code-search demo; scm code-search demo a b; --limit many}"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "event_driven",
+          "condition": "parley scm symbols <slug> <name> is run",
+          "system": "parley CLI",
+          "action": "send one GET to the symbols route with name and the flags given, and print the hub's answer",
+          "contract": "one request GET /api/v1/workspaces/<slug>/scm/symbols?name=…; --exact sends exact=true, --kind, --path and --limit their values",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, rows added to the same tables {scm symbols demo NewRouter → scm/symbols?name=NewRouter; with --exact --kind func --path internal/api --limit 5 → exact=true&kind=func&limit=5&name=NewRouter&path=internal%2Fapi; scm symbols demo refused}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "ubiquitous",
+          "system": "parley CLI",
+          "action": "for any session of parley mcp that serves the group scm, serve the two commands as the tools scm_code_search and scm_symbols, in a read-only session too",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, beside TestMCPList_PrintsTheDefaultSelectionAsTools: mcp --read-only --list holds scm_code_search with the required strings slug and query and the optional limit, and scm_symbols with slug and name and the optional exact, kind, path and limit"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent orients itself without a clone",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs parley scm code-search demo 'sym:Handler lang:go'"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/scm/code-search with the query"
+        },
+        {
+          "actor": "parleyd",
+          "action": "finds the index at the head, asks it and answers the ranked files with indexed_sha"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley scm symbols demo NewRouter, then parley scm outline demo internal/api/router.go"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers the declaration with its file and lines, then the file's outline"
+        },
+        {
+          "actor": "agent",
+          "action": "creates its fork and runs parley scm code-search demo--greeting greet"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers from demo's index with workspace demo"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI's command tree",
+          "HTTP router and pipeline",
+          "the code index component with agentkit-go's codesearch",
+          "the source control component",
+          "a real repository"
+        ],
+        "setup": [
+          "a hub with [code_index] and the workspace demo, whose main holds internal/api/router.go with func NewRouter and type Handler and greet.go with func greet, indexed at its head; a fork demo--greeting"
+        ],
+        "end_state": [
+          "the first command printed files with internal/api/router.go among them, indexed_sha demo's head and workspace demo",
+          "the second printed a symbol NewRouter of kind func in internal/api/router.go with its start_line",
+          "the third printed the outline of that file with NewRouter on the same line",
+          "the fourth printed workspace \"demo\" and greet.go",
+          "every command exited 0"
+        ],
+        "pseudocode": "in test/e2e/code_index_test.go: run the four commands through cli.Run with an agent's credential and assert the end state"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A change lands and a search a second later finds it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "lands a change on demo that adds a function"
+        },
+        {
+          "actor": "parleyd",
+          "action": "moves main and queues the build of the landed commit"
+        },
+        {
+          "actor": "agent",
+          "action": "runs parley scm code-search demo with the new function's name one second later"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends the request and waits for the answer"
+        },
+        {
+          "actor": "parleyd",
+          "action": "waits for the build of the new head and answers from it with indexed_sha the landed commit"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the land",
+          "the job queue",
+          "the code index component with agentkit-go's codesearch",
+          "the parley CLI's command tree"
+        ],
+        "setup": [
+          "the hub of PATH-1 with an open change on demo that adds func landedHere and can land"
+        ],
+        "end_state": [
+          "the search printed the file the change added, with indexed_sha equal to the landed commit",
+          "parley_code_index_wait_seconds has one more observation under outcome ready",
+          "a search on a hub whose [code_index] max_files is below the workspace's file count printed partial true"
+        ],
+        "pseudocode": "in test/e2e/code_index_test.go: land the change through the API, run the command at once through cli.Run, assert the first two end states; start a second hub with max_files = 3 and a workspace of ten files and assert the third"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/agent-fox-dev/agentkit-go/codesearch",
+      "version": "main at 20c16c9, after codesearch/v0.9.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Index.Tools",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/codesearch",
+          "signature": "func (idx *Index) Tools() []core.Tool"
+        },
+        {
+          "name": "Index.Symbols",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/codesearch",
+          "signature": "func (idx *Index) Symbols(ctx context.Context, q tools.SymbolQuery) (tools.SymbolAnswer, bool, error)"
+        }
+      ]
+    },
+    {
+      "package": "github.com/agent-fox-dev/agentkit-go",
+      "version": "v0.10.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "SymbolQuery",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/tools",
+          "signature": "type SymbolQuery struct { Name string; Kind string; Path string; Exact bool }"
+        },
+        {
+          "name": "SymbolAnswer",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/tools",
+          "signature": "type SymbolAnswer struct { Matches []SymbolMatch; FilesIndexed int; Backends map[string]int }"
+        },
+        {
+          "name": "SymbolMatch",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/tools",
+          "signature": "type SymbolMatch struct { Path, Backend, Kind, Name, Container, Signature string; Exported bool; StartLine, EndLine int }"
+        },
+        {
+          "name": "ToolResult",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/core",
+          "signature": "type ToolResult struct { OK bool; Data map[string]any; Error string; Detail string; … }"
+        },
+        {
+          "name": "LangFor",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "func LangFor(path string, src []byte) string"
+        }
+      ]
+    }
+  ]
+}
