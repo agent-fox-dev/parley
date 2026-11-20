@@ -6782,13 +6782,20 @@ and error; lines below the configured level are dropped. Its `ReplaceAttr`,
 which the JSON handler calls for the message and every attribute, those of
 `With` and of groups included, passes every string value and the text of
 every `error` value through `scrubber.Scrub`. Any other value is scrubbed
-as its `fmt` text (a `[]byte` as text): when scrubbing changes that text
-(it removes something, or cuts a text of more than 1024 bytes), the
-scrubbed text is written in the value's place; otherwise every string of
+as its `fmt` text (a `[]byte` as text; a byte slice nested in a struct, a
+map or a list, which `fmt` writes as its byte values such as
+`[104 117 110]`, is replaced by the scrubbed text the bytes spell when
+scrubbing that text changes it, `scrubByteValues`): when scrubbing changes
+that text (it removes something, or cuts a text of more than 1024 bytes),
+the scrubbed text is written in the value's place; otherwise every string of
 the value's JSON form, the keys of its objects included, is scrubbed
-(`scrubJSON`), so that what `fmt` does not show (a `MarshalText` result, a
-value behind a pointer) is scrubbed too, and a value holding no secret keeps
-its JSON form. The values of an `http.Header`'s `Authorization` and
+(`scrubJSON`), and so is the text a string spells as standard base64, the
+JSON form of a nested byte slice, so that what `fmt` does not show (a
+`MarshalText` result, a value behind a pointer) is scrubbed too, and a value
+holding no secret keeps its JSON form. Object keys that scrub to the same
+text are all kept: the keys scrubbing changed are placed after the others,
+in the order of their unscrubbed text, and one whose scrubbed text is taken
+gets the suffix `#2`, `#3` and so on. The values of an `http.Header`'s `Authorization` and
 `Proxy-Authorization` headers are written as `[redacted]`, whatever their
 shape. `time` is written in UTC, so that the logs of hosts in different
 zones sort together; keys and `level` are written as they are. The JSON
