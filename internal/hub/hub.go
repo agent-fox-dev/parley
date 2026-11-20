@@ -72,6 +72,7 @@ const DefaultLoopGrace = 15 * time.Second
 // every package's schema steps, start hooks and maintenance tasks is written
 // down in one place.
 var parts = []func(*Composition){
+	composeGitCheck,
 	composeIdempotency,
 	composeBootstrap,
 	composeIdentity,

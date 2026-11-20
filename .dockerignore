@@ -1,0 +1,15 @@
+# The images build from the repository root; they need go.mod, go.sum, cmd
+# and internal. Keep history, specs, docs, test data and local files that may
+# hold secrets out of the build context.
+.git
+.specs
+.claude
+docs
+**/testdata
+hack
+build
+bin
+**/admin_token
+**/config.toml
+**/.env
+secrets

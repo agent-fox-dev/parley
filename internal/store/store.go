@@ -63,6 +63,8 @@ type Store struct {
 	// SQLite's lock, which would leave them to the busy timeout.
 	write  chan struct{}
 	closed atomic.Bool
+	// steps are the schema steps the store was opened with.
+	steps []Step
 }
 
 // Open creates the data directory and the workspace root when they are

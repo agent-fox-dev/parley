@@ -151,7 +151,8 @@ func writeSnapshot(ctx context.Context, cfg *config.Config, target string) error
 }
 
 // copyWorkspaceRoot copies every file, directory and symbolic link under
-// root to dst, keeping their relative paths. The objects of each git
+// root to dst, git's lock files aside, keeping their relative paths. The
+// objects of each git
 // repository are copied after the rest of it, that is, after its refs,
 // packed-refs and HEAD: objects are only added while a hub runs, so every
 // ref copied points at an object that is copied after it.
@@ -183,11 +184,14 @@ func copyWorkspaceRoot(root, dst string) error {
 }
 
 // copyTree copies the directory src to dst, which must not exist, leaving
-// out the directories below src that deferred reports true for. An entry
-// below src that is removed after its directory was listed and before it is
-// copied is left out: git creates and removes lock and temporary files in a
-// repository while a running hub is backed up, and the snapshot is then as
-// if taken after the removal. The error names the path that failed.
+// out the directories below src that deferred reports true for. A regular
+// file whose name ends in .lock is left out: git holds one only while it
+// writes the file beside it, and a lock file in a restored repository would
+// refuse every later write of that file. An entry below src that is removed
+// after its directory was listed and before it is copied is left out: git
+// creates and removes lock and temporary files in a repository while a
+// running hub is backed up, and the snapshot is then as if taken after the
+// removal. The error names the path that failed.
 func copyTree(src, dst string, deferred func(path string) bool) error {
 	return filepath.WalkDir(src, func(path string, e fs.DirEntry, err error) error {
 		rel, relErr := filepath.Rel(src, path)
@@ -227,6 +231,9 @@ func copyTree(src, dst string, deferred func(path string) bool) error {
 			}
 			return nil
 		case e.Type().IsRegular():
+			if strings.HasSuffix(e.Name(), ".lock") {
+				return nil
+			}
 			if err := copyFile(path, to); err != nil && !removed(path) {
 				return fmt.Errorf("copy %s: %w", path, err)
 			}

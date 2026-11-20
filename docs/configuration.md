@@ -39,7 +39,7 @@ parser's own message, which can quote the text at the mistake, such as
 example:
 
 ```json
-{"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
+{"time":"2026-11-13T12:11:38.609972Z","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
 ```
 
 ### Environment references

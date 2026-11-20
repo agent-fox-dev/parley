@@ -60,6 +60,7 @@ func validate(steps []Step) error {
 // migrate applies, in order, every step its target store has not recorded.
 // It stops at the first step that fails; the steps before it stay applied.
 func (s *Store) migrate(ctx context.Context, steps []Step) error {
+	s.steps = steps
 	for _, db := range []*sql.DB{s.main, s.analytics} {
 		if _, err := db.ExecContext(ctx, stepsTable); err != nil {
 			return fmt.Errorf("create schema step record: %w", err)
@@ -90,4 +91,51 @@ func (s *Store) migrate(ctx context.Context, steps []Step) error {
 		}
 	}
 	return nil
+}
+
+// AppliedSteps returns the names of the schema steps the target store
+// records, in the order they were applied. It only reads. The record's rows
+// are only ever inserted, so their rowid order is the order of application.
+func (s *Store) AppliedSteps(ctx context.Context, target Target) ([]string, error) {
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
+	var db *sql.DB
+	switch target {
+	case Main:
+		db = s.main
+	case Analytics:
+		db = s.analytics
+	default:
+		return nil, fmt.Errorf("unknown target store %d", target)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name FROM schema_steps ORDER BY rowid`)
+	if err != nil {
+		return nil, fmt.Errorf("read the applied schema steps: %w", err)
+	}
+	defer rows.Close()
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("read the applied schema steps: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the applied schema steps: %w", err)
+	}
+	return names, nil
+}
+
+// RegisteredSteps returns the names of the steps of the target store the
+// store was opened with, in the order they were registered.
+func (s *Store) RegisteredSteps(target Target) []string {
+	names := []string{}
+	for _, step := range s.steps {
+		if step.Target == target {
+			names = append(names, step.Name)
+		}
+	}
+	return names
 }

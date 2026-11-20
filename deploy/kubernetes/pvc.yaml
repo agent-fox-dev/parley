@@ -1,0 +1,15 @@
+# The hub's one volume: its stores, its repositories and its config dir. One
+# hub writes it, so it is ReadWriteOnce; the cluster's default storage class
+# provides it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: parley-data
+  labels:
+    app.kubernetes.io/name: parley
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

@@ -77,7 +77,7 @@ entries:
 |---|---|
 | the database file's own name (`parley.db` by default) | a copy of the transactional store |
 | `analytics.db` | a copy of the analytical store |
-| the workspace root's own name (`workspaces` by default) | a copy of every file, directory and symbolic link under the workspace root, with the same relative paths |
+| the workspace root's own name (`workspaces` by default) | a copy of every file, directory and symbolic link under the workspace root but files whose name ends in `.lock`, with the same relative paths |
 
 Each store is copied first, as one read of the engine (SQLite's
 `VACUUM INTO`): the copy holds every transaction committed before the copy
@@ -85,7 +85,9 @@ began, each with all of its rows, while the hub goes on committing, and it
 is a single database file without a write-ahead log. The workspace root is
 copied next; within each git repository the refs, `packed-refs` and `HEAD`
 are copied before the objects, so every copied ref points at a copied
-object.
+object. Files whose name ends in `.lock` (git's locks of a write in
+progress) are left out, so a repository restored from the snapshot takes
+pushes.
 
 The command only reads the hub's data: it binds no listener, runs no
 bootstrap, start work or maintenance task, applies no schema step and
@@ -101,7 +103,7 @@ On success it writes one log line naming the directory, nothing on stdout,
 and exits `0`:
 
 ```json
-{"time":"2026-11-13T13:44:23.060364+01:00","level":"INFO","msg":"backup written","dir":"/srv/backups/2026-11-13"}
+{"time":"2026-11-13T12:44:23.060364Z","level":"INFO","msg":"backup written","dir":"/srv/backups/2026-11-13"}
 ```
 
 Otherwise it writes one line, `backup failed` with the cause in `error`,
@@ -112,9 +114,9 @@ directory, and a directory inside the workspace root or inside the data
 directory (the directory of `[database].path`):
 
 ```json
-{"time":"2026-11-13T13:44:22.522501+01:00","level":"ERROR","msg":"backup failed","error":"database file /srv/parley/data/parley.db does not exist"}
-{"time":"2026-11-13T13:44:23.075944+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/backups/2026-11-13 is not empty"}
-{"time":"2026-11-13T13:44:23.081202+01:00","level":"ERROR","msg":"backup failed","error":"backup directory /srv/parley/data/snapshot is inside the data directory /srv/parley/data"}
+{"time":"2026-11-13T12:44:22.522501Z","level":"ERROR","msg":"backup failed","error":"database file /srv/parley/data/parley.db does not exist"}
+{"time":"2026-11-13T12:44:23.075944Z","level":"ERROR","msg":"backup failed","error":"backup directory /srv/backups/2026-11-13 is not empty"}
+{"time":"2026-11-13T12:44:23.081202Z","level":"ERROR","msg":"backup failed","error":"backup directory /srv/parley/data/snapshot is inside the data directory /srv/parley/data"}
 ```
 
 A relative directory is taken relative to the working directory.
@@ -122,6 +124,16 @@ A relative directory is taken relative to the working directory.
 When a copy fails part-way, for example on a file under the workspace root
 it cannot read, it removes everything it wrote (the directory too, when it
 created it), and the line names the path that failed.
+
+There is no restore command: restoring is copying. Copy the snapshot's
+database file to `[database].path`, its `analytics.db` beside it and its
+workspace directory to `[workspace].path` on the new host, put the
+configuration file in place (the snapshot holds none) and start `parleyd`
+with no flags. It applies no schema step, runs its start work on the
+restored data, listens and keeps the source hub's admin token. A snapshot
+taken while the hub commits and git clients push restores the same way:
+both stores pass an integrity check, and every repository passes `git fsck`
+with each ref at the source's commit or an ancestor of it.
 
 ### The admin token
 
@@ -149,7 +161,7 @@ A run that writes the token file logs its absolute path at warn level and
 exits `0` without listening or running any start work:
 
 ```json
-{"time":"2026-11-13T13:20:41.118034+01:00","level":"WARN","msg":"admin token written: save the token and delete the file","path":"/srv/parley/admin_token"}
+{"time":"2026-11-13T12:20:41.118034Z","level":"WARN","msg":"admin token written: save the token and delete the file","path":"/srv/parley/admin_token"}
 ```
 
 Save the token and delete the file: the hub does not start while the file
@@ -160,7 +172,7 @@ the file and exits `1`. While the file is there, a start without
 `--reset-admin-token` writes:
 
 ```json
-{"time":"2026-11-13T13:21:02.530118+01:00","level":"ERROR","msg":"cannot start","error":"admin token file /srv/parley/admin_token exists: save the token, delete the file and start the hub again"}
+{"time":"2026-11-13T12:21:02.530118Z","level":"ERROR","msg":"cannot start","error":"admin token file /srv/parley/admin_token exists: save the token, delete the file and start the hub again"}
 ```
 
 ### The start
@@ -175,7 +187,7 @@ the file and exits `1`. While the file is there, a start without
    start while the file is there, or goes on (see
    [The admin token](#the-admin-token));
 4. it runs the start work the hub's parts registered, in order, each to
-   completion;
+   completion, beginning with the git check (see [Git](#git));
 5. it binds `[server].bind`:`[server].port`;
 6. it starts the maintenance loop in the background, without waiting for
    its first pass: one pass at once and one every hour, each running the
@@ -186,18 +198,64 @@ the file and exits `1`. While the file is there, a start without
 A failure in stages 1 to 5 writes exactly one error line to stderr, closes
 the stores when they were open, and exits `1` without listening.
 
+### Git
+
+The hub needs the `git` command, version 2.38 or later. The first start work
+runs `git --version` once and reads the version from the first line of its
+output, `git version <major>.<minor>` followed by anything
+(`git version 2.39.3 (Apple Git-146)` and `git version 2.45.1.windows.1` are
+read); only major and minor are compared. `git` is looked up on the `PATH` of
+the environment `parleyd` was started with.
+
+When the version is accepted, the line `git version checked` is one of the
+start reports written right before the `listening` line, its `git_version`
+the text after `git version ` up to the first space:
+
+```json
+{"time":"2026-11-20T09:14:03.201544Z","level":"INFO","msg":"git version checked","git_version":"2.39.3"}
+```
+
+Otherwise the start stops with one error line and exit status `1`, before
+any other start work runs and without listening:
+
+| Case | The `error` contains |
+|---|---|
+| no `git` on `PATH` | `git not found on PATH; parleyd needs git 2.38 or later` |
+| a version below 2.38 | `git 2.30.2 is too old; parleyd needs git 2.38 or later` |
+| a first line not of the form above | `cannot read the git version from "<first line, cut to 100 bytes>"` |
+| `git --version` exits with a status other than 0 | `git --version failed: exit status 3` |
+| no answer within 10 seconds (the process is killed) | `git --version failed: no answer within 10s` |
+
+```json
+{"time":"2026-11-20T09:13:41.007812Z","level":"ERROR","msg":"cannot start","error":"start hook \"git-version\": git 2.30.2 is too old; parleyd needs git 2.38 or later"}
+```
+
+`--help`, a usage error, `parleyd backup` and the bootstrap runs that write
+the admin token file and exit end before the start work, so they run no
+`git` and work on a host without it.
+
 ### Log lines
 
 `parleyd` logs JSON objects to stderr, one per line, with `log/slog`. Every
-line has `time`, `level` and `msg`. `level` is `TRACE`, `DEBUG`, `INFO`,
+line has `time`, an RFC 3339 timestamp in UTC ending in `Z`, `level` and
+`msg`; a line break inside a message or a value is written escaped, so a
+logged line is always one line. `level` is `TRACE`, `DEBUG`, `INFO`,
 `WARN` or `ERROR`; lines below `[logging].level` (`info` by default) are not
 written, and with `trace` every line is. Before the configuration is loaded
-the level is `info`.
+the level is `info`. A line that cannot be written to stderr is dropped:
+the request that caused it is answered as it would have been, and the hub
+goes on.
+
+A line logged while a request is handled, by the request's handler, a
+middleware or code they call with the request's context, carries
+`request_id`, the request's `X-Request-ID`. A line logged outside a request
+(the start, the maintenance loop, background work) has none.
 
 The message and every attribute of every line are scrubbed before the line
 is written (an error as its text; a value that is neither a string nor an
 error as its printed text, which takes the value's place when scrubbing
-changes it): the
+changes it, and otherwise every string of its JSON form, map keys included;
+numbers, booleans and durations are written as they are): the
 `client_secret` of every configured OAuth provider, other secret values the
 hub knows and the hub's own credentials (admin tokens, personal access
 tokens and API keys) become `[redacted]`, the user information is removed
@@ -216,17 +274,17 @@ stored with each, without decrypting any): those cannot be read until their
 key is configured again.
 
 ```json
-{"time":"2026-11-14T06:20:11.402117+01:00","level":"INFO","msg":"secret encryption","key_configured":true,"previous_key_present":false,"undecryptable_secrets":0}
+{"time":"2026-11-14T05:20:11.402117Z","level":"INFO","msg":"secret encryption","key_configured":true,"previous_key_present":false,"undecryptable_secrets":0}
 ```
 
 Without a current key it also writes a warning and goes on starting:
 
 ```json
-{"time":"2026-11-14T06:20:11.402121+01:00","level":"WARN","msg":"secrets cannot be stored: no encryption key configured"}
+{"time":"2026-11-14T05:20:11.402121Z","level":"WARN","msg":"secrets cannot be stored: no encryption key configured"}
 ```
 
 ```json
-{"time":"2026-11-13T13:11:38.622658+01:00","level":"INFO","msg":"listening","addr":"127.0.0.1:52887","config":"/srv/parley/config.toml","data_dir":"/srv/parley/data"}
+{"time":"2026-11-13T12:11:38.622658Z","level":"INFO","msg":"listening","addr":"127.0.0.1:52887","config":"/srv/parley/config.toml","data_dir":"/srv/parley/data"}
 ```
 
 `addr` is the address the listener bound, with the port the system chose
@@ -241,7 +299,7 @@ answered, except requests to `/healthz` and `/readyz` (which get one, at
 debug level, when `[logging].log_health_probes` is `true`):
 
 ```json
-{"time":"2026-11-13T10:12:03.104211+01:00","level":"INFO","msg":"request","method":"GET","path":"/version","status":200,"duration_ms":0.087,"request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"}
+{"time":"2026-11-13T09:12:03.104211Z","level":"INFO","msg":"request","method":"GET","path":"/version","status":200,"duration_ms":0.087,"request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13"}
 ```
 
 `path` is the request's URL path without the query string. `status` is the
@@ -255,7 +313,7 @@ When a REST request fails in a way the hub did not expect, the client gets
 goroutine's `stack`:
 
 ```json
-{"time":"2026-11-13T10:12:09.551873+01:00","level":"ERROR","msg":"internal error","request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13","error":"open workspace: permission denied"}
+{"time":"2026-11-13T09:12:09.551873Z","level":"ERROR","msg":"internal error","request_id":"0b5c6f2e-8d1a-4c3b-9e7f-2a4d6c8e0f13","error":"open workspace: permission denied"}
 ```
 
 A maintenance task that returns an error or panics writes one line with the
@@ -263,7 +321,7 @@ task's name and the scrubbed error, and does not stop the others; it runs
 again in the next hourly pass:
 
 ```json
-{"time":"2026-11-13T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
+{"time":"2026-11-13T09:13:00.000000Z","level":"ERROR","msg":"maintenance task failed","task":"claim_cleanup","error":"remove claim: database is locked"}
 ```
 
 The maintenance task `token_binding_sweep` writes one info line with the
@@ -271,7 +329,7 @@ number of tokens it revoked, in a pass that revoked any: tokens bound to a
 workspace that no longer exists:
 
 ```json
-{"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"revoked the tokens bound to workspaces that no longer exist","count":2}
+{"time":"2026-11-14T09:13:00.000000Z","level":"INFO","msg":"revoked the tokens bound to workspaces that no longer exist","count":2}
 ```
 
 The maintenance task `retention` writes one line for each of its steps
@@ -280,8 +338,8 @@ then fails too, with the `maintenance task failed` line naming the failed
 steps (see [configuration.md](configuration.md#retention)):
 
 ```json
-{"time":"2026-11-14T10:13:00.000000+01:00","level":"ERROR","msg":"retention step failed","step":"run_records","error":"delete the records with timestamp before …: database is locked"}
-{"time":"2026-11-14T10:13:00.000000+01:00","level":"ERROR","msg":"maintenance task failed","task":"retention","error":"retention steps failed: run_records"}
+{"time":"2026-11-14T09:13:00.000000Z","level":"ERROR","msg":"retention step failed","step":"run_records","error":"delete the records with timestamp before …: database is locked"}
+{"time":"2026-11-14T09:13:00.000000Z","level":"ERROR","msg":"maintenance task failed","task":"retention","error":"retention steps failed: run_records"}
 ```
 
 The maintenance task `secret_reencryption` writes one info line in every
@@ -293,7 +351,7 @@ Once `remaining` is `0` the previous key can be removed (see
 [configuration.md](configuration.md#secret-keys)):
 
 ```json
-{"time":"2026-11-14T10:13:00.000000+01:00","level":"INFO","msg":"secret re-encryption","converted":5,"remaining":0}
+{"time":"2026-11-14T09:13:00.000000Z","level":"INFO","msg":"secret re-encryption","converted":5,"remaining":0}
 ```
 
 When a stop stops waiting for something whose grace or the 30-second limit
@@ -301,7 +359,7 @@ has passed, it writes one line naming it in `work`: `requests`,
 `maintenance loop` or the name of a piece of background work:
 
 ```json
-{"time":"2026-11-13T14:02:31.401227+01:00","level":"WARN","msg":"abandoned at the stop","work":"event_streams"}
+{"time":"2026-11-13T13:02:31.401227Z","level":"WARN","msg":"abandoned at the stop","work":"event_streams"}
 ```
 
 When the start fails before listening it writes one line and exits `1`.
@@ -310,13 +368,13 @@ configuration key, the secret key's variable or file, the path, the schema
 step, the admin token file or the start work that failed:
 
 ```json
-{"time":"2026-11-13T13:11:38.609972+01:00","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
+{"time":"2026-11-13T12:11:38.609972Z","level":"ERROR","msg":"cannot start","error":"configuration file /srv/parley/config.toml: server.prot: unknown key"}
 ```
 
 A secret key that cannot be loaded is named and never quoted:
 
 ```json
-{"time":"2026-11-14T06:20:11.391337+01:00","level":"ERROR","msg":"cannot start","error":"PARLEY_SECRETS_KEY: must be standard padded base64 of exactly 32 bytes"}
+{"time":"2026-11-14T05:20:11.391337Z","level":"ERROR","msg":"cannot start","error":"PARLEY_SECRETS_KEY: must be standard padded base64 of exactly 32 bytes"}
 ```
 
 With sandboxes on (a `[sandbox]` section, see
@@ -334,13 +392,13 @@ a policy file the gateway rejects or cannot validate. The gateway token and
 the OIDC client secret never appear in it:
 
 ```json
-{"time":"2026-11-13T13:11:39.120534+01:00","level":"ERROR","msg":"cannot start","error":"start hook \"sandbox_runtime_check\": sandbox.gateway_url: the gateway runs OpenShell release \"0.3.1\", outside the supported range >=0.1.0 <0.2.0"}
+{"time":"2026-11-13T12:11:39.120534Z","level":"ERROR","msg":"cannot start","error":"start hook \"sandbox_runtime_check\": sandbox.gateway_url: the gateway runs OpenShell release \"0.3.1\", outside the supported range >=0.1.0 <0.2.0"}
 ```
 
 When it cannot bind the address the line is `cannot listen`:
 
 ```json
-{"time":"2026-11-13T10:11:41.348421+01:00","level":"ERROR","msg":"cannot listen","addr":"0.0.0.0:8080","error":"listen tcp 0.0.0.0:8080: bind: address already in use"}
+{"time":"2026-11-13T09:11:41.348421Z","level":"ERROR","msg":"cannot listen","addr":"0.0.0.0:8080","error":"listen tcp 0.0.0.0:8080: bind: address already in use"}
 ```
 
 `parleyd backup` writes `backup written` with `dir` on success, or
