@@ -188,7 +188,7 @@ func (s *Service) TransitionTx(ctx context.Context, tx *sql.Tx, id, from, to, re
 		return false, func() {}, err
 	}
 	return true, func() {
-		if from == StateReady {
+		if from == StateReady || to == StateReady {
 			s.toolDefs.forget(id)
 		}
 		if seconds != nil {

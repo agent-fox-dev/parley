@@ -148,7 +148,7 @@ func TestActivity_RecordsAToolCallWhenItStartsAndWhenItEnds(t *testing.T) {
 
 	release, waiting, _ := h.held()
 	start := h.clock.Now()
-	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "30m"})
+	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "30m"}, nil)
 	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	if got := h.lastActivity(t, id); !got.Equal(start) || !got.After(before) {
 		t.Errorf("while the call runs last_activity_at = %v; want its start %v", got, start)

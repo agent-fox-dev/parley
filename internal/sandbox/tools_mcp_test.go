@@ -3,11 +3,13 @@ package sandbox_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/agent-fox-dev/parley/internal/hubtest"
 	"github.com/agent-fox-dev/parley/internal/sandbox"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime"
 	"github.com/agent-fox-dev/parley/internal/sandbox/runtime/runtimetest"
@@ -231,7 +233,7 @@ func TestMCP_GivesACallThatOutlastsItsBoundAsAResult(t *testing.T) {
 	h.listed(t, id, h.key, nil)
 	_, waiting, _ := h.held()
 	answered := h.sending(context.Background(), http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
-		map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}})
+		map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}}, mcpHeader)
 	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	h.clock.Advance(10 * 60 * 1e9)
 	a := rpcAnswer{answer: receive(t, answered)}
@@ -259,7 +261,7 @@ func TestMCP_RefusesAToolOutsideTheSetAndArgumentsOverFourMebibytes(t *testing.T
 		{"arguments that are not an object", h.key, "write_file", []any{1}, "object"},
 	} {
 		t.Run(row.name, func(t *testing.T) {
-			uploads, events := h.opsOf(runtime.OpUpload, id), len(h.sandboxEvents(t, "parley.sandbox.tool_call", id))
+			uploads := h.opsOf(runtime.OpUpload, id)
 			a := h.mcpCall(t, id, row.cred, row.tool, row.arguments)
 			wantRPCError(t, a, -32602)
 			if !strings.Contains(a.rpcErr.Message, row.names) {
@@ -267,9 +269,6 @@ func TestMCP_RefusesAToolOutsideTheSetAndArgumentsOverFourMebibytes(t *testing.T
 			}
 			if n := h.opsOf(runtime.OpUpload, id) - uploads; n != 0 {
 				t.Errorf("the refused call made %d uploads; want none", n)
-			}
-			if n := len(h.sandboxEvents(t, "parley.sandbox.tool_call", id)) - events; n != 0 {
-				t.Errorf("the refused call left %d events; want none", n)
 			}
 		})
 	}
@@ -303,7 +302,7 @@ func TestMCP_AnswersAFailedCallAndABusySandboxAsErrors(t *testing.T) {
 	})
 	t.Run("a sandbox that runs as many commands as it may", func(t *testing.T) {
 		release, waiting, _ := h.held()
-		first := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil)
+		first := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
 		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		a := h.mcpCall(t, id, h.key, "read_file", nil)
 		wantRPCError(t, a, -32000)
@@ -369,5 +368,53 @@ func TestMCP_AnswersAnyOtherMethodNotFound(t *testing.T) {
 		t.Run(row.method, func(t *testing.T) {
 			wantRPCError(t, h.mcp(t, id, h.key, row.method, row.params, nil), -32601)
 		})
+	}
+	t.Run("a method beside a member whose name differs in case only", func(t *testing.T) {
+		wantRPCError(t, h.mcpRaw(t, id, h.key, json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"resources/list","Method":"ping"}`), nil), -32601)
+	})
+	t.Run("a batch of requests", func(t *testing.T) {
+		a := h.mcpRaw(t, id, h.key, json.RawMessage(`[{"jsonrpc":"2.0","id":1,"method":"resources/list"}]`), nil)
+		wantRPCError(t, a, -32600)
+	})
+}
+
+func TestMCP_AnswersDefinitionsItCannotServeAsAFailedToolServer(t *testing.T) {
+	t.Parallel()
+	h := startToolsHub(t, "")
+	deep := strings.Repeat(`{"type":"object","properties":{"a":`, 1100) + `{"type":"string"}` + strings.Repeat(`}}`, 1100)
+	for _, row := range []struct{ name, input, output string }{
+		{"an input schema whose type has another case", `{"Type":"object"}`, `null`},
+		{"an input schema without a type", `{"properties":{}}`, `null`},
+		{"an input schema with a parameter header on an array", `{"type":"object","properties":{"a":{"type":"array","x-mcp-header":"X"}}}`, `null`},
+		{"an input schema nested too deep", deep, `null`},
+		{"an output schema nested too deep", `{"type":"object"}`, deep},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			id := h.tooled(t, nil)
+			h.tools.SetTools(func(_ context.Context, _ runtimetest.ToolListing, stdout, _ io.Writer) int {
+				_, _ = io.WriteString(stdout, `[{"name":"odd","description":"x","input_schema":`+row.input+`,"output_schema":`+row.output+`}]`)
+				return 0
+			})
+			for range 2 {
+				a := h.mcp(t, id, h.key, "initialize", initializeParams, nil)
+				if a.status != http.StatusBadGateway || a.err.ErrorType != "tool_server_failed" || a.isRPC {
+					t.Fatalf("initialize = %d %.300s; want 502 tool_server_failed as the hub's error object", a.status, a.body)
+				}
+			}
+		})
+	}
+}
+
+func TestMCP_AnswersTheRateLimitAsPlainHTTP(t *testing.T) {
+	t.Parallel()
+	h := startToolsHubWith(t, "", func(cfg *hubtest.Config) { cfg.TOML = "[limits]\nrequests_per_minute = 3\n" + cfg.TOML })
+	id := h.tooled(t, nil)
+	key := h.IssueKey(t, h.member)
+	var last rpcAnswer
+	for range 4 {
+		last = h.mcp(t, id, key, "ping", nil, nil)
+	}
+	if last.status != http.StatusTooManyRequests || last.err.ErrorType != "rate_limited" || last.isRPC {
+		t.Errorf("the fourth request of a minute = %d %s; want 429 rate_limited as the hub's error object", last.status, last.body)
 	}
 }

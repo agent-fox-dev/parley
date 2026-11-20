@@ -88,7 +88,7 @@ func TestMetrics_CountsToolCallsByToolAndOutcome(t *testing.T) {
 		t.Fatalf("the call of a tool server that exits 1 = %d %s; want 502", a.status, a.body)
 	}
 	_, waiting, _ := h.held()
-	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "read_file"), h.key, map[string]any{"timeout": "10s"})
+	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "read_file"), h.key, map[string]any{"timeout": "10s"}, nil)
 	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	h.clock.Advance(10 * time.Second)
 	receive(t, answered)

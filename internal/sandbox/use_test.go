@@ -19,7 +19,6 @@ func TestUseRoutes_AnswerDisabledWhileSandboxesAreOff(t *testing.T) {
 	t.Parallel()
 	h := startProbeHub(t, false)
 	key := h.IssueKey(t, h.owner)
-	// The routes a later part adds to the gate are disabled like the rest.
 	for _, u := range useRoutes {
 		for _, slug := range []string{"ws", "nope"} {
 			t.Run(u.String()+" on "+slug, func(t *testing.T) {

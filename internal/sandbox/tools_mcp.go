@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -54,29 +55,26 @@ func (c *toolCaller) serveMCP(w http.ResponseWriter, r *http.Request, u useReque
 	if err != nil {
 		return err
 	}
+	if unservedMCPMessage(w, r) {
+		return nil
+	}
+	// out drops what the SDK writes for a call nobody waits for any more.
+	out := &abandonableWriter{ResponseWriter: w}
 	srv := mcp.NewServer(&mcp.Implementation{Name: mcpServerName, Version: buildinfo.Get().Version}, &mcp.ServerOptions{
 		Instructions: fmt.Sprintf("These tools work in the working directory of the sandbox %s of the Parley workspace %s.", u.rec.ID, u.slug),
 		// Stated, so that the SDK adds neither its default logging
 		// capability nor a tool list that changes.
 		Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 	})
-	if unservedMCPMethod(w, r) {
-		return nil
-	}
 	listed := make([]*mcp.Tool, 0, len(defs))
 	for _, d := range defs {
-		// The SDK panics on an input schema of another type.
-		var schema struct {
-			Type any `json:"type"`
-		}
-		if json.Unmarshal(d.InputSchema, &schema) != nil || schema.Type != "object" {
-			return c.s.toolServerFailed(r.Context(), u.rec.ID, fmt.Sprintf("the input schema of the tool %q does not have the type object", d.Name))
-		}
 		tool := &mcp.Tool{Name: d.Name, Description: d.Description, InputSchema: d.InputSchema}
 		if d.hasOutputSchema() {
 			tool.OutputSchema = d.OutputSchema
 		}
-		srv.AddTool(tool, c.mcpHandler(r, u, d))
+		if reason := addMCPTool(srv, tool, c.mcpHandler(r, u, d, out)); reason != "" {
+			return c.s.toolServerFailed(r.Context(), u.rec.ID, fmt.Sprintf("the tool %q cannot be served over MCP: %s", d.Name, reason))
+		}
 		listed = append(listed, tool)
 	}
 	srv.AddReceivingMiddleware(listInOrder(listed))
@@ -87,38 +85,92 @@ func (c *toolCaller) serveMCP(w http.ResponseWriter, r *http.Request, u useReque
 		MaxRequestBodyBytes:        -1,
 		DisableLocalhostProtection: true,
 	})
-	h.ServeHTTP(w, r)
+	h.ServeHTTP(out, r)
+	if out.abandoned.Load() {
+		// As a call over REST does: the connection is dropped.
+		panic(http.ErrAbortHandler)
+	}
 	return nil
 }
 
-// unservedMCPMethod answers the request r itself, and reports true, when
-// its body is one JSON-RPC request for a method other than mcpMethods: the
-// protocol's method-not-found error, whatever the SDK would answer, which
-// knows more methods than a sandbox serves and answers one it does not know
-// outside JSON-RPC. Notifications, which a client sends after initialize,
-// and everything that is not one request are left to the SDK.
-func unservedMCPMethod(w http.ResponseWriter, r *http.Request) bool {
+// addMCPTool adds tool to srv. The SDK panics on a tool it does not take:
+// an input schema that is not of the type object, a schema nested too deep,
+// an annotation it refuses. The schemas are the tool server's, so a panic
+// is its failure and not the hub's: reason says what the SDK refused, ""
+// when it took the tool.
+func addMCPTool(srv *mcp.Server, tool *mcp.Tool, h mcp.ToolHandler) (reason string) {
+	defer func() {
+		if p := recover(); p != nil {
+			reason = fmt.Sprint(p)
+		}
+	}()
+	srv.AddTool(tool, h)
+	return ""
+}
+
+// abandonableWriter is the writer the SDK answers through. Once a call is
+// abandoned it drops what is written, so that a call nobody waits for any
+// more gets no answer, whatever the SDK makes of the handler's error.
+type abandonableWriter struct {
+	http.ResponseWriter
+	abandoned atomic.Bool
+}
+
+func (w *abandonableWriter) WriteHeader(code int) {
+	if !w.abandoned.Load() {
+		w.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (w *abandonableWriter) Write(b []byte) (int, error) {
+	if w.abandoned.Load() {
+		return len(b), nil
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Unwrap gives http.ResponseController the gate's writer.
+func (w *abandonableWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// unservedMCPMessage answers the request r itself, and reports true, when
+// its body is a JSON-RPC request for a method other than mcpMethods, with
+// the protocol's method-not-found error, or a batch, with its
+// invalid-request error. The SDK knows more methods than a sandbox serves,
+// answers one it does not know outside JSON-RPC, and takes a batch, in which
+// such a method would pass. Notifications, which a client sends after
+// initialize, and everything that is not one request are left to the SDK.
+func unservedMCPMessage(w http.ResponseWriter, r *http.Request) bool {
 	body, err := io.ReadAll(r.Body)
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	if err != nil {
 		return false
 	}
-	var msg struct {
-		ID     json.RawMessage `json:"id"`
-		Method *string         `json:"method"`
+	refuse := func(id json.RawMessage, code int64, message string) bool {
+		server.WriteJSON(w, http.StatusOK, struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Error   jsonrpc.Error   `json:"error"`
+		}{"2.0", id, jsonrpc.Error{Code: code, Message: message}})
+		return true
 	}
-	if json.Unmarshal(body, &msg) != nil || msg.Method == nil || len(msg.ID) == 0 || bytes.Equal(msg.ID, []byte("null")) {
+	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 && trimmed[0] == '[' {
+		return refuse(json.RawMessage("null"), jsonrpc.CodeInvalidRequest, "batches are not served")
+	}
+	// A map keeps the members apart by their exact names, as the SDK reads
+	// them; a struct would take Method for method.
+	var msg map[string]json.RawMessage
+	if json.Unmarshal(body, &msg) != nil {
 		return false
 	}
-	if slices.Contains(mcpMethods, *msg.Method) || strings.HasPrefix(*msg.Method, "notifications/") {
+	var method string
+	id := msg["id"]
+	if json.Unmarshal(msg["method"], &method) != nil || len(id) == 0 || bytes.Equal(id, []byte("null")) {
 		return false
 	}
-	server.WriteJSON(w, http.StatusOK, struct {
-		JSONRPC string          `json:"jsonrpc"`
-		ID      json.RawMessage `json:"id"`
-		Error   jsonrpc.Error   `json:"error"`
-	}{"2.0", msg.ID, jsonrpc.Error{Code: jsonrpc.CodeMethodNotFound, Message: fmt.Sprintf("method %q is not served", *msg.Method)}})
-	return true
+	if slices.Contains(mcpMethods, method) || strings.HasPrefix(method, "notifications/") {
+		return false
+	}
+	return refuse(id, jsonrpc.CodeMethodNotFound, fmt.Sprintf("method %q is not served", method))
 }
 
 // listInOrder answers tools/list with tools as they are, in the tool
@@ -136,8 +188,9 @@ func listInOrder(tools []*mcp.Tool) mcp.Middleware {
 
 // mcpHandler handles the tools/call of the tool d for the request r: it
 // makes the call as the REST route does and gives the tool's result as an
-// MCP tool result. What is not a tool result is a JSON-RPC error.
-func (c *toolCaller) mcpHandler(r *http.Request, u useRequest, d toolDefinition) mcp.ToolHandler {
+// MCP tool result. What is not a tool result is a JSON-RPC error, and a call
+// nobody waits for any more makes out drop the answer.
+func (c *toolCaller) mcpHandler(r *http.Request, u useRequest, d toolDefinition, out *abandonableWriter) mcp.ToolHandler {
 	return func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		input := json.RawMessage(bytes.TrimSpace(req.Params.Arguments))
 		switch {
@@ -151,13 +204,14 @@ func (c *toolCaller) mcpHandler(r *http.Request, u useRequest, d toolDefinition)
 		// The request's context, not the handler's, says whether the caller
 		// is still there: the SDK does not tie the two for every client.
 		res, _, err := c.call(r, toolCall{
-			via: viaMCP, slug: u.slug, caller: u.caller, rec: u.rec, set: u.set, tool: d.Name,
+			via: viaMCP, caller: u.caller, rec: u.rec, set: u.set, tool: d.Name,
 			input: input, bound: c.bound(mcpToolTimeout),
 		})
 		switch {
 		case errors.Is(err, errToolBusy):
 			return nil, &jsonrpc.Error{Code: codeSandboxBusy, Message: "sandbox busy"}
 		case errors.Is(err, errToolAbandoned):
+			out.abandoned.Store(true)
 			return nil, err
 		case err != nil:
 			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: c.failureMessage(r.Context(), u.rec.ID, err)}

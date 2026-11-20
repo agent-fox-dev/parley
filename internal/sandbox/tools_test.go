@@ -70,7 +70,7 @@ func TestTools_RefuseACallerTheLogsRouteRefusesTheSameWay(t *testing.T) {
 		}{
 			{"no credential", "", 401},
 			{"a PAT without a sandboxes scope", h.pat(t, h.owner, "git:read"), 403},
-			{"a token bound to another workspace", h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"sandboxes:write"}, Workspace: "ws2"}), 0},
+			{"a token bound to another workspace", h.IssuePAT(t, identity.PATSpec{UserID: h.owner, Permissions: []string{"sandboxes:write"}, Workspace: "ws2"}), 404},
 			{"a PAT of a user outside the org", h.pat(t, h.outsider, "sandboxes:write"), 404},
 		} {
 			t.Run(u.String()+" with "+row.name, func(t *testing.T) {
@@ -216,7 +216,10 @@ func TestToolList_ReadsTheDefinitionsOncePerSandboxAndSetWhileItStaysReady(t *te
 
 	list(h.key)
 	list(h.key)
-	want("two listings of the full set", 1, 0)
+	if a := h.tool(t, id, h.key, "read_file", nil); a.status != http.StatusOK {
+		t.Fatalf("a call = %d %s; want 200", a.status, a.body)
+	}
+	want("two listings and a call of the full set", 1, 0)
 	first := h.tools.Listings()[0]
 	if !slices.Equal(first.Command, []string{toolServerPath, "tools"}) || first.WorkDir != sandbox.WorkDir || len(first.Stdin) != 0 {
 		t.Errorf("the definitions were read with %q in %q with %d bytes of input; want %q in %s without input",
@@ -302,6 +305,7 @@ func TestToolList_FailsWhenTheToolServerDoesAndKeepsNothingOfIt(t *testing.T) {
 		{"prints an object", prints(`{"ok":true}`, "", 0)},
 		{"prints two arrays", prints(string(good)+string(good), "", 0)},
 		{"prints a definition without a name", prints(`[{"description":"x","input_schema":{"type":"object"}}]`, "", 0)},
+		{"prints two definitions of one name", prints(`[{"name":"x","description":"x","input_schema":{"type":"object"}},{"name":"x","description":"y","input_schema":{"type":"object"}}]`, "", 0)},
 		{"prints a definition whose input schema is not an object", prints(`[{"name":"x","description":"x","input_schema":"any"}]`, "", 0)},
 		{"prints more than 4 MiB", prints(`[{"name":"x","description":"`+strings.Repeat("d", 4<<20)+`","input_schema":{"type":"object"}}]`, "", 0)},
 	} {

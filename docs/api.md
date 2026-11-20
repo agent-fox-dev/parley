@@ -8562,8 +8562,8 @@ something that is not one such object or prints more than 4 MiB is
 `tool_server_failed`, and a runtime that cannot be reached
 `sandbox_runtime_error`, each with a message cleared of the sandbox's secret
 values and the hub's and cut to 1,024 bytes. The same holds for a listing
-whose output is not one JSON array of definitions, each with a name and an
-input schema that is an object. A result is not redacted: like the output of
+whose output is not one JSON array of definitions, each with a name no
+other has and an input schema that is an object. A result is not redacted: like the output of
 an exec it may hold whatever the sandbox holds.
 
 A call whose caller leaves, or that runs when the hub begins to stop, is
@@ -8579,7 +8579,7 @@ metadata
 ```
 
 `via` is `rest` or `mcp` and `set` the caller's set. A call with `ok: false`
-adds `error`: the tool's error code, `timeout`, `tool_server_failed` (also
+adds `error`: the tool's error code, cut to 64 characters, `timeout`, `tool_server_failed` (also
 for a call nobody waited for any more) or `sandbox_runtime_error`. The
 arguments and the result never appear. A `code_mode` call is one event,
 whatever its script called. The call also adds 1 to
@@ -8657,6 +8657,7 @@ application/json` and an `Accept` that names both `application/json` and
 | `tools/call` | the call, with `arguments` as the input (`{}` when absent) under a bound of 10 minutes |
 | a notification | accepted |
 | any other | the JSON-RPC error `-32601` |
+| a batch (a JSON array) | the JSON-RPC error `-32600` (`batches are not served`) |
 
 The result of `tools/call` has `isError` the negation of `ok`; one text
 content, the tool server's `text` when it gave one, otherwise the JSON of

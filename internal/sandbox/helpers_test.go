@@ -2660,7 +2660,14 @@ type toolsHub struct {
 // lines settings.
 func startToolsHub(t *testing.T, settings string) *toolsHub {
 	t.Helper()
-	h := &toolsHub{execHub: startUseSandboxHub(t, settings)}
+	return startToolsHubWith(t, settings, nil)
+}
+
+// startToolsHubWith is startToolsHub with the hub's configuration as edit
+// changes it when edit is not nil.
+func startToolsHubWith(t *testing.T, settings string, edit func(*hubtest.Config)) *toolsHub {
+	t.Helper()
+	h := &toolsHub{execHub: newExecHub(t, settings, edit)}
 	h.tools = runtimetest.NewToolServer(h.rt, toolServerPath)
 	h.cmds.set(toolServerPath, h.tools.Run)
 	h.cmds.set("rm", h.tools.Run)
@@ -2727,21 +2734,17 @@ func (h *toolsHub) tool(t *testing.T, id, cred, name string, body any) answer {
 	t.Helper()
 	var a answer
 	a.status, a.header, a.body = h.Exchange(t, http.MethodPost, "/api/v1"+toolPath(id, name), cred, body, nil)
-	var env struct {
-		Error *json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
-		_ = json.Unmarshal(*env.Error, &a.err)
-	}
+	a.readError()
 	return a
 }
 
-// sending sends method path, under /api/v1, with cred and the JSON body
-// under ctx, from another goroutine, and delivers the answer on the channel
-// it returns: with status 0 when the request got none.
-func (h *toolsHub) sending(ctx context.Context, method, path, cred string, body any) <-chan answer {
+// sending sends method path, under /api/v1, with cred, the JSON body and
+// the headers of header under ctx, from another goroutine, and delivers the
+// answer on the channel it returns: with status 0 when the request got
+// none, as when ctx ended first or the hub dropped the connection. A nil
+// body sends none, as hubtest's Call does.
+func (h *execHub) sending(ctx context.Context, method, path, cred string, body any, header http.Header) <-chan answer {
 	out := make(chan answer, 1)
-	// A nil body sends none, as hubtest's Call does.
 	var raw []byte
 	if body != nil {
 		raw, _ = json.Marshal(body)
@@ -2755,7 +2758,9 @@ func (h *toolsHub) sending(ctx context.Context, method, path, cred string, body 
 		}
 		req.Header.Set("Authorization", "Bearer "+cred)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header["Accept"] = mcpHeader["Accept"]
+		for k, vs := range header {
+			req.Header[k] = vs
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return
@@ -2766,14 +2771,20 @@ func (h *toolsHub) sending(ctx context.Context, method, path, cred string, body 
 			return
 		}
 		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
-		var env struct {
-			Error *json.RawMessage `json:"error"`
-		}
-		if json.Unmarshal(b, &env) == nil && env.Error != nil {
-			_ = json.Unmarshal(*env.Error, &a.err)
-		}
+		a.readError()
 	}()
 	return out
+}
+
+// readError reads the members of the error envelope of a's body, if it has
+// one.
+func (a *answer) readError() {
+	var env struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(a.body, &env) == nil && env.Error != nil {
+		_ = json.Unmarshal(*env.Error, &a.err)
+	}
 }
 
 // rpcAnswer is the answer to an MCP message: the HTTP answer and, when its
@@ -3014,32 +3025,7 @@ func (h *execHub) execAs(t *testing.T, cred, id string, body any, header http.He
 // request got none, as when ctx ended first or the hub dropped the
 // connection.
 func (h *execHub) execing(ctx context.Context, id string, body any, header http.Header) <-chan answer {
-	out := make(chan answer, 1)
-	raw, _ := json.Marshal(body)
-	go func() {
-		var a answer
-		defer func() { out <- a }()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL("/api/v1"+sandboxPath("ws", id)+"/exec"), bytes.NewReader(raw))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Authorization", "Bearer "+h.key)
-		req.Header.Set("Content-Type", "application/json")
-		for k, vs := range header {
-			req.Header[k] = vs
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return
-		}
-		a.status, a.header, a.body = resp.StatusCode, resp.Header, b
-	}()
-	return out
+	return h.sending(ctx, http.MethodPost, sandboxPath("ws", id)+"/exec", h.key, body, header)
 }
 
 // commands run the commands of an exec hub's runtime. main, a main process,

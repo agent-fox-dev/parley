@@ -228,7 +228,7 @@ func TestToolCall_RemovesItsRequestFileHoweverItEnds(t *testing.T) {
 	}
 	t.Run("a call that outlasts its bound", func(t *testing.T) {
 		_, waiting, _ := h.held()
-		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"})
+		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"}, nil)
 		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		h.clock.Advance(10 * time.Second)
 		if a := receive(t, answered); a.status != http.StatusOK {
@@ -277,7 +277,7 @@ func TestToolCall_EndsACallThatOutlastsItsBound(t *testing.T) {
 	h := startToolsHub(t, "max_concurrent_execs = 1\n")
 	id := h.tooled(t, nil)
 	_, waiting, killed := h.held()
-	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"})
+	answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"}, nil)
 	eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 	h.clock.Advance(9 * time.Second)
 	select {
@@ -312,7 +312,7 @@ func TestToolCall_CountsAmongTheSandboxesCommands(t *testing.T) {
 
 	t.Run("while a tool call runs", func(t *testing.T) {
 		release, waiting, _ := h.held()
-		first := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil)
+		first := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
 		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		uploads := h.opsOf(runtime.OpUpload, id)
 		busy(t, h.tool(t, id, h.key, "read_file", nil))
@@ -358,6 +358,7 @@ func TestToolCall_FailsWhenTheToolServerOrTheRuntimeDoes(t *testing.T) {
 		{"prints an array", printing(`[]`, "", 0)},
 		{"prints an object without ok", printing(`{}`, "", 0)},
 		{"prints an ok that is not a boolean", printing(`{"ok":"yes"}`, "", 0)},
+		{"prints an ok that is null", printing(`{"ok":null}`, "", 0)},
 		{"prints data that is not an object", printing(`{"ok":true,"data":[1]}`, "", 0)},
 		{"prints two objects", printing(`{"ok": true}{"ok": true}`, "", 0)},
 		{"prints more than 4 MiB", printing(`{"ok":true,"data":{"p":"`+strings.Repeat("d", 4<<20)+`"}}`, "", 0)},
@@ -514,7 +515,7 @@ func TestToolCall_LeavesOneEventForEveryCallThatStarted(t *testing.T) {
 	t.Run("a call that outlasts its bound", func(t *testing.T) {
 		_, waiting, _ := h.held()
 		before := len(h.toolEvents(t, id))
-		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"})
+		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, map[string]any{"timeout": "10s"}, nil)
 		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		h.clock.Advance(10 * time.Second)
 		receive(t, answered)
@@ -552,6 +553,8 @@ func TestToolCall_KeepsArgumentsAndResultsOutOfItsEvent(t *testing.T) {
 	for _, prints := range []string{
 		`{"ok":true,"data":{"content":"` + out + `"},"text":"` + out + `"}`,
 		`{"ok":false,"error":"not_found","detail":"` + out + `","data":{"path":"` + out + `"}}`,
+		// A tool server's error is a code; what is not one is cut short.
+		`{"ok":false,"error":"` + strings.Repeat("e", 100) + out + `","data":{}}`,
 	} {
 		h.tools.SetCall(printing(prints, out, 0))
 		decoded(t, h.tool(t, id, h.key, "read_file", map[string]any{"input": map[string]any{"path": in}}), http.StatusOK)
@@ -582,8 +585,8 @@ func TestToolCall_KeepsArgumentsAndResultsOutOfItsEvent(t *testing.T) {
 			}
 		}
 	}
-	if err := rows.Err(); err != nil || n != 4 {
-		t.Errorf("read %d events (%v); want the four calls'", n, err)
+	if err := rows.Err(); err != nil || n != 6 {
+		t.Errorf("read %d events (%v); want the six calls'", n, err)
 	}
 	if log := h.Log.String(); strings.Contains(log, in) || strings.Contains(log, out) {
 		t.Error("the hub's log holds an argument or a part of a result")
@@ -616,7 +619,6 @@ func TestToolCall_RecordsNothingForARequestThatNeverRan(t *testing.T) {
 		call func(t *testing.T) int
 		want int
 	}{
-		{"a listing over REST", func(t *testing.T) int { a, _ := h.list(t, id, h.key); return a.status }, 200},
 		{"a listing over MCP", func(t *testing.T) int { return h.mcp(t, id, h.memberKey, "tools/list", nil, nil).status }, 200},
 		{"a tool outside the caller's set", func(t *testing.T) int { return h.tool(t, id, h.memberKey, "execute", nil).status }, 403},
 		{"a tool no set holds", func(t *testing.T) int { return h.tool(t, id, h.key, "no_such_tool", nil).status }, 404},
@@ -665,7 +667,7 @@ func TestToolCall_RecordsNothingForARequestThatNeverRan(t *testing.T) {
 
 func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
 	t.Parallel()
-	h := startToolsHub(t, "max_concurrent_execs = 1\n")
+	h := startToolsHub(t, "max_concurrent_execs = 2\n")
 	id := h.tooled(t, nil)
 	h.listed(t, id, h.key, nil)
 	_, waiting, killed := h.held()
@@ -676,18 +678,26 @@ func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
 		if len(evs) != len(vias) {
 			t.Fatalf("the sandbox has %d tool call events; want %d", len(evs), len(vias))
 		}
-		for i, via := range vias {
+		var got []string
+		for i := range evs {
+			via, _ := evs[i].metadata["via"].(string)
+			got = append(got, via)
 			delete(evs[i].metadata, "duration_ms")
 			failed["via"] = via
 			if !reflect.DeepEqual(evs[i].metadata, failed) {
 				t.Errorf("event %d has the metadata %v; want %v", i, evs[i].metadata, failed)
 			}
 		}
+		slices.Sort(got)
+		slices.Sort(vias)
+		if !slices.Equal(got, vias) {
+			t.Errorf("the events came through %v; want %v", got, vias)
+		}
 	}
 
 	t.Run("when its caller leaves", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		answered := h.sending(ctx, http.MethodPost, toolPath(id, "execute"), h.key, nil)
+		answered := h.sending(ctx, http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
 		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		cancel()
 		if a := <-answered; a.status != 0 {
@@ -703,28 +713,35 @@ func TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed(t *testing.T) {
 	t.Run("when its caller leaves an MCP call", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		answered := h.sending(ctx, http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
-			map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}})
+			map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}}, mcpHeader)
 		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
 		cancel()
 		<-answered
 		eventually(t, "the tool server to be killed", func() bool { return killed.Load() == 2 })
 		eventually(t, "the call's event", func() bool { return len(h.toolEvents(t, id)) == 2 })
 		wantEvents(t, "rest", "mcp")
+		if got, want := h.toolCallSamples(t), []string{`tool="execute",outcome="failed" 2`}; !slices.Equal(got, want) {
+			t.Errorf("the tool call counter has the samples %v; want %v", got, want)
+		}
 	})
 	t.Run("when the hub begins to stop", func(t *testing.T) {
-		answered := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil)
-		eventually(t, "the call to run", func() bool { return waiting.Load() == 1 })
+		overREST := h.sending(context.Background(), http.MethodPost, toolPath(id, "execute"), h.key, nil, nil)
+		overMCP := h.sending(context.Background(), http.MethodPost, sandboxPath("ws", id)+"/mcp", h.key,
+			map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "execute"}}, mcpHeader)
+		eventually(t, "the calls to run", func() bool { return waiting.Load() == 2 })
 		h.Stop()
 		if code := h.ExitCode(t, 10*time.Second); code != 0 {
 			t.Fatalf("the hub stopped with %d; want 0", code)
 		}
-		if a := receive(t, answered); a.status != 0 {
-			t.Errorf("the caller got %d %s; want no answer", a.status, a.body)
+		for name, answered := range map[string]<-chan answer{"REST": overREST, "MCP": overMCP} {
+			if a := receive(t, answered); a.status != 0 {
+				t.Errorf("the caller over %s got %d %s; want no answer", name, a.status, a.body)
+			}
 		}
-		if killed.Load() != 3 {
-			t.Errorf("the runtime killed %d tool servers; want 3", killed.Load())
+		if killed.Load() != 4 {
+			t.Errorf("the runtime killed %d tool servers; want 4", killed.Load())
 		}
 		h.Restart(t)
-		wantEvents(t, "rest", "mcp", "rest")
+		wantEvents(t, "rest", "mcp", "rest", "mcp")
 	})
 }

@@ -47,6 +47,9 @@ const (
 	// maxToolStderr is how much of the tool server's error output is kept
 	// for the message of a failed call.
 	maxToolStderr = 64 << 10
+	// maxToolErrorCode is how many characters of a tool's error code a
+	// call's event keeps.
+	maxToolErrorCode = 64
 	// removeTimeout bounds the removal of a request file, which runs after
 	// the caller may have left.
 	removeTimeout = 10 * time.Second
@@ -125,11 +128,10 @@ const eventTimeout = 5 * time.Second
 
 // toolCall is one call of one tool, through either route.
 type toolCall struct {
-	// via is viaREST or viaMCP, slug the workspace the request names and
-	// caller who sent it.
-	via, slug string
-	caller    identity.Principal
-	rec       Record
+	// via is viaREST or viaMCP and caller who sent the request.
+	via    string
+	caller identity.Principal
+	rec    Record
 	// set is the caller's tool set and tool the tool's name.
 	set, tool string
 	// input is the tool's input, a JSON object.
@@ -240,7 +242,7 @@ func (c *toolCaller) serve(w http.ResponseWriter, r *http.Request, u useRequest)
 		return err
 	}
 	res, ms, err := c.call(r, toolCall{
-		via: viaREST, slug: u.slug, caller: u.caller, rec: u.rec, set: u.set, tool: name,
+		via: viaREST, caller: u.caller, rec: u.rec, set: u.set, tool: name,
 		input: u.tool.input, bound: c.bound(u.tool.timeout),
 	})
 	switch {
@@ -377,7 +379,10 @@ func (c *toolCaller) record(ctx context.Context, tc toolCall, res toolResult, er
 	case err == nil && timedOut:
 		meta["error"], outcome = toolErrorTimeout, toolOutcomeTimeout
 	case err == nil:
-		meta["error"], outcome = res.Error, toolOutcomeError
+		// The tool server says what its code is; what it says is held to
+		// the length of one and cleared like every text about a sandbox.
+		code := s.ScrubSandbox(context.WithoutCancel(ctx), tc.rec.ID, cutRunes(res.Error, maxToolErrorCode))
+		meta["error"], outcome = s.scrub(code), toolOutcomeError
 	case errors.As(err, &answer) || errors.Is(err, errToolAbandoned):
 		// A call nobody waits for any more gave no result either.
 		meta["error"] = errorTypeToolServerFailed
@@ -454,7 +459,11 @@ func readToolResult(code int, stdout, stderr []byte) (res toolResult, problem st
 	if err := decodeOne(stdout, '{', &members); err != nil {
 		return res, "it printed something that is not one JSON object"
 	}
-	if json.Unmarshal(members["ok"], &res.OK) != nil || len(members["ok"]) == 0 {
+	switch string(bytes.TrimSpace(members["ok"])) {
+	case "true":
+		res.OK = true
+	case "false":
+	default:
 		return res, "its result has no boolean ok"
 	}
 	res.Data = json.RawMessage(`{}`)

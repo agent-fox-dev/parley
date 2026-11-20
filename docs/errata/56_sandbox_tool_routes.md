@@ -14,9 +14,11 @@ outside JSON-RPC, and it serves the methods of resources, prompts,
 completion and logging whether or not the server holds any. The route
 therefore reads the method of a request before the SDK does, and answers one
 it does not serve with the JSON-RPC error `-32601` (`method "<m>" is not
-served`). Notifications and everything that is not one request go to the
-SDK. This is the only JSON-RPC answer the hub writes by hand. Code:
-`unservedMCPMethod` in `internal/sandbox/tools_mcp.go`; test:
+served`), and a batch, in which such a method would reach the SDK, with
+`-32600` (`batches are not served`). Notifications and everything else that
+is not one request go to the SDK. These are the only JSON-RPC answers the
+hub writes by hand. Code: `unservedMCPMessage` in
+`internal/sandbox/tools_mcp.go`; test:
 `TestMCP_AnswersAnyOtherMethodNotFound`.
 
 ## `tools/list` is answered in the tool server's order
@@ -51,9 +53,27 @@ The server of an MCP request is built from the caller's tool definitions
 before the SDK reads the message. While they cannot be read, every request
 to the route, `initialize` and `ping` included, is answered `502
 tool_server_failed` (or `sandbox_runtime_error`) as plain HTTP. The same
-answer is given to a definition whose input schema does not have the type
-`object`, which MCP requires and the SDK panics on; the REST listing serves
-such a definition as it is.
+answer is given to a definition the SDK does not take and panics on: an
+input schema that does not have the type `object`, a schema nested deeper
+than it reads, an annotation it refuses. The REST listing serves such a
+definition as it is. Test:
+`TestMCP_AnswersDefinitionsItCannotServeAsAFailedToolServer`.
+
+## A token bound to another workspace is `404`, as on the logs route
+
+The package's contract lists `403 forbidden` for a workspace-bound token of
+another workspace. The binding guard answers such a token `404 not_found`
+on every route of a workspace, the logs route included, and the criterion
+asks for what the logs route answers, so the three routes answer `404`.
+Test: `TestTools_RefuseACallerTheLogsRouteRefusesTheSameWay`.
+
+## An abandoned MCP call gets no answer
+
+The SDK writes a JSON-RPC error for whatever a tool handler returns. For a
+call whose caller left or that ran when the hub began to stop, the route
+drops what the SDK writes and then the connection, as the REST route does.
+Code: `abandonableWriter`; test:
+`TestToolCall_EndsACallNobodyWaitsForAndRecordsItAsFailed`.
 
 ## `input: null` is an absent input
 
@@ -72,6 +92,14 @@ REST answer promises `data` as an object. An absent or `null` `data` is
 `{}`.
 
 ## Smaller choices
+
+- A tool's error code is kept in the call's event up to 64 characters, and
+  scrubbed like every text about a sandbox: nothing holds a tool server to
+  printing a code.
+- Two definitions of one name are a failed listing.
+- The definitions kept of a sandbox are dropped when it leaves `ready` and
+  again when it becomes `ready`, so that a request that passed the gate
+  just before it left cannot leave old ones behind.
 
 - A tool server's error output is kept up to 64 KiB for the message of a
   failed call, which is then cut to 1,024 bytes.

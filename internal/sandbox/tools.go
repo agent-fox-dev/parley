@@ -122,8 +122,10 @@ func (t *toolDefs) entry(id, set string) *toolDefsEntry {
 	return e
 }
 
-// forget drops what is kept of the sandbox id, which has left ready: its
-// tool server may not be the same when it is ready again.
+// forget drops what is kept of the sandbox id, which has left ready or has
+// become ready: its tool server may not be the same when it is ready again,
+// and a request that passed the gate before the sandbox left ready may have
+// kept definitions after it left.
 func (t *toolDefs) forget(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -178,11 +180,16 @@ func (s *Service) readToolDefinitions(ctx context.Context, rec Record, set strin
 	if err := decodeOne(res.Stdout, '[', &defs); err != nil {
 		return fail("it printed something that is not one JSON array of definitions")
 	}
+	names := make(map[string]bool, len(defs))
 	for i := range defs {
 		d := &defs[i]
 		if d.Name == "" {
 			return fail("definition %d has no name", i+1)
 		}
+		if names[d.Name] {
+			return fail("definition %d repeats a name", i+1)
+		}
+		names[d.Name] = true
 		if schema := bytes.TrimSpace(d.InputSchema); len(schema) == 0 || schema[0] != '{' {
 			return fail("the input schema of %q is not an object", d.Name)
 		}
