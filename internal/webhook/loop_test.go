@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"net"
 	"net/http"
 	"reflect"
 	"slices"
@@ -70,6 +71,47 @@ func TestDelivery_SendsANewEventAtOnceAndRecordsItsSuccess(t *testing.T) {
 	}
 	if n := len(in.requests()); n != 1 {
 		t.Errorf("the receiver got %d requests, want 1", n)
+	}
+}
+
+func TestDelivery_RecordsWhyAFailedAttemptFailed(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedURL := "http://" + closed.Addr().String() + "/hook"
+	closed.Close()
+	answer := func(status int) string {
+		return newInbox(t, func(delivered, <-chan struct{}) int { return status }).url()
+	}
+	rows := []struct {
+		name    string
+		url     string
+		code    int64
+		failure string
+	}{
+		{"a 500 status", answer(http.StatusInternalServerError), 500, ""},
+		{"a 101 status", answer(http.StatusSwitchingProtocols), 101, ""},
+		{"a 302 status", answer(http.StatusFound), 302, "redirect"},
+		{"a closed port", closedURL, 0, "connection_failed"},
+	}
+	ids := make([]string, len(rows))
+	for i, row := range rows {
+		ids[i] = w.subscribe(t, demo, map[string]any{"url": row.url, "types": testTypes})
+	}
+	seq := w.emit(t, demo, "parley.test.event", "")
+
+	for i, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			d := w.retrying(t, ids[i], 1)
+			if d.seq != seq || d.responseCode.Valid != (row.code != 0) || d.responseCode.Int64 != row.code ||
+				d.err.Valid != (row.failure != "") || d.err.String != row.failure {
+				t.Errorf("delivery = %+v, want seq %d with response_code %d (null for 0) and error %q (null for none)",
+					d, seq, row.code, row.failure)
+			}
+		})
 	}
 }
 

@@ -475,6 +475,19 @@ func TestSend_FailsAndRecordsWhyOnAnyOtherEnd(t *testing.T) {
 		{name: "500", code: 500, target: func(t *testing.T) (string, func(*testing.T)) {
 			return newReceiver(t, false, answerStatus(500)).URL + "/h", nil
 		}},
+		// 101 is the one 100-class status an HTTP client takes as final.
+		{name: "101", code: 101, target: func(t *testing.T) (string, func(*testing.T)) {
+			return newReceiver(t, false, answerStatus(101)).URL + "/h", nil
+		}},
+		// Any other 100-class status is informational: the client reads it
+		// and waits on for the final one.
+		{name: "103 and then no final status for 3s", failure: "timeout", target: func(t *testing.T) (string, func(*testing.T)) {
+			return newReceiver(t, false, func(w http.ResponseWriter, r *http.Request, stop <-chan struct{}) {
+				w.WriteHeader(http.StatusEarlyHints)
+				stall(r, stop, 3*time.Second)
+				w.WriteHeader(http.StatusOK)
+			}).URL + "/h", nil
+		}},
 		{name: "302 to a second receiver", code: 302, failure: "redirect", target: func(t *testing.T) (string, func(*testing.T)) {
 			second := newReceiver(t, false, answerStatus(200))
 			first := newReceiver(t, false, func(w http.ResponseWriter, r *http.Request, _ <-chan struct{}) {
