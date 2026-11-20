@@ -46,9 +46,14 @@ func failedResult(code, format string, args ...any) toolResult {
 // toolSession is the tools of one run of parley mcp and what a call of one
 // runs with: the hub and the credential, read once when the session starts.
 type toolSession struct {
-	opts  options
-	st    settings
-	tools []commandTool
+	opts options
+	st   settings
+	// settings are the flags the session was started with.
+	settings mcpSettings
+	tools    []commandTool
+	// sandboxTools are the tools of the session's sandbox, read from the
+	// hub when the session starts; none without --sandbox.
+	sandboxTools []sandboxTool
 	// codeMode says whether code_mode is served, and scriptTimeout bounds
 	// one of its scripts' wall time.
 	codeMode      bool
@@ -79,6 +84,9 @@ func readScriptTimeout(value string) (time.Duration, error) {
 // newToolSession builds the session of the settings s over the command tree
 // of opts, for the hub and the credential of st.
 func newToolSession(opts options, st settings, s mcpSettings) (*toolSession, error) {
+	if s.sandbox != "" && s.workspace == "" {
+		return nil, usageError("--sandbox names a sandbox of a workspace: give the workspace with --workspace")
+	}
 	tools, err := commandTools(newRootCommand(opts), s)
 	if err != nil {
 		return nil, err
@@ -90,7 +98,7 @@ func newToolSession(opts options, st settings, s mcpSettings) (*toolSession, err
 	if err != nil {
 		return nil, err
 	}
-	return &toolSession{opts: opts, st: st, tools: tools, codeMode: !s.noCodeMode, scriptTimeout: scriptTimeout}, nil
+	return &toolSession{opts: opts, st: st, settings: s, tools: tools, codeMode: !s.noCodeMode, scriptTimeout: scriptTimeout}, nil
 }
 
 // call calls the tool name with the JSON parameters input.

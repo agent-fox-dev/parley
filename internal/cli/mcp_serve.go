@@ -47,13 +47,20 @@ func mcpInstructions(s mcpSettings) string {
 var shellTools = []string{"execute", "run_command"}
 
 // served are the tools the session serves, in the order it serves them: the
-// command tools and then code_mode, agentkit-go's tool that runs a script
+// command tools, the tools of its sandbox and then code_mode, agentkit-go's tool that runs a script
 // over all the others, unless the session leaves it out. descriptionBytes
 // is the size of code_mode's description, which declares every tool it is
 // bound to; 0 without it.
 func (s *toolSession) served() (tools []core.Tool, descriptionBytes int, err error) {
-	if tools, err = s.coreTools(); err != nil || !s.codeMode {
-		return tools, 0, err
+	if tools, err = s.coreTools(); err != nil {
+		return nil, 0, err
+	}
+	ofSandbox, err := s.sandboxCoreTools()
+	if err != nil {
+		return nil, 0, err
+	}
+	if tools = append(tools, ofSandbox...); !s.codeMode {
+		return tools, 0, nil
 	}
 	codeMode, info, err := codemode.New(tools, codemode.Options{MaxTimeout: s.scriptTimeout})
 	if err != nil {

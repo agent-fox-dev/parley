@@ -91,11 +91,19 @@ func runMCPCommand(c *call) error {
 	if err != nil {
 		return err
 	}
-	if s.list {
+	// Only a sandbox's tools are read from the hub, so --list without one
+	// needs neither a hub URL nor a credential.
+	if s.list && s.sandbox == "" {
 		return printTools(c, session)
 	}
 	if session.st, err = resolveSettings(c.cmd); err != nil {
 		return err
+	}
+	if err := session.loadSandboxTools(c.ctx); err != nil {
+		return err
+	}
+	if s.list {
+		return printTools(c, session)
 	}
 	return session.serve(c.ctx, c.stderr, s)
 }

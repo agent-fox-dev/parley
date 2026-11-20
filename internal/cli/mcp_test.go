@@ -487,6 +487,9 @@ func toolSessionOn(t *testing.T, opts options, hubURL string, s mcpSettings) *to
 	unsetEnv(t, "PARLEY_ENDPOINT_URL")
 	unsetEnv(t, "PARLEY_API_KEY")
 	session, err := newToolSession(opts, settings{hubURL: hubURL, credential: "k"}, s)
+	if err == nil {
+		err = session.loadSandboxTools(t.Context())
+	}
 	if err != nil {
 		t.Fatalf("build the tools of %+v: %v", s, err)
 	}
@@ -1167,5 +1170,182 @@ func TestMCP_RefusesAScriptTimeoutOutOfRange(t *testing.T) {
 		if code, _, stderr := runMCP(t, defaultOptions(), "--list", "--script-timeout", value); code != 0 {
 			t.Errorf("--script-timeout %s: exit status %d, %s; want it accepted", value, code, stderr)
 		}
+	}
+}
+
+// sandboxToolsPath is the route of the tools of the sandbox sbx_1 of demo.
+const sandboxToolsPath = "/api/v1/workspaces/demo/sandboxes/sbx_1/tools"
+
+// sandboxToolList is what the hub answers for the tools of a sandbox: the
+// set and one definition per name.
+func sandboxToolList(set string, names ...string) string {
+	type definition struct {
+		Name         string         `json:"name"`
+		Description  string         `json:"description"`
+		InputSchema  map[string]any `json:"input_schema"`
+		OutputSchema any            `json:"output_schema"`
+	}
+	defs := make([]definition, 0, len(names))
+	for _, name := range names {
+		defs = append(defs, definition{
+			Name: name, Description: "The sandbox's " + name + ".",
+			InputSchema: map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string", "description": "a path of " + name}}},
+		})
+	}
+	out, _ := json.Marshal(map[string]any{"set": set, "tools": defs})
+	return string(out)
+}
+
+// onSandbox are the settings of parley mcp for the sandbox sbx_1 of demo.
+func onSandbox(s mcpSettings) mcpSettings {
+	s.workspace, s.sandbox = "demo", "sbx_1"
+	return s
+}
+
+func TestSandboxTools_AreServedBesideTheCommandToolsAndBoundToCodeMode(t *testing.T) {
+	hub := newStubHub(t).
+		answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file", "edit_file", "execute")).
+		answer(http.MethodPost, sandboxToolsPath+"/read_file", http.StatusOK, `{"ok":true,"data":{"content":"hello"},"duration_ms":3}`).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, changeThree)
+
+	tools := mcpList(t, defaultOptions(), onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1")...)
+	names := toolNames(tools)
+	if tail := names[len(names)-4:]; !slices.Equal(tail, []string{"read_file", "edit_file", "execute", "code_mode"}) {
+		t.Errorf("the tools end with %v; want the sandbox's tools in the hub's order and then code_mode", tail)
+	}
+	read := toolNamed(t, tools, "read_file")
+	if read.Description != "The sandbox's read_file." || read.InputSchema.Properties["path"]["description"] != "a path of read_file" {
+		t.Errorf("read_file is listed as %+v; want the hub's description and input schema", read)
+	}
+	if n := hub.count(http.MethodGet); n != 1 {
+		t.Errorf("the hub got %d GETs for the list, want one of the sandbox's tools", n)
+	}
+
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, onSandbox(withCodeMode()))
+	res := runScript(t, r, `
+def main():
+    return read_file(path="a.txt")["content"] + ":" + change_show(number="3")["title"]
+`)
+	if !res.OK || !strings.Contains(resultText(res), "hello:One") {
+		t.Errorf("a script over a sandbox tool and a command is %+v; want hello:One", res)
+	}
+}
+
+func TestSandboxTools_RelayACallToTheHubAndGiveItsResultAsItIs(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file"))
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, onSandbox(mcpDefaults()))
+	const call = sandboxToolsPath + "/read_file"
+
+	hub.answer(http.MethodPost, call, http.StatusOK, `{"ok":true,"data":{"content":"x"},"text":"x","duration_ms":3}`)
+	res := runTool(t, r, "read_file", map[string]any{"path": "a.txt"})
+	if !res.OK || res.Data["content"] != "x" || res.Text != "x" {
+		t.Errorf("the result is %+v; want the hub's data and text", res)
+	}
+	if sent := hub.last(t); sent.method != http.MethodPost || sent.path != call || sent.header.Get("Authorization") != "Bearer k" {
+		t.Errorf("the call sent %s %s with %q", sent.method, sent.path, sent.header.Get("Authorization"))
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(hub.last(t).body), &body); err != nil || !reflect.DeepEqual(body, map[string]any{"input": map[string]any{"path": "a.txt"}}) {
+		t.Errorf("the call's body is %s; want the parameters as input and nothing else", hub.last(t).body)
+	}
+
+	hub.answer(http.MethodPost, call, http.StatusOK, `{"ok":false,"data":{},"error":"not_found","detail":"no such file","duration_ms":2}`)
+	res = runTool(t, r, "read_file", map[string]any{"path": "nope"})
+	if res.OK || res.Error != "not_found" || res.Detail != "no such file" {
+		t.Errorf("a tool that failed is %+v; want the hub's error and detail", res)
+	}
+}
+
+func TestSandboxTools_GiveAnErrorOfTheHubAsAFailedResult(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file"))
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, onSandbox(mcpDefaults()))
+	for _, row := range []struct {
+		status    int
+		errorType string
+	}{{409, "sandbox_not_ready"}, {429, "rate_limited"}, {403, "insufficient_scope"}, {502, "tool_server_failed"}} {
+		t.Run(row.errorType, func(t *testing.T) {
+			hub.answer(http.MethodPost, sandboxToolsPath+"/read_file", row.status, fmt.Sprintf(`{"error":{"code":%d,"message":"refused","error_type":%q}}`, row.status, row.errorType))
+			res := runTool(t, r, "read_file", map[string]any{"path": "a.txt"})
+			if res.OK || res.Error != row.errorType || res.Detail != "refused" {
+				t.Errorf("the result is %+v; want a failed one with the hub's error", res)
+			}
+		})
+	}
+	hub.answer(http.MethodPost, sandboxToolsPath+"/read_file", http.StatusBadGateway, "bad gateway")
+	if res := runTool(t, r, "read_file", map[string]any{"path": "a.txt"}); res.OK || res.Error != "http_502" {
+		t.Errorf("an answer without an envelope is %+v; want the error http_502", res)
+	}
+	hub.answer(http.MethodPost, sandboxToolsPath+"/read_file", http.StatusOK, `{"ok":true,"data":{}}`)
+	if res := runTool(t, r, "read_file", map[string]any{"path": "a.txt"}); !res.OK {
+		t.Errorf("the next call is %+v; want it to succeed", res)
+	}
+}
+
+func TestMCP_RefusesASandboxWithoutAWorkspace(t *testing.T) {
+	for _, list := range []bool{true, false} {
+		hub := newStubHub(t)
+		args := onHub(hub.URL, "--sandbox", "sbx_1")
+		if list {
+			args = append(args, "--list")
+		}
+		code, stdout, stderr := runMCP(t, defaultOptions(), args...)
+		wantUsageError(t, code, stdout, stderr, "--workspace")
+		if n := hub.requestCount(); n != 0 {
+			t.Errorf("%d requests were sent, want none", n)
+		}
+	}
+}
+
+func TestMCP_EndsWithTheHubsRefusalWhenItCannotReadTheSandboxsTools(t *testing.T) {
+	for _, row := range []struct {
+		status    int
+		errorType string
+	}{{404, "tools_unavailable"}, {409, "sandbox_not_ready"}, {404, "sandbox_not_found"}, {403, "insufficient_scope"}} {
+		for _, list := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, --list %v", row.errorType, list), func(t *testing.T) {
+				envelope := fmt.Sprintf(`{"error":{"code":%d,"message":"refused","error_type":%q}}`, row.status, row.errorType)
+				hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, row.status, envelope)
+				args := onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1")
+				if list {
+					args = append(args, "--list")
+				}
+				code, stdout, stderr := runMCP(t, defaultOptions(), args...)
+				if code != exitHubError || stdout != "" || stderr != indented(t, envelope) {
+					t.Errorf("exit status %d, stdout %q, stderr %q; want 1, nothing and the hub's envelope", code, stdout, stderr)
+				}
+			})
+		}
+	}
+}
+
+func TestMCP_RefusesASandboxToolNamedLikeAnotherTool(t *testing.T) {
+	for _, row := range []struct{ tool, clashesWith string }{{"change_show", "change show"}, {"code_mode", "code_mode"}} {
+		t.Run(row.tool, func(t *testing.T) {
+			hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", "read_file", row.tool))
+			code, stdout, stderr := runMCP(t, defaultOptions(), onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1", "--list")...)
+			var env cliEnvelope
+			if code != exitClientError || stdout != "" || json.Unmarshal([]byte(stderr), &env) != nil || env.Error.ErrorType != clientErrorType ||
+				!strings.Contains(env.Error.Message, row.tool) || !strings.Contains(env.Error.Message, row.clashesWith) {
+				t.Errorf("exit status %d, stdout %q, stderr %q; want 2 and a client_error naming %s and %s", code, stdout, stderr, row.tool, row.clashesWith)
+			}
+		})
+	}
+}
+
+func TestSandboxTools_AreOnlyTheOnesThatChangeNothingWithReadOnly(t *testing.T) {
+	all := []string{"read_file", "write_file", "edit_file", "execute", "run_command", "search_files"}
+	hub := newStubHub(t).answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("full", all...))
+	args := onHub(hub.URL, "--workspace", "demo", "--sandbox", "sbx_1", "--groups", "scm", "--no-code-mode")
+	names := toolNames(mcpList(t, defaultOptions(), append(args, "--read-only")...))
+	if tail := names[len(names)-2:]; !slices.Equal(tail, []string{"read_file", "search_files"}) || slices.Contains(names, "execute") || slices.Contains(names, "scm_commit") {
+		t.Errorf("--read-only serves %v; want the reading commands and of the sandbox read_file and search_files", names)
+	}
+	if names := toolNames(mcpList(t, defaultOptions(), args...)); !slices.Equal(names[len(names)-6:], all) {
+		t.Errorf("without --read-only the sandbox's tools are %v; want all six", names[len(names)-6:])
+	}
+	hub.answer(http.MethodGet, sandboxToolsPath, http.StatusOK, sandboxToolList("read_only", "read_file", "search_files", "code_search"))
+	names = toolNames(mcpList(t, defaultOptions(), append(args, "--read-only")...))
+	if tail := names[len(names)-3:]; !slices.Equal(tail, []string{"read_file", "search_files", "code_search"}) {
+		t.Errorf("of a set the hub gives as read-only, %v is served; want every tool of it", tail)
 	}
 }

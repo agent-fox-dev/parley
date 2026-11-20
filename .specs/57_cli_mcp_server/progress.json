@@ -3,7 +3,7 @@
   "spec_id": "57",
   "spec_name": "cli_mcp_server",
   "schema_version": 3,
-  "updated_at": "2026-11-20T19:41:57Z",
+  "updated_at": "2026-11-20T19:47:46Z",
   "tasks": [
     {
       "id": 1,
@@ -578,7 +578,121 @@
     },
     {
       "id": 5,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-6.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_AreServedBesideTheCommandToolsAndBoundToCodeMode",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_RelayACallToTheHubAndGiveItsResultAsItIs",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.3",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_GiveAnErrorOfTheHubAsAFailedResult",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesASandboxWithoutAWorkspace",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.5",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_EndsWithTheHubsRefusalWhenItCannotReadTheSandboxsTools",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_RefusesASandboxToolNamedLikeAnotherTool",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-6.7",
+          "tests": [
+            {
+              "test": "./internal/cli:TestSandboxTools_AreOnlyTheOnesThatChangeNothingWithReadOnly",
+              "failed": {
+                "at": "2026-11-20T19:42:52Z",
+                "tree": "e18cdffc7fae9910e3f904698cc3a964ac0cac13"
+              },
+              "passed": {
+                "at": "2026-11-20T19:47:46Z",
+                "tree": "577d9667e21de29665073164b8ec708bf56dd28c"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 6,
