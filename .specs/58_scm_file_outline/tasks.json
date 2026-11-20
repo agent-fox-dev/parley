@@ -1,0 +1,107 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/tasks.v3.json",
+  "spec_id": "58",
+  "spec_name": "scm_file_outline",
+  "schema_version": 3,
+  "test_commands": {
+    "all_tests": "go test ./... -count=1",
+    "linter": "golangci-lint run ./...",
+    "spec_tests": "go test ./internal/scm/... ./internal/cli/... ./internal/metrics/... ./test/e2e/... -count=1"
+  },
+  "dependencies": [
+    {
+      "spec": "20",
+      "reason": "adds a read route to the source control component and uses its route helper, resolver, file lookup, read timeout, caching and recorder"
+    },
+    {
+      "spec": "09",
+      "reason": "declares parley scm outline through the command helper, beside the other scm reads"
+    },
+    {
+      "spec": "57",
+      "reason": "parley mcp serves the new command as the tool scm_outline, which a test of its listing asserts"
+    },
+    {
+      "spec": "54",
+      "reason": "changes how the hub image builds parleyd, and extends the image's test"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Serve GET …/scm/outline",
+      "criteria": [
+        "REQ-1",
+        "REQ-2"
+      ],
+      "steps": [
+        "Add a row for the outline route to the table scmRoutes of internal/scm/helpers_test.go, so that the access, caching, timeout and recorder tests cover it, write the route's own behaviours in a new internal/scm/outline_test.go and, under the build constraint cgo, the table of the fifteen languages in internal/scm/outline_cgo_test.go, and confirm they fail",
+        "Declare GET /workspaces/:slug/scm/outline with the component's route helper under the new op outline, and add outline to the values of the label op of parley_scm_requests_total in the metrics catalogue and its test",
+        "Read path with the file route's path check and ref with the resolver, the default branch when absent; give the answer its caching headers from the resolved commit before anything of the file is read, so that a current copy costs no read",
+        "Look the path up at the commit as the file route does: 404 path_not_found, 400 for a directory or a submodule. A symbolic link is answered 200 with supported false, language \"\" and no declarations, without reading its target",
+        "Refuse a file over 1 MiB with 413 payload_too_large and its size before reading it; read the bytes; refuse a file with a NUL byte in its first 8,000 bytes with 422 binary_file naming the path, using the probe blame uses",
+        "Outline the bytes with outline.Outline of github.com/agent-fox-dev/agentkit-go/outline under the request's context, which ends at the read timeout; an error of a cancelled context is left to the read wrapper, which answers 503 scm_timeout",
+        "Answer 200 with path, resolved_sha, language (the outline's Lang), supported (its backend is not none) and declarations: kind, name, container, signature, exported, start_line, end_line, in the outline's order and [] when there are none",
+        "Run go mod tidy: the outline package brings the tree-sitter grammar modules into go.mod. Confirm that cmd/parley still builds with CGO_ENABLED=0 and that its dependencies name none of them",
+        "Describe the route, its answer, its errors and the op outline in docs/api.md, and the outline in the source control part of docs/architecture.md"
+      ],
+      "touches": [
+        "internal/scm/outline.go",
+        "internal/scm/outline_test.go",
+        "internal/scm/outline_cgo_test.go",
+        "internal/scm/handler.go",
+        "internal/scm/helpers_test.go",
+        "internal/scm/blame.go",
+        "internal/metrics/catalogue.go",
+        "internal/metrics/catalogue_test.go",
+        "go.mod",
+        "go.sum",
+        "docs/api.md",
+        "docs/architecture.md"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Add parley scm outline",
+      "criteria": [
+        "REQ-3.1",
+        "REQ-3.2",
+        "REQ-3.3"
+      ],
+      "steps": [
+        "Add the command's rows to the tables of internal/cli/scm_test.go and the tool's check to internal/cli/mcp_test.go, and confirm they fail",
+        "Declare outline among the scm reads of internal/cli/scm.go, as blame is declared: the arguments slug and path, both required, the path sent as the query parameter path, and the flag --ref with the reads' shared ref flag",
+        "Nothing is done for parley mcp: the command is in the group scm and its route is a GET, so it is the tool scm_outline in a default and in a read-only session",
+        "Describe the command in docs/cli.md beside the other scm reads"
+      ],
+      "touches": [
+        "internal/cli/scm.go",
+        "internal/cli/scm_test.go",
+        "internal/cli/mcp_test.go",
+        "docs/cli.md"
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Build parleyd with cgo in the hub image",
+      "criteria": [
+        "REQ-3.4"
+      ],
+      "steps": [
+        "Extend the hub image's test in test/image/hub_test.go with the outline of a Python file and the run of the image's parley, and, where a container engine is at hand, confirm it fails; without one, say so in the report: the image tests skip, and the criterion stays unshown",
+        "In containers/hub/Dockerfile, build parleyd with CGO_ENABLED=1 in a build stage that holds a C toolchain (build-base on the alpine Go image), and parley in a go build of its own with CGO_ENABLED=0; keep the linker flags and the build arguments of both",
+        "Keep the runtime stage on the alpine image the build stage's C library matches, so that parleyd starts without any package added for it; add none unless the binary needs one, and name it in the Dockerfile's comment if it does",
+        "Extend the test of test/e2e/build_test.go that builds the binaries: cmd/parleyd builds with cgo, and cmd/parley, as before, with CGO_ENABLED=0",
+        "Say in README.md, where it says how to build, that parleyd needs a C toolchain to outline languages other than Go and that parley needs none; describe the image's two builds in the packaging part of docs/architecture.md"
+      ],
+      "touches": [
+        "containers/hub/Dockerfile",
+        "test/image/hub_test.go",
+        "test/e2e/build_test.go",
+        "test/e2e/scm_read_test.go",
+        "README.md",
+        "docs/architecture.md"
+      ]
+    }
+  ]
+}
