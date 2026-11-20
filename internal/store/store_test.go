@@ -234,6 +234,50 @@ func TestOpen_AppliesOnlyTheSchemaStepsNotYetRecorded(t *testing.T) {
 	}
 }
 
+func TestStore_ListsTheAppliedStepsInOrderOfApplicationAndTheRegisteredOnes(t *testing.T) {
+	t.Parallel()
+	opts := options(t.TempDir())
+	ctx := context.Background()
+	rec := &recorder{}
+	t1 := rec.step("t1", store.Main, `CREATE TABLE a (id INTEGER)`)
+	t2 := rec.step("t2", store.Analytics, `CREATE TABLE b (id INTEGER)`)
+	t3 := rec.step("t3", store.Main, `CREATE TABLE c (id INTEGER)`)
+	st, err := store.Open(ctx, opts, []store.Step{t3, t2, t1})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A step registered first now is applied after the recorded ones: the
+	// listing follows the application, not the registration or the name.
+	t0 := rec.step("t0", store.Main, `CREATE TABLE z (id INTEGER)`)
+	st = mustOpen(t, opts, []store.Step{t0, t1, t2, t3})
+	for _, tt := range []struct {
+		target            store.Target
+		applied, register []string
+	}{
+		{store.Main, []string{"t3", "t1", "t0"}, []string{"t0", "t1", "t3"}},
+		{store.Analytics, []string{"t2"}, []string{"t2"}},
+	} {
+		got, err := st.AppliedSteps(ctx, tt.target)
+		if err != nil || !slices.Equal(got, tt.applied) {
+			t.Errorf("AppliedSteps(%d) = %v, %v; want %v", tt.target, got, err, tt.applied)
+		}
+		if got := st.RegisteredSteps(tt.target); !slices.Equal(got, tt.register) {
+			t.Errorf("RegisteredSteps(%d) = %v, want %v", tt.target, got, tt.register)
+		}
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := st.AppliedSteps(ctx, store.Main); !errors.Is(err, store.ErrClosed) {
+		t.Errorf("AppliedSteps after Close = %v, want ErrClosed", err)
+	}
+}
+
 func TestOpen_StopsAtAFailingSchemaStep(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
