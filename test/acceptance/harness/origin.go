@@ -235,3 +235,13 @@ func (h *Hub) Fork(credential, parent string, permissions []string, extra map[st
 	token, _ := r.Body["token"].(map[string]any)
 	return &Fork{Slug: str(ws["slug"]), Remote: str(r.Body["remote"]), Token: str(token["token"]), Body: r.Body}
 }
+
+// PushToOrigin sends the hub's branch of ws to the workspace's origin, which
+// must take pushes (PushableOrigin), with parley workspace push run with
+// the owner's API key, and returns the commit the origin's branch is at
+// afterwards.
+func (h *Hub) PushToOrigin(ws *Workspace, branch string) string {
+	h.t.Helper()
+	h.CLI(ws.Owner.Key, "workspace", "push", ws.Slug, branch).Must(h.t)
+	return ws.Origin.Head(branch)
+}

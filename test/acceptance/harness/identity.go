@@ -175,3 +175,36 @@ func (h *Hub) SetPolicy(credential, workspace, document string) int {
 	}
 	return rev
 }
+
+// Cast is the organization acme, owned by alice, with bob as a member who
+// may only read its workspaces; the workspace demo of acme, which alice
+// owns, registered from a seeded origin; and five credentials that reach
+// demo.
+type Cast struct {
+	Demo       *Workspace
+	Alice, Bob *User
+	// OwnerKey is alice's API key; BoundPAT is a token of alice bound to
+	// demo; PathPAT is a token of alice bound to no workspace whose writes
+	// are limited to the paths **; MemberKey is bob's API key; Admin is
+	// the admin token. Both tokens may read and write over git.
+	OwnerKey, BoundPAT, PathPAT, MemberKey, Admin string
+}
+
+// Cast signs alice and bob in and builds the cast around them.
+func (h *Hub) Cast() *Cast {
+	h.t.Helper()
+	alice, bob := h.User("alice"), h.User("bob")
+	h.Call(http.MethodPost, "/api/v1/orgs", h.AdminToken, map[string]any{"name": "acme", "slug": "acme", "owner_id": alice.ID}).
+		Want(h.t, http.StatusCreated)
+	// Owning an organization is not being a member of it, and only a
+	// member may create a workspace in it.
+	h.AddMember("acme", alice)
+	h.AddMember("acme", bob)
+	demo := h.Register(alice, "demo", h.Origin(), map[string]any{"org_id": "acme"})
+	git := []string{"git:read", "git:write"}
+	return &Cast{
+		Demo: demo, Alice: alice, Bob: bob,
+		OwnerKey: alice.Key, BoundPAT: h.BoundPAT(alice, demo.Slug, git), PathPAT: h.PAT(alice, git, "**"),
+		MemberKey: bob.Key, Admin: h.AdminToken,
+	}
+}
