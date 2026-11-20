@@ -13,10 +13,16 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/agent-fox-dev/parley/internal/cli"
 	"github.com/agent-fox-dev/parley/internal/config"
@@ -178,5 +184,205 @@ func TestCLI_LoginPrintsTheHubsRefusalOfAnUnknownKeyAsReceived(t *testing.T) {
 	}
 	if _, err := os.Lstat(configDir); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("%s exists (or cannot be checked: %v), want it absent", configDir, err)
+	}
+}
+
+// mcpProcess is parley mcp started as a harness starts it, with the MCP
+// session of the SDK's client on its standard input and output.
+type mcpProcess struct {
+	cmd     *exec.Cmd
+	session *mcp.ClientSession
+	stderr  *lockedBuffer
+	// initialized is what the server answered to initialize.
+	initialized *mcp.InitializeResult
+}
+
+// lockedBuffer is a buffer the process's stderr is copied to while the test
+// reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// startMCP starts the built parley binary as `parley mcp args` against the
+// hub at hubURL with the credential key and connects an MCP client to it.
+// The session and the process end with the test.
+func startMCP(t *testing.T, hubURL, key string, args ...string) *mcpProcess {
+	t.Helper()
+	p := &mcpProcess{stderr: &lockedBuffer{}}
+	p.cmd = exec.Command(credentialHelper(t), append([]string{"mcp", "--endpoint-url", hubURL, "--api-key", key}, args...)...)
+	p.cmd.Stderr = p.stderr
+	p.cmd.Dir = t.TempDir()
+	client := mcp.NewClient(&mcp.Implementation{Name: "harness", Version: "1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: p.cmd}, nil)
+	if err != nil {
+		t.Fatalf("connect to parley mcp %v: %v\nstderr: %s", args, err, p.stderr)
+	}
+	p.session, p.initialized = session, session.InitializeResult()
+	t.Cleanup(func() { _ = session.Close() })
+	return p
+}
+
+// toolNames are the names of the tools the session lists, in order.
+func (p *mcpProcess) toolNames(t *testing.T) []string {
+	t.Helper()
+	list, err := p.session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list the tools: %v", err)
+	}
+	names := make([]string, 0, len(list.Tools))
+	for _, tool := range list.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+// call calls the tool name with arguments and returns its structured
+// content and whether the result is an error.
+func (p *mcpProcess) call(t *testing.T, name string, arguments map[string]any) (map[string]any, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	res, err := p.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: arguments})
+	if err != nil {
+		t.Fatalf("call %s: %v\nstderr: %s", name, err, p.stderr)
+	}
+	// The server sends a result as the text of its first content: the
+	// envelope {ok, data, error, detail}. The data is returned, with the
+	// error and its detail of a failed result among its members.
+	var envelope struct {
+		Data   map[string]any `json:"data"`
+		Error  string         `json:"error"`
+		Detail string         `json:"detail"`
+	}
+	for _, c := range res.Content {
+		if text, isText := c.(*mcp.TextContent); isText && json.Unmarshal([]byte(text.Text), &envelope) == nil {
+			break
+		}
+	}
+	data := envelope.Data
+	if data == nil {
+		data = map[string]any{}
+	}
+	if res.IsError {
+		data["error"], data["detail"] = envelope.Error, envelope.Detail
+	}
+	return data, res.IsError
+}
+
+// listedByMCP runs `parley mcp args --list` with the built binary and
+// returns the names it prints.
+func listedByMCP(t *testing.T, args ...string) []string {
+	t.Helper()
+	out, err := exec.Command(credentialHelper(t), append([]string{"mcp", "--list"}, args...)...).Output()
+	if err != nil {
+		t.Fatalf("parley mcp --list %v: %v", args, err)
+	}
+	var tools []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out, &tools); err != nil {
+		t.Fatalf("parley mcp --list printed no JSON array: %v\n%s", err, out)
+	}
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+func TestMCP_ServesTheCommandsAsToolsToAHarnessOnStandardInputAndOutput(t *testing.T) {
+	parallel(t)
+	h := hubtest.Start(t, nil)
+	p := startMCP(t, h.URL(""), h.IssueKey(t, h.CreateUser(t, "dana")), "--groups", "workspace:read", "--no-code-mode")
+
+	if info := p.initialized.ServerInfo; info == nil || info.Name != "parley" || info.Version != "dev" {
+		t.Errorf("the server is %+v; want parley in the built version dev", info)
+	}
+	if in := p.initialized.Instructions; in == "" || strings.Count(in, ". ") > 2 {
+		t.Errorf("the instructions are %q; want one to three sentences", in)
+	}
+	names := p.toolNames(t)
+	if want := listedByMCP(t, "--groups", "workspace:read", "--no-code-mode"); !slices.Equal(names, want) || len(names) == 0 {
+		t.Errorf("the session lists %v; want what --list prints, %v", names, want)
+	}
+	data, isError := p.call(t, "workspace_list", map[string]any{"limit": 5})
+	if items, isList := data["items"].([]any); isError || !isList || len(items) != 0 {
+		t.Errorf("workspace_list answered %v (error %v); want the hub's empty page", data, isError)
+	}
+	data, isError = p.call(t, "workspace_get", map[string]any{"slug": "nope"})
+	if !isError || data["error"] != "not_found" {
+		t.Errorf("workspace_get of an unknown workspace answered %v (error %v); want a failed result with the hub's error", data, isError)
+	}
+
+	if err := p.session.Close(); err != nil {
+		t.Errorf("close the session: %v", err)
+	}
+	if state := p.cmd.ProcessState; state == nil || state.ExitCode() != 0 {
+		t.Errorf("after the client closed its end the process is %v; want it exited with 0", state)
+	}
+	lines := strings.Split(strings.TrimSpace(p.stderr.String()), "\n")
+	var calls int
+	for _, line := range lines {
+		var l map[string]any
+		if err := json.Unmarshal([]byte(line), &l); err != nil {
+			t.Errorf("the stderr line %q is not one JSON object", line)
+		}
+		if l["tool"] == "workspace_get" || l["tool"] == "workspace_list" {
+			calls++
+		}
+	}
+	if calls != 2 {
+		t.Errorf("stderr has %d lines for the two calls:\n%s", calls, p.stderr)
+	}
+}
+
+func TestMCP_EndsItsSessionAndItsCallsOnASignal(t *testing.T) {
+	parallel(t)
+	for _, sig := range []os.Signal{syscall.SIGTERM, os.Interrupt} {
+		t.Run(sig.String(), func(t *testing.T) {
+			arrived, cancelled := make(chan struct{}), make(chan struct{})
+			hub := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				close(arrived)
+				<-r.Context().Done()
+				close(cancelled)
+			}))
+			defer hub.Close()
+			p := startMCP(t, hub.URL, "k", "--groups", "workspace:read", "--no-code-mode")
+			go func() {
+				_, _ = p.session.CallTool(context.Background(), &mcp.CallToolParams{Name: "workspace_get", Arguments: map[string]any{"slug": "demo"}})
+			}()
+			select {
+			case <-arrived:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("the call did not reach the hub\nstderr: %s", p.stderr)
+			}
+			if err := p.cmd.Process.Signal(sig); err != nil {
+				t.Fatal(err)
+			}
+			exited := make(chan struct{})
+			go func() { _ = p.session.Wait(); close(exited) }()
+			for name, done := range map[string]chan struct{}{"the hub to see the call cancelled": cancelled, "the session to end": exited} {
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Errorf("waited 5 s for %s after %s", name, sig)
+				}
+			}
+		})
 	}
 }

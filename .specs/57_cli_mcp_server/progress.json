@@ -3,7 +3,7 @@
   "spec_id": "57",
   "spec_name": "cli_mcp_server",
   "schema_version": 3,
-  "updated_at": "2026-11-20T19:28:43Z",
+  "updated_at": "2026-11-20T19:35:53Z",
   "tasks": [
     {
       "id": 1,
@@ -339,7 +339,124 @@
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-4.1",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_ServesACommandToolThroughTheRunnerAsTheSessionCallsIt",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            },
+            {
+              "test": "./test/e2e:TestMCP_ServesTheCommandsAsToolsToAHarnessOnStandardInputAndOutput",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.2",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_InstructsTheHarnessInAtMostThreeSentences",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            },
+            {
+              "test": "./test/e2e:TestMCP_ServesTheCommandsAsToolsToAHarnessOnStandardInputAndOutput",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.3",
+          "no_red": "parley mcp resolves its settings as every command does since the task that declared it, before it serves; the test pins that this stays so once it serves",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_EndsWithoutAnEndpointOrACredentialBeforeItServes",
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.4",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_WritesOneLineToStderrForEveryToolCall",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.5",
+          "tests": [
+            {
+              "test": "./test/e2e:TestMCP_EndsItsSessionAndItsCallsOnASignal",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        },
+        {
+          "covers": "REQ-4.6",
+          "tests": [
+            {
+              "test": "./internal/cli:TestMCP_KeepsTheCredentialItReadAtStart",
+              "failed": {
+                "at": "2026-11-20T19:31:00Z",
+                "tree": "b8c35040b29d8ffa0900856f563184ad6351ec4a"
+              },
+              "passed": {
+                "at": "2026-11-20T19:35:51Z",
+                "tree": "159f9f34e5b4323c34e2b068a9cc3ef5824c7291"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,

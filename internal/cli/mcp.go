@@ -97,7 +97,7 @@ func runMCPCommand(c *call) error {
 	if session.st, err = resolveSettings(c.cmd); err != nil {
 		return err
 	}
-	return clientError("parley mcp serves no session yet; use --list")
+	return session.serve(c.ctx, c.stderr, s)
 }
 
 // listedTool is a tool as --list prints it.

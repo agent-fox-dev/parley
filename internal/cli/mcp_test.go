@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-fox-dev/agentkit-go/core"
+	"github.com/agent-fox-dev/agentkit-go/runner"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -841,5 +844,194 @@ func TestToolCall_EndsACallThatOutlastsItsBound(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(5 * time.Second):
 		t.Error("the hub did not see the request's context end")
+	}
+}
+
+// runnerOn is the runner of the tool session of s over the tree of opts,
+// with what it logs written to the returned buffer.
+func runnerOn(t *testing.T, opts options, hubURL string, s mcpSettings) (*runner.Runner, *bytes.Buffer) {
+	t.Helper()
+	var stderr bytes.Buffer
+	r, err := toolSessionOn(t, opts, hubURL, s).runner(&stderr)
+	if err != nil {
+		t.Fatalf("build the runner of %+v: %v", s, err)
+	}
+	return r, &stderr
+}
+
+// run calls the tool name of r with the parameters input.
+func runTool(t *testing.T, r *runner.Runner, name string, input any) core.ToolResult {
+	t.Helper()
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r.Call(t.Context(), name, raw)
+}
+
+// callLine is a line parley mcp writes to stderr for a tool call.
+type callLine map[string]any
+
+// callLines decodes the lines of stderr, each one JSON object.
+func callLines(t *testing.T, stderr string) []callLine {
+	t.Helper()
+	var lines []callLine
+	for _, line := range nonEmptyLines(stderr) {
+		var l callLine
+		if err := json.Unmarshal([]byte(line), &l); err != nil {
+			t.Fatalf("the stderr line %q is not one JSON object: %v", line, err)
+		}
+		lines = append(lines, l)
+	}
+	return lines
+}
+
+func TestMCP_ServesACommandToolThroughTheRunnerAsTheSessionCallsIt(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, changeThree)
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, mcpDefaults())
+	var names []string
+	for _, tool := range r.Tools() {
+		names = append(names, tool.Name)
+	}
+	if want := toolNames(mcpList(t, defaultOptions(), "--no-code-mode")); !slices.Equal(names, want) {
+		t.Errorf("the runner serves\n%v\nwant the tools --list prints\n%v", names, want)
+	}
+	res := runTool(t, r, "change_show", map[string]any{"slug": "demo", "number": "3"})
+	if !res.OK || res.Data["title"] != "One" {
+		t.Errorf("change_show through the runner is %+v; want the hub's change", res)
+	}
+	hub.answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusNotFound, `{"error":{"code":404,"message":"no such change","error_type":"change_not_found"}}`)
+	res = runTool(t, r, "change_show", map[string]any{"slug": "demo", "number": "3"})
+	if res.OK || res.Error != "change_not_found" || res.Detail != "no such change" {
+		t.Errorf("a refused call through the runner is %+v; want a failed result with the hub's error", res)
+	}
+	// The runner checks the parameters against the tool's schema before the
+	// tool runs, and names what it refuses.
+	sent := hub.requestCount()
+	for param, input := range map[string]map[string]any{
+		"nope":    {"slug": "demo", "number": "3", "nope": 1},
+		"number":  {"slug": "demo"},
+		"include": {"slug": "demo", "number": "3", "include": []string{"x"}},
+	} {
+		res := runTool(t, r, "change_show", input)
+		if res.OK || res.Error != "invalid_arguments" || !strings.Contains(res.Detail, param) {
+			t.Errorf("a call with a bad %s through the runner is %+v; want a failed result naming it", param, res)
+		}
+	}
+	if hub.requestCount() != sent {
+		t.Error("a call with bad parameters sent a request")
+	}
+}
+
+func TestMCP_InstructsTheHarnessInAtMostThreeSentences(t *testing.T) {
+	for _, row := range []struct {
+		name     string
+		s        mcpSettings
+		has, not []string
+	}{
+		{"no flag", mcpSettings{}, []string{"code_mode"}, []string{"workspace", "sandbox"}},
+		{"a workspace", mcpSettings{workspace: "demo"}, []string{"demo", "code_mode"}, []string{"sandbox"}},
+		{"a workspace and a sandbox", mcpSettings{workspace: "demo--fix", sandbox: "sbx_0123"}, []string{"demo--fix", "sbx_0123", "code_mode"}, nil},
+		{"no code mode", mcpSettings{workspace: "demo", noCodeMode: true}, []string{"demo"}, []string{"code_mode"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			got := mcpInstructions(row.s)
+			if n := strings.Count(got, ". ") + 1; n > 3 || !strings.HasSuffix(got, ".") || strings.Contains(got, "\n") {
+				t.Errorf("the instructions have %d sentences: %q; want at most three", n, got)
+			}
+			for _, name := range row.has {
+				if !strings.Contains(got, name) {
+					t.Errorf("the instructions %q do not name %s", got, name)
+				}
+			}
+			for _, name := range row.not {
+				if strings.Contains(got, name) {
+					t.Errorf("the instructions %q name %s", got, name)
+				}
+			}
+		})
+	}
+}
+
+func TestMCP_EndsWithoutAnEndpointOrACredentialBeforeItServes(t *testing.T) {
+	hub := newStubHub(t)
+	for _, row := range []struct {
+		name string
+		args []string
+	}{
+		{"no endpoint", []string{"--api-key", "k"}},
+		{"no credential", []string{"--endpoint-url", hub.URL}},
+		{"neither", nil},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			code, stdout, stderr := runMCP(t, defaultOptions(), row.args...)
+			var env cliEnvelope
+			if code != exitClientError || stdout != "" || json.Unmarshal([]byte(stderr), &env) != nil || env.Error.ErrorType != clientErrorType {
+				t.Errorf("exit status %d, stdout %q, stderr %q; want 2, nothing and one client_error envelope", code, stdout, stderr)
+			}
+			if listCode, _, _ := runMCP(t, defaultOptions(), append([]string{"--list"}, row.args...)...); listCode != 0 {
+				t.Errorf("--list in the same state exits %d, want 0", listCode)
+			}
+		})
+	}
+}
+
+func TestMCP_WritesOneLineToStderrForEveryToolCall(t *testing.T) {
+	const in, out = "IN-7f3a", "OUT-9c1e"
+	hub := newStubHub(t).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/3", http.StatusOK, `{"number":3,"title":"`+out+`"}`).
+		answer(http.MethodGet, "/api/v1/workspaces/demo/changes/4", http.StatusNotFound, `{"error":{"code":404,"message":"`+out+`","error_type":"change_not_found"}}`)
+	r, stderr := runnerOn(t, defaultOptions(), hub.URL, mcpDefaults())
+
+	runTool(t, r, "change_show", map[string]any{"slug": "demo", "number": "3", "include": in})
+	runTool(t, r, "change_show", map[string]any{"slug": "demo", "number": "4", "include": in})
+	runTool(t, r, "change_show", map[string]any{"slug": "demo", "nope": in})
+
+	lines := callLines(t, stderr.String())
+	if len(lines) != 3 {
+		t.Fatalf("three calls wrote %d lines: %s", len(lines), stderr)
+	}
+	for i, want := range []callLine{
+		{"tool": "change_show", "ok": true},
+		{"tool": "change_show", "ok": false, "error": "change_not_found"},
+		// agentkit-go refuses a parameter the schema lacks before the tool
+		// runs.
+		{"tool": "change_show", "ok": false, "error": "not_run"},
+	} {
+		got := lines[i]
+		if ms, isNumber := got["duration_ms"].(float64); !isNumber || ms < 0 {
+			t.Errorf("line %d has the duration_ms %v, want a number of at least 0", i, got["duration_ms"])
+		}
+		delete(got, "duration_ms")
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("line %d is %v, want %v and duration_ms", i, got, want)
+		}
+	}
+	if s := stderr.String(); strings.Contains(s, in) || strings.Contains(s, out) {
+		t.Errorf("stderr holds an argument or a part of a result: %s", s)
+	}
+}
+
+func TestMCP_KeepsTheCredentialItReadAtStart(t *testing.T) {
+	hub := newStubHub(t).answer(http.MethodGet, "/api/v1/workspaces/demo", http.StatusOK, `{"slug":"demo"}`)
+	r, _ := runnerOn(t, defaultOptions(), hub.URL, mcpDefaults())
+	// What a command run from the shell would read now is another hub and
+	// another credential.
+	other := newStubHub(t)
+	t.Setenv("PARLEY_ENDPOINT_URL", other.URL)
+	t.Setenv("PARLEY_API_KEY", "another")
+	writeConfigFile(t, os.Getenv("PARLEY_CONFIG_DIR"), "endpoint_url = \""+other.URL+"\"\napi_key = \"a-third\"\n")
+
+	if res := runTool(t, r, "workspace_get", map[string]any{"slug": "demo"}); !res.OK || hub.last(t).header.Get("Authorization") != "Bearer k" || other.requestCount() != 0 {
+		t.Errorf("the call is %+v, sent with %q; want the hub and the credential read at start", res, hub.last(t).header.Get("Authorization"))
+	}
+	hub.answer(http.MethodGet, "/api/v1/workspaces/demo", http.StatusUnauthorized, `{"error":{"code":401,"message":"unknown credential","error_type":"unauthenticated"}}`)
+	if res := runTool(t, r, "workspace_get", map[string]any{"slug": "demo"}); res.OK || res.Error != "unauthenticated" {
+		t.Errorf("a call the hub answers 401 is %+v; want a failed result with the error unauthenticated", res)
+	}
+	before := hub.requestCount()
+	runTool(t, r, "workspace_get", map[string]any{"slug": "demo"})
+	if hub.requestCount() != before+1 || hub.last(t).header.Get("Authorization") != "Bearer k" {
+		t.Error("after a 401 the next call was not sent with the credential read at start")
 	}
 }
