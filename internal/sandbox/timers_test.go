@@ -26,6 +26,16 @@ func TestLifecycleTimers(t *testing.T) {
 	// fork sweep does not remove it first.
 	h.fork(t, "demo--gone", "demo", t0.Add(7*24*time.Hour), nil)
 	h.fork(t, "demo--late", "demo", t0.Add(time.Second), nil)
+	// The loop leaves to the minute's pass a sandbox expired at or before
+	// its last expiry pass, but takes at once one it has not passed over
+	// yet. A sandbox expired at t0, and a transition that wakes the loop,
+	// make it pass at t0 now, so that it takes none of the rows' sandboxes
+	// expired at t0 away from the passes the rows run themselves.
+	primer := h.seedRecord(t, "demo", sandbox.StateReady, func(r *sandbox.Record) { r.ExpiresAt = t0 })
+	if _, err := h.svc.Transition(ctx, nil, primer, sandbox.StateReady, sandbox.StateStopped, "", nil); err != nil {
+		t.Fatalf("stop the sandbox that wakes the loop: %v", err)
+	}
+	eventually(t, "the loop's expiry pass at t0", func() bool { return storedRecord(t, h.Hub, primer).State == sandbox.StateDeleted })
 	// on moves a sandbox to the workspace slug, outside any session.
 	on := func(slug string) func(*sandbox.Record) {
 		return func(r *sandbox.Record) { r.Workspace, r.SessionID = slug, nil }
