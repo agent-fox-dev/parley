@@ -562,3 +562,14 @@ func Release(n int, fn func(i int)) (wait func()) {
 	close(gate)
 	return done.Wait
 }
+
+// SignIn signs the user name in to the hub again, as a person who logs in
+// once more does: the user gets a new API key and its earlier keys are
+// revoked. User returns the user with the new key from then on.
+func (h *Hub) SignIn(name string) *User {
+	h.t.Helper()
+	h.usersMu.Lock()
+	delete(h.users, name)
+	h.usersMu.Unlock()
+	return h.User(name)
+}
