@@ -81,7 +81,7 @@ func TestRead_EndsAReadThatOutlastsTheReadTimeout(t *testing.T) {
 		d.Open = func(context.Context, string) (scm.Repository, error) { return stalledRepo{ended: &ended}, nil }
 	})
 	for _, rt := range scmRoutes {
-		if !slices.Contains([]string{"tree", "file", "diff", "compare", "blame", "search"}, rt.op) {
+		if !slices.Contains([]string{"tree", "file", "diff", "compare", "blame", "search", "outline"}, rt.op) {
 			continue
 		}
 		t.Run(rt.op, func(t *testing.T) {

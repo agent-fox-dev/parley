@@ -20,6 +20,12 @@ const maxBlameSize = 2 << 20
 // byte to call the file binary.
 const binaryProbe = 8000
 
+// isBinary reports whether content is a binary file's, as git judges it: a
+// NUL byte among its first binaryProbe bytes.
+func isBinary(content []byte) bool {
+	return bytes.IndexByte(content[:min(len(content), binaryProbe)], 0) >= 0
+}
+
 // blameRange is a range of lines of a blame answer.
 type blameRange struct {
 	StartLine         int          `json:"start_line"`
@@ -92,7 +98,7 @@ func (c *Component) getBlame(w http.ResponseWriter, r *http.Request) error {
 	if err := rd.repo.WriteBlob(ctx, file.ID, &content); err != nil {
 		return err
 	}
-	if bytes.IndexByte(content.Bytes()[:min(content.Len(), binaryProbe)], 0) >= 0 {
+	if isBinary(content.Bytes()) {
 		return server.InvalidRequest(fmt.Sprintf("file %q is binary at %s, and a binary file has no lines to blame", path, res.SHA))
 	}
 	lines := lineCount(content.Bytes())

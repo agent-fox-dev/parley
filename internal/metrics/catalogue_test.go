@@ -42,8 +42,8 @@ var documented = []struct {
 	{"parley_git_requests_total", metrics.Counter, []label{
 		closed("service", "info-refs", "upload-pack", "receive-pack"), closed("result", "ok", "refused", "error")}, nil},
 	{"parley_scm_requests_total", metrics.Counter, []label{
-		closed("op", "refs", "commits", "tree", "file", "diff", "compare", "blame", "search", "commit",
-			"ref_create", "ref_move", "ref_delete", "rebase"),
+		closed("op", "refs", "commits", "tree", "file", "diff", "compare", "blame", "search", "outline",
+			"commit", "ref_create", "ref_move", "ref_delete", "rebase"),
 		closed("result", "ok", "ref_moved", "refused", "error")}, nil},
 	{"parley_changes_open", metrics.Gauge, []label{open("workspace")}, nil},
 	{"parley_lands_total", metrics.Counter, []label{closed("result", "landed", "conflict", "blocked", "failed")}, nil},

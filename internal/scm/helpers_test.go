@@ -212,14 +212,16 @@ func newComposedWorld(t testing.TB, toml string, compose func(*hub.Composition),
 // readWorld is the world the tests that only read share, built once for the
 // package: a world as newWorld makes it, its rate limit off since every
 // test that reads sends with the same keys, with the owner's workspaces hist,
-// tree, files, diff, cmp, blame and search added. hist, diff and blame are
-// the ids addHistory, addDiff and addBlame return; tree, files, cmp and
-// search the git directories of those workspaces, files a tree workspace
-// holding fileExtras too; and searchMain the id of search's main. Its tests
-// change nothing in it and read neither its observations nor its opens.
+// tree, files, diff, cmp, blame, search and outline added. hist, diff, blame
+// and outline are the ids addHistory, addDiff, addBlame and addOutline
+// return; tree, files, cmp and search the git directories of those
+// workspaces, files a tree workspace holding fileExtras too; and searchMain
+// the id of search's main. Its tests change nothing in it and read neither
+// its observations nor its opens.
 type readWorld struct {
 	*world
 	hist, diff, blame        map[string]string
+	outline                  map[string]string
 	tree, files, cmp, search string
 	searchMain               string
 }
@@ -243,6 +245,7 @@ func readOnlyWorld(t *testing.T) *readWorld {
 		w.hist, w.diff, w.blame = w.addHistory(tb), w.addDiff(tb), w.addBlame(tb)
 		w.tree, w.files, w.cmp = w.addTree(tb, "tree"), w.addTree(tb, "files", fileExtras...), w.addCompare(tb)
 		w.search, w.searchMain = w.addSearch(tb)
+		w.outline = w.addOutline(tb)
 		readOnly.w = w
 	})
 	if readOnly.failure != nil {
@@ -635,6 +638,7 @@ var scmRoutes = []struct{ op, ok, bad string }{
 	{"compare", "/compare?base=main&head=feature/x", "/compare?base=main"},
 	{"blame", "/blame?path=f.txt", "/blame?path=nope.txt"},
 	{"search", "/search?q=c1", "/search"},
+	{"outline", "/outline?path=f.txt", "/outline?path=nope.txt"},
 }
 
 // observations is a request recorder that keeps what it was told, each
