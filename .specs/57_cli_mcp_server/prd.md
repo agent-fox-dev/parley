@@ -2,9 +2,12 @@
 spec_id: "57"
 spec_name: "cli_mcp_server"
 title: "Serve the CLI's commands as tools over MCP, with code mode"
-status: "draft"
+status: "active"
 created_at: "2026-11-20T15:38:04Z"
-intent_hash: null
+intent_hash: "069d46bfa18c21c019e09c62ee49c197b88a7ba3975b74e1d4dc51c9f5ae88c7"
+contract_hash:
+  requirements.json: "24f2abe898b3980f671748d6a6ba85140ea27c42bcc03f226502f59f7c239f9d"
+  tasks.json: "5c763cf27506da9fb5f548d2a0a9d2de6f6fa5c744841de948d04564c1385224"
 schema_version: 3
 source: "docs/prd/19_cli_mcp_server.md"
 ---
@@ -233,7 +236,8 @@ route's method is `GET`. The default is
    that forks has to name the fork, which a removed parameter would
    prevent.
 5. **`parley` stays pure Go; agentkit-go is slimmed first** (owner's
-   decision). This PRD waits for agentkit-go's PRD 16.
+   decision). This PRD waited for agentkit-go's PRD 16, which is built
+   (see Verified External API).
 6. **`group:read` instead of a special case for `workspace`**: the default
    wants the workspace reads without archive and delete, and the same
    suffix is useful for every group.
@@ -297,7 +301,7 @@ route's method is `GET`. The default is
 - PRD 18, package 56 `sandbox_tool_routes` (active, every task done): the
   two REST routes `--sandbox` uses. Everything but `--sandbox` works
   without it.
-- agentkit-go PRD 16 (in pull request 185 of that repository, not built):
+- agentkit-go PRD 16 (built, on that repository's `main` at `20c16c9`):
   the runner, code mode and MCP serving without cgo and providers. Hard
   dependency.
 - Package 49 `agent_sessions_and_usage` (active, every task done): its
@@ -347,13 +351,23 @@ Read the same way when the package was written, in the checkout at
   `github.com/modelcontextprotocol/go-sdk` v1.8.0, which `go.mod` holds
   since package 56, is the client transport the session's tests use.
 
-**Not built**: package `runner` and `runner.New` (agentkit-go PRD 16); the
-signatures above are today's, under the root package. Today `codemode`
-depends on 15 tree-sitter and provider packages and `mcpserve` on 62, so
-linking them needs cgo: **this package cannot meet goal 6, and tasks 3 to 5
-cannot be implemented, until agentkit-go PRD 16 is built and released.**
-**Unverified**: whether `mcpserve` serves a `core.Tool` with only `Execute`
-set (the runner's contract says it runs one).
+agentkit-go's PRD 16 has since been built (its `main` at `20c16c9`, 47
+commits after `v0.9.1`, not yet tagged), and read there:
+
+- `runner.New(ts runner.Toolset) (*runner.Runner, error)` in
+  `github.com/agent-fox-dev/agentkit-go/runner`; `Toolset` has `Tools`,
+  `Policy`, `Guard`, `After` and `Events`; the runner has `Call`, `Batch`,
+  `Reachable` and `Tools`. It refuses a tool with neither or both of
+  `Handler` and `Execute`, so a tool with only `Execute` is run.
+- `mcpserve.New(r *runner.Runner, opts mcpserve.Options) (*mcpserve.Server, error)`
+  serves `r.Tools()` and refuses a tool whose input schema is not an
+  object with `"type": "object"`.
+- `runner`, `codemode`, `core`, `schema`, `guard` and the module `mcpserve`
+  build with `CGO_ENABLED=0` and depend on no tree-sitter module and no
+  provider SDK.
+
+Until agentkit-go tags a release, `go.mod` takes both modules at a
+pseudo-version of that commit or a later one.
 
 ## Glossary
 

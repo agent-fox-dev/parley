@@ -616,7 +616,7 @@
   "external_apis": [
     {
       "package": "github.com/agent-fox-dev/agentkit-go",
-      "version": "v0.9.1",
+      "version": "main at 20c16c9, 47 commits after v0.9.1",
       "verified": true,
       "symbols": [
         {
@@ -665,23 +665,6 @@
           "signature": "func AllowAll(context.Context, core.BeforeToolCallContext) core.BeforeToolCallDecision"
         },
         {
-          "name": "Runner.Call, Runner.Reachable",
-          "import_path": "github.com/agent-fox-dev/agentkit-go",
-          "signature": "func (r *Runner) Call(ctx context.Context, name string, input json.RawMessage) core.ToolResult; func (r *Runner) Reachable() []core.Tool"
-        },
-        {
-          "name": "New, Server.ServeStdio, Options (fields)",
-          "import_path": "github.com/agent-fox-dev/agentkit-go/mcpserve",
-          "signature": "func New(r *agentkit.Runner, opts Options) (*Server, error); func (s *Server) ServeStdio(ctx context.Context) error; Name string; Version string; Instructions string; Logger *slog.Logger"
-        }
-      ]
-    },
-    {
-      "package": "github.com/agent-fox-dev/agentkit-go",
-      "version": "v0.9.1",
-      "verified": false,
-      "symbols": [
-        {
           "name": "New",
           "import_path": "github.com/agent-fox-dev/agentkit-go/runner",
           "signature": "func New(ts Toolset) (*Runner, error)"
@@ -690,6 +673,16 @@
           "name": "Toolset (fields)",
           "import_path": "github.com/agent-fox-dev/agentkit-go/runner",
           "signature": "Tools []core.Tool; Policy core.ToolPolicy; Guard core.BeforeToolCall; After core.AfterToolCall; Events func(core.Event)"
+        },
+        {
+          "name": "Runner.Call, Runner.Reachable, Runner.Tools",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/runner",
+          "signature": "func (r *Runner) Call(ctx context.Context, name string, input json.RawMessage) core.ToolResult; func (r *Runner) Reachable() []core.Tool; func (r *Runner) Tools() []core.Tool"
+        },
+        {
+          "name": "New, Server.ServeStdio, Options (fields)",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/mcpserve",
+          "signature": "func New(r *runner.Runner, opts Options) (*Server, error); func (s *Server) ServeStdio(ctx context.Context) error; Name string; Version string; Instructions string; Logger *slog.Logger"
         }
       ]
     },
