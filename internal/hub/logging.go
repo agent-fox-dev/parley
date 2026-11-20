@@ -3,12 +3,14 @@ package hub
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/agent-fox-dev/parley/internal/scrub"
@@ -24,12 +26,17 @@ const LevelTrace = slog.Level(-8)
 // below level dropped, and the message and every attribute, also in groups,
 // passed through s before they are written. A string is written scrubbed and
 // an error as its scrubbed text. Any other value is scrubbed as its fmt text
-// ([]byte as text): when scrubbing changes that text, removing a secret or
-// cutting it to scrub.MaxLen, the scrubbed text is written in its place.
-// Otherwise every string of its JSON form, map keys included, is scrubbed,
-// so that what fmt does not show (a MarshalText result, a value behind a
-// pointer) is scrubbed too, and a value holding no secret keeps its JSON
-// form. Numbers, booleans and durations are written as they are. The values
+// ([]byte as text, and a byte slice nested in it, which fmt writes as its
+// byte values, as the text they spell when that text holds something to
+// scrub): when scrubbing changes that text, removing a secret or cutting it
+// to scrub.MaxLen, the scrubbed text is written in its place. Otherwise
+// every string of its JSON form, map keys included, is scrubbed, and so is
+// the text a string spells as standard base64, the JSON form of a byte
+// slice, so that what fmt does not show (a MarshalText result, a value
+// behind a pointer) is scrubbed too, and a value holding no secret keeps its
+// JSON form. Keys that scrub to the same text are all kept, the second and
+// later with a suffix #2, #3 and so on, in the order of their unscrubbed
+// text. Numbers, booleans and durations are written as they are. The values
 // of an http.Header's Authorization and Proxy-Authorization headers are
 // never written. Attribute keys are written as they are. A line logged with
 // the context of a request the HTTP server handles carries that request's id
@@ -136,8 +143,17 @@ func scrubJSON(s *scrub.Scrubber, v any) (any, bool) {
 func scrubStrings(s *scrub.Scrubber, v any) (any, bool) {
 	switch x := v.(type) {
 	case string:
-		scrubbed := s.Scrub(x)
-		return scrubbed, scrubbed != x
+		if scrubbed := s.Scrub(x); scrubbed != x {
+			return scrubbed, true
+		}
+		// encoding/json writes a byte slice as standard base64, which hides
+		// the secret's text from the scrubber.
+		if raw, err := base64.StdEncoding.DecodeString(x); err == nil {
+			if text, scrubbed := string(raw), s.Scrub(string(raw)); scrubbed != text {
+				return scrubbed, true
+			}
+		}
+		return x, false
 	case []any:
 		changed := false
 		for i, e := range x {
@@ -147,13 +163,36 @@ func scrubStrings(s *scrub.Scrubber, v any) (any, bool) {
 		}
 		return x, changed
 	case map[string]any:
+		type entry struct {
+			from, to string
+			value    any
+		}
 		out := make(map[string]any, len(x))
 		changed := false
+		var renamed []entry
 		for k, e := range x {
-			key, ck := scrubStrings(s, k)
 			value, cv := scrubStrings(s, e)
-			out[key.(string)] = value
-			changed = changed || ck || cv
+			key, ck := scrubStrings(s, k)
+			changed = changed || cv || ck
+			if ck {
+				renamed = append(renamed, entry{k, key.(string), value})
+			} else {
+				out[k] = value
+			}
+		}
+		// The keys scrubbing changed go last, in the order of their own
+		// text, so that one that scrubs to the text of another key takes a
+		// suffix rather than the other's place.
+		slices.SortFunc(renamed, func(a, b entry) int { return strings.Compare(a.from, b.from) })
+		for _, r := range renamed {
+			name := r.to
+			for n := 2; ; n++ {
+				if _, taken := out[name]; !taken {
+					break
+				}
+				name = r.to + "#" + strconv.Itoa(n)
+			}
+			out[name] = r.value
 		}
 		return out, changed
 	}
@@ -186,8 +225,68 @@ func scrubValue(s *scrub.Scrubber, v any) (string, bool) {
 	default:
 		text = fmt.Sprint(v)
 	}
-	scrubbed := s.Scrub(text)
+	scrubbed := s.Scrub(scrubByteValues(s, text))
 	return scrubbed, changed || scrubbed != text
+}
+
+// scrubByteValues replaces each run of byte values in text, the form fmt
+// writes a nested byte slice in ("[104 117 110]"), by the scrubbed text the
+// bytes spell, when scrubbing that text changes it. A secret held in a byte
+// slice inside a struct, a map or a list shows in fmt's text only that way.
+func scrubByteValues(s *scrub.Scrubber, text string) string {
+	var b strings.Builder
+	rest := text
+	for {
+		i := strings.IndexByte(rest, '[')
+		if i < 0 {
+			break
+		}
+		raw, n, ok := byteValues(rest[i+1:])
+		if !ok {
+			b.WriteString(rest[:i+1])
+			rest = rest[i+1:]
+			continue
+		}
+		b.WriteString(rest[:i])
+		if spelled, scrubbed := string(raw), s.Scrub(string(raw)); scrubbed != spelled {
+			b.WriteString(scrubbed)
+		} else {
+			b.WriteString(rest[i : i+1+n])
+		}
+		rest = rest[i+1+n:]
+	}
+	b.WriteString(rest)
+	return b.String()
+}
+
+// byteValues reads the byte values of a run that begins after its "[": one
+// or more decimal numbers up to 255, one space apart, closed by "]". It
+// returns the bytes and the length of the run, the "]" included.
+func byteValues(text string) ([]byte, int, bool) {
+	var raw []byte
+	i := 0
+	for {
+		j := i
+		for j < len(text) && j-i < 4 && text[j] >= '0' && text[j] <= '9' {
+			j++
+		}
+		v, err := strconv.Atoi(text[i:j])
+		if j == i || err != nil || v > 255 {
+			return nil, 0, false
+		}
+		raw = append(raw, byte(v))
+		if j == len(text) {
+			return nil, 0, false
+		}
+		switch text[j] {
+		case ']':
+			return raw, j + 1, true
+		case ' ':
+			i = j + 1
+		default:
+			return nil, 0, false
+		}
+	}
 }
 
 // parseLevel reads a [logging].level value; anything it does not know is

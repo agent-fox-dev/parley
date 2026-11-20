@@ -251,6 +251,8 @@ func TestNewLogger_ScrubsEveryStringInAValueOfAnyType(t *testing.T) {
 	pat := newPAT(t)
 	type credential struct{ Token string }
 	type holder struct{ Cred *credential }
+	type payload struct{ Body []byte }
+	type wrapped struct{ Payload *payload }
 	for _, tc := range []struct {
 		name  string
 		value any
@@ -266,17 +268,33 @@ func TestNewLogger_ScrubsEveryStringInAValueOfAnyType(t *testing.T) {
 		{"a value written as text", textual{2}, scrub.Marker},
 		{"a token in a struct field", credential{pat}, scrub.Marker},
 		{"a token behind a pointer field", holder{&credential{pat}}, scrub.Marker},
+		{"a byte slice in a struct field", payload{[]byte("password=hunter2")}, "password=" + scrub.Marker},
+		{"a byte slice beside a secret string", struct {
+			Body []byte
+			Note string
+		}{[]byte("hunter2"), "hunter2"}, scrub.Marker},
+		{"byte slices in a map", map[string][]byte{"k": []byte("hunter2")}, scrub.Marker},
+		{"a byte slice in a list of structs", []payload{{[]byte("a")}, {[]byte("password=hunter2")}}, "password=" + scrub.Marker},
+		{"a byte slice behind a pointer field", wrapped{&payload{[]byte("password=hunter2")}}, "password=" + scrub.Marker},
+		// Both keys scrub to the same text, and both values are kept.
+		{"keys that scrub to the same text", map[textual]string{{2}: "first", {3}: "second"},
+			`{"tok [redacted]":"first","tok [redacted]#2":"second"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			s := scrub.New()
 			s.Add("hunter2")
+			s.Add("hunter3")
 			var buf bytes.Buffer
 			hub.NewLogger(&buf, "info", s).Info("m", "v", tc.value, "count", 3, "ok", true, "wait", 2*time.Second)
 
 			line := buf.String()
-			if strings.Contains(line, "hunter2") || strings.Contains(line, pat) {
-				t.Errorf("line %s holds the secret", line)
+			for _, secret := range []string{"hunter2", "hunter3", pat} {
+				// fmt writes a nested byte slice as its byte values.
+				decimal := strings.Trim(fmt.Sprint([]byte(secret)), "[]")
+				if strings.Contains(line, secret) || strings.Contains(line, decimal) {
+					t.Errorf("line %s holds the secret %s", line, secret)
+				}
 			}
 			if !strings.Contains(line, tc.want) {
 				t.Errorf("line %s does not hold %s", line, tc.want)
