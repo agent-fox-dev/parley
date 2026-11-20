@@ -1,0 +1,762 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "56",
+  "spec_name": "sandbox_tool_routes",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "The profile names the tool server",
+      "rationale": "An operator decides per profile whether its sandboxes offer tools, by saying where the tool server is in the profile's image.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "optional",
+          "condition": "a [[sandbox.profiles]] table sets tool_server to an absolute path of at most 256 bytes",
+          "action": "load the profile with that path as its tool server, and load a profile without the key, or with an empty value, as one without a tool server",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/profile_test.go, extending TestFromConfig_ReadsEveryKeyOfAProfile and TestSettings_LooksUpProfilesAndCredentialsWithTheirDefaults: a profile table with tool_server = \"/usr/local/bin/agentkit-tools\" loads with Profile.ToolServer equal to it; a table without the key, and one with tool_server = \"\", load with \"\"; a path of exactly 256 bytes loads"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "unwanted",
+          "condition": "a profile's tool_server is not an absolute path or is longer than 256 bytes",
+          "action": "refuse the configuration with a message that names the profile and the key, and not start",
+          "contract": "the load of the [sandbox] section fails with a failure whose text holds sandbox.profiles[<name>].tool_server; the hub does not start",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/profile_test.go, new rows of the table of TestFromConfig_RefusesAnInvalidProfileNamingItsKey: tool_server in {\"bin/agentkit-tools\", \"agentkit-tools\", \"./x\", \"/\" followed by 256 bytes}: wantErrorNaming(t, s, err, \"sandbox.profiles[agent].tool_server\")"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /sandbox-profiles",
+          "action": "show on each profile the boolean member tools, true exactly when the profile names a tool server, and never the path",
+          "contract": "HTTP 200; every item has tools: bool; no member of an item holds the tool server's path",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a hub with one profile that names a tool server and one that does not"
+            ],
+            "pseudocode": "in internal/sandbox/routes_test.go, extending TestProfileList_ShowsWhatAProfileOffersWithoutItsPolicyPathEnvValuesOrSecrets: items[with].tools == true; items[without].tools == false; the body does not contain the path"
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "a sandbox is created from a profile",
+          "action": "keep the profile's tool server with the sandbox, in the snapshot of its profile, and show on the sandbox object the boolean member tools, true exactly when the snapshot names a tool server, whatever the profile says later",
+          "contract": "every sandbox object has tools: bool; the stored snapshot holds the path; no response holds the path",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/create_test.go, extending TestCreate_StoresProvisioningSandbox: a create from a profile with tool_server answers an object with tools == true and storedRecord(t, h, id).Snapshot.ToolServer == the path; a create from a profile without it answers tools == false. In internal/sandbox/object_test.go, extending TestObject_HasEveryMember: the object has the member tools"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any sandbox stored before the snapshot had a tool server, show tools: false and answer its tool routes as those of a sandbox without tools",
+          "check": {
+            "kind": "unit",
+            "setup": [
+              "a sandbox row whose stored snapshot JSON has no tool server member"
+            ],
+            "pseudocode": "in internal/sandbox/store_test.go, extending TestStore_KeepsWhatItIsGiven: the row reads back with Snapshot.ToolServer == \"\" and ObjectOf(rec, true).Tools == false"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Decide who may use which tools of a sandbox",
+      "rationale": "A caller who may run commands in the sandbox gets every tool; a caller who may only read gets the tools that change nothing, and nobody else gets any.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "event_driven",
+          "condition": "a request to GET …/sandboxes/:id/tools, POST …/sandboxes/:id/tools/:name or POST …/sandboxes/:id/mcp comes from a caller that would be allowed to exec in the sandbox: its PAT, if it is one, holds sandboxes:write, it has write access to the workspace, and its credential covers the sandbox's hub credential",
+          "action": "serve the request with the full set, every tool the tool server serves, decided for this request alone",
+          "contract": "the listing's set is \"full\" and holds every definition of `<tool_server> tools`",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a hub with the fake runtime whose commands are answered by the stand-in tool server, serving thirteen tools without --read-only and nine with it",
+              "a ready sandbox with tools and a hub credential holding sandboxes:write"
+            ],
+            "pseudocode": "in internal/sandbox/tools_test.go, one table over callers, asserting the set of GET …/tools: {admin token: full; API key of an owner: full; PAT with sandboxes:write of a writer covering the hub credential: full; workspace-bound token of the fork with sandboxes:write: full; PAT with sandboxes:read of a writer: read_only; PAT with sandboxes:write of a member with read access: read_only; PAT with sandboxes:write of a writer that lacks a scope of the hub credential: read_only; PAT with sandboxes:write limited to paths the hub credential is not limited to: read_only; API key of a member with read access: read_only}"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "event_driven",
+          "condition": "such a request comes from any other caller whose PAT, if it is one, holds sandboxes:read and who has read access to the workspace, a caller with write access whose credential does not cover the sandbox's hub credential included",
+          "action": "serve the request with the read-only set: the full set without write_file, edit_file, execute and run_command, as the tool server defines it under --read-only",
+          "contract": "the listing's set is \"read_only\" and holds every definition of `<tool_server> tools --read-only`, none of them write_file, edit_file, execute or run_command",
+          "check": {
+            "same_as": "REQ-2.1"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the caller has no credential, a PAT without a sandboxes scope, a workspace-bound token of another workspace, or no read access to the workspace",
+          "action": "refuse the request on each of the three routes with the status and error_type the logs route of the same sandbox gives the same caller, and run nothing in the sandbox",
+          "contract": "401 unauthenticated without a credential; 403 insufficient_scope for a PAT without sandboxes:read; 403 forbidden for a bound token of another workspace; 404 for a workspace the caller cannot read; the hub's error object on all three routes, the MCP route included; no runtime call",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_test.go, a table over {no credential, PAT without a sandboxes scope, bound token of another fork, PAT of a user outside the org} and the three routes: status and error_type equal those of GET …/logs for the same caller; ops(rt.Calls()) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the id names no sandbox of the workspace",
+          "action": "refuse the request on each of the three routes",
+          "contract": "HTTP 404 with error_type sandbox_not_found, as the hub's error object",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_test.go, beside the table above: an unknown id, and the id of a sandbox of another workspace, on the three routes answer 404 sandbox_not_found"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the sandbox has tools: false",
+          "action": "refuse the request on each of the three routes, after the scope and access checks, and run nothing in the sandbox",
+          "contract": "HTTP 404 with error_type tools_unavailable, as the hub's error object; a caller without access still gets its access refusal; no runtime call; exec, files, logs and attach of the sandbox answer as before",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready sandbox of a profile without tool_server"
+            ],
+            "pseudocode": "in internal/sandbox/tools_test.go: the three routes answer 404 tools_unavailable to a writer; to a PAT without a sandboxes scope they answer 403 insufficient_scope; POST …/exec on the same sandbox answers 200; ops(rt.Calls()) holds no upload"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the hub has no [sandbox] section",
+          "action": "refuse the request on each of the three routes as every sandbox route does",
+          "contract": "HTTP 404 with error_type sandboxes_disabled",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/use_test.go, the three routes added to the table of TestUseRoutes_AnswerDisabledWhileSandboxesAreOff"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "unwanted",
+          "condition": "the sandbox is in a state other than ready",
+          "action": "refuse the request on each of the three routes and run nothing in the sandbox",
+          "contract": "HTTP 409 with error_type sandbox_not_ready, as the hub's error object; no runtime call",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/use_test.go, the three routes added to the table of TestUseRoutes_RefuseASandboxInAStateTheRouteDoesNotAllow, over the states provisioning, stopped, completed, failed and deleted"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "ubiquitous",
+          "action": "for any request that fails more than one check, answer the first in this order: the feature, the binding, the scope, workspace access, the sandbox's existence, its tools, the request's body, its state, and for a call the tool's name and then the place among the concurrent execs",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/use_test.go, rows added to the table of TestUseRoutes_AnswerTheFirstCheckARequestFails for POST …/tools/:name: {no scope and unknown sandbox: 403 insufficient_scope; unknown sandbox and a body that is not an object: 404 sandbox_not_found; sandbox without tools and a bad body: 404 tools_unavailable; bad body and a stopped sandbox: 400; stopped sandbox and an unknown tool: 409; unknown tool with every place taken: 404 tool_not_found}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "List and call the tools over REST",
+      "rationale": "A script uses a sandbox's tools with one GET and one POST and no MCP client.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "a caller with a tool set requests GET /workspaces/:slug/sandboxes/:id/tools on a ready sandbox with tools",
+          "action": "answer with the caller's set and its tool definitions in the tool server's order",
+          "contract": "HTTP 200 with {\"set\": \"full\" | \"read_only\", \"tools\": [{\"name\", \"description\", \"input_schema\", \"output_schema\"}]}; output_schema is null for a tool without one; the schemas are the tool server's, member for member",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_test.go: r = GET …/tools as a writer; r.status == 200; r.set == \"full\"; names(r.tools) == the stand-in's names in its order; r.tools[i].input_schema deep-equals the stand-in's; the tool without an output schema has output_schema == null. As a reader: set == \"read_only\" and names == the stand-in's under --read-only"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "state_driven",
+          "condition": "a sandbox stays ready after the definitions of a set were read from its tool server",
+          "action": "answer every listing and every call of that set from the definitions it kept, without running `<tool_server> tools` again, and read them again once the sandbox has left ready and is ready again",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_test.go: GET …/tools twice as a writer and once more after a call: the runtime ran [tool_server, \"tools\"] once, in /workspace, without standard input; GET as a reader runs [tool_server, \"tools\", \"--read-only\"] once; after the record moves to stopped and back to ready, GET as a writer runs [tool_server, \"tools\"] once more; after hubtest Restart the next GET runs it once more"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "action": "for any listing, leave last_activity_at as it was, take no place among the sandbox's concurrent execs, emit no event and count no metric",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "max_concurrent_execs = 1 and one exec running in the sandbox"
+            ],
+            "pseudocode": "in internal/sandbox/tools_test.go: GET …/tools answers 200 while the exec runs; storedRecord(t, h, id).LastActivityAt is unchanged by it; h.sandboxEvents(t, \"parley.sandbox.tool_call\", id) is empty; the recorder has no series of parley_sandbox_tool_calls_total"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "event_driven",
+          "condition": "a caller requests POST /workspaces/:slug/sandboxes/:id/tools/:name with a body {\"input\"?: object, \"timeout\"?: duration} naming a tool of its set",
+          "action": "make the tool call with input, {} when absent, under the time bound timeout, 60s when absent, cut to [sandbox].max_exec_timeout when it is longer, and answer with the tool's result and how long the call took",
+          "contract": "HTTP 200 with {\"ok\": bool, \"data\": object, \"error\"?: string, \"detail\"?: string, \"text\"?: string, \"duration_ms\": int}; a tool failure and a timeout are 200 with ok: false; an empty body is the call with input {}",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go: r = POST …/tools/read_file {\"input\": {\"path\": \"a.txt\"}}; r.status == 200; r.ok == true; r.data deep-equals the stand-in's data; r.duration_ms >= 0; the stand-in was given the input. A table of bounds with max_exec_timeout = 5m: {no timeout: --timeout 60s; \"10s\": 10s; \"1h\": 300s}. POST with no body calls with input {}. A stand-in result with text answers text; one without has no text member"
+          }
+        },
+        {
+          "id": "REQ-3.5",
+          "pattern": "unwanted",
+          "condition": "the body of a call is not a JSON object, its input is not a JSON object, or its timeout is not a positive duration of the hub's duration grammar",
+          "action": "refuse the call and run nothing in the sandbox",
+          "contract": "HTTP 400 with error_type invalid_request and a message naming the member; no runtime call",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/tools_call_test.go, a table over the bodies {`[]`, `\"x\"`, `{\"input\": []}`, `{\"input\": \"x\"}`, `{\"timeout\": \"0s\"}`, `{\"timeout\": \"-1s\"}`, `{\"timeout\": \"soon\"}`, `{\"timeout\": 5}`}: 400 invalid_request; the message names input or timeout; ops(rt.Calls()) is unchanged"
+          }
+        },
+        {
+          "id": "REQ-3.6",
+          "pattern": "unwanted",
+          "condition": "a caller with the read-only set calls a tool that the full set holds and the read-only set does not",
+          "action": "refuse the call before anything is written to or run in the sandbox for it",
+          "contract": "HTTP 403 with error_type insufficient_scope; no upload and no call of the tool server; no event",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go, a table over write_file, edit_file, execute and run_command called by a reader: 403 insufficient_scope; the runtime ran no upload and no [tool_server, \"call\", …]; the same four called by a writer answer 200"
+          }
+        },
+        {
+          "id": "REQ-3.7",
+          "pattern": "unwanted",
+          "condition": "a call names a tool that neither set holds",
+          "action": "refuse the call before anything is written to or run in the sandbox for it",
+          "contract": "HTTP 404 with error_type tool_not_found and a message naming the tool; no upload and no call of the tool server; no event",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go: POST …/tools/no_such_tool as a writer and as a reader answers 404 tool_not_found; the message holds no_such_tool; the runtime ran no upload"
+          }
+        },
+        {
+          "id": "REQ-3.8",
+          "pattern": "unwanted",
+          "condition": "the input of a call is larger than 4 MiB as JSON",
+          "action": "refuse the call and run nothing in the sandbox",
+          "contract": "HTTP 413 with error_type payload_too_large; an input of exactly 4 MiB is called; no runtime call for the refused one",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/sandbox/tools_call_test.go: an input whose JSON is 4<<20 bytes answers 200; one of 4<<20 + 1 bytes answers 413 payload_too_large and the runtime ran no upload"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-4",
+      "title": "Run the tool server in the sandbox, once per call",
+      "rationale": "The tools run inside the sandbox, so what they can read, write and reach is what the sandbox allows; the runtime's exec carries no input, so each call is a file and one process.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-4.1",
+          "pattern": "event_driven",
+          "condition": "a tool call has passed every check",
+          "action": "write {\"name\", \"input\"} to the file /tmp/parley-tools/requests/<32 random lowercase hex characters>.json with mode 0600 through the runtime's Upload, run `<tool_server> call --request <file> --dir /workspace --index-dir /tmp/parley-tools/index --timeout <bound in whole seconds>s`, with --read-only added when the caller has the read-only set, through the runtime's ExecStream in /workspace with no standard input and no environment of its own, and take the one JSON object it prints as the tool's result",
+          "contract": "one upload of the request and one run of the tool server per call; the command's arguments are exactly those; the result's members ok, data, error, detail and text are the tool server's",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go: after one call as a writer, the runtime's calls hold one upload to a path matching ^/tmp/parley-tools/requests/[0-9a-f]{32}\\.json$ with mode 0600 whose content is {\"name\": \"read_file\", \"input\": {…}}, and one exec_stream whose command is [tool_server, \"call\", \"--request\", that path, \"--dir\", \"/workspace\", \"--index-dir\", \"/tmp/parley-tools/index\", \"--timeout\", \"60s\"], WorkDir /workspace, empty Stdin and nil Env; as a reader the command ends with \"--read-only\"; two calls use two different file names"
+          }
+        },
+        {
+          "id": "REQ-4.2",
+          "pattern": "event_driven",
+          "condition": "a tool call whose request file was written ends, with a result or as a failed call",
+          "action": "remove the request file from the sandbox, and when the removal fails log it and leave the call's answer as it is",
+          "contract": "after the answer, no file is left under /tmp/parley-tools/requests; a failed removal leaves the status and body unchanged and writes one warning to the hub's log, without the file's content",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the fake runtime with host directories, the stand-in answering through its script"
+            ],
+            "pseudocode": "in internal/sandbox/tools_call_test.go, a table over {a call that succeeds, a tool failure, a tool server that exits 1, a timeout}: afterwards the runtime's Walk of /tmp/parley-tools/requests is empty. With the removal's exec failing: the answer equals the answer without the failure and hubtest.LogBuffer holds one warning naming the sandbox"
+          }
+        },
+        {
+          "id": "REQ-4.3",
+          "pattern": "event_driven",
+          "condition": "the tool server prints a result with ok: false: a file not found, an edit that is not unique, a command the tool reports as failed",
+          "action": "give the caller the tool's result with ok: false and the tool's error code and detail, as a result and not as a failed call",
+          "contract": "REST: HTTP 200 with ok: false, error and detail as the tool server printed them",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go: the stand-in prints {\"ok\": false, \"error\": \"not_found\", \"detail\": \"no such file\", \"data\": {}} and exits 0; POST …/tools/read_file answers 200 with ok == false, error == \"not_found\", detail == \"no such file\""
+          }
+        },
+        {
+          "id": "REQ-4.4",
+          "pattern": "unwanted",
+          "condition": "a tool call is still running when its time bound passes",
+          "action": "kill the tool server and give the caller a tool result that says the call timed out",
+          "contract": "the result is {\"ok\": false, \"error\": \"timeout\"} with data {}; REST: HTTP 200; the tool server's process has ended and the request file is removed",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub's timers are the test's, as in TestExec_KillsACommandThatOutlastsItsTimeout",
+              "a stand-in that waits for its context to end"
+            ],
+            "pseudocode": "in internal/sandbox/tools_call_test.go: POST …/tools/execute {\"timeout\": \"10s\"}; fire the 10s timer; the answer is 200 with ok == false and error == \"timeout\"; the stand-in's context ended; a later call is not refused for the place the first held"
+          }
+        },
+        {
+          "id": "REQ-4.5",
+          "pattern": "unwanted",
+          "condition": "a tool call arrives while the sandbox already runs [sandbox].max_concurrent_execs commands, execs and tool calls counted together",
+          "action": "refuse the call without writing or running anything in the sandbox, and give a call's place back when the call ends, however it ends",
+          "contract": "REST: HTTP 429 with error_type rate_limited and no Retry-After header; MCP: a JSON-RPC error with code -32000 and the message \"sandbox busy\"; no upload; no event",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "max_concurrent_execs = 1"
+            ],
+            "pseudocode": "in internal/sandbox/tools_call_test.go, beside the cases of TestExec_RefusesACommandOverTheSandboxLimit: with one tool call held open by the stand-in, a second call answers 429 rate_limited without Retry-After and so does POST …/exec; with one exec held open, a tool call answers 429; once the first has ended, a call answers 200"
+          }
+        },
+        {
+          "id": "REQ-4.6",
+          "pattern": "unwanted",
+          "condition": "the tool server cannot be started, exits with a status other than 0, prints something that is not one JSON object with a boolean ok for a call or one JSON array of definitions for a listing, or prints more than 4 MiB, or the runtime cannot be reached",
+          "action": "fail the call or the listing with tool_server_failed, or with sandbox_runtime_error when it was the runtime, with a message of at most 1,024 bytes cleared of the sandbox's secret values and the hub's, and keep no definitions from a failed listing",
+          "contract": "REST: HTTP 502 with error_type tool_server_failed, or 502 sandbox_runtime_error for the runtime; the message is at most 1,024 bytes and holds no exposed secret value, credential value or hub credential; MCP: a JSON-RPC error with code -32603 and the same message",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a sandbox that exposes the secret NPM_TOKEN"
+            ],
+            "pseudocode": "in internal/sandbox/tools_call_test.go, a table over the stand-in's behaviour for POST …/tools/read_file and for GET …/tools: {exit 127 with stderr holding the secret's value, exit 1, exit 2, stdout `not json`, stdout `[]` for a call, stdout `{}` without ok, stdout `{\"ok\": true}{\"ok\": true}`, stdout of 4<<20 + 1 bytes, a definition without a name}: 502 tool_server_failed; len(message) <= 1024; the message does not hold the secret's value. With rt.FailOperation(runtime.OpExecStream, runtime.ErrUnavailable, …) and with OpUpload failing: 502 sandbox_runtime_error. After a failed listing the next GET runs `tools` again"
+          }
+        },
+        {
+          "id": "REQ-4.7",
+          "pattern": "event_driven",
+          "condition": "a tool call starts in the sandbox, and again when it ends",
+          "action": "raise the sandbox's last_activity_at to that time, and never for a call that was refused before it started",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the hub's clock is the test's"
+            ],
+            "pseudocode": "in internal/sandbox/activity_test.go, beside the cases of exec: a call that starts at T and ends at T+3s leaves storedRecord(t, h, id).LastActivityAt == T+3s, and T while it runs; a call refused 404 tool_not_found, 403 or 429 leaves it unchanged"
+          }
+        },
+        {
+          "id": "REQ-4.8",
+          "pattern": "unwanted",
+          "condition": "the caller of a running tool call leaves, or the hub begins to stop",
+          "action": "kill the tool server, write no answer, remove the request file, give the call's place back and record the call as a failed one",
+          "contract": "the connection is dropped without an answer; the tool server's process has ended; the call's event has ok: false and error \"tool_server_failed\", and it counts under the outcome failed",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go, as TestExec_KillsTheCommandWhenTheCallerLeavesOrTheHubStops, over {the caller cancels its request, the hub's shutdown is signalled}: the stand-in's context ends; a later call gets a place; h.sandboxEvents(t, \"parley.sandbox.tool_call\", id) holds one event with metadata.ok == false and metadata.error == \"tool_server_failed\""
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-5",
+      "title": "Serve the tools as an MCP server for one sandbox",
+      "rationale": "A harness that speaks MCP uses the sandbox's tools with one URL and a Parley credential, and nothing else to configure.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-5.1",
+          "pattern": "event_driven",
+          "condition": "an MCP client sends initialize or ping to POST /workspaces/:slug/sandboxes/:id/mcp with a credential that has a tool set",
+          "action": "answer initialize with the server name parley, the hub's version, the tools capability and instructions of one sentence naming the workspace and the sandbox id, and answer ping with an empty result",
+          "contract": "HTTP 200 with Content-Type application/json and no Mcp-Session-Id header; result.serverInfo.name == \"parley\"; result.serverInfo.version is the version GET /version reports; result.capabilities has tools and no resources or prompts; result.instructions is one sentence holding the slug and the id",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go: r = POST …/mcp {\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {…}} with Authorization: Bearer; assert the members of the contract; a ping answers {\"jsonrpc\": \"2.0\", \"id\": 2, \"result\": {}}"
+          }
+        },
+        {
+          "id": "REQ-5.2",
+          "pattern": "ubiquitous",
+          "action": "for any request to the MCP route, serve it on its own: set and read no session id, need no initialize before it, answer a request after a hub restart as before it, and answer GET and DELETE with 405",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go: tools/list without an initialize answers the tools; a request carrying Mcp-Session-Id: x is answered the same; after hubtest Restart tools/list answers the same tools; GET …/mcp and DELETE …/mcp with a valid credential answer 405"
+          }
+        },
+        {
+          "id": "REQ-5.3",
+          "pattern": "event_driven",
+          "condition": "an MCP client sends tools/list",
+          "action": "answer with the caller's tool set: each tool's name, description, input schema and, where it has one, output schema, as the tool server gave them and in its order",
+          "contract": "result.tools[i] has name, description and inputSchema, and outputSchema exactly when the tool has one; a caller with the read-only set gets no write_file, edit_file, execute or run_command; no nextCursor",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go: tools/list as a writer names the stand-in's thirteen tools in order with inputSchema deep-equal to the stand-in's input_schema; the tool without an output schema has no outputSchema member; as a reader it names the nine of --read-only"
+          }
+        },
+        {
+          "id": "REQ-5.4",
+          "pattern": "event_driven",
+          "condition": "an MCP client sends tools/call naming a tool of the caller's set",
+          "action": "make the tool call with the arguments as input under a time bound of 10 minutes, cut to [sandbox].max_exec_timeout when that is shorter, and answer with the tool's result as an MCP tool result",
+          "contract": "result.isError is the negation of ok; result.content is one text item: the tool server's text when it gave one, otherwise the JSON of data for a success and `<error>: <detail>` for a failure; result.structuredContent is data exactly when the tool has an output schema; a timeout is a result with isError true and the text \"timeout: …\"",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go, a table over the stand-in's result: {ok with text: isError false, content[0].text == text; ok without text: content[0].text == json(data); ok false, error not_found, detail d: isError true, content[0].text == \"not_found: d\"; a tool with an output schema: structuredContent == data; a tool without: no structuredContent}; the tool server was run with --timeout 600s, and with 300s when max_exec_timeout = 5m; absent arguments call with input {}"
+          }
+        },
+        {
+          "id": "REQ-5.5",
+          "pattern": "unwanted",
+          "condition": "a tools/call names a tool outside the caller's set or one no set holds, or carries arguments larger than 4 MiB as JSON",
+          "action": "answer a JSON-RPC error and run nothing in the sandbox for it",
+          "contract": "HTTP 200 with a JSON-RPC error of code -32602 whose message names the tool, or the 4 MiB limit for the arguments; no upload; no event",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go, a table: {execute called by a reader, no_such_tool called by a writer}: error.code == -32602 and error.message holds the name; arguments of 4<<20 + 1 bytes: error.code == -32602; the runtime ran no upload in any row"
+          }
+        },
+        {
+          "id": "REQ-5.6",
+          "pattern": "unwanted",
+          "condition": "a tools/call is a failed call, or arrives while the sandbox runs as many commands as it may",
+          "action": "answer a JSON-RPC error instead of a tool result",
+          "contract": "a failed call (tool_server_failed, sandbox_runtime_error) is a JSON-RPC error with code -32603 and the scrubbed message of at most 1,024 bytes; a call over the concurrent-exec limit is a JSON-RPC error with code -32000 and the message \"sandbox busy\"",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go: with the stand-in exiting 1, tools/call answers error.code == -32603; with the runtime unreachable, -32603; with max_concurrent_execs = 1 and one call held open, a second tools/call answers error.code == -32000 and error.message == \"sandbox busy\""
+          }
+        },
+        {
+          "id": "REQ-5.7",
+          "pattern": "unwanted",
+          "condition": "a request to the MCP route is refused before its MCP message is read: by the credential, the scope, workspace access, the sandbox's existence, its tools, its state, the feature, the rate limit, or a body over 8 MiB",
+          "action": "answer it as plain HTTP with the hub's error object and not as JSON-RPC",
+          "contract": "401; 403; 404 sandbox_not_found, tools_unavailable or sandboxes_disabled; 409 sandbox_not_ready; 413 for a body over 8 MiB; 429 for the rate limit; each body is the hub's error object with error_type, and has no jsonrpc member",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go, a table of tools/list requests: {no credential: 401; PAT without a sandboxes scope: 403; unknown sandbox: 404 sandbox_not_found; sandbox without tools: 404 tools_unavailable; stopped sandbox: 409 sandbox_not_ready; a body of 8<<20 + 1 bytes: 413}: the body decodes as the hub's error object and has no jsonrpc member; a body of 5 MiB that is a valid tools/list is answered 200"
+          }
+        },
+        {
+          "id": "REQ-5.8",
+          "pattern": "unwanted",
+          "condition": "an MCP client sends a method other than initialize, ping, tools/list, tools/call and the notifications that follow initialize",
+          "action": "answer the protocol's method-not-found error",
+          "contract": "a JSON-RPC error with code -32601",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_mcp_test.go, a table over the methods {resources/list, resources/read, prompts/list, completion/complete, logging/setLevel, no/such}: error.code == -32601; notifications/initialized is accepted with 202 or 200 and no error"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-6",
+      "title": "Record every tool call as one event and in two metrics",
+      "rationale": "An operator sees who used which tool in which sandbox and how it ended, without the hub's log ever holding file contents or secrets.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-6.1",
+          "pattern": "event_driven",
+          "condition": "a tool call that was started in the sandbox ends",
+          "action": "emit one hub event of type parley.sandbox.tool_call",
+          "contract": "one event: resource type sandbox, resource id the sandbox id, the workspace's normal visibility, the caller as actor, the sandbox's session_id, and metadata {\"tool\", \"ok\", \"error\"?, \"duration_ms\", \"via\": \"mcp\" | \"rest\", \"set\": \"full\" | \"read_only\"}; error is absent for ok: true and otherwise the tool's error code, \"timeout\", \"tool_server_failed\" or \"sandbox_runtime_error\"",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a ready sandbox with tools and a session"
+            ],
+            "pseudocode": "in internal/sandbox/tools_call_test.go, a table over {REST call as a writer that succeeds: ok true, no error, via rest, set full; MCP call as a reader: via mcp, set read_only; tool failure not_found: ok false, error not_found; timeout: error timeout; tool server exits 1: error tool_server_failed; runtime unreachable at exec_stream: error sandbox_runtime_error; a code_mode call: tool code_mode}: h.sandboxEvents(t, \"parley.sandbox.tool_call\", id) holds exactly one event per call with that metadata, the caller's actor, the sandbox's session_id and resource sandbox/id; a reader of the workspace sees it in GET /events and a user outside it does not"
+          }
+        },
+        {
+          "id": "REQ-6.2",
+          "pattern": "ubiquitous",
+          "action": "for any tool call, keep its arguments and its result out of the event: the metadata holds the six members named and nothing else",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go: a call whose input holds the marker IN-7f3a and whose result's data, text and detail hold OUT-9c1e: the stored event's JSON holds neither marker and its metadata's keys are a subset of {tool, ok, error, duration_ms, via, set}"
+          }
+        },
+        {
+          "id": "REQ-6.3",
+          "pattern": "unwanted",
+          "condition": "a request is refused before anything ran in the sandbox for it (access, the sandbox's tools, the body, the state, the tool's name, the limit), or is a listing",
+          "action": "emit no event and count no metric for it",
+          "contract": "the number of parley.sandbox.tool_call events and the series of parley_sandbox_tool_calls_total are unchanged",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/tools_call_test.go, a table over {403 insufficient_scope for the tool, 404 tool_not_found, 400 body, 413, 409 stopped, 429 limit, MCP -32602, MCP tools/list, GET …/tools}: h.sandboxEvents(t, \"parley.sandbox.tool_call\", id) stays empty and recorder.values(\"parley_sandbox_tool_calls_total\") stays empty"
+          }
+        },
+        {
+          "id": "REQ-6.4",
+          "pattern": "event_driven",
+          "condition": "a code_mode call ends",
+          "action": "emit one event for it, whatever tools its script called",
+          "check": {
+            "same_as": "REQ-6.1"
+          }
+        },
+        {
+          "id": "REQ-6.5",
+          "pattern": "event_driven",
+          "condition": "a tool call that was started in the sandbox ends",
+          "action": "add one to parley_sandbox_tool_calls_total under the labels tool and outcome, where outcome is ok for a result with ok: true, tool_error for a result with ok: false, timeout for a call that outlasted its bound and failed for a failed call, and observe the call's duration in seconds in parley_sandbox_tool_call_duration_seconds under the label tool",
+          "contract": "both metrics appear on GET /metrics after the first call; the counter rises by exactly one per started call",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/sandbox/metrics_test.go, beside TestMetrics_CreatesAndStates, with the recordingRecorder: after {a success, a tool failure, a timeout, a tool server that exits 1} of read_file, recorder.values(\"parley_sandbox_tool_calls_total\") == {tool=read_file,outcome=ok: 1, …tool_error: 1, …timeout: 1, …failed: 1} and len(recorder.observations(\"parley_sandbox_tool_call_duration_seconds\")) == 4; recorder.values(\"parley_sandbox_exec_total\") is empty"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "A harness outside the sandbox works in it over MCP",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "creates a fork with a sandbox of a profile that names the tool server, and gives a harness the sandbox's MCP URL and the fork's token"
+        },
+        {
+          "actor": "agent",
+          "action": "connects to POST /workspaces/:slug/sandboxes/:id/mcp, initializes and lists the tools"
+        },
+        {
+          "actor": "parleyd",
+          "action": "decides the full set for the token, reads the definitions from the tool server once and answers thirteen tools"
+        },
+        {
+          "actor": "agent",
+          "action": "calls code_search twice, then edit_file, then execute"
+        },
+        {
+          "actor": "parleyd",
+          "action": "for each call uploads the request file, runs the tool server on it through the runtime, answers the result, removes the file and emits one parley.sandbox.tool_call event"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "runs each tool server process in the sandbox's working directory as the workload user"
+        },
+        {
+          "actor": "developer",
+          "action": "reads one event per call on the event stream, and finds the edit in the working directory and no request file or index inside it"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router and pipeline",
+          "sandbox service and its gate",
+          "MCP server of the SDK",
+          "event component",
+          "store",
+          "the fake runtime with host directories"
+        ],
+        "setup": [
+          "a hub started as startSandboxUseHub does, with a profile that names a tool server, hub_access = \"fork\" and max_concurrent_execs above 1",
+          "the stand-in tool server answers the runtime's commands: tools prints thirteen definitions, call edit_file changes the named file in the working directory, call code_search writes under its --index-dir when the index is missing and reports whether it built it"
+        ],
+        "end_state": [
+          "the MCP client of the SDK, given only the URL and the fork's token, listed thirteen tools",
+          "the second code_search reported that it did not build the index",
+          "GET /events as the developer holds four parley.sandbox.tool_call events for the sandbox, with via mcp and set full, in the order of the calls",
+          "the file edit_file changed holds the edit, and the runtime's Walk of /workspace names no path of parley-tools",
+          "the runtime's Walk of /tmp/parley-tools/requests is empty"
+        ],
+        "pseudocode": "a new test in test/e2e/sandbox_use_test.go beside TestSandboxUse_AnAgentUploadsAScriptRunsItAndDownloadsItsResult: c = an MCP client of the SDK over streamable HTTP with the bearer token; tools = c.ListTools(); len(tools) == 13; c.CallTool(code_search) twice; c.CallTool(edit_file); c.CallTool(execute); then assert the end state through GET /events and the fake's files"
+      }
+    },
+    {
+      "id": "PATH-2",
+      "title": "A reviewer reads a colleague's sandbox over REST and cannot change it",
+      "steps": [
+        {
+          "actor": "developer",
+          "action": "as an org member with read access, requests GET /workspaces/:slug/sandboxes/:id/tools of a colleague's sandbox"
+        },
+        {
+          "actor": "parleyd",
+          "action": "decides the read-only set and answers the definitions of the tool server under --read-only"
+        },
+        {
+          "actor": "developer",
+          "action": "calls POST …/tools/read_file with a path, and then POST …/tools/execute"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the tool server with --read-only for read_file and answers its result, and refuses execute with 403 insufficient_scope without running anything"
+        },
+        {
+          "actor": "OpenShell gateway",
+          "action": "runs the one tool server process of the read_file call"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router and pipeline",
+          "workspace access decision",
+          "sandbox service and its gate",
+          "event component",
+          "store",
+          "the fake runtime with host directories"
+        ],
+        "setup": [
+          "the hub of PATH-1, a file a.txt in the working directory, and a second user who is a member of the org with read access to the fork, with an API key"
+        ],
+        "end_state": [
+          "the listing answered set read_only without write_file, edit_file, execute and run_command",
+          "read_file answered 200 with ok true and the content of a.txt in data",
+          "execute answered 403 insufficient_scope",
+          "the runtime ran the tool server's call once, with --read-only",
+          "one parley.sandbox.tool_call event exists, for read_file, with set read_only and via rest"
+        ],
+        "pseudocode": "a new test in test/e2e/sandbox_use_test.go: list = GET …/tools as the member; r = POST …/tools/read_file {\"input\": {\"path\": \"a.txt\"}}; x = POST …/tools/execute {\"input\": {\"command\": \"id\"}}; assert the end state"
+      }
+    },
+    {
+      "id": "PATH-3",
+      "title": "A script searches a sandbox over REST, and a sandbox without tools refuses it",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "as a CI script with an API key, calls POST /workspaces/:slug/sandboxes/:id/tools/search_files with a pattern"
+        },
+        {
+          "actor": "parleyd",
+          "action": "runs the tool server in the sandbox and answers 200 with the matches in data"
+        },
+        {
+          "actor": "agent",
+          "action": "makes the same call, and the listing and the MCP initialize, on a sandbox of a profile without tool_server"
+        },
+        {
+          "actor": "parleyd",
+          "action": "answers each 404 tools_unavailable and runs nothing, while an exec in that sandbox still works"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "HTTP router and pipeline",
+          "configuration loader with two profiles",
+          "sandbox service and its gate",
+          "store",
+          "the fake runtime with host directories"
+        ],
+        "setup": [
+          "a hub with the profile tools, which names a tool server, and the profile plain, which does not, and one ready sandbox of each"
+        ],
+        "end_state": [
+          "the search answered 200 with ok true and the stand-in's matches in data",
+          "GET /sandbox-profiles shows tools true for tools and false for plain, and the two sandbox objects show the same",
+          "the three routes on the plain sandbox answered 404 tools_unavailable",
+          "POST …/exec on the plain sandbox answered 200"
+        ],
+        "pseudocode": "a new test in test/e2e/sandbox_use_test.go: r = POST …/tools/search_files {\"input\": {\"pattern\": \"TODO\"}} on the tools sandbox; then GET …/tools, POST …/tools/search_files and POST …/mcp on the plain sandbox; then POST …/exec on it; assert the end state"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/modelcontextprotocol/go-sdk",
+      "version": "v1.8.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "NewServer",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "func NewServer(impl *Implementation, options *ServerOptions) *Server"
+        },
+        {
+          "name": "Implementation",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "type Implementation struct { Name, Title, Description, Version string; … }"
+        },
+        {
+          "name": "ServerOptions (fields)",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "Instructions string; Capabilities *ServerCapabilities; Logger *slog.Logger"
+        },
+        {
+          "name": "Server.AddTool",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "func (s *Server) AddTool(t *Tool, h ToolHandler)"
+        },
+        {
+          "name": "Tool (fields)",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "Name string; Title string; Description string; InputSchema any; OutputSchema any"
+        },
+        {
+          "name": "ToolHandler",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "type ToolHandler func(context.Context, *CallToolRequest) (*CallToolResult, error)"
+        },
+        {
+          "name": "CallToolRequest",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "type CallToolRequest = ServerRequest[*CallToolParamsRaw]"
+        },
+        {
+          "name": "CallToolParamsRaw (fields)",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "Name string; Arguments json.RawMessage"
+        },
+        {
+          "name": "CallToolResult (fields)",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "Content []Content; StructuredContent any; IsError bool"
+        },
+        {
+          "name": "TextContent",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "type TextContent struct { Text string; Meta Meta; Annotations *Annotations }"
+        },
+        {
+          "name": "NewStreamableHTTPHandler",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "func NewStreamableHTTPHandler(getServer func(*http.Request) *Server, opts *StreamableHTTPOptions) *StreamableHTTPHandler"
+        },
+        {
+          "name": "StreamableHTTPOptions (fields)",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/mcp",
+          "signature": "Stateless bool; JSONResponse bool; MaxRequestBodyBytes int64; Logger *slog.Logger"
+        },
+        {
+          "name": "Error",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/jsonrpc",
+          "signature": "type Error = jsonrpc2.WireError // struct { Code int64; Message string; Data json.RawMessage }"
+        },
+        {
+          "name": "CodeInvalidParams, CodeInternalError, CodeMethodNotFound",
+          "import_path": "github.com/modelcontextprotocol/go-sdk/jsonrpc",
+          "signature": "const CodeMethodNotFound = -32601; CodeInvalidParams = -32602; CodeInternalError = -32603"
+        }
+      ]
+    }
+  ]
+}
