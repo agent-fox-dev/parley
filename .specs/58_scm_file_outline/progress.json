@@ -3,7 +3,7 @@
   "spec_id": "58",
   "spec_name": "scm_file_outline",
   "schema_version": 3,
-  "updated_at": "2026-11-20T21:45:22Z",
+  "updated_at": "2026-11-20T21:57:37Z",
   "tasks": [
     {
       "id": 1,
@@ -349,7 +349,25 @@
     },
     {
       "id": 3,
-      "state": "pending"
+      "state": "done",
+      "evidence": [
+        {
+          "covers": "REQ-3.4",
+          "tests": [
+            {
+              "test": "./test/image:TestHubImage_RunsTheHubOnOneVolume",
+              "failed": {
+                "at": "2026-11-20T21:46:58Z",
+                "tree": "68cef9eeff1004ef9a4e612cec0f396681a2190e"
+              },
+              "passed": {
+                "at": "2026-11-20T21:57:29Z",
+                "tree": "68985856b46207fbd68867de533355493b3cf005"
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": 4,

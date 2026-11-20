@@ -3,12 +3,14 @@
 package e2e
 
 import (
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -94,6 +96,33 @@ func TestBuild_RunsTheBuiltBinaries(t *testing.T) {
 		var tools []map[string]any
 		if err != nil || json.Unmarshal(out, &tools) != nil || len(tools) == 0 {
 			t.Fatalf("parley mcp --list of that binary: %v\n%.300s", err, out)
+		}
+	})
+
+	t.Run("parleyd builds with cgo and links the grammars of the outline", func(t *testing.T) {
+		// Without a C compiler go build turns cgo off by itself, and then
+		// parleyd outlines Go alone.
+		if out, err := exec.Command("go", "env", "CGO_ENABLED").Output(); err != nil || strings.TrimSpace(string(out)) != "1" {
+			t.Skipf("this toolchain builds without cgo (go env CGO_ENABLED = %q, %v)", out, err)
+		}
+		bin := filepath.Join(dir, "parleyd-cgo")
+		cmd := exec.Command("go", "build", "-o", bin, "./cmd/parleyd")
+		cmd.Dir = moduleRoot
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build ./cmd/parleyd with CGO_ENABLED=1: %v\n%s", err, out)
+		}
+		info, err := buildinfo.ReadFile(bin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cgo := slices.ContainsFunc(info.Settings, func(s debug.BuildSetting) bool { return s.Key == "CGO_ENABLED" && s.Value == "1" })
+		python := slices.ContainsFunc(info.Deps, func(m *debug.Module) bool { return strings.HasSuffix(m.Path, "/tree-sitter-python") })
+		if !cgo || !python {
+			t.Errorf("parleyd: built with cgo %t, links the Python grammar %t; want both", cgo, python)
+		}
+		if err := exec.Command(bin, "--help").Run(); err != nil {
+			t.Errorf("parleyd --help of that binary: %v", err)
 		}
 	})
 

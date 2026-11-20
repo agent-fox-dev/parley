@@ -1,10 +1,12 @@
 package image_test
 
 import (
+	"debug/buildinfo"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -75,6 +77,38 @@ func TestHubImage_RunsTheHubOnOneVolume(t *testing.T) {
 		}
 		if err := json.Unmarshal([]byte(version.stdout), &doc); err != nil || doc.CLI.Version != buildVersion {
 			t.Errorf("parley version printed %q (%v); want cli.version %q", version.stdout, err, buildVersion)
+		}
+	})
+
+	t.Run("holds a parleyd built with cgo and the outline's grammars beside a parley built without", func(t *testing.T) {
+		dir := t.TempDir()
+		settings := func(program string) (cgo string, grammars int) {
+			t.Helper()
+			bin := filepath.Join(dir, program)
+			must(t, engine, "cp", id+":/usr/local/bin/"+program, bin)
+			info, err := buildinfo.ReadFile(bin)
+			if err != nil {
+				t.Fatalf("the build information of the image's %s: %v", program, err)
+			}
+			for _, s := range info.Settings {
+				if s.Key == "CGO_ENABLED" {
+					cgo = s.Value
+				}
+			}
+			for _, dep := range info.Deps {
+				if strings.Contains(dep.Path, "/tree-sitter-") {
+					grammars++
+				}
+			}
+			return cgo, grammars
+		}
+		// The grammars of the fourteen languages other than Go come in
+		// thirteen modules: TypeScript's holds TSX too, and Shell's is bash.
+		if cgo, grammars := settings("parleyd"); cgo != "1" || grammars < 13 {
+			t.Errorf("parleyd: CGO_ENABLED=%s with %d grammar modules; want 1 and the outline's grammars", cgo, grammars)
+		}
+		if cgo, grammars := settings("parley"); cgo != "0" || grammars != 0 {
+			t.Errorf("parley: CGO_ENABLED=%s with %d grammar modules; want 0 and none", cgo, grammars)
 		}
 	})
 
