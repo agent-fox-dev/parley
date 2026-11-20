@@ -4674,7 +4674,12 @@ its author date (`(*gitrepo.Repo).AuthorZone`, since `ReadCommits` reads
 it in UTC) and the message `squashMessage` writes, and none when the tree is unchanged), and hands
 the result to `commit` (`commit.go`). A `commit` that
 finds the target moved since it was read starts the next try on the new
-head; when the last try lost, the attempt ends `failed` `contention`. A
+head; a swap that lost while the target still reads the head the try
+was built on lost to another writer that holds the target's lock and has
+not moved it yet, and the next try waits for that move, reading the
+branch every 5 ms for 2 s at most (`awaitMove`), rather than build at once
+on a head that would lose again; when the last try lost, the attempt ends
+`failed` `contention`. A
 gate, store or git error other than a conflict ends it `failed`
 `internal` and is returned to the engine's caller. On each try whose
 build did not conflict and made a head the guards have not allowed yet
