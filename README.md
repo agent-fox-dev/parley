@@ -43,6 +43,15 @@ embedded SQLite stores and a directory of git repositories.
   `containers/sandbox/Dockerfile` a reference sandbox image, and
   `deploy/kubernetes/` runs one hub on a persistent volume (see
   [Architecture](docs/architecture.md#images-and-manifests)).
+- `go test ./test/acceptance/...` runs the black-box acceptance suite: it
+  builds both programs, starts real hubs and drives them only over HTTP, the
+  `parley` binary and stock `git`. Its longer scenarios run only when asked:
+  `PARLEY_ACCEPTANCE_LONG=1` (waits of minutes to an hour),
+  `PARLEY_ACCEPTANCE_LARGE_REPO=1` (a 1 GiB repository),
+  `PARLEY_ACCEPTANCE_REFERENCE_HOST=1` (the latency targets) and
+  `PARLEY_ACCEPTANCE_OPENSHELL_GATEWAY_URL` with
+  `PARLEY_ACCEPTANCE_OPENSHELL_TOKEN_FILE` and
+  `PARLEY_ACCEPTANCE_SANDBOX_IMAGE` (the sandbox scenarios).
 - `go test ./test/perf/` with `PARLEY_PERF_URL` set measures the
   performance targets against a running hub (see
   [Performance](docs/performance.md)).
