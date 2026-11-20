@@ -71,6 +71,33 @@ func TestRetry_WaitsLongerAfterEachFailureUntilADayAfterTheFirstAttempt(t *testi
 	}
 }
 
+func TestRetry_CountsTheWaitFromTheEndOfTheFailedAttemptToTheNanosecond(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, options{toml: insecure})
+	// The attempt starts 900 ms into a second and the receiver takes 600 ms
+	// to answer it.
+	w.clock.advance(900 * time.Millisecond)
+	in := newInbox(t, func(d delivered, _ <-chan struct{}) int {
+		w.clock.advance(600 * time.Millisecond)
+		return http.StatusInternalServerError
+	})
+	id := w.subscribe(t, demo, map[string]any{"url": in.url(), "types": testTypes})
+	w.emit(t, demo, "parley.test.event", "")
+
+	d := w.retrying(t, id, 1)
+	ended := w.clock.Now()
+	if next := timeAt(d.nextAttemptAt.Int64); !next.Equal(ended.Add(10 * time.Second)) {
+		t.Fatalf("an attempt that failed at %s schedules the next at %s, want 10 s later", ended.Format(time.RFC3339Nano), next.Format(time.RFC3339Nano))
+	}
+	w.clock.advance(10*time.Second - time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	if got := len(in.requests()); got != 1 {
+		t.Fatalf("a millisecond before the retry is due the receiver got %d requests, want 1", got)
+	}
+	w.clock.advance(time.Millisecond)
+	w.retrying(t, id, 2)
+}
+
 // testTypes is the filter of the subscriptions of the state tests: the
 // events the tests write, not the subscription's own parley.webhook.* events.
 var testTypes = []string{"parley.test.*"}

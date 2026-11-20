@@ -115,9 +115,6 @@ row, and the paging scenario allows that end page there only.
 
 ## Gaps tracked as issues
 
-- A webhook's retry is scheduled 10 s after the first attempt's time cut to
-  the whole second (`internal/webhook/loop.go`), so it can reach the
-  receiver after 9 s. The scenario asserts at least 9 s.
 - The sandbox scenarios were not run against an OpenShell gateway, and with
   the pinned SDK (create in a working directory, the main command, logs and
   policy validation answer `unsupported`) they are expected to fail against

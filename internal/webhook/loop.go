@@ -408,7 +408,7 @@ func (c *Component) attempt(ctx context.Context, l *loop, sub Subscription, d de
 	if out.success {
 		return c.succeeded(ctx, sub, d, at, out)
 	}
-	return c.failed(ctx, sub, d, at, out)
+	return c.failed(ctx, sub, d, at, c.deps.Clock.Now().UTC(), out)
 }
 
 // succeeded records the successful attempt at at of the delivery d of sub,
@@ -430,15 +430,18 @@ func (c *Component) succeeded(ctx context.Context, sub Subscription, d delivery,
 	return again, time.Time{}, nil
 }
 
-// failed records the failed attempt at at of the delivery d of sub. One
-// made at the end of its event's retry window or later gives the event up
-// (giveUp). Any other is recorded in one transaction: the delivery stays pending with its next attempt scheduled
-// (nextAttempt), and the subscription gets last_status failed,
+// failed records the failed attempt at at of the delivery d of sub, which
+// ended at ended. One made at the end of its event's retry window or later
+// gives the event up (giveUp). Any other is recorded in one transaction: the
+// delivery stays pending with its next attempt scheduled the wait after
+// ended (nextAttempt), not after at, which is cut to the whole second, so
+// that the receiver never sees the retry sooner than the wait after the
+// attempt it failed, and the subscription gets last_status failed,
 // last_delivery_at and, when it has none, failing_since. The loop then waits
 // for that time and sends nothing else for sub meanwhile, so that no later
 // event overtakes the pending one; a wake-up before it changes nothing, since
 // resume waits again.
-func (c *Component) failed(ctx context.Context, sub Subscription, d delivery, at time.Time, out outcome) (next, time.Time, error) {
+func (c *Component) failed(ctx context.Context, sub Subscription, d delivery, at, ended time.Time, out outcome) (next, time.Time, error) {
 	first := at
 	if d.FirstAttemptAt != nil {
 		first = *d.FirstAttemptAt
@@ -446,7 +449,7 @@ func (c *Component) failed(ctx context.Context, sub Subscription, d delivery, at
 	if !at.Before(first.Add(retryWindow)) {
 		return c.giveUp(ctx, sub, d, at, out)
 	}
-	due := nextAttempt(first, at, d.Attempts+1)
+	due := nextAttempt(first, ended, d.Attempts+1)
 	var recorded bool
 	err := c.deps.Store.Tx(ctx, func(tx *sql.Tx) error {
 		var err error
