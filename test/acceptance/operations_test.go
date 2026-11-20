@@ -13,18 +13,24 @@ import (
 
 // writers keeps eight writers busy on demo until stop is called: four
 // commit to branches of their own through the source control API, four
-// create claims. It counts the writes answered 2xx and records every
-// answer of 500 or more and every request that got no answer.
+// create claims. It counts the writes answered 2xx and records every other
+// answer, and every request that got none, as a fault: no write of theirs
+// may be refused. A writer whose request got no answer stops, so that a
+// hub that went away is not called in a loop.
 type writers struct {
 	acked  atomic.Int64
 	mu     sync.Mutex
 	faults []string
 	done   chan struct{}
 	wg     sync.WaitGroup
+	once   sync.Once
 }
 
-func startWriters(hub *harness.Hub, credential string) *writers {
+// startWriters starts the writers; they are stopped when the test ends at
+// the latest.
+func startWriters(t *testing.T, hub *harness.Hub, credential string) *writers {
 	w := &writers{done: make(chan struct{})}
+	t.Cleanup(func() { w.stop() })
 	for i := range 8 {
 		w.wg.Add(1)
 		go func() {
@@ -54,13 +60,15 @@ func startWriters(hub *harness.Hub, credential string) *writers {
 						head = harness.Str(harness.Field(r.Body, "commit.sha"))
 					}
 				}
-				switch {
-				case r.Err != nil || r.Status >= 500:
-					w.mu.Lock()
-					w.faults = append(w.faults, fmt.Sprintf("writer %d: %d %v %s", i, r.Status, r.Err, r.Raw))
-					w.mu.Unlock()
-				case r.Status/100 == 2:
+				if r.Err == nil && r.Status/100 == 2 {
 					w.acked.Add(1)
+					continue
+				}
+				w.mu.Lock()
+				w.faults = append(w.faults, fmt.Sprintf("writer %d: %d %v %s", i, r.Status, r.Err, r.Raw))
+				w.mu.Unlock()
+				if r.Err != nil {
+					return
 				}
 			}
 		}()
@@ -68,9 +76,9 @@ func startWriters(hub *harness.Hub, credential string) *writers {
 	return w
 }
 
-// stop stops the writers and returns the faults they met.
+// stop stops the writers, once, and returns the faults they met.
 func (w *writers) stop() []string {
-	close(w.done)
+	w.once.Do(func() { close(w.done) })
 	w.wg.Wait()
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -79,8 +87,10 @@ func (w *writers) stop() []string {
 
 func TestOperations_BackupWhileRunningRestoresToACleanStart(t *testing.T) {
 	t.Parallel()
-	hub, demo := demoHub(t)
-	key := demo.Owner.Key
+	// Four writers of claims pass the default limit of 1000 active claims
+	// of a workspace within seconds, and the limit refuses the rest.
+	hub := harness.Start(t, harness.Options{TOML: "[awareness]\nmax_claims_per_workspace = 1000000\n"})
+	key := hub.Workspace(hub.User("alice"), "demo").Owner.Key
 	var open []int
 	for i := range 8 {
 		number := openChange(t, hub, key, fmt.Sprint("change-", i), map[string]string{fmt.Sprintf("c%d.txt", i): "change\n"})
@@ -91,7 +101,7 @@ func TestOperations_BackupWhileRunningRestoresToACleanStart(t *testing.T) {
 		}
 	}
 
-	w := startWriters(hub, key)
+	w := startWriters(t, hub, key)
 	harness.Eventually(t, "the writers to be writing", func() bool { return w.acked.Load() >= 8 })
 	snap := filepath.Join(t.TempDir(), "snapshot")
 	ackedBefore := w.acked.Load()
@@ -102,7 +112,10 @@ func TestOperations_BackupWhileRunningRestoresToACleanStart(t *testing.T) {
 		t.Fatalf("parleyd backup exited %d, want 0:\n%s%s", backup.Code, backup.Stdout, backup.Stderr)
 	}
 	if len(faults) > 0 {
-		t.Errorf("the writers met %d answers of 500 or more, or none, while the backup ran: %v", len(faults), faults)
+		t.Errorf("the writers met %d answers other than 2xx, or none, while the backup ran: %v", len(faults), faults)
+	}
+	if ackedDuring == 0 {
+		t.Error("no write was answered 2xx while the backup ran, want the hub to keep writing")
 	}
 	t.Logf("%d writes answered 2xx while the backup ran", ackedDuring)
 

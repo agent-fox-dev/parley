@@ -33,9 +33,33 @@ throttles the suite, and git's unauthenticated first requests count against
 the loopback address) and `[changes] mergeable_debounce = "0s"` (otherwise
 mergeability is reported up to 5 s late). A scenario adds only what it
 needs: `[land] max_attempts = 20` for twenty concurrent lands,
-`[awareness] max_claims_per_workspace = 1000000` for eight writers killed
-under load (they pass the default 1,000 within two seconds), and
-`[webhooks] allow_insecure = true` for the loopback receiver.
+`[awareness] max_claims_per_workspace = 1000000` for the writers killed
+under load and those writing while a backup runs (they pass the default
+1,000 within seconds), `[webhooks] allow_insecure = true` for the loopback
+receiver, `[events] retention = "1h"` for the expired cursor (the shortest
+retention the hub takes), the variable `SSL_CERT_FILE` naming the fake
+forge's certificate for the hubs that reach it, and, against a gateway, a
+`[sandbox]` section with the gateway's URL, a token file and the profiles a
+scenario names.
+
+## Rows left out of the paging and idempotency sweeps
+
+The paging and idempotency scenarios sweep every list and create route of
+the table but eight, each marked in it with its reason; all eight stay in
+the envelope scenario's 401 and 405 sweep:
+
+- `GET /api/v1/auth/providers`: the configuration names at most two
+  providers, so a list of three cannot exist.
+- The six sandbox lists (`GET /api/v1/sandbox-profiles`,
+  `/api/v1/sandboxes`, `/api/v1/workspaces/:slug/sandboxes`, a sandbox's
+  `logs` and `proposals`, and `/api/v1/workspaces/:slug/sandbox-rules`)
+  and the sandbox create (`POST /api/v1/workspaces/:slug/sandboxes`): the
+  suite's hubs have no OpenShell gateway.
+
+The five forge lists and five forge creates are swept against the
+harness's fake GitHub API, which pages by `per_page` and `page` with a
+`Link` header as GitHub does; the workspace writes to it with a `GIT_PAT`
+secret.
 
 ## Names the package has wrong
 
@@ -104,5 +128,6 @@ row, and the paging scenario allows that end page there only.
   one. Two optional variables help a remote gateway reach the hub:
   `PARLEY_ACCEPTANCE_SANDBOX_HUB_HOST` and
   `PARLEY_ACCEPTANCE_OPENSHELL_PROVIDER_PROFILE`; only the gateway URL gates,
-  so a gateway set up halfway fails the scenarios instead of skipping them.
+  so a gateway set up halfway fails the scenarios instead of skipping them,
+  and without `PARLEY_ACCEPTANCE_SANDBOX_IMAGE` they fail at once.
 - The 1 GiB repository and reference-host scenarios were not run here.

@@ -36,6 +36,23 @@ type seeded struct {
 	ids map[string]string
 	// origin is the origin and upstream of the carry-patch workspace.
 	origin *harness.Origin
+	// forge is the fake forge the workspace of forgedHub reads and writes
+	// as the repository acme/<its slug>.
+	forge *harness.Forge
+}
+
+// forgedHub starts a hub that trusts a fake forge, with alice signed in
+// and her workspace slug registered from an origin the forge knows as
+// acme/<slug>, whose forge it is.
+func forgedHub(t *testing.T, slug string) *seeded {
+	t.Helper()
+	forge := harness.NewForge(t)
+	hub := harness.Start(t, harness.Options{TOML: "[webhooks]\nallow_insecure = true\n", Env: forge.Env()})
+	alice := hub.User("alice")
+	s := &seeded{t: t, hub: hub, alice: alice, ids: map[string]string{}, forge: forge}
+	hub.Register(alice, slug, hub.Origin(harness.WithRepoPath("acme/"+slug+".git")), nil)
+	s.call(http.MethodPatch, wsPath(slug, ""), alice.Key, map[string]any{"settings": map[string]any{"forge_api_url": forge.URL}}, http.StatusOK)
+	return s
 }
 
 // path is the row's path with every placeholder replaced by its
@@ -286,14 +303,15 @@ type listing struct {
 // none of which has an item yet.
 func pageParents(t *testing.T) *seeded {
 	t.Helper()
-	hub := harness.Start(t, harness.Options{TOML: "[webhooks]\nallow_insecure = true\n"})
-	alice := hub.User("alice")
-	s := &seeded{t: t, hub: hub, alice: alice, ids: map[string]string{}}
-	key := alice.Key
+	s := forgedHub(t, "pages")
+	hub, alice, key := s.hub, s.alice, s.alice.Key
 	hub.User("erin")
 	hub.User("kate")
-	hub.Workspace(alice, "pages")
 	hub.Workspace(alice, "third")
+	// The forge's issue 2 and pull request 5 never get an item of a list.
+	s.forge.SetIssues("acme", "pages", harness.Issue{Number: 1, Title: "First"}, harness.Issue{Number: 2, Title: "Second"},
+		harness.Issue{Number: 3, Title: "Third"})
+	s.forge.SetPulls("acme", "pages", harness.Pull{Number: 4, Title: "Fourth"}, harness.Pull{Number: 5, Title: "Fifth"})
 	hub.CreateOrg("acme")
 	s.ids["zed"] = harness.Str(s.call(http.MethodPost, "/api/v1/users", hub.AdminToken, map[string]any{
 		"username": "zed", "email": "zed@example.test", "provider": "github", "provider_id": "999999",
@@ -360,6 +378,11 @@ func (s *seeded) listings() map[string]listing {
 		"/api/v1/workspaces/:slug/cost":                           ws("/cost?group_by=model", "key"),
 		"/api/v1/workspaces/:slug/forge/deliveries":               ws("/forge/deliveries", "delivery_id"),
 		"/api/v1/workspaces/:slug/forks":                          ws("/forks", "slug"),
+		"/api/v1/workspaces/:slug/issues":                         {path: pages + "/issues", empty: pages + "/issues?state=closed", credential: key, id: "number"},
+		"/api/v1/workspaces/:slug/issues/:number/comments":        {path: pages + "/issues/1/comments", empty: pages + "/issues/2/comments", credential: key, id: "id"},
+		"/api/v1/workspaces/:slug/pulls/:number/files":            {path: pages + "/pulls/4/files", empty: pages + "/pulls/5/files", credential: key, id: "filename"},
+		"/api/v1/workspaces/:slug/pulls/:number/checks":           {path: pages + "/pulls/4/checks", empty: pages + "/pulls/5/checks", credential: key, id: "name"},
+		"/api/v1/workspaces/:slug/pulls/:number/reviews":          {path: pages + "/pulls/4/reviews", empty: pages + "/pulls/5/reviews", credential: key, id: "body"},
 		"/api/v1/workspaces/:slug/lands":                          ws("/lands", "id"),
 		"/api/v1/workspaces/:slug/patches":                        {path: carry + "/patches", empty: carry + "/patches", credential: key, id: "id"},
 		"/api/v1/workspaces/:slug/rebuilds":                       {path: carry + "/rebuilds", empty: carry + "/rebuilds", credential: key, id: "id"},
@@ -415,6 +438,16 @@ func (s *seeded) forgeDelivery(slug, secret, id string) {
 // list.
 func (s *seeded) seedThree() {
 	s.t.Helper()
+	s.seedThreeOwned()
+	s.seedThreeOfChanges()
+	s.seedThreeFromOutside()
+}
+
+// seedThreeOwned gives the organizations, users and workspaces three
+// members, secrets, variables, tokens, sessions, claims, forks, webhooks,
+// deliveries and telemetry records each, and kate three API keys.
+func (s *seeded) seedThreeOwned() {
+	s.t.Helper()
 	hub, key, admin := s.hub, s.alice.Key, s.hub.AdminToken
 	pages := wsPath("pages", "")
 	three := []string{"1", "2", "3"}
@@ -453,10 +486,20 @@ func (s *seeded) seedThree() {
 	}
 	hub.SignIn("kate")
 	hub.SignIn("kate")
+}
+
+// seedThreeOfChanges gives pages three files to find, change e three
+// versions, approvals, checks and land attempts, and change o three
+// overlapping changes.
+func (s *seeded) seedThreeOfChanges() {
+	s.t.Helper()
+	hub, key := s.hub, s.alice.Key
+	pages := wsPath("pages", "")
+	three := []string{"1", "2", "3"}
 
 	// Three files with the word the search looks for, committed to main by
 	// its owner.
-	main := harness.Str(hub.Get(key, pages+"/scm/refs/main").Body["sha"])
+	main := mainHeadOf(s.t, hub, key, "pages")
 	s.call(http.MethodPost, pages+"/scm/commits", key, map[string]any{
 		"branch": "main", "expected_head_sha": main, "message": "Add the needles",
 		"operations": []any{put("n1.txt", "needle 1\n"), put("n2.txt", "needle 2\n"), put("n3.txt", "needle 3\n")},
@@ -499,12 +542,30 @@ func (s *seeded) seedThree() {
 		return len(hub.Get(key, pages+"/changes/"+s.ids["o"]+"/overlaps").Items()) >= 3
 	})
 
-	// Three deliveries from the forge.
-	s.call(http.MethodPatch, pages, key, map[string]any{"settings": map[string]any{"forge_api_url": "https://127.0.0.1:1/github"}}, http.StatusOK)
+}
+
+// seedThreeFromOutside gives pages three deliveries from its forge, and its
+// forge's issue 1 three comments, written through the hub, and pull
+// request 4 three files, check runs and reviews; and carry three patches
+// and rebuilds, and the rerere records of three conflicts.
+func (s *seeded) seedThreeFromOutside() {
+	s.t.Helper()
+	key := s.alice.Key
+	pages := wsPath("pages", "")
+	three := []string{"1", "2", "3"}
+
 	secret := harness.Str(s.call(http.MethodPut, pages+"/forge/webhook", key, nil, http.StatusOK).Body["secret"])
 	for _, n := range three {
 		s.forgeDelivery("pages", secret, "delivery-"+n)
 	}
+	// A write reaches the forge with the workspace's forge credential.
+	s.call(http.MethodPost, pages+"/secrets", key, entries("GIT_PAT"), http.StatusCreated)
+	for _, n := range three {
+		s.call(http.MethodPost, pages+"/issues/1/comments", key, map[string]any{"body": "comment " + n}, http.StatusCreated)
+	}
+	s.forge.SetPulls("acme", "pages", harness.Pull{Number: 4, Title: "Fourth", Files: []string{"f1.txt", "f2.txt", "f3.txt"},
+		Checks: []string{"build", "lint", "test"}, Reviews: []string{"review 1", "review 2", "review 3"}},
+		harness.Pull{Number: 5, Title: "Fifth"})
 
 	// Three patches and three rebuilds of carry; the last rebuild, which
 	// goes on past a conflict, meets one in each patch, as the upstream
@@ -523,15 +584,6 @@ func (s *seeded) seedThree() {
 	s.call(http.MethodPatch, carry, key, map[string]any{"settings": map[string]any{"rebuild_fail_mode": "continue"}}, http.StatusOK)
 	id := harness.Str(s.call(http.MethodPost, carry+"/rebuild", key, nil, http.StatusAccepted).Body["id"])
 	s.waitRebuild("carry", id)
-}
-
-// ids are the identifiers of the items, read at the member id.
-func ids(items []map[string]any, id string) []string {
-	var out []string
-	for _, it := range items {
-		out = append(out, fmt.Sprint(harness.Field(it, id)))
-	}
-	return out
 }
 
 func TestConventions_EveryListPagesTheSameWay(t *testing.T) {
@@ -555,7 +607,8 @@ func TestConventions_EveryListPagesTheSameWay(t *testing.T) {
 			credential = l.emptyCredential
 		}
 		empty := hub.Call(http.MethodGet, l.empty, credential, nil)
-		if empty.Status != http.StatusOK || len(empty.Items()) != 0 || empty.Body["next_cursor"] != nil || empty.Body["items"] == nil {
+		cursor, hasCursor := empty.Body["next_cursor"]
+		if empty.Status != http.StatusOK || len(empty.Items()) != 0 || !hasCursor || cursor != nil || empty.Body["items"] == nil {
 			t.Errorf("GET %s on a parent without items: %d %s, want items [] and next_cursor null", l.empty, empty.Status, empty.Raw)
 		}
 	}
@@ -576,15 +629,23 @@ func TestConventions_EveryListPagesTheSameWay(t *testing.T) {
 			continue
 		}
 		all := hub.Call(http.MethodGet, l.path, l.credential, nil)
-		want := ids(all.Items(), l.id)
+		want := members(all.Body, "items", l.id)
 		if all.Status != http.StatusOK || len(want) < 3 {
 			t.Errorf("GET %s: %d with %d items, want 200 with at least three: %s", l.path, all.Status, len(want), all.Raw)
+			continue
+		}
+		if slices.Contains(want, "") || len(slices.Compact(sorted(want))) != len(want) {
+			t.Errorf("GET %s: the items' %s are %v, want each one set and distinct", l.path, l.id, want)
 			continue
 		}
 		var seen []string
 		cursor := ""
 		for page := 0; page <= len(want); page++ {
 			p := hub.Call(http.MethodGet, withQuery(l.path, "limit=1"+cursor), l.credential, nil)
+			if _, ok := p.Body["next_cursor"]; !ok {
+				t.Errorf("GET %s page %d with limit=1: %d %s, want a next_cursor member", l.path, page+1, p.Status, p.Raw)
+				break
+			}
 			if r.feed && p.Status == http.StatusOK && len(p.Items()) == 0 && p.Body["next_cursor"] == nil && len(seen) == len(want) {
 				break // the empty page that ends a walk of the event log
 			}
@@ -592,7 +653,7 @@ func TestConventions_EveryListPagesTheSameWay(t *testing.T) {
 				t.Errorf("GET %s page %d with limit=1: %d %s, want one item", l.path, page+1, p.Status, p.Raw)
 				break
 			}
-			seen = append(seen, ids(p.Items(), l.id)...)
+			seen = append(seen, members(p.Body, "items", l.id)...)
 			next, isString := p.Body["next_cursor"].(string)
 			if !isString {
 				break
@@ -619,21 +680,6 @@ func TestConventions_EveryListPagesTheSameWay(t *testing.T) {
 	}
 }
 
-// count is the number of items of the list at path, read with credential.
-func (s *seeded) count(credential, path string) int {
-	s.t.Helper()
-	n, cursor := 0, ""
-	for {
-		page := s.hub.Get(credential, withQuery(path, "limit=200"+cursor))
-		n += len(page.Items())
-		next := harness.Str(page.Body["next_cursor"])
-		if next == "" {
-			return n
-		}
-		cursor = "&cursor=" + next
-	}
-}
-
 // creation is how the idempotency scenario sends a create route.
 type creation struct {
 	path, credential string
@@ -646,12 +692,12 @@ type creation struct {
 // table needs to exist first.
 func createParents(t *testing.T) *seeded {
 	t.Helper()
-	hub := harness.Start(t, harness.Options{TOML: "[webhooks]\nallow_insecure = true\n"})
-	alice := hub.User("alice")
-	s := &seeded{t: t, hub: hub, alice: alice, ids: map[string]string{}}
-	key := alice.Key
-	hub.Workspace(alice, "idem")
+	s := forgedHub(t, "idem")
+	hub, key := s.hub, s.alice.Key
 	hub.CreateOrg("acme")
+	s.call(http.MethodPost, wsPath("idem", "/secrets"), key, entries("GIT_PAT"), http.StatusCreated)
+	s.forge.SetIssues("acme", "idem", harness.Issue{Number: 1, Title: "To comment on"})
+	s.forge.SetPulls("acme", "idem", harness.Pull{Number: 2, Title: "To comment on"})
 	s.ids["session"] = harness.Str(s.call(http.MethodPost, "/api/v1/sessions", key,
 		map[string]any{"workspace_slug": "idem"}, http.StatusCreated).Body["id"])
 	number := func(r harness.Response) string {
@@ -663,7 +709,7 @@ func createParents(t *testing.T) *seeded {
 	s.ids["behind"] = number(s.commitOn(key, "idem", "behind", "main", "Change to rebase"))
 	s.commitOn(key, "idem", "plain", "main", "")
 	s.call(http.MethodPost, wsPath("idem", "/changes/"+s.ids["revert"]+"/land"), key, map[string]any{}, http.StatusOK)
-	s.ids["main"] = harness.Str(hub.Get(key, wsPath("idem", "/scm/refs/main")).Body["sha"])
+	s.ids["main"] = mainHeadOf(t, hub, key, "idem")
 	s.ids["receiver"] = harness.NewReceiver(t).URL
 	s.carryPatch("carry", map[string]map[string]string{"patch-2": {"patch-2.txt": "two\n"}})
 	s.ids["origin"] = hub.Origin().URL()
@@ -676,7 +722,9 @@ func (s *seeded) creations() map[string]creation {
 	key, admin := s.alice.Key, s.hub.AdminToken
 	idem, carry := wsPath("idem", ""), wsPath("carry", "")
 	run := idem + "/runs/" + runID
-	counted := func(credential, path string) func() int { return func() int { return s.count(credential, path) } }
+	counted := func(credential, path string) func() int {
+		return func() int { return len(walk(s.t, s.hub, credential, path)) }
+	}
 	in := func(path string, body any, list string) creation {
 		return creation{path: path, credential: key, body: body, count: counted(key, list)}
 	}
@@ -708,6 +756,17 @@ func (s *seeded) creations() map[string]creation {
 		"/api/v1/workspaces/:slug/changes/:number/revert": in(change("revert", "/revert"), map[string]any{}, idem+"/changes"),
 		"/api/v1/workspaces/:slug/claims": in(idem+"/claims", map[string]any{"paths": []string{"a.txt"}, "intent": "idem"},
 			idem+"/claims"),
+		"/api/v1/workspaces/:slug/issues": {path: idem + "/issues", credential: key, body: map[string]any{"title": "Idem"},
+			count: func() int { return len(s.forge.Issues("acme", "idem")) }},
+		"/api/v1/workspaces/:slug/issues/:number/comments": {path: idem + "/issues/1/comments", credential: key,
+			body: map[string]any{"body": "idem"}, count: func() int { return len(s.forge.Issues("acme", "idem")[0].Comments) }},
+		"/api/v1/workspaces/:slug/labels": {path: idem + "/labels", credential: key, body: map[string]any{"name": "idem"},
+			count: func() int { return len(s.forge.Labels("acme", "idem")) }},
+		"/api/v1/workspaces/:slug/pulls": {path: idem + "/pulls", credential: key,
+			body:  map[string]any{"title": "Idem", "head": "plain", "base": "main"},
+			count: func() int { return len(s.forge.Pulls("acme", "idem")) }},
+		"/api/v1/workspaces/:slug/pulls/:number/comments": {path: idem + "/pulls/2/comments", credential: key,
+			body: map[string]any{"body": "idem"}, count: func() int { return len(s.forge.Pulls("acme", "idem")[0].Comments) }},
 		"/api/v1/workspaces/:slug/forks": in(idem+"/forks", map[string]any{"token": map[string]any{"permissions": []string{"git:read"}}},
 			idem+"/forks"),
 		"/api/v1/workspaces/:slug/patches":             in(carry+"/patches", map[string]any{"branch_name": "patch-2"}, carry+"/patches"),

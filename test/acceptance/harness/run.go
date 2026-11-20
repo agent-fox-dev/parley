@@ -53,6 +53,11 @@ func (r Result) JSON() map[string]any {
 	return m
 }
 
+// callLimit is the longest a process the harness runs to its end may take,
+// so that a hung git, parley or parleyd fails its scenario rather than the
+// whole run at go test's timeout.
+const callLimit = 2 * time.Minute
+
 // run runs name with args in dir with exactly the environment env.
 func run(ctx context.Context, dir string, env []string, name string, args ...string) Result {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -76,7 +81,9 @@ func run(ctx context.Context, dir string, env []string, name string, args ...str
 // ("" for none), in a home and a configuration directory of its own. A
 // command that waits polls every second rather than every five.
 func (h *Hub) CLI(credential string, args ...string) Result {
-	return h.CLIContext(context.Background(), credential, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), callLimit)
+	defer cancel()
+	return h.CLIContext(ctx, credential, args...)
 }
 
 // CLIContext is CLI for a command that does not end by itself, such as
@@ -111,7 +118,9 @@ func (h *Hub) Git(dir, credential string, args ...string) Result {
 		env = append(env, "PARLEY_ENDPOINT_URL="+h.URL(""), "PARLEY_API_KEY="+credential)
 		args = append([]string{"-c", "credential." + h.URL("") + ".helper=!" + built.parley + " credential-helper"}, args...)
 	}
-	return run(context.Background(), dir, env, "git", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), callLimit)
+	defer cancel()
+	return run(ctx, dir, env, "git", args...)
 }
 
 // gitEnv is the whole environment of the scenario's git.
@@ -128,7 +137,9 @@ func (h *Hub) gitEnv() []string {
 // NAME=value variables env added to its environment, such as those a
 // credential helper the scenario configures itself reads.
 func (h *Hub) GitEnv(dir string, env []string, args ...string) Result {
-	return run(context.Background(), dir, append(h.gitEnv(), env...), "git", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), callLimit)
+	defer cancel()
+	return run(ctx, dir, append(h.gitEnv(), env...), "git", args...)
 }
 
 // AuthURL is remote with credential as the password of its user info.

@@ -318,7 +318,7 @@ func TestProtected_OwnerPushOffRefusesEveryDirectUpdate(t *testing.T) {
 			name   string
 			update func(string) attempt
 		}{{"git push", u.push}, {"API commit", u.commit}, {"API ref move", u.move}} {
-			refused(t, who.name+", "+op.name, op.update(who.credential), "is protected", "protected_branch")
+			refused(t, who.name+", "+op.name, op.update(who.credential), viaChangeText, "protected_branch")
 		}
 	}
 	if head := mainHead(t, hub, cast.OwnerKey); head != before {

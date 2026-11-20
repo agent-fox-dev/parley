@@ -27,10 +27,12 @@ type route struct {
 	// showOnce are the members of a create's answer, by dotted path, that
 	// are shown once and left out of a replay.
 	showOnce []string
-	// seed names the seeding of the conventions scenarios that makes the
+	// seed names the seeding of the envelope scenario that makes the
 	// identifiers of the path exist: "" for a path that names none, gateway
-	// and forge for resources a hub without either cannot have, whose
-	// identifiers are left nonexistent.
+	// and forge for resources of a gateway or a forge, which that
+	// scenario's hub has neither of, so their identifiers are left
+	// nonexistent. The paging and idempotency scenarios give their hubs
+	// the fake forge.
 	seed string
 	// outside is why a list or create route is left out of the paging and
 	// idempotency scenarios; it stays in the envelope scenario.
@@ -185,23 +187,23 @@ var routes = []route{
 	{method: "GET", path: "/api/v1/workspaces/:slug/vars/resolved", list: true, seed: "workspace"},
 	{method: "GET", path: "/api/v1/workspaces/:slug/forge", seed: "workspace"},
 	{method: "GET", path: "/api/v1/workspaces/:slug/forge/repository", seed: "workspace"},
-	{method: "GET", path: "/api/v1/workspaces/:slug/issues", list: true, seed: "forge", outside: "needs a forge"},
+	{method: "GET", path: "/api/v1/workspaces/:slug/issues", list: true, seed: "forge"},
 	{method: "GET", path: "/api/v1/workspaces/:slug/issues/:number", seed: "forge"},
-	{method: "GET", path: "/api/v1/workspaces/:slug/issues/:number/comments", list: true, seed: "forge", outside: "needs a forge"},
+	{method: "GET", path: "/api/v1/workspaces/:slug/issues/:number/comments", list: true, seed: "forge"},
 	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number", seed: "forge"},
 	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/state", seed: "forge"},
-	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/files", list: true, seed: "forge", outside: "needs a forge"},
-	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/checks", list: true, seed: "forge", outside: "needs a forge"},
-	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/reviews", list: true, seed: "forge", outside: "needs a forge"},
-	{method: "POST", path: "/api/v1/workspaces/:slug/issues", create: true, seed: "forge", outside: "needs a forge"},
+	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/files", list: true, seed: "forge"},
+	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/checks", list: true, seed: "forge"},
+	{method: "GET", path: "/api/v1/workspaces/:slug/pulls/:number/reviews", list: true, seed: "forge"},
+	{method: "POST", path: "/api/v1/workspaces/:slug/issues", create: true, seed: "forge"},
 	{method: "PATCH", path: "/api/v1/workspaces/:slug/issues/:number", seed: "forge"},
 	{method: "POST", path: "/api/v1/workspaces/:slug/issues/:number/close", seed: "forge"},
-	{method: "POST", path: "/api/v1/workspaces/:slug/issues/:number/comments", create: true, seed: "forge", outside: "needs a forge"},
+	{method: "POST", path: "/api/v1/workspaces/:slug/issues/:number/comments", create: true, seed: "forge"},
 	{method: "POST", path: "/api/v1/workspaces/:slug/issues/:number/labels", seed: "forge"},
 	{method: "DELETE", path: "/api/v1/workspaces/:slug/issues/:number/labels/:name", seed: "forge"},
-	{method: "POST", path: "/api/v1/workspaces/:slug/labels", create: true, seed: "forge", outside: "needs a forge"},
-	{method: "POST", path: "/api/v1/workspaces/:slug/pulls", create: true, seed: "forge", outside: "needs a forge"},
-	{method: "POST", path: "/api/v1/workspaces/:slug/pulls/:number/comments", create: true, seed: "forge", outside: "needs a forge"},
+	{method: "POST", path: "/api/v1/workspaces/:slug/labels", create: true, seed: "forge"},
+	{method: "POST", path: "/api/v1/workspaces/:slug/pulls", create: true, seed: "forge"},
+	{method: "POST", path: "/api/v1/workspaces/:slug/pulls/:number/comments", create: true, seed: "forge"},
 	{method: "PUT", path: "/api/v1/workspaces/:slug/forge/webhook", seed: "workspace"},
 	{method: "DELETE", path: "/api/v1/workspaces/:slug/forge/webhook", seed: "workspace"},
 	{method: "GET", path: "/api/v1/workspaces/:slug/forge/deliveries", list: true, seed: "workspace"},

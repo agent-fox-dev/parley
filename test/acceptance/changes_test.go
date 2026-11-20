@@ -189,7 +189,7 @@ func TestChange_LandedCommitResolvesToChangeVersionAndSession(t *testing.T) {
 		t.Fatal("the change lists no land attempt")
 	}
 	sha := harness.Str(lands[0]["landed_sha"])
-	if main := harness.Str(hub.Get(key, "/api/v1/workspaces/demo/scm/refs/main").Body["sha"]); sha == "" || sha != main {
+	if main := mainHead(t, hub, key); sha == "" || sha != main {
 		t.Fatalf("the land attempt landed %q, want the head of main %q", sha, main)
 	}
 
@@ -223,18 +223,13 @@ func TestChange_DirectOwnerPushResolvesToNoChange(t *testing.T) {
 	if change, present := commit["change"]; !present || change != nil {
 		t.Errorf("the pushed commit's change is %v (present %v), want null", change, present)
 	}
-	var push map[string]any
+	var pushes []map[string]any
 	harness.Eventually(t, "the push of "+sha+" in the event log", func() bool {
-		for _, e := range hub.Get(key, "/api/v1/events/log?workspace=demo&types=parley.git.push").Items() {
-			if harness.Field(e, "metadata.after") == sha {
-				push = e
-				return true
-			}
-		}
-		return false
+		pushes = pushesTo(eventLog(t, hub, key, "workspace=demo&types=parley.git.push", 0), sha)
+		return len(pushes) > 0
 	})
-	if harness.Field(push, "metadata.ref") != "refs/heads/main" || harness.Field(push, "metadata.direct") != true {
-		t.Errorf("the push event's metadata is %v, want ref refs/heads/main, direct", push["metadata"])
+	if len(pushes) != 1 || harness.Field(pushes[0], "metadata.ref") != "refs/heads/main" || harness.Field(pushes[0], "metadata.direct") != true {
+		t.Errorf("the log holds the pushes %v to %s, want one, of refs/heads/main, direct", pushes, sha)
 	}
 	if open := hub.Get(key, changes+"?state=open").Items(); len(open) != 0 {
 		t.Errorf("the workspace has open changes %v, want none", open)

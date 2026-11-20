@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,14 +53,30 @@ func decode(t *testing.T, raw []byte) map[string]any {
 	return m
 }
 
-// members are the string member name of every object of the array at
-// path of m.
+// members are the member name, a dotted path, of every element of the
+// array at path of m, in order, as text: a number in decimal, "" for an
+// element without the member. With name "" they are the elements
+// themselves. They are nil when m holds no array at path.
 func members(m map[string]any, path, name string) []string {
-	raw, _ := harness.Field(m, path).([]any)
+	raw, ok := harness.Field(m, path).([]any)
+	if !ok {
+		return nil
+	}
 	out := []string{}
 	for _, it := range raw {
-		obj, _ := it.(map[string]any)
-		out = append(out, harness.Str(harness.Field(obj, name)))
+		v := it
+		if name != "" {
+			obj, _ := it.(map[string]any)
+			v = harness.Field(obj, name)
+		}
+		switch x := v.(type) {
+		case string:
+			out = append(out, x)
+		case float64:
+			out = append(out, strconv.FormatFloat(x, 'f', -1, 64))
+		default:
+			out = append(out, "")
+		}
 	}
 	return out
 }
@@ -160,7 +177,7 @@ func TestSCM_CommitOfSeveralFiles(t *testing.T) {
 	t.Parallel()
 	hub, demo, _ := scmHub(t)
 	key := demo.Owner.Key
-	main := harness.Str(hub.Get(key, scm+"/refs/main").Body["sha"])
+	main := mainHead(t, hub, key)
 
 	r := hub.Call(http.MethodPost, scm+"/commits", key, map[string]any{
 		"branch": "api-work", "base_ref": "main", "message": "m",

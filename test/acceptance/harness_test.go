@@ -127,7 +127,8 @@ func TestHarness_GatedScenariosSkipWithAStatedReason(t *testing.T) {
 
 	// A set gateway variable never skips: a gateway nobody answers at fails
 	// the scenario with the hub's start error.
-	code, out = run("^TestSandbox_ForkWithSandbox", harness.ChildEnv(t, harness.Gateway.Var+"=http://127.0.0.1:1"))
+	code, out = run("^TestSandbox_ForkWithSandbox", harness.ChildEnv(t, harness.Gateway.Var+"=http://127.0.0.1:1",
+		harness.ImageVar+"=sandbox.example.test/acceptance:1"))
 	if code == 0 || !strings.Contains(out, "--- FAIL") || !strings.Contains(out, "sandbox.gateway_url") {
 		t.Errorf("with an unreachable gateway the sandbox scenario exited %d, want a failure naming sandbox.gateway_url:\n%s", code, out)
 	}

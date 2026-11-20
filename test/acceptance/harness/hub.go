@@ -192,9 +192,15 @@ type Options struct {
 	PublicHost string
 }
 
-// Hub is a parleyd process the harness started, with its directories.
+// Hub is a parleyd process the harness started, with its directories. Its
+// helpers fail the test it was started in, or the one With names.
 type Hub struct {
-	t    testing.TB
+	t testing.TB
+	*hubState
+}
+
+// hubState is what every view of a hub (With) shares.
+type hubState struct {
 	opts Options
 	// Port is the hub's loopback port; ListeningAddr is the address its
 	// listening line named at the last start.
@@ -218,6 +224,8 @@ type Hub struct {
 	cmd      *exec.Cmd
 	exited   chan struct{}
 	exitCode int
+	// started is set once the hub listened for the first time.
+	started bool
 
 	usersMu sync.Mutex
 	users   map[string]*User
@@ -279,12 +287,12 @@ func (h *Hub) StartOn(dataDir string) *Hub {
 func newHub(tb testing.TB, o Options, dataDir, secretsKey string) *Hub {
 	tb.Helper()
 	build(tb)
-	h := &Hub{
-		t: tb, opts: o, Port: freePort(tb), DataDir: dataDir, secretsKey: secretsKey,
+	h := &Hub{t: tb, hubState: &hubState{
+		opts: o, Port: freePort(tb), DataDir: dataDir, secretsKey: secretsKey,
 		ConfigDir: tb.TempDir(), WorkDir: tb.TempDir(), Home: tb.TempDir(), TmpDir: tb.TempDir(),
 		gitHome: tb.TempDir(), cliHome: tb.TempDir(), cliConfig: tb.TempDir(),
 		bin: built.parleyd, log: &logBuffer{}, users: map[string]*User{},
-	}
+	}}
 	h.writeConfig()
 	h.env = append([]string{
 		"XDG_CONFIG_HOME=" + h.ConfigDir, "XDG_DATA_HOME=" + h.DataDir, "PARLEY_SECRETS_KEY=" + secretsKey,
@@ -354,6 +362,10 @@ func hasTable(toml, name string) bool {
 	return false
 }
 
+// With is the same hub with helpers that fail tb instead, such as a
+// subtest of the test that started it.
+func (h *Hub) With(tb testing.TB) *Hub { return &Hub{t: tb, hubState: h.hubState} }
+
 // URL is the hub's address followed by path.
 func (h *Hub) URL(path string) string { return "http://127.0.0.1:" + strconv.Itoa(h.Port) + path }
 
@@ -364,12 +376,53 @@ func (h *Hub) Log() string { return h.log.String() }
 // Parleyd runs the hub's parleyd binary with args in the hub's environment
 // and working directory, such as parleyd backup, and waits for it.
 func (h *Hub) Parleyd(args ...string) Result {
-	return run(context.Background(), h.WorkDir, h.env, h.bin, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), callLimit)
+	defer cancel()
+	return run(ctx, h.WorkDir, h.env, h.bin, args...)
 }
 
 // Start starts the hub again on its directories and port after Stop or
-// Kill, and waits until it is ready.
+// Kill, and waits until it is ready. A start again keeps the port, which
+// the hub's external URL and every remote of its clients name, so another
+// process that took the port while the hub was down fails it; that is
+// inherent in restarting a hub where its clients look for it. The first
+// start of a hub moves to a fresh port when its own was taken, since the
+// port was only known free when freePort closed its listener.
 func (h *Hub) Start() {
+	h.t.Helper()
+	for try := 1; ; try++ {
+		from := h.log.size()
+		exited := h.launch()
+		if exited == nil {
+			break
+		}
+		h.mu.Lock()
+		code := h.exitCode
+		h.cmd = nil
+		h.mu.Unlock()
+		if h.started || try == 3 || !strings.Contains(h.log.since(from), "address already in use") {
+			h.t.Fatalf("parleyd exited %d before it listened (its log follows the test)", code)
+		}
+		h.Port = freePort(h.t)
+		h.writeConfig()
+	}
+	h.started = true
+	deadline := time.Now().Add(startLimit)
+	for {
+		if r := h.Call(http.MethodGet, "/readyz", "", nil); r.Status == http.StatusOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("GET /readyz did not answer 200 within %v", startLimit)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// launch starts parleyd and waits for its listening line. It returns nil
+// once the hub listens, and the channel closed at its exit when it exited
+// first.
+func (h *Hub) launch() <-chan struct{} {
 	h.t.Helper()
 	cmd := exec.Command(h.bin)
 	cmd.Dir, cmd.Env = h.WorkDir, h.env
@@ -392,26 +445,14 @@ func (h *Hub) Start() {
 		h.mu.Unlock()
 		close(exited)
 	}()
-	deadline := time.After(startLimit)
 	select {
 	case h.ListeningAddr = <-listening:
+		return nil
 	case <-exited:
-		h.mu.Lock()
-		h.cmd = nil
-		h.mu.Unlock()
-		h.t.Fatalf("parleyd exited %d before it listened (its log follows the test)", h.exitCode)
-	case <-deadline:
+		return exited
+	case <-time.After(startLimit):
 		h.t.Fatalf("parleyd wrote no listening line within %v", startLimit)
-	}
-	for {
-		if r := h.Call(http.MethodGet, "/readyz", "", nil); r.Status == http.StatusOK {
-			return
-		}
-		select {
-		case <-deadline:
-			h.t.Fatalf("GET /readyz did not answer 200 within %v", startLimit)
-		case <-time.After(10 * time.Millisecond):
-		}
+		return nil
 	}
 }
 
@@ -522,6 +563,20 @@ func (l *logBuffer) Write(p []byte) (int, error) {
 		l.line = append(l.line[:0], l.line[i+1:]...)
 	}
 	return len(p), nil
+}
+
+// size is the length of everything written so far.
+func (l *logBuffer) size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.all.Len()
+}
+
+// since is what was written after the first n bytes.
+func (l *logBuffer) since(n int) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return string(l.all.Bytes()[n:])
 }
 
 func (l *logBuffer) String() string {

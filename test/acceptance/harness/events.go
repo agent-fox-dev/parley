@@ -19,11 +19,9 @@ import (
 // Event is one hub_event frame of an event stream.
 type Event struct {
 	Seq int64
-	// Type is the record's type; Record is the frame's data decoded and
-	// Data the data as received.
+	// Type is the record's type; Record is the frame's data decoded.
 	Type   string
 	Record map[string]any
-	Data   string
 	// At is when the frame arrived.
 	At time.Time
 }
@@ -39,6 +37,13 @@ type Stream struct {
 	taken  int
 	notify chan struct{}
 }
+
+// streamClient opens event streams. It has no overall timeout, since a
+// stream lasts until it is closed, but a hub that does not begin to answer
+// fails the scenario rather than hanging it.
+var streamClient = &http.Client{Transport: &http.Transport{
+	Proxy: http.ProxyFromEnvironment, ResponseHeaderTimeout: 30 * time.Second,
+}}
 
 // Events opens the event stream with credential, the query (such as
 // "types=parley.claim.*&after=0", "" for none) and the header given as
@@ -58,8 +63,7 @@ func (h *Hub) Events(credential, query string, header ...string) *Stream {
 	for i := 0; i+1 < len(header); i += 2 {
 		req.Header.Set(header[i], header[i+1])
 	}
-	// No client timeout: the stream lasts until it is closed.
-	res, err := http.DefaultClient.Do(req)
+	res, err := streamClient.Do(req)
 	if err != nil {
 		h.t.Fatalf("GET %s: %v", path, err)
 	}
@@ -84,7 +88,7 @@ func (s *Stream) read() {
 		switch {
 		case line == "":
 			if kind == "hub_event" {
-				e := Event{Seq: id, Data: data, At: time.Now()}
+				e := Event{Seq: id, At: time.Now()}
 				_ = json.Unmarshal([]byte(data), &e.Record)
 				e.Type = str(e.Record["type"])
 				s.mu.Lock()
@@ -177,7 +181,7 @@ func (h *Hub) EventsRefused(credential, query string, header ...string) Response
 	for i := 0; i+1 < len(header); i += 2 {
 		req.Header.Set(header[i], header[i+1])
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := streamClient.Do(req)
 	if err != nil {
 		return Response{Err: err}
 	}

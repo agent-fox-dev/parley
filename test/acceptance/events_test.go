@@ -3,6 +3,7 @@ package acceptance
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"sync"
@@ -32,6 +33,38 @@ func newClaim(t *testing.T, hub *harness.Hub, credential string) string {
 		t.Fatalf("the claim's answer holds no id: %s", r.Raw)
 	}
 	return id
+}
+
+// walk is every item of the list at path, with its query, read with
+// credential 200 at a time by following next_cursor to its end.
+func walk(t *testing.T, hub *harness.Hub, credential, path string) []map[string]any {
+	t.Helper()
+	u, err := url.Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("limit", "200")
+	var all []map[string]any
+	for {
+		u.RawQuery = q.Encode()
+		page := hub.Get(credential, u.String())
+		all = append(all, page.Items()...)
+		next := harness.Str(page.Body["next_cursor"])
+		if next == "" {
+			return all
+		}
+		q.Set("cursor", next)
+	}
+}
+
+// eventLog is every event of the event log that credential sees after the
+// seq after, oldest first, with the filters of query (such as
+// "workspace=demo", "" for none). The log's cursor is its position, so
+// the walk starts with it.
+func eventLog(t *testing.T, hub *harness.Hub, credential, query string, after int64) []map[string]any {
+	t.Helper()
+	return walk(t, hub, credential, "/api/v1/events/log?cursor="+strconv.FormatInt(after, 10)+"&"+query)
 }
 
 // seqOf is the seq of the event record e.
@@ -102,7 +135,11 @@ func TestLong_CursorOlderThanRetentionIsExpired(t *testing.T) {
 	hub := harness.Start(t, harness.Options{TOML: "[events]\nretention = \"1h\"\n"})
 	key := hub.Workspace(hub.User("alice"), "demo").Owner.Key
 	newClaim(t, hub, key)
-	s0 := seqOf(eventLog(t, hub, key, "types=parley.claim.create", 0)[0])
+	created := eventLog(t, hub, key, "types=parley.claim.create", 0)
+	if len(created) == 0 {
+		t.Fatal("the log holds no parley.claim.create of the first claim")
+	}
+	s0 := seqOf(created[0])
 	for range 5 {
 		newClaim(t, hub, key)
 	}
@@ -172,23 +209,6 @@ func TestEvents_CarryTheSessionOfTheOperation(t *testing.T) {
 	}
 }
 
-// allPages is every item of the list at path, with credential, a page of
-// 200 at a time.
-func allPages(t *testing.T, hub *harness.Hub, credential, path string) []map[string]any {
-	t.Helper()
-	var all []map[string]any
-	cursor := ""
-	for {
-		page := hub.Get(credential, path+"&limit=200"+cursor)
-		all = append(all, page.Items()...)
-		next := harness.Str(page.Body["next_cursor"])
-		if next == "" {
-			return all
-		}
-		cursor = "&cursor=" + next
-	}
-}
-
 func TestEvents_NoneMissingAfterKillUnderLoad(t *testing.T) {
 	t.Parallel()
 	// Eight writers reach the default limit of 1000 active claims of a
@@ -224,7 +244,7 @@ func TestEvents_NoneMissingAfterKillUnderLoad(t *testing.T) {
 	hub.Start()
 
 	active := map[string]bool{}
-	for _, c := range allPages(t, hub, key, claims+"?state=active") {
+	for _, c := range walk(t, hub, key, claims+"?state=active") {
 		active[harness.Str(c["id"])] = true
 	}
 	created := eventLog(t, hub, key, "workspace=demo&types=parley.claim.create", 0)

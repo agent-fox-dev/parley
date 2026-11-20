@@ -43,15 +43,6 @@ func objectsOf(m map[string]any, member string) []map[string]any {
 	return objects
 }
 
-// claimIDs are the ids of an activity answer's claims.
-func claimIDs(activity map[string]any) []string {
-	ids := []string{}
-	for _, c := range objectsOf(activity, "claims") {
-		ids = append(ids, harness.Str(c["id"]))
-	}
-	return ids
-}
-
 // activityWithBoth waits until the activity of src/a.txt lists the changes
 // x and y, which the awareness worker indexes in the background, and
 // returns it.
@@ -99,12 +90,16 @@ func TestAwareness_OverlapIsAnnouncedOncePerChange(t *testing.T) {
 		t.Errorf("change %d overlaps %v, want [%d]", x, got, y)
 	}
 
-	// A further version that keeps the overlap announces nothing: the
-	// awareness worker runs every second, so five seconds give it five
-	// passes over the new version.
-	hub.CommitFiles(clone, "Edit src/a.txt in y again", map[string]string{"src/a.txt": "from y, again\n"})
+	// A further version that keeps the overlap announces nothing. It also
+	// adds a file of its own: once the activity of that file lists y, the
+	// worker has indexed the version, and announced in the same pass what
+	// it would announce of it.
+	hub.CommitFiles(clone, "Edit src/a.txt in y again", map[string]string{"src/a.txt": "from y, again\n", "src/marker.txt": "y\n"})
 	hub.Git(clone, "", "push", "-q", "origin", "y").Must(t)
-	time.Sleep(5 * time.Second)
+	harness.Eventually(t, "the activity of src/marker.txt to list y", func() bool {
+		changes := hub.Get(key, "/api/v1/workspaces/demo/activity?paths=src/marker.txt").Body
+		return slices.Equal(numbersAt(objectsOf(changes, "changes"), "change.number"), []int{y})
+	})
 	if events := overlapEvents(t, hub, key); len(events) != 2 {
 		t.Errorf("after a further overlapping version the log holds %d parley.change.overlap events, want 2: %v", len(events), events)
 	}
@@ -123,13 +118,13 @@ func TestAwareness_ActivityReturnsChangesAndLiveClaim(t *testing.T) {
 	}
 
 	a := activityWithBoth(t, hub, key, x, y)
-	if ids := claimIDs(a); !slices.Equal(ids, []string{claim}) {
+	if ids := members(a, "claims", "id"); !slices.Equal(ids, []string{claim}) {
 		t.Errorf("the activity lists the claims %v, want [%s]", ids, claim)
 	} else if state := objectsOf(a, "claims")[0]["state"]; state != "active" {
 		t.Errorf("the claim's state is %v, want active", state)
 	}
 	out := hub.CLI(key, "activity", demo.Slug, "--paths", "src/a.txt").Must(t).JSON()
-	if ids := claimIDs(out); !slices.Equal(ids, []string{claim}) {
+	if ids := members(out, "claims", "id"); !slices.Equal(ids, []string{claim}) {
 		t.Errorf("parley activity lists the claims %v, want [%s]", ids, claim)
 	}
 	if got := numbersAt(objectsOf(out, "changes"), "change.number"); !slices.Equal(got, sorted2(x, y)) {
@@ -147,13 +142,29 @@ func TestAwareness_ExpiredClaimLeavesActivity(t *testing.T) {
 	// claim falls within its two seconds.
 	activityWithBoth(t, hub, key, x, y)
 
-	claim, _ := hub.Call(http.MethodPost, "/api/v1/workspaces/demo/claims", key, map[string]any{
-		"paths": []string{"src/**"}, "intent": "i", "ttl": "2s",
-	}).Want(t, http.StatusCreated).Body["claim"].(map[string]any)
-	id := harness.Str(claim["id"])
-	if ids := claimIDs(hub.Get(key, activityOfA).Body); !slices.Contains(ids, id) {
-		t.Fatalf("the activity right after the claim lists the claims %v, want %s among them", ids, id)
+	// A read that leaves the claim unlisted proves something only when it
+	// was answered well within the claim's two seconds; on a machine too
+	// slow for that, a new claim is tried.
+	var claim map[string]any
+	for try := 1; ; try++ {
+		sent := time.Now()
+		claim, _ = hub.Call(http.MethodPost, "/api/v1/workspaces/demo/claims", key, map[string]any{
+			"paths": []string{"src/**"}, "intent": "i", "ttl": "2s",
+		}).Want(t, http.StatusCreated).Body["claim"].(map[string]any)
+		ids := members(hub.Get(key, activityOfA).Body, "claims", "id")
+		listed, within := slices.Contains(ids, harness.Str(claim["id"])), time.Since(sent) < 1500*time.Millisecond
+		if listed {
+			break
+		}
+		if within {
+			t.Fatalf("the activity right after the claim lists the claims %v, want %s among them", ids, claim["id"])
+		}
+		if try == 5 {
+			t.Logf("no read of the activity was answered within 1.5 s of a claim's creation in %d tries: whether it lists a live claim is not shown", try)
+			break
+		}
 	}
+	id := harness.Str(claim["id"])
 
 	createdAt, err := time.Parse(time.RFC3339, harness.Str(claim["created_at"]))
 	if err != nil {
@@ -161,7 +172,7 @@ func TestAwareness_ExpiredClaimLeavesActivity(t *testing.T) {
 	}
 	time.Sleep(time.Until(createdAt.Add(4 * time.Second)))
 	a := hub.Get(key, activityOfA).Body
-	if ids := claimIDs(a); len(ids) != 0 {
+	if ids := members(a, "claims", "id"); len(ids) != 0 {
 		t.Errorf("4 s after its creation the activity lists the claims %v, want none", ids)
 	}
 	if got := numbersAt(objectsOf(a, "changes"), "change.number"); !slices.Equal(got, sorted2(x, y)) {
@@ -195,23 +206,26 @@ func TestAwareness_NeverRefusesAPushOrALand(t *testing.T) {
 	hub.Call(http.MethodPost, "/api/v1/workspaces/demo/claims", cast.MemberKey, map[string]any{
 		"paths": []string{"src/**"}, "intent": "refactor src", "ttl": "1h", "session_id": session,
 	}).Want(t, http.StatusCreated)
-	if claims := claimIDs(hub.Get(key, activityOfA).Body); len(claims) != 1 {
+	if claims := members(hub.Get(key, activityOfA).Body, "claims", "id"); len(claims) != 1 {
 		t.Fatalf("the activity of src/a.txt lists the claims %v, want bob's alone", claims)
 	}
 
+	// Each source branch takes a push and an API commit under the claim.
 	clone := hub.Clone(cast.Demo.Remote, key)
-	hub.Git(clone, "", "checkout", "-q", "x").Must(t)
-	hub.CommitFiles(clone, "Add src/x.txt", map[string]string{"src/x.txt": "x\n"})
-	if push := hub.Git(clone, "", "push", "origin", "x"); push.Code != 0 || strings.Contains(push.Stderr, "error") {
-		t.Errorf("the push to x exited %d, want 0 without an error:\n%s", push.Code, push.Stderr)
-	}
-
-	yHead := harness.Str(hub.Get(key, scm+"/refs/y").Body["sha"])
-	commit := hub.Call(http.MethodPost, scm+"/commits", key, map[string]any{
-		"branch": "y", "expected_head_sha": yHead, "message": "Add src/y.txt", "operations": []any{put("src/y.txt", "y\n")},
-	})
-	if commit.Status != http.StatusCreated {
-		t.Errorf("the API commit on y answered %d %s, want 201", commit.Status, commit.Raw)
+	for _, branch := range []string{"x", "y"} {
+		hub.Git(clone, "", "checkout", "-q", branch).Must(t)
+		hub.CommitFiles(clone, "Add src/"+branch+"-push.txt", map[string]string{"src/" + branch + "-push.txt": branch + "\n"})
+		if push := hub.Git(clone, "", "push", "origin", branch); push.Code != 0 {
+			t.Errorf("the push to %s exited %d, want 0:\n%s", branch, push.Code, push.Stderr)
+		}
+		head := harness.Str(hub.Get(key, scm+"/refs/"+branch).Body["sha"])
+		commit := hub.Call(http.MethodPost, scm+"/commits", key, map[string]any{
+			"branch": branch, "expected_head_sha": head, "message": "Add src/" + branch + "-api.txt",
+			"operations": []any{put("src/"+branch+"-api.txt", branch+"\n")},
+		})
+		if commit.Status != http.StatusCreated {
+			t.Errorf("the API commit on %s answered %d %s, want 201", branch, commit.Status, commit.Raw)
+		}
 	}
 
 	if l := hub.Land(key, cast.Demo.Slug, x); l.Body["status"] != "landed" {

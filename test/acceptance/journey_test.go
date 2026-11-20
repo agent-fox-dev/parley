@@ -1,11 +1,8 @@
 package acceptance
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -29,35 +26,6 @@ func changeOfPush(t *testing.T, push harness.Result) int {
 	}
 	n, _ := strconv.Atoi(m[1])
 	return n
-}
-
-// writeFile writes content to name in the clone dir.
-func writeFile(t *testing.T, dir, name, content string) {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// eventLog is every event of the event log that credential sees after the
-// seq after, oldest first, with the filters of query (such as
-// "workspace=demo", "" for none).
-func eventLog(t *testing.T, hub *harness.Hub, credential, query string, after int64) []map[string]any {
-	t.Helper()
-	var all []map[string]any
-	for {
-		page := hub.Get(credential, "/api/v1/events/log?limit=200&after="+strconv.FormatInt(after, 10)+"&"+query)
-		items := page.Items()
-		all = append(all, items...)
-		if len(items) < 200 {
-			return all
-		}
-		after = int64(harness.Num(items[len(items)-1]["seq"]))
-	}
 }
 
 func TestJourney_AgentForksPushesAndLands(t *testing.T) {
@@ -242,14 +210,6 @@ func TestJourney_ConsumerResumesTheEventStream(t *testing.T) {
 	for _, e := range want {
 		wantSeqs = append(wantSeqs, int64(harness.Num(e["seq"])))
 	}
-	// parley events tail replays the same events from the same position.
-	tailed := make(chan harness.Result, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		tailed <- hub.CLIContext(ctx, ci, "events", "tail", "--workspace", "demo", "--after", strconv.FormatInt(s0, 10))
-	}()
-
 	r2 := hub.Events(ci, "workspace=demo", "Last-Event-ID", strconv.FormatInt(s0, 10))
 	got := r2.Next(len(want), 10*time.Second)
 	var gotSeqs []int64
@@ -283,15 +243,17 @@ func TestJourney_ConsumerResumesTheEventStream(t *testing.T) {
 		seen[e.Seq] = true
 	}
 
+	// parley events tail replays the same events from the same position.
 	var tailSeqs []int64
-	for _, line := range (<-tailed).Lines() {
+	for _, line := range hub.Tail(ci, len(wantSeqs), 30*time.Second, "--workspace", "demo", "--after", strconv.FormatInt(s0, 10)) {
 		var rec struct{ Seq int64 }
-		if json.Unmarshal([]byte(line), &rec) == nil {
-			tailSeqs = append(tailSeqs, rec.Seq)
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Errorf("parley events tail printed %q, want an event record: %v", line, err)
 		}
+		tailSeqs = append(tailSeqs, rec.Seq)
 	}
-	if len(tailSeqs) < len(wantSeqs) || !slices.Equal(tailSeqs[:len(wantSeqs)], wantSeqs) {
-		t.Errorf("parley events tail --after %d printed the seqs %v, want the log's %v first", s0, tailSeqs, wantSeqs)
+	if !slices.Equal(tailSeqs, wantSeqs) {
+		t.Errorf("parley events tail --after %d printed the seqs %v first, want the log's %v", s0, tailSeqs, wantSeqs)
 	}
 
 	// The review agent learned of the second change from its replayed

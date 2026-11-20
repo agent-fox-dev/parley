@@ -55,7 +55,7 @@ func TestSession_ReachesForkChangesVersionsAndLands(t *testing.T) {
 	want := sorted2(s.c1, s.c2)
 
 	got := hub.Get(key, "/api/v1/sessions/"+s.session).Body
-	if forks := stringsOf(got["forks"]); !slices.Contains(forks, s.fork.Slug) {
+	if forks := members(got, "forks", ""); !slices.Contains(forks, s.fork.Slug) {
 		t.Errorf("the session lists the forks %v, want %s among them", forks, s.fork.Slug)
 	}
 	if numbers := numbersAt(objectsOf(got, "changes"), "number"); !slices.Equal(numbers, want) {

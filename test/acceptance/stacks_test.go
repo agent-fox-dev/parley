@@ -113,7 +113,7 @@ func TestStack_LandingBottomRebasesNextOntoTarget(t *testing.T) {
 	if r := hub.Land(key, demo.Slug, n[0]); r.Body["status"] != "landed" {
 		t.Fatalf("the land answered %s, want landed", r.Raw)
 	}
-	main := harness.Str(hub.Get(key, "/api/v1/workspaces/demo/scm/refs/main").Body["sha"])
+	main := mainHead(t, hub, key)
 	harness.Eventually(t, "the next change to be rebased onto main", func() bool {
 		b := hub.Get(key, changePath(n[1], "")).Body
 		return b["depends_on"] == nil && hub.Get(key, changePath(n[1], "/versions/latest")).Body["kind"] == "restack"

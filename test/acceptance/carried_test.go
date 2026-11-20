@@ -119,7 +119,7 @@ func carriedSecretsAndVariables(t *testing.T) {
 
 	cli("secrets", "create", "API_TOKEN="+value, "--workspace", demo.Slug)
 	listed := cli("secrets", "list", "--workspace", demo.Slug)
-	if !slices.Contains(stringsAt(listed.JSON(), "items", "key"), "API_TOKEN") {
+	if !slices.Contains(members(listed.JSON(), "items", "key"), "API_TOKEN") {
 		t.Errorf("parley secrets list printed %s, want API_TOKEN among the keys", listed.Stdout)
 	}
 	cli("vars", "create", "REGION=eu", "--workspace", demo.Slug)
@@ -139,15 +139,6 @@ func carriedSecretsAndVariables(t *testing.T) {
 			t.Errorf("a command printed the secret's value: %q", out)
 		}
 	}
-}
-
-// stringsAt is the string member of every object of m's list member.
-func stringsAt(m map[string]any, list, member string) []string {
-	var out []string
-	for _, o := range objectsOf(m, list) {
-		out = append(out, harness.Str(o[member]))
-	}
-	return out
 }
 
 // carriedForge points a workspace at the fake forge and lists the issues
@@ -187,7 +178,7 @@ func carriedSessionAuditAndMetrics(t *testing.T) {
 	hub.CLI(key, "claim", "create", demo.Slug, "--paths", "src/**", "--intent", "tidy up", "--session", session).Must(t)
 
 	audit := hub.CLI(key, "audit", "query", "--session", session).Must(t).JSON()
-	if types := stringsAt(audit, "items", "type"); !slices.Contains(types, "parley.claim.create") {
+	if types := members(audit, "items", "type"); !slices.Contains(types, "parley.claim.create") {
 		t.Errorf("parley audit query --session printed the types %v, want parley.claim.create among them", types)
 	}
 

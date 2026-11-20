@@ -26,8 +26,10 @@ func TestAutoLand_LandsOnceTheRequiredCheckPasses(t *testing.T) {
 	if c := hub.Get(key, changePath(n, "")).Body; c["state"] != "open" || c["auto_land"] != true {
 		t.Fatalf("the change opened %v with auto_land %v, want open with auto_land true", c["state"], c["auto_land"])
 	}
-	// Nothing may land before the check is reported: the lander looks
-	// every second, so three seconds give it every chance to.
+	// Nothing may land before the check is reported. The hub shows no sign
+	// that its lander looked at the change, so this window of three of its
+	// one-second passes is best-effort: a wrong land shows only if it falls
+	// inside it.
 	time.Sleep(3 * time.Second)
 	if state := hub.Get(key, changePath(n, "")).Body["state"]; state != "open" {
 		t.Fatalf("the change is %v before its check was reported, want open", state)

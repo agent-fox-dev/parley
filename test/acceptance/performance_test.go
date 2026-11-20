@@ -118,14 +118,24 @@ func preparedChanges(t *testing.T, hub *harness.Hub, demo *harness.Workspace, pr
 	return numbers
 }
 
+// The performance scenario does not run in parallel with the others: its
+// targets are those of one client on an otherwise idle hub and host.
 func TestPerformance_SingleClientTargetsOfTheReferenceHost(t *testing.T) {
 	harness.Require(t, harness.ReferenceHost)
 	hub := harness.Start(t)
 	alice := hub.User("alice")
 	demo := hub.RegisterWithin(10*time.Minute, alice, "demo", referenceOrigin(t, hub), nil)
-	key := alice.Key
-	ws := "/api/v1/workspaces/demo"
+	measureLatencies(t, hub, demo)
+	measureLandThroughput(t, hub, demo)
+	measureEventDelay(t, hub, alice.Key)
+}
 
+// measureLatencies checks the p95 of each single-request target over
+// samples requests.
+func measureLatencies(t *testing.T, hub *harness.Hub, demo *harness.Workspace) {
+	t.Helper()
+	key := demo.Owner.Key
+	ws := "/api/v1/workspaces/demo"
 	hundredFiles := func(i int) []any {
 		ops := make([]any, 100)
 		for f := range ops {
@@ -174,8 +184,13 @@ func TestPerformance_SingleClientTargetsOfTheReferenceHost(t *testing.T) {
 			t.Logf("%s: p95 %v", l.name, got)
 		}
 	}
+}
 
-	// Throughput: eight clients land 80 disjoint changes for a minute.
+// measureLandThroughput checks that eight clients land at least 60
+// disjoint changes in a minute.
+func measureLandThroughput(t *testing.T, hub *harness.Hub, demo *harness.Workspace) {
+	t.Helper()
+	key, ws := demo.Owner.Key, "/api/v1/workspaces/demo"
 	ready := preparedChanges(t, hub, demo, "disjoint", 80, 1)
 	var next, landed atomic.Int64
 	deadline := time.Now().Add(time.Minute)
@@ -200,9 +215,13 @@ func TestPerformance_SingleClientTargetsOfTheReferenceHost(t *testing.T) {
 	if landed.Load() < 60 {
 		t.Errorf("%d changes landed on main within one minute, want at least 60", landed.Load())
 	}
+}
 
-	// Event delay: a live subscriber receives each claim's event within a
-	// second of the claim's 201.
+// measureEventDelay checks that a live subscriber receives each claim's
+// event within a second of the claim's 201.
+func measureEventDelay(t *testing.T, hub *harness.Hub, key string) {
+	t.Helper()
+	ws := "/api/v1/workspaces/demo"
 	stream := hub.Events(key, "types=parley.claim.create")
 	var worst time.Duration
 	for i := range samples {

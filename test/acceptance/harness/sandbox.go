@@ -47,9 +47,10 @@ var sandboxProfiles = map[string]string{
 // keys of the section such as "max_per_workspace = 1", and the profiles
 // named, among default, cred, exposing, needs and quick, each running the
 // image ImageVar names. tb is skipped unless Gateway's variable is set.
-// The gateway variable alone gates: without TokenFileVar the hub sends a
-// token the gateway refuses, so that a gateway set up halfway fails the
-// scenario at the hub's start rather than skipping it.
+// The gateway variable alone gates, so that a gateway set up halfway fails
+// the scenario rather than skipping it: without ImageVar the scenario
+// fails at once, and without TokenFileVar the hub sends a token the
+// gateway refuses.
 func SandboxOptions(tb testing.TB, settings string, profiles ...string) Options {
 	tb.Helper()
 	gateway := Require(tb, Gateway)
@@ -61,19 +62,18 @@ func SandboxOptions(tb testing.TB, settings string, profiles ...string) Options 
 		}
 		token = string(raw)
 	}
+	image := os.Getenv(ImageVar)
+	if image == "" {
+		tb.Fatalf("%s is set, %s is not: set it to the image the sandboxes run", Gateway.Var, ImageVar)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "[sandbox]\ngateway_url = %q\ntoken_file = \"gateway-token\"\n%s\n", gateway, settings)
-	image := os.Getenv(ImageVar)
 	for _, name := range profiles {
 		keys, ok := sandboxProfiles[name]
 		if !ok {
 			tb.Fatalf("the harness has no sandbox profile %q", name)
 		}
-		fmt.Fprintf(&b, "[[sandbox.profiles]]\nname = %q\n", name)
-		if image != "" {
-			fmt.Fprintf(&b, "image = %q\n", image)
-		}
-		b.WriteString(keys + "\n")
+		fmt.Fprintf(&b, "[[sandbox.profiles]]\nname = %q\nimage = %q\n%s\n", name, image, keys)
 		if name == "cred" {
 			provider := os.Getenv(ProviderProfileVar)
 			if provider == "" {
@@ -126,10 +126,14 @@ type Sandbox struct {
 
 // TrySandbox asks for a sandbox on workspace with credential and the
 // create's body, and returns the hub's answer, with the sandbox when it was
-// created (nil otherwise). It does not wait for the sandbox to be ready.
+// created (nil otherwise), failing the test when no answer came. It does
+// not wait for the sandbox to be ready.
 func (h *Hub) TrySandbox(credential, workspace string, body map[string]any) (*Sandbox, Response) {
 	h.t.Helper()
 	r := h.Call(http.MethodPost, "/api/v1/workspaces/"+workspace+"/sandboxes", credential, body)
+	if r.Err != nil {
+		h.t.Fatalf("create a sandbox on %s: no answer (status %d): %v", workspace, r.Status, r.Err)
+	}
 	if r.Status != http.StatusCreated {
 		return nil, r
 	}

@@ -54,7 +54,7 @@ func TestFork_OneCallGivesForkRemoteAndToken(t *testing.T) {
 
 	// No wait between the answer and the clone.
 	clone := hub.Clone(fork.Remote, fork.Token)
-	main := harness.Str(hub.Get(demo.Owner.Key, "/api/v1/workspaces/demo/scm/refs/main").Body["sha"])
+	main := mainHead(t, hub, demo.Owner.Key)
 	if head := hub.Rev(clone, "HEAD"); head != main {
 		t.Errorf("the clone's HEAD is %s, want demo's main %s", head, main)
 	}

@@ -72,19 +72,6 @@ func counted(t *testing.T, hub *harness.Hub, credential string, number int, rule
 	return -1, harness.Str(landing["status"])
 }
 
-// stringsOf is the JSON array of strings v, nil when v is not an array.
-func stringsOf(v any) []string {
-	raw, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	out := []string{}
-	for _, it := range raw {
-		out = append(out, harness.Str(it))
-	}
-	return out
-}
-
 // pushedBy clones demo with credential, commits the files on the new
 // branch, and pushes it asking for a change, which the push opens with
 // credential. It returns the clone and the change's number.
@@ -159,7 +146,7 @@ func TestPolicy_ApprovalByPushingCredentialDoesNotCount(t *testing.T) {
 	_, n := pushedBy(t, hub, demo, p, "rates", map[string]string{"billing/rates.txt": "rate 1\n"})
 
 	a1 := hub.Call(http.MethodPost, changePath(n, "/approvals"), p, map[string]any{"verdict": "approve"}).Want(t, http.StatusCreated)
-	if forRules := stringsOf(a1.Body["counts_for"]); forRules == nil || len(forRules) != 0 {
+	if forRules := members(a1.Body, "counts_for", ""); forRules == nil || len(forRules) != 0 {
 		t.Errorf("the pushing token's approval counts for %s, want nothing", a1.Raw)
 	}
 	if c, status := counted(t, hub, key, n, "billing"); c != 0 || status != "pending" {
@@ -167,7 +154,7 @@ func TestPolicy_ApprovalByPushingCredentialDoesNotCount(t *testing.T) {
 	}
 
 	a2 := hub.CLI(key, "change", "approve", demo.Slug, strconv.Itoa(n)).Must(t)
-	if forRules := stringsOf(a2.JSON()["counts_for"]); !slices.Equal(forRules, []string{"billing"}) {
+	if forRules := members(a2.JSON(), "counts_for", ""); !slices.Equal(forRules, []string{"billing"}) {
 		t.Errorf("the API key's approval counts for %s, want [billing]", a2.Stdout)
 	}
 	if c, status := counted(t, hub, key, n, "billing"); c != 1 || status != "ready" {

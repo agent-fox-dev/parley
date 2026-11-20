@@ -60,7 +60,10 @@ func TestGit_CloneFetchPushWithPATAndCredentialHelper(t *testing.T) {
 			{"partial", []string{"--filter=blob:none"}},
 		} {
 			row := auth.name + "-" + kind.name
+			// The rows run one after the other: each checks out and pushes
+			// its own branch in the one pusher clone.
 			t.Run(row, func(t *testing.T) {
+				hub := hub.With(t)
 				dir := filepath.Join(t.TempDir(), "clone")
 				args := append(append(append([]string{"clone", "-q"}, auth.cloneArgs...), kind.args...), auth.remote, dir)
 				auth.git("", args...).Must(t)
@@ -97,11 +100,9 @@ func TestGit_CloneFetchPushWithPATAndCredentialHelper(t *testing.T) {
 					t.Errorf("origin/%s is %s after the fetch, want the pushed %s", side, got, want)
 				}
 
-				// The hub's receive-pack does not yet accept the shallow
-				// <oid> lines git sends before the commands of a push from a
-				// shallow clone: readCommands and parseCommand in
-				// internal/gitserver/receive.go answer 400. The shallow rows
-				// prove the clone and the fetch only.
+				// The hub's receive-pack answers 400 to the shallow lines a
+				// push from a shallow clone sends before its commands
+				// (internal/gitserver/receive.go): no push from those rows.
 				if kind.name == "shallow" {
 					return
 				}

@@ -112,7 +112,7 @@ func TestSandbox_ForkWithSandboxChecksOutAndPushOpensAChange(t *testing.T) {
 	}
 	s.WaitReady()
 
-	head := harness.Str(hub.Get(cast.OwnerKey, "/api/v1/workspaces/"+fork+"/scm/refs/main").Body["sha"])
+	head := mainHeadOf(t, hub, cast.OwnerKey, fork)
 	e := hub.CLI(cast.OwnerKey, "sandbox", "exec", fork, s.ID, "--", "git", "rev-parse", "HEAD")
 	if e.Code != 0 || strings.TrimSpace(e.Stdout) != head {
 		t.Errorf("git rev-parse HEAD in the sandbox exited %d printing %q, want the fork's main %s:\n%s", e.Code, e.Stdout, head, e.Stderr)
@@ -139,7 +139,7 @@ func TestSandbox_WorkloadSeesPlaceholdersOnly(t *testing.T) {
 
 	aliceFork := hub.Fork(cast.OwnerKey, "demo", nil, nil)
 	s1 := hub.Sandbox(cast.OwnerKey, aliceFork.Slug, map[string]any{"profile": "cred"})
-	env := s1.Exec("env").Stdout
+	env := environment(t, s1)
 	var key string
 	for _, line := range strings.Split(env, "\n") {
 		if v, ok := strings.CutPrefix(line, "PARLEY_API_KEY="); ok {
@@ -161,7 +161,7 @@ func TestSandbox_WorkloadSeesPlaceholdersOnly(t *testing.T) {
 	// bob may only read demo, so the parent's secret is not his to expose.
 	bobFork := hub.Fork(cast.MemberKey, "demo", nil, nil)
 	s2 := hub.Sandbox(cast.MemberKey, bobFork.Slug, map[string]any{"profile": "exposing"})
-	if strings.Contains(s2.Exec("env").Stdout, values["DEPLOY_KEY"]) {
+	if strings.Contains(environment(t, s2), values["DEPLOY_KEY"]) {
 		t.Errorf("the environment of the read-only member's sandbox holds the value of the parent's DEPLOY_KEY")
 	}
 	if got := s2.Get(); strings.Contains(string(got.Raw), "DEPLOY_KEY") {
@@ -204,6 +204,17 @@ func TestSandbox_ExposedSecretIsReadableInsideAndNamedNotShownOutside(t *testing
 	if strings.Contains(logs, value) {
 		t.Errorf("parley sandbox logs printed the secret's value:\n%s", logs)
 	}
+}
+
+// environment is what env prints in s, failing the test unless it ran
+// and printed the environment.
+func environment(t *testing.T, s *harness.Sandbox) string {
+	t.Helper()
+	e := s.Exec("env")
+	if e.ExitCode != 0 || !strings.Contains(e.Stdout, "PATH=") {
+		t.Fatalf("env in sandbox %s exited %d printing\n%s%s\nwant 0 and an environment holding PATH", s.ID, e.ExitCode, e.Stdout, e.Stderr)
+	}
+	return e.Stdout
 }
 
 // eventsOf are the events among all whose resource is the sandbox id.
@@ -279,13 +290,7 @@ func TestSandbox_DeniedHostIsReportedAndOpensAfterApproval(t *testing.T) {
 	var p map[string]any
 	harness.Eventually(t, "parley sandbox proposals to list an open proposal for "+host, func() bool {
 		listed := hub.CLI(cast.OwnerKey, "sandbox", "proposals", fork.Slug, s.ID).Must(t)
-		items, _ := listed.JSON()["items"].([]any)
-		var objs []map[string]any
-		for _, it := range items {
-			m, _ := it.(map[string]any)
-			objs = append(objs, m)
-		}
-		p = proposalFor(objs, host)
+		p = proposalFor(objectsOf(listed.JSON(), "items"), host)
 		return p != nil
 	})
 	hub.CLI(cast.OwnerKey, "sandbox", "approve", fork.Slug, s.ID, harness.Str(p["id"]), "--acknowledge-findings").Must(t)
@@ -308,9 +313,9 @@ func TestSandbox_WorkspaceRuleAppliesToNewSandboxesOnly(t *testing.T) {
 	hub.Call(http.MethodPost, s1.Path("/proposals/"+p+"/approve"), key,
 		map[string]any{"scope": "workspace", "acknowledge_findings": true}).Want(t, http.StatusOK)
 	var rule map[string]any
-	rules, _ := hub.CLI(key, "sandbox", "rules", "demo").Must(t).JSON()["items"].([]any)
-	for _, it := range rules {
-		if m, _ := it.(map[string]any); names(m, host) {
+	rules := objectsOf(hub.CLI(key, "sandbox", "rules", "demo").Must(t).JSON(), "items")
+	for _, m := range rules {
+		if names(m, host) {
 			if rule != nil {
 				t.Errorf("demo holds more than one rule for %s: %v", host, rules)
 			}
@@ -335,6 +340,7 @@ func TestSandbox_WorkspaceRuleAppliesToNewSandboxesOnly(t *testing.T) {
 	if code := curl(s0, target); code == 0 {
 		t.Errorf("a sandbox running before the approval reached %s: the rule applied to it", target)
 	}
+	harness.Eventually(t, "parley.sandbox.deny for the sandbox running before the approval", func() bool { return denied(t, hub, s0, host) })
 
 	hub.CLI(key, "sandbox", "rule-delete", "demo", harness.Str(rule["id"])).Must(t)
 	s4 := sandboxOn("demo")
@@ -404,18 +410,7 @@ func TestSandbox_CheckpointsRestoreAndHubRestart(t *testing.T) {
 			hub.CLI(key, "sandbox", "stop", s.Workspace, s.ID).Must(t)
 		}, "stopped", "", time.Minute},
 		{"idle", "quick", nil, "stopped", "idle", 4 * time.Minute},
-		// An exec every 20 s keeps the sandbox from going idle first.
-		{"expiry", "quick", func(_ *testing.T, hub *harness.Hub, key string, s *harness.Sandbox) {
-			go func() {
-				for {
-					r := hub.Call(http.MethodPost, s.Path("/exec"), key, map[string]any{"command": []string{"true"}})
-					if r.Status != http.StatusOK {
-						return
-					}
-					time.Sleep(20 * time.Second)
-				}
-			}()
-		}, "deleted", "expired", 6 * time.Minute},
+		{"expiry", "quick", keepBusy, "deleted", "expired", 6 * time.Minute},
 	}
 	for _, e := range endings {
 		t.Run(e.name, func(t *testing.T) {
@@ -450,39 +445,72 @@ func TestSandbox_CheckpointsRestoreAndHubRestart(t *testing.T) {
 		})
 	}
 
-	t.Run("restart", func(t *testing.T) {
-		t.Parallel()
-		hub, cast := gatewayHub(t, "", "default")
-		fork := hub.Fork(cast.OwnerKey, "demo", nil, nil)
-		r := hub.Sandbox(cast.OwnerKey, fork.Slug, map[string]any{
-			"profile": "default", "command": []string{"sh", "-c", "while true; do date +%s >> /tmp/ticks; sleep 1; done"},
-		})
-		ticks := func() []string { return r.Exec("cat", "/tmp/ticks").Lines() }
-		var before []string
-		harness.Eventually(t, "the main process to append ticks", func() bool { before = ticks(); return len(before) >= 3 })
+	t.Run("restart", sandboxOutlivesHubRestart)
+}
 
-		hub.Stop()
-		time.Sleep(5 * time.Second) // the sandbox runs on without its hub
-		hub.Start()
-		harness.EventuallyWithin(t, 60*time.Second, "the sandbox to be shown ready after the restart", func() bool {
-			return hub.Call(http.MethodGet, r.Path(""), cast.OwnerKey, nil).Body["state"] == "ready"
-		})
-
-		after := ticks()
-		if len(after) <= len(before) {
-			t.Errorf("the main process appended no tick across the restart: %d before, %d after", len(before), len(after))
-		}
-		gap := 0
-		for i := 1; i < len(after); i++ {
-			a, errA := strconv.Atoi(after[i-1])
-			b, errB := strconv.Atoi(after[i])
-			if errA != nil || errB != nil {
-				t.Fatalf("the ticks are not whole seconds: %q", after)
+// keepBusy runs an exec in s every 20 s, which keeps it from going idle,
+// until the test ends or an exec is refused.
+func keepBusy(t *testing.T, hub *harness.Hub, key string, s *harness.Sandbox) {
+	done, stopped := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(done); <-stopped })
+	go func() {
+		defer close(stopped)
+		for {
+			r := hub.Call(http.MethodPost, s.Path("/exec"), key, map[string]any{"command": []string{"true"}})
+			if r.Status != http.StatusOK {
+				return
 			}
-			gap = max(gap, b-a)
+			select {
+			case <-done:
+				return
+			case <-time.After(20 * time.Second):
+			}
 		}
-		if gap > 5 {
-			t.Errorf("the main process's ticks have a gap of %d s, want at most 5: the hub's restart stopped it", gap)
-		}
+	}()
+}
+
+// sandboxOutlivesHubRestart stops and starts the hub of a sandbox whose
+// main process writes a tick a second, which goes on throughout.
+func sandboxOutlivesHubRestart(t *testing.T) {
+	t.Parallel()
+	hub, cast := gatewayHub(t, "", "default")
+	fork := hub.Fork(cast.OwnerKey, "demo", nil, nil)
+	r := hub.Sandbox(cast.OwnerKey, fork.Slug, map[string]any{
+		"profile": "default", "command": []string{"sh", "-c", "while true; do date +%s >> /tmp/ticks; sleep 1; done"},
 	})
+	ticks := func() []string { return r.Exec("cat", "/tmp/ticks").Lines() }
+	var before []string
+	harness.Eventually(t, "the main process to append ticks", func() bool { before = ticks(); return len(before) >= 3 })
+
+	hub.Stop()
+	time.Sleep(5 * time.Second) // the sandbox runs on without its hub
+	hub.Start()
+	harness.EventuallyWithin(t, 60*time.Second, "the sandbox to be shown ready after the restart", func() bool {
+		return hub.Call(http.MethodGet, r.Path(""), cast.OwnerKey, nil).Body["state"] == "ready"
+	})
+
+	// The file grows on after the restart only while the main process
+	// that writes it lives.
+	after := ticks()
+	time.Sleep(3 * time.Second)
+	if later := ticks(); len(later) <= len(after) {
+		t.Errorf("the main process appended no tick in the 3 s after the restart (%d ticks, then %d): it did not survive it", len(after), len(later))
+	} else {
+		after = later
+	}
+	if len(after) <= len(before) {
+		t.Errorf("the main process appended no tick across the restart: %d before, %d after", len(before), len(after))
+	}
+	gap := 0
+	for i := 1; i < len(after); i++ {
+		a, errA := strconv.Atoi(after[i-1])
+		b, errB := strconv.Atoi(after[i])
+		if errA != nil || errB != nil {
+			t.Fatalf("the ticks are not whole seconds: %q", after)
+		}
+		gap = max(gap, b-a)
+	}
+	if gap > 5 {
+		t.Errorf("the main process's ticks have a gap of %d s, want at most 5: the hub's restart stopped it", gap)
+	}
 }

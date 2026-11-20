@@ -35,7 +35,13 @@ func openChange(t *testing.T, hub *harness.Hub, credential, branch string, files
 // mainHead is the commit demo's main points at.
 func mainHead(t *testing.T, hub *harness.Hub, credential string) string {
 	t.Helper()
-	return harness.Str(hub.Get(credential, scm+"/refs/main").Body["sha"])
+	return mainHeadOf(t, hub, credential, "demo")
+}
+
+// mainHeadOf is the commit main of the workspace slug points at.
+func mainHeadOf(t *testing.T, hub *harness.Hub, credential, slug string) string {
+	t.Helper()
+	return harness.Str(hub.Get(credential, "/api/v1/workspaces/"+slug+"/scm/refs/main").Body["sha"])
 }
 
 // fiveLines is src/a.txt as seedFiveLines puts it on main; lineThree is
@@ -101,15 +107,10 @@ func TestLand_TwentyDisjointChangesLandConcurrently(t *testing.T) {
 	base := mainHead(t, hub, key)
 
 	answers := make([]harness.Response, n)
-	sent := make([]int, n)
 	harness.Release(n, func(i int) {
-		sent[i]++
 		answers[i] = hub.Call(http.MethodPost, landPath(numbers[i]), key, nil)
 	})()
 	for i, a := range answers {
-		if sent[i] != 1 {
-			t.Errorf("caller %d sent %d land requests, want 1", i+1, sent[i])
-		}
 		if a.Status != http.StatusOK || a.Body["status"] != "landed" {
 			t.Errorf("the land of c%d answered %d %s, want 200 with the status landed", i+1, a.Status, a.Raw)
 		}
@@ -201,7 +202,7 @@ func TestLand_KilledHubLeavesNoHalfLandedChange(t *testing.T) {
 	t.Parallel()
 	hub, demo := demoHub(t)
 	key := demo.Owner.Key
-	landed := 0
+	landed, leftOpen := 0, 0
 	for _, delay := range []time.Duration{0, 20 * time.Millisecond, 60 * time.Millisecond, 150 * time.Millisecond} {
 		const n = 10
 		numbers := make([]int, n)
@@ -220,12 +221,19 @@ func TestLand_KilledHubLeavesNoHalfLandedChange(t *testing.T) {
 		wait()
 		hub.Start()
 
-		// A land in flight at the kill is run again after the start.
+		// A land in flight at the kill is run again after the start, and
+		// ends.
+		inFlight := members(hub.Get(key, "/api/v1/workspaces/demo/lands?status=running").Body, "items", "id")
 		harness.Eventually(t, "no land attempt to be running", func() bool {
 			return len(hub.Get(key, "/api/v1/workspaces/demo/lands?status=running").Items()) == 0
 		})
+		for _, id := range inFlight {
+			if status := hub.Get(key, "/api/v1/workspaces/demo/lands/"+id).Body["status"]; status == "running" || status == nil {
+				t.Errorf("kill after %v: the land attempt %s, running at the start, is %v, want it ended", delay, id, status)
+			}
+		}
 		landEvents := map[string]int{}
-		for _, e := range hub.Get(key, "/api/v1/events/log?workspace=demo&types=parley.change.land&limit=200").Items() {
+		for _, e := range eventLog(t, hub, key, "workspace=demo&types=parley.change.land", 0) {
 			landEvents[harness.Str(e["resource_id"])]++
 		}
 		clone := hub.Clone(demo.Remote, key)
@@ -244,19 +252,17 @@ func TestLand_KilledHubLeavesNoHalfLandedChange(t *testing.T) {
 					delay, number, state, held, events)
 			}
 		}
-		if running := hub.Get(key, "/api/v1/workspaces/demo/lands?status=running").Items(); len(running) != 0 {
-			t.Errorf("kill after %v: %d land attempts are running, want none", delay, len(running))
-		}
-		t.Logf("kill after %v: %d of %d changes left open", delay, len(open), n)
+		leftOpen += len(open)
+		t.Logf("kill after %v: %d of %d changes left open, %d land attempts running at the start", delay, len(open), n, len(inFlight))
 		if len(open) > 0 {
 			if r := hub.Call(http.MethodPost, landPath(open[0]), key, nil); r.Status != http.StatusOK || r.Body["status"] != "landed" {
 				t.Errorf("kill after %v: the land of the open change %d answered %d %s, want 200 landed", delay, open[0], r.Status, r.Raw)
 			}
 		}
 	}
-	// Without a landed change no kill came while a land was under way, and
-	// the scenario would have shown nothing.
-	if landed == 0 {
-		t.Error("no change landed in any round, want the kills to come while lands were under way")
+	// Without a landed change and one left open no kill came while lands
+	// were under way, and the scenario would have shown nothing.
+	if landed == 0 || leftOpen == 0 {
+		t.Errorf("%d changes landed and %d were left open over the rounds, want at least one of each: the kills to come while lands were under way", landed, leftOpen)
 	}
 }
