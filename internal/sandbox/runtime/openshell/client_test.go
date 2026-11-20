@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,9 +32,9 @@ func TestClient_PassesTheContract(t *testing.T) {
 			Client: func(workspace string, rec runtime.Recorder) runtime.Client {
 				return openshell.NewWithClient(g, workspace, openshell.Deps{Scrubber: scrub.New(), Recorder: rec})
 			},
-			SetUnreachable:        g.SetUnreachable,
-			AddProposal:           drafts.add,
-			EndpointsWithoutPaths: true,
+			SetUnreachable:         g.SetUnreachable,
+			AddProposal:            drafts.add,
+			EndpointsWithoutScheme: true,
 		}
 	})
 }
@@ -61,8 +62,11 @@ func TestClient_ActsOnProvidersInItsWorkspaceOnly(t *testing.T) {
 	require(t, a.EnsureProvider(ctx, runtime.Provider{Name: "p", Profile: "anthropic", Value: "v", Labels: map[string]string{"parley.sandbox": "sb-1"}}), "EnsureProvider")
 	stored, err := s.Fake().Providers().Get(ctx, "parley", "p")
 	require(t, err, "reading the provider from the SDK")
-	if stored.Type != "anthropic" || !reflect.DeepEqual(stored.Spec.Credentials, map[string]string{"anthropic": "v"}) {
-		t.Errorf("SDK provider = type %q credentials %v, want type anthropic with the value under the profile's credential", stored.Type, stored.Spec.Credentials)
+	if stored.Type != "anthropic" || !reflect.DeepEqual(stored.Spec.Credentials, map[string]string{"ANTHROPIC_API_KEY": "v"}) {
+		t.Errorf("SDK provider = type %q credentials %v, want type anthropic with the value under the credential's variable", stored.Type, stored.Spec.Credentials)
+	}
+	if stored.Spec.ProfileWorkspace != "parley" {
+		t.Errorf("SDK provider's profile workspace = %q, want parley, which holds the profile the client installed", stored.Spec.ProfileWorkspace)
 	}
 	wantOneKind(t, b.EnsureProvider(ctx, runtime.Provider{Name: "q", Profile: "anthropic", Value: "v"}), runtime.ErrNotFound)
 	wantOneKind(t, b.DeleteProvider(ctx, "p"), runtime.ErrNotFound)
@@ -79,7 +83,7 @@ func TestClient_ActsOnProvidersInItsWorkspaceOnly(t *testing.T) {
 	}
 }
 
-func TestClient_InstallsAProviderProfileWithTheEndpointsHostPortAndScheme(t *testing.T) {
+func TestClient_InstallsAProviderProfileWithAnHTTPEndpointPerPath(t *testing.T) {
 	t.Parallel()
 	s := newGateway()
 	c := openshell.NewWithClient(s, "parley", openshell.Deps{})
@@ -87,24 +91,34 @@ func TestClient_InstallsAProviderProfileWithTheEndpointsHostPortAndScheme(t *tes
 	p := runtime.ProviderProfile{
 		ID:        "parley-hub",
 		Variables: []string{"PARLEY_API_KEY"},
-		Endpoints: []runtime.Endpoint{{Scheme: "https", Host: "hub.test", Port: 443, Paths: []string{"/api/v1/", "/git/"}}},
+		Endpoints: []runtime.Endpoint{
+			{Scheme: "https", Host: "hub.test", Port: 443, Paths: []string{"/api/v1/", "/git"}},
+			{Scheme: "http", Host: "other.test", Port: 8080},
+		},
 	}
 	require(t, c.InstallProviderProfile(ctx, p), "InstallProviderProfile")
 	installed, ok := s.Profile("parley", "parley-hub")
 	if !ok {
 		t.Fatal("the profile was not installed")
 	}
-	if want := []v1.NetworkEndpoint{{Host: "hub.test", Port: 443, Protocol: "https"}}; !reflect.DeepEqual(installed.Endpoints, want) {
-		t.Errorf("installed endpoints = %+v, want %+v (no paths)", installed.Endpoints, want)
+	rest := func(host string, port uint32, path string) v1.NetworkEndpoint {
+		return v1.NetworkEndpoint{Host: host, Port: port, Protocol: "rest", Access: v1.NetworkAccessPresetFull, Path: path}
+	}
+	want := []v1.NetworkEndpoint{rest("hub.test", 443, "/api/v1/**"), rest("hub.test", 443, "/git/**"), rest("other.test", 8080, "")}
+	if !reflect.DeepEqual(installed.Endpoints, want) {
+		t.Errorf("installed endpoints = %+v\nwant %+v", installed.Endpoints, want)
 	}
 	if want := []v1.ProfileCredential{{Name: "parley-hub", EnvVars: []string{"PARLEY_API_KEY"}, Required: true}}; !reflect.DeepEqual(installed.Credentials, want) {
 		t.Errorf("installed credentials = %+v, want %+v", installed.Credentials, want)
 	}
 	got, err := c.GetProviderProfile(ctx, "parley-hub")
 	require(t, err, "GetProviderProfile")
-	want := runtime.ProviderProfile{ID: "parley-hub", Variables: []string{"PARLEY_API_KEY"}, Endpoints: []runtime.Endpoint{{Scheme: "https", Host: "hub.test", Port: 443}}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("GetProviderProfile = %+v, want %+v", got, want)
+	wantProfile := runtime.ProviderProfile{ID: "parley-hub", Variables: []string{"PARLEY_API_KEY"}, Endpoints: []runtime.Endpoint{
+		{Host: "hub.test", Port: 443, Paths: []string{"/api/v1/", "/git/"}},
+		{Host: "other.test", Port: 8080},
+	}}
+	if !reflect.DeepEqual(got, wantProfile) {
+		t.Errorf("GetProviderProfile = %+v, want %+v (no scheme)", got, wantProfile)
 	}
 
 	p.Variables = []string{"PARLEY_API_KEY", "PARLEY_TOKEN"}
@@ -129,8 +143,11 @@ func TestClient_EnsuresListsAttachesAndDetachesAProvider(t *testing.T) {
 	require(t, c.EnsureProvider(ctx, runtime.Provider{Name: "p", Profile: "anthropic", Value: "v2", Labels: labels}), "EnsureProvider again")
 	stored, err := s.Fake().Providers().Get(ctx, "parley", "p")
 	require(t, err, "reading the provider from the SDK")
-	if !reflect.DeepEqual(stored.Spec.Credentials, map[string]string{"api_key": "v2"}) {
-		t.Errorf("SDK credentials = %v, want the last value under the profile's credential", stored.Spec.Credentials)
+	if !reflect.DeepEqual(stored.Spec.Credentials, map[string]string{"ANTHROPIC_API_KEY": "v2"}) {
+		t.Errorf("SDK credentials = %v, want the last value under the credential's variable", stored.Spec.Credentials)
+	}
+	if stored.Spec.ProfileWorkspace != "" {
+		t.Errorf("SDK provider's profile workspace = %q, want none for a profile the gateway ships", stored.Spec.ProfileWorkspace)
 	}
 	list, err := c.ListProviders(ctx)
 	require(t, err, "ListProviders")
@@ -189,12 +206,16 @@ func TestClient_CreatesASandboxOnlyWithWhatTheSDKCanCarry(t *testing.T) {
 			CPU:       "2",
 			Memory:    "4Gi",
 			GPU:       1,
+			WorkDir:   "/workspace",
 			Env:       map[string]string{"PARLEY_SANDBOX": "sb-1"},
 			Providers: []string{"p"},
 			Labels:    map[string]string{"parley.sandbox": "sb-1"},
 			Policy: runtime.Policy{
-				Protected: []runtime.Rule{{Name: "parley-hub", Body: json.RawMessage(`{"endpoints":[{"host":"hub.test","port":443}]}`)}},
-				Added:     []runtime.Rule{{Name: "pypi", Body: json.RawMessage(`{"endpoints":[{"host":"pypi.test","port":443}],"binaries":[{"path":"/usr/bin/pip"}]}`)}},
+				Protected: []runtime.Rule{
+					{Name: "parley-hub", Body: json.RawMessage(`{"providers":["sb-1-hub"],"endpoints":[{"scheme":"https","host":"hub.test","port":443,"paths":["/api/v1/w","/api/v1/w/**"]}]}`)},
+					{Name: "credential-model", Body: json.RawMessage(`{"providers":["sb-1-model"]}`)},
+				},
+				Added: []runtime.Rule{{Name: "pypi", Body: json.RawMessage(`{"endpoints":[{"host":"pypi.test","port":443}],"binaries":[{"path":"/usr/bin/pip"}]}`)}},
 			},
 		}
 		if change != nil {
@@ -202,27 +223,66 @@ func TestClient_CreatesASandboxOnlyWithWhatTheSDKCanCarry(t *testing.T) {
 		}
 		return spec
 	}
+	filesystem := &v1.FilesystemPolicy{
+		IncludeWorkdir: true,
+		ReadOnly:       []string{"/bin", "/usr", "/lib", "/proc", "/dev/urandom", "/etc", "/var/log"},
+		ReadWrite:      []string{"/tmp", "/dev/null", "/workspace"},
+	}
+	rest := func(path string) v1.PolicyNetworkEndpoint {
+		return v1.PolicyNetworkEndpoint{Host: "hub.test", Port: 443, Protocol: "rest", Access: v1.NetworkAccessPresetFull, Path: path}
+	}
+	carriedPolicy := &v1.SandboxPolicy{
+		Version:    1,
+		Filesystem: filesystem,
+		Landlock:   &v1.LandlockPolicy{Compatibility: "best_effort"},
+		NetworkPolicies: map[string]v1.NetworkPolicyRule{
+			// The credential's rule names a provider only: the gateway
+			// binds a provider by its profile, so nothing of it is sent.
+			"parley-hub": {Name: "parley-hub", Endpoints: []v1.PolicyNetworkEndpoint{rest("/api/v1/w"), rest("/api/v1/w/**")}, Binaries: []v1.PolicyNetworkBinary{{Path: "/**"}}},
+			"pypi":       {Name: "pypi", Endpoints: []v1.PolicyNetworkEndpoint{{Host: "pypi.test", Port: 443}}, Binaries: []v1.PolicyNetworkBinary{{Path: "/usr/bin/pip"}}},
+		},
+	}
+	unsupportedRule := func(body string) func(*runtime.SandboxSpec) {
+		return func(s *runtime.SandboxSpec) {
+			s.Policy.Added = []runtime.Rule{{Name: "r", Body: json.RawMessage(body)}}
+		}
+	}
 	rows := []struct {
 		name string
 		spec runtime.SandboxSpec
-		want error // nil: the sandbox is created
+		// policy is the SDK policy the sandbox is created with, when want
+		// is nil.
+		policy *v1.SandboxPolicy
+		want   error // nil: the sandbox is created
 	}{
-		{name: "everything the SDK can carry", spec: carried(nil)},
+		{name: "everything the SDK can carry", spec: carried(nil), policy: carriedPolicy},
+		{
+			name:   "a working directory without rules",
+			spec:   carried(func(s *runtime.SandboxSpec) { s.Policy = runtime.Policy{} }),
+			policy: &v1.SandboxPolicy{Version: 1, Filesystem: filesystem, Landlock: &v1.LandlockPolicy{Compatibility: "best_effort"}},
+		},
+		{
+			name: "neither a working directory nor rules",
+			spec: carried(func(s *runtime.SandboxSpec) { s.WorkDir, s.Policy = "", runtime.Policy{} }),
+		},
 		{
 			name: "a base policy document",
 			spec: carried(func(s *runtime.SandboxSpec) { s.Policy.Base = []byte("version: 1\n") }),
 			want: runtime.ErrUnsupported,
 		},
 		{
-			name: "a working directory",
-			spec: carried(func(s *runtime.SandboxSpec) { s.WorkDir = "/w" }),
+			name: "a rule the SDK's network rule cannot hold",
+			spec: carried(unsupportedRule(`{"endpoints":[{"host":"x.test","port":443,"allowed_ips":["10.0.0.0/8"]}]}`)),
 			want: runtime.ErrUnsupported,
 		},
 		{
-			name: "a rule the SDK's network rule cannot hold",
-			spec: carried(func(s *runtime.SandboxSpec) {
-				s.Policy.Protected = []runtime.Rule{{Name: "r", Body: json.RawMessage(`{"endpoints":[{"host":"x.test","port":443,"allowed_ips":["10.0.0.0/8"]}]}`)}}
-			}),
+			name: "an endpoint with paths and no scheme",
+			spec: carried(unsupportedRule(`{"endpoints":[{"host":"x.test","port":443,"paths":["/a"]}]}`)),
+			want: runtime.ErrUnsupported,
+		},
+		{
+			name: "an endpoint with a scheme and a protocol",
+			spec: carried(unsupportedRule(`{"endpoints":[{"scheme":"https","host":"x.test","port":443,"protocol":"tcp"}]}`)),
 			want: runtime.ErrUnsupported,
 		},
 		{
@@ -264,16 +324,56 @@ func TestClient_CreatesASandboxOnlyWithWhatTheSDKCanCarry(t *testing.T) {
 				Providers: []string{"p"},
 				GPU:       true,
 				GPUCount:  &gpus,
-				Policy: &v1.SandboxPolicy{NetworkPolicies: map[string]v1.NetworkPolicyRule{
-					"parley-hub": {Name: "parley-hub", Endpoints: []v1.PolicyNetworkEndpoint{{Host: "hub.test", Port: 443}}},
-					"pypi":       {Name: "pypi", Endpoints: []v1.PolicyNetworkEndpoint{{Host: "pypi.test", Port: 443}}, Binaries: []v1.PolicyNetworkBinary{{Path: "/usr/bin/pip"}}},
-				}},
+				Policy:    row.policy,
 			}
 			if !reflect.DeepEqual(sb.Spec, want) {
 				t.Errorf("SDK spec = %+v\nwant %+v", sb.Spec, want)
+				if sb.Spec.Policy != nil && row.policy != nil {
+					t.Errorf("SDK policy = %+v\nwant %+v", *sb.Spec.Policy, *row.policy)
+				}
 			}
 		})
 	}
+}
+
+func TestClient_NamesASandboxTheGatewayWouldRefuseByAHashOfItsName(t *testing.T) {
+	t.Parallel()
+	s := newGateway()
+	c := openshell.NewWithClient(s, "parley", openshell.Deps{})
+	ctx := t.Context()
+	long := "sbx_0123456789abcdef0123456789abcdef"
+	for _, name := range []string{long, "sb-1"} {
+		st, err := c.CreateSandbox(ctx, runtime.SandboxSpec{Name: name})
+		require(t, err, "CreateSandbox "+name)
+		if st.Name != name {
+			t.Errorf("CreateSandbox(%s) reports the name %q", name, st.Name)
+		}
+	}
+	at, err := s.Fake().Sandboxes().ListAll(ctx, "parley")
+	require(t, err, "listing the SDK's sandboxes")
+	var names []string
+	for _, sb := range at {
+		names = append(names, sb.Name)
+		if len(sb.Name) > 19 || strings.ContainsAny(sb.Name, "_ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+			t.Errorf("the gateway holds a sandbox named %q, which it refuses", sb.Name)
+		}
+	}
+	if !slices.Contains(names, "sb-1") {
+		t.Errorf("the gateway's sandboxes are %v, want sb-1 under its own name", names)
+	}
+	got, err := c.GetSandbox(ctx, long)
+	require(t, err, "GetSandbox")
+	if got.Name != long {
+		t.Errorf("GetSandbox(%s).Name = %q", long, got.Name)
+	}
+	list, err := c.ListSandboxes(ctx)
+	require(t, err, "ListSandboxes")
+	if len(list) != 2 || list[0].Name != "sb-1" || list[1].Name != long {
+		t.Errorf("ListSandboxes = %+v, want sb-1 and %s by their own names", list, long)
+	}
+	require(t, c.DeleteSandbox(ctx, long), "DeleteSandbox")
+	_, err = c.GetSandbox(ctx, long)
+	wantOneKind(t, err, runtime.ErrNotFound)
 }
 
 func TestClient_StartsAStoppedSandboxOnlyWithoutAPolicyOrAnEnvironment(t *testing.T) {

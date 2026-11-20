@@ -1,6 +1,9 @@
 # The reference sandbox image: git, a POSIX shell, the CA certificates and the
-# parley CLI, run as user 1000 with a writable home. It satisfies the image
-# contract of a sandbox and is the example an operator's own image follows.
+# parley CLI, run as user 1000 with a writable home and the working directory
+# /workspace, which the user owns. It satisfies the image contract of a
+# sandbox and is the example an operator's own image follows: OpenShell
+# creates a sandbox without a working directory, and its user cannot create
+# /workspace, so the image holds it.
 # Build it from the repository root:
 #
 #   docker build -f containers/sandbox/Dockerfile \
@@ -29,7 +32,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w \
 FROM docker.io/library/alpine:3.22
 RUN apk add --no-cache git ca-certificates \
  && addgroup -g 1000 sandbox \
- && adduser -D -u 1000 -G sandbox -h /home/sandbox -s /bin/sh sandbox
+ && adduser -D -u 1000 -G sandbox -h /home/sandbox -s /bin/sh sandbox \
+ && mkdir /workspace && chown 1000:1000 /workspace
 COPY --from=build /out/parley /usr/local/bin/
 USER 1000:1000
 ENV HOME=/home/sandbox

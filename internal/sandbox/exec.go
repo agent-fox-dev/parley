@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -218,9 +219,11 @@ func (x *executor) start(r *http.Request, u useRequest) (*execution, error) {
 	}
 	go e.watch(x.s.deps.Shutdown)
 	// The runtime holds the sandbox's environment since its creation and
-	// lays the request's over it, so only the request's is sent.
+	// lays the request's over it, so only the request's is sent. The
+	// working directory is always named: a runtime that has none at
+	// creation runs a command without one in the image's.
 	stream, err := x.s.Client().ExecStream(ctx, id, runtime.ExecRequest{
-		Command: u.exec.command, WorkDir: u.exec.workDir, Env: u.exec.env, Stdin: u.exec.stdin,
+		Command: u.exec.command, WorkDir: cmp.Or(u.exec.workDir, WorkDir), Env: u.exec.env, Stdin: u.exec.stdin,
 	})
 	if err != nil {
 		e.end()
