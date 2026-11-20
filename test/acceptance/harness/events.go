@@ -2,9 +2,13 @@ package harness
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -156,3 +160,71 @@ func (s *Stream) MaxSeq() int64 {
 
 // Close drops the connection, as a consumer that goes away does.
 func (s *Stream) Close() { _ = s.res.Body.Close() }
+
+// EventsRefused opens the event stream as Events does and returns the
+// answer when the hub refuses it; a stream answered 200 is closed at once
+// and returned with that status and no body.
+func (h *Hub) EventsRefused(credential, query string, header ...string) Response {
+	path := "/api/v1/events"
+	if query != "" {
+		path += "?" + query
+	}
+	req, err := http.NewRequest(http.MethodGet, h.URL(path), nil)
+	if err != nil {
+		return Response{Err: err}
+	}
+	req.Header.Set("Authorization", "Bearer "+credential)
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return Response{Err: err}
+	}
+	defer res.Body.Close()
+	r := Response{Status: res.StatusCode, Header: res.Header}
+	if res.StatusCode == http.StatusOK {
+		return r
+	}
+	r.Raw, r.Err = io.ReadAll(res.Body)
+	_ = json.Unmarshal(r.Raw, &r.Body)
+	return r
+}
+
+// Tail runs parley events tail with credential and args, such as --after
+// 12, until it has printed n lines or timeout has passed, and returns the
+// lines it printed by then: the command itself never ends.
+func (h *Hub) Tail(credential string, n int, timeout time.Duration, args ...string) []string {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, built.parley, append([]string{"events", "tail"}, args...)...)
+	// The environment CLI gives the parley it runs.
+	cmd.Dir = h.cliHome
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"), "HOME=" + h.cliHome, "PARLEY_CONFIG_DIR=" + h.cliConfig,
+		"PARLEY_ENDPOINT_URL=" + h.URL(""), "PARLEY_API_KEY=" + credential,
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		h.t.Fatalf("start parley events tail: %v", err)
+	}
+	var lines []string
+	sc := bufio.NewScanner(out)
+	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
+	for len(lines) < n && sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	cancel()
+	_ = cmd.Wait()
+	if len(lines) < n {
+		h.t.Logf("parley events tail printed %d of %d lines within %v; its standard error:\n%s", len(lines), n, timeout, stderr.String())
+	}
+	return lines
+}

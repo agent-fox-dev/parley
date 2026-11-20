@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -14,10 +15,19 @@ import (
 
 // Delivery is one request a Receiver received.
 type Delivery struct {
+	Method string
 	Header http.Header
 	// Body is the request's body byte for byte.
 	Body []byte
 	At   time.Time
+	// Status is what the receiver answered.
+	Status int
+}
+
+// Seq is the delivery's Parley-Seq, 0 when it has none.
+func (d Delivery) Seq() int64 {
+	n, _ := strconv.ParseInt(d.Header.Get("Parley-Seq"), 10, 64)
+	return n
 }
 
 // Receiver is a webhook endpoint on a loopback port that records every
@@ -40,8 +50,8 @@ func NewReceiver(tb testing.TB) *Receiver {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, _ := io.ReadAll(req.Body)
 		r.mu.Lock()
-		r.got = append(r.got, Delivery{Header: req.Header.Clone(), Body: body, At: time.Now()})
 		status := r.status
+		r.got = append(r.got, Delivery{Method: req.Method, Header: req.Header.Clone(), Body: body, At: time.Now(), Status: status})
 		r.mu.Unlock()
 		select {
 		case r.notify <- struct{}{}:
@@ -81,6 +91,37 @@ func (r *Receiver) Wait(n int, timeout time.Duration) []Delivery {
 		case <-r.notify:
 		case <-deadline:
 			r.t.Fatalf("%d of %d webhook requests arrived within %v", len(r.Deliveries()), n, timeout)
+		}
+	}
+}
+
+// Last is the request received last, failing the test when none was.
+func (r *Receiver) Last() Delivery {
+	r.t.Helper()
+	got := r.Deliveries()
+	if len(got) == 0 {
+		r.t.Fatal("the webhook receiver got no request")
+	}
+	return got[len(got)-1]
+}
+
+// WaitUntilSeq returns every request received, once one carrying the
+// Parley-Seq seq was answered with a 2xx status, and fails the test when
+// none was within timeout.
+func (r *Receiver) WaitUntilSeq(seq int64, timeout time.Duration) []Delivery {
+	r.t.Helper()
+	deadline := time.After(timeout)
+	for {
+		got := r.Deliveries()
+		for _, d := range got {
+			if d.Seq() == seq && d.Status >= 200 && d.Status < 300 {
+				return got
+			}
+		}
+		select {
+		case <-r.notify:
+		case <-deadline:
+			r.t.Fatalf("no webhook request of the seq %d was accepted within %v; %d requests arrived", seq, timeout, len(got))
 		}
 	}
 }
