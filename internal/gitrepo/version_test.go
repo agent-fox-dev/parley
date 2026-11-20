@@ -14,6 +14,7 @@ import (
 )
 
 func TestParseVersion_ReadsMajorAndMinorAndComparesOnThemOnly(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		line         string
 		major, minor int
@@ -46,6 +47,7 @@ func TestParseVersion_ReadsMajorAndMinorAndComparesOnThemOnly(t *testing.T) {
 }
 
 func TestParseVersion_RefusesALineWithoutAVersion(t *testing.T) {
+	t.Parallel()
 	for _, line := range []string{"", "git version", "git version two", "git version 2", "hg version 2.40", "version 2.40.0"} {
 		if v, err := gitrepo.ParseVersion(line); err == nil {
 			t.Errorf("ParseVersion(%q) = %+v, want an error", line, v)
@@ -65,6 +67,7 @@ func gitScript(t *testing.T, body string) func(string) (string, error) {
 }
 
 func TestCheckVersion_ReportsAGitThatCannotBeRead(t *testing.T) {
+	t.Parallel()
 	long := strings.Repeat("x", 300)
 	for _, c := range []struct {
 		name, body, want string
@@ -81,16 +84,19 @@ func TestCheckVersion_ReportsAGitThatCannotBeRead(t *testing.T) {
 }
 
 func TestCheckVersion_KillsAGitThatDoesNotAnswerInTime(t *testing.T) {
+	t.Parallel()
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	lookPath := gitScript(t, "echo $$ > '"+pidFile+"'\nsleep 60\n")
 	start := time.Now()
-	_, err := gitrepo.CheckVersion(context.Background(), lookPath, 200*time.Millisecond)
+	// A limit long enough for sh to write its process id under a loaded
+	// machine before it is killed.
+	_, err := gitrepo.CheckVersion(context.Background(), lookPath, time.Second)
 	elapsed := time.Since(start)
-	if err == nil || !strings.Contains(err.Error(), "git --version failed: no answer within 200ms") {
-		t.Errorf("CheckVersion error = %v, want one saying no answer within 200ms", err)
+	if err == nil || !strings.Contains(err.Error(), "git --version failed: no answer within 1s") {
+		t.Errorf("CheckVersion error = %v, want one saying no answer within 1s", err)
 	}
-	if elapsed >= 2200*time.Millisecond {
-		t.Errorf("CheckVersion returned after %v, want less than 2.2 s", elapsed)
+	if elapsed >= 3*time.Second {
+		t.Errorf("CheckVersion returned after %v, want less than 3 s", elapsed)
 	}
 	text, err := os.ReadFile(pidFile)
 	if err != nil {

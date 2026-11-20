@@ -29,6 +29,23 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      # On an empty volume the runtime would create the config dir, the
+      # parent of the config.toml mount, as root, and the hub could not
+      # write its admin token file there. The init container creates the
+      # config and data dirs first, as the pod's user, from the hub's image
+      # (replace its reference as the hub container's below).
+      initContainers:
+        - name: data-dirs
+          image: parley-hub:latest
+          command: ["mkdir", "-p", "/var/lib/parley/config", "/var/lib/parley/data"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/parley
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       containers:
         - name: parley
           # Replace with the reference of the parley-hub image in your
@@ -49,6 +66,14 @@ spec:
             - name: config
               mountPath: /var/lib/parley/config/config.toml
               subPath: config.toml
+          # The first start applies every schema step; the liveness probe
+          # takes over once /healthz has answered, up to five minutes in.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
           livenessProbe:
             httpGet:
               path: /healthz

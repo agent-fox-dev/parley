@@ -23,8 +23,7 @@ type scenario struct {
 	// ctx, which carries the scenario's deadline, ends; an error it
 	// returns (a *requestError for a request the hub refused) ends the
 	// scenario in error. A capacity scenario's expected stop is no error:
-	// the body returns the count it reached. nil is a scenario the harness
-	// does not measure yet.
+	// the body returns the count it reached.
 	body func(ctx context.Context, e *env) (outcome, error)
 }
 

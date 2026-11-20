@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,64 +83,37 @@ func TestRestore_AHubStartsOnTheCopyOfAnIdleHubsSnapshotWithItsDataAndTakesNewWo
 	}
 	snapshotHashes := hashFiles(t, snapshot)
 
-	port := freePort(t)
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	dir := restore(t, snapshot, port)
-	var calls, rows atomic.Int64
-	var bound atomic.Bool
-	var rt2 *hub.Runtime
-	restored := hubtest.Serve(t, hub.Options{WorkDir: dir, Env: env, Compose: func(c *hub.Composition) {
-		rt2 = c.Runtime()
-		tableA(c)
-		c.AddStartHook("read_restored", func(ctx context.Context, rt *hub.Runtime) error {
-			calls.Add(1)
-			if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-				conn.Close()
-				bound.Store(true)
-			}
-			var n int64
-			if err := rt.Store.Main().QueryRowContext(ctx, "SELECT count(*) FROM a").Scan(&n); err != nil {
-				return err
-			}
-			rows.Store(n)
-			return nil
-		})
-	}})
+	r := startRestored(t, snapshot, env, tableA)
 
-	if got := restored.Listening["addr"]; got != addr {
-		t.Errorf("the restored hub listens on %v, want %s", got, addr)
+	if got := r.Listening["addr"]; got != r.addr {
+		t.Errorf("the restored hub listens on %v, want %s", got, r.addr)
 	}
-	if got := status(t, restored.URL("/readyz")); got != http.StatusOK {
+	if got := status(t, r.URL("/readyz")); got != http.StatusOK {
 		t.Errorf("GET /readyz of the restored hub = %d, want 200", got)
 	}
-	if calls.Load() != 1 || bound.Load() || rows.Load() != 100 {
+	if r.calls.Load() != 1 || r.bound.Load() || r.rows.Load() != 100 {
 		t.Errorf("the start hook ran %d times, with the listener bound: %t, and read %d rows; want once, before the bind, 100 rows",
-			calls.Load(), bound.Load(), rows.Load())
+			r.calls.Load(), r.bound.Load(), r.rows.Load())
 	}
-	if got := adminTokenHash(t, rt2.Store); got != tokenHash {
+	if got := adminTokenHash(t, r.rt.Store); got != tokenHash {
 		t.Errorf("the restored admin token hash = %q, want the source's %q", got, tokenHash)
 	}
-	if got := appliedSteps(t, rt2.Store); !slices.Equal(got[0], applied[0]) || !slices.Equal(got[1], applied[1]) {
+	if got := appliedSteps(t, r.rt.Store); !slices.Equal(got[0], applied[0]) || !slices.Equal(got[1], applied[1]) {
 		t.Errorf("the restored hub applied schema steps: the stores record %v, the source's recorded %v", got, applied)
 	}
-	err := rt2.Store.Tx(ctx, func(tx *sql.Tx) error {
+	err := r.rt.Store.Tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.Exec("INSERT INTO a (txn, n) VALUES (10, 0)")
 		return err
 	})
 	if err != nil {
 		t.Errorf("a transaction on the restored store: %v", err)
 	}
-	repo := filepath.Join(dir, "data", "workspaces", "r.git")
-	clone := t.TempDir()
-	git(t, clone, "clone", "--quiet", repo, ".")
-	pushed := commitFile(t, func(args ...string) string { return git(t, clone, args...) }, "file", "three", "three")
-	git(t, clone, "push", "--quiet", "origin", "main")
-	if got, want := git(t, repo, "rev-parse", "main"), pushed; got != want {
-		t.Errorf("the restored repository's main is %s after the push, want %s", got, want)
+	if err := pushNewCommit(t, filepath.Join(r.dir, "data", "workspaces", "r.git")); err != nil {
+		t.Errorf("a push to the restored repository: %v", err)
 	}
 
-	restored.Stop()
-	if code := restored.ExitCode(t, 5*time.Second); code != 0 {
+	r.Stop()
+	if code := r.ExitCode(t, 5*time.Second); code != 0 {
 		t.Errorf("the restored hub returned %d after a stop, want 0", code)
 	}
 	if got := hashFiles(t, snapshot); !maps.Equal(got, snapshotHashes) {
@@ -221,6 +195,9 @@ func TestRestore_ABackupTakenUnderLoadRestoresToAHubWithSoundStoresAndCompleteRe
 			if _, err := runGit(copied, "merge-base", "--is-ancestor", before, head); err != nil {
 				t.Errorf("backup %d: the restored main of %s, %s, does not hold %s, pushed before the backup began: %v",
 					round, filepath.Base(repo), head, before, err)
+			}
+			if err := pushNewCommit(t, copied); err != nil {
+				t.Errorf("backup %d: a push to the restored %s: %v", round, filepath.Base(repo), err)
 			}
 		}
 		restored.Stop()
@@ -322,13 +299,86 @@ func rowCount(t *testing.T, db *sql.DB, table string) int {
 	return n
 }
 
-// freePort returns a TCP port on 127.0.0.1 that was free a moment ago.
-func freePort(t *testing.T) int {
+// restoredHub is a hub started on the copy of a snapshot, and what its
+// start hook saw.
+type restoredHub struct {
+	*hubtest.Served
+	// dir is its working directory and addr the address its config.toml
+	// names.
+	dir, addr string
+	rt        *hub.Runtime
+	// calls counts the runs of the start hook, bound says whether the hook
+	// reached a listener on addr, rows is the count of a it read.
+	calls, rows atomic.Int64
+	bound       atomic.Bool
+}
+
+// startRestored copies snapshot into a new working directory whose
+// config.toml binds a port of 127.0.0.1 and starts a hub there with the
+// parts of compose and a start hook that reads table a and dials the
+// address.
+//
+// The test holds the port until the hook runs: the hub binds the address
+// of its config.toml itself, which a listener handed to it would bypass,
+// so the port is reserved by a listener of the test that the hook closes
+// before it dials. Another process can then take the port only in the
+// moment between the hook and the bind; and a hub that bound before its
+// hooks ran finds the port taken and does not start.
+func startRestored(t *testing.T, snapshot string, env config.Env, compose func(*hub.Composition)) *restoredHub {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("find a free port: %v", err)
+		t.Fatalf("reserve a port: %v", err)
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	t.Cleanup(func() { reserved.Close() })
+	port := reserved.Addr().(*net.TCPAddr).Port
+	r := &restoredHub{dir: restore(t, snapshot, port), addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
+	r.Served = hubtest.Serve(t, hub.Options{WorkDir: r.dir, Env: env, Compose: func(c *hub.Composition) {
+		r.rt = c.Runtime()
+		compose(c)
+		c.AddStartHook("read_restored", func(ctx context.Context, rt *hub.Runtime) error {
+			r.calls.Add(1)
+			if err := reserved.Close(); err != nil {
+				return err
+			}
+			if conn, err := net.DialTimeout("tcp", r.addr, time.Second); err == nil {
+				conn.Close()
+				r.bound.Store(true)
+			}
+			var n int64
+			if err := rt.Store.Main().QueryRowContext(ctx, "SELECT count(*) FROM a").Scan(&n); err != nil {
+				return err
+			}
+			r.rows.Store(n)
+			return nil
+		})
+	}})
+	return r
+}
+
+// pushNewCommit pushes one new commit onto main of the bare repository
+// repo from a clone of its own, and fails unless git exits with 0 and main
+// is the commit afterwards.
+func pushNewCommit(t *testing.T, repo string) error {
+	t.Helper()
+	work := t.TempDir()
+	if _, err := runGit(work, "clone", "--quiet", "--bare", "--shared", repo, "."); err != nil {
+		return err
+	}
+	out, err := runGit(work, "rev-parse", "main^{tree}", "main")
+	if err != nil {
+		return err
+	}
+	tree, parent, _ := strings.Cut(out, "\n")
+	commit, err := runGit(work, "commit-tree", tree, "-p", parent, "-m", "after the restore")
+	if err != nil {
+		return err
+	}
+	if _, err := runGit(work, "push", "--quiet", repo, commit+":refs/heads/main"); err != nil {
+		return err
+	}
+	if head, err := runGit(repo, "rev-parse", "refs/heads/main"); err != nil || head != commit {
+		return fmt.Errorf("main is %s after the push of %s (%v)", head, commit, err)
+	}
+	return nil
 }

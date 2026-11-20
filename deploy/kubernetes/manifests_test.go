@@ -83,14 +83,20 @@ type envSource struct {
 }
 
 type container struct {
-	Image          string          `yaml:"image"`
-	Command        []string        `yaml:"command"`
-	Args           []string        `yaml:"args"`
-	Ports          []containerPort `yaml:"ports"`
-	EnvFrom        []envSource     `yaml:"envFrom"`
-	VolumeMounts   []mount         `yaml:"volumeMounts"`
-	LivenessProbe  probe           `yaml:"livenessProbe"`
-	ReadinessProbe probe           `yaml:"readinessProbe"`
+	Name            string          `yaml:"name"`
+	Image           string          `yaml:"image"`
+	Command         []string        `yaml:"command"`
+	Args            []string        `yaml:"args"`
+	Ports           []containerPort `yaml:"ports"`
+	EnvFrom         []envSource     `yaml:"envFrom"`
+	VolumeMounts    []mount         `yaml:"volumeMounts"`
+	StartupProbe    probe           `yaml:"startupProbe"`
+	LivenessProbe   probe           `yaml:"livenessProbe"`
+	ReadinessProbe  probe           `yaml:"readinessProbe"`
+	SecurityContext struct {
+		RunAsUser    *int  `yaml:"runAsUser"`
+		RunAsNonRoot *bool `yaml:"runAsNonRoot"`
+	} `yaml:"securityContext"`
 }
 
 // resolve returns the number p names among the container's ports, or 0.
@@ -126,8 +132,9 @@ type deployment struct {
 					RunAsNonRoot *bool `yaml:"runAsNonRoot"`
 					FSGroup      *int  `yaml:"fsGroup"`
 				} `yaml:"securityContext"`
-				Containers []container `yaml:"containers"`
-				Volumes    []struct {
+				InitContainers []container `yaml:"initContainers"`
+				Containers     []container `yaml:"containers"`
+				Volumes        []struct {
 					Name                  string `yaml:"name"`
 					PersistentVolumeClaim *struct {
 						ClaimName string `yaml:"claimName"`
@@ -286,6 +293,30 @@ func TestDeployment_MountsTheClaimAndTheConfigFileAndRunsAsUser10001(t *testing.
 	if sc.FSGroup == nil || *sc.FSGroup != 10001 {
 		t.Errorf("fsGroup = %v, want 10001", sc.FSGroup)
 	}
+
+	// The config file's mount would otherwise make the runtime create the
+	// config dir, as root, on an empty volume, where the hub could not
+	// write its admin token file.
+	if len(pod.InitContainers) != 1 {
+		t.Fatalf("the Deployment has %d init containers, want 1 that creates the config dir", len(pod.InitContainers))
+	}
+	ic := pod.InitContainers[0]
+	if ic.Image != c.Image {
+		t.Errorf("the init container's image = %q, want the hub's %q", ic.Image, c.Image)
+	}
+	if u := ic.SecurityContext.RunAsUser; u != nil && *u != *sc.RunAsUser {
+		t.Errorf("the init container runs as user %d, want the pod's user %d", *u, *sc.RunAsUser)
+	}
+	if nr := ic.SecurityContext.RunAsNonRoot; nr != nil && !*nr {
+		t.Errorf("the init container sets runAsNonRoot false, want it to run as the pod's non-root user")
+	}
+	if !slices.Contains(ic.VolumeMounts, mount{Name: data, MountPath: "/var/lib/parley"}) {
+		t.Errorf("the init container's volumeMounts %+v do not mount the claim at /var/lib/parley", ic.VolumeMounts)
+	}
+	if ic.Args != nil || len(ic.Command) == 0 || ic.Command[0] != "mkdir" || !slices.Contains(ic.Command, "-p") ||
+		!slices.Contains(ic.Command, "/var/lib/parley/config") {
+		t.Errorf("the init container's command = %q, args = %q; want mkdir -p of /var/lib/parley/config and no args", ic.Command, ic.Args)
+	}
 }
 
 func TestConfigMap_LoadsWithTheExampleSecretAsTheEnvironment(t *testing.T) {
@@ -351,6 +382,7 @@ func TestDeploymentAndService_ServeAndProbePort8080(t *testing.T) {
 		name, path string
 		probe      probe
 	}{
+		{"startupProbe", "/healthz", c.StartupProbe},
 		{"livenessProbe", "/healthz", c.LivenessProbe},
 		{"readinessProbe", "/readyz", c.ReadinessProbe},
 	} {

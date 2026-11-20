@@ -65,8 +65,11 @@ past its deadline (10 minutes; 60 for a capacity scenario). The detail of an
 `error` names the method, the path, the status and the `error_type` of the
 first failing request, or says `deadline exceeded`. For a capacity scenario
 the hub's refusal of a creation is the expected stop: the count reached is
-the measurement, and the detail begins `refused with <status>
-<error_type>`. A scenario that ends in `error` does not stop the run.
+the measurement, and the detail says `refused with <status> <error_type>
+after <count>`, then the method, the path and the hub's message;
+`active_forks`, which fills each workspace in turn, writes one
+`<workspace> refused with <status> <error_type> after <count>` per
+workspace that refused, separated by `; `. A scenario that ends in `error` does not stop the run.
 
 The default limits (200 forks per workspace, 20 sandboxes per user) are
 below two capacity targets: list enough workspaces or raise the limits, and

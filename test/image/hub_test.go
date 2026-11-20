@@ -133,7 +133,7 @@ func startHub(t *testing.T, engine, ref, vol string) (id, base string) {
 // get answers the body of a GET of url that answers 200.
 func get(t *testing.T, url string) string {
 	t.Helper()
-	resp, err := http.Get(url)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}

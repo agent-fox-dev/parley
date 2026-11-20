@@ -383,6 +383,9 @@ func (s *stub) createCommit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The delay counts from when the answer left, so that no event comes
+	// sooner than eventDelay after the harness had its commit's answer.
+	w.(http.Flusher).Flush()
 	time.AfterFunc(s.opts.eventDelay, func() { s.publish(slug, sha) })
 }
 

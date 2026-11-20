@@ -301,8 +301,9 @@ A request may send its own `X-Request-ID`. When it is a UUID in the
 of any version and in either letter case, the hub uses it as the request's id
 and returns it exactly as received. Otherwise, or when the header is absent,
 the hub generates a random (version 4) UUID in lower case and returns that.
-The id is in the hub's log line for the request, and in every line the hub
-logs while it handles the request, so quote it when reporting a problem.
+The id is in the hub's log line for the request, and in every line logged
+with the request's context while it is handled, so quote it when reporting
+a problem.
 
 `Cache-Control` is set once per response:
 

@@ -130,6 +130,16 @@ func run(t *testing.T, engine string, args ...string) result {
 
 func runFor(t *testing.T, limit time.Duration, engine string, args ...string) result {
 	t.Helper()
+	r, err := runCommand(limit, engine, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// runCommand runs the engine with args, up to limit, and returns an error
+// only when the command cannot run at all.
+func runCommand(limit time.Duration, engine string, args ...string) (result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, engine, args...)
@@ -138,9 +148,9 @@ func runFor(t *testing.T, limit time.Duration, engine string, args ...string) re
 	err := cmd.Run()
 	var exit *exec.ExitError
 	if err != nil && !errors.As(err, &exit) {
-		t.Fatalf("%s %s: %v", engine, strings.Join(args, " "), err)
+		return result{}, fmt.Errorf("%s %s: %w", engine, strings.Join(args, " "), err)
 	}
-	return result{stdout: stdout.String(), stderr: stderr.String(), code: cmd.ProcessState.ExitCode()}
+	return result{stdout: stdout.String(), stderr: stderr.String(), code: cmd.ProcessState.ExitCode()}, nil
 }
 
 // must runs the engine with args and returns its trimmed output; it fails t
@@ -170,7 +180,9 @@ type build struct {
 // buildImage builds the image of dockerfile, a path from the repository
 // root, with the repository root as its context and the run's build values,
 // once per test run, and returns its reference. The image is removed after
-// the tests.
+// the tests. A build that failed fails every test that asks for the image:
+// nothing inside the build may end the first test that asked, which would
+// leave the others with no reference and no error.
 func buildImage(t *testing.T, engine, dockerfile, name string) string {
 	t.Helper()
 	buildsMu.Lock()
@@ -188,12 +200,16 @@ func buildImage(t *testing.T, engine, dockerfile, name string) string {
 		}
 		ref := fmt.Sprintf("%s:test-%d", name, os.Getpid())
 		start := time.Now()
-		r := runFor(t, buildLimit, engine, "build",
+		r, err := runCommand(buildLimit, engine, "build",
 			"-f", filepath.Join(root, dockerfile),
 			"--build-arg", "VERSION="+buildVersion,
 			"--build-arg", "COMMIT="+buildCommit,
 			"--build-arg", "BUILD_TIME="+buildTime,
 			"-t", ref, root)
+		if err != nil {
+			b.err = err
+			return
+		}
 		if r.code != 0 {
 			b.err = fmt.Errorf("%s build -f %s: exit code %d\n%s", engine, dockerfile, r.code, tail(r.stdout+r.stderr, 40))
 			return

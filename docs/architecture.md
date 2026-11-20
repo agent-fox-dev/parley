@@ -707,8 +707,12 @@ the first failure:
    permission bits and symbolic links; the `objects` directory of each git
    directory (one that holds a `HEAD` file) is copied after the rest of the
    tree, so its refs, `packed-refs` and `HEAD` are read before its objects
-   and every copied ref points at a copied object. A file, symbolic link or
-   directory removed after its directory was listed and before it is copied
+   and every copied ref points at a copied object. A regular file whose name
+   ends in `.lock` is left out: git holds one only while it writes the file
+   beside it, and a lock left in a restored repository would refuse every
+   later write of that file (a ref, `packed-refs`, `config`). A file,
+   symbolic link or directory removed after its directory was listed and
+   before it is copied
    (git creates and removes lock and temporary files while a hub runs) is
    left out, as if the snapshot were taken after its removal; any other
    error of the copy fails the backup.
@@ -7978,9 +7982,15 @@ with `envFrom`; a PersistentVolumeClaim `parley-data` (`ReadWriteOnce`,
 strategy `Recreate`, so that an update stops the old hub before the new one
 opens the same data, the claim at `/var/lib/parley`, the ConfigMap's
 `config.toml` mounted by `subPath` at `/var/lib/parley/config/config.toml`
-(the config dir stays on the volume and writable), `runAsUser` and
-`fsGroup` 10001 with `runAsNonRoot`, liveness on `/healthz` and readiness on
-`/readyz` at port 8080 and `terminationGracePeriodSeconds` 40, above the
-hub's 30-second stop; and a ClusterIP Service `parley` on port 8080. The
+(the config dir stays on the volume and writable), an init container
+`data-dirs` of the same image that runs `mkdir -p /var/lib/parley/config
+/var/lib/parley/data` as the pod's user on the claim first (on an empty
+volume the runtime would otherwise create the config dir, the mount's
+parent, as root, and the hub could not write its admin token file there),
+`runAsUser` and `fsGroup` 10001 with `runAsNonRoot`, a startup probe on
+`/healthz` (every 5 seconds, up to 60 failures, so a first start that
+applies every schema step is not ended by the liveness probe), liveness on
+`/healthz` and readiness on `/readyz` at port 8080 and
+`terminationGracePeriodSeconds` 40, above the hub's 30-second stop; and a ClusterIP Service `parley` on port 8080. The
 Deployment runs `parleyd` with no flags: how an operator bootstraps the
 admin token on the volume is not part of the manifests.

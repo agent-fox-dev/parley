@@ -77,7 +77,7 @@ entries:
 |---|---|
 | the database file's own name (`parley.db` by default) | a copy of the transactional store |
 | `analytics.db` | a copy of the analytical store |
-| the workspace root's own name (`workspaces` by default) | a copy of every file, directory and symbolic link under the workspace root, with the same relative paths |
+| the workspace root's own name (`workspaces` by default) | a copy of every file, directory and symbolic link under the workspace root but files whose name ends in `.lock`, with the same relative paths |
 
 Each store is copied first, as one read of the engine (SQLite's
 `VACUUM INTO`): the copy holds every transaction committed before the copy
@@ -85,7 +85,9 @@ began, each with all of its rows, while the hub goes on committing, and it
 is a single database file without a write-ahead log. The workspace root is
 copied next; within each git repository the refs, `packed-refs` and `HEAD`
 are copied before the objects, so every copied ref points at a copied
-object.
+object. Files whose name ends in `.lock` (git's locks of a write in
+progress) are left out, so a repository restored from the snapshot takes
+pushes.
 
 The command only reads the hub's data: it binds no listener, runs no
 bootstrap, start work or maintenance task, applies no schema step and

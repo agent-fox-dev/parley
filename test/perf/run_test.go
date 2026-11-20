@@ -71,28 +71,38 @@ func readReport(t *testing.T, path, token string) reportDoc {
 
 func TestRun_FailsWithoutRunningAScenarioWhenTheHubDoesNotAnswerVersion(t *testing.T) {
 	t.Parallel()
-	t.Run("answered 503", func(t *testing.T) {
-		t.Parallel()
-		s := newStub(t, map[string]http.HandlerFunc{"GET /version": failWith(503, "unavailable", "starting")})
-		_, err := perf.Run(t.Context(), s.config(t))
-		if err == nil || !strings.Contains(err.Error(), s.URL) || strings.Contains(err.Error(), stubToken) {
-			t.Errorf("err = %v, want one naming %s without the token", err, s.URL)
-		}
-		if got := s.requests(); !slices.Equal(got, []string{"GET /version"}) {
-			t.Errorf("the stub was sent %q, want GET /version alone", got)
-		}
-	})
-	t.Run("not answered", func(t *testing.T) {
-		t.Parallel()
-		closed := httptest.NewServer(http.NotFoundHandler())
-		closed.Close()
-		cfg := perf.Config{URL: closed.URL, Token: stubToken, Workspaces: []string{"w"},
-			ReportPath: filepath.Join(t.TempDir(), "report.json")}
-		_, err := perf.Run(t.Context(), cfg)
-		if err == nil || !strings.Contains(err.Error(), closed.URL) || strings.Contains(err.Error(), stubToken) {
-			t.Errorf("err = %v, want one naming %s without the token", err, closed.URL)
-		}
-	})
+	for _, tc := range []struct {
+		name string
+		// arrange returns the hub's URL and, when the test can see them,
+		// the requests it was sent.
+		arrange func(t *testing.T) (url string, requests func() []string)
+	}{
+		{"answered 503", func(t *testing.T) (string, func() []string) {
+			s := newStub(t, map[string]http.HandlerFunc{"GET /version": failWith(503, "unavailable", "starting")})
+			return s.URL, s.requests
+		}},
+		{"not answered", func(t *testing.T) (string, func() []string) {
+			closed := httptest.NewServer(http.NotFoundHandler())
+			closed.Close()
+			return closed.URL, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			url, requests := tc.arrange(t)
+			cfg := perf.Config{URL: url, Token: stubToken, Workspaces: []string{"w"},
+				ReportPath: filepath.Join(t.TempDir(), "report.json")}
+			_, err := perf.Run(t.Context(), cfg)
+			if err == nil || !strings.Contains(err.Error(), url) || strings.Contains(err.Error(), stubToken) {
+				t.Errorf("err = %v, want one naming %s without the token", err, url)
+			}
+			if requests != nil {
+				if got := requests(); !slices.Equal(got, []string{"GET /version"}) {
+					t.Errorf("the hub was sent %q, want GET /version alone", got)
+				}
+			}
+		})
+	}
 }
 
 func TestRun_FailsNamingAReportPathItCannotWrite(t *testing.T) {
@@ -132,26 +142,47 @@ func TestRun_SkipsTheScenariosWhoseVariableIsUnset(t *testing.T) {
 	}
 }
 
-func TestRun_EndsAScenarioWhoseRequestFailsInErrorAndGoesOn(t *testing.T) {
+func TestRun_EndsAScenarioTheHubFailsInErrorAndGoesOn(t *testing.T) {
 	t.Parallel()
-	s := newStub(t, map[string]http.HandlerFunc{
-		"POST /api/v1/workspaces/{slug}/forks": failWith(500, "internal", "internal error"),
-	})
-	rep, err := perf.Run(t.Context(), s.config(t))
-	if err != nil {
-		t.Fatalf("Run = %v, want no error", err)
+	const exec = "POST /api/v1/workspaces/{slug}/sandboxes/{id}/exec"
+	execAnswers := func(answer map[string]any) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, answer) }
 	}
-	r := result(t, rep, "fork_create")
-	if r.Status != perf.Error || r.Measured != nil {
-		t.Errorf("fork_create = %+v, want error with no measurement", r)
-	}
-	for _, part := range []string{"POST", "/workspaces/w/forks", "500", "internal"} {
-		if !strings.Contains(r.Detail, part) {
-			t.Errorf("fork_create's detail %q does not hold %q", r.Detail, part)
-		}
-	}
-	if len(rep.Results) != len(scenarioNames) || result(t, rep, "file_read").Status == "" {
-		t.Errorf("results = %+v, want all %d, file_read's with a status", rep.Results, len(scenarioNames))
+	for _, tc := range []struct {
+		name, scenario, route string
+		handler               http.HandlerFunc
+		// parts are what the scenario's detail holds.
+		parts []string
+	}{
+		{"a request answered 500", "fork_create", "POST /api/v1/workspaces/{slug}/forks",
+			failWith(500, "internal", "internal error"), []string{"POST", "/workspaces/w/forks", "500", "internal"}},
+		{"true exits with 3", "sandbox_exec", exec,
+			execAnswers(map[string]any{"exit_code": 3, "stdout": "", "stderr": ""}), []string{"exit code 3"}},
+		{"an answer with no exit code", "sandbox_exec", exec,
+			execAnswers(map[string]any{"stdout": "", "stderr": ""}), []string{"exit code none"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStub(t, map[string]http.HandlerFunc{tc.route: tc.handler})
+			cfg := s.config(t)
+			cfg.SandboxProfile = "agent"
+			rep, err := perf.Run(t.Context(), cfg)
+			if err != nil {
+				t.Fatalf("Run = %v, want no error", err)
+			}
+			r := result(t, rep, tc.scenario)
+			if r.Status != perf.Error || r.Measured != nil {
+				t.Errorf("%s = %+v, want error with no measurement", tc.scenario, r)
+			}
+			for _, part := range tc.parts {
+				if !strings.Contains(r.Detail, part) {
+					t.Errorf("%s's detail %q does not hold %q", tc.scenario, r.Detail, part)
+				}
+			}
+			if len(rep.Results) != len(scenarioNames) || result(t, rep, "file_read").Status == "" {
+				t.Errorf("results = %+v, want all %d, file_read's with a status", rep.Results, len(scenarioNames))
+			}
+		})
 	}
 }
 
@@ -206,9 +237,6 @@ func TestRun_WritesTheReport(t *testing.T) {
 	if !slices.Equal(names, scenarioNames) {
 		t.Errorf("results = %q, want %q", names, scenarioNames)
 	}
-	if fr := result(t, rep, "file_read"); fr.Status != perf.Error || !strings.Contains(fr.Detail, "500") {
-		t.Errorf("file_read = %+v, want error naming 500", fr)
-	}
 	var want map[string]any
 	_ = json.Unmarshal([]byte(stubVersion), &want)
 	if doc.Hub.URL != s.URL || !reflect.DeepEqual(doc.Hub.Version, want) {
@@ -258,9 +286,11 @@ func TestRun_MeasuresARealHubAndPasses(t *testing.T) {
 	if len(doc.Results) != len(scenarioNames) {
 		t.Fatalf("the report has %d results, want %d", len(doc.Results), len(scenarioNames))
 	}
+	// None is met: a scenario that measures sends the token first, and the
+	// hub refuses it.
 	for i, r := range doc.Results {
-		if r.Name != scenarioNames[i] || !slices.Contains([]string{"met", "missed", "skipped", "error"}, r.Status) {
-			t.Errorf("result %d = %s %s, want %s with one of the four statuses", i, r.Name, r.Status, scenarioNames[i])
+		if r.Name != scenarioNames[i] || !slices.Contains([]string{"missed", "skipped", "error"}, r.Status) {
+			t.Errorf("result %d = %s %s, want %s missed, skipped or in error, not met", i, r.Name, r.Status, scenarioNames[i])
 		}
 	}
 	// The hub knows no such token, so it refuses the first request of a

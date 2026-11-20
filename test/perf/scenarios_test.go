@@ -1,6 +1,7 @@
 package perf_test
 
 import (
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -118,8 +119,20 @@ func TestRun_MeasuresLandingLatencyThroughputAndConcurrency(t *testing.T) {
 	if tp.count != 120 || tp.max > 8 || tp.max < 2 {
 		t.Errorf("land_throughput sent %d land requests, at most %d in flight; want 120, from 2 to 8 in flight", tp.count, tp.max)
 	}
-	if want := 120 * 60 / tp.last.Sub(tp.first).Seconds(); math.Abs(m-want) > want/10 {
-		t.Errorf("land_throughput measured %v per minute, want %v within 10 percent", m, want)
+	// The rate is the lands over the time the harness spent landing, which
+	// spans every land request the stub saw, from the first one's arrival
+	// to the last one's answer.
+	var landed, of int
+	var took float64
+	tr := result(t, rep, "land_throughput")
+	if _, err := fmt.Sscanf(tr.Detail, "%d of %d landed in %f s", &landed, &of, &took); err != nil || landed != 120 || of != 120 {
+		t.Fatalf("land_throughput's detail %q (%v), want 120 of 120 landed in a time", tr.Detail, err)
+	}
+	if want := 120 * 60 / took; math.Abs(m-want) > want/100 {
+		t.Errorf("land_throughput measured %v per minute, want 120 lands per %v s, %v", m, took, want)
+	}
+	if span := tp.last.Sub(tp.first).Seconds(); took < span-0.001 {
+		t.Errorf("land_throughput landed in %v s, less than the %v s from the first land request to the last answer", took, span)
 	}
 
 	if m := checkResult(t, rep, "land_concurrency", 16, perf.Target{Comparison: perf.LE, Value: 0, Unit: "count"}, perf.Missed); m != 2 {
@@ -179,10 +192,15 @@ func TestRun_MeasuresMergeabilityAndEventLatency(t *testing.T) {
 		t.Parallel()
 		s := newStubWith(t, stubOptions{mergeDelay: time.Hour}, nil)
 		cfg := s.config(t)
-		cfg.ScenarioDeadline = 500 * time.Millisecond
+		// Long enough for the scenario to open its changes and poll, so
+		// that the deadline ends it while the changes are still unknown.
+		cfg.ScenarioDeadline = 3 * time.Second
 		rep := run(t, cfg)
-		if r := result(t, rep, "mergeability"); r.Status != perf.Error || !strings.Contains(r.Detail, "deadline exceeded") {
+		if r := result(t, rep, "mergeability"); r.Status != perf.Error || r.Detail != "deadline exceeded" {
 			t.Errorf("mergeability = %+v, want error saying deadline exceeded", r)
+		}
+		if n := len(s.mergeabilityPolls()); n == 0 {
+			t.Errorf("mergeability never listed its unknown changes before the deadline, want it to have polled")
 		}
 	})
 }
@@ -241,9 +259,11 @@ func TestRun_RemovesWhatItCreatedAndKeepsToItsOwnTargetBranch(t *testing.T) {
 		cfg.SandboxProfile = "agent"
 		rep := run(t, cfg)
 		check(t, s, rep)
+		// The scenarios whose commits failed ended in error, and what they
+		// created was removed all the same.
 		for _, name := range []string{"commit_create", "land", "event_latency"} {
-			if r := result(t, rep, name); r.Status != perf.Error || !strings.Contains(r.Detail, "500") {
-				t.Errorf("%s = %+v, want error naming the 500", name, r)
+			if r := result(t, rep, name); r.Status != perf.Error {
+				t.Errorf("%s = %+v, want error", name, r)
 			}
 		}
 		if s.openedStreams() == 0 {

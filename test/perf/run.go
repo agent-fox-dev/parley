@@ -14,9 +14,6 @@ import (
 // versionWait bounds the GET /version that begins a run.
 const versionWait = 10 * time.Second
 
-// notMeasured is the detail of a scenario the harness has no body for.
-const notMeasured = "not measured: the harness does not run this scenario yet"
-
 // Run measures the targets of the hub cfg names and writes the report to
 // cfg.ReportPath. It fails before any scenario when cfg lacks the URL, the
 // token or a workspace, or when the hub does not answer GET /version with
@@ -87,10 +84,6 @@ func runScenario(ctx context.Context, sc scenario, e *env) (Result, []string) {
 	res := Result{Name: sc.name, Target: sc.target, Status: Error}
 	if v := unsetNeed(sc, e.cfg); v != "" {
 		res.Status, res.Detail = Skipped, v
-		return res, nil
-	}
-	if sc.body == nil {
-		res.Detail = notMeasured
 		return res, nil
 	}
 	deadline := e.cfg.ScenarioDeadline

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -16,10 +15,6 @@ import (
 
 const sandboxDockerfile = "containers/sandbox/Dockerfile"
 
-// objectID is the output of git rev-parse HEAD in a repository of SHA-1
-// object names.
-var objectID = regexp.MustCompile(`^[0-9a-f]{40}$`)
-
 func TestSandboxImage_SatisfiesTheImageContract(t *testing.T) {
 	engine := engineFor(t)
 	t.Parallel()
@@ -27,12 +22,6 @@ func TestSandboxImage_SatisfiesTheImageContract(t *testing.T) {
 
 	t.Run("the reference image", func(t *testing.T) {
 		t.Parallel()
-		r := run(t, engine, "run", "--rm", ref, "sh", "-c",
-			`cd "$(mktemp -d)" && git init -q . && echo x > f && git add f && git -c user.name=t -c user.email=t@x commit -q -m m && git rev-parse HEAD`)
-		lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
-		if r.code != 0 || !objectID.MatchString(lines[len(lines)-1]) {
-			t.Errorf("git init, commit and rev-parse HEAD: exit code %d, output %q; want 0 and an object id\n%s", r.code, r.stdout, r.stderr)
-		}
 		if err := image.CheckContract(engine, ref); err != nil {
 			t.Errorf("CheckContract(%s) = %v, want nil", ref, err)
 		}

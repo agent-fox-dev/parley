@@ -433,6 +433,50 @@ func TestRun_CopiesTheWorkspaceRootSoThatGitReadsEveryRepository(t *testing.T) {
 	}
 }
 
+func TestRun_LeavesGitLockFilesOutOfTheSnapshotSoThatTheCopyTakesPushes(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Fatalf("git is needed: %v", err)
+	}
+	d := startDataHub(t).stopped(t)
+	repo := filepath.Join(d.workspaceRoot(), "acme", "r.git")
+	bareRepo(t, repo)
+	head := git(t, repo, "rev-parse", "refs/heads/main")
+	// The lock files of writes in progress, as a push in flight leaves
+	// them while the backup walks the repository.
+	for _, name := range []string{"refs/heads/main.lock", "packed-refs.lock", "config.lock"} {
+		writeFile(t, filepath.Join(repo, name), head+"\n")
+	}
+
+	target := filepath.Join(t.TempDir(), "snapshot")
+	if res := d.backup(t, target); res.code != 0 {
+		t.Fatalf("backup returned %d; stderr = %q", res.code, res.stderr)
+	}
+
+	var locks []string
+	for path := range tree(t, target) {
+		if strings.HasSuffix(path, ".lock") {
+			locks = append(locks, path)
+		}
+	}
+	if len(locks) != 0 {
+		t.Errorf("the snapshot holds the lock files %v, want none", locks)
+	}
+	restored := filepath.Join(t.TempDir(), "r.git")
+	if err := os.CopyFS(restored, os.DirFS(filepath.Join(target, "workspaces", "acme", "r.git"))); err != nil {
+		t.Fatal(err)
+	}
+	clone := t.TempDir()
+	git(t, clone, "clone", "--quiet", restored, ".")
+	writeFile(t, filepath.Join(clone, "file"), "three")
+	git(t, clone, "commit", "--quiet", "-am", "three")
+	pushed := git(t, clone, "rev-parse", "HEAD")
+	git(t, clone, "push", "--quiet", "origin", "main")
+	if got := git(t, restored, "rev-parse", "refs/heads/main"); got != pushed {
+		t.Errorf("the restored repository's main is %s after the push, want %s", got, pushed)
+	}
+}
+
 func TestRun_FailsTheBackupWithOneLineAndRemovesWhatItWrote(t *testing.T) {
 	t.Parallel()
 	type arrangement struct {
@@ -517,16 +561,16 @@ func TestCopyTree_LeavesOutWhatIsRemovedWhileItCopies(t *testing.T) {
 			t.Parallel()
 			src := filepath.Join(t.TempDir(), "src")
 			writeFile(t, filepath.Join(src, "a", "file"), "a")
-			tc.create(t, filepath.Join(src, "b.lock"))
+			tc.create(t, filepath.Join(src, "b.tmp"))
 			writeFile(t, filepath.Join(src, "kept"), "kept")
 			dst := filepath.Join(t.TempDir(), "dst")
 
-			// The walk has listed src when it reaches a: b.lock is removed
+			// The walk has listed src when it reaches a: b.tmp is removed
 			// after it was listed and before it is copied, as git removes
-			// a lock file while a running hub is backed up.
+			// a temporary file while a running hub is backed up.
 			err := hub.CopyTree(src, dst, func(path string) bool {
 				if filepath.Base(path) == "a" {
-					if err := os.RemoveAll(filepath.Join(src, "b.lock")); err != nil {
+					if err := os.RemoveAll(filepath.Join(src, "b.tmp")); err != nil {
 						t.Error(err)
 					}
 				}

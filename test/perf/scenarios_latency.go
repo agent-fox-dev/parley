@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -165,7 +166,11 @@ func sandboxExec(ctx context.Context, e *env) (outcome, error) {
 			return outcome{}, err
 		}
 		if ans.ExitCode == nil || *ans.ExitCode != 0 {
-			return outcome{}, fmt.Errorf("true in sandbox %s did not exit with 0: exit code %v", id, ans.ExitCode)
+			code := "none"
+			if ans.ExitCode != nil {
+				code = strconv.Itoa(*ans.ExitCode)
+			}
+			return outcome{}, fmt.Errorf("true in sandbox %s did not exit with 0: exit code %s", id, code)
 		}
 		samples = append(samples, ms(resp.duration))
 	}

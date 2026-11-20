@@ -157,99 +157,6 @@ func TestLifecycle_FirstBootHandsOutTheAdminTokenThenServesAndStopsOnSIGTERM(t *
 	}
 }
 
-func TestLifecycle_BacksUpARunningHubAndAHubStartsOnTheSnapshot(t *testing.T) {
-	parallel(t)
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Fatalf("git is needed: %v", err)
-	}
-	dir := t.TempDir()
-	writeConfig(t, dir, "[server]\nbind = \"127.0.0.1\"\nport = 0\n")
-	env := config.MapEnv(nil)
-	tableA := store.Step{Name: "test_a", Target: store.Main, Apply: func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, "CREATE TABLE a (txn INTEGER NOT NULL, n INTEGER NOT NULL)")
-		return err
-	}}
-	var applied atomic.Int32
-	compose := func(rt **hub.Runtime) func(*hub.Composition) {
-		return func(c *hub.Composition) {
-			*rt = c.Runtime()
-			step := tableA
-			step.Apply = func(ctx context.Context, tx *sql.Tx) error {
-				applied.Add(1)
-				return tableA.Apply(ctx, tx)
-			}
-			c.AddSchemaStep(step)
-		}
-	}
-
-	var rt1 *hub.Runtime
-	hub1 := hubtest.Serve(t, hub.Options{WorkDir: dir, Env: env, Compose: compose(&rt1)})
-	commit := func(txn int) error {
-		return rt1.Store.Tx(context.Background(), func(tx *sql.Tx) error {
-			for n := range 10 {
-				if _, err := tx.Exec("INSERT INTO a (txn, n) VALUES (?, ?)", txn, n); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	}
-	for txn := range 10 {
-		if err := commit(txn); err != nil {
-			t.Fatalf("commit before the backup: %v", err)
-		}
-	}
-	bareRepo(t, filepath.Join(dir, "data", "workspaces", "r.git"))
-	stopWriter := keepCommitting(10, commit)
-
-	target := filepath.Join(t.TempDir(), "snapshot")
-	var out, errb hubtest.LogBuffer
-	code := hub.Run(context.Background(), hub.Options{
-		Args: []string{"backup", target}, Env: env, WorkDir: dir, Stdout: &out, Stderr: &errb,
-		Compose: compose(new(*hub.Runtime)),
-	})
-	if code != 0 {
-		t.Fatalf("parleyd backup returned %d, want 0; stderr = %q", code, errb.String())
-	}
-	if got := status(t, hub1.URL("/readyz")); got != http.StatusOK {
-		t.Errorf("GET /readyz of the running hub = %d after the backup, want 200", got)
-	}
-	if err := stopWriter(); err != nil {
-		t.Errorf("the writer failed during the backup: %v", err)
-	}
-	for _, name := range []string{"parley.db", "analytics.db", "workspaces"} {
-		if _, err := os.Stat(filepath.Join(target, name)); err != nil {
-			t.Errorf("the snapshot lacks %s: %v", name, err)
-		}
-	}
-
-	dir2 := t.TempDir()
-	writeConfig(t, dir2, "[server]\nbind = \"127.0.0.1\"\nport = 0\n\n[database]\npath = \""+
-		filepath.Join(target, "parley.db")+"\"\n\n[workspace]\npath = \""+filepath.Join(target, "workspaces")+"\"\n")
-	appliedBefore := applied.Load()
-	hub2 := hubtest.Serve(t, hub.Options{WorkDir: dir2, Env: env, Compose: compose(new(*hub.Runtime))})
-	if got := status(t, hub2.URL("/readyz")); got != http.StatusOK {
-		t.Errorf("GET /readyz of the hub on the snapshot = %d, want 200", got)
-	}
-	if applied.Load() != appliedBefore {
-		t.Errorf("the hub on the snapshot applied a schema step")
-	}
-	hub2.Stop()
-	if code := hub2.ExitCode(t, 5*time.Second); code != 0 {
-		t.Errorf("the hub on the snapshot returned %d after a stop, want 0", code)
-	}
-
-	if n := countRows(t, filepath.Join(target, "parley.db"), "a"); n%10 != 0 || n < 100 {
-		t.Errorf("the snapshot holds %d rows, want a multiple of 10 and at least 100", n)
-	}
-	git(t, filepath.Join(target, "workspaces", "r.git"), "fsck", "--no-progress")
-
-	hub1.Stop()
-	if code := hub1.ExitCode(t, 5*time.Second); code != 0 {
-		t.Errorf("the first hub returned %d after a stop, want 0", code)
-	}
-}
-
 // checkTokenFile checks the admin token file at path, written by the hub
 // whose data directory is dataDir: mode 0600 and a content whose SHA-256 is
 // the stored hash. It returns the token.
@@ -297,31 +204,6 @@ func bareRepo(t *testing.T, path string) {
 		git(t, clone, "commit", "--quiet", "-m", msg)
 	}
 	git(t, clone, "push", "--quiet", path, "main")
-}
-
-// keepCommitting calls commit with first, first+1, ... in a goroutine until
-// the returned function is called, which returns the first error of commit.
-func keepCommitting(first int, commit func(txn int) error) (stop func() error) {
-	done := make(chan struct{})
-	result := make(chan error, 1)
-	go func() {
-		for txn := first; ; txn++ {
-			select {
-			case <-done:
-				result <- nil
-				return
-			default:
-			}
-			if err := commit(txn); err != nil {
-				result <- err
-				return
-			}
-		}
-	}()
-	return func() error {
-		close(done)
-		return <-result
-	}
 }
 
 // countRows counts the rows of table in the store file at path, opened
