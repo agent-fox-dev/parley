@@ -22,7 +22,8 @@ import (
 // and walks their history as git merge-base and rev-list do, for the
 // questions the hub asks of a repository thousands of times, each of which
 // would otherwise start a git process: IsAncestor, MergeBase,
-// CommitsBetween, ReadCommits and the commits a rebase replays. Like the
+// CommitsBetween, ReadCommits, the commits a rebase replays and the zones
+// of their authors' times (readAuthorZones in rebase.go). Like the
 // readers of objectfile.go and refsfile.go, its ok is false for what it does
 // not read the way git does, and its caller asks git then: an object it does
 // not find in the repository's object store or its alternates, a pack index

@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -341,12 +343,24 @@ func TestCreateCommit_WritesTheCommitAsGiven(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			id, err := f.repo.CreateCommit(context.Background(), c.spec)
+			var checks atomic.Int32
+			repo, err := gitrepo.Git{Trace: func(args []string) {
+				if slices.Contains(args, "cat-file") {
+					checks.Add(1)
+				}
+			}}.Open(context.Background(), f.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := repo.CreateCommit(context.Background(), c.spec)
 			if err != nil {
 				t.Fatalf("CreateCommit: %v", err)
 			}
 			if got := gitrepotest.Git(t, f.dir, "cat-file", "commit", id) + "\n"; got != c.want {
 				t.Errorf("commit %s is\n%s\nwant\n%s", id, got, c.want)
+			}
+			if n := checks.Load(); n != 0 {
+				t.Errorf("CreateCommit ran git cat-file %d times, want none: it reads the types of its tree and parents itself", n)
 			}
 		})
 	}

@@ -508,9 +508,11 @@ func (r *Repo) CreateCommit(ctx context.Context, spec CommitSpec) (string, error
 			return "", fmt.Errorf("object %q: %w", id, ErrNotFound)
 		}
 	}
-	types, err := r.batchCheck(ctx, "%(objecttype)", names)
-	if err != nil {
-		return "", err
+	types, ok := readObjectTypes(r.dir, names)
+	if !ok {
+		if types, err = r.batchCheck(ctx, "%(objecttype)", names); err != nil {
+			return "", err
+		}
 	}
 	if len(types) != len(names) {
 		return "", fmt.Errorf("cat-file answered %q", types)
