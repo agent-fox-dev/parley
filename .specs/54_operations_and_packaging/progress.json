@@ -3,11 +3,11 @@
   "spec_id": "54",
   "spec_name": "operations_and_packaging",
   "schema_version": 3,
-  "updated_at": "",
+  "updated_at": "2026-11-20T00:23:40Z",
   "tasks": [
     {
       "id": 1,
-      "state": "pending"
+      "state": "done"
     },
     {
       "id": 2,
