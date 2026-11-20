@@ -1,0 +1,305 @@
+{
+  "$schema": "https://agent-fox.dev/schemas/requirements.v3.json",
+  "spec_id": "58",
+  "spec_name": "scm_file_outline",
+  "schema_version": 3,
+  "requirements": [
+    {
+      "id": "REQ-1",
+      "title": "Outline a file at a ref",
+      "rationale": "Knowing what a file declares, and where, is what an agent reads first; it should cost one request and no clone.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-1.1",
+          "pattern": "event_driven",
+          "condition": "a caller requests GET /workspaces/:slug/scm/outline with the path of a source file in a supported language",
+          "action": "answer with the file's declarations in line order, each with its kind, name, container, signature, whether it is exported, and its first and last line, and with the commit the ref resolved to",
+          "contract": "HTTP 200 with {\"path\", \"resolved_sha\", \"language\", \"supported\": true, \"declarations\": [{\"kind\", \"name\", \"container\", \"signature\", \"exported\", \"start_line\", \"end_line\"}]}; kind is one of func, method, type, class, interface, enum, trait, const, var, module, macro; lines are 1-based; declarations is [] for a file that declares nothing, never null",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a workspace whose main holds router.go, a Go file with a constant, a type with a method, an exported and an unexported function, and empty.go, a Go file with a package clause alone"
+            ],
+            "pseudocode": "in a new internal/scm/outline_test.go, with the hub and repository helpers of internal/scm/helpers_test.go: r = GET …/scm/outline?path=router.go; r.status == 200; r.path == \"router.go\"; r.resolved_sha == head of main; r.language == \"Go\"; r.supported == true; declarations, in order, equal the file's {kind, name, container, signature, exported, start_line, end_line}, the method with its type as container; start_line rises; GET of empty.go answers supported true and declarations == []"
+          }
+        },
+        {
+          "id": "REQ-1.2",
+          "pattern": "optional",
+          "condition": "the request names a ref",
+          "action": "outline the file as it is at that ref: a branch, a tag, a full or abbreviated commit id, or a hub-owned ref, on a repository or on a fork's own refs, and without a ref at the workspace's default branch, a fork's base branch",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go, as TestFile_ReadsTheCommitItsRefNames does for the file route: the file differs between main, the branch feat, the tag v1 and the first commit; a table over ref {absent, main, feat, v1, the first commit's id, its 8-character form}: resolved_sha and the declarations are those of that commit; on a fork (as in internal/scm/fork_test.go), ref absent outlines the fork's base branch and ref = the fork's own branch outlines the fork's file"
+          }
+        },
+        {
+          "id": "REQ-1.3",
+          "pattern": "event_driven",
+          "condition": "the file is in a language this build of the hub has no backend for, or in no known language",
+          "action": "answer that the file is not supported, with no declarations, and not as an error",
+          "contract": "HTTP 200 with supported: false, declarations: [], language the language's name where the extension is known and \"\" otherwise",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go, a table over files of main {README.md, data.csv, Makefile, a file without an extension}: 200, supported == false, declarations == [], language == \"\""
+          }
+        },
+        {
+          "id": "REQ-1.4",
+          "pattern": "event_driven",
+          "condition": "the path names a symbolic link",
+          "action": "answer that the link is not supported, without following it",
+          "contract": "HTTP 200 with supported: false, language: \"\", declarations: []; the link's target is not read",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go: main holds link.go, a symbolic link to router.go; GET …/scm/outline?path=link.go answers 200 with supported false, language \"\" and no declarations"
+          }
+        },
+        {
+          "id": "REQ-1.5",
+          "pattern": "ubiquitous",
+          "action": "for any file in Go, Python, JavaScript, TypeScript, Rust, Java, Kotlin, C#, Ruby, C, C++, PHP, Scala, Lua or Shell, outline it with supported: true when the hub is built with cgo",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "the test binary is built with cgo; the test file carries the build constraint cgo, since without it only Go has a backend"
+            ],
+            "pseudocode": "in a new internal/scm/outline_cgo_test.go, a table of one small file per language (a.py, a.js, a.ts, a.rs, A.java, a.kt, A.cs, a.rb, a.c, a.cpp, a.php, a.scala, a.lua, a.sh, each declaring one function or class named greet or Greeter): GET …/scm/outline answers supported true, language the language's name, and a declaration with that name and a start_line of at least 1"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-2",
+      "title": "Refuse what cannot be outlined, and follow the conventions of the reads",
+      "rationale": "The outline is one more read of the source control API: a caller that knows the file route knows its errors, its access rule and its caching.",
+      "system": "parleyd",
+      "criteria": [
+        {
+          "id": "REQ-2.1",
+          "pattern": "unwanted",
+          "condition": "the request has no path, or a path the file route refuses: absolute, with an empty, . or .. segment, under .git, or holding a NUL character",
+          "action": "refuse the request without opening the repository's objects",
+          "contract": "HTTP 400 with error_type invalid_request and the file route's message for the same path",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go, a table over path {absent, \"\", \"/a.go\", \"a//b.go\", \"../a.go\", \".git/config\"}: 400 invalid_request, and the message equals the one GET …/scm/file answers for the same path"
+          }
+        },
+        {
+          "id": "REQ-2.2",
+          "pattern": "unwanted",
+          "condition": "the ref names no commit, or the path does not exist at the ref",
+          "action": "refuse the request as the file route does",
+          "contract": "HTTP 404 with error_type ref_not_found for the ref, and 404 with error_type path_not_found for the path",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go: ref=nope answers 404 ref_not_found; path=nope.go answers 404 path_not_found; a path that exists on feat and not on main answers 404 without a ref and 200 with ref=feat"
+          }
+        },
+        {
+          "id": "REQ-2.3",
+          "pattern": "unwanted",
+          "condition": "the path names a directory or a submodule",
+          "action": "refuse the request",
+          "contract": "HTTP 400 with error_type invalid_request and a message that says the path is not a file",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go: path=internal, a directory of main, answers 400 invalid_request"
+          }
+        },
+        {
+          "id": "REQ-2.4",
+          "pattern": "unwanted",
+          "condition": "the file is larger than 1 MiB",
+          "action": "refuse the request before any of the file is read",
+          "contract": "HTTP 413 with error_type payload_too_large and the member size, the file's size in bytes; a file of exactly 1 MiB is outlined",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go: big.go of 1<<20 + 1 bytes answers 413 payload_too_large with size == 1048577; edge.go of exactly 1<<20 bytes, a valid Go file padded with a comment, answers 200"
+          }
+        },
+        {
+          "id": "REQ-2.5",
+          "pattern": "unwanted",
+          "condition": "the file is binary: its first 8,000 bytes hold a NUL byte",
+          "action": "refuse the request without parsing the file",
+          "contract": "HTTP 422 with error_type binary_file and a message naming the path",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/outline_test.go, a table {logo.png with a NUL in its header, blob.go whose third byte is NUL}: 422 binary_file; a .go file whose only NUL is at byte 9,000 is not refused as binary"
+          }
+        },
+        {
+          "id": "REQ-2.6",
+          "pattern": "unwanted",
+          "condition": "the read outlasts [scm].read_timeout",
+          "action": "end the read and answer as every source control read does",
+          "contract": "HTTP 503 with error_type scm_timeout and none of the caching headers",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/timeout_test.go, the outline route added to the table of TestRead_EndsAReadThatOutlastsTheReadTimeout: 503 scm_timeout"
+          }
+        },
+        {
+          "id": "REQ-2.7",
+          "pattern": "ubiquitous",
+          "action": "for any successful answer, give the caching headers of the source control reads: immutable when the ref was written as a full commit id, otherwise an entity tag to revalidate with, and answer a request whose If-None-Match holds the tag 304 without reading the file",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "in internal/scm/cache_test.go, the outline route added to the tables of TestRead_MarksAnAnswerAddressedByFullIdsImmutable, TestRead_AnswersAnyOtherReadWithATagToRevalidate, TestRead_AnswersNotModifiedToAnIfNoneMatchHoldingItsTag, TestRead_AnswersNotModifiedWithoutTheReadsCostlyPart and TestRead_LeavesAnErrorWithoutATagAndUncached; the tag changes when main moves and when the path changes"
+          }
+        },
+        {
+          "id": "REQ-2.8",
+          "pattern": "ubiquitous",
+          "action": "for any request to the route, apply the access rule of the source control reads (a PAT needs git:read, the caller read access to the workspace, a fork's reader reads the fork) and report the request once to parley_scm_requests_total under the op outline",
+          "check": {
+            "kind": "integration",
+            "pseudocode": "the outline route added to the tables of internal/scm/access_test.go (TestRead_ServesEveryReaderOnEveryReadableWorkspace, TestRead_RefusesACallerWhoMayNotReadWithoutOpeningTheRepository, TestRead_RefusesAWorkspaceThatIsNotReadableWithoutOpeningTheRepository) and of internal/scm/recorder_test.go (TestRead_ReportsEachRequestOnceToTheRecorder, under the op outline with the results the other reads report), all through one new row of the table scmRoutes of internal/scm/helpers_test.go; in internal/metrics/catalogue_test.go the documented values of the label op of parley_scm_requests_total gain outline"
+          }
+        }
+      ]
+    },
+    {
+      "id": "REQ-3",
+      "title": "Outline from the shell, as a tool, and in the hub image",
+      "rationale": "The operation reaches an agent as a command and as a tool, and the image an operator runs outlines every language of the list.",
+      "criteria": [
+        {
+          "id": "REQ-3.1",
+          "pattern": "event_driven",
+          "condition": "parley scm outline <slug> <path> is run, with or without --ref",
+          "system": "parley CLI",
+          "action": "send one GET to the outline route with path and, when given, ref, and print the hub's answer",
+          "contract": "one request GET /api/v1/workspaces/<slug>/scm/outline?path=…[&ref=…]; stdout is the answer as one JSON document; exit status 0; the hub's error envelope on stderr and exit status 1 for a refusal",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, rows added to the table of TestSCM_ReadsSendOneGetAndPrintTheAnswer: {scm outline demo internal/api/router.go → scm/outline?path=internal%2Fapi%2Frouter.go; with --ref v1 → path=…&ref=v1}"
+          }
+        },
+        {
+          "id": "REQ-3.2",
+          "pattern": "unwanted",
+          "condition": "parley scm outline is run without a slug or without a path, or with a third argument",
+          "system": "parley CLI",
+          "action": "refuse the command line before any request",
+          "contract": "one usage_error envelope on stderr; exit status 2; no request sent",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/scm_test.go, rows added to the table of TestSCM_RefusesABadCommandLineBeforeAnyRequest: {scm outline, scm outline demo, scm outline demo a.go b.go}"
+          }
+        },
+        {
+          "id": "REQ-3.3",
+          "pattern": "ubiquitous",
+          "system": "parley CLI",
+          "action": "for any session of parley mcp that serves the group scm, serve the command as the tool scm_outline, in a read-only session too",
+          "check": {
+            "kind": "unit",
+            "pseudocode": "in internal/cli/mcp_test.go, beside TestMCPList_PrintsTheDefaultSelectionAsTools: mcp --list and mcp --read-only --list hold scm_outline with the required string parameters slug and path and the optional string ref"
+          }
+        },
+        {
+          "id": "REQ-3.4",
+          "pattern": "ubiquitous",
+          "system": "hub image",
+          "action": "for any build of the hub image, hold a parleyd built with cgo, which outlines the fifteen languages, beside a parley built without cgo",
+          "check": {
+            "kind": "integration",
+            "setup": [
+              "a container engine, as the image tests need; they skip without one"
+            ],
+            "pseudocode": "in test/image/hub_test.go, a subtest of TestHubImage_RunsTheHubOnOneVolume: a git repository with a.py is made inside the container with the image's git, a workspace is created from it through the hub's API with the admin token, and GET …/scm/outline?path=a.py answers supported true with the function a.py declares; `parley version` of the image's parley exits 0"
+          }
+        }
+      ]
+    }
+  ],
+  "execution_paths": [
+    {
+      "id": "PATH-1",
+      "title": "An agent outlines a file before it forks",
+      "steps": [
+        {
+          "actor": "agent",
+          "action": "runs parley scm outline demo internal/api/router.go"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "sends GET /api/v1/workspaces/demo/scm/outline?path=internal/api/router.go with the agent's credential"
+        },
+        {
+          "actor": "parleyd",
+          "action": "checks the credential and read access, resolves the default branch, reads the file's bytes from the repository and outlines them"
+        },
+        {
+          "actor": "parley CLI",
+          "action": "prints the declarations with their kinds, signatures and lines"
+        },
+        {
+          "actor": "agent",
+          "action": "runs the command again with --ref on a branch that changed the file and reads the declarations of that commit"
+        }
+      ],
+      "smoke": {
+        "real_components": [
+          "the parley CLI's command tree",
+          "HTTP router and pipeline",
+          "the source control component with a real repository",
+          "agentkit-go's outline package"
+        ],
+        "setup": [
+          "the hub of the source control read tests of test/e2e/scm_read_test.go, whose demo holds internal/api/router.go on main and a changed copy on the branch feat, and app.py"
+        ],
+        "end_state": [
+          "the first command printed the declarations of main's router.go with resolved_sha main's head, NewRouter among them with its line",
+          "the second printed those of feat's copy, with the function feat added",
+          "parley scm outline demo app.py printed supported true and the function the file declares",
+          "each command exited 0 and the hub's metrics count three requests under op outline"
+        ],
+        "pseudocode": "a new test in test/e2e/scm_read_test.go beside TestSCMRead_AnAgentReadsAFileByNameThenByIdThenADiff: run the three commands through cli.Run against the hub and assert the end state; the Python row needs the test binary built with cgo"
+      }
+    }
+  ],
+  "external_apis": [
+    {
+      "package": "github.com/agent-fox-dev/agentkit-go",
+      "version": "v0.10.0",
+      "verified": true,
+      "symbols": [
+        {
+          "name": "Outline",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "func Outline(ctx context.Context, abs string, src []byte, opts Options) (File, error)"
+        },
+        {
+          "name": "File",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type File struct { Path string; Lang string; Backend Backend; Decls []Decl }"
+        },
+        {
+          "name": "Decl",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type Decl struct { Kind Kind; Name string; Container string; Signature string; Exported bool; StartLine int; EndLine int }"
+        },
+        {
+          "name": "Options",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "type Options struct { Root string; MaxFileBytes int64 }"
+        },
+        {
+          "name": "BackendGoAST, BackendTreeSitter, BackendNone",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "const BackendGoAST Backend = \"go/ast\"; BackendTreeSitter Backend = \"tree-sitter\"; BackendNone Backend = \"none\""
+        },
+        {
+          "name": "LangFor",
+          "import_path": "github.com/agent-fox-dev/agentkit-go/outline",
+          "signature": "func LangFor(path string, src []byte) string"
+        }
+      ]
+    }
+  ]
+}
