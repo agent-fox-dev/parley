@@ -10595,6 +10595,11 @@ and never stored. Everything else **fails**, recorded on the delivery as:
 | the TLS handshake fails, an untrusted certificate included | `null` | `tls_error` |
 | the address is refused (see [Destinations](#destinations)) | `null` | `destination_refused` |
 
+An informational status (`1xx`) other than `101 Switching Protocols` does not
+end an attempt: the hub waits on for the final status, and an attempt that
+gets none within the timeout is a `timeout`. A `101` ends it as any other
+status does: `response_code` `101`, `error` `null`.
+
 A signing secret that cannot be decrypted (no key is configured, or the
 stored value opens under neither key) sends nothing unsigned: the loop makes
 no attempt, leaves the delivery as it is and tries again within a minute,

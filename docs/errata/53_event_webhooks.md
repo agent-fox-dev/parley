@@ -99,6 +99,15 @@ carrier-grade NAT that some cloud and container networks use inside, since
 both can lead into the hub's own network. `[webhooks].allow_private` lifts
 the refusal for them as for the other ranges.
 
+## Only a 101 is a 100-class end of an attempt
+
+The package records a 100-class status like a 400 to 599 one: the status as
+`response_code`, `error` null. HTTP makes every 100-class status but
+`101 Switching Protocols` informational, and the sender's HTTP client reads
+those and waits on for the final status, so a receiver that sends `103` and
+nothing more ends the attempt in a `timeout`. A `101` is final, and is
+recorded as the package says: `response_code` 101, `error` null.
+
 ## The OnCommit callback is registered by the first loop
 
 The package registers the delivery loops' wake-up with the event component
